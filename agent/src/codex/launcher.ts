@@ -50,9 +50,15 @@ const MAX_CONTROL_BYTES = 8192; // 8 KiB per control frame
  *  Codex bundle (`/opt/uzi-codex/.../bin` and `codex-path/rg` are resolved by
  *  absolute path INSIDE the launch, never via PATH — PRD #1156 build facts). */
 const CODEX_LAUNCH_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/uzi-toolchain/bin";
-const CODEX_BIN = "/opt/uzi-codex/0.153.2/bin/codex";
-const SUPERVISOR_BIN = "/usr/local/bin/uzi-codex-supervisor";
-const PROVIDER_CHILD_ARGV = ["app-server"] as const;
+/** The pinned, image-baked Codex app-server binary. Exported so the production adapter
+ *  composition (codex-executor.ts) can build a provider {@link CodexLaunchSpec} without
+ *  re-typing the literal; the launcher still re-validates a provider spec names exactly it. */
+export const CODEX_BIN = "/opt/uzi-codex/0.153.2/bin/codex";
+/** The pinned, image-baked supervisor trust anchor. Exported for the same reason. */
+export const SUPERVISOR_BIN = "/usr/local/bin/uzi-codex-supervisor";
+/** The fixed provider child argv (`codex app-server`). Exported so the production
+ *  composition supplies exactly the launcher-required value. */
+export const PROVIDER_CHILD_ARGV = ["app-server"] as const;
 const RESERVED_PROVIDER_ENV_KEYS = new Set([
   "HOME", "CODEX_HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME",
   "TMPDIR", "PATH", "SHELL", "LANG", "TERM", "NODE_OPTIONS", "BASH_ENV", "ENV", "SHELLOPTS",

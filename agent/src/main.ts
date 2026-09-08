@@ -5,6 +5,8 @@ import { WorkerClient, RequestError } from "./client.js";
 import { GitCache } from "./git.js";
 import { StubExecutor } from "./executor.js";
 import { SdkExecutor } from "./sdk-executor.js";
+import { selectCodexBinding, CodexSelectionError } from "./codex/select.js";
+import { CodexExecutor, FailClosedExecutor, CODEX_PRODUCTION_PROVIDER } from "./codex/codex-executor.js";
 import { ChatExecutor, type ChatExecutorLike } from "./chat-executor.js";
 import { StubChatExecutor } from "./chat-executor-stub.js";
 import { RunRunner, type ExecutorFactory } from "./runner.js";
@@ -104,7 +106,36 @@ async function main(): Promise<void> {
   // what hid it: "stable across resume" reads as a guarantee it cannot make. The
   // runner now preflights the transcript and drops an unresolvable resume with an
   // honest run message (issue #105, sdk-session.ts).
-  const makeExecutor: ExecutorFactory = (runId) => {
+  const makeExecutor: ExecutorFactory = (runId, codex) => {
+    // PRD #1171 M3 — the claim-aware DARK selection seam. `selectCodexBinding` is a pure,
+    // fail-closed discriminator: ABSENCE of the block takes the LITERAL current Claude/stub
+    // path below (Claude byte-for-byte); a COMPLETE server-owned block selects Codex; a
+    // PRESENT-but-BROKEN block throws a bounded, secret-free CodexSelectionError. We wrap
+    // the select so that throw becomes a FailClosedExecutor whose run() re-throws the
+    // message (routing through the runner's failed-run catch), NEVER a Claude fallback and
+    // NEVER a crash of executeClaim itself.
+    let selection;
+    try {
+      selection = selectCodexBinding({ codex });
+    } catch (err) {
+      if (err instanceof CodexSelectionError) {
+        return { executor: new FailClosedExecutor(err.message) };
+      }
+      throw err;
+    }
+    if (selection.kind === "codex") {
+      // A validated Codex binding: the production CodexExecutor over the M3a launcher, the
+      // dark core and the M1 credential bridge. Per-run owned HOME (like SdkExecutor).
+      const runHome = path.join(sdkHomeRoot, runId);
+      const executor = new CodexExecutor(log, runHome, {
+        binding: selection.binding,
+        client,
+        provider: CODEX_PRODUCTION_PROVIDER,
+      });
+      return { executor, homeDir: runHome };
+    }
+
+    // selection.kind === "claude": the EXACT legacy path, unchanged.
     // The stub has no SDK $HOME (no session transcript to isolate); its only homeDir
     // use is the provisioning subprocess HOME, which stays SHARED (warm-start) like
     // the SDK executor's. So the stub keeps the shared root and there is nothing

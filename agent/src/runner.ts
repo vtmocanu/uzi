@@ -21,6 +21,7 @@ import type {
   AgentSource,
   AgentTemplate,
   AskUserQuestion,
+  ClaimCodexSecrets,
   ClaimConfig,
   ClaimResponse,
   IterationBudget,
@@ -307,8 +308,12 @@ export interface RunExecution {
   homeDir?: string;
 }
 
-/** Build a per-execution executor for a run id (called once per `execute`). */
-export type ExecutorFactory = (runId: string) => RunExecution;
+/** Build a per-execution executor for a run id (called once per `execute`). PRD #1171 M3:
+ *  widened with the optional claim Codex binding so the factory's DARK selection seam can
+ *  build a Codex executor for an internally-bound claim; absent (the ordinary Claude claim)
+ *  takes the exact legacy path. The chat lane's `makeChatExecutor` is a DIFFERENT type and
+ *  is untouched. */
+export type ExecutorFactory = (runId: string, codex?: ClaimCodexSecrets) => RunExecution;
 
 /**
  * PRD #218 M1 — the worker-shutdown registry entry for one in-flight run. A graceful
@@ -607,9 +612,19 @@ export class RunRunner {
 
   private async executeClaim(claim: ClaimResponse): Promise<void> {
     const runId = claim.run_id;
+    // PRD #1171 M3 (redactor canary hoist): register the Codex access-token + capability
+    // canaries with the logger BEFORE makeExecutor, so a construction error inside the
+    // Codex executor factory can never log an unredacted token. Both are secrets; absent on
+    // an ordinary Claude claim (empty array ⇒ no-op). They join runScopedSecrets so the
+    // terminal eviction (below) covers them, and buildFlight appends them to both redactors.
+    const codexCanaries: string[] = claim.secrets.codex
+      ? [claim.secrets.codex.access_token, claim.secrets.codex.capability]
+      : [];
+    for (const s of codexCanaries) this.log.addSecret(s);
     // This run's OWN executor + private HOME (PRD #42 Decisions 4/5), built fresh
-    // per execution so nothing subprocess-scoped is shared with a concurrent run.
-    const { executor, homeDir: runHome } = this.makeExecutor(runId);
+    // per execution so nothing subprocess-scoped is shared with a concurrent run. The
+    // DARK Codex selection seam reads claim.secrets.codex (absent ⇒ the literal Claude path).
+    const { executor, homeDir: runHome } = this.makeExecutor(runId, claim.secrets.codex);
     // Register per-run secrets with the logger so they are scrubbed from any
     // output, then never log the claim payload itself. Tracked in runScopedSecrets
     // and evicted on terminal (Decision 7) so a completed run's PAT/token does not
@@ -626,6 +641,11 @@ export class RunRunner {
     if (claim.secrets.anthropic_oauth_token)
       runScopedSecrets.push(claim.secrets.anthropic_oauth_token);
     for (const s of runScopedSecrets) this.log.addSecret(s);
+    // The codex canaries were ALREADY addSecret'd above (before makeExecutor); append them
+    // to runScopedSecrets AFTER the add loop — never inside it — so each is registered
+    // exactly ONCE yet still evicted at the terminal (removeSecret is ref-counted, so a
+    // second add here would leave a dangling registration the single eviction can't clear).
+    runScopedSecrets.push(...codexCanaries);
 
     const flight = this.buildFlight(
       claim,
@@ -2086,6 +2106,13 @@ export class RunRunner {
       this.joinToken,
       gitBasic,
     ];
+    // PRD #1171 M3: APPEND the two Codex canaries (access token + capability) so both
+    // redactors scrub them from run-message payloads and out-of-payload strings
+    // (failure_reason). Append-only — the existing forge_pat/anthropic/join/gitBasic
+    // ordering is untouched; absent on an ordinary Claude claim (nothing added).
+    if (claim.secrets.codex) {
+      secrets.push(claim.secrets.codex.access_token, claim.secrets.codex.capability);
+    }
     const redact = makeRedactor(secrets);
     const redactText = makeTextRedactor(secrets);
     const batcher = new MessageBatcher(

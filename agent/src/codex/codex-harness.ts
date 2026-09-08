@@ -45,6 +45,7 @@
 // {@link CodexHarnessError} throw (Claude's clean-EOF `exhausted` is unaffected).
 
 import { renderCodexRun } from "./render.js";
+import { CODEX_DELEGATE_TOOLS, canonicalizeCodexToolName } from "./broker.js";
 import { normalizeCodexStatus, normalizeCodexTerminalErrors, normalizeCodexUsage } from "./terminal-normalize.js";
 
 import type { Logger } from "../log.js";
@@ -127,6 +128,20 @@ export type LaunchRootSeam = (spec: CodexLaunchRootSpec) => Promise<CodexLaunchR
 /** The injected session-presence seam backing {@link CodexHarness.inspectSession}. */
 export type SessionInspectSeam = (id: string) => Promise<SessionPresence>;
 
+/**
+ * A per-child-thread demux sink (PRD #1171 m3, part C). The m2
+ * {@link CodexDelegationRunner} needs a per-child `ChildThreadController.notifications()`
+ * over the SAME app-server transport, but `CodexTransport.notifications()` is
+ * single-consumer (owned by the root loop). So a delegation callback registers a sink for
+ * its child thread id via {@link CodexHarness.registerChildSink}; the root loop routes
+ * every frame carrying that thread id into the sink and leaves every root frame on the root
+ * loop. When no sink is registered the root path is BYTE-IDENTICAL to before the demux.
+ */
+export interface CodexChildSink {
+  /** Deliver one demuxed child-thread frame to the child controller's stream. */
+  push(note: CodexNotification): void;
+}
+
 export interface CodexHarnessOptions {
   readonly registry: ExecutionRegistry;
   readonly launchRoot: LaunchRootSeam;
@@ -152,6 +167,16 @@ function asObject(v: unknown): Record<string, unknown> | undefined {
 
 function asString(v: unknown): string | undefined {
   return typeof v === "string" ? v : undefined;
+}
+
+/** The app-server thread id a decoded notification carries, or undefined when it carries
+ *  none. Lifecycle frames carry it top-level; `activity` frames (item/completed,
+ *  item/tool/call, deltas) carry it in `params.threadId`. Used by the child-sink demux to
+ *  decide whether a frame belongs to a delegated child thread. */
+function noteThreadId(note: CodexNotification): string | undefined {
+  if (note.kind !== "activity") return note.threadId;
+  const params = asObject(note.params);
+  return asString(params?.threadId);
 }
 
 /** Extract non-empty text off an item, from a bare `text` string and/or a `content`
@@ -204,6 +229,16 @@ export class CodexHarness implements RunHarness {
   private currentModel?: string;
   private closed = false;
 
+  // Child-thread demux (part C): a registered sink receives every frame carrying its
+  // child thread id off the SAME transport, so a delegation's child turn can consume its
+  // own notifications while the root loop keeps reading. Empty on the non-delegation path.
+  private readonly childSinks = new Map<string, CodexChildSink>();
+  // Concurrently-running DELEGATION callbacks. A delegate callback drives a child turn
+  // whose frames this root loop demuxes, so it CANNOT be awaited inline (that would
+  // deadlock the transport read). It runs in the background, tracked here, and the turn
+  // stream flushes it before ending. Every non-delegate callback stays inline.
+  private readonly pendingToolCalls = new Set<Promise<void>>();
+
   // Per-turn state (turns run strictly sequentially).
   private activeTurnId?: string;
   private turnClosed = false;
@@ -230,6 +265,50 @@ export class CodexHarness implements RunHarness {
 
   inspectSession(id: string): Promise<SessionPresence> {
     return this.sessionInspect(id);
+  }
+
+  // --- child-thread demux (part C) ---------------------------------------------
+  // The delegation seam (built by the CodexExecutor) uses these to run a child turn on
+  // the SAME provider transport as the root: it starts the child thread via
+  // {@link requestOnTransport}, registers a sink for the child thread id so the root loop
+  // routes the child's frames into the child controller, and answers the child's tool
+  // callbacks via {@link respondOnTransport}. Root frames are untouched, so a run with no
+  // subagents behaves exactly as before the demux.
+
+  /** Route frames carrying `threadId` into `sink` instead of the root loop. */
+  registerChildSink(threadId: string, sink: CodexChildSink): void {
+    this.childSinks.set(threadId, sink);
+  }
+
+  /** Stop routing frames for `threadId` to a child sink (the child turn is done). */
+  unregisterChildSink(threadId: string): void {
+    this.childSinks.delete(threadId);
+  }
+
+  /** Send a request on the shared provider transport. The child-thread seam uses it to
+   *  start/interrupt a child thread on the SAME app-server; the child's frames are
+   *  demuxed back via {@link registerChildSink}. Rejects if the provider root is not
+   *  launched (a child turn is only ever started from inside an active root turn). */
+  requestOnTransport<T = unknown>(method: string, params?: unknown, opts?: { signal?: AbortSignal }): Promise<T> {
+    const transport = this.transport;
+    if (!transport) {
+      return Promise.reject(new CodexHarnessError({ category: "protocol", message: "codex provider root is not launched" }));
+    }
+    return transport.request<T>(method, params, opts);
+  }
+
+  /** Answer a child server→client tool-call on the shared transport. Best-effort: an
+   *  undeliverable reply into a closed transport is dropped, never thrown (mirrors the
+   *  root {@link routeToolCall} reply guard). */
+  respondOnTransport(
+    requestId: number | string,
+    response: { readonly result: unknown } | { readonly error: { readonly code: number; readonly message: string } },
+  ): void {
+    try {
+      this.transport?.respond(requestId, response);
+    } catch {
+      /* the transport may already be closed; the child settles via its own terminal/abort */
+    }
   }
 
   startTurn(request: RunTurnRequest): HarnessTurn {
@@ -303,8 +382,10 @@ export class CodexHarness implements RunHarness {
 
   /** Idempotent root iterator/transport closure ONLY. Closes the turn's iteration and
    *  the shared root transport (idempotent); it does NOT drain children, kill groups or
-   *  reap — that is quiesce/reap/dispose. */
-  private async close(): Promise<void> {
+   *  reap — that is quiesce/reap/dispose. Public so the executor's terminal cleanup can
+   *  close the transport (rejecting any straggler request) after the registry reaps the
+   *  provider root; the per-turn `HarnessTurn.close` seam routes here too. */
+  async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
     this.turnClosed = true;
@@ -406,6 +487,20 @@ export class CodexHarness implements RunHarness {
             message: "codex app-server stream ended before turn completion",
           });
         }
+        // CHILD-THREAD DEMUX (part C). A frame carrying a REGISTERED child thread id is a
+        // delegated child's frame: route it to the child controller's sink and keep
+        // reading, NEVER map/yield it on the root loop. The `size > 0` guard makes the
+        // non-delegation path (no child sinks) BYTE-IDENTICAL to before this edit.
+        if (this.childSinks.size > 0) {
+          const childId = noteThreadId(step.value);
+          if (childId !== undefined) {
+            const sink = this.childSinks.get(childId);
+            if (sink !== undefined) {
+              sink.push(step.value);
+              continue;
+            }
+          }
+        }
         // The broker-callback await (mapNote → routeToolCall → broker.handleToolCall) is
         // itself raced against the owner abort — WITHOUT this, a never-settling broker seam
         // (a model-selected long-running shell) leaves the turn un-cancellable, falsifying
@@ -420,7 +515,15 @@ export class CodexHarness implements RunHarness {
           return;
         }
         yield mapped;
-        if (mapped.kind === "turn_finished") return; // close the iterator after the terminal
+        if (mapped.kind === "turn_finished") {
+          // Flush any concurrently-running delegation callbacks: each drives a child turn
+          // that settles (and replies) before this resolves, so the parent spawn_agent
+          // callback has responded by the time the root turn stream closes. A wedged
+          // child self-bounds via its own per-child deadline (delegation.ts), so this
+          // await is finite. The non-delegation path has an empty set and never waits.
+          if (this.pendingToolCalls.size > 0) await Promise.allSettled(this.pendingToolCalls);
+          return; // close the iterator after the terminal
+        }
       }
     } finally {
       if (onAbort) request.signal.removeEventListener("abort", onAbort);
@@ -558,7 +661,14 @@ export class CodexHarness implements RunHarness {
     switch (note.kind) {
       case "thread_started":
         // The model-bearing init: carries the model the harness configured, distinct
-        // from the bare turn-start below.
+        // from the bare turn-start below. Bind it to the ACTIVE ROOT thread: a child
+        // `thread/started` (a delegated subagent's) must never latch the root session id
+        // or emit a root `initialized`. The demux already routes a registered child's
+        // frames away, so this is defense-in-depth for the pre-registration window and any
+        // stray/foreign thread id — such a frame is liveness only.
+        if (note.threadId !== this.threadId) {
+          return { kind: "activity", sessionId: note.threadId };
+        }
         return { kind: "initialized", model: this.currentModel, sessionId: note.threadId };
       case "turn_started":
         return { kind: "activity", sessionId: note.threadId };
@@ -607,7 +717,7 @@ export class CodexHarness implements RunHarness {
    *  it settles (a broker deny is a FAILED tool RESULT — `success:false` — not a JSON-RPC
    *  error, mirroring the M0 policy-broker). Authority over WHAT a matched callback may do
    *  stays the broker's; the harness only gates WHICH turn's callbacks reach it. */
-  private async routeToolCall(transport: CodexTransport, requestId: number | string, params: unknown): Promise<void> {
+  private routeToolCall(transport: CodexTransport, requestId: number | string, params: unknown): Promise<void> {
     const p = asObject(params) ?? {};
     // A callback is served ONLY for the ACTIVE root turn. We bind on BOTH the raw thread
     // id AND the raw turn id (never folded to this.threadId/activeTurnId), so an absent/
@@ -625,23 +735,47 @@ export class CodexHarness implements RunHarness {
       rawThreadId === this.threadId &&
       rawTurnId !== undefined &&
       rawTurnId === this.activeTurnId;
-    let result: CallbackResult;
     if (!matchesActive) {
-      result = { ok: false, code: "not_active_turn", message: "callback does not match the active turn" };
-    } else {
+      this.safeRespond(transport, requestId, { ok: false, code: "not_active_turn", message: "callback does not match the active turn" });
+      return Promise.resolve();
+    }
+    const runAndReply = async (): Promise<void> => {
+      let result: CallbackResult;
       try {
         // A matched callback is, by construction, the root turn's — origin is "root".
         result = await this.broker.handleToolCall({ threadId, turnId, callId }, p.tool, p.arguments, "root");
       } catch {
         result = { ok: false, code: "broker_error", message: "the callback failed" };
       }
+      this.safeRespond(transport, requestId, result);
+    };
+    // A DELEGATION callback (spawn_agent / the collaboration*/Subagent* family) drives a
+    // CHILD turn whose frames THIS root loop demuxes off the SAME transport
+    // (registerChildSink). It therefore MUST run CONCURRENTLY with continued note
+    // consumption — awaiting it inline would deadlock, because the child's frames would
+    // never be read. It runs in the background, tracked in `pendingToolCalls`, and the
+    // turn stream flushes it before ending; the broker's own delegate seam guarantees the
+    // child settles before this callback (the parent spawn_agent) resolves. EVERY OTHER
+    // callback is awaited inline exactly as before, so the non-delegation path is
+    // byte-identical (the abort race in runTurn still bounds a wedged inline callback).
+    const toolName = asString(p.tool);
+    if (toolName !== undefined && CODEX_DELEGATE_TOOLS.has(canonicalizeCodexToolName(toolName))) {
+      const task = runAndReply();
+      this.pendingToolCalls.add(task);
+      void task.finally(() => this.pendingToolCalls.delete(task));
+      return Promise.resolve();
     }
+    return runAndReply();
+  }
+
+  /** Reply to a server→client tool-call with a broker {@link CallbackResult}, mapped to the
+   *  app-server reply shape. Best-effort: an undeliverable reply into a closed transport
+   *  (an owner abort/close raced this pending callback) is dropped, NEVER thrown. */
+  private safeRespond(transport: CodexTransport, requestId: number | string, result: CallbackResult): void {
     try {
       transport.respond(requestId, this.replyOf(result));
     } catch {
-      // The transport may already be closed (an owner abort/close raced this pending
-      // broker callback): a reply that can no longer be delivered is dropped, NEVER thrown
-      // into a closed transport.
+      /* transport closed underneath a late reply; the run settles via its terminal/abort */
     }
   }
 
