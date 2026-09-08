@@ -204,8 +204,10 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 	}
 	rows = append(rows, limitWaitRows(r, time.Now())...)
 	// The pause block (PRD #1190 M4): a PAUSED row while parked by an owner pause, or a
-	// PAUSE_REQUESTED row while a pause is pending on a still-running run. Empty for every
-	// other run, so a run that was never paused is byte-for-byte unchanged.
+	// PAUSE_REQUESTED row while a pause is pending and the run has not yet parked into
+	// `paused` (so it shows on a running run AND on one involuntarily parked — limit_wait
+	// etc. — that still carries the request). Empty for every other run, so a run that was
+	// never paused is byte-for-byte unchanged.
 	rows = append(rows, pauseDetailRows(r, time.Now())...)
 	// MR_REWORK rides every run like WAIT_ON_LIMIT above, and is tri-state (PRD #841):
 	// "inherit" (nil → follow the owner's account default), "on" or "off". An always-present
@@ -286,20 +288,25 @@ func limitWaitRows(r apitypes.RunDTO, now time.Time) [][]string {
 
 // pauseDetailRows is the pause block of `uzi run get` (PRD #1190 M4). It renders at most
 // one row, and the two are mutually exclusive by construction: a PAUSED run has cleared its
-// pause_requested_at (SetRunPaused nulls it), and a PAUSE_REQUESTED row only shows on a
-// still-`running` run. So a run is never both.
+// pause_requested_at (SetRunPaused nulls it), and the PAUSE_REQUESTED row is gated to a run
+// that has NOT yet parked into `paused` (the PAUSED arm returns first). So a run is never both.
 //
 //   - PAUSED (status == paused): when the run parked, how long ago, its milestone progress,
 //     and how recently its checkpoint was pushed.
-//   - PAUSE_REQUESTED (status == running, pause_requested_at set): the boundary the pending
-//     request waits for — the next milestone (milestone mode) or the next turn (`now`).
+//   - PAUSE_REQUESTED (pause_requested_at set, status != paused): the boundary the pending
+//     request waits for — the next milestone (milestone mode) or the next turn (`now`). This
+//     is gated on pause_requested_at, NOT on status == running, because a pending pause
+//     SURVIVES an involuntary park: limit_wait/pool_wait/awaiting_input leave the pause
+//     columns untouched, and the request lands at the first boundary after the run resumes
+//     (PRD D6). So this row shows on a running run AND on such a parked run that still carries
+//     the request — matching the web's pending chip (shown whenever pause_requested_at is set).
 //
 // It takes now so the elapsed clocks unit-test deterministically, matching limitWaitRows.
 func pauseDetailRows(r apitypes.RunDTO, now time.Time) [][]string {
 	if r.Status == statusPaused {
 		return [][]string{{"PAUSED", pausedSummary(r, now)}}
 	}
-	if r.Status == "running" && r.PauseRequestedAt != nil {
+	if r.PauseRequestedAt != nil {
 		return [][]string{{"PAUSE_REQUESTED", pauseBoundaryClause(r)}}
 	}
 	return nil
@@ -412,13 +419,18 @@ func pausedLine(r apitypes.RunDTO, now time.Time, width int) string {
 	return joinSheddingClauses(width, lead, doneClause, pauseCheckpointClause(r, now))
 }
 
-// pauseRequestedLine is the run detail's row-2 line for a still-running run with a pending
-// pause (PRD #1190 M4). One physical row, wait colour, shedding from the right: it drops the
-// "cancel or pause now …" hint first, then the "after M<N>" boundary, keeping
+// pauseRequestedLine is the run detail's row-2 line for a run that carries a pending pause and
+// has not yet parked into `paused` (PRD #1190 M4) — a running run, or one involuntarily parked
+// (limit_wait etc.) that still carries the request. One physical row, wait colour, shedding
+// from the right: it drops the "manage …" hint first, then the "after M<N>" boundary, keeping
 // "pause requested" as the surviving lead.
+//
+// The hint is "manage from the web or CLI", deliberately NOT "cancel or pause now": the TUI
+// footer already binds `x` to CANCEL THE RUN, so a "cancel" here would read as that key, and
+// "pause now" duplicated the "now" the boundary clause already carries for a now-mode request.
 func pauseRequestedLine(r apitypes.RunDTO, width int) string {
 	return joinSheddingClauses(width,
-		"pause requested", pauseBoundaryClause(r), "cancel or pause now from the web or CLI")
+		"pause requested", pauseBoundaryClause(r), "manage from the web or CLI")
 }
 
 // milestoneRows renders a milestone-structured run's progress block for `uzi run get`

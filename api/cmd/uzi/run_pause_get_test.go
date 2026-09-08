@@ -96,7 +96,8 @@ func TestPauseBoundaryClause(t *testing.T) {
 }
 
 // TestPauseDetailRows: exactly one row for a paused run (PAUSED), exactly one for a pending
-// pause on a running run (PAUSE_REQUESTED), and none for a run that is neither.
+// pause on a run that has not yet parked into `paused` — running OR involuntarily parked
+// (PAUSE_REQUESTED) — and none for a run that is neither.
 func TestPauseDetailRows(t *testing.T) {
 	now := time.Date(2026, 9, 8, 13, 42, 0, 0, time.UTC)
 
@@ -115,6 +116,22 @@ func TestPauseDetailRows(t *testing.T) {
 	rows = pauseDetailRows(pending, now)
 	if len(rows) != 1 || rows[0][0] != "PAUSE_REQUESTED" || rows[0][1] != "after M4" {
 		t.Fatalf("pending pause: rows = %v, want one PAUSE_REQUESTED 'after M4' row", rows)
+	}
+
+	// A pending pause that survived a usage-limit park: still limit_wait, still carrying the
+	// request → the PAUSE_REQUESTED row must still show (PRD D6), matching the web's chip.
+	parkedPending := apitypes.RunDTO{
+		ID: "r1", Status: statusLimitWait, Milestones: sixMilestones(),
+		PauseRequestedAt: &req, PauseMode: sp("milestone"), PauseAfterCount: intPtr(3),
+	}
+	rows = pauseDetailRows(parkedPending, now)
+	if len(rows) != 1 || rows[0][0] != "PAUSE_REQUESTED" || rows[0][1] != "after M4" {
+		t.Fatalf("limit_wait run with a pending pause: rows = %v, want one PAUSE_REQUESTED 'after M4' row", rows)
+	}
+
+	// A limit_wait run with NO pending pause → no pause rows (the pause block stays empty).
+	if rows := pauseDetailRows(apitypes.RunDTO{ID: "r1", Status: statusLimitWait}, now); rows != nil {
+		t.Errorf("limit_wait run with no pause: rows = %v, want none", rows)
 	}
 
 	// A plain running run with no request → no rows.
@@ -156,5 +173,33 @@ func TestRunGetRendersPendingRow(t *testing.T) {
 	// A pending pause must NOT also draw a PAUSED row (the run is still running).
 	if strings.Contains(stdout, "\nPAUSED ") || strings.Contains(stdout, "PAUSED  ") {
 		t.Errorf("a pending pause on a running run must not draw a PAUSED row:\n%s", stdout)
+	}
+}
+
+// TestRunGetRendersPendingRowOnLimitWait: a pending pause that was overtaken by a usage-limit
+// park still shows the PAUSE_REQUESTED row, beside the LIMIT_WAIT park block — the request
+// survives the park and lands at the first boundary after the run resumes (PRD D6).
+func TestRunGetRendersPendingRowOnLimitWait(t *testing.T) {
+	req := time.Date(2026, 9, 8, 11, 0, 0, 0, time.UTC)
+	retry := time.Now().Add(4 * time.Hour)
+	parkedPending := apitypes.RunDTO{
+		ID: "r1", Kind: "issue", Status: statusLimitWait, Health: "ok", Milestones: sixMilestones(),
+		PauseRequestedAt: &req, PauseMode: sp("milestone"), PauseAfterCount: intPtr(3),
+		RetryNotBefore: &retry, RateLimitType: sp("five_hour"),
+	}
+	fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{"r1": parkedPending}}
+	stdout, stderr, code := runCLI(t, fakeEnv(fc), "run", "get", "r1")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0 (stderr: %s)", code, stderr)
+	}
+	if !strings.Contains(stdout, "PAUSE_REQUESTED") || !strings.Contains(stdout, "after M4") {
+		t.Errorf("`run get` on a limit_wait run must still show PAUSE_REQUESTED (want 'after M4'):\n%s", stdout)
+	}
+	if !strings.Contains(stdout, "LIMIT_WAIT") {
+		t.Errorf("`run get` on a limit_wait run must still show the LIMIT_WAIT park block:\n%s", stdout)
+	}
+	// The run has not parked into `paused`, so no PAUSED row.
+	if strings.Contains(stdout, "\nPAUSED ") || strings.Contains(stdout, "PAUSED  ") {
+		t.Errorf("a limit_wait run with a pending pause must not draw a PAUSED row:\n%s", stdout)
 	}
 }

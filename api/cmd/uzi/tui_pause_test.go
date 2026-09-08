@@ -63,14 +63,25 @@ func TestPausedDetailShowsGlyphAndWord(t *testing.T) {
 	}
 }
 
-// TestPauseRow2LinesPerStatus — the row-2 line drawn in the detail depends on status: a paused
-// run draws the "‖ paused by you" line; a running run with a pending request draws the
-// "pause requested" line; a plain running run draws neither.
+// TestPauseRow2LinesPerStatus — the row-2 line drawn in the detail depends on status and the
+// pending-pause flag: a paused run draws the "‖ paused by you" line; a run that carries
+// pause_requested_at but has not yet parked into `paused` draws the "pause requested" line
+// (whether it is still running OR involuntarily parked, since a pending pause survives such a
+// park — PRD D6); a plain running run draws neither.
 func TestPauseRow2LinesPerStatus(t *testing.T) {
 	req := time.Date(2026, 9, 8, 11, 0, 0, 0, time.UTC)
 	pending := apitypes.RunDTO{
 		ID: "r1", Kind: "issue", Status: "running", Health: "ok", Milestones: sixMilestones(),
 		PauseRequestedAt: &req, PauseMode: sp("milestone"), PauseAfterCount: intPtr(3),
+	}
+	// A pending pause that was overtaken by a usage-limit park: the run is limit_wait but still
+	// carries pause_requested_at, so the pending line must still show (it lands at the first
+	// boundary after the run resumes).
+	retry := time.Date(2026, 9, 8, 15, 0, 0, 0, time.UTC)
+	parkedPending := apitypes.RunDTO{
+		ID: "r1", Kind: "issue", Status: statusLimitWait, Health: "ok", Milestones: sixMilestones(),
+		PauseRequestedAt: &req, PauseMode: sp("milestone"), PauseAfterCount: intPtr(3),
+		RetryNotBefore: &retry, RateLimitType: sp("five_hour"),
 	}
 	plain := apitypes.RunDTO{ID: "r1", Kind: "issue", Status: "running", Health: "ok"}
 
@@ -94,6 +105,17 @@ func TestPauseRow2LinesPerStatus(t *testing.T) {
 	}
 	if strings.Contains(pendingOut, "paused by you") {
 		t.Errorf("a running run with a pending pause must NOT draw the paused line:\n%s", pendingOut)
+	}
+
+	parkedOut := render(parkedPending)
+	if !strings.Contains(parkedOut, "pause requested") {
+		t.Errorf("a limit_wait run carrying a pending pause is missing the pause-requested line:\n%s", parkedOut)
+	}
+	if !strings.Contains(parkedOut, "waiting: Anthropic usage limit") {
+		t.Errorf("a limit_wait run must still draw the rate-limit park line beside the pause line:\n%s", parkedOut)
+	}
+	if strings.Contains(parkedOut, "paused by you") {
+		t.Errorf("a limit_wait run with a pending pause must NOT draw the paused line:\n%s", parkedOut)
 	}
 
 	plainOut := render(plain)
@@ -154,8 +176,13 @@ func TestPauseRequestedLineContent(t *testing.T) {
 		Status: "running", Milestones: sixMilestones(), PauseMode: sp("milestone"), PauseAfterCount: intPtr(3),
 	}
 	full := pauseRequestedLine(r, 120)
-	if full != "pause requested · after M4 · cancel or pause now from the web or CLI" {
+	if full != "pause requested · after M4 · manage from the web or CLI" {
 		t.Errorf("full pause-requested line = %q", full)
+	}
+	// The hint must not imply a TUI key: `x` in the footer cancels the RUN, so a "cancel"
+	// verb here would read as that key, and "pause now" duplicated the boundary's "now".
+	if strings.Contains(full, "cancel") || strings.Contains(full, "pause now") {
+		t.Errorf("hint must not collide with the `x cancel` footer key or say 'pause now': %q", full)
 	}
 	// Tight: the hint sheds first, the boundary survives.
 	mid := pauseRequestedLine(r, 30)
@@ -166,6 +193,19 @@ func TestPauseRequestedLineContent(t *testing.T) {
 	narrow := pauseRequestedLine(r, 5)
 	if narrow != "pause requested" {
 		t.Errorf("narrow pause-requested line = %q, want just 'pause requested'", narrow)
+	}
+}
+
+// TestPauseRequestedLineNowModeNoDuplicateNow — a now-mode pending pause names the boundary
+// "now" exactly once: the boundary clause carries it and the hint must not repeat it.
+func TestPauseRequestedLineNowModeNoDuplicateNow(t *testing.T) {
+	r := apitypes.RunDTO{Status: "running", Milestones: sixMilestones(), PauseMode: sp("now"), PauseAfterCount: intPtr(3)}
+	full := pauseRequestedLine(r, 120)
+	if full != "pause requested · now · manage from the web or CLI" {
+		t.Errorf("now-mode pause-requested line = %q", full)
+	}
+	if n := strings.Count(full, "now"); n != 1 {
+		t.Errorf("now-mode line should say 'now' exactly once, got %d: %q", n, full)
 	}
 }
 
