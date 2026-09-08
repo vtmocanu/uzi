@@ -55,18 +55,29 @@ function drain(stream: Readable): Promise<Buffer> {
   });
 }
 
-/** Spy on client.publishCheckpoint: buffer the pack and return a landed publish. */
-function spyPublish(): { restore: () => void } {
+/** A recorded publishCheckpoint call (mirrors runner-park-checkpoint.test.ts's PublishCall). */
+interface PublishCall {
+  runId: string;
+  tipOid: string;
+}
+
+/** Spy on client.publishCheckpoint: buffer the pack, RECORD the call, and return a landed publish.
+ *  Returns { calls, restore } so a test can assert how many publish RPCs were made — an
+ *  empty/unmoved tip produces no pack, so publishCheckpointBestEffort records ZERO calls. */
+function spyPublish(): { calls: PublishCall[]; restore: () => void } {
+  const calls: PublishCall[] = [];
   const orig = client.publishCheckpoint.bind(client);
   (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = async (
-    _runId: string,
-    _tipOid: string,
+    runId: string,
+    tipOid: string,
     pack: Readable,
   ) => {
     await drain(pack);
+    calls.push({ runId, tipOid });
     return { ok: true, body: { published: true, ref: "refs/uzi-checkpoints/agent/issue-x" } };
   };
   return {
+    calls,
     restore: () => {
       (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = orig;
     },
@@ -242,18 +253,28 @@ describe("RunRunner — owner-requested pause park (PRD #1190 M2)", () => {
   it("reports `pause_failed` and KEEPS RUNNING on an EMPTY/unpublishable pack (a `now` pause before any commit)", async () => {
     const { gitlab } = fakeGitlab();
     const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-1190-empty-"));
-    // A `now` pause dropped the first turn before any commit landed durably, so there is nothing to
-    // publish. Decision 8: an empty/unpublishable pack does NOT get a clean-park shortcut — it falls
-    // through to publishCheckpointBestEffort, whose false result reports pause_failed and the run
-    // keeps running. (A base-tip shortcut would be UNSAFE on the seededFrom:"tracking" resume leg,
-    // where baseCommit is durable on origin only if the prior park's best-effort publish landed.)
-    const { restore } = spyPublishHttpError(500);
+    // A `now` pause dropped the first turn before any commit landed durably, so the clone's tip is
+    // still its unmoved base. Use a HEALTHY transport (spyPublish, NOT a forced HTTP error): with a
+    // healthy transport the ONLY reason no publish lands is that checkpointPack produces no pack for
+    // an empty/unmoved tip, so publishCheckpointBestEffort makes ZERO publish RPCs and still returns
+    // false → pause_failed, and the run keeps running (Decision 8: no clean-park shortcut without a
+    // durable checkpoint). The calls.length === 0 assertion below is what catches an unsafe base-tip
+    // shortcut — forcing the failure with an HTTP 500 would MASK it, since a 500 yields pause_failed
+    // whether or not a pack was ever produced/published. (A base-tip shortcut would be UNSAFE on the
+    // seededFrom:"tracking" resume leg, where baseCommit is durable on origin only if the prior
+    // park's best-effort publish landed.)
+    const { calls, restore } = spyPublish();
     try {
       const { factory, parkResults } = emptyPauseFactory(homeRoot);
       const claim = gitlabClaim(1105);
       await runnerWithGit(factory, gitlab).execute(claim);
 
       assert.deepEqual(parkResults, [false], "an empty/unpublishable pack does NOT park");
+      assert.equal(
+        calls.length,
+        0,
+        `an empty/unmoved tip produces no pack, so ZERO publish RPCs are made, got ${calls.length}`,
+      );
       const statuses = stateStatuses(claim.run_id);
       assert.ok(
         statuses.includes("pause_failed"),
