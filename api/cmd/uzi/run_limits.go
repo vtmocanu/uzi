@@ -121,3 +121,44 @@ func newRunMrReworkCmd(env Env, gf *globalFlags) *cobra.Command {
 	mrRework.Flags().Bool("clear", false, "clear the per-run override back to inherit (follow the account default)")
 	return mrRework
 }
+
+// newRunReworkCmd builds `uzi run rework`.
+func newRunReworkCmd(env Env, gf *globalFlags) *cobra.Command {
+	rework := &cobra.Command{
+		Use:   "rework <run-id>",
+		Short: "Start one on-demand MR-rework cycle on a completed run past the automatic cap",
+		Long: "Start ONE on-demand MR-rework cycle on a completed run whose MR is open, PAST the " +
+			"automatic cap (PRD #1202). It is how an owner reworks an MR after the automatic watcher has " +
+			"stopped: it SKIPS the cap, the quiet-period debounce, the head-SHA staleness check and the " +
+			"green-pipeline gate, but KEEPS the branch guard, the one-active-rework guard, the admin " +
+			"kill-switch, the owner token and the open-MR requirement. The cycle does NOT count against " +
+			"the automatic cap.\n\n" +
+			"Guidance is optional: pass -m <text> (or pipe it on stdin) to steer the rework; an empty " +
+			"guidance is a valid trigger as long as there is a new review comment (the server answers 409 " +
+			"\"nothing to rework\" when neither a guidance nor a new comment applies). A foreign or unknown " +
+			"run is a 404 (exit 4); a refusal — disabled, not reworkable, already running, or nothing new — " +
+			"is a 409 (exit 5). Prints the created mr_rework run.",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := env.client(gf)
+			if err != nil {
+				return err
+			}
+			msg, _ := cmd.Flags().GetString("message")
+			// Guidance is OPTIONAL here (unlike revise/follow-up, which reject an empty
+			// message): an empty guidance is a valid trigger server-side, so resolveMessage's
+			// result — the -m value, or a body piped on stdin when -m is absent, "" when
+			// neither — is forwarded verbatim with no emptiness guard.
+			guidance := resolveMessage(env, msg)
+			run, err := c.RunRework(cmd.Context(), args[0], guidance)
+			if err != nil {
+				return err
+			}
+			// renderCreatedRun is `run create`'s renderer: renderRunDetail for humans and the
+			// SAME {"run": <dto>} envelope for --json, since this creates a new mr_rework run.
+			return renderCreatedRun(env, gf, run)
+		},
+	}
+	rework.Flags().StringP("message", "m", "", "optional guidance to steer the rework (or pipe it on stdin)")
+	return rework
+}

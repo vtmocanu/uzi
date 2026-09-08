@@ -231,6 +231,24 @@ func (c *HTTPClient) SetRunMrRework(ctx context.Context, id string, enabled *boo
 	return env.Run, nil
 }
 
+// RunRework triggers one on-demand MR-rework cycle (PRD #1202 M1). guidance rides the
+// body verbatim (NO omitempty — an empty guidance is a valid trigger, so the key is
+// always sent); the server unwraps to the created `mr_rework` run. The exit-code mapping
+// (404→ExitNotFound, 409→ExitConflict, 400→ExitUsage) comes for free through
+// statusError/postJSON, so it is not hand-rolled here.
+func (c *HTTPClient) RunRework(ctx context.Context, runID, guidance string) (apitypes.RunDTO, error) {
+	body := struct {
+		Guidance string `json:"guidance"`
+	}{Guidance: guidance}
+	var env struct {
+		Run apitypes.RunDTO `json:"run"`
+	}
+	if err := c.postJSON(ctx, "/api/runs/"+url.PathEscape(runID)+"/rework", body, &env); err != nil {
+		return apitypes.RunDTO{}, err
+	}
+	return env.Run, nil
+}
+
 // CreateRunSeed is PRD #209's optional seeded plan for CreateRun: an
 // externally-authored plan and the run's subagent roster. Nil ⇒ an ordinary run
 // planned from the issue. It mirrors the server's workersvc.SeededPlan and keeps the

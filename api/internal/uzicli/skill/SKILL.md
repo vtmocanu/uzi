@@ -162,6 +162,7 @@ uzi run inputs <run-id>
 uzi run expedite <run-id> [--clear]
 uzi run resume-now <run-id>
 uzi run mr-rework <run-id> [--enabled[=false]] [--clear]
+uzi run rework <run-id> [-m|--message <text>]
 uzi schedule create --repo <repo-id> [--repo <repo-id>]... (--issue <iid> | --sweep [--label <l>]... [--create-missing-labels] | --prompt <text>) (--at <rfc3339> | --cron <expr>) [--tz <iana>] [--enabled[=false]] [--auto-approve[=false]] [--wait-on-limit] [--mr-rework[=false]] [--output mr|issues]
 uzi schedule list
 uzi schedule get <schedule-id>
@@ -514,6 +515,16 @@ uzi version
   usage error (exit 2); a foreign/unknown run is a 404 (exit 4). The write is inert once
   the MR is merged or closed. Prints the updated run, whose `MR_REWORK` row reads
   inherit/on/off.
+- `uzi run rework <run-id> [-m|--message <text>]` — start ONE on-demand MR-rework cycle
+  on a **completed** run whose MR is open, PAST the automatic cap (PRD #1202) — the way to
+  rework an MR after the automatic watcher has stopped. It SKIPS the cap, the quiet-period
+  debounce, the head-SHA staleness check and the green-pipeline gate, but KEEPS the branch
+  guard, the one-active-rework guard, the admin kill-switch, the owner token and the open-MR
+  requirement. The cycle does **not** count against the automatic cap. A foreign/unknown run
+  is a 404 (exit 4); a refusal — disabled, not reworkable, already running, or nothing new to
+  rework — is a 409 (exit 5). `-m`/`--message` carries optional guidance to steer the rework
+  (or pipe it on stdin); an empty guidance is a valid trigger as long as there is a new review
+  comment. Prints the created `mr_rework` run.
 
 ### Schedules — time-driven runs
 

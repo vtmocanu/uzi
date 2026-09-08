@@ -207,6 +207,17 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 	// "inherit" (nil → follow the owner's account default), "on" or "off". An always-present
 	// row keeps "inherit" distinguishable from an old CLI that does not know the field.
 	rows = append(rows, []string{"MR_REWORK", triStateStr(r.MrReworkEnabled)})
+	// MR_REWORK_CYCLES is the OWNER-ONLY automatic-rework ledger view (PRD #1202): cycles
+	// spent / the live admin cap, with " (stopped)" once the cap is reached (on-demand
+	// rework is how the owner reworks past it). Rendered ONLY when BOTH fields are present,
+	// so an old server that omits them keeps the old output (no row).
+	if r.MrReworkAutoCycles != nil && r.MrReworkAutoCap != nil {
+		cycles := fmt.Sprintf("%d/%d", *r.MrReworkAutoCycles, *r.MrReworkAutoCap)
+		if *r.MrReworkAutoCycles >= *r.MrReworkAutoCap {
+			cycles += " (stopped)"
+		}
+		rows = append(rows, []string{"MR_REWORK_CYCLES", cycles})
+	}
 	if err := p.Table(nil, rows); err != nil {
 		return err
 	}

@@ -98,6 +98,7 @@ uzi run follow-up <id> [--message <text>]
 uzi run answer <id> [--message <text> ...]
 uzi run inputs <id> [--json]
 uzi run expedite <id> [--clear]
+uzi run rework <id> [-m|--message <text>]
 uzi schedule create --repo <id> [--repo <id> ...] (--issue <iid> | --sweep [--label <l> ...] [--create-missing-labels] | --prompt <text>)
                     (--at <rfc3339> | --cron <expr>) [--tz <iana>]
                     [--auto-approve[=false]] [--wait-on-limit[=false]]
@@ -451,6 +452,17 @@ A few worth knowing:
   to its kind default priority (it does **not** demote it below normal). It
   prints the updated run; `--json` emits the run object, whose `priority` reads
   `expedited` after a bump.
+- **`run rework <id>`** starts ONE on-demand MR-rework cycle on a **completed**
+  run whose MR is open, past the automatic cap — the way to rework an MR after the
+  automatic watcher has stopped. It skips the cap, the quiet-period debounce, the
+  head-SHA staleness check and the green-pipeline gate, but keeps the branch guard,
+  the one-active-rework guard, the admin kill-switch, the owner token and the open-MR
+  requirement; the cycle does **not** count against the automatic cap. A
+  foreign/unknown run is not found (exit 4) and a refusal (disabled, not reworkable,
+  already running, or nothing new to rework) is a conflict (exit 5). `-m`/`--message`
+  carries optional guidance (or pipe it on stdin); an empty guidance is a valid
+  trigger as long as there is a new review comment. It prints the created `mr_rework`
+  run; `--json` emits the `{"run": ...}` envelope, like `run create`.
 - **A message's content is under `payload`, not `body` or `content`.** Each
   `--json` line carries the text under `payload` (raw per-kind JSON); there is no
   `body`/`content` field, so reading either returns empty — indistinguishable from
