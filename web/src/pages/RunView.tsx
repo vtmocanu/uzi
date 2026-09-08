@@ -1312,9 +1312,16 @@ export function RunView() {
                   Issue #754: `pool_wait` is excluded for the SAME reason as limit_wait —
                   it is a self-resuming hold (blocked on a pooled token, resumes on its
                   own hours later), so a green "live" chip beside its amber wait pill is
-                  the same false all-clear. The two self-resuming holds are excluded; the
-                  needs-you gates keep the chip. */}
-              {!terminal && run.status !== "limit_wait" && run.status !== "pool_wait" && (
+                  the same false all-clear.
+
+                  PRD #1190: `paused` is excluded too. A paused run is a DELIBERATE hold
+                  the owner placed — nothing runs, nothing is spent, and the header reads
+                  "‖ paused · clock stopped". A green "live" chip beside that is the same
+                  false all-clear: it is not a self-resuming clock park like the two
+                  above, but it is equally not the running go-signal the chip promises,
+                  and (like the holds) it can sit for a long time. The self-resuming holds
+                  AND a user pause are excluded; the needs-you gates keep the chip. */}
+              {!terminal && run.status !== "limit_wait" && run.status !== "pool_wait" && run.status !== "paused" && (
                 <span
                   title={connected ? "Live" : "Reconnecting…"}
                   className={cx(

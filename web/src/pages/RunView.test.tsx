@@ -1332,6 +1332,50 @@ describe("RunView — paused header: Resume + pending-pause chip (PRD #1190)", (
     expect(chip.className).not.toContain("animate-pulse");
     expect(chip.querySelector(".animate-pulse")).toBeNull();
   });
+
+  // PRD #1190 Fix 1 (web-ux F2, extending #35/#754): the green "● live" chip is a running
+  // go-signal, so it must NOT render on a paused run — beside "‖ paused · clock stopped" it
+  // is a false all-clear, the very reason limit_wait and pool_wait already exclude it. The
+  // "Live" title is unique to that chip (the stage/health chips carry none), so its absence
+  // is a meaningful miss, paired with the running-run positive control below so the
+  // assertion cannot pass vacuously.
+  it("does NOT render the 'live' chip on a paused run (a false go-signal beside '‖ paused')", async () => {
+    renderPage(PAUSED, true);
+    await screen.findByText("Add rate limiting");
+    expect(screen.queryByTitle("Live")).toBeNull();
+    // The clock-stopped elapsed is still there — the run is legitimately not live.
+    expect(screen.getByText(/clock stopped/i)).toBeTruthy();
+  });
+
+  it("DOES render the 'live' chip on a running run (the positive control for the exclusion)", async () => {
+    renderPage({ status: "running", started_at: "2026-01-01T00:00:00Z" }, true);
+    await screen.findByText("Add rate limiting");
+    expect(screen.getByTitle("Live")).toBeTruthy();
+  });
+
+  // PRD #1190 Fix 2/3: a paused run keeps SteerQueueCard with parked=true, MATCHING the
+  // limit_wait pattern (RunView renders SteerQueueCard unconditionally; on limit_wait both
+  // LimitWaitPanel and the card carry a "Stop run"). So the paused page is DELIBERATELY a
+  // panel/card split, not a single action surface, and this documents the PRD-intended
+  // pairs rather than de-duplicating them:
+  //   - TWO Resume paths — the header "▶ Resume" (D14, the Expedite pattern) + PausedPanel's
+  //     Resume. Both are PRD-spec'd.
+  //   - TWO Stop paths — PausedPanel's Stop + the card's Stop, exactly as limit_wait pairs
+  //     LimitWaitPanel's Stop with the card's Stop.
+  it("keeps the header+panel Resume pair and the panel/card Stop split, matching limit_wait", async () => {
+    renderPage(PAUSED, true);
+    await screen.findByText("Add rate limiting");
+    expect(screen.getAllByRole("button", { name: /resume/i })).toHaveLength(2);
+    expect(screen.getAllByRole("button", { name: /stop run/i })).toHaveLength(2);
+  });
+
+  it("still offers the follow-up composer on a paused run, with the QUEUED (not 'resumes') copy", async () => {
+    renderPage(PAUSED, true);
+    await screen.findByText("Add rate limiting");
+    const box = screen.getByPlaceholderText(/send a follow-up message/i) as HTMLTextAreaElement;
+    expect(box.placeholder).toContain("queued until the run resumes");
+    expect(box.placeholder).not.toContain("resumes the agent as its next turn");
+  });
 });
 
 // PRD #1190: the PausedPanel, mounted directly (it is exported, like LimitWaitPanel) so its

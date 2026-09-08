@@ -363,6 +363,18 @@ describe("SteerQueueCard — the composer does not promise resumption on a parke
     expect(placeholder()).not.toContain("resumes the agent as its next turn");
   });
 
+  // PRD #1190: a `paused` run is the same kind of hold as limit_wait/pool_wait from the
+  // composer's side — nothing runs until Resume, so a follow-up sent here is NOT the next
+  // turn; it is queued until the run resumes. The "resumes the agent" placeholder would be
+  // the opposite of what happens (the very false promise limit_wait fixed).
+  it("says QUEUED on a paused run too, never that it resumes the agent", () => {
+    render(
+      <SteerQueueCard inputs={[]} terminal={false} status="paused" busy={false} onStop={noop} onSend={noop} />,
+    );
+    expect(placeholder()).toContain("queued until the run resumes");
+    expect(placeholder()).not.toContain("resumes the agent as its next turn");
+  });
+
   it("leaves the copy untouched on a live run", () => {
     render(
       <SteerQueueCard inputs={[]} terminal={false} status="running" busy={false} onStop={noop} onSend={noop} />,
