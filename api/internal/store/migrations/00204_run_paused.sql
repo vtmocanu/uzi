@@ -16,10 +16,13 @@
 -- omits 'pool_wait', so it is NOT the source of truth). 'paused' is a NON-TERMINAL hold,
 -- like limit_wait/pool_wait/awaiting_input/awaiting_followup.
 ALTER TABLE runs DROP CONSTRAINT IF EXISTS runs_status_check;
+-- Added NOT VALID: skip the validating table scan (and the ACCESS EXCLUSIVE lock it would
+-- otherwise hold to check every existing row) at add-time; new/updated rows are still
+-- enforced. 00205 runs VALIDATE CONSTRAINT to confirm the backlog under a lock-cheap scan.
 ALTER TABLE runs ADD CONSTRAINT runs_status_check
     CHECK (status IN ('queued', 'claimed', 'running', 'awaiting_approval', 'awaiting_input',
                       'limit_wait', 'completed', 'failed', 'cancelled', 'awaiting_followup',
-                      'pool_wait', 'paused'));
+                      'pool_wait', 'paused')) NOT VALID;
 
 -- A PENDING pause is a FLAG on a still-running run, not a status (Decision 3): the run
 -- stays 'running' and these three columns carry the request until the worker parks at its
@@ -46,8 +49,10 @@ ALTER TABLE runs ADD COLUMN IF NOT EXISTS checkpoint_tip_at timestamptz;
 -- list from anything but the live constraint silently deletes whatever it forgets (00092
 -- documents exactly that failure).
 ALTER TABLE run_user_inputs DROP CONSTRAINT IF EXISTS run_user_inputs_kind_check;
+-- Added NOT VALID: same as runs_status_check above — skip the validating table scan (and the
+-- ACCESS EXCLUSIVE lock) at add-time; 00205 validates the backlog under a lock-cheap scan.
 ALTER TABLE run_user_inputs ADD CONSTRAINT run_user_inputs_kind_check
-    CHECK (kind IN ('follow_up', 'approve_plan', 'reject_plan', 'cancel', 'revise_plan', 'answer', 'stop', 'scope', 'pause', 'pause_cancel', 'resume'));
+    CHECK (kind IN ('follow_up', 'approve_plan', 'reject_plan', 'cancel', 'revise_plan', 'answer', 'stop', 'scope', 'pause', 'pause_cancel', 'resume')) NOT VALID;
 
 -- slack_run_messages.park_kind: which park the marker recorded, so the resume line can be
 -- worded honestly ('paused' → "▶️ Resumed", 'limit_wait'/NULL → "▶️ Resumed · usage limit

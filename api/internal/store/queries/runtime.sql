@@ -1499,6 +1499,13 @@ RETURNING id, user_id, status;
 -- surfaces as 409 / applied=false. Re-delivery is idempotent, and the worker's cleanup
 -- carve-out keys off the RETURNED status, so a refused park cleans up rather than leaking.
 --
+-- THE PENDING-REQUEST GUARD (pause_requested_at IS NOT NULL) is the entry-side analog of
+-- ADR-1190 I3's <> 'paused' stale-report guards on SetRunRunning/SetRunAwaitingApproval: a
+-- delayed 'paused' report must not park a run whose pending request was already CLEARED — by a
+-- CancelPauseInput withdrawal, the pause_failed ClearPauseRequest, or a terminal transition —
+-- between the worker deciding to park and this UPDATE landing. Without it a withdrawn pause
+-- could still park the run on the in-flight report; with it that report is a 0-row no-op.
+--
 -- The pending-pause columns are CLEARED here — the request has now been CONSUMED (the run
 -- reached the park it asked for), so nothing re-arms the ACK after a resume. This is one of
 -- the four sites that clear them (with CancelPauseInput on withdrawal, ClearPauseRequest on a
@@ -1520,7 +1527,8 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
 WHERE id = @id AND worker_id = @worker_id
-  AND status = 'running';
+  AND status = 'running'
+  AND pause_requested_at IS NOT NULL;
 
 -- name: ResumePausedRun :one
 -- Owner-scoped resume of ONE paused run (PRD #1190 M1): paused -> queued, the on-demand

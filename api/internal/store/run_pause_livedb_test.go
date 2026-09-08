@@ -165,13 +165,15 @@ func TestRunPauseQueriesLiveDB(t *testing.T) {
 
 	// --- SetRunPaused source + worker guards ----------------------------------
 	t.Run("SetRunPaused refuses a non-running run and a foreign worker", func(t *testing.T) {
-		// Wrong status.
-		queued := insertRun(t, "queued", "issue", false, true, false, 0, "", 0)
+		// Wrong status. The pause columns are ARMED so the ONLY reason SetRunPaused refuses is
+		// the status guard, not the new pause_requested_at IS NOT NULL guard (test is otherwise
+		// vacuous now that a NULL request also produces a 0-row no-op).
+		queued := insertRun(t, "queued", "issue", false, true, false, 0, "milestone", 2)
 		if rows, err := q.SetRunPaused(ctx, store.SetRunPausedParams{ID: queued, WorkerID: workerID}); err != nil || rows != 0 {
 			t.Fatalf("SetRunPaused on queued run = (%d,%v), want (0,nil)", rows, err)
 		}
-		// Foreign worker on a running run.
-		running := insertRun(t, "running", "issue", false, true, false, 0, "", 0)
+		// Foreign worker on a running run — pause columns ARMED so only the worker guard refuses.
+		running := insertRun(t, "running", "issue", false, true, false, 0, "milestone", 2)
 		foreign := pgtype.UUID{Bytes: uuid.New(), Valid: true}
 		if rows, err := q.SetRunPaused(ctx, store.SetRunPausedParams{ID: running, WorkerID: foreign}); err != nil || rows != 0 {
 			t.Fatalf("SetRunPaused with foreign worker = (%d,%v), want (0,nil)", rows, err)
@@ -189,6 +191,42 @@ func TestRunPauseQueriesLiveDB(t *testing.T) {
 		}
 		if at, mode, after := pauseCols(t, set); at.Valid || mode.Valid || after.Valid {
 			t.Fatal("SetRunPaused must clear the pending-pause columns")
+		}
+	})
+
+	// --- SetRunPaused requires an active pending pause request ----------------
+	// PRD #1190 finding [2] (ADR-1190 I3 entry-side analog): a delayed 'paused' report must not
+	// park a run whose pending request was already CLEARED between the worker deciding to park
+	// and the UPDATE landing — a CancelPauseInput withdrawal, the pause_failed ClearPauseRequest,
+	// or a terminal transition. So SetRunPaused now also guards on pause_requested_at IS NOT NULL.
+	t.Run("SetRunPaused requires a pending pause request", func(t *testing.T) {
+		// Running under the correct worker, but the pending pause was withdrawn (columns cleared,
+		// e.g. by CancelPauseInput) before this delayed park report landed: a 0-row no-op that
+		// leaves the run running, exactly as a stale park should.
+		id := insertRun(t, "running", "issue", false, true, false, 0, "milestone", 2)
+		if _, err := q.CancelPauseInput(ctx, id); err != nil {
+			t.Fatalf("CancelPauseInput to withdraw the pending pause: %v", err)
+		}
+		if at, _, _ := pauseCols(t, id); at.Valid {
+			t.Fatal("precondition: CancelPauseInput must clear pause_requested_at")
+		}
+		if rows, err := q.SetRunPaused(ctx, store.SetRunPausedParams{ID: id, WorkerID: workerID}); err != nil || rows != 0 {
+			t.Fatalf("SetRunPaused with no pending request = (%d,%v), want (0,nil)", rows, err)
+		}
+		if status(t, id) != "running" {
+			t.Fatal("SetRunPaused must not park a run whose pending pause was withdrawn")
+		}
+		// Mutation-style control: re-arm the request via CreatePauseInput on the SAME running run
+		// and the next park report parks it (1 row), proving the no-op above is the pending-request
+		// guard, not some unrelated refusal.
+		if _, err := q.CreatePauseInput(ctx, store.CreatePauseInputParams{ID: id, Mode: pgconvText("now")}); err != nil {
+			t.Fatalf("CreatePauseInput to re-arm the request: %v", err)
+		}
+		if rows, err := q.SetRunPaused(ctx, store.SetRunPausedParams{ID: id, WorkerID: workerID}); err != nil || rows != 1 {
+			t.Fatalf("SetRunPaused with a pending request = (%d,%v), want (1,nil)", rows, err)
+		}
+		if status(t, id) != "paused" {
+			t.Fatal("SetRunPaused must park a run that has a pending pause request")
 		}
 	})
 
