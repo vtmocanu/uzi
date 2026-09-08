@@ -50,6 +50,15 @@ export function GroupRow({
 }) {
   const [expanded, setExpanded] = useState(false);
   const [filing, setFiling] = useState(false);
+  // Local just-filed override: the issue a Create click produced plus fileIssue's `warning`.
+  // fileIssue's `warning` is a created-with-warning SUCCESS — the forge issue WAS created, only
+  // its local link/cache could not settle — set EXACTLY when the link did not settle, so the
+  // backlog refetch below then OMITS the coordinate, the row stays in the `todo` bucket, and
+  // File issue would re-arm against a forge issue that already exists (a silent duplicate).
+  // This override keeps the "Filed #N" chip and the warning on the row regardless, while the
+  // settled refetch still reconciles a link that DID settle. Survives onFiled's in-place reload
+  // (the row keeps its coordKey key).
+  const [justFiled, setJustFiled] = useState<{ iid: number; web_url: string; warning: string } | null>(null);
   const openCount = group.open_count;
   // The group's newest OPEN occurrence: the first occurrence bucketed "todo" in the grouper's
   // wire order, which the backlog query sorts rv.updated_at DESC, so it is the newest review.
@@ -75,7 +84,13 @@ export function GroupRow({
               </code>
             )}
             <span className="text-xs text-faint">{seenInRunsLabel(group.run_count)}</span>
-            {group.bucket !== "todo" && <TriageStateChip state={rollupState(group.bucket)} />}
+            {/* The local just-filed override wins and shows the "Filed #N" link chip; otherwise
+                the group rollup chip (never rendered for a still-`todo` group). */}
+            {justFiled ? (
+              <TriageStateChip state="filed" filed={{ issue_iid: justFiled.iid, issue_url: justFiled.web_url }} />
+            ) : (
+              group.bucket !== "todo" && <TriageStateChip state={rollupState(group.bucket)} />
+            )}
             {openCount > 0 && <span className="text-xs text-faint">{openCount} open</span>}
           </div>
           {group.rationale_preview.trim() !== "" && (
@@ -83,13 +98,19 @@ export function GroupRow({
               {stripUnsafeChars(group.rationale_preview)}
             </p>
           )}
+          {/* The created-with-warning line, under the chip (same style as FindingCard): the
+              issue exists on the forge, only its local link/cache did not settle. */}
+          {justFiled?.warning && <p className="mt-1 text-xs text-muted">{justFiled.warning}</p>}
         </div>
         <div className="flex shrink-0 items-center gap-1.5">
           {/* Delegated mode: an absent handler hides its button, so a group with no open
               member (scope=open would settle nothing) shows no action, matching the old
               GroupDisposeControls that returned null when disabled. */}
           <TriageActions
-            onFile={canAct && newestOpen ? () => setFiling(true) : undefined}
+            // Once this coordinate is filed — locally (justFiled, incl. the created-with-warning
+            // case) — File issue is withdrawn so it never re-arms over a live forge issue; Mark
+            // done and Dismiss stay available.
+            onFile={!justFiled && canAct && newestOpen ? () => setFiling(true) : undefined}
             onMarkDone={canAct ? () => onDispose("done") : undefined}
             onDismiss={canAct ? (reason) => onDispose("dismissed", reason) : undefined}
           />
@@ -125,11 +146,14 @@ export function GroupRow({
               };
             }}
             onCreate={async (values) => {
-              await api.fileIssue(newestOpen.run_id, newestOpen.rec_id, {
+              const res = await api.fileIssue(newestOpen.run_id, newestOpen.rec_id, {
                 repo_id: values.repoId,
                 title: values.title,
                 description: values.description,
               });
+              // Record the created issue + any warning locally so the row reflects the filing
+              // even when the refetch below does not settle the link (created-with-warning).
+              setJustFiled({ iid: res.issue.iid, web_url: res.issue.web_url, warning: res.warning ?? "" });
               setFiling(false);
               onFiled();
             }}

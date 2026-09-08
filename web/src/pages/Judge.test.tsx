@@ -1226,6 +1226,37 @@ describe("Judge — File issue on the group row (PRD #1183, folded from Occurren
     await waitFor(() => expect(mockApi.getJudgeBacklog).toHaveBeenCalledTimes(2));
   });
 
+  // Folds in the deleted OccurrenceFileIssue.test's "created-with-warning is a success, not a
+  // retry signal" coverage. fileIssue's `warning` marks a created-with-warning SUCCESS: the
+  // forge issue exists but its local link/cache could not settle, so it is set EXACTLY when the
+  // backlog refetch will still return the group in `todo` (the coordinate never reaches the
+  // `filed` rung). The row must NOT fall back to To triage and re-arm File issue over a live
+  // forge issue — a duplicate — so a local just-filed override keeps "Filed #N" + the warning up.
+  it("keeps the created issue + its warning on the row when the refetch does not settle the link (created-with-warning)", async () => {
+    // Every getJudgeBacklog returns the still-`todo` mixedGroup: the link never settles.
+    mockApi.getJudgeBacklog.mockResolvedValue(backlog({ groups: [mixedGroup()], triage: mixedTriage }));
+    mockApi.getIssueDraft.mockResolvedValue({ draft: draftFixture() });
+    mockApi.fileIssue.mockResolvedValue({
+      issue: { iid: 71, web_url: "https://forge.example/71", title: "t" },
+      warning: "Issue created, but its local link could not be saved.",
+    });
+    renderJudge();
+    await waitFor(() => expect(screen.getByText("api/internal/poller")).toBeTruthy());
+
+    fireEvent.click(screen.getByRole("button", { name: "File issue" }));
+    fireEvent.click(await screen.findByText("Create issue"));
+
+    // (a) the "Filed #N ↗" link chip renders on the row from the local override.
+    const link = await screen.findByRole("link", { name: /Filed #71/ });
+    expect(link.getAttribute("href")).toBe("https://forge.example/71");
+    // (b) the created-with-warning line renders under the chip.
+    expect(
+      screen.getByText("Issue created, but its local link could not be saved."),
+    ).toBeTruthy();
+    // (c) File issue does NOT reappear — no duplicate invitation over a live issue.
+    expect(screen.queryByRole("button", { name: "File issue" })).toBeNull();
+  });
+
   it("keeps the draft open with the user's edits when the forge rejects the create", async () => {
     mockApi.getJudgeBacklog.mockResolvedValue(backlog({ groups: [mixedGroup()], triage: mixedTriage }));
     mockApi.getIssueDraft.mockResolvedValue({ draft: draftFixture() });

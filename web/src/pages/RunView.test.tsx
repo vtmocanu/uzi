@@ -2927,6 +2927,49 @@ describe("JudgePanel (PRD #46 M4)", () => {
     expect(screen.queryByText("File issue")).toBeNull();
   });
 
+  it("keeps the created issue + its warning up when the refetch does not settle the link (created-with-warning)", async () => {
+    // fileIssue's `warning` is a created-with-warning SUCCESS: the forge issue WAS created, only
+    // its local link/cache could not settle, so it is set EXACTLY when the review refetch will
+    // NOT carry the filed link. Every getRunReview here returns the UNFILED review (the link
+    // never settles). Without the local just-filed override the row would fall back to "To
+    // triage" and re-arm File issue over a live forge issue (a silent duplicate); the override
+    // keeps "Filed #N" + the warning on screen and withholds File issue.
+    mockApi.getRunReview.mockResolvedValue({ review: review(), pending_judge: null });
+    mockApi.listRepos.mockResolvedValue({
+      repos: [repoOpt("repo1", "vtmocanu/uzi")],
+    });
+    mockApi.getIssueDraft.mockResolvedValue({ draft: draftFixture() });
+    mockApi.fileIssue.mockResolvedValue({
+      issue: {
+        iid: 71,
+        web_url: "https://gitlab.example/vtmocanu/uzi/-/issues/71",
+        title: "t",
+      },
+      warning: "Issue created, but its local link could not be saved.",
+    });
+    render(<JudgePanel run={run({ status: "completed" })} />);
+
+    fireEvent.click(await screen.findByText("File issue"));
+    fireEvent.click(await screen.findByText("Create issue"));
+    expect(mockApi.fileIssue).toHaveBeenCalledWith("r1", "rc1", {
+      repo_id: "repo1",
+      title: "Improve the reviewer: reviewer",
+      description: draftFixture().description,
+    });
+
+    // (a) the "Filed #N ↗" chip/link renders from the local override, not the refetch.
+    const link = await screen.findByRole("link", { name: /Filed #71/ });
+    expect(link.getAttribute("href")).toBe(
+      "https://gitlab.example/vtmocanu/uzi/-/issues/71",
+    );
+    // (b) the created-with-warning line renders under the chip.
+    expect(
+      screen.getByText("Issue created, but its local link could not be saved."),
+    ).toBeTruthy();
+    // (c) File issue does NOT reappear — no duplicate invitation over a live issue.
+    expect(screen.queryByText("File issue")).toBeNull();
+  });
+
   it("disables Create until a repo is picked when no default resolves (state D)", async () => {
     mockApi.getRunReview.mockResolvedValue({ review: review(), pending_judge: null });
     mockApi.listRepos.mockResolvedValue({

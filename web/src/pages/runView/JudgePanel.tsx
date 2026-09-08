@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   api,
   ApiError,
+  type CreatedIssue,
   type Disposition,
   type FiledIssue,
   type PendingJudge,
@@ -31,6 +32,19 @@ import { IssueDraftCard, type IssueDraftSeed, type IssueDraftValues } from "../.
 // the row (PRD #1183). Comma form, no dashes, per the vocabulary contract.
 const STALE_FILED_WARNING =
   "Filed for an earlier version of this recommendation, re-running the judge changed it since.";
+
+// JustFiled is the run page's minimal local filed override, re-introduced from the pre-#1183
+// RecommendationFiler after M2 dropped it for a pure refetch. It carries the issue a Create
+// click just produced plus fileIssue's `warning`, and is kept per coordinate so a filed
+// recommendation ALWAYS shows "Filed #N" and its warning even when the review refetch did not
+// settle the link. `warning` is a SUCCESS signal — the forge issue WAS created, only its local
+// link/cache could not settle — set EXACTLY when the link did not settle, so without this
+// override the refetched review omits the coordinate, the row falls back to "To triage",
+// File issue re-arms, and the user is silently invited to file a DUPLICATE. The settled
+// refetch reconciles the rest through filedByCoord; this only guarantees the created issue
+// and its warning are shown. Separate from STALE_FILED_WARNING (filed_at < review.updated_at),
+// which is a different signal and stays untouched.
+type JustFiled = { iid: number; web_url: string; warning: string };
 
 // JUDGE_STAT_K is the tile label class, mirroring RunUsage.tsx's K_CLASS so the judge
 // strip reads identically to the run's own usage strip.
@@ -108,6 +122,10 @@ export function JudgePanel({
   // The caller's connected repos back the file-issue draft picker (PRD #68 M4). Fetched
   // once for the panel; a failure just leaves the picker empty (the draft still opens).
   const [repos, setRepos] = useState<Repo[]>([]);
+  // Local just-filed overrides keyed by coordinate (see JustFiled): a coordinate whose file
+  // succeeded but whose link did not settle server-side still shows "Filed #N" and its warning
+  // here, so the refetch that omits it can never re-arm File issue against a live forge issue.
+  const [justFiled, setJustFiled] = useState<Map<string, JustFiled>>(new Map());
   // The updated_at of the verdict CURRENTLY ON SCREEN (null when there is none). The poll
   // below compares each response against it to decide whether a NEWER verdict arrived and
   // the panel should swap to it.
@@ -497,8 +515,13 @@ export function JudgePanel({
           {review.recommendations.length > 0 ? (
             <ul className="space-y-2">
               {review.recommendations.map((rec) => {
-                const disp = dispByCoord.get(coordKey(rec.category, rec.target));
-                const filed = filedByCoord.get(coordKey(rec.category, rec.target));
+                const ck = coordKey(rec.category, rec.target);
+                const disp = dispByCoord.get(ck);
+                const filed = filedByCoord.get(ck);
+                // The local just-filed override for this coordinate (see JustFiled): present
+                // once a Create click resolved, it keeps the filed chip and any warning on
+                // screen when the refetch has not (or could not) settle the link.
+                const jf = justFiled.get(ck);
                 // Collapse-dismissed: hide a dismissed row while the toggle is off.
                 if (!showDismissed && disp?.status === "dismissed") return null;
                 // A filed LINK is stale when it predates the current review revision — a
@@ -525,7 +548,15 @@ export function JudgePanel({
                         className="ml-auto flex flex-wrap items-center gap-2"
                         title={staleFiled ? STALE_FILED_WARNING : undefined}
                       >
-                        {filed && <TriageStateChip state="filed" filed={filed} />}
+                        {/* Settled link wins; the local just-filed override is the fallback
+                            that keeps "Filed #N" up when the refetch did not settle it. */}
+                        {filed ? (
+                          <TriageStateChip state="filed" filed={filed} />
+                        ) : (
+                          jf && (
+                            <TriageStateChip state="filed" filed={{ issue_iid: jf.iid, issue_url: jf.web_url }} />
+                          )
+                        )}
                         {disp ? (
                           disp.status === "done" ? (
                             <TriageStateChip state="done" />
@@ -536,11 +567,14 @@ export function JudgePanel({
                             />
                           )
                         ) : (
-                          !filed && <TriageStateChip state="to_triage" />
+                          !filed && !jf && <TriageStateChip state="to_triage" />
                         )}
                       </span>
                     </div>
                     {staleFiled && <p className="mt-1 text-xs text-faint">{STALE_FILED_WARNING}</p>}
+                    {/* The created-with-warning line, under the chip (same style as FindingCard):
+                        the issue exists on the forge, only its local link/cache did not settle. */}
+                    {jf?.warning && <p className="mt-1 text-xs text-muted">{jf.warning}</p>}
                     {rec.rationale_md.trim() !== "" && (
                       <div className="judge-prose mt-1.5">
                         <Markdown content={stripUnsafeChars(rec.rationale_md)} />
@@ -551,8 +585,14 @@ export function JudgePanel({
                       rec={rec}
                       disp={disp}
                       filed={filed}
+                      justFiled={jf}
                       repos={repos}
                       onChanged={fetchReview}
+                      onJustFiled={(issue, warning) =>
+                        setJustFiled((prev) =>
+                          new Map(prev).set(ck, { iid: issue.iid, web_url: issue.web_url, warning }),
+                        )
+                      }
                       onError={setActionErr}
                     />
                   </li>
@@ -603,16 +643,20 @@ function RecommendationTriage({
   rec,
   disp,
   filed,
+  justFiled,
   repos,
   onChanged,
+  onJustFiled,
   onError,
 }: {
   runId: string;
   rec: ReviewRecommendation;
   disp?: Disposition;
   filed?: FiledIssue;
+  justFiled?: JustFiled;
   repos: Repo[];
   onChanged: () => Promise<void>;
+  onJustFiled: (issue: CreatedIssue, warning: string) => void;
   onError: (msg: string) => void;
 }) {
   const [busy, setBusy] = useState(false);
@@ -671,10 +715,13 @@ function RecommendationTriage({
     };
   };
 
-  // Create posts the existing file-issue call, then refetches (the new filed link lands in
-  // filedByCoord, flipping the chip to "Filed #N ↗" and hiding File issue) and closes the card.
+  // Create posts the existing file-issue call, records the created issue + any warning as the
+  // local just-filed override (so the coordinate shows "Filed #N" even if the link did not
+  // settle — fileIssue's `warning` is a created-with-warning success, not a retry signal),
+  // then refetches (the settled link lands in filedByCoord and takes over) and closes the card.
   const createIssue = async ({ repoId, title, description }: IssueDraftValues) => {
-    await api.fileIssue(runId, rec.id, { repo_id: repoId, title, description });
+    const res = await api.fileIssue(runId, rec.id, { repo_id: repoId, title, description });
+    onJustFiled(res.issue, res.warning ?? "");
     setDraftOpen(false);
     await onChanged();
   };
@@ -697,9 +744,11 @@ function RecommendationTriage({
         <>
           <div className="mt-2">
             <TriageActions
-              // File issue only when not already filed (once filed the chip shows the link)
-              // and not while the draft is open (the card below is the filing UI).
-              onFile={filed || draftOpen ? undefined : () => setDraftOpen(true)}
+              // File issue only when not already filed — a settled link (filed) OR the local
+              // just-filed override (justFiled, the created-with-warning case where the link did
+              // not settle) both hide it, so File never re-arms over a live forge issue — and
+              // not while the draft is open (the card below is the filing UI).
+              onFile={filed || justFiled || draftOpen ? undefined : () => setDraftOpen(true)}
               onMarkDone={() => act(() => api.setDisposition(runId, rec.id, "done"), "Marked done")}
               onDismiss={(reason) =>
                 act(
