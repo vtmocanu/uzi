@@ -1,10 +1,11 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { api, type JudgeBacklog } from "../../lib/api";
-import { verdictTrend, rollupLabel, rollupTone, seenInRunsLabel } from "../../lib/judgeBacklog";
+import { verdictTrend, seenInRunsLabel } from "../../lib/judgeBacklog";
 import { coordKey, recommendationLabel } from "../../lib/judge";
 import { stripUnsafeChars } from "../../lib/safeText";
-import { Badge, Card, cx, ListSkeleton, SectionTitle } from "../../components/ui";
+import { TriageStateChip } from "../../components/triage/TriageStateChip";
+import { Card, cx, ListSkeleton, SectionTitle } from "../../components/ui";
 
 // ZeroState is the first-class inbox-zero view (Decision 8): to-triage = 0 is the goal, so
 // the page is not blank. It fetches the bucket=all snapshot to show the recent-verdict trend
@@ -88,7 +89,9 @@ export function ZeroState({ judgeEnabled }: { judgeEnabled: boolean }) {
           <ul className="space-y-1.5">
             {settled.map((g) => (
               <li key={coordKey(g.category, g.target)} className="flex flex-wrap items-center gap-2 text-sm">
-                <Badge tone={rollupTone(g.bucket)}>{rollupLabel(g.bucket)}</Badge>
+                {/* The same shared chip GroupRow uses, so the settled examples read the one
+                    vocabulary ("✓ Done" / "Filed"). The list is filtered to done/filed above. */}
+                <TriageStateChip state={g.bucket === "done" ? "done" : "filed"} />
                 <span className="text-muted">{recommendationLabel(g.category)}</span>
                 {g.target.trim() !== "" && (
                   <code className="rounded bg-raised px-1.5 py-0.5 font-mono text-xs text-fg">

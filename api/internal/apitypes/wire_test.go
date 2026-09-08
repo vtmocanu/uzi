@@ -314,16 +314,17 @@ func TestJudgeOccurrenceDTOTags(t *testing.T) {
 	// filed_issue and set_via are both omitempty: an unfiled (or claimed-but-unsettled)
 	// occurrence omits filed_issue rather than shipping a null the consumer special-cases,
 	// and a hand-set (or absent) disposition omits set_via, which carries meaning only when
-	// present.
+	// present. judged_at is NOT omitempty (PRD #1183 M2) — it is always present, so it joins
+	// all three variants below.
 	assertTags(t, "JudgeOccurrenceDTO", JudgeOccurrenceDTO{},
-		"run_id", "run_title", "review_id", "rec_id", "verdict", "confidence", "bucket")
+		"run_id", "run_title", "review_id", "rec_id", "verdict", "confidence", "bucket", "judged_at")
 	assertTags(t, "JudgeOccurrenceDTO(filed)", JudgeOccurrenceDTO{FiledIssue: &JudgeFiledIssueRefDTO{}},
-		"run_id", "run_title", "review_id", "rec_id", "verdict", "confidence", "bucket", "filed_issue")
+		"run_id", "run_title", "review_id", "rec_id", "verdict", "confidence", "bucket", "judged_at", "filed_issue")
 	// The auto-done shape: PRD #98 Decision 6's "done via #IID" needs BOTH, since the label
 	// names the issue whose closure produced the done.
 	assertTags(t, "JudgeOccurrenceDTO(auto-done)",
 		JudgeOccurrenceDTO{SetVia: "issue_close", FiledIssue: &JudgeFiledIssueRefDTO{}},
-		"run_id", "run_title", "review_id", "rec_id", "verdict", "confidence", "bucket",
+		"run_id", "run_title", "review_id", "rec_id", "verdict", "confidence", "bucket", "judged_at",
 		"filed_issue", "set_via")
 }
 

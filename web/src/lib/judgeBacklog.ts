@@ -6,9 +6,6 @@
 // escaping alone does not touch bidi overrides (issue #124).
 
 import type {
-  BadgeTone,
-} from "../components/ui";
-import type {
   JudgeBacklogBucket,
   JudgeRecommendationGroup,
   ReviewVerdict,
@@ -70,39 +67,30 @@ export function bucketTabCount(triage: TriageCounts, bucket: JudgeBacklogBucket)
   }
 }
 
-// rollupTone tints a group's rollup badge by the #94 ladder tone: todo is a plain
-// neutral "to do", filed is info, done is ok, dismissed is muted/neutral. A group
-// rollup is never "all" (that is a filter, not a member state), but the map is total so
-// the type stays exhaustive.
-const ROLLUP_TONE: Record<JudgeBacklogBucket, BadgeTone> = {
-  todo: "neutral",
-  filed: "info",
-  done: "ok",
-  dismissed: "neutral",
-  all: "neutral",
-};
-
-export function rollupTone(bucket: JudgeBacklogBucket): BadgeTone {
-  return ROLLUP_TONE[bucket];
-}
-
-const ROLLUP_LABEL: Record<JudgeBacklogBucket, string> = {
-  todo: "To do",
-  filed: "Filed",
-  done: "Done",
-  dismissed: "Dismissed",
-  all: "All",
-};
-
-export function rollupLabel(bucket: JudgeBacklogBucket): string {
-  return ROLLUP_LABEL[bucket];
-}
+// A group's rollup state (and each occurrence's) is now rendered through the shared
+// TriageStateChip (PRD #1183): the Judge page's GroupRow and ZeroState map the wire bucket
+// onto the normalised TriageState, so the old per-surface rollupLabel/rollupTone maps have
+// no consumer and were removed rather than left as dead exports (knip gates unused value
+// exports at error).
 
 // seenInRunsLabel is the frequency evidence chip. Singular/plural so "seen in 1 run"
 // never reads wrong — a group can legitimately be a single run (it just is not deduped
-// across any yet).
+// across any yet). Still consumed by the zero-state's recently-handled list; the Judge
+// group row now reads openOfRunsLabel instead (PRD #1183 M2).
 export function seenInRunsLabel(runCount: number): string {
   return `seen in ${runCount} ${runCount === 1 ? "run" : "runs"}`;
+}
+
+// openOfRunsLabel is the Judge group row's frequency chip (PRD #1183 M2): how many of the
+// runs a coordinate recurs in still have it open. "N open of M runs" while any are open, and
+// "M runs, all settled" once none are — both plural-correct on the run count. It folds the
+// old "seen in M runs" evidence and the separate "N open" count into one honest phrase.
+export function openOfRunsLabel(open: number, runs: number): string {
+  const runNoun = runs === 1 ? "run" : "runs";
+  if (open === 0) {
+    return `${runs} ${runNoun}, all settled`;
+  }
+  return `${open} open of ${runs} ${runNoun}`;
 }
 
 // judgeBridgeLine reconciles the two count units the Judge page shows: the per-ROW
@@ -111,7 +99,7 @@ export function seenInRunsLabel(runCount: number): string {
 // supplies groupTotal from a CANONICAL uncapped source (the category-stats matrix sum), never
 // backlog.groups.length (which is capped/filtered). "all" carries no bucket adjective.
 const BRIDGE_ADJECTIVE: Record<JudgeBacklogBucket, string> = {
-  todo: "to-do ",
+  todo: "to triage ",
   filed: "filed ",
   done: "done ",
   dismissed: "dismissed ",

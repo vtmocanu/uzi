@@ -2,10 +2,9 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   api,
   ApiError,
-  isHttpsUrl,
+  type CreatedIssue,
   type Disposition,
   type FiledIssue,
-  type IssueDraft,
   type PendingJudge,
   type Repo,
   type ReviewRecommendation,
@@ -15,17 +14,37 @@ import {
 } from "../../lib/api";
 import { errorMessage } from "../../lib/apiError";
 import { coordKey, recommendationLabel, verdictLabel, verdictTone } from "../../lib/judge";
-import { useDemoMode } from "../../lib/demoMode";
-import { maskRepoPath } from "../../lib/demoMask";
 import { isJudgeEligible } from "../../lib/runKind";
 import { stripUnsafeChars } from "../../lib/safeText";
 import { useAsyncData } from "../../lib/useAsyncData";
-import { formatElapsed } from "../../lib/runBadge";
 import { formatDuration } from "../../components/RunEvent";
 import { formatTokens, formatCost } from "../../lib/formatTokens";
 import { Markdown } from "../../components/Markdown";
-import { Alert, Badge, Button, Card, Input, Select, Spinner, Textarea, cx } from "../../components/ui";
-import { ExternalLinkIcon, FileTextIcon } from "../../components/icons";
+import { Alert, Badge, Button, Card, Spinner, cx } from "../../components/ui";
+import { TriageActions } from "../../components/triage/TriageActions";
+import { TriageDisposedRow } from "../../components/triage/TriageDisposedRow";
+import { TriageStateChip } from "../../components/triage/TriageStateChip";
+import { IssueDraftCard, type IssueDraftSeed, type IssueDraftValues } from "../../components/triage/IssueDraftCard";
+
+// STALE_FILED_WARNING is the one line that survives the deleted "Issue created." box: a filed
+// link is stale when it predates the current review revision (the judge re-ran and changed the
+// recommendation after it was filed). It lands in the filed chip's title AND as a line under
+// the row (PRD #1183). Comma form, no dashes, per the vocabulary contract.
+const STALE_FILED_WARNING =
+  "Filed for an earlier version of this recommendation, re-running the judge changed it since.";
+
+// JustFiled is the run page's minimal local filed override, re-introduced from the pre-#1183
+// RecommendationFiler after M2 dropped it for a pure refetch. It carries the issue a Create
+// click just produced plus fileIssue's `warning`, and is kept per coordinate so a filed
+// recommendation ALWAYS shows "Filed #N" and its warning even when the review refetch did not
+// settle the link. `warning` is a SUCCESS signal — the forge issue WAS created, only its local
+// link/cache could not settle — set EXACTLY when the link did not settle, so without this
+// override the refetched review omits the coordinate, the row falls back to "To triage",
+// File issue re-arms, and the user is silently invited to file a DUPLICATE. The settled
+// refetch reconciles the rest through filedByCoord; this only guarantees the created issue
+// and its warning are shown. Separate from STALE_FILED_WARNING (filed_at < review.updated_at),
+// which is a different signal and stays untouched.
+type JustFiled = { iid: number; web_url: string; warning: string };
 
 // JUDGE_STAT_K is the tile label class, mirroring RunUsage.tsx's K_CLASS so the judge
 // strip reads identically to the run's own usage strip.
@@ -103,6 +122,10 @@ export function JudgePanel({
   // The caller's connected repos back the file-issue draft picker (PRD #68 M4). Fetched
   // once for the panel; a failure just leaves the picker empty (the draft still opens).
   const [repos, setRepos] = useState<Repo[]>([]);
+  // Local just-filed overrides keyed by coordinate (see JustFiled): a coordinate whose file
+  // succeeded but whose link did not settle server-side still shows "Filed #N" and its warning
+  // here, so the refetch that omits it can never re-arm File issue against a live forge issue.
+  const [justFiled, setJustFiled] = useState<Map<string, JustFiled>>(new Map());
   // The updated_at of the verdict CURRENTLY ON SCREEN (null when there is none). The poll
   // below compares each response against it to decide whether a NEWER verdict arrived and
   // the panel should swap to it.
@@ -492,10 +515,20 @@ export function JudgePanel({
           {review.recommendations.length > 0 ? (
             <ul className="space-y-2">
               {review.recommendations.map((rec) => {
-                const disp = dispByCoord.get(coordKey(rec.category, rec.target));
-                const filed = filedByCoord.get(coordKey(rec.category, rec.target));
+                const ck = coordKey(rec.category, rec.target);
+                const disp = dispByCoord.get(ck);
+                const filed = filedByCoord.get(ck);
+                // The local just-filed override for this coordinate (see JustFiled): present
+                // once a Create click resolved, it keeps the filed chip and any warning on
+                // screen when the refetch has not (or could not) settle the link.
+                const jf = justFiled.get(ck);
                 // Collapse-dismissed: hide a dismissed row while the toggle is off.
                 if (!showDismissed && disp?.status === "dismissed") return null;
+                // A filed LINK is stale when it predates the current review revision — a
+                // DIFFERENT signal from disp.stale (the disposition's own rationale-hash
+                // compare, rendered inside TriageDisposedRow). It rides the chip's title and
+                // a line under the row, replacing the deleted "Issue created." box's warning.
+                const staleFiled = filed !== undefined && new Date(filed.filed_at) < new Date(review.updated_at);
                 return (
                   <li key={rec.id} className="rounded-lg border border-edge bg-raised/40 px-3 py-2.5">
                     <div className="flex flex-wrap items-center gap-2">
@@ -506,34 +539,60 @@ export function JudgePanel({
                         </code>
                       )}
                       {rec.confidence && <span className="text-xs text-faint">{rec.confidence} confidence</span>}
-                      <span className="ml-auto">
-                        <DispositionChip disp={disp} filedSettled={filed !== undefined} />
+                      {/* The one triage ladder, via TriageStateChip. A disposition (done/
+                          dismissed) wins the primary chip, but an already-filed link is kept
+                          BESIDE it so a filed-then-done row still shows its issue link
+                          (Resolved Q: file then later mark done). To-triage is the open default
+                          only when neither a disposition nor a filed link exists. */}
+                      <span
+                        className="ml-auto flex flex-wrap items-center gap-2"
+                        title={staleFiled ? STALE_FILED_WARNING : undefined}
+                      >
+                        {/* Settled link wins; the local just-filed override is the fallback
+                            that keeps "Filed #N" up when the refetch did not settle it. */}
+                        {filed ? (
+                          <TriageStateChip state="filed" filed={filed} />
+                        ) : (
+                          jf && (
+                            <TriageStateChip state="filed" filed={{ issue_iid: jf.iid, issue_url: jf.web_url }} />
+                          )
+                        )}
+                        {disp ? (
+                          disp.status === "done" ? (
+                            <TriageStateChip state="done" />
+                          ) : (
+                            <TriageStateChip
+                              state="dismissed"
+                              reason={disp.reason === "not_an_issue" ? "not_an_issue" : "wont_do"}
+                            />
+                          )
+                        ) : (
+                          !filed && !jf && <TriageStateChip state="to_triage" />
+                        )}
                       </span>
                     </div>
+                    {staleFiled && <p className="mt-1 text-xs text-faint">{STALE_FILED_WARNING}</p>}
+                    {/* The created-with-warning line, under the chip (same style as FindingCard):
+                        the issue exists on the forge, only its local link/cache did not settle. */}
+                    {jf?.warning && <p className="mt-1 text-xs text-muted">{jf.warning}</p>}
                     {rec.rationale_md.trim() !== "" && (
                       <div className="judge-prose mt-1.5">
                         <Markdown content={stripUnsafeChars(rec.rationale_md)} />
                       </div>
                     )}
-                    {/* A settled disposition (done/dismissed) hides the create-issue
-                        affordance (File / draft) but NOT an already-filed link: a rec that
-                        was filed and then marked done keeps both facts visible (Resolved Q:
-                        "you can file then later mark done"). RecommendationFiler renders the
-                        filed-issue link regardless, and `actionHidden` suppresses only the
-                        create action once a disposition exists. */}
-                    <RecommendationFiler
+                    <RecommendationTriage
                       runId={run.id}
                       rec={rec}
-                      filed={filed}
-                      reviewUpdatedAt={review.updated_at}
-                      repos={repos}
-                      actionHidden={disp !== undefined}
-                    />
-                    <DispositionControls
-                      runId={run.id}
-                      recId={rec.id}
                       disp={disp}
+                      filed={filed}
+                      justFiled={jf}
+                      repos={repos}
                       onChanged={fetchReview}
+                      onJustFiled={(issue, warning) =>
+                        setJustFiled((prev) =>
+                          new Map(prev).set(ck, { iid: issue.iid, web_url: issue.web_url, warning }),
+                        )
+                      }
                       onError={setActionErr}
                     />
                   </li>
@@ -561,358 +620,67 @@ export function JudgePanel({
   );
 }
 
-// JustFiled is the local filed state after a successful Create click (mock C), so the row
-// flips without re-fetching the review. warning carries a created-with-warning message
-// (the issue exists on the forge but its local link/cache could not be settled).
-type JustFiled = { iid: number; web_url: string; warning?: string };
-
-// RecommendationFiler is the per-recommendation File-issue affordance (PRD #68 M4): the
-// idle button (mock A), the ProposalCard-shaped inline draft (mock B / no-default D /
-// forge-error E), and the filed row (mock C, from a server link OR a just-filed local
-// one). Every draft field is INERT text like ProposalCard — title/description render in an
-// editable control, never through Markdown, and the load-bearing sanitizer re-runs
-// server-side at the POST. The draft shows RAW markdown (no rendered preview) by design.
-function RecommendationFiler({
+// RecommendationTriage is the per-recommendation triage area on the run page (PRD #1183):
+// the shared TriageActions row (File issue · Mark done · Dismiss ▾) while the coordinate is
+// open, or TriageDisposedRow (resolved Xh ago · the server stale badge · Undo) once a
+// disposition exists, with IssueDraftCard opening BELOW the row on File issue. It replaces
+// the old lone-orange RecommendationFiler + DispositionControls pair and the "Issue created."
+// box (the filed state is now the "Filed #N ↗" chip in the row's state slot).
+//
+// This is the OWNED mutation mode: each handler does the optimistic api call, then the
+// single-row refetch (onChanged) so the triage bar, chips and stale flag re-read from the
+// server (never re-derived in TS), sets the live-region message, and arms the successor-focus
+// move onto whichever control just mounted (the disposed row's Undo, or — after an Undo — the
+// action row's first button).
+//
+// LIVE-REGION FIX (PRD #1183 review carry-forward): the sr-only region is hosted HERE, OUTSIDE
+// the disp/no-disp branch, so a "Marked done" / "Dismissed" / "Undone" announcement survives
+// the TriageActions→TriageDisposedRow swap that unmounts TriageActions the instant the message
+// is set. TriageActions is told the caller hosts the region (callerHostsLiveRegion) so it
+// renders no second, doomed one; the delegated-mode callers keep TriageActions' own region.
+function RecommendationTriage({
   runId,
   rec,
-  filed,
-  reviewUpdatedAt,
-  repos,
-  actionHidden = false,
-}: {
-  runId: string;
-  rec: ReviewRecommendation;
-  filed?: FiledIssue;
-  reviewUpdatedAt: string;
-  repos: Repo[];
-  // A disposed row suppresses the create-issue affordance (the "File issue" button and
-  // its draft) while STILL showing an existing filed link below — so a filed-then-done
-  // rec keeps its clickable issue link but offers no way to file a second issue.
-  actionHidden?: boolean;
-}) {
-  const demo = useDemoMode();
-  const [open, setOpen] = useState(false);
-  const [draft, setDraft] = useState<IssueDraft | null>(null);
-  const [loadingDraft, setLoadingDraft] = useState(false);
-  const [draftErr, setDraftErr] = useState("");
-  const [repoId, setRepoId] = useState("");
-  const [title, setTitle] = useState("");
-  const [description, setDescription] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [fileErr, setFileErr] = useState("");
-  const [local, setLocal] = useState<JustFiled | null>(null);
-
-  // Filed already (server link) or just now (local) → the filed row (mock C). A server
-  // link is stale when it predates the current review revision (filed_at < updated_at:
-  // "filed for an earlier version"); a just-filed local link is by definition current.
-  if (filed || local) {
-    const iid = local ? local.iid : filed!.issue_iid;
-    const url = local ? local.web_url : filed!.issue_url;
-    const stale = !local && filed ? new Date(filed.filed_at) < new Date(reviewUpdatedAt) : false;
-    return (
-      <div className="mt-2.5 rounded-lg border border-ok/40 bg-ok/10 px-3 py-2 text-sm text-ok">
-        <span className="font-medium">Issue created.</span>{" "}
-        {isHttpsUrl(url) ? (
-          <a
-            href={url}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="inline-flex items-center gap-1 font-medium underline underline-offset-2 hover:text-ok"
-          >
-            #{iid} <ExternalLinkIcon />
-          </a>
-        ) : (
-          <span className="font-medium">#{iid}</span>
-        )}
-        {local?.warning ? (
-          <p className="mt-1 text-xs text-warn">{local.warning}</p>
-        ) : stale ? (
-          <p className="mt-1 text-xs text-faint">
-            Filed for an earlier version of this recommendation — re-running the judge changed it since.
-          </p>
-        ) : (
-          <span className="text-ok/80"> — open it on the board to start a run.</span>
-        )}
-      </div>
-    );
-  }
-
-  // Past this point is the create-issue affordance. A disposed row with no filed link
-  // renders nothing here (the filed row above already returned when a link exists).
-  if (actionHidden) return null;
-
-  const openDraft = async () => {
-    setOpen(true);
-    setLoadingDraft(true);
-    setDraftErr("");
-    try {
-      const { draft } = await api.getIssueDraft(runId, rec.id);
-      setDraft(draft);
-      setRepoId(draft.default_repo_id);
-      // Issue #124 / LOW-1: sanitize what UZI supplies, leave what the USER types alone.
-      // These are controlled components, so the state IS what gets POSTed — filtering
-      // `value=` would silently rewrite the user's own typing. The SEED is uzi-supplied
-      // (a server draft templated from `rec.target` + `rationale_md`), so it is exactly
-      // the boundary that may be cleaned.
-      //
-      // The ingest strip means new rows can no longer carry Cf at all; this covers reviews
-      // stored BEFORE it, the same argument the renderer-side strip rests on. It is also
-      // on the SAFE side of the quick-action ordering trap: measured, a Cf strip applied
-      // BEFORE the server's StripUnfencedSlashLines makes `<ZWSP>/label ~backdoor` into a
-      // line the slash-pass then DROPS, whereas stripping AFTER that pass would turn an
-      // inert line into a live GitLab quick action.
-      setTitle(stripUnsafeChars(draft.title));
-      setDescription(stripUnsafeChars(draft.description));
-    } catch (e) {
-      setDraftErr(errorMessage(e, "Could not load the draft"));
-    } finally {
-      setLoadingDraft(false);
-    }
-  };
-
-  const create = async () => {
-    setFileErr("");
-    setBusy(true);
-    try {
-      const { issue, warning } = await api.fileIssue(runId, rec.id, { repo_id: repoId, title, description });
-      setLocal({ iid: issue.iid, web_url: issue.web_url, warning });
-    } catch (e) {
-      // Forge rejected the write (mock E): the draft stays open with its edits intact.
-      setFileErr(errorMessage(e, "Could not file the issue"));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  if (!open) {
-    return (
-      <div className="mt-2.5">
-        <Button size="sm" onClick={openDraft}>
-          File issue
-        </Button>
-      </div>
-    );
-  }
-
-  return (
-    <div className="mt-2.5 overflow-hidden rounded-xl border border-brand/40 bg-brand/[0.06]">
-      <div className="flex items-center justify-between gap-2 border-b border-brand/20 bg-brand/10 px-3 py-2">
-        <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-brand">
-          <span aria-hidden="true">
-            <FileTextIcon />
-          </span>
-          Draft issue
-        </span>
-        <Badge tone="brand">needs your review</Badge>
-      </div>
-
-      <div className="space-y-3 px-3 py-3">
-        {loadingDraft && (
-          <p role="status" className="text-sm text-faint">
-            Loading draft…
-          </p>
-        )}
-        {draftErr && <Alert message={draftErr} />}
-        {/* A draft-load failure must not trap the card: with no draft there is neither the
-            Cancel below (inside the draft guard) nor the File-issue button (open===true),
-            so offer Retry + Cancel here. */}
-        {draftErr && !draft && (
-          <div className="flex flex-wrap gap-2">
-            <Button size="sm" onClick={openDraft}>
-              Retry
-            </Button>
-            <Button size="sm" variant="secondary" onClick={() => setOpen(false)}>
-              Cancel
-            </Button>
-          </div>
-        )}
-        {draft && (
-          <>
-            {/* Provenance (Decision 8): whose worker produced this (attacker-influencable)
-                text — prominent (boxed + labeled) so an admin filing another user's review
-                notices whose text they are about to publish. */}
-            {draft.provenance && (
-              <div className="rounded-md border border-edge bg-raised/50 px-2.5 py-1.5 text-xs text-muted">
-                <span className="font-semibold text-fg">Source:</span> {draft.provenance}
-              </div>
-            )}
-            {fileErr && <Alert message={fileErr} />}
-
-            <div className="space-y-1">
-              <label className="block text-xs text-muted">Repo</label>
-              <Select value={repoId} onChange={(e) => setRepoId(e.target.value)}>
-                <option value="">Select a repo…</option>
-                {repos.map((r) => (
-                  <option key={r.id} value={r.id}>
-                    {maskRepoPath(r.path_with_namespace, demo)}
-                  </option>
-                ))}
-              </Select>
-              {draft.default_note && (
-                <p
-                  role="status"
-                  className={cx(
-                    "text-xs",
-                    repoId
-                      ? "text-faint"
-                      : "rounded-md border border-info/40 bg-info/10 px-2.5 py-1.5 text-info",
-                  )}
-                >
-                  {draft.default_note}
-                </p>
-              )}
-            </div>
-
-            {/* Every field below is inert text (never Markdown): the title/description are
-                edited raw, and the server re-sanitizes at the POST boundary. */}
-            <div className="space-y-1">
-              <label className="block text-xs text-muted">Title</label>
-              <Input value={title} onChange={(e) => setTitle(e.target.value)} />
-            </div>
-
-            <div className="space-y-1">
-              <label className="block text-xs text-muted">Description</label>
-              <Textarea
-                rows={10}
-                value={description}
-                onChange={(e) => setDescription(e.target.value)}
-                className="max-h-72 font-mono text-xs"
-              />
-            </div>
-
-            <div className="space-y-1">
-              <label className="block text-xs text-muted">Labels</label>
-              <div className="flex flex-wrap gap-1">
-                {draft.labels.map((l) => (
-                  <Badge key={l} tone="neutral">
-                    {l}
-                  </Badge>
-                ))}
-              </div>
-              <p className="text-xs text-faint">
-                Lands on the board and is startable without a PRD file. No autopilot label — nothing runs until you click
-                Start.
-              </p>
-            </div>
-
-            <div className="flex flex-wrap gap-2 pt-0.5">
-              <Button size="sm" disabled={busy || !repoId || title.trim() === ""} onClick={create}>
-                Create issue
-              </Button>
-              <Button size="sm" variant="secondary" disabled={busy} onClick={() => setOpen(false)}>
-                Cancel
-              </Button>
-            </div>
-          </>
-        )}
-      </div>
-    </div>
-  );
-}
-
-// DispositionChip renders a recommendation's triage status by the D#2 precedence
-// ladder — disposition (done/dismissed) wins over a settled filed link, which wins
-// over the open "To do" default. Tones mirror the mockup: a not_an_issue (false
-// positive) reads danger and reserves the only warm/red chip; a wont_do reads neutral
-// grey (a valid-but-parked call is not a warning), done reads ok, filed reads info.
-function DispositionChip({ disp, filedSettled }: { disp?: Disposition; filedSettled: boolean }) {
-  if (disp?.status === "dismissed") {
-    return disp.reason === "not_an_issue" ? (
-      <Badge tone="danger">Dismissed · Not an issue</Badge>
-    ) : (
-      <Badge tone="neutral">Dismissed · Won't do</Badge>
-    );
-  }
-  // The ✓ is decorative — aria-hidden so a screen reader reads just "Done", not
-  // "check mark Done".
-  if (disp?.status === "done")
-    return (
-      <Badge tone="ok">
-        <span aria-hidden="true">✓</span> Done
-      </Badge>
-    );
-  if (filedSettled) return <Badge tone="info">Filed</Badge>;
-  return <Badge tone="neutral">To do</Badge>;
-}
-
-// resolvedAgo renders a disposition's set_at as a coarse "resolved Xh ago". The panel
-// shows only a relative time, never the actor — under owner-only the setter is always
-// the owner (D#6). Guards an unparseable timestamp.
-function resolvedAgo(setAt: string): string {
-  const t = Date.parse(setAt);
-  if (!Number.isFinite(t)) return "resolved";
-  return `resolved ${formatElapsed(Date.now() - t)} ago`;
-}
-
-// DispositionControls is the per-row triage affordance (PRD #94). With no disposition
-// it offers Mark done + Dismiss ▾ (Won't do / Not an issue); with one it shows the
-// server-computed stale flag and an Undo. EVERY mutation refetches the review
-// (onChanged) so the triage bar, chips, and stale flag re-read from the server — the
-// panel never re-derives triage state in TS.
-function DispositionControls({
-  runId,
-  recId,
   disp,
+  filed,
+  justFiled,
+  repos,
   onChanged,
+  onJustFiled,
   onError,
 }: {
   runId: string;
-  recId: string;
+  rec: ReviewRecommendation;
   disp?: Disposition;
+  filed?: FiledIssue;
+  justFiled?: JustFiled;
+  repos: Repo[];
   onChanged: () => Promise<void>;
+  onJustFiled: (issue: CreatedIssue, warning: string) => void;
   onError: (msg: string) => void;
 }) {
   const [busy, setBusy] = useState(false);
-  const [menuOpen, setMenuOpen] = useState(false);
-  // A polite sr-only live region announces the mutation result; it lives OUTSIDE the
-  // disp/no-disp branch so the branch swap after a mutation doesn't drop the message.
   const [announce, setAnnounce] = useState("");
+  const [draftOpen, setDraftOpen] = useState(false);
 
-  // Refs for a11y. The ui Button is a plain (non-forwardRef) component, so focus targets
-  // that are Buttons (Mark done, Dismiss trigger) are located by querySelector off a stable
-  // container ref rather than a direct ref; Undo is a raw <button> and takes a ref directly.
-  // menuWrapRef also backs the outside-click hit test. rootRef is the no-disp branch root.
-  const menuWrapRef = useRef<HTMLDivElement>(null);
+  // rootRef contains the persistent live region + whichever branch is showing, so the
+  // successor-focus effect can find "the first button" for both branches (the disposed row's
+  // Undo is its only button; the action row's first button after an Undo).
   const rootRef = useRef<HTMLDivElement>(null);
-  const undoRef = useRef<HTMLButtonElement>(null);
-  // Set true just before the refetch so the disp-transition effect below knows the change
-  // was user-initiated (skips focus-stealing on the initial mount / passive re-renders).
+  // Armed just before a refetch so the successor-focus effect knows the pending re-render is
+  // user-initiated (and does not steal focus on mount or a passive refetch).
   const focusAfterMutation = useRef(false);
 
-  // Escape closes the menu (focus back to the Dismiss trigger — the first button in the
-  // wrapper); a pointerdown outside the wrapper closes it too. Wired only while open, torn
-  // down on close/unmount.
-  useEffect(() => {
-    if (!menuOpen) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        setMenuOpen(false);
-        menuWrapRef.current?.querySelector<HTMLElement>("button")?.focus();
-      }
-    };
-    const onPointerDown = (e: Event) => {
-      if (menuWrapRef.current && !menuWrapRef.current.contains(e.target as Node)) {
-        setMenuOpen(false);
-      }
-    };
-    document.addEventListener("keydown", onKey);
-    document.addEventListener("pointerdown", onPointerDown);
-    return () => {
-      document.removeEventListener("keydown", onKey);
-      document.removeEventListener("pointerdown", onPointerDown);
-    };
-  }, [menuOpen]);
-
-  // After a mutation + refetch re-renders this row into the other branch, move focus to the
-  // successor control that just mounted (disp → Undo; no disp → Mark done, the first button
-  // in the root). Keyed on disp AND busy: the successor button is `disabled={busy}` and busy
-  // only clears in the finally AFTER the refetch, so we defer the focus until busy drops
-  // (a disabled element ignores .focus()). The armed flag survives the intervening renders.
+  // After a mutation + refetch swaps this row into the other branch, move focus to the
+  // control that just mounted. disp → the disposed row's Undo; no disp (after an Undo) → the
+  // action row's first button. Both are the FIRST <button> in the container, so one query
+  // serves both. Keyed on disp AND busy: the successor is `disabled={busy}` and busy only
+  // clears in the finally AFTER the refetch, so the focus is deferred until busy drops (a
+  // disabled element ignores .focus()); the armed flag survives the intervening renders.
   useEffect(() => {
     if (!focusAfterMutation.current || busy) return;
     focusAfterMutation.current = false;
-    if (disp) undoRef.current?.focus();
-    else rootRef.current?.querySelector<HTMLElement>("button")?.focus();
+    rootRef.current?.querySelector<HTMLElement>("button")?.focus();
   }, [disp, busy]);
 
   const act = async (fn: () => Promise<unknown>, message: string) => {
@@ -920,8 +688,8 @@ function DispositionControls({
     setBusy(true);
     try {
       await fn();
-      // Arm the focus move BEFORE the refetch so the disp-transition effect (fired by the
-      // parent's re-render on refetch) sees the flag set.
+      // Arm the focus move BEFORE the refetch so the effect (fired by the parent's re-render
+      // on refetch swapping the disp prop) sees the flag set.
       focusAfterMutation.current = true;
       setAnnounce(message);
       await onChanged();
@@ -930,101 +698,80 @@ function DispositionControls({
       onError(errorMessage(e, "Could not update the disposition"));
     } finally {
       setBusy(false);
-      setMenuOpen(false);
     }
   };
 
-  // The live region is shared by both branches so an announcement survives the branch swap.
-  const liveRegion = (
-    <span className="sr-only" role="status" aria-live="polite">
-      {announce}
-    </span>
-  );
+  // Adapts the server IssueDraft (default_repo_id + default_note) onto the card's normalised
+  // seed. The card stripUnsafeChars's the title/description seed itself.
+  const loadDraft = async (): Promise<IssueDraftSeed> => {
+    const { draft } = await api.getIssueDraft(runId, rec.id);
+    return {
+      title: draft.title,
+      description: draft.description,
+      labels: draft.labels,
+      provenance: draft.provenance,
+      defaultRepoId: draft.default_repo_id,
+      defaultNote: draft.default_note,
+    };
+  };
 
-  if (disp) {
-    return (
-      <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
-        {liveRegion}
-        <span className="text-faint">{resolvedAgo(disp.set_at)}</span>
-        {disp.stale && (
-          <Badge
-            tone="warning"
-            title="The judge re-ran and this recommendation's rationale changed since you resolved it."
-          >
-            recommendation changed since you resolved
-          </Badge>
-        )}
-        <button
-          type="button"
-          ref={undoRef}
-          disabled={busy}
-          onClick={() => act(() => api.deleteDisposition(runId, recId), "Disposition undone")}
-          className="font-medium text-faint underline underline-offset-2 transition-colors hover:text-fg disabled:opacity-50"
-        >
-          Undo
-        </button>
-      </div>
-    );
-  }
+  // Create posts the existing file-issue call, records the created issue + any warning as the
+  // local just-filed override (so the coordinate shows "Filed #N" even if the link did not
+  // settle — fileIssue's `warning` is a created-with-warning success, not a retry signal),
+  // then refetches (the settled link lands in filedByCoord and takes over) and closes the card.
+  const createIssue = async ({ repoId, title, description }: IssueDraftValues) => {
+    const res = await api.fileIssue(runId, rec.id, { repo_id: repoId, title, description });
+    onJustFiled(res.issue, res.warning ?? "");
+    setDraftOpen(false);
+    await onChanged();
+  };
 
   return (
-    <div ref={rootRef} className="mt-2 flex flex-wrap items-center gap-2">
-      {liveRegion}
-      <Button
-        size="sm"
-        variant="secondary"
-        disabled={busy}
-        onClick={() => act(() => api.setDisposition(runId, recId, "done"), "Marked done")}
-      >
-        Mark done
-      </Button>
-      <div className="relative" ref={menuWrapRef}>
-        <Button
-          size="sm"
-          variant="secondary"
-          disabled={busy}
-          aria-haspopup="menu"
-          aria-expanded={menuOpen}
-          onClick={() => setMenuOpen((o) => !o)}
-        >
-          Dismiss ▾
-        </Button>
-        {menuOpen && (
-          <div
-            role="menu"
-            className="absolute z-10 mt-1 w-56 rounded-lg border border-edge-strong bg-surface p-1 shadow-lg"
-          >
-            <button
-              type="button"
-              role="menuitem"
-              disabled={busy}
-              onClick={() => act(() => api.setDisposition(runId, recId, "dismissed", "wont_do"), "Dismissed — won't do")}
-              className="flex w-full flex-col gap-0.5 rounded-md px-2.5 py-2 text-left text-sm text-fg transition-colors hover:bg-raised disabled:opacity-50"
-            >
-              Won't do
-              <span className="text-xs text-faint">Valid, but not worth acting on</span>
-            </button>
-            <button
-              type="button"
-              role="menuitem"
-              disabled={busy}
-              onClick={() =>
-                act(() => api.setDisposition(runId, recId, "dismissed", "not_an_issue"), "Dismissed — not an issue")
+    <div ref={rootRef}>
+      {/* Persistent sr-only live region — see the LIVE-REGION FIX note above. Always mounted
+          (empty until a mutation), the convention the run page's other live regions follow. */}
+      <span className="sr-only" role="status" aria-live="polite">
+        {announce}
+      </span>
+      {disp ? (
+        <TriageDisposedRow
+          resolvedAt={disp.set_at}
+          stale={disp.stale}
+          busy={busy}
+          onUndo={() => act(() => api.deleteDisposition(runId, rec.id), "Undone")}
+        />
+      ) : (
+        <>
+          <div className="mt-2">
+            <TriageActions
+              // File issue only when not already filed — a settled link (filed) OR the local
+              // just-filed override (justFiled, the created-with-warning case where the link did
+              // not settle) both hide it, so File never re-arms over a live forge issue — and
+              // not while the draft is open (the card below is the filing UI).
+              onFile={filed || justFiled || draftOpen ? undefined : () => setDraftOpen(true)}
+              onMarkDone={() => act(() => api.setDisposition(runId, rec.id, "done"), "Marked done")}
+              onDismiss={(reason) =>
+                act(
+                  () => api.setDisposition(runId, rec.id, "dismissed", reason),
+                  reason === "not_an_issue" ? "Dismissed, not an issue" : "Dismissed, won't do",
+                )
               }
-              className="flex w-full flex-col gap-0.5 rounded-md px-2.5 py-2 text-left text-sm text-fg transition-colors hover:bg-raised disabled:opacity-50"
-            >
-              Not an issue
-              <span className="text-xs text-faint">False positive — the judge got it wrong</span>
-            </button>
+              dismissCopy="judge"
+              busy={busy}
+              callerHostsLiveRegion
+            />
           </div>
-        )}
-      </div>
+          {draftOpen && (
+            <IssueDraftCard loadDraft={loadDraft} onCreate={createIssue} onCancel={() => setDraftOpen(false)} repos={repos} />
+          )}
+        </>
+      )}
     </div>
   );
 }
 
 // TriageSummary renders a TriageCounts bundle DIRECTLY — a segmented meter plus the
-// counts line (to do / filed / done / dismissed, with the false-positive sub-count).
+// counts line (to triage / filed / done / dismissed, with the false-positive sub-count).
 // It never derives a number itself: the same server bundle backs the per-review bar,
 // the global strip, and `uzi review show`, so they cannot disagree (D#7/D#8). Exported
 // so RunsList's global strip renders the identical visual from getJudgeStats.
@@ -1047,7 +794,7 @@ export function TriageSummary({
       </div>
       <TriageMeter triage={triage} />
       <div className="mt-3 flex flex-wrap items-baseline gap-x-4 gap-y-1 text-xs">
-        <TriageCount dotClass="bg-warn" n={triage.todo} label="to do" />
+        <TriageCount dotClass="bg-warn" n={triage.todo} label="to triage" />
         <TriageCount dotClass="bg-info" n={triage.filed} label="filed" />
         <TriageCount dotClass="bg-ok" n={triage.done} label="done" />
         <TriageCount dotClass="bg-muted" n={triage.dismissed} label="dismissed" />

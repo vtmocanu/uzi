@@ -29,9 +29,17 @@ occurrence's own triage state.
 
 ## 2. Triage a whole group at once
 
-**Mark done** or **Dismiss ▾** (Won't do / Not an issue) on a row applies to
-**every open occurrence across every run**, in one call. Tick several rows and
-the selection bar does the same across all of them.
+Every row leads with three actions of equal weight: **File issue**, **Mark
+done**, and **Dismiss ▾** (Won't do / Not an issue).
+
+**Mark done** and **Dismiss ▾** apply to **every open occurrence across every
+run**, in one call. Tick several rows and the selection bar does the same
+across all of them.
+
+**File issue** works on one occurrence, not the whole group: it drafts from
+the group's **newest open occurrence**, the most-recently-judged run that's
+still open, right on the row, no expander needed. The other open runs stay
+open until you **Mark done** the whole group.
 
 Three things worth knowing, because each looks like a bug and is not:
 
@@ -45,11 +53,11 @@ Three things worth knowing, because each looks like a bug and is not:
   than vanishing, so you can see what you just did — and **Undo** in the toast
   reverts exactly the occurrences that action settled.
 
-Filing an issue is still **per recommendation**, from the occurrence expander,
-using the same draft-and-review flow as
-[the run page](./judge.md#filing-an-issue-from-a-recommendation). There is no
-"file the whole group as one issue" — that needs a repo pick and a human draft
-per item, and it is not built.
+Filing uses the same draft-and-review flow as
+[the run page](./judge.md#filing-an-issue-from-a-recommendation), and no
+longer needs opening the occurrence expander first. There is no "file the
+whole group as one issue" yet, that needs a repo pick and a human draft per
+item, and it is not built.
 
 ## 3. The tabs, and the one number
 

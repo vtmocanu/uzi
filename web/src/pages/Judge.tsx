@@ -47,6 +47,7 @@ import type { Toast } from "./judge/shared";
 import { LabelFilter } from "./judge/LabelFilter";
 import { MultiSelectBar } from "./judge/MultiSelectBar";
 import { GroupRow } from "./judge/GroupRow";
+import { SelectAllCheckbox } from "../components/triage/SelectAllCheckbox";
 import { ZeroState } from "./judge/ZeroState";
 import { UndoToast } from "./judge/UndoToast";
 
@@ -405,6 +406,20 @@ export function Judge() {
     return out;
   }, [backlog, selected]);
 
+  // Select-all header state (PRD #1183 M2): the coordinate keys of every group ON SCREEN, and
+  // whether all / some of them are selected. onChange fans the whole visible list into (or out
+  // of) the selection — the same coordKey the row checkboxes toggle, so MultiSelectBar's own
+  // selectedCoords.length count stays correct without change.
+  const visibleKeys = useMemo(
+    () => (backlog?.groups ?? []).map((g) => coordKey(g.category, g.target)),
+    [backlog],
+  );
+  const allSelected = visibleKeys.length > 0 && visibleKeys.every((k) => selected.has(k));
+  const someSelected = visibleKeys.some((k) => selected.has(k));
+  const toggleSelectAll = (checked: boolean) => {
+    setSelected(checked ? new Set(visibleKeys) : new Set());
+  };
+
   const triage = backlog?.triage;
   // Inbox-zero is a first-class LANDING view: it shows when the To-triage bucket comes
   // back genuinely empty. It gates on `groups.length === 0` — NOT on triage.todo alone —
@@ -508,36 +523,35 @@ export function Judge() {
         />
       )}
 
-      {/* The bridge line reconciling the two count units on this page: the whole-backlog
-          recommendation-ROW count for the active bucket against the whole-backlog deduped
-          GROUP total. Suppressed when a category filter is active (the rec half is a
+      {/* EXACTLY ONE status line under the tabs (PRD #1183 M2), never both a bridge line and a
+          "Showing" line. When the bridge's gate holds it reconciles the two count units on this
+          page — the whole-backlog recommendation-ROW count for the active bucket against the
+          whole-backlog deduped GROUP total. Its gate: no category filter (the rec half is a
           whole-backlog count and can only honestly reconcile against a whole-backlog group
-          total), when the backlog is truncated (the truncation Alert already flags the picture
-          as incomplete), and when the group total is 0 (a failed/empty category-stats fetch,
-          which would otherwise read "across 0 groups"). Also suppressed under a run anchor
-          (`?run=`): the recommendation half (`triage`) is whole-account, computed with no run
-          argument, while the group half is run-anchor scoped, so the two cannot honestly
-          reconcile there either. The "Showing N groups" line below stays unchanged and covers
-          the filtered/on-screen scope. Also gated on categoryStatsFresh: a disposition installs
-          the new triage synchronously but refetches the matrix async, so without this the bridge
-          would briefly reconcile the new recommendation count against the stale group total. */}
-      {!loading && backlog && !showZeroState && !runAnchor && triage && categories.length === 0 && !backlog.truncated && categoryStatsFresh && bridgeGroupTotal > 0 && (
-        <p className="text-sm text-muted">
-          {judgeBridgeLine(bucketTabCount(triage, bucket), bridgeGroupTotal, bucket)}
-        </p>
-      )}
-
-      {/* A plain view hint reading the length of the RETURNED (filtered) groups — open
-          question 4's "result line", deliberately not a restyled triage strip. It reads the
-          groups actually on screen, so it can never be mistaken for the canonical triage
-          counts the tabs and badge show. */}
+          total), not truncated (the truncation Alert already flags the picture as incomplete),
+          no run anchor (`triage` is whole-account while the group half would be run-scoped),
+          a non-zero group total (a 0 would read "across 0 groups"), and categoryStatsFresh — a
+          disposition installs the new triage synchronously but refetches the matrix async, so
+          without this the bridge would briefly reconcile the new recommendation count against
+          the stale group total. OTHERWISE the "Showing" line reads the length of the RETURNED
+          (filtered) groups on screen; when truncated it reads "Showing N of M groups" against
+          the canonical group total so the on-screen count is never mistaken for the whole. The
+          role="status" live region is preserved across both. */}
       {!loading && backlog && !showZeroState && (
         <p role="status" aria-live="polite" className="text-sm text-faint">
-          {categories.length > 0 ? (
+          {!runAnchor && triage && categories.length === 0 && !backlog.truncated && categoryStatsFresh && bridgeGroupTotal > 0 ? (
+            judgeBridgeLine(bucketTabCount(triage, bucket), bridgeGroupTotal, bucket)
+          ) : categories.length > 0 ? (
             <>
               Showing <b className="font-semibold text-muted tabular-nums">{backlog.groups.length}</b>{" "}
               {backlog.groups.length === 1 ? "group" : "groups"} matching{" "}
               {categories.map((c) => recommendationLabel(c)).join(", ")}
+            </>
+          ) : backlog.truncated && bridgeGroupTotal > 0 ? (
+            <>
+              Showing <b className="font-semibold text-muted tabular-nums">{backlog.groups.length}</b> of{" "}
+              <b className="font-semibold text-muted tabular-nums">{bridgeGroupTotal}</b>{" "}
+              {bridgeGroupTotal === 1 ? "group" : "groups"}
             </>
           ) : (
             <>
@@ -573,19 +587,33 @@ export function Judge() {
               }
             />
           ) : (
-            <ul className="space-y-2">
-              {backlog.groups.map((g) => (
-                <GroupRow
-                  key={coordKey(g.category, g.target)}
-                  group={g}
-                  selected={selected.has(coordKey(g.category, g.target))}
-                  onToggleSelect={() => toggleSelect(coordKey(g.category, g.target))}
-                  onDispose={(status, reason) => dispose([{ category: g.category, target: g.target }], status, reason)}
-                  repos={repos}
-                  onFiled={reloadAfterMutation}
+            <>
+              {/* Select-all header (PRD #1183 M2): checks/indeterminate off the visible groups,
+                  fans the whole list into the selection MultiSelectBar acts on. */}
+              <div className="flex items-center px-1">
+                <SelectAllCheckbox
+                  checked={allSelected}
+                  indeterminate={someSelected && !allSelected}
+                  onChange={toggleSelectAll}
+                  label={`Select all ${backlog.groups.length} shown`}
                 />
-              ))}
-            </ul>
+              </div>
+              <ul className="space-y-2">
+                {backlog.groups.map((g) => (
+                  <GroupRow
+                    key={coordKey(g.category, g.target)}
+                    group={g}
+                    selected={selected.has(coordKey(g.category, g.target))}
+                    onToggleSelect={() => toggleSelect(coordKey(g.category, g.target))}
+                    onDispose={(status, reason) => dispose([{ category: g.category, target: g.target }], status, reason)}
+                    repos={repos}
+                    onFiled={reloadAfterMutation}
+                    // The omittable full-rationale fetch for the expander (PRD #1183 M2).
+                    fetchReview={api.getRunReview}
+                  />
+                ))}
+              </ul>
+            </>
           )}
         </>
       )}

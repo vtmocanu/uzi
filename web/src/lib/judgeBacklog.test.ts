@@ -5,9 +5,8 @@ import {
   judgeBridgeLine,
   JUDGE_BUCKETS,
   verdictTrend,
-  rollupLabel,
-  rollupTone,
   seenInRunsLabel,
+  openOfRunsLabel,
 } from "./judgeBacklog";
 import type { JudgeRecommendationGroup, TriageCounts } from "./api";
 
@@ -29,14 +28,6 @@ describe("judgeBacklog — bucket tabs", () => {
     expect(JUDGE_BUCKETS).toEqual(["todo", "filed", "done", "dismissed", "all"]);
     expect(JUDGE_BUCKETS.map(bucketTabLabel)).toEqual(["To triage", "Filed", "Done", "Dismissed", "All"]);
   });
-
-  it("maps the rollup badge tone/label for each rung", () => {
-    expect(rollupLabel("filed")).toBe("Filed");
-    expect(rollupLabel("done")).toBe("Done");
-    expect(rollupLabel("dismissed")).toBe("Dismissed");
-    expect(rollupTone("done")).toBe("ok");
-    expect(rollupTone("filed")).toBe("info");
-  });
 });
 
 describe("judgeBacklog — evidence copy", () => {
@@ -44,14 +35,24 @@ describe("judgeBacklog — evidence copy", () => {
     expect(seenInRunsLabel(1)).toBe("seen in 1 run");
     expect(seenInRunsLabel(3)).toBe("seen in 3 runs");
   });
+
+  // PRD #1183 M2: the Judge group row's frequency chip folds the open count and the run
+  // count into one phrase, plural-correct on the runs and switching to "all settled" at zero.
+  it("reads 'N open of M runs', singular/plural on runs, and 'M runs, all settled' at zero open", () => {
+    expect(openOfRunsLabel(3, 5)).toBe("3 open of 5 runs");
+    expect(openOfRunsLabel(1, 1)).toBe("1 open of 1 run");
+    expect(openOfRunsLabel(2, 1)).toBe("2 open of 1 run"); // plural open, singular run
+    expect(openOfRunsLabel(0, 5)).toBe("5 runs, all settled");
+    expect(openOfRunsLabel(0, 1)).toBe("1 run, all settled");
+  });
 });
 
 describe("judgeBacklog — judgeBridgeLine reconciles rows against groups", () => {
   it("carries the per-bucket adjective (none for `all`) and pluralises BOTH nouns", () => {
     // Both singular: the adjective sits between the count and the noun, no plural on either.
-    expect(judgeBridgeLine(1, 1, "todo")).toBe("1 to-do recommendation across 1 group");
+    expect(judgeBridgeLine(1, 1, "todo")).toBe("1 to triage recommendation across 1 group");
     // Both plural.
-    expect(judgeBridgeLine(42, 18, "todo")).toBe("42 to-do recommendations across 18 groups");
+    expect(judgeBridgeLine(42, 18, "todo")).toBe("42 to triage recommendations across 18 groups");
     // A done case — different adjective, mixed plurality (plural recs, singular group).
     expect(judgeBridgeLine(3, 1, "done")).toBe("3 done recommendations across 1 group");
     // filed and dismissed adjectives.
@@ -118,10 +119,9 @@ describe("judgeBacklog — JUDGE_BUCKETS is the whole union (PRD #98 review N7)"
     expect(new Set(JUDGE_BUCKETS).size).toBe(JUDGE_BUCKETS.length);
   });
 
-  it("has a tab label and a rollup label for every member — exhaustive by construction", () => {
+  it("has a tab label for every member — exhaustive by construction", () => {
     for (const b of JUDGE_BUCKETS) {
       expect(bucketTabLabel(b)).toBeTruthy();
-      expect(rollupLabel(b)).toBeTruthy();
     }
   });
 });
