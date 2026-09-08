@@ -353,9 +353,15 @@ type ClaimSecrets struct {
 }
 
 // ClaimCodexSecrets is the usable Codex credential for one claim of a Codex-bound run
-// (PRD #1147 M2, B7). It carries ONLY what the worker needs to act as the credential
-// and to call the (dark) per-run credential-operation endpoints:
+// (PRD #1147 M2, B7; PRD #1171 M1 adds AuthMode + Generation). It carries ONLY what the
+// worker needs to act as the credential and to call the (dark) per-run
+// credential-operation endpoints:
 //
+//   - AuthMode is the run's server-owned, frozen auth mode ("subscription" | "api_key").
+//     It is the discriminant of the TS wire union (agent/src/protocol.ts): the worker
+//     never guesses the mode from the credential shape, and an api_key run structurally
+//     cannot refresh (the release/refresh routes and the coordinated refresher both
+//     refuse ScopeStartRefresh for it).
 //   - AccessToken is the directly-usable token for the run's auth mode: for a
 //     subscription run it is the access_token extracted from the account's sealed
 //     merged login (the refresh/login blob is NEVER included); for an api_key run it
@@ -364,11 +370,24 @@ type ClaimSecrets struct {
 //     (epoch-tagged plaintext), minted server-side at claim assembly. The worker
 //     presents it back to authorize a credential operation (persist-recovery /
 //     release-access-token / start-refresh); the server stores only its sha256.
+//   - Generation is the subscription account's CURRENT committed generation — the
+//     generation of the sealed_login this claim releases, and the worker's initial
+//     observedGeneration for a coordinated refresh. It is a *int64 with omitempty so
+//     the wire matches the TS discriminated union EXACTLY: a subscription run carries a
+//     REAL generation (0 at initial login, a real zero — a non-nil pointer to 0
+//     serializes as "generation":0, not omitted), while an api_key run (which can never
+//     refresh) carries NO generation key at all. Sourced from the account row the
+//     subscription open already reads; never a new query.
 //
 // Never logged; the whole struct is secret-bearing like its parent ClaimSecrets.
 type ClaimCodexSecrets struct {
+	AuthMode    string `json:"auth_mode"`
 	AccessToken string `json:"access_token"`
 	Capability  string `json:"capability"`
+	// Generation: *int64 + omitempty is load-bearing (see the type doc). A subscription
+	// claim sets it (0 is a real, wire-visible zero); an api_key claim leaves it nil so
+	// the `generation` key is absent, matching the TS `api_key` union arm.
+	Generation *int64 `json:"generation,omitempty"`
 }
 
 // ClaimAgent is a PRD #3 agent template as structured fields, ready to map onto

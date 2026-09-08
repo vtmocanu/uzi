@@ -825,6 +825,11 @@ func (s *Service) codexClaimSecrets(ctx context.Context, wkr store.Worker, run s
 		return nil, rerr
 	}
 
+	// generation carries the subscription account's current committed generation onto the
+	// claim wire (PRD #1171 M1). It stays nil for an api_key run (which can never refresh),
+	// so ClaimCodexSecrets.Generation's omitempty drops the key for that mode — matching the
+	// TS discriminated union. A subscription run sets it (a real 0 at initial login).
+	var generation *int64
 	var accessToken string
 	switch authMode {
 	case codexAuthModeSubscription:
@@ -845,6 +850,15 @@ func (s *Service) codexClaimSecrets(ctx context.Context, wkr store.Worker, run s
 		if aerr != nil {
 			return nil, fmt.Errorf("codex claim: read account: %w", aerr)
 		}
+		// The generation of the sealed_login being released. acct.Generation is the live
+		// generation counter (NOT NULL, DEFAULT 0), and it equals the generation of the
+		// current committed sealed_login: a lease acquire does not bump it, only a durable
+		// CommitCodexRefresh does (which also installs the matching login). So it is exactly
+		// what codexReturnCommitted returns alongside a token, and the correct initial
+		// observedGeneration for the worker's later coordinated refresh. Copied to a local so
+		// the pointer does not alias the loop-free struct field beyond this scope.
+		g := acct.Generation
+		generation = &g
 		plain, oerr := secretopen.OpenSealed(s.vlt, s.box, run.UserID, store.KindCodexAuth, acct.SealedWith, acct.SealedLogin)
 		if oerr != nil {
 			if errors.Is(oerr, secretopen.ErrVaultLocked) {
@@ -898,7 +912,12 @@ func (s *Service) codexClaimSecrets(ctx context.Context, wkr store.Worker, run s
 		return nil, rerr
 	}
 
-	return &ClaimCodexSecrets{AccessToken: accessToken, Capability: wireCap}, nil
+	return &ClaimCodexSecrets{
+		AuthMode:    authMode,
+		AccessToken: accessToken,
+		Capability:  wireCap,
+		Generation:  generation, // subscription: the committed generation; api_key: nil (key omitted)
+	}, nil
 }
 
 // reauthorizeCodexRelease re-reads a FRESH GetRunCodexAuthContext snapshot and re-verifies

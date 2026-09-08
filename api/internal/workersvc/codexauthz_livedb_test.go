@@ -178,6 +178,17 @@ func TestAuthorizeCodexCredentialOpAcceptsValidLiveDB(t *testing.T) {
 	if codex.Capability == "" {
 		t.Fatal("claim must carry a capability")
 	}
+	// PRD #1171 M1: a subscription claim carries auth_mode + the account's committed
+	// generation (0 at initial login, a real value the worker uses as its initial
+	// observedGeneration for a coordinated refresh).
+	if codex.AuthMode != codexAuthModeSubscription {
+		t.Fatalf("claim auth_mode = %q, want subscription", codex.AuthMode)
+	}
+	if codex.Generation == nil {
+		t.Fatal("a subscription claim must carry a generation (never nil)")
+	} else if *codex.Generation != 0 {
+		t.Fatalf("initial subscription generation = %d, want 0", *codex.Generation)
+	}
 
 	authCtx, err := f.svc.AuthorizeCodexCredentialOp(env.ctx, f.wkr, f.runID, codex.Capability, ScopeReleaseAccessToken)
 	if err != nil {
@@ -364,6 +375,15 @@ func TestAuthorizeCodexScopeNotApplicableAPIKeyLiveDB(t *testing.T) {
 	}
 	if codex.AccessToken != staticKey {
 		t.Fatalf("api_key claim access token = %q, want the seeded static key %q", codex.AccessToken, staticKey)
+	}
+	// PRD #1171 M1: an api_key claim carries auth_mode="api_key" and NO generation — it can
+	// never refresh, so the generation field is absent (nil), matching the TS union's
+	// api_key arm.
+	if codex.AuthMode != codexAuthModeAPIKey {
+		t.Fatalf("claim auth_mode = %q, want api_key", codex.AuthMode)
+	}
+	if codex.Generation != nil {
+		t.Fatalf("an api_key claim must carry NO generation, got %d", *codex.Generation)
 	}
 
 	// Release is authorized.

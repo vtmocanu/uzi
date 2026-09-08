@@ -35,6 +35,10 @@ import {
   type MergeRequestDTO,
   type JobListDTO,
   type LatestPipelineDTO,
+  type CodexReleaseRequest,
+  type CodexReleaseResponse,
+  type CodexRefreshRequest,
+  type CodexRefreshResponse,
 } from "./protocol.js";
 
 /** Error carrying the server's HTTP status + (truncated) body for retry logic. */
@@ -515,6 +519,35 @@ export class WorkerClient {
       `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/forge/mr-threads/resolve`,
       { resolve_id: resolveId },
     )) as ResolveMRThreadDTO;
+  }
+
+  // ── Codex credential bridge (PRD #1171 M1), ships DARK ─────────────────────
+  // Bearer-only, run-scoped worker→API routes over the API's coordinated-refresh service.
+  // The run id is the URL path — NEVER the body. Consumed by the Codex executor
+  // composition (a later milestone, m3); an api_key run only ever calls releaseCodex.
+  // Both responses are Cache-Control: no-store and secret-bearing (an access token), so the
+  // caller must treat the result like a claim secret — never log or persist it beyond use.
+
+  /** Re-fetch the run's currently-committed Codex access token (POST /worker/runs/:id/
+   *  codex/release). Used before constructing a fresh provider root. Both auth modes. */
+  async releaseCodex(runId: string, req: CodexReleaseRequest): Promise<CodexReleaseResponse> {
+    return (await this.postJSON(
+      `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/codex/release`,
+      req,
+    )) as CodexReleaseResponse;
+  }
+
+  /** Run the coordinated subscription refresh and release the freshly-committed access
+   *  token (POST /worker/runs/:id/codex/refresh). `req.operation_id` MUST be generated ONCE
+   *  per logical refresh and RETAINED by the caller across retries: on an HTTP timeout or a
+   *  lost reply, re-call with the SAME operation_id so the server replays its prior result
+   *  rather than starting a second provider exchange (the worker never begins a second
+   *  exchange blindly). Subscription runs only — an api_key run can never refresh. */
+  async refreshCodex(runId: string, req: CodexRefreshRequest): Promise<CodexRefreshResponse> {
+    return (await this.postJSON(
+      `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/codex/refresh`,
+      req,
+    )) as CodexRefreshResponse;
   }
 
   /** A 4xx body mentioning "terminal": the server already finalized the run, so the

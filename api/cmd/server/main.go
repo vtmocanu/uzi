@@ -25,6 +25,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/agentsource"
 	"github.com/vtmocanu/uzi/api/internal/anthropic"
 	"github.com/vtmocanu/uzi/api/internal/auth"
+	"github.com/vtmocanu/uzi/api/internal/codexauth"
 	"github.com/vtmocanu/uzi/api/internal/config"
 	"github.com/vtmocanu/uzi/api/internal/forgesvc"
 	"github.com/vtmocanu/uzi/api/internal/handler"
@@ -100,6 +101,14 @@ var (
 	prdsDone = ""
 	prdsOpen = ""
 )
+
+// codexProviderRequestTimeout bounds ONE Codex provider HTTP call (oauth token refresh or
+// the nonrotating identity re-verify) in the production codexauth.Client (PRD #1171 M1).
+// It is the innermost of the nested refresh budget documented at the wsvc.SetCodexRefresh
+// call site: two serial provider calls at 4s each = 8s worst case, inside the 8s refresh
+// lease TTL and under the ~9s server budget, keeping the whole worker→API→provider→commit→
+// callback round trip below the pinned app-server 10-second external-auth deadline.
+const codexProviderRequestTimeout = 4 * time.Second
 
 func main() {
 	// -health is a shell-free container healthcheck: the distroless runtime
@@ -464,6 +473,37 @@ func run() error {
 	// Default ON — a docker-needing run is claimable only by a docker-capable worker; OFF
 	// reverts to best-effort claiming while the docker allowlist above stays enforced.
 	wsvc.SetCapabilitySettings(settingsCache)
+
+	// Codex production oauth-exchange client (PRD #1171 M1), ships DARK. Wire the API-owned
+	// codexauth.Client into the coordinated refresher so a worker /codex/refresh route can
+	// actually rotate a subscription login; without it CoordinatedCodexRefresh fails closed
+	// (ErrCodexRefreshNoClient) and no route ever touches the provider. The endpoint,
+	// provider name and client id are the compiled-in provider defaults
+	// (codexauth.NewClient) — NEVER from a claim, model, repo, saved label or callback. Tests
+	// inject a fake through WithHTTPDoer; production takes the fixed defaults.
+	//
+	// The per-provider-request deadline (codexProviderRequestTimeout) is the innermost of a
+	// nested budget that keeps the WHOLE worker → API → provider → durable-commit → callback
+	// round trip UNDER the pinned app-server 10-second external-auth callback deadline
+	// (PRD #1147 M2 B6):
+	//
+	//	app-server external-auth callback deadline ......... 10s  (pinned, provider-imposed)
+	//	server-side coordinated-refresh handling budget .... ~9s  (≈1s reserved for the
+	//	                                                          worker↔API HTTP round trip
+	//	                                                          in each direction)
+	//	one provider HTTP call (codexProviderRequestTimeout)  4s  (the ADVANCE path makes TWO
+	//	                                                          serial provider calls — the
+	//	                                                          oauth token refresh, then the
+	//	                                                          nonrotating identity
+	//	                                                          re-verify — so 2×4s = 8s worst
+	//	                                                          case, still inside the 8s
+	//	                                                          refresh lease TTL
+	//	                                                          (codexRefreshLeaseTTL) and the
+	//	                                                          ~9s server budget, leaving the
+	//	                                                          durable commit its margin)
+	wsvc.SetCodexRefresh(codexauth.NewClient(
+		codexauth.WithPerRequestTimeout(codexProviderRequestTimeout),
+	))
 
 	// Browser live-event hub (M5): workersvc broadcasts persisted run events to
 	// it, and the WS handler fans them out to subscribed browsers. In-process and

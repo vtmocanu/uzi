@@ -938,6 +938,16 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		r.Post("/runs/{id}/forge/mr-threads/reply", h.WorkerForgeReplyMRThread)
 		r.Post("/runs/{id}/forge/mr-threads/resolve", h.WorkerForgeResolveMRThread)
 
+		// Codex credential bridge (PRD #1171 M1), ships DARK. Bearer-only, run-scoped
+		// worker→API routes over the M1 coordinated-refresh service half. release re-fetches
+		// the run's committed access token; refresh runs the coordinated subscription
+		// rotation. The path {id} is the SOLE run identity — strict request bodies carry only
+		// capability/operation_id/observed_generation and reject any body-supplied run/user/
+		// secret/account/token field; every response is Cache-Control: no-store. An ordinary
+		// Claude run never has a Codex binding, so these fail closed for it (not codex-bound).
+		r.Post("/runs/{id}/codex/release", h.WorkerCodexRelease)
+		r.Post("/runs/{id}/codex/refresh", h.WorkerCodexRefresh)
+
 		// Run judge (PRD #46 M3): a judge run reads the run it reviews and posts a
 		// verdict. Both are judge-run-scoped (the worker must own the active judge
 		// run reviewing {id}); {id} is the TARGET run, not the judge run.

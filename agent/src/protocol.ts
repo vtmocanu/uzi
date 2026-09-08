@@ -467,6 +467,61 @@ export type ClaimCodexSecrets =
   | { auth_mode: "api_key"; access_token: string; capability: string };
 
 /**
+ * Request body for POST /worker/runs/{id}/codex/release (PRD #1171 M1). The run id is the
+ * URL path and is NEVER carried in the body, so this carries ONLY the per-claim
+ * credential-operation capability. The server strict-decodes and rejects any extra field
+ * (a body-supplied run id, a user/secret/account id, or a token/login blob), so this shape
+ * is exactly the set of fields the endpoint accepts. Secret-bearing (the capability);
+ * never logged.
+ */
+export interface CodexReleaseRequest {
+  capability: string;
+}
+
+/**
+ * Response of the release route: ONLY the run's currently-committed access token. The auth
+ * mode and generation the worker needs already rode the claim ({@link ClaimCodexSecrets}),
+ * so a release is a re-fetch of the usable token for a fresh provider root. Delivered
+ * Cache-Control: no-store; secret-bearing, never logged or persisted beyond the run.
+ */
+export interface CodexReleaseResponse {
+  access_token: string;
+}
+
+/**
+ * Request body for POST /worker/runs/{id}/codex/refresh (PRD #1171 M1). The run id is the
+ * URL path. Fields, and ONLY these fields:
+ *
+ *   * capability — the per-claim credential-operation capability (as for release).
+ *   * operation_id — ONE random id per LOGICAL refresh, generated AND RETAINED by the
+ *     caller: after an HTTP timeout or a lost reply the caller re-calls with the SAME
+ *     operation_id so the server replays its prior result rather than starting a second
+ *     provider exchange. The worker never begins a second exchange blindly.
+ *   * observed_generation — the generation the worker last saw (from its claim's
+ *     {@link ClaimCodexSecrets} generation, or a prior refresh result's generation).
+ *
+ * Subscription only; an api_key run can never refresh and must never call this. The server
+ * strict-decodes and rejects any other field. Secret-bearing (the capability).
+ */
+export interface CodexRefreshRequest {
+  capability: string;
+  operation_id: string;
+  observed_generation: number;
+}
+
+/**
+ * Response of the refresh route on success: the freshly-committed access token, its
+ * generation (the worker's NEXT observed_generation), and the outcome
+ * ("advanced" | "replayed" | "reconciled"). A contended/quarantined outcome rides an HTTP
+ * error with no body, not this shape. Delivered Cache-Control: no-store; secret-bearing.
+ */
+export interface CodexRefreshResponse {
+  access_token: string;
+  generation: number;
+  outcome: string;
+}
+
+/**
  * Per-run secrets. Delivered ONLY in the claim response (PRD: "the claim
  * payload is the only delivery path"). Never persisted beyond the run, never
  * logged. The worker (not the agent) holds forge_pat and performs every

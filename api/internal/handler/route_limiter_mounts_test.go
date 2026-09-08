@@ -67,7 +67,11 @@ var limiterNames = [...]string{
 // error rather than a failing row. Spelled `lim*` rather than matching the parameter
 // names exactly, so nothing here shadows a parameter inside Routes.
 //
-// 182 as of this commit (PRD #1147 M1 added the six id-keyed codex credential writes —
+// 184 as of this commit (PRD #1171 M1 added POST /api/worker/runs/{id}/codex/release and
+// POST /api/worker/runs/{id}/codex/refresh — the Bearer-only Codex credential
+// release/refresh bridge, both worker-authenticated and both noLimiter, like the other
+// worker /runs/{id}/... routes they sit beside.)
+// It was 182 until then (PRD #1147 M1 added the six id-keyed codex credential writes —
 // POST/PATCH/DELETE for /api/me/secrets/codex_auth and /api/me/secrets/openai_api_key,
 // all cookie-only and all noLimiter, like the anthropic writes they sit beside.)
 // It was 176 until then (PRD #1093 M2 added GET, PUT and DELETE /api/schedules/pause —
@@ -537,6 +541,11 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/worker/heartbeat", noLimiter},
 	{"POST", "/api/worker/register", noLimiter},
 	{"POST", "/api/worker/runs/claim", noLimiter},
+	// PRD #1171 M1: the Codex credential release/refresh bridge. Bearer-only, scoped to
+	// the worker's own run; the coordinated refresher bounds contention itself and neither
+	// touches the forge → noLimiter, matching the other worker /runs/{id}/... writes.
+	{"POST", "/api/worker/runs/{id}/codex/refresh", noLimiter},
+	{"POST", "/api/worker/runs/{id}/codex/release", noLimiter},
 	// PRD #333 M2: the incidental-findings capture route. It rides
 	// proposalLimiter.PerWorkerMiddleware (a per-WORKER, IP-fallback mount), which this
 	// per-USER probe reads as noLimiter — same as the proposals route below it.
