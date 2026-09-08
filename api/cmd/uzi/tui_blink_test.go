@@ -156,12 +156,12 @@ func milestoneDetailRun(id string, done int, inProg string) apitypes.RunDTO {
 		Milestones: ms, MilestonesCompleted: completed, MilestonesInProgress: []string{inProg}}
 }
 
-// PRD #1136 SC1: the crew-rail in-progress milestone ROW is a ◐ ⇄ ○ blink in the faint colour,
-// in ANTI-PHASE to the micro-bar. blinkOn==false → ◐ (the presence/static frame); blinkOn==true →
+// PRD #1136 SC1: the crew-rail in-progress milestone ROW is a ◕ ⇄ ○ blink in the faint colour,
+// in ANTI-PHASE to the micro-bar. blinkOn==false → ◕ (the presence/static frame); blinkOn==true →
 // ○. This pins the alternation AND the inverted polarity — every OTHER rail test renders at the
 // default blinkOn==false (the static frame), so without this the toggle is unproven and green.
-// ◐ is the in-progress row's ONLY occurrence in the rail (the micro-bar uses ▰/▱, never ◐), so a
-// ◐-count of 1↔0 across the phases is a clean channel for the flip.
+// ◕ is the in-progress row's ONLY occurrence in the rail (the micro-bar uses ▰/▱, never ◕), so a
+// ◕-count of 1↔0 across the phases is a clean channel for the flip.
 func TestTUIDetailMilestoneRowBlinkAlternates(t *testing.T) {
 	now := time.Now()
 	run := milestoneDetailRun("77777777-2222", 1, "m2") // m1 done, m2 in progress, m3 not started
@@ -174,13 +174,13 @@ func TestTUIDetailMilestoneRowBlinkAlternates(t *testing.T) {
 	pal := newPalette(true)
 	off := render(false)
 	on := render(true)
-	// blinkOn==false (also the static / non-tty / NO_BLINK frame): the in-progress row is ◐ in faint.
-	if !strings.Contains(off, paintSeg(pal.faintC, nil, false, "◐")) {
-		t.Errorf("blinkOn=false: in-progress row is not ◐ in faint\n%s", stripANSI(off))
+	// blinkOn==false (also the static / non-tty / NO_BLINK frame): the in-progress row is ◕ in faint.
+	if !strings.Contains(off, paintSeg(pal.faintC, nil, false, "◕")) {
+		t.Errorf("blinkOn=false: in-progress row is not ◕ in faint\n%s", stripANSI(off))
 	}
-	// blinkOn==true: the row flips to ○; no ◐ remains anywhere in the rail.
-	if strings.Contains(on, "◐") {
-		t.Errorf("blinkOn=true: in-progress row did not flip away from ◐\n%s", stripANSI(on))
+	// blinkOn==true: the row flips to ○; no ◕ remains anywhere in the rail.
+	if strings.Contains(on, "◕") {
+		t.Errorf("blinkOn=true: in-progress row did not flip away from ◕\n%s", stripANSI(on))
 	}
 	if !strings.Contains(on, paintSeg(pal.faintC, nil, false, "○")) {
 		t.Errorf("blinkOn=true: in-progress row is not ○ in faint\n%s", stripANSI(on))
@@ -188,20 +188,20 @@ func TestTUIDetailMilestoneRowBlinkAlternates(t *testing.T) {
 }
 
 // PRD #1136 SC4: under an Ascii/NO_COLOR profile (tint stripped) the crew-rail in-progress row
-// stays legible by SHAPE — a static ◐, distinct from a not-started ○ and a done ✓. The board
+// stays legible by SHAPE — a static ◕, distinct from a not-started ○ and a done ✓. The board
 // micro-bar's Ascii test above covers only the micro-bar; this covers the rail rows (the case D4
-// exists for, doubly so now the row's ◐ shares faintC with a not-started ○).
+// exists for, doubly so now the row's ◕ shares faintC with a not-started ○).
 func TestTUIDetailMilestoneRowAsciiShape(t *testing.T) {
 	now := time.Now()
-	run := milestoneDetailRun("77777777-3333", 1, "m2") // m1 done (✓), m2 in progress (◐), m3 not started (○)
+	run := milestoneDetailRun("77777777-3333", 1, "m2") // m1 done (✓), m2 in progress (◕), m3 not started (○)
 	m := tuiTestModel(t, &uzicli.FakeClient{}, run.ID)
 	next, _ := m.Update(tea.ColorProfileMsg{Profile: colorprofile.Ascii})
 	m = next.(tuiModel)
 	m = applyDetail(m, run, []apitypes.MessageDTO{msgDTO(1, "text", "lead", "", "", "planning", now)})
 	// blinkOn defaults false → the static/presence frame; Ascii strips colour, so only shape carries state.
 	out := stripANSI(m.View().Content)
-	if !strings.Contains(out, "◐") {
-		t.Errorf("Ascii in-progress row is not the ◐ shape\n%s", out)
+	if !strings.Contains(out, "◕") {
+		t.Errorf("Ascii in-progress row is not the ◕ shape\n%s", out)
 	}
 	if !strings.Contains(out, "○") {
 		t.Errorf("Ascii not-started row is not the ○ shape\n%s", out)
@@ -215,7 +215,7 @@ func TestTUIDetailMilestoneRowAsciiShape(t *testing.T) {
 // in-progress row — blinkOn is a GLOBAL phase driven by any live board run, so an ungated row
 // would flip to a bare ○ (indistinguishable from a not-started sibling) on half the frames on
 // finished/stale data. milestoneRowCell gates its animation on `blink` (the same !terminal
-// condition the eyebrow micro-bar uses), so a terminal run's row is the STATIC ◐ regardless of
+// condition the eyebrow micro-bar uses), so a terminal run's row is the STATIC ◕ regardless of
 // blinkOn. Rendered at blinkOn==true — the frame that WOULD show ○ if the guard were missing.
 func TestTUIDetailMilestoneRowTerminalStaysStatic(t *testing.T) {
 	now := time.Now()
@@ -226,8 +226,8 @@ func TestTUIDetailMilestoneRowTerminalStaysStatic(t *testing.T) {
 	m.blinkOn = true // the phase that would expose a bare ○ if the row weren't gated on !terminal
 	out := m.View().Content
 	pal := newPalette(true)
-	if !strings.Contains(out, paintSeg(pal.faintC, nil, false, "◐")) {
-		t.Errorf("terminal run: in-progress row must stay a static ◐ (not pulse to ○) at blinkOn=true\n%s", stripANSI(out))
+	if !strings.Contains(out, paintSeg(pal.faintC, nil, false, "◕")) {
+		t.Errorf("terminal run: in-progress row must stay a static ◕ (not pulse to ○) at blinkOn=true\n%s", stripANSI(out))
 	}
 }
 
@@ -477,5 +477,197 @@ func TestTUIBoardSecondLineGainsAndLosesActivity(t *testing.T) {
 	m = next.(tuiModel)
 	if !strings.Contains(m.View().Content, "task-coder") {
 		t.Errorf("the selected run regained activity but the second line did not return\n%s", m.View().Content)
+	}
+}
+
+// ── #1176: the milestone micro-bars blink ONE cell PER in-progress milestone ──────────────────
+
+// boardRunWith builds a 4-milestone (m1..m4) board run with an explicit completed/in-progress set
+// and a distinct IssueTitle — the multi-in-progress and stale/duplicate shapes milestoneRunItem's
+// single-inProg helper cannot express.
+func boardRunWith(id, status, title string, completed, inProgress []string) apitypes.RunListItemDTO {
+	return apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{
+		ID: id, Kind: "issue", Status: status, IssueTitle: title,
+		Milestones:           []apitypes.Milestone{{ID: "m1"}, {ID: "m2"}, {ID: "m3"}, {ID: "m4"}},
+		MilestonesCompleted:  completed,
+		MilestonesInProgress: inProgress,
+	}}
+}
+
+// boardMileLine renders ONE board run at the Ascii profile (so the bar reads by SHAPE, the same
+// channel TestTUIBlinkAsciiShapeAlternates uses) with the given blink phase, and returns the
+// stripped physical line carrying it — isolated by its IssueTitle so a sibling run's bar can't
+// stand in.
+func boardMileLine(t *testing.T, run apitypes.RunListItemDTO, on bool) string {
+	t.Helper()
+	m := tuiTestModel(t, &uzicli.FakeClient{}, "")
+	m.width = 120
+	next, _ := m.Update(tea.ColorProfileMsg{Profile: colorprofile.Ascii})
+	m = next.(tuiModel)
+	next, _ = m.Update(boardRunsMsg{reqID: m.board.waitID, runs: []apitypes.RunListItemDTO{run}})
+	m = next.(tuiModel)
+	m.blinkOn = on
+	out := stripANSI(m.View().Content)
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, run.IssueTitle) {
+			return line
+		}
+	}
+	t.Fatalf("no board line for %q\n%s", run.IssueTitle, out)
+	return ""
+}
+
+// railEyebrow renders the crew-rail milestone block through the COMPOSED detail view
+// (m.View().Content) — the same laneRailWidth (26) clamp a user sees, via joinColumns. Asserting
+// here rather than on the unclamped renderMilestones() proves the #1176 in-flight suffix survives
+// end to end: a multi-id `· <id>, <id>` suffix reflows to its own rail line instead of ellipsizing.
+func railEyebrow(t *testing.T, run apitypes.RunDTO, on bool) string {
+	t.Helper()
+	m := tuiTestModel(t, &uzicli.FakeClient{}, run.ID) // width defaults to 120
+	m = applyDetail(m, run, nil)
+	m.blinkOn = on
+	return stripANSI(m.View().Content)
+}
+
+// milestoneRailRun builds a milestone-structured RunDTO for the crew-rail eyebrow tests.
+func milestoneRailRun(id, title string, ms []apitypes.Milestone, completed, inProgress []string) apitypes.RunDTO {
+	return apitypes.RunDTO{ID: id, Kind: "issue", Status: "running", IssueTitle: title,
+		Milestones: ms, MilestonesCompleted: completed, MilestonesInProgress: inProgress}
+}
+
+// FAILS-BEFORE (#1176): the board micro-bar blinks ONE cell PER in-progress milestone, not just
+// the first. Two milestones in flight (m2, m3) after one done (m1) draw done ▰ + two in-progress ▰
+// + one remaining ▱ = ▰▰▰▱ in the ON frame. The pre-#1176 single-cell bar rendered ▰▰▱▱ (one
+// in-progress cell) and fails the ON assertion.
+func TestTUIBoardMilestoneBarCountsTwoInProgress(t *testing.T) {
+	run := boardRunWith("aaaaaaaa-1", "running", "two-in-flight",
+		[]string{"m1"}, []string{"m2", "m3"}) // done=1, m2+m3 in flight, m4 remaining
+	on := boardMileLine(t, run, true)
+	off := boardMileLine(t, run, false)
+	// ON: done ▰ + two in-progress ▰ + one remaining ▱ = ▰▰▰▱. A single-cell bar would be ▰▰▱▱.
+	if !strings.Contains(on, "▰▰▰▱") {
+		t.Errorf("ON frame with two in-progress milestones must render ▰▰▰▱\n%q", on)
+	}
+	// OFF/static frame: both in-progress cells are ▱ → ▰▱▱▱.
+	if !strings.Contains(off, "▰▱▱▱") {
+		t.Errorf("OFF frame must render ▰▱▱▱ (in-progress cells ▱)\n%q", off)
+	}
+	if off == on {
+		t.Error("the in-progress cells did not alternate by shape between phases")
+	}
+}
+
+// FAILS-BEFORE (#1176): the crew-rail eyebrow bar counts EVERY in-progress milestone AND the
+// suffix lists them all. Two in flight (m2, m3) after one done → the bar is ▰▰▰▱ (single-cell:
+// ▰▰▱▱) and the suffix is `· m2, m3` (first-id-only: `· m2`).
+func TestTUIRailEyebrowCountsAndSuffix(t *testing.T) {
+	run := milestoneRailRun("eeeeeeee-1", "rail two",
+		[]apitypes.Milestone{{ID: "m1", Title: "Alpha"}, {ID: "m2", Title: "Beta"},
+			{ID: "m3", Title: "Gamma"}, {ID: "m4", Title: "Delta"}},
+		[]string{"m1"}, []string{"m2", "m3"})
+	eye := railEyebrow(t, run, true)
+	// The bar counts BOTH in-progress cells: done ▰ + 2 in-progress-on ▰ + 1 remaining ▱ = ▰▰▰▱.
+	if !strings.Contains(eye, "▰▰▰▱") {
+		t.Errorf("eyebrow bar must count two in-progress cells (▰▰▰▱, single-cell would be ▰▰▱▱)\n%q", eye)
+	}
+	// The suffix lists EVERY in-progress id; a first-id-only suffix would read `· m2`.
+	if !strings.Contains(eye, "· m2, m3") {
+		t.Errorf("eyebrow suffix must list both in-progress ids as `· m2, m3`\n%q", eye)
+	}
+}
+
+// FAILS-BEFORE (#1176): the eyebrow suffix shows at most two ids, folding the rest into ` +N`.
+// Three in flight (m1, m2, m3) → `· m1, m2 +1`. A first-id-only suffix would read `· m1`.
+func TestTUIRailEyebrowSuffixCapsAtTwo(t *testing.T) {
+	run := milestoneRailRun("eeeeeeee-2", "rail three",
+		[]apitypes.Milestone{{ID: "m1", Title: "Alpha"}, {ID: "m2", Title: "Beta"},
+			{ID: "m3", Title: "Gamma"}, {ID: "m4", Title: "Delta"}},
+		[]string{},                 // non-nil empty ⇒ reported
+		[]string{"m1", "m2", "m3"}) // three in progress
+	eye := railEyebrow(t, run, false)
+	if !strings.Contains(eye, "· m1, m2 +1") {
+		t.Errorf("eyebrow suffix must cap at two ids with a +N remainder (`· m1, m2 +1`)\n%q", eye)
+	}
+}
+
+// GUARD (#1176): a milestone that is BOTH completed and (stale) in-progress is excluded from the
+// in-flight suffix. Holds before and after m2 — milestoneInProgress already skipped a ticked id,
+// and milestoneInProgressIDs applies the same completed-exclusion.
+func TestTUIRailEyebrowSuffixOmitsCompleted(t *testing.T) {
+	run := milestoneRailRun("eeeeeeee-3", "rail stale",
+		[]apitypes.Milestone{{ID: "m1", Title: "Alpha"}, {ID: "m2", Title: "Beta"}, {ID: "m3", Title: "Gamma"}},
+		[]string{"m1"}, []string{"m1", "m2"}) // m1 is ticked AND stale-in-progress
+	eye := railEyebrow(t, run, false)
+	if !strings.Contains(eye, "· m2") {
+		t.Errorf("eyebrow suffix must name the live in-progress id (`· m2`)\n%q", eye)
+	}
+	// m1 is completed, so it must NOT appear anywhere in the eyebrow's in-flight suffix.
+	if strings.Contains(eye, "m1") {
+		t.Errorf("a ticked milestone (m1) must be excluded from the in-flight suffix\n%q", eye)
+	}
+}
+
+// FAILS-BEFORE (this rework): a long-slug in-progress trio must keep its in-flight COUNT in the
+// composed rail. `backend-setup`/`frontend-wire`/`deploy-stage` (each at/over the 12-col Plain cap)
+// make an unbudgeted `· <id>, <id> +1` exceed the fixed 26-col rail, so joinColumns clamps the line
+// and eats the trailing `+N`. The budgeted suffix folds the shown pair into one id + a larger `+N`,
+// so the composed continuation line fits and the count survives.
+func TestTUIRailEyebrowLongIDsKeepCount(t *testing.T) {
+	run := milestoneRailRun("eeeeeeee-4", "rail long ids",
+		[]apitypes.Milestone{
+			{ID: "backend-setup", Title: "Backend"}, {ID: "frontend-wire", Title: "Frontend"},
+			{ID: "deploy-stage", Title: "Deploy"}},
+		[]string{}, // non-nil empty ⇒ reported
+		[]string{"backend-setup", "frontend-wire", "deploy-stage"}) // three long ids in flight
+	view := railEyebrow(t, run, false)
+	// Three in flight, one id shown ⇒ `+2`. The count must survive the composed-view rail clamp
+	// (an unbudgeted `<id>, <id> +1` line would ellipsize the `+N` away).
+	if !strings.Contains(view, "+2") {
+		t.Errorf("long-id in-flight count must survive the composed rail clamp as `+2`\n%s", view)
+	}
+}
+
+// GUARD (#1176): a TERMINAL run carrying a stale MilestonesInProgress draws NO in-progress cells
+// and does not flip with the blink phase — the row is faint end to end. Holds before and after m2
+// (the `dim`/`!terminal` gate is unchanged). Rendered at blinkOn=true (the frame that would show
+// an in-progress ▰ if the gate were missing) and compared against the OFF frame.
+func TestTUIBoardMilestoneBarTerminalBlinksNothing(t *testing.T) {
+	run := boardRunWith("aaaaaaaa-2", "completed", "done stale",
+		[]string{"m1"}, []string{"m2", "m3"}) // stale in-progress on a finished run
+	on := boardMileLine(t, run, true)
+	off := boardMileLine(t, run, false)
+	// Only the done cell is filled; the finished row blinks nothing → ▰▱▱▱.
+	if !strings.Contains(on, "▰▱▱▱") {
+		t.Errorf("terminal run must draw only the done cell (▰▱▱▱), no in-progress cells\n%q", on)
+	}
+	if on != off {
+		t.Errorf("terminal run's bar must not flip with the blink phase\non =%q\noff=%q", on, off)
+	}
+}
+
+// GUARD (#1176): the frozen-list helper drops an in-progress id absent from the frozen list and
+// dedups a repeated one, so a stale or duplicated snapshot can never overflow the bar. Both hold
+// before and after m2 (milestoneInProgress iterated the frozen list too) — regression guards for
+// milestoneInProgressIDs.
+func TestTUIBoardMilestoneBarStaleAndDuplicateNotCounted(t *testing.T) {
+	// (a) an in-progress id absent from the frozen list is dropped → no in-progress cell.
+	stale := boardRunWith("aaaaaaaa-3", "running", "stale id",
+		[]string{"m1"}, []string{"mX"}) // mX is not in m1..m4
+	line := boardMileLine(t, stale, true)
+	if !strings.Contains(line, "▰▱▱▱") {
+		t.Errorf("(a) a stale in-progress id must draw no in-progress cell (▰▱▱▱)\n%q", line)
+	}
+	if strings.Contains(line, "▰▰") {
+		t.Errorf("(a) a dropped stale id must not add a second filled cell\n%q", line)
+	}
+	// (b) a duplicated in-progress id counts once → exactly ONE in-progress cell.
+	dup := boardRunWith("aaaaaaaa-4", "running", "dup id",
+		[]string{"m1"}, []string{"m2", "m2"}) // duplicate m2
+	line = boardMileLine(t, dup, true)
+	if !strings.Contains(line, "▰▰▱▱") {
+		t.Errorf("(b) a duplicated in-progress id must count once (▰▰▱▱)\n%q", line)
+	}
+	if strings.Contains(line, "▰▰▰▱") {
+		t.Errorf("(b) a duplicated id must not draw two in-progress cells (▰▰▰▱)\n%q", line)
 	}
 }

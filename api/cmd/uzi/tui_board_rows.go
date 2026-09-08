@@ -447,16 +447,20 @@ func (m tuiModel) milestoneMarker(r apitypes.RunListItemDTO, dim bool, bg color.
 	if dim {
 		fillC = m.pal.faintC
 	}
-	// The in-progress cell (first frozen id in progress, D4) takes the cell right after the
-	// done fill and blinks ▰/▱ in the tungsten colour (PRD #1136 D2, via milestoneCell). Not on
-	// a DONE (terminal) row — its in-progress snapshot is stale and the row is faint end to end.
-	ipID, _ := milestoneInProgress(r.RunDTO)
-	blink := ipID != "" && done < total && !dim
+	// The in-progress cells (EVERY frozen id in progress, #1176) take the cells right after the
+	// done fill and blink ▰/▱ in the tungsten colour (via milestoneCell). The count is clamped to
+	// the remaining cells (defensive; the frozen-list helper already bounds it). Not on a DONE
+	// (terminal) row — its in-progress snapshot is stale and the row is faint end to end.
+	n := len(milestoneInProgressIDs(r.RunDTO))
+	if rem := total - done; n > rem {
+		n = rem
+	}
+	blink := n > 0 && done < total && !dim
 	out := paintSeg(fillC, bg, false, strings.Repeat("▰", done))
 	empty := total - done
 	if blink {
-		out += m.milestoneCell(bg)
-		empty--
+		out += strings.Repeat(m.milestoneCell(bg), n)
+		empty -= n
 	}
 	return out + paintSeg(m.pal.faintC, bg, false, strings.Repeat("▱", empty))
 }
