@@ -55,7 +55,7 @@ describe("mockApi settings persistence (demo survives reload)", () => {
           judge_daily_budget: "0",
           health_enabled: "false",
           health_stall_seconds: "120",
-          health_slow_seconds: "2700",
+          health_near_timeout_pct: "85",
           health_queued_seconds: "600",
           health_approval_seconds: "3600",
           health_nudge_cooldown_seconds: "1800",

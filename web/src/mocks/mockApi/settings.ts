@@ -69,7 +69,9 @@ const SEED_APP_SETTINGS: AppSettings = {
   summary_model: "haiku",
   health_enabled: "true",
   health_stall_seconds: "300",
-  health_slow_seconds: "2700",
+  // PRD #1170: near-timeout at 85% of the run's wall-clock budget (replaces the old
+  // wall-clock "slow after seconds" default of 2700).
+  health_near_timeout_pct: "85",
   health_queued_seconds: "600",
   health_approval_seconds: "3600",
   health_nudge_cooldown_seconds: "1800",
@@ -146,7 +148,7 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
     (a.summary_model === undefined || typeof a.summary_model === "string") &&
     typeof a.health_enabled === "string" &&
     typeof a.health_stall_seconds === "string" &&
-    typeof a.health_slow_seconds === "string" &&
+    typeof a.health_near_timeout_pct === "string" &&
     typeof a.health_queued_seconds === "string" &&
     typeof a.health_approval_seconds === "string" &&
     typeof a.health_nudge_cooldown_seconds === "string" &&
@@ -608,7 +610,6 @@ export const settingsApi = {
       // inclusive range [60, 86400].
       if (
         key === "health_stall_seconds" ||
-        key === "health_slow_seconds" ||
         key === "health_queued_seconds" ||
         key === "health_approval_seconds" ||
         key === "health_nudge_cooldown_seconds"
@@ -619,6 +620,20 @@ export const settingsApi = {
         const n = Number(value);
         if (n !== 0 && (n < 60 || n > 86400)) {
           throw new ApiError(400, `${key}: must be 0 (off) or between 60 and 86400`);
+        }
+        (nonSecret as Record<string, string>)[key] = String(n);
+        continue;
+      }
+      // Near-timeout percent (PRD #1170), mirroring the server's validateHealthPercent:
+      // a whole number that is 0 (disable) or in the inclusive range [50, 99]. 100 is
+      // rejected because the sweeper fires the timeout at 100%.
+      if (key === "health_near_timeout_pct") {
+        if (!/^-?\d+$/.test(value)) {
+          throw new ApiError(400, `${key}: must be 0 (disabled) or between 50 and 99 percent`);
+        }
+        const n = Number(value);
+        if (n !== 0 && (n < 50 || n > 99)) {
+          throw new ApiError(400, `${key}: must be 0 (disabled) or between 50 and 99 percent`);
         }
         (nonSecret as Record<string, string>)[key] = String(n);
         continue;
