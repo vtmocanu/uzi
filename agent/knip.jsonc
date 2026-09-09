@@ -32,6 +32,13 @@
   // `unlisted`/`binaries` rules, so a *different* mistake about it is still caught.
   "ignoreDependencies": ["agent-browser"],
 
+  // `mkfifo` is a standard POSIX utility (coreutils), invoked ONLY by
+  // test/repo-instructions.test.ts to build a real FIFO and prove the CLAUDE.md reader
+  // never blocks on `open()` (#1219). It is not a project dependency and has no
+  // package.json bin, so knip's `binaries` rule flags it as unlisted; the test itself
+  // skips cleanly when `mkfifo` is absent. This is the ONLY ignored binary.
+  "ignoreBinaries": ["mkfifo"],
+
   // An exported type/interface referenced only within its OWN declaring file is
   // legitimate in-file contract surface, not dead-export debt: the src/protocol.ts
   // worker/api wire DTOs are exported so a reader finds the shape even though one

@@ -2784,6 +2784,39 @@ describe("SdkExecutor JS dependency provisioning (PRD #121 M2)", () => {
     );
   });
 
+  it("reads the repo root CLAUDE.md BEFORE the dependency install can mutate the clone (#1219 TOCTOU)", async () => {
+    // Load-bearing ordering (#246 M2 symlink-follow safety): readRepoInstructions must run
+    // BEFORE startDepsInstall. The package manager is the concurrent, un-awaited clone
+    // writer; reading first removes it from the resolve→read window. This installDeps fake
+    // rewrites the root CLAUDE.md the instant it is invoked — if the read ran AFTER the
+    // install kicked off (the pre-#1219 order), the lead prompt would carry the POST bytes.
+    const worktree = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-repoinstr-order-"));
+    const PRE = "PRE-INSTALL-REPO-INSTRUCTIONS-MARKER";
+    const POST = "POST-INSTALL-REPO-INSTRUCTIONS-MARKER";
+    fs.writeFileSync(path.join(worktree, "CLAUDE.md"), `# ${PRE}\n`);
+
+    const installDeps: SdkExecutorOptions["installDeps"] = async (root) => {
+      // Synchronous rewrite at invocation: with the correct ordering this runs after the
+      // read, so the POST bytes never reach the prompt.
+      fs.writeFileSync(path.join(root, "CLAUDE.md"), `# ${POST}\n`);
+      return { results: [], truncated: false };
+    };
+
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("# Plan\n- step 1"), resultSuccess()],
+      [assistantText("implementing"), signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx({ worktreePath: worktree, repoClaudemdEnabled: true });
+    try {
+      await new SdkExecutor(nullLogger(), homeDir, { queryFn, installDeps }).run(probe.ctx);
+      const planAppend = appendOf(turns[0]!.options.systemPrompt);
+      assert.ok(planAppend.includes(PRE), "the lead prompt carries the CLAUDE.md bytes read BEFORE the install");
+      assert.ok(!planAppend.includes(POST), "the install's post-kickoff rewrite must never reach the prompt");
+    } finally {
+      fs.rmSync(worktree, { recursive: true, force: true });
+    }
+  });
+
   // Local: `revise`/`approve` live in the PRD #41 describe block, not at file scope.
   const revise = (feedback: string): PlanVerdict => ({ kind: "revise", feedback });
   const approve: PlanVerdict = { kind: "approve", selection: { status: "absent" } };

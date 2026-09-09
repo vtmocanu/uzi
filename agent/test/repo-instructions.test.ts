@@ -1,6 +1,9 @@
-import { afterEach, beforeEach, describe, it } from "node:test";
+import { afterEach, beforeEach, describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import fsp from "node:fs/promises";
+import type { FileHandle } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import {
@@ -211,6 +214,125 @@ describe("readRepoInstructions (PRD #246 M2)", () => {
     fs.writeFileSync(path.join(clone, "AGENTS.md"), "x".repeat(REPO_INSTRUCTIONS_MAX_BYTES + 1));
     fs.symlinkSync("AGENTS.md", repoInstructionsPath(clone));
     assert.deepStrictEqual(await readRepoInstructions(clone), { dropped: "too_large" });
+  });
+
+  it("an actual ELOOP symlink cycle (a -> b -> a) ⇒ dropped: symlinked", async () => {
+    // realpath walks the chain and throws ELOOP on a cycle; the reader maps that throw
+    // to `symlinked`, never a crash. CLAUDE.md -> a.md, a.md -> b.md, b.md -> a.md.
+    fs.symlinkSync("a.md", repoInstructionsPath(clone));
+    fs.symlinkSync("b.md", path.join(clone, "a.md"));
+    fs.symlinkSync("a.md", path.join(clone, "b.md"));
+    assert.deepStrictEqual(await readRepoInstructions(clone), { dropped: "symlinked" });
+  });
+
+  it("a symlinked clonePath still follows an in-tree symlink target", async () => {
+    // The clone root itself is reached via a symlink (realpath resolves BOTH sides, so
+    // the containment compare is realClone vs realTarget, not the raw paths). An in-tree
+    // CLAUDE.md -> AGENTS.md is still correctly contained and read.
+    const body = "# Via a symlinked clone root\nStill contained.\n";
+    fs.writeFileSync(path.join(clone, "AGENTS.md"), body);
+    fs.symlinkSync("AGENTS.md", repoInstructionsPath(clone));
+    const linkToClone = `${clone}-alias`;
+    fs.symlinkSync(clone, linkToClone);
+    try {
+      const result = await readRepoInstructions(linkToClone);
+      assert.ok("text" in result);
+      assert.strictEqual(result.text, body);
+    } finally {
+      fs.rmSync(linkToClone, { force: true });
+    }
+  });
+
+  it("an in-tree symlink to an UNTRACKED/generated regular file is followed (provenance is 'any in-tree regular file')", async () => {
+    // Pins the intended (widened) provenance policy: the followed target need not be a
+    // tracked or human-authored file — any contained regular file is read. A build step
+    // writing a file the symlink points at is in scope by design; the safety rests on
+    // containment + advisory framing + reading before untrusted code runs, NOT on the
+    // target's provenance. If this policy is ever tightened, this test should change too.
+    const body = "# Generated at build time\nNot a tracked file.\n";
+    fs.writeFileSync(path.join(clone, "generated.md"), body);
+    fs.symlinkSync("generated.md", repoInstructionsPath(clone));
+    const result = await readRepoInstructions(clone);
+    assert.ok("text" in result);
+    assert.strictEqual(result.text, body);
+  });
+
+  it("an in-tree symlink to a FIFO ⇒ dropped: symlinked, and open NEVER blocks", async () => {
+    // CLAUDE.md -> an in-tree FIFO. Without O_NONBLOCK, open(O_RDONLY) on a FIFO blocks
+    // until a writer appears, hanging run setup; with it, open returns and the fstat
+    // rejects the non-regular file.
+    const fifo = path.join(clone, "pipe");
+    try {
+      execFileSync("mkfifo", [fifo], { stdio: "pipe" });
+    } catch {
+      return; // mkfifo unavailable (non-POSIX) — the guard is POSIX-only; skip cleanly.
+    }
+    fs.symlinkSync("pipe", repoInstructionsPath(clone));
+    // Bounded, and cleaned up in BOTH directions. The timer is cleared on the fast
+    // (passing) path so it never holds the event loop open. The reader is started ONCE and
+    // referenced in the catch. A rendezvous-writer is opened ONLY when the timeout actually
+    // fired (timedOut) — i.e. only when the reader is genuinely parked in open(O_RDONLY): a
+    // fast assertion failure or a reader rejection enters the catch with NO parked reader,
+    // where opening a writer would hang. The writer uses O_WRONLY | O_NONBLOCK so it never
+    // blocks, and we then let the (released) reader settle, bounded, before rethrowing.
+    const reader = readRepoInstructions(clone);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let timedOut = false;
+    const guard = new Promise<never>((_, rej) => {
+      timer = setTimeout(() => {
+        timedOut = true;
+        rej(new Error("readRepoInstructions blocked on a FIFO open"));
+      }, 3000);
+    });
+    try {
+      const result = await Promise.race([reader, guard]);
+      assert.deepStrictEqual(result, { dropped: "symlinked" });
+    } catch (err) {
+      if (timedOut) {
+        // Regression path only: release the parked reader with a non-blocking writer so
+        // the process can exit, then let the reader settle (bounded) before rethrowing.
+        try {
+          fs.closeSync(fs.openSync(fifo, fs.constants.O_WRONLY | fs.constants.O_NONBLOCK));
+        } catch {
+          /* best effort — never block or mask the real failure */
+        }
+        await Promise.race([reader.catch(() => {}), new Promise((r) => setTimeout(r, 500))]);
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+  });
+
+  it("a close() failure after a successful read is swallowed ⇒ still returns text (never throws)", async () => {
+    // The finally must not let a rejecting close() override the return: an unguarded
+    // `await fh.close()` throw in a finally replaces the try's return with a throw,
+    // breaking the reader's "always returns a drop or text, never throws" contract that
+    // keeps run setup alive. Stub open() to hand back a handle whose close rejects while
+    // stat/readFile succeed.
+    write("# prose\nkeep me\n");
+    const openReal = fsp.open.bind(fsp);
+    const m = mock.method(fsp, "open", async (p: string, flags: number) => {
+      const real = await openReal(p, flags);
+      return {
+        stat: () => real.stat(),
+        readFile: (enc: BufferEncoding) => real.readFile(enc),
+        close: async () => {
+          await real.close(); // still release the real fd, then fail the close()
+          throw new Error("synthetic close failure");
+        },
+      } as unknown as FileHandle;
+    });
+    try {
+      const result = await readRepoInstructions(clone);
+      // Non-vacuous: prove the stubbed open (whose close throws) was actually exercised,
+      // so a mock that failed to patch the shared module can't turn this into a false pass.
+      assert.ok(m.mock.callCount() >= 1, "the stubbed open must have been used");
+      assert.ok("text" in result, "a close() failure must not turn a good read into a drop or throw");
+      assert.match((result as { text: string }).text, /keep me/);
+    } finally {
+      m.mock.restore();
+    }
   });
 
   it("line-leading @-import lines are stripped to a visible marker; prose survives", async () => {

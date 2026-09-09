@@ -755,6 +755,51 @@ export class SdkExecutor implements Executor {
       provision: this.provision,
     });
 
+    // Repo instructions (PRD #246 M2). When the repo owner opted in, read + sanitize
+    // the clone's ROOT CLAUDE.md and frame it ONCE as a nonce-fenced UNTRUSTED/ADVISORY
+    // block — read once (one file read), framed once (one nonce), threaded to BOTH
+    // buildLeadSystemPrompt sites below. `settingSources: []` is untouched: this is our
+    // own read+inject channel, never the SDK's project loader. Lead-only. The outcome
+    // (injected byte count, or the drop reason) is trace-logged.
+    //
+    // READ HERE, BEFORE startDepsInstall — deliberately, and load-bearing for the
+    // symlink-follow safety. The install runs with --ignore-scripts + per-manager
+    // hardening (js-deps.ts), so it does NOT execute repo-authored install code — but the
+    // package manager ITSELF writes into the clone (node_modules, lockfiles) and is NOT
+    // awaited (it overlaps the plan turn), so it mutates the clone CONCURRENTLY with
+    // everything below. Reading the root CLAUDE.md before that install begins removes that
+    // same-run writer from readRepoInstructions' resolve→open window; the inode-pinned,
+    // O_NOFOLLOW read (open once, fstat + read through the handle) then pins the bytes and
+    // rejects a FINAL-component symlink swap. This is a mitigation, not a total guarantee:
+    // a PARENT-component swap before open, and documented cross-run races (with
+    // WORKER_MAX_CONCURRENT_RUNS > 1 a sibling run's Bash can write another run's worktree
+    // — docs/worker-setup.md), remain residual.
+    let repoInstructionsBlock: string | undefined;
+    if (ctx.repoClaudemdEnabled) {
+      const result = await readRepoInstructions(ctx.worktreePath);
+      if ("text" in result) {
+        repoInstructionsBlock = buildRepoInstructionsContext(result.text);
+        // Only claim "injected" when the FRAMED block is non-empty. A present but
+        // whitespace-only CLAUDE.md frames to "" (buildLeadSystemPrompt then injects
+        // nothing), so emitting "injected … (N bytes)" here would be a false status.
+        ctx.emit({
+          kind: "status",
+          agent: "worker",
+          payload: {
+            text: repoInstructionsBlock
+              ? `repo instructions: injected root CLAUDE.md as advisory lead context (${Buffer.byteLength(result.text, "utf8")} bytes)`
+              : `repo instructions: not injected (empty)`,
+          },
+        });
+      } else {
+        ctx.emit({
+          kind: "status",
+          agent: "worker",
+          payload: { text: `repo instructions: not injected (${result.dropped})` },
+        });
+      }
+    }
+
     // JS dependency provisioning (PRD #121 M2). Kicked off HERE — after
     // provisionRunTools, so the install resolves the RUN's provisioned node/npm off
     // toolEnv's PATH rather than the image's, and before the plan turn, so it overlaps
@@ -812,38 +857,6 @@ export class SdkExecutor implements Executor {
     const runSkills = prepared.runSkills;
     const skillsPluginPath = prepared.pluginPath;
     this.emitSkillDrops(ctx, prepared.drops);
-
-    // Repo instructions (PRD #246 M2). When the repo owner opted in, read + sanitize
-    // the clone's ROOT CLAUDE.md and frame it ONCE as a nonce-fenced UNTRUSTED/ADVISORY
-    // block — read once (one file read), framed once (one nonce), threaded to BOTH
-    // buildLeadSystemPrompt sites below. `settingSources: []` is untouched: this is our
-    // own read+inject channel, never the SDK's project loader. Lead-only. The outcome
-    // (injected byte count, or the drop reason) is trace-logged like emitSkillDrops.
-    let repoInstructionsBlock: string | undefined;
-    if (ctx.repoClaudemdEnabled) {
-      const result = await readRepoInstructions(ctx.worktreePath);
-      if ("text" in result) {
-        repoInstructionsBlock = buildRepoInstructionsContext(result.text);
-        // Only claim "injected" when the FRAMED block is non-empty. A present but
-        // whitespace-only CLAUDE.md frames to "" (buildLeadSystemPrompt then injects
-        // nothing), so emitting "injected … (N bytes)" here would be a false status.
-        ctx.emit({
-          kind: "status",
-          agent: "worker",
-          payload: {
-            text: repoInstructionsBlock
-              ? `repo instructions: injected root CLAUDE.md as advisory lead context (${Buffer.byteLength(result.text, "utf8")} bytes)`
-              : `repo instructions: not injected (empty)`,
-          },
-        });
-      } else {
-        ctx.emit({
-          kind: "status",
-          agent: "worker",
-          payload: { text: `repo instructions: not injected (${result.dropped})` },
-        });
-      }
-    }
 
     // Subagents: each def.skills is its allocated delivered skills (re-filtered to
     // the materialized survivors, so it never lists a uzi:<name> not in the plugin
