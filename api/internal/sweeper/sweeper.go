@@ -107,7 +107,7 @@ func (e *Engine) runOnce(ctx context.Context) {
 	}
 	// Only log when the pass actually did something, to keep the log quiet on an
 	// idle system.
-	if res.WorkersOffline+res.ClaimedReset+res.RunningTimeout+res.StaleFailed+res.StaleRequeued+res.ChatIdleCompleted+res.ProposalsRecovered+res.HealthChanged+res.AutoStopped+res.PoolResumed > 0 {
+	if res.WorkersOffline+res.ClaimedReset+res.RunningTimeout+res.StaleFailed+res.StaleRequeued+res.ChatIdleCompleted+res.ProposalsRecovered+res.HealthChanged+res.AutoStopped+res.LimitPromoted+res.PoolResumed+res.RecoveryPromoted > 0 {
 		slog.Info("sweeper pass",
 			"workers_offline", res.WorkersOffline,
 			"claimed_reset", res.ClaimedReset,
@@ -121,10 +121,18 @@ func (e *Engine) runOnce(ctx context.Context) {
 			// as observability that nothing observes is the wrong shape for an M7
 			// milestone, and without it an auto-stop does not raise this line at all.
 			"auto_stopped", res.AutoStopped,
+			// PRD #35: same reasoning — in the sum above as well as emitted here, so a
+			// tick that only promotes a run out of limit_wait (retry_not_before elapsed)
+			// still raises this line rather than resuming a held run invisibly.
+			"limit_promoted", res.LimitPromoted,
 			// PRD #754 M5: same reasoning — in the sum above as well as emitted here, so a
 			// resume-only tick (nothing else changed) still raises this line rather than
 			// resuming a held run invisibly.
 			"pool_resumed", res.PoolResumed,
+			// issue #1197: same reasoning — in the sum above as well as emitted here, so a
+			// tick that only promotes a run out of recovery_wait (recovery_retry_not_before
+			// elapsed) still raises this line rather than resuming a held run invisibly.
+			"recovery_promoted", res.RecoveryPromoted,
 		)
 	}
 }
