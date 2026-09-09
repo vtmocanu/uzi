@@ -6,6 +6,7 @@ import {
   type IncidentalFindingBucket,
   type IncidentalFindingFileResult,
   type IncidentalFindingIssueDraft,
+  type TriageCounts,
 } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
 import { recommendationLabel, verdictLabel } from "../../lib/judge";
@@ -17,12 +18,19 @@ import { reviews } from "./judge";
 
 // Incidental-findings coordinates (PRD #333 M7). Mutable copy so file/dismiss persist in a
 // demo session; the seed stays pristine so a module reload re-seeds a clean backlog.
-const findings: MockFinding[] = mockFindings.map((f) => ({ ...f, labels: [...f.labels], run_ids: [...f.run_ids] }));
+const findings: MockFinding[] = mockFindings.map((f) => ({
+  ...f,
+  labels: [...f.labels],
+  run_ids: [...f.run_ids],
+  occurrences: f.occurrences ? f.occurrences.map((o) => ({ ...o })) : undefined,
+}));
 
 // findingDTO projects a mock coordinate to the wire DTO, omitting the optional keys exactly as
-// the server's `omitempty` tags do (a null finding_id / iid / resolved_at is simply absent).
+// the server's `omitempty` tags do (a null finding_id / iid / resolved_at / reason is simply
+// absent). disposition_id is always present (PRD #1183 M3).
 function findingDTO(f: MockFinding): IncidentalFinding {
   return {
+    disposition_id: f.disposition_id,
     ...(f.finding_id ? { finding_id: f.finding_id } : {}),
     location: f.location,
     repo_id: f.repo_id,
@@ -30,21 +38,27 @@ function findingDTO(f: MockFinding): IncidentalFinding {
     status: f.status,
     last_title: f.last_title,
     seen_in_runs: f.seen_in_runs,
+    ...(f.dismiss_reason ? { dismiss_reason: f.dismiss_reason } : {}),
+    ...(f.set_via ? { set_via: f.set_via } : {}),
+    ...(f.evidence_preview ? { evidence_preview: f.evidence_preview } : {}),
+    ...(f.occurrences && f.occurrences.length ? { occurrences: f.occurrences.map((o) => ({ ...o })) } : {}),
     ...(f.filed_issue_iid != null ? { filed_issue_iid: f.filed_issue_iid } : {}),
     ...(f.filed_issue_url ? { filed_issue_url: f.filed_issue_url } : {}),
     ...(f.resolved_at ? { resolved_at: f.resolved_at } : {}),
   };
 }
 
-// matchFindingBucket maps a disposition status to the ?bucket= filter (D7): to_file shows only
-// open, filed/dismissed show their own status, all shows everything (the transient `filing` is
-// invisible to to_file, exactly like the server).
+// matchFindingBucket maps a disposition status to the ?bucket= filter (D7; PRD #1183 M4 added
+// `done`): to_file shows only open, filed/done/dismissed show their own status, all shows
+// everything (the transient `filing` is invisible to to_file, exactly like the server).
 function matchFindingBucket(status: MockFinding["status"], bucket: IncidentalFindingBucket): boolean {
   switch (bucket) {
     case "to_file":
       return status === "open";
     case "filed":
       return status === "filed";
+    case "done":
+      return status === "done";
     case "dismissed":
       return status === "dismissed";
     case "all":
@@ -161,13 +175,15 @@ export const findingsApi = {
     // card / stale backlog row handles gracefully (the guarded claim, D4).
     if (f.status !== "open") throw new ApiError(409, "this finding is already filed or being filed");
     const iid = 900 + (parseInt(id.replace(/\D/g, ""), 10) || 0);
+    const webURL = `https://gitlab.example.com/${f.repo_path}/-/issues/${iid}`;
     f.status = "filed";
     f.filed_issue_iid = iid;
+    f.filed_issue_url = webURL;
     f.resolved_at = new Date().toISOString();
     const res: IncidentalFindingFileResult = {
       issue: {
         iid,
-        web_url: `https://gitlab.example.com/${f.repo_path}/-/issues/${iid}`,
+        web_url: webURL,
         title: body?.title ?? f.last_title,
       },
     };
@@ -184,8 +200,63 @@ export const findingsApi = {
       throw new ApiError(409, "cannot dismiss (already filed, being filed, or already dismissed)");
     }
     f.status = "dismissed";
+    f.dismiss_reason = reason;
     f.resolved_at = new Date().toISOString();
     return delay({ status: "dismissed", reason }, 80);
+  },
+
+  // ── Findings stats, bulk dismiss + undo (PRD #1183 M3) ───────────────────────
+  // getFindingsStats is the canonical per-status tally (the finding twin of getJudgeStats): the six
+  // TriageCounts computed from the seed, repo-scoped, and IGNORING ?run= entirely (the run anchor
+  // narrows the list, never the counts), so the badge, the tabs and the strip are one number per
+  // repo scope. `total` is a raw count including any transient `filing` row.
+  getFindingsStats: async (repo?: string) => {
+    const me = requireSession();
+    const mine = findings.filter((f) => f.user_id === me.id);
+    const scoped = repo ? mine.filter((f) => f.repo_id === repo) : mine;
+    const stats: TriageCounts = {
+      total: scoped.length,
+      todo: scoped.filter((f) => f.status === "open").length,
+      filed: scoped.filter((f) => f.status === "filed").length,
+      done: scoped.filter((f) => f.status === "done").length,
+      dismissed: scoped.filter((f) => f.status === "dismissed").length,
+      false_positives: scoped.filter((f) => f.status === "dismissed" && f.dismiss_reason === "not_an_issue").length,
+    };
+    return delay(stats, 60);
+  },
+  // dismissFindings is the BULK dismiss, keyed on disposition_id (not the evidence id). Owner-scoped,
+  // capped at 100, and — like the server fan-out — it SKIPS a non-open or foreign id silently, so
+  // `updated` can be < ids.length. Returns {updated, findings} with the moved rows re-read.
+  dismissFindings: async (ids: string[], reason: "wont_do" | "not_an_issue") => {
+    const me = requireSession();
+    if (reason !== "wont_do" && reason !== "not_an_issue") {
+      throw new ApiError(400, "reason must be wont_do or not_an_issue");
+    }
+    if (ids.length > 100) throw new ApiError(400, "too many ids (max 100)");
+    const moved: MockFinding[] = [];
+    for (const id of ids) {
+      const f = findings.find((x) => x.disposition_id === id && x.user_id === me.id);
+      if (!f || f.status !== "open") continue; // skip non-open / foreign silently
+      f.status = "dismissed";
+      f.dismiss_reason = reason;
+      f.resolved_at = new Date().toISOString();
+      moved.push(f);
+    }
+    return delay({ updated: moved.length, findings: moved.map(findingDTO) }, 80);
+  },
+  // undoDismissFinding reopens a dismissed coordinate (dismissed → open), keyed on disposition_id.
+  // Only a currently-dismissed owned row can be undone; anything else is a 404. Returns the reopened
+  // row so the caller can reconcile in place.
+  undoDismissFinding: async (dispositionId: string) => {
+    const me = requireSession();
+    const f = findings.find(
+      (x) => x.disposition_id === dispositionId && x.user_id === me.id && x.status === "dismissed",
+    );
+    if (!f) throw new ApiError(404, "no dismissed finding to undo");
+    f.status = "open";
+    f.dismiss_reason = undefined;
+    f.resolved_at = null;
+    return delay(findingDTO(f), 60);
   },
 
   // ── File a forge issue from a recommendation (PRD #68 M4 preview) ────────────

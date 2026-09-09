@@ -486,6 +486,10 @@ type Store interface {
 	// assembles the DTO from these.
 	ListFindingsBacklog(ctx context.Context, arg store.ListFindingsBacklogParams) ([]store.ListFindingsBacklogRow, error)
 	CountOpenFindingsForUser(ctx context.Context, arg store.CountOpenFindingsForUserParams) (int64, error)
+	// The per-status Findings tally (PRD #1183 M3, GET /api/findings/stats) and the batched
+	// per-page evidence read (evidence_preview + occurrences), so FindingsBacklog never N+1s.
+	CountFindingsByStatusForUser(ctx context.Context, arg store.CountFindingsByStatusForUserParams) (store.CountFindingsByStatusForUserRow, error)
+	ListFindingEvidenceForDispositions(ctx context.Context, arg store.ListFindingEvidenceForDispositionsParams) ([]store.ListFindingEvidenceForDispositionsRow, error)
 	InsertFinding(ctx context.Context, arg store.InsertFindingParams) (store.IncidentalFinding, error)
 	UpsertOpenDisposition(ctx context.Context, arg store.UpsertOpenDispositionParams) (store.FindingDisposition, error)
 	ReopenDispositionOnHashMismatch(ctx context.Context, arg store.ReopenDispositionOnHashMismatchParams) (int64, error)

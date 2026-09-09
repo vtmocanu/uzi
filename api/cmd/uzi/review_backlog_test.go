@@ -55,8 +55,9 @@ func backlogFake() *uzicli.FakeClient {
 	}}
 }
 
-// The human view renders the group grain the PRD specifies: category · target · seen in N
-// runs · open N, plus the rationale preview.
+// The human view renders the group grain the PRD specifies: category · target · the "N open of
+// M runs" frequency phrase (PRD #1183 M5, folding the old "seen in M runs · N open"), plus the
+// rationale preview. A fully-settled group reads "M runs, all settled".
 func TestReviewBacklogHumanRendersGroups(t *testing.T) {
 	fc := backlogFake()
 	out, _, code := runCLI(t, fakeEnv(fc), "review", "backlog")
@@ -64,15 +65,20 @@ func TestReviewBacklogHumanRendersGroups(t *testing.T) {
 		t.Fatalf("exit = %d, want 0", code)
 	}
 	for _, want := range []string{
-		"install_worker_tool", "rg", "seen in 3 runs", "2 open",
+		"install_worker_tool", "rg", "2 open of 3 runs",
 		"the worker image lacks ripgrep",
-		"tests", "unit", "seen in 1 run", "0 open",
+		"tests", "unit", "1 run, all settled",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("backlog output missing %q:\n%s", want, out)
 		}
 	}
-	// "seen in 1 run", never "1 runs" — the singular is the whole reason runsPhrase exists.
+	// The old "seen in N runs · N open" phrasing is gone — folded into "N open of M runs".
+	// (review backlog no longer uses "seen in"; the findings backlog still does.)
+	if strings.Contains(out, "seen in") {
+		t.Errorf("the group line still carries the retired 'seen in' phrasing:\n%s", out)
+	}
+	// "1 run, all settled", never "1 runs" — the run noun is singular at 1.
 	if strings.Contains(out, "1 runs") {
 		t.Errorf("run count not singularised at 1:\n%s", out)
 	}

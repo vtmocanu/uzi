@@ -54,9 +54,15 @@ vi.mock("../lib/api", () => ({
     // here would start measuring the wrong badge.
     runsInProgressCount: vi.fn().mockResolvedValue({ count: 0 }),
     listSchedules: vi.fn().mockResolvedValue([]),
-    // PRD #333 M7: AppShell polls the Findings open-count badge on mount; zero + empty so
-    // these navigation tests assert the nav STRUCTURE without a findings badge in the way.
+    // PRD #333 M7 / PRD #1183 M4: AppShell now polls the Findings open-count badge from
+    // getFindingsStats().todo on navigation; zero counts so these tests assert the nav STRUCTURE
+    // without a findings badge in the way. listFindings stays stubbed (Findings page uses it), and
+    // the bulk-dismiss / undo verbs are added so any new api.* call resolves (this module mock has
+    // no importOriginal, so every function AppShell/Judge/Findings can reach must exist here).
     listFindings: vi.fn().mockResolvedValue({ bucket: "to_file", repo: "", run: "", open_count: 0, findings: [] }),
+    getFindingsStats: vi.fn().mockResolvedValue({ total: 0, todo: 0, filed: 0, done: 0, dismissed: 0, false_positives: 0 }),
+    dismissFindings: vi.fn(),
+    undoDismissFinding: vi.fn(),
     listRuns: vi.fn().mockResolvedValue({ runs: [] }),
     // Notifications inbox — the THIRD triage.todo consumer (PRD #98 M5).
     listNotifications: vi.fn(),

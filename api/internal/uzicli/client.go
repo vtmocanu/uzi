@@ -432,6 +432,27 @@ type Client interface {
 	// unknown/foreign id is a 404 (exit 4); a non-open coordinate (filed/filing/already
 	// dismissed) is a 409 (exit 5). 200 → nil.
 	DismissFinding(ctx context.Context, id, reason string) error
+	// GetFindingsStats returns the caller's Findings per-status tally, scoped to one repo (PRD
+	// #1183 M5): GET /api/findings/stats?repo=<repo>. It is the finding twin of JudgeStats and
+	// reuses the SAME apitypes.TriageDTO ({total, todo, filed, done, dismissed, false_positives};
+	// todo = open, false_positives = not_an_issue). Owner-scoped on RequireUser (so `uzi findings
+	// stats` works from a CLI token), read-only, no forge write and no token spend. repo is
+	// forwarded VERBATIM and an empty value OMITS the parameter, so the tally spans all the
+	// caller's repos; a well-formed but foreign/unknown repo id returns an all-zero tally (no
+	// existence oracle), while an unparseable id is the server's 400 → the usage exit code. Like
+	// JudgeStats the reply is an UNENVELOPED TriageDTO, and it ignores ?run= server-side (the run
+	// anchor narrows the list, never the counts), so the badge, the tabs and the strip agree.
+	GetFindingsStats(ctx context.Context, repo string) (apitypes.TriageDTO, error)
+	// UndoDismissFinding reopens a dismissed finding coordinate (PRD #1183 M5): DELETE
+	// /api/findings/{id}/dismiss, keyed on the disposition id (a dismissed coordinate may carry no
+	// evidence row, so undo keys on the ALWAYS-present disposition id, not the evidence id the
+	// file/single-dismiss POSTs use). A 404 means the coordinate is not dismissed — an
+	// unknown/foreign id or a non-dismissed one, deliberately indistinguishable — returned as the
+	// sentinel ErrFindingNotDismissed (a plain error, NOT an *ExitError, mirroring
+	// ErrNoDisposition) so `uzi findings undo` can soften it to a friendly "already undone" line
+	// and exit 0. Every other failure propagates as an *ExitError with the documented exit code.
+	// 200 → nil.
+	UndoDismissFinding(ctx context.Context, id string) error
 	// GetReviewIssueDraft fetches the server-templated issue draft for one judge
 	// recommendation (PRD #365 M2): GET
 	// /api/runs/{runID}/review/recommendations/{recID}/issue-draft. Owner-or-admin to READ
@@ -486,6 +507,13 @@ type ProjectSyncStatus struct {
 // *ExitError, so `uzi review undo` can treat it as "already undone" (a friendly
 // message, exit 0) instead of a hard not-found failure.
 var ErrNoDisposition = errors.New("no disposition to undo")
+
+// ErrFindingNotDismissed is returned by UndoDismissFinding when the coordinate had no
+// dismissal to undo (the endpoint answers 404 — an unknown/foreign id or a non-dismissed
+// coordinate, deliberately indistinguishable, no existence oracle). Like ErrNoDisposition
+// it is a plain error, NOT an *ExitError, so `uzi findings undo` can treat it as "already
+// undone" (a friendly message, exit 0) instead of a hard not-found failure.
+var ErrFindingNotDismissed = errors.New("finding is not dismissed")
 
 // maxRespBytes caps how much of a response body the client reads, so a broken or
 // hostile endpoint cannot make the CLI allocate without bound. 32 MiB is far above

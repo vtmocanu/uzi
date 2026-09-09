@@ -24,17 +24,95 @@ import "time"
 // what lets the backlog render a filed coordinate as a click-through link even for a coordinate
 // filed from the CLI or revisited in a later session (no session-local file result to link
 // from). It is a forge-produced URL, not agent text; the web renders it only when it is https.
+//
+// DispositionID is the coordinate's finding_dispositions.id — the ALWAYS-PRESENT primary id the
+// bulk-dismiss (POST /findings/dismiss {ids}) and undo (DELETE /findings/{id}/dismiss) endpoints
+// key on (PRD #1183 M3). It is distinct from FindingID: FindingID is the newest EVIDENCE row's
+// id (nil once the evidence was cascaded away with a deleted run), while a dismissed/done/filed
+// coordinate always has a disposition id even with no evidence — which is exactly why undo keys
+// on this, not on the evidence id. It is NOT omitempty: every real backlog row carries one.
+//
+// DismissReason (wont_do | not_an_issue, omitempty) and SetVia (issue_close, omitempty) surface
+// the disposition's reason and provenance so the state chip can read "Dismissed · Won't do" and
+// distinguish a hand-set done from an issue-close auto-done (PRD #1183 M3), the finding twin of
+// JudgeOccurrenceDTO.SetVia. EvidencePreview is the newest evidence row's description_md as
+// PLAIN TEXT, capped like the judge's rationale_preview (RationalePreviewMaxRunes + the same
+// ellipsis), and — like every model-authored field — must be rendered as escaped text by every
+// consumer, never markdown/HTML. Occurrences is the per-run evidence, newest-first, capped at 20.
+// All four are omitempty: a resolved/dismissed coordinate may carry no evidence, and an open one
+// no reason/provenance.
 type IncidentalFindingDTO struct {
-	FindingID     *string    `json:"finding_id,omitempty"`
-	Location      string     `json:"location"`
-	RepoID        string     `json:"repo_id"`
-	RepoPath      string     `json:"repo_path"`
-	Status        string     `json:"status"`
-	LastTitle     string     `json:"last_title"`
-	SeenInRuns    int        `json:"seen_in_runs"`
-	FiledIssueIID *int64     `json:"filed_issue_iid,omitempty"`
-	FiledIssueURL string     `json:"filed_issue_url,omitempty"`
-	ResolvedAt    *time.Time `json:"resolved_at,omitempty"`
+	DispositionID   string                 `json:"disposition_id"`
+	FindingID       *string                `json:"finding_id,omitempty"`
+	Location        string                 `json:"location"`
+	RepoID          string                 `json:"repo_id"`
+	RepoPath        string                 `json:"repo_path"`
+	Status          string                 `json:"status"`
+	LastTitle       string                 `json:"last_title"`
+	SeenInRuns      int                    `json:"seen_in_runs"`
+	DismissReason   string                 `json:"dismiss_reason,omitempty"`
+	SetVia          string                 `json:"set_via,omitempty"`
+	FiledIssueIID   *int64                 `json:"filed_issue_iid,omitempty"`
+	FiledIssueURL   string                 `json:"filed_issue_url,omitempty"`
+	ResolvedAt      *time.Time             `json:"resolved_at,omitempty"`
+	EvidencePreview string                 `json:"evidence_preview,omitempty"`
+	Occurrences     []FindingOccurrenceDTO `json:"occurrences,omitempty"`
+}
+
+// FindingOccurrenceDTO is one run's report of a finding coordinate (PRD #1183 M3): the finding
+// twin of JudgeOccurrenceDTO's per-run slice. RunTitle is the reporting run's issue_title and
+// ReportedAt is the evidence row's created_at (both typed exactly as JudgeOccurrenceDTO types
+// run_title/judged_at, so a consumer never special-cases the shape). Confidence is the
+// agent-supplied confidence string. All four keys are always present.
+type FindingOccurrenceDTO struct {
+	RunID      string    `json:"run_id"`
+	RunTitle   string    `json:"run_title"`
+	ReportedAt time.Time `json:"reported_at"`
+	Confidence string    `json:"confidence"`
+}
+
+// FileFindingRequest is the (all-optional) body of POST /api/findings/{id}/issue (PRD #333 M5,
+// exported in PRD #1183 M3 so the wire lives in apitypes beside the response). Every field is a
+// user EDIT of the server-rendered draft, so none is trusted: the handler re-runs title/description
+// through the field-level sanitisers and UNIONs labels with the server marker.
+type FileFindingRequest struct {
+	Title       *string  `json:"title"`
+	Description *string  `json:"description"`
+	Labels      []string `json:"labels"`
+}
+
+// DismissFindingRequest is the body of POST /api/findings/{id}/dismiss: a required reason from the
+// closed enum {wont_do, not_an_issue}. The DB CHECK ((status='dismissed')=(reason IS NOT NULL)) is
+// the backstop; the handler rejects a missing/invalid reason as a 400 first.
+type DismissFindingRequest struct {
+	Reason string `json:"reason"`
+}
+
+// BulkDismissFindingsRequest is the body of POST /api/findings/dismiss (PRD #1183 M3): a set of
+// disposition ids and one shared reason. The handler caps Ids at 100 (a 400 above it) and skips a
+// foreign or non-open id silently, so the request is idempotent-ish and owner-scoped by the query.
+type BulkDismissFindingsRequest struct {
+	IDs    []string `json:"ids"`
+	Reason string   `json:"reason"`
+}
+
+// DismissFindingResultDTO is the typed POST /api/findings/{id}/dismiss response (PRD #1183 M3),
+// replacing the untyped map[string]string the handler returned before. Status is always
+// "dismissed" on the 200 path; Reason echoes the applied reason (omitempty is harmless — it is
+// always present on a successful dismiss).
+type DismissFindingResultDTO struct {
+	Status string `json:"status"`
+	Reason string `json:"reason,omitempty"`
+}
+
+// BulkDismissFindingsResultDTO is the POST /api/findings/dismiss response (PRD #1183 M3). Updated
+// is how many coordinates the one statement moved to dismissed (a foreign or non-open id is
+// skipped silently, so Updated can be less than len(ids)); Findings re-reads the updated rows so
+// the client can reconcile them in place. Findings is never nil on the wire (an empty result
+// encodes []), so a client iterates it without a null guard.
+type BulkDismissFindingsResultDTO struct {
+	Updated  int                    `json:"updated"`
+	Findings []IncidentalFindingDTO `json:"findings"`
 }
 
 // IncidentalFindingBacklogDTO is GET /api/findings (PRD #333 M4, D7/D8): the caller's

@@ -95,7 +95,7 @@ type Engine struct {
 	projectReverse projectReverseSyncer
 
 	// forgeTimeout is the per-forge-call HTTP timeout (config.ForgeHTTPTimeout). It
-	// is used ONLY to floor the per-tick deadline (tickBudget, at 2x) so a poll
+	// is used ONLY to floor the per-tick deadline (tickBudget, at 3x) so a poll
 	// interval shorter than the forge calls a tick makes — the e2e harness pins 2s,
 	// well under the 15s default — cannot preempt an in-flight sync call. Optional
 	// (zero => no floor, tick budget stays exactly interval), set via SetForgeTimeout,
@@ -209,7 +209,7 @@ func reconcileDue(pollCount, reconcileEvery int) bool {
 	return pollCount == 1 || pollCount%reconcileEvery == 0
 }
 
-// tickBudget is the deadline for one tick: the poll interval, floored at 2x the
+// tickBudget is the deadline for one tick: the poll interval, floored at 3x the
 // forge HTTP timeout. Without the floor, an interval shorter than the forge calls a
 // tick makes (the e2e harness pins 2s, well under the 15s FORGE_HTTP_TIMEOUT
 // default) makes the tick's context deadline fire before the forge client's own
@@ -219,11 +219,13 @@ func reconcileDue(pollCount, reconcileEvery int) bool {
 // (budget == interval), preserving the pre-#139 behaviour for callers that never
 // wire it.
 //
-// The floor is 2x, not 1x: FullSync makes TWO sequential ListIssues calls (and the
-// tick opens with a ListEnabledReposWithConnections DB query before any forge call),
-// so one per-call timeout of budget could still cancel the second call mid-flight.
-// 2x-of-ForgeHTTPTimeout is the same margin config.go clamps the sweep timeouts to,
-// and for the same reason (an operation that must clear two forge calls).
+// The floor is 3x, not 1x: FullSync makes THREE sequential ListIssues calls — the
+// uzi-labeled fetch, the open fetch, and the finding-labeled fetch (PRD #1183 Child B,
+// added so a CLOSED finding issue reaches the cache for the filed→Done sync) — and the
+// tick opens with a ListEnabledReposWithConnections DB query before any forge call, so
+// a smaller budget could cancel the third call mid-flight. config.go clamps the sweep
+// timeouts to 2x for the same kind of reason, but sweep clears only two forge calls;
+// the poller's tick now clears three, so its floor is one multiple wider.
 //
 // This floors the DEADLINE only, not the cadence: the Run ticker still fires every
 // interval, and because ticks never overlap (the Run loop is single-goroutine), a
@@ -232,7 +234,7 @@ func reconcileDue(pollCount, reconcileEvery int) bool {
 // The common fast path (a responsive forge answering in ms) still completes far
 // inside the interval, so a short poll cadence is preserved.
 func tickBudget(interval, forgeTimeout time.Duration) time.Duration {
-	if floor := 2 * forgeTimeout; forgeTimeout > 0 && interval < floor {
+	if floor := 3 * forgeTimeout; forgeTimeout > 0 && interval < floor {
 		return floor
 	}
 	return interval
@@ -280,7 +282,7 @@ func guardPanic(repo string, fn func()) {
 // let a tick run unbounded. Errors on one repo are logged and skipped so a single
 // bad connection (revoked PAT, forge down) never stalls the others.
 func (e *Engine) tick(ctx context.Context) {
-	// Bound the whole tick at tickBudget — the poll interval, but floored at 2x the
+	// Bound the whole tick at tickBudget — the poll interval, but floored at 3x the
 	// forge HTTP timeout so a poll interval shorter than the tick's forge calls (the
 	// e2e 2s cadence) can't preempt an in-flight sync call (issue #139). When the
 	// floor applies, a slow-but-alive forge lets the tick run past the interval; that
@@ -397,6 +399,15 @@ func (e *Engine) syncRepo(ctx context.Context, r store.ListEnabledReposWithConne
 	// forge is unreachable (a stale cache must not manufacture edges).
 	if err := e.svc.SyncFiledIssueCloses(ctx, r.ID); err != nil {
 		slog.Error("poller: sync filed-issue closes", "repo", r.PathWithNamespace, "error", err)
+	}
+
+	// Filed→Done findings sync (PRD #1183 Child B, M3): the finding twin of the judge sync above,
+	// on the SAME fresh issue cache and with no forge call of its own. A filed incidental finding
+	// whose issue was just observed CLOSED moves to Done, once, on the open→closed edge, and reopens
+	// if the bug reappears. Placed immediately after the judge sync so both consume the same tick's
+	// cache; skipped by the same early returns when the forge is unreachable.
+	if err := e.svc.SyncFindingIssueCloses(ctx, r.ID); err != nil {
+		slog.Error("poller: sync finding-issue closes", "repo", r.PathWithNamespace, "error", err)
 	}
 
 	// Pipeline-status sync (PRD #6): refresh the CI-badge cache for the repo's

@@ -435,22 +435,46 @@ func TestPendingJudgeDTOTags(t *testing.T) {
 	assertTags(t, "PendingJudgeDTO", PendingJudgeDTO{}, "state", "enqueued_at")
 }
 
-// TestIncidentalFindingDTOTags pins the PRD #333 M4 backlog-row shape. finding_id,
-// filed_issue_iid, filed_issue_url and resolved_at are all omitempty: a display-only
-// coordinate whose evidence was cascaded away carries no finding_id, and an OPEN coordinate
-// carries neither a filed iid, a filed url, nor a resolved_at. The zero-value pin asserts the
-// always-present key set (mirroring how runDTOKeys excludes the omitempty Usage), and the
-// populated pin asserts the four optional keys surface when set.
+// TestIncidentalFindingDTOTags pins the PRD #333 M4 backlog-row shape, widened by PRD #1183 M3.
+// disposition_id is ALWAYS present (the id the bulk-dismiss/undo endpoints key on). finding_id,
+// dismiss_reason, set_via, filed_issue_iid, filed_issue_url, resolved_at, evidence_preview and
+// occurrences are all omitempty: a display-only coordinate whose evidence was cascaded away
+// carries no finding_id/evidence_preview/occurrences, an OPEN coordinate carries no
+// filed/resolved fields, and only a dismissed/auto-done coordinate carries a reason/set_via. The
+// zero-value pin asserts the always-present key set; the populated pin asserts every optional key
+// surfaces when set.
 func TestIncidentalFindingDTOTags(t *testing.T) {
 	assertTags(t, "IncidentalFindingDTO", IncidentalFindingDTO{},
-		"location", "repo_id", "repo_path", "status", "last_title", "seen_in_runs")
+		"disposition_id", "location", "repo_id", "repo_path", "status", "last_title", "seen_in_runs")
 	id := "f1"
 	iid := int64(7)
 	now := time.Unix(0, 0)
-	full := IncidentalFindingDTO{FindingID: &id, FiledIssueIID: &iid, FiledIssueURL: "https://forge.example/g/a/-/issues/7", ResolvedAt: &now}
+	full := IncidentalFindingDTO{
+		DispositionID: "d1", FindingID: &id, DismissReason: "wont_do", SetVia: "issue_close",
+		FiledIssueIID: &iid, FiledIssueURL: "https://forge.example/g/a/-/issues/7", ResolvedAt: &now,
+		EvidencePreview: "x", Occurrences: []FindingOccurrenceDTO{{}},
+	}
 	assertTags(t, "IncidentalFindingDTO(full)", full,
-		"finding_id", "location", "repo_id", "repo_path", "status", "last_title",
-		"seen_in_runs", "filed_issue_iid", "filed_issue_url", "resolved_at")
+		"disposition_id", "finding_id", "location", "repo_id", "repo_path", "status", "last_title",
+		"seen_in_runs", "dismiss_reason", "set_via", "filed_issue_iid", "filed_issue_url",
+		"resolved_at", "evidence_preview", "occurrences")
+}
+
+// TestFindingOccurrenceDTOTags pins the per-run occurrence shape (PRD #1183 M3), the finding twin
+// of JudgeOccurrenceDTO. All four keys are always present (none omitempty), matching how
+// JudgeOccurrenceDTO types run_title/judged_at and confidence.
+func TestFindingOccurrenceDTOTags(t *testing.T) {
+	assertTags(t, "FindingOccurrenceDTO", FindingOccurrenceDTO{},
+		"run_id", "run_title", "reported_at", "confidence")
+}
+
+// TestDismissFindingResultDTOTags pins the typed dismiss responses (PRD #1183 M3). The single
+// dismiss carries {status, reason}; the bulk dismiss carries {updated, findings}.
+func TestDismissFindingResultDTOTags(t *testing.T) {
+	assertTags(t, "DismissFindingResultDTO", DismissFindingResultDTO{Reason: "wont_do"}, "status", "reason")
+	// reason is omitempty, so an empty reason drops the key.
+	assertTags(t, "DismissFindingResultDTO(no-reason)", DismissFindingResultDTO{}, "status")
+	assertTags(t, "BulkDismissFindingsResultDTO", BulkDismissFindingsResultDTO{}, "updated", "findings")
 }
 
 func TestIncidentalFindingBacklogDTOTags(t *testing.T) {

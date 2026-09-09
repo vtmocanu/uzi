@@ -341,8 +341,8 @@ func renderBacklog(p *uzicli.Printer, b apitypes.JudgeBacklogDTO) error {
 		// copies — deliberately, see their comments — but neither is the source here.)
 		// Bucket is likewise a closed server-side enum. If a future read ever sourced
 		// category from a table without the CHECK, this line would need sanitising too.
-		p.Printf("- [%s] %s → %s · seen in %s · %d open\n",
-			g.Bucket, g.Category, sanitizeTTY(g.Target), runsPhrase(g.RunCount), g.OpenCount)
+		p.Printf("- [%s] %s → %s · %s\n",
+			g.Bucket, g.Category, sanitizeTTY(g.Target), openOfRunsPhrase(g.OpenCount, g.RunCount))
 		if r := sanitizeTTY(strings.TrimSpace(g.RationalePreview)); r != "" {
 			for _, line := range strings.Split(r, "\n") {
 				p.Printf("    %s\n", line)
@@ -352,12 +352,30 @@ func renderBacklog(p *uzicli.Printer, b apitypes.JudgeBacklogDTO) error {
 	return nil
 }
 
-// runsPhrase renders the "seen in N runs" evidence chip, singular at 1.
+// runsPhrase renders the "seen in N runs" evidence chip, singular at 1. Still used by the
+// findings backlog render (each finding row shows "seen in N runs"); the judge group line folded
+// its own copy into openOfRunsPhrase below.
 func runsPhrase(n int) string {
 	if n == 1 {
 		return "1 run"
 	}
 	return strconv.Itoa(n) + " runs"
+}
+
+// openOfRunsPhrase renders a judge group's frequency chip (PRD #1183 M5): how many of the runs a
+// coordinate recurs in still have it open. "N open of M runs" while any are open, "M runs, all
+// settled" once none are — both plural-correct on the run count. It mirrors the web helper
+// openOfRunsLabel (web/src/lib/judgeBacklog.ts) so the CLI and the Judge page read the same phrase,
+// folding the group line's old "seen in M runs · N open" into one honest line.
+func openOfRunsPhrase(open, runs int) string {
+	runNoun := "runs"
+	if runs == 1 {
+		runNoun = "run"
+	}
+	if open == 0 {
+		return strconv.Itoa(runs) + " " + runNoun + ", all settled"
+	}
+	return strconv.Itoa(open) + " open of " + strconv.Itoa(runs) + " " + runNoun
 }
 
 // runGroupDisposition drives the bulk fan-out for one group coordinate and reports what the

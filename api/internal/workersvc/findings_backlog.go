@@ -18,11 +18,18 @@ import (
 // disposition status; `all` maps to a NULL status (the unfiltered view).
 const BucketToFile = "to_file"
 
+// maxFindingOccurrences caps the per-coordinate occurrence list on the wire (PRD #1183 M3): a
+// bug seen in hundreds of runs ships at most this many, newest-first, so the DTO stays bounded.
+// The cap is applied in Go (not SQL), mirroring the delegation.
+const maxFindingOccurrences = 20
+
 // findingBuckets is the closed ?bucket= enum, reached only through ValidFindingBucket.
 // Unexported for the same reason judgeBacklogBuckets is: an exported package-level map is
 // mutable from anywhere and a validator you cannot see from the handler is not a validator.
+// BucketDone joins the set (PRD #1183 M3): a finding reaches `done` only via the issue-close
+// sync, and the Findings page's fifth tab reads it.
 var findingBuckets = map[string]bool{
-	BucketToFile: true, BucketFiled: true, BucketDismissed: true, BucketAll: true,
+	BucketToFile: true, BucketFiled: true, BucketDone: true, BucketDismissed: true, BucketAll: true,
 }
 
 // ValidFindingBucket reports whether s is an accepted GET /api/findings ?bucket= value. The
@@ -40,6 +47,8 @@ func findingBucketStatus(bucket string) pgtype.Text {
 		return pgtype.Text{String: "open", Valid: true}
 	case BucketFiled:
 		return pgtype.Text{String: "filed", Valid: true}
+	case BucketDone:
+		return pgtype.Text{String: "done", Valid: true}
 	case BucketDismissed:
 		return pgtype.Text{String: "dismissed", Valid: true}
 	default: // BucketAll
@@ -86,10 +95,89 @@ func (s *Service) FindingsBacklog(ctx context.Context, ownerUserID uuid.UUID, bu
 	if runFilter != uuid.Nil {
 		out.Run = runFilter.String()
 	}
+	dispositionIDs := make([]uuid.UUID, 0, len(rows))
 	for _, r := range rows {
 		out.Findings = append(out.Findings, mapIncidentalFindingRow(r))
+		dispositionIDs = append(dispositionIDs, r.DispositionID)
+	}
+
+	// One batched evidence read for the whole page (never N+1): the newest evidence row per
+	// coordinate is the evidence_preview, the rows in order are the occurrence list (capped at 20,
+	// newest-first). A coordinate whose evidence was cascaded away returns no rows and keeps its
+	// nil preview/occurrences (last_title still keeps it legible).
+	if len(dispositionIDs) > 0 {
+		if err := s.attachFindingEvidence(ctx, ownerUserID, out.Findings, dispositionIDs); err != nil {
+			return apitypes.IncidentalFindingBacklogDTO{}, err
+		}
 	}
 	return out, nil
+}
+
+// attachFindingEvidence loads the per-run evidence behind a page of coordinates in ONE query and
+// sets each DTO's EvidencePreview (newest description_md, capped) and Occurrences (newest-first,
+// capped at maxFindingOccurrences). dispositionIDs is index-aligned with findings, so the
+// disposition id at findings[i] is dispositionIDs[i]. ownerUserID scopes the evidence read to the
+// caller's coordinates (defense-in-depth at the query boundary, CWE-639/IDOR).
+func (s *Service) attachFindingEvidence(ctx context.Context, ownerUserID uuid.UUID, findings []apitypes.IncidentalFindingDTO, dispositionIDs []uuid.UUID) error {
+	rows, err := s.q.ListFindingEvidenceForDispositions(ctx, store.ListFindingEvidenceForDispositionsParams{
+		Ids:    dispositionIDs,
+		UserID: ownerUserID,
+	})
+	if err != nil {
+		return err
+	}
+	previews := make(map[uuid.UUID]string, len(dispositionIDs))
+	occurrences := make(map[uuid.UUID][]apitypes.FindingOccurrenceDTO, len(dispositionIDs))
+	for _, e := range rows {
+		// Rows arrive newest-first WITHIN each disposition, so the first row seen sets the preview.
+		if _, seen := previews[e.DispositionID]; !seen {
+			previews[e.DispositionID] = rationalePreview(e.DescriptionMd)
+		}
+		// The SQL query already caps each disposition to its newest 20 rows (row_number() window,
+		// keep 20 == maxFindingOccurrences in sync); this guard is a defensive belt-and-braces cap.
+		if len(occurrences[e.DispositionID]) < maxFindingOccurrences {
+			occurrences[e.DispositionID] = append(occurrences[e.DispositionID], apitypes.FindingOccurrenceDTO{
+				RunID:      e.RunID.String(),
+				RunTitle:   e.RunTitle,
+				ReportedAt: e.ReportedAt.Time,
+				Confidence: e.Confidence,
+			})
+		}
+	}
+	for i := range findings {
+		id := dispositionIDs[i]
+		if p, ok := previews[id]; ok {
+			findings[i].EvidencePreview = p
+		}
+		if occ, ok := occurrences[id]; ok {
+			findings[i].Occurrences = occ
+		}
+	}
+	return nil
+}
+
+// FindingsStats is the Findings per-status tally (PRD #1183 M3, GET /api/findings/stats): the
+// finding twin of JudgeTriageStats, reusing apitypes.TriageDTO. Owner-scoped, with an OPTIONAL
+// repo narrow (repoFilter uuid.Nil = all repos, mapped to a SQL NULL). It IGNORES any run anchor
+// by construction — the query carries no run param — so the badge, the tabs and the summary strip
+// read one number per repo scope even when the list is anchored to a run. todo = open,
+// false_positives = the not_an_issue sub-count of dismissed; total includes a transient filing row.
+func (s *Service) FindingsStats(ctx context.Context, ownerUserID, repoFilter uuid.UUID) (apitypes.TriageDTO, error) {
+	row, err := s.q.CountFindingsByStatusForUser(ctx, store.CountFindingsByStatusForUserParams{
+		UserID: ownerUserID,
+		RepoID: pgconv.UUIDOrNull(repoFilter),
+	})
+	if err != nil {
+		return apitypes.TriageDTO{}, err
+	}
+	return apitypes.TriageDTO{
+		Total:          int(row.Total),
+		Todo:           int(row.Todo),
+		Filed:          int(row.Filed),
+		Done:           int(row.Done),
+		Dismissed:      int(row.Dismissed),
+		FalsePositives: int(row.FalsePositives),
+	}, nil
 }
 
 // mapIncidentalFindingRow projects one store backlog row onto the wire DTO, mapping the
@@ -98,6 +186,7 @@ func (s *Service) FindingsBacklog(ctx context.Context, ownerUserID uuid.UUID, bu
 // filed/resolved.
 func mapIncidentalFindingRow(r store.ListFindingsBacklogRow) apitypes.IncidentalFindingDTO {
 	dto := apitypes.IncidentalFindingDTO{
+		DispositionID: r.DispositionID.String(),
 		Location:      r.Location,
 		RepoID:        r.RepoID.String(),
 		RepoPath:      r.RepoPath,
@@ -105,6 +194,12 @@ func mapIncidentalFindingRow(r store.ListFindingsBacklogRow) apitypes.Incidental
 		LastTitle:     r.LastTitle,
 		SeenInRuns:    int(r.SeenInRuns),
 		FiledIssueURL: r.FiledIssueUrl,
+	}
+	if r.DismissReason.Valid {
+		dto.DismissReason = r.DismissReason.String
+	}
+	if r.SetVia.Valid {
+		dto.SetVia = r.SetVia.String
 	}
 	if r.LatestFindingID.Valid {
 		id := uuid.UUID(r.LatestFindingID.Bytes).String()

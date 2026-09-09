@@ -90,6 +90,13 @@ func contractCases() []contractCase {
 		newContractCase[UserSettingsDTO]("user_settings"),
 		newContractCase[CatalogEntryDTO]("catalog_entry"),
 		newContractCase[AdminCLITokenDTO]("cli_token"),
+		// PRD #1183 M3: the first fixture pair for the Findings backlog row, so its Go/TS
+		// mirror is guarded from now on. Every nullable field on IncidentalFindingDTO is
+		// omitempty (finding_id, filed_issue_iid, resolved_at, …), so its zero.json carries
+		// NO null — registered {stem:"finding", nullable:false} on the TS side, the same
+		// shape as AgentMemoryDTO. The zero-fixture check stays non-vacuous by pinning the
+		// always-present key set.
+		newContractCase[IncidentalFindingDTO]("finding"),
 	}
 }
 

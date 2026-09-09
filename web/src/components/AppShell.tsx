@@ -22,6 +22,7 @@ import { useFavicon } from "../lib/useFavicon";
 import { brandTabTitle } from "../lib/brandTitle";
 import { licenseCreditEnabled } from "../lib/flags";
 import { JudgeTodoContext, JudgeTodoValueContext } from "./JudgeTodoContext";
+import { FindingsOpenContext, FindingsOpenValueContext } from "./FindingsOpenContext";
 import { BuildInfoPopover } from "./BuildInfoPopover";
 import { ChangelogDrawer } from "./ChangelogDrawer";
 import {
@@ -1194,9 +1195,15 @@ export function AppShell({ children }: { children: ReactNode }) {
     };
   }, [user, location.pathname]);
 
-  // Open-findings poll (PRD #333 M7, D8): the same on-navigation cadence as the Judge poll,
-  // reading the GET /api/findings `open_count` meta with NO repo filter (the global count). A
-  // failed fetch keeps the last known count rather than blanking the badge.
+  // Open-findings poll (PRD #333 M7, D8; PRD #1183 M4): the same on-navigation cadence as the
+  // Judge poll, now reading the canonical GET /api/findings/stats `todo` with NO repo filter (the
+  // global open count) rather than the deprecated backlog `open_count` meta — so the badge, the
+  // Findings To-triage tab and the summary strip are one number, and the FindingsOpenContext below
+  // lets the page keep the badge fresh after a dismiss without a navigation. A failed fetch keeps
+  // the last known count rather than blanking the badge. NOTE on scope: while the Findings page is
+  // mounted it re-scopes this badge to the active ?repo= filter through FindingsOpenContext (that
+  // page's tabs, summary strip and this badge are one number PER repo scope, by design); this
+  // on-navigation poll publishes the GLOBAL count and restores it on the next pathname change.
   useEffect(() => {
     if (!user) {
       setFindingsOpen(0);
@@ -1204,9 +1211,9 @@ export function AppShell({ children }: { children: ReactNode }) {
     }
     let alive = true;
     api
-      .listFindings()
-      .then((data) => {
-        if (alive) setFindingsOpen(data.open_count);
+      .getFindingsStats()
+      .then((stats) => {
+        if (alive) setFindingsOpen(stats.todo);
       })
       .catch(() => {});
     return () => {
@@ -1331,8 +1338,16 @@ export function AppShell({ children }: { children: ReactNode }) {
               how the Judge page keeps it fresh after a dispose; the value is how the judge
               notification in the inbox reads the SAME number the nav badge above is
               rendering, rather than polling for its own copy. */}
+          {/* Findings' twin of the judge channel (PRD #1183 M4): the setter lets the Findings
+              page keep the nav badge fresh after a dismiss without a navigation; the value lets a
+              consumer read the SAME number the badge above renders. Nested inside the judge
+              providers so both channels wrap `children`. */}
           <JudgeTodoContext.Provider value={setJudgeTodo}>
-            <JudgeTodoValueContext.Provider value={judgeTodo}>{children}</JudgeTodoValueContext.Provider>
+            <JudgeTodoValueContext.Provider value={judgeTodo}>
+              <FindingsOpenContext.Provider value={setFindingsOpen}>
+                <FindingsOpenValueContext.Provider value={findingsOpen}>{children}</FindingsOpenValueContext.Provider>
+              </FindingsOpenContext.Provider>
+            </JudgeTodoValueContext.Provider>
           </JudgeTodoContext.Provider>
         </div>
       </main>

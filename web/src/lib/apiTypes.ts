@@ -2795,10 +2795,27 @@ export interface JudgeDispositionResult {
 
 // IncidentalFindingBucket is the GET /api/findings ?bucket= filter (D7). The default
 // (`to_file`) is the backlog's reason to exist — what still needs filing.
-export type IncidentalFindingBucket = "to_file" | "filed" | "dismissed" | "all";
+export type IncidentalFindingBucket = "to_file" | "filed" | "done" | "dismissed" | "all";
+
+// FindingOccurrence is one run's report of a finding coordinate (PRD #1183 M3): the finding
+// twin of JudgeOccurrence. `run_title` and `reported_at` mirror the run's issue_title and the
+// evidence row's created_at; `confidence` is the agent-supplied confidence string. All four keys
+// are always present. `run_title` is agent-adjacent text — render it as escaped text through
+// stripUnsafeChars, never markdown/HTML.
+export interface FindingOccurrence {
+  run_id: string;
+  run_title: string;
+  reported_at: string;
+  confidence: string;
+}
 
 // IncidentalFinding is one (repo, location) coordinate in the per-repo Findings backlog,
 // deduped across every run it recurs in (mirrors apitypes.IncidentalFindingDTO, D7).
+//
+// `disposition_id` is the coordinate's finding_dispositions.id — the ALWAYS-PRESENT id the
+// bulk-dismiss (POST /findings/dismiss {ids}) and undo (DELETE /findings/{id}/dismiss) endpoints
+// key on (PRD #1183 M3). It is distinct from `finding_id`: a dismissed/done coordinate always has
+// a disposition_id even when its evidence is gone, which is exactly why undo keys on it.
 //
 // `finding_id` is the latest evidence row's id — the id the file/dismiss actions drive on
 // (M5). It is UNDEFINED (omitempty) on a filed/dismissed coordinate whose evidence rows were
@@ -2806,10 +2823,20 @@ export type IncidentalFindingBucket = "to_file" | "filed" | "dismissed" | "all";
 // disposition-driven) and `last_title` keeps it legible, but there is no evidence row to act
 // on, so a nil finding_id means "not actionable from here".
 //
+// `dismiss_reason` (wont_do | not_an_issue), `set_via` (issue_close), `evidence_preview` (the
+// newest evidence row's description_md, plain text, capped) and `occurrences` (newest-first,
+// capped at 20) are the PRD #1183 M3 additions — all OPTIONAL for api/web rollout skew. Like the
+// judge's rationale_preview, `evidence_preview` and every occurrence's `run_title` MUST be
+// rendered as escaped text through stripUnsafeChars, never markdown/HTML.
+//
 // `location`, `repo_path` and `last_title` are agent-authored, already-sanitised (inert at
 // rest) — but like the judge's rationale_preview EVERY consumer renders them as escaped text
 // through stripUnsafeChars, never markdown/HTML (issue #124 hardening).
 export interface IncidentalFinding {
+  // Always present on the wire, but kept OPTIONAL following this file's convention for an
+  // always-present field (avoids forcing every mock/test object to add it, and covers api/web
+  // rollout skew) — the same reason finding_id and the M3 additions below are optional.
+  disposition_id?: string;
   finding_id?: string;
   location: string;
   repo_id: string;
@@ -2817,6 +2844,8 @@ export interface IncidentalFinding {
   status: string;
   last_title: string;
   seen_in_runs: number;
+  dismiss_reason?: string;
+  set_via?: string;
   filed_issue_iid?: number;
   // filed_issue_url is the stored forge URL a filed coordinate produced (stamped at settle
   // time). It is the DTO-carried source the backlog links "Filed #<iid>" through — present for a
@@ -2824,6 +2853,8 @@ export interface IncidentalFinding {
   // filed. Rendered as a link only when it is a real https URL.
   filed_issue_url?: string;
   resolved_at?: string;
+  evidence_preview?: string;
+  occurrences?: FindingOccurrence[];
 }
 
 // IncidentalFindingBacklog is GET /api/findings (D7/D8). `bucket`/`repo`/`run` echo the

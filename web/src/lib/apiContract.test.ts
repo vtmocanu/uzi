@@ -25,6 +25,7 @@ import type {
   Chat,
   AgentTemplate,
   SchedulePauseDTO,
+  IncidentalFinding,
 } from "./apiTypes";
 
 import runZero from "../../../fixtures/api-contract/run.zero.json";
@@ -75,6 +76,8 @@ import agentTemplateZero from "../../../fixtures/api-contract/agent_template.zer
 import agentTemplateFull from "../../../fixtures/api-contract/agent_template.full.json";
 import schedulePauseZero from "../../../fixtures/api-contract/schedule_pause.zero.json";
 import schedulePauseFull from "../../../fixtures/api-contract/schedule_pause.full.json";
+import findingZero from "../../../fixtures/api-contract/finding.zero.json";
+import findingFull from "../../../fixtures/api-contract/finding.full.json";
 
 // The api ⇄ SPA JSON wire-contract (PRD #982). This is the VITEST HALF; the Go
 // half is api/internal/apitypes/contract_test.go. Neither reads the other: each
@@ -541,6 +544,24 @@ type ZeroOf<T, NeverNull extends keyof T = never> = {
   void _schedulePauseFull;
 }
 
+// ── IncidentalFinding (PRD #1183 M3) ────────────────────────────────────────
+// The first fixture pair for the Findings backlog row. No ZeroOf exemption: every nullable Go
+// field is omitempty, so the zero value drops it rather than emitting a null (like AgentMemoryDTO,
+// declared nullable:false below), and every required TS field is a non-omitempty Go field present
+// in zero.json. The four M3 additions (dismiss_reason, set_via, evidence_preview, occurrences)
+// plus finding_id/filed_* are optional in TS, so their absence from zero.json is accepted. No
+// drift: the key set matches IncidentalFinding exactly.
+{
+  const _findingMissing: never = null as unknown as Exclude<keyof IncidentalFinding, keyof typeof findingFull>;
+  const _findingExtra: never = null as unknown as Exclude<keyof typeof findingFull, keyof IncidentalFinding>;
+  const _findingZero: ZeroOf<IncidentalFinding> = findingZero;
+  const _findingFull: Widen<IncidentalFinding> = findingFull;
+  void _findingMissing;
+  void _findingExtra;
+  void _findingZero;
+  void _findingFull;
+}
+
 // ── Runtime self-checks ─────────────────────────────────────────────────────
 // A contract that passes on a missing fixture, or on a zero.json with no null in
 // it, is the false-green shape this repo documents repeatedly. These fatal
@@ -599,6 +620,11 @@ const dtos: { stem: string; nullable: boolean }[] = [
   // All-scalar / no nullable Go field: their zero.json legitimately carries no null.
   { stem: "column", nullable: false },
   { stem: "branding", nullable: false },
+  // PRD #1183 M3: IncidentalFindingDTO's nullable fields (finding_id, filed_issue_iid,
+  // resolved_at) are ALL omitempty, so its zero.json carries no null — the same shape as
+  // AgentMemoryDTO, declared nullable:false rather than manufacturing a null by dropping an
+  // existing field's omitempty (which would change the live findings wire).
+  { stem: "finding", nullable: false },
 ];
 
 describe("api-contract fixtures are present and discriminating", () => {

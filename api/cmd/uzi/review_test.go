@@ -453,6 +453,36 @@ func TestReviewFileUnknownExit4(t *testing.T) {
 	})
 }
 
+// renderBacklog prints the group frequency as "N open of M runs" and, once a group is fully
+// settled, "M runs, all settled" (PRD #1183 M5, mirroring the web openOfRunsLabel), replacing the
+// old "seen in M runs · N open". Both are plural-correct on the run count.
+func TestReviewBacklogRendersOpenOfRuns(t *testing.T) {
+	fc := backlogFake() // group A: 2 open of 3 runs; group B: 0 open of 1 run
+	out, _, code := runCLI(t, fakeEnv(fc), "review", "backlog")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(out, "2 open of 3 runs") {
+		t.Errorf("an open group must read \"N open of M runs\":\n%s", out)
+	}
+	// A fully-settled group (0 open) reads "M runs, all settled", singular at 1.
+	if !strings.Contains(out, "1 run, all settled") {
+		t.Errorf("a fully-settled group must read \"M runs, all settled\":\n%s", out)
+	}
+
+	// A fully-settled group over MANY runs pluralises the run noun.
+	fc2 := backlogFake()
+	fc2.JudgeBacklogResult.Groups[1].OpenCount = 0
+	fc2.JudgeBacklogResult.Groups[1].RunCount = 4
+	out2, _, code2 := runCLI(t, fakeEnv(fc2), "review", "backlog")
+	if code2 != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code2)
+	}
+	if !strings.Contains(out2, "4 runs, all settled") {
+		t.Errorf("a settled group over 4 runs must read \"4 runs, all settled\":\n%s", out2)
+	}
+}
+
 // The deprecated `uzi run review` alias still works (shares runReviewShow) and its
 // cobra deprecation notice goes to STDERR, keeping --json stdout pure.
 func TestRunReviewDeprecatedAliasNoticeOnStderr(t *testing.T) {

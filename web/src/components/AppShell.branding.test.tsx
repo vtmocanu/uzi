@@ -39,6 +39,8 @@ vi.mock("../lib/api", () => ({
     listFindings: vi
       .fn()
       .mockResolvedValue({ bucket: "to_file", repo: "", run: "", open_count: 0, findings: [] }),
+    // PRD #1183 M4: the Findings nav badge now polls getFindingsStats().todo.
+    getFindingsStats: vi.fn().mockResolvedValue({ total: 0, todo: 0, filed: 0, done: 0, dismissed: 0, false_positives: 0 }),
     listRuns: vi.fn().mockResolvedValue({ runs: [] }),
     getMyRateLimits: vi.fn().mockResolvedValue({ status: "no_token" }),
     getMySettings: vi.fn().mockResolvedValue({

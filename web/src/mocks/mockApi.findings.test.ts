@@ -21,6 +21,12 @@ describe("mockApi findings backlog (PRD #333 M7)", () => {
     expect(openCount).toBeGreaterThan(0);
     expect(mine.some((f) => f.status === "filed")).toBe(true);
     expect(mine.some((f) => f.status === "dismissed")).toBe(true);
+    // PRD #1183 M3/M4: a `done` row (issue-close sync) and a dismissed row carrying a reason, so
+    // the done chip and the reasoned dismissed chip are both exercised by the surfaces.
+    expect(mine.some((f) => f.status === "done" && f.set_via === "issue_close")).toBe(true);
+    expect(mine.some((f) => f.status === "dismissed" && f.dismiss_reason != null)).toBe(true);
+    // Every coordinate carries a disposition_id (the bulk-dismiss / undo key).
+    expect(mine.every((f) => !!f.disposition_id)).toBe(true);
     // A display-only coordinate (evidence cascaded away) and more than one repo, so grouping
     // and the null-finding_id row are both exercised by the surfaces.
     expect(mine.some((f) => f.finding_id === null)).toBe(true);
@@ -84,5 +90,103 @@ describe("mockApi findings backlog (PRD #333 M7)", () => {
     expect(ok.status).toBe("dismissed");
     // A second dismiss (now dismissed) is a 409.
     await expect(api.dismissFinding("find-1", "wont_do")).rejects.toMatchObject({ status: 409 });
+  });
+
+  it("the done bucket returns the issue-close coordinate with its provenance", async () => {
+    const api = await freshApi();
+    const done = await api.listFindings("done");
+    expect(done.findings.length).toBeGreaterThan(0);
+    expect(done.findings.every((f) => f.status === "done")).toBe(true);
+    const row = done.findings.find((f) => f.set_via === "issue_close");
+    expect(row).toBeTruthy();
+    expect(row?.filed_issue_iid).toBeGreaterThan(0);
+  });
+
+  it("the dismissed bucket carries the dismiss_reason", async () => {
+    const api = await freshApi();
+    const dismissed = await api.listFindings("dismissed");
+    expect(dismissed.findings.some((f) => f.dismiss_reason === "wont_do")).toBe(true);
+  });
+
+  it("every backlog row carries its disposition_id", async () => {
+    const api = await freshApi();
+    const all = await api.listFindings("all");
+    expect(all.findings.length).toBeGreaterThan(0);
+    expect(all.findings.every((f) => !!f.disposition_id)).toBe(true);
+  });
+});
+
+describe("mockApi findings stats (PRD #1183 M3)", () => {
+  it("computes the six counts from the seed, and equals a hand count per status", async () => {
+    const api = await freshApi();
+    const stats = await api.getFindingsStats();
+    expect(stats.total).toBe(mine.length);
+    expect(stats.todo).toBe(mine.filter((f) => f.status === "open").length);
+    expect(stats.filed).toBe(mine.filter((f) => f.status === "filed").length);
+    expect(stats.done).toBe(mine.filter((f) => f.status === "done").length);
+    expect(stats.dismissed).toBe(mine.filter((f) => f.status === "dismissed").length);
+    expect(stats.false_positives).toBe(
+      mine.filter((f) => f.status === "dismissed" && f.dismiss_reason === "not_an_issue").length,
+    );
+  });
+
+  it("is repo-scoped", async () => {
+    const api = await freshApi();
+    const atlas = await api.getFindingsStats("repo-atlas");
+    const atlasRows = mine.filter((f) => f.repo_id === "repo-atlas");
+    expect(atlas.total).toBe(atlasRows.length);
+    expect(atlas.todo).toBe(atlasRows.filter((f) => f.status === "open").length);
+  });
+
+  it("moves the todo count after a dismiss (the nav-badge source)", async () => {
+    const api = await freshApi();
+    const before = await api.getFindingsStats();
+    // disp-1 (find-1) is open — dismiss it via the bulk endpoint.
+    await api.dismissFindings(["disp-1"], "wont_do");
+    const after = await api.getFindingsStats();
+    expect(after.todo).toBe(before.todo - 1);
+    expect(after.dismissed).toBe(before.dismissed + 1);
+  });
+});
+
+describe("mockApi findings bulk dismiss + undo (PRD #1183 M3)", () => {
+  it("bulk-dismisses over disposition ids, skipping non-open and foreign ids silently", async () => {
+    const api = await freshApi();
+    // disp-1 + disp-2 are open; disp-3 is filed (skipped); an unknown id is skipped.
+    const res = await api.dismissFindings(["disp-1", "disp-2", "disp-3", "disp-does-not-exist"], "wont_do");
+    expect(res.updated).toBe(2);
+    expect(res.findings.every((f) => f.status === "dismissed")).toBe(true);
+    expect(res.findings.every((f) => f.dismiss_reason === "wont_do")).toBe(true);
+    expect(new Set(res.findings.map((f) => f.disposition_id))).toEqual(new Set(["disp-1", "disp-2"]));
+    // They no longer show under to_file.
+    const toFile = await api.listFindings("to_file");
+    expect(toFile.findings.some((f) => f.disposition_id === "disp-1")).toBe(false);
+  });
+
+  it("rejects a bulk dismiss with a bad reason (400) or over the 100-id cap (400)", async () => {
+    const api = await freshApi();
+    await expect(
+      api.dismissFindings(["disp-1"], "nope" as unknown as "wont_do"),
+    ).rejects.toMatchObject({ status: 400 });
+    const tooMany = Array.from({ length: 101 }, (_, i) => `disp-${i}`);
+    await expect(api.dismissFindings(tooMany, "wont_do")).rejects.toMatchObject({ status: 400 });
+  });
+
+  it("undo reopens a dismissed coordinate by disposition_id and clears the reason", async () => {
+    const api = await freshApi();
+    await api.dismissFindings(["disp-1"], "not_an_issue");
+    const row = await api.undoDismissFinding("disp-1");
+    expect(row.status).toBe("open");
+    expect(row.dismiss_reason).toBeUndefined();
+    // It is back under to_file.
+    const toFile = await api.listFindings("to_file");
+    expect(toFile.findings.some((f) => f.disposition_id === "disp-1")).toBe(true);
+  });
+
+  it("undo of a non-dismissed coordinate is a 404", async () => {
+    const api = await freshApi();
+    // disp-3 is filed, not dismissed.
+    await expect(api.undoDismissFinding("disp-3")).rejects.toMatchObject({ status: 404 });
+    await expect(api.undoDismissFinding("disp-does-not-exist")).rejects.toMatchObject({ status: 404 });
   });
 });

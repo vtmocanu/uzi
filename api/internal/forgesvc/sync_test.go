@@ -39,6 +39,20 @@ type fakeForge struct {
 	openIssues []forge.Issue
 	openErr    error
 
+	// Finding fetch (PRD #1183 Child B): both sync paths issue a THIRD ListIssues call
+	// keyed on the finding marker label (state=all) so a CLOSED finding issue is
+	// observed. It is discriminated from the uzi fetch by its LABEL VALUE
+	// (findingLabelFor), NOT by call order, so a swap still routes correctly — the same
+	// shape-not-index discipline the open fetch uses. findingIssues is what it returns;
+	// findingErr forces it to fail. findingLabel overrides the label the fake routes on
+	// and defaults to settings.DefaultFindingLabel, which is exactly what a Service with
+	// no configured/overridden finding label resolves to — so a pre-#1183 test that
+	// never sets findingIssues gets an empty finding fetch rather than a duplicate of the
+	// uzi fetch.
+	findingLabel  string
+	findingIssues []forge.Issue
+	findingErr    error
+
 	// MR-close watcher (PRD #24) scripting. mr/mrErr are the default GetMergeRequest
 	// result; mrByIID/mrErrByIID override per mrIID (for multi-candidate tests).
 	mr          forge.MergeRequest
@@ -138,18 +152,54 @@ func (f *fakeForge) ListIssues(_ context.Context, _ int64, opts forge.ListIssues
 		}
 		return f.openIssues, nil
 	}
+	// The finding fetch names the finding marker label (state=all). Route on the LABEL
+	// VALUE, not call order, so a reorder still discriminates it from the uzi fetch.
+	if len(opts.Labels) == 1 && opts.Labels[0] == f.findingLabelFor() {
+		if f.findingErr != nil {
+			return nil, f.findingErr
+		}
+		return f.findingIssues, nil
+	}
 	if f.listErr != nil {
 		return nil, f.listErr
 	}
 	return f.issues, nil
 }
 
-// prdListCalls returns just the PRD-labelled ListIssues calls, so an assertion about
-// the PRD fetch's options is not disturbed by the additive open fetch sitting next to
-// it in listCalls.
+// findingLabelFor is the label the fake routes the finding fetch on: the explicit
+// override when set, else settings.DefaultFindingLabel (what the Service falls back to
+// when no finding label is configured), so the fake and the service agree on which
+// third-fetch label means "the finding fetch".
+func (f *fakeForge) findingLabelFor() string {
+	if f.findingLabel != "" {
+		return f.findingLabel
+	}
+	return settings.DefaultFindingLabel
+}
+
+// findingListCalls returns just the finding-labelled ListIssues calls, the sibling of
+// prdListCalls/openListCalls for the third fetch. Like them it routes on the call's
+// SHAPE (its single finding label), never its index.
+func (f *fakeForge) findingListCalls() []forge.ListIssuesOptions {
+	var out []forge.ListIssuesOptions
+	for _, c := range f.listCalls {
+		if len(c.Labels) == 1 && c.Labels[0] == f.findingLabelFor() {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// prdListCalls returns just the uzi-labelled ListIssues calls, so an assertion about
+// the uzi fetch's options is not disturbed by the additive open fetch OR the additive
+// finding fetch sitting next to it in listCalls. The finding fetch is also label-shaped,
+// so it is excluded by its label value (findingLabelFor) — leaving only the uzi fetch.
 func (f *fakeForge) prdListCalls() []forge.ListIssuesOptions {
 	var out []forge.ListIssuesOptions
 	for _, c := range f.listCalls {
+		if len(c.Labels) == 1 && c.Labels[0] == f.findingLabelFor() {
+			continue // the finding fetch, not the uzi one — see findingListCalls
+		}
 		if len(c.Labels) > 0 {
 			out = append(out, c)
 		}
@@ -382,6 +432,16 @@ func (s *fakeStore) ApplyFiledIssueCloseEdge(_ context.Context, arg store.ApplyF
 	return s.closeApplyRows, s.closeApplyErr
 }
 
+// The findings Filed→Done sync (PRD #1183 M3) is covered by a live-DB test against real Postgres
+// (finding_issue_close_livedb_test.go), the same way the judge sync's edge semantics live in a
+// live-DB test; these stubs exist only so *fakeStore keeps satisfying the widened IssueStore.
+func (s *fakeStore) ListFindingIssueCloseEdges(_ context.Context, _ uuid.UUID) ([]store.ListFindingIssueCloseEdgesRow, error) {
+	return nil, nil
+}
+func (s *fakeStore) ApplyFindingIssueCloseEdge(_ context.Context, _ uuid.UUID) (int64, error) {
+	return 0, nil
+}
+
 func (s *fakeStore) ListPRDLinkPatchCandidates(_ context.Context, arg store.ListPRDLinkPatchCandidatesParams) ([]store.ListPRDLinkPatchCandidatesRow, error) {
 	s.prdCandidateArgs = append(s.prdCandidateArgs, arg)
 	return s.prdCandidates, s.prdCandidatesErr
@@ -441,10 +501,14 @@ func scheduledCand(runID uuid.UUID, mrIID int64, stored *string) store.ListSched
 	return row
 }
 
-// fakeLabels is a fixed LabelConfig for the sync tests.
-type fakeLabels struct{ uzi string }
+// fakeLabels is a fixed LabelConfig for the sync tests. finding is optional: left
+// empty it makes FindingLabel return "", which the Service resolves to
+// settings.DefaultFindingLabel — the same value the fakeForge's finding fetch routes
+// on by default, so the two agree without either being set explicitly.
+type fakeLabels struct{ uzi, finding string }
 
-func (f fakeLabels) UziLabel(context.Context) (string, error) { return f.uzi, nil }
+func (f fakeLabels) UziLabel(context.Context) (string, error)     { return f.uzi, nil }
+func (f fakeLabels) FindingLabel(context.Context) (string, error) { return f.finding, nil }
 
 func newTestService(st IssueStore) *Service {
 	// box is nil: FullSync/IncrementalSync operate on a passed-in Forge and

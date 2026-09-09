@@ -134,6 +134,40 @@ func (c *HTTPClient) DismissFinding(ctx context.Context, id, reason string) erro
 	return c.postJSON(ctx, "/api/findings/"+url.PathEscape(id)+"/dismiss", map[string]string{"reason": reason}, nil)
 }
 
+func (c *HTTPClient) GetFindingsStats(ctx context.Context, repo string) (apitypes.TriageDTO, error) {
+	path := "/api/findings/stats"
+	// repo is omitted rather than sent empty when unset: the handler's `!= ""` branch is what
+	// applies the repo filter, and an explicit empty value would take the same branch only by
+	// coincidence. Escaped because it is user input off a flag. The reply is the unenveloped
+	// TriageDTO, exactly like JudgeStats.
+	if repo != "" {
+		q := url.Values{}
+		q.Set("repo", repo)
+		path += "?" + q.Encode()
+	}
+	var out apitypes.TriageDTO
+	if err := c.get(ctx, path, &out); err != nil {
+		return apitypes.TriageDTO{}, err
+	}
+	return out, nil
+}
+
+func (c *HTTPClient) UndoDismissFinding(ctx context.Context, id string) error {
+	// A 404 here means the coordinate is not dismissed (an unknown/foreign id or a non-dismissed
+	// one) — softened to ErrFindingNotDismissed (a plain error) so `uzi findings undo` can report
+	// "already undone" and exit 0. Any other non-2xx keeps its real exit code. Mirrors
+	// DeleteDisposition's DELETE-404 softening; the id is escaped, off the positional.
+	path := "/api/findings/" + url.PathEscape(id) + "/dismiss"
+	resp, body, err := c.doJSONRead(ctx, http.MethodDelete, path, nil)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		return ErrFindingNotDismissed
+	}
+	return decode2xx(resp, body, path, nil)
+}
+
 // ReviewFiledIssueDTO / ReviewIssueFileResult mirror the review file handler's wire shape
 // (POST .../review/recommendations/{recID}/issue): the created forge issue plus an optional
 // created-with-warning note. Defined here (not in apitypes) because the handler's response is

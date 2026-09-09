@@ -65,8 +65,8 @@ func TestFullSyncFetchesOpenIssuesAdditively(t *testing.T) {
 	if _, err := svc.FullSync(context.Background(), uuid.New(), 7, f); err != nil {
 		t.Fatalf("FullSync: %v", err)
 	}
-	if len(f.listCalls) != 2 {
-		t.Fatalf("expected 2 ListIssues calls (PRD + additive), got %d: %+v", len(f.listCalls), f.listCalls)
+	if len(f.listCalls) != 3 {
+		t.Fatalf("expected 3 ListIssues calls (uzi + additive open + finding), got %d: %+v", len(f.listCalls), f.listCalls)
 	}
 	prd, open := f.listCalls[0], f.listCalls[1]
 	if prd.State != forge.StateAll {
@@ -80,6 +80,19 @@ func TestFullSyncFetchesOpenIssuesAdditively(t *testing.T) {
 	}
 	if len(open.Labels) != 0 {
 		t.Errorf("additive fetch must carry no label filter, got %v", open.Labels)
+	}
+	// The THIRD fetch is finding-labelled and state=all, mirroring the uzi fetch's shape
+	// so a CLOSED finding issue reaches the cache (PRD #1183 Child B): open-only and
+	// uzi-only fetches structurally miss it.
+	finding := f.findingListCalls()
+	if len(finding) != 1 {
+		t.Fatalf("expected exactly one finding fetch, got %d: %+v", len(finding), f.listCalls)
+	}
+	if finding[0].State != forge.StateAll {
+		t.Errorf("finding fetch state = %q, want StateAll (closed finding issues must reach the cache)", finding[0].State)
+	}
+	if len(finding[0].Labels) != 1 || finding[0].Labels[0] != settings.DefaultFindingLabel {
+		t.Errorf("finding fetch labels = %v, want [%s]", finding[0].Labels, settings.DefaultFindingLabel)
 	}
 	if got := upsertedIIDs(st); !slices.Equal(got, []int64{1, 2}) {
 		t.Errorf("upserted iids = %v, want both halves [1 2]", got)
@@ -107,12 +120,18 @@ func TestFullSyncDoesNotThreadTheRunEligibleSet(t *testing.T) {
 	if _, err := svc.FullSync(context.Background(), uuid.New(), 7, f); err != nil {
 		t.Fatalf("FullSync: %v", err)
 	}
-	if len(f.listCalls) != 2 {
-		t.Fatalf("expected 2 ListIssues calls, got %d: %+v", len(f.listCalls), f.listCalls)
+	if len(f.listCalls) != 3 {
+		t.Fatalf("expected 3 ListIssues calls, got %d: %+v", len(f.listCalls), f.listCalls)
 	}
 	prd := f.listCalls[0]
 	if len(prd.Labels) != 1 || prd.Labels[0] != uziLabel {
 		t.Fatalf("label-filtered fetch labels = %v, want exactly [%s] — the run-eligible SET must never reach the ANDed sync fetch", prd.Labels, uziLabel)
+	}
+	// The finding fetch is likewise a single-label query: the run-eligible SET must never
+	// reach EITHER label-filtered fetch (ListIssuesOptions.Labels is ANDed).
+	finding := f.findingListCalls()
+	if len(finding) != 1 || len(finding[0].Labels) != 1 || finding[0].Labels[0] != settings.DefaultFindingLabel {
+		t.Fatalf("finding fetch labels = %+v, want exactly [%s]", finding, settings.DefaultFindingLabel)
 	}
 }
 
@@ -257,23 +276,28 @@ func TestEachFetchCarriesItsOwnMark(t *testing.T) {
 	st := &fakeStore{}
 	svc := newTestService(st)
 	f := &fakeForge{}
-	start := Marks{PRD: time.Unix(500, 0), Open: time.Unix(900, 0)}
+	// All THREE marks DIFFER, so a field swap among the fetches' lower bounds fails here
+	// rather than reading as "each carried a bound".
+	start := Marks{PRD: time.Unix(500, 0), Open: time.Unix(900, 0), Finding: time.Unix(700, 0)}
 
 	if _, err := svc.IncrementalSync(context.Background(), uuid.New(), 7, f, start); err != nil {
 		t.Fatalf("IncrementalSync: %v", err)
 	}
-	if len(f.listCalls) != 2 {
-		t.Fatalf("expected 2 ListIssues calls, got %d", len(f.listCalls))
+	if len(f.listCalls) != 3 {
+		t.Fatalf("expected 3 ListIssues calls, got %d", len(f.listCalls))
 	}
-	prd, open := f.prdListCalls(), f.openListCalls()
-	if len(prd) != 1 || len(open) != 1 {
-		t.Fatalf("expected one PRD and one open fetch, got %d/%d: %+v", len(prd), len(open), f.listCalls)
+	prd, open, finding := f.prdListCalls(), f.openListCalls(), f.findingListCalls()
+	if len(prd) != 1 || len(open) != 1 || len(finding) != 1 {
+		t.Fatalf("expected one uzi, one open and one finding fetch, got %d/%d/%d: %+v", len(prd), len(open), len(finding), f.listCalls)
 	}
 	if prd[0].UpdatedAfter == nil || !prd[0].UpdatedAfter.Equal(start.PRD) {
 		t.Errorf("PRD fetch updated_after = %v, want %v (its OWN mark)", prd[0].UpdatedAfter, start.PRD)
 	}
 	if open[0].UpdatedAfter == nil || !open[0].UpdatedAfter.Equal(start.Open) {
 		t.Errorf("open fetch updated_after = %v, want %v (its OWN mark)", open[0].UpdatedAfter, start.Open)
+	}
+	if finding[0].UpdatedAfter == nil || !finding[0].UpdatedAfter.Equal(start.Finding) {
+		t.Errorf("finding fetch updated_after = %v, want %v (its OWN mark)", finding[0].UpdatedAfter, start.Finding)
 	}
 }
 
@@ -499,5 +523,162 @@ func TestAClosedNonPRDIssueIsNeitherRefreshedNorKept(t *testing.T) {
 	}
 	if !slices.Contains(keep, int64(1)) {
 		t.Fatalf("keep-set %v dropped the PRD issue, which is a different bug entirely", keep)
+	}
+}
+
+// ── PRD #1183 Child B: the additive finding fetch ─────────────────────────────
+//
+// The third fetch mirrors the uzi fetch (finding label, state=all) and exists to close
+// one structural gap: a CLOSED finding-labelled issue is returned by NEITHER the uzi
+// fetch (it is not uzi-labelled) NOR the open fetch (it is closed), so before it the
+// row was evicted on close and forgesvc.SyncFindingIssueCloses never observed the
+// open→closed edge. These tests pin the fetch's shape, its additive upsert/keep, its
+// fail-closed contract (Decision 11, extended from two fetches to three), and the
+// defensive skip when the finding label collides with the uzi label.
+
+// findingClosed builds a CLOSED forge issue carrying the default finding marker label
+// (and no uzi label) at a given updated_at — the exact shape the third fetch exists to
+// catch and the first two structurally miss.
+func findingClosed(iid int64, updated time.Time) forge.Issue {
+	return forge.Issue{IID: iid, Title: "t", State: "closed", Labels: []string{settings.DefaultFindingLabel}, UpdatedAt: updated}
+}
+
+// TestFullSyncFetchesFindingIssuesAdditively is the finding twin of
+// TestFullSyncFetchesOpenIssuesAdditively: the third fetch observes a closed finding
+// issue, upserts it as closed (so the close-sync can read state='closed'), and keeps it
+// in the union so the reconcile does not evict it. Its mark advances to the fetch's max.
+func TestFullSyncFetchesFindingIssuesAdditively(t *testing.T) {
+	st := &fakeStore{}
+	svc := newTestService(st)
+	f := &fakeForge{
+		issues:        []forge.Issue{labelled(1, time.Unix(100, 0), uziLabel)},
+		openIssues:    []forge.Issue{labelled(2, time.Unix(100, 0), "bug")},
+		findingIssues: []forge.Issue{findingClosed(9, time.Unix(300, 0))},
+	}
+
+	got, err := svc.FullSync(context.Background(), uuid.New(), 7, f)
+	if err != nil {
+		t.Fatalf("FullSync: %v", err)
+	}
+	if ids := upsertedIIDs(st); !slices.Equal(ids, []int64{1, 2, 9}) {
+		t.Fatalf("upserted iids = %v, want [1 2 9] — the closed finding issue must reach the cache", ids)
+	}
+	if keep := keepSet(t, st); !slices.Contains(keep, int64(9)) {
+		t.Fatalf("keep-set %v dropped the closed finding issue; the third fetch must keep it cached, not evict it on close", keep)
+	}
+	// The row is written with state='closed' — the exact snapshot SyncFindingIssueCloses
+	// keys the open→closed edge on.
+	var wroteClosed bool
+	for _, u := range st.upserts {
+		if u.ForgeIssueIid == 9 {
+			wroteClosed = u.State == "closed"
+		}
+	}
+	if !wroteClosed {
+		t.Errorf("issue 9 must be upserted with state='closed'; the close-sync edge depends on it")
+	}
+	if !got.Finding.Equal(time.Unix(300, 0)) {
+		t.Errorf("Finding mark = %v, want %v (its OWN fetch's max)", got.Finding, time.Unix(300, 0))
+	}
+}
+
+// TestFullSyncEvictsNothingWhenFindingFetchFails extends Decision 11's fail-closed rule
+// to the third fetch: a failed finding fetch drives NO eviction and NO upsert, and
+// FullSync returns the zero Marks so the caller holds the marks it had. Without the
+// return-before-eviction guard the union would be built from two of three fetches and
+// wipe whatever the finding fetch owns.
+func TestFullSyncEvictsNothingWhenFindingFetchFails(t *testing.T) {
+	boom := errors.New("forge is down")
+	st := &fakeStore{}
+	svc := newTestService(st)
+	f := &fakeForge{
+		issues:     []forge.Issue{labelled(1, time.Unix(100, 0), uziLabel)},
+		openIssues: []forge.Issue{labelled(2, time.Unix(100, 0), "bug")},
+		findingErr: boom,
+	}
+
+	marks, err := svc.FullSync(context.Background(), uuid.New(), 7, f)
+	if !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want the finding-fetch error surfaced (no soft-fail)", err)
+	}
+	if len(st.deleteCalls) != 0 {
+		t.Errorf("a failed finding fetch must evict NOTHING, got %+v", st.deleteCalls)
+	}
+	if len(st.upserts) != 0 {
+		t.Errorf("a failed finding fetch must upsert NOTHING (all fetches complete before any write), got %+v", st.upserts)
+	}
+	if !marks.PRD.IsZero() || !marks.Open.IsZero() || !marks.Finding.IsZero() {
+		t.Errorf("marks = %+v, want the zero Marks so the poller keeps the marks it had", marks)
+	}
+}
+
+// TestIncrementalSyncFailsClosedOnFindingFetch is Decision 11a's asymmetric-failure rule
+// for the third fetch: a failed finding fetch returns the CALLER'S whole Marks unchanged,
+// so the next pass does not skip a window whose rows never reached the cache.
+func TestIncrementalSyncFailsClosedOnFindingFetch(t *testing.T) {
+	boom := errors.New("forge is down")
+	st := &fakeStore{}
+	svc := newTestService(st)
+	start := Marks{PRD: time.Unix(500, 0), Open: time.Unix(900, 0), Finding: time.Unix(700, 0)}
+	f := &fakeForge{
+		issues:     []forge.Issue{labelled(1, time.Unix(9000, 0), uziLabel)},
+		openIssues: []forge.Issue{labelled(2, time.Unix(9000, 0), "bug")},
+		findingErr: boom,
+	}
+
+	got, err := svc.IncrementalSync(context.Background(), uuid.New(), 7, f, start)
+	if !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want the finding-fetch error surfaced", err)
+	}
+	if !got.PRD.Equal(start.PRD) || !got.Open.Equal(start.Open) || !got.Finding.Equal(start.Finding) {
+		t.Fatalf("marks = %+v, want the WHOLE trio held at %+v — advancing past an unwritten window makes the skip permanent until the reconcile", got, start)
+	}
+	if len(st.upserts) != 0 {
+		t.Errorf("no path's rows may be written when a fetch fails, got %+v", st.upserts)
+	}
+}
+
+// TestIncrementalSyncAdvancesFindingMark: the finding fetch's mark advances to its own
+// batch max, independently of the other two (which return nothing here and hold at the
+// caller's values). The closed finding issue is upserted so the close-sync can read it.
+func TestIncrementalSyncAdvancesFindingMark(t *testing.T) {
+	st := &fakeStore{}
+	svc := newTestService(st)
+	f := &fakeForge{findingIssues: []forge.Issue{findingClosed(9, time.Unix(4000, 0))}}
+	start := Marks{PRD: time.Unix(500, 0), Open: time.Unix(900, 0), Finding: time.Unix(1000, 0)}
+
+	got, err := svc.IncrementalSync(context.Background(), uuid.New(), 7, f, start)
+	if err != nil {
+		t.Fatalf("IncrementalSync: %v", err)
+	}
+	if !got.Finding.Equal(time.Unix(4000, 0)) {
+		t.Errorf("Finding mark = %v, want its fetch's max %v", got.Finding, time.Unix(4000, 0))
+	}
+	if !got.PRD.Equal(start.PRD) || !got.Open.Equal(start.Open) {
+		t.Errorf("PRD/Open marks moved on an empty fetch: got %+v, want held at %+v", got, start)
+	}
+	if ids := upsertedIIDs(st); !slices.Equal(ids, []int64{9}) {
+		t.Errorf("upserted iids = %v, want [9] (the closed finding issue reaching the cache)", ids)
+	}
+}
+
+// TestFullSyncSkipsFindingFetchWhenLabelEqualsUzi is the defensive skip: ValidateMerged
+// forbids finding_label == uzi_label, but if a misconfig slipped through the finding
+// fetch would be a pure duplicate of the state=all uzi fetch. FullSync issues only the
+// two base fetches and leaves the Finding mark zero (an unissued fetch is no evidence).
+func TestFullSyncSkipsFindingFetchWhenLabelEqualsUzi(t *testing.T) {
+	st := &fakeStore{}
+	svc := New(st, nil, time.Second, fakeLabels{uzi: uziLabel, finding: uziLabel})
+	f := &fakeForge{issues: []forge.Issue{labelled(1, time.Unix(100, 0), uziLabel)}}
+
+	got, err := svc.FullSync(context.Background(), uuid.New(), 7, f)
+	if err != nil {
+		t.Fatalf("FullSync: %v", err)
+	}
+	if len(f.listCalls) != 2 {
+		t.Fatalf("expected only 2 ListIssues calls when finding==uzi (third skipped), got %d: %+v", len(f.listCalls), f.listCalls)
+	}
+	if !got.Finding.IsZero() {
+		t.Errorf("Finding mark = %v, want zero — the skipped fetch is no evidence", got.Finding)
 	}
 }
