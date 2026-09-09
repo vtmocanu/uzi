@@ -308,8 +308,14 @@ RUN bash /tmp/codex/assert-codex.sh \
 # intentionally on NO PATH: the launcher resolves it by absolute path
 # (/usr/local/bin/uzi-codex-supervisor) as a trusted, caller-supplied argv0 — never model-
 # controlled.
+#
+# The SAME module ships a SECOND static command, uzi-codex-fileop (the [B2] openat2
+# worktree-confined file-operation helper, `./fileop`), built in the same RUN off the same
+# vendored tree (identical GOTOOLCHAIN/CGO/GOFLAGS env), installed root-owned 0555 at
+# /usr/local/bin/uzi-codex-fileop (matching FILEOP_BIN in agent/src/codex/codex-executor.ts).
+# MIRRORED from templates/base — keep the COPY/RUN lines in lockstep (jvm is NOT `FROM base`).
 COPY agent/codex/supervisor /build/uzi-codex-supervisor
-RUN cd /build/uzi-codex-supervisor && GOTOOLCHAIN=local CGO_ENABLED=0 GOFLAGS="-mod=vendor -buildvcs=false" go build -trimpath -o /usr/local/bin/uzi-codex-supervisor . && chmod 0555 /usr/local/bin/uzi-codex-supervisor && rm -rf /build/uzi-codex-supervisor
+RUN cd /build/uzi-codex-supervisor && GOTOOLCHAIN=local CGO_ENABLED=0 GOFLAGS="-mod=vendor -buildvcs=false" go build -trimpath -o /usr/local/bin/uzi-codex-supervisor . && chmod 0555 /usr/local/bin/uzi-codex-supervisor && go build -trimpath -o /usr/local/bin/uzi-codex-fileop ./fileop && chmod 0555 /usr/local/bin/uzi-codex-fileop && rm -rf /build/uzi-codex-supervisor
 
 COPY agent/tsconfig.json ./
 COPY agent/src ./src

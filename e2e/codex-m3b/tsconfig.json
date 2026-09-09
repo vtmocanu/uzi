@@ -1,0 +1,28 @@
+{
+  "//": "PRD #1171 m5: typecheck the packaged CodexExecutor lifecycle harness.",
+  "//1": "Cloned from e2e/codex-m3a/tsconfig.json (NodeNext, strict, skipLibCheck, types",
+  "//2": "node) so the '../../agent/src/...' NodeNext specifiers the packaged-modules type",
+  "//3": "bindings and the type-only executor imports use resolve exactly as the agent module",
+  "//4": "compiles them. typeRoots points at the agent module's @types because this directory",
+  "//5": "has no node_modules of its own; the imported agent src files resolve their own",
+  "//6": "sibling imports by walking up. harness-m0.d.ts supplies the ambient types for the",
+  "//7": "frozen '../codex-m0/harness.mjs' protocol helpers the loopback fake reuses, so the",
+  "//8": "strict, allowJs:false compile resolves them without editing the frozen .mjs.",
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2024"],
+    "typeRoots": ["../../agent/node_modules/@types"],
+    "types": ["node"],
+    "strict": true,
+    "noEmit": true,
+    "allowJs": false,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "forceConsistentCasingInFileNames": true
+  },
+  "include": ["*.test.ts", "fake-provider.ts", "packaged-modules.ts", "harness-m0.d.ts"],
+  "exclude": ["node_modules", ".bin"]
+}
