@@ -127,11 +127,22 @@ async function main(): Promise<void> {
       // A validated Codex binding: the production CodexExecutor over the M3a launcher, the
       // dark core and the M1 credential bridge. Per-run owned HOME (like SdkExecutor).
       const runHome = path.join(sdkHomeRoot, runId);
-      const executor = new CodexExecutor(log, runHome, {
-        binding: selection.binding,
-        client,
-        provider: CODEX_PRODUCTION_PROVIDER,
-      });
+      const executor = new CodexExecutor(
+        log,
+        runHome,
+        {
+          binding: selection.binding,
+          client,
+          provider: CODEX_PRODUCTION_PROVIDER,
+        },
+        {
+          // PRD #1171 m4 (F1): the RUNNER owns the terminal registry teardown. Its post-run
+          // durability sinks (park/shutdown/finalize) reap the provider root through
+          // withBoundary AFTER run() returns, and executeClaim's finally calls safety.dispose
+          // once the last sink settles — so run()'s finally must leave the registry ALIVE.
+          deferRegistryTeardown: true,
+        },
+      );
       return { executor, homeDir: runHome };
     }
 

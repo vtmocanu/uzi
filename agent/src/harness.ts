@@ -342,6 +342,13 @@ export interface CodexExecutionSafety {
     request: BoundaryRequest,
     action: (permit: BoundaryPermit) => Promise<T>,
   ): Promise<T>;
+  // PRD #1171 m4 (F1): the terminal tool-disposal, delegated to the registry's
+  // `disposeTools`. The executor's `run()` no longer disposes the registry on the
+  // normal path — its post-run durability sinks (park/shutdown/finalize) still need
+  // the roots alive to reap — so the runner calls this ONCE in `executeClaim`'s
+  // `finally`, after every sink has settled, to drop the roots/handlers. Idempotent
+  // (disposeTools is), so a backstop dispose in the executor never double-disposes.
+  dispose(request: BoundaryRequest): Promise<ToolDisposal>;
 }
 
 // M3 addition required on the existing outer Executor contract in executor.ts:

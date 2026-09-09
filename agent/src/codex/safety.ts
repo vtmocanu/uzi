@@ -58,6 +58,24 @@ export type BoundaryActionOutcome =
     }
   | { kind: "poisoned"; error: HarnessError };
 
+/** PRD #1171 m4: the NEUTRAL result of the per-sink auth-mode reconciliation. It is the
+ *  ONLY thing that crosses back from the executor-owned reconcile closure into the generic
+ *  safety code — the runner and the generic `withBoundary` NEVER see `authMode`, a token, an
+ *  operation id or a generation. `ready` lets the boundary proceed to quiesce/reap/mint;
+ *  `blocked` poisons the epoch and throws `CodexBoundaryError("reconcile")` WITHOUT
+ *  quiescing/reaping/minting, so the sink counter stays zero and later publication is
+ *  blocked. */
+export type ReconcileOutcome =
+  | { kind: "ready" }
+  | { kind: "blocked"; errors: readonly HarnessError[] };
+
+/** PRD #1171 m4: the executor-owned auth-mode reconcile step run BEFORE every Codex
+ *  boundary. A subscription run refreshes + durably advances its generation here; an
+ *  api_key run performs zero refresh and only re-authorizes. Absent ⇒ no reconcile step
+ *  (Claude/tests that do not pass it are unaffected). It NEVER returns a credential — only a
+ *  neutral {@link ReconcileOutcome}. */
+export type ReconcileBeforeBoundary = (request: BoundaryRequest) => Promise<ReconcileOutcome>;
+
 /** Thrown by `withBoundary` when the boundary cannot be established (quiesce/reap
  *  failed) or the action's own children left the epoch poisoned. The sink was
  *  never run, or ran but its cleanup was incomplete; either way the caller must
@@ -70,7 +88,7 @@ export class CodexBoundaryError extends Error {
    *  the standard `cause`. Undefined when the action itself did not throw. */
   readonly actionError?: unknown;
   constructor(
-    readonly stage: "quiesce" | "reap" | "action",
+    readonly stage: "reconcile" | "quiesce" | "reap" | "action",
     readonly errors: readonly HarnessError[],
     actionError?: unknown,
   ) {
@@ -104,6 +122,9 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
 
   private readonly registry: ExecutionRegistry;
   private readonly seams: BoundarySeams;
+  // PRD #1171 m4: the OPTIONAL executor-owned auth-mode reconcile step. Absent ⇒ no
+  // reconcile (Claude/tests). Only its neutral {@link ReconcileOutcome} crosses back in.
+  private readonly reconcileBeforeBoundary: ReconcileBeforeBoundary | undefined;
 
   // Serialization tail: each boundary awaits the previous one's release.
   private queueTail: Promise<void> = Promise.resolve();
@@ -113,9 +134,14 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
   private currentDeadlineMs = 0;
   private pendingActions: Promise<unknown>[] = [];
 
-  constructor(registry: ExecutionRegistry, seams: BoundarySeams) {
+  constructor(
+    registry: ExecutionRegistry,
+    seams: BoundarySeams,
+    reconcileBeforeBoundary?: ReconcileBeforeBoundary,
+  ) {
     this.registry = registry;
     this.seams = seams;
+    this.reconcileBeforeBoundary = reconcileBeforeBoundary;
   }
 
   async withBoundary<T>(
@@ -141,6 +167,22 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     request: BoundaryRequest,
     action: (permit: BoundaryPermit) => Promise<T>,
   ): Promise<T> {
+    // (1.5) PRD #1171 m4: per-sink auth-mode reconciliation, AFTER the serialization queue
+    // (in withBoundary) and BEFORE quiesce/reap/mint. A subscription run refreshes + durably
+    // advances its generation here; an api_key run re-authorizes with zero refresh. A
+    // `blocked` outcome (contended/quarantined/persistence-failure/HTTP error) poisons the
+    // epoch and throws WITHOUT quiescing/reaping/minting or running the action — the sink
+    // counter stays zero, publication is blocked, and the primary + cleanup evidence are
+    // retained separately. Absent seam ⇒ no reconcile step (Claude/tests unaffected). Only
+    // the neutral outcome crosses back in; this generic code never sees authMode.
+    if (this.reconcileBeforeBoundary) {
+      const reconciled = await this.reconcileBeforeBoundary(request);
+      if (reconciled.kind === "blocked") {
+        this.registry.poison(reconciled.errors);
+        throw new CodexBoundaryError("reconcile", reconciled.errors);
+      }
+    }
+
     // (2) Quiesce child admission. Must be fully quiescent or the sink is uncalled.
     const q = await this.seams.quiesce(request);
     if (q.kind !== "quiescent") {
@@ -339,11 +381,16 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
 export function createCodexExecutionSafety(
   registry: ExecutionRegistry,
   spawnRoot: SpawnRootSeam,
+  reconcileBeforeBoundary?: ReconcileBeforeBoundary,
 ): CodexExecutionSafetyImpl {
-  return new CodexExecutionSafetyImpl(registry, {
-    quiesce: (request) => registry.quiesceChildren(request.deadlineMs),
-    reap: (request, closedEpoch) => registry.reapProcesses(request.deadlineMs, closedEpoch),
-    dispose: (request) => registry.disposeTools(request.deadlineMs),
-    spawnRoot,
-  });
+  return new CodexExecutionSafetyImpl(
+    registry,
+    {
+      quiesce: (request) => registry.quiesceChildren(request.deadlineMs),
+      reap: (request, closedEpoch) => registry.reapProcesses(request.deadlineMs, closedEpoch),
+      dispose: (request) => registry.disposeTools(request.deadlineMs),
+      spawnRoot,
+    },
+    reconcileBeforeBoundary,
+  );
 }

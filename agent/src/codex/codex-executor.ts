@@ -23,8 +23,11 @@
 // SCOPE (R4): this does NOT clone SdkExecutor's Claude-lane extras (empty-turn retry,
 // plan/intent summary hooks, health/interleave sentinels, interactive park/pause). It
 // reuses `ctx.gatePlan` for the plan→approval gate exactly like SdkExecutor, but drives
-// turns Codex-specific. The runner durability SINKS are wired through `this.safety` in m4
-// (not here); m3 only POPULATES `safety` and reaps the registry roots in run()'s finally.
+// turns Codex-specific. The runner's durability SINKS run through `this.safety.withBoundary`
+// (m4), each preceded by an executor-owned per-sink auth-mode reconcile (part 4). Under a
+// runner (deferRegistryTeardown), run()'s finally leaves the registry ALIVE for those
+// post-run sinks and the runner disposes it via `safety.dispose` after the last sink (F1);
+// STANDALONE, run()'s finally backstops the registry teardown itself.
 
 import path from "node:path";
 import { spawn } from "node:child_process";
@@ -34,10 +37,12 @@ import type { Logger } from "../log.js";
 import type { WorkerClient } from "../client.js";
 import { PlanRejectedError, type Executor, type ExecutorResult, type RunContext } from "../executor.js";
 import type {
+  BoundaryRequest,
   CodexExecutionSafety,
   HarnessAgent,
   HarnessContextHook,
   HarnessEffort,
+  HarnessError,
   ReducedTurnResult,
   RunTurnRequest,
   TurnStreamEnd,
@@ -49,7 +54,12 @@ import { errMessage } from "../util.js";
 import type { AgentTemplate } from "../protocol.js";
 
 import { ExecutionRegistry, newLocalExecutionEpoch, type RegisteredRoot } from "./registry.js";
-import { createCodexExecutionSafety, type SpawnRootSeam } from "./safety.js";
+import {
+  createCodexExecutionSafety,
+  type ReconcileBeforeBoundary,
+  type ReconcileOutcome,
+  type SpawnRootSeam,
+} from "./safety.js";
 import {
   CodexHarness,
   type CodexChildSink,
@@ -264,6 +274,73 @@ export class CodexAdviceCredentialBridge {
 }
 
 /**
+ * PRD #1171 m4 (part 4): the RUN-LANE per-sink auth-mode reconcile closure — the safety facade
+ * runs it BEFORE every durability boundary. Mirrors {@link CodexAdviceCredentialBridge}: it
+ * captures the runId, the client (release/refresh) and the immutable binding (authMode +
+ * subscription generation), and ONLY its neutral {@link ReconcileOutcome} crosses back into the
+ * generic safety code (never authMode/token/generation).
+ *
+ *  - SUBSCRIPTION: mint ONE operation_id per LOGICAL refresh and RETAIN it across retries (a lost
+ *    reply replays rather than starting a second provider exchange); refreshCodex → advance the
+ *    observed generation on success (a durable commit BEFORE the permit) and clear the operation
+ *    id so the next boundary mints a fresh one. A contended/quarantined/persistence-failure (any
+ *    HTTP error) → {kind:"blocked"} WITHOUT advancing/clearing, so a RETRIED boundary reuses the
+ *    same operation id rather than beginning a second provider exchange.
+ *  - API_KEY: ZERO refreshCodex calls; a fresh releaseCodex only. success → ready.
+ *
+ * `registerToken` is called with any freshly released token (subscription or api_key) so the
+ * caller can register it with the run redactor and track it for terminal eviction.
+ *
+ * Exported (with {@link CodexAdviceCredentialBridge}) so the differential test pins BOTH against
+ * drift.
+ */
+export function buildRunLaneReconcile(
+  runId: string,
+  client: Pick<WorkerClient, "releaseCodex" | "refreshCodex">,
+  binding: CodexBinding,
+  registerToken: (token: string) => void,
+): ReconcileBeforeBoundary {
+  let reconcileOperationId: string | undefined;
+  let observedGeneration = binding.generation; // subscription initial; undefined for api_key
+  return async (_request: BoundaryRequest): Promise<ReconcileOutcome> => {
+    try {
+      if (binding.authMode === "subscription") {
+        if (observedGeneration === undefined) {
+          // A subscription binding always carries a generation (the selector enforces it); its
+          // absence here is a protocol fault, not a live credential, so fail closed.
+          const errors: readonly HarnessError[] = [
+            { category: "authorization", message: "codex subscription boundary reconcile has no observed generation" },
+          ];
+          return { kind: "blocked", errors };
+        }
+        // ONE operation id per LOGICAL refresh, RETAINED across retries until it SUCCEEDS.
+        if (reconcileOperationId === undefined) reconcileOperationId = randomUUID();
+        const res = await client.refreshCodex(runId, {
+          capability: binding.capability,
+          operation_id: reconcileOperationId,
+          observed_generation: observedGeneration,
+        });
+        registerToken(res.access_token);
+        observedGeneration = res.generation; // durable commit → advance BEFORE the permit
+        reconcileOperationId = undefined; // logical refresh done; next boundary mints fresh
+        return { kind: "ready" };
+      }
+      // api_key: ZERO refresh; a fresh release re-authorizes only (no subscription fallback).
+      const res = await client.releaseCodex(runId, { capability: binding.capability });
+      registerToken(res.access_token);
+      return { kind: "ready" };
+    } catch {
+      // Fail CLOSED with a bounded, secret-free reason (authMode is safe to name). The op id and
+      // observed generation are DELIBERATELY left intact so a retried boundary reuses them.
+      const errors: readonly HarnessError[] = [
+        { category: "authorization", message: `codex ${binding.authMode} boundary reconcile failed` },
+      ];
+      return { kind: "blocked", errors };
+    }
+  };
+}
+
+/**
  * Build an isolated {@link CodexAdviceHarness} whose credential is freshly released through
  * `bridge`. If the bridge fails closed (authority unavailable) the release throws and NO
  * advice root is built — the failure propagates rather than degrading to an un-credentialed
@@ -318,6 +395,14 @@ export interface CodexExecutorDeps {
   readonly childTurnDeadlineMs?: number;
   /** The runner-owned scratch dir for the command identity env (`TMPDIR`). */
   readonly commandTmpdir?: string;
+  /** PRD #1171 m4 (F1): the runner OWNS the terminal registry teardown. When true, `run()`'s
+   *  finally does NOT quiesce/reap/dispose the registry — its post-run durability sinks
+   *  (park/shutdown/finalize) reap the provider root through `withBoundary`, and the runner's
+   *  `executeClaim` finally calls `safety.dispose` once every sink has settled — so the
+   *  registry must stay ALIVE across `run()`. When false/absent (a STANDALONE executor with no
+   *  runner sink), `run()`'s finally is the sole teardown and reaps+disposes the registry
+   *  itself (the backstop). The runner (main.ts) sets it true. */
+  readonly deferRegistryTeardown?: boolean;
 }
 
 export interface CodexExecutorOptions {
@@ -328,11 +413,11 @@ export interface CodexExecutorOptions {
 
 // ─── The production CodexExecutor ───────────────────────────────────────────────
 export class CodexExecutor implements Executor {
-  /** M3 (PRD #1171): the Codex outer safety facade, POPULATED at the top of `run()` (before
-   *  any model work). The runner's durability sinks are routed through it in m4; m3 only
-   *  populates it and reaps the registry roots in run()'s finally. Absent means Claude/stub
-   *  — this executor always sets it, so the runner never takes the legacy killAgentTree
-   *  branch for a Codex run. This class deliberately does NOT implement `killAgentTree`. */
+  /** M3/M4 (PRD #1171): the Codex outer safety facade, POPULATED at the top of `run()` (before
+   *  any model work) with the per-sink auth-mode reconcile closure. The runner's durability
+   *  sinks route through it (m4). Absent means Claude/stub — this executor always sets it, so
+   *  the runner never takes the legacy killAgentTree branch for a Codex run. This class
+   *  deliberately does NOT implement `killAgentTree`. */
   safety?: CodexExecutionSafety;
 
   private readonly log: Logger;
@@ -375,7 +460,15 @@ export class CodexExecutor implements Executor {
       this.deps.spawnBoundaryRoot ??
       ((): Promise<RegisteredRoot> =>
         Promise.reject(new Error("codex boundary-action spawn is not wired until m4")));
-    this.safety = createCodexExecutionSafety(registry, spawnBoundaryRoot);
+    // (2b) PRD #1171 m4: the per-sink auth-mode reconcile closure. It runs INSIDE the safety
+    // facade before every boundary quiesce/reap/mint, and ONLY its neutral ReconcileOutcome
+    // crosses back into the generic code — the runner and generic withBoundary never see
+    // authMode/token/generation. All credential logic lives here (mirroring the advice bridge).
+    this.safety = createCodexExecutionSafety(
+      registry,
+      spawnBoundaryRoot,
+      this.makeBoundaryReconcile(ctx.runId, releasedTokens),
+    );
 
     // The SCRUBBED command-identity env — NOTHING from process.env (cross-root credential
     // boundary). Both the shell effect surface and the fileop helper use it.
@@ -492,8 +585,10 @@ export class CodexExecutor implements Executor {
 
       return { branch: ctx.branch };
     } finally {
-      // Terminal cleanup: reap every registered root (quiesce → reap → dispose), close the
-      // harness/transport, dispose the fileop handle, and remove the credential-free store.
+      // Terminal cleanup (m4 F1): a BACKSTOP that reaps+disposes the registry ONLY when NO
+      // runner sink will (deferRegistryTeardown unset); otherwise it leaves the registry ALIVE
+      // for the runner's post-run durability sinks and only tears down the executor-owned
+      // harness/transport, fileop handle and credential-free store.
       await this.terminalCleanup(registry, harness, fileopHandle, storeDir, boundaryDeadlineMs);
       // (C) Evict every fresh released token from the logger's secret set — AFTER the
       // harness/transport is closed above, so no late log line can still carry the token.
@@ -603,6 +698,22 @@ export class CodexExecutor implements Executor {
 
   private tripError(reason: string): Error {
     return new Error(reason);
+  }
+
+  // ─── the per-sink auth-mode reconcile closure (m4, part 4) ────────────────────
+  /**
+   * The executor-owned auth-mode reconcile closure the safety facade runs BEFORE every boundary
+   * quiesce/reap/mint. Delegates to the standalone {@link buildRunLaneReconcile} (pinned by the
+   * differential test against the advice bridge), registering any fresh token with the redactor
+   * and tracking it for terminal eviction (part C), the same as a provider-root release.
+   */
+  private makeBoundaryReconcile(runId: string, releasedTokens: Set<string>): ReconcileBeforeBoundary {
+    const log = this.log;
+    return buildRunLaneReconcile(runId, this.opts.client, this.opts.binding, (token) => {
+      if (!token) return;
+      log.addSecret(token); // BEFORE any use; balanced by removeSecret at terminal cleanup
+      releasedTokens.add(token);
+    });
   }
 
   // ─── the child-turn demux seam (part C) ───────────────────────────────────────
@@ -718,7 +829,7 @@ export class CodexExecutor implements Executor {
     return `${head}\n\n${ctx.issueDescription}`;
   }
 
-  // ─── terminal cleanup ─────────────────────────────────────────────────────────
+  // ─── terminal cleanup (m4 F1: the relocated registry teardown + backstop) ─────
   private async terminalCleanup(
     registry: ExecutionRegistry,
     harness: CodexHarness,
@@ -726,17 +837,31 @@ export class CodexExecutor implements Executor {
     storeDir: string,
     deadlineMs: number,
   ): Promise<void> {
-    try {
-      const q = await registry.quiesceChildren(deadlineMs);
-      if (q.kind === "quiescent") await registry.reapProcesses(deadlineMs, q.epoch);
-    } catch {
-      /* best-effort terminal reap; the safety facade owns the poison bookkeeping */
+    // PRD #1171 m4 (F1): the REGISTRY teardown (quiesce → reap → disposeTools) is RELOCATED to
+    // the runner when it drives this executor. Its post-run durability sinks
+    // (park/shutdown/finalize) reap the provider root through `withBoundary` AFTER run()
+    // returns, and the runner's executeClaim finally calls `safety.dispose` once the last sink
+    // settles — so the registry must stay ALIVE here. `deferRegistryTeardown` therefore SKIPS
+    // the registry teardown in that mode. When it is NOT set (a STANDALONE executor with no
+    // runner sink — a direct caller, or an exception before/around the model turns), this
+    // finally is the SOLE teardown, so it BACKSTOPS the registry here: reap+dispose the
+    // provider root so it is torn down on every no-sink path. disposeTools is idempotent, so a
+    // later runner dispose can never double-dispose.
+    if (!this.deps.deferRegistryTeardown && registry.state() !== "disposed") {
+      try {
+        const q = await registry.quiesceChildren(deadlineMs);
+        if (q.kind === "quiescent") await registry.reapProcesses(deadlineMs, q.epoch);
+      } catch {
+        /* best-effort terminal reap; the safety facade owns the poison bookkeeping */
+      }
+      try {
+        await registry.disposeTools(deadlineMs);
+      } catch {
+        /* idempotent dispose */
+      }
     }
-    try {
-      await registry.disposeTools(deadlineMs);
-    } catch {
-      /* idempotent dispose */
-    }
+    // The harness/transport, the fileop helper and the credential-free session store are
+    // EXECUTOR-owned (not the registry) — always torn down here, idempotently, on every path.
     await harness.close().catch(() => undefined);
     await fileopHandle.dispose().catch(() => undefined);
     // The session subset is credential-free and re-seeded on the next claim's adopt, so it

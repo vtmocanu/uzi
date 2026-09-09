@@ -8,6 +8,7 @@ import {
   type BoundaryActionIdentity,
   type BoundaryActionOutcome,
   type BoundarySeams,
+  type ReconcileBeforeBoundary,
   type SpawnRootSeam,
 } from "../src/codex/safety.js";
 import {
@@ -408,6 +409,66 @@ describe("CodexExecutionSafety [R3-2]: PAT-bearing ordering guard", () => {
     assert.equal(spawnState.calls, 1);
     assert.equal(spawnState.lastIdentity, "worker_pat");
     assert.equal(reg.hasLiveCommandRoot(), false);
+  });
+});
+
+describe("CodexExecutionSafety.withBoundary: per-sink reconcile (m4)", () => {
+  it("reconcile blocked → throws CodexBoundaryError('reconcile') BEFORE quiesce/reap/mint/action, poisons, and blocks later publication", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(5));
+    const events: string[] = [];
+    const seams: BoundarySeams = {
+      quiesce: async () => {
+        events.push("quiesce");
+        return { kind: "quiescent", epoch: 5 };
+      },
+      reap: async (_r, epoch) => {
+        events.push("reap");
+        return { kind: "observed_empty", evidence: "supervisor_echild", epoch };
+      },
+      dispose: async () => ({ kind: "disposed" }),
+      spawnRoot: async () => {
+        throw new Error("unused");
+      },
+    };
+    const reconcile: ReconcileBeforeBoundary = async () => ({
+      kind: "blocked",
+      errors: [{ category: "authorization", message: "refresh contended" }],
+    });
+    const safety = new CodexExecutionSafetyImpl(reg, seams, reconcile);
+    let actionRan = 0;
+    await assert.rejects(
+      safety.withBoundary(req("finalize"), async () => {
+        actionRan += 1;
+      }),
+      (e: unknown) => e instanceof CodexBoundaryError && e.stage === "reconcile",
+    );
+    assert.equal(actionRan, 0, "the trusted action never ran");
+    assert.deepEqual(events, [], "neither quiesce nor reap ran (blocked before the reap)");
+    assert.equal(reg.state(), "poisoned");
+    assert.equal(reg.isPoisoned(), true);
+
+    // Later publication is blocked: even a now-READY reconcile fails at quiesce on the poisoned
+    // registry (the real registry seams surface the poison).
+    const safety2 = createCodexExecutionSafety(reg, spawnCounter().seam, async () => ({ kind: "ready" }));
+    await assert.rejects(
+      safety2.withBoundary(req("finalize"), async () => {
+        actionRan += 1;
+      }),
+      (e: unknown) => e instanceof CodexBoundaryError && e.stage === "quiesce",
+    );
+    assert.equal(actionRan, 0, "the trusted action still never ran — publication stays blocked");
+  });
+
+  it("reconcile ready → proceeds through quiesce/reap/mint and runs the action", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(6));
+    const safety = createCodexExecutionSafety(reg, spawnCounter().seam, async () => ({ kind: "ready" }));
+    let ran = false;
+    const result = await safety.withBoundary(req("checkpoint"), async (permit) => {
+      ran = true;
+      return permit.epoch;
+    });
+    assert.equal(ran, true);
+    assert.equal(result, 6);
   });
 });
 

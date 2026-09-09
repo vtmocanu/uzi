@@ -5,6 +5,7 @@ import {
   CodexExecutor,
   FailClosedExecutor,
   CodexAdviceCredentialBridge,
+  buildRunLaneReconcile,
   makeCodexAdviceHarness,
   CODEX_PRODUCTION_PROVIDER,
   makeDefaultSpawnCommand,
@@ -26,6 +27,7 @@ import type { CodexNotification, CodexTransport } from "../src/codex/transport.j
 import type { RunContext, EmittedMessage, Executor } from "../src/executor.js";
 import type { Logger } from "../src/log.js";
 import type { AgentTemplate } from "../src/protocol.js";
+import type { BoundaryRequest } from "../src/harness.js";
 
 // PRD #1171 (M3, milestone 3, Phase 2A) — the production CodexExecutor + the claim-aware
 // DARK selection seam, driven with an in-memory transport and scripted app-server frames
@@ -894,5 +896,144 @@ describe("CodexExecutor: default command capture is byte-capped (A — untrusted
     assert.equal(res.code, 0, "a clean exit reports the child's own code, not the kill sentinel");
     assert.equal(res.stdout, "hello world");
     assert.equal(res.stderr, "oops");
+  });
+});
+
+// ================================================================================
+// A fake client for the reconcile differential test: records each refresh's operation_id +
+// observed_generation and can fail its first N refresh calls (to model a lost-reply RETRY).
+interface DiffClient {
+  refreshCalls: { operation_id: string; observed_generation: number }[];
+  releaseCalls: { capability: string }[];
+  releaseCodex(runId: string, req: { capability: string }): Promise<{ access_token: string }>;
+  refreshCodex(
+    runId: string,
+    req: { capability: string; operation_id: string; observed_generation: number },
+  ): Promise<{ access_token: string; generation: number; outcome: string }>;
+}
+function diffClient(opts: { failCalls?: number } = {}): DiffClient {
+  const refreshCalls: DiffClient["refreshCalls"] = [];
+  const releaseCalls: DiffClient["releaseCalls"] = [];
+  let calls = 0;
+  let gen = 10; // the generation each SUCCESSFUL refresh commits (10, 11, …)
+  return {
+    refreshCalls,
+    releaseCalls,
+    async releaseCodex(_runId, req) {
+      releaseCalls.push({ capability: req.capability });
+      return { access_token: "diff-release-tok" };
+    },
+    async refreshCodex(_runId, req) {
+      calls += 1;
+      refreshCalls.push({ operation_id: req.operation_id, observed_generation: req.observed_generation });
+      if (opts.failCalls && calls <= opts.failCalls) throw new Error("refresh contended");
+      return { access_token: "diff-refresh-tok", generation: gen++, outcome: "advanced" };
+    },
+  };
+}
+
+const RECONCILE_REQ: BoundaryRequest = { boundary: "finalize", deadlineMs: 1000 };
+
+describe("CodexExecutor: run-lane reconcile ⟷ advice bridge — differential (m4 part 4, no drift)", () => {
+  it("subscription: BOTH reuse the operation id across a retry AND advance the generation on success", async () => {
+    // Advice bridge: a failed refresh() then a retry reuse the SAME op id; the observed
+    // generation is unchanged on the failed attempt (no double exchange).
+    const ac = diffClient({ failCalls: 1 });
+    const bridge = new CodexAdviceCredentialBridge("run-1", ac as never, bindingOf(SUBSCRIPTION));
+    await assert.rejects(bridge.refresh(), /contended/, "the advice bridge fails closed");
+    await bridge.refresh(); // retry succeeds
+    assert.equal(ac.refreshCalls.length, 2);
+    assert.equal(ac.refreshCalls[0]!.operation_id, ac.refreshCalls[1]!.operation_id, "advice reuses the op id across a retry");
+    assert.equal(ac.refreshCalls[0]!.observed_generation, 3, "advice starts from the claim generation");
+    assert.equal(ac.refreshCalls[1]!.observed_generation, 3, "advice does NOT advance the generation on a failed attempt");
+
+    // Run-lane reconcile: mirror it — a `blocked` outcome then a `ready` retry reuse the op id.
+    const rc = diffClient({ failCalls: 1 });
+    const reconcile = buildRunLaneReconcile("run-1", rc as never, bindingOf(SUBSCRIPTION), () => {});
+    assert.equal((await reconcile(RECONCILE_REQ)).kind, "blocked", "the run-lane reconcile fails closed on the first attempt");
+    assert.equal((await reconcile(RECONCILE_REQ)).kind, "ready", "the retry succeeds");
+    assert.equal(rc.refreshCalls.length, 2);
+    assert.equal(rc.refreshCalls[0]!.operation_id, rc.refreshCalls[1]!.operation_id, "run-lane reuses the op id across the retry");
+    assert.equal(rc.refreshCalls[0]!.observed_generation, 3);
+    assert.equal(rc.refreshCalls[1]!.observed_generation, 3, "run-lane re-uses the SAME observed generation (unchanged on failure)");
+    // A NEW boundary after success mints a FRESH op id and uses the advanced generation.
+    assert.equal((await reconcile(RECONCILE_REQ)).kind, "ready");
+    assert.notEqual(rc.refreshCalls[2]!.operation_id, rc.refreshCalls[0]!.operation_id, "a new boundary mints a fresh op id");
+    assert.equal(rc.refreshCalls[2]!.observed_generation, 10, "and it uses the advanced generation the prior success committed");
+  });
+
+  it("api_key: BOTH perform ZERO refresh (advice fails closed on refresh; run-lane releases only)", async () => {
+    const ac = diffClient();
+    const bridge = new CodexAdviceCredentialBridge("run-1", ac as never, bindingOf(API_KEY));
+    await bridge.release();
+    await assert.rejects(bridge.refresh(), /not permitted for an api_key/);
+    assert.equal(ac.refreshCalls.length, 0, "advice never refreshes an api_key credential");
+
+    const rc = diffClient();
+    const reconcile = buildRunLaneReconcile("run-1", rc as never, bindingOf(API_KEY), () => {});
+    assert.equal((await reconcile(RECONCILE_REQ)).kind, "ready");
+    assert.equal(rc.refreshCalls.length, 0, "the run-lane api_key reconcile performs ZERO refresh");
+    assert.equal(rc.releaseCalls.length, 1, "it freshly releases (re-authorizes) instead");
+  });
+
+  it("blocked outcome fails closed for BOTH (a persistence failure never yields a ready/token)", async () => {
+    const ac = diffClient({ failCalls: 99 });
+    const bridge = new CodexAdviceCredentialBridge("run-1", ac as never, bindingOf(SUBSCRIPTION));
+    await assert.rejects(bridge.refresh(), /contended/);
+
+    const rc = diffClient({ failCalls: 99 });
+    const reconcile = buildRunLaneReconcile("run-1", rc as never, bindingOf(SUBSCRIPTION), () => {});
+    const out = await reconcile(RECONCILE_REQ);
+    assert.equal(out.kind, "blocked");
+    if (out.kind === "blocked") {
+      assert.ok(out.errors.length >= 1, "the blocked outcome carries evidence");
+      assert.doesNotMatch(JSON.stringify(out.errors), /diff-refresh-tok|diff-release-tok/, "no token leaks into the neutral outcome");
+    }
+  });
+});
+
+describe("CodexExecutor: F1 registry teardown relocation", () => {
+  it("(F1) deferRegistryTeardown: run()'s finally leaves the registry ALIVE, then a runner sink reaps and the terminal dispose tears down", async () => {
+    const rig = makeRig();
+    rig.deps = { ...rig.deps, deferRegistryTeardown: true };
+    rig.transport.push(threadStarted()).push(turnCompleted("completed")).end();
+    const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    await withTimeout(exec.run(makeCtx().ctx), 3000, "deferred run");
+    // run()'s finally did NOT reap/dispose the registry — it survives for the runner's sinks.
+    assert.equal(rig.reaped(), 0, "the provider root was NOT reaped by run()");
+    assert.equal(rig.disposed(), 0, "the provider root was NOT disposed by run()");
+    assert.ok(exec.safety, "safety is populated");
+
+    // Simulate the runner's terminal/finalize withBoundary sink, then its executeClaim-finally
+    // dispose. The subscription reconcile runs before the boundary.
+    await exec.safety!.withBoundary({ boundary: "finalize", deadlineMs: 200 }, async () => {});
+    assert.ok(rig.reaped() >= 1, "the runner's finalize sink reaped the provider root");
+    assert.ok(rig.client.refreshCalls.length >= 1, "the sink's subscription reconcile refreshed first");
+    await exec.safety!.dispose({ boundary: "terminal", deadlineMs: 200 });
+    assert.ok(rig.disposed() >= 1, "the runner's terminal dispose tore down the provider root");
+  });
+
+  it("(F1) standalone (no deferRegistryTeardown): run()'s finally BACKSTOPS the registry teardown (provider root torn down)", async () => {
+    const rig = makeRig();
+    rig.transport.push(threadStarted()).push(turnCompleted("completed")).end();
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx), 3000, "standalone run");
+    assert.ok(rig.reaped() >= 1, "the backstop reaped the provider root");
+    assert.ok(rig.disposed() >= 1, "the backstop disposed the provider root");
+  });
+
+  it("(F1) an error mid-turn still tears down the provider root via the standalone backstop", async () => {
+    const rig = makeRig({
+      responder: (c) => {
+        if (c.method === "turn/start") throw new Error("boom: mid-turn failure");
+        return defaultResponder(c);
+      },
+    });
+    rig.transport.push(threadStarted());
+    await assert.rejects(
+      withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx), 3000, "error run"),
+      /boom: mid-turn failure/,
+    );
+    // The provider root was registered before turn/start threw; the backstop still tore it down.
+    assert.ok(rig.disposed() >= 1, "the error-before-completion path tore down the provider root via the backstop");
   });
 });
