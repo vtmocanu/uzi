@@ -1001,6 +1001,101 @@ describe("CodexHarness: tool-call is bound fail-closed to the active (thread, tu
   });
 });
 
+describe("CodexHarness: trusted ROOT signal callbacks route scanned signals into a main frame (m2)", () => {
+  // A REAL broker so dispatchSignal actually scans the signal (root grants include the signal
+  // tools + isRoot:true), returning `{ok:true, output: scanned}` — the input the harness surfaces.
+  function signalBroker(request: RunTurnRequest): CodexCallbackBroker {
+    const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
+    return new CodexCallbackBroker({
+      registry,
+      spawnCommand: async () => ({ code: 0, stdout: "", stderr: "" }),
+      fileop: { op: async () => ({ ok: true }) },
+      worktreePath: WORKSPACE,
+      grants: renderCodexRun(request).leadGrants,
+      delegate: async () => ({ ok: false, code: "x", message: "no" }),
+      allowedRoles: new Set<string>(),
+    });
+  }
+
+  it("a root submit_plan tool call yields a main-origin frame carrying the scanned signals (AND still replies)", async () => {
+    const request = makeRequest({ phase: "plan" });
+    const { harness, transport } = makeHarness({ broker: signalBroker(request) });
+    transport
+      .push(threadStarted())
+      .push(toolCall(5, "submit_plan", { plan_md: "the plan body" }, "th-1", "tn-1", "c1"))
+      .push(turnCompleted("completed"))
+      .end();
+
+    const events = await collect(harness.startTurn(request).events);
+    const frames = events.filter((e) => e.kind === "frame");
+    assert.equal(frames.length, 1, "exactly one signals frame for the accepted root signal");
+    const frame = frames[0]!;
+    assert.equal(frame.kind, "frame");
+    if (frame.kind === "frame") {
+      assert.deepEqual(frame.origin, { kind: "main" }, "the signals frame is main-origin (reducer folds only main)");
+      assert.deepEqual(frame.items, [], "the signals frame carries no persisted output items");
+      assert.equal(frame.signals?.plan, "the plan body", "the scanned plan rides the frame's signals");
+      assert.equal(frame.sessionId, "th-1");
+    }
+    // The model reply still went out (success:true) IN ADDITION to the frame.
+    assert.equal(transport.responses.length, 1);
+    assert.equal(rec(rec(transport.responses[0]!.response).result).success, true);
+  });
+
+  it("a root signal_done tool call yields a main-origin frame carrying done:true", async () => {
+    const request = makeRequest();
+    const { harness, transport } = makeHarness({ broker: signalBroker(request) });
+    transport
+      .push(threadStarted())
+      .push(toolCall(6, "signal_done", {}, "th-1", "tn-1", "c1"))
+      .push(turnCompleted("completed"))
+      .end();
+
+    const events = await collect(harness.startTurn(request).events);
+    const frame = events.find((e) => e.kind === "frame");
+    assert.ok(frame, "a signals frame was emitted for a root signal_done");
+    if (frame && frame.kind === "frame") {
+      assert.deepEqual(frame.origin, { kind: "main" });
+      assert.equal(frame.signals?.done, true, "signal_done folds to done:true");
+    }
+  });
+
+  it("a non-signal tool call still yields activity and NO signals frame (byte-identical path)", async () => {
+    const request = makeRequest();
+    const { harness, transport } = makeHarness({ broker: signalBroker(request) });
+    transport
+      .push(threadStarted())
+      .push(toolCall(7, "Bash", { command: "echo hi" }, "th-1", "tn-1", "c1"))
+      .push(turnCompleted("completed"))
+      .end();
+
+    const events = await collect(harness.startTurn(request).events);
+    assert.equal(events.filter((e) => e.kind === "frame").length, 0, "a shell effect emits no signals frame");
+    // The tool call was still intercepted + replied, surfaced only as activity.
+    assert.equal(transport.responses.length, 1);
+    assert.equal(rec(rec(transport.responses[0]!.response).result).success, true);
+  });
+
+  it("a stale-turn OR foreign-thread signal is denied fail-closed: broker never reached, no main+signals frame", async () => {
+    const request = makeRequest();
+    const { harness, transport } = makeHarness({ broker: signalBroker(request) });
+    transport
+      .push(threadStarted())
+      // right root thread, WRONG turn — denied before the broker, so no signals frame.
+      .push(toolCall(8, "submit_plan", { plan_md: "sneaky stale plan" }, "th-1", "stale-turn", "c1"))
+      // foreign thread — likewise denied before the broker.
+      .push(toolCall(9, "signal_done", {}, "foreign-thread", "tn-1", "c2"))
+      .push(turnCompleted("completed"))
+      .end();
+
+    const events = await collect(harness.startTurn(request).events);
+    assert.equal(events.filter((e) => e.kind === "frame").length, 0, "no signals frame for a stale/foreign signal");
+    // Both were denied with a FAILED tool result (not_active_turn), never reaching the broker.
+    assert.equal(transport.responses.length, 2);
+    for (const r of transport.responses) assert.equal(rec(rec(r.response).result).success, false);
+  });
+});
+
 describe("CodexHarness: terminal provider fields are bounded + redacted", () => {
   it("a terminal never leaks a raw turn.error, a raw usage blob, and closes an unknown status", async () => {
     const { harness, transport } = makeHarness();

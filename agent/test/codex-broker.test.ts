@@ -17,6 +17,14 @@ import {
   type SpawnCommandResult,
 } from "../src/codex/broker.js";
 import { ExecutionRegistry, newLocalExecutionEpoch } from "../src/codex/registry.js";
+import { buildCodexToolHandlers } from "../src/codex/codex-executor.js";
+import { forgeToolNames } from "../src/forge-tools.js";
+import { memoryToolNames } from "../src/memory-tools.js";
+import { reportIncidentalIssueToolName } from "../src/findings-tools.js";
+import type { Logger } from "../src/log.js";
+import type { WorkerClient } from "../src/client.js";
+import type { EmittedMessage } from "../src/executor.js";
+import type { ClaimSkill } from "../src/protocol.js";
 
 // PRD #1171 (M3, milestone 2) — the worker callback broker. Every seam is a fake;
 // the ExecutionRegistry is the REAL one (it is pure logic) so admission/replay/poison
@@ -751,5 +759,109 @@ describe("CodexCallbackBroker: a throwing seam denies as broker_error with the r
     // epoch is not poisoned (a clean quiesce would follow).
     assert.equal(h.registry.inFlightCallbackCount(), 0);
     assert.equal(h.registry.isPoisoned(), false);
+  });
+});
+
+// PRD #1171 M3 (item 5) — the REAL executor-built tool-handler map wired through the
+// broker. Not a hand-rolled `new Map([...])` (that is the generic routing tested above);
+// this proves the map buildCodexToolHandlers produces resolves forge/memory/findings and
+// the Codex-specific Skill delivery, and that a subagent never reaches the memory handler.
+describe("CodexCallbackBroker: production tool-handler map (buildCodexToolHandlers)", () => {
+  const NOOP_LOG: Logger = { debug() {}, info() {}, warn() {}, error() {}, addSecret() {}, removeSecret() {}, child() { return NOOP_LOG; } };
+  const FORGE_GET_ISSUE = forgeToolNames()[0]!; // mcp__forge__get_issue
+  const MEMORY_TOOL = memoryToolNames()[0]!;
+  const FINDINGS_TOOL = reportIncidentalIssueToolName();
+
+  /** A minimal WorkerClient with just the reads/writes the wired handlers call, recording
+   *  what each saw so a test can prove the callback reached the real handler. */
+  function toolClient(): { client: WorkerClient; forgeIssue: number[]; memory: string[]; finding: string[] } {
+    const forgeIssue: number[] = [];
+    const memory: string[] = [];
+    const finding: string[] = [];
+    const client = {
+      async getForgeIssue(_runId: string, iid: number) { forgeIssue.push(iid); return { iid, title: "FORGE_ISSUE_CANARY" }; },
+      async saveMemory(_runId: string, body: { title: string }) { memory.push(body.title); return { id: "mem-canary", title: body.title }; },
+      async reportFinding(_runId: string, _body: unknown) { finding.push("find-canary"); return "find-canary"; },
+    } as unknown as WorkerClient;
+    return { client, forgeIssue, memory, finding };
+  }
+
+  function toolMap(skills: ClaimSkill[] = [{ name: "prd-lifecycle", description: "PRD lifecycle skill", body: "SKILL_BODY_CANARY" }]): {
+    map: ReturnType<typeof buildCodexToolHandlers>;
+    emitted: EmittedMessage[];
+    calls: ReturnType<typeof toolClient>;
+  } {
+    const emitted: EmittedMessage[] = [];
+    const calls = toolClient();
+    const map = buildCodexToolHandlers({ client: calls.client, runId: "run-tools", log: NOOP_LOG, emit: (m) => emitted.push(m), skills });
+    return { map, emitted, calls };
+  }
+
+  it("routes a ROOT forge callback to the real handler (ok, not denied_tool)", async () => {
+    const { map, calls } = toolMap();
+    const h = makeBroker({ grants: grants({ allowedTools: new Set([FORGE_GET_ISSUE]), isRoot: true }), toolHandlers: map });
+    const r = await h.broker.handleToolCall(rt(), FORGE_GET_ISSUE, { iid: 9 }, "root");
+    assert.equal(r.ok, true);
+    assert.deepEqual(calls.forgeIssue, [9]);
+    if (r.ok) assert.ok(JSON.stringify(r.output).includes("FORGE_ISSUE_CANARY"), "the forge evidence rode the callback output");
+  });
+
+  it("routes a ROOT memory callback to the real handler (ok, not denied_tool)", async () => {
+    const { map, calls } = toolMap();
+    const h = makeBroker({ grants: grants({ allowedTools: new Set([MEMORY_TOOL]), isRoot: true }), toolHandlers: map });
+    const r = await h.broker.handleToolCall(rt(), MEMORY_TOOL, { title: "a durable fact", body: "the mechanism" }, "root");
+    assert.equal(r.ok, true);
+    assert.deepEqual(calls.memory, ["a durable fact"]);
+  });
+
+  it("routes a ROOT findings callback to the real handler and emits the finding card", async () => {
+    const { map, emitted, calls } = toolMap();
+    const h = makeBroker({ grants: grants({ allowedTools: new Set([FINDINGS_TOOL]), isRoot: true }), toolHandlers: map });
+    const r = await h.broker.handleToolCall(rt(), FINDINGS_TOOL, { title: "leak", description: "d", location: "a/b.ts#f" }, "root");
+    assert.equal(r.ok, true);
+    assert.equal(calls.finding.length, 1);
+    assert.ok(emitted.some((m) => m.kind === "finding"), "the finding card was emitted to the stream");
+  });
+
+  it("DENIES a memory callback to a subagent (render strips memory; the allowedTools gate denies denied_tool)", async () => {
+    const { map, calls } = toolMap();
+    // A subagent's grants never carry the memory tool (isSubagentForbidden), modelled here.
+    const h = makeBroker({ grants: grants({ allowedTools: new Set(["Read"]), isRoot: false }), toolHandlers: map });
+    const r = await h.broker.handleToolCall(rt(), MEMORY_TOOL, { title: "t", body: "b" }, "child");
+    assertDenied(r, "denied_tool");
+    assert.deepEqual(calls.memory, [], "the memory handler was never reached");
+  });
+
+  it("delivers a GRANTED skill's content through the Skill handler (ok, not denied)", async () => {
+    const { map } = toolMap();
+    const h = makeBroker({
+      grants: grants({ allowedTools: new Set(["Skill"]), allowedSkills: new Set(["prd-lifecycle"]), isRoot: true }),
+      toolHandlers: map,
+    });
+    const r = await h.broker.handleToolCall(rt(), "Skill", { skill: "prd-lifecycle" }, "root");
+    assert.equal(r.ok, true);
+    if (r.ok) assert.ok(JSON.stringify(r.output).includes("SKILL_BODY_CANARY"), "the granted skill's body rode the callback output");
+  });
+
+  it("still DENIES an ungranted skill at the broker's allowedSkills gate (denied_skill, handler never reached)", async () => {
+    const { map } = toolMap();
+    const h = makeBroker({
+      grants: grants({ allowedTools: new Set(["Skill"]), allowedSkills: new Set(["prd-lifecycle"]), isRoot: true }),
+      toolHandlers: map,
+    });
+    const r = await h.broker.handleToolCall(rt(), "Skill", { skill: "not-granted" }, "root");
+    assertDenied(r, "denied_skill");
+  });
+
+  it("a granted-but-bodyless skill returns a bounded ack (never denied_tool, never a throw)", async () => {
+    // Granted (in allowedSkills) but absent from ctx.skills → the handler's fallback ack.
+    const { map } = toolMap([]);
+    const h = makeBroker({
+      grants: grants({ allowedTools: new Set(["Skill"]), allowedSkills: new Set(["prd-lifecycle"]), isRoot: true }),
+      toolHandlers: map,
+    });
+    const r = await h.broker.handleToolCall(rt(), "Skill", { skill: "prd-lifecycle" }, "root");
+    assert.equal(r.ok, true, "a granted-but-bodyless skill is an ok ack, not a deny");
+    if (r.ok) assert.ok(JSON.stringify(r.output).includes("prd-lifecycle"), "the ack names the skill");
   });
 });

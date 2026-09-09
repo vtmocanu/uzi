@@ -42,8 +42,9 @@ import {
   isRecognizedCodexTool,
   type RunGrants,
 } from "./broker.js";
-import { MEMORY_SERVER_NAME } from "../memory-tools.js";
+import { MEMORY_SERVER_NAME, memoryToolNames } from "../memory-tools.js";
 import { reportIncidentalIssueToolName } from "../findings-tools.js";
+import { forgeToolNames } from "../forge-tools.js";
 import { SKILL_NAME_RE } from "../skills-plugin.js";
 import { FINDINGS_NUDGE_APPEND, WORKER_RUNTIME_APPEND } from "../prompt.js";
 
@@ -58,6 +59,18 @@ const SPAWN_AGENT = "spawn_agent";
 /** The incidental-findings callback name (`mcp__findings__report_incidental_issue`),
  *  granted to every inherit / non-empty-allow role exactly as agents.ts does. */
 const FINDINGS_TOOL_NAME = reportIncidentalIssueToolName();
+
+/** The save_memory callback name (`mcp__memory__save_memory`). Granted on the ROOT
+ *  vocabulary only — mirroring agents.ts, where the lead gets memory but a subagent
+ *  never does (and `isSubagentForbidden` strips it via the `mcp__memory__` prefix even
+ *  from an explicit subagent allowlist). */
+const MEMORY_TOOL_NAME = memoryToolNames()[0]!;
+
+/** The eight qualified forge callback names (`mcp__forge__<tool>`). Granted on the ROOT
+ *  vocabulary here (mirroring agents.ts: the lead gets forge); a subagent gets forge only
+ *  through an explicit allowlist naming a recognized `mcp__forge__*` tool, which
+ *  `buildAllowedTools` keeps and `isSubagentForbidden` does not strip. */
+const FORGE_TOOL_NAMES = forgeToolNames();
 
 // --- model + effort contract (adr/1106-codex-harness.md §Model and effort) -----
 
@@ -151,11 +164,14 @@ function isSubagentForbidden(canonical: string): boolean {
 
 /** The full callback vocabulary an inherit-all role receives. A subagent gets the
  *  base read/write/shell/skill set plus the findings tool; the root additionally
- *  gets delegation and the workflow signals. */
+ *  gets delegation, the workflow signals, and the lead-only forge + memory tools
+ *  (agents.ts parity: the lead gets forge + memory, a subagent gets neither by
+ *  inheritance — a subagent reaches forge only via an explicit allowlist, and
+ *  `isSubagentForbidden` keeps memory off a subagent even then). */
 function fullVocabulary(isRoot: boolean): readonly string[] {
   const base = [BASH_TOOL, APPLY_PATCH, READ_TOOL, SKILL_TOOL, FINDINGS_TOOL_NAME];
   if (!isRoot) return base;
-  return [...base, SPAWN_AGENT, ...CODEX_SIGNAL_TOOLS];
+  return [...base, SPAWN_AGENT, ...CODEX_SIGNAL_TOOLS, ...FORGE_TOOL_NAMES, MEMORY_TOOL_NAME];
 }
 
 /** A stable, insertion-ordered set built from a sorted copy, so any serialized

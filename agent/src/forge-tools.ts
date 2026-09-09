@@ -102,7 +102,7 @@ export interface ForgeToolsDeps {
  *  (replyMrThread / resolveMrThread) do NOT — that asymmetry is deliberate and
  *  preserved here. All eight close over the SAME `calls` counter built once in
  *  makeForgeToolHandlers, so the budget is genuinely per-run, not per-tool. */
-interface ForgeToolHandlers {
+export interface ForgeToolHandlers {
   getIssue(args: { iid: number }): Promise<ToolTextResult>;
   listIssues(args: { state?: "opened" | "closed"; labels?: string[]; updated_after?: string }): Promise<ToolTextResult>;
   getMergeRequest(args: { iid: number }): Promise<ToolTextResult>;
@@ -113,6 +113,28 @@ interface ForgeToolHandlers {
   resolveMrThread(args: { resolve_id: string }): Promise<ToolTextResult>;
 }
 
+/** The eight forge tool suffixes, surfaced as `mcp__forge__<suffix>`. The ORDER is
+ *  contractual — {@link forgeToolNames} and any caller pairing a name to a handler rely
+ *  on it (six reads then the two PRD #700 M4 writes). */
+const FORGE_TOOL_SUFFIXES = [
+  "get_issue",
+  "list_issues",
+  "get_merge_request",
+  "get_pipeline_jobs",
+  "latest_pipeline",
+  "list_issue_label_events",
+  "reply_mr_thread",
+  "resolve_mr_thread",
+] as const;
+
+/** The eight qualified forge tool names (`mcp__forge__<tool>`), mirroring
+ *  {@link import("./memory-tools.js").memoryToolNames}. Exported so the Codex executor
+ *  (codex-executor.ts) can grant them in its render vocabulary and key its tool-handler
+ *  map, cross-module — the same names the SDK forge server registers below. */
+export function forgeToolNames(): string[] {
+  return FORGE_TOOL_SUFFIXES.map((suffix) => `mcp__${FORGE_SERVER_NAME}__${suffix}`);
+}
+
 /**
  * Build the raw forge tool handlers for one run (unit-testable; mirrors
  * makeMemoryToolHandlers / makeFindingsToolHandlers). The per-run call budget is a
@@ -120,12 +142,12 @@ interface ForgeToolHandlers {
  * reads consume it, the two writes do not — so it bounds the whole session regardless
  * of how the handlers are wired into tool schemas.
  *
- * Module-private (not exported): the test suite reaches these handlers through the
- * built server's `_registeredTools`, and no other module imports the factory, so
- * exporting it would trip the knip `exports` gate (its `ignoreExportsUsedInFile`
- * covers only interfaces/types, not functions). The split is achieved either way.
+ * Exported (PRD #1171 M3): the Codex executor (codex-executor.ts) consumes it
+ * cross-module to wire the forge tools into its callback broker, and `buildForgeToolsServer`
+ * below still calls it internally for the Claude SDK server — so knip sees a real
+ * importer and the `exports` gate is satisfied.
  */
-function makeForgeToolHandlers(deps: ForgeToolsDeps): ForgeToolHandlers {
+export function makeForgeToolHandlers(deps: ForgeToolsDeps): ForgeToolHandlers {
   const { client, runId, log } = deps;
 
   // Per-session budget. Shared by every read tool of this server (the server is built

@@ -38,8 +38,18 @@ export type ResponseItem = Record<string, unknown>;
 export type ResponsesBody = { readonly model?: unknown; readonly input?: readonly unknown[] } & Record<string, unknown>;
 
 export interface FakeProviderOptions {
-  /** The exact bearer credential the app-server must present (assembled at runtime). */
-  readonly credential: string;
+  /** The exact bearer credential the app-server must present (assembled at runtime).
+   *  Required in the DEFAULT strict mode; ignored (and optional) when `acceptAnyBearer`
+   *  is set — the real-server path releases a token the test cannot know ahead of time. */
+  readonly credential?: string;
+  /** m6 (item 7): accept AND record ANY non-empty bearer instead of requiring an exact
+   *  match. The real WorkerClient path releases the seeded credential from the throwaway
+   *  Postgres — a value the test never learns in advance — so the fake cannot be
+   *  pre-configured with it. In this mode every presented token is pushed onto
+   *  {@link FakeProvider.observedBearers} so the test can prove the RELEASED token (the one
+   *  the real Codex presented here) never leaked to a public/log surface. Strict mode (the
+   *  default) keeps the exact-match check and still records the bearer. */
+  readonly acceptAnyBearer?: boolean;
   /** Produce the Responses output items for one request (mirrors M0's `respond`). */
   readonly respond: (body: ResponsesBody, provider: FakeProvider) => ResponseItem[] | Promise<ResponseItem[]>;
 }
@@ -106,11 +116,18 @@ function sse(id: string, items: ResponseItem[]): string {
 export class FakeProvider {
   readonly requests: ResponsesBody[] = [];
   readonly errors: string[] = [];
+  /** m6 (item 7): every bearer token presented on a `/v1/responses` request, in order and
+   *  stripped of the `Bearer ` prefix. On the real-server path the RELEASED credential
+   *  (which the test never knows ahead of time) lands here, so the credential-canary
+   *  boundary is asserted against the token the real Codex actually presented. Recorded in
+   *  BOTH strict and accept-any mode. */
+  readonly observedBearers: string[] = [];
   private closing = false;
   private constructor(
     private readonly server: Server,
     readonly port: number,
-    private readonly credential: string,
+    private readonly credential: string | undefined,
+    private readonly acceptAnyBearer: boolean,
     private readonly responder: (body: ResponsesBody, provider: FakeProvider) => ResponseItem[] | Promise<ResponseItem[]>,
   ) {}
 
@@ -133,7 +150,7 @@ export class FakeProvider {
     if (address === null || typeof address === "string" || address.address !== "127.0.0.1") {
       throw new Error("fake provider must bind 127.0.0.1");
     }
-    const provider = new FakeProvider(server, address.port, options.credential, options.respond);
+    const provider = new FakeProvider(server, address.port, options.credential, options.acceptAnyBearer === true, options.respond);
     holder.provider = provider;
     return provider;
   }
@@ -156,8 +173,21 @@ export class FakeProvider {
     request.on("end", () => {
       void (async () => {
         try {
-          if (request.headers.authorization !== `Bearer ${this.credential}`) {
-            throw new Error(`unauthenticated request (authorization=${String(request.headers.authorization)})`);
+          const auth = request.headers.authorization;
+          const bearer = typeof auth === "string" && auth.startsWith("Bearer ") ? auth.slice("Bearer ".length) : undefined;
+          // Record the presented token in BOTH modes so the credential-canary boundary can be
+          // asserted against the RELEASED token (the real-server path releases a value the test
+          // cannot know ahead of time — see observedBearers).
+          if (bearer !== undefined && bearer.length > 0) this.observedBearers.push(bearer);
+          if (this.acceptAnyBearer) {
+            // Accept-any (item 7): the released credential is unknown ahead of time, so any
+            // non-empty bearer is accepted — but a MISSING bearer is still a fault (a request
+            // that never authenticated would falsify the login/credential evidence).
+            if (bearer === undefined || bearer.length === 0) {
+              throw new Error("unauthenticated request (accept-any mode: no bearer token presented)");
+            }
+          } else if (auth !== `Bearer ${this.credential}`) {
+            throw new Error(`unauthenticated request (authorization=${String(auth)})`);
           }
           const body = JSON.parse(raw) as ResponsesBody;
           this.requests.push(body);
@@ -182,34 +212,93 @@ export class FakeProvider {
 }
 
 /**
- * The IMAGE-leg lifecycle responder: a fixed, deterministic tool sequence the real Codex
- * app-server replays as the packaged CodexExecutor drives one implement turn. Each step's
- * argument carries the matching secret-shaped canary from {@link CodexCanaries}. Advances by
- * request count (Codex re-POSTs `/v1/responses` after each tool result, so the count is the
- * step index): Bash → apply_patch → spawn_agent (synchronous subagent) → submit_plan (a ROOT
- * signal, denied-when-non-root by the broker, latched-but-inert in m3) → finish message.
+ * PRD #1171 m6 (item 8): the machine-recorded evidence the packaged Block-B lifecycle proof
+ * derives its real-path counts from. Every field is what the fake provider OBSERVED the
+ * packaged executor drive — the responder self-records each workflow stage it emitted, so the
+ * counts are provider-visible evidence, not the executor's own bookkeeping. `steps` equals the
+ * number of `/v1/responses` POSTs handled (== {@link FakeProvider.requests}.length).
  */
-export function lifecycleResponder(canaries: CodexCanaries): (body: ResponsesBody, provider: FakeProvider) => ResponseItem[] {
-  return (_body, provider) => {
-    const step = provider.requests.length; // 1-based: this request is the Nth
-    switch (step) {
-      case 1:
-        return [tool("cc-bash", "Bash", { command: `echo ${canaries.bashArg}` }) as ResponseItem];
-      case 2: {
-        // patchTool's FROZEN filename constraint is /^[a-z-]+$/, so map the canary to a
-        // filename-safe form (the marker file only proves the patch effect ran; the
-        // credential/capability boundary is what the suite asserts). [#1171 m5 review]
-        const patchName = canaries.patchArg.replace(/[^a-z-]+/g, "-");
-        return [patchTool("cc-patch", patchName) as ResponseItem];
-      }
-      case 3:
-        return [tool("cc-spawn", "spawn_agent", { subagent_type: "coder", prompt: canaries.spawnArg }) as ResponseItem];
-      case 4:
-        return [tool("cc-plan", "submit_plan", { plan: canaries.planArg }) as ResponseItem];
-      default:
-        return [message("m3b lifecycle finished") as ResponseItem];
-    }
+export interface LifecycleEvidence {
+  steps: number;
+  /** A `Bash` tool call was emitted (drives the real command supervisor root). */
+  bash: number;
+  /** An `apply_patch` custom tool call was emitted (drives the real openat2 fileop root; it
+   *  writes a marker file into the worktree, the test's command-root filesystem evidence). */
+  patch: number;
+  /** A `spawn_agent` delegation was emitted (drives a synchronous demuxed child turn). */
+  spawn: number;
+  /** A cooperative `checkpoint` signal was emitted (drives ctx.checkpoint + a new-root resume). */
+  checkpoint: number;
+  /** A `submit_plan` root workflow signal was emitted. */
+  submitPlan: number;
+  /** A `signal_done` root workflow signal was emitted (the run-completing signal). */
+  signalDone: number;
+  /** A finish message was emitted (completes the turn once the scripted sequence is exhausted). */
+  finish: number;
+}
+
+/**
+ * The IMAGE-leg lifecycle responder that ALSO records what it drove (item 8). One output item
+ * per `/v1/responses` POST, in a fixed sequence — Bash → apply_patch → spawn_agent → checkpoint
+ * → submit_plan → signal_done — after which it emits a finish message on every subsequent POST
+ * so the current (and any straggler child) turn completes cleanly. Each stage's argument carries
+ * the matching secret-shaped canary from {@link CodexCanaries} (model-chosen tool args, distinct
+ * from the credential/capability the boundary asserts absent). The returned `evidence` is mutated
+ * in place as the run drives, so the test reads it AFTER the run.
+ *
+ * 🔴 MAINTAINER-VERIFIED: the exact Responses item framing the real Codex app-server accepts — and
+ * how parent/child turn POSTs interleave — is unconfirmed in code (codex-harness.ts marks the item
+ * types provisional). This is the current best model; the always-eventually `signal_done` is what
+ * drives a clean run to `ran === true`. A maintainer confirms/tunes it when the docker leg runs.
+ */
+export function recordingLifecycleResponder(
+  canaries: CodexCanaries,
+): { respond: (body: ResponsesBody, provider: FakeProvider) => ResponseItem[]; evidence: LifecycleEvidence } {
+  const evidence: LifecycleEvidence = {
+    steps: 0, bash: 0, patch: 0, spawn: 0, checkpoint: 0, submitPlan: 0, signalDone: 0, finish: 0,
   };
+  // patchTool's FROZEN filename constraint is /^[a-z-]+$/, so map the canary to a filename-safe
+  // form (the marker file only proves the fileop command root ran; the credential/capability
+  // boundary is what the suite asserts). [#1171 m5 review]
+  const patchName = canaries.patchArg.replace(/[^a-z-]+/g, "-");
+  const script: Array<{ item: () => ResponseItem; mark: () => void }> = [
+    { item: () => tool("cc-bash", "Bash", { command: `echo ${canaries.bashArg}` }) as ResponseItem, mark: () => { evidence.bash += 1; } },
+    { item: () => patchTool("cc-patch", patchName) as ResponseItem, mark: () => { evidence.patch += 1; } },
+    { item: () => tool("cc-spawn", "spawn_agent", { subagent_type: "coder", prompt: canaries.spawnArg }) as ResponseItem, mark: () => { evidence.spawn += 1; } },
+    { item: () => tool("cc-ckpt", "checkpoint", {}) as ResponseItem, mark: () => { evidence.checkpoint += 1; } },
+    { item: () => tool("cc-plan", "submit_plan", { plan: canaries.planArg }) as ResponseItem, mark: () => { evidence.submitPlan += 1; } },
+    { item: () => tool("cc-done", "signal_done", {}) as ResponseItem, mark: () => { evidence.signalDone += 1; } },
+  ];
+  let stage = 0;
+  const respond = (): ResponseItem[] => {
+    evidence.steps += 1;
+    const next = script[stage];
+    if (next !== undefined) {
+      stage += 1;
+      next.mark();
+      return [next.item()];
+    }
+    evidence.finish += 1;
+    return [message("m3b lifecycle finished") as ResponseItem];
+  };
+  return { respond, evidence };
+}
+
+/** Count the tool-call REPLIES (function/custom tool-call OUTPUT items) the app-server fed back
+ *  across every recorded request — provider-visible evidence that the packaged executor's broker
+ *  executed a tool and returned its result to Codex (the `callbacks` real-path count). */
+export function countToolCallbacks(requests: readonly ResponsesBody[]): number {
+  let n = 0;
+  for (const body of requests) {
+    const input = Array.isArray(body.input) ? body.input : [];
+    for (const item of input) {
+      if (item !== null && typeof item === "object") {
+        const t = (item as { type?: unknown }).type;
+        if (t === "function_call_output" || t === "custom_tool_call_output") n += 1;
+      }
+    }
+  }
+  return n;
 }
 
 /** A trivial always-finish responder (a turn with no tool call, just a message). */

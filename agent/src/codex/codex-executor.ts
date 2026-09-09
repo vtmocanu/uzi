@@ -36,7 +36,12 @@ import type { Readable, Writable } from "node:stream";
 
 import type { Logger } from "../log.js";
 import type { WorkerClient } from "../client.js";
-import { PlanRejectedError, type Executor, type ExecutorResult, type RunContext } from "../executor.js";
+import { PlanRejectedError, type EmittedMessage, type Executor, type ExecutorResult, type RunContext } from "../executor.js";
+import { makeMemoryToolHandlers, memoryToolNames, type MemoryToolHandlers } from "../memory-tools.js";
+import { makeFindingsToolHandlers, reportIncidentalIssueToolName, type FindingsToolHandlers } from "../findings-tools.js";
+import { FORGE_SERVER_NAME, makeForgeToolHandlers, type ForgeToolHandlers } from "../forge-tools.js";
+import { provisionRunTools } from "../provision-run.js";
+import { asText } from "../tool-evidence.js";
 import type {
   BoundaryRequest,
   BoundaryProcessRequest,
@@ -53,7 +58,7 @@ import { RunTurnReducerImpl } from "../harness-reducer.js";
 import { buildLeadSystemPrompt } from "../prompt.js";
 import { RUNNER_UID, uidSplitActive } from "../runner-uid.js";
 import { errMessage } from "../util.js";
-import type { AgentTemplate } from "../protocol.js";
+import type { AgentTemplate, ClaimSkill } from "../protocol.js";
 
 import { ExecutionRegistry, newLocalExecutionEpoch, type RegisteredRoot } from "./registry.js";
 import {
@@ -78,6 +83,7 @@ import {
   type ScreenPolicy,
   type SpawnCommandResult,
   type SpawnCommandSeam,
+  type ToolHandler,
 } from "./broker.js";
 import {
   CodexDelegationRunner,
@@ -100,6 +106,12 @@ import { createCodexTransport } from "./transport.js";
 import type { CodexNotification } from "./transport.js";
 import type { CodexBinding } from "./select.js";
 import { CodexAdviceHarness, type LaunchAdviceRootSeam } from "./codex-advice-harness.js";
+import {
+  createCodexAppServerAuth,
+  type CodexAppServerAuthConfig,
+  type CodexAppServerAuthMode,
+  type CodexSubscriptionRefreshBridge,
+} from "./appserver-auth.js";
 
 // ─── Part G: the FIXED production vendor targets ────────────────────────────────
 /**
@@ -126,22 +138,56 @@ export const CODEX_PRODUCTION_PROVIDER: CodexProviderConfig = {
  *  Codex-bound claim selects the CodexExecutor. */
 const FILEOP_BIN = "/usr/local/bin/uzi-codex-fileop";
 
-/** The fully-REPLACED command-identity env (never merged with `process.env`): NOTHING
- *  inherited (no PAT/token/provider credential), only inert path/tmp/locale. This is the
- *  cross-root credential-read boundary — the credential-free command surface must not see
- *  the worker's environment. */
-const COMMAND_ENV_PATH = "/usr/bin:/bin";
+/** The fixed command-identity PATH: the system dirs plus the pinned worker toolchain,
+ *  mirroring the provider lane's `CODEX_LAUNCH_PATH` (launcher.ts). These FIXED dirs are
+ *  always present and come FIRST; a run's provisioned `toolEnv.PATH` is APPENDED after
+ *  them (see {@link buildCommandEnv}), so provisioned tools resolve but can never displace
+ *  or drop the boundary dirs. Every entry sits under a directory the command root's
+ *  Landlock allows read+exec on (`/usr`, `/sbin`, `/bin`, `/opt/uzi-toolchain`, `/nix`),
+ *  so a resolved binary is executable inside the sandbox. This env is never merged with
+ *  `process.env`: NOTHING is inherited (no PAT/token/provider credential) — the
+ *  credential-free command surface must not see the worker's environment. */
+const COMMAND_ENV_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/uzi-toolchain/bin";
+
+/** Keys a provisioned `toolEnv` entry may NEVER set in the credential-free command env.
+ *  UNIONS the command boundary literals (PATH/TMPDIR/LANG/HOME — the scrubbed command
+ *  identity pins these, and sdk-env.ts's PROTECTED_ENV_KEYS deliberately OMITS
+ *  PATH/TMPDIR/LANG, so relying on it alone would leave those open) with a MIRROR of that
+ *  module-private PROTECTED_ENV_KEYS set (the OAuth credential + the two ANTHROPIC_* keys +
+ *  the browser flag). So a hostile/malformed `toolEnv` can neither breach the command
+ *  boundary NOR reintroduce a credential-adjacent key. PATH is additionally handled
+ *  specially in {@link buildCommandEnv} (fixed prefix, provisioned value appended). */
+const COMMAND_ENV_PROTECTED_KEYS: ReadonlySet<string> = new Set([
+  // Command boundary literals.
+  "PATH",
+  "TMPDIR",
+  "LANG",
+  "HOME",
+  // Mirror of sdk-env.ts PROTECTED_ENV_KEYS (module-private there; cannot be imported).
+  "CLAUDE_CODE_OAUTH_TOKEN",
+  "ANTHROPIC_API_KEY",
+  "ANTHROPIC_AUTH_TOKEN",
+  "AGENT_BROWSER_ARGS",
+]);
 
 const DEFAULT_IDLE_MS = 5 * 60 * 1000;
 const DEFAULT_WALL_MS = 60 * 60 * 1000;
 const DEFAULT_BOUNDARY_DEADLINE_MS = 30 * 1000;
 const DEFAULT_CHILD_TURN_DEADLINE_MS = 10 * 60 * 1000;
+// The single-milestone implement/review iteration budget when the claim omits one, matching
+// sdk-executor's DEFAULT_MAX_ITERATIONS (PRD: RUN_MAX_ITERATIONS default 5). Codex carries no
+// milestone-scaling served budget yet, so the claim value or this default is the whole cap.
+const DEFAULT_MAX_ITERATIONS = 5;
 
 // Watchdog/cancel trip reasons (secret-free static strings). "run cancelled" matches the
 // runner's terminal cancel wording so a Codex cancel routes identically.
 const REASON_IDLE = "codex run idle timeout";
 const REASON_WALL = "codex run wall-clock timeout";
 const REASON_CANCEL = "run cancelled";
+// The bounded implement/review loop's fail-closed exhaustion reason (secret-free static string),
+// mirroring sdk-executor's REASON_MAX_ITERATIONS: the loop reached its iteration budget without
+// the lead signalling done.
+const REASON_MAX_ITERATIONS = "codex run reached its implement/review iteration budget without completing";
 
 /** The reducer's lead-context hook is a NO-OP for Codex: `CodexHarness.readContext`
  *  returns `undefined` (no characterized context RPC yet), so the reducer never attaches a
@@ -150,6 +196,13 @@ const NOOP_CONTEXT_HOOK: HarnessContextHook = {
   request(): void {},
   get: async (): Promise<undefined> => undefined,
 };
+
+/** Derive a positive integer budget from a claim-config value, mirroring sdk-executor's
+ *  `positive`: a finite value > 0 is floored, anything else (absent/zero/negative/garbage)
+ *  falls back to the default. */
+function positiveOr(value: number | undefined, fallback: number): number {
+  return typeof value === "number" && value > 0 ? Math.floor(value) : fallback;
+}
 
 /** Map one uzi {@link AgentTemplate} onto the neutral {@link HarnessAgent} the Codex
  *  renderer consumes. `null`/absent tools = inherit; a list = an explicit allowlist. */
@@ -252,6 +305,18 @@ export class CodexAdviceCredentialBridge {
     this.observedGeneration = binding.generation; // subscription initial; undefined for api_key
   }
 
+  /** The immutable auth mode of the bound credential. Exposed so the advice composition can
+   *  pick the app-server auth mode (subscription vs api_key) without reaching into the binding. */
+  get authMode(): CodexBinding["authMode"] {
+    return this.binding.authMode;
+  }
+
+  /** The provider-verified subscription account id, or undefined for api_key. Server-owned
+   *  and immutable; the app-server login uses it, never the callback's untrusted hint. */
+  get chatgptAccountId(): string | undefined {
+    return this.binding.authMode === "subscription" ? this.binding.chatgptAccountId : undefined;
+  }
+
   /** Release the run's currently-committed access token (both auth modes). Fails CLOSED
    *  (throws) on any release error — capability/ownership loss must not fall back. */
   async release(signal?: AbortSignal): Promise<string> {
@@ -306,6 +371,107 @@ export class CodexAdviceCredentialBridge {
     // beginRefreshOperation at that boundary; ambiguous failures retain this id.
     return res.access_token;
   }
+
+  /**
+   * Build the advice lane's app-server subscription refresh bridge by REUSING the run-lane
+   * {@link buildAppServerRefreshBridge}, so the advice lane's app-server refresh is byte-identical
+   * to the run lane's — GENERATION-AFTER-DELIVERY. The pinned app-server auth owner retains the
+   * SAME operation id across a delivery-failed retry (an HTTP refresh that succeeded but whose
+   * token never reached Codex), so a bridge that advanced its observed generation IMMEDIATELY (as
+   * {@link refresh} does) would re-send an ALREADY-ADVANCED observed_generation on that retry and
+   * the real client's response validation would reject it (`generation <= observed`). Folding
+   * pending→committed only on a NEW operation id avoids that. The committed cell is FRESH per
+   * bridge, seeded from this binding's generation (the advice lane owns no shared run cell), and
+   * `registerToken` redacts every refreshed token. Subscription only (throws for api_key, exactly
+   * like the run lane).
+   */
+  buildSubscriptionRefreshBridge(registerToken: (token: string) => void): CodexSubscriptionRefreshBridge {
+    return buildAppServerRefreshBridge(
+      this.runId,
+      this.client,
+      this.binding,
+      { value: this.binding.authMode === "subscription" ? this.binding.generation : undefined },
+      registerToken,
+    );
+  }
+}
+
+/**
+ * The run's ONE shared committed observed-generation holder (PRD #1171 m1). BOTH the run-lane
+ * boundary reconcile ({@link buildRunLaneReconcile}) AND the app-server refresh bridge
+ * ({@link buildAppServerRefreshBridge}) read and write this SAME cell, so neither keeps a
+ * private generation: a during-run app-server refresh advances it and a post-run boundary
+ * reconcile picks it up. Because the app-server bridge folds pending→committed ONLY on a NEW
+ * operation id (generation-after-delivery), at run-end the cell holds the last
+ * CONFIRMED-DELIVERED generation — one behind an undelivered final refresh, not "exactly where
+ * the run left it". That is the conservative/safe direction: the server replays or advances
+ * from a generation the worker actually installed, never from one that never reached Codex.
+ * `value` is the subscription observed generation; `undefined` for api_key (which never refreshes).
+ */
+export interface CodexCommittedGenerationCell {
+  value: number | undefined;
+}
+
+/**
+ * PRD #1171 m1 (integration): the production app-server subscription refresh bridge. The
+ * pinned app-server auth owner ({@link createCodexAppServerAuth}) calls this when Codex asks to
+ * re-login a subscription; it forwards the exchange to {@link WorkerClient.refreshCodex} with
+ * the SERVER-owned account id, the immutable subscription mode, the SHARED observed generation,
+ * the app-server-supplied operation id (RETAINED across ambiguous/lost-delivery retries by the
+ * auth owner, which mints a NEW id only after a fully-delivered success), and the caller's
+ * cancellation signal (combined with WorkerClient's fixed 8s cap).
+ *
+ * GENERATION-AFTER-DELIVERY: the freshly-committed generation is held as `pending` and folded
+ * into the SHARED committed cell ONLY when a genuinely NEW operation id arrives — proving the
+ * prior refresh fully delivered to Codex, since the auth owner reuses the SAME id on a delivery
+ * failure. A same-id RETRY therefore replays the OLD committed generation as `observed_generation`,
+ * never the not-yet-delivered pending one, so the server replays/advances from the last generation
+ * the worker actually installed. The fold never regresses the shared cell (a concurrent boundary
+ * reconcile may have advanced it further). Subscription only — an api_key credential builds no bridge.
+ */
+export function buildAppServerRefreshBridge(
+  runId: string,
+  client: Pick<WorkerClient, "refreshCodex">,
+  binding: CodexBinding,
+  committed: CodexCommittedGenerationCell,
+  registerToken: (token: string) => void,
+): CodexSubscriptionRefreshBridge {
+  if (binding.authMode !== "subscription") {
+    // Fail-closed guard: an api_key credential can never refresh (mirrors the reconcile).
+    throw new Error("codex app-server refresh bridge requires a subscription binding");
+  }
+  const { capability, chatgptAccountId } = binding;
+  let lastSeenOperationId: string | undefined;
+  let pendingGeneration: number | undefined;
+  return {
+    refresh: async ({ operationId, signal }): Promise<{ accessToken: string; accountId: string }> => {
+      // A genuinely NEW operation id is the auth owner's DELIVERY signal for the prior refresh:
+      // fold pending → committed (never regressing the shared cell). A same-id retry keeps the
+      // OLD committed generation as the observed value it sends.
+      if (operationId !== lastSeenOperationId) {
+        if (pendingGeneration !== undefined && (committed.value === undefined || pendingGeneration > committed.value)) {
+          committed.value = pendingGeneration;
+        }
+        lastSeenOperationId = operationId;
+      }
+      const observedGeneration = committed.value;
+      if (observedGeneration === undefined) {
+        // A subscription binding always carries a generation; its absence is a protocol fault.
+        throw new Error("codex app-server refresh has no observed generation");
+      }
+      const res = await client.refreshCodex(
+        runId,
+        { capability, operation_id: operationId, observed_generation: observedGeneration },
+        { authMode: "subscription", chatgptAccountId },
+        signal,
+      );
+      registerToken(res.access_token);
+      // Held, NOT committed: the shared cell only advances once a NEW operation id proves this
+      // token reached Codex (see fold above).
+      pendingGeneration = res.generation;
+      return { accessToken: res.access_token, accountId: res.chatgpt_account_id };
+    },
+  };
 }
 
 /**
@@ -326,6 +492,12 @@ export class CodexAdviceCredentialBridge {
  * `registerToken` is called with any freshly released token (subscription or api_key) so the
  * caller can register it with the run redactor and track it for terminal eviction.
  *
+ * `committed` is the run's ONE shared observed-generation cell (PRD #1171 m1): the same holder
+ * the app-server refresh bridge reads/writes, so a subscription generation advanced by a
+ * during-run app-server refresh carries into the post-run boundary reconciles and vice versa —
+ * neither keeps a private copy. Omitted (the differential/isolated callers) it defaults to a
+ * fresh per-call cell seeded from the binding, preserving the standalone semantics.
+ *
  * Exported (with {@link CodexAdviceCredentialBridge}) so the differential test pins BOTH against
  * drift.
  */
@@ -334,13 +506,13 @@ export function buildRunLaneReconcile(
   client: Pick<WorkerClient, "releaseCodex" | "refreshCodex">,
   binding: CodexBinding,
   registerToken: (token: string) => void,
+  committed: CodexCommittedGenerationCell = { value: binding.authMode === "subscription" ? binding.generation : undefined },
 ): ReconcileBeforeBoundary {
   let reconcileOperationId: string | undefined;
-  let observedGeneration = binding.generation; // subscription initial; undefined for api_key
   return async (_request: BoundaryRequest, signal: AbortSignal): Promise<ReconcileOutcome> => {
     try {
       if (binding.authMode === "subscription") {
-        if (observedGeneration === undefined) {
+        if (committed.value === undefined) {
           // A subscription binding always carries a generation (the selector enforces it); its
           // absence here is a protocol fault, not a live credential, so fail closed.
           const errors: readonly HarnessError[] = [
@@ -355,13 +527,13 @@ export function buildRunLaneReconcile(
           {
             capability: binding.capability,
             operation_id: reconcileOperationId,
-            observed_generation: observedGeneration,
+            observed_generation: committed.value,
           },
           { authMode: "subscription", chatgptAccountId: binding.chatgptAccountId },
           signal,
         );
         registerToken(res.access_token);
-        observedGeneration = res.generation; // durable commit → advance BEFORE the permit
+        committed.value = res.generation; // durable commit → advance the SHARED cell BEFORE the permit
         reconcileOperationId = undefined; // logical refresh done; next boundary mints fresh
         return { kind: "ready" };
       }
@@ -387,9 +559,10 @@ export function buildRunLaneReconcile(
 
 /**
  * Build an isolated {@link CodexAdviceHarness} whose credential is freshly released through
- * `bridge`. If the bridge fails closed (authority unavailable) the release throws and NO
- * advice root is built — the failure propagates rather than degrading to an un-credentialed
- * root. Only `credentialValue` is fed into the harness — NO workspace/registry/broker.
+ * `bridge` and authenticated over the app-server login RPC. If the bridge fails closed
+ * (authority unavailable) the release throws and NO advice root is built — the failure
+ * propagates rather than degrading to an un-credentialed root. The auth owner is the ONLY
+ * credential seam fed into the harness — NO workspace/registry/broker, no env credential.
  *
  * This DELIVERS the factory + bridge; it is deliberately NOT wired into the shared
  * `model-pass.ts` (R3), which hardcodes `ClaudeAdviceHarness` and owns Claude parity.
@@ -401,8 +574,46 @@ export async function makeCodexAdviceHarness(
   log: Logger,
   signal?: AbortSignal,
 ): Promise<CodexAdviceHarness> {
-  const credentialValue = await bridge.release(signal);
-  return new CodexAdviceHarness({ launchRoot, provider, credentialValue, log });
+  // Register EVERY advice token — the initial release AND any subscription refresh — with the
+  // harness redactor so neither can ride a log line verbatim. The advice lane has no separate
+  // per-worker eviction, so over-retention is the safe direction (mirrors the run lane's redactor
+  // registration; this closes the advice-lane redactor gap for refreshed tokens).
+  const registerToken = (token: string): void => {
+    if (token) log.addSecret(token);
+  };
+  // Release the initial committed token (fail-closed: a release throw propagates and NO root is
+  // built). It seeds the app-server login credential; the token flows over the login RPC, never env.
+  const initial = await bridge.release(signal);
+  registerToken(initial);
+  const appServerAuth = createCodexAppServerAuth(buildAdviceAuthConfig(bridge, initial, registerToken));
+  return new CodexAdviceHarness({ launchRoot, provider, appServerAuth, log });
+}
+
+/** Build the advice lane's app-server auth config from the released initial token. Subscription
+ *  REUSES the run-lane {@link buildAppServerRefreshBridge} (via
+ *  {@link CodexAdviceCredentialBridge.buildSubscriptionRefreshBridge}), so the advice lane's
+ *  app-server refresh is byte-consistent with the run lane BY CONSTRUCTION — generation-after-
+ *  delivery, not the immediate-advance {@link CodexAdviceCredentialBridge.refresh} primitive that
+ *  a delivery-failed same-op retry would break. api_key builds a no-refresh key config. Unit-only
+ *  (no live caller) — it keeps the advice lane fail-closed. */
+function buildAdviceAuthConfig(
+  bridge: CodexAdviceCredentialBridge,
+  initial: string,
+  registerToken: (token: string) => void,
+): CodexAppServerAuthConfig {
+  if (bridge.authMode !== "subscription") {
+    return { mode: "api_key", apiKey: initial };
+  }
+  const accountId = bridge.chatgptAccountId;
+  if (accountId === undefined) {
+    // A subscription bridge always exposes its account id; absence is a protocol fault.
+    throw new Error("codex advice subscription bridge has no account id");
+  }
+  return {
+    mode: "subscription",
+    initial: { accessToken: initial, accountId },
+    bridge: bridge.buildSubscriptionRefreshBridge(registerToken),
+  };
 }
 
 // ─── The fail-closed selection guard executor ───────────────────────────────────
@@ -420,12 +631,129 @@ export class FailClosedExecutor implements Executor {
   }
 }
 
+// ─── the production MCP/forge/memory/findings/skill tool-handler map ────────────
+export interface CodexToolHandlerDeps {
+  readonly client: WorkerClient;
+  readonly runId: string;
+  readonly log: Logger;
+  /** The run's live-stream emit (the findings tool emits a `finding` card through it). */
+  readonly emit: (msg: EmittedMessage) => void;
+  /** The run's GRANTED skills (ctx.skills). The Skill handler returns the sanitized
+   *  body/description of the requested granted skill; the broker has ALREADY gated the
+   *  call on `allowedSkills` before the handler is reached. */
+  readonly skills: readonly ClaimSkill[];
+}
+
+/**
+ * Build the ONE per-run tool-handler map the root broker AND every delegated-child broker
+ * key their `mcp` dispatch against (broker.dispatchMcp does `toolHandlers.get(name)` by the
+ * RAW callback name and DENIES `denied_tool` when absent). Built ONCE per run() — NOT per
+ * turn — because the forge and memory handlers hold per-RUN budget counters
+ * (MAX_FORGE_CALLS_PER_RUN, the 5-writes/run memory cap) that a per-turn rebuild would
+ * reset. It REUSES the Claude raw handler factories verbatim (makeMemoryToolHandlers /
+ * makeFindingsToolHandlers / makeForgeToolHandlers), so the authority + redaction + budget
+ * rules are byte-identical to the Claude lane; only the Skill delivery is Codex-specific.
+ *
+ * Keys:
+ *   - `mcp__memory__save_memory`            → saveMemory
+ *   - `mcp__findings__report_incidental_issue` → reportIncidentalIssue
+ *   - each `mcp__forge__<tool>`             → the matching ForgeToolHandlers method
+ *   - `Skill` (reads the skill name from args) → the Codex Skill handler. This is the ONLY
+ *     skill key: render grants expose the canonical `"Skill"` tool to the model (the requested
+ *     skill rides in args and the broker gates it on `allowedSkills`), so a per-skill
+ *     `mcp__skills__<name>` key would be unreachable under those grants and its key/args
+ *     mismatch a latent inconsistency — it is deliberately NOT registered.
+ */
+export function buildCodexToolHandlers(deps: CodexToolHandlerDeps): ReadonlyMap<string, ToolHandler> {
+  const { client, runId, log, emit, skills } = deps;
+  const map = new Map<string, ToolHandler>();
+
+  // memory (one tool; ROOT-only — render never grants it to a subagent, and the broker's
+  // allowedTools gate stops a subagent reaching this handler regardless).
+  const memHandlers: MemoryToolHandlers = makeMemoryToolHandlers({ client, runId, log });
+  map.set(
+    memoryToolNames()[0]!,
+    (args) => memHandlers.saveMemory(args as Parameters<MemoryToolHandlers["saveMemory"]>[0]),
+  );
+
+  // findings (granted to the lead AND every subagent — stays in the subagent base).
+  const findingsHandlers: FindingsToolHandlers = makeFindingsToolHandlers({ client, runId, emit, log });
+  map.set(
+    reportIncidentalIssueToolName(),
+    (args) => findingsHandlers.reportIncidentalIssue(args as Parameters<FindingsToolHandlers["reportIncidentalIssue"]>[0]),
+  );
+
+  // forge (8 tools; the 6 reads + 2 writes share the ONE per-run budget in makeForgeToolHandlers).
+  // An explicit [suffix, handler] table so a rename cannot silently misalign the map; the
+  // qualified keys equal forgeToolNames() by construction (same FORGE_SERVER_NAME + suffixes).
+  const forgeHandlers: ForgeToolHandlers = makeForgeToolHandlers({ client, runId, log });
+  const forgeEntries: ReadonlyArray<readonly [suffix: string, handler: ToolHandler]> = [
+    ["get_issue", (a) => forgeHandlers.getIssue(a as Parameters<ForgeToolHandlers["getIssue"]>[0])],
+    ["list_issues", (a) => forgeHandlers.listIssues(a as Parameters<ForgeToolHandlers["listIssues"]>[0])],
+    ["get_merge_request", (a) => forgeHandlers.getMergeRequest(a as Parameters<ForgeToolHandlers["getMergeRequest"]>[0])],
+    ["get_pipeline_jobs", (a) => forgeHandlers.getPipelineJobs(a as Parameters<ForgeToolHandlers["getPipelineJobs"]>[0])],
+    ["latest_pipeline", (a) => forgeHandlers.latestPipeline(a as Parameters<ForgeToolHandlers["latestPipeline"]>[0])],
+    ["list_issue_label_events", (a) => forgeHandlers.listIssueLabelEvents(a as Parameters<ForgeToolHandlers["listIssueLabelEvents"]>[0])],
+    ["reply_mr_thread", (a) => forgeHandlers.replyMrThread(a as Parameters<ForgeToolHandlers["replyMrThread"]>[0])],
+    ["resolve_mr_thread", (a) => forgeHandlers.resolveMrThread(a as Parameters<ForgeToolHandlers["resolveMrThread"]>[0])],
+  ];
+  for (const [suffix, handler] of forgeEntries) map.set(`mcp__${FORGE_SERVER_NAME}__${suffix}`, handler);
+
+  // Skill — Codex-SPECIFIC delivery. Skills have NO Claude runtime tool analogue: Claude
+  // enables them through the SDK `skills` plugin list (markdown loaded by the SDK), not a
+  // callback handler, so there is nothing to reuse here. The broker gates the call on
+  // `allowedSkills` (so the name reaching this handler is already a granted, kebab-case
+  // skill), then requires a handler keyed by the raw callback name; this returns the granted
+  // skill's description + body as the tool result. Keyed ONLY under the canonical "Skill"
+  // (the requested skill rides in args) — that is the tool render grants actually expose. A
+  // per-skill `mcp__skills__<name>` key would be unreachable under those grants and its
+  // key/args mismatch a latent inconsistency, so it is deliberately not registered.
+  const skillByName = new Map<string, ClaimSkill>();
+  for (const s of skills) skillByName.set(s.name, s);
+  const deliverSkill = (name: string): ToolTextResultLike => {
+    const skill = skillByName.get(name);
+    if (skill === undefined || skill.body.trim().length === 0) {
+      // Bounded ack naming the skill (never "no handler wired", never a throw). `name` is a
+      // granted, broker-validated skill name, so it is safe to echo.
+      return asText(`skill "${name}" is granted but its content is not available in this run; proceed without it.`);
+    }
+    return asText(`${skill.description}\n\n${skill.body}`);
+  };
+  map.set("Skill", (args) => {
+    const name = firstSkillName(args);
+    return Promise.resolve(
+      name === undefined ? asText("a skill invocation requires a skill name.") : deliverSkill(name),
+    );
+  });
+
+  return map;
+}
+
+/** The single-text-block tool-result shape the reused Claude handlers (and the Skill
+ *  handler above) return; the broker forwards it as the callback `output`. Mirrors
+ *  tool-evidence.ts's ToolTextResult without re-importing the type. */
+type ToolTextResultLike = ReturnType<typeof asText>;
+
+/** The requested skill name from a `Skill` callback's args (`skill` or `name`), else
+ *  undefined. Mirrors the broker's own skill-name extraction (firstStrField). */
+function firstSkillName(args: unknown): string | undefined {
+  if (args === null || typeof args !== "object" || Array.isArray(args)) return undefined;
+  const record = args as Record<string, unknown>;
+  for (const key of ["skill", "name"]) {
+    const v = record[key];
+    if (typeof v === "string" && v.length > 0) return v;
+  }
+  return undefined;
+}
+
 // ─── Injectable seams (production defaults; tests inject fakes) ──────────────────
 export interface CodexExecutorDeps {
   /** Adapts the real M3a launcher for a PROVIDER root; a test injects a fake returning a
-   *  scripted in-memory transport (NO real Codex). Receives the harness's launch spec AND
-   *  the FRESHLY-RELEASED credential; the credential rides ONLY into the launcher env. */
-  readonly launchProviderRoot?: (spec: CodexLaunchRootSpec, credential: string) => Promise<CodexLaunchRootResult>;
+   *  scripted in-memory transport (NO real Codex). Receives the harness's launch spec AND the
+   *  immutable app-server auth mode; the credential NO LONGER rides into the launcher env — it
+   *  flows over the app-server login RPC (the harness's auth session), so the launcher emits the
+   *  production config and injects no provider credential var. */
+  readonly launchProviderRoot?: (spec: CodexLaunchRootSpec, authMode: CodexAppServerAuthMode) => Promise<CodexLaunchRootResult>;
   /** Test-only high-level command seam. Production leaves this absent and uses
    * the registered supervisor-root implementation. */
   readonly spawnCommand?: SpawnCommandSeam;
@@ -438,8 +766,16 @@ export interface CodexExecutorDeps {
   /** The boundary-action spawn seam for the safety facade (m4 wires the real supervisor
    *  root). Never invoked in m3 (no runner sink is routed through `withBoundary` yet). */
   readonly spawnBoundaryRoot?: SpawnRootSeam;
-  /** The credential-free session store (default: the real {@link CodexSessionStore}). */
-  readonly sessionStore?: Pick<typeof CodexSessionStore, "adopt" | "inspect" | "remove">;
+  /** The credential-free session store (default: the real {@link CodexSessionStore}).
+   *  `persist` is used before every provider-root reap and at terminal to capture the
+   *  live session subset; `remove` is NO LONGER called by the executor (the runner's
+   *  runHome lifecycle owns store removal — preserve on park, remove on terminal). */
+  readonly sessionStore?: Pick<typeof CodexSessionStore, "adopt" | "inspect" | "remove" | "persist">;
+  /** The shared tool-provisioning step (PRD #18). Production uses the real
+   *  {@link provisionRunTools}; a unit test injects a stub so no real devbox/nix install
+   *  runs. The resolved `toolEnv` is folded into the credential-free command env
+   *  (bounded by PROVISION_ENV_ALLOWLIST; the boundary literals are protected). */
+  readonly provisionRunTools?: typeof provisionRunTools;
   readonly idleMs?: number;
   readonly wallMs?: number;
   readonly boundaryDeadlineMs?: number;
@@ -464,6 +800,62 @@ export interface CodexExecutorOptions {
   readonly provider: CodexProviderConfig;
 }
 
+// ─── The per-epoch provider bundle + the shared per-run context (m4) ────────────
+/**
+ * PRD #1171 m4: the SHARED per-run state every provider epoch is built from. Closed over ONCE in
+ * `run()` and passed to every {@link CodexExecutor.startProviderEpoch} so a recreated epoch reuses
+ * (never rebuilds) the released-token set, the committed-generation cell, the tool-handler map, the
+ * reconcile + eviction closures, provisioning-derived command env, the effect launcher and the
+ * boundary seams. Only the per-epoch registry/safety/harness/effect-roots + a fresh credential +
+ * an owned HOME are minted anew per epoch.
+ */
+interface EpochSharedContext {
+  readonly provider: CodexProviderConfig;
+  readonly binding: CodexBinding;
+  readonly worktreePath: string;
+  readonly storeDir: string;
+  readonly homeRoot: string;
+  readonly boundaryDeadlineMs: number;
+  readonly childTurnDeadlineMs: number;
+  readonly commandEnv: NodeJS.ProcessEnv;
+  readonly screenPolicy: ScreenPolicy;
+  readonly toolHandlers: ReadonlyMap<string, ToolHandler>;
+  readonly registerToken: (token: string) => void;
+  readonly committedGeneration: CodexCommittedGenerationCell;
+  readonly launchEffectRoot: (spec: CodexEffectLaunchSpec, deadlineMs?: number) => Promise<CodexRootHandle>;
+  readonly spawnBoundaryRoot: SpawnRootSeam;
+  readonly boundaryProcessSpawner: SpawnBoundaryProcessSeam;
+  readonly reconcile: ReconcileBeforeBoundary;
+  readonly evictTokens: () => void;
+}
+
+/**
+ * PRD #1171 m4: ONE fresh provider epoch — its own {@link ExecutionRegistry} (a distinct
+ * local-execution epoch), safety facade, provider {@link CodexHarness}, fileop/command effect
+ * roots, and a per-epoch owned HOME (`codexHome`) that adopts the credential-free session subset
+ * from the shared store. `run()` holds the CURRENT epoch and hot-swaps `this.safety` to it so the
+ * runner's durability sinks always reap the LIVE provider root; a cooperative-checkpoint reap and
+ * plan approval REPLACE it with a fresh epoch via {@link CodexExecutor.startProviderEpoch}.
+ */
+interface ProviderEpoch {
+  readonly registry: ExecutionRegistry;
+  readonly safety: CodexExecutionSafety;
+  readonly harness: CodexHarness;
+  readonly fileopHandle: FileopHelperHandle;
+  readonly spawnCommand: SpawnCommandSeam;
+  readonly fileop: FileopClient;
+  readonly codexHome: string;
+  /** The session id a fresh provider root resumes (the prior epoch's latest thread, or the
+   *  incoming `ctx.sessionId` for a cross-worker resume; undefined ⇒ start a fresh session). */
+  readonly resumeSessionId: string | undefined;
+  readonly buildPhaseBroker: (phase: "plan" | "implement", signal?: AbortSignal) => CodexCallbackBroker;
+  /** Persist THIS epoch's credential-free session subset into the shared store (best-effort). */
+  persistSession(): Promise<void>;
+  /** Full teardown of an ABANDONED epoch on recreation (quiesce + reap + disposeTools the
+   *  registry, WITHOUT the token-eviction hook, then close the harness/fileop). */
+  dispose(): Promise<void>;
+}
+
 // ─── The production CodexExecutor ───────────────────────────────────────────────
 export class CodexExecutor implements Executor {
   /** M3/M4 (PRD #1171): the Codex outer safety facade, POPULATED at the top of `run()` (before
@@ -477,7 +869,7 @@ export class CodexExecutor implements Executor {
   private readonly homeRoot: string;
   private readonly opts: CodexExecutorOptions;
   private readonly deps: CodexExecutorDeps;
-  private readonly sessionStore: Pick<typeof CodexSessionStore, "adopt" | "inspect" | "remove">;
+  private readonly sessionStore: Pick<typeof CodexSessionStore, "adopt" | "inspect" | "remove" | "persist">;
 
   constructor(log: Logger, homeRoot: string, opts: CodexExecutorOptions, deps: CodexExecutorDeps = {}) {
     this.log = log;
@@ -493,202 +885,142 @@ export class CodexExecutor implements Executor {
     const binding = this.opts.binding;
     const provider = this.opts.provider;
     const worktreePath = ctx.worktreePath;
-    const ownedDataRoot = path.join(this.homeRoot, "codex-data");
     const storeDir = path.join(this.homeRoot, "codex-session-store");
     const boundaryDeadlineMs = this.deps.boundaryDeadlineMs ?? DEFAULT_BOUNDARY_DEADLINE_MS;
 
     if (uidSplitActive()) await assertCommandWorktreePosture(worktreePath);
 
-    // (C) Every FRESH provider token released this run is registered with the logger's
-    // secret set (`addSecret`) before use; without a matching `removeSecret` a long-lived
-    // worker's secret set would grow permanently, one entry per provider-root start. Track
-    // them here and evict them ONLY at terminal cleanup (never mid-run, where a late log
-    // line could still carry the token) — over-retention is the safe direction.
+    // (C) SHARED across every provider epoch: each FRESH provider token released this run is
+    // registered with the logger's secret set (`addSecret`) BEFORE use; without a matching
+    // `removeSecret` a long-lived worker's secret set would grow permanently. A recreated epoch
+    // releases a NEW token into this SAME set, and every epoch's tokens are evicted together at
+    // the terminal (over-retention is the safe direction — never mid-run, where a late log line
+    // could still carry a token). Idempotent per token so a token reused across paths registers once.
     const releasedTokens = new Set<string>();
+    const registerToken = (token: string): void => {
+      if (!token || releasedTokens.has(token)) return;
+      this.log.addSecret(token);
+      releasedTokens.add(token);
+    };
+    // (m1) The run's ONE shared committed observed-generation cell, SHARED across every epoch: the
+    // app-server refresh bridge (during a turn) and the boundary reconcile (at a sink) of EVERY
+    // epoch read/write it, so a generation advanced under epoch N carries into epoch N+1. Neither
+    // keeps a private copy. Subscription seeds it from the binding; api_key never refreshes.
+    const committedGeneration: CodexCommittedGenerationCell = {
+      value: binding.authMode === "subscription" ? binding.generation : undefined,
+    };
 
-    // (1) The immutable per-run local-execution-epoch registry.
-    const registry = new ExecutionRegistry(newLocalExecutionEpoch(0));
-    const launchEffectRoot = this.deps.launchEffectRoot ?? ((spec: CodexEffectLaunchSpec, deadlineMs?: number) =>
-      launchCodexEffectRoot(spec, deadlineMs === undefined ? {} : { deadlines: { started: deadlineMs } }));
+    // A SINGLE terminal try/finally spanning ALL provider epochs. `epoch` holds the CURRENT
+    // provider epoch — undefined until the first startProviderEpoch succeeds, so a setup failure
+    // BEFORE any epoch is built still reaches the finally to evict every registered token. Each
+    // cooperative-checkpoint reap and the plan approval REPLACES it with a fresh epoch (a new
+    // registry + safety facade + harness + fileop/command roots on a fresh credential + a new
+    // local-execution epoch + the adopted session), disposing the old one. `epochIndex` numbers
+    // each epoch's local-execution epoch and its own owned HOME; `provisionDir` is the ONE per-run
+    // provisioning dir the finally removes.
+    let epoch: ProviderEpoch | undefined;
+    let epochIndex = 0;
+    let provisionDir: string | undefined;
+    try {
+      // Provision the run's tool packages ONCE (PRD #18; SHARED across every epoch — the forge/
+      // memory budget counters a per-epoch rebuild would reset). A tier-1 failure throws
+      // REASON_PROVISION_FAILED, which this try's finally then cleans up after. Injected via
+      // `deps.provisionRunTools` so a unit test stubs it. The provisioning HOME + root are SHARED
+      // worker-lifetime paths (not the per-run codex home), matching sdk-executor.
+      const provisionRunToolsFn = this.deps.provisionRunTools ?? provisionRunTools;
+      const provisioned = await provisionRunToolsFn(ctx, {
+        provisionRoot: path.join(path.dirname(this.homeRoot), "provision"),
+        homeDir: this.homeRoot,
+        log: this.log,
+      });
+      provisionDir = provisioned.provisionDir; // removed in the terminal finally (best-effort)
 
-    // (2) The outer safety facade — populated BEFORE any model work. The legacy
-    // root-only seam remains for compatibility; permit-held Git uses the supervised
-    // process seam wired below.
-    const spawnBoundaryRoot: SpawnRootSeam =
-      this.deps.spawnBoundaryRoot ??
-      ((): Promise<RegisteredRoot> =>
-        Promise.reject(new Error("codex boundary-action spawn is not wired until m4")));
-    // (2b) PRD #1171 m4: the per-sink auth-mode reconcile closure. It runs INSIDE the safety
-    // facade before every boundary quiesce/reap/mint, and ONLY its neutral ReconcileOutcome
-    // crosses back into the generic code — the runner and generic withBoundary never see
-    // authMode/token/generation. All credential logic lives here (mirroring the advice bridge).
-    this.safety = createCodexExecutionSafety(
-      registry,
-      spawnBoundaryRoot,
-      this.makeBoundaryReconcile(ctx.runId, releasedTokens),
-      // (C, F1) Terminal eviction of tokens released by the POST-RUN sink reconciles. The
-      // runner calls safety.dispose after the last durability sink — by which point run()'s
-      // finally (below) has already evicted+cleared the DURING-run tokens — so tokens the
-      // sinks added here are un-scrubbed at the true terminal. `clear()` makes it idempotent
-      // (a second dispose, or the standalone backstop, sees an empty set and no-ops).
-      () => {
+      // The SCRUBBED command-identity env — NOTHING from process.env (cross-root credential
+      // boundary). The FIXED toolchain+system PATH comes first; the run's allowlisted provisioned
+      // toolEnv (PATH appended, NIX_SSL_CERT_FILE/LOCALE_ARCHIVE folded) rides in without ever
+      // overwriting a boundary literal or a PROTECTED_ENV_KEYS member. Built ONCE and shared by
+      // every epoch's command + fileop effect surfaces (the roots are per-epoch; the env is not).
+      const commandEnv: NodeJS.ProcessEnv = buildCommandEnv(
+        this.deps.commandTmpdir ?? "/tmp",
+        provisioned.toolEnv,
+      );
+
+      // The ONE per-run MCP/forge/memory/findings/skill handler map, SHARED by EVERY epoch's root
+      // + child brokers. Built HERE (once per run(), NOT per epoch/turn) because the forge + memory
+      // handlers hold per-RUN budget counters a rebuild would reset. render.ts decides WHICH names
+      // each role may invoke (root gets forge + memory; a subagent never inherits memory); this map
+      // only supplies the handler an already-authorized call routes to.
+      const toolHandlers = buildCodexToolHandlers({
+        client: this.opts.client,
+        runId: ctx.runId,
+        log: this.log,
+        emit: (msg) => ctx.emit(msg),
+        skills: ctx.skills ?? [],
+      });
+
+      // The low-level effect launcher, boundary seams and per-sink reconcile/eviction closures —
+      // all SHARED across epochs (each epoch's registry-bound safety facade + effect roots are
+      // built from these). The `spawnBoundaryRoot` legacy seam is unused by the runner (which
+      // drives `spawnBoundaryProcess`); it stays a fail-closed reject stub. The reconcile + eviction
+      // closures write the SHARED released-token set and committed-generation cell, so credential
+      // state is continuous across a recreation.
+      const launchEffectRoot = this.deps.launchEffectRoot ?? ((spec: CodexEffectLaunchSpec, deadlineMs?: number) =>
+        launchCodexEffectRoot(spec, deadlineMs === undefined ? {} : { deadlines: { started: deadlineMs } }));
+      const spawnBoundaryRoot: SpawnRootSeam =
+        this.deps.spawnBoundaryRoot ??
+        ((): Promise<RegisteredRoot> =>
+          Promise.reject(new Error("codex boundary-action spawn seam is not wired (the runner drives spawnBoundaryProcess)")));
+      const boundaryProcessSpawner = makeBoundaryProcessSpawner(launchEffectRoot);
+      const reconcile = this.makeBoundaryReconcile(ctx.runId, registerToken, committedGeneration);
+      // (C, F1) Terminal eviction of tokens released by the POST-RUN sink reconciles. The runner
+      // calls safety.dispose after the last durability sink — by which point run()'s finally has
+      // already evicted+cleared the DURING-run tokens — so the FINAL epoch's onDispose evicts only
+      // the post-run tokens. `clear()` makes it idempotent. SHARED across epochs, but ONLY the
+      // FINAL epoch's safety.dispose ever invokes it (an abandoned epoch's dispose tears down its
+      // registry directly, WITHOUT this hook, so a mid-run recreation never evicts a live token).
+      const evictTokens = (): void => {
         for (const token of releasedTokens) this.log.removeSecret(token);
         releasedTokens.clear();
-      },
-      makeBoundaryProcessSpawner(launchEffectRoot),
-    );
+      };
 
-    // The SCRUBBED command-identity env — NOTHING from process.env (cross-root credential
-    // boundary). Both the shell effect surface and the fileop helper use it.
-    const commandEnv: NodeJS.ProcessEnv = {
-      PATH: COMMAND_ENV_PATH,
-      TMPDIR: this.deps.commandTmpdir ?? "/tmp",
-      LANG: "C",
-    };
-
-    // (4) The command + fileop effect surfaces (credential-free command identity).
-    const baseSpawnCommand = this.deps.spawnCommand ?? makeDefaultSpawnCommand(
-      registry,
-      launchEffectRoot,
-      boundaryDeadlineMs,
-      worktreePath,
-      commandEnv,
-    );
-    // Route the SCRUBBED command-identity env THROUGH the seam (not merely closed over by the
-    // default seam) so an injected seam records the exact env command spawns run under — the
-    // same scrubbed env the fileop seam already receives. [#1171 m5 review]
-    const spawnCommand: SpawnCommandSeam = (argv, spawnOpts) => baseSpawnCommand(argv, { ...spawnOpts, env: commandEnv });
-    const fileopRoot = await launchRegisteredEffectRoot(
-      registry,
-      launchEffectRoot,
-      commandEffectSpec(
+      // The per-run state every epoch is built from. Everything here is SHARED and closed over
+      // ONCE; startProviderEpoch mints only the per-epoch registry/safety/harness/effect roots +
+      // its own fresh credential + owned HOME on top of it.
+      const shared: EpochSharedContext = {
+        provider,
+        binding,
         worktreePath,
-        worktreePath,
-        FILEOP_BIN,
-        ["--root", worktreePath],
+        storeDir,
+        homeRoot: this.homeRoot,
+        boundaryDeadlineMs,
+        childTurnDeadlineMs: this.deps.childTurnDeadlineMs ?? DEFAULT_CHILD_TURN_DEADLINE_MS,
         commandEnv,
-      ),
-      boundaryDeadlineMs,
-      "command",
-    );
-    let fileopHandle: FileopHelperHandle;
-    try {
-      fileopHandle = (this.deps.wireFileop ?? wireFileopHelper)({
-        stdin: fileopRoot.handle.transport.stdin,
-        stdout: fileopRoot.handle.transport.stdout,
-      });
-    } catch (error) {
-      await registry.reapRoot(fileopRoot.root, boundaryDeadlineMs);
-      throw error;
-    }
-    const fileop: FileopClient = fileopHandle.client;
+        screenPolicy: { dockerWired: false },
+        toolHandlers,
+        registerToken,
+        committedGeneration,
+        launchEffectRoot,
+        spawnBoundaryRoot,
+        boundaryProcessSpawner,
+        reconcile,
+        evictTokens,
+      };
 
-    const screenPolicy: ScreenPolicy = { dockerWired: false };
-    const childTurnDeadlineMs = this.deps.childTurnDeadlineMs ?? DEFAULT_CHILD_TURN_DEADLINE_MS;
+      // Build the FIRST provider epoch (epoch 0): eager fresh credential release (fail-closed),
+      // the registered fileop/command root, the app-server auth session on that token, the safety
+      // facade, the phase brokers and the provider harness. `this.safety` is hot-swapped to the
+      // current epoch's facade so the runner's durability sinks (which re-read executor.safety
+      // fresh on every call) always reap the LIVE provider root. epoch 0 resumes ctx.sessionId (a
+      // cross-worker resume) or starts a fresh session. `lastSessionId` tracks the most recent
+      // turn's session id so a recreated epoch resumes the RIGHT thread.
+      let lastSessionId = ctx.sessionId ?? undefined;
+      epoch = await this.startProviderEpoch(ctx, shared, lastSessionId, epochIndex);
+      this.safety = epoch.safety;
 
-    // (5) The composition cycle (harness → broker → delegation → harness) is resolved by
-    // late-binding `harness`: the delegation seam captures it by reference and is only
-    // invoked once a spawn_agent callback fires, by which point `harness` is assigned.
-    let harness!: CodexHarness;
+      const reducer = new RunTurnReducerImpl(NOOP_CONTEXT_HOOK);
+      const idleMs = this.deps.idleMs ?? (ctx.config?.idle_timeout_seconds ? ctx.config.idle_timeout_seconds * 1000 : DEFAULT_IDLE_MS);
+      const wallMs = this.deps.wallMs ?? (ctx.config?.run_timeout_seconds ? ctx.config.run_timeout_seconds * 1000 : DEFAULT_WALL_MS);
 
-    // (3) PHASE-CORRECT broker + delegation construction, PER TURN. The broker enforces the
-    // plan-phase file-write ban through `grants.phase` (broker.dispatchFileWrite returns
-    // `write_denied_in_plan`) and its delegation runner passes the SAME phase into each
-    // child's grants. buildCodexRunPlan("plan") does NOT strip write tools — the phase field
-    // IS the mechanism (render.ts) — so the broker's grants MUST be phase-correct for the turn
-    // it serves. A single implement-phase broker (frozen at construction) would leave that ban
-    // INERT during the plan turn, letting a model apply_patch/Write mutate the worktree BEFORE
-    // approval, subagents included. So the broker + its delegation runner are rebuilt per turn
-    // from a phase-correct run plan; only the phase-derived grants/roles/allowedRoles change.
-    // The registry, effect seams, worktree, screen policy and cancel signal are reused, and the
-    // provider root + transport (owned by the single `harness`, below) are built once and reused.
-    const buildPhaseBroker = (phase: "plan" | "implement", signal?: AbortSignal): CodexCallbackBroker => {
-      const runPlan = buildCodexRunPlan(
-        this.buildRunRequest(ctx, phase, this.phasePrompt(ctx, phase), undefined, new AbortController().signal),
-      );
-      const delegationRunner = new CodexDelegationRunner({
-        registry,
-        roles: runPlan.roles,
-        // The child-turn seam demuxes a child thread's frames off the SAME transport
-        // (part C): start a child thread/turn, register a sink, hand the runner a controller.
-        startChildTurn: (spec: StartChildTurnSpec) => this.startChildTurn(harness, provider, worktreePath, spec),
-        spawnCommand,
-        fileop,
-        worktreePath,
-        screenPolicy,
-        signal,
-        childTurnDeadlineMs,
-      });
-      return new CodexCallbackBroker({
-        registry,
-        spawnCommand,
-        fileop,
-        worktreePath,
-        grants: runPlan.lead.grants,
-        delegate: delegationRunner.toDelegateSeam(),
-        allowedRoles: runPlan.allowedRoles,
-        screenPolicy,
-        signal,
-      });
-    };
-
-    // Seed the harness with the PLAN-phase broker (the fail-safe default: writes denied).
-    // `run()` re-points it to the phase-correct broker BEFORE each turn via `harness.useBroker`,
-    // so a turn can never route through implement-phase grants unless the executor grants them.
-    const planBroker = buildPhaseBroker("plan");
-
-    // The FRESH-credential provider launch seam (part D): release a fresh committed token
-    // per provider root, register it with the redactor, adopt the credential-free session
-    // subset into the fresh home, then launch with the fresh token (which rides ONLY into
-    // the launcher env). A new root always re-authorizes; a resume still gets a fresh token.
-    const launchProviderRoot = this.deps.launchProviderRoot ?? defaultLaunchProviderRoot;
-    const providerLaunchSeam: LaunchRootSeam = async (spec) => {
-      const expected = binding.authMode === "subscription"
-        ? {
-            authMode: "subscription" as const,
-            chatgptAccountId: binding.chatgptAccountId,
-            minimumGeneration: binding.generation,
-          }
-        : { authMode: "api_key" as const };
-      const released = await this.opts.client.releaseCodex(
-        ctx.runId,
-        { capability: binding.capability },
-        expected,
-        ctx.signal,
-      );
-      if (!releasedTokens.has(released.access_token)) {
-        this.log.addSecret(released.access_token); // BEFORE any use
-        releasedTokens.add(released.access_token); // evicted at terminal cleanup (part C)
-      }
-      const codexHome = path.join(spec.ownedDataRoot, "codex");
-      // Best-effort credential-free seed. NOTE (m3b/m4): under the uid split the fresh home
-      // is runner-owned 0700, so this cross-uid seed moves into the launcher's runner-
-      // identity tree step; here (and in the unit composition) it runs against the worker.
-      await this.sessionStore.adopt(storeDir, codexHome).catch(() => undefined);
-      return launchProviderRoot({ ...spec, credentialValue: released.access_token }, released.access_token);
-    };
-
-    harness = new CodexHarness({
-      registry,
-      launchRoot: providerLaunchSeam,
-      broker: planBroker,
-      provider,
-      workspace: worktreePath,
-      homeDir: ownedDataRoot,
-      log: this.log,
-      // The store is per-run and credential-free; presence backs inspectSession.
-      sessionInspect: () => this.sessionStore.inspect(storeDir),
-      // The credential is NOT known at construction — it is released FRESH per root inside
-      // `providerLaunchSeam`, so the harness carries none (undefined).
-      credentialValue: undefined,
-    });
-
-    const reducer = new RunTurnReducerImpl(NOOP_CONTEXT_HOOK);
-    const resumeId = ctx.sessionId ?? undefined;
-    const idleMs = this.deps.idleMs ?? (ctx.config?.idle_timeout_seconds ? ctx.config.idle_timeout_seconds * 1000 : DEFAULT_IDLE_MS);
-    const wallMs = this.deps.wallMs ?? (ctx.config?.run_timeout_seconds ? ctx.config.run_timeout_seconds * 1000 : DEFAULT_WALL_MS);
-
-    try {
       // Plan → approval gate, exactly like SdkExecutor (fail-closed): a pre-approved resume
       // skips the planning turn and the gate.
       const preApproved = ctx.planApproved === true && !!ctx.approvedPlan?.trim();
@@ -696,8 +1028,8 @@ export class CodexExecutor implements Executor {
         // The PLAN turn(s) run under PLAN-phase grants: the broker denies every file write
         // (write_denied_in_plan) and child subagents inherit plan-phase grants, so nothing
         // mutates the worktree before the plan is approved. All revise iterations reuse this
-        // plan-phase broker (the implement turn re-points it, below).
-        let planResult = await this.driveCodexTurn(ctx, harness, reducer, "plan", this.planPrompt(ctx), resumeId, idleMs, wallMs, buildPhaseBroker);
+        // epoch's plan-phase broker (the implement epoch, below, re-points to implement).
+        let planResult = await this.driveCodexTurn(ctx, epoch.harness, reducer, "plan", this.planPrompt(ctx), epoch.resumeSessionId, idleMs, wallMs, epoch.buildPhaseBroker);
         let planMd = planResult.plan;
         if (planMd === undefined || planMd.trim().length === 0) {
           throw new Error("codex plan turn produced no plan");
@@ -705,7 +1037,7 @@ export class CodexExecutor implements Executor {
         let verdict = await ctx.gatePlan(planMd, planResult.milestones);
         while (verdict.kind === "revise") {
           ctx.emit({ kind: "plan_feedback", agent: "worker", payload: { feedback: verdict.feedback } });
-          planResult = await this.driveCodexTurn(ctx, harness, reducer, "plan", this.planPrompt(ctx), resumeId, idleMs, wallMs, buildPhaseBroker);
+          planResult = await this.driveCodexTurn(ctx, epoch.harness, reducer, "plan", this.planPrompt(ctx), epoch.resumeSessionId, idleMs, wallMs, epoch.buildPhaseBroker);
           planMd = planResult.plan;
           if (planMd === undefined || planMd.trim().length === 0) {
             throw new Error("codex plan turn produced no plan on revision");
@@ -714,32 +1046,312 @@ export class CodexExecutor implements Executor {
         }
         if (verdict.kind === "reject") throw new PlanRejectedError(verdict.reason);
         if (verdict.kind === "cancel") throw new Error(REASON_CANCEL);
+
+        // NEW-ROOT RESUME at plan approval. The plan turn's provider root holds a live credential
+        // it does not need during the approval wait, so: persist the credential-free session,
+        // recreate a fresh epoch (fresh credential + new local-execution epoch + adopted session)
+        // that resumes the plan thread, hot-swap `this.safety` to it, then fully dispose the old
+        // epoch. Implement now runs on a fresh credential/root — the plan root's credential was
+        // released for the duration of the (possibly long) approval.
+        if (planResult.sessionId) lastSessionId = planResult.sessionId;
+        await epoch.persistSession();
+        const old = epoch;
+        epoch = await this.startProviderEpoch(ctx, shared, lastSessionId, ++epochIndex);
+        this.safety = epoch.safety;
+        await old.dispose();
       }
 
-      // Implement turn (Codex-specific driving; the full lifecycle is m5). Re-point the
-      // broker to IMPLEMENT-phase grants (file writes permitted) BEFORE driving it. The plan
-      // driveCodexTurn has returned; the next (implement) turn drives sequentially. The
-      // re-point is race-safe not because every callback has drained (a backgrounded child
-      // callback can outlive the plan turn) but because an in-flight child captured its OWN
-      // plan-phase child broker at spawn — the root `this.broker` swap never touches it.
-      await this.driveCodexTurn(ctx, harness, reducer, "implement", this.implementPrompt(ctx), resumeId, idleMs, wallMs, buildPhaseBroker);
+      // Implement ⇄ review loop (bounded). Each iteration drives ONE implement turn under
+      // IMPLEMENT-phase grants on the CURRENT epoch. Off the reducer's per-turn ReducedTurnResult:
+      //   - carry `latestProgress`, overwriting ONLY when the turn reported progress, so a quiet
+      //     turn keeps the last known progress rather than blanking it (mirrors sdk-executor);
+      //   - carry `lastSessionId` off each turn so a recreated epoch resumes the RIGHT thread;
+      //   - a `checkpoint` that is NOT `done` is a cooperative milestone boundary → persist the
+      //     live session, reap the CURRENT epoch (checkpoint reap:true routes through
+      //     this.safety = epoch.safety), then NEW-ROOT RESUME: recreate a fresh epoch on a fresh
+      //     credential + new local-execution epoch + the adopted session, and drive the next
+      //     implement turn on the NEW root — the reaped root's registry is permanently closed, so
+      //     the next turn REQUIRES a fresh registry/provider root;
+      //   - `done` (a root signal_done folded via the m2 signal-routing frame) ends the loop;
+      //   - reaching the bounded iteration budget fails closed (REASON_MAX_ITERATIONS);
+      //   - otherwise an iteration-boundary fallback checkpoint (reap:false — credential-free, does
+      //     NOT reap the provider → NO recreation; the SAME epoch drives the next turn), then continue.
+      const maxIterations = positiveOr(ctx.config?.max_iterations, DEFAULT_MAX_ITERATIONS);
+      let latestProgress: ReducedTurnResult["progress"];
+      let iteration = 0;
+      for (;;) {
+        iteration++;
+        const result = await this.driveCodexTurn(ctx, epoch.harness, reducer, "implement", this.implementPrompt(ctx), epoch.resumeSessionId, idleMs, wallMs, epoch.buildPhaseBroker);
+        if (result.sessionId) lastSessionId = result.sessionId;
+        // Only overwrite when THIS turn reported progress (a quiet turn keeps the last value).
+        if (result.progress) latestProgress = result.progress;
+        // A cooperative checkpoint that did not also finish: persist BEFORE the reap (so the live
+        // session is captured before the provider root dies), reap the CURRENT epoch's roots, then
+        // recreate a fresh provider epoch and continue on the NEW root. A turn that is BOTH
+        // checkpoint and done still terminates (the done break wins below, reached because this
+        // branch is skipped when done).
+        if (result.checkpoint && !result.done) {
+          await epoch.persistSession();
+          await ctx.checkpoint?.({ reap: true, progress: latestProgress });
+          const old = epoch;
+          epoch = await this.startProviderEpoch(ctx, shared, lastSessionId, ++epochIndex);
+          this.safety = epoch.safety;
+          await old.dispose();
+          continue;
+        }
+        if (result.done) break;
+        if (iteration >= maxIterations) throw new Error(REASON_MAX_ITERATIONS);
+        // Iteration-boundary fallback checkpoint (Decision 10b analogue): fetch-back WITHOUT
+        // reaping so a backgrounded dev server the lead means to reuse survives, and the SAME
+        // provider root/epoch drives the next turn (no recreation). Best-effort.
+        await ctx.checkpoint?.({ reap: false, progress: latestProgress });
+      }
 
       return { branch: ctx.branch };
     } finally {
-      // Terminal cleanup (m4 F1): a BACKSTOP that reaps+disposes the registry ONLY when NO
-      // runner sink will (deferRegistryTeardown unset); otherwise it leaves the registry ALIVE
-      // for the runner's post-run durability sinks and only tears down the executor-owned
-      // harness/transport, fileop handle and credential-free store.
-      await this.terminalCleanup(registry, harness, fileopHandle, storeDir, boundaryDeadlineMs);
-      // (C) Evict the DURING-run released tokens (provider-root launches) from the logger's
-      // secret set — AFTER the harness/transport is closed above, so no late log line can
-      // still carry the token. `removeSecret` is reference-counted. `clear()` so the terminal
-      // dispose hook (which evicts the POST-RUN sink tokens) does not double-remove these:
-      // under deferRegistryTeardown this finally runs BEFORE the post-run sinks, so those
-      // sink-released tokens are evicted by the onDispose hook wired into safety.dispose.
+      // Terminal (m4 F1). Capture the FINAL epoch's credential-free session into the store so a
+      // park/preserve resume can adopt it (the runner's runHome lifecycle — preserve on park,
+      // remove on terminal — now OWNS store removal; the executor only ever persists, NEVER
+      // removes). Then tear down the final epoch: under deferRegistryTeardown leave its registry
+      // ALIVE for the runner's post-run durability sinks (which reap the provider root and then
+      // safety.dispose it), else BACKSTOP the registry teardown here. Intermediate epochs were
+      // already fully disposed at their recreation. `epoch` is undefined only if the FIRST
+      // startProviderEpoch threw before building an epoch — the token eviction below still runs.
+      if (epoch) {
+        await epoch.persistSession();
+        await this.tearDownEpoch(epoch.registry, epoch.harness, epoch.fileopHandle, boundaryDeadlineMs, !this.deps.deferRegistryTeardown);
+      }
+      // (C) Evict the DURING-run released tokens (every epoch's provider-root launches + refreshes)
+      // from the logger's secret set — AFTER the harness/transport is closed above, so no late log
+      // line can still carry a token. `removeSecret` is reference-counted. `clear()` so the terminal
+      // dispose hook (which evicts the POST-RUN sink tokens) does not double-remove these: under
+      // deferRegistryTeardown this finally runs BEFORE the post-run sinks, so those sink-released
+      // tokens are evicted by the onDispose hook wired into the FINAL epoch's safety.dispose.
       for (const token of releasedTokens) this.log.removeSecret(token);
       releasedTokens.clear();
+      // Remove the per-run provisioning dir (the synthesized devbox.json + profile symlinks).
+      // The nix STORE is global (on the data volume), NOT here, so this never evicts the
+      // warm-start cache. Best-effort, mirroring sdk-executor. Absent ⇒ nothing was provisioned.
+      if (provisionDir) await fs.rm(provisionDir, { recursive: true, force: true }).catch(() => undefined);
     }
+  }
+
+  // ─── the per-epoch provider bundle (m4: new-root resume) ──────────────────────
+  /**
+   * Build ONE fresh provider epoch: a NEW {@link ExecutionRegistry} (a distinct local-execution
+   * epoch), a FRESHLY-released committed credential, the app-server auth session on that token,
+   * the registry-bound safety facade, the fileop/command effect roots, the phase-correct broker
+   * builder + delegation runner, and the provider {@link CodexHarness} that adopts the
+   * credential-free session subset into a per-epoch owned HOME. Everything per-run (the released-
+   * token set, the committed-generation cell, the tool-handler map, the reconcile + eviction
+   * closures, provisioning) is SHARED via {@link EpochSharedContext}; this only mints what a fresh
+   * provider root needs. Returns a self-disposing {@link ProviderEpoch}.
+   *
+   * A recreated provider root REQUIRES a brand-new registry: after a durability boundary the prior
+   * registry is permanently `"closed"` and denies `reserveLaunch("provider")` forever, and the
+   * app-server auth session cannot move between transports — so both are minted afresh here.
+   *
+   * On ANY failure mid-build the partial epoch is best-effort torn down before rethrowing, so a
+   * failed recreation never leaks a half-built registry/harness/fileop.
+   */
+  private async startProviderEpoch(
+    ctx: RunContext,
+    shared: EpochSharedContext,
+    resumeSessionId: string | undefined,
+    epochIndex: number,
+  ): Promise<ProviderEpoch> {
+    const {
+      provider, binding, worktreePath, storeDir, homeRoot, boundaryDeadlineMs, childTurnDeadlineMs,
+      commandEnv, screenPolicy, toolHandlers, registerToken, committedGeneration, launchEffectRoot,
+      spawnBoundaryRoot, boundaryProcessSpawner, reconcile, evictTokens,
+    } = shared;
+
+    // Each epoch gets its OWN owned data root / codexHome (M3a fresh-home semantics), so a
+    // recreated provider root never inherits the prior root's auth/cache material; it adopts the
+    // credential-free session subset from the SHARED store instead.
+    const ownedDataRoot = path.join(homeRoot, "codex-data", `epoch-${epochIndex}`);
+    const codexHome = path.join(ownedDataRoot, "codex");
+    const registry = new ExecutionRegistry(newLocalExecutionEpoch(epochIndex));
+    // The safety facade is bound to THIS registry but carries the SHARED reconcile + eviction
+    // closures (so credential/generation state is continuous across epochs). Only the FINAL
+    // epoch's safety.dispose ever runs evictTokens (an abandoned epoch's dispose tears its
+    // registry down directly, never through this facade).
+    const safety = createCodexExecutionSafety(registry, spawnBoundaryRoot, reconcile, evictTokens, boundaryProcessSpawner);
+
+    let harness: CodexHarness | undefined;
+    let fileopHandle: FileopHelperHandle | undefined;
+    try {
+      // Release a FRESH committed credential for THIS provider root (fail-closed: a
+      // capability/ownership loss rejects, never degrades to an un-credentialed root). Registered
+      // with the redactor + tracked for terminal eviction BEFORE any use; it seeds the app-server
+      // login (the token flows over `account/login/start`, NEVER the launcher env).
+      const initialToken = await this.releaseInitialCredential(ctx, registerToken, committedGeneration);
+
+      // The pinned app-server auth owner is built per epoch on the fresh token (it binds to ONE
+      // transport and cannot move — see appserver-auth.ts). Subscription carries the SHARED-cell
+      // refresh bridge; api_key carries no bridge.
+      const authConfig: CodexAppServerAuthConfig = binding.authMode === "subscription"
+        ? {
+            mode: "subscription",
+            initial: { accessToken: initialToken, accountId: binding.chatgptAccountId },
+            bridge: buildAppServerRefreshBridge(ctx.runId, this.opts.client, binding, committedGeneration, registerToken),
+          }
+        : { mode: "api_key", apiKey: initialToken };
+      const appServerAuth = createCodexAppServerAuth(authConfig);
+
+      // (4) The command + fileop effect surfaces, registered in THIS epoch's registry. Route the
+      // SCRUBBED command-identity env THROUGH the seam so an injected seam records it too.
+      const baseSpawnCommand = this.deps.spawnCommand ?? makeDefaultSpawnCommand(
+        registry,
+        launchEffectRoot,
+        boundaryDeadlineMs,
+        worktreePath,
+        commandEnv,
+      );
+      const spawnCommand: SpawnCommandSeam = (argv, spawnOpts) => baseSpawnCommand(argv, { ...spawnOpts, env: commandEnv });
+      const fileopRoot = await launchRegisteredEffectRoot(
+        registry,
+        launchEffectRoot,
+        commandEffectSpec(worktreePath, worktreePath, FILEOP_BIN, ["--root", worktreePath], commandEnv),
+        boundaryDeadlineMs,
+        "command",
+      );
+      try {
+        fileopHandle = (this.deps.wireFileop ?? wireFileopHelper)({
+          stdin: fileopRoot.handle.transport.stdin,
+          stdout: fileopRoot.handle.transport.stdout,
+        });
+      } catch (error) {
+        await registry.reapRoot(fileopRoot.root, boundaryDeadlineMs);
+        throw error;
+      }
+      const fileop: FileopClient = fileopHandle.client;
+
+      // (5) The composition cycle (harness → broker → delegation → harness) is resolved by
+      // late-binding `harness`: the delegation seam captures it by reference and is only invoked
+      // once a spawn_agent callback fires, by which point `harness` is assigned.
+      //
+      // (3) PHASE-CORRECT broker + delegation, PER TURN, bound to THIS registry/fileop/spawnCommand
+      // and the SHARED per-run tool-handler map. The broker enforces the plan-phase file-write ban
+      // through `grants.phase`, so it MUST be phase-correct for the turn it serves; the harness
+      // re-points it via useBroker before each turn.
+      const providerLaunchRoot = this.deps.launchProviderRoot ?? defaultLaunchProviderRoot;
+      const buildPhaseBroker = (phase: "plan" | "implement", signal?: AbortSignal): CodexCallbackBroker => {
+        const runPlan = buildCodexRunPlan(
+          this.buildRunRequest(ctx, phase, this.phasePrompt(ctx, phase), undefined, new AbortController().signal),
+        );
+        const delegationRunner = new CodexDelegationRunner({
+          registry,
+          roles: runPlan.roles,
+          startChildTurn: (spec: StartChildTurnSpec) => this.startChildTurn(harness!, provider, worktreePath, spec),
+          spawnCommand,
+          fileop,
+          worktreePath,
+          toolHandlers,
+          screenPolicy,
+          signal,
+          childTurnDeadlineMs,
+        });
+        return new CodexCallbackBroker({
+          registry,
+          spawnCommand,
+          fileop,
+          worktreePath,
+          grants: runPlan.lead.grants,
+          delegate: delegationRunner.toDelegateSeam(),
+          toolHandlers,
+          allowedRoles: runPlan.allowedRoles,
+          screenPolicy,
+          signal,
+        });
+      };
+      // Seed the harness with the PLAN-phase broker (the fail-safe default: writes denied).
+      const planBroker = buildPhaseBroker("plan");
+
+      // The provider launch seam (part D): adopt the credential-free session subset from the
+      // SHARED store into THIS epoch's fresh HOME, then launch the provider root under app-server
+      // auth (the launcher injects NO env credential — the token flows over the login RPC).
+      const providerLaunchSeam: LaunchRootSeam = async (spec) => {
+        await this.sessionStore.adopt(storeDir, codexHome).catch(() => undefined);
+        return providerLaunchRoot(spec, binding.authMode);
+      };
+
+      harness = new CodexHarness({
+        registry,
+        launchRoot: providerLaunchSeam,
+        broker: planBroker,
+        provider,
+        workspace: worktreePath,
+        homeDir: ownedDataRoot,
+        log: this.log,
+        sessionInspect: () => this.sessionStore.inspect(storeDir),
+        appServerAuth,
+      });
+
+      const epochHarness = harness;
+      const epochFileop = fileopHandle;
+      return {
+        registry,
+        safety,
+        harness: epochHarness,
+        fileopHandle: epochFileop,
+        spawnCommand,
+        fileop,
+        codexHome,
+        resumeSessionId,
+        buildPhaseBroker,
+        // Persist THIS epoch's credential-free session subset into the SHARED store. Best-effort:
+        // a persist failure never blocks the reap/recreation (the store fails safe to a fresh
+        // session on the next adopt).
+        persistSession: async (): Promise<void> => {
+          await this.sessionStore.persist(codexHome, storeDir).catch(() => undefined);
+        },
+        // Full teardown of an ABANDONED epoch on recreation: quiesce + reap (best-effort) +
+        // disposeTools the registry (WITHOUT the onDispose token-eviction hook — a live token must
+        // survive into the next epoch), then close the harness/transport and dispose the fileop.
+        dispose: async (): Promise<void> => {
+          await this.tearDownEpoch(registry, epochHarness, epochFileop, boundaryDeadlineMs, true);
+        },
+      };
+    } catch (error) {
+      // Never leak a half-built epoch (especially a failed recreation, where run()'s `epoch` still
+      // points at the PREVIOUS live epoch): best-effort tear down whatever this build produced.
+      await this.tearDownEpoch(registry, harness, fileopHandle, boundaryDeadlineMs, true).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  /**
+   * Tear down one provider epoch. When `disposeRegistry` is true (an abandoned epoch on
+   * recreation, or the STANDALONE terminal backstop) it quiesces + reaps + disposes the registry;
+   * when false (the FINAL epoch under deferRegistryTeardown) it leaves the registry ALIVE for the
+   * runner's post-run durability sinks. The harness/transport and fileop CLIENT are executor-owned
+   * and always closed here (idempotently, guarded for a setup failure that reached this before
+   * either was built). The registry teardown here NEVER runs the onDispose token-eviction hook —
+   * that fires only through the FINAL epoch's `safety.dispose` at the true terminal.
+   */
+  private async tearDownEpoch(
+    registry: ExecutionRegistry,
+    harness: CodexHarness | undefined,
+    fileopHandle: FileopHelperHandle | undefined,
+    deadlineMs: number,
+    disposeRegistry: boolean,
+  ): Promise<void> {
+    if (disposeRegistry && registry.state() !== "disposed") {
+      try {
+        const q = await registry.quiesceChildren(deadlineMs);
+        if (q.kind === "quiescent") await registry.reapProcesses(deadlineMs, q.epoch);
+      } catch {
+        /* best-effort terminal reap; the safety facade owns the poison bookkeeping */
+      }
+      try {
+        await registry.disposeTools(deadlineMs);
+      } catch {
+        /* idempotent dispose */
+      }
+    }
+    await harness?.close().catch(() => undefined);
+    await fileopHandle?.dispose().catch(() => undefined);
   }
 
   // ─── the per-turn drive (run-lane precedence, Codex-specific) ─────────────────
@@ -846,20 +1458,53 @@ export class CodexExecutor implements Executor {
     return new Error(reason);
   }
 
-  // ─── the per-sink auth-mode reconcile closure (m4, part 4) ────────────────────
+  // ─── the initial credential release + per-sink auth-mode reconcile closure ────
+  /**
+   * Release the currently-committed access token (both auth modes) for a fresh provider root —
+   * called once PER EPOCH (every provider-root start/resume freshly releases the committed
+   * credential). Fails CLOSED (throws) on any release error — a capability/ownership loss must
+   * reject the run, never degrade to an un-credentialed root. The freshly-released token is
+   * registered with the redactor (via `registerToken`) before it is used to seed the app-server
+   * login credential. For subscription the minimum-generation floor is the SHARED committed cell
+   * (a during-run refresh may have advanced it past the binding's initial generation), falling back
+   * to the binding's generation when the cell is unset.
+   */
+  private async releaseInitialCredential(
+    ctx: RunContext,
+    registerToken: (token: string) => void,
+    committed: CodexCommittedGenerationCell,
+  ): Promise<string> {
+    const binding = this.opts.binding;
+    const expected = binding.authMode === "subscription"
+      ? {
+          authMode: "subscription" as const,
+          chatgptAccountId: binding.chatgptAccountId,
+          minimumGeneration: committed.value ?? binding.generation,
+        }
+      : { authMode: "api_key" as const };
+    const released = await this.opts.client.releaseCodex(
+      ctx.runId,
+      { capability: binding.capability },
+      expected,
+      ctx.signal,
+    );
+    registerToken(released.access_token); // BEFORE any use
+    return released.access_token;
+  }
+
   /**
    * The executor-owned auth-mode reconcile closure the safety facade runs BEFORE every boundary
    * quiesce/reap/mint. Delegates to the standalone {@link buildRunLaneReconcile} (pinned by the
-   * differential test against the advice bridge), registering any fresh token with the redactor
-   * and tracking it for terminal eviction (part C), the same as a provider-root release.
+   * differential test against the advice bridge), sharing the run's ONE committed-generation cell
+   * and `registerToken` closure so the boundary reconcile and the app-server refresh bridge never
+   * keep private state (part C / m1).
    */
-  private makeBoundaryReconcile(runId: string, releasedTokens: Set<string>): ReconcileBeforeBoundary {
-    const log = this.log;
-    return buildRunLaneReconcile(runId, this.opts.client, this.opts.binding, (token) => {
-      if (!token || releasedTokens.has(token)) return;
-      log.addSecret(token); // BEFORE any use; balanced by removeSecret in the terminal dispose hook (post-run sinks) or run()'s finally (during-run)
-      releasedTokens.add(token);
-    });
+  private makeBoundaryReconcile(
+    runId: string,
+    registerToken: (token: string) => void,
+    committed: CodexCommittedGenerationCell,
+  ): ReconcileBeforeBoundary {
+    return buildRunLaneReconcile(runId, this.opts.client, this.opts.binding, registerToken, committed);
   }
 
   // ─── the child-turn demux seam (part C) ───────────────────────────────────────
@@ -982,45 +1627,6 @@ export class CodexExecutor implements Executor {
     return `${head}\n\n${ctx.issueDescription}`;
   }
 
-  // ─── terminal cleanup (m4 F1: the relocated registry teardown + backstop) ─────
-  private async terminalCleanup(
-    registry: ExecutionRegistry,
-    harness: CodexHarness,
-    fileopHandle: FileopHelperHandle,
-    storeDir: string,
-    deadlineMs: number,
-  ): Promise<void> {
-    // PRD #1171 m4 (F1): the REGISTRY teardown (quiesce → reap → disposeTools) is RELOCATED to
-    // the runner when it drives this executor. Its post-run durability sinks
-    // (park/shutdown/finalize) reap the provider root through `withBoundary` AFTER run()
-    // returns, and the runner's executeClaim finally calls `safety.dispose` once the last sink
-    // settles — so the registry must stay ALIVE here. `deferRegistryTeardown` therefore SKIPS
-    // the registry teardown in that mode. When it is NOT set (a STANDALONE executor with no
-    // runner sink — a direct caller, or an exception before/around the model turns), this
-    // finally is the SOLE teardown, so it BACKSTOPS the registry here: reap+dispose the
-    // provider root so it is torn down on every no-sink path. disposeTools is idempotent, so a
-    // later runner dispose can never double-dispose.
-    if (!this.deps.deferRegistryTeardown && registry.state() !== "disposed") {
-      try {
-        const q = await registry.quiesceChildren(deadlineMs);
-        if (q.kind === "quiescent") await registry.reapProcesses(deadlineMs, q.epoch);
-      } catch {
-        /* best-effort terminal reap; the safety facade owns the poison bookkeeping */
-      }
-      try {
-        await registry.disposeTools(deadlineMs);
-      } catch {
-        /* idempotent dispose */
-      }
-    }
-    // The harness/transport, the fileop helper and the credential-free session store are
-    // EXECUTOR-owned (not the registry) — always torn down here, idempotently, on every path.
-    await harness.close().catch(() => undefined);
-    await fileopHandle.dispose().catch(() => undefined);
-    // The session subset is credential-free and re-seeded on the next claim's adopt, so it
-    // is removed at the terminal boundary. (A park/resume-preserve carve-out is m4/m5.)
-    await this.sessionStore.remove(storeDir).catch(() => undefined);
-  }
 }
 
 // ─── production seam defaults (DARK; tests inject fakes) ────────────────────────
@@ -1120,6 +1726,37 @@ export function commandSandboxArgv(
     "--cwd", workCwd,
     "--", command, ...args,
   ];
+}
+
+/**
+ * Build the fully-REPLACED credential-free command-identity env: the FIXED
+ * toolchain+system PATH ({@link COMMAND_ENV_PATH}), TMPDIR and LANG, folding in the run's
+ * allowlisted provisioned `toolEnv` (bounded upstream by PROVISION_ENV_ALLOWLIST to
+ * {PATH, NIX_SSL_CERT_FILE, LOCALE_ARCHIVE}). NOTHING from process.env is inherited.
+ *
+ *   - PATH: the fixed boundary dirs come FIRST and are ALWAYS present; a provisioned
+ *     `toolEnv.PATH` is APPENDED after them, so provisioned tools resolve but can never
+ *     displace or drop the boundary dirs (the fixed prefix always wins on a collision).
+ *   - the OTHER allowlisted vars (NIX_SSL_CERT_FILE / LOCALE_ARCHIVE) are folded in.
+ *   - a `toolEnv` entry can NEVER overwrite a boundary literal (PATH/TMPDIR/LANG/HOME) or a
+ *     PROTECTED_ENV_KEYS member — {@link COMMAND_ENV_PROTECTED_KEYS} unions both, because
+ *     PROTECTED_ENV_KEYS alone omits PATH/TMPDIR/LANG. `commandEffectSpec` later overrides
+ *     HOME/TMPDIR to the per-command private tmp, so those stay boundary-safe regardless.
+ */
+export function buildCommandEnv(tmpdir: string, toolEnv: Record<string, string>): NodeJS.ProcessEnv {
+  const provisionedPath = toolEnv.PATH;
+  const env: NodeJS.ProcessEnv = {
+    // The fixed boundary dirs come first; a provisioned PATH is appended (never prepended,
+    // never substituted), so a provisioned entry cannot shadow a boundary dir.
+    PATH: provisionedPath ? `${COMMAND_ENV_PATH}:${provisionedPath}` : COMMAND_ENV_PATH,
+    TMPDIR: tmpdir,
+    LANG: "C",
+  };
+  for (const [k, v] of Object.entries(toolEnv)) {
+    if (COMMAND_ENV_PROTECTED_KEYS.has(k)) continue; // never breach the boundary / reintroduce a credential key
+    env[k] = v;
+  }
+  return env;
 }
 
 function commandEffectSpec(
@@ -1265,17 +1902,18 @@ function makeBoundaryProcessSpawner(
 }
 
 /** Adapt the real M3a launcher for a PROVIDER root. Builds the launcher-fixed spec (the
- *  pinned binary/supervisor/argv), launches, and adapts the {@link CodexRootHandle} into a
- *  registry-ownable {@link RegisteredRoot} + the app-server transport. DARK: never run in
- *  tests (a fake `launchProviderRoot` is injected). */
-async function defaultLaunchProviderRoot(spec: CodexLaunchRootSpec, credential: string): Promise<CodexLaunchRootResult> {
+ *  pinned binary/supervisor/argv) under APP-SERVER AUTH — the launcher emits the production
+ *  config and injects NO env credential; the credential enters over the login RPC — launches,
+ *  and adapts the {@link CodexRootHandle} into a registry-ownable {@link RegisteredRoot} + the
+ *  app-server transport. DARK: never run in tests (a fake `launchProviderRoot` is injected). */
+async function defaultLaunchProviderRoot(spec: CodexLaunchRootSpec, authMode: CodexAppServerAuthMode): Promise<CodexLaunchRootResult> {
   const handle = await launchCodexRoot({
     ownedDataRoot: spec.ownedDataRoot,
+    // No credentialValue: the token flows over `account/login/start`, never the launcher env.
     provider: {
       name: spec.provider.name,
       baseUrl: spec.provider.baseUrl,
       envKey: spec.provider.envKey,
-      credentialValue: credential,
     },
     model: spec.model,
     codexBin: CODEX_BIN,
@@ -1283,6 +1921,8 @@ async function defaultLaunchProviderRoot(spec: CodexLaunchRootSpec, credential: 
     kind: "provider",
     childArgv: [...PROVIDER_CHILD_ARGV],
     cwd: spec.cwd,
+    useAppServerAuth: true,
+    authMode,
   });
   const stdout = handle.transport.stdout;
   const stdin = handle.transport.stdin;

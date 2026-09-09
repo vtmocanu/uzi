@@ -252,6 +252,69 @@ describe("launchCodexRoot: env allowlist, trees, argv", () => {
   });
 });
 
+describe("launchCodexRoot: app-server auth (production config, no env credential)", () => {
+  it("useAppServerAuth emits the PRODUCTION config and injects NO provider env credential", async () => {
+    const fake = newFake();
+    // The spec still carries a provider credentialValue; under app-server auth the launcher
+    // must NOT propagate it to the env (the token flows over the login RPC, not /proc environ).
+    await launchCodexRoot(baseSpec({ useAppServerAuth: true, authMode: "subscription" }), baseDeps(fake));
+    const env = spawnCalls[0]?.options.env ?? {};
+    assert.equal(env.CODEX_PROVIDER_KEY, undefined, "no provider credential var under app-server auth");
+    assert.equal(Object.keys(env).includes("CODEX_PROVIDER_KEY"), false);
+    // Exactly the base allowlist, MINUS the provider credential var.
+    assert.deepEqual(
+      Object.keys(env).sort(),
+      [
+        "CODEX_HOME", "HOME", "LANG", "PATH", "SHELL", "TERM", "TMPDIR",
+        "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME",
+      ].sort(),
+    );
+    // The config is buildCodexProductionConfigToml: native-disabled lines + the built-in
+    // `openai` provider, with NO re-declared [model_providers.*] table (which would set
+    // requires_openai_auth=false and BYPASS the account/login/start the auth session performs).
+    const configFile = treeCalls[0]?.files[0];
+    assert.ok(configFile);
+    assert.match(configFile.content, /project_doc_max_bytes = 0/);
+    assert.match(configFile.content, /trust_level = "untrusted"/);
+    assert.match(configFile.content, /model_provider = "openai"/);
+    assert.doesNotMatch(configFile.content, /\[model_providers\./, "production config declares no custom provider table");
+    assert.doesNotMatch(configFile.content, /requires_openai_auth/);
+    assert.doesNotMatch(configFile.content, /base_url/);
+  });
+
+  it("the ABSENT flag keeps the transitional env-key path (custom table + injected credential)", async () => {
+    const fake = newFake();
+    await launchCodexRoot(baseSpec(), baseDeps(fake)); // no useAppServerAuth
+    const env = spawnCalls[0]?.options.env ?? {};
+    assert.equal(env.CODEX_PROVIDER_KEY, "dummy-key", "the transitional path still injects the credential var");
+    const configFile = treeCalls[0]?.files[0];
+    assert.ok(configFile);
+    assert.match(configFile.content, /\[model_providers\./, "the transitional path declares the custom provider table");
+    assert.match(configFile.content, /requires_openai_auth = false/);
+  });
+
+  it("rejects useAppServerAuth without an explicit auth mode (fail-closed, before provisioning)", async () => {
+    const fake = newFake();
+    await assert.rejects(
+      launchCodexRoot(baseSpec({ useAppServerAuth: true }), baseDeps(fake)),
+      /app-server auth requires an explicit/,
+    );
+    assert.equal(treeCalls.length, 0);
+    assert.equal(spawnCalls.length, 0);
+  });
+
+  it("rejects useAppServerAuth on a non-provider (command) root", async () => {
+    const fake = newFake({ uid: COMMAND_UID });
+    await assert.rejects(
+      launchCodexRoot(
+        baseSpec({ kind: "command", childArgv: ["exec"], useAppServerAuth: true, authMode: "api_key" }),
+        baseDeps(fake),
+      ),
+      /only supported for a provider root/,
+    );
+  });
+});
+
 describe("launchCodexEffectRoot: supervised command identity", () => {
   it("launches uid 10003 with a replaced env and reports the primary child status", async () => {
     const fake = newFake({ uid: COMMAND_UID });

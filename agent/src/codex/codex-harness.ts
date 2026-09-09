@@ -34,8 +34,12 @@
 //   turn/started              → `activity`
 //   item/completed (agent msg)→ `frame` (text/thinking items + call-basis usage + model)
 //   item/* (deltas, other)    → `activity`  (Codex item updates are activity)
-//   item/tool/call (id-bearing)→ intercepted: broker route + `transport.respond`, then
-//                               yielded as `activity` (NOT a frame)
+//   item/tool/call (id-bearing)→ intercepted: broker route + `transport.respond`; a DENIED,
+//                               non-signal, delegation or child/foreign/stale call is yielded
+//                               as `activity` (NOT a frame), while an ACCEPTED ROOT SIGNAL call
+//                               (submit_plan/signal_done/checkpoint/progress/questions) ALSO
+//                               yields a main-origin `frame` carrying the scanned `signals` so
+//                               the run-lane reducer folds them (the model reply is unchanged)
 //   auth refresh request      → narrow auth owner (never broker), then `activity`
 //   other server→client req   → fail-closed JSON-RPC method error, then `activity`
 //   turn/completed            → `turn_finished` (decoded terminal; success/failed by
@@ -47,7 +51,7 @@
 // {@link CodexHarnessError} throw (Claude's clean-EOF `exhausted` is unaffected).
 
 import { renderCodexRun } from "./render.js";
-import { CODEX_DELEGATE_TOOLS, canonicalizeCodexToolName } from "./broker.js";
+import { CODEX_DELEGATE_TOOLS, CODEX_SIGNAL_TOOLS, canonicalizeCodexToolName } from "./broker.js";
 import { normalizeCodexStatus, normalizeCodexTerminalErrors, normalizeCodexUsage } from "./terminal-normalize.js";
 
 import type { Logger } from "../log.js";
@@ -66,6 +70,7 @@ import type {
   RunTurnRequest,
   SessionPresence,
   ToolDisposal,
+  TurnSignals,
 } from "../harness.js";
 import type { CallbackResult, CodexCallbackBroker } from "./broker.js";
 import type { CodexAppServerAuthSession } from "./appserver-auth.js";
@@ -206,6 +211,15 @@ function extractText(item: Record<string, unknown>): string[] {
  *  of the unadmitted root so it cannot hang the setup throw. */
 const REGISTRY_ADMISSION_TEARDOWN_DEADLINE_MS = 1000;
 
+/** What {@link CodexHarness.routeToolCall} hands back to {@link CodexHarness.mapNote} on the
+ *  INLINE path when the broker ACCEPTED a TRUSTED ROOT workflow-signal callback: the scanned
+ *  `signals` the reducer folds. It exists ONLY for a signal tool the active root turn owns —
+ *  every non-signal, denied, delegation or non-active-turn outcome returns `undefined`, so a
+ *  signals frame is emitted only where the authority gates already admitted a root signal. */
+interface RoutedRootSignal {
+  readonly signals: Readonly<Partial<TurnSignals>>;
+}
+
 // --- the harness --------------------------------------------------------------
 
 export class CodexHarness implements RunHarness {
@@ -248,7 +262,7 @@ export class CodexHarness implements RunHarness {
   // whose frames this root loop demuxes, so it CANNOT be awaited inline (that would
   // deadlock the transport read). It runs in the background, tracked here, and the turn
   // stream flushes it before ending. Every non-delegate callback stays inline.
-  private readonly pendingToolCalls = new Set<Promise<void>>();
+  private readonly pendingToolCalls = new Set<Promise<unknown>>();
 
   // Per-turn state (turns run strictly sequentially).
   private activeTurnId?: string;
@@ -762,7 +776,25 @@ export class CodexHarness implements RunHarness {
           // A server→client request. Only the tool-call lane routes to the broker; any
           // other server-initiated request is answered fail-closed as unsupported.
           if (note.method === "item/tool/call") {
-            await this.routeToolCall(transport, note.requestId, note.params);
+            const routed = await this.routeToolCall(transport, note.requestId, note.params);
+            if (routed !== undefined) {
+              // A TRUSTED ROOT signal callback the broker ACCEPTED (submit_plan/signal_done/
+              // checkpoint/report_progress/questions): surface its scanned signals as a
+              // main-origin frame so the run-lane reducer's foldSignals fires. The model reply
+              // already went out via routeToolCall (replyOf) — this frame is IN ADDITION, never
+              // instead. Every other tool call (denied, non-signal, delegation, or a child/
+              // foreign/stale identity) returns undefined and falls through to the
+              // byte-identical `activity` below.
+              return {
+                kind: "frame",
+                origin: { kind: "main" },
+                attribution: {},
+                items: [],
+                signals: routed.signals,
+                model: this.currentModel,
+                sessionId: this.threadId,
+              };
+            }
           } else {
             try {
               transport.respond(note.requestId, { error: { code: -32601, message: "unsupported request" } });
@@ -788,8 +820,19 @@ export class CodexHarness implements RunHarness {
    *  and the broker is never called. When the broker IS called, the reply is sent ONLY AFTER
    *  it settles (a broker deny is a FAILED tool RESULT — `success:false` — not a JSON-RPC
    *  error, mirroring the M0 policy-broker). Authority over WHAT a matched callback may do
-   *  stays the broker's; the harness only gates WHICH turn's callbacks reach it. */
-  private routeToolCall(transport: CodexTransport, requestId: number | string, params: unknown): Promise<void> {
+   *  stays the broker's; the harness only gates WHICH turn's callbacks reach it.
+   *
+   *  RETURN: a {@link RoutedRootSignal} ONLY when the accepted callback was a TRUSTED ROOT
+   *  workflow signal (the caller surfaces its scanned signals on a main-origin frame the
+   *  reducer folds); `undefined` for every other outcome — a stale/foreign/absent identity, a
+   *  denied signal, a backgrounded DELEGATION, or a non-signal effect (shell/file/mcp) — none
+   *  of which may move the run's workflow, so none emits a signals frame. The model reply is
+   *  identical in every case (via {@link replyOf}); the return only carries the fold input. */
+  private async routeToolCall(
+    transport: CodexTransport,
+    requestId: number | string,
+    params: unknown,
+  ): Promise<RoutedRootSignal | undefined> {
     const p = asObject(params) ?? {};
     // A callback is served ONLY for the ACTIVE root turn. We bind on BOTH the raw thread
     // id AND the raw turn id (never folded to this.threadId/activeTurnId), so an absent/
@@ -809,9 +852,9 @@ export class CodexHarness implements RunHarness {
       rawTurnId === this.activeTurnId;
     if (!matchesActive) {
       this.safeRespond(transport, requestId, { ok: false, code: "not_active_turn", message: "callback does not match the active turn" });
-      return Promise.resolve();
+      return undefined;
     }
-    const runAndReply = async (): Promise<void> => {
+    const runAndReply = async (): Promise<CallbackResult> => {
       let result: CallbackResult;
       try {
         // A matched callback is, by construction, the root turn's — origin is "root".
@@ -820,24 +863,36 @@ export class CodexHarness implements RunHarness {
         result = { ok: false, code: "broker_error", message: "the callback failed" };
       }
       this.safeRespond(transport, requestId, result);
+      return result;
     };
+    const toolName = asString(p.tool);
+    const canonical = toolName !== undefined ? canonicalizeCodexToolName(toolName) : undefined;
     // A DELEGATION callback (spawn_agent / the collaboration*/Subagent* family) drives a
     // CHILD turn whose frames THIS root loop demuxes off the SAME transport
     // (registerChildSink). It therefore MUST run CONCURRENTLY with continued note
     // consumption — awaiting it inline would deadlock, because the child's frames would
     // never be read. It runs in the background, tracked in `pendingToolCalls`, and the
     // turn stream flushes it before ending; the broker's own delegate seam guarantees the
-    // child settles before this callback (the parent spawn_agent) resolves. EVERY OTHER
-    // callback is awaited inline exactly as before, so the non-delegation path is
-    // byte-identical (the abort race in runTurn still bounds a wedged inline callback).
-    const toolName = asString(p.tool);
-    if (toolName !== undefined && CODEX_DELEGATE_TOOLS.has(canonicalizeCodexToolName(toolName))) {
+    // child settles before this callback (the parent spawn_agent) resolves. A delegation is
+    // never a workflow signal, so it emits NO signals frame. EVERY OTHER callback is awaited
+    // inline exactly as before, so the non-delegation path is byte-identical (the abort race
+    // in runTurn still bounds a wedged inline callback).
+    if (canonical !== undefined && CODEX_DELEGATE_TOOLS.has(canonical)) {
       const task = runAndReply();
       this.pendingToolCalls.add(task);
       void task.finally(() => this.pendingToolCalls.delete(task));
-      return Promise.resolve();
+      return undefined;
     }
-    return runAndReply();
+    const result = await runAndReply();
+    // Route a TRUSTED ROOT SIGNAL callback's scanned result into the run-lane reducer: when
+    // the tool canonicalizes to a signal tool AND the broker ACCEPTED it, `result.output` is
+    // the scanned Partial<TurnSignals> (broker.dispatchSignal returns `{ok:true, output:
+    // scanned}`), which the caller surfaces on a main-origin signals frame. A DENIED signal
+    // (result.ok === false) folds nothing; a non-signal effect (shell/file/mcp) is undefined.
+    if (canonical !== undefined && CODEX_SIGNAL_TOOLS.has(canonical) && result.ok) {
+      return { signals: result.output as Readonly<Partial<TurnSignals>> };
+    }
+    return undefined;
   }
 
   /** Reply to a server→client tool-call with a broker {@link CallbackResult}, mapped to the

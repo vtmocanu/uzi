@@ -63,10 +63,21 @@ UZI_CODEX_M3B_PACKAGED=1 task test:codex-m3b:packaged
 
 `test:codex-m3b:packaged` runs the host `tsc` (always) and, when `UZI_CODEX_M3B_PACKAGED=1` is
 set with a working docker daemon, builds both `base` and `jvm` images and runs
-`run-lifecycle.sh` inside each. `run-lifecycle.sh` runs the packaging controls **and** the
-lifecycle suite (Block A + Block B) under `--network none` + the read-only-root confinement
-posture, bounded by an outer `timeout --kill-after` watchdog, and asserts positive per-image
-`tests` / `callbacks` / `delegations` / `roots` counts.
+`run-lifecycle.sh` inside each. `run-lifecycle.sh` runs the packaging controls (`--network none`)
+**and** the lifecycle suite under the read-only-root confinement posture. For Block B's real-launch
+proof the lifecycle container joins a purpose-built `docker network create --internal` (no external
+egress) alongside a throwaway Postgres and a `codexm3btestserver` container that serves the real
+worker Bearer routes; the loopback fake OpenAI provider stays inside the worker container. It is
+bounded by an outer `timeout --kill-after` watchdog and asserts the positive per-image Block A
+`tests` / `callbacks` / `delegations` / `roots` counts **and** the Block B real-path counts
+(`ran===true`, nonzero login / provider turns / callbacks / delegation / registered+reaped
+provider+command roots / checkpoints / signals / refresh advance+replay / finalization, api_key
+refresh == 0). All throwaway containers/network/image are named outside the `uzi-` namespace and
+torn down by exact name.
+
+NOTE: the both-image docker EXECUTION is a CI/maintainer step — in-worker image builds are
+storage-flaky (they can fail with `No space left on device` building the nix/devbox toolchain), so
+the harness is authored + host-typechecked while the both-image run is executed where disk allows.
 
 `run.sh` is the lighter standalone entry that builds an image and runs only `controls.sh`.
 
@@ -91,8 +102,11 @@ and it is built so an automated / no-input invocation can never reach one:
   (image `/app/src`, or the host source tree). It does **not** import `main.ts` (which
   self-invokes the worker on import); the dark selection factory is loaded through its exported
   constituents.
-- `fake-provider.ts` — the localhost loopback `/v1/responses` fake + the shared `codexCanaries()`
-  and the image-leg `lifecycleResponder`.
+- `fake-provider.ts` — the localhost loopback `/v1/responses` fake (accept-any-bearer, records the
+  presented token for the canary-absence check) + the shared `codexCanaries()` and the image-leg
+  `recordingLifecycleResponder` / `countToolCallbacks`.
+- `testserver.Dockerfile` — builds `api/cmd/codexm3btestserver` (the real Bearer-route server) for
+  the Block B internal-network container.
 - `lifecycle.test.ts` — Block A (injected fakes, always) + Block B (real launch, image-only).
 - `run-lifecycle.sh` / `run.sh` / `controls.sh` — the image orchestrators + packaging controls.
 - `live.sh` — the maintainer-only real-provider entrypoint.

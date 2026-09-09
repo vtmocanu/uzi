@@ -253,7 +253,7 @@ func TestWorkerCodexRefreshRejectsUnadvanceableSafeIntegerMaximum(t *testing.T) 
 
 func TestCodexCredentialResponseWireModes(t *testing.T) {
 	t.Run("subscription includes verified account, generation, and explicit plan null", func(t *testing.T) {
-		b, err := json.Marshal(codexSubscriptionResponse{
+		b, err := json.Marshal(codexSubscriptionResponse{ //nolint:gosec // G117: "ACCESS-PLACEHOLDER" is a hardcoded test placeholder, not a real credential; this test asserts the JSON wire shape only.
 			AuthMode:         "subscription",
 			AccessToken:      "ACCESS-PLACEHOLDER",
 			Generation:       0,
@@ -270,7 +270,7 @@ func TestCodexCredentialResponseWireModes(t *testing.T) {
 	})
 
 	t.Run("api_key omits every subscription field", func(t *testing.T) {
-		b, err := json.Marshal(codexAPIKeyResponse{AuthMode: "api_key", AccessToken: "KEY-PLACEHOLDER"})
+		b, err := json.Marshal(codexAPIKeyResponse{AuthMode: "api_key", AccessToken: "KEY-PLACEHOLDER"}) //nolint:gosec // G117: "KEY-PLACEHOLDER" is a hardcoded test placeholder, not a real credential; this test asserts the JSON wire shape only.
 		if err != nil {
 			t.Fatalf("marshal api_key response: %v", err)
 		}
@@ -281,7 +281,7 @@ func TestCodexCredentialResponseWireModes(t *testing.T) {
 	})
 
 	t.Run("refresh repeats subscription authority", func(t *testing.T) {
-		b, err := json.Marshal(codexRefreshResponse{
+		b, err := json.Marshal(codexRefreshResponse{ //nolint:gosec // G117: "ACCESS-PLACEHOLDER" is a hardcoded test placeholder, not a real credential; this test asserts the JSON wire shape only.
 			AuthMode:         "subscription",
 			AccessToken:      "ACCESS-PLACEHOLDER",
 			Generation:       4,

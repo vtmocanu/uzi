@@ -3244,11 +3244,12 @@ export class RunRunner {
           // built INSIDE the reaped action (only when it will be used) so its PAT fetch never
           // precedes the reap.
           //
-          // DEFENSIVE (m4): m3's CodexExecutor never invokes ctx.checkpoint, so the Codex
-          // withBoundary branch here is UNREACHABLE for Codex in m4. A CONTINUING Codex
-          // checkpoint (reap:true-and-continue) stays CREDENTIAL-FREE until m5 — the boundary
-          // form is wired for completeness while the publish still runs through the credential-
-          // free body. A CodexBoundaryError would propagate; today it cannot arise here.
+          // CODEX (m4): a cooperative CodexExecutor checkpoint now invokes ctx.checkpoint({reap:true}),
+          // so this Codex withBoundary branch IS reached. reapForSink reads executor.safety fresh and a
+          // Codex run always sets it, so the per-sink auth-mode reconcile runs and the reap is credentialed
+          // (the executor then recreates the reaped provider epoch — see startProviderEpoch). A blocked
+          // reconcile (e.g. a transient refresh failure) surfaces a CodexBoundaryError that propagates and
+          // fails the run — the intended fail-closed behavior for a credentialed durability boundary.
           await this.reapForSink(
             executor,
             { boundary: "checkpoint", deadlineMs: this.codexBoundaryDeadlineMs },

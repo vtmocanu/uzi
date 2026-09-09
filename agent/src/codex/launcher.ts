@@ -45,7 +45,9 @@ import {
 import {
   assertNoUnexpectedSystemConfig as defaultAssertNoUnexpectedSystemConfig,
   buildCodexConfigToml,
+  buildCodexProductionConfigToml,
 } from "./config.js";
+import type { CodexAppServerAuthMode } from "./appserver-auth.js";
 
 // ─── Bounds (fixture-derived; supervisor-side limits are matched, not trusted) ────
 const MAX_EVIDENCE_LINES = 256;
@@ -99,6 +101,17 @@ export interface CodexLaunchSpec {
   readonly childArgv: readonly string[];
   /** The canonical project / launch cwd, provisioned untrusted in config.toml. */
   readonly cwd: string;
+  /** PRD #1171: when true, the root authenticates through the app-server login RPC
+   *  (`account/login/start`) rather than an env-key credential. `launchCodexRoot` then
+   *  emits the production `config.toml` ({@link buildCodexProductionConfigToml}, the
+   *  built-in `openai` provider with NO re-declared `[model_providers.*]` table that would
+   *  bypass the login) and {@link buildReplacedEnv} injects NO provider credential var for
+   *  this root — the credential enters over the transport, never the environment. Absent /
+   *  false keeps the transitional env-key path byte-identical. Provider roots only. */
+  readonly useAppServerAuth?: boolean;
+  /** The immutable app-server auth mode, REQUIRED when {@link useAppServerAuth} is set (the
+   *  production config builder forces an explicit no-fallback choice). Ignored otherwise. */
+  readonly authMode?: CodexAppServerAuthMode;
 }
 
 /** The privileged step that creates the runner-owned trees + writes the config. The
@@ -318,6 +331,14 @@ function validateLaunchContract(spec: CodexLaunchSpec): void {
   if (!/^[A-Z][A-Z0-9_]*$/.test(spec.provider.envKey) || RESERVED_PROVIDER_ENV_KEYS.has(spec.provider.envKey)) {
     throw new Error("provider envKey is invalid or reserved by the launcher allowlist");
   }
+  if (spec.useAppServerAuth) {
+    if (spec.kind !== "provider") {
+      throw new Error("app-server auth is only supported for a provider root");
+    }
+    if (spec.authMode !== "subscription" && spec.authMode !== "api_key") {
+      throw new Error("app-server auth requires an explicit subscription or api_key mode");
+    }
+  }
 }
 
 /** The fully-REPLACED env allowlist (never a merge of the worker's env): HOME,
@@ -338,7 +359,9 @@ function buildReplacedEnv(trees: OwnedTrees, spec: CodexLaunchSpec): NodeJS.Proc
     LANG: "C",
     TERM: "dumb",
   };
-  if (spec.kind === "provider" && spec.provider.credentialValue !== undefined) {
+  // An app-server-auth root delivers its credential over the login RPC, NOT the env: never
+  // inject the provider var for it (the credential must not be readable in /proc/<pid>/environ).
+  if (spec.kind === "provider" && !spec.useAppServerAuth && spec.provider.credentialValue !== undefined) {
     env[spec.provider.envKey] = spec.provider.credentialValue;
   }
   return env;
@@ -393,12 +416,26 @@ export async function launchCodexRoot(spec: CodexLaunchSpec, deps: LauncherDeps 
   // 3. Fresh per-launch trees, created RUNNER-OWNED 0700 via the injectable step.
   const trees = deriveOwnedTrees(spec.ownedDataRoot);
   const configPath = join(trees.codexHome, "config.toml");
-  // 4. Stock config.toml (native-off; canonical project untrusted), written 0600 as runner.
-  const configText = buildCodexConfigToml({
-    model: spec.model,
-    provider: { name: spec.provider.name, baseUrl: spec.provider.baseUrl, envKey: spec.provider.envKey, wireApi: "responses" },
-    projectPath: spec.cwd,
-  });
+  // 4. config.toml (native-off; canonical project untrusted), written 0600 as runner. An
+  //    app-server-auth provider root emits the PRODUCTION config (the built-in `openai`
+  //    provider, no re-declared table that would bypass the login); every other root keeps
+  //    the transitional env-key config, byte-identical to before this seam.
+  let configText: string;
+  if (spec.useAppServerAuth) {
+    // validateLaunchContract already refused an absent/invalid authMode; re-narrow for the
+    // (non-optional) production builder input rather than assert non-null.
+    const authMode = spec.authMode;
+    if (authMode !== "subscription" && authMode !== "api_key") {
+      throw new Error("app-server auth requires an explicit subscription or api_key mode");
+    }
+    configText = buildCodexProductionConfigToml({ model: spec.model, projectPath: spec.cwd, authMode });
+  } else {
+    configText = buildCodexConfigToml({
+      model: spec.model,
+      provider: { name: spec.provider.name, baseUrl: spec.provider.baseUrl, envKey: spec.provider.envKey, wireApi: "responses" },
+      projectPath: spec.cwd,
+    });
+  }
   (deps.makeRunnerTrees ?? defaultMakeRunnerTrees)({
     uid,
     kind: spec.kind,

@@ -3,9 +3,11 @@ import assert from "node:assert/strict";
 
 import { renderCodexRun, type RenderedCodexRun } from "../src/codex/render.js";
 import type { CodexRenderDiagnostic } from "../src/codex/render.js";
-import type { RunGrants } from "../src/codex/broker.js";
+import { isRecognizedCodexTool, type RunGrants } from "../src/codex/broker.js";
 import type { HarnessAgent, HarnessToolSet, RunTurnRequest } from "../src/harness.js";
 import { reportIncidentalIssueToolName } from "../src/findings-tools.js";
+import { memoryToolNames } from "../src/memory-tools.js";
+import { forgeToolNames } from "../src/forge-tools.js";
 
 // PRD #1171 (M2/M5) — the CLAUDE-RENDERER BYTE-IDENTITY MUTATION test.
 //
@@ -182,5 +184,56 @@ describe("Claude-renderer byte identity — mutation controls", () => {
     const members = [...coder.allowedTools].reverse();
     coder.allowedTools = new Set(members);
     assert.equal(serialize(reordered), golden, "reordering set members must not break byte identity");
+  });
+});
+
+// PRD #1171 M3 (item 5) — the forge/memory/findings vocabulary grant, mirroring agents.ts:
+// the LEAD (root) gets forge + memory + findings; a SUBAGENT gets findings but NEVER inherits
+// memory or forge; an explicit subagent allowlist may name a forge tool (recognized, kept) but
+// naming the memory tool is stripped by isSubagentForbidden.
+describe("Claude-parity vocabulary — forge/memory/findings grants", () => {
+  const FINDINGS_TOOL = reportIncidentalIssueToolName();
+  const MEMORY_TOOL = memoryToolNames()[0]!;
+  const FORGE_TOOLS = forgeToolNames();
+
+  it("the ROOT inherit vocabulary grants forge + memory + findings", () => {
+    const run = renderCodexRun(runRequest());
+    const lead = run.leadGrants.allowedTools;
+    assert.equal(lead.has(FINDINGS_TOOL), true, "lead keeps findings");
+    assert.equal(lead.has(MEMORY_TOOL), true, "lead gets memory");
+    for (const forge of FORGE_TOOLS) assert.equal(lead.has(forge), true, `lead gets ${forge}`);
+  });
+
+  it("a SUBAGENT inherit vocabulary grants findings but NOT memory and NOT forge", () => {
+    const run = renderCodexRun(runRequest({ agents: { helper: agent({ tools: { kind: "inherit" } }) } }));
+    const tools = run.perRoleGrants.get("helper")!.allowedTools;
+    assert.equal(tools.has(FINDINGS_TOOL), true, "subagent keeps findings (base)");
+    assert.equal(tools.has(MEMORY_TOOL), false, "subagent never inherits memory");
+    for (const forge of FORGE_TOOLS) assert.equal(tools.has(forge), false, `subagent never inherits ${forge}`);
+  });
+
+  it("forge + memory tool names are recognized by the broker vocabulary", () => {
+    for (const forge of FORGE_TOOLS) assert.equal(isRecognizedCodexTool(forge), true, `${forge} recognized`);
+    assert.equal(isRecognizedCodexTool(MEMORY_TOOL), true, "memory recognized");
+  });
+
+  it("an explicit subagent allowlist naming a forge tool keeps it, but naming memory is stripped", () => {
+    const run = renderCodexRun(
+      runRequest({
+        agents: {
+          helper: agent({ tools: allow([FORGE_TOOLS[0]!, MEMORY_TOOL, "Read"]) }),
+        },
+      }),
+    );
+    const tools = run.perRoleGrants.get("helper")!.allowedTools;
+    assert.equal(tools.has(FORGE_TOOLS[0]!), true, "an explicitly-allowed forge tool survives on a subagent");
+    assert.equal(tools.has("Read"), true, "the ordinary tool survives");
+    assert.equal(tools.has(MEMORY_TOOL), false, "memory is stripped from a subagent even when explicitly allowed");
+    // Recognized names ⇒ no unknown_tool diagnostic for either.
+    assert.equal(
+      run.diagnostics.some((d) => d.kind === "unknown_tool" && d.role === "helper"),
+      false,
+      "recognized forge/memory names are not reported as unknown",
+    );
   });
 });

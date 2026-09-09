@@ -2167,14 +2167,19 @@ tasks:
     #      the agent source shapes, so a drift in CodexExecutor/select/main fails HERE, on
     #      every m3b run, not only inside the container. It needs no docker.
     #   2. The DOCKER leg (OPT-IN via UZI_CODEX_M3B_PACKAGED=1). It builds BOTH real worker
-    #      images (base + jvm) and runs e2e/codex-m3b/run-lifecycle.sh inside each through
-    #      the REAL root-start entrypoint under the PRD confinement posture (read-only root,
-    #      tmpfs runtime mounts, --network none loopback fake provider), driving the packaged
-    #      /app/src CodexExecutor through the plan/approval-resume -> implement -> synchronous
-    #      subagent -> root-only-signal-denial -> checkpoint -> cancel -> finalization
-    #      lifecycle and proving the injected credential/capability canaries never reach a
-    #      public message, a provider-visible request, a log line, or the command-root state;
-    #      the same image run exercises uid-10003 Landlock sibling isolation and real cap-kill/reap.
+    #      images (base + jvm) and runs e2e/codex-m3b/run-lifecycle.sh for each. That script now
+    #      stands up a throwaway migrated Postgres + the api/cmd/codexm3btestserver container on a
+    #      `docker network create --internal` (no-egress) network and runs the packaged /app/src
+    #      CodexExecutor inside the worker image through the REAL root-start entrypoint under the
+    #      PRD confinement posture (read-only root, tmpfs runtime mounts, cap-drop, no-new-privs) on
+    #      that SAME internal network — so Block B drives the REAL WorkerClient Bearer release/refresh
+    #      routes over real HTTP while the loopback fake OpenAI provider stays inside the container.
+    #      It exercises login -> plan/approval-resume -> implement -> synchronous subagent ->
+    #      root-only-signal-denial -> checkpoint (new-root resume) -> refresh advance/replay ->
+    #      finalization, emitting SEPARATE real-path counts that must every be > 0 (api_key refresh
+    #      == 0), and proving the released credential + capability canaries never reach a public
+    #      message or a log line; the same image run exercises uid-10003 Landlock sibling isolation
+    #      and real cap-kill/reap. Every throwaway resource is torn down by exact name in a trap.
     #      This leg is CI/maintainer-only: in-worker image builds are storage-flaky and arm64
     #      is blocked, so it is DEFAULT-SKIPPED. Requires a working docker daemon + egress for
     #      the pinned Codex/toolchain artifacts on a cold build. NOT wired into gate.
