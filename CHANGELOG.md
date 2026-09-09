@@ -18,6 +18,8 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+## [0.81.0] - 2026-09-09
+
 ### Added
 
 - **On-demand MR rework past the automatic cap, with optional guidance ([#1202](https://github.com/vtmocanu/uzi/issues/1202)).**
@@ -3937,7 +3939,8 @@ Re-ships the PRD #87 browser prebake + `web-ux` builtin (v0.11.0, rolled back to
 
 - Worker-side redaction now covers the `agent` and `kind` message fields, not just the payload and `agent_instance`/`agent_label`, closing a gap where a secret placed in either field reached the API, the WebSocket frame, the browser, and `uzi run logs` unscrubbed (PRD #108).
 
-[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.80.0...HEAD
+[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.81.0...HEAD
+[0.81.0]: https://github.com/vtmocanu/uzi/compare/v0.80.0...v0.81.0
 [0.80.0]: https://github.com/vtmocanu/uzi/compare/v0.79.0...v0.80.0
 [0.79.0]: https://github.com/vtmocanu/uzi/compare/v0.78.0...v0.79.0
 [0.78.0]: https://github.com/vtmocanu/uzi/compare/v0.77.0...v0.78.0
