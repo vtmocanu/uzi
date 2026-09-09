@@ -10,9 +10,11 @@ import {
 } from "../src/repo-instructions.js";
 
 // PRD #246 M2 — the structural sanitizer for the clone's ROOT CLAUDE.md. Root file
-// only, symlink never followed, size-capped, line-leading @-imports stripped, CRLF
-// normalized. Safety is structure + framing, NOT prose filtering (see the file's own
-// trust-model comment); these tests pin the structural transforms only.
+// only; a symlink is followed ONLY when its resolved real path is a regular file
+// inside the clone tree and not under `.git/` (escaping/broken/looping/non-file/`.git/`
+// symlinks are dropped); size-capped, line-leading @-imports stripped, CRLF normalized.
+// Safety is structure + framing, NOT prose filtering (see the file's own trust-model
+// comment); these tests pin the structural transforms only.
 describe("readRepoInstructions (PRD #246 M2)", () => {
   let clone: string;
   beforeEach(() => {
@@ -161,6 +163,32 @@ describe("readRepoInstructions (PRD #246 M2)", () => {
     // Contained, but the resolved target is not a regular file.
     fs.mkdirSync(path.join(clone, "subdir"));
     fs.symlinkSync("subdir", repoInstructionsPath(clone));
+    assert.deepStrictEqual(await readRepoInstructions(clone), { dropped: "symlinked" });
+  });
+
+  it("a symlink into a name-prefix SIBLING of the clone ⇒ dropped: symlinked", async () => {
+    // The escape a `realTarget.startsWith(realClone)` check would WRONGLY admit: a
+    // sibling dir whose path shares the clone's name prefix (e.g. `<clone>-evil`). The
+    // `path.relative` containment used here yields `../<clone>-evil/...`, so it is
+    // correctly refused. Pins the exact defense the code comments call out.
+    const evil = `${clone}-evil`;
+    fs.mkdirSync(evil);
+    const target = path.join(evil, "secret.md");
+    fs.writeFileSync(target, "# outside the clone via a name-prefix sibling\n");
+    try {
+      fs.symlinkSync(target, repoInstructionsPath(clone)); // absolute target
+      assert.deepStrictEqual(await readRepoInstructions(clone), { dropped: "symlinked" });
+    } finally {
+      fs.rmSync(evil, { recursive: true, force: true });
+    }
+  });
+
+  it("a symlink to a file under the clone's .git/ dir ⇒ dropped: symlinked", async () => {
+    // In-tree but never legitimate instruction content: a `.git/` target is refused
+    // even though it is contained, so a symlink cannot inject repo metadata.
+    fs.mkdirSync(path.join(clone, ".git"));
+    fs.writeFileSync(path.join(clone, ".git", "config"), "[core]\n\trepositoryformatversion = 0\n");
+    fs.symlinkSync(path.join(".git", "config"), repoInstructionsPath(clone));
     assert.deepStrictEqual(await readRepoInstructions(clone), { dropped: "symlinked" });
   });
 

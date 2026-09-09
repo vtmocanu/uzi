@@ -7,14 +7,16 @@
 // loader), so `settingSources: []` never loosens. Nothing else is read: no nested
 // `**/CLAUDE.md`, no `CLAUDE.local.md`, no `.claude/` config. A symlinked CLAUDE.md
 // IS followed, but ONLY when its fully-resolved real path is a regular file that
-// stays INSIDE the clone tree (the common `CLAUDE.md -> AGENTS.md` convention, this
-// repo's own layout); an escaping, broken, looping, or non-file symlink is never
-// read. Reading an in-tree target grants nothing the repo could not have committed
-// as CLAUDE.md directly, so the invariant "a hostile repo cannot redirect the read
-// outside its own tree" is preserved by the containment check. The file is
-// size-capped, and line-leading `@`-import lines are stripped so the model is not
-// induced to Read arbitrary files. The result is framed DOWNSTREAM
-// (buildRepoInstructionsContext) as a nonce-fenced UNTRUSTED/ADVISORY block, lead-only.
+// stays INSIDE the clone tree AND is not under the clone's `.git/` dir (the common
+// `CLAUDE.md -> AGENTS.md` convention, this repo's own layout); an escaping, broken,
+// looping, non-file, or `.git/`-internal symlink is never read. The containment check
+// enforces exactly one invariant: "a hostile repo cannot redirect the read outside
+// its own tree." A followed target is always a regular file the lead can already read
+// through its own tools, and it is framed DOWNSTREAM (buildRepoInstructionsContext) as
+// a nonce-fenced UNTRUSTED/ADVISORY block, lead-only — so following an in-tree symlink
+// grants no capability the opt-in did not already imply. The file is size-capped, and
+// line-leading `@`-import lines are stripped so the model is not induced to Read
+// arbitrary files.
 //
 // The safety of this feature is guardrails + human review + these STRUCTURAL
 // transforms + the advisory framing — NOT content/prose sanitization, which is
@@ -59,11 +61,13 @@ const IMPORT_STRIPPED_MARKER = "<!-- uzi: @-import stripped -->";
  *      or absolute relative path means the target escapes the tree ⇒ `symlinked`.
  *      `path.relative` is used, not a `startsWith` string prefix, which a sibling like
  *      `/clone-evil` would defeat.
- *   3. `stat` the resolved target; a throw ⇒ `{ dropped: "read_error" }`; a non-file
+ *   3. Refuse a target under the clone's `.git/` dir (first path segment `.git`) —
+ *      it is in-tree but never legitimate instruction content ⇒ `symlinked`.
+ *   4. `stat` the resolved target; a throw ⇒ `{ dropped: "read_error" }`; a non-file
  *      (a symlink to a directory/device) ⇒ `{ dropped: "symlinked" }`.
- *   A followed in-tree target grants nothing the repo could not have committed as
- *   CLAUDE.md directly, so the "cannot redirect the read outside its own tree"
- *   invariant is preserved by the containment check.
+ *   The check enforces the "cannot redirect the read outside its own tree" invariant
+ *   (plus the `.git/` carve-out); a followed target is a regular file the lead can
+ *   already read via its own tools, injected only as nonce-fenced advisory context.
  * - A non-symlink that is not a regular file (a directory/socket named CLAUDE.md) ⇒
  *   `{ dropped: "symlinked" }`.
  * - A plain regular file ⇒ read it directly.
@@ -96,6 +100,11 @@ async function resolveReadPath(
     if (rel === "" || rel === ".." || rel.startsWith(".." + path.sep) || path.isAbsolute(rel)) {
       return { dropped: "symlinked" };
     }
+    // In-tree but never instruction content: refuse a target under the clone's `.git/`
+    // dir (git internals/hooks/config), so a symlink cannot inject repo metadata.
+    if (rel.split(path.sep)[0] === ".git") {
+      return { dropped: "symlinked" };
+    }
     let targetStat;
     try {
       targetStat = await fs.stat(realTarget);
@@ -117,12 +126,13 @@ async function resolveReadPath(
  *
  * - `lstat` the root path; a read error (ENOENT) ⇒ `{ dropped: "absent" }`.
  * - A symlinked CLAUDE.md is FOLLOWED only when its fully-resolved real path is a
- *   regular file that stays INSIDE the clone tree (the `CLAUDE.md -> AGENTS.md`
- *   convention). An escaping/broken/looping/non-file symlink ⇒ `{ dropped: "symlinked" }`,
- *   and so is a non-symlink that is not a regular file (a directory). The containment
- *   check preserves the invariant that a hostile repo cannot redirect the read outside
- *   its own tree; reading an in-tree target grants nothing the repo could not have
- *   committed as CLAUDE.md directly. See `resolveReadPath` for the exact rules.
+ *   regular file that stays INSIDE the clone tree and is not under `.git/` (the
+ *   `CLAUDE.md -> AGENTS.md` convention). An escaping/broken/looping/non-file/`.git/`
+ *   symlink ⇒ `{ dropped: "symlinked" }`, and so is a non-symlink that is not a regular
+ *   file (a directory). The containment check preserves the invariant that a hostile
+ *   repo cannot redirect the read outside its own tree; a followed target is a regular
+ *   file the lead can already read via its own tools. See `resolveReadPath` for the
+ *   exact rules.
  * - Over `maxBytes` (the RESOLVED target's size) ⇒ `{ dropped: "too_large" }`.
  * - A `readFile` failure after the lstat/stat passed (e.g. EACCES on a mode-000 file, a
  *   transient FS error, a TOCTOU delete) ⇒ `{ dropped: "read_error" }`. The read is
