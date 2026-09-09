@@ -103,7 +103,7 @@ After the final push, request the permit for `H`, create/adopt the PR, then quer
 
 Add `SetRunCompletionHold`, not a widened `SetRunPaused`. It admits only an owned gated run in `running` or `awaiting_input`, requires at least one completion attempt, stamps `hold_reason=completion_blocked` and `hold_captured_head`, clears the completion question, and transitions to `paused` with a positive returned-status acknowledgement.
 
-The worker-authored completion question does not use `question_timeout_seconds` or throw `REASON_QUESTION_TIMEOUT`. Add claim-delivered `completion_hold_window_seconds`, default 900 seconds. An owner `continue` inside that live window resumes in place. Expiry invokes the verified park order below; it never becomes `failed`.
+The worker-authored completion question does not use `question_timeout_seconds` or throw `REASON_QUESTION_TIMEOUT`. Add claim-delivered `completion_hold_window_seconds`, default 900 seconds. An owner `continue` inside that live window resumes in place only while the lead executor is still alive. Expiry invokes the verified park order below; it never becomes `failed`. Run-page copy states that after parking, conversation continuity is available only when resume reclaims the same worker within the existing 2-hour affinity; #1229 later removes that limitation for supported providers.
 
 Park ordering is fixed for later children:
 
@@ -119,7 +119,7 @@ This child ships `captureHoldContext()` as an explicit `same_worker_only` result
 
 ### D7: Reserve one decision path
 
-Add `run_user_inputs.kind = completion_decision` and one owner/admin endpoint. This child supports only `{decision: continue, guidance?}` in both the live `awaiting_input` window and `paused` hold. It records the decision, resumes when parked, carries `hold_reason` and last attempt on the claim, injects guidance and clears the hold on the first accepted running report.
+Add `run_user_inputs.kind = completion_decision` and one owner/admin endpoint. This child supports only `{decision: continue, guidance?}` in both the live `awaiting_input` window and `paused` hold. It records the decision, resumes when parked, carries `hold_reason` and last attempt on the claim, injects guidance and clears the hold on the first accepted running report. A decision received while the live lead executor exists may resume in place. A hold entered after `phasePublish` reaped the lead, or any already-paused hold, resumes through `queued` and a new claim/session restore; it must never call an ended executor.
 
 #1227 extends the same kind and endpoint with `partial` and `accept`; it does not create another control plane.
 
