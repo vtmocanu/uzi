@@ -199,11 +199,34 @@ else
   # Restart the worker (same join token ⇒ same worker id): it re-claims both by
   # affinity and drives them to completion. The exported UZI_WORKER_TOKEN re-sources
   # the `worker_token` secret; no token re-delivery is needed.
+  #
+  # Since issue #1213 the re-claim of a HARD-KILLED run first parks in recovery_wait:
+  # the SIGKILL left a pending recovery-capture journal, so the runner verifies the
+  # retained runner clone before reseeding, then the sweeper auto-promotes it back to
+  # queued for a second re-claim that reaches the gate. So the resume traverses
+  # recovery_wait → queued → claimed → running → awaiting_approval. The overlay
+  # compresses the park's backoff base (RUN_RECOVERY_PARK_BASE=1s) so the whole park
+  # fits this wait, but the park's jitter is a non-configurable UNIFORM 5-30s
+  # (recoverywait.go), so recovery_retry_not_before lands base+jitter ≈ 6-31s out (~20s typical),
+  # plus ≤2s sweep granularity and ~0.5s re-claim before recovery work: a ~33.5s
+  # deterministic scheduling bound. The ceiling is 90s (give-up, not expected) to absorb
+  # that worst case plus re-claim + plan under CI load.
   "${COMPOSE[@]}" up -d --wait agent >/dev/null
   wait_worker_online
-  wait_status "$RUN_KA" awaiting_approval 60
-  wait_status "$RUN_KB" awaiting_approval 60
-  pass "restarted worker re-claimed both re-queued runs (affinity) — both back at the gate"
+  wait_status "$RUN_KA" awaiting_approval 90
+  wait_status "$RUN_KB" awaiting_approval 90
+  # OBSERVE the recovery_wait traversal, don't just assume it (the pass line claims it).
+  # Each re-claim of a hard-killed run must park EXACTLY once: 0 ⇒ the resume never went
+  # through recovery_wait (the assertion above became vacuous — e.g. the retained-clone
+  # detection regressed), >1 ⇒ an unnecessary re-park that the compressed cadence would
+  # otherwise hide (handleRecoveryExhausted's verified capture must clear the journal so
+  # the promoted re-claim proceeds instead of parking again). recovery_wait_count is not
+  # on the run DTO, so read it straight from the row.
+  RWC_KA="$(db_psql "SELECT recovery_wait_count FROM runs WHERE id = '$RUN_KA'")"
+  RWC_KB="$(db_psql "SELECT recovery_wait_count FROM runs WHERE id = '$RUN_KB'")"
+  { [ "$RWC_KA" = 1 ] && [ "$RWC_KB" = 1 ]; } \
+    || fail "each re-claimed run must park in recovery_wait exactly once (got KA=$RWC_KA KB=$RWC_KB): 0=resume skipped the park, >1=an unnecessary re-park"
+  pass "restarted worker re-claimed both re-queued runs (affinity, via recovery_wait ×1 each) — both back at the gate"
 
   apipost "/api/runs/$RUN_KA/inputs" '{"kind":"approve_plan","body":""}' >/dev/null
   apipost "/api/runs/$RUN_KB/inputs" '{"kind":"approve_plan","body":""}' >/dev/null

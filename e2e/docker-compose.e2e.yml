@@ -110,6 +110,19 @@ services:
       # worker-loss requeue are bounded by ~2s rather than ~15s. Product knob added in
       # the same change; unset ⇒ the api's built-in 15s default.
       SWEEP_INTERVAL: 2s
+      # Transient-recovery park cadence (issue #1197 / #1213): the first recovery
+      # park's backoff base and the ceiling on its doubling. Shrunk from the shipped
+      # 1m/30m defaults because the #42 mid-run-SIGKILL step (phase 45) now routes its
+      # resume THROUGH recovery_wait — a hard worker-loss leaves a pending recovery-
+      # capture journal, so the re-claim parks to verify the retained runner clone
+      # before reseeding — and the sweeper (SWEEP_INTERVAL above) auto-promotes it once
+      # recovery_retry_not_before elapses. The park's dominant term is the NON-configurable jitter
+      # (recoveryParkJitterMin..Max = 5s..30s, recoverywait.go), so compressing the base
+      # to ~1s keeps the whole park inside the phase's resume wait; a small max caps the
+      # doubling should a run park more than once. Overlay-only; production defaults
+      # (config.go RUN_RECOVERY_PARK_BASE / RUN_RECOVERY_MAX_PARK) are untouched.
+      RUN_RECOVERY_PARK_BASE: 1s
+      RUN_RECOVERY_MAX_PARK: 5s
       # MR review-watcher debounce (PRD #966 M6 / D6): the review-landed quiet period
       # the mr_rework detector waits after the newest review comment before queuing a
       # rework. Shrunk from the shipped 3m default so phase 71 can inject a note and
