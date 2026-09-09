@@ -41,13 +41,26 @@ check_static_bin() {
     bad "$_p ownership/mode wrong: owner=$_own mode=$_mode (want 0:0 / 555)"
   fi
   # It must be executable and statically linked (no dynamic loader) — a runner-writable /nix
-  # dependency would break the trust-anchor posture. `file` may be absent; fall back to ldd.
+  # dependency would break the trust-anchor posture. This control must FAIL (not `note`)
+  # without positive static-link evidence: a non-static result, and the absence of BOTH
+  # `file` and `ldd`, each increment FAIL so the proof cannot read green unproven.
   if command -v file >/dev/null 2>&1; then
     _f="$(file -b "$_p" 2>/dev/null || echo '?')"
     case "$_f" in
       *statically\ linked*) ok "$_p is statically linked" ;;
-      *) note "$_p file: $_f (expected 'statically linked')" ;;
+      *) bad "$_p is not statically linked: $_f" ;;
     esac
+  elif command -v ldd >/dev/null 2>&1; then
+    # ldd on a STATIC binary: glibc prints "not a dynamic executable"; musl prints
+    # "Not a valid dynamic program" (or errors). A DYNAMIC binary lists a loader / "=>".
+    _l="$(ldd "$_p" 2>&1 || true)"
+    case "$_l" in
+      *"=>"*|*ld-musl*|*ld-linux*) bad "$_p is not statically linked (ldd reported a dynamic loader)" ;;
+      *"not a dynamic executable"*|*"Not a valid dynamic program"*) ok "$_p is statically linked (ldd)" ;;
+      *) bad "$_p static-link unproven by ldd: $_l" ;;
+    esac
+  else
+    bad "cannot prove $_p is statically linked: neither file nor ldd is present"
   fi
 }
 

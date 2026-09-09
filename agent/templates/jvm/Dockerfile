@@ -315,7 +315,7 @@ RUN bash /tmp/codex/assert-codex.sh \
 # /usr/local/bin/uzi-codex-fileop (matching FILEOP_BIN in agent/src/codex/codex-executor.ts).
 # MIRRORED from templates/base — keep the COPY/RUN lines in lockstep (jvm is NOT `FROM base`).
 COPY agent/codex/supervisor /build/uzi-codex-supervisor
-RUN cd /build/uzi-codex-supervisor && GOTOOLCHAIN=local CGO_ENABLED=0 GOFLAGS="-mod=vendor -buildvcs=false" go build -trimpath -o /usr/local/bin/uzi-codex-supervisor . && chmod 0555 /usr/local/bin/uzi-codex-supervisor && go build -trimpath -o /usr/local/bin/uzi-codex-fileop ./fileop && chmod 0555 /usr/local/bin/uzi-codex-fileop && rm -rf /build/uzi-codex-supervisor
+RUN cd /build/uzi-codex-supervisor && export GOTOOLCHAIN=local CGO_ENABLED=0 GOFLAGS="-mod=vendor -buildvcs=false" && go build -trimpath -o /usr/local/bin/uzi-codex-supervisor . && chmod 0555 /usr/local/bin/uzi-codex-supervisor && go build -trimpath -o /usr/local/bin/uzi-codex-fileop ./fileop && chmod 0555 /usr/local/bin/uzi-codex-fileop && rm -rf /build/uzi-codex-supervisor
 
 COPY agent/tsconfig.json ./
 COPY agent/src ./src
