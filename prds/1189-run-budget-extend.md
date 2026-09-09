@@ -126,6 +126,15 @@ Because this PRD lands after #1170, which deletes `KeyHealthSlowSeconds`, rewrit
 - **D10: `checkpoint_tip_at` lands here with `IF NOT EXISTS`.** #1190 needs it too; whichever merges second is a no-op. The panel and the DM both need "how old is the last checkpoint", which the tip SHA alone cannot answer.
 - **D11: no TUI change.** Read-only surface; #1170 already shows the countdown there. Owner decision 2026-09-07.
 
+## ⚠ Provisional field finding (AI-added 2026-09-09; NOT accepted, revalidate at implementation)
+
+This block is a live observation added after planning, not a settled design fact. Do not treat it as valid input to the design: when this PRD is implemented, re-derive it against the real code and delete or rewrite it. It is recorded so the implementer starts from the evidence rather than re-discovering it.
+
+- **Observation.** A running `mr_rework` run had its server budget extended by editing `budget_wall_seconds` in the DB (6h to 9h). `deadline_at` and the near-timeout flag both moved (API-confirmed), yet the run still failed at the original 6h mark with `fail_origin=agent_failure`, `failure_reason="run exceeded its wall-clock timeout"`: the worker's own `REASON_WALL` (`agent/src/sdk-executor.ts:128`), not the server sweep (which stamps `fail_origin=run_timeout`).
+- **Why it may contradict D6 and the "A worker's soft wall" risk.** The worker arms its wall at claim from `RunTimeoutSeconds = COALESCE(budget_wall_seconds, RUN_TIMEOUT)` (`api/internal/workersvc/claim_assembly.go:436`) and trips it as a hard failure. For any run whose armed wall equals the frozen budget (`mr_rework`, and every run once extended past its frozen budget), the worker can trip before the extended server deadline. A server-columns-only extend then risks being a silent no-op: the deadline moves and the flag clears while the run still dies at the old time, which is worse than shipping nothing. The one-shot `wallScaled` latch (`sdk-executor.ts:1848`, `&& !wallScaled`) and per-turn arming may also block the D6 follow-up ("serve it on the ACK") from lifting the wall a second time.
+- **If confirmed, the implication is scope.** The worker-serve moves from follow-up into M1: feed `budget_extension_seconds` into the served wall (claim assembly plus the running-report ACK), allow the wall to re-lift after the first scale, re-arm the in-turn wall on a served bump, and add an acceptance test that a running run survives past its original wall.
+- **Caveats before accepting.** The DB edit changed `budget_wall_seconds`, not the proposed `budget_extension_seconds`; the run was `mr_rework` (never milestone-scaled, so no `wallScaled` headroom); `RUN_TIMEOUT` on that cluster was 6h, not the 2h this PRD's prose assumes. Reproduce against the actual implementation, on a milestone-scaled run too, before treating any of this as true.
+
 ## Success criteria
 
 - A running issue run with an 8h budget extended by 2h is failed by the sweep only after 10h active; `deadline_at`, the header, `uzi run get` and the Slack DM all name the same new deadline.
@@ -139,7 +148,7 @@ Because this PRD lands after #1170, which deletes `KeyHealthSlowSeconds`, rewrit
 - **Rollout skew.** A new SPA against an api pod without the four DTO fields sees `undefined`: the header falls back to plain elapsed and the button does not render (`budget_extension_cap_seconds` undefined is treated as "unknown", not `0`). Keep every new web field optional; the M2 tests pin the fallback.
 - **Two drafts numbered 00203.** #1190 drafts `00204`; at landing renumber to the live head. `check:migration-numbering` in `gate:repo` catches a duplicate prefix.
 - **`sqlc generate` needs the module proxy** (see #1170's Risks for the hand-edit fallback shape).
-- **A worker's soft wall.** D6 accepts that a very long extension could see the worker self-trip its advisory wall; measured today the server's scaled budget already exceeds the worker's initial reference and runs do not self-trip, because `wallSeconds` on the ACK lifts it. If M7 shows otherwise, serve the extension on the ACK.
+- **A worker's soft wall.** D6 accepts that a very long extension could see the worker self-trip its advisory wall; measured today the server's scaled budget already exceeds the worker's initial reference and runs do not self-trip, because `wallSeconds` on the ACK lifts it. If M7 shows otherwise, serve the extension on the ACK. (See the Provisional field finding after the Decision log, 2026-09-09: a live `mr_rework` run appears to contradict this. Provisional, revalidate at implementation.)
 - **Health nudge repeat.** After an extension the run may re-cross 85% and DM again; accepted per #1170 D8.
 
 ## Out of scope
