@@ -14,7 +14,7 @@ Uzi asks a lead to declare only milestones it actually completed, but trusts tha
 
 PR #1220 proved the failure: its run froze `m1..m5`, declared `m1..m4`, used only 8 of 25 iterations, had no scope cap, contradicted its own PRD on M3/M5, and still opened a closing PR. This is a lifecycle bug, not a prompt-quality problem.
 
-The final product rejects an incomplete completion attempt without failing the run or losing its work. It checkpoints Git and provider context, returns exact missing requirements to the same lead session while progress continues, and parks recoverably for owner action after bounded no progress. A closing PR requires an independently audited server permit bound to the exact final head.
+The final product rejects an incomplete completion attempt without failing the run or losing its work. It checkpoints Git and provider context, returns exact missing requirements to the same lead session while progress continues, and parks recoverably for owner action after bounded no progress. A closing PR for an interlocked issue run requires a profile-appropriate server permit bound to the exact final head: structural for structural-profile runs, independently audited semantic for semantic-profile runs.
 
 > Reject the completion attempt, not the run. Fail closed on publication and completion, preserve the work, and rework with the same lead by default.
 
@@ -27,7 +27,7 @@ The final product rejects an incomplete completion attempt without failing the r
 | 3 | [#1228 Shared encrypted provider-context generations](1228-shared-context-generations.md) | One dark storage/codec primitive for run holds and #1214 PR sessions | #1227 by queue policy; no technical dependency |
 | 4 | [#1229 Durable run-hold capture and cross-worker resume](1229-durable-run-holds.md) | Verified provider context plus Git before park; restore before inspect on another worker | #1226 + #1228 |
 | 5 | [#1230 Semantic completion contract and plan coverage review](1230-semantic-completion-contract.md) | Source-backed criteria, independent plan coverage and autopilot fallback | #1226 |
-| 6 | [#1231 Independent completion auditor and semantic permit](1231-completion-auditor.md) | Exact-head full audit, reproducible evidence, semantic permit and bounded recovery | #1226 + #1230 |
+| 6 | [#1231 Independent completion auditor and semantic permit](1231-completion-auditor.md) | Exact-head full audit (tool-less, two-pass cap, fixed token/wall budget), captured gate evidence, semantic permit, per-repo semantic opt-in and bounded recovery | #1226 + #1230 |
 | 7 | [#1233 Structured completion blockers and governed MR rework](1233-structured-blockers-mr-rework.md) | Server-owned blocker dispositions and contract-governed automatic/manual rework | #1227 + #1230 + #1231 |
 | 8 | [#1232 Completion interlock integration, rollout and epic close-out](1232-completion-interlock-integration.md) | End-to-end/race proof, default enablement, consolidated docs and epic close | #1226-#1231 + #1233 |
 
@@ -62,10 +62,10 @@ These seams are fixed here so each merged child extends rather than replaces its
 - [ ] #1227 merged: only the owner/admin can continue, reduce exact scope or accept exact criteria with a reason.
 - [ ] #1228 merged: one encrypted, bounded provider-context primitive exists for both consumer lifecycles.
 - [ ] #1229 merged: completion holds preserve Git and supported provider context across worker replacement.
-- [ ] #1230 merged: approved plans carry independently reviewed source-backed semantic contracts.
-- [ ] #1231 merged: a full exact-head semantic audit gates completion on capable workers.
+- [ ] #1230 merged: the per-repo semantic setting has default-off storage and a read seam with no write path or runtime effect, and the dormant compiler/reviewer produce independently reviewed source-backed semantic contracts under test.
+- [ ] #1231 merged: on repos with the semantic setting on, a bounded full exact-head audit gates completion on capable workers.
 - [ ] #1233 merged: structured blocker policy gates completion and governed automatic/manual MR rework.
-- [ ] #1232 merged: integrated recovery/compatibility/mutation proof passes and new issue runs use the interlock by default.
+- [ ] #1232 merged: integrated recovery/compatibility/mutation proof passes and new issue runs use the structural interlock by default; the semantic profile stays a per-repo opt-in.
 - [ ] #1214 is amended to consume #1228 and is queued only after the shared seams are stable.
 
 ## Maintainer-operated post-merge validation
@@ -84,7 +84,7 @@ Record sanitized commands/outcomes, commit/image versions and dates. Never mark 
 
 - Structural containment lands before semantic judgment and states that limitation.
 - Same-worker context lands before durable cross-worker recovery and is exposed as degraded, not hidden.
-- Independent plan/final audits add bounded owner-token cost; deterministic checks run first and one full audit remains the correctness price.
+- Independent plan/final audits add bounded owner-token cost, and the bound is concrete: the coverage review is at most two invocations per verdict-bearing review sharing 5 min and 40k tokens, capped at three reviews and 15 min / 120k tokens per run and the completion audit at most two tool-less passes (5 min each, 10 min aggregate, 100k tokens) over a worker-built packet with captured gate evidence, so review time scales with the diff, not with implementation time. Deterministic checks run first. Both run only on repos that opt into the semantic profile; the structural interlock costs no tokens and is the default.
 - A PAT-holding compromised worker remains outside scope; the hard claim clause addresses normal version skew.
 - Finalize-time base-align conflicts, non-fast-forward rejection and push-secret blocking retain their existing typed preserved-work behavior; this epic changes incomplete-completion handling, not every terminal finalization error.
 - A provider without a verified codec cannot be called cross-worker durable.
@@ -102,3 +102,4 @@ No `docs/ROADMAP.md` exists in the inspected checkout.
 - 2026-09-09: `@brainstorm` independently confirmed all five, identified ADR-456 movement as an additional risk, and proposed stable cross-child seams.
 - 2026-09-09: User chose an epic with smaller tasks executed one by one. Final deliverability review split structured blockers/MR rework from the auditor; the eight-child sequence above is the reconciled design. No implementation run started.
 - 2026-09-09: Both peers re-reviewed the final document set after corrections and approved it with no blocking findings. Residual operational risks are recorded in the owning children; only #1226 is sweep-eligible.
+- 2026-09-09: Maintainer asked that a long implementation run not earn a proportionally long review. Lead Claude session and `@vasile` (Codex) agreed the bounds now recorded in #1230 D2, #1231 D1/D2/D4/D6 and #1232 D4: tool-less auditor on the advice-lane primitive, captured gate artifacts with re-execution as fallback, no incremental audits, two-audit cap with numeric wall/token ceilings, and the semantic profile as a per-repo opt-in with structural as the default. #1226 is unchanged.

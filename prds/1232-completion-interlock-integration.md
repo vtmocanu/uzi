@@ -51,7 +51,9 @@ The worker can run component gates, LiveDB and isolated compose. Hosted-k8s work
 
 ### D4: Enable by default only after compatibility proof
 
-Rehearse API-first and worker-first skew. Gated runs must remain visibly queued until a capable worker exists; legacy contract-null runs remain operable. After the fleet capability path is proven, make all new issue runs use the structural/semantic completion profile by default and retire the temporary admin rollout flag. Rollback may stop creating new contracts but cannot make existing contracted runs claimable by old workers.
+Rehearse API-first and worker-first skew. Gated runs must remain visibly queued until a capable worker exists; legacy contract-null runs remain operable. After the fleet capability path is proven, make all new issue runs use the **structural** completion profile by default and retire the temporary admin rollout flag. The semantic profile (#1230 coverage review plus #1231 audit) stays behind the per-repo semantic setting (#1230 storage, #1231 activation), default off; this child does not flip it. Rollback may stop creating new contracts but cannot make existing contracted runs claimable by old workers.
+
+The default-on structural interlock costs no model tokens. The independent-audit guarantee applies to semantic-profile runs only, and the docs consolidated in M5 say so rather than promising it for every run.
 
 ### D5: Close the epic without hiding outstanding operations
 
@@ -69,19 +71,19 @@ Five sequential milestones; all implementation-run milestones are worker-runnabl
 | 4 | M4: full gates and adversarial mutations | M1-M3 | Task gates and mutation harness | Regression channels prove the load-bearing guards. |
 | 5 | M5: default enablement, docs and epic close-out | M1-M4 | config, docs/specs/ADR/PRDs | Correctness becomes default and records are synchronized. |
 
-- [ ] **M1: integrated #1220 lifecycle fixture.** Run real API/store plus worker in an isolated project. Freeze five milestones, submit four with contradictory M3 evidence and verify the same session receives M5/M3, no forge create occurs, work is checkpointed and the run stays non-terminal. Complete the missing work and verify full exact-head audit, permit, PR head/body, context capture and atomic terminal state. Gate: relevant e2e target plus `task gate:api` and `task gate:agent`.
+- [ ] **M1: integrated #1220 lifecycle fixture.** Run real API/store plus worker in an isolated project with the per-repo semantic setting explicitly enabled on the fixture repo through #1231's write path and its activation fence open (the default is off), and a sibling structural-profile case proving no audit call. Freeze five milestones, submit four with contradictory M3 evidence and verify the same session receives M5/M3, no forge create occurs, work is checkpointed and the run stays non-terminal. Complete the missing work and verify full exact-head audit, permit, PR head/body, context capture and atomic terminal state. Gate: relevant e2e target plus `task gate:api` and `task gate:agent`.
 - [ ] **M2: failure, race and recovery matrix.** Exercise worker/API loss before/after permit, branch push, PR create/adopt, context generation, hold report, owner decision and completion response. Include stale claim, contract/head/decision races, two-worker restore, audit outage/cap and unsupported codec. Assert the observable final run/PR/context state and no only-copy cleanup. Gates: integration, LiveDB and real-Git tests.
 - [ ] **M3: compatibility and rollout rehearsal.** Prove flag-off/contract-null paths are byte-compatible, old workers cannot claim contracted runs through override/kill-switch, API-first deployment waits visibly, worker-first deployment ignores unused optional fields, and rollback cannot strip an existing contract. Rehearse in isolated compose with exact container names outside `uzi-*`; never tear down the real stack. Gate: relevant API/agent/web tests.
 - [ ] **M4: full gates and adversarial mutations.** Run `task gate` once to a log and inspect every named slot. Run targeted red mutations for missing-milestone denial, hard claim clause, permit guard, exact head, capture ACK, semantic audit and finding settlement, then restore and verify the tree. No workflow fixture or credential-shaped literal. Record unavailable environment-only checks rather than claiming green.
-- [ ] **M5: default enablement, docs and epic close-out.** Enable the interlock by default for new issue runs and remove/retire the temporary rollout flag while retaining legacy-row behavior. Consolidate run lifecycle, pause/recovery, plan approval, MR rework and CLI docs; run `task docs:sync`; update ADR 1225, `ARCHITECTURE.md`, `specs/human.md`, `specs/ai.md`, #1214 pointers and the #1225 child checklist. Move the epic PRD only when all children are merged. Emit the maintainer hosted-k8s checklist and leave each row honestly pending until externally verified.
+- [ ] **M5: default enablement, docs and epic close-out.** Enable the structural interlock by default for new issue runs and remove/retire the temporary rollout flag while retaining legacy-row behavior; leave the per-repo semantic setting default off and document what each profile costs. Consolidate run lifecycle, pause/recovery, plan approval, MR rework and CLI docs; run `task docs:sync`; update ADR 1225, `ARCHITECTURE.md`, `specs/human.md`, `specs/ai.md`, #1214 pointers and the #1225 child checklist. Move the epic PRD only when all children are merged. Emit the maintainer hosted-k8s checklist and leave each row honestly pending until externally verified.
 
 ## Acceptance criteria
 
 - The complete #1220 failure reproduces before guards and cannot open a closing PR after them.
-- Same-session rework, owner holds/decisions, cross-worker context and semantic audit function together through real API/worker boundaries.
+- Same-session rework, owner holds/decisions, cross-worker context and, on a semantic-profile repo, the bounded semantic audit function together through real API/worker boundaries.
 - Every crash/race either completes idempotently or remains recoverable/non-terminal with no work loss.
 - Old workers cannot claim contracted runs; legacy runs remain unchanged.
-- New issue runs use the interlock by default after rollout; existing contract authority cannot be rolled back away.
+- New issue runs use the structural interlock by default after rollout; the semantic profile remains a per-repo opt-in; existing contract authority cannot be rolled back away.
 - Every load-bearing guard has a targeted red mutation and green restored proof.
 - The worker completes all frozen criteria without kube credentials, workflow edits or open web.
 - The epic and #1214 records accurately reflect merged dependencies and outstanding maintainer validation.
@@ -102,3 +104,4 @@ Record commands, sanitized outcomes, commit/image versions and dates. If the imp
 ## Review record
 
 - 2026-09-09: Split from #1225 after review found hosted-k8s proof could not be a worker completion gate and the combined PRD was too large. This child owns integration and close-out only; it introduces no new contract.
+- 2026-09-09: Cost bounding pass with `@vasile` (Codex): the default flip covers the structural profile only; the semantic profile stays behind the per-repo semantic setting (#1230 storage, #1231 activation), and the audit guarantee is worded for semantic-profile runs.
