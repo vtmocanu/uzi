@@ -489,7 +489,11 @@ export class CodexExecutor implements Executor {
     };
 
     // (4) The command + fileop effect surfaces (credential-free command identity).
-    const spawnCommand: SpawnCommandSeam = this.deps.spawnCommand ?? makeDefaultSpawnCommand(commandEnv);
+    const baseSpawnCommand = this.deps.spawnCommand ?? makeDefaultSpawnCommand(commandEnv);
+    // Route the SCRUBBED command-identity env THROUGH the seam (not merely closed over by the
+    // default seam) so an injected seam records the exact env command spawns run under — the
+    // same scrubbed env the fileop seam already receives. [#1171 m5 review]
+    const spawnCommand: SpawnCommandSeam = (argv, spawnOpts) => baseSpawnCommand(argv, { ...spawnOpts, env: commandEnv });
     const fileopHandle: FileopHelperHandle = (this.deps.spawnFileop ?? defaultSpawnFileop)(worktreePath, commandEnv);
     const fileop: FileopClient = fileopHandle.client;
 
@@ -553,8 +557,10 @@ export class CodexExecutor implements Executor {
     const launchProviderRoot = this.deps.launchProviderRoot ?? defaultLaunchProviderRoot;
     const providerLaunchSeam: LaunchRootSeam = async (spec) => {
       const released = await this.opts.client.releaseCodex(ctx.runId, { capability: binding.capability });
-      this.log.addSecret(released.access_token); // BEFORE any use
-      releasedTokens.add(released.access_token); // evicted at terminal cleanup (part C)
+      if (!releasedTokens.has(released.access_token)) {
+        this.log.addSecret(released.access_token); // BEFORE any use
+        releasedTokens.add(released.access_token); // evicted at terminal cleanup (part C)
+      }
       const codexHome = path.join(spec.ownedDataRoot, "codex");
       // Best-effort credential-free seed. NOTE (m3b/m4): under the uid split the fresh home
       // is runner-owned 0700, so this cross-uid seed moves into the launcher's runner-
@@ -751,7 +757,7 @@ export class CodexExecutor implements Executor {
   private makeBoundaryReconcile(runId: string, releasedTokens: Set<string>): ReconcileBeforeBoundary {
     const log = this.log;
     return buildRunLaneReconcile(runId, this.opts.client, this.opts.binding, (token) => {
-      if (!token) return;
+      if (!token || releasedTokens.has(token)) return;
       log.addSecret(token); // BEFORE any use; balanced by removeSecret in the terminal dispose hook (post-run sinks) or run()'s finally (during-run)
       releasedTokens.add(token);
     });
@@ -947,7 +953,7 @@ export function makeDefaultSpawnCommand(commandEnv: NodeJS.ProcessEnv): SpawnCom
       const wrapped = commandRootCommand(cmd ?? "/bin/sh", rest);
       const child = spawn(wrapped.command, wrapped.args, {
         cwd: opts.cwd,
-        env: commandEnv,
+        env: opts.env ?? commandEnv,
         stdio: ["ignore", "pipe", "pipe"],
       });
       let stdout = "";

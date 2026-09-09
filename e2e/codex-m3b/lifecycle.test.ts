@@ -347,7 +347,7 @@ interface Rig {
   reaped: () => number;
   disposed: () => number;
   fileopDisposed: () => number;
-  spawnCommandCalls: { argv: readonly string[]; opts: { cwd?: string } }[];
+  spawnCommandCalls: { argv: readonly string[]; opts: { cwd?: string; env?: NodeJS.ProcessEnv } }[];
   fileopSpawns: { worktreePath: string; env: NodeJS.ProcessEnv }[];
   sessionOps: { adopt: number; removeCalls: number; inspect: number };
   deps: CodexExecutorDeps;
@@ -614,6 +614,10 @@ describe("codex-m3b packaged lifecycle (injected fakes)", () => {
     assert.equal(rig.transport.turnStartCount, 2, "a child turn/start was demuxed");
     const bash = rig.spawnCommandCalls.find((s) => JSON.stringify(s.argv).includes(canaries.bashArg));
     assert.ok(bash, "the child Bash effect reached the command-identity spawn seam");
+    // The scrubbed command-identity env is now exposed THROUGH the seam (finding [3]): the
+    // recorded spawn carries LANG=C and no credential/capability.
+    assert.equal(bash.opts.env?.LANG, "C", "the command spawn received the scrubbed command-identity env via the seam");
+    assert.doesNotMatch(JSON.stringify(bash.opts.env ?? {}), new RegExp(escapeRe(canaries.credential)), "the scrubbed command env carries no credential");
     counts.callbacks += rig.spawnCommandCalls.length;
 
     const replyOf = (id: number): { success?: boolean } => rec(rec(rig.transport.responses.find((r) => r.requestId === id)?.response).result) as { success?: boolean };

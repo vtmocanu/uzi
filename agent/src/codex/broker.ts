@@ -209,10 +209,14 @@ export interface SpawnCommandResult {
   readonly stderr: string;
 }
 
-/** Options for a shell effect spawn (currently only the working directory, which
- *  the broker guarantees is inside the worktree before calling). */
+/** Options for a shell effect spawn: the working directory (the broker guarantees it is
+ *  inside the worktree before calling) and the SCRUBBED command-identity env the child
+ *  runs under. The executor routes its per-run scrubbed env through `env` so an injected
+ *  seam records the exact env command spawns use; the default seam falls back to its
+ *  closed-over env when `env` is absent. */
 export interface SpawnCommandOptions {
   readonly cwd?: string;
+  readonly env?: NodeJS.ProcessEnv;
 }
 
 /** The injected "run a shell command as the COMMAND identity" seam. `argv` is the

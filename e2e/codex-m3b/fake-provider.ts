@@ -195,8 +195,13 @@ export function lifecycleResponder(canaries: CodexCanaries): (body: ResponsesBod
     switch (step) {
       case 1:
         return [tool("cc-bash", "Bash", { command: `echo ${canaries.bashArg}` }) as ResponseItem];
-      case 2:
-        return [patchTool("cc-patch", canaries.patchArg) as ResponseItem];
+      case 2: {
+        // patchTool's FROZEN filename constraint is /^[a-z-]+$/, so map the canary to a
+        // filename-safe form (the marker file only proves the patch effect ran; the
+        // credential/capability boundary is what the suite asserts). [#1171 m5 review]
+        const patchName = canaries.patchArg.replace(/[^a-z-]+/g, "-");
+        return [patchTool("cc-patch", patchName) as ResponseItem];
+      }
       case 3:
         return [tool("cc-spawn", "spawn_agent", { subagent_type: "coder", prompt: canaries.spawnArg }) as ResponseItem];
       case 4:
