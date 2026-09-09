@@ -196,7 +196,7 @@ export function lifecycleResponder(canaries: CodexCanaries): (body: ResponsesBod
       case 1:
         return [tool("cc-bash", "Bash", { command: `echo ${canaries.bashArg}` }) as ResponseItem];
       case 2:
-        return [patchTool("cc-patch", "patch-marker") as ResponseItem];
+        return [patchTool("cc-patch", canaries.patchArg) as ResponseItem];
       case 3:
         return [tool("cc-spawn", "spawn_agent", { subagent_type: "coder", prompt: canaries.spawnArg }) as ResponseItem];
       case 4:

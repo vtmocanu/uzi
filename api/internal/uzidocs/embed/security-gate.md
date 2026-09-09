@@ -119,7 +119,10 @@ canary is an instrument failure (exit 2), never a clean run.
   sanctioned.)
 - **`codex-durability-sink-boundary.yml`** (DARK Codex, issue #1171) — the
   runner durability/publication sinks in `agent/src/runner.ts` must not spawn a
-  raw subprocess (`spawn`/`spawnSync`/`exec`/`execFile`). The runner holds the
+  raw subprocess (all seven `child_process` forms:
+  `spawn`/`spawnSync`/`exec`/`execSync`/`execFile`/`execFileSync`/`fork`, kept in
+  sync with `codex-no-direct-spawn.yml` so an idiomatic `execSync` git bypass
+  cannot evade it). The runner holds the
   run's PAT, so a raw `spawn("git", ...)` would be a credential-bearing git
   bypass of the injected git client and the `withBoundary` reap barrier;
   `runner.ts` imports no `child_process` today, so the clean tree is zero.

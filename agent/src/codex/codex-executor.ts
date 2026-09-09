@@ -614,7 +614,10 @@ export class CodexExecutor implements Executor {
 
       // Implement turn (Codex-specific driving; the full lifecycle is m5). Re-point the
       // broker to IMPLEMENT-phase grants (file writes permitted) BEFORE driving it. The plan
-      // turn has fully settled by now, so this re-point is race-free (turns are sequential).
+      // driveCodexTurn has returned; the next (implement) turn drives sequentially. The
+      // re-point is race-safe not because every callback has drained (a backgrounded child
+      // callback can outlive the plan turn) but because an in-flight child captured its OWN
+      // plan-phase child broker at spawn — the root `this.broker` swap never touches it.
       harness.useBroker(buildPhaseBroker("implement"));
       await this.driveCodexTurn(ctx, harness, reducer, "implement", this.implementPrompt(ctx), resumeId, idleMs, wallMs);
 

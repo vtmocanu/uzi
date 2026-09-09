@@ -274,8 +274,11 @@ export class CodexHarness implements RunHarness {
   /** Re-point the callback broker used by the NEXT turn. The provider root, transport and
    *  the harness itself are constructed ONCE and reused; only the broker (its immutable
    *  per-(thread,turn) grants) changes per turn. Turns run strictly sequentially — the
-   *  current turn has fully settled before the owner calls this — so re-pointing between
-   *  turns is race-free, and within a turn `this.broker` is stable. The executor uses it
+   *  next turn's root frames only begin after this returns — so re-pointing between turns
+   *  is race-safe: a root callback reads `this.broker` fresh at dispatch and a stale
+   *  prior-turn root callback is rejected `not_active_turn`, while an in-flight CHILD
+   *  callback holds its own child broker captured at spawn (this swap never touches it).
+   *  Within a turn `this.broker` is stable. The executor uses it
    *  to serve each turn a PHASE-CORRECT broker (a plan-phase broker denies every file
    *  write; the implement-phase broker permits them), so the plan turn cannot mutate the
    *  worktree before its plan is approved. This STRENGTHENS the per-turn grant invariant:

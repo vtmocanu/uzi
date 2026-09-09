@@ -2129,7 +2129,7 @@ tasks:
         done
 
   test:codex-m3b:
-    desc: Opt-in aggregate of the credential-free Codex adapter unit and state controls (PRD 1171 M1)
+    desc: Opt-in aggregate of the credential-free Codex adapter unit and state controls (PRD 1171 M1-M5)
     # An aggregate of the Codex adapter UNIT/state controls that exist today: the
     # agent-side registry/safety/transport suites plus the runner-uid identity-boundary
     # tests (including the runner-cmd command-root uid). The individual unit files run in
@@ -2148,7 +2148,10 @@ tasks:
     # target). The individual unit files still run in node's DEFAULT PARALLEL mode.
     dir: agent
     cmds:
-      - node --import tsx --test --test-timeout=120000 test/codex-registry.test.ts test/codex-safety.test.ts test/codex-transport.test.ts test/runner-uid.test.ts test/codex-broker.test.ts test/codex-render.test.ts test/codex-harness.test.ts test/codex-advice-harness.test.ts test/codex-select.test.ts test/codex-session-state.test.ts test/codex-config.test.ts test/codex-launcher.test.ts test/codex-terminal-normalize.test.ts test/codex-delegation.test.ts test/codex-fileop-client.test.ts test/codex-run-builder.test.ts test/codex-render-mutation.test.ts test/codex-executor.test.ts test/runner-codex-sinks.test.ts
+      # Includes the e2e/codex-m3b Block-A lifecycle proof (host-side, injected fakes, no
+      # Docker): its canary-absence security assertions run IN this gate; Block B (the real
+      # image path) self-skips unless CODEX_M3B_PACKAGED=1 (set only by run-lifecycle.sh).
+      - node --import tsx --test --test-timeout=120000 test/codex-registry.test.ts test/codex-safety.test.ts test/codex-transport.test.ts test/runner-uid.test.ts test/codex-broker.test.ts test/codex-render.test.ts test/codex-harness.test.ts test/codex-advice-harness.test.ts test/codex-select.test.ts test/codex-session-state.test.ts test/codex-config.test.ts test/codex-launcher.test.ts test/codex-terminal-normalize.test.ts test/codex-delegation.test.ts test/codex-fileop-client.test.ts test/codex-run-builder.test.ts test/codex-render-mutation.test.ts test/codex-executor.test.ts test/runner-codex-sinks.test.ts ../e2e/codex-m3b/lifecycle.test.ts
       # The both-image packaged proof. Its host tsc leg ALWAYS runs (cheap, host-only);
       # its docker leg is OPT-IN (UZI_CODEX_M3B_PACKAGED=1) so this aggregate stays green
       # in an environment without a docker daemon / with storage-flaky image builds.

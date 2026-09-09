@@ -11,8 +11,10 @@
 # mentions of "child_process"/"spawn", no call), so this rule reports ZERO findings on
 # the clean tree.
 #
-# THE PATTERN. `pattern-either` over the child_process creation forms
-# (spawn/spawnSync/exec/execFile). A raw `spawn("git", ...)` added inside a sink
+# THE PATTERN. `pattern-either` over ALL child_process creation forms
+# (spawn/spawnSync/exec/execSync/execFile/execFileSync/fork) -- kept in sync with
+# codex-no-direct-spawn.yml so the idiomatic `execSync("git push ...")` bypass cannot
+# evade the guard. A raw `spawn("git", ...)`/`execSync("git ...")` added inside a sink
 # fires. `exec(...)` matches a bare `exec` callee only, not `regexp.exec(...)`.
 #
 # 🔴 RELIABILITY BOUNDARY. This catches a RAW-SUBPROCESS PAT bypass -- a direct
@@ -45,4 +47,7 @@ rules:
       - pattern: spawn(...)
       - pattern: spawnSync(...)
       - pattern: exec(...)
+      - pattern: execSync(...)
       - pattern: execFile(...)
+      - pattern: execFileSync(...)
+      - pattern: fork(...)
