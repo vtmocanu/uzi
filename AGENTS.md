@@ -2,6 +2,19 @@
 
 "Uzinele Întunecate" (uzi): an AI dark factory. Go API + React SPA + PostgreSQL + an opt-in per-user worker container, run via docker-compose on a laptop. Users connect a forge and an Anthropic token; agents work `PRD`-labeled issues end to end (plan → approval gate → implement ⇄ review → branch + MR, never touching `main`).
 
+## Pull request reviews
+
+- Review requests authorize fetching the PR into a detached `/private/tmp` worktree.
+- Never `git pull` or switch the `main` worktree.
+- Use `gh pr diff` for scope, the worktree for files and tests, and `gh pr view` or `gh api` for metadata.
+
+```sh
+git fetch origin pull/<number>/head:refs/reviews/pr-<number>-<reviewer>
+git worktree add --detach /private/tmp/uzi-pr-<number>-<reviewer> refs/reviews/pr-<number>-<reviewer>
+git worktree remove /private/tmp/uzi-pr-<number>-<reviewer>
+git update-ref -d refs/reviews/pr-<number>-<reviewer>
+```
+
 ## Destructive operations
 
 Always loaded: a path-scoped rule fires on a file READ, i.e. after the decision to act, and everything here is irreversible.
