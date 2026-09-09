@@ -1,4 +1,4 @@
-import { describe, it } from "node:test";
+import { describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import { PassThrough } from "node:stream";
 
@@ -50,8 +50,12 @@ function makeClient(opts: { maxLineBytes?: number; requestTimeoutMs?: number } =
   requests: RequestSink;
   respond: (r: Record<string, unknown>) => void;
   endHelper: () => void;
+  writes: () => number;
 } {
   const toHelper = new PassThrough();
+  // Spy on client→helper writes (still calls through) so a test can prove the client's
+  // oversize guard rejects a frame BEFORE writing it. [#1171 m5 review]
+  const writeSpy = mock.method(toHelper, "write");
   const toClient = new PassThrough();
   const client = new FileopHelperClient({
     inbound: toClient,
@@ -64,6 +68,7 @@ function makeClient(opts: { maxLineBytes?: number; requestTimeoutMs?: number } =
     requests: new RequestSink(toHelper),
     respond: (r) => toClient.write(`${JSON.stringify(r)}\n`),
     endHelper: () => toClient.end(),
+    writes: () => writeSpy.mock.callCount(),
   };
 }
 
@@ -171,6 +176,7 @@ describe("FileopHelperClient: fail-closed transport handling", () => {
     const res = await p;
     assert.equal(res.ok, false);
     assert.equal(res.code, "E_OVERSIZE");
+    assert.equal(h.writes(), 0, "the oversize frame was rejected before any write to the helper");
   });
 
   it("resolves E_TIMEOUT when no response arrives within the deadline", async () => {

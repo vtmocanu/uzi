@@ -373,7 +373,11 @@ describe("RunRunner — per-run executor isolation (PRD #42 Decision 4)", () => 
           codex: { auth_mode: "subscription", access_token: CODEX_TOKEN, capability: CODEX_CAP, generation: 3 },
         },
       });
-      await runnerWith(() => ({ executor: new StubExecutor(nullLogger()) }), gitlab, undefined, logger).execute(claim);
+      await runnerWith(() => {
+        assert.ok(added.includes(CODEX_TOKEN), "the codex token canary is registered BEFORE the executor is constructed");
+        assert.ok(added.includes(CODEX_CAP), "the codex capability canary is registered BEFORE the executor is constructed");
+        return { executor: new StubExecutor(nullLogger()) };
+      }, gitlab, undefined, logger).execute(claim);
       assert.ok(added.includes(CODEX_TOKEN), "the codex access token was registered as a canary");
       assert.ok(added.includes(CODEX_CAP), "the codex capability was registered as a canary");
       assert.ok(removed.includes(CODEX_TOKEN), "the codex token canary was evicted on terminal");
