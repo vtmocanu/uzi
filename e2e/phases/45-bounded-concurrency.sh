@@ -199,11 +199,21 @@ else
   # Restart the worker (same join token ⇒ same worker id): it re-claims both by
   # affinity and drives them to completion. The exported UZI_WORKER_TOKEN re-sources
   # the `worker_token` secret; no token re-delivery is needed.
+  #
+  # Since issue #1213 the re-claim of a HARD-KILLED run first parks in recovery_wait:
+  # the SIGKILL left a pending recovery-capture journal, so the runner verifies the
+  # retained runner clone before reseeding, then the sweeper auto-promotes it back to
+  # queued for a second re-claim that reaches the gate. So the resume traverses
+  # recovery_wait → queued → claimed → running → awaiting_approval. The overlay
+  # compresses the park's backoff base (RUN_RECOVERY_PARK_BASE) so the whole park fits
+  # this wait, but the park's jitter is a non-configurable 5-30s (recoverywait.go), so
+  # the ceiling is 90s (give-up, not expected — the park promotes in ~10s typically)
+  # to absorb the worst-case jitter plus re-claim under CI load.
   "${COMPOSE[@]}" up -d --wait agent >/dev/null
   wait_worker_online
-  wait_status "$RUN_KA" awaiting_approval 60
-  wait_status "$RUN_KB" awaiting_approval 60
-  pass "restarted worker re-claimed both re-queued runs (affinity) — both back at the gate"
+  wait_status "$RUN_KA" awaiting_approval 90
+  wait_status "$RUN_KB" awaiting_approval 90
+  pass "restarted worker re-claimed both re-queued runs (affinity, via recovery_wait) — both back at the gate"
 
   apipost "/api/runs/$RUN_KA/inputs" '{"kind":"approve_plan","body":""}' >/dev/null
   apipost "/api/runs/$RUN_KB/inputs" '{"kind":"approve_plan","body":""}' >/dev/null
