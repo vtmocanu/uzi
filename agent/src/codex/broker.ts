@@ -116,6 +116,29 @@ const CHILD_FAILURE_CODES: ReadonlySet<string> = new Set([
   "child_denied",
 ]);
 
+/** Closed helper/client failure vocabulary permitted into model-visible output.
+ *  The Go helper owns every `E_*` code except the client's local timeout sentinel. */
+const FILEOP_FAILURE_CODES: ReadonlySet<string> = new Set([
+  "E_OVERSIZE",
+  "E_MALFORMED",
+  "E_UNKNOWN_OP",
+  "E_DENIED",
+  "E_ESCAPE",
+  "E_SYMLINK",
+  "E_NOT_FOUND",
+  "E_EXISTS",
+  "E_NOT_DIR",
+  "E_IS_DIR",
+  "E_NOT_FILE",
+  "E_NOT_EMPTY",
+  "E_PERM",
+  "E_INTERNAL",
+  "E_IO",
+  "E_NO_MATCH",
+  "E_AMBIGUOUS",
+  "E_TIMEOUT",
+]);
+
 /** The capability the broker binds a callback to, decided from the tool NAME +
  *  grants — never from the arguments. */
 type Capability = "shell" | "file_write" | "file_read" | "signal" | "delegate" | "mcp" | "unknown";
@@ -172,7 +195,9 @@ export type CallbackResult =
  *  (agent/codex/supervisor/fileop). `path`/`newPath` are worktree-RELATIVE (the
  *  helper anchors them at the root dirfd and rejects an absolute/`..`/`.git`
  *  component itself); `data` is base64 for a write (and the REPLACEMENT text for
- *  `apply`); `old` is base64 of the text `apply` must find-and-replace on a held fd.
+ *  `apply`); `old` is base64 of the text `apply` must find-and-replace. The helper
+ *  reads through an openat2-pinned fd, then stages and atomically renames the result
+ *  within the pinned parent directory.
  *  The `id` correlation is the production client's job, not the broker's. */
 export interface FileopRequest {
   readonly op: "stat" | "read" | "write" | "apply" | "mkdir" | "rename" | "unlink" | "rmdir" | "list";
@@ -217,6 +242,7 @@ export interface SpawnCommandResult {
 export interface SpawnCommandOptions {
   readonly cwd?: string;
   readonly env?: NodeJS.ProcessEnv;
+  readonly signal?: AbortSignal;
 }
 
 /** The injected "run a shell command as the COMMAND identity" seam. `argv` is the
@@ -289,6 +315,7 @@ export interface CodexCallbackBrokerOptions {
    *  every delegation as an unknown role. */
   readonly allowedRoles?: ReadonlySet<string>;
   readonly screenPolicy?: ScreenPolicy;
+  readonly signal?: AbortSignal;
 }
 
 // --- small pure helpers -------------------------------------------------------
@@ -322,7 +349,7 @@ function anyStrField(args: unknown, key: string): string | undefined {
 
 /** One parsed Claude-vocabulary edit: a non-empty `oldStr` to find and a (possibly
  *  empty) `newStr` to replace it with. This is the `apply_patch`/`Edit`/`MultiEdit`
- *  argument shape the renderer maps, normalized for the fd-anchored `apply` op. */
+ *  argument shape the renderer maps, normalized for the atomic staged `apply` op. */
 interface ParsedEdit {
   readonly oldStr: string;
   readonly newStr: string;
@@ -426,6 +453,7 @@ export class CodexCallbackBroker {
   private readonly allowedRoles: ReadonlySet<string>;
   private readonly extraSecretPaths: readonly string[];
   private readonly dockerWired: boolean;
+  private readonly signal: AbortSignal | undefined;
 
   constructor(opts: CodexCallbackBrokerOptions) {
     this.registry = opts.registry;
@@ -438,6 +466,7 @@ export class CodexCallbackBroker {
     this.allowedRoles = opts.allowedRoles ?? new Set<string>();
     this.extraSecretPaths = opts.screenPolicy?.extraSecretPaths ?? [];
     this.dockerWired = opts.screenPolicy?.dockerWired ?? false;
+    this.signal = opts.signal;
   }
 
   /**
@@ -603,7 +632,7 @@ export class CodexCallbackBroker {
     }
     if (screen.denied) return deny("shell_denied", screen.reason ?? "denied by guardrail");
 
-    const spawned = await this.spawnCommand(["/bin/sh", "-c", command], { cwd: spawnCwd });
+    const spawned = await this.spawnCommand(["/bin/sh", "-c", command], { cwd: spawnCwd, signal: this.signal });
     return {
       ok: true,
       output: {
@@ -645,8 +674,8 @@ export class CodexCallbackBroker {
     // maps (Write/Edit/MultiEdit → apply_patch). Which EFFECT it is comes from the args,
     // but the args NEVER widen authority — the capability was already granted. Precedence:
     //   1. a full-file `content` body           → the `write` op (create-or-truncate);
-    //   2. a `edits` array (MultiEdit)           → a SEQUENCE of fd-anchored `apply` ops;
-    //   3. a single `old_string`/`new_string`    → ONE fd-anchored `apply` op.
+    //   2. a `edits` array (MultiEdit)           → a SEQUENCE of atomic staged `apply` ops;
+    //   3. a single `old_string`/`new_string`    → ONE atomic staged `apply` op.
     // EVERY branch goes through the openat2 no-symlink fileop helper — a model-selected
     // file effect never falls back to pathname check-then-use node `fs`. The `content`
     // branch stays byte-for-byte the M2 behaviour so its existing control is unaffected.
@@ -671,10 +700,9 @@ export class CodexCallbackBroker {
     const screened = this.screenAndRelativize(candidate);
     if ("ok" in screened) return screened;
 
-    // Apply each edit as its OWN atomic fd-anchored op (the Go helper holds one fd per
-    // apply for the whole read-modify-write, so there is no check-then-use window). A
-    // multi-edit is a sequence of atomic edits, not one atomic transaction — the first
-    // failure stops and is returned so a partial application is reported, never masked.
+    // Apply each edit as its OWN atomic staged replacement. A multi-edit is a sequence
+    // of atomic edits, not one atomic transaction. The first failure stops the batch,
+    // and the bounded denial explicitly reports how many earlier edits remain applied.
     let applied = 0;
     for (const edit of edits) {
       const res = await this.fileop.op({
@@ -683,7 +711,7 @@ export class CodexCallbackBroker {
         old: Buffer.from(edit.oldStr, "utf8").toString("base64"),
         data: Buffer.from(edit.newStr, "utf8").toString("base64"),
       });
-      if (!res.ok) return this.mapFileopError(res);
+      if (!res.ok) return this.mapFileopError(res, applied);
       applied += 1;
     }
     return { ok: true, output: { applied } };
@@ -738,10 +766,19 @@ export class CodexCallbackBroker {
     };
   }
 
-  /** Map a fileop error code (bounded vocabulary) to a neutral denial. The code is
-   *  safe to echo; a raw errno/path/content never reaches here. */
-  private mapFileopError(res: FileopResponse): CallbackResult {
-    return deny("fileop_denied", `file operation denied (${res.code ?? "E_IO"})`);
+  /** Map a fileop response to a bounded neutral denial. Only the closed helper/client
+   *  code vocabulary is echoed; a raw code, errno, path, or content never reaches it. */
+  private mapFileopError(res: FileopResponse, appliedBeforeFailure?: number): CallbackResult {
+    const code =
+      typeof res.code === "string" && res.code.length <= 16 && FILEOP_FAILURE_CODES.has(res.code) ? res.code : "E_IO";
+    const partial =
+      appliedBeforeFailure === undefined
+        ? ""
+        : `; ${appliedBeforeFailure} edit${appliedBeforeFailure === 1 ? "" : "s"} applied before failure`;
+    // `appliedBeforeFailure` is bounded by a JavaScript array length, so its decimal
+    // representation is at most ten digits. No path, edit body, or raw helper error
+    // crosses this neutral model-visible result.
+    return deny("fileop_denied", `file operation denied (${code})${partial}`);
   }
 
   // --- signals (ROOT-ONLY) ----------------------------------------------------

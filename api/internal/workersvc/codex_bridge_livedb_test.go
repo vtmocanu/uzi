@@ -118,6 +118,9 @@ func TestCoordinatedRefreshThroughProductionCodexauthClientLiveDB(t *testing.T) 
 	if res.AccessToken == f.accessToken {
 		t.Fatal("refresh released the pre-rotation (stale) access token")
 	}
+	if res.ChatGPTAccountID != acct.WorkspaceAccountID {
+		t.Fatalf("refresh chatgpt account id = %q, want verified %q", res.ChatGPTAccountID, acct.WorkspaceAccountID)
+	}
 	if oauth, usage := doer.calls(); oauth != 1 || usage != 1 {
 		t.Fatalf("provider calls = (oauth %d, usage %d), want (1, 1) for one advance", oauth, usage)
 	}

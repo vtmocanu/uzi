@@ -2151,7 +2151,7 @@ tasks:
       # Includes the e2e/codex-m3b Block-A lifecycle proof (host-side, injected fakes, no
       # Docker): its canary-absence security assertions run IN this gate; Block B (the real
       # image path) self-skips unless CODEX_M3B_PACKAGED=1 (set only by run-lifecycle.sh).
-      - node --import tsx --test --test-timeout=120000 test/codex-registry.test.ts test/codex-safety.test.ts test/codex-transport.test.ts test/runner-uid.test.ts test/codex-broker.test.ts test/codex-render.test.ts test/codex-harness.test.ts test/codex-advice-harness.test.ts test/codex-select.test.ts test/codex-session-state.test.ts test/codex-config.test.ts test/codex-launcher.test.ts test/codex-terminal-normalize.test.ts test/codex-delegation.test.ts test/codex-fileop-client.test.ts test/codex-run-builder.test.ts test/codex-render-mutation.test.ts test/codex-executor.test.ts test/runner-codex-sinks.test.ts ../e2e/codex-m3b/lifecycle.test.ts
+      - node --import tsx --test --test-timeout=120000 test/codex-registry.test.ts test/codex-safety.test.ts test/codex-transport.test.ts test/runner-uid.test.ts test/codex-broker.test.ts test/codex-render.test.ts test/codex-harness.test.ts test/codex-advice-harness.test.ts test/codex-select.test.ts test/codex-session-state.test.ts test/codex-config.test.ts test/codex-launcher.test.ts test/codex-terminal-normalize.test.ts test/codex-delegation.test.ts test/codex-fileop-client.test.ts test/codex-run-builder.test.ts test/codex-render-mutation.test.ts test/codex-executor.test.ts test/codex-command-root-linux.test.ts test/runner-codex-sinks.test.ts ../e2e/codex-m3b/lifecycle.test.ts
       # The both-image packaged proof. Its host tsc leg ALWAYS runs (cheap, host-only);
       # its docker leg is OPT-IN (UZI_CODEX_M3B_PACKAGED=1) so this aggregate stays green
       # in an environment without a docker daemon / with storage-flaky image builds.
@@ -2173,7 +2173,8 @@ tasks:
     #      /app/src CodexExecutor through the plan/approval-resume -> implement -> synchronous
     #      subagent -> root-only-signal-denial -> checkpoint -> cancel -> finalization
     #      lifecycle and proving the injected credential/capability canaries never reach a
-    #      public message, a provider-visible request, a log line, or the command-root state.
+    #      public message, a provider-visible request, a log line, or the command-root state;
+    #      the same image run exercises uid-10003 Landlock sibling isolation and real cap-kill/reap.
     #      This leg is CI/maintainer-only: in-worker image builds are storage-flaky and arm64
     #      is blocked, so it is DEFAULT-SKIPPED. Requires a working docker daemon + egress for
     #      the pinned Codex/toolchain artifacts on a cold build. NOT wired into gate.

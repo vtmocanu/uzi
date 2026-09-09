@@ -239,6 +239,8 @@ export class MessageBatcher {
   private closed = false;
   /** The currently running flush, if any, so close() can await it. */
   private inFlight: Promise<void> | undefined;
+  /** Cancels the current post even when a timer, rather than close(), started it. */
+  private inFlightAbort: AbortController | undefined;
 
   /** Scrubs known secrets from every payload before it leaves the worker. */
   private readonly redact: PayloadRedactor;
@@ -431,13 +433,20 @@ export class MessageBatcher {
     return this.buffer.splice(0, n);
   }
 
-  async flush(): Promise<void> {
+  async flush(signal?: AbortSignal): Promise<void> {
     if (this.flushing || this.buffer.length === 0 || this.tripped) return;
     this.flushing = true;
-    this.inFlight = this.doFlush();
+    const abort = new AbortController();
+    const onAbort = (): void => abort.abort(signal?.reason);
+    if (signal?.aborted) onAbort();
+    else signal?.addEventListener("abort", onAbort, { once: true });
+    this.inFlightAbort = abort;
+    this.inFlight = this.doFlush(abort.signal);
     try {
       await this.inFlight;
     } finally {
+      signal?.removeEventListener("abort", onAbort);
+      if (this.inFlightAbort === abort) this.inFlightAbort = undefined;
       this.inFlight = undefined;
     }
   }
@@ -494,7 +503,7 @@ export class MessageBatcher {
    *
    * Returns the messages that still need delivering, in seq order.
    */
-  private async bisect(batch: Buffered[]): Promise<{ remaining: Buffered[]; progressed: boolean }> {
+  private async bisect(batch: Buffered[], signal?: AbortSignal): Promise<{ remaining: Buffered[]; progressed: boolean }> {
     let lo = 0;
     let hi = batch.length;
     let posts = 0;
@@ -514,6 +523,7 @@ export class MessageBatcher {
         await this.client.postMessages(
           this.runId,
           half.map((b) => b.msg),
+          signal,
         );
         lo = mid; // confirmed clean by a 2xx
         progressed = true; // a sub-batch was persisted
@@ -567,7 +577,7 @@ export class MessageBatcher {
       bisect_posts: posts,
     });
     try {
-      await this.client.postMessages(this.runId, [marker.msg]);
+      await this.client.postMessages(this.runId, [marker.msg], signal);
       progressed = true; // the poison was isolated and tombstoned
       return { remaining: batch.slice(lo + 1), progressed };
     } catch (err) {
@@ -593,22 +603,27 @@ export class MessageBatcher {
    * ordinary case the buffer is far under the cap, this runs once, and the wire
    * behaviour is identical to before.
    */
-  private async doFlush(): Promise<void> {
+  private async doFlush(signal?: AbortSignal): Promise<void> {
     try {
-      while (this.buffer.length > 0 && !this.tripped) {
+      while (this.buffer.length > 0 && !this.tripped && !signal?.aborted) {
         const batch = this.takePrefix();
         if (batch.length === 0) break;
         try {
           await this.client.postMessages(
             this.runId,
             batch.map((b) => b.msg),
+            signal,
           );
           // Any success clears the backoff, the failure clock and the split limit.
           this.consecutiveFailures = 0;
           this.failingSince = undefined;
           this.splitLimit = undefined;
         } catch (err) {
-          if (await this.handleFailure(batch, err)) break;
+          if (signal?.aborted) {
+            this.buffer = batch.concat(this.buffer);
+            break;
+          }
+          if (await this.handleFailure(batch, err, signal)) break;
         }
       }
     } finally {
@@ -621,7 +636,7 @@ export class MessageBatcher {
    * React to one failed sub-batch. Returns true when the flush loop should stop and
    * wait for the backed-off retry, false when it should keep going immediately.
    */
-  private async handleFailure(batch: Buffered[], err: unknown): Promise<boolean> {
+  private async handleFailure(batch: Buffered[], err: unknown, signal?: AbortSignal): Promise<boolean> {
     const verdict = classify(err);
     const lastSeq = batch[0]?.msg.seq ?? this.seq;
 
@@ -686,7 +701,7 @@ export class MessageBatcher {
         this.buffer = [tombstone(only, "message_dropped", "payload rejected by the api", this.redactText), ...this.buffer];
         return false;
       }
-      const { remaining, progressed } = await this.bisect(batch);
+      const { remaining, progressed } = await this.bisect(batch, signal);
       this.buffer = remaining.concat(this.buffer);
       if (this.tripped) return true;
       if (!progressed) {
@@ -734,8 +749,10 @@ export class MessageBatcher {
     }
   }
 
-  /** Stop accepting messages and drain the buffer with a few bounded retries. */
-  async close(): Promise<void> {
+  /** Stop accepting messages and drain the buffer with a few bounded retries.
+   * A durability permit signal also cancels a timer-started in-flight post, so
+   * close cannot outlive the owning boundary on an independent HTTP timeout. */
+  async close(signal?: AbortSignal): Promise<void> {
     this.closed = true;
     if (this.timer) {
       clearTimeout(this.timer);
@@ -745,7 +762,18 @@ export class MessageBatcher {
     // failed flush re-buffers its batch before we decide what is left to drain
     // (otherwise close() could observe an empty buffer and return while the
     // in-flight flush later fails and strands those messages).
-    if (this.inFlight) await this.inFlight;
+    const abortInFlight = (): void => this.inFlightAbort?.abort(signal?.reason);
+    if (signal?.aborted) abortInFlight();
+    else signal?.addEventListener("abort", abortInFlight, { once: true });
+    try {
+      if (this.inFlight) await this.inFlight;
+    } finally {
+      signal?.removeEventListener("abort", abortInFlight);
+    }
+    if (signal?.aborted) {
+      this.warnUndeliveredAtClose("durability boundary deadline expired");
+      return;
+    }
     // A tripped breaker skips the drain entirely. The 3 attempts plus 600ms of
     // sleeps below exist to ride out a blip; a trip has already established that
     // this is not a blip, so buying three more futile round-trips only delays the
@@ -771,14 +799,40 @@ export class MessageBatcher {
     let failed = 0;
     while (failed < CLOSE_MAX_FAILED_ATTEMPTS && this.buffer.length > 0) {
       const before = this.buffer.length;
-      await this.flush();
+      await this.flush(signal);
       if (this.buffer.length === 0) break;
+      if (signal?.aborted) break;
       if (this.buffer.length < before) continue; // a sub-batch landed; keep going
       failed += 1;
-      await sleep(200 * failed);
+      await sleepUnlessAborted(200 * failed, signal);
     }
-    if (this.buffer.length > 0) {
-      this.log.warn("message batcher closed with undelivered messages", { run_id: this.runId, dropped: this.buffer.length });
-    }
+    if (this.buffer.length > 0)
+      this.warnUndeliveredAtClose(signal?.aborted ? "durability boundary deadline expired" : undefined);
   }
+
+  private warnUndeliveredAtClose(reason?: string): void {
+    if (this.buffer.length === 0) return;
+    this.log.warn("message batcher closed with undelivered messages", {
+      run_id: this.runId,
+      dropped: this.buffer.length,
+      ...(reason ? { reason } : {}),
+    });
+  }
+}
+
+function sleepUnlessAborted(ms: number, signal: AbortSignal | undefined): Promise<void> {
+  if (!signal) return sleep(ms);
+  signal.throwIfAborted();
+  return new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    timer.unref?.();
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      reject(signal.reason);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
 }

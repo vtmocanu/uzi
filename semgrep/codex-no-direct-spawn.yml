@@ -1,24 +1,21 @@
 # DARK CODEX GUARD (issue #1171 M5) -- no raw child_process spawn in
-# agent/src/codex/** outside the three sanctioned raw-spawn wrappers.
+# agent/src/codex/** outside the one sanctioned supervisor launcher.
 #
 # WHAT THIS ENFORCES. Inside the Codex provider tree, raw subprocess creation is
-# confined to exactly three files that legitimately import `node:child_process`
-# today: launcher.ts (the supervisor spawn plus the id/provision spawnSync probes),
-# codex-executor.ts (the command seam's direct child spawn), and fileop-client.ts
-# (the fileop seam). Every other file in agent/src/codex/** must reach a subprocess
-# through those seams, never by importing child_process and spawning its own -- a raw
+# confined to launcher.ts (the supervisor spawn plus the id/provision spawnSync
+# probes). Every other file in agent/src/codex/** must reach a subprocess
+# through that seam, never by importing child_process and spawning its own -- a raw
 # spawn elsewhere escapes the supervisor/registry lifecycle and the seam boundary.
-# (R2 supervisor-registration of these spawners is deferred, so the three stay
-# sanctioned for now.)
+# Shell, fileop and boundary-action processes reserve and register through it.
 #
 # THE PATTERN. `pattern-either` over three shapes: (1) the bare-callee child_process
 # call forms (spawn/spawnSync/exec/execSync/execFile/execFileSync/fork); (2) the
 # namespace-member forms (cp.spawn(...) etc.) for the names that do not collide with
 # common member methods; and (3) an aliased or namespaced child_process IMPORT itself
 # (import * as cp / import { spawn as start }), whose local name is arbitrary and so
-# escapes (1) and (2). The three sanctioned spawner files are `paths.exclude`d. On the
-# clean tree the only child_process users in agent/src/codex/** are those three excluded
-# files (confirmed by grep), so this rule reports ZERO findings; the same call/import in
+# escapes (1) and (2). The sanctioned launcher is `paths.exclude`d. On the
+# clean tree it is the only child_process user in agent/src/codex/**, so this rule
+# reports ZERO findings; the same call/import in
 # e.g. broker.ts fires. `exec(...)` matches only a bare `exec` callee, and no $NS.exec
 # member pattern is used, so `regexp.exec(...)` / `str.exec(...)` never fire. Codex tests
 # live under agent/test/, outside this rule's /agent/src/codex scope.
@@ -26,7 +23,7 @@
 # 🔴 RELIABILITY BOUNDARY. This is a SYNTACTIC, FILE-GLOB-SCOPED match on the direct
 # child_process call APIs and imports by name. It does NOT trace a spawn hidden behind a helper
 # imported from another module (intraprocedural limit), and it does NOT prove the
-# three sanctioned spawners themselves are correct -- only that no NEW file in the
+# sanctioned spawner itself is correct -- only that no NEW file in the
 # tree grows its own raw spawn. A spawner added under a new sanctioned seam must be
 # added to the exclude list deliberately, the same way the include glob is kept in
 # sync.
@@ -36,14 +33,14 @@
 # an aliased `import { spawn as start } from "node:child_process"; start("x");` fires;
 # reverting returns to zero.
 # NEGATIVE CONTROL: the committed tree reports zero findings -- the only child_process
-# users are the three excluded files, and `regexp.exec(...)` does not match.
+# user is the excluded launcher, and `regexp.exec(...)` does not match.
 rules:
   - id: codex-no-direct-spawn
     languages: [typescript]
     severity: ERROR
     message: >-
-      Raw child_process spawn is confined to the three sanctioned Codex spawner files
-      (launcher.ts, codex-executor.ts, fileop-client.ts). A spawn/exec/fork in any
+      Raw child_process spawn is confined to the sanctioned Codex supervisor launcher.
+      A spawn/exec/fork in any
       other agent/src/codex file escapes the supervisor/registry lifecycle and the
       seam boundary. Route the subprocess through the launcher / command / fileop
       seam.
@@ -53,13 +50,10 @@ rules:
       # The gate scans `.` from the repo root, so this resolves to agent/src/codex/.
       include:
         - /agent/src/codex
-      # The only three files that legitimately import node:child_process today: the
-      # supervisor spawn (launcher.ts), the command seam's direct child spawn
-      # (codex-executor.ts), and the fileop seam (fileop-client.ts).
+      # The only file that legitimately imports node:child_process today: the
+      # supervisor spawn plus its fixed provisioning probes.
       exclude:
         - /agent/src/codex/launcher.ts
-        - /agent/src/codex/codex-executor.ts
-        - /agent/src/codex/fileop-client.ts
     pattern-either:
       # (1) BARE-CALLEE call forms (a destructured `import { spawn } from ...`).
       - pattern: spawn(...)

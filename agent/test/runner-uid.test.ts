@@ -207,16 +207,15 @@ describe("runner-uid: codex command/boundary identities (#1171)", () => {
     assert.ok(args.indexOf("--") < args.indexOf("bash"), "the command must follow the -- separator");
   });
 
-  it("workerBoundaryCommand is UNWRAPPED in BOTH modes (the worker IS uid 10001)", () => {
-    // The credentialed boundary root must run as the PAT holder itself — no setpriv.
+  it("workerBoundaryCommand preserves uid 10001 but clears retained controller caps under the split", () => {
     assert.deepEqual(workerBoundaryCommand("git", ["push", "origin", "HEAD"]), {
       command: "git",
       args: ["push", "origin", "HEAD"],
     });
     process.env.UZI_UID_SPLIT = "1";
     assert.deepEqual(workerBoundaryCommand("git", ["push", "origin", "HEAD"]), {
-      command: "git",
-      args: ["push", "origin", "HEAD"],
+      command: "/bin/setpriv",
+      args: [...setprivArgsForUid(WORKER_UID), "git", "push", "origin", "HEAD"],
     });
   });
 });

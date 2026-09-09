@@ -112,7 +112,7 @@ func (h intentReadHookStore) GetCodexRefreshIntent(ctx context.Context, arg stor
 }
 
 // releaseHookStore wraps *store.Queries to fire a side effect during the subscription
-// token-read step of ReleaseCodexAccessToken — after the FIRST authorize has passed and
+// token-read step of ReleaseCodexCredential, after the FIRST authorize has passed and
 // before the recheck-before-release — so a test can stale authority mid-call and pin the
 // recheck (deleting the recheck makes such a test leak the token and fail).
 type releaseHookStore struct {
@@ -1013,23 +1013,30 @@ func (e codexTestEnv) openSealedBlob(t *testing.T, userID uuid.UUID, sealed []by
 	return b
 }
 
-// TestReleaseCodexAccessTokenSubscriptionLiveDB proves release returns the subscription
-// access token only (never the login/refresh blob) and rejects when authority is stale.
-func TestReleaseCodexAccessTokenSubscriptionLiveDB(t *testing.T) {
+// TestReleaseCodexCredentialSubscriptionLiveDB proves release returns the subscription
+// access token plus its server-owned account/generation metadata (never the login/refresh
+// blob) and rejects when authority is stale.
+func TestReleaseCodexCredentialSubscriptionLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 
 	t.Run("returns access token only", func(t *testing.T) {
 		f := newRefreshFixture(t, env, &fakeRefreshClient{})
 		capw := env.mintCap(t, f.runID, f.workerID)
-		tok, err := f.svc.ReleaseCodexAccessToken(env.ctx, f.wkr, f.runID, capw)
+		released, err := f.svc.ReleaseCodexCredential(env.ctx, f.wkr, f.runID, capw)
 		if err != nil {
 			t.Fatalf("release: %v", err)
 		}
-		if tok != f.accessToken {
-			t.Fatalf("released %q, want the access token %q", tok, f.accessToken)
+		if released.AccessToken != f.accessToken {
+			t.Fatalf("released %q, want the access token %q", released.AccessToken, f.accessToken)
 		}
-		if tok == f.prevRefreshToken {
+		if released.AccessToken == f.prevRefreshToken {
 			t.Fatal("release must never return the refresh token")
+		}
+		if released.AuthMode != codexAuthModeSubscription || released.Generation == nil || *released.Generation != 0 {
+			t.Fatalf("subscription release metadata = (%q,%v), want (subscription,0)", released.AuthMode, released.Generation)
+		}
+		if released.ChatGPTAccountID != f.workspaceAcctID {
+			t.Fatalf("chatgpt account id = %q, want verified %q", released.ChatGPTAccountID, f.workspaceAcctID)
 		}
 	})
 
@@ -1039,12 +1046,12 @@ func TestReleaseCodexAccessTokenSubscriptionLiveDB(t *testing.T) {
 		// A genuine account-level revoke bumps credential_revision, staling the run's
 		// frozen authority.
 		env.exec(`UPDATE codex_provider_account SET credential_revision = credential_revision + 1 WHERE id=$1`, f.accountID)
-		tok, err := f.svc.ReleaseCodexAccessToken(env.ctx, f.wkr, f.runID, capw)
+		released, err := f.svc.ReleaseCodexCredential(env.ctx, f.wkr, f.runID, capw)
 		if !errors.Is(err, ErrCodexAccountRevisionStale) {
 			t.Fatalf("err = %v, want ErrCodexAccountRevisionStale", err)
 		}
-		if tok != "" {
-			t.Fatalf("token = %q, want empty on stale authority", tok)
+		if released != (CodexReleaseResult{}) {
+			t.Fatalf("release = %+v, want empty on stale authority", released)
 		}
 	})
 
@@ -1064,17 +1071,17 @@ func TestReleaseCodexAccessTokenSubscriptionLiveDB(t *testing.T) {
 				env.exec(`UPDATE codex_provider_account SET credential_revision = credential_revision + 1 WHERE id=$1`, f.accountID)
 			},
 		}
-		tok, err := f.svc.ReleaseCodexAccessToken(env.ctx, f.wkr, f.runID, capw)
+		released, err := f.svc.ReleaseCodexCredential(env.ctx, f.wkr, f.runID, capw)
 		if !errors.Is(err, ErrCodexAccountRevisionStale) {
 			t.Fatalf("err = %v, want ErrCodexAccountRevisionStale from the recheck", err)
 		}
-		if tok != "" {
-			t.Fatalf("token = %q, want empty when authority stales mid-call", tok)
+		if released != (CodexReleaseResult{}) {
+			t.Fatalf("release = %+v, want empty when authority stales mid-call", released)
 		}
 	})
 }
 
-// TestReleaseCodexAccessTokenMisboundKindNonDisclosureLiveDB pins the kind non-disclosure
+// TestReleaseCodexCredentialMisboundKindNonDisclosureLiveDB pins the kind non-disclosure
 // defense (PRD #1147 audit #6): a run FORCED into a mis-bound state — codex_auth_mode
 // 'api_key' while its codex_secret_id points at a codex_auth alias (whose login blob
 // carries a refresh_token) — must NEVER release that blob. Release refuses it with
@@ -1086,7 +1093,7 @@ func TestReleaseCodexAccessTokenSubscriptionLiveDB(t *testing.T) {
 // the api_key branch with OpenByID, which decrypts a row of ANY kind — so this run would
 // have released the codex_auth login blob (refresh_token and all) as the "access token".
 // The fix refuses it and discloses no bytes.
-func TestReleaseCodexAccessTokenMisboundKindNonDisclosureLiveDB(t *testing.T) {
+func TestReleaseCodexCredentialMisboundKindNonDisclosureLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	userID, workerID, repoID := env.seedCodexInfra(t)
 
@@ -1104,23 +1111,23 @@ func TestReleaseCodexAccessTokenMisboundKindNonDisclosureLiveDB(t *testing.T) {
 	wkr := store.Worker{ID: workerID, UserID: userID}
 	capw := env.mintCap(t, runID, workerID)
 
-	tok, err := svc.ReleaseCodexAccessToken(env.ctx, wkr, runID, capw)
+	released, err := svc.ReleaseCodexCredential(env.ctx, wkr, runID, capw)
 	if !errors.Is(err, ErrCodexKindModeMismatch) {
 		t.Fatalf("mis-bound release: want ErrCodexKindModeMismatch, got %v", err)
 	}
 	// Any non-empty token is a failure; report a LEAKED value specifically (folded into the
 	// non-empty branch so the leak check is live, not dead code on an already-empty tok).
-	if tok != "" {
-		if strings.Contains(tok, "refresh") || tok == refresh {
-			t.Fatalf("the codex_auth login blob leaked through the api_key release path: %q", tok)
+	if released != (CodexReleaseResult{}) {
+		if strings.Contains(released.AccessToken, "refresh") || released.AccessToken == refresh {
+			t.Fatalf("the codex_auth login blob leaked through the api_key release path: %q", released.AccessToken)
 		}
-		t.Fatalf("mis-bound release must disclose no token, got %q", tok)
+		t.Fatalf("mis-bound release must disclose no credential, got %+v", released)
 	}
 }
 
-// TestReleaseCodexAccessTokenAPIKeyLiveDB proves release on an api_key run returns the
-// static key.
-func TestReleaseCodexAccessTokenAPIKeyLiveDB(t *testing.T) {
+// TestReleaseCodexCredentialAPIKeyLiveDB proves release on an api_key run returns the
+// static key and no subscription-only metadata.
+func TestReleaseCodexCredentialAPIKeyLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	userID, workerID, repoID := env.seedCodexInfra(t)
 	key := codexToken("sk")
@@ -1133,12 +1140,15 @@ func TestReleaseCodexAccessTokenAPIKeyLiveDB(t *testing.T) {
 	wkr := store.Worker{ID: workerID, UserID: userID}
 	capw := env.mintCap(t, runID, workerID)
 
-	tok, err := svc.ReleaseCodexAccessToken(env.ctx, wkr, runID, capw)
+	released, err := svc.ReleaseCodexCredential(env.ctx, wkr, runID, capw)
 	if err != nil {
 		t.Fatalf("release api_key: %v", err)
 	}
-	if tok != key {
-		t.Fatalf("released %q, want the static key %q", tok, key)
+	if released.AccessToken != key {
+		t.Fatalf("released %q, want the static key %q", released.AccessToken, key)
+	}
+	if released.AuthMode != codexAuthModeAPIKey || released.Generation != nil || released.ChatGPTAccountID != "" {
+		t.Fatalf("api_key release carried subscription metadata: %+v", released)
 	}
 }
 

@@ -37,10 +37,17 @@ class SpawnSpy {
 /** A spy over the fileop client, returning a scripted response. */
 class FileopSpy {
   calls: FileopRequest[] = [];
-  constructor(private readonly response: FileopResponse = { ok: true, size: 3 }) {}
+  private readonly responses: readonly FileopResponse[];
+  private responseIndex = 0;
+
+  constructor(response: FileopResponse | FileopResponse[] = { ok: true, size: 3 }) {
+    this.responses = Array.isArray(response) ? response : [response];
+  }
   op = async (request: FileopRequest): Promise<FileopResponse> => {
     this.calls.push(request);
-    return this.response;
+    const index = Math.min(this.responseIndex, this.responses.length - 1);
+    this.responseIndex += 1;
+    return this.responses[index]!;
   };
 }
 
@@ -258,6 +265,16 @@ describe("CodexCallbackBroker: file effects through the fileop client", () => {
     assert.equal(fileop.calls.length, 1);
   });
 
+  it("never reflects an unknown or oversized fileop code into model-visible output", async () => {
+    const rawCode = `E_FORGED\n${"x".repeat(4096)}`;
+    const fileop = new FileopSpy({ ok: false, code: rawCode });
+    const h = makeBroker({ fileop });
+    const r = await h.broker.handleToolCall(rt(), "Write", { path: "src/x.ts", content: "x" }, "root");
+    assertDenied(r, "fileop_denied");
+    assert.equal(r.message, "file operation denied (E_IO)");
+    assert.equal(r.message.includes(rawCode), false);
+  });
+
   it("denies a file write during the plan phase (no fileop)", async () => {
     const h = makeBroker({ grants: grants({ phase: "plan" }) });
     const r = await h.broker.handleToolCall(rt(), "Write", { path: "src/x.ts", content: "x" }, "root");
@@ -265,7 +282,7 @@ describe("CodexCallbackBroker: file effects through the fileop client", () => {
     assert.equal(h.fileop.calls.length, 0);
   });
 
-  it("routes an Edit (old_string/new_string) to the fd-anchored apply op", async () => {
+  it("routes an Edit (old_string/new_string) to the atomic staged apply op", async () => {
     const h = makeBroker();
     const r = await h.broker.handleToolCall(
       rt(),
@@ -331,6 +348,20 @@ describe("CodexCallbackBroker: file effects through the fileop client", () => {
     assertDenied(r, "fileop_denied");
     assert.match(r.message, /E_NO_MATCH/);
     assert.equal(fileop.calls.length, 1);
+  });
+
+  it("reports a successful first MultiEdit when the second apply fails", async () => {
+    const fileop = new FileopSpy([{ ok: true, size: 3 }, { ok: false, code: "E_AMBIGUOUS" }]);
+    const h = makeBroker({ fileop });
+    const r = await h.broker.handleToolCall(
+      rt(),
+      "MultiEdit",
+      { path: "src/x.ts", edits: [{ old_string: "a", new_string: "1" }, { old_string: "b", new_string: "2" }] },
+      "root",
+    );
+    assertDenied(r, "fileop_denied");
+    assert.equal(r.message, "file operation denied (E_AMBIGUOUS); 1 edit applied before failure");
+    assert.equal(fileop.calls.length, 2);
   });
 
   it("maps the apply no-match / ambiguous codes to a neutral denial", async () => {

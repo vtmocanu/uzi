@@ -30,8 +30,8 @@ import { before, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import fs from "node:fs";
-import os from "node:os";
 import nodePath from "node:path";
+import { PassThrough } from "node:stream";
 
 import {
   loadPackagedCodexExecutor,
@@ -49,7 +49,8 @@ import type { FileopHelperHandle } from "../../agent/src/codex/fileop-client.js"
 import type { CodexNotification, CodexTransport } from "../../agent/src/codex/transport.js";
 import type { RunContext, EmittedMessage, Executor } from "../../agent/src/executor.js";
 import type { Logger } from "../../agent/src/log.js";
-import type { AgentTemplate } from "../../agent/src/protocol.js";
+import type { AgentTemplate, ClaimCodexSecrets } from "../../agent/src/protocol.js";
+import type { CodexEffectLaunchSpec, CodexRootHandle } from "../../agent/src/codex/launcher.js";
 
 // ─── the PACKAGED adapter, loaded once before any test (image /app/src, or the host
 // source tree). A top-level `before` (not top-level await — the CommonJS-typed e2e tree
@@ -372,10 +373,23 @@ function makeRig(canaries: CodexCanaries, opts: { responder?: Responder } = {}):
       spawnCommandCalls.push({ argv, opts: cmdOpts });
       return { code: 0, stdout: "ok", stderr: "" };
     },
-    spawnFileop: (worktreePath, env) => {
-      fileopSpawns.push({ worktreePath, env });
-      return fh.handle;
+    launchEffectRoot: async (spec: CodexEffectLaunchSpec): Promise<CodexRootHandle> => {
+      fileopSpawns.push({ worktreePath: "/work/repo", env: spec.env });
+      const stdin = new PassThrough();
+      const stdout = new PassThrough();
+      const stderr = new PassThrough();
+      return {
+        started: { event: "started", supervisorPid: 200, childPid: 201, subreaper: true, nondumpable: true, uid: 10003, liveCapsZero: true, capBoundingSet: "0xc0", noNewPrivs: true },
+        supervisorPid: 200,
+        transport: { stdin, stdout, stderr },
+        snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
+        waitChild: async () => ({ event: "child_exit", code: 0 }),
+        dispose: async () => ({ clean: true, event: { event: "dispose", id: 1, state: "drained", authority: "ECHILD+__WALL" } }),
+        failed: undefined,
+        whenFailed: new Promise<Error>(() => undefined),
+      };
     },
+    wireFileop: () => fh.handle,
     sessionStore: {
       adopt: async () => {
         sessionOps.adopt += 1;
@@ -486,8 +500,15 @@ const counts = { tests: 0, callbacks: 0, delegations: 0, roots: 0 };
 
 /** Build a subscription codex block whose capability IS the canary and whose claim token is a
  *  distinct fresh secret (asserted absent too). */
-function subscriptionBlock(canaries: CodexCanaries, claimToken: string): Record<string, unknown> {
-  return { auth_mode: "subscription", access_token: claimToken, capability: canaries.capability, generation: 3 };
+function subscriptionBlock(canaries: CodexCanaries, claimToken: string): ClaimCodexSecrets {
+  return {
+    auth_mode: "subscription",
+    access_token: claimToken,
+    capability: canaries.capability,
+    generation: 3,
+    chatgpt_account_id: "verified-account",
+    chatgpt_plan_type: null,
+  };
 }
 
 const agents: AgentTemplate[] = [
@@ -752,11 +773,15 @@ describe("codex-m3b packaged lifecycle (real launch → loopback provider)", { s
       };
       const loopbackProvider: CodexProviderConfig = { ...provider, baseUrl: fake.baseUrl };
       const log = recordingLog();
-      // Fresh WRITABLE worktree + home under the per-uid tmpfs (the image root is read-only):
-      // the launcher requires an ownedDataRoot (homeRoot/codex-data) that does NOT pre-exist.
-      const scratch = fs.mkdtempSync(nodePath.join(os.tmpdir(), "codex-m3b-"));
+      // Fresh writable worktree + home under /data/runner's setgid runner-group tree.
+      // Do not use mkdtemp: Node forces 0700, which would falsify the uid-10003
+      // command-root access posture this packaged control must exercise.
+      const scratch = nodePath.join("/data/runner", `codex-m3b-${randomBytes(8).toString("hex")}`);
+      fs.mkdirSync(scratch, { recursive: true, mode: 0o2770 });
+      fs.chmodSync(scratch, 0o2770);
       const worktree = nodePath.join(scratch, "work");
-      fs.mkdirSync(worktree, { recursive: true });
+      fs.mkdirSync(worktree, { recursive: true, mode: 0o2770 });
+      fs.chmodSync(worktree, 0o2770);
       const exec = new CodexExecutor(
         log.log,
         nodePath.join(scratch, "home"),

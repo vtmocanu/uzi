@@ -104,13 +104,11 @@ var (
 
 // codexProviderRequestTimeout bounds ONE Codex provider HTTP call (oauth token refresh or
 // the nonrotating identity re-verify) in the production codexauth.Client (PRD #1171 M1).
-// It is the innermost of the nested refresh budget documented at the wsvc.SetCodexRefresh
-// call site: two serial provider calls at 4s each = 8s worst case, which MEETS (does not
-// exceed) the 8s refresh lease TTL and stays under the ~9s server budget, keeping the whole
-// worker→API→provider→commit→callback round trip below the pinned app-server 10-second
-// external-auth deadline. A lease that expires mid-exchange safely routes to
-// reconcile/quarantine, and the app-server retries idempotently with the same operation id.
-const codexProviderRequestTimeout = 4 * time.Second
+// It is the innermost nested deadline: two serial calls consume at most 6s, leaving a real
+// second inside the 7s refresh lease for intent/identity/commit work. The worker-facing API
+// finishes within 7.5s, its HTTP client caps the round trip at 8s, and the future app-server
+// callback bridge retains the remaining margin below the fixed 10s provider deadline.
+const codexProviderRequestTimeout = 3 * time.Second
 
 func main() {
 	// -health is a shell-free container healthcheck: the distroless runtime
@@ -489,24 +487,18 @@ func run() error {
 	// round trip UNDER the pinned app-server 10-second external-auth callback deadline
 	// (PRD #1147 M2 B6):
 	//
-	//	app-server external-auth callback deadline ......... 10s  (pinned, provider-imposed)
-	//	server-side coordinated-refresh handling budget .... ~9s  (≈1s reserved for the
-	//	                                                          worker↔API HTTP round trip
-	//	                                                          in each direction)
-	//	one provider HTTP call (codexProviderRequestTimeout)  4s  (the ADVANCE path makes TWO
-	//	                                                          serial provider calls — the
-	//	                                                          oauth token refresh, then the
-	//	                                                          nonrotating identity
-	//	                                                          re-verify — so 2×4s = 8s worst
-	//	                                                          case, which MEETS (does not
-	//	                                                          exceed) the 8s refresh lease
-	//	                                                          TTL (codexRefreshLeaseTTL) and
-	//	                                                          stays under the ~9s server
-	//	                                                          budget. A lease that expires
-	//	                                                          mid-exchange routes to
-	//	                                                          reconcile/quarantine and the
-	//	                                                          app-server retries idempotently
-	//	                                                          with the same operation id)
+	//	app-server external-auth callback deadline ......... 10s   (pinned, provider-imposed)
+	//	future worker callback deadline ...................... 9s   (callback implementation is
+	//	                                                           outside this Phase-1 unit)
+	//	worker → API HTTP timeout ............................. 8s   (agent WorkerClient)
+	//	API route handling timeout .......................... 7.5s   (worker_codex.go)
+	//	coordinated-refresh lease ............................. 7s   (codexrefresh.go)
+	//	one provider HTTP call (codexProviderRequestTimeout) .. 3s   (at most two serial calls,
+	//	                                                           leaving 1s for durable DB work)
+	//
+	// Each outer layer therefore has actual response/cancellation margin. A timeout keeps
+	// the logical operation id and observed generation unchanged so reconciliation retries
+	// the same operation instead of blindly starting another exchange.
 	wsvc.SetCodexRefresh(codexauth.NewClient(
 		codexauth.WithPerRequestTimeout(codexProviderRequestTimeout),
 	))

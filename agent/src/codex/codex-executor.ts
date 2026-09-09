@@ -30,14 +30,16 @@
 // STANDALONE, run()'s finally backstops the registry teardown itself.
 
 import path from "node:path";
-import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import fs from "node:fs/promises";
+import type { Readable, Writable } from "node:stream";
 
 import type { Logger } from "../log.js";
 import type { WorkerClient } from "../client.js";
 import { PlanRejectedError, type Executor, type ExecutorResult, type RunContext } from "../executor.js";
 import type {
   BoundaryRequest,
+  BoundaryProcessRequest,
   CodexExecutionSafety,
   HarnessAgent,
   HarnessContextHook,
@@ -49,7 +51,7 @@ import type {
 } from "../harness.js";
 import { RunTurnReducerImpl } from "../harness-reducer.js";
 import { buildLeadSystemPrompt } from "../prompt.js";
-import { commandRootCommand } from "../runner-uid.js";
+import { RUNNER_UID, uidSplitActive } from "../runner-uid.js";
 import { errMessage } from "../util.js";
 import type { AgentTemplate } from "../protocol.js";
 
@@ -59,6 +61,8 @@ import {
   type ReconcileBeforeBoundary,
   type ReconcileOutcome,
   type SpawnRootSeam,
+  type SpawnBoundaryProcessSeam,
+  type SpawnedBoundaryProcess,
 } from "./safety.js";
 import {
   CodexHarness,
@@ -82,8 +86,16 @@ import {
 } from "./delegation.js";
 import { buildCodexRunPlan } from "./run-builder.js";
 import { CodexSessionStore } from "./session-state.js";
-import { spawnFileopHelper, type FileopHelperHandle } from "./fileop-client.js";
-import { CODEX_BIN, PROVIDER_CHILD_ARGV, SUPERVISOR_BIN, launchCodexRoot } from "./launcher.js";
+import { wireFileopHelper, type FileopHelperHandle } from "./fileop-client.js";
+import {
+  CODEX_BIN,
+  PROVIDER_CHILD_ARGV,
+  SUPERVISOR_BIN,
+  launchCodexEffectRoot,
+  launchCodexRoot,
+  type CodexEffectLaunchSpec,
+  type CodexRootHandle,
+} from "./launcher.js";
 import { createCodexTransport } from "./transport.js";
 import type { CodexNotification } from "./transport.js";
 import type { CodexBinding } from "./select.js";
@@ -242,8 +254,21 @@ export class CodexAdviceCredentialBridge {
 
   /** Release the run's currently-committed access token (both auth modes). Fails CLOSED
    *  (throws) on any release error — capability/ownership loss must not fall back. */
-  async release(): Promise<string> {
-    const res = await this.client.releaseCodex(this.runId, { capability: this.binding.capability });
+  async release(signal?: AbortSignal): Promise<string> {
+    const expected = this.binding.authMode === "subscription"
+      ? {
+          authMode: "subscription" as const,
+          chatgptAccountId: this.binding.chatgptAccountId,
+          minimumGeneration: this.observedGeneration ?? this.binding.generation,
+        }
+      : { authMode: "api_key" as const };
+    const res = await this.client.releaseCodex(
+      this.runId,
+      { capability: this.binding.capability },
+      expected,
+      signal,
+    );
+    if (res.auth_mode === "subscription") this.observedGeneration = res.generation;
     return res.access_token;
   }
 
@@ -256,7 +281,7 @@ export class CodexAdviceCredentialBridge {
   /** Run the coordinated subscription refresh and return the freshly-committed token.
    *  SUBSCRIPTION ONLY — an api_key credential fails CLOSED. The operation id is minted
    *  lazily on the first call and RETAINED across retries. */
-  async refresh(): Promise<string> {
+  async refresh(signal?: AbortSignal): Promise<string> {
     if (this.binding.authMode !== "subscription") {
       throw new Error("codex advice refresh is not permitted for an api_key credential");
     }
@@ -264,12 +289,21 @@ export class CodexAdviceCredentialBridge {
       throw new Error("codex advice refresh has no observed generation");
     }
     if (this.refreshOperationId === undefined) this.refreshOperationId = randomUUID();
-    const res = await this.client.refreshCodex(this.runId, {
-      capability: this.binding.capability,
-      operation_id: this.refreshOperationId,
-      observed_generation: this.observedGeneration,
-    });
+    const res = await this.client.refreshCodex(
+      this.runId,
+      {
+        capability: this.binding.capability,
+        operation_id: this.refreshOperationId,
+        observed_generation: this.observedGeneration,
+      },
+      { authMode: "subscription", chatgptAccountId: this.binding.chatgptAccountId },
+      signal,
+    );
     this.observedGeneration = res.generation; // the worker's NEXT observed generation
+    // TODO(PRD#1171 integration): replace this bridge with the app-server callback owner,
+    // which clears the retained operation id after this authenticated committed success
+    // and mints a new one only for the next logical callback. Until then callers must use
+    // beginRefreshOperation at that boundary; ambiguous failures retain this id.
     return res.access_token;
   }
 }
@@ -303,7 +337,7 @@ export function buildRunLaneReconcile(
 ): ReconcileBeforeBoundary {
   let reconcileOperationId: string | undefined;
   let observedGeneration = binding.generation; // subscription initial; undefined for api_key
-  return async (_request: BoundaryRequest): Promise<ReconcileOutcome> => {
+  return async (_request: BoundaryRequest, signal: AbortSignal): Promise<ReconcileOutcome> => {
     try {
       if (binding.authMode === "subscription") {
         if (observedGeneration === undefined) {
@@ -316,18 +350,28 @@ export function buildRunLaneReconcile(
         }
         // ONE operation id per LOGICAL refresh, RETAINED across retries until it SUCCEEDS.
         if (reconcileOperationId === undefined) reconcileOperationId = randomUUID();
-        const res = await client.refreshCodex(runId, {
-          capability: binding.capability,
-          operation_id: reconcileOperationId,
-          observed_generation: observedGeneration,
-        });
+        const res = await client.refreshCodex(
+          runId,
+          {
+            capability: binding.capability,
+            operation_id: reconcileOperationId,
+            observed_generation: observedGeneration,
+          },
+          { authMode: "subscription", chatgptAccountId: binding.chatgptAccountId },
+          signal,
+        );
         registerToken(res.access_token);
         observedGeneration = res.generation; // durable commit → advance BEFORE the permit
         reconcileOperationId = undefined; // logical refresh done; next boundary mints fresh
         return { kind: "ready" };
       }
       // api_key: ZERO refresh; a fresh release re-authorizes only (no subscription fallback).
-      const res = await client.releaseCodex(runId, { capability: binding.capability });
+      const res = await client.releaseCodex(
+        runId,
+        { capability: binding.capability },
+        { authMode: "api_key" },
+        signal,
+      );
       registerToken(res.access_token);
       return { kind: "ready" };
     } catch {
@@ -355,8 +399,9 @@ export async function makeCodexAdviceHarness(
   provider: CodexProviderConfig,
   launchRoot: LaunchAdviceRootSeam,
   log: Logger,
+  signal?: AbortSignal,
 ): Promise<CodexAdviceHarness> {
-  const credentialValue = await bridge.release();
+  const credentialValue = await bridge.release(signal);
   return new CodexAdviceHarness({ launchRoot, provider, credentialValue, log });
 }
 
@@ -381,10 +426,15 @@ export interface CodexExecutorDeps {
    *  scripted in-memory transport (NO real Codex). Receives the harness's launch spec AND
    *  the FRESHLY-RELEASED credential; the credential rides ONLY into the launcher env. */
   readonly launchProviderRoot?: (spec: CodexLaunchRootSpec, credential: string) => Promise<CodexLaunchRootResult>;
-  /** Runs a shell effect as the credential-free command identity. */
+  /** Test-only high-level command seam. Production leaves this absent and uses
+   * the registered supervisor-root implementation. */
   readonly spawnCommand?: SpawnCommandSeam;
-  /** Spawns the openat2 fileop helper as the command identity, given the SCRUBBED env. */
-  readonly spawnFileop?: (worktreePath: string, env: NodeJS.ProcessEnv) => FileopHelperHandle;
+  /** Test-only fileop client factory, invoked only after a command supervisor
+   * root has been reserved, launched and registered. */
+  readonly wireFileop?: (process: { stdin: Writable | null; stdout: Readable | null }) => FileopHelperHandle;
+  /** Low-level supervised effect launcher. Production uses the M3a supervisor;
+   * tests inject in-memory streams while retaining registry ownership. */
+  readonly launchEffectRoot?: (spec: CodexEffectLaunchSpec, deadlineMs?: number) => Promise<CodexRootHandle>;
   /** The boundary-action spawn seam for the safety facade (m4 wires the real supervisor
    *  root). Never invoked in m3 (no runner sink is routed through `withBoundary` yet). */
   readonly spawnBoundaryRoot?: SpawnRootSeam;
@@ -394,7 +444,9 @@ export interface CodexExecutorDeps {
   readonly wallMs?: number;
   readonly boundaryDeadlineMs?: number;
   readonly childTurnDeadlineMs?: number;
-  /** The runner-owned scratch dir for the command identity env (`TMPDIR`). */
+  /** Base TMPDIR exposed to an injected high-level command seam. The production
+   * supervised path replaces it with a random per-root directory allowlisted by
+   * the Landlock wrapper. */
   readonly commandTmpdir?: string;
   /** PRD #1171 m4 (F1): the runner OWNS the terminal registry teardown. When true, `run()`'s
    *  finally does NOT quiesce/reap/dispose the registry — its post-run durability sinks
@@ -445,6 +497,8 @@ export class CodexExecutor implements Executor {
     const storeDir = path.join(this.homeRoot, "codex-session-store");
     const boundaryDeadlineMs = this.deps.boundaryDeadlineMs ?? DEFAULT_BOUNDARY_DEADLINE_MS;
 
+    if (uidSplitActive()) await assertCommandWorktreePosture(worktreePath);
+
     // (C) Every FRESH provider token released this run is registered with the logger's
     // secret set (`addSecret`) before use; without a matching `removeSecret` a long-lived
     // worker's secret set would grow permanently, one entry per provider-root start. Track
@@ -454,9 +508,12 @@ export class CodexExecutor implements Executor {
 
     // (1) The immutable per-run local-execution-epoch registry.
     const registry = new ExecutionRegistry(newLocalExecutionEpoch(0));
+    const launchEffectRoot = this.deps.launchEffectRoot ?? ((spec: CodexEffectLaunchSpec, deadlineMs?: number) =>
+      launchCodexEffectRoot(spec, deadlineMs === undefined ? {} : { deadlines: { started: deadlineMs } }));
 
-    // (2) The outer safety facade — populated BEFORE any model work. `spawnBoundaryRoot`
-    // is the m4 hook (R2): the trusted boundary-action lane is not exercised in m3.
+    // (2) The outer safety facade — populated BEFORE any model work. The legacy
+    // root-only seam remains for compatibility; permit-held Git uses the supervised
+    // process seam wired below.
     const spawnBoundaryRoot: SpawnRootSeam =
       this.deps.spawnBoundaryRoot ??
       ((): Promise<RegisteredRoot> =>
@@ -478,6 +535,7 @@ export class CodexExecutor implements Executor {
         for (const token of releasedTokens) this.log.removeSecret(token);
         releasedTokens.clear();
       },
+      makeBoundaryProcessSpawner(launchEffectRoot),
     );
 
     // The SCRUBBED command-identity env — NOTHING from process.env (cross-root credential
@@ -489,12 +547,40 @@ export class CodexExecutor implements Executor {
     };
 
     // (4) The command + fileop effect surfaces (credential-free command identity).
-    const baseSpawnCommand = this.deps.spawnCommand ?? makeDefaultSpawnCommand(commandEnv);
+    const baseSpawnCommand = this.deps.spawnCommand ?? makeDefaultSpawnCommand(
+      registry,
+      launchEffectRoot,
+      boundaryDeadlineMs,
+      worktreePath,
+      commandEnv,
+    );
     // Route the SCRUBBED command-identity env THROUGH the seam (not merely closed over by the
     // default seam) so an injected seam records the exact env command spawns run under — the
     // same scrubbed env the fileop seam already receives. [#1171 m5 review]
     const spawnCommand: SpawnCommandSeam = (argv, spawnOpts) => baseSpawnCommand(argv, { ...spawnOpts, env: commandEnv });
-    const fileopHandle: FileopHelperHandle = (this.deps.spawnFileop ?? defaultSpawnFileop)(worktreePath, commandEnv);
+    const fileopRoot = await launchRegisteredEffectRoot(
+      registry,
+      launchEffectRoot,
+      commandEffectSpec(
+        worktreePath,
+        worktreePath,
+        FILEOP_BIN,
+        ["--root", worktreePath],
+        commandEnv,
+      ),
+      boundaryDeadlineMs,
+      "command",
+    );
+    let fileopHandle: FileopHelperHandle;
+    try {
+      fileopHandle = (this.deps.wireFileop ?? wireFileopHelper)({
+        stdin: fileopRoot.handle.transport.stdin,
+        stdout: fileopRoot.handle.transport.stdout,
+      });
+    } catch (error) {
+      await registry.reapRoot(fileopRoot.root, boundaryDeadlineMs);
+      throw error;
+    }
     const fileop: FileopClient = fileopHandle.client;
 
     const screenPolicy: ScreenPolicy = { dockerWired: false };
@@ -516,7 +602,7 @@ export class CodexExecutor implements Executor {
     // from a phase-correct run plan; only the phase-derived grants/roles/allowedRoles change.
     // The registry, effect seams, worktree, screen policy and cancel signal are reused, and the
     // provider root + transport (owned by the single `harness`, below) are built once and reused.
-    const buildPhaseBroker = (phase: "plan" | "implement"): CodexCallbackBroker => {
+    const buildPhaseBroker = (phase: "plan" | "implement", signal?: AbortSignal): CodexCallbackBroker => {
       const runPlan = buildCodexRunPlan(
         this.buildRunRequest(ctx, phase, this.phasePrompt(ctx, phase), undefined, new AbortController().signal),
       );
@@ -530,7 +616,7 @@ export class CodexExecutor implements Executor {
         fileop,
         worktreePath,
         screenPolicy,
-        signal: ctx.signal,
+        signal,
         childTurnDeadlineMs,
       });
       return new CodexCallbackBroker({
@@ -542,6 +628,7 @@ export class CodexExecutor implements Executor {
         delegate: delegationRunner.toDelegateSeam(),
         allowedRoles: runPlan.allowedRoles,
         screenPolicy,
+        signal,
       });
     };
 
@@ -556,7 +643,19 @@ export class CodexExecutor implements Executor {
     // the launcher env). A new root always re-authorizes; a resume still gets a fresh token.
     const launchProviderRoot = this.deps.launchProviderRoot ?? defaultLaunchProviderRoot;
     const providerLaunchSeam: LaunchRootSeam = async (spec) => {
-      const released = await this.opts.client.releaseCodex(ctx.runId, { capability: binding.capability });
+      const expected = binding.authMode === "subscription"
+        ? {
+            authMode: "subscription" as const,
+            chatgptAccountId: binding.chatgptAccountId,
+            minimumGeneration: binding.generation,
+          }
+        : { authMode: "api_key" as const };
+      const released = await this.opts.client.releaseCodex(
+        ctx.runId,
+        { capability: binding.capability },
+        expected,
+        ctx.signal,
+      );
       if (!releasedTokens.has(released.access_token)) {
         this.log.addSecret(released.access_token); // BEFORE any use
         releasedTokens.add(released.access_token); // evicted at terminal cleanup (part C)
@@ -598,8 +697,7 @@ export class CodexExecutor implements Executor {
         // (write_denied_in_plan) and child subagents inherit plan-phase grants, so nothing
         // mutates the worktree before the plan is approved. All revise iterations reuse this
         // plan-phase broker (the implement turn re-points it, below).
-        harness.useBroker(planBroker);
-        let planResult = await this.driveCodexTurn(ctx, harness, reducer, "plan", this.planPrompt(ctx), resumeId, idleMs, wallMs);
+        let planResult = await this.driveCodexTurn(ctx, harness, reducer, "plan", this.planPrompt(ctx), resumeId, idleMs, wallMs, buildPhaseBroker);
         let planMd = planResult.plan;
         if (planMd === undefined || planMd.trim().length === 0) {
           throw new Error("codex plan turn produced no plan");
@@ -607,7 +705,7 @@ export class CodexExecutor implements Executor {
         let verdict = await ctx.gatePlan(planMd, planResult.milestones);
         while (verdict.kind === "revise") {
           ctx.emit({ kind: "plan_feedback", agent: "worker", payload: { feedback: verdict.feedback } });
-          planResult = await this.driveCodexTurn(ctx, harness, reducer, "plan", this.planPrompt(ctx), resumeId, idleMs, wallMs);
+          planResult = await this.driveCodexTurn(ctx, harness, reducer, "plan", this.planPrompt(ctx), resumeId, idleMs, wallMs, buildPhaseBroker);
           planMd = planResult.plan;
           if (planMd === undefined || planMd.trim().length === 0) {
             throw new Error("codex plan turn produced no plan on revision");
@@ -624,8 +722,7 @@ export class CodexExecutor implements Executor {
       // re-point is race-safe not because every callback has drained (a backgrounded child
       // callback can outlive the plan turn) but because an in-flight child captured its OWN
       // plan-phase child broker at spawn — the root `this.broker` swap never touches it.
-      harness.useBroker(buildPhaseBroker("implement"));
-      await this.driveCodexTurn(ctx, harness, reducer, "implement", this.implementPrompt(ctx), resumeId, idleMs, wallMs);
+      await this.driveCodexTurn(ctx, harness, reducer, "implement", this.implementPrompt(ctx), resumeId, idleMs, wallMs, buildPhaseBroker);
 
       return { branch: ctx.branch };
     } finally {
@@ -667,6 +764,7 @@ export class CodexExecutor implements Executor {
     resumeId: string | undefined,
     idleMs: number,
     wallMs: number,
+    buildPhaseBroker: (phase: "plan" | "implement", signal?: AbortSignal) => CodexCallbackBroker,
   ): Promise<ReducedTurnResult> {
     const turnAbort = new AbortController();
     let tripReason: string | undefined;
@@ -698,6 +796,7 @@ export class CodexExecutor implements Executor {
 
     const request = this.buildRunRequest(ctx, phase, prompt, resumeId, turnAbort.signal);
     try {
+      harness.useBroker(buildPhaseBroker(phase, turnAbort.signal));
       if (tripReason) throw this.tripError(tripReason);
       armIdle();
       const turn = harness.startTurn(request);
@@ -931,35 +1030,143 @@ export class CodexExecutor implements Executor {
  *  display cap can run. 1 MiB is comfortably above that display cap yet firmly bounded; at
  *  the cap we STOP accumulating (keep the byte-bounded prefix) and SIGKILL the child, then
  *  RESOLVE (never reject) with the truncated output so the broker still applies its own cap.
- *  NOTE: cancelling a running command on a turn abort (threading a signal to kill mid-run) is
- *  deliberately DEFERRED to m4 with R2 (registering the command process as a supervisor
- *  root); m3 adds only this untrusted-input byte cap + kill. */
+ *  Turn abort and capture-cap trips now dispose the registered supervisor root and
+ *  await ECHILD+__WALL before the callback settles. */
 export const MAX_COMMAND_CAPTURE_BYTES = 1 << 20; // 1 MiB
 /** The exit code reported when a command is SIGKILLed AT the capture cap. 137 = 128 + 9
  *  (SIGKILL), the conventional shell convention, so a capped result is distinguishable from
  *  a clean exit while still being a plain non-zero code the broker/reducer already tolerate. */
 export const COMMAND_CAPTURE_KILLED_CODE = 137;
 
-/** Run a shell effect as the credential-free command identity. R2 (m4 hook): this is a
- *  DIRECT `child_process.spawn`, NOT yet a registered supervisor root — m4 must reserve +
- *  register a `command` root in the {@link ExecutionRegistry} HERE so the reap barrier
- *  covers it before any credentialed boundary action runs. The seam SHAPE stays stable so
- *  m4 can wrap it without changing the broker contract. Exported for a direct unit test of
- *  the capture cap; production wires it through the default `spawnCommand` seam. */
-export function makeDefaultSpawnCommand(commandEnv: NodeJS.ProcessEnv): SpawnCommandSeam {
-  return (argv, opts) =>
-    new Promise<SpawnCommandResult>((resolve, reject) => {
+const COMMAND_SANDBOX_BIN = "/usr/local/bin/uzi-codex-command-sandbox";
+
+async function assertCommandWorktreePosture(worktreePath: string): Promise<void> {
+  const stat = await fs.stat(worktreePath);
+  const required = 0o2070; // setgid plus group rwx
+  if (stat.gid !== RUNNER_UID || (stat.mode & required) !== required) {
+    throw new Error("Codex command worktree lacks the required runner-group setgid/write posture");
+  }
+}
+
+interface RegisteredEffectRoot {
+  readonly handle: CodexRootHandle;
+  readonly root: RegisteredRoot;
+}
+
+export function registeredRoot(handle: CodexRootHandle, kind: RegisteredRoot["kind"]): RegisteredRoot {
+  return {
+    kind,
+    reap: async (deadlineMs) => {
+      const outcome = await handle.dispose(deadlineMs);
+      return outcome.clean
+        ? { ok: true }
+        : { ok: false, error: { category: "tool", message: `${kind} supervisor root disposal not clean` } };
+    },
+    dispose: async (deadlineMs) => {
+      const outcome = await handle.dispose(deadlineMs);
+      if (!outcome.clean) throw new Error(`${kind} supervisor root disposal not clean`);
+    },
+  };
+}
+
+async function launchRegisteredEffectRoot(
+  registry: ExecutionRegistry,
+  launch: (spec: CodexEffectLaunchSpec, deadlineMs?: number) => Promise<CodexRootHandle>,
+  spec: CodexEffectLaunchSpec,
+  deadlineMs: number,
+  kind: RegisteredRoot["kind"],
+): Promise<RegisteredEffectRoot> {
+  const reservation = registry.reserveLaunch(kind);
+  if (reservation.kind !== "reserved") throw new Error(`${kind} launch admission is closed`);
+  let handle: CodexRootHandle;
+  try {
+    handle = await launch(spec, deadlineMs);
+  } catch (error) {
+    registry.cancelReservation(reservation.reservation);
+    throw error;
+  }
+  const root = registeredRoot(handle, kind);
+  const admitted = registry.registerRoot(reservation.reservation, root);
+  if (!admitted.ok) {
+    await root.dispose(deadlineMs).catch(() => undefined);
+    throw new Error(`${kind} root failed registry admission`);
+  }
+  return { handle, root };
+}
+
+/** Build the fixed argv for the root-owned Landlock wrapper used by uid 10003.
+ * Landlock allowlists only this run's worktree, its random private tmp and
+ * read-only system/toolchain paths, so sibling `/data`, `/run`, `/proc` and `/tmp`
+ * state cannot be enumerated even though every run shares numeric uid 10003. */
+export function commandSandboxArgv(
+  worktreePath: string,
+  cwd: string,
+  command: string,
+  args: readonly string[],
+  privateTmp: string,
+): string[] {
+  const worktree = path.resolve(worktreePath);
+  const workCwd = path.resolve(cwd);
+  const rel = path.relative(worktree, workCwd);
+  if (rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
+    throw new Error("command cwd escapes the worktree sandbox");
+  }
+  if (!path.isAbsolute(privateTmp) || privateTmp === path.parse(privateTmp).root) {
+    throw new Error("command private tmp must be an absolute non-root path");
+  }
+  return [
+    "--root", worktree,
+    "--tmp", privateTmp,
+    "--cwd", workCwd,
+    "--", command, ...args,
+  ];
+}
+
+function commandEffectSpec(
+  worktreePath: string,
+  cwd: string,
+  command: string,
+  args: readonly string[],
+  env: NodeJS.ProcessEnv,
+): CodexEffectLaunchSpec {
+  const cleanupToken = randomUUID();
+  const privateTmp = `/tmp/uzi-codex-command-${cleanupToken}`;
+  return {
+    identity: "command",
+    command: COMMAND_SANDBOX_BIN,
+    args: commandSandboxArgv(worktreePath, cwd, command, args, privateTmp),
+    cwd: worktreePath,
+    env: { ...env, HOME: privateTmp, TMPDIR: privateTmp },
+    supervisorBin: SUPERVISOR_BIN,
+    cleanupToken,
+  };
+}
+
+/** Run a model-authorized shell effect as a registered command supervisor root.
+ * The callback returns only after the primary child and every backgrounded
+ * descendant have settled; abort/cap paths also reap before returning. */
+export function makeDefaultSpawnCommand(
+  registry: ExecutionRegistry,
+  launch: (spec: CodexEffectLaunchSpec, deadlineMs?: number) => Promise<CodexRootHandle>,
+  reapDeadlineMs: number,
+  worktreePath: string,
+  commandEnv: NodeJS.ProcessEnv,
+): SpawnCommandSeam {
+  return async (argv, opts): Promise<SpawnCommandResult> => {
       const [cmd, ...rest] = argv;
-      const wrapped = commandRootCommand(cmd ?? "/bin/sh", rest);
-      const child = spawn(wrapped.command, wrapped.args, {
-        cwd: opts.cwd,
-        env: opts.env ?? commandEnv,
-        stdio: ["ignore", "pipe", "pipe"],
-      });
+      const launched = await launchRegisteredEffectRoot(
+        registry,
+        launch,
+        commandEffectSpec(worktreePath, opts.cwd ?? worktreePath, cmd ?? "/bin/sh", rest, opts.env ?? commandEnv),
+        reapDeadlineMs,
+        "command",
+      );
       let stdout = "";
       let stderr = "";
       let capturedBytes = 0;
       let killedAtCap = false;
+      let capResolve!: () => void;
+      const capTrip = new Promise<void>((resolve) => { capResolve = resolve; });
       // Accumulate up to MAX_COMMAND_CAPTURE_BYTES combined across BOTH streams. On the
       // chunk that would cross the cap, keep only the byte-bounded prefix, mark the capture
       // truncated, and SIGKILL the child (an unbounded producer cannot be allowed to OOM the
@@ -975,29 +1182,86 @@ export function makeDefaultSpawnCommand(commandEnv: NodeJS.ProcessEnv): SpawnCom
           return;
         }
         // The chunk crosses the cap: keep the byte-bounded prefix only, then kill.
-        const prefix = Buffer.from(chunk, "utf8").subarray(0, remaining).toString("utf8");
+        let prefix = Buffer.from(chunk, "utf8").subarray(0, remaining).toString("utf8");
+        // A byte slice can end mid-codepoint; Buffer.toString would replace that
+        // suffix with a three-byte U+FFFD and exceed a 1-2 byte remainder. Trim the
+        // decoded suffix until its encoded form is within the hard byte budget.
+        while (Buffer.byteLength(prefix, "utf8") > remaining) prefix = prefix.slice(0, -1);
         if (onto === "stdout") stdout += prefix;
         else stderr += prefix;
         capturedBytes = MAX_COMMAND_CAPTURE_BYTES;
         killedAtCap = true;
-        child.kill("SIGKILL"); // kill the child AT the cap — never accumulate past it
+        capResolve();
       };
-      child.stdout?.setEncoding("utf8");
-      child.stdout?.on("data", (c: string) => accumulate(c, "stdout"));
-      child.stderr?.setEncoding("utf8");
-      child.stderr?.on("data", (c: string) => accumulate(c, "stderr"));
-      child.on("error", reject);
-      // On close, resolve with the (possibly truncated) capture. A cap-kill reports the
-      // SIGKILL sentinel code; otherwise the child's own close code (or -1 if absent).
-      child.on("close", (code) =>
-        resolve({ code: killedAtCap ? COMMAND_CAPTURE_KILLED_CODE : code ?? -1, stdout, stderr }),
-      );
-    });
+      launched.handle.transport.stdout?.setEncoding("utf8");
+      launched.handle.transport.stdout?.on("data", (c: string) => accumulate(c, "stdout"));
+      launched.handle.transport.stderr?.setEncoding("utf8");
+      launched.handle.transport.stderr?.on("data", (c: string) => accumulate(c, "stderr"));
+      const ended = (stream: Readable | null): Promise<void> => new Promise((resolve) => {
+        if (!stream || stream.readableEnded || stream.destroyed) { resolve(); return; }
+        stream.once("end", resolve);
+        stream.once("close", resolve);
+      });
+      const outputEnded = Promise.all([
+        ended(launched.handle.transport.stdout),
+        ended(launched.handle.transport.stderr),
+      ]);
+
+      let onAbort: (() => void) | undefined;
+      const aborted = new Promise<"aborted">((resolve) => {
+        if (opts.signal?.aborted) resolve("aborted");
+        else if (opts.signal) {
+          onAbort = () => resolve("aborted");
+          opts.signal.addEventListener("abort", onAbort, { once: true });
+        }
+      });
+      const terminal = launched.handle.waitChild(DEFAULT_WALL_MS).then((result) => ({ kind: "exit" as const, code: result.code }));
+      void terminal.catch(() => undefined);
+      const first = await Promise.race([
+        terminal,
+        aborted.then(() => ({ kind: "aborted" as const })),
+        capTrip.then(() => ({ kind: "cap" as const })),
+      ]);
+      if (onAbort && opts.signal) opts.signal.removeEventListener("abort", onAbort);
+      const reaped = await registry.reapRoot(launched.root, reapDeadlineMs);
+      if (!reaped.ok) throw new Error("command supervisor root did not reap cleanly");
+      await outputEnded;
+      if (first.kind === "aborted") throw new Error("command aborted");
+      return {
+        code: first.kind === "cap" || killedAtCap ? COMMAND_CAPTURE_KILLED_CODE : first.code,
+        stdout,
+        stderr,
+      };
+  };
 }
 
-/** Spawn the openat2 fileop helper as the command identity with the SCRUBBED env. */
-function defaultSpawnFileop(worktreePath: string, env: NodeJS.ProcessEnv): FileopHelperHandle {
-  return spawnFileopHelper({ fileopBin: FILEOP_BIN, worktreePath, env });
+function makeBoundaryProcessSpawner(
+  launch: (spec: CodexEffectLaunchSpec, deadlineMs?: number) => Promise<CodexRootHandle>,
+): SpawnBoundaryProcessSeam {
+  return async (request: BoundaryProcessRequest, deadlineMs: number): Promise<SpawnedBoundaryProcess> => {
+    const [command, ...args] = request.argv;
+    if (!command) throw new Error("boundary process argv is empty");
+    const spec: CodexEffectLaunchSpec = request.identity === "command"
+      ? commandEffectSpec(request.cwd, request.cwd, command, args, request.env)
+      : {
+          identity: "worker_pat",
+          command,
+          args,
+          cwd: request.cwd,
+          env: request.env,
+          supervisorBin: SUPERVISOR_BIN,
+        };
+    const handle = await launch(spec, deadlineMs);
+    // stderr is consumed by GitCache for all boundary processes. The provider
+    // adapter below drains its otherwise-unused stderr independently.
+    return {
+      root: registeredRoot(handle, "boundary_action"),
+      stdin: handle.transport.stdin,
+      stdout: handle.transport.stdout,
+      stderr: handle.transport.stderr,
+      waitChild: async (deadlineMs) => handle.waitChild(deadlineMs),
+    };
+  };
 }
 
 /** Adapt the real M3a launcher for a PROVIDER root. Builds the launcher-fixed spec (the
@@ -1023,17 +1287,11 @@ async function defaultLaunchProviderRoot(spec: CodexLaunchRootSpec, credential: 
   const stdout = handle.transport.stdout;
   const stdin = handle.transport.stdin;
   if (!stdout || !stdin) throw new Error("codex provider root is missing a stdio transport channel");
+  // Provider stderr is never model-visible or logged, but it must be drained: an
+  // unread pipe can fill and deadlock the app-server before the registry can reap it.
+  handle.transport.stderr?.resume();
   const transport = createCodexTransport({ inbound: stdout, outbound: stdin });
-  const root: RegisteredRoot = {
-    kind: "provider",
-    reap: async (deadlineMs) => {
-      const out = await handle.dispose(deadlineMs);
-      return out.clean ? { ok: true } : { ok: false, error: { category: "tool", message: "codex provider root disposal not clean" } };
-    },
-    dispose: async (deadlineMs) => {
-      await handle.dispose(deadlineMs);
-    },
-  };
+  const root = registeredRoot(handle, "provider");
   return { root, transport, supervisorPid: handle.supervisorPid ?? -1 };
 }
 

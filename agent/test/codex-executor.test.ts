@@ -1,5 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { PassThrough } from "node:stream";
 
 import {
   CodexExecutor,
@@ -9,13 +10,15 @@ import {
   makeCodexAdviceHarness,
   CODEX_PRODUCTION_PROVIDER,
   makeDefaultSpawnCommand,
+  registeredRoot,
   MAX_COMMAND_CAPTURE_BYTES,
   COMMAND_CAPTURE_KILLED_CODE,
+  commandSandboxArgv,
   type CodexExecutorDeps,
 } from "../src/codex/codex-executor.js";
 import { selectCodexBinding, CodexSelectionError, type CodexBinding } from "../src/codex/select.js";
 import type { CodexLaunchRootResult, CodexProviderConfig } from "../src/codex/codex-harness.js";
-import type { RegisteredRoot } from "../src/codex/registry.js";
+import { ExecutionRegistry, newLocalExecutionEpoch, type RegisteredRoot } from "../src/codex/registry.js";
 import type { FileopHelperHandle } from "../src/codex/fileop-client.js";
 import type {
   CodexAdviceLaunchResult,
@@ -28,6 +31,7 @@ import type { RunContext, EmittedMessage, Executor } from "../src/executor.js";
 import type { Logger } from "../src/log.js";
 import type { AgentTemplate } from "../src/protocol.js";
 import type { BoundaryRequest } from "../src/harness.js";
+import type { CodexEffectLaunchSpec, CodexRootHandle } from "../src/codex/launcher.js";
 
 // PRD #1171 (M3, milestone 3, Phase 2A) — the production CodexExecutor + the claim-aware
 // DARK selection seam, driven with an in-memory transport and scripted app-server frames
@@ -256,7 +260,14 @@ function bindingOf(codex: Record<string, unknown>): CodexBinding {
   return selection.binding;
 }
 
-const SUBSCRIPTION = { auth_mode: "subscription", access_token: "claim-tok", capability: "run-cap", generation: 3 };
+const SUBSCRIPTION = {
+  auth_mode: "subscription",
+  access_token: "claim-tok",
+  capability: "run-cap",
+  generation: 3,
+  chatgpt_account_id: "verified-account",
+  chatgpt_plan_type: null,
+};
 const API_KEY = { auth_mode: "api_key", access_token: "claim-tok", capability: "run-cap" };
 
 interface FakeClient {
@@ -340,6 +351,7 @@ interface Rig {
   fileopDisposed: () => number;
   spawnCommandCalls: { argv: readonly string[]; opts: { cwd?: string } }[];
   fileopSpawns: { worktreePath: string; env: NodeJS.ProcessEnv }[];
+  effectDisposes: () => number;
   sessionOps: { adopt: number; removeCalls: number; inspect: number };
   deps: CodexExecutorDeps;
 }
@@ -352,6 +364,7 @@ function makeRig(opts: { responder?: Responder; token?: string } = {}): Rig {
   const spawnCommandCalls: Rig["spawnCommandCalls"] = [];
   const fileopSpawns: Rig["fileopSpawns"] = [];
   const sessionOps = { adopt: 0, removeCalls: 0, inspect: 0 };
+  let effectDisposes = 0;
   const deps: CodexExecutorDeps = {
     launchProviderRoot: async (_spec, credential): Promise<CodexLaunchRootResult> => {
       // Assert the FRESH credential reaches the launcher (its env). Stash for the test.
@@ -362,10 +375,32 @@ function makeRig(opts: { responder?: Responder; token?: string } = {}): Rig {
       spawnCommandCalls.push({ argv, opts: cmdOpts });
       return { code: 0, stdout: "ok", stderr: "" };
     },
-    spawnFileop: (worktreePath, env) => {
-      fileopSpawns.push({ worktreePath, env });
-      return fh.handle;
+    launchEffectRoot: async (spec: CodexEffectLaunchSpec): Promise<CodexRootHandle> => {
+      fileopSpawns.push({ worktreePath: WORKSPACE, env: spec.env });
+      const stdin = new PassThrough();
+      const stdout = new PassThrough();
+      const stderr = new PassThrough();
+      return {
+        started: {
+          event: "started", supervisorPid: 200, childPid: 201, subreaper: true,
+          nondumpable: true, uid: 10003, liveCapsZero: true, capBoundingSet: "0xc0", noNewPrivs: true,
+        },
+        supervisorPid: 200,
+        transport: { stdin, stdout, stderr },
+        snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
+        waitChild: async () => ({ event: "child_exit", code: 0 }),
+        dispose: async () => {
+          effectDisposes += 1;
+          return {
+            clean: true,
+            event: { event: "dispose", id: 1, state: "drained", authority: "ECHILD+__WALL" },
+          };
+        },
+        failed: undefined,
+        whenFailed: new Promise<Error>(() => undefined),
+      };
     },
+    wireFileop: () => fh.handle,
     sessionStore: {
       adopt: async () => {
         sessionOps.adopt += 1;
@@ -394,6 +429,7 @@ function makeRig(opts: { responder?: Responder; token?: string } = {}): Rig {
     fileopDisposed: fh.disposed,
     spawnCommandCalls,
     fileopSpawns,
+    effectDisposes: () => effectDisposes,
     sessionOps,
     deps,
   };
@@ -460,7 +496,7 @@ describe("CodexExecutor: dark selection seam (the makeExecutor decision)", () =>
       { auth_mode: "subscription", access_token: "", capability: "SECRET-CAP", generation: 1 }, // invalid_access_token
       { auth_mode: "subscription", access_token: "SECRET-TOKEN", capability: "", generation: 1 }, // invalid_capability
       { auth_mode: "subscription", access_token: "SECRET-TOKEN", capability: "SECRET-CAP" }, // subscription_missing_generation
-      { auth_mode: "api_key", access_token: "SECRET-TOKEN", capability: "SECRET-CAP", generation: 1 }, // api_key_unexpected_generation
+      { auth_mode: "api_key", access_token: "SECRET-TOKEN", capability: "SECRET-CAP", generation: 1 }, // api_key_unexpected_subscription_fields
     ];
     for (const codex of broken) {
       let err: unknown;
@@ -568,6 +604,62 @@ describe("CodexExecutor: run() control flow (run-lane precedence)", () => {
       /boom: transport exploded/,
     );
   });
+
+  for (const scenario of [
+    { name: "idle", idleMs: 20, wallMs: 1000, expected: /idle timeout/ },
+    { name: "wall", idleMs: 1000, wallMs: 20, expected: /wall-clock timeout/ },
+  ] as const) {
+    it(`${scenario.name} trip propagates the active turn signal into the shell effect`, async () => {
+      const rig = makeRig();
+      let shellObservedAbort = false;
+      rig.deps = {
+        ...rig.deps,
+        idleMs: scenario.idleMs,
+        wallMs: scenario.wallMs,
+        spawnCommand: async (_argv, opts) => new Promise((resolve) => {
+          const settle = (): void => {
+            shellObservedAbort = true;
+            resolve({ code: 137, stdout: "", stderr: "" });
+          };
+          if (opts.signal?.aborted) settle();
+          else opts.signal?.addEventListener("abort", settle, { once: true });
+        }),
+      };
+      rig.transport
+        .push(threadStarted())
+        .push(toolCall(91, "Bash", { command: "sleep 60" }, "th-1", "tn-1", `trip-${scenario.name}`));
+      await assert.rejects(
+        withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx), 3000, `${scenario.name} shell trip`),
+        scenario.expected,
+      );
+      assert.equal(shellObservedAbort, true, "the pending shell received the turn abort before run cleanup");
+    });
+  }
+
+  it("user cancel propagates the active turn signal into the shell effect", async () => {
+    const controller = new AbortController();
+    const rig = makeRig();
+    let shellObservedAbort = false;
+    rig.deps = {
+      ...rig.deps,
+      spawnCommand: async (_argv, opts) => new Promise((resolve) => {
+        const settle = (): void => {
+          shellObservedAbort = true;
+          resolve({ code: 137, stdout: "", stderr: "" });
+        };
+        if (opts.signal?.aborted) settle();
+        else opts.signal?.addEventListener("abort", settle, { once: true });
+      }),
+    };
+    rig.transport
+      .push(threadStarted())
+      .push(toolCall(92, "Bash", { command: "sleep 60" }, "th-1", "tn-1", "trip-cancel"));
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx({ signal: controller.signal }).ctx);
+    await tick();
+    controller.abort();
+    await assert.rejects(withTimeout(running, 3000, "cancel shell trip"), /run cancelled/);
+    assert.equal(shellObservedAbort, true);
+  });
 });
 
 // ================================================================================
@@ -621,10 +713,11 @@ describe("CodexExecutor: credential bridge + isolation", () => {
     const spawn0 = rig.fileopSpawns[0];
     assert.ok(spawn0);
     const env = spawn0.env;
-    assert.deepEqual(Object.keys(env).sort(), ["LANG", "PATH", "TMPDIR"], "exactly the scrubbed keys");
+    assert.deepEqual(Object.keys(env).sort(), ["HOME", "LANG", "PATH", "TMPDIR"], "exactly the scrubbed keys");
     assert.equal(env.PATH, "/usr/bin:/bin");
     assert.equal(env.LANG, "C");
-    assert.equal(env.TMPDIR, "/run/runner-tmp");
+    assert.match(String(env.HOME), /^\/tmp\/uzi-codex-command-/);
+    assert.equal(env.TMPDIR, env.HOME, "one random Landlock-allowed tmp per command root");
     // Nothing inherited from the worker: no PAT/token/provider credential shape.
     assert.doesNotMatch(JSON.stringify(env), new RegExp(FRESH_TOKEN + "|run-cap|claim-tok"));
     assert.equal(spawn0.worktreePath, WORKSPACE);
@@ -862,19 +955,48 @@ describe("CodexExecutor: advice auth bridge + factory (part F)", () => {
 
 // ================================================================================
 describe("CodexExecutor: default command capture is byte-capped (A — untrusted-input OOM)", () => {
-  // A REAL spawn: without UZI_UID_SPLIT, commandRootCommand is a pass-through, so the
-  // default seam spawns the bare command. A custom (non-scrubbed) env is used only so the
-  // shell resolves the coreutils it needs — env scrubbing is (13)'s concern, not this test's.
+  // The low-level supervisor is faked, while the production reservation, registry,
+  // capture-cap and whole-root reap path is real.
   const runEnv: NodeJS.ProcessEnv = { PATH: process.env.PATH ?? "/usr/bin:/bin", LANG: "C", TMPDIR: "/tmp" };
 
+  function supervisedOutput(output: Buffer, code = 0): (spec: CodexEffectLaunchSpec) => Promise<CodexRootHandle> {
+    return async () => {
+      const stdin = new PassThrough();
+      const stdout = new PassThrough();
+      const stderr = new PassThrough();
+      let disposed = false;
+      stdout.write(output);
+      return {
+        started: { event: "started", supervisorPid: 10, childPid: 11, subreaper: true, nondumpable: true, uid: 10003, liveCapsZero: true, capBoundingSet: "0xc0", noNewPrivs: true },
+        supervisorPid: 10,
+        transport: { stdin, stdout, stderr },
+        snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
+        waitChild: async () => ({ event: "child_exit", code }),
+        dispose: async () => {
+          if (!disposed) { disposed = true; stdout.end(); stderr.end(); }
+          return { clean: true, event: { event: "dispose", id: 1, state: "drained", authority: "ECHILD+__WALL" } };
+        },
+        failed: undefined,
+        whenFailed: new Promise<Error>(() => undefined),
+      };
+    };
+  }
+
   it("(A) caps combined stdout+stderr at MAX_COMMAND_CAPTURE_BYTES, SIGKILLs the child, and RESOLVES (never rejects) with the truncated result", async () => {
-    const spawnCommand = makeDefaultSpawnCommand(runEnv);
+    const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
     // The child would emit 8 MiB (>> the 1 MiB cap). WITHOUT the cap the seam would
     // accumulate the whole 8 MiB (and an UNBOUNDED producer like `yes` would grow the JS
     // string until the worker OOMs). WITH the cap it stops at 1 MiB and kills the child.
     const bytesToEmit = 8 * 1024 * 1024;
+    const spawnCommand = makeDefaultSpawnCommand(
+      registry,
+      supervisedOutput(Buffer.alloc(bytesToEmit)),
+      1000,
+      "/data/runner/repo/run-1",
+      runEnv,
+    );
     const res = await withTimeout(
-      spawnCommand(["/bin/sh", "-c", `head -c ${bytesToEmit} /dev/zero`], { cwd: "/tmp" }),
+      spawnCommand(["/bin/sh", "-c", `head -c ${bytesToEmit} /dev/zero`], { cwd: "/data/runner/repo/run-1" }),
       30000,
       "capped command",
     );
@@ -887,15 +1009,77 @@ describe("CodexExecutor: default command capture is byte-capped (A — untrusted
   });
 
   it("(A) does NOT cap or kill a command whose output is under the cap (clean exit code preserved)", async () => {
-    const spawnCommand = makeDefaultSpawnCommand(runEnv);
+    const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
+    const spawnCommand = makeDefaultSpawnCommand(
+      registry,
+      supervisedOutput(Buffer.from("hello world")),
+      1000,
+      "/data/runner/repo/run-1",
+      runEnv,
+    );
     const res = await withTimeout(
-      spawnCommand(["/bin/sh", "-c", "printf 'hello world'; printf 'oops' 1>&2"], { cwd: "/tmp" }),
+      spawnCommand(["/bin/sh", "-c", "printf 'hello world'"], { cwd: "/data/runner/repo/run-1" }),
       30000,
       "small command",
     );
     assert.equal(res.code, 0, "a clean exit reports the child's own code, not the kill sentinel");
     assert.equal(res.stdout, "hello world");
-    assert.equal(res.stderr, "oops");
+    assert.equal(res.stderr, "");
+  });
+
+  it("reserves before launch and an active-turn abort reaps the command root before rejecting", async () => {
+    const registry = new ExecutionRegistry(newLocalExecutionEpoch(2));
+    let reservedAtLaunch = false;
+    let disposes = 0;
+    const launch = async (): Promise<CodexRootHandle> => {
+      reservedAtLaunch = registry.pendingLaunchCount() === 1;
+      const stdin = new PassThrough();
+      const stdout = new PassThrough();
+      const stderr = new PassThrough();
+      return {
+        started: { event: "started", supervisorPid: 20, childPid: 21, subreaper: true, nondumpable: true, uid: 10003, liveCapsZero: true, capBoundingSet: "0xc0", noNewPrivs: true },
+        supervisorPid: 20,
+        transport: { stdin, stdout, stderr },
+        snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
+        waitChild: async () => new Promise(() => undefined),
+        dispose: async () => {
+          disposes += 1;
+          stdout.end(); stderr.end();
+          return { clean: true, event: { event: "dispose", id: 1, state: "drained", authority: "ECHILD+__WALL" } };
+        },
+        failed: undefined,
+        whenFailed: new Promise<Error>(() => undefined),
+      };
+    };
+    const spawnCommand = makeDefaultSpawnCommand(registry, launch, 1000, "/data/runner/repo/run-2", runEnv);
+    const abort = new AbortController();
+    const running = spawnCommand(["/bin/sh", "-c", "sleep 60"], {
+      cwd: "/data/runner/repo/run-2",
+      signal: abort.signal,
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(registry.hasLiveCommandRoot(), true, "registered before effect use");
+    abort.abort();
+    await assert.rejects(running, /command aborted/);
+    assert.equal(reservedAtLaunch, true);
+    assert.equal(disposes, 1, "abort awaited the supervisor's clean whole-root disposal");
+    assert.equal(registry.hasLiveCommandRoot(), false);
+  });
+
+  it("builds the fixed Landlock wrapper argv for only the current worktree/private tmp", () => {
+    const args = commandSandboxArgv(
+      "/data/runner/repo/run-a",
+      "/data/runner/repo/run-a/sub",
+      "/bin/sh",
+      ["-c", "pwd"],
+      "/tmp/uzi-codex-command-test-a",
+    );
+    assert.deepEqual(args, [
+      "--root", "/data/runner/repo/run-a",
+      "--tmp", "/tmp/uzi-codex-command-test-a",
+      "--cwd", "/data/runner/repo/run-a/sub",
+      "--", "/bin/sh", "-c", "pwd",
+    ]);
   });
 });
 
@@ -933,8 +1117,33 @@ function diffClient(opts: { failCalls?: number } = {}): DiffClient {
 }
 
 const RECONCILE_REQ: BoundaryRequest = { boundary: "finalize", deadlineMs: 1000 };
+const RECONCILE_SIGNAL = new AbortController().signal;
 
 describe("CodexExecutor: run-lane reconcile ⟷ advice bridge — differential (m4 part 4, no drift)", () => {
+  it("run-lane reconciliation propagates boundary cancellation to the credential HTTP seam", async () => {
+    const controller = new AbortController();
+    let seenSignal: AbortSignal | undefined;
+    const client = {
+      refreshCodex: async (
+        _runId: string,
+        _request: unknown,
+        _expected: unknown,
+        signal?: AbortSignal,
+      ): Promise<never> => {
+        seenSignal = signal;
+        return new Promise<never>((_, reject) => {
+          signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+        });
+      },
+      releaseCodex: async (): Promise<never> => { throw new Error("unused"); },
+    };
+    const reconcile = buildRunLaneReconcile("run-1", client as never, bindingOf(SUBSCRIPTION), () => {});
+    const pending = reconcile(RECONCILE_REQ, controller.signal);
+    controller.abort();
+    assert.equal((await pending).kind, "blocked");
+    assert.equal(seenSignal, controller.signal);
+  });
+
   it("subscription: BOTH reuse the operation id across a retry AND advance the generation on success", async () => {
     // Advice bridge: a failed refresh() then a retry reuse the SAME op id; the observed
     // generation is unchanged on the failed attempt (no double exchange).
@@ -950,14 +1159,14 @@ describe("CodexExecutor: run-lane reconcile ⟷ advice bridge — differential (
     // Run-lane reconcile: mirror it — a `blocked` outcome then a `ready` retry reuse the op id.
     const rc = diffClient({ failCalls: 1 });
     const reconcile = buildRunLaneReconcile("run-1", rc as never, bindingOf(SUBSCRIPTION), () => {});
-    assert.equal((await reconcile(RECONCILE_REQ)).kind, "blocked", "the run-lane reconcile fails closed on the first attempt");
-    assert.equal((await reconcile(RECONCILE_REQ)).kind, "ready", "the retry succeeds");
+    assert.equal((await reconcile(RECONCILE_REQ, RECONCILE_SIGNAL)).kind, "blocked", "the run-lane reconcile fails closed on the first attempt");
+    assert.equal((await reconcile(RECONCILE_REQ, RECONCILE_SIGNAL)).kind, "ready", "the retry succeeds");
     assert.equal(rc.refreshCalls.length, 2);
     assert.equal(rc.refreshCalls[0]!.operation_id, rc.refreshCalls[1]!.operation_id, "run-lane reuses the op id across the retry");
     assert.equal(rc.refreshCalls[0]!.observed_generation, 3);
     assert.equal(rc.refreshCalls[1]!.observed_generation, 3, "run-lane re-uses the SAME observed generation (unchanged on failure)");
     // A NEW boundary after success mints a FRESH op id and uses the advanced generation.
-    assert.equal((await reconcile(RECONCILE_REQ)).kind, "ready");
+    assert.equal((await reconcile(RECONCILE_REQ, RECONCILE_SIGNAL)).kind, "ready");
     assert.notEqual(rc.refreshCalls[2]!.operation_id, rc.refreshCalls[0]!.operation_id, "a new boundary mints a fresh op id");
     assert.equal(rc.refreshCalls[2]!.observed_generation, 10, "and it uses the advanced generation the prior success committed");
   });
@@ -971,7 +1180,7 @@ describe("CodexExecutor: run-lane reconcile ⟷ advice bridge — differential (
 
     const rc = diffClient();
     const reconcile = buildRunLaneReconcile("run-1", rc as never, bindingOf(API_KEY), () => {});
-    assert.equal((await reconcile(RECONCILE_REQ)).kind, "ready");
+    assert.equal((await reconcile(RECONCILE_REQ, RECONCILE_SIGNAL)).kind, "ready");
     assert.equal(rc.refreshCalls.length, 0, "the run-lane api_key reconcile performs ZERO refresh");
     assert.equal(rc.releaseCalls.length, 1, "it freshly releases (re-authorizes) instead");
   });
@@ -983,7 +1192,7 @@ describe("CodexExecutor: run-lane reconcile ⟷ advice bridge — differential (
 
     const rc = diffClient({ failCalls: 99 });
     const reconcile = buildRunLaneReconcile("run-1", rc as never, bindingOf(SUBSCRIPTION), () => {});
-    const out = await reconcile(RECONCILE_REQ);
+    const out = await reconcile(RECONCILE_REQ, RECONCILE_SIGNAL);
     assert.equal(out.kind, "blocked");
     if (out.kind === "blocked") {
       assert.ok(out.errors.length >= 1, "the blocked outcome carries evidence");
@@ -993,6 +1202,28 @@ describe("CodexExecutor: run-lane reconcile ⟷ advice bridge — differential (
 });
 
 describe("CodexExecutor: F1 registry teardown relocation", () => {
+  it("an unconfirmed launcher dispose is a failing RegisteredRoot.dispose, never marked disposed", async () => {
+    const handle: CodexRootHandle = {
+      started: { event: "started", supervisorPid: 30, childPid: 31, subreaper: true, nondumpable: true, uid: 10003, liveCapsZero: true, capBoundingSet: "0xc0", noNewPrivs: true },
+      supervisorPid: 30,
+      transport: { stdin: null, stdout: null, stderr: null },
+      snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
+      waitChild: async () => ({ event: "child_exit", code: 0 }),
+      dispose: async () => ({ clean: false, reason: "deadline" }),
+      failed: undefined,
+      whenFailed: new Promise<Error>(() => undefined),
+    };
+    const registry = new ExecutionRegistry(newLocalExecutionEpoch(8));
+    const root = registeredRoot(handle, "command");
+    const reservation = registry.reserveLaunch("command");
+    assert.equal(reservation.kind, "reserved");
+    if (reservation.kind !== "reserved") return;
+    assert.equal(registry.registerRoot(reservation.reservation, root).ok, true);
+    const disposed = await registry.disposeTools(50);
+    assert.equal(disposed.kind, "incomplete");
+    assert.equal(registry.isPoisoned(), true);
+  });
+
   it("(F1) deferRegistryTeardown: run()'s finally leaves the registry ALIVE, then a runner sink reaps and the terminal dispose tears down", async () => {
     const rig = makeRig();
     rig.deps = { ...rig.deps, deferRegistryTeardown: true };
@@ -1003,12 +1234,14 @@ describe("CodexExecutor: F1 registry teardown relocation", () => {
     // run()'s finally did NOT reap/dispose the registry — it survives for the runner's sinks.
     assert.equal(rig.reaped(), 0, "the provider root was NOT reaped by run()");
     assert.equal(rig.disposed(), 0, "the provider root was NOT disposed by run()");
+    assert.equal(rig.effectDisposes(), 0, "the registered persistent fileop root remains for the durability boundary");
     assert.ok(exec.safety, "safety is populated");
 
     // Simulate the runner's terminal/finalize withBoundary sink, then its executeClaim-finally
     // dispose. The subscription reconcile runs before the boundary.
     await exec.safety!.withBoundary({ boundary: "finalize", deadlineMs: 200 }, async () => {});
     assert.ok(rig.reaped() >= 1, "the runner's finalize sink reaped the provider root");
+    assert.ok(rig.effectDisposes() >= 1, "the same boundary reaped the registered fileop command root");
     assert.ok(rig.client.refreshCalls.length >= 1, "the sink's subscription reconcile refreshed first");
     // The sink's reconcile registered a FRESH refresh token with the redactor; it is NOT yet
     // evicted (run()'s finally already ran, before this post-run sink).
@@ -1120,7 +1353,7 @@ describe("CodexExecutor: per-turn phase-correct broker (plan write ban)", () => 
     // --- PLAN turn: the broker MUST be plan-phase, so the write is denied before any fileop.
     const planRig = makeRig();
     const planFileop = recordingFileop();
-    planRig.deps = { ...planRig.deps, spawnFileop: () => planFileop.handle };
+    planRig.deps = { ...planRig.deps, wireFileop: () => planFileop.handle };
     planRig.transport.push(threadStarted()).push(writeCall("th-1", "tn-1")).push(turnCompleted("completed")).end();
     const { ctx: planCtx } = makeCtx({ planApproved: false, approvedPlan: undefined, gatePlan });
     // The write ban fires mid-turn; run() then rejects because the m5-incomplete plan lifecycle
@@ -1137,7 +1370,7 @@ describe("CodexExecutor: per-turn phase-correct broker (plan write ban)", () => 
     // --- IMPLEMENT turn: the same Write is APPLIED (a pre-approved run drives only implement).
     const implRig = makeRig();
     const implFileop = recordingFileop();
-    implRig.deps = { ...implRig.deps, spawnFileop: () => implFileop.handle };
+    implRig.deps = { ...implRig.deps, wireFileop: () => implFileop.handle };
     implRig.transport.push(threadStarted()).push(writeCall("th-1", "tn-1")).push(turnCompleted("completed")).end();
     const { ctx: implCtx } = makeCtx(); // pre-approved (planApproved + approvedPlan) → implement turn only
     const result = await withTimeout(makeExecutor(implRig, bindingOf(SUBSCRIPTION)).run(implCtx), 3000, "implement-turn write");
@@ -1167,7 +1400,7 @@ describe("CodexExecutor: per-turn phase-correct broker (plan write ban)", () => 
     };
     const rig = makeRig({ responder });
     const childFileop = recordingFileop();
-    rig.deps = { ...rig.deps, spawnFileop: () => childFileop.handle };
+    rig.deps = { ...rig.deps, wireFileop: () => childFileop.handle };
     rig.transport.push(threadStarted()).push(toolCall(1, "spawn_agent", { role: "coder", prompt: "help" }, "th-1", "tn-1", "c-root"));
 
     const { ctx } = makeCtx({ planApproved: false, approvedPlan: undefined, gatePlan, agents });

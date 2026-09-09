@@ -450,11 +450,11 @@ export interface ClaimRepo {
  * `auth_mode` mirroring the planned Go wire (`ClaimCodexSecrets`, emitted by
  * `claim_assembly.go` ONLY when `runs.codex_secret_id` is frozen):
  *
- *   * "subscription" carries the account's committed `generation` — the worker's
- *     initial observedGeneration for coordinated refresh. Subscription is the only
- *     mode that may refresh.
- *   * "api_key" has NO `generation` and can never refresh; an api_key run must
- *     never invoke refresh.
+ *   * "subscription" carries the account's committed `generation`, provider-verified
+ *     `chatgpt_account_id`, and `chatgpt_plan_type:null`, which are the only authoritative
+ *     inputs for pinned app-server's chatgptAuthTokens mode. A callback
+ *     `previousAccountId` is only an untrusted hint and never replaces this value.
+ *   * "api_key" has NONE of those subscription fields and can never refresh.
  *
  * Present ONLY for an internally-bound Codex run (ships DARK — M5 still owns public
  * routing). Ordinary Claude claims OMIT it, so their wire is byte-identical: the
@@ -463,7 +463,14 @@ export interface ClaimRepo {
  * persisted beyond the run, never logged (the access token/capability are secrets).
  */
 export type ClaimCodexSecrets =
-  | { auth_mode: "subscription"; access_token: string; capability: string; generation: number }
+  | {
+      auth_mode: "subscription";
+      access_token: string;
+      capability: string;
+      generation: number;
+      chatgpt_account_id: string;
+      chatgpt_plan_type: null;
+    }
   | { auth_mode: "api_key"; access_token: string; capability: string };
 
 /**
@@ -479,14 +486,20 @@ export interface CodexReleaseRequest {
 }
 
 /**
- * Response of the release route: ONLY the run's currently-committed access token. The auth
- * mode and generation the worker needs already rode the claim ({@link ClaimCodexSecrets}),
- * so a release is a re-fetch of the usable token for a fresh provider root. Delivered
- * Cache-Control: no-store; secret-bearing, never logged or persisted beyond the run.
+ * Response of the release route. Subscription repeats the freshly-authorized committed
+ * generation and provider-verified account id needed to construct a new app-server root;
+ * API key carries only its mode and token. The disjoint union prevents subscription
+ * account/generation/plan fields from leaking into API-key mode.
  */
-export interface CodexReleaseResponse {
-  access_token: string;
-}
+export type CodexReleaseResponse =
+  | {
+      auth_mode: "subscription";
+      access_token: string;
+      generation: number;
+      chatgpt_account_id: string;
+      chatgpt_plan_type: null;
+    }
+  | { auth_mode: "api_key"; access_token: string };
 
 /**
  * Request body for POST /worker/runs/{id}/codex/refresh (PRD #1171 M1). The run id is the
@@ -516,9 +529,12 @@ export interface CodexRefreshRequest {
  * error with no body, not this shape. Delivered Cache-Control: no-store; secret-bearing.
  */
 export interface CodexRefreshResponse {
+  auth_mode: "subscription";
   access_token: string;
   generation: number;
-  outcome: string;
+  chatgpt_account_id: string;
+  chatgpt_plan_type: null;
+  outcome: "advanced" | "replayed" | "reconciled";
 }
 
 /**

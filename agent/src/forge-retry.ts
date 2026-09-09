@@ -219,6 +219,8 @@ export interface WithForgeRetryOptions {
   sleep?: (ms: number) => Promise<void>;
   /** Optional logger; a warn is emitted before each retry sleep. */
   log?: { warn: (msg: string, meta?: Record<string, unknown>) => void };
+  /** Cancels attempts and backoff at the owning durability boundary deadline. */
+  signal?: AbortSignal;
 }
 
 export interface WithRetryOptions {
@@ -232,6 +234,51 @@ export interface WithRetryOptions {
   log?: { warn: (msg: string, meta?: Record<string, unknown>) => void };
   /** Message logged (log.warn) before each retry sleep. Default a generic phrase. */
   logMessage?: string;
+  signal?: AbortSignal;
+}
+
+function abortError(): Error {
+  const error = new Error("forge retry aborted at durability boundary");
+  error.name = "AbortError";
+  return error;
+}
+
+function waitRetryDelay(ms: number, signal: AbortSignal | undefined): Promise<void> {
+  if (!signal) return sleepReal(ms);
+  if (signal.aborted) return Promise.reject(abortError());
+  return new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    timer.unref?.();
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      reject(abortError());
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function waitInjectedDelay(delay: Promise<void>, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.reject(abortError());
+  return new Promise<void>((resolve, reject) => {
+    const onAbort = (): void => {
+      signal.removeEventListener("abort", onAbort);
+      reject(abortError());
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    delay.then(
+      () => {
+        signal.removeEventListener("abort", onAbort);
+        resolve();
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
 }
 
 /**
@@ -248,6 +295,7 @@ export async function withRetry<T>(fn: () => Promise<T>, opts: WithRetryOptions)
   const sleep = opts.sleep ?? sleepReal;
 
   for (let attempt = 0; ; attempt++) {
+    if (opts.signal?.aborted) throw abortError();
     try {
       return await fn();
     } catch (err) {
@@ -258,7 +306,12 @@ export async function withRetry<T>(fn: () => Promise<T>, opts: WithRetryOptions)
           delay_ms: delay,
           error: err instanceof Error ? err.message : String(err),
         });
-        await sleep(delay);
+        if (opts.sleep) {
+          const delayPromise = sleep(delay);
+          await (opts.signal ? waitInjectedDelay(delayPromise, opts.signal) : delayPromise);
+        } else {
+          await waitRetryDelay(delay, opts.signal);
+        }
         continue;
       }
       throw err;
@@ -285,5 +338,6 @@ export async function withForgeRetry<T>(
     sleep: opts.sleep,
     log: opts.log,
     logMessage: "transient forge error; retrying push/MR-create",
+    signal: opts.signal,
   });
 }

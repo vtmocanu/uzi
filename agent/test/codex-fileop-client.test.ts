@@ -4,7 +4,7 @@ import { PassThrough } from "node:stream";
 
 import {
   FileopHelperClient,
-  spawnFileopHelper,
+  wireFileopHelper,
   type FileopProcess,
 } from "../src/codex/fileop-client.js";
 import type { FileopResponse } from "../src/codex/broker.js";
@@ -202,9 +202,8 @@ describe("FileopHelperClient: malformed response desync", () => {
   });
 });
 
-describe("spawnFileopHelper: production process wiring", () => {
-  it("spawns the fileop binary with the trusted --root argv and wires a working client", async () => {
-    let captured: { command: string; args: readonly string[]; env: NodeJS.ProcessEnv | undefined } | undefined;
+describe("wireFileopHelper: registered process wiring", () => {
+  it("wires an already-supervised process to a working client", async () => {
     const toHelper = new PassThrough();
     const toClient = new PassThrough();
     let stdinEnded = false;
@@ -212,25 +211,7 @@ describe("spawnFileopHelper: production process wiring", () => {
       stdin: Object.assign(toHelper, { end: () => { stdinEnded = true; } }) as unknown as FileopProcess["stdin"],
       stdout: toClient,
     };
-    const scrubbedEnv: NodeJS.ProcessEnv = { PATH: "/codex-cmd/bin", TMPDIR: "/codex-cmd/tmp" };
-    const handle = spawnFileopHelper(
-      { fileopBin: "/opt/uzi-codex/bin/uzi-codex-fileop", worktreePath: "/work/tree", env: scrubbedEnv },
-      {
-        spawnProcess: (command, args, env) => {
-          captured = { command, args, env };
-          return fakeProc;
-        },
-      },
-    );
-    // Single-uid (UZI_UID_SPLIT unset in the test env): commandRootCommand passes the
-    // command through unwrapped, so the argv is exactly the trusted, model-free target.
-    assert.ok(captured);
-    assert.equal(captured.command, "/opt/uzi-codex/bin/uzi-codex-fileop");
-    assert.deepEqual(captured.args, ["--root", "/work/tree"]);
-    // The command-root env is EXACTLY the caller's scrubbed env — never the worker's
-    // ambient process.env (a cross-root credential-read gap). Proves spawnFileopHelper
-    // forwards spec.env verbatim and does not fall back to the inherited environment.
-    assert.deepEqual(captured.env, scrubbedEnv);
+    const handle = wireFileopHelper(fakeProc);
 
     // The wired client speaks over the fake stdio.
     const reqSink = new RequestSink(toHelper);
@@ -249,10 +230,7 @@ describe("spawnFileopHelper: production process wiring", () => {
   it("throws when the spawned process lacks a stdio channel", () => {
     assert.throws(
       () =>
-        spawnFileopHelper(
-          { fileopBin: "/bin/x", worktreePath: "/w", env: {} },
-          { spawnProcess: () => ({ stdin: null, stdout: null }) },
-        ),
+        wireFileopHelper({ stdin: null, stdout: null }),
       /missing a stdin\/stdout channel/,
     );
   });

@@ -76,11 +76,12 @@ timeout --kill-after=60s "$TIMEOUT" docker run --rm --network none \
   --read-only \
   --tmpfs /nix:exec --tmpfs /data --tmpfs /tmp:exec \
   --entrypoint /usr/local/sbin/uzi-entrypoint \
-  -e CODEX_M3B_PACKAGED=1 -e CODEX_M3B_SRC=/app/src \
+  -e CODEX_M3B_PACKAGED=1 -e CODEX_M3B_SRC=/app/src -e UZI_R2_COMMAND_ROOT_LINUX=1 \
   -v "$REPO/e2e":/work/e2e:ro \
+  -v "$REPO/agent/test":/app/test:ro \
   --name "$LIFECYCLE_NAME" \
   "$IMAGE" /bin/sh -c 'cd /app && exec /usr/local/bin/node --import tsx --test --test-concurrency=1 --test-timeout=120000 \
-    /work/e2e/codex-m3b/lifecycle.test.ts' 2>&1 | tee "$LIFECYCLE_OUT"
+    /app/test/codex-command-root-linux.test.ts /work/e2e/codex-m3b/lifecycle.test.ts' 2>&1 | tee "$LIFECYCLE_OUT"
 rc_lifecycle=${PIPESTATUS[0]}
 set -e
 docker rm -f "$LIFECYCLE_NAME" >/dev/null 2>&1 || true

@@ -77,6 +77,14 @@ type snapshotEvidence struct {
 	Processes []procRow `json:"processes"`
 }
 
+// childExitEvidence is emitted exactly once when the supervised primary child
+// exits. The status is normalized to the conventional shell code (128+signal
+// for a signal death), so callers never need raw WaitStatus details.
+type childExitEvidence struct {
+	Event string `json:"event"`
+	Code  int    `json:"code"`
+}
+
 // disposeEvidence builds the "dispose" event for a completed drain attempt.
 func disposeEvidence(id int, d drainResult) map[string]any {
 	m := d.fields()

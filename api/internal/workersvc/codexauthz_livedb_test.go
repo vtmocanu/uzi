@@ -189,6 +189,11 @@ func TestAuthorizeCodexCredentialOpAcceptsValidLiveDB(t *testing.T) {
 	} else if *codex.Generation != 0 {
 		t.Fatalf("initial subscription generation = %d, want 0", *codex.Generation)
 	}
+	state := mustState(t, env, f.userID, f.aliasID)
+	account := env.mustAccount(t, f.userID, uuid.UUID(state.ProviderAccountID.Bytes))
+	if codex.ChatGPTAccountID != account.WorkspaceAccountID {
+		t.Fatalf("claim chatgpt account id = %q, want verified %q", codex.ChatGPTAccountID, account.WorkspaceAccountID)
+	}
 
 	authCtx, err := f.svc.AuthorizeCodexCredentialOp(env.ctx, f.wkr, f.runID, codex.Capability, ScopeReleaseAccessToken)
 	if err != nil {
@@ -384,6 +389,9 @@ func TestAuthorizeCodexScopeNotApplicableAPIKeyLiveDB(t *testing.T) {
 	}
 	if codex.Generation != nil {
 		t.Fatalf("an api_key claim must carry NO generation, got %d", *codex.Generation)
+	}
+	if codex.ChatGPTAccountID != "" {
+		t.Fatalf("an api_key claim must carry NO chatgpt account id, got %q", codex.ChatGPTAccountID)
 	}
 
 	// Release is authorized.

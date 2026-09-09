@@ -65,6 +65,18 @@ func TestSnapshotEvidenceCommOnly(t *testing.T) {
 	}
 }
 
+func TestChildExitEvidenceIsBoundedToNormalizedCode(t *testing.T) {
+	m := decode(t, childExitEvidence{Event: "child_exit", Code: 143})
+	if m["event"] != "child_exit" || m["code"].(float64) != 143 {
+		t.Fatalf("unexpected child exit evidence: %v", m)
+	}
+	for _, forbidden := range []string{"status", "signal", "argv", "command"} {
+		if _, ok := m[forbidden]; ok {
+			t.Errorf("child exit evidence must not carry %q", forbidden)
+		}
+	}
+}
+
 func TestDisposeEvidenceDrained(t *testing.T) {
 	d := drainResult{State: stateDrained, Authority: authorityECHILD, Killed: []int{11}, Reaped: []int{11}}
 	m := decode(t, disposeEvidence(4, d))

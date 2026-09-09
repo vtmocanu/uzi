@@ -13,7 +13,7 @@ import {
 import type { SecretFinding } from "./secret-scan-guard.js";
 import type { Executor, ExecutorResult, RunContext } from "./executor.js";
 import { PlanRejectedError } from "./executor.js";
-import type { BoundaryRequest } from "./harness.js";
+import type { BoundaryPermit, BoundaryRequest } from "./harness.js";
 import { skillsPluginDir } from "./skills-plugin.js";
 import { describeLimit, LimitReachedError } from "./limit.js";
 import type { Logger } from "./log.js";
@@ -363,6 +363,7 @@ interface RunFlight {
   readonly steering: SteeringChannel;
   readonly reportState: (
     body: Parameters<WorkerClient["reportState"]>[1],
+    signal?: AbortSignal,
   ) => ReturnType<WorkerClient["reportState"]>;
   observedSessionId: string | undefined;
   barePath: string | undefined;
@@ -695,7 +696,7 @@ export class RunRunner {
       await this.withCodexBoundaryOnly(
         executor,
         { boundary: "finalize", deadlineMs: this.codexBoundaryDeadlineMs },
-        () => this.phasePublish(claim, flight),
+        (permit) => this.phasePublish(claim, flight, permit?.signal),
       );
     } catch (err) {
       // PRD #35: a usage-limit death is not an ordinary failure. Handled before the
@@ -864,13 +865,19 @@ export class RunRunner {
                   boundary: "shutdown",
                   deadlineMs: Math.min(this.codexBoundaryDeadlineMs, this.shutdownPublishTimeoutMs),
                 },
-                async () => {
+                async (permit) => {
                   await this.git.commitWipMarker(worktreePath).catch(() => false);
                   await this.fetchBackBestEffort(barePath, worktreePath, branch, runId, runLog);
                   // PRD #1062 M2 (#1036): the path is reaped above, so the overlay's PAT
                   // default-fetch is permitted — a behind-on-workflows branch checkpoints durably.
                   const shutdownOverlay = await this.buildCheckpointOverlay(claim, flight, barePath);
-                  published = await this.publishCheckpointBestEffort(flight, barePath, branch, shutdownOverlay);
+                  published = await this.publishCheckpointBestEffort(
+                    flight,
+                    barePath,
+                    branch,
+                    shutdownOverlay,
+                    permit?.signal,
+                  );
                 },
               );
             } catch (err) {
@@ -885,15 +892,13 @@ export class RunRunner {
             }
             return published;
           })();
-          // undefined ⇒ the budget elapsed before the sequence finished: nothing confirmably
-          // landed, so a cross-worker resume does restart from default — the same truthful
-          // consequence as an outright publish failure. `=== true` folds false + undefined
-          // into the NOT-published line. The orphaned durability promise (on a timeout) is
-          // best-effort and never rejects, so leaving it running past this point is safe.
-          const published = await this.raceShutdownBudget(
-            durability,
-            this.shutdownPublishTimeoutMs,
-          );
+          // Claude retains the literal legacy budget race. Codex must not abandon a held
+          // permit: its boundary signal cancels supervised children + the upload at the same
+          // bounded deadline, and we await actual action/root settlement before terminal
+          // safety.dispose or run-home cleanup can proceed.
+          const published = executor.safety
+            ? await durability
+            : await this.raceShutdownBudget(durability, this.shutdownPublishTimeoutMs);
           // issue #1030 M4: surface the outcome on the feed the same way the park path does,
           // reusing the batcher emit + the reportPublishOutcome dedupe from M1. This lands
           // because it is emitted BEFORE the single batcher.close() below — the shutdown
@@ -1129,8 +1134,11 @@ export class RunRunner {
     }
   }
 
-  private async phasePublish(claim: ClaimResponse, flight: RunFlight): Promise<void> {
-    const { runLog, batcher, reportState, redactText, executor, runHome } = flight;
+  private async phasePublish(claim: ClaimResponse, flight: RunFlight, boundarySignal?: AbortSignal): Promise<void> {
+    const { runLog, batcher, redactText, executor, runHome } = flight;
+    const reportState = (body: Parameters<RunFlight["reportState"]>[0]) =>
+      flight.reportState(body, boundarySignal);
+    const closeBatcher = () => batcher.close(boundarySignal);
     const runId = claim.run_id;
     const result = flight.result!;
     // PRD #1190 M2: an owner-requested pause PARKED the run mid-loop (handlePausePark reported
@@ -1145,7 +1153,7 @@ export class RunRunner {
       // no-op for Codex (its executor implements no killAgentTree and never sets pausedAt); for
       // Claude it is the literal legacy reap, byte-unchanged.
       executor.killAgentTree?.();
-      await batcher.close().catch(() => undefined);
+      await closeBatcher().catch(() => undefined);
       runLog.info("run parked on an owner-requested pause; skipping finalization", {
         run_id: runId,
       });
@@ -1169,7 +1177,7 @@ export class RunRunner {
           text: "not a code problem: completing with the diagnosis, no merge request",
         },
       });
-      await batcher.close();
+      await closeBatcher();
       await reportState({ status: "completed", fix_verdict: "not_code" });
       runLog.info("ci_fix run completed with not_code verdict", {
         run_id: runId,
@@ -1212,7 +1220,7 @@ export class RunRunner {
             text: "report_only was set but this run published a checkpoint to origin; failing to avoid orphaning it",
           },
         });
-        await batcher.close();
+        await closeBatcher();
         await reportState({
           status: "failed",
           failure_reason:
@@ -1232,7 +1240,7 @@ export class RunRunner {
           text: "report-only run: recording findings; no branch pushed and no merge request opened",
         },
       });
-      await batcher.close();
+      await closeBatcher();
       await reportState({
         status: "completed",
         report_only: true,
@@ -1289,7 +1297,7 @@ export class RunRunner {
                 text: "operator scope directive stopped this run before any milestone produced committed work; recording it, no merge request",
               },
             });
-            await batcher.close();
+            await closeBatcher();
             await reportState({
               status: "completed",
               report_only: true,
@@ -1312,7 +1320,7 @@ export class RunRunner {
               text: "no changes were committed and report_only was not set; failing",
             },
           });
-          await batcher.close();
+          await closeBatcher();
           await reportState({
             status: "failed",
             failure_reason:
@@ -1364,7 +1372,7 @@ export class RunRunner {
               text: "report_only was set but this run published a checkpoint to origin; failing to avoid orphaning it",
             },
           });
-          await batcher.close();
+          await closeBatcher();
           await reportState({
             status: "failed",
             failure_reason:
@@ -1384,7 +1392,7 @@ export class RunRunner {
             text: "prompt run committed no changes: recording findings; no branch pushed and no merge request opened",
           },
         });
-        await batcher.close();
+        await closeBatcher();
         await reportState({
           status: "completed",
           report_only: true,
@@ -1577,7 +1585,7 @@ export class RunRunner {
           "run failed: branch touches .github/workflows which the bot PAT cannot push; preserving diff",
           { run_id: runId, paths: wfHits },
         );
-        await batcher.close();
+        await closeBatcher();
         await reportState({
           status: "failed",
           failure_reason: reason.slice(0, MAX_FAILURE_REASON_LEN),
@@ -1644,7 +1652,7 @@ export class RunRunner {
             })),
           },
         );
-        await batcher.close();
+        await closeBatcher();
         await reportPushSecretBlocked(reason);
         return;
       }
@@ -1676,7 +1684,7 @@ export class RunRunner {
             claim.repo.clone_url,
             claim.secrets.forge_username,
           ),
-        { log: runLog },
+        { log: runLog, signal: boundarySignal },
       );
 
     // PRD #974 M2 — the GH013 remote backstop. When a finalize push (the normal path OR an
@@ -1703,7 +1711,7 @@ export class RunRunner {
       runLog.info("run failed: push rejected by GitHub Push Protection (GH013)", {
         run_id: runId,
       });
-      await batcher.close();
+      await closeBatcher();
       await reportPushSecretBlocked(reason);
     };
 
@@ -1789,7 +1797,7 @@ export class RunRunner {
             runLog.info("run failed: finalize base-align conflict; preserving diff", {
               run_id: runId,
             });
-            await batcher.close();
+            await closeBatcher();
             await reportState({
               status: "failed",
               failure_reason: composeBaseAlignConflictReason(alignDefaultBranch),
@@ -2085,7 +2093,7 @@ export class RunRunner {
           text: `task complete; pushed ${result.branch} (no merge request — pull the branch)`,
         },
       });
-      await batcher.close();
+      await closeBatcher();
       await reportState({
         status: "completed",
         branch: result.branch,
@@ -2136,8 +2144,8 @@ export class RunRunner {
             result.gatesDiscoveryTruncated,
             result.scopeCapped,
           ),
-        }),
-      { log: runLog },
+        }, boundarySignal),
+      { log: runLog, signal: boundarySignal },
     );
     batcher.emit({
       kind: "status",
@@ -2145,7 +2153,7 @@ export class RunRunner {
       payload: { text: `merge request opened: !${mr.iid} ${mr.webUrl}` },
     });
 
-    await batcher.close();
+    await closeBatcher();
     // Persist the MR/PR web URL the forge just handed us (PRD #65 D8), so the web
     // links it directly instead of reconstructing the URL by string surgery. Omit
     // it when the forge returned none (mr.webUrl empty) so the server lands NULL and
@@ -2266,12 +2274,13 @@ export class RunRunner {
       cancel,
       steering,
       observedSessionId: undefined,
-      reportState: (body) =>
+      reportState: (body, signal) =>
         this.client.reportState(
           runId,
           flight.observedSessionId
             ? { ...body, session_id: flight.observedSessionId }
             : body,
+          signal,
         ),
       barePath: undefined,
       worktreePath: undefined,
@@ -3352,9 +3361,9 @@ export class RunRunner {
    * `killAgentTree` reap branch (Claude/stub — unchanged ordering, cleanup and errors).
    *
    * The runner is HARNESS-AGNOSTIC: it branches ONLY on `!!executor.safety`, never reads
-   * authMode/credentials, never imports agent/src/codex/**, never calls `spawnBoundaryAction`,
-   * and IGNORES the `permit` — the PAT git/publish work runs as plain runner `child_process`
-   * INSIDE the held permit (safety is the reap + closed admission, not a boundary-action spawn).
+   * authMode/credentials and never imports agent/src/codex/**. Inside a Codex permit it scopes
+   * GitCache to `spawnBoundaryProcess`, so every git/gitleaks/pack child reserves and settles a
+   * registry-owned boundary-action root rather than merely running beside a held permit.
    * All auth-mode reconciliation lives inside the executor-owned reconcile closure the facade
    * runs BEFORE the reap. A `CodexBoundaryError` (sink counter zero, publication blocked)
    * PROPAGATES to the caller, which decides whether it is a best-effort publish failure or a
@@ -3363,15 +3372,19 @@ export class RunRunner {
   private async reapForSink(
     executor: Executor,
     req: BoundaryRequest,
-    action: () => Promise<void>,
+    action: (permit?: BoundaryPermit) => Promise<void>,
   ): Promise<void> {
-    if (executor.safety) {
-      await executor.safety.withBoundary(req, async (_permit) => {
-        await action();
+    const safety = executor.safety;
+    if (safety) {
+      await safety.withBoundary(req, async (permit) => {
+        await this.git.withBoundaryProcessSpawner(
+          (process) => safety.spawnBoundaryProcess(permit, process),
+          () => action(permit),
+        );
       });
     } else {
       executor.killAgentTree?.();
-      await action();
+      await action(undefined);
     }
   }
 
@@ -3384,14 +3397,18 @@ export class RunRunner {
   private async withCodexBoundaryOnly(
     executor: Executor,
     req: BoundaryRequest,
-    action: () => Promise<void>,
+    action: (permit?: BoundaryPermit) => Promise<void>,
   ): Promise<void> {
-    if (executor.safety) {
-      await executor.safety.withBoundary(req, async (_permit) => {
-        await action();
+    const safety = executor.safety;
+    if (safety) {
+      await safety.withBoundary(req, async (permit) => {
+        await this.git.withBoundaryProcessSpawner(
+          (process) => safety.spawnBoundaryProcess(permit, process),
+          () => action(permit),
+        );
       });
     } else {
-      await action(); // legacy already reaped at its untouched killAgentTree site
+      await action(undefined); // legacy already reaped at its untouched killAgentTree site
     }
   }
 
@@ -3493,6 +3510,7 @@ export class RunRunner {
     barePath: string,
     branch: string,
     overlay?: CheckpointOverlayContext,
+    signal?: AbortSignal,
   ): Promise<boolean> {
     // issue #1086 (F2): two-tip reconciliation. The CONFIRMED tip advances only on a real ACK; an
     // ambiguous result (non-2xx, or a throw after the pack tip is known) records the ATTEMPTED tip
@@ -3505,7 +3523,7 @@ export class RunRunner {
       const packed = await this.git.checkpointPack(barePath, branch, overlay);
       if (!packed) return false; // nothing to publish — not a failure, stay silent
       packedTip = packed.tipOid;
-      const res = await this.client.publishCheckpoint(flight.runId, packed.tipOid, packed.pack);
+      const res = await this.client.publishCheckpoint(flight.runId, packed.tipOid, packed.pack, signal);
       if (res.ok && res.body.published === true) {
         // PRD #1062 M2 (#1036): a CONFIRMED publish advances the known checkpoint ref tip to the
         // declared tip (the overlay `O_ov`, or realTip on the no-overlay path), so the NEXT
@@ -4104,9 +4122,9 @@ export class RunRunner {
       await this.withCodexBoundaryOnly(
         flight.executor,
         { boundary: "shutdown", deadlineMs: this.codexBoundaryDeadlineMs },
-        async () => {
+        async (permit) => {
           const overlay = await this.buildCheckpointOverlay(claim, flight, barePath);
-          published = await this.publishCheckpointBestEffort(flight, barePath, branch, overlay);
+          published = await this.publishCheckpointBestEffort(flight, barePath, branch, overlay, permit?.signal);
         },
       );
     } catch (err) {

@@ -7,10 +7,9 @@
 // stat / list / mkdir / rename / unlink / rmdir) is executed by the helper under
 // RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS, so the KERNEL is the
 // containment and there is NO check-then-use window: this client NEVER touches a
-// model path with node `fs`, and it NEVER realpath-checks-then-opens-by-pathname. A
-// patch (`apply`) rides the helper's fd-anchored read-modify-write on ONE held fd, so
-// a symlink/rename swap racing the edit is refused (E_SYMLINK) or lands on the pinned
-// inode, never followed out of the worktree.
+// model path with node `fs`, and it NEVER realpath-checks-then-opens-by-pathname.
+// Reads stay pinned to the openat2-resolved descriptor; replacements are staged in
+// the pinned parent directory and atomically renamed over the target.
 //
 // The helper is a long-lived per-run process launched as the credential-free COMMAND
 // identity (uid 10003, `commandRootCommand`) with the worktree root passed ONCE on its
@@ -18,17 +17,16 @@
 // wire: request/response id correlation, bounded newline framing, per-request
 // deadlines and fail-closed transport-failure mapping. It is decoupled from the
 // process (it takes injected streams) so unit tests drive it with in-memory pipes and
-// no real helper binary; {@link spawnFileopHelper} is the thin production wiring.
+// no real helper binary; {@link wireFileopHelper} accepts only streams from an
+// already-registered supervisor root.
 //
 // SECURITY: this module NEVER logs a raw path, file body, request or response. A
 // transport failure maps to a bounded typed code (`E_IO` / `E_TIMEOUT` / `E_OVERSIZE`
 // / `E_MALFORMED`) the broker renders as a neutral `fileop_denied`; the helper's own
 // codes are already bounded and path/content-free.
 
-import { spawn } from "node:child_process";
 import type { Readable, Writable } from "node:stream";
 
-import { commandRootCommand } from "../runner-uid.js";
 import type { FileopClient, FileopRequest, FileopResponse } from "./broker.js";
 
 /** Per-line ceiling on a decoded response frame. Mirrors the helper's own
@@ -223,19 +221,6 @@ export class FileopHelperClient implements FileopClient {
 
 // --- production process wiring -------------------------------------------------
 
-/** The trusted, launcher-fixed inputs for spawning the helper. `fileopBin` and
- *  `worktreePath` are absolute and worker-chosen, NEVER model-controlled. */
-export interface FileopHelperSpec {
-  readonly fileopBin: string;
-  readonly worktreePath: string;
-  /** The command-root env (the credential-free command identity's PATH/TMPDIR); the
-   *  helper needs no credentials. REQUIRED and REPLACED, never merged with — and never
-   *  defaulted to — the worker's own `process.env`: the caller (m3) must construct a
-   *  scrubbed env so the credential-free command identity cannot inherit provider
-   *  credentials. Omitting it is a bug, not "use the ambient environment". */
-  readonly env: NodeJS.ProcessEnv;
-}
-
 /** A live helper process plus its client. `dispose` best-effort ends the request
  *  stream (the helper exits on stdin EOF) and closes the client; process REAPING is
  *  the registry/safety lane's job, not this handle's. */
@@ -250,36 +235,17 @@ export interface FileopProcess {
   readonly stdin: Writable | null;
   readonly stdout: Readable | null;
 }
-export type SpawnFileopProcess = (
-  command: string,
-  args: readonly string[],
-  env: NodeJS.ProcessEnv | undefined,
-) => FileopProcess;
-
-const defaultSpawnFileopProcess: SpawnFileopProcess = (command, args, env) =>
-  // `env ?? {}`, NEVER a bare `env` that Node would fall back to `process.env` for: the
-  // credential-free command identity must not silently inherit the worker's environment
-  // (a cross-root credential-read gap). A missing env yields an empty environment (a
-  // detectable broken helper), never the ambient one.
-  spawn(command, [...args], { stdio: ["pipe", "pipe", "pipe"], env: env ?? {} }) as unknown as FileopProcess;
-
 export interface SpawnFileopHelperDeps {
-  readonly spawnProcess?: SpawnFileopProcess;
   readonly maxLineBytes?: number;
   readonly requestTimeoutMs?: number;
 }
 
 /**
- * Launch the fileop helper as the credential-free COMMAND identity and return a wired
- * {@link FileopClient}. The helper argv is trusted and launcher-fixed
- * (`<fileopBin> --root <abs-worktree>`); the worktree root is the anchor the kernel
- * containment resolves beneath, never a model path. Composed via `commandRootCommand`
- * so the helper runs under uid 10003 (setpriv cap-clear) under the uid split, exactly
- * like the shell effect surface, and unchanged single-uid.
+ * Wire the already-launched, registry-admitted command-root helper to its NDJSON
+ * client. Process launch/reap belongs to the execution registry; this function
+ * cannot create an unsupervised helper by construction.
  */
-export function spawnFileopHelper(spec: FileopHelperSpec, deps: SpawnFileopHelperDeps = {}): FileopHelperHandle {
-  const wrapped = commandRootCommand(spec.fileopBin, ["--root", spec.worktreePath]);
-  const proc = (deps.spawnProcess ?? defaultSpawnFileopProcess)(wrapped.command, wrapped.args, spec.env);
+export function wireFileopHelper(proc: FileopProcess, deps: SpawnFileopHelperDeps = {}): FileopHelperHandle {
   if (!proc.stdin || !proc.stdout) {
     throw new Error("fileop helper process is missing a stdin/stdout channel");
   }

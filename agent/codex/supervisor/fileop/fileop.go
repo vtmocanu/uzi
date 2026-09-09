@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -93,24 +95,62 @@ type request struct {
 	Old     string `json:"old"`
 }
 
-// server holds the worktree-root dirfd opened ONCE (O_DIRECTORY|O_PATH) and the
-// per-op bounds. Bounds are fields (not bare consts) so tests can drive the same
-// production code paths with small caps; newServer wires the production defaults.
+// server holds the worktree-root dirfd opened ONCE (O_DIRECTORY|O_PATH), the per-op
+// bounds, and narrow staging syscall seams. Fields let tests drive production paths
+// with small caps and deterministic failures; newServer wires every production value.
 type server struct {
-	rootFD   int
-	maxRead  int
-	maxWrite int
-	lineMax  int
+	rootFD          int
+	maxRead         int
+	maxWrite        int
+	lineMax         int
+	stageWrite      func(int, []byte) error
+	stageRename     func(int, string, int, string, uint) error
+	newStageName    func() (string, error)
+	beforeApplyOpen func()
 }
 
 // newServer builds a server anchored at rootFD with the production bounds.
 func newServer(rootFD int) *server {
 	return &server{
-		rootFD:   rootFD,
-		maxRead:  maxReadBytes,
-		maxWrite: maxWriteBytes,
-		lineMax:  maxRequestLine,
+		rootFD:          rootFD,
+		maxRead:         maxReadBytes,
+		maxWrite:        maxWriteBytes,
+		lineMax:         maxRequestLine,
+		stageWrite:      writeAll,
+		stageRename:     unix.Renameat2,
+		newStageName:    randomStageName,
+		beforeApplyOpen: func() {},
 	}
+}
+
+// writeAll writes the complete replacement body to a staged regular file. A short
+// write is retried; returning nil therefore means every byte reached the staged fd.
+func writeAll(fd int, data []byte) error {
+	for len(data) > 0 {
+		n, err := unix.Write(fd, data)
+		if errors.Is(err, unix.EINTR) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if n <= 0 {
+			return unix.EIO
+		}
+		data = data[n:]
+	}
+	return nil
+}
+
+// randomStageName returns a fixed-size, model-independent basename for a temporary
+// replacement file. O_EXCL remains the collision authority; randomness only keeps a
+// staged body difficult for another local process to guess while the edit is pending.
+func randomStageName() (string, error) {
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return "", err
+	}
+	return ".uzi-fileop-" + hex.EncodeToString(nonce[:]), nil
 }
 
 // serve runs the newline-delimited-JSON request/response loop: one request per
@@ -195,16 +235,23 @@ func (s *server) handle(req request) map[string]any {
 	}
 }
 
-// openBeneath resolves rel against the root dirfd with the KERNEL containment
-// flags. Every path-consuming operation goes through here; nothing else opens by
-// pathname. O_CLOEXEC is always set so a transient fd never leaks across a fork.
-func (s *server) openBeneath(rel string, flags int, mode uint32) (int, error) {
+// openAtBeneath resolves rel against an already-pinned dirfd with the KERNEL
+// containment flags. O_CLOEXEC is always set so a transient fd never leaks across
+// a fork.
+func openAtBeneath(dirFD int, rel string, flags int, mode uint32) (int, error) {
 	how := &unix.OpenHow{
 		Flags:   uint64(flags) | unix.O_CLOEXEC,
 		Mode:    uint64(mode),
 		Resolve: resolveFlags,
 	}
-	return unix.Openat2(s.rootFD, rel, how)
+	return unix.Openat2(dirFD, rel, how)
+}
+
+// openBeneath resolves rel against the worktree-root dirfd. Every model-selected
+// path starts here; operations that pin a nested parent use openAtBeneath for the
+// final slash-free component so no later parent substitution can redirect them.
+func (s *server) openBeneath(rel string, flags int, mode uint32) (int, error) {
+	return openAtBeneath(s.rootFD, rel, flags, mode)
 }
 
 // resolveParent splits rel into (parent directory, final single component) and
@@ -363,20 +410,16 @@ func (s *server) doWrite(req request) map[string]any {
 	return okResp(req.ID, map[string]any{"size": int64(len(data))})
 }
 
-// doApply applies an old→new text replacement to an EXISTING regular file
-// ATOMICALLY on ONE held fd: it opens the target once beneath root (openat2, no
-// symlink), reads its current bytes, replaces the (unique) `old` occurrence with
-// `new`, then truncates and rewrites through the SAME descriptor. This is the
-// Claude Edit/apply_patch vocabulary the renderer maps, applied race-safely: there
-// is no read-then-reopen window a mutator could redirect, because the whole
-// read-modify-write rides the fd that openat2 already resolved and pinned. A swap
-// of the pathname after the open cannot move the write off the pinned inode, and a
-// swap that races the open is refused by RESOLVE_NO_SYMLINKS (E_SYMLINK), never
-// followed. `old` MUST be non-empty and occur EXACTLY once (an absent match is
-// E_NO_MATCH, multiple matches are E_AMBIGUOUS); the plain create-or-overwrite case
-// is the `write` op, never this one. `old`/`new` ride base64 in Old/Data. O_TRUNC is
-// NOT set on the open (it must not truncate before the regular-file check); the
-// explicit Ftruncate after the fstat resets the length on a confirmed regular file.
+// doApply applies an old→new text replacement to an EXISTING regular file. It opens
+// the target once beneath root (openat2, no symlink), reads its current bytes, and
+// requires `old` to occur exactly once. The replacement is written completely to a
+// unique regular file created with O_EXCL in the already-pinned parent directory,
+// given the target's mode, synced, closed, then atomically renamed over the target
+// with renameat2. Until that final rename succeeds the live target is untouched, so
+// a short write or other staging failure cannot expose an empty or partial file.
+// All pathname operations use slash-free basenames against the pinned parent fd:
+// they cannot follow a swapped symlink outside the worktree. `old`/`new` ride base64
+// in Old/Data; the plain create-or-overwrite case is the `write` op, never this one.
 func (s *server) doApply(req request) map[string]any {
 	if err := validatePath(req.Path); err != nil {
 		return errResp(req.ID, classify(err))
@@ -398,7 +441,15 @@ func (s *server) doApply(req request) map[string]any {
 	if len(newBytes) > s.maxWrite {
 		return errResp(req.ID, codeOversize)
 	}
-	fd, err := s.openBeneath(req.Path, unix.O_RDWR|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
+	parentFD, base, ownParent, err := s.resolveParent(req.Path)
+	if err != nil {
+		return errResp(req.ID, classify(err))
+	}
+	if ownParent {
+		defer unix.Close(parentFD)
+	}
+	s.beforeApplyOpen()
+	fd, err := openAtBeneath(parentFD, base, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
 	if err != nil {
 		return errResp(req.ID, classify(err))
 	}
@@ -445,15 +496,55 @@ func (s *server) doApply(req request) map[string]any {
 	if len(updated) > s.maxWrite {
 		return errResp(req.ID, codeOversize)
 	}
-	if err := unix.Ftruncate(fd, 0); err != nil {
+
+	stageFD := -1
+	stageName := ""
+	for attempts := 0; attempts < 16; attempts++ {
+		stageName, err = s.newStageName()
+		if err != nil {
+			return errResp(req.ID, codeIO)
+		}
+		stageFD, err = unix.Openat(
+			parentFD,
+			stageName,
+			unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC,
+			0o600,
+		)
+		if !errors.Is(err, unix.EEXIST) {
+			break
+		}
+	}
+	if err != nil {
+		return errResp(req.ID, classify(err))
+	}
+	stageExists := true
+	defer func() {
+		if stageFD >= 0 {
+			_ = unix.Close(stageFD)
+		}
+		if stageExists {
+			_ = unix.Unlinkat(parentFD, stageName, 0)
+		}
+	}()
+
+	if err := s.stageWrite(stageFD, updated); err != nil {
 		return errResp(req.ID, codeIO)
 	}
-	// WriteAt writes at an ABSOLUTE offset (the file was not opened O_APPEND), so the
-	// post-read fd offset is irrelevant and the freshly-truncated file is rewritten
-	// from byte 0 on the same held descriptor.
-	if _, werr := f.WriteAt(updated, 0); werr != nil {
+	if err := unix.Fchmod(stageFD, st.Mode&0o7777); err != nil {
+		return errResp(req.ID, classify(err))
+	}
+	if err := unix.Fsync(stageFD); err != nil {
 		return errResp(req.ID, codeIO)
 	}
+	closeErr := unix.Close(stageFD)
+	stageFD = -1
+	if closeErr != nil {
+		return errResp(req.ID, codeIO)
+	}
+	if err := s.stageRename(parentFD, stageName, parentFD, base, 0); err != nil {
+		return errResp(req.ID, classify(err))
+	}
+	stageExists = false
 	return okResp(req.ID, map[string]any{"size": int64(len(updated))})
 }
 

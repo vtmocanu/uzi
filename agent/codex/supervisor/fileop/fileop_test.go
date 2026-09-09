@@ -673,8 +673,8 @@ func TestApplyRoundTrip(t *testing.T) {
 	}
 }
 
-// TestApplyGrowsAndShrinks proves the explicit Ftruncate resets the length so a
-// replacement shorter OR longer than the original leaves no stale trailing bytes.
+// TestApplyGrowsAndShrinks proves the staged replacement body carries exactly the
+// requested bytes when it is shorter OR longer than the original.
 func TestApplyGrowsAndShrinks(t *testing.T) {
 	s, _ := newTestServer(t)
 	wantOK(t, s.handle(request{ID: 1, Op: opWrite, Path: "f", Data: b64("keep <MARK> keep")}))
@@ -753,13 +753,158 @@ func TestApplyOversizeResult(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 	wantErr(t, s.handle(request{ID: 1, Op: opApply, Path: "f", Old: b64("<M>"), Data: b64(strings.Repeat("z", 128))}), codeOversize)
-	// Untouched: the pre-check rejects before Ftruncate.
+	// Untouched: the pre-check rejects before a stage file is created.
 	body, err := os.ReadFile(filepath.Join(root, "f"))
 	if err != nil {
 		t.Fatalf("read back: %v", err)
 	}
 	if string(body) != "<M>" {
 		t.Fatalf("file mutated by an oversize apply: %q", body)
+	}
+}
+
+// TestApplyStagingWriteFailurePreservesOriginal proves the replacement never
+// truncates the live target. Even after a prefix reaches the staged file, an error
+// leaves the old content and mode intact and removes the temporary file.
+func TestApplyStagingWriteFailurePreservesOriginal(t *testing.T) {
+	s, root := newTestServer(t)
+	target := filepath.Join(root, "target")
+	if err := os.WriteFile(target, []byte("before OLD after"), 0o640); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if err := os.Chmod(target, 0o640); err != nil {
+		t.Fatalf("chmod seed: %v", err)
+	}
+	s.stageWrite = func(fd int, data []byte) error {
+		if len(data) < 3 {
+			t.Fatalf("replacement unexpectedly short: %d", len(data))
+		}
+		if _, err := unix.Write(fd, data[:3]); err != nil {
+			t.Fatalf("write staged prefix: %v", err)
+		}
+		return unix.EIO
+	}
+
+	wantErr(t, s.handle(request{ID: 1, Op: opApply, Path: "target", Old: b64("OLD"), Data: b64("NEW BODY")}), codeIO)
+	body, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read original: %v", err)
+	}
+	if got := string(body); got != "before OLD after" {
+		t.Fatalf("failed apply changed live target to %q", got)
+	}
+	var st unix.Stat_t
+	if err := unix.Stat(target, &st); err != nil {
+		t.Fatalf("stat original: %v", err)
+	}
+	if got := st.Mode & 0o7777; got != 0o640 {
+		t.Fatalf("failed apply changed target mode to %#o", got)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatalf("list root: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "target" {
+		t.Fatalf("failed apply left staged files: %v", entries)
+	}
+}
+
+// TestApplyRenameFailurePreservesOriginal proves a failure after the replacement is
+// fully staged and synced still leaves the target intact and cleans the stage file.
+func TestApplyRenameFailurePreservesOriginal(t *testing.T) {
+	s, root := newTestServer(t)
+	target := filepath.Join(root, "target")
+	if err := os.WriteFile(target, []byte("left OLD right"), 0o600); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	s.stageRename = func(int, string, int, string, uint) error { return unix.EIO }
+
+	wantErr(t, s.handle(request{ID: 1, Op: opApply, Path: "target", Old: b64("OLD"), Data: b64("NEW")}), codeIO)
+	body, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read original: %v", err)
+	}
+	if got := string(body); got != "left OLD right" {
+		t.Fatalf("failed rename changed live target to %q", got)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatalf("list root: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "target" {
+		t.Fatalf("failed rename left staged files: %v", entries)
+	}
+}
+
+// TestApplyPreservesTargetModeAndReplacesContent proves a successful rename carries
+// the complete new body and the original target's permission bits.
+func TestApplyPreservesTargetModeAndReplacesContent(t *testing.T) {
+	s, root := newTestServer(t)
+	target := filepath.Join(root, "target")
+	if err := os.WriteFile(target, []byte("alpha OLD omega"), 0o751); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if err := os.Chmod(target, 0o751); err != nil {
+		t.Fatalf("chmod seed: %v", err)
+	}
+
+	wantOK(t, s.handle(request{ID: 1, Op: opApply, Path: "target", Old: b64("OLD"), Data: b64("replacement body")}))
+	body, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read replacement: %v", err)
+	}
+	if got := string(body); got != "alpha replacement body omega" {
+		t.Fatalf("replacement content = %q", got)
+	}
+	var st unix.Stat_t
+	if err := unix.Stat(target, &st); err != nil {
+		t.Fatalf("stat replacement: %v", err)
+	}
+	if got := st.Mode & 0o7777; got != 0o751 {
+		t.Fatalf("replacement mode = %#o, want %#o", got, uint32(0o751))
+	}
+}
+
+// TestApplyPinsNestedParentForReadAndRename swaps a nested parent after resolveParent
+// has pinned it. The target read and replacement rename must both use that same dirfd;
+// reopening the full path from root would read the substitute directory's file and
+// write those bytes into the pinned original directory.
+func TestApplyPinsNestedParentForReadAndRename(t *testing.T) {
+	s, root := newTestServer(t)
+	nested := filepath.Join(root, "nested")
+	pinned := filepath.Join(root, "pinned")
+	if err := os.Mkdir(nested, 0o755); err != nil {
+		t.Fatalf("mkdir nested: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(nested, "target"), []byte("pinned OLD body"), 0o600); err != nil {
+		t.Fatalf("seed pinned target: %v", err)
+	}
+	s.beforeApplyOpen = func() {
+		if err := os.Rename(nested, pinned); err != nil {
+			t.Fatalf("move pinned parent: %v", err)
+		}
+		if err := os.Mkdir(nested, 0o755); err != nil {
+			t.Fatalf("create substitute parent: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(nested, "target"), []byte("substitute OLD body"), 0o600); err != nil {
+			t.Fatalf("seed substitute target: %v", err)
+		}
+	}
+
+	wantOK(t, s.handle(request{ID: 1, Op: opApply, Path: "nested/target", Old: b64("OLD"), Data: b64("NEW")}))
+	pinnedBody, err := os.ReadFile(filepath.Join(pinned, "target"))
+	if err != nil {
+		t.Fatalf("read pinned target: %v", err)
+	}
+	if got := string(pinnedBody); got != "pinned NEW body" {
+		t.Fatalf("pinned target = %q, want %q", got, "pinned NEW body")
+	}
+	substituteBody, err := os.ReadFile(filepath.Join(nested, "target"))
+	if err != nil {
+		t.Fatalf("read substitute target: %v", err)
+	}
+	if got := string(substituteBody); got != "substitute OLD body" {
+		t.Fatalf("substitute target changed to %q", got)
 	}
 }
 
@@ -835,23 +980,16 @@ func TestApplyConcurrentMutatorNeverEscapes(t *testing.T) {
 	<-done
 }
 
-// TestApplyAtomicOnHeldFD exercises the read-modify-write mechanism itself: apply
-// reads and rewrites through the SAME descriptor openat2 pinned (Ftruncate+WriteAt on
-// the held fd), producing a correct in-place edit with no read-op-then-write-op
-// composition. It does NOT stage a pathname swap — the anti-redirect property under a
-// concurrent mutator is proven deterministically by TestApplySymlinkSwapRefused (a
-// swapped-in symlink is refused at open with E_SYMLINK) and by
-// TestApplyConcurrentMutatorNeverEscapes (the outside secret is never touched across
-// thousands of iterations).
-func TestApplyAtomicOnHeldFD(t *testing.T) {
-	// Not a timing race: this asserts the mechanism (WriteAt to the fd that openat2
-	// pinned), which cannot be redirected by any later rename of the name.
+// TestApplyAtomicReplacement exercises the successful staged rename through the
+// public request path. The anti-redirect property under a concurrent mutator is
+// covered by TestApplySymlinkSwapRefused and TestApplyConcurrentMutatorNeverEscapes.
+func TestApplyAtomicReplacement(t *testing.T) {
 	s, _ := newTestServer(t)
 	wantOK(t, s.handle(request{ID: 1, Op: opWrite, Path: "target", Data: b64("hello WORLD")}))
 	wantOK(t, s.handle(request{ID: 2, Op: opApply, Path: "target", Old: b64("WORLD"), Data: b64("THERE")}))
 	r := s.handle(request{ID: 3, Op: opRead, Path: "target"})
 	wantOK(t, r)
 	if got := string(respData(t, r)); got != "hello THERE" {
-		t.Fatalf("apply on held fd = %q, want %q", got, "hello THERE")
+		t.Fatalf("atomic replacement = %q, want %q", got, "hello THERE")
 	}
 }

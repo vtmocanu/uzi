@@ -75,6 +75,8 @@ export class FakeApi {
     string,
     { httpStatus: number; status?: string }
   >();
+  private codexDelayMs = 0;
+  private codexResponseOverride: unknown | undefined;
 
   // --- records -------------------------------------------------------------
   readonly registers: RecordedRegister[] = [];
@@ -98,6 +100,11 @@ export class FakeApi {
   }> = [];
   readonly proposalRequests: Array<{
     runId: string;
+    body: Record<string, unknown>;
+  }> = [];
+  readonly codexRequests: Array<{
+    runId: string;
+    operation: "release" | "refresh";
     body: Record<string, unknown>;
   }> = [];
 
@@ -262,6 +269,14 @@ export class FakeApi {
     this.chatMessagesByRun.set(id, msgs);
   }
 
+  delayCodexResponses(ms: number): void {
+    this.codexDelayMs = ms;
+  }
+
+  overrideNextCodexResponse(body: unknown): void {
+    this.codexResponseOverride = body;
+  }
+
   messages(runId: string): OutgoingMessage[] {
     return this.messagesByRun.get(runId) ?? [];
   }
@@ -304,6 +319,33 @@ export class FakeApi {
       const claim = this.claimQueue.shift();
       if (!claim) return sendEmpty(res, 204);
       return send(res, 200, claim);
+    }
+
+    const codexMatch = /^\/api\/worker\/runs\/([^/]+)\/codex\/(release|refresh)$/.exec(p);
+    if (req.method === "POST" && codexMatch) {
+      const runId = codexMatch[1] as string;
+      const operation = codexMatch[2] as "release" | "refresh";
+      this.codexRequests.push({ runId, operation, body: json });
+      if (this.codexDelayMs > 0) {
+        await new Promise<void>((resolve) => setTimeout(resolve, this.codexDelayMs));
+      }
+      if (this.codexResponseOverride !== undefined) {
+        const override = this.codexResponseOverride;
+        this.codexResponseOverride = undefined;
+        return send(res, 200, override);
+      }
+      if (operation === "release" && runId === "api-key") {
+        return send(res, 200, { auth_mode: "api_key", access_token: "api-key-access" });
+      }
+      const generation = operation === "refresh" ? Number(json.observed_generation) + 1 : 3;
+      return send(res, 200, {
+        auth_mode: "subscription",
+        access_token: "subscription-access",
+        generation,
+        chatgpt_account_id: "verified-account",
+        chatgpt_plan_type: null,
+        ...(operation === "refresh" ? { outcome: "advanced" } : {}),
+      });
     }
 
     // Chat read surface (PRD #39 M3), user-scoped server-side. Records query params

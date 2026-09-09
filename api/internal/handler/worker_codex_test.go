@@ -2,12 +2,14 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -23,8 +25,10 @@ import (
 // run-id-in-body, a missing capability, a malformed operation id), plus the pure
 // error→HTTP mapping leaks no provider text or secret. The service BEHAVIOUR (real
 // release/refresh, generation, quarantine, two-stale-clients, api_key-zero-refresh,
-// production codexauth.Client injection) is proven in workersvc's *_livedb_test.go against
-// a real Postgres — a handler test cannot reach it without one.
+// codexauth.Client behavior) is proven in workersvc's *_livedb_test.go against a real
+// Postgres. Production main injection is pinned separately by
+// cmd/server/codex_budget_test.go; this package's routed LiveDB test proves the real
+// WorkerRoutes → RequireWorker → handler → workersvc chain.
 
 // codexWorkerReq builds a worker-authenticated POST to a codex route with the {id} chi
 // param and a raw JSON body. withWorker=false omits the worker context (the 401 case).
@@ -85,6 +89,34 @@ func TestWorkerCodexRoutesRequireWorker(t *testing.T) {
 	}
 }
 
+// Exercise the production WorkerRoutes tree, not the handler methods directly. Walking
+// the real chi router is load-bearing: an unauthenticated request cannot discriminate a
+// missing child route because the parent /worker Bearer middleware returns 401 first.
+func TestWorkerCodexRoutesMounted(t *testing.T) {
+	router, ok := (&Handler{}).WorkerRoutes(nil).(chi.Routes)
+	if !ok {
+		t.Fatal("WorkerRoutes did not return a walkable chi router")
+	}
+	want := map[string]bool{
+		"POST /api/worker/runs/{id}/codex/release": false,
+		"POST /api/worker/runs/{id}/codex/refresh": false,
+	}
+	if err := chi.Walk(router, func(method, pattern string, _ http.Handler, _ ...func(http.Handler) http.Handler) error {
+		key := method + " " + pattern
+		if _, tracked := want[key]; tracked {
+			want[key] = true
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("walk WorkerRoutes: %v", err)
+	}
+	for route, found := range want {
+		if !found {
+			t.Fatalf("production WorkerRoutes is missing %s", route)
+		}
+	}
+}
+
 // ── 400: a malformed path run id ({id} is the SOLE run identity) ──
 func TestWorkerCodexRoutesMalformedRunID(t *testing.T) {
 	h := &Handler{}
@@ -136,6 +168,24 @@ func TestWorkerCodexRoutesRejectBodySuppliedFields(t *testing.T) {
 	}
 }
 
+// A second JSON value used to be ignored after the first authorized object. Both worker
+// credential routes are authority boundaries, so the entire body must be exactly one
+// value, apart from trailing whitespace.
+func TestWorkerCodexRoutesRejectTrailingJSONValue(t *testing.T) {
+	h := &Handler{}
+	runID := uuid.New().String()
+	for _, c := range codexHandlers(h) {
+		t.Run(c.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			body := validCodexBody(c.name) + fmt.Sprintf(` {"run_id":%q}`, uuid.New().String())
+			c.fn(rec, codexWorkerReq(true, runID, body))
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 for a trailing JSON value, body %q", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
 // ── 400: a missing capability (the one required scoped field) ──
 func TestWorkerCodexRoutesRequireCapability(t *testing.T) {
 	h := &Handler{}
@@ -166,6 +216,89 @@ func TestWorkerCodexRefreshMalformedOperationID(t *testing.T) {
 	}
 }
 
+func TestWorkerCodexRefreshRejectsNegativeGeneration(t *testing.T) {
+	h := &Handler{}
+	rec := httptest.NewRecorder()
+	h.WorkerCodexRefresh(rec, codexWorkerReq(true, uuid.New().String(),
+		fmt.Sprintf(`{"capability":"1.cap","operation_id":%q,"observed_generation":-1}`, uuid.New().String())))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 for a negative generation, body %q", rec.Code, rec.Body.String())
+	}
+}
+
+func TestWorkerCodexRefreshRequiresGenerationPresence(t *testing.T) {
+	h := &Handler{}
+	for _, body := range []string{
+		fmt.Sprintf(`{"capability":"1.cap","operation_id":%q}`, uuid.New().String()),
+		fmt.Sprintf(`{"capability":"1.cap","operation_id":%q,"observed_generation":null}`, uuid.New().String()),
+	} {
+		rec := httptest.NewRecorder()
+		h.WorkerCodexRefresh(rec, codexWorkerReq(true, uuid.New().String(), body))
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400 when observed_generation is omitted/null, body %q", rec.Code, rec.Body.String())
+		}
+	}
+}
+
+func TestWorkerCodexRefreshRejectsUnadvanceableSafeIntegerMaximum(t *testing.T) {
+	h := &Handler{}
+	rec := httptest.NewRecorder()
+	body := fmt.Sprintf(`{"capability":"1.cap","operation_id":%q,"observed_generation":%d}`,
+		uuid.New().String(), maxCodexRefreshObservedGeneration)
+	h.WorkerCodexRefresh(rec, codexWorkerReq(true, uuid.New().String(), body))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 before service/provider work at max safe generation", rec.Code)
+	}
+}
+
+func TestCodexCredentialResponseWireModes(t *testing.T) {
+	t.Run("subscription includes verified account, generation, and explicit plan null", func(t *testing.T) {
+		b, err := json.Marshal(codexSubscriptionResponse{
+			AuthMode:         "subscription",
+			AccessToken:      "ACCESS-PLACEHOLDER",
+			Generation:       0,
+			ChatGPTAccountID: "verified-account",
+			ChatGPTPlanType:  nil,
+		})
+		if err != nil {
+			t.Fatalf("marshal subscription response: %v", err)
+		}
+		want := `{"auth_mode":"subscription","access_token":"ACCESS-PLACEHOLDER","generation":0,"chatgpt_account_id":"verified-account","chatgpt_plan_type":null}`
+		if string(b) != want {
+			t.Fatalf("subscription response = %s, want %s", b, want)
+		}
+	})
+
+	t.Run("api_key omits every subscription field", func(t *testing.T) {
+		b, err := json.Marshal(codexAPIKeyResponse{AuthMode: "api_key", AccessToken: "KEY-PLACEHOLDER"})
+		if err != nil {
+			t.Fatalf("marshal api_key response: %v", err)
+		}
+		want := `{"auth_mode":"api_key","access_token":"KEY-PLACEHOLDER"}`
+		if string(b) != want {
+			t.Fatalf("api_key response = %s, want %s", b, want)
+		}
+	})
+
+	t.Run("refresh repeats subscription authority", func(t *testing.T) {
+		b, err := json.Marshal(codexRefreshResponse{
+			AuthMode:         "subscription",
+			AccessToken:      "ACCESS-PLACEHOLDER",
+			Generation:       4,
+			ChatGPTAccountID: "verified-account",
+			ChatGPTPlanType:  nil,
+			Outcome:          "advanced",
+		})
+		if err != nil {
+			t.Fatalf("marshal refresh response: %v", err)
+		}
+		want := `{"auth_mode":"subscription","access_token":"ACCESS-PLACEHOLDER","generation":4,"chatgpt_account_id":"verified-account","chatgpt_plan_type":null,"outcome":"advanced"}`
+		if string(b) != want {
+			t.Fatalf("refresh response = %s, want %s", b, want)
+		}
+	})
+}
+
 // ── no-store on every response, even the pre-service rejections (a success body is
 // secret-bearing; setting it unconditionally at the top guarantees it covers that body). ──
 func TestWorkerCodexRoutesSetNoStore(t *testing.T) {
@@ -179,6 +312,12 @@ func TestWorkerCodexRoutesSetNoStore(t *testing.T) {
 				t.Fatalf("Cache-Control = %q, want no-store", got)
 			}
 		})
+	}
+}
+
+func TestCodexWorkerOperationTimeoutLeavesResponseMargin(t *testing.T) {
+	if codexWorkerOperationTimeout != 7500*time.Millisecond {
+		t.Fatalf("API operation timeout = %s, want 7.5s below the worker's 8s HTTP budget", codexWorkerOperationTimeout)
 	}
 }
 

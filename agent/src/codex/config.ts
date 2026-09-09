@@ -9,9 +9,10 @@
 //     ships hooks OFF, so there is nothing to bypass: `hooks = false`, and NO
 //     `bypass_hook_trust`, NO `--dangerously-bypass-hook-trust` anywhere.
 //   * the fixture accepts arbitrary caller-shaped knobs (code_mode / unified_exec /
-//     multi_agent variables, `write_stdin_approval`). Production accepts ONLY a
-//     provider endpoint + model + canonical project path and pins every native
-//     surface to its disabled value; it never folds in repo-controlled config.
+//     multi_agent variables, `write_stdin_approval`). The generic M3a launcher builder
+//     accepts only a trusted provider + model + canonical project path and pins every
+//     native surface disabled. The production authentication builder below is narrower:
+//     it fixes the built-in OpenAI provider and accepts no endpoint/env-key injection.
 //
 // The ADR (`adr/1106-codex-harness.md:337-344`) requires the canonical project be
 // provisioned EXPLICITLY `untrusted` with `project_doc_max_bytes = 0`: pinned
@@ -20,6 +21,8 @@
 // "untrusted"` to avoid that branch.
 
 import { lstatSync } from "node:fs";
+
+import type { CodexAppServerAuthMode } from "./appserver-auth.js";
 
 /**
  * A model provider the stock config points Codex at. `wireApi` is pinned to the
@@ -56,28 +59,10 @@ function toml(value: string): string {
   return JSON.stringify(value);
 }
 
-/**
- * Build the `config.toml` TEXT for a stock, native-DISABLED Codex app-server.
- *
- * Every native surface is pinned to its stock disabled value: `project_doc_max_bytes
- * = 0`, `web_search = "disabled"`, analytics/feedback/agents off, the whole
- * `[features]` family (apps / plugins / shell_snapshot* / code_mode* / remote_models
- * / unified_exec / hooks / multi_agent* / enable_request_compression) off, and
- * `check_for_update_on_startup = false`. The canonical project is provisioned
- * explicitly `untrusted`. The provider block carries zero retries and no websockets.
- */
-export function buildCodexConfigToml(opts: CodexConfigOptions): string {
-  const { model, provider, projectPath } = opts;
-  if (!PROVIDER_NAME_RE.test(provider.name)) {
-    throw new Error(`Codex provider name must match ${PROVIDER_NAME_RE} (got ${JSON.stringify(provider.name)})`);
-  }
-  if (provider.wireApi !== "responses") {
-    throw new Error(`Codex M3a supports only the "responses" wire (got ${JSON.stringify(provider.wireApi)})`);
-  }
-  // A single deterministic template — no caller-shaped branches, no repo config.
+function nativeDisabledConfigLines(model: string, providerName: string, projectPath: string): string[] {
   return [
     `model = ${toml(model)}`,
-    `model_provider = ${toml(provider.name)}`,
+    `model_provider = ${toml(providerName)}`,
     `project_doc_max_bytes = 0`,
     `check_for_update_on_startup = false`,
     `web_search = "disabled"`,
@@ -112,6 +97,30 @@ export function buildCodexConfigToml(opts: CodexConfigOptions): string {
     `[projects.${toml(projectPath)}]`,
     `trust_level = "untrusted"`,
     ``,
+  ];
+}
+
+/**
+ * Build the `config.toml` TEXT for a stock, native-DISABLED Codex app-server.
+ *
+ * Every native surface is pinned to its stock disabled value: `project_doc_max_bytes
+ * = 0`, `web_search = "disabled"`, analytics/feedback/agents off, the whole
+ * `[features]` family (apps / plugins / shell_snapshot* / code_mode* / remote_models
+ * / unified_exec / hooks / multi_agent* / enable_request_compression) off, and
+ * `check_for_update_on_startup = false`. The canonical project is provisioned
+ * explicitly `untrusted`. The provider block carries zero retries and no websockets.
+ */
+export function buildCodexConfigToml(opts: CodexConfigOptions): string {
+  const { model, provider, projectPath } = opts;
+  if (!PROVIDER_NAME_RE.test(provider.name)) {
+    throw new Error(`Codex provider name must match ${PROVIDER_NAME_RE} (got ${JSON.stringify(provider.name)})`);
+  }
+  if (provider.wireApi !== "responses") {
+    throw new Error(`Codex M3a supports only the "responses" wire (got ${JSON.stringify(provider.wireApi)})`);
+  }
+  // A single deterministic template — no caller-shaped branches, no repo config.
+  return [
+    ...nativeDisabledConfigLines(model, provider.name, projectPath),
     `[model_providers.${toml(provider.name)}]`,
     `name = ${toml(provider.name)}`,
     `base_url = ${toml(provider.baseUrl)}`,
@@ -123,6 +132,41 @@ export function buildCodexConfigToml(opts: CodexConfigOptions): string {
     `stream_max_retries = 0`,
     ``,
   ].join("\n");
+}
+
+/** Inputs for the production app-server-auth config. There is deliberately no provider
+ * endpoint/name/env-key field: pinned Codex's built-in `openai` provider owns those
+ * values, and chooses its backend from the authenticated mode. */
+export interface CodexProductionConfigOptions {
+  readonly model: string;
+  readonly projectPath: string;
+  readonly authMode: CodexAppServerAuthMode;
+}
+
+/**
+ * Build the fixed production config used with `account/login/start` authentication.
+ *
+ * Pinned 0.153.2's built-in `openai` provider has `requires_openai_auth = true` and no
+ * configured base URL. That absence is load-bearing: API-key auth selects
+ * `https://api.openai.com/v1`, while `chatgptAuthTokens` selects the ChatGPT Codex
+ * backend. Re-declaring the provider with the partial adapter's fixed API base URL and
+ * `requires_openai_auth = false` would bypass the login performed by appserver-auth.ts
+ * and route a subscription through the paid API-key endpoint.
+ *
+ * `authMode` is required even though the TOML is identical for both modes. It forces the
+ * trusted composition to make an explicit no-fallback choice, which the auth session then
+ * enforces on the protocol. Unknown runtime keys are rejected so an endpoint cannot be
+ * smuggled into this production builder from a claim, repo or test fixture.
+ */
+export function buildCodexProductionConfigToml(opts: CodexProductionConfigOptions): string {
+  const keys = Object.keys(opts);
+  if (keys.some((key) => key !== "model" && key !== "projectPath" && key !== "authMode")) {
+    throw new Error("Codex production config received an unsupported option");
+  }
+  if (opts.authMode !== "api_key" && opts.authMode !== "subscription") {
+    throw new Error("Codex production config requires an explicit supported auth mode");
+  }
+  return nativeDisabledConfigLines(opts.model, "openai", opts.projectPath).join("\n");
 }
 
 /** Thrown when {@link assertNoUnexpectedSystemConfig} finds a system config root the

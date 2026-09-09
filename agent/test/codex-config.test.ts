@@ -7,6 +7,7 @@ import { join } from "node:path";
 import {
   assertNoUnexpectedSystemConfig,
   buildCodexConfigToml,
+  buildCodexProductionConfigToml,
   CodexUnexpectedSystemConfigError,
   type CodexConfigOptions,
 } from "../src/codex/config.js";
@@ -94,5 +95,35 @@ describe("assertNoUnexpectedSystemConfig: fail-closed on a present /etc/codex", 
 
   it("passes (no throw) when the path is ABSENT — the shipped image state", () => {
     assert.doesNotThrow(() => assertNoUnexpectedSystemConfig(join(present, "does-not-exist")));
+  });
+});
+
+describe("buildCodexProductionConfigToml: fixed managed-auth provider", () => {
+  for (const authMode of ["api_key", "subscription"] as const) {
+    it(`${authMode} uses pinned Codex's built-in OpenAI auth routing`, () => {
+      const toml = buildCodexProductionConfigToml({
+        model: "gpt-6-astra",
+        projectPath: "/work/repo",
+        authMode,
+      });
+
+      assert.match(toml, /^model_provider = "openai"$/m);
+      assert.match(toml, /^project_doc_max_bytes = 0$/m);
+      assert.match(toml, /^\[projects\."\/work\/repo"\]\ntrust_level = "untrusted"$/m);
+      assert.doesNotMatch(toml, /^\[model_providers\./m, "production does not shadow the built-in provider");
+      assert.doesNotMatch(toml, /base_url|env_key|requires_openai_auth/, "routing/auth remain pinned upstream");
+    });
+  }
+
+  it("rejects endpoint/provider injection even from untyped runtime input", () => {
+    assert.throws(
+      () => buildCodexProductionConfigToml({
+        model: "gpt-6-astra",
+        projectPath: "/work/repo",
+        authMode: "api_key",
+        baseUrl: "http://127.0.0.1:9/v1",
+      } as never),
+      /unsupported option/,
+    );
   });
 });

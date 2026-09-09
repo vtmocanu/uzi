@@ -7,6 +7,7 @@
 #
 #   * the static process supervisor  /usr/local/bin/uzi-codex-supervisor  root-owned 0555
 #   * the static openat2 fileop helper /usr/local/bin/uzi-codex-fileop     root-owned 0555
+#   * the static Landlock command wrapper /usr/local/bin/uzi-codex-command-sandbox root-owned 0555
 #   * node + tsx + the pinned Codex app-server are present
 #   * the packaged CodexExecutor source's FILEOP_BIN constant == the installed fileop path
 #
@@ -16,6 +17,7 @@ set -u
 
 SUP=/usr/local/bin/uzi-codex-supervisor
 FILEOP=/usr/local/bin/uzi-codex-fileop
+SANDBOX=/usr/local/bin/uzi-codex-command-sandbox
 NODE=/usr/local/bin/node
 TSX=/app/node_modules/.bin/tsx
 CODEX=/opt/uzi-codex/0.153.2/bin/codex
@@ -72,6 +74,9 @@ check_static_bin "$SUP"
 hdr "Control P2: the static openat2 fileop helper (the m5 Dockerfile install)"
 check_static_bin "$FILEOP"
 
+hdr "Control P2b: the static Landlock command wrapper"
+check_static_bin "$SANDBOX"
+
 hdr "Control P3: node + tsx + the pinned Codex app-server"
 [ -x "$NODE" ] && ok "node present ($NODE)" || bad "node missing at $NODE"
 [ -x "$TSX" ]  && ok "tsx present ($TSX)"  || bad "tsx missing at $TSX"
@@ -87,6 +92,12 @@ if [ -f "$EXECUTOR_SRC" ]; then
   fi
 else
   bad "packaged executor source not found at $EXECUTOR_SRC"
+fi
+
+if grep -q 'COMMAND_SANDBOX_BIN = "/usr/local/bin/uzi-codex-command-sandbox"' "$EXECUTOR_SRC"; then
+  ok "packaged codex-executor.ts pins COMMAND_SANDBOX_BIN to $SANDBOX"
+else
+  bad "packaged codex-executor.ts COMMAND_SANDBOX_BIN does not match $SANDBOX"
 fi
 
 hdr "SUMMARY packaging PASS=$PASS FAIL=$FAIL"

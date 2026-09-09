@@ -93,6 +93,203 @@ describe("register / heartbeat / claim", () => {
   });
 });
 
+describe("Codex credential bridge", () => {
+  it("preserves server-owned subscription authority on release and refresh", async () => {
+    const client = newClient();
+    const expected = { authMode: "subscription", chatgptAccountId: "verified-account", minimumGeneration: 3 } as const;
+    const released = await client.releaseCodex("subscription-run", { capability: "1.cap" }, expected);
+    assert.deepStrictEqual(released, {
+      auth_mode: "subscription",
+      access_token: "subscription-access",
+      generation: 3,
+      chatgpt_account_id: "verified-account",
+      chatgpt_plan_type: null,
+    });
+
+    const operationId = "2a515338-32ef-4cb0-88db-b702b9402f21";
+    const refreshed = await client.refreshCodex("subscription-run", {
+      capability: "1.cap",
+      operation_id: operationId,
+      observed_generation: 3,
+    }, { authMode: "subscription", chatgptAccountId: "verified-account" });
+    assert.deepStrictEqual(refreshed, {
+      auth_mode: "subscription",
+      access_token: "subscription-access",
+      generation: 4,
+      chatgpt_account_id: "verified-account",
+      chatgpt_plan_type: null,
+      outcome: "advanced",
+    });
+    assert.equal(api.codexRequests.at(-1)?.body.operation_id, operationId);
+  });
+
+  it("keeps API-key release structurally free of subscription metadata", async () => {
+    const released = await newClient().releaseCodex(
+      "api-key",
+      { capability: "1.cap" },
+      { authMode: "api_key" },
+    );
+    assert.deepStrictEqual(released, { auth_mode: "api_key", access_token: "api-key-access" });
+    assert.ok(!("generation" in released));
+    assert.ok(!("chatgpt_account_id" in released));
+    assert.ok(!("chatgpt_plan_type" in released));
+  });
+
+  it("uses the shorter Codex HTTP budget instead of the general worker timeout", async () => {
+    api.delayCodexResponses(100);
+    const client = new WorkerClient(baseUrl, TOKEN, "0.1.0-test", nullLogger(), {
+      httpTimeoutMs: 1_000,
+      codexHTTPTimeoutMs: 20,
+    });
+    await assert.rejects(
+      client.releaseCodex(
+        "subscription-run",
+        { capability: "1.cap" },
+        { authMode: "subscription", chatgptAccountId: "verified-account", minimumGeneration: 3 },
+      ),
+    );
+  });
+
+  it("combines caller cancellation with the fixed Codex deadline", async () => {
+    api.delayCodexResponses(100);
+    const client = new WorkerClient(baseUrl, TOKEN, "0.1.0-test", nullLogger(), {
+      codexHTTPTimeoutMs: 1_000,
+    });
+    const abort = new AbortController();
+    abort.abort();
+    await assert.rejects(
+      client.releaseCodex(
+        "subscription-run",
+        { capability: "1.cap" },
+        { authMode: "subscription", chatgptAccountId: "verified-account", minimumGeneration: 3 },
+        abort.signal,
+      ),
+    );
+  });
+
+  it("applies the fixed Codex timeout to refresh", async () => {
+    api.delayCodexResponses(100);
+    const client = new WorkerClient(baseUrl, TOKEN, "0.1.0-test", nullLogger(), {
+      httpTimeoutMs: 1_000,
+      codexHTTPTimeoutMs: 20,
+    });
+    await assert.rejects(
+      client.refreshCodex(
+        "subscription-run",
+        {
+          capability: "1.cap",
+          operation_id: "2a515338-32ef-4cb0-88db-b702b9402f21",
+          observed_generation: 3,
+        },
+        { authMode: "subscription", chatgptAccountId: "verified-account" },
+      ),
+    );
+  });
+
+  it("combines caller cancellation with the refresh timeout", async () => {
+    api.delayCodexResponses(100);
+    const client = new WorkerClient(baseUrl, TOKEN, "0.1.0-test", nullLogger(), {
+      codexHTTPTimeoutMs: 1_000,
+    });
+    const abort = new AbortController();
+    abort.abort();
+    await assert.rejects(
+      client.refreshCodex(
+        "subscription-run",
+        {
+          capability: "1.cap",
+          operation_id: "2a515338-32ef-4cb0-88db-b702b9402f21",
+          observed_generation: 3,
+        },
+        { authMode: "subscription", chatgptAccountId: "verified-account" },
+        abort.signal,
+      ),
+    );
+  });
+
+  it("rejects release responses that disagree with the immutable binding", async () => {
+    const client = newClient();
+    const subscription = {
+      authMode: "subscription",
+      chatgptAccountId: "verified-account",
+      minimumGeneration: 3,
+    } as const;
+    const invalidSubscription = [
+      { auth_mode: "api_key", access_token: "wrong-mode" },
+      { auth_mode: "subscription", access_token: "x", generation: 3, chatgpt_account_id: "other", chatgpt_plan_type: null },
+      { auth_mode: "subscription", access_token: "x", generation: 2, chatgpt_account_id: "verified-account", chatgpt_plan_type: null },
+      { auth_mode: "subscription", access_token: "x", generation: 3.5, chatgpt_account_id: "verified-account", chatgpt_plan_type: null },
+      { auth_mode: "subscription", access_token: "x", generation: 3, chatgpt_account_id: "verified-account", chatgpt_plan_type: "plus" },
+      { auth_mode: "subscription", access_token: "x", generation: 3, chatgpt_account_id: "verified-account", chatgpt_plan_type: null, extra: true },
+    ];
+    for (const body of invalidSubscription) {
+      api.overrideNextCodexResponse(body);
+      await assert.rejects(
+        client.releaseCodex("subscription-run", { capability: "1.cap" }, subscription),
+        /invalid codex credential response/,
+      );
+    }
+
+    api.overrideNextCodexResponse({
+      auth_mode: "api_key",
+      access_token: "x",
+      generation: 0,
+      chatgpt_account_id: null,
+      chatgpt_plan_type: null,
+    });
+    await assert.rejects(
+      client.releaseCodex("api-key", { capability: "1.cap" }, { authMode: "api_key" }),
+      /invalid codex credential response/,
+    );
+  });
+
+  it("rejects stale or open-ended refresh responses", async () => {
+    const client = newClient();
+    const req = {
+      capability: "1.cap",
+      operation_id: "2a515338-32ef-4cb0-88db-b702b9402f21",
+      observed_generation: 3,
+    };
+    const expected = { authMode: "subscription", chatgptAccountId: "verified-account" } as const;
+    const invalid = [
+      { auth_mode: "subscription", access_token: "x", generation: 3, chatgpt_account_id: "verified-account", chatgpt_plan_type: null, outcome: "replayed" },
+      { auth_mode: "subscription", access_token: "x", generation: 5, chatgpt_account_id: "verified-account", chatgpt_plan_type: null, outcome: "advanced" },
+      { auth_mode: "subscription", access_token: "x", generation: 4, chatgpt_account_id: "other", chatgpt_plan_type: null, outcome: "advanced" },
+      { auth_mode: "subscription", access_token: "x", generation: 4, chatgpt_account_id: "verified-account", chatgpt_plan_type: null, outcome: "unknown" },
+      { auth_mode: "subscription", access_token: "x", generation: 4, chatgpt_account_id: "verified-account", chatgpt_plan_type: null, outcome: "advanced", extra: true },
+    ];
+    for (const body of invalid) {
+      api.overrideNextCodexResponse(body);
+      await assert.rejects(
+        client.refreshCodex("subscription-run", req, expected),
+        /invalid codex credential response/,
+      );
+    }
+
+    api.overrideNextCodexResponse({
+      auth_mode: "subscription",
+      access_token: "x",
+      generation: 5,
+      chatgpt_account_id: "verified-account",
+      chatgpt_plan_type: null,
+      outcome: "reconciled",
+    });
+    const reconciled = await client.refreshCodex("subscription-run", req, expected);
+    assert.equal(reconciled.generation, 5, "reconciliation may legitimately jump several generations");
+
+    const callsBefore = api.codexRequests.length;
+    await assert.rejects(
+      client.refreshCodex(
+        "subscription-run",
+        { ...req, observed_generation: Number.MAX_SAFE_INTEGER },
+        expected,
+      ),
+      /invalid codex credential response/,
+    );
+    assert.equal(api.codexRequests.length, callsBefore, "unsafe observed generation is rejected before HTTP/provider work");
+  });
+});
+
 describe("reportState", () => {
   it("posts a non-terminal state once", async () => {
     const client = newClient();
@@ -124,6 +321,32 @@ describe("reportState", () => {
     // 2 injected failures + 1 success.
     assert.strictEqual(api.stateAttempts, 3);
     assert.deepStrictEqual(api.states, [{ runId: "run-1", body: { status: "completed", branch: "agent/issue-1" } }]);
+  });
+
+  it("cancels a durability-boundary state report while it is in retry backoff", async () => {
+    api.failStateNext(1, 503);
+    let sleepStartedResolve!: () => void;
+    const sleepStarted = new Promise<void>((resolve) => { sleepStartedResolve = resolve; });
+    const client = new WorkerClient(baseUrl, TOKEN, "0.1.0-test", nullLogger(), {
+      sleep: async () => {
+        sleepStartedResolve();
+        await new Promise<void>(() => undefined);
+      },
+      terminalRetrySchedule: [5_000],
+      httpTimeoutMs: 5_000,
+    });
+    const abort = new AbortController();
+    const reporting = client.reportState("run-1", { status: "completed", branch: "agent/issue-1" }, abort.signal);
+    await sleepStarted;
+    abort.abort();
+
+    await Promise.race([
+      assert.rejects(reporting, (error: unknown) => error instanceof DOMException && error.name === "AbortError"),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("reportState abandoned its retry backoff")), 500).unref(),
+      ),
+    ]);
+    assert.equal(api.stateAttempts, 1, "boundary cancellation prevented a second state write");
   });
 
   it("treats an already-terminal (409) terminal report as success", async () => {

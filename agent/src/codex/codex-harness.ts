@@ -22,9 +22,11 @@
 //     per-role grants; the harness uses it to configure the thread/turn.
 //   - `sessionInspect` backs {@link inspectSession}.
 //
-// SECURITY: the provider credential is a PRIVATE construction input; it flows only into
-// the launch spec (→ the app-server's env), NEVER into a thread/turn param, a frame, a
-// tool result or a log line. This module NEVER logs raw frames, tokens or bodies.
+// SECURITY: pinned app-server auth receives the provider credential only through its
+// private construction input and exchanges it on the initialize/login/refresh transport
+// lane. The transitional env credential path is mutually exclusive. Neither path exposes
+// auth to a thread/turn param, model callback broker, tool result or log line. This module
+// NEVER logs raw frames, tokens or bodies.
 //
 // EVENT DECODE (app-server frame → neutral event), authoritative rules 1/3/8/9:
 //   thread/started            → `initialized` (the model-bearing init; carries the
@@ -34,8 +36,8 @@
 //   item/* (deltas, other)    → `activity`  (Codex item updates are activity)
 //   item/tool/call (id-bearing)→ intercepted: broker route + `transport.respond`, then
 //                               yielded as `activity` (NOT a frame)
-//   other server→client req   → answered with a fail-closed JSON-RPC method error, then
-//                               yielded as `activity`
+//   auth refresh request      → narrow auth owner (never broker), then `activity`
+//   other server→client req   → fail-closed JSON-RPC method error, then `activity`
 //   turn/completed            → `turn_finished` (decoded terminal; success/failed by
 //                               status), then the iterator closes
 // ERROR PRECEDENCE (run-lane, rule 9): a local watchdog/cancel (the owner's aborted
@@ -66,6 +68,7 @@ import type {
   ToolDisposal,
 } from "../harness.js";
 import type { CallbackResult, CodexCallbackBroker } from "./broker.js";
+import type { CodexAppServerAuthSession } from "./appserver-auth.js";
 import type { ExecutionRegistry, RegisteredRoot } from "./registry.js";
 import type { CodexNotification, CodexTransport } from "./transport.js";
 import type { RenderedCodexRun } from "./render.js";
@@ -155,7 +158,10 @@ export interface CodexHarnessOptions {
   /** Defaults to {@link renderCodexRun}; injectable for tests. */
   readonly render?: (request: RunTurnRequest) => RenderedCodexRun;
   readonly sessionInspect: SessionInspectSeam;
-  /** PRIVATE provider credential; never model-visible, never logged, never in a frame. */
+  /** Pinned app-server authentication owner. This narrow transport seam is never
+   *  exposed to the callback broker or model. */
+  readonly appServerAuth?: CodexAppServerAuthSession;
+  /** Transitional pre-auth integration input. Mutually exclusive with appServerAuth. */
   readonly credentialValue?: string;
 }
 
@@ -218,7 +224,8 @@ export class CodexHarness implements RunHarness {
   private readonly log: Logger;
   private readonly render: (request: RunTurnRequest) => RenderedCodexRun;
   private readonly sessionInspect: SessionInspectSeam;
-  // Private construction input; NEVER model-visible, never logged, never in a frame.
+  private readonly appServerAuth?: CodexAppServerAuthSession;
+  // Transitional private input; never combined with the pinned app-server auth path.
   private readonly credentialValue?: string;
 
   // Run-level provider root state (launched once, reused across turns; a reused
@@ -264,6 +271,13 @@ export class CodexHarness implements RunHarness {
     this.log = opts.log;
     this.render = opts.render ?? renderCodexRun;
     this.sessionInspect = opts.sessionInspect;
+    if (opts.appServerAuth !== undefined && opts.credentialValue !== undefined) {
+      throw new CodexHarnessError({
+        category: "protocol",
+        message: "codex harness received conflicting authentication inputs",
+      });
+    }
+    this.appServerAuth = opts.appServerAuth;
     this.credentialValue = opts.credentialValue;
   }
 
@@ -413,7 +427,12 @@ export class CodexHarness implements RunHarness {
     // Wake a run loop wedged in a pending broker callback so the generator returns rather
     // than hang on that await while the transport is torn down underneath it.
     this.stopTurn?.();
-    await this.transport?.close();
+    this.appServerAuth?.closeAdmissionAndCancel();
+    try {
+      await this.transport?.close();
+    } finally {
+      await this.appServerAuth?.drainInterceptedRequests();
+    }
   }
 
   /** Shared stop path for an owner abort / watchdog / requestStop / close: interrupt the
@@ -454,7 +473,7 @@ export class CodexHarness implements RunHarness {
         return;
       }
       // 1. Ensure the provider root + transport (launched once, reused after).
-      await this.ensureRoot();
+      await this.ensureRoot(request.signal);
       const transport = this.transport;
       const notes = this.notes;
       if (!transport || !notes) {
@@ -538,7 +557,7 @@ export class CodexHarness implements RunHarness {
         // at the safety boundary, and a late broker reply is guarded in routeToolCall so it
         // never throws into a closed transport. The happy path is unchanged: a callback
         // that settles normally still replies via transport.respond after the broker settles.
-        const mapped = await Promise.race([this.mapNote(transport, step.value), abortPromise]);
+        const mapped = await Promise.race([this.mapNote(transport, step.value, request.signal), abortPromise]);
         if (mapped === "aborted") {
           this.endTurnOnStop();
           return;
@@ -560,8 +579,15 @@ export class CodexHarness implements RunHarness {
     }
   }
 
-  private async ensureRoot(): Promise<void> {
-    if (this.transport) return;
+  private async ensureRoot(signal?: AbortSignal): Promise<void> {
+    if (this.transport) {
+      // A prior startup may have failed after the root was registered. Re-enter the
+      // pinned auth owner so its poison state remains the explicit failure, and never
+      // proceed merely because a transport object exists.
+      await this.appServerAuth?.authenticate(this.transport, signal);
+      if (!this.notes) this.notes = this.transport.notifications();
+      return;
+    }
     const reservation = this.registry.reserveLaunch("provider");
     if (reservation.kind !== "reserved") {
       throw new CodexHarnessError({ category: "protocol", message: "codex provider launch admission is closed" });
@@ -574,7 +600,7 @@ export class CodexHarness implements RunHarness {
         model: this.currentModel ?? this.provider.model,
         cwd: this.workspace,
         ownedDataRoot: this.homeDir,
-        credentialValue: this.credentialValue,
+        credentialValue: this.appServerAuth === undefined ? this.credentialValue : undefined,
       });
     } catch (error) {
       // The launch aborted before producing a root: settle the reservation so it does
@@ -594,6 +620,9 @@ export class CodexHarness implements RunHarness {
       throw new CodexHarnessError({ category: "protocol", message: "codex provider root failed registry admission" });
     }
     this.transport = launched.transport;
+    // The pinned initialize/initialized/login sequence completes before any thread/model
+    // work. The auth owner has no reference to the model callback broker.
+    await this.appServerAuth?.authenticate(launched.transport, signal);
     // Single-consumer: obtain the notifications iterator exactly once for the root.
     this.notes = launched.transport.notifications();
     this.log.debug("codex provider root launched", { supervisorPid: launched.supervisorPid });
@@ -686,7 +715,11 @@ export class CodexHarness implements RunHarness {
   /** Map one decoded {@link CodexNotification} to exactly one {@link HarnessEvent}.
    *  Server→client tool-call requests are intercepted here (routed to the broker and
    *  answered via `transport.respond`) and surfaced as `activity`, never as a frame. */
-  private async mapNote(transport: CodexTransport, note: CodexNotification): Promise<HarnessEvent> {
+  private async mapNote(
+    transport: CodexTransport,
+    note: CodexNotification,
+    signal?: AbortSignal,
+  ): Promise<HarnessEvent> {
     switch (note.kind) {
       case "thread_started":
         // The model-bearing init: carries the model the harness configured, distinct
@@ -710,12 +743,22 @@ export class CodexHarness implements RunHarness {
         if (note.threadId !== this.threadId || note.turnId !== this.activeTurnId) {
           return { kind: "activity", sessionId: note.threadId };
         }
+        // A same-chunk refresh is intercepted before this terminal reaches the queue.
+        // Do not publish success until every accepted auth operation settles; a sticky
+        // protocol poison throws here instead of allowing the terminal through.
+        await this.appServerAuth?.drainInterceptedRequests();
         const terminal = this.decodeTerminal(note);
         this.terminalEmitted = true;
         return { kind: "turn_finished", terminal, sessionId: note.threadId };
       }
       case "activity": {
         if (note.requestId !== undefined) {
+          // Refresh is the only non-tool request admitted here. It is consumed by the
+          // narrow auth owner before the broker lane, so no credential authority becomes
+          // model-visible through a callback.
+          if (await this.appServerAuth?.handleServerRequest(transport, note, signal)) {
+            return { kind: "activity", sessionId: this.threadId };
+          }
           // A server→client request. Only the tool-call lane routes to the broker; any
           // other server-initiated request is answered fail-closed as unsupported.
           if (note.method === "item/tool/call") {

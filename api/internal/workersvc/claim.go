@@ -2,6 +2,7 @@ package workersvc
 
 import (
 	"encoding/json"
+	"errors"
 	"log/slog"
 
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -353,9 +354,8 @@ type ClaimSecrets struct {
 }
 
 // ClaimCodexSecrets is the usable Codex credential for one claim of a Codex-bound run
-// (PRD #1147 M2, B7; PRD #1171 M1 adds AuthMode + Generation). It carries ONLY what the
-// worker needs to act as the credential and to call the (dark) per-run
-// credential-operation endpoints:
+// (PRD #1147 M2, B7; PRD #1171 M1). It carries only what the worker needs to act as
+// the credential and call the dark per-run credential-operation endpoints:
 //
 //   - AuthMode is the run's server-owned, frozen auth mode ("subscription" | "api_key").
 //     It is the discriminant of the TS wire union (agent/src/protocol.ts): the worker
@@ -370,24 +370,71 @@ type ClaimSecrets struct {
 //     (epoch-tagged plaintext), minted server-side at claim assembly. The worker
 //     presents it back to authorize a credential operation (persist-recovery /
 //     release-access-token / start-refresh); the server stores only its sha256.
-//   - Generation is the subscription account's CURRENT committed generation — the
+//   - Generation is the subscription account's CURRENT committed generation: the
 //     generation of the sealed_login this claim releases, and the worker's initial
-//     observedGeneration for a coordinated refresh. It is a *int64 with omitempty so
-//     the wire matches the TS discriminated union EXACTLY: a subscription run carries a
-//     REAL generation (0 at initial login, a real zero — a non-nil pointer to 0
-//     serializes as "generation":0, not omitted), while an api_key run (which can never
-//     refresh) carries NO generation key at all. Sourced from the account row the
-//     subscription open already reads; never a new query.
+//     observedGeneration for a coordinated refresh. A subscription run carries a REAL
+//     generation (0 at initial login stays wire-visible), while an api_key run carries no
+//     generation key. It is sourced from the account row the subscription open already
+//     reads, never a new query.
+//   - ChatGPTAccountID is the subscription account's provider-verified workspace/account
+//     id. It is server-owned authority, not the app-server refresh callback's untrusted
+//     previousAccountId hint. Subscription claims carry it; api_key claims do not.
+//
+// The custom marshaler is load-bearing: subscription emits chatgpt_plan_type:null for
+// pinned app-server's chatgptAuthTokens input, while the api_key arm structurally omits
+// every subscription-only account/generation/plan field.
 //
 // Never logged; the whole struct is secret-bearing like its parent ClaimSecrets.
 type ClaimCodexSecrets struct {
-	AuthMode    string `json:"auth_mode"`
-	AccessToken string `json:"access_token"`
-	Capability  string `json:"capability"`
-	// Generation: *int64 + omitempty is load-bearing (see the type doc). A subscription
-	// claim sets it (0 is a real, wire-visible zero); an api_key claim leaves it nil so
-	// the `generation` key is absent, matching the TS `api_key` union arm.
-	Generation *int64 `json:"generation,omitempty"`
+	AuthMode    string `json:"-"`
+	AccessToken string `json:"-"`
+	Capability  string `json:"-"`
+	// Generation is a pointer so subscription generation zero remains distinguishable from
+	// api_key absence. MarshalJSON turns those into the two exact wire shapes.
+	Generation       *int64 `json:"-"`
+	ChatGPTAccountID string `json:"-"`
+}
+
+// MarshalJSON encodes the two auth modes as distinct wire shapes. Keeping the api_key
+// shape separate makes it impossible for a nil plan to become an accidental
+// chatgpt_plan_type:null field on API-key responses.
+func (c ClaimCodexSecrets) MarshalJSON() ([]byte, error) {
+	switch c.AuthMode {
+	case codexAuthModeSubscription:
+		if c.Generation == nil || c.ChatGPTAccountID == "" {
+			return nil, errors.New("codex subscription claim is missing server-owned auth metadata")
+		}
+		return json.Marshal(struct {
+			AuthMode         string  `json:"auth_mode"`
+			AccessToken      string  `json:"access_token"`
+			Capability       string  `json:"capability"`
+			Generation       int64   `json:"generation"`
+			ChatGPTAccountID string  `json:"chatgpt_account_id"`
+			ChatGPTPlanType  *string `json:"chatgpt_plan_type"`
+		}{
+			AuthMode:         c.AuthMode,
+			AccessToken:      c.AccessToken,
+			Capability:       c.Capability,
+			Generation:       *c.Generation,
+			ChatGPTAccountID: c.ChatGPTAccountID,
+			ChatGPTPlanType:  nil,
+		})
+	case codexAuthModeAPIKey:
+		if c.Generation != nil || c.ChatGPTAccountID != "" {
+			return nil, errors.New("codex api_key claim carries subscription-only auth metadata")
+		}
+		return json.Marshal(struct {
+			AuthMode    string `json:"auth_mode"`
+			AccessToken string `json:"access_token"`
+			Capability  string `json:"capability"`
+		}{
+			AuthMode:    c.AuthMode,
+			AccessToken: c.AccessToken,
+			Capability:  c.Capability,
+		})
+	default:
+		return nil, errors.New("codex claim has an invalid auth mode")
+	}
 }
 
 // ClaimAgent is a PRD #3 agent template as structured fields, ready to map onto

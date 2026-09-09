@@ -27,9 +27,9 @@ let fatalLog: Logger | undefined;
 async function main(): Promise<void> {
   // PRD #51 M4: under the uid split, run the worker with umask 002 so (a) the runner-owned
   // /data subtrees the worker mkdirs (runner clone parents, per-run SDK HOME, provision)
-  // are group-`runner`-writable — the runner-uid children can then create their per-run
+  // are group-`runner`-writable — runner and runner-cmd children can then create/access their per-run
   // dirs — and (b) the runner children inherit umask 002 (it crosses fork/exec/setpriv),
-  // so their files are group-writable and the worker (a `runner`-group member) can tear
+  // so their files are group-writable and the worker/runner-cmd (`runner`-group members) can tear
   // them down on terminal. This never widens a WORKER-owned path to the runner: those are
   // group `worker` (which the runner is not in), so 002 only adds group-`worker` write
   // there (inert). Single-uid (#58): unchanged (default umask, no separate runner).

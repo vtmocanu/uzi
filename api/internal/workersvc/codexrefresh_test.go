@@ -12,6 +12,12 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
+func TestCodexRefreshLeaseLeavesWorkerHTTPMargin(t *testing.T) {
+	if codexRefreshLeaseTTL != 7*time.Second {
+		t.Fatalf("refresh lease = %s, want 7s below the worker's 8s HTTP budget", codexRefreshLeaseTTL)
+	}
+}
+
 // These are the DB-free unit tests for the coordinated Codex refresher's two pure
 // decision functions (PRD #1147 M2, B6): the merged-reseal rule and the reconcile
 // resolution rule. They need no Postgres, so they run in the ordinary `go test` sweep.

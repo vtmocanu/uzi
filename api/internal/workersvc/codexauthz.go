@@ -843,11 +843,12 @@ func (s *Service) codexClaimSecrets(ctx context.Context, wkr store.Worker, run s
 		return nil, rerr
 	}
 
-	// generation carries the subscription account's current committed generation onto the
-	// claim wire (PRD #1171 M1). It stays nil for an api_key run (which can never refresh),
-	// so ClaimCodexSecrets.Generation's omitempty drops the key for that mode — matching the
-	// TS discriminated union. A subscription run sets it (a real 0 at initial login).
+	// Generation and chatgptAccountID carry server-owned subscription state onto the claim
+	// wire (PRD #1171 M1). Both come from the provider account whose identity was verified
+	// during import/reconciliation. The app-server callback's previousAccountId remains an
+	// untrusted hint and is never accepted here. Both stay absent for api_key.
 	var generation *int64
+	var chatgptAccountID string
 	var accessToken string
 	switch authMode {
 	case codexAuthModeSubscription:
@@ -877,6 +878,7 @@ func (s *Service) codexClaimSecrets(ctx context.Context, wkr store.Worker, run s
 		// the pointer does not alias the loop-free struct field beyond this scope.
 		g := acct.Generation
 		generation = &g
+		chatgptAccountID = acct.WorkspaceAccountID
 		plain, oerr := secretopen.OpenSealed(s.vlt, s.box, run.UserID, store.KindCodexAuth, acct.SealedWith, acct.SealedLogin)
 		if oerr != nil {
 			if errors.Is(oerr, secretopen.ErrVaultLocked) {
@@ -931,10 +933,11 @@ func (s *Service) codexClaimSecrets(ctx context.Context, wkr store.Worker, run s
 	}
 
 	return &ClaimCodexSecrets{
-		AuthMode:    authMode,
-		AccessToken: accessToken,
-		Capability:  wireCap,
-		Generation:  generation, // subscription: the committed generation; api_key: nil (key omitted)
+		AuthMode:         authMode,
+		AccessToken:      accessToken,
+		Capability:       wireCap,
+		Generation:       generation,
+		ChatGPTAccountID: chatgptAccountID,
 	}, nil
 }
 

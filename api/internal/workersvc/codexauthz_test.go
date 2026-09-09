@@ -126,10 +126,9 @@ func TestClaimSecretsClaudeByteIdentical(t *testing.T) {
 }
 
 // TestClaimCodexSecretsShape proves a Codex-bound claim carries ONLY the auth mode, the
-// access token, the per-claim capability and (subscription only) the committed generation
-// — never a refresh/login blob or an id. It also proves the two discriminated arms match
-// the TS wire union EXACTLY (agent/src/protocol.ts): subscription carries a REAL
-// "generation" (0 is a wire-visible zero), api_key omits the key entirely.
+// access token, the per-claim capability and the mode-specific server-owned metadata,
+// never a refresh/login blob or internal id. It proves subscription carries a real
+// generation, verified ChatGPT account id and plan null, while api_key omits all three.
 func TestClaimCodexSecretsShape(t *testing.T) {
 	// The one placeholder whose name trips gosec G101 is extracted so its suppression
 	// sits on the exact triggering assignment, not on the composite-literal brace (which
@@ -142,7 +141,7 @@ func TestClaimCodexSecretsShape(t *testing.T) {
 	// The forbidden set: neither the refresh/login blob nor any id may ride the wire, in
 	// either arm. `login` matches nothing in `auth_mode` (no "login" substring), so it stays
 	// a clean canary for a leaked login blob.
-	forbidden := []string{"refresh_token", "refresh", "login", "secret_id", "account_id"}
+	forbidden := []string{"refresh_token", "refresh", "login", "secret_id", "provider_user_id", "workspace_account_id"}
 	assertNoForbidden := func(t *testing.T, got string) {
 		t.Helper()
 		for _, f := range forbidden {
@@ -159,10 +158,11 @@ func TestClaimCodexSecretsShape(t *testing.T) {
 			ForgePAT:            forgePAT,
 			AnthropicOAuthToken: anthropicToken,
 			Codex: &ClaimCodexSecrets{
-				AuthMode:    codexAuthModeSubscription,
-				AccessToken: codexAccess,
-				Capability:  codexCap,
-				Generation:  &gen,
+				AuthMode:         codexAuthModeSubscription,
+				AccessToken:      codexAccess,
+				Capability:       codexCap,
+				Generation:       &gen,
+				ChatGPTAccountID: "verified-account",
 			},
 		}
 		b, err := json.Marshal(cs)
@@ -185,6 +185,12 @@ func TestClaimCodexSecretsShape(t *testing.T) {
 		if !strings.Contains(got, `"generation":0`) {
 			t.Fatalf("subscription generation 0 must be a REAL wire-visible zero: %s", got)
 		}
+		if !strings.Contains(got, `"chatgpt_account_id":"verified-account"`) {
+			t.Fatalf("subscription verified account id missing: %s", got)
+		}
+		if !strings.Contains(got, `"chatgpt_plan_type":null`) {
+			t.Fatalf("subscription plan type must be explicit null: %s", got)
+		}
 		assertNoForbidden(t, got)
 	})
 
@@ -193,10 +199,11 @@ func TestClaimCodexSecretsShape(t *testing.T) {
 		cs := ClaimSecrets{
 			ForgePAT: forgePAT,
 			Codex: &ClaimCodexSecrets{
-				AuthMode:    codexAuthModeSubscription,
-				AccessToken: codexAccess,
-				Capability:  codexCap,
-				Generation:  &gen,
+				AuthMode:         codexAuthModeSubscription,
+				AccessToken:      codexAccess,
+				Capability:       codexCap,
+				Generation:       &gen,
+				ChatGPTAccountID: "verified-account",
 			},
 		}
 		b, err := json.Marshal(cs)
@@ -227,9 +234,38 @@ func TestClaimCodexSecretsShape(t *testing.T) {
 		if !strings.Contains(got, `"auth_mode":"api_key"`) {
 			t.Fatalf("auth_mode missing/wrong: %s", got)
 		}
-		if strings.Contains(got, "generation") {
-			t.Fatalf("api_key claim must carry NO generation key: %s", got)
+		for _, forbidden := range []string{"generation", "chatgpt_account_id", "chatgpt_plan_type"} {
+			if strings.Contains(got, forbidden) {
+				t.Fatalf("api_key claim must carry no subscription field %q: %s", forbidden, got)
+			}
 		}
 		assertNoForbidden(t, got)
+	})
+
+	t.Run("api_key rejects accidentally populated subscription metadata", func(t *testing.T) {
+		gen := int64(1)
+		_, err := json.Marshal(ClaimCodexSecrets{
+			AuthMode:         codexAuthModeAPIKey,
+			AccessToken:      codexAccess,
+			Capability:       codexCap,
+			Generation:       &gen,
+			ChatGPTAccountID: "must-not-ship",
+		})
+		if err == nil {
+			t.Fatal("api_key claim with subscription metadata marshaled successfully")
+		}
+	})
+
+	t.Run("subscription requires verified account authority", func(t *testing.T) {
+		gen := int64(0)
+		_, err := json.Marshal(ClaimCodexSecrets{
+			AuthMode:    codexAuthModeSubscription,
+			AccessToken: codexAccess,
+			Capability:  codexCap,
+			Generation:  &gen,
+		})
+		if err == nil {
+			t.Fatal("subscription claim without a verified account id marshaled successfully")
+		}
 	})
 }

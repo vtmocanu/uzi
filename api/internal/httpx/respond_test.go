@@ -86,6 +86,42 @@ func TestDecodeJSONRejectsUnknownFields(t *testing.T) {
 	}
 }
 
+func TestDecodeJSONStrictRejectsTrailingValueWithoutChangingDecodeJSON(t *testing.T) {
+	type payload struct {
+		S string `json:"s"`
+	}
+	body := `{"s":"first"} {"s":"second"}`
+
+	var compatible payload
+	if err := DecodeJSON(requestWithBody(body), &compatible); err != nil {
+		t.Fatalf("DecodeJSON compatibility path rejected the trailing value: %v", err)
+	}
+	if compatible.S != "first" {
+		t.Fatalf("DecodeJSON decoded %q, want first value", compatible.S)
+	}
+
+	var strict payload
+	if err := DecodeJSONStrict(requestWithBody(body), &strict); err == nil {
+		t.Fatal("DecodeJSONStrict accepted a trailing JSON value")
+	}
+}
+
+// The first JSON value can end exactly at maxBodyBytes. A LimitReader(maxBodyBytes)
+// falsely reports EOF there even when a second value follows, so strict decoding reads one
+// bounded sentinel byte and rejects the over-cap/trailing body.
+func TestDecodeJSONStrictDetectsTrailingValueBeyondExactCap(t *testing.T) {
+	atCap := exactSizeJSON(t, maxBodyBytes)
+	var accepted payload
+	if err := DecodeJSONStrict(requestWithBody(atCap), &accepted); err != nil {
+		t.Fatalf("strict decoder rejected one JSON value exactly at the cap: %v", err)
+	}
+
+	var rejected payload
+	if err := DecodeJSONStrict(requestWithBody(atCap+` {}`), &rejected); err == nil {
+		t.Fatal("strict decoder accepted a trailing value beyond an exact-cap first value")
+	}
+}
+
 func TestDecodeJSONLimitedRejectsUnknownFields(t *testing.T) {
 	var dst payload
 	rec := httptest.NewRecorder()

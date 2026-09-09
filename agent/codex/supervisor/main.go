@@ -24,10 +24,16 @@ func main() {
 func realMain(args []string) int {
 	ev := &evidence{w: os.NewFile(4, "evidence")}
 
-	expectUID, childArgv, err := parseArgs(args)
+	expectUID, cleanupToken, dropControllerCaps, childArgv, err := parseArgs(args)
 	if err != nil {
 		_ = ev.writeJSON(abnormalEvidence("invalid arguments", nil))
 		return 2
+	}
+	if dropControllerCaps {
+		if err := clearAllCaps(); err != nil {
+			_ = ev.writeJSON(abnormalEvidence("profile:capDrop", nil))
+			return 2
+		}
 	}
 
 	// (1) Establish + verify subreaper and nondumpability BEFORE fork. PR_SET_DUMPABLE
@@ -62,6 +68,20 @@ func realMain(args []string) int {
 		_ = ev.writeJSON(abnormalEvidence("child launch failed", nil))
 		return 2
 	}
+	// The supervised child inherited stdio 0/1/2. Drop the supervisor's copies so
+	// EOF/backpressure describe the child tree rather than this long-lived control
+	// process; control/evidence remain isolated on fd3/fd4.
+	_ = unix.Close(0)
+	_ = unix.Close(1)
+	_ = unix.Close(2)
+	childReady, readyErr := watchChild(childPid)
+	if readyErr != nil {
+		deadline := time.Now().Add(time.Duration(defaultDisposeTimeoutMs) * time.Millisecond)
+		cleanup := drain(deadline, time.Now, func() { time.Sleep(2 * time.Millisecond) }, selfDirectChildren, realKill, realReap)
+		_ = ev.writeJSON(abnormalEvidence("child watch failed", &cleanup))
+		removeCommandTmp(cleanupToken)
+		return 2
+	}
 
 	sup := &supervisor{
 		ev:      ev,
@@ -71,48 +91,140 @@ func realMain(args []string) int {
 			directChildren: selfDirectChildren,
 			kill:           realKill,
 			reap:           realReap,
+			childReady:     childReady,
+			reapChild:      realReapChild,
 			snapshot:       func() ([]procRow, error) { return walkDescendants(os.Getpid()) },
 			now:            time.Now,
 			sleep:          func() { time.Sleep(2 * time.Millisecond) },
 		},
 	}
-	return sup.run(childPid, st)
+	code := sup.run(childPid, st)
+	removeCommandTmp(cleanupToken)
+	return code
+}
+
+func removeCommandTmp(token string) {
+	if token != "" {
+		_ = os.RemoveAll("/tmp/uzi-codex-command-" + token)
+	}
+}
+
+// watchChild returns a one-shot readiness channel backed by a pidfd. Readiness
+// means the primary child is waitable; it does not reap. The supervisor's main
+// loop therefore remains the sole wait authority and never races drain's
+// Wait4(-1, __WALL) path.
+func watchChild(pid int) (<-chan error, error) {
+	fd, err := unix.PidfdOpen(pid, 0)
+	if err != nil {
+		return nil, err
+	}
+	ready := make(chan error, 1)
+	go func() {
+		defer unix.Close(fd)
+		fds := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
+		for {
+			_, pollErr := unix.Poll(fds, -1)
+			if pollErr == unix.EINTR {
+				continue
+			}
+			ready <- pollErr
+			return
+		}
+	}()
+	return ready, nil
+}
+
+// realReapChild reaps only the supervised primary child after its pidfd became
+// readable. Detached/background descendants remain adopted by the subreaper and
+// are accounted for by the later ECHILD+__WALL drain.
+func realReapChild(pid int) (int, error) {
+	var ws unix.WaitStatus
+	got, err := unix.Wait4(pid, &ws, unix.WNOHANG|unix.WALL, nil)
+	if err != nil {
+		return 0, err
+	}
+	if got != pid {
+		return 0, errors.New("child was not waitable after pidfd readiness")
+	}
+	if ws.Exited() {
+		return ws.ExitStatus(), nil
+	}
+	if ws.Signaled() {
+		return 128 + int(ws.Signal()), nil
+	}
+	return 1, nil
 }
 
 var errBadArgs = errors.New("invalid arguments")
 
 // parseArgs parses the trusted, caller-supplied argv:
 //
-//	--expect-uid <N> -- <child-exec-abspath> [child args...]
+//	--expect-uid <N> [--drop-controller-caps] -- <child-exec-abspath> [child args...]
 //
 // The child exec path must be absolute (never a model-selected relative target),
 // and --expect-uid is mandatory.
-func parseArgs(args []string) (expectUID int, childArgv []string, err error) {
+func parseArgs(args []string) (expectUID int, cleanupToken string, dropControllerCaps bool, childArgv []string, err error) {
 	seenUID := false
 	i := 0
 	for i < len(args) {
 		switch args[i] {
 		case "--expect-uid":
 			if i+1 >= len(args) {
-				return 0, nil, errBadArgs
+				return 0, "", false, nil, errBadArgs
 			}
 			n, cerr := strconv.Atoi(args[i+1])
 			if cerr != nil || n < 0 {
-				return 0, nil, errBadArgs
+				return 0, "", false, nil, errBadArgs
 			}
 			expectUID, seenUID = n, true
 			i += 2
+		case "--cleanup-token":
+			if i+1 >= len(args) || cleanupToken != "" || !validCleanupToken(args[i+1]) {
+				return 0, "", false, nil, errBadArgs
+			}
+			cleanupToken = args[i+1]
+			i += 2
+		case "--drop-controller-caps":
+			if dropControllerCaps {
+				return 0, "", false, nil, errBadArgs
+			}
+			dropControllerCaps = true
+			i++
 		case "--":
 			child := args[i+1:]
 			if !seenUID || len(child) == 0 || !strings.HasPrefix(child[0], "/") {
-				return 0, nil, errBadArgs
+				return 0, "", false, nil, errBadArgs
 			}
-			return expectUID, child, nil
+			return expectUID, cleanupToken, dropControllerCaps, child, nil
 		default:
-			return 0, nil, errBadArgs
+			return 0, "", false, nil, errBadArgs
 		}
 	}
-	return 0, nil, errBadArgs
+	return 0, "", false, nil, errBadArgs
+}
+
+func clearAllCaps() error {
+	hdr := unix.CapUserHeader{Version: unix.LINUX_CAPABILITY_VERSION_3, Pid: 0}
+	data := [2]unix.CapUserData{}
+	return unix.Capset(&hdr, &data[0])
+}
+
+func validCleanupToken(token string) bool {
+	if len(token) != 36 {
+		return false
+	}
+	for i, c := range token {
+		if i == 8 || i == 13 || i == 18 || i == 23 {
+			if c != '-' {
+				return false
+			}
+			continue
+		}
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
 }
 
 // establishSubreaper sets PR_SET_CHILD_SUBREAPER then CONFIRMS it via

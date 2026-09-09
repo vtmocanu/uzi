@@ -38,7 +38,7 @@ ENV PATH="${JAVA_HOME}/bin:${PATH}"
 # NOT in group `worker`; its primary group `runner-cmd` (gid 10003) lets setpriv
 # `--regid 10003` resolve, and it joins group `runner` as a supplementary member so
 # `--init-groups` grants the `runner` group -- letting a command root write the shared
-# run worktree (a later #1171 unit makes it setgid group=runner, group-writable) and read
+# setgid group=runner, group-writable run worktree and read
 # the group-accessible /nix toolchain (`/nix` is worker:runner), exactly as the `runner`
 # uid does today. Numbered to match the k8s design intent (worker 10001 / runner 10002 /
 # runner-cmd 10003); `worker` joins group `runner`. Created EARLY so /nix + /data can be
@@ -309,13 +309,15 @@ RUN bash /tmp/codex/assert-codex.sh \
 # (/usr/local/bin/uzi-codex-supervisor) as a trusted, caller-supplied argv0 — never model-
 # controlled.
 #
-# The SAME module ships a SECOND static command, uzi-codex-fileop (the [B2] openat2
+# The SAME module ships two more static commands: uzi-codex-fileop (the [B2] openat2
 # worktree-confined file-operation helper, `./fileop`), built in the same RUN off the same
 # vendored tree (identical GOTOOLCHAIN/CGO/GOFLAGS env), installed root-owned 0555 at
 # /usr/local/bin/uzi-codex-fileop (matching FILEOP_BIN in agent/src/codex/codex-executor.ts).
+# uzi-codex-command-sandbox applies the fail-closed Landlock filesystem allowlist before
+# uid-10003 effects and is also root-owned 0555 and absent from PATH.
 # MIRRORED from templates/base — keep the COPY/RUN lines in lockstep (jvm is NOT `FROM base`).
 COPY agent/codex/supervisor /build/uzi-codex-supervisor
-RUN cd /build/uzi-codex-supervisor && export GOTOOLCHAIN=local CGO_ENABLED=0 GOFLAGS="-mod=vendor -buildvcs=false" && go build -trimpath -o /usr/local/bin/uzi-codex-supervisor . && chmod 0555 /usr/local/bin/uzi-codex-supervisor && go build -trimpath -o /usr/local/bin/uzi-codex-fileop ./fileop && chmod 0555 /usr/local/bin/uzi-codex-fileop && rm -rf /build/uzi-codex-supervisor
+RUN cd /build/uzi-codex-supervisor && export GOTOOLCHAIN=local CGO_ENABLED=0 GOFLAGS="-mod=vendor -buildvcs=false" && go build -trimpath -o /usr/local/bin/uzi-codex-supervisor . && chmod 0555 /usr/local/bin/uzi-codex-supervisor && go build -trimpath -o /usr/local/bin/uzi-codex-fileop ./fileop && chmod 0555 /usr/local/bin/uzi-codex-fileop && go build -trimpath -o /usr/local/bin/uzi-codex-command-sandbox ./cmdsandbox && chmod 0555 /usr/local/bin/uzi-codex-command-sandbox && rm -rf /build/uzi-codex-supervisor
 
 COPY agent/tsconfig.json ./
 COPY agent/src ./src

@@ -2,6 +2,7 @@
 package httpx
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
@@ -76,8 +77,9 @@ func PathUUIDMsg(w http.ResponseWriter, r *http.Request, param, message string) 
 	return id, true
 }
 
-// DecodeJSON reads and decodes a JSON request body into dst, rejecting unknown
-// fields and trailing data.
+// DecodeJSON reads and decodes one JSON value into dst, rejecting unknown fields. It does
+// not inspect a second value buffered after the first; routes whose body is an authority
+// boundary must use DecodeJSONStrict.
 //
 // The io.LimitReader here TRUNCATES SILENTLY: an oversize body is not reported as
 // oversize, it is cut short and then fails as malformed JSON. Every caller
@@ -88,6 +90,32 @@ func DecodeJSON(r *http.Request, dst any) error {
 	dec := json.NewDecoder(io.LimitReader(r.Body, maxBodyBytes))
 	dec.DisallowUnknownFields()
 	return dec.Decode(dst)
+}
+
+// DecodeJSONStrict is DecodeJSON plus a second decode that requires EOF. It reads one
+// bounded sentinel byte past maxBodyBytes before decoding, so a first value ending exactly
+// at the cap cannot hide a trailing value behind LimitReader's synthetic EOF.
+func DecodeJSONStrict(r *http.Request, dst any) error {
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
+	if err != nil {
+		return err
+	}
+	if len(body) > maxBodyBytes {
+		return errors.New("request body exceeds strict JSON limit")
+	}
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		return err
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("request body must contain one JSON value")
+		}
+		return err
+	}
+	return nil
 }
 
 // DecodeJSONLimited is DecodeJSON for a route whose client needs to tell "your

@@ -150,6 +150,15 @@ export interface CodexTransport {
     requestId: number | string,
     response: { readonly result: unknown } | { readonly error: { readonly code: number; readonly message: string } },
   ): void;
+  /**
+   * Install the single narrow server-request interceptor. It runs synchronously in the
+   * read path, before an id-bearing request can enter the notification queue. Returning
+   * true claims that request; false leaves it on the ordinary single-consumer stream.
+   *
+   * Optional only for structural compatibility with credential-free test transports.
+   * The pinned app-server auth owner requires it and fails closed when it is absent.
+   */
+  installServerRequestInterceptor?(interceptor: (note: CodexNotification, frameBytes: number) => boolean): () => void;
   /** Single-consumer async iterator of decoded notifications. Ends (done) on a clean
    *  close; throws the terminal {@link CodexTransportError} on a framing/EOF failure. */
   notifications(): AsyncIterableIterator<CodexNotification>;
@@ -201,6 +210,7 @@ class CodexTransportImpl implements CodexTransport {
   private notesBytes = 0;
   private notesWaiter: { resolve: (r: IteratorResult<CodexNotification>) => void; reject: (e: unknown) => void } | undefined;
   private notesIterated = false;
+  private serverRequestInterceptor?: (note: CodexNotification, frameBytes: number) => boolean;
 
   private readonly onDataHandler = (chunk: string): void => this.onData(chunk);
   private readonly onEndHandler = (): void => this.onEof();
@@ -304,6 +314,17 @@ class CodexTransportImpl implements CodexTransport {
     // its pending request rather than treating it as a fresh notification.
     const frame = "error" in response ? { id: requestId, error: response.error } : { id: requestId, result: response.result };
     this.enqueueFrame(frame);
+  }
+
+  installServerRequestInterceptor(interceptor: (note: CodexNotification, frameBytes: number) => boolean): () => void {
+    if (this.closed) throw this.terminalError ?? fail("transport", "codex transport is closed");
+    if (this.serverRequestInterceptor !== undefined) {
+      throw fail("protocol", "codex transport server-request interceptor is already installed");
+    }
+    this.serverRequestInterceptor = interceptor;
+    return (): void => {
+      if (this.serverRequestInterceptor === interceptor) this.serverRequestInterceptor = undefined;
+    };
   }
 
   notifications(): AsyncIterableIterator<CodexNotification> {
@@ -430,7 +451,18 @@ class CodexTransportImpl implements CodexTransport {
     const id = msg.id;
     if (typeof method === "string") {
       const requestId = typeof id === "number" || typeof id === "string" ? id : undefined;
-      this.pushNotification(this.decodeNotification(method, msg.params, requestId), byteLen);
+      const note = this.decodeNotification(method, msg.params, requestId);
+      if (requestId !== undefined && this.serverRequestInterceptor !== undefined) {
+        let handled: boolean;
+        try {
+          handled = this.serverRequestInterceptor(note, byteLen);
+        } catch {
+          this.terminate(fail("protocol", "codex transport server-request interceptor failed"));
+          return;
+        }
+        if (handled) return;
+      }
+      this.pushNotification(note, byteLen);
       return;
     }
     if (typeof id === "number" || typeof id === "string") {
@@ -537,6 +569,7 @@ class CodexTransportImpl implements CodexTransport {
     this.inbound.removeListener("close", this.onEndHandler);
     this.inbound.removeListener("error", this.onInboundError);
     this.outbound.removeListener("error", this.onOutboundError);
+    this.serverRequestInterceptor = undefined;
     this.sendQueue.length = 0;
     this.sendBytes = 0;
 

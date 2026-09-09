@@ -22,6 +22,19 @@ import type { ClaimCodexSecrets, ClaimSecrets } from "../src/protocol.js";
 // ever interpolated back out.
 const SECRET_TOKEN = "sk-codex-SECRET-ACCESS-TOKEN-abc123-do-not-leak";
 const SECRET_CAP = "cap-SECRET-CAPABILITY-xyz789-do-not-leak";
+const PRIVATE_ACCOUNT = "account-PRIVATE-IDENTITY-do-not-leak";
+
+function validSubscription(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    auth_mode: "subscription",
+    access_token: SECRET_TOKEN,
+    capability: SECRET_CAP,
+    generation: 7,
+    chatgpt_account_id: PRIVATE_ACCOUNT,
+    chatgpt_plan_type: null,
+    ...overrides,
+  };
+}
 
 describe("selectCodexBinding: absence takes the exact Claude path", () => {
   it("returns {kind:'claude'} when the codex block is a MISSING key", () => {
@@ -39,12 +52,14 @@ describe("selectCodexBinding: absence takes the exact Claude path", () => {
 });
 
 describe("selectCodexBinding: a complete, valid block selects Codex", () => {
-  it("subscription (finite generation) → codex; authMode subscription; canRefresh true; mode subscription", () => {
+  it("subscription (nonnegative safe-integer generation) → codex; authMode subscription; canRefresh true", () => {
     const subCodex: ClaimCodexSecrets = {
       auth_mode: "subscription",
       access_token: SECRET_TOKEN,
       capability: SECRET_CAP,
       generation: 7,
+      chatgpt_account_id: PRIVATE_ACCOUNT,
+      chatgpt_plan_type: null,
     };
     const claim: ClaimSecrets = { forge_pat: "pat", codex: subCodex };
 
@@ -56,13 +71,15 @@ describe("selectCodexBinding: a complete, valid block selects Codex", () => {
     assert.equal(sel.binding.accessToken, SECRET_TOKEN);
     assert.equal(sel.binding.capability, SECRET_CAP);
     assert.equal(sel.binding.generation, 7);
+    assert.equal(sel.binding.chatgptAccountId, PRIVATE_ACCOUNT);
+    assert.equal(sel.binding.chatgptPlanType, null);
     assert.equal(mode(sel.binding), "subscription");
     assert.equal(canRefresh(sel.binding), true);
   });
 
   it("accepts generation === 0 (a finite, falsy generation is valid)", () => {
     const sel = selectCodexBinding({
-      codex: { auth_mode: "subscription", access_token: SECRET_TOKEN, capability: SECRET_CAP, generation: 0 },
+      codex: validSubscription({ generation: 0 }),
     });
     assert.equal(sel.kind, "codex");
     if (sel.kind !== "codex") return;
@@ -104,43 +121,83 @@ const MALFORMED: { name: string; codex: unknown; reason: CodexSelectionErrorReas
   },
   {
     name: "empty access_token",
-    codex: { auth_mode: "subscription", access_token: "", capability: SECRET_CAP, generation: 1 },
+    codex: validSubscription({ access_token: "" }),
     reason: "invalid_access_token",
   },
   {
     name: "missing access_token",
-    codex: { auth_mode: "subscription", capability: SECRET_CAP, generation: 1 },
+    codex: { ...validSubscription(), access_token: undefined },
     reason: "invalid_access_token",
   },
   {
     name: "empty capability",
-    codex: { auth_mode: "subscription", access_token: SECRET_TOKEN, capability: "", generation: 1 },
+    codex: validSubscription({ capability: "" }),
     reason: "invalid_capability",
   },
   {
     name: "subscription missing generation",
-    codex: { auth_mode: "subscription", access_token: SECRET_TOKEN, capability: SECRET_CAP },
+    codex: { ...validSubscription(), generation: undefined },
     reason: "subscription_missing_generation",
   },
   {
     name: "subscription generation is NaN",
-    codex: { auth_mode: "subscription", access_token: SECRET_TOKEN, capability: SECRET_CAP, generation: Number.NaN },
+    codex: validSubscription({ generation: Number.NaN }),
     reason: "subscription_generation_not_finite",
   },
   {
     name: "subscription generation is Infinity",
-    codex: {
-      auth_mode: "subscription",
-      access_token: SECRET_TOKEN,
-      capability: SECRET_CAP,
-      generation: Number.POSITIVE_INFINITY,
-    },
+    codex: validSubscription({ generation: Number.POSITIVE_INFINITY }),
     reason: "subscription_generation_not_finite",
+  },
+  {
+    name: "subscription generation is fractional",
+    codex: validSubscription({ generation: 1.5 }),
+    reason: "subscription_generation_not_safe_integer",
+  },
+  {
+    name: "subscription generation exceeds the safe-integer range",
+    codex: validSubscription({ generation: Number.MAX_SAFE_INTEGER + 1 }),
+    reason: "subscription_generation_not_safe_integer",
+  },
+  {
+    name: "subscription generation is negative",
+    codex: validSubscription({ generation: -1 }),
+    reason: "subscription_generation_negative",
+  },
+  {
+    name: "subscription account id is missing",
+    codex: { ...validSubscription(), chatgpt_account_id: undefined },
+    reason: "subscription_invalid_account_id",
+  },
+  {
+    name: "subscription account id is empty",
+    codex: validSubscription({ chatgpt_account_id: "" }),
+    reason: "subscription_invalid_account_id",
+  },
+  {
+    name: "subscription plan type is missing",
+    codex: { ...validSubscription(), chatgpt_plan_type: undefined },
+    reason: "subscription_invalid_plan_type",
+  },
+  {
+    name: "subscription plan type is provider text instead of null",
+    codex: validSubscription({ chatgpt_plan_type: "plus" }),
+    reason: "subscription_invalid_plan_type",
   },
   {
     name: "api_key WITH a generation",
     codex: { auth_mode: "api_key", access_token: SECRET_TOKEN, capability: SECRET_CAP, generation: 5 },
-    reason: "api_key_unexpected_generation",
+    reason: "api_key_unexpected_subscription_fields",
+  },
+  {
+    name: "api_key WITH an account id",
+    codex: { auth_mode: "api_key", access_token: SECRET_TOKEN, capability: SECRET_CAP, chatgpt_account_id: PRIVATE_ACCOUNT },
+    reason: "api_key_unexpected_subscription_fields",
+  },
+  {
+    name: "api_key WITH an explicit plan null",
+    codex: { auth_mode: "api_key", access_token: SECRET_TOKEN, capability: SECRET_CAP, chatgpt_plan_type: null },
+    reason: "api_key_unexpected_subscription_fields",
   },
   { name: "codex block is null", codex: null, reason: "not_an_object" },
   { name: "codex block is a string (secret-shaped)", codex: SECRET_TOKEN, reason: "not_an_object" },
@@ -162,6 +219,7 @@ describe("selectCodexBinding: a present-but-malformed block fails closed (throws
           // offending block carried them.
           assert.ok(!e.message.includes(SECRET_TOKEN), `message leaked the access token: ${e.message}`);
           assert.ok(!e.message.includes(SECRET_CAP), `message leaked the capability: ${e.message}`);
+          assert.ok(!e.message.includes(PRIVATE_ACCOUNT), `message leaked the account id: ${e.message}`);
           return true;
         },
       );
@@ -195,6 +253,8 @@ describe("CodexBinding brand: only selectCodexBinding may mint a binding", () =>
       accessToken: SECRET_TOKEN,
       capability: SECRET_CAP,
       generation: 1,
+      chatgptAccountId: PRIVATE_ACCOUNT,
+      chatgptPlanType: null,
     };
 
     // @ts-expect-error - the CodexBinding brand is a module-private unique symbol: only

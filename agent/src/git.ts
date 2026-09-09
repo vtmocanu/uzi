@@ -1,4 +1,5 @@
 import { execFile, spawn, type ChildProcess } from "node:child_process";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { promisify } from "node:util";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -6,6 +7,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { Readable } from "node:stream";
 import type { Logger } from "./log.js";
+import type { BoundaryProcessHandle, BoundaryProcessRequest } from "./harness.js";
 import { runnerCommand, runnerPath, runnerTmpdir } from "./runner-uid.js";
 import { withForgeRetry } from "./forge-retry.js";
 import { flagCIConfigPaths } from "./ci-config-guard.js";
@@ -35,6 +37,8 @@ const execFileAsync = promisify(execFile);
 // nonexistent path is harmless (git simply runs no hooks), so this is safe on a
 // host/image without the baked dir (e.g. a unit test), where no hooks run anyway.
 const EMPTY_GIT_HOOKS_DIR = "/usr/share/uzi-git-nohooks";
+const GIT_BIN = "/usr/bin/git";
+const GITLEAKS_BIN = "/usr/local/bin/gitleaks";
 
 // PRD #51 M0 — shared-git write→worker-execute hardening. git has several config keys
 // whose value is run as a COMMAND during ordinary (even non-credentialed) operations. A
@@ -125,6 +129,9 @@ const GIT_CODE_EXEC_KEY_PINS: ReadonlyArray<readonly [key: string, value: string
 ];
 
 const GIT_TIMEOUT_MS = 10 * 60_000; // 10m — clones can be large on cold caches.
+const GIT_MAX_BUFFER = 64 * 1024 * 1024;
+
+export type BoundaryProcessSpawner = (request: BoundaryProcessRequest) => Promise<BoundaryProcessHandle>;
 
 // PRD #400 M4b — byte cap on the review diff a ReviewRunner feeds the reviewer model.
 // A huge diff must not blow the model's context window or the worker's memory, so the
@@ -360,6 +367,7 @@ export class GitCache {
   private readonly runnerRoot: string;
   /** Per-bare-path serialization: git's lockfiles can't take parallel mutations. */
   private readonly locks = new Map<string, Promise<unknown>>();
+  private readonly boundaryProcesses = new AsyncLocalStorage<BoundaryProcessSpawner>();
 
   constructor(
     dataDir: string,
@@ -370,6 +378,13 @@ export class GitCache {
   ) {
     this.reposRoot = path.join(dataDir, "repos");
     this.runnerRoot = path.join(dataDir, "runner");
+  }
+
+  /** Scope every subprocess created by `action` to the permit-bound supervisor
+   * spawner. AsyncLocalStorage keeps concurrent runs isolated while leaving every
+   * non-Codex call on the literal legacy child_process path. */
+  withBoundaryProcessSpawner<T>(spawner: BoundaryProcessSpawner, action: () => Promise<T>): Promise<T> {
+    return this.boundaryProcesses.run(spawner, action);
   }
 
   barePathFor(repoUrl: string): string {
@@ -552,8 +567,9 @@ export class GitCache {
       // The clone's parent dir. Under the M4 split it must be group-`runner`-writable so
       // the runner-uid `git clone` can create <key> inside it: /data/runner is
       // worker:runner 2775 (setgid) from the entrypoint, and the worker runs with umask
-      // 002 (main.ts), so this mkdir is 2775 group `runner` — the runner (a `runner`-group
-      // member) can then create its clone here. Single-uid (#58): plain worker dir.
+      // 002 (main.ts), so this mkdir is 2775 group `runner` — the runner creates the
+      // clone and the isolated runner-cmd identity can write it through the same group.
+      // Single-uid (#58): plain worker dir.
       await fs.mkdir(path.dirname(clonePath), { recursive: true });
 
       // Resolve the base commit in the BARE (authoritative), per the PRD #218 M2 table
@@ -1414,7 +1430,7 @@ export class GitCache {
     // same floor either way, so the default's workflow blobs (reachable from the floor on the
     // not-pushed leg) are not re-shipped.
     const wanted = wantRev === realTip ? trackingRef : wantRev;
-    const { stdout } = this.spawnGit(
+    const { stdout } = await this.spawnGit(
       barePath,
       ["pack-objects", "--revs", "--stdout"],
       `${wanted}\n^${excludeRef}\n`,
@@ -1877,14 +1893,14 @@ export class GitCache {
       let execOk = true;
       let stderr = "";
       try {
-        const res = await execFileAsync("gitleaks", args, {
+        const res = await this.execScoped("gitleaks", args, {
           // gitEnv(): the hardened REPLACEMENT env (no join token / API URL, plus the
           // core.hooksPath / GIT_CONFIG_NOSYSTEM / global=/dev/null pins), so gitleaks'
           // internal `git -C … log -p` runs WITHOUT worker credentials in its environment and
           // cannot fire a planted hook or read a system/global config as the worker uid. gitEnv
           // carries PATH+HOME (+TMPDIR), so gitleaks itself still runs; it needs no secret env.
           env: gitEnv(),
-          maxBuffer: 64 * 1024 * 1024,
+          maxBuffer: GIT_MAX_BUFFER,
           timeout: GIT_TIMEOUT_MS,
         });
         stderr = res.stderr ?? "";
@@ -2410,15 +2426,74 @@ export class GitCache {
 
   // --- git subprocess plumbing -------------------------------------------------
 
+  private async execScoped(
+    command: string,
+    args: string[],
+    options: { env: NodeJS.ProcessEnv; timeout?: number; maxBuffer?: number; cwd?: string },
+    identity: BoundaryProcessRequest["identity"] = "worker_pat",
+  ): Promise<{ stdout: string; stderr: string }> {
+    const boundary = this.boundaryProcesses.getStore();
+    if (!boundary) {
+      const result = await execFileAsync(command, args, options);
+      return { stdout: String(result.stdout), stderr: String(result.stderr) };
+    }
+    const cwd = options.cwd ?? (identity === "command" ? commandCwd(args) : "/");
+    const executable = resolveBoundaryExecutable(command);
+    const process = await boundary({ argv: [executable, ...args], cwd, env: options.env, identity });
+    process.stdin?.end();
+    const cap = options.maxBuffer ?? GIT_MAX_BUFFER;
+    const collect = (stream: Readable | null): Promise<{ chunks: Buffer[]; oversized: boolean }> =>
+      new Promise((resolve, reject) => {
+        if (!stream) { resolve({ chunks: [], oversized: false }); return; }
+        const chunks: Buffer[] = [];
+        let bytes = 0;
+        let oversized = false;
+        stream.on("data", (chunk: Buffer | string) => {
+          const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+          if (oversized) return;
+          const remaining = cap - bytes;
+          if (buf.length > remaining) {
+            if (remaining > 0) chunks.push(buf.subarray(0, remaining));
+            oversized = true;
+            bytes = cap;
+            return;
+          }
+          chunks.push(buf);
+          bytes += buf.length;
+        });
+        stream.once("end", () => resolve({ chunks, oversized }));
+        stream.once("error", reject);
+      });
+    const [stdout, stderr, terminal] = await Promise.all([
+      collect(process.stdout),
+      collect(process.stderr),
+      process.completed,
+    ]);
+    const out = Buffer.concat(stdout.chunks).toString();
+    const err = Buffer.concat(stderr.chunks).toString();
+    if (stdout.oversized || stderr.oversized || terminal.code !== 0) {
+      const failure = new Error(
+        stdout.oversized || stderr.oversized
+          ? `subprocess output exceeded ${cap} bytes`
+          : `subprocess exited ${terminal.code}`,
+      ) as Error & { code?: number; stdout?: string; stderr?: string };
+      failure.code = terminal.code;
+      failure.stdout = out;
+      failure.stderr = err;
+      throw failure;
+    }
+    return { stdout: out, stderr: err };
+  }
+
   private async runGit(cwd: string | undefined, args: string[], pat?: string, scope?: string, username?: string): Promise<string> {
     const env = gitEnv(pat, scope, username);
     // Log args only; the PAT lives in env (GIT_CONFIG_VALUE_n), never in args.
     this.log.debug("git", { cwd, args });
     try {
-      const { stdout } = await execFileAsync("git", withDir(cwd, args), {
+      const { stdout } = await this.execScoped("git", withDir(cwd, args), {
         env,
         timeout: GIT_TIMEOUT_MS,
-        maxBuffer: 64 * 1024 * 1024,
+        maxBuffer: GIT_MAX_BUFFER,
       });
       return stdout;
     } catch (err) {
@@ -2442,10 +2517,10 @@ export class GitCache {
     const env = { ...gitEnv(), ...extraEnv };
     this.log.debug("git (env)", { cwd, args });
     try {
-      const { stdout } = await execFileAsync("git", withDir(cwd, args), {
+      const { stdout } = await this.execScoped("git", withDir(cwd, args), {
         env,
         timeout: GIT_TIMEOUT_MS,
-        maxBuffer: 64 * 1024 * 1024,
+        maxBuffer: GIT_MAX_BUFFER,
       });
       return stdout;
     } catch (err) {
@@ -2464,13 +2539,35 @@ export class GitCache {
    * consumer streaming it (the publish upload) sees the failure and the caller's best-effort
    * `.catch` fires rather than a truncated pack landing silently.
    */
-  private spawnGit(
+  private async spawnGit(
     cwd: string,
     args: string[],
     stdin?: string,
-  ): { child: ChildProcess; stdout: Readable } {
+  ): Promise<{ child?: ChildProcess; stdout: Readable }> {
     const env = gitEnv();
     this.log.debug("git (spawn)", { cwd, args });
+    const boundary = this.boundaryProcesses.getStore();
+    if (boundary) {
+      const process = await boundary({ argv: [GIT_BIN, ...withDir(cwd, args)], cwd, env, identity: "worker_pat" });
+      if (!process.stdout) throw new Error("supervised git process has no stdout");
+      const stderrChunks: Buffer[] = [];
+      let stderrBytes = 0;
+      process.stderr?.on("data", (c: Buffer | string) => {
+        if (stderrBytes >= GIT_MAX_BUFFER) return;
+        const chunk = Buffer.isBuffer(c) ? c : Buffer.from(c);
+        const kept = chunk.subarray(0, GIT_MAX_BUFFER - stderrBytes);
+        stderrChunks.push(kept);
+        stderrBytes += kept.length;
+      });
+      process.completed.then(({ code }) => {
+        if (code !== 0) {
+          const detail = Buffer.concat(stderrChunks).subarray(0, GIT_MAX_BUFFER).toString().trim();
+          process.stdout?.destroy(new Error(`git ${args.join(" ")} exited ${code}${detail ? `: ${detail}` : ""}`));
+        }
+      }, (error: unknown) => process.stdout?.destroy(error instanceof Error ? error : new Error(String(error))));
+      process.stdin?.end(stdin ?? "");
+      return { stdout: process.stdout };
+    }
     const child = spawn("git", withDir(cwd, args), { env });
     const stderrChunks: Buffer[] = [];
     child.stderr?.on("data", (c: Buffer) => stderrChunks.push(c));
@@ -2500,14 +2597,19 @@ export class GitCache {
     const env: NodeJS.ProcessEnv = { ...base, PATH: runnerPath() };
     const tmp = runnerTmpdir();
     if (tmp) env.TMPDIR = tmp;
-    const wrapped = runnerCommand("git", withDir(cwd, args));
+    // A permit-scoped subprocess is already launched as the isolated command uid
+    // by Codex safety. Applying the legacy setpriv-to-runner wrapper inside that
+    // cap-less uid would fail (and would try to cross identities twice).
+    const wrapped = this.boundaryProcesses.getStore()
+      ? { command: GIT_BIN, args: withDir(cwd, args) }
+      : runnerCommand("git", withDir(cwd, args));
     this.log.debug("git (runner uid)", { cwd, args });
     try {
-      const { stdout } = await execFileAsync(wrapped.command, wrapped.args, {
+      const { stdout } = await this.execScoped(wrapped.command, wrapped.args, {
         env,
         timeout: GIT_TIMEOUT_MS,
-        maxBuffer: 64 * 1024 * 1024,
-      });
+        maxBuffer: GIT_MAX_BUFFER,
+      }, "command");
       return stdout;
     } catch (err) {
       // Preserve git's numeric exit code on the wrapped error so a caller can discriminate
@@ -2523,7 +2625,7 @@ export class GitCache {
   /** Run git, returning the exit code (0 on success) instead of throwing. */
   private async tryGit(cwd: string | undefined, args: string[], pat?: string): Promise<number> {
     try {
-      await execFileAsync("git", withDir(cwd, args), { env: gitEnv(pat), timeout: GIT_TIMEOUT_MS });
+      await this.execScoped("git", withDir(cwd, args), { env: gitEnv(pat), timeout: GIT_TIMEOUT_MS });
       return 0;
     } catch (err) {
       const code = (err as { code?: unknown }).code;
@@ -2564,7 +2666,7 @@ export class GitCache {
 
   private async tryGitStdout(cwd: string | undefined, args: string[]): Promise<string> {
     try {
-      const { stdout } = await execFileAsync("git", withDir(cwd, args), { env: gitEnv(), timeout: GIT_TIMEOUT_MS });
+      const { stdout } = await this.execScoped("git", withDir(cwd, args), { env: gitEnv(), timeout: GIT_TIMEOUT_MS });
       return stdout.trim();
     } catch {
       return "";
@@ -2584,6 +2686,22 @@ export class GitCache {
 
 function withDir(cwd: string | undefined, args: string[]): string[] {
   return cwd ? ["-C", cwd, ...args] : args;
+}
+
+function commandCwd(args: readonly string[]): string {
+  const at = args.indexOf("-C");
+  const cwd = at >= 0 ? args[at + 1] : undefined;
+  if (!cwd || !path.isAbsolute(cwd)) {
+    throw new Error("permit-held runner git requires an absolute -C worktree");
+  }
+  return cwd;
+}
+
+export function resolveBoundaryExecutable(command: string): string {
+  if (command === "git") return GIT_BIN;
+  if (command === "gitleaks") return GITLEAKS_BIN;
+  if (path.isAbsolute(command)) return command;
+  throw new Error("permit-held subprocess executable is not a trusted absolute path");
 }
 
 /** The git author identity planted on every runner clone (issue #234) and used by the

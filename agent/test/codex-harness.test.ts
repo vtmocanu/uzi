@@ -20,6 +20,10 @@ import { renderCodexRun } from "../src/codex/render.js";
 import type { HarnessEvent, RunTurnRequest } from "../src/harness.js";
 import type { CodexNotification, CodexTransport } from "../src/codex/transport.js";
 import type { Logger } from "../src/log.js";
+import {
+  createCodexAppServerAuth,
+  type CodexAppServerAuthSession,
+} from "../src/codex/appserver-auth.js";
 
 // PRD #1171 (M3, milestone 3) — the Codex run-harness core, driven with an in-memory
 // transport and scripted app-server frames (NO real Codex process). Every external
@@ -64,6 +68,14 @@ function defaultResponder(method: string): unknown {
   return {};
 }
 
+function authResponder(method: string, params: unknown): unknown {
+  if (method === "initialize") {
+    return { userAgent: "codex/0.153.2", codexHome: "/owned/codex", platformFamily: "unix", platformOs: "linux" };
+  }
+  if (method === "account/login/start") return { type: rec(params).type };
+  return defaultResponder(method);
+}
+
 /** A scriptable in-memory {@link CodexTransport}: request/respond/notify calls are
  *  captured, requests answer from an injected responder, and `notifications()` drains a
  *  queue the test pre-loads via {@link FakeTransport.push} / {@link FakeTransport.end}. */
@@ -79,6 +91,9 @@ class FakeTransport implements CodexTransport {
   private waiter: ((r: IteratorResult<CodexNotification>) => void) | undefined;
   private consumed = false;
   private closedFlag = false;
+  private interceptor?: (note: CodexNotification, frameBytes: number) => boolean;
+  onRespond?: (requestId: number | string, response: unknown) => void;
+  onClose?: () => void;
 
   constructor(private readonly responder: (method: string, params: unknown) => unknown = defaultResponder) {}
 
@@ -91,6 +106,14 @@ class FakeTransport implements CodexTransport {
       this.queue.push(note);
     }
     return this;
+  }
+
+  emitServerRequest(note: CodexNotification): boolean {
+    const requestId = note.kind === "activity" ? note.requestId : undefined;
+    const frameBytes = Buffer.byteLength(JSON.stringify({ id: requestId, method: note.method, params: note.params }), "utf8");
+    if (this.interceptor?.(note, frameBytes)) return true;
+    this.push(note);
+    return false;
   }
 
   end(): this {
@@ -121,6 +144,15 @@ class FakeTransport implements CodexTransport {
     // reply that settles after the turn is torn down exercises routeToolCall's guard.
     if (this.closedFlag) throw new Error("codex transport is closed");
     this.responses.push({ requestId, response });
+    this.onRespond?.(requestId, response);
+  }
+
+  installServerRequestInterceptor(interceptor: (note: CodexNotification, frameBytes: number) => boolean): () => void {
+    if (this.interceptor !== undefined) throw new Error("interceptor already installed");
+    this.interceptor = interceptor;
+    return () => {
+      if (this.interceptor === interceptor) this.interceptor = undefined;
+    };
   }
 
   notifications(): AsyncIterableIterator<CodexNotification> {
@@ -151,6 +183,7 @@ class FakeTransport implements CodexTransport {
   close(): Promise<void> {
     this.closes += 1;
     this.closedFlag = true;
+    this.onClose?.();
     return Promise.resolve();
   }
 }
@@ -243,6 +276,7 @@ function makeHarness(
     broker?: CodexCallbackBroker;
     launchRoot?: LaunchRootSeam;
     sessionInspect?: SessionInspectSeam;
+    appServerAuth?: CodexAppServerAuthSession;
     credentialValue?: string;
   } = {},
 ): HarnessBits {
@@ -259,6 +293,7 @@ function makeHarness(
     homeDir: "/work/.codex-state",
     log: noopLog,
     sessionInspect: opts.sessionInspect ?? (async () => "unknown"),
+    appServerAuth: opts.appServerAuth,
     credentialValue: opts.credentialValue,
   });
   return { harness, transport, registry };
@@ -316,6 +351,268 @@ describe("CodexHarness: kind + thread configuration", () => {
   it("advertises kind codex", () => {
     const { harness } = makeHarness();
     assert.equal(harness.kind, "codex");
+  });
+
+  it("authenticates before thread/model work and routes refresh outside the model broker", async () => {
+    let brokerCalls = 0;
+    const appServerAuth = createCodexAppServerAuth({
+      mode: "subscription",
+      initial: { accessToken: "initial-access", accountId: "server-account" },
+      bridge: {
+        refresh: async () => ({ accessToken: "next-access", accountId: "server-account" }),
+      },
+    });
+    const transport = new FakeTransport(authResponder);
+    const { harness } = makeHarness({
+      transport,
+      appServerAuth,
+      broker: stubBroker(async () => {
+        brokerCalls += 1;
+        return { ok: true, output: {} };
+      }),
+    });
+    transport
+      .push(threadStarted())
+      .push({
+        kind: "activity",
+        method: "account/chatgptAuthTokens/refresh",
+        requestId: 91,
+        params: { reason: "unauthorized", previousAccountId: "hint-only" },
+      })
+      .push(turnCompleted())
+      .end();
+
+    await collect(harness.startTurn(makeRequest()).events);
+
+    assert.deepEqual(transport.requests.map((request) => request.method), [
+      "initialize",
+      "account/login/start",
+      "thread/start",
+      "turn/start",
+    ]);
+    assert.deepEqual(transport.notifies, [{ method: "initialized", params: undefined }]);
+    assert.equal(brokerCalls, 0, "the auth callback never enters the model callback broker");
+    assert.deepEqual(transport.responses, [{
+      requestId: 91,
+      response: {
+        result: { accessToken: "next-access", chatgptAccountId: "server-account", chatgptPlanType: null },
+      },
+    }]);
+  });
+
+  it("pumps auth while thread/start is pending, so setup cannot deadlock behind notifications", async () => {
+    let brokerCalls = 0;
+    let resolveThread!: (value: unknown) => void;
+    let transport!: FakeTransport;
+    transport = new FakeTransport((method, params) => {
+      if (method === "thread/start") {
+        const pending = new Promise<unknown>((resolve) => {
+          resolveThread = resolve;
+        });
+        // This request is emitted while thread/start is unresolved. Without the read-path
+        // auth pump it sits behind notifications(), which the harness cannot consume until
+        // thread/start returns: the exact setup deadlock this regression pins.
+        transport.emitServerRequest({
+          kind: "activity",
+          method: "account/chatgptAuthTokens/refresh",
+          requestId: 92,
+          params: { reason: "unauthorized", previousAccountId: "hint-only" },
+        });
+        return pending;
+      }
+      return authResponder(method, params);
+    });
+    transport.onRespond = (requestId) => {
+      if (requestId === 92) resolveThread({ thread: { id: "th-1" } });
+    };
+    const appServerAuth = createCodexAppServerAuth({
+      mode: "subscription",
+      initial: { accessToken: "initial-access", accountId: "server-account" },
+      bridge: {
+        refresh: async () => ({ accessToken: "next-access", accountId: "server-account" }),
+      },
+    });
+    const { harness } = makeHarness({
+      transport,
+      appServerAuth,
+      broker: stubBroker(async () => {
+        brokerCalls += 1;
+        return { ok: true, output: {} };
+      }),
+    });
+    transport.push(threadStarted()).push(turnCompleted()).end();
+
+    const events = await withTimeout(collect(harness.startTurn(makeRequest()).events), 500, "setup auth refresh");
+
+    assert.equal(events.at(-1)?.kind, "turn_finished");
+    assert.equal(brokerCalls, 0, "setup auth never enters the model callback broker");
+    assert.equal(transport.responses.some((response) => response.requestId === 92), true);
+  });
+
+  it("does not publish a same-chunk terminal while an intercepted refresh is held", async () => {
+    let releaseRefresh!: (value: { accessToken: string; accountId: string }) => void;
+    const heldRefresh = new Promise<{ accessToken: string; accountId: string }>((resolve) => {
+      releaseRefresh = resolve;
+    });
+    let brokerCalls = 0;
+    let transport!: FakeTransport;
+    transport = new FakeTransport((method, params) => {
+      if (method === "turn/start") {
+        queueMicrotask(() => {
+          // Same decoder batch ordering: the interceptor owns refresh before terminal is
+          // visible to the consumer. Terminal must drain that owner before publication.
+          transport.emitServerRequest({
+            kind: "activity",
+            method: "account/chatgptAuthTokens/refresh",
+            requestId: 93,
+            params: { reason: "unauthorized", previousAccountId: "hint-only" },
+          });
+          transport.push(turnCompleted());
+        });
+      }
+      return authResponder(method, params);
+    });
+    const appServerAuth = createCodexAppServerAuth({
+      mode: "subscription",
+      initial: { accessToken: "initial-access", accountId: "server-account" },
+      bridge: { refresh: () => heldRefresh },
+    });
+    const { harness } = makeHarness({
+      transport,
+      appServerAuth,
+      broker: stubBroker(async () => {
+        brokerCalls += 1;
+        return { ok: true, output: {} };
+      }),
+    });
+    transport.push(threadStarted());
+
+    let settled = false;
+    const result = collect(harness.startTurn(makeRequest()).events).finally(() => {
+      settled = true;
+    });
+    await tick();
+    await tick();
+    assert.equal(settled, false, "terminal remains withheld while refresh is held");
+    assert.equal(brokerCalls, 0);
+
+    releaseRefresh({ accessToken: "next-access", accountId: "server-account" });
+    const events = await withTimeout(result, 500, "held auth terminal drain");
+    assert.equal(events.at(-1)?.kind, "turn_finished");
+    assert.equal(transport.responses.some((response) => response.requestId === 93), true);
+  });
+
+  it("close cancels and drains accepted intercepted auth before transport teardown", async () => {
+    let bridgeEntered!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      bridgeEntered = resolve;
+    });
+    let bridgeSettled = false;
+    const appServerAuth = createCodexAppServerAuth({
+      mode: "subscription",
+      initial: { accessToken: "initial-access", accountId: "server-account" },
+      bridge: {
+        refresh: ({ signal }) => new Promise((_resolve, reject) => {
+          bridgeEntered();
+          signal.addEventListener("abort", () => {
+            setTimeout(() => {
+              bridgeSettled = true;
+              reject(new Error("cancelled"));
+            }, 20);
+          }, { once: true });
+        }),
+      },
+    });
+    const transport = new FakeTransport(authResponder);
+    const { harness } = makeHarness({ transport, appServerAuth });
+    transport.push(threadStarted());
+    const iterator = harness.startTurn(makeRequest()).events[Symbol.asyncIterator]();
+    await iterator.next();
+
+    transport.emitServerRequest({
+      kind: "activity",
+      method: "account/chatgptAuthTokens/refresh",
+      requestId: 94,
+      params: { reason: "unauthorized", previousAccountId: null },
+    });
+    await entered;
+
+    await harness.close();
+
+    assert.equal(bridgeSettled, true, "close waited for the cancelled bridge to settle");
+    assert.equal(
+      transport.responses.some((response) => response.requestId === 94),
+      false,
+      "transport closes before drain, so shutdown sends no late auth reply",
+    );
+    assert.ok(transport.closes >= 1);
+  });
+
+  it("close breaks a pending-login plus intercepted-refresh ownership cycle", async () => {
+    let rejectLogin!: (error: Error) => void;
+    let markRefreshEmitted!: () => void;
+    const refreshEmitted = new Promise<void>((resolve) => {
+      markRefreshEmitted = resolve;
+    });
+    let bridgeCalls = 0;
+    let brokerCalls = 0;
+    let transport!: FakeTransport;
+    transport = new FakeTransport((method, params) => {
+      if (method === "account/login/start") {
+        queueMicrotask(() => {
+          transport.emitServerRequest({
+            kind: "activity",
+            method: "account/chatgptAuthTokens/refresh",
+            requestId: 95,
+            params: { reason: "unauthorized", previousAccountId: null },
+          });
+          markRefreshEmitted();
+        });
+        return new Promise<never>((_resolve, reject) => {
+          rejectLogin = reject;
+        });
+      }
+      return authResponder(method, params);
+    });
+    transport.onClose = () => rejectLogin(new Error("transport closed"));
+    const appServerAuth = createCodexAppServerAuth({
+      mode: "subscription",
+      initial: { accessToken: "initial-access", accountId: "server-account" },
+      bridge: {
+        refresh: async () => {
+          bridgeCalls += 1;
+          return { accessToken: "unused", accountId: "unused" };
+        },
+      },
+    });
+    const { harness } = makeHarness({
+      transport,
+      appServerAuth,
+      broker: stubBroker(async () => {
+        brokerCalls += 1;
+        return { ok: true, output: {} };
+      }),
+    });
+    const iterator = harness.startTurn(makeRequest()).events[Symbol.asyncIterator]();
+    const pendingSetup = iterator.next();
+    void pendingSetup.catch(() => {});
+    await refreshEmitted;
+
+    await withTimeout(harness.close(), 500, "pending-login auth close");
+    await assert.rejects(pendingSetup, /authentication startup failed/);
+    await withTimeout(appServerAuth.drainInterceptedRequests(), 50, "post-close auth drain");
+
+    assert.equal(bridgeCalls, 0, "refresh never crosses the unvalidated login boundary");
+    assert.equal(brokerCalls, 0);
+    assert.ok(transport.closes >= 1);
+  });
+
+  it("rejects simultaneous env credential and app-server auth instead of choosing a fallback", () => {
+    const appServerAuth = createCodexAppServerAuth({ mode: "api_key", apiKey: "test-key" });
+    assert.throws(
+      () => makeHarness({ appServerAuth, credentialValue: "other-key" }),
+      /conflicting authentication inputs/,
+    );
   });
 
   it("thread/start carries an EXPLICIT untrusted project + doc_max_bytes 0 and NEVER a hook-trust bypass", async () => {

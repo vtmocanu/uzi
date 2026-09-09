@@ -1,9 +1,11 @@
 package handler
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -15,7 +17,7 @@ import (
 // Codex worker credential-operation routes (PRD #1171 M1), ships DARK. These are the
 // Bearer-only worker→API bridge over the coordinated-refresh service half (codexrefresh.go):
 //
-//	POST /worker/runs/{id}/codex/release  → ReleaseCodexAccessToken (both auth modes)
+//	POST /worker/runs/{id}/codex/release  → ReleaseCodexCredential (both auth modes)
 //	POST /worker/runs/{id}/codex/refresh  → CoordinatedCodexRefresh (subscription only)
 //
 // Trust-boundary rules, all fail-closed (PRD #1171 M1 §5, mirroring worker_forge.go):
@@ -23,7 +25,8 @@ import (
 //   - The path {id} is the SOLE run identity. The worker is authenticated by its Bearer
 //     join token (RequireWorker mounts these under /worker), and the service derives the
 //     account/credential from the OWNED run binding alone — never from the body.
-//   - Request bodies are STRICT-decoded (httpx.DecodeJSON rejects unknown fields) and
+//   - Request bodies are STRICT-decoded (httpx.DecodeJSONStrict rejects unknown fields
+//     and a trailing second JSON value) and
 //     carry ONLY capability / operation_id / observed_generation. A body that names a run
 //     id (run_id/id), a user/secret/account id, or any token/login field is an UNKNOWN
 //     field to these structs, so the strict decode rejects it with a 400 before the
@@ -50,18 +53,40 @@ const (
 	codexErrInternal           = "codex operation failed"
 )
 
+// codexWorkerOperationTimeout is the server-side slice of pinned app-server's fixed
+// 10-second external-auth callback budget. The worker caps this HTTP round trip at 8s;
+// finishing API work within 7.5s reserves 500ms for response delivery and 2.5s at the
+// callback layer. The coordinated refresh lease is shorter still (7s), and its two serial
+// provider calls are capped at 3s each, leaving durable-commit margin.
+const codexWorkerOperationTimeout = 7500 * time.Millisecond
+
+// maxCodexRefreshObservedGeneration is the largest JSON integer the TypeScript worker can
+// represent exactly. It cannot be used as an observed refresh generation because an
+// advanced response must be observed+1, which would leave the safe-integer domain.
+const maxCodexRefreshObservedGeneration = int64(1<<53 - 1)
+
 // codexReleaseRequest is the STRICT body of POST /worker/runs/{id}/codex/release. It
 // carries ONLY the run-scoped capability — the run id is the path, never the body.
 type codexReleaseRequest struct {
 	Capability string `json:"capability"`
 }
 
-// codexReleaseResponse releases ONLY the currently-committed access token. The auth mode
-// and generation the worker needs already rode the claim (ClaimCodexSecrets); the release
-// is a re-fetch of the committed token for a fresh provider root, and the service method
-// (ReleaseCodexAccessToken) returns only the token, so this is the minimal secret-bearing
-// body. It is Cache-Control: no-store.
-type codexReleaseResponse struct {
+// codexSubscriptionResponse is the server-owned authentication input for pinned
+// app-server's chatgptAuthTokens mode. ChatGPTPlanType is deliberately nil and has no
+// omitempty tag, so subscription emits chatgpt_plan_type:null. ChatGPTAccountID comes from
+// verified provider identity, never app-server's untrusted previousAccountId hint.
+type codexSubscriptionResponse struct {
+	AuthMode         string  `json:"auth_mode"`
+	AccessToken      string  `json:"access_token"`
+	Generation       int64   `json:"generation"`
+	ChatGPTAccountID string  `json:"chatgpt_account_id"`
+	ChatGPTPlanType  *string `json:"chatgpt_plan_type"`
+}
+
+// codexAPIKeyResponse is intentionally a separate wire shape. An API-key result contains
+// no subscription generation/account/plan fields, including no null placeholders.
+type codexAPIKeyResponse struct {
+	AuthMode    string `json:"auth_mode"`
 	AccessToken string `json:"access_token"`
 }
 
@@ -73,7 +98,7 @@ type codexReleaseResponse struct {
 type codexRefreshRequest struct {
 	Capability         string `json:"capability"`
 	OperationID        string `json:"operation_id"`
-	ObservedGeneration int64  `json:"observed_generation"`
+	ObservedGeneration *int64 `json:"observed_generation"`
 }
 
 // codexRefreshResponse releases the freshly-committed access token plus the minimal
@@ -82,9 +107,12 @@ type codexRefreshRequest struct {
 // reconciled); a contended/quarantined outcome rides an HTTP error and no body. It is
 // Cache-Control: no-store.
 type codexRefreshResponse struct {
-	AccessToken string `json:"access_token"`
-	Generation  int64  `json:"generation"`
-	Outcome     string `json:"outcome"`
+	AuthMode         string  `json:"auth_mode"`
+	AccessToken      string  `json:"access_token"`
+	Generation       int64   `json:"generation"`
+	ChatGPTAccountID string  `json:"chatgpt_account_id"`
+	ChatGPTPlanType  *string `json:"chatgpt_plan_type"`
+	Outcome          string  `json:"outcome"`
 }
 
 // WorkerCodexRelease releases the run's currently-committed Codex access token to the
@@ -105,14 +133,7 @@ func (h *Handler) WorkerCodexRelease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req codexReleaseRequest
-	if err := httpx.DecodeJSON(r, &req); err != nil {
-		// Strict decode: httpx.DecodeJSON DisallowUnknownFields on the single decoded body,
-		// so malformed JSON OR any unknown field (a body-supplied run id, user/secret/account
-		// id, or token/login field) fails closed as 400 here. It does NOT reject a trailing
-		// value after the first, but a trailing value is simply not decoded — it cannot
-		// smuggle a run id or credential field into req, because only the first value is
-		// decoded and that value's unknown fields are already rejected. The path {id} remains
-		// the sole run identity regardless.
+	if err := httpx.DecodeJSONStrict(r, &req); err != nil {
 		httpx.Error(w, http.StatusBadRequest, codexErrInvalid)
 		return
 	}
@@ -121,12 +142,38 @@ func (h *Handler) WorkerCodexRelease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token, err := h.wsvc.ReleaseCodexAccessToken(r.Context(), wkr, runID, req.Capability)
+	ctx, cancel := context.WithTimeout(r.Context(), codexWorkerOperationTimeout)
+	defer cancel()
+	result, err := h.wsvc.ReleaseCodexCredential(ctx, wkr, runID, req.Capability)
 	if err != nil {
 		h.writeCodexError(w, "release", err)
 		return
 	}
-	httpx.JSON(w, http.StatusOK, codexReleaseResponse{AccessToken: token})
+	switch result.AuthMode {
+	case "subscription":
+		if result.Generation == nil || result.ChatGPTAccountID == "" {
+			h.writeCodexError(w, "release", errors.New("codex subscription release metadata missing"))
+			return
+		}
+		httpx.JSON(w, http.StatusOK, codexSubscriptionResponse{
+			AuthMode:         result.AuthMode,
+			AccessToken:      result.AccessToken,
+			Generation:       *result.Generation,
+			ChatGPTAccountID: result.ChatGPTAccountID,
+			ChatGPTPlanType:  nil,
+		})
+	case "api_key":
+		if result.Generation != nil || result.ChatGPTAccountID != "" {
+			h.writeCodexError(w, "release", errors.New("codex api_key release carried subscription metadata"))
+			return
+		}
+		httpx.JSON(w, http.StatusOK, codexAPIKeyResponse{
+			AuthMode:    result.AuthMode,
+			AccessToken: result.AccessToken,
+		})
+	default:
+		h.writeCodexError(w, "release", errors.New("codex release auth mode invalid"))
+	}
 }
 
 // WorkerCodexRefresh runs the coordinated subscription refresh for the owning worker and
@@ -146,11 +193,12 @@ func (h *Handler) WorkerCodexRefresh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req codexRefreshRequest
-	if err := httpx.DecodeJSON(r, &req); err != nil {
+	if err := httpx.DecodeJSONStrict(r, &req); err != nil {
 		httpx.Error(w, http.StatusBadRequest, codexErrInvalid)
 		return
 	}
-	if req.Capability == "" {
+	if req.Capability == "" || req.ObservedGeneration == nil ||
+		*req.ObservedGeneration < 0 || *req.ObservedGeneration >= maxCodexRefreshObservedGeneration {
 		httpx.Error(w, http.StatusBadRequest, codexErrInvalid)
 		return
 	}
@@ -162,15 +210,24 @@ func (h *Handler) WorkerCodexRefresh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	res, err := h.wsvc.CoordinatedCodexRefresh(r.Context(), wkr, runID, req.Capability, opID, req.ObservedGeneration)
+	ctx, cancel := context.WithTimeout(r.Context(), codexWorkerOperationTimeout)
+	defer cancel()
+	res, err := h.wsvc.CoordinatedCodexRefresh(ctx, wkr, runID, req.Capability, opID, *req.ObservedGeneration)
 	if err != nil {
 		h.writeCodexError(w, "refresh", err)
 		return
 	}
+	if res.Generation < 0 || res.ChatGPTAccountID == "" {
+		h.writeCodexError(w, "refresh", errors.New("codex subscription refresh metadata missing"))
+		return
+	}
 	httpx.JSON(w, http.StatusOK, codexRefreshResponse{
-		AccessToken: res.AccessToken,
-		Generation:  res.Generation,
-		Outcome:     codexRefreshOutcomeString(res.Outcome),
+		AuthMode:         "subscription",
+		AccessToken:      res.AccessToken,
+		Generation:       res.Generation,
+		ChatGPTAccountID: res.ChatGPTAccountID,
+		ChatGPTPlanType:  nil,
+		Outcome:          codexRefreshOutcomeString(res.Outcome),
 	})
 }
 

@@ -1,5 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { PassThrough } from "node:stream";
 
 import {
   CodexBoundaryError,
@@ -83,6 +84,68 @@ function spawnCounter(
 }
 
 describe("CodexExecutionSafety.withBoundary: gate ordering", () => {
+  it("uses one absolute deadline and passes a shrinking remaining budget across stages", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(12));
+    const seen: number[] = [];
+    const safety = new CodexExecutionSafetyImpl(reg, {
+      quiesce: async (request) => {
+        seen.push(request.deadlineMs);
+        await new Promise<void>((resolve) => setTimeout(resolve, 20));
+        return { kind: "quiescent", epoch: 12 };
+      },
+      reap: async (request) => {
+        seen.push(request.deadlineMs);
+        return { kind: "observed_empty", evidence: "supervisor_echild", epoch: 12 };
+      },
+      dispose: async () => ({ kind: "disposed" }),
+      spawnRoot: spawnCounter().seam,
+    });
+    await safety.withBoundary({ boundary: "finalize", deadlineMs: 100 }, async () => undefined);
+    assert.equal(seen.length, 2);
+    assert.ok((seen[0] ?? 0) <= 100 && (seen[0] ?? 0) > 0);
+    assert.ok((seen[1] ?? 0) < (seen[0] ?? 0) - 10, `remaining budgets shrink: ${seen.join(" -> ")}`);
+  });
+
+  it("propagates the same deadline AbortSignal into reconciliation", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(13));
+    let reconcileSignal: AbortSignal | undefined;
+    const safety = createCodexExecutionSafety(
+      reg,
+      spawnCounter().seam,
+      async (_request, signal) => {
+        reconcileSignal = signal;
+        await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+        return { kind: "blocked", errors: [{ category: "timeout", message: "reconcile cancelled at boundary deadline" }] };
+      },
+    );
+    const started = Date.now();
+    await assert.rejects(
+      safety.withBoundary({ boundary: "shutdown", deadlineMs: 25 }, async () => undefined),
+      (error: unknown) => error instanceof CodexBoundaryError && error.stage === "reconcile",
+    );
+    assert.equal(reconcileSignal?.aborted, true);
+    assert.ok(Date.now() - started < 100, "reconciliation used the boundary deadline, not its own full timeout");
+  });
+
+  it("a clean quiesce that settles after expiry still blocks permit mint and action", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(14));
+    let actionCalls = 0;
+    const safety = new CodexExecutionSafetyImpl(reg, {
+      quiesce: async () => {
+        await new Promise<void>((resolve) => setTimeout(resolve, 30));
+        return { kind: "quiescent", epoch: 14 };
+      },
+      reap: async () => ({ kind: "observed_empty", evidence: "supervisor_echild", epoch: 14 }),
+      dispose: async () => ({ kind: "disposed" }),
+      spawnRoot: spawnCounter().seam,
+    });
+    await assert.rejects(
+      safety.withBoundary({ boundary: "shutdown", deadlineMs: 15 }, async () => { actionCalls += 1; }),
+      (error: unknown) => error instanceof CodexBoundaryError && error.stage === "quiesce",
+    );
+    assert.equal(actionCalls, 0, "a late clean result cannot mint a permit after the deadline");
+  });
+
   it("quiesces, reaps, then mints a matching-epoch permit and runs the action", async () => {
     const reg = new ExecutionRegistry(newLocalExecutionEpoch(11));
     const safety = createCodexExecutionSafety(reg, spawnCounter().seam);
@@ -155,6 +218,28 @@ describe("CodexExecutionSafety.withBoundary: gate ordering", () => {
 });
 
 describe("CodexExecutionSafety.withBoundary: serialized overlapping boundaries", () => {
+  it("charges queue wait to the same deadline and never runs an action whose budget expired", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(20));
+    const safety = createCodexExecutionSafety(reg, spawnCounter().seam);
+    const releaseFirst = defer<void>();
+    const first = safety.withBoundary({ boundary: "checkpoint", deadlineMs: 100 }, async () => {
+      await releaseFirst.promise;
+    });
+    await tick();
+    let secondRan = false;
+    const second = safety.withBoundary({ boundary: "shutdown", deadlineMs: 10 }, async () => {
+      secondRan = true;
+    });
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+    releaseFirst.resolve();
+    await first;
+    await assert.rejects(
+      second,
+      (error: unknown) => error instanceof CodexBoundaryError && error.stage === "quiesce",
+    );
+    assert.equal(secondRan, false);
+  });
+
   it("does not begin a second boundary until the first fully releases", async () => {
     const reg = new ExecutionRegistry(newLocalExecutionEpoch(1));
     const events: string[] = [];
@@ -366,6 +451,75 @@ describe("CodexExecutionSafety.spawnBoundaryAction: boundary-action lane", () =>
     assert.equal(outcome?.kind, "refused");
     if (outcome?.kind === "refused") assert.equal(outcome.reason, "stale_permit");
     assert.equal(spawnState.calls, 0);
+  });
+});
+
+describe("CodexExecutionSafety.spawnBoundaryProcess: permit-owned subprocesses", () => {
+  it("reserves before spawn, registers, and holds the permit until the whole root reaps", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(9));
+    const exited = defer<{ code: number }>();
+    let reservationSeen = false;
+    let reaps = 0;
+    const safety = createCodexExecutionSafety(
+      reg,
+      spawnCounter().seam,
+      undefined,
+      undefined,
+      async () => {
+        reservationSeen = reg.pendingLaunchCount() === 1;
+        return {
+          root: new FakeRoot("boundary_action", async () => { reaps += 1; return { ok: true }; }),
+          stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(),
+          waitChild: async () => exited.promise,
+        };
+      },
+    );
+    let boundarySettled = false;
+    const p = safety.withBoundary(req("finalize"), async (permit) => {
+      const process = await safety.spawnBoundaryProcess(permit, {
+        argv: ["/usr/bin/git", "status"], cwd: "/tmp", env: {}, identity: "worker_pat",
+      });
+      void process.completed;
+    }).then(() => { boundarySettled = true; });
+    await tick();
+    assert.equal(reservationSeen, true, "the launch reservation exists before the spawn seam runs");
+    assert.equal(boundarySettled, false, "a fire-and-forget child still holds the permit");
+    exited.resolve({ code: 0 });
+    await p;
+    assert.equal(reaps, 1, "the registered boundary root reaped before permit release");
+  });
+
+  it("deadline abort still awaits root reap and poisons instead of abandoning the action", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(10));
+    let reaped = false;
+    let reapBudget = -1;
+    const safety = createCodexExecutionSafety(
+      reg,
+      spawnCounter().seam,
+      undefined,
+      undefined,
+      async () => ({
+        root: new FakeRoot("boundary_action", async (deadlineMs) => {
+          reaped = true;
+          reapBudget = deadlineMs;
+          return { ok: true };
+        }),
+        stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(),
+        waitChild: async () => new Promise<{ code: number }>(() => undefined),
+      }),
+    );
+    await assert.rejects(
+      safety.withBoundary({ boundary: "shutdown", deadlineMs: 20 }, async (permit) => {
+        const process = await safety.spawnBoundaryProcess(permit, {
+          argv: ["/bin/sleep", "forever"], cwd: "/tmp", env: {}, identity: "worker_pat",
+        });
+        await process.completed;
+      }),
+      CodexBoundaryError,
+    );
+    assert.equal(reaped, true, "deadline cancellation reaped before withBoundary rejected");
+    assert.ok(reapBudget <= 2, `action-root reap received only the remaining budget (${reapBudget}ms)`);
+    assert.equal(reg.isPoisoned(), true, "a timed-out permit-held process poisons publication");
   });
 });
 

@@ -1,11 +1,10 @@
 // PRD #1156 (M3a) — the isolated per-root Codex launch primitive.
 //
-// This is the reusable library the FUTURE worker adapter (and the m3a lifecycle
+// This is the reusable library the production worker adapter (and the m3a lifecycle
 // test) calls to launch ONE supervisor root: a static Go supervisor
 // (`/usr/local/bin/uzi-codex-supervisor`, built by a sibling unit) which forks the
 // pinned Codex app-server (`/opt/uzi-codex/0.153.2/bin/codex app-server`). It
-// composes the UNCHANGED worker→runner uid boundary in `runner-uid.ts`
-// (`runnerCommand` / `uidSplitActive`) — this file edits none of those helpers.
+// composes the worker→runner/runner-cmd uid boundaries in `runner-uid.ts`.
 //
 // SUPPORTED PROFILE (fail-closed): this primitive is supported ONLY under the A1
 // uid-split (a trusted controller at the worker uid, an untrusted runner at a
@@ -17,7 +16,7 @@
 // launcher side to match; we invent no fields):
 //   control  → fd3 (we WRITE): {"op":"snapshot","id"} / {"op":"dispose","id","timeoutMs"}
 //   evidence ← fd4 (we READ):  started / snapshot / dispose(drained|unconfirmed) / abnormal
-//   argv: <supervisor> --expect-uid <N> -- <codexBin> <childArgv...>   (launcher-fixed)
+//   argv: <supervisor> --expect-uid <N> [--cleanup-token <uuid>] -- <child> <argv...>
 //   stdio: [pipe0, pipe1, pipe2, pipe3=control, pipe4=evidence]; 0/1/2 are the
 //          app-server TRANSPORT the child inherits — exposed on the handle so a
 //          caller speaks app-server JSONL RPC over them.
@@ -35,7 +34,14 @@ import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
 import type { Readable, Writable } from "node:stream";
 
-import { runnerCommand, uidSplitActive } from "../runner-uid.js";
+import {
+  COMMAND_UID,
+  WORKER_UID,
+  commandRootCommand,
+  runnerCommand,
+  uidSplitActive,
+  workerBoundaryCommand,
+} from "../runner-uid.js";
 import {
   assertNoUnexpectedSystemConfig as defaultAssertNoUnexpectedSystemConfig,
   buildCodexConfigToml,
@@ -100,6 +106,7 @@ export interface CodexLaunchSpec {
  *  the runner uid (setpriv). Injectable so unit tests fake it (no setpriv/root). */
 export interface RunnerTreeRequest {
   readonly uid: number;
+  readonly kind: CodexRootKind;
   readonly root: string;
   readonly dirs: readonly string[];
   readonly files: readonly { readonly path: string; readonly content: string; readonly mode: number }[];
@@ -137,6 +144,8 @@ export interface LauncherDeps {
   readonly env?: NodeJS.ProcessEnv;
   /** Resolve the intended runner uid `<N>` (defaults to `id -u runner`). */
   readonly resolveRunnerUid?: () => number;
+  readonly resolveCommandUid?: () => number;
+  readonly resolveWorkerUid?: () => number;
   readonly makeRunnerTrees?: MakeRunnerTrees;
   readonly spawnSupervisor?: SpawnSupervisor;
   readonly assertNoUnexpectedSystemConfig?: (etcCodexDir?: string) => void;
@@ -160,6 +169,10 @@ export interface SnapshotEvidence {
   readonly event: "snapshot";
   readonly id: number;
   readonly processes: ReadonlyArray<{ readonly pid: number; readonly ppid: number; readonly pgid: number; readonly comm: string }>;
+}
+export interface ChildExitEvidence {
+  readonly event: "child_exit";
+  readonly code: number;
 }
 export interface DisposeEvidence {
   readonly event: "dispose";
@@ -185,6 +198,8 @@ export interface CodexRootHandle {
   /** The app-server TRANSPORT (fds 0/1/2) — a caller speaks app-server JSONL RPC here. */
   readonly transport: { readonly stdin: Writable | null; readonly stdout: Readable | null; readonly stderr: Readable | null };
   snapshot(timeoutMs?: number): Promise<SnapshotEvidence>;
+  /** Await the supervised primary child's normalized terminal status. */
+  waitChild(timeoutMs?: number): Promise<ChildExitEvidence>;
   dispose(timeoutMs?: number): Promise<DisposeOutcome>;
   /** The sticky failure for THIS root, if any (abnormal, early exit, protocol breach). */
   readonly failed: Error | undefined;
@@ -221,7 +236,8 @@ function defaultMakeRunnerTrees(request: RunnerTreeRequest): void {
   // process environment: another concurrent runner can read a normal helper process via
   // /proc/<pid>/environ. Only inert locale/path values cross this short provisioning step.
   const provisionEnv: NodeJS.ProcessEnv = { PATH: "/usr/bin:/bin", LANG: "C" };
-  const mk = runnerCommand("/bin/sh", [
+  const wrap = request.kind === "command" ? commandRootCommand : runnerCommand;
+  const mk = wrap("/bin/sh", [
     "-ceu",
     `root="$1"; uid="$2"; shift 2; umask 077; mkdir -m 700 -- "$root"; trap 'rc=$?; [ "$rc" -eq 0 ] || rm -rf -- "$root"; exit "$rc"' EXIT; chmod 700 "$root"; for d in "$@"; do mkdir -m 700 -- "$d"; chmod 700 "$d"; done; for d in "$root" "$@"; do [ "$(stat -c %u "$d")" = "$uid" ] && [ "$(stat -c %a "$d")" = 700 ]; done; trap - EXIT`,
     "sh", request.root, String(request.uid), ...request.dirs,
@@ -231,12 +247,12 @@ function defaultMakeRunnerTrees(request: RunnerTreeRequest): void {
   try {
     for (const file of request.files) {
       const octal = (file.mode & 0o777).toString(8).padStart(3, "0");
-      const w = runnerCommand("/bin/sh", ["-ceu", `umask 077; cat > "$1"; chmod ${octal} "$1"; [ "$(stat -c %u "$1")" = "$2" ] && [ "$(stat -c %a "$1")" = ${octal} ]`, "sh", file.path, String(request.uid)]);
+      const w = wrap("/bin/sh", ["-ceu", `umask 077; cat > "$1"; chmod ${octal} "$1"; [ "$(stat -c %u "$1")" = "$2" ] && [ "$(stat -c %a "$1")" = ${octal} ]`, "sh", file.path, String(request.uid)]);
       const wr = spawnSync(w.command, w.args, { env: provisionEnv, input: file.content, stdio: ["pipe", "ignore", "pipe"] });
       if (wr.status !== 0) throw new Error(`runner-owned file write failed for ${file.path} (exit ${String(wr.status)}): ${String(wr.stderr)}`);
     }
   } catch (error) {
-    const rm = runnerCommand("/bin/rm", ["-rf", "--", request.root]);
+    const rm = wrap("/bin/rm", ["-rf", "--", request.root]);
     spawnSync(rm.command, rm.args, { env: provisionEnv, stdio: "ignore" });
     throw error;
   }
@@ -366,7 +382,9 @@ export async function launchCodexRoot(spec: CodexLaunchSpec, deps: LauncherDeps 
   validateLaunchContract(spec);
 
   // Resolve the intended runner uid <N> for --expect-uid and the runner-owned trees.
-  const uid = (deps.resolveRunnerUid ?? defaultResolveRunnerUid)();
+  const uid = spec.kind === "command"
+    ? (deps.resolveCommandUid ?? (() => COMMAND_UID))()
+    : (deps.resolveRunnerUid ?? defaultResolveRunnerUid)();
   if (!Number.isInteger(uid) || uid <= 0) throw new Error(`resolved runner uid is invalid: ${String(uid)}`);
 
   // 2. Reject unexpected system config (a fresh HOME does not neutralize /etc/codex).
@@ -383,6 +401,7 @@ export async function launchCodexRoot(spec: CodexLaunchSpec, deps: LauncherDeps 
   });
   (deps.makeRunnerTrees ?? defaultMakeRunnerTrees)({
     uid,
+    kind: spec.kind,
     root: spec.ownedDataRoot,
     dirs: trees.all,
     files: [{ path: configPath, content: configText, mode: 0o600 }],
@@ -395,7 +414,9 @@ export async function launchCodexRoot(spec: CodexLaunchSpec, deps: LauncherDeps 
   //    with 5-fd stdio (0/1/2 transport, 3 control, 4 evidence). The supervisor argv
   //    is trusted & launcher-fixed: never model-controlled.
   const supervisorArgv = ["--expect-uid", String(uid), "--", spec.codexBin, ...spec.childArgv];
-  const wrapped = runnerCommand(spec.supervisorBin, supervisorArgv);
+  const wrapped = spec.kind === "command"
+    ? commandRootCommand(spec.supervisorBin, supervisorArgv)
+    : runnerCommand(spec.supervisorBin, supervisorArgv);
   const child = (deps.spawnSupervisor ?? defaultSpawnSupervisor)(wrapped.command, wrapped.args, {
     cwd: spec.cwd,
     env: replacedEnv,
@@ -403,10 +424,71 @@ export async function launchCodexRoot(spec: CodexLaunchSpec, deps: LauncherDeps 
   });
 
   // 7. Parse evidence (bounded), await `started`, expose snapshot/dispose + transport.
-  return createHandle(child, uid, { ...DEFAULT_DEADLINES, ...deps.deadlines });
+  return createHandle(child, uid, { ...DEFAULT_DEADLINES, ...deps.deadlines }, spec.kind);
 }
 
-async function createHandle(child: SupervisorProcess, expectedUid: number, deadlines: LauncherDeadlines): Promise<CodexRootHandle> {
+/** A generic supervised effect launch. Unlike {@link launchCodexRoot}, it creates
+ * no provider HOME/config tree: the trusted caller supplies a fully replaced env
+ * and an already-screened absolute executable/argv. */
+export interface CodexEffectLaunchSpec {
+  readonly identity: "command" | "worker_pat";
+  readonly command: string;
+  readonly args: readonly string[];
+  readonly cwd: string;
+  readonly env: NodeJS.ProcessEnv;
+  readonly supervisorBin: string;
+  /** Optional UUID token for the supervisor's fixed
+   * `/tmp/uzi-codex-command-<token>` cleanup path. */
+  readonly cleanupToken?: string;
+}
+
+export async function launchCodexEffectRoot(
+  spec: CodexEffectLaunchSpec,
+  deps: LauncherDeps = {},
+): Promise<CodexRootHandle> {
+  const profileEnv = deps.env ?? process.env;
+  if (!uidSplitActive(profileEnv)) {
+    throw new CodexUnsupportedProfileError("Codex effect roots require the A1 uid split; refusing to launch");
+  }
+  if (spec.supervisorBin !== SUPERVISOR_BIN) {
+    throw new Error(`supervisorBin must equal the immutable image path ${SUPERVISOR_BIN}`);
+  }
+  if (!isAbsolute(spec.command) || !isAbsolute(spec.cwd)) {
+    throw new Error("effect command and cwd must be absolute paths");
+  }
+  const expectedUid = spec.identity === "command"
+    ? (deps.resolveCommandUid ?? (() => COMMAND_UID))()
+    : (deps.resolveWorkerUid ?? (() => process.getuid?.() ?? WORKER_UID))();
+  const requiredUid = spec.identity === "command" ? COMMAND_UID : WORKER_UID;
+  if (expectedUid !== requiredUid) {
+    throw new Error(`effect identity resolved unexpected uid ${String(expectedUid)}`);
+  }
+  if (spec.cleanupToken !== undefined && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(spec.cleanupToken)) {
+    throw new Error("effect cleanup token must be a lowercase UUID");
+  }
+  const supervisorArgv = [
+    "--expect-uid", String(expectedUid),
+    ...(spec.cleanupToken ? ["--cleanup-token", spec.cleanupToken] : []),
+    ...(spec.identity === "worker_pat" ? ["--drop-controller-caps"] : []),
+    "--", spec.command, ...spec.args,
+  ];
+  const wrapped = spec.identity === "command"
+    ? commandRootCommand(spec.supervisorBin, supervisorArgv)
+    : workerBoundaryCommand(spec.supervisorBin, supervisorArgv);
+  const child = (deps.spawnSupervisor ?? defaultSpawnSupervisor)(wrapped.command, wrapped.args, {
+    cwd: spec.cwd,
+    env: { ...spec.env },
+    stdio: ["pipe", "pipe", "pipe", "pipe", "pipe"],
+  });
+  return createHandle(child, expectedUid, { ...DEFAULT_DEADLINES, ...deps.deadlines }, "command");
+}
+
+async function createHandle(
+  child: SupervisorProcess,
+  expectedUid: number,
+  deadlines: LauncherDeadlines,
+  kind: CodexRootKind,
+): Promise<CodexRootHandle> {
   const control = asWritable(child.stdio[3], "control");
   const evidence = asReadable(child.stdio[4], "evidence");
 
@@ -414,6 +496,7 @@ async function createHandle(child: SupervisorProcess, expectedUid: number, deadl
   const pending = new Map<number, { resolve: (e: SnapshotEvidence | DisposeEvidence) => void; reject: (err: Error) => void }>();
   let failure: Error | undefined;
   let startedEvent: StartedEvidence | undefined;
+  let childExitEvent: ChildExitEvidence | undefined;
   let exited = false;
   let exitInfo: { code: number | null; signal: NodeJS.Signals | null } | undefined;
   let disposeInFlight = false;
@@ -424,6 +507,13 @@ async function createHandle(child: SupervisorProcess, expectedUid: number, deadl
   let resolveStarted!: (e: StartedEvidence) => void;
   let rejectStarted!: (err: Error) => void;
   const startedPromise = new Promise<StartedEvidence>((resolve, reject) => { resolveStarted = resolve; rejectStarted = reject; });
+  let resolveChildExit!: (e: ChildExitEvidence) => void;
+  let rejectChildExit!: (err: Error) => void;
+  const childExitPromise = new Promise<ChildExitEvidence>((resolve, reject) => {
+    resolveChildExit = resolve;
+    rejectChildExit = reject;
+  });
+  void childExitPromise.catch(() => undefined);
   let resolveExit!: (info: { code: number | null; signal: NodeJS.Signals | null }) => void;
   const exitPromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => { resolveExit = resolve; });
   let resolveFailed!: (err: Error) => void;
@@ -434,6 +524,7 @@ async function createHandle(child: SupervisorProcess, expectedUid: number, deadl
       failure = err;
       resolveFailed(err);
       if (!startedEvent) rejectStarted(err);
+      if (!childExitEvent) rejectChildExit(err);
     }
     for (const p of pending.values()) p.reject(failure);
     pending.clear();
@@ -492,6 +583,20 @@ async function createHandle(child: SupervisorProcess, expectedUid: number, deadl
         if (waiter && typeof id === "number") { pending.delete(id); waiter.resolve(record as unknown as SnapshotEvidence | DisposeEvidence); }
         return;
       }
+      case "child_exit": {
+        const code = record.code;
+        if (!Number.isInteger(code) || Number(code) < 0 || Number(code) > 255 || childExitEvent) {
+          fail(new Error("malformed or duplicate child_exit evidence"));
+          return;
+        }
+        const ev: ChildExitEvidence = { event: "child_exit", code: Number(code) };
+        childExitEvent = ev;
+        resolveChildExit(ev);
+        if (kind === "provider") {
+          fail(new Error(`supervised provider child exited unexpectedly (code=${ev.code})`));
+        }
+        return;
+      }
       case "abnormal": {
         fail(new Error(`supervisor abnormal: ${String(record.reason ?? "unknown")}`));
         return;
@@ -542,17 +647,29 @@ async function createHandle(child: SupervisorProcess, expectedUid: number, deadl
     return ev;
   }
 
+  async function waitChild(timeoutMs = deadlines.exit): Promise<ChildExitEvidence> {
+    if (childExitEvent) return childExitEvent;
+    if (failure) throw failure;
+    return withDeadline(childExitPromise, timeoutMs, "supervised child exit");
+  }
+
   async function dispose(timeoutMs = 2000): Promise<DisposeOutcome> {
     if (cleanDisposed && lastDrained) return { clean: true, event: lastDrained };
     if (failure) return { clean: false, reason: failure.message };
     if (exited) return { clean: false, reason: `supervisor already exited (code=${String(exitInfo?.code)})` };
     if (control.destroyed) return { clean: false, reason: "control channel unavailable; disposal unconfirmed" };
     disposeInFlight = true;
+    const deadlineAt = Date.now() + Math.max(0, timeoutMs);
+    const remaining = (): number => Math.max(0, Math.ceil(deadlineAt - Date.now()));
     try {
       const id = nextId++;
       let ev: SnapshotEvidence | DisposeEvidence;
       try {
-        ev = await withDeadline(sendAndWait(id, { op: "dispose", id, timeoutMs }), deadlines.dispose + timeoutMs, "dispose");
+        ev = await withDeadline(
+          sendAndWait(id, { op: "dispose", id, timeoutMs: remaining() }),
+          Math.min(remaining(), deadlines.dispose + timeoutMs),
+          "dispose",
+        );
       } catch (error) {
         return { clean: false, reason: error instanceof Error ? error.message : String(error) };
       }
@@ -567,7 +684,7 @@ async function createHandle(child: SupervisorProcess, expectedUid: number, deadl
       // Drained reported — a clean supervisor exit (0) must confirm it.
       let exit: { code: number | null; signal: NodeJS.Signals | null };
       try {
-        exit = await withDeadline(exitPromise, deadlines.exit, "supervisor exit");
+        exit = await withDeadline(exitPromise, Math.min(remaining(), deadlines.exit), "supervisor exit");
       } catch (error) {
         return { clean: false, reason: error instanceof Error ? error.message : String(error), event: disposeEv };
       }
@@ -599,6 +716,7 @@ async function createHandle(child: SupervisorProcess, expectedUid: number, deadl
     supervisorPid: child.pid,
     transport: { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr },
     snapshot,
+    waitChild,
     dispose,
     get failed() { return failure; },
     whenFailed,

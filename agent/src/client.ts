@@ -67,6 +67,131 @@ export interface ClientOptions {
   sleep?: (ms: number) => Promise<void>;
   terminalRetrySchedule?: number[];
   httpTimeoutMs?: number;
+  /** Codex external-auth worker→API slice. Kept below app-server's fixed 10s callback
+   *  deadline; the API finishes within 7.5s, leaving response-delivery margin. */
+  codexHTTPTimeoutMs?: number;
+}
+
+export type CodexReleaseExpectation =
+  | { authMode: "subscription"; chatgptAccountId: string; minimumGeneration: number }
+  | { authMode: "api_key" };
+
+export interface CodexRefreshExpectation {
+  authMode: "subscription";
+  chatgptAccountId: string;
+}
+
+const CODEX_REFRESH_OUTCOMES = new Set<CodexRefreshResponse["outcome"]>([
+  "advanced",
+  "replayed",
+  "reconciled",
+]);
+
+function codexResponseError(): Error {
+  return new Error("invalid codex credential response");
+}
+
+function responseRecord(raw: unknown): Record<string, unknown> {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) throw codexResponseError();
+  return raw as Record<string, unknown>;
+}
+
+function hasExactKeys(record: Record<string, unknown>, expected: readonly string[]): boolean {
+  const actual = Object.keys(record).sort();
+  const wanted = [...expected].sort();
+  return actual.length === wanted.length && actual.every((key, i) => key === wanted[i]);
+}
+
+function validGeneration(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function validRefreshOutcome(value: unknown): value is CodexRefreshResponse["outcome"] {
+  return typeof value === "string" && CODEX_REFRESH_OUTCOMES.has(value as CodexRefreshResponse["outcome"]);
+}
+
+function validateCodexReleaseResponse(
+  raw: unknown,
+  expected: CodexReleaseExpectation,
+): CodexReleaseResponse {
+  const body = responseRecord(raw);
+  if (expected.authMode === "api_key") {
+    if (
+      !hasExactKeys(body, ["auth_mode", "access_token"]) ||
+      body.auth_mode !== "api_key" ||
+      typeof body.access_token !== "string" ||
+      body.access_token.length === 0
+    ) {
+      throw codexResponseError();
+    }
+    return { auth_mode: "api_key", access_token: body.access_token };
+  }
+
+  if (!validGeneration(expected.minimumGeneration) || expected.chatgptAccountId.length === 0) {
+    throw codexResponseError();
+  }
+  if (
+    !hasExactKeys(body, [
+      "auth_mode",
+      "access_token",
+      "generation",
+      "chatgpt_account_id",
+      "chatgpt_plan_type",
+    ]) ||
+    body.auth_mode !== "subscription" ||
+    typeof body.access_token !== "string" ||
+    body.access_token.length === 0 ||
+    !validGeneration(body.generation) ||
+    body.generation < expected.minimumGeneration ||
+    body.chatgpt_account_id !== expected.chatgptAccountId ||
+    body.chatgpt_plan_type !== null
+  ) {
+    throw codexResponseError();
+  }
+  return {
+    auth_mode: "subscription",
+    access_token: body.access_token,
+    generation: body.generation,
+    chatgpt_account_id: body.chatgpt_account_id,
+    chatgpt_plan_type: null,
+  };
+}
+
+function validateCodexRefreshResponse(
+  raw: unknown,
+  expected: CodexRefreshExpectation,
+  observedGeneration: number,
+): CodexRefreshResponse {
+  const body = responseRecord(raw);
+  if (
+    !hasExactKeys(body, [
+      "auth_mode",
+      "access_token",
+      "generation",
+      "chatgpt_account_id",
+      "chatgpt_plan_type",
+      "outcome",
+    ]) ||
+    body.auth_mode !== expected.authMode ||
+    typeof body.access_token !== "string" ||
+    body.access_token.length === 0 ||
+    !validRefreshOutcome(body.outcome) ||
+    !validGeneration(body.generation) ||
+    body.generation <= observedGeneration ||
+    (body.outcome === "advanced" && body.generation !== observedGeneration + 1) ||
+    body.chatgpt_account_id !== expected.chatgptAccountId ||
+    body.chatgpt_plan_type !== null
+  ) {
+    throw codexResponseError();
+  }
+  return {
+    auth_mode: "subscription",
+    access_token: body.access_token,
+    generation: body.generation,
+    chatgpt_account_id: body.chatgpt_account_id,
+    chatgpt_plan_type: null,
+    outcome: body.outcome,
+  };
 }
 
 /** Response of the MR-thread reply write (PRD #700 M4). `replied` is true when the
@@ -88,6 +213,7 @@ export class WorkerClient {
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly terminalRetrySchedule: number[];
   private readonly httpTimeoutMs: number;
+  private readonly codexHTTPTimeoutMs: number;
 
   constructor(
     private readonly baseUrl: string,
@@ -99,6 +225,7 @@ export class WorkerClient {
     this.sleep = opts.sleep ?? sleepReal;
     this.terminalRetrySchedule = opts.terminalRetrySchedule ?? DEFAULT_TERMINAL_RETRY_SCHEDULE;
     this.httpTimeoutMs = opts.httpTimeoutMs ?? 30_000;
+    this.codexHTTPTimeoutMs = opts.codexHTTPTimeoutMs ?? 8_000;
   }
 
   async register(
@@ -155,10 +282,15 @@ export class WorkerClient {
     return (await res.json()) as ChatClaimResponse;
   }
 
-  async postMessages(runId: string, messages: OutgoingMessage[]): Promise<void> {
+  async postMessages(runId: string, messages: OutgoingMessage[], signal?: AbortSignal): Promise<void> {
     if (messages.length === 0) return;
     const body: MessagesRequest = { messages };
-    await this.postJSON(`${WORKER_API_PREFIX}/runs/${runId}/messages`, body);
+    await this.postJSON(
+      `${WORKER_API_PREFIX}/runs/${runId}/messages`,
+      body,
+      this.httpTimeoutMs,
+      signal,
+    );
   }
 
   /**
@@ -170,6 +302,10 @@ export class WorkerClient {
    * server. An "already terminal" server response (409, or a 4xx body mentioning
    * terminal) does not throw, so a lost ack / duplicate replay is safe. A
    * 4xx is otherwise fatal.
+   *
+   * A durability-boundary caller supplies its permit signal. It cancels the
+   * in-flight request and any retry backoff, so the boundary awaits real request
+   * settlement without multiplying its own deadline by this retry schedule.
    *
    * The RESULT used to be discarded. It is now returned, because `limit_wait`
    * (PRD #35) is the first report whose consequence is that the caller SKIPS
@@ -183,11 +319,12 @@ export class WorkerClient {
    * so parsing a 409's status back out of the error text would work in tests and
    * fail on real runs.
    */
-  async reportState(runId: string, body: StateRequest): Promise<StateAck> {
+  async reportState(runId: string, body: StateRequest, signal?: AbortSignal): Promise<StateAck> {
     const path = `${WORKER_API_PREFIX}/runs/${runId}/state`;
     for (let attempt = 0; ; attempt++) {
+      signal?.throwIfAborted();
       try {
-        const res = await this.fetchRaw("POST", path, body);
+        const res = await this.fetchRaw("POST", path, body, this.httpTimeoutMs, signal);
         // 409 = the server declined the transition and is telling us the run's real
         // status. Not an error, and not a retry: the server has moved on.
         if (res.status === 200 || res.status === 409) {
@@ -229,6 +366,7 @@ export class WorkerClient {
         // but no status came back. Undefined reads as "not parked", which is safe.
         return { applied: true, status: undefined };
       } catch (err) {
+        if (signal?.aborted) throw err;
         if (this.isAlreadyTerminal(err)) {
           // A 4xx whose TEXT says terminal. The status is not recoverable here, and
           // an absent status is the safe answer for every caller.
@@ -238,7 +376,7 @@ export class WorkerClient {
         if (!isTransient(err) || attempt >= this.terminalRetrySchedule.length) throw err;
         const delay = this.terminalRetrySchedule[attempt] ?? 0;
         this.log.warn("state report failed, retrying", { run_id: runId, status: body.status, attempt, delay_ms: delay });
-        await this.sleep(delay);
+        await abortableSleep(this.sleep, delay, signal);
       }
     }
   }
@@ -266,6 +404,7 @@ export class WorkerClient {
     runId: string,
     tipOid: string,
     pack: Readable,
+    boundarySignal?: AbortSignal,
   ): Promise<PublishResult> {
     const path = `${WORKER_API_PREFIX}/runs/${runId}/publish`;
     const init: RequestInit = {
@@ -280,7 +419,9 @@ export class WorkerClient {
       // undici requires `duplex: "half"` for a streamed (Readable) request body; without it
       // the fetch throws before sending. (oxlint no-invalid-fetch-options accepts this shape.)
       duplex: "half",
-      signal: AbortSignal.timeout(this.httpTimeoutMs),
+      signal: boundarySignal
+        ? AbortSignal.any([boundarySignal, AbortSignal.timeout(this.httpTimeoutMs)])
+        : AbortSignal.timeout(this.httpTimeoutMs),
     };
     const res = await fetch(this.baseUrl + path, init);
     if (res.status < 200 || res.status >= 300) return { ok: false, httpStatus: res.status };
@@ -528,26 +669,51 @@ export class WorkerClient {
   // Both responses are Cache-Control: no-store and secret-bearing (an access token), so the
   // caller must treat the result like a claim secret — never log or persist it beyond use.
 
-  /** Re-fetch the run's currently-committed Codex access token (POST /worker/runs/:id/
-   *  codex/release). Used before constructing a fresh provider root. Both auth modes. */
-  async releaseCodex(runId: string, req: CodexReleaseRequest): Promise<CodexReleaseResponse> {
-    return (await this.postJSON(
+  /** Re-fetch the run's currently-committed Codex auth (POST /worker/runs/:id/codex/release).
+   *  `expected` is the immutable claim binding: a cross-mode/account response, stale
+   *  generation, non-null plan, or API-key subscription field fails closed. `signal` is
+   *  combined with the fixed Codex HTTP deadline. */
+  async releaseCodex(
+    runId: string,
+    req: CodexReleaseRequest,
+    expected: CodexReleaseExpectation,
+    signal?: AbortSignal,
+  ): Promise<CodexReleaseResponse> {
+    const raw = await this.postCodexJSON(
       `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/codex/release`,
       req,
-    )) as CodexReleaseResponse;
+      signal,
+    );
+    return validateCodexReleaseResponse(raw, expected);
   }
 
-  /** Run the coordinated subscription refresh and release the freshly-committed access
+  /** Run the coordinated subscription refresh and release the freshly-committed auth
    *  token (POST /worker/runs/:id/codex/refresh). `req.operation_id` MUST be generated ONCE
    *  per logical refresh and RETAINED by the caller across retries: on an HTTP timeout or a
    *  lost reply, re-call with the SAME operation_id so the server replays its prior result
    *  rather than starting a second provider exchange (the worker never begins a second
-   *  exchange blindly). Subscription runs only — an api_key run can never refresh. */
-  async refreshCodex(runId: string, req: CodexRefreshRequest): Promise<CodexRefreshResponse> {
-    return (await this.postJSON(
+   *  exchange blindly). Subscription runs only. The response must match the immutable
+   *  account, advance the observed generation, carry a null plan and use a closed outcome;
+   *  caller cancellation is combined with the fixed Codex HTTP deadline. */
+  async refreshCodex(
+    runId: string,
+    req: CodexRefreshRequest,
+    expected: CodexRefreshExpectation,
+    signal?: AbortSignal,
+  ): Promise<CodexRefreshResponse> {
+    if (
+      !validGeneration(req.observed_generation) ||
+      req.observed_generation === Number.MAX_SAFE_INTEGER ||
+      expected.chatgptAccountId.length === 0
+    ) {
+      throw codexResponseError();
+    }
+    const raw = await this.postCodexJSON(
       `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/codex/refresh`,
       req,
-    )) as CodexRefreshResponse;
+      signal,
+    );
+    return validateCodexRefreshResponse(raw, expected, req.observed_generation);
   }
 
   /** A 4xx body mentioning "terminal": the server already finalized the run, so the
@@ -565,12 +731,29 @@ export class WorkerClient {
     return err.status < 500 && /terminal/i.test(err.body);
   }
 
-  private async postJSON(path: string, body: unknown): Promise<unknown> {
-    const res = await this.fetchRaw("POST", path, body);
+  private async postJSON(
+    path: string,
+    body: unknown,
+    timeoutMs = this.httpTimeoutMs,
+    callerSignal?: AbortSignal,
+  ): Promise<unknown> {
+    const res = await this.fetchRaw("POST", path, body, timeoutMs, callerSignal);
     if (res.status >= 400) throw await this.toError("POST", path, res);
     if (res.status === 204) return undefined;
     const text = await res.text();
     return text ? JSON.parse(text) : undefined;
+  }
+
+  private async postCodexJSON(path: string, body: unknown, signal?: AbortSignal): Promise<unknown> {
+    const res = await this.fetchRaw("POST", path, body, this.codexHTTPTimeoutMs, signal);
+    if (res.status >= 400) throw await this.toError("POST", path, res);
+    const text = await res.text();
+    if (!text) throw codexResponseError();
+    try {
+      return JSON.parse(text) as unknown;
+    } catch {
+      throw codexResponseError();
+    }
   }
 
   private async getJSON(path: string): Promise<unknown> {
@@ -580,7 +763,13 @@ export class WorkerClient {
     return text ? JSON.parse(text) : undefined;
   }
 
-  private async fetchRaw(method: "GET" | "POST", path: string, body: unknown): Promise<Response> {
+  private async fetchRaw(
+    method: "GET" | "POST",
+    path: string,
+    body: unknown,
+    timeoutMs = this.httpTimeoutMs,
+    callerSignal?: AbortSignal,
+  ): Promise<Response> {
     const headers: Record<string, string> = {
       Authorization: `Bearer ${this.token}`,
       "X-Client-Version": this.version,
@@ -595,7 +784,9 @@ export class WorkerClient {
     const init: RequestInit = {
       method,
       headers,
-      signal: AbortSignal.timeout(this.httpTimeoutMs),
+      signal: callerSignal
+        ? AbortSignal.any([callerSignal, AbortSignal.timeout(timeoutMs)])
+        : AbortSignal.timeout(timeoutMs),
     };
     if (body !== undefined) init.body = JSON.stringify(body);
     return fetch(this.baseUrl + path, init);
@@ -691,4 +882,32 @@ export function isTransient(err: unknown): boolean {
   }
   // Network error / timeout (AbortError) / non-HTTP failure.
   return true;
+}
+
+/** Sleep through an injected or real timer without letting a durability-boundary
+ * cancellation strand reportState in its retry backoff. */
+function abortableSleep(
+  sleeper: (ms: number) => Promise<void>,
+  ms: number,
+  signal: AbortSignal | undefined,
+): Promise<void> {
+  if (!signal) return sleeper(ms);
+  signal.throwIfAborted();
+  return new Promise<void>((resolve, reject) => {
+    const onAbort = (): void => {
+      signal.removeEventListener("abort", onAbort);
+      reject(signal.reason);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    sleeper(ms).then(
+      () => {
+        signal.removeEventListener("abort", onAbort);
+        resolve();
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
 }

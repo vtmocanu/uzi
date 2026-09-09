@@ -108,15 +108,13 @@ canary is an instrument failure (exit 2), never a clean run.
 - **`codex-no-direct-spawn.yml`** (DARK Codex, issue #1171) — raw
   `child_process` creation inside `agent/src/codex/**`
   (`spawn`/`spawnSync`/`exec`/`execSync`/`execFile`/`execFileSync`/`fork`) is
-  confined to the three files that legitimately import `node:child_process`
-  today: `launcher.ts` (supervisor spawn), `codex-executor.ts` (command seam),
-  `fileop-client.ts` (fileop seam), all `paths.exclude`d. A raw spawn in any
+  confined to `launcher.ts`, the one supervisor-launch/provisioning trust anchor
+  excluded by path. Shell, fileop and permit-held boundary actions reserve and
+  register a supervisor root before their process streams are exposed. A raw spawn in any
   other Codex file (e.g. `broker.ts`) fires. **Reliability boundary:** a
   syntactic, file-glob-scoped match on the direct call APIs — it does not trace
   a spawn hidden behind a helper in another module, and a spawner added under a
-  new sanctioned seam must be added to the exclude list deliberately. (R2
-  supervisor-registration of these spawners is deferred, so the three stay
-  sanctioned.)
+  new sanctioned seam must be added to the exclude list deliberately.
 - **`codex-durability-sink-boundary.yml`** (DARK Codex, issue #1171) — the
   runner durability/publication sinks in `agent/src/runner.ts` must not spawn a
   raw subprocess (all seven `child_process` forms:

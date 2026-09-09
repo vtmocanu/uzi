@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -21,6 +21,8 @@ import {
 } from "../src/codex/registry.js";
 import { selectCodexBinding, type CodexBinding } from "../src/codex/select.js";
 import type { CodexExecutionSafety } from "../src/harness.js";
+import { resolveBoundaryExecutable } from "../src/git.js";
+import { GitLabClient } from "../src/forge.js";
 import {
   api,
   client,
@@ -31,6 +33,14 @@ import {
 } from "./runner-harness.js";
 
 installHarness();
+
+describe("Codex durability executable resolution", () => {
+  it("pins Git and gitleaks to absolute image paths and rejects other relative names", () => {
+    assert.equal(resolveBoundaryExecutable("git"), "/usr/bin/git");
+    assert.equal(resolveBoundaryExecutable("gitleaks"), "/usr/local/bin/gitleaks");
+    assert.throws(() => resolveBoundaryExecutable("relative-tool"), /trusted absolute path/);
+  });
+});
 
 // PRD #1171 m4 (Phase 2B) — every durability/publication sink in the runner routes through the
 // optional Codex `withBoundary` reap facade, per-sink auth-mode reconcile, the pause-sink
@@ -86,6 +96,8 @@ const SUBSCRIPTION = {
   access_token: "claim-tok-XXXXXXXX",
   capability: "run-cap-XXXXXXXX",
   generation: 3,
+  chatgpt_account_id: "verified-account",
+  chatgpt_plan_type: null,
 };
 const API_KEY = {
   auth_mode: "api_key",
@@ -134,6 +146,8 @@ interface CodexRig {
   registeredTokens: string[];
   reaps: () => number;
   disposes: () => number;
+  processSpawns: () => number;
+  processArgv: readonly (readonly string[])[];
 }
 
 const RELEASE_TOK = "codex-release-tok-XXXXXXXX";
@@ -164,6 +178,8 @@ function codexRig(opts: { authMode?: "subscription" | "api_key"; blockReconcile?
     },
   };
   const registeredTokens: string[] = [];
+  let processSpawns = 0;
+  const processArgv: (readonly string[])[] = [];
   const reconcile: ReconcileBeforeBoundary = buildRunLaneReconcile(
     "run-codex-sink",
     fakeClient as never,
@@ -177,6 +193,29 @@ function codexRig(opts: { authMode?: "subscription" | "api_key"; blockReconcile?
       throw new Error("boundary-action spawn is not used by these sink tests");
     },
     reconcile,
+    undefined,
+    async (request) => {
+      processSpawns += 1;
+      processArgv.push(request.argv);
+      const [command, ...args] = request.argv;
+      if (!command) throw new Error("empty test process argv");
+      const child = spawn(command, args, { cwd: request.cwd, env: request.env, stdio: ["pipe", "pipe", "pipe"] });
+      const terminal = new Promise<{ code: number }>((resolve, reject) => {
+        child.once("error", reject);
+        child.once("exit", (code, signal) => resolve({ code: code ?? (signal ? 128 : 1) }));
+      });
+      return {
+        root: {
+          kind: "boundary_action",
+          reap: async () => { await terminal; return { ok: true }; },
+          dispose: async () => { if (child.exitCode === null) child.kill("SIGKILL"); await terminal.catch(() => undefined); },
+        },
+        stdin: child.stdin,
+        stdout: child.stdout,
+        stderr: child.stderr,
+        waitChild: async () => terminal,
+      };
+    },
   );
   const boundaries: string[] = [];
   const disposeBoundaries: string[] = [];
@@ -186,6 +225,7 @@ function codexRig(opts: { authMode?: "subscription" | "api_key"; blockReconcile?
       boundaries.push(req.boundary);
       return inner.withBoundary(req, action);
     },
+    spawnBoundaryProcess: (permit, request) => inner.spawnBoundaryProcess(permit, request),
     dispose: (req) => {
       disposeBoundaries.push(req.boundary);
       return inner.dispose(req);
@@ -201,6 +241,8 @@ function codexRig(opts: { authMode?: "subscription" | "api_key"; blockReconcile?
     registeredTokens,
     reaps: tr.reaps,
     disposes: tr.disposes,
+    processSpawns: () => processSpawns,
+    processArgv,
   };
 }
 
@@ -224,6 +266,58 @@ function statuses(runId: string): string[] {
 
 // ================================================================================
 describe("RunRunner m4 — Codex durability sinks route through withBoundary", () => {
+  it("aborts and settles a stuck finalize forge request before withBoundary/dispose returns", async () => {
+    let httpCalls = 0;
+    let httpSettled = false;
+    let httpStartedAt = 0;
+    let httpSettledAt = 0;
+    const stuckForge = new GitLabClient({
+      httpTimeoutMs: 5_000,
+      fetchFn: async (_url, init) => {
+        httpCalls += 1;
+        httpStartedAt = Date.now();
+        await new Promise<void>((_, reject) => {
+          const abort = (): void => {
+            httpSettled = true;
+            httpSettledAt = Date.now();
+            reject(new Error("finalize forge request aborted"));
+          };
+          if (init.signal?.aborted) abort();
+          else init.signal?.addEventListener("abort", abort, { once: true });
+        });
+        throw new Error("unreachable");
+      },
+    });
+    const rig = codexRig();
+    const originalWithBoundary = rig.safety.withBoundary.bind(rig.safety);
+    let finalizeBoundaryReturnedAt = 0;
+    rig.safety.withBoundary = async (request, action) => {
+      try {
+        return await originalWithBoundary(request, action);
+      } finally {
+        if (request.boundary === "finalize") finalizeBoundaryReturnedAt = Date.now();
+      }
+    };
+    const originalDispose = rig.safety.dispose.bind(rig.safety);
+    let disposeBeforeHttpSettlement = false;
+    rig.safety.dispose = async (request) => {
+      if (!httpSettled) disposeBeforeHttpSettlement = true;
+      return originalDispose(request);
+    };
+    const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
+      commitInTree(ctx.worktreePath, "STUCK-FORGE.txt", "finalize must cancel\n");
+      return { branch: ctx.branch };
+    });
+    await runnerWith(() => ({ executor: exec }), stuckForge, undefined, undefined, {
+      codexBoundaryDeadlineMs: 2_000,
+    }).execute(gitlabClaim(1219));
+    assert.equal(httpCalls, 1, "deadline cancellation prevented forge retry/backoff");
+    assert.equal(httpSettled, true, "the in-flight forge request observed permit cancellation");
+    assert.ok(httpSettledAt <= finalizeBoundaryReturnedAt, "withBoundary returned only after HTTP settlement");
+    assert.equal(disposeBeforeHttpSettlement, false, "terminal dispose waited for HTTP settlement");
+    assert.ok(httpSettledAt - httpStartedAt < 4000, "the independent 5s forge timeout did not control finalize");
+  });
+
   it("(1) phasePublish FINALIZE routes through withBoundary; the trusted push/MR runs inside it (subscription reconcile + reap before publish)", async () => {
     const { gitlab, calls } = fakeGitlab();
     const rig = codexRig({ authMode: "subscription" });
@@ -240,6 +334,8 @@ describe("RunRunner m4 — Codex durability sinks route through withBoundary", (
     assert.ok(statuses(claim.run_id).includes("completed"), "the run completed");
     // The provider root was reaped as part of the finalize boundary, BEFORE the credentialed push.
     assert.ok(rig.reaps() >= 1, "the provider root was reaped inside the finalize boundary");
+    assert.ok(rig.processSpawns() > 0, "permit-held Git launched through registered boundary-action roots");
+    assert.ok(rig.processArgv.every((argv) => argv[0]?.startsWith("/")), "every permit-held executable is absolute");
     // The subscription reconcile ran before the boundary (one refresh; zero standalone release).
     assert.ok(rig.refreshCalls() >= 1, "the subscription reconcile refreshed before the boundary");
     // F1: the runner disposed the registry ONCE after the sinks settled.
@@ -304,6 +400,56 @@ describe("RunRunner m4 — Codex durability sinks route through withBoundary", (
       assert.ok(rig.boundaries.includes("shutdown"), `shutdown boundary recorded; got ${JSON.stringify(rig.boundaries)}`);
     } finally {
       restore();
+    }
+  });
+
+  it("shutdown deadline cancels the upload and awaits its settlement before safety.dispose", async () => {
+    const { gitlab } = fakeGitlab();
+    const originalPublish = client.publishCheckpoint.bind(client);
+    let uploadSettled = false;
+    (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = async (
+      _runId: string,
+      _tipOid: string,
+      pack: Readable,
+      signal?: AbortSignal,
+    ) => {
+      await drain(pack);
+      await new Promise<void>((resolve) => {
+        if (signal?.aborted) resolve();
+        else signal?.addEventListener("abort", () => resolve(), { once: true });
+      });
+      await new Promise<void>((resolve) => setTimeout(resolve, 30));
+      uploadSettled = true;
+      throw new Error("test upload aborted");
+    };
+    try {
+      const rig = codexRig();
+      const originalDispose = rig.safety.dispose.bind(rig.safety);
+      let disposeBeforeSettlement = false;
+      rig.safety.dispose = async (request) => {
+        if (!uploadSettled) disposeBeforeSettlement = true;
+        return originalDispose(request);
+      };
+      let started!: () => void;
+      const startedP = new Promise<void>((resolve) => { started = resolve; });
+      const runner = runnerWith(() => ({ executor: new FakeCodexExecutor(rig.safety, async (ctx) => {
+        commitInTree(ctx.worktreePath, "SHUT-TIMEOUT.txt", "work before timeout\n");
+        started();
+        await new Promise<void>((_, reject) => ctx.signal!.addEventListener("abort", () => reject(new Error("aborted")), { once: true }));
+        return { branch: ctx.branch };
+      }) }), gitlab, undefined, undefined, {
+        codexBoundaryDeadlineMs: 500,
+        shutdownPublishTimeoutMs: 500,
+      });
+      const run = runner.execute(gitlabClaim(1209, { wait_on_limit: true }));
+      await startedP;
+      runner.shutdown();
+      await run;
+      assert.equal(uploadSettled, true);
+      assert.equal(disposeBeforeSettlement, false, "terminal dispose cannot overtake the timed-out durability action");
+      assert.deepEqual(rig.disposeBoundaries, ["terminal"]);
+    } finally {
+      (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = originalPublish;
     }
   });
 

@@ -296,6 +296,7 @@ export class CodexDelegationRunner {
       toolHandlers: this.toolHandlers,
       allowedRoles: new Set<string>(),
       screenPolicy: this.screenPolicy,
+      signal,
     });
 
     const pending = new Set<Promise<void>>();

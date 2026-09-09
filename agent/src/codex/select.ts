@@ -28,17 +28,33 @@ declare const codexBindingBrand: unique symbol;
  *   * `accessToken` / `capability` — non-empty, server-owned; SECRETS (never logged).
  *   * `generation` — present IFF subscription (the worker's initial observedGeneration
  *     for coordinated refresh); ABSENT for api_key.
+ *   * `chatgptAccountId` / `chatgptPlanType` — subscription-only, server-owned inputs for
+ *     pinned app-server. The callback's previousAccountId is an untrusted hint.
  *
  * Obtainable only via {@link selectCodexBinding}; the brand blocks object-literal
  * forgery.
  */
-export interface CodexBinding {
+interface CodexBindingBase {
   readonly [codexBindingBrand]: true;
-  readonly authMode: "subscription" | "api_key";
   readonly accessToken: string;
   readonly capability: string;
-  readonly generation?: number;
 }
+
+export type CodexBinding = CodexBindingBase &
+  (
+    | {
+        readonly authMode: "subscription";
+        readonly generation: number;
+        readonly chatgptAccountId: string;
+        readonly chatgptPlanType: null;
+      }
+    | {
+        readonly authMode: "api_key";
+        readonly generation?: never;
+        readonly chatgptAccountId?: never;
+        readonly chatgptPlanType?: never;
+      }
+  );
 
 /** The dark selection decision. `claude` is the exact legacy Claude path (absence);
  *  `codex` carries a validated binding (a complete server-owned Codex block). */
@@ -55,7 +71,11 @@ export type CodexSelectionErrorReason =
   | "invalid_capability"
   | "subscription_missing_generation"
   | "subscription_generation_not_finite"
-  | "api_key_unexpected_generation";
+  | "subscription_generation_not_safe_integer"
+  | "subscription_generation_negative"
+  | "subscription_invalid_account_id"
+  | "subscription_invalid_plan_type"
+  | "api_key_unexpected_subscription_fields";
 
 /** Static, bounded messages. Deliberately NO interpolation of the offending value:
  *  the access token and capability are secrets, and even the auth_mode is untrusted
@@ -67,7 +87,11 @@ const REASON_MESSAGES: Record<CodexSelectionErrorReason, string> = {
   invalid_capability: "Codex claim block is missing a valid capability",
   subscription_missing_generation: "Codex subscription claim is missing its generation",
   subscription_generation_not_finite: "Codex subscription claim generation is not a finite number",
-  api_key_unexpected_generation: "Codex api_key claim must not carry a generation",
+  subscription_generation_not_safe_integer: "Codex subscription claim generation is not a safe integer",
+  subscription_generation_negative: "Codex subscription claim generation must be nonnegative",
+  subscription_invalid_account_id: "Codex subscription claim is missing its verified account id",
+  subscription_invalid_plan_type: "Codex subscription claim plan type must be null",
+  api_key_unexpected_subscription_fields: "Codex api_key claim must not carry subscription metadata",
 };
 
 /**
@@ -149,13 +173,37 @@ function validateCodexBinding(raw: unknown): CodexBinding {
     if (!Number.isFinite(generation)) {
       throw new CodexSelectionError("subscription_generation_not_finite");
     }
-    return { authMode, accessToken, capability, generation } as CodexBinding;
+    if (!Number.isSafeInteger(generation)) {
+      throw new CodexSelectionError("subscription_generation_not_safe_integer");
+    }
+    if (generation < 0) {
+      throw new CodexSelectionError("subscription_generation_negative");
+    }
+    const chatgptAccountId = record.chatgpt_account_id;
+    if (typeof chatgptAccountId !== "string" || chatgptAccountId.length === 0) {
+      throw new CodexSelectionError("subscription_invalid_account_id");
+    }
+    if (record.chatgpt_plan_type !== null) {
+      throw new CodexSelectionError("subscription_invalid_plan_type");
+    }
+    return {
+      authMode,
+      accessToken,
+      capability,
+      generation,
+      chatgptAccountId,
+      chatgptPlanType: null,
+    } as CodexBinding;
   }
 
-  // api_key: carries NO refresh generation. A present one is malformed (it can never
-  // refresh), so we reject rather than silently ignore it.
-  if (record.generation !== undefined) {
-    throw new CodexSelectionError("api_key_unexpected_generation");
+  // api_key carries no subscription generation/account/plan fields. Any presence is
+  // malformed, including an explicit null: reject rather than silently ignore it.
+  if (
+    record.generation !== undefined ||
+    record.chatgpt_account_id !== undefined ||
+    record.chatgpt_plan_type !== undefined
+  ) {
+    throw new CodexSelectionError("api_key_unexpected_subscription_fields");
   }
   return { authMode, accessToken, capability } as CodexBinding;
 }

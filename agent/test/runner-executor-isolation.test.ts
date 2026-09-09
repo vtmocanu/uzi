@@ -370,7 +370,14 @@ describe("RunRunner — per-run executor isolation (PRD #42 Decision 4)", () => 
           forge_pat: "fixture-forge-pat-codex-01",
           anthropic_oauth_token: "dummy-oauth-codex-000001",
           forge_username: "bot",
-          codex: { auth_mode: "subscription", access_token: CODEX_TOKEN, capability: CODEX_CAP, generation: 3 },
+          codex: {
+            auth_mode: "subscription",
+            access_token: CODEX_TOKEN,
+            capability: CODEX_CAP,
+            generation: 3,
+            chatgpt_account_id: "verified-account",
+            chatgpt_plan_type: null,
+          },
         },
       });
       await runnerWith(() => {

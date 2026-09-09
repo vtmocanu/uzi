@@ -4,10 +4,11 @@ import { EventEmitter } from "node:events";
 import { createInterface } from "node:readline";
 import { PassThrough, Writable } from "node:stream";
 
-import { setprivRunnerArgs } from "../src/runner-uid.js";
+import { COMMAND_UID, WORKER_UID, setprivArgsForUid, setprivRunnerArgs } from "../src/runner-uid.js";
 import {
   CodexUnsupportedProfileError,
   launchCodexRoot,
+  launchCodexEffectRoot,
   type CodexLaunchSpec,
   type LauncherDeps,
   type RunnerTreeRequest,
@@ -81,6 +82,7 @@ class FakeSupervisor extends EventEmitter {
   writeEvidence(value: unknown): void { this.evidence.write(`${JSON.stringify(value)}\n`); }
   writeRawEvidence(text: string): void { this.evidence.write(`${text}\n`); }
   emitAbnormal(reason: string): void { this.writeEvidence({ event: "abnormal", reason, cleanup: { state: "unconfirmed" } }); }
+  emitChildExit(code: number): void { this.writeEvidence({ event: "child_exit", code }); }
   exitWith(code: number, signal: NodeJS.Signals | null = null): void { this.emit("exit", code, signal); }
 
   private onControl(line: string): void {
@@ -189,7 +191,7 @@ describe("launchCodexRoot: env allowlist, trees, argv", () => {
   });
 
   it("(b') is credential-FREE for kind:command", async () => {
-    const fake = newFake();
+    const fake = newFake({ uid: COMMAND_UID });
     await launchCodexRoot(baseSpec({ kind: "command", childArgv: ["exec", "--", "echo"] }), baseDeps(fake));
     const env = spawnCalls[0]?.options.env ?? {};
     assert.equal(env.CODEX_PROVIDER_KEY, undefined, "no provider credential for a command root");
@@ -247,6 +249,65 @@ describe("launchCodexRoot: env allowlist, trees, argv", () => {
   it("rejects a started posture with an unexpected capability bounding set", async () => {
     const fake = newFake({ capBoundingSet: "0xff" });
     await assert.rejects(launchCodexRoot(baseSpec(), baseDeps(fake)), /unsafe start posture.*capBoundingSet=0xff/s);
+  });
+});
+
+describe("launchCodexEffectRoot: supervised command identity", () => {
+  it("launches uid 10003 with a replaced env and reports the primary child status", async () => {
+    const fake = newFake({ uid: COMMAND_UID });
+    const env = { PATH: "/usr/bin:/bin", HOME: "/tmp", TMPDIR: "/tmp" };
+    // Runtime assembly preserves the UUID-format cleanup-token assertion without
+    // committing a generic-api-key-shaped false positive to the public tree.
+    const cleanupToken = ["01234567", "89ab", "cdef", "0123", "456789abcdef"].join("-");
+    const handle = await launchCodexEffectRoot(
+      {
+        identity: "command",
+        command: "/bin/sh",
+        args: ["-c", "exit 7"],
+        cwd: "/work/repo",
+        env,
+        supervisorBin: SUPERVISOR_BIN,
+        cleanupToken,
+      },
+      baseDeps(fake, { resolveCommandUid: () => COMMAND_UID }),
+    );
+    const call = spawnCalls[0];
+    assert.ok(call);
+    assert.equal(call.command, "/bin/setpriv");
+    assert.deepEqual(call.args, [
+      ...setprivArgsForUid(COMMAND_UID),
+      SUPERVISOR_BIN,
+      "--expect-uid", String(COMMAND_UID),
+      "--cleanup-token", cleanupToken,
+      "--", "/bin/sh", "-c", "exit 7",
+    ]);
+    assert.deepEqual(call.options.env, env);
+    fake.emitChildExit(7);
+    assert.deepEqual(await handle.waitChild(), { event: "child_exit", code: 7 });
+  });
+
+  it("keeps a permit-held worker action at uid 10001 while still using the fixed supervisor", async () => {
+    const fake = newFake({ uid: WORKER_UID });
+    const env = { PATH: "/usr/bin:/bin", GIT_CONFIG_COUNT: "0" };
+    await launchCodexEffectRoot(
+      {
+        identity: "worker_pat",
+        command: "/usr/bin/git",
+        args: ["status"],
+        cwd: "/work/repo",
+        env,
+        supervisorBin: SUPERVISOR_BIN,
+      },
+      baseDeps(fake, { resolveWorkerUid: () => WORKER_UID }),
+    );
+    const call = spawnCalls[0];
+    assert.ok(call);
+    assert.equal(call.command, "/bin/setpriv", "the worker uid is retained while its controller caps are cleared");
+    assert.deepEqual(call.args, [
+      ...setprivArgsForUid(WORKER_UID), SUPERVISOR_BIN,
+      "--expect-uid", String(WORKER_UID), "--drop-controller-caps", "--", "/usr/bin/git", "status",
+    ]);
+    assert.deepEqual(call.options.env, env);
   });
 });
 
@@ -310,6 +371,14 @@ describe("launchCodexRoot: happy-path lifecycle over the fake supervisor", () =>
 });
 
 describe("launchCodexRoot: abnormal paths never claim clean disposal", () => {
+  it("treats a provider primary-child exit as a root failure", async () => {
+    const fake = newFake();
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    fake.emitChildExit(17);
+    const failure = await handle.whenFailed;
+    assert.match(failure.message, /provider child exited unexpectedly.*17/);
+  });
+
   it("(f1) an `abnormal` evidence frame fails the root", async () => {
     const fake = newFake();
     const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
@@ -390,6 +459,7 @@ describe("runLaunchCli: packaged entrypoint (knip-visible import)", () => {
       supervisorPid: 1,
       transport: { stdin: null, stdout: null, stderr: null },
       snapshot: () => Promise.reject(new Error("unused")),
+      waitChild: () => Promise.resolve({ event: "child_exit" as const, code: 0 }),
       dispose: () => { disposed.push(1); return Promise.resolve({ clean: true as const, event: { event: "dispose" as const, id: 1, state: "drained" as const } }); },
       failed: undefined,
       whenFailed: new Promise<Error>(() => { /* never fails in this test */ }),
