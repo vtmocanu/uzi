@@ -106,7 +106,7 @@ func (s *Service) FindingsBacklog(ctx context.Context, ownerUserID uuid.UUID, bu
 	// newest-first). A coordinate whose evidence was cascaded away returns no rows and keeps its
 	// nil preview/occurrences (last_title still keeps it legible).
 	if len(dispositionIDs) > 0 {
-		if err := s.attachFindingEvidence(ctx, out.Findings, dispositionIDs); err != nil {
+		if err := s.attachFindingEvidence(ctx, ownerUserID, out.Findings, dispositionIDs); err != nil {
 			return apitypes.IncidentalFindingBacklogDTO{}, err
 		}
 	}
@@ -116,9 +116,13 @@ func (s *Service) FindingsBacklog(ctx context.Context, ownerUserID uuid.UUID, bu
 // attachFindingEvidence loads the per-run evidence behind a page of coordinates in ONE query and
 // sets each DTO's EvidencePreview (newest description_md, capped) and Occurrences (newest-first,
 // capped at maxFindingOccurrences). dispositionIDs is index-aligned with findings, so the
-// disposition id at findings[i] is dispositionIDs[i].
-func (s *Service) attachFindingEvidence(ctx context.Context, findings []apitypes.IncidentalFindingDTO, dispositionIDs []uuid.UUID) error {
-	rows, err := s.q.ListFindingEvidenceForDispositions(ctx, dispositionIDs)
+// disposition id at findings[i] is dispositionIDs[i]. ownerUserID scopes the evidence read to the
+// caller's coordinates (defense-in-depth at the query boundary, CWE-639/IDOR).
+func (s *Service) attachFindingEvidence(ctx context.Context, ownerUserID uuid.UUID, findings []apitypes.IncidentalFindingDTO, dispositionIDs []uuid.UUID) error {
+	rows, err := s.q.ListFindingEvidenceForDispositions(ctx, store.ListFindingEvidenceForDispositionsParams{
+		Ids:    dispositionIDs,
+		UserID: ownerUserID,
+	})
 	if err != nil {
 		return err
 	}
@@ -129,6 +133,8 @@ func (s *Service) attachFindingEvidence(ctx context.Context, findings []apitypes
 		if _, seen := previews[e.DispositionID]; !seen {
 			previews[e.DispositionID] = rationalePreview(e.DescriptionMd)
 		}
+		// The SQL query already caps each disposition to its newest 20 rows (row_number() window,
+		// keep 20 == maxFindingOccurrences in sync); this guard is a defensive belt-and-braces cap.
 		if len(occurrences[e.DispositionID]) < maxFindingOccurrences {
 			occurrences[e.DispositionID] = append(occurrences[e.DispositionID], apitypes.FindingOccurrenceDTO{
 				RunID:      e.RunID.String(),

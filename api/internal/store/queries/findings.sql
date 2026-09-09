@@ -278,25 +278,37 @@ WHERE user_id = @user_id
 -- this ONCE. Evidence lives in `findings` keyed by the coordinate (user_id, repo_id, location),
 -- so it joins finding_dispositions d (by id) back to findings f on the coordinate, then to runs
 -- for the run title. `runs.issue_title` is the run title, exactly what JudgeOccurrenceDTO carries;
--- findings.run_id CASCADEs to runs, so the inner JOIN never drops a live evidence row. Ordered
--- newest-first WITHIN each disposition (created_at DESC, id DESC breaks ties on the same instant),
--- so Go takes the FIRST row per disposition as the evidence_preview and the rows in order as the
--- occurrence list (capped at 20 in Go, not here, per the delegation). A resolved coordinate whose
--- evidence was all cascaded away with a deleted run simply returns no rows — no preview, no
--- occurrences — which is correct (last_title still keeps it legible in the backlog).
-SELECT
-    d.id             AS disposition_id,
-    f.run_id         AS run_id,
-    r.issue_title    AS run_title,
-    f.created_at     AS reported_at,
-    f.confidence     AS confidence,
-    f.description_md AS description_md
-FROM finding_dispositions d
-JOIN findings f
-    ON f.user_id = d.user_id AND f.repo_id = d.repo_id AND f.location = d.location
-JOIN runs r ON r.id = f.run_id
-WHERE d.id = ANY(@ids::uuid[])
-ORDER BY d.id, f.created_at DESC, f.id DESC;
+-- findings.run_id CASCADEs to runs, so the inner JOIN never drops a live evidence row.
+--
+-- OWNER-SCOPED IN SQL: the @user_id predicate (AND d.user_id = @user_id) enforces ownership at the
+-- query boundary as defense-in-depth (CWE-639/IDOR), not only in the already-owner-scoped caller.
+-- CAPPED IN SQL: a row_number() window PARTITION BY d.id keeps only the newest 20 evidence rows per
+-- disposition (rn <= 20), so a bug seen in hundreds of runs no longer streams every row to Go.
+-- Ordered newest-first WITHIN each disposition (created_at DESC, id DESC breaks ties on the same
+-- instant, materialised as rn where rn=1 is newest), so Go takes the FIRST row per disposition as the
+-- evidence_preview and the rows in order as the occurrence list. A resolved coordinate whose evidence
+-- was all cascaded away with a deleted run simply returns no rows — no preview, no occurrences —
+-- which is correct (last_title still keeps it legible in the backlog).
+SELECT disposition_id, run_id, run_title, reported_at, confidence, description_md
+FROM (
+    SELECT
+        d.id             AS disposition_id,
+        f.run_id         AS run_id,
+        r.issue_title    AS run_title,
+        f.created_at     AS reported_at,
+        f.confidence     AS confidence,
+        f.description_md AS description_md,
+        row_number() OVER (PARTITION BY d.id ORDER BY f.created_at DESC, f.id DESC) AS rn
+    FROM finding_dispositions d
+    JOIN findings f
+        ON f.user_id = d.user_id AND f.repo_id = d.repo_id AND f.location = d.location
+    JOIN runs r ON r.id = f.run_id
+    WHERE d.id = ANY(@ids::uuid[])
+      AND d.user_id = @user_id
+) ranked
+-- 20 mirrors maxFindingOccurrences in api/internal/workersvc/findings_backlog.go; keep the two in sync.
+WHERE rn <= 20
+ORDER BY disposition_id, rn;
 
 -- name: BulkDismissFindings :many
 -- Bulk triage (PRD #1183 M3): dismiss up to N owned OPEN coordinates in one statement, keyed by
