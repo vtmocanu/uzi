@@ -246,6 +246,27 @@ func TestSyncFindingIssueClosesLiveDB(t *testing.T) {
 	}
 }
 
+// ── An OPEN finding issue is left filed: the close sync fires only on the closed edge ──
+// Regression for the SQL edge predicate `i.state = 'closed'` in ListFindingIssueCloseEdges: with an
+// opened cached issue the sync must be a no-op — the coordinate stays `filed` and close_synced_at is
+// never stamped. Without this case, dropping the state predicate would not redden the suite.
+func TestSyncFindingIssueOpenStaysFiledLiveDB(t *testing.T) {
+	svc, pool, q := findingCloseSyncLiveDB(t)
+	ctx := context.Background()
+	userID, repoID, location := seedFindingCloseFixture(ctx, t, q, pool, 550, false)
+
+	if err := svc.SyncFindingIssueCloses(ctx, repoID); err != nil {
+		t.Fatalf("SyncFindingIssueCloses: %v", err)
+	}
+	s := readDisp(ctx, t, pool, userID, repoID, location)
+	if s.status != "filed" {
+		t.Fatalf("status = %s, want filed (an opened issue must not auto-move to done)", s.status)
+	}
+	if s.closeSynced {
+		t.Fatal("close_synced_at was stamped for an opened issue; the sync must fire only on the closed edge")
+	}
+}
+
 // ── A reopened coordinate refiled with a NEW iid syncs again ──
 func TestFindingReopenRefileSyncsAgainLiveDB(t *testing.T) {
 	svc, pool, q := findingCloseSyncLiveDB(t)

@@ -118,6 +118,13 @@ func TestIncidentalFindingsLiveDB(t *testing.T) {
 		for _, stmt := range migrationUpStatements(t, "00206_finding_issue_close_sync.sql") {
 			mustExec(ctx, t, pool, stmt)
 		}
+		// 00207 VALIDATEs the two CHECKs 00206 added NOT VALID (status now admits 'done', and set_via),
+		// so this hand-replayed recreate matches the schema store.Migrate produces rather than leaving
+		// the constraints un-validated. (store.Migrate can't do it: after 00129's Down the recorded
+		// goose version is still HEAD, so a Migrate call is a no-op and the dropped tables stay gone.)
+		for _, stmt := range migrationUpStatements(t, "00207_validate_finding_status_check.sql") {
+			mustExec(ctx, t, pool, stmt)
+		}
 	})
 
 	insFinding := func(runID, repoID uuid.UUID, location, title string) store.IncidentalFinding {
