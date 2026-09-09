@@ -3,7 +3,7 @@
 **Status**: Accepted
 **Date**: 2026-08-09
 **Deciders**: Vlad + agent team (architect, coders, review waves — reviewer, auditor, tester, web-ux)
-**PRD**: [prds/done/246-trusted-repo-instructions.md](../prds/done/246-trusted-repo-instructions.md) (GitLab issue [vtmocanu/uzi#246](https://github.com/vtmocanu/uzi/issues/246)) — the PRD carries the milestones, the full evidence base, and the decision log; this ADR carries the durable design shape and its rationale.
+**PRD**: [prds/done/246-trusted-repo-instructions.md](../prds/done/246-trusted-repo-instructions.md) (GitHub issue [vtmocanu/uzi#246](https://github.com/vtmocanu/uzi/issues/246)) — the PRD carries the milestones, the full evidence base, and the decision log; this ADR carries the durable design shape and its rationale.
 
 ## Decision (summary)
 
@@ -124,9 +124,37 @@ parses):
 
 - **Root file only.** `path.join(clonePath, "CLAUDE.md")` — no nested
   `**/CLAUDE.md`, no `CLAUDE.local.md`.
-- **Symlinks never followed.** `lstat` gates on `isFile()`; a symlink or
-  directory is dropped (`symlinked`) and never read, so a hostile repo
-  cannot redirect the read outside its own tree.
+- **Symlinks followed, but only when contained.** `realpath` resolves
+  both the clone path and the link, following the whole chain (a broken
+  link or an `ELOOP` cycle throws, dropped `symlinked`); containment is
+  then checked with `path.relative` on the two realpath-resolved paths —
+  not a `startsWith` string prefix, which a sibling directory like
+  `<clone>-evil` would defeat — and an empty/`..`/`../…`/absolute result
+  means the target escapes the clone tree, dropped `symlinked`. A
+  resolved target under the clone's `.git/` dir is also dropped
+  `symlinked`. The resolved path is then `open`ed once and the
+  regular-file check (fstat) and the read both go through that one
+  handle (a non-regular target — a symlink to a directory/device — is
+  dropped `symlinked` at the fstat), so the fstat and the read operate on
+  the same opened inode and nothing can redirect the read AFTER `open`.
+  This honors the common `CLAUDE.md -> AGENTS.md` convention (uzi's own
+  repo layout). The containment check establishes the realpath is in-tree;
+  it is not a full guarantee the OPENED inode is that same file, because a
+  parent-component swap between `realpath` and `open` is a documented
+  residual (below). Note the source is widened: a followed target is
+  ANY in-tree regular file (it may be untracked or build-generated), not
+  only a human-authored one; what bounds it is the containment, the
+  advisory framing, and that the read runs BEFORE the same-run dependency
+  install writes into the clone (the worker reads the root file before it
+  kicks off `startDepsInstall`; the install runs `--ignore-scripts`, so
+  the concurrent writer is the package manager itself, not repo postinstall
+  code) and before any agent turn runs repo-authored code. That ordering
+  removes the same-run package-manager writer from the resolve→open
+  window; the file descriptor pins the bytes after `open`, and
+  `O_NOFOLLOW` rejects a final-component symlink swap. It is not total: a
+  parent-component swap before `open`, and documented cross-run races
+  (with `WORKER_MAX_CONCURRENT_RUNS` > 1 a sibling run's Bash can write
+  another run's worktree, see `docs/worker-setup.md`), remain residual.
 - **Line-leading `@`-import lines stripped**, replaced with a visible
   `<!-- uzi: @-import stripped -->` marker. Claude Code's `CLAUDE.md`
   `@path` imports are an arbitrary-file-read vector; because uzi reads the

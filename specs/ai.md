@@ -20035,8 +20035,10 @@ user-stated requirement changed; this rides those existing constraints. Full rat
   the `PreToolUse` deny-hook. **Why:** keeping the SDK loader disabled is what makes "advisory
   context" strictly weaker than "SDK-honored config."
 - **Structural sanitization ONLY — no prose / injection-phrase filtering.** Root-file-only; `lstat`
-  symlink-guard (a symlinked or non-regular `CLAUDE.md` is never read, mirroring §105's SKILL.md
-  guard); line-leading `@`-import lines stripped to a visible marker (defense-in-depth against a
+  symlink-guard (a symlinked `CLAUDE.md` is FOLLOWED only when it resolves — via `realpath` +
+  `path.relative` containment — to a regular file INSIDE the clone tree and not under `.git/`; an
+  escaping / broken / looping / non-regular-file / `.git/` symlink is dropped `symlinked`, never
+  read); line-leading `@`-import lines stripped to a visible marker (defense-in-depth against a
   model-induced `Read`, inert because WE read the file so the SDK never resolves the ref); a 64 KiB
   cap enforced on **both** raw bytes AND post-sanitization bytes (the marker is longer than the `@…`
   line it replaces, so a file under the raw cap could amplify over it — the injected text can never

@@ -1,6 +1,9 @@
-import { afterEach, beforeEach, describe, it } from "node:test";
+import { afterEach, beforeEach, describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import fsp from "node:fs/promises";
+import type { FileHandle } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import {
@@ -10,9 +13,11 @@ import {
 } from "../src/repo-instructions.js";
 
 // PRD #246 M2 — the structural sanitizer for the clone's ROOT CLAUDE.md. Root file
-// only, symlink never followed, size-capped, line-leading @-imports stripped, CRLF
-// normalized. Safety is structure + framing, NOT prose filtering (see the file's own
-// trust-model comment); these tests pin the structural transforms only.
+// only; a symlink is followed ONLY when its resolved real path is a regular file
+// inside the clone tree and not under `.git/` (escaping/broken/looping/non-file/`.git/`
+// symlinks are dropped); size-capped, line-leading @-imports stripped, CRLF normalized.
+// Safety is structure + framing, NOT prose filtering (see the file's own trust-model
+// comment); these tests pin the structural transforms only.
 describe("readRepoInstructions (PRD #246 M2)", () => {
   let clone: string;
   beforeEach(() => {
@@ -85,10 +90,10 @@ describe("readRepoInstructions (PRD #246 M2)", () => {
     assert.strictEqual(result.text, body);
   });
 
-  it("a symlinked CLAUDE.md is NEVER read ⇒ dropped: symlinked", async () => {
-    // A real target OUTSIDE the clone, and CLAUDE.md is a symlink to it. lstat must
-    // see the symlink and refuse, exactly like repo-skills.ts refuses a symlinked
-    // SKILL.md — so a hostile repo cannot redirect the read out of its tree.
+  it("a symlink whose target escapes the clone tree is never read ⇒ dropped: symlinked", async () => {
+    // A real target OUTSIDE the clone, and CLAUDE.md is a symlink to it. The resolved
+    // real path is not contained by the clone, so it is refused — a hostile repo
+    // cannot redirect the read out of its tree.
     const outside = path.join(os.tmpdir(), `uzi-repoinstr-target-${process.pid}-${Date.now()}.md`);
     fs.writeFileSync(outside, "# secret outside the clone\n");
     try {
@@ -102,6 +107,232 @@ describe("readRepoInstructions (PRD #246 M2)", () => {
   it("a directory named CLAUDE.md ⇒ dropped: symlinked (non-regular file)", async () => {
     fs.mkdirSync(repoInstructionsPath(clone));
     assert.deepStrictEqual(await readRepoInstructions(clone), { dropped: "symlinked" });
+  });
+
+  it("an in-tree symlink IS followed and read (CLAUDE.md -> AGENTS.md)", async () => {
+    // The common convention (this repo's own layout): CLAUDE.md is a relative symlink
+    // to a real, in-tree AGENTS.md. It is followed and its content read.
+    const body = "# Conventions\nRun the gate before every push.\n";
+    fs.writeFileSync(path.join(clone, "AGENTS.md"), body);
+    fs.symlinkSync("AGENTS.md", repoInstructionsPath(clone));
+    const result = await readRepoInstructions(clone);
+    assert.ok("text" in result);
+    assert.strictEqual(result.text, body);
+  });
+
+  it("an in-tree symlink to a file in a SUBDIRECTORY is followed", async () => {
+    const body = "# Nested\nInstructions live under docs/.\n";
+    fs.mkdirSync(path.join(clone, "docs"));
+    fs.writeFileSync(path.join(clone, "docs", "instructions.md"), body);
+    fs.symlinkSync("docs/instructions.md", repoInstructionsPath(clone));
+    const result = await readRepoInstructions(clone);
+    assert.ok("text" in result);
+    assert.strictEqual(result.text, body);
+  });
+
+  it("an in-tree symlink CHAIN is followed (CLAUDE.md -> a.md -> b.md)", async () => {
+    // realpath walks the whole chain; every hop stays inside the clone.
+    const body = "# End of the chain\nThis is b.md.\n";
+    fs.writeFileSync(path.join(clone, "b.md"), body);
+    fs.symlinkSync("b.md", path.join(clone, "a.md"));
+    fs.symlinkSync("a.md", repoInstructionsPath(clone));
+    const result = await readRepoInstructions(clone);
+    assert.ok("text" in result);
+    assert.strictEqual(result.text, body);
+  });
+
+  it("a relative symlink that escapes via .. ⇒ dropped: symlinked", async () => {
+    // The target is a real file, but it resolves OUTSIDE the clone (a sibling under
+    // tmpdir, since the clone is a direct child of tmpdir), so the containment check
+    // refuses it — not the broken-link path.
+    const outsideName = `uzi-repoinstr-escape-${process.pid}-${Date.now()}.md`;
+    const outside = path.join(clone, "..", outsideName);
+    fs.writeFileSync(outside, "# outside the clone\n");
+    try {
+      fs.symlinkSync(path.join("..", outsideName), repoInstructionsPath(clone));
+      assert.deepStrictEqual(await readRepoInstructions(clone), { dropped: "symlinked" });
+    } finally {
+      fs.rmSync(outside, { force: true });
+    }
+  });
+
+  it("a broken/dangling symlink ⇒ dropped: symlinked", async () => {
+    // Target does not exist, so realpath throws — never read.
+    fs.symlinkSync("does-not-exist.md", repoInstructionsPath(clone));
+    assert.deepStrictEqual(await readRepoInstructions(clone), { dropped: "symlinked" });
+  });
+
+  it("a symlink to an in-tree DIRECTORY ⇒ dropped: symlinked", async () => {
+    // Contained, but the resolved target is not a regular file.
+    fs.mkdirSync(path.join(clone, "subdir"));
+    fs.symlinkSync("subdir", repoInstructionsPath(clone));
+    assert.deepStrictEqual(await readRepoInstructions(clone), { dropped: "symlinked" });
+  });
+
+  it("a symlink into a name-prefix SIBLING of the clone ⇒ dropped: symlinked", async () => {
+    // The escape a `realTarget.startsWith(realClone)` check would WRONGLY admit: a
+    // sibling dir whose path shares the clone's name prefix (e.g. `<clone>-evil`). The
+    // `path.relative` containment used here yields `../<clone>-evil/...`, so it is
+    // correctly refused. Pins the exact defense the code comments call out.
+    const evil = `${clone}-evil`;
+    fs.mkdirSync(evil);
+    const target = path.join(evil, "secret.md");
+    fs.writeFileSync(target, "# outside the clone via a name-prefix sibling\n");
+    try {
+      fs.symlinkSync(target, repoInstructionsPath(clone)); // absolute target
+      assert.deepStrictEqual(await readRepoInstructions(clone), { dropped: "symlinked" });
+    } finally {
+      fs.rmSync(evil, { recursive: true, force: true });
+    }
+  });
+
+  it("a symlink to a file under the clone's .git/ dir ⇒ dropped: symlinked", async () => {
+    // In-tree but never legitimate instruction content: a `.git/` target is refused
+    // even though it is contained, so a symlink cannot inject repo metadata.
+    fs.mkdirSync(path.join(clone, ".git"));
+    fs.writeFileSync(path.join(clone, ".git", "config"), "[core]\n\trepositoryformatversion = 0\n");
+    fs.symlinkSync(path.join(".git", "config"), repoInstructionsPath(clone));
+    assert.deepStrictEqual(await readRepoInstructions(clone), { dropped: "symlinked" });
+  });
+
+  it("sanitization applies to the RESOLVED content of an in-tree symlink", async () => {
+    // The @-import strip runs on the followed target's bytes, not the link.
+    fs.writeFileSync(
+      path.join(clone, "AGENTS.md"),
+      "# Conventions\n@./secrets.md\nRun the gate before every push.\n",
+    );
+    fs.symlinkSync("AGENTS.md", repoInstructionsPath(clone));
+    const result = await readRepoInstructions(clone);
+    assert.ok("text" in result);
+    assert.ok(!result.text.includes("@./secrets.md"));
+    assert.strictEqual(result.text.match(/<!-- uzi: @-import stripped -->/g)?.length, 1);
+    assert.ok(result.text.includes("Run the gate before every push."));
+  });
+
+  it("an in-tree symlink to an oversized (> 64 KiB) real file ⇒ dropped: too_large", async () => {
+    // The resolved target's size is what bounds the cap, checked before reading.
+    fs.writeFileSync(path.join(clone, "AGENTS.md"), "x".repeat(REPO_INSTRUCTIONS_MAX_BYTES + 1));
+    fs.symlinkSync("AGENTS.md", repoInstructionsPath(clone));
+    assert.deepStrictEqual(await readRepoInstructions(clone), { dropped: "too_large" });
+  });
+
+  it("an actual ELOOP symlink cycle (a -> b -> a) ⇒ dropped: symlinked", async () => {
+    // realpath walks the chain and throws ELOOP on a cycle; the reader maps that throw
+    // to `symlinked`, never a crash. CLAUDE.md -> a.md, a.md -> b.md, b.md -> a.md.
+    fs.symlinkSync("a.md", repoInstructionsPath(clone));
+    fs.symlinkSync("b.md", path.join(clone, "a.md"));
+    fs.symlinkSync("a.md", path.join(clone, "b.md"));
+    assert.deepStrictEqual(await readRepoInstructions(clone), { dropped: "symlinked" });
+  });
+
+  it("a symlinked clonePath still follows an in-tree symlink target", async () => {
+    // The clone root itself is reached via a symlink (realpath resolves BOTH sides, so
+    // the containment compare is realClone vs realTarget, not the raw paths). An in-tree
+    // CLAUDE.md -> AGENTS.md is still correctly contained and read.
+    const body = "# Via a symlinked clone root\nStill contained.\n";
+    fs.writeFileSync(path.join(clone, "AGENTS.md"), body);
+    fs.symlinkSync("AGENTS.md", repoInstructionsPath(clone));
+    const linkToClone = `${clone}-alias`;
+    fs.symlinkSync(clone, linkToClone);
+    try {
+      const result = await readRepoInstructions(linkToClone);
+      assert.ok("text" in result);
+      assert.strictEqual(result.text, body);
+    } finally {
+      fs.rmSync(linkToClone, { force: true });
+    }
+  });
+
+  it("an in-tree symlink to an UNTRACKED/generated regular file is followed (provenance is 'any in-tree regular file')", async () => {
+    // Pins the intended (widened) provenance policy: the followed target need not be a
+    // tracked or human-authored file — any contained regular file is read. A build step
+    // writing a file the symlink points at is in scope by design; the safety rests on
+    // containment + advisory framing + reading before untrusted code runs, NOT on the
+    // target's provenance. If this policy is ever tightened, this test should change too.
+    const body = "# Generated at build time\nNot a tracked file.\n";
+    fs.writeFileSync(path.join(clone, "generated.md"), body);
+    fs.symlinkSync("generated.md", repoInstructionsPath(clone));
+    const result = await readRepoInstructions(clone);
+    assert.ok("text" in result);
+    assert.strictEqual(result.text, body);
+  });
+
+  it("an in-tree symlink to a FIFO ⇒ dropped: symlinked, and open NEVER blocks", async () => {
+    // CLAUDE.md -> an in-tree FIFO. Without O_NONBLOCK, open(O_RDONLY) on a FIFO blocks
+    // until a writer appears, hanging run setup; with it, open returns and the fstat
+    // rejects the non-regular file.
+    const fifo = path.join(clone, "pipe");
+    try {
+      execFileSync("mkfifo", [fifo], { stdio: "pipe" });
+    } catch {
+      return; // mkfifo unavailable (non-POSIX) — the guard is POSIX-only; skip cleanly.
+    }
+    fs.symlinkSync("pipe", repoInstructionsPath(clone));
+    // Bounded, and cleaned up in BOTH directions. The timer is cleared on the fast
+    // (passing) path so it never holds the event loop open. The reader is started ONCE and
+    // referenced in the catch. A rendezvous-writer is opened ONLY when the timeout actually
+    // fired (timedOut) — i.e. only when the reader is genuinely parked in open(O_RDONLY): a
+    // fast assertion failure or a reader rejection enters the catch with NO parked reader,
+    // where opening a writer would hang. The writer uses O_WRONLY | O_NONBLOCK so it never
+    // blocks, and we then let the (released) reader settle, bounded, before rethrowing.
+    const reader = readRepoInstructions(clone);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let timedOut = false;
+    const guard = new Promise<never>((_, rej) => {
+      timer = setTimeout(() => {
+        timedOut = true;
+        rej(new Error("readRepoInstructions blocked on a FIFO open"));
+      }, 3000);
+    });
+    try {
+      const result = await Promise.race([reader, guard]);
+      assert.deepStrictEqual(result, { dropped: "symlinked" });
+    } catch (err) {
+      if (timedOut) {
+        // Regression path only: release the parked reader with a non-blocking writer so
+        // the process can exit, then let the reader settle (bounded) before rethrowing.
+        try {
+          fs.closeSync(fs.openSync(fifo, fs.constants.O_WRONLY | fs.constants.O_NONBLOCK));
+        } catch {
+          /* best effort — never block or mask the real failure */
+        }
+        await Promise.race([reader.catch(() => {}), new Promise((r) => setTimeout(r, 500))]);
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+  });
+
+  it("a close() failure after a successful read is swallowed ⇒ still returns text (never throws)", async () => {
+    // The finally must not let a rejecting close() override the return: an unguarded
+    // `await fh.close()` throw in a finally replaces the try's return with a throw,
+    // breaking the reader's "always returns a drop or text, never throws" contract that
+    // keeps run setup alive. Stub open() to hand back a handle whose close rejects while
+    // stat/readFile succeed.
+    write("# prose\nkeep me\n");
+    const openReal = fsp.open.bind(fsp);
+    const m = mock.method(fsp, "open", async (p: string, flags: number) => {
+      const real = await openReal(p, flags);
+      return {
+        stat: () => real.stat(),
+        readFile: (enc: BufferEncoding) => real.readFile(enc),
+        close: async () => {
+          await real.close(); // still release the real fd, then fail the close()
+          throw new Error("synthetic close failure");
+        },
+      } as unknown as FileHandle;
+    });
+    try {
+      const result = await readRepoInstructions(clone);
+      // Non-vacuous: prove the stubbed open (whose close throws) was actually exercised,
+      // so a mock that failed to patch the shared module can't turn this into a false pass.
+      assert.ok(m.mock.callCount() >= 1, "the stubbed open must have been used");
+      assert.ok("text" in result, "a close() failure must not turn a good read into a drop or throw");
+      assert.match((result as { text: string }).text, /keep me/);
+    } finally {
+      m.mock.restore();
+    }
   });
 
   it("line-leading @-import lines are stripped to a visible marker; prose survives", async () => {
