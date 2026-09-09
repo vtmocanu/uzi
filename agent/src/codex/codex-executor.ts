@@ -109,8 +109,9 @@ export const CODEX_PRODUCTION_PROVIDER: CodexProviderConfig = {
   model: "gpt-6-astra",
 };
 
-/** The pinned, image-baked openat2 fileop helper. NOTE (m3b/m5 packaging): this binary is
- *  not yet installed in the worker images — the packaged proof (m3b) installs it. Dark. */
+/** The pinned, image-baked openat2 fileop helper — built + installed 0555 in both worker
+ *  images (base + jvm) alongside the supervisor (m5 packaging). Dark: only reached once a
+ *  Codex-bound claim selects the CodexExecutor. */
 const FILEOP_BIN = "/usr/local/bin/uzi-codex-fileop";
 
 /** The fully-REPLACED command-identity env (never merged with `process.env`): NOTHING
@@ -487,46 +488,63 @@ export class CodexExecutor implements Executor {
       LANG: "C",
     };
 
-    // (3) The plan (grants/roles/allowedRoles). Built once from an implement-phase request:
-    // the lead's root grants and the delegation role table are phase-stable for the broker.
-    const runPlan = buildCodexRunPlan(this.buildRunRequest(ctx, "implement", this.implementPrompt(ctx), undefined, new AbortController().signal));
-
     // (4) The command + fileop effect surfaces (credential-free command identity).
     const spawnCommand: SpawnCommandSeam = this.deps.spawnCommand ?? makeDefaultSpawnCommand(commandEnv);
     const fileopHandle: FileopHelperHandle = (this.deps.spawnFileop ?? defaultSpawnFileop)(worktreePath, commandEnv);
     const fileop: FileopClient = fileopHandle.client;
 
     const screenPolicy: ScreenPolicy = { dockerWired: false };
+    const childTurnDeadlineMs = this.deps.childTurnDeadlineMs ?? DEFAULT_CHILD_TURN_DEADLINE_MS;
 
     // (5) The composition cycle (harness → broker → delegation → harness) is resolved by
     // late-binding `harness`: the delegation seam captures it by reference and is only
     // invoked once a spawn_agent callback fires, by which point `harness` is assigned.
     let harness!: CodexHarness;
-    const childTurnDeadlineMs = this.deps.childTurnDeadlineMs ?? DEFAULT_CHILD_TURN_DEADLINE_MS;
-    const delegationRunner = new CodexDelegationRunner({
-      registry,
-      roles: runPlan.roles,
-      // The child-turn seam demuxes a child thread's frames off the SAME transport
-      // (part C): start a child thread/turn, register a sink, hand the runner a controller.
-      startChildTurn: (spec: StartChildTurnSpec) => this.startChildTurn(harness, provider, worktreePath, spec),
-      spawnCommand,
-      fileop,
-      worktreePath,
-      screenPolicy,
-      signal: ctx.signal,
-      childTurnDeadlineMs,
-    });
 
-    const broker = new CodexCallbackBroker({
-      registry,
-      spawnCommand,
-      fileop,
-      worktreePath,
-      grants: runPlan.lead.grants,
-      delegate: delegationRunner.toDelegateSeam(),
-      allowedRoles: runPlan.allowedRoles,
-      screenPolicy,
-    });
+    // (3) PHASE-CORRECT broker + delegation construction, PER TURN. The broker enforces the
+    // plan-phase file-write ban through `grants.phase` (broker.dispatchFileWrite returns
+    // `write_denied_in_plan`) and its delegation runner passes the SAME phase into each
+    // child's grants. buildCodexRunPlan("plan") does NOT strip write tools — the phase field
+    // IS the mechanism (render.ts) — so the broker's grants MUST be phase-correct for the turn
+    // it serves. A single implement-phase broker (frozen at construction) would leave that ban
+    // INERT during the plan turn, letting a model apply_patch/Write mutate the worktree BEFORE
+    // approval, subagents included. So the broker + its delegation runner are rebuilt per turn
+    // from a phase-correct run plan; only the phase-derived grants/roles/allowedRoles change.
+    // The registry, effect seams, worktree, screen policy and cancel signal are reused, and the
+    // provider root + transport (owned by the single `harness`, below) are built once and reused.
+    const buildPhaseBroker = (phase: "plan" | "implement"): CodexCallbackBroker => {
+      const runPlan = buildCodexRunPlan(
+        this.buildRunRequest(ctx, phase, this.phasePrompt(ctx, phase), undefined, new AbortController().signal),
+      );
+      const delegationRunner = new CodexDelegationRunner({
+        registry,
+        roles: runPlan.roles,
+        // The child-turn seam demuxes a child thread's frames off the SAME transport
+        // (part C): start a child thread/turn, register a sink, hand the runner a controller.
+        startChildTurn: (spec: StartChildTurnSpec) => this.startChildTurn(harness, provider, worktreePath, spec),
+        spawnCommand,
+        fileop,
+        worktreePath,
+        screenPolicy,
+        signal: ctx.signal,
+        childTurnDeadlineMs,
+      });
+      return new CodexCallbackBroker({
+        registry,
+        spawnCommand,
+        fileop,
+        worktreePath,
+        grants: runPlan.lead.grants,
+        delegate: delegationRunner.toDelegateSeam(),
+        allowedRoles: runPlan.allowedRoles,
+        screenPolicy,
+      });
+    };
+
+    // Seed the harness with the PLAN-phase broker (the fail-safe default: writes denied).
+    // `run()` re-points it to the phase-correct broker BEFORE each turn via `harness.useBroker`,
+    // so a turn can never route through implement-phase grants unless the executor grants them.
+    const planBroker = buildPhaseBroker("plan");
 
     // The FRESH-credential provider launch seam (part D): release a fresh committed token
     // per provider root, register it with the redactor, adopt the credential-free session
@@ -548,7 +566,7 @@ export class CodexExecutor implements Executor {
     harness = new CodexHarness({
       registry,
       launchRoot: providerLaunchSeam,
-      broker,
+      broker: planBroker,
       provider,
       workspace: worktreePath,
       homeDir: ownedDataRoot,
@@ -570,6 +588,11 @@ export class CodexExecutor implements Executor {
       // skips the planning turn and the gate.
       const preApproved = ctx.planApproved === true && !!ctx.approvedPlan?.trim();
       if (!preApproved && ctx.gatePlan) {
+        // The PLAN turn(s) run under PLAN-phase grants: the broker denies every file write
+        // (write_denied_in_plan) and child subagents inherit plan-phase grants, so nothing
+        // mutates the worktree before the plan is approved. All revise iterations reuse this
+        // plan-phase broker (the implement turn re-points it, below).
+        harness.useBroker(planBroker);
         let planResult = await this.driveCodexTurn(ctx, harness, reducer, "plan", this.planPrompt(ctx), resumeId, idleMs, wallMs);
         let planMd = planResult.plan;
         if (planMd === undefined || planMd.trim().length === 0) {
@@ -589,7 +612,10 @@ export class CodexExecutor implements Executor {
         if (verdict.kind === "cancel") throw new Error(REASON_CANCEL);
       }
 
-      // Implement turn (Codex-specific driving; the full lifecycle is m5).
+      // Implement turn (Codex-specific driving; the full lifecycle is m5). Re-point the
+      // broker to IMPLEMENT-phase grants (file writes permitted) BEFORE driving it. The plan
+      // turn has fully settled by now, so this re-point is race-free (turns are sequential).
+      harness.useBroker(buildPhaseBroker("implement"));
       await this.driveCodexTurn(ctx, harness, reducer, "implement", this.implementPrompt(ctx), resumeId, idleMs, wallMs);
 
       return { branch: ctx.branch };
@@ -827,6 +853,13 @@ export class CodexExecutor implements Executor {
       ...(effort !== undefined ? { effort } : {}),
     };
     return request;
+  }
+
+  /** The phase-appropriate prompt for a run-plan build. buildCodexRunPlan reads only the
+   *  request's grants/roles from this (the broker never consults the prompt text), so this
+   *  only keeps the constructed run plan phase-consistent for clarity. */
+  private phasePrompt(ctx: RunContext, phase: "plan" | "implement"): string {
+    return phase === "plan" ? this.planPrompt(ctx) : this.implementPrompt(ctx);
   }
 
   private planPrompt(ctx: RunContext): string {

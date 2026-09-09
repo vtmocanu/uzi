@@ -207,7 +207,11 @@ export class CodexHarness implements RunHarness {
 
   private readonly registry: ExecutionRegistry;
   private readonly launchRootSeam: LaunchRootSeam;
-  private readonly broker: CodexCallbackBroker;
+  // The active callback broker. NOT `readonly`: turns run strictly sequentially, so the
+  // owner re-points it BETWEEN turns via {@link useBroker} to make the broker's IMMUTABLE
+  // per-(thread,turn) grants genuinely PER-TURN (phase-correct) instead of frozen at
+  // construction. Within a turn it is stable (a turn fully settles before the next starts).
+  private broker: CodexCallbackBroker;
   private readonly provider: CodexProviderConfig;
   private readonly workspace: string;
   private readonly homeDir: string;
@@ -265,6 +269,19 @@ export class CodexHarness implements RunHarness {
 
   inspectSession(id: string): Promise<SessionPresence> {
     return this.sessionInspect(id);
+  }
+
+  /** Re-point the callback broker used by the NEXT turn. The provider root, transport and
+   *  the harness itself are constructed ONCE and reused; only the broker (its immutable
+   *  per-(thread,turn) grants) changes per turn. Turns run strictly sequentially — the
+   *  current turn has fully settled before the owner calls this — so re-pointing between
+   *  turns is race-free, and within a turn `this.broker` is stable. The executor uses it
+   *  to serve each turn a PHASE-CORRECT broker (a plan-phase broker denies every file
+   *  write; the implement-phase broker permits them), so the plan turn cannot mutate the
+   *  worktree before its plan is approved. This STRENGTHENS the per-turn grant invariant:
+   *  the grants are genuinely per-turn, not one implement-phase set frozen at construction. */
+  useBroker(broker: CodexCallbackBroker): void {
+    this.broker = broker;
   }
 
   // --- child-thread demux (part C) ---------------------------------------------

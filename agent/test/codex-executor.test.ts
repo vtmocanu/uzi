@@ -1049,3 +1049,140 @@ describe("CodexExecutor: F1 registry teardown relocation", () => {
     assert.ok(rig.disposed() >= 1, "the error-before-completion path tore down the provider root via the backstop");
   });
 });
+
+// ================================================================================
+// The FIXED production Codex vendor target. A silent change to name/baseUrl/envKey/model
+// would re-point every DARK production run at a different endpoint/model; pin it byte-for-byte
+// so a mutation of the production constructor's constant is caught (mutation evidence).
+describe("CodexExecutor: production provider constant (mutation evidence)", () => {
+  it("pins the fixed production Codex vendor target byte-for-byte", () => {
+    assert.deepEqual(CODEX_PRODUCTION_PROVIDER, {
+      name: "openai",
+      baseUrl: "https://api.openai.com/v1",
+      envKey: "OPENAI_API_KEY",
+      model: "gpt-6-astra",
+    });
+  });
+});
+
+// ================================================================================
+// PRD #1171 m5 — the per-turn PHASE-CORRECT broker. The broker enforces the plan-phase
+// file-write ban through `grants.phase` (broker.dispatchFileWrite → write_denied_in_plan), so
+// the broker serving the PLAN turn must carry plan-phase grants. The old single implement-phase
+// broker (frozen at construction, reused across both turns) left that ban INERT during the plan
+// turn — a model apply_patch/Write mutated the worktree BEFORE approval. These tests drive a
+// real plan turn and a real implement turn and are fail-old/pass-fixed.
+describe("CodexExecutor: per-turn phase-correct broker (plan write ban)", () => {
+  // A file-write callback carried on the turn each run drives (Write → apply_patch → file_write).
+  const WRITE_ID = 77;
+  const writeCall = (threadId: string, turnId: string): CodexNotification =>
+    toolCall(
+      WRITE_ID,
+      "Write",
+      { file_path: "PLAN_NOTES.md", content: "must not be written during planning" },
+      threadId,
+      turnId,
+      "cc-write",
+    );
+
+  function replyForId(rig: Rig, id: number): { success?: boolean; text?: string } {
+    const entry = rig.transport.responses.find((r) => r.requestId === id);
+    const response = rec(entry?.response);
+    const result = rec(response.result) as { success?: boolean; contentItems?: { text?: string }[] };
+    return { success: result.success, text: result.contentItems?.[0]?.text };
+  }
+
+  // A fileop client that RECORDS every op it is asked to run, so a test can prove the worktree
+  // was (or was not) mutated: under the plan-phase ban the write is denied BEFORE any fileop.
+  function recordingFileop(): { handle: FileopHelperHandle; ops: string[] } {
+    const ops: string[] = [];
+    return {
+      handle: {
+        client: {
+          op: async (req) => {
+            ops.push(req.op);
+            return { ok: true, size: 32 };
+          },
+        },
+        dispose: async () => {},
+      },
+      ops,
+    };
+  }
+
+  // gatePlan is provided ONLY to activate run()'s plan-gate branch. The plan turn's write ban
+  // fires while the turn streams, before any plan is produced (the Codex plan→gate lifecycle is
+  // completed in a later milestone, so a plan turn yields no plan yet and run() then rejects),
+  // so this approver is never actually invoked — the write-ban side effects are the assertion.
+  const gatePlan: NonNullable<RunContext["gatePlan"]> = async () => ({ kind: "cancel" });
+
+  it("(P1) a Write during the PLAN turn is DENIED (write_denied_in_plan) and never reaches the fileop helper; the SAME Write during the IMPLEMENT turn is APPLIED", async () => {
+    // --- PLAN turn: the broker MUST be plan-phase, so the write is denied before any fileop.
+    const planRig = makeRig();
+    const planFileop = recordingFileop();
+    planRig.deps = { ...planRig.deps, spawnFileop: () => planFileop.handle };
+    planRig.transport.push(threadStarted()).push(writeCall("th-1", "tn-1")).push(turnCompleted("completed")).end();
+    const { ctx: planCtx } = makeCtx({ planApproved: false, approvedPlan: undefined, gatePlan });
+    // The write ban fires mid-turn; run() then rejects because the m5-incomplete plan lifecycle
+    // yields no plan. The rejection is incidental — the recorded reply + fileop ops are the point.
+    await assert.rejects(
+      withTimeout(makeExecutor(planRig, bindingOf(SUBSCRIPTION)).run(planCtx), 3000, "plan-turn write"),
+      /produced no plan/,
+    );
+    const planReply = replyForId(planRig, WRITE_ID);
+    assert.equal(planReply.success, false, "the plan-turn Write was DENIED (fails on the old single implement-phase broker)");
+    assert.match(planReply.text ?? "", /not permitted during the plan phase/, "the deny is write_denied_in_plan");
+    assert.deepEqual(planFileop.ops, [], "no fileop op ran during the plan phase — the worktree was NOT mutated");
+
+    // --- IMPLEMENT turn: the same Write is APPLIED (a pre-approved run drives only implement).
+    const implRig = makeRig();
+    const implFileop = recordingFileop();
+    implRig.deps = { ...implRig.deps, spawnFileop: () => implFileop.handle };
+    implRig.transport.push(threadStarted()).push(writeCall("th-1", "tn-1")).push(turnCompleted("completed")).end();
+    const { ctx: implCtx } = makeCtx(); // pre-approved (planApproved + approvedPlan) → implement turn only
+    const result = await withTimeout(makeExecutor(implRig, bindingOf(SUBSCRIPTION)).run(implCtx), 3000, "implement-turn write");
+    assert.equal(result.branch, "agent/issue-42");
+    assert.equal(replyForId(implRig, WRITE_ID).success, true, "the implement-turn Write was APPLIED");
+    assert.deepEqual(implFileop.ops, ["write"], "the write reached the fileop helper during the implement phase");
+  });
+
+  it("(P2) a subagent spawned during the PLAN turn inherits plan-phase grants — its Write is DENIED and never mutates the worktree", async () => {
+    const agents: AgentTemplate[] = [
+      { name: "lead", description: "the lead", prompt_body: "lead body", tools: null, skills: [] },
+      { name: "coder", description: "a coder", prompt_body: "coder body", tools: null, skills: [] },
+    ];
+    const CHILD_WRITE_ID = 88;
+    const responder: Responder = (c) => {
+      if (c.method === "thread/start") return { thread: { id: c.threadStartCount === 1 ? "th-1" : "th-child" } };
+      if (c.method === "turn/start") {
+        if (c.turnStartCount === 1) return { turn: { id: "tn-1" } };
+        // The CHILD turn: a Write callback (denied under plan-phase CHILD grants) + its terminal.
+        c.transport
+          .push(toolCall(CHILD_WRITE_ID, "Write", { file_path: "CHILD.md", content: "child must not write in plan" }, "th-child", "tn-child", "cc-child-write"))
+          .push(turnCompleted("completed", "th-child", "tn-child"));
+        return { turn: { id: "tn-child" } };
+      }
+      if (c.method === "turn/interrupt") return {};
+      return {};
+    };
+    const rig = makeRig({ responder });
+    const childFileop = recordingFileop();
+    rig.deps = { ...rig.deps, spawnFileop: () => childFileop.handle };
+    rig.transport.push(threadStarted()).push(toolCall(1, "spawn_agent", { role: "coder", prompt: "help" }, "th-1", "tn-1", "c-root"));
+
+    const { ctx } = makeCtx({ planApproved: false, approvedPlan: undefined, gatePlan, agents });
+    const runP = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+
+    // The parent spawn_agent callback resolves only after the child settles; once it has, close
+    // the root plan turn (which yields no plan — the m5-incomplete lifecycle — so run() rejects).
+    await waitFor(() => rig.transport.responses.some((r) => r.requestId === 1), "parent spawn_agent reply", 5000);
+    rig.transport.push(turnCompleted("completed", "th-1", "tn-1")).end();
+    await assert.rejects(withTimeout(runP, 5000, "plan-turn subagent write"), /produced no plan/);
+
+    const childReply = replyForId(rig, CHILD_WRITE_ID);
+    assert.equal(childReply.success, false, "the child's plan-turn Write was DENIED (fails on the old implement-phase child grants)");
+    assert.match(childReply.text ?? "", /not permitted during the plan phase/, "the child deny is write_denied_in_plan");
+    assert.deepEqual(childFileop.ops, [], "no child fileop op ran during the plan phase");
+    assert.equal(rig.transport.turnStartCount, 2, "the child turn ran on the same transport (demuxed)");
+  });
+});
