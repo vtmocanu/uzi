@@ -124,8 +124,17 @@ parses):
 
 - **Root file only.** `path.join(clonePath, "CLAUDE.md")` — no nested
   `**/CLAUDE.md`, no `CLAUDE.local.md`.
-- **Symlinks never followed.** `lstat` gates on `isFile()`; a symlink or
-  directory is dropped (`symlinked`) and never read, so a hostile repo
+- **Symlinks followed, but only when contained.** `realpath` resolves
+  both the clone path and the link, following the whole chain (a broken
+  link or an `ELOOP` cycle throws, dropped `symlinked`); containment is
+  then checked with `path.relative` on the two realpath-resolved paths —
+  not a `startsWith` string prefix, which a sibling directory like
+  `<clone>-evil` would defeat — and an empty/`..`/`../…`/absolute result
+  means the target escapes the clone tree, dropped `symlinked`. A
+  resolved target under the clone's `.git/` dir, or one that is not a
+  regular file (a directory), is also dropped `symlinked` and never
+  read. This honors the common `CLAUDE.md -> AGENTS.md` convention (uzi's
+  own repo layout) while preserving the invariant that a hostile repo
   cannot redirect the read outside its own tree.
 - **Line-leading `@`-import lines stripped**, replaced with a visible
   `<!-- uzi: @-import stripped -->` marker. Claude Code's `CLAUDE.md`
