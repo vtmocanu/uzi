@@ -85,10 +85,10 @@ describe("readRepoInstructions (PRD #246 M2)", () => {
     assert.strictEqual(result.text, body);
   });
 
-  it("a symlinked CLAUDE.md is NEVER read ⇒ dropped: symlinked", async () => {
-    // A real target OUTSIDE the clone, and CLAUDE.md is a symlink to it. lstat must
-    // see the symlink and refuse, exactly like repo-skills.ts refuses a symlinked
-    // SKILL.md — so a hostile repo cannot redirect the read out of its tree.
+  it("a symlink whose target escapes the clone tree is never read ⇒ dropped: symlinked", async () => {
+    // A real target OUTSIDE the clone, and CLAUDE.md is a symlink to it. The resolved
+    // real path is not contained by the clone, so it is refused — a hostile repo
+    // cannot redirect the read out of its tree.
     const outside = path.join(os.tmpdir(), `uzi-repoinstr-target-${process.pid}-${Date.now()}.md`);
     fs.writeFileSync(outside, "# secret outside the clone\n");
     try {
@@ -102,6 +102,87 @@ describe("readRepoInstructions (PRD #246 M2)", () => {
   it("a directory named CLAUDE.md ⇒ dropped: symlinked (non-regular file)", async () => {
     fs.mkdirSync(repoInstructionsPath(clone));
     assert.deepStrictEqual(await readRepoInstructions(clone), { dropped: "symlinked" });
+  });
+
+  it("an in-tree symlink IS followed and read (CLAUDE.md -> AGENTS.md)", async () => {
+    // The common convention (this repo's own layout): CLAUDE.md is a relative symlink
+    // to a real, in-tree AGENTS.md. It is followed and its content read.
+    const body = "# Conventions\nRun the gate before every push.\n";
+    fs.writeFileSync(path.join(clone, "AGENTS.md"), body);
+    fs.symlinkSync("AGENTS.md", repoInstructionsPath(clone));
+    const result = await readRepoInstructions(clone);
+    assert.ok("text" in result);
+    assert.strictEqual(result.text, body);
+  });
+
+  it("an in-tree symlink to a file in a SUBDIRECTORY is followed", async () => {
+    const body = "# Nested\nInstructions live under docs/.\n";
+    fs.mkdirSync(path.join(clone, "docs"));
+    fs.writeFileSync(path.join(clone, "docs", "instructions.md"), body);
+    fs.symlinkSync("docs/instructions.md", repoInstructionsPath(clone));
+    const result = await readRepoInstructions(clone);
+    assert.ok("text" in result);
+    assert.strictEqual(result.text, body);
+  });
+
+  it("an in-tree symlink CHAIN is followed (CLAUDE.md -> a.md -> b.md)", async () => {
+    // realpath walks the whole chain; every hop stays inside the clone.
+    const body = "# End of the chain\nThis is b.md.\n";
+    fs.writeFileSync(path.join(clone, "b.md"), body);
+    fs.symlinkSync("b.md", path.join(clone, "a.md"));
+    fs.symlinkSync("a.md", repoInstructionsPath(clone));
+    const result = await readRepoInstructions(clone);
+    assert.ok("text" in result);
+    assert.strictEqual(result.text, body);
+  });
+
+  it("a relative symlink that escapes via .. ⇒ dropped: symlinked", async () => {
+    // The target is a real file, but it resolves OUTSIDE the clone (a sibling under
+    // tmpdir, since the clone is a direct child of tmpdir), so the containment check
+    // refuses it — not the broken-link path.
+    const outsideName = `uzi-repoinstr-escape-${process.pid}-${Date.now()}.md`;
+    const outside = path.join(clone, "..", outsideName);
+    fs.writeFileSync(outside, "# outside the clone\n");
+    try {
+      fs.symlinkSync(path.join("..", outsideName), repoInstructionsPath(clone));
+      assert.deepStrictEqual(await readRepoInstructions(clone), { dropped: "symlinked" });
+    } finally {
+      fs.rmSync(outside, { force: true });
+    }
+  });
+
+  it("a broken/dangling symlink ⇒ dropped: symlinked", async () => {
+    // Target does not exist, so realpath throws — never read.
+    fs.symlinkSync("does-not-exist.md", repoInstructionsPath(clone));
+    assert.deepStrictEqual(await readRepoInstructions(clone), { dropped: "symlinked" });
+  });
+
+  it("a symlink to an in-tree DIRECTORY ⇒ dropped: symlinked", async () => {
+    // Contained, but the resolved target is not a regular file.
+    fs.mkdirSync(path.join(clone, "subdir"));
+    fs.symlinkSync("subdir", repoInstructionsPath(clone));
+    assert.deepStrictEqual(await readRepoInstructions(clone), { dropped: "symlinked" });
+  });
+
+  it("sanitization applies to the RESOLVED content of an in-tree symlink", async () => {
+    // The @-import strip runs on the followed target's bytes, not the link.
+    fs.writeFileSync(
+      path.join(clone, "AGENTS.md"),
+      "# Conventions\n@./secrets.md\nRun the gate before every push.\n",
+    );
+    fs.symlinkSync("AGENTS.md", repoInstructionsPath(clone));
+    const result = await readRepoInstructions(clone);
+    assert.ok("text" in result);
+    assert.ok(!result.text.includes("@./secrets.md"));
+    assert.strictEqual(result.text.match(/<!-- uzi: @-import stripped -->/g)?.length, 1);
+    assert.ok(result.text.includes("Run the gate before every push."));
+  });
+
+  it("an in-tree symlink to an oversized (> 64 KiB) real file ⇒ dropped: too_large", async () => {
+    // The resolved target's size is what bounds the cap, checked before reading.
+    fs.writeFileSync(path.join(clone, "AGENTS.md"), "x".repeat(REPO_INSTRUCTIONS_MAX_BYTES + 1));
+    fs.symlinkSync("AGENTS.md", repoInstructionsPath(clone));
+    assert.deepStrictEqual(await readRepoInstructions(clone), { dropped: "too_large" });
   });
 
   it("line-leading @-import lines are stripped to a visible marker; prose survives", async () => {
