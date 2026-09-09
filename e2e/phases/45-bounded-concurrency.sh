@@ -207,7 +207,7 @@ else
   # recovery_wait → queued → claimed → running → awaiting_approval. The overlay
   # compresses the park's backoff base (RUN_RECOVERY_PARK_BASE=1s) so the whole park
   # fits this wait, but the park's jitter is a non-configurable UNIFORM 5-30s
-  # (recoverywait.go), so retry_not_before lands base+jitter ≈ 6-31s out (~20s typical),
+  # (recoverywait.go), so recovery_retry_not_before lands base+jitter ≈ 6-31s out (~20s typical),
   # plus ≤2s sweep granularity and ~0.5s re-claim before recovery work: a ~33.5s
   # deterministic scheduling bound. The ceiling is 90s (give-up, not expected) to absorb
   # that worst case plus re-claim + plan under CI load.

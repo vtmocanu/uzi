@@ -116,7 +116,7 @@ services:
       # resume THROUGH recovery_wait — a hard worker-loss leaves a pending recovery-
       # capture journal, so the re-claim parks to verify the retained runner clone
       # before reseeding — and the sweeper (SWEEP_INTERVAL above) auto-promotes it once
-      # retry_not_before elapses. The park's dominant term is the NON-configurable jitter
+      # recovery_retry_not_before elapses. The park's dominant term is the NON-configurable jitter
       # (recoveryParkJitterMin..Max = 5s..30s, recoverywait.go), so compressing the base
       # to ~1s keeps the whole park inside the phase's resume wait; a small max caps the
       # doubling should a run park more than once. Overlay-only; production defaults
