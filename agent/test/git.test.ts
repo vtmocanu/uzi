@@ -36,6 +36,43 @@ describe("bareDirName", () => {
   });
 });
 
+describe("permit-scoped bare lock acquisition", () => {
+  it("settles promptly on boundary abort without running or overtaking a queued mutation", async () => {
+    const internals = git as unknown as {
+      withLock<T>(key: string, fn: () => Promise<T>): Promise<T>;
+    };
+    let releaseHolder!: () => void;
+    let holderStarted!: () => void;
+    const holderStartedP = new Promise<void>((resolve) => { holderStarted = resolve; });
+    const holder = internals.withLock("shared-bare", async () => {
+      holderStarted();
+      await new Promise<void>((resolve) => { releaseHolder = resolve; });
+      return "holder";
+    });
+    await holderStartedP;
+
+    const abort = new AbortController();
+    let queuedRan = false;
+    const queued = git.withBoundaryProcessSpawner(
+      async () => { throw new Error("no subprocess expected"); },
+      abort.signal,
+      () => internals.withLock("shared-bare", async () => {
+        queuedRan = true;
+        return "queued";
+      }),
+    );
+
+    abort.abort();
+    await assert.rejects(queued, /permit-held git lock wait aborted: boundary deadline exceeded/);
+    assert.equal(queuedRan, false, "an aborted waiter cannot enter the held lock");
+
+    releaseHolder();
+    assert.equal(await holder, "holder");
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(queuedRan, false, "the forfeited slot stays skipped after the prior holder releases");
+  });
+});
+
 describe("ensureClone", () => {
   it("clones bare on first call and fetches on the second", async () => {
     const bare = await git.ensureClone(fx.originPath);

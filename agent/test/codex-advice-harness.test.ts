@@ -693,6 +693,46 @@ describe("CodexAdviceHarness: timeout + grace + fail-closed setup", () => {
     assert.equal(bits.disposeCalls(), 1, "auth drain failure cannot skip root cleanup");
   });
 
+  it("does not let a cleanup-only auth drain failure replace a successful advice result", async () => {
+    let drains = 0;
+    const appServerAuth: CodexAppServerAuthSession = {
+      mode: "subscription",
+      authenticate: async () => {},
+      handleServerRequest: async () => false,
+      drainInterceptedRequests: async () => {
+        drains += 1;
+        if (drains > 1) throw new Error("cleanup drain failed");
+      },
+      closeAdmissionAndCancel() {},
+    };
+    const bits = makeHarness({ appServerAuth });
+    bits.transport.push(threadStarted()).push(agentMessage("kept result")).push(turnCompleted("completed")).end();
+
+    const result = await bits.harness.run(makeAdviceRequest(), noThrowPolicy);
+
+    assert.equal(result.text, "kept result");
+    assert.equal(drains, 2, "the terminal drain succeeded before the cleanup-only drain failed");
+    assert.equal(bits.disposeCalls(), 1);
+  });
+
+  it("does not let an auth cleanup failure replace the exact timeout rejection", async () => {
+    const appServerAuth: CodexAppServerAuthSession = {
+      mode: "subscription",
+      authenticate: async () => {},
+      handleServerRequest: async () => false,
+      drainInterceptedRequests: async () => { throw new Error("cleanup drain failed"); },
+      closeAdmissionAndCancel() {},
+    };
+    const bits = makeHarness({ appServerAuth });
+    bits.transport.push(threadStarted()).push(agentMessage("partial"));
+
+    await assert.rejects(
+      bits.harness.run(makeAdviceRequest({ label: "review", timeoutMs: 25, graceMs: 10 }), noThrowPolicy),
+      /review model call exceeded 25ms/,
+    );
+    assert.equal(bits.disposeCalls(), 1);
+  });
+
   it("an unexpected EOF (no terminal) rejects with a protocol error and still disposes the HOME", async () => {
     const bits = makeHarness();
     bits.transport.push(threadStarted()).push(turnStarted()).end(); // ends before turn/completed

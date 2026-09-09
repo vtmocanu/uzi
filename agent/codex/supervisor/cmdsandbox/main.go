@@ -5,6 +5,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -36,23 +37,28 @@ var baseRights = uint64(
 
 func main() { os.Exit(realMain(os.Args[1:])) }
 
+func setupFailure(stage string, err error) int {
+	_, _ = fmt.Fprintf(os.Stderr, "uzi-codex-command-sandbox: %s: %v\n", stage, err)
+	return 2
+}
+
 func realMain(args []string) int {
 	root, tmp, cwd, child, err := parseArgs(args)
 	if err != nil {
-		return 2
+		return setupFailure("invalid arguments", err)
 	}
 	if err := os.Mkdir(tmp, 0o700); err != nil {
-		return 2
+		return setupFailure("create private tmp", err)
 	}
 	defer os.RemoveAll(tmp)
 	if err := os.Chmod(tmp, 0o700); err != nil {
-		return 2
+		return setupFailure("harden private tmp", err)
 	}
 	if err := confine(root, tmp); err != nil {
-		return 2
+		return setupFailure("apply Landlock policy", err)
 	}
 	if err := os.Chdir(cwd); err != nil {
-		return 2
+		return setupFailure("enter command cwd", err)
 	}
 	cmd := exec.Command(child[0], child[1:]...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr

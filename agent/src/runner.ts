@@ -693,11 +693,24 @@ export class RunRunner {
       // (terminal/finalize) is NOT swallowed — it propagates to the failed-run report below
       // (executeClaim's catch classifies it as a generic failure, never a limit/pause/shutdown
       // branch, since CodexBoundaryError is none of those types).
+      let postFinalizeTerminal: (() => Promise<void>) | undefined;
       await this.withCodexBoundaryOnly(
         executor,
         { boundary: "finalize", deadlineMs: this.codexBoundaryDeadlineMs },
-        (permit) => this.phasePublish(claim, flight, permit?.signal),
+        (permit) => this.phasePublish(
+          claim,
+          flight,
+          permit?.signal,
+          executor.safety
+            ? (report) => { postFinalizeTerminal = report; }
+            : undefined,
+        ),
       );
+      // Once a branch push or MR creation succeeds, its terminal record is irreversible
+      // bookkeeping for an already-committed forge side effect. Deliver it only after the
+      // Codex boundary has released, with the normal terminal retry schedule and without
+      // the boundary's expiring signal, so a near-deadline MR cannot become a failed run.
+      await postFinalizeTerminal?.();
     } catch (err) {
       // PRD #35: a usage-limit death is not an ordinary failure. Handled before the
       // generic path below because that path is terminal in both senses — it reports
@@ -1134,11 +1147,33 @@ export class RunRunner {
     }
   }
 
-  private async phasePublish(claim: ClaimResponse, flight: RunFlight, boundarySignal?: AbortSignal): Promise<void> {
+  private async phasePublish(
+    claim: ClaimResponse,
+    flight: RunFlight,
+    boundarySignal?: AbortSignal,
+    deferCommittedTerminal?: (report: () => Promise<void>) => void,
+  ): Promise<void> {
     const { runLog, batcher, redactText, executor, runHome } = flight;
     const reportState = (body: Parameters<RunFlight["reportState"]>[0]) =>
       flight.reportState(body, boundarySignal);
     const closeBatcher = () => batcher.close(boundarySignal);
+    const finishCommittedPublish = async (
+      body: Parameters<RunFlight["reportState"]>[0],
+      logMessage: string,
+      fields: Record<string, unknown>,
+    ): Promise<void> => {
+      if (deferCommittedTerminal) {
+        deferCommittedTerminal(async () => {
+          await batcher.close();
+          await flight.reportState(body);
+          runLog.info(logMessage, fields);
+        });
+        return;
+      }
+      await closeBatcher();
+      await reportState(body);
+      runLog.info(logMessage, fields);
+    };
     const runId = claim.run_id;
     const result = flight.result!;
     // PRD #1190 M2: an owner-requested pause PARKED the run mid-loop (handlePausePark reported
@@ -2093,14 +2128,12 @@ export class RunRunner {
           text: `task complete; pushed ${result.branch} (no merge request — pull the branch)`,
         },
       });
-      await closeBatcher();
-      await reportState({
+      await finishCommittedPublish({
         status: "completed",
         branch: result.branch,
         prd_done_path: result.prdDonePath,
         milestones_completed: result.milestonesCompleted,
-      });
-      runLog.info("task run completed (no MR)", { branch: result.branch });
+      }, "task run completed (no MR)", { branch: result.branch });
       return;
     }
 
@@ -2153,7 +2186,6 @@ export class RunRunner {
       payload: { text: `merge request opened: !${mr.iid} ${mr.webUrl}` },
     });
 
-    await closeBatcher();
     // Persist the MR/PR web URL the forge just handed us (PRD #65 D8), so the web
     // links it directly instead of reconstructing the URL by string surgery. Omit
     // it when the forge returned none (mr.webUrl empty) so the server lands NULL and
@@ -2167,7 +2199,7 @@ export class RunRunner {
     // lead declared none) — same absent-vs-present discipline as prd_done_path, so the
     // server UNIONs them into milestones_completed only when actually declared and a
     // no-declaration completion is byte-identical to before.
-    await reportState({
+    await finishCommittedPublish({
       status: "completed",
       branch: result.branch,
       mr_iid: mr.iid,
@@ -2178,8 +2210,7 @@ export class RunRunner {
       // stop_kind='scope_capped'. OMITTED (not false) on a normal completion, so the wire
       // shape is unchanged for every non-truncated run.
       scope_capped: result.scopeCapped ? true : undefined,
-    });
-    runLog.info("run completed", { branch: result.branch, mr_iid: mr.iid });
+    }, "run completed", { branch: result.branch, mr_iid: mr.iid });
   }
 
   private buildFlight(
@@ -3380,6 +3411,7 @@ export class RunRunner {
       await safety.withBoundary(req, async (permit) => {
         await this.git.withBoundaryProcessSpawner(
           (process) => safety.spawnBoundaryProcess(permit, process),
+          permit.signal,
           () => action(permit),
         );
       });
@@ -3405,6 +3437,7 @@ export class RunRunner {
       await safety.withBoundary(req, async (permit) => {
         await this.git.withBoundaryProcessSpawner(
           (process) => safety.spawnBoundaryProcess(permit, process),
+          permit.signal,
           () => action(permit),
         );
       });

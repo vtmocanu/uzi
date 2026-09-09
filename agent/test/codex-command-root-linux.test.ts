@@ -75,6 +75,7 @@ describe("Codex supervised command root (Linux packaged profile)", { skip: ENABL
     );
     assert.equal(capped.code, COMMAND_CAPTURE_KILLED_CODE);
     assert.equal(Buffer.byteLength(capped.stdout), MAX_COMMAND_CAPTURE_BYTES);
+    assert.equal(registry.rootCount(), 2, "both command roots were registered before the reap proof");
     assert.equal(registry.hasLiveCommandRoot(), false, "cap-kill returned only after ECHILD+__WALL reap");
     const tmpAfter = (await fs.readdir("/tmp")).filter((name) => name.startsWith("uzi-codex-command-")).sort();
     assert.deepEqual(tmpAfter, tmpBefore, "normal and SIGKILL paths leave no per-command tmp directory");

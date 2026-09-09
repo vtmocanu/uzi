@@ -226,6 +226,7 @@ timeout --kill-after=60s "$TIMEOUT" docker run --rm --network "$NET" \
   --security-opt no-new-privileges \
   --read-only \
   --tmpfs /nix:exec --tmpfs /data --tmpfs /tmp:exec \
+  --tmpfs /work/repo:rw,exec,nosuid,size=64m,uid=10001,gid=10002,mode=2770 \
   --entrypoint /usr/local/sbin/uzi-entrypoint \
   -e CODEX_M3B_PACKAGED=1 -e CODEX_M3B_SRC=/app/src -e UZI_R2_COMMAND_ROOT_LINUX=1 \
   -e "CODEX_M3B_WORKER_BASE_URL=$WORKER_BASE_URL" \

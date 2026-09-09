@@ -133,6 +133,11 @@ const GIT_MAX_BUFFER = 64 * 1024 * 1024;
 
 export type BoundaryProcessSpawner = (request: BoundaryProcessRequest) => Promise<BoundaryProcessHandle>;
 
+interface BoundaryProcessScope {
+  spawn: BoundaryProcessSpawner;
+  signal: AbortSignal;
+}
+
 // PRD #400 M4b — byte cap on the review diff a ReviewRunner feeds the reviewer model.
 // A huge diff must not blow the model's context window or the worker's memory, so the
 // diff is truncated at this size with a marker. 512 KiB is generous for a task-run diff
@@ -367,7 +372,7 @@ export class GitCache {
   private readonly runnerRoot: string;
   /** Per-bare-path serialization: git's lockfiles can't take parallel mutations. */
   private readonly locks = new Map<string, Promise<unknown>>();
-  private readonly boundaryProcesses = new AsyncLocalStorage<BoundaryProcessSpawner>();
+  private readonly boundaryProcesses = new AsyncLocalStorage<BoundaryProcessScope>();
 
   constructor(
     dataDir: string,
@@ -380,11 +385,15 @@ export class GitCache {
     this.runnerRoot = path.join(dataDir, "runner");
   }
 
-  /** Scope every subprocess created by `action` to the permit-bound supervisor
-   * spawner. AsyncLocalStorage keeps concurrent runs isolated while leaving every
-   * non-Codex call on the literal legacy child_process path. */
-  withBoundaryProcessSpawner<T>(spawner: BoundaryProcessSpawner, action: () => Promise<T>): Promise<T> {
-    return this.boundaryProcesses.run(spawner, action);
+  /** Scope every subprocess and bare-lock acquisition created by `action` to the
+   * permit-bound supervisor and deadline. AsyncLocalStorage keeps concurrent runs
+   * isolated while leaving every non-Codex call on the literal legacy path. */
+  withBoundaryProcessSpawner<T>(
+    spawner: BoundaryProcessSpawner,
+    signal: AbortSignal,
+    action: () => Promise<T>,
+  ): Promise<T> {
+    return this.boundaryProcesses.run({ spawn: spawner, signal }, action);
   }
 
   barePathFor(repoUrl: string): string {
@@ -2439,7 +2448,7 @@ export class GitCache {
     }
     const cwd = options.cwd ?? (identity === "command" ? commandCwd(args) : "/");
     const executable = resolveBoundaryExecutable(command);
-    const process = await boundary({ argv: [executable, ...args], cwd, env: options.env, identity });
+    const process = await boundary.spawn({ argv: [executable, ...args], cwd, env: options.env, identity });
     process.stdin?.end();
     const cap = options.maxBuffer ?? GIT_MAX_BUFFER;
     const collect = (stream: Readable | null): Promise<{ chunks: Buffer[]; oversized: boolean }> =>
@@ -2548,7 +2557,7 @@ export class GitCache {
     this.log.debug("git (spawn)", { cwd, args });
     const boundary = this.boundaryProcesses.getStore();
     if (boundary) {
-      const process = await boundary({ argv: [GIT_BIN, ...withDir(cwd, args)], cwd, env, identity: "worker_pat" });
+      const process = await boundary.spawn({ argv: [GIT_BIN, ...withDir(cwd, args)], cwd, env, identity: "worker_pat" });
       if (!process.stdout) throw new Error("supervised git process has no stdout");
       const stderrChunks: Buffer[] = [];
       let stderrBytes = 0;
@@ -2673,14 +2682,56 @@ export class GitCache {
     }
   }
 
-  /** Serialize all mutations on a given bare repo (chained promises per path). */
+  /** Serialize all mutations on a given bare repo (chained promises per path).
+   * A permit-scoped caller waiting behind another run observes its boundary abort
+   * promptly and forfeits its slot without running `fn`. The stored chain still
+   * waits for the prior holder before it settles, so a cancelled waiter can never
+   * let a later mutation overtake the holder and violate serialization. */
   private withLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
     const prev = this.locks.get(key) ?? Promise.resolve();
-    const next = prev.then(fn, fn);
-    // Keep the chain alive but swallow the stored result's rejection so one
-    // failure doesn't poison every later op on the same repo.
+    const scope = this.boundaryProcesses.getStore();
+    let started = false;
+    let settled = false;
+    let removeAbortListener = (): void => {};
+    let resolveResult!: (value: T) => void;
+    let rejectResult!: (error: unknown) => void;
+    const result = new Promise<T>((resolve, reject) => {
+      resolveResult = resolve;
+      rejectResult = reject;
+    });
+    const abortBeforeAcquisition = (): void => {
+      if (started || settled) return;
+      settled = true;
+      removeAbortListener();
+      rejectResult(new Error("permit-held git lock wait aborted: boundary deadline exceeded"));
+    };
+    if (scope) {
+      removeAbortListener = (): void => scope.signal.removeEventListener("abort", abortBeforeAcquisition);
+      if (scope.signal.aborted) abortBeforeAcquisition();
+      else scope.signal.addEventListener("abort", abortBeforeAcquisition, { once: true });
+    }
+    const run = async (): Promise<void> => {
+      if (settled) return;
+      if (scope?.signal.aborted) {
+        abortBeforeAcquisition();
+        return;
+      }
+      started = true;
+      removeAbortListener();
+      try {
+        const value = await fn();
+        settled = true;
+        resolveResult(value);
+      } catch (error) {
+        settled = true;
+        rejectResult(error);
+      }
+    };
+    const next = prev.then(run, run);
+    // Keep the serialization chain alive but swallow its stored result so one
+    // failed mutation does not poison every later op on the same repo.
     this.locks.set(key, next.catch(() => undefined));
-    return next;
+    return result;
   }
 }
 

@@ -317,6 +317,13 @@ export class CodexAdviceHarness implements AdviceHarness {
         await awaitSettled(work, request.graceMs ?? DEFAULT_ADVICE_GRACE_MS);
         try {
           await this.appServerAuth?.drainInterceptedRequests();
+        } catch (e) {
+          // The terminal path drains before it returns, so an auth poison that affects
+          // the verdict already surfaced as the primary error there. Cleanup evidence
+          // must not replace a completed result or the exact timeout/abort rejection.
+          this.log.warn(`${request.label} codex advice auth cleanup failed`, {
+            error: errMessage(e),
+          });
         } finally {
           // Best-effort HOME/root disposal, exactly once, even when authentication draining
           // fails. A late launch remains owned by work.then(disposeOnce) above.

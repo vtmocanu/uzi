@@ -344,6 +344,48 @@ describe("RunRunner m4 — Codex durability sinks route through withBoundary", (
     assert.ok(rig.disposes() >= 1, "the provider root was disposed");
   });
 
+  it("reports the committed MR terminal only after the Codex finalize boundary releases", async () => {
+    const { gitlab, calls } = fakeGitlab();
+    const rig = codexRig();
+    const originalWithBoundary = rig.safety.withBoundary.bind(rig.safety);
+    let insideFinalize = false;
+    rig.safety.withBoundary = (request, action) =>
+      originalWithBoundary(request, async (permit) => {
+        if (request.boundary === "finalize") insideFinalize = true;
+        try {
+          return await action(permit);
+        } finally {
+          if (request.boundary === "finalize") insideFinalize = false;
+        }
+      });
+
+    const originalReportState = client.reportState.bind(client);
+    let terminalInsideFinalize: boolean | undefined;
+    let terminalCarriedBoundarySignal: boolean | undefined;
+    client.reportState = async (runId, body, signal) => {
+      if (body.status === "completed" && body.mr_iid !== undefined) {
+        terminalInsideFinalize = insideFinalize;
+        terminalCarriedBoundarySignal = signal !== undefined;
+      }
+      return originalReportState(runId, body, signal);
+    };
+    try {
+      const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
+        commitInTree(ctx.worktreePath, "TERMINAL.txt", "report after boundary\n");
+        return { branch: ctx.branch };
+      });
+      const claim = gitlabClaim(1221);
+      await runnerWith(() => ({ executor: exec }), gitlab).execute(claim);
+
+      assert.equal(calls.length, 1, "the MR was created inside the trusted finalize action");
+      assert.equal(terminalInsideFinalize, false, "the committed MR terminal runs after boundary release");
+      assert.equal(terminalCarriedBoundarySignal, false, "the terminal retry schedule is not poisoned by the expired boundary signal");
+      assert.ok(statuses(claim.run_id).includes("completed"));
+    } finally {
+      client.reportState = originalReportState;
+    }
+  });
+
   it("(1) checkpoint reap:true routes through withBoundary (boundary=checkpoint)", async () => {
     const { gitlab } = fakeGitlab();
     const rig = codexRig();

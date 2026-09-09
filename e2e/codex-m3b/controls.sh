@@ -57,8 +57,10 @@ check_static_bin() {
     # "Not a valid dynamic program" (or errors). A DYNAMIC binary lists a loader / "=>".
     _l="$(ldd "$_p" 2>&1 || true)"
     case "$_l" in
-      *"=>"*|*ld-musl*|*ld-linux*) bad "$_p is not statically linked (ldd reported a dynamic loader)" ;;
+      # Alpine's ldd prefixes its static-binary verdict with the musl loader path, so
+      # match that positive verdict BEFORE the generic dynamic-loader indicators.
       *"not a dynamic executable"*|*"Not a valid dynamic program"*) ok "$_p is statically linked (ldd)" ;;
+      *"=>"*|*ld-musl*|*ld-linux*) bad "$_p is not statically linked (ldd reported a dynamic loader)" ;;
       *) bad "$_p static-link unproven by ldd: $_l" ;;
     esac
   else

@@ -266,7 +266,7 @@ export function recordingLifecycleResponder(
     { item: () => patchTool("cc-patch", patchName) as ResponseItem, mark: () => { evidence.patch += 1; } },
     { item: () => tool("cc-spawn", "spawn_agent", { subagent_type: "coder", prompt: canaries.spawnArg }) as ResponseItem, mark: () => { evidence.spawn += 1; } },
     { item: () => tool("cc-ckpt", "checkpoint", {}) as ResponseItem, mark: () => { evidence.checkpoint += 1; } },
-    { item: () => tool("cc-plan", "submit_plan", { plan: canaries.planArg }) as ResponseItem, mark: () => { evidence.submitPlan += 1; } },
+    { item: () => tool("cc-plan", "submit_plan", { plan_md: canaries.planArg }) as ResponseItem, mark: () => { evidence.submitPlan += 1; } },
     { item: () => tool("cc-done", "signal_done", {}) as ResponseItem, mark: () => { evidence.signalDone += 1; } },
   ];
   let stage = 0;
