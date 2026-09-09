@@ -57,7 +57,7 @@ const (
 // 10-second external-auth callback budget. The worker caps this HTTP round trip at 8s;
 // finishing API work within 7.5s reserves 500ms for response delivery and 2.5s at the
 // callback layer. The coordinated refresh lease is shorter still (7s), and its two serial
-// provider calls are capped at 3s each, leaving durable-commit margin.
+// provider calls are capped at 2.5s each, leaving durable-commit and recheck margin.
 const codexWorkerOperationTimeout = 7500 * time.Millisecond
 
 // maxCodexRefreshObservedGeneration is the largest JSON integer the TypeScript worker can
@@ -182,6 +182,12 @@ func (h *Handler) WorkerCodexRelease(w http.ResponseWriter, r *http.Request) {
 // check (ScopeStartRefresh does not apply) and performs ZERO provider calls.
 func (h *Handler) WorkerCodexRefresh(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
+	// Start the operation budget at handler entry, before authentication lookups and body
+	// decoding. The coordinated refresh lease and provider sub-deadlines derive from this
+	// context, so pre-provider work cannot silently extend the app-server callback budget.
+	ctx, cancel := context.WithTimeout(r.Context(), codexWorkerOperationTimeout)
+	defer cancel()
+	r = r.WithContext(ctx)
 
 	wkr, ok := mw.WorkerFromContext(r.Context())
 	if !ok {
@@ -210,8 +216,6 @@ func (h *Handler) WorkerCodexRefresh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), codexWorkerOperationTimeout)
-	defer cancel()
 	res, err := h.wsvc.CoordinatedCodexRefresh(ctx, wkr, runID, req.Capability, opID, *req.ObservedGeneration)
 	if err != nil {
 		h.writeCodexError(w, "refresh", err)

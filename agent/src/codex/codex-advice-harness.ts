@@ -315,10 +315,13 @@ export class CodexAdviceHarness implements AdviceHarness {
         // Wait for streaming work to settle (bounded by grace after abort) before HOME
         // disposal. Closing transport above lets pending setup unwind inside this grace.
         await awaitSettled(work, request.graceMs ?? DEFAULT_ADVICE_GRACE_MS);
-        await this.appServerAuth?.drainInterceptedRequests();
-        // Best-effort HOME/root disposal, exactly once. A late launch remains owned by
-        // work.then(disposeOnce) above.
-        await disposeOnce();
+        try {
+          await this.appServerAuth?.drainInterceptedRequests();
+        } finally {
+          // Best-effort HOME/root disposal, exactly once, even when authentication draining
+          // fails. A late launch remains owned by work.then(disposeOnce) above.
+          await disposeOnce();
+        }
       }
     }
   }

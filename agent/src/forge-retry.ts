@@ -251,7 +251,8 @@ function waitRetryDelay(ms: number, signal: AbortSignal | undefined): Promise<vo
       signal.removeEventListener("abort", onAbort);
       resolve();
     }, ms);
-    timer.unref?.();
+    // This delay is part of a required durability-boundary write. Keep it referenced so
+    // Node cannot exit between attempts; the abort listener still cancels it promptly.
     const onAbort = (): void => {
       clearTimeout(timer);
       reject(abortError());

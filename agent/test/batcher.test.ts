@@ -50,6 +50,25 @@ describe("MessageBatcher durability-boundary cancellation", () => {
     ]);
     assert.equal(settled, true);
   });
+
+  it("returns normally when the durability deadline lands during retry backoff", async () => {
+    const boundary = new AbortController();
+    let calls = 0;
+    const client = {
+      async postMessages(): Promise<void> {
+        calls += 1;
+        if (calls === 1) setTimeout(() => boundary.abort(), 10);
+        throw new Error("transient message failure");
+      },
+    } as unknown as WorkerClient;
+    const { logger } = recordingLogger();
+    const batcher = new MessageBatcher(client, "run-backoff-boundary", 0, 0, logger);
+    batcher.emit({ kind: "status", agent: "worker", payload: { text: "pending" } });
+
+    await assert.doesNotReject(batcher.close(boundary.signal));
+    assert.equal(boundary.signal.aborted, true, "the abort landed during the retry delay");
+    assert.equal(calls, 1, "close did not begin another flush after the boundary expired");
+  });
 });
 
 // PRD #11 M4: every emitted run message is logged at debug (the single

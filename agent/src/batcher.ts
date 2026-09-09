@@ -798,6 +798,7 @@ export class MessageBatcher {
     // consume an attempt; only an attempt that moved nothing does.
     let failed = 0;
     while (failed < CLOSE_MAX_FAILED_ATTEMPTS && this.buffer.length > 0) {
+      if (signal?.aborted) break;
       const before = this.buffer.length;
       await this.flush(signal);
       if (this.buffer.length === 0) break;
@@ -822,8 +823,8 @@ export class MessageBatcher {
 
 function sleepUnlessAborted(ms: number, signal: AbortSignal | undefined): Promise<void> {
   if (!signal) return sleep(ms);
-  signal.throwIfAborted();
-  return new Promise<void>((resolve, reject) => {
+  if (signal.aborted) return Promise.resolve();
+  return new Promise<void>((resolve) => {
     const timer = setTimeout(() => {
       signal.removeEventListener("abort", onAbort);
       resolve();
@@ -831,7 +832,7 @@ function sleepUnlessAborted(ms: number, signal: AbortSignal | undefined): Promis
     timer.unref?.();
     const onAbort = (): void => {
       clearTimeout(timer);
-      reject(signal.reason);
+      resolve();
     };
     signal.addEventListener("abort", onAbort, { once: true });
   });

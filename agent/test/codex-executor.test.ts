@@ -1875,6 +1875,69 @@ describe("CodexExecutor: plan folding + implement/review loop (m2)", () => {
     assert.equal(rig.epochs[1]!.transport.turnStartCount, 1, "the implement turn ran on epoch 1 (the recreated root)");
   });
 
+  it("passes reviewer feedback to the revised plan turn and bounds revision attempts", async () => {
+    const feedback = "Split the database change from the worker integration.";
+    const planResponder: Responder = (c) => {
+      if (c.method === "thread/start") return { thread: { id: "th-plan" } };
+      if (c.method === "turn/start") {
+        const turnId = `tn-plan-${c.turnStartCount}`;
+        if (c.turnStartCount === 1) c.transport.push(threadStarted("th-plan"));
+        c.transport
+          .push(toolCall(c.turnStartCount, "submit_plan", { plan_md: `plan-${c.turnStartCount}` }, "th-plan", turnId, `c-plan-${c.turnStartCount}`))
+          .push(turnCompleted("completed", "th-plan", turnId));
+        return { turn: { id: turnId } };
+      }
+      return {};
+    };
+    const rig = makeMultiEpochRig([
+      planResponder,
+      epochResponder("resumed-plan", "tn-implement", (t, th, tn) => {
+        t.push(toolCall(99, "signal_done", {}, th, tn, "c-done")).push(turnCompleted("completed", th, tn));
+      }),
+    ]);
+    let gateCalls = 0;
+    const gatePlan: NonNullable<RunContext["gatePlan"]> = async () => {
+      gateCalls += 1;
+      return gateCalls === 1
+        ? { kind: "revise", feedback }
+        : { kind: "approve", selection: { source: "own", agents: [] } } as never;
+    };
+    const { ctx } = makeCtx({
+      planApproved: false,
+      approvedPlan: undefined,
+      gatePlan,
+      config: { plan_max_revisions: 1 },
+    });
+
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "revised plan run");
+    const planTurns = rig.epochs[0]!.transport.requests.filter((request) => request.method === "turn/start");
+    assert.equal(planTurns.length, 2);
+    assert.doesNotMatch(JSON.stringify(planTurns[0]!.params), new RegExp(feedback));
+    assert.match(JSON.stringify(planTurns[1]!.params), new RegExp(feedback));
+
+    const capped = makeRig({
+      responder: (c) => {
+        if (c.method === "thread/start") return { thread: { id: "th-1" } };
+        if (c.method === "turn/start") {
+          c.transport.push(threadStarted()).push(toolCall(7, "submit_plan", { plan_md: "unchanged" }, "th-1", "tn-1", "c-plan")).push(turnCompleted("completed"));
+          return { turn: { id: "tn-1" } };
+        }
+        return {};
+      },
+    });
+    const cappedCtx = makeCtx({
+      planApproved: false,
+      approvedPlan: undefined,
+      gatePlan: async () => ({ kind: "revise", feedback }),
+      config: { plan_max_revisions: 0 },
+    }).ctx;
+    await assert.rejects(
+      withTimeout(makeExecutor(capped, bindingOf(SUBSCRIPTION)).run(cappedCtx), 5000, "revision cap"),
+      /revision budget exhausted/,
+    );
+    assert.equal(capped.transport.turnStartCount, 1, "zero revision budget cannot start another plan turn");
+  });
+
   it("(m2-2) a cooperative checkpoint (not done) drives ctx.checkpoint({reap:true}), recreates the epoch, and the next implement turn on the NEW root reaches done", async () => {
     // m4 change: a cooperative checkpoint reap recreates the provider epoch, so the second implement
     // turn runs on a DISTINCT root/transport (the reaped root's registry is permanently closed).

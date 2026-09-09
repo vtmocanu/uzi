@@ -273,8 +273,18 @@ describe("CodexCallbackBroker: file effects through the fileop client", () => {
     assert.equal(fileop.calls.length, 1);
   });
 
-  it("never reflects an unknown or oversized fileop code into model-visible output", async () => {
-    const rawCode = `E_FORGED\n${"x".repeat(4096)}`;
+  it("never reflects a short unknown fileop code into model-visible output", async () => {
+    const rawCode = "E_FORGED";
+    const fileop = new FileopSpy({ ok: false, code: rawCode });
+    const h = makeBroker({ fileop });
+    const r = await h.broker.handleToolCall(rt(), "Write", { path: "src/x.ts", content: "x" }, "root");
+    assertDenied(r, "fileop_denied");
+    assert.equal(r.message, "file operation denied (E_IO)");
+    assert.equal(r.message.includes(rawCode), false);
+  });
+
+  it("never reflects an oversized fileop code into model-visible output", async () => {
+    const rawCode = `E_IO_${"x".repeat(4096)}`;
     const fileop = new FileopSpy({ ok: false, code: rawCode });
     const h = makeBroker({ fileop });
     const r = await h.broker.handleToolCall(rt(), "Write", { path: "src/x.ts", content: "x" }, "root");

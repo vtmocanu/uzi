@@ -60,6 +60,21 @@ LIFECYCLE_OUT="$HERE/lifecycle-run.$$.log"
 
 log() { printf '\n### %s\n' "$*"; }
 
+if [ "$(uname -m)" != "x86_64" ]; then
+  log "FAILURE: packaged lifecycle requires a native x86_64 host"
+  exit 1
+fi
+
+require_linux_amd64_image() {
+  _image="$1"
+  _platform="$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$_image" 2>/dev/null || true)"
+  if [ "$_platform" != "linux/amd64" ]; then
+    log "FAILURE: image $_image platform is ${_platform:-unknown}, want linux/amd64"
+    exit 1
+  fi
+  log "image $_image platform verified: $_platform"
+}
+
 # cleanup removes EXACTLY the resources this run created, by exact name only. Idempotent and safe
 # on any partial start. Never a uzi-* glob, never `docker compose down`, never `-p uzi`, never -v.
 cleanup() {
@@ -78,6 +93,7 @@ else
   DOCKER_BUILDKIT=1 docker build -f "$REPO/$DOCKERFILE" -t "$IMAGE" \
     --build-arg "UZI_SRC_SHA=$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)" "$REPO"
 fi
+require_linux_amd64_image "$IMAGE"
 
 # 2. Packaging controls — writable-root posture, ROOT start via the real entrypoint. Proves the
 #    baked supervisor + fileop ownership/mode. Independent of the api server, so `--network none`.
@@ -133,6 +149,7 @@ fi
 ADVERTISE="http://${API_NAME}:${API_PORT}"
 log "building test-server image $API_IMAGE from e2e/codex-m3b/testserver.Dockerfile"
 DOCKER_BUILDKIT=1 docker build -f "$HERE/testserver.Dockerfile" -t "$API_IMAGE" "$REPO/api"
+require_linux_amd64_image "$API_IMAGE"
 log "starting test server $API_NAME on $NET (bind 0.0.0.0:$API_PORT, advertise $ADVERTISE)"
 docker run -d --name "$API_NAME" --network "$NET" \
   -e "UZI_TEST_DATABASE_URL=$DSN" \

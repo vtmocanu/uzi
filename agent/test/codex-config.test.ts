@@ -126,4 +126,15 @@ describe("buildCodexProductionConfigToml: fixed managed-auth provider", () => {
       /unsupported option/,
     );
   });
+
+  it("rejects missing and unsupported auth modes without an earlier unknown-option failure", () => {
+    assert.throws(
+      () => buildCodexProductionConfigToml({ model: "gpt-6-astra", projectPath: "/work/repo" } as never),
+      /explicit supported auth mode/,
+    );
+    assert.throws(
+      () => buildCodexProductionConfigToml({ model: "gpt-6-astra", projectPath: "/work/repo", authMode: "oauth" } as never),
+      /explicit supported auth mode/,
+    );
+  });
 });

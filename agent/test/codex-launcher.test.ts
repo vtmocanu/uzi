@@ -47,6 +47,8 @@ interface FakeOpts {
   disposeState?: "drained" | "unconfirmed";
   disposeAuthority?: string;
   exitCode?: number;
+  disposeNearBudget?: boolean;
+  exitDelayMs?: number;
 }
 
 /** A fake supervisor: 5 PassThrough fds, reads control on fd3, emits the pinned
@@ -62,6 +64,9 @@ class FakeSupervisor extends EventEmitter {
   private readonly disposeState: "drained" | "unconfirmed";
   private readonly disposeAuthority: string;
   private readonly exitCode: number;
+  private readonly disposeNearBudget: boolean;
+  private readonly exitDelayMs: number;
+  readonly disposeTimeouts: number[] = [];
 
   constructor(opts: FakeOpts = {}) {
     super();
@@ -69,6 +74,8 @@ class FakeSupervisor extends EventEmitter {
     this.disposeState = opts.disposeState ?? "drained";
     this.disposeAuthority = opts.disposeAuthority ?? "ECHILD+__WALL";
     this.exitCode = opts.exitCode ?? 0;
+    this.disposeNearBudget = opts.disposeNearBudget ?? false;
+    this.exitDelayMs = opts.exitDelayMs ?? 0;
     createInterface({ input: this.control }).on("line", (line) => this.onControl(line));
     if (opts.autoStarted ?? true) {
       this.writeEvidence({
@@ -86,13 +93,18 @@ class FakeSupervisor extends EventEmitter {
   exitWith(code: number, signal: NodeJS.Signals | null = null): void { this.emit("exit", code, signal); }
 
   private onControl(line: string): void {
-    const cmd = JSON.parse(line) as { op: string; id: number };
+    const cmd = JSON.parse(line) as { op: string; id: number; timeoutMs?: number };
     if (cmd.op === "snapshot") {
       this.writeEvidence({ event: "snapshot", id: cmd.id, processes: [{ pid: this.pid + 1, ppid: this.pid, pgid: this.pid, comm: "codex" }] });
     } else if (cmd.op === "dispose") {
+      this.disposeTimeouts.push(cmd.timeoutMs ?? 0);
       if (this.disposeState === "drained") {
-        this.writeEvidence({ event: "dispose", id: cmd.id, state: "drained", authority: this.disposeAuthority, killed: [], reaped: [this.pid + 1] });
-        queueMicrotask(() => this.exitWith(this.exitCode));
+        const emit = (): void => {
+          this.writeEvidence({ event: "dispose", id: cmd.id, state: "drained", authority: this.disposeAuthority, killed: [], reaped: [this.pid + 1] });
+          setTimeout(() => this.exitWith(this.exitCode), this.exitDelayMs);
+        };
+        if (this.disposeNearBudget) setTimeout(emit, Math.max(0, (cmd.timeoutMs ?? 0) - 5));
+        else emit();
       } else {
         this.writeEvidence({ event: "dispose", id: cmd.id, state: "unconfirmed", reason: "deadline", killed: [], reaped: [], children: [this.pid + 1] });
       }
@@ -430,6 +442,18 @@ describe("launchCodexRoot: happy-path lifecycle over the fake supervisor", () =>
     assert.equal(outcome.clean, true);
     assert.ok(outcome.clean && outcome.event.state === "drained");
     assert.equal(handle.failed, undefined);
+  });
+
+  it("reserves caller budget for exit confirmation after a near-deadline drain", async () => {
+    const fake = newFake({ disposeNearBudget: true, exitDelayMs: 10 });
+    const handle = await launchCodexRoot(
+      baseSpec(),
+      baseDeps(fake, { deadlines: { started: 1000, snapshot: 1000, dispose: 1000, exit: 30 } }),
+    );
+
+    const outcome = await handle.dispose(100);
+    assert.equal(outcome.clean, true);
+    assert.ok((fake.disposeTimeouts[0] ?? 100) <= 80, "drain received no more than four fifths of the total budget");
   });
 });
 

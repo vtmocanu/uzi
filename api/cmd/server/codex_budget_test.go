@@ -9,11 +9,11 @@ import (
 )
 
 // The production refresh path performs an OAuth exchange and a verified identity read
-// serially. Three seconds per call caps network time at six seconds, leaving a real second
-// for the durable intent/commit inside workersvc's seven-second lease.
+// serially. Two and a half seconds per call caps network time at five seconds, preserving
+// the request-entry-anchored commit/recheck and response reserves.
 func TestCodexProviderRequestTimeoutLeavesCommitMargin(t *testing.T) {
-	if codexProviderRequestTimeout != 3*time.Second {
-		t.Fatalf("provider request timeout = %s, want 3s", codexProviderRequestTimeout)
+	if codexProviderRequestTimeout != 2500*time.Millisecond {
+		t.Fatalf("provider request timeout = %s, want 2.5s", codexProviderRequestTimeout)
 	}
 }
 

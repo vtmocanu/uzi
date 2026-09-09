@@ -104,11 +104,10 @@ var (
 
 // codexProviderRequestTimeout bounds ONE Codex provider HTTP call (oauth token refresh or
 // the nonrotating identity re-verify) in the production codexauth.Client (PRD #1171 M1).
-// It is the innermost nested deadline: two serial calls consume at most 6s, leaving a real
-// second inside the 7s refresh lease for intent/identity/commit work. The worker-facing API
-// finishes within 7.5s, its HTTP client caps the round trip at 8s, and the future app-server
-// callback bridge retains the remaining margin below the fixed 10s provider deadline.
-const codexProviderRequestTimeout = 3 * time.Second
+// It is the innermost nested deadline: two serial calls consume at most 5s. Request-entry
+// anchoring reserves a second for durable commit/recheck and 500ms for response delivery
+// inside the 7.5s route budget, while the worker HTTP client remains capped at 8s.
+const codexProviderRequestTimeout = 2500 * time.Millisecond
 
 func main() {
 	// -health is a shell-free container healthcheck: the distroless runtime
@@ -493,8 +492,8 @@ func run() error {
 	//	worker → API HTTP timeout ............................. 8s   (agent WorkerClient)
 	//	API route handling timeout .......................... 7.5s   (worker_codex.go)
 	//	coordinated-refresh lease ............................. 7s   (codexrefresh.go)
-	//	one provider HTTP call (codexProviderRequestTimeout) .. 3s   (at most two serial calls,
-	//	                                                           leaving 1s for durable DB work)
+	//	one provider HTTP call (codexProviderRequestTimeout) 2.5s   (at most two serial calls,
+	//	                                                           leaving commit/recheck margin)
 	//
 	// Each outer layer therefore has actual response/cancellation margin. A timeout keeps
 	// the logical operation id and observed generation unchanged so reconciliation retries

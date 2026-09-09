@@ -55,13 +55,18 @@ describe("Codex supervised command root (Linux packaged profile)", { skip: ENABL
     const isolation = await spawnCommand(
       [
         "/bin/sh", "-c",
-        `ls /data/runner >/dev/null 2>&1 && printf sibling-enumerable; cat ${sibling}/canary >/dev/null 2>&1 && printf sibling-readable; cat /run/secrets/worker_token >/dev/null 2>&1 && printf token-readable; printf isolated > proof`,
+        `ls /data/runner >/dev/null 2>&1 && printf sibling-enumerable; cat ${sibling}/canary >/dev/null 2>&1 && printf sibling-readable; cat /run/secrets/worker_token >/dev/null 2>&1 && printf token-readable; printf %s "$TMPDIR" > tmpdir-proof; printf isolated > proof`,
       ],
       { cwd: worktree },
     );
     assert.equal(isolation.code, 0, `sandbox command failed: ${isolation.stderr}`);
     assert.equal(isolation.stdout, "", "sibling runs cannot be enumerated/read and the worker token cannot be read");
     assert.equal(await fs.readFile(`${worktree}/proof`, "utf8"), "isolated");
+    assert.match(
+      await fs.readFile(`${worktree}/tmpdir-proof`, "utf8"),
+      /^\/tmp\/uzi-codex-command-/,
+      "the command observed its provisioned private TMPDIR",
+    );
 
     const bytesToEmit = 8 * 1024 * 1024;
     const capped = await spawnCommand(
@@ -69,7 +74,7 @@ describe("Codex supervised command root (Linux packaged profile)", { skip: ENABL
       { cwd: worktree },
     );
     assert.equal(capped.code, COMMAND_CAPTURE_KILLED_CODE);
-    assert.ok(Buffer.byteLength(capped.stdout) <= MAX_COMMAND_CAPTURE_BYTES);
+    assert.equal(Buffer.byteLength(capped.stdout), MAX_COMMAND_CAPTURE_BYTES);
     assert.equal(registry.hasLiveCommandRoot(), false, "cap-kill returned only after ECHILD+__WALL reap");
     const tmpAfter = (await fs.readdir("/tmp")).filter((name) => name.startsWith("uzi-codex-command-")).sort();
     assert.deepEqual(tmpAfter, tmpBefore, "normal and SIGKILL paths leave no per-command tmp directory");

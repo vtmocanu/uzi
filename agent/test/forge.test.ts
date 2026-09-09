@@ -86,6 +86,7 @@ describe("GitLabClient.createMergeRequest", () => {
     const fetchFn: FetchFn = async (url, init) => {
       calls.push({ url, method: init.method, headers: init.headers, body: init.body, redirect: init.redirect, signal: init.signal });
       if (calls.length === 1) return { status: 409, text: async () => "duplicate" };
+      assert.ok(init.signal, "duplicate-MR lookup must receive the boundary signal");
       await new Promise<void>((_, reject) => {
         const abort = (): void => {
           lookupSettled = true;

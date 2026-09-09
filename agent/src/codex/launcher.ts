@@ -700,11 +700,16 @@ async function createHandle(
     const remaining = (): number => Math.max(0, Math.ceil(deadlineAt - Date.now()));
     try {
       const id = nextId++;
+      // Keep part of the caller's total budget for observing the supervisor's clean exit
+      // after it reports drained. Giving drain the entire budget makes a successful drain
+      // race an immediate 0ms exit-confirmation timeout.
+      const exitReserve = Math.min(deadlines.exit, Math.max(1, Math.floor(remaining() / 5)));
+      const drainBudget = Math.max(0, remaining() - exitReserve);
       let ev: SnapshotEvidence | DisposeEvidence;
       try {
         ev = await withDeadline(
-          sendAndWait(id, { op: "dispose", id, timeoutMs: remaining() }),
-          Math.min(remaining(), deadlines.dispose + timeoutMs),
+          sendAndWait(id, { op: "dispose", id, timeoutMs: drainBudget }),
+          Math.min(remaining(), drainBudget),
           "dispose",
         );
       } catch (error) {
@@ -721,7 +726,7 @@ async function createHandle(
       // Drained reported — a clean supervisor exit (0) must confirm it.
       let exit: { code: number | null; signal: NodeJS.Signals | null };
       try {
-        exit = await withDeadline(exitPromise, Math.min(remaining(), deadlines.exit), "supervisor exit");
+        exit = await withDeadline(exitPromise, Math.min(remaining(), exitReserve), "supervisor exit");
       } catch (error) {
         return { clean: false, reason: error instanceof Error ? error.message : String(error), event: disposeEv };
       }

@@ -149,9 +149,10 @@ export interface CodexProductionConfigOptions {
  * Pinned 0.153.2's built-in `openai` provider has `requires_openai_auth = true` and no
  * configured base URL. That absence is load-bearing: API-key auth selects
  * `https://api.openai.com/v1`, while `chatgptAuthTokens` selects the ChatGPT Codex
- * backend. Re-declaring the provider with the partial adapter's fixed API base URL and
- * `requires_openai_auth = false` would bypass the login performed by appserver-auth.ts
- * and route a subscription through the paid API-key endpoint.
+ * backend. Pinned 0.153.2 merges configured providers with `or_insert`, so a caller cannot
+ * override the built-in `openai` provider with a partial table. Its production request and
+ * stream retry defaults therefore remain active by design; the zero-retry custom-provider
+ * settings belong only to deterministic fake-provider tests.
  *
  * `authMode` is required even though the TOML is identical for both modes. It forces the
  * trusted composition to make an explicit no-fallback choice, which the auth session then

@@ -15,8 +15,8 @@
 // block takes the exact legacy path).
 //
 // SECURITY: the provider credential is a PRIVATE construction input released FRESH per
-// provider root (part D). It rides ONLY into the launcher env, never a frame/log/tool
-// result. The command + fileop effect surfaces run as the credential-free command identity
+// provider root (part D). It rides only through the app-server authentication RPC, never a
+// launcher environment, frame, log, or tool result. The command + fileop effect surfaces run as the credential-free command identity
 // (`commandRootCommand`, uid 10003) with a SCRUBBED env — nothing inherited from
 // `process.env`.
 //
@@ -55,7 +55,7 @@ import type {
   TurnStreamEnd,
 } from "../harness.js";
 import { RunTurnReducerImpl } from "../harness-reducer.js";
-import { buildLeadSystemPrompt } from "../prompt.js";
+import { buildLeadSystemPrompt, buildRevisePlanPrompt } from "../prompt.js";
 import { RUNNER_UID, uidSplitActive } from "../runner-uid.js";
 import { errMessage } from "../util.js";
 import type { AgentTemplate, ClaimSkill } from "../protocol.js";
@@ -178,6 +178,7 @@ const DEFAULT_CHILD_TURN_DEADLINE_MS = 10 * 60 * 1000;
 // sdk-executor's DEFAULT_MAX_ITERATIONS (PRD: RUN_MAX_ITERATIONS default 5). Codex carries no
 // milestone-scaling served budget yet, so the claim value or this default is the whole cap.
 const DEFAULT_MAX_ITERATIONS = 5;
+const DEFAULT_MAX_REVISIONS = 3;
 
 // Watchdog/cancel trip reasons (secret-free static strings). "run cancelled" matches the
 // runner's terminal cancel wording so a Codex cancel routes identically.
@@ -202,6 +203,15 @@ const NOOP_CONTEXT_HOOK: HarnessContextHook = {
  *  falls back to the default. */
 function positiveOr(value: number | undefined, fallback: number): number {
   return typeof value === "number" && value > 0 ? Math.floor(value) : fallback;
+}
+
+/** Mirror the shared plan-gate contract: zero explicitly disables revisions, while an
+ * absent or invalid claim value falls back to the server default. */
+function planMaxRevisionsOf(config: RunContext["config"]): number {
+  const value = config?.plan_max_revisions;
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? Math.floor(value)
+    : DEFAULT_MAX_REVISIONS;
 }
 
 /** Map one uzi {@link AgentTemplate} onto the neutral {@link HarnessAgent} the Codex
@@ -1035,9 +1045,17 @@ export class CodexExecutor implements Executor {
           throw new Error("codex plan turn produced no plan");
         }
         let verdict = await ctx.gatePlan(planMd, planResult.milestones);
+        const maxRevisions = planMaxRevisionsOf(ctx.config);
+        let revisions = 0;
         while (verdict.kind === "revise") {
-          ctx.emit({ kind: "plan_feedback", agent: "worker", payload: { feedback: verdict.feedback } });
-          planResult = await this.driveCodexTurn(ctx, epoch.harness, reducer, "plan", this.planPrompt(ctx), epoch.resumeSessionId, idleMs, wallMs, epoch.buildPhaseBroker);
+          const feedback = verdict.feedback;
+          ctx.emit({ kind: "plan_feedback", agent: "worker", payload: { feedback } });
+          if (revisions >= maxRevisions) {
+            throw new Error("codex plan revision budget exhausted");
+          }
+          revisions++;
+          ctx.emit({ kind: "plan_revising", agent: "worker", payload: { round: revisions } });
+          planResult = await this.driveCodexTurn(ctx, epoch.harness, reducer, "plan", buildRevisePlanPrompt(feedback), epoch.resumeSessionId, idleMs, wallMs, epoch.buildPhaseBroker);
           planMd = planResult.plan;
           if (planMd === undefined || planMd.trim().length === 0) {
             throw new Error("codex plan turn produced no plan on revision");

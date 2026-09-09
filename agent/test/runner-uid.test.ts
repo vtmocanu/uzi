@@ -215,7 +215,16 @@ describe("runner-uid: codex command/boundary identities (#1171)", () => {
     process.env.UZI_UID_SPLIT = "1";
     assert.deepEqual(workerBoundaryCommand("git", ["push", "origin", "HEAD"]), {
       command: "/bin/setpriv",
-      args: [...setprivArgsForUid(WORKER_UID), "git", "push", "origin", "HEAD"],
+      args: [
+        "--reuid", "10001",
+        "--regid", "10001",
+        "--init-groups",
+        "--bounding-set", "-all",
+        "--inh-caps", "-all",
+        "--ambient-caps", "-all",
+        "--",
+        "git", "push", "origin", "HEAD",
+      ],
     });
   });
 });

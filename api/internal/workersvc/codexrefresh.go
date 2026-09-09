@@ -34,9 +34,18 @@ import (
 // codexRefreshLeaseTTL bounds the complete API-side refresh lease. Pinned app-server has
 // a fixed 10-second external-auth deadline; the worker reserves 1 second and gives its
 // API request 8 seconds. A 7-second lease therefore leaves a real second for the HTTP
-// response. Production provider calls are capped at 3 seconds each, leaving another
-// second inside this lease for intent, identity validation and the durable commit.
+// response. Production provider calls are capped at 2.5 seconds each, leaving another
+// second inside this lease for identity validation, the durable commit and authority recheck.
 const codexRefreshLeaseTTL = 7 * time.Second
+
+const (
+	// Leave the handler enough time to encode and deliver the response after the service
+	// returns. The handler's 7.5s context starts at request entry.
+	codexRefreshResponseReserve = 500 * time.Millisecond
+	// Stop provider work before the lease expires so identity verification, sealing, the
+	// durable commit, and the final authority recheck retain a bounded slice.
+	codexRefreshCommitReserve = time.Second
+)
 
 // Codex refresh-intent states (the codex_refresh_intent.state CHECK values, migration
 // 00201). Named here so the state machine never spells a bare literal that could drift
@@ -310,13 +319,23 @@ func (s *Service) sealCodexLogin(userID uuid.UUID, plaintext []byte) (sealed []b
 // It NEVER returns an access token that was not durably committed, NEVER rotates two
 // operations in parallel, and NEVER blindly re-spends a refresh token after a crash.
 func (s *Service) CoordinatedCodexRefresh(ctx context.Context, wkr store.Worker, runID uuid.UUID, capability string, operationID uuid.UUID, observedGeneration int64) (CodexRefreshResult, error) {
+	operationBudget := codexRefreshOperationBudget(ctx)
+	if operationBudget <= codexRefreshCommitReserve {
+		return CodexRefreshResult{}, context.DeadlineExceeded
+	}
+	operationDeadline := time.Now().Add(operationBudget)
+	operationCtx, cancel := context.WithDeadline(ctx, operationDeadline)
+	defer cancel()
+	leaseDeadline := s.codexNow().Add(operationBudget)
+	providerDeadline := operationDeadline.Add(-codexRefreshCommitReserve)
+
 	// (1) Authorize ScopeStartRefresh. This is subscription-only, so a successful authCtx
 	// carries the resolved account id; an api_key run is refused by the scope check.
-	authCtx, err := s.AuthorizeCodexCredentialOp(ctx, wkr, runID, capability, ScopeStartRefresh)
+	authCtx, err := s.AuthorizeCodexCredentialOp(operationCtx, wkr, runID, capability, ScopeStartRefresh)
 	if err != nil {
 		return CodexRefreshResult{}, err
 	}
-	res, err := s.coordinatedRefresh(ctx, authCtx.UserID, authCtx.AccountID, operationID, observedGeneration)
+	res, err := s.coordinatedRefresh(operationCtx, authCtx.UserID, authCtx.AccountID, operationID, observedGeneration, leaseDeadline, providerDeadline)
 
 	// (7) Post-exchange release recheck (audit #3b), the recheck-before-release idiom
 	// ReleaseCodexCredential uses. CoordinatedCodexRefresh authorized ScopeStartRefresh
@@ -327,17 +346,28 @@ func (s *Service) CoordinatedCodexRefresh(ctx context.Context, wkr store.Worker,
 	// the token and refuse this run as contended; no token that a no-longer-owning run could
 	// use ever leaves this call.
 	if err == nil && res.AccessToken != "" {
-		if _, rerr := s.AuthorizeCodexCredentialOp(ctx, wkr, runID, capability, ScopeStartRefresh); rerr != nil {
+		if _, rerr := s.AuthorizeCodexCredentialOp(operationCtx, wkr, runID, capability, ScopeStartRefresh); rerr != nil {
 			return CodexRefreshResult{Outcome: CodexRefreshContended}, rerr
 		}
 	}
 	return res, err
 }
 
+func codexRefreshOperationBudget(ctx context.Context) time.Duration {
+	budget := codexRefreshLeaseTTL
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline) - codexRefreshResponseReserve
+		if remaining < budget {
+			budget = remaining
+		}
+	}
+	return budget
+}
+
 // coordinatedRefresh is the post-authorization core, keyed on the resolved (user,
 // account). Split out so its failure paths (CAS lost, persistence failure) are testable
 // through a wrapped store without re-deriving the authority every time.
-func (s *Service) coordinatedRefresh(ctx context.Context, userID, accountID, operationID uuid.UUID, observedGeneration int64) (CodexRefreshResult, error) {
+func (s *Service) coordinatedRefresh(ctx context.Context, userID, accountID, operationID uuid.UUID, observedGeneration int64, leaseDeadline, providerDeadline time.Time) (CodexRefreshResult, error) {
 	q, ok := s.codexRefreshQueries()
 	if !ok {
 		return CodexRefreshResult{}, errCodexStoreUnavailable
@@ -387,7 +417,7 @@ func (s *Service) coordinatedRefresh(ctx context.Context, userID, accountID, ope
 	}
 
 	// observedGeneration == acct.Generation → ADVANCE (steps 3-6).
-	return s.advanceCodexRefresh(ctx, q, userID, accountID, operationID, acct)
+	return s.advanceCodexRefresh(ctx, q, userID, accountID, operationID, acct, leaseDeadline, providerDeadline)
 }
 
 // advanceCodexRefresh performs the rotation itself (PRD #1147 M2, B6 §3-6): durable intent,
@@ -395,7 +425,7 @@ func (s *Service) coordinatedRefresh(ctx context.Context, userID, accountID, ope
 // BEFORE the lease so a same-operationID concurrent retry is caught (23505) before any lease
 // is held and can never strand it. `acct` is the account read at generation ==
 // observedGeneration (the generation this rotation advances FROM).
-func (s *Service) advanceCodexRefresh(ctx context.Context, q codexRefreshStore, userID, accountID, operationID uuid.UUID, acct store.CodexProviderAccount) (CodexRefreshResult, error) {
+func (s *Service) advanceCodexRefresh(ctx context.Context, q codexRefreshStore, userID, accountID, operationID uuid.UUID, acct store.CodexProviderAccount, leaseDeadline, providerDeadline time.Time) (CodexRefreshResult, error) {
 	// Extract the refresh token FIRST (a local read that mutates nothing). Hoisting it
 	// ahead of the intent/lease means a locked vault or a login with no refresh token
 	// fails cleanly — no durable intent left behind that a survivor would have to
@@ -443,10 +473,9 @@ func (s *Service) advanceCodexRefresh(ctx context.Context, q codexRefreshStore, 
 	// op's own 'rotating' intent (from_generation=acct.Generation) is resolved by
 	// ReconcileUnresolvedCodexRefresh once the account advances past it. Either way no lease
 	// is stranded and the stale refresh token is never re-spent.
-	deadline := s.codexNow().Add(codexRefreshLeaseTTL)
 	n, err := q.AcquireCodexRefreshLease(ctx, store.AcquireCodexRefreshLeaseParams{
 		Op:             operationID,
-		Deadline:       pgconv.Time(deadline),
+		Deadline:       pgconv.Time(leaseDeadline),
 		ID:             accountID,
 		UserID:         userID,
 		FromGeneration: acct.Generation,
@@ -465,7 +494,9 @@ func (s *Service) advanceCodexRefresh(ctx context.Context, q codexRefreshStore, 
 	// may have rotated server-side before the transport failed), so the intent is LEFT
 	// 'rotating' for a survivor to reconcile — never a blind retry of the old refresh
 	// token. The lease expires and routes to quarantine.
-	result, rerr := s.codexRefresh.Refresh(ctx, prev.RefreshToken)
+	providerCtx, cancelProvider := context.WithDeadline(ctx, providerDeadline)
+	defer cancelProvider()
+	result, rerr := s.codexRefresh.Refresh(providerCtx, prev.RefreshToken)
 	if rerr != nil {
 		return CodexRefreshResult{Outcome: CodexRefreshContended}, fmt.Errorf("codex refresh: provider exchange: %w", rerr)
 	}
@@ -535,7 +566,7 @@ func (s *Service) advanceCodexRefresh(ctx context.Context, q codexRefreshStore, 
 	//     RETAINED, not discarded: protect it in the recovery slot at from_generation and leave
 	//     the intent 'rotating' so a later promotion re-verifies it. Return NO token, but do NOT
 	//     claim recovery is impossible (PRD #1147 M4, defect 5).
-	id, derr := s.codexRefresh.DiscoverIdentity(ctx, result.AccessToken)
+	id, derr := s.codexRefresh.DiscoverIdentity(providerCtx, result.AccessToken)
 	switch {
 	case derr == nil && id.ProviderUserID == acct.ProviderUserID && id.WorkspaceAccountID == acct.WorkspaceAccountID:
 		// MATCH → fall through to the commit below.

@@ -446,7 +446,6 @@ class AppServerAuthSession implements CodexAppServerAuthSession {
     const aborted = new Promise<never>((_, reject) => {
       onInternalAbort = (): void => reject(transportError("codex authentication refresh aborted"));
       controller.signal.addEventListener("abort", onInternalAbort, { once: true });
-      if (controller.signal.aborted) onInternalAbort();
     });
     let timer: ReturnType<typeof setTimeout> | undefined;
     const deadline = new Promise<never>((_, reject) => {

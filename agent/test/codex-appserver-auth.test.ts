@@ -253,6 +253,28 @@ describe("Codex app-server auth: subscription refresh", () => {
     assert.notEqual(operationIds[2], operationIds[1], "a later logical refresh gets a new operation id");
   });
 
+  it("handles an already-aborted outer signal without an unhandled rejected promise", async () => {
+    const auth = subscription({ refresh: async () => REFRESHED });
+    const transport = new FakeTransport();
+    await auth.authenticate(transport);
+    const outer = new AbortController();
+    outer.abort();
+    let unhandled: unknown;
+    const recordUnhandled = (reason: unknown): void => { unhandled = reason; };
+    process.once("unhandledRejection", recordUnhandled);
+    try {
+      assert.equal(await auth.handleServerRequest(transport, refreshRequest(9), outer.signal), true);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(unhandled, undefined);
+      assert.deepEqual((responses(transport)[0]!.response as { error: unknown }).error, {
+        code: -32001,
+        message: "codex authentication refresh unavailable",
+      });
+    } finally {
+      process.removeListener("unhandledRejection", recordUnhandled);
+    }
+  });
+
   it("enforces a hard bridge budget below pinned app-server's 10-second deadline", async () => {
     let bridgeSignal: AbortSignal | undefined;
     const auth = subscription({

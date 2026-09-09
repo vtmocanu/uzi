@@ -678,6 +678,21 @@ describe("CodexAdviceHarness: timeout + grace + fail-closed setup", () => {
     assert.equal(bits.disposeCalls(), 1, "the isolated HOME is disposed after settlement/grace");
   });
 
+  it("disposes the advice root when authentication draining fails", async () => {
+    const appServerAuth: CodexAppServerAuthSession = {
+      mode: "subscription",
+      authenticate: async () => {},
+      handleServerRequest: async () => false,
+      drainInterceptedRequests: async () => { throw new Error("auth drain failed"); },
+      closeAdmissionAndCancel() {},
+    };
+    const bits = makeHarness({ appServerAuth });
+    bits.transport.push(threadStarted()).push(turnCompleted("completed")).end();
+
+    await assert.rejects(bits.harness.run(makeAdviceRequest(), noThrowPolicy), /auth drain failed/);
+    assert.equal(bits.disposeCalls(), 1, "auth drain failure cannot skip root cleanup");
+  });
+
   it("an unexpected EOF (no terminal) rejects with a protocol error and still disposes the HOME", async () => {
     const bits = makeHarness();
     bits.transport.push(threadStarted()).push(turnStarted()).end(); // ends before turn/completed

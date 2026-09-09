@@ -337,7 +337,15 @@ export class FakeApi {
       if (operation === "release" && runId === "api-key") {
         return send(res, 200, { auth_mode: "api_key", access_token: "api-key-access" });
       }
-      const generation = operation === "refresh" ? Number(json.observed_generation) + 1 : 3;
+      const observed = json.observed_generation;
+      if (
+        operation === "refresh"
+        && (typeof observed !== "number" || !Number.isSafeInteger(observed) || observed < 0)
+      ) {
+        return send(res, 400, { error: "invalid observed_generation" });
+      }
+      let generation = 3;
+      if (operation === "refresh") generation = observed as number + 1;
       return send(res, 200, {
         auth_mode: "subscription",
         access_token: "subscription-access",
