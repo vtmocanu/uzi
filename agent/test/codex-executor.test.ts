@@ -997,7 +997,8 @@ describe("CodexExecutor: F1 registry teardown relocation", () => {
     const rig = makeRig();
     rig.deps = { ...rig.deps, deferRegistryTeardown: true };
     rig.transport.push(threadStarted()).push(turnCompleted("completed")).end();
-    const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    const rlog = recordingLog();
+    const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION), rlog.log);
     await withTimeout(exec.run(makeCtx().ctx), 3000, "deferred run");
     // run()'s finally did NOT reap/dispose the registry — it survives for the runner's sinks.
     assert.equal(rig.reaped(), 0, "the provider root was NOT reaped by run()");
@@ -1009,8 +1010,19 @@ describe("CodexExecutor: F1 registry teardown relocation", () => {
     await exec.safety!.withBoundary({ boundary: "finalize", deadlineMs: 200 }, async () => {});
     assert.ok(rig.reaped() >= 1, "the runner's finalize sink reaped the provider root");
     assert.ok(rig.client.refreshCalls.length >= 1, "the sink's subscription reconcile refreshed first");
+    // The sink's reconcile registered a FRESH refresh token with the redactor; it is NOT yet
+    // evicted (run()'s finally already ran, before this post-run sink).
+    const sinkTok = `${FRESH_TOKEN}-refreshed`;
+    assert.ok(rlog.added.includes(sinkTok), "the post-run sink reconcile registered its refresh token");
+    assert.ok(!rlog.removed.includes(sinkTok), "the sink token is NOT evicted until the terminal dispose");
     await exec.safety!.dispose({ boundary: "terminal", deadlineMs: 200 });
     assert.ok(rig.disposed() >= 1, "the runner's terminal dispose tore down the provider root");
+    // FAIL-OLD/PASS-FIXED (executor adoption of onDispose): the terminal dispose evicts the
+    // post-run sink token via the executor's onDispose closure, so EVERY registered token is
+    // balanced by a removal — no leaked redactor entry per Codex run. Deleting the executor's
+    // 4th `createCodexExecutionSafety` arg leaves `sinkTok` in `added` but not `removed`.
+    assert.ok(rlog.removed.includes(sinkTok), "the terminal dispose evicted the post-run sink token (onDispose adoption)");
+    assert.deepEqual([...rlog.added].sort(), [...rlog.removed].sort(), "every registered token was evicted (no redactor leak)");
   });
 
   it("(F1) standalone (no deferRegistryTeardown): run()'s finally BACKSTOPS the registry teardown (provider root torn down)", async () => {

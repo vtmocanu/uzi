@@ -395,9 +395,15 @@ export function createCodexExecutionSafety(
       quiesce: (request) => registry.quiesceChildren(request.deadlineMs),
       reap: (request, closedEpoch) => registry.reapProcesses(request.deadlineMs, closedEpoch),
       dispose: async (request) => {
-        const result = await registry.disposeTools(request.deadlineMs);
-        await onDispose?.();
-        return result;
+        // `onDispose` (the executor's post-run sink token eviction) must run even if
+        // `disposeTools` ever rejects — otherwise those tokens would leak. `disposeTools`
+        // catches internally today (never throws), so the `finally` is future-proofing;
+        // over-retention is the safe direction but eviction is the point.
+        try {
+          return await registry.disposeTools(request.deadlineMs);
+        } finally {
+          await onDispose?.();
+        }
       },
       spawnRoot,
     },
