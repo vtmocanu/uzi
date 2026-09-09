@@ -122,7 +122,14 @@ DELETE FROM mr_rework_ledger
 WHERE repo_id = @repo_id::uuid AND ref <> ALL(@keep_refs::text[]);
 
 -- name: CreateAutoMRReworkRun :one
--- Queue an mr_rework run (PRD #700 M3, sibling of CreateCIFixRun). issue_iid stays
+-- Queue an mr_rework run (PRD #700 M3, sibling of CreateCIFixRun). The NAME is
+-- historical: PRD #1202 added an on-demand (manual) trigger, so @trigger_source is now
+-- the ONLY thing that differs between the two callers — 'mr_rework' from the poller
+-- detector, 'manual' from the on-demand endpoint. The name is deliberately kept because
+-- a live-DB lock probe (mr_rework_branch_guard_livedb_test.go) keys on the generated
+-- `-- name: CreateAutoMRReworkRun` header. kind stays 'mr_rework' regardless of the
+-- trigger; both flavours are the same run kind, distinguished only by trigger_source (D7).
+-- issue_iid stays
 -- NULL (kind='mr_rework'); issue_title/issue_description carry the synthesized human
 -- summary. pipeline_ref = the agent branch (agent/issue-N, uzi/prompt-…, or
 -- uzi/self-improve/… — PRD #908) is written AT INSERT so the cross-kind branch
@@ -156,7 +163,58 @@ INSERT INTO runs (
 SELECT
     @user_id, @repo_id::uuid, 'mr_rework', @issue_title, @issue_description,
     @pipeline_ref, @mr_iid, @target_run_id, sqlc.narg('review_comments')::jsonb, true, @wait_on_limit,
-    COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), 'mr_rework'
+    COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), @trigger_source
+WHERE NOT EXISTS (
+    SELECT 1 FROM runs
+    WHERE repo_id = @repo_id::uuid
+      AND kind = 'ci_fix'
+      AND pipeline_ref = @pipeline_ref
+      AND status NOT IN ('completed', 'failed', 'cancelled')
+)
+RETURNING *;
+
+-- name: CreateManualMRReworkRunAndAdvance :one
+-- ATOMIC on-demand (manual) mr_rework create + ledger advance (PRD #1202, review-finding
+-- hardening of !1207). Folds the run INSERT and the manual high-water advance into ONE
+-- statement so Postgres commits BOTH or NEITHER: previously StartMRReworkForRun created the
+-- run, then called AdvanceMRReworkHighWater separately and only LOGGED an advance failure —
+-- returning success with an unadvanced ledger, which let the automatic watcher re-fire on the
+-- same comments once the manual run went terminal.
+--
+-- The `runs` INSERT is the OUTER statement (RETURNING * -> the Run model) and is byte-for-byte
+-- the CreateAutoMRReworkRun body except trigger_source is hard-coded 'manual' (the only caller
+-- is the on-demand path). Keep the two INSERT bodies in sync.
+--
+-- The `led` CTE mirrors AdvanceMRReworkHighWater's ON CONFLICT body (GREATEST high_water,
+-- reset halt_notified, attempt_count NEVER named -> non-counting, PRD D1) and self-gates on
+-- the SAME cross-kind `WHERE NOT EXISTS` predicate as the run INSERT, evaluated on the same
+-- snapshot, so: branch-in-use -> both insert 0 rows (ErrBranchInUse, ledger untouched);
+-- same-MR/active-branch 23505 -> whole statement aborts, ledger rolled back
+-- (ErrActiveMRReworkExists/ErrBranchInUse); success -> run + ledger commit together. `ref` on
+-- the ledger is the pipeline_ref (the branch), exactly as the two-step path passed it.
+WITH led AS (
+    INSERT INTO mr_rework_ledger (repo_id, ref, high_water)
+    SELECT @repo_id::uuid, @pipeline_ref, @high_water
+    WHERE NOT EXISTS (
+        SELECT 1 FROM runs
+        WHERE repo_id = @repo_id::uuid
+          AND kind = 'ci_fix'
+          AND pipeline_ref = @pipeline_ref
+          AND status NOT IN ('completed', 'failed', 'cancelled')
+    )
+    ON CONFLICT (repo_id, ref) DO UPDATE
+    SET high_water    = GREATEST(mr_rework_ledger.high_water, EXCLUDED.high_water),
+        halt_notified = false,
+        updated_at    = now()
+)
+INSERT INTO runs (
+    user_id, repo_id, kind, issue_title, issue_description,
+    pipeline_ref, mr_iid, target_run_id, review_comments, auto_approve, wait_on_limit, required_capabilities, trigger_source
+)
+SELECT
+    @user_id, @repo_id::uuid, 'mr_rework', @issue_title, @issue_description,
+    @pipeline_ref, @mr_iid, @target_run_id, sqlc.narg('review_comments')::jsonb, true, @wait_on_limit,
+    COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), 'manual'
 WHERE NOT EXISTS (
     SELECT 1 FROM runs
     WHERE repo_id = @repo_id::uuid

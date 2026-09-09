@@ -757,6 +757,10 @@ Mock at `prds/mockups/1167-lights-on-themes-mock.html`.
 - Admin sets the instance defaults (mode plus a theme per polarity plus typeface); a user override wins — extends Feature #21's server-side theme default. [user 2026-09-07]
 - Per-user typeface — System or IBM Plex — independent of theme; bundled, no external font fetch. [user 2026-09-07]
 
+## Feature #1202 — On-demand MR rework
+
+- An owner can start one MR rework cycle on demand from a completed run's page or with uzi run rework, with optional guidance, even after the automatic cap; on-demand cycles never count against the cap. [user, #1202]
+
 ## Startup admin seed
 
 - Seed an admin user from env at startup (`UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME`) so the user survives DB wipes.

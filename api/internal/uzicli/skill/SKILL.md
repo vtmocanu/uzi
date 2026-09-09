@@ -164,6 +164,7 @@ uzi run expedite <run-id> [--clear]
 uzi run resume-now <run-id>
 uzi run resume <run-id>
 uzi run mr-rework <run-id> [--enabled[=false]] [--clear]
+uzi run rework <run-id> [-m|--message <text>]
 uzi schedule create --repo <repo-id> [--repo <repo-id>]... (--issue <iid> | --sweep [--label <l>]... [--create-missing-labels] | --prompt <text>) (--at <rfc3339> | --cron <expr>) [--tz <iana>] [--enabled[=false]] [--auto-approve[=false]] [--wait-on-limit] [--mr-rework[=false]] [--output mr|issues]
 uzi schedule list
 uzi schedule get <schedule-id>
@@ -294,13 +295,13 @@ uzi version
   from the wrong key is indistinguishable from a message with no content; read
   `payload`.**
 
-  **The twelve `status` values, and what `--follow` actually waits for.** A run's
-  `status` (on `run get` and `run list`) is one of exactly twelve values:
+  **The thirteen `status` values, and what `--follow` actually waits for.** A run's
+  `status` (on `run get` and `run list`) is one of exactly thirteen values:
   `queued`, `claimed`, `running`, `awaiting_approval`, `awaiting_input`,
-  `awaiting_followup`, `limit_wait`, `pool_wait`, `completed`, `failed`, `cancelled`,
-  `paused`. Only
+  `awaiting_followup`, `limit_wait`, `pool_wait`, `recovery_wait`, `paused`,
+  `completed`, `failed`, `cancelled`. Only
   `completed`, `failed` and `cancelled` are **terminal**, and `uzi run logs --follow` returns ONLY on
-  those three. The six non-terminal parks/holds it will **not** stop at are
+  those three. The seven non-terminal parks/holds it will **not** stop at are
   `awaiting_approval` (the plan gate), `awaiting_input` (a clarifying
   question, answered with `run answer`), `awaiting_followup` (an interactive
   task — `uzi handoff --interactive` — parked after a clean `signal_done`,
@@ -309,8 +310,9 @@ uzi version
   `limit_wait` (parked while an Anthropic usage limit resets; the sweep
   promotes it back to `queued` once past its `retry_not_before`),
   `pool_wait` (an `auto` run held because its token pool is empty — add a token
-  to the pool and it resumes), and `paused` (an owner-requested hold — `uzi
-  run pause` — resumed on demand from the run page or `uzi run resume <id>`;
+  to the pool and it resumes), `recovery_wait` (parked after an empty model turn;
+  the sweep retries it on a capped backoff), and `paused` (an owner-requested hold, `uzi
+  run pause`, resumed on demand from the run page or `uzi run resume <id>`;
   it does not auto-resume). So to
   wait for a plan gate or a clarification park, use **`uzi run wait <id>`** (see
   below) — relying on `--follow` there blocks until the run truly finishes, which
@@ -318,7 +320,7 @@ uzi version
   the server is newer than this binary — upgrade rather than trusting the value
   to mean "active". The live `/api/ws` stream and `uzi tui` go further and
   rewrite an unrecognised status to `unknown`, but plain `run get`/`run list
-  --json` pass it through verbatim, so this twelve-value list is what you branch
+  --json` pass it through verbatim, so this thirteen-value list is what you branch
   on.)
 
   **Paging is internal and transparent; treat it as all-or-nothing.** A large
@@ -339,9 +341,10 @@ uzi version
   `awaiting_input` (a clarification park), `awaiting_followup` (an interactive
   task parked awaiting your next follow-up — it does not auto-resume, so a
   bare wait stops there too), `completed`, `failed`, `cancelled` — and keeps
-  waiting through `queued`/`claimed`/`running`/`limit_wait`/`pool_wait` (the
-  latter two resume on their own) and `paused` (resumed on demand with `uzi
-  run resume`). So a bare
+  waiting through `queued`/`claimed`/`running`/`limit_wait`/`pool_wait`/
+  `recovery_wait`/`paused`: limit and recovery waits retry on a timer, pool waits
+  need an available pooled token, and owner pauses need `uzi run resume`.
+  So a bare
   `uzi run wait <id>` is "wait for the plan gate, a clarification, an
   interactive park, OR the end". It **exits 0** the
   moment a target state is reached (including if the run is already in one),
@@ -351,7 +354,7 @@ uzi version
   gives **exit 7** if it elapses first (there is no default timeout — a healthy
   gated run stops at its gate, so a bare wait cannot hang). A single transient
   `6` (server blip) is ridden out, not fatal. `--until <a,b>` overrides the stop
-  set (validated against the twelve statuses).
+  set (validated against the thirteen statuses).
 
   **Narrow the wait after you approve.** A run lingers at `awaiting_approval` for
   a beat after a successful `run approve` (the async flip to `running`), so the
@@ -522,6 +525,16 @@ uzi version
   usage error (exit 2); a foreign/unknown run is a 404 (exit 4). The write is inert once
   the MR is merged or closed. Prints the updated run, whose `MR_REWORK` row reads
   inherit/on/off.
+- `uzi run rework <run-id> [-m|--message <text>]` — start ONE on-demand MR-rework cycle
+  on a **completed** run whose MR is open, PAST the automatic cap (PRD #1202) — the way to
+  rework an MR after the automatic watcher has stopped. It SKIPS the cap, the quiet-period
+  debounce, the head-SHA staleness check and the green-pipeline gate, but KEEPS the branch
+  guard, the one-active-rework guard, the admin kill-switch, the owner token and the open-MR
+  requirement. The cycle does **not** count against the automatic cap. A foreign/unknown run
+  is a 404 (exit 4); a refusal — disabled, not reworkable, already running, or nothing new to
+  rework — is a 409 (exit 5). `-m`/`--message` carries optional guidance to steer the rework
+  (or pipe it on stdin); an empty guidance is a valid trigger as long as there is a new review
+  comment. Prints the created `mr_rework` run.
 
 ### Schedules — time-driven runs
 
@@ -727,14 +740,17 @@ an instruction.
 **Auto mode, step by step.** Every step can STOP and hand back to the user; it
 never forces past a bad plan, a blocked merge, or an unfixable pipeline.
 
-1. **Resolve coordinates.** `uzi repo list --json` for the repo id; take the PRD
-   issue iid from the user or context. Confirm the issue carries the `uzi` label —
-   `run create` (step 3) rejects one that lacks it ("not marked as uzi's work"), and
-   an issue just handed off by `/prd-create` commonly carries only `PRD`. Add `uzi`
-   via the forge's **Promote** action, which writes the label AND refreshes uzi's
-   cache in one request so the run starts immediately; adding the label with the
-   plain forge CLI instead leaves `run create` failing until the next poller sync
-   (seconds to a minute of blind retries).
+1. **Resolve coordinates and make the issue eligible.** `uzi repo list --json` for
+   the repo id; take the PRD issue iid from the user or context. Confirm the issue
+   carries the configured `uzi` eligibility label — `run create` (step 3) rejects one
+   that lacks it ("not marked as uzi's work"), and an issue just handed off by
+   `/prd-create` commonly carries only `PRD`. Once the user has authorized dispatch,
+   add the label with the repository's native forge CLI and verify the forge reports
+   it. The direct label write reaches uzi's cached issue on the next poller sync. Let
+   step 3 attempt creation once; only if it returns that specific eligibility
+   rejection while the forge still shows the label, retry the same create after short
+   waits for up to 90 seconds (one full default poll interval plus sync margin). Stop on
+   any other error, and never blindly repeat a create whose result is uncertain.
 2. **Pre-flight: is anything already in flight that this run depends on or
    collides with?** Ask the user **only on a confident blocker**, never on the
    mere presence of parallel runs — independent issues run fine side by side (each
@@ -994,12 +1010,11 @@ the cost of one approval.
 
 **No `prds/*.md` file for this issue yet?** It still works — the plan you
 supply is what the file would have provided. A PRD file is optional, never
-required; the issue needs only the `uzi` label. And if you
-just added the `uzi` label yourself, `run create` may still answer "issue
-does not carry the uzi label" until the next poller sync — going through
-the forge's own **Promote** action instead writes the label and updates
-uzi's cache in the same request, so a freshly-promoted issue is runnable
-immediately, with no wait.
+required; the issue needs only the configured `uzi` eligibility label. After
+adding that label with the native forge CLI, verify it on the forge before
+creating the run. If `run create` still reports that the issue is not marked as
+uzi's work, wait for the next poller sync and retry only that specific rejection
+for up to 90 seconds with default settings; stop on any other error.
 
 ### Reading and triaging the judge's review
 

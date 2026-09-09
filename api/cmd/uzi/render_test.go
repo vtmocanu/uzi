@@ -1049,6 +1049,13 @@ func TestRunAgeCell(t *testing.T) {
 			want: "20m",
 		},
 		{
+			// recovery_wait (issue #1197) is a park like limit_wait/pool_wait — it anchors
+			// on UpdatedAt and renders a waiting duration, NOT "-".
+			name: "recovery_wait off UpdatedAt",
+			r:    apitypes.RunDTO{Status: statusRecoveryWait, UpdatedAt: now.Add(-15 * time.Minute)},
+			want: "15m",
+		},
+		{
 			// Terminal is a static span FinishedAt−StartedAt, so a now far from either end
 			// does not change it: this run ran for 2h whenever it is listed.
 			name: "completed is a static ran-span",
@@ -1190,6 +1197,50 @@ func TestRenderRunDetailMrReworkTriState(t *testing.T) {
 	}
 }
 
+// TestRenderRunDetailMrReworkCycles — the OWNER-ONLY automatic-rework ledger row (PRD
+// #1202): rendered ONLY when BOTH MrReworkAutoCycles and MrReworkAutoCap are present, as
+// "N/M", with " (stopped)" appended once the cap is reached. When either field is nil the
+// row is omitted entirely, so an old server that never sends the fields keeps the old
+// output.
+func TestRenderRunDetailMrReworkCycles(t *testing.T) {
+	render := func(cycles, capN *int) string {
+		t.Helper()
+		var buf bytes.Buffer
+		p := uzicli.NewPrinter(&buf, false, false, true, false)
+		r := apitypes.RunDTO{ID: "run-1", Kind: "issue", Status: "completed", Health: "ok", MrReworkAutoCycles: cycles, MrReworkAutoCap: capN}
+		if err := renderRunDetail(p, r); err != nil {
+			t.Fatalf("renderRunDetail: %v", err)
+		}
+		return buf.String()
+	}
+	ptr := func(n int) *int { return &n }
+
+	// Below the cap: "N/M", no "(stopped)".
+	if out := render(ptr(1), ptr(3)); !strings.Contains(out, "MR_REWORK_CYCLES") || !strings.Contains(out, "1/3") {
+		t.Errorf("below cap: want MR_REWORK_CYCLES 1/3, got:\n%s", out)
+	} else if strings.Contains(out, "(stopped)") {
+		t.Errorf("below cap: must NOT read (stopped), got:\n%s", out)
+	}
+	// At the cap: "N/M (stopped)".
+	if out := render(ptr(3), ptr(3)); !strings.Contains(out, "MR_REWORK_CYCLES") || !strings.Contains(out, "3/3 (stopped)") {
+		t.Errorf("at cap: want MR_REWORK_CYCLES 3/3 (stopped), got:\n%s", out)
+	}
+	// Past the cap (>= is the trigger): still "(stopped)".
+	if out := render(ptr(4), ptr(3)); !strings.Contains(out, "4/3 (stopped)") {
+		t.Errorf("past cap: want MR_REWORK_CYCLES 4/3 (stopped), got:\n%s", out)
+	}
+	// Either field nil → the row is omitted (old-server compatibility).
+	if out := render(nil, ptr(3)); strings.Contains(out, "MR_REWORK_CYCLES") {
+		t.Errorf("nil cycles: want NO MR_REWORK_CYCLES row, got:\n%s", out)
+	}
+	if out := render(ptr(1), nil); strings.Contains(out, "MR_REWORK_CYCLES") {
+		t.Errorf("nil cap: want NO MR_REWORK_CYCLES row, got:\n%s", out)
+	}
+	if out := render(nil, nil); strings.Contains(out, "MR_REWORK_CYCLES") {
+		t.Errorf("both nil: want NO MR_REWORK_CYCLES row, got:\n%s", out)
+	}
+}
+
 // TestRenderScheduleDetailMrReworkTriState — the per-schedule MR-rework override (PRD #841
 // M3) renders as inherit/on/off in `schedule get`, mirroring the run-detail row above.
 func TestRenderScheduleDetailMrReworkTriState(t *testing.T) {
@@ -1243,6 +1294,15 @@ func TestSteerStateOnAParkedRun(t *testing.T) {
 	// were ever added to it.
 	if strings.Contains(steerState(kindFollowUp, nil, nil, statusLimitWait), "run finished") {
 		t.Error(`steerState(unconsumed, limit_wait) claims the run finished — a parked run resumes and its queue drains, so the follow-up has NOT been dropped`)
+	}
+
+	// recovery_wait (issue #1197) is the sibling transient-recovery park: the queue state
+	// is likewise UNCHANGED, and the suffix names the recovery reason (not a usage limit).
+	if got := steerState(kindFollowUp, nil, nil, statusRecoveryWait); !strings.HasPrefix(got, "queued") || !strings.Contains(got, "recovering") {
+		t.Errorf("steerState(unconsumed, recovery_wait) = %q, want a queued row naming the transient-recovery park", got)
+	}
+	if got := steerState(kindFollowUp, &consumed, nil, statusRecoveryWait); !strings.HasPrefix(got, "delivered") || !strings.Contains(got, "recovering") {
+		t.Errorf("steerState(consumed, recovery_wait) = %q, want a delivered row naming the transient-recovery park", got)
 	}
 
 	// Every other status is untouched.

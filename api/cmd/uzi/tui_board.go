@@ -149,7 +149,7 @@ func (b *boardState) visible() []apitypes.RunListItemDTO {
 // The three triage bands, in fixed top-to-bottom order.
 const (
 	bandNeedsYou = iota // awaiting_approval + awaiting_input + awaiting_followup — the only rows a human must act on
-	bandFloor           // everything non-terminal not in NEEDS YOU (running/claimed/queued/planning/limit_wait/pool_wait, stalled)
+	bandFloor           // everything non-terminal not in NEEDS YOU (running/claimed/queued/planning/limit_wait/pool_wait/recovery_wait, stalled)
 	bandDone            // terminal: completed/failed/cancelled
 	numBands
 )
@@ -690,7 +690,8 @@ func (m tuiModel) boardSummary() string {
 		case "awaiting_followup":
 			followups++
 		}
-		if stalledHealth[r.Health] {
+		// Match the recovery row's token: health frozen while parked needs no attention.
+		if r.Status != statusRecoveryWait && stalledHealth[r.Health] {
 			warn++
 		}
 	}

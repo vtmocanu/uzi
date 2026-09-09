@@ -232,6 +232,8 @@ The run view in the web UI shows a terse, one-line-per-event feed (tool calls wi
 | `RUN_MAX_REQUEUES` | `1` | How many times the sweeper may re-queue a run whose worker went stale before failing it instead. `0` means fail immediately on worker death (no re-queue). |
 | `RUN_LIMIT_MAX_WAITS` | `5` | How many times one run may park at `limit_wait` on an Anthropic usage limit (PRD #35, `runs.limit_wait_count`) before the next limit failure fails it instead ("usage-limit retry budget exhausted") rather than parking again. `0` is legal and means "never park" — the off switch for an operator who wants today's fail-immediately behaviour, matching how `RUN_MAX_REQUEUES=0` means "never re-queue". |
 | `RUN_LIMIT_MAX_PARK` | `192h` (8 days) | Ceiling on how far out a single park's `retry_not_before` may reach; a run whose computed wait exceeds this fails instead of parking, so a compromised or buggy worker can't hold a run parked for years. Longer than the SDK's longest reported window (`seven_day`) to leave headroom for jitter and clock skew. **Cannot be disabled**: unlike a set-but-unparseable `UZI_AUTOSTOP_ENABLED`, an invalid or non-positive value here is not a boot guard — it silently falls back to the default, so a mistyped `RUN_LIMIT_MAX_PARK=0` does not remove the clamp. |
+| `RUN_RECOVERY_PARK_BASE` | `1m` | Wait for the **first** `recovery_wait` park a run enters when a resumed SDK turn keeps coming back empty, after bounded in-process retries (issue #1197; see [Recovering from an empty turn](run-recovery-wait.md)). Each subsequent park on the same run doubles the previous wait, clamped at `RUN_RECOVERY_MAX_PARK` below. Unlike `limit_wait`, there is deliberately **no** `RUN_RECOVERY_MAX_WAITS` — a run keeps auto-resuming on this backoff until it recovers or the owner cancels it, so this knob (and the one below) shapes only the retry *cadence*, never a park budget. |
+| `RUN_RECOVERY_MAX_PARK` | `30m` | Ceiling on a single `recovery_wait` park's backoff wait — the same role `RUN_LIMIT_MAX_PARK` plays for `limit_wait`, just clamped far shorter by default (30m vs. 8 days), because an empty turn is expected to be transient rather than a multi-day usage-limit window. |
 | `UZI_AUTOSTOP_ENABLED` | `true` | Operator kill switch for the automatic stop of a run whose updates cannot be saved (PRD #108 M5). See [Why was my run stopped automatically?](run-auto-stopped.md). Setting it to `false` disables **only the stop** — the run is still flagged `looping` with a truthful reason, so you keep the visibility and give up the intervention. It is deliberately **not** the admin [Run health](admin-settings.md#run-health) toggle: an admin turning health off must not silently disable loop protection, and an automatic destructive behaviour should not depend for its off switch on the database it might be misbehaving against. Unlike the tuning knobs above, a set-but-unparseable value **aborts boot** rather than defaulting — a typo like `flase` would otherwise leave you believing you had disarmed something that kills runs. |
 | `WORKER_HEARTBEAT_STALE` | `45s` | No heartbeat past this and the sweeper marks a worker offline and re-queues its non-terminal runs. |
 | `SWEEP_INTERVAL` | `15s` | Run-liveness sweep cadence (stale-worker requeue, run-health detection, timeout sweeps). `0` or unset ⇒ the sweeper's built-in 15s default, so leaving it unset keeps current behaviour. |
@@ -276,7 +278,29 @@ single global cutoff, so a scaled run is not swept to failed at the plain
 real stall detector no matter how large the scaled iteration or wall-clock budget
 gets.
 
-**A parked run's disk cost.** A run that parks at `limit_wait` deliberately keeps its git clone/worktree, its skills plugin dir, and its per-run SDK home on the worker's disk instead of cleaning up, so a resume can pick up the same session rather than starting fresh. One run's SDK home alone has been measured holding 167.3 MB of Go module cache (see `UZI_HOME_RECLAIM` below). So size worker disk for roughly `RUN_LIMIT_MAX_WAITS` concurrently parked runs times (one clone + one plugin dir + up to ~170 MB of run HOME) — the caps above bound *how many* parks and *how long*, not how much each one holds on disk.
+**A parked run's disk cost.** `limit_wait`, `recovery_wait` and owner-requested
+`paused` runs retain their skills plugin directory and per-run SDK home for
+same-worker session resume, plus recovery refs in the shared bare repository.
+The runner clone is normally removed after capture. A failed recovery capture
+also retains its source clone until capture succeeds or a terminal outcome is
+acknowledged. One SDK home was measured holding 167.3 MB of Go module cache
+(see `UZI_HOME_RECLAIM` below); this is an example, not an upper bound.
+
+Size storage for shared repositories plus active clones, all retained
+plugin/HOME directories, pending-capture clones and operating headroom.
+Measure the high-water size of those directories under your workloads and
+multiply by your chosen operational allowance for concurrent retained runs.
+Monitor both retained-run count and free bytes/inodes, and alert before that
+allowance or storage headroom is exhausted. Expand storage or explicitly
+cancel unwanted runs; do not delete nonterminal recovery state to reclaim space.
+
+There is **no built-in hard bound on the number of parked runs per worker**:
+parks release execution slots, so worker concurrency does not bound retained
+directories. `RUN_LIMIT_MAX_WAITS` limits cycles for one usage-limited run, not
+concurrent parked runs. Recovery parks and owner pauses have no lifetime cap;
+backoff limits retry frequency, not disk use. Do not treat either value as a
+fleet capacity bound. These cleanup and capacity distinctions were verified
+against runner cleanup and the recovery lifecycle on 2026-09-08.
 
 **The two caps are asymmetric on purpose, and there is no env spelling that removes the park ceiling.** `RUN_LIMIT_MAX_WAITS=0` is honored and means "never park" — a legitimate policy choice an operator may zero away. `RUN_LIMIT_MAX_PARK=0` is not honored: it silently falls back to `192h` (see its own row), because it is a security bound rather than a policy knob, and a bound with an off switch is not a bound.
 

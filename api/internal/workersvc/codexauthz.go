@@ -46,9 +46,12 @@ const codexCoordQuarantined = "quarantined"
 // "actively claimed by a live worker" set: the worker holds the run and is (or is
 // about to be) executing.
 //
-// parked states ARE included on purpose — 'limit_wait' and the awaiting_* parks are a
-// worker still holding the run, and D4 requires persist-before-park, so a park must be
-// able to persist recovery material. The following are deliberately EXCLUDED, all on the
+// parked states ARE included on purpose — 'limit_wait', 'recovery_wait' (issue #1197) and
+// the awaiting_* parks are a worker still holding the run, and D4 requires
+// persist-before-park, so a park must be able to persist recovery material. recovery_wait
+// is a MID-EXECUTION park like limit_wait (a running worker parked the run on a transient
+// recovery), so it belongs here — unlike the pre-execution 'pool_wait' below. The following
+// are deliberately EXCLUDED, all on the
 // same principle (no worker is actively executing the run, so no live capability should
 // be honored): 'queued' — the requeue gap where the run was handed back and no worker
 // owns it (the capability is revoked and the epoch bumped on that transition);
@@ -65,6 +68,7 @@ var codexActivelyClaimedStatuses = map[string]bool{
 	"awaiting_input":    true,
 	"awaiting_followup": true,
 	"limit_wait":        true,
+	"recovery_wait":     true,
 }
 
 // CodexOpScope is one of the three DISTINCT credential-operation scopes a per-claim

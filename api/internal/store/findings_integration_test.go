@@ -110,19 +110,19 @@ func TestIncidentalFindingsLiveDB(t *testing.T) {
 		if f, d := tablesExist(); !f || !d {
 			t.Fatalf("after replaying Up both tables should exist again (findings=%v dispositions=%v)", f, d)
 		}
-		// PRD #1183 M3: finding_dispositions is extended by 00206 (set_via, close_synced_at, the
+		// PRD #1183 M3: finding_dispositions is extended by 00209 (set_via, close_synced_at, the
 		// widened status CHECK, the close-pending index). The generated queries RETURNING * now
 		// expect those columns, so a 00129-only recreate is no longer the whole table — replay
-		// 00206's Up too so the SUBSEQUENT subtests (which drive the generated UpsertOpenDisposition
+		// 00209's Up too so the SUBSEQUENT subtests (which drive the generated UpsertOpenDisposition
 		// etc.) run against the current schema rather than a partial one.
-		for _, stmt := range migrationUpStatements(t, "00206_finding_issue_close_sync.sql") {
+		for _, stmt := range migrationUpStatements(t, "00209_finding_issue_close_sync.sql") {
 			mustExec(ctx, t, pool, stmt)
 		}
-		// 00207 VALIDATEs the two CHECKs 00206 added NOT VALID (status now admits 'done', and set_via),
+		// 00210 VALIDATEs the two CHECKs 00209 added NOT VALID (status now admits 'done', and set_via),
 		// so this hand-replayed recreate matches the schema store.Migrate produces rather than leaving
 		// the constraints un-validated. (store.Migrate can't do it: after 00129's Down the recorded
 		// goose version is still HEAD, so a Migrate call is a no-op and the dropped tables stay gone.)
-		for _, stmt := range migrationUpStatements(t, "00207_validate_finding_status_check.sql") {
+		for _, stmt := range migrationUpStatements(t, "00210_validate_finding_status_check.sql") {
 			mustExec(ctx, t, pool, stmt)
 		}
 	})

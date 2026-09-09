@@ -525,6 +525,9 @@ var wantRouteMounts = []routeMount{
 	// mirroring the priority verb's posture.
 	{"POST", "/api/runs/{id}/resume-now", noLimiter},
 	{"POST", "/api/runs/{id}/review/recommendations/{recID}/issue", limForge},
+	// On-demand MR rework (PRD #1202): reads the MR's review comments off the forge on
+	// every call, so it carries the per-user forge limiter, like ci-fix-runs.
+	{"POST", "/api/runs/{id}/rework", limForge},
 	{"POST", "/api/skills/", noLimiter},
 	{"POST", "/api/skills/{id}/reset", noLimiter},
 	{"POST", "/api/tool-allowlist/", noLimiter},

@@ -127,6 +127,10 @@ describe("StatusPill", () => {
     // RUN_STATUS_LABELS entry would leave StatusPill printing "pool wait" against
     // runBadge's "waiting for pool", which this loop then catches.
     expect(checked).toContain("pool_wait");
+    // Issue #1197: recovery_wait de-underscores to "recovery wait", which is exactly the
+    // word runBadge uses, so it deliberately has NO RUN_STATUS_LABELS override — this
+    // loop pins the two surfaces to that one word so a later override on only one drifts.
+    expect(checked).toContain("recovery_wait");
     // PRD #1190: paused must print one word — "‖ paused" — on BOTH the pill and the board
     // badge. The pill carries the "‖" glyph via RUN_STATUS_LABELS so it agrees with
     // runBadge's "‖ paused" label; a missing entry would leave StatusPill printing "paused"

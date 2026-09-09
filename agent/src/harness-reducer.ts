@@ -100,6 +100,15 @@ export class RunTurnReducerImpl implements RunTurnReducer {
     reduction: TurnReduction,
   ): void {
     const at = event.attribution;
+    // issue #1197 (D-RC2a): a frame that carries model output (items) or usage is
+    // POSITIVE evidence the model did something this turn. Latched broadly on entry —
+    // any assistant/tool frame or attached usage — so the empty-turn detector below
+    // (numTurns === 0 && !sawModelActivity) only fires for a turn that streamed no
+    // model output at all. Signal-only tool_use frames (e.g. submit_plan) also set it,
+    // but those turns are never positively-empty anyway (they set plan/questions).
+    if (event.items.length > 0 || event.usage) {
+      this.result.sawModelActivity = true;
+    }
     // usageAttached is PER-FRAME: the frame's per-call usage + model ride the FIRST
     // item that survives the signal filter (co-gated — model only where usage is).
     let usageAttached = false;
@@ -123,6 +132,10 @@ export class RunTurnReducerImpl implements RunTurnReducer {
         em.payload["usage"] = event.usage.wire?.usage;
         if (event.model !== undefined) em.payload["model"] = event.model;
         usageAttached = true;
+        // issue #1197 (D-RC2a): usage folded ⇒ model activity (belt-and-braces beside
+        // the on-entry latch above; kept here so a future refactor of the entry guard
+        // cannot silently drop the usage signal).
+        this.result.sawModelActivity = true;
         // Fire the lead context read once per turn, on the first surviving
         // usage-bearing item whose displayed agent is the lead — NOT awaited here
         // (the adapter's read runs concurrently while the turn streams).
@@ -173,6 +186,13 @@ export class RunTurnReducerImpl implements RunTurnReducer {
     reduction: TurnReduction,
   ): Promise<void> {
     const terminal = event.terminal;
+    // issue #1197 (D-RC2a): the SDK terminal's positively-reported turn count is typed
+    // `unknown` on the wire. Coerce it ONLY when it is a finite number (mirroring
+    // limit.ts normalizeResetsAt's guard shape); missing/garbage metrics MUST stay
+    // undefined — NEVER default to 0 — so a turn that ran but reported no count is not
+    // mistaken for a positively-empty (zero-turn) result.
+    const n = terminal.metrics.wire?.num_turns;
+    if (typeof n === "number" && Number.isFinite(n)) this.result.numTurns = n;
     const em = projectResult({
       outcome: terminal.outcome,
       subtype: terminal.subtype,
@@ -213,6 +233,9 @@ export class RunTurnReducerImpl implements RunTurnReducer {
   /** Reset the per-turn accumulators; leaves the run-level `reportedSessionId` latch
    *  untouched. */
   private resetPerTurn(): void {
+    // Replacing `this.result` wholesale also clears the issue #1197 (D-RC2a) evidence
+    // fields (`numTurns`, `sawModelActivity`), which live on `this.result`, so each
+    // turn begins with no carried-over empty-turn evidence.
     this.result = { done: false };
     this.leadText = [];
     this.turnSessionId = undefined;

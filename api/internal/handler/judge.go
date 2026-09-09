@@ -331,11 +331,11 @@ func judgeRunToDTO(jr *store.GetJudgeRunUsageForTargetRow) *apitypes.JudgeRunDTO
 // uq_runs_one_active_judge_per_target index's active set: status NOT IN
 // ('completed','failed','cancelled'). That set is defined by SUBTRACTION, so it contains
 // every status runs.status legally admits minus three. Against the LIVE constraint
-// (runs_status_check, last rewritten by 00146, ten values) the whole set is:
+// (runs_status_check, last rewritten by 00203, twelve values) the whole set is:
 //
-//	queued, claimed, running, awaiting_approval, awaiting_input, limit_wait, awaiting_followup
+//	queued, claimed, running, awaiting_approval, awaiting_input, awaiting_followup, limit_wait, pool_wait, recovery_wait
 //
-// — and it will silently include any status a future migration adds. ALL SEVEN are
+// — and it will silently include any status a future migration adds. ALL NINE are
 // enumerated, because the subtraction is the whole argument and naming some members
 // while dropping others makes it read as a guess:
 //   - queued, claimed, running: where a judge run actually lives.
@@ -351,6 +351,12 @@ func judgeRunToDTO(jr *store.GetJudgeRunUsageForTargetRow) *apitypes.JudgeRunDTO
 //   - awaiting_followup (00146): PRD #517's interactive-task park; out of reach for a
 //     judge run (its writer guards `kind = 'task' AND interactive`), but the schema
 //     permits the status on any row, so the query can still return it.
+//   - pool_wait (00170): PRD #754's empty-token-pool hold; out of reach for a judge run
+//     (SetRunPoolWait carries `AND kind <> 'judge'`, Decision 14, and only an auto run is
+//     ever held), but the schema permits the status on any row.
+//   - recovery_wait (00203): issue #1197's transient-recovery park; out of reach for a
+//     judge run (SetRunRecoveryWait carries `AND kind <> 'judge'`, mirroring Decision 14),
+//     but the schema permits the status on any row.
 //
 // Out of reach is not impossible: the schema permits every one of these on a judge row
 // (runs_status_check does not condition on kind), so the query CAN return them, and a

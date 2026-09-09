@@ -173,22 +173,28 @@ func newRunLogsCmd(env Env, gf *globalFlags) *cobra.Command {
 				// NDJSON there for an agent to parse line by line (renderMessage). A
 				// human-readable notice on that stream would corrupt the contract. This
 				// is the same split cobra's deprecation notice already uses here.
-				if run.Status == statusLimitWait || run.Status == statusPoolWait {
+				if run.Status == statusLimitWait || run.Status == statusPoolWait || run.Status == statusRecoveryWait {
 					if !parked {
 						parked = true
-						// pool_wait is the sibling silence limit_wait is (both are long,
-						// output-less holds that look like a hang from the outside), so it
-						// earns the same one-shot notice — but a DIFFERENT one, because it
-						// resumes on a different trigger: a pooled token, not a clock. A
-						// direct limit_wait⇄pool_wait transition would be missed by the bare
-						// `parked` bool, but it cannot happen — a held run is promoted to
-						// `queued` (a non-held status that clears `parked` via the else-if
-						// below) before it could hold again, so re-arming here is exact.
-						if run.Status == statusPoolWait {
+						// pool_wait and recovery_wait are the sibling silences limit_wait is
+						// (all long, output-less holds that look like a hang from the outside),
+						// so each earns the same one-shot notice — but a DIFFERENT one, because
+						// they resume on different triggers: pool_wait on a pooled token,
+						// recovery_wait on a capped backoff clock, limit_wait on a clock. A
+						// direct park⇄park transition would be missed by the bare `parked`
+						// bool, but it cannot happen — a held run is promoted to `queued` (a
+						// non-held status that clears `parked` via the else-if below) before it
+						// could hold again, so re-arming here is exact.
+						switch run.Status {
+						case statusPoolWait:
 							_, _ = fmt.Fprintf(env.Stderr,
 								"run %s held — its token pool is empty; still following, it resumes when a token is pooled\n",
 								args[0])
-						} else {
+						case statusRecoveryWait:
+							_, _ = fmt.Fprintf(env.Stderr,
+								"run %s recovering — a transient empty turn parked it; still following, it resumes on its own\n",
+								args[0])
+						default: // statusLimitWait
 							_, _ = fmt.Fprintf(env.Stderr, "run %s %s — still following; it resumes on its own\n",
 								args[0], limitWaitLine(run, time.Now()))
 						}
@@ -198,7 +204,7 @@ func newRunLogsCmd(env Env, gf *globalFlags) *cobra.Command {
 					// cellText, NOT sanitizeTTY, and the difference is the whole point:
 					// sanitizeTTY spares "\n", so a status carrying one would inject a
 					// line onto stderr. Unreachable today because runs_status_check
-					// constrains status to eleven values (migration 00165) — which is precisely the argument
+					// constrains status to twelve values (migration 00203) — which is precisely the argument
 					// limitWaitLine's own comment REJECTS for rate_limit_type ("server-
 					// controlled today" is exactly the assumption that rots). Holding one
 					// line of this file to a weaker standard than the line beside it, on a

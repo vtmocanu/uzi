@@ -395,6 +395,18 @@ type Config struct {
 	RunLimitMaxWaits int           // parks allowed per run before it fails
 	RunLimitMaxPark  time.Duration // furthest a single park may defer a run
 
+	// Transient-recovery park (issue #1197). A run that reports a positively-empty SDK
+	// turn (after bounded in-process retries) parks in 'recovery_wait' and the sweeper
+	// auto-promotes it on a capped exponential backoff. UNLIKE the usage-limit park there
+	// is NO per-run park cap (no RUN_RECOVERY_MAX_WAITS): a park always becomes promotable
+	// again, so the run recovers repeatedly until it succeeds or the owner cancels.
+	//
+	// RunRecoveryParkBase is the FIRST park's wait (the backoff's base); each subsequent
+	// park doubles it, clamped at RunRecoveryMaxPark. Both shape only the retry cadence —
+	// neither can fail a run. recovery_wait_count feeds the curve, never a limit.
+	RunRecoveryParkBase time.Duration // first recovery park's wait; doubles per prior park
+	RunRecoveryMaxPark  time.Duration // ceiling on one recovery park's backoff
+
 	// CI status integration (PRD #6). The pipeline sync rides the existing poller
 	// tick (no new interval). CIWatchRunWindow bounds how long a finished run's
 	// branch stays watched after it completes; CIWatchMaxRefs caps how many run
@@ -875,8 +887,9 @@ func Load() (Config, error) {
 	cfg.WorkerPollInterval = parseDuration("WORKER_POLL_INTERVAL", 3*time.Second)
 	cfg.WorkerAffinityGrace = parseDuration("WORKER_AFFINITY_GRACE", 2*time.Minute)
 	// PRD #628 D3a: the run-lane affinity ceiling. ClaimRun now pins a promoted run
-	// to its prior worker only while that worker is a live, non-draining claim target
-	// (the liveness leg); this ceiling bounds the one live-but-wedged pathology a pure
+	// to its prior worker while its row exists and it is heartbeating or draining
+	// (PRD #1030, verified against ClaimRun on 2026-09-08; the earlier comment
+	// incorrectly excluded draining workers). This ceiling bounds the pathology a pure
 	// liveness test would strand forever. Generous by design (a healthy worker
 	// re-claims its own promoted run within one poll long before this fires) and much
 	// longer than the 2-min WorkerAffinityGrace, which stays the CHAT lane's grace
@@ -904,6 +917,12 @@ func Load() (Config, error) {
 	// re-queue".
 	cfg.RunLimitMaxWaits = parseNonNegInt("RUN_LIMIT_MAX_WAITS", 5)
 	cfg.RunLimitMaxPark = parseDuration("RUN_LIMIT_MAX_PARK", 8*24*time.Hour)
+
+	// Transient-recovery park (issue #1197). parseDuration, so an invalid/non-positive
+	// value silently falls back to the default (like RUN_LIMIT_MAX_PARK): these shape the
+	// auto-promote cadence and have no off switch — there is no "never recover" mode.
+	cfg.RunRecoveryParkBase = parseDuration("RUN_RECOVERY_PARK_BASE", time.Minute)
+	cfg.RunRecoveryMaxPark = parseDuration("RUN_RECOVERY_MAX_PARK", 30*time.Minute)
 
 	cfg.SkillMaxBytes = parseInt("SKILL_MAX_BYTES", 65536)
 	cfg.SkillsMaxPerRun = parseInt("SKILLS_MAX_PER_RUN", 32)

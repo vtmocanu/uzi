@@ -105,6 +105,14 @@ type Client interface {
 	// null`). No status guard: editable on a completed run for as long as its MR is open. A
 	// foreign/absent run is 404 → 4.
 	SetRunMrRework(ctx context.Context, id string, enabled *bool) (apitypes.RunDTO, error)
+	// RunRework starts ONE on-demand MR-rework cycle on a completed run whose MR is open,
+	// past the automatic cap (PRD #1202 M1): POST /api/runs/{id}/rework {guidance},
+	// RequireUser so a `uzc_` token reaches it. guidance is the optional operator note
+	// (empty is a valid trigger as long as there is a new comment). Returns the created
+	// `mr_rework` run. A foreign/unknown run is 404 → ExitNotFound (4); a refusal (disabled
+	// / not reworkable / already running / nothing new) is 409 → ExitConflict (5); guidance
+	// too long is 400 → ExitUsage (2) — all via the shared status→exit mapping.
+	RunRework(ctx context.Context, runID, guidance string) (apitypes.RunDTO, error)
 	// SelfRateLimits returns the caller's OWN per-token rate-limit meters, each
 	// carrying the server-computed auto-selection status: GET /api/me/rate-limits.
 	//

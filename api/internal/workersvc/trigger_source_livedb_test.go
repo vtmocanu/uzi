@@ -154,6 +154,7 @@ func TestTriggerSourceStampedLiveDB(t *testing.T) {
 	r, err = q.CreateAutoMRReworkRun(ctx, store.CreateAutoMRReworkRunParams{
 		UserID: userID, RepoID: repoID, IssueTitle: "t", IssueDescription: "d",
 		PipelineRef: tText("agent/issue-8"), MrIid: tInt8(8), TargetRunID: tUUID(base1), WaitOnLimit: false,
+		TriggerSource: "mr_rework",
 	})
 	assert(t, "CreateAutoMRReworkRun", "mr_rework", r, err)
 

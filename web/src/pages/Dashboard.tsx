@@ -201,12 +201,19 @@ export function Dashboard() {
   // old "waiting on a usage limit": that older wording is TRUE only for limit_wait and
   // false for a pool hold, so the honest generalization is the resource-agnostic phrase
   // that holds for both.
+  //
+  // Issue #1197: recovery_wait is the same KIND again — a non-terminal, self-resuming
+  // hold (a transient-recovery park that auto-resumes on a capped backoff). It counts
+  // as waiting, not "at work", for exactly the reasons limit_wait/pool_wait do; the
+  // resource-agnostic "waiting to resume" copy holds for it too.
   const active = data?.runs.filter((r) => !isTerminalRun(r.status)) ?? [];
-  // PRD #1190: a `paused` run joins the hold bucket too — non-terminal but not actively
-  // working (it waits for its owner to resume), the same KIND of hold as the two above.
-  // "waiting to resume" stays honest: a paused run does resume, on demand.
+  // PRD #1190: an owner pause also waits to resume, on demand.
   const waiting = active.filter(
-    (r) => r.status === "limit_wait" || r.status === "pool_wait" || r.status === "paused",
+    (r) =>
+      r.status === "limit_wait" ||
+      r.status === "pool_wait" ||
+      r.status === "recovery_wait" ||
+      r.status === "paused",
   );
   const working = active.length - waiting.length;
   // "8 at work · 1 waiting to resume" only when there is something to disambiguate; a
@@ -367,16 +374,20 @@ export function Dashboard() {
               const msBadge = ms
                 ? milestoneBadgeText(ms, (r.milestones_in_progress?.length ?? 0) > 0)
                 : null;
-              // PRD #1064 M3: the "now" line under the title, for ANY non-terminal run
-              // that has a current_activity (the DTO field, present on the RunListItem).
-              // Hidden when null or terminal — a pre-feature run and a finished run read
-              // exactly as before (D5). The activity's untrusted fields render escaped
-              // through stripUnsafeChars.
+              // PRD #1064 M3: the "now" line under the title uses current_activity from
+              // the RunListItem. Hidden when null, terminal, or held; untrusted fields
+              // render escaped through stripUnsafeChars.
               const activity = r.current_activity;
-              // PRD #1190: a `paused` run is non-terminal but nothing runs while paused, so
-              // it must not render the live `bg-ok animate-pulse` "now" strip — exclude it
-              // alongside terminal runs.
-              const showNow = activity != null && !isTerminalRun(r.status) && r.status !== "paused";
+              // Verified 2026-09-08: the API includes all non-terminal runs in its last
+              // tool-use lookup, so holds can retain stale activity. The four waiting
+              // states must not turn that history into a pulsing live-work indicator.
+              const showNow =
+                activity != null &&
+                !isTerminalRun(r.status) &&
+                r.status !== "paused" &&
+                r.status !== "limit_wait" &&
+                r.status !== "pool_wait" &&
+                r.status !== "recovery_wait";
               const nowMilestone = firstInProgressMilestoneId(r);
               return (
               // Issue #485 NB1: RunIssueRef renders a real forge <a>, which cannot nest

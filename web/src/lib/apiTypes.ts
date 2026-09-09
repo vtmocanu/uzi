@@ -1768,6 +1768,14 @@ export type RunStatus =
    *  moment a token is opted into the pool, and can be resumed on demand via
    *  `resumeRunNow` (POST /runs/{id}/resume-now). */
   | "pool_wait"
+  /** Issue #1197: a transient-recovery park. A run parks here when a resumed SDK
+   *  turn came back positively empty (zero turns, no model activity) and the bounded
+   *  in-process retries were exhausted. NON-terminal — deliberately absent from
+   *  TERMINAL_RUN_STATUSES below. Like pool_wait it carries no reset window and no
+   *  countdown and it ships with no dedicated DTO fields. It auto-resumes on a capped
+   *  exponential backoff until the run recovers or the owner cancels it; unlike
+   *  pool_wait there is no resume-now verb (the backoff is server-owned). */
+  | "recovery_wait"
   /** PRD #1190: a run its OWNER paused on demand. In the wait family beside limit_wait
    *  and pool_wait (In Progress on the board, exempt from the timeout sweep, never
    *  health-flagged, HOME never reclaimed), but UNLIKE those two it resumes ONLY on
@@ -1938,6 +1946,13 @@ export interface Run {
    *  per-run override. Kept `boolean | null` (never `any`) to preserve the
    *  omitted-vs-null-vs-value distinction, exactly like mr_state's nullability. */
   mr_rework_enabled?: boolean | null;
+  /** PRD #1202 D11: the OWNER-ONLY view of the automatic rework loop guard, so the owner
+   *  can see why the watcher stopped. `mr_rework_auto_cycles` is the automatic cycles spent
+   *  (0 when none), `mr_rework_auto_cap` the live admin cap. Both are populated only on the
+   *  run-detail read, for the run's owner, on a completed issue/prompt/self_improve run with
+   *  an open MR; `null` (or absent on an older api pod) everywhere else. */
+  mr_rework_auto_cycles?: number | null;
+  mr_rework_auto_cap?: number | null;
   failure_reason: string | null;
   /** Server-stamped stop signal (PRD #33, widened by #108 M5): "cancelled" or
    *  "plan_rejected" (human), "auto_stopped" (server), null otherwise. isStoppedRun
@@ -3099,4 +3114,3 @@ export interface RunSocketLike {
   onerror: (() => void) | null;
   close(): void;
 }
-

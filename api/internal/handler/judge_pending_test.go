@@ -25,14 +25,16 @@ import (
 // GetActiveJudgeRunForTarget can actually hand back. Its predicate carries the
 // uq_runs_one_active_judge_per_target active set, `status NOT IN ('completed','failed',
 // 'cancelled')`, which is a set defined by SUBTRACTION. Against the LIVE constraint
-// (runs_status_check, ten values as of 00146) that is SEVEN statuses — queued, claimed,
-// running, awaiting_approval, awaiting_input, limit_wait, awaiting_followup — and a future
-// migration widening runs_status_check silently adds its new value too.
+// (runs_status_check, twelve values as of 00203) that is NINE statuses — queued, claimed,
+// running, awaiting_approval, awaiting_input, awaiting_followup, limit_wait, pool_wait,
+// recovery_wait — and a future migration widening runs_status_check silently adds its new
+// value too.
 //
-// Every one of the seven has a row, INCLUDING the three a judge run cannot reach today
-// (awaiting_approval, limit_wait and awaiting_followup), because the argument this table encodes is the
-// subtraction, not the reachable subset: enumerating some members and quietly dropping
-// others is how the set stops matching the constraint. That is also why "a status that
+// Every one of the nine has a row, INCLUDING the five a judge run cannot reach today
+// (awaiting_approval, limit_wait, awaiting_followup, pool_wait and recovery_wait), because
+// the argument this table encodes is the subtraction, not the reachable subset:
+// enumerating some members and quietly dropping others is how the set stops matching the
+// constraint. That is also why "a status that
 // does not exist yet" is here — an enumerated switch over queued/claimed/running would
 // pass every other row and fall through to "" for that one, shipping state:"" and
 // breaking the clients' closed "scheduled" | "running" union — a blank chip exactly
@@ -61,6 +63,14 @@ func TestPendingJudgeState(t *testing.T) {
 			"inside the active set (00146) — PRD #517's interactive-task park; out of reach for a judge " +
 				"(its writer guards kind='task' AND interactive), but schema-permitted like the rest, so " +
 				"the query can return it"},
+		{"pool_wait", "running",
+			"inside the active set (00170) — PRD #754's empty-token-pool hold; out of reach for a judge " +
+				"(SetRunPoolWait carries AND kind <> 'judge', and only an auto run is ever held), but " +
+				"schema-permitted like the rest, so the query can return it"},
+		{"recovery_wait", "running",
+			"inside the active set (00203) — issue #1197's transient-recovery park; out of reach for a " +
+				"judge (SetRunRecoveryWait carries AND kind <> 'judge'), but schema-permitted like the rest, " +
+				"so the query can return it"},
 		{"some_future_status", "running",
 			"the mapper must be total over a set defined by subtraction: an unknown active status " +
 				"degrades to 'a judge is working on it', which is true of every member by construction"},

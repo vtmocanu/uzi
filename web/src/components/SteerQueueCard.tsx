@@ -324,18 +324,19 @@ export function SteerQueueCard({
               The "queued until the run resumes" placeholder is resource-agnostic and
               stays honest for a pool hold.
 
-              PRD #1190: `paused` sets parked too, matching the self-resuming holds. A
-              paused run is a deliberate owner hold — nothing runs until Resume — so a
-              follow-up sent here is NOT the next turn; it is queued until the run resumes.
-              The "resumes the agent" placeholder would be the opposite of what happens
-              (the same false promise limit_wait fixed), while "queued until the run
-              resumes" stays honest. The panel/card split matches limit_wait: PausedPanel
-              owns Resume + Stop, and this card keeps its own composer + Stop exactly as it
-              does beside LimitWaitPanel. */}
+              Issue #1197 and PRD #1190: recovery_wait and paused set parked too.
+              A follow-up does not un-park either hold: recovery_wait resumes on its
+              capped backoff, and paused waits for the owner to Resume. The composer
+              must promise only that the message is queued until the run resumes. */}
           <FollowUpComposer
             busy={busy}
             onSend={onSend}
-            parked={status === "limit_wait" || status === "pool_wait" || status === "paused"}
+            parked={
+              status === "limit_wait" ||
+              status === "pool_wait" ||
+              status === "recovery_wait" ||
+              status === "paused"
+            }
           />
           {/* PRD #1190: Pause ▾ sits beside Stop run, offered only for a RUNNING, pausable
               run with no pause already pending (a pending request has its own chip + actions

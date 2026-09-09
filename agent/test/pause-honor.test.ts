@@ -302,6 +302,31 @@ describe("PRD #1190 M2 — worker pause honor gate (loop-top)", () => {
   // ctx.signal WITH a PauseNowSignal from inside reportIteration (returning pauseRequested:false so
   // the loop-top milestone branch does NOT fire) — driveTurn's top trip guard then throws the
   // PauseNowSignal, which the loop's turn catch takes to the same park path.
+  it("a now pause during empty-turn backoff uses the pause park", async () => {
+    const cancel = new AbortController();
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("# Plan"), resultSuccess()],
+      // The timer fires only after the empty turn yields back to the event loop,
+      // while the recovery wrapper is waiting between retries.
+      async function* () {
+        setTimeout(() => cancel.abort(new PauseNowSignal()), 0);
+        yield {
+          type: "result", subtype: "success", is_error: false,
+          num_turns: 0, session_id: "sess-1",
+        } as unknown as SDKMessage;
+      },
+    ]);
+    const probe = makeCtx({ signal: cancel.signal });
+    const result = await new SdkExecutor(nullLogger(), homeDir, {
+      queryFn,
+      emptyTurnBackoffBaseMs: 100,
+      emptyTurnMaxRetries: 2,
+    }).run(probe.ctx);
+    assert.equal(probe.parkCalls.length, 1, "the typed pause reaches parkForPause");
+    assert.ok(result.pausedAt, "the run pauses instead of failing or recovery-parking");
+    assert.equal(turns.length, 2, "no SDK retry starts after the pause request");
+  });
+
   it("parks on a `now` pause abort (PauseNowSignal caught around driveTurn)", async () => {
     const { queryFn, turns } = fakeTurns([
       [submitPlanWithMilestones("# Plan", THREE_MILESTONES), resultSuccess()], // planning turn

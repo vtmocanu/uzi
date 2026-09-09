@@ -13,7 +13,7 @@
 -- the UI can label it "done via #IID". The column and its CHECK are added SEPARATELY: Postgres
 -- does not accept NOT VALID on an inline column constraint (it is a syntax error), only on a
 -- table-level ADD CONSTRAINT. Added NOT VALID so the add skips the validating table scan (and
--- the ACCESS EXCLUSIVE lock it would otherwise hold); 00207 runs VALIDATE CONSTRAINT under a
+-- the ACCESS EXCLUSIVE lock it would otherwise hold); 00210 runs VALIDATE CONSTRAINT under a
 -- lock-cheap scan, the same two-step pattern 00204/00205 use.
 ALTER TABLE finding_dispositions ADD COLUMN set_via text;
 ALTER TABLE finding_dispositions ADD CONSTRAINT finding_dispositions_set_via_check
@@ -29,7 +29,7 @@ ALTER TABLE finding_dispositions ADD COLUMN close_synced_at timestamptz;
 -- Widen the status CHECK to admit 'done', the sync's terminal rung. The 00129 CHECK was inline
 -- and unnamed, so Postgres named it finding_dispositions_status_check: DROP by that name, then
 -- ADD it back with the widened set. The first four values are copied VERBATIM from the live
--- 00129 constraint; 'done' is the only addition. Added NOT VALID; 00207 validates it.
+-- 00129 constraint; 'done' is the only addition. Added NOT VALID; 00210 validates it.
 ALTER TABLE finding_dispositions DROP CONSTRAINT finding_dispositions_status_check;
 ALTER TABLE finding_dispositions ADD CONSTRAINT finding_dispositions_status_check
     CHECK (status IN ('open', 'filing', 'filed', 'dismissed', 'done')) NOT VALID;

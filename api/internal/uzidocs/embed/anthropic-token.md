@@ -113,7 +113,7 @@ token** on each one you are happy for uzi to spend; `uzi token pool <name>
 itself into the pool would spend a credential you reserved for something
 else, which is the whole reason it starts out.
 
-> **Every new worker defaults to auto-select.** Pin a worker to a token
+> **New workers default to auto-select when a pool exists.** Pin a worker to a token
 > (above) and it stays **pinned**. Otherwise, a newly created worker — a
 > [worker uzi
 > auto-provisions for an unmet
@@ -121,8 +121,11 @@ else, which is the whole reason it starts out.
 > a hosted worker you provision yourself, or one you join with a plain join
 > token — comes up set to **Auto-select from the pool** as long as you have
 > at least one pooled token, so a burst of new workers spreads across your
-> pool instead of leaning on one credential. If your pool is empty, it
-> quietly spends your default token instead, the same as any other worker.
+> pool instead of leaning on one credential. If your pool is empty at worker
+> creation, the worker starts in **Default** mode instead. This is a
+> creation-time choice, not a fallback for an **Auto-select** worker: an
+> existing auto-select worker whose pool becomes empty holds its run and
+> does not spend an unpooled default token.
 > This is the default for **newly created** workers only: it does not
 > retroactively re-point a worker you already set up, so an existing worker
 > keeps whatever mode it already has until you change it yourself.
@@ -138,9 +141,12 @@ each pooled token shows whether auto-selection could pick it *right now*:
 | **stale reading** | the last reading is too old to steer a choice |
 | **low headroom** | it is nearly exhausted, so it is picked only if every pooled token is |
 
-Those chips are the point rather than decoration: a token uzi cannot read a
-usage figure for can never be chosen, and without the chip it would sit there
-looking active. Check them after opting a token in.
+These chips explain normal ranking. A pooled token without a usable usage
+reading can still be selected by the last-resort pooled-token fallback
+described below. Check them after opting a token in.
+
+Creation-time mode and claim-time fallback verified against worker creation
+and `autoChoice` on 2026-09-08.
 
 ### How it chooses
 
@@ -190,6 +196,9 @@ can skip the wait with `uzi run resume-now <run-id>` or the run view's
 **Resume now** button. This is a different wait than
 [a usage-limit pause](run-limit-wait.md): a `pool_wait` hold means there was
 nothing pooled to spend at all, not that a pooled token hit its rate limit.
+It is also different from [a transient-recovery
+park](run-recovery-wait.md): `pool_wait` means there was nothing pooled to
+spend, not that a resumed turn came back empty.
 
 ### Reading it back
 

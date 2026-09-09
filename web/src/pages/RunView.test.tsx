@@ -23,6 +23,7 @@ import {
   RunStopReason,
   HealthFlag,
   LimitWaitPanel,
+  RecoveryWaitPanel,
   MrReworkPanel,
   PausedPanel,
   RunView,
@@ -38,6 +39,7 @@ import runViewSource from "./RunView.tsx?raw";
 import questionPanelSource from "../components/QuestionPanel.tsx?raw";
 import {
   api,
+  ApiError,
   type IssueDraft,
   type Repo,
   type RepoAgent,
@@ -75,6 +77,10 @@ vi.mock("../lib/api", async (importOriginal) => {
       // null; setRunMrRework echoes an updated run).
       getMySettings: vi.fn().mockResolvedValue({ settings: { mr_rework_enabled: null } }),
       setRunMrRework: vi.fn().mockResolvedValue({ run: null }),
+      // PRD #1202: the on-demand "Rework now" action. Defaulted to resolve with a new
+      // mr_rework run so a click settles; the cases that assert its args/link override it.
+      startRunRework: vi.fn().mockResolvedValue({ run: null }),
+
       // PRD #1190: pause/resume mutations. Defaulted to resolve so a click + refreshRun
       // settles; the paused cases assert the call args.
       resumeRun: vi.fn().mockResolvedValue({ run: null }),
@@ -1729,6 +1735,165 @@ describe("MrReworkPanel — per-run MR-rework checkbox (PRD #841)", () => {
     });
     await waitFor(() => expect(mockApi.setRunMrRework).toHaveBeenCalledWith("r1", false));
     await waitFor(() => expect(refreshRun).toHaveBeenCalled());
+  });
+});
+
+describe("MrReworkPanel — on-demand rework + past-cap surface (PRD #1202)", () => {
+  const REWORK_NOW = /rework now/i;
+  const CYCLES = /Automatic rework: 5 of 5 cycles used · stopped/;
+
+  // A completed reworkable run whose MR is still open — the canReworkNow shape.
+  const reworkable = (over: Partial<Run> = {}) =>
+    run({ kind: "issue", status: "completed", mr_iid: 61, mr_state: "opened", ...over });
+
+  function renderPanel(over: Partial<Run>, canSteer = true) {
+    return render(
+      <MemoryRouter>
+        <MrReworkPanel
+          run={reworkable(over)}
+          busy={false}
+          canSteer={canSteer}
+          userDefault={null}
+          onToggle={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+  }
+
+  it("HIDES 'Rework now' on a still-running run", () => {
+    renderPanel({ status: "running", mr_iid: null, mr_state: null });
+    expect(screen.queryByRole("button", { name: REWORK_NOW })).toBeNull();
+  });
+
+  it("HIDES 'Rework now' for a NON-OWNER (canSteer=false)", () => {
+    renderPanel({}, false);
+    expect(screen.queryByRole("button", { name: REWORK_NOW })).toBeNull();
+  });
+
+  it("HIDES 'Rework now' once the MR is MERGED", () => {
+    renderPanel({ mr_state: "merged" });
+    expect(screen.queryByRole("button", { name: REWORK_NOW })).toBeNull();
+  });
+
+  it("HIDES 'Rework now' on a chat run", () => {
+    renderPanel({ kind: "chat" });
+    expect(screen.queryByRole("button", { name: REWORK_NOW })).toBeNull();
+  });
+
+  it("SHOWS 'Rework now' on a completed ISSUE run with an open MR", () => {
+    renderPanel({});
+    expect(screen.getByRole("button", { name: REWORK_NOW })).toBeTruthy();
+  });
+
+  it("SHOWS 'Rework now' on a completed PROMPT run with an open MR (and the toggle renders too)", () => {
+    renderPanel({ kind: "prompt" });
+    expect(screen.getByRole("button", { name: REWORK_NOW })).toBeTruthy();
+    expect(screen.getByLabelText(/auto-rework/i)).toBeTruthy();
+  });
+
+  it("renders the cycles line '5 of 5 cycles used · stopped' from a past-cap run", () => {
+    renderPanel({ mr_rework_auto_cycles: 5, mr_rework_auto_cap: 5 });
+    expect(screen.getByText(CYCLES)).toBeTruthy();
+  });
+
+  it("does NOT render the cycles line when mr_rework_auto_cycles is null/absent", () => {
+    renderPanel({});
+    expect(screen.queryByText(/cycles used/)).toBeNull();
+  });
+
+  it("does NOT append '· stopped' below the cap (2 of 5 cycles used)", () => {
+    renderPanel({ mr_rework_auto_cycles: 2, mr_rework_auto_cap: 5 });
+    expect(screen.getByText(/Automatic rework: 2 of 5 cycles used$/)).toBeTruthy();
+  });
+
+  it("clicking Rework now → Start rework POSTs the TRIMMED guidance and links to the new run", async () => {
+    mockApi.startRunRework.mockResolvedValue({
+      run: run({ id: "run-new-9", kind: "mr_rework", status: "queued" }),
+    });
+    renderPanel({});
+    fireEvent.click(screen.getByRole("button", { name: REWORK_NOW }));
+    const ta = screen.getByLabelText(/guidance \(optional\)/i);
+    fireEvent.change(ta, { target: { value: "  focus on error handling  " } });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /start rework/i }));
+    });
+    expect(mockApi.startRunRework).toHaveBeenCalledWith("r1", "focus on error handling");
+    const link = await screen.findByRole("link", { name: /open the rework run/i });
+    expect(link.getAttribute("href")).toBe("/runs/run-new-9");
+  });
+
+  it("shows a later rework refusal instead of the previous successful run", async () => {
+    mockApi.startRunRework
+      .mockResolvedValueOnce({ run: run({ id: "run-first", kind: "mr_rework", status: "queued" }) })
+      .mockRejectedValueOnce(new ApiError(409, "a rework is already running for this MR"));
+    renderPanel({});
+    fireEvent.click(screen.getByRole("button", { name: REWORK_NOW }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /start rework/i }));
+    });
+    expect(screen.getByRole("link", { name: /open the rework run/i }).getAttribute("href"))
+      .toBe("/runs/run-first");
+
+    fireEvent.click(screen.getByRole("button", { name: REWORK_NOW }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /start rework/i }));
+    });
+    expect(mockApi.startRunRework).toHaveBeenCalledTimes(2);
+    expect(screen.getByText("a rework is already running for this MR")).toBeTruthy();
+    expect(screen.queryByRole("link", { name: /open the rework run/i })).toBeNull();
+  });
+
+  it("a 409 renders the server's message INLINE (role=status), not the page banner", async () => {
+    mockApi.startRunRework.mockRejectedValue(
+      new ApiError(409, "a rework is already running for this MR"),
+    );
+    renderPanel({});
+    fireEvent.click(screen.getByRole("button", { name: REWORK_NOW }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /start rework/i }));
+    });
+    const note = await screen.findByText(/a rework is already running for this MR/);
+    expect(note).toBeTruthy();
+    // The panel renders no role="alert" — a rework-already-running state is not a failure.
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("refuses a guidance body over the 8 KiB cap client-side (Start rework disabled)", () => {
+    renderPanel({});
+    fireEvent.click(screen.getByRole("button", { name: REWORK_NOW }));
+    const ta = screen.getByLabelText(/guidance \(optional\)/i);
+    fireEvent.change(ta, { target: { value: "a".repeat(8193) } });
+    expect((screen.getByRole("button", { name: /start rework/i }) as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByText(/too long/i)).toBeTruthy();
+  });
+
+  it("(page wiring) a 409 on Rework now leaves the page-level error banner empty", async () => {
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
+    mockApi.startRunRework.mockRejectedValue(new ApiError(409, "nothing new to rework"));
+    mockUseRunStream.mockReturnValue({
+      run: run({ kind: "issue", status: "completed", mr_iid: 61, mr_state: "opened" }),
+      messages: [],
+      connected: true,
+      error: "",
+      submit: vi.fn(),
+      refreshRun: vi.fn(),
+      inputs: [],
+      canSteer: true,
+    } as unknown as ReturnType<typeof useRunStream>);
+    render(
+      <MemoryRouter initialEntries={["/runs/r1"]}>
+        <RunView />
+      </MemoryRouter>,
+    );
+    await screen.findByText("Add rate limiting");
+    fireEvent.click(await screen.findByRole("button", { name: REWORK_NOW }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /start rework/i }));
+    });
+    expect(await screen.findByText(/nothing new to rework/)).toBeTruthy();
+    // The page-level actionErr/error Alert (role="alert") never fired — the state stayed
+    // inline in the panel (role="status").
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 });
 
@@ -4227,6 +4392,65 @@ describe("RunView ↔ LimitWaitPanel wiring (PRD #35)", () => {
   });
 });
 
+// Issue #1197: the transient-recovery hold panel. COPY ONLY — it explains the automatic
+// resume and self-hides on every other status, exactly like PoolWaitPanel.
+describe("RecoveryWaitPanel (issue #1197)", () => {
+  it("renders the recovery copy for a recovery_wait run", () => {
+    const { container } = render(<RecoveryWaitPanel run={run({ status: "recovery_wait" })} />);
+    // The park is announced (role=status heading) and the copy explains the automatic
+    // resume and the owner's cancel option — distinct from a pooled-token / usage-limit park.
+    expect(container.querySelector('[role="status"]')).not.toBeNull();
+    expect(container.textContent).toContain("transient empty model result");
+    expect(container.textContent).toContain("resumes on");
+    expect(container.textContent).toContain("cancel");
+    // COPY ONLY: no "Resume now" control (no resume-now verb for this park) and no countdown.
+    expect(container.querySelector("button")).toBeNull();
+    expect(container.textContent).not.toContain("Resumes in");
+  });
+
+  it("renders NOTHING for any other status, including the sibling parks and terminal runs", () => {
+    for (const status of [
+      "running",
+      "limit_wait",
+      "pool_wait",
+      "completed",
+      "failed",
+      "cancelled",
+    ] as const) {
+      cleanup();
+      const { container } = render(<RecoveryWaitPanel run={run({ status })} />);
+      expect(container.textContent).toBe("");
+    }
+  });
+});
+
+// Issue #1197: the page wiring for recovery_wait — the panel is mounted, the stray "live"
+// chip is suppressed, and the now-line treats it as a waiting park. Same source-text
+// instrument (and the same acknowledged ceiling — presence, not render) as the wiring
+// blocks above: the page needs a router, the auth context and a live WS stream to mount.
+describe("RunView ↔ recovery_wait wiring (issue #1197)", () => {
+  const live = runViewSource
+    .replace(/\{\/\*[\s\S]*?\*\/\}/g, "")
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/^\s*\/\/.*$/gm, "");
+
+  it("mounts the panel on the run page", () => {
+    expect(live).toContain("<RecoveryWaitPanel");
+  });
+
+  it("suppresses the green 'live' chip on a recovery_wait run (no false all-clear)", () => {
+    // The self-resuming park must be excluded alongside limit_wait/pool_wait, or a green
+    // "live" chip sits beside the amber "recovery wait" pill telling two opposite things.
+    expect(live).toContain('run.status !== "recovery_wait"');
+  });
+
+  it("counts recovery_wait as a waiting park in the now-line strip", () => {
+    // MilestoneNowStrip's waiting flag must list recovery_wait so the strip does not
+    // pretend the lane is working while the run is backing off to retry.
+    expect(live).toContain('status === "recovery_wait"');
+  });
+});
+
 describe("RunView ↔ QuestionPanel wiring (PRD #88 M2)", () => {
   // Same instrument and the SAME acknowledged ceiling as the block above: this proves
   // the text is present and not commented out, never that it runs. `{false && …}` still
@@ -4357,6 +4581,48 @@ describe("RunView park announcement — awaiting_followup (PRD #517, a11y)", () 
     await screen.findByText("Add rate limiting");
     const region = document.querySelector('div.sr-only[role="status"]') as HTMLElement;
     expect(region.textContent).toBe("");
+  });
+});
+
+// Issue #1197 (a11y): recovery_wait is a self-resuming park with NO ActivityFeed message
+// backup (unlike limit_wait, whose run message the feed's polite region narrates) and
+// RecoveryWaitPanel mounts in the same tick as its content — so, exactly like pool_wait,
+// the ALWAYS-MOUNTED page-level sr-only region is what reliably announces it. Same
+// instrument as the awaiting_followup block above.
+describe("RunView park announcement — recovery_wait (issue #1197, a11y)", () => {
+  function renderPage(over: Partial<Run>) {
+    mockUseRunStream.mockReturnValue({
+      run: run(over),
+      messages: [],
+      connected: true,
+      error: "",
+      submit: vi.fn(),
+      refreshRun: vi.fn(),
+      inputs: [],
+      canSteer: true,
+    } as unknown as ReturnType<typeof useRunStream>);
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
+    return render(
+      <MemoryRouter initialEntries={["/runs/r1"]}>
+        <RunView />
+      </MemoryRouter>,
+    );
+  }
+
+  it("announces the recovery park through the always-mounted sr-only region", async () => {
+    renderPage({ status: "recovery_wait" });
+    const region = await waitFor(() => {
+      const el = document.querySelector('div.sr-only[role="status"]') as HTMLElement | null;
+      if (!el || el.textContent === "") throw new Error("not announced yet");
+      return el;
+    });
+    expect(region.getAttribute("aria-live")).toBe("polite");
+    expect(region.textContent).toBe(
+      "This run paused to recover from a transient empty result and will resume automatically.",
+    );
+    // Mutation guard: it is the recovery copy, NOT the pool_wait or awaiting_input copy.
+    expect(region.textContent).not.toContain("pooled Anthropic token");
+    expect(region.textContent).not.toContain("asking you a question");
   });
 });
 

@@ -1063,6 +1063,23 @@ const realApi = {
     request<{ run: Run }>("PUT", `/runs/${id}/mr-rework`, { enabled }),
 
   /**
+   * PRD #1202: start an ON-DEMAND MR-review-rework run for THIS run's open MR, right now.
+   * Owner-scoped, and it deliberately BYPASSES the automatic loop's cap / debounce /
+   * staleness / green-pipeline gates — the owner asked explicitly — while KEEPING the
+   * correctness guards. `guidance` is optional extra steering (≤ 8 KiB, server-enforced);
+   * omitted sends "".
+   *
+   * On success the server returns 201 with the freshly-created `mr_rework` run. The
+   * failure codes are STATES, not surprises the caller should surface as a page-level
+   * error: a 409 is "feature off / run not reworkable / a rework or ci_fix is already
+   * running / nothing new with empty guidance", a 404 is a foreign or unknown run, a
+   * 400 is a too-long guidance / bad body, a 502 is a forge read failure. Callers gate
+   * the affordance on canReworkNow (lib/mrRework.ts) and render any error inline.
+   */
+  startRunRework: (id: string, guidance?: string) =>
+    request<{ run: Run }>("POST", `/runs/${id}/rework`, { guidance: guidance ?? "" }),
+
+  /**
    * Issue #754: resume an `auto`-lane run parked at `pool_wait` (the owner's
    * Anthropic token pool was empty) right now, without waiting for a token to be
    * opted into the pool. No request body; returns the updated run, which moves to
