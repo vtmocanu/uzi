@@ -382,13 +382,23 @@ export function createCodexExecutionSafety(
   registry: ExecutionRegistry,
   spawnRoot: SpawnRootSeam,
   reconcileBeforeBoundary?: ReconcileBeforeBoundary,
+  // Optional terminal hook run after the registry's tools are disposed. The terminal
+  // boundary owner (the runner, after the last sink) invokes `dispose` exactly at the
+  // true terminal — which is AFTER run()'s finally under deferRegistryTeardown — so the
+  // executor uses this to evict tokens released by the POST-RUN sink reconciles (which
+  // run()'s already-completed finally could not have evicted). Idempotent by contract.
+  onDispose?: () => void | Promise<void>,
 ): CodexExecutionSafetyImpl {
   return new CodexExecutionSafetyImpl(
     registry,
     {
       quiesce: (request) => registry.quiesceChildren(request.deadlineMs),
       reap: (request, closedEpoch) => registry.reapProcesses(request.deadlineMs, closedEpoch),
-      dispose: (request) => registry.disposeTools(request.deadlineMs),
+      dispose: async (request) => {
+        const result = await registry.disposeTools(request.deadlineMs);
+        await onDispose?.();
+        return result;
+      },
       spawnRoot,
     },
     reconcileBeforeBoundary,

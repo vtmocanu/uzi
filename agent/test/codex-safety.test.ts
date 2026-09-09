@@ -470,6 +470,35 @@ describe("CodexExecutionSafety.withBoundary: per-sink reconcile (m4)", () => {
     assert.equal(ran, true);
     assert.equal(result, 6);
   });
+
+  it("dispose runs the onDispose terminal hook AFTER a post-run sink registered a token (F1: sink tokens are evicted)", async () => {
+    // Models the executor's F1 wiring: a post-run sink reconcile registers a fresh token
+    // into a set (via addSecret), and the terminal dispose the runner calls evicts it via
+    // onDispose. FAIL-OLD/PASS-FIXED: before the onDispose hook, dispose did NOT evict, so
+    // every Codex sink leaked a token registration into the worker-lifetime redactor.
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(3));
+    const registered = new Set<string>();
+    const removed: string[] = [];
+    const reconcile: ReconcileBeforeBoundary = async () => {
+      registered.add("sink-token"); // stands in for log.addSecret + releasedTokens.add
+      return { kind: "ready" };
+    };
+    const onDispose = (): void => {
+      for (const t of registered) removed.push(t);
+      registered.clear();
+    };
+    const safety = createCodexExecutionSafety(reg, spawnCounter().seam, reconcile, onDispose);
+    // A post-run sink: withBoundary runs the reconcile (registers the token), no eviction yet.
+    await safety.withBoundary(req("finalize"), async () => {});
+    assert.deepEqual([...registered], ["sink-token"], "the sink reconcile registered a token");
+    assert.deepEqual(removed, [], "not evicted until the terminal dispose");
+    // The terminal dispose (the runner, after the last sink) evicts it via onDispose.
+    await safety.dispose(req("terminal"));
+    assert.deepEqual(removed, ["sink-token"], "the terminal dispose evicted the post-run sink token");
+    assert.equal(registered.size, 0, "cleared so a second dispose cannot double-remove");
+    await safety.dispose(req("terminal"));
+    assert.deepEqual(removed, ["sink-token"], "a second dispose is idempotent (no re-remove)");
+  });
 });
 
 describe("CodexExecutionSafety.withBoundary: primary-failure evidence preservation", () => {

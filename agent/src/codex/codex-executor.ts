@@ -468,6 +468,15 @@ export class CodexExecutor implements Executor {
       registry,
       spawnBoundaryRoot,
       this.makeBoundaryReconcile(ctx.runId, releasedTokens),
+      // (C, F1) Terminal eviction of tokens released by the POST-RUN sink reconciles. The
+      // runner calls safety.dispose after the last durability sink — by which point run()'s
+      // finally (below) has already evicted+cleared the DURING-run tokens — so tokens the
+      // sinks added here are un-scrubbed at the true terminal. `clear()` makes it idempotent
+      // (a second dispose, or the standalone backstop, sees an empty set and no-ops).
+      () => {
+        for (const token of releasedTokens) this.log.removeSecret(token);
+        releasedTokens.clear();
+      },
     );
 
     // The SCRUBBED command-identity env — NOTHING from process.env (cross-root credential
@@ -590,11 +599,14 @@ export class CodexExecutor implements Executor {
       // for the runner's post-run durability sinks and only tears down the executor-owned
       // harness/transport, fileop handle and credential-free store.
       await this.terminalCleanup(registry, harness, fileopHandle, storeDir, boundaryDeadlineMs);
-      // (C) Evict every fresh released token from the logger's secret set — AFTER the
-      // harness/transport is closed above, so no late log line can still carry the token.
-      // `removeSecret` is reference-counted, so this only un-scrubs a token whose last
-      // holder is this run.
+      // (C) Evict the DURING-run released tokens (provider-root launches) from the logger's
+      // secret set — AFTER the harness/transport is closed above, so no late log line can
+      // still carry the token. `removeSecret` is reference-counted. `clear()` so the terminal
+      // dispose hook (which evicts the POST-RUN sink tokens) does not double-remove these:
+      // under deferRegistryTeardown this finally runs BEFORE the post-run sinks, so those
+      // sink-released tokens are evicted by the onDispose hook wired into safety.dispose.
       for (const token of releasedTokens) this.log.removeSecret(token);
+      releasedTokens.clear();
     }
   }
 
@@ -711,7 +723,7 @@ export class CodexExecutor implements Executor {
     const log = this.log;
     return buildRunLaneReconcile(runId, this.opts.client, this.opts.binding, (token) => {
       if (!token) return;
-      log.addSecret(token); // BEFORE any use; balanced by removeSecret at terminal cleanup
+      log.addSecret(token); // BEFORE any use; balanced by removeSecret in the terminal dispose hook (post-run sinks) or run()'s finally (during-run)
       releasedTokens.add(token);
     });
   }
