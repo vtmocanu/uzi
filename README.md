@@ -251,3 +251,15 @@ uzi is provided "as is", without warranty of any kind (see [LICENSE](LICENSE)). 
 ## License
 
 [MIT](LICENSE) © 2026 Vlad Mocanu / METAMINDS
+
+## Star history
+
+<p align="center">
+  <a href="https://star-history.com/#vtmocanu/uzi&Date">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=vtmocanu/uzi&type=Date&theme=dark">
+      <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=vtmocanu/uzi&type=Date">
+      <img alt="Star history chart for vtmocanu/uzi" src="https://api.star-history.com/svg?repos=vtmocanu/uzi&type=Date" width="640">
+    </picture>
+  </a>
+</p>
