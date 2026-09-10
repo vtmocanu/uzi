@@ -101,7 +101,7 @@ function shellWords(command: string): string[] {
   return words;
 }
 
-function dockerfileRunCommands(text: string): string[] {
+function dockerfileLogicalRuns(text: string): string[] {
   const runs: string[] = [];
   let fragments: string[] | undefined;
 
@@ -121,11 +121,27 @@ function dockerfileRunCommands(text: string): string[] {
     fragments.push(fragment.replace(/\\\s*$/, ""));
     if (continued) continue;
 
-    runs.push(...splitShellCommands(fragments.join(" ")));
+    runs.push(fragments.join(" "));
     fragments = undefined;
   }
 
   return runs;
+}
+
+function dockerfileRunCommands(text: string): string[] {
+  return dockerfileLogicalRuns(text).flatMap((run) => splitShellCommands(run));
+}
+
+const unsupportedGroupShellWords = new Set([
+  "if", "then", "elif", "else", "fi", "for", "while", "until", "do", "done",
+  "case", "in", "esac", "select", "function", "{", "}", "(", ")", "[[", "]]",
+]);
+
+function hasUnsupportedGroupShellSyntax(text: string): boolean {
+  return dockerfileLogicalRuns(text).some((run) => {
+    const words = splitShellCommands(run).flatMap((command) => shellWords(command));
+    return words.includes("addgroup") && words.some((word) => unsupportedGroupShellWords.has(word));
+  });
 }
 
 function hasCommand(text: string, expected: readonly string[]): boolean {
@@ -144,11 +160,11 @@ function hasRequiredSessionGroupMembership(text: string): boolean {
 }
 
 function hasForbiddenProviderWorkerMembership(text: string): boolean {
-  return hasCommand(text, ["addgroup", "runner", "worker"]);
+  return hasCommand(text, ["addgroup", "runner", "worker"]) || hasUnsupportedGroupShellSyntax(text);
 }
 
 function hasForbiddenCommandSessionMembership(text: string): boolean {
-  return hasCommand(text, ["addgroup", "runner-cmd", "codex-session"]);
+  return hasCommand(text, ["addgroup", "runner-cmd", "codex-session"]) || hasUnsupportedGroupShellSyntax(text);
 }
 
 function templateDockerfiles(): { name: string; text: string }[] {
@@ -974,5 +990,10 @@ describe("worker template Dockerfile group-membership parser", () => {
   it("detects a continued command-runner membership", () => {
     const dockerfile = ["RUN addgroup runner-cmd " + String.fromCharCode(92), "    codex-session"].join("\n");
     assert.equal(hasForbiddenCommandSessionMembership(dockerfile), true);
+  });
+
+  it("detects a forbidden provider membership nested in compound shell syntax", () => {
+    const dockerfile = "RUN if true; then addgroup runner worker; fi\n";
+    assert.equal(hasForbiddenProviderWorkerMembership(dockerfile), true);
   });
 });
