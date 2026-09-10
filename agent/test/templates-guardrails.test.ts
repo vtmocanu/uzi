@@ -48,8 +48,9 @@ describe("worker template Dockerfiles keep guardrail layers", () => {
       assert.doesNotMatch(text, /^\s*USER\s+/m, `${name}/Dockerfile must NOT set a USER — the entrypoint drops root -> worker`);
       assert.match(text, /adduser\s+-u\s+10001\s+-G\s+worker\b/, `${name}/Dockerfile must create the worker uid (10001)`);
       assert.match(text, /adduser\s+-u\s+10002\s+-G\s+runner\b/, `${name}/Dockerfile must create the runner uid (10002)`);
-      assert.match(text, /addgroup\s+runner\s+worker\b/, `${name}/Dockerfile must let the provider runner expose only its sessions subtree to the worker group`);
-      assert.doesNotMatch(text, /addgroup\s+runner-cmd\s+worker\b/, `${name}/Dockerfile must keep command roots out of the worker group`);
+      assert.match(text, /^\s*RUN\s+addgroup\s+-g\s+10004\s+codex-session\b.*\baddgroup\s+worker\s+codex-session\b.*\baddgroup\s+runner\s+codex-session\b/m, `${name}/Dockerfile must create the dedicated provider-session reader group in a RUN instruction`);
+      assert.doesNotMatch(text, /addgroup\s+runner-cmd\s+codex-session\b/, `${name}/Dockerfile must keep command roots out of the provider-session reader group`);
+      assert.doesNotMatch(text, /^\s*RUN\s+addgroup\s+runner\s+worker(?:\s|$)/m, `${name}/Dockerfile must not grant the provider runner the broad worker group`);
       assert.match(text, /apk add[^\n]*\bsetpriv\b/, `${name}/Dockerfile must install util-linux setpriv (the A1 drop wrapper)`);
       assert.match(
         text,

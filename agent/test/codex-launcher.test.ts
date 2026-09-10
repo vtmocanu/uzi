@@ -4,7 +4,7 @@ import { EventEmitter } from "node:events";
 import { createInterface } from "node:readline";
 import { PassThrough, Writable } from "node:stream";
 
-import { COMMAND_UID, WORKER_UID, setprivArgsForUid, setprivRunnerArgs } from "../src/runner-uid.js";
+import { CODEX_SESSION_GID, COMMAND_UID, WORKER_UID, setprivArgsForUid, setprivRunnerArgs } from "../src/runner-uid.js";
 import {
   CodexUnsupportedProfileError,
   launchCodexRoot,
@@ -300,7 +300,7 @@ describe("launchCodexRoot: app-server auth (production config, no env credential
     assert.doesNotMatch(configFile.content, /requires_openai_auth/);
     assert.doesNotMatch(configFile.content, /base_url/);
     assert.deepEqual(treeCalls[0]?.sharedSessionRead, {
-      gid: WORKER_UID,
+      gid: CODEX_SESSION_GID,
       codexHome: `${DATA_ROOT}/codex`,
       sessionDir: `${DATA_ROOT}/codex/sessions`,
     });

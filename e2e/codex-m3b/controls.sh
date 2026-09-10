@@ -102,16 +102,25 @@ else
   bad "packaged codex-executor.ts COMMAND_SANDBOX_BIN does not match $SANDBOX"
 fi
 
-hdr "Control P5: managed-auth session reader group is provider-only"
+hdr "Control P5: dedicated managed-auth session reader group"
 _runner_groups=" $(id -Gn runner 2>/dev/null || true) "
+_worker_groups=" $(id -Gn worker 2>/dev/null || true) "
 _command_groups=" $(id -Gn runner-cmd 2>/dev/null || true) "
 case "$_runner_groups" in
-  *" worker "*) ok "provider runner belongs to the trusted worker group" ;;
-  *) bad "provider runner is missing the trusted worker group" ;;
+  *" codex-session "*) ok "provider runner belongs to the dedicated session group" ;;
+  *) bad "provider runner is missing the dedicated session group" ;;
+esac
+case "$_worker_groups" in
+  *" codex-session "*) ok "worker belongs to the dedicated session group" ;;
+  *) bad "worker is missing the dedicated session group" ;;
 esac
 case "$_command_groups" in
-  *" worker "*) bad "command runner must not belong to the trusted worker group" ;;
-  *) ok "command runner is excluded from the trusted worker group" ;;
+  *" codex-session "*) bad "command runner must not belong to the dedicated session group" ;;
+  *) ok "command runner is excluded from the dedicated session group" ;;
+esac
+case "$_runner_groups" in
+  *" worker "*) bad "provider runner must not belong to the broad worker group" ;;
+  *) ok "provider runner is excluded from the broad worker group" ;;
 esac
 
 hdr "SUMMARY packaging PASS=$PASS FAIL=$FAIL"

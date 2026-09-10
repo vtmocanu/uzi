@@ -57,6 +57,10 @@ export const RUNNER_UID = 10002;
  *  existing pair; see the worker/runner/runner-cmd accounts in
  *  agent/templates/base/Dockerfile. */
 export const COMMAND_UID = 10003;
+/** gid 10004, shared only by the trusted worker and provider runner. It grants
+ * traverse/read access to managed-auth provider sessions without adding the
+ * provider to the broad worker primary group; runner-cmd is never a member. */
+export const CODEX_SESSION_GID = 10004;
 /** uid 10001 — `worker`, the PAT-holding worker process itself. Credentialed
  *  boundary-action roots ARE this process, so becoming `worker` needs no setpriv (see
  *  {@link workerBoundaryCommand}). Image account: the `worker` account in

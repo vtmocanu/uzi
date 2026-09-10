@@ -1356,7 +1356,7 @@ export class CodexExecutor implements Executor {
       // a deterministic short-lived sibling staging tree. The launcher provisions the final
       // runner-owned HOME first, then copies the vetted seed AS runner before app-server spawn.
       // This keeps the worker read-only on the final 0710/2750 provider tree and keeps the
-      // command identity out of the worker-group session path. The staging tree is gone before
+      // command identity out of the dedicated session-reader path. The staging tree is gone before
       // the harness can send initialize or any model-bearing request.
       const providerLaunchSeam: LaunchRootSeam = async (spec) => {
         if (this.deps.launchProviderRoot !== undefined) {

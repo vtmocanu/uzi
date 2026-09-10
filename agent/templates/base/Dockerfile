@@ -41,18 +41,19 @@ RUN n=0; until apk add --no-cache git bash tini curl xz tar setpriv docker-cli d
 # credential-free command-root identity (the Codex adapter's shell + fileop callbacks),
 # OS-isolated from the provider credential (uid 10002) -- a distinct uid means it cannot
 # read the provider root's mode-0400 /proc/<pid>/environ, its owner-only trees, or the
-# group-worker managed-auth session path. It
-# is given NO credential/PAT and is NOT in group `worker`; its primary group `runner-cmd`
+# dedicated-group managed-auth session path. It is given NO credential/PAT and is
+# outside both `worker` and `codex-session`; its primary group `runner-cmd`
 # (gid 10003) lets setpriv `--regid 10003` resolve, and it joins group `runner` as a
 # supplementary member so `--init-groups` grants the `runner` group -- letting a command
 # root write the shared setgid group=runner, group-writable run worktree and read the
 # group-accessible /nix toolchain (`/nix` is worker:runner),
 # exactly as the `runner` uid does today. Numbered to match the k8s remote-worker design
 # intent (worker 10001 / runner 10002 / runner-cmd 10003). `worker` joins group `runner`
-# so it can reach runner-group trees. `runner` joins group `worker` only so managed-auth
-# provider roots can expose traverse-only parents plus their credential-free sessions subtree
-# to the trusted worker; `runner-cmd` is deliberately not in group `worker`. That one
-# membership is added in a late layer so it does not invalidate the heavy toolchain cache.
+# so it can reach runner-group trees. A dedicated `codex-session` group (gid 10004)
+# contains only worker + provider runner, so managed-auth roots can expose traverse-only
+# parents plus credential-free sessions without granting the provider the broad `worker`
+# group; `runner-cmd` is deliberately excluded. The group is added in a late layer so it
+# does not invalidate the heavy toolchain cache.
 # The accounts are created EARLY so /nix + /data can be chowned to them
 # below; the entrypoint drops root -> worker at run time.
 RUN addgroup -g 10001 worker && adduser -u 10001 -G worker -h /home/worker -D worker \
@@ -395,7 +396,7 @@ RUN bash /tmp/codex/assert-codex.sh \
 # root-owned 0555, absent from PATH, and selected only by the trusted executor.
 COPY agent/codex/supervisor /build/uzi-codex-supervisor
 RUN cd /build/uzi-codex-supervisor && export GOTOOLCHAIN=local CGO_ENABLED=0 GOFLAGS="-mod=vendor -buildvcs=false" && go build -trimpath -o /usr/local/bin/uzi-codex-supervisor . && chmod 0555 /usr/local/bin/uzi-codex-supervisor && go build -trimpath -o /usr/local/bin/uzi-codex-fileop ./fileop && chmod 0555 /usr/local/bin/uzi-codex-fileop && go build -trimpath -o /usr/local/bin/uzi-codex-command-sandbox ./cmdsandbox && chmod 0555 /usr/local/bin/uzi-codex-command-sandbox && rm -rf /build/uzi-codex-supervisor
-RUN addgroup runner worker
+RUN addgroup -g 10004 codex-session && addgroup worker codex-session && addgroup runner codex-session
 
 COPY agent/tsconfig.json ./
 COPY agent/src ./src

@@ -36,6 +36,7 @@ import { createInterface } from "node:readline";
 import type { Readable, Writable } from "node:stream";
 
 import {
+  CODEX_SESSION_GID,
   COMMAND_UID,
   WORKER_UID,
   commandRootCommand,
@@ -90,7 +91,7 @@ export interface CodexLaunchProvider {
 export interface CodexLaunchSpec {
   /** A RUNNER-WRITABLE root, OUTSIDE the target repo, under which fresh per-launch
    * HOME/CODEX_HOME/XDG/TMPDIR trees are created runner-owned mode 0700. Managed-auth
-   * provider roots add only worker-group traverse on the root and CODEX_HOME, plus
+   * provider roots add only session-reader-group traverse on the root and CODEX_HOME, plus
    * read access on CODEX_HOME/sessions, so the worker can persist that safe subset. */
   readonly ownedDataRoot: string;
   readonly provider: CodexLaunchProvider;
@@ -541,7 +542,7 @@ export async function launchCodexRoot(spec: CodexLaunchSpec, deps: LauncherDeps 
   (deps.assertNoUnexpectedSystemConfig ?? defaultAssertNoUnexpectedSystemConfig)(deps.etcCodexDir);
 
   // 3. Fresh per-launch trees, runner-owned via the injectable step. Managed auth adds
-  // only the trusted worker's traverse/read path to the credential-free sessions subtree.
+  // only the dedicated worker+provider group's traverse/read path to the sessions subtree.
   const trees = deriveOwnedTrees(spec.ownedDataRoot);
   const configPath = join(trees.codexHome, "config.toml");
   const sessionSeedDir = join(`${spec.ownedDataRoot}.session-seed`, "sessions");
@@ -577,7 +578,7 @@ export async function launchCodexRoot(spec: CodexLaunchSpec, deps: LauncherDeps 
     ...(spec.kind === "provider" && spec.useAppServerAuth
       ? {
           sharedSessionRead: {
-            gid: WORKER_UID,
+            gid: CODEX_SESSION_GID,
             codexHome: trees.codexHome,
             sessionDir: join(trees.codexHome, "sessions"),
           },
