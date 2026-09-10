@@ -28,12 +28,10 @@ same posture and the frozen M0 protocol helpers.
 Block A is the **in-worker-validated** security proof; run in-image (`CODEX_M3B_SRC=/app/src`)
 the *same* tests load the baked `/app/src` adapter, so it doubles as the packaged
 unit-composition proof. Block B and the docker legs are **CI/maintainer-only** because they
-require native AMD64 image builds plus a Landlock-capable kernel. The pre-hardening `base`
-and `jvm` images were verified on 2026-09-10 on an OKD cluster: each passed `13/13`
-packaging controls and `13/13` lifecycle tests. The final dedicated-session-group hardening
-adds two packaging controls, and the credential-binding regression adds one lifecycle test. The
-exact implementation-head rerun targets `15/15` packaging and `14/14` lifecycle per image and
-remains in progress. In-worker image builds can still
+require native AMD64 image builds plus a Landlock-capable kernel. The final `base` and `jvm`
+images from implementation commit `e2e33ff` were verified on 2026-09-10 on an OKD cluster:
+each passed `15/15` packaging controls and `14/14` lifecycle tests. The final count includes
+the dedicated-session-group controls and provider credential-binding regression. In-worker image builds can still
 be storage-heavy and arm64 remains unsupported for this proof. Block B stays skipped host-side.
 
 ## The canaries
