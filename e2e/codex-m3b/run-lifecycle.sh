@@ -37,9 +37,17 @@
 #   UZI_M3B_DOCKERFILE   worker Dockerfile to build        (default: agent/templates/base/Dockerfile)
 #   UZI_M3B_SKIP_BUILD   set to 1 to reuse an existing worker image (skip docker build)
 #   UZI_M3B_BUILD_NETWORK optional build-step network: default, host, or none (runtime unchanged)
-#   UZI_M3B_TEST_TIMEOUT outer watchdog seconds            (default: 600)
+#   UZI_M3B_TEST_TIMEOUT outer watchdog seconds            (default: 600; raise it for live)
 #   CDR_M3B_PG_IMAGE     throwaway Postgres image          (default: postgres:17)
 #   CDR_M3B_API_PORT     port the api container binds/advertises (default: 8080)
+#
+# LIVE mode (PRD #1106 M3b live-acceptance), strictly opt-in via env (set by live.sh --live):
+#   CODEX_M3B_LIVE       1 = run the SUBSCRIPTION lifecycle against the REAL Codex provider using a
+#                        maintainer-injected login; unset = the credential-free offline run, which
+#                        stays byte-identical. Real-provider runs are slower — raise UZI_M3B_TEST_TIMEOUT.
+#   CODEX_M3B_LIVE_LOGIN_JSON  (live only) the real subscription login blob; the test server seeds it
+#   CODEX_M3B_LIVE_BASE_URL    (live only) the real provider Responses base URL
+#   UZI_M3B_LIVE_TEST_TIMEOUT_MS  (live only) per-test node cap in ms (default: 600000)
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -60,6 +68,22 @@ PG_NAME="cdr-m3b-pg-$$"
 API_NAME="cdr-m3b-api-$$"
 API_IMAGE="cdr-m3b-api-img-$$:local"
 LIFECYCLE_OUT="$HERE/lifecycle-run.$$.log"
+
+# LIVE mode is strictly opt-in: with CODEX_M3B_LIVE unset, every array below is empty / --internal
+# and this run is byte-identical to the credential-free offline proof. In live mode the network is
+# egress-capable, the live env is threaded into the test-server (its Go seeds the real login) and
+# the lifecycle container, and the per-test node cap is raised for real-provider latency.
+LIVE="${CODEX_M3B_LIVE:-}"
+NET_INTERNAL_ARGS=(--internal)
+LIVE_TESTSERVER_ENV=()
+LIVE_LIFECYCLE_ENV=()
+TEST_TIMEOUT_MS=120000
+if [ "$LIVE" = "1" ]; then
+  NET_INTERNAL_ARGS=()
+  LIVE_TESTSERVER_ENV=(-e CODEX_M3B_LIVE=1 -e CODEX_M3B_LIVE_LOGIN_JSON -e CODEX_M3B_LIVE_BASE_URL)
+  LIVE_LIFECYCLE_ENV=(-e CODEX_M3B_LIVE=1 -e CODEX_M3B_LIVE_BASE_URL)
+  TEST_TIMEOUT_MS="${UZI_M3B_LIVE_TEST_TIMEOUT_MS:-600000}"
+fi
 
 log() { printf '\n### %s\n' "$*"; }
 
@@ -124,9 +148,14 @@ set -e
 docker rm -f "$CONTROLS_NAME" >/dev/null 2>&1 || true
 log "packaging controls rc=$rc_controls"
 
-# 3. The internal (no external egress) network the PG + api + worker containers share.
-log "creating internal network $NET (no external egress)"
-docker network create --internal "$NET" >/dev/null
+# 3. The network the PG + api + worker containers share. Offline it is --internal (no external
+#    egress); live it is egress-capable so the worker/test-server reach the real provider + auth hosts.
+if [ "$LIVE" = "1" ]; then
+  log "creating EGRESS-CAPABLE network $NET (live mode: real Codex provider reachable)"
+else
+  log "creating internal network $NET (no external egress)"
+fi
+docker network create "${NET_INTERNAL_ARGS[@]}" "$NET" >/dev/null
 
 # 4. Throwaway Postgres on the internal network. The api server migrates it (store.Migrate) on boot.
 PGPASS="$(openssl rand -hex 16)"
@@ -163,10 +192,13 @@ log "building test-server image $API_IMAGE from e2e/codex-m3b/testserver.Dockerf
 DOCKER_BUILDKIT=1 docker build "${BUILD_NETWORK_ARGS[@]}" -f "$HERE/testserver.Dockerfile" -t "$API_IMAGE" "$REPO/api"
 require_linux_amd64_image "$API_IMAGE"
 log "starting test server $API_NAME on $NET (bind 0.0.0.0:$API_PORT, advertise $ADVERTISE)"
+# In live mode LIVE_TESTSERVER_ENV forwards CODEX_M3B_LIVE + the injected login blob + base URL so
+# the Go seeds discover the real identity and wire the real refresh client (offline: the array is empty).
 docker run -d --name "$API_NAME" --network "$NET" \
   -e "UZI_TEST_DATABASE_URL=$DSN" \
   -e "CODEX_M3B_LISTEN=0.0.0.0:${API_PORT}" \
   -e "CODEX_M3B_ADVERTISE_URL=$ADVERTISE" \
+  "${LIVE_TESTSERVER_ENV[@]}" \
   "$API_IMAGE" >/dev/null
 
 log "waiting for the test server to migrate+seed and print its JSON contract"
@@ -195,15 +227,25 @@ fi
 # Parse the contract on the host with node (the same tool the counts parser uses; no /nix jq).
 read_contract() {
   printf '%s' "$contract" | node -e '
+    const live = process.env.CODEX_M3B_LIVE === "1";
     let raw = ""; process.stdin.on("data", (d) => (raw += d)); process.stdin.on("end", () => {
       try {
         const c = JSON.parse(raw.trim());
+        // Subscription fields are always required. The api_key arm is skipped in live mode
+        // (subscription-only seeding), so its fields are only required offline.
+        const required = [
+          c.base_url, c.worker_token,
+          c.subscription.run_id, c.subscription.capability, c.subscription.chatgpt_account_id, String(c.subscription.generation),
+        ];
+        if (!live) { required.push(c.api_key.run_id, c.api_key.capability); }
+        if (required.some((v) => v === undefined || v === null || v === "")) { process.exit(2); }
+        // The output shape stays fixed at 8 lines so the read block below is unchanged; in live
+        // mode the two api_key lines are empty (the lifecycle harness tolerates them absent).
         const out = [
           c.base_url, c.worker_token,
           c.subscription.run_id, c.subscription.capability, c.subscription.chatgpt_account_id, String(c.subscription.generation),
-          c.api_key.run_id, c.api_key.capability,
+          c.api_key.run_id ?? "", c.api_key.capability ?? "",
         ];
-        if (out.some((v) => v === undefined || v === null || v === "")) { process.exit(2); }
         process.stdout.write(out.join("\n"));
       } catch { process.exit(1); }
     });'
@@ -238,10 +280,12 @@ fi
 WORKER_BASE_URL="http://${API_IP}:${API_PORT}"
 log "server up; contract origin=$CONTRACT_BASE_URL; internal worker route resolved; sub_run=$SUB_RUN_ID api_run=$APIKEY_RUN_ID"
 
-# 6. The lifecycle suite — CONFINEMENT posture, but on the INTERNAL network (loopback fake provider
-#    inside the container; the network reaches only api+PG). CODEX_M3B_SRC pins the packaged
-#    /app/src; CODEX_M3B_PACKAGED=1 turns on Block B; the server-contract env points the real
-#    WorkerClient at the api container. Output is captured for the per-image count assertions.
+# 6. The lifecycle suite — CONFINEMENT posture. Offline: the INTERNAL network (loopback fake provider
+#    inside the container; the network reaches only api+PG). Live: the egress-capable network, no fake
+#    provider — the subscription leg drives the REAL provider (CODEX_M3B_LIVE + base URL forwarded via
+#    LIVE_LIFECYCLE_ENV). CODEX_M3B_SRC pins the packaged /app/src; CODEX_M3B_PACKAGED=1 turns on Block
+#    B; the server-contract env points the real WorkerClient at the api container. Output is captured
+#    for the per-image count assertions.
 log "running the packaged lifecycle suite in $IMAGE under the confinement posture (network $NET)"
 set +e
 timeout --kill-after=60s "$TIMEOUT" docker run --rm --network "$NET" \
@@ -261,10 +305,12 @@ timeout --kill-after=60s "$TIMEOUT" docker run --rm --network "$NET" \
   -e "CODEX_M3B_SUB_GEN=$SUB_GEN" \
   -e "CODEX_M3B_APIKEY_RUN_ID=$APIKEY_RUN_ID" \
   -e "CODEX_M3B_APIKEY_CAP=$APIKEY_CAP" \
+  -e "CODEX_M3B_TEST_TIMEOUT_MS=$TEST_TIMEOUT_MS" \
+  "${LIVE_LIFECYCLE_ENV[@]}" \
   -v "$REPO/e2e":/work/e2e:ro \
   -v "$REPO/agent/test":/app/test:ro \
   --name "$LIFECYCLE_NAME" \
-  "$IMAGE" /bin/sh -c 'cd /app && exec /usr/local/bin/node --import tsx --test --test-concurrency=1 --test-timeout=120000 \
+  "$IMAGE" /bin/sh -c 'cd /app && exec /usr/local/bin/node --import tsx --test --test-concurrency=1 --test-timeout="${CODEX_M3B_TEST_TIMEOUT_MS:-120000}" \
     /app/test/codex-command-root-linux.test.ts /work/e2e/codex-m3b/lifecycle.test.ts' 2>&1 | tee "$LIFECYCLE_OUT"
 rc_lifecycle=${PIPESTATUS[0]}
 set -e
@@ -273,8 +319,49 @@ docker rm -f "$LIFECYCLE_NAME" >/dev/null 2>&1 || true
 # 7. Per-image count assertions (belt-and-braces; the suite itself already asserts these). Parse the
 #    Block-A CODEX_M3B_COUNTS AND the Block-B real-path summaries with node (never a /nix jq),
 #    reading the LAST occurrence of each, and require every real-path count > 0 + api_key refresh 0.
+#    In LIVE mode the fake-provider-visible counts (login/turns/callbacks/etc.) are not observable
+#    and the api_key arm is skipped, so a reduced live parser asserts Block A + the live subscription
+#    summary (ran + release + refresh advance/replay + the check-b concurrency invariants) instead.
 rc_counts=1
-if node - "$LIFECYCLE_OUT" <<'NODE'
+if [ "$LIVE" = "1" ]; then
+  if node - "$LIFECYCLE_OUT" <<'NODE'
+const fs = require("node:fs");
+const text = fs.readFileSync(process.argv[2], "utf8");
+const last = (marker) => {
+  let found;
+  for (const line of text.split("\n")) {
+    const i = line.indexOf(marker + " ");
+    if (i >= 0) found = line.slice(i + marker.length + 1).trim();
+  }
+  return found;
+};
+const fail = (m) => { console.error("count check FAILED: " + m); process.exit(1); };
+const parse = (marker) => {
+  const raw = last(marker);
+  if (!raw) fail("no " + marker + " summary found");
+  try { return JSON.parse(raw); } catch { fail("could not parse " + marker + ": " + raw); }
+};
+// Block A still runs live (injected fakes), unchanged.
+const a = parse("CODEX_M3B_COUNTS");
+for (const k of ["tests", "callbacks", "delegations", "roots"]) {
+  if (!(Number(a[k]) > 0)) fail(`Block A ${k} not > 0 (${a[k]})`);
+}
+// The live subscription real-path summary (fake-visible counts are not observable live).
+const s = parse("CODEX_M3B_LIVE_SUB_COUNTS");
+if (s.ran !== true) fail(`live subscription ran !== true (${s.ran})`);
+if (!(Number(s.releases) > 0)) fail(`live releases not > 0 (${s.releases})`);
+if (!(Number(s.refreshAdvanced) > 0)) fail(`live refreshAdvanced not > 0 (${s.refreshAdvanced})`);
+if (!(Number(s.refreshReplayed) > 0)) fail(`live refreshReplayed not > 0 (${s.refreshReplayed})`);
+if (s.checkBSingleStep !== true) fail(`live check-b did not advance by exactly one step (${s.checkBSingleStep})`);
+if (s.checkBConverged !== true) fail(`live check-b did not converge on one token/generation (${s.checkBConverged})`);
+console.log("live per-image counts OK (Block A + live subscription + check-b)");
+NODE
+  then
+    rc_counts=0
+  else
+    rc_counts=1
+  fi
+elif node - "$LIFECYCLE_OUT" <<'NODE'
 const fs = require("node:fs");
 const text = fs.readFileSync(process.argv[2], "utf8");
 const last = (marker) => {

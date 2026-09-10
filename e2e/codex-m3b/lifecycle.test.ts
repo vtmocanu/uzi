@@ -984,6 +984,16 @@ describe("codex-m3b packaged lifecycle (injected fakes)", () => {
 // ================================================================================
 const PACKAGED = process.env.CODEX_M3B_PACKAGED === "1";
 
+// LIVE (PRD #1106 M3b live-acceptance): strictly opt-in via env, set only by run-lifecycle.sh's
+// live branch (live.sh --live). When set, the subscription leg drives the REAL Codex provider with
+// a maintainer-injected login and the api_key leg is skipped (subscription-only). When UNSET,
+// nothing below reads it, so Block A and the offline Block B are byte-for-byte unchanged.
+const LIVE = process.env.CODEX_M3B_LIVE === "1";
+
+// The production Responses base URL fallback when CODEX_M3B_LIVE_BASE_URL is unset (mirrors
+// CODEX_PRODUCTION_PROVIDER.baseUrl in agent/src/codex/codex-executor.ts).
+const LIVE_BASE_URL_FALLBACK = "https://api.openai.com/v1";
+
 describe("codex-m3b real-provider responder routing", () => {
   it("rejects a non-empty bearer that the worker API did not release", async () => {
     const { FakeProvider } = await import("./fake-provider.js");
@@ -1056,7 +1066,11 @@ function readServerContract(): ServerContract | undefined {
   const subGenRaw = process.env.CODEX_M3B_SUB_GEN;
   const apiRunId = process.env.CODEX_M3B_APIKEY_RUN_ID;
   const apiCap = process.env.CODEX_M3B_APIKEY_CAP;
-  if (!baseUrl || !workerToken || !subRunId || !subCap || !subAccount || !subGenRaw || !apiRunId || !apiCap) {
+  // Subscription fields are always required. In LIVE mode the api_key arm is skipped
+  // (subscription-only seeding), so its fields may be absent — the subscription leg still uses
+  // the real WorkerClient. Offline they are required exactly as before.
+  const apiKeyOk = LIVE || (Boolean(apiRunId) && Boolean(apiCap));
+  if (!baseUrl || !workerToken || !subRunId || !subCap || !subAccount || !subGenRaw || !apiKeyOk) {
     return undefined;
   }
   const generation = Number(subGenRaw);
@@ -1065,7 +1079,7 @@ function readServerContract(): ServerContract | undefined {
     baseUrl,
     workerToken,
     sub: { runId: subRunId, capability: subCap, account: subAccount, generation },
-    apiKey: { runId: apiRunId, capability: apiCap },
+    apiKey: { runId: apiRunId ?? "", capability: apiCap ?? "" },
   };
 }
 
@@ -1197,8 +1211,254 @@ function makeScratch(): { scratch: string; worktree: string; home: string } {
   return { scratch, worktree, home: nodePath.join(scratch, "home") };
 }
 
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** A proxy over the real WorkerClient that CAPTURES every plaintext access token a release/refresh
+ *  hands back (the executor's and the probes'), so the live canary-absence proof can assert none of
+ *  them leaks into a public message or a log line — the live analog of the offline fake's
+ *  `observedBearers`. Every other method delegates unchanged. */
+function tokenCapturingClient(inner: WorkerClientInstance, captured: string[]): WorkerClientInstance {
+  return new Proxy(inner, {
+    get(target, prop, receiver) {
+      if (prop === "releaseCodex") {
+        return async (...args: Parameters<WorkerClientInstance["releaseCodex"]>) => {
+          const res = await target.releaseCodex(...args);
+          if (res.access_token) captured.push(res.access_token);
+          return res;
+        };
+      }
+      if (prop === "refreshCodex") {
+        return async (...args: Parameters<WorkerClientInstance["refreshCodex"]>) => {
+          const res = await target.refreshCodex(...args);
+          if (res.access_token) captured.push(res.access_token);
+          return res;
+        };
+      }
+      const value = Reflect.get(target, prop, receiver) as unknown;
+      return typeof value === "function" ? (value as (...a: unknown[]) => unknown).bind(target) : value;
+    },
+  });
+}
+
+type LiveRefreshResp = Awaited<ReturnType<WorkerClientInstance["refreshCodex"]>>;
+
+/** Run one coordinated subscription refresh, retaining the operation id across a retry: a 409
+ *  "contended" (another operation holds the live lease) is the documented retry-and-reconcile
+ *  signal, and re-sending the SAME operation id after the winner commits replays/reconciles to the
+ *  committed token rather than starting a second exchange. */
+async function refreshWithRetry(
+  client: WorkerClientInstance,
+  runId: string,
+  capability: string,
+  account: string,
+  operationId: string,
+  observedGeneration: number,
+  maxAttempts = 8,
+): Promise<LiveRefreshResp> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    try {
+      return await client.refreshCodex(
+        runId,
+        { capability, operation_id: operationId, observed_generation: observedGeneration },
+        { authMode: "subscription", chatgptAccountId: account },
+      );
+    } catch (err) {
+      lastErr = err;
+      await sleepMs(250 * (attempt + 1));
+    }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
+}
+
+/** The LIVE subscription leg (PRD #1106 M3b live-acceptance). Selected only when CODEX_M3B_LIVE=1;
+ *  the offline body is untouched. It drives the packaged CodexExecutor against the REAL Codex
+ *  provider with the maintainer-injected login (no fake provider, no appServerAuthOpenAIBaseUrlForTest)
+ *  and then proves the coordinated subscription refresh over the REAL /codex/refresh route, including
+ *  the two-concurrent-refresh "check-b" convergence. The credential lifecycle (release + coordinated
+ *  refresh + check-b) is the deterministic, gated proof; the full real-model run is attempted and
+ *  reported (`ran`) but is not itself a hard gate (it can be skipped with CODEX_M3B_LIVE_SKIP_EXEC=1),
+ *  because a real model's tool choices against the minimal test server are a maintainer-verified
+ *  aspect, not part of this wiring. */
+async function runLiveSubscription(): Promise<void> {
+  const contract = readServerContract();
+  assert.ok(contract, "live subscription requires the server contract (the real WorkerClient); is the test server seeding live?");
+  const c = contract as NonNullable<typeof contract>;
+
+  const log = recordingLog();
+  const WorkerClient = await loadWorkerClientCtor();
+  const realClient = new WorkerClient(c.baseUrl, c.workerToken, "codex-m3b", log.log);
+  const counts: ClientCounts = { release: 0, refresh: 0, refreshAdvanced: 0, refreshReplayed: 0 };
+  const capturedTokens: string[] = [];
+  // Count releases/refresh outcomes AND capture every plaintext token for the canary proof.
+  const client = tokenCapturingClient(countingWorkerClient(realClient, counts, new Set<string>()), capturedTokens);
+
+  const binding = subscriptionBindingFromContract(c);
+  const account = c.sub.account;
+  const runId = c.sub.runId;
+
+  const liveBaseUrl = process.env.CODEX_M3B_LIVE_BASE_URL ?? LIVE_BASE_URL_FALLBACK;
+  // The REAL provider: leave appServerAuthOpenAIBaseUrlForTest UNSET so the executor keeps the
+  // production provider name and dials the real provider; the login RPC carries the released token.
+  const liveProvider: CodexProviderConfig = { ...provider, baseUrl: liveBaseUrl };
+  const sessionOps: SessionOps = { adopt: 0, adoptFiles: 0, persist: 0, persistFiles: 0, persistFailures: 0, inspect: 0, remove: 0 };
+  const realDeps: CodexExecutorDeps = {
+    sessionStore: countingSessionStore(sessionOps),
+    deferRegistryTeardown: true,
+    idleMs: 60000,
+    wallMs: 300000,
+    boundaryDeadlineMs: 5000,
+    childTurnDeadlineMs: 60000,
+    commandTmpdir: process.env.TMPDIR ?? "/tmp",
+  };
+
+  const { scratch, worktree, home } = makeScratch();
+  const emittedAll: EmittedMessage[] = [];
+  let exec: InstanceType<typeof CodexExecutor> | undefined;
+  let ran = false;
+  let ranError = "";
+  let terminalDisposed = false;
+
+  try {
+    // (1) Attempt the full real-model run unless the maintainer opts out. Non-gating: its released
+    // tokens feed the canary proof and its outcome is reported, but a real model's tool behaviour
+    // against the minimal test server is not part of the wiring under proof here.
+    if (process.env.CODEX_M3B_LIVE_SKIP_EXEC === "1") {
+      console.log("CODEX_M3B_LIVE exec run skipped (CODEX_M3B_LIVE_SKIP_EXEC=1)");
+    } else {
+      const { ctx, emitted } = makeCtx({
+        runId,
+        worktreePath: worktree,
+        planApproved: false,
+        approvedPlan: undefined,
+        gatePlan: async () => ({ kind: "approve", selection: { source: "own", agents: [] } }) as never,
+        agents,
+        checkpoint: async () => {},
+      });
+      const runTimeoutMs = Number(process.env.CODEX_M3B_LIVE_RUN_TIMEOUT_MS ?? 300000);
+      exec = new CodexExecutor(log.log, home, { binding, client, provider: liveProvider }, realDeps);
+      try {
+        await withTimeout(exec.run(ctx), runTimeoutMs, "live subscription run");
+        ran = true;
+      } catch (err) {
+        ran = false;
+        ranError = err instanceof Error ? err.message : String(err);
+      }
+      for (const m of emitted) emittedAll.push(m);
+      // Post-run durability sinks, mirroring the offline body (best-effort; never masks the proof).
+      try {
+        if (exec.safety) await exec.safety.withBoundary({ boundary: "finalize", deadlineMs: 5000 }, async () => {});
+      } catch {
+        // reported via ranError / the credential proof below
+      }
+      try {
+        if (exec.safety) {
+          await exec.safety.dispose({ boundary: "terminal", deadlineMs: 5000 });
+          terminalDisposed = true;
+        }
+      } catch {
+        terminalDisposed = false;
+      }
+    }
+
+    // (2) The DETERMINISTIC credential-lifecycle proof over the REAL routes. First a sequential
+    // advance+replay (same operation id) exactly as the offline probe does, then check-b.
+    const g0 = await (async (): Promise<number> => {
+      const rel = await client.releaseCodex(
+        runId,
+        { capability: c.sub.capability },
+        { authMode: "subscription", chatgptAccountId: account, minimumGeneration: 0 },
+      );
+      assert.equal(rel.auth_mode, "subscription", "the live release returned a subscription token");
+      return rel.auth_mode === "subscription" ? rel.generation : 0;
+    })();
+    const seqOp = randomUUID();
+    const advanced = await refreshWithRetry(client, runId, c.sub.capability, account, seqOp, g0);
+    assert.equal(advanced.outcome, "advanced", "a fresh operation id advances the committed generation once");
+    assert.equal(advanced.generation, g0 + 1, "the advance moved the generation by exactly one step");
+    const replayed = await refreshWithRetry(client, runId, c.sub.capability, account, seqOp, g0);
+    assert.equal(replayed.outcome, "replayed", "the SAME operation id replays the committed result (no second exchange)");
+    assert.equal(replayed.access_token, advanced.access_token, "the replay returns the same committed access token");
+    assert.equal(replayed.generation, advanced.generation, "the replay returns the same committed generation");
+
+    // (3) check-b: TWO concurrent refreshes at the SAME observed generation, DISTINCT operation ids.
+    // The coordinated refresher serializes on the account: exactly one advances (a single provider
+    // exchange), the other reconciles to the committed result. Both converge on one token/generation,
+    // and the committed generation moves by exactly one step.
+    const relB = await client.releaseCodex(
+      runId,
+      { capability: c.sub.capability },
+      { authMode: "subscription", chatgptAccountId: account, minimumGeneration: 0 },
+    );
+    const gB = relB.auth_mode === "subscription" ? relB.generation : 0;
+    const opA = randomUUID();
+    const opC = randomUUID();
+    const [rA, rC] = await Promise.all([
+      refreshWithRetry(client, runId, c.sub.capability, account, opA, gB),
+      refreshWithRetry(client, runId, c.sub.capability, account, opC, gB),
+    ]);
+    const advancedCount = [rA, rC].filter((r) => r.outcome === "advanced").length;
+    const relAfter = await client.releaseCodex(
+      runId,
+      { capability: c.sub.capability },
+      { authMode: "subscription", chatgptAccountId: account, minimumGeneration: 0 },
+    );
+    const committedAfter = relAfter.auth_mode === "subscription" ? relAfter.generation : -1;
+    const checkBSingleStep = committedAfter === gB + 1 && rA.generation === gB + 1 && rC.generation === gB + 1;
+    const checkBConverged = rA.access_token === rC.access_token && rA.generation === rC.generation;
+
+    assert.equal(advancedCount, 1, "exactly ONE of the two concurrent refreshes advanced (a single coordinated exchange)");
+    assert.ok(checkBSingleStep, `check-b advanced the committed generation by exactly one step (gB=${gB}, committedAfter=${committedAfter}, rA=${rA.generation}, rC=${rC.generation})`);
+    assert.ok(checkBConverged, "check-b: both concurrent refreshes converged on the same access token + generation");
+
+    // (4) Emit the machine summary run-lifecycle.sh's live counts parser greps.
+    const liveCounts = {
+      ran,
+      ranError,
+      releases: counts.release,
+      refreshAdvanced: counts.refreshAdvanced,
+      refreshReplayed: counts.refreshReplayed,
+      checkBSingleStep,
+      checkBConverged,
+    };
+    console.log(`CODEX_M3B_LIVE_SUB_COUNTS ${JSON.stringify(liveCounts)}`);
+
+    // (5) The credential-lifecycle invariants are the gate; the full model run is reported, not gated.
+    assert.ok(counts.release > 0, `the live run released a real token at least once (got ${counts.release})`);
+    assert.ok(counts.refreshAdvanced > 0, `the live run advanced a coordinated refresh (got ${counts.refreshAdvanced})`);
+    assert.ok(counts.refreshReplayed > 0, `the live run replayed a coordinated refresh (got ${counts.refreshReplayed})`);
+    if (!ran && process.env.CODEX_M3B_LIVE_SKIP_EXEC !== "1") {
+      console.log(`CODEX_M3B_LIVE exec run did not complete (ran=false${ranError ? `: ${ranError}` : ""}); the credential-lifecycle proof above still gates`);
+    }
+
+    // (6) The canary boundary: no released/refreshed token and no capability rides an emitted
+    // message or a log line. capturedTokens holds every plaintext token the executor + probes saw.
+    const emittedBlob = JSON.stringify(emittedAll);
+    const logBlob = log.lines.join("\n");
+    for (const tok of new Set(capturedTokens)) {
+      assert.doesNotMatch(emittedBlob, new RegExp(escapeRe(tok)), "a released credential leaked into an emitted message");
+      assert.doesNotMatch(logBlob, new RegExp(escapeRe(tok)), "a released credential leaked into a log line");
+    }
+    assert.doesNotMatch(emittedBlob, new RegExp(escapeRe(c.sub.capability)), "capability canary leaked into an emitted message");
+    assert.doesNotMatch(logBlob, new RegExp(escapeRe(c.sub.capability)), "capability canary leaked into a log line");
+  } finally {
+    if (!terminalDisposed && exec?.safety) {
+      await exec.safety.dispose({ boundary: "terminal", deadlineMs: 5000 }).catch(() => undefined);
+    }
+    fs.rmSync(scratch, { recursive: true, force: true });
+  }
+}
+
 describe("codex-m3b packaged lifecycle (real launch → loopback provider)", { skip: PACKAGED ? false : "image-only (set CODEX_M3B_PACKAGED=1 inside the worker image)" }, () => {
   it("subscription: drives the packaged CodexExecutor through the REAL supervisor/fileop/codex + real WorkerClient with NONZERO real-path counts and no canary leak", async () => {
+    // LIVE mode drives the REAL provider via a wholly separate body (no fake). When CODEX_M3B_LIVE
+    // is unset this guard is inert and the offline body below is byte-for-byte unchanged.
+    if (LIVE) {
+      await runLiveSubscription();
+      return;
+    }
     const { FakeProvider, recordingLifecycleResponder, countToolCallbacks, toolCallbackTexts, codexCanaries: freshCanaries } = await import("./fake-provider.js");
     const canaries = freshCanaries();
     const contract = readServerContract();
@@ -1470,7 +1730,7 @@ describe("codex-m3b packaged lifecycle (real launch → loopback provider)", { s
     }
   });
 
-  it("api_key: drives the packaged CodexExecutor with an api_key binding and makes ZERO refresh calls (a release re-authorizes, never a refresh)", async () => {
+  it("api_key: drives the packaged CodexExecutor with an api_key binding and makes ZERO refresh calls (a release re-authorizes, never a refresh)", { skip: LIVE ? "subscription-only in live mode" : false }, async () => {
     const { FakeProvider, recordingLifecycleResponder, codexCanaries: freshCanaries } = await import("./fake-provider.js");
     const canaries = freshCanaries();
     const contract = readServerContract();
