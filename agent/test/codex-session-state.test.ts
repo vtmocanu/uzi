@@ -213,11 +213,15 @@ describe(
     await writeFileAt(join(stagedHome, "sessions", "notes.txt"), "never-copy\n");
     const providerSessions = join(root, "epoch-2", "codex", "sessions");
     await fsp.mkdir(providerSessions, { recursive: true, mode: 0o2750 });
+    // Match launcher's production posture: recursive mkdir does not portably retain
+    // the setgid bit, so the launcher follows it with an explicit chmod.
+    await fsp.chmod(providerSessions, 0o2750);
 
     const seeded = await seedCodexSessionArtifacts(join(stagedHome, "sessions"), providerSessions);
     assert.equal(seeded.files, 1);
     assert.deepEqual(await collectRelFiles(providerSessions), ["2026/rollout-safe.jsonl"]);
-    assert.equal((await fsp.stat(join(providerSessions, "2026"))).mode & 0o7777, 0o2750);
+    assert.equal((await fsp.stat(providerSessions)).mode & 0o7777, 0o2750);
+    assert.equal((await fsp.stat(join(providerSessions, "2026"))).mode & 0o777, 0o750);
     assert.equal((await fsp.stat(join(providerSessions, "2026", "rollout-safe.jsonl"))).mode & 0o777, 0o640);
   });
 
