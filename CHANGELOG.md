@@ -18,6 +18,13 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+## [0.82.0] - 2026-09-10
+
+### Added
+
+- **Codex worker lane: the production execution and advice adapter, still dark ([#1220](https://github.com/vtmocanu/uzi/issues/1220), [#1171](https://github.com/vtmocanu/uzi/issues/1171), [#1106](https://github.com/vtmocanu/uzi/issues/1106)).**
+  Behind the scenes and not user-visible yet: connects the Codex credential, harness-boundary and image-packaging groundwork from 0.79.0 and 0.80.0 into a complete Codex run and advice adapter. Worker-owned callbacks, not Codex-native tools or hooks, own shell, file and patch edits, skills, workflow signals and delegation; an immutable per-run registry and a matching-epoch safety permit guard every durability and publication sink; provider roots are OS-isolated so credentials are inaccessible rather than merely absent from the environment; and subscription refresh runs through the API-owned coordination flow. Public Codex routing stays disabled, so saving a Codex credential still cannot create a Codex run through any of today's paths, and the Claude worker path is preserved unchanged.
+
 ## [0.81.0] - 2026-09-09
 
 ### Added
@@ -3939,7 +3946,8 @@ Re-ships the PRD #87 browser prebake + `web-ux` builtin (v0.11.0, rolled back to
 
 - Worker-side redaction now covers the `agent` and `kind` message fields, not just the payload and `agent_instance`/`agent_label`, closing a gap where a secret placed in either field reached the API, the WebSocket frame, the browser, and `uzi run logs` unscrubbed (PRD #108).
 
-[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.81.0...HEAD
+[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.82.0...HEAD
+[0.82.0]: https://github.com/vtmocanu/uzi/compare/v0.81.0...v0.82.0
 [0.81.0]: https://github.com/vtmocanu/uzi/compare/v0.80.0...v0.81.0
 [0.80.0]: https://github.com/vtmocanu/uzi/compare/v0.79.0...v0.80.0
 [0.79.0]: https://github.com/vtmocanu/uzi/compare/v0.78.0...v0.79.0
