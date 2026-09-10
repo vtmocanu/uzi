@@ -418,15 +418,39 @@ func TestRunPauseQueriesLiveDB(t *testing.T) {
 	// "pause requested" on a dead run. Each case arms a pending pause on a running run,
 	// asserts it is SET first (so the clear assertion is non-vacuous), fires ONE terminal
 	// transition, then asserts the run is terminal AND the three columns are all NULL.
+	//
+	// PRD #1224 M2 (Decision 7): this same table now ALSO pins the milestones_agents clear.
+	// armedRunning additionally sets milestones_in_progress + milestones_agents to non-empty
+	// values and asserts milestones_agents is SET, and assertCleared additionally asserts it
+	// is NULL after the transition — so all ten terminal writers are proven to clear the
+	// per-milestone agent attribution beside milestones_in_progress.
 	t.Run("every terminal transition clears a pending pause", func(t *testing.T) {
+		// milestonesAgents reads the run's milestones_agents column as its ::text form, so a
+		// NULL column scans to an invalid pgtype.Text (Decision 7 clear assertion).
+		milestonesAgents := func(t *testing.T, id uuid.UUID) pgtype.Text {
+			t.Helper()
+			var raw pgtype.Text
+			if err := pool.QueryRow(ctx, `SELECT milestones_agents::text FROM runs WHERE id=$1`, id).Scan(&raw); err != nil {
+				t.Fatalf("read milestones_agents %s: %v", id, err)
+			}
+			return raw
+		}
 		// armedRunning inserts a running issue run under this worker carrying a pending
-		// milestone pause (after-count 2), and asserts the columns actually landed SET —
-		// the control half that keeps the post-transition clear assertion honest.
+		// milestone pause (after-count 2), arms a non-empty milestones_in_progress +
+		// milestones_agents beside it (PRD #1224 M2), and asserts both the pause columns and
+		// milestones_agents actually landed SET — the control half that keeps the
+		// post-transition clear assertion honest.
 		armedRunning := func(t *testing.T, requeueCount int32, startedOld bool) uuid.UUID {
 			t.Helper()
 			id := insertRun(t, "running", "issue", false, true, startedOld, requeueCount, "milestone", 2)
+			mustExec(ctx, t, pool,
+				`UPDATE runs SET milestones_in_progress = '["m1"]'::jsonb,
+				 milestones_agents = '[{"id":"m1","agent":"coder"}]'::jsonb WHERE id = $1`, id)
 			if at, mode, after := pauseCols(t, id); !at.Valid || mode.String != "milestone" || after.Int32 != 2 {
 				t.Fatalf("precondition: pending pause not armed (at.Valid=%v mode=%q after=%d)", at.Valid, mode.String, after.Int32)
+			}
+			if ma := milestonesAgents(t, id); !ma.Valid {
+				t.Fatalf("precondition: milestones_agents not armed (Valid=%v)", ma.Valid)
 			}
 			return id
 		}
@@ -437,6 +461,9 @@ func TestRunPauseQueriesLiveDB(t *testing.T) {
 			}
 			if at, mode, after := pauseCols(t, id); at.Valid || mode.Valid || after.Valid {
 				t.Fatalf("terminal transition must clear the pending-pause columns (at.Valid=%v mode.Valid=%v after.Valid=%v)", at.Valid, mode.Valid, after.Valid)
+			}
+			if ma := milestonesAgents(t, id); ma.Valid {
+				t.Fatalf("terminal transition must clear milestones_agents (got %q)", ma.String)
 			}
 		}
 

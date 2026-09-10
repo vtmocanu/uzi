@@ -520,6 +520,7 @@ type Run struct {
 	CheckpointTipAt        pgtype.Timestamptz `json:"checkpoint_tip_at"`
 	RecoveryWaitCount      int32              `json:"recovery_wait_count"`
 	RecoveryRetryNotBefore pgtype.Timestamptz `json:"recovery_retry_not_before"`
+	MilestonesAgents       []byte             `json:"milestones_agents"`
 }
 
 type RunMessage struct {
