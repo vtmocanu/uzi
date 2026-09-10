@@ -1289,7 +1289,12 @@ async function runLiveSubscription(): Promise<void> {
 
   const log = recordingLog();
   const WorkerClient = await loadWorkerClientCtor();
-  const realClient = new WorkerClient(c.baseUrl, c.workerToken, "codex-m3b", log.log);
+  // Default to the PRODUCTION worker budget (8s codexHTTPTimeoutMs) so pass/fail is production-
+  // equivalent; the server keeps its production 7.5s route / 7s lease + 2.5s per-provider-call cap.
+  // CODEX_M3B_LIVE_RELAX_TIMEOUTS=1 relaxes the client to 30s (and drops the server per-call cap) as
+  // an explicit diagnostic mode only.
+  const relaxTimeouts = process.env.CODEX_M3B_LIVE_RELAX_TIMEOUTS === "1";
+  const realClient = new WorkerClient(c.baseUrl, c.workerToken, "codex-m3b", log.log, { codexHTTPTimeoutMs: relaxTimeouts ? 30_000 : 8_000, httpTimeoutMs: 30_000 });
   const counts: ClientCounts = { release: 0, refresh: 0, refreshAdvanced: 0, refreshReplayed: 0 };
   const capturedTokens: string[] = [];
   // Count releases/refresh outcomes AND capture every plaintext token for the canary proof.
@@ -1447,7 +1452,12 @@ async function runLiveSubscription(): Promise<void> {
     if (!terminalDisposed && exec?.safety) {
       await exec.safety.dispose({ boundary: "terminal", deadlineMs: 5000 }).catch(() => undefined);
     }
-    fs.rmSync(scratch, { recursive: true, force: true });
+    try {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    } catch {
+      // Best-effort: a model run's uid-10003 command files can be unremovable by this uid (EACCES).
+      // The pod is throwaway, so a leftover scratch dir never affects the proof.
+    }
   }
 }
 

@@ -50,11 +50,13 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"syscall"
 	"time"
 
@@ -160,10 +162,17 @@ func buildLiveSubscription() *liveSubscription {
 	if login.AccessToken == "" || login.RefreshToken == "" {
 		log.Fatal("codexm3btestserver: CODEX_M3B_LIVE_LOGIN_JSON must carry a non-empty access_token and refresh_token")
 	}
+	// Production-equivalent per-provider-call cap (mirrors cmd/server's
+	// WithPerRequestTimeout(codexProviderRequestTimeout)) so the acceptance measures the real budget.
+	// CODEX_M3B_LIVE_RELAX_TIMEOUTS=1 drops the cap as an explicit diagnostic mode only.
+	client := codexauth.NewClient(codexauth.WithPerRequestTimeout(2500 * time.Millisecond))
+	if os.Getenv("CODEX_M3B_LIVE_RELAX_TIMEOUTS") == "1" {
+		client = codexauth.NewClient()
+	}
 	return &liveSubscription{
 		accessToken:  login.AccessToken,
 		refreshToken: login.RefreshToken,
-		client:       codexauth.NewClient(),
+		client:       client,
 	}
 }
 
@@ -437,24 +446,100 @@ func seedSubscription(ctx context.Context, pool *pgxpool.Pool, q *store.Queries,
 	}, nil
 }
 
+// resolveLiveIdentity establishes the login's canonical identity tuple with a NONROTATING read,
+// refreshing first when the injected access token is already expired. ChatGPT access tokens are
+// short-lived, so a 401 on the identity read is expected and recoverable: it mints a fresh access
+// token from the durable refresh token (a single codexauth.Refresh), then discovers with it. It
+// returns the tuple plus the tokens to seal (rotated when a refresh happened). Only an invalid
+// refresh token or an unreachable provider fails here, before any run is seeded.
+func resolveLiveIdentity(ctx context.Context, client *codexauth.Client, accessToken, refreshToken string) (codexauth.Identity, string, string, error) {
+	id, err := client.DiscoverIdentity(ctx, accessToken)
+	if err == nil {
+		return id, accessToken, refreshToken, nil
+	}
+	var authErr *codexauth.AuthError
+	if !errors.As(err, &authErr) || !authErr.Unauthorized() {
+		// Not a 401: the token authenticated but identity did not resolve (e.g. ErrIdentityIncomplete).
+		// A refresh cannot help, so log the usage-response SHAPE (key names + field presence only,
+		// never values) to reveal whether the provider moved or omitted the identity fields.
+		diagnoseUsageShape(ctx, accessToken)
+		return codexauth.Identity{}, "", "", fmt.Errorf("discover live identity: %w", err)
+	}
+	// The injected access token is expired/invalid (401). Mint a fresh one from the durable refresh
+	// token, then discover with it. Refresh MAY rotate the refresh token; seal whichever it returns.
+	res, err := client.Refresh(ctx, refreshToken)
+	if err != nil {
+		return codexauth.Identity{}, "", "", fmt.Errorf("refresh live login after a 401 on identity (invalid refresh token? re-run 'codex login'): %w", err)
+	}
+	newRefresh := refreshToken
+	if res.RefreshToken != nil && *res.RefreshToken != "" {
+		newRefresh = *res.RefreshToken
+	}
+	id, err = client.DiscoverIdentity(ctx, res.AccessToken)
+	if err != nil {
+		diagnoseUsageShape(ctx, res.AccessToken)
+		return codexauth.Identity{}, "", "", fmt.Errorf("discover live identity after refresh: %w", err)
+	}
+	return id, res.AccessToken, newRefresh, nil
+}
+
+// diagnoseUsageShape logs the SHAPE of the /wham/usage response (its top-level key names, the HTTP
+// status, and whether account_id/user_id are present and non-empty) when identity discovery cannot
+// resolve the tuple. It logs field NAMES and booleans ONLY, never any value, so a maintainer can
+// tell a moved/renamed field or an empty usage record from a real outage without exposing the token
+// or any account data. It is best-effort: any failure is logged and swallowed.
+func diagnoseUsageShape(ctx context.Context, accessToken string) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, codexauth.DefaultUsageBaseURL+"/wham/usage", nil)
+	if err != nil {
+		log.Printf("codexm3btestserver: diag: build usage request: %v", err)
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Accept", "application/json")
+	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	if err != nil {
+		log.Printf("codexm3btestserver: diag: usage request: %v", err)
+		return
+	}
+	defer resp.Body.Close() //nolint:errcheck // best-effort diagnostic
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(body, &top); err != nil {
+		log.Printf("codexm3btestserver: diag: /wham/usage status=%d body is not a JSON object (len=%d)", resp.StatusCode, len(body))
+		return
+	}
+	keys := make([]string, 0, len(top))
+	for k := range top {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	nonEmpty := func(k string) bool {
+		v := string(top[k])
+		return len(top[k]) > 0 && v != `""` && v != "null"
+	}
+	log.Printf("codexm3btestserver: diag: /wham/usage status=%d top-level keys=%v account_id_present=%v user_id_present=%v",
+		resp.StatusCode, keys, nonEmpty("account_id"), nonEmpty("user_id"))
+}
+
 // seedSubscriptionLive seeds the subscription arm from the maintainer-injected REAL Codex
 // login (CODEX_M3B_LIVE=1). It mirrors seedSubscription's credential graph, but every value
 // except the two injected tokens comes from the provider, not a canary:
 //
-//   - DiscoverIdentity establishes the login's canonical (provider_user_id, workspace_account_id)
-//     tuple with a NONROTATING read. An expired or invalid access token fails loudly HERE
-//     (no account is injected), before any run is seeded.
+//   - resolveLiveIdentity establishes the login's canonical (provider_user_id, workspace_account_id)
+//     tuple with a NONROTATING read, refreshing first if the injected access token is already
+//     expired, so a stale access token (they are short-lived) is recovered via the durable refresh
+//     token before any run is seeded.
 //   - the real {access_token,refresh_token} blob is sealed and stored; it lives only in memory
 //     and the sealed DB row, never in a file.
 //   - the REAL codexauth client is wired into the coordinated refresher, so POST /codex/refresh
 //     performs a real oauth rotation (the canary arm wires an in-process fake instead).
 func seedSubscriptionLive(ctx context.Context, pool *pgxpool.Pool, q *store.Queries, box *secretbox.Box, wsvc *workersvc.Service, ownerID, repoID, workerID uuid.UUID, live *liveSubscription) (subscriptionContract, error) {
-	id, err := live.client.DiscoverIdentity(ctx, live.accessToken)
+	id, accessToken, refreshToken, err := resolveLiveIdentity(ctx, live.client, live.accessToken, live.refreshToken)
 	if err != nil {
-		return subscriptionContract{}, fmt.Errorf("discover live identity (expired or invalid access token?): %w", err)
+		return subscriptionContract{}, err
 	}
 
-	login := fmt.Sprintf(`{"access_token":%q,"refresh_token":%q}`, live.accessToken, live.refreshToken)
+	login := fmt.Sprintf(`{"access_token":%q,"refresh_token":%q}`, accessToken, refreshToken)
 	sealedLogin, err := box.Seal([]byte(login))
 	if err != nil {
 		return subscriptionContract{}, fmt.Errorf("seal live login: %w", err)
