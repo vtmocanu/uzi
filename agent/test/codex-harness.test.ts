@@ -634,6 +634,9 @@ describe("CodexHarness: kind + thread configuration", () => {
     assert.equal(dynamicTools.some((tool) => tool.name === "SubagentStart"), false, "code-mode lifecycle names are not model-visible");
     assert.equal(params.developerInstructions, "you are the lead");
     assert.equal(params.instructions, undefined, "the ignored legacy field is never sent");
+    const startTurn = transport.requests.find((r) => r.method === "turn/start");
+    assert.ok(startTurn, "turn/start was sent after thread/start");
+    assert.deepEqual(rec(startTurn.params).environments, [], "every root turn disables native environments");
     assert.equal(config.project_doc_max_bytes, 0);
     const projects = rec(config.projects);
     assert.deepEqual(projects[WORKSPACE], { trust_level: "untrusted" });
@@ -656,13 +659,20 @@ describe("CodexHarness: kind + thread configuration", () => {
     const params = rec(resume.params);
     assert.equal(params.threadId, "resumed-1");
     assert.equal(params.dynamicTools, undefined, "pinned thread/resume restores dynamic tools from persisted history");
-    assert.equal(params.environments, undefined, "pinned thread/resume restores the empty environment selection from history");
+    assert.equal(params.environments, undefined, "thread/resume has no environments field in the pinned protocol");
     assert.equal(params.developerInstructions, "you are the lead");
     assert.equal(params.instructions, undefined);
     const config = rec(params.config);
     assert.equal(config.project_doc_max_bytes, 0);
     assert.deepEqual(rec(config.projects)[WORKSPACE], { trust_level: "untrusted" });
     assert.doesNotMatch(JSON.stringify(params), /bypass_hook_trust/);
+    const startTurn = transport.requests.find((r) => r.method === "turn/start");
+    assert.ok(startTurn, "turn/start was sent after resume");
+    assert.deepEqual(
+      rec(startTurn.params).environments,
+      [],
+      "the resumed turn explicitly disables native environments instead of accepting provider defaults",
+    );
   });
 
   it("rejects a thread/resume response without a non-empty thread id", async () => {

@@ -161,6 +161,10 @@ func main() {
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,
 	}
+	// Plain HTTP is intentional for this test-only socket. Container mode runs only runtime
+	// synthetic credentials on the script-owned internal network, and the same disposable
+	// Docker controller can already inspect every peer's environment and logs. Ephemeral TLS
+	// would add PKI plumbing without adding a trust boundary or testing production transport.
 
 	// The advertised base_url is what a WORKER (possibly in another container) dials. In
 	// container mode the bound address is a wildcard (0.0.0.0), which no peer can dial, so

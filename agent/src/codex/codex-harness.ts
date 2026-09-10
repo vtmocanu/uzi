@@ -723,6 +723,10 @@ export class CodexHarness implements RunHarness {
     const params: Record<string, unknown> = {
       threadId,
       input: [{ type: "text", text: rendered.leadPrompt.prompt }],
+      // A cold thread/resume in pinned Codex does not restore the thread/start
+      // environment selection. Reassert the empty selection on every turn so a
+      // resumed root cannot inherit the provider's native execution environment.
+      environments: [],
     };
     if (this.currentModel !== undefined) params.model = this.currentModel;
     if (rendered.lead.modelReasoningEffort !== undefined) params.modelReasoningEffort = rendered.lead.modelReasoningEffort;

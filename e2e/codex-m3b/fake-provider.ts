@@ -4,9 +4,9 @@
 // It is the m3b analogue of the m3a loopback fake (`e2e/codex-m3a/fake-provider.ts`) and,
 // like it, the m3 rebuild of the frozen M0 fixture's `/v1/responses` server (only the frozen
 // PURE protocol helpers `message`/`callOutput` are reused, NOT `Probe`/`SupervisorProbe`).
-// It binds ONLY 127.0.0.1 (loopback works under `--network none`), authenticates a
-// RUNTIME-ASSEMBLED dummy bearer token (no baked/real secret), and streams a fixed,
-// deterministic SSE response the caller shapes via `respond`. No model decides anything.
+// It binds ONLY 127.0.0.1 (loopback works under `--network none`), authenticates either an
+// exact runtime dummy credential or a digest recorded from a successful WorkerClient
+// release/refresh, and streams a fixed deterministic SSE response. No model decides anything.
 //
 // It is used ONLY by lifecycle.test.ts's IMAGE leg (the real supervisor + real Codex talk to
 // it). The host node --test leg drives the packaged CodexExecutor through an in-memory
@@ -20,7 +20,7 @@
 // remains independent and uses an in-memory transport.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 
 import { message, tool } from "../codex-m0/harness.mjs";
 
@@ -35,18 +35,12 @@ export type ResponseItem = Record<string, unknown>;
 export type ResponsesBody = { readonly model?: unknown; readonly input?: readonly unknown[] } & Record<string, unknown>;
 
 export interface FakeProviderOptions {
-  /** The exact bearer credential the app-server must present (assembled at runtime).
-   *  Required in the DEFAULT strict mode; ignored (and optional) when `acceptAnyBearer`
-   *  is set — the real-server path releases a token the test cannot know ahead of time. */
+  /** The exact bearer credential the app-server must present (assembled at runtime). */
   readonly credential?: string;
-  /** m6 (item 7): accept AND record ANY non-empty bearer instead of requiring an exact
-   *  match. The real WorkerClient path releases the seeded credential from the throwaway
-   *  Postgres — a value the test never learns in advance — so the fake cannot be
-   *  pre-configured with it. In this mode every presented token is pushed onto
-   *  {@link FakeProvider.observedBearers} so the test can prove the RELEASED token (the one
-   *  the real Codex presented here) never leaked to a public/log surface. Strict mode (the
-   *  default) keeps the exact-match check and still records the bearer. */
-  readonly acceptAnyBearer?: boolean;
+  /** SHA-256 digests of credentials successfully returned by the WorkerClient. The mutable
+   *  set is populated before Codex can present each release/refresh result, so the real-server
+   *  path binds provider authentication without putting raw credentials in a contract or log. */
+  readonly allowedBearerDigests?: ReadonlySet<string>;
   /** Produce the Responses output items for one request (mirrors M0's `respond`). */
   readonly respond: (body: ResponsesBody, provider: FakeProvider) => ResponseItem[] | Promise<ResponseItem[]>;
 }
@@ -54,6 +48,11 @@ export interface FakeProviderOptions {
 /** A runtime-assembled dummy bearer token — secret-SHAPED, never a real/baked value. */
 export function dummyCredential(): string {
   return `sk-m3b-${randomBytes(18).toString("hex")}`;
+}
+
+/** One-way identity used to bind provider requests to WorkerClient release/refresh results. */
+export function bearerDigest(credential: string): string {
+  return createHash("sha256").update(credential).digest("hex");
 }
 
 /**
@@ -116,15 +115,15 @@ export class FakeProvider {
   /** m6 (item 7): every bearer token presented on a `/v1/responses` request, in order and
    *  stripped of the `Bearer ` prefix. On the real-server path the RELEASED credential
    *  (which the test never knows ahead of time) lands here, so the credential-canary
-   *  boundary is asserted against the token the real Codex actually presented. Recorded in
-   *  BOTH strict and accept-any mode. */
+   *  boundary is asserted against the token the real Codex actually presented. Only an
+   *  authenticated bearer is recorded. */
   readonly observedBearers: string[] = [];
   private closing = false;
   private constructor(
     private readonly server: Server,
     readonly port: number,
     private readonly credential: string | undefined,
-    private readonly acceptAnyBearer: boolean,
+    private readonly allowedBearerDigests: ReadonlySet<string> | undefined,
     private readonly responder: (body: ResponsesBody, provider: FakeProvider) => ResponseItem[] | Promise<ResponseItem[]>,
   ) {}
 
@@ -134,6 +133,9 @@ export class FakeProvider {
   }
 
   static async start(options: FakeProviderOptions): Promise<FakeProvider> {
+    if ((options.credential === undefined) === (options.allowedBearerDigests === undefined)) {
+      throw new Error("fake provider requires exactly one bearer authentication mode");
+    }
     const server = createServer();
     const holder = { provider: undefined as FakeProvider | undefined };
     server.on("request", (request, response) => holder.provider?.handle(request, response));
@@ -147,7 +149,7 @@ export class FakeProvider {
     if (address === null || typeof address === "string" || address.address !== "127.0.0.1") {
       throw new Error("fake provider must bind 127.0.0.1");
     }
-    const provider = new FakeProvider(server, address.port, options.credential, options.acceptAnyBearer === true, options.respond);
+    const provider = new FakeProvider(server, address.port, options.credential, options.allowedBearerDigests, options.respond);
     holder.provider = provider;
     return provider;
   }
@@ -172,20 +174,16 @@ export class FakeProvider {
         try {
           const auth = request.headers.authorization;
           const bearer = typeof auth === "string" && auth.startsWith("Bearer ") ? auth.slice("Bearer ".length) : undefined;
-          // Record the presented token in BOTH modes so the credential-canary boundary can be
-          // asserted against the RELEASED token (the real-server path releases a value the test
-          // cannot know ahead of time — see observedBearers).
-          if (bearer !== undefined && bearer.length > 0) this.observedBearers.push(bearer);
-          if (this.acceptAnyBearer) {
-            // Accept-any (item 7): the released credential is unknown ahead of time, so any
-            // non-empty bearer is accepted — but a MISSING bearer is still a fault (a request
-            // that never authenticated would falsify the login/credential evidence).
-            if (bearer === undefined || bearer.length === 0) {
-              throw new Error("unauthenticated request (accept-any mode: no bearer token presented)");
-            }
-          } else if (auth !== `Bearer ${this.credential}`) {
-            throw new Error(`unauthenticated request (authorization=${String(auth)})`);
+          if (bearer === undefined || bearer.length === 0) {
+            throw new Error("unauthenticated request (no bearer token presented)");
           }
+          const allowed = this.allowedBearerDigests === undefined
+            ? this.credential !== undefined && bearer === this.credential
+            : this.allowedBearerDigests.has(bearerDigest(bearer));
+          if (!allowed) {
+            throw new Error("unauthenticated request (bearer was not released by the worker client)");
+          }
+          this.observedBearers.push(bearer);
           const body = JSON.parse(raw) as ResponsesBody;
           this.requests.push(body);
           const items = await this.responder(body, this);

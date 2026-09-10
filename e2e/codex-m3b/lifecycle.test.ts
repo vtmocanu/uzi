@@ -40,7 +40,7 @@ import {
   type SessionStateModule,
   type SelectModule,
 } from "./packaged-modules.js";
-import { codexCanaries, type CodexCanaries } from "./fake-provider.js";
+import { bearerDigest, codexCanaries, type CodexCanaries } from "./fake-provider.js";
 
 import type { CodexExecutorDeps } from "../../agent/src/codex/codex-executor.js";
 import type { CodexBinding } from "../../agent/src/codex/select.js";
@@ -985,6 +985,33 @@ describe("codex-m3b packaged lifecycle (injected fakes)", () => {
 const PACKAGED = process.env.CODEX_M3B_PACKAGED === "1";
 
 describe("codex-m3b real-provider responder routing", () => {
+  it("rejects a non-empty bearer that the worker API did not release", async () => {
+    const { FakeProvider } = await import("./fake-provider.js");
+    const allowedBearerDigests = new Set<string>();
+    const fake = await FakeProvider.start({ allowedBearerDigests, respond: () => [] });
+    try {
+      const rejected = await fetch(`${fake.baseUrl}/responses`, {
+        method: "POST",
+        headers: { authorization: "Bearer unreleased-test-token", "content-type": "application/json" },
+        body: "{}",
+      });
+      assert.equal(rejected.status, 500, "an unreleased non-empty bearer must fail closed");
+      assert.equal(fake.requests.length, 0, "an unauthorized request never reaches the provider responder");
+
+      const released = "released-test-token";
+      allowedBearerDigests.add(bearerDigest(released));
+      const accepted = await fetch(`${fake.baseUrl}/responses`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${released}`, "content-type": "application/json" },
+        body: "{}",
+      });
+      assert.equal(accepted.status, 200, "a bearer recorded from a worker release is accepted");
+      assert.equal(fake.requests.length, 1);
+    } finally {
+      await fake.close();
+    }
+  });
+
   it("a child turn finishes without consuming the root checkpoint stage", async () => {
     const { recordingLifecycleResponder, codexCanaries: freshCanaries } = await import("./fake-provider.js");
     const canaries = freshCanaries();
@@ -1064,19 +1091,26 @@ interface ClientCounts {
 /** Wrap the REAL WorkerClient so release/refresh are counted (and refresh outcomes classified)
  *  while every other method — the tool-handler forge/memory/findings surface — delegates
  *  unchanged to the real instance. */
-function countingWorkerClient(real: WorkerClientInstance, counts: ClientCounts): WorkerClientInstance {
+function countingWorkerClient(
+  real: WorkerClientInstance,
+  counts: ClientCounts,
+  allowedBearerDigests: Set<string>,
+): WorkerClientInstance {
   return new Proxy(real, {
     get(target, prop, receiver) {
       if (prop === "releaseCodex") {
-        return (...args: Parameters<WorkerClientInstance["releaseCodex"]>) => {
+        return async (...args: Parameters<WorkerClientInstance["releaseCodex"]>) => {
           counts.release += 1;
-          return target.releaseCodex(...args);
+          const res = await target.releaseCodex(...args);
+          allowedBearerDigests.add(bearerDigest(res.access_token));
+          return res;
         };
       }
       if (prop === "refreshCodex") {
         return async (...args: Parameters<WorkerClientInstance["refreshCodex"]>) => {
           counts.refresh += 1;
           const res = await target.refreshCodex(...args);
+          allowedBearerDigests.add(bearerDigest(res.access_token));
           if (res.outcome === "advanced") counts.refreshAdvanced += 1;
           else if (res.outcome === "replayed") counts.refreshReplayed += 1;
           return res;
@@ -1168,11 +1202,15 @@ describe("codex-m3b packaged lifecycle (real launch → loopback provider)", { s
     const { FakeProvider, recordingLifecycleResponder, countToolCallbacks, toolCallbackTexts, codexCanaries: freshCanaries } = await import("./fake-provider.js");
     const canaries = freshCanaries();
     const contract = readServerContract();
-    // Accept-any bearer + record it: on the real-server path the RELEASED token (the credential
-    // canary) is unknown ahead of time, so the fake accepts whatever the real Codex presents and
-    // records it for the boundary assertion.
+    const allowedBearerDigests = new Set<string>();
+    if (contract === undefined) {
+      allowedBearerDigests.add(bearerDigest(canaries.credential));
+      allowedBearerDigests.add(bearerDigest(`${canaries.credential}-refreshed`));
+    }
+    // The real-server path populates this set only from successful WorkerClient release/refresh
+    // results before Codex can present them. The fallback's known fake responses are seeded above.
     const { respond, evidence } = recordingLifecycleResponder(canaries);
-    const fake = await FakeProvider.start({ acceptAnyBearer: true, respond });
+    const fake = await FakeProvider.start({ allowedBearerDigests, respond });
 
     // Wire the client: REAL WorkerClient against the throwaway Postgres when the contract is
     // present, else the in-memory fake client (still exercises the real launcher).
@@ -1185,7 +1223,7 @@ describe("codex-m3b packaged lifecycle (real launch → loopback provider)", { s
     if (contract) {
       const WorkerClient = await loadWorkerClientCtor();
       realClient = new WorkerClient(contract.baseUrl, contract.workerToken, "codex-m3b", log.log);
-      client = countingWorkerClient(realClient, counts);
+      client = countingWorkerClient(realClient, counts, allowedBearerDigests);
       binding = subscriptionBindingFromContract(contract);
       runId = contract.sub.runId;
     } else {
@@ -1271,7 +1309,7 @@ describe("codex-m3b packaged lifecycle (real launch → loopback provider)", { s
       // path only — the fake client cannot exercise the coordinated-refresh replay dedup.
       if (contract && realClient) {
         try {
-          const probe = countingWorkerClient(realClient, counts);
+          const probe = countingWorkerClient(realClient, counts, allowedBearerDigests);
           const rel = await probe.releaseCodex(
             contract.sub.runId,
             { capability: contract.sub.capability },
@@ -1436,8 +1474,10 @@ describe("codex-m3b packaged lifecycle (real launch → loopback provider)", { s
     const { FakeProvider, recordingLifecycleResponder, codexCanaries: freshCanaries } = await import("./fake-provider.js");
     const canaries = freshCanaries();
     const contract = readServerContract();
+    const allowedBearerDigests = new Set<string>();
+    if (contract === undefined) allowedBearerDigests.add(bearerDigest(canaries.credential));
     const { respond } = recordingLifecycleResponder(canaries);
-    const fake = await FakeProvider.start({ acceptAnyBearer: true, respond });
+    const fake = await FakeProvider.start({ allowedBearerDigests, respond });
 
     const counts: ClientCounts = { release: 0, refresh: 0, refreshAdvanced: 0, refreshReplayed: 0 };
     const log = recordingLog();
@@ -1448,7 +1488,7 @@ describe("codex-m3b packaged lifecycle (real launch → loopback provider)", { s
     if (contract) {
       const WorkerClient = await loadWorkerClientCtor();
       const realClient = new WorkerClient(contract.baseUrl, contract.workerToken, "codex-m3b", log.log);
-      client = countingWorkerClient(realClient, counts);
+      client = countingWorkerClient(realClient, counts, allowedBearerDigests);
       binding = apiKeyBindingFromContract(contract);
       runId = contract.apiKey.runId;
     } else {

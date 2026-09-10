@@ -15,6 +15,142 @@ import { fileURLToPath } from "node:url";
 
 const templatesDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../templates");
 
+type ShellQuote = "'" | '"';
+
+function splitShellCommands(run: string): string[] {
+  const commands: string[] = [];
+  let current = "";
+  let quote: ShellQuote | undefined;
+  let escaped = false;
+
+  const finish = (): void => {
+    const command = current.trim();
+    if (command !== "") commands.push(command);
+    current = "";
+  };
+
+  for (let index = 0; index < run.length; index += 1) {
+    const char = run[index]!;
+    if (escaped) {
+      current += char;
+      escaped = false;
+      continue;
+    }
+    if (char === "\\" && quote !== "'") {
+      current += char;
+      escaped = true;
+      continue;
+    }
+    if (quote !== undefined) {
+      current += char;
+      if (char === quote) quote = undefined;
+      continue;
+    }
+    if (char === "'" || char === '"') {
+      quote = char;
+      current += char;
+      continue;
+    }
+    if (char === "#" && (current === "" || /\s/.test(current.at(-1)!))) break;
+    const next = run[index + 1];
+    if (char === ";" || (char === "&" && next === "&") || (char === "|" && next === "|")) {
+      finish();
+      if (char !== ";") index += 1;
+      continue;
+    }
+    current += char;
+  }
+  finish();
+  return commands;
+}
+
+function shellWords(command: string): string[] {
+  const words: string[] = [];
+  let current = "";
+  let quote: ShellQuote | undefined;
+  let escaped = false;
+
+  const finish = (): void => {
+    if (current !== "") words.push(current);
+    current = "";
+  };
+
+  for (const char of command) {
+    if (escaped) {
+      current += char;
+      escaped = false;
+      continue;
+    }
+    if (char === "\\" && quote !== "'") {
+      escaped = true;
+      continue;
+    }
+    if (quote !== undefined) {
+      if (char === quote) quote = undefined;
+      else current += char;
+      continue;
+    }
+    if (char === "'" || char === '"') {
+      quote = char;
+      continue;
+    }
+    if (/\s/.test(char)) finish();
+    else current += char;
+  }
+  finish();
+  return words;
+}
+
+function dockerfileRunCommands(text: string): string[] {
+  const runs: string[] = [];
+  let fragments: string[] | undefined;
+
+  for (const rawLine of text.split("\n")) {
+    const line = rawLine.trim();
+    if (line === "" || line.startsWith("#")) continue;
+
+    let fragment = line;
+    if (fragments === undefined) {
+      const start = /^RUN(?:\s+|$)(.*)$/i.exec(line);
+      if (start === null) continue;
+      fragments = [];
+      fragment = start[1]!;
+    }
+
+    const continued = /\\\s*$/.test(fragment);
+    fragments.push(fragment.replace(/\\\s*$/, ""));
+    if (continued) continue;
+
+    runs.push(...splitShellCommands(fragments.join(" ")));
+    fragments = undefined;
+  }
+
+  return runs;
+}
+
+function hasCommand(text: string, expected: readonly string[]): boolean {
+  return dockerfileRunCommands(text).some((command) => {
+    const words = shellWords(command);
+    return expected.every((word, index) => words[index] === word);
+  });
+}
+
+function hasRequiredSessionGroupMembership(text: string): boolean {
+  return (
+    hasCommand(text, ["addgroup", "-g", "10004", "codex-session"]) &&
+    hasCommand(text, ["addgroup", "worker", "codex-session"]) &&
+    hasCommand(text, ["addgroup", "runner", "codex-session"])
+  );
+}
+
+function hasForbiddenProviderWorkerMembership(text: string): boolean {
+  return hasCommand(text, ["addgroup", "runner", "worker"]);
+}
+
+function hasForbiddenCommandSessionMembership(text: string): boolean {
+  return hasCommand(text, ["addgroup", "runner-cmd", "codex-session"]);
+}
+
 function templateDockerfiles(): { name: string; text: string }[] {
   return fs
     .readdirSync(templatesDir, { withFileTypes: true })
@@ -48,9 +184,9 @@ describe("worker template Dockerfiles keep guardrail layers", () => {
       assert.doesNotMatch(text, /^\s*USER\s+/m, `${name}/Dockerfile must NOT set a USER — the entrypoint drops root -> worker`);
       assert.match(text, /adduser\s+-u\s+10001\s+-G\s+worker\b/, `${name}/Dockerfile must create the worker uid (10001)`);
       assert.match(text, /adduser\s+-u\s+10002\s+-G\s+runner\b/, `${name}/Dockerfile must create the runner uid (10002)`);
-      assert.match(text, /^\s*RUN\s+addgroup\s+-g\s+10004\s+codex-session\b.*\baddgroup\s+worker\s+codex-session\b.*\baddgroup\s+runner\s+codex-session\b/m, `${name}/Dockerfile must create the dedicated provider-session reader group in a RUN instruction`);
-      assert.doesNotMatch(text, /addgroup\s+runner-cmd\s+codex-session\b/, `${name}/Dockerfile must keep command roots out of the provider-session reader group`);
-      assert.doesNotMatch(text, /^\s*RUN\s+addgroup\s+runner\s+worker(?:\s|$)/m, `${name}/Dockerfile must not grant the provider runner the broad worker group`);
+      assert.equal(hasRequiredSessionGroupMembership(text), true, `${name}/Dockerfile must create the dedicated provider-session reader group in a RUN instruction`);
+      assert.equal(hasForbiddenCommandSessionMembership(text), false, `${name}/Dockerfile must keep command roots out of the provider-session reader group`);
+      assert.equal(hasForbiddenProviderWorkerMembership(text), false, `${name}/Dockerfile must not grant the provider runner the broad worker group`);
       assert.match(text, /apk add[^\n]*\bsetpriv\b/, `${name}/Dockerfile must install util-linux setpriv (the A1 drop wrapper)`);
       assert.match(
         text,
@@ -810,5 +946,33 @@ describe("worker template registry stays in sync (three sources)", () => {
     const webFile = path.resolve(templatesDir, "../../web/src/lib/workerTemplates.ts");
     const names = parseStringList(fs.readFileSync(webFile, "utf8"), /WORKER_TEMPLATES\s*=\s*\[([^\]]*)\]/);
     assert.deepStrictEqual(names, dirNames, "template dirs must equal web WORKER_TEMPLATES");
+  });
+});
+
+describe("worker template Dockerfile group-membership parser", () => {
+  it("detects a forbidden provider-to-worker membership on a continued RUN instruction", () => {
+    const dockerfile = `RUN addgroup -g 10004 codex-session && addgroup worker codex-session && addgroup runner codex-session && \\
+    addgroup runner worker\n`;
+    assert.equal(hasForbiddenProviderWorkerMembership(dockerfile), true);
+  });
+
+  it("does not accept required membership words that occur only in a shell comment", () => {
+    const dockerfile = "RUN addgroup -g 10004 codex-session # addgroup worker codex-session && addgroup runner codex-session\n";
+    assert.equal(hasRequiredSessionGroupMembership(dockerfile), false);
+  });
+
+  it("does not treat a quoted hash as a comment that hides a later forbidden command", () => {
+    const dockerfile = "RUN printf '%s\\n' 'marker # not a comment' && addgroup runner worker\n";
+    assert.equal(hasForbiddenProviderWorkerMembership(dockerfile), true);
+  });
+
+  it("does not split quoted command text on a semicolon", () => {
+    const dockerfile = "RUN printf '%s\\n' 'harmless; addgroup runner worker extra'\n";
+    assert.equal(hasForbiddenProviderWorkerMembership(dockerfile), false);
+  });
+
+  it("detects a continued command-runner membership", () => {
+    const dockerfile = ["RUN addgroup runner-cmd " + String.fromCharCode(92), "    codex-session"].join("\n");
+    assert.equal(hasForbiddenCommandSessionMembership(dockerfile), true);
   });
 });
