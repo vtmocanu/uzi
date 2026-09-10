@@ -182,6 +182,7 @@ func (h *Handler) WorkerCodexRelease(w http.ResponseWriter, r *http.Request) {
 // check (ScopeStartRefresh does not apply) and performs ZERO provider calls.
 func (h *Handler) WorkerCodexRefresh(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
+	routeStart := time.Now()
 	// Start the operation budget at handler entry, before authentication lookups and body
 	// decoding. The coordinated refresh lease and provider sub-deadlines derive from this
 	// context, so pre-provider work cannot silently extend the app-server callback budget.
@@ -216,7 +217,12 @@ func (h *Handler) WorkerCodexRefresh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var svcErr error
+	wroteSuccess := false
+	defer func() { logCodexRouteTiming(opID, routeStart, codexRouteResult(svcErr, wroteSuccess)) }()
+
 	res, err := h.wsvc.CoordinatedCodexRefresh(ctx, wkr, runID, req.Capability, opID, *req.ObservedGeneration)
+	svcErr = err
 	if err != nil {
 		h.writeCodexError(w, "refresh", err)
 		return
@@ -233,6 +239,7 @@ func (h *Handler) WorkerCodexRefresh(w http.ResponseWriter, r *http.Request) {
 		ChatGPTPlanType:  nil,
 		Outcome:          codexRefreshOutcomeString(res.Outcome),
 	})
+	wroteSuccess = true
 }
 
 // writeCodexError maps a service error to its fixed HTTP status + coordinate-free body and
@@ -306,6 +313,35 @@ func codexHTTPError(err error) (int, string) {
 		// text reaches the body; it is the generic 500, logged server-side by writeCodexError.
 		return http.StatusInternalServerError, codexErrInternal
 	}
+}
+
+// codex refresh route-total timing (issue #1238), secret-free. Correlated by the non-secret
+// operation_id; carries only route_total_ms and a finite result. No token/account/error text.
+const codexTimingMsgRoute = "codex refresh route"
+
+// codexRouteResult classifies the route-total outcome from the two handler-known facts at
+// emit time. A returned service error dominates and is classified via CodexTimingResult;
+// otherwise the outcome is "ok" ONLY when the success response write was invoked, so a
+// success-metadata rejection (service err == nil but the handler answered 500) is "error",
+// as is any other post-parse terminal that did not reach the success write. Actual network
+// delivery / a ResponseWriter.Write failure is NOT reflected here — httpx.JSON returns no
+// error, so a partial/failed write after headers are sent is unobservable at this layer.
+func codexRouteResult(serviceErr error, wroteSuccess bool) string {
+	if serviceErr != nil {
+		return workersvc.CodexTimingResult(serviceErr)
+	}
+	if wroteSuccess {
+		return "ok"
+	}
+	return "error"
+}
+
+func logCodexRouteTiming(operationID uuid.UUID, start time.Time, result string) {
+	slog.Info(codexTimingMsgRoute,
+		"operation_id", operationID.String(),
+		"route_total_ms", workersvc.CodexTimingMS(time.Since(start)),
+		"result", result,
+	)
 }
 
 // codexRefreshOutcomeString renders a CoordinatedCodexRefresh outcome as a stable wire
