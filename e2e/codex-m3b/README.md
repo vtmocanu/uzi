@@ -31,8 +31,9 @@ unit-composition proof. Block B and the docker legs are **CI/maintainer-only** b
 require native AMD64 image builds plus a Landlock-capable kernel. The pre-hardening `base`
 and `jvm` images were verified on 2026-09-10 on an OKD cluster: each passed `13/13`
 packaging controls and `13/13` lifecycle tests. The final dedicated-session-group hardening
-adds two packaging controls, so the exact implementation-head rerun targets `15/15`
-packaging and `13/13` lifecycle per image and remains in progress. In-worker image builds can still
+adds two packaging controls, and the credential-binding regression adds one lifecycle test. The
+exact implementation-head rerun targets `15/15` packaging and `14/14` lifecycle per image and
+remains in progress. In-worker image builds can still
 be storage-heavy and arm64 remains unsupported for this proof. Block B stays skipped host-side.
 
 ## The canaries

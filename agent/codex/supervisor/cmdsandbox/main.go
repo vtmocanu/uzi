@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"syscall"
 	"unsafe"
 
@@ -18,6 +19,7 @@ import (
 const (
 	landlockRulePathBeneath = 1
 	landlockVersionFlag     = 1
+	landlockDenyProbe       = "/app/package.json"
 )
 
 var baseRights = uint64(
@@ -35,7 +37,17 @@ var baseRights = uint64(
 		unix.LANDLOCK_ACCESS_FS_MAKE_BLOCK |
 		unix.LANDLOCK_ACCESS_FS_MAKE_SYM)
 
-func main() { os.Exit(realMain(os.Args[1:])) }
+func main() {
+	os.Exit(runOnLockedThread(os.Args[1:], runtime.LockOSThread, realMain))
+}
+
+func runOnLockedThread(args []string, lock func(), run func([]string) int) int {
+	// Landlock ABI 6 restricts only the calling OS thread and its descendants. Pin
+	// this goroutine before any policy setup and never unlock, so Go cannot migrate
+	// it between restrict_self, the deny probe and the child fork/exec.
+	lock()
+	return run(args)
+}
 
 func setupFailure(stage string, err error) int {
 	_, _ = fmt.Fprintf(os.Stderr, "uzi-codex-command-sandbox: %s: %v\n", stage, err)
@@ -88,6 +100,9 @@ func parseArgs(args []string) (root, tmp, cwd string, child []string, err error)
 	if !filepath.IsAbs(root) || !filepath.IsAbs(tmp) || !filepath.IsAbs(cwd) || len(child) == 0 || !filepath.IsAbs(child[0]) {
 		return "", "", "", nil, errors.New("paths must be absolute")
 	}
+	if filepath.Clean(root) == string(filepath.Separator) {
+		return "", "", "", nil, errors.New("root sandbox is forbidden")
+	}
 	rel, relErr := filepath.Rel(root, cwd)
 	if relErr != nil || rel == ".." || (len(rel) >= 3 && rel[:3] == ".."+string(filepath.Separator)) {
 		return "", "", "", nil, errors.New("cwd escapes root")
@@ -134,12 +149,49 @@ func confine(root, tmp string) error {
 	if err := addPathRule(int(fd), tmp, handled); err != nil {
 		return err
 	}
+	if err := requireProbeReadable(landlockDenyProbe, os.Open); err != nil {
+		return err
+	}
 	if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
 		return err
 	}
 	_, _, errno = syscall.Syscall(unix.SYS_LANDLOCK_RESTRICT_SELF, fd, 0, 0)
 	if errno != 0 {
 		return errno
+	}
+	if err := requireProbeDenied(landlockDenyProbe, os.Open); err != nil {
+		return err
+	}
+	return nil
+}
+
+type probeOpen func(string) (*os.File, error)
+
+// requireProbeReadable proves the deny sentinel exists and ordinary DAC/LSM policy
+// allows it before Landlock is applied, so the post-restriction denial is discriminating.
+func requireProbeReadable(path string, open probeOpen) error {
+	file, err := open(path)
+	if err != nil {
+		return errors.New("Landlock deny probe was not readable before restriction")
+	}
+	if err := file.Close(); err != nil {
+		return errors.New("Landlock deny probe could not be closed")
+	}
+	return nil
+}
+
+// requireProbeDenied positively observes that the policy attached to the locked OS
+// thread before any model command is forked. The file is baked, world-readable and
+// outside every allowlist; its pre-restriction check prevents DAC or another LSM from
+// producing a false green.
+func requireProbeDenied(path string, open probeOpen) error {
+	file, err := open(path)
+	if err == nil {
+		_ = file.Close()
+		return errors.New("Landlock deny probe unexpectedly readable")
+	}
+	if !errors.Is(err, os.ErrPermission) {
+		return errors.New("Landlock deny probe returned an unexpected error")
 	}
 	return nil
 }
