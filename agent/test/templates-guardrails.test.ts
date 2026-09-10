@@ -17,88 +17,166 @@ const templatesDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), 
 
 type ShellQuote = "'" | '"';
 
-function splitShellCommands(run: string): string[] {
-  const commands: string[] = [];
-  let current = "";
+interface ShellWord {
+  value: string;
+  quoted: boolean;
+  unquoted: boolean;
+}
+
+interface ShellScan {
+  commands: ShellWord[][];
+  unsupportedOperator: boolean;
+  executableSubstitutionHasAddgroup: boolean;
+}
+
+const unsupportedGroupShellWords = new Set([
+  "if", "then", "elif", "else", "fi", "for", "while", "until", "do", "done",
+  "case", "in", "esac", "select", "function", "{", "}", "!", "[[", "]]",
+]);
+
+function closingCommandSubstitution(text: string, openIndex: number): number | undefined {
+  let depth = 1;
   let quote: ShellQuote | undefined;
   let escaped = false;
+  for (let index = openIndex + 1; index < text.length; index += 1) {
+    const char = text[index]!;
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (char === "\\" && quote !== "'") {
+      escaped = true;
+      continue;
+    }
+    if (quote !== undefined) {
+      if (char === quote) quote = undefined;
+      continue;
+    }
+    if (char === "'" || char === '"') quote = char;
+    else if (char === "(") depth += 1;
+    else if (char === ")" && --depth === 0) return index;
+  }
+  return undefined;
+}
 
-  const finish = (): void => {
-    const command = current.trim();
-    if (command !== "") commands.push(command);
-    current = "";
+function closingBacktick(text: string, openIndex: number): number | undefined {
+  let escaped = false;
+  for (let index = openIndex + 1; index < text.length; index += 1) {
+    const char = text[index]!;
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (char === "\\") escaped = true;
+    else if (char === "`") return index;
+  }
+  return undefined;
+}
+
+function scanHasPotentialAddgroup(scan: ShellScan): boolean {
+  return scan.executableSubstitutionHasAddgroup || scan.commands.some((command) =>
+    command.some((word, index) => word.value === "addgroup" && (index === 0 || word.unquoted)),
+  );
+}
+
+function scanShellCommands(run: string): ShellScan {
+  const commands: ShellWord[][] = [];
+  let words: ShellWord[] = [];
+  let value = "";
+  let wordStarted = false;
+  let quoted = false;
+  let unquoted = false;
+  let quote: ShellQuote | undefined;
+  let escaped = false;
+  let unsupportedOperator = false;
+  let executableSubstitutionHasAddgroup = false;
+
+  const finishWord = (): void => {
+    if (wordStarted) words.push({ value, quoted, unquoted });
+    value = "";
+    wordStarted = false;
+    quoted = false;
+    unquoted = false;
+  };
+  const finishCommand = (): void => {
+    finishWord();
+    if (words.length > 0) commands.push(words);
+    words = [];
   };
 
   for (let index = 0; index < run.length; index += 1) {
     const char = run[index]!;
     if (escaped) {
-      current += char;
+      value += char;
+      wordStarted = true;
+      quoted = true;
       escaped = false;
       continue;
     }
     if (char === "\\" && quote !== "'") {
-      current += char;
       escaped = true;
       continue;
     }
     if (quote !== undefined) {
-      current += char;
       if (char === quote) quote = undefined;
+      else {
+        value += char;
+        wordStarted = true;
+        if (quote === '"' && char === "$" && run[index + 1] === "(") {
+          const close = closingCommandSubstitution(run, index + 1);
+          const body = run.slice(index + 2, close);
+          unsupportedOperator = true;
+          if (scanHasPotentialAddgroup(scanShellCommands(body))) {
+            executableSubstitutionHasAddgroup = true;
+          }
+          if (close !== undefined) {
+            value += run.slice(index + 1, close + 1);
+            index = close;
+          }
+        } else if (quote === '"' && char === "`") {
+          const close = closingBacktick(run, index);
+          const body = run.slice(index + 1, close);
+          unsupportedOperator = true;
+          if (scanHasPotentialAddgroup(scanShellCommands(body))) {
+            executableSubstitutionHasAddgroup = true;
+          }
+          if (close !== undefined) {
+            value += run.slice(index + 1, close + 1);
+            index = close;
+          }
+        }
+      }
       continue;
     }
     if (char === "'" || char === '"') {
       quote = char;
-      current += char;
+      wordStarted = true;
+      quoted = true;
       continue;
     }
-    if (char === "#" && (current === "" || /\s/.test(current.at(-1)!))) break;
+    if (char === "#" && !wordStarted) break;
     const next = run[index + 1];
     if (char === ";" || (char === "&" && next === "&") || (char === "|" && next === "|")) {
-      finish();
+      finishCommand();
       if (char !== ";") index += 1;
       continue;
     }
-    current += char;
+    if (char === "|" || char === "&" || char === "(" || char === ")" || char === "<" || char === ">" || char === "`") {
+      unsupportedOperator = true;
+      finishCommand();
+      continue;
+    }
+    if (/\s/.test(char)) {
+      finishWord();
+      continue;
+    }
+    value += char;
+    wordStarted = true;
+    unquoted = true;
   }
-  finish();
-  return commands;
-}
-
-function shellWords(command: string): string[] {
-  const words: string[] = [];
-  let current = "";
-  let quote: ShellQuote | undefined;
-  let escaped = false;
-
-  const finish = (): void => {
-    if (current !== "") words.push(current);
-    current = "";
-  };
-
-  for (const char of command) {
-    if (escaped) {
-      current += char;
-      escaped = false;
-      continue;
-    }
-    if (char === "\\" && quote !== "'") {
-      escaped = true;
-      continue;
-    }
-    if (quote !== undefined) {
-      if (char === quote) quote = undefined;
-      else current += char;
-      continue;
-    }
-    if (char === "'" || char === '"') {
-      quote = char;
-      continue;
-    }
-    if (/\s/.test(char)) finish();
-    else current += char;
-  }
-  finish();
-  return words;
+  if (quote !== undefined || escaped) unsupportedOperator = true;
+  finishCommand();
+  return { commands, unsupportedOperator, executableSubstitutionHasAddgroup };
 }
 
 function dockerfileLogicalRuns(text: string): string[] {
@@ -128,27 +206,28 @@ function dockerfileLogicalRuns(text: string): string[] {
   return runs;
 }
 
-function dockerfileRunCommands(text: string): string[] {
-  return dockerfileLogicalRuns(text).flatMap((run) => splitShellCommands(run));
-}
-
-const unsupportedGroupShellWords = new Set([
-  "if", "then", "elif", "else", "fi", "for", "while", "until", "do", "done",
-  "case", "in", "esac", "select", "function", "{", "}", "(", ")", "[[", "]]",
-]);
-
 function hasUnsupportedGroupShellSyntax(text: string): boolean {
   return dockerfileLogicalRuns(text).some((run) => {
-    const words = splitShellCommands(run).flatMap((command) => shellWords(command));
-    return words.includes("addgroup") && words.some((word) => unsupportedGroupShellWords.has(word));
+    const scan = scanShellCommands(run);
+    const addgroupIndexes = scan.commands.flatMap((command) =>
+      command.flatMap((word, index) =>
+        (word.value === "addgroup" && (index === 0 || word.unquoted) ? [index] : [])),
+    );
+    if (scan.executableSubstitutionHasAddgroup) return true;
+    if (addgroupIndexes.length === 0) return false;
+    if (scan.unsupportedOperator || addgroupIndexes.some((index) => index !== 0)) return true;
+    return scan.commands.some((command) => {
+      const first = command[0];
+      return first !== undefined && !first.quoted && unsupportedGroupShellWords.has(first.value);
+    });
   });
 }
 
 function hasCommand(text: string, expected: readonly string[]): boolean {
-  return dockerfileRunCommands(text).some((command) => {
-    const words = shellWords(command);
-    return expected.every((word, index) => words[index] === word);
-  });
+  return dockerfileLogicalRuns(text).some((run) =>
+    scanShellCommands(run).commands.some((command) =>
+      expected.every((word, index) => command[index]?.value === word)),
+  );
 }
 
 function hasRequiredSessionGroupMembership(text: string): boolean {
@@ -995,5 +1074,38 @@ describe("worker template Dockerfile group-membership parser", () => {
   it("detects a forbidden provider membership nested in compound shell syntax", () => {
     const dockerfile = "RUN if true; then addgroup runner worker; fi\n";
     assert.equal(hasForbiddenProviderWorkerMembership(dockerfile), true);
+  });
+
+  it("detects forbidden provider membership inside a subshell", () => {
+    assert.equal(hasForbiddenProviderWorkerMembership("RUN (addgroup runner worker)\n"), true);
+  });
+
+  it("detects a negated forbidden provider membership", () => {
+    assert.equal(hasForbiddenProviderWorkerMembership("RUN ! addgroup runner worker\n"), true);
+  });
+
+  it("detects forbidden provider membership on the right side of a pipeline", () => {
+    assert.equal(hasForbiddenProviderWorkerMembership("RUN true | addgroup runner worker\n"), true);
+  });
+
+  it("does not treat a quoted reserved word as compound syntax", () => {
+    const dockerfile = "RUN printf '%s' 'if' && addgroup -g 10004 codex-session && addgroup worker codex-session && addgroup runner codex-session\n";
+    assert.equal(hasForbiddenProviderWorkerMembership(dockerfile), false);
+    assert.equal(hasRequiredSessionGroupMembership(dockerfile), true);
+  });
+
+  it("detects forbidden provider membership inside a quoted command substitution", () => {
+    const dockerfile = `RUN printf '%s' "$(addgroup runner worker)"\n`;
+    assert.equal(hasForbiddenProviderWorkerMembership(dockerfile), true);
+  });
+
+  it("detects forbidden provider membership inside a quoted backtick substitution", () => {
+    const dockerfile = "RUN printf '%s' \"`addgroup runner worker`\"\n";
+    assert.equal(hasForbiddenProviderWorkerMembership(dockerfile), true);
+  });
+
+  it("does not treat a fully quoted addgroup argument as executable", () => {
+    const dockerfile = "RUN printf '%s' 'addgroup'\n";
+    assert.equal(hasForbiddenProviderWorkerMembership(dockerfile), false);
   });
 });
