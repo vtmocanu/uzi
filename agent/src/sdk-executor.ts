@@ -2072,9 +2072,13 @@ export class SdkExecutor implements Executor {
           // (PRD #390 M1's no-signal invariant, enforced here on the executor side).
           progressMissedLastTurn = false;
           consecutiveMisses = 0;
+          // PRD #1224 M1: the milestone just finished, so its per-milestone agent
+          // attribution is stale. Clear it alongside the in_progress reset (set to []) so
+          // the next running report carries an empty attribution, matching the cleared
+          // in_progress; a fresh dispatch declares a new mapping next turn.
           latestProgress =
             latestProgress && latestProgress.completed.length > 0
-              ? { completed: latestProgress.completed, in_progress: [] }
+              ? { completed: latestProgress.completed, in_progress: [], milestones_agents: [] }
               : undefined;
           resetStallState(); // a cooperative checkpoint is progress → breaks any refusal streak
           continue;
