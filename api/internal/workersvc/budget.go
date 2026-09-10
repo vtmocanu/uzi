@@ -15,4 +15,12 @@ const (
 	// derived timeout, independent of milestone count — the second half of the hard
 	// ceiling the count cap gives (Risks). 8 * 60 * 60 = 28800.
 	budgetWallCeilingSeconds = 8 * 60 * 60
+	// sizeBudgetFactorL floors the per-run budget for a LARGE-repo run (size_class='l')
+	// that froze 0 or 1 milestones — otherwise it would drop to the global default
+	// (RUN_MAX_ITERATIONS=5 / RUN_TIMEOUT=2h). The freeze CASE multiplies the base
+	// iteration/wall budget by this factor only in the count<=1 arm; 's'/'m'/'' stay NULL
+	// (unchanged). Chosen so an 'l' run floors to run_max_iterations*5 (=25 by default) and
+	// LEAST(run_timeout*5, budgetWallCeilingSeconds) (=8h), matching what the milestone-count
+	// path gives a ~5-milestone run. See runtime.sql CreateApprovePlanInput / SetRunRunning.
+	sizeBudgetFactorL = 5
 )

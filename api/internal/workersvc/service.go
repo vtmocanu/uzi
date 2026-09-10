@@ -2136,6 +2136,7 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		runningParams.RunMaxIterations = int32(s.p.RunMaxIterations) //nolint:gosec // G115: RunMaxIterations is a small bounded config int (env RUN_MAX_ITERATIONS), never near int32 range
 		runningParams.RunTimeoutSeconds = int32(s.p.RunTimeout.Seconds())
 		runningParams.MilestoneBudgetCap = milestoneBudgetCap
+		runningParams.SizeBudgetFactorL = sizeBudgetFactorL
 		runningParams.BudgetWallCeilingSeconds = budgetWallCeilingSeconds
 		// PRD #84 M4: an AUTOPILOT run auto-approves its own plan and NEVER reports
 		// awaiting_approval, so it rides the plan-time INFERRED requirement set on this
