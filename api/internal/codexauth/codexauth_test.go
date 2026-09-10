@@ -274,10 +274,11 @@ func TestDiscoverIdentityAccountIDFromTokenClaim(t *testing.T) {
 	}
 }
 
-// Precedence + lazy parse: a NON-empty account_id in the usage response wins, and the
-// token is not parsed at all — proven by a deliberately malformed bearer still yielding
-// the response's account id rather than an error.
-func TestDiscoverIdentityResponseAccountIDTakesPrecedence(t *testing.T) {
+// Lazy parse: when the usage response carries account_id, a deliberately malformed
+// bearer is tolerated (never required to be a valid JWT) — the token is consulted only
+// on the empty-account_id fallback path. This pins tolerance, not precedence order; the
+// discriminating precedence assertion is TestDiscoverIdentityResponseAccountIDBeatsTokenClaim.
+func TestDiscoverIdentityResponseAccountIDToleratesMalformedToken(t *testing.T) {
 	tr := newCountingTransport(func(key string, _ *http.Request) (*http.Response, error) {
 		if key != usageKey {
 			t.Errorf("unexpected endpoint hit: %s", key)
@@ -294,7 +295,30 @@ func TestDiscoverIdentityResponseAccountIDTakesPrecedence(t *testing.T) {
 		t.Fatalf("ProviderUserID = %q, want user-abc", id.ProviderUserID)
 	}
 	if id.WorkspaceAccountID != "acct-from-usage" {
-		t.Fatalf("WorkspaceAccountID = %q, want acct-from-usage (response must win, malformed token never parsed)", id.WorkspaceAccountID)
+		t.Fatalf("WorkspaceAccountID = %q, want acct-from-usage (a malformed token must not error the account_id-present path)", id.WorkspaceAccountID)
+	}
+}
+
+// Precedence order (security-relevant): the provider-verified /wham/usage account_id must
+// win over the caller-supplied JWT claim. A VALID token carrying a DIFFERENT account id
+// discriminates this from "token wins" — the response value must be the one returned, so a
+// future flip to trusting the claim over the provider read is caught here.
+func TestDiscoverIdentityResponseAccountIDBeatsTokenClaim(t *testing.T) {
+	token := jwtWithAccountID(t, "acct-from-token-should-lose")
+	tr := newCountingTransport(func(key string, _ *http.Request) (*http.Response, error) {
+		if key != usageKey {
+			t.Errorf("unexpected endpoint hit: %s", key)
+		}
+		return jsonResponse(http.StatusOK, `{"user_id":"user-abc","account_id":"acct-from-usage"}`), nil
+	})
+	c := newTestClient(tr)
+
+	id, err := c.DiscoverIdentity(context.Background(), token)
+	if err != nil {
+		t.Fatalf("DiscoverIdentity: %v", err)
+	}
+	if id.WorkspaceAccountID != "acct-from-usage" {
+		t.Fatalf("WorkspaceAccountID = %q, want acct-from-usage (provider-verified response must beat the JWT claim)", id.WorkspaceAccountID)
 	}
 }
 
