@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import {
   CodexCallbackBroker,
+  canonicalizeCodexToolName,
   MAX_ID_BYTES,
   MAX_TOOL_NAME_BYTES,
   type CallbackResult,
@@ -530,6 +531,13 @@ describe("CodexCallbackBroker: delegation", () => {
 });
 
 describe("CodexCallbackBroker: MCP / skills pass-through", () => {
+  it("maps native-colliding app-server wire names back to canonical worker authority", () => {
+    assert.equal(canonicalizeCodexToolName("uzi_bash"), "Bash");
+    assert.equal(canonicalizeCodexToolName("uzi_apply_patch"), "apply_patch");
+    assert.equal(canonicalizeCodexToolName("uzi_read"), "Read");
+    assert.equal(canonicalizeCodexToolName("uzi_skill"), "Skill");
+  });
+
   it("routes an allowed MCP tool to its injected handler", async () => {
     const handlers = new Map([["mcp__memory__store", async () => ({ stored: true })]]);
     const h = makeBroker({
@@ -539,6 +547,17 @@ describe("CodexCallbackBroker: MCP / skills pass-through", () => {
     const r = await h.broker.handleToolCall(rt(), "mcp__memory__store", { note: "x" }, "root");
     assert.equal(r.ok, true);
     if (r.ok) assert.deepEqual(r.output, { stored: true });
+  });
+
+  it("maps a fixed app-server-safe MCP wire alias back to the canonical granted handler", async () => {
+    const canonical = "mcp__forge__get_issue";
+    const handlers = new Map([[canonical, async () => ({ issue: true })]]);
+    const h = makeBroker({
+      grants: grants({ allowedTools: new Set([canonical]) }),
+      toolHandlers: handlers,
+    });
+    const r = await h.broker.handleToolCall(rt(), "uzi_forge_get_issue", { iid: 1 }, "root");
+    assert.deepEqual(r, { ok: true, output: { issue: true } });
   });
 
   it("denies an allowed MCP tool with no wired handler", async () => {

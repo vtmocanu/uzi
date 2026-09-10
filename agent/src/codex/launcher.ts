@@ -30,6 +30,7 @@
 // mint a run-level permit or `observed_empty`.
 
 import { spawn, spawnSync } from "node:child_process";
+import { lstatSync } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
 import type { Readable, Writable } from "node:stream";
@@ -45,9 +46,11 @@ import {
 import {
   assertNoUnexpectedSystemConfig as defaultAssertNoUnexpectedSystemConfig,
   buildCodexConfigToml,
+  buildCodexLoopbackTestConfigToml,
   buildCodexProductionConfigToml,
 } from "./config.js";
 import type { CodexAppServerAuthMode } from "./appserver-auth.js";
+import { SESSION_SEED_ENTRYPOINT } from "./session-seed-cli.js";
 
 // ─── Bounds (fixture-derived; supervisor-side limits are matched, not trusted) ────
 const MAX_EVIDENCE_LINES = 256;
@@ -86,7 +89,9 @@ export interface CodexLaunchProvider {
 
 export interface CodexLaunchSpec {
   /** A RUNNER-WRITABLE root, OUTSIDE the target repo, under which fresh per-launch
-   *  HOME/CODEX_HOME/XDG/TMPDIR trees are created runner-owned mode 0700. */
+   * HOME/CODEX_HOME/XDG/TMPDIR trees are created runner-owned mode 0700. Managed-auth
+   * provider roots add only worker-group traverse on the root and CODEX_HOME, plus
+   * read access on CODEX_HOME/sessions, so the worker can persist that safe subset. */
   readonly ownedDataRoot: string;
   readonly provider: CodexLaunchProvider;
   readonly model: string;
@@ -112,6 +117,9 @@ export interface CodexLaunchSpec {
   /** The immutable app-server auth mode, REQUIRED when {@link useAppServerAuth} is set (the
    *  production config builder forces an explicit no-fallback choice). Ignored otherwise. */
   readonly authMode?: CodexAppServerAuthMode;
+  /** Managed-auth resume only: copy the executor's deterministic, credential-free
+   * sibling staging tree into the runner-owned sessions directory before spawn. */
+  readonly seedSession?: boolean;
 }
 
 /** The privileged step that creates the runner-owned trees + writes the config. The
@@ -122,9 +130,20 @@ export interface RunnerTreeRequest {
   readonly kind: CodexRootKind;
   readonly root: string;
   readonly dirs: readonly string[];
+  /** Narrow managed-auth session export path. The worker may traverse root/codexHome
+   * and read sessionDir, but cannot list either parent. */
+  readonly sharedSessionRead?: {
+    readonly gid: number;
+    readonly codexHome: string;
+    readonly sessionDir: string;
+  };
+  /** Deterministic credential-free staging source, copied as the provider runner
+   * after final tree provisioning and before the app-server process is spawned. */
+  readonly sessionSeedDir?: string;
   readonly files: readonly { readonly path: string; readonly content: string; readonly mode: number }[];
 }
 export type MakeRunnerTrees = (request: RunnerTreeRequest) => void;
+export type RemoveRunnerTree = (request: Pick<RunnerTreeRequest, "uid" | "kind" | "root">) => void;
 
 /** The minimal supervisor-process surface the launcher uses. Node's `ChildProcess`
  *  satisfies it structurally; the unit tests inject a fake that does too. */
@@ -160,10 +179,19 @@ export interface LauncherDeps {
   readonly resolveCommandUid?: () => number;
   readonly resolveWorkerUid?: () => number;
   readonly makeRunnerTrees?: MakeRunnerTrees;
+  /** Remove the runner-owned launch tree after, and only after, its supervisor
+   * proves a drained disposal. Tests inject this alongside makeRunnerTrees. */
+  readonly removeRunnerTree?: RemoveRunnerTree;
+  /** Static, path-free diagnostic for a best-effort tree-removal failure. */
+  readonly reportRunnerTreeCleanupFailure?: () => void;
   readonly spawnSupervisor?: SpawnSupervisor;
   readonly assertNoUnexpectedSystemConfig?: (etcCodexDir?: string) => void;
   readonly etcCodexDir?: string;
   readonly deadlines?: Partial<LauncherDeadlines>;
+  /** M3b-only authenticated custom-provider redirect. The alternate builder accepts
+   * only a credential-free literal loopback URL and disables WebSockets; production
+   * leaves this absent and therefore emits the fixed vendor config byte-for-byte. */
+  readonly appServerAuthOpenAIBaseUrlForTest?: string;
 }
 
 // ─── Evidence frame shapes (READ from fd4; we do not invent fields) ─────────────
@@ -241,9 +269,10 @@ function defaultResolveRunnerUid(): number {
   return uid;
 }
 
-/** Default privileged provisioning: create the dirs 0700 and write the config file,
- *  ALL as the runner uid via setpriv (`runnerCommand`), never chown. File content is
- *  fed on stdin so it is never embedded in an argv. Not exercised by unit tests. */
+/** Default privileged provisioning: create the dirs as the runner uid via setpriv
+ * (`runnerCommand`) and write the config 0600, never chown. Trees stay 0700 except
+ * for the narrow managed-auth session export posture on RunnerTreeRequest.
+ * File content is fed on stdin so it is never embedded in an argv. */
 function defaultMakeRunnerTrees(request: RunnerTreeRequest): void {
   // The helper itself runs as the shared runner uid, so it must not inherit the worker
   // process environment: another concurrent runner can read a normal helper process via
@@ -258,6 +287,40 @@ function defaultMakeRunnerTrees(request: RunnerTreeRequest): void {
   const r = spawnSync(mk.command, mk.args, { env: provisionEnv, stdio: ["ignore", "ignore", "pipe"] });
   if (r.status !== 0) throw new Error(`runner-owned tree creation failed (exit ${String(r.status)}): ${String(r.stderr)}`);
   try {
+    const shared = request.sharedSessionRead;
+    if (shared !== undefined) {
+      const share = wrap("/bin/sh", [
+        "-ceu",
+        `root="$1"; codex="$2"; sessions="$3"; uid="$4"; gid="$5"; chgrp "$gid" "$root" "$codex"; chmod 710 "$root" "$codex"; mkdir -m 2750 -- "$sessions"; chgrp "$gid" "$sessions"; chmod 2750 "$sessions"; [ "$(stat -c %u "$root")" = "$uid" ] && [ "$(stat -c %g "$root")" = "$gid" ] && [ "$(stat -c %a "$root")" = 710 ] && [ "$(stat -c %u "$codex")" = "$uid" ] && [ "$(stat -c %g "$codex")" = "$gid" ] && [ "$(stat -c %a "$codex")" = 710 ] && [ "$(stat -c %u "$sessions")" = "$uid" ] && [ "$(stat -c %g "$sessions")" = "$gid" ] && [ "$(stat -c %a "$sessions")" = 2750 ]`,
+        "sh", request.root, shared.codexHome, shared.sessionDir, String(request.uid), String(shared.gid),
+      ]);
+      const sr = spawnSync(share.command, share.args, { env: provisionEnv, stdio: ["ignore", "ignore", "pipe"] });
+      if (sr.status !== 0) {
+        throw new Error(`runner-owned session export posture failed (exit ${String(sr.status)}): ${String(sr.stderr)}`);
+      }
+    }
+    if (request.sessionSeedDir !== undefined) {
+      if (shared === undefined || request.kind !== "provider") {
+        throw new Error("runner-owned session seed requires a managed-auth provider tree");
+      }
+      const seed = wrap("/app/node_modules/.bin/tsx", [
+        SESSION_SEED_ENTRYPOINT,
+        request.sessionSeedDir,
+        shared.sessionDir,
+      ]);
+      const seeded = spawnSync(seed.command, seed.args, {
+        env: {
+          PATH: "/usr/local/bin:/usr/bin:/bin",
+          LANG: "C",
+          HOME: join(request.root, "home"),
+          TMPDIR: join(request.root, "tmp"),
+        },
+        stdio: ["ignore", "ignore", "pipe"],
+      });
+      if (seeded.status !== 0) {
+        throw new Error(`runner-owned session seed failed (exit ${String(seeded.status)})`);
+      }
+    }
     for (const file of request.files) {
       const octal = (file.mode & 0o777).toString(8).padStart(3, "0");
       const w = wrap("/bin/sh", ["-ceu", `umask 077; cat > "$1"; chmod ${octal} "$1"; [ "$(stat -c %u "$1")" = "$2" ] && [ "$(stat -c %a "$1")" = ${octal} ]`, "sh", file.path, String(request.uid)]);
@@ -269,6 +332,64 @@ function defaultMakeRunnerTrees(request: RunnerTreeRequest): void {
     spawnSync(rm.command, rm.args, { env: provisionEnv, stdio: "ignore" });
     throw error;
   }
+}
+
+/** Remove one private launch tree as the identity that owns it. The caller has
+ * already validated the immutable launch spec; re-check the destructive target
+ * here so a future caller cannot turn this helper into a broad delete. */
+function defaultRemoveRunnerTree(request: Pick<RunnerTreeRequest, "uid" | "kind" | "root">): void {
+  if (!isAbsolute(request.root) || resolve(request.root) === sep || resolve(request.root) !== request.root) {
+    throw new Error("refusing to remove a non-canonical owned data root");
+  }
+  const stat = lstatSync(request.root, { throwIfNoEntry: false });
+  if (stat === undefined) return;
+  if (stat.isSymbolicLink() || !stat.isDirectory() || stat.uid !== request.uid) {
+    throw new Error("refusing to remove an unexpected owned data root");
+  }
+  const wrap = request.kind === "command" ? commandRootCommand : runnerCommand;
+  const rm = wrap("/bin/rm", ["-rf", "--", request.root]);
+  const cleanupEnv: NodeJS.ProcessEnv = { PATH: "/usr/bin:/bin", LANG: "C" };
+  const result = spawnSync(rm.command, rm.args, { env: cleanupEnv, stdio: ["ignore", "ignore", "pipe"] });
+  if (result.status !== 0) {
+    throw new Error(`runner-owned tree removal failed (exit ${String(result.status)}): ${String(result.stderr)}`);
+  }
+}
+
+/** Bind the runner-owned tree to the same proven lifecycle as its supervisor.
+ * A failed/unconfirmed disposal leaves the tree intact for forensic recovery;
+ * a repeated clean dispose never repeats a successful removal. */
+function withOwnedTreeCleanup(
+  handle: CodexRootHandle,
+  request: Pick<RunnerTreeRequest, "uid" | "kind" | "root">,
+  remove: RemoveRunnerTree,
+  reportFailure: () => void,
+): CodexRootHandle {
+  let removed = false;
+  return {
+    started: handle.started,
+    supervisorPid: handle.supervisorPid,
+    transport: handle.transport,
+    snapshot: (timeoutMs) => handle.snapshot(timeoutMs),
+    waitChild: (timeoutMs) => handle.waitChild(timeoutMs),
+    dispose: async (timeoutMs) => {
+      const outcome = await handle.dispose(timeoutMs);
+      if (outcome.clean && !removed) {
+        // Disposal evidence and disk reclamation are different facts. Once the
+        // supervisor proved ECHILD+__WALL and exited 0, a filesystem anomaly must
+        // retain the tree for inspection, not rewrite that clean process result or
+        // prevent sibling roots from being reaped by the aggregate boundary.
+        removed = true;
+        try {
+          remove(request);
+        } catch {
+          try { reportFailure(); } catch { /* diagnostics never replace lifecycle evidence */ }
+        }
+      }
+      return outcome;
+    },
+    get failed() { return handle.failed; },
+    whenFailed: handle.whenFailed,
+  };
 }
 
 const defaultSpawnSupervisor: SpawnSupervisor = (command, args, options) =>
@@ -311,8 +432,8 @@ function pathsOverlap(a: string, b: string): boolean {
 /** Validate the trusted construction contract for every caller, not only the JSON CLI. */
 function validateLaunchContract(spec: CodexLaunchSpec): void {
   if (spec.kind !== "provider" && spec.kind !== "command") throw new Error("kind must be provider or command");
-  if (!isAbsolute(spec.ownedDataRoot) || resolve(spec.ownedDataRoot) === sep) {
-    throw new Error("ownedDataRoot must be an absolute non-root path");
+  if (!isAbsolute(spec.ownedDataRoot) || resolve(spec.ownedDataRoot) === sep || resolve(spec.ownedDataRoot) !== spec.ownedDataRoot) {
+    throw new Error("ownedDataRoot must be a canonical absolute non-root path");
   }
   if (!isAbsolute(spec.cwd)) throw new Error("cwd must be an absolute path");
   if (pathsOverlap(spec.ownedDataRoot, spec.cwd)) {
@@ -403,6 +524,12 @@ export async function launchCodexRoot(spec: CodexLaunchSpec, deps: LauncherDeps 
   }
 
   validateLaunchContract(spec);
+  if (deps.appServerAuthOpenAIBaseUrlForTest !== undefined && !spec.useAppServerAuth) {
+    throw new Error("Codex loopback test base URL requires app-server auth");
+  }
+  if (spec.seedSession && (spec.kind !== "provider" || !spec.useAppServerAuth)) {
+    throw new Error("Codex session seeding requires a managed-auth provider root");
+  }
 
   // Resolve the intended runner uid <N> for --expect-uid and the runner-owned trees.
   const uid = spec.kind === "command"
@@ -413,13 +540,16 @@ export async function launchCodexRoot(spec: CodexLaunchSpec, deps: LauncherDeps 
   // 2. Reject unexpected system config (a fresh HOME does not neutralize /etc/codex).
   (deps.assertNoUnexpectedSystemConfig ?? defaultAssertNoUnexpectedSystemConfig)(deps.etcCodexDir);
 
-  // 3. Fresh per-launch trees, created RUNNER-OWNED 0700 via the injectable step.
+  // 3. Fresh per-launch trees, runner-owned via the injectable step. Managed auth adds
+  // only the trusted worker's traverse/read path to the credential-free sessions subtree.
   const trees = deriveOwnedTrees(spec.ownedDataRoot);
   const configPath = join(trees.codexHome, "config.toml");
+  const sessionSeedDir = join(`${spec.ownedDataRoot}.session-seed`, "sessions");
   // 4. config.toml (native-off; canonical project untrusted), written 0600 as runner. An
   //    app-server-auth provider root emits the PRODUCTION config (the built-in `openai`
-  //    provider, no re-declared table that would bypass the login); every other root keeps
-  //    the transitional env-key config, byte-identical to before this seam.
+  //    provider, no re-declared table that would bypass the login). The explicit M3b-only
+  //    dependency instead emits its authenticated HTTP loopback provider. Every other root
+  //    keeps the transitional env-key config, byte-identical to before this seam.
   let configText: string;
   if (spec.useAppServerAuth) {
     // validateLaunchContract already refused an absent/invalid authMode; re-narrow for the
@@ -428,7 +558,10 @@ export async function launchCodexRoot(spec: CodexLaunchSpec, deps: LauncherDeps 
     if (authMode !== "subscription" && authMode !== "api_key") {
       throw new Error("app-server auth requires an explicit subscription or api_key mode");
     }
-    configText = buildCodexProductionConfigToml({ model: spec.model, projectPath: spec.cwd, authMode });
+    const configOpts = { model: spec.model, projectPath: spec.cwd, authMode };
+    configText = deps.appServerAuthOpenAIBaseUrlForTest === undefined
+      ? buildCodexProductionConfigToml(configOpts)
+      : buildCodexLoopbackTestConfigToml(configOpts, deps.appServerAuthOpenAIBaseUrlForTest);
   } else {
     configText = buildCodexConfigToml({
       model: spec.model,
@@ -441,6 +574,16 @@ export async function launchCodexRoot(spec: CodexLaunchSpec, deps: LauncherDeps 
     kind: spec.kind,
     root: spec.ownedDataRoot,
     dirs: trees.all,
+    ...(spec.kind === "provider" && spec.useAppServerAuth
+      ? {
+          sharedSessionRead: {
+            gid: WORKER_UID,
+            codexHome: trees.codexHome,
+            sessionDir: join(trees.codexHome, "sessions"),
+          },
+        }
+      : {}),
+    ...(spec.seedSession ? { sessionSeedDir } : {}),
     files: [{ path: configPath, content: configText, mode: 0o600 }],
   });
 
@@ -461,7 +604,14 @@ export async function launchCodexRoot(spec: CodexLaunchSpec, deps: LauncherDeps 
   });
 
   // 7. Parse evidence (bounded), await `started`, expose snapshot/dispose + transport.
-  return createHandle(child, uid, { ...DEFAULT_DEADLINES, ...deps.deadlines }, spec.kind);
+  const handle = await createHandle(child, uid, { ...DEFAULT_DEADLINES, ...deps.deadlines }, spec.kind);
+  return withOwnedTreeCleanup(
+    handle,
+    { uid, kind: spec.kind, root: spec.ownedDataRoot },
+    deps.removeRunnerTree ?? defaultRemoveRunnerTree,
+    deps.reportRunnerTreeCleanupFailure
+      ?? (() => process.stderr.write("codex runner-owned tree cleanup failed; retaining the tree\n")),
+  );
 }
 
 /** A generic supervised effect launch. Unlike {@link launchCodexRoot}, it creates

@@ -36,6 +36,7 @@
 #   UZI_M3B_IMAGE        worker image tag to build/run     (default: uzi-agent-m3b:base)
 #   UZI_M3B_DOCKERFILE   worker Dockerfile to build        (default: agent/templates/base/Dockerfile)
 #   UZI_M3B_SKIP_BUILD   set to 1 to reuse an existing worker image (skip docker build)
+#   UZI_M3B_BUILD_NETWORK optional build-step network: default, host, or none (runtime unchanged)
 #   UZI_M3B_TEST_TIMEOUT outer watchdog seconds            (default: 600)
 #   CDR_M3B_PG_IMAGE     throwaway Postgres image          (default: postgres:17)
 #   CDR_M3B_API_PORT     port the api container binds/advertises (default: 8080)
@@ -48,6 +49,8 @@ DOCKERFILE="${UZI_M3B_DOCKERFILE:-agent/templates/base/Dockerfile}"
 TIMEOUT="${UZI_M3B_TEST_TIMEOUT:-600}"
 PG_IMAGE="${CDR_M3B_PG_IMAGE:-postgres:17}"
 API_PORT="${CDR_M3B_API_PORT:-8080}"
+BUILD_NETWORK="${UZI_M3B_BUILD_NETWORK:-}"
+BUILD_NETWORK_ARGS=()
 
 # Every throwaway resource carries the PID suffix and is OUTSIDE the uzi- namespace.
 CONTROLS_NAME="codex-m3b-controls-$$"
@@ -59,6 +62,15 @@ API_IMAGE="cdr-m3b-api-img-$$:local"
 LIFECYCLE_OUT="$HERE/lifecycle-run.$$.log"
 
 log() { printf '\n### %s\n' "$*"; }
+
+case "$BUILD_NETWORK" in
+  "") ;;
+  default|host|none) BUILD_NETWORK_ARGS=(--network "$BUILD_NETWORK") ;;
+  *)
+    log "FAILURE: UZI_M3B_BUILD_NETWORK must be default, host, or none"
+    exit 1
+    ;;
+esac
 
 if [ "$(uname -m)" != "x86_64" ]; then
   log "FAILURE: packaged lifecycle requires a native x86_64 host"
@@ -90,7 +102,7 @@ if [ "${UZI_M3B_SKIP_BUILD:-}" = "1" ]; then
   log "UZI_M3B_SKIP_BUILD=1 — reusing existing worker image $IMAGE"
 else
   log "building worker image $IMAGE from $DOCKERFILE (several minutes on a cold cache)"
-  DOCKER_BUILDKIT=1 docker build -f "$REPO/$DOCKERFILE" -t "$IMAGE" \
+  DOCKER_BUILDKIT=1 docker build "${BUILD_NETWORK_ARGS[@]}" -f "$REPO/$DOCKERFILE" -t "$IMAGE" \
     --build-arg "UZI_SRC_SHA=$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)" "$REPO"
 fi
 require_linux_amd64_image "$IMAGE"
@@ -148,7 +160,7 @@ fi
 #    on stdout (all diagnostics go to stderr), which we read back from its logs.
 ADVERTISE="http://${API_NAME}:${API_PORT}"
 log "building test-server image $API_IMAGE from e2e/codex-m3b/testserver.Dockerfile"
-DOCKER_BUILDKIT=1 docker build -f "$HERE/testserver.Dockerfile" -t "$API_IMAGE" "$REPO/api"
+DOCKER_BUILDKIT=1 docker build "${BUILD_NETWORK_ARGS[@]}" -f "$HERE/testserver.Dockerfile" -t "$API_IMAGE" "$REPO/api"
 require_linux_amd64_image "$API_IMAGE"
 log "starting test server $API_NAME on $NET (bind 0.0.0.0:$API_PORT, advertise $ADVERTISE)"
 docker run -d --name "$API_NAME" --network "$NET" \
@@ -201,7 +213,7 @@ if ! CONTRACT_FIELDS="$(read_contract)"; then
   exit 1
 fi
 {
-  IFS= read -r WORKER_BASE_URL
+  IFS= read -r CONTRACT_BASE_URL
   IFS= read -r WORKER_TOKEN
   IFS= read -r SUB_RUN_ID
   IFS= read -r SUB_CAP
@@ -212,7 +224,19 @@ fi
 } <<EOF
 $CONTRACT_FIELDS
 EOF
-log "server up; contract base_url=$WORKER_BASE_URL sub_run=$SUB_RUN_ID api_run=$APIKEY_RUN_ID"
+
+# Use the exact address Docker assigned on this owned internal network. Nested Docker under
+# Kubernetes can provide working container-to-container routing while its embedded DNS is
+# unavailable; advertising the container name then makes Node's WorkerClient fail before any
+# Codex request. The API container has exactly one network attachment, and the lifecycle worker
+# joins that same internal no-egress network below. Never print the ephemeral address.
+API_IP="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$API_NAME")"
+if [ -z "$API_IP" ]; then
+  log "FAILURE: test server has no address on the owned internal network"
+  exit 1
+fi
+WORKER_BASE_URL="http://${API_IP}:${API_PORT}"
+log "server up; contract origin=$CONTRACT_BASE_URL; internal worker route resolved; sub_run=$SUB_RUN_ID api_run=$APIKEY_RUN_ID"
 
 # 6. The lifecycle suite — CONFINEMENT posture, but on the INTERNAL network (loopback fake provider
 #    inside the container; the network reaches only api+PG). CODEX_M3B_SRC pins the packaged

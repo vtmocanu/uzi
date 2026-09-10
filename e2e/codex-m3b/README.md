@@ -27,11 +27,11 @@ same posture and the frozen M0 protocol helpers.
 
 Block A is the **in-worker-validated** security proof; run in-image (`CODEX_M3B_SRC=/app/src`)
 the *same* tests load the baked `/app/src` adapter, so it doubles as the packaged
-unit-composition proof. Block B and the docker legs are **CI/maintainer-only**: in-worker image
-builds are storage-flaky and arm64 is blocked, and the exact real app-server item framing is
-still unconfirmed (`agent/src/codex/codex-harness.ts` marks the item types provisional and to be
-confirmed here). Block B is therefore authored best-effort and **🔴 maintainer-verified**; it is
-skipped host-side.
+unit-composition proof. Block B and the docker legs are **CI/maintainer-only** because they
+require native AMD64 image builds plus a Landlock-capable kernel. They were verified on
+2026-09-10 in both `base` and `jvm` worker images on an OKD cluster: each image passed
+`13/13` packaging controls and `13/13` lifecycle tests. In-worker image builds can still
+be storage-heavy and arm64 remains unsupported for this proof. Block B stays skipped host-side.
 
 ## The canaries
 
@@ -59,6 +59,9 @@ cd agent && node --import tsx --test ../e2e/codex-m3b/lifecycle.test.ts   # Bloc
 
 # CI/maintainer (docker; both images):
 UZI_CODEX_M3B_PACKAGED=1 task test:codex-m3b:packaged
+
+# Nested Docker only, when bridge-networked build steps have no egress:
+UZI_CODEX_M3B_PACKAGED=1 UZI_M3B_BUILD_NETWORK=host task test:codex-m3b:packaged
 ```
 
 `test:codex-m3b:packaged` runs the host `tsc` (always) and, when `UZI_CODEX_M3B_PACKAGED=1` is
@@ -74,6 +77,11 @@ bounded by an outer `timeout --kill-after` watchdog and asserts the positive per
 provider+command roots / checkpoints / signals / refresh advance+replay / finalization, api_key
 refresh == 0). All throwaway containers/network/image are named outside the `uzi-` namespace and
 torn down by exact name.
+
+`UZI_M3B_BUILD_NETWORK` controls only Dockerfile `RUN` steps. It accepts `default`, `host`, or
+`none`, and is unset by default. The `host` option is for nested Docker environments whose bridge
+network cannot reach package mirrors; it does not change the lifecycle containers, which still run
+on the purpose-built internal no-egress network described above.
 
 NOTE: the both-image docker EXECUTION is a CI/maintainer step — in-worker image builds are
 storage-flaky (they can fail with `No space left on device` building the nix/devbox toolchain), so

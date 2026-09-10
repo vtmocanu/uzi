@@ -226,6 +226,7 @@ describe("CodexDelegationRunner: happy path + honest attribution", () => {
     // The child ran on its OWN honest prompt/model/task, not the parent's.
     assert.equal(b.startSpecs.length, 1);
     assert.equal(b.startSpecs[0]!.role, "coder");
+    assert.equal(b.startSpecs[0]!.grants.isRoot, false, "the child thread receives only its immutable child grants");
     assert.equal(b.startSpecs[0]!.taskInput, "do the task");
     assert.equal(b.startSpecs[0]!.model, "gpt-6-astra");
     assert.deepEqual(b.startSpecs[0]!.parent, { threadId: "root-thread", turnId: "root-turn", callId: "root-call" });

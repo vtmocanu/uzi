@@ -22,21 +22,22 @@
 //     packaged executor through the REAL launcher → real static supervisor → real Codex →
 //     loopback fake provider (fake-provider.ts) under `--network none`, proving the baked
 //     supervisor + fileop binaries and the launch wiring, and re-asserting the canary boundary
-//     against the REAL process surface. It is 🔴 MAINTAINER-VERIFIED (in-worker image builds
-//     are storage-flaky / arm64-blocked, and the real app-server item framing is unconfirmed);
-//     it is SKIPPED host-side.
+//     against the REAL process surface. VERIFIED 2026-09-10 in both native AMD64 worker
+//     images on a Landlock-capable OKD cluster; it remains SKIPPED host-side.
 
 import { before, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import nodePath from "node:path";
 import { PassThrough } from "node:stream";
 
 import {
   loadPackagedCodexExecutor,
+  loadPackagedSessionState,
   loadPackagedSelect,
   type CodexExecutorModule,
+  type SessionStateModule,
   type SelectModule,
 } from "./packaged-modules.js";
 import { codexCanaries, type CodexCanaries } from "./fake-provider.js";
@@ -59,6 +60,7 @@ let CodexExecutor: CodexExecutorModule["CodexExecutor"];
 let FailClosedExecutor: CodexExecutorModule["FailClosedExecutor"];
 let selectCodexBinding: SelectModule["selectCodexBinding"];
 let CodexSelectionError: SelectModule["CodexSelectionError"];
+let CodexSessionStore: SessionStateModule["CodexSessionStore"];
 
 before(async () => {
   const exec = await loadPackagedCodexExecutor();
@@ -67,6 +69,7 @@ before(async () => {
   const sel = await loadPackagedSelect();
   selectCodexBinding = sel.selectCodexBinding;
   CodexSelectionError = sel.CodexSelectionError;
+  CodexSessionStore = (await loadPackagedSessionState()).CodexSessionStore;
 });
 
 const WORKSPACE = "/work/repo";
@@ -921,7 +924,11 @@ describe("codex-m3b packaged lifecycle (injected fakes)", () => {
     const { ctx, emitted } = makeCtx({ planApproved: true, approvedPlan: "plan", signal: controller.signal });
     const log = recordingLog();
     const p = makeExecutor(rig, bindingOf(subscriptionBlock(canaries, "t")), log.log).run(ctx);
-    await tick();
+    await waitFor(
+      () => rig.transport.turnStartCount === 1,
+      "cancel test provider root and turn/start admission",
+      5000,
+    );
     controller.abort();
     await assert.rejects(withTimeout(p, 5000, "cancel run"), (e: Error) => {
       assert.equal(e.message, "run cancelled", "the cancel trip wins over the raw AbortError");
@@ -970,11 +977,32 @@ describe("codex-m3b packaged lifecycle (injected fakes)", () => {
 // server-contract env. It emits a SEPARATE real-path counts object and requires every category the
 // lifecycle exercises to be nonzero — so a real-path exception (ran=false) or a silently-empty
 // stage FAILS here rather than reading green (the vacuous Block B is retired). The exact real
-// app-server item framing + parent/child turn interleaving is 🔴 MAINTAINER-VERIFIED (unconfirmed
-// in code); the recording responder always eventually drives a root `signal_done`, so a clean run
-// reaches `ran === true`. The outer run-lifecycle.sh watchdog bounds a wedged real process.
+// app-server item framing + parent/child turn interleaving is VERIFIED by the 2026-09-10
+// native both-image run; the recording responder always eventually drives a root
+// `signal_done`, so a clean run reaches `ran === true`. The outer run-lifecycle.sh
+// watchdog bounds a wedged real process.
 // ================================================================================
 const PACKAGED = process.env.CODEX_M3B_PACKAGED === "1";
+
+describe("codex-m3b real-provider responder routing", () => {
+  it("a child turn finishes without consuming the root checkpoint stage", async () => {
+    const { recordingLifecycleResponder, codexCanaries: freshCanaries } = await import("./fake-provider.js");
+    const canaries = freshCanaries();
+    const { respond } = recordingLifecycleResponder(canaries);
+    const root = () => respond({ input: [] }, undefined as never);
+    assert.equal(root()[0]?.name, "submit_plan");
+    assert.equal(root()[0]?.type, "message", "submit_plan ends its root turn");
+    assert.equal(root()[0]?.name, "uzi_bash");
+    assert.equal(root()[0]?.name, "uzi_apply_patch");
+    assert.equal(root()[0]?.name, "spawn_agent");
+    const child = respond({ input: [{ type: "input_text", text: canaries.spawnArg }] }, undefined as never);
+    assert.equal(child[0]?.type, "message", "the child receives a terminal message");
+    const afterChild = respond({
+      input: [{ type: "function_call", arguments: JSON.stringify({ prompt: canaries.spawnArg }) }],
+    }, undefined as never);
+    assert.equal(afterChild[0]?.name, "checkpoint", "the parent history does not misclassify and keeps its next root stage");
+  });
+});
 
 /** The instance type of the REAL worker→API transport (agent/src/client.ts). Loaded at runtime
  *  from the image-baked (or host source-tree) `src`, mirroring packaged-modules.ts, so Block B
@@ -1064,26 +1092,41 @@ function countingWorkerClient(real: WorkerClientInstance, counts: ClientCounts):
  *  `persist` (called before every provider-root reap and at terminal) in the REAL launch path. */
 interface SessionOps {
   adopt: number;
+  adoptFiles: number;
   persist: number;
+  persistFiles: number;
+  persistFailures: number;
+  lastPersistError?: string;
   inspect: number;
   remove: number;
 }
 function countingSessionStore(ops: SessionOps): NonNullable<CodexExecutorDeps["sessionStore"]> {
   return {
-    adopt: async () => {
+    adopt: async (...args) => {
       ops.adopt += 1;
-      return { files: 0 };
+      const result = await CodexSessionStore.adopt(...args);
+      ops.adoptFiles += result.files;
+      return result;
     },
-    inspect: async () => {
+    inspect: async (...args) => {
       ops.inspect += 1;
-      return "absent";
+      return CodexSessionStore.inspect(...args);
     },
-    remove: async () => {
+    remove: async (...args) => {
       ops.remove += 1;
+      return CodexSessionStore.remove(...args);
     },
-    persist: async () => {
+    persist: async (...args) => {
       ops.persist += 1;
-      return { files: 0, bytes: 0 };
+      try {
+        const result = await CodexSessionStore.persist(...args);
+        ops.persistFiles += result.files;
+        return result;
+      } catch (error) {
+        ops.persistFailures += 1;
+        ops.lastPersistError = error instanceof Error ? `${error.name}:${error.message}` : "unknown";
+        throw error;
+      }
     },
   };
 }
@@ -1122,7 +1165,7 @@ function makeScratch(): { scratch: string; worktree: string; home: string } {
 
 describe("codex-m3b packaged lifecycle (real launch → loopback provider)", { skip: PACKAGED ? false : "image-only (set CODEX_M3B_PACKAGED=1 inside the worker image)" }, () => {
   it("subscription: drives the packaged CodexExecutor through the REAL supervisor/fileop/codex + real WorkerClient with NONZERO real-path counts and no canary leak", async () => {
-    const { FakeProvider, recordingLifecycleResponder, countToolCallbacks, codexCanaries: freshCanaries } = await import("./fake-provider.js");
+    const { FakeProvider, recordingLifecycleResponder, countToolCallbacks, toolCallbackTexts, codexCanaries: freshCanaries } = await import("./fake-provider.js");
     const canaries = freshCanaries();
     const contract = readServerContract();
     // Accept-any bearer + record it: on the real-server path the RELEASED token (the credential
@@ -1152,13 +1195,14 @@ describe("codex-m3b packaged lifecycle (real launch → loopback provider)", { s
       runId = "run-1";
     }
 
-    const sessionOps: SessionOps = { adopt: 0, persist: 0, inspect: 0, remove: 0 };
+    const sessionOps: SessionOps = { adopt: 0, adoptFiles: 0, persist: 0, persistFiles: 0, persistFailures: 0, inspect: 0, remove: 0 };
     // deferRegistryTeardown keeps the provider registry ALIVE across run() so the post-run
     // finalize boundary can run the executor's OWN auth-mode reconcile (a subscription refresh
     // over the real route) and reap the live provider root.
     const realDeps: CodexExecutorDeps = {
       sessionStore: countingSessionStore(sessionOps),
       deferRegistryTeardown: true,
+      appServerAuthOpenAIBaseUrlForTest: fake.baseUrl,
       idleMs: 20000,
       wallMs: 60000,
       boundaryDeadlineMs: 3000,
@@ -1170,11 +1214,16 @@ describe("codex-m3b packaged lifecycle (real launch → loopback provider)", { s
     const markerName = canaries.patchArg.replace(/[^a-z-]+/g, "-");
 
     let checkpoints = 0;
+    let planGates = 0;
     const { ctx, emitted } = makeCtx({
       runId,
       worktreePath: worktree,
-      planApproved: true,
-      approvedPlan: "plan",
+      planApproved: false,
+      approvedPlan: undefined,
+      gatePlan: async () => {
+        planGates += 1;
+        return { kind: "approve", selection: { source: "own", agents: [] } } as never;
+      },
       agents,
       checkpoint: async () => {
         checkpoints += 1;
@@ -1215,6 +1264,7 @@ describe("codex-m3b packaged lifecycle (real launch → loopback provider)", { s
         terminalDisposed = false;
       }
 
+      const refreshProbeOutcomes: string[] = [];
       // Direct advance+replay probe over the REAL refresh route (subscription): read the current
       // committed generation, advance once with a fresh operation id (→ "advanced"), then re-send
       // the SAME operation id + observed generation (→ "replayed"). Counted via the proxy. Server
@@ -1229,17 +1279,22 @@ describe("codex-m3b packaged lifecycle (real launch → loopback provider)", { s
           );
           if (rel.auth_mode === "subscription") {
             const g0 = rel.generation;
-            const op = `codex-m3b-op-${randomBytes(9).toString("hex")}`;
-            await probe.refreshCodex(
+            // The worker route strictly parses operation_id as a UUID. A descriptive
+            // arbitrary string is rejected before CoordinatedCodexRefresh and makes the
+            // probe's catch look like a missing replay.
+            const op = randomUUID();
+            const advanced = await probe.refreshCodex(
               contract.sub.runId,
               { capability: contract.sub.capability, operation_id: op, observed_generation: g0 },
               { authMode: "subscription", chatgptAccountId: contract.sub.account },
             );
-            await probe.refreshCodex(
+            refreshProbeOutcomes.push(advanced.outcome);
+            const replayed = await probe.refreshCodex(
               contract.sub.runId,
               { capability: contract.sub.capability, operation_id: op, observed_generation: g0 },
               { authMode: "subscription", chatgptAccountId: contract.sub.account },
             );
+            refreshProbeOutcomes.push(replayed.outcome);
           }
         } catch {
           // A probe failure leaves refreshReplayed at 0, which the nonzero assertion below reports.
@@ -1254,6 +1309,11 @@ describe("codex-m3b packaged lifecycle (real launch → loopback provider)", { s
         }
       })();
       const distinctBearers = [...new Set(fake.observedBearers)];
+      const checkpointCallbackTexts = toolCallbackTexts(fake.requests, "cc-ckpt");
+      const patchCallbackTexts = toolCallbackTexts(fake.requests, "cc-patch");
+      const bashCallbackTexts = toolCallbackTexts(fake.requests, "cc-bash");
+      const patchAccepted = patchCallbackTexts.some((text) => text.includes('"written":true'));
+      const bashAccepted = bashCallbackTexts.some((text) => text.includes('"code":0'));
 
       // The SEPARATE real-path counts. Each is derived from provider-visible evidence + the
       // observable executor seams (the fake provider's recorded requests/bearers, the recording
@@ -1268,26 +1328,36 @@ describe("codex-m3b packaged lifecycle (real launch → loopback provider)", { s
         providerTurns: fake.requests.length,
         // callbacks: tool-call replies the broker executed and fed back to Codex.
         callbacks: countToolCallbacks(fake.requests),
-        // delegation: a spawn_agent child turn was driven.
-        delegation: evidence.spawn,
+        checkpointCallbacks: checkpointCallbackTexts.length,
+        checkpointAccepted: checkpointCallbackTexts.some((text) => text.includes('"checkpoint":true')),
+        patchAccepted,
+        bashAccepted,
+        // delegation: the provider observed the child thread's own user-task request.
+        delegation: evidence.childTurns,
         // signals: submit_plan + signal_done (the run-completing root signal).
         submitPlanSignals: evidence.submitPlan,
         doneSignals: evidence.signalDone,
+        planGates,
         // checkpoints: cooperative checkpoint reaches the runner ctx.checkpoint sink.
         checkpoints,
+        sessionPersistFiles: sessionOps.persistFiles,
+        sessionAdoptFiles: sessionOps.adoptFiles,
+        sessionPersistFailures: sessionOps.persistFailures,
+        sessionPersistError: sessionOps.lastPersistError,
         // provider roots registered: one releaseCodex per provider epoch (>=1; >=2 after a
         // cooperative-checkpoint new-root resume). In the fake-client fallback this reads the
         // fake's releaseCalls.
         providerRootsRegistered: contract ? counts.release : (client as unknown as { releaseCalls?: unknown[] }).releaseCalls?.length ?? 0,
         // provider roots reaped: the finalize boundary reaped the live provider root.
         providerRootsReaped: finalizeReaped ? 1 : 0,
-        // command roots registered: the REAL openat2 fileop root applied the patch marker on disk.
-        commandRootsRegistered: markerExists ? 1 : 0,
+        // command roots registered: the REAL openat2 fileop root returned an accepted write.
+        commandRootsRegistered: patchAccepted ? 1 : 0,
         // command roots reaped: the terminal dispose tore down every registered root.
         commandRootsReaped: terminalDisposed ? 1 : 0,
         // refresh advance/replay over the real coordinated-refresh route.
         refreshAdvanced: contract ? counts.refreshAdvanced : (client as unknown as { refreshCalls?: unknown[] }).refreshCalls?.length ?? 0,
         refreshReplayed: counts.refreshReplayed,
+        refreshProbeOutcomes,
         // finalization: the run reached its terminal cleanly.
         finalization: ran ? 1 : 0,
         evidence,
@@ -1296,6 +1366,10 @@ describe("codex-m3b packaged lifecycle (real launch → loopback provider)", { s
 
       // A real-path exception FAILS (no more silently-logged ran).
       assert.ok(ran, `the packaged real-launch run completed cleanly (ran=${ran}${ranError ? `: ${ranError}` : ""})`);
+      assert.ok(
+        fake.requests.length > 0,
+        "the real Codex app-server reached the in-container loopback provider",
+      );
       assert.deepEqual(fake.errors, [], "the loopback fake saw no auth/transport errors");
 
       const requireNonzero: ReadonlyArray<readonly [string, number]> = [
@@ -1305,7 +1379,10 @@ describe("codex-m3b packaged lifecycle (real launch → loopback provider)", { s
         ["delegation", realCounts.delegation],
         ["submitPlanSignals", realCounts.submitPlanSignals],
         ["doneSignals", realCounts.doneSignals],
+        ["planGates", realCounts.planGates],
         ["checkpoints", realCounts.checkpoints],
+        ["sessionPersistFiles", realCounts.sessionPersistFiles],
+        ["sessionAdoptFiles", realCounts.sessionAdoptFiles],
         ["providerRootsRegistered", realCounts.providerRootsRegistered],
         ["providerRootsReaped", realCounts.providerRootsReaped],
         ["commandRootsRegistered", realCounts.commandRootsRegistered],
@@ -1316,8 +1393,13 @@ describe("codex-m3b packaged lifecycle (real launch → loopback provider)", { s
       for (const [name, value] of requireNonzero) {
         assert.ok(value > 0, `real-path count ${name} must be > 0 (got ${value})`);
       }
+      assert.equal(realCounts.checkpointAccepted, true, "the app-server delivered the accepted checkpoint result back to the provider");
+      assert.equal(realCounts.bashAccepted, true, "the screened shell callback completed through its command supervisor root");
+      assert.equal(realCounts.patchAccepted, true, "the openat2 fileop callback completed through its persistent command root");
+      assert.equal(markerExists, true, "the accepted fileop callback left its marker in the worktree");
       if (contract) {
         assert.ok(realCounts.refreshReplayed > 0, `real-path count refreshReplayed must be > 0 (got ${realCounts.refreshReplayed})`);
+        assert.deepEqual(realCounts.refreshProbeOutcomes, ["advanced", "replayed"], "the same valid operation id advances once and then replays");
       } else {
         console.log("CODEX_M3B_PACKAGED_REAL not-asserted: refreshReplayed (no server contract; the fake client cannot exercise the coordinated-refresh replay path)");
       }
@@ -1328,6 +1410,11 @@ describe("codex-m3b packaged lifecycle (real launch → loopback provider)", { s
       const capabilityCanary = contract ? contract.sub.capability : canaries.capability;
       const emittedBlob = JSON.stringify(emitted);
       const logBlob = log.lines.join("\n");
+      assert.match(
+        emittedBlob,
+        /m3b lifecycle turn finished/,
+        "the real app-server agent-message item decoded into a public frame",
+      );
       for (const cred of distinctBearers) {
         assert.doesNotMatch(emittedBlob, new RegExp(escapeRe(cred)), "released credential leaked into an emitted message");
         assert.doesNotMatch(logBlob, new RegExp(escapeRe(cred)), "released credential leaked into a log line");
@@ -1372,10 +1459,11 @@ describe("codex-m3b packaged lifecycle (real launch → loopback provider)", { s
       fakeRefreshCalls = () => rig.client.refreshCalls.length;
     }
 
-    const sessionOps: SessionOps = { adopt: 0, persist: 0, inspect: 0, remove: 0 };
+    const sessionOps: SessionOps = { adopt: 0, adoptFiles: 0, persist: 0, persistFiles: 0, persistFailures: 0, inspect: 0, remove: 0 };
     const realDeps: CodexExecutorDeps = {
       sessionStore: countingSessionStore(sessionOps),
       deferRegistryTeardown: true,
+      appServerAuthOpenAIBaseUrlForTest: fake.baseUrl,
       idleMs: 20000,
       wallMs: 60000,
       boundaryDeadlineMs: 3000,
@@ -1428,6 +1516,10 @@ describe("codex-m3b packaged lifecycle (real launch → loopback provider)", { s
       console.log(`CODEX_M3B_PACKAGED_REAL_APIKEY_COUNTS ${JSON.stringify({ ran, login: distinctBearers.length, providerTurns: fake.requests.length, release: releaseCount, refresh: refreshCount })}`);
 
       assert.ok(ran, `the packaged api_key run completed cleanly (ran=${ran}${ranError ? `: ${ranError}` : ""})`);
+      assert.ok(
+        fake.requests.length > 0,
+        "the real Codex app-server reached the in-container loopback provider",
+      );
       assert.deepEqual(fake.errors, [], "the loopback fake saw no auth/transport errors");
       // The load-bearing api_key invariant: ZERO refresh calls across the whole run + boundary.
       assert.equal(refreshCount, 0, `an api_key run must make ZERO codex/refresh calls (got ${refreshCount})`);

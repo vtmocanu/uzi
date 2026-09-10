@@ -32,6 +32,7 @@
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
+import { constants as FS } from "node:fs";
 import type { Readable, Writable } from "node:stream";
 
 import type { Logger } from "../log.js";
@@ -56,7 +57,7 @@ import type {
 } from "../harness.js";
 import { RunTurnReducerImpl } from "../harness-reducer.js";
 import { buildLeadSystemPrompt, buildRevisePlanPrompt } from "../prompt.js";
-import { RUNNER_UID, uidSplitActive } from "../runner-uid.js";
+import { RUNNER_UID, WORKER_UID, uidSplitActive } from "../runner-uid.js";
 import { errMessage } from "../util.js";
 import type { AgentTemplate, ClaimSkill } from "../protocol.js";
 
@@ -105,6 +106,8 @@ import {
 import { createCodexTransport } from "./transport.js";
 import type { CodexNotification } from "./transport.js";
 import type { CodexBinding } from "./select.js";
+import { CODEX_M3B_LOOPBACK_PROVIDER_NAME } from "./config.js";
+import { buildCodexDynamicTools } from "./dynamic-tools.js";
 import { CodexAdviceHarness, type LaunchAdviceRootSeam } from "./codex-advice-harness.js";
 import {
   createCodexAppServerAuth,
@@ -744,6 +747,42 @@ export function buildCodexToolHandlers(deps: CodexToolHandlerDeps): ReadonlyMap<
  *  tool-evidence.ts's ToolTextResult without re-importing the type. */
 type ToolTextResultLike = ReturnType<typeof asText>;
 
+/** Create one worker-owned, runner-group-accessible directory without following a
+ * final symlink. The private runner-owned epoch roots live below these shared
+ * directories; the credential-free store remains worker-owned beside them. */
+async function ensureCodexSharedDirectory(dir: string): Promise<void> {
+  try {
+    await fs.mkdir(dir, { mode: 0o2770 });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+  }
+  const handle = await fs.open(dir, FS.O_RDONLY | FS.O_DIRECTORY | FS.O_NOFOLLOW);
+  try {
+    const before = await handle.stat();
+    if (!before.isDirectory() || before.uid !== WORKER_UID || before.gid !== RUNNER_UID) {
+      throw new Error("Codex shared data directory has an unexpected owner or group");
+    }
+    await handle.chmod(0o2770);
+    const after = await handle.stat();
+    if ((after.mode & 0o7777) !== 0o2770) {
+      throw new Error("Codex shared data directory has an unexpected mode");
+    }
+  } finally {
+    await handle.close();
+  }
+}
+
+async function prepareCodexRunHome(homeRoot: string): Promise<void> {
+  if (!path.isAbsolute(homeRoot) || path.resolve(homeRoot) !== homeRoot || homeRoot === path.parse(homeRoot).root) {
+    throw new Error("Codex run HOME must be a canonical absolute non-root path");
+  }
+  if (process.getuid?.() !== WORKER_UID) {
+    throw new Error("Codex run HOME must be prepared by the worker identity");
+  }
+  await ensureCodexSharedDirectory(homeRoot);
+  await ensureCodexSharedDirectory(path.join(homeRoot, "codex-data"));
+}
+
 /** The requested skill name from a `Skill` callback's args (`skill` or `name`), else
  *  undefined. Mirrors the broker's own skill-name extraction (firstStrField). */
 function firstSkillName(args: unknown): string | undefined {
@@ -764,6 +803,10 @@ export interface CodexExecutorDeps {
    *  flows over the app-server login RPC (the harness's auth session), so the launcher emits the
    *  production config and injects no provider credential var. */
   readonly launchProviderRoot?: (spec: CodexLaunchRootSpec, authMode: CodexAppServerAuthMode) => Promise<CodexLaunchRootResult>;
+  /** M3b packaged-proof seam. It preserves the real launcher and account/login/start,
+   * selecting only a validated in-container HTTP loopback provider with WebSockets off.
+   * Production leaves this absent and keeps pinned Codex's built-in provider. */
+  readonly appServerAuthOpenAIBaseUrlForTest?: string;
   /** Test-only high-level command seam. Production leaves this absent and uses
    * the registered supervisor-root implementation. */
   readonly spawnCommand?: SpawnCommandSeam;
@@ -893,7 +936,17 @@ export class CodexExecutor implements Executor {
     // Everything that needs the worktree is built at the TOP of run() (the executor is
     // constructed before the claim's worktree exists).
     const binding = this.opts.binding;
-    const provider = this.opts.provider;
+    // The packaged-only loopback seam must override both halves of the app-server
+    // provider selection. config.toml names the custom HTTP provider in launcher.ts,
+    // while thread/start carries this object and would otherwise override it back to
+    // the production `openai` provider, silently bypassing the in-container fake.
+    const provider = this.deps.appServerAuthOpenAIBaseUrlForTest === undefined
+      ? this.opts.provider
+      : {
+          ...this.opts.provider,
+          name: CODEX_M3B_LOOPBACK_PROVIDER_NAME,
+          baseUrl: this.deps.appServerAuthOpenAIBaseUrlForTest,
+        };
     const worktreePath = ctx.worktreePath;
     const storeDir = path.join(this.homeRoot, "codex-session-store");
     const boundaryDeadlineMs = this.deps.boundaryDeadlineMs ?? DEFAULT_BOUNDARY_DEADLINE_MS;
@@ -1184,6 +1237,14 @@ export class CodexExecutor implements Executor {
       spawnBoundaryRoot, boundaryProcessSpawner, reconcile, evictTokens,
     } = shared;
 
+    // The real launcher needs a worker-owned shared run HOME and codex-data parent: the
+    // credential-free session store is worker-owned, while each child epoch is runner-owned
+    // 0700 and removed as runner after its supervisor proves drained disposal. Injected
+    // launchProviderRoot tests own their synthetic filesystem and skip this production step.
+    if (this.deps.launchProviderRoot === undefined) {
+      await prepareCodexRunHome(homeRoot);
+    }
+
     // Each epoch gets its OWN owned data root / codexHome (M3a fresh-home semantics), so a
     // recreated provider root never inherits the prior root's auth/cache material; it adopts the
     // credential-free session subset from the SHARED store instead.
@@ -1253,7 +1314,12 @@ export class CodexExecutor implements Executor {
       // and the SHARED per-run tool-handler map. The broker enforces the plan-phase file-write ban
       // through `grants.phase`, so it MUST be phase-correct for the turn it serves; the harness
       // re-points it via useBroker before each turn.
-      const providerLaunchRoot = this.deps.launchProviderRoot ?? defaultLaunchProviderRoot;
+      const providerLaunchRoot = this.deps.launchProviderRoot
+        ?? ((spec, authMode) => defaultLaunchProviderRoot(
+          spec,
+          authMode,
+          this.deps.appServerAuthOpenAIBaseUrlForTest,
+        ));
       const buildPhaseBroker = (phase: "plan" | "implement", signal?: AbortSignal): CodexCallbackBroker => {
         const runPlan = buildCodexRunPlan(
           this.buildRunRequest(ctx, phase, this.phasePrompt(ctx, phase), undefined, new AbortController().signal),
@@ -1286,12 +1352,35 @@ export class CodexExecutor implements Executor {
       // Seed the harness with the PLAN-phase broker (the fail-safe default: writes denied).
       const planBroker = buildPhaseBroker("plan");
 
-      // The provider launch seam (part D): adopt the credential-free session subset from the
-      // SHARED store into THIS epoch's fresh HOME, then launch the provider root under app-server
-      // auth (the launcher injects NO env credential — the token flows over the login RPC).
+      // The provider launch seam (part D): materialize the credential-free session subset into
+      // a deterministic short-lived sibling staging tree. The launcher provisions the final
+      // runner-owned HOME first, then copies the vetted seed AS runner before app-server spawn.
+      // This keeps the worker read-only on the final 0710/2750 provider tree and keeps the
+      // command identity out of the worker-group session path. The staging tree is gone before
+      // the harness can send initialize or any model-bearing request.
       const providerLaunchSeam: LaunchRootSeam = async (spec) => {
-        await this.sessionStore.adopt(storeDir, codexHome).catch(() => undefined);
-        return providerLaunchRoot(spec, binding.authMode);
+        if (this.deps.launchProviderRoot !== undefined) {
+          // Unit seams own a synthetic filesystem and retain the direct adopt call so
+          // their established control-flow timing and session-operation evidence stay
+          // independent of the production launcher staging protocol.
+          await this.sessionStore.adopt(storeDir, codexHome).catch(() => undefined);
+          return providerLaunchRoot(spec, binding.authMode);
+        }
+        const sessionSeedHome = `${ownedDataRoot}.session-seed`;
+        await fs.rm(sessionSeedHome, { recursive: true, force: true }).catch(() => undefined);
+        const adopted = await this.sessionStore.adopt(
+          storeDir,
+          sessionSeedHome,
+          { destination: "runner-seed" },
+        ).catch(() => undefined);
+        try {
+          return await providerLaunchRoot(
+            { ...spec, ...(adopted !== undefined && adopted.files > 0 ? { seedSession: true } : {}) },
+            binding.authMode,
+          );
+        } finally {
+          await fs.rm(sessionSeedHome, { recursive: true, force: true }).catch(() => undefined);
+        }
       };
 
       harness = new CodexHarness({
@@ -1543,8 +1632,10 @@ export class CodexExecutor implements Executor {
           cwd: workspace,
           approvalPolicy: "never",
           ephemeral: true,
+          environments: [],
+          dynamicTools: buildCodexDynamicTools(spec.grants),
           config: { project_doc_max_bytes: 0, projects: { [workspace]: { trust_level: "untrusted" } } },
-          instructions: spec.systemPrompt,
+          developerInstructions: spec.systemPrompt,
         },
         { signal: spec.signal },
       );
@@ -1924,7 +2015,11 @@ function makeBoundaryProcessSpawner(
  *  config and injects NO env credential; the credential enters over the login RPC — launches,
  *  and adapts the {@link CodexRootHandle} into a registry-ownable {@link RegisteredRoot} + the
  *  app-server transport. DARK: never run in tests (a fake `launchProviderRoot` is injected). */
-async function defaultLaunchProviderRoot(spec: CodexLaunchRootSpec, authMode: CodexAppServerAuthMode): Promise<CodexLaunchRootResult> {
+async function defaultLaunchProviderRoot(
+  spec: CodexLaunchRootSpec,
+  authMode: CodexAppServerAuthMode,
+  openAIBaseUrlForTest?: string,
+): Promise<CodexLaunchRootResult> {
   const handle = await launchCodexRoot({
     ownedDataRoot: spec.ownedDataRoot,
     // No credentialValue: the token flows over `account/login/start`, never the launcher env.
@@ -1941,7 +2036,10 @@ async function defaultLaunchProviderRoot(spec: CodexLaunchRootSpec, authMode: Co
     cwd: spec.cwd,
     useAppServerAuth: true,
     authMode,
-  });
+    seedSession: spec.seedSession,
+  }, openAIBaseUrlForTest === undefined
+    ? undefined
+    : { appServerAuthOpenAIBaseUrlForTest: openAIBaseUrlForTest });
   const stdout = handle.transport.stdout;
   const stdin = handle.transport.stdin;
   if (!stdout || !stdin) throw new Error("codex provider root is missing a stdio transport channel");

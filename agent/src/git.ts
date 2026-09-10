@@ -2457,7 +2457,24 @@ export class GitCache {
         const chunks: Buffer[] = [];
         let bytes = 0;
         let oversized = false;
-        stream.on("data", (chunk: Buffer | string) => {
+        let settled = false;
+        const cleanup = (): void => {
+          boundary.signal.removeEventListener("abort", onAbort);
+          stream.removeListener("data", onData);
+          stream.removeListener("end", onEnd);
+          stream.removeListener("error", onError);
+        };
+        const settle = (
+          result: { chunks: Buffer[]; oversized: boolean } | undefined,
+          error?: unknown,
+        ): void => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          if (error !== undefined) reject(error);
+          else resolve(result!);
+        };
+        const onData = (chunk: Buffer | string): void => {
           const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
           if (oversized) return;
           const remaining = cap - bytes;
@@ -2469,9 +2486,18 @@ export class GitCache {
           }
           chunks.push(buf);
           bytes += buf.length;
-        });
-        stream.once("end", () => resolve({ chunks, oversized }));
-        stream.once("error", reject);
+        };
+        const onEnd = (): void => settle({ chunks, oversized });
+        const onError = (error: unknown): void => settle(undefined, error);
+        const onAbort = (): void => {
+          stream.destroy();
+          settle(undefined, new Error("permit-held git output collection aborted: boundary deadline exceeded"));
+        };
+        stream.on("data", onData);
+        stream.once("end", onEnd);
+        stream.once("error", onError);
+        if (boundary.signal.aborted) onAbort();
+        else boundary.signal.addEventListener("abort", onAbort, { once: true });
       });
     const [stdout, stderr, terminal] = await Promise.all([
       collect(process.stdout),

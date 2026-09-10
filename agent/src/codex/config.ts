@@ -50,6 +50,8 @@ export interface CodexConfigOptions {
  *  `model_provider` reference; keep it a simple identifier so the two always agree
  *  and no injection is possible through the table header. */
 const PROVIDER_NAME_RE = /^[A-Za-z0-9._-]+$/;
+/** One fixed provider identity shared by the M3b config and thread/start seam. */
+export const CODEX_M3B_LOOPBACK_PROVIDER_NAME = "uzi-m3b-openai";
 
 /** TOML basic-string encoder. TOML basic strings share JSON's escaping for the
  *  characters that occur in paths/URLs/identifiers, so `JSON.stringify` yields a
@@ -79,6 +81,10 @@ function nativeDisabledConfigLines(model: string, providerName: string, projectP
     `[features]`,
     `apps = false`,
     `plugins = false`,
+    `shell_tool = false`,
+    `view_image = false`,
+    `sleep_tool = false`,
+    `apply_patch_freeform = false`,
     `shell_snapshot = false`,
     `shell_snapshot_v2 = false`,
     `code_mode = false`,
@@ -143,6 +149,16 @@ export interface CodexProductionConfigOptions {
   readonly authMode: CodexAppServerAuthMode;
 }
 
+function validateProductionConfigOptions(opts: CodexProductionConfigOptions): void {
+  const keys = Object.keys(opts);
+  if (keys.some((key) => key !== "model" && key !== "projectPath" && key !== "authMode")) {
+    throw new Error("Codex production config received an unsupported option");
+  }
+  if (opts.authMode !== "api_key" && opts.authMode !== "subscription") {
+    throw new Error("Codex production config requires an explicit supported auth mode");
+  }
+}
+
 /**
  * Build the fixed production config used with `account/login/start` authentication.
  *
@@ -160,14 +176,61 @@ export interface CodexProductionConfigOptions {
  * smuggled into this production builder from a claim, repo or test fixture.
  */
 export function buildCodexProductionConfigToml(opts: CodexProductionConfigOptions): string {
-  const keys = Object.keys(opts);
-  if (keys.some((key) => key !== "model" && key !== "projectPath" && key !== "authMode")) {
-    throw new Error("Codex production config received an unsupported option");
-  }
-  if (opts.authMode !== "api_key" && opts.authMode !== "subscription") {
-    throw new Error("Codex production config requires an explicit supported auth mode");
-  }
+  validateProductionConfigOptions(opts);
   return nativeDisabledConfigLines(opts.model, "openai", opts.projectPath).join("\n");
+}
+
+/**
+ * Build an authenticated custom-provider config for the in-container M3b fake. This
+ * is deliberately separate from {@link buildCodexProductionConfigToml}: production
+ * keeps the built-in `openai` provider and emits no endpoint override.
+ *
+ * Pinned Codex 0.153.2's built-in provider has WebSockets enabled and cannot be
+ * overridden by a same-name provider table (`merge_configured_model_providers` uses
+ * `or_insert`). Its app-server tests instead use a distinct custom provider with
+ * `requires_openai_auth = true` and `supports_websockets = false`; this reproduces
+ * that exact HTTP-fake shape while preserving `account/login/start`. Keep the URL
+ * narrower than a general provider seam so a test dependency can never redirect
+ * credentials to a network peer.
+ */
+export function buildCodexLoopbackTestConfigToml(
+  opts: CodexProductionConfigOptions,
+  openAIBaseUrl: string,
+): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(openAIBaseUrl);
+  } catch {
+    throw new Error("Codex loopback test base URL is invalid");
+  }
+  const normalizedBaseUrl = `http://127.0.0.1:${parsed.port}/v1`;
+  if (
+    parsed.protocol !== "http:"
+    || parsed.hostname !== "127.0.0.1"
+    || parsed.port === ""
+    || parsed.pathname !== "/v1"
+    || parsed.username !== ""
+    || parsed.password !== ""
+    || parsed.search !== ""
+    || parsed.hash !== ""
+    || openAIBaseUrl !== normalizedBaseUrl
+  ) {
+    throw new Error("Codex loopback test base URL must be http://127.0.0.1:<port>/v1 with no credentials or query");
+  }
+  validateProductionConfigOptions(opts);
+  const providerName = CODEX_M3B_LOOPBACK_PROVIDER_NAME;
+  return [
+    ...nativeDisabledConfigLines(opts.model, providerName, opts.projectPath),
+    `[model_providers.${toml(providerName)}]`,
+    `name = "OpenAI"`,
+    `base_url = ${toml(normalizedBaseUrl)}`,
+    `wire_api = "responses"`,
+    `supports_websockets = false`,
+    `requires_openai_auth = true`,
+    `request_max_retries = 0`,
+    `stream_max_retries = 0`,
+    ``,
+  ].join("\n");
 }
 
 /** Thrown when {@link assertNoUnexpectedSystemConfig} finds a system config root the

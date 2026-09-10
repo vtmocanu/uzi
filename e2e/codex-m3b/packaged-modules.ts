@@ -15,6 +15,8 @@ import { pathToFileURL } from "node:url";
 export type CodexExecutorModule = typeof import("../../agent/src/codex/codex-executor.js");
 /** The claim → binding selector (the first half of main.ts's makeExecutor decision). */
 export type SelectModule = typeof import("../../agent/src/codex/select.js");
+/** The credential-free session store used across real provider-root recreation. */
+export type SessionStateModule = typeof import("../../agent/src/codex/session-state.js");
 
 /** The image-baked (or host source-tree) `src` dir the packaged modules load from.
  *
@@ -39,6 +41,10 @@ export function loadPackagedCodexExecutor(): Promise<CodexExecutorModule> {
 
 export function loadPackagedSelect(): Promise<SelectModule> {
   return load<SelectModule>("codex/select.ts");
+}
+
+export function loadPackagedSessionState(): Promise<SessionStateModule> {
+  return load<SessionStateModule>("codex/session-state.ts");
 }
 
 // NOTE (main.ts): the DARK selection FACTORY lives in main.ts as a private const

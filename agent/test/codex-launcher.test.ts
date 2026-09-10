@@ -119,6 +119,8 @@ class FakeSupervisor extends EventEmitter {
 const fakes: FakeSupervisor[] = [];
 const spawnCalls: { command: string; args: readonly string[]; options: { cwd: string; env: NodeJS.ProcessEnv } }[] = [];
 const treeCalls: RunnerTreeRequest[] = [];
+const treeRemoveCalls: Array<Pick<RunnerTreeRequest, "uid" | "kind" | "root">> = [];
+let treeCleanupFailures = 0;
 
 function baseDeps(fake: FakeSupervisor, overrides: Partial<LauncherDeps> = {}): LauncherDeps {
   return {
@@ -126,6 +128,8 @@ function baseDeps(fake: FakeSupervisor, overrides: Partial<LauncherDeps> = {}): 
     resolveRunnerUid: () => RUNNER_UID,
     assertNoUnexpectedSystemConfig: () => { /* no /etc/codex in unit tests */ },
     makeRunnerTrees: (req) => { treeCalls.push(req); },
+    removeRunnerTree: (req) => { treeRemoveCalls.push(req); },
+    reportRunnerTreeCleanupFailure: () => { treeCleanupFailures += 1; },
     spawnSupervisor: (command, args, options) => {
       spawnCalls.push({ command, args, options });
       return fake as unknown as SupervisorProcess;
@@ -150,6 +154,8 @@ beforeEach(() => {
   process.env.CODEX_CANARY_LEAK = "SHOULD-NOT-LEAK";
   spawnCalls.length = 0;
   treeCalls.length = 0;
+  treeRemoveCalls.length = 0;
+  treeCleanupFailures = 0;
 });
 afterEach(() => {
   for (const f of fakes) f.destroyAll();
@@ -217,6 +223,7 @@ describe("launchCodexRoot: env allowlist, trees, argv", () => {
     assert.ok(req, "makeRunnerTrees was called");
     assert.equal(req.uid, RUNNER_UID);
     assert.equal(req.root, DATA_ROOT);
+    assert.equal(req.sharedSessionRead, undefined, "the transitional provider tree stays owner-only");
     assert.deepEqual([...req.dirs], [
       `${DATA_ROOT}/home`, `${DATA_ROOT}/codex`, `${DATA_ROOT}/xdg-config`,
       `${DATA_ROOT}/xdg-cache`, `${DATA_ROOT}/xdg-data`, `${DATA_ROOT}/xdg-state`, `${DATA_ROOT}/tmp`,
@@ -292,6 +299,61 @@ describe("launchCodexRoot: app-server auth (production config, no env credential
     assert.doesNotMatch(configFile.content, /\[model_providers\./, "production config declares no custom provider table");
     assert.doesNotMatch(configFile.content, /requires_openai_auth/);
     assert.doesNotMatch(configFile.content, /base_url/);
+    assert.deepEqual(treeCalls[0]?.sharedSessionRead, {
+      gid: WORKER_UID,
+      codexHome: `${DATA_ROOT}/codex`,
+      sessionDir: `${DATA_ROOT}/codex/sessions`,
+    });
+  });
+
+  it("the explicit M3b seam uses an authenticated HTTP-only loopback provider", async () => {
+    const fake = newFake();
+    await launchCodexRoot(
+      baseSpec({ useAppServerAuth: true, authMode: "subscription" }),
+      baseDeps(fake, { appServerAuthOpenAIBaseUrlForTest: "http://127.0.0.1:43123/v1" }),
+    );
+    const configFile = treeCalls[0]?.files[0];
+    assert.ok(configFile);
+    assert.match(configFile.content, /^model_provider = "uzi-m3b-openai"$/m);
+    assert.match(configFile.content, /^\[model_providers\."uzi-m3b-openai"\]$/m);
+    assert.match(configFile.content, /^base_url = "http:\/\/127\.0\.0\.1:43123\/v1"$/m);
+    assert.match(configFile.content, /^supports_websockets = false$/m);
+    assert.match(configFile.content, /^requires_openai_auth = true$/m);
+    assert.equal(spawnCalls[0]?.options.env.CODEX_PROVIDER_KEY, undefined);
+  });
+
+  it("derives the only allowed session-seed source from the managed provider root", async () => {
+    const fake = newFake();
+    await launchCodexRoot(
+      baseSpec({ useAppServerAuth: true, authMode: "subscription", seedSession: true }),
+      baseDeps(fake),
+    );
+    assert.equal(treeCalls[0]?.sessionSeedDir, `${DATA_ROOT}.session-seed/sessions`);
+    assert.ok(treeCalls[0]?.sharedSessionRead, "the final 0710/2750 posture is provisioned before seeding");
+    assert.equal(spawnCalls.length, 1, "the supervisor starts only after makeRunnerTrees completes");
+  });
+
+  it("refuses the M3b redirect without app-server auth", async () => {
+    const fake = newFake();
+    await assert.rejects(
+      launchCodexRoot(
+        baseSpec(),
+        baseDeps(fake, { appServerAuthOpenAIBaseUrlForTest: "http://127.0.0.1:43123/v1" }),
+      ),
+      /requires app-server auth/,
+    );
+    assert.equal(treeCalls.length, 0);
+    assert.equal(spawnCalls.length, 0);
+  });
+
+  it("refuses session seeding outside a managed-auth provider root", async () => {
+    const fake = newFake();
+    await assert.rejects(
+      launchCodexRoot(baseSpec({ seedSession: true }), baseDeps(fake)),
+      /session seeding requires a managed-auth provider root/,
+    );
+    assert.equal(treeCalls.length, 0);
+    assert.equal(spawnCalls.length, 0);
   });
 
   it("the ABSENT flag keeps the transitional env-key path (custom table + injected credential)", async () => {
@@ -420,6 +482,16 @@ describe("launchCodexRoot: trusted construction contract", () => {
       /ownedDataRoot and cwd must be disjoint/,
     );
   });
+
+  it("rejects a non-canonical owned data root before provisioning", async () => {
+    const fake = newFake();
+    await assert.rejects(
+      launchCodexRoot(baseSpec({ ownedDataRoot: "/data/run/../root-1" }), baseDeps(fake)),
+      /canonical absolute non-root path/,
+    );
+    assert.equal(treeCalls.length, 0);
+    assert.equal(spawnCalls.length, 0);
+  });
 });
 
 describe("launchCodexRoot: happy-path lifecycle over the fake supervisor", () => {
@@ -441,6 +513,9 @@ describe("launchCodexRoot: happy-path lifecycle over the fake supervisor", () =>
     const outcome = await handle.dispose(1500);
     assert.equal(outcome.clean, true);
     assert.ok(outcome.clean && outcome.event.state === "drained");
+    assert.deepEqual(treeRemoveCalls, [{ uid: RUNNER_UID, kind: "provider", root: DATA_ROOT }]);
+    assert.equal((await handle.dispose(1500)).clean, true, "dispose stays idempotent");
+    assert.equal(treeRemoveCalls.length, 1, "a clean tree removal runs once");
     assert.equal(handle.failed, undefined);
   });
 
@@ -493,6 +568,24 @@ describe("launchCodexRoot: abnormal paths never claim clean disposal", () => {
     assert.equal(outcome.clean, false);
     assert.ok(!outcome.clean && outcome.event?.state === "unconfirmed");
     assert.match(outcome.clean ? "" : outcome.reason, /unconfirmed/);
+    assert.equal(treeRemoveCalls.length, 0, "an unconfirmed disposal retains the owned tree");
+  });
+
+  it("retains a runner-owned tree without replacing clean supervisor disposal when removal fails", async () => {
+    const fake = newFake();
+    let attempts = 0;
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake, {
+      removeRunnerTree: () => {
+        attempts += 1;
+        throw new Error("cleanup refused");
+      },
+    }));
+    const outcome = await handle.dispose(500);
+    assert.equal(outcome.clean, true, "disk reclamation does not replace proven process disposal");
+    assert.equal(attempts, 1);
+    assert.equal(treeCleanupFailures, 1, "the path-free cleanup diagnostic fires once");
+    assert.equal((await handle.dispose(500)).clean, true);
+    assert.equal(attempts, 1, "a failed best-effort cleanup is not retried on idempotent dispose");
   });
 
   it("(f4) a drained report contradicted by a non-zero exit is NOT clean", async () => {

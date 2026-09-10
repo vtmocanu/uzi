@@ -6,8 +6,9 @@
 // catalogs) elsewhere under `$CODEX_HOME` (e.g. `auth.json`). To resume a run across
 // a checkpoint/park/shutdown root recreation, uzi preserves ONLY a proven
 // CREDENTIAL-FREE session subset and re-authorizes the credential per root
-// separately. This module owns that subset copy: a runner-owned per-run store that
-// survives root reaping, seeded back into a fresh root before app-server start.
+// separately. This module owns that subset copy: a worker-owned per-run store beside
+// the runner-owned epoch trees. It survives root reaping and is seeded back into a
+// fresh epoch before app-server start.
 //
 // ─── CRITICAL SAFETY RULE: ALLOWLIST, NEVER DENYLIST ────────────────────────────
 // We copy ONLY an explicit allowlist of credential-free session artifacts, and NEVER
@@ -24,11 +25,11 @@
 //       over-exclusion merely falls back to a fresh session, which is fail-safe;
 //       leaking one auth byte is not.
 //
-// 🔴 PROVISIONAL: the exact pinned-Codex rollout file set is NOT fully characterized
-// offline. The allowlist above is deliberately conservative and MUST be confirmed
-// against the real app-server in the packaged integration (m3b:packaged) before this
-// is trusted in production. Widen the allowlist only with a proven credential-free
-// characterization; never widen it speculatively.
+// VERIFIED 2026-09-10: pinned Codex 0.153.2 wrote the resumable rollout under this
+// `.jsonl`-only subtree in both native AMD64 packaged worker images. Persist/adopt
+// crossed plan approval and cooperative-checkpoint root recreation with nonzero file
+// counts, while the credential/capability canaries stayed absent from every observed
+// surface. The allowlist remains deliberately narrow; never widen it speculatively.
 //
 // ─── TRAVERSAL / SYMLINK SAFETY (openat2-style, fd-anchored) ────────────────────
 // The copy walk is ANCHORED on held directory file descriptors on BOTH ends, never on
@@ -112,9 +113,9 @@ import type { SessionPresence } from "../harness.js";
  *  is the first allowlist gate. */
 export const SESSION_ALLOWED_SUBDIR = "sessions";
 
-/** Allowed rollout/transcript file extensions. Pinned Codex writes rollouts as
- *  JSONL; anything else under `sessions/` is treated as uncertain and EXCLUDED.
- *  Provisional pending m3b:packaged confirmation (see file header). */
+/** Allowed rollout/transcript file extensions. Pinned Codex 0.153.2 writes the
+ * resumable rollout as JSONL, verified by the 2026-09-10 both-image packaged proof;
+ * anything else under `sessions/` is treated as uncertain and EXCLUDED. */
 export const SESSION_ALLOWED_EXTENSIONS: readonly string[] = [".jsonl"];
 
 /** Auth-shaped name substrings. A file OR directory whose name contains any of these
@@ -127,10 +128,9 @@ export const SESSION_ALLOWED_EXTENSIONS: readonly string[] = [".jsonl"];
  *
  *  It matches ASCII-case-insensitively ONLY (`.toLowerCase()`): homoglyph / Unicode
  *  confusable names (e.g. a Cyrillic `а` in "аuth") are NOT normalized and would slip
- *  past this substring test. That is a DOCUMENTED residual of the PROVISIONAL
- *  content-trust model (see file header) — the primary allowlist, not this deny-list,
- *  is the load-bearing gate, and the real rollout name set must be characterized
- *  against the app-server in m3b:packaged before this is trusted in production. */
+ *  past this substring test. The primary `.jsonl` allowlist and `sessions/` subtree,
+ *  not this deny-list, are the load-bearing gates. The deny-list adds defense in depth
+ *  to the rollout shape verified by the both-image packaged proof. */
 export const SESSION_DENY_NAME_SUBSTRINGS: readonly string[] = [
   "auth",
   "access",
@@ -199,6 +199,12 @@ export interface PersistResult {
 export interface AdoptResult {
   readonly files: number;
 }
+
+/** Destination posture for an adopted session copy. `private` is the ordinary
+ * worker-owned 0700/0600 tree. `runner-seed` is a short-lived, credential-free
+ * staging tree whose directories/files are group-readable so the provider runner
+ * can copy them into its own final 2750 session tree before app-server start. */
+export type SessionAdoptDestination = "private" | "runner-seed";
 
 /** Thrown by `persist` when a bound is exceeded (fail-closed): the copy stops rather
  *  than persisting an unbounded subset. `adopt`/`inspect` are fail-SAFE instead and
@@ -354,6 +360,7 @@ async function copyAllowlistedSessions(
   destSessionsDir: string,
   bounds: SessionStoreBounds,
   throwOnBound: boolean,
+  destModes: { readonly dir: number; readonly file: number } = { dir: 0o700, file: 0o600 },
 ): Promise<CopyTally> {
   const srcRoot = resolve(srcSessionsDir);
   const destRoot = resolve(destSessionsDir);
@@ -412,7 +419,7 @@ async function copyAllowlistedSessions(
           // Create the dest child relative to the dest parent fd (openat-style), then
           // open it O_NOFOLLOW so we descend into a real, in-tree directory.
           try {
-            await fsp.mkdir(`/proc/self/fd/${destDirFh.fd}/${name}`, { mode: 0o700 });
+            await fsp.mkdir(`/proc/self/fd/${destDirFh.fd}/${name}`, { mode: destModes.dir });
           } catch (error) {
             if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
           }
@@ -469,7 +476,7 @@ async function copyAllowlistedSessions(
           destDirFh,
           name,
           FS.O_WRONLY | FS.O_CREAT | FS.O_TRUNC | FS.O_NOFOLLOW,
-          0o600,
+          destModes.file,
         );
         try {
           await destFile.writeFile(data);
@@ -504,7 +511,7 @@ async function copyAllowlistedSessions(
   try {
     // Create + open the top-level DEST sessions dir, O_NOFOLLOW so we never write
     // THROUGH a symlinked dest either.
-    await fsp.mkdir(destRoot, { recursive: true, mode: 0o700 });
+    await fsp.mkdir(destRoot, { recursive: true, mode: destModes.dir });
     const destTop = await fsp.open(destRoot, FS.O_RDONLY | FS.O_NOFOLLOW | FS.O_DIRECTORY);
     try {
       await walk(srcTop, destTop, 0);
@@ -516,6 +523,23 @@ async function copyAllowlistedSessions(
   }
 
   return tally;
+}
+
+/** Copy an already-vetted, credential-free staging `sessions/` tree into the
+ * runner-owned provider destination. The launcher invokes this in a fixed helper
+ * process as uid `runner`; using the same fd-anchored allowlist here prevents the
+ * restoration side from drifting into a broader recursive copy. */
+export async function seedCodexSessionArtifacts(
+  stagedSessionsDir: string,
+  providerSessionsDir: string,
+): Promise<AdoptResult> {
+  return copyAllowlistedSessions(
+    stagedSessionsDir,
+    providerSessionsDir,
+    DEFAULT_SESSION_STORE_BOUNDS,
+    false,
+    { dir: 0o2750, file: 0o640 },
+  );
 }
 
 /** Scan for the FIRST allowlisted artifact under `sessionsDir`, bounded by
@@ -579,15 +603,29 @@ function pathComponents(absPath: string): string[] {
   return resolve(absPath).split("/").filter((p) => p.length > 0);
 }
 
+// Linux O_PATH is intentionally not exposed by Node's fs.constants. It obtains a
+// path-only descriptor without requiring directory read/list permission, while
+// O_DIRECTORY + O_NOFOLLOW retain the ancestor type/symlink checks. Non-Linux hosts
+// use O_RDONLY; the packaged runtime and this boundary are Linux-only.
+const LINUX_O_PATH = 0o10000000;
+const DIR_READ_FLAGS = FS.O_RDONLY | FS.O_DIRECTORY | FS.O_NOFOLLOW;
+const DIR_PATH_FLAGS = process.platform === "linux"
+  ? LINUX_O_PATH | FS.O_DIRECTORY | FS.O_NOFOLLOW
+  : DIR_READ_FLAGS;
+
 /** Open an absolute directory by walking EVERY component from `/` with `O_DIRECTORY | O_NOFOLLOW`,
  *  so a symlinked ancestor at ANY level is refused (ELOOP) — the userland openat2
- *  `RESOLVE_NO_SYMLINKS`. Every component must already exist as a real directory; nothing is
- *  created or followed. Used to pin the trusted `storeDir` and the untrusted `codexHome`. */
-async function resolveDir(absPath: string): Promise<FileHandle> {
-  let fh = await fsp.open("/", FS.O_RDONLY | FS.O_DIRECTORY | FS.O_NOFOLLOW);
+ *  `RESOLVE_NO_SYMLINKS`. Linux ancestors use O_PATH so execute-only traversal remains
+ *  non-listable; the final descriptor is read-capable unless `pathOnlyFinal` is true.
+ *  Every component must already exist as a real directory; nothing is created or followed. */
+async function resolveDir(absPath: string, pathOnlyFinal = false): Promise<FileHandle> {
+  const parts = pathComponents(absPath);
+  let fh = await fsp.open("/", parts.length === 0 && !pathOnlyFinal ? DIR_READ_FLAGS : DIR_PATH_FLAGS);
   try {
-    for (const part of pathComponents(absPath)) {
-      const next = await openAt(fh, part, FS.O_RDONLY | FS.O_DIRECTORY | FS.O_NOFOLLOW);
+    for (let i = 0; i < parts.length; i += 1) {
+      const part = parts[i]!;
+      const final = i === parts.length - 1;
+      const next = await openAt(fh, part, final && !pathOnlyFinal ? DIR_READ_FLAGS : DIR_PATH_FLAGS);
       await fh.close();
       fh = next;
     }
@@ -785,7 +823,7 @@ export interface CodexSessionStoreHooks {
 
 export interface CodexSessionStoreApi {
   persist(codexHome: string, storeDir: string, opts?: { bounds?: SessionStoreBounds }): Promise<PersistResult>;
-  adopt(storeDir: string, codexHome: string): Promise<AdoptResult>;
+  adopt(storeDir: string, codexHome: string, opts?: { destination?: SessionAdoptDestination }): Promise<AdoptResult>;
   inspect(storeDir: string, opts?: { scanCap?: number }): Promise<SessionPresence>;
   remove(storeDir: string): Promise<void>;
 }
@@ -844,7 +882,7 @@ export function createCodexSessionStore(hooks: CodexSessionStoreHooks = {}): Cod
           // genuine I/O error propagates and fails persist closed (old store left intact).
           let sourceAbsent = false;
           try {
-            codexHomeFd = await resolveDir(codexHome);
+            codexHomeFd = await resolveDir(codexHome, true);
           } catch (error) {
             const code = (error as NodeJS.ErrnoException).code;
             if (code === "ENOENT") sourceAbsent = true;
@@ -916,8 +954,11 @@ export function createCodexSessionStore(hooks: CodexSessionStoreHooks = {}): Cod
      * the dest `sessions/` is never written THROUGH a symlink. Runs under the per-storeDir operation
      * lock, so no concurrent persist can reap the generation between reading `current` and copying it.
      */
-    async adopt(storeDir, codexHome) {
+    async adopt(storeDir, codexHome, opts = {}) {
       return withStoreLock(storeDir, async () => {
+        const destination = opts.destination ?? "private";
+        const destDirMode = destination === "runner-seed" ? 0o750 : 0o700;
+        const destFileMode = destination === "runner-seed" ? 0o640 : 0o600;
         let storeFd: FileHandle | undefined;
         let gensFd: FileHandle | undefined;
         let genFd: FileHandle | undefined;
@@ -948,7 +989,7 @@ export function createCodexSessionStore(hooks: CodexSessionStoreHooks = {}): Cod
             codexHomeFd = await resolveDir(codexHome);
           } catch (error) {
             if ((error as NodeJS.ErrnoException).code !== "ENOENT") return { files: 0 };
-            codexHomeFd = await resolveDirEnsuringFinal(codexHome, 0o700);
+            codexHomeFd = await resolveDirEnsuringFinal(codexHome, destDirMode);
           }
 
           // Never write THROUGH a symlinked (or non-dir) dest `sessions/`: remove such an entry
@@ -957,13 +998,14 @@ export function createCodexSessionStore(hooks: CodexSessionStoreHooks = {}): Cod
           if (destStat && (destStat.isSymbolicLink() || !destStat.isDirectory())) {
             await rmAt(codexHomeFd, SESSION_ALLOWED_SUBDIR);
           }
-          await mkdirAt(codexHomeFd, SESSION_ALLOWED_SUBDIR, 0o700);
+          await mkdirAt(codexHomeFd, SESSION_ALLOWED_SUBDIR, destDirMode);
 
           const tally = await copyAllowlistedSessions(
             `/proc/self/fd/${genFd.fd}/${SESSION_ALLOWED_SUBDIR}`,
             `/proc/self/fd/${codexHomeFd.fd}/${SESSION_ALLOWED_SUBDIR}`,
             DEFAULT_SESSION_STORE_BOUNDS,
             false, // fail-safe: adopt what fits, never throw
+            { dir: destDirMode, file: destFileMode },
           );
           return { files: tally.files };
         } catch {

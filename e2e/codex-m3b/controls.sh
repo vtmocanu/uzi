@@ -80,9 +80,9 @@ hdr "Control P2b: the static Landlock command wrapper"
 check_static_bin "$SANDBOX"
 
 hdr "Control P3: node + tsx + the pinned Codex app-server"
-[ -x "$NODE" ] && ok "node present ($NODE)" || bad "node missing at $NODE"
-[ -x "$TSX" ]  && ok "tsx present ($TSX)"  || bad "tsx missing at $TSX"
-[ -x "$CODEX" ] && ok "codex present ($CODEX)" || bad "codex missing at $CODEX"
+if [ -x "$NODE" ]; then ok "node present ($NODE)"; else bad "node missing at $NODE"; fi
+if [ -x "$TSX" ]; then ok "tsx present ($TSX)"; else bad "tsx missing at $TSX"; fi
+if [ -x "$CODEX" ]; then ok "codex present ($CODEX)"; else bad "codex missing at $CODEX"; fi
 
 hdr "Control P4: the packaged FILEOP_BIN constant matches the installed path"
 if [ -f "$EXECUTOR_SRC" ]; then
@@ -101,6 +101,18 @@ if grep -q 'COMMAND_SANDBOX_BIN = "/usr/local/bin/uzi-codex-command-sandbox"' "$
 else
   bad "packaged codex-executor.ts COMMAND_SANDBOX_BIN does not match $SANDBOX"
 fi
+
+hdr "Control P5: managed-auth session reader group is provider-only"
+_runner_groups=" $(id -Gn runner 2>/dev/null || true) "
+_command_groups=" $(id -Gn runner-cmd 2>/dev/null || true) "
+case "$_runner_groups" in
+  *" worker "*) ok "provider runner belongs to the trusted worker group" ;;
+  *) bad "provider runner is missing the trusted worker group" ;;
+esac
+case "$_command_groups" in
+  *" worker "*) bad "command runner must not belong to the trusted worker group" ;;
+  *) ok "command runner is excluded from the trusted worker group" ;;
+esac
 
 hdr "SUMMARY packaging PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ]

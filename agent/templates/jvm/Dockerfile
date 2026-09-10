@@ -34,14 +34,18 @@ ENV PATH="${JAVA_HOME}/bin:${PATH}"
 # (M4). uid 10003 (`runner-cmd`) is the PRD #1171 credential-free command-root identity
 # (the Codex adapter's shell + fileop callbacks), OS-isolated from the provider credential
 # (uid 10002) -- a distinct uid means it cannot read the provider root's mode-0400
-# /proc/<pid>/environ or its 0700 HOME/CODEX_HOME. It is given NO credential/PAT and is
+# /proc/<pid>/environ, its owner-only trees, or the group-worker managed-auth session
+# path. It is given NO credential/PAT and is
 # NOT in group `worker`; its primary group `runner-cmd` (gid 10003) lets setpriv
 # `--regid 10003` resolve, and it joins group `runner` as a supplementary member so
 # `--init-groups` grants the `runner` group -- letting a command root write the shared
 # setgid group=runner, group-writable run worktree and read
 # the group-accessible /nix toolchain (`/nix` is worker:runner), exactly as the `runner`
 # uid does today. Numbered to match the k8s design intent (worker 10001 / runner 10002 /
-# runner-cmd 10003); `worker` joins group `runner`. Created EARLY so /nix + /data can be
+# runner-cmd 10003); `worker` joins group `runner`. `runner` joins group `worker` only
+# for the managed-auth credential-free sessions read path; `runner-cmd` remains excluded.
+# That membership is added in a late layer to preserve the heavy toolchain cache. The
+# accounts are created EARLY so /nix + /data can be
 # chowned; the entrypoint drops root -> worker at run time.
 RUN addgroup -g 10001 worker && adduser -u 10001 -G worker -h /home/worker -D worker \
     && addgroup -g 10002 runner && adduser -u 10002 -G runner -h /home/runner -D runner \
@@ -318,6 +322,7 @@ RUN bash /tmp/codex/assert-codex.sh \
 # MIRRORED from templates/base — keep the COPY/RUN lines in lockstep (jvm is NOT `FROM base`).
 COPY agent/codex/supervisor /build/uzi-codex-supervisor
 RUN cd /build/uzi-codex-supervisor && export GOTOOLCHAIN=local CGO_ENABLED=0 GOFLAGS="-mod=vendor -buildvcs=false" && go build -trimpath -o /usr/local/bin/uzi-codex-supervisor . && chmod 0555 /usr/local/bin/uzi-codex-supervisor && go build -trimpath -o /usr/local/bin/uzi-codex-fileop ./fileop && chmod 0555 /usr/local/bin/uzi-codex-fileop && go build -trimpath -o /usr/local/bin/uzi-codex-command-sandbox ./cmdsandbox && chmod 0555 /usr/local/bin/uzi-codex-command-sandbox && rm -rf /build/uzi-codex-supervisor
+RUN addgroup runner worker
 
 COPY agent/tsconfig.json ./
 COPY agent/src ./src

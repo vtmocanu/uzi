@@ -15,17 +15,14 @@
 // WorkerClient injects PLUS the secret-shaped tool-argument canaries this provider emits, so
 // both legs assert against the SAME shapes.
 //
-// 🔴 MAINTAINER-VERIFIED: the exact Responses `item.type` / tool-call framing the real Codex
-// app-server accepts is UNCONFIRMED in code (agent/src/codex/codex-harness.ts marks the item
-// types "provisional … MUST be verified in the packaged integration (m3b:packaged)"). The
-// responders below are the current best model; a maintainer confirms them when the docker leg
-// first runs. The host leg — which is what CI/in-worker validation exercises — does not depend
-// on them.
+// VERIFIED 2026-09-10: the exact response/tool framing and parent/child interleaving below
+// completed through pinned Codex 0.153.2 in both native AMD64 worker images. The host leg
+// remains independent and uses an in-memory transport.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { randomBytes } from "node:crypto";
 
-import { message, patchTool, tool } from "../codex-m0/harness.mjs";
+import { message, tool } from "../codex-m0/harness.mjs";
 
 const DEADLINE_MS = 15_000;
 const MAX_BYTES = 4 * 1024 * 1024;
@@ -220,6 +217,8 @@ export class FakeProvider {
  */
 export interface LifecycleEvidence {
   steps: number;
+  /** A provider request carrying the delegated child's user task was observed. */
+  childTurns: number;
   /** A `Bash` tool call was emitted (drives the real command supervisor root). */
   bash: number;
   /** An `apply_patch` custom tool call was emitted (drives the real openat2 fileop root; it
@@ -246,36 +245,63 @@ export interface LifecycleEvidence {
  * from the credential/capability the boundary asserts absent). The returned `evidence` is mutated
  * in place as the run drives, so the test reads it AFTER the run.
  *
- * 🔴 MAINTAINER-VERIFIED: the exact Responses item framing the real Codex app-server accepts — and
- * how parent/child turn POSTs interleave — is unconfirmed in code (codex-harness.ts marks the item
- * types provisional). This is the current best model; the always-eventually `signal_done` is what
- * drives a clean run to `ran === true`. A maintainer confirms/tunes it when the docker leg runs.
+ * VERIFIED 2026-09-10: pinned Codex accepted this Responses framing and parent/child
+ * interleaving in both native AMD64 packaged images. The always-eventually
+ * `signal_done` keeps the fixture bounded after the scripted stages.
  */
 export function recordingLifecycleResponder(
   canaries: CodexCanaries,
 ): { respond: (body: ResponsesBody, provider: FakeProvider) => ResponseItem[]; evidence: LifecycleEvidence } {
   const evidence: LifecycleEvidence = {
-    steps: 0, bash: 0, patch: 0, spawn: 0, checkpoint: 0, submitPlan: 0, signalDone: 0, finish: 0,
+    steps: 0, childTurns: 0, bash: 0, patch: 0, spawn: 0, checkpoint: 0, submitPlan: 0, signalDone: 0, finish: 0,
   };
   // patchTool's FROZEN filename constraint is /^[a-z-]+$/, so map the canary to a filename-safe
   // form (the marker file only proves the fileop command root ran; the credential/capability
   // boundary is what the suite asserts). [#1171 m5 review]
   const patchName = canaries.patchArg.replace(/[^a-z-]+/g, "-");
-  const script: Array<{ item: () => ResponseItem; mark: () => void }> = [
-    { item: () => tool("cc-bash", "Bash", { command: `echo ${canaries.bashArg}` }) as ResponseItem, mark: () => { evidence.bash += 1; } },
-    { item: () => patchTool("cc-patch", patchName) as ResponseItem, mark: () => { evidence.patch += 1; } },
+  const script: Array<{ item: () => ResponseItem; mark: () => void; endsTurn?: boolean }> = [
+    { item: () => tool("cc-plan", "submit_plan", { plan_md: canaries.planArg }) as ResponseItem, mark: () => { evidence.submitPlan += 1; }, endsTurn: true },
+    { item: () => tool("cc-bash", "uzi_bash", { command: `echo ${canaries.bashArg}` }) as ResponseItem, mark: () => { evidence.bash += 1; } },
+    { item: () => tool("cc-patch", "uzi_apply_patch", { path: patchName, content: "M3b marker\n" }) as ResponseItem, mark: () => { evidence.patch += 1; } },
     { item: () => tool("cc-spawn", "spawn_agent", { subagent_type: "coder", prompt: canaries.spawnArg }) as ResponseItem, mark: () => { evidence.spawn += 1; } },
-    { item: () => tool("cc-ckpt", "checkpoint", {}) as ResponseItem, mark: () => { evidence.checkpoint += 1; } },
-    { item: () => tool("cc-plan", "submit_plan", { plan_md: canaries.planArg }) as ResponseItem, mark: () => { evidence.submitPlan += 1; } },
-    { item: () => tool("cc-done", "signal_done", {}) as ResponseItem, mark: () => { evidence.signalDone += 1; } },
+    { item: () => tool("cc-ckpt", "checkpoint", {}) as ResponseItem, mark: () => { evidence.checkpoint += 1; }, endsTurn: true },
+    { item: () => tool("cc-done", "signal_done", {}) as ResponseItem, mark: () => { evidence.signalDone += 1; }, endsTurn: true },
   ];
   let stage = 0;
-  const respond = (): ResponseItem[] => {
+  let finishNextRootTurn = false;
+  const isChildTurn = (body: ResponsesBody): boolean => {
+    const input = Array.isArray(body.input) ? body.input : [];
+    return input.some((item) => {
+      if (item === null || typeof item !== "object") return false;
+      const record = item as Record<string, unknown>;
+      // Pinned Codex may encode the turn's user input either as a message content
+      // array or as a direct input item. The parent can later retain spawnArg only
+      // inside its historical function_call arguments, which this exclusion keeps
+      // from being mistaken for the child thread.
+      return record.type !== "function_call" && JSON.stringify(record).includes(canaries.spawnArg);
+    });
+  };
+  const respond = (body: ResponsesBody): ResponseItem[] => {
     evidence.steps += 1;
+    // A spawn_agent callback starts a synchronous CHILD turn on the same provider.
+    // Complete that turn without consuming the root workflow's next scripted stage;
+    // the parent history later contains the spawn argument as a function call, but
+    // only the child's user message contains it as user content.
+    if (isChildTurn(body)) {
+      evidence.childTurns += 1;
+      evidence.finish += 1;
+      return [message("m3b child finished") as ResponseItem];
+    }
+    if (finishNextRootTurn) {
+      finishNextRootTurn = false;
+      evidence.finish += 1;
+      return [message("m3b lifecycle turn finished") as ResponseItem];
+    }
     const next = script[stage];
     if (next !== undefined) {
       stage += 1;
       next.mark();
+      finishNextRootTurn = next.endsTurn === true;
       return [next.item()];
     }
     evidence.finish += 1;
@@ -299,6 +325,35 @@ export function countToolCallbacks(requests: readonly ResponsesBody[]): number {
     }
   }
   return n;
+}
+
+/** Text returned to one provider-issued dynamic callback, observed in the next
+ * Responses request. This distinguishes "the fixture emitted a call" from "the
+ * app-server delivered it to the worker and fed the worker's result back". */
+export function toolCallbackTexts(requests: readonly ResponsesBody[], callId: string): string[] {
+  const texts: string[] = [];
+  for (const body of requests) {
+    const input = Array.isArray(body.input) ? body.input : [];
+    for (const item of input) {
+      if (item === null || typeof item !== "object") continue;
+      const record = item as Record<string, unknown>;
+      if (
+        (record.type !== "function_call_output" && record.type !== "custom_tool_call_output")
+        || record.call_id !== callId
+      ) continue;
+      if (typeof record.output === "string") {
+        texts.push(record.output);
+        continue;
+      }
+      if (!Array.isArray(record.output)) continue;
+      for (const content of record.output) {
+        if (content === null || typeof content !== "object") continue;
+        const text = (content as Record<string, unknown>).text;
+        if (typeof text === "string") texts.push(text);
+      }
+    }
+  }
+  return texts;
 }
 
 /** A trivial always-finish responder (a turn with no tool call, just a message). */

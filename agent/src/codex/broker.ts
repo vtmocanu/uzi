@@ -81,6 +81,38 @@ const CODEX_TOOL_ALIASES: ReadonlyMap<string, string> = new Map([
   ["Agent", "spawn_agent"],
 ]);
 
+/** Pinned Codex owns native spellings such as `Bash` and `apply_patch` (both
+ * empirically collided in the packaged proof), while app-server dynamic tools
+ * reserve every `mcp__*` name. `Read`/`Skill` are renamed defensively with the same
+ * rule. Advertise collision-free fixed wire aliases and map them back to canonical
+ * worker authority before any decision. */
+const CODEX_DYNAMIC_WIRE_NAMES: ReadonlyMap<string, string> = new Map([
+  ["Bash", "uzi_bash"],
+  ["apply_patch", "uzi_apply_patch"],
+  ["Read", "uzi_read"],
+  ["Skill", "uzi_skill"],
+  ["mcp__forge__get_issue", "uzi_forge_get_issue"],
+  ["mcp__forge__list_issues", "uzi_forge_list_issues"],
+  ["mcp__forge__get_merge_request", "uzi_forge_get_merge_request"],
+  ["mcp__forge__get_pipeline_jobs", "uzi_forge_get_pipeline_jobs"],
+  ["mcp__forge__latest_pipeline", "uzi_forge_latest_pipeline"],
+  ["mcp__forge__list_issue_label_events", "uzi_forge_list_issue_label_events"],
+  ["mcp__forge__reply_mr_thread", "uzi_forge_reply_mr_thread"],
+  ["mcp__forge__resolve_mr_thread", "uzi_forge_resolve_mr_thread"],
+  ["mcp__memory__save_memory", "uzi_memory_save_memory"],
+  ["mcp__findings__report_incidental_issue", "uzi_findings_report_incidental_issue"],
+]);
+const CODEX_DYNAMIC_CANONICAL_NAMES: ReadonlyMap<string, string> = new Map(
+  [...CODEX_DYNAMIC_WIRE_NAMES].map(([canonical, wire]) => [wire, canonical]),
+);
+
+/** Return the app-server-safe wire name for a canonical granted tool. An unknown
+ * MCP name has no production handler contract and is deliberately not advertised. */
+export function codexDynamicToolWireName(canonical: string): string | undefined {
+  if (canonical.startsWith("mcp__")) return CODEX_DYNAMIC_WIRE_NAMES.get(canonical);
+  return CODEX_DYNAMIC_WIRE_NAMES.get(canonical) ?? canonical;
+}
+
 // The five workflow signalling tools (agent/src/signals.ts:28-32). Bare names; the
 // `mcp__uzi__<name>` qualified forms normalize to these. scanSignals remains the
 // authoritative parser — this set is only for recognition/routing.
@@ -145,6 +177,8 @@ type Capability = "shell" | "file_write" | "file_read" | "signal" | "delegate" |
 
 /** Canonical callback name shared by the renderer and the enforcing broker. */
 export function canonicalizeCodexToolName(name: string): string {
+  const dynamic = CODEX_DYNAMIC_CANONICAL_NAMES.get(name);
+  if (dynamic !== undefined) return dynamic;
   const alias = CODEX_TOOL_ALIASES.get(name);
   if (alias !== undefined) return alias;
   const prefix = `mcp__${SIGNAL_SERVER_NAME}__`;
@@ -853,7 +887,7 @@ export class CodexCallbackBroker {
         return deny("denied_skill", `skill "${safeId(skill)}" is not granted to role "${safeId(this.grants.role)}"`);
       }
     }
-    const handler = this.toolHandlers?.get(name);
+    const handler = this.toolHandlers?.get(canonical);
     if (handler === undefined) {
       return deny("denied_tool", `no handler is wired for "${safeId(name)}"`);
     }

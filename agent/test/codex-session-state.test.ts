@@ -9,6 +9,7 @@ import { dirname, join } from "node:path";
 import {
   CodexSessionStore,
   createCodexSessionStore,
+  seedCodexSessionArtifacts,
   storeLockRegistrySize,
   CodexSessionStoreBoundError,
   CodexSessionStoreError,
@@ -190,6 +191,34 @@ describe(
     for (const rel of await collectRelFiles(genDir)) {
       assert.doesNotMatch(await fsp.readFile(join(genDir, rel), "utf8"), /SECRET/);
     }
+  });
+
+  it("runner seed reuses the allowlist and writes the final 2750/0640 posture", async () => {
+    await writeFileAt(join(codexHome, "sessions", "2026", "rollout-safe.jsonl"), "safe\n");
+    await CodexSessionStore.persist(codexHome, storeDir);
+
+    const stagedHome = join(root, "epoch-2.session-seed");
+    const adopted = await CodexSessionStore.adopt(
+      storeDir,
+      stagedHome,
+      { destination: "runner-seed" },
+    );
+    assert.equal(adopted.files, 1);
+    assert.equal((await fsp.stat(stagedHome)).mode & 0o777, 0o750);
+    assert.equal((await fsp.stat(join(stagedHome, "sessions", "2026", "rollout-safe.jsonl"))).mode & 0o777, 0o640);
+
+    // Defense in depth: even if the trusted staging step were later widened, the
+    // runner-side copy applies the same allowlist again.
+    await writeFileAt(join(stagedHome, "sessions", "auth-token.jsonl"), "never-copy\n");
+    await writeFileAt(join(stagedHome, "sessions", "notes.txt"), "never-copy\n");
+    const providerSessions = join(root, "epoch-2", "codex", "sessions");
+    await fsp.mkdir(providerSessions, { recursive: true, mode: 0o2750 });
+
+    const seeded = await seedCodexSessionArtifacts(join(stagedHome, "sessions"), providerSessions);
+    assert.equal(seeded.files, 1);
+    assert.deepEqual(await collectRelFiles(providerSessions), ["2026/rollout-safe.jsonl"]);
+    assert.equal((await fsp.stat(join(providerSessions, "2026"))).mode & 0o7777, 0o2750);
+    assert.equal((await fsp.stat(join(providerSessions, "2026", "rollout-safe.jsonl"))).mode & 0o777, 0o640);
   });
 
   it("adopt seeds a fresh codexHome/sessions from the store (round-trip preserves rollouts)", async () => {

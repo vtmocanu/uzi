@@ -7,6 +7,7 @@ import { join } from "node:path";
 import {
   assertNoUnexpectedSystemConfig,
   buildCodexConfigToml,
+  buildCodexLoopbackTestConfigToml,
   buildCodexProductionConfigToml,
   CodexUnexpectedSystemConfigError,
   type CodexConfigOptions,
@@ -45,7 +46,8 @@ describe("buildCodexConfigToml: stock native-disabled config", () => {
 
   it("pins every [features] native knob to its disabled value", () => {
     for (const key of [
-      "apps", "plugins", "shell_snapshot", "shell_snapshot_v2",
+      "apps", "plugins", "shell_tool", "view_image", "sleep_tool", "apply_patch_freeform",
+      "shell_snapshot", "shell_snapshot_v2",
       "code_mode", "code_mode_only", "code_mode_host", "code_mode_prewarm",
       "remote_models", "unified_exec", "hooks", "multi_agent", "multi_agent_v2",
       "enable_request_compression",
@@ -136,5 +138,45 @@ describe("buildCodexProductionConfigToml: fixed managed-auth provider", () => {
       () => buildCodexProductionConfigToml({ model: "gpt-6-astra", projectPath: "/work/repo", authMode: "oauth" } as never),
       /explicit supported auth mode/,
     );
+  });
+});
+
+describe("buildCodexLoopbackTestConfigToml: authenticated packaged fake", () => {
+  const opts = {
+    model: "gpt-6-astra",
+    projectPath: "/work/repo",
+    authMode: "subscription" as const,
+  };
+
+  it("uses pinned Codex's authenticated custom-provider test shape with WebSockets off", () => {
+    const toml = buildCodexLoopbackTestConfigToml(opts, "http://127.0.0.1:43123/v1");
+    assert.match(toml, /^model_provider = "uzi-m3b-openai"$/m);
+    assert.match(toml, /^\[model_providers\."uzi-m3b-openai"\]$/m);
+    assert.match(toml, /^name = "OpenAI"$/m);
+    assert.match(toml, /^base_url = "http:\/\/127\.0\.0\.1:43123\/v1"$/m);
+    assert.match(toml, /^supports_websockets = false$/m);
+    assert.match(toml, /^requires_openai_auth = true$/m);
+    assert.doesNotMatch(toml, /env_key/);
+  });
+
+  it("rejects every non-literal-loopback redirect and credential-bearing URL", () => {
+    for (const value of [
+      "https://127.0.0.1:43123/v1",
+      "http://localhost:43123/v1",
+      "http://127.0.0.1/v1",
+      "http://127.0.0.1:43123/other",
+      "http://user:secret@127.0.0.1:43123/v1",
+      "http://127.0.0.1:43123/v1?target=external",
+      "http://0x7f000001:43123/v1",
+      "http://2130706433:43123/v1",
+      "http://127.0.0.1:80/v1",
+      "https://api.openai.com/v1",
+    ]) {
+      assert.throws(
+        () => buildCodexLoopbackTestConfigToml(opts, value),
+        /loopback test base URL/,
+        value,
+      );
+    }
   });
 });

@@ -51,6 +51,7 @@
 // {@link CodexHarnessError} throw (Claude's clean-EOF `exhausted` is unaffected).
 
 import { renderCodexRun } from "./render.js";
+import { buildCodexDynamicTools } from "./dynamic-tools.js";
 import { CODEX_DELEGATE_TOOLS, CODEX_SIGNAL_TOOLS, canonicalizeCodexToolName } from "./broker.js";
 import { normalizeCodexStatus, normalizeCodexTerminalErrors, normalizeCodexUsage } from "./terminal-normalize.js";
 
@@ -107,8 +108,9 @@ export interface CodexProviderConfig {
 }
 
 /** The spec the harness builds and hands to {@link CodexHarnessOptions.launchRoot}. It
- *  carries only trusted, launcher-fixed values plus the per-run home/workspace; the
- *  credential rides here (→ the app-server env) and never anywhere model-visible. */
+ *  carries only trusted, launcher-fixed values plus the per-run home/workspace. Managed
+ *  app-server auth keeps the credential out of this shape; the optional legacy
+ *  transitional credential remains private and never becomes model-visible. */
 export interface CodexLaunchRootSpec {
   readonly kind: "provider";
   readonly provider: CodexProviderConfig;
@@ -117,6 +119,9 @@ export interface CodexLaunchRootSpec {
   readonly cwd: string;
   /** The runner-writable owned data root for the per-launch HOME/CODEX_HOME/XDG trees. */
   readonly ownedDataRoot: string;
+  /** Executor-owned resume bit. Production derives the only allowed staging path from
+   * ownedDataRoot; no caller- or model-supplied source path crosses the launcher. */
+  readonly seedSession?: boolean;
   /** The provider credential; PRIVATE — the seam forwards it to the launcher env only. */
   readonly credentialValue?: string;
 }
@@ -665,9 +670,14 @@ export class CodexHarness implements RunHarness {
         modelProvider: this.provider.name,
         cwd: this.workspace,
         approvalPolicy: "never",
-        ephemeral: true,
+        // Run roots must persist their rollout under CODEX_HOME so approval and
+        // cooperative-checkpoint root recreation can adopt it and thread/resume.
+        // Child and advice threads remain ephemeral because they are never resumed.
+        ephemeral: false,
+        environments: [],
+        dynamicTools: buildCodexDynamicTools(rendered.leadGrants),
         config: this.threadConfig(),
-        instructions: rendered.leadPrompt.systemPrompt,
+        developerInstructions: rendered.leadPrompt.systemPrompt,
       },
       { signal },
     );
@@ -693,7 +703,7 @@ export class CodexHarness implements RunHarness {
         cwd: this.workspace,
         approvalPolicy: "never",
         config: this.threadConfig(),
-        instructions: rendered.leadPrompt.systemPrompt,
+        developerInstructions: rendered.leadPrompt.systemPrompt,
       },
       { signal: request.signal },
     );
@@ -952,12 +962,11 @@ export class CodexHarness implements RunHarness {
     };
   }
 
-  // PROVISIONAL item-type strings. The exact app-server `item.type` values below
-  // ("agentMessage"/"assistantMessage"/"agent_message"/"reasoning") are NOT yet confirmed
-  // against a real app-server — they are the current best guess. They MUST be verified in
-  // the packaged integration (m3b:packaged) before they are trusted; do NOT add or rename
-  // a type here on a guess. An unrecognized type intentionally falls through to `[]`, which
-  // the caller surfaces as `activity` (never a frame) — the safe default.
+  // VERIFIED 2026-09-10: the native both-image packaged proof drove pinned Codex
+  // 0.153.2 and confirmed its active agent-message form decodes to a non-empty public
+  // frame. The alternate spellings and reasoning arm remain compatibility cases; do
+  // not add or rename a type on a guess. An unrecognized type intentionally falls
+  // through to `[]`, which the caller surfaces as `activity` (never a frame).
   private decodeItemContent(item: Record<string, unknown>): HarnessItem[] {
     const type = asString(item.type);
     if (type === "agentMessage" || type === "assistantMessage" || type === "agent_message") {

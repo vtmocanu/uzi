@@ -66,6 +66,9 @@ export interface DelegationRole {
  *  resolved model/effort, the parent lineage and the combined abort signal. */
 export interface StartChildTurnSpec {
   readonly role: string;
+  /** The immutable child-role grants also define the dynamic tools registered on
+   * its fresh app-server thread. */
+  readonly grants: RunGrants;
   readonly systemPrompt: string;
   /** The model-supplied task text (from the parent's spawn args) — UNTRUSTED DATA
    *  passed as the child turn's input, never as authority. */
@@ -268,6 +271,7 @@ export class CodexDelegationRunner {
     try {
       controller = await this.startChildTurn({
         role: request.role,
+        grants: roleDef.grants,
         systemPrompt: roleDef.systemPrompt,
         taskInput,
         model: roleDef.model,

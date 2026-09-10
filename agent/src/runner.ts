@@ -689,23 +689,31 @@ export class RunRunner {
       // (push/base-align/MR, or the pause/not_code/report-only early returns) runs under the
       // held permit — its per-sink reconcile + quiesce+reap close admission and tear down the
       // provider root before any PAT git op. For Claude/stub this is a plain call (the legacy
-      // reap already happened at the untouched security boundary). A CodexBoundaryError here
-      // (terminal/finalize) is NOT swallowed — it propagates to the failed-run report below
-      // (executeClaim's catch classifies it as a generic failure, never a limit/pause/shutdown
-      // branch, since CodexBoundaryError is none of those types).
+      // reap already happened at the untouched security boundary). A CodexBoundaryError before
+      // a committed publish still propagates to the failed-run report below. Once phasePublish
+      // registers the committed terminal callback, however, the pushed branch/open MR is the
+      // authoritative outcome and must be reported after the boundary releases.
       let postFinalizeTerminal: (() => Promise<void>) | undefined;
-      await this.withCodexBoundaryOnly(
-        executor,
-        { boundary: "finalize", deadlineMs: this.codexBoundaryDeadlineMs },
-        (permit) => this.phasePublish(
-          claim,
-          flight,
-          permit?.signal,
-          executor.safety
-            ? (report) => { postFinalizeTerminal = report; }
-            : undefined,
-        ),
-      );
+      try {
+        await this.withCodexBoundaryOnly(
+          executor,
+          { boundary: "finalize", deadlineMs: this.codexBoundaryDeadlineMs },
+          (permit) => this.phasePublish(
+            claim,
+            flight,
+            permit?.signal,
+            executor.safety
+              ? (report) => { postFinalizeTerminal = report; }
+              : undefined,
+          ),
+        );
+      } catch (err) {
+        if (!postFinalizeTerminal || !isCodexBoundaryError(err)) throw err;
+        runLog.warn(
+          "Codex finalize boundary failed after committed publish; reporting committed terminal outcome",
+          { error: errMessage(err) },
+        );
+      }
       // Once a branch push or MR creation succeeds, its terminal record is irreversible
       // bookkeeping for an already-committed forge side effect. Deliver it only after the
       // Codex boundary has released, with the normal terminal retry schedule and without

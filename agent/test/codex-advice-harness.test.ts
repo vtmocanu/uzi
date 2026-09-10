@@ -528,6 +528,7 @@ describe("CodexAdviceHarness: the tool-less advice ceiling (by construction)", (
     assert.deepEqual(
       Object.keys(features).sort(),
       [
+        "apply_patch_freeform",
         "apps",
         "code_mode",
         "code_mode_host",
@@ -541,7 +542,10 @@ describe("CodexAdviceHarness: the tool-less advice ceiling (by construction)", (
         "remote_models",
         "shell_snapshot",
         "shell_snapshot_v2",
+        "shell_tool",
+        "sleep_tool",
         "unified_exec",
+        "view_image",
       ],
       "the complete characterized feature ceiling stays explicit",
     );
@@ -552,6 +556,10 @@ describe("CodexAdviceHarness: the tool-less advice ceiling (by construction)", (
     );
     assert.equal((config.agents as Record<string, unknown>).enabled, false);
     assert.equal(params.approvalPolicy, "never");
+    assert.deepEqual(params.environments, [], "no native execution environment is attached");
+    assert.deepEqual(params.dynamicTools, [], "advice receives no worker callback tools");
+    assert.equal(params.developerInstructions, "you are the reviewer");
+    assert.equal(params.instructions, undefined, "the ignored legacy field is never sent");
     // No hook-trust bypass anywhere in the start params.
     assert.ok(!JSON.stringify(params).includes("bypass_hook_trust"));
     assert.ok(!JSON.stringify(params).includes("dangerously-bypass-hook-trust"));

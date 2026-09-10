@@ -40,6 +40,7 @@ import type { Logger } from "../src/log.js";
 import type { AgentTemplate } from "../src/protocol.js";
 import type { BoundaryRequest } from "../src/harness.js";
 import type { CodexEffectLaunchSpec, CodexRootHandle } from "../src/codex/launcher.js";
+import { CODEX_M3B_LOOPBACK_PROVIDER_NAME } from "../src/codex/config.js";
 
 // PRD #1171 (M3, milestone 3, Phase 2A) — the production CodexExecutor + the claim-aware
 // DARK selection seam, driven with an in-memory transport and scripted app-server frames
@@ -409,6 +410,7 @@ function makeRig(opts: { responder?: Responder; token?: string } = {}): Rig {
       // always undefined here (the harness zeroes it when appServerAuth is present).
       (transport as unknown as { launchAuthMode?: string; specCredential?: string }).launchAuthMode = authMode;
       (transport as unknown as { launchAuthMode?: string; specCredential?: string }).specCredential = spec.credentialValue;
+      (transport as unknown as { specProviderName?: string }).specProviderName = spec.provider.name;
       return { root, transport, supervisorPid: 1234 };
     },
     spawnCommand: async (argv, cmdOpts) => {
@@ -895,6 +897,29 @@ describe("CodexExecutor: credential bridge + isolation", () => {
     assert.equal((rig.transport as unknown as { launchAuthMode?: string }).launchAuthMode, "api_key");
   });
 
+  it("the packaged loopback seam keeps config and thread/start on the same custom provider", async () => {
+    const rig = makeRig();
+    rig.deps = {
+      ...rig.deps,
+      appServerAuthOpenAIBaseUrlForTest: "http://127.0.0.1:43123/v1",
+    };
+    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    await withTimeout(makeExecutor(rig, bindingOf(API_KEY)).run(makeCtx().ctx), 3000, "loopback provider selection");
+
+    assert.equal(
+      (rig.transport as unknown as { specProviderName?: string }).specProviderName,
+      CODEX_M3B_LOOPBACK_PROVIDER_NAME,
+      "the launcher spec selects the fixed loopback provider",
+    );
+    const start = rig.transport.requests.find((request) => request.method === "thread/start");
+    assert.ok(start);
+    assert.equal(
+      rec(start.params).modelProvider,
+      CODEX_M3B_LOOPBACK_PROVIDER_NAME,
+      "thread/start must not override the config back to the production provider",
+    );
+  });
+
   it("(3-run) an api_key run NEVER calls refresh", async () => {
     const rig = makeRig();
     rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
@@ -993,7 +1018,7 @@ describe("CodexExecutor: child-thread delegation demux (part C)", () => {
         if (c.turnStartCount === 1) return { turn: { id: "tn-1" } };
         // The CHILD turn: emit its callbacks + terminal now that the sink is registered.
         c.transport
-          .push(toolCall(11, "Bash", { command: "echo hi" }, "th-child", "tn-child", "cc-bash"))
+          .push(toolCall(11, "uzi_bash", { command: "echo hi" }, "th-child", "tn-child", "cc-bash"))
           .push(toolCall(12, "submit_plan", { plan: "child cannot plan" }, "th-child", "tn-child", "cc-sig"))
           .push(toolCall(13, "spawn_agent", { role: "coder" }, "th-child", "tn-child", "cc-nest"))
           .push(turnCompleted("completed", "th-child", "tn-child"));
@@ -1021,6 +1046,16 @@ describe("CodexExecutor: child-thread delegation demux (part C)", () => {
     // A child thread + turn were started on the SAME transport (demuxed).
     assert.equal(rig.transport.threadStartCount, 2, "a child thread/start was issued");
     assert.equal(rig.transport.turnStartCount, 2, "a child turn/start was issued");
+    const childStart = rig.transport.requests.filter((request) => request.method === "thread/start")[1];
+    assert.ok(childStart);
+    const childParams = rec(childStart.params);
+    assert.deepEqual(childParams.environments, [], "the child receives no native execution environment");
+    const childTools = childParams.dynamicTools as Array<Record<string, unknown>>;
+    assert.ok(childTools.some((tool) => tool.name === "uzi_bash"), "the child's granted shell callback uses the collision-free wire alias");
+    assert.equal(childTools.some((tool) => tool.name === "signal_done"), false, "root signals are not advertised to a child");
+    assert.equal(childTools.some((tool) => tool.name === "spawn_agent"), false, "nested delegation is not advertised to a child");
+    assert.match(String(childParams.developerInstructions), /^coder body\n\n/, "the rendered child prompt uses the real protocol field");
+    assert.equal(childParams.instructions, undefined);
 
     // The child's Bash effect ran as the command identity (through the demux + child broker).
     const bash = rig.spawnCommandCalls.find((s) => JSON.stringify(s.argv).includes("echo hi"));

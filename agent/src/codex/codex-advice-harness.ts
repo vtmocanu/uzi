@@ -457,6 +457,10 @@ export class CodexAdviceHarness implements AdviceHarness {
       features: {
         apps: false,
         plugins: false,
+        shell_tool: false,
+        view_image: false,
+        sleep_tool: false,
+        apply_patch_freeform: false,
         shell_snapshot: false,
         shell_snapshot_v2: false,
         code_mode: false,
@@ -489,8 +493,10 @@ export class CodexAdviceHarness implements AdviceHarness {
         cwd,
         approvalPolicy: "never",
         ephemeral: true,
+        environments: [],
+        dynamicTools: [],
         config: this.adviceThreadConfig(cwd),
-        instructions: rendered.systemPrompt,
+        developerInstructions: rendered.systemPrompt,
       },
       { signal },
     );

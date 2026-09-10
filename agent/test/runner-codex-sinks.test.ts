@@ -23,6 +23,7 @@ import { selectCodexBinding, type CodexBinding } from "../src/codex/select.js";
 import type { CodexExecutionSafety } from "../src/harness.js";
 import { resolveBoundaryExecutable } from "../src/git.js";
 import { GitLabClient } from "../src/forge.js";
+import { recordingLogger } from "./helpers.js";
 import {
   api,
   client,
@@ -384,6 +385,38 @@ describe("RunRunner m4 — Codex durability sinks route through withBoundary", (
     } finally {
       client.reportState = originalReportState;
     }
+  });
+
+  it("reports the committed MR instead of failing when the finalize boundary errors after publication", async () => {
+    const { gitlab, calls } = fakeGitlab();
+    const rig = codexRig();
+    const originalWithBoundary = rig.safety.withBoundary.bind(rig.safety);
+    rig.safety.withBoundary = async (request, action) => {
+      const value = await originalWithBoundary(request, action);
+      if (request.boundary === "finalize") {
+        const error = new Error("deadline expired after action settlement");
+        error.name = "CodexBoundaryError";
+        throw error;
+      }
+      return value;
+    };
+    const { logger, lines } = recordingLogger();
+    const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
+      commitInTree(ctx.worktreePath, "LATE-BOUNDARY.txt", "published before boundary error\n");
+      return { branch: ctx.branch };
+    });
+    const claim = gitlabClaim(1222);
+    await runnerWith(() => ({ executor: exec }), gitlab, undefined, logger).execute(claim);
+
+    assert.equal(calls.length, 1, "the MR was already created before the boundary error");
+    assert.ok(statuses(claim.run_id).includes("completed"), "the committed publish is reported completed");
+    assert.ok(!statuses(claim.run_id).includes("failed"), "the committed publish is never misreported failed");
+    assert.ok(
+      lines.some((line) =>
+        (line as { msg?: string }).msg ===
+        "Codex finalize boundary failed after committed publish; reporting committed terminal outcome"),
+      "the swallowed post-publish boundary error is logged",
+    );
   });
 
   it("(1) checkpoint reap:true routes through withBoundary (boundary=checkpoint)", async () => {

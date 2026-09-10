@@ -615,7 +615,7 @@ describe("CodexHarness: kind + thread configuration", () => {
     );
   });
 
-  it("thread/start carries an EXPLICIT untrusted project + doc_max_bytes 0 and NEVER a hook-trust bypass", async () => {
+  it("thread/start carries worker dynamic tools, no native environment, explicit instructions/trust, and no hook bypass", async () => {
     const { harness, transport } = makeHarness();
     transport.push(threadStarted()).end();
     const turn = harness.startTurn(makeRequest());
@@ -625,7 +625,15 @@ describe("CodexHarness: kind + thread configuration", () => {
     const start = transport.requests.find((r) => r.method === "thread/start");
     assert.ok(start, "thread/start was sent");
     const params = rec(start.params);
+    assert.equal(params.ephemeral, false, "run roots persist the rollout required by new-root resume");
     const config = rec(params.config);
+    assert.deepEqual(params.environments, [], "an empty environment list disables native shell and patch tools");
+    const dynamicTools = params.dynamicTools as Array<Record<string, unknown>>;
+    assert.ok(dynamicTools.some((tool) => tool.name === "signal_done"), "the root callback vocabulary is registered");
+    assert.ok(dynamicTools.some((tool) => tool.name === "uzi_bash"), "the screened shell callback uses a collision-free wire alias");
+    assert.equal(dynamicTools.some((tool) => tool.name === "SubagentStart"), false, "code-mode lifecycle names are not model-visible");
+    assert.equal(params.developerInstructions, "you are the lead");
+    assert.equal(params.instructions, undefined, "the ignored legacy field is never sent");
     assert.equal(config.project_doc_max_bytes, 0);
     const projects = rec(config.projects);
     assert.deepEqual(projects[WORKSPACE], { trust_level: "untrusted" });
@@ -647,6 +655,10 @@ describe("CodexHarness: kind + thread configuration", () => {
     assert.ok(resume, "thread/resume was sent");
     const params = rec(resume.params);
     assert.equal(params.threadId, "resumed-1");
+    assert.equal(params.dynamicTools, undefined, "pinned thread/resume restores dynamic tools from persisted history");
+    assert.equal(params.environments, undefined, "pinned thread/resume restores the empty environment selection from history");
+    assert.equal(params.developerInstructions, "you are the lead");
+    assert.equal(params.instructions, undefined);
     const config = rec(params.config);
     assert.equal(config.project_doc_max_bytes, 0);
     assert.deepEqual(rec(config.projects)[WORKSPACE], { trust_level: "untrusted" });

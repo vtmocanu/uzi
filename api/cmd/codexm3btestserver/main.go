@@ -33,6 +33,7 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -277,7 +278,12 @@ func seedFixtures(ctx context.Context, pool *pgxpool.Pool, q *store.Queries, box
 // per-claim capability. It also wires the in-process refresh fake to return the frozen
 // tuple so a coordinated refresh advances.
 func seedSubscription(ctx context.Context, pool *pgxpool.Pool, q *store.Queries, box *secretbox.Box, wsvc *workersvc.Service, ownerID, repoID, workerID uuid.UUID) (subscriptionContract, error) {
-	accessToken := "canary-sub-access-" + uuid.NewString()
+	providerUserID := "canary-provider-" + uuid.NewString()
+	chatGPTAccountID := "canary-account-" + uuid.NewString()
+	accessToken, err := fakeChatGPTAccessToken(chatGPTAccountID, uuid.NewString())
+	if err != nil {
+		return subscriptionContract{}, fmt.Errorf("build access token: %w", err)
+	}
 	refreshToken := "canary-sub-refresh-" + uuid.NewString()
 	login := fmt.Sprintf(`{"access_token":%q,"refresh_token":%q}`, accessToken, refreshToken)
 	sealedLogin, err := box.Seal([]byte(login))
@@ -292,8 +298,6 @@ func seedSubscription(ctx context.Context, pool *pgxpool.Pool, q *store.Queries,
 		return subscriptionContract{}, fmt.Errorf("insert codex secret: %w", err)
 	}
 
-	providerUserID := "canary-provider-" + uuid.NewString()
-	chatGPTAccountID := "canary-account-" + uuid.NewString()
 	account, err := q.InsertCodexProviderAccount(ctx, store.InsertCodexProviderAccountParams{
 		UserID: ownerID, ProviderUserID: providerUserID, WorkspaceAccountID: chatGPTAccountID,
 		SealedLogin: sealedLogin, SealedWith: store.SealedWithMaster,
@@ -335,8 +339,12 @@ func seedSubscription(ctx context.Context, pool *pgxpool.Pool, q *store.Queries,
 
 	// Wire the in-process refresh fake to the frozen tuple so CoordinatedCodexRefresh
 	// advances (rather than quarantining on a mismatch) and commits a canary rotated token.
+	rotatedAccessToken, err := fakeChatGPTAccessToken(chatGPTAccountID, uuid.NewString())
+	if err != nil {
+		return subscriptionContract{}, fmt.Errorf("build rotated access token: %w", err)
+	}
 	wsvc.SetCodexRefresh(&fakeCodexRefresh{
-		newAccessToken: "canary-sub-access-new-" + uuid.NewString(),
+		newAccessToken: rotatedAccessToken,
 		newRefresh:     "canary-sub-refresh-new-" + uuid.NewString(),
 		identity:       codexauth.Identity{ProviderUserID: providerUserID, WorkspaceAccountID: chatGPTAccountID},
 	})
@@ -347,6 +355,30 @@ func seedSubscription(ctx context.Context, pool *pgxpool.Pool, q *store.Queries,
 		ChatGPTAccountID: chatGPTAccountID,
 		Generation:       account.Generation,
 	}, nil
+}
+
+// fakeChatGPTAccessToken builds the syntactically valid unsigned JWT shape pinned Codex
+// requires for its external chatgptAuthTokens login. Codex parses these claims but does not
+// verify a signature on this caller-supplied external-auth path. The random id keeps refresh
+// material distinct, and every value exists only inside this throwaway test server.
+func fakeChatGPTAccessToken(accountID, tokenID string) (string, error) {
+	header, err := json.Marshal(map[string]string{"alg": "none", "typ": "JWT"})
+	if err != nil {
+		return "", err
+	}
+	payload, err := json.Marshal(map[string]any{
+		"email": "m3b@example.test",
+		"jti":   "canary-" + tokenID,
+		"https://api.openai.com/auth": map[string]any{
+			"chatgpt_plan_type":  "pro",
+			"chatgpt_account_id": accountID,
+		},
+	})
+	if err != nil {
+		return "", err
+	}
+	encode := base64.RawURLEncoding.EncodeToString
+	return encode(header) + "." + encode(payload) + "." + encode([]byte("test-signature")), nil
 }
 
 // seedAPIKey mirrors an api_key-mode run: an openai_api_key alias sealing a canary static
