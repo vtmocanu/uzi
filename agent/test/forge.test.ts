@@ -23,13 +23,14 @@ interface Call {
   headers: Record<string, string>;
   body?: string;
   redirect?: string;
+  signal?: AbortSignal | null;
 }
 
 function recorder(responses: Array<{ status: number; body: unknown }>): { fetchFn: FetchFn; calls: Call[] } {
   const calls: Call[] = [];
   let i = 0;
   const fetchFn: FetchFn = async (url, init) => {
-    calls.push({ url, method: init.method, headers: init.headers, body: init.body, redirect: init.redirect });
+    calls.push({ url, method: init.method, headers: init.headers, body: init.body, redirect: init.redirect, signal: init.signal });
     const r = responses[Math.min(i, responses.length - 1)]!;
     i++;
     return { status: r.status, text: async () => (typeof r.body === "string" ? r.body : JSON.stringify(r.body)) };
@@ -77,6 +78,36 @@ describe("GitLabClient.createMergeRequest", () => {
     assert.strictEqual(calls[1]!.method, "GET");
     assert.strictEqual(calls[1]!.headers["PRIVATE-TOKEN"], PAT);
     assert.match(calls[1]!.url, /state=opened&source_branch=agent%2Fissue-5/);
+  });
+
+  it("propagates boundary cancellation through the duplicate-MR lookup GET", async () => {
+    const calls: Call[] = [];
+    let lookupSettled = false;
+    const fetchFn: FetchFn = async (url, init) => {
+      calls.push({ url, method: init.method, headers: init.headers, body: init.body, redirect: init.redirect, signal: init.signal });
+      if (calls.length === 1) return { status: 409, text: async () => "duplicate" };
+      assert.ok(init.signal, "duplicate-MR lookup must receive the boundary signal");
+      await new Promise<void>((_, reject) => {
+        const abort = (): void => {
+          lookupSettled = true;
+          reject(new Error("lookup cancelled"));
+        };
+        if (init.signal?.aborted) abort();
+        else init.signal?.addEventListener("abort", abort, { once: true });
+      });
+      throw new Error("unreachable");
+    };
+    const abort = new AbortController();
+    const startedAt = Date.now();
+    const lookup = new GitLabClient({ fetchFn, httpTimeoutMs: 5_000 }).createMergeRequest(base, abort.signal);
+    setTimeout(() => abort.abort(), 10);
+
+    await assert.rejects(lookup, /lookup cancelled/);
+    assert.equal(calls.length, 2);
+    assert.equal(calls[1]?.method, "GET");
+    assert.equal(calls[1]?.signal?.aborted, true);
+    assert.equal(lookupSettled, true, "createMergeRequest waited for the lookup to observe cancellation");
+    assert.ok(Date.now() - startedAt < 1_000, "the independent 5s lookup timeout did not control cancellation");
   });
 
   it("throws a ForgeError (no PAT in the message) on an unexpected status", async () => {

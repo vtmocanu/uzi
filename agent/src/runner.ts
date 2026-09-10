@@ -13,6 +13,7 @@ import {
 import type { SecretFinding } from "./secret-scan-guard.js";
 import type { Executor, ExecutorResult, RunContext } from "./executor.js";
 import { PlanRejectedError } from "./executor.js";
+import type { BoundaryPermit, BoundaryRequest } from "./harness.js";
 import { skillsPluginDir } from "./skills-plugin.js";
 import { describeLimit, LimitReachedError } from "./limit.js";
 import type { Logger } from "./log.js";
@@ -21,6 +22,7 @@ import type {
   AgentSource,
   AgentTemplate,
   AskUserQuestion,
+  ClaimCodexSecrets,
   ClaimConfig,
   ClaimResponse,
   IterationBudget,
@@ -69,6 +71,16 @@ import { REASON_NO_TOKEN, TransientRecoveryError } from "./sdk-executor.js";
 /** Cap on a reported failure_reason, matching the forge error-body cap
  *  (forge.ts) so a runaway SDK error can't bloat the run row or the stream. */
 const MAX_FAILURE_REASON_LEN = 512;
+
+/** PRD #1171 m4: a name-based CodexBoundaryError probe. The runner stays HARNESS-AGNOSTIC and
+ *  never imports from agent/src/codex/**, so it recognizes the boundary-blocked error — thrown
+ *  by the executor-owned safety facade when a durability sink could not reap/reconcile (sink
+ *  counter zero, publication blocked) — by its `name`, not by `instanceof`. On a best-effort
+ *  sink (park/shutdown/recovery) this lets the runner fold it into the existing publish-failure
+ *  outcome; a terminal/finalize sink lets it propagate to the failed-run report. */
+function isCodexBoundaryError(err: unknown): boolean {
+  return err instanceof Error && err.name === "CodexBoundaryError";
+}
 
 /** PRD #974 follow-up (#1077): a terminal push_secret_blocked report whose reportState
  *  exhausted its bounded retries and threw. Carrying the typed origin + safe reason through
@@ -307,8 +319,12 @@ export interface RunExecution {
   homeDir?: string;
 }
 
-/** Build a per-execution executor for a run id (called once per `execute`). */
-export type ExecutorFactory = (runId: string) => RunExecution;
+/** Build a per-execution executor for a run id (called once per `execute`). PRD #1171 M3:
+ *  widened with the optional claim Codex binding so the factory's DARK selection seam can
+ *  build a Codex executor for an internally-bound claim; absent (the ordinary Claude claim)
+ *  takes the exact legacy path. The chat lane's `makeChatExecutor` is a DIFFERENT type and
+ *  is untouched. */
+export type ExecutorFactory = (runId: string, codex?: ClaimCodexSecrets) => RunExecution;
 
 /**
  * PRD #218 M1 — the worker-shutdown registry entry for one in-flight run. A graceful
@@ -347,6 +363,7 @@ interface RunFlight {
   readonly steering: SteeringChannel;
   readonly reportState: (
     body: Parameters<WorkerClient["reportState"]>[1],
+    signal?: AbortSignal,
   ) => ReturnType<WorkerClient["reportState"]>;
   observedSessionId: string | undefined;
   barePath: string | undefined;
@@ -416,6 +433,10 @@ export interface RunnerOptions {
   shutdownPublishTimeoutMs?: number;
   /** Delay between local recovery capture / state-report attempts (capped at 30s). */
   recoveryRetryMs?: number;
+  /** PRD #1171 m4: the bounded absolute deadline (ms) for a Codex durability-sink
+   *  `withBoundary` (quiesce → reap → action). NEVER unbounded. Default 30s. Only used when the
+   *  executor is Codex-selected (`executor.safety`); a Claude/stub run ignores it. */
+  codexBoundaryDeadlineMs?: number;
   /** Injectable clock for tests; defaults to Date.now. */
   now?: () => number;
   /** Injectable answer-deadline timer for tests; defaults to setTimeout (unref'd)
@@ -463,6 +484,8 @@ export class RunRunner {
   /** PRD #1030 M4: client-side cap (ms) on the graceful-shutdown durability sequence. */
   private readonly shutdownPublishTimeoutMs: number;
   private readonly recoveryRetryMs: number;
+  /** PRD #1171 m4: bounded absolute deadline (ms) for a Codex durability-sink withBoundary. */
+  private readonly codexBoundaryDeadlineMs: number;
   /** PRD #267: injectable clock (defaults to Date.now), so the time-gate is testable.
    *  Also feeds the PRD #88 answer-deadline math (askUser), so that budget is testable
    *  on the same clock. */
@@ -541,6 +564,11 @@ export class RunRunner {
     this.checkpointIntervalMs = opts.checkpointIntervalMs ?? 20 * 60_000;
     this.shutdownPublishTimeoutMs = opts.shutdownPublishTimeoutMs ?? 15_000;
     this.recoveryRetryMs = Math.max(1, Math.min(opts.recoveryRetryMs ?? 1_000, 30_000));
+    // PRD #1171 m4: bounded, never unbounded. Clamp a caller-supplied 0/negative to the default.
+    this.codexBoundaryDeadlineMs =
+      opts.codexBoundaryDeadlineMs && opts.codexBoundaryDeadlineMs > 0
+        ? opts.codexBoundaryDeadlineMs
+        : 30_000;
     this.now = opts.now ?? (() => Date.now());
     this.setTimer =
       opts.setTimer ??
@@ -607,9 +635,19 @@ export class RunRunner {
 
   private async executeClaim(claim: ClaimResponse): Promise<void> {
     const runId = claim.run_id;
+    // PRD #1171 M3 (redactor canary hoist): register the Codex access-token + capability
+    // canaries with the logger BEFORE makeExecutor, so a construction error inside the
+    // Codex executor factory can never log an unredacted token. Both are secrets; absent on
+    // an ordinary Claude claim (empty array ⇒ no-op). They join runScopedSecrets so the
+    // terminal eviction (below) covers them, and buildFlight appends them to both redactors.
+    const codexCanaries: string[] = claim.secrets.codex
+      ? [claim.secrets.codex.access_token, claim.secrets.codex.capability]
+      : [];
+    for (const s of codexCanaries) this.log.addSecret(s);
     // This run's OWN executor + private HOME (PRD #42 Decisions 4/5), built fresh
-    // per execution so nothing subprocess-scoped is shared with a concurrent run.
-    const { executor, homeDir: runHome } = this.makeExecutor(runId);
+    // per execution so nothing subprocess-scoped is shared with a concurrent run. The
+    // DARK Codex selection seam reads claim.secrets.codex (absent ⇒ the literal Claude path).
+    const { executor, homeDir: runHome } = this.makeExecutor(runId, claim.secrets.codex);
     // Register per-run secrets with the logger so they are scrubbed from any
     // output, then never log the claim payload itself. Tracked in runScopedSecrets
     // and evicted on terminal (Decision 7) so a completed run's PAT/token does not
@@ -626,6 +664,11 @@ export class RunRunner {
     if (claim.secrets.anthropic_oauth_token)
       runScopedSecrets.push(claim.secrets.anthropic_oauth_token);
     for (const s of runScopedSecrets) this.log.addSecret(s);
+    // The codex canaries were ALREADY addSecret'd above (before makeExecutor); append them
+    // to runScopedSecrets AFTER the add loop — never inside it — so each is registered
+    // exactly ONCE yet still evicted at the terminal (removeSecret is ref-counted, so a
+    // second add here would leave a dangling registration the single eviction can't clear).
+    runScopedSecrets.push(...codexCanaries);
 
     const flight = this.buildFlight(
       claim,
@@ -640,7 +683,42 @@ export class RunRunner {
       await this.phaseClone(claim, flight);
       const sessionId = await this.phaseResume(claim, flight);
       await this.phasePreflightHandoff(claim, flight, sessionId);
-      await this.phasePublish(claim, flight);
+      // PRD #1171 m4: the finalize sink. phasePreflightHandoff already ran the
+      // security-boundary reap (its killAgentTree?.() — no-op for Codex); this wrapper adds the
+      // Codex-ONLY finalize withBoundary so that, for a Codex run, the WHOLE phasePublish
+      // (push/base-align/MR, or the pause/not_code/report-only early returns) runs under the
+      // held permit — its per-sink reconcile + quiesce+reap close admission and tear down the
+      // provider root before any PAT git op. For Claude/stub this is a plain call (the legacy
+      // reap already happened at the untouched security boundary). A CodexBoundaryError before
+      // a committed publish still propagates to the failed-run report below. Once phasePublish
+      // registers the committed terminal callback, however, the pushed branch/open MR is the
+      // authoritative outcome and must be reported after the boundary releases.
+      let postFinalizeTerminal: (() => Promise<void>) | undefined;
+      try {
+        await this.withCodexBoundaryOnly(
+          executor,
+          { boundary: "finalize", deadlineMs: this.codexBoundaryDeadlineMs },
+          (permit) => this.phasePublish(
+            claim,
+            flight,
+            permit?.signal,
+            executor.safety
+              ? (report) => { postFinalizeTerminal = report; }
+              : undefined,
+          ),
+        );
+      } catch (err) {
+        if (!postFinalizeTerminal || !isCodexBoundaryError(err)) throw err;
+        runLog.warn(
+          "Codex finalize boundary failed after committed publish; reporting committed terminal outcome",
+          { error: errMessage(err) },
+        );
+      }
+      // Once a branch push or MR creation succeeds, its terminal record is irreversible
+      // bookkeeping for an already-committed forge side effect. Deliver it only after the
+      // Codex boundary has released, with the normal terminal retry schedule and without
+      // the boundary's expiring signal, so a near-deadline MR cannot become a failed run.
+      await postFinalizeTerminal?.();
     } catch (err) {
       // PRD #35: a usage-limit death is not an ordinary failure. Handled before the
       // generic path below because that path is terminal in both senses — it reports
@@ -667,55 +745,62 @@ export class RunRunner {
           const barePath = flight.barePath;
           const worktreePath = flight.worktreePath;
           const branch = flight.branch;
-          // Belt-and-braces reap before we read the runner-owned clone, matching the
-          // done path and the shutdown branch — safe today (the executor's run() finally
-          // reaps first) but kept consistent across all three fetch-back sites.
-          executor.killAgentTree?.();
-          // PRD #759 M1: before the fetch-back, commit any uncommitted work in the
-          // runner-owned clone to a clearly-marked THROWAWAY commit (subject-prefixed
-          // wip(park):), run as the runner uid in the clone. This is the one thing run
-          // #685 lacked — every durability layer below captures COMMITTED commits only,
-          // so mid-milestone uncommitted edits were `fs.rm`'d on the next claim. Making a
-          // durable marked commit exist means the fetch-back just below carries it to the
-          // local tracking ref, and the #628 broker further down publishes it to
-          // refs/uzi-checkpoints/<branch>; M2 strips it back to uncommitted at adopt time
-          // so it never reaches the MR. commitWipMarker already swallows every error
-          // (best-effort — a park that loses work is worse than a missing WIP commit, D4);
-          // the .catch is belt-and-braces so nothing on this line can undo the park.
-          await this.git.commitWipMarker(worktreePath).catch(() => false);
-          await this.fetchBackBestEffort(barePath, worktreePath, branch, runId, runLog);
-          // PRD #628 M2: publish a checkpoint to origin on the park path so a DIFFERENT
-          // worker re-claiming this limit_wait run can recover the committed tree from
-          // refs/uzi-checkpoints/<branch> instead of reseeding off default and
-          // re-implementing already-committed milestones. This is a ONE-SHOT publish, not
-          // the mid-run time-gate (timeGateOpen is local to the mid-run checkpoint closure;
-          // neither it nor lastPublishedTip is read here): publish unconditionally. An empty park is
-          // harmless — checkpointPack returns null (no RPC) when the tracking ref is ABSENT,
-          // and when it is present-but-unmoved it brokers a zero-object pack that adds
-          // nothing to origin (verified 2026-08-23); either way no spurious tree is
-          // published. It runs AFTER the fetch-back so the tracking ref checkpointPack reads
-          // is current. Best-effort
-          // (publishCheckpointBestEffort swallows/logs/surfaces every failure — null pack,
-          // non-2xx, thrown error — and never throws): a publish failure must never undo the
-          // park, exactly as the fetch-back above must not (D4). The publish stays on the
-          // join-token seam (checkpointPack local read → client.publishCheckpoint), never a
-          // git push / PAT (ADR-628 guardrail invariants).
-          //
-          // issue #1030: the park-publish result is now EXPLICIT on the feed rather than
-          // ignored — a success line, and a failure line that names the durability
-          // consequence (a resume on another worker restarts from the default branch). The
-          // `false` case covers a real publish failure AND an empty park (null pack / no
-          // committed work): in both, nothing landed on refs/uzi-checkpoints/<branch>, so a
-          // cross-worker resume does restart from default, which the line states truthfully.
-          // publishCheckpointBestEffort ALSO emits the specific HTTP/skip outcome (deduped),
-          // so a failure shows both the cause and this consequence. This batcher.emit lands
-          // because handleLimitReached now FLUSHES (not closes) the batcher on the park
-          // branch, leaving it open until the close just below.
-          // PRD #1062 M2 (#1036): the park path is reaped (the agent tree is dead by the time
-          // the catch runs), so a PAT git op is permitted — build the overlay so a branch behind
-          // `main` on `.github/workflows` still checkpoints durably instead of skipping.
-          const parkOverlay = await this.buildCheckpointOverlay(claim, flight, barePath);
-          const parkPublished = await this.publishCheckpointBestEffort(flight, barePath, branch, parkOverlay);
+          // PRD #1171 m4: route the park durability publish through the Codex reap facade.
+          // For a Claude/stub run this is the LITERAL legacy `killAgentTree` reap (belt-and-
+          // braces before we read the runner-owned clone — safe today since the executor's
+          // run() finally reaps first — kept consistent with the done/shutdown fetch-back
+          // sites) followed by the publish body, byte-for-byte. For a Codex run the facade
+          // quiesces+reaps the provider root (after its per-sink auth-mode reconcile) and holds
+          // the permit across the whole publish body.
+          let parkPublished = false;
+          try {
+            await this.reapForSink(
+              executor,
+              { boundary: "park", deadlineMs: this.codexBoundaryDeadlineMs },
+              async () => {
+                // PRD #759 M1: commit any uncommitted work in the runner-owned clone to a
+                // clearly-marked THROWAWAY commit (subject-prefixed wip(park):) so the
+                // fetch-back carries it to the local tracking ref and the #628 broker publishes
+                // it; M2 strips it back to uncommitted at adopt time so it never reaches the MR.
+                // Best-effort — commitWipMarker swallows every error and the .catch is belt-and-
+                // braces so nothing here can undo the park (D4).
+                await this.git.commitWipMarker(worktreePath).catch(() => false);
+                await this.fetchBackBestEffort(barePath, worktreePath, branch, runId, runLog);
+                // PRD #628 M2: publish a ONE-SHOT checkpoint to origin so a DIFFERENT worker
+                // re-claiming this limit_wait run recovers the committed tree from
+                // refs/uzi-checkpoints/<branch> instead of cold-starting from default. Runs
+                // AFTER the fetch-back (checkpointPack reads the current tracking ref); an empty
+                // park brokers a null/zero pack and publishes nothing. PRD #1062 M2 (#1036): the
+                // park path is reaped above, so the overlay's PAT default-fetch is permitted.
+                // The publish stays on the join-token seam (checkpointPack local read →
+                // client.publishCheckpoint) and never throws; a publish failure must not undo
+                // the park (D4).
+                parkPublished = await this.publishCheckpointBestEffort(
+                  flight,
+                  barePath,
+                  branch,
+                  await this.buildCheckpointOverlay(claim, flight, barePath),
+                );
+              },
+            );
+          } catch (err) {
+            // A NON-boundary throw propagates exactly as before. A CodexBoundaryError means the
+            // Codex boundary could not reap/publish — nothing landed on origin, the same
+            // durability consequence as a publish failure (parkPublished stays false); it must
+            // NOT undo the park.
+            if (!isCodexBoundaryError(err)) throw err;
+            runLog.warn("park checkpoint boundary blocked; nothing published to origin", {
+              run_id: runId,
+              error: errMessage(err),
+            });
+          }
+          // issue #1030: the park-publish result is EXPLICIT on the feed — a success line, and a
+          // failure line naming the durability consequence (a resume on another worker restarts
+          // from the default branch). The false case covers a real publish failure, an empty
+          // park (null pack / no committed work) AND a blocked Codex boundary; in all, nothing
+          // landed on refs/uzi-checkpoints/<branch>. publishCheckpointBestEffort ALSO emits the
+          // specific HTTP/skip outcome (deduped). This batcher.emit lands because
+          // handleLimitReached FLUSHES (not closes) the batcher on the park branch.
           batcher.emit({
             kind: "status",
             agent: "worker",
@@ -750,9 +835,10 @@ export class RunRunner {
         // steering-cancel aborts the same controller with the same REASON_CANCELLED and
         // must still fall through to the generic failure below. The run's tree is
         // already reaped (sdk-executor's run() finally kills the agent tree before this
-        // catch is entered); killAgentTree here is the belt-and-braces reap at the
-        // security boundary before we read the runner-owned clone.
-        executor.killAgentTree?.();
+        // catch is entered); the belt-and-braces reap now lives INSIDE the durability sink
+        // below (m4: reapForSink — killAgentTree for Claude, withBoundary for Codex), which
+        // always runs on this path because `shuttingDown` is only ever set once the runner
+        // clone (hence barePath) exists.
         if (flight.barePath && flight.worktreePath && flight.branch) {
           const barePath = flight.barePath;
           const worktreePath = flight.worktreePath;
@@ -787,23 +873,53 @@ export class RunRunner {
           // plus contention, not the sum). 15s is generous for a healthy publish yet caps a
           // hung/unreachable forge well short of both the 30s SIGKILL and the 60s server cap.
           const durability = (async (): Promise<boolean> => {
-            await this.git.commitWipMarker(worktreePath).catch(() => false);
-            await this.fetchBackBestEffort(barePath, worktreePath, branch, runId, runLog);
-            // PRD #1062 M2 (#1036): the graceful-shutdown path already reaped the agent tree
-            // (killAgentTree above), so the overlay's PAT default-fetch is permitted here — a
-            // behind-on-workflows branch checkpoints durably instead of skipping.
-            const shutdownOverlay = await this.buildCheckpointOverlay(claim, flight, barePath);
-            return this.publishCheckpointBestEffort(flight, barePath, branch, shutdownOverlay);
+            let published = false;
+            try {
+              // PRD #1171 m4: the shutdown durability publish routes through the reap facade so
+              // deadlineMs ≤ the shutdown publish timeout keeps it inside the k8s grace race
+              // below. Claude/stub reaps via killAgentTree then runs the body byte-for-byte;
+              // Codex quiesces+reaps the provider root (after its per-sink reconcile) and holds
+              // the permit across the body.
+              await this.reapForSink(
+                executor,
+                {
+                  boundary: "shutdown",
+                  deadlineMs: Math.min(this.codexBoundaryDeadlineMs, this.shutdownPublishTimeoutMs),
+                },
+                async (permit) => {
+                  await this.git.commitWipMarker(worktreePath).catch(() => false);
+                  await this.fetchBackBestEffort(barePath, worktreePath, branch, runId, runLog);
+                  // PRD #1062 M2 (#1036): the path is reaped above, so the overlay's PAT
+                  // default-fetch is permitted — a behind-on-workflows branch checkpoints durably.
+                  const shutdownOverlay = await this.buildCheckpointOverlay(claim, flight, barePath);
+                  published = await this.publishCheckpointBestEffort(
+                    flight,
+                    barePath,
+                    branch,
+                    shutdownOverlay,
+                    permit?.signal,
+                  );
+                },
+              );
+            } catch (err) {
+              // A NON-boundary throw propagates as before. A CodexBoundaryError means the sink
+              // could not reap/publish — nothing landed, the same truthful consequence as a
+              // publish failure (published stays false); it must NOT fail the requeue.
+              if (!isCodexBoundaryError(err)) throw err;
+              runLog.warn("shutdown checkpoint boundary blocked; nothing published to origin", {
+                run_id: runId,
+                error: errMessage(err),
+              });
+            }
+            return published;
           })();
-          // undefined ⇒ the budget elapsed before the sequence finished: nothing confirmably
-          // landed, so a cross-worker resume does restart from default — the same truthful
-          // consequence as an outright publish failure. `=== true` folds false + undefined
-          // into the NOT-published line. The orphaned durability promise (on a timeout) is
-          // best-effort and never rejects, so leaving it running past this point is safe.
-          const published = await this.raceShutdownBudget(
-            durability,
-            this.shutdownPublishTimeoutMs,
-          );
+          // Claude retains the literal legacy budget race. Codex must not abandon a held
+          // permit: its boundary signal cancels supervised children + the upload at the same
+          // bounded deadline, and we await actual action/root settlement before terminal
+          // safety.dispose or run-home cleanup can proceed.
+          const published = executor.safety
+            ? await durability
+            : await this.raceShutdownBudget(durability, this.shutdownPublishTimeoutMs);
           // issue #1030 M4: surface the outcome on the feed the same way the park path does,
           // reusing the batcher emit + the reportPublishOutcome dedupe from M1. This lands
           // because it is emitted BEFORE the single batcher.close() below — the shutdown
@@ -888,6 +1004,19 @@ export class RunRunner {
         );
       }
     } finally {
+      // PRD #1171 m4 (F1): the FINAL Codex registry disposal, after EVERY durability sink has
+      // settled. A Codex executor's run() no longer disposes its registry on the normal path —
+      // its post-run sinks (park/shutdown/finalize) reap the provider root through withBoundary,
+      // which needs the roots alive — so the runner disposes it here, once, on every path
+      // (success, park, shutdown, generic failure). Harness-agnostic: guarded on
+      // `executor.safety`, so a Claude/stub run (no safety) is untouched. Best-effort +
+      // idempotent (disposeTools is), so a standalone-backstop dispose never double-disposes,
+      // and a dispose failure can never convert a completed run into a failed one.
+      if (executor.safety) {
+        await executor.safety
+          .dispose({ boundary: "terminal", deadlineMs: this.codexBoundaryDeadlineMs })
+          .catch((e) => runLog.warn("codex terminal dispose failed", { error: errMessage(e) }));
+      }
       // PRD #218 M1: drop the shutdown-registry entry. A terminal run (or a parked one)
       // must not stay abortable — shutdown() iterating a stale entry would abort a
       // controller nobody is watching, and the map would leak an entry per run.
@@ -1026,8 +1155,33 @@ export class RunRunner {
     }
   }
 
-  private async phasePublish(claim: ClaimResponse, flight: RunFlight): Promise<void> {
-    const { runLog, batcher, reportState, redactText, executor, runHome } = flight;
+  private async phasePublish(
+    claim: ClaimResponse,
+    flight: RunFlight,
+    boundarySignal?: AbortSignal,
+    deferCommittedTerminal?: (report: () => Promise<void>) => void,
+  ): Promise<void> {
+    const { runLog, batcher, redactText, executor, runHome } = flight;
+    const reportState = (body: Parameters<RunFlight["reportState"]>[0]) =>
+      flight.reportState(body, boundarySignal);
+    const closeBatcher = () => batcher.close(boundarySignal);
+    const finishCommittedPublish = async (
+      body: Parameters<RunFlight["reportState"]>[0],
+      logMessage: string,
+      fields: Record<string, unknown>,
+    ): Promise<void> => {
+      if (deferCommittedTerminal) {
+        deferCommittedTerminal(async () => {
+          await batcher.close();
+          await flight.reportState(body);
+          runLog.info(logMessage, fields);
+        });
+        return;
+      }
+      await closeBatcher();
+      await reportState(body);
+      runLog.info(logMessage, fields);
+    };
     const runId = claim.run_id;
     const result = flight.result!;
     // PRD #1190 M2: an owner-requested pause PARKED the run mid-loop (handlePausePark reported
@@ -1037,8 +1191,12 @@ export class RunRunner {
     // flushed it) and return. Keyed on the result the executor returned so a non-pause path can
     // never reach this branch.
     if (result.pausedAt) {
+      // PRD #1171 m4: needs NO own permit — for a Codex run this whole phasePublish already
+      // runs INSIDE the finalize withBoundary (executeClaim wraps the call), and this line is a
+      // no-op for Codex (its executor implements no killAgentTree and never sets pausedAt); for
+      // Claude it is the literal legacy reap, byte-unchanged.
       executor.killAgentTree?.();
-      await batcher.close().catch(() => undefined);
+      await closeBatcher().catch(() => undefined);
       runLog.info("run parked on an owner-requested pause; skipping finalization", {
         run_id: runId,
       });
@@ -1051,6 +1209,9 @@ export class RunRunner {
     // A ci_fix run that judged the failure not a code problem (PRD #6) completes
     // with the diagnosis and NO push/MR — there is nothing to land.
     if (result.fixVerdict === "not_code") {
+      // PRD #1171 m4: needs NO own permit — for a Codex run this runs INSIDE the finalize
+      // withBoundary that wraps phasePublish, and this line is a no-op for Codex; for Claude it
+      // is the literal legacy reap, byte-unchanged.
       executor.killAgentTree?.();
       batcher.emit({
         kind: "status",
@@ -1059,7 +1220,7 @@ export class RunRunner {
           text: "not a code problem: completing with the diagnosis, no merge request",
         },
       });
-      await batcher.close();
+      await closeBatcher();
       await reportState({ status: "completed", fix_verdict: "not_code" });
       runLog.info("ci_fix run completed with not_code verdict", {
         run_id: runId,
@@ -1102,7 +1263,7 @@ export class RunRunner {
             text: "report_only was set but this run published a checkpoint to origin; failing to avoid orphaning it",
           },
         });
-        await batcher.close();
+        await closeBatcher();
         await reportState({
           status: "failed",
           failure_reason:
@@ -1122,7 +1283,7 @@ export class RunRunner {
           text: "report-only run: recording findings; no branch pushed and no merge request opened",
         },
       });
-      await batcher.close();
+      await closeBatcher();
       await reportState({
         status: "completed",
         report_only: true,
@@ -1179,7 +1340,7 @@ export class RunRunner {
                 text: "operator scope directive stopped this run before any milestone produced committed work; recording it, no merge request",
               },
             });
-            await batcher.close();
+            await closeBatcher();
             await reportState({
               status: "completed",
               report_only: true,
@@ -1202,7 +1363,7 @@ export class RunRunner {
               text: "no changes were committed and report_only was not set; failing",
             },
           });
-          await batcher.close();
+          await closeBatcher();
           await reportState({
             status: "failed",
             failure_reason:
@@ -1254,7 +1415,7 @@ export class RunRunner {
               text: "report_only was set but this run published a checkpoint to origin; failing to avoid orphaning it",
             },
           });
-          await batcher.close();
+          await closeBatcher();
           await reportState({
             status: "failed",
             failure_reason:
@@ -1274,7 +1435,7 @@ export class RunRunner {
             text: "prompt run committed no changes: recording findings; no branch pushed and no merge request opened",
           },
         });
-        await batcher.close();
+        await closeBatcher();
         await reportState({
           status: "completed",
           report_only: true,
@@ -1467,7 +1628,7 @@ export class RunRunner {
           "run failed: branch touches .github/workflows which the bot PAT cannot push; preserving diff",
           { run_id: runId, paths: wfHits },
         );
-        await batcher.close();
+        await closeBatcher();
         await reportState({
           status: "failed",
           failure_reason: reason.slice(0, MAX_FAILURE_REASON_LEN),
@@ -1534,7 +1695,7 @@ export class RunRunner {
             })),
           },
         );
-        await batcher.close();
+        await closeBatcher();
         await reportPushSecretBlocked(reason);
         return;
       }
@@ -1566,7 +1727,7 @@ export class RunRunner {
             claim.repo.clone_url,
             claim.secrets.forge_username,
           ),
-        { log: runLog },
+        { log: runLog, signal: boundarySignal },
       );
 
     // PRD #974 M2 — the GH013 remote backstop. When a finalize push (the normal path OR an
@@ -1593,7 +1754,7 @@ export class RunRunner {
       runLog.info("run failed: push rejected by GitHub Push Protection (GH013)", {
         run_id: runId,
       });
-      await batcher.close();
+      await closeBatcher();
       await reportPushSecretBlocked(reason);
     };
 
@@ -1679,7 +1840,7 @@ export class RunRunner {
             runLog.info("run failed: finalize base-align conflict; preserving diff", {
               run_id: runId,
             });
-            await batcher.close();
+            await closeBatcher();
             await reportState({
               status: "failed",
               failure_reason: composeBaseAlignConflictReason(alignDefaultBranch),
@@ -1975,14 +2136,12 @@ export class RunRunner {
           text: `task complete; pushed ${result.branch} (no merge request — pull the branch)`,
         },
       });
-      await batcher.close();
-      await reportState({
+      await finishCommittedPublish({
         status: "completed",
         branch: result.branch,
         prd_done_path: result.prdDonePath,
         milestones_completed: result.milestonesCompleted,
-      });
-      runLog.info("task run completed (no MR)", { branch: result.branch });
+      }, "task run completed (no MR)", { branch: result.branch });
       return;
     }
 
@@ -2026,8 +2185,8 @@ export class RunRunner {
             result.gatesDiscoveryTruncated,
             result.scopeCapped,
           ),
-        }),
-      { log: runLog },
+        }, boundarySignal),
+      { log: runLog, signal: boundarySignal },
     );
     batcher.emit({
       kind: "status",
@@ -2035,7 +2194,6 @@ export class RunRunner {
       payload: { text: `merge request opened: !${mr.iid} ${mr.webUrl}` },
     });
 
-    await batcher.close();
     // Persist the MR/PR web URL the forge just handed us (PRD #65 D8), so the web
     // links it directly instead of reconstructing the URL by string surgery. Omit
     // it when the forge returned none (mr.webUrl empty) so the server lands NULL and
@@ -2049,7 +2207,7 @@ export class RunRunner {
     // lead declared none) — same absent-vs-present discipline as prd_done_path, so the
     // server UNIONs them into milestones_completed only when actually declared and a
     // no-declaration completion is byte-identical to before.
-    await reportState({
+    await finishCommittedPublish({
       status: "completed",
       branch: result.branch,
       mr_iid: mr.iid,
@@ -2060,8 +2218,7 @@ export class RunRunner {
       // stop_kind='scope_capped'. OMITTED (not false) on a normal completion, so the wire
       // shape is unchanged for every non-truncated run.
       scope_capped: result.scopeCapped ? true : undefined,
-    });
-    runLog.info("run completed", { branch: result.branch, mr_iid: mr.iid });
+    }, "run completed", { branch: result.branch, mr_iid: mr.iid });
   }
 
   private buildFlight(
@@ -2086,6 +2243,13 @@ export class RunRunner {
       this.joinToken,
       gitBasic,
     ];
+    // PRD #1171 M3: APPEND the two Codex canaries (access token + capability) so both
+    // redactors scrub them from run-message payloads and out-of-payload strings
+    // (failure_reason). Append-only — the existing forge_pat/anthropic/join/gitBasic
+    // ordering is untouched; absent on an ordinary Claude claim (nothing added).
+    if (claim.secrets.codex) {
+      secrets.push(claim.secrets.codex.access_token, claim.secrets.codex.capability);
+    }
     const redact = makeRedactor(secrets);
     const redactText = makeTextRedactor(secrets);
     const batcher = new MessageBatcher(
@@ -2149,12 +2313,13 @@ export class RunRunner {
       cancel,
       steering,
       observedSessionId: undefined,
-      reportState: (body) =>
+      reportState: (body, signal) =>
         this.client.reportState(
           runId,
           flight.observedSessionId
             ? { ...body, session_id: flight.observedSessionId }
             : body,
+          signal,
         ),
       barePath: undefined,
       worktreePath: undefined,
@@ -3016,123 +3181,130 @@ export class RunRunner {
         const tipUnmovedSinceFetch =
           trackTip !== null && cloneTip !== null && trackTip === cloneTip;
 
-        // Reap on EVERY model-cooperative checkpoint (Decision 10b), STRICTLY before ANY git
-        // below — both the credential-free fetch-back and the #1036 overlay's PAT-bearing
-        // fetchDefaultTip. The reap is tied to opts.reap (the real "safe to reap" signal: the
-        // agent's turn has ALREADY ENDED), NOT to the fetch: the fetch-back is credential-free
-        // but the M2 overlay is not, so REAP-BEFORE-GIT requires the reap precede it here,
-        // regardless of tip movement. The fallback (reap:false) must NOT reap: a backgrounded
-        // dev server the lead means to reuse next iteration must survive. The done path
-        // likewise reaps before its fetch-back.
-        if (opts.reap) executor.killAgentTree?.();
-
-        // Skip ONLY the fetch when there is nothing new to fetch — do NOT return, so the
-        // origin-publish gate below still runs (Decision 9: a commit fetched at an earlier
-        // iteration can become publish-eligible on a later tip-unmoved iteration once the
-        // interval opens).
-        if (!tipUnmovedSinceFetch) {
-          // Fetch back, credential-free (#218's helper): brings the committed work into
-          // refs/uzi-runner/<branch> where the reseed reads it. Best-effort, never fails.
-          await this.fetchBackBestEffort(
-            barePath,
-            runnerClone.path,
-            runnerClone.branch,
-            runId,
-            runLog,
-          );
-        } else {
-          runLog.info("checkpoint fetch skipped: branch tip unmoved since last checkpoint", {
-            run_id: runId,
-            branch: runnerClone.branch,
-          });
-        }
-
-        // PRD #267: origin-publish gate. The publish is CREDENTIAL-FREE (a pack brokered to
-        // the api via publishCheckpoint, no PAT — publishCheckpointBestEffort -> git.checkpointPack
-        // (local objects) -> client.publishCheckpoint (worker join token)), so it is safe on the
-        // reap:false path with the agent tree ALIVE. PRD #122 Decisions 10b/14 dissolved the
-        // reap/publish coupling for the broker (it was a property of the rejected worker-side
-        // push, not a correctness invariant); reap:false originally did not publish purely for
-        // scope + broker cost, which the time-gate now bounds (<=1 publish/interval/run).
-        //   - reap:true  (milestone): publish whenever there is new committed work not yet on
-        //     origin. Behaviourally equivalent to the old always-publish minus a redundant
-        //     re-publish of an already-published tip.
-        //   - reap:false (iteration boundary, PRD #267): publish only when the time-gate is open
-        //     AND there is new committed work. "new work" keys on lastPublishedTip (Decision 9),
-        //     NOT the fetch-skip above, so a commit that then goes idle for >= the interval still
-        //     ships exactly once.
+        // PRD #267: "new committed work not yet on origin". Depends ONLY on cloneTip (read at
+        // the top) and flight.lastPublishedTip, neither of which the fetch-back changes, so it
+        // is safe to compute here — before the reap decision — and close over it below.
         const hasNewWork = cloneTip !== null && cloneTip !== flight.lastPublishedTip;
-        const timeGateOpen =
-          this.checkpointIntervalMs > 0 &&
-          this.now() - flight.lastPublish >= this.checkpointIntervalMs;
-        let published = false;
-        if (hasNewWork && (opts.reap || timeGateOpen)) {
-          // PRD #1062 M2 (#1036): attempt the `.github/workflows` overlay ONLY on the reap:true
-          // (milestone) path. On that path the agent tree was ALREADY reaped unconditionally
-          // above (opts.reap ⇒ killAgentTree, hoisted before both fetch paths), so the overlay's
-          // default-tip fetch — a PAT git op — runs with no live agent, satisfying REAP-BEFORE-GIT
-          // (~:2745). The overlay is FORBIDDEN on the reap:false path where the agent is still
-          // ALIVE. So reap:false publishes with NO overlay (undefined) — byte-behaviourally unchanged.
-          const midRunOverlay = opts.reap
-            ? await this.buildCheckpointOverlay(claim, flight, barePath)
-            : undefined;
-          published = await this.publishCheckpointBestEffort(
-            flight,
-            barePath,
-            runnerClone.branch,
-            midRunOverlay,
-          );
-          // Advance the time-gate on every ATTEMPT (not just success): this bounds broker
-          // retry cadence to <= 1 publish/interval/run even under a persistent broker
-          // failure, so a failing publish cannot spam every iteration.
-          flight.lastPublish = this.now();
-          // PRD #267 Fix 1 (Decision 9 / the "worst-case loss ~one interval" criterion):
-          // advance lastPublishedTip ONLY on a CONFIRMED landed publish. On failure the tip
-          // stays un-advanced, so hasNewWork stays true and the time-gate retries the SAME
-          // tip at the next interval boundary — the idle commit still ships (bounded loss),
-          // rather than being marked published-and-forgotten by a transient broker failure.
-          if (published) {
-            flight.lastPublishedTip = cloneTip ?? flight.lastPublishedTip;
-            // PRD #267 M3: make the time-based publish observable — the "committed work is
-            // now safe on origin" moment for a reap:false checkpoint (the milestone/reap:true
-            // publish is already visible via its running report below). Only for the time
-            // path so we do not double-log the milestone case.
-            if (!opts.reap) {
-              runLog.info("checkpoint published to origin (time-based)", {
-                run_id: runId,
-                branch: runnerClone.branch,
-                tip: cloneTip,
-              });
+
+        // PRD #1171 m4: the fetch-back + origin-publish + running-report body, extracted so the
+        // reap:true (milestone) path routes it through the Codex reap facade while the reap:false
+        // (iteration-boundary) path calls it DIRECTLY (credential-free, no permit). `overlay` is
+        // the reap:true `.github/workflows` overlay (undefined off the reaped path and when
+        // nothing publishes); its default-tip fetch is a PAT git op, so it is only ever passed on
+        // a reaped path (REAP-BEFORE-GIT).
+        const doCheckpointPublish = async (overlay?: CheckpointOverlayContext): Promise<void> => {
+          // Skip ONLY the fetch when there is nothing new to fetch — do NOT return, so the
+          // origin-publish gate below still runs (Decision 9: a commit fetched at an earlier
+          // iteration can become publish-eligible on a later tip-unmoved iteration).
+          if (!tipUnmovedSinceFetch) {
+            // Fetch back, credential-free (#218's helper): brings the committed work into
+            // refs/uzi-runner/<branch> where the reseed reads it. Best-effort, never fails.
+            await this.fetchBackBestEffort(
+              barePath,
+              runnerClone.path,
+              runnerClone.branch,
+              runId,
+              runLog,
+            );
+          } else {
+            runLog.info("checkpoint fetch skipped: branch tip unmoved since last checkpoint", {
+              run_id: runId,
+              branch: runnerClone.branch,
+            });
+          }
+
+          // PRD #267: origin-publish gate. The publish is CREDENTIAL-FREE (a pack brokered to the
+          // api via publishCheckpoint, no PAT — checkpointPack local objects → client join token)
+          // EXCEPT the reap:true `overlay`'s default-tip fetch.
+          //   - reap:true  (milestone): publish whenever there is new committed work.
+          //   - reap:false (iteration boundary, PRD #267): publish only when the time-gate is
+          //     open AND there is new committed work — "new work" keys on lastPublishedTip, NOT
+          //     the fetch-skip above, so an idle commit still ships exactly once.
+          const timeGateOpen =
+            this.checkpointIntervalMs > 0 &&
+            this.now() - flight.lastPublish >= this.checkpointIntervalMs;
+          let published = false;
+          if (hasNewWork && (opts.reap || timeGateOpen)) {
+            published = await this.publishCheckpointBestEffort(
+              flight,
+              barePath,
+              runnerClone.branch,
+              overlay,
+            );
+            // Advance the time-gate on every ATTEMPT (not just success): bounds broker retry
+            // cadence to <= 1 publish/interval/run even under a persistent broker failure.
+            flight.lastPublish = this.now();
+            // PRD #267 Fix 1 (Decision 9): advance lastPublishedTip ONLY on a CONFIRMED landed
+            // publish, so a transient broker failure leaves hasNewWork true and the time-gate
+            // retries the SAME tip at the next interval boundary (bounded loss).
+            if (published) {
+              flight.lastPublishedTip = cloneTip ?? flight.lastPublishedTip;
+              // PRD #267 M3: make the time-based publish observable, only for the time path so
+              // we do not double-log the milestone case.
+              if (!opts.reap) {
+                runLog.info("checkpoint published to origin (time-based)", {
+                  run_id: runId,
+                  branch: runnerClone.branch,
+                  tip: cloneTip,
+                });
+              }
             }
           }
-        }
-        // Report the checkpointed milestone as a `running` report — additive-optional
-        // (milestone fields omitted when no progress) and wrapped so it never throws. NO
-        // iteration_count: a checkpoint is not an iteration-boundary report, so leaving it
-        // out keeps it from regressing the server's GREATEST-merged iteration counter.
-        //
-        // PRD #267 Fix 2: emit ONLY when there was real activity — a fetch (tip moved since
-        // the last checkpoint) OR a publish. On a pure-idle checkpoint (tip unmoved AND
-        // nothing published) stay silent, restoring the pre-M1 early-return behaviour while
-        // still signalling a time-based publish of an idle tip ("work is now safe on origin").
-        if (!tipUnmovedSinceFetch || published) {
-          // PRD #1064 M1: enqueue onto the per-run chain so this checkpoint report stays
-          // ordered behind any pending immediate `reportProgress` push.
-          await enqueueRunningReport(() =>
-            reportState({
-              status: "running",
-              ...(opts.progress
-                ? {
-                    milestones_completed: opts.progress.completed,
-                    milestones_in_progress: opts.progress.in_progress,
-                  }
-                : {}),
-            }),
-          ).catch((e) =>
-            runLog.warn("could not report checkpoint progress", {
-              error: errMessage(e),
-            }),
+          // Report the checkpointed milestone as a `running` report (additive-optional; NO
+          // iteration_count so it never regresses the server's GREATEST-merged counter). PRD
+          // #267 Fix 2: emit ONLY on real activity (a fetch or a publish); stay silent on a
+          // pure-idle checkpoint.
+          if (!tipUnmovedSinceFetch || published) {
+            // PRD #1064 M1: enqueue onto the per-run chain so this checkpoint report stays
+            // ordered behind any pending immediate `reportProgress` push.
+            await enqueueRunningReport(() =>
+              reportState({
+                status: "running",
+                ...(opts.progress
+                  ? {
+                      milestones_completed: opts.progress.completed,
+                      milestones_in_progress: opts.progress.in_progress,
+                    }
+                  : {}),
+              }),
+            ).catch((e) =>
+              runLog.warn("could not report checkpoint progress", {
+                error: errMessage(e),
+              }),
+            );
+          }
+        };
+
+        if (opts.reap) {
+          // reap:true (milestone). REAP-BEFORE-GIT (Decision 10b, B1/M4 audit): the facade reaps
+          // the agent tree — killAgentTree for Claude/stub; withBoundary quiesce+reap (after the
+          // per-sink auth-mode reconcile) for Codex — STRICTLY before ANY git below (the
+          // credential-free fetch-back AND the #1036 overlay's PAT default-fetch). The overlay is
+          // built INSIDE the reaped action (only when it will be used) so its PAT fetch never
+          // precedes the reap.
+          //
+          // CODEX (m4): a cooperative CodexExecutor checkpoint now invokes ctx.checkpoint({reap:true}),
+          // so this Codex withBoundary branch IS reached. reapForSink reads executor.safety fresh and a
+          // Codex run always sets it, so the per-sink auth-mode reconcile runs and the reap is credentialed
+          // (the executor then recreates the reaped provider epoch — see startProviderEpoch). A blocked
+          // reconcile (e.g. a transient refresh failure) surfaces a CodexBoundaryError that propagates and
+          // fails the run — the intended fail-closed behavior for a credentialed durability boundary.
+          await this.reapForSink(
+            executor,
+            { boundary: "checkpoint", deadlineMs: this.codexBoundaryDeadlineMs },
+            async () => {
+              const midRunOverlay = hasNewWork
+                ? await this.buildCheckpointOverlay(claim, flight, barePath)
+                : undefined;
+              await doCheckpointPublish(midRunOverlay);
+            },
           );
+        } else {
+          // reap:false (iteration boundary): NO reap, NO permit, NO overlay — the agent tree
+          // stays ALIVE (a backgrounded dev server survives to the next iteration) and the
+          // publish is credential-free, so it is safe with the agent alive. A credential-free
+          // fetch-back / join-token publish never mints a permit.
+          await doCheckpointPublish(undefined);
         }
       },
       // Issue #281: a cheap fingerprint of the runner clone's committed + working-tree
@@ -3222,6 +3394,66 @@ export class RunRunner {
    * with a warn (D4): a fetch-back that fails must not undo the park or block the
    * requeue.
    */
+  // ─── PRD #1171 m4: Codex durability-sink boundary helpers ──────────────────────
+  /**
+   * Route a durability/publication sink through the Codex `withBoundary` reap facade when the
+   * executor is Codex-selected (`executor.safety`), else take the LITERAL legacy
+   * `killAgentTree` reap branch (Claude/stub — unchanged ordering, cleanup and errors).
+   *
+   * The runner is HARNESS-AGNOSTIC: it branches ONLY on `!!executor.safety`, never reads
+   * authMode/credentials and never imports agent/src/codex/**. Inside a Codex permit it scopes
+   * GitCache to `spawnBoundaryProcess`, so every git/gitleaks/pack child reserves and settles a
+   * registry-owned boundary-action root rather than merely running beside a held permit.
+   * All auth-mode reconciliation lives inside the executor-owned reconcile closure the facade
+   * runs BEFORE the reap. A `CodexBoundaryError` (sink counter zero, publication blocked)
+   * PROPAGATES to the caller, which decides whether it is a best-effort publish failure or a
+   * failed-run report.
+   */
+  private async reapForSink(
+    executor: Executor,
+    req: BoundaryRequest,
+    action: (permit?: BoundaryPermit) => Promise<void>,
+  ): Promise<void> {
+    const safety = executor.safety;
+    if (safety) {
+      await safety.withBoundary(req, async (permit) => {
+        await this.git.withBoundaryProcessSpawner(
+          (process) => safety.spawnBoundaryProcess(permit, process),
+          permit.signal,
+          () => action(permit),
+        );
+      });
+    } else {
+      executor.killAgentTree?.();
+      await action(undefined);
+    }
+  }
+
+  /**
+   * Like {@link reapForSink} but the LEGACY branch does NOT reap — the caller's untouched
+   * `killAgentTree` site already reaped (the security-boundary reap for finalize, or
+   * `handleRecoveryExhausted`'s reap for recovery). For a Codex run the whole action runs under
+   * the held permit (its quiesce+reap closes admission before the credentialed publish).
+   */
+  private async withCodexBoundaryOnly(
+    executor: Executor,
+    req: BoundaryRequest,
+    action: (permit?: BoundaryPermit) => Promise<void>,
+  ): Promise<void> {
+    const safety = executor.safety;
+    if (safety) {
+      await safety.withBoundary(req, async (permit) => {
+        await this.git.withBoundaryProcessSpawner(
+          (process) => safety.spawnBoundaryProcess(permit, process),
+          permit.signal,
+          () => action(permit),
+        );
+      });
+    } else {
+      await action(undefined); // legacy already reaped at its untouched killAgentTree site
+    }
+  }
+
   /**
    * PRD #1030 M4: bound a best-effort promise by a client-side budget, resolving to
    * `undefined` when the budget elapses first (never rejecting). Used to cap the
@@ -3320,6 +3552,7 @@ export class RunRunner {
     barePath: string,
     branch: string,
     overlay?: CheckpointOverlayContext,
+    signal?: AbortSignal,
   ): Promise<boolean> {
     // issue #1086 (F2): two-tip reconciliation. The CONFIRMED tip advances only on a real ACK; an
     // ambiguous result (non-2xx, or a throw after the pack tip is known) records the ATTEMPTED tip
@@ -3332,7 +3565,7 @@ export class RunRunner {
       const packed = await this.git.checkpointPack(barePath, branch, overlay);
       if (!packed) return false; // nothing to publish — not a failure, stay silent
       packedTip = packed.tipOid;
-      const res = await this.client.publishCheckpoint(flight.runId, packed.tipOid, packed.pack);
+      const res = await this.client.publishCheckpoint(flight.runId, packed.tipOid, packed.pack, signal);
       if (res.ok && res.body.published === true) {
         // PRD #1062 M2 (#1036): a CONFIRMED publish advances the known checkpoint ref tip to the
         // declared tip (the overlay `O_ov`, or realTip on the no-overlay path), so the NEXT
@@ -3700,6 +3933,12 @@ export class RunRunner {
    * alive; the publish is on the credential-free join-token seam (checkpointPack local read →
    * client.publishCheckpoint), exactly like the reap:false mid-run checkpoint, so it is safe with
    * the agent alive.
+   *
+   * PRD #1171 m4 (pause-sink designation): this sink mints NO Codex permit and is DELIBERATELY
+   * left entirely unchanged. It is a credential-free publish (overlay undefined) with no reap and
+   * the agent alive — the SAME class as the reap:false checkpoint — so per the m4 structural rule
+   * (a path mints a permit IFF it does a PAT-bearing overlay publish or a terminal/finalize reap)
+   * it never touches the reapForSink/withCodexBoundaryOnly helpers.
    */
   private async handlePausePark(
     flight: RunFlight,
@@ -3905,17 +4144,37 @@ export class RunRunner {
       branch,
     );
     if (!verified) return { verified: false, published: false };
-    // Remote publish is SEPARATE and best-effort. The agent tree was reaped by the caller,
-    // so the overlay's PAT default-fetch is permitted. publishCheckpointBestEffort already
-    // surfaces the specific HTTP/skip outcome (deduped) on the feed; the caller's park
-    // notice states the durability consequence.
-    const overlay = await this.buildCheckpointOverlay(claim, flight, barePath);
-    const published = await this.publishCheckpointBestEffort(
-      flight,
-      barePath,
-      branch,
-      overlay,
-    );
+    // Remote publish is SEPARATE and best-effort. The agent tree was already reaped by the
+    // caller (handleRecoveryExhausted's killAgentTree, untouched), so the overlay's PAT
+    // default-fetch is permitted. publishCheckpointBestEffort surfaces the HTTP/skip outcome
+    // (deduped); the caller's park notice states the durability consequence.
+    //
+    // PRD #1171 m4: for a Codex run the publish region runs under the finalize-class reap
+    // facade (withCodexBoundaryOnly): the caller's reap is a no-op for Codex, so the boundary's
+    // quiesce+reap (after its per-sink reconcile) is what closes admission before the
+    // credentialed publish. captureRecoveryRestorePoint runs in handleRecoveryExhausted's retry
+    // loop, so the boundary must be idempotent — a re-quiesce of a closed registry re-asserts
+    // emptiness and a re-reap re-invokes each RegisteredRoot.reap (idempotent). A blocked Codex
+    // boundary is a best-effort recovery path: it leaves `published` false (the restore point is
+    // still VERIFIED locally, so the caller's "saved on this worker" notice fires) and must NOT
+    // fail the capture. (Codex never actually reaches recovery in m4 — its executor throws no
+    // TransientRecoveryError — so this is defensive wiring.)
+    let published = false;
+    try {
+      await this.withCodexBoundaryOnly(
+        flight.executor,
+        { boundary: "shutdown", deadlineMs: this.codexBoundaryDeadlineMs },
+        async (permit) => {
+          const overlay = await this.buildCheckpointOverlay(claim, flight, barePath);
+          published = await this.publishCheckpointBestEffort(flight, barePath, branch, overlay, permit?.signal);
+        },
+      );
+    } catch (err) {
+      if (!isCodexBoundaryError(err)) throw err;
+      runLog.warn("recovery checkpoint boundary blocked; restore point saved locally but not published", {
+        error: errMessage(err),
+      });
+    }
     return { verified, published };
   }
 

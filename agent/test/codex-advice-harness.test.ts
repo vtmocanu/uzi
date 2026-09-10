@@ -13,6 +13,10 @@ import type { CodexProviderConfig } from "../src/codex/codex-harness.js";
 import type { AdviceRequest, AdviceResultPolicy } from "../src/harness.js";
 import type { CodexNotification, CodexTransport } from "../src/codex/transport.js";
 import type { Logger } from "../src/log.js";
+import {
+  createCodexAppServerAuth,
+  type CodexAppServerAuthSession,
+} from "../src/codex/appserver-auth.js";
 
 // PRD #1171 (M3, milestone 3) — the Codex TOOL-LESS, isolated advice pass, driven with an
 // in-memory transport and scripted app-server frames (NO real Codex process). Every
@@ -44,6 +48,16 @@ function defaultResponder(method: string): unknown {
   return {};
 }
 
+function authResponder(method: string, params: unknown): unknown {
+  if (method === "initialize") {
+    return { userAgent: "codex/0.153.2", codexHome: "/owned/codex", platformFamily: "unix", platformOs: "linux" };
+  }
+  if (method === "account/login/start") {
+    return { type: (params as { type?: unknown } | undefined)?.type };
+  }
+  return defaultResponder(method);
+}
+
 /** A scriptable in-memory {@link CodexTransport}: request/respond/notify calls are
  *  captured, requests answer from an injected responder, and `notifications()` drains a
  *  queue the test pre-loads via {@link FakeTransport.push} / {@link FakeTransport.end}. */
@@ -58,6 +72,9 @@ class FakeTransport implements CodexTransport {
   private waiter: ((r: IteratorResult<CodexNotification>) => void) | undefined;
   private consumed = false;
   private closedFlag = false;
+  private interceptor?: (note: CodexNotification, frameBytes: number) => boolean;
+  onRespond?: (requestId: number | string, response: unknown) => void;
+  onClose?: () => void;
 
   constructor(private readonly responder: (method: string, params: unknown) => unknown = defaultResponder) {}
 
@@ -70,6 +87,14 @@ class FakeTransport implements CodexTransport {
       this.queue.push(note);
     }
     return this;
+  }
+
+  emitServerRequest(note: CodexNotification): boolean {
+    const requestId = note.kind === "activity" ? note.requestId : undefined;
+    const frameBytes = Buffer.byteLength(JSON.stringify({ id: requestId, method: note.method, params: note.params }), "utf8");
+    if (this.interceptor?.(note, frameBytes)) return true;
+    this.push(note);
+    return false;
   }
 
   end(): this {
@@ -99,6 +124,15 @@ class FakeTransport implements CodexTransport {
     // that races a torn-down transport exercises refuseServerRequest's guard.
     if (this.closedFlag) throw new Error("codex transport is closed");
     this.responses.push({ requestId, response });
+    this.onRespond?.(requestId, response);
+  }
+
+  installServerRequestInterceptor(interceptor: (note: CodexNotification, frameBytes: number) => boolean): () => void {
+    if (this.interceptor !== undefined) throw new Error("interceptor already installed");
+    this.interceptor = interceptor;
+    return () => {
+      if (this.interceptor === interceptor) this.interceptor = undefined;
+    };
   }
 
   notifications(): AsyncIterableIterator<CodexNotification> {
@@ -129,6 +163,7 @@ class FakeTransport implements CodexTransport {
   close(): Promise<void> {
     this.closes += 1;
     this.closedFlag = true;
+    this.onClose?.();
     return Promise.resolve();
   }
 }
@@ -198,6 +233,7 @@ function makeHarness(
     credentialValue?: string;
     cwd?: string;
     provider?: CodexProviderConfig;
+    appServerAuth?: CodexAppServerAuthSession;
     disposeThrows?: boolean;
     log?: Logger;
   } = {},
@@ -219,6 +255,7 @@ function makeHarness(
   const harness = new CodexAdviceHarness({
     launchRoot,
     provider: opts.provider ?? provider,
+    appServerAuth: opts.appServerAuth,
     credentialValue: opts.credentialValue,
     log: opts.log ?? noopLog,
   });
@@ -230,6 +267,132 @@ function makeHarness(
 describe("CodexAdviceHarness: kind + a text advice pass", () => {
   it("advertises kind codex", () => {
     assert.equal(makeHarness().harness.kind, "codex");
+  });
+
+  it("authenticates before thread/model work and admits only the narrow refresh bridge", async () => {
+    const transport = new FakeTransport(authResponder);
+    const appServerAuth = createCodexAppServerAuth({
+      mode: "subscription",
+      initial: { accessToken: "initial-access", accountId: "server-account" },
+      bridge: {
+        refresh: async () => ({ accessToken: "next-access", accountId: "server-account" }),
+      },
+    });
+    const bits = makeHarness({ transport, appServerAuth });
+    transport
+      .push(threadStarted())
+      .push({
+        kind: "activity",
+        method: "account/chatgptAuthTokens/refresh",
+        requestId: 44,
+        params: { reason: "unauthorized", previousAccountId: null },
+      })
+      .push(agentMessage("ok"))
+      .push(turnCompleted("completed"))
+      .end();
+
+    const result = await bits.harness.run(makeAdviceRequest(), noThrowPolicy);
+
+    assert.equal(result.text, "ok");
+    assert.deepEqual(transport.requests.map((request) => request.method), [
+      "initialize",
+      "account/login/start",
+      "thread/start",
+      "turn/start",
+    ]);
+    assert.deepEqual(transport.notifies, [{ method: "initialized", params: undefined }]);
+    assert.deepEqual(transport.responses, [{
+      requestId: 44,
+      response: {
+        result: { accessToken: "next-access", chatgptAccountId: "server-account", chatgptPlanType: null },
+      },
+    }]);
+  });
+
+  it("pumps auth while turn/start is pending instead of deadlocking advice setup", async () => {
+    let resolveTurn!: (value: unknown) => void;
+    let transport!: FakeTransport;
+    transport = new FakeTransport((method, params) => {
+      if (method === "turn/start") {
+        const pending = new Promise<unknown>((resolve) => {
+          resolveTurn = resolve;
+        });
+        transport.emitServerRequest({
+          kind: "activity",
+          method: "account/chatgptAuthTokens/refresh",
+          requestId: 45,
+          params: { reason: "unauthorized", previousAccountId: null },
+        });
+        return pending;
+      }
+      return authResponder(method, params);
+    });
+    transport.onRespond = (requestId) => {
+      if (requestId === 45) resolveTurn({ turn: { id: "tn-1" } });
+    };
+    const appServerAuth = createCodexAppServerAuth({
+      mode: "subscription",
+      initial: { accessToken: "initial-access", accountId: "server-account" },
+      bridge: {
+        refresh: async () => ({ accessToken: "next-access", accountId: "server-account" }),
+      },
+    });
+    const bits = makeHarness({ transport, appServerAuth });
+    transport.push(threadStarted()).push(agentMessage("ok")).push(turnCompleted("completed")).end();
+
+    const result = await bits.harness.run(makeAdviceRequest({ timeoutMs: 500 }), noThrowPolicy);
+
+    assert.equal(result.text, "ok");
+    assert.equal(transport.responses.some((response) => response.requestId === 45), true);
+  });
+
+  it("withholds a same-chunk advice terminal until intercepted auth settles", async () => {
+    let releaseRefresh!: (value: { accessToken: string; accountId: string }) => void;
+    const heldRefresh = new Promise<{ accessToken: string; accountId: string }>((resolve) => {
+      releaseRefresh = resolve;
+    });
+    let transport!: FakeTransport;
+    transport = new FakeTransport((method, params) => {
+      if (method === "turn/start") {
+        queueMicrotask(() => {
+          transport.emitServerRequest({
+            kind: "activity",
+            method: "account/chatgptAuthTokens/refresh",
+            requestId: 46,
+            params: { reason: "unauthorized", previousAccountId: null },
+          });
+          transport.push(turnCompleted("completed"));
+        });
+      }
+      return authResponder(method, params);
+    });
+    const appServerAuth = createCodexAppServerAuth({
+      mode: "subscription",
+      initial: { accessToken: "initial-access", accountId: "server-account" },
+      bridge: { refresh: () => heldRefresh },
+    });
+    const bits = makeHarness({ transport, appServerAuth });
+    transport.push(threadStarted()).push(agentMessage("ok"));
+
+    let settled = false;
+    const resultPromise = bits.harness.run(makeAdviceRequest({ timeoutMs: 500 }), noThrowPolicy).finally(() => {
+      settled = true;
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(settled, false, "advice terminal remains withheld while refresh is held");
+
+    releaseRefresh({ accessToken: "next-access", accountId: "server-account" });
+    const result = await resultPromise;
+    assert.equal(result.text, "ok");
+    assert.equal(transport.responses.some((response) => response.requestId === 46), true);
+  });
+
+  it("rejects simultaneous env credential and app-server auth", () => {
+    const appServerAuth = createCodexAppServerAuth({ mode: "api_key", apiKey: "test-key" });
+    assert.throws(
+      () => makeHarness({ appServerAuth, credentialValue: "other-key" }),
+      /conflicting authentication inputs/,
+    );
   });
 
   it("accumulates assistant text and returns the terminal with turn-basis usage", async () => {
@@ -365,6 +528,7 @@ describe("CodexAdviceHarness: the tool-less advice ceiling (by construction)", (
     assert.deepEqual(
       Object.keys(features).sort(),
       [
+        "apply_patch_freeform",
         "apps",
         "code_mode",
         "code_mode_host",
@@ -378,7 +542,10 @@ describe("CodexAdviceHarness: the tool-less advice ceiling (by construction)", (
         "remote_models",
         "shell_snapshot",
         "shell_snapshot_v2",
+        "shell_tool",
+        "sleep_tool",
         "unified_exec",
+        "view_image",
       ],
       "the complete characterized feature ceiling stays explicit",
     );
@@ -389,6 +556,10 @@ describe("CodexAdviceHarness: the tool-less advice ceiling (by construction)", (
     );
     assert.equal((config.agents as Record<string, unknown>).enabled, false);
     assert.equal(params.approvalPolicy, "never");
+    assert.deepEqual(params.environments, [], "no native execution environment is attached");
+    assert.deepEqual(params.dynamicTools, [], "advice receives no worker callback tools");
+    assert.equal(params.developerInstructions, "you are the reviewer");
+    assert.equal(params.instructions, undefined, "the ignored legacy field is never sent");
     // No hook-trust bypass anywhere in the start params.
     assert.ok(!JSON.stringify(params).includes("bypass_hook_trust"));
     assert.ok(!JSON.stringify(params).includes("dangerously-bypass-hook-trust"));
@@ -451,6 +622,54 @@ describe("CodexAdviceHarness: credential isolation", () => {
 });
 
 describe("CodexAdviceHarness: timeout + grace + fail-closed setup", () => {
+  it("timeout breaks a pending-login plus intercepted-refresh ownership cycle", async () => {
+    let rejectLogin!: (error: Error) => void;
+    let markRefreshEmitted!: () => void;
+    const refreshEmitted = new Promise<void>((resolve) => {
+      markRefreshEmitted = resolve;
+    });
+    let bridgeCalls = 0;
+    let transport!: FakeTransport;
+    transport = new FakeTransport((method, params) => {
+      if (method === "account/login/start") {
+        queueMicrotask(() => {
+          transport.emitServerRequest({
+            kind: "activity",
+            method: "account/chatgptAuthTokens/refresh",
+            requestId: 47,
+            params: { reason: "unauthorized", previousAccountId: null },
+          });
+          markRefreshEmitted();
+        });
+        return new Promise<never>((_resolve, reject) => {
+          rejectLogin = reject;
+        });
+      }
+      return authResponder(method, params);
+    });
+    transport.onClose = () => rejectLogin(new Error("transport closed"));
+    const appServerAuth = createCodexAppServerAuth({
+      mode: "subscription",
+      initial: { accessToken: "initial-access", accountId: "server-account" },
+      bridge: {
+        refresh: async () => {
+          bridgeCalls += 1;
+          return { accessToken: "unused", accountId: "unused" };
+        },
+      },
+    });
+    const bits = makeHarness({ transport, appServerAuth });
+    const run = bits.harness.run(makeAdviceRequest({ timeoutMs: 50, graceMs: 100 }), noThrowPolicy);
+    await refreshEmitted;
+
+    await assert.rejects(run, /review model call exceeded 50ms/);
+    await appServerAuth.drainInterceptedRequests();
+
+    assert.equal(bridgeCalls, 0);
+    assert.ok(transport.closes >= 1);
+    assert.equal(bits.disposeCalls(), 1);
+  });
+
   it("timeout ABORTS + rejects with the exact label/timeout message, returns NO partial text, and disposes HOME", async () => {
     const bits = makeHarness();
     // thread/start + turn/start answer, then a partial message, then the stream blocks with
@@ -465,6 +684,61 @@ describe("CodexAdviceHarness: timeout + grace + fail-closed setup", () => {
       return true;
     });
     assert.equal(bits.disposeCalls(), 1, "the isolated HOME is disposed after settlement/grace");
+  });
+
+  it("disposes the advice root when authentication draining fails", async () => {
+    const appServerAuth: CodexAppServerAuthSession = {
+      mode: "subscription",
+      authenticate: async () => {},
+      handleServerRequest: async () => false,
+      drainInterceptedRequests: async () => { throw new Error("auth drain failed"); },
+      closeAdmissionAndCancel() {},
+    };
+    const bits = makeHarness({ appServerAuth });
+    bits.transport.push(threadStarted()).push(turnCompleted("completed")).end();
+
+    await assert.rejects(bits.harness.run(makeAdviceRequest(), noThrowPolicy), /auth drain failed/);
+    assert.equal(bits.disposeCalls(), 1, "auth drain failure cannot skip root cleanup");
+  });
+
+  it("does not let a cleanup-only auth drain failure replace a successful advice result", async () => {
+    let drains = 0;
+    const appServerAuth: CodexAppServerAuthSession = {
+      mode: "subscription",
+      authenticate: async () => {},
+      handleServerRequest: async () => false,
+      drainInterceptedRequests: async () => {
+        drains += 1;
+        if (drains > 1) throw new Error("cleanup drain failed");
+      },
+      closeAdmissionAndCancel() {},
+    };
+    const bits = makeHarness({ appServerAuth });
+    bits.transport.push(threadStarted()).push(agentMessage("kept result")).push(turnCompleted("completed")).end();
+
+    const result = await bits.harness.run(makeAdviceRequest(), noThrowPolicy);
+
+    assert.equal(result.text, "kept result");
+    assert.equal(drains, 2, "the terminal drain succeeded before the cleanup-only drain failed");
+    assert.equal(bits.disposeCalls(), 1);
+  });
+
+  it("does not let an auth cleanup failure replace the exact timeout rejection", async () => {
+    const appServerAuth: CodexAppServerAuthSession = {
+      mode: "subscription",
+      authenticate: async () => {},
+      handleServerRequest: async () => false,
+      drainInterceptedRequests: async () => { throw new Error("cleanup drain failed"); },
+      closeAdmissionAndCancel() {},
+    };
+    const bits = makeHarness({ appServerAuth });
+    bits.transport.push(threadStarted()).push(agentMessage("partial"));
+
+    await assert.rejects(
+      bits.harness.run(makeAdviceRequest({ label: "review", timeoutMs: 25, graceMs: 10 }), noThrowPolicy),
+      /review model call exceeded 25ms/,
+    );
+    assert.equal(bits.disposeCalls(), 1);
   });
 
   it("an unexpected EOF (no terminal) rejects with a protocol error and still disposes the HOME", async () => {

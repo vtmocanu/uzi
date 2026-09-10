@@ -9,9 +9,10 @@
 //     ships hooks OFF, so there is nothing to bypass: `hooks = false`, and NO
 //     `bypass_hook_trust`, NO `--dangerously-bypass-hook-trust` anywhere.
 //   * the fixture accepts arbitrary caller-shaped knobs (code_mode / unified_exec /
-//     multi_agent variables, `write_stdin_approval`). Production accepts ONLY a
-//     provider endpoint + model + canonical project path and pins every native
-//     surface to its disabled value; it never folds in repo-controlled config.
+//     multi_agent variables, `write_stdin_approval`). The generic M3a launcher builder
+//     accepts only a trusted provider + model + canonical project path and pins every
+//     native surface disabled. The production authentication builder below is narrower:
+//     it fixes the built-in OpenAI provider and accepts no endpoint/env-key injection.
 //
 // The ADR (`adr/1106-codex-harness.md:337-344`) requires the canonical project be
 // provisioned EXPLICITLY `untrusted` with `project_doc_max_bytes = 0`: pinned
@@ -20,6 +21,8 @@
 // "untrusted"` to avoid that branch.
 
 import { lstatSync } from "node:fs";
+
+import type { CodexAppServerAuthMode } from "./appserver-auth.js";
 
 /**
  * A model provider the stock config points Codex at. `wireApi` is pinned to the
@@ -47,6 +50,8 @@ export interface CodexConfigOptions {
  *  `model_provider` reference; keep it a simple identifier so the two always agree
  *  and no injection is possible through the table header. */
 const PROVIDER_NAME_RE = /^[A-Za-z0-9._-]+$/;
+/** One fixed provider identity shared by the M3b config and thread/start seam. */
+export const CODEX_M3B_LOOPBACK_PROVIDER_NAME = "uzi-m3b-openai";
 
 /** TOML basic-string encoder. TOML basic strings share JSON's escaping for the
  *  characters that occur in paths/URLs/identifiers, so `JSON.stringify` yields a
@@ -54,6 +59,51 @@ const PROVIDER_NAME_RE = /^[A-Za-z0-9._-]+$/;
  *  `harness.mjs:209`). */
 function toml(value: string): string {
   return JSON.stringify(value);
+}
+
+function nativeDisabledConfigLines(model: string, providerName: string, projectPath: string): string[] {
+  return [
+    `model = ${toml(model)}`,
+    `model_provider = ${toml(providerName)}`,
+    `project_doc_max_bytes = 0`,
+    `check_for_update_on_startup = false`,
+    `web_search = "disabled"`,
+    ``,
+    `[analytics]`,
+    `enabled = false`,
+    ``,
+    `[feedback]`,
+    `enabled = false`,
+    ``,
+    `[agents]`,
+    `enabled = false`,
+    ``,
+    `[features]`,
+    `apps = false`,
+    `plugins = false`,
+    `shell_tool = false`,
+    `view_image = false`,
+    `sleep_tool = false`,
+    `apply_patch_freeform = false`,
+    `shell_snapshot = false`,
+    `shell_snapshot_v2 = false`,
+    `code_mode = false`,
+    `code_mode_only = false`,
+    `code_mode_host = false`,
+    `code_mode_prewarm = false`,
+    `remote_models = false`,
+    `unified_exec = false`,
+    `hooks = false`,
+    `multi_agent = false`,
+    `multi_agent_v2 = false`,
+    `enable_request_compression = false`,
+    ``,
+    // Explicit untrusted state for the canonical project (ADR:337-344). A quoted
+    // key so any path is represented safely.
+    `[projects.${toml(projectPath)}]`,
+    `trust_level = "untrusted"`,
+    ``,
+  ];
 }
 
 /**
@@ -76,42 +126,7 @@ export function buildCodexConfigToml(opts: CodexConfigOptions): string {
   }
   // A single deterministic template — no caller-shaped branches, no repo config.
   return [
-    `model = ${toml(model)}`,
-    `model_provider = ${toml(provider.name)}`,
-    `project_doc_max_bytes = 0`,
-    `check_for_update_on_startup = false`,
-    `web_search = "disabled"`,
-    ``,
-    `[analytics]`,
-    `enabled = false`,
-    ``,
-    `[feedback]`,
-    `enabled = false`,
-    ``,
-    `[agents]`,
-    `enabled = false`,
-    ``,
-    `[features]`,
-    `apps = false`,
-    `plugins = false`,
-    `shell_snapshot = false`,
-    `shell_snapshot_v2 = false`,
-    `code_mode = false`,
-    `code_mode_only = false`,
-    `code_mode_host = false`,
-    `code_mode_prewarm = false`,
-    `remote_models = false`,
-    `unified_exec = false`,
-    `hooks = false`,
-    `multi_agent = false`,
-    `multi_agent_v2 = false`,
-    `enable_request_compression = false`,
-    ``,
-    // Explicit untrusted state for the canonical project (ADR:337-344). A quoted
-    // key so any path is represented safely.
-    `[projects.${toml(projectPath)}]`,
-    `trust_level = "untrusted"`,
-    ``,
+    ...nativeDisabledConfigLines(model, provider.name, projectPath),
     `[model_providers.${toml(provider.name)}]`,
     `name = ${toml(provider.name)}`,
     `base_url = ${toml(provider.baseUrl)}`,
@@ -119,6 +134,99 @@ export function buildCodexConfigToml(opts: CodexConfigOptions): string {
     `wire_api = "responses"`,
     `supports_websockets = false`,
     `requires_openai_auth = false`,
+    `request_max_retries = 0`,
+    `stream_max_retries = 0`,
+    ``,
+  ].join("\n");
+}
+
+/** Inputs for the production app-server-auth config. There is deliberately no provider
+ * endpoint/name/env-key field: pinned Codex's built-in `openai` provider owns those
+ * values, and chooses its backend from the authenticated mode. */
+export interface CodexProductionConfigOptions {
+  readonly model: string;
+  readonly projectPath: string;
+  readonly authMode: CodexAppServerAuthMode;
+}
+
+function validateProductionConfigOptions(opts: CodexProductionConfigOptions): void {
+  const keys = Object.keys(opts);
+  if (keys.some((key) => key !== "model" && key !== "projectPath" && key !== "authMode")) {
+    throw new Error("Codex production config received an unsupported option");
+  }
+  if (opts.authMode !== "api_key" && opts.authMode !== "subscription") {
+    throw new Error("Codex production config requires an explicit supported auth mode");
+  }
+}
+
+/**
+ * Build the fixed production config used with `account/login/start` authentication.
+ *
+ * Pinned 0.153.2's built-in `openai` provider has `requires_openai_auth = true` and no
+ * configured base URL. That absence is load-bearing: API-key auth selects
+ * `https://api.openai.com/v1`, while `chatgptAuthTokens` selects the ChatGPT Codex
+ * backend. Pinned 0.153.2 merges configured providers with `or_insert`, so a caller cannot
+ * override the built-in `openai` provider with a partial table. Its production request and
+ * stream retry defaults therefore remain active by design; the zero-retry custom-provider
+ * settings belong only to deterministic fake-provider tests.
+ *
+ * `authMode` is required even though the TOML is identical for both modes. It forces the
+ * trusted composition to make an explicit no-fallback choice, which the auth session then
+ * enforces on the protocol. Unknown runtime keys are rejected so an endpoint cannot be
+ * smuggled into this production builder from a claim, repo or test fixture.
+ */
+export function buildCodexProductionConfigToml(opts: CodexProductionConfigOptions): string {
+  validateProductionConfigOptions(opts);
+  return nativeDisabledConfigLines(opts.model, "openai", opts.projectPath).join("\n");
+}
+
+/**
+ * Build an authenticated custom-provider config for the in-container M3b fake. This
+ * is deliberately separate from {@link buildCodexProductionConfigToml}: production
+ * keeps the built-in `openai` provider and emits no endpoint override.
+ *
+ * Pinned Codex 0.153.2's built-in provider has WebSockets enabled and cannot be
+ * overridden by a same-name provider table (`merge_configured_model_providers` uses
+ * `or_insert`). Its app-server tests instead use a distinct custom provider with
+ * `requires_openai_auth = true` and `supports_websockets = false`; this reproduces
+ * that exact HTTP-fake shape while preserving `account/login/start`. Keep the URL
+ * narrower than a general provider seam so a test dependency can never redirect
+ * credentials to a network peer.
+ */
+export function buildCodexLoopbackTestConfigToml(
+  opts: CodexProductionConfigOptions,
+  openAIBaseUrl: string,
+): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(openAIBaseUrl);
+  } catch {
+    throw new Error("Codex loopback test base URL is invalid");
+  }
+  const normalizedBaseUrl = `http://127.0.0.1:${parsed.port}/v1`;
+  if (
+    parsed.protocol !== "http:"
+    || parsed.hostname !== "127.0.0.1"
+    || parsed.port === ""
+    || parsed.pathname !== "/v1"
+    || parsed.username !== ""
+    || parsed.password !== ""
+    || parsed.search !== ""
+    || parsed.hash !== ""
+    || openAIBaseUrl !== normalizedBaseUrl
+  ) {
+    throw new Error("Codex loopback test base URL must be http://127.0.0.1:<port>/v1 with no credentials or query");
+  }
+  validateProductionConfigOptions(opts);
+  const providerName = CODEX_M3B_LOOPBACK_PROVIDER_NAME;
+  return [
+    ...nativeDisabledConfigLines(opts.model, providerName, opts.projectPath),
+    `[model_providers.${toml(providerName)}]`,
+    `name = "OpenAI"`,
+    `base_url = ${toml(normalizedBaseUrl)}`,
+    `wire_api = "responses"`,
+    `supports_websockets = false`,
+    `requires_openai_auth = true`,
     `request_max_retries = 0`,
     `stream_max_retries = 0`,
     ``,

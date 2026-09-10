@@ -21,6 +21,13 @@
 # handler/oidc.go (the OIDC state cookie) -- none in a worker/controller handler --
 # so on the clean tree this scoped rule reports ZERO findings.
 #
+# DARK CODEX (issue #1171 M5): the DARK Codex worker route handler,
+# api/internal/handler/worker_codex.go, is a Bearer-only RequireWorker route and is
+# ALREADY covered by the `worker_*.go` include glob below -- no pattern change was
+# needed to bring it under this invariant, only this note. Its red control (a
+# `r.Cookie("x")` read added inside a worker_codex.go handler) fires; the clean file
+# reads no cookie, so it contributes zero.
+#
 # 🔴 RELIABILITY BOUNDARY. This rule is FILE-GLOB-SCOPED (the paths below), so it
 # guards only the KNOWN worker/controller handler files by name, and the glob is a
 # NAME proxy for the real "mounted under RequireWorker/RequireController" property.
@@ -79,6 +86,8 @@ rules:
       # api/internal/handler/. semgrep's defaults skip *_test.go, so this scopes
       # to the production handler files.
       include:
+        # worker_*.go also covers the DARK Codex worker route,
+        # worker_codex.go (issue #1171 M5) -- Bearer-only under RequireWorker.
         - /api/internal/handler/worker_*.go
         - /api/internal/handler/controller_*.go
         - /api/internal/handler/judge_worker.go

@@ -26,6 +26,7 @@
 // EVIDENCE (fd 4, one JSON object per line, each <= 65536 bytes, <= 256 lines):
 //
 //	{"event":"started",...}
+//	{"event":"child_exit","code":<int>}
 //	{"event":"snapshot","id":<int>,"processes":[{pid,ppid,pgid,comm}...]}
 //	{"event":"dispose","id":<int>,"state":"drained",...}
 //	{"event":"dispose","id":<int>,"state":"unconfirmed","reason":"...",...}
@@ -33,7 +34,12 @@
 //
 // ARGV (trusted, caller-supplied, NEVER model-controlled):
 //
-//	uzi-codex-supervisor --expect-uid <N> -- <child-exec-abspath> [child args...]
+//	uzi-codex-supervisor --expect-uid <N> [--cleanup-token <lowercase-uuid>] [--drop-controller-caps] -- <child-exec-abspath> [child args...]
+//
+// The optional token authorizes only removal of the fixed path
+// /tmp/uzi-codex-command-<token> after cleanup; it is not an arbitrary path.
+// The cap-drop flag is used only for worker-uid durability roots: it clears the
+// entrypoint's controller-only SETUID/SETGID before the unchanged zero-cap check.
 //
 // EXIT CODE: 0 iff a dispose reached state "drained"; non-zero on abnormal,
 // unconfirmed or profile-fail.

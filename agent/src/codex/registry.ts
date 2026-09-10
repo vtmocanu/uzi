@@ -125,6 +125,7 @@ interface CallbackRecord {
 interface RootRecord {
   readonly root: RegisteredRoot;
   reaped: boolean;
+  reapPromise?: Promise<ReapOutcome>;
   disposed: boolean;
 }
 
@@ -533,7 +534,7 @@ export class ExecutionRegistry {
     // Reap every root; do not short-circuit, one incomplete root must not hide
     // another, and every root must be asked.
     const outcomes = await Promise.all(
-      this.roots.map(async (rec) => ({ rec, outcome: await rec.root.reap(deadlineMs) })),
+      this.roots.map(async (rec) => ({ rec, outcome: await this.reapRecord(rec, deadlineMs) })),
     );
     for (const { rec, outcome } of outcomes) {
       if (outcome.ok) {
@@ -547,6 +548,42 @@ export class ExecutionRegistry {
       return { kind: "incomplete", errors };
     }
     return { kind: "observed_empty", evidence: "supervisor_echild", epoch: this.epochValue };
+  }
+
+  /** Settle one registered root before the aggregate durability boundary. Command
+   * callbacks use this so their reply is not published while a backgrounded
+   * descendant survives. The call is identity-bound, single-flight and idempotent;
+   * an unknown root or incomplete reap poisons the epoch. */
+  async reapRoot(root: RegisteredRoot, deadlineMs: number): Promise<ReapOutcome> {
+    const rec = this.roots.find((candidate) => candidate.root === root);
+    if (!rec) {
+      const error: HarnessError = { category: "protocol", message: "reapRoot: root is not registered" };
+      this.poison(error);
+      return { ok: false, error };
+    }
+    const outcome = await this.reapRecord(rec, deadlineMs);
+    if (!outcome.ok) this.poison(outcome.error);
+    return outcome;
+  }
+
+  private reapRecord(rec: RootRecord, deadlineMs: number): Promise<ReapOutcome> {
+    if (rec.reaped) return Promise.resolve({ ok: true });
+    if (rec.reapPromise) return rec.reapPromise;
+    rec.reapPromise = (async () => {
+      try {
+        const outcome = await rec.root.reap(deadlineMs);
+        if (outcome.ok) rec.reaped = true;
+        return outcome;
+      } catch {
+        return {
+          ok: false,
+          error: { category: "tool", message: "reapRoot: root reap rejected before completion" },
+        };
+      } finally {
+        rec.reapPromise = undefined;
+      }
+    })();
+    return rec.reapPromise;
   }
 
   /**

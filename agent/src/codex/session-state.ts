@@ -6,8 +6,9 @@
 // catalogs) elsewhere under `$CODEX_HOME` (e.g. `auth.json`). To resume a run across
 // a checkpoint/park/shutdown root recreation, uzi preserves ONLY a proven
 // CREDENTIAL-FREE session subset and re-authorizes the credential per root
-// separately. This module owns that subset copy: a runner-owned per-run store that
-// survives root reaping, seeded back into a fresh root before app-server start.
+// separately. This module owns that subset copy: a worker-owned per-run store beside
+// the runner-owned epoch trees. It survives root reaping and is seeded back into a
+// fresh epoch before app-server start.
 //
 // ─── CRITICAL SAFETY RULE: ALLOWLIST, NEVER DENYLIST ────────────────────────────
 // We copy ONLY an explicit allowlist of credential-free session artifacts, and NEVER
@@ -24,11 +25,11 @@
 //       over-exclusion merely falls back to a fresh session, which is fail-safe;
 //       leaking one auth byte is not.
 //
-// 🔴 PROVISIONAL: the exact pinned-Codex rollout file set is NOT fully characterized
-// offline. The allowlist above is deliberately conservative and MUST be confirmed
-// against the real app-server in the packaged integration (m3b:packaged) before this
-// is trusted in production. Widen the allowlist only with a proven credential-free
-// characterization; never widen it speculatively.
+// VERIFIED 2026-09-10: pinned Codex 0.153.2 wrote the resumable rollout under this
+// `.jsonl`-only subtree in both native AMD64 packaged worker images. Persist/adopt
+// crossed plan approval and cooperative-checkpoint root recreation with nonzero file
+// counts, while the credential/capability canaries stayed absent from every observed
+// surface. The allowlist remains deliberately narrow; never widen it speculatively.
 //
 // ─── TRAVERSAL / SYMLINK SAFETY (openat2-style, fd-anchored) ────────────────────
 // The copy walk is ANCHORED on held directory file descriptors on BOTH ends, never on
@@ -56,9 +57,44 @@
 // the untrusted codexHome would otherwise exhaust the process fd table (EMFILE, ≈ depth
 // 510 at the default 1024 fd limit) long before the per-entry scan cap — which bounds
 // total entries but NOT depth — is reached; the depth cap bounds the simultaneous-fd
-// count directly. A failed `persist` removes any partial dest copy before re-throwing,
-// so a breach mid-copy leaves nothing a later `adopt`/`inspect` would treat as a
-// resumable store.
+// count directly.
+//
+// ─── PUBLICATION MODEL: immutable generations + one atomically-renamed pointer ──
+// The store is NOT a single mutable `sessions/` dir. `persist` writes each fresh copy into its
+// OWN immutable generation directory `generations/<genId>/sessions/**` (a private, unique
+// `<genId>` this module mints — never model or path input, validated against a closed grammar
+// {@link GEN_ID_RE}), and publishes it by writing the winning `<genId>` into a small plain-text
+// pointer file `current` by renaming a fresh temp file ONTO it ({@link publishPointer}). The
+// pointer is REPLACED by one same-parent atomic rename — it is never unlinked — so a concurrent
+// `inspect`/`adopt`, or a crashed PROCESS, always sees `current` naming a complete generation,
+// never an absent or half-written one. NO symlink is used as the pointer. This is process-crash
+// atomic VISIBILITY, NOT whole-system power-loss durability: no data is fsync'd, so a store lost
+// to power loss simply fails safe to a fresh session.
+//
+// `persist` never touches the previous generation or the pointer before that final rename, so
+// ANY failure (a bound breach, an I/O error, a copy refusal) leaves the previous good generation
+// still named by `current` and fully discoverable; the incomplete new generation is a
+// never-pointed orphan, best-effort removed on the failing call and otherwise reaped later. The
+// previous good store is never moved aside, so a double failure can never strand it.
+//
+// RECLAMATION is reader-safe by FULL SERIALIZATION. The store is per-run / per-worker-local and
+// never shared across processes, so an in-process discipline suffices: EVERY operation — persist,
+// adopt, inspect and remove — runs under one per-storeDir lock ({@link withStoreLock}), from the
+// root/pointer open through completion. So a reader holds the lock across reading `current` and
+// opening + copying its generation, and no persist (hence no {@link reapGenerations}, which keeps
+// only the new + previous generation) can run in between — there is no read→open window to race
+// and no lease bookkeeping. Two persists likewise never overlap. `.current.tmp.*` residue from a
+// crashed publish is swept on the next persist ({@link sweepStaleTemps}).
+//
+// The transaction layer is fd-anchored, and ANCESTOR-safe: the trusted `storeDir` and the
+// UNTRUSTED `codexHome` are opened by walking EVERY path component from `/` with
+// `O_DIRECTORY | O_NOFOLLOW` ({@link resolveDir}) — a symlinked ancestor at ANY level is refused,
+// not just a symlinked final component — and every generation/pointer operation runs relative to
+// the held dirfd via `/proc/self/fd/<fd>/<name>`. Only a validated FINAL component is ever created
+// (relative to a pinned parent), never a pathname `mkdir -p`. FRESHNESS: a persist that captures
+// ZERO artifacts (absent or empty source) still publishes an EMPTY generation and advances
+// `current`, so `inspect` becomes absent and a stale session cannot resume — a genuinely
+// UNREADABLE `current` (EACCES) instead fails persist closed rather than reap.
 //
 // This module NEVER logs file contents or a token; diagnostics are static and
 // bounded (an error names only which cap was hit, never a path or a byte).
@@ -68,6 +104,7 @@ import type { FileHandle } from "node:fs/promises";
 import { constants as FS } from "node:fs";
 import type { Stats } from "node:fs";
 import { extname, isAbsolute, join, relative, resolve } from "node:path";
+import { randomBytes } from "node:crypto";
 
 import type { SessionPresence } from "../harness.js";
 
@@ -76,9 +113,9 @@ import type { SessionPresence } from "../harness.js";
  *  is the first allowlist gate. */
 export const SESSION_ALLOWED_SUBDIR = "sessions";
 
-/** Allowed rollout/transcript file extensions. Pinned Codex writes rollouts as
- *  JSONL; anything else under `sessions/` is treated as uncertain and EXCLUDED.
- *  Provisional pending m3b:packaged confirmation (see file header). */
+/** Allowed rollout/transcript file extensions. Pinned Codex 0.153.2 writes the
+ * resumable rollout as JSONL, verified by the 2026-09-10 both-image packaged proof;
+ * anything else under `sessions/` is treated as uncertain and EXCLUDED. */
 export const SESSION_ALLOWED_EXTENSIONS: readonly string[] = [".jsonl"];
 
 /** Auth-shaped name substrings. A file OR directory whose name contains any of these
@@ -91,10 +128,9 @@ export const SESSION_ALLOWED_EXTENSIONS: readonly string[] = [".jsonl"];
  *
  *  It matches ASCII-case-insensitively ONLY (`.toLowerCase()`): homoglyph / Unicode
  *  confusable names (e.g. a Cyrillic `а` in "аuth") are NOT normalized and would slip
- *  past this substring test. That is a DOCUMENTED residual of the PROVISIONAL
- *  content-trust model (see file header) — the primary allowlist, not this deny-list,
- *  is the load-bearing gate, and the real rollout name set must be characterized
- *  against the app-server in m3b:packaged before this is trusted in production. */
+ *  past this substring test. The primary `.jsonl` allowlist and `sessions/` subtree,
+ *  not this deny-list, are the load-bearing gates. The deny-list adds defense in depth
+ *  to the rollout shape verified by the both-image packaged proof. */
 export const SESSION_DENY_NAME_SUBSTRINGS: readonly string[] = [
   "auth",
   "access",
@@ -163,6 +199,12 @@ export interface PersistResult {
 export interface AdoptResult {
   readonly files: number;
 }
+
+/** Destination posture for an adopted session copy. `private` is the ordinary
+ * worker-owned 0700/0600 tree. `runner-seed` is a short-lived, credential-free
+ * staging tree whose directories/files are group-readable so the provider runner
+ * can copy them into its own final 2750 session tree before app-server start. */
+export type SessionAdoptDestination = "private" | "runner-seed";
 
 /** Thrown by `persist` when a bound is exceeded (fail-closed): the copy stops rather
  *  than persisting an unbounded subset. `adopt`/`inspect` are fail-SAFE instead and
@@ -318,6 +360,7 @@ async function copyAllowlistedSessions(
   destSessionsDir: string,
   bounds: SessionStoreBounds,
   throwOnBound: boolean,
+  destModes: { readonly dir: number; readonly file: number } = { dir: 0o700, file: 0o600 },
 ): Promise<CopyTally> {
   const srcRoot = resolve(srcSessionsDir);
   const destRoot = resolve(destSessionsDir);
@@ -376,7 +419,7 @@ async function copyAllowlistedSessions(
           // Create the dest child relative to the dest parent fd (openat-style), then
           // open it O_NOFOLLOW so we descend into a real, in-tree directory.
           try {
-            await fsp.mkdir(`/proc/self/fd/${destDirFh.fd}/${name}`, { mode: 0o700 });
+            await fsp.mkdir(`/proc/self/fd/${destDirFh.fd}/${name}`, { mode: destModes.dir });
           } catch (error) {
             if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
           }
@@ -433,7 +476,7 @@ async function copyAllowlistedSessions(
           destDirFh,
           name,
           FS.O_WRONLY | FS.O_CREAT | FS.O_TRUNC | FS.O_NOFOLLOW,
-          0o600,
+          destModes.file,
         );
         try {
           await destFile.writeFile(data);
@@ -468,7 +511,7 @@ async function copyAllowlistedSessions(
   try {
     // Create + open the top-level DEST sessions dir, O_NOFOLLOW so we never write
     // THROUGH a symlinked dest either.
-    await fsp.mkdir(destRoot, { recursive: true, mode: 0o700 });
+    await fsp.mkdir(destRoot, { recursive: true, mode: destModes.dir });
     const destTop = await fsp.open(destRoot, FS.O_RDONLY | FS.O_NOFOLLOW | FS.O_DIRECTORY);
     try {
       await walk(srcTop, destTop, 0);
@@ -480,6 +523,23 @@ async function copyAllowlistedSessions(
   }
 
   return tally;
+}
+
+/** Copy an already-vetted, credential-free staging `sessions/` tree into the
+ * runner-owned provider destination. The launcher invokes this in a fixed helper
+ * process as uid `runner`; using the same fd-anchored allowlist here prevents the
+ * restoration side from drifting into a broader recursive copy. */
+export async function seedCodexSessionArtifacts(
+  stagedSessionsDir: string,
+  providerSessionsDir: string,
+): Promise<AdoptResult> {
+  return copyAllowlistedSessions(
+    stagedSessionsDir,
+    providerSessionsDir,
+    DEFAULT_SESSION_STORE_BOUNDS,
+    false,
+    { dir: 0o2750, file: 0o640 },
+  );
 }
 
 /** Scan for the FIRST allowlisted artifact under `sessionsDir`, bounded by
@@ -512,152 +572,531 @@ async function hasAllowlistedArtifact(sessionsDir: string, scanCap: number): Pro
   return walk("");
 }
 
+// ─── Generation + pointer publication (fd-anchored transaction layer) ───────────
+
+/** Subdirectory under `storeDir` holding the immutable per-persist generation dirs. */
+const GENERATIONS_SUBDIR = "generations";
+/** Plain-text pointer file naming the current generation (NEVER a symlink). */
+const CURRENT_POINTER = "current";
+/** Closed grammar for a generation id: `g` + 24 lowercase hex. This module MINTS the id (never
+ *  model/path input); it is validated on every read so a corrupt or planted pointer resolves to
+ *  "no current generation" (fail-safe → fresh session). */
+const GEN_ID_RE = /^g[0-9a-f]{24}$/;
+/** The pointer holds a single short id; anything larger is treated as corrupt. */
+const POINTER_MAX_BYTES = 64;
+/** Temp-file prefix for the atomic pointer publish (same-parent rename source). */
+const POINTER_TMP_PREFIX = ".current.tmp.";
+
+function freshGenId(): string {
+  return `g${randomBytes(12).toString("hex")}`;
+}
+function isValidGenId(id: string): boolean {
+  return GEN_ID_RE.test(id);
+}
+
+async function closeQuietly(fh: FileHandle | undefined): Promise<void> {
+  if (fh) await fh.close().catch(() => {});
+}
+
+/** Split an absolute path into its non-empty components (`resolve` first drops `.`/`..`). */
+function pathComponents(absPath: string): string[] {
+  return resolve(absPath).split("/").filter((p) => p.length > 0);
+}
+
+// Linux O_PATH is intentionally not exposed by Node's fs.constants. It obtains a
+// path-only descriptor without requiring directory read/list permission, while
+// O_DIRECTORY + O_NOFOLLOW retain the ancestor type/symlink checks. Non-Linux hosts
+// use O_RDONLY; the packaged runtime and this boundary are Linux-only.
+const LINUX_O_PATH = 0o10000000;
+const DIR_READ_FLAGS = FS.O_RDONLY | FS.O_DIRECTORY | FS.O_NOFOLLOW;
+const DIR_PATH_FLAGS = process.platform === "linux"
+  ? LINUX_O_PATH | FS.O_DIRECTORY | FS.O_NOFOLLOW
+  : DIR_READ_FLAGS;
+
+/** Open an absolute directory by walking EVERY component from `/` with `O_DIRECTORY | O_NOFOLLOW`,
+ *  so a symlinked ancestor at ANY level is refused (ELOOP) — the userland openat2
+ *  `RESOLVE_NO_SYMLINKS`. Linux ancestors use O_PATH so execute-only traversal remains
+ *  non-listable; the final descriptor is read-capable unless `pathOnlyFinal` is true.
+ *  Every component must already exist as a real directory; nothing is created or followed. */
+async function resolveDir(absPath: string, pathOnlyFinal = false): Promise<FileHandle> {
+  const parts = pathComponents(absPath);
+  let fh = await fsp.open("/", parts.length === 0 && !pathOnlyFinal ? DIR_READ_FLAGS : DIR_PATH_FLAGS);
+  try {
+    for (let i = 0; i < parts.length; i += 1) {
+      const part = parts[i]!;
+      const final = i === parts.length - 1;
+      const next = await openAt(fh, part, final && !pathOnlyFinal ? DIR_READ_FLAGS : DIR_PATH_FLAGS);
+      await fh.close();
+      fh = next;
+    }
+    return fh;
+  } catch (error) {
+    await closeQuietly(fh);
+    throw error;
+  }
+}
+
+/** Resolve the PARENT of `absPath` ancestor-safely, then create (idempotently) and open ONLY the
+ *  final component relative to that pinned parent — never a pathname `mkdir -p`, so no symlinked
+ *  ancestor is created through or followed. The parent must already exist. */
+async function resolveDirEnsuringFinal(absPath: string, mode: number): Promise<FileHandle> {
+  const parts = pathComponents(absPath);
+  if (parts.length === 0) {
+    throw new Error("codex session store: refusing to operate on the filesystem root");
+  }
+  const base = parts[parts.length - 1]!;
+  const parentFd = await resolveDir(`/${parts.slice(0, -1).join("/")}`);
+  try {
+    await mkdirAt(parentFd, base, mode); // idempotent (EEXIST tolerated)
+    return await openAt(parentFd, base, FS.O_RDONLY | FS.O_DIRECTORY | FS.O_NOFOLLOW);
+  } finally {
+    await closeQuietly(parentFd);
+  }
+}
+
+/** `mkdir <parentFd>/<name>` (openat-style, relative to a held dirfd), tolerating EEXIST. */
+async function mkdirAt(parent: FileHandle, name: string, mode: number): Promise<void> {
+  try {
+    await fsp.mkdir(`/proc/self/fd/${parent.fd}/${name}`, { mode });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+  }
+}
+
+/** `rm -rf <parentFd>/<name>` (relative to a held dirfd). `name` is a single validated
+ *  component (a gen id, a temp file, or the allowlist subdir), never a traversal. */
+async function rmAt(parent: FileHandle, name: string): Promise<void> {
+  await fsp.rm(`/proc/self/fd/${parent.fd}/${name}`, { recursive: true, force: true });
+}
+
+/** `lstat <parentFd>/<name>` (relative to a held dirfd); undefined if absent. lstat does NOT
+ *  follow a symlinked final component, so a planted symlink is detectable. */
+async function lstatAt(parent: FileHandle, name: string): Promise<Stats | undefined> {
+  try {
+    return await fsp.lstat(`/proc/self/fd/${parent.fd}/${name}`);
+  } catch {
+    return undefined;
+  }
+}
+
+/** The classified result of reading the current pointer. */
+type PointerRead = { kind: "present"; genId: string } | { kind: "absent" } | { kind: "corrupt" };
+
+/** Read + CLASSIFY the current pointer relative to a held `storeDir` dirfd. ENOENT → `absent`; a
+ *  symlinked/non-file/over-long/bad-grammar pointer → `corrupt` (both fail-safe → fresh session);
+ *  a GENUINE I/O error (EACCES/EIO/…) THROWS, so callers keep uncertainty distinct from absence
+ *  (inspect → "unknown", persist → fail-closed rather than a wrong reap). `faultPointerRead` is a
+ *  test-only injected fault (see {@link CodexSessionStoreHooks}); production passes undefined. */
+async function readCurrentPointer(
+  storeFd: FileHandle,
+  faultPointerRead: (() => Error) | undefined,
+): Promise<PointerRead> {
+  if (faultPointerRead) throw faultPointerRead();
+  let fh: FileHandle | undefined;
+  try {
+    fh = await fsp.open(`/proc/self/fd/${storeFd.fd}/${CURRENT_POINTER}`, FS.O_RDONLY | FS.O_NOFOLLOW);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return { kind: "absent" };
+    if (code === "ELOOP" || code === "EISDIR" || code === "ENOTDIR") return { kind: "corrupt" };
+    throw error; // EACCES / EIO / … — genuine uncertainty, propagated
+  }
+  try {
+    const st = await fh.stat();
+    if (!st.isFile() || st.size > POINTER_MAX_BYTES) return { kind: "corrupt" };
+    const raw = (await readBounded(fh, st.size)).toString("utf8").trim();
+    return isValidGenId(raw) ? { kind: "present", genId: raw } : { kind: "corrupt" };
+  } finally {
+    await closeQuietly(fh);
+  }
+}
+
+/** Publish `genId` by writing it to a fresh unique temp file and renaming that ONTO `current` —
+ *  one same-parent atomic rename that REPLACES the pointer (it is never unlinked), so a reader
+ *  or a crashed PROCESS always sees `current` naming a complete generation. This is process-crash
+ *  atomic VISIBILITY only; it is NOT a whole-system power-loss durability guarantee (no fsync) —
+ *  a store lost to power loss simply fails safe to a fresh session. On ANY write/rename failure
+ *  the temp is unlinked, so no `.current.tmp.*` residue is left. Relative to the held storeDir
+ *  dirfd. */
+async function publishPointer(storeFd: FileHandle, genId: string): Promise<void> {
+  const tmpName = `${POINTER_TMP_PREFIX}${randomBytes(8).toString("hex")}`;
+  const tmpPath = `/proc/self/fd/${storeFd.fd}/${tmpName}`;
+  let fh: FileHandle | undefined;
+  let published = false;
+  try {
+    fh = await fsp.open(tmpPath, FS.O_WRONLY | FS.O_CREAT | FS.O_EXCL | FS.O_NOFOLLOW, 0o600);
+    await fh.writeFile(`${genId}\n`);
+    await closeQuietly(fh);
+    fh = undefined;
+    await fsp.rename(tmpPath, `/proc/self/fd/${storeFd.fd}/${CURRENT_POINTER}`);
+    published = true;
+  } finally {
+    await closeQuietly(fh);
+    if (!published) await fsp.rm(tmpPath, { force: true }).catch(() => {}); // never leave a temp
+  }
+}
+
+/** Remove leftover `.current.tmp.*` files (a crashed publish's residue). Safe with no reader
+ *  coordination: a temp is only ever renamed onto `current` by its own creator, so a leftover is
+ *  abandoned and read by no one. Bounded by the scan cap. Relative to the held `storeDir` dirfd. */
+async function sweepStaleTemps(storeFd: FileHandle, bounds: SessionStoreBounds): Promise<void> {
+  let entries;
+  try {
+    entries = await fsp.readdir(`/proc/self/fd/${storeFd.fd}`, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  let scanned = 0;
+  for (const entry of entries) {
+    if ((scanned += 1) > bounds.maxScanEntries) return;
+    if (entry.isFile() && entry.name.startsWith(POINTER_TMP_PREFIX)) {
+      await rmAt(storeFd, entry.name).catch(() => {});
+    }
+  }
+}
+
+/** Reap every generation directory except those in `keep` (the new + previous generation).
+ *  Reader-safe because every store operation is serialized (see the per-store lock below): no
+ *  reader can be mid-read of a generation while a persist reaps. Bounded by the scan cap;
+ *  best-effort per entry. Relative to the held `generations/` dirfd. */
+async function reapGenerations(
+  gensFd: FileHandle,
+  keep: Set<string>,
+  bounds: SessionStoreBounds,
+): Promise<void> {
+  let entries;
+  try {
+    entries = await fsp.readdir(`/proc/self/fd/${gensFd.fd}`, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  let scanned = 0;
+  for (const entry of entries) {
+    if ((scanned += 1) > bounds.maxScanEntries) return;
+    if (!entry.isDirectory() || keep.has(entry.name)) continue;
+    await rmAt(gensFd, entry.name).catch(() => {});
+  }
+}
+
+// ─── per-storeDir operation lock (full serialization) ───────────────────────────
+// The store is per-run / per-worker-local and is NEVER shared across processes (a different
+// worker has no store, per the module doc), so an IN-PROCESS discipline suffices. EVERY store
+// operation — persist, adopt, inspect and remove — runs under this per-storeDir lock, from the
+// root/pointer open through completion. So a reader holds the lock across reading `current` and
+// opening + copying its generation, and no persist (hence no reap) can run in between: there is
+// no read→open→lease window to race, and no lease bookkeeping is needed. Two persists likewise
+// never overlap. Keys are the resolved storeDir path.
+const storeChains = new Map<string, Promise<void>>();
+function withStoreLock<T>(storeDir: string, fn: () => Promise<T>): Promise<T> {
+  const key = resolve(storeDir);
+  const prior = storeChains.get(key) ?? Promise.resolve();
+  const run = prior.then(fn, fn); // run after the previous op settles, whatever its outcome
+  const tail = run.then(() => {}, () => {}); // the chain tail never rejects
+  storeChains.set(key, tail);
+  // IDENTITY-SAFE cleanup: when THIS tail settles, drop the key ONLY if it is still the tail. A
+  // newer queued op replaces `storeChains.get(key)` synchronously, so an older completion can never
+  // delete a newer op's tail; when the LAST op for a key settles, its entry is removed and the
+  // registry returns to zero (no retained per-run key after ordinary ops or a terminal remove).
+  void tail.then(() => {
+    if (storeChains.get(key) === tail) storeChains.delete(key);
+  });
+  return run;
+}
+
+/** TEST-ONLY read-only diagnostic: the number of live per-storeDir lock chains. No `storeChains`
+ *  is otherwise observable, so the churn regression uses this to prove the registry returns to
+ *  zero after operations complete. It grants no mutation or fault authority. */
+export function storeLockRegistrySize(): number {
+  return storeChains.size;
+}
+
 // ─── Public API ─────────────────────────────────────────────────────────────────
 
+/** TEST-ONLY composition hooks. The production store ({@link CodexSessionStore}) is built with
+ *  none. They exist so the regression suite can place DETERMINISTIC barriers (not probabilistic
+ *  sampling) around the publication protocol, via {@link createCodexSessionStore}. */
+export interface CodexSessionStoreHooks {
+  /** When set, the current-pointer read throws this, simulating a GENUINE I/O error (EACCES/EIO)
+   *  that the classification must distinguish from a missing/corrupt pointer. */
+  readonly faultPointerRead?: () => Error;
+}
+
+export interface CodexSessionStoreApi {
+  persist(codexHome: string, storeDir: string, opts?: { bounds?: SessionStoreBounds }): Promise<PersistResult>;
+  adopt(storeDir: string, codexHome: string, opts?: { destination?: SessionAdoptDestination }): Promise<AdoptResult>;
+  inspect(storeDir: string, opts?: { scanCap?: number }): Promise<SessionPresence>;
+  remove(storeDir: string): Promise<void>;
+}
+
 /**
- * The credential-free Codex session store. Every method takes explicit directory
- * paths so it is unit-testable against temp dirs with no real Codex.
+ * Build a credential-free Codex session store. Every method takes explicit directory paths so it
+ * is unit-testable against temp dirs with no real Codex.
  *
- *   - `persist` copies the credential-free session subset OUT of a live root's
- *     `$CODEX_HOME` into the runner-owned per-run store (survives root reaping).
- *   - `adopt` seeds a fresh root's `$CODEX_HOME/sessions/` from that store.
- *   - `inspect` reports whether the store holds a resumable session (tri-state).
- *   - `remove` deletes the store at the terminal boundary (credential-free, always
- *     removable).
+ *   - `persist` copies the credential-free session subset OUT of a live root's `$CODEX_HOME` into
+ *     a fresh immutable generation and publishes it (survives root reaping).
+ *   - `adopt` seeds a fresh root's `$CODEX_HOME/sessions/` from the current generation.
+ *   - `inspect` reports whether the current generation holds a resumable session (tri-state).
+ *   - `remove` deletes the store at the terminal boundary (credential-free, always removable).
  *
- * The store is per-worker-local and is NEVER serialized through any API/checkpoint:
- * a different worker has no store, so `inspect` returns "absent" and the harness
- * starts fresh over the recovered worktree (a deliberate non-goal, per the plan).
+ * On-disk layout under `storeDir`: `generations/<genId>/sessions/**` (immutable per-persist
+ * generations) plus a plain-text `current` pointer naming the winning `<genId>`, published by one
+ * atomic same-parent rename (see the module header). CONCURRENCY: EVERY operation runs under the
+ * per-storeDir operation lock (see above), so a reader holds the lock across reading `current` and
+ * copying its generation and no persist (hence no reap) can run in between; two persists never
+ * overlap. The store is per-worker-local and NEVER shared across processes, so this in-process
+ * lock is sufficient.
  */
-export const CodexSessionStore = {
-  /**
-   * Copy the credential-free session subset from `codexHome` into `storeDir`
-   * (created mode 0700). The store's `sessions/` copy is refreshed (cleared first),
-   * so a stale rollout never lingers. Only the allowlist is copied; symlinks are
-   * rejected; the copy is bounded and throws {@link CodexSessionStoreBoundError} on
-   * a breach. `opts.bounds` overrides the default caps (used by tests).
-   *
-   * Atomic-ish on failure: if the copy throws mid-way (a bound breach or an I/O
-   * error), the partial `destSessions` subtree is removed before the error propagates,
-   * so a failed persist leaves nothing a later `inspect`/`adopt` would treat as a
-   * resumable store.
-   */
-  async persist(
-    codexHome: string,
-    storeDir: string,
-    opts: { bounds?: SessionStoreBounds } = {},
-  ): Promise<PersistResult> {
-    const bounds = opts.bounds ?? DEFAULT_SESSION_STORE_BOUNDS;
-    const srcSessions = join(codexHome, SESSION_ALLOWED_SUBDIR);
-    const destSessions = join(storeDir, SESSION_ALLOWED_SUBDIR);
-    try {
-      await fsp.mkdir(storeDir, { recursive: true, mode: 0o700 });
-      await fsp.chmod(storeDir, 0o700);
+export function createCodexSessionStore(hooks: CodexSessionStoreHooks = {}): CodexSessionStoreApi {
+  return {
+    /**
+     * Copy the credential-free session subset from `codexHome` into a FRESH immutable generation
+     * and publish it as the current generation with one atomic pointer rename. Only the allowlist
+     * is copied; symlinks are rejected; the copy is bounded and throws
+     * {@link CodexSessionStoreBoundError} on a breach. `opts.bounds` overrides the default caps.
+     *
+     * The previous generation and the `current` pointer are never touched until the new
+     * generation is fully copied, so ANY failure leaves the previous good generation still
+     * current and discoverable; the incomplete new generation is a never-pointed orphan
+     * (best-effort removed here, else reaped by the next persist). FRESHNESS: an absent or empty
+     * source publishes an EMPTY generation and advances `current`, so `inspect` becomes absent and
+     * a stale session cannot resume (this is the established behavior, not a keep-old cache). A
+     * genuinely UNREADABLE `current` (EACCES) fails persist closed rather than reap. Persists are
+     * serialized per storeDir.
+     */
+    async persist(codexHome, storeDir, opts = {}) {
+      return withStoreLock(storeDir, async () => {
+        const bounds = opts.bounds ?? DEFAULT_SESSION_STORE_BOUNDS;
+        let storeFd: FileHandle | undefined;
+        let codexHomeFd: FileHandle | undefined;
+        let gensFd: FileHandle | undefined;
+        let newGenFd: FileHandle | undefined;
+        let newGenId: string | undefined;
+        try {
+          // Pin the TRUSTED store dir ancestor-safely; create ONLY its final component; set its
+          // mode through the held fd (never a pathname mkdir -p / chmod).
+          storeFd = await resolveDirEnsuringFinal(storeDir, 0o700);
+          await storeFd.chmod(0o700);
 
-      // Refresh: clear any prior copy so the store never holds a stale rollout set.
-      await fsp.rm(destSessions, { recursive: true, force: true });
+          // Pin the UNTRUSTED codexHome ancestor-safely. ENOENT → empty source (still publish an
+          // empty generation for freshness). ELOOP/ENOTDIR (symlinked/odd ancestor) → refuse. A
+          // genuine I/O error propagates and fails persist closed (old store left intact).
+          let sourceAbsent = false;
+          try {
+            codexHomeFd = await resolveDir(codexHome, true);
+          } catch (error) {
+            const code = (error as NodeJS.ErrnoException).code;
+            if (code === "ENOENT") sourceAbsent = true;
+            else if (code === "ELOOP" || code === "ENOTDIR") {
+              throw new CodexSessionStoreError("source-not-directory");
+            } else throw error;
+          }
 
-      const tally = await copyAllowlistedSessions(srcSessions, destSessions, bounds, true);
-      return { files: tally.files, bytes: tally.bytes };
-    } catch (error) {
-      // FIX 3 (atomic-ish persist): a bound breach or I/O error can throw AFTER some
-      // files were already copied, leaving a PARTIAL `destSessions` that a later
-      // `inspect()` would report "present" and `adopt()` would resume. Remove it before
-      // re-throwing so a failed persist leaves nothing adoptable. Swallow any cleanup
-      // error so it never masks the original failure.
-      await fsp.rm(destSessions, { recursive: true, force: true }).catch(() => {});
+          // Classify the current pointer BEFORE creating anything. A genuine I/O error throws here
+          // and fails persist closed, so an unreadable `current` never causes a wrong reap.
+          const pointer = await readCurrentPointer(storeFd, hooks.faultPointerRead);
+          const prevGenId = pointer.kind === "present" ? pointer.genId : undefined;
 
-      // Bound breaches keep their fail-closed contract, and the top-level source refusal
-      // is already a static, path-free error — re-throw both as-is. Anything else is a
-      // raw `fs` error whose `.path` names a filesystem path; wrap it in a static module
-      // error so persist never propagates a path (see the module's safety rule).
-      if (
-        error instanceof CodexSessionStoreBoundError ||
-        error instanceof CodexSessionStoreError
-      ) {
-        throw error;
-      }
-      throw new CodexSessionStoreError("io-error");
-    }
-  },
+          // Build a fresh immutable generation, fd-anchored under storeFd.
+          await mkdirAt(storeFd, GENERATIONS_SUBDIR, 0o700);
+          gensFd = await openAt(storeFd, GENERATIONS_SUBDIR, FS.O_RDONLY | FS.O_DIRECTORY | FS.O_NOFOLLOW);
+          newGenId = freshGenId();
+          await fsp.mkdir(`/proc/self/fd/${gensFd.fd}/${newGenId}`, { mode: 0o700 });
+          newGenFd = await openAt(gensFd, newGenId, FS.O_RDONLY | FS.O_DIRECTORY | FS.O_NOFOLLOW);
 
-  /**
-   * Seed `codexHome/sessions/` from `storeDir` BEFORE app-server start. Missing or
-   * corrupt store → no-op (0 files), NEVER throws (fail-safe → fresh session). This
-   * is also the cross-worker path: a worker with no store adopts nothing.
-   */
-  async adopt(storeDir: string, codexHome: string): Promise<AdoptResult> {
-    try {
-      const srcSessions = join(storeDir, SESSION_ALLOWED_SUBDIR);
-      const st = await tryLstat(srcSessions);
-      // Absent, a symlink, or not a directory → treat as no store (fresh session).
-      if (!st || st.isSymbolicLink() || !st.isDirectory()) return { files: 0 };
+          // Copy the allowlisted source into the new generation (fail-closed). A symlinked
+          // codexHome/sessions is refused by the copy's own O_NOFOLLOW top open.
+          let tally: { files: number; bytes: number } = { files: 0, bytes: 0 };
+          if (!sourceAbsent && codexHomeFd) {
+            tally = await copyAllowlistedSessions(
+              `/proc/self/fd/${codexHomeFd.fd}/${SESSION_ALLOWED_SUBDIR}`,
+              `/proc/self/fd/${newGenFd.fd}/${SESSION_ALLOWED_SUBDIR}`,
+              bounds,
+              true,
+            );
+          }
+          // A generation is always well-formed: ensure a (possibly empty) sessions/ dir.
+          await mkdirAt(newGenFd, SESSION_ALLOWED_SUBDIR, 0o700);
 
-      const destSessions = join(codexHome, SESSION_ALLOWED_SUBDIR);
-      // FIX 3 (dest-side twin of FIX 1): never write THROUGH a symlinked (or non-dir)
-      // dest `sessions/`. `mkdir(..., {recursive})` FOLLOWS a symlink, so a planted
-      // `codexHome/sessions -> /elsewhere` would land the copy out of the fresh root.
-      // If the dest exists as a symlink or a non-directory, remove that entry first
-      // (rm on a symlink unlinks only the link, never its target) so we then create a
-      // real, in-tree directory. A legit existing directory is left untouched.
-      const destStat = await tryLstat(destSessions);
-      if (destStat && (destStat.isSymbolicLink() || !destStat.isDirectory())) {
-        await fsp.rm(destSessions, { recursive: true, force: true });
-      }
-      await fsp.mkdir(destSessions, { recursive: true, mode: 0o700 });
-      const tally = await copyAllowlistedSessions(
-        srcSessions,
-        destSessions,
-        DEFAULT_SESSION_STORE_BOUNDS,
-        false, // fail-safe: adopt what fits, never throw
-      );
-      return { files: tally.files };
-    } catch {
-      // Corrupt/unexpected I/O → no-op. Adoption is best-effort; a fresh session is
-      // always a safe fallback.
-      return { files: 0 };
-    }
-  },
+          // Publish (even an empty generation — freshness), then reap stale generations keeping the
+          // new + previous only, and sweep leftover pointer temps. Reader-safe: the operation lock
+          // means no reader is mid-read while this reaps.
+          await publishPointer(storeFd, newGenId);
+          const keep = new Set<string>([newGenId]);
+          if (prevGenId) keep.add(prevGenId);
+          await reapGenerations(gensFd, keep, bounds);
+          await sweepStaleTemps(storeFd, bounds);
+          return { files: tally.files, bytes: tally.bytes };
+        } catch (error) {
+          // The pointer + previous generations were never touched before the atomic publish, so
+          // the previous good store stays current and discoverable. Drop the partial new gen.
+          if (gensFd && newGenId) await rmAt(gensFd, newGenId).catch(() => {});
+          if (
+            error instanceof CodexSessionStoreBoundError ||
+            error instanceof CodexSessionStoreError
+          ) {
+            throw error;
+          }
+          throw new CodexSessionStoreError("io-error");
+        } finally {
+          await closeQuietly(newGenFd);
+          await closeQuietly(gensFd);
+          await closeQuietly(codexHomeFd);
+          await closeQuietly(storeFd);
+        }
+      });
+    },
 
-  /**
-   * Tri-state presence of a resumable session in the store, mirroring
-   * {@link SessionPresence}: "present" when the store holds ≥1 session artifact,
-   * "absent" when the store is missing/empty/corrupt (fail-safe → fresh session),
-   * "unknown" only on a genuine I/O uncertainty (e.g. EACCES, or a tree too large to
-   * scan within bounds).
-   */
-  async inspect(
-    storeDir: string,
-    opts: { scanCap?: number } = {},
-  ): Promise<SessionPresence> {
-    const srcSessions = join(storeDir, SESSION_ALLOWED_SUBDIR);
-    try {
-      const st = await fsp.lstat(srcSessions);
-      if (st.isSymbolicLink() || !st.isDirectory()) return "absent"; // corrupt → absent
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code === "ENOENT" || code === "ENOTDIR") return "absent";
-      return "unknown"; // EACCES/ELOOP/… — genuinely cannot tell
-    }
-    try {
-      const found = await hasAllowlistedArtifact(
-        srcSessions,
-        opts.scanCap ?? DEFAULT_SESSION_STORE_BOUNDS.maxFiles,
-      );
-      return found ? "present" : "absent";
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code === "ENOENT" || code === "ENOTDIR") return "absent";
-      return "unknown"; // bound breach or unexpected I/O → uncertainty
-    }
-  },
+    /**
+     * Seed `codexHome/sessions/` from the store's CURRENT generation BEFORE app-server start. A
+     * missing store, an absent/invalid/unreadable pointer, a dangling generation, or any I/O error
+     * → no-op (0 files), NEVER throws (fail-safe → fresh session). Both roots are anchored by an
+     * ancestor-safe component walk (a symlinked ancestor of storeDir or codexHome is refused), and
+     * the dest `sessions/` is never written THROUGH a symlink. Runs under the per-storeDir operation
+     * lock, so no concurrent persist can reap the generation between reading `current` and copying it.
+     */
+    async adopt(storeDir, codexHome, opts = {}) {
+      return withStoreLock(storeDir, async () => {
+        const destination = opts.destination ?? "private";
+        const destDirMode = destination === "runner-seed" ? 0o750 : 0o700;
+        const destFileMode = destination === "runner-seed" ? 0o640 : 0o600;
+        let storeFd: FileHandle | undefined;
+        let gensFd: FileHandle | undefined;
+        let genFd: FileHandle | undefined;
+        let codexHomeFd: FileHandle | undefined;
+        try {
+          try {
+            storeFd = await resolveDir(storeDir);
+          } catch {
+            return { files: 0 };
+          }
+          let pointer: PointerRead;
+          try {
+            pointer = await readCurrentPointer(storeFd, hooks.faultPointerRead);
+          } catch {
+            return { files: 0 }; // genuine I/O → fail-safe fresh session
+          }
+          if (pointer.kind !== "present") return { files: 0 };
+          try {
+            gensFd = await openAt(storeFd, GENERATIONS_SUBDIR, FS.O_RDONLY | FS.O_DIRECTORY | FS.O_NOFOLLOW);
+            genFd = await openAt(gensFd, pointer.genId, FS.O_RDONLY | FS.O_DIRECTORY | FS.O_NOFOLLOW);
+          } catch {
+            return { files: 0 }; // a dangling pointer → fresh session
+          }
 
-  /**
-   * Delete the store at the terminal boundary. The session subset is credential-free,
-   * so it is removed unconditionally. Idempotent: a missing store is a no-op
-   * (`force` swallows ENOENT).
-   */
-  async remove(storeDir: string): Promise<void> {
-    await fsp.rm(storeDir, { recursive: true, force: true });
-  },
-};
+          // Pin the dest codexHome ancestor-safely, creating ONLY its final component if a fresh
+          // root's home does not exist yet.
+          try {
+            codexHomeFd = await resolveDir(codexHome);
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") return { files: 0 };
+            codexHomeFd = await resolveDirEnsuringFinal(codexHome, destDirMode);
+          }
+
+          // Never write THROUGH a symlinked (or non-dir) dest `sessions/`: remove such an entry
+          // first (rm on a symlink unlinks only the link), then create a real in-tree directory.
+          const destStat = await lstatAt(codexHomeFd, SESSION_ALLOWED_SUBDIR);
+          if (destStat && (destStat.isSymbolicLink() || !destStat.isDirectory())) {
+            await rmAt(codexHomeFd, SESSION_ALLOWED_SUBDIR);
+          }
+          await mkdirAt(codexHomeFd, SESSION_ALLOWED_SUBDIR, destDirMode);
+
+          const tally = await copyAllowlistedSessions(
+            `/proc/self/fd/${genFd.fd}/${SESSION_ALLOWED_SUBDIR}`,
+            `/proc/self/fd/${codexHomeFd.fd}/${SESSION_ALLOWED_SUBDIR}`,
+            DEFAULT_SESSION_STORE_BOUNDS,
+            false, // fail-safe: adopt what fits, never throw
+            { dir: destDirMode, file: destFileMode },
+          );
+          return { files: tally.files };
+        } catch {
+          return { files: 0 };
+        } finally {
+          await closeQuietly(genFd);
+          await closeQuietly(gensFd);
+          await closeQuietly(codexHomeFd);
+          await closeQuietly(storeFd);
+        }
+      });
+    },
+
+    /**
+     * Tri-state presence of a resumable session in the store's CURRENT generation:
+     * "present" when it holds ≥1 session artifact, "absent" when the store/pointer/generation is
+     * missing, corrupt or empty (fail-safe → fresh session), "unknown" ONLY on genuine I/O
+     * uncertainty (an unreadable storeDir or pointer — EACCES/EIO — or a tree too large to scan
+     * within bounds). Runs under the per-storeDir operation lock.
+     */
+    async inspect(storeDir, opts = {}) {
+      return withStoreLock(storeDir, async () => {
+        let storeFd: FileHandle | undefined;
+        let gensFd: FileHandle | undefined;
+        let genFd: FileHandle | undefined;
+        try {
+          try {
+            storeFd = await resolveDir(storeDir);
+          } catch (error) {
+            const code = (error as NodeJS.ErrnoException).code;
+            if (code === "ENOENT" || code === "ENOTDIR" || code === "ELOOP") return "absent";
+            return "unknown"; // EACCES/… — genuinely cannot tell
+          }
+          let pointer: PointerRead;
+          try {
+            pointer = await readCurrentPointer(storeFd, hooks.faultPointerRead);
+          } catch {
+            return "unknown"; // genuine I/O reading the pointer is uncertainty, NOT absence
+          }
+          if (pointer.kind !== "present") return "absent"; // missing/corrupt pointer → fresh
+          try {
+            gensFd = await openAt(storeFd, GENERATIONS_SUBDIR, FS.O_RDONLY | FS.O_DIRECTORY | FS.O_NOFOLLOW);
+            genFd = await openAt(gensFd, pointer.genId, FS.O_RDONLY | FS.O_DIRECTORY | FS.O_NOFOLLOW);
+          } catch (error) {
+            const code = (error as NodeJS.ErrnoException).code;
+            if (code === "ENOENT" || code === "ENOTDIR") return "absent"; // dangling pointer
+            return "unknown";
+          }
+          try {
+            const found = await hasAllowlistedArtifact(
+              `/proc/self/fd/${genFd.fd}/${SESSION_ALLOWED_SUBDIR}`,
+              opts.scanCap ?? DEFAULT_SESSION_STORE_BOUNDS.maxFiles,
+            );
+            return found ? "present" : "absent";
+          } catch (error) {
+            const code = (error as NodeJS.ErrnoException).code;
+            if (code === "ENOENT" || code === "ENOTDIR") return "absent";
+            return "unknown"; // bound breach or unexpected I/O → uncertainty
+          }
+        } finally {
+          await closeQuietly(genFd);
+          await closeQuietly(gensFd);
+          await closeQuietly(storeFd);
+        }
+      });
+    },
+
+    /**
+     * Delete the store at the terminal boundary (ancestor-safe: the final component is removed
+     * relative to a pinned parent). Credential-free, so removed unconditionally. Idempotent: a
+     * missing store or parent is a no-op. Runs under the per-storeDir operation lock.
+     */
+    async remove(storeDir) {
+      return withStoreLock(storeDir, async () => {
+        const parts = pathComponents(storeDir);
+        if (parts.length === 0) return;
+        let parentFd: FileHandle | undefined;
+        try {
+          parentFd = await resolveDir(`/${parts.slice(0, -1).join("/")}`);
+        } catch {
+          return; // parent gone → nothing to remove
+        }
+        try {
+          await rmAt(parentFd, parts[parts.length - 1]!);
+        } finally {
+          await closeQuietly(parentFd);
+        }
+      });
+    },
+  };
+}
+
+/** The credential-free Codex session store (production instance; no test hooks). */
+export const CodexSessionStore: CodexSessionStoreApi = createCodexSessionStore();

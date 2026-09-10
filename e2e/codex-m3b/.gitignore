@@ -1,0 +1,5 @@
+# Container run logs land here; the m3b harness builds no committed binaries (it drives the
+# packaged /app/src CodexExecutor and the image-baked supervisor/fileop/codex), so there is
+# no compiled stub to ignore as there is in codex-m3a.
+*.log
+gate-log.*

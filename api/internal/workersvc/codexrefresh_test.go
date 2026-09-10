@@ -1,6 +1,7 @@
 package workersvc
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -11,6 +12,24 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/codexauth"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
+
+func TestCodexRefreshLeaseLeavesWorkerHTTPMargin(t *testing.T) {
+	if codexRefreshLeaseTTL != 7*time.Second {
+		t.Fatalf("refresh lease = %s, want 7s below the worker's 8s HTTP budget", codexRefreshLeaseTTL)
+	}
+}
+
+func TestCodexRefreshOperationBudgetHonorsRequestDeadline(t *testing.T) {
+	if got := codexRefreshOperationBudget(context.Background()); got != codexRefreshLeaseTTL {
+		t.Fatalf("budget without deadline = %s, want %s", got, codexRefreshLeaseTTL)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	got := codexRefreshOperationBudget(ctx)
+	if got > 1500*time.Millisecond || got < 1100*time.Millisecond {
+		t.Fatalf("budget from 2s request deadline = %s, want about 1.5s after response reserve", got)
+	}
+}
 
 // These are the DB-free unit tests for the coordinated Codex refresher's two pure
 // decision functions (PRD #1147 M2, B6): the merged-reseal rule and the reconcile

@@ -22,11 +22,11 @@
 //     `dispose()`; production wires an advice launcher, tests inject a fake returning a
 //     scripted in-memory transport. There is NO registry and NO broker in this lane.
 //
-// SECURITY: the provider credential is a PRIVATE construction input (the narrow
-// provider-auth bridge for the selected credential, NOT a general callback registry);
-// it flows only into the launch spec (→ the isolated app-server's env), NEVER into a
-// thread/turn param, a frame, a reply or a log line. This module NEVER logs raw frames,
-// tokens or bodies, and it exposes NO credential to the model.
+// SECURITY: pinned app-server auth receives the provider credential only through its
+// private construction input and exchanges it on the initialize/login/refresh transport
+// lane. The transitional env credential path is mutually exclusive. Neither path exposes
+// auth to a thread/turn param, model tool/callback surface or log line. This module NEVER
+// logs raw frames, tokens or bodies, and it exposes NO credential to the model.
 //
 // POLICY + TIMEOUT (harness-contract.md §"Rate limits and advice"):
 //   - the synchronous uzi `policy.onTerminal` runs ONCE inside terminal consumption,
@@ -53,6 +53,7 @@ import type {
   HarnessThrownFailure,
 } from "../harness.js";
 import type { CodexProviderConfig } from "./codex-harness.js";
+import type { CodexAppServerAuthSession } from "./appserver-auth.js";
 import type { CodexNotification, CodexTransport } from "./transport.js";
 import type { RenderedCodexAdvice } from "./render.js";
 
@@ -117,12 +118,14 @@ export type LaunchAdviceRootSeam = (spec: CodexAdviceLaunchSpec) => Promise<Code
 
 /** Construction inputs — the SEPARATELY-GATED advice surface. Deliberately NARROW: NO
  *  agents, NO tools, NO broker, NO registry, NO run worktree, NO handler registry. The
- *  credential is a PRIVATE input (the narrow provider-auth bridge for the selected
- *  credential, not a general callback registry). */
+ *  app-server authentication is a PRIVATE, narrow transport seam for the selected
+ *  credential, not a general callback registry. */
 export interface CodexAdviceHarnessOptions {
   readonly launchRoot: LaunchAdviceRootSeam;
   readonly provider: CodexProviderConfig;
-  /** PRIVATE provider credential; never model-visible, never logged, never in a frame. */
+  /** Pinned auth owner for this isolated app-server. It has no run callback registry. */
+  readonly appServerAuth?: CodexAppServerAuthSession;
+  /** Transitional pre-auth integration input. Mutually exclusive with appServerAuth. */
   readonly credentialValue?: string;
   readonly log: Logger;
 }
@@ -200,13 +203,21 @@ export class CodexAdviceHarness implements AdviceHarness {
 
   private readonly launchRoot: LaunchAdviceRootSeam;
   private readonly provider: CodexProviderConfig;
-  // PRIVATE construction input; NEVER model-visible, never logged, never in a frame.
+  private readonly appServerAuth?: CodexAppServerAuthSession;
+  // Transitional private input; never combined with the pinned app-server auth path.
   private readonly credentialValue?: string;
   private readonly log: Logger;
 
   constructor(opts: CodexAdviceHarnessOptions) {
     this.launchRoot = opts.launchRoot;
     this.provider = opts.provider;
+    if (opts.appServerAuth !== undefined && opts.credentialValue !== undefined) {
+      throw new CodexAdviceError({
+        category: "protocol",
+        message: "codex advice harness received conflicting authentication inputs",
+      });
+    }
+    this.appServerAuth = opts.appServerAuth;
     this.credentialValue = opts.credentialValue;
     this.log = opts.log;
   }
@@ -255,6 +266,7 @@ export class CodexAdviceHarness implements AdviceHarness {
     // captured once the launch resolves. Disposal is funneled through the idempotent
     // `disposeOnce` so it runs EXACTLY ONCE regardless of race ordering.
     let disposeSeam: (() => Promise<void>) | undefined;
+    let transportSeam: CodexTransport | undefined;
     let disposed = false;
     const disposeOnce = async (): Promise<void> => {
       if (disposed) return;
@@ -272,12 +284,13 @@ export class CodexAdviceHarness implements AdviceHarness {
         provider: this.provider,
         model,
         // PRIVATE → the isolated launcher env ONLY; never a thread/turn param or frame.
-        credentialValue: this.credentialValue,
+        credentialValue: this.appServerAuth === undefined ? this.credentialValue : undefined,
         // Bound the launch itself by the same deadline: a slow launcher can be aborted
         // instead of resolving uncancellable past the timeout and leaking its root.
         signal: internalAbort.signal,
       });
       disposeSeam = launched.dispose;
+      transportSeam = launched.transport;
       return this.consume(launched.transport, launched.cwd, rendered, model, policy, internalAbort.signal);
     })();
 
@@ -292,14 +305,31 @@ export class CodexAdviceHarness implements AdviceHarness {
     } finally {
       if (timer) clearTimeout(timer);
       request.signal.removeEventListener("abort", onExternalAbort);
-      // Wait for the streaming work to settle (bounded by grace after abort) BEFORE the
-      // isolated HOME is disposed, so cleanup does not race an aborted app-server that may
-      // still touch its HOME. On the success path work already settled → returns at once.
-      await awaitSettled(work, request.graceMs ?? DEFAULT_ADVICE_GRACE_MS);
-      // Best-effort HOME/root disposal, EXACTLY ONCE. If the launch has not resolved within
-      // the grace this is a no-op and the late disposer above owns cleanup instead. A cleanup
-      // warning NEVER replaces the primary failure (the try's throw/return already stands).
-      await disposeOnce();
+      // Shutdown ordering is load-bearing for a refresh intercepted while login is still
+      // pending: close admission/cancel first, close transport to reject the login RPC,
+      // then drain the auth owner. Draining before transport close creates a cycle.
+      this.appServerAuth?.closeAdmissionAndCancel();
+      try {
+        await transportSeam?.close();
+      } finally {
+        // Wait for streaming work to settle (bounded by grace after abort) before HOME
+        // disposal. Closing transport above lets pending setup unwind inside this grace.
+        await awaitSettled(work, request.graceMs ?? DEFAULT_ADVICE_GRACE_MS);
+        try {
+          await this.appServerAuth?.drainInterceptedRequests();
+        } catch (e) {
+          // The terminal path drains before it returns, so an auth poison that affects
+          // the verdict already surfaced as the primary error there. Cleanup evidence
+          // must not replace a completed result or the exact timeout/abort rejection.
+          this.log.warn(`${request.label} codex advice auth cleanup failed`, {
+            error: errMessage(e),
+          });
+        } finally {
+          // Best-effort HOME/root disposal, exactly once, even when authentication draining
+          // fails. A late launch remains owned by work.then(disposeOnce) above.
+          await disposeOnce();
+        }
+      }
     }
   }
 
@@ -318,6 +348,8 @@ export class CodexAdviceHarness implements AdviceHarness {
     policy: AdviceResultPolicy,
     signal: AbortSignal,
   ): Promise<AdviceResult> {
+    // Authentication is setup, so it completes before any thread/model work.
+    await this.appServerAuth?.authenticate(transport, signal);
     const threadId = await this.startThread(transport, cwd, rendered, model, signal);
     await this.startTurnRpc(transport, threadId, rendered, model, signal);
 
@@ -360,15 +392,18 @@ export class CodexAdviceHarness implements AdviceHarness {
         }
         const note = step.value;
 
-        // A server→client request: NO broker, NO callback registry, NO tool surface.
-        // Answer fail-closed and run NOTHING — this is the tool-less advice ceiling by
-        // construction (there is nowhere to route an effect even if the model asked).
+        // A server→client request: the narrow provider-auth owner is the only admitted
+        // seam. It has no workspace or run callback registry; everything else is refused.
         if (note.kind === "activity" && note.requestId !== undefined) {
+          if (await this.appServerAuth?.handleServerRequest(transport, note, signal)) continue;
           this.refuseServerRequest(transport, note.requestId);
           continue;
         }
 
         if (note.kind === "turn_completed") {
+          // A same-chunk refresh is owned by the auth interceptor. Advice cannot return a
+          // terminal verdict until it settles, and a sticky auth poison fails closed.
+          await this.appServerAuth?.drainInterceptedRequests();
           const terminal = this.decodeTerminal(note);
           const isError = terminal.outcome === "failed";
           // The synchronous uzi policy runs HERE, inside terminal consumption, BEFORE the
@@ -404,9 +439,8 @@ export class CodexAdviceHarness implements AdviceHarness {
       }
     } finally {
       if (onAbort) signal.removeEventListener("abort", onAbort);
-      // Idempotent iterator/transport closure AFTER the policy ran (or after abort/EOF).
-      // This is the "iterator closure" the synchronous policy precedes.
-      await transport.close();
+      // The outer run owner closes auth admission, transport, and owned auth tasks in
+      // cycle-free order after this work settles. Policy still runs before that closure.
     }
   }
 
@@ -423,6 +457,10 @@ export class CodexAdviceHarness implements AdviceHarness {
       features: {
         apps: false,
         plugins: false,
+        shell_tool: false,
+        view_image: false,
+        sleep_tool: false,
+        apply_patch_freeform: false,
         shell_snapshot: false,
         shell_snapshot_v2: false,
         code_mode: false,
@@ -455,8 +493,10 @@ export class CodexAdviceHarness implements AdviceHarness {
         cwd,
         approvalPolicy: "never",
         ephemeral: true,
+        environments: [],
+        dynamicTools: [],
         config: this.adviceThreadConfig(cwd),
-        instructions: rendered.systemPrompt,
+        developerInstructions: rendered.systemPrompt,
       },
       { signal },
     );

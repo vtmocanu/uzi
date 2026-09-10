@@ -1,0 +1,53 @@
+# DARK CODEX GUARD (issue #1171 M5) -- the runner durability/publication sinks must
+# not spawn a raw subprocess (a PAT-bearing git bypass); everything goes through the
+# injected git client / the withBoundary helpers.
+#
+# WHAT THIS ENFORCES. agent/src/runner.ts publishes run durability (git commit/push,
+# forge publication) through an INJECTED git client and the withBoundary reap
+# lifecycle, never by spawning its own subprocess. The runner holds the run's PAT, so
+# a raw `spawn("git", ...)` here would be a credential-bearing git invocation that
+# sidesteps the injected client -- exactly the PAT bypass the sink boundary exists to
+# prevent. runner.ts imports no child_process today (confirmed by grep: only comment
+# mentions of "child_process"/"spawn", no call), so this rule reports ZERO findings on
+# the clean tree.
+#
+# THE PATTERN. `pattern-either` over ALL child_process creation forms
+# (spawn/spawnSync/exec/execSync/execFile/execFileSync/fork) -- kept in sync with
+# codex-no-direct-spawn.yml so the idiomatic `execSync("git push ...")` bypass cannot
+# evade the guard. A raw `spawn("git", ...)`/`execSync("git ...")` added inside a sink
+# fires. `exec(...)` matches a bare `exec` callee only, not `regexp.exec(...)`.
+#
+# 🔴 RELIABILITY BOUNDARY. This catches a RAW-SUBPROCESS PAT bypass -- a direct
+# child_process call in runner.ts. It does NOT prove the deeper property that the
+# publication happens INSIDE the reap barrier (the withBoundary / permit lifecycle):
+# that ordering invariant is a review concern and is covered by
+# agent/test/runner-codex-sinks.test.ts, not by this syntactic match. A bypass routed
+# through a helper in another module is likewise out of scope (intraprocedural limit).
+#
+# POSITIVE CONTROL (verified before commit): adding `spawn("git", ["push"]);` to a
+# runner.ts sink fires; reverting returns to zero.
+# NEGATIVE CONTROL: the committed tree reports zero findings -- runner.ts publishes
+# via the injected git client, with no raw child_process spawn.
+rules:
+  - id: codex-durability-sink-boundary
+    languages: [typescript]
+    severity: ERROR
+    message: >-
+      The runner durability/publication sinks must not spawn a raw subprocess: the
+      runner holds the run PAT, so a raw spawn("git", ...) is a credential-bearing git
+      bypass of the injected git client and the withBoundary reap barrier. Publish
+      through the injected git client, not child_process.
+    paths:
+      # Root-anchored (leading `/`) to silence semgrep's Semgrepignore-v2
+      # deprecation warning about bare relative includes, mirroring canary.yml.
+      # The gate scans `.` from the repo root, so this resolves to agent/src/runner.ts.
+      include:
+        - /agent/src/runner.ts
+    pattern-either:
+      - pattern: spawn(...)
+      - pattern: spawnSync(...)
+      - pattern: exec(...)
+      - pattern: execSync(...)
+      - pattern: execFile(...)
+      - pattern: execFileSync(...)
+      - pattern: fork(...)

@@ -81,6 +81,38 @@ const CODEX_TOOL_ALIASES: ReadonlyMap<string, string> = new Map([
   ["Agent", "spawn_agent"],
 ]);
 
+/** Pinned Codex owns native spellings such as `Bash` and `apply_patch` (both
+ * empirically collided in the packaged proof), while app-server dynamic tools
+ * reserve every `mcp__*` name. `Read`/`Skill` are renamed defensively with the same
+ * rule. Advertise collision-free fixed wire aliases and map them back to canonical
+ * worker authority before any decision. */
+const CODEX_DYNAMIC_WIRE_NAMES: ReadonlyMap<string, string> = new Map([
+  ["Bash", "uzi_bash"],
+  ["apply_patch", "uzi_apply_patch"],
+  ["Read", "uzi_read"],
+  ["Skill", "uzi_skill"],
+  ["mcp__forge__get_issue", "uzi_forge_get_issue"],
+  ["mcp__forge__list_issues", "uzi_forge_list_issues"],
+  ["mcp__forge__get_merge_request", "uzi_forge_get_merge_request"],
+  ["mcp__forge__get_pipeline_jobs", "uzi_forge_get_pipeline_jobs"],
+  ["mcp__forge__latest_pipeline", "uzi_forge_latest_pipeline"],
+  ["mcp__forge__list_issue_label_events", "uzi_forge_list_issue_label_events"],
+  ["mcp__forge__reply_mr_thread", "uzi_forge_reply_mr_thread"],
+  ["mcp__forge__resolve_mr_thread", "uzi_forge_resolve_mr_thread"],
+  ["mcp__memory__save_memory", "uzi_memory_save_memory"],
+  ["mcp__findings__report_incidental_issue", "uzi_findings_report_incidental_issue"],
+]);
+const CODEX_DYNAMIC_CANONICAL_NAMES: ReadonlyMap<string, string> = new Map(
+  [...CODEX_DYNAMIC_WIRE_NAMES].map(([canonical, wire]) => [wire, canonical]),
+);
+
+/** Return the app-server-safe wire name for a canonical granted tool. An unknown
+ * MCP name has no production handler contract and is deliberately not advertised. */
+export function codexDynamicToolWireName(canonical: string): string | undefined {
+  if (canonical.startsWith("mcp__")) return CODEX_DYNAMIC_WIRE_NAMES.get(canonical);
+  return CODEX_DYNAMIC_WIRE_NAMES.get(canonical) ?? canonical;
+}
+
 // The five workflow signalling tools (agent/src/signals.ts:28-32). Bare names; the
 // `mcp__uzi__<name>` qualified forms normalize to these. scanSignals remains the
 // authoritative parser — this set is only for recognition/routing.
@@ -116,12 +148,37 @@ const CHILD_FAILURE_CODES: ReadonlySet<string> = new Set([
   "child_denied",
 ]);
 
+/** Closed helper/client failure vocabulary permitted into model-visible output.
+ *  The Go helper owns every `E_*` code except the client's local timeout sentinel. */
+const FILEOP_FAILURE_CODES: ReadonlySet<string> = new Set([
+  "E_OVERSIZE",
+  "E_MALFORMED",
+  "E_UNKNOWN_OP",
+  "E_DENIED",
+  "E_ESCAPE",
+  "E_SYMLINK",
+  "E_NOT_FOUND",
+  "E_EXISTS",
+  "E_NOT_DIR",
+  "E_IS_DIR",
+  "E_NOT_FILE",
+  "E_NOT_EMPTY",
+  "E_PERM",
+  "E_INTERNAL",
+  "E_IO",
+  "E_NO_MATCH",
+  "E_AMBIGUOUS",
+  "E_TIMEOUT",
+]);
+
 /** The capability the broker binds a callback to, decided from the tool NAME +
  *  grants — never from the arguments. */
 type Capability = "shell" | "file_write" | "file_read" | "signal" | "delegate" | "mcp" | "unknown";
 
 /** Canonical callback name shared by the renderer and the enforcing broker. */
 export function canonicalizeCodexToolName(name: string): string {
+  const dynamic = CODEX_DYNAMIC_CANONICAL_NAMES.get(name);
+  if (dynamic !== undefined) return dynamic;
   const alias = CODEX_TOOL_ALIASES.get(name);
   if (alias !== undefined) return alias;
   const prefix = `mcp__${SIGNAL_SERVER_NAME}__`;
@@ -171,13 +228,17 @@ export type CallbackResult =
 /** One fileop request, mapped to the NDJSON op protocol
  *  (agent/codex/supervisor/fileop). `path`/`newPath` are worktree-RELATIVE (the
  *  helper anchors them at the root dirfd and rejects an absolute/`..`/`.git`
- *  component itself); `data` is base64 for a write. The `id` correlation is the
- *  production client's job, not the broker's. */
+ *  component itself); `data` is base64 for a write (and the REPLACEMENT text for
+ *  `apply`); `old` is base64 of the text `apply` must find-and-replace. The helper
+ *  reads through an openat2-pinned fd, then stages and atomically renames the result
+ *  within the pinned parent directory.
+ *  The `id` correlation is the production client's job, not the broker's. */
 export interface FileopRequest {
-  readonly op: "stat" | "read" | "write" | "mkdir" | "rename" | "unlink" | "rmdir" | "list";
+  readonly op: "stat" | "read" | "write" | "apply" | "mkdir" | "rename" | "unlink" | "rmdir" | "list";
   readonly path: string;
   readonly newPath?: string;
   readonly data?: string;
+  readonly old?: string;
 }
 
 /** One fileop response. `ok:false` carries a bounded error code from the helper's
@@ -207,10 +268,15 @@ export interface SpawnCommandResult {
   readonly stderr: string;
 }
 
-/** Options for a shell effect spawn (currently only the working directory, which
- *  the broker guarantees is inside the worktree before calling). */
+/** Options for a shell effect spawn: the working directory (the broker guarantees it is
+ *  inside the worktree before calling) and the SCRUBBED command-identity env the child
+ *  runs under. The executor routes its per-run scrubbed env through `env` so an injected
+ *  seam records the exact env command spawns use; the default seam falls back to its
+ *  closed-over env when `env` is absent. */
 export interface SpawnCommandOptions {
   readonly cwd?: string;
+  readonly env?: NodeJS.ProcessEnv;
+  readonly signal?: AbortSignal;
 }
 
 /** The injected "run a shell command as the COMMAND identity" seam. `argv` is the
@@ -283,6 +349,7 @@ export interface CodexCallbackBrokerOptions {
    *  every delegation as an unknown role. */
   readonly allowedRoles?: ReadonlySet<string>;
   readonly screenPolicy?: ScreenPolicy;
+  readonly signal?: AbortSignal;
 }
 
 // --- small pure helpers -------------------------------------------------------
@@ -304,6 +371,35 @@ function firstStrField(args: unknown, keys: readonly string[]): string | undefin
     if (v !== undefined) return v;
   }
   return undefined;
+}
+
+/** A string field of `args` that MAY be the empty string (e.g. an Edit `new_string`
+ *  that deletes text), distinct from {@link strField}'s non-empty contract. Returns
+ *  undefined only when the key is absent or not a string. */
+function anyStrField(args: unknown, key: string): string | undefined {
+  const v = asObject(args)?.[key];
+  return typeof v === "string" ? v : undefined;
+}
+
+/** One parsed Claude-vocabulary edit: a non-empty `oldStr` to find and a (possibly
+ *  empty) `newStr` to replace it with. This is the `apply_patch`/`Edit`/`MultiEdit`
+ *  argument shape the renderer maps, normalized for the atomic staged `apply` op. */
+interface ParsedEdit {
+  readonly oldStr: string;
+  readonly newStr: string;
+}
+
+/** Parse a single `{ old_string, new_string }` edit object (the Edit tool shape and
+ *  each MultiEdit entry). Returns undefined when the shape is not a valid edit so the
+ *  caller can fail closed with `bad_args`. `old_string` must be a non-empty string (an
+ *  empty old is the create/overwrite case, which is the `content` write path, never an
+ *  apply); `new_string` must be a string but MAY be empty (a deletion). */
+function parseEdit(value: unknown): ParsedEdit | undefined {
+  const oldStr = strField(value, "old_string");
+  if (oldStr === undefined) return undefined;
+  const newStr = anyStrField(value, "new_string");
+  if (newStr === undefined) return undefined;
+  return { oldStr, newStr };
 }
 
 function boundedString(s: string, maxBytes: number): string {
@@ -391,6 +487,7 @@ export class CodexCallbackBroker {
   private readonly allowedRoles: ReadonlySet<string>;
   private readonly extraSecretPaths: readonly string[];
   private readonly dockerWired: boolean;
+  private readonly signal: AbortSignal | undefined;
 
   constructor(opts: CodexCallbackBrokerOptions) {
     this.registry = opts.registry;
@@ -403,6 +500,7 @@ export class CodexCallbackBroker {
     this.allowedRoles = opts.allowedRoles ?? new Set<string>();
     this.extraSecretPaths = opts.screenPolicy?.extraSecretPaths ?? [];
     this.dockerWired = opts.screenPolicy?.dockerWired ?? false;
+    this.signal = opts.signal;
   }
 
   /**
@@ -568,7 +666,7 @@ export class CodexCallbackBroker {
     }
     if (screen.denied) return deny("shell_denied", screen.reason ?? "denied by guardrail");
 
-    const spawned = await this.spawnCommand(["/bin/sh", "-c", command], { cwd: spawnCwd });
+    const spawned = await this.spawnCommand(["/bin/sh", "-c", command], { cwd: spawnCwd, signal: this.signal });
     return {
       ok: true,
       output: {
@@ -605,21 +703,73 @@ export class CodexCallbackBroker {
     }
     const candidate = firstStrField(args, ["path", "file_path"]);
     if (candidate === undefined) return deny("bad_args", "a file write requires a string 'path'");
-    // M2 wires the full-file write primitive (a `content` body); incremental
-    // Edit/patch application (old_string/new_string) lands in a later milestone.
+
+    // The `apply_patch` capability covers the whole Claude write vocabulary the renderer
+    // maps (Write/Edit/MultiEdit → apply_patch). Which EFFECT it is comes from the args,
+    // but the args NEVER widen authority — the capability was already granted. Precedence:
+    //   1. a full-file `content` body           → the `write` op (create-or-truncate);
+    //   2. a `edits` array (MultiEdit)           → a SEQUENCE of atomic staged `apply` ops;
+    //   3. a single `old_string`/`new_string`    → ONE atomic staged `apply` op.
+    // EVERY branch goes through the openat2 no-symlink fileop helper — a model-selected
+    // file effect never falls back to pathname check-then-use node `fs`. The `content`
+    // branch stays byte-for-byte the M2 behaviour so its existing control is unaffected.
     const content = firstStrField(args, ["content", "data", "text"]);
-    if (content === undefined) return deny("bad_args", "a file write requires a string 'content'");
+    if (content !== undefined) {
+      const screened = this.screenAndRelativize(candidate);
+      if ("ok" in screened) return screened;
+      const res = await this.fileop.op({
+        op: "write",
+        path: screened.rel,
+        data: Buffer.from(content, "utf8").toString("base64"),
+      });
+      if (!res.ok) return this.mapFileopError(res);
+      return { ok: true, output: { written: true, size: res.size } };
+    }
+
+    const edits = this.parseEdits(args);
+    if (edits === undefined) {
+      return deny("bad_args", "a file write requires 'content', an 'edits' array, or an 'old_string'/'new_string' pair");
+    }
 
     const screened = this.screenAndRelativize(candidate);
     if ("ok" in screened) return screened;
 
-    const res = await this.fileop.op({
-      op: "write",
-      path: screened.rel,
-      data: Buffer.from(content, "utf8").toString("base64"),
-    });
-    if (!res.ok) return this.mapFileopError(res);
-    return { ok: true, output: { written: true, size: res.size } };
+    // Apply each edit as its OWN atomic staged replacement. A multi-edit is a sequence
+    // of atomic edits, not one atomic transaction. The first failure stops the batch,
+    // and the bounded denial explicitly reports how many earlier edits remain applied.
+    let applied = 0;
+    for (const edit of edits) {
+      const res = await this.fileop.op({
+        op: "apply",
+        path: screened.rel,
+        old: Buffer.from(edit.oldStr, "utf8").toString("base64"),
+        data: Buffer.from(edit.newStr, "utf8").toString("base64"),
+      });
+      if (!res.ok) return this.mapFileopError(res, applied);
+      applied += 1;
+    }
+    return { ok: true, output: { applied } };
+  }
+
+  /** Parse the Claude Edit/MultiEdit argument vocabulary into an ordered list of
+   *  {@link ParsedEdit}s, or undefined when the args carry no valid edit. `edits` (the
+   *  MultiEdit array) takes precedence over a bare `old_string`/`new_string` pair; an
+   *  `edits` value that is present but not a non-empty array of valid edits is a
+   *  fail-closed undefined (never silently treated as zero edits). */
+  private parseEdits(args: unknown): readonly ParsedEdit[] | undefined {
+    const raw = asObject(args)?.edits;
+    if (raw !== undefined) {
+      if (!Array.isArray(raw) || raw.length === 0) return undefined;
+      const parsed: ParsedEdit[] = [];
+      for (const entry of raw) {
+        const edit = parseEdit(entry);
+        if (edit === undefined) return undefined; // one malformed entry fails the whole batch closed
+        parsed.push(edit);
+      }
+      return parsed;
+    }
+    const single = parseEdit(args);
+    return single === undefined ? undefined : [single];
   }
 
   private async dispatchFileRead(args: unknown): Promise<CallbackResult> {
@@ -650,10 +800,19 @@ export class CodexCallbackBroker {
     };
   }
 
-  /** Map a fileop error code (bounded vocabulary) to a neutral denial. The code is
-   *  safe to echo; a raw errno/path/content never reaches here. */
-  private mapFileopError(res: FileopResponse): CallbackResult {
-    return deny("fileop_denied", `file operation denied (${res.code ?? "E_IO"})`);
+  /** Map a fileop response to a bounded neutral denial. Only the closed helper/client
+   *  code vocabulary is echoed; a raw code, errno, path, or content never reaches it. */
+  private mapFileopError(res: FileopResponse, appliedBeforeFailure?: number): CallbackResult {
+    const code =
+      typeof res.code === "string" && res.code.length <= 16 && FILEOP_FAILURE_CODES.has(res.code) ? res.code : "E_IO";
+    const partial =
+      appliedBeforeFailure === undefined
+        ? ""
+        : `; ${appliedBeforeFailure} edit${appliedBeforeFailure === 1 ? "" : "s"} applied before failure`;
+    // `appliedBeforeFailure` is bounded by a JavaScript array length, so its decimal
+    // representation is at most ten digits. No path, edit body, or raw helper error
+    // crosses this neutral model-visible result.
+    return deny("fileop_denied", `file operation denied (${code})${partial}`);
   }
 
   // --- signals (ROOT-ONLY) ----------------------------------------------------
@@ -728,7 +887,7 @@ export class CodexCallbackBroker {
         return deny("denied_skill", `skill "${safeId(skill)}" is not granted to role "${safeId(this.grants.role)}"`);
       }
     }
-    const handler = this.toolHandlers?.get(name);
+    const handler = this.toolHandlers?.get(canonical);
     if (handler === undefined) {
       return deny("denied_tool", `no handler is wired for "${safeId(name)}"`);
     }

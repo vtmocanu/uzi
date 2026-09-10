@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import {
   CodexCallbackBroker,
+  canonicalizeCodexToolName,
   MAX_ID_BYTES,
   MAX_TOOL_NAME_BYTES,
   type CallbackResult,
@@ -17,6 +18,14 @@ import {
   type SpawnCommandResult,
 } from "../src/codex/broker.js";
 import { ExecutionRegistry, newLocalExecutionEpoch } from "../src/codex/registry.js";
+import { buildCodexToolHandlers } from "../src/codex/codex-executor.js";
+import { forgeToolNames } from "../src/forge-tools.js";
+import { memoryToolNames } from "../src/memory-tools.js";
+import { reportIncidentalIssueToolName } from "../src/findings-tools.js";
+import type { Logger } from "../src/log.js";
+import type { WorkerClient } from "../src/client.js";
+import type { EmittedMessage } from "../src/executor.js";
+import type { ClaimSkill } from "../src/protocol.js";
 
 // PRD #1171 (M3, milestone 2) — the worker callback broker. Every seam is a fake;
 // the ExecutionRegistry is the REAL one (it is pure logic) so admission/replay/poison
@@ -37,10 +46,17 @@ class SpawnSpy {
 /** A spy over the fileop client, returning a scripted response. */
 class FileopSpy {
   calls: FileopRequest[] = [];
-  constructor(private readonly response: FileopResponse = { ok: true, size: 3 }) {}
+  private readonly responses: readonly FileopResponse[];
+  private responseIndex = 0;
+
+  constructor(response: FileopResponse | FileopResponse[] = { ok: true, size: 3 }) {
+    this.responses = Array.isArray(response) ? response : [response];
+  }
   op = async (request: FileopRequest): Promise<FileopResponse> => {
     this.calls.push(request);
-    return this.response;
+    const index = Math.min(this.responseIndex, this.responses.length - 1);
+    this.responseIndex += 1;
+    return this.responses[index]!;
   };
 }
 
@@ -258,9 +274,165 @@ describe("CodexCallbackBroker: file effects through the fileop client", () => {
     assert.equal(fileop.calls.length, 1);
   });
 
+  it("never reflects a short unknown fileop code into model-visible output", async () => {
+    const rawCode = "E_FORGED";
+    const fileop = new FileopSpy({ ok: false, code: rawCode });
+    const h = makeBroker({ fileop });
+    const r = await h.broker.handleToolCall(rt(), "Write", { path: "src/x.ts", content: "x" }, "root");
+    assertDenied(r, "fileop_denied");
+    assert.equal(r.message, "file operation denied (E_IO)");
+    assert.equal(r.message.includes(rawCode), false);
+  });
+
+  it("never reflects an oversized fileop code into model-visible output", async () => {
+    const rawCode = `E_IO_${"x".repeat(4096)}`;
+    const fileop = new FileopSpy({ ok: false, code: rawCode });
+    const h = makeBroker({ fileop });
+    const r = await h.broker.handleToolCall(rt(), "Write", { path: "src/x.ts", content: "x" }, "root");
+    assertDenied(r, "fileop_denied");
+    assert.equal(r.message, "file operation denied (E_IO)");
+    assert.equal(r.message.includes(rawCode), false);
+  });
+
   it("denies a file write during the plan phase (no fileop)", async () => {
     const h = makeBroker({ grants: grants({ phase: "plan" }) });
     const r = await h.broker.handleToolCall(rt(), "Write", { path: "src/x.ts", content: "x" }, "root");
+    assertDenied(r, "write_denied_in_plan");
+    assert.equal(h.fileop.calls.length, 0);
+  });
+
+  it("routes an Edit (old_string/new_string) to the atomic staged apply op", async () => {
+    const h = makeBroker();
+    const r = await h.broker.handleToolCall(
+      rt(),
+      "Edit",
+      { path: "src/x.ts", old_string: "foo", new_string: "bar" },
+      "root",
+    );
+    assert.equal(r.ok, true);
+    if (r.ok) assert.deepEqual(r.output, { applied: 1 });
+    assert.equal(h.fileop.calls.length, 1);
+    const req = h.fileop.calls[0]!;
+    assert.equal(req.op, "apply");
+    assert.equal(req.path, "src/x.ts");
+    assert.equal(req.old, Buffer.from("foo", "utf8").toString("base64"));
+    assert.equal(req.data, Buffer.from("bar", "utf8").toString("base64"));
+  });
+
+  it("allows an Edit whose new_string is empty (a deletion)", async () => {
+    const h = makeBroker();
+    const r = await h.broker.handleToolCall(
+      rt(),
+      "Edit",
+      { path: "src/x.ts", old_string: "delete me", new_string: "" },
+      "root",
+    );
+    assert.equal(r.ok, true);
+    assert.equal(h.fileop.calls.length, 1);
+    assert.equal(h.fileop.calls[0]!.data, "");
+  });
+
+  it("routes a MultiEdit to an ORDERED sequence of apply ops", async () => {
+    const h = makeBroker();
+    const r = await h.broker.handleToolCall(
+      rt(),
+      "MultiEdit",
+      {
+        path: "src/x.ts",
+        edits: [
+          { old_string: "a", new_string: "1" },
+          { old_string: "b", new_string: "2" },
+        ],
+      },
+      "root",
+    );
+    assert.equal(r.ok, true);
+    if (r.ok) assert.deepEqual(r.output, { applied: 2 });
+    assert.equal(h.fileop.calls.length, 2);
+    assert.deepEqual(h.fileop.calls.map((c) => c.op), ["apply", "apply"]);
+    assert.equal(h.fileop.calls[0]!.old, Buffer.from("a", "utf8").toString("base64"));
+    assert.equal(h.fileop.calls[1]!.old, Buffer.from("b", "utf8").toString("base64"));
+  });
+
+  it("stops a MultiEdit at the FIRST failing apply and reports the denial", async () => {
+    // The fileop spy fails every op; the batch must stop after the first, not apply the rest.
+    const fileop = new FileopSpy({ ok: false, code: "E_NO_MATCH" });
+    const h = makeBroker({ fileop });
+    const r = await h.broker.handleToolCall(
+      rt(),
+      "MultiEdit",
+      { path: "src/x.ts", edits: [{ old_string: "a", new_string: "1" }, { old_string: "b", new_string: "2" }] },
+      "root",
+    );
+    assertDenied(r, "fileop_denied");
+    assert.match(r.message, /E_NO_MATCH/);
+    assert.equal(fileop.calls.length, 1);
+  });
+
+  it("reports a successful first MultiEdit when the second apply fails", async () => {
+    const fileop = new FileopSpy([{ ok: true, size: 3 }, { ok: false, code: "E_AMBIGUOUS" }]);
+    const h = makeBroker({ fileop });
+    const r = await h.broker.handleToolCall(
+      rt(),
+      "MultiEdit",
+      { path: "src/x.ts", edits: [{ old_string: "a", new_string: "1" }, { old_string: "b", new_string: "2" }] },
+      "root",
+    );
+    assertDenied(r, "fileop_denied");
+    assert.equal(r.message, "file operation denied (E_AMBIGUOUS); 1 edit applied before failure");
+    assert.equal(fileop.calls.length, 2);
+  });
+
+  it("maps the apply no-match / ambiguous codes to a neutral denial", async () => {
+    for (const code of ["E_NO_MATCH", "E_AMBIGUOUS"]) {
+      const fileop = new FileopSpy({ ok: false, code });
+      const h = makeBroker({ fileop });
+      const r = await h.broker.handleToolCall(
+        rt(),
+        "Edit",
+        { path: "src/x.ts", old_string: "foo", new_string: "bar" },
+        "root",
+      );
+      assertDenied(r, "fileop_denied");
+      assert.match(r.message, new RegExp(code));
+    }
+  });
+
+  it("denies an apply_patch/Edit with neither content nor an old_string/new_string pair", async () => {
+    const h = makeBroker();
+    const r = await h.broker.handleToolCall(rt(), "Edit", { path: "src/x.ts", new_string: "bar" }, "root");
+    assertDenied(r, "bad_args");
+    assert.equal(h.fileop.calls.length, 0);
+  });
+
+  it("denies a MultiEdit whose edits array is empty or malformed (fail-closed)", async () => {
+    const h1 = makeBroker();
+    const empty = await h1.broker.handleToolCall(rt(), "MultiEdit", { path: "src/x.ts", edits: [] }, "root");
+    assertDenied(empty, "bad_args");
+    assert.equal(h1.fileop.calls.length, 0);
+
+    const h2 = makeBroker();
+    const malformed = await h2.broker.handleToolCall(
+      rt(),
+      "MultiEdit",
+      { path: "src/x.ts", edits: [{ old_string: "a", new_string: "1" }, { new_string: "no-old" }] },
+      "root",
+    );
+    assertDenied(malformed, "bad_args");
+    // Not even the first, well-formed edit runs: the whole batch fails closed on parse.
+    assert.equal(h2.fileop.calls.length, 0);
+  });
+
+  it("denies an Edit's .git path with the jail and never issues a fileop", async () => {
+    const h = makeBroker();
+    const r = await h.broker.handleToolCall(rt(), "Edit", { path: ".git/config", old_string: "a", new_string: "b" }, "root");
+    assertDenied(r, "path_denied");
+    assert.equal(h.fileop.calls.length, 0);
+  });
+
+  it("denies an Edit during the plan phase (no fileop)", async () => {
+    const h = makeBroker({ grants: grants({ phase: "plan" }) });
+    const r = await h.broker.handleToolCall(rt(), "Edit", { path: "src/x.ts", old_string: "a", new_string: "b" }, "root");
     assertDenied(r, "write_denied_in_plan");
     assert.equal(h.fileop.calls.length, 0);
   });
@@ -359,6 +531,13 @@ describe("CodexCallbackBroker: delegation", () => {
 });
 
 describe("CodexCallbackBroker: MCP / skills pass-through", () => {
+  it("maps native-colliding app-server wire names back to canonical worker authority", () => {
+    assert.equal(canonicalizeCodexToolName("uzi_bash"), "Bash");
+    assert.equal(canonicalizeCodexToolName("uzi_apply_patch"), "apply_patch");
+    assert.equal(canonicalizeCodexToolName("uzi_read"), "Read");
+    assert.equal(canonicalizeCodexToolName("uzi_skill"), "Skill");
+  });
+
   it("routes an allowed MCP tool to its injected handler", async () => {
     const handlers = new Map([["mcp__memory__store", async () => ({ stored: true })]]);
     const h = makeBroker({
@@ -368,6 +547,17 @@ describe("CodexCallbackBroker: MCP / skills pass-through", () => {
     const r = await h.broker.handleToolCall(rt(), "mcp__memory__store", { note: "x" }, "root");
     assert.equal(r.ok, true);
     if (r.ok) assert.deepEqual(r.output, { stored: true });
+  });
+
+  it("maps a fixed app-server-safe MCP wire alias back to the canonical granted handler", async () => {
+    const canonical = "mcp__forge__get_issue";
+    const handlers = new Map([[canonical, async () => ({ issue: true })]]);
+    const h = makeBroker({
+      grants: grants({ allowedTools: new Set([canonical]) }),
+      toolHandlers: handlers,
+    });
+    const r = await h.broker.handleToolCall(rt(), "uzi_forge_get_issue", { iid: 1 }, "root");
+    assert.deepEqual(r, { ok: true, output: { issue: true } });
   });
 
   it("denies an allowed MCP tool with no wired handler", async () => {
@@ -598,5 +788,109 @@ describe("CodexCallbackBroker: a throwing seam denies as broker_error with the r
     // epoch is not poisoned (a clean quiesce would follow).
     assert.equal(h.registry.inFlightCallbackCount(), 0);
     assert.equal(h.registry.isPoisoned(), false);
+  });
+});
+
+// PRD #1171 M3 (item 5) — the REAL executor-built tool-handler map wired through the
+// broker. Not a hand-rolled `new Map([...])` (that is the generic routing tested above);
+// this proves the map buildCodexToolHandlers produces resolves forge/memory/findings and
+// the Codex-specific Skill delivery, and that a subagent never reaches the memory handler.
+describe("CodexCallbackBroker: production tool-handler map (buildCodexToolHandlers)", () => {
+  const NOOP_LOG: Logger = { debug() {}, info() {}, warn() {}, error() {}, addSecret() {}, removeSecret() {}, child() { return NOOP_LOG; } };
+  const FORGE_GET_ISSUE = forgeToolNames()[0]!; // mcp__forge__get_issue
+  const MEMORY_TOOL = memoryToolNames()[0]!;
+  const FINDINGS_TOOL = reportIncidentalIssueToolName();
+
+  /** A minimal WorkerClient with just the reads/writes the wired handlers call, recording
+   *  what each saw so a test can prove the callback reached the real handler. */
+  function toolClient(): { client: WorkerClient; forgeIssue: number[]; memory: string[]; finding: string[] } {
+    const forgeIssue: number[] = [];
+    const memory: string[] = [];
+    const finding: string[] = [];
+    const client = {
+      async getForgeIssue(_runId: string, iid: number) { forgeIssue.push(iid); return { iid, title: "FORGE_ISSUE_CANARY" }; },
+      async saveMemory(_runId: string, body: { title: string }) { memory.push(body.title); return { id: "mem-canary", title: body.title }; },
+      async reportFinding(_runId: string, _body: unknown) { finding.push("find-canary"); return "find-canary"; },
+    } as unknown as WorkerClient;
+    return { client, forgeIssue, memory, finding };
+  }
+
+  function toolMap(skills: ClaimSkill[] = [{ name: "prd-lifecycle", description: "PRD lifecycle skill", body: "SKILL_BODY_CANARY" }]): {
+    map: ReturnType<typeof buildCodexToolHandlers>;
+    emitted: EmittedMessage[];
+    calls: ReturnType<typeof toolClient>;
+  } {
+    const emitted: EmittedMessage[] = [];
+    const calls = toolClient();
+    const map = buildCodexToolHandlers({ client: calls.client, runId: "run-tools", log: NOOP_LOG, emit: (m) => emitted.push(m), skills });
+    return { map, emitted, calls };
+  }
+
+  it("routes a ROOT forge callback to the real handler (ok, not denied_tool)", async () => {
+    const { map, calls } = toolMap();
+    const h = makeBroker({ grants: grants({ allowedTools: new Set([FORGE_GET_ISSUE]), isRoot: true }), toolHandlers: map });
+    const r = await h.broker.handleToolCall(rt(), FORGE_GET_ISSUE, { iid: 9 }, "root");
+    assert.equal(r.ok, true);
+    assert.deepEqual(calls.forgeIssue, [9]);
+    if (r.ok) assert.ok(JSON.stringify(r.output).includes("FORGE_ISSUE_CANARY"), "the forge evidence rode the callback output");
+  });
+
+  it("routes a ROOT memory callback to the real handler (ok, not denied_tool)", async () => {
+    const { map, calls } = toolMap();
+    const h = makeBroker({ grants: grants({ allowedTools: new Set([MEMORY_TOOL]), isRoot: true }), toolHandlers: map });
+    const r = await h.broker.handleToolCall(rt(), MEMORY_TOOL, { title: "a durable fact", body: "the mechanism" }, "root");
+    assert.equal(r.ok, true);
+    assert.deepEqual(calls.memory, ["a durable fact"]);
+  });
+
+  it("routes a ROOT findings callback to the real handler and emits the finding card", async () => {
+    const { map, emitted, calls } = toolMap();
+    const h = makeBroker({ grants: grants({ allowedTools: new Set([FINDINGS_TOOL]), isRoot: true }), toolHandlers: map });
+    const r = await h.broker.handleToolCall(rt(), FINDINGS_TOOL, { title: "leak", description: "d", location: "a/b.ts#f" }, "root");
+    assert.equal(r.ok, true);
+    assert.equal(calls.finding.length, 1);
+    assert.ok(emitted.some((m) => m.kind === "finding"), "the finding card was emitted to the stream");
+  });
+
+  it("DENIES a memory callback to a subagent (render strips memory; the allowedTools gate denies denied_tool)", async () => {
+    const { map, calls } = toolMap();
+    // A subagent's grants never carry the memory tool (isSubagentForbidden), modelled here.
+    const h = makeBroker({ grants: grants({ allowedTools: new Set(["Read"]), isRoot: false }), toolHandlers: map });
+    const r = await h.broker.handleToolCall(rt(), MEMORY_TOOL, { title: "t", body: "b" }, "child");
+    assertDenied(r, "denied_tool");
+    assert.deepEqual(calls.memory, [], "the memory handler was never reached");
+  });
+
+  it("delivers a GRANTED skill's content through the Skill handler (ok, not denied)", async () => {
+    const { map } = toolMap();
+    const h = makeBroker({
+      grants: grants({ allowedTools: new Set(["Skill"]), allowedSkills: new Set(["prd-lifecycle"]), isRoot: true }),
+      toolHandlers: map,
+    });
+    const r = await h.broker.handleToolCall(rt(), "Skill", { skill: "prd-lifecycle" }, "root");
+    assert.equal(r.ok, true);
+    if (r.ok) assert.ok(JSON.stringify(r.output).includes("SKILL_BODY_CANARY"), "the granted skill's body rode the callback output");
+  });
+
+  it("still DENIES an ungranted skill at the broker's allowedSkills gate (denied_skill, handler never reached)", async () => {
+    const { map } = toolMap();
+    const h = makeBroker({
+      grants: grants({ allowedTools: new Set(["Skill"]), allowedSkills: new Set(["prd-lifecycle"]), isRoot: true }),
+      toolHandlers: map,
+    });
+    const r = await h.broker.handleToolCall(rt(), "Skill", { skill: "not-granted" }, "root");
+    assertDenied(r, "denied_skill");
+  });
+
+  it("a granted-but-bodyless skill returns a bounded ack (never denied_tool, never a throw)", async () => {
+    // Granted (in allowedSkills) but absent from ctx.skills → the handler's fallback ack.
+    const { map } = toolMap([]);
+    const h = makeBroker({
+      grants: grants({ allowedTools: new Set(["Skill"]), allowedSkills: new Set(["prd-lifecycle"]), isRoot: true }),
+      toolHandlers: map,
+    });
+    const r = await h.broker.handleToolCall(rt(), "Skill", { skill: "prd-lifecycle" }, "root");
+    assert.equal(r.ok, true, "a granted-but-bodyless skill is an ok ack, not a deny");
+    if (r.ok) assert.ok(JSON.stringify(r.output).includes("prd-lifecycle"), "the ack names the skill");
   });
 });

@@ -5,6 +5,8 @@ import { WorkerClient, RequestError } from "./client.js";
 import { GitCache } from "./git.js";
 import { StubExecutor } from "./executor.js";
 import { SdkExecutor } from "./sdk-executor.js";
+import { selectCodexBinding, CodexSelectionError } from "./codex/select.js";
+import { CodexExecutor, FailClosedExecutor, CODEX_PRODUCTION_PROVIDER } from "./codex/codex-executor.js";
 import { ChatExecutor, type ChatExecutorLike } from "./chat-executor.js";
 import { StubChatExecutor } from "./chat-executor-stub.js";
 import { RunRunner, type ExecutorFactory } from "./runner.js";
@@ -25,9 +27,9 @@ let fatalLog: Logger | undefined;
 async function main(): Promise<void> {
   // PRD #51 M4: under the uid split, run the worker with umask 002 so (a) the runner-owned
   // /data subtrees the worker mkdirs (runner clone parents, per-run SDK HOME, provision)
-  // are group-`runner`-writable — the runner-uid children can then create their per-run
+  // are group-`runner`-writable — runner and runner-cmd children can then create/access their per-run
   // dirs — and (b) the runner children inherit umask 002 (it crosses fork/exec/setpriv),
-  // so their files are group-writable and the worker (a `runner`-group member) can tear
+  // so their files are group-writable and the worker/runner-cmd (`runner`-group members) can tear
   // them down on terminal. This never widens a WORKER-owned path to the runner: those are
   // group `worker` (which the runner is not in), so 002 only adds group-`worker` write
   // there (inert). Single-uid (#58): unchanged (default umask, no separate runner).
@@ -104,7 +106,47 @@ async function main(): Promise<void> {
   // what hid it: "stable across resume" reads as a guarantee it cannot make. The
   // runner now preflights the transcript and drops an unresolvable resume with an
   // honest run message (issue #105, sdk-session.ts).
-  const makeExecutor: ExecutorFactory = (runId) => {
+  const makeExecutor: ExecutorFactory = (runId, codex) => {
+    // PRD #1171 M3 — the claim-aware DARK selection seam. `selectCodexBinding` is a pure,
+    // fail-closed discriminator: ABSENCE of the block takes the LITERAL current Claude/stub
+    // path below (Claude byte-for-byte); a COMPLETE server-owned block selects Codex; a
+    // PRESENT-but-BROKEN block throws a bounded, secret-free CodexSelectionError. We wrap
+    // the select so that throw becomes a FailClosedExecutor whose run() re-throws the
+    // message (routing through the runner's failed-run catch), NEVER a Claude fallback and
+    // NEVER a crash of executeClaim itself.
+    let selection;
+    try {
+      selection = selectCodexBinding({ codex });
+    } catch (err) {
+      if (err instanceof CodexSelectionError) {
+        return { executor: new FailClosedExecutor(err.message) };
+      }
+      throw err;
+    }
+    if (selection.kind === "codex") {
+      // A validated Codex binding: the production CodexExecutor over the M3a launcher, the
+      // dark core and the M1 credential bridge. Per-run owned HOME (like SdkExecutor).
+      const runHome = path.join(sdkHomeRoot, runId);
+      const executor = new CodexExecutor(
+        log,
+        runHome,
+        {
+          binding: selection.binding,
+          client,
+          provider: CODEX_PRODUCTION_PROVIDER,
+        },
+        {
+          // PRD #1171 m4 (F1): the RUNNER owns the terminal registry teardown. Its post-run
+          // durability sinks (park/shutdown/finalize) reap the provider root through
+          // withBoundary AFTER run() returns, and executeClaim's finally calls safety.dispose
+          // once the last sink settles — so run()'s finally must leave the registry ALIVE.
+          deferRegistryTeardown: true,
+        },
+      );
+      return { executor, homeDir: runHome };
+    }
+
+    // selection.kind === "claude": the EXACT legacy path, unchanged.
     // The stub has no SDK $HOME (no session transcript to isolate); its only homeDir
     // use is the provisioning subprocess HOME, which stays SHARED (warm-start) like
     // the SDK executor's. So the stub keeps the shared root and there is nothing

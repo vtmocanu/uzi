@@ -17,6 +17,8 @@
 
 import type {
   BoundaryPermit,
+  BoundaryProcessHandle,
+  BoundaryProcessRequest,
   BoundaryRequest,
   ChildQuiescence,
   CodexExecutionSafety,
@@ -40,6 +42,18 @@ export type SpawnRootSeam = (
   deadlineMs: number,
 ) => Promise<RegisteredRoot>;
 
+export interface SpawnedBoundaryProcess extends Omit<BoundaryProcessHandle, "completed"> {
+  readonly root: RegisteredRoot;
+  /** Wait only for the supervised primary child. The safety owner follows it
+   * with the registry-owned whole-root reap before exposing completion. */
+  waitChild(deadlineMs: number): Promise<{ readonly code: number }>;
+}
+
+export type SpawnBoundaryProcessSeam = (
+  request: BoundaryProcessRequest,
+  deadlineMs: number,
+) => Promise<SpawnedBoundaryProcess>;
+
 /** The registry-bound seams `withBoundary` drives. Kept injectable so the facade is
  *  testable without a real registry or real processes; {@link createCodexExecutionSafety}
  *  wires them to a live {@link ExecutionRegistry}. */
@@ -48,6 +62,7 @@ export interface BoundarySeams {
   reap(request: BoundaryRequest, closedEpoch: number): Promise<ProcessReap>;
   dispose(request: BoundaryRequest): Promise<ToolDisposal>;
   spawnRoot: SpawnRootSeam;
+  spawnProcess?: SpawnBoundaryProcessSeam;
 }
 
 export type BoundaryActionOutcome =
@@ -57,6 +72,25 @@ export type BoundaryActionOutcome =
       reason: "stale_permit" | "admission_not_closed" | "command_roots_live";
     }
   | { kind: "poisoned"; error: HarnessError };
+
+/** PRD #1171 m4: the NEUTRAL result of the per-sink auth-mode reconciliation. It is the
+ *  ONLY thing that crosses back from the executor-owned reconcile closure into the generic
+ *  safety code — the runner and the generic `withBoundary` NEVER see `authMode`, a token, an
+ *  operation id or a generation. `ready` lets the boundary proceed to quiesce/reap/mint;
+ *  `blocked` poisons the epoch and throws `CodexBoundaryError("reconcile")` WITHOUT
+ *  quiescing/reaping/minting, so the sink counter stays zero and later publication is
+ *  blocked. */
+export type ReconcileOutcome =
+  | { kind: "ready" }
+  | { kind: "blocked"; errors: readonly HarnessError[] };
+
+/** PRD #1171 m4: the executor-owned auth-mode reconcile step run BEFORE every Codex
+ *  boundary. A subscription run refreshes + durably advances its generation here; an
+ *  api_key run performs zero refresh and only re-authorizes. Absent ⇒ no reconcile step
+ *  (Claude/tests that do not pass it are unaffected). It NEVER returns a credential — only a
+ *  neutral {@link ReconcileOutcome}. The signal is the same one held by the
+ *  eventual permit and aborts at the single boundary deadline. */
+export type ReconcileBeforeBoundary = (request: BoundaryRequest, signal: AbortSignal) => Promise<ReconcileOutcome>;
 
 /** Thrown by `withBoundary` when the boundary cannot be established (quiesce/reap
  *  failed) or the action's own children left the epoch poisoned. The sink was
@@ -70,7 +104,7 @@ export class CodexBoundaryError extends Error {
    *  the standard `cause`. Undefined when the action itself did not throw. */
   readonly actionError?: unknown;
   constructor(
-    readonly stage: "quiesce" | "reap" | "action",
+    readonly stage: "reconcile" | "quiesce" | "reap" | "action",
     readonly errors: readonly HarnessError[],
     actionError?: unknown,
   ) {
@@ -95,8 +129,12 @@ export class CodexBoundaryError extends Error {
 // This matches harness-contract.md:637 ("the epoch number is descriptive; the
 // module-private brand and safety owner's held state enforce authority"). This
 // trusted minter is the sole legitimate construction point.
-function mintPermit(epoch: number, boundary: BoundaryRequest["boundary"]): BoundaryPermit {
-  return { epoch, boundary } as unknown as BoundaryPermit;
+function mintPermit(epoch: number, boundary: BoundaryRequest["boundary"], signal: AbortSignal): BoundaryPermit {
+  return { epoch, boundary, signal } as unknown as BoundaryPermit;
+}
+
+function remainingMs(deadlineAt: number): number {
+  return Math.max(0, Math.ceil(deadlineAt - Date.now()));
 }
 
 export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
@@ -104,24 +142,33 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
 
   private readonly registry: ExecutionRegistry;
   private readonly seams: BoundarySeams;
+  // PRD #1171 m4: the OPTIONAL executor-owned auth-mode reconcile step. Absent ⇒ no
+  // reconcile (Claude/tests). Only its neutral {@link ReconcileOutcome} crosses back in.
+  private readonly reconcileBeforeBoundary: ReconcileBeforeBoundary | undefined;
 
   // Serialization tail: each boundary awaits the previous one's release.
   private queueTail: Promise<void> = Promise.resolve();
 
   // Live only while an action is running under a held permit.
   private heldPermit: BoundaryPermit | undefined;
-  private currentDeadlineMs = 0;
+  private currentDeadlineAt = 0;
   private pendingActions: Promise<unknown>[] = [];
 
-  constructor(registry: ExecutionRegistry, seams: BoundarySeams) {
+  constructor(
+    registry: ExecutionRegistry,
+    seams: BoundarySeams,
+    reconcileBeforeBoundary?: ReconcileBeforeBoundary,
+  ) {
     this.registry = registry;
     this.seams = seams;
+    this.reconcileBeforeBoundary = reconcileBeforeBoundary;
   }
 
   async withBoundary<T>(
     request: BoundaryRequest,
     action: (permit: BoundaryPermit) => Promise<T>,
   ): Promise<T> {
+    const deadlineAt = Date.now() + Math.max(0, request.deadlineMs);
     // (1) Serialize overlapping acquisitions. Each call parks on the prior tail and
     // installs a fresh release the next caller will await.
     const prior = this.queueTail;
@@ -131,7 +178,7 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     });
     try {
       await prior;
-      return await this.runBoundary(request, action);
+      return await this.runBoundary(request, action, deadlineAt);
     } finally {
       release();
     }
@@ -140,9 +187,53 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
   private async runBoundary<T>(
     request: BoundaryRequest,
     action: (permit: BoundaryPermit) => Promise<T>,
+    deadlineAt: number,
   ): Promise<T> {
+    const boundaryAbort = new AbortController();
+    // Convert the public duration to one absolute deadline. Each acquisition stage
+    // receives only the remaining budget, and the action receives the same deadline
+    // signal. Action bodies must propagate that signal into non-registry I/O; we do
+    // not Promise.race and abandon an uncooperative action. The production runner
+    // propagates it through finalize/recovery forge + worker HTTP, retry backoff and
+    // message drain, while permit-owned processes consume the shrinking budget.
+    const atEntry = remainingMs(deadlineAt);
+    if (atEntry <= 0) {
+      const errors: readonly HarnessError[] = [{ category: "timeout", message: "codex boundary expired in the acquisition queue" }];
+      this.registry.poison(errors);
+      throw new CodexBoundaryError("quiesce", errors);
+    }
+    const boundaryTimer = setTimeout(() => boundaryAbort.abort(), atEntry);
+    boundaryTimer.unref?.();
+    const requireRemaining = (stage: "reconcile" | "quiesce" | "reap"): void => {
+      if (!boundaryAbort.signal.aborted && remainingMs(deadlineAt) > 0) return;
+      const errors: readonly HarnessError[] = [{ category: "timeout", message: `codex boundary deadline expired after ${stage}` }];
+      this.registry.poison(errors);
+      throw new CodexBoundaryError(stage, errors);
+    };
+    try {
+    // (1.5) PRD #1171 m4: per-sink auth-mode reconciliation, AFTER the serialization queue
+    // (in withBoundary) and BEFORE quiesce/reap/mint. A subscription run refreshes + durably
+    // advances its generation here; an api_key run re-authorizes with zero refresh. A
+    // `blocked` outcome (contended/quarantined/persistence-failure/HTTP error) poisons the
+    // epoch and throws WITHOUT quiescing/reaping/minting or running the action — the sink
+    // counter stays zero, publication is blocked, and the primary + cleanup evidence are
+    // retained separately. Absent seam ⇒ no reconcile step (Claude/tests unaffected). Only
+    // the neutral outcome crosses back in; this generic code never sees authMode.
+    if (this.reconcileBeforeBoundary) {
+      const reconciled = await this.reconcileBeforeBoundary(
+        { ...request, deadlineMs: remainingMs(deadlineAt) },
+        boundaryAbort.signal,
+      );
+      if (reconciled.kind === "blocked") {
+        this.registry.poison(reconciled.errors);
+        throw new CodexBoundaryError("reconcile", reconciled.errors);
+      }
+      requireRemaining("reconcile");
+    }
+
     // (2) Quiesce child admission. Must be fully quiescent or the sink is uncalled.
-    const q = await this.seams.quiesce(request);
+    requireRemaining("quiesce");
+    const q = await this.seams.quiesce({ ...request, deadlineMs: remainingMs(deadlineAt) });
     if (q.kind !== "quiescent") {
       const errors: readonly HarnessError[] =
         q.kind === "incomplete"
@@ -151,11 +242,12 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
       this.registry.poison(errors);
       throw new CodexBoundaryError("quiesce", errors);
     }
+    requireRemaining("quiesce");
     const epoch = q.epoch;
 
     // (3) Reap every registered root. Must be observed-empty AND carry the SAME
     // epoch we just quiesced at; a mismatch means a stale/foreign permit domain.
-    const r = await this.seams.reap(request, epoch);
+    const r = await this.seams.reap({ ...request, deadlineMs: remainingMs(deadlineAt) }, epoch);
     if (r.kind !== "observed_empty" || r.epoch !== epoch) {
       const errors: readonly HarnessError[] =
         r.kind === "incomplete"
@@ -169,13 +261,15 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
       this.registry.poison(errors);
       throw new CodexBoundaryError("reap", errors);
     }
+    requireRemaining("reap");
 
     // (4) Mint the unforgeable matching-epoch permit and (5) run the action while
     // holding it. The permit/closed epoch is held through the full async action and
-    // every boundary-action child; release only after actual settlement.
-    const permit = mintPermit(epoch, request.boundary);
+    // every boundary-action child; release only after actual settlement. The action
+    // consumes permit.signal rather than being raced and abandoned at the deadline.
+    const permit = mintPermit(epoch, request.boundary, boundaryAbort.signal);
     this.heldPermit = permit;
-    this.currentDeadlineMs = request.deadlineMs;
+    this.currentDeadlineAt = deadlineAt;
     this.pendingActions = [];
 
     let outcome: { ok: true; value: T } | { ok: false; error: unknown };
@@ -204,6 +298,10 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
 
     this.heldPermit = undefined;
 
+    if (boundaryAbort.signal.aborted) {
+      this.registry.poison({ category: "timeout", message: "codex boundary action deadline exceeded" });
+    }
+
     if (this.registry.state() === "poisoned") {
       // Preserve BOTH the cleanup/poison evidence AND the action's own thrown error
       // (when it threw). The poison evidence explains why the boundary is not clean;
@@ -218,6 +316,85 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     }
     if (!outcome.ok) throw outcome.error;
     return outcome.value;
+    } finally {
+      clearTimeout(boundaryTimer);
+    }
+  }
+
+  async spawnBoundaryProcess(
+    permit: BoundaryPermit,
+    request: BoundaryProcessRequest,
+  ): Promise<BoundaryProcessHandle> {
+    if (this.heldPermit !== permit) throw new Error("codex boundary process refused: stale permit");
+    if (permit.signal.aborted) throw new Error("codex boundary process refused: boundary deadline exceeded");
+    if (!request.argv[0]?.startsWith("/")) {
+      const error: HarnessError = { category: "protocol", message: "boundary process executable must be absolute" };
+      this.registry.poison(error);
+      throw new Error(error.message);
+    }
+    if (request.identity === "worker_pat") {
+      if (this.registry.state() !== "closed") throw new Error("codex boundary process refused: admission not closed");
+      if (this.registry.hasLiveCommandRoot()) throw new Error("codex boundary process refused: command roots live");
+    }
+    const reservation = this.registry.reserveLaunch("boundary_action");
+    if (reservation.kind !== "reserved" || !this.seams.spawnProcess) {
+      if (reservation.kind === "reserved") this.registry.cancelReservation(reservation.reservation);
+      const error: HarnessError = { category: "protocol", message: "boundary process launch unavailable" };
+      this.registry.poison(error);
+      throw new Error(error.message);
+    }
+    let launched: SpawnedBoundaryProcess;
+    try {
+      launched = await this.seams.spawnProcess(request, remainingMs(this.currentDeadlineAt));
+    } catch {
+      this.registry.cancelReservation(reservation.reservation);
+      const error: HarnessError = { category: "tool", message: "boundary process spawn failed" };
+      this.registry.poison(error);
+      throw new Error(error.message);
+    }
+    const registered = this.registry.registerRoot(reservation.reservation, launched.root);
+    if (!registered.ok) {
+      await launched.root.dispose(remainingMs(this.currentDeadlineAt)).catch(() => undefined);
+      throw new Error("boundary process failed registry admission");
+    }
+    const completed = (async (): Promise<{ readonly code: number }> => {
+      let terminal: { readonly code: number } | undefined;
+      let terminalError: unknown;
+      try {
+        terminal = await this.waitChildOrAbort(launched, permit.signal, remainingMs(this.currentDeadlineAt));
+      } catch (error) {
+        terminalError = error;
+      }
+      const reaped = await this.registry.reapRoot(launched.root, remainingMs(this.currentDeadlineAt));
+      if (!reaped.ok) throw new Error("boundary process root did not reap cleanly");
+      if (terminalError !== undefined) throw terminalError;
+      if (!terminal) throw new Error("boundary process produced no terminal result");
+      return terminal;
+    })();
+    // Track synchronously before returning the streams. Even a caller that forgets
+    // `completed` cannot release the permit while this process/root is live.
+    this.pendingActions.push(completed);
+    return {
+      stdin: launched.stdin,
+      stdout: launched.stdout,
+      stderr: launched.stderr,
+      completed,
+    };
+  }
+
+  private waitChildOrAbort(
+    launched: SpawnedBoundaryProcess,
+    signal: AbortSignal,
+    deadlineMs: number,
+  ): Promise<{ readonly code: number }> {
+    if (signal.aborted) return Promise.reject(new Error("boundary process deadline exceeded"));
+    return new Promise((resolve, reject) => {
+      const onAbort = (): void => reject(new Error("boundary process deadline exceeded"));
+      signal.addEventListener("abort", onAbort, { once: true });
+      launched.waitChild(deadlineMs).then(resolve, reject).finally(() => {
+        signal.removeEventListener("abort", onAbort);
+      });
+    });
   }
 
   /**
@@ -284,7 +461,7 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     }
     let root: RegisteredRoot;
     try {
-      root = await this.seams.spawnRoot(argv, identity, this.currentDeadlineMs);
+      root = await this.seams.spawnRoot(argv, identity, remainingMs(this.currentDeadlineAt));
     } catch (e) {
       this.registry.cancelReservation(reserved.reservation);
       const error: HarnessError = {
@@ -300,13 +477,13 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
       // the registry has poisoned itself and never admitted this root. Do NOT reap an
       // unadmitted root; best-effort tear the just-spawned process down and surface the
       // poison so the boundary is never treated as clean.
-      await root.dispose(this.currentDeadlineMs).catch(() => {});
+      await root.dispose(remainingMs(this.currentDeadlineAt)).catch(() => {});
       return { kind: "poisoned", error: registered.error };
     }
     // Hold the permit until this root reaps its whole descendant set.
     let reap: ReapOutcome;
     try {
-      reap = await root.reap(this.currentDeadlineMs);
+      reap = await root.reap(remainingMs(this.currentDeadlineAt));
     } catch {
       const error: HarnessError = {
         category: "tool",
@@ -339,11 +516,34 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
 export function createCodexExecutionSafety(
   registry: ExecutionRegistry,
   spawnRoot: SpawnRootSeam,
+  reconcileBeforeBoundary?: ReconcileBeforeBoundary,
+  // Optional terminal hook run after the registry's tools are disposed. The terminal
+  // boundary owner (the runner, after the last sink) invokes `dispose` exactly at the
+  // true terminal — which is AFTER run()'s finally under deferRegistryTeardown — so the
+  // executor uses this to evict tokens released by the POST-RUN sink reconciles (which
+  // run()'s already-completed finally could not have evicted). Idempotent by contract.
+  onDispose?: () => void | Promise<void>,
+  spawnProcess?: SpawnBoundaryProcessSeam,
 ): CodexExecutionSafetyImpl {
-  return new CodexExecutionSafetyImpl(registry, {
-    quiesce: (request) => registry.quiesceChildren(request.deadlineMs),
-    reap: (request, closedEpoch) => registry.reapProcesses(request.deadlineMs, closedEpoch),
-    dispose: (request) => registry.disposeTools(request.deadlineMs),
-    spawnRoot,
-  });
+  return new CodexExecutionSafetyImpl(
+    registry,
+    {
+      quiesce: (request) => registry.quiesceChildren(request.deadlineMs),
+      reap: (request, closedEpoch) => registry.reapProcesses(request.deadlineMs, closedEpoch),
+      dispose: async (request) => {
+        // `onDispose` (the executor's post-run sink token eviction) must run even if
+        // `disposeTools` ever rejects — otherwise those tokens would leak. `disposeTools`
+        // catches internally today (never throws), so the `finally` is future-proofing;
+        // over-retention is the safe direction but eviction is the point.
+        try {
+          return await registry.disposeTools(request.deadlineMs);
+        } finally {
+          await onDispose?.();
+        }
+      },
+      spawnRoot,
+      spawnProcess,
+    },
+    reconcileBeforeBoundary,
+  );
 }

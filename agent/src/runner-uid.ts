@@ -49,14 +49,18 @@ export const RUNNER_UID = 10002;
 /** uid 10003 — `runner-cmd`, a NEW distinct cap-less identity for command roots (the
  *  model-authorized shell + fileop effect surface). Credential-free, primary group
  *  `runner-cmd` (gid 10003) and a supplementary member of group `runner`, so its
- *  worktree writes are group-`runner` and group-writable under the setgid+umask
- *  discipline landing in a later #1171 unit. Distinct from RUNNER_UID so a command root
+ *  worktree writes are group-`runner` and group-writable under the enforced
+ *  setgid+umask discipline. Distinct from RUNNER_UID so a command root
  *  cannot read a provider root's auth/session state at the OS level (plan §2.8). The
  *  `runner-cmd` account now EXISTS in the images — group gid 10003 plus a `runner-cmd`
  *  passwd entry that is a supplementary member of group `runner` — numbered above the
  *  existing pair; see the worker/runner/runner-cmd accounts in
  *  agent/templates/base/Dockerfile. */
 export const COMMAND_UID = 10003;
+/** gid 10004, shared only by the trusted worker and provider runner. It grants
+ * traverse/read access to managed-auth provider sessions without adding the
+ * provider to the broad worker primary group; runner-cmd is never a member. */
+export const CODEX_SESSION_GID = 10004;
 /** uid 10001 — `worker`, the PAT-holding worker process itself. Credentialed
  *  boundary-action roots ARE this process, so becoming `worker` needs no setpriv (see
  *  {@link workerBoundaryCommand}). Image account: the `worker` account in
@@ -165,16 +169,23 @@ export function commandRootCommand(command: string, args: readonly string[]): { 
 
 /**
  * The credentialed boundary-action identity: the PAT-holding `worker` (WORKER_UID).
- * The worker process ALREADY IS uid 10001, so a boundary root must run UNWRAPPED —
- * there is no identity to `setpriv` into, and wrapping it would strip the very
- * capabilities/credentials the action needs. Returns the command/args verbatim in BOTH
- * modes; it exists as an explicit "run as the worker" seam symmetric with
+ * The worker process already is uid 10001, but on the split profile it retains
+ * controller-only SETUID/SETGID capabilities. A boundary subprocess needs its PAT
+ * environment, not those caps, so it re-enters uid/gid 10001 through setpriv,
+ * clears inheritable/ambient caps there, and asks the trusted supervisor to capset
+ * the retained effective/permitted pair to zero before profile validation. Single-uid
+ * remains verbatim. This seam is symmetric with
  * {@link runnerCommand}/{@link commandRootCommand}, so the Codex safety lane never
  * reaches for a bare spawn. Reaping every command root BEFORE a credentialed boundary
- * action runs is enforced by that safety lane (a later #1171 unit), not here.
+ * action runs is enforced by the Codex safety lane, not here.
  */
 export function workerBoundaryCommand(command: string, args: readonly string[]): { command: string; args: string[] } {
-  return { command, args: [...args] };
+  if (!uidSplitActive()) return { command, args: [...args] };
+  // The root-start entrypoint deliberately leaves SETUID/SETGID effective on the
+  // worker controller so it can launch the two untrusted identities. A worker-PAT
+  // durability child needs the worker uid and credential env, not those caps. Clear
+  // them before the supervisor posture check, while retaining uid/gid 10001.
+  return { command: SETPRIV, args: [...setprivArgsForUid(WORKER_UID), command, ...args] };
 }
 
 /**

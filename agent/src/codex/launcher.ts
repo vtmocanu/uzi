@@ -1,11 +1,10 @@
 // PRD #1156 (M3a) — the isolated per-root Codex launch primitive.
 //
-// This is the reusable library the FUTURE worker adapter (and the m3a lifecycle
+// This is the reusable library the production worker adapter (and the m3a lifecycle
 // test) calls to launch ONE supervisor root: a static Go supervisor
 // (`/usr/local/bin/uzi-codex-supervisor`, built by a sibling unit) which forks the
 // pinned Codex app-server (`/opt/uzi-codex/0.153.2/bin/codex app-server`). It
-// composes the UNCHANGED worker→runner uid boundary in `runner-uid.ts`
-// (`runnerCommand` / `uidSplitActive`) — this file edits none of those helpers.
+// composes the worker→runner/runner-cmd uid boundaries in `runner-uid.ts`.
 //
 // SUPPORTED PROFILE (fail-closed): this primitive is supported ONLY under the A1
 // uid-split (a trusted controller at the worker uid, an untrusted runner at a
@@ -17,7 +16,7 @@
 // launcher side to match; we invent no fields):
 //   control  → fd3 (we WRITE): {"op":"snapshot","id"} / {"op":"dispose","id","timeoutMs"}
 //   evidence ← fd4 (we READ):  started / snapshot / dispose(drained|unconfirmed) / abnormal
-//   argv: <supervisor> --expect-uid <N> -- <codexBin> <childArgv...>   (launcher-fixed)
+//   argv: <supervisor> --expect-uid <N> [--cleanup-token <uuid>] -- <child> <argv...>
 //   stdio: [pipe0, pipe1, pipe2, pipe3=control, pipe4=evidence]; 0/1/2 are the
 //          app-server TRANSPORT the child inherits — exposed on the handle so a
 //          caller speaks app-server JSONL RPC over them.
@@ -31,15 +30,28 @@
 // mint a run-level permit or `observed_empty`.
 
 import { spawn, spawnSync } from "node:child_process";
+import { lstatSync } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
 import type { Readable, Writable } from "node:stream";
 
-import { runnerCommand, uidSplitActive } from "../runner-uid.js";
+import {
+  CODEX_SESSION_GID,
+  COMMAND_UID,
+  WORKER_UID,
+  commandRootCommand,
+  runnerCommand,
+  uidSplitActive,
+  workerBoundaryCommand,
+} from "../runner-uid.js";
 import {
   assertNoUnexpectedSystemConfig as defaultAssertNoUnexpectedSystemConfig,
   buildCodexConfigToml,
+  buildCodexLoopbackTestConfigToml,
+  buildCodexProductionConfigToml,
 } from "./config.js";
+import type { CodexAppServerAuthMode } from "./appserver-auth.js";
+import { SESSION_SEED_ENTRYPOINT } from "./session-seed-cli.js";
 
 // ─── Bounds (fixture-derived; supervisor-side limits are matched, not trusted) ────
 const MAX_EVIDENCE_LINES = 256;
@@ -50,9 +62,15 @@ const MAX_CONTROL_BYTES = 8192; // 8 KiB per control frame
  *  Codex bundle (`/opt/uzi-codex/.../bin` and `codex-path/rg` are resolved by
  *  absolute path INSIDE the launch, never via PATH — PRD #1156 build facts). */
 const CODEX_LAUNCH_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/uzi-toolchain/bin";
-const CODEX_BIN = "/opt/uzi-codex/0.153.2/bin/codex";
-const SUPERVISOR_BIN = "/usr/local/bin/uzi-codex-supervisor";
-const PROVIDER_CHILD_ARGV = ["app-server"] as const;
+/** The pinned, image-baked Codex app-server binary. Exported so the production adapter
+ *  composition (codex-executor.ts) can build a provider {@link CodexLaunchSpec} without
+ *  re-typing the literal; the launcher still re-validates a provider spec names exactly it. */
+export const CODEX_BIN = "/opt/uzi-codex/0.153.2/bin/codex";
+/** The pinned, image-baked supervisor trust anchor. Exported for the same reason. */
+export const SUPERVISOR_BIN = "/usr/local/bin/uzi-codex-supervisor";
+/** The fixed provider child argv (`codex app-server`). Exported so the production
+ *  composition supplies exactly the launcher-required value. */
+export const PROVIDER_CHILD_ARGV = ["app-server"] as const;
 const RESERVED_PROVIDER_ENV_KEYS = new Set([
   "HOME", "CODEX_HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME",
   "TMPDIR", "PATH", "SHELL", "LANG", "TERM", "NODE_OPTIONS", "BASH_ENV", "ENV", "SHELLOPTS",
@@ -72,7 +90,9 @@ export interface CodexLaunchProvider {
 
 export interface CodexLaunchSpec {
   /** A RUNNER-WRITABLE root, OUTSIDE the target repo, under which fresh per-launch
-   *  HOME/CODEX_HOME/XDG/TMPDIR trees are created runner-owned mode 0700. */
+   * HOME/CODEX_HOME/XDG/TMPDIR trees are created runner-owned mode 0700. Managed-auth
+   * provider roots add only session-reader-group traverse on the root and CODEX_HOME, plus
+   * read access on CODEX_HOME/sessions, so the worker can persist that safe subset. */
   readonly ownedDataRoot: string;
   readonly provider: CodexLaunchProvider;
   readonly model: string;
@@ -87,6 +107,20 @@ export interface CodexLaunchSpec {
   readonly childArgv: readonly string[];
   /** The canonical project / launch cwd, provisioned untrusted in config.toml. */
   readonly cwd: string;
+  /** PRD #1171: when true, the root authenticates through the app-server login RPC
+   *  (`account/login/start`) rather than an env-key credential. `launchCodexRoot` then
+   *  emits the production `config.toml` ({@link buildCodexProductionConfigToml}, the
+   *  built-in `openai` provider with NO re-declared `[model_providers.*]` table that would
+   *  bypass the login) and {@link buildReplacedEnv} injects NO provider credential var for
+   *  this root — the credential enters over the transport, never the environment. Absent /
+   *  false keeps the transitional env-key path byte-identical. Provider roots only. */
+  readonly useAppServerAuth?: boolean;
+  /** The immutable app-server auth mode, REQUIRED when {@link useAppServerAuth} is set (the
+   *  production config builder forces an explicit no-fallback choice). Ignored otherwise. */
+  readonly authMode?: CodexAppServerAuthMode;
+  /** Managed-auth resume only: copy the executor's deterministic, credential-free
+   * sibling staging tree into the runner-owned sessions directory before spawn. */
+  readonly seedSession?: boolean;
 }
 
 /** The privileged step that creates the runner-owned trees + writes the config. The
@@ -94,11 +128,23 @@ export interface CodexLaunchSpec {
  *  the runner uid (setpriv). Injectable so unit tests fake it (no setpriv/root). */
 export interface RunnerTreeRequest {
   readonly uid: number;
+  readonly kind: CodexRootKind;
   readonly root: string;
   readonly dirs: readonly string[];
+  /** Narrow managed-auth session export path. The worker may traverse root/codexHome
+   * and read sessionDir, but cannot list either parent. */
+  readonly sharedSessionRead?: {
+    readonly gid: number;
+    readonly codexHome: string;
+    readonly sessionDir: string;
+  };
+  /** Deterministic credential-free staging source, copied as the provider runner
+   * after final tree provisioning and before the app-server process is spawned. */
+  readonly sessionSeedDir?: string;
   readonly files: readonly { readonly path: string; readonly content: string; readonly mode: number }[];
 }
 export type MakeRunnerTrees = (request: RunnerTreeRequest) => void;
+export type RemoveRunnerTree = (request: Pick<RunnerTreeRequest, "uid" | "kind" | "root">) => void;
 
 /** The minimal supervisor-process surface the launcher uses. Node's `ChildProcess`
  *  satisfies it structurally; the unit tests inject a fake that does too. */
@@ -131,11 +177,22 @@ export interface LauncherDeps {
   readonly env?: NodeJS.ProcessEnv;
   /** Resolve the intended runner uid `<N>` (defaults to `id -u runner`). */
   readonly resolveRunnerUid?: () => number;
+  readonly resolveCommandUid?: () => number;
+  readonly resolveWorkerUid?: () => number;
   readonly makeRunnerTrees?: MakeRunnerTrees;
+  /** Remove the runner-owned launch tree after, and only after, its supervisor
+   * proves a drained disposal. Tests inject this alongside makeRunnerTrees. */
+  readonly removeRunnerTree?: RemoveRunnerTree;
+  /** Static, path-free diagnostic for a best-effort tree-removal failure. */
+  readonly reportRunnerTreeCleanupFailure?: () => void;
   readonly spawnSupervisor?: SpawnSupervisor;
   readonly assertNoUnexpectedSystemConfig?: (etcCodexDir?: string) => void;
   readonly etcCodexDir?: string;
   readonly deadlines?: Partial<LauncherDeadlines>;
+  /** M3b-only authenticated custom-provider redirect. The alternate builder accepts
+   * only a credential-free literal loopback URL and disables WebSockets; production
+   * leaves this absent and therefore emits the fixed vendor config byte-for-byte. */
+  readonly appServerAuthOpenAIBaseUrlForTest?: string;
 }
 
 // ─── Evidence frame shapes (READ from fd4; we do not invent fields) ─────────────
@@ -154,6 +211,10 @@ export interface SnapshotEvidence {
   readonly event: "snapshot";
   readonly id: number;
   readonly processes: ReadonlyArray<{ readonly pid: number; readonly ppid: number; readonly pgid: number; readonly comm: string }>;
+}
+export interface ChildExitEvidence {
+  readonly event: "child_exit";
+  readonly code: number;
 }
 export interface DisposeEvidence {
   readonly event: "dispose";
@@ -179,6 +240,8 @@ export interface CodexRootHandle {
   /** The app-server TRANSPORT (fds 0/1/2) — a caller speaks app-server JSONL RPC here. */
   readonly transport: { readonly stdin: Writable | null; readonly stdout: Readable | null; readonly stderr: Readable | null };
   snapshot(timeoutMs?: number): Promise<SnapshotEvidence>;
+  /** Await the supervised primary child's normalized terminal status. */
+  waitChild(timeoutMs?: number): Promise<ChildExitEvidence>;
   dispose(timeoutMs?: number): Promise<DisposeOutcome>;
   /** The sticky failure for THIS root, if any (abnormal, early exit, protocol breach). */
   readonly failed: Error | undefined;
@@ -207,15 +270,17 @@ function defaultResolveRunnerUid(): number {
   return uid;
 }
 
-/** Default privileged provisioning: create the dirs 0700 and write the config file,
- *  ALL as the runner uid via setpriv (`runnerCommand`), never chown. File content is
- *  fed on stdin so it is never embedded in an argv. Not exercised by unit tests. */
+/** Default privileged provisioning: create the dirs as the runner uid via setpriv
+ * (`runnerCommand`) and write the config 0600, never chown. Trees stay 0700 except
+ * for the narrow managed-auth session export posture on RunnerTreeRequest.
+ * File content is fed on stdin so it is never embedded in an argv. */
 function defaultMakeRunnerTrees(request: RunnerTreeRequest): void {
   // The helper itself runs as the shared runner uid, so it must not inherit the worker
   // process environment: another concurrent runner can read a normal helper process via
   // /proc/<pid>/environ. Only inert locale/path values cross this short provisioning step.
   const provisionEnv: NodeJS.ProcessEnv = { PATH: "/usr/bin:/bin", LANG: "C" };
-  const mk = runnerCommand("/bin/sh", [
+  const wrap = request.kind === "command" ? commandRootCommand : runnerCommand;
+  const mk = wrap("/bin/sh", [
     "-ceu",
     `root="$1"; uid="$2"; shift 2; umask 077; mkdir -m 700 -- "$root"; trap 'rc=$?; [ "$rc" -eq 0 ] || rm -rf -- "$root"; exit "$rc"' EXIT; chmod 700 "$root"; for d in "$@"; do mkdir -m 700 -- "$d"; chmod 700 "$d"; done; for d in "$root" "$@"; do [ "$(stat -c %u "$d")" = "$uid" ] && [ "$(stat -c %a "$d")" = 700 ]; done; trap - EXIT`,
     "sh", request.root, String(request.uid), ...request.dirs,
@@ -223,17 +288,109 @@ function defaultMakeRunnerTrees(request: RunnerTreeRequest): void {
   const r = spawnSync(mk.command, mk.args, { env: provisionEnv, stdio: ["ignore", "ignore", "pipe"] });
   if (r.status !== 0) throw new Error(`runner-owned tree creation failed (exit ${String(r.status)}): ${String(r.stderr)}`);
   try {
+    const shared = request.sharedSessionRead;
+    if (shared !== undefined) {
+      const share = wrap("/bin/sh", [
+        "-ceu",
+        `root="$1"; codex="$2"; sessions="$3"; uid="$4"; gid="$5"; chgrp "$gid" "$root" "$codex"; chmod 710 "$root" "$codex"; mkdir -m 2750 -- "$sessions"; chgrp "$gid" "$sessions"; chmod 2750 "$sessions"; [ "$(stat -c %u "$root")" = "$uid" ] && [ "$(stat -c %g "$root")" = "$gid" ] && [ "$(stat -c %a "$root")" = 710 ] && [ "$(stat -c %u "$codex")" = "$uid" ] && [ "$(stat -c %g "$codex")" = "$gid" ] && [ "$(stat -c %a "$codex")" = 710 ] && [ "$(stat -c %u "$sessions")" = "$uid" ] && [ "$(stat -c %g "$sessions")" = "$gid" ] && [ "$(stat -c %a "$sessions")" = 2750 ]`,
+        "sh", request.root, shared.codexHome, shared.sessionDir, String(request.uid), String(shared.gid),
+      ]);
+      const sr = spawnSync(share.command, share.args, { env: provisionEnv, stdio: ["ignore", "ignore", "pipe"] });
+      if (sr.status !== 0) {
+        throw new Error(`runner-owned session export posture failed (exit ${String(sr.status)}): ${String(sr.stderr)}`);
+      }
+    }
+    if (request.sessionSeedDir !== undefined) {
+      if (shared === undefined || request.kind !== "provider") {
+        throw new Error("runner-owned session seed requires a managed-auth provider tree");
+      }
+      const seed = wrap("/app/node_modules/.bin/tsx", [
+        SESSION_SEED_ENTRYPOINT,
+        request.sessionSeedDir,
+        shared.sessionDir,
+      ]);
+      const seeded = spawnSync(seed.command, seed.args, {
+        env: {
+          PATH: "/usr/local/bin:/usr/bin:/bin",
+          LANG: "C",
+          HOME: join(request.root, "home"),
+          TMPDIR: join(request.root, "tmp"),
+        },
+        stdio: ["ignore", "ignore", "pipe"],
+      });
+      if (seeded.status !== 0) {
+        throw new Error(`runner-owned session seed failed (exit ${String(seeded.status)})`);
+      }
+    }
     for (const file of request.files) {
       const octal = (file.mode & 0o777).toString(8).padStart(3, "0");
-      const w = runnerCommand("/bin/sh", ["-ceu", `umask 077; cat > "$1"; chmod ${octal} "$1"; [ "$(stat -c %u "$1")" = "$2" ] && [ "$(stat -c %a "$1")" = ${octal} ]`, "sh", file.path, String(request.uid)]);
+      const w = wrap("/bin/sh", ["-ceu", `umask 077; cat > "$1"; chmod ${octal} "$1"; [ "$(stat -c %u "$1")" = "$2" ] && [ "$(stat -c %a "$1")" = ${octal} ]`, "sh", file.path, String(request.uid)]);
       const wr = spawnSync(w.command, w.args, { env: provisionEnv, input: file.content, stdio: ["pipe", "ignore", "pipe"] });
       if (wr.status !== 0) throw new Error(`runner-owned file write failed for ${file.path} (exit ${String(wr.status)}): ${String(wr.stderr)}`);
     }
   } catch (error) {
-    const rm = runnerCommand("/bin/rm", ["-rf", "--", request.root]);
+    const rm = wrap("/bin/rm", ["-rf", "--", request.root]);
     spawnSync(rm.command, rm.args, { env: provisionEnv, stdio: "ignore" });
     throw error;
   }
+}
+
+/** Remove one private launch tree as the identity that owns it. The caller has
+ * already validated the immutable launch spec; re-check the destructive target
+ * here so a future caller cannot turn this helper into a broad delete. */
+function defaultRemoveRunnerTree(request: Pick<RunnerTreeRequest, "uid" | "kind" | "root">): void {
+  if (!isAbsolute(request.root) || resolve(request.root) === sep || resolve(request.root) !== request.root) {
+    throw new Error("refusing to remove a non-canonical owned data root");
+  }
+  const stat = lstatSync(request.root, { throwIfNoEntry: false });
+  if (stat === undefined) return;
+  if (stat.isSymbolicLink() || !stat.isDirectory() || stat.uid !== request.uid) {
+    throw new Error("refusing to remove an unexpected owned data root");
+  }
+  const wrap = request.kind === "command" ? commandRootCommand : runnerCommand;
+  const rm = wrap("/bin/rm", ["-rf", "--", request.root]);
+  const cleanupEnv: NodeJS.ProcessEnv = { PATH: "/usr/bin:/bin", LANG: "C" };
+  const result = spawnSync(rm.command, rm.args, { env: cleanupEnv, stdio: ["ignore", "ignore", "pipe"] });
+  if (result.status !== 0) {
+    throw new Error(`runner-owned tree removal failed (exit ${String(result.status)}): ${String(result.stderr)}`);
+  }
+}
+
+/** Bind the runner-owned tree to the same proven lifecycle as its supervisor.
+ * A failed/unconfirmed disposal leaves the tree intact for forensic recovery;
+ * a repeated clean dispose never repeats a successful removal. */
+function withOwnedTreeCleanup(
+  handle: CodexRootHandle,
+  request: Pick<RunnerTreeRequest, "uid" | "kind" | "root">,
+  remove: RemoveRunnerTree,
+  reportFailure: () => void,
+): CodexRootHandle {
+  let removed = false;
+  return {
+    started: handle.started,
+    supervisorPid: handle.supervisorPid,
+    transport: handle.transport,
+    snapshot: (timeoutMs) => handle.snapshot(timeoutMs),
+    waitChild: (timeoutMs) => handle.waitChild(timeoutMs),
+    dispose: async (timeoutMs) => {
+      const outcome = await handle.dispose(timeoutMs);
+      if (outcome.clean && !removed) {
+        // Disposal evidence and disk reclamation are different facts. Once the
+        // supervisor proved ECHILD+__WALL and exited 0, a filesystem anomaly must
+        // retain the tree for inspection, not rewrite that clean process result or
+        // prevent sibling roots from being reaped by the aggregate boundary.
+        removed = true;
+        try {
+          remove(request);
+        } catch {
+          try { reportFailure(); } catch { /* diagnostics never replace lifecycle evidence */ }
+        }
+      }
+      return outcome;
+    },
+    get failed() { return handle.failed; },
+    whenFailed: handle.whenFailed,
+  };
 }
 
 const defaultSpawnSupervisor: SpawnSupervisor = (command, args, options) =>
@@ -276,8 +433,8 @@ function pathsOverlap(a: string, b: string): boolean {
 /** Validate the trusted construction contract for every caller, not only the JSON CLI. */
 function validateLaunchContract(spec: CodexLaunchSpec): void {
   if (spec.kind !== "provider" && spec.kind !== "command") throw new Error("kind must be provider or command");
-  if (!isAbsolute(spec.ownedDataRoot) || resolve(spec.ownedDataRoot) === sep) {
-    throw new Error("ownedDataRoot must be an absolute non-root path");
+  if (!isAbsolute(spec.ownedDataRoot) || resolve(spec.ownedDataRoot) === sep || resolve(spec.ownedDataRoot) !== spec.ownedDataRoot) {
+    throw new Error("ownedDataRoot must be a canonical absolute non-root path");
   }
   if (!isAbsolute(spec.cwd)) throw new Error("cwd must be an absolute path");
   if (pathsOverlap(spec.ownedDataRoot, spec.cwd)) {
@@ -295,6 +452,14 @@ function validateLaunchContract(spec: CodexLaunchSpec): void {
   }
   if (!/^[A-Z][A-Z0-9_]*$/.test(spec.provider.envKey) || RESERVED_PROVIDER_ENV_KEYS.has(spec.provider.envKey)) {
     throw new Error("provider envKey is invalid or reserved by the launcher allowlist");
+  }
+  if (spec.useAppServerAuth) {
+    if (spec.kind !== "provider") {
+      throw new Error("app-server auth is only supported for a provider root");
+    }
+    if (spec.authMode !== "subscription" && spec.authMode !== "api_key") {
+      throw new Error("app-server auth requires an explicit subscription or api_key mode");
+    }
   }
 }
 
@@ -316,7 +481,9 @@ function buildReplacedEnv(trees: OwnedTrees, spec: CodexLaunchSpec): NodeJS.Proc
     LANG: "C",
     TERM: "dumb",
   };
-  if (spec.kind === "provider" && spec.provider.credentialValue !== undefined) {
+  // An app-server-auth root delivers its credential over the login RPC, NOT the env: never
+  // inject the provider var for it (the credential must not be readable in /proc/<pid>/environ).
+  if (spec.kind === "provider" && !spec.useAppServerAuth && spec.provider.credentialValue !== undefined) {
     env[spec.provider.envKey] = spec.provider.credentialValue;
   }
   return env;
@@ -358,27 +525,66 @@ export async function launchCodexRoot(spec: CodexLaunchSpec, deps: LauncherDeps 
   }
 
   validateLaunchContract(spec);
+  if (deps.appServerAuthOpenAIBaseUrlForTest !== undefined && !spec.useAppServerAuth) {
+    throw new Error("Codex loopback test base URL requires app-server auth");
+  }
+  if (spec.seedSession && (spec.kind !== "provider" || !spec.useAppServerAuth)) {
+    throw new Error("Codex session seeding requires a managed-auth provider root");
+  }
 
   // Resolve the intended runner uid <N> for --expect-uid and the runner-owned trees.
-  const uid = (deps.resolveRunnerUid ?? defaultResolveRunnerUid)();
+  const uid = spec.kind === "command"
+    ? (deps.resolveCommandUid ?? (() => COMMAND_UID))()
+    : (deps.resolveRunnerUid ?? defaultResolveRunnerUid)();
   if (!Number.isInteger(uid) || uid <= 0) throw new Error(`resolved runner uid is invalid: ${String(uid)}`);
 
   // 2. Reject unexpected system config (a fresh HOME does not neutralize /etc/codex).
   (deps.assertNoUnexpectedSystemConfig ?? defaultAssertNoUnexpectedSystemConfig)(deps.etcCodexDir);
 
-  // 3. Fresh per-launch trees, created RUNNER-OWNED 0700 via the injectable step.
+  // 3. Fresh per-launch trees, runner-owned via the injectable step. Managed auth adds
+  // only the dedicated worker+provider group's traverse/read path to the sessions subtree.
   const trees = deriveOwnedTrees(spec.ownedDataRoot);
   const configPath = join(trees.codexHome, "config.toml");
-  // 4. Stock config.toml (native-off; canonical project untrusted), written 0600 as runner.
-  const configText = buildCodexConfigToml({
-    model: spec.model,
-    provider: { name: spec.provider.name, baseUrl: spec.provider.baseUrl, envKey: spec.provider.envKey, wireApi: "responses" },
-    projectPath: spec.cwd,
-  });
+  const sessionSeedDir = join(`${spec.ownedDataRoot}.session-seed`, "sessions");
+  // 4. config.toml (native-off; canonical project untrusted), written 0600 as runner. An
+  //    app-server-auth provider root emits the PRODUCTION config (the built-in `openai`
+  //    provider, no re-declared table that would bypass the login). The explicit M3b-only
+  //    dependency instead emits its authenticated HTTP loopback provider. Every other root
+  //    keeps the transitional env-key config, byte-identical to before this seam.
+  let configText: string;
+  if (spec.useAppServerAuth) {
+    // validateLaunchContract already refused an absent/invalid authMode; re-narrow for the
+    // (non-optional) production builder input rather than assert non-null.
+    const authMode = spec.authMode;
+    if (authMode !== "subscription" && authMode !== "api_key") {
+      throw new Error("app-server auth requires an explicit subscription or api_key mode");
+    }
+    const configOpts = { model: spec.model, projectPath: spec.cwd, authMode };
+    configText = deps.appServerAuthOpenAIBaseUrlForTest === undefined
+      ? buildCodexProductionConfigToml(configOpts)
+      : buildCodexLoopbackTestConfigToml(configOpts, deps.appServerAuthOpenAIBaseUrlForTest);
+  } else {
+    configText = buildCodexConfigToml({
+      model: spec.model,
+      provider: { name: spec.provider.name, baseUrl: spec.provider.baseUrl, envKey: spec.provider.envKey, wireApi: "responses" },
+      projectPath: spec.cwd,
+    });
+  }
   (deps.makeRunnerTrees ?? defaultMakeRunnerTrees)({
     uid,
+    kind: spec.kind,
     root: spec.ownedDataRoot,
     dirs: trees.all,
+    ...(spec.kind === "provider" && spec.useAppServerAuth
+      ? {
+          sharedSessionRead: {
+            gid: CODEX_SESSION_GID,
+            codexHome: trees.codexHome,
+            sessionDir: join(trees.codexHome, "sessions"),
+          },
+        }
+      : {}),
+    ...(spec.seedSession ? { sessionSeedDir } : {}),
     files: [{ path: configPath, content: configText, mode: 0o600 }],
   });
 
@@ -389,7 +595,9 @@ export async function launchCodexRoot(spec: CodexLaunchSpec, deps: LauncherDeps 
   //    with 5-fd stdio (0/1/2 transport, 3 control, 4 evidence). The supervisor argv
   //    is trusted & launcher-fixed: never model-controlled.
   const supervisorArgv = ["--expect-uid", String(uid), "--", spec.codexBin, ...spec.childArgv];
-  const wrapped = runnerCommand(spec.supervisorBin, supervisorArgv);
+  const wrapped = spec.kind === "command"
+    ? commandRootCommand(spec.supervisorBin, supervisorArgv)
+    : runnerCommand(spec.supervisorBin, supervisorArgv);
   const child = (deps.spawnSupervisor ?? defaultSpawnSupervisor)(wrapped.command, wrapped.args, {
     cwd: spec.cwd,
     env: replacedEnv,
@@ -397,10 +605,78 @@ export async function launchCodexRoot(spec: CodexLaunchSpec, deps: LauncherDeps 
   });
 
   // 7. Parse evidence (bounded), await `started`, expose snapshot/dispose + transport.
-  return createHandle(child, uid, { ...DEFAULT_DEADLINES, ...deps.deadlines });
+  const handle = await createHandle(child, uid, { ...DEFAULT_DEADLINES, ...deps.deadlines }, spec.kind);
+  return withOwnedTreeCleanup(
+    handle,
+    { uid, kind: spec.kind, root: spec.ownedDataRoot },
+    deps.removeRunnerTree ?? defaultRemoveRunnerTree,
+    deps.reportRunnerTreeCleanupFailure
+      ?? (() => process.stderr.write("codex runner-owned tree cleanup failed; retaining the tree\n")),
+  );
 }
 
-async function createHandle(child: SupervisorProcess, expectedUid: number, deadlines: LauncherDeadlines): Promise<CodexRootHandle> {
+/** A generic supervised effect launch. Unlike {@link launchCodexRoot}, it creates
+ * no provider HOME/config tree: the trusted caller supplies a fully replaced env
+ * and an already-screened absolute executable/argv. */
+export interface CodexEffectLaunchSpec {
+  readonly identity: "command" | "worker_pat";
+  readonly command: string;
+  readonly args: readonly string[];
+  readonly cwd: string;
+  readonly env: NodeJS.ProcessEnv;
+  readonly supervisorBin: string;
+  /** Optional UUID token for the supervisor's fixed
+   * `/tmp/uzi-codex-command-<token>` cleanup path. */
+  readonly cleanupToken?: string;
+}
+
+export async function launchCodexEffectRoot(
+  spec: CodexEffectLaunchSpec,
+  deps: LauncherDeps = {},
+): Promise<CodexRootHandle> {
+  const profileEnv = deps.env ?? process.env;
+  if (!uidSplitActive(profileEnv)) {
+    throw new CodexUnsupportedProfileError("Codex effect roots require the A1 uid split; refusing to launch");
+  }
+  if (spec.supervisorBin !== SUPERVISOR_BIN) {
+    throw new Error(`supervisorBin must equal the immutable image path ${SUPERVISOR_BIN}`);
+  }
+  if (!isAbsolute(spec.command) || !isAbsolute(spec.cwd)) {
+    throw new Error("effect command and cwd must be absolute paths");
+  }
+  const expectedUid = spec.identity === "command"
+    ? (deps.resolveCommandUid ?? (() => COMMAND_UID))()
+    : (deps.resolveWorkerUid ?? (() => process.getuid?.() ?? WORKER_UID))();
+  const requiredUid = spec.identity === "command" ? COMMAND_UID : WORKER_UID;
+  if (expectedUid !== requiredUid) {
+    throw new Error(`effect identity resolved unexpected uid ${String(expectedUid)}`);
+  }
+  if (spec.cleanupToken !== undefined && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(spec.cleanupToken)) {
+    throw new Error("effect cleanup token must be a lowercase UUID");
+  }
+  const supervisorArgv = [
+    "--expect-uid", String(expectedUid),
+    ...(spec.cleanupToken ? ["--cleanup-token", spec.cleanupToken] : []),
+    ...(spec.identity === "worker_pat" ? ["--drop-controller-caps"] : []),
+    "--", spec.command, ...spec.args,
+  ];
+  const wrapped = spec.identity === "command"
+    ? commandRootCommand(spec.supervisorBin, supervisorArgv)
+    : workerBoundaryCommand(spec.supervisorBin, supervisorArgv);
+  const child = (deps.spawnSupervisor ?? defaultSpawnSupervisor)(wrapped.command, wrapped.args, {
+    cwd: spec.cwd,
+    env: { ...spec.env },
+    stdio: ["pipe", "pipe", "pipe", "pipe", "pipe"],
+  });
+  return createHandle(child, expectedUid, { ...DEFAULT_DEADLINES, ...deps.deadlines }, "command");
+}
+
+async function createHandle(
+  child: SupervisorProcess,
+  expectedUid: number,
+  deadlines: LauncherDeadlines,
+  kind: CodexRootKind,
+): Promise<CodexRootHandle> {
   const control = asWritable(child.stdio[3], "control");
   const evidence = asReadable(child.stdio[4], "evidence");
 
@@ -408,6 +684,7 @@ async function createHandle(child: SupervisorProcess, expectedUid: number, deadl
   const pending = new Map<number, { resolve: (e: SnapshotEvidence | DisposeEvidence) => void; reject: (err: Error) => void }>();
   let failure: Error | undefined;
   let startedEvent: StartedEvidence | undefined;
+  let childExitEvent: ChildExitEvidence | undefined;
   let exited = false;
   let exitInfo: { code: number | null; signal: NodeJS.Signals | null } | undefined;
   let disposeInFlight = false;
@@ -418,6 +695,13 @@ async function createHandle(child: SupervisorProcess, expectedUid: number, deadl
   let resolveStarted!: (e: StartedEvidence) => void;
   let rejectStarted!: (err: Error) => void;
   const startedPromise = new Promise<StartedEvidence>((resolve, reject) => { resolveStarted = resolve; rejectStarted = reject; });
+  let resolveChildExit!: (e: ChildExitEvidence) => void;
+  let rejectChildExit!: (err: Error) => void;
+  const childExitPromise = new Promise<ChildExitEvidence>((resolve, reject) => {
+    resolveChildExit = resolve;
+    rejectChildExit = reject;
+  });
+  void childExitPromise.catch(() => undefined);
   let resolveExit!: (info: { code: number | null; signal: NodeJS.Signals | null }) => void;
   const exitPromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => { resolveExit = resolve; });
   let resolveFailed!: (err: Error) => void;
@@ -428,6 +712,7 @@ async function createHandle(child: SupervisorProcess, expectedUid: number, deadl
       failure = err;
       resolveFailed(err);
       if (!startedEvent) rejectStarted(err);
+      if (!childExitEvent) rejectChildExit(err);
     }
     for (const p of pending.values()) p.reject(failure);
     pending.clear();
@@ -486,6 +771,20 @@ async function createHandle(child: SupervisorProcess, expectedUid: number, deadl
         if (waiter && typeof id === "number") { pending.delete(id); waiter.resolve(record as unknown as SnapshotEvidence | DisposeEvidence); }
         return;
       }
+      case "child_exit": {
+        const code = record.code;
+        if (!Number.isInteger(code) || Number(code) < 0 || Number(code) > 255 || childExitEvent) {
+          fail(new Error("malformed or duplicate child_exit evidence"));
+          return;
+        }
+        const ev: ChildExitEvidence = { event: "child_exit", code: Number(code) };
+        childExitEvent = ev;
+        resolveChildExit(ev);
+        if (kind === "provider") {
+          fail(new Error(`supervised provider child exited unexpectedly (code=${ev.code})`));
+        }
+        return;
+      }
       case "abnormal": {
         fail(new Error(`supervisor abnormal: ${String(record.reason ?? "unknown")}`));
         return;
@@ -536,17 +835,34 @@ async function createHandle(child: SupervisorProcess, expectedUid: number, deadl
     return ev;
   }
 
+  async function waitChild(timeoutMs = deadlines.exit): Promise<ChildExitEvidence> {
+    if (childExitEvent) return childExitEvent;
+    if (failure) throw failure;
+    return withDeadline(childExitPromise, timeoutMs, "supervised child exit");
+  }
+
   async function dispose(timeoutMs = 2000): Promise<DisposeOutcome> {
     if (cleanDisposed && lastDrained) return { clean: true, event: lastDrained };
     if (failure) return { clean: false, reason: failure.message };
     if (exited) return { clean: false, reason: `supervisor already exited (code=${String(exitInfo?.code)})` };
     if (control.destroyed) return { clean: false, reason: "control channel unavailable; disposal unconfirmed" };
     disposeInFlight = true;
+    const deadlineAt = Date.now() + Math.max(0, timeoutMs);
+    const remaining = (): number => Math.max(0, Math.ceil(deadlineAt - Date.now()));
     try {
       const id = nextId++;
+      // Keep part of the caller's total budget for observing the supervisor's clean exit
+      // after it reports drained. Giving drain the entire budget makes a successful drain
+      // race an immediate 0ms exit-confirmation timeout.
+      const exitReserve = Math.min(deadlines.exit, Math.max(1, Math.floor(remaining() / 5)));
+      const drainBudget = Math.max(0, remaining() - exitReserve);
       let ev: SnapshotEvidence | DisposeEvidence;
       try {
-        ev = await withDeadline(sendAndWait(id, { op: "dispose", id, timeoutMs }), deadlines.dispose + timeoutMs, "dispose");
+        ev = await withDeadline(
+          sendAndWait(id, { op: "dispose", id, timeoutMs: drainBudget }),
+          Math.min(remaining(), drainBudget),
+          "dispose",
+        );
       } catch (error) {
         return { clean: false, reason: error instanceof Error ? error.message : String(error) };
       }
@@ -561,7 +877,7 @@ async function createHandle(child: SupervisorProcess, expectedUid: number, deadl
       // Drained reported — a clean supervisor exit (0) must confirm it.
       let exit: { code: number | null; signal: NodeJS.Signals | null };
       try {
-        exit = await withDeadline(exitPromise, deadlines.exit, "supervisor exit");
+        exit = await withDeadline(exitPromise, Math.min(remaining(), exitReserve), "supervisor exit");
       } catch (error) {
         return { clean: false, reason: error instanceof Error ? error.message : String(error), event: disposeEv };
       }
@@ -593,6 +909,7 @@ async function createHandle(child: SupervisorProcess, expectedUid: number, deadl
     supervisorPid: child.pid,
     transport: { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr },
     snapshot,
+    waitChild,
     dispose,
     get failed() { return failure; },
     whenFailed,

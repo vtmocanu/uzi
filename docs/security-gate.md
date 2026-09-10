@@ -75,7 +75,10 @@ canary is an instrument failure (exit 2), never a clean run.
   `auth.ValidateCSRF(...)`). It is **file-glob scoped** to the known
   handler files (`worker_*.go`, `controller_*.go`, `judge_worker.go`,
   `task_review.go`, excluding `worker_upgrade_summary.go`, which is a
-  legitimately cookie-capable `RequireUser` route). A new worker handler
+  legitimately cookie-capable `RequireUser` route). The DARK Codex worker
+  route `worker_codex.go` (issue #1171) is a Bearer-only `RequireWorker`
+  handler and is **already covered by the `worker_*.go` glob** — no pattern
+  change was needed to bring it under this invariant. A new worker handler
   added under a differently-named file escapes it until the glob is widened
   — code review is the backstop for that gap. (There is no route-enumeration
   test asserting the cookie-free property today: `route_limiter_mounts_test.go`
@@ -90,6 +93,41 @@ canary is an instrument failure (exit 2), never a clean run.
   key's presence would false-positive on every legitimate
   `{ ...baseOptions, ... }` spread site. That gap is a review + test concern,
   not a semgrep one.
+- **`codex-fixed-constructor.yml`** (DARK Codex, issue #1171) — the Codex run
+  lane is composed at exactly two sanctioned construction sites: `main.ts`
+  news up the production `CodexExecutor`, and `codex/codex-executor.ts` is the
+  composition root for the `CodexHarness` (run lane) and `CodexAdviceHarness`
+  (advice lane). It matches `new CodexHarness/CodexAdviceHarness/CodexExecutor(...)`
+  anywhere else under `agent/src` (those two files are `paths.exclude`d), so a
+  hand-rolled alternate construction that bypasses the production composition
+  (claim-aware dark selection, redactor wiring, auth-mode bridge, `withBoundary`
+  reap lifecycle) fires. **Reliability boundary:** it matches a construction
+  **site**, not a semantic "wrong endpoint" — that the lane is stood up against
+  the correct provider root / credential / auth mode / claim is the launcher's
+  `validateLaunchContract` plus code review, not this syntactic match.
+- **`codex-no-direct-spawn.yml`** (DARK Codex, issue #1171) — raw
+  `child_process` creation inside `agent/src/codex/**`
+  (`spawn`/`spawnSync`/`exec`/`execSync`/`execFile`/`execFileSync`/`fork`) is
+  confined to `launcher.ts`, the one supervisor-launch/provisioning trust anchor
+  excluded by path. Shell, fileop and permit-held boundary actions reserve and
+  register a supervisor root before their process streams are exposed. A raw spawn in any
+  other Codex file (e.g. `broker.ts`) fires. **Reliability boundary:** a
+  syntactic, file-glob-scoped match on the direct call APIs — it does not trace
+  a spawn hidden behind a helper in another module, and a spawner added under a
+  new sanctioned seam must be added to the exclude list deliberately.
+- **`codex-durability-sink-boundary.yml`** (DARK Codex, issue #1171) — the
+  runner durability/publication sinks in `agent/src/runner.ts` must not spawn a
+  raw subprocess (all seven `child_process` forms:
+  `spawn`/`spawnSync`/`exec`/`execSync`/`execFile`/`execFileSync`/`fork`, kept in
+  sync with `codex-no-direct-spawn.yml` so an idiomatic `execSync` git bypass
+  cannot evade it). The runner holds the
+  run's PAT, so a raw `spawn("git", ...)` would be a credential-bearing git
+  bypass of the injected git client and the `withBoundary` reap barrier;
+  `runner.ts` imports no `child_process` today, so the clean tree is zero.
+  **Reliability boundary:** it catches a raw-subprocess PAT bypass only. The
+  deeper "publication must be **inside** the reap barrier" ordering property is
+  a review concern covered by `agent/test/runner-codex-sinks.test.ts`, not this
+  match, and a bypass routed through a helper in another module is out of scope.
 
 ## Division of labour with CodeQL
 

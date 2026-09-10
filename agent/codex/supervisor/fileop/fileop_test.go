@@ -655,3 +655,341 @@ func TestConcurrentMutatorNeverEscapes(t *testing.T) {
 	close(stop)
 	<-done
 }
+
+// TestApplyRoundTrip proves the fd-anchored find-and-replace edits a unique match
+// in place and reports the new size, then round-trips through a read.
+func TestApplyRoundTrip(t *testing.T) {
+	s, _ := newTestServer(t)
+	wantOK(t, s.handle(request{ID: 1, Op: opWrite, Path: "src.txt", Data: b64("alpha BETA gamma")}))
+	resp := s.handle(request{ID: 2, Op: opApply, Path: "src.txt", Old: b64("BETA"), Data: b64("delta")})
+	wantOK(t, resp)
+	if got := resp["size"]; got != int64(len("alpha delta gamma")) {
+		t.Fatalf("apply size = %v, want %d", got, len("alpha delta gamma"))
+	}
+	r := s.handle(request{ID: 3, Op: opRead, Path: "src.txt"})
+	wantOK(t, r)
+	if got := string(respData(t, r)); got != "alpha delta gamma" {
+		t.Fatalf("post-apply read = %q, want %q", got, "alpha delta gamma")
+	}
+}
+
+// TestApplyGrowsAndShrinks proves the staged replacement body carries exactly the
+// requested bytes when it is shorter OR longer than the original.
+func TestApplyGrowsAndShrinks(t *testing.T) {
+	s, _ := newTestServer(t)
+	wantOK(t, s.handle(request{ID: 1, Op: opWrite, Path: "f", Data: b64("keep <MARK> keep")}))
+	// Longer replacement.
+	wantOK(t, s.handle(request{ID: 2, Op: opApply, Path: "f", Old: b64("<MARK>"), Data: b64("a much longer replacement body")}))
+	r := s.handle(request{ID: 3, Op: opRead, Path: "f"})
+	wantOK(t, r)
+	if got := string(respData(t, r)); got != "keep a much longer replacement body keep" {
+		t.Fatalf("grow apply = %q", got)
+	}
+	// Shorter replacement must truncate the tail away (no leftover bytes).
+	wantOK(t, s.handle(request{ID: 4, Op: opApply, Path: "f", Old: b64("a much longer replacement body"), Data: b64("x")}))
+	r2 := s.handle(request{ID: 5, Op: opRead, Path: "f"})
+	wantOK(t, r2)
+	if got := string(respData(t, r2)); got != "keep x keep" {
+		t.Fatalf("shrink apply = %q, want %q", got, "keep x keep")
+	}
+}
+
+// TestApplyNoMatchAndAmbiguous proves the uniqueness contract: an absent match is
+// E_NO_MATCH and a repeated match is E_AMBIGUOUS, and NEITHER touches the file.
+func TestApplyNoMatchAndAmbiguous(t *testing.T) {
+	s, _ := newTestServer(t)
+	wantOK(t, s.handle(request{ID: 1, Op: opWrite, Path: "f", Data: b64("one two two three")}))
+	wantErr(t, s.handle(request{ID: 2, Op: opApply, Path: "f", Old: b64("absent"), Data: b64("x")}), codeNoMatch)
+	wantErr(t, s.handle(request{ID: 3, Op: opApply, Path: "f", Old: b64("two"), Data: b64("x")}), codeAmbiguous)
+	// The file is untouched by either rejected edit.
+	r := s.handle(request{ID: 4, Op: opRead, Path: "f"})
+	wantOK(t, r)
+	if got := string(respData(t, r)); got != "one two two three" {
+		t.Fatalf("file mutated by a rejected apply: %q", got)
+	}
+}
+
+// TestApplyRejectsEmptyOldAndBadBase64 proves the create/overwrite case is NOT this
+// op (empty old is E_MALFORMED) and that malformed base64 in either body is refused.
+func TestApplyRejectsEmptyOldAndBadBase64(t *testing.T) {
+	s, _ := newTestServer(t)
+	wantOK(t, s.handle(request{ID: 1, Op: opWrite, Path: "f", Data: b64("body")}))
+	wantErr(t, s.handle(request{ID: 2, Op: opApply, Path: "f", Old: "", Data: b64("x")}), codeMalformed)
+	wantErr(t, s.handle(request{ID: 3, Op: opApply, Path: "f", Old: "!!not-base64!!", Data: b64("x")}), codeMalformed)
+	wantErr(t, s.handle(request{ID: 4, Op: opApply, Path: "f", Old: b64("body"), Data: "!!not-base64!!"}), codeMalformed)
+}
+
+// TestApplyNonexistentIsNotFound proves apply edits an EXISTING file only (no
+// O_CREAT); a missing target is E_NOT_FOUND, never silently created.
+func TestApplyNonexistentIsNotFound(t *testing.T) {
+	s, _ := newTestServer(t)
+	wantErr(t, s.handle(request{ID: 1, Op: opApply, Path: "ghost", Old: b64("x"), Data: b64("y")}), codeNotFound)
+	// And it did not create the file.
+	st := s.handle(request{ID: 2, Op: opStat, Path: "ghost"})
+	wantOK(t, st)
+	if exists, _ := st["exists"].(bool); exists {
+		t.Fatalf("apply created a nonexistent file")
+	}
+}
+
+// TestApplyRejectsDirAndDotGit proves apply refuses a directory target (E_IS_DIR)
+// and any .git component (E_DENIED), the same jail every other op enforces.
+func TestApplyRejectsDirAndDotGit(t *testing.T) {
+	s, _ := newTestServer(t)
+	wantOK(t, s.handle(request{ID: 1, Op: opMkdir, Path: "d"}))
+	wantErr(t, s.handle(request{ID: 2, Op: opApply, Path: "d", Old: b64("x"), Data: b64("y")}), codeIsDir)
+	wantErr(t, s.handle(request{ID: 3, Op: opApply, Path: ".git/config", Old: b64("x"), Data: b64("y")}), codeDenied)
+	// A nested .git component is denied too (the case-sensitive repo-git jail).
+	wantErr(t, s.handle(request{ID: 4, Op: opApply, Path: "sub/.git/x", Old: b64("x"), Data: b64("y")}), codeDenied)
+}
+
+// TestApplyOversizeResult proves the resulting file is bounded: a replacement that
+// would push the file past maxWrite is E_OVERSIZE and leaves the file untouched.
+func TestApplyOversizeResult(t *testing.T) {
+	s, root := newTestServer(t)
+	s.maxRead = 64
+	s.maxWrite = 64
+	if err := os.WriteFile(filepath.Join(root, "f"), []byte("<M>"), 0o600); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	wantErr(t, s.handle(request{ID: 1, Op: opApply, Path: "f", Old: b64("<M>"), Data: b64(strings.Repeat("z", 128))}), codeOversize)
+	// Untouched: the pre-check rejects before a stage file is created.
+	body, err := os.ReadFile(filepath.Join(root, "f"))
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if string(body) != "<M>" {
+		t.Fatalf("file mutated by an oversize apply: %q", body)
+	}
+}
+
+// TestApplyStagingWriteFailurePreservesOriginal proves the replacement never
+// truncates the live target. Even after a prefix reaches the staged file, an error
+// leaves the old content and mode intact and removes the temporary file.
+func TestApplyStagingWriteFailurePreservesOriginal(t *testing.T) {
+	s, root := newTestServer(t)
+	target := filepath.Join(root, "target")
+	if err := os.WriteFile(target, []byte("before OLD after"), 0o640); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if err := os.Chmod(target, 0o640); err != nil {
+		t.Fatalf("chmod seed: %v", err)
+	}
+	s.stageWrite = func(fd int, data []byte) error {
+		if len(data) < 3 {
+			t.Fatalf("replacement unexpectedly short: %d", len(data))
+		}
+		if _, err := unix.Write(fd, data[:3]); err != nil {
+			t.Fatalf("write staged prefix: %v", err)
+		}
+		return unix.EIO
+	}
+
+	wantErr(t, s.handle(request{ID: 1, Op: opApply, Path: "target", Old: b64("OLD"), Data: b64("NEW BODY")}), codeIO)
+	body, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read original: %v", err)
+	}
+	if got := string(body); got != "before OLD after" {
+		t.Fatalf("failed apply changed live target to %q", got)
+	}
+	var st unix.Stat_t
+	if err := unix.Stat(target, &st); err != nil {
+		t.Fatalf("stat original: %v", err)
+	}
+	if got := st.Mode & 0o7777; got != 0o640 {
+		t.Fatalf("failed apply changed target mode to %#o", got)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatalf("list root: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "target" {
+		t.Fatalf("failed apply left staged files: %v", entries)
+	}
+}
+
+// TestApplyRenameFailurePreservesOriginal proves a failure after the replacement is
+// fully staged and synced still leaves the target intact and cleans the stage file.
+func TestApplyRenameFailurePreservesOriginal(t *testing.T) {
+	s, root := newTestServer(t)
+	target := filepath.Join(root, "target")
+	if err := os.WriteFile(target, []byte("left OLD right"), 0o600); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	s.stageRename = func(int, string, int, string, uint) error { return unix.EIO }
+
+	wantErr(t, s.handle(request{ID: 1, Op: opApply, Path: "target", Old: b64("OLD"), Data: b64("NEW")}), codeIO)
+	body, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read original: %v", err)
+	}
+	if got := string(body); got != "left OLD right" {
+		t.Fatalf("failed rename changed live target to %q", got)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatalf("list root: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "target" {
+		t.Fatalf("failed rename left staged files: %v", entries)
+	}
+}
+
+// TestApplyPreservesTargetModeAndReplacesContent proves a successful rename carries
+// the complete new body and the original target's permission bits.
+func TestApplyPreservesTargetModeAndReplacesContent(t *testing.T) {
+	s, root := newTestServer(t)
+	target := filepath.Join(root, "target")
+	if err := os.WriteFile(target, []byte("alpha OLD omega"), 0o751); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if err := os.Chmod(target, 0o751); err != nil {
+		t.Fatalf("chmod seed: %v", err)
+	}
+
+	wantOK(t, s.handle(request{ID: 1, Op: opApply, Path: "target", Old: b64("OLD"), Data: b64("replacement body")}))
+	body, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read replacement: %v", err)
+	}
+	if got := string(body); got != "alpha replacement body omega" {
+		t.Fatalf("replacement content = %q", got)
+	}
+	var st unix.Stat_t
+	if err := unix.Stat(target, &st); err != nil {
+		t.Fatalf("stat replacement: %v", err)
+	}
+	if got := st.Mode & 0o7777; got != 0o751 {
+		t.Fatalf("replacement mode = %#o, want %#o", got, uint32(0o751))
+	}
+}
+
+// TestApplyPinsNestedParentForReadAndRename swaps a nested parent after resolveParent
+// has pinned it. The target read and replacement rename must both use that same dirfd;
+// reopening the full path from root would read the substitute directory's file and
+// write those bytes into the pinned original directory.
+func TestApplyPinsNestedParentForReadAndRename(t *testing.T) {
+	s, root := newTestServer(t)
+	nested := filepath.Join(root, "nested")
+	pinned := filepath.Join(root, "pinned")
+	if err := os.Mkdir(nested, 0o755); err != nil {
+		t.Fatalf("mkdir nested: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(nested, "target"), []byte("pinned OLD body"), 0o600); err != nil {
+		t.Fatalf("seed pinned target: %v", err)
+	}
+	s.beforeApplyOpen = func() {
+		if err := os.Rename(nested, pinned); err != nil {
+			t.Fatalf("move pinned parent: %v", err)
+		}
+		if err := os.Mkdir(nested, 0o755); err != nil {
+			t.Fatalf("create substitute parent: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(nested, "target"), []byte("substitute OLD body"), 0o600); err != nil {
+			t.Fatalf("seed substitute target: %v", err)
+		}
+	}
+
+	wantOK(t, s.handle(request{ID: 1, Op: opApply, Path: "nested/target", Old: b64("OLD"), Data: b64("NEW")}))
+	pinnedBody, err := os.ReadFile(filepath.Join(pinned, "target"))
+	if err != nil {
+		t.Fatalf("read pinned target: %v", err)
+	}
+	if got := string(pinnedBody); got != "pinned NEW body" {
+		t.Fatalf("pinned target = %q, want %q", got, "pinned NEW body")
+	}
+	substituteBody, err := os.ReadFile(filepath.Join(nested, "target"))
+	if err != nil {
+		t.Fatalf("read substitute target: %v", err)
+	}
+	if got := string(substituteBody); got != "substitute OLD body" {
+		t.Fatalf("substitute target changed to %q", got)
+	}
+}
+
+// TestApplySymlinkSwapRefused proves apply refuses a target swapped to a symlink
+// (E_SYMLINK) rather than following it — the fd-anchored no-symlink discipline.
+func TestApplySymlinkSwapRefused(t *testing.T) {
+	s, root := newTestServer(t)
+	wantOK(t, s.handle(request{ID: 1, Op: opWrite, Path: "swap", Data: b64("legit CONTENT here")}))
+	if err := os.Remove(filepath.Join(root, "swap")); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	if err := os.Symlink("/etc/passwd", filepath.Join(root, "swap")); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	wantErr(t, s.handle(request{ID: 2, Op: opApply, Path: "swap", Old: b64("root"), Data: b64("pwned")}), codeSymlink)
+}
+
+// TestApplyConcurrentMutatorNeverEscapes hammers apply on a relpath a background
+// mutator flips between a safe regular file and a symlink to an OUTSIDE secret.
+// Every apply either edits the in-jail SAFE file or is refused (E_SYMLINK /
+// E_NOT_FOUND / E_NO_MATCH) — the outside secret is NEVER opened or overwritten,
+// and the secret file's bytes are never changed by the helper.
+func TestApplyConcurrentMutatorNeverEscapes(t *testing.T) {
+	s, root := newTestServer(t)
+
+	outside := t.TempDir()
+	secret := filepath.Join(outside, "secret.txt")
+	if err := os.WriteFile(secret, []byte("SECRET"), 0o600); err != nil {
+		t.Fatalf("write secret: %v", err)
+	}
+
+	race := filepath.Join(root, "race")
+	tmpReg := filepath.Join(root, ".stage-reg")
+	tmpLink := filepath.Join(root, ".stage-link")
+	if err := os.WriteFile(race, []byte("SAFE"), 0o600); err != nil {
+		t.Fatalf("seed race: %v", err)
+	}
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			os.Remove(tmpLink)
+			if os.Symlink(secret, tmpLink) == nil {
+				os.Rename(tmpLink, race)
+			}
+			os.Remove(tmpReg)
+			if os.WriteFile(tmpReg, []byte("SAFE"), 0o600) == nil {
+				os.Rename(tmpReg, race)
+			}
+		}
+	}()
+
+	for i := 0; i < 4000; i++ {
+		r := s.handle(request{ID: i, Op: opApply, Path: "race", Old: b64("SAFE"), Data: b64("EDITED")})
+		if ok, _ := r["ok"].(bool); !ok {
+			// A refusal is fine; it must be one of the fd-anchored no-symlink outcomes,
+			// never a followed escape onto the outside secret.
+			wantErrOneOf(t, r, codeSymlink, codeNotFound, codeNoMatch)
+		}
+		// The outside secret must never be touched by any apply, regardless of outcome.
+		if body, err := os.ReadFile(secret); err == nil && string(body) != "SECRET" {
+			t.Fatalf("apply escaped and overwrote the outside secret: %q", body)
+		}
+	}
+	close(stop)
+	<-done
+}
+
+// TestApplyAtomicReplacement exercises the successful staged rename through the
+// public request path. The anti-redirect property under a concurrent mutator is
+// covered by TestApplySymlinkSwapRefused and TestApplyConcurrentMutatorNeverEscapes.
+func TestApplyAtomicReplacement(t *testing.T) {
+	s, _ := newTestServer(t)
+	wantOK(t, s.handle(request{ID: 1, Op: opWrite, Path: "target", Data: b64("hello WORLD")}))
+	wantOK(t, s.handle(request{ID: 2, Op: opApply, Path: "target", Old: b64("WORLD"), Data: b64("THERE")}))
+	r := s.handle(request{ID: 3, Op: opRead, Path: "target"})
+	wantOK(t, r)
+	if got := string(respData(t, r)); got != "hello THERE" {
+		t.Fatalf("atomic replacement = %q, want %q", got, "hello THERE")
+	}
+}

@@ -22,9 +22,11 @@
 //     per-role grants; the harness uses it to configure the thread/turn.
 //   - `sessionInspect` backs {@link inspectSession}.
 //
-// SECURITY: the provider credential is a PRIVATE construction input; it flows only into
-// the launch spec (→ the app-server's env), NEVER into a thread/turn param, a frame, a
-// tool result or a log line. This module NEVER logs raw frames, tokens or bodies.
+// SECURITY: pinned app-server auth receives the provider credential only through its
+// private construction input and exchanges it on the initialize/login/refresh transport
+// lane. The transitional env credential path is mutually exclusive. Neither path exposes
+// auth to a thread/turn param, model callback broker, tool result or log line. This module
+// NEVER logs raw frames, tokens or bodies.
 //
 // EVENT DECODE (app-server frame → neutral event), authoritative rules 1/3/8/9:
 //   thread/started            → `initialized` (the model-bearing init; carries the
@@ -32,10 +34,14 @@
 //   turn/started              → `activity`
 //   item/completed (agent msg)→ `frame` (text/thinking items + call-basis usage + model)
 //   item/* (deltas, other)    → `activity`  (Codex item updates are activity)
-//   item/tool/call (id-bearing)→ intercepted: broker route + `transport.respond`, then
-//                               yielded as `activity` (NOT a frame)
-//   other server→client req   → answered with a fail-closed JSON-RPC method error, then
-//                               yielded as `activity`
+//   item/tool/call (id-bearing)→ intercepted: broker route + `transport.respond`; a DENIED,
+//                               non-signal, delegation or child/foreign/stale call is yielded
+//                               as `activity` (NOT a frame), while an ACCEPTED ROOT SIGNAL call
+//                               (submit_plan/signal_done/checkpoint/progress/questions) ALSO
+//                               yields a main-origin `frame` carrying the scanned `signals` so
+//                               the run-lane reducer folds them (the model reply is unchanged)
+//   auth refresh request      → narrow auth owner (never broker), then `activity`
+//   other server→client req   → fail-closed JSON-RPC method error, then `activity`
 //   turn/completed            → `turn_finished` (decoded terminal; success/failed by
 //                               status), then the iterator closes
 // ERROR PRECEDENCE (run-lane, rule 9): a local watchdog/cancel (the owner's aborted
@@ -45,6 +51,8 @@
 // {@link CodexHarnessError} throw (Claude's clean-EOF `exhausted` is unaffected).
 
 import { renderCodexRun } from "./render.js";
+import { buildCodexDynamicTools } from "./dynamic-tools.js";
+import { CODEX_DELEGATE_TOOLS, CODEX_SIGNAL_TOOLS, canonicalizeCodexToolName } from "./broker.js";
 import { normalizeCodexStatus, normalizeCodexTerminalErrors, normalizeCodexUsage } from "./terminal-normalize.js";
 
 import type { Logger } from "../log.js";
@@ -63,8 +71,10 @@ import type {
   RunTurnRequest,
   SessionPresence,
   ToolDisposal,
+  TurnSignals,
 } from "../harness.js";
 import type { CallbackResult, CodexCallbackBroker } from "./broker.js";
+import type { CodexAppServerAuthSession } from "./appserver-auth.js";
 import type { ExecutionRegistry, RegisteredRoot } from "./registry.js";
 import type { CodexNotification, CodexTransport } from "./transport.js";
 import type { RenderedCodexRun } from "./render.js";
@@ -98,8 +108,9 @@ export interface CodexProviderConfig {
 }
 
 /** The spec the harness builds and hands to {@link CodexHarnessOptions.launchRoot}. It
- *  carries only trusted, launcher-fixed values plus the per-run home/workspace; the
- *  credential rides here (→ the app-server env) and never anywhere model-visible. */
+ *  carries only trusted, launcher-fixed values plus the per-run home/workspace. Managed
+ *  app-server auth keeps the credential out of this shape; the optional legacy
+ *  transitional credential remains private and never becomes model-visible. */
 export interface CodexLaunchRootSpec {
   readonly kind: "provider";
   readonly provider: CodexProviderConfig;
@@ -108,6 +119,9 @@ export interface CodexLaunchRootSpec {
   readonly cwd: string;
   /** The runner-writable owned data root for the per-launch HOME/CODEX_HOME/XDG trees. */
   readonly ownedDataRoot: string;
+  /** Executor-owned resume bit. Production derives the only allowed staging path from
+   * ownedDataRoot; no caller- or model-supplied source path crosses the launcher. */
+  readonly seedSession?: boolean;
   /** The provider credential; PRIVATE — the seam forwards it to the launcher env only. */
   readonly credentialValue?: string;
 }
@@ -127,6 +141,20 @@ export type LaunchRootSeam = (spec: CodexLaunchRootSpec) => Promise<CodexLaunchR
 /** The injected session-presence seam backing {@link CodexHarness.inspectSession}. */
 export type SessionInspectSeam = (id: string) => Promise<SessionPresence>;
 
+/**
+ * A per-child-thread demux sink (PRD #1171 m3, part C). The m2
+ * {@link CodexDelegationRunner} needs a per-child `ChildThreadController.notifications()`
+ * over the SAME app-server transport, but `CodexTransport.notifications()` is
+ * single-consumer (owned by the root loop). So a delegation callback registers a sink for
+ * its child thread id via {@link CodexHarness.registerChildSink}; the root loop routes
+ * every frame carrying that thread id into the sink and leaves every root frame on the root
+ * loop. When no sink is registered the root path is BYTE-IDENTICAL to before the demux.
+ */
+export interface CodexChildSink {
+  /** Deliver one demuxed child-thread frame to the child controller's stream. */
+  push(note: CodexNotification): void;
+}
+
 export interface CodexHarnessOptions {
   readonly registry: ExecutionRegistry;
   readonly launchRoot: LaunchRootSeam;
@@ -140,7 +168,10 @@ export interface CodexHarnessOptions {
   /** Defaults to {@link renderCodexRun}; injectable for tests. */
   readonly render?: (request: RunTurnRequest) => RenderedCodexRun;
   readonly sessionInspect: SessionInspectSeam;
-  /** PRIVATE provider credential; never model-visible, never logged, never in a frame. */
+  /** Pinned app-server authentication owner. This narrow transport seam is never
+   *  exposed to the callback broker or model. */
+  readonly appServerAuth?: CodexAppServerAuthSession;
+  /** Transitional pre-auth integration input. Mutually exclusive with appServerAuth. */
   readonly credentialValue?: string;
 }
 
@@ -152,6 +183,16 @@ function asObject(v: unknown): Record<string, unknown> | undefined {
 
 function asString(v: unknown): string | undefined {
   return typeof v === "string" ? v : undefined;
+}
+
+/** The app-server thread id a decoded notification carries, or undefined when it carries
+ *  none. Lifecycle frames carry it top-level; `activity` frames (item/completed,
+ *  item/tool/call, deltas) carry it in `params.threadId`. Used by the child-sink demux to
+ *  decide whether a frame belongs to a delegated child thread. */
+function noteThreadId(note: CodexNotification): string | undefined {
+  if (note.kind !== "activity") return note.threadId;
+  const params = asObject(note.params);
+  return asString(params?.threadId);
 }
 
 /** Extract non-empty text off an item, from a bare `text` string and/or a `content`
@@ -175,6 +216,15 @@ function extractText(item: Record<string, unknown>): string[] {
  *  of the unadmitted root so it cannot hang the setup throw. */
 const REGISTRY_ADMISSION_TEARDOWN_DEADLINE_MS = 1000;
 
+/** What {@link CodexHarness.routeToolCall} hands back to {@link CodexHarness.mapNote} on the
+ *  INLINE path when the broker ACCEPTED a TRUSTED ROOT workflow-signal callback: the scanned
+ *  `signals` the reducer folds. It exists ONLY for a signal tool the active root turn owns —
+ *  every non-signal, denied, delegation or non-active-turn outcome returns `undefined`, so a
+ *  signals frame is emitted only where the authority gates already admitted a root signal. */
+interface RoutedRootSignal {
+  readonly signals: Readonly<Partial<TurnSignals>>;
+}
+
 // --- the harness --------------------------------------------------------------
 
 export class CodexHarness implements RunHarness {
@@ -182,14 +232,19 @@ export class CodexHarness implements RunHarness {
 
   private readonly registry: ExecutionRegistry;
   private readonly launchRootSeam: LaunchRootSeam;
-  private readonly broker: CodexCallbackBroker;
+  // The active callback broker. NOT `readonly`: turns run strictly sequentially, so the
+  // owner re-points it BETWEEN turns via {@link useBroker} to make the broker's IMMUTABLE
+  // per-(thread,turn) grants genuinely PER-TURN (phase-correct) instead of frozen at
+  // construction. Within a turn it is stable (a turn fully settles before the next starts).
+  private broker: CodexCallbackBroker;
   private readonly provider: CodexProviderConfig;
   private readonly workspace: string;
   private readonly homeDir: string;
   private readonly log: Logger;
   private readonly render: (request: RunTurnRequest) => RenderedCodexRun;
   private readonly sessionInspect: SessionInspectSeam;
-  // Private construction input; NEVER model-visible, never logged, never in a frame.
+  private readonly appServerAuth?: CodexAppServerAuthSession;
+  // Transitional private input; never combined with the pinned app-server auth path.
   private readonly credentialValue?: string;
 
   // Run-level provider root state (launched once, reused across turns; a reused
@@ -203,6 +258,16 @@ export class CodexHarness implements RunHarness {
   private threadId?: string;
   private currentModel?: string;
   private closed = false;
+
+  // Child-thread demux (part C): a registered sink receives every frame carrying its
+  // child thread id off the SAME transport, so a delegation's child turn can consume its
+  // own notifications while the root loop keeps reading. Empty on the non-delegation path.
+  private readonly childSinks = new Map<string, CodexChildSink>();
+  // Concurrently-running DELEGATION callbacks. A delegate callback drives a child turn
+  // whose frames this root loop demuxes, so it CANNOT be awaited inline (that would
+  // deadlock the transport read). It runs in the background, tracked here, and the turn
+  // stream flushes it before ending. Every non-delegate callback stays inline.
+  private readonly pendingToolCalls = new Set<Promise<unknown>>();
 
   // Per-turn state (turns run strictly sequentially).
   private activeTurnId?: string;
@@ -225,11 +290,78 @@ export class CodexHarness implements RunHarness {
     this.log = opts.log;
     this.render = opts.render ?? renderCodexRun;
     this.sessionInspect = opts.sessionInspect;
+    if (opts.appServerAuth !== undefined && opts.credentialValue !== undefined) {
+      throw new CodexHarnessError({
+        category: "protocol",
+        message: "codex harness received conflicting authentication inputs",
+      });
+    }
+    this.appServerAuth = opts.appServerAuth;
     this.credentialValue = opts.credentialValue;
   }
 
   inspectSession(id: string): Promise<SessionPresence> {
     return this.sessionInspect(id);
+  }
+
+  /** Re-point the callback broker used by the NEXT turn. The provider root, transport and
+   *  the harness itself are constructed ONCE and reused; only the broker (its immutable
+   *  per-(thread,turn) grants) changes per turn. Turns run strictly sequentially — the
+   *  next turn's root frames only begin after this returns — so re-pointing between turns
+   *  is race-safe: a root callback reads `this.broker` fresh at dispatch and a stale
+   *  prior-turn root callback is rejected `not_active_turn`, while an in-flight CHILD
+   *  callback holds its own child broker captured at spawn (this swap never touches it).
+   *  Within a turn `this.broker` is stable. The executor uses it
+   *  to serve each turn a PHASE-CORRECT broker (a plan-phase broker denies every file
+   *  write; the implement-phase broker permits them), so the plan turn cannot mutate the
+   *  worktree before its plan is approved. This STRENGTHENS the per-turn grant invariant:
+   *  the grants are genuinely per-turn, not one implement-phase set frozen at construction. */
+  useBroker(broker: CodexCallbackBroker): void {
+    this.broker = broker;
+  }
+
+  // --- child-thread demux (part C) ---------------------------------------------
+  // The delegation seam (built by the CodexExecutor) uses these to run a child turn on
+  // the SAME provider transport as the root: it starts the child thread via
+  // {@link requestOnTransport}, registers a sink for the child thread id so the root loop
+  // routes the child's frames into the child controller, and answers the child's tool
+  // callbacks via {@link respondOnTransport}. Root frames are untouched, so a run with no
+  // subagents behaves exactly as before the demux.
+
+  /** Route frames carrying `threadId` into `sink` instead of the root loop. */
+  registerChildSink(threadId: string, sink: CodexChildSink): void {
+    this.childSinks.set(threadId, sink);
+  }
+
+  /** Stop routing frames for `threadId` to a child sink (the child turn is done). */
+  unregisterChildSink(threadId: string): void {
+    this.childSinks.delete(threadId);
+  }
+
+  /** Send a request on the shared provider transport. The child-thread seam uses it to
+   *  start/interrupt a child thread on the SAME app-server; the child's frames are
+   *  demuxed back via {@link registerChildSink}. Rejects if the provider root is not
+   *  launched (a child turn is only ever started from inside an active root turn). */
+  requestOnTransport<T = unknown>(method: string, params?: unknown, opts?: { signal?: AbortSignal }): Promise<T> {
+    const transport = this.transport;
+    if (!transport) {
+      return Promise.reject(new CodexHarnessError({ category: "protocol", message: "codex provider root is not launched" }));
+    }
+    return transport.request<T>(method, params, opts);
+  }
+
+  /** Answer a child server→client tool-call on the shared transport. Best-effort: an
+   *  undeliverable reply into a closed transport is dropped, never thrown (mirrors the
+   *  root {@link routeToolCall} reply guard). */
+  respondOnTransport(
+    requestId: number | string,
+    response: { readonly result: unknown } | { readonly error: { readonly code: number; readonly message: string } },
+  ): void {
+    try {
+      this.transport?.respond(requestId, response);
+    } catch {
+      /* the transport may already be closed; the child settles via its own terminal/abort */
+    }
   }
 
   startTurn(request: RunTurnRequest): HarnessTurn {
@@ -303,8 +435,10 @@ export class CodexHarness implements RunHarness {
 
   /** Idempotent root iterator/transport closure ONLY. Closes the turn's iteration and
    *  the shared root transport (idempotent); it does NOT drain children, kill groups or
-   *  reap — that is quiesce/reap/dispose. */
-  private async close(): Promise<void> {
+   *  reap — that is quiesce/reap/dispose. Public so the executor's terminal cleanup can
+   *  close the transport (rejecting any straggler request) after the registry reaps the
+   *  provider root; the per-turn `HarnessTurn.close` seam routes here too. */
+  async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
     this.turnClosed = true;
@@ -312,7 +446,12 @@ export class CodexHarness implements RunHarness {
     // Wake a run loop wedged in a pending broker callback so the generator returns rather
     // than hang on that await while the transport is torn down underneath it.
     this.stopTurn?.();
-    await this.transport?.close();
+    this.appServerAuth?.closeAdmissionAndCancel();
+    try {
+      await this.transport?.close();
+    } finally {
+      await this.appServerAuth?.drainInterceptedRequests();
+    }
   }
 
   /** Shared stop path for an owner abort / watchdog / requestStop / close: interrupt the
@@ -353,7 +492,7 @@ export class CodexHarness implements RunHarness {
         return;
       }
       // 1. Ensure the provider root + transport (launched once, reused after).
-      await this.ensureRoot();
+      await this.ensureRoot(request.signal);
       const transport = this.transport;
       const notes = this.notes;
       if (!transport || !notes) {
@@ -406,6 +545,29 @@ export class CodexHarness implements RunHarness {
             message: "codex app-server stream ended before turn completion",
           });
         }
+        // CHILD-THREAD DEMUX (part C). A frame carrying a REGISTERED child thread id is a
+        // delegated child's frame: route its CONTENT to the child controller's sink and
+        // NEVER map/yield that content on the root loop. But routing must still count as
+        // LIVENESS for the root's idle watchdog: the root driveCodexTurn re-arms idle on
+        // every event it consumes (codex-executor.ts), so a bare `continue` here would
+        // starve that re-arm for the whole delegation, and a subagent turn longer than
+        // `idleMs` would falsely trip REASON_IDLE while the child is actively producing.
+        // So after routing, yield a CONTENT-FREE `activity` carrying ONLY the ROOT thread
+        // id (no items, no child text) — enough to re-arm idle without leaking any child
+        // content onto the root frame stream. The reducer treats `activity` as pure
+        // liveness (no message, no frame). The `size > 0` guard keeps the non-delegation
+        // path (no child sinks) BYTE-IDENTICAL to before this edit.
+        if (this.childSinks.size > 0) {
+          const childId = noteThreadId(step.value);
+          if (childId !== undefined) {
+            const sink = this.childSinks.get(childId);
+            if (sink !== undefined) {
+              sink.push(step.value);
+              yield { kind: "activity", sessionId: this.threadId };
+              continue;
+            }
+          }
+        }
         // The broker-callback await (mapNote → routeToolCall → broker.handleToolCall) is
         // itself raced against the owner abort — WITHOUT this, a never-settling broker seam
         // (a model-selected long-running shell) leaves the turn un-cancellable, falsifying
@@ -414,13 +576,21 @@ export class CodexHarness implements RunHarness {
         // at the safety boundary, and a late broker reply is guarded in routeToolCall so it
         // never throws into a closed transport. The happy path is unchanged: a callback
         // that settles normally still replies via transport.respond after the broker settles.
-        const mapped = await Promise.race([this.mapNote(transport, step.value), abortPromise]);
+        const mapped = await Promise.race([this.mapNote(transport, step.value, request.signal), abortPromise]);
         if (mapped === "aborted") {
           this.endTurnOnStop();
           return;
         }
         yield mapped;
-        if (mapped.kind === "turn_finished") return; // close the iterator after the terminal
+        if (mapped.kind === "turn_finished") {
+          // Flush any concurrently-running delegation callbacks: each drives a child turn
+          // that settles (and replies) before this resolves, so the parent spawn_agent
+          // callback has responded by the time the root turn stream closes. A wedged
+          // child self-bounds via its own per-child deadline (delegation.ts), so this
+          // await is finite. The non-delegation path has an empty set and never waits.
+          if (this.pendingToolCalls.size > 0) await Promise.allSettled(this.pendingToolCalls);
+          return; // close the iterator after the terminal
+        }
       }
     } finally {
       if (onAbort) request.signal.removeEventListener("abort", onAbort);
@@ -428,8 +598,15 @@ export class CodexHarness implements RunHarness {
     }
   }
 
-  private async ensureRoot(): Promise<void> {
-    if (this.transport) return;
+  private async ensureRoot(signal?: AbortSignal): Promise<void> {
+    if (this.transport) {
+      // A prior startup may have failed after the root was registered. Re-enter the
+      // pinned auth owner so its poison state remains the explicit failure, and never
+      // proceed merely because a transport object exists.
+      await this.appServerAuth?.authenticate(this.transport, signal);
+      if (!this.notes) this.notes = this.transport.notifications();
+      return;
+    }
     const reservation = this.registry.reserveLaunch("provider");
     if (reservation.kind !== "reserved") {
       throw new CodexHarnessError({ category: "protocol", message: "codex provider launch admission is closed" });
@@ -442,7 +619,7 @@ export class CodexHarness implements RunHarness {
         model: this.currentModel ?? this.provider.model,
         cwd: this.workspace,
         ownedDataRoot: this.homeDir,
-        credentialValue: this.credentialValue,
+        credentialValue: this.appServerAuth === undefined ? this.credentialValue : undefined,
       });
     } catch (error) {
       // The launch aborted before producing a root: settle the reservation so it does
@@ -462,6 +639,9 @@ export class CodexHarness implements RunHarness {
       throw new CodexHarnessError({ category: "protocol", message: "codex provider root failed registry admission" });
     }
     this.transport = launched.transport;
+    // The pinned initialize/initialized/login sequence completes before any thread/model
+    // work. The auth owner has no reference to the model callback broker.
+    await this.appServerAuth?.authenticate(launched.transport, signal);
     // Single-consumer: obtain the notifications iterator exactly once for the root.
     this.notes = launched.transport.notifications();
     this.log.debug("codex provider root launched", { supervisorPid: launched.supervisorPid });
@@ -490,9 +670,14 @@ export class CodexHarness implements RunHarness {
         modelProvider: this.provider.name,
         cwd: this.workspace,
         approvalPolicy: "never",
-        ephemeral: true,
+        // Run roots must persist their rollout under CODEX_HOME so approval and
+        // cooperative-checkpoint root recreation can adopt it and thread/resume.
+        // Child and advice threads remain ephemeral because they are never resumed.
+        ephemeral: false,
+        environments: [],
+        dynamicTools: buildCodexDynamicTools(rendered.leadGrants),
         config: this.threadConfig(),
-        instructions: rendered.leadPrompt.systemPrompt,
+        developerInstructions: rendered.leadPrompt.systemPrompt,
       },
       { signal },
     );
@@ -518,7 +703,7 @@ export class CodexHarness implements RunHarness {
         cwd: this.workspace,
         approvalPolicy: "never",
         config: this.threadConfig(),
-        instructions: rendered.leadPrompt.systemPrompt,
+        developerInstructions: rendered.leadPrompt.systemPrompt,
       },
       { signal: request.signal },
     );
@@ -538,6 +723,10 @@ export class CodexHarness implements RunHarness {
     const params: Record<string, unknown> = {
       threadId,
       input: [{ type: "text", text: rendered.leadPrompt.prompt }],
+      // A cold thread/resume in pinned Codex does not restore the thread/start
+      // environment selection. Reassert the empty selection on every turn so a
+      // resumed root cannot inherit the provider's native execution environment.
+      environments: [],
     };
     if (this.currentModel !== undefined) params.model = this.currentModel;
     if (rendered.lead.modelReasoningEffort !== undefined) params.modelReasoningEffort = rendered.lead.modelReasoningEffort;
@@ -554,11 +743,22 @@ export class CodexHarness implements RunHarness {
   /** Map one decoded {@link CodexNotification} to exactly one {@link HarnessEvent}.
    *  Server→client tool-call requests are intercepted here (routed to the broker and
    *  answered via `transport.respond`) and surfaced as `activity`, never as a frame. */
-  private async mapNote(transport: CodexTransport, note: CodexNotification): Promise<HarnessEvent> {
+  private async mapNote(
+    transport: CodexTransport,
+    note: CodexNotification,
+    signal?: AbortSignal,
+  ): Promise<HarnessEvent> {
     switch (note.kind) {
       case "thread_started":
         // The model-bearing init: carries the model the harness configured, distinct
-        // from the bare turn-start below.
+        // from the bare turn-start below. Bind it to the ACTIVE ROOT thread: a child
+        // `thread/started` (a delegated subagent's) must never latch the root session id
+        // or emit a root `initialized`. The demux already routes a registered child's
+        // frames away, so this is defense-in-depth for the pre-registration window and any
+        // stray/foreign thread id — such a frame is liveness only.
+        if (note.threadId !== this.threadId) {
+          return { kind: "activity", sessionId: note.threadId };
+        }
         return { kind: "initialized", model: this.currentModel, sessionId: note.threadId };
       case "turn_started":
         return { kind: "activity", sessionId: note.threadId };
@@ -571,16 +771,44 @@ export class CodexHarness implements RunHarness {
         if (note.threadId !== this.threadId || note.turnId !== this.activeTurnId) {
           return { kind: "activity", sessionId: note.threadId };
         }
+        // A same-chunk refresh is intercepted before this terminal reaches the queue.
+        // Do not publish success until every accepted auth operation settles; a sticky
+        // protocol poison throws here instead of allowing the terminal through.
+        await this.appServerAuth?.drainInterceptedRequests();
         const terminal = this.decodeTerminal(note);
         this.terminalEmitted = true;
         return { kind: "turn_finished", terminal, sessionId: note.threadId };
       }
       case "activity": {
         if (note.requestId !== undefined) {
+          // Refresh is the only non-tool request admitted here. It is consumed by the
+          // narrow auth owner before the broker lane, so no credential authority becomes
+          // model-visible through a callback.
+          if (await this.appServerAuth?.handleServerRequest(transport, note, signal)) {
+            return { kind: "activity", sessionId: this.threadId };
+          }
           // A server→client request. Only the tool-call lane routes to the broker; any
           // other server-initiated request is answered fail-closed as unsupported.
           if (note.method === "item/tool/call") {
-            await this.routeToolCall(transport, note.requestId, note.params);
+            const routed = await this.routeToolCall(transport, note.requestId, note.params);
+            if (routed !== undefined) {
+              // A TRUSTED ROOT signal callback the broker ACCEPTED (submit_plan/signal_done/
+              // checkpoint/report_progress/questions): surface its scanned signals as a
+              // main-origin frame so the run-lane reducer's foldSignals fires. The model reply
+              // already went out via routeToolCall (replyOf) — this frame is IN ADDITION, never
+              // instead. Every other tool call (denied, non-signal, delegation, or a child/
+              // foreign/stale identity) returns undefined and falls through to the
+              // byte-identical `activity` below.
+              return {
+                kind: "frame",
+                origin: { kind: "main" },
+                attribution: {},
+                items: [],
+                signals: routed.signals,
+                model: this.currentModel,
+                sessionId: this.threadId,
+              };
+            }
           } else {
             try {
               transport.respond(note.requestId, { error: { code: -32601, message: "unsupported request" } });
@@ -606,8 +834,19 @@ export class CodexHarness implements RunHarness {
    *  and the broker is never called. When the broker IS called, the reply is sent ONLY AFTER
    *  it settles (a broker deny is a FAILED tool RESULT — `success:false` — not a JSON-RPC
    *  error, mirroring the M0 policy-broker). Authority over WHAT a matched callback may do
-   *  stays the broker's; the harness only gates WHICH turn's callbacks reach it. */
-  private async routeToolCall(transport: CodexTransport, requestId: number | string, params: unknown): Promise<void> {
+   *  stays the broker's; the harness only gates WHICH turn's callbacks reach it.
+   *
+   *  RETURN: a {@link RoutedRootSignal} ONLY when the accepted callback was a TRUSTED ROOT
+   *  workflow signal (the caller surfaces its scanned signals on a main-origin frame the
+   *  reducer folds); `undefined` for every other outcome — a stale/foreign/absent identity, a
+   *  denied signal, a backgrounded DELEGATION, or a non-signal effect (shell/file/mcp) — none
+   *  of which may move the run's workflow, so none emits a signals frame. The model reply is
+   *  identical in every case (via {@link replyOf}); the return only carries the fold input. */
+  private async routeToolCall(
+    transport: CodexTransport,
+    requestId: number | string,
+    params: unknown,
+  ): Promise<RoutedRootSignal | undefined> {
     const p = asObject(params) ?? {};
     // A callback is served ONLY for the ACTIVE root turn. We bind on BOTH the raw thread
     // id AND the raw turn id (never folded to this.threadId/activeTurnId), so an absent/
@@ -625,23 +864,59 @@ export class CodexHarness implements RunHarness {
       rawThreadId === this.threadId &&
       rawTurnId !== undefined &&
       rawTurnId === this.activeTurnId;
-    let result: CallbackResult;
     if (!matchesActive) {
-      result = { ok: false, code: "not_active_turn", message: "callback does not match the active turn" };
-    } else {
+      this.safeRespond(transport, requestId, { ok: false, code: "not_active_turn", message: "callback does not match the active turn" });
+      return undefined;
+    }
+    const runAndReply = async (): Promise<CallbackResult> => {
+      let result: CallbackResult;
       try {
         // A matched callback is, by construction, the root turn's — origin is "root".
         result = await this.broker.handleToolCall({ threadId, turnId, callId }, p.tool, p.arguments, "root");
       } catch {
         result = { ok: false, code: "broker_error", message: "the callback failed" };
       }
+      this.safeRespond(transport, requestId, result);
+      return result;
+    };
+    const toolName = asString(p.tool);
+    const canonical = toolName !== undefined ? canonicalizeCodexToolName(toolName) : undefined;
+    // A DELEGATION callback (spawn_agent / the collaboration*/Subagent* family) drives a
+    // CHILD turn whose frames THIS root loop demuxes off the SAME transport
+    // (registerChildSink). It therefore MUST run CONCURRENTLY with continued note
+    // consumption — awaiting it inline would deadlock, because the child's frames would
+    // never be read. It runs in the background, tracked in `pendingToolCalls`, and the
+    // turn stream flushes it before ending; the broker's own delegate seam guarantees the
+    // child settles before this callback (the parent spawn_agent) resolves. A delegation is
+    // never a workflow signal, so it emits NO signals frame. EVERY OTHER callback is awaited
+    // inline exactly as before, so the non-delegation path is byte-identical (the abort race
+    // in runTurn still bounds a wedged inline callback).
+    if (canonical !== undefined && CODEX_DELEGATE_TOOLS.has(canonical)) {
+      const task = runAndReply();
+      this.pendingToolCalls.add(task);
+      void task.finally(() => this.pendingToolCalls.delete(task));
+      return undefined;
     }
+    const result = await runAndReply();
+    // Route a TRUSTED ROOT SIGNAL callback's scanned result into the run-lane reducer: when
+    // the tool canonicalizes to a signal tool AND the broker ACCEPTED it, `result.output` is
+    // the scanned Partial<TurnSignals> (broker.dispatchSignal returns `{ok:true, output:
+    // scanned}`), which the caller surfaces on a main-origin signals frame. A DENIED signal
+    // (result.ok === false) folds nothing; a non-signal effect (shell/file/mcp) is undefined.
+    if (canonical !== undefined && CODEX_SIGNAL_TOOLS.has(canonical) && result.ok) {
+      return { signals: result.output as Readonly<Partial<TurnSignals>> };
+    }
+    return undefined;
+  }
+
+  /** Reply to a server→client tool-call with a broker {@link CallbackResult}, mapped to the
+   *  app-server reply shape. Best-effort: an undeliverable reply into a closed transport
+   *  (an owner abort/close raced this pending callback) is dropped, NEVER thrown. */
+  private safeRespond(transport: CodexTransport, requestId: number | string, result: CallbackResult): void {
     try {
       transport.respond(requestId, this.replyOf(result));
     } catch {
-      // The transport may already be closed (an owner abort/close raced this pending
-      // broker callback): a reply that can no longer be delivered is dropped, NEVER thrown
-      // into a closed transport.
+      /* transport closed underneath a late reply; the run settles via its terminal/abort */
     }
   }
 
@@ -691,12 +966,11 @@ export class CodexHarness implements RunHarness {
     };
   }
 
-  // PROVISIONAL item-type strings. The exact app-server `item.type` values below
-  // ("agentMessage"/"assistantMessage"/"agent_message"/"reasoning") are NOT yet confirmed
-  // against a real app-server — they are the current best guess. They MUST be verified in
-  // the packaged integration (m3b:packaged) before they are trusted; do NOT add or rename
-  // a type here on a guess. An unrecognized type intentionally falls through to `[]`, which
-  // the caller surfaces as `activity` (never a frame) — the safe default.
+  // VERIFIED 2026-09-10: the native both-image packaged proof drove pinned Codex
+  // 0.153.2 and confirmed its active agent-message form decodes to a non-empty public
+  // frame. The alternate spellings and reasoning arm remain compatibility cases; do
+  // not add or rename a type on a guess. An unrecognized type intentionally falls
+  // through to `[]`, which the caller surfaces as `activity` (never a frame).
   private decodeItemContent(item: Record<string, unknown>): HarnessItem[] {
     const type = asString(item.type);
     if (type === "agentMessage" || type === "assistantMessage" || type === "agent_message") {

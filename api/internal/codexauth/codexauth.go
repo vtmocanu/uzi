@@ -115,6 +115,14 @@ type Client struct {
 	usageBase string
 	oauthBase string
 	clientID  string
+	// perRequestTimeout bounds ONE provider HTTP call (identity read OR token refresh)
+	// with a context deadline (PRD #1171 M1). Zero (the default) means "no per-request
+	// deadline beyond whatever the doer enforces" — the pre-#1171 dark-M1 behaviour, so
+	// existing callers/tests are unchanged. Production sets it (WithPerRequestTimeout) so
+	// the whole worker→API→provider→durable-commit→callback round trip stays under the
+	// pinned app-server 10-second external-auth callback deadline; see the nested budget
+	// documented at the NewClient call site in cmd/server/main.go.
+	perRequestTimeout time.Duration
 }
 
 // Option configures a Client at construction.
@@ -130,11 +138,29 @@ func WithHTTPDoer(d httpDoer) Option {
 	}
 }
 
-// NewClient builds a Client with the provider defaults, then applies opts. The
-// only option the dark M1 layer needs is WithHTTPDoer (tests inject a fake
-// transport); the base URLs and client id are the fixed provider defaults. A later
-// unit that must point at a non-default endpoint can add the override option then,
-// with a caller — an unused exported option would redden the deadcode gate now.
+// WithPerRequestTimeout bounds each provider HTTP call (DiscoverIdentity, Refresh) with
+// a per-request context deadline (PRD #1171 M1). It is the production knob that keeps the
+// coordinated refresh — which makes up to two serial provider calls (oauth refresh +
+// nonrotating identity re-verify) — inside the app-server's 10-second external-auth
+// callback budget. A non-positive value is ignored (keeps the default: no per-request
+// deadline), so an accidental zero never disables the doer's own timeout.
+func WithPerRequestTimeout(d time.Duration) Option {
+	return func(c *Client) {
+		if d > 0 {
+			c.perRequestTimeout = d
+		}
+	}
+}
+
+// NewClient builds a Client with the provider defaults, then applies opts. The base
+// URLs, provider name and client id are the FIXED provider defaults — production never
+// takes an endpoint from a claim, model, repo, saved label or callback (PRD #1171 M1);
+// a localhost/fake provider is injected in tests ONLY through WithHTTPDoer, whose fake
+// doer intercepts the request regardless of the (still-default) URL, so no endpoint
+// override option is needed or offered. Production additionally passes
+// WithPerRequestTimeout to bound each provider call under the app-server callback
+// deadline. A later unit that must point at a non-default endpoint can add the override
+// option then, with a caller — an unused exported option would redden the deadcode gate.
 func NewClient(opts ...Option) *Client {
 	c := &Client{
 		doer:      &http.Client{Timeout: 15 * time.Second},
@@ -146,6 +172,18 @@ func NewClient(opts ...Option) *Client {
 		o(c)
 	}
 	return c
+}
+
+// requestContext derives the per-request context for one provider call: when a
+// per-request timeout is configured it returns ctx with that deadline (and a cancel to
+// release the timer); otherwise it returns ctx unchanged with a no-op cancel, preserving
+// the pre-#1171 behaviour for callers that did not set one. The caller MUST defer the
+// returned cancel.
+func (c *Client) requestContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if c.perRequestTimeout > 0 {
+		return context.WithTimeout(ctx, c.perRequestTimeout)
+	}
+	return ctx, func() {}
 }
 
 // usageResponse is the subset of the usage endpoint's body we read. Both fields
@@ -166,6 +204,8 @@ type usageResponse struct {
 //     but its account is not yet fully named).
 //   - non-2xx (including 401) → *AuthError carrying the status.
 func (c *Client) DiscoverIdentity(ctx context.Context, accessToken string) (Identity, error) {
+	ctx, cancel := c.requestContext(ctx)
+	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.usageBase+"/wham/usage", nil)
 	if err != nil {
 		return Identity{}, fmt.Errorf("codexauth: build identity request: %w", err)
@@ -228,6 +268,8 @@ func (c *Client) Refresh(ctx context.Context, refreshToken string) (RefreshResul
 	if err != nil {
 		return RefreshResult{}, fmt.Errorf("codexauth: encode refresh request: %w", err)
 	}
+	ctx, cancel := c.requestContext(ctx)
+	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.oauthBase+"/oauth/token", bytes.NewReader(payload))
 	if err != nil {
 		return RefreshResult{}, fmt.Errorf("codexauth: build refresh request: %w", err)

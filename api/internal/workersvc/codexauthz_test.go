@@ -125,8 +125,10 @@ func TestClaimSecretsClaudeByteIdentical(t *testing.T) {
 	}
 }
 
-// TestClaimCodexSecretsShape proves a Codex-bound claim carries ONLY the access token
-// and the per-claim capability — never a refresh/login blob or an id.
+// TestClaimCodexSecretsShape proves a Codex-bound claim carries ONLY the auth mode, the
+// access token, the per-claim capability and the mode-specific server-owned metadata,
+// never a refresh/login blob or internal id. It proves subscription carries a real
+// generation, verified ChatGPT account id and plan null, while api_key omits all three.
 func TestClaimCodexSecretsShape(t *testing.T) {
 	// The one placeholder whose name trips gosec G101 is extracted so its suppression
 	// sits on the exact triggering assignment, not on the composite-literal brace (which
@@ -135,33 +137,135 @@ func TestClaimCodexSecretsShape(t *testing.T) {
 	anthropicToken := "ANTHROPIC-OAUTH-PLACEHOLDER" //nolint:gosec // G101: placeholder fixture string, not a real credential
 	codexAccess := "CODEX-ACCESS-PLACEHOLDER"
 	codexCap := formatCodexCapability(3, "cap-secret-placeholder")
-	cs := ClaimSecrets{
-		ForgeUsername:       "bot",
-		ForgePAT:            forgePAT,
-		AnthropicOAuthToken: anthropicToken,
-		Codex: &ClaimCodexSecrets{
-			AccessToken: codexAccess,
-			Capability:  codexCap,
-		},
-	}
-	b, err := json.Marshal(cs)
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	got := string(b)
-	if !strings.Contains(got, `"codex":{`) {
-		t.Fatalf("codex block missing: %s", got)
-	}
-	if !strings.Contains(got, `"access_token":"CODEX-ACCESS-PLACEHOLDER"`) {
-		t.Fatalf("access_token missing: %s", got)
-	}
-	if !strings.Contains(got, `"capability":"3.cap-secret-placeholder"`) {
-		t.Fatalf("capability missing: %s", got)
-	}
-	// The refresh/login blob and any secret id must NEVER appear.
-	for _, forbidden := range []string{"refresh_token", "refresh", "login", "secret_id", "account_id"} {
-		if strings.Contains(got, forbidden) {
-			t.Fatalf("forbidden field %q leaked into codex claim: %s", forbidden, got)
+
+	// The forbidden set: neither the refresh/login blob nor any id may ride the wire, in
+	// either arm. `login` matches nothing in `auth_mode` (no "login" substring), so it stays
+	// a clean canary for a leaked login blob.
+	forbidden := []string{"refresh_token", "refresh", "login", "secret_id", "provider_user_id", "workspace_account_id"}
+	assertNoForbidden := func(t *testing.T, got string) {
+		t.Helper()
+		for _, f := range forbidden {
+			if strings.Contains(got, f) {
+				t.Fatalf("forbidden field %q leaked into codex claim: %s", f, got)
+			}
 		}
 	}
+
+	t.Run("subscription carries a real generation (0 is visible)", func(t *testing.T) {
+		gen := int64(0) // a real zero — must serialize as "generation":0, never omitted
+		cs := ClaimSecrets{
+			ForgeUsername:       "bot",
+			ForgePAT:            forgePAT,
+			AnthropicOAuthToken: anthropicToken,
+			Codex: &ClaimCodexSecrets{
+				AuthMode:         codexAuthModeSubscription,
+				AccessToken:      codexAccess,
+				Capability:       codexCap,
+				Generation:       &gen,
+				ChatGPTAccountID: "verified-account",
+			},
+		}
+		b, err := json.Marshal(cs)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		got := string(b)
+		if !strings.Contains(got, `"codex":{`) {
+			t.Fatalf("codex block missing: %s", got)
+		}
+		if !strings.Contains(got, `"auth_mode":"subscription"`) {
+			t.Fatalf("auth_mode missing/wrong: %s", got)
+		}
+		if !strings.Contains(got, `"access_token":"CODEX-ACCESS-PLACEHOLDER"`) {
+			t.Fatalf("access_token missing: %s", got)
+		}
+		if !strings.Contains(got, `"capability":"3.cap-secret-placeholder"`) {
+			t.Fatalf("capability missing: %s", got)
+		}
+		if !strings.Contains(got, `"generation":0`) {
+			t.Fatalf("subscription generation 0 must be a REAL wire-visible zero: %s", got)
+		}
+		if !strings.Contains(got, `"chatgpt_account_id":"verified-account"`) {
+			t.Fatalf("subscription verified account id missing: %s", got)
+		}
+		if !strings.Contains(got, `"chatgpt_plan_type":null`) {
+			t.Fatalf("subscription plan type must be explicit null: %s", got)
+		}
+		assertNoForbidden(t, got)
+	})
+
+	t.Run("subscription non-zero generation", func(t *testing.T) {
+		gen := int64(7)
+		cs := ClaimSecrets{
+			ForgePAT: forgePAT,
+			Codex: &ClaimCodexSecrets{
+				AuthMode:         codexAuthModeSubscription,
+				AccessToken:      codexAccess,
+				Capability:       codexCap,
+				Generation:       &gen,
+				ChatGPTAccountID: "verified-account",
+			},
+		}
+		b, err := json.Marshal(cs)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		if got := string(b); !strings.Contains(got, `"generation":7`) {
+			t.Fatalf("generation 7 missing: %s", got)
+		}
+	})
+
+	t.Run("api_key omits generation entirely", func(t *testing.T) {
+		cs := ClaimSecrets{
+			ForgePAT: forgePAT,
+			Codex: &ClaimCodexSecrets{
+				AuthMode:    codexAuthModeAPIKey,
+				AccessToken: codexAccess,
+				Capability:  codexCap,
+				// Generation left nil: omitempty must drop the key for the api_key arm, which
+				// can never refresh. Its PRESENCE (even as 0) would violate the TS union.
+			},
+		}
+		b, err := json.Marshal(cs)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		got := string(b)
+		if !strings.Contains(got, `"auth_mode":"api_key"`) {
+			t.Fatalf("auth_mode missing/wrong: %s", got)
+		}
+		for _, forbidden := range []string{"generation", "chatgpt_account_id", "chatgpt_plan_type"} {
+			if strings.Contains(got, forbidden) {
+				t.Fatalf("api_key claim must carry no subscription field %q: %s", forbidden, got)
+			}
+		}
+		assertNoForbidden(t, got)
+	})
+
+	t.Run("api_key rejects accidentally populated subscription metadata", func(t *testing.T) {
+		gen := int64(1)
+		_, err := json.Marshal(ClaimCodexSecrets{
+			AuthMode:         codexAuthModeAPIKey,
+			AccessToken:      codexAccess,
+			Capability:       codexCap,
+			Generation:       &gen,
+			ChatGPTAccountID: "must-not-ship",
+		})
+		if err == nil {
+			t.Fatal("api_key claim with subscription metadata marshaled successfully")
+		}
+	})
+
+	t.Run("subscription requires verified account authority", func(t *testing.T) {
+		gen := int64(0)
+		_, err := json.Marshal(ClaimCodexSecrets{
+			AuthMode:    codexAuthModeSubscription,
+			AccessToken: codexAccess,
+			Capability:  codexCap,
+			Generation:  &gen,
+		})
+		if err == nil {
+			t.Fatal("subscription claim without a verified account id marshaled successfully")
+		}
+	})
 }

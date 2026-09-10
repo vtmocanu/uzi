@@ -17,6 +17,60 @@ function fakeClient(): { client: WorkerClient; sent: OutgoingMessage[] } {
   return { client, sent };
 }
 
+describe("MessageBatcher durability-boundary cancellation", () => {
+  it("aborts and settles a timer-started message request before close returns", async () => {
+    let startedResolve!: () => void;
+    const started = new Promise<void>((resolve) => { startedResolve = resolve; });
+    let settled = false;
+    const client = {
+      async postMessages(_runId: string, _messages: OutgoingMessage[], signal?: AbortSignal): Promise<void> {
+        startedResolve();
+        await new Promise<void>((_, reject) => {
+          const abort = (): void => {
+            settled = true;
+            reject(new Error("message request cancelled"));
+          };
+          if (signal?.aborted) abort();
+          else signal?.addEventListener("abort", abort, { once: true });
+        });
+      },
+    } as unknown as WorkerClient;
+    const { logger } = recordingLogger();
+    const batcher = new MessageBatcher(client, "run-boundary", 0, 0, logger);
+    batcher.emit({ kind: "status", agent: "worker", payload: { text: "pending" } });
+    await started;
+
+    const boundarySignal = AbortSignal.timeout(20);
+    const watchdog = AbortSignal.timeout(500);
+    await Promise.race([
+      batcher.close(boundarySignal),
+      new Promise<never>((_, reject) =>
+        watchdog.addEventListener("abort", () => reject(new Error("close abandoned the message request")), { once: true }),
+      ),
+    ]);
+    assert.equal(settled, true);
+  });
+
+  it("returns normally when the durability deadline lands during retry backoff", async () => {
+    const boundary = new AbortController();
+    let calls = 0;
+    const client = {
+      async postMessages(): Promise<void> {
+        calls += 1;
+        if (calls === 1) setTimeout(() => boundary.abort(), 10);
+        throw new Error("transient message failure");
+      },
+    } as unknown as WorkerClient;
+    const { logger } = recordingLogger();
+    const batcher = new MessageBatcher(client, "run-backoff-boundary", 0, 0, logger);
+    batcher.emit({ kind: "status", agent: "worker", payload: { text: "pending" } });
+
+    await assert.doesNotReject(batcher.close(boundary.signal));
+    assert.equal(boundary.signal.aborted, true, "the abort landed during the retry delay");
+    assert.equal(calls, 1, "close did not begin another flush after the boundary expired");
+  });
+});
+
 // PRD #11 M4: every emitted run message is logged at debug (the single
 // MessageBatcher.emit chokepoint) with a redacted payload, so UZI_LOG_LEVEL=debug
 // surfaces the raw frames in `docker logs` without any secret reaching them.

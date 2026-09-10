@@ -169,6 +169,66 @@ describe("codex transport: notification decoding", () => {
   });
 });
 
+describe("codex transport: server-request interceptor", () => {
+  it("claims an auth request synchronously before the notification queue", async () => {
+    const { inbound, outbound, transport } = makePair();
+    const frames = collectFrames(outbound);
+    const intercepted: CodexNotification[] = [];
+    transport.installServerRequestInterceptor!((note) => {
+      if (note.kind !== "activity" || note.method !== "account/chatgptAuthTokens/refresh") return false;
+      intercepted.push(note);
+      transport.respond(note.requestId!, { result: { handled: true } });
+      return true;
+    });
+    const notes = transport.notifications();
+
+    // One chunk deliberately carries a claimed auth request followed by ordinary
+    // liveness. The claimed request must be answered directly and never occupy the
+    // single-consumer queue that setup has not started draining yet.
+    inbound.write(
+      `${JSON.stringify({ id: 73, method: "account/chatgptAuthTokens/refresh", params: { reason: "unauthorized" } })}\n`
+      + `${JSON.stringify({ method: "other/activity", params: {} })}\n`,
+    );
+    await flush();
+
+    assert.equal(intercepted.length, 1);
+    assert.equal(intercepted[0]?.kind, "activity");
+    if (intercepted[0]?.kind === "activity") assert.equal(intercepted[0].requestId, 73);
+    assert.deepEqual(frames(), [{ id: 73, result: { handled: true } }]);
+    const queued = await notes.next();
+    assert.equal(queued.done, false);
+    assert.equal(queued.value?.kind, "activity");
+    if (queued.value?.kind === "activity") assert.equal(queued.value.method, "other/activity");
+    await transport.close();
+  });
+
+  it("fails the real notification stream and closes when the interceptor throws", async () => {
+    const { inbound, transport } = makePair();
+    transport.installServerRequestInterceptor!(() => { throw new Error("interceptor boom"); });
+    const pending = transport.notifications().next();
+
+    writeFrame(inbound, { id: 74, method: "account/chatgptAuthTokens/refresh", params: {} });
+    await assert.rejects(pending, /codex transport server-request interceptor failed/);
+    assert.throws(() => transport.notify("after/failure"), /server-request interceptor failed/);
+  });
+
+  it("queues an id-bearing request with its requestId when the interceptor declines it", async () => {
+    const { inbound, transport } = makePair();
+    transport.installServerRequestInterceptor!(() => false);
+    const notes = transport.notifications();
+
+    writeFrame(inbound, { id: "request-75", method: "other/request", params: { value: 1 } });
+    const queued = await notes.next();
+    assert.equal(queued.done, false);
+    assert.equal(queued.value?.kind, "activity");
+    if (queued.value?.kind === "activity") {
+      assert.equal(queued.value.method, "other/request");
+      assert.equal(queued.value.requestId, "request-75");
+    }
+    await transport.close();
+  });
+});
+
 describe("codex transport: respond (server→client reply lane)", () => {
   it("frames a success reply as {id, result} on the outbound stream", async () => {
     const { outbound, transport } = makePair();

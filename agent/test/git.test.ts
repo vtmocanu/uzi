@@ -1,11 +1,12 @@
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { getEventListeners } from "node:events";
 import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import type { Readable } from "node:stream";
+import { PassThrough, Readable } from "node:stream";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { nullLogger, recordingLogger } from "./helpers.js";
 import { GitCache, bareDirName, gitEnv } from "../src/git.js";
@@ -33,6 +34,96 @@ describe("bareDirName", () => {
     assert.strictEqual(bareDirName("https://gitlab.com/org/repo"), "gitlab.com+org+repo.git");
     assert.strictEqual(bareDirName("git@gitlab.com:org/repo.git"), "gitlab.com+org+repo.git");
     assert.strictEqual(bareDirName("ssh://git@gitlab.com:22/org/repo.git"), "gitlab.com%3A22+org+repo.git");
+  });
+});
+
+describe("permit-scoped bare lock acquisition", () => {
+  it("settles promptly on boundary abort without running or overtaking a queued mutation", async () => {
+    const internals = git as unknown as {
+      withLock<T>(key: string, fn: () => Promise<T>): Promise<T>;
+    };
+    let releaseHolder!: () => void;
+    let holderStarted!: () => void;
+    const holderStartedP = new Promise<void>((resolve) => { holderStarted = resolve; });
+    const holder = internals.withLock("shared-bare", async () => {
+      holderStarted();
+      await new Promise<void>((resolve) => { releaseHolder = resolve; });
+      return "holder";
+    });
+    await holderStartedP;
+
+    const abort = new AbortController();
+    let queuedRan = false;
+    const queued = git.withBoundaryProcessSpawner(
+      async () => { throw new Error("no subprocess expected"); },
+      abort.signal,
+      () => internals.withLock("shared-bare", async () => {
+        queuedRan = true;
+        return "queued";
+      }),
+    );
+
+    abort.abort();
+    await assert.rejects(queued, /permit-held git lock wait aborted: boundary deadline exceeded/);
+    assert.equal(queuedRan, false, "an aborted waiter cannot enter the held lock");
+
+    releaseHolder();
+    assert.equal(await holder, "holder");
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(queuedRan, false, "the forfeited slot stays skipped after the prior holder releases");
+  });
+});
+
+describe("permit-scoped git output collection", () => {
+  const execScoped = (
+    cache: GitCache,
+    signal: AbortSignal,
+    stdout: Readable,
+    stderr: Readable,
+    maxBuffer = 1024,
+  ): Promise<{ stdout: string; stderr: string }> => {
+    const internals = cache as unknown as {
+      execScoped(
+        command: string,
+        args: string[],
+        options: { env: NodeJS.ProcessEnv; maxBuffer: number },
+      ): Promise<{ stdout: string; stderr: string }>;
+    };
+    return cache.withBoundaryProcessSpawner(
+      async () => ({
+        stdin: null,
+        stdout,
+        stderr,
+        completed: Promise.resolve({ code: 0 }),
+      }),
+      signal,
+      () => internals.execScoped("git", ["--version"], { env: {}, maxBuffer }),
+    );
+  };
+
+  it("destroys and settles both output collectors when the boundary aborts", async () => {
+    const abort = new AbortController();
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    const pending = execScoped(git, abort.signal, stdout, stderr);
+
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(getEventListeners(abort.signal, "abort").length, 2);
+    abort.abort();
+
+    await assert.rejects(pending, /permit-held git output collection aborted: boundary deadline exceeded/);
+    assert.equal(stdout.destroyed, true, "stdout was destroyed on boundary abort");
+    assert.equal(stderr.destroyed, true, "stderr was destroyed on boundary abort");
+    assert.equal(getEventListeners(abort.signal, "abort").length, 0, "settled collectors removed their abort listeners");
+  });
+
+  it("removes abort listeners after ordinary collection and preserves the output cap error", async () => {
+    const abort = new AbortController();
+    await assert.rejects(
+      execScoped(git, abort.signal, Readable.from(["12345"]), Readable.from([]), 4),
+      /subprocess output exceeded 4 bytes/,
+    );
+    assert.equal(getEventListeners(abort.signal, "abort").length, 0);
   });
 });
 

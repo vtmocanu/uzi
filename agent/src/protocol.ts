@@ -450,11 +450,11 @@ export interface ClaimRepo {
  * `auth_mode` mirroring the planned Go wire (`ClaimCodexSecrets`, emitted by
  * `claim_assembly.go` ONLY when `runs.codex_secret_id` is frozen):
  *
- *   * "subscription" carries the account's committed `generation` — the worker's
- *     initial observedGeneration for coordinated refresh. Subscription is the only
- *     mode that may refresh.
- *   * "api_key" has NO `generation` and can never refresh; an api_key run must
- *     never invoke refresh.
+ *   * "subscription" carries the account's committed `generation`, provider-verified
+ *     `chatgpt_account_id`, and `chatgpt_plan_type:null`, which are the only authoritative
+ *     inputs for pinned app-server's chatgptAuthTokens mode. A callback
+ *     `previousAccountId` is only an untrusted hint and never replaces this value.
+ *   * "api_key" has NONE of those subscription fields and can never refresh.
  *
  * Present ONLY for an internally-bound Codex run (ships DARK — M5 still owns public
  * routing). Ordinary Claude claims OMIT it, so their wire is byte-identical: the
@@ -463,8 +463,79 @@ export interface ClaimRepo {
  * persisted beyond the run, never logged (the access token/capability are secrets).
  */
 export type ClaimCodexSecrets =
-  | { auth_mode: "subscription"; access_token: string; capability: string; generation: number }
+  | {
+      auth_mode: "subscription";
+      access_token: string;
+      capability: string;
+      generation: number;
+      chatgpt_account_id: string;
+      chatgpt_plan_type: null;
+    }
   | { auth_mode: "api_key"; access_token: string; capability: string };
+
+/**
+ * Request body for POST /worker/runs/{id}/codex/release (PRD #1171 M1). The run id is the
+ * URL path and is NEVER carried in the body, so this carries ONLY the per-claim
+ * credential-operation capability. The server strict-decodes and rejects any extra field
+ * (a body-supplied run id, a user/secret/account id, or a token/login blob), so this shape
+ * is exactly the set of fields the endpoint accepts. Secret-bearing (the capability);
+ * never logged.
+ */
+export interface CodexReleaseRequest {
+  capability: string;
+}
+
+/**
+ * Response of the release route. Subscription repeats the freshly-authorized committed
+ * generation and provider-verified account id needed to construct a new app-server root;
+ * API key carries only its mode and token. The disjoint union prevents subscription
+ * account/generation/plan fields from leaking into API-key mode.
+ */
+export type CodexReleaseResponse =
+  | {
+      auth_mode: "subscription";
+      access_token: string;
+      generation: number;
+      chatgpt_account_id: string;
+      chatgpt_plan_type: null;
+    }
+  | { auth_mode: "api_key"; access_token: string };
+
+/**
+ * Request body for POST /worker/runs/{id}/codex/refresh (PRD #1171 M1). The run id is the
+ * URL path. Fields, and ONLY these fields:
+ *
+ *   * capability — the per-claim credential-operation capability (as for release).
+ *   * operation_id — ONE random id per LOGICAL refresh, generated AND RETAINED by the
+ *     caller: after an HTTP timeout or a lost reply the caller re-calls with the SAME
+ *     operation_id so the server replays its prior result rather than starting a second
+ *     provider exchange. The worker never begins a second exchange blindly.
+ *   * observed_generation — the generation the worker last saw (from its claim's
+ *     {@link ClaimCodexSecrets} generation, or a prior refresh result's generation).
+ *
+ * Subscription only; an api_key run can never refresh and must never call this. The server
+ * strict-decodes and rejects any other field. Secret-bearing (the capability).
+ */
+export interface CodexRefreshRequest {
+  capability: string;
+  operation_id: string;
+  observed_generation: number;
+}
+
+/**
+ * Response of the refresh route on success: the freshly-committed access token, its
+ * generation (the worker's NEXT observed_generation), and the outcome
+ * ("advanced" | "replayed" | "reconciled"). A contended/quarantined outcome rides an HTTP
+ * error with no body, not this shape. Delivered Cache-Control: no-store; secret-bearing.
+ */
+export interface CodexRefreshResponse {
+  auth_mode: "subscription";
+  access_token: string;
+  generation: number;
+  chatgpt_account_id: string;
+  chatgpt_plan_type: null;
+  outcome: "advanced" | "replayed" | "reconciled";
+}
 
 /**
  * Per-run secrets. Delivered ONLY in the claim response (PRD: "the claim

@@ -1,0 +1,62 @@
+# DARK CODEX GUARD (issue #1171 M5) -- alternate Codex harness/executor construction
+# is forbidden outside the production composition.
+#
+# WHAT THIS ENFORCES. The Codex provider run lane is composed at exactly two
+# sanctioned construction sites: agent/src/main.ts builds the production
+# `CodexExecutor` (the run entrypoint), and agent/src/codex/codex-executor.ts is the
+# composition root that news up the `CodexHarness` (the supervisor/registry run lane)
+# and the `CodexAdviceHarness` (the read-only advice lane). No OTHER file in
+# agent/src may construct one of these three classes: a second, hand-rolled
+# `new CodexHarness(...)` / `new CodexAdviceHarness(...)` / `new CodexExecutor(...)`
+# elsewhere would bypass the production composition -- the claim-aware dark
+# selection, the redactor wiring, the auth-mode bridge, the withBoundary reap
+# lifecycle -- and stand up a Codex lane with none of those guardrails attached.
+#
+# THE PATTERN. `pattern-either` over the three `new` expressions; the two sanctioned
+# construction files are `paths.exclude`d, so the clean tree (constructions live only
+# in main.ts and codex-executor.ts) yields ZERO findings, while the same `new` in any
+# other agent/src file fires. `new CodexHarnessError(...)` is a DIFFERENT identifier
+# and never matches `new CodexHarness(...)`. Tests construct these too but live under
+# agent/test/, outside this rule's /agent/src scope.
+#
+# 🔴 RELIABILITY BOUNDARY -- THIS MATCHES A CONSTRUCTION SITE, NOT A SEMANTIC "WRONG
+# ENDPOINT". The rule proves only that no unsanctioned FILE news up one of these
+# classes. It does NOT prove the sanctioned construction was handed the right launch
+# context (the right provider root, credential, auth mode, dark-selection claim) --
+# that a Codex lane is stood up against the correct endpoint is the launcher's
+# `validateLaunchContract` check plus code review, not a syntactic match. A caller
+# that constructs the executor correctly but passes it the wrong contract is
+# invisible here by design.
+#
+# POSITIVE CONTROL (verified before commit): adding `new CodexHarness({});` to another
+# agent/src file (e.g. agent/src/codex/broker.ts) fires; reverting returns to zero.
+# NEGATIVE CONTROL: the committed tree reports zero findings -- the only constructions
+# are in the two excluded sites (main.ts, codex-executor.ts).
+rules:
+  - id: codex-fixed-constructor
+    languages: [typescript]
+    severity: ERROR
+    message: >-
+      Codex harness/executor construction is composed once, at the sanctioned sites
+      (agent/src/main.ts and agent/src/codex/codex-executor.ts). A
+      `new CodexHarness/CodexAdviceHarness/CodexExecutor(...)` in any other agent/src
+      file bypasses the production composition (claim-aware dark selection, redactor
+      wiring, auth-mode bridge, withBoundary reap lifecycle). Construct through the
+      composition root, not by hand.
+    paths:
+      # Root-anchored (leading `/`) to silence semgrep's Semgrepignore-v2
+      # deprecation warning about bare relative includes, mirroring canary.yml.
+      # The gate scans `.` from the repo root, so this resolves to agent/src/.
+      include:
+        - /agent/src
+      # The two sanctioned construction sites: main.ts builds the production
+      # CodexExecutor; codex-executor.ts is the composition root that news up the
+      # CodexHarness and CodexAdviceHarness. Excluded so the legitimate composition
+      # never false-positives.
+      exclude:
+        - /agent/src/codex/codex-executor.ts
+        - /agent/src/main.ts
+    pattern-either:
+      - pattern: new CodexHarness(...)
+      - pattern: new CodexAdviceHarness(...)
+      - pattern: new CodexExecutor(...)

@@ -10,6 +10,7 @@
 // delegation surface is deferred to M3/M4 and intentionally omitted here so knip's
 // zero-unused-export gate stays green).
 
+import type { Readable, Writable } from "node:stream";
 import type { EmittedMessage } from "./executor.js";
 import type {
   AskUserQuestion,
@@ -276,7 +277,7 @@ export type SafeBoundary =
 
 export interface BoundaryRequest {
   boundary: SafeBoundary;
-  deadlineMs: number; // absolute wall-clock deadline, never an unbounded wait
+  deadlineMs: number; // total wall-clock budget, converted once to an absolute deadline
 }
 
 export type ChildQuiescence =
@@ -334,6 +335,24 @@ export interface BoundaryPermit {
   readonly [boundaryPermitBrand]: true;
   readonly epoch: number;
   readonly boundary: SafeBoundary;
+  /** Aborts at the boundary's wall deadline. Permit-held subprocesses and
+   * shutdown publication must consume it; timeout never authorizes abandonment. */
+  readonly signal: AbortSignal;
+}
+
+export interface BoundaryProcessRequest {
+  /** argv[0] is a trusted absolute executable path; relative/PATH resolution is forbidden. */
+  readonly argv: readonly string[];
+  readonly cwd: string;
+  readonly env: NodeJS.ProcessEnv;
+  readonly identity: "command" | "worker_pat";
+}
+
+export interface BoundaryProcessHandle {
+  readonly stdin: Writable | null;
+  readonly stdout: Readable | null;
+  readonly stderr: Readable | null;
+  readonly completed: Promise<{ readonly code: number }>;
 }
 
 export interface CodexExecutionSafety {
@@ -342,6 +361,19 @@ export interface CodexExecutionSafety {
     request: BoundaryRequest,
     action: (permit: BoundaryPermit) => Promise<T>,
   ): Promise<T>;
+  /** Spawn one permit-held durability subprocess as a registered supervisor
+   * root. Completion includes the primary status and the whole-root reap. */
+  spawnBoundaryProcess(
+    permit: BoundaryPermit,
+    request: BoundaryProcessRequest,
+  ): Promise<BoundaryProcessHandle>;
+  // PRD #1171 m4 (F1): the terminal tool-disposal, delegated to the registry's
+  // `disposeTools`. The executor's `run()` no longer disposes the registry on the
+  // normal path — its post-run durability sinks (park/shutdown/finalize) still need
+  // the roots alive to reap — so the runner calls this ONCE in `executeClaim`'s
+  // `finally`, after every sink has settled, to drop the roots/handlers. Idempotent
+  // (disposeTools is), so a backstop dispose in the executor never double-disposes.
+  dispose(request: BoundaryRequest): Promise<ToolDisposal>;
 }
 
 // M3 addition required on the existing outer Executor contract in executor.ts:

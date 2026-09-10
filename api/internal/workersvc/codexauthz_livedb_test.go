@@ -178,6 +178,22 @@ func TestAuthorizeCodexCredentialOpAcceptsValidLiveDB(t *testing.T) {
 	if codex.Capability == "" {
 		t.Fatal("claim must carry a capability")
 	}
+	// PRD #1171 M1: a subscription claim carries auth_mode + the account's committed
+	// generation (0 at initial login, a real value the worker uses as its initial
+	// observedGeneration for a coordinated refresh).
+	if codex.AuthMode != codexAuthModeSubscription {
+		t.Fatalf("claim auth_mode = %q, want subscription", codex.AuthMode)
+	}
+	if codex.Generation == nil {
+		t.Fatal("a subscription claim must carry a generation (never nil)")
+	} else if *codex.Generation != 0 {
+		t.Fatalf("initial subscription generation = %d, want 0", *codex.Generation)
+	}
+	state := mustState(t, env, f.userID, f.aliasID)
+	account := env.mustAccount(t, f.userID, uuid.UUID(state.ProviderAccountID.Bytes))
+	if codex.ChatGPTAccountID != account.WorkspaceAccountID {
+		t.Fatalf("claim chatgpt account id = %q, want verified %q", codex.ChatGPTAccountID, account.WorkspaceAccountID)
+	}
 
 	authCtx, err := f.svc.AuthorizeCodexCredentialOp(env.ctx, f.wkr, f.runID, codex.Capability, ScopeReleaseAccessToken)
 	if err != nil {
@@ -365,6 +381,18 @@ func TestAuthorizeCodexScopeNotApplicableAPIKeyLiveDB(t *testing.T) {
 	if codex.AccessToken != staticKey {
 		t.Fatalf("api_key claim access token = %q, want the seeded static key %q", codex.AccessToken, staticKey)
 	}
+	// PRD #1171 M1: an api_key claim carries auth_mode="api_key" and NO generation — it can
+	// never refresh, so the generation field is absent (nil), matching the TS union's
+	// api_key arm.
+	if codex.AuthMode != codexAuthModeAPIKey {
+		t.Fatalf("claim auth_mode = %q, want api_key", codex.AuthMode)
+	}
+	if codex.Generation != nil {
+		t.Fatalf("an api_key claim must carry NO generation, got %d", *codex.Generation)
+	}
+	if codex.ChatGPTAccountID != "" {
+		t.Fatalf("an api_key claim must carry NO chatgpt account id, got %q", codex.ChatGPTAccountID)
+	}
 
 	// Release is authorized.
 	if _, err := svc.AuthorizeCodexCredentialOp(env.ctx, wkr, runID, codex.Capability, ScopeReleaseAccessToken); err != nil {
@@ -374,6 +402,45 @@ func TestAuthorizeCodexScopeNotApplicableAPIKeyLiveDB(t *testing.T) {
 	cap2 := env.mintCap(t, runID, workerID)
 	if _, err := svc.AuthorizeCodexCredentialOp(env.ctx, wkr, runID, cap2, ScopeStartRefresh); !errors.Is(err, ErrCodexScopeNotApplicable) {
 		t.Fatalf("start-refresh on api_key: want ErrCodexScopeNotApplicable, got %v", err)
+	}
+}
+
+// TestAuthorizeCodexUnownedRunNoAuthModeOracleLiveDB proves the ownership gate precedes the
+// mode-dependent scope-applicability check, so an UNOWNED run cannot be used as a
+// cross-tenant oracle for its auth_mode. A worker probing a foreign api_key run with
+// ScopeStartRefresh must get ErrCodexWorkerMismatch (handler → 404), NOT
+// ErrCodexScopeNotApplicable (→ 403): a 403-vs-404 split would otherwise disclose that the
+// foreign run is api_key.
+//
+// FAIL-OLD / PASS-FIXED: before the reorder, scope.appliesTo(authMode) ran BEFORE the
+// ownership check, so a foreign worker's start-refresh on an api_key run returned
+// ErrCodexScopeNotApplicable and leaked the auth_mode. Ownership-first makes every unowned
+// run return the same ErrCodexWorkerMismatch regardless of mode.
+func TestAuthorizeCodexUnownedRunNoAuthModeOracleLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	userID, workerID, repoID := env.seedCodexInfra(t)
+	staticKey := codexToken("sk")
+	aliasID := env.seedStaticAPIKey(t, userID, "codex-key-"+uuid.NewString(), staticKey)
+	runID := env.seedCodexRun(t, userID, workerID, repoID)
+	svc := &Service{q: env.q, box: env.box}
+	if err := svc.FreezeCodexBinding(env.ctx, userID, runID, aliasID, codexAuthModeAPIKey); err != nil {
+		t.Fatalf("FreezeCodexBinding: %v", err)
+	}
+	owner := store.Worker{ID: workerID, UserID: userID}
+	capOwner := env.mintCap(t, runID, workerID)
+
+	// A DIFFERENT worker (a foreign tenant) probes the run it does not own. The ownership
+	// gate fires before scope.appliesTo, so the mode-dependent reject is never reached and
+	// the auth_mode does not leak.
+	foreign := store.Worker{ID: uuid.New(), UserID: uuid.New()}
+	if _, err := svc.AuthorizeCodexCredentialOp(env.ctx, foreign, runID, capOwner, ScopeStartRefresh); !errors.Is(err, ErrCodexWorkerMismatch) {
+		t.Fatalf("unowned api_key start-refresh: want ErrCodexWorkerMismatch (no auth_mode oracle), got %v", err)
+	}
+
+	// Sanity: the true owner still gets the mode-dependent reject — the fix reordered the
+	// checks, it did not suppress scope-applicability for owned runs.
+	if _, err := svc.AuthorizeCodexCredentialOp(env.ctx, owner, runID, capOwner, ScopeStartRefresh); !errors.Is(err, ErrCodexScopeNotApplicable) {
+		t.Fatalf("owner api_key start-refresh: want ErrCodexScopeNotApplicable, got %v", err)
 	}
 }
 

@@ -291,6 +291,9 @@ func TestCoordinatedCodexRefreshTwoClientBurstSingleRotationLiveDB(t *testing.T)
 		if res.Generation != 1 {
 			t.Fatalf("client %d generation = %d, want 1", i+1, res.Generation)
 		}
+		if res.ChatGPTAccountID != acct.WorkspaceAccountID {
+			t.Fatalf("client %d chatgpt account id = %q, want verified %q", i+1, res.ChatGPTAccountID, acct.WorkspaceAccountID)
+		}
 	}
 	if res1.AccessToken != res2.AccessToken {
 		t.Fatalf("clients diverged: %q vs %q (both must hold the one committed token)", res1.AccessToken, res2.AccessToken)

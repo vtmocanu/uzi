@@ -66,7 +66,7 @@ export class ForgeError extends Error {
  *  branch. Deliberately one method — the worker never reads issues, labels, or
  *  pipelines; that surface is the Go driver's. */
 export interface ForgeClient {
-  createMergeRequest(p: CreateMrParams): Promise<MergeRequest>;
+  createMergeRequest(p: CreateMrParams, signal?: AbortSignal): Promise<MergeRequest>;
 }
 
 export interface ForgeClientOptions {
@@ -97,8 +97,8 @@ abstract class HttpForgeClient implements ForgeClient {
     this.httpTimeoutMs = opts.httpTimeoutMs ?? 30_000;
   }
 
-  async createMergeRequest(p: CreateMrParams): Promise<MergeRequest> {
-    const res = await this.request("POST", this.createUrl(p.repoUrl), p.pat, this.createBody(p));
+  async createMergeRequest(p: CreateMrParams, signal?: AbortSignal): Promise<MergeRequest> {
+    const res = await this.request("POST", this.createUrl(p.repoUrl), p.pat, this.createBody(p), signal);
     if (res.status === 201) return this.parseMr(await res.text());
 
     // An MR/PR for this branch may already exist (a resume, or a prior finish that
@@ -113,7 +113,7 @@ abstract class HttpForgeClient implements ForgeClient {
     // tolerates that and falls through to the error below rather than pretending
     // success.
     if (this.duplicateStatuses().includes(res.status)) {
-      const existing = await this.findOpenMr(p);
+      const existing = await this.findOpenMr(p, signal);
       if (existing) return existing;
     }
     throw new ForgeError(res.status, (await safeText(res)).slice(0, 512));
@@ -130,6 +130,7 @@ abstract class HttpForgeClient implements ForgeClient {
     url: string,
     pat: string,
     body?: unknown,
+    signal?: AbortSignal,
   ): Promise<{ status: number; text(): Promise<string> }> {
     // Guard 1: never send the PAT over a non-https URL. The credential rides a
     // header, and only TLS keeps it off the wire — a plaintext (or malformed) URL
@@ -143,7 +144,9 @@ abstract class HttpForgeClient implements ForgeClient {
         method,
         headers,
         body: body === undefined ? undefined : JSON.stringify(body),
-        signal: AbortSignal.timeout(this.httpTimeoutMs),
+        signal: signal
+          ? AbortSignal.any([signal, AbortSignal.timeout(this.httpTimeoutMs)])
+          : AbortSignal.timeout(this.httpTimeoutMs),
         // Guard 2: a redirect must never carry the PAT header to another origin —
         // turn any 3xx into a transport error instead of following it.
         redirect: "error",
@@ -172,7 +175,7 @@ abstract class HttpForgeClient implements ForgeClient {
   /** The create request body (forge-specific field names). */
   protected abstract createBody(p: CreateMrParams): unknown;
   /** Find the existing OPEN MR/PR for this source→target on a 409; undefined when none. */
-  protected abstract findOpenMr(p: CreateMrParams): Promise<MergeRequest | undefined>;
+  protected abstract findOpenMr(p: CreateMrParams, signal?: AbortSignal): Promise<MergeRequest | undefined>;
   /** Parse a create (201) response body into a MergeRequest. */
   protected abstract parseMr(text: string): MergeRequest;
 }
@@ -201,9 +204,9 @@ export class GitLabClient extends HttpForgeClient {
     };
   }
 
-  protected async findOpenMr(p: CreateMrParams): Promise<MergeRequest | undefined> {
+  protected async findOpenMr(p: CreateMrParams, signal?: AbortSignal): Promise<MergeRequest | undefined> {
     const q = `${this.createUrl(p.repoUrl)}?state=opened&source_branch=${encodeURIComponent(p.sourceBranch)}&target_branch=${encodeURIComponent(p.targetBranch)}`;
-    const res = await this.request("GET", q, p.pat);
+    const res = await this.request("GET", q, p.pat, undefined, signal);
     if (res.status !== 200) return undefined;
     const list = safeJson(await res.text());
     if (Array.isArray(list) && list.length > 0) return parseGitlabMr(list[0]);
@@ -235,14 +238,14 @@ export class ForgejoClient extends HttpForgeClient {
     return { head: p.sourceBranch, base: p.targetBranch, title: p.title, body: p.description };
   }
 
-  protected async findOpenMr(p: CreateMrParams): Promise<MergeRequest | undefined> {
+  protected async findOpenMr(p: CreateMrParams, signal?: AbortSignal): Promise<MergeRequest | undefined> {
     // Direct base/head lookup (GetPullRequestByBaseHead, gitea 1.22+ ⇒ every
     // supported Forgejo). A 404 means no PR for this pair; a closed/merged match is
     // not a resume target — either way tolerate it (the 409 may have been a
     // non-duplicate conflict) and let the create error propagate.
     const { apiBase, owner, repo } = forgejoRepoParts(p.repoUrl);
     const url = `${apiBase}/api/v1/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls/${encodeURIComponent(p.targetBranch)}/${encodeURIComponent(p.sourceBranch)}`;
-    const res = await this.request("GET", url, p.pat);
+    const res = await this.request("GET", url, p.pat, undefined, signal);
     if (res.status !== 200) return undefined;
     const obj = safeJson(await res.text());
     if (!obj || typeof obj !== "object") return undefined;
@@ -284,14 +287,14 @@ export class GitHubClient extends HttpForgeClient {
     return [409, 422];
   }
 
-  protected async findOpenMr(p: CreateMrParams): Promise<MergeRequest | undefined> {
+  protected async findOpenMr(p: CreateMrParams, signal?: AbortSignal): Promise<MergeRequest | undefined> {
     // List open PRs filtered by head (`owner:branch`, same-repo) and base. A match is
     // the first array element; anything else (empty list, non-200) means no resume
     // target and the create error propagates.
     const { apiBase, owner, repo } = githubRepoParts(p.repoUrl);
     const head = `${owner}:${p.sourceBranch}`;
     const url = `${apiBase}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls?state=open&head=${encodeURIComponent(head)}&base=${encodeURIComponent(p.targetBranch)}`;
-    const res = await this.request("GET", url, p.pat);
+    const res = await this.request("GET", url, p.pat, undefined, signal);
     if (res.status !== 200) return undefined;
     const list = safeJson(await res.text());
     if (!Array.isArray(list) || list.length === 0) return undefined;

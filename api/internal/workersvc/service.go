@@ -1192,6 +1192,15 @@ func (s *Service) SetLifecycle(l RunLifecycle) { s.lifecycle = l }
 // behavior), which is what the workersvc tests rely on.
 func (s *Service) SetVault(v *vault.Vault) { s.vlt = v }
 
+// SetCodexRefresh wires the production Codex oauth-exchange client into the coordinated
+// refresher (PRD #1171 M1, ships DARK), mirroring SetVault. Call once at startup, before
+// serving. In production main.go injects a fixed-endpoint, deadline-bounded
+// *codexauth.Client; tests inject a call-counting fake (or a real Client over a fake
+// httpDoer). A nil client (the default, and every test that never wires it) leaves
+// CoordinatedCodexRefresh refusing before it touches the provider
+// (ErrCodexRefreshNoClient) — so a deployment without it never rotates, fail-closed.
+func (s *Service) SetCodexRefresh(c CodexRefreshClient) { s.codexRefresh = c }
+
 // SetHealthSettings wires the run-health settings reader (PRD #47). Call once at
 // startup, before the sweeper runs, with the same settings cache the HTTP handlers
 // hold. A nil healthSettings (the default) disables the health detector entirely.
