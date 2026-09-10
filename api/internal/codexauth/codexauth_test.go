@@ -2,6 +2,8 @@ package codexauth
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -58,6 +60,34 @@ func newTestClient(tr *countingTransport) *Client {
 // real or real-looking contiguous token literal lives in tracked source.
 func assembleToken(prefix string) string {
 	return strings.Join([]string{prefix, "fixture", "not", "a", "real", "token"}, "-")
+}
+
+// assembleJWT builds a three-segment "a.b.c" JWT-shaped string from raw segment bytes,
+// each unpadded-base64url-encoded (base64.RawURLEncoding — the shape a real ChatGPT
+// access token uses, and what cmd/codexm3btestserver builds). It lets the fallback
+// tests construct a payload carrying an arbitrary claim object (or deliberately
+// malformed bytes) without a contiguous token literal in tracked source.
+func assembleJWT(header, payload, signature []byte) string {
+	enc := base64.RawURLEncoding.EncodeToString
+	return enc(header) + "." + enc(payload) + "." + enc(signature)
+}
+
+// jwtWithAccountID assembles a well-formed access-token JWT whose payload carries the
+// "https://api.openai.com/auth".chatgpt_account_id claim set to accountID — the
+// personal-seat shape DiscoverIdentity falls back to when /wham/usage omits account_id.
+func jwtWithAccountID(t *testing.T, accountID string) string {
+	t.Helper()
+	payload, err := json.Marshal(map[string]any{
+		"email": "seat@example.test",
+		"https://api.openai.com/auth": map[string]any{
+			"chatgpt_plan_type":  "pro",
+			"chatgpt_account_id": accountID,
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal claims: %v", err)
+	}
+	return assembleJWT([]byte(`{"alg":"none","typ":"JWT"}`), payload, []byte("sig"))
 }
 
 // (a) Both identity fields present → Identity returned, and the oauth counter is 0
@@ -208,5 +238,145 @@ func TestRefreshNoAccessToken(t *testing.T) {
 	_, err := c.Refresh(context.Background(), assembleToken("old-refresh"))
 	if !errors.Is(err, ErrNoAccessToken) {
 		t.Fatalf("err = %v, want ErrNoAccessToken", err)
+	}
+}
+
+// Personal-seat fallback: usage 200 with an empty account_id but a bearer JWT carrying
+// chatgpt_account_id → the claim supplies WorkspaceAccountID. Also proves the exact
+// bearer reached /wham/usage and that the discovery stayed nonrotating (zero oauth).
+func TestDiscoverIdentityAccountIDFromTokenClaim(t *testing.T) {
+	token := jwtWithAccountID(t, "acct-from-claim")
+	var gotAuth string
+	tr := newCountingTransport(func(key string, req *http.Request) (*http.Response, error) {
+		if key != usageKey {
+			t.Errorf("unexpected endpoint hit: %s", key)
+		}
+		gotAuth = req.Header.Get("Authorization")
+		return jsonResponse(http.StatusOK, `{"user_id":"user-abc"}`), nil
+	})
+	c := newTestClient(tr)
+
+	id, err := c.DiscoverIdentity(context.Background(), token)
+	if err != nil {
+		t.Fatalf("DiscoverIdentity: %v", err)
+	}
+	if id.ProviderUserID != "user-abc" || id.WorkspaceAccountID != "acct-from-claim" {
+		t.Fatalf("identity = %+v, want {user-abc acct-from-claim}", id)
+	}
+	if gotAuth != "Bearer "+token {
+		t.Fatalf("Authorization header = %q, want %q", gotAuth, "Bearer "+token)
+	}
+	if tr.counts[usageKey] != 1 {
+		t.Fatalf("usage endpoint hit %d times, want 1", tr.counts[usageKey])
+	}
+	if tr.counts[oauthKey] != 0 {
+		t.Fatalf("oauth endpoint hit %d times, want 0 (discovery must be nonrotating)", tr.counts[oauthKey])
+	}
+}
+
+// Precedence + lazy parse: a NON-empty account_id in the usage response wins, and the
+// token is not parsed at all — proven by a deliberately malformed bearer still yielding
+// the response's account id rather than an error.
+func TestDiscoverIdentityResponseAccountIDTakesPrecedence(t *testing.T) {
+	tr := newCountingTransport(func(key string, _ *http.Request) (*http.Response, error) {
+		if key != usageKey {
+			t.Errorf("unexpected endpoint hit: %s", key)
+		}
+		return jsonResponse(http.StatusOK, `{"user_id":"user-abc","account_id":"acct-from-usage"}`), nil
+	})
+	c := newTestClient(tr)
+
+	id, err := c.DiscoverIdentity(context.Background(), "not-a-jwt")
+	if err != nil {
+		t.Fatalf("DiscoverIdentity: %v", err)
+	}
+	if id.ProviderUserID != "user-abc" {
+		t.Fatalf("ProviderUserID = %q, want user-abc", id.ProviderUserID)
+	}
+	if id.WorkspaceAccountID != "acct-from-usage" {
+		t.Fatalf("WorkspaceAccountID = %q, want acct-from-usage (response must win, malformed token never parsed)", id.WorkspaceAccountID)
+	}
+}
+
+// Malformed/absent account-id claim: with user_id present but account_id absent from the
+// usage response, each structurally broken token falls through to ErrIdentityIncomplete.
+func TestDiscoverIdentityMalformedTokenClaimStaysIncomplete(t *testing.T) {
+	enc := base64.RawURLEncoding.EncodeToString
+	header := []byte(`{"alg":"none","typ":"JWT"}`)
+	sig := []byte("sig")
+	cases := []struct {
+		name  string
+		token string
+	}{
+		// (a) two segments instead of three.
+		{"wrong segment count", enc(header) + "." + enc([]byte(`{"https://api.openai.com/auth":{"chatgpt_account_id":"acct"}}`))},
+		// (b) payload segment is not valid base64url ('!' is outside the alphabet).
+		{"bad base64 payload", enc(header) + ".!!!not-base64!!!." + enc(sig)},
+		// (c) payload decodes to bytes that are not JSON.
+		{"valid base64 invalid json", assembleJWT(header, []byte("not-json"), sig)},
+		// (d) valid JSON but no OpenAI auth namespace.
+		{"missing namespace", assembleJWT(header, []byte(`{"email":"seat@example.test"}`), sig)},
+		// (e) namespace present but the account-id claim is missing.
+		{"namespace without account id", assembleJWT(header, []byte(`{"https://api.openai.com/auth":{"chatgpt_plan_type":"pro"}}`), sig)},
+		// (e') namespace present but the account-id claim is the empty string.
+		{"empty account id", assembleJWT(header, []byte(`{"https://api.openai.com/auth":{"chatgpt_account_id":""}}`), sig)},
+		// (f) account-id claim present but the wrong JSON type (number, not string).
+		{"account id wrong type", assembleJWT(header, []byte(`{"https://api.openai.com/auth":{"chatgpt_account_id":12345}}`), sig)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tr := newCountingTransport(func(string, *http.Request) (*http.Response, error) {
+				return jsonResponse(http.StatusOK, `{"user_id":"user-abc"}`), nil
+			})
+			c := newTestClient(tr)
+
+			_, err := c.DiscoverIdentity(context.Background(), tc.token)
+			if !errors.Is(err, ErrIdentityIncomplete) {
+				t.Fatalf("err = %v, want ErrIdentityIncomplete", err)
+			}
+			if tr.counts[oauthKey] != 0 {
+				t.Fatalf("oauth endpoint hit %d times, want 0", tr.counts[oauthKey])
+			}
+		})
+	}
+}
+
+// user_id anchor: even a well-formed account-id claim never manufactures a subject. With
+// account_id present in the response but user_id absent, identity stays incomplete.
+func TestDiscoverIdentityUserIDNeverFromToken(t *testing.T) {
+	token := jwtWithAccountID(t, "acct-from-claim")
+	tr := newCountingTransport(func(string, *http.Request) (*http.Response, error) {
+		return jsonResponse(http.StatusOK, `{"account_id":"acct-from-usage"}`), nil
+	})
+	c := newTestClient(tr)
+
+	_, err := c.DiscoverIdentity(context.Background(), token)
+	if !errors.Is(err, ErrIdentityIncomplete) {
+		t.Fatalf("err = %v, want ErrIdentityIncomplete (user_id is never derived from the token)", err)
+	}
+	if tr.counts[oauthKey] != 0 {
+		t.Fatalf("oauth endpoint hit %d times, want 0", tr.counts[oauthKey])
+	}
+}
+
+// Non-2xx short-circuits before any token parse: a 401 with a valid-claim bearer yields
+// the typed *AuthError, never an identity synthesised from the claim.
+func TestDiscoverIdentityUnauthorizedIgnoresTokenClaim(t *testing.T) {
+	token := jwtWithAccountID(t, "acct-from-claim")
+	tr := newCountingTransport(func(string, *http.Request) (*http.Response, error) {
+		return jsonResponse(http.StatusUnauthorized, `{"error":"invalid_token"}`), nil
+	})
+	c := newTestClient(tr)
+
+	_, err := c.DiscoverIdentity(context.Background(), token)
+	var authErr *AuthError
+	if !errors.As(err, &authErr) {
+		t.Fatalf("err = %v, want *AuthError", err)
+	}
+	if authErr.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", authErr.StatusCode)
+	}
+	if tr.counts[oauthKey] != 0 {
+		t.Fatalf("oauth endpoint hit %d times, want 0", tr.counts[oauthKey])
 	}
 }
