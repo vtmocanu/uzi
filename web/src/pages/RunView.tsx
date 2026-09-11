@@ -26,6 +26,7 @@ import { canReworkNow, canToggleMrRework, effectiveMrRework } from "../lib/mrRew
 import { stripUnsafeChars } from "../lib/safeText";
 import { useNow } from "../lib/useNow";
 import {
+  effectiveMilestoneAgents,
   effectiveRunStatus,
   firstInProgressMilestoneId,
   formatElapsed,
@@ -38,6 +39,7 @@ import {
   mrChipTitle,
   shadowSignal,
   shouldShowHealthFlag,
+  uniqueLiveMatchMilestoneId,
 } from "../lib/runBadge";
 import { activityAge, latestActivity } from "../lib/runActivity";
 import { forgeNounLower, mrAbbrev, mrRefSymbol } from "../lib/forgeNoun";
@@ -219,17 +221,29 @@ function MilestoneMark({ state }: { state: "done" | "in_progress" | "left" }) {
 //   - unattached — activity exists but no milestone is declared in progress: a faint
 //                border, sitting directly under the header.
 //
-// 🔴 ALL FOUR display fields (agent, agent_label, tool, detail) are folded through
-// stripUnsafeChars here (defense-in-depth): the server caps/strips only detail and
-// agent_label, so agent and tool arrive UNSANITIZED on the wire — an auditor note. The
-// pulsing dot uses animate-pulse, which index.css neutralizes under prefers-reduced-motion.
+// 🔴 ALL display fields are folded through stripUnsafeChars here (defense-in-depth): the
+// server caps/strips only detail and agent_label, so agent/role and tool arrive UNSANITIZED
+// on the wire — an auditor note. In the PRD #1224 per-milestone-attribution path (M5) the
+// role/label are the DECLARED agent/agent_label (equally untrusted), so the same fold covers
+// them. The pulsing dot uses animate-pulse, which index.css neutralizes under
+// prefers-reduced-motion.
+//
+// PRD #1224 M5 (D3): `live` carries the current tool/detail/age. It is non-null for TODAY's
+// activity-driven strip (the D8-fallback path) AND for the single unique-match milestone in
+// the attributed path; it is null for a declared-only strip (a sibling attribution, or every
+// strip when a repeated role makes the live join ambiguous), which then shows role + label
+// only — no tool line, no age. The waiting/border/dot logic stays keyed on status/variant.
 function MilestoneNowStrip({
-  activity,
+  role,
+  label,
+  live,
   status,
   now,
   variant,
 }: {
-  activity: RunActivity;
+  role: string;
+  label: string;
+  live: { tool: string; detail: string; at: string } | null;
   status: string;
   now: number;
   variant: "active" | "unattached";
@@ -237,11 +251,14 @@ function MilestoneNowStrip({
   const waiting =
     status === "limit_wait" || status === "pool_wait" || status === "recovery_wait";
   const waitingLabel = status === "recovery_wait" ? "waiting to recover" : "waiting on rate limit";
-  const age = activityAge(activity.at, now);
-  const role = stripUnsafeChars(activity.agent);
-  const label = stripUnsafeChars(activity.agent_label);
-  const tool = stripUnsafeChars(activity.tool);
-  const detail = stripUnsafeChars(activity.detail);
+  const safeRole = stripUnsafeChars(role);
+  const safeLabel = stripUnsafeChars(label);
+  // Live tool/age only when the caller passed a live frame; a declared-only strip shows the
+  // role + label alone (age stays "" so neither the "X ago" token nor a waiting-suffix age
+  // renders).
+  const age = live ? activityAge(live.at, now) : "";
+  const tool = live ? stripUnsafeChars(live.tool) : "";
+  const detail = live ? stripUnsafeChars(live.detail) : "";
   const toolText = tool ? (detail ? `${tool} ${detail}` : tool) : detail;
   const border = waiting ? "border-warning" : variant === "unattached" ? "border-faint" : "border-ok/50";
   const accent = waiting ? "text-warning" : "text-ok";
@@ -249,8 +266,8 @@ function MilestoneNowStrip({
   return (
     <div className={cx("mt-1.5 flex items-center gap-2 border-l-2 py-1 pl-3 text-xs", border)}>
       <span aria-hidden className={cx("h-1.5 w-1.5 shrink-0 rounded-full animate-pulse", dotBg)} />
-      <span className={cx("shrink-0 font-medium", accent)}>{role}</span>
-      {label && <span className="min-w-0 flex-1 truncate italic text-muted">{label}</span>}
+      <span className={cx("shrink-0 font-medium", accent)}>{safeRole}</span>
+      {safeLabel && <span className="min-w-0 flex-1 truncate italic text-muted">{safeLabel}</span>}
       {toolText && <span className="min-w-0 shrink truncate font-mono text-faint">{toolText}</span>}
       <span className="ml-auto shrink-0 whitespace-nowrap font-mono tabular-nums text-faint">
         {waiting ? `${waitingLabel}${age ? ` · ${age}` : ""}` : age ? `${age} ago` : ""}
@@ -296,6 +313,17 @@ export function MilestoneChecklist({ run, activity = null }: { run: Run; activit
   // D4: the first in-progress id by frozen order is the one the header names and the
   // strip attaches under. null when nothing is declared in progress.
   const firstInProgress = firstInProgressMilestoneId(run);
+  // PRD #1224 M5 (D8): "effective attribution" = milestones_agents entries whose milestone
+  // is CURRENTLY in progress, in frozen order. ONLY a non-empty list activates per-milestone
+  // rendering; null / [] / stale-only fall back to the pre-#1224 render below (the M4
+  // baseline guards that path). We branch on this LENGTH, never on milestones_agents != null.
+  const effective = effectiveMilestoneAgents(run);
+  const attributed = effective.length > 0;
+  const effectiveById = new Map(effective.map((e) => [e.id, e]));
+  // D3: live tool/age enriches a strip ONLY when EXACTLY ONE effective attribution's declared
+  // agent byte-matches the live activity agent; zero or 2+ matches (a repeated role) suppress
+  // live on ALL strips — every strip then shows declared role + label only.
+  const uniqueMatchId = activity ? uniqueLiveMatchMilestoneId(effective, activity.agent) : null;
   return (
     <Card className="p-4">
       <div className="mb-3 flex items-center justify-between gap-2">
@@ -315,13 +343,24 @@ export function MilestoneChecklist({ run, activity = null }: { run: Run; activit
         </span>
       </div>
       {/* Unattached strip: a milestone run with activity but nothing declared in progress
-          shows the "now" line directly under the header (D5's "nothing declared" variant). */}
-      {!firstInProgress && activity && (
-        <MilestoneNowStrip activity={activity} status={run.status} now={now} variant="unattached" />
+          shows the "now" line directly under the header (D5's "nothing declared" variant).
+          ONLY in the D8-fallback (unattributed) path — in the attributed path every strip
+          hangs off its own milestone row, so no unattached strip renders (and effective is
+          non-empty only when some milestone is in progress, so firstInProgress is set). */}
+      {!attributed && !firstInProgress && activity && (
+        <MilestoneNowStrip
+          role={activity.agent}
+          label={activity.agent_label}
+          live={{ tool: activity.tool, detail: activity.detail, at: activity.at }}
+          status={run.status}
+          now={now}
+          variant="unattached"
+        />
       )}
       <ul className="mt-2 space-y-1.5">
         {milestones.map((m) => {
           const state = completed.has(m.id) ? "done" : inProgress.has(m.id) ? "in_progress" : "left";
+          const attribution = effectiveById.get(m.id);
           return (
             <li key={m.id} className="text-sm">
               <div className="flex items-center gap-2">
@@ -336,12 +375,38 @@ export function MilestoneChecklist({ run, activity = null }: { run: Run; activit
                   {stripUnsafeChars(m.title)}
                 </span>
               </div>
-              {/* Attached strip: the "now" line sits under the FIRST in-progress row only
-                  (D4), so a second in-progress milestone keeps its ◐ mark and carries no
-                  strip. */}
-              {activity && m.id === firstInProgress && (
-                <MilestoneNowStrip activity={activity} status={run.status} now={now} variant="active" />
-              )}
+              {/* PRD #1224 M5 attributed path (D8/D3/D9): every in-progress milestone with an
+                  effective attribution shows its DECLARED role + label; live tool/age is added
+                  ONLY to the single unique-match milestone (D3). The ◐ mark above is untouched
+                  (D9 — attribution is strictly additive). */}
+              {attributed
+                ? attribution && (
+                    <MilestoneNowStrip
+                      role={attribution.agent}
+                      label={attribution.agent_label}
+                      live={
+                        m.id === uniqueMatchId && activity
+                          ? { tool: activity.tool, detail: activity.detail, at: activity.at }
+                          : null
+                      }
+                      status={run.status}
+                      now={now}
+                      variant="active"
+                    />
+                  )
+                : // D8-fallback (unattributed): the "now" line sits under the FIRST in-progress
+                  // row only (D4), sourced from the activity prop — structurally today's render.
+                  activity &&
+                  m.id === firstInProgress && (
+                    <MilestoneNowStrip
+                      role={activity.agent}
+                      label={activity.agent_label}
+                      live={{ tool: activity.tool, detail: activity.detail, at: activity.at }}
+                      status={run.status}
+                      now={now}
+                      variant="active"
+                    />
+                  )}
             </li>
           );
         })}

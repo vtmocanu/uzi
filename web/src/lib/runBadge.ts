@@ -7,6 +7,7 @@ import {
   isTerminalRun,
   type LatestRun,
   type Milestone,
+  type MilestoneAgent,
   type RunHealth,
   type RunPriority,
   type StopKind,
@@ -687,6 +688,64 @@ export function firstInProgressMilestoneId(run: {
     if (inProgress.has(m.id)) return m.id;
   }
   return null;
+}
+
+// effectiveMilestoneAgents returns the run's per-milestone agent attributions
+// (milestones_agents) filtered to entries whose milestone id is CURRENTLY in progress AND NOT
+// already completed — the PRD #1224 D6 read-time re-filter — in FROZEN milestone order
+// (run.milestones is the source of order, never the milestones_agents array order). This is the
+// D8 "effective attribution" trigger: ONLY a non-empty result activates per-milestone rendering;
+// null / [] / stale-only (entries whose id is not in the live in-progress set) all yield [] and
+// fall the surface back to the pre-#1224 render. A duplicate id keeps its first entry (the server
+// validates uniqueness, so this is defensive).
+//
+// The completed re-filter mirrors the Go/TUI helper (api/cmd/uzi/tui_detail_rail.go
+// effectiveMilestoneAgents, which likewise excludes `completed[ma.ID]`) and the render's OWN
+// done-precedence: MilestoneChecklist marks a milestone ✓ done whenever its id is in
+// milestones_completed, ahead of in-progress. The server validates milestones_completed and
+// milestones_in_progress INDEPENDENTLY, so an id can be reported in BOTH — and a done milestone
+// must never show a live "now working" strip. Excluding completed ids here keeps that suppression
+// consistent across web and TUI/CLI.
+export function effectiveMilestoneAgents(run: {
+  milestones?: Milestone[] | null;
+  milestones_in_progress?: string[] | null;
+  milestones_completed?: string[] | null;
+  milestones_agents?: MilestoneAgent[] | null;
+}): MilestoneAgent[] {
+  const frozen = run.milestones ?? [];
+  const inProgress = new Set(run.milestones_in_progress ?? []);
+  const completed = new Set(run.milestones_completed ?? []);
+  const byId = new Map<string, MilestoneAgent>();
+  for (const a of run.milestones_agents ?? []) {
+    if (!byId.has(a.id)) byId.set(a.id, a);
+  }
+  const out: MilestoneAgent[] = [];
+  for (const m of frozen) {
+    if (!inProgress.has(m.id)) continue;
+    if (completed.has(m.id)) continue;
+    const a = byId.get(m.id);
+    if (a) out.push(a);
+  }
+  return out;
+}
+
+// uniqueLiveMatchMilestoneId returns the milestone id of the SINGLE effective attribution
+// whose declared agent byte-matches the live activity agent — the PRD #1224 D3 live-
+// enrichment join. Returns null on ZERO or TWO-OR-MORE matches: a repeated role is ambiguous,
+// so live tool/age is suppressed on ALL strips rather than guessed onto one. activityAgent is
+// the current_activity.agent the strip would enrich from (null/undefined/"" never matches).
+export function uniqueLiveMatchMilestoneId(
+  effective: MilestoneAgent[],
+  activityAgent: string | null | undefined,
+): string | null {
+  if (!activityAgent) return null;
+  let match: string | null = null;
+  for (const e of effective) {
+    if (e.agent !== activityAgent) continue;
+    if (match !== null) return null; // two-or-more → ambiguous, suppress on all
+    match = e.id;
+  }
+  return match;
 }
 
 // hasActiveRun reports whether a card's latest run is still non-terminal. The

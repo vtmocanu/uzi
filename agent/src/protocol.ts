@@ -685,6 +685,28 @@ export interface Proposal {
 export interface MilestoneProgress {
   completed: string[];
   in_progress: string[];
+  /**
+   * PRD #1224 M1: the lead's OPTIONAL per-in-progress-milestone agent attribution.
+   * Present only when the lead declared it on `report_progress`; absent otherwise, so a
+   * run that declares nothing behaves exactly as today. Rides `running` reports only,
+   * alongside `milestones_in_progress`. The api is the authority on validation.
+   */
+  milestones_agents?: MilestoneAgent[];
+}
+
+/**
+ * PRD #1224 M1: one lead-declared attribution linking an in-progress milestone to the
+ * agent working it. `agent` is the EXACT `subagent_type` identifier the lead passed to
+ * its Agent/Task dispatch — the only value that byte-matches the server's
+ * `current_activity.agent` (which is derived from `subagent_type`), so it is what the
+ * server joins on; it is stored byte-exact and must NOT be transformed beyond trimming.
+ * `agent_label` is optional short display text. Subagents never declare this (the
+ * `isSubagentFrame` firewall keeps holding); the api is the authority on validation.
+ */
+export interface MilestoneAgent {
+  id: string;
+  agent: string;
+  agent_label?: string;
 }
 
 /**
@@ -1739,6 +1761,12 @@ export interface StateRequest {
    *  and an informational field never fails a run. */
   milestones_completed?: string[];
   milestones_in_progress?: string[];
+  /** PRD #1224 M1: the lead's OPTIONAL per-in-progress-milestone agent attribution.
+   *  Additive-optional: omitted entirely by a lead that declared nothing, so the wire
+   *  shape matches a pre-#1224 worker. Rides `running` reports only, ALONGSIDE
+   *  `milestones_in_progress` (each entry's `id` should also appear there). The api is the
+   *  authority on validation (per-entry drop, byte-exact `agent` join, label strip+cap). */
+  milestones_agents?: MilestoneAgent[];
   /** PRD #628 M4: the TREE signal that this run's clone reseeded from the DEFAULT branch
    *  on a cross-worker re-claim (`seededFrom === "default"` / `priorCommits === 0`) — no
    *  committed work was recovered, so pass-1's `milestones_completed` is stale and the

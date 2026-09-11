@@ -1076,6 +1076,18 @@ UPDATE runs SET
         WHEN sqlc.narg('milestones_in_progress')::jsonb IS NULL THEN milestones_in_progress
         ELSE sqlc.narg('milestones_in_progress')::jsonb
     END,
+    -- PRD #1224 M2 (Decision 6): the per-milestone agent attribution moves WITH the
+    -- validated in_progress write — keyed on the SAME milestones_in_progress narg gate, NOT
+    -- its own presence. So a report that does not validly update in_progress leaves this
+    -- column untouched; a report that DOES update in_progress overwrites this with the
+    -- validated attribution subset the service passes ('[]' when none survive, clearing a
+    -- departed lane's stale entry). The service (M3) only sets the milestones_agents param
+    -- when it also writes in_progress; a nil param here with a present in_progress means
+    -- "in_progress advanced, no attribution survived" → '[]'.
+    milestones_agents = CASE
+        WHEN sqlc.narg('milestones_in_progress')::jsonb IS NULL THEN milestones_agents
+        ELSE COALESCE(sqlc.narg('milestones_agents')::jsonb, '[]'::jsonb)
+    END,
     -- Exit contract (PRD #47 Decision 3), guarded so it fires only on ENTRY to
     -- running. This statement is also the running→running heartbeat (idempotent),
     -- and an unconditional reset would clear the detector's flag on every heartbeat;
@@ -1972,6 +1984,9 @@ UPDATE runs SET
     -- 'chat'-only, and progressParams gates milestone writes to issue runs, so its snapshot
     -- is always NULL — the clear there would be a no-op and is deliberately omitted.)
     milestones_in_progress = NULL,
+    -- PRD #1224 M2 (Decision 7): the per-milestone agent attribution rides the SAME
+    -- terminal clear as in_progress above — dead run, no in-progress lanes, no attribution.
+    milestones_agents = NULL,
     -- PRD #1190 M1: a terminal run carries no pending pause. Clearing the three
     -- pause columns on every terminal transition makes the design true at the root:
     -- a run that completes, fails or is cancelled while carrying an owner's pending
@@ -2040,6 +2055,7 @@ UPDATE runs SET
     finished_at        = now(),
     -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
     milestones_in_progress = NULL,
+    milestones_agents = NULL,
     -- PRD #1190 M1: a terminal run carries no pending pause (root-cause clear; see SetRunCompleted).
     pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
@@ -2066,6 +2082,7 @@ UPDATE runs SET
     finished_at        = now(),
     -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
     milestones_in_progress = NULL,
+    milestones_agents = NULL,
     -- PRD #1190 M1: a terminal run carries no pending pause (root-cause clear; see SetRunCompleted).
     pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
@@ -2086,6 +2103,7 @@ UPDATE runs SET status = 'cancelled', status_since = now(), stop_kind = 'cancell
     stop_reason = @stop_reason,
     -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
     milestones_in_progress = NULL,
+    milestones_agents = NULL,
     -- PRD #1190 M1: a terminal run carries no pending pause (root-cause clear; see SetRunCompleted).
     pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
@@ -2125,6 +2143,7 @@ UPDATE runs SET
     finished_at        = now(),
     -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
     milestones_in_progress = NULL,
+    milestones_agents = NULL,
     -- PRD #1190 M1: a terminal run carries no pending pause (root-cause clear; see SetRunCompleted).
     pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
@@ -2173,6 +2192,7 @@ UPDATE runs SET status = 'failed', status_since = now(),
     finished_at        = now(),
     -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
     milestones_in_progress = NULL,
+    milestones_agents = NULL,
     -- PRD #1190 M1: a terminal run carries no pending pause (root-cause clear; see SetRunCompleted).
     pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
@@ -2241,6 +2261,7 @@ UPDATE runs SET status = 'failed', status_since = now(), stop_kind = 'plan_rejec
     failure_reason = @failure_reason, move_pending_since = now(), finished_at = now(),
     -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
     milestones_in_progress = NULL,
+    milestones_agents = NULL,
     -- PRD #1190 M1: a terminal run carries no pending pause (root-cause clear; see SetRunCompleted).
     pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
@@ -2455,6 +2476,7 @@ UPDATE runs SET status = 'failed', status_since = now(), failure_reason = @failu
     move_pending_since = now(), finished_at = now(),
     -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
     milestones_in_progress = NULL,
+    milestones_agents = NULL,
     -- PRD #1190 M1: a terminal run carries no pending pause (root-cause clear; see SetRunCompleted).
     pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
     -- Exit contract (PRD #47 Decision 3): a timed-out run must not keep a stale ⚠.
@@ -2503,6 +2525,7 @@ UPDATE runs SET status = 'failed', status_since = now(), failure_reason = @failu
     move_pending_since = now(), finished_at = now(),
     -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
     milestones_in_progress = NULL,
+    milestones_agents = NULL,
     -- PRD #1190 M1: a terminal run carries no pending pause (root-cause clear; see SetRunCompleted).
     pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
@@ -2557,6 +2580,7 @@ UPDATE runs SET status = 'failed', status_since = now(), failure_reason = @failu
     move_pending_since = now(), finished_at = now(),
     -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
     milestones_in_progress = NULL,
+    milestones_agents = NULL,
     -- PRD #1190 M1: a terminal run carries no pending pause (root-cause clear; see SetRunCompleted).
     pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.

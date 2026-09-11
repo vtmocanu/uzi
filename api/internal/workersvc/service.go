@@ -28,6 +28,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/autoselect"
 	"github.com/vtmocanu/uzi/api/internal/board"
 	"github.com/vtmocanu/uzi/api/internal/capability"
@@ -2007,6 +2008,11 @@ type StateRequest struct {
 	// persisted, and never fails the report.
 	MilestonesCompleted  *[]string `json:"milestones_completed"`
 	MilestonesInProgress *[]string `json:"milestones_in_progress"`
+	// MilestonesAgents is the lead's OPTIONAL per-in-progress-milestone agent attribution
+	// (PRD #1224). RAW, UNVALIDATED wire input decoded here; milestoneAgentsParam
+	// per-entry-validates it (Decision 4/5) and couples the write to the validated in_progress
+	// set (Decision 6). Absent (nil) ⇒ nothing declared. Rides `running` reports only.
+	MilestonesAgents *[]apitypes.MilestoneAgent `json:"milestones_agents"`
 	// SeededFromDefault (PRD #628 M4) is the worker's TREE signal that a cross-worker
 	// re-claim reseeded from the DEFAULT branch (seededFrom === "default" / priorCommits
 	// === 0) — no committed work was recovered, so pass-1's milestones_completed is stale
@@ -2680,6 +2686,12 @@ func (s *Service) runningStateParams(ctx context.Context, run store.Run, req Sta
 	// is unioned server-side, in_progress overwritten. Additive-optional, never fails the
 	// report.
 	p.MilestonesCompleted, p.MilestonesInProgress = progressParams(run.Kind, run.MilestonesFrozen, req.MilestonesCompleted, req.MilestonesInProgress)
+
+	// PRD #1224 (Decision 6): couple the validated attribution to the in_progress write.
+	// Keyed on the validated in_progress JSON (nil ⇒ in_progress not updated ⇒ leave the
+	// column untouched); when in_progress IS updated, milestoneAgentsParam returns the
+	// validated subset ('[]' when none survive), which the SQL COALESCEs.
+	p.MilestonesAgents = milestoneAgentsParam(run.Kind, p.MilestonesInProgress, req.MilestonesAgents)
 
 	// PRD #1226 M1 (D1): for an INTERLOCKED autopilot run that has not yet frozen its
 	// contract, build the structural completion contract to freeze on this `running` report

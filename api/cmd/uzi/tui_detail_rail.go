@@ -259,6 +259,71 @@ func milestoneInProgressIDs(run apitypes.RunDTO) []string {
 	return ids
 }
 
+// effectiveMilestoneAgents is the per-milestone agent attribution (PRD #1224) after the D6
+// read-time re-filter: MilestonesAgents keyed by milestone id, restricted to entries whose id is
+// GENUINELY in progress — a member of the live MilestonesInProgress set AND not already completed,
+// the same set milestoneInProgressIDs draws. Returns nil when nothing survives, so a caller can
+// branch on "effective attribution present" via `len(...) > 0` — the D8 trigger, NOT a
+// milestones_agents-non-nil test, because D6 persists `[]` on a valid progress update with no
+// attribution. First-occurrence-wins on a duplicated id mirrors the server's first-valid-wins
+// (D5). The map values are copied whole; the id/agent/label fields are drawn (and folded) by the
+// renderers, never here. Shared by the TUI crew rail and the CLI `run get` so the two surfaces
+// activate per-milestone attribution off the identical rule.
+func effectiveMilestoneAgents(run apitypes.RunDTO) map[string]apitypes.MilestoneAgent {
+	if len(run.MilestonesAgents) == 0 || len(run.MilestonesInProgress) == 0 || len(run.Milestones) == 0 {
+		return nil
+	}
+	inProg := make(map[string]bool, len(run.MilestonesInProgress))
+	for _, id := range run.MilestonesInProgress {
+		inProg[id] = true
+	}
+	completed := make(map[string]bool, len(run.MilestonesCompleted))
+	for _, id := range run.MilestonesCompleted {
+		completed[id] = true
+	}
+	frozen := make(map[string]bool, len(run.Milestones))
+	for _, mi := range run.Milestones {
+		frozen[mi.ID] = true
+	}
+	var out map[string]apitypes.MilestoneAgent
+	for _, ma := range run.MilestonesAgents {
+		if !frozen[ma.ID] || !inProg[ma.ID] || completed[ma.ID] {
+			continue
+		}
+		if _, dup := out[ma.ID]; dup {
+			continue // first-occurrence wins (matches the server's first-valid-wins, D5)
+		}
+		if out == nil {
+			out = make(map[string]apitypes.MilestoneAgent, len(run.MilestonesAgents))
+		}
+		out[ma.ID] = ma
+	}
+	return out
+}
+
+// uniqueMilestoneAgentMatch returns the milestone id of the SINGLE effective attribution whose
+// DECLARED agent byte-matches the run's live activity agent (PRD #1224 D3): live tool/age enriches
+// that lane alone. It returns "" when zero or two-plus effective entries share the activity's role
+// (a repeated role) — so a lane's live tool/age is never printed under a sibling lane's milestone,
+// the one non-guessing rule, since the lead lacks agent_instance to disambiguate. An empty
+// activityAgent (a bare lead frame) matches nothing (effective agents are non-empty, IsValidName
+// identifiers).
+func uniqueMilestoneAgentMatch(eff map[string]apitypes.MilestoneAgent, activityAgent string) string {
+	if activityAgent == "" {
+		return ""
+	}
+	id, n := "", 0
+	for mid, ma := range eff {
+		if ma.Agent == activityAgent {
+			id, n = mid, n+1
+		}
+	}
+	if n == 1 {
+		return id
+	}
+	return ""
+}
+
 // milestoneIPSuffix builds the eyebrow's `<id>, <id> +N` in-progress suffix from the frozen-order
 // in-progress id list, BUDGETED to fit maxWidth visual columns (the width the rail line can carry):
 // up to two ids joined by ", ", then " +N" for the rest (`m1`, `m1, m2`, `m1, m2 +1`), dropping to a
@@ -417,6 +482,21 @@ func (m tuiModel) renderMilestones() string {
 	if !terminal {
 		act = railActivity(m.detail.frames)
 	}
+	// Per-milestone agent attribution (PRD #1224 M6). effAgents is the D6-refiltered attribution
+	// keyed by milestone id; a NON-EMPTY effAgents is the D8 trigger that switches the now-line from
+	// the single first-in-progress attach point to one DECLARED role line per attributed milestone.
+	// Computed only for a non-terminal run: a terminal run has no "now" (act is nil) and, per D7, the
+	// server clears the attribution on every terminal transition, so a stale snapshot never activates
+	// attribution here. uniqueID is the single lane whose declared agent matches the live activity —
+	// the only milestone that also shows live age (D3).
+	var effAgents map[string]apitypes.MilestoneAgent
+	uniqueID := ""
+	if !terminal {
+		effAgents = effectiveMilestoneAgents(m.detail.run)
+		if act != nil {
+			uniqueID = uniqueMilestoneAgentMatch(effAgents, act.Agent)
+		}
+	}
 	var sb strings.Builder
 	// The eyebrow gets a milestone micro-bar (▰ done / ▱ remaining) beside the count, the rail
 	// twin of the board's micro-bar, with the in-progress cell blinking in the tungsten colour
@@ -451,8 +531,9 @@ func (m tuiModel) renderMilestones() string {
 	}
 	// Nothing declared in progress but there IS activity: an unattached now line directly under
 	// the eyebrow (PRD #1064 mock; #390 D7 — declared, not inferred, so the milestone stays
-	// unmarked).
-	if ipID == "" && act != nil {
+	// unmarked). Suppressed under effective attribution (PRD #1224 D8): the per-milestone declared
+	// lines below carry the crew, so no unattached line rides the eyebrow in that branch.
+	if len(effAgents) == 0 && ipID == "" && act != nil {
 		sb.WriteString(m.railNowLines(act, " ", "   "))
 	}
 	for _, mi := range ms {
@@ -473,8 +554,26 @@ func (m tuiModel) renderMilestones() string {
 			style = lipgloss.NewStyle() // current — plain terminal fg, like the web's text-fg
 		}
 		sb.WriteString(" " + glyph + " " + style.Render(m.renderer.Plain(mi.Title, milestoneTitleCap)) + "\n")
-		// The now line rides beneath the in-progress milestone it belongs to.
-		if mi.ID == ipID && act != nil {
+		// The now line rides beneath the in-progress milestone it belongs to. Under effective
+		// attribution (PRD #1224 D8) every attributed in-progress milestone gets a DECLARED role
+		// line (role + label), and only the D3 unique-matching lane also shows the live age; else
+		// the render is exactly today's single first-in-progress now-line under ipID.
+		switch {
+		case len(effAgents) > 0:
+			if e, ok := effAgents[mi.ID]; ok {
+				age := ""
+				if act != nil && mi.ID == uniqueID {
+					age = relAge(act.At)
+				}
+				// Bound to locals so the declared role/label reach railMilestoneAgentLines (which
+				// folds BOTH through renderer.Plain) as plumbing, not as a raw draw — the same
+				// copy-then-render shape the laneFrame converters use. The hostile-render test
+				// (TestTUIViewsStripControlBytesFromUntrustedText) is the standing proof the fold
+				// holds; the D7 AST guard cannot see through the indirection (its documented gap D).
+				role, label := e.Agent, e.AgentLabel
+				sb.WriteString(m.railMilestoneAgentLines(role, label, age, "   ", "     "))
+			}
+		case mi.ID == ipID && act != nil:
 			sb.WriteString(m.railNowLines(act, "   ", "     "))
 		}
 	}
@@ -494,6 +593,31 @@ func (m tuiModel) railNowLines(act *apitypes.RunActivity, arrowIndent, labelInde
 	if lbl := activityLabel(act); lbl != "" {
 		lst := lipgloss.NewStyle().Foreground(m.pal.faintC).Italic(true)
 		sb.WriteString(labelIndent + lst.Render(m.renderer.Plain(lbl, milestoneTitleCap)) + "\n")
+	}
+	return sb.String()
+}
+
+// railMilestoneAgentLines renders the crew rail's DECLARED attribution line beneath an
+// effective-attributed in-progress milestone (PRD #1224 M6, D3): a `↳ <role>` line carrying the
+// milestone's declared subagent role and — ONLY for the D3 unique-matching lane, where the caller
+// passes a non-empty age — the live age appended as ` · <age>`; a non-matching lane (or every lane
+// when a repeated role suppresses enrichment) passes age "" and shows the role with no age. When
+// the declared label is non-empty an italic label line follows, exactly like railNowLines'
+// second line. It mirrors railNowLines' shape and indents (arrowIndent/labelIndent place the lines
+// under their owning milestone) but draws the DECLARED role/label rather than the live activity's.
+// role is MilestoneAgent.Agent (an IsValidName-validated, terminal-safe identifier) and label is
+// MilestoneAgent.AgentLabel (UNTRUSTED, model-authored display text); BOTH ride renderer.Plain, the
+// same D4/D7 fold railNowLines applies to the RunActivity fields.
+func (m tuiModel) railMilestoneAgentLines(role, label, age, arrowIndent, labelIndent string) string {
+	var sb strings.Builder
+	line := arrowIndent + m.pal.faint.Render("↳ ") + m.pal.state(crewWorking).Render(m.renderer.Plain(role, 14))
+	if age != "" {
+		line += m.pal.faint.Render(" · " + age)
+	}
+	sb.WriteString(line + "\n")
+	if label != "" {
+		lst := lipgloss.NewStyle().Foreground(m.pal.faintC).Italic(true)
+		sb.WriteString(labelIndent + lst.Render(m.renderer.Plain(label, milestoneTitleCap)) + "\n")
 	}
 	return sb.String()
 }

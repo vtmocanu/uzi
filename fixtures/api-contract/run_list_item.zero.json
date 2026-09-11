@@ -19,6 +19,7 @@
   "milestones_candidate": null,
   "milestones_completed": null,
   "milestones_in_progress": null,
+  "milestones_agents": null,
   "budget_max_iterations": null,
   "budget_wall_seconds": null,
   "scope_ceiling": null,

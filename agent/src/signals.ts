@@ -19,6 +19,7 @@ import { z } from "zod";
 import type {
   AskUserQuestion,
   Milestone,
+  MilestoneAgent,
   MilestoneProgress,
   Proposal,
 } from "./protocol.js";
@@ -91,7 +92,10 @@ export interface ScannedSignals {
    *  made one. MAIN-THREAD-ONLY (extracted behind the same isSubagentFrame guard as the
    *  plan and milestones), so a subagent frame can never move the run's progress. Both
    *  arrays are defensively parsed — malformed input yields empty arrays, never a throw.
-   *  Present whenever a report_progress tool_use was seen on a main-thread frame. */
+   *  Present whenever a report_progress tool_use was seen on a main-thread frame. PRD #1224
+   *  M1: also carries an OPTIONAL `milestones_agents` per-milestone agent attribution (via
+   *  the MilestoneProgress type), attached only when the lead declared a non-empty one —
+   *  attribution alone never manufactures a progress signal. */
   progress?: MilestoneProgress;
   /** PRD #122 M6: true when a `checkpoint` tool_use was seen on a MAIN-THREAD frame.
    *  MAIN-THREAD-ONLY, behind the same isSubagentFrame guard as `progress`, and for the
@@ -400,6 +404,10 @@ export function buildSignalMcpServer(
                   .optional()
                   .default([])
                   .describe("Milestone ids currently being worked on (a snapshot, replaced each call)."),
+                milestones_agents: z
+                  .array(z.object({ id: z.string(), agent: z.string(), agent_label: z.string().optional() }))
+                  .optional()
+                  .describe("For each milestone you are working through a SUBAGENT, its id plus the EXACT subagent_type string you passed to the Agent/Task dispatch (kebab-case), and an optional short human label. Best-effort; only ids also present in in_progress are used; subagents never report."),
               },
               () => h.reportProgress(),
             ),
@@ -581,6 +589,49 @@ function parseProgressIds(raw: unknown): string[] {
 }
 
 /**
+ * Parse the OPTIONAL `milestones_agents` argument of a report_progress call (PRD #1224 M1).
+ * Defensive in the same register as parseProgressIds: a non-array yields []; each entry must
+ * be an object with a non-empty string `id` (trimmed, clamped to MAX_PROGRESS_ID_RUNES) and a
+ * non-empty string `agent`. Entries are NOT deduped here — the server (milestoneAgentsParam)
+ * is first-VALID-wins, so a duplicate id is left for it to resolve; the raw list is capped at
+ * MAX_PROGRESS_IDS for hygiene. Never throws.
+ *
+ * `agent` is trimmed ONLY — NOT clamped or otherwise transformed — because the server stores
+ * it byte-exact and joins on it against `current_activity.agent` (derived from `subagent_type`);
+ * an over-long or otherwise invalid `agent` is left for the server to drop, not silently
+ * mangled here (mangling would desync the join). `agent_label` is passed through, trimmed and
+ * clamped to MAX_MILESTONE_TITLE_RUNES for payload hygiene only — the server does the
+ * authoritative control-rune strip + cap. The cap here is HYGIENE; the api validates
+ * membership (id must be a frozen, in-progress member) + the identifier shape and is the
+ * authoritative control (D4/D5).
+ */
+function parseMilestoneAgents(raw: unknown): MilestoneAgent[] {
+  if (!Array.isArray(raw)) return [];
+  const out: MilestoneAgent[] = [];
+  // NO client-side dedup by id: the server's milestoneAgentsParam is first-VALID-wins — an
+  // invalid `agent` does NOT reserve its id, so a later valid entry for the same id can still
+  // win. Deduping here (which cannot cheaply replicate the server's IsValidName check without
+  // desyncing) would let an invalid-first duplicate reserve the id and drop the valid entry
+  // before the server ever sees it. So cap the RAW entries for payload hygiene and leave the
+  // per-id selection to the server.
+  for (const item of raw.slice(0, MAX_PROGRESS_IDS)) {
+    const entry = asRecord(item);
+    if (!entry) continue;
+    const id = typeof entry["id"] === "string" ? entry["id"].trim() : "";
+    if (id === "") continue;
+    const agent = typeof entry["agent"] === "string" ? entry["agent"].trim() : "";
+    if (agent === "") continue;
+    const parsed: MilestoneAgent = { id: clamp(id, MAX_PROGRESS_ID_RUNES), agent };
+    if (typeof entry["agent_label"] === "string") {
+      const label = entry["agent_label"].trim();
+      if (label !== "") parsed.agent_label = clamp(label, MAX_MILESTONE_TITLE_RUNES);
+    }
+    out.push(parsed);
+  }
+  return out;
+}
+
+/**
  * Parse the `proposal` argument of a signal_done call (PRD #929 M2). Defensive in the
  * same register as the other extractions: a non-object, or one missing a non-empty
  * string `title` or `body`, yields undefined and never throws — so a malformed proposal
@@ -734,11 +785,22 @@ export function scanSignals(message: unknown): ScannedSignals {
       // signal. Last-wins within the turn holds for real reports (a later real call still
       // overwrites), and a later all-empty call cannot wipe an earlier real one — that
       // falls out naturally here because the empty call no longer assigns.
+      //
+      // PRD #1224 M1: also parse the OPTIONAL per-milestone agent attribution. It is
+      // attribution ONLY, never a signal on its own — an all-empty report_progress that
+      // carries only `milestones_agents` stays NO SIGNAL (out.progress undefined), matching
+      // the #390 D3 invariant above. So we compute it defensively and attach it to
+      // out.progress ONLY when the progress object is being set AND the parsed list is
+      // non-empty; it never manufactures a progress signal.
       const input = asRecord(block["input"]);
       const completed = parseProgressIds(input?.["completed"]);
       const in_progress = parseProgressIds(input?.["in_progress"]);
-      if (completed.length > 0 || in_progress.length > 0)
+      if (completed.length > 0 || in_progress.length > 0) {
         out.progress = { completed, in_progress };
+        const milestones_agents = parseMilestoneAgents(input?.["milestones_agents"]);
+        if (milestones_agents.length > 0)
+          out.progress.milestones_agents = milestones_agents;
+      }
     } else if (name === CHECKPOINT_QUALIFIED) {
       // PRD #122 M6. Extracted HERE, inside the content loop that isSubagentFrame already
       // guards (the early return at the top of scanSignals), so it inherits the SAME

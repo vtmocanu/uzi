@@ -525,6 +525,7 @@ type Run struct {
 	CompletionContract        []byte             `json:"completion_contract"`
 	CompletionAttempts        int32              `json:"completion_attempts"`
 	LatestCompletionAttempt   []byte             `json:"latest_completion_attempt"`
+	MilestonesAgents          []byte             `json:"milestones_agents"`
 }
 
 type RunCompletionAttempt struct {
