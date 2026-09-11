@@ -590,6 +590,11 @@ export interface ClaimConfig {
    *  k8s. Absent or <= 0 from an older server ⇒ the worker's own defaults. */
   question_max?: number;
   question_timeout_seconds?: number;
+  /** PRD #1226 M5 (D6): the live owner-continue window (seconds) before a completion-blocked
+   *  run parks. The worker's completion-question timer uses THIS instead of
+   *  question_timeout_seconds for the completion hold. Default 900s; consumed in a later unit.
+   *  Absent or <= 0 from an older server ⇒ the worker falls back to its own default. */
+  completion_hold_window_seconds?: number;
   /** The run owner's per-user default model (PRD #17). When present it overrides
    *  the lead template's model for the main thread; absent when the owner set no
    *  default, so the worker falls back to the lead template's model. */

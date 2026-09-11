@@ -483,9 +483,15 @@ type ClaimConfig struct {
 	// The deadline is therefore NOT durable: a worker death re-queues the run and the
 	// resumed worker starts a fresh clock, so the honest worst case is
 	// QuestionTimeoutSeconds × (RUN_MAX_REQUEUES + 1).
-	QuestionMax            int     `json:"question_max"`
-	QuestionTimeoutSeconds int     `json:"question_timeout_seconds"`
-	DefaultModel           *string `json:"default_model,omitempty"`
+	QuestionMax            int `json:"question_max"`
+	QuestionTimeoutSeconds int `json:"question_timeout_seconds"`
+	// CompletionHoldWindowSeconds is the PRD #1226 M5 (D6) live owner-continue window before a
+	// completion-blocked run parks: the worker's completion-question timer uses THIS instead of
+	// question_timeout_seconds for the completion hold. Default 900s. omitempty keeps a legacy
+	// claim (or a 0 config) byte-identical to today's wire, and an older worker (or a missing
+	// field) falls back to its own default, exactly like task_idle_timeout_seconds above.
+	CompletionHoldWindowSeconds int     `json:"completion_hold_window_seconds,omitempty"`
+	DefaultModel                *string `json:"default_model,omitempty"`
 	// DefaultEffort is the SDK effort level the worker applies to the lead/main
 	// thread: the owner's explicit per-user reasoning effort (PRD #617), or the uzi
 	// default `xhigh` (issue #1157) when the owner has not chosen (NULL). It is

@@ -865,8 +865,13 @@ type Params struct {
 	// tuning var into a hosted worker pod, so an env knob would be unreachable on k8s.
 	QuestionMax            int
 	QuestionTimeoutSeconds int
-	RunMaxRequeues         int
-	WorkerHeartbeatStale   time.Duration
+	// CompletionHoldWindowSeconds (PRD #1226 M5, D6) is the live owner-continue window a
+	// completion-blocked run waits before parking. Configured server-side (like the question
+	// bounds above) and shipped in the claim so the worker's completion-question timer uses it
+	// instead of QuestionTimeoutSeconds for the completion hold.
+	CompletionHoldWindowSeconds int
+	RunMaxRequeues              int
+	WorkerHeartbeatStale        time.Duration
 	// DiskPressureThreshold (PRD #837 M4, UZI_DISK_PRESSURE_THRESHOLD) is the used/total
 	// fraction in (0,1] at/above which a self-reported disk volume counts as "over
 	// threshold" for one heartbeat. Heartbeat feeds it to diskOverThreshold, which drives

@@ -42,6 +42,14 @@
   "pause_mode": "x",
   "pause_after_count": 1,
   "checkpoint_tip_at": "2020-01-02T03:04:05Z",
+  "completion_interlock": true,
+  "completion_attempts": 1,
+  "completion_unmet": [
+    "x"
+  ],
+  "hold_reason": "x",
+  "hold_context": "x",
+  "completion_phase": "x",
   "worker_id": "x",
   "branch": "x",
   "base_branch": "x",

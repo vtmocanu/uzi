@@ -111,6 +111,14 @@ var runDTOKeys = []string{
 	// steer — a worker-facing bool on the state-ack beside pause_requested, false unless the sweeper
 	// stamped completion_budget_exhausted_at. Always on the wire.
 	"pause_requested", "completion_budget_exhausted", "pause_requested_at", "pause_mode", "pause_after_count", "checkpoint_tip_at",
+	// PRD #1226 M5 (D8): the honest-state completion fields the web + CLI render the interlock
+	// states from. completion_interlock is the discriminator (non-null completion_contract_version);
+	// completion_attempts / completion_unmet / hold_reason surface the run's attempt history and
+	// hold; hold_context is the constant same-worker-only provider string (null unless held); and
+	// completion_phase is the ONE server-derived label (completionPhaseRule) both surfaces render,
+	// so they cannot disagree. completion_unmet is a never-null array ([] over null); all six always
+	// on the wire.
+	"completion_interlock", "completion_attempts", "completion_unmet", "hold_reason", "hold_context", "completion_phase",
 	"worker_id", "branch",
 	// PRD #400 (uzi handoff): the task/handoff columns, meaningful only on a
 	// kind='task' run. base_branch is null on every non-task run; open_mr is false by

@@ -184,8 +184,41 @@ type RunDTO struct {
 	// null before the first publish. Not owner-gated — it is just a timestamp — and it drives the
 	// "work since the last checkpoint (Nm ago)" a `now` pause discards.
 	CheckpointTipAt *time.Time `json:"checkpoint_tip_at"`
-	WorkerID        *string    `json:"worker_id"`
-	Branch          *string    `json:"branch"`
+	// The HONEST-STATE completion fields (PRD #1226 M5, D8) — the wire contract the web + CLI
+	// render the completion-interlock states from. CompletionInterlock is the discriminator:
+	// true iff run.CompletionContractVersion is non-null (this run runs the structural
+	// completion protocol). A NON-interlocked run (legacy, or the rollout OFF) carries every
+	// field below at its inert default (0/[]/null/"") and renders exactly as today. All are
+	// always on the wire.
+	CompletionInterlock bool `json:"completion_interlock"`
+	// CompletionAttempts is how many structural completion attempts this run has recorded
+	// (int(run.CompletionAttempts)); 0 for a run that never attempted and every non-interlocked run.
+	CompletionAttempts int `json:"completion_attempts"`
+	// CompletionUnmet is the bounded still-unmet milestone-id list from the run's LATEST
+	// completion attempt, decoded from runs.latest_completion_attempt.unmet. A STABLE array,
+	// NEVER null: it is `[]` when there is no attempt or none are unmet, so a consumer reads a
+	// length without a null guard. The ids are server-validated milestone ids (safe keys, not
+	// free text), but a consumer writing them to a terminal still sanitizes at render — the same
+	// obligation Milestones carries.
+	CompletionUnmet []string `json:"completion_unmet"`
+	// HoldReason is why the run is HELD (mapped from run.HoldReason): 'completion_blocked' when
+	// it parked in a completion hold, null when not held. Read-only surfacing of the column.
+	HoldReason *string `json:"hold_reason"`
+	// HoldContext is the D8 provider-context string a completion hold states: the constant
+	// "unavailable(same_worker_only)" when the run is in a completion hold (HoldReason ==
+	// 'completion_blocked'), else null. It exists so the UI/CLI state the hold's durability
+	// HONESTLY — the hold is same-worker-only and MUST NOT be rendered as cross-worker durable.
+	// Server-computed, not stored.
+	HoldContext *string `json:"hold_context"`
+	// CompletionPhase is the SERVER-COMPUTED derived completion label (one of "checking" |
+	// "reworking" | "blocked" | ""): the SINGLE field the web and CLI both render D8's three
+	// states from ("Checking completion" / "Reworking unmet milestones" / "Completion blocked"),
+	// so the two surfaces cannot disagree. Computed in ONE place (completionPhaseRule, runs_dto.go),
+	// the pause_requested precedent; "" for a non-interlocked run and any run not in one of the
+	// three live states. Always on the wire.
+	CompletionPhase string  `json:"completion_phase"`
+	WorkerID        *string `json:"worker_id"`
+	Branch          *string `json:"branch"`
 	// BaseBranch and OpenMr are the task/handoff columns (PRD #400), meaningful only
 	// for a kind='task' run. BaseBranch is the source ref the task branched from (null
 	// when it inherited the caller's local HEAD, and on every non-task run); OpenMr is

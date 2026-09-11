@@ -440,9 +440,13 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			PlanMaxRevisions:       s.p.PlanMaxRevisions,
 			QuestionMax:            s.p.QuestionMax,
 			QuestionTimeoutSeconds: s.p.QuestionTimeoutSeconds,
-			DefaultModel:           textPtr(defaultModel),
-			DefaultEffort:          resolveEffortPtr(defaultEffort),
-			AttributionEnabled:     attributionEnabled,
+			// PRD #1226 M5 (D6): the completion-hold owner-continue window (default 900s), so the
+			// worker's completion-question timer uses it instead of question_timeout_seconds for a
+			// completion-blocked run. Configured server-side, shipped like the question bounds above.
+			CompletionHoldWindowSeconds: s.p.CompletionHoldWindowSeconds,
+			DefaultModel:                textPtr(defaultModel),
+			DefaultEffort:               resolveEffortPtr(defaultEffort),
+			AttributionEnabled:          attributionEnabled,
 			// PRD #305 M3: deliver the flag frozen onto the run at fire time (M1). Read
 			// straight off the run row — not re-derived from the schedule. false for every
 			// run that did not opt in, so omitempty keeps its claim byte-identical to today.

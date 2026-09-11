@@ -271,6 +271,7 @@ func run() error {
 		PlanMaxRevisions:            cfg.PlanMaxRevisions,
 		QuestionMax:                 cfg.QuestionMax,
 		QuestionTimeoutSeconds:      cfg.QuestionTimeoutSeconds,
+		CompletionHoldWindowSeconds: cfg.CompletionHoldWindowSeconds,
 		RunMaxRequeues:              cfg.RunMaxRequeues,
 		WorkerHeartbeatStale:        cfg.WorkerHeartbeatStale,
 		DiskPressureThreshold:       cfg.DiskPressureThreshold,

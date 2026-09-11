@@ -2214,6 +2214,36 @@ export interface Run {
   pause_mode?: "milestone" | "now" | null;
   pause_after_count?: number | null;
   checkpoint_tip_at?: string | null;
+  /** PRD #1226 M5 (D8): the honest-state completion fields — the wire contract the web + CLI
+   *  render the completion-interlock states from. All OPTIONAL for api/web rollout skew (a
+   *  pre-feature api pod omits the keys), exactly like the pause block above; the server always
+   *  sends them.
+   *
+   *  `completion_interlock` is the discriminator: true iff this run runs the structural
+   *  completion protocol (non-null completion_contract_version). A non-interlocked run (legacy,
+   *  or the rollout OFF) carries every field below at its inert default and renders as today.
+   *  `completion_attempts` is how many structural attempts it recorded (0 when none).
+   *  `completion_unmet` is the bounded still-unmet milestone-id list from the LATEST attempt — a
+   *  STABLE array, never null ([] when none), so read a length without a null guard. Its ids are
+   *  server-validated milestone keys (not free text), but still sanitize before writing to a
+   *  terminal (same rule as milestones).
+   *
+   *  `hold_reason` is 'completion_blocked' when the run parked in a completion hold, else null.
+   *  `hold_context` is the constant "unavailable(same_worker_only)" ONLY while held, else null:
+   *  the UI/CLI state the hold's durability HONESTLY from it — the hold is same-worker-only and
+   *  must NOT be shown as cross-worker durable.
+   *
+   *  🔴 RENDER `completion_phase`; NEVER RE-DERIVE IT. It is the SINGLE server-computed label
+   *  ("checking" | "reworking" | "blocked" | "") the web and CLI both render D8's three states
+   *  from ("Checking completion" / "Reworking unmet milestones" / "Completion blocked"), so the
+   *  two surfaces cannot disagree. "" for a non-interlocked run and any run not in one of the
+   *  three live states. */
+  completion_interlock?: boolean;
+  completion_attempts?: number;
+  completion_unmet?: string[];
+  hold_reason?: string | null;
+  hold_context?: string | null;
+  completion_phase?: "checking" | "reworking" | "blocked" | "";
   /** PRD #400: the task/handoff source ref a kind='task' run branched from — null when it
    *  inherited the caller's local HEAD, and on every non-task run. For a handoff created
    *  without --base (issue #403 F3) it is the resolved SEED COMMIT sha the auto-review uses
