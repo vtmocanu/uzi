@@ -32,9 +32,13 @@ const (
 	// is no server-owned source since the api never clones the repo; (2) the 'l' floor
 	// (25 iters / 8h) is strictly <= the pre-existing, also-worker-reported milestone-count arm
 	// (run_max_iterations*milestoneBudgetCap = 60 iters / 8h), the two CASE arms are mutually
-	// exclusive and never stack, so it adds no new ceiling; (3) the freeze is run-ownership
-	// guarded (SetState -> runOwnedByWorker; the freeze UPDATEs carry worker_id), so a worker
-	// only inflates its OWN run, spending that user's own token/compute — no cross-tenant reach;
+	// exclusive and never stack, so it adds no new ceiling; (3) it is self-directed: SetState
+	// gates on runOwnedByWorker first, and the size_class WRITE is worker_id-scoped in both write
+	// paths (SetRunRunning / SetRunAwaitingApproval) — so the value can only reach the run's own
+	// row. The autopilot freeze (SetRunRunning) also carries worker_id in its UPDATE; the
+	// human-gated freeze (CreateApprovePlanInput, WHERE id = @run_id) is triggered by the run's
+	// OWNER and reads that run's own already-persisted size_class. Either way a worker only
+	// inflates its OWN run, spending that user's own token/compute — no cross-tenant reach;
 	// (4) both budget columns COALESCE onto the immutable frozen value, so the floor applies at
 	// most once.
 	sizeBudgetFactorL = 5
