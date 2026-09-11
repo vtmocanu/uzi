@@ -335,8 +335,14 @@ func (s *Service) persistCompletionAttempt(ctx context.Context, wkr store.Worker
 func unionMilestoneIDs(existing, declared []byte) []byte {
 	a, _ := DecodeMilestoneIDs(existing)
 	b, _ := DecodeMilestoneIDs(declared)
-	seen := make(map[string]bool, len(a)+len(b))
-	out := make([]string, 0, len(a)+len(b))
+	// Pre-size to the base (existing) set only. CodeQL flags `len(a)+len(b)` as a
+	// (theoretical) allocation-size overflow; both sets are subset-validated to the
+	// frozen milestone list (<= maxMilestonesPerRun each, see progressParams), so the
+	// sum can never overflow, but a single-len hint matches the local idiom
+	// (validateProgressIDs) and clears the scanner. The map/slice grow for b's ids as
+	// needed.
+	seen := make(map[string]bool, len(a))
+	out := make([]string, 0, len(a))
 	for _, id := range a {
 		if !seen[id] {
 			seen[id] = true
