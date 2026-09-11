@@ -341,6 +341,11 @@ type fakeStore struct {
 	reviseCapArg       *store.CreateRunReviseInputIfUnderCapParams
 	createdStopVerdict *store.CreateStopVerdictInputParams
 	createdApproval    *store.CreateApprovePlanInputParams
+	// freezeSnapshot is what GetRunMilestoneFreezeSnapshot returns (PRD #260/#1226). The zero
+	// value has empty milestone columns (the prior hardcoded behavior); a test sets its
+	// MilestonesFrozen/MilestonesCandidate to drive the approve-time completion-contract build,
+	// which reads its milestone source from this snapshot rather than the run row.
+	freezeSnapshot store.GetRunMilestoneFreezeSnapshotRow
 	// PRD #634 M2: capture the scope-ceiling write submitInput's `scope` (and the
 	// milestone-run `stop` remap) makes. createdScopeCeiling holds the LAST call (nil
 	// until reached); createdScopeCeilings records every call in order, so a test can
@@ -1170,7 +1175,14 @@ func (f *fakeStore) CreateApprovePlanInput(_ context.Context, arg store.CreateAp
 	return store.RunUserInput{}, nil
 }
 func (f *fakeStore) GetRunMilestoneFreezeSnapshot(_ context.Context, id uuid.UUID) (store.GetRunMilestoneFreezeSnapshotRow, error) {
-	return store.GetRunMilestoneFreezeSnapshotRow{ID: id}, nil
+	// The zero value has empty milestone columns (the original hardcoded behavior, so every
+	// existing fixture is unchanged). A test that needs the approve-time completion-contract
+	// build to see a real milestone list sets freezeSnapshot: submitApproval reads its
+	// contract's milestone SOURCE from THIS snapshot (submit.go, PRD #260/#1226 D1), not from
+	// the run row, whenever the snapshot read succeeds. The run id is always stamped on.
+	snap := f.freezeSnapshot
+	snap.ID = id
+	return snap, nil
 }
 func (f *fakeStore) CancelRunServerSide(_ context.Context, arg store.CancelRunServerSideParams) (int64, error) {
 	f.cancelled = &arg

@@ -83,6 +83,37 @@ func (e interlockLiveDB) seedWorker(t *testing.T, protocolCaps []string) uuid.UU
 	return id
 }
 
+// seedSpreadWorker inserts an ONLINE worker with an advertised run-lane cap
+// (max_concurrent_runs) and a fresh heartbeat, so it can act as a fleet-spread deferral
+// target (PRD #216 D8: a NULL cap is never a spread target, and a peer with no heartbeat
+// is not live). protocolCaps nil ⇒ '{}' (implements no protocol) — the discriminator the
+// D2 peer mirror clause reads directly off the peer's own protocol_capabilities column.
+func (e interlockLiveDB) seedSpreadWorker(t *testing.T, protocolCaps []string, maxConcurrent int) uuid.UUID {
+	t.Helper()
+	id := uuid.New()
+	if protocolCaps == nil {
+		protocolCaps = []string{}
+	}
+	e.exec(t, `INSERT INTO workers (id, user_id, name, token_hash, status, protocol_capabilities, max_concurrent_runs, last_heartbeat_at)
+	           VALUES ($1, $2, $3, $4, 'online', $5, $6, now())`,
+		id, e.userID, "w-"+id.String()[:8], id[:], protocolCaps, maxConcurrent)
+	return id
+}
+
+// seedActiveRunOwnedBy inserts a 'running' issue run owned by workerID, so the worker counts
+// as loaded in the fleet-spread cross-multiplication (a worker with 0 active runs is
+// minimum-loaded and never defers — R3, so a claimant that should defer needs ≥1 active run).
+func (e interlockLiveDB) seedActiveRunOwnedBy(t *testing.T, workerID uuid.UUID) uuid.UUID {
+	t.Helper()
+	id := uuid.New()
+	iid := *e.nextIID
+	*e.nextIID++
+	e.exec(t, `INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, kind, status, worker_id)
+	           VALUES ($1, $2, $3, $4, 't', 'd', 'issue', 'running', $5)`,
+		id, e.userID, e.repoID, iid, workerID)
+	return id
+}
+
 // seedQueuedRun inserts a queued issue run. contractVersion nil ⇒ a LEGACY run
 // (completion_contract_version NULL); non-nil ⇒ an INTERLOCKED run stamped at that version.
 func (e interlockLiveDB) seedQueuedRun(t *testing.T, contractVersion *int32, requiredCaps []string) uuid.UUID {
@@ -387,6 +418,59 @@ func TestCompletionContractNotFrozenBeforeMilestonesLiveDB(t *testing.T) {
 	if gotRev == nil || *gotRev != 1 {
 		t.Fatalf("contract_revision after the milestone report = %v, want 1", gotRev)
 	}
+}
+
+// TestClaimInterlockPeerSpreadMirrorLiveDB covers the D2 peer fleet-spread MIRROR clause
+// (`r.completion_contract_version IS NULL OR 'completion_interlock_v1' = ANY(p.protocol_capabilities)`
+// in ClaimRun's NOT EXISTS peer block). Fleet-aware spread (PRD #216) DEFERS a queued run to a
+// strictly-better idle peer instead of a busy claimant taking it — but for an INTERLOCKED run
+// that peer must ALSO implement the completion protocol, or the run would be deferred to a peer
+// that can never claim it (the D2 hard clause blocks the peer's own claim), making the run
+// permanently unclaimable. The two sub-cases differ ONLY in the idle peer's
+// protocol_capabilities, isolating the mirror clause: an INCAPABLE peer is not a valid deferral
+// target (busy claimant claims), a CAPABLE peer is (busy claimant defers).
+func TestClaimInterlockPeerSpreadMirrorLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	v1 := int32(1)
+
+	// A busy CAPABLE claimant: cap=2 with 1 active run, so it is NOT minimum-loaded and the
+	// fleet-spread rule CAN defer its claim to a strictly-better (idle) peer. It implements the
+	// protocol, so the claimant's OWN D2 hard clause never blocks it — isolating the PEER clause.
+	newBusyClaimant := func() uuid.UUID {
+		me := e.seedSpreadWorker(t, []string{"completion_interlock_v1"}, 2)
+		e.seedActiveRunOwnedBy(t, me)
+		return me
+	}
+
+	t.Run("incapable idle peer is NOT a spread target; busy claimant claims", func(t *testing.T) {
+		me := newBusyClaimant()
+		e.seedSpreadWorker(t, nil, 2) // idle, cap=2, but implements no protocol
+		runID := e.seedQueuedRun(t, &v1, nil)
+
+		run, err := e.q.ClaimRun(e.ctx, e.claimParams(me, []string{"completion_interlock_v1"}, false))
+		if err != nil {
+			t.Fatalf("busy claimant must claim the interlocked run — the incapable peer is not a valid deferral target (err=%v); the mirror clause must exclude it", err)
+		}
+		if run.ID != runID {
+			t.Fatalf("claimed %v, want %v", run.ID, runID)
+		}
+		if run.Status != "claimed" {
+			t.Fatalf("claimed run status = %q, want claimed", run.Status)
+		}
+	})
+
+	t.Run("capable idle peer IS a spread target; busy claimant defers", func(t *testing.T) {
+		me := newBusyClaimant()
+		e.seedSpreadWorker(t, []string{"completion_interlock_v1"}, 2) // idle, cap=2, implements the protocol
+		runID := e.seedQueuedRun(t, &v1, nil)
+
+		if _, err := e.q.ClaimRun(e.ctx, e.claimParams(me, []string{"completion_interlock_v1"}, false)); !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatalf("busy claimant must DEFER the interlocked run to the capable idle peer (err=%v); the mirror clause admits a capable peer as a spread target", err)
+		}
+		if s := e.runStatus(t, runID); s != "queued" {
+			t.Fatalf("deferred run must stay queued; status = %q", s)
+		}
+	})
 }
 
 // readContract returns the run's frozen completion_contract jsonb (nil when NULL) and
