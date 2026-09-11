@@ -479,6 +479,7 @@ func (s *Service) submitApproval(ctx context.Context, run store.Run, sel AgentSe
 		RunMaxIterations:         int32(s.p.RunMaxIterations), //nolint:gosec // G115: RunMaxIterations is a small bounded config int (env RUN_MAX_ITERATIONS), never near int32 range
 		RunTimeoutSeconds:        int32(s.p.RunTimeout.Seconds()),
 		MilestoneBudgetCap:       milestoneBudgetCap,
+		SizeBudgetFactorL:        sizeBudgetFactorL,
 		BudgetWallCeilingSeconds: budgetWallCeilingSeconds,
 	}); err != nil {
 		return SubmitInputResult{}, err

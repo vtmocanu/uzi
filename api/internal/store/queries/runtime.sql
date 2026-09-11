@@ -1055,11 +1055,23 @@ UPDATE runs SET
     -- milestone count at freeze, written IMMUTABLY. NULL for a 0/1-milestone run so its
     -- budget is byte-for-byte the global default. Count capped at milestone_budget_cap,
     -- wall capped at budget_wall_ceiling_seconds. Frozen source = same COALESCE as above.
+    -- Issue #1181: mirror of the CreateApprovePlanInput size_class floor for the AUTOPILOT
+    -- path. The count<=1 arm floors an 'l' run instead of dropping to NULL; 's'/'m'/'' stay
+    -- NULL. Read COALESCE(sqlc.narg('size_class'), size_class) — this statement SETs size_class
+    -- (line above) and Postgres evaluates SET RHS against the OLD row, so bare size_class would
+    -- miss the size_class this self-contained running report carries at the freeze instant. The
+    -- count>=2 arm is unchanged. If you change this, change CreateApprovePlanInput too.
     budget_max_iterations = COALESCE(budget_max_iterations,
-        CASE WHEN COALESCE(jsonb_array_length(COALESCE(milestones_frozen, sqlc.narg('milestones_frozen')::jsonb, milestones_candidate)), 0) <= 1 THEN NULL
+        CASE WHEN COALESCE(jsonb_array_length(COALESCE(milestones_frozen, sqlc.narg('milestones_frozen')::jsonb, milestones_candidate)), 0) <= 1
+                 THEN CASE COALESCE(sqlc.narg('size_class'), size_class)
+                          WHEN 'l' THEN sqlc.arg('run_max_iterations')::int * sqlc.arg('size_budget_factor_l')::int
+                          ELSE NULL END
              ELSE sqlc.arg('run_max_iterations')::int * LEAST(jsonb_array_length(COALESCE(milestones_frozen, sqlc.narg('milestones_frozen')::jsonb, milestones_candidate)), sqlc.arg('milestone_budget_cap')::int) END),
     budget_wall_seconds = COALESCE(budget_wall_seconds,
-        CASE WHEN COALESCE(jsonb_array_length(COALESCE(milestones_frozen, sqlc.narg('milestones_frozen')::jsonb, milestones_candidate)), 0) <= 1 THEN NULL
+        CASE WHEN COALESCE(jsonb_array_length(COALESCE(milestones_frozen, sqlc.narg('milestones_frozen')::jsonb, milestones_candidate)), 0) <= 1
+                 THEN CASE COALESCE(sqlc.narg('size_class'), size_class)
+                          WHEN 'l' THEN LEAST(sqlc.arg('run_timeout_seconds')::int * sqlc.arg('size_budget_factor_l')::int, sqlc.arg('budget_wall_ceiling_seconds')::int)
+                          ELSE NULL END
              ELSE LEAST(sqlc.arg('run_timeout_seconds')::int * LEAST(jsonb_array_length(COALESCE(milestones_frozen, sqlc.narg('milestones_frozen')::jsonb, milestones_candidate)), sqlc.arg('milestone_budget_cap')::int), sqlc.arg('budget_wall_ceiling_seconds')::int) END),
     -- PRD #122 M2 (Decision 3): completed is UNIONED (monotone, dedup); in_progress is
     -- OVERWRITTEN wholesale. NULL param = "not reported this call" → column untouched.
@@ -3074,11 +3086,26 @@ WITH selected AS (
         -- a double-approve or a re-gate resume never changes a budget frozen once. NULL for
         -- a 0/1-milestone plan (byte-for-byte the global default). See SetRunRunning for the
         -- autopilot mirror of this compute.
+        -- Issue #1181: the count<=1 arm no longer drops straight to NULL. A LARGE-repo run
+        -- (size_class='l') floors to run_max_iterations*size_budget_factor_l iters and
+        -- LEAST(run_timeout*size_budget_factor_l, ceiling) wall, so a large gated run whose
+        -- lead wrote milestones as PROSE (0 structured milestones) still gets a size-scaled
+        -- budget rather than the 5-iter/2h global default. 's'/'m'/'' stay NULL (unchanged,
+        -- byte-for-byte the pre-feature default). Read bare runs.size_class: this statement
+        -- does NOT SET size_class (it was persisted by the pre-gate SetRunAwaitingApproval
+        -- report), so the OLD-row value is the committed one. The count>=2 arm is unchanged.
+        -- See SetRunRunning for the autopilot mirror (which reads COALESCE(narg,size_class)).
         budget_max_iterations = COALESCE(runs.budget_max_iterations,
-            CASE WHEN COALESCE(jsonb_array_length(COALESCE(runs.milestones_frozen, runs.milestones_candidate)), 0) <= 1 THEN NULL
+            CASE WHEN COALESCE(jsonb_array_length(COALESCE(runs.milestones_frozen, runs.milestones_candidate)), 0) <= 1
+                     THEN CASE runs.size_class
+                              WHEN 'l' THEN sqlc.arg('run_max_iterations')::int * sqlc.arg('size_budget_factor_l')::int
+                              ELSE NULL END
                  ELSE sqlc.arg('run_max_iterations')::int * LEAST(jsonb_array_length(COALESCE(runs.milestones_frozen, runs.milestones_candidate)), sqlc.arg('milestone_budget_cap')::int) END),
         budget_wall_seconds = COALESCE(runs.budget_wall_seconds,
-            CASE WHEN COALESCE(jsonb_array_length(COALESCE(runs.milestones_frozen, runs.milestones_candidate)), 0) <= 1 THEN NULL
+            CASE WHEN COALESCE(jsonb_array_length(COALESCE(runs.milestones_frozen, runs.milestones_candidate)), 0) <= 1
+                     THEN CASE runs.size_class
+                              WHEN 'l' THEN LEAST(sqlc.arg('run_timeout_seconds')::int * sqlc.arg('size_budget_factor_l')::int, sqlc.arg('budget_wall_ceiling_seconds')::int)
+                              ELSE NULL END
                  ELSE LEAST(sqlc.arg('run_timeout_seconds')::int * LEAST(jsonb_array_length(COALESCE(runs.milestones_frozen, runs.milestones_candidate)), sqlc.arg('milestone_budget_cap')::int), sqlc.arg('budget_wall_ceiling_seconds')::int) END),
         updated_at       = now()
     WHERE id = @run_id

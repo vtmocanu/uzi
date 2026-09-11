@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"slices"
 	"sort"
 	"testing"
 	"time"
@@ -67,6 +68,7 @@ func TestRunMilestoneProgressLiveDB(t *testing.T) {
 		runTimeout    = 7200
 		budgetCap     = 12
 		wallCeiling   = 28800
+		sizeFactorL   = 5 // issue #1181: the 'l' size-class budget floor factor
 		issueIIDStart = 1
 	)
 
@@ -244,6 +246,108 @@ func TestRunMilestoneProgressLiveDB(t *testing.T) {
 		}
 		if mi, w := readBudget(run); mi == nil || *mi != 35 || w == nil || *w != 28800 {
 			t.Fatalf("budget changed on heartbeat = %v/%v, want a stable 35/28800", ptrStr(mi), ptrStr(w))
+		}
+	})
+
+	// ── Issue #1181: the count<=1 arm floors a LARGE-repo run's budget by size_class instead
+	//    of dropping to the global default. An 'l' run with 0/1 milestone freezes
+	//    run_max_iterations*size_budget_factor_l = 5*5 = 25 iters and
+	//    LEAST(run_timeout*5, ceiling) = LEAST(36000, 28800) = 28800s wall, matching what a
+	//    ~5-milestone count-based run gets. 's'/'m'/'' stay NULL; the count>=2 arm is unchanged. ──
+
+	// The HUMAN-GATED path (CreateApprovePlanInput). size_class='l' is persisted by the
+	// pre-gate awaiting_approval report; the approve freeze reads bare runs.size_class.
+	t.Run("issue #1181: large gated 1-milestone plan floors to a size-scaled budget", func(t *testing.T) {
+		run := newRun("running")
+		if _, err := q.SetRunAwaitingApproval(ctx, store.SetRunAwaitingApprovalParams{
+			PlanMd: pgtype.Text{String: "# plan", Valid: true}, SizeClass: pgtype.Text{String: "l", Valid: true},
+			MilestonesCandidate: milestoneList(1), ID: run, WorkerID: workerID,
+		}); err != nil {
+			t.Fatalf("SetRunAwaitingApproval: %v", err)
+		}
+		if _, err := q.CreateApprovePlanInput(ctx, store.CreateApprovePlanInputParams{
+			RunID: run, Body: pgtype.Text{String: "{}", Valid: true},
+			AgentSource: pgtype.Text{String: "own", Valid: true}, AgentExclusions: []byte("[]"),
+			RunMaxIterations: runMaxIter, RunTimeoutSeconds: runTimeout,
+			MilestoneBudgetCap: budgetCap, BudgetWallCeilingSeconds: wallCeiling,
+			SizeBudgetFactorL: sizeFactorL,
+		}); err != nil {
+			t.Fatalf("CreateApprovePlanInput: %v", err)
+		}
+		mi, w := readBudget(run)
+		if mi == nil || *mi != 25 || w == nil || *w != 28800 {
+			t.Fatalf("large gated floored budget = %v/%v, want 25/28800", ptrStr(mi), ptrStr(w))
+		}
+	})
+
+	// The AUTOPILOT path (SetRunRunning), reading COALESCE(narg('size_class'), size_class).
+	// 0 frozen milestones (milestones written as prose) still floors on 'l'.
+	t.Run("issue #1181: large autopilot 0-milestone report floors to a size-scaled budget", func(t *testing.T) {
+		run := newRun("claimed")
+		if _, err := q.SetRunRunning(ctx, store.SetRunRunningParams{
+			ID: run, WorkerID: workerID, SizeClass: pgtype.Text{String: "l", Valid: true},
+			RunMaxIterations: runMaxIter, RunTimeoutSeconds: runTimeout,
+			MilestoneBudgetCap: budgetCap, BudgetWallCeilingSeconds: wallCeiling,
+			SizeBudgetFactorL: sizeFactorL,
+		}); err != nil {
+			t.Fatalf("SetRunRunning: %v", err)
+		}
+		mi, w := readBudget(run)
+		if mi == nil || *mi != 25 || w == nil || *w != 28800 {
+			t.Fatalf("large autopilot floored budget = %v/%v, want 25/28800", ptrStr(mi), ptrStr(w))
+		}
+	})
+
+	// 's'/'m'/'' (default) with 0/1 milestone stay NULL — the global default — proving the
+	// floor is scoped to 'l' and small/medium/unsized are byte-for-byte unchanged.
+	t.Run("issue #1181: small, medium and unsized 0/1-milestone plans stay NULL", func(t *testing.T) {
+		cases := []struct {
+			name, size string
+			frozen     int
+		}{
+			{"medium", "m", 1},
+			{"small", "s", 0},
+			{"unsized", "", 1},
+		}
+		for _, tc := range cases {
+			run := newRun("claimed")
+			p := store.SetRunRunningParams{
+				ID: run, WorkerID: workerID,
+				RunMaxIterations: runMaxIter, RunTimeoutSeconds: runTimeout,
+				MilestoneBudgetCap: budgetCap, BudgetWallCeilingSeconds: wallCeiling,
+				SizeBudgetFactorL: sizeFactorL,
+			}
+			if tc.frozen > 0 {
+				p.MilestonesFrozen = milestoneList(tc.frozen)
+			}
+			if tc.size != "" {
+				p.SizeClass = pgtype.Text{String: tc.size, Valid: true}
+			}
+			if _, err := q.SetRunRunning(ctx, p); err != nil {
+				t.Fatalf("SetRunRunning (%s): %v", tc.name, err)
+			}
+			if mi, w := readBudget(run); mi != nil || w != nil {
+				t.Fatalf("%s (size=%q) 0/1-milestone budget = %v/%v, want NULL/NULL", tc.name, tc.size, ptrStr(mi), ptrStr(w))
+			}
+		}
+	})
+
+	// An 'l' run with 2 frozen milestones is owned by the count>=2 arm, unchanged: 5*2=10
+	// iters and LEAST(7200*2,28800)=14400s wall. The 'l' floor (25) did NOT leak in.
+	t.Run("issue #1181: large 2-milestone plan is count-based, not size-floored", func(t *testing.T) {
+		run := newRun("claimed")
+		if _, err := q.SetRunRunning(ctx, store.SetRunRunningParams{
+			MilestonesFrozen: milestoneList(2), SizeClass: pgtype.Text{String: "l", Valid: true},
+			ID: run, WorkerID: workerID,
+			RunMaxIterations: runMaxIter, RunTimeoutSeconds: runTimeout,
+			MilestoneBudgetCap: budgetCap, BudgetWallCeilingSeconds: wallCeiling,
+			SizeBudgetFactorL: sizeFactorL,
+		}); err != nil {
+			t.Fatalf("SetRunRunning: %v", err)
+		}
+		mi, w := readBudget(run)
+		if mi == nil || *mi != 10 || w == nil || *w != 14400 {
+			t.Fatalf("large 2-milestone count-based budget = %v/%v, want 10/14400 (5*2, LEAST(7200*2,28800))", ptrStr(mi), ptrStr(w))
 		}
 	})
 
@@ -722,13 +826,5 @@ func ptrStr(v *int32) string {
 }
 
 func eqIDs(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
+	return slices.Equal(a, b)
 }

@@ -163,7 +163,10 @@ async function readTextBestEffort(abs: string): Promise<string> {
 }
 
 /** Coarse size bucket from the number of directories the scan read. Thresholds are
- *  deliberately simple and soft — this is display-only and gates nothing:
+ *  deliberately simple and soft. Besides run rendering, the server floors a LARGE ('l')
+ *  run's per-run iteration/wall budget by this bucket (issue #1181; see the count<=1 arm
+ *  of the freeze CASE in api store/queries/runtime.sql + sizeBudgetFactorL in
+ *  api workersvc/budget.go), so 'l' is now (mildly) load-bearing, not display-only:
  *    < 20 dirs   ⇒ "s"   (a small/single-package repo)
  *    < 150 dirs  ⇒ "m"   (a typical multi-package repo)
  *    otherwise   ⇒ "l"   (a large monorepo, or the scan hit its cost bound). */

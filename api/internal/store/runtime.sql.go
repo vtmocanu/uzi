@@ -1104,12 +1104,27 @@ WITH selected AS (
         -- a double-approve or a re-gate resume never changes a budget frozen once. NULL for
         -- a 0/1-milestone plan (byte-for-byte the global default). See SetRunRunning for the
         -- autopilot mirror of this compute.
+        -- Issue #1181: the count<=1 arm no longer drops straight to NULL. A LARGE-repo run
+        -- (size_class='l') floors to run_max_iterations*size_budget_factor_l iters and
+        -- LEAST(run_timeout*size_budget_factor_l, ceiling) wall, so a large gated run whose
+        -- lead wrote milestones as PROSE (0 structured milestones) still gets a size-scaled
+        -- budget rather than the 5-iter/2h global default. 's'/'m'/'' stay NULL (unchanged,
+        -- byte-for-byte the pre-feature default). Read bare runs.size_class: this statement
+        -- does NOT SET size_class (it was persisted by the pre-gate SetRunAwaitingApproval
+        -- report), so the OLD-row value is the committed one. The count>=2 arm is unchanged.
+        -- See SetRunRunning for the autopilot mirror (which reads COALESCE(narg,size_class)).
         budget_max_iterations = COALESCE(runs.budget_max_iterations,
-            CASE WHEN COALESCE(jsonb_array_length(COALESCE(runs.milestones_frozen, runs.milestones_candidate)), 0) <= 1 THEN NULL
-                 ELSE $6::int * LEAST(jsonb_array_length(COALESCE(runs.milestones_frozen, runs.milestones_candidate)), $7::int) END),
+            CASE WHEN COALESCE(jsonb_array_length(COALESCE(runs.milestones_frozen, runs.milestones_candidate)), 0) <= 1
+                     THEN CASE runs.size_class
+                              WHEN 'l' THEN $6::int * $7::int
+                              ELSE NULL END
+                 ELSE $6::int * LEAST(jsonb_array_length(COALESCE(runs.milestones_frozen, runs.milestones_candidate)), $8::int) END),
         budget_wall_seconds = COALESCE(runs.budget_wall_seconds,
-            CASE WHEN COALESCE(jsonb_array_length(COALESCE(runs.milestones_frozen, runs.milestones_candidate)), 0) <= 1 THEN NULL
-                 ELSE LEAST($8::int * LEAST(jsonb_array_length(COALESCE(runs.milestones_frozen, runs.milestones_candidate)), $7::int), $9::int) END),
+            CASE WHEN COALESCE(jsonb_array_length(COALESCE(runs.milestones_frozen, runs.milestones_candidate)), 0) <= 1
+                     THEN CASE runs.size_class
+                              WHEN 'l' THEN LEAST($9::int * $7::int, $10::int)
+                              ELSE NULL END
+                 ELSE LEAST($9::int * LEAST(jsonb_array_length(COALESCE(runs.milestones_frozen, runs.milestones_candidate)), $8::int), $10::int) END),
         updated_at       = now()
     WHERE id = $1
     RETURNING id
@@ -1126,6 +1141,7 @@ type CreateApprovePlanInputParams struct {
 	AgentExclusions          []byte      `json:"agent_exclusions"`
 	CompletionContract       []byte      `json:"completion_contract"`
 	RunMaxIterations         int32       `json:"run_max_iterations"`
+	SizeBudgetFactorL        int32       `json:"size_budget_factor_l"`
 	MilestoneBudgetCap       int32       `json:"milestone_budget_cap"`
 	RunTimeoutSeconds        int32       `json:"run_timeout_seconds"`
 	BudgetWallCeilingSeconds int32       `json:"budget_wall_ceiling_seconds"`
@@ -1150,6 +1166,7 @@ func (q *Queries) CreateApprovePlanInput(ctx context.Context, arg CreateApproveP
 		arg.AgentExclusions,
 		arg.CompletionContract,
 		arg.RunMaxIterations,
+		arg.SizeBudgetFactorL,
 		arg.MilestoneBudgetCap,
 		arg.RunTimeoutSeconds,
 		arg.BudgetWallCeilingSeconds,
@@ -7909,12 +7926,24 @@ UPDATE runs SET
     -- milestone count at freeze, written IMMUTABLY. NULL for a 0/1-milestone run so its
     -- budget is byte-for-byte the global default. Count capped at milestone_budget_cap,
     -- wall capped at budget_wall_ceiling_seconds. Frozen source = same COALESCE as above.
+    -- Issue #1181: mirror of the CreateApprovePlanInput size_class floor for the AUTOPILOT
+    -- path. The count<=1 arm floors an 'l' run instead of dropping to NULL; 's'/'m'/'' stay
+    -- NULL. Read COALESCE(sqlc.narg('size_class'), size_class) — this statement SETs size_class
+    -- (line above) and Postgres evaluates SET RHS against the OLD row, so bare size_class would
+    -- miss the size_class this self-contained running report carries at the freeze instant. The
+    -- count>=2 arm is unchanged. If you change this, change CreateApprovePlanInput too.
     budget_max_iterations = COALESCE(budget_max_iterations,
-        CASE WHEN COALESCE(jsonb_array_length(COALESCE(milestones_frozen, $9::jsonb, milestones_candidate)), 0) <= 1 THEN NULL
-             ELSE $11::int * LEAST(jsonb_array_length(COALESCE(milestones_frozen, $9::jsonb, milestones_candidate)), $12::int) END),
+        CASE WHEN COALESCE(jsonb_array_length(COALESCE(milestones_frozen, $9::jsonb, milestones_candidate)), 0) <= 1
+                 THEN CASE COALESCE($8, size_class)
+                          WHEN 'l' THEN $11::int * $12::int
+                          ELSE NULL END
+             ELSE $11::int * LEAST(jsonb_array_length(COALESCE(milestones_frozen, $9::jsonb, milestones_candidate)), $13::int) END),
     budget_wall_seconds = COALESCE(budget_wall_seconds,
-        CASE WHEN COALESCE(jsonb_array_length(COALESCE(milestones_frozen, $9::jsonb, milestones_candidate)), 0) <= 1 THEN NULL
-             ELSE LEAST($13::int * LEAST(jsonb_array_length(COALESCE(milestones_frozen, $9::jsonb, milestones_candidate)), $12::int), $14::int) END),
+        CASE WHEN COALESCE(jsonb_array_length(COALESCE(milestones_frozen, $9::jsonb, milestones_candidate)), 0) <= 1
+                 THEN CASE COALESCE($8, size_class)
+                          WHEN 'l' THEN LEAST($14::int * $12::int, $15::int)
+                          ELSE NULL END
+             ELSE LEAST($14::int * LEAST(jsonb_array_length(COALESCE(milestones_frozen, $9::jsonb, milestones_candidate)), $13::int), $15::int) END),
     -- PRD #122 M2 (Decision 3): completed is UNIONED (monotone, dedup); in_progress is
     -- OVERWRITTEN wholesale. NULL param = "not reported this call" → column untouched.
     -- Ids are validated + membership-checked server-side (progressParams) before here.
@@ -7922,13 +7951,13 @@ UPDATE runs SET
     -- completion path (signal_done reconciliation). The two sites MUST keep identical
     -- dedup semantics — if you change one, change both.
     milestones_completed = CASE
-        WHEN $15::jsonb IS NULL THEN milestones_completed
+        WHEN $16::jsonb IS NULL THEN milestones_completed
         ELSE COALESCE((SELECT jsonb_agg(DISTINCT e)
-                       FROM jsonb_array_elements_text(COALESCE(milestones_completed, '[]'::jsonb) || $15::jsonb) AS e), '[]'::jsonb)
+                       FROM jsonb_array_elements_text(COALESCE(milestones_completed, '[]'::jsonb) || $16::jsonb) AS e), '[]'::jsonb)
     END,
     milestones_in_progress = CASE
-        WHEN $16::jsonb IS NULL THEN milestones_in_progress
-        ELSE $16::jsonb
+        WHEN $17::jsonb IS NULL THEN milestones_in_progress
+        ELSE $17::jsonb
     END,
     -- PRD #1224 M2 (Decision 6): the per-milestone agent attribution moves WITH the
     -- validated in_progress write — keyed on the SAME milestones_in_progress narg gate, NOT
@@ -7939,8 +7968,8 @@ UPDATE runs SET
     -- when it also writes in_progress; a nil param here with a present in_progress means
     -- "in_progress advanced, no attribution survived" → '[]'.
     milestones_agents = CASE
-        WHEN $16::jsonb IS NULL THEN milestones_agents
-        ELSE COALESCE($17::jsonb, '[]'::jsonb)
+        WHEN $17::jsonb IS NULL THEN milestones_agents
+        ELSE COALESCE($18::jsonb, '[]'::jsonb)
     END,
     -- Exit contract (PRD #47 Decision 3), guarded so it fires only on ENTRY to
     -- running. This statement is also the running→running heartbeat (idempotent),
@@ -7965,7 +7994,7 @@ UPDATE runs SET
                THEN GREATEST(0, EXTRACT(EPOCH FROM (now() - status_since))::int)
                ELSE 0 END,
     updated_at       = now()
-WHERE runs.id = $18 AND worker_id = $19
+WHERE runs.id = $19 AND worker_id = $20
   AND status NOT IN ('completed', 'failed', 'cancelled')
   -- limit_wait is excluded EXPLICITLY, and note that the negative guard above does
   -- NOT cover it (PRD #35): a parked run is inside 'NOT IN (terminal)', so without
@@ -7999,7 +8028,7 @@ WHERE runs.id = $18 AND worker_id = $19
   AND status <> 'paused'
   AND (status <> 'awaiting_approval' OR EXISTS (
         SELECT 1 FROM run_user_inputs
-        WHERE run_user_inputs.run_id = $18
+        WHERE run_user_inputs.run_id = $19
           AND run_user_inputs.kind = 'approve_plan'
           AND run_user_inputs.consumed_at IS NOT NULL))
   -- awaiting_input → running is guarded the same way and for the same reason
@@ -8022,7 +8051,7 @@ WHERE runs.id = $18 AND worker_id = $19
   -- equality NULL, so the guard blocks: fail-closed.
   AND (status <> 'awaiting_input' OR EXISTS (
         SELECT 1 FROM run_user_inputs
-        WHERE run_user_inputs.run_id = $18
+        WHERE run_user_inputs.run_id = $19
           AND run_user_inputs.kind = 'answer'
           AND run_user_inputs.consumed_at IS NOT NULL
           AND run_user_inputs.question_id = runs.open_question_id))
@@ -8070,7 +8099,7 @@ WHERE runs.id = $18 AND worker_id = $19
   -- predicate below (` + "`" + `id > COALESCE(open_followup_id, 0)` + "`" + `) is UNCHANGED by #559.
   AND (status <> 'awaiting_followup' OR EXISTS (
         SELECT 1 FROM run_user_inputs
-        WHERE run_user_inputs.run_id = $18
+        WHERE run_user_inputs.run_id = $19
           AND run_user_inputs.kind = 'follow_up'
           AND run_user_inputs.consumed_at IS NOT NULL
           AND run_user_inputs.id > COALESCE(runs.open_followup_id, 0)))
@@ -8088,6 +8117,7 @@ type SetRunRunningParams struct {
 	MilestonesFrozen         []byte      `json:"milestones_frozen"`
 	CompletionContract       []byte      `json:"completion_contract"`
 	RunMaxIterations         int32       `json:"run_max_iterations"`
+	SizeBudgetFactorL        int32       `json:"size_budget_factor_l"`
 	MilestoneBudgetCap       int32       `json:"milestone_budget_cap"`
 	RunTimeoutSeconds        int32       `json:"run_timeout_seconds"`
 	BudgetWallCeilingSeconds int32       `json:"budget_wall_ceiling_seconds"`
@@ -8140,6 +8170,7 @@ func (q *Queries) SetRunRunning(ctx context.Context, arg SetRunRunningParams) (i
 		arg.MilestonesFrozen,
 		arg.CompletionContract,
 		arg.RunMaxIterations,
+		arg.SizeBudgetFactorL,
 		arg.MilestoneBudgetCap,
 		arg.RunTimeoutSeconds,
 		arg.BudgetWallCeilingSeconds,

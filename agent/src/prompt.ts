@@ -1035,6 +1035,11 @@ export function buildPlanPrompt(input: PlanPromptInput): string {
     "them as `submit_plan`'s `milestones` — each `{id, title}` with a short stable id",
     "like `m1` — so the human approves the breakdown along with the plan. OMIT",
     "milestones for small single-unit work.",
+    "When your plan's PROSE lays out a milestone breakdown (M1, M2, …), emit that SAME",
+    "breakdown here as structured `milestones` — the live progress surface (TUI, web, CLI)",
+    "renders from this structured list, not from the plan text, so milestones described",
+    "only in prose show no progress. This does not change the opt-out above: omit them for",
+    "genuinely single-unit work.",
     "",
     // PRD #72 Decision 15. The done-condition clause is present during planning
     // too, but nothing asked the plan to SAY the PRD will be updated and possibly
