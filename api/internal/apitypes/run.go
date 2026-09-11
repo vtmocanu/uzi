@@ -162,6 +162,15 @@ type RunDTO struct {
 	// rule (pause_mode='now', or 'milestone' once the in-flight milestone completed) lives in
 	// ONE place (runToDTO's pauseRequestedRule). false whenever no pause is pending.
 	PauseRequested bool `json:"pause_requested"`
+	// CompletionBudgetExhausted is the SERVER-DECIDED served `budget_exhausted` steer (PRD #1226
+	// M4, D3): true when the server has stamped runs.completion_budget_exhausted_at, telling a
+	// LIVE post-attempt worker holding this run that its wall budget is exhausted and it should
+	// enter the completion hold. Like PauseRequested it is a worker-facing ACK boolean (NOT
+	// owner-gated) that rides the running-report ACK — the SAME delivery pause_requested uses — so
+	// the worker reads it off {run: RunDTO}. Computed as run.CompletionBudgetExhaustedAt.Valid;
+	// false whenever the column is NULL (the un-served state, cleared when the worker enters the
+	// hold via SetRunCompletionHold so a stale ACK cannot re-arm it).
+	CompletionBudgetExhausted bool `json:"completion_budget_exhausted"`
 	// PauseRequestedAt / PauseMode / PauseAfterCount describe a PENDING pause request on a
 	// still-running run (PRD #1190 M1): a flag, not a status (Decision 3). All null when no
 	// pause is pending. They carry an owner's intent, so they ride only the owner/admin RunDTO

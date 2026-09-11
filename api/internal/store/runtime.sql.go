@@ -8501,6 +8501,60 @@ func (q *Queries) SettleScopeInputDisposition(ctx context.Context, arg SettleSco
 	return result.RowsAffected(), nil
 }
 
+const stampCompletionBudgetExhausted = `-- name: StampCompletionBudgetExhausted :execrows
+UPDATE runs SET completion_budget_exhausted_at = now(), updated_at = now()
+WHERE status = 'running'
+  AND started_at < ($1::timestamptz
+        - make_interval(secs => COALESCE(budget_wall_seconds, $2::int)
+                              + budget_paused_seconds))
+  AND kind NOT IN ('chat', 'judge')
+  AND interactive = false
+  AND completion_attempts > 0
+  AND completion_contract_version IS NOT NULL
+  AND completion_budget_exhausted_at IS NULL
+  AND worker_id IN (
+      SELECT w.id FROM workers w
+      WHERE w.last_heartbeat_at IS NOT NULL
+        AND w.last_heartbeat_at >= $3::timestamptz
+  )
+`
+
+type StampCompletionBudgetExhaustedParams struct {
+	Now                  pgtype.Timestamptz `json:"now"`
+	GlobalTimeoutSeconds int32              `json:"global_timeout_seconds"`
+	WorkerStaleCutoff    pgtype.Timestamptz `json:"worker_stale_cutoff"`
+}
+
+// PRD #1226 M4 (D3): the server-side served `budget_exhausted` steer. It is the COMPLEMENT of
+// SweepRunningTimeout — it stamps EXACTLY the rows that sweep DELIBERATELY SPARED via its
+// completion-interlock carve-out (the `AND NOT (completion_attempts > 0 AND worker_id IN
+// <live-heartbeat>)` clause above). Those spared rows are past their wall budget but held live
+// by a working lead, and they must not run forever: this stamp arms a ONE-SHOT served flag
+// (completion_budget_exhausted_at) that the worker reads off its running-report ACK (the SAME
+// delivery the pause_requested flag rides, surfaced as RunDTO.CompletionBudgetExhausted) and then
+// routes to the completion hold — steering the live lead INTO the verified hold rather than
+// terminal-failing it out from under a live worker.
+//
+// The deadline math and the kind/interactive exemptions MIRROR SweepRunningTimeout EXACTLY (same
+// per-run wall = COALESCE(budget_wall_seconds, global_timeout_seconds) + budget_paused_seconds,
+// same 'chat'/'judge' and interactive=false exemptions), and the two carve-out predicates
+// (completion_attempts > 0 AND the live-heartbeat worker subquery keyed on the SAME
+// worker_stale_cutoff) are applied POSITIVELY here — so the stamp set is byte-for-byte the set the
+// sweep excluded. completion_contract_version IS NOT NULL keeps a legacy run out (it never
+// interlocks and so is never a candidate for the hold).
+//
+// It is ONE-SHOT: `completion_budget_exhausted_at IS NULL` means a run is stamped at most once per
+// exhaustion. The worker acting on the served steer CLEARS the flag — SetRunCompletionHold sets
+// completion_budget_exhausted_at back to NULL (the D3 "clears it so a stale ACK cannot re-arm"
+// contract) — so a running-report ACK that echoes a since-consumed flag can never re-arm the steer.
+func (q *Queries) StampCompletionBudgetExhausted(ctx context.Context, arg StampCompletionBudgetExhaustedParams) (int64, error) {
+	result, err := q.db.Exec(ctx, stampCompletionBudgetExhausted, arg.Now, arg.GlobalTimeoutSeconds, arg.WorkerStaleCutoff)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const sweepClaimedNeverStarted = `-- name: SweepClaimedNeverStarted :many
 
 UPDATE runs SET status = 'queued', status_since = now(),

@@ -799,10 +799,14 @@ func (h *Handler) WorkerRunCompletionAttempt(w http.ResponseWriter, r *http.Requ
 //
 // It mirrors WorkerRunState's applied/409 shape EXACTLY, and that shape is load-bearing for the
 // park-order ack contract: on success it returns 200 with the paused run, and on a REFUSED hold it
-// returns 409 with the run's REAL (non-paused) status. The worker reads the returned status and
-// cleans up (removes the clone / plugin dir / HOME) ONLY when it sees `paused`; a non-paused body
-// means retain the run live. (A reclaim surfaces as ErrRunNotOwned -> 404, which the worker also
-// never reads as `paused`.)
+// returns 409 with the run's ACTUAL status. That status is usually non-paused (a still-live run the
+// guard rejected, or one that moved to queued/terminal), but it CAN be `paused`: an idempotent
+// retry after a hold already landed — or a run an owner already paused — re-reads as `paused` while
+// the guard (source running/awaiting_input) legitimately refuses. The worker keys its cleanup
+// (removes the clone / plugin dir / HOME) off a `paused` status; a `paused` 409 is SAFE, not a bug,
+// because the run IS already held and cleaning up an already-held run is idempotent (a later resume
+// re-clones). A non-paused body means retain the run live. (A reclaim surfaces as ErrRunNotOwned ->
+// 404, which the worker never reads as `paused`.)
 func (h *Handler) WorkerRunCompletionHold(w http.ResponseWriter, r *http.Request) {
 	wkr, ok := mw.WorkerFromContext(r.Context())
 	if !ok {

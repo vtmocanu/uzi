@@ -322,13 +322,18 @@ func (s *Service) RecordCompletionAttempt(ctx context.Context, wkr store.Worker,
 // stored NULL via pgconv.TextOrNull.
 //
 // A guard-failed hold is 0 rows (pgx.ErrNoRows): NON-TERMINAL, applied=false, no error. On that
-// path it RE-READS the owned run so the caller returns 409 with the run's REAL (non-paused)
-// status — exactly the SetState/WorkerRunState applied=false contract, where the worker reads its
-// live status off the body and retains the run. The re-read predates no snapshot: the hold's guard
-// and the re-read both key on (id, worker_id), so a run that failed the guard while still owned
-// re-reads cleanly, while a genuinely reclaimed run surfaces as ErrRunNotOwned (-> 404) — the
-// worker never sees `paused` in either case, so it never wrongly cleans up. Only an infra error
-// propagates.
+// path it RE-READS the owned run so the caller returns 409 with the run's ACTUAL status — exactly
+// the SetState/WorkerRunState applied=false contract, where the worker reads its live status off
+// the body and retains the run. That status is USUALLY non-paused (a still-live running/
+// awaiting_input run the guard rejected for another reason, or one that moved to queued/terminal),
+// but it CAN be `paused`: an idempotent retry after a hold already landed — or a run an owner
+// already paused — re-reads as `paused` while the guard (source status running/awaiting_input)
+// legitimately refuses. A `paused` 409 is SAFE, not a bug: the run IS already held, and cleaning up
+// an already-held run is idempotent (a later resume re-clones), so keying the worker's cleanup off
+// the returned status stays correct whether it reads `paused` from a 200 (this hold landed) or a
+// 409 (already held). The re-read predates no snapshot: the hold's guard and the re-read both key on
+// (id, worker_id), so a run that failed the guard while still owned re-reads cleanly, while a
+// genuinely reclaimed run surfaces as ErrRunNotOwned (-> 404). Only an infra error propagates.
 func (s *Service) SetRunCompletionHold(ctx context.Context, wkr store.Worker, runID uuid.UUID, capturedHead string) (store.Run, bool, error) {
 	// NUL-strip BEFORE the trim (a NUL is not whitespace, so a "\x00 h \x00" would survive a
 	// trim) — the same order RequestCompletionPermit / persistCompletionAttempt use for every

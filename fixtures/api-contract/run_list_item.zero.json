@@ -23,6 +23,7 @@
   "budget_wall_seconds": null,
   "scope_ceiling": null,
   "pause_requested": false,
+  "completion_budget_exhausted": false,
   "pause_requested_at": null,
   "pause_mode": null,
   "pause_after_count": null,

@@ -634,9 +634,10 @@ func (e interlockLiveDB) openQuestionIDNull(t *testing.T, runID uuid.UUID) bool 
 // TestSetRunCompletionHoldLiveDB (PRD #1226 M4, D6) proves the dedicated completion-HOLD
 // transition. An OWNED, INTERLOCKED run with at least one recorded completion attempt holds from
 // BOTH running and awaiting_input (-> paused, hold_reason='completion_blocked', captured head
-// recorded, open_question_id cleared). A run with completion_attempts==0 or in a non-
-// running/awaiting_input status is REFUSED (0 rows -> applied=false, status unchanged). And
-// SetRunPaused — the SIBLING this must not weaken — still pauses an owner-pause run, unchanged.
+// recorded, open_question_id cleared). A run with completion_attempts==0, in a non-
+// running/awaiting_input status, or LEGACY (completion_contract_version NULL) is REFUSED (0 rows ->
+// applied=false, status unchanged). And SetRunPaused — the SIBLING this must not weaken — still
+// pauses an owner-pause run, unchanged.
 func TestSetRunCompletionHoldLiveDB(t *testing.T) {
 	e := setupInterlockLiveDB(t)
 	svc := e.permitService(t)
@@ -725,6 +726,28 @@ func TestSetRunCompletionHoldLiveDB(t *testing.T) {
 	}
 	if s := e.runStatus(t, ownerPause); s != "paused" {
 		t.Fatalf("owner-pause run status = %q, want paused", s)
+	}
+
+	// Case 6: a LEGACY (non-interlocked) running run with completion_attempts>0 is REFUSED — the
+	// completion_contract_version IS NOT NULL guard clause keeps a run that never interlocks out of
+	// the hold, even though it satisfies the status and attempt predicates. Seed a frozen run, then
+	// NULL its contract version so only that clause distinguishes it from Case 1. Mutation-check:
+	// drop `completion_contract_version IS NOT NULL` from SetRunCompletionHold and this reddens.
+	legacy := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
+	e.exec(t, `UPDATE runs SET completion_contract_version = NULL, completion_attempts = 4 WHERE id = $1`, legacy)
+	run6, applied6, err := svc.SetRunCompletionHold(e.ctx, wkr, legacy, "h")
+	if err != nil {
+		t.Fatalf("SetRunCompletionHold (legacy): %v", err)
+	}
+	if applied6 {
+		t.Fatal("a LEGACY (completion_contract_version NULL) run must NOT hold, even with an attempt " +
+			"(completion_contract_version IS NOT NULL guard)")
+	}
+	if run6.Status != "running" {
+		t.Fatalf("a refused legacy hold must leave status unchanged; got %q, want running", run6.Status)
+	}
+	if s := e.runStatus(t, legacy); s != "running" {
+		t.Fatalf("db status after refused legacy hold = %q, want running", s)
 	}
 }
 

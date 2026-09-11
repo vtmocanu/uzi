@@ -107,7 +107,10 @@ var runDTOKeys = []string{
 	// scope_ceiling), the three pending-pause intent fields (null ⇒ no pause pending; they ride
 	// only the owner/admin RunDTO, never the board card), and the checkpoint-tip timestamp
 	// (null before the first publish). All always on the wire.
-	"pause_requested", "pause_requested_at", "pause_mode", "pause_after_count", "checkpoint_tip_at",
+	// PRD #1226 M4 (D3): completion_budget_exhausted is the server-decided served budget_exhausted
+	// steer — a worker-facing bool on the state-ack beside pause_requested, false unless the sweeper
+	// stamped completion_budget_exhausted_at. Always on the wire.
+	"pause_requested", "completion_budget_exhausted", "pause_requested_at", "pause_mode", "pause_after_count", "checkpoint_tip_at",
 	"worker_id", "branch",
 	// PRD #400 (uzi handoff): the task/handoff columns, meaningful only on a
 	// kind='task' run. base_branch is null on every non-task run; open_mr is false by

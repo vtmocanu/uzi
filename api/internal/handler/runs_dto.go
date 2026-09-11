@@ -303,6 +303,11 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration) ap
 		mode = r.PauseMode.String
 	}
 	dto.PauseRequested = pauseRequestedRule(mode, len(dto.Milestones), len(dto.MilestonesCompleted), afterCount)
+	// PRD #1226 M4 (D3): the server-decided served `budget_exhausted` steer rides the running-report
+	// ACK exactly like PauseRequested. It is true iff the sweeper has stamped
+	// completion_budget_exhausted_at (StampCompletionBudgetExhausted) — a one-shot flag the live
+	// post-attempt worker reads to enter the completion hold; false whenever the column is NULL.
+	dto.CompletionBudgetExhausted = r.CompletionBudgetExhaustedAt.Valid
 	// PRD #362 M1, Decision 6 (tolerate-on-read): decode the summary_deltas jsonb into
 	// the typed slice; a malformed or unexpected value renders as NO deltas (nil), logged
 	// and never a panic — the deltas are advisory and a prior write's data, not an

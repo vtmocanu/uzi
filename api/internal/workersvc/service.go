@@ -613,6 +613,11 @@ type Store interface {
 	// backs createRun's create-time open-MR refusal (the open-MR dedup that --force bypasses).
 	GetOpenMRRunForIssue(ctx context.Context, arg store.GetOpenMRRunForIssueParams) (pgtype.Int8, error)
 	SweepRunningTimeout(ctx context.Context, arg store.SweepRunningTimeoutParams) ([]store.SweepRunningTimeoutRow, error)
+	// StampCompletionBudgetExhausted (PRD #1226 M4, D3) arms the server-side served
+	// `budget_exhausted` steer on EXACTLY the post-attempt live-worker interlocked rows
+	// SweepRunningTimeout's carve-out spared. Same now/global_timeout_seconds/worker_stale_cutoff
+	// args the sweep receives; returns the execrows count of rows freshly stamped this tick.
+	StampCompletionBudgetExhausted(ctx context.Context, arg store.StampCompletionBudgetExhaustedParams) (int64, error)
 	FailRunsOfStaleWorkersOverCap(ctx context.Context, arg store.FailRunsOfStaleWorkersOverCapParams) ([]store.FailRunsOfStaleWorkersOverCapRow, error)
 	RequeueRunsOfStaleWorkers(ctx context.Context, arg store.RequeueRunsOfStaleWorkersParams) ([]store.RequeueRunsOfStaleWorkersRow, error)
 	FailWorkerRunsOverCap(ctx context.Context, arg store.FailWorkerRunsOverCapParams) ([]uuid.UUID, error)
@@ -4288,6 +4293,13 @@ type SweepResult struct {
 	// partial index this reads covers only parked runs, a set that is empty on a healthy
 	// instance. Counted like LimitPromoted (len of the returned slice).
 	RecoveryPromoted int64
+	// CompletionBudgetExhausted is the number of runs this pass armed with the server-side
+	// served `budget_exhausted` steer (PRD #1226 M4, D3): the post-attempt live-worker
+	// interlocked rows past their wall budget that SweepRunningTimeout's carve-out spared, now
+	// stamped so their live lead is steered into the completion hold. Set from the execrows
+	// count. Normally 0 (the completion interlock is rollout-OFF and this only fires on a spared,
+	// budget-exhausted run).
+	CompletionBudgetExhausted int64
 }
 
 // -------------------------------------------------------------------------

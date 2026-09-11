@@ -37,6 +37,7 @@
   "budget_wall_seconds": 1,
   "scope_ceiling": 1,
   "pause_requested": true,
+  "completion_budget_exhausted": true,
   "pause_requested_at": "2020-01-02T03:04:05Z",
   "pause_mode": "x",
   "pause_after_count": 1,

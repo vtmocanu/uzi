@@ -141,6 +141,10 @@ func TestSweeperPassLogsResumeOnlyTicks(t *testing.T) {
 	}{
 		{name: "limit_wait promotion alone", res: workersvc.SweepResult{LimitPromoted: 1}, attr: "limit_promoted"},
 		{name: "recovery_wait promotion alone", res: workersvc.SweepResult{RecoveryPromoted: 1}, attr: "recovery_promoted"},
+		// PRD #1226 M4 (D3): a tick that ONLY arms the served budget_exhausted steer must raise the
+		// line too — the guard sum AND emit list both include CompletionBudgetExhausted, else a
+		// steer-only tick logs nothing and the steer is invisible.
+		{name: "completion budget exhausted alone", res: workersvc.SweepResult{CompletionBudgetExhausted: 1}, attr: "completion_budget_exhausted"},
 		{name: "idle tick logs nothing", res: workersvc.SweepResult{}, attr: ""},
 	}
 	for _, tc := range cases {

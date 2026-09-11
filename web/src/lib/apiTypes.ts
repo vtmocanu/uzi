@@ -2203,6 +2203,13 @@ export interface Run {
    *  "Pause now" menu can name what an immediate park would discard. null before any
    *  checkpoint. */
   pause_requested?: boolean;
+  /** PRD #1226 M4 (D3): `completion_budget_exhausted` is the SERVER-DECIDED, worker-facing ACK
+   *  boolean that rides the running-report ACK beside `pause_requested` (built by runToDTO): true
+   *  when the server stamped the run's completion budget as exhausted, steering a live post-attempt
+   *  worker into the completion hold. The web does not act on it (like `pause_requested`), but it is
+   *  on the DTO so it is typed here to match the recorded contract fixtures. OPTIONAL for api/web
+   *  rollout skew exactly like `pause_requested`; the server always sends it. */
+  completion_budget_exhausted?: boolean;
   pause_requested_at?: string | null;
   pause_mode?: "milestone" | "now" | null;
   pause_after_count?: number | null;

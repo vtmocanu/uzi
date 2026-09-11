@@ -1033,6 +1033,14 @@ func (f *autoStopSweepStore) SweepClaimedNeverStarted(context.Context, pgtype.Ti
 func (f *autoStopSweepStore) SweepRunningTimeout(context.Context, store.SweepRunningTimeoutParams) ([]store.SweepRunningTimeoutRow, error) {
 	return nil, nil
 }
+
+// PRD #1226 M4 (D3)'s served-steer stamp, called right after SweepRunningTimeout. Empty (0 rows)
+// for the same reason as the other passes this fixture does not exercise: it is here so Sweep runs
+// end to end, and stamping nothing keeps this file's subject (the auto-stop streak) the only thing
+// moving.
+func (f *autoStopSweepStore) StampCompletionBudgetExhausted(context.Context, store.StampCompletionBudgetExhaustedParams) (int64, error) {
+	return 0, nil
+}
 func (f *autoStopSweepStore) FailRunsOfStaleWorkersOverCap(context.Context, store.FailRunsOfStaleWorkersOverCapParams) ([]store.FailRunsOfStaleWorkersOverCapRow, error) {
 	return nil, nil
 }
