@@ -167,7 +167,8 @@ export type SpawnSupervisor = (
 export interface LauncherDeadlines {
   readonly started: number;
   readonly snapshot: number;
-  /** Slack added to the caller's dispose `timeoutMs` before the launcher gives up. */
+  /** Legacy input-shape field, not consulted by disposal. Call `handle.dispose(timeoutMs)` with the
+   * total budget explicitly; omitting it uses the handle's 2s default. */
   readonly dispose: number;
   readonly exit: number;
 }

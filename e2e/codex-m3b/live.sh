@@ -35,7 +35,7 @@ log() { printf '\n### %s\n' "$*"; }
 case "$MODE" in
   --dry-run)
     # Fake/loopback mode: exactly the credential-free packaged proof, safe to run unattended.
-    # It NEVER touches a real provider even if CODEX_M3B_LIVE_PROVIDER_KEY happens to be set.
+    # It NEVER touches a real provider even if CODEX_M3B_LIVE_LOGIN_JSON happens to be set.
     log "live.sh --dry-run: running the credential-free loopback lifecycle proof (no real provider)"
     exec "$HERE/run-lifecycle.sh"
     ;;
@@ -48,7 +48,7 @@ case "$MODE" in
     if [ -z "${CODEX_M3B_LIVE_BASE_URL:-}" ]; then
       die "--live requires CODEX_M3B_LIVE_BASE_URL (the real provider Responses base URL, e.g. https://api.openai.com/v1) alongside the injected login."
     fi
-    log "live.sh --live: MAINTAINER real-provider SUBSCRIPTION run against ${CODEX_M3B_LIVE_BASE_URL}"
+    log "live.sh --live: MAINTAINER real-provider SUBSCRIPTION run (endpoint supplied but not printed)"
     log "WARNING: a real coordinated refresh ROTATES the seat's refresh-token family (see LIVE-ACCEPTANCE.md)."
     # Turn live mode on everywhere and hand the injected login + base URL to run-lifecycle.sh,
     # which seeds the real login into the test server (its Go seeds discover the identity and
@@ -61,7 +61,7 @@ case "$MODE" in
     exec "$HERE/run-lifecycle.sh"
     ;;
   "")
-    die "no mode chosen and no credential injected. This is the automated/no-input path and it REFUSES rather than reach any provider. Use --dry-run for the credential-free loopback proof; --live (with an injected CODEX_M3B_LIVE_PROVIDER_KEY) is maintainer-only."
+    die "no mode chosen and no credential injected. This is the automated/no-input path and it REFUSES rather than reach any provider. Use --dry-run for the credential-free loopback proof; --live (with an injected CODEX_M3B_LIVE_LOGIN_JSON) is maintainer-only."
     ;;
   *)
     die "unknown argument '$MODE' (want --dry-run or --live)."

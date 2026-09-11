@@ -7,8 +7,8 @@
 # no-egress docker network:
 #
 #   1. PACKAGING controls (controls.sh) through the real root entrypoint under the writable-root
-#      posture (unchanged), so the on-disk supervisor+fileop ownership it proves is production-true.
-#      Runs under `--network none`.
+#      posture in credential-free mode, so the on-disk supervisor+fileop ownership it proves is
+#      production-true. Runs under `--network none`; live mode skips this separate container.
 #   2. A throwaway migrated Postgres container + the api/cmd/codexm3btestserver container, both on a
 #      `docker network create --internal` network (no external egress), so the packaged executor's
 #      REAL WorkerClient can hit the Bearer codex/release + codex/refresh routes over real HTTP.
@@ -19,9 +19,9 @@
 #      turns on Block B, and the server-contract env points the real WorkerClient at the api
 #      container. The whole docker run is bounded by an OUTER `timeout --kill-after` watchdog.
 #
-# It then parses BOTH the Block-A `CODEX_M3B_COUNTS` summary and the Block-B
-# `CODEX_M3B_PACKAGED_REAL_COUNTS` / `CODEX_M3B_PACKAGED_REAL_APIKEY_COUNTS` summaries and requires
-# every real-path count > 0 (and the api_key refresh count == 0).
+# It then parses BOTH the Block-A `CODEX_M3B_COUNTS` summary and the Block-B summaries. Offline it
+# requires every real-path count > 0 (and api_key refresh == 0). Live it gates subscription advice,
+# cancel/root-action settlement and no-leak evidence; token-rotating refresh probes are opt-in.
 #
 # ISOLATION (CLAUDE.md destructive-ops rules): every throwaway resource is named OUTSIDE the uzi-
 # namespace and torn down by its EXACT name in a `trap cleanup EXIT` — never a uzi-* glob, never
@@ -37,7 +37,7 @@
 #   UZI_M3B_DOCKERFILE   worker Dockerfile to build        (default: agent/templates/base/Dockerfile)
 #   UZI_M3B_SKIP_BUILD   set to 1 to reuse an existing worker image (skip docker build)
 #   UZI_M3B_BUILD_NETWORK optional build-step network: default, host, or none (runtime unchanged)
-#   UZI_M3B_TEST_TIMEOUT outer watchdog seconds            (default: 600; raise it for live)
+#   UZI_M3B_TEST_TIMEOUT outer watchdog seconds            (default: 600 offline, 1200 live)
 #   CDR_M3B_PG_IMAGE     throwaway Postgres image          (default: postgres:17)
 #   CDR_M3B_API_PORT     port the api container binds/advertises (default: 8080)
 #
@@ -47,7 +47,8 @@
 #                        stays byte-identical. Real-provider runs are slower — raise UZI_M3B_TEST_TIMEOUT.
 #   CODEX_M3B_LIVE_LOGIN_JSON  (live only) the real subscription login blob; the test server seeds it
 #   CODEX_M3B_LIVE_BASE_URL    (live only) the real provider Responses base URL
-#   UZI_M3B_LIVE_TEST_TIMEOUT_MS  (live only) per-test node cap in ms (default: 600000)
+#   UZI_M3B_LIVE_TEST_TIMEOUT_MS  (live only) per-test node cap in ms (default: 1000000)
+#   CODEX_M3B_LIVE_REFRESH_PROBES 1 = opt in to sequential + check-b real refresh rotation
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -81,8 +82,11 @@ TEST_TIMEOUT_MS=120000
 if [ "$LIVE" = "1" ]; then
   NET_INTERNAL_ARGS=()
   LIVE_TESTSERVER_ENV=(-e CODEX_M3B_LIVE=1 -e CODEX_M3B_LIVE_LOGIN_JSON -e CODEX_M3B_LIVE_BASE_URL -e CODEX_M3B_LIVE_RELAX_TIMEOUTS)
-  LIVE_LIFECYCLE_ENV=(-e CODEX_M3B_LIVE=1 -e CODEX_M3B_LIVE_BASE_URL -e CODEX_M3B_LIVE_SKIP_EXEC -e CODEX_M3B_LIVE_RELAX_TIMEOUTS)
-  TEST_TIMEOUT_MS="${UZI_M3B_LIVE_TEST_TIMEOUT_MS:-600000}"
+  # The lifecycle process receives the login blob only so its in-process no-leak oracle can scan
+  # the actual access + refresh tokens. The production launcher receives neither through its env.
+  LIVE_LIFECYCLE_ENV=(-e CODEX_M3B_LIVE=1 -e CODEX_M3B_LIVE_LOGIN_JSON -e CODEX_M3B_LIVE_BASE_URL -e CODEX_M3B_LIVE_SKIP_EXEC -e CODEX_M3B_LIVE_RELAX_TIMEOUTS -e CODEX_M3B_LIVE_REFRESH_PROBES -e CODEX_M3B_LIVE_ADVICE_TIMEOUT_MS -e CODEX_M3B_LIVE_RUN_TIMEOUT_MS)
+  TIMEOUT="${UZI_M3B_TEST_TIMEOUT:-1200}"
+  TEST_TIMEOUT_MS="${UZI_M3B_LIVE_TEST_TIMEOUT_MS:-1000000}"
 fi
 
 log() { printf '\n### %s\n' "$*"; }
@@ -131,22 +135,29 @@ else
 fi
 require_linux_amd64_image "$IMAGE"
 
-# 2. Packaging controls — writable-root posture, ROOT start via the real entrypoint. Proves the
-#    baked supervisor + fileop ownership/mode. Independent of the api server, so `--network none`.
-log "running packaging controls in $IMAGE (writable-root posture, real entrypoint, --network none)"
-set +e
-timeout --kill-after=30s 180 docker run --rm --network none \
-  --cap-drop ALL \
-  --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add SETPCAP --cap-add SETUID --cap-add SETGID \
-  --security-opt no-new-privileges \
-  --entrypoint /usr/local/sbin/uzi-entrypoint \
-  -v "$REPO/e2e":/work/e2e:ro \
-  --name "$CONTROLS_NAME" \
-  "$IMAGE" /bin/sh /work/e2e/codex-m3b/controls.sh
-rc_controls=$?
-set -e
-docker rm -f "$CONTROLS_NAME" >/dev/null 2>&1 || true
-log "packaging controls rc=$rc_controls"
+# 2. Packaging controls — writable-root posture, ROOT start via the real entrypoint. The
+#    credential-free dry-run keeps this byte-for-byte invocation. Live mode skips the separate
+#    controls container: its production launch/action roots are exercised and settled by the live
+#    lifecycle suite itself, without starting an unrelated extra container beside real credentials.
+rc_controls=0
+if [ "$LIVE" = "1" ]; then
+  log "packaging controls skipped in live mode (dry-run remains the packaging control)"
+else
+  log "running packaging controls in $IMAGE (writable-root posture, real entrypoint, --network none)"
+  set +e
+  timeout --kill-after=30s 180 docker run --rm --network none \
+    --cap-drop ALL \
+    --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add SETPCAP --cap-add SETUID --cap-add SETGID \
+    --security-opt no-new-privileges \
+    --entrypoint /usr/local/sbin/uzi-entrypoint \
+    -v "$REPO/e2e":/work/e2e:ro \
+    --name "$CONTROLS_NAME" \
+    "$IMAGE" /bin/sh /work/e2e/codex-m3b/controls.sh
+  rc_controls=$?
+  set -e
+  docker rm -f "$CONTROLS_NAME" >/dev/null 2>&1 || true
+  log "packaging controls rc=$rc_controls"
+fi
 
 # 3. The network the PG + api + worker containers share. Offline it is --internal (no external
 #    egress); live it is egress-capable so the worker/test-server reach the real provider + auth hosts.
@@ -291,6 +302,8 @@ log "server up; contract origin=$CONTRACT_BASE_URL; internal worker route resolv
 #    for the per-image count assertions.
 log "running the packaged lifecycle suite in $IMAGE under the confinement posture (network $NET)"
 set +e
+# The single-quoted command is expanded by the inner container shell, not this host shell.
+# shellcheck disable=SC2016
 timeout --kill-after=60s "$TIMEOUT" docker run --rm --network "$NET" \
   --cap-drop ALL \
   --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add SETPCAP --cap-add SETUID --cap-add SETGID \
@@ -323,8 +336,10 @@ docker rm -f "$LIFECYCLE_NAME" >/dev/null 2>&1 || true
 #    Block-A CODEX_M3B_COUNTS AND the Block-B real-path summaries with node (never a /nix jq),
 #    reading the LAST occurrence of each, and require every real-path count > 0 + api_key refresh 0.
 #    In LIVE mode the fake-provider-visible counts (login/turns/callbacks/etc.) are not observable
-#    and the api_key arm is skipped, so a reduced live parser asserts Block A + the live subscription
-#    summary (ran + release + refresh advance/replay + the check-b concurrency invariants) instead.
+#    and the api_key arm is skipped. The reduced parser always gates Block A plus live subscription
+#    release, advice, cancel/root-action settlement, and no-leak evidence. Sequential/check-b refresh
+#    fields gate only when CODEX_M3B_LIVE_REFRESH_PROBES=1; the default live pass does not require or
+#    execute those token-rotating probes.
 rc_counts=1
 if [ "$LIVE" = "1" ]; then
   if node - "$LIFECYCLE_OUT" <<'NODE'
@@ -351,14 +366,36 @@ for (const k of ["tests", "callbacks", "delegations", "roots"]) {
 }
 // The live subscription real-path summary (fake-visible counts are not observable live).
 const s = parse("CODEX_M3B_LIVE_SUB_COUNTS");
-// ran is reported, not gated: a real model turn against the minimal test server is non-deterministic
-// (it may produce no plan), so the deterministic gate is the credential lifecycle + check-b below.
-if (!(Number(s.releases) > 0)) fail(`live releases not > 0 (${s.releases})`);
-if (!(Number(s.refreshAdvanced) > 0)) fail(`live refreshAdvanced not > 0 (${s.refreshAdvanced})`);
-if (!(Number(s.refreshReplayed) > 0)) fail(`live refreshReplayed not > 0 (${s.refreshReplayed})`);
-if (s.checkBSingleStep !== true) fail(`live check-b did not advance by exactly one step (${s.checkBSingleStep})`);
-if (s.checkBConverged !== true) fail(`live check-b did not converge on one token/generation (${s.checkBConverged})`);
-console.log("live per-image counts OK (Block A + live subscription + check-b)");
+// `ran` and advice text are reported, not gated. The deterministic default gate is release + the
+// advice terminal/policy/fail-closed ceiling + post-turn-start cancel + root/action settlement +
+// the in-process no-leak oracle.
+if (!(Number(s.releases) >= 2)) fail(`live releases less than 2 (${s.releases})`);
+if (s.adviceCompleted !== true) fail(`live advice did not complete (${s.adviceCompleted})`);
+if (Number(s.adviceReleaseCount) !== 1) fail(`live advice release count not 1 (${s.adviceReleaseCount})`);
+if (s.adviceReleaseFailClosed !== true) fail(`live advice release failure was not fail-closed (${s.adviceReleaseFailClosed})`);
+if (Number(s.advicePolicyCalls) !== 1) fail(`live advice policy count not 1 (${s.advicePolicyCalls})`);
+if (!(Number(s.adviceRoots) > 0) || s.adviceRootsSettled !== true) fail("live advice root did not settle");
+if (s.adviceTransportClosed !== true) fail("live advice transport did not close");
+if (Number(s.adviceActions) !== 0 || s.adviceActionsZero !== true) fail("live advice admitted an action root");
+if (!(Number(s.cancelTurnStarts) > 0)) fail(`live cancel observed no turn/start (${s.cancelTurnStarts})`);
+if (s.cancelWon !== true) fail(`live cancel did not win (${s.cancelWon})`);
+if (s.cancelTerminalDisposed !== true) fail(`live cancel terminal dispose failed (${s.cancelTerminalDisposed})`);
+if (!(Number(s.cancelProviderRoots) > 0) || s.cancelRootsSettled !== true) fail("live cancel provider roots did not settle");
+if (s.cancelTransportsClosed !== true) fail("live cancel provider transports did not close");
+if (!(Number(s.cancelActions) > 0) || s.cancelActionsSettled !== true) fail("live cancel action roots did not settle");
+if (s.noLeak !== true) fail(`live in-process no-leak oracle did not pass (${s.noLeak})`);
+
+const refreshEnabled = process.env.CODEX_M3B_LIVE_REFRESH_PROBES === "1";
+if (s.refreshProbesEnabled !== refreshEnabled) fail("live refresh-probe mode disagrees with the harness env");
+if (refreshEnabled) {
+  if (s.refreshProbeAdvanced !== true) fail(`live sequential refresh did not advance (${s.refreshProbeAdvanced})`);
+  if (s.refreshProbeReplayed !== true) fail(`live sequential refresh did not replay (${s.refreshProbeReplayed})`);
+  if (s.checkBSingleStep !== true) fail(`live check-b did not advance by exactly one step (${s.checkBSingleStep})`);
+  if (s.checkBConverged !== true) fail(`live check-b did not converge on one token/generation (${s.checkBConverged})`);
+}
+console.log(refreshEnabled
+  ? "live per-image counts OK (Block A + subscription advice/cancel/no-leak + opt-in refresh probes)"
+  : "live per-image counts OK (Block A + subscription advice/cancel/no-leak; refresh probes off)");
 NODE
   then
     rc_counts=0

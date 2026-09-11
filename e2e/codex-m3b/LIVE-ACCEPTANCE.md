@@ -5,16 +5,21 @@ packaged `CodexExecutor` proof that runs credential-free against a loopback fake
 the **real** ChatGPT/OpenAI provider using a maintainer-injected subscription login. It is strictly
 opt-in via env; with the env unset every leg is byte-for-byte the credential-free offline run.
 
-The live branch drives the **subscription** lifecycle only, and adds a two-concurrent-refresh
-**check-b** that proves the coordinated single-exchange refresh against the real `/codex/refresh`
-route.
+The live branch drives the **subscription** lifecycle only. Its default gate now includes one real
+production advice-harness pass, a deterministic cancel after the app-server accepts `turn/start`,
+registered provider/action-root settlement, and an in-process no-leak oracle. The sequential refresh
+and two-concurrent-refresh **check-b** are available only through the explicit
+`CODEX_M3B_LIVE_REFRESH_PROBES=1` opt-in.
 
-## 🔴 Read first — a real refresh rotates the seat
+## Read first: a real refresh rotates the seat
 
-A real coordinated refresh performs a real oauth exchange at the provider and **ROTATES the seat's
-refresh-token family**. This harness performs *several* real refreshes in one run: the executor's own
-in-run refresh and finalize reconcile, the sequential advance+replay probe, and the two concurrent
-check-b refreshes. Each rotates the stored refresh token.
+A real coordinated refresh performs a real OAuth exchange at the provider and **rotates the seat's
+refresh-token family**. The default live run does **not** execute the explicit sequential or check-b
+refresh probes. The app-server may still request a refresh if the injected access token expires, and
+the default complete executor run normally refreshes during its finalize reconcile (set
+`CODEX_M3B_LIVE_SKIP_EXEC=1` to omit that non-gating run). Setting
+`CODEX_M3B_LIVE_REFRESH_PROBES=1` additionally runs the sequential advance/replay and concurrent
+check-b probes, which deliberately rotate the stored refresh token.
 
 - **Use a DEDICATED test seat, never your primary working `codex login`.** If a bug — or an
   interrupted durable commit — leaves the seat's stored refresh token out of sync with the provider,
@@ -37,10 +42,12 @@ Optional tunables (sane defaults; real-provider latency makes larger values advi
 
 | Env | Default | What |
 |---|---|---|
-| `UZI_M3B_TEST_TIMEOUT` | `600` | Outer watchdog **seconds**. Raise it for a live run (a real model turn is slow); e.g. `1800`. |
-| `UZI_M3B_LIVE_TEST_TIMEOUT_MS` | `600000` | Per-test `node --test` cap in ms (live only). |
-| `CODEX_M3B_LIVE_RUN_TIMEOUT_MS` | `300000` | Inner cap on the real executor run in ms. |
-| `CODEX_M3B_LIVE_SKIP_EXEC` | (unset) | `1` skips the full real-model executor run and runs only the credential-lifecycle + check-b proof (cheaper/faster; the deterministic gate still holds). |
+| `UZI_M3B_TEST_TIMEOUT` | `1200` in live mode | Outer watchdog **seconds**. The credential-free default remains `600`; use `1800` when provider latency warrants more room. |
+| `UZI_M3B_LIVE_TEST_TIMEOUT_MS` | `1000000` | Per-test `node --test` cap in ms (live only), sized above the advice, cancel, and optional complete-run inner caps. |
+| `CODEX_M3B_LIVE_RUN_TIMEOUT_MS` | `300000` | Inner cap on the optional complete real executor run in ms. |
+| `CODEX_M3B_LIVE_ADVICE_TIMEOUT_MS` | `180000` | Inner cap on the gated real advice pass in ms. |
+| `CODEX_M3B_LIVE_SKIP_EXEC` | (unset) | `1` skips only the non-gating complete real-model run. Advice, cancel/root settlement, release/fail-closed, and no-leak gates still run. |
+| `CODEX_M3B_LIVE_REFRESH_PROBES` | (unset) | `1` explicitly enables the token-rotating sequential advance/replay and concurrent check-b probes. Default live acceptance does not execute or require them. |
 | `UZI_M3B_SKIP_BUILD` | (unset) | `1` reuses an existing `uzi-agent-m3b:base` image instead of building it. |
 
 ### The login blob shape
@@ -62,9 +69,9 @@ rather than seeding a broken account.
 
 ```sh
 # 1. Get the tree. Until the `feat/codex-m3b-live-subscription` branch is merged, this glue lives
-#    only on that branch: either check it out, or clone `main` and copy the 5 changed harness files
-#    over it (e.g. `kubectl cp` them into the pod) — `e2e/codex-m3b/{live.sh,run-lifecycle.sh,
-#    lifecycle.test.ts,LIVE-ACCEPTANCE.md}` and `api/cmd/codexm3btestserver/main.go`.
+#    only on that branch: either check it out, or clone `main` and copy the changed harness files
+#    over it: `e2e/codex-m3b/{live.sh,run-lifecycle.sh,lifecycle.test.ts,packaged-modules.ts,
+#    LIVE-ACCEPTANCE.md}` and `api/cmd/codexm3btestserver/main.go`.
 git clone https://github.com/vtmocanu/uzi.git && cd uzi
 
 # 2. Pull the packaged worker base image and retag it to the harness's expected tag.
@@ -81,30 +88,40 @@ UZI_M3B_TEST_TIMEOUT=1800 \
   ./e2e/codex-m3b/live.sh --live
 ```
 
+That default does not run the explicit sequential/check-b refresh rotation. A maintainer who
+intentionally wants to reproduce acceptance check 2 adds
+`CODEX_M3B_LIVE_REFRESH_PROBES=1` to the same command and uses a dedicated test seat.
+
 `live.sh --live` refuses (non-zero) unless both `CODEX_M3B_LIVE_LOGIN_JSON` and
 `CODEX_M3B_LIVE_BASE_URL` are present, then `exec`s `run-lifecycle.sh` with live mode on. In live mode
 `run-lifecycle.sh`:
 
+- skips the separate packaging-controls container; `--dry-run` keeps that container and its behavior
+  unchanged;
 - creates the docker network **without** `--internal` (egress-capable), so the worker and test-server
   reach the real provider and the real ChatGPT auth hosts;
-- passes the live env into the **test-server** container (its Go seeds discover the identity, seal the
-  real login, and wire the real `codexauth` client into the coordinated refresher) and into the
-  **lifecycle** container (so the suite uses the real base URL, subscription-only);
-- runs the same Block A canary-boundary proof (injected fakes, unchanged), then the live subscription
-  leg, and asserts a reduced live count summary (`CODEX_M3B_LIVE_SUB_COUNTS`).
+- passes the live env into the **test-server** container so it discovers identity, seals the real
+  login, and wires the real `codexauth` client; the lifecycle process receives the login blob only so
+  its no-leak oracle can scan the actual access and refresh values, while the launched production
+  root still receives neither value through its environment;
+- runs the unchanged Block A injected-fake proof, then the real subscription advice and cancellation
+  passes, the optional complete run, and only when enabled the explicit refresh probes;
+- parses `CODEX_M3B_LIVE_SUB_COUNTS` as counts and booleans only. That summary prints no token,
+  capability, account, endpoint, session, thread, or turn value.
 
 ## What the four maintainer live-acceptance checks (PRD #1171 §"Maintainer-only live acceptance") get from this
 
 | # | Check | Status in this harness |
 |---|-------|------------------------|
-| 1 | One production run-harness turn **and** one advice-harness pass on a subscription login, then repeat on an OpenAI API key; no fallback | **Partial.** The live subscription leg drives one real production run-harness turn against the real provider (reported as `ran`; non-gating — a real model's tool choices against the minimal test server are maintainer-verified, and it can be skipped with `CODEX_M3B_LIVE_SKIP_EXEC=1`). The **advice-harness pass** and the **API-key repeat** are **NOT** exercised here (the api_key leg is skipped in live mode) — still manual. |
-| 2 | Two processes on the same subscription state, force an expired generation, observe **exactly one** coordinated refresh and both consuming the one durable generation | **Exercised (check-b).** Two concurrent `/codex/refresh` calls at the same observed generation, distinct operation ids, over the **real** coordinated-refresh route: the harness asserts exactly one `advanced`, both converging on the same access token + generation, and the committed generation advancing by **exactly one** step. Nuance: it uses two concurrent HTTP calls from **one** process (both hit the same server-side coordinated-refresh state machine, which is the serialization point being proven), not two OS processes. |
-| 3 | Recreate the process/root, authenticate from the API's committed state, then cancel + final boundary cleanup with every registered root settled | **Partial.** The live run exercises release-from-committed-state, the finalize boundary reconcile and the terminal dispose (roots reaped/settled). **Cancel** is proven by Block A (injected fakes), not on the live path. |
-| 4 | No secret, capability, account id, private endpoint, session/thread id or raw auth artifact in logs, git, image layers or the public evidence | **Partial.** The live leg captures every plaintext token the executor + probes released and asserts none — and the capability — appears in an emitted message or a log line. The broader sweep (account id, endpoints, session/thread ids, git history, image layers, the recorded evidence) remains a **manual** maintainer step. |
+| 1 | One production run-harness turn **and** one advice-harness pass on a subscription login, then repeat on an OpenAI API key; no fallback | **Subscription half exercised.** The complete production run remains reported as `ran` and content-non-gating. A separate real advice pass uses `makeCodexAdviceHarness` with a test-only adapter over the packaged production `launchCodexRoot` and `createCodexTransport`; it gates one fresh release, one successful terminal/policy callback, no action surface, clean root disposal, and a denied-release negative that launches no root. The real API-key repeat is intentionally **user-deferred to parent M6**. This harness does not add or claim it. |
+| 2 | Two processes on the same subscription state, force an expired generation, observe **exactly one** coordinated refresh and both consuming the one durable generation | **Opt-in, default off.** `CODEX_M3B_LIVE_REFRESH_PROBES=1` runs the accepted sequential advance/replay and concurrent check-b assertions over the real route. The default live pass neither executes nor requires them, avoiding routine refresh-family rotation. The concurrency probe still uses two concurrent HTTP calls from one process, not two OS processes. |
+| 3 | Recreate the process/root, authenticate from the API's committed state, then cancel + final boundary cleanup with every registered root settled | **Subscription cancellation exercised.** A fresh committed token authenticates a real root. The test observes a successful `turn/start`, aborts before the harness consumes a terminal, requires the exact owner-cancel outcome, then requires `safety.dispose` to report `disposed` with every tracked provider and command/file action root settled and no disposal failure. |
+| 4 | No secret, capability, account id, private endpoint, session/thread id or raw auth artifact in logs, git, image layers or the public evidence | **In-process portion exercised.** The suite checks the injected access and refresh tokens, every released/refreshed access token, capability, account id, provider and worker endpoint URL/host, and every observed session/thread/turn id across emitted/advice messages, scrubbed logs, and non-auth request evidence. Required routing ids and login fields are allowed only in their exact internal RPC slots; the emitted summary contains booleans/counts only, and failures print only a static category/surface. Git history and image-layer inspection remain external maintainer checks. |
 
-Treat the deterministic gate here as the credential lifecycle: a real release, the coordinated
-advance+replay, and the check-b concurrency convergence. The full real-model run and the wider
-no-leak sweep are maintainer-verified.
+The default deterministic gate is now fresh release plus advice terminal/policy/fail-closed
+construction, post-turn-start cancel, provider/action-root settlement, and the in-process no-leak
+oracle. The complete real-model run and advice text remain content-non-gating. Check-b runs only
+when explicitly enabled. The real API-key repeat remains deferred to M6.
 
 ## Teardown
 
@@ -129,9 +146,13 @@ the real database.
 
 - `live.sh` — the maintainer-only entrypoint. `--dry-run` = credential-free loopback; `--live` =
   real provider (requires the injected login + base URL); no arg / no login = refuses.
-- `run-lifecycle.sh` — the orchestrator. Live mode: egress-capable network + live env into the
-  test-server and lifecycle containers + a reduced live count summary.
-- `api/cmd/codexm3btestserver` — the throwaway Bearer-route server. Live mode: seals the real
-  env-injected login, auto-discovers identity, wires the real `codexauth` client, subscription-only.
-- `lifecycle.test.ts` — Block A (injected fakes, always) + the real-launch suite; its subscription
-  leg branches to the live body under `CODEX_M3B_LIVE=1`, and adds check-b.
+- `run-lifecycle.sh`: the orchestrator. Live mode skips only the packaging-controls container, uses
+  an egress-capable network, threads the no-leak inputs into the lifecycle process, and parses the
+  boolean/count-only live summary. Dry-run behavior is unchanged.
+- `api/cmd/codexm3btestserver`: the throwaway Bearer-route server. Live mode seals the real
+  env-injected login, auto-discovers identity, wires the real `codexauth` client, and remains
+  subscription-only.
+- `packaged-modules.ts`: resolves the image-baked launcher and transport factories used by the
+  test-only advice/cancel adapter.
+- `lifecycle.test.ts`: Block A (injected fakes, always) plus the real-launch suite. Its live body gates
+  subscription advice, cancellation, cleanup, and no-leak evidence; check-b is explicit opt-in.

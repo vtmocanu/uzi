@@ -36,15 +36,19 @@ import {
   loadPackagedCodexExecutor,
   loadPackagedSessionState,
   loadPackagedSelect,
+  loadPackagedLauncher,
+  loadPackagedTransport,
   type CodexExecutorModule,
+  type LauncherModule,
   type SessionStateModule,
   type SelectModule,
+  type TransportModule,
 } from "./packaged-modules.js";
 import { bearerDigest, codexCanaries, type CodexCanaries } from "./fake-provider.js";
 
 import type { CodexExecutorDeps } from "../../agent/src/codex/codex-executor.js";
 import type { CodexBinding } from "../../agent/src/codex/select.js";
-import type { CodexLaunchRootResult, CodexProviderConfig } from "../../agent/src/codex/codex-harness.js";
+import type { CodexLaunchRootResult, CodexLaunchRootSpec, CodexProviderConfig } from "../../agent/src/codex/codex-harness.js";
 import type { RegisteredRoot } from "../../agent/src/codex/registry.js";
 import type { FileopHelperHandle } from "../../agent/src/codex/fileop-client.js";
 import type { CodexNotification, CodexTransport } from "../../agent/src/codex/transport.js";
@@ -52,24 +56,46 @@ import type { RunContext, EmittedMessage, Executor } from "../../agent/src/execu
 import type { Logger } from "../../agent/src/log.js";
 import type { AgentTemplate, ClaimCodexSecrets } from "../../agent/src/protocol.js";
 import type { CodexEffectLaunchSpec, CodexRootHandle } from "../../agent/src/codex/launcher.js";
+import type { CodexAppServerAuthMode } from "../../agent/src/codex/appserver-auth.js";
+import type { LaunchAdviceRootSeam } from "../../agent/src/codex/codex-advice-harness.js";
+import type { AdviceRequest, AdviceResultPolicy, HarnessTerminal } from "../../agent/src/harness.js";
 
 // ─── the PACKAGED adapter, loaded once before any test (image /app/src, or the host
 // source tree). A top-level `before` (not top-level await — the CommonJS-typed e2e tree
 // forbids it) resolves them before the first `it` body runs. ────────────────────
 let CodexExecutor: CodexExecutorModule["CodexExecutor"];
 let FailClosedExecutor: CodexExecutorModule["FailClosedExecutor"];
+let CodexAdviceCredentialBridge: CodexExecutorModule["CodexAdviceCredentialBridge"];
+let makeCodexAdviceHarness: CodexExecutorModule["makeCodexAdviceHarness"];
+let registeredRoot: CodexExecutorModule["registeredRoot"];
 let selectCodexBinding: SelectModule["selectCodexBinding"];
 let CodexSelectionError: SelectModule["CodexSelectionError"];
 let CodexSessionStore: SessionStateModule["CodexSessionStore"];
+let launchCodexRoot: LauncherModule["launchCodexRoot"];
+let launchCodexEffectRoot: LauncherModule["launchCodexEffectRoot"];
+let CODEX_BIN: LauncherModule["CODEX_BIN"];
+let SUPERVISOR_BIN: LauncherModule["SUPERVISOR_BIN"];
+let PROVIDER_CHILD_ARGV: LauncherModule["PROVIDER_CHILD_ARGV"];
+let createCodexTransport: TransportModule["createCodexTransport"];
 
 before(async () => {
   const exec = await loadPackagedCodexExecutor();
   CodexExecutor = exec.CodexExecutor;
   FailClosedExecutor = exec.FailClosedExecutor;
+  CodexAdviceCredentialBridge = exec.CodexAdviceCredentialBridge;
+  makeCodexAdviceHarness = exec.makeCodexAdviceHarness;
+  registeredRoot = exec.registeredRoot;
   const sel = await loadPackagedSelect();
   selectCodexBinding = sel.selectCodexBinding;
   CodexSelectionError = sel.CodexSelectionError;
   CodexSessionStore = (await loadPackagedSessionState()).CodexSessionStore;
+  const launcher = await loadPackagedLauncher();
+  launchCodexRoot = launcher.launchCodexRoot;
+  launchCodexEffectRoot = launcher.launchCodexEffectRoot;
+  CODEX_BIN = launcher.CODEX_BIN;
+  SUPERVISOR_BIN = launcher.SUPERVISOR_BIN;
+  PROVIDER_CHILD_ARGV = launcher.PROVIDER_CHILD_ARGV;
+  createCodexTransport = (await loadPackagedTransport()).createCodexTransport;
 });
 
 const WORKSPACE = "/work/repo";
@@ -932,7 +958,6 @@ describe("codex-m3b packaged lifecycle (injected fakes)", () => {
     controller.abort();
     await assert.rejects(withTimeout(p, 5000, "cancel run"), (e: Error) => {
       assert.equal(e.message, "run cancelled", "the cancel trip wins over the raw AbortError");
-      assert.doesNotMatch(e.message, /AbortError/);
       return true;
     });
     // The standalone backstop still tore the provider root down on the cancel path.
@@ -993,6 +1018,14 @@ const LIVE = process.env.CODEX_M3B_LIVE === "1";
 // The production Responses base URL fallback when CODEX_M3B_LIVE_BASE_URL is unset (mirrors
 // CODEX_PRODUCTION_PROVIDER.baseUrl in agent/src/codex/codex-executor.ts).
 const LIVE_BASE_URL_FALLBACK = "https://api.openai.com/v1";
+
+// REFRESH PROBES (PRD #1171 M3, item 1): the sequential advance+replay probe and the
+// two-concurrent-refresh "check-b" REPEAT the already-accepted coordinated-refresh proof
+// (PRD #1171 "Maintainer-only live acceptance" check 2), and each real refresh ROTATES the
+// seat's refresh-token family. So they are strictly OPT-IN and DEFAULT OFF: today's live
+// pass proves the subscription advice + cancel/root-settlement + no-leak checks WITHOUT
+// rotating the seat. Set CODEX_M3B_LIVE_REFRESH_PROBES=1 to reproduce accepted check 2.
+const LIVE_REFRESH_PROBES = process.env.CODEX_M3B_LIVE_REFRESH_PROBES === "1";
 
 describe("codex-m3b real-provider responder routing", () => {
   it("rejects a non-empty bearer that the worker API did not release", async () => {
@@ -1215,10 +1248,606 @@ function sleepMs(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+interface LiveTurnStartLatch {
+  readonly observed: Promise<void>;
+  readonly released: Promise<void>;
+  markObserved(): void;
+  release(): void;
+}
+
+function liveTurnStartLatch(): LiveTurnStartLatch {
+  let markObserved!: () => void;
+  let release!: () => void;
+  let observedOnce = false;
+  let releasedOnce = false;
+  const observed = new Promise<void>((resolve) => { markObserved = resolve; });
+  const released = new Promise<void>((resolve) => { release = resolve; });
+  return {
+    observed,
+    released,
+    markObserved: () => {
+      if (!observedOnce) {
+        observedOnce = true;
+        markObserved();
+      }
+    },
+    release: () => {
+      if (!releasedOnce) {
+        releasedOnce = true;
+        release();
+      }
+    },
+  };
+}
+
+interface LiveTransportRequest {
+  readonly method: string;
+  readonly params: unknown;
+}
+
+interface LiveServerRequest {
+  readonly method: string | null;
+  readonly requestId: number | string;
+  readonly params: unknown;
+}
+
+interface LiveServerResponse {
+  readonly requestId: number | string;
+  readonly kind: "result" | "error";
+}
+
+/** In-process evidence from a TEST-ONLY adapter around the packaged production launcher and
+ * transport. It retains no stdout/stderr and is never printed; only count/boolean projections enter
+ * CODEX_M3B_LIVE_SUB_COUNTS. */
+interface LiveLaunchEvidence {
+  providerLaunched: number;
+  actionLaunched: number;
+  providerSettled: number;
+  actionSettled: number;
+  disposalFailures: number;
+  transportClosed: number;
+  turnStarts: number;
+  readonly requests: LiveTransportRequest[];
+  readonly serverRequests: LiveServerRequest[];
+  readonly serverResponses: LiveServerResponse[];
+  readonly threadIds: Set<string>;
+  readonly turnIds: Set<string>;
+  readonly turnStartLatch?: LiveTurnStartLatch;
+}
+
+function liveLaunchEvidence(turnStartLatch?: LiveTurnStartLatch): LiveLaunchEvidence {
+  return {
+    providerLaunched: 0,
+    actionLaunched: 0,
+    providerSettled: 0,
+    actionSettled: 0,
+    disposalFailures: 0,
+    transportClosed: 0,
+    turnStarts: 0,
+    requests: [],
+    serverRequests: [],
+    serverResponses: [],
+    threadIds: new Set<string>(),
+    turnIds: new Set<string>(),
+    ...(turnStartLatch === undefined ? {} : { turnStartLatch }),
+  };
+}
+
+function addLiveId(set: Set<string>, value: unknown): void {
+  if (typeof value === "string" && value.length > 0) set.add(value);
+}
+
+function recordLiveRequestIds(evidence: LiveLaunchEvidence, params: unknown, result: unknown): void {
+  const request = rec(params);
+  addLiveId(evidence.threadIds, request.threadId);
+  addLiveId(evidence.threadIds, request.sessionId);
+  addLiveId(evidence.turnIds, request.turnId);
+  const response = rec(result);
+  addLiveId(evidence.threadIds, rec(response.thread).id);
+  addLiveId(evidence.turnIds, rec(response.turn).id);
+}
+
+function recordLiveNoteIds(evidence: LiveLaunchEvidence, note: CodexNotification): void {
+  if (note.kind !== "activity") {
+    addLiveId(evidence.threadIds, note.threadId);
+    if (note.kind !== "thread_started") addLiveId(evidence.turnIds, note.turnId);
+  }
+  const params = rec(note.params);
+  addLiveId(evidence.threadIds, params.threadId);
+  addLiveId(evidence.threadIds, params.sessionId);
+  addLiveId(evidence.turnIds, params.turnId);
+  addLiveId(evidence.threadIds, rec(params.thread).id);
+  addLiveId(evidence.turnIds, rec(params.turn).id);
+}
+
+/** Observe the real JSON-RPC transport without changing request/response semantics. A cancel test
+ * may hold the first successful turn/start response long enough to abort deterministically after
+ * the app-server admitted the turn but before the harness can consume a terminal. */
+function observingLiveTransport(inner: CodexTransport, evidence: LiveLaunchEvidence): CodexTransport {
+  let heldTurnStart = false;
+  let closePromise: Promise<void> | undefined;
+  return {
+    async request<T = unknown>(method: string, params?: unknown, opts?: { signal?: AbortSignal; deadlineMs?: number }): Promise<T> {
+      evidence.requests.push({ method, params });
+      const result = await inner.request<T>(method, params, opts);
+      recordLiveRequestIds(evidence, params, result);
+      if (method === "turn/start" && typeof rec(rec(result).turn).id === "string") {
+        evidence.turnStarts += 1;
+        if (!heldTurnStart && evidence.turnStartLatch !== undefined) {
+          heldTurnStart = true;
+          evidence.turnStartLatch.markObserved();
+          await evidence.turnStartLatch.released;
+        }
+      }
+      return result;
+    },
+    notify(method, params): void {
+      inner.notify(method, params);
+    },
+    respond(requestId, response): void {
+      evidence.serverResponses.push({ requestId, kind: "error" in response ? "error" : "result" });
+      inner.respond(requestId, response);
+    },
+    installServerRequestInterceptor(interceptor): () => void {
+      const install = inner.installServerRequestInterceptor;
+      if (install === undefined) throw new Error("live transport lacks the production auth interceptor seam");
+      return install.call(inner, (note, frameBytes) => {
+        recordLiveNoteIds(evidence, note);
+        if (note.kind === "activity" && note.requestId !== undefined) {
+          evidence.serverRequests.push({ method: note.method, requestId: note.requestId, params: note.params });
+        }
+        return interceptor(note, frameBytes);
+      });
+    },
+    notifications(): AsyncIterableIterator<CodexNotification> {
+      const source = inner.notifications();
+      const iterator: AsyncIterableIterator<CodexNotification> = {
+        next: async () => {
+          const step = await source.next();
+          if (!step.done) recordLiveNoteIds(evidence, step.value);
+          return step;
+        },
+        [Symbol.asyncIterator](): AsyncIterableIterator<CodexNotification> {
+          return iterator;
+        },
+      };
+      return iterator;
+    },
+    close(): Promise<void> {
+      if (closePromise === undefined) {
+        closePromise = inner.close().then(() => {
+          evidence.transportClosed += 1;
+        });
+      }
+      return closePromise;
+    },
+  };
+}
+
+function trackedLiveRoot(
+  handle: CodexRootHandle,
+  evidence: LiveLaunchEvidence,
+  kind: "provider" | "action",
+): CodexRootHandle {
+  let settled = false;
+  return {
+    started: handle.started,
+    supervisorPid: handle.supervisorPid,
+    transport: handle.transport,
+    snapshot: (timeoutMs) => handle.snapshot(timeoutMs),
+    waitChild: (timeoutMs) => handle.waitChild(timeoutMs),
+    dispose: async (timeoutMs) => {
+      try {
+        const outcome = await handle.dispose(timeoutMs);
+        if (outcome.clean && !settled) {
+          settled = true;
+          if (kind === "provider") evidence.providerSettled += 1;
+          else evidence.actionSettled += 1;
+        } else if (!outcome.clean) {
+          evidence.disposalFailures += 1;
+        }
+        return outcome;
+      } catch (error) {
+        evidence.disposalFailures += 1;
+        throw error;
+      }
+    },
+    get failed() {
+      return handle.failed;
+    },
+    whenFailed: handle.whenFailed,
+  };
+}
+
+/** The TEST-ONLY launcher adapter used by both live run and advice passes. Its body deliberately
+ * mirrors production defaultLaunchProviderRoot: fixed binaries/argv, app-server auth, provider
+ * stderr drained, and createCodexTransport over the launched root's stdio. */
+async function launchTrackedLiveProvider(
+  spec: CodexLaunchRootSpec,
+  authMode: CodexAppServerAuthMode,
+  evidence: LiveLaunchEvidence,
+): Promise<{ readonly handle: CodexRootHandle; readonly transport: CodexTransport; readonly supervisorPid: number }> {
+  if (spec.credentialValue !== undefined) {
+    throw new Error("live app-server-auth launch received an environment credential");
+  }
+  const launched = await launchCodexRoot({
+    ownedDataRoot: spec.ownedDataRoot,
+    provider: {
+      name: spec.provider.name,
+      baseUrl: spec.provider.baseUrl,
+      envKey: spec.provider.envKey,
+    },
+    model: spec.model,
+    codexBin: CODEX_BIN,
+    supervisorBin: SUPERVISOR_BIN,
+    kind: "provider",
+    childArgv: [...PROVIDER_CHILD_ARGV],
+    cwd: spec.cwd,
+    useAppServerAuth: true,
+    authMode,
+    seedSession: spec.seedSession,
+  });
+  evidence.providerLaunched += 1;
+  const handle = trackedLiveRoot(launched, evidence, "provider");
+  const stdout = handle.transport.stdout;
+  const stdin = handle.transport.stdin;
+  if (!stdout || !stdin) {
+    await handle.dispose(5000).catch(() => undefined);
+    throw new Error("live provider root is missing a stdio transport channel");
+  }
+  handle.transport.stderr?.resume();
+  const transport = observingLiveTransport(createCodexTransport({ inbound: stdout, outbound: stdin }), evidence);
+  return { handle, transport, supervisorPid: handle.supervisorPid ?? -1 };
+}
+
+function liveProviderLaunchSeam(evidence: LiveLaunchEvidence): NonNullable<CodexExecutorDeps["launchProviderRoot"]> {
+  return async (spec, authMode) => {
+    const launched = await launchTrackedLiveProvider(spec, authMode, evidence);
+    return {
+      root: registeredRoot(launched.handle, "provider"),
+      transport: launched.transport,
+      supervisorPid: launched.supervisorPid,
+    };
+  };
+}
+
+function liveEffectLaunchSeam(evidence: LiveLaunchEvidence): NonNullable<CodexExecutorDeps["launchEffectRoot"]> {
+  return async (spec, deadlineMs) => {
+    const handle = await launchCodexEffectRoot(
+      spec,
+      deadlineMs === undefined ? {} : { deadlines: { started: deadlineMs } },
+    );
+    evidence.actionLaunched += 1;
+    return trackedLiveRoot(handle, evidence, "action");
+  };
+}
+
+function liveAdviceLaunchSeam(scratch: string, evidence: LiveLaunchEvidence): LaunchAdviceRootSeam {
+  let launchSequence = 0;
+  return async (spec) => {
+    if (spec.credentialValue !== undefined) {
+      throw new Error("live advice launch received an environment credential");
+    }
+    if (spec.signal?.aborted) throw new Error("live advice launch was aborted before root creation");
+    launchSequence += 1;
+    const cwd = nodePath.join(scratch, `advice-work-${launchSequence}`);
+    fs.mkdirSync(cwd, { recursive: true, mode: 0o2770 });
+    fs.chmodSync(cwd, 0o2770);
+    const launched = await launchTrackedLiveProvider(
+      {
+        kind: "provider",
+        provider: spec.provider,
+        model: spec.model,
+        cwd,
+        ownedDataRoot: nodePath.join(scratch, `advice-root-${launchSequence}`),
+      },
+      "subscription",
+      evidence,
+    );
+    let disposePromise: Promise<void> | undefined;
+    const dispose = (): Promise<void> => {
+      if (disposePromise === undefined) {
+        disposePromise = (async () => {
+          let transportClosed = true;
+          try {
+            await launched.transport.close();
+          } catch {
+            transportClosed = false;
+          }
+          const outcome = await launched.handle.dispose(5000);
+          if (!outcome.clean) throw new Error("live advice provider root did not settle cleanly");
+          if (!transportClosed) throw new Error("live advice transport did not close cleanly");
+        })();
+      }
+      return disposePromise;
+    };
+    if (spec.signal?.aborted) {
+      await dispose().catch(() => undefined);
+      throw new Error("live advice launch was aborted after root creation");
+    }
+    return { transport: launched.transport, cwd, dispose };
+  };
+}
+
+const LIVE_AUTH_REQUEST_METHODS = new Set([
+  "account/login/start",
+  "account/chatgptAuthTokens/refresh",
+]);
+const LIVE_PROTOCOL_ID_KEYS = new Set([
+  "id",
+  "requestId",
+  "request_id",
+  "threadId",
+  "thread_id",
+  "turnId",
+  "turn_id",
+  "sessionId",
+  "session_id",
+  "callId",
+  "call_id",
+]);
+
+/** Remove only protocol-routing identifier fields from the request-evidence projection. The raw
+ * in-process evidence is retained for structural assertions; this projection proves an id cannot
+ * escape in model text/config while allowing threadId/turnId in their required RPC routing slots. */
+function withoutProtocolIds(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(withoutProtocolIds);
+  if (value === null || typeof value !== "object") return value;
+  const out: Record<string, unknown> = {};
+  for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
+    if (!LIVE_PROTOCOL_ID_KEYS.has(key)) out[key] = withoutProtocolIds(nested);
+  }
+  return out;
+}
+
+function publicLiveRequestEvidence(
+  evidences: readonly LiveLaunchEvidence[],
+  stripProtocolIds: boolean,
+): string {
+  const project = (value: unknown): unknown => stripProtocolIds ? withoutProtocolIds(value) : value;
+  return JSON.stringify(evidences.flatMap((evidence) => [
+    ...evidence.requests
+      .filter((request) => !LIVE_AUTH_REQUEST_METHODS.has(request.method))
+      .map((request) => ({ method: request.method, params: project(request.params) })),
+    ...evidence.serverRequests
+      .filter((request) => request.method === null || !LIVE_AUTH_REQUEST_METHODS.has(request.method))
+      .map((request) => ({ method: request.method, params: project(request.params) })),
+  ]));
+}
+
+/** Assert absence without handing assert/regex the needle or haystack. If this trips, Node prints
+ * only the static category/surface message, never the secret or the evidence containing it. */
+function assertLiveValueAbsent(blob: string, needle: string | undefined, message: string): void {
+  if (needle !== undefined && needle.length > 0 && blob.includes(needle)) throw new Error(message);
+}
+
+async function withStaticLiveFailure<T>(work: Promise<T>, message: string): Promise<T> {
+  try {
+    return await work;
+  } catch {
+    throw new Error(message);
+  }
+}
+
+function endpointNeedles(raw: string): string[] {
+  const out = [raw];
+  try {
+    const url = new URL(raw);
+    out.push(url.origin, url.host, url.hostname);
+  } catch {
+    throw new Error("live endpoint is not a valid URL");
+  }
+  return [...new Set(out.filter((value) => value.length > 0))];
+}
+
+function assertLiveNoLeak(options: {
+  readonly evidences: readonly LiveLaunchEvidence[];
+  readonly emitted: readonly EmittedMessage[];
+  readonly additionalMessages?: readonly string[];
+  readonly log: RecordingLog;
+  readonly tokens: readonly string[];
+  readonly authForbiddenTokens: readonly string[];
+  readonly capability: string;
+  readonly accountId: string;
+  readonly endpoints: readonly string[];
+  readonly extraIds?: readonly string[];
+}): void {
+  const allIds = new Set(options.extraIds ?? []);
+  for (const evidence of options.evidences) {
+    for (const id of evidence.threadIds) allIds.add(id);
+    for (const id of evidence.turnIds) allIds.add(id);
+  }
+  const messageBlob = JSON.stringify({ emitted: options.emitted, additional: options.additionalMessages ?? [] });
+  const logBlob = options.log.lines.join("\n");
+  const surfaces = [
+    { name: "messages", blob: messageBlob },
+    { name: "logs", blob: logBlob },
+    // Keep protocol ids in this projection while checking every OTHER category. A token/account
+    // smuggled into an `id` field must not disappear merely because ids have an allowed wire slot.
+    { name: "request evidence", blob: publicLiveRequestEvidence(options.evidences, false) },
+  ] as const;
+  const categories: ReadonlyArray<readonly [string, readonly string[]]> = [
+    ["access or refresh token", [...new Set(options.tokens.filter((value) => value.length > 0))]],
+    ["capability", [options.capability]],
+    ["account id", [options.accountId]],
+    ["provider URL or host", [...new Set(options.endpoints.flatMap(endpointNeedles))]],
+  ];
+  for (const surface of surfaces) {
+    for (const [category, needles] of categories) {
+      for (const needle of needles) {
+        assertLiveValueAbsent(surface.blob, needle, `live ${category} appeared in ${surface.name}`);
+      }
+    }
+  }
+
+  const idSurfaces = [
+    { name: "messages", blob: messageBlob },
+    { name: "logs", blob: logBlob },
+    // Remove only required RPC routing fields for the id check. The same value in prompt/config/text
+    // remains visible and fails; tokens/accounts/endpoints were checked against the raw projection.
+    { name: "request evidence", blob: publicLiveRequestEvidence(options.evidences, true) },
+  ] as const;
+  for (const surface of idSurfaces) {
+    for (const id of allIds) {
+      assertLiveValueAbsent(surface.blob, id, `live session or thread id appeared in ${surface.name}`);
+    }
+  }
+
+  // The auth lane legitimately contains the released access token + account id. Even there, the
+  // refresh token, run capability, and endpoint coordinates must be absent. Keep this raw lane
+  // in-process and use the same non-disclosing failure helper.
+  const rawAuthEvidence = JSON.stringify(options.evidences.flatMap((evidence) => [
+    ...evidence.requests.filter((request) => LIVE_AUTH_REQUEST_METHODS.has(request.method)),
+    ...evidence.serverRequests.filter((request) => request.method !== null && LIVE_AUTH_REQUEST_METHODS.has(request.method)),
+  ]));
+  for (const token of options.authForbiddenTokens) {
+    assertLiveValueAbsent(rawAuthEvidence, token, "live forbidden token appeared in auth request evidence");
+  }
+  assertLiveValueAbsent(rawAuthEvidence, options.capability, "live capability appeared in auth request evidence");
+  for (const endpoint of options.endpoints.flatMap(endpointNeedles)) {
+    assertLiveValueAbsent(rawAuthEvidence, endpoint, "live provider URL or host appeared in auth request evidence");
+  }
+  const rawRefreshRequests = JSON.stringify(options.evidences.flatMap((evidence) =>
+    evidence.serverRequests.filter((request) => request.method === "account/chatgptAuthTokens/refresh"),
+  ));
+  for (const token of options.tokens) {
+    assertLiveValueAbsent(rawRefreshRequests, token, "live token appeared in a provider refresh request");
+  }
+}
+
+function assertSubscriptionLoginShape(
+  evidence: LiveLaunchEvidence,
+  accountId: string,
+  capturedTokens: readonly string[],
+): void {
+  const logins = evidence.requests.filter((request) => request.method === "account/login/start");
+  if (logins.length !== evidence.providerLaunched || logins.length === 0) {
+    throw new Error("every live provider root must authenticate exactly once");
+  }
+  for (const login of logins) {
+    const params = rec(login.params);
+    if (params.type !== "chatgptAuthTokens") throw new Error("live provider root did not use subscription authentication");
+    if (typeof params.accessToken !== "string" || !capturedTokens.includes(params.accessToken)) {
+      throw new Error("live provider root did not use a freshly released access token");
+    }
+    if (params.chatgptAccountId !== accountId) {
+      throw new Error("live provider root did not use the server-verified account id");
+    }
+    if (params.chatgptPlanType !== null) {
+      throw new Error("live provider root did not pin the subscription plan hint to null");
+    }
+    assert.deepEqual(
+      Object.keys(params).sort(),
+      ["accessToken", "chatgptAccountId", "chatgptPlanType", "type"],
+      "the subscription login RPC carries only the pinned auth fields",
+    );
+  }
+}
+
+function assertAdviceCeiling(evidence: LiveLaunchEvidence): void {
+  const starts = evidence.requests.filter((request) => request.method === "thread/start");
+  assert.equal(starts.length, 1, "one isolated advice thread was started");
+  const params = rec(starts[0]?.params);
+  if (!Array.isArray(params.dynamicTools) || params.dynamicTools.length !== 0) {
+    throw new Error("the live advice thread exposed a dynamic tool");
+  }
+  if (!Array.isArray(params.environments) || params.environments.length !== 0) {
+    throw new Error("the live advice thread exposed a native environment");
+  }
+  if (params.ephemeral !== true) throw new Error("the live advice thread was not ephemeral");
+  if (params.approvalPolicy !== "never") throw new Error("the live advice thread could request approval");
+  const config = rec(params.config);
+  if (config.project_doc_max_bytes !== 0) throw new Error("the live advice thread could read project instructions");
+  if (config.web_search !== "disabled") throw new Error("the live advice thread did not disable web search");
+  if (rec(config.agents).enabled !== false) throw new Error("the live advice thread did not disable native agents");
+  const featureValues = Object.values(rec(config.features));
+  if (featureValues.length === 0 || featureValues.some((value) => value !== false)) {
+    throw new Error("the live advice thread did not disable every declared native feature");
+  }
+  const cwd = params.cwd;
+  if (typeof cwd !== "string" || rec(rec(config.projects)[cwd]).trust_level !== "untrusted") {
+    throw new Error("the live advice project was not explicitly untrusted");
+  }
+
+  for (const request of evidence.serverRequests) {
+    if (request.method === "account/chatgptAuthTokens/refresh") continue;
+    const response = evidence.serverResponses.find((candidate) => candidate.requestId === request.requestId);
+    if (response?.kind !== "error") {
+      throw new Error("a non-auth advice server request was not refused fail-closed");
+    }
+  }
+}
+
+describe("codex-m3b live no-leak oracle calibration", () => {
+  it("checks raw id fields for secrets, allows routing ids only in their slots, and never discloses a matched value", () => {
+    const token = `live-token-calibration-${randomBytes(12).toString("hex")}`;
+    const tokenEvidence = liveLaunchEvidence();
+    tokenEvidence.requests.push({ method: "turn/start", params: { id: token } });
+    let tokenError: unknown;
+    try {
+      assertLiveNoLeak({
+        evidences: [tokenEvidence],
+        emitted: [],
+        log: recordingLog(),
+        tokens: [token],
+        authForbiddenTokens: [],
+        capability: "calibration-capability",
+        accountId: "calibration-account",
+        endpoints: ["https://provider.example.test/v1"],
+      });
+    } catch (error) {
+      tokenError = error;
+    }
+    if (!(tokenError instanceof Error)
+      || tokenError.message !== "live access or refresh token appeared in request evidence"
+      || tokenError.message.includes(token)) {
+      throw new Error("live token no-leak calibration did not fail safely");
+    }
+
+    const threadId = `live-thread-calibration-${randomBytes(12).toString("hex")}`;
+    const idEvidence = liveLaunchEvidence();
+    idEvidence.threadIds.add(threadId);
+    idEvidence.requests.push({ method: "turn/start", params: { threadId } });
+    assertLiveNoLeak({
+      evidences: [idEvidence],
+      emitted: [],
+      log: recordingLog(),
+      tokens: [],
+      authForbiddenTokens: [],
+      capability: "calibration-capability",
+      accountId: "calibration-account",
+      endpoints: ["https://provider.example.test/v1"],
+    });
+    idEvidence.requests.push({
+      method: "turn/start",
+      params: { threadId, input: [{ type: "text", text: threadId }] },
+    });
+    let idError: unknown;
+    try {
+      assertLiveNoLeak({
+        evidences: [idEvidence],
+        emitted: [],
+        log: recordingLog(),
+        tokens: [],
+        authForbiddenTokens: [],
+        capability: "calibration-capability",
+        accountId: "calibration-account",
+        endpoints: ["https://provider.example.test/v1"],
+      });
+    } catch (error) {
+      idError = error;
+    }
+    if (!(idError instanceof Error)
+      || idError.message !== "live session or thread id appeared in request evidence"
+      || idError.message.includes(threadId)) {
+      throw new Error("live identifier no-leak calibration did not fail safely");
+    }
+  });
+});
+
 /** A proxy over the real WorkerClient that CAPTURES every plaintext access token a release/refresh
- *  hands back (the executor's and the probes'), so the live canary-absence proof can assert none of
- *  them leaks into a public message or a log line — the live analog of the offline fake's
- *  `observedBearers`. Every other method delegates unchanged. */
+ *  hands back (the executor's and the probes'), so the live no-leak proof can scan messages, logs and
+ *  non-auth request evidence without ever printing a token. Every other method delegates unchanged. */
 function tokenCapturingClient(inner: WorkerClientInstance, captured: string[]): WorkerClientInstance {
   return new Proxy(inner, {
     get(target, prop, receiver) {
@@ -1273,19 +1902,57 @@ async function refreshWithRetry(
   throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
 }
 
+interface LiveLoginSecrets {
+  readonly accessToken: string;
+  readonly refreshToken: string;
+}
+
+function readLiveLoginSecrets(): LiveLoginSecrets {
+  const raw = process.env.CODEX_M3B_LIVE_LOGIN_JSON;
+  if (!raw) throw new Error("live no-leak proof requires CODEX_M3B_LIVE_LOGIN_JSON in the lifecycle container");
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    throw new Error("live login JSON is invalid");
+  }
+  const record = rec(value);
+  if (typeof record.access_token !== "string" || record.access_token.length === 0
+    || typeof record.refresh_token !== "string" || record.refresh_token.length === 0) {
+    throw new Error("live login JSON must contain non-empty access_token and refresh_token strings");
+  }
+  if (Object.keys(record).some((key) => key !== "access_token" && key !== "refresh_token")) {
+    throw new Error("live login JSON contains an unsupported field");
+  }
+  return { accessToken: record.access_token, refreshToken: record.refresh_token };
+}
+
+function makeLiveRunPaths(scratch: string, label: string): { readonly worktree: string; readonly home: string } {
+  const worktree = nodePath.join(scratch, `${label}-work`);
+  fs.mkdirSync(worktree, { recursive: true, mode: 0o2770 });
+  fs.chmodSync(worktree, 0o2770);
+  return { worktree, home: nodePath.join(scratch, `${label}-home`) };
+}
+
+function liveTimeoutMs(envName: string, fallback: number): number {
+  const raw = process.env[envName];
+  if (raw === undefined || raw.length === 0) return fallback;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value <= 0) throw new Error(`${envName} must be a positive integer`);
+  return value;
+}
+
 /** The LIVE subscription leg (PRD #1106 M3b live-acceptance). Selected only when CODEX_M3B_LIVE=1;
- *  the offline body is untouched. It drives the packaged CodexExecutor against the REAL Codex
- *  provider with the maintainer-injected login (no fake provider, no appServerAuthOpenAIBaseUrlForTest)
- *  and then proves the coordinated subscription refresh over the REAL /codex/refresh route, including
- *  the two-concurrent-refresh "check-b" convergence. The credential lifecycle (release + coordinated
- *  refresh + check-b) is the deterministic, gated proof; the full real-model run is attempted and
- *  reported (`ran`) but is not itself a hard gate (it can be skipped with CODEX_M3B_LIVE_SKIP_EXEC=1),
- *  because a real model's tool choices against the minimal test server are a maintainer-verified
- *  aspect, not part of this wiring. */
+ *  the offline body is untouched. It gates one real tool-less advice pass, a run cancellation after
+ *  observed turn/start, root/action settlement, fresh release/fail-closed construction, and a broad
+ *  non-disclosing no-leak oracle. Advice text and the complete model run's content remain non-gating.
+ *  The token-rotating sequential/check-b refresh probes run only under LIVE_REFRESH_PROBES; default
+ *  live acceptance does not execute or require them. */
 async function runLiveSubscription(): Promise<void> {
   const contract = readServerContract();
   assert.ok(contract, "live subscription requires the server contract (the real WorkerClient); is the test server seeding live?");
   const c = contract as NonNullable<typeof contract>;
+  const liveLogin = readLiveLoginSecrets();
 
   const log = recordingLog();
   const WorkerClient = await loadWorkerClientCtor();
@@ -1294,44 +1961,246 @@ async function runLiveSubscription(): Promise<void> {
   // CODEX_M3B_LIVE_RELAX_TIMEOUTS=1 relaxes the client to 30s (and drops the server per-call cap) as
   // an explicit diagnostic mode only.
   const relaxTimeouts = process.env.CODEX_M3B_LIVE_RELAX_TIMEOUTS === "1";
-  const realClient = new WorkerClient(c.baseUrl, c.workerToken, "codex-m3b", log.log, { codexHTTPTimeoutMs: relaxTimeouts ? 30_000 : 8_000, httpTimeoutMs: 30_000 });
+  const realClient = new WorkerClient(c.baseUrl, c.workerToken, "codex-m3b", log.log, {
+    codexHTTPTimeoutMs: relaxTimeouts ? 30_000 : 8_000,
+    httpTimeoutMs: 30_000,
+  });
   const counts: ClientCounts = { release: 0, refresh: 0, refreshAdvanced: 0, refreshReplayed: 0 };
   const capturedTokens: string[] = [];
-  // Count releases/refresh outcomes AND capture every plaintext token for the canary proof.
+  // Count releases/refresh outcomes AND capture every plaintext token for the no-leak proof.
   const client = tokenCapturingClient(countingWorkerClient(realClient, counts, new Set<string>()), capturedTokens);
 
   const binding = subscriptionBindingFromContract(c);
   const account = c.sub.account;
   const runId = c.sub.runId;
-
   const liveBaseUrl = process.env.CODEX_M3B_LIVE_BASE_URL ?? LIVE_BASE_URL_FALLBACK;
-  // The REAL provider: leave appServerAuthOpenAIBaseUrlForTest UNSET so the executor keeps the
-  // production provider name and dials the real provider; the login RPC carries the released token.
   const liveProvider: CodexProviderConfig = { ...provider, baseUrl: liveBaseUrl };
-  const sessionOps: SessionOps = { adopt: 0, adoptFiles: 0, persist: 0, persistFiles: 0, persistFailures: 0, inspect: 0, remove: 0 };
-  const realDeps: CodexExecutorDeps = {
+  const sessionOps: SessionOps = {
+    adopt: 0,
+    adoptFiles: 0,
+    persist: 0,
+    persistFiles: 0,
+    persistFailures: 0,
+    inspect: 0,
+    remove: 0,
+  };
+  const { scratch, worktree, home } = makeScratch();
+  const cancelPaths = makeLiveRunPaths(scratch, "cancel");
+  const adviceEvidence = liveLaunchEvidence();
+  const cancelLatch = liveTurnStartLatch();
+  const cancelEvidence = liveLaunchEvidence(cancelLatch);
+  const evidences = [adviceEvidence, cancelEvidence] as const;
+  const emittedAll: EmittedMessage[] = [];
+  const adviceMessages: string[] = [];
+
+  const depsFor = (evidence: LiveLaunchEvidence): CodexExecutorDeps => ({
     sessionStore: countingSessionStore(sessionOps),
     deferRegistryTeardown: true,
-    idleMs: 60000,
-    wallMs: 300000,
+    launchProviderRoot: liveProviderLaunchSeam(evidence),
+    launchEffectRoot: liveEffectLaunchSeam(evidence),
+    idleMs: 60_000,
+    wallMs: 300_000,
     boundaryDeadlineMs: 5000,
-    childTurnDeadlineMs: 60000,
+    childTurnDeadlineMs: 60_000,
+    commandTmpdir: process.env.TMPDIR ?? "/tmp",
+  });
+  // Keep the complete run on the literal production default launcher path. The injected adapter is
+  // only for the new advice seam and the single-epoch cancellation observation; using it for a
+  // plan-approval root recreation would bypass the production session-staging branch.
+  const fullRunDeps: CodexExecutorDeps = {
+    sessionStore: countingSessionStore(sessionOps),
+    deferRegistryTeardown: true,
+    idleMs: 60_000,
+    wallMs: 300_000,
+    boundaryDeadlineMs: 5000,
+    childTurnDeadlineMs: 60_000,
     commandTmpdir: process.env.TMPDIR ?? "/tmp",
   };
 
-  const { scratch, worktree, home } = makeScratch();
-  const emittedAll: EmittedMessage[] = [];
-  let exec: InstanceType<typeof CodexExecutor> | undefined;
+  let fullExec: InstanceType<typeof CodexExecutor> | undefined;
+  let cancelExec: InstanceType<typeof CodexExecutor> | undefined;
+  let fullTerminalDisposed = false;
+  let cancelTerminalDisposed = false;
   let ran = false;
-  let ranError = "";
-  let terminalDisposed = false;
+  let adviceCompleted = false;
+  let adviceReleaseFailClosed = false;
+  let advicePolicyCalls = 0;
+  let adviceReleaseCount = 0;
+  let cancelWon = false;
+  let noLeak = false;
+  let refreshProbeAdvanced = false;
+  let refreshProbeReplayed = false;
+  let checkBSingleStep = false;
+  let checkBConverged = false;
 
   try {
-    // (1) Attempt the full real-model run unless the maintainer opts out. Non-gating: its released
-    // tokens feed the canary proof and its outcome is reported, but a real model's tool behaviour
-    // against the minimal test server is not part of the wiring under proof here.
+    // (1) One REAL subscription advice pass. Production advice stays unchanged: the test-only
+    // launch seam composes the packaged launchCodexRoot + createCodexTransport exactly like the
+    // production run launcher, while makeCodexAdviceHarness owns fresh release + app-server auth.
+    const adviceLaunch = liveAdviceLaunchSeam(scratch, adviceEvidence);
+    const releaseBeforeAdvice = counts.release;
+    const adviceBridge = new CodexAdviceCredentialBridge(runId, client, binding);
+    const adviceHarness = await withStaticLiveFailure(
+      makeCodexAdviceHarness(adviceBridge, liveProvider, adviceLaunch, log.log),
+      "live advice construction failed closed",
+    );
+    adviceReleaseCount = counts.release - releaseBeforeAdvice;
+    assert.equal(adviceReleaseCount, 1, "advice construction released exactly one fresh committed token");
+    assert.equal(adviceEvidence.providerLaunched, 0, "advice construction performs no model work before run()");
+
+    let policyTerminal: HarnessTerminal | undefined;
+    let policySawError: boolean | undefined;
+    const advicePolicy: AdviceResultPolicy = {
+      onTerminal: (terminal, context) => {
+        advicePolicyCalls += 1;
+        policyTerminal = terminal;
+        policySawError = context.isError;
+        if (context.latest !== undefined) throw new Error("Codex advice unexpectedly fabricated rate-limit evidence");
+      },
+    };
+    const adviceController = new AbortController();
+    const adviceTimeoutMs = liveTimeoutMs("CODEX_M3B_LIVE_ADVICE_TIMEOUT_MS", 180_000);
+    const adviceRequest: AdviceRequest = {
+      label: "summary",
+      systemPrompt: "Return a short plain-text summary. Do not use tools or mention runtime metadata.",
+      prompt: "Summarize this sentence: the live advice lifecycle completed.",
+      model: liveProvider.model,
+      output: { kind: "text" },
+      signal: adviceController.signal,
+      timeoutMs: adviceTimeoutMs,
+    };
+    const adviceResult = await withStaticLiveFailure(
+      withTimeout(
+        adviceHarness.run(adviceRequest, advicePolicy),
+        adviceTimeoutMs + 10_000,
+        "live subscription advice pass",
+      ),
+      "live advice pass failed closed",
+    );
+    adviceMessages.push(adviceResult.text);
+    assert.equal(adviceResult.end.kind, "terminal", "the real advice pass reached a terminal");
+    if (adviceResult.end.kind !== "terminal") throw new Error("the real advice pass did not return a terminal");
+    assert.equal(adviceResult.end.terminal.outcome, "success", "the real advice terminal succeeded");
+    assert.equal(advicePolicyCalls, 1, "the advice policy ran exactly once before cleanup");
+    assert.equal(policyTerminal, adviceResult.end.terminal, "the advice policy observed the returned terminal");
+    assert.equal(policySawError, false, "the successful advice terminal was not classified as an error");
+    assertAdviceCeiling(adviceEvidence);
+    assert.equal(adviceEvidence.providerLaunched, 1, "the advice pass launched one isolated provider root");
+    assert.equal(adviceEvidence.providerSettled, 1, "the advice pass settled its isolated provider root");
+    assert.equal(adviceEvidence.transportClosed, 1, "the advice pass closed its app-server transport");
+    assert.equal(adviceEvidence.actionLaunched, 0, "the advice pass launched no command/action root");
+    assert.equal(adviceEvidence.disposalFailures, 0, "the advice pass had no root-disposal failure");
+    adviceCompleted = true;
+
+    // A deterministic negative beside the live pass pins factory fail-closed behavior: release
+    // authority fails before launch, so no fallback/uncredentialed advice root can be constructed.
+    const deniedMessage = "test-only advice release denied";
+    const deniedClient = {
+      releaseCodex: async () => { throw new Error(deniedMessage); },
+      refreshCodex: async () => { throw new Error("test-only advice refresh must not run"); },
+    };
+    const deniedBridge = new CodexAdviceCredentialBridge(runId, deniedClient as never, binding);
+    const launchesBeforeDeniedRelease = adviceEvidence.providerLaunched;
+    await assert.rejects(
+      makeCodexAdviceHarness(deniedBridge, liveProvider, adviceLaunch, log.log),
+      (error: unknown) => error instanceof Error && error.message === deniedMessage,
+    );
+    assert.equal(
+      adviceEvidence.providerLaunched,
+      launchesBeforeDeniedRelease,
+      "a denied advice release launched no provider root",
+    );
+    adviceReleaseFailClosed = true;
+
+    // (2) A REAL subscription cancellation after a successful turn/start. The observing adapter
+    // holds that response until the external abort fires, making the precedence deterministic:
+    // owner cancel must win over a queued provider terminal or raw transport close.
+    const cancelController = new AbortController();
+    const { ctx: cancelCtx, emitted: cancelEmitted } = makeCtx({
+      runId,
+      worktreePath: cancelPaths.worktree,
+      planApproved: true,
+      approvedPlan: "exercise cancellation only",
+      agents,
+      checkpoint: async () => {},
+      signal: cancelController.signal,
+    });
+    cancelExec = new CodexExecutor(
+      log.log,
+      cancelPaths.home,
+      { binding, client, provider: liveProvider },
+      depsFor(cancelEvidence),
+    );
+    const releasesBeforeCancel = counts.release;
+    const cancelRun = cancelExec.run(cancelCtx);
+    const prematureCancelSettlement = cancelRun.then(
+      () => { throw new Error("live cancel run completed before turn/start was observed"); },
+      () => {
+        const lastMethod = cancelEvidence.requests.at(-1)?.method;
+        const safeLastMethod = lastMethod === "initialize"
+          || lastMethod === "account/login/start"
+          || lastMethod === "thread/start"
+          || lastMethod === "turn/start"
+          ? lastMethod
+          : "none-or-other";
+        const stage = counts.release === releasesBeforeCancel
+          ? "before-release"
+          : cancelEvidence.providerLaunched === 0
+            ? "after-release-before-provider"
+            : cancelEvidence.turnStarts === 0
+              ? "after-provider-before-turn-start"
+              : "after-turn-start";
+        throw new Error(`live cancel run failed before turn/start was observed (${stage}; last=${safeLastMethod})`);
+      },
+    );
+    await withTimeout(
+      Promise.race([cancelLatch.observed, prematureCancelSettlement]),
+      120_000,
+      "live cancel turn/start admission",
+    );
+    cancelController.abort();
+    cancelLatch.release();
+    let cancelError: unknown;
+    try {
+      await withTimeout(cancelRun, 120_000, "live cancel settlement");
+    } catch (error) {
+      cancelError = error;
+    }
+    if (!(cancelError instanceof Error) || cancelError.message !== "run cancelled") {
+      throw new Error("live owner cancellation did not win after observed turn/start");
+    }
+    cancelWon = true;
+    for (const message of cancelEmitted) emittedAll.push(message);
+
+    const cancelSafety = cancelExec.safety;
+    assert.ok(cancelSafety, "the live cancel run constructed the Codex safety owner");
+    const cancelDisposal = await cancelSafety.dispose({ boundary: "terminal", deadlineMs: 5000 });
+    assert.equal(cancelDisposal.kind, "disposed", "terminal dispose settled registered roots and actions after cancel");
+    cancelTerminalDisposed = true;
+    assert.ok(cancelEvidence.turnStarts > 0, "cancel fired only after a real turn/start succeeded");
+    assert.ok(cancelEvidence.providerLaunched > 0, "the cancel pass launched a real provider root");
+    assert.ok(cancelEvidence.actionLaunched > 0, "the cancel pass launched its registered command/file action root");
+    assert.equal(
+      cancelEvidence.providerSettled,
+      cancelEvidence.providerLaunched,
+      "terminal dispose settled every cancel provider root",
+    );
+    assert.equal(
+      cancelEvidence.actionSettled,
+      cancelEvidence.actionLaunched,
+      "terminal dispose settled every cancel action root",
+    );
+    assert.equal(
+      cancelEvidence.transportClosed,
+      cancelEvidence.providerLaunched,
+      "cancel cleanup closed every provider transport",
+    );
+    assert.equal(cancelEvidence.disposalFailures, 0, "cancel cleanup had no root-disposal failure");
+
+    // (3) Attempt the complete real-model run unless the maintainer opts out. Its content/tool
+    // choices remain non-gating; released tokens and request evidence still join the no-leak proof.
     if (process.env.CODEX_M3B_LIVE_SKIP_EXEC === "1") {
-      console.log("CODEX_M3B_LIVE exec run skipped (CODEX_M3B_LIVE_SKIP_EXEC=1)");
+      console.log("CODEX_M3B_LIVE complete run skipped; advice + cancel + no-leak gates still run");
     } else {
       const { ctx, emitted } = makeCtx({
         runId,
@@ -1342,115 +2211,166 @@ async function runLiveSubscription(): Promise<void> {
         agents,
         checkpoint: async () => {},
       });
-      const runTimeoutMs = Number(process.env.CODEX_M3B_LIVE_RUN_TIMEOUT_MS ?? 300000);
-      exec = new CodexExecutor(log.log, home, { binding, client, provider: liveProvider }, realDeps);
+      const runTimeoutMs = liveTimeoutMs("CODEX_M3B_LIVE_RUN_TIMEOUT_MS", 300_000);
+      fullExec = new CodexExecutor(
+        log.log,
+        home,
+        { binding, client, provider: liveProvider },
+        fullRunDeps,
+      );
       try {
-        await withTimeout(exec.run(ctx), runTimeoutMs, "live subscription run");
+        await withTimeout(fullExec.run(ctx), runTimeoutMs, "live subscription complete run");
         ran = true;
-      } catch (err) {
-        ran = false;
-        ranError = err instanceof Error ? err.message : String(err);
-      }
-      for (const m of emitted) emittedAll.push(m);
-      // Post-run durability sinks, mirroring the offline body (best-effort; never masks the proof).
-      try {
-        if (exec.safety) await exec.safety.withBoundary({ boundary: "finalize", deadlineMs: 5000 }, async () => {});
       } catch {
-        // reported via ranError / the credential proof below
+        ran = false;
       }
+      for (const message of emitted) emittedAll.push(message);
+      // These sinks mirror the real runner. They remain non-gating with the complete model run,
+      // but cleanup is attempted and all resulting surfaces are included in the no-leak proof.
       try {
-        if (exec.safety) {
-          await exec.safety.dispose({ boundary: "terminal", deadlineMs: 5000 });
-          terminalDisposed = true;
+        if (fullExec.safety) {
+          await fullExec.safety.withBoundary({ boundary: "finalize", deadlineMs: 5000 }, async () => {});
         }
       } catch {
-        terminalDisposed = false;
+        // Non-gating complete run; deterministic advice/cancel gates already passed.
+      }
+      try {
+        if (fullExec.safety) {
+          const disposal = await fullExec.safety.dispose({ boundary: "terminal", deadlineMs: 5000 });
+          fullTerminalDisposed = disposal.kind === "disposed";
+        }
+      } catch {
+        fullTerminalDisposed = false;
       }
     }
 
-    // (2) The DETERMINISTIC credential-lifecycle proof over the REAL routes. First a sequential
-    // advance+replay (same operation id) exactly as the offline probe does, then check-b.
-    const g0 = await (async (): Promise<number> => {
-      const rel = await client.releaseCodex(
+    // (4) Optional refresh-rotation acceptance. DEFAULT OFF: neither sequential advance/replay nor
+    // check-b runs unless the maintainer explicitly sets CODEX_M3B_LIVE_REFRESH_PROBES=1.
+    if (LIVE_REFRESH_PROBES) {
+      const g0 = await (async (): Promise<number> => {
+        const release = await client.releaseCodex(
+          runId,
+          { capability: c.sub.capability },
+          { authMode: "subscription", chatgptAccountId: account, minimumGeneration: 0 },
+        );
+        assert.equal(release.auth_mode, "subscription", "the live refresh probe released a subscription token");
+        return release.auth_mode === "subscription" ? release.generation : 0;
+      })();
+      const sequentialOperation = randomUUID();
+      const advanced = await refreshWithRetry(
+        client,
+        runId,
+        c.sub.capability,
+        account,
+        sequentialOperation,
+        g0,
+      );
+      assert.equal(advanced.outcome, "advanced", "a fresh refresh operation advances exactly once");
+      assert.equal(advanced.generation, g0 + 1, "the sequential refresh advanced one generation");
+      const replayed = await refreshWithRetry(
+        client,
+        runId,
+        c.sub.capability,
+        account,
+        sequentialOperation,
+        g0,
+      );
+      assert.equal(replayed.outcome, "replayed", "the retained refresh operation replays");
+      if (replayed.access_token !== advanced.access_token) {
+        throw new Error("the retained refresh operation did not replay the committed access token");
+      }
+      assert.equal(replayed.generation, advanced.generation, "the retained refresh operation replayed the committed generation");
+      refreshProbeAdvanced = true;
+      refreshProbeReplayed = true;
+
+      const releaseB = await client.releaseCodex(
         runId,
         { capability: c.sub.capability },
         { authMode: "subscription", chatgptAccountId: account, minimumGeneration: 0 },
       );
-      assert.equal(rel.auth_mode, "subscription", "the live release returned a subscription token");
-      return rel.auth_mode === "subscription" ? rel.generation : 0;
-    })();
-    const seqOp = randomUUID();
-    const advanced = await refreshWithRetry(client, runId, c.sub.capability, account, seqOp, g0);
-    assert.equal(advanced.outcome, "advanced", "a fresh operation id advances the committed generation once");
-    assert.equal(advanced.generation, g0 + 1, "the advance moved the generation by exactly one step");
-    const replayed = await refreshWithRetry(client, runId, c.sub.capability, account, seqOp, g0);
-    assert.equal(replayed.outcome, "replayed", "the SAME operation id replays the committed result (no second exchange)");
-    assert.equal(replayed.access_token, advanced.access_token, "the replay returns the same committed access token");
-    assert.equal(replayed.generation, advanced.generation, "the replay returns the same committed generation");
+      const generationB = releaseB.auth_mode === "subscription" ? releaseB.generation : 0;
+      const [resultA, resultB] = await Promise.all([
+        refreshWithRetry(client, runId, c.sub.capability, account, randomUUID(), generationB),
+        refreshWithRetry(client, runId, c.sub.capability, account, randomUUID(), generationB),
+      ]);
+      const oneAdvanced = [resultA, resultB].filter((result) => result.outcome === "advanced").length === 1;
+      const releaseAfter = await client.releaseCodex(
+        runId,
+        { capability: c.sub.capability },
+        { authMode: "subscription", chatgptAccountId: account, minimumGeneration: 0 },
+      );
+      const committedAfter = releaseAfter.auth_mode === "subscription" ? releaseAfter.generation : -1;
+      checkBSingleStep = oneAdvanced
+        && committedAfter === generationB + 1
+        && resultA.generation === generationB + 1
+        && resultB.generation === generationB + 1;
+      checkBConverged = resultA.generation === resultB.generation
+        && resultA.access_token === resultB.access_token;
+      assert.equal(checkBSingleStep, true, "check-b committed exactly one generation advance");
+      assert.equal(checkBConverged, true, "check-b converged on one committed token and generation");
+    }
 
-    // (3) check-b: TWO concurrent refreshes at the SAME observed generation, DISTINCT operation ids.
-    // The coordinated refresher serializes on the account: exactly one advances (a single provider
-    // exchange), the other reconciles to the committed result. Both converge on one token/generation,
-    // and the committed generation moves by exactly one step.
-    const relB = await client.releaseCodex(
-      runId,
-      { capability: c.sub.capability },
-      { authMode: "subscription", chatgptAccountId: account, minimumGeneration: 0 },
-    );
-    const gB = relB.auth_mode === "subscription" ? relB.generation : 0;
-    const opA = randomUUID();
-    const opC = randomUUID();
-    const [rA, rC] = await Promise.all([
-      refreshWithRetry(client, runId, c.sub.capability, account, opA, gB),
-      refreshWithRetry(client, runId, c.sub.capability, account, opC, gB),
-    ]);
-    const advancedCount = [rA, rC].filter((r) => r.outcome === "advanced").length;
-    const relAfter = await client.releaseCodex(
-      runId,
-      { capability: c.sub.capability },
-      { authMode: "subscription", chatgptAccountId: account, minimumGeneration: 0 },
-    );
-    const committedAfter = relAfter.auth_mode === "subscription" ? relAfter.generation : -1;
-    const checkBSingleStep = committedAfter === gB + 1 && rA.generation === gB + 1 && rC.generation === gB + 1;
-    const checkBConverged = rA.access_token === rC.access_token && rA.generation === rC.generation;
+    // (5) Structural auth + no-leak gates. The actual access/refresh tokens, capability, account id,
+    // endpoint coordinates, and every observed session/thread/turn id are checked across messages,
+    // logs, and request evidence. Failures reveal only a static category/surface, never a value.
+    assertSubscriptionLoginShape(adviceEvidence, account, capturedTokens);
+    assertSubscriptionLoginShape(cancelEvidence, account, capturedTokens);
+    assertLiveNoLeak({
+      evidences,
+      emitted: emittedAll,
+      additionalMessages: adviceMessages,
+      log,
+      tokens: [liveLogin.accessToken, liveLogin.refreshToken, c.workerToken, ...capturedTokens],
+      authForbiddenTokens: [liveLogin.refreshToken, c.workerToken],
+      capability: c.sub.capability,
+      accountId: account,
+      endpoints: [liveBaseUrl, c.baseUrl],
+    });
+    noLeak = true;
 
-    assert.equal(advancedCount, 1, "exactly ONE of the two concurrent refreshes advanced (a single coordinated exchange)");
-    assert.ok(checkBSingleStep, `check-b advanced the committed generation by exactly one step (gB=${gB}, committedAfter=${committedAfter}, rA=${rA.generation}, rC=${rC.generation})`);
-    assert.ok(checkBConverged, "check-b: both concurrent refreshes converged on the same access token + generation");
-
-    // (4) Emit the machine summary run-lifecycle.sh's live counts parser greps.
+    // (6) Sanitized machine summary. It contains booleans/counts only. The parser always gates
+    // advice, cancel, release and no-leak; refresh fields gate only when refreshProbesEnabled=true.
     const liveCounts = {
       ran,
-      ranError,
+      fullTerminalDisposed,
       releases: counts.release,
-      refreshAdvanced: counts.refreshAdvanced,
-      refreshReplayed: counts.refreshReplayed,
+      adviceCompleted,
+      adviceReleaseCount,
+      adviceReleaseFailClosed,
+      advicePolicyCalls,
+      adviceRoots: adviceEvidence.providerLaunched,
+      adviceRootsSettled: adviceEvidence.providerLaunched === adviceEvidence.providerSettled,
+      adviceTransportClosed: adviceEvidence.transportClosed === adviceEvidence.providerLaunched,
+      adviceActions: adviceEvidence.actionLaunched,
+      adviceActionsZero: adviceEvidence.actionLaunched === 0,
+      cancelTurnStarts: cancelEvidence.turnStarts,
+      cancelWon,
+      cancelTerminalDisposed,
+      cancelProviderRoots: cancelEvidence.providerLaunched,
+      cancelRootsSettled: cancelEvidence.providerLaunched === cancelEvidence.providerSettled,
+      cancelTransportsClosed: cancelEvidence.transportClosed === cancelEvidence.providerLaunched,
+      cancelActions: cancelEvidence.actionLaunched,
+      cancelActionsSettled: cancelEvidence.actionLaunched === cancelEvidence.actionSettled,
+      noLeak,
+      refreshProbesEnabled: LIVE_REFRESH_PROBES,
+      refreshProbeAdvanced,
+      refreshProbeReplayed,
       checkBSingleStep,
       checkBConverged,
     };
     console.log(`CODEX_M3B_LIVE_SUB_COUNTS ${JSON.stringify(liveCounts)}`);
 
-    // (5) The credential-lifecycle invariants are the gate; the full model run is reported, not gated.
-    assert.ok(counts.release > 0, `the live run released a real token at least once (got ${counts.release})`);
-    assert.ok(counts.refreshAdvanced > 0, `the live run advanced a coordinated refresh (got ${counts.refreshAdvanced})`);
-    assert.ok(counts.refreshReplayed > 0, `the live run replayed a coordinated refresh (got ${counts.refreshReplayed})`);
+    assert.ok(counts.release >= 2, "the advice and cancel gates each released a real committed token");
     if (!ran && process.env.CODEX_M3B_LIVE_SKIP_EXEC !== "1") {
-      console.log(`CODEX_M3B_LIVE exec run did not complete (ran=false${ranError ? `: ${ranError}` : ""}); the credential-lifecycle proof above still gates`);
+      console.log("CODEX_M3B_LIVE complete run did not finish; its content remains non-gating");
     }
-
-    // (6) The canary boundary: no released/refreshed token and no capability rides an emitted
-    // message or a log line. capturedTokens holds every plaintext token the executor + probes saw.
-    const emittedBlob = JSON.stringify(emittedAll);
-    const logBlob = log.lines.join("\n");
-    for (const tok of new Set(capturedTokens)) {
-      assert.doesNotMatch(emittedBlob, new RegExp(escapeRe(tok)), "a released credential leaked into an emitted message");
-      assert.doesNotMatch(logBlob, new RegExp(escapeRe(tok)), "a released credential leaked into a log line");
-    }
-    assert.doesNotMatch(emittedBlob, new RegExp(escapeRe(c.sub.capability)), "capability canary leaked into an emitted message");
-    assert.doesNotMatch(logBlob, new RegExp(escapeRe(c.sub.capability)), "capability canary leaked into a log line");
   } finally {
-    if (!terminalDisposed && exec?.safety) {
-      await exec.safety.dispose({ boundary: "terminal", deadlineMs: 5000 }).catch(() => undefined);
+    cancelLatch.release();
+    if (!cancelTerminalDisposed && cancelExec?.safety) {
+      await cancelExec.safety.dispose({ boundary: "terminal", deadlineMs: 5000 }).catch(() => undefined);
+    }
+    if (!fullTerminalDisposed && fullExec?.safety) {
+      await fullExec.safety.dispose({ boundary: "terminal", deadlineMs: 5000 }).catch(() => undefined);
     }
     try {
       fs.rmSync(scratch, { recursive: true, force: true });
