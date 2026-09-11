@@ -608,6 +608,24 @@ func (s *Service) capabilityAwareOn(ctx context.Context) bool {
 	return on
 }
 
+// completionInterlockOn reads the completion-interlock rollout switch (PRD #1226 M1, D1),
+// nil-safe and FAIL-SAFE OFF — the DELIBERATE opposite of capabilityAwareOn's default-on.
+// A nil reader (tests, or a deployment without a settings cache) or ANY read error both
+// leave it false, so createRun stamps completion_contract_version ONLY on an affirmative
+// "true". This gate must not accidentally engage a still-rolling-out feature: an
+// unconfigured or momentarily-unreadable setting creates a legacy (unstamped) run rather
+// than an interlocked one no worker in the fleet can yet claim.
+func (s *Service) completionInterlockOn(ctx context.Context) bool {
+	if s.completionInterlock == nil {
+		return false
+	}
+	on, err := s.completionInterlock.CompletionInterlockRollout(ctx)
+	if err != nil {
+		return false
+	}
+	return on
+}
+
 // verdictUndelivered reports whether the run carries a gate verdict submitted AT OR AFTER
 // this gate opened — i.e. the owner has answered and the worker has not acted on it yet
 // (issue #182). The predicate, its `>=` boundary and the four-of-six kind list all live in

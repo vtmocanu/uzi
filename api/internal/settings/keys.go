@@ -97,7 +97,17 @@ const (
 	// subset clause. OFF is an explicit, documented degraded mode (best-effort claiming;
 	// a docker-needing run may be claimed by a non-docker worker and fail mid-run).
 	KeyCapabilityAwareScheduling = "capability_aware_scheduling"
-	KeyHealthStallSeconds        = "health_stall_seconds"
+	// Completion-interlock rollout switch (PRD #1226 M1, D1/D8). A bool
+	// ("true"/"false"), default FALSE — the DELIBERATE opposite of
+	// KeyCapabilityAwareScheduling's default-on/fail-open posture. When ON, CreateRun
+	// stamps completion_contract_version=1 on a new issue run before its first claim, so
+	// the run is interlocked and the non-bypassable ClaimRun protocol clause (D2) applies.
+	// A read error is treated as OFF (fail-safe): this gate must not accidentally engage a
+	// still-rolling-out feature. It is a temporary ROLLOUT control, not a permanent owner
+	// opt-out; the maintainer flips it on once the API and a capable worker image are
+	// deployed (#1232 / follow-up).
+	KeyCompletionInterlockRollout = "completion_interlock_rollout"
+	KeyHealthStallSeconds         = "health_stall_seconds"
 	// KeyHealthNearTimeoutPct (PRD #1170) replaces the retired seconds-based health-slow
 	// setting. A percentage of the run's effective wall-clock budget (0 = disabled, else [50, 99])
 	// at which a running run is flagged near timeout — validated by validateHealthPercent,
@@ -304,7 +314,13 @@ const (
 	// because on a homogeneous fleet the capability match is a no-op (every worker
 	// satisfies every run); it only helps heterogeneous fleets and acts as an escape
 	// hatch if inference false-positives start blocking runs.
-	DefaultCapabilityAwareScheduling  = "true"
+	DefaultCapabilityAwareScheduling = "true"
+	// PRD #1226 M1 (D1/D8): the completion-interlock rollout switch defaults OFF. New
+	// issue runs are interlocked ONLY once the maintainer flips this on, after the API and
+	// a capable worker image are deployed. Default-off (and fail-safe-off on a read error)
+	// is the deliberate opposite of the capability-aware fail-open, so the gate never
+	// accidentally engages before the fleet can satisfy the protocol clause.
+	DefaultCompletionInterlockRollout = "false"
 	DefaultHealthStallSeconds         = "300"  // 5m of silence (no tool in flight)
 	DefaultHealthNearTimeoutPct       = "85"   // PRD #1170: flag at 85% of the run's wall-clock budget
 	DefaultHealthQueuedSeconds        = "600"  // 10m stuck queued
@@ -429,7 +445,11 @@ var Defaults = map[string]string{
 	// PRD #84 capability-aware scheduling kill-switch. Same no-seeded-row pattern: an
 	// absent row synthesizes to the default (true), so All/AdminView surface it to the
 	// settings page on every instance and no migration seeds it.
-	KeyCapabilityAwareScheduling:  DefaultCapabilityAwareScheduling,
+	KeyCapabilityAwareScheduling: DefaultCapabilityAwareScheduling,
+	// PRD #1226 M1 completion-interlock rollout switch. Same no-seeded-row pattern: an
+	// absent row synthesizes to the default (false), so All/AdminView surface it to the
+	// settings page on every instance and no migration seeds it.
+	KeyCompletionInterlockRollout: DefaultCompletionInterlockRollout,
 	KeyHealthStallSeconds:         DefaultHealthStallSeconds,
 	KeyHealthNearTimeoutPct:       DefaultHealthNearTimeoutPct,
 	KeyHealthQueuedSeconds:        DefaultHealthQueuedSeconds,

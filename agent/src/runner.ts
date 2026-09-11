@@ -1202,6 +1202,22 @@ export class RunRunner {
       });
       return;
     }
+    // PRD #1226 M3 (D3/D6): the run entered the recoverable COMPLETION HOLD — a repeated
+    // no-progress completion attempt, or a post-attempt budget/stall/wall/idle exhaustion, routed
+    // to ctx.enterCompletionHold (M4) instead of failing. Like the pause park, the run is
+    // non-terminal and the hold seam already handled the transition, so there is nothing to
+    // finalize (no push, no MR, no completion report). Reap + close the batcher and return; the
+    // finally preserves its HOME for resume. In M3 this branch is dead (the seam is unwired, so
+    // completionHeld is never set) — M4 wires the seam and this becomes live.
+    if (result.completionHeld) {
+      executor.killAgentTree?.();
+      await closeBatcher().catch(() => undefined);
+      runLog.info("run entered the completion hold; skipping finalization", {
+        run_id: runId,
+        reason: result.completionHeld.reason,
+      });
+      return;
+    }
     const runnerClone = flight.runnerClone!;
     const barePath = flight.barePath!;
     const lastPublishedTip = flight.lastPublishedTip;
@@ -3345,6 +3361,27 @@ export class RunRunner {
       // returning whether the run parked. Called from the implement loop's pause boundary and
       // its `now`-pause turn catch.
       parkForPause: (pausedAt) => this.handlePausePark(flight, pausedAt),
+      // PRD #1226 M3 (D1/D2): this run is INTERLOCKED when the claim's WORKER-ONLY
+      // completion_contract_version is non-null. The executor then runs the structural completion
+      // protocol on signal_done instead of finalizing directly. false/absent (legacy run, rollout
+      // OFF, or an older server that never sends the key) ⇒ the legacy finalize path, unchanged.
+      completionInterlock: claim.config?.completion_contract_version != null,
+      // PRD #1226 M3 (D3): the same-session structural completion attempt. Forwards the executor's
+      // declaration + head + worktree fingerprint to the worker completion/attempt endpoint, which
+      // union-merges the declaration into milestones_completed, recomputes unmet server-side, and
+      // records a bounded attempt — returning the server-authoritative unmet set + attempt count.
+      recordCompletionAttempt: ({ declared, head, worktreeFingerprint }) =>
+        this.client.recordCompletionAttempt(runId, {
+          milestonesCompleted: declared,
+          head,
+          worktreeFingerprint,
+        }),
+      // PRD #1226 M4 wires enterCompletionHold — the recoverable completion-hold seam
+      // (SetRunCompletionHold + captureHoldContext + the fixed park order). Deliberately LEFT
+      // UNWIRED in M3: the executor treats it as optional and falls back to the legacy terminal
+      // throw when it is absent, so a repeated-no-progress or post-attempt exhaustion fails as
+      // today until M4 lands. The feature is rollout-OFF (completion_interlock_rollout defaults
+      // OFF) until #1232 and M3+M4 ship together, so this unwired seam never fires in production.
     };
 
     // PRD #1064 M1: drain the per-run running-report chain before this phase yields control,

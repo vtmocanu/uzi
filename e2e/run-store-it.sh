@@ -132,7 +132,15 @@ PKGS=(
   ./internal/schedsvc/...
   ./internal/workersvc/...
 )
-LOG="$(mktemp -t uzi-store-it-log)"
+# EXPLICIT XXXXXX template, NOT `mktemp -t <name>`: GNU coreutils rejects a `-t`
+# template with too few X's (it needs >=3 consecutive; this one had none) with "too
+# few X's in template", while BSD/macOS accepts it, so that form fails only on the
+# Linux worker/CI, never a contributor's mac. Matches the idiom in
+# scripts/scan-secrets.sh (commit f0e3c438) and is enforced by check:mktemp-portability.
+LOG="$(mktemp "${TMPDIR:-/tmp}/uzi-store-it-log.XXXXXX")" || {
+  echo "run-store-it: mktemp failed" >&2
+  exit 1
+}
 UZI_TEST_DATABASE_URL="$DSN" go test -buildvcs=false -count=1 -v -race -p 1 \
   -run 'LiveDB$' "${PKGS[@]}" 2>&1 | tee "$LOG"
 

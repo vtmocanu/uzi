@@ -446,7 +446,9 @@ func (r *CodexReconciler) sealLogin(userID uuid.UUID, plaintext []byte) (sealed 
 // discoveryFailureReason maps a DiscoverIdentity error to a short, secret-free
 // last_error string. It names WHY the identity could not be established so a user
 // reading the alias state knows whether to re-log-in (auth) or retry (transient),
-// without echoing any token or response body.
+// without echoing any token or response body. "Identity incomplete" now means neither
+// the usage response nor the access-token JWT claim yielded an account id (or user_id
+// was absent) — the personal-seat token fallback in DiscoverIdentity was also exhausted.
 func discoveryFailureReason(err error) string {
 	switch {
 	case errors.Is(err, codexauth.ErrIdentityIncomplete):

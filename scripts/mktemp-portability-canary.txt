@@ -1,0 +1,17 @@
+# Positive control for scripts/check-mktemp-portability.sh -- DO NOT "fix" the last line.
+#
+# The last line deliberately carries a template with too few X's: GNU coreutils needs a
+# run of at least 3 consecutive X's, and it has 2, so `mktemp` dies with "too few X's in
+# template". The guard scans this file first and exits 2 (instrument broken) if the
+# detector no longer fires on it, so a pattern or PCRE regression fails loudly instead of
+# passing silently.
+#
+# The template uses 2 X's rather than zero on purpose: it must STOP matching under a
+# regression to zero-X-only detection, so that such a regression trips exit 2. For that
+# to hold, the last line must be the ONLY match in this file -- so every explanatory line
+# here is `#`-prefixed, which the guard's `^[^#]*` clause excludes from matching. Keep it
+# that way: do not add an un-prefixed line, and do not un-prefix these.
+#
+# This is a .txt file, so it is outside the guard's tracked-`*.sh` sweep and is never run
+# or shellchecked. Mirrors scripts/binary-text-canary.go.
+LOG="$(mktemp -t uzi-canary.XX)"
