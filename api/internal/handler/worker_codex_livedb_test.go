@@ -47,7 +47,15 @@ func (*failingCodexResponseWriter) Write(_ []byte) (int, error) {
 func (f *routedCodexRefreshFake) Refresh(_ context.Context, refreshToken string) (codexauth.RefreshResult, error) {
 	f.refreshCalls++
 	f.refreshToken = refreshToken
-	return codexauth.RefreshResult{AccessToken: f.newAccessToken, RefreshToken: &f.newRefresh}, nil
+	return codexauth.RefreshResult{
+		AccessToken:  f.newAccessToken,
+		RefreshToken: &f.newRefresh,
+		IdentityClaims: codexauth.FreshAccessTokenIdentityClaims{
+			ChatGPTAccountID: f.identity.WorkspaceAccountID,
+			ChatGPTUserID:    f.identity.ProviderUserID,
+			AuthUserID:       f.identity.ProviderUserID,
+		},
+	}, nil
 }
 
 func (f *routedCodexRefreshFake) DiscoverIdentity(_ context.Context, _ string) (codexauth.Identity, error) {
@@ -202,8 +210,8 @@ func TestWorkerCodexRoutesReleaseAndRefreshLiveDB(t *testing.T) {
 	if refreshed.AccessToken != newAccessToken || refreshed.Generation != 1 || refreshed.ChatGPTAccountID != chatGPTAccountID {
 		t.Fatalf("refresh = %+v, want rotated token, generation 1 and verified account", refreshed)
 	}
-	if provider.refreshCalls != 1 || provider.discoverCalls != 1 || provider.refreshToken != refreshToken {
-		t.Fatalf("provider calls/token = (%d,%d,%q), want (1,1,original refresh token)",
+	if provider.refreshCalls != 1 || provider.discoverCalls != 0 || provider.refreshToken != refreshToken {
+		t.Fatalf("provider calls/token = (%d,%d,%q), want (1,0,original refresh token)",
 			provider.refreshCalls, provider.discoverCalls, provider.refreshToken)
 	}
 
@@ -219,7 +227,7 @@ func TestWorkerCodexRoutesReleaseAndRefreshLiveDB(t *testing.T) {
 	if writeFailure.status != http.StatusOK {
 		t.Fatalf("write-failure refresh status = %d, want 200 headers before the failed body write", writeFailure.status)
 	}
-	if provider.refreshCalls != 1 || provider.discoverCalls != 1 {
+	if provider.refreshCalls != 1 || provider.discoverCalls != 0 {
 		t.Fatalf("reconciled write-failure request repeated provider calls: refresh=%d discover=%d",
 			provider.refreshCalls, provider.discoverCalls)
 	}

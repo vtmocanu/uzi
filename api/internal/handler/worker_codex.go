@@ -56,8 +56,8 @@ const (
 // codexWorkerOperationTimeout is the server-side slice of pinned app-server's fixed
 // 10-second external-auth callback budget. The worker caps this HTTP round trip at 8s;
 // finishing API work within 7.5s reserves 500ms for response delivery and 2.5s at the
-// callback layer. The coordinated refresh lease is shorter still (7s), and its two serial
-// provider calls are capped at 2.5s each, leaving durable-commit and recheck margin.
+// callback layer. The coordinated refresh lease is shorter still (7s); its one bounded
+// oauth exchange leaves margin for the local identity differential, commit and recheck.
 const codexWorkerOperationTimeout = 7500 * time.Millisecond
 
 // maxCodexRefreshObservedGeneration is the largest JSON integer the TypeScript worker can

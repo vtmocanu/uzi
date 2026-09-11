@@ -76,9 +76,8 @@ import (
 
 // fakeCodexRefresh is the in-process CodexRefreshClient the server wires via
 // wsvc.SetCodexRefresh, mirroring worker_codex_livedb_test.go's routedCodexRefreshFake.
-// It performs NO provider network call: Refresh returns a canary rotated token pair and
-// DiscoverIdentity returns the frozen subscription tuple so a coordinated refresh commits
-// (advanced) rather than quarantining on a tuple mismatch.
+// It performs no provider network call: Refresh returns a canary token pair plus matching
+// fresh-token claims. DiscoverIdentity remains available for recovery promotion.
 type fakeCodexRefresh struct {
 	newAccessToken string
 	newRefresh     string
@@ -87,7 +86,15 @@ type fakeCodexRefresh struct {
 
 func (f *fakeCodexRefresh) Refresh(_ context.Context, _ string) (codexauth.RefreshResult, error) {
 	rotated := f.newRefresh
-	return codexauth.RefreshResult{AccessToken: f.newAccessToken, RefreshToken: &rotated}, nil
+	return codexauth.RefreshResult{
+		AccessToken:  f.newAccessToken,
+		RefreshToken: &rotated,
+		IdentityClaims: codexauth.FreshAccessTokenIdentityClaims{
+			ChatGPTAccountID: f.identity.WorkspaceAccountID,
+			ChatGPTUserID:    f.identity.ProviderUserID,
+			AuthUserID:       f.identity.ProviderUserID,
+		},
+	}, nil
 }
 
 func (f *fakeCodexRefresh) DiscoverIdentity(_ context.Context, _ string) (codexauth.Identity, error) {

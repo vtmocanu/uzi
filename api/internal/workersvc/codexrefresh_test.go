@@ -66,6 +66,41 @@ func TestMergeCodexLoginReplacesRefreshTokenWhenProvided(t *testing.T) {
 	}
 }
 
+func TestClassifyCodexFreshIdentity(t *testing.T) {
+	acct := store.CodexProviderAccount{
+		ProviderUserID:     "user-canonical",
+		WorkspaceAccountID: "acct-canonical",
+	}
+	complete := codexauth.FreshAccessTokenIdentityClaims{
+		ChatGPTAccountID: "acct-canonical",
+		ChatGPTUserID:    "user-canonical",
+		AuthUserID:       "user-canonical",
+	}
+	tests := []struct {
+		name   string
+		claims codexauth.FreshAccessTokenIdentityClaims
+		want   codexFreshIdentityVerdict
+	}{
+		{name: "matching tuple", claims: complete, want: codexFreshIdentityMatch},
+		{name: "account mismatch with verified user", claims: codexauth.FreshAccessTokenIdentityClaims{ChatGPTAccountID: "acct-other", ChatGPTUserID: "user-canonical", AuthUserID: "user-canonical"}, want: codexFreshIdentityUnverified},
+		{name: "user mismatch with matching account", claims: codexauth.FreshAccessTokenIdentityClaims{ChatGPTAccountID: "acct-canonical", ChatGPTUserID: "user-other", AuthUserID: "user-other"}, want: codexFreshIdentityMismatch},
+		{name: "user mismatch with different account", claims: codexauth.FreshAccessTokenIdentityClaims{ChatGPTAccountID: "acct-other", ChatGPTUserID: "user-other", AuthUserID: "user-other"}, want: codexFreshIdentityMismatch},
+		{name: "user mismatch with missing account", claims: codexauth.FreshAccessTokenIdentityClaims{ChatGPTUserID: "user-other", AuthUserID: "user-other"}, want: codexFreshIdentityMismatch},
+		{name: "missing account", claims: codexauth.FreshAccessTokenIdentityClaims{ChatGPTUserID: "user-canonical", AuthUserID: "user-canonical"}, want: codexFreshIdentityUnverified},
+		{name: "missing chatgpt user", claims: codexauth.FreshAccessTokenIdentityClaims{ChatGPTAccountID: "acct-canonical", AuthUserID: "user-canonical"}, want: codexFreshIdentityUnverified},
+		{name: "missing auth user", claims: codexauth.FreshAccessTokenIdentityClaims{ChatGPTAccountID: "acct-canonical", ChatGPTUserID: "user-canonical"}, want: codexFreshIdentityUnverified},
+		{name: "ambiguous user claims", claims: codexauth.FreshAccessTokenIdentityClaims{ChatGPTAccountID: "acct-canonical", ChatGPTUserID: "user-canonical", AuthUserID: "user-other"}, want: codexFreshIdentityUnverified},
+		{name: "malformed parser zero value", claims: codexauth.FreshAccessTokenIdentityClaims{}, want: codexFreshIdentityUnverified},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := classifyCodexFreshIdentity(acct, tt.claims); got != tt.want {
+				t.Fatalf("verdict = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 // TestCodexRefreshResolution proves the reconcile decision rule: a landed commit
 // (generation advanced) → reconciled; a surviving recovery copy at the stranded
 // generation → reconciled (recoverable, not total loss); a LIVE, validly-leased in-flight

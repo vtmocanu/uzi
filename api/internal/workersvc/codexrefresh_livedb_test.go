@@ -22,32 +22,32 @@ import (
 // ships DARK) end to end against a REAL Postgres with an IN-PROCESS call-counting fake
 // oauth client — no HTTP. They are REPRESENTATIVE: one client at a time, driving each
 // arm of the state machine (advance, replay, reconcile, contended, quarantine, recovery).
-// m4 does the exhaustive two-client concurrency matrix.
+// codex_m4_livedb_test.go supplies the exhaustive two-client concurrency matrix.
 //
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres. All fixtures use
 // fresh UUIDs so a single-process `-run 'LiveDB$'` sweep never collides.
 
-// fakeRefreshClient is the in-process oauth-exchange + identity seam. It counts Refresh
-// calls (proving replay/reconcile spend ZERO), records the refresh token it was handed, and
-// returns a configured result (single-use rotating tokens set by the test).
+// fakeRefreshClient is the in-process oauth-exchange + recovery-identity seam. It counts
+// Refresh calls (proving replay/reconcile spend zero), records the refresh token it was
+// handed, and returns configured rotating material. The default refresh result carries a
+// complete claim tuple derived from matchIdentity; tests can override it to exercise
+// mismatch and unverified callback outcomes without a network identity call.
 //
-// It ALSO implements DiscoverIdentity (audit #2): the coordinated refresher now re-verifies
-// the freshly-exchanged access token against the account's frozen tuple. By default
-// DiscoverIdentity returns matchIdentity (which newRefreshFixture pins to the fixture
-// account's tuple, so the happy path MATCHES); a test overrides a specific token via
-// identityByToken (a VERIFIED MISMATCH / incomplete) or errByToken (a TRANSIENT absence).
-// onRefresh, when set, fires inside Refresh after counting — a test uses it to stale
-// authority mid-exchange (audit #3b).
+// DiscoverIdentity remains independently observable for recovery promotion, where full
+// network verification is still required outside the callback budget. onRefresh, when set,
+// fires after counting so tests can stale authority mid-exchange.
 type fakeRefreshClient struct {
 	calls            int
 	lastRefreshToken string
 	result           codexauth.RefreshResult
 	err              error
 
-	matchIdentity   codexauth.Identity            // default DiscoverIdentity answer
-	identityByToken map[string]codexauth.Identity // per-token identity override
-	errByToken      map[string]error              // per-token DiscoverIdentity error
+	matchIdentity   codexauth.Identity            // default recovery DiscoverIdentity answer
+	identityByToken map[string]codexauth.Identity // per-token recovery identity override
+	errByToken      map[string]error              // per-token recovery DiscoverIdentity error
 	discoverCalls   int
+	freshClaims     codexauth.FreshAccessTokenIdentityClaims
+	freshClaimsSet  bool
 	onRefresh       func() // fires inside Refresh, after counting (audit #3b hook)
 }
 
@@ -60,7 +60,13 @@ func (f *fakeRefreshClient) Refresh(_ context.Context, refreshToken string) (cod
 	if f.err != nil {
 		return codexauth.RefreshResult{}, f.err
 	}
-	return f.result, nil
+	result := f.result
+	if f.freshClaimsSet {
+		result.IdentityClaims = f.freshClaims
+	} else if result.IdentityClaims == (codexauth.FreshAccessTokenIdentityClaims{}) {
+		result.IdentityClaims = freshClaimsForIdentity(f.matchIdentity)
+	}
+	return result, nil
 }
 
 func (f *fakeRefreshClient) DiscoverIdentity(_ context.Context, accessToken string) (codexauth.Identity, error) {
@@ -172,7 +178,7 @@ type refreshFixture struct {
 	wkr              store.Worker
 	accessToken      string // the account's committed access token at generation 0
 	prevRefreshToken string // the refresh token the first exchange must be handed
-	providerUserID   string // the account's frozen identity tuple (for re-verification)
+	providerUserID   string // frozen tuple used by claim and recovery checks
 	workspaceAcctID  string
 }
 
@@ -210,9 +216,9 @@ func newRefreshFixture(t *testing.T, env codexTestEnv, fake CodexRefreshClient) 
 		t.Fatalf("FreezeCodexBinding: %v", err)
 	}
 
-	// Pin the fake's default DiscoverIdentity answer to the account's frozen tuple so the
-	// post-refresh re-verification (audit #2) MATCHES on the happy path; a test that wants a
-	// mismatch/absence overrides a specific token via identityByToken/errByToken.
+	// Pin the fake's default fresh-token claims and recovery DiscoverIdentity answer to the
+	// account's frozen tuple. Tests can override freshClaims for callback mismatch/unverified
+	// outcomes or identityByToken/errByToken for recovery verification.
 	acct := env.mustAccount(t, userID, accountID)
 	setFakeMatchIdentity(fake, codexauth.Identity{ProviderUserID: acct.ProviderUserID, WorkspaceAccountID: acct.WorkspaceAccountID})
 
@@ -231,15 +237,22 @@ func newRefreshFixture(t *testing.T, env codexTestEnv, fake CodexRefreshClient) 
 	}
 }
 
-// setFakeMatchIdentity pins the default DiscoverIdentity answer on whichever concrete fake
-// a fixture was handed, so the post-refresh re-verification (audit #2) matches on the happy
-// path without every test re-registering the tuple.
+// setFakeMatchIdentity pins the default fresh-token claims and recovery discovery answer on
+// whichever concrete fake a fixture was handed.
 func setFakeMatchIdentity(fake CodexRefreshClient, id codexauth.Identity) {
 	switch c := fake.(type) {
 	case *fakeRefreshClient:
 		c.matchIdentity = id
 	case *mintingRefreshClient:
 		c.matchIdentity = id
+	}
+}
+
+func freshClaimsForIdentity(id codexauth.Identity) codexauth.FreshAccessTokenIdentityClaims {
+	return codexauth.FreshAccessTokenIdentityClaims{
+		ChatGPTAccountID: id.WorkspaceAccountID,
+		ChatGPTUserID:    id.ProviderUserID,
+		AuthUserID:       id.ProviderUserID,
 	}
 }
 
@@ -719,19 +732,14 @@ func mustIntent(t *testing.T, env codexTestEnv, op, userID uuid.UUID) store.Code
 	return it
 }
 
-// TestCoordinatedCodexRefreshIdentityMatchCommitsLiveDB (audit #2, MATCH) proves the
-// post-refresh re-verification does NOT reject a valid refresh: when the freshly-exchanged
-// access token discovers the SAME account tuple, the rotation commits and the token is
-// returned — a guard against a check that wrongly rejects legitimate refreshes.
+// TestCoordinatedCodexRefreshIdentityMatchCommitsLiveDB proves complete, internally
+// consistent fresh-token claims matching the frozen tuple permit the commit with no
+// DiscoverIdentity network call.
 func TestCoordinatedCodexRefreshIdentityMatchCommitsLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	newAccess := codexToken("access-new")
 	fake := &fakeRefreshClient{result: codexauth.RefreshResult{AccessToken: newAccess}}
 	f := newRefreshFixture(t, env, fake)
-	// Explicitly register the exchanged token → the account's frozen tuple (a MATCH).
-	fake.identityByToken = map[string]codexauth.Identity{
-		newAccess: {ProviderUserID: f.providerUserID, WorkspaceAccountID: f.workspaceAcctID},
-	}
 	capw := env.mintCap(t, f.runID, f.workerID)
 
 	res, err := f.svc.CoordinatedCodexRefresh(env.ctx, f.wkr, f.runID, capw, uuid.New(), 0)
@@ -741,30 +749,70 @@ func TestCoordinatedCodexRefreshIdentityMatchCommitsLiveDB(t *testing.T) {
 	if res.Outcome != CodexRefreshAdvanced || res.Generation != 1 || res.AccessToken != newAccess {
 		t.Fatalf("result = %+v, want advanced/gen1/%q", res, newAccess)
 	}
-	if fake.discoverCalls != 1 {
-		t.Fatalf("discover calls = %d, want exactly 1 (one re-verification)", fake.discoverCalls)
+	if fake.calls != 1 || fake.discoverCalls != 0 {
+		t.Fatalf("provider calls = (refresh %d, discover %d), want (1, 0)", fake.calls, fake.discoverCalls)
 	}
 	if blob := env.accountBlob(t, f.userID, f.accountID); blob.AccessToken != newAccess {
 		t.Fatalf("committed access token = %q, want %q", blob.AccessToken, newAccess)
 	}
 }
 
-// TestCoordinatedCodexRefreshIdentityMismatchQuarantinesLiveDB (audit #2, VERIFIED MISMATCH)
-// proves that when the freshly-exchanged access token discovers a DIFFERENT account tuple,
-// the material is NEITHER committed NOR written to the recovery slot: the account is
-// quarantined, the intent is unrecoverable, and NO token is returned.
-//
-// FAILS OLD: the old advance path committed whatever the exchange returned, sealing account
-// B's login under account A and handing back B's token.
-func TestCoordinatedCodexRefreshIdentityMismatchQuarantinesLiveDB(t *testing.T) {
+// TestCoordinatedCodexRefreshAccountClaimMismatchRetainsLiveDB proves a matching verified
+// user plus a different workspace claim is not enough evidence for destructive quarantine.
+// The material is retained for network recovery and no token is returned.
+func TestCoordinatedCodexRefreshAccountClaimMismatchRetainsLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	newAccess := codexToken("access-new")
 	fake := &fakeRefreshClient{result: codexauth.RefreshResult{AccessToken: newAccess}}
 	f := newRefreshFixture(t, env, fake)
-	// The exchanged token discovers a DIFFERENT account than the one we are rotating.
-	fake.identityByToken = map[string]codexauth.Identity{
-		newAccess: {ProviderUserID: "other-user-" + uuid.NewString(), WorkspaceAccountID: "other-acct-" + uuid.NewString()},
+	fake.freshClaimsSet = true
+	fake.freshClaims = freshClaimsForIdentity(codexauth.Identity{
+		ProviderUserID:     f.providerUserID,
+		WorkspaceAccountID: "other-acct-" + uuid.NewString(),
+	})
+	capw := env.mintCap(t, f.runID, f.workerID)
+	op := uuid.New()
+
+	res, err := f.svc.CoordinatedCodexRefresh(env.ctx, f.wkr, f.runID, capw, op, 0)
+	if !errors.Is(err, ErrCodexRefreshQuarantined) {
+		t.Fatalf("err = %v, want ErrCodexRefreshQuarantined", err)
 	}
+	if errors.Is(err, ErrCodexRefreshUnrecoverable) {
+		t.Fatalf("err = %v, must not be unrecoverable for an unverified account claim", err)
+	}
+	if res.Outcome != CodexRefreshQuarantined || res.AccessToken != "" {
+		t.Fatalf("result = %+v, want quarantined outcome with no token", res)
+	}
+	if fake.calls != 1 || fake.discoverCalls != 0 {
+		t.Fatalf("provider calls = (refresh %d, discover %d), want (1, 0)", fake.calls, fake.discoverCalls)
+	}
+	acct := env.mustAccount(t, f.userID, f.accountID)
+	if acct.Generation != 0 || acct.CoordState != codexCoordQuarantined {
+		t.Fatalf("account state = generation %d coord %q, want generation 0 quarantined", acct.Generation, acct.CoordState)
+	}
+	if len(acct.RecoverySealed) == 0 || !acct.RecoveryGeneration.Valid || acct.RecoveryGeneration.Int64 != 0 {
+		t.Fatalf("recovery slot not retained: sealed=%d gen=%v", len(acct.RecoverySealed), acct.RecoveryGeneration)
+	}
+	if blob := env.openSealedBlob(t, f.userID, acct.RecoverySealed, acct.RecoverySealedWith.String); blob.AccessToken != newAccess {
+		t.Fatalf("recovery blob access token = %q, want %q", blob.AccessToken, newAccess)
+	}
+	if it := mustIntent(t, env, op, f.userID); it.State != codexIntentRotating {
+		t.Fatalf("intent state = %q, want rotating for network recovery", it.State)
+	}
+}
+
+// A verified user mismatch remains destructive even when the workspace claim also differs;
+// account uncertainty must not hide a same-workspace/different-user rejection.
+func TestCoordinatedCodexRefreshUserClaimMismatchQuarantinesLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	newAccess := codexToken("access-new")
+	fake := &fakeRefreshClient{result: codexauth.RefreshResult{AccessToken: newAccess}}
+	f := newRefreshFixture(t, env, fake)
+	fake.freshClaimsSet = true
+	fake.freshClaims = freshClaimsForIdentity(codexauth.Identity{
+		ProviderUserID:     "other-user-" + uuid.NewString(),
+		WorkspaceAccountID: "other-acct-" + uuid.NewString(),
+	})
 	capw := env.mintCap(t, f.runID, f.workerID)
 	op := uuid.New()
 
@@ -773,62 +821,73 @@ func TestCoordinatedCodexRefreshIdentityMismatchQuarantinesLiveDB(t *testing.T) 
 		t.Fatalf("err = %v, want ErrCodexRefreshUnrecoverable", err)
 	}
 	if res.Outcome != CodexRefreshQuarantined || res.AccessToken != "" {
-		t.Fatalf("result = %+v, want quarantined outcome with NO token", res)
+		t.Fatalf("result = %+v, want quarantined outcome with no token", res)
 	}
-	if fake.calls != 1 {
-		t.Fatalf("provider calls = %d, want exactly 1", fake.calls)
+	if fake.calls != 1 || fake.discoverCalls != 0 {
+		t.Fatalf("provider calls = (refresh %d, discover %d), want (1, 0)", fake.calls, fake.discoverCalls)
 	}
 	acct := env.mustAccount(t, f.userID, f.accountID)
-	if acct.Generation != 0 {
-		t.Fatalf("generation = %d, want 0 (a mismatch must not commit)", acct.Generation)
-	}
-	if acct.CoordState != codexCoordQuarantined {
-		t.Fatalf("coord_state = %q, want quarantined", acct.CoordState)
-	}
-	if len(acct.RecoverySealed) != 0 {
-		t.Fatalf("recovery slot must be EMPTY on a mismatch (material is not this account's), got %d bytes", len(acct.RecoverySealed))
+	if acct.Generation != 0 || acct.CoordState != codexCoordQuarantined || len(acct.RecoverySealed) != 0 {
+		t.Fatalf("mismatch account state = generation %d coord %q recovery %d bytes", acct.Generation, acct.CoordState, len(acct.RecoverySealed))
 	}
 	if it := mustIntent(t, env, op, f.userID); it.State != codexIntentUnrecoverable {
 		t.Fatalf("intent state = %q, want unrecoverable", it.State)
 	}
 }
 
-// TestCoordinatedCodexRefreshIdentityAbsenceRetainsLiveDB (audit #2, ABSENCE) proves that a
-// TRANSIENT DiscoverIdentity error after a successful exchange does NOT discard the new
-// material: the single-use refresh token was already spent, so the merged blob is RETAINED
-// in the recovery slot and the intent is LEFT 'rotating' for a later promotion to
-// re-verify. No token is returned, but recovery is possible.
-func TestCoordinatedCodexRefreshIdentityAbsenceRetainsLiveDB(t *testing.T) {
-	env := setupCodexLiveDB(t)
-	newAccess := codexToken("access-new")
-	fake := &fakeRefreshClient{result: codexauth.RefreshResult{AccessToken: newAccess}}
-	f := newRefreshFixture(t, env, fake)
-	// DiscoverIdentity itself errors transiently (network/5xx) — an ABSENCE, not a verdict.
-	fake.errByToken = map[string]error{newAccess: errors.New("codexauth: identity request: network unreachable")}
-	capw := env.mintCap(t, f.runID, f.workerID)
-	op := uuid.New()
+// TestCoordinatedCodexRefreshUnverifiedClaimsRetainsLiveDB proves malformed, missing, and
+// internally inconsistent fresh-token claims release no token and retain the rotated login
+// for a later full network verification.
+func TestCoordinatedCodexRefreshUnverifiedClaimsRetainsLiveDB(t *testing.T) {
+	tests := []struct {
+		name   string
+		claims func(refreshFixture) codexauth.FreshAccessTokenIdentityClaims
+	}{
+		{name: "malformed parser zero value", claims: func(refreshFixture) codexauth.FreshAccessTokenIdentityClaims {
+			return codexauth.FreshAccessTokenIdentityClaims{}
+		}},
+		{name: "missing auth user", claims: func(f refreshFixture) codexauth.FreshAccessTokenIdentityClaims {
+			return codexauth.FreshAccessTokenIdentityClaims{ChatGPTAccountID: f.workspaceAcctID, ChatGPTUserID: f.providerUserID}
+		}},
+		{name: "ambiguous user claims", claims: func(f refreshFixture) codexauth.FreshAccessTokenIdentityClaims {
+			return codexauth.FreshAccessTokenIdentityClaims{ChatGPTAccountID: f.workspaceAcctID, ChatGPTUserID: f.providerUserID, AuthUserID: "other-user-" + uuid.NewString()}
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := setupCodexLiveDB(t)
+			newAccess := codexToken("access-new")
+			fake := &fakeRefreshClient{result: codexauth.RefreshResult{AccessToken: newAccess}}
+			f := newRefreshFixture(t, env, fake)
+			fake.freshClaimsSet = true
+			fake.freshClaims = tt.claims(f)
+			capw := env.mintCap(t, f.runID, f.workerID)
+			op := uuid.New()
 
-	res, err := f.svc.CoordinatedCodexRefresh(env.ctx, f.wkr, f.runID, capw, op, 0)
-	if !errors.Is(err, ErrCodexRefreshQuarantined) {
-		t.Fatalf("err = %v, want ErrCodexRefreshQuarantined", err)
-	}
-	if res.Outcome != CodexRefreshQuarantined || res.AccessToken != "" {
-		t.Fatalf("result = %+v, want quarantined outcome with NO token", res)
-	}
-	acct := env.mustAccount(t, f.userID, f.accountID)
-	if acct.Generation != 0 {
-		t.Fatalf("generation = %d, want 0 (an unverified exchange must not commit)", acct.Generation)
-	}
-	if len(acct.RecoverySealed) == 0 || !acct.RecoveryGeneration.Valid || acct.RecoveryGeneration.Int64 != 0 {
-		t.Fatalf("recovery slot not retained: sealed=%d gen=%v", len(acct.RecoverySealed), acct.RecoveryGeneration)
-	}
-	// The retained material really is the NEW access token, openable for a later promotion.
-	if blob := env.openSealedBlob(t, f.userID, acct.RecoverySealed, acct.SealedWith); blob.AccessToken != newAccess {
-		t.Fatalf("recovery blob access token = %q, want the retained new %q", blob.AccessToken, newAccess)
-	}
-	// The intent stays 'rotating' so a promotion pass re-verifies later — NOT unrecoverable.
-	if it := mustIntent(t, env, op, f.userID); it.State != codexIntentRotating {
-		t.Fatalf("intent state = %q, want rotating (retained for a later promotion)", it.State)
+			res, err := f.svc.CoordinatedCodexRefresh(env.ctx, f.wkr, f.runID, capw, op, 0)
+			if !errors.Is(err, ErrCodexRefreshQuarantined) {
+				t.Fatalf("err = %v, want ErrCodexRefreshQuarantined", err)
+			}
+			if res.Outcome != CodexRefreshQuarantined || res.AccessToken != "" {
+				t.Fatalf("result = %+v, want quarantined outcome with no token", res)
+			}
+			if fake.calls != 1 || fake.discoverCalls != 0 {
+				t.Fatalf("provider calls = (refresh %d, discover %d), want (1, 0)", fake.calls, fake.discoverCalls)
+			}
+			acct := env.mustAccount(t, f.userID, f.accountID)
+			if acct.Generation != 0 {
+				t.Fatalf("generation = %d, want 0", acct.Generation)
+			}
+			if len(acct.RecoverySealed) == 0 || !acct.RecoveryGeneration.Valid || acct.RecoveryGeneration.Int64 != 0 {
+				t.Fatalf("recovery slot not retained: sealed=%d gen=%v", len(acct.RecoverySealed), acct.RecoveryGeneration)
+			}
+			if blob := env.openSealedBlob(t, f.userID, acct.RecoverySealed, acct.SealedWith); blob.AccessToken != newAccess {
+				t.Fatalf("recovery blob access token = %q, want %q", blob.AccessToken, newAccess)
+			}
+			if it := mustIntent(t, env, op, f.userID); it.State != codexIntentRotating {
+				t.Fatalf("intent state = %q, want rotating", it.State)
+			}
+		})
 	}
 }
 
@@ -900,6 +959,9 @@ func TestReconcileUnresolvedCodexRefreshPromotesRecoveryLiveDB(t *testing.T) {
 		if pre.CoordState != codexCoordQuarantined || len(pre.RecoverySealed) == 0 {
 			t.Fatalf("precondition: account not quarantined-with-recovery: state=%q sealed=%d", pre.CoordState, len(pre.RecoverySealed))
 		}
+		if fake.discoverCalls != 0 {
+			t.Fatalf("refresh callback made %d discovery calls, want 0", fake.discoverCalls)
+		}
 
 		// Reconcile on the un-hooked store (the commit hook was only for the seed) with the
 		// same MATCHING-identity fake → promotion installs the recovery material.
@@ -910,6 +972,9 @@ func TestReconcileUnresolvedCodexRefreshPromotesRecoveryLiveDB(t *testing.T) {
 		}
 		if n != 1 {
 			t.Fatalf("resolved = %d, want 1", n)
+		}
+		if fake.discoverCalls != 1 {
+			t.Fatalf("recovery discovery calls = %d, want exactly 1 before promotion", fake.discoverCalls)
 		}
 		acct := env.mustAccount(t, f.userID, f.accountID)
 		if acct.CoordState != "idle" {
@@ -936,6 +1001,9 @@ func TestReconcileUnresolvedCodexRefreshPromotesRecoveryLiveDB(t *testing.T) {
 		}
 		if n2 != 0 {
 			t.Fatalf("second reconcile resolved %d, want 0 (no-op)", n2)
+		}
+		if fake.discoverCalls != 1 {
+			t.Fatalf("recovery discovery calls after no-op = %d, want 1", fake.discoverCalls)
 		}
 		if a2 := env.mustAccount(t, f.userID, f.accountID); a2.Generation != 1 || a2.CoordState != "idle" {
 			t.Fatalf("second reconcile mutated the account: gen=%d state=%q", a2.Generation, a2.CoordState)
@@ -985,6 +1053,9 @@ func TestReconcileUnresolvedCodexRefreshPromotesRecoveryLiveDB(t *testing.T) {
 
 		if _, err := f.svc.ReconcileUnresolvedCodexRefresh(env.ctx, f.userID, f.accountID); err != nil {
 			t.Fatalf("reconcile: %v", err)
+		}
+		if fake.discoverCalls != 1 {
+			t.Fatalf("recovery discovery calls = %d, want exactly 1 before rejecting promotion", fake.discoverCalls)
 		}
 		acct := env.mustAccount(t, f.userID, f.accountID)
 		if acct.CoordState != codexCoordQuarantined {
@@ -1161,7 +1232,7 @@ func TestReleaseCodexCredentialAPIKeyLiveDB(t *testing.T) {
 // recovery-slot write is RESILIENT: SetCodexRecoverySlot fails the first calls (a transient
 // blip) but the bounded synchronous retry, then the background retrier, eventually land it —
 // so the freshly-rotated single-use material is NOT dropped and the intent is NOT marked
-// unrecoverable. It drives the ABSENCE (transient DiscoverIdentity error) retain path.
+// unrecoverable. It drives the unverified fresh-token claim retain path.
 //
 // FAILS OLD: the old codexRetainUnverifiedMaterial wrote once on the request ctx and, on a
 // single write error, marked the intent unrecoverable and dropped the material.
@@ -1170,8 +1241,8 @@ func TestCoordinatedCodexRefreshRecoverySlotRetryPersistsLiveDB(t *testing.T) {
 	newAccess := codexToken("access-new")
 	fake := &fakeRefreshClient{result: codexauth.RefreshResult{AccessToken: newAccess}}
 	f := newRefreshFixture(t, env, fake)
-	// Absence: DiscoverIdentity errors transiently → the retain path writes the recovery slot.
-	fake.errByToken = map[string]error{newAccess: errors.New("codexauth: identity request: network unreachable")}
+	// Unverified claims route the exchanged material through the recovery slot.
+	fake.freshClaimsSet = true
 	// The recovery write fails past the synchronous attempts, forcing the background retrier;
 	// the test's synchronous s.background runs it inline so the slot is populated by return.
 	hook := &recoverySlotHookStore{Queries: env.q, failFirst: codexRecoverySlotSyncAttempts + 1}
@@ -1216,7 +1287,7 @@ func TestCoordinatedCodexRefreshRecoverySlotZeroRowsIsNotPersistedLiveDB(t *test
 	newAccess := codexToken("access-new")
 	fake := &fakeRefreshClient{result: codexauth.RefreshResult{AccessToken: newAccess}}
 	f := newRefreshFixture(t, env, fake)
-	fake.errByToken = map[string]error{newAccess: errors.New("codexauth: identity request: network unreachable")}
+	fake.freshClaimsSet = true
 	hook := &recoverySlotZeroStore{Queries: env.q}
 	f.svc.q = hook
 	capw := env.mintCap(t, f.runID, f.workerID)
@@ -1362,23 +1433,20 @@ func TestCoordinatedCodexRefreshVaultLockedSealRetainsLiveDB(t *testing.T) {
 	}
 }
 
-// TestCoordinatedCodexRefreshIdentityIncompleteRetainsLiveDB (defect 5, refresh-time) proves
-// an INCOMPLETE identity (an authenticated 2xx MISSING subject/workspace — "cannot tell") is
-// routed to the RETAIN path, NOT the confirmed-mismatch/unrecoverable path: the material is
-// kept in the recovery slot, the intent stays 'rotating', NO token is released, and a
-// subsequent verification (a later reconcile whose DiscoverIdentity now resolves the frozen
-// tuple) can still promote it.
-//
-// FAILS OLD: the old refresh-time switch bucketed ErrIdentityIncomplete with a confirmed
-// mismatch (codexQuarantineIdentityMismatch) — marked unrecoverable, no recovery slot.
+// TestCoordinatedCodexRefreshIdentityIncompleteRetainsLiveDB proves an incomplete fresh-token
+// claim tuple is retained rather than treated as a mismatch. A later reconcile performs the
+// full network discovery and can promote it.
 func TestCoordinatedCodexRefreshIdentityIncompleteRetainsLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	newAccess := codexToken("access-new")
 	fake := &fakeRefreshClient{result: codexauth.RefreshResult{AccessToken: newAccess}}
 	f := newRefreshFixture(t, env, fake)
-	// The exchanged token returns an authenticated 2xx MISSING subject/workspace — not a
-	// positively-different tuple.
-	fake.errByToken = map[string]error{newAccess: codexauth.ErrIdentityIncomplete}
+	// The exchanged token omits one established user claim, so it cannot decide identity.
+	fake.freshClaimsSet = true
+	fake.freshClaims = codexauth.FreshAccessTokenIdentityClaims{
+		ChatGPTAccountID: f.workspaceAcctID,
+		ChatGPTUserID:    f.providerUserID,
+	}
 	capw := env.mintCap(t, f.runID, f.workerID)
 	op := uuid.New()
 
@@ -1406,7 +1474,6 @@ func TestCoordinatedCodexRefreshIdentityIncompleteRetainsLiveDB(t *testing.T) {
 
 	// A subsequent verification can still succeed: once DiscoverIdentity resolves the account's
 	// frozen tuple, a reconcile pass promotes the retained material to the live login.
-	delete(fake.errByToken, newAccess)
 	fake.identityByToken = map[string]codexauth.Identity{
 		newAccess: {ProviderUserID: f.providerUserID, WorkspaceAccountID: f.workspaceAcctID},
 	}

@@ -12,10 +12,10 @@
 // separate hosts. Identity is established WITHOUT rotating anything: a caller
 // reconciling a freshly imported login must be able to prove it never spent a
 // refresh (M1's whole point is identity-first, no pre-identity rotation), which is
-// exactly what DiscoverIdentity's zero oauth traffic gives it. Refresh exists now
-// only as the raw primitive the m1 instrument test uses to prove the oauth counter
-// is observable at all; the COORDINATED refresh orchestration (lease/intent/
-// generation) is a later unit and is not built here.
+// exactly what DiscoverIdentity's zero oauth traffic gives it. Refresh is the raw
+// exchange primitive consumed by workersvc's coordinated lease/intent/generation
+// state machine; it also decodes the narrow fresh-token claims used there without
+// adding a second provider call.
 //
 // The network is the only thing tests fake: they inject an httpDoer (or an
 // http.Client wrapping a fake http.RoundTripper), and the real client code —
@@ -105,13 +105,32 @@ type Identity struct {
 	WorkspaceAccountID string
 }
 
+// FreshAccessTokenIdentityClaims is the narrow identity subset decoded from a
+// freshly exchanged ChatGPT access-token JWT. The two user fields are kept
+// separate because a caller must require them to be non-empty and equal before
+// comparing that value with the canonical provider user id. The zero value, a
+// missing field, or disagreement is unverified.
+//
+// These are decoded claims, not locally authenticated claims. They are suitable
+// for the coordinated-refresh differential check only when the token came
+// directly from Refresh's successful exchange against the fixed provider.
+type FreshAccessTokenIdentityClaims struct {
+	ChatGPTAccountID string
+	ChatGPTUserID    string
+	AuthUserID       string
+}
+
 // RefreshResult is the outcome of an oauth token refresh. AccessToken is always
 // non-empty (Refresh errors otherwise). RefreshToken is a pointer because the
 // provider MAY omit a rotated refresh token, and nil ("keep using the old one")
-// is a distinct, legal answer from an empty string.
+// is a distinct, legal answer from an empty string. IdentityClaims contains only
+// the claim candidates needed to compare the fresh token with the account's
+// canonical tuple; zero or partial claims are deliberately returned as
+// unverified rather than turning a successful token exchange into a parse error.
 type RefreshResult struct {
-	AccessToken  string
-	RefreshToken *string
+	AccessToken    string
+	RefreshToken   *string
+	IdentityClaims FreshAccessTokenIdentityClaims
 }
 
 // Client is the direct HTTP provider client. It holds the network seam, the two
@@ -146,11 +165,10 @@ func WithHTTPDoer(d httpDoer) Option {
 }
 
 // WithPerRequestTimeout bounds each provider HTTP call (DiscoverIdentity, Refresh) with
-// a per-request context deadline (PRD #1171 M1). It is the production knob that keeps the
-// coordinated refresh — which makes up to two serial provider calls (oauth refresh +
-// nonrotating identity re-verify) — inside the app-server's 10-second external-auth
-// callback budget. A non-positive value is ignored (keeps the default: no per-request
-// deadline), so an accidental zero never disables the doer's own timeout.
+// a per-request context deadline (PRD #1171 M1). The coordinated callback uses it for its
+// single oauth exchange; import and recovery use it for their nonrotating identity reads.
+// A non-positive value is ignored (keeps the default: no per-request deadline), so an
+// accidental zero never disables the doer's own timeout.
 func WithPerRequestTimeout(d time.Duration) Option {
 	return func(c *Client) {
 		if d > 0 {
@@ -263,32 +281,55 @@ func (c *Client) DiscoverIdentity(ctx context.Context, accessToken string) (Iden
 	return Identity{ProviderUserID: body.UserID, WorkspaceAccountID: accountID}, nil
 }
 
-// accountIDFromAccessToken extracts the chatgpt_account_id claim from a ChatGPT
-// access-token JWT payload for the personal-seat fallback in DiscoverIdentity. It
-// parses ONLY the middle (payload) segment as unpadded base64url and reads the
-// "https://api.openai.com/auth".chatgpt_account_id claim; it deliberately verifies
-// NO signature (the token was already accepted by the provider on the preceding
-// /wham/usage 2xx). Any structural failure — not three segments, bad base64, bad
-// JSON, missing namespace, wrong claim type, empty value — returns "", so the
-// caller falls through to ErrIdentityIncomplete.
+type accessTokenIdentityClaims struct {
+	Auth struct {
+		ChatGPTAccountID string `json:"chatgpt_account_id"`
+		ChatGPTUserID    string `json:"chatgpt_user_id"`
+		UserID           string `json:"user_id"`
+	} `json:"https://api.openai.com/auth"`
+}
+
+// ParseFreshAccessTokenIdentityClaims purely decodes the identity claims needed
+// to compare a freshly exchanged ChatGPT access token with a stored canonical
+// tuple. It parses only the middle JWT segment as unpadded base64url and verifies
+// no signature. Any structural failure, including a wrong claim type, returns the
+// zero value. Missing or empty claims remain empty so the caller can classify the
+// identity as unverified. The two user claim names stay separate: their equality
+// is part of the differential check, not an assumption made by the parser.
+func ParseFreshAccessTokenIdentityClaims(token string) FreshAccessTokenIdentityClaims {
+	claims, ok := decodeAccessTokenIdentityClaims(token)
+	if !ok {
+		return FreshAccessTokenIdentityClaims{}
+	}
+	return FreshAccessTokenIdentityClaims{
+		ChatGPTAccountID: claims.Auth.ChatGPTAccountID,
+		ChatGPTUserID:    claims.Auth.ChatGPTUserID,
+		AuthUserID:       claims.Auth.UserID,
+	}
+}
+
+// accountIDFromAccessToken extracts chatgpt_account_id for DiscoverIdentity's
+// personal-seat fallback. It reuses the same JWT decoder as the fresh-token
+// differential parser. The lack of local signature verification is sound only
+// after the fixed /wham/usage endpoint accepted this same bearer token.
 func accountIDFromAccessToken(token string) string {
+	return ParseFreshAccessTokenIdentityClaims(token).ChatGPTAccountID
+}
+
+func decodeAccessTokenIdentityClaims(token string) (accessTokenIdentityClaims, bool) {
 	segments := strings.Split(token, ".")
 	if len(segments) != 3 {
-		return ""
+		return accessTokenIdentityClaims{}, false
 	}
 	payload, err := base64.RawURLEncoding.DecodeString(segments[1])
 	if err != nil {
-		return ""
+		return accessTokenIdentityClaims{}, false
 	}
-	var claims struct {
-		Auth struct {
-			ChatGPTAccountID string `json:"chatgpt_account_id"`
-		} `json:"https://api.openai.com/auth"`
-	}
+	var claims accessTokenIdentityClaims
 	if err := json.Unmarshal(payload, &claims); err != nil {
-		return ""
+		return accessTokenIdentityClaims{}, false
 	}
-	return claims.Auth.ChatGPTAccountID
+	return claims, true
 }
 
 // refreshRequest is the JSON body of the oauth token exchange.
@@ -308,12 +349,12 @@ type refreshResponse struct {
 }
 
 // Refresh exchanges a refresh token for a fresh access token via a POST to the
-// oauth surface. This is the RAW primitive (PRD #1147 M1): it performs exactly one
-// oauth call and returns the new material. The coordinated refresh orchestration
-// (lease/intent/generation) is a later unit and is not built here.
+// oauth surface. This raw primitive performs exactly one provider call, returns
+// the new material, and purely decodes the narrow identity claims from that same
+// access token for workersvc's coordinated differential check.
 //
-//   - 2xx with an access_token → RefreshResult{AccessToken, RefreshToken}, where
-//     RefreshToken is nil when the provider omitted a rotated token.
+//   - 2xx with an access_token → RefreshResult with the token pair and purely decoded
+//     identity claims; RefreshToken is nil when the provider omitted a rotated token.
 //   - 2xx without an access_token → ErrNoAccessToken.
 //   - non-2xx (including 401) → *AuthError carrying the status.
 func (c *Client) Refresh(ctx context.Context, refreshToken string) (RefreshResult, error) {
@@ -352,5 +393,9 @@ func (c *Client) Refresh(ctx context.Context, refreshToken string) (RefreshResul
 	if body.AccessToken == nil || *body.AccessToken == "" {
 		return RefreshResult{}, ErrNoAccessToken
 	}
-	return RefreshResult{AccessToken: *body.AccessToken, RefreshToken: body.RefreshToken}, nil
+	return RefreshResult{
+		AccessToken:    *body.AccessToken,
+		RefreshToken:   body.RefreshToken,
+		IdentityClaims: ParseFreshAccessTokenIdentityClaims(*body.AccessToken),
+	}, nil
 }

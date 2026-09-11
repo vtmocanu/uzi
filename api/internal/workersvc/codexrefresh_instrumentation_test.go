@@ -116,8 +116,8 @@ func assertNoCanary(t *testing.T, recs []captureRecord, canaries ...string) {
 	}
 }
 
-// instrFakeRefresh is a small local CodexRefreshClient: Refresh returns a configured result
-// (or a configured error) and DiscoverIdentity returns a configured identity.
+// instrFakeRefresh is a small local CodexRefreshClient. Refresh drives the callback path;
+// DiscoverIdentity remains available for the recovery-only half of the interface.
 type instrFakeRefresh struct {
 	result     codexauth.RefreshResult
 	refreshErr error
@@ -242,8 +242,14 @@ func TestCodexRefreshInstrumentationNoSecretLeak(t *testing.T) {
 	cap := installCapture(t)
 	box, acct := newInstrFixture(t)
 	fake := &instrFakeRefresh{
-		result:   codexauth.RefreshResult{AccessToken: "CANARY_NEW_ACCESS"}, //nolint:gosec // G101: test canary string, not a real credential
-		identity: codexauth.Identity{ProviderUserID: "canary-user", WorkspaceAccountID: "CANARY_ACCOUNT_ID"},
+		result: codexauth.RefreshResult{ //nolint:gosec // G101: test canary string, not a real credential
+			AccessToken: "CANARY_NEW_ACCESS",
+			IdentityClaims: codexauth.FreshAccessTokenIdentityClaims{
+				ChatGPTAccountID: "CANARY_ACCOUNT_ID",
+				ChatGPTUserID:    "canary-user",
+				AuthUserID:       "canary-user",
+			},
+		},
 	}
 	svc := &Service{box: box, codexRefresh: fake}
 
@@ -264,9 +270,8 @@ func TestCodexRefreshInstrumentationNoSecretLeak(t *testing.T) {
 
 	recs := cap.snapshot()
 	wantPhases := map[string]bool{
-		codexRefreshPhaseOAuthPost:   false,
-		codexRefreshPhaseIdentityGet: false,
-		codexRefreshPhaseCommit:      false,
+		codexRefreshPhaseOAuthPost: false,
+		codexRefreshPhaseCommit:    false,
 	}
 	for _, rec := range recs {
 		if rec.msg != codexTimingMsgPhase {

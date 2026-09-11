@@ -54,10 +54,9 @@ type mintingRefreshClient struct {
 	refresh    []string // the rotated refresh token minted by Refresh, in call order
 	onExchange func(ctx context.Context, call int) error
 
-	// matchIdentity is the tuple DiscoverIdentity returns for EVERY minted access token, so
-	// the post-refresh re-verification (audit #2) matches across every generation (a
-	// rotation never changes the account tuple). seedTwoRunsSameAccount / newRefreshFixture
-	// pin it to the fixture account's tuple.
+	// matchIdentity supplies every minted token's matching claim tuple and remains the
+	// DiscoverIdentity answer for recovery promotion. A rotation never changes this tuple;
+	// seedTwoRunsSameAccount / newRefreshFixture pin it to the fixture account.
 	matchIdentity codexauth.Identity
 }
 
@@ -66,6 +65,7 @@ func (c *mintingRefreshClient) Refresh(ctx context.Context, refreshToken string)
 	c.calls++
 	call := c.calls
 	c.handed = append(c.handed, refreshToken)
+	matchIdentity := c.matchIdentity
 	c.mu.Unlock()
 
 	if c.onExchange != nil {
@@ -80,12 +80,15 @@ func (c *mintingRefreshClient) Refresh(ctx context.Context, refreshToken string)
 	c.access = append(c.access, access)
 	c.refresh = append(c.refresh, rotated)
 	c.mu.Unlock()
-	return codexauth.RefreshResult{AccessToken: access, RefreshToken: &rotated}, nil
+	return codexauth.RefreshResult{
+		AccessToken:    access,
+		RefreshToken:   &rotated,
+		IdentityClaims: freshClaimsForIdentity(matchIdentity),
+	}, nil
 }
 
-// DiscoverIdentity returns the pinned account tuple for every access token (audit #2): a
-// rotation never changes the account, so the freshly-exchanged token always re-verifies to
-// the same tuple. Safe for concurrent use (test A drives it from two goroutines).
+// DiscoverIdentity returns the pinned account tuple for recovery promotion. It remains
+// independently observable from the fresh-token claim path and is safe for concurrent use.
 func (c *mintingRefreshClient) DiscoverIdentity(_ context.Context, _ string) (codexauth.Identity, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -157,8 +160,8 @@ func seedTwoRunsSameAccount(t *testing.T, env codexTestEnv, refresh CodexRefresh
 	}
 	accountID := uuid.UUID(st1.ProviderAccountID.Bytes)
 
-	// Pin the fake's DiscoverIdentity answer to the shared account's tuple so the post-refresh
-	// re-verification (audit #2) matches for both runs across every rotation.
+	// Pin both the fake's fresh-token claims and recovery DiscoverIdentity answer to the
+	// shared account tuple across every rotation.
 	setFakeMatchIdentity(refresh, codexauth.Identity{ProviderUserID: providerUser, WorkspaceAccountID: workspace})
 
 	svc := &Service{q: env.q, box: env.box, codexRefresh: refresh}

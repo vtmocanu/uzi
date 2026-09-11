@@ -8,9 +8,9 @@ import (
 	"time"
 )
 
-// The production refresh path performs an OAuth exchange and a verified identity read
-// serially. Two and a half seconds per call caps network time at five seconds, preserving
-// the request-entry-anchored commit/recheck and response reserves.
+// The production refresh callback performs one OAuth exchange. Its 2.5-second cap leaves
+// ample request-entry-anchored margin for the local claim comparison, commit/recheck and
+// response delivery; import and recovery identity reads use the same per-call cap elsewhere.
 func TestCodexProviderRequestTimeoutLeavesCommitMargin(t *testing.T) {
 	if codexProviderRequestTimeout != 2500*time.Millisecond {
 		t.Fatalf("provider request timeout = %s, want 2.5s", codexProviderRequestTimeout)

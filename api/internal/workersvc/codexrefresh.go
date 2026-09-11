@@ -27,23 +27,22 @@ import (
 // AcquireCodexRefreshLease / CommitCodexRefresh, the durable codex_refresh_intent, and
 // the SetCodexRecoverySlot / QuarantineExpiredCodexLease quarantine pair.
 //
-// m4 will PROVE this exhaustively with a fake provider and two concurrent clients; the
-// tests here are representative (one client, a call-counting fake), not the full
-// concurrency matrix.
+// codex_m4_livedb_test.go proves this exhaustively with a fake provider and two concurrent
+// clients; the representative tests in codexrefresh_livedb_test.go cover each state arm.
 
 // codexRefreshLeaseTTL bounds the complete API-side refresh lease. Pinned app-server has
 // a fixed 10-second external-auth deadline; the worker reserves 1 second and gives its
 // API request 8 seconds. A 7-second lease therefore leaves a real second for the HTTP
-// response. Production provider calls are capped at 2.5 seconds each, leaving another
-// second inside this lease for identity validation, the durable commit and authority recheck.
+// response. The callback performs one bounded oauth exchange, then leaves time for the
+// local claim comparison, durable commit and authority recheck.
 const codexRefreshLeaseTTL = 7 * time.Second
 
 const (
 	// Leave the handler enough time to encode and deliver the response after the service
 	// returns. The handler's 7.5s context starts at request entry.
 	codexRefreshResponseReserve = 500 * time.Millisecond
-	// Stop provider work before the lease expires so identity verification, sealing, the
-	// durable commit, and the final authority recheck retain a bounded slice.
+	// Stop provider work before the lease expires so the local identity comparison, sealing,
+	// durable commit, and final authority recheck retain a bounded slice.
 	codexRefreshCommitReserve = time.Second
 )
 
@@ -162,13 +161,11 @@ var (
 // depends on (PRD #1147 M2). *codexauth.Client satisfies it; tests supply an in-process
 // fake with a refresh counter and single-use rotating tokens.
 //
-// It EMBEDS CodexIdentityClient (codexcred.go) so the coordinated refresher can do BOTH
-// halves of a hardened rotation: exchange the refresh token AND re-verify, with a
-// nonrotating DiscoverIdentity, that the freshly-exchanged access token still resolves to
-// the SAME account tuple it is rotating (PRD #1147 audit #2). *codexauth.Client already
-// satisfies both methods, so this needs no codexauth edit and no new Service field. The
-// interface lives here in workersvc rather than reaching into codexauth so the codexauth
-// package needs no edit.
+// It embeds CodexIdentityClient because recovery promotion still performs a full,
+// nonrotating DiscoverIdentity verification outside the callback budget. The coordinated
+// callback itself performs only Refresh and compares the fresh token's returned identity
+// claims with the frozen tuple. *codexauth.Client supplies both methods through one service
+// field; tests can keep the exchange and recovery reads independently observable.
 type CodexRefreshClient interface {
 	CodexIdentityClient
 	Refresh(ctx context.Context, refreshToken string) (codexauth.RefreshResult, error)
@@ -256,6 +253,33 @@ func mergeCodexLogin(prev codexLoginBlob, result codexauth.RefreshResult) codexL
 	return merged
 }
 
+type codexFreshIdentityVerdict int
+
+const (
+	codexFreshIdentityUnverified codexFreshIdentityVerdict = iota
+	codexFreshIdentityMatch
+	codexFreshIdentityMismatch
+)
+
+// classifyCodexFreshIdentity compares only claims whose mapping to /wham/usage is
+// established. Both user claim names must be present and agree before either can
+// authenticate a differential result. A verified user mismatch is destructive regardless
+// of the account claim. The account claim may complete a match, but its mapping to the
+// usage account id is not independently established, so a missing or differing account is
+// unverified and retained for later network verification.
+func classifyCodexFreshIdentity(acct store.CodexProviderAccount, claims codexauth.FreshAccessTokenIdentityClaims) codexFreshIdentityVerdict {
+	if claims.ChatGPTUserID == "" || claims.AuthUserID == "" || claims.ChatGPTUserID != claims.AuthUserID {
+		return codexFreshIdentityUnverified
+	}
+	if claims.ChatGPTUserID != acct.ProviderUserID {
+		return codexFreshIdentityMismatch
+	}
+	if claims.ChatGPTAccountID == "" || claims.ChatGPTAccountID != acct.WorkspaceAccountID {
+		return codexFreshIdentityUnverified
+	}
+	return codexFreshIdentityMatch
+}
+
 // openCodexSealed opens and decodes ANY codex login blob sealed on the shared vault path
 // (AAD user_id||codex_auth) — the account's sealed_login OR its recovery_sealed, which are
 // always produced by the same per-user seal. A locked vault surfaces as errVaultLocked
@@ -306,17 +330,15 @@ func (s *Service) sealCodexLogin(userID uuid.UUID, plaintext []byte) (sealed []b
 
 // Codex refresh timing observability (issue #1238). Secret-free structured slog fields that
 // let the pinned app-server external-auth budget be characterized: per-phase elapsed_ms
-// around the two serial provider calls and the durable commit, plus a service total. NEVER
-// logs a token, refresh token, ChatGPT account id, body, provider URL, or raw error text —
-// only elapsed integers, the non-secret operation_id, a fixed phase name, and a finite
-// result classification.
+// around the single oauth exchange and durable commit, plus a service total. NEVER logs a
+// token, refresh token, ChatGPT account id, body, provider URL, or raw error text, only
+// elapsed integers, the non-secret operation_id, a fixed phase name, and a finite result.
 const (
 	codexTimingMsgPhase   = "codex refresh phase"
 	codexTimingMsgService = "codex refresh service"
 
-	codexRefreshPhaseOAuthPost   = "oauth_post"
-	codexRefreshPhaseIdentityGet = "identity_get"
-	codexRefreshPhaseCommit      = "commit"
+	codexRefreshPhaseOAuthPost = "oauth_post"
+	codexRefreshPhaseCommit    = "commit"
 )
 
 // CodexTimingResult classifies a call's terminal error into a finite, secret-free token for
@@ -610,37 +632,28 @@ func (s *Service) advanceCodexRefresh(ctx context.Context, q codexRefreshStore, 
 		return CodexRefreshResult{Outcome: CodexRefreshQuarantined}, fmt.Errorf("%w: seal of refreshed login failed: %v", ErrCodexRefreshUnrecoverable, err)
 	}
 
-	// (6b) Post-refresh identity RE-VERIFICATION (audit #2), BEFORE the commit. A refresh
-	// token exchange can — through provider error, credential mix-up, or a hostile token —
-	// return an access token that belongs to a DIFFERENT account than the one we are
-	// rotating. Committing it would bind account A's row to account B's login and hand
-	// account B's token to account A's run. So re-read identity with a NONROTATING
-	// DiscoverIdentity and branch on the account's FROZEN tuple:
+	// (6b) Post-refresh identity differential, BEFORE the commit. Refresh decoded the
+	// freshly exchanged access token's narrow identity claims without another network call.
+	// Compare them with the account's FROZEN tuple:
 	//
-	//   - MATCH (both fields equal) → proceed to commit exactly as before.
-	//   - VERIFIED MISMATCH (discovery succeeded, tuple positively DIFFERS) → the material is
-	//     NOT account A's: do NOT commit and do NOT write it to the recovery slot (it would
-	//     poison a later promotion). Mark the intent unrecoverable, quarantine (owner+op
-	//     guarded), return NO token.
-	//   - INCOMPLETE (ErrIdentityIncomplete — an authenticated 2xx MISSING subject/workspace,
-	//     i.e. "cannot tell", NOT a positively-different tuple) OR ABSENCE (DiscoverIdentity
-	//     itself errored transiently — network/5xx) → we ALREADY spent account A's single-use
-	//     refresh token and CANNOT yet establish a mismatch, so the NEW material must be
-	//     RETAINED, not discarded: protect it in the recovery slot at from_generation and leave
-	//     the intent 'rotating' so a later promotion re-verifies it. Return NO token, but do NOT
-	//     claim recovery is impossible (PRD #1147 M4, defect 5).
-	identityStart := time.Now()
-	id, derr := s.codexRefresh.DiscoverIdentity(providerCtx, result.AccessToken)
-	logCodexRefreshPhase(operationID, codexRefreshPhaseIdentityGet, identityStart, derr)
-	switch {
-	case derr == nil && id.ProviderUserID == acct.ProviderUserID && id.WorkspaceAccountID == acct.WorkspaceAccountID:
-		// MATCH → fall through to the commit below.
-	case derr == nil:
-		// VERIFIED MISMATCH: discovery succeeded and the tuple positively differs.
+	//   - MATCH: chatgpt_account_id matches, and the two established user claim names are
+	//     non-empty, equal to each other, and equal to provider_user_id. Commit may proceed.
+	//   - VERIFIED USER MISMATCH: the two complete, equal user claims differ from
+	//     provider_user_id, regardless of account claim. Do not retain; quarantine.
+	//   - UNVERIFIED: malformed/missing/disagreeing user claims, or a missing/differing account
+	//     claim after the user matches, cannot decide the full tuple. Retain the material in
+	//     recovery and release no token. Recovery promotion still performs the full network
+	//     DiscoverIdentity verification outside the callback budget.
+	switch classifyCodexFreshIdentity(acct, result.IdentityClaims) {
+	case codexFreshIdentityMatch:
+		// MATCH: fall through to the commit below.
+	case codexFreshIdentityMismatch:
+		// This destructive verdict is sound only because codexauth decoded the token returned
+		// by Refresh's successful exchange against the fixed provider over TLS. A configurable
+		// oauth endpoint must not reuse this branch without a new authentication proof.
 		return s.codexQuarantineIdentityMismatch(ctx, q, userID, accountID, operationID)
 	default:
-		// ErrIdentityIncomplete ("cannot tell") OR a transient absence — both RETAIN.
-		return s.codexRetainUnverifiedMaterial(ctx, q, userID, accountID, operationID, acct.Generation, sealed, sealedWith, derr)
+		return s.codexRetainUnverifiedMaterial(ctx, q, userID, accountID, operationID, acct.Generation, sealed, sealedWith)
 	}
 
 	// (6c) Durable commit.
@@ -706,11 +719,10 @@ func (s *Service) handleCodexCommitFailure(ctx context.Context, q codexRefreshSt
 	return CodexRefreshResult{Outcome: CodexRefreshQuarantined}, fmt.Errorf("%w: commit failed: %v", ErrCodexRefreshQuarantined, commitErr)
 }
 
-// codexQuarantineIdentityMismatch resolves a post-refresh re-verification that returned a
-// VERIFIED answer the material FAILS (audit #2): DiscoverIdentity either resolved the
-// freshly-exchanged access token to a DIFFERENT account tuple, or reported an incomplete
-// identity. The material is not account A's, so it is NEITHER committed NOR written to the
-// recovery slot (a poisoned recovery blob would later mis-promote). The intent is marked
+// codexQuarantineIdentityMismatch resolves complete, internally consistent fresh-token user
+// claims that differ from the account's frozen provider user. The account claim is irrelevant
+// to this verified user mismatch. The material is neither committed nor written to recovery
+// (a poisoned recovery blob would later mis-promote). The intent is marked
 // unrecoverable (re-login required) and the account is quarantined (guarded on
 // in_progress + this op, so only the lease holder may park it). NO token is returned.
 func (s *Service) codexQuarantineIdentityMismatch(ctx context.Context, q codexRefreshStore, userID, accountID, operationID uuid.UUID) (CodexRefreshResult, error) {
@@ -719,16 +731,13 @@ func (s *Service) codexQuarantineIdentityMismatch(ctx context.Context, q codexRe
 	return CodexRefreshResult{Outcome: CodexRefreshQuarantined}, ErrCodexRefreshUnrecoverable
 }
 
-// codexRetainUnverifiedMaterial resolves a post-refresh re-verification whose OUTCOME is
-// unknown (audit #2, absence): DiscoverIdentity itself errored transiently, so we cannot
-// yet tell whether the exchanged material is account A's. Because the single-use refresh
-// token was ALREADY spent, discarding the new material would brick the account; instead it
-// is RETAINED in the recovery slot at from_generation (which also quarantines) and the
-// intent is LEFT 'rotating' so a later promotion re-verifies and installs it. Returns a
-// quarantined outcome with NO token — but recovery is possible, not lost. Should even the
-// recovery write fail, the outcome is truly unknown with no protected copy, so the intent
-// is marked unrecoverable.
-func (s *Service) codexRetainUnverifiedMaterial(ctx context.Context, q codexRefreshStore, userID, accountID, operationID uuid.UUID, fromGeneration int64, sealedMerged []byte, sealedWith string, discoverErr error) (CodexRefreshResult, error) {
+// codexRetainUnverifiedMaterial resolves fresh-token claims that cannot establish an
+// identity differential. Because the single-use refresh token was already spent, discarding
+// the new material would brick the account; instead it is retained in the recovery slot at
+// from_generation (which also quarantines) and the intent stays 'rotating' so a later
+// network verification can promote it. It returns no token. If the recovery write also
+// fails, no protected copy survives, so the intent becomes unrecoverable.
+func (s *Service) codexRetainUnverifiedMaterial(ctx context.Context, q codexRefreshStore, userID, accountID, operationID uuid.UUID, fromGeneration int64, sealedMerged []byte, sealedWith string) (CodexRefreshResult, error) {
 	// The recovery write is RESILIENT (detached ctx + bounded retry + background handoff, PRD
 	// #1147 M4 defect 4): a cancelled request ctx or a single transient DB blip must not drop
 	// the single-use material. Only an ESTABLISHED loss marks the intent unrecoverable.
@@ -736,7 +745,7 @@ func (s *Service) codexRetainUnverifiedMaterial(ctx context.Context, q codexRefr
 		s.markCodexIntentUnrecoverable(ctx, q, userID, operationID)
 		return CodexRefreshResult{Outcome: CodexRefreshQuarantined}, fmt.Errorf("%w: %v", ErrCodexRefreshUnrecoverable, perr)
 	}
-	return CodexRefreshResult{Outcome: CodexRefreshQuarantined}, fmt.Errorf("%w: identity re-verification unavailable: %v", ErrCodexRefreshQuarantined, discoverErr)
+	return CodexRefreshResult{Outcome: CodexRefreshQuarantined}, fmt.Errorf("%w: fresh access-token identity claims are unverified", ErrCodexRefreshQuarantined)
 }
 
 // persistCodexRecoverySlot writes freshly-rotated (single-use) codex material into the
