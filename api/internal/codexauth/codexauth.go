@@ -25,11 +25,13 @@ package codexauth
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -54,8 +56,11 @@ const DefaultClientID = "app_EMoamEEZ73f0CkXaXp7hrann"
 const maxBodyBytes = 1 << 20
 
 // ErrIdentityIncomplete is returned by DiscoverIdentity when the provider replied
-// 2xx but the identity is not fully determined: either user_id or account_id (or
-// both) was absent/empty. It is a sentinel so a caller can branch on "the login
+// 2xx but the identity is not fully determined. user_id is the sole provider-verified
+// anchor: absent/empty user_id is always incomplete. account_id is incomplete only
+// when it is absent from BOTH the usage response and the access-token JWT claim
+// (a personal ChatGPT seat omits it from the response, so the token claim is the
+// fallback source). It is a sentinel so a caller can branch on "the login
 // authenticated but we cannot yet name its account" without string-matching.
 var ErrIdentityIncomplete = errors.New("codexauth: provider identity incomplete")
 
@@ -91,8 +96,10 @@ type httpDoer interface {
 }
 
 // Identity is a Codex login's canonical account tuple. ProviderUserID is the
-// provider's user_id; WorkspaceAccountID is its account_id. Both are always
-// non-empty on a value returned by DiscoverIdentity.
+// provider's user_id; WorkspaceAccountID is its account_id — a workspace account id
+// from the usage response, or (for a personal ChatGPT seat, whose usage response
+// omits it) the chatgpt_account_id claim carried in the access-token JWT. Both are
+// always non-empty on a value returned by DiscoverIdentity.
 type Identity struct {
 	ProviderUserID     string
 	WorkspaceAccountID string
@@ -188,7 +195,9 @@ func (c *Client) requestContext(ctx context.Context) (context.Context, context.C
 
 // usageResponse is the subset of the usage endpoint's body we read. Both fields
 // are optional: the provider may omit either, and an omitted field decodes to the
-// empty string, which DiscoverIdentity treats as "identity incomplete".
+// empty string. An omitted user_id is "identity incomplete"; an omitted account_id
+// (a personal ChatGPT seat) triggers DiscoverIdentity's JWT-claim fallback rather
+// than being immediately incomplete.
 type usageResponse struct {
 	AccountID string `json:"account_id"`
 	UserID    string `json:"user_id"`
@@ -199,9 +208,13 @@ type usageResponse struct {
 // a caller can prove identity was established without spending a refresh (PRD
 // #1147 M1). accessToken is presented as a bearer credential.
 //
-//   - 2xx with BOTH user_id and account_id present → Identity{user_id, account_id}.
-//   - 2xx with either absent/empty → ErrIdentityIncomplete (the login authenticated
-//     but its account is not yet fully named).
+//   - 2xx: user_id is required — it is the sole provider-verified anchor and is never
+//     derived from the token. account_id comes from the usage response; when the
+//     response omits it (a personal ChatGPT seat), it falls back to the token's
+//     chatgpt_account_id claim (see accountIDFromAccessToken). With both a user_id and
+//     an account_id from either source → Identity{user_id, account_id}.
+//   - 2xx with user_id absent, or with no account_id from either source →
+//     ErrIdentityIncomplete (the login authenticated but its account is not yet fully named).
 //   - non-2xx (including 401) → *AuthError carrying the status.
 func (c *Client) DiscoverIdentity(ctx context.Context, accessToken string) (Identity, error) {
 	ctx, cancel := c.requestContext(ctx)
@@ -228,10 +241,54 @@ func (c *Client) DiscoverIdentity(ctx context.Context, accessToken string) (Iden
 	if err := json.NewDecoder(io.LimitReader(resp.Body, maxBodyBytes)).Decode(&body); err != nil {
 		return Identity{}, fmt.Errorf("codexauth: decode identity response: %w", err)
 	}
-	if body.UserID == "" || body.AccountID == "" {
+	if body.UserID == "" {
 		return Identity{}, ErrIdentityIncomplete
 	}
-	return Identity{ProviderUserID: body.UserID, WorkspaceAccountID: body.AccountID}, nil
+	accountID := body.AccountID
+	if accountID == "" {
+		// Fallback source for a personal ChatGPT seat, whose /wham/usage body omits
+		// account_id. The JWT is the caller-supplied bearer token itself, parsed ONLY
+		// here and ONLY AFTER /wham/usage returned 2xx for that same bearer — i.e.
+		// OpenAI already authenticated the token, so its signed claims are authentic
+		// and no local signature verification is needed. This argument also relies on
+		// the usage endpoint being the FIXED OpenAI-over-TLS endpoint (see NewClient);
+		// a future configurable endpoint, or the ChatGPT-Account-Id header hardening
+		// split to #1239, must revisit it. user_id is never derived from the token — it
+		// stays the sole provider-verified anchor.
+		accountID = accountIDFromAccessToken(accessToken)
+	}
+	if accountID == "" {
+		return Identity{}, ErrIdentityIncomplete
+	}
+	return Identity{ProviderUserID: body.UserID, WorkspaceAccountID: accountID}, nil
+}
+
+// accountIDFromAccessToken extracts the chatgpt_account_id claim from a ChatGPT
+// access-token JWT payload for the personal-seat fallback in DiscoverIdentity. It
+// parses ONLY the middle (payload) segment as unpadded base64url and reads the
+// "https://api.openai.com/auth".chatgpt_account_id claim; it deliberately verifies
+// NO signature (the token was already accepted by the provider on the preceding
+// /wham/usage 2xx). Any structural failure — not three segments, bad base64, bad
+// JSON, missing namespace, wrong claim type, empty value — returns "", so the
+// caller falls through to ErrIdentityIncomplete.
+func accountIDFromAccessToken(token string) string {
+	segments := strings.Split(token, ".")
+	if len(segments) != 3 {
+		return ""
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(segments[1])
+	if err != nil {
+		return ""
+	}
+	var claims struct {
+		Auth struct {
+			ChatGPTAccountID string `json:"chatgpt_account_id"`
+		} `json:"https://api.openai.com/auth"`
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return ""
+	}
+	return claims.Auth.ChatGPTAccountID
 }
 
 // refreshRequest is the JSON body of the oauth token exchange.
