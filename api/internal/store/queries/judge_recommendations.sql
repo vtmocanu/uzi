@@ -175,3 +175,51 @@ WHERE rv.user_id = @user_id
   AND rv.target_run_id = ANY(@run_ids::uuid[])
 ORDER BY rv.target_run_id
 LIMIT @lim;
+
+-- name: ListJudgeRecommendationRowsAll :many
+-- The ADMIN "All users" aggregate read (PRD #1184 M1): the cross-user twin of
+-- ListJudgeRecommendationRowsForUser above. It is a SEPARATE query with NO user predicate at
+-- ALL (decision log 2026-09-07), never a relaxation of the owner query — so the owner query's
+-- `WHERE rv.user_id = @user_id`, its owner-scoped `?run=` semi-join and every "IsAdmin is
+-- never consulted" comment stay literally true. The Risks section's leak (a future refactor
+-- merging the two behind a nullable user sentinel) is closed by keeping them disjoint.
+--
+-- ATTRIBUTION IS HIDDEN AT THE SQL LAYER — this is Success Criterion #2, the first of the
+-- four layers (§379's template). This projection deliberately OMITS run_title (r.issue_title),
+-- rec_id (rr.id), review_id (rv.id) and the filed issue's iid/url: none of them may reach an
+-- admin DTO. It projects rv.user_id and rv.target_run_id ONLY as opaque UUIDs the Go grouper
+-- (GroupJudgeRecommendationsAll) counts distinct values of — user_count and run_count — and
+-- then DROPS; neither ever reaches an occurrence DTO. The `runs` join the owner query added for
+-- issue_title is gone with run_title (it was 1:1 and projection-only, so removing it changes no
+-- row).
+--
+-- There is deliberately NO ?run= anchor on the admin path: an anchor names a run, which is
+-- attribution, and the notification deep-link is into the caller's OWN run (owner scope). The
+-- ?category= label filter and the LIMIT/cap are byte-identical to the owner query, and so is
+-- the ORDER BY, so the grouper's "a group's first row is its most-recent occurrence" contract
+-- and the truncation semantics carry over unchanged. Bucketing/grouping still happen entirely
+-- in Go through the shared BucketOf — no SQL CASE, no GROUP BY (§332).
+SELECT
+    rv.user_id                     AS user_id,
+    rv.target_run_id               AS run_id,
+    rv.verdict                     AS verdict,
+    rv.updated_at                  AS judged_at,
+    rr.category                    AS category,
+    rr.target                      AS target,
+    rr.rationale_md                AS rationale_md,
+    rr.confidence                  AS confidence,
+    d.status                       AS disposition_status,
+    d.set_via                      AS set_via,
+    (f.filed_at IS NOT NULL)::bool AS filed_settled
+FROM run_reviews rv
+JOIN review_recommendations rr ON rr.review_id = rv.id
+LEFT JOIN recommendation_dispositions d
+    ON d.review_id = rv.id AND d.category = rr.category AND d.target = rr.target
+LEFT JOIN recommendation_filed_issues f
+    ON f.review_id = rv.id AND f.category = rr.category AND f.target = rr.target
+WHERE (
+    sqlc.narg('categories')::text[] IS NULL
+    OR rr.category = ANY(sqlc.narg('categories')::text[])
+)
+ORDER BY rv.updated_at DESC, rv.created_at DESC, rv.id DESC, rr.created_at ASC, rr.id ASC
+LIMIT NULLIF(@lim::int, 0);

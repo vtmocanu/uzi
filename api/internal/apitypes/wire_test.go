@@ -382,6 +382,74 @@ func TestJudgeBacklogDTOTags(t *testing.T) {
 	assertTags(t, "JudgeBacklogDTO", JudgeBacklogDTO{}, "bucket", "run", "groups", "truncated", "triage")
 }
 
+// The admin "All users" aggregate DTOs (PRD #1184 M1). Their tag sets are the THIRD of the
+// four attribution-hiding layers (§379): the wire must carry no identifier at all. set_via is
+// omitempty on the occurrence exactly like JudgeOccurrenceDTO — absent on a zero value, present
+// only when a disposition provenance exists.
+func TestJudgeAdminOccurrenceDTOTags(t *testing.T) {
+	assertTags(t, "JudgeAdminOccurrenceDTO", JudgeAdminOccurrenceDTO{},
+		"judged_at", "verdict", "bucket")
+	// With a provenance set, set_via joins — the auto-done / admin-done shape.
+	assertTags(t, "JudgeAdminOccurrenceDTO(with set_via)", JudgeAdminOccurrenceDTO{SetVia: "admin"},
+		"judged_at", "verdict", "bucket", "set_via")
+}
+
+func TestJudgeAdminGroupDTOTags(t *testing.T) {
+	assertTags(t, "JudgeAdminGroupDTO", JudgeAdminGroupDTO{},
+		"category", "target", "bucket", "open_count", "run_count", "user_count",
+		"rationale_preview", "occurrences")
+}
+
+func TestJudgeAdminBacklogDTOTags(t *testing.T) {
+	assertTags(t, "JudgeAdminBacklogDTO", JudgeAdminBacklogDTO{},
+		"bucket", "groups", "truncated", "triage")
+}
+
+// TestJudgeAdminDTOsCarryNoIdentifier is Success Criterion #2 pinned on the wire: the admin
+// aggregate response must carry NO owner, run id, run title, review id, recommendation id,
+// user id or email — at ANY nesting level, on EVERY variant (an occurrence with set_via, a
+// populated group, a full backlog). The tag-set tests above pin the exact top-level keys;
+// this scans the FULL serialized JSON of a populated tree for the forbidden key names, so a
+// leak riding a nested struct is caught too. It is the tag-layer companion to the live-DB test
+// that scans for forbidden VALUES.
+func TestJudgeAdminDTOsCarryNoIdentifier(t *testing.T) {
+	forbidden := []string{
+		`"run_id"`, `"run_title"`, `"review_id"`, `"rec_id"`,
+		`"user_id"`, `"owner"`, `"owner_email"`, `"email"`, `"filed_issue"`,
+		`"issue_iid"`, `"issue_url"`,
+	}
+	// A populated tree that exercises every variant: a group with two occurrences (one carrying
+	// set_via), inside a full backlog with a triage tally.
+	backlog := JudgeAdminBacklogDTO{
+		Bucket: "todo",
+		Groups: []JudgeAdminGroupDTO{{
+			Category: "improve_uzi", Target: "docs", Bucket: "todo",
+			OpenCount: 1, RunCount: 2, UserCount: 2, RationalePreview: "because",
+			Occurrences: []JudgeAdminOccurrenceDTO{
+				{JudgedAt: time.Now(), Verdict: "issues", Bucket: "todo"},
+				{JudgedAt: time.Now(), Verdict: "ok", Bucket: "done", SetVia: "admin"},
+			},
+		}},
+		Truncated: false,
+		Triage:    TriageDTO{Total: 2, Todo: 1, Done: 1},
+	}
+	for _, v := range []any{
+		backlog,
+		JudgeAdminGroupDTO{Category: "c", Target: "t", Occurrences: []JudgeAdminOccurrenceDTO{{SetVia: "issue_close"}}},
+		JudgeAdminOccurrenceDTO{SetVia: "admin"},
+	} {
+		b, err := json.Marshal(v)
+		if err != nil {
+			t.Fatalf("marshal %T: %v", v, err)
+		}
+		for _, key := range forbidden {
+			if strings.Contains(string(b), key) {
+				t.Errorf("%T serialized with a forbidden identifier key %s — attribution must be hidden at the wire layer\njson: %s", v, key, b)
+			}
+		}
+	}
+}
+
 // The bulk fan-out's reply had NO wire pin at all until PRD #98 review BLK-UNDO, which is
 // why `settled` could be added without anything noticing the shape moved. `settled` is
 // deliberately NOT omitempty: a consumer must be able to distinguish "this call settled

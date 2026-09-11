@@ -459,6 +459,13 @@ type Store interface {
 	// runs join, the verdict/confidence/filed projection, the pushed-down ?run= anchor
 	// and a hard row cap.
 	ListJudgeRecommendationRowsForUser(ctx context.Context, arg store.ListJudgeRecommendationRowsForUserParams) ([]store.ListJudgeRecommendationRowsForUserRow, error)
+	// Admin "All users" aggregate reads (PRD #1184 M1): the cross-user twins of the two
+	// owner-scoped judge reads above, with NO user predicate at all. Separate queries (never a
+	// relaxation of the owner ones), and their projections hide attribution at the SQL layer —
+	// user_id/run_id are opaque count inputs the grouper drops, and run_title/rec_id/review_id/
+	// filed iid+url are never selected.
+	ListJudgeRecommendationRowsAll(ctx context.Context, arg store.ListJudgeRecommendationRowsAllParams) ([]store.ListJudgeRecommendationRowsAllRow, error)
+	ListJudgeTriageRowsAll(ctx context.Context) ([]store.ListJudgeTriageRowsAllRow, error)
 	// Judge menu bulk-disposition resolve (PRD #98 M2): the owner-scoped lookup of a set
 	// of (category, target) coordinates' member recommendations. It is the security
 	// boundary of the fan-out — the disposition is written off the rows it returns, never

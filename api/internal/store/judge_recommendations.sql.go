@@ -12,6 +12,106 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const listJudgeRecommendationRowsAll = `-- name: ListJudgeRecommendationRowsAll :many
+SELECT
+    rv.user_id                     AS user_id,
+    rv.target_run_id               AS run_id,
+    rv.verdict                     AS verdict,
+    rv.updated_at                  AS judged_at,
+    rr.category                    AS category,
+    rr.target                      AS target,
+    rr.rationale_md                AS rationale_md,
+    rr.confidence                  AS confidence,
+    d.status                       AS disposition_status,
+    d.set_via                      AS set_via,
+    (f.filed_at IS NOT NULL)::bool AS filed_settled
+FROM run_reviews rv
+JOIN review_recommendations rr ON rr.review_id = rv.id
+LEFT JOIN recommendation_dispositions d
+    ON d.review_id = rv.id AND d.category = rr.category AND d.target = rr.target
+LEFT JOIN recommendation_filed_issues f
+    ON f.review_id = rv.id AND f.category = rr.category AND f.target = rr.target
+WHERE (
+    $1::text[] IS NULL
+    OR rr.category = ANY($1::text[])
+)
+ORDER BY rv.updated_at DESC, rv.created_at DESC, rv.id DESC, rr.created_at ASC, rr.id ASC
+LIMIT NULLIF($2::int, 0)
+`
+
+type ListJudgeRecommendationRowsAllParams struct {
+	Categories []string `json:"categories"`
+	Lim        int32    `json:"lim"`
+}
+
+type ListJudgeRecommendationRowsAllRow struct {
+	UserID            uuid.UUID          `json:"user_id"`
+	RunID             uuid.UUID          `json:"run_id"`
+	Verdict           string             `json:"verdict"`
+	JudgedAt          pgtype.Timestamptz `json:"judged_at"`
+	Category          string             `json:"category"`
+	Target            string             `json:"target"`
+	RationaleMd       string             `json:"rationale_md"`
+	Confidence        string             `json:"confidence"`
+	DispositionStatus pgtype.Text        `json:"disposition_status"`
+	SetVia            pgtype.Text        `json:"set_via"`
+	FiledSettled      bool               `json:"filed_settled"`
+}
+
+// The ADMIN "All users" aggregate read (PRD #1184 M1): the cross-user twin of
+// ListJudgeRecommendationRowsForUser above. It is a SEPARATE query with NO user predicate at
+// ALL (decision log 2026-09-07), never a relaxation of the owner query — so the owner query's
+// `WHERE rv.user_id = @user_id`, its owner-scoped `?run=` semi-join and every "IsAdmin is
+// never consulted" comment stay literally true. The Risks section's leak (a future refactor
+// merging the two behind a nullable user sentinel) is closed by keeping them disjoint.
+//
+// ATTRIBUTION IS HIDDEN AT THE SQL LAYER — this is Success Criterion #2, the first of the
+// four layers (§379's template). This projection deliberately OMITS run_title (r.issue_title),
+// rec_id (rr.id), review_id (rv.id) and the filed issue's iid/url: none of them may reach an
+// admin DTO. It projects rv.user_id and rv.target_run_id ONLY as opaque UUIDs the Go grouper
+// (GroupJudgeRecommendationsAll) counts distinct values of — user_count and run_count — and
+// then DROPS; neither ever reaches an occurrence DTO. The `runs` join the owner query added for
+// issue_title is gone with run_title (it was 1:1 and projection-only, so removing it changes no
+// row).
+//
+// There is deliberately NO ?run= anchor on the admin path: an anchor names a run, which is
+// attribution, and the notification deep-link is into the caller's OWN run (owner scope). The
+// ?category= label filter and the LIMIT/cap are byte-identical to the owner query, and so is
+// the ORDER BY, so the grouper's "a group's first row is its most-recent occurrence" contract
+// and the truncation semantics carry over unchanged. Bucketing/grouping still happen entirely
+// in Go through the shared BucketOf — no SQL CASE, no GROUP BY (§332).
+func (q *Queries) ListJudgeRecommendationRowsAll(ctx context.Context, arg ListJudgeRecommendationRowsAllParams) ([]ListJudgeRecommendationRowsAllRow, error) {
+	rows, err := q.db.Query(ctx, listJudgeRecommendationRowsAll, arg.Categories, arg.Lim)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListJudgeRecommendationRowsAllRow{}
+	for rows.Next() {
+		var i ListJudgeRecommendationRowsAllRow
+		if err := rows.Scan(
+			&i.UserID,
+			&i.RunID,
+			&i.Verdict,
+			&i.JudgedAt,
+			&i.Category,
+			&i.Target,
+			&i.RationaleMd,
+			&i.Confidence,
+			&i.DispositionStatus,
+			&i.SetVia,
+			&i.FiledSettled,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listJudgeRecommendationRowsForUser = `-- name: ListJudgeRecommendationRowsForUser :many
 
 SELECT

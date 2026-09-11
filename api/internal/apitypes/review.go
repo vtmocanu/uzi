@@ -239,6 +239,67 @@ type JudgeBacklogDTO struct {
 	Triage    TriageDTO                     `json:"triage"`
 }
 
+// JudgeAdminOccurrenceDTO is one run's instance of a deduped recommendation in the ADMIN
+// "All users" aggregate (PRD #1184 M1). It is the attribution-hidden cousin of
+// JudgeOccurrenceDTO: it carries NO run_id, run_title, review_id or rec_id — none of them may
+// reach an admin read (Success Criterion #2), because a run id/title names a run and a rec/
+// review id is an address into one user's data. What survives is the per-run TRIAGE state
+// (bucket + provenance) and the judging time, which say how widespread and how settled a
+// coordinate is without saying whose it is.
+//
+// judged_at is the review's last-judging time (the backlog sort key); it is NOT omitempty,
+// matching JudgeOccurrenceDTO. verdict is the run_reviews.verdict enum. bucket comes from the
+// shared workersvc.BucketOf ladder. set_via is the disposition provenance ("issue_close",
+// "denied_cli", "admin", …), omitempty because a hand-set or absent disposition carries none —
+// the same rule as JudgeOccurrenceDTO.SetVia.
+type JudgeAdminOccurrenceDTO struct {
+	JudgedAt time.Time `json:"judged_at"`
+	Verdict  string    `json:"verdict"`
+	Bucket   string    `json:"bucket"`
+	SetVia   string    `json:"set_via,omitempty"`
+}
+
+// JudgeAdminGroupDTO is one (category, target) coordinate deduped across EVERY user's runs
+// (PRD #1184 M1) — the admin "All users" row. It mirrors JudgeRecommendationGroupDTO's
+// coordinate/bucket/open_count/run_count/rationale_preview shape but ADDS user_count (the
+// distinct owner count, the "K users" evidence chip) and carries attribution-hidden
+// occurrences. It deliberately has NO field for any identifier: no owner, user_id, run_id,
+// run_title, review_id or rec_id (the second of the four hiding layers, §379).
+//
+// OpenCount is the number of todo members, RunCount the distinct run count, UserCount the
+// distinct owner count. The backlog ranks by UserCount, then RunCount, then OpenCount — how
+// many people hit a pattern is the strongest cross-user priority signal. RationalePreview is
+// the most-recent occurrence's rationale_md, truncated and shipped as plain text exactly like
+// the owner DTO (the no-raw-render guarantee is client-side).
+type JudgeAdminGroupDTO struct {
+	Category         string                    `json:"category"`
+	Target           string                    `json:"target"`
+	Bucket           string                    `json:"bucket"`
+	OpenCount        int                       `json:"open_count"`
+	RunCount         int                       `json:"run_count"`
+	UserCount        int                       `json:"user_count"`
+	RationalePreview string                    `json:"rationale_preview"`
+	Occurrences      []JudgeAdminOccurrenceDTO `json:"occurrences"`
+}
+
+// JudgeAdminBacklogDTO is GET /api/admin/judge/recommendations (PRD #1184 M1): the admin
+// "All users" aggregate backlog, deduped by (category, target) across every user's runs, with
+// attribution hidden at four layers. It is the cross-user twin of JudgeBacklogDTO, minus the
+// Run echo (there is no ?run= anchor on the admin path — an anchor names a run).
+//
+// Bucket echoes the applied ?bucket= filter (default todo). Truncated says the read hit the
+// same hard row cap as the owner backlog (workersvc.JudgeBacklogMaxRows), with the same
+// caveat: the cut is pre-grouping, so a surviving group's counts may be understated and its
+// rollup wrong — never present a truncated page as authoritative. Triage is the canonical
+// all-users tally read from the separate ListJudgeTriageRowsAll query, never tallied from
+// Groups, so it stays whole even when the page is cut.
+type JudgeAdminBacklogDTO struct {
+	Bucket    string               `json:"bucket"`
+	Groups    []JudgeAdminGroupDTO `json:"groups"`
+	Truncated bool                 `json:"truncated"`
+	Triage    TriageDTO            `json:"triage"`
+}
+
 // JudgeDispositionResultDTO is the response to the bulk group-disposition fan-out
 // (PRD #98 M2, Decision 3).
 //

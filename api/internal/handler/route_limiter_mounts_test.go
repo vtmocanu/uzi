@@ -67,7 +67,10 @@ var limiterNames = [...]string{
 // error rather than a failing row. Spelled `lim*` rather than matching the parameter
 // names exactly, so nothing here shadows a parameter inside Routes.
 //
-// 184 as of this commit (PRD #1171 M1 added POST /api/worker/runs/{id}/codex/release and
+// 187 as of this commit (PRD #1184 M1 added GET /api/admin/judge/recommendations,
+// GET /api/admin/judge/stats and GET /api/admin/judge/category-stats — the admin "All users"
+// judge aggregate reads, mounted in the admin read group beside /admin/runs, all noLimiter.)
+// It was 184 until then (PRD #1171 M1 added POST /api/worker/runs/{id}/codex/release and
 // POST /api/worker/runs/{id}/codex/refresh — the Bearer-only Codex credential
 // release/refresh bridge, both worker-authenticated and both noLimiter, like the other
 // worker /runs/{id}/... routes they sit beside.)
@@ -237,6 +240,12 @@ var wantRouteMounts = []routeMount{
 	// like POST /{id}/privilege-check — it makes the same class of upstream forge
 	// reads (2 + 2×repos), so it draws from the forge pocket rather than none.
 	{"GET", "/api/admin/guardrail-impact", limForge},
+	// PRD #1184 M1: the admin "All users" judge aggregate reads — deduped recommendations,
+	// the cross-user triage strip and filter-chip counts. Reads of stored review rows, no
+	// forge call → noLimiter, like /admin/runs beside them.
+	{"GET", "/api/admin/judge/category-stats", noLimiter},
+	{"GET", "/api/admin/judge/recommendations", noLimiter},
+	{"GET", "/api/admin/judge/stats", noLimiter},
 	{"GET", "/api/admin/rate-limits", noLimiter},
 	{"GET", "/api/admin/runs", noLimiter},
 	{"GET", "/api/admin/agent-source", noLimiter},

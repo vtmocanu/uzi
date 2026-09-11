@@ -40,6 +40,16 @@ func (h *Handler) mountAdminRoutes(r chi.Router, forgeLimiter, authLimiter *mw.L
 			// Agents-status overview: every user's workers + active runs.
 			r.Get("/workers", h.AdminListWorkers)
 			r.Get("/runs", h.AdminListRuns)
+			// Admin "All users" judge aggregate reads (PRD #1184 M1): every user's judge
+			// recommendations deduped by (category, target) with attribution hidden, plus the
+			// cross-user triage strip and filter-chip counts. Separate handlers calling distinct
+			// all-users store methods (the AdminListRuns shape), so the owner /me/judge routes
+			// and queries stay byte-identical. CLI-reachable with a uza_ token; a masked uzc_ or
+			// a non-admin session is 403 by RequireAdminRO above. No ?run= anchor (an anchor
+			// names a run); writes/dispositions are a later milestone in the write group below.
+			r.Get("/judge/recommendations", h.AdminJudgeRecommendations)
+			r.Get("/judge/stats", h.AdminJudgeStats)
+			r.Get("/judge/category-stats", h.AdminJudgeCategoryStats)
 			// PRD #66 M9 (D8): the admin cross-user blocked-repos list. A read of the
 			// STORED privilege_report across all users (no forge call), so it carries no
 			// per-user limiter — same shape as /runs and /workers.
