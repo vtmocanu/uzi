@@ -1,0 +1,80 @@
+[
+  {
+    "name": "two-in-progress-unique-match",
+    "milestones": ["m1", "m2", "m3", "m4"],
+    "milestones_completed": ["m1"],
+    "milestones_in_progress": ["m3", "m2"],
+    "milestones_agents": [
+      { "id": "m2", "agent": "coder", "agent_label": "a" },
+      { "id": "m3", "agent": "tester", "agent_label": "b" }
+    ],
+    "activity_agent": "tester",
+    "expected": { "effective_ids": ["m2", "m3"], "unique_match_id": "m3" }
+  },
+  {
+    "name": "repeated-role-suppressed",
+    "milestones": ["m1", "m2", "m3", "m4"],
+    "milestones_completed": ["m1"],
+    "milestones_in_progress": ["m2", "m3"],
+    "milestones_agents": [
+      { "id": "m2", "agent": "coder", "agent_label": "a" },
+      { "id": "m3", "agent": "coder", "agent_label": "b" }
+    ],
+    "activity_agent": "coder",
+    "expected": { "effective_ids": ["m2", "m3"], "unique_match_id": null }
+  },
+  {
+    "name": "mixed-valid-and-stale-D6-refilter",
+    "milestones": ["m1", "m2", "m3", "m4"],
+    "milestones_completed": ["m1"],
+    "milestones_in_progress": ["m2"],
+    "milestones_agents": [
+      { "id": "m2", "agent": "coder", "agent_label": "a" },
+      { "id": "m3", "agent": "tester", "agent_label": "b" }
+    ],
+    "activity_agent": "coder",
+    "expected": { "effective_ids": ["m2"], "unique_match_id": "m2" }
+  },
+  {
+    "name": "null-attribution",
+    "milestones": ["m1", "m2", "m3", "m4"],
+    "milestones_completed": ["m1"],
+    "milestones_in_progress": ["m2", "m3"],
+    "milestones_agents": null,
+    "activity_agent": "coder",
+    "expected": { "effective_ids": [], "unique_match_id": null }
+  },
+  {
+    "name": "empty-attribution",
+    "milestones": ["m1", "m2", "m3", "m4"],
+    "milestones_completed": ["m1"],
+    "milestones_in_progress": ["m2", "m3"],
+    "milestones_agents": [],
+    "activity_agent": "coder",
+    "expected": { "effective_ids": [], "unique_match_id": null }
+  },
+  {
+    "name": "zero-match",
+    "milestones": ["m1", "m2", "m3", "m4"],
+    "milestones_completed": ["m1"],
+    "milestones_in_progress": ["m2", "m3"],
+    "milestones_agents": [
+      { "id": "m2", "agent": "coder", "agent_label": "a" },
+      { "id": "m3", "agent": "tester", "agent_label": "b" }
+    ],
+    "activity_agent": "reviewer",
+    "expected": { "effective_ids": ["m2", "m3"], "unique_match_id": null }
+  },
+  {
+    "name": "duplicate-id-first-valid-wins",
+    "milestones": ["m1", "m2", "m3", "m4"],
+    "milestones_completed": ["m1"],
+    "milestones_in_progress": ["m2"],
+    "milestones_agents": [
+      { "id": "m2", "agent": "coder", "agent_label": "a" },
+      { "id": "m2", "agent": "tester", "agent_label": "b" }
+    ],
+    "activity_agent": "coder",
+    "expected": { "effective_ids": ["m2"], "unique_match_id": "m2" }
+  }
+]
