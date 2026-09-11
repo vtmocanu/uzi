@@ -110,6 +110,15 @@ export class FakeApi {
     operation: "release" | "refresh";
     body: Record<string, unknown>;
   }> = [];
+  // PRD #1226 M4 (D6): the completion-hold endpoint. Records each request (run + body) and
+  // answers a configurable {run:{status}} at a configurable HTTP status — the worker keys its
+  // park order off the RETURNED status (paused ⇒ held), reading it off both a 200 and a 409.
+  readonly completionHoldRequests: Array<{
+    runId: string;
+    body: Record<string, unknown>;
+  }> = [];
+  private completionHoldStatus = "paused";
+  private completionHoldHttpStatus = 200;
 
   constructor(private readonly token: string) {
     this.server = http.createServer((req, res) => {
@@ -252,6 +261,13 @@ export class FakeApi {
   setPauseRequestedAck(runId: string, requested = true): void {
     if (requested) this.pauseRequestedRuns.add(runId);
     else this.pauseRequestedRuns.delete(runId);
+  }
+
+  /** PRD #1226 M4 (D6): set the {run:{status}} the completion-hold endpoint answers, and the HTTP
+   *  status it answers with (default 200; 409 models a refusal the client must NOT throw on). */
+  setCompletionHoldResponse(status: string, httpStatus = 200): void {
+    this.completionHoldStatus = status;
+    this.completionHoldHttpStatus = httpStatus;
   }
 
   /** Observe each /state report as it lands, so a test can react to a value the
@@ -434,6 +450,17 @@ export class FakeApi {
       if (o.httpStatus !== 200)
         return send(res, o.httpStatus, { error: "run not found for this worker" });
       return send(res, 200, { status: o.status ?? "running" });
+    }
+
+    // PRD #1226 M4 (D6): the completion-hold endpoint. Records the request and answers the
+    // configured {run:{status}} at the configured HTTP status (200 landed / 409 refused).
+    const holdMatch = /^\/api\/worker\/runs\/([^/]+)\/completion\/hold$/.exec(p);
+    if (req.method === "POST" && holdMatch) {
+      const runId = holdMatch[1] as string;
+      this.completionHoldRequests.push({ runId, body: json });
+      return send(res, this.completionHoldHttpStatus, {
+        run: { id: runId, status: this.completionHoldStatus },
+      });
     }
 
     return send(res, 404, { error: "not found", path: p });

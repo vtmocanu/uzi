@@ -553,6 +553,14 @@ type ClaimConfig struct {
 	// path; an un-upgraded worker ignores the key (but the M1/M2 hard claim clause prevents an
 	// incapable worker from claiming an interlocked run in the first place).
 	CompletionContractVersion *int `json:"completion_contract_version,omitempty"`
+	// ContractRevision is the FROZEN structural completion-contract revision (PRD #1226 M4,
+	// D5), read straight off runs.contract_revision. The worker echoes it VERBATIM in its
+	// completion permit request so the server can reject a revision drift (a contract re-freeze
+	// under the worker). nil for a legacy or non-interlocked run (the column is NULL until the
+	// contract freezes), so omitempty keeps such a claim byte-identical to today's. This is
+	// WORKER-ONLY claim config, deliberately NOT on the web RunDTO, so it touches no api-contract
+	// fixture (same as CompletionContractVersion above).
+	ContractRevision *int `json:"contract_revision,omitempty"`
 }
 
 // agentsFromTemplates maps stored templates to claim-payload agents, decoding

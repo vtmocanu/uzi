@@ -439,11 +439,18 @@ export interface RunContext {
    *  or a post-attempt budget/stall/wall/idle exhaustion, the executor routes here INSTEAD of
    *  throwing a terminal failure, so the run enters a recoverable hold that preserves its Git work
    *  rather than failing. M4 wires the real implementation (SetRunCompletionHold + captureHoldContext
-   *  + the fixed park order); in M3 the runner leaves it UNWIRED, so the executor falls back to the
+   *  + the fixed park order); when the runner leaves it UNWIRED the executor falls back to the
    *  legacy throw (the feature is rollout-OFF until #1232 and M3+M4 ship together, so an unwired
-   *  seam never fires in production). When present, the executor calls it, latches
-   *  {@link ExecutorResult.completionHeld}, and breaks so the runner skips finalization. */
-  enterCompletionHold?(reason: string): Promise<void>;
+   *  seam never fires in production).
+   *
+   *  Returns TRUE when the run ENTERED the verified hold (parked; the runner preserved the clone
+   *  and HOME and the caller latches {@link ExecutorResult.completionHeld} and breaks so the runner
+   *  skips finalization). Returns FALSE when the hold could NOT be entered — capture was never
+   *  verified, or the server did not ACK `paused` — so the run is KEPT LIVE and nothing was cleaned
+   *  up; the caller then falls through to the LEGACY terminal throw (never the destructive
+   *  cleanup). The implementation MUST NOT run the destructive clone/HOME cleanup on the false
+   *  path. */
+  enterCompletionHold?(reason: string): Promise<boolean>;
 }
 
 export interface ExecutorResult {

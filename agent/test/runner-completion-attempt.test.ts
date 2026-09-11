@@ -112,6 +112,13 @@ function makeCompletionCtx(
     interlock?: boolean;
     config?: RunContext["config"];
     worktreeFingerprint?: string | null;
+    // PRD #1226 M4: what the wired enterCompletionHold returns. true = it entered the verified
+    // hold (caller latches completionHeld + breaks); false = it could NOT hold (kept the run live)
+    // so the caller falls through to the legacy throw. Defaults true.
+    holdReturns?: boolean;
+    // PRD #1226 M4 (D3): from this iteration number on, reportIteration serves budgetExhausted:true
+    // (the server's steer). undefined ⇒ never served.
+    budgetExhaustedFromIteration?: number;
   } = {},
 ): CompletionProbe {
   const order: string[] = [];
@@ -138,8 +145,15 @@ function makeCompletionCtx(
     onSessionId: () => {},
     gatePlan: async () => approve,
     pullFollowUp: () => undefined,
-    reportIteration: (n) => {
+    reportIteration: async (n) => {
       iterations.push(n);
+      if (
+        opts.budgetExhaustedFromIteration !== undefined &&
+        n >= opts.budgetExhaustedFromIteration
+      ) {
+        return { budgetExhausted: true };
+      }
+      return undefined;
     },
     completionInterlock: opts.interlock ?? true,
     checkpoint: async () => {
@@ -158,6 +172,9 @@ function makeCompletionCtx(
     ctx.enterCompletionHold = async (reason) => {
       order.push("hold");
       holdReasons.push(reason);
+      // The runner's real enterCompletionHold returns true only when it entered the verified hold;
+      // false keeps the run live and the caller must fall through to the legacy throw.
+      return opts.holdReturns ?? true;
     };
   }
   return { ctx, order, attemptCalls, holdReasons, iterations };
@@ -340,5 +357,54 @@ describe("SdkExecutor completion interlock (PRD #1226 M3)", () => {
     const probe = makeCompletionCtx({ unmetScript: [["m1"]], wireHold: false });
     await assert.rejects(new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx), /completion blocked/);
     assert.strictEqual(probe.attemptCalls.length, 3, "still bounded by STALL_LIMIT even without the seam");
+  });
+
+  it("(h) a FALSE enterCompletionHold return falls back to the legacy throw (the run is not held)", async () => {
+    // PRD #1226 M4: the hold seam is WIRED but enterCompletionHold could not enter the hold
+    // (capture unverified, or the ACK was not `paused`) and returned false. The three-identical-
+    // attempt no-progress route must then throw the legacy REASON, NOT latch completionHeld.
+    const { queryFn } = fakeTurns([[submitPlan("plan"), resultSuccess()], [signalDone(), resultSuccess()]]);
+    const probe = makeCompletionCtx({ unmetScript: [["m1"]], holdReturns: false });
+    await assert.rejects(new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx), /completion blocked/);
+    assert.strictEqual(probe.holdReasons.length, 1, "the hold WAS attempted (routeCompletionHold called it)");
+    // The run is emphatically NOT marked held: a false return means keep-live-then-legacy-throw.
+    assert.strictEqual(probe.attemptCalls.length, 3, "still bounded by STALL_LIMIT");
+  });
+
+  it("(i) a POST-attempt served budget_exhausted steer routes to the hold", async () => {
+    // iter1: signal_done → attempt (unmet non-empty → completionAttempted=true, re-prompt). From
+    // iter2 the server serves budgetExhausted:true; the loop-top budget steer — post-attempt on an
+    // interlocked run — enters the hold with the budget reason, even though no WALL/IDLE tripped.
+    const { queryFn } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+      [assistantText("still working"), resultSuccess()],
+    ]);
+    const probe = makeCompletionCtx({
+      unmetScript: [["m1"]],
+      config: { max_iterations: 20 },
+      budgetExhaustedFromIteration: 2,
+    });
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.strictEqual(probe.holdReasons.length, 1, "the budget steer routed to the hold exactly once");
+    assert.match(probe.holdReasons[0]!, /completion budget exhausted/);
+    assert.ok(result.completionHeld, "completionHeld latched so the runner skips finalization");
+    assert.match(result.completionHeld!.reason, /completion budget exhausted/);
+  });
+
+  it("(i) a PRE-attempt served budget_exhausted steer does NOT route (no completion attempt yet)", async () => {
+    // The server serves budgetExhausted:true from iteration 1, BEFORE any completion attempt. The
+    // steer is gated on completionAttempted, so it must NOT hold; the run proceeds to signal_done
+    // and finalizes (empty unmet). This pins the completionAttempted gate on the budget steer.
+    const { queryFn } = fakeTurns([[submitPlan("plan"), resultSuccess()], [signalDone(), resultSuccess()]]);
+    const probe = makeCompletionCtx({
+      unmetScript: [[]], // empty unmet → finalize on the first attempt
+      config: { max_iterations: 20 },
+      budgetExhaustedFromIteration: 1,
+    });
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.deepStrictEqual(probe.holdReasons, [], "a pre-attempt budget steer must not hold");
+    assert.strictEqual(result.branch, "agent/issue-5", "the run finalized normally");
+    assert.strictEqual(result.completionHeld, undefined);
   });
 });

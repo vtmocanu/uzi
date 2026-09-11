@@ -648,6 +648,11 @@ export interface ClaimConfig {
    *  WORKER-ONLY claim config — deliberately NOT on the web RunDTO. Absent (a legacy run, or
    *  rollout OFF) ⇒ the worker runs the legacy path, byte-identical to today. */
   completion_contract_version?: number;
+  /** PRD #1226 M4 (D5): the FROZEN structural completion-contract revision, read straight off
+   *  runs.contract_revision. The worker echoes it VERBATIM in its completion permit request so
+   *  the server can reject a revision drift. WORKER-ONLY claim config (NOT the web RunDTO).
+   *  Absent (a legacy/non-interlocked run, or a contract not yet frozen) ⇒ no permit request. */
+  contract_revision?: number;
 }
 
 /**

@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
+import http from "node:http";
+import type { AddressInfo } from "node:net";
 import { FakeApi } from "./fake-api.js";
 import { makeClaim, nullLogger } from "./helpers.js";
 import { WorkerClient, RequestError, isTransient } from "../src/client.js";
@@ -577,5 +579,132 @@ describe("chat read surface (PRD #39 M3)", () => {
     assert.strictEqual(req.body.repo_path, "group/project");
     assert.strictEqual(p.status, "pending");
     assert.deepStrictEqual(p.labels, ["PRD"]);
+  });
+});
+
+// PRD #1226 M4 (D5/D6) — the completion permit + hold client calls. These are load-bearing to the
+// interlock's safety (the M4.2a reviewer flagged them as untested): the hold must read its status
+// off BOTH a 200 AND a 409 without throwing (the worker keys its park order off the returned
+// status), and a permit DENIAL is a 200 body (granted:false) the caller must not treat as an
+// error. A self-contained inline stub server (not FakeApi) lets each test pin the exact HTTP status
+// + body the client must tolerate.
+describe("completion permit + hold client calls (PRD #1226 M4)", () => {
+  interface Recorded {
+    method?: string;
+    path?: string;
+    body: Record<string, unknown>;
+  }
+  async function stubServer(
+    respond: (body: Record<string, unknown>) => { status: number; body: unknown },
+  ): Promise<{ url: string; requests: Recorded[]; close: () => Promise<void> }> {
+    const requests: Recorded[] = [];
+    const server = http.createServer((req, res) => {
+      let raw = "";
+      req.on("data", (c) => (raw += String(c)));
+      req.on("end", () => {
+        const body = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
+        requests.push({ method: req.method, path: req.url, body });
+        const { status, body: respBody } = respond(body);
+        res.writeHead(status, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(respBody));
+      });
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+    server.unref();
+    const { port } = server.address() as AddressInfo;
+    return {
+      url: `http://127.0.0.1:${port}`,
+      requests,
+      close: () => new Promise<void>((r) => server.close(() => r())),
+    };
+  }
+  function clientFor(url: string): WorkerClient {
+    return new WorkerClient(url, TOKEN, "0.1.0-test", nullLogger(), {
+      sleep: async () => {},
+      terminalRetrySchedule: [1, 1, 1],
+    });
+  }
+
+  it("requestCompletionHold reads status off a 200 body and sends the captured head", async () => {
+    const srv = await stubServer(() => ({ status: 200, body: { run: { status: "paused" } } }));
+    try {
+      const out = await clientFor(srv.url).requestCompletionHold("run-1", { head: "deadbeef" });
+      assert.deepStrictEqual(out, { status: "paused" }, "a landed hold reads status=paused");
+      const req = srv.requests.at(-1)!;
+      assert.strictEqual(req.method, "POST");
+      assert.match(req.path ?? "", /\/api\/worker\/runs\/run-1\/completion\/hold$/);
+      assert.strictEqual(req.body.head, "deadbeef", "the captured head H rides the request body");
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it("requestCompletionHold reads status off a 409 body WITHOUT throwing (hold refused, run retained)", async () => {
+    // A 409 means the server refused the hold; it is NOT an error here — the worker reads the
+    // returned status (not paused ⇒ retain the run) rather than the 409 throwing through postJSON.
+    const srv = await stubServer(() => ({ status: 409, body: { run: { status: "running" } } }));
+    try {
+      const out = await clientFor(srv.url).requestCompletionHold("run-1", { head: "abc123" });
+      assert.deepStrictEqual(out, { status: "running" }, "a 409 refusal returns the real status, no throw");
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it("requestCompletionPermit maps a granted 200 body to the permit", async () => {
+    const srv = await stubServer(() => ({
+      status: 200,
+      body: {
+        granted: true,
+        permit: {
+          id: "permit-1",
+          contract_revision: 1,
+          branch: "agent/issue-5",
+          head: "cafef00d",
+          issued_at: "2026-07-10T00:00:00Z",
+          finding_ids: ["f1", "f2"],
+        },
+      },
+    }));
+    try {
+      const out = await clientFor(srv.url).requestCompletionPermit("run-1", {
+        contractRevision: 1,
+        branch: "agent/issue-5",
+        head: "cafef00d",
+      });
+      assert.strictEqual(out.granted, true);
+      assert.ok(out.permit, "a granted decision carries the permit");
+      assert.strictEqual(out.permit!.id, "permit-1");
+      assert.strictEqual(out.permit!.contractRevision, 1);
+      assert.deepStrictEqual(out.permit!.findingIds, ["f1", "f2"]);
+      const req = srv.requests.at(-1)!;
+      assert.match(req.path ?? "", /\/api\/worker\/runs\/run-1\/completion\/permit$/);
+      assert.strictEqual(req.body.contract_revision, 1, "the frozen revision rides the permit request");
+      assert.strictEqual(req.body.head, "cafef00d");
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it("requestCompletionPermit maps a DENIED 200 body without throwing", async () => {
+    // Every denial is a NON-TERMINAL 200 body (granted:false + deny_reason), never a 4xx — the
+    // caller reworks/holds on the reason rather than treating it as a transport error.
+    const srv = await stubServer(() => ({
+      status: 200,
+      body: { granted: false, deny_reason: "missing_milestones", unmet: ["m1", "m2"] },
+    }));
+    try {
+      const out = await clientFor(srv.url).requestCompletionPermit("run-1", {
+        contractRevision: 1,
+        branch: "agent/issue-5",
+        head: "cafef00d",
+      });
+      assert.strictEqual(out.granted, false, "a denial is granted:false, not a throw");
+      assert.strictEqual(out.denyReason, "missing_milestones");
+      assert.deepStrictEqual(out.unmet, ["m1", "m2"]);
+      assert.strictEqual(out.permit, undefined, "a denial carries no permit");
+    } finally {
+      await srv.close();
+    }
   });
 });

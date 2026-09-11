@@ -72,6 +72,12 @@ import { REASON_NO_TOKEN, TransientRecoveryError } from "./sdk-executor.js";
  *  (forge.ts) so a runaway SDK error can't bloat the run row or the stream. */
 const MAX_FAILURE_REASON_LEN = 512;
 
+/** PRD #1226 M4 (D6): bounded in-call attempts to capture a VERIFIED completion-hold restore
+ *  point before giving up and keeping the run live. Mirrors handleRecoveryExhausted's retain-and-
+ *  retry, but bounded (this runs synchronously inside the executor's completion loop, not the
+ *  server-parked recovery loop). A never-verified capture returns false — never a park/cleanup. */
+const COMPLETION_HOLD_CAPTURE_ATTEMPTS = 3;
+
 /** PRD #1171 m4: a name-based CodexBoundaryError probe. The runner stays HARNESS-AGNOSTIC and
  *  never imports from agent/src/codex/**, so it recognizes the boundary-blocked error — thrown
  *  by the executor-owned safety facade when a durability sink could not reap/reconcile (sink
@@ -3131,6 +3137,11 @@ export class RunRunner {
           // loop-top pause branch reads it off `served`.
           if (typeof ack.pauseRequested === "boolean")
             b.pauseRequested = ack.pauseRequested;
+          // PRD #1226 M4 (D3): carry the server-decided budget_exhausted steer off the SAME ACK,
+          // beside pauseRequested, so a live post-attempt interlocked run learns it must enter the
+          // completion hold (the loop-top budget-steer branch reads it off `served`).
+          if (typeof ack.budgetExhausted === "boolean")
+            b.budgetExhausted = ack.budgetExhausted;
           // Without the scope/completed fields in this return guard, a non-budget-scaled
           // run's ACK (no budget fields) would return `undefined` and m3's loop-top gate at
           // `if (served)` would never see the ceiling. This is behavior-preserving for the
@@ -3141,7 +3152,8 @@ export class RunRunner {
             b.wallSeconds !== undefined ||
             b.scopeCeiling !== undefined ||
             b.completedCount !== undefined ||
-            b.pauseRequested !== undefined
+            b.pauseRequested !== undefined ||
+            b.budgetExhausted !== undefined
             ? b
             : undefined;
         } catch (e) {
@@ -3361,12 +3373,16 @@ export class RunRunner {
           head,
           worktreeFingerprint,
         }),
-      // PRD #1226 M4 wires enterCompletionHold — the recoverable completion-hold seam
-      // (SetRunCompletionHold + captureHoldContext + the fixed park order). Deliberately LEFT
-      // UNWIRED in M3: the executor treats it as optional and falls back to the legacy terminal
-      // throw when it is absent, so a repeated-no-progress or post-attempt exhaustion fails as
-      // today until M4 lands. The feature is rollout-OFF (completion_interlock_rollout defaults
-      // OFF) until #1232 and M3+M4 ship together, so this unwired seam never fires in production.
+      // PRD #1226 M4 (D3/D6): the recoverable completion-hold seam is now WIRED. On a repeated
+      // no-progress completion attempt, a post-attempt budget/stall/wall/idle exhaustion, or the
+      // server's budget_exhausted steer, the executor calls this INSTEAD of throwing a terminal
+      // failure. enterCompletionHold reaps, captures a VERIFIED same-worker restore point, requests
+      // the hold, and returns true ONLY on a `paused` ACK (parked; the finally preserves the clone
+      // and HOME); false keeps the run LIVE with nothing cleaned up, so the executor falls back to
+      // the legacy throw. The feature is rollout-OFF (completion_interlock_rollout defaults OFF)
+      // until #1232, so this seam is inert in production — completionInterlock above is false.
+      enterCompletionHold: (reason) =>
+        this.enterCompletionHold(flight, claim, reason, runLog),
     };
 
     // PRD #1064 M1: drain the per-run running-report chain before this phase yields control,
@@ -4213,6 +4229,199 @@ export class RunRunner {
       });
     }
     return { verified, published };
+  }
+
+  /**
+   * PRD #1226 M4 (D3/D6): enter the recoverable COMPLETION HOLD. Modeled on
+   * handleRecoveryExhausted (the hold-loop template) with the D6 FIXED park order:
+   *   1. reap the agent tree (REAP-BEFORE-GIT, before any credentialed capture git).
+   *   2. set the preserve flags FIRST so no cleanup can strand the clone/session while capture or
+   *      the hold ACK is still uncertain — the retain-everything default is set before any
+   *      destructive possibility and NEVER cleared (AC safety invariant).
+   *   3-5. captureHoldContext (WIP-commit dirty → fetch-back → verifyRunnerTrackingCovers, REQUIRE
+   *      verified; publish best-effort) with a bounded retry; a never-verified capture returns
+   *      false WITHOUT requesting a hold and WITHOUT cleanup — the live clone is retained.
+   *   6. client.requestCompletionHold({head}) and REQUIRE the RETURNED status === "paused" (the
+   *      positive-ack contract, the same as the pause park). A non-paused status or a thrown error
+   *      keeps the run live with everything retained.
+   *   7. only after a paused ACK: mark the flight parked (so the finally's park carve-out preserves
+   *      the HOME + plugin dir, the clone staying via preserveRecoveryClone) and return true.
+   *
+   * Returns true = ENTERED the verified hold (parked; phasePublish's completionHeld branch
+   * finalizes nothing and the finally preserves the clone + HOME for a same-worker resume). Returns
+   * false = could NOT capture a verified restore point OR the hold ACK was not `paused`, so the run
+   * is KEPT LIVE and NOTHING is cleaned up (the executor falls back to the legacy terminal throw).
+   * The destructive clone/HOME cleanup NEVER runs from here — retention is set up front and held.
+   * `reason` is a content-free failure-reason constant, never raw model output.
+   */
+  private async enterCompletionHold(
+    flight: RunFlight,
+    claim: ClaimResponse,
+    reason: string,
+    runLog: Logger,
+  ): Promise<boolean> {
+    // 1. Reap the agent tree BEFORE any credentialed capture git (REAP-BEFORE-GIT), exactly like
+    //    handleRecoveryExhausted. Idempotent — phasePublish's completionHeld branch reaps again.
+    flight.executor.killAgentTree?.();
+    // 2. Retain EVERYTHING up front: the runner clone is the only copy of the run's work until the
+    //    tracking ref verifiably covers HEAD, and the session HOME must survive the same-worker
+    //    resume. Set before any destructive possibility and NEVER cleared, so an uncertain capture
+    //    or a refused hold ACK can never strand the work (AC: no hold cleans the only Git work copy
+    //    when capture or acknowledgement is uncertain).
+    flight.preserveRecoveryClone = true;
+    flight.preserveSession = true;
+    // 3-5. Capture a VERIFIED same-worker restore point, retrying bounded (like recovery's retain-
+    //    and-retry, but bounded — this runs inside the executor's completion loop). An unverified
+    //    capture retains the live clone and does NOT request a hold or clean up anything.
+    let captured:
+      | { verified: boolean; published: boolean; mode: "same_worker_only"; head: string | null }
+      | undefined;
+    for (let attempt = 0; attempt < COMPLETION_HOLD_CAPTURE_ATTEMPTS; attempt++) {
+      if (flight.active?.shuttingDown || flight.steering.isCancelled()) break;
+      try {
+        const result = await this.captureHoldContext(claim, flight, runLog);
+        if (result.verified) {
+          captured = result;
+          break;
+        }
+      } catch (captureError) {
+        runLog.warn("completion hold capture failed; retaining live work for retry", {
+          error: errMessage(captureError),
+        });
+      }
+      if (attempt < COMPLETION_HOLD_CAPTURE_ATTEMPTS - 1) await this.waitRecoveryRetry(flight);
+    }
+    if (!captured || captured.head === null) {
+      runLog.warn(
+        "completion hold: restore point never verified; keeping the run live (no hold requested, nothing cleaned up)",
+        { run_id: flight.runId },
+      );
+      return false;
+    }
+    // 6. Request the hold and REQUIRE the RETURNED status to be literally "paused" (the positive-
+    //    ack contract, keyed off the returned status exactly like the pause park — never off
+    //    `applied`). requestCompletionHold reads the status off BOTH a 200 and a 409 body without
+    //    throwing; a non-paused status or a real transport error keeps the run live, retained.
+    const head = captured.head;
+    let status: string;
+    try {
+      ({ status } = await this.client.requestCompletionHold(flight.runId, { head }));
+    } catch (holdError) {
+      runLog.warn("completion hold: hold request failed; keeping the run live with its work retained", {
+        run_id: flight.runId,
+        error: errMessage(holdError),
+      });
+      return false;
+    }
+    if (status !== "paused") {
+      runLog.warn("completion hold: server did not park the run; keeping it live with its work retained", {
+        run_id: flight.runId,
+        server_status: status || "unknown",
+      });
+      return false;
+    }
+    // 7. Durably held. Mark the flight parked so the finally's park carve-out preserves the HOME and
+    //    plugin dir for the same-worker resume (the clone stays via preserveRecoveryClone, set
+    //    above). phasePublish's completionHeld branch reaps again (idempotent) and skips finalize.
+    flight.parked = true;
+    runLog.info("run entered the recoverable completion hold; preserving its clone and HOME for resume", {
+      run_id: flight.runId,
+      reason,
+      published: captured.published,
+      head,
+    });
+    return true;
+  }
+
+  /**
+   * PRD #1226 M4 (D6): capture a VERIFIED same-worker-only completion-hold restore point. Modeled
+   * on captureRecoveryRestorePoint: worktreeStatus (null ⇒ unverified) → dirty? commitWipMarker
+   * (require committed) → fetchAgentBranch (throws on fail) → verifyRunnerTrackingCovers (POSITIVE
+   * verify) → publishCheckpointBestEffort (SEPARATE, best-effort). Returns an explicit
+   * `same_worker_only` result whose `head` is the captured tracking tip (via git.trackingTip) after
+   * a verified capture. `verified:false` (with `head:null`) means the source clone remains the only
+   * authoritative copy — the caller retains it and never requests a hold. `published:false` is
+   * acceptable (the local verified capture is what gates "captured"); a same-worker resume reseeds
+   * from the worker-owned tracking ref, not from origin.
+   */
+  private async captureHoldContext(
+    claim: ClaimResponse,
+    flight: RunFlight,
+    runLog: Logger,
+  ): Promise<{ verified: boolean; published: boolean; mode: "same_worker_only"; head: string | null }> {
+    const NONE = {
+      verified: false,
+      published: false,
+      mode: "same_worker_only" as const,
+      head: null,
+    };
+    const barePath = flight.barePath;
+    const worktreePath = flight.worktreePath;
+    const branch = flight.branch;
+    if (!barePath || !worktreePath || !branch) {
+      runLog.warn("completion hold capture skipped: no clone paths on the flight; nothing to capture");
+      return NONE;
+    }
+    // Distinguish dirty vs clean EXPLICITLY (runner-uid porcelain) rather than trusting
+    // commitWipMarker's ambiguous false. A null (unreadable) status cannot assert clean ⇒ not
+    // verified: retain the clone and retry.
+    const status = await this.git.worktreeStatus(worktreePath);
+    if (status === null) {
+      runLog.warn("completion hold capture: worktree status unreadable (cannot assert clean)");
+      return NONE;
+    }
+    if (status.length > 0) {
+      // DIRTY → commit the WIP marker and REQUIRE it committed; a false here is unambiguously a
+      // commit FAILURE (we already know the tree is dirty), so the local restore point is not
+      // verified for this attempt.
+      const committed = await this.git.commitWipMarker(worktreePath);
+      if (!committed) {
+        runLog.warn("completion hold capture: WIP commit of a dirty tree failed");
+        return NONE;
+      }
+    }
+    // Fetch the run's tip into the worker bare's tracking ref (refs/uzi-runner/<branch>).
+    // fetchAgentBranch THROWS on failure (unlike the void fetchBackBestEffort), so a failed
+    // fetch-back is caught here rather than swallowed.
+    try {
+      await this.git.fetchAgentBranch(barePath, worktreePath, branch, flight.runId);
+    } catch (e) {
+      runLog.warn("completion hold capture: fetch-back failed", { error: errMessage(e) });
+      return NONE;
+    }
+    // POSITIVELY VERIFY the LOCAL restore point: the bare's tracking ref now covers the run's
+    // current HEAD (incl. any WIP marker), so a same-worker reseed recovers exactly this tip.
+    const verified = await this.git.verifyRunnerTrackingCovers(barePath, worktreePath, branch);
+    if (!verified) return NONE;
+    // The captured head is the verified tracking tip. A verified ref whose tip is unresolvable is
+    // treated as unverified (retain) — the hold contract requires a real head H for the permit.
+    const head = await this.git.trackingTip(barePath, branch);
+    if (head === null) {
+      runLog.warn("completion hold capture: tracking ref verified but its tip is unresolvable");
+      return NONE;
+    }
+    // Remote publish is SEPARATE and best-effort. The agent tree was already reaped by the caller
+    // (enterCompletionHold's killAgentTree), so the overlay's PAT default-fetch is permitted; for a
+    // Codex run the publish runs under the finalize-class boundary facade (withCodexBoundaryOnly),
+    // idempotent like the recovery path. A blocked boundary leaves `published` false — the restore
+    // point is still VERIFIED locally, which is what gates "captured".
+    let published = false;
+    try {
+      await this.withCodexBoundaryOnly(
+        flight.executor,
+        { boundary: "shutdown", deadlineMs: this.codexBoundaryDeadlineMs },
+        async (permit) => {
+          const overlay = await this.buildCheckpointOverlay(claim, flight, barePath);
+          published = await this.publishCheckpointBestEffort(flight, barePath, branch, overlay, permit?.signal);
+        },
+      );
+    } catch (err) {
+      if (!isCodexBoundaryError(err)) throw err;
+      runLog.warn("completion hold checkpoint boundary blocked; restore point saved locally but not published", {
+        error: errMessage(err),
+      });
+    }
+    return { verified: true, published, mode: "same_worker_only", head };
   }
 
   /**

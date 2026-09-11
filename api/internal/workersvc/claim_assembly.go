@@ -463,6 +463,10 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			// completion protocol; nil (legacy run / rollout OFF) ⇒ omitted, legacy path. This
 			// is WORKER-ONLY claim config, NOT the web RunDTO, so it touches no api-contract fixture.
 			CompletionContractVersion: intPtr(run.CompletionContractVersion),
+			// PRD #1226 M4 (D5): the frozen structural contract revision, read straight off
+			// runs.contract_revision. The worker echoes it in its completion permit request; nil
+			// (legacy / non-interlocked / contract not yet frozen) ⇒ omitted, same as above.
+			ContractRevision: intPtr(run.ContractRevision),
 		},
 	}
 

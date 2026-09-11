@@ -167,6 +167,12 @@ const REASON_NO_PROGRESS =
 // enterCompletionHold instead, which parks the run without failing it.
 const REASON_COMPLETION_NO_PROGRESS =
   "completion blocked: the lead declared the run complete but the frozen completion contract still has unmet milestones, and repeated completion attempts made no progress (the same unmet set, branch head and worktree across attempts). Held for an owner decision rather than shipping an incomplete run.";
+// PRD #1226 M4 (D3): the SERVER's budget-exhausted steer reason. Static and content-free (safe to
+// persist as failure_reason on the legacy throw fallback). A live POST-attempt interlocked run the
+// server has flagged past its completion budget enters the hold with this reason PROACTIVELY at the
+// loop top, even if the worker's own WALL/IDLE has not tripped.
+const REASON_COMPLETION_BUDGET_EXHAUSTED =
+  "completion budget exhausted: the server flagged this run past its completion budget after a completion attempt. Held for an owner decision rather than continuing to spend budget.";
 
 // issue #1197 (D-RC2b): bounded, budget-safe in-process retries on a POSITIVELY-EMPTY
 // SDK turn (0 turns, no model activity, no plan/questions/done). ONLY a positively-empty
@@ -1930,6 +1936,23 @@ export class SdkExecutor implements Executor {
             break;
           }
         }
+        // PRD #1226 M4 (D3): the SERVER's budget-exhausted steer. A LIVE post-attempt interlocked
+        // run the server has flagged past its completion budget (served.budgetExhausted, off the
+        // SAME running-report ACK as pauseRequested) enters the completion hold PROACTIVELY here —
+        // even if the worker's own WALL/IDLE has not tripped. GATED on completionAttempted so a
+        // PRE-attempt budget flag never holds (there is no captured completion state to preserve
+        // yet, and the legacy wall/idle terminal path still owns a real pre-attempt exhaustion). A
+        // false hold verdict (capture unverified, or the server did not ACK `paused`) falls through
+        // and the run CONTINUES, exactly like a declined pause — never a destructive cleanup.
+        if (
+          served?.budgetExhausted &&
+          ctx.completionInterlock &&
+          completionAttempted &&
+          (await this.routeCompletionHold(ctx, REASON_COMPLETION_BUDGET_EXHAUSTED, completionAttempted))
+        ) {
+          completionHeld = { reason: REASON_COMPLETION_BUDGET_EXHAUSTED };
+          break;
+        }
         ctx.emit({
           kind: "status",
           agent: "worker",
@@ -3126,13 +3149,14 @@ export class SdkExecutor implements Executor {
   }
 
   /**
-   * PRD #1226 M3 (D3): route a post-attempt terminal reason to the COMPLETION HOLD when the run
+   * PRD #1226 M3/M4 (D3): route a post-attempt terminal reason to the COMPLETION HOLD when the run
    * has recorded at least one completion attempt AND the hold seam is wired, else fall back to the
-   * legacy throw. Returns true when it entered the hold (the caller latches completionHeld and
-   * breaks); false when it did not (the caller throws Error(reason) exactly as before). In M3 the
-   * runner leaves ctx.enterCompletionHold UNWIRED, so this always returns false in production and
-   * the legacy terminal behavior is unchanged; M4 wires it so a post-attempt exhaustion parks
-   * without failing. `attempted` is the loop's completionAttempted latch.
+   * legacy throw. Returns the HOLD'S OWN verdict: true when the run ENTERED the verified hold (the
+   * caller latches completionHeld and breaks); false when the hold was NOT entered — the seam is
+   * unwired (M3 / rollout OFF), no attempt has run yet, OR the wired hold could not capture/ACK
+   * `paused` and kept the run LIVE — so the caller throws Error(reason) exactly as before. The
+   * false path never runs the destructive cleanup (the hold impl owns that invariant). `attempted`
+   * is the loop's completionAttempted latch.
    */
   private async routeCompletionHold(
     ctx: RunContext,
@@ -3140,8 +3164,7 @@ export class SdkExecutor implements Executor {
     attempted: boolean,
   ): Promise<boolean> {
     if (attempted && ctx.enterCompletionHold) {
-      await ctx.enterCompletionHold(reason);
-      return true;
+      return await ctx.enterCompletionHold(reason);
     }
     return false;
   }
