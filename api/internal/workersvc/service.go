@@ -1059,6 +1059,18 @@ type CapabilityScheduleReader interface {
 	CapabilityAwareScheduling(ctx context.Context) (bool, error)
 }
 
+// CompletionInterlockReader is the narrow settings view createRun reads for the
+// completion-interlock rollout switch (PRD #1226 M1, D1). *settings.Cache satisfies it.
+// Kept its own interface (interface segregation, like CapabilityScheduleReader) so a
+// test exercises only what it uses. Optional (nil-safe): a nil reader — or a read error
+// — DEFAULTS the flag OFF (the DELIBERATE opposite of CapabilityScheduleReader's
+// default-on), so a new run is interlocked ONLY on an affirmative "true". This gate must
+// not accidentally engage a still-rolling-out feature, so both the unconfigured and the
+// unreadable case fail safe to legacy (unstamped) runs.
+type CompletionInterlockReader interface {
+	CompletionInterlockRollout(ctx context.Context) (bool, error)
+}
+
 // Service holds the store, the secret cipher, and the runtime params.
 type Service struct {
 	q   Store
@@ -1112,6 +1124,13 @@ type Service struct {
 	// the flag DEFAULTS ON, so tests and deployments without a settings cache route
 	// capability-aware exactly as a live instance whose admin left the default in place.
 	capabilitySettings CapabilityScheduleReader
+	// completionInterlock reads the completion-interlock rollout switch createRun consults
+	// to decide whether to stamp completion_contract_version=1 on a new issue run (PRD
+	// #1226 M1, D1). Optional (nil-safe); set via SetCompletionInterlockSettings with the
+	// same settings cache the HTTP handlers hold. Nil ⇒ the flag DEFAULTS OFF, so tests and
+	// deployments without a settings cache create legacy (unstamped) runs exactly as before
+	// — the fail-safe direction, opposite the capability-aware default-on.
+	completionInterlock CompletionInterlockReader
 	// persistFail counts consecutive AppendMessages failures per run (PRD #108 M4),
 	// the signal a persistence wedge cannot suppress because the wedge IS the event
 	// being counted. Always non-nil (New constructs it).
@@ -1220,6 +1239,15 @@ func (s *Service) SetDockerAllowlist(r DockerAllowlistReader) { s.dockerAllowlis
 // safe rather than a silent disable.
 func (s *Service) SetCapabilitySettings(r CapabilityScheduleReader) { s.capabilitySettings = r }
 
+// SetCompletionInterlockSettings wires the completion-interlock rollout-switch reader
+// createRun consults (PRD #1226 M1, D1). Call once at startup, before serving, with the
+// same settings cache the HTTP handlers hold. Nil (the default in tests) defaults the flag
+// OFF — new runs are created legacy/unstamped — so the omission is a safe no-op rather than
+// a silent enable.
+func (s *Service) SetCompletionInterlockSettings(r CompletionInterlockReader) {
+	s.completionInterlock = r
+}
+
 // SetForgeBaseURLAllowed wires the SSRF gate for the M8 checkpoint-publish path
 // (PRD #122). Call once at startup with config.Config.ForgeBaseURLAllowed. Leaving
 // it unset (nil) makes Publish refuse — it is a loud misconfiguration, never
@@ -1290,7 +1318,7 @@ func New(q Store, box *secretbox.Box, p Params) *Service {
 // awaiting_input forever, pointing at execution that no longer exists, with its
 // worker-held answer deadline gone and no user-visible signal — on the ordinary
 // restart path this comment already names.
-func (s *Service) Register(ctx context.Context, wkr store.Worker, version, template string, maxConcurrentRuns *int, capabilities []string) (store.Worker, error) {
+func (s *Service) Register(ctx context.Context, wkr store.Worker, version, template string, maxConcurrentRuns *int, capabilities []string, protocolCapabilities []string) (store.Worker, error) {
 	max := int32(s.p.RunMaxRequeues) //nolint:gosec // G115: RunMaxRequeues is a small bounded config int (env RUN_MAX_REQUEUES), never near int32 range
 	orphanFailed, err := s.q.FailWorkerRunsOverCap(ctx, store.FailWorkerRunsOverCapParams{
 		FailureReason: pgconv.TextOrNull("worker restarted; run orphaned and out of re-queue budget"),
@@ -1327,12 +1355,22 @@ func (s *Service) Register(ctx context.Context, wkr store.Worker, version, templ
 	// validation, dedupe, and stable order — so the column stays authoritative and a
 	// later milestone's peer subquery can read workers.capabilities directly.
 	storedCaps := capability.Filter(append(capability.SelfReportable(capabilities), capability.TemplateCapabilities(template)...))
+	// protocolCaps is the STORED protocol set (PRD #1226 M1, D2): the worker's
+	// self-reported protocol capabilities, passed through the server-owned
+	// capability.FilterProtocol for vocabulary validation, dedupe and stable order — so
+	// a garbled/hostile report cannot smuggle an arbitrary protocol string in. It is
+	// kept SEPARATE from storedCaps and written to workers.protocol_capabilities, the
+	// column the ClaimRun hard clause reads directly. Overwritten on every register (the
+	// fresh-start signal), so a downgraded image that stops reporting the protocol loses
+	// it here — which correctly makes it unable to claim an interlocked run.
+	protocolCaps := capability.FilterProtocol(protocolCapabilities)
 	row, err := s.q.RegisterWorker(ctx, store.RegisterWorkerParams{
-		Version:           pgconv.TextOrNull(version),
-		TemplateReported:  pgconv.TextOrNull(template),
-		Capabilities:      storedCaps,
-		MaxConcurrentRuns: pgconv.Int4Ptr(maxConcurrentRuns),
-		ID:                wkr.ID,
+		Version:              pgconv.TextOrNull(version),
+		TemplateReported:     pgconv.TextOrNull(template),
+		Capabilities:         storedCaps,
+		ProtocolCapabilities: protocolCaps,
+		MaxConcurrentRuns:    pgconv.Int4Ptr(maxConcurrentRuns),
+		ID:                   wkr.ID,
 	})
 	if err != nil {
 		return store.Worker{}, err
@@ -1497,6 +1535,12 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker) (*ClaimPayload, e
 		DockerRepoAllowlist: allowlist,
 		WorkerCaps:          wkr.Capabilities,
 		CapabilityAware:     capabilityAware,
+		// PRD #1226 M1 (D2): the claiming worker's self-reported protocol capabilities,
+		// read by the non-bypassable completion-protocol clause in ClaimRun. An interlocked
+		// run is claimable only when this set contains 'completion_interlock_v1'; a legacy
+		// run is unaffected. Deliberately NOT folded into WorkerCaps — it is a separate
+		// column and a separate, override-proof clause.
+		WorkerProtocolCaps: wkr.ProtocolCapabilities,
 		// PRD #529 Decision 4: an ephemeral worker may claim only its bound run.
 		IsEphemeral:           wkr.Ephemeral,
 		EphemeralRunID:        wkr.EphemeralRunID,
@@ -2586,6 +2630,30 @@ func (s *Service) runningStateParams(ctx context.Context, run store.Run, req Sta
 	// is unioned server-side, in_progress overwritten. Additive-optional, never fails the
 	// report.
 	p.MilestonesCompleted, p.MilestonesInProgress = progressParams(run.Kind, run.MilestonesFrozen, req.MilestonesCompleted, req.MilestonesInProgress)
+
+	// PRD #1226 M1 (D1): for an INTERLOCKED autopilot run that has not yet frozen its
+	// contract, build the structural completion contract to freeze on this `running` report
+	// from the SAME 3-way frozen source the query resolves —
+	// COALESCE(milestones_frozen, this report's frozen list, milestones_candidate). Guarded
+	// on version-set AND contract-not-yet-frozen so an ordinary heartbeat after the freeze
+	// rebuilds nothing; the query independently guards the assignment (freezes once,
+	// idempotently), so a heartbeat that DID rebuild would still be a no-op. Best-effort: a
+	// corrupt milestone column logs and passes NULL rather than failing the running report.
+	if run.CompletionContractVersion.Valid && len(run.CompletionContract) == 0 {
+		src := run.MilestonesFrozen
+		if len(src) == 0 {
+			src = p.MilestonesFrozen
+		}
+		if len(src) == 0 {
+			src = run.MilestonesCandidate
+		}
+		contract, err := buildCompletionContract(src)
+		if err != nil {
+			slog.Warn("workersvc: build completion contract on running report failed", "run_id", run.ID, "error", err)
+		} else {
+			p.CompletionContract = contract
+		}
+	}
 
 	if req.RepoAgents != nil {
 		if err := validateRepoAgents(*req.RepoAgents); err != nil {
@@ -3745,6 +3813,17 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 			}
 		}
 	}
+	// PRD #1226 M1 (D1): stamp the run as INTERLOCKED before its first claim when the
+	// rollout switch is on. completionInterlockOn is FAIL-SAFE OFF (nil reader or any read
+	// error → false), the opposite of the capability-aware fail-open, so this gate never
+	// accidentally engages a still-rolling-out feature. NULL (the not-interlocked legacy
+	// state) unless on. createRun only ever creates issue-kind rows, so this is inherently
+	// issue-scoped; the contract CONTENT is frozen later at approval / the first running
+	// report, not here.
+	var completionContractVersion pgtype.Int4
+	if s.completionInterlockOn(ctx) {
+		completionContractVersion = pgtype.Int4{Int32: 1, Valid: true}
+	}
 	run, err := s.q.CreateRun(ctx, store.CreateRunParams{
 		UserID:           userID,
 		RepoID:           repoID,
@@ -3796,6 +3875,10 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		// issue #857 M2: the provenance stamp threaded from each public entrypoint
 		// ("manual"/"schedule"/"autopilot"), so a run records why it fired.
 		TriggerSource: triggerSource,
+		// PRD #1226 M1 (D1): NULL (legacy) unless the rollout switch is on, in which case
+		// this stamps the run interlocked (version 1) before its first claim. Listed
+		// explicitly per runtime.sql's 🔴 silently-omittable-narg warning.
+		CompletionContractVersion: completionContractVersion,
 	})
 	if err != nil {
 		if isUniqueViolation(err) {

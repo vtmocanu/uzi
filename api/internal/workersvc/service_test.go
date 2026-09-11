@@ -3235,7 +3235,7 @@ func TestRegisterRecoversOrphansThenComesOnline(t *testing.T) {
 	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
 	svc := New(fs, newBox(t), testParams())
 
-	if _, err := svc.Register(context.Background(), w, "1.2.3", "jvm", intp(2), nil); err != nil {
+	if _, err := svc.Register(context.Background(), w, "1.2.3", "jvm", intp(2), nil, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	want := []string{"fail_over_cap", "requeue_worker", "register"}
@@ -3274,7 +3274,7 @@ func TestRegisterUnionsAndFiltersCapabilities(t *testing.T) {
 	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
 	svc := New(fs, newBox(t), testParams())
 
-	if _, err := svc.Register(context.Background(), w, "1.2.3", "jvm", nil, []string{"docker", "gpu", "docker"}); err != nil {
+	if _, err := svc.Register(context.Background(), w, "1.2.3", "jvm", nil, []string{"docker", "gpu", "docker"}, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	got := fs.registerParams.Capabilities
@@ -3291,7 +3291,7 @@ func TestRegisterBaseTemplateDropsSelfReportedJVM(t *testing.T) {
 	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
 	svc := New(fs, newBox(t), testParams())
 
-	if _, err := svc.Register(context.Background(), w, "1.2.3", "base", nil, []string{"jvm", "docker"}); err != nil {
+	if _, err := svc.Register(context.Background(), w, "1.2.3", "base", nil, []string{"jvm", "docker"}, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	got := fs.registerParams.Capabilities
@@ -3307,11 +3307,52 @@ func TestRegisterBaseTemplateNoSelfReportEmptyCapabilities(t *testing.T) {
 	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
 	svc := New(fs, newBox(t), testParams())
 
-	if _, err := svc.Register(context.Background(), w, "1.2.3", "base", nil, nil); err != nil {
+	if _, err := svc.Register(context.Background(), w, "1.2.3", "base", nil, nil, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	if got := fs.registerParams.Capabilities; len(got) != 0 {
 		t.Fatalf("register capabilities = %v, want empty", got)
+	}
+}
+
+func TestRegisterFiltersProtocolCapabilitiesSeparately(t *testing.T) {
+	// PRD #1226 M1 (D2): the worker's self-reported PROTOCOL capabilities are FilterProtocol-ed
+	// and stored in protocol_capabilities, SEPARATE from capabilities. A scheduler-vocabulary
+	// name (docker) and an unknown name are dropped from the protocol set; the known protocol
+	// (completion_interlock_v1) survives. The scheduler capabilities set is unaffected by what
+	// the worker puts in the protocol slot, and vice versa.
+	w := worker()
+	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
+	svc := New(fs, newBox(t), testParams())
+
+	if _, err := svc.Register(context.Background(), w, "1.2.3", "base", nil,
+		[]string{"docker"}, []string{"completion_interlock_v1", "docker", "gpu", "completion_interlock_v1"}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	// Scheduler capabilities: only the self-reported docker (base template implies nothing).
+	if got := fs.registerParams.Capabilities; len(got) != 1 || got[0] != "docker" {
+		t.Fatalf("register capabilities = %v, want [docker]", got)
+	}
+	// Protocol capabilities: only the known protocol, deduped; docker/gpu dropped.
+	if got := fs.registerParams.ProtocolCapabilities; len(got) != 1 || got[0] != "completion_interlock_v1" {
+		t.Fatalf("register protocol_capabilities = %v, want [completion_interlock_v1]", got)
+	}
+}
+
+func TestRegisterNilProtocolCapsStoresEmpty(t *testing.T) {
+	// PRD #1226 M1 (D2): a worker (an older image) that self-reports no protocol capabilities
+	// stores the empty set — never nil — so the NOT NULL protocol_capabilities column is
+	// written '{}', and the ClaimRun hard clause correctly treats it as "implements no
+	// protocol" (unable to claim an interlocked run).
+	w := worker()
+	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
+	svc := New(fs, newBox(t), testParams())
+
+	if _, err := svc.Register(context.Background(), w, "1.2.3", "base", nil, nil, nil); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if got := fs.registerParams.ProtocolCapabilities; len(got) != 0 {
+		t.Fatalf("register protocol_capabilities = %v, want empty", got)
 	}
 }
 
@@ -3322,7 +3363,7 @@ func TestRegisterNilCapStoresNull(t *testing.T) {
 	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
 	svc := New(fs, newBox(t), testParams())
 
-	if _, err := svc.Register(context.Background(), w, "1.2.3", "", nil, nil); err != nil {
+	if _, err := svc.Register(context.Background(), w, "1.2.3", "", nil, nil, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	if fs.registerParams == nil || fs.registerParams.MaxConcurrentRuns.Valid {
@@ -3337,7 +3378,7 @@ func TestRegisterEmptyTemplateStoresNull(t *testing.T) {
 	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
 	svc := New(fs, newBox(t), testParams())
 
-	if _, err := svc.Register(context.Background(), w, "1.2.3", "", nil, nil); err != nil {
+	if _, err := svc.Register(context.Background(), w, "1.2.3", "", nil, nil, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	if fs.registerParams == nil || fs.registerParams.TemplateReported.Valid {

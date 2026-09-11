@@ -320,6 +320,15 @@ export interface RegisterRequest {
    *  query. Sent only when non-empty (same "only send when known" shape as `template`);
    *  compat rule: the api MUST tolerate it in the same release the worker sends it. */
   capabilities?: string[];
+  /** The PROTOCOL capabilities this worker self-reports as implemented (PRD #1226 M1,
+   *  D2): today `["completion_interlock_v1"]`, meaning this image implements the
+   *  structural completion protocol. Kept DELIBERATELY SEPARATE from `capabilities` (the
+   *  scheduler vocabulary) — the server stores it in workers.protocol_capabilities and the
+   *  hard ClaimRun clause reads it there, OUTSIDE required_capabilities and the
+   *  capability_aware kill-switch, so an old image that omits it can never claim an
+   *  interlocked run. Sent only when non-empty (same "only send when known" shape as
+   *  `capabilities`); the api Filter-s it against a server-owned protocol vocabulary. */
+  protocol_capabilities?: string[];
 }
 
 export interface RegisterResponse {

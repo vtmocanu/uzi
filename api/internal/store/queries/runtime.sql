@@ -183,6 +183,15 @@ WITH prev AS (
         -- COALESCE guards the NOT NULL column against a nil slice from any caller
         -- (pgx encodes a nil []string as SQL NULL): a nil report stores '{}', not NULL.
         capabilities        = COALESCE(@capabilities::text[], '{}'),
+        -- protocol_capabilities is the server-authoritative PROTOCOL capability set (PRD
+        -- #1226 M1, D2): the FilterProtocol-ed set the worker self-reports, kept SEPARATE
+        -- from capabilities so a protocol string never enters the scheduler vocabulary.
+        -- Overwritten on every register (the fresh-start signal), so a worker that stops
+        -- self-reporting the protocol loses it here too — which correctly makes it unable
+        -- to claim an interlocked run. COALESCE guards the NOT NULL column against a nil
+        -- slice from any caller (pgx encodes a nil []string as SQL NULL): a nil report
+        -- stores '{}', not NULL.
+        protocol_capabilities = COALESCE(@protocol_capabilities::text[], '{}'),
         max_concurrent_runs = sqlc.narg('max_concurrent_runs'),
         -- online_since is the api-owned uptime anchor (PRD #251 M1): PRESERVE it if the
         -- worker is already online with one, else STAMP now() — so a steady stream of
@@ -398,8 +407,19 @@ WHERE status = 'online'
 -- against the vocabulary at its write path, so no re-validation is needed here.
 -- Repo-less kinds (judge/chat/self_improve) INSERT elsewhere and keep the '{}'
 -- column default. Plan inference (M4) later union-merges via a separate UPDATE.
-INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve, wait_on_limit, mr_rework_enabled, plan_md, plan_source, agent_source, agent_exclusions, planned_base_commit, require_base_match, model, override_subagent_model, issue_comments, review_comments, required_capabilities, trigger_source)
-VALUES (@user_id, @repo_id::uuid, @issue_iid, @issue_title, @issue_description, sqlc.narg('origin_column'), now(), @auto_approve, @wait_on_limit, sqlc.narg('mr_rework_enabled'), sqlc.narg('plan_md'), @plan_source, sqlc.narg('agent_source'), sqlc.narg('agent_exclusions')::jsonb, sqlc.narg('planned_base_commit'), @require_base_match, sqlc.narg('model'), @override_subagent_model, sqlc.narg('issue_comments')::jsonb, sqlc.narg('review_comments')::jsonb, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), @trigger_source)
+--
+-- 🔴 completion_contract_version (PRD #1226 M1, D1) is listed here for the SAME reason as
+-- the fields above: it is a silently-omittable nullable param (sqlc.narg). createRun reads
+-- the completion_interlock_rollout switch (fail-safe OFF) and passes 1 ONLY when it is on,
+-- stamping the run as INTERLOCKED before its first claim; a legacy/rollout-off run passes
+-- NULL and stays the explicit legacy state. An omitted Go struct field would compile green
+-- and silently ship NULL for every run (the feature inert), so a per-path test guards it,
+-- not the compiler. Stamped BEFORE the first claim on purpose: approval does not re-claim,
+-- so stamping only at approval would make the D2 hard claim clause vacuous for the
+-- plan-phase worker. The contract CONTENT (completion_contract/contract_revision) is still
+-- absent here — it is frozen with milestones_frozen at approval / the first running report.
+INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve, wait_on_limit, mr_rework_enabled, plan_md, plan_source, agent_source, agent_exclusions, planned_base_commit, require_base_match, model, override_subagent_model, issue_comments, review_comments, required_capabilities, trigger_source, completion_contract_version)
+VALUES (@user_id, @repo_id::uuid, @issue_iid, @issue_title, @issue_description, sqlc.narg('origin_column'), now(), @auto_approve, @wait_on_limit, sqlc.narg('mr_rework_enabled'), sqlc.narg('plan_md'), @plan_source, sqlc.narg('agent_source'), sqlc.narg('agent_exclusions')::jsonb, sqlc.narg('planned_base_commit'), @require_base_match, sqlc.narg('model'), @override_subagent_model, sqlc.narg('issue_comments')::jsonb, sqlc.narg('review_comments')::jsonb, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), @trigger_source, sqlc.narg('completion_contract_version'))
 RETURNING *;
 
 -- name: GetRunByIDForUser :one
@@ -667,6 +687,18 @@ WHERE id = (
       -- PRD #84 M2 extends it: the run's required_capabilities must be a subset of the
       -- claiming worker's effective caps (@worker_caps ∪ docker), gated by @capability_aware.
       AND fn_worker_can_claim(@is_docker_worker::boolean, @docker_repo_allowlist::uuid[], r.repo_id, r.kind, @worker_caps::text[], r.required_capabilities, @capability_aware::boolean)
+      -- PRD #1226 M1 (D2): the NON-BYPASSABLE completion-protocol claim clause. An
+      -- INTERLOCKED run (completion_contract_version IS NOT NULL) may be claimed ONLY by a
+      -- worker whose SELF-REPORTED protocol_capabilities contain 'completion_interlock_v1';
+      -- a LEGACY run (version IS NULL) is unaffected and claimable by any worker. This clause
+      -- is a DEDICATED, standalone predicate INTENTIONALLY OUTSIDE fn_worker_can_claim,
+      -- required_capabilities, ClearRunRequiredCapabilities and the @capability_aware
+      -- kill-switch: an owner capability override or the kill-switch can neutralize the
+      -- ordinary required-capability match, but NONE of them may authorize a worker that does
+      -- not implement the completion protocol. @worker_protocol_caps is the claiming worker's
+      -- stored workers.protocol_capabilities column, passed by the Go caller.
+      AND (r.completion_contract_version IS NULL
+           OR 'completion_interlock_v1' = ANY(@worker_protocol_caps::text[]))
       -- PRD #529 Decision 4: an ephemeral worker exists to serve exactly one run and
       -- must never take foreign work — otherwise it could hold a non-owning run when
       -- its bound run terminates, blocking the busy-guarded teardown (M4). So an
@@ -719,6 +751,13 @@ WHERE id = (
                 AND (NOT p.ephemeral OR p.ephemeral_run_id = r.id)
                 AND p.max_concurrent_runs IS NOT NULL
                 AND fn_worker_can_claim(COALESCE(p.docker_enabled, false), @docker_repo_allowlist::uuid[], r.repo_id, r.kind, p.capabilities, r.required_capabilities, @capability_aware::boolean)
+                -- PRD #1226 M1 (D2): MIRROR the non-bypassable completion-protocol clause for
+                -- the peer, or fleet-spread could DEFER an interlocked run to an INCAPABLE peer
+                -- that would never be able to claim it — making the run unclaimable. Reads the
+                -- peer's OWN workers.protocol_capabilities column directly (no Go param, unlike
+                -- the claimant's @worker_protocol_caps above).
+                AND (r.completion_contract_version IS NULL
+                     OR 'completion_interlock_v1' = ANY(p.protocol_capabilities))
                 AND pa.active < p.max_concurrent_runs
                 AND pa.active * (SELECT w.max_concurrent_runs FROM workers w WHERE w.id = @worker_id)
                     < (SELECT count(*) FROM runs mr
@@ -986,6 +1025,32 @@ UPDATE runs SET
     --      wins and the stale round-2 candidate cannot overwrite it. The common heartbeat
     --      is likewise a no-op via clause 1.
     milestones_frozen = COALESCE(milestones_frozen, sqlc.narg('milestones_frozen')::jsonb, milestones_candidate),
+    -- PRD #1226 M1 (D1): freeze the STRUCTURAL COMPLETION CONTRACT at the SAME point the
+    -- AUTOPILOT path freezes milestones_frozen (the FIRST report that resolves a milestone
+    -- list), IDEMPOTENTLY and by the SAME rules as the human approve path
+    -- (CreateApprovePlanInput). The freeze condition is TIED to the milestone freeze: the run
+    -- is INTERLOCKED (completion_contract_version IS NOT NULL), the contract is not yet frozen
+    -- (completion_contract IS NULL), AND the resolved milestone source is present — the SAME
+    -- 3-way COALESCE(milestones_frozen, narg, milestones_candidate) that milestones_frozen
+    -- above freezes from. The milestone-source guard is LOAD-BEARING: an autopilot run reports
+    -- `running` at claim time BEFORE it resolves its milestones, and without this guard that
+    -- early report would freeze an EMPTY contract that a later milestone-carrying report could
+    -- never correct (the contract-IS-NULL idempotency would already be spent). Postgres
+    -- evaluates every SET RHS against the OLD row, so completion_contract/version and the
+    -- COALESCE source here read the pre-update tuple — the same mechanism the milestones_frozen
+    -- immutability COALESCE relies on. The Go caller (runningStateParams) builds
+    -- @completion_contract from that same resolved source. contract_revision is set to 1 in the
+    -- SAME condition so revision and contract are always frozen together, never one without the other.
+    completion_contract = CASE
+        WHEN completion_contract_version IS NOT NULL AND completion_contract IS NULL
+             AND COALESCE(milestones_frozen, sqlc.narg('milestones_frozen')::jsonb, milestones_candidate) IS NOT NULL
+        THEN sqlc.narg('completion_contract')::jsonb
+        ELSE completion_contract END,
+    contract_revision = CASE
+        WHEN completion_contract_version IS NOT NULL AND completion_contract IS NULL
+             AND COALESCE(milestones_frozen, sqlc.narg('milestones_frozen')::jsonb, milestones_candidate) IS NOT NULL
+        THEN 1
+        ELSE contract_revision END,
     -- PRD #122 M2 (Decision 5/5b): per-run budget derived SERVER-SIDE from the frozen
     -- milestone count at freeze, written IMMUTABLY. NULL for a 0/1-milestone run so its
     -- budget is byte-for-byte the global default. Count capped at milestone_budget_cap,
@@ -2939,6 +3004,27 @@ WITH selected AS (
         -- resume) never changes a list that was frozen once. A run with no candidate
         -- freezes NULL, which is correct: nothing to approve, nothing frozen.
         milestones_frozen = COALESCE(runs.milestones_frozen, runs.milestones_candidate),
+        -- PRD #1226 M1 (D1): freeze the STRUCTURAL COMPLETION CONTRACT at the SAME approve
+        -- freeze as milestones_frozen, IDEMPOTENTLY. The freeze condition is TIED to the
+        -- milestone freeze: the run is INTERLOCKED (completion_contract_version IS NOT NULL,
+        -- stamped at CreateRun when the rollout switch was on), the contract is not yet frozen
+        -- (completion_contract IS NULL), AND the resolved milestone source is present — the SAME
+        -- COALESCE(milestones_frozen, milestones_candidate) milestones_frozen above freezes from.
+        -- So a double-approve or re-gate resume never re-freezes, a legacy/rollout-off run keeps
+        -- NULL, and a run with no candidate freezes no contract (consistent with milestones_frozen
+        -- staying NULL — the interlock still holds via the version). The Go caller (submitApproval)
+        -- builds @completion_contract from that same source. contract_revision is set to 1 in the
+        -- SAME condition so revision and contract are always frozen together, never one alone.
+        completion_contract = CASE
+            WHEN runs.completion_contract_version IS NOT NULL AND runs.completion_contract IS NULL
+                 AND COALESCE(runs.milestones_frozen, runs.milestones_candidate) IS NOT NULL
+            THEN sqlc.narg('completion_contract')::jsonb
+            ELSE runs.completion_contract END,
+        contract_revision = CASE
+            WHEN runs.completion_contract_version IS NOT NULL AND runs.completion_contract IS NULL
+                 AND COALESCE(runs.milestones_frozen, runs.milestones_candidate) IS NOT NULL
+            THEN 1
+            ELSE runs.contract_revision END,
         -- PRD #122 M2 (Decision 5/5b): the per-run budget is derived at the SAME freeze,
         -- from the same COALESCE'd frozen source, and written IDEMPOTENTLY via COALESCE —
         -- a double-approve or a re-gate resume never changes a budget frozen once. NULL for

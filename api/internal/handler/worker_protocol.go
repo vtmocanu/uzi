@@ -221,6 +221,15 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 		// persisting to workers.capabilities — so an unknown/garbled name here is
 		// dropped, never stored, and the register never 400s over this field.
 		Capabilities []string `json:"capabilities"`
+		// ProtocolCapabilities is the worker's self-reported PROTOCOL capability set
+		// (PRD #1226 M1, D2: today ["completion_interlock_v1"], meaning this image
+		// implements the structural completion protocol). Threaded into wsvc.Register,
+		// which passes it through the server-owned capability.FilterProtocol before
+		// persisting to workers.protocol_capabilities — a SEPARATE column from
+		// workers.capabilities, so a protocol string never leaks into the scheduler
+		// vocabulary or the web capability picker. An unknown/garbled name here is
+		// dropped, never stored, and the register never 400s over this field.
+		ProtocolCapabilities []string `json:"protocol_capabilities"`
 	}
 	if err := httpx.DecodeJSON(r, &req); err != nil && !errors.Is(err, io.EOF) {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
@@ -255,7 +264,7 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("worker reported an out-of-range max_concurrent_runs; dropping", "worker_id", wkr.ID.String(), "value", *advertisedCap)
 		advertisedCap = nil
 	}
-	updated, err := h.wsvc.Register(r.Context(), wkr, version, reported, advertisedCap, req.Capabilities)
+	updated, err := h.wsvc.Register(r.Context(), wkr, version, reported, advertisedCap, req.Capabilities, req.ProtocolCapabilities)
 	if err != nil {
 		slog.Error("worker register", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")

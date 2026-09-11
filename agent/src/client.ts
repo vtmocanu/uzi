@@ -233,6 +233,7 @@ export class WorkerClient {
     template?: string,
     maxConcurrentRuns?: number,
     capabilities?: string[],
+    protocolCapabilities?: string[],
   ): Promise<RegisterResponse> {
     const body: RegisterRequest = { name, version: this.version };
     // Only send the field when known: an image without ENV WORKER_TEMPLATE reports
@@ -250,6 +251,12 @@ export class WorkerClient {
     // register wire stays byte-identical to today. The api declares-and-ignores it in
     // M1 (accept-and-ignore); #84 owns storage + the claim-time match predicate.
     if (capabilities?.length) body.capabilities = capabilities;
+    // Self-reported PROTOCOL capabilities (PRD #1226 M1, D2): what protocols this image
+    // implements (today ["completion_interlock_v1"]). Only send when non-empty (mirrors
+    // `capabilities`), so an image that implements no protocol keeps the register wire
+    // byte-identical to today. The server stores it in workers.protocol_capabilities,
+    // SEPARATE from `capabilities`, and the ClaimRun hard clause reads it there.
+    if (protocolCapabilities?.length) body.protocol_capabilities = protocolCapabilities;
     return (await this.postJSON(`${WORKER_API_PREFIX}/register`, body)) as RegisterResponse;
   }
 
