@@ -534,7 +534,9 @@ and the standing preference here is not to spin up review agents by default (202
   (path:line, severity, title), names the reason when a PR was **not** reviewed, and
   **exits 3 if ANY named PR lacks a review** (0 = all reviewed, findings or clean) — never
   merge on a non-zero exit; re-trigger `@coderabbitai review` or take the CR-absent fallback
-  below. Pull one finding's full body with:
+  below. When the reason is **rate limited**, `@coderabbitai rate limit` (exact two words;
+  alias `@coderabbitai reviews remaining?`) replies with the reset window ("available in N
+  minutes"); re-run `@coderabbitai review` once it clears. Pull one finding's full body with:
   ```
   gh api repos/OWNER/REPO/pulls/PR/comments --paginate \
     --jq '.[]|select(.user.login|test("coderabbit";"i"))|"### \(.path):\(.line)\n\(.body)"'
