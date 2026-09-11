@@ -286,10 +286,19 @@ Edit api/internal/poller/ci_autofix.go  40s ago`. Those words come from the
 run's newest `tool_use` frame, never from raw tool input: a file path for
 `Read`/`Edit`/`Write`/`MultiEdit`, the dispatch description for `Agent` or
 `Bash` — a `Bash` command itself is never shown. When several milestones
-are in progress at once, the now line attaches to the first by the
-approved order; the rest still show their plain in-progress mark. A run
-with activity but nothing declared in progress shows an unattached now
-line under the milestone header instead.
+are in progress at once and the lead has attributed an agent to each — the
+exact `subagent_type` it dispatched, plus an optional label — **every**
+attributed in-progress milestone shows the agent working it: its declared
+role and label. The live tool and the "how long ago it last spoke" piece
+still attach to at most one milestone: the one whose declared agent
+uniquely matches the run's current activity. Two lanes sharing a role
+can't be told apart without the invocation id the lead doesn't have, so
+when a role repeats, live tool/age is withheld from every attributed
+milestone rather than guessed onto the wrong lane — role and label alone
+still show on each. When no agent is attributed, the now line attaches to
+the first in-progress milestone by the approved order; the rest still show
+their plain in-progress mark. A run with activity but nothing declared in
+progress shows an unattached now line under the milestone header instead.
 
 **On the TUI**, the in-progress milestone shows up two ways. In the crew
 rail's milestone checklist it's a `◕` that blinks `◕`/`○` on a half-second

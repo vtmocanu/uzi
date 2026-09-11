@@ -890,7 +890,12 @@ chain in the diagram above, with no intervening `running`.
   per-turn reporting enforced (an escalating prompt plus a feed-only `status` after
   K=2 misses) while never failing the run, and an all-empty `report_progress` is a
   no-op. `uzi run get` renders the same `–/N`, at parity with the web badge and TUI
-  rail.
+  rail. PRD #1224 adds a nullable `runs.milestones_agents` — validated
+  per-milestone agent attribution the lead declares — written coupled to
+  `milestones_in_progress` in `SetRunRunning` and cleared beside it on every
+  terminal transition; web/TUI/CLI render the declared agent under each
+  in-progress milestone, with live tool/age enriching only the uniquely-matching
+  lane.
 - **Operator scope steering** (PRD #634, [ADR-634](adr/0634-run-scope-steering.md)) —
   a mid-run `uzi run stop`/`uzi run scope --through N` on a milestone run writes one
   nullable `runs.scope_ceiling` (last-writer-wins, clamped to `[completed_count,
