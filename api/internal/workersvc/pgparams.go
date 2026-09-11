@@ -89,6 +89,18 @@ func textPtr(t pgtype.Text) *string {
 	return &s
 }
 
+// intPtr returns the persisted int4 as *int, nil when the column is NULL — the mirror of
+// textPtr for a nullable int served on the claim (PRD #1226 M3: the completion-contract
+// version discriminator, which the wire renders as `completion_contract_version` with
+// omitempty so a legacy/rollout-off run omits the key entirely).
+func intPtr(v pgtype.Int4) *int {
+	if !v.Valid {
+		return nil
+	}
+	i := int(v.Int32)
+	return &i
+}
+
 // resolveEffortPtr resolves the owner's per-user default reasoning effort to the
 // level the worker applies (PRD #617 + issue #1157): the owner's explicit choice,
 // or the uzi default (xhigh) when the column is NULL/blank. The wire field stays

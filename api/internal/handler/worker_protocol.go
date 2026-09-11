@@ -221,6 +221,15 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 		// persisting to workers.capabilities — so an unknown/garbled name here is
 		// dropped, never stored, and the register never 400s over this field.
 		Capabilities []string `json:"capabilities"`
+		// ProtocolCapabilities is the worker's self-reported PROTOCOL capability set
+		// (PRD #1226 M1, D2: today ["completion_interlock_v1"], meaning this image
+		// implements the structural completion protocol). Threaded into wsvc.Register,
+		// which passes it through the server-owned capability.FilterProtocol before
+		// persisting to workers.protocol_capabilities — a SEPARATE column from
+		// workers.capabilities, so a protocol string never leaks into the scheduler
+		// vocabulary or the web capability picker. An unknown/garbled name here is
+		// dropped, never stored, and the register never 400s over this field.
+		ProtocolCapabilities []string `json:"protocol_capabilities"`
 	}
 	if err := httpx.DecodeJSON(r, &req); err != nil && !errors.Is(err, io.EOF) {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
@@ -255,7 +264,7 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("worker reported an out-of-range max_concurrent_runs; dropping", "worker_id", wkr.ID.String(), "value", *advertisedCap)
 		advertisedCap = nil
 	}
-	updated, err := h.wsvc.Register(r.Context(), wkr, version, reported, advertisedCap, req.Capabilities)
+	updated, err := h.wsvc.Register(r.Context(), wkr, version, reported, advertisedCap, req.Capabilities, req.ProtocolCapabilities)
 	if err != nil {
 		slog.Error("worker register", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -690,6 +699,98 @@ func (h *Handler) WorkerRunOwnership(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"status": status})
+}
+
+// WorkerRunCompletionPermit is the completion-interlock permit endpoint (PRD #1226 M2, D4/D5):
+// the worker requests a permit bound to the frozen contract revision, the source branch, and the
+// EXACT final head. The service applies the claim fence, recomputes the unmet structural
+// criteria server-side, and either issues an idempotent permit or returns a structured
+// non-terminal denial. Mirrors WorkerRunState's decode/auth pattern.
+func (h *Handler) WorkerRunCompletionPermit(w http.ResponseWriter, r *http.Request) {
+	wkr, ok := mw.WorkerFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "worker authentication required")
+		return
+	}
+	runID, ok := httpx.PathUUID(w, r, "id", "run")
+	if !ok {
+		return
+	}
+	var body struct {
+		ContractRevision int    `json:"contract_revision"`
+		Branch           string `json:"branch"`
+		Head             string `json:"head"`
+	}
+	if err := httpx.DecodeJSON(r, &body); err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	branch := strings.TrimSpace(body.Branch)
+	head := strings.TrimSpace(body.Head)
+	if body.ContractRevision < 1 || branch == "" || head == "" {
+		httpx.Error(w, http.StatusBadRequest, "contract_revision (>=1), branch and head are required")
+		return
+	}
+	res, err := h.wsvc.RequestCompletionPermit(r.Context(), wkr, runID, workersvc.CompletionPermitRequest{
+		ContractRevision: body.ContractRevision, Branch: branch, Head: head,
+	})
+	if err != nil {
+		if errors.Is(err, workersvc.ErrRunNotOwned) {
+			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
+			return
+		}
+		slog.Error("worker run completion permit", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	httpx.JSON(w, http.StatusOK, res)
+}
+
+// WorkerRunCompletionAttempt is the same-lead nudge endpoint (PRD #1226 M2, D4; M3 caller): the
+// worker reports the current head + worktree fingerprint, the server recomputes the unmet set
+// and records a bounded attempt, and returns the server-authoritative unmet set + attempt count.
+func (h *Handler) WorkerRunCompletionAttempt(w http.ResponseWriter, r *http.Request) {
+	wkr, ok := mw.WorkerFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "worker authentication required")
+		return
+	}
+	runID, ok := httpx.PathUUID(w, r, "id", "run")
+	if !ok {
+		return
+	}
+	var body struct {
+		// PRD #1226 M3: the lead's signal_done declaration. The service subset-validates it
+		// against the frozen list and union-merges it into runs.milestones_completed before
+		// recomputing unmet. Omitted/null ⇒ nothing declared this attempt (union no-op).
+		MilestonesCompleted []string `json:"milestones_completed"`
+		Head                string   `json:"head"`
+		WorktreeFingerprint string   `json:"worktree_fingerprint"`
+	}
+	if err := httpx.DecodeJSON(r, &body); err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	res, err := h.wsvc.RecordCompletionAttempt(r.Context(), wkr, runID, workersvc.CompletionAttemptRequest{
+		MilestonesCompleted: body.MilestonesCompleted,
+		Head:                strings.TrimSpace(body.Head),
+		WorktreeFingerprint: strings.TrimSpace(body.WorktreeFingerprint),
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, workersvc.ErrRunNotOwned):
+			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
+		case errors.Is(err, workersvc.ErrCompletionStaleClaim):
+			httpx.Error(w, http.StatusConflict, "run is not in a live claimed state for this worker")
+		case errors.Is(err, workersvc.ErrCompletionNotInterlocked):
+			httpx.Error(w, http.StatusBadRequest, "run is not interlocked")
+		default:
+			slog.Error("worker run completion attempt", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+		}
+		return
+	}
+	httpx.JSON(w, http.StatusOK, res)
 }
 
 // workerMemoryToDTO maps a stored entry to the worker-facing DTO. It carries run_id

@@ -48,6 +48,11 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 		FailureReason:        pgconv.TextOrNull("run exceeded RUN_TIMEOUT"),
 		Now:                  pgconv.Time(now),
 		GlobalTimeoutSeconds: int32(s.p.RunTimeout.Seconds()),
+		// PRD #1226 M3 (D3): the completion-interlock carve-out excludes a post-attempt run
+		// whose worker heartbeat is still inside THIS bound — the SAME staleCutoff the
+		// stale-worker requeue/fail paths below use, so "live" here means exactly "not yet
+		// swept as a stale worker". A live post-attempt run is left for its worker to hold.
+		WorkerStaleCutoff: staleCutoff,
 	})
 	if err != nil {
 		return res, fmt.Errorf("sweep running-timeout: %w", err)

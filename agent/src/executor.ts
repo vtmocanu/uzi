@@ -418,6 +418,32 @@ export interface RunContext {
    *  "unchanged" and never trips on that turn. Absent on the stub/chat/non-issue
    *  executors, in which case the detector is inert and the loop is unchanged. */
   worktreeFingerprint?(): Promise<string | null>;
+  /** PRD #1226 M3 (D1/D2): this is an INTERLOCKED run (the claim's completion_contract_version
+   *  is non-null), so on a clean `signal_done` the implement loop runs the structural completion
+   *  protocol (checkpoint-first same-lead attempt loop) instead of finalizing directly. Absent/
+   *  false ⇒ a legacy run: the loop finalizes on `signal_done` exactly as today. */
+  completionInterlock?: boolean;
+  /** PRD #1226 M3 (D3): record ONE same-session structural completion attempt with the SERVER.
+   *  The runner wires it to the worker `completion/attempt` client call: the server union-merges
+   *  the lead's `declared` milestones into runs.milestones_completed, recomputes the unmet
+   *  structural criteria over the merged set, and records a bounded attempt — returning the
+   *  server-authoritative unmet set (the executor reworks against THIS, never its own belief) and
+   *  the new attempt count. Absent ⇒ the executor never enters the completion protocol (falls
+   *  through to the legacy finalize). */
+  recordCompletionAttempt?(args: {
+    declared: string[];
+    head: string | null;
+    worktreeFingerprint: string | null;
+  }): Promise<{ unmet: string[]; attemptCount: number }>;
+  /** PRD #1226 M3/M4 (D6): the completion-hold SEAM. On a repeated no-progress completion attempt
+   *  or a post-attempt budget/stall/wall/idle exhaustion, the executor routes here INSTEAD of
+   *  throwing a terminal failure, so the run enters a recoverable hold that preserves its Git work
+   *  rather than failing. M4 wires the real implementation (SetRunCompletionHold + captureHoldContext
+   *  + the fixed park order); in M3 the runner leaves it UNWIRED, so the executor falls back to the
+   *  legacy throw (the feature is rollout-OFF until #1232 and M3+M4 ship together, so an unwired
+   *  seam never fires in production). When present, the executor calls it, latches
+   *  {@link ExecutorResult.completionHeld}, and breaks so the runner skips finalization. */
+  enterCompletionHold?(reason: string): Promise<void>;
 }
 
 export interface ExecutorResult {
@@ -493,6 +519,15 @@ export interface ExecutorResult {
    *  scopeCapped): pause is meaningful for issue, non-interactive task, prompt and self_improve.
    *  Absent on every normal completion. StubExecutor never sets it. */
   pausedAt?: { completedCount: number; total?: number };
+  /** PRD #1226 M3 (D3/D6): set when the run entered the COMPLETION HOLD — a repeated no-progress
+   *  completion attempt, or a post-attempt budget/stall/wall/idle exhaustion, routed to
+   *  `ctx.enterCompletionHold` instead of throwing. The runner reads it in phasePublish to SKIP
+   *  finalization (no push, no PR, no completion report), exactly like `pausedAt`: the hold seam
+   *  already parked the run (M4). `reason` is the static, content-free failure-reason constant the
+   *  route used. Only ever set when `ctx.enterCompletionHold` is wired (M4); nil in M3 production
+   *  (the seam is unwired, so the executor falls back to the legacy throw). StubExecutor never
+   *  sets it. */
+  completionHeld?: { reason: string };
 }
 
 /**

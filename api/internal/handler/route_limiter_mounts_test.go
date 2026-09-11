@@ -546,6 +546,12 @@ var wantRouteMounts = []routeMount{
 	// touches the forge → noLimiter, matching the other worker /runs/{id}/... writes.
 	{"POST", "/api/worker/runs/{id}/codex/refresh", noLimiter},
 	{"POST", "/api/worker/runs/{id}/codex/release", noLimiter},
+	// PRD #1226 M2: the completion-interlock permit-issue and same-lead attempt endpoints.
+	// Worker-authenticated, scoped to the worker's own run, no forge call → noLimiter, matching
+	// the other worker /runs/{id}/... writes; both are bounded server-side (the permit is
+	// idempotent, the attempt log is pruned to N) rather than by a per-user limiter.
+	{"POST", "/api/worker/runs/{id}/completion/attempt", noLimiter},
+	{"POST", "/api/worker/runs/{id}/completion/permit", noLimiter},
 	// PRD #333 M2: the incidental-findings capture route. It rides
 	// proposalLimiter.PerWorkerMiddleware (a per-WORKER, IP-fallback mount), which this
 	// per-USER probe reads as noLimiter — same as the proposals route below it.

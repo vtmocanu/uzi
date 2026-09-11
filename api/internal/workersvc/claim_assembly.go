@@ -458,6 +458,11 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			DeniedToolPackages: toolprofile.DenylistNames(),
 			// PRD #71 M2: nil for non-ci_fix runs (column NULL) → omitted by omitempty.
 			CIConfigPaths: run.CiConfigPaths,
+			// PRD #1226 M3 (D1/D2): the completion-interlock discriminator, read straight off
+			// runs.completion_contract_version. Non-nil ⇒ the worker runs the structural
+			// completion protocol; nil (legacy run / rollout OFF) ⇒ omitted, legacy path. This
+			// is WORKER-ONLY claim config, NOT the web RunDTO, so it touches no api-contract fixture.
+			CompletionContractVersion: intPtr(run.CompletionContractVersion),
 		},
 	}
 

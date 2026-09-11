@@ -218,15 +218,23 @@ type fakeStore struct {
 	// PRD #517 M2: captures the SetRunAwaitingFollowup arg (nil until the park query
 	// is reached) so a test can assert the accept path was taken and prove the
 	// interactive/task guard rejects BEFORE the query on a mismatched run.
-	setFollowup      *store.SetRunAwaitingFollowupParams
-	setFollowupRows  int64
-	setCompleted     *store.SetRunCompletedParams
-	setFailed        *store.SetRunFailedParams
-	reconciledMR     *store.ReconcileRunMRParams
-	setRunningRows   int64
-	setCompletedRows int64
-	reconcileMRRows  int64
-	consumeRows      []store.ConsumeRunInputsRow
+	setFollowup     *store.SetRunAwaitingFollowupParams
+	setFollowupRows int64
+	setCompleted    *store.SetRunCompletedParams
+	setFailed       *store.SetRunFailedParams
+	reconciledMR    *store.ReconcileRunMRParams
+	// PRD #1226 M2: completion-attempt + permit-issue capture for the fake-store denial/grant
+	// unit tests (the transactional completion path is covered by the LiveDB tests instead).
+	recordedAttempts   []store.RecordCompletionAttemptParams
+	recordAttemptCount int32
+	recordAttemptErr   error
+	upsertPermitParams *store.UpsertCompletionPermitParams
+	upsertedPermit     store.RunCompletionPermit
+	upsertPermitErr    error
+	setRunningRows     int64
+	setCompletedRows   int64
+	reconcileMRRows    int64
+	consumeRows        []store.ConsumeRunInputsRow
 	// PRD #634 M4: capture the scope-disposition settle the completed transition makes.
 	settledScope     *store.SettleScopeInputDispositionParams
 	settledScopeRows int64
@@ -341,6 +349,11 @@ type fakeStore struct {
 	reviseCapArg       *store.CreateRunReviseInputIfUnderCapParams
 	createdStopVerdict *store.CreateStopVerdictInputParams
 	createdApproval    *store.CreateApprovePlanInputParams
+	// freezeSnapshot is what GetRunMilestoneFreezeSnapshot returns (PRD #260/#1226). The zero
+	// value has empty milestone columns (the prior hardcoded behavior); a test sets its
+	// MilestonesFrozen/MilestonesCandidate to drive the approve-time completion-contract build,
+	// which reads its milestone source from this snapshot rather than the run row.
+	freezeSnapshot store.GetRunMilestoneFreezeSnapshotRow
 	// PRD #634 M2: capture the scope-ceiling write submitInput's `scope` (and the
 	// milestone-run `stop` remap) makes. createdScopeCeiling holds the LAST call (nil
 	// until reached); createdScopeCeilings records every call in order, so a test can
@@ -1170,7 +1183,14 @@ func (f *fakeStore) CreateApprovePlanInput(_ context.Context, arg store.CreateAp
 	return store.RunUserInput{}, nil
 }
 func (f *fakeStore) GetRunMilestoneFreezeSnapshot(_ context.Context, id uuid.UUID) (store.GetRunMilestoneFreezeSnapshotRow, error) {
-	return store.GetRunMilestoneFreezeSnapshotRow{ID: id}, nil
+	// The zero value has empty milestone columns (the original hardcoded behavior, so every
+	// existing fixture is unchanged). A test that needs the approve-time completion-contract
+	// build to see a real milestone list sets freezeSnapshot: submitApproval reads its
+	// contract's milestone SOURCE from THIS snapshot (submit.go, PRD #260/#1226 D1), not from
+	// the run row, whenever the snapshot read succeeds. The run id is always stamped on.
+	snap := f.freezeSnapshot
+	snap.ID = id
+	return snap, nil
 }
 func (f *fakeStore) CancelRunServerSide(_ context.Context, arg store.CancelRunServerSideParams) (int64, error) {
 	f.cancelled = &arg
@@ -3235,7 +3255,7 @@ func TestRegisterRecoversOrphansThenComesOnline(t *testing.T) {
 	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
 	svc := New(fs, newBox(t), testParams())
 
-	if _, err := svc.Register(context.Background(), w, "1.2.3", "jvm", intp(2), nil); err != nil {
+	if _, err := svc.Register(context.Background(), w, "1.2.3", "jvm", intp(2), nil, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	want := []string{"fail_over_cap", "requeue_worker", "register"}
@@ -3274,7 +3294,7 @@ func TestRegisterUnionsAndFiltersCapabilities(t *testing.T) {
 	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
 	svc := New(fs, newBox(t), testParams())
 
-	if _, err := svc.Register(context.Background(), w, "1.2.3", "jvm", nil, []string{"docker", "gpu", "docker"}); err != nil {
+	if _, err := svc.Register(context.Background(), w, "1.2.3", "jvm", nil, []string{"docker", "gpu", "docker"}, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	got := fs.registerParams.Capabilities
@@ -3291,7 +3311,7 @@ func TestRegisterBaseTemplateDropsSelfReportedJVM(t *testing.T) {
 	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
 	svc := New(fs, newBox(t), testParams())
 
-	if _, err := svc.Register(context.Background(), w, "1.2.3", "base", nil, []string{"jvm", "docker"}); err != nil {
+	if _, err := svc.Register(context.Background(), w, "1.2.3", "base", nil, []string{"jvm", "docker"}, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	got := fs.registerParams.Capabilities
@@ -3307,11 +3327,52 @@ func TestRegisterBaseTemplateNoSelfReportEmptyCapabilities(t *testing.T) {
 	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
 	svc := New(fs, newBox(t), testParams())
 
-	if _, err := svc.Register(context.Background(), w, "1.2.3", "base", nil, nil); err != nil {
+	if _, err := svc.Register(context.Background(), w, "1.2.3", "base", nil, nil, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	if got := fs.registerParams.Capabilities; len(got) != 0 {
 		t.Fatalf("register capabilities = %v, want empty", got)
+	}
+}
+
+func TestRegisterFiltersProtocolCapabilitiesSeparately(t *testing.T) {
+	// PRD #1226 M1 (D2): the worker's self-reported PROTOCOL capabilities are FilterProtocol-ed
+	// and stored in protocol_capabilities, SEPARATE from capabilities. A scheduler-vocabulary
+	// name (docker) and an unknown name are dropped from the protocol set; the known protocol
+	// (completion_interlock_v1) survives. The scheduler capabilities set is unaffected by what
+	// the worker puts in the protocol slot, and vice versa.
+	w := worker()
+	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
+	svc := New(fs, newBox(t), testParams())
+
+	if _, err := svc.Register(context.Background(), w, "1.2.3", "base", nil,
+		[]string{"docker"}, []string{"completion_interlock_v1", "docker", "gpu", "completion_interlock_v1"}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	// Scheduler capabilities: only the self-reported docker (base template implies nothing).
+	if got := fs.registerParams.Capabilities; len(got) != 1 || got[0] != "docker" {
+		t.Fatalf("register capabilities = %v, want [docker]", got)
+	}
+	// Protocol capabilities: only the known protocol, deduped; docker/gpu dropped.
+	if got := fs.registerParams.ProtocolCapabilities; len(got) != 1 || got[0] != "completion_interlock_v1" {
+		t.Fatalf("register protocol_capabilities = %v, want [completion_interlock_v1]", got)
+	}
+}
+
+func TestRegisterNilProtocolCapsStoresEmpty(t *testing.T) {
+	// PRD #1226 M1 (D2): a worker (an older image) that self-reports no protocol capabilities
+	// stores the empty set — never nil — so the NOT NULL protocol_capabilities column is
+	// written '{}', and the ClaimRun hard clause correctly treats it as "implements no
+	// protocol" (unable to claim an interlocked run).
+	w := worker()
+	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
+	svc := New(fs, newBox(t), testParams())
+
+	if _, err := svc.Register(context.Background(), w, "1.2.3", "base", nil, nil, nil); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if got := fs.registerParams.ProtocolCapabilities; len(got) != 0 {
+		t.Fatalf("register protocol_capabilities = %v, want empty", got)
 	}
 }
 
@@ -3322,7 +3383,7 @@ func TestRegisterNilCapStoresNull(t *testing.T) {
 	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
 	svc := New(fs, newBox(t), testParams())
 
-	if _, err := svc.Register(context.Background(), w, "1.2.3", "", nil, nil); err != nil {
+	if _, err := svc.Register(context.Background(), w, "1.2.3", "", nil, nil, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	if fs.registerParams == nil || fs.registerParams.MaxConcurrentRuns.Valid {
@@ -3337,7 +3398,7 @@ func TestRegisterEmptyTemplateStoresNull(t *testing.T) {
 	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
 	svc := New(fs, newBox(t), testParams())
 
-	if _, err := svc.Register(context.Background(), w, "1.2.3", "", nil, nil); err != nil {
+	if _, err := svc.Register(context.Background(), w, "1.2.3", "", nil, nil, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	if fs.registerParams == nil || fs.registerParams.TemplateReported.Valid {
