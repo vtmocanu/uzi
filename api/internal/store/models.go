@@ -523,6 +523,31 @@ type Run struct {
 	CompletionContractVersion pgtype.Int4        `json:"completion_contract_version"`
 	ContractRevision          pgtype.Int4        `json:"contract_revision"`
 	CompletionContract        []byte             `json:"completion_contract"`
+	CompletionAttempts        int32              `json:"completion_attempts"`
+	LatestCompletionAttempt   []byte             `json:"latest_completion_attempt"`
+}
+
+type RunCompletionAttempt struct {
+	ID                  uuid.UUID          `json:"id"`
+	RunID               uuid.UUID          `json:"run_id"`
+	ContractRevision    pgtype.Int4        `json:"contract_revision"`
+	Unmet               []byte             `json:"unmet"`
+	Head                pgtype.Text        `json:"head"`
+	WorktreeFingerprint pgtype.Text        `json:"worktree_fingerprint"`
+	CreatedAt           pgtype.Timestamptz `json:"created_at"`
+}
+
+type RunCompletionPermit struct {
+	ID               uuid.UUID          `json:"id"`
+	RunID            uuid.UUID          `json:"run_id"`
+	ContractRevision int32              `json:"contract_revision"`
+	Branch           string             `json:"branch"`
+	Head             string             `json:"head"`
+	IssuedByWorkerID pgtype.UUID        `json:"issued_by_worker_id"`
+	Audit            []byte             `json:"audit"`
+	FindingIds       []string           `json:"finding_ids"`
+	IssuedAt         pgtype.Timestamptz `json:"issued_at"`
+	ConsumedAt       pgtype.Timestamptz `json:"consumed_at"`
 }
 
 type RunMessage struct {

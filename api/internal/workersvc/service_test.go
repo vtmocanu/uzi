@@ -218,15 +218,23 @@ type fakeStore struct {
 	// PRD #517 M2: captures the SetRunAwaitingFollowup arg (nil until the park query
 	// is reached) so a test can assert the accept path was taken and prove the
 	// interactive/task guard rejects BEFORE the query on a mismatched run.
-	setFollowup      *store.SetRunAwaitingFollowupParams
-	setFollowupRows  int64
-	setCompleted     *store.SetRunCompletedParams
-	setFailed        *store.SetRunFailedParams
-	reconciledMR     *store.ReconcileRunMRParams
-	setRunningRows   int64
-	setCompletedRows int64
-	reconcileMRRows  int64
-	consumeRows      []store.ConsumeRunInputsRow
+	setFollowup     *store.SetRunAwaitingFollowupParams
+	setFollowupRows int64
+	setCompleted    *store.SetRunCompletedParams
+	setFailed       *store.SetRunFailedParams
+	reconciledMR    *store.ReconcileRunMRParams
+	// PRD #1226 M2: completion-attempt + permit-issue capture for the fake-store denial/grant
+	// unit tests (the transactional completion path is covered by the LiveDB tests instead).
+	recordedAttempts   []store.RecordCompletionAttemptParams
+	recordAttemptCount int32
+	recordAttemptErr   error
+	upsertPermitParams *store.UpsertCompletionPermitParams
+	upsertedPermit     store.RunCompletionPermit
+	upsertPermitErr    error
+	setRunningRows     int64
+	setCompletedRows   int64
+	reconcileMRRows    int64
+	consumeRows        []store.ConsumeRunInputsRow
 	// PRD #634 M4: capture the scope-disposition settle the completed transition makes.
 	settledScope     *store.SettleScopeInputDispositionParams
 	settledScopeRows int64

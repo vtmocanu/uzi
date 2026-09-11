@@ -803,6 +803,20 @@ type Store interface {
 	// and the admin allowlist it is re-validated against at claim time.
 	GetRepoToolProfile(ctx context.Context, arg store.GetRepoToolProfileParams) (store.RepoToolProfile, error)
 	ListToolAllowlist(ctx context.Context) ([]store.ToolAllowlist, error)
+
+	// Completion interlock — attempts + permits (PRD #1226 M2, D4/D5). RecordCompletionAttempt
+	// and UpsertCompletionPermit are called on the non-transactional permit/attempt endpoints
+	// through s.q; the completion-transaction queries (GetRunOwnedByWorkerForUpdate,
+	// GetUnconsumedCompletionPermit, GetConsumedCompletionPermit, ConsumeCompletionPermit) are
+	// invoked through a tx-bound *store.Queries inside completeRunWithPermit, and appear here so
+	// the interface stays the complete list of queries this package uses (a new query changes
+	// the interface).
+	RecordCompletionAttempt(ctx context.Context, arg store.RecordCompletionAttemptParams) (int32, error)
+	UpsertCompletionPermit(ctx context.Context, arg store.UpsertCompletionPermitParams) (store.RunCompletionPermit, error)
+	GetRunOwnedByWorkerForUpdate(ctx context.Context, arg store.GetRunOwnedByWorkerForUpdateParams) (store.Run, error)
+	GetUnconsumedCompletionPermit(ctx context.Context, arg store.GetUnconsumedCompletionPermitParams) (store.RunCompletionPermit, error)
+	GetConsumedCompletionPermit(ctx context.Context, arg store.GetConsumedCompletionPermitParams) (store.RunCompletionPermit, error)
+	ConsumeCompletionPermit(ctx context.Context, arg store.ConsumeCompletionPermitParams) (int64, error)
 }
 
 // Params are the runtime knobs the service needs, mirrored from config.
@@ -1177,6 +1191,13 @@ type Service struct {
 	// service-layer gate is skipped (guardDefaultBranch is a no-op) and layer 3 (the
 	// claim backstop) remains the security net, so a wiring gap never fails all runs.
 	guard RepoGuard
+	// txBeginner opens the pgx transaction the permit-gated completion runs in (PRD #1226
+	// M2, D4): completeRunWithPermit locks the run, consumes the permit and writes
+	// `completed` atomically through it. *pgxpool.Pool satisfies it; set via SetTxBeginner.
+	// Nil is FAIL-CLOSED — an interlocked completion errors rather than completing
+	// non-atomically, so a deployment that never wired it can never complete an interlocked
+	// run without the permit transaction. A LEGACY completion never touches it.
+	txBeginner TxBeginner
 }
 
 // SetSettings wires the instance settings reader (PRD #46). Call once at startup,
@@ -1889,6 +1910,15 @@ type StateRequest struct {
 	PlanMd *string `json:"plan_md"`
 	Branch *string `json:"branch"`
 	MrIID  *int64  `json:"mr_iid"`
+	// Head is the EXACT source-branch tip H a `completed` report is being made against
+	// (PRD #1226 M2, D5). It is REQUIRED for an INTERLOCKED run's completion: SetState routes
+	// such a completion through completeRunWithPermit, which consumes the permit issued for
+	// (run, contract_revision, Head) and writes `completed` in one transaction. A completed
+	// report whose Head does not match an unconsumed permit leaves the run non-terminal
+	// (applied=false). Absent on a LEGACY run's completion (that path is byte-for-byte
+	// unchanged) and on every non-completed report. httpx.DecodeJSON rejects unknown fields,
+	// so this field MUST exist here or a new worker's report 400s.
+	Head *string `json:"head"`
 	// MrWebURL is the MR/PR web URL as the forge reported it (PRD #65 D8), reported
 	// on completion alongside MrIID. Additive + optional (R8): an OLD worker omits it
 	// and textParam(nil) lands NULL, which the web renders via the legacy forgeUrls.ts
@@ -2321,7 +2351,7 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		} else if owned.ScopeCeiling.Valid {
 			settleScopeDisposition = "declined"
 		}
-		rows, err = s.q.SetRunCompleted(ctx, store.SetRunCompletedParams{
+		completedParams := store.SetRunCompletedParams{
 			Branch: stripNULParam(req.Branch), MrIid: pgconv.Int8Ptr(req.MrIID), MrWebUrl: stripNULParam(req.MrWebURL), SessionID: sessionID,
 			FixVerdict:          clampWireFixVerdict(req.FixVerdict),
 			PrdDonePath:         clampWirePRDDonePath(owned, req.PrdDonePath),
@@ -2330,7 +2360,27 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			MilestonesCompleted: completedIDs,
 			StopKind:            scopeStopKind,
 			ID:                  runID, WorkerID: pgconv.UUID(wkr.ID),
-		})
+		}
+		// PRD #1226 M2 (D4): an INTERLOCKED run's terminal completion is PERMIT-GATED and runs
+		// through a service transaction (completeRunWithPermit) that consumes the permit issued
+		// for the exact (run, contract_revision, head) and writes `completed` atomically, with a
+		// seam for later generation activation. A gated completion with no matching unconsumed
+		// permit updates nothing and stays non-terminal (rows==0 -> applied=false -> 409). A
+		// retry after response loss (run already completed, this worker's permit consumed) is
+		// idempotent success, returned early WITHOUT re-running the terminal automation below
+		// (it fired on the original completion). A LEGACY run (completion_contract_version IS
+		// NULL) NEVER permit-gates and keeps the existing direct SetRunCompleted path
+		// byte-for-byte.
+		if owned.CompletionContractVersion.Valid {
+			var idempotent bool
+			rows, idempotent, err = s.completeRunWithPermit(ctx, wkr, owned, req, completedParams)
+			if err == nil && idempotent {
+				run, rerr := s.runOwnedByWorker(ctx, runID, wkr)
+				return run, true, rerr
+			}
+		} else {
+			rows, err = s.q.SetRunCompleted(ctx, completedParams)
+		}
 	case "limit_wait":
 		rows, err = s.setLimitWait(ctx, owned, wkr, req, sessionID)
 	case "recovery_wait":

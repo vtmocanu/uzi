@@ -1,0 +1,353 @@
+package workersvc
+
+import (
+	"testing"
+
+	"github.com/google/uuid"
+
+	"github.com/vtmocanu/uzi/api/internal/store"
+)
+
+// PRD #1226 M2 (D4/D5) LiveDB coverage of the attempt/permit/completion-transaction boundary.
+// This is a DATA-INTEGRITY boundary, so these run against a real throwaway Postgres (skipped
+// unless UZI_TEST_DATABASE_URL). They reuse interlockLiveDB (setup + seed helpers from
+// completion_interlock_livedb_test.go) and drive the real Service (real *store.Queries + the
+// pool as the tx beginner), not fakes.
+
+// permitService builds a Service over the live store with the pool wired as the completion
+// transaction beginner, and background work dropped so no detached goroutine can outlive the
+// test's pool.
+func (e interlockLiveDB) permitService(t *testing.T) *Service {
+	t.Helper()
+	svc := New(e.q, newBox(t), testParams())
+	svc.SetTxBeginner(e.pool)
+	svc.SetBackground(func(func()) {})
+	return svc
+}
+
+// seedFrozenRun inserts an INTERLOCKED, FROZEN, running issue run owned by workerID:
+// completion_contract_version=1, contract_revision=1, completion_contract built from
+// milestoneIDs (NULL when contractNull — the split-state fixture), milestones_frozen set to the
+// [{id,title}] objects, milestones_completed to the bare id array completedIDs.
+func (e interlockLiveDB) seedFrozenRun(t *testing.T, workerID uuid.UUID, milestoneIDs, completedIDs []string, contractNull bool) uuid.UUID {
+	t.Helper()
+	id := uuid.New()
+	iid := *e.nextIID
+	*e.nextIID++
+	frozen := frozenJSON(t, milestoneIDs...)
+	completed := idsJSON(t, completedIDs...)
+	var contract []byte
+	if !contractNull {
+		c, err := buildCompletionContract(frozen)
+		if err != nil {
+			t.Fatalf("buildCompletionContract: %v", err)
+		}
+		contract = c
+	}
+	e.exec(t, `INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, kind, status, worker_id,
+	               completion_contract_version, contract_revision, completion_contract, milestones_frozen, milestones_completed)
+	           VALUES ($1, $2, $3, $4, 't', 'd', 'issue', 'running', $5, 1, 1, $6, $7, $8)`,
+		id, e.userID, e.repoID, iid, workerID, contract, frozen, completed)
+	return id
+}
+
+// seedLegacyRunningRun inserts a LEGACY (completion_contract_version NULL) running issue run
+// owned by workerID — the passthrough fixture.
+func (e interlockLiveDB) seedLegacyRunningRun(t *testing.T, workerID uuid.UUID) uuid.UUID {
+	t.Helper()
+	id := uuid.New()
+	iid := *e.nextIID
+	*e.nextIID++
+	e.exec(t, `INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, kind, status, worker_id)
+	           VALUES ($1, $2, $3, $4, 't', 'd', 'issue', 'running', $5)`,
+		id, e.userID, e.repoID, iid, workerID)
+	return id
+}
+
+func (e interlockLiveDB) runCompletionAttempts(t *testing.T, runID uuid.UUID) (count int, latestSet bool) {
+	t.Helper()
+	if err := e.pool.QueryRow(e.ctx,
+		`SELECT completion_attempts, latest_completion_attempt IS NOT NULL FROM runs WHERE id = $1`, runID).
+		Scan(&count, &latestSet); err != nil {
+		t.Fatalf("read completion_attempts: %v", err)
+	}
+	return count, latestSet
+}
+
+func (e interlockLiveDB) attemptRowCount(t *testing.T, runID uuid.UUID) int {
+	t.Helper()
+	var n int
+	if err := e.pool.QueryRow(e.ctx, `SELECT count(*) FROM run_completion_attempts WHERE run_id = $1`, runID).Scan(&n); err != nil {
+		t.Fatalf("count attempt rows: %v", err)
+	}
+	return n
+}
+
+// TestPermitIdempotentReissueLiveDB: a duplicate permit request for the same identity returns
+// the SAME permit id (idempotent), not a second permit.
+func TestPermitIdempotentReissueLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	svc := e.permitService(t)
+	wid := e.seedWorker(t, []string{"completion_interlock_v1"})
+	runID := e.seedFrozenRun(t, wid, []string{"m1", "m2"}, []string{"m1", "m2"}, false)
+	wkr := store.Worker{ID: wid}
+	req := CompletionPermitRequest{ContractRevision: 1, Branch: "agent/issue-1", Head: "deadbeef"}
+
+	first, err := svc.RequestCompletionPermit(e.ctx, wkr, runID, req)
+	if err != nil || !first.Granted || first.Permit == nil {
+		t.Fatalf("first request must grant: res=%+v err=%v", first, err)
+	}
+	second, err := svc.RequestCompletionPermit(e.ctx, wkr, runID, req)
+	if err != nil || !second.Granted || second.Permit == nil {
+		t.Fatalf("second request must grant: res=%+v err=%v", second, err)
+	}
+	if first.Permit.ID != second.Permit.ID {
+		t.Fatalf("duplicate request issued a NEW permit (%s != %s); the upsert must be idempotent", first.Permit.ID, second.Permit.ID)
+	}
+	var n int
+	if err := e.pool.QueryRow(e.ctx, `SELECT count(*) FROM run_completion_permits WHERE run_id = $1`, runID).Scan(&n); err != nil {
+		t.Fatalf("count permits: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("expected exactly ONE permit row, got %d", n)
+	}
+}
+
+// TestPermitStaleClaimLiveDB: a wrong-worker request is ErrRunNotOwned; a not-live run is a
+// stale_claim denial. Neither issues a permit.
+func TestPermitStaleClaimLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	svc := e.permitService(t)
+	owner := e.seedWorker(t, []string{"completion_interlock_v1"})
+	other := e.seedWorker(t, []string{"completion_interlock_v1"})
+	runID := e.seedFrozenRun(t, owner, []string{"m1"}, []string{"m1"}, false)
+	req := CompletionPermitRequest{ContractRevision: 1, Branch: "b", Head: "h"}
+
+	// Wrong worker.
+	if _, err := svc.RequestCompletionPermit(e.ctx, store.Worker{ID: other}, runID, req); err == nil {
+		t.Fatal("a non-owning worker must not get a permit (want ErrRunNotOwned)")
+	}
+
+	// Owned but not live (paused).
+	e.exec(t, `UPDATE runs SET status = 'paused' WHERE id = $1`, runID)
+	res, err := svc.RequestCompletionPermit(e.ctx, store.Worker{ID: owner}, runID, req)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if res.Granted || res.DenyReason != CompletionDenyStaleClaim {
+		t.Fatalf("a not-live run must be a stale_claim denial; got %+v", res)
+	}
+	var n int
+	if err := e.pool.QueryRow(e.ctx, `SELECT count(*) FROM run_completion_permits WHERE run_id = $1`, runID).Scan(&n); err != nil {
+		t.Fatalf("count permits: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("no permit should be issued for a stale claim; got %d", n)
+	}
+}
+
+// TestPermitRevisionDriftLiveDB: a request whose contract_revision differs from the run's frozen
+// revision is denied revision_drift.
+func TestPermitRevisionDriftLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	svc := e.permitService(t)
+	wid := e.seedWorker(t, []string{"completion_interlock_v1"})
+	runID := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
+	res, err := svc.RequestCompletionPermit(e.ctx, store.Worker{ID: wid}, runID,
+		CompletionPermitRequest{ContractRevision: 2, Branch: "b", Head: "h"})
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if res.Granted || res.DenyReason != CompletionDenyRevisionDrift {
+		t.Fatalf("want revision_drift; got %+v", res)
+	}
+}
+
+// TestPermitMissingMilestonesLiveDB: an incomplete run is denied missing_milestones with the
+// unmet list AND a run_completion_attempts row is written, completion_attempts incremented, and
+// latest_completion_attempt set.
+func TestPermitMissingMilestonesLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	svc := e.permitService(t)
+	wid := e.seedWorker(t, []string{"completion_interlock_v1"})
+	runID := e.seedFrozenRun(t, wid, []string{"m1", "m2"}, []string{"m1"}, false)
+	res, err := svc.RequestCompletionPermit(e.ctx, store.Worker{ID: wid}, runID,
+		CompletionPermitRequest{ContractRevision: 1, Branch: "b", Head: "h1"})
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if res.Granted || res.DenyReason != CompletionDenyMissingMilestones {
+		t.Fatalf("want missing_milestones; got %+v", res)
+	}
+	if len(res.Unmet) != 1 || res.Unmet[0] != "m2" {
+		t.Fatalf("unmet = %v, want [m2]", res.Unmet)
+	}
+	if got := e.attemptRowCount(t, runID); got != 1 {
+		t.Fatalf("run_completion_attempts rows = %d, want 1", got)
+	}
+	count, latestSet := e.runCompletionAttempts(t, runID)
+	if count != 1 {
+		t.Fatalf("completion_attempts = %d, want 1", count)
+	}
+	if !latestSet {
+		t.Fatal("latest_completion_attempt must be set after an attempt")
+	}
+}
+
+// TestPermitAttemptLogBoundedLiveDB proves the attempt log is pruned to <= 50 rows per run.
+func TestPermitAttemptLogBoundedLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	svc := e.permitService(t)
+	wid := e.seedWorker(t, []string{"completion_interlock_v1"})
+	runID := e.seedFrozenRun(t, wid, []string{"m1", "m2"}, []string{"m1"}, false)
+	wkr := store.Worker{ID: wid}
+	for i := 0; i < 60; i++ {
+		if _, err := svc.RequestCompletionPermit(e.ctx, wkr, runID,
+			CompletionPermitRequest{ContractRevision: 1, Branch: "b", Head: "h"}); err != nil {
+			t.Fatalf("attempt %d: %v", i, err)
+		}
+	}
+	if got := e.attemptRowCount(t, runID); got > 50 {
+		t.Fatalf("attempt log must be bounded to <= 50 rows; got %d", got)
+	}
+	count, _ := e.runCompletionAttempts(t, runID)
+	if count != 60 {
+		t.Fatalf("completion_attempts counter must be monotone (60), got %d", count)
+	}
+}
+
+// TestCompletionWithPermitLiveDB: a granted permit lets the completed report terminate the run,
+// and a retry after response loss is idempotent success (not a spurious denial).
+func TestCompletionWithPermitLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	svc := e.permitService(t)
+	wid := e.seedWorker(t, []string{"completion_interlock_v1"})
+	runID := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
+	wkr := store.Worker{ID: wid}
+	const head = "cafef00d"
+
+	permit, err := svc.RequestCompletionPermit(e.ctx, wkr, runID,
+		CompletionPermitRequest{ContractRevision: 1, Branch: "agent/issue-1", Head: head})
+	if err != nil || !permit.Granted {
+		t.Fatalf("permit must be granted: %+v err=%v", permit, err)
+	}
+
+	run, applied, err := svc.SetState(e.ctx, wkr, runID, StateRequest{State: "completed", Head: strPtr(head), Branch: strPtr("agent/issue-1")})
+	if err != nil {
+		t.Fatalf("SetState completed: %v", err)
+	}
+	if !applied || run.Status != "completed" {
+		t.Fatalf("a permitted completion must terminate the run; applied=%v status=%q", applied, run.Status)
+	}
+	// The permit is consumed exactly once.
+	var consumed bool
+	if err := e.pool.QueryRow(e.ctx, `SELECT consumed_at IS NOT NULL FROM run_completion_permits WHERE run_id = $1`, runID).Scan(&consumed); err != nil {
+		t.Fatalf("read permit: %v", err)
+	}
+	if !consumed {
+		t.Fatal("the permit must be consumed by the completion")
+	}
+
+	// Retry after response loss: a SECOND completed report for the same identity is idempotent
+	// success, NOT a denial.
+	run2, applied2, err := svc.SetState(e.ctx, wkr, runID, StateRequest{State: "completed", Head: strPtr(head), Branch: strPtr("agent/issue-1")})
+	if err != nil {
+		t.Fatalf("idempotent retry errored: %v", err)
+	}
+	if !applied2 || run2.Status != "completed" {
+		t.Fatalf("a retry after success must be idempotent success; applied=%v status=%q", applied2, run2.Status)
+	}
+}
+
+// TestCompletionWithoutPermitStaysNonTerminalLiveDB: a gated completion with NO matching
+// unconsumed permit updates nothing and the run stays non-terminal. THIS is the assertion the
+// mutation self-check must be able to redden.
+func TestCompletionWithoutPermitStaysNonTerminalLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	svc := e.permitService(t)
+	wid := e.seedWorker(t, []string{"completion_interlock_v1"})
+	runID := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
+	wkr := store.Worker{ID: wid}
+
+	// No permit issued.
+	run, applied, err := svc.SetState(e.ctx, wkr, runID, StateRequest{State: "completed", Head: strPtr("nope"), Branch: strPtr("b")})
+	if err != nil {
+		t.Fatalf("SetState completed: %v", err)
+	}
+	if applied {
+		t.Fatal("a gated completion without a permit must NOT be applied")
+	}
+	if run.Status == "completed" {
+		t.Fatalf("run must stay non-terminal without a permit; status = %q", run.Status)
+	}
+	if s := e.runStatus(t, runID); s != "running" {
+		t.Fatalf("run must remain running; status = %q", s)
+	}
+}
+
+// TestCompletionWrongHeadStaysNonTerminalLiveDB: a permit issued for head H does not let a
+// completed report for a DIFFERENT head terminate the run.
+func TestCompletionWrongHeadStaysNonTerminalLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	svc := e.permitService(t)
+	wid := e.seedWorker(t, []string{"completion_interlock_v1"})
+	runID := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
+	wkr := store.Worker{ID: wid}
+
+	if _, err := svc.RequestCompletionPermit(e.ctx, wkr, runID,
+		CompletionPermitRequest{ContractRevision: 1, Branch: "b", Head: "H1"}); err != nil {
+		t.Fatalf("permit: %v", err)
+	}
+	run, applied, err := svc.SetState(e.ctx, wkr, runID, StateRequest{State: "completed", Head: strPtr("H2"), Branch: strPtr("b")})
+	if err != nil {
+		t.Fatalf("SetState completed: %v", err)
+	}
+	if applied || run.Status == "completed" {
+		t.Fatalf("a completion for the wrong head must stay non-terminal; applied=%v status=%q", applied, run.Status)
+	}
+}
+
+// TestLegacyCompletionPassthroughLiveDB: a legacy run (completion_contract_version NULL)
+// completes through the unchanged path, needing no permit.
+func TestLegacyCompletionPassthroughLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	svc := e.permitService(t)
+	wid := e.seedWorker(t, nil)
+	runID := e.seedLegacyRunningRun(t, wid)
+	wkr := store.Worker{ID: wid}
+
+	run, applied, err := svc.SetState(e.ctx, wkr, runID, StateRequest{State: "completed", Branch: strPtr("agent/issue-9"), Head: strPtr("ignored")})
+	if err != nil {
+		t.Fatalf("SetState completed (legacy): %v", err)
+	}
+	if !applied || run.Status != "completed" {
+		t.Fatalf("a legacy run must complete through the unchanged path; applied=%v status=%q", applied, run.Status)
+	}
+}
+
+// TestSplitStateDeniedLiveDB: an interlocked run with milestones_frozen set but
+// completion_contract NULL is denied contract_not_frozen (fail-closed), and cannot complete.
+func TestSplitStateDeniedLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	svc := e.permitService(t)
+	wid := e.seedWorker(t, []string{"completion_interlock_v1"})
+	runID := e.seedFrozenRun(t, wid, []string{"m1"}, nil, true) // contractNull=true
+	wkr := store.Worker{ID: wid}
+
+	res, err := svc.RequestCompletionPermit(e.ctx, wkr, runID,
+		CompletionPermitRequest{ContractRevision: 1, Branch: "b", Head: "h"})
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if res.Granted || res.DenyReason != CompletionDenyContractNotFrozen {
+		t.Fatalf("split-state must be denied contract_not_frozen; got %+v", res)
+	}
+	// And a direct completed report cannot terminate it either (no permit exists).
+	run, applied, err := svc.SetState(e.ctx, wkr, runID, StateRequest{State: "completed", Head: strPtr("h"), Branch: strPtr("b")})
+	if err != nil {
+		t.Fatalf("SetState completed: %v", err)
+	}
+	if applied || run.Status == "completed" {
+		t.Fatalf("a split-state run must not complete; applied=%v status=%q", applied, run.Status)
+	}
+}

@@ -480,6 +480,13 @@ func run() error {
 	// and a capable worker image are deployed.
 	wsvc.SetCompletionInterlockSettings(settingsCache)
 
+	// Completion-interlock permit transaction (PRD #1226 M2, D4): the permit-gated completion
+	// (completeRunWithPermit) consumes the permit and writes `completed` atomically through a pgx
+	// transaction opened on the shared pool. A nil beginner is fail-closed (an interlocked
+	// completion errors rather than completing non-atomically), so this wiring is what lets an
+	// interlocked run complete at all.
+	wsvc.SetTxBeginner(pool)
+
 	// Codex production oauth-exchange client (PRD #1171 M1), ships DARK. Wire the API-owned
 	// codexauth.Client into the coordinated refresher so a worker /codex/refresh route can
 	// actually rotate a subscription login; without it CoordinatedCodexRefresh fails closed

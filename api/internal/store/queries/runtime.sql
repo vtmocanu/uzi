@@ -3856,3 +3856,127 @@ WHERE id = @id AND user_id = @user_id;
 -- fail-open is keyed on created_at, so priority is orthogonal to the age clocks.
 UPDATE runs SET priority = sqlc.narg('priority')::smallint
 WHERE id = @id AND user_id = @user_id AND status = 'queued';
+
+-- name: GetRunOwnedByWorkerForUpdate :one
+-- PRD #1226 M2 (D4): the completion transaction's row lock. completeRunWithPermit opens a
+-- pgx transaction and SELECTs the run FOR UPDATE through this so two concurrent completed
+-- reports (a retry after response loss) serialize — the second blocks until the first
+-- commits and then sees the terminal row. Worker-scoped like GetRunOwnedByWorker: a run the
+-- worker does not hold returns pgx.ErrNoRows.
+SELECT * FROM runs WHERE id = @id AND worker_id = @worker_id FOR UPDATE;
+
+-- name: RecordCompletionAttempt :one
+-- PRD #1226 M2 (D4): record ONE gated completion attempt and return the run's new attempt
+-- count, ATOMICALLY and BOUNDED. Fired on the permit path's missing-milestones denial (with a
+-- head, no worktree fingerprint) and by the same-lead nudge endpoint (with both). In one
+-- statement it:
+--   1. inserts the attempt row (`ins`) GUARDED to an INTERLOCKED run OWNED by the worker
+--      (completion_contract_version IS NOT NULL); the INSERT ... SELECT ... FROM runs yields no
+--      row and inserts nothing when the guard fails. Data-modifying CTEs always run to
+--      completion even when the primary query does not read them.
+--   2. PRUNES the run's attempt log to the most recent N: it keeps the 49 newest EXISTING
+--      rows (the prune subquery reads the pre-INSERT snapshot, so the just-inserted row is not
+--      visible to it and can never be pruned) and this insert adds one, so the table lands at
+--      <= 50 rows per run — the bound that keeps the log from growing without limit. Gated on
+--      EXISTS(ins) so it only fires when the attempt was actually recorded.
+--   3. increments runs.completion_attempts (M3 reads it for the SweepRunningTimeout carve-out)
+--      and overwrites runs.latest_completion_attempt with the current summary (server now()),
+--      under the SAME guard so a non-owning/legacy call changes nothing. The final UPDATE takes
+--      the runs row lock (serializing concurrent attempts) and returns 0 rows -> pgx.ErrNoRows
+--      when the guard fails — the caller's "not recorded" signal.
+--
+-- The outer references are qualified `runs.` on purpose: sqlc pulls the `ins` CTE (named in
+-- EXISTS below) into the outer name scope, so a bare `id`/`completion_attempts` would collide
+-- with ins's RETURNING column and trip its "column reference is ambiguous" analyzer.
+WITH ins AS (
+    INSERT INTO run_completion_attempts (run_id, contract_revision, unmet, head, worktree_fingerprint)
+    SELECT r.id, sqlc.narg('contract_revision'), @unmet::jsonb, sqlc.narg('head'), sqlc.narg('worktree_fingerprint')
+    FROM runs r
+    WHERE r.id = @run_id AND r.worker_id = @worker_id AND r.completion_contract_version IS NOT NULL
+    RETURNING run_completion_attempts.id
+),
+pruned AS (
+    DELETE FROM run_completion_attempts a
+    WHERE a.run_id = @run_id
+      AND EXISTS (SELECT 1 FROM ins)
+      AND a.id NOT IN (
+          SELECT b.id FROM run_completion_attempts b
+          WHERE b.run_id = @run_id
+          ORDER BY b.created_at DESC, b.id DESC
+          LIMIT 49
+      )
+    RETURNING a.id
+)
+UPDATE runs SET
+    completion_attempts = runs.completion_attempts + 1,
+    latest_completion_attempt = jsonb_build_object(
+        'unmet', @unmet::jsonb,
+        'head', sqlc.narg('head')::text,
+        'worktree_fingerprint', sqlc.narg('worktree_fingerprint')::text,
+        'at', now()
+    ),
+    updated_at = now()
+WHERE runs.id = @run_id AND runs.worker_id = @worker_id AND runs.completion_contract_version IS NOT NULL
+  AND EXISTS (SELECT 1 FROM ins)
+RETURNING runs.completion_attempts;
+
+-- name: UpsertCompletionPermit :one
+-- PRD #1226 M2 (D4/D5): idempotently ISSUE a structural completion permit bound to the exact
+-- identity (run_id, contract_revision, head). The UNIQUE (run_id, contract_revision, head) is
+-- the idempotency key: repeating an UNCHANGED request lands on the conflict path, which does a
+-- deliberate no-op UPDATE (branch = its own value) purely so RETURNING yields the PRE-EXISTING
+-- row — it NEVER resets consumed_at or issued_at, so a re-request returns the SAME permit
+-- rather than re-issuing or un-consuming one. audit is NULL and finding_ids is '{}' under
+-- profile=structural (reserved for #1231). issued_by_worker_id is the claim fence.
+--
+-- DO UPDATE SET branch = EXCLUDED.branch is the deliberate near-no-op forced by the
+-- idempotency contract: a re-request for the SAME (run_id, contract_revision, head) carries
+-- the same branch (a head fixes its branch), so this changes nothing; it exists only so
+-- RETURNING yields the PRE-EXISTING row on conflict. It touches ONLY branch — issued_at,
+-- issued_by_worker_id, consumed_at, audit and finding_ids are all preserved, so a re-request
+-- never re-issues nor un-consumes the permit. (EXCLUDED.branch, not the target table by name,
+-- because sqlc's analyzer treats a target-table self-reference in DO UPDATE as ambiguous.)
+--
+-- audit and finding_ids are DELIBERATELY OMITTED from the insert: their column defaults (NULL
+-- and '{}') are EXACTLY the structural values, and #1231 fills them by adding them here. This
+-- also keeps the statement in the plain @param / EXCLUDED shape sqlc's ON-CONFLICT analyzer
+-- accepts (a COALESCE(narg::text[], '{}') in the VALUES list trips its column resolver).
+INSERT INTO run_completion_permits (
+    run_id, contract_revision, branch, head, issued_by_worker_id
+) VALUES (
+    @run_id, @contract_revision, @branch, @head, sqlc.narg('issued_by_worker_id')
+)
+ON CONFLICT (run_id, contract_revision, head) DO UPDATE
+    SET branch = EXCLUDED.branch
+RETURNING *;
+
+-- name: GetUnconsumedCompletionPermit :one
+-- PRD #1226 M2 (D4/D5): fetch the UNCONSUMED permit for the exact identity, FOR UPDATE, inside
+-- the completion transaction. issued_by_worker_id fences it to the reporting worker (the claim
+-- fence). No row (identity/head/revision mismatch, already consumed, or a different worker)
+-- returns pgx.ErrNoRows, which completeRunWithPermit reads as "no matching permit -> the gated
+-- completion stays non-terminal".
+SELECT * FROM run_completion_permits
+WHERE run_id = @run_id AND contract_revision = @contract_revision AND head = @head
+  AND issued_by_worker_id = @issued_by_worker_id
+  AND consumed_at IS NULL
+FOR UPDATE;
+
+-- name: GetConsumedCompletionPermit :one
+-- PRD #1226 M2 (D4): the retry-after-response-loss probe. When a completed report arrives for
+-- an ALREADY-terminal run, completeRunWithPermit checks whether THIS worker's permit for the
+-- identity was already consumed (i.e. we completed it once and the response was lost); if so it
+-- returns idempotent success instead of a spurious denial. FOR UPDATE under the same
+-- run-row lock so the check serializes with a concurrent first completion.
+SELECT * FROM run_completion_permits
+WHERE run_id = @run_id AND contract_revision = @contract_revision AND head = @head
+  AND issued_by_worker_id = @issued_by_worker_id
+  AND consumed_at IS NOT NULL
+FOR UPDATE;
+
+-- name: ConsumeCompletionPermit :execrows
+-- PRD #1226 M2 (D4): consume the permit inside the completion transaction — stamp consumed_at
+-- once. Guarded on the worker fence and consumed_at IS NULL so a double-consume matches 0 rows;
+-- the caller requires exactly 1 row affected before writing `completed`.
+UPDATE run_completion_permits SET consumed_at = now()
+WHERE id = @id AND issued_by_worker_id = @issued_by_worker_id AND consumed_at IS NULL;
