@@ -221,11 +221,23 @@ func (s *Service) RequestCompletionPermit(ctx context.Context, wkr store.Worker,
 		}
 		return CompletionPermitResult{Granted: false, DenyReason: CompletionDenyMissingMilestones, Unmet: unmet}, nil
 	}
+	// NUL-strip the worker-authored branch and head before they reach the permit's `text NOT NULL`
+	// columns (migration 00212): a NUL raises Postgres 22021, which 500s the issue so the permit is
+	// never written — and because the interlocked run's terminal completion transaction can only
+	// consume a permit that was issued, that would PERMANENTLY block the run from completing (worse
+	// than the attempt path, which only loses an attempt log). This is the same worker-field
+	// discipline persistCompletionAttempt / stripNULParam apply everywhere else. head is stripped
+	// with the SAME helper (in the SAME order, before any trim) the CONSUME side
+	// (completeRunWithPermit) uses, so a real hex head matches at both issue and consume, and a NUL
+	// that strips to the same value matches too. Control/bidi/charset rejection is deliberately NOT
+	// done here — that render-boundary sanitization is M5's job.
+	cleanBranch, _ := stripNUL(req.Branch)
+	cleanHead, _ := stripNUL(req.Head)
 	permit, err := s.q.UpsertCompletionPermit(ctx, store.UpsertCompletionPermitParams{
 		RunID:            run.ID,
 		ContractRevision: run.ContractRevision.Int32,
-		Branch:           req.Branch,
-		Head:             req.Head,
+		Branch:           cleanBranch,
+		Head:             cleanHead,
 		IssuedByWorkerID: pgconv.UUID(wkr.ID),
 	})
 	if err != nil {
@@ -368,7 +380,14 @@ func (s *Service) completeRunWithPermit(ctx context.Context, wkr store.Worker, o
 	}
 	head := ""
 	if req.Head != nil {
-		head = strings.TrimSpace(*req.Head)
+		// NUL-strip BEFORE the trim (a NUL is not whitespace, so a "\x00 h \x00" would survive a
+		// trim) — the SAME helper and order the ISSUE side (RequestCompletionPermit) and
+		// persistCompletionAttempt use, so a real hex head, or a NUL that strips to one, matches the
+		// permit's stored head in the GetUnconsumed/GetConsumedCompletionPermit `WHERE head=$x`
+		// lookups below. Without it a NUL in the reported head raises Postgres 22021 on those params
+		// and 500s the completion. The TrimSpace + empty->non-terminal handling is unchanged.
+		clean, _ := stripNUL(*req.Head)
+		head = strings.TrimSpace(clean)
 	}
 	// No head or an unfrozen revision cannot match a permit → non-terminal (fail-closed). This is
 	// a cheap early-out on the pre-tx `owned` snapshot before we open a transaction; the

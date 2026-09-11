@@ -543,3 +543,78 @@ func TestAttemptNULStrippedLiveDB(t *testing.T) {
 		t.Fatalf("latest_completion_attempt summary = (%q, %q), want (deadbeef, wf1)", jHead, jWF)
 	}
 }
+
+// permitBranchHead reads the single stored run_completion_permits row's branch and head TEXT
+// columns (both `text NOT NULL`, migration 00212) — the two surfaces a NUL would 22021 on issue.
+func (e interlockLiveDB) permitBranchHead(t *testing.T, runID uuid.UUID) (branch, head string) {
+	t.Helper()
+	if err := e.pool.QueryRow(e.ctx,
+		`SELECT branch, head FROM run_completion_permits WHERE run_id = $1`, runID).
+		Scan(&branch, &head); err != nil {
+		t.Fatalf("read permit branch/head: %v", err)
+	}
+	return branch, head
+}
+
+// TestPermitNULStrippedEndToEndLiveDB (PRD #1226 hardening): a permit REQUESTED with a NUL in head
+// and/or branch is ISSUED NUL-stripped (no 22021 -> 500), and a completion REPORTED with the SAME
+// NUL-containing head strips to the same value and still matches and consumes that permit — end to
+// end, issue -> consume. This closes on the PERMIT path the symmetric NUL gap the attempt path
+// already fixed, where a 500 is WORSE: an unissued permit (both branch/head are `text NOT NULL`,
+// migration 00212) blocks the interlocked run's terminal completion transaction outright, not just
+// an attempt log, because that transaction can only consume a permit that was issued. It is the
+// same worker-field discipline every other worker-authored text field carries (stripNULParam /
+// persistCompletionAttempt). Mutation-sensitive: revert the strip in RequestCompletionPermit and
+// the issue 22021s (the permit-granted assertion reddens); revert it in completeRunWithPermit and
+// the consume 22021s (the SetState assertion reddens).
+func TestPermitNULStrippedEndToEndLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	svc := e.permitService(t)
+	wid := e.seedWorker(t, []string{"completion_interlock_v1"})
+	runID := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
+	wkr := store.Worker{ID: wid}
+	// A hostile NUL spliced into an otherwise-real head/branch; both strip to the SAME value on the
+	// issue and consume sides, so a legitimate completion still finds its permit.
+	const (
+		nulHead     = "ca\x00fef00d"
+		nulBranch   = "agent/\x00issue-1"
+		cleanHead   = "cafef00d"
+		cleanBranch = "agent/issue-1"
+	)
+
+	// ISSUE: a NUL in head/branch must not 22021 -> 500; the permit is issued NUL-stripped.
+	res, err := svc.RequestCompletionPermit(e.ctx, wkr, runID,
+		CompletionPermitRequest{ContractRevision: 1, Branch: nulBranch, Head: nulHead})
+	if err != nil {
+		t.Fatalf("a NUL in permit head/branch must be stripped, not error (22021 -> 500): %v", err)
+	}
+	if !res.Granted || res.Permit == nil {
+		t.Fatalf("the permit must be granted (NUL stripped): %+v", res)
+	}
+	if res.Permit.Head != cleanHead || res.Permit.Branch != cleanBranch {
+		t.Fatalf("issued permit DTO = (head %q, branch %q), want (%q, %q) NUL stripped",
+			res.Permit.Head, res.Permit.Branch, cleanHead, cleanBranch)
+	}
+	// The stored `text NOT NULL` columns carry the stripped values.
+	if b, h := e.permitBranchHead(t, runID); b != cleanBranch || h != cleanHead {
+		t.Fatalf("stored permit = (branch %q, head %q), want (%q, %q) NUL stripped", b, h, cleanBranch, cleanHead)
+	}
+
+	// CONSUME: a completed report carrying the SAME NUL head strips to the same value, matches the
+	// issued permit, terminates the interlocked run, and consumes the permit exactly once.
+	run, applied, err := svc.SetState(e.ctx, wkr, runID,
+		StateRequest{State: "completed", Head: strPtr(nulHead), Branch: strPtr(nulBranch)})
+	if err != nil {
+		t.Fatalf("a NUL head on the consume side must be stripped, not error (22021 -> 500): %v", err)
+	}
+	if !applied || run.Status != "completed" {
+		t.Fatalf("a NUL head that strips to the issued permit's head must complete the run; applied=%v status=%q", applied, run.Status)
+	}
+	var consumed bool
+	if err := e.pool.QueryRow(e.ctx, `SELECT consumed_at IS NOT NULL FROM run_completion_permits WHERE run_id = $1`, runID).Scan(&consumed); err != nil {
+		t.Fatalf("read permit: %v", err)
+	}
+	if !consumed {
+		t.Fatal("the permit must be consumed by the NUL-head completion")
+	}
+}
