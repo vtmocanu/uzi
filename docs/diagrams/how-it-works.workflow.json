@@ -2,7 +2,7 @@
   "schema_version": 2,
   "diagram_type": "workflow",
   "meta": {
-    "title": "How uzi works",
+    "title": "How uzi ships an issue",
     "quality_profile": "showcase",
     "legend": {
       "mode": "auto",
@@ -10,276 +10,406 @@
         "security": {
           "label": "Human decision"
         },
+        "backend": {
+          "label": "uzi agents"
+        },
         "messagebus": {
           "label": "CI trigger"
         },
-        "backend": {
-          "label": "uzi agents"
+        "external": {
+          "label": "External"
         }
       }
     }
   },
   "lanes": [
     {
-      "id": "plan",
-      "label": "Plan"
-    },
-    {
-      "id": "ci",
-      "label": "CI fix"
+      "id": "intake",
+      "label": "Intake & planning"
     },
     {
       "id": "build",
-      "label": "Build"
+      "label": "Implementation loop"
     },
     {
       "id": "ship",
-      "label": "Review & ship"
+      "label": "Ship, review & merge"
     }
   ],
   "groups": [
     {
       "id": "loop",
-      "label": "Implement + review loop",
+      "label": "Lead orchestrates agents",
       "lane": "build",
-      "fromCol": 2,
-      "toCol": 3,
+      "fromCol": 3,
+      "toCol": 4,
       "variant": "emphasis"
     }
   ],
-  "mainPath": [
-    "issue",
-    "leadPlans",
-    "planGate",
-    "coder",
-    "validate",
-    "pr",
-    "humanReview",
-    "done"
-  ],
+  "semanticChecks": {
+    "allowedRoots": [
+      "A",
+      "H"
+    ],
+    "allowedTerminals": [
+      "G"
+    ],
+    "requiredPaths": [
+      {
+        "from": "A",
+        "to": "G"
+      },
+      {
+        "from": "H",
+        "to": "C"
+      }
+    ]
+  },
   "nodes": [
     {
-      "id": "issue",
-      "lane": "plan",
-      "col": 0,
-      "type": "external",
-      "label": "Issue labeled uzi",
-      "sublabel": "from your forge",
-      "width": 128
-    },
-    {
-      "id": "leadPlans",
-      "lane": "plan",
-      "col": 1,
-      "type": "backend",
-      "label": "Lead plans",
-      "sublabel": "drafts approach",
-      "width": 118
-    },
-    {
-      "id": "planGate",
-      "lane": "plan",
-      "col": 2,
-      "type": "security",
-      "label": "Plan gate",
-      "sublabel": "you approve",
-      "tag": "human",
-      "width": 118
-    },
-    {
-      "id": "redpipe",
-      "lane": "ci",
+      "id": "H",
+      "lane": "intake",
       "col": 0,
       "type": "messagebus",
       "label": "Red pipeline",
       "sublabel": "CI failed",
-      "width": 118
+      "width": 140,
+      "yOffset": 64
     },
     {
-      "id": "fixci",
-      "lane": "ci",
+      "id": "I",
+      "lane": "intake",
       "col": 1,
       "type": "backend",
       "label": "Fix CI run",
-      "sublabel": "diagnose",
-      "width": 118
+      "sublabel": "diagnose + fix",
+      "width": 150,
+      "yOffset": 64
     },
     {
-      "id": "coder",
+      "id": "A",
+      "lane": "intake",
+      "col": 0,
+      "type": "external",
+      "label": "uzi-labeled issue",
+      "sublabel": "or assigned to uzi-bot",
+      "width": 196,
+      "yOffset": -64
+    },
+    {
+      "id": "B",
+      "lane": "intake",
+      "col": 1,
+      "type": "backend",
+      "label": "Lead plans",
+      "sublabel": "reads repo",
+      "width": 140,
+      "yOffset": -64
+    },
+    {
+      "id": "C",
+      "lane": "intake",
+      "col": 2,
+      "type": "security",
+      "label": "Plan gate",
+      "sublabel": "human approval",
+      "width": 150,
+      "yOffset": 0
+    },
+    {
+      "id": "CO",
       "lane": "build",
       "col": 2,
       "type": "backend",
-      "label": "Coder implements",
+      "label": "coder implements",
       "sublabel": "writes code",
-      "width": 118
+      "width": 160
     },
     {
-      "id": "validate",
+      "id": "R",
       "lane": "build",
       "col": 3,
       "type": "backend",
-      "label": "Specialist review",
-      "sublabel": "review · audit · test · verify",
-      "width": 152
+      "label": "reviewer",
+      "sublabel": "correctness",
+      "width": 132,
+      "yOffset": -108
     },
     {
-      "id": "pr",
+      "id": "AU",
+      "lane": "build",
+      "col": 3,
+      "type": "backend",
+      "label": "auditor",
+      "sublabel": "security scan",
+      "width": 132,
+      "yOffset": -36
+    },
+    {
+      "id": "TE",
+      "lane": "build",
+      "col": 3,
+      "type": "backend",
+      "label": "tester",
+      "sublabel": "runs the gate",
+      "width": 132,
+      "yOffset": 36
+    },
+    {
+      "id": "FC",
+      "lane": "build",
+      "col": 3,
+      "type": "backend",
+      "label": "fact-checker",
+      "sublabel": "verifies claims",
+      "width": 150,
+      "yOffset": 108
+    },
+    {
+      "id": "VG",
       "lane": "build",
       "col": 4,
       "type": "backend",
-      "label": "Branch + PR",
-      "sublabel": "never main",
-      "width": 118
+      "label": "validated?",
+      "sublabel": "all agents pass",
+      "width": 150,
+      "tag": "fan-in gate"
     },
     {
-      "id": "rework",
+      "id": "E",
       "lane": "ship",
       "col": 3,
       "type": "backend",
-      "label": "uzi reworks PR",
-      "sublabel": "on your comments",
-      "width": 118
+      "label": "Branch + PR",
+      "sublabel": "opens MR",
+      "width": 140,
+      "yOffset": -70
     },
     {
-      "id": "humanReview",
+      "id": "F",
       "lane": "ship",
       "col": 4,
       "type": "security",
       "label": "Human review",
-      "sublabel": "you decide",
-      "tag": "human",
-      "width": 118
+      "sublabel": "merge or comment",
+      "width": 160,
+      "yOffset": -70
     },
     {
-      "id": "done",
+      "id": "G",
       "lane": "ship",
       "col": 5,
       "type": "external",
       "label": "Done",
-      "sublabel": "PR merged",
-      "width": 118
+      "sublabel": "merged",
+      "width": 118,
+      "yOffset": -70
+    },
+    {
+      "id": "AR",
+      "lane": "ship",
+      "col": 4,
+      "type": "external",
+      "label": "CodeRabbit",
+      "sublabel": "+ AI reviewers",
+      "width": 150,
+      "yOffset": 70
+    },
+    {
+      "id": "RW",
+      "lane": "ship",
+      "col": 2,
+      "type": "backend",
+      "label": "uzi reworks PR",
+      "sublabel": "auto-approved",
+      "width": 158,
+      "yOffset": 70
     }
   ],
   "edges": [
     {
       "id": "issue-plan",
-      "from": "issue",
-      "to": "leadPlans",
-      "variant": "default"
+      "from": "A",
+      "to": "B",
+      "role": "main",
+      "width": 2.2
     },
     {
       "id": "plan-gate",
-      "from": "leadPlans",
-      "to": "planGate",
-      "variant": "emphasis"
-    },
-    {
-      "id": "gate-reject",
-      "from": "planGate",
-      "to": "leadPlans",
-      "label": "reject with reason",
-      "variant": "default",
-      "role": "return"
-    },
-    {
-      "id": "gate-approve",
-      "from": "planGate",
-      "to": "coder",
-      "label": "approve",
-      "variant": "emphasis",
+      "from": "B",
+      "to": "C",
       "role": "main",
-      "toSide": "left",
-      "fromSide": "bottom"
+      "width": 2.2
     },
     {
-      "id": "coder-validate",
-      "from": "coder",
-      "to": "validate",
-      "variant": "emphasis"
+      "id": "reject",
+      "from": "C",
+      "to": "B",
+      "label": "reject with reason",
+      "role": "error",
+      "variant": "dashed",
+      "width": 1.1
     },
     {
-      "id": "validate-changes",
-      "from": "validate",
-      "to": "coder",
-      "label": "needs changes",
-      "variant": "default",
-      "role": "return"
+      "id": "approve",
+      "from": "C",
+      "to": "CO",
+      "label": "approve",
+      "role": "main",
+      "width": 2.2,
+      "via": [[462, 390]]
     },
     {
-      "id": "validate-good",
-      "from": "validate",
-      "to": "pr",
-      "label": "looks good",
-      "variant": "emphasis",
-      "role": "main"
+      "id": "co-r",
+      "from": "CO",
+      "to": "R",
+      "role": "branch",
+      "fromSide": "right"
     },
     {
-      "id": "pr-review",
-      "from": "pr",
-      "to": "humanReview",
-      "variant": "emphasis"
+      "id": "co-au",
+      "from": "CO",
+      "to": "AU",
+      "role": "branch",
+      "fromSide": "right"
     },
     {
-      "id": "review-merge",
-      "from": "humanReview",
-      "to": "done",
-      "label": "merge",
-      "variant": "emphasis",
-      "role": "main"
+      "id": "co-te",
+      "from": "CO",
+      "to": "TE",
+      "role": "branch",
+      "fromSide": "right"
     },
     {
-      "id": "review-comments",
-      "from": "humanReview",
-      "to": "rework",
-      "label": "comments",
-      "variant": "default",
+      "id": "co-fc",
+      "from": "CO",
+      "to": "FC",
+      "role": "branch",
+      "fromSide": "right"
+    },
+    {
+      "id": "r-vg",
+      "from": "R",
+      "to": "VG",
       "role": "branch"
     },
     {
-      "id": "rework-coder",
-      "from": "rework",
-      "to": "coder",
-      "variant": "default",
-      "role": "return"
+      "id": "au-vg",
+      "from": "AU",
+      "to": "VG",
+      "role": "branch"
     },
     {
-      "id": "redpipe-fixci",
-      "from": "redpipe",
-      "to": "fixci",
-      "variant": "default"
+      "id": "te-vg",
+      "from": "TE",
+      "to": "VG",
+      "role": "branch"
     },
     {
-      "id": "fixci-gate",
-      "from": "fixci",
-      "to": "planGate",
-      "variant": "default",
+      "id": "fc-vg",
+      "from": "FC",
+      "to": "VG",
+      "role": "branch"
+    },
+    {
+      "id": "needs-changes",
+      "from": "VG",
+      "to": "CO",
+      "label": "needs changes",
+      "role": "error",
+      "variant": "dashed",
+      "width": 1.1,
+      "toSide": "left"
+    },
+    {
+      "id": "looks-good",
+      "from": "VG",
+      "to": "E",
+      "label": "looks good",
+      "role": "main",
+      "width": 2.2
+    },
+    {
+      "id": "pr-human",
+      "from": "E",
+      "to": "F",
+      "role": "main",
+      "width": 2.2
+    },
+    {
+      "id": "pr-ai",
+      "from": "E",
+      "to": "AR",
+      "role": "branch"
+    },
+    {
+      "id": "merge",
+      "from": "F",
+      "to": "G",
+      "label": "merge",
+      "role": "main",
+      "width": 2.2
+    },
+    {
+      "id": "human-comments",
+      "from": "F",
+      "to": "RW",
+      "label": "comments",
+      "role": "branch"
+    },
+    {
+      "id": "ai-comments",
+      "from": "AR",
+      "to": "RW",
+      "label": "comments",
+      "role": "branch"
+    },
+    {
+      "id": "rework",
+      "from": "RW",
+      "to": "CO",
+      "label": "auto-approved fix",
+      "role": "branch",
+      "variant": "dashed",
+      "width": 1.1
+    },
+    {
+      "id": "red-fix",
+      "from": "H",
+      "to": "I",
+      "role": "branch"
+    },
+    {
+      "id": "fix-replan",
+      "from": "I",
+      "to": "C",
       "role": "branch",
       "toSide": "left"
     }
   ],
   "cards": [
     {
-      "dot": "violet",
+      "dot": "rose",
       "title": "Two decisions stay human",
       "items": [
-        "You approve the plan before any code is written",
-        "You merge the pull request; uzi never merges"
+        "The Plan gate approves the approach before any code",
+        "Human review decides merge; everything between is agents"
       ]
     },
     {
       "dot": "emerald",
       "title": "main is never touched",
       "items": [
-        "Work lands on a fresh branch and a pull request",
-        "Guardrails hold even under an adversarial prompt"
+        "Agents work a branch and open a pull request",
+        "A human merges; uzi only reworks on comments"
       ]
     },
     {
       "dot": "cyan",
       "title": "Reviewers run in parallel",
       "items": [
-        "Reviewer, auditor, tester and fact-checker validate each change",
-        "Issues and red pipelines both reach the plan gate"
+        "reviewer, auditor, tester and fact-checker fan out at once",
+        "Work advances only when all of them pass"
       ]
     }
   ]
