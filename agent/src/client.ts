@@ -9,6 +9,8 @@ import {
   type CreateProposalRequest,
   type CompletionAttemptRequest,
   type CompletionAttemptResponse,
+  type CompletionPermitRequest,
+  type CompletionPermitResponse,
   type ReportFindingRequest,
   type HeartbeatRequest,
   type MessagesRequest,
@@ -210,6 +212,28 @@ export interface ResolveMRThreadDTO {
   resolved: boolean;
 }
 
+/** A completion permit as the worker sees it (PRD #1226 M4, D5), mapped from the wire
+ *  CompletionPermitResponse.permit. Carries no secret and no forge coordinate. */
+export interface CompletionPermit {
+  id: string;
+  contractRevision: number;
+  branch: string;
+  head: string;
+  issuedAt: string;
+  findingIds: string[];
+}
+
+/** The completion-permit endpoint's decision (PRD #1226 M4, D5), mapped from
+ *  CompletionPermitResponse. `granted` true carries `permit`; `granted` false carries a
+ *  `denyReason` from the server taxonomy (and `unmet` for missing_milestones). Every
+ *  denial is NON-TERMINAL — the run keeps its status and the caller acts on the reason. */
+export interface CompletionPermitResult {
+  granted: boolean;
+  denyReason?: string;
+  unmet?: string[];
+  permit?: CompletionPermit;
+}
+
 /** Transport for the worker→API control plane (PRD §Worker protocol). */
 export class WorkerClient {
   private readonly sleep: (ms: number) => Promise<void>;
@@ -361,6 +385,11 @@ export class WorkerClient {
           // closure can fold it into the IterationBudget the loop-top pause branch reads.
           if (fields.pauseRequested !== undefined)
             ack.pauseRequested = fields.pauseRequested;
+          // PRD #1226 M4 (D3): the server-decided one-shot budget_exhausted steer rides the same
+          // ACK beside pauseRequested, so a live post-attempt run learns it must enter the
+          // completion hold.
+          if (fields.budgetExhausted !== undefined)
+            ack.budgetExhausted = fields.budgetExhausted;
           if (!ack.applied) {
             this.log.info("state report not applied server-side", {
               run_id: runId,
@@ -554,6 +583,64 @@ export class WorkerClient {
       body,
     )) as CompletionAttemptResponse;
     return { unmet: res.unmet ?? [], attemptCount: res.attempt_count ?? 0 };
+  }
+
+  /** Ask the server to issue a completion permit for the exact-head verify (POST /worker/
+   *  runs/:id/completion/permit, PRD #1226 M4, D5). The server recomputes its OWNED structural
+   *  predicates and, on a clean recompute, issues (idempotently) a permit bound to (run,
+   *  contract_revision, branch, head). Every rejection is a NON-TERMINAL structured denial —
+   *  `granted:false` with a `denyReason` (and `unmet` for missing_milestones) — so the caller
+   *  reworks/holds/stops rather than treating it as an error. Throws RequestError only on a
+   *  transport/HTTP error (the denial is a 200 body, not a 4xx). */
+  async requestCompletionPermit(
+    runId: string,
+    args: { contractRevision: number; branch: string; head: string },
+  ): Promise<CompletionPermitResult> {
+    const body: CompletionPermitRequest = {
+      contract_revision: args.contractRevision,
+      branch: args.branch,
+      head: args.head,
+    };
+    const res = (await this.postJSON(
+      `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/completion/permit`,
+      body,
+    )) as CompletionPermitResponse;
+    const result: CompletionPermitResult = { granted: res.granted ?? false };
+    if (res.deny_reason !== undefined) result.denyReason = res.deny_reason;
+    if (res.unmet !== undefined) result.unmet = res.unmet;
+    if (res.permit) {
+      result.permit = {
+        id: res.permit.id,
+        contractRevision: res.permit.contract_revision,
+        branch: res.permit.branch,
+        head: res.permit.head,
+        issuedAt: res.permit.issued_at,
+        findingIds: res.permit.finding_ids ?? [],
+      };
+    }
+    return result;
+  }
+
+  /** Ask the server to park an interlocked run on the completion HOLD (POST /worker/runs/:id/
+   *  completion/hold, PRD #1226 M4, D6). The server returns `{run: RunDTO}` on BOTH 200 (hold
+   *  landed, status becomes "paused") AND 409 (hold refused, RETAIN the run) — a 409 is NOT an
+   *  error here. CRITICAL: the worker's park order keys off the RETURNED run.status being
+   *  literally "paused", so both statuses are read off the body (like reportState) rather than a
+   *  409 throwing through postJSON. Returns `{ status }` = the run's status from the response
+   *  body (paused on a landed hold, the real status on a refusal); an unmodelled 2xx or an
+   *  unreadable body yields "" (never "paused" ⇒ retain, the safe default). A genuine transport
+   *  error or a non-200/409 4xx/5xx still throws RequestError. */
+  async requestCompletionHold(runId: string, args: { head: string }): Promise<{ status: string }> {
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/completion/hold`;
+    const res = await this.fetchRaw("POST", path, { head: args.head });
+    if (res.status === 200 || res.status === 409) {
+      const fields = await readRunAck(res);
+      return { status: fields.status ?? "" };
+    }
+    if (res.status >= 400) throw await this.toError("POST", path, res);
+    // A 2xx we do not model (e.g. 204 from an older server): no status came back, which is
+    // not "paused" and so retains the run.
+    return { status: "" };
   }
 
   // ── Inline run summaries (PRD #362 M3c) ────────────────────────────────────
@@ -857,6 +944,7 @@ export async function readRunAck(res: Response): Promise<{
   scopeCeiling?: number;
   completedCount?: number;
   pauseRequested?: boolean;
+  budgetExhausted?: boolean;
 }> {
   try {
     const text = await res.text();
@@ -869,6 +957,7 @@ export async function readRunAck(res: Response): Promise<{
         scope_ceiling?: unknown;
         milestones_completed?: unknown;
         pause_requested?: unknown;
+        completion_budget_exhausted?: unknown;
       };
     };
     const run = parsed?.run;
@@ -879,6 +968,7 @@ export async function readRunAck(res: Response): Promise<{
       scopeCeiling?: number;
       completedCount?: number;
       pauseRequested?: boolean;
+      budgetExhausted?: boolean;
     } = {};
     if (typeof run?.status === "string") out.status = run.status;
     if (typeof run?.budget_max_iterations === "number")
@@ -901,6 +991,12 @@ export async function readRunAck(res: Response): Promise<{
     // absent, which the loop-top pause branch reads as "no pause requested".
     if (typeof run?.pause_requested === "boolean")
       out.pauseRequested = run.pause_requested;
+    // PRD #1226 M4 (D3): the server-decided one-shot budget_exhausted steer rides the same
+    // {run: RunDTO} body beside pause_requested. A boolean only — a non-boolean (older server
+    // that omits it, unparseable value) leaves it absent, which the completion-hold branch
+    // reads as "no budget-exhausted steer".
+    if (typeof run?.completion_budget_exhausted === "boolean")
+      out.budgetExhausted = run.completion_budget_exhausted;
     return out;
   } catch {
     return {};

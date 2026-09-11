@@ -713,6 +713,11 @@ export interface IterationBudget {
    *  to decide whether to park the run at this boundary; the worker honours the boolean and the
    *  server owns the rule (Decision 4). Absent ⇒ no pause requested this iteration. */
   pauseRequested?: boolean;
+  /** PRD #1226 M4 (D3): the server-decided one-shot steer that a LIVE post-attempt run past its
+   *  wall must enter the completion hold, carried off the SAME running-report ACK as the
+   *  pause/budget fields (StateAck.budgetExhausted, the DTO's `completion_budget_exhausted`).
+   *  Same delivery seam as `pauseRequested`; absent ⇒ no budget-exhausted steer this iteration. */
+  budgetExhausted?: boolean;
 }
 
 /** One human comment on the worked issue, snapshotted at run creation (PRD #381).
@@ -1240,6 +1245,37 @@ export interface CompletionAttemptRequest {
 export interface CompletionAttemptResponse {
   unmet: string[];
   attempt_count: number;
+}
+
+/** Request body for POST /api/worker/runs/:id/completion/permit (PRD #1226 M4, D5). The
+ *  worker asks the server to issue a completion permit: the frozen `contract_revision` it
+ *  believes it is completing against, the source `branch`, and the EXACT final `head` H the
+ *  alignment/push path landed. The server recomputes its OWNED structural predicates and
+ *  never trusts a "milestones done" claim — there is none in the request. */
+export interface CompletionPermitRequest {
+  contract_revision: number;
+  branch: string;
+  head: string;
+}
+
+/** Response body for POST /api/worker/runs/:id/completion/permit (PRD #1226 M4, D5), the
+ *  server's permit decision. `granted:true` carries `permit` (bound to run,
+ *  contract_revision, branch, head); `granted:false` carries a `deny_reason` from the
+ *  server taxonomy (stale_claim / not_interlocked / revision_drift / contract_not_frozen /
+ *  missing_milestones / empty_head) and, for missing_milestones, the `unmet` id list. EVERY
+ *  denial is NON-TERMINAL — the run keeps its status and the worker acts on the reason. */
+export interface CompletionPermitResponse {
+  granted: boolean;
+  deny_reason?: string;
+  unmet?: string[];
+  permit?: {
+    id: string;
+    contract_revision: number;
+    branch: string;
+    head: string;
+    issued_at: string;
+    finding_ids: string[];
+  };
 }
 
 /** Request body for POST /api/worker/runs/:id/findings (PRD #333 M2). The server
@@ -1789,6 +1825,13 @@ export interface StateRequest {
    *  excludes a follow-up consumed mid-round-trip from the watermark, so its later wake
    *  succeeds instead of stranding the run. Additive + optional. */
   open_followup_id?: number;
+  /** PRD #1226 M4 (D5): the EXACT final head H a COMPLETED report is made against — the
+   *  commit the alignment/push path landed. The api consumes the completion permit issued
+   *  for (run, contract_revision, branch, head), so the head reported here must be the same
+   *  40-hex commit the permit was bound to. Additive + optional and ABSENT on a legacy /
+   *  non-completed report — an old worker omits it and a non-interlocked completion has no
+   *  permit to match. */
+  head?: string;
 }
 
 /**
@@ -1847,6 +1890,13 @@ export interface StateAck {
    *  pause branch reads it (via IterationBudget). Absent/non-boolean (older server, unparseable
    *  body) ⇒ treated as false = "no pause requested". */
   pauseRequested?: boolean;
+  /** PRD #1226 M4 (D3): the SERVER-DECIDED one-shot `budget_exhausted` steer, read off the SAME
+   *  `{run: RunDTO}` body as `status` (the DTO's `completion_budget_exhausted` field, built beside
+   *  `pause_requested`). true when the server has stamped the run's completion budget exhausted,
+   *  steering a live post-attempt worker into the completion hold. The worker just HONOURS the
+   *  boolean; the server owns the rule. Absent/non-boolean (older server, unparseable body) ⇒
+   *  treated as false = "no budget-exhausted steer". */
+  budgetExhausted?: boolean;
 }
 
 export interface UserInput {

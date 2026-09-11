@@ -380,6 +380,128 @@ describe("createMergeRequest — transient findOpenMr during a duplicate (PRD #2
   });
 });
 
+// PRD #1226 M4 (D5): the forge-neutral PR-head read. Each driver GETs its own single-MR/PR
+// endpoint and parses the true source-branch head, returning a validated 40-hex commit id;
+// a non-200, a missing head field, or a malformed SHA throws a ForgeError (the caller treats
+// a failed head-read as "cannot verify H" — non-terminal). The PAT rides the auth header only.
+const HEAD_DIFF_REFS = "1111111111111111111111111111111111111111";
+const HEAD_TOP_LEVEL = "2222222222222222222222222222222222222222";
+const HEAD_PR = "abcdef0123456789abcdef0123456789abcdef01";
+
+describe("GitLabClient.getMergeRequestHead", () => {
+  it("GETs the single-MR endpoint (PAT header only) and PREFERS diff_refs.head_sha over the top-level sha", async () => {
+    const { fetchFn, calls } = recorder([
+      { status: 200, body: { iid: 42, sha: HEAD_TOP_LEVEL, diff_refs: { head_sha: HEAD_DIFF_REFS } } },
+    ]);
+    const head = await new GitLabClient({ fetchFn }).getMergeRequestHead(base.repoUrl, PAT, 42);
+
+    assert.strictEqual(head, HEAD_DIFF_REFS);
+    const call = calls[0]!;
+    assert.strictEqual(call.method, "GET");
+    assert.match(call.url, /\/api\/v4\/projects\/group%2Fsub%2Frepo\/merge_requests\/42$/);
+    assert.strictEqual(call.headers["PRIVATE-TOKEN"], PAT);
+    assert.ok(!call.url.includes(PAT), "PAT not in URL");
+  });
+
+  it("falls back to the top-level sha when diff_refs.head_sha is absent", async () => {
+    const { fetchFn } = recorder([{ status: 200, body: { iid: 42, sha: HEAD_TOP_LEVEL } }]);
+    const head = await new GitLabClient({ fetchFn }).getMergeRequestHead(base.repoUrl, PAT, 42);
+    assert.strictEqual(head, HEAD_TOP_LEVEL);
+  });
+
+  it("throws a ForgeError when both head fields are absent", async () => {
+    const { fetchFn } = recorder([{ status: 200, body: { iid: 42 } }]);
+    await assert.rejects(
+      new GitLabClient({ fetchFn }).getMergeRequestHead(base.repoUrl, PAT, 42),
+      (err: unknown) => err instanceof ForgeError,
+    );
+  });
+
+  it("throws a ForgeError on a malformed (non-40-hex) sha", async () => {
+    const { fetchFn } = recorder([{ status: 200, body: { iid: 42, diff_refs: { head_sha: "not-a-real-sha" } } }]);
+    await assert.rejects(
+      new GitLabClient({ fetchFn }).getMergeRequestHead(base.repoUrl, PAT, 42),
+      (err: unknown) => err instanceof ForgeError,
+    );
+  });
+
+  it("throws a ForgeError (no PAT in the message) on a non-200", async () => {
+    const { fetchFn } = recorder([{ status: 404, body: { message: "404 Not found" } }]);
+    await assert.rejects(
+      new GitLabClient({ fetchFn }).getMergeRequestHead(base.repoUrl, PAT, 42),
+      (err: unknown) => err instanceof ForgeError && err.status === 404 && !err.message.includes(PAT),
+    );
+  });
+});
+
+describe("ForgejoClient.getMergeRequestHead", () => {
+  it("GETs the single-PR endpoint (token header only) and parses head.sha", async () => {
+    const { fetchFn, calls } = recorder([{ status: 200, body: { number: 42, head: { sha: HEAD_PR } } }]);
+    const head = await new ForgejoClient({ fetchFn }).getMergeRequestHead(fjBase.repoUrl, PAT, 42);
+
+    assert.strictEqual(head, HEAD_PR);
+    const call = calls[0]!;
+    assert.strictEqual(call.method, "GET");
+    assert.match(call.url, /\/api\/v1\/repos\/org\/repo\/pulls\/42$/);
+    assert.strictEqual(call.headers["Authorization"], `token ${PAT}`);
+    assert.ok(!call.url.includes(PAT), "PAT not in URL");
+  });
+
+  it("throws a ForgeError when head.sha is missing", async () => {
+    const { fetchFn } = recorder([{ status: 200, body: { number: 42, head: {} } }]);
+    await assert.rejects(
+      new ForgejoClient({ fetchFn }).getMergeRequestHead(fjBase.repoUrl, PAT, 42),
+      (err: unknown) => err instanceof ForgeError,
+    );
+  });
+
+  it("throws a ForgeError on a malformed head.sha", async () => {
+    const { fetchFn } = recorder([{ status: 200, body: { number: 42, head: { sha: "deadbeef" } } }]);
+    await assert.rejects(
+      new ForgejoClient({ fetchFn }).getMergeRequestHead(fjBase.repoUrl, PAT, 42),
+      (err: unknown) => err instanceof ForgeError,
+    );
+  });
+
+  it("throws a ForgeError on a non-200", async () => {
+    const { fetchFn } = recorder([{ status: 404, body: { message: "not found" } }]);
+    await assert.rejects(
+      new ForgejoClient({ fetchFn }).getMergeRequestHead(fjBase.repoUrl, PAT, 42),
+      (err: unknown) => err instanceof ForgeError && err.status === 404,
+    );
+  });
+});
+
+describe("GitHubClient.getMergeRequestHead", () => {
+  it("GETs api.github.com/repos/{o}/{r}/pulls/{n} (Bearer header only) and parses head.sha", async () => {
+    const { fetchFn, calls } = recorder([{ status: 200, body: { number: 42, head: { sha: HEAD_PR } } }]);
+    const head = await new GitHubClient({ fetchFn }).getMergeRequestHead(ghBase.repoUrl, PAT, 42);
+
+    assert.strictEqual(head, HEAD_PR);
+    const call = calls[0]!;
+    assert.strictEqual(call.method, "GET");
+    assert.strictEqual(call.url, "https://api.github.com/repos/octo/repo/pulls/42");
+    assert.strictEqual(call.headers["Authorization"], `Bearer ${PAT}`);
+    assert.ok(!call.url.includes(PAT), "PAT not in URL");
+  });
+
+  it("throws a ForgeError when head.sha is missing", async () => {
+    const { fetchFn } = recorder([{ status: 200, body: { number: 42, head: {} } }]);
+    await assert.rejects(
+      new GitHubClient({ fetchFn }).getMergeRequestHead(ghBase.repoUrl, PAT, 42),
+      (err: unknown) => err instanceof ForgeError,
+    );
+  });
+
+  it("throws a ForgeError on a non-200", async () => {
+    const { fetchFn } = recorder([{ status: 403, body: { message: "forbidden" } }]);
+    await assert.rejects(
+      new GitHubClient({ fetchFn }).getMergeRequestHead(ghBase.repoUrl, PAT, 42),
+      (err: unknown) => err instanceof ForgeError && err.status === 403,
+    );
+  });
+});
+
 describe("forgeClientFor", () => {
   it("selects GitLab for absent/gitlab, Forgejo for forgejo, GitHub for github", () => {
     assert.ok(forgeClientFor(undefined) instanceof GitLabClient);
