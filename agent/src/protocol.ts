@@ -641,6 +641,13 @@ export interface ClaimConfig {
    *  (tool_packages) is already denylist-checked server-side and is NEVER filtered
    *  locally. Absent on an older server ⇒ undefined ⇒ no filtering (today's behavior). */
   denied_tool_packages?: string[];
+  /** PRD #1226 M3 (D1/D2): the completion-interlock discriminator. Non-nil (value 1 today)
+   *  ⇒ this run is INTERLOCKED and the worker must run the structural completion protocol
+   *  (checkpoint-first same-lead attempt loop, permit before PR). Read straight off
+   *  runs.completion_contract_version, stamped by the rollout switch at CreateRun (M1). This is
+   *  WORKER-ONLY claim config — deliberately NOT on the web RunDTO. Absent (a legacy run, or
+   *  rollout OFF) ⇒ the worker runs the legacy path, byte-identical to today. */
+  completion_contract_version?: number;
 }
 
 /**
@@ -1212,6 +1219,27 @@ export interface CreateProposalRequest {
   title: string;
   description: string;
   labels: string[];
+}
+
+/** Request body for POST /api/worker/runs/:id/completion/attempt (PRD #1226 M3). The lead's
+ *  same-session structural completion attempt: the worker reports the signal_done declaration
+ *  (`milestones_completed`) plus the branch tip (`head`) and worktree fingerprint. The server
+ *  subset-validates the declaration against the frozen list, UNION-merges it into
+ *  runs.milestones_completed, recomputes the unmet structural criteria over the merged set, and
+ *  records a bounded attempt — all in one call. Everything is SERVER-authoritative; the worker
+ *  reworks against the returned unmet set, never its own belief. */
+export interface CompletionAttemptRequest {
+  milestones_completed: string[];
+  head: string | null;
+  worktree_fingerprint: string | null;
+}
+
+/** Response body for POST /api/worker/runs/:id/completion/attempt (PRD #1226 M3): the
+ *  server-authoritative unmet structural criteria (empty ⇒ every frozen milestone is declared
+ *  complete) and the run's new monotone attempt count. */
+export interface CompletionAttemptResponse {
+  unmet: string[];
+  attempt_count: number;
 }
 
 /** Request body for POST /api/worker/runs/:id/findings (PRD #333 M2). The server

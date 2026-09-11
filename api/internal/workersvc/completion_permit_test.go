@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -328,6 +329,53 @@ func TestRecordCompletionAttemptEndpoint(t *testing.T) {
 		}
 		if len(fs.recordedAttempts) != 1 || fs.recordedAttempts[0].WorktreeFingerprint.String != "wf" {
 			t.Fatalf("attempt not recorded with fingerprint; got %+v", fs.recordedAttempts)
+		}
+	})
+
+	t.Run("union-merges the declaration and recomputes over the merged set (M3)", func(t *testing.T) {
+		run := interlockedRun(w)
+		run.Kind = runkind.Issue
+		run.MilestonesFrozen = frozenJSON(t, "m1", "m2", "m3")
+		run.CompletionContract = contractJSON(t, "m1", "m2", "m3")
+		run.MilestonesCompleted = idsJSON(t, "m1")
+		fs := &fakeStore{runOwned: run, recordAttemptCount: 2}
+		svc := New(fs, newBox(t), testParams())
+		// Declare m2 (a member) AND a non-member "bogus" via the attempt endpoint.
+		res, err := svc.RecordCompletionAttempt(context.Background(), w, run.ID,
+			CompletionAttemptRequest{MilestonesCompleted: []string{"m2", "bogus"}, Head: "h"})
+		if err != nil {
+			t.Fatalf("unexpected err: %v", err)
+		}
+		// A whole set containing a non-member is rejected by progressParams (all-or-nothing), so
+		// nothing is unioned and the recompute stays [m2 m3].
+		if len(res.Unmet) != 2 || res.Unmet[0] != "m2" || res.Unmet[1] != "m3" {
+			t.Fatalf("unmet = %v, want [m2 m3] (a set with a non-member is dropped whole)", res.Unmet)
+		}
+		if len(fs.recordedAttempts) != 1 || fs.recordedAttempts[0].MilestonesCompleted != nil {
+			t.Fatalf("a rejected declaration must pass NIL to the union param; got %+v", fs.recordedAttempts)
+		}
+
+		// Now declare only the member m2: it validates, is passed to the union, and the recompute
+		// over the merged {m1,m2} shrinks unmet to [m3].
+		fs2 := &fakeStore{runOwned: run, recordAttemptCount: 2}
+		svc2 := New(fs2, newBox(t), testParams())
+		res2, err := svc2.RecordCompletionAttempt(context.Background(), w, run.ID,
+			CompletionAttemptRequest{MilestonesCompleted: []string{"m2"}, Head: "h"})
+		if err != nil {
+			t.Fatalf("unexpected err: %v", err)
+		}
+		if len(res2.Unmet) != 1 || res2.Unmet[0] != "m3" {
+			t.Fatalf("unmet = %v, want [m3] (m2 union-merged into the recompute)", res2.Unmet)
+		}
+		if len(fs2.recordedAttempts) != 1 {
+			t.Fatalf("want one recorded attempt; got %d", len(fs2.recordedAttempts))
+		}
+		merged, derr := DecodeMilestoneIDs(fs2.recordedAttempts[0].MilestonesCompleted)
+		if derr != nil {
+			t.Fatalf("decode union param: %v", derr)
+		}
+		if len(merged) != 1 || merged[0] != "m2" {
+			t.Fatalf("union param = %v, want [m2] (the validated declaration passed to the SQL union)", merged)
 		}
 	})
 }

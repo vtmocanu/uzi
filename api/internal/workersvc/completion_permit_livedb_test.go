@@ -1,6 +1,7 @@
 package workersvc
 
 import (
+	"sort"
 	"testing"
 
 	"github.com/google/uuid"
@@ -404,5 +405,77 @@ func TestSplitStateDeniedLiveDB(t *testing.T) {
 	}
 	if applied || run.Status == "completed" {
 		t.Fatalf("a split-state run must not complete; applied=%v status=%q", applied, run.Status)
+	}
+}
+
+// milestonesCompletedIDs reads and decodes runs.milestones_completed (the bare id array).
+func (e interlockLiveDB) milestonesCompletedIDs(t *testing.T, runID uuid.UUID) []string {
+	t.Helper()
+	var raw []byte
+	if err := e.pool.QueryRow(e.ctx, `SELECT milestones_completed FROM runs WHERE id = $1`, runID).Scan(&raw); err != nil {
+		t.Fatalf("read milestones_completed: %v", err)
+	}
+	ids, err := DecodeMilestoneIDs(raw)
+	if err != nil {
+		t.Fatalf("decode milestones_completed: %v", err)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+// TestAttemptUnionMergesDeclarationLiveDB (PRD #1226 M3): the attempt endpoint union-merges the
+// lead's declared milestones into runs.milestones_completed and recomputes unmet over the merged
+// set in ONE call — removing the M2-review "persist THEN attempt" ordering hazard. Declaring m2 via
+// the attempt endpoint shrinks unmet from [m2 m3] to [m3] AND persists m2 into milestones_completed;
+// a non-member declared id is dropped by the subset-validation and never persisted or counted.
+func TestAttemptUnionMergesDeclarationLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	svc := e.permitService(t)
+	wid := e.seedWorker(t, []string{"completion_interlock_v1"})
+	// Frozen m1,m2,m3; only m1 declared complete at seed.
+	runID := e.seedFrozenRun(t, wid, []string{"m1", "m2", "m3"}, []string{"m1"}, false)
+	wkr := store.Worker{ID: wid}
+
+	// Attempt with NO declaration: unmet is [m2 m3] over the existing set.
+	res1, err := svc.RecordCompletionAttempt(e.ctx, wkr, runID, CompletionAttemptRequest{Head: "h1", WorktreeFingerprint: "wf1"})
+	if err != nil {
+		t.Fatalf("attempt1: %v", err)
+	}
+	if len(res1.Unmet) != 2 || res1.Unmet[0] != "m2" || res1.Unmet[1] != "m3" {
+		t.Fatalf("unmet1 = %v, want [m2 m3]", res1.Unmet)
+	}
+	if got := e.milestonesCompletedIDs(t, runID); len(got) != 1 || got[0] != "m1" {
+		t.Fatalf("milestones_completed after no-declaration attempt = %v, want [m1]", got)
+	}
+
+	// Declare m2 THROUGH the attempt endpoint: it is union-merged into milestones_completed and
+	// the recomputed unmet shrinks to [m3] in the same call.
+	res2, err := svc.RecordCompletionAttempt(e.ctx, wkr, runID,
+		CompletionAttemptRequest{MilestonesCompleted: []string{"m2"}, Head: "h2", WorktreeFingerprint: "wf2"})
+	if err != nil {
+		t.Fatalf("attempt2: %v", err)
+	}
+	if len(res2.Unmet) != 1 || res2.Unmet[0] != "m3" {
+		t.Fatalf("unmet2 = %v, want [m3] (declaration union-merged)", res2.Unmet)
+	}
+	if res2.AttemptCount != 2 {
+		t.Fatalf("attempt_count = %d, want 2", res2.AttemptCount)
+	}
+	if got := e.milestonesCompletedIDs(t, runID); len(got) != 2 || got[0] != "m1" || got[1] != "m2" {
+		t.Fatalf("milestones_completed after declaring m2 = %v, want [m1 m2] merged (the ordering-hazard fix)", got)
+	}
+
+	// A non-member declared id is DROPPED by the subset-validation (progressParams): it neither
+	// shrinks unmet nor gets persisted.
+	res3, err := svc.RecordCompletionAttempt(e.ctx, wkr, runID,
+		CompletionAttemptRequest{MilestonesCompleted: []string{"bogus"}, Head: "h3"})
+	if err != nil {
+		t.Fatalf("attempt3: %v", err)
+	}
+	if len(res3.Unmet) != 1 || res3.Unmet[0] != "m3" {
+		t.Fatalf("unmet3 = %v, want [m3] (bogus id dropped)", res3.Unmet)
+	}
+	if got := e.milestonesCompletedIDs(t, runID); len(got) != 2 || got[0] != "m1" || got[1] != "m2" {
+		t.Fatalf("milestones_completed after declaring a non-member = %v, want unchanged [m1 m2]", got)
 	}
 }

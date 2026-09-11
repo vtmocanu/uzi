@@ -7,6 +7,8 @@ import {
   type ChatClaimResponse,
   type ClaimResponse,
   type CreateProposalRequest,
+  type CompletionAttemptRequest,
+  type CompletionAttemptResponse,
   type ReportFindingRequest,
   type HeartbeatRequest,
   type MessagesRequest,
@@ -529,6 +531,29 @@ export class WorkerClient {
       id: string;
     };
     return res.id;
+  }
+
+  /** Record ONE same-session structural completion attempt (POST /worker/runs/:id/completion/
+   *  attempt, PRD #1226 M3). The server union-merges the lead's declaration into
+   *  milestones_completed, recomputes the unmet structural criteria over the merged set, and
+   *  records a bounded attempt — all server-authoritative, in one call (this collapses the M2
+   *  "persist declaration THEN attempt" ordering hazard). Returns the recomputed unmet set (the
+   *  executor reworks against THIS, never its own belief) and the new attempt count. Throws
+   *  RequestError on non-2xx (409 stale claim, 400 not interlocked) — the caller decides. */
+  async recordCompletionAttempt(
+    runId: string,
+    args: { milestonesCompleted: string[]; head: string | null; worktreeFingerprint: string | null },
+  ): Promise<{ unmet: string[]; attemptCount: number }> {
+    const body: CompletionAttemptRequest = {
+      milestones_completed: args.milestonesCompleted,
+      head: args.head,
+      worktree_fingerprint: args.worktreeFingerprint,
+    };
+    const res = (await this.postJSON(
+      `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/completion/attempt`,
+      body,
+    )) as CompletionAttemptResponse;
+    return { unmet: res.unmet ?? [], attemptCount: res.attempt_count ?? 0 };
   }
 
   // ── Inline run summaries (PRD #362 M3c) ────────────────────────────────────

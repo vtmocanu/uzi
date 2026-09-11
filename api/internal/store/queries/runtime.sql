@@ -2470,6 +2470,26 @@ WHERE status = 'running'
                               + budget_paused_seconds))
   AND kind NOT IN ('chat', 'judge')
   AND interactive = false
+  -- PRD #1226 M3 (D3): completion-interlock carve-out. A run that has recorded at least one
+  -- completion attempt (completion_attempts > 0) AND whose worker is STILL ALIVE (a heartbeat
+  -- inside the same staleness bound the requeue path uses) is EXCLUDED from the wall-clock
+  -- sweep — its live lead is legitimately working the checkpoint-first completion protocol and
+  -- will itself enter the verified completion hold (M4) rather than being terminal-failed out
+  -- from under a live worker. The carve-out is DELIBERATELY NARROW (live worker only): a
+  -- post-attempt run whose worker went STALE is NOT protected here, so it still follows the
+  -- existing RequeueRunsOfStaleWorkers / FailRunsOfStaleWorkersOverCap path (the carve-out can
+  -- never silently become an infinite hold on a dead worker — PRD Risk "Wedged live worker").
+  -- A PRE-attempt run (completion_attempts = 0) past its wall is still failed, unchanged.
+  -- worker_stale_cutoff NULL (an older/unset caller) makes the subquery match no worker, so the
+  -- carve-out never fires and this is byte-identical to the pre-M3 sweep.
+  AND NOT (
+      completion_attempts > 0
+      AND worker_id IN (
+          SELECT w.id FROM workers w
+          WHERE w.last_heartbeat_at IS NOT NULL
+            AND w.last_heartbeat_at >= sqlc.arg('worker_stale_cutoff')::timestamptz
+      )
+  )
 RETURNING id, user_id, status;
 
 -- name: FailRunsOfStaleWorkersOverCap :many
@@ -3866,10 +3886,10 @@ WHERE id = @id AND user_id = @user_id AND status = 'queued';
 SELECT * FROM runs WHERE id = @id AND worker_id = @worker_id FOR UPDATE;
 
 -- name: RecordCompletionAttempt :one
--- PRD #1226 M2 (D4): record ONE gated completion attempt and return the run's new attempt
+-- PRD #1226 M2 (D4) + M3: record ONE gated completion attempt and return the run's new attempt
 -- count, ATOMICALLY and BOUNDED. Fired on the permit path's missing-milestones denial (with a
--- head, no worktree fingerprint) and by the same-lead nudge endpoint (with both). In one
--- statement it:
+-- head, no worktree fingerprint, no declaration) and by the same-lead nudge endpoint (with head,
+-- worktree fingerprint AND the lead's declared milestones_completed). In one statement it:
 --   1. inserts the attempt row (`ins`) GUARDED to an INTERLOCKED run OWNED by the worker
 --      (completion_contract_version IS NOT NULL); the INSERT ... SELECT ... FROM runs yields no
 --      row and inserts nothing when the guard fails. Data-modifying CTEs always run to
@@ -3879,11 +3899,20 @@ SELECT * FROM runs WHERE id = @id AND worker_id = @worker_id FOR UPDATE;
 --      visible to it and can never be pruned) and this insert adds one, so the table lands at
 --      <= 50 rows per run — the bound that keeps the log from growing without limit. Gated on
 --      EXISTS(ins) so it only fires when the attempt was actually recorded.
---   3. increments runs.completion_attempts (M3 reads it for the SweepRunningTimeout carve-out)
---      and overwrites runs.latest_completion_attempt with the current summary (server now()),
---      under the SAME guard so a non-owning/legacy call changes nothing. The final UPDATE takes
---      the runs row lock (serializing concurrent attempts) and returns 0 rows -> pgx.ErrNoRows
---      when the guard fails — the caller's "not recorded" signal.
+--   3. UNION-MERGES the lead's declared milestones_completed into runs.milestones_completed
+--      (PRD #1226 M3): the M3 review flagged the "agent must persist its declaration before the
+--      attempt" ordering hazard, so the attempt endpoint now persists it in the SAME statement.
+--      The CASE is copied VERBATIM from SetRunRunning's milestones_completed union (monotone,
+--      DISTINCT dedup); a NULL @milestones_completed (the permit path, which carries no
+--      declaration) leaves the column untouched, byte-identical to before. The ids are
+--      subset-validated against the frozen list SERVER-SIDE (progressParams) before this call.
+--   4. increments runs.completion_attempts (the SweepRunningTimeout carve-out reads it) and
+--      overwrites runs.latest_completion_attempt with the current summary (server now()), under
+--      the SAME guard so a non-owning/legacy call changes nothing. @unmet is the SERVER
+--      recompute done in Go AFTER the same union above (computeUnmetCriteria over the merged
+--      set), so the persisted unmet is consistent with the persisted milestones_completed. The
+--      final UPDATE takes the runs row lock (serializing concurrent attempts) and returns 0
+--      rows -> pgx.ErrNoRows when the guard fails — the caller's "not recorded" signal.
 --
 -- The outer references are qualified `runs.` on purpose: sqlc pulls the `ins` CTE (named in
 -- EXISTS below) into the outer name scope, so a bare `id`/`completion_attempts` would collide
@@ -3909,6 +3938,12 @@ pruned AS (
 )
 UPDATE runs SET
     completion_attempts = runs.completion_attempts + 1,
+    -- PRD #1226 M3: union-merge the lead's declaration (verbatim SetRunRunning semantics).
+    milestones_completed = CASE
+        WHEN sqlc.narg('milestones_completed')::jsonb IS NULL THEN runs.milestones_completed
+        ELSE COALESCE((SELECT jsonb_agg(DISTINCT e)
+                       FROM jsonb_array_elements_text(COALESCE(runs.milestones_completed, '[]'::jsonb) || sqlc.narg('milestones_completed')::jsonb) AS e), '[]'::jsonb)
+    END,
     latest_completion_attempt = jsonb_build_object(
         'unmet', @unmet::jsonb,
         'head', sqlc.narg('head')::text,

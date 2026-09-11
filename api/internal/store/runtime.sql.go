@@ -5787,18 +5787,18 @@ func (q *Queries) ReconcileRunMR(ctx context.Context, arg ReconcileRunMRParams) 
 const recordCompletionAttempt = `-- name: RecordCompletionAttempt :one
 WITH ins AS (
     INSERT INTO run_completion_attempts (run_id, contract_revision, unmet, head, worktree_fingerprint)
-    SELECT r.id, $6, $1::jsonb, $2, $3
+    SELECT r.id, $7, $2::jsonb, $3, $4
     FROM runs r
-    WHERE r.id = $4 AND r.worker_id = $5 AND r.completion_contract_version IS NOT NULL
+    WHERE r.id = $5 AND r.worker_id = $6 AND r.completion_contract_version IS NOT NULL
     RETURNING run_completion_attempts.id
 ),
 pruned AS (
     DELETE FROM run_completion_attempts a
-    WHERE a.run_id = $4
+    WHERE a.run_id = $5
       AND EXISTS (SELECT 1 FROM ins)
       AND a.id NOT IN (
           SELECT b.id FROM run_completion_attempts b
-          WHERE b.run_id = $4
+          WHERE b.run_id = $5
           ORDER BY b.created_at DESC, b.id DESC
           LIMIT 49
       )
@@ -5806,19 +5806,26 @@ pruned AS (
 )
 UPDATE runs SET
     completion_attempts = runs.completion_attempts + 1,
+    -- PRD #1226 M3: union-merge the lead's declaration (verbatim SetRunRunning semantics).
+    milestones_completed = CASE
+        WHEN $1::jsonb IS NULL THEN runs.milestones_completed
+        ELSE COALESCE((SELECT jsonb_agg(DISTINCT e)
+                       FROM jsonb_array_elements_text(COALESCE(runs.milestones_completed, '[]'::jsonb) || $1::jsonb) AS e), '[]'::jsonb)
+    END,
     latest_completion_attempt = jsonb_build_object(
-        'unmet', $1::jsonb,
-        'head', $2::text,
-        'worktree_fingerprint', $3::text,
+        'unmet', $2::jsonb,
+        'head', $3::text,
+        'worktree_fingerprint', $4::text,
         'at', now()
     ),
     updated_at = now()
-WHERE runs.id = $4 AND runs.worker_id = $5 AND runs.completion_contract_version IS NOT NULL
+WHERE runs.id = $5 AND runs.worker_id = $6 AND runs.completion_contract_version IS NOT NULL
   AND EXISTS (SELECT 1 FROM ins)
 RETURNING runs.completion_attempts
 `
 
 type RecordCompletionAttemptParams struct {
+	MilestonesCompleted []byte      `json:"milestones_completed"`
 	Unmet               []byte      `json:"unmet"`
 	Head                pgtype.Text `json:"head"`
 	WorktreeFingerprint pgtype.Text `json:"worktree_fingerprint"`
@@ -5827,10 +5834,10 @@ type RecordCompletionAttemptParams struct {
 	ContractRevision    pgtype.Int4 `json:"contract_revision"`
 }
 
-// PRD #1226 M2 (D4): record ONE gated completion attempt and return the run's new attempt
+// PRD #1226 M2 (D4) + M3: record ONE gated completion attempt and return the run's new attempt
 // count, ATOMICALLY and BOUNDED. Fired on the permit path's missing-milestones denial (with a
-// head, no worktree fingerprint) and by the same-lead nudge endpoint (with both). In one
-// statement it:
+// head, no worktree fingerprint, no declaration) and by the same-lead nudge endpoint (with head,
+// worktree fingerprint AND the lead's declared milestones_completed). In one statement it:
 //  1. inserts the attempt row (`ins`) GUARDED to an INTERLOCKED run OWNED by the worker
 //     (completion_contract_version IS NOT NULL); the INSERT ... SELECT ... FROM runs yields no
 //     row and inserts nothing when the guard fails. Data-modifying CTEs always run to
@@ -5840,17 +5847,27 @@ type RecordCompletionAttemptParams struct {
 //     visible to it and can never be pruned) and this insert adds one, so the table lands at
 //     <= 50 rows per run — the bound that keeps the log from growing without limit. Gated on
 //     EXISTS(ins) so it only fires when the attempt was actually recorded.
-//  3. increments runs.completion_attempts (M3 reads it for the SweepRunningTimeout carve-out)
-//     and overwrites runs.latest_completion_attempt with the current summary (server now()),
-//     under the SAME guard so a non-owning/legacy call changes nothing. The final UPDATE takes
-//     the runs row lock (serializing concurrent attempts) and returns 0 rows -> pgx.ErrNoRows
-//     when the guard fails — the caller's "not recorded" signal.
+//  3. UNION-MERGES the lead's declared milestones_completed into runs.milestones_completed
+//     (PRD #1226 M3): the M3 review flagged the "agent must persist its declaration before the
+//     attempt" ordering hazard, so the attempt endpoint now persists it in the SAME statement.
+//     The CASE is copied VERBATIM from SetRunRunning's milestones_completed union (monotone,
+//     DISTINCT dedup); a NULL @milestones_completed (the permit path, which carries no
+//     declaration) leaves the column untouched, byte-identical to before. The ids are
+//     subset-validated against the frozen list SERVER-SIDE (progressParams) before this call.
+//  4. increments runs.completion_attempts (the SweepRunningTimeout carve-out reads it) and
+//     overwrites runs.latest_completion_attempt with the current summary (server now()), under
+//     the SAME guard so a non-owning/legacy call changes nothing. @unmet is the SERVER
+//     recompute done in Go AFTER the same union above (computeUnmetCriteria over the merged
+//     set), so the persisted unmet is consistent with the persisted milestones_completed. The
+//     final UPDATE takes the runs row lock (serializing concurrent attempts) and returns 0
+//     rows -> pgx.ErrNoRows when the guard fails — the caller's "not recorded" signal.
 //
 // The outer references are qualified `runs.` on purpose: sqlc pulls the `ins` CTE (named in
 // EXISTS below) into the outer name scope, so a bare `id`/`completion_attempts` would collide
 // with ins's RETURNING column and trip its "column reference is ambiguous" analyzer.
 func (q *Queries) RecordCompletionAttempt(ctx context.Context, arg RecordCompletionAttemptParams) (int32, error) {
 	row := q.db.QueryRow(ctx, recordCompletionAttempt,
+		arg.MilestonesCompleted,
 		arg.Unmet,
 		arg.Head,
 		arg.WorktreeFingerprint,
@@ -8319,6 +8336,26 @@ WHERE status = 'running'
                               + budget_paused_seconds))
   AND kind NOT IN ('chat', 'judge')
   AND interactive = false
+  -- PRD #1226 M3 (D3): completion-interlock carve-out. A run that has recorded at least one
+  -- completion attempt (completion_attempts > 0) AND whose worker is STILL ALIVE (a heartbeat
+  -- inside the same staleness bound the requeue path uses) is EXCLUDED from the wall-clock
+  -- sweep — its live lead is legitimately working the checkpoint-first completion protocol and
+  -- will itself enter the verified completion hold (M4) rather than being terminal-failed out
+  -- from under a live worker. The carve-out is DELIBERATELY NARROW (live worker only): a
+  -- post-attempt run whose worker went STALE is NOT protected here, so it still follows the
+  -- existing RequeueRunsOfStaleWorkers / FailRunsOfStaleWorkersOverCap path (the carve-out can
+  -- never silently become an infinite hold on a dead worker — PRD Risk "Wedged live worker").
+  -- A PRE-attempt run (completion_attempts = 0) past its wall is still failed, unchanged.
+  -- worker_stale_cutoff NULL (an older/unset caller) makes the subquery match no worker, so the
+  -- carve-out never fires and this is byte-identical to the pre-M3 sweep.
+  AND NOT (
+      completion_attempts > 0
+      AND worker_id IN (
+          SELECT w.id FROM workers w
+          WHERE w.last_heartbeat_at IS NOT NULL
+            AND w.last_heartbeat_at >= $4::timestamptz
+      )
+  )
 RETURNING id, user_id, status
 `
 
@@ -8326,6 +8363,7 @@ type SweepRunningTimeoutParams struct {
 	FailureReason        pgtype.Text        `json:"failure_reason"`
 	Now                  pgtype.Timestamptz `json:"now"`
 	GlobalTimeoutSeconds int32              `json:"global_timeout_seconds"`
+	WorkerStaleCutoff    pgtype.Timestamptz `json:"worker_stale_cutoff"`
 }
 
 type SweepRunningTimeoutRow struct {
@@ -8369,7 +8407,12 @@ type SweepRunningTimeoutRow struct {
 // server-only, IMMUTABLE value — so a future writer that persists an UNCAPPED budget_wall_seconds
 // would bypass the ceiling here, and the cap must stay at every write path, not be moved to reads.
 func (q *Queries) SweepRunningTimeout(ctx context.Context, arg SweepRunningTimeoutParams) ([]SweepRunningTimeoutRow, error) {
-	rows, err := q.db.Query(ctx, sweepRunningTimeout, arg.FailureReason, arg.Now, arg.GlobalTimeoutSeconds)
+	rows, err := q.db.Query(ctx, sweepRunningTimeout,
+		arg.FailureReason,
+		arg.Now,
+		arg.GlobalTimeoutSeconds,
+		arg.WorkerStaleCutoff,
+	)
 	if err != nil {
 		return nil, err
 	}

@@ -73,12 +73,20 @@ type CompletionPermitRequest struct {
 	Head             string
 }
 
-// CompletionAttemptRequest is the same-lead nudge (M3) request (PRD #1226 M2, D4): the worker
-// reports the current head and worktree fingerprint; the SERVER recomputes the unmet set and
-// records a bounded attempt. There is deliberately no contract_revision here — the attempt path
-// is server-authoritative and fences on run.ContractRevision, never on a worker-supplied revision
-// (only the permit endpoint checks a requested revision, for revision_drift).
+// CompletionAttemptRequest is the same-lead nudge (M3) request (PRD #1226 M2/M3, D4): the worker
+// reports the lead's declared milestones_completed plus the current head and worktree fingerprint.
+// The SERVER union-merges the declaration into runs.milestones_completed, recomputes the unmet set
+// over the merged set, and records a bounded attempt — all in one call (M3 collapses the previous
+// "persist declaration THEN attempt" ordering hazard into a single server call). There is
+// deliberately no contract_revision here — the attempt path is server-authoritative and fences on
+// run.ContractRevision, never on a worker-supplied revision (only the permit endpoint checks a
+// requested revision, for revision_drift).
 type CompletionAttemptRequest struct {
+	// MilestonesCompleted is the lead's signal_done declaration (frozen milestone ids). The
+	// server subset-validates it against the run's frozen list (progressParams) and UNIONs it
+	// into runs.milestones_completed before recomputing unmet. nil ⇒ nothing declared this
+	// attempt (the union is a no-op; the server keeps whatever report_progress already unioned).
+	MilestonesCompleted []string
 	Head                string
 	WorktreeFingerprint string
 }
@@ -208,7 +216,7 @@ func (s *Service) RequestCompletionPermit(ctx context.Context, wkr store.Worker,
 		// A gated attempt with missing milestones: record it (bounded) and deny non-terminally.
 		// A recompute race that reclaimed the run (ErrNoRows from the write) leaves the denial
 		// intact — the recompute was valid at load; only an infra error propagates.
-		if _, aerr := s.persistCompletionAttempt(ctx, wkr, run, unmet, req.Head, ""); aerr != nil && !errors.Is(aerr, pgx.ErrNoRows) {
+		if _, aerr := s.persistCompletionAttempt(ctx, wkr, run, unmet, req.Head, "", nil); aerr != nil && !errors.Is(aerr, pgx.ErrNoRows) {
 			return CompletionPermitResult{}, aerr
 		}
 		return CompletionPermitResult{Granted: false, DenyReason: CompletionDenyMissingMilestones, Unmet: unmet}, nil
@@ -226,11 +234,14 @@ func (s *Service) RequestCompletionPermit(ctx context.Context, wkr store.Worker,
 	return CompletionPermitResult{Granted: true, Permit: permitToDTO(permit)}, nil
 }
 
-// RecordCompletionAttempt is the same-lead nudge endpoint (M3) (PRD #1226 M2, D4). It applies
-// the claim fence, recomputes the unmet set server-side (fail-closed for an unverifiable
-// contract) and records a bounded attempt (counter++, latest summary, pruned log). It returns
-// the server-authoritative unmet set and the new attempt count. Claim-fence denials come back as
-// sentinel errors the handler maps to status codes.
+// RecordCompletionAttempt is the same-lead nudge endpoint (M3) (PRD #1226 M2/M3, D4). It applies
+// the claim fence, PERSISTS the lead's declared milestones (union-merged into
+// runs.milestones_completed, subset-validated by progressParams), recomputes the unmet set
+// server-side over the merged set (fail-closed for an unverifiable contract) and records a bounded
+// attempt (counter++, latest summary, pruned log) — all in the single RecordCompletionAttempt
+// statement, which removes the M2-review-flagged "agent must persist its declaration before the
+// attempt" ordering hazard. It returns the server-authoritative unmet set and the new attempt
+// count. Claim-fence denials come back as sentinel errors the handler maps to status codes.
 func (s *Service) RecordCompletionAttempt(ctx context.Context, wkr store.Worker, runID uuid.UUID, req CompletionAttemptRequest) (CompletionAttemptResult, error) {
 	run, deny, err := s.loadClaimedInterlockedRun(ctx, runID, wkr)
 	if err != nil {
@@ -242,8 +253,22 @@ func (s *Service) RecordCompletionAttempt(ctx context.Context, wkr store.Worker,
 	case CompletionDenyNotInterlocked:
 		return CompletionAttemptResult{}, ErrCompletionNotInterlocked
 	}
-	unmet, _ := computeUnmetCriteria(run)
-	count, err := s.persistCompletionAttempt(ctx, wkr, run, unmet, req.Head, req.WorktreeFingerprint)
+	// PRD #1226 M3: subset-validate the lead's declaration against the frozen list — the SAME
+	// kind/membership gate SetRunRunning/SetRunCompleted apply (progressParams). declaredJSON is
+	// the jsonb the RecordCompletionAttempt statement UNIONs into milestones_completed; nil when
+	// nothing valid was declared (the union is then a no-op).
+	var declaredPtr *[]string
+	if req.MilestonesCompleted != nil {
+		declaredPtr = &req.MilestonesCompleted
+	}
+	declaredJSON, _ := progressParams(run.Kind, run.MilestonesFrozen, declaredPtr, nil)
+	// Recompute unmet over the MERGED set (existing ∪ declared) so the persisted unmet is
+	// consistent with the milestones_completed the same statement persists. computeUnmetCriteria
+	// reads run.MilestonesCompleted, so hand it a run copy whose completed set is the merge.
+	merged := run
+	merged.MilestonesCompleted = unionMilestoneIDs(run.MilestonesCompleted, declaredJSON)
+	unmet, _ := computeUnmetCriteria(merged)
+	count, err := s.persistCompletionAttempt(ctx, wkr, run, unmet, req.Head, req.WorktreeFingerprint, declaredJSON)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			// The run was reclaimed between the load and the write — the fence no longer holds.
@@ -255,15 +280,19 @@ func (s *Service) RecordCompletionAttempt(ctx context.Context, wkr store.Worker,
 }
 
 // persistCompletionAttempt writes one bounded completion attempt through the store query
-// (insert row + increment counter + set summary + prune to N), returning the run's new attempt
-// count. It is the single writer both endpoints share. pgx.ErrNoRows means the guard (owned +
-// interlocked) failed at write time — a raced reclaim — which each caller interprets.
-func (s *Service) persistCompletionAttempt(ctx context.Context, wkr store.Worker, run store.Run, unmet []string, head, worktreeFingerprint string) (int32, error) {
+// (insert row + increment counter + union the declaration into milestones_completed + set
+// summary + prune to N), returning the run's new attempt count. It is the single writer both
+// endpoints share: the attempt endpoint passes the subset-validated declaration jsonb
+// (milestonesCompletedJSON) to union-merge, while the permit path passes nil (it carries no
+// declaration, so the union CASE leaves milestones_completed untouched). pgx.ErrNoRows means the
+// guard (owned + interlocked) failed at write time — a raced reclaim — which each caller interprets.
+func (s *Service) persistCompletionAttempt(ctx context.Context, wkr store.Worker, run store.Run, unmet []string, head, worktreeFingerprint string, milestonesCompletedJSON []byte) (int32, error) {
 	unmetJSON, err := encodeJSONArray(unmet)
 	if err != nil {
 		return 0, err
 	}
 	return s.q.RecordCompletionAttempt(ctx, store.RecordCompletionAttemptParams{
+		MilestonesCompleted: milestonesCompletedJSON,
 		Unmet:               unmetJSON,
 		Head:                pgconv.TextOrNull(strings.TrimSpace(head)),
 		WorktreeFingerprint: pgconv.TextOrNull(strings.TrimSpace(worktreeFingerprint)),
@@ -271,6 +300,37 @@ func (s *Service) persistCompletionAttempt(ctx context.Context, wkr store.Worker
 		WorkerID:            pgconv.UUID(wkr.ID),
 		ContractRevision:    run.ContractRevision,
 	})
+}
+
+// unionMilestoneIDs returns the monotone, DISTINCT-deduped union of two milestones_completed
+// jsonb id-arrays (existing ∪ declared), mirroring the SetRunRunning SQL union so the Go-side
+// recompute over the merged set matches the merge the RecordCompletionAttempt statement persists.
+// Set membership is order-independent, so computeUnmetCriteria's result is identical regardless of
+// the union output order. A nil/empty declared leaves the existing set unchanged; on an encode
+// error it falls back to the existing bytes (the recompute then simply omits the declaration —
+// fail-safe, never a panic).
+func unionMilestoneIDs(existing, declared []byte) []byte {
+	a, _ := DecodeMilestoneIDs(existing)
+	b, _ := DecodeMilestoneIDs(declared)
+	seen := make(map[string]bool, len(a)+len(b))
+	out := make([]string, 0, len(a)+len(b))
+	for _, id := range a {
+		if !seen[id] {
+			seen[id] = true
+			out = append(out, id)
+		}
+	}
+	for _, id := range b {
+		if !seen[id] {
+			seen[id] = true
+			out = append(out, id)
+		}
+	}
+	enc, err := encodeJSONArray(out)
+	if err != nil {
+		return existing
+	}
+	return enc
 }
 
 // completeRunWithPermit runs an INTERLOCKED run's terminal completion through a single pgx

@@ -760,15 +760,21 @@ func (h *Handler) WorkerRunCompletionAttempt(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	var body struct {
-		Head                string `json:"head"`
-		WorktreeFingerprint string `json:"worktree_fingerprint"`
+		// PRD #1226 M3: the lead's signal_done declaration. The service subset-validates it
+		// against the frozen list and union-merges it into runs.milestones_completed before
+		// recomputing unmet. Omitted/null ⇒ nothing declared this attempt (union no-op).
+		MilestonesCompleted []string `json:"milestones_completed"`
+		Head                string   `json:"head"`
+		WorktreeFingerprint string   `json:"worktree_fingerprint"`
 	}
 	if err := httpx.DecodeJSON(r, &body); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	res, err := h.wsvc.RecordCompletionAttempt(r.Context(), wkr, runID, workersvc.CompletionAttemptRequest{
-		Head: strings.TrimSpace(body.Head), WorktreeFingerprint: strings.TrimSpace(body.WorktreeFingerprint),
+		MilestonesCompleted: body.MilestonesCompleted,
+		Head:                strings.TrimSpace(body.Head),
+		WorktreeFingerprint: strings.TrimSpace(body.WorktreeFingerprint),
 	})
 	if err != nil {
 		switch {
