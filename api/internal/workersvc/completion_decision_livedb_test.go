@@ -61,16 +61,19 @@ func (e interlockLiveDB) pendingFollowUpBody(t *testing.T, runID uuid.UUID) stri
 // interlock (hold_reason='completion_blocked') accepts a continue decision — it resumes THROUGH
 // queued via ResumePausedRun, the hold columns are STILL set (cleared only on the first running
 // report, not prematurely), a completion_decision audit row and the guidance follow_up are
-// enqueued. THEN a SetRunRunning report clears hold_reason/hold_captured_head/
-// completion_budget_exhausted_at — the D7 "clears the hold on the first accepted running report".
+// enqueued. THEN a SetRunRunning report clears hold_reason/hold_captured_head — the D7 "clears the
+// hold on the first accepted running report". completion_budget_exhausted_at is the M4/D3 served
+// steer flag and is DELIBERATELY NOT cleared by SetRunRunning (its only clear is SetRunCompletionHold
+// on hold entry); this test pins that it SURVIVES both the resume and the running report.
 func TestCompletionDecisionPausedResumesLiveDB(t *testing.T) {
 	e := setupInterlockLiveDB(t)
 	svc := e.permitService(t)
 	wid := e.seedWorker(t, []string{"completion_interlock_v1"})
 	runID := e.seedFrozenRun(t, wid, []string{"m1", "m2"}, []string{"m1"}, false)
-	// Park it on the completion hold exactly as SetRunCompletionHold would: paused,
-	// hold_reason='completion_blocked', a captured head, an attempt recorded, and the one-shot
-	// served-steer flag set (so the running-report clear is observable).
+	// Park it on the completion hold: paused, hold_reason='completion_blocked', a captured head, and
+	// an attempt recorded. completion_budget_exhausted_at is also set here to prove SetRunRunning
+	// leaves the served-steer flag UNTOUCHED (in production SetRunCompletionHold clears it on hold
+	// entry, so a real completion hold carries it NULL; setting it here makes the non-clear observable).
 	e.exec(t, `UPDATE runs SET status = 'paused', hold_reason = 'completion_blocked',
 	               hold_captured_head = 'capturedhead1', completion_attempts = 1,
 	               completion_budget_exhausted_at = now() WHERE id = $1`, runID)
@@ -135,8 +138,10 @@ func TestCompletionDecisionPausedResumesLiveDB(t *testing.T) {
 	if head != nil {
 		t.Fatalf("hold_captured_head must be CLEARED on the first running report; got %q", *head)
 	}
-	if exhausted {
-		t.Fatal("completion_budget_exhausted_at must be CLEARED on the first running report")
+	if !exhausted {
+		t.Fatal("completion_budget_exhausted_at must SURVIVE the running report — it is the M4/D3 served " +
+			"steer flag the worker reads off this report's ACK to route into the completion hold; SetRunRunning " +
+			"must not disarm it (its only clear is SetRunCompletionHold on hold entry)")
 	}
 }
 

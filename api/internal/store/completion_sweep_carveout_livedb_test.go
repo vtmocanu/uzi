@@ -350,3 +350,113 @@ func TestStampCompletionBudgetExhaustedLiveDB(t *testing.T) {
 			"on the served steer must clear it so a stale ACK cannot re-arm the steer")
 	}
 }
+
+// TestSetRunRunningPreservesCompletionBudgetExhaustedLiveDB pins the M4/D3 served steer against the
+// M5/D7 hold-clear: a NORMAL `running` report (SetRunRunning) MUST NOT clear the served
+// budget_exhausted flag (completion_budget_exhausted_at). SetState's running arm calls SetRunRunning
+// and THEN re-reads the row for the worker ACK (runToDTO -> RunDTO.CompletionBudgetExhausted ==
+// .Valid), which the worker reads as served.budgetExhausted and routes into the completion hold. If
+// SetRunRunning cleared the flag, the very report meant to CARRY the steer would DISARM it — the ACK
+// would always report budgetExhausted=false and the worker could never enter the hold on the
+// server's steer.
+//
+// The flag is ARMED here via the REAL StampCompletionBudgetExhausted (not a manual UPDATE), so this
+// exercises the genuine arm-then-heartbeat path. The flag's ONLY legitimate clear is
+// SetRunCompletionHold (the worker actually entering the hold), pinned by
+// TestStampCompletionBudgetExhaustedLiveDB above; hold_reason/hold_captured_head DO clear on
+// SetRunRunning (the D7 resume->running clear), pinned by TestCompletionDecisionPausedResumesLiveDB.
+//
+// This is the assertion that REDDENS on the bug (an unconditional `completion_budget_exhausted_at =
+// NULL` in SetRunRunning).
+//
+// Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres; mirrors the siblings above.
+func TestSetRunRunningPreservesCompletionBudgetExhaustedLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via the store integration runner for live-DB coverage")
+	}
+	ctx := context.Background()
+	if err := store.Migrate(ctx, dsn); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	pool, err := store.OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	defer pool.Close()
+	q := store.New(pool)
+
+	userID, connID, repoID := uuid.New(), uuid.New(), uuid.New()
+	mustExec(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
+		userID, fmt.Sprintf("running-preserves-exhausted-%s@e2e", userID))
+	mustExec(ctx, t, pool,
+		`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
+		 VALUES ($1, $2, 'gitlab', 'https://forge.e2e', 'bot', 1, $3)`, connID, userID, []byte{0x1})
+	mustExec(ctx, t, pool,
+		`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
+		 VALUES ($1, $2, 1, 'g/r', 'https://forge.e2e/g/r', 'main', true)`, repoID, connID)
+
+	// A LIVE worker (fresh heartbeat) — the stamp's live-heartbeat subquery admits it.
+	liveWorker := uuid.New()
+	mustExec(ctx, t, pool,
+		`INSERT INTO workers (id, user_id, name, token_hash, status, last_heartbeat_at)
+		 VALUES ($1, $2, 'live', $3, 'online', now())`, liveWorker, userID, liveWorker[:])
+
+	// An interlocked (completion_contract_version=1) running run with a recorded attempt, past its
+	// wall — exactly the row StampCompletionBudgetExhausted arms.
+	runID := uuid.New()
+	mustExec(ctx, t, pool,
+		`INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, kind, status, worker_id,
+		    completion_attempts, completion_contract_version, contract_revision, started_at)
+		 VALUES ($1, $2, $3, 1, 't', 'd', 'issue', 'running', $4, 1, 1, 1, now() - interval '10 years')`,
+		runID, userID, repoID, liveWorker)
+
+	cutoff := pgtype.Timestamptz{Time: time.Now().UTC().Add(-5 * time.Minute), Valid: true}
+	stamped, err := q.StampCompletionBudgetExhausted(ctx, store.StampCompletionBudgetExhaustedParams{
+		Now:                  pgtype.Timestamptz{Time: time.Now().UTC(), Valid: true},
+		GlobalTimeoutSeconds: 3600,
+		WorkerStaleCutoff:    cutoff,
+	})
+	if err != nil {
+		t.Fatalf("StampCompletionBudgetExhausted: %v", err)
+	}
+	if stamped < 1 {
+		t.Fatalf("StampCompletionBudgetExhausted stamped %d rows, want at least 1 (the seeded run)", stamped)
+	}
+
+	isStamped := func() bool {
+		t.Helper()
+		var set bool
+		if err := pool.QueryRow(ctx, `SELECT completion_budget_exhausted_at IS NOT NULL FROM runs WHERE id = $1`, runID).Scan(&set); err != nil {
+			t.Fatalf("read completion_budget_exhausted_at: %v", err)
+		}
+		return set
+	}
+	if !isStamped() {
+		t.Fatal("precondition: the seeded run must be stamped before the running report")
+	}
+
+	// A NORMAL running report (running -> running heartbeat), the params a running report carries.
+	rows, err := q.SetRunRunning(ctx, store.SetRunRunningParams{
+		IterationCount:           1,
+		RunMaxIterations:         5,
+		MilestoneBudgetCap:       10,
+		RunTimeoutSeconds:        7200,
+		BudgetWallCeilingSeconds: 86400,
+		ID:                       runID,
+		WorkerID:                 pgtype.UUID{Bytes: liveWorker, Valid: true},
+	})
+	if err != nil {
+		t.Fatalf("SetRunRunning: %v", err)
+	}
+	if rows != 1 {
+		t.Fatalf("SetRunRunning affected %d rows, want 1", rows)
+	}
+
+	// THE ASSERTION that reddens on the bug: the served steer must SURVIVE the running report.
+	if !isStamped() {
+		t.Fatal("SetRunRunning CLEARED completion_budget_exhausted_at; the served budget_exhausted steer " +
+			"MUST survive the running report so the worker can read it off the ACK (RunDTO.CompletionBudgetExhausted) " +
+			"and route into the completion hold. Its only clear is SetRunCompletionHold on hold entry, not this report.")
+	}
+}

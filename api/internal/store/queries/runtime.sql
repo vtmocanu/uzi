@@ -974,18 +974,29 @@ UPDATE runs SET
     -- PRD #1226 M5 (D7): the completion hold is OVER the instant the worker reports running
     -- again — a resumed completion-blocked run (paused → queued → claimed → running, or the
     -- live awaiting_input window resuming in place) is once more executing, so the hold
-    -- annotations must not survive it. This is the D7 "clears the hold on the FIRST accepted
+    -- ANNOTATIONS must not survive it. This is the D7 "clears the hold on the FIRST accepted
     -- running report": ResumePausedRun deliberately leaves them set (the decision is not yet
     -- acted on), and here the first running report clears them — the SAME "no setter leaves a
     -- resolved park marker behind" discipline as open_question_id above. Cleared
     -- UNCONDITIONALLY (not CASE'd on entry): a running → running heartbeat re-clears columns
     -- that are already NULL on a running run, so it is a no-op there, and any resume path that
-    -- reaches running must end the hold. completion_budget_exhausted_at is the one-shot served
-    -- steer flag (D3) — clearing it here matches SetRunCompletionHold's "a stale ack cannot
-    -- re-arm the steer" contract once the run is running again.
+    -- reaches running must end the hold.
+    --
+    -- ONLY hold_reason/hold_captured_head are cleared here — they are paused-run annotations,
+    -- never set on a running run, so this is a no-op on a heartbeat and the real clear happens on
+    -- the resume→running transition. completion_budget_exhausted_at is deliberately NOT cleared
+    -- here: it is the M4/D3 one-shot SERVED steer flag, ARMED by StampCompletionBudgetExhausted on
+    -- a `status='running'` run and read off the SAME running-report ACK the worker routes to the
+    -- completion hold (RunDTO.CompletionBudgetExhausted). Clearing it in this statement would
+    -- disarm the steer with the very report meant to carry it — SetState calls SetRunRunning and
+    -- THEN re-reads the row for the ACK, so a clear here always ACKs budgetExhausted=false and the
+    -- worker could never enter the hold on the server's steer. Its ONLY clear is SetRunCompletionHold
+    -- (the worker actually entering the hold — the D3 "a stale ack cannot re-arm the steer" contract)
+    -- or an owner decision acting on it. On a resume-from-hold it is already NULL (SetRunCompletionHold
+    -- cleared it on hold entry); on a normal running heartbeat a set flag is the ACTIVE steer that MUST
+    -- survive to reach the worker's ACK.
     hold_reason                    = NULL,
     hold_captured_head             = NULL,
-    completion_budget_exhausted_at = NULL,
     started_at       = COALESCE(started_at, now()),
     iteration_count  = GREATEST(iteration_count, @iteration_count),
     session_id       = COALESCE(sqlc.narg('session_id'), session_id),
