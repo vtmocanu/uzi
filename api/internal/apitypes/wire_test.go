@@ -98,7 +98,11 @@ var runDTOKeys = []string{
 	// PRD #122 M2: live progress (id arrays, nil ⇒ null) and the effective per-run
 	// budget (nil ⇒ null ⇒ the global default). All four always present; a client
 	// branches per field. budget_* are load-bearing on the state-ack, not just display.
-	"milestones_completed", "milestones_in_progress", "budget_max_iterations", "budget_wall_seconds",
+	"milestones_completed", "milestones_in_progress",
+	// PRD #1224: the validated per-milestone agent attribution (nil ⇒ null), always on the
+	// wire; the subset of the lead's declaration whose ids survived in-progress validation.
+	"milestones_agents",
+	"budget_max_iterations", "budget_wall_seconds",
 	// PRD #634 M2: the operator scope ceiling (nil ⇒ null ⇒ unbounded), always on the wire;
 	// like budget_* it is load-bearing on the state-ack, not just display — the worker honors
 	// it at the loop top.
