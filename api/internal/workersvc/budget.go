@@ -22,5 +22,20 @@ const (
 	// (unchanged). Chosen so an 'l' run floors to run_max_iterations*5 (=25 by default) and
 	// LEAST(run_timeout*5, budgetWallCeilingSeconds) (=8h), matching what the milestone-count
 	// path gives a ~5-milestone run. See runtime.sql CreateApprovePlanInput / SetRunRunning.
+	//
+	// Accepted risk (issue #1181, MR !1242 review — CWE-400 amplification lens): size_class is
+	// worker-REPORTED, so this factor is a worker-influenced budget lever. It is trusted
+	// DELIBERATELY, on the same basis as the milestone-count factor above (Decision 12: the
+	// server enforces the CAP, not the signal). Concretely: (1) size_class is a deterministic
+	// directory-count scan in worker code (agent/src/toolchain-detect.ts sizeClassFor, computed
+	// once BEFORE the implementation loop), NOT agent/LLM or prompt-injection output, and there
+	// is no server-owned source since the api never clones the repo; (2) the 'l' floor
+	// (25 iters / 8h) is strictly <= the pre-existing, also-worker-reported milestone-count arm
+	// (run_max_iterations*milestoneBudgetCap = 60 iters / 8h), the two CASE arms are mutually
+	// exclusive and never stack, so it adds no new ceiling; (3) the freeze is run-ownership
+	// guarded (SetState -> runOwnedByWorker; the freeze UPDATEs carry worker_id), so a worker
+	// only inflates its OWN run, spending that user's own token/compute — no cross-tenant reach;
+	// (4) both budget columns COALESCE onto the immutable frozen value, so the floor applies at
+	// most once.
 	sizeBudgetFactorL = 5
 )
