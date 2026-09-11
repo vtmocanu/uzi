@@ -73,16 +73,26 @@ export class Worker {
         // `?.` degrades safe to "no capability" if wiring is somehow unset: registration
         // is a load-bearing loop that must never throw on a config quirk.
         const capabilities = this.config.dockerWiring?.dockerHost ? ["docker"] : undefined;
+        // Self-report the PROTOCOL capabilities this image implements (PRD #1226 M1, D2).
+        // This image always implements the structural completion protocol, so it
+        // unconditionally announces completion_interlock_v1. Kept SEPARATE from
+        // `capabilities` (the scheduler vocabulary) on the wire: the server stores it in
+        // workers.protocol_capabilities and the ClaimRun hard clause reads it there,
+        // OUTSIDE required_capabilities and the capability_aware kill-switch, so an old
+        // image that omits it can never claim an interlocked run.
+        const protocolCapabilities = ["completion_interlock_v1"];
         const res = await this.client.register(
           this.config.workerName,
           this.config.workerTemplate,
           this.config.maxConcurrentRuns,
           capabilities,
+          protocolCapabilities,
         );
         this.log.info("registered", {
           name: this.config.workerName,
           template: this.config.workerTemplate,
           capabilities: capabilities ?? [],
+          protocol_capabilities: protocolCapabilities,
           worker_id: res.worker_id ?? null,
         });
         return;

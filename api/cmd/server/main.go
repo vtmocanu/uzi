@@ -473,6 +473,20 @@ func run() error {
 	// reverts to best-effort claiming while the docker allowlist above stays enforced.
 	wsvc.SetCapabilitySettings(settingsCache)
 
+	// Completion-interlock rollout switch (PRD #1226 M1, D1): createRun reads it from the
+	// same settings cache to decide whether to stamp completion_contract_version=1 on a new
+	// issue run, so an admin flip takes effect within the cache TTL. Default OFF and
+	// FAIL-SAFE OFF — new runs stay legacy until the maintainer flips it on after the API
+	// and a capable worker image are deployed.
+	wsvc.SetCompletionInterlockSettings(settingsCache)
+
+	// Completion-interlock permit transaction (PRD #1226 M2, D4): the permit-gated completion
+	// (completeRunWithPermit) consumes the permit and writes `completed` atomically through a pgx
+	// transaction opened on the shared pool. A nil beginner is fail-closed (an interlocked
+	// completion errors rather than completing non-atomically), so this wiring is what lets an
+	// interlocked run complete at all.
+	wsvc.SetTxBeginner(pool)
+
 	// Codex production oauth-exchange client (PRD #1171 M1), ships DARK. Wire the API-owned
 	// codexauth.Client into the coordinated refresher so a worker /codex/refresh route can
 	// actually rotate a subscription login; without it CoordinatedCodexRefresh fails closed

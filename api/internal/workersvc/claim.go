@@ -543,6 +543,16 @@ type ClaimConfig struct {
 	// REQUIRED — a non-ci_fix run's runs.ci_config_paths column is NULL, so the field
 	// is nil and omitted, keeping every issue/chat claim byte-identical to pre-M2.
 	CIConfigPaths []string `json:"ci_config_paths,omitempty"`
+	// CompletionContractVersion is the completion-interlock discriminator (PRD #1226 M3,
+	// D1/D2): non-nil (value 1 today) when this run is INTERLOCKED, so the worker knows to
+	// run the structural completion protocol (checkpoint-first same-lead attempt loop, permit
+	// before PR). Read straight off runs.completion_contract_version, which the rollout switch
+	// stamps in CreateRun (M1). This is WORKER-ONLY claim config — deliberately NOT on the web
+	// RunDTO — so adding it touches no api-contract fixture. nil (a legacy run, or rollout OFF)
+	// ⇒ omitempty keeps the claim byte-identical to today's and the worker runs the legacy
+	// path; an un-upgraded worker ignores the key (but the M1/M2 hard claim clause prevents an
+	// incapable worker from claiming an interlocked run in the first place).
+	CompletionContractVersion *int `json:"completion_contract_version,omitempty"`
 }
 
 // agentsFromTemplates maps stored templates to claim-payload agents, decoding

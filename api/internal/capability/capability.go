@@ -25,6 +25,39 @@ const (
 	JVM = "jvm"
 )
 
+// CompletionInterlockV1 is the PROTOCOL capability a worker self-reports (PRD #1226
+// M1, D2) to declare it implements the structural completion protocol. It is
+// DELIBERATELY NOT a member of the scheduler `vocabulary` above: it lives in a
+// SEPARATE protocol vocabulary (below) that is never mirrored to the web capability
+// picker (web/src/lib/capabilityVocabulary.ts) and never surfaces in the user-facing
+// repo-capability UI, because it is a worker/server protocol fact, not a repo-run
+// requirement a user chooses. The ClaimRun hard clause (D2) reads it directly from
+// workers.protocol_capabilities, OUTSIDE required_capabilities, ClearRunRequiredCapabilities
+// and the capability_aware kill-switch, so an incapable worker can never claim an
+// interlocked run through any of those bypass paths.
+const CompletionInterlockV1 = "completion_interlock_v1"
+
+// protocolVocabulary is the closed set of legal PROTOCOL capability names — kept
+// entirely separate from `vocabulary` so a protocol string is never offered to users
+// through Vocabulary()/the web mirror. FilterProtocol drops anything not in here.
+var protocolVocabulary = map[string]struct{}{
+	CompletionInterlockV1: {},
+}
+
+// protocolOrder fixes FilterProtocol's stable output order (protocolVocabulary is a map,
+// so its own iteration order is not stable). Keep in lockstep with protocolVocabulary.
+var protocolOrder = []string{CompletionInterlockV1}
+
+// FilterProtocol returns the members of in that are in the PROTOCOL vocabulary, DROPPING
+// unknowns silently (never an error), deduped, in stable order. It mirrors Filter but
+// gates the worker's self-reported PROTOCOL capabilities (workers.protocol_capabilities)
+// before storage, so a garbled or hostile worker report cannot smuggle an arbitrary
+// protocol string in. It is deliberately NOT part of Filter/Vocabulary: the protocol set
+// must never leak into the scheduler vocabulary or the web capability picker.
+func FilterProtocol(in []string) []string {
+	return filterOrdered(in, protocolVocabulary, protocolOrder)
+}
+
 // vocabulary is the v1 closed set of legal capability names. Filter drops
 // anything not in here; nothing outside this map is ever persisted or surfaced.
 var vocabulary = map[string]struct{}{

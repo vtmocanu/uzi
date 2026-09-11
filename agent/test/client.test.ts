@@ -68,6 +68,25 @@ describe("register / heartbeat / claim", () => {
     }
   });
 
+  it("sends protocol_capabilities when the image implements a protocol (PRD #1226 M1)", async () => {
+    await newClient().register("vlad-laptop", "base", 1, ["docker"], ["completion_interlock_v1"]);
+    const rec = api.registers[0];
+    assert.ok(rec);
+    assert.deepStrictEqual(rec.protocol_capabilities, ["completion_interlock_v1"]);
+    // The scheduler capabilities travel in their own field, unaffected.
+    assert.deepStrictEqual(rec.capabilities, ["docker"]);
+  });
+
+  it("omits protocol_capabilities when none are reported (empty or undefined)", async () => {
+    // An older image sends no protocol_capabilities key — the register wire stays
+    // byte-identical (only send when non-empty), mirroring `capabilities`.
+    await newClient().register("vlad-laptop", "base", 1, undefined, []);
+    await newClient().register("vlad-laptop", "base", 1, undefined, undefined);
+    for (const rec of api.registers) {
+      assert.strictEqual(rec.protocol_capabilities, undefined);
+    }
+  });
+
   it("rejects a wrong token with 401", async () => {
     const bad = new WorkerClient(baseUrl, "nope", "0.1.0-test", nullLogger());
     await assert.rejects(bad.heartbeat(), RequestError);

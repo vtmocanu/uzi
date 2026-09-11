@@ -441,8 +441,37 @@ func (s *Service) submitApproval(ctx context.Context, run store.Run, sel AgentSe
 	if beforeErr != nil {
 		slog.Warn("workersvc: approve-freeze pre-read failed", "run_id", run.ID, "error", beforeErr)
 	}
+	// PRD #1226 M1 (D1): build the structural completion contract to freeze at the SAME
+	// approve freeze, ONLY for an interlocked run (completion_contract_version stamped at
+	// CreateRun). Build it from the SAME milestone source the query freezes —
+	// COALESCE(milestones_frozen, milestones_candidate) — preferring the fresh `before`
+	// snapshot read just above (so it matches what the freeze reads a line later), falling
+	// back to the run snapshot if that read failed. The query still guards the assignment
+	// (freezes once, only when contract IS NULL), so a re-approve never re-freezes. A
+	// legacy/rollout-off run passes NULL and stays legacy. A build error is best-effort:
+	// log and pass NULL rather than fail the human approve (mirrors the #260 instrumentation).
+	var completionContract []byte
+	if run.CompletionContractVersion.Valid && len(run.CompletionContract) == 0 {
+		frozenSrc := run.MilestonesFrozen
+		candidateSrc := run.MilestonesCandidate
+		if beforeErr == nil {
+			frozenSrc = before.MilestonesFrozen
+			candidateSrc = before.MilestonesCandidate
+		}
+		src := frozenSrc
+		if len(src) == 0 {
+			src = candidateSrc
+		}
+		contract, cerr := buildCompletionContract(src)
+		if cerr != nil {
+			slog.Warn("workersvc: build completion contract at approve failed", "run_id", run.ID, "error", cerr)
+		} else {
+			completionContract = contract
+		}
+	}
 	if _, err := s.q.CreateApprovePlanInput(ctx, store.CreateApprovePlanInputParams{
 		RunID: run.ID, Body: pgconv.TextOrNull(string(body)), AgentSource: pgconv.TextOrNull(sel.Source), AgentExclusions: exclusions,
+		CompletionContract: completionContract,
 		// PRD #122 M2 (Decision 5/5b): the budget-scaling config the freeze reads to derive
 		// this run's effective budget from its frozen milestone count, atomically with the
 		// candidate→frozen copy. IDEMPOTENT via COALESCE — a re-gate resume re-supplies the

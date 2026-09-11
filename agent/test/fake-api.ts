@@ -20,6 +20,9 @@ interface RecordedRegister {
   /** The self-reported capability set (PRD #83 Q1), or undefined when the worker
    *  sends no `capabilities` field (no daemon wired / older image). */
   capabilities?: string[];
+  /** The self-reported PROTOCOL capability set (PRD #1226 M1, D2), or undefined when
+   *  the worker sends no `protocol_capabilities` field (an older image). */
+  protocol_capabilities?: string[];
   authorized: boolean;
 }
 
@@ -308,6 +311,10 @@ export class FakeApi {
       // register wire stays byte-identical. Mirrors the api's accept-and-ignore.
       if (json.capabilities !== undefined)
         rec.capabilities = (json.capabilities as unknown[]).map(String);
+      // Protocol capabilities (PRD #1226 M1, D2): recorded only when present, so an old
+      // image's register wire stays byte-identical. Mirrors the api's Filter-and-store.
+      if (json.protocol_capabilities !== undefined)
+        rec.protocol_capabilities = (json.protocol_capabilities as unknown[]).map(String);
       this.registers.push(rec);
       return send(res, 200, { worker_id: randomUUID() });
     }

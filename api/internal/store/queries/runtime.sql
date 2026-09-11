@@ -183,6 +183,15 @@ WITH prev AS (
         -- COALESCE guards the NOT NULL column against a nil slice from any caller
         -- (pgx encodes a nil []string as SQL NULL): a nil report stores '{}', not NULL.
         capabilities        = COALESCE(@capabilities::text[], '{}'),
+        -- protocol_capabilities is the server-authoritative PROTOCOL capability set (PRD
+        -- #1226 M1, D2): the FilterProtocol-ed set the worker self-reports, kept SEPARATE
+        -- from capabilities so a protocol string never enters the scheduler vocabulary.
+        -- Overwritten on every register (the fresh-start signal), so a worker that stops
+        -- self-reporting the protocol loses it here too — which correctly makes it unable
+        -- to claim an interlocked run. COALESCE guards the NOT NULL column against a nil
+        -- slice from any caller (pgx encodes a nil []string as SQL NULL): a nil report
+        -- stores '{}', not NULL.
+        protocol_capabilities = COALESCE(@protocol_capabilities::text[], '{}'),
         max_concurrent_runs = sqlc.narg('max_concurrent_runs'),
         -- online_since is the api-owned uptime anchor (PRD #251 M1): PRESERVE it if the
         -- worker is already online with one, else STAMP now() — so a steady stream of
@@ -398,8 +407,19 @@ WHERE status = 'online'
 -- against the vocabulary at its write path, so no re-validation is needed here.
 -- Repo-less kinds (judge/chat/self_improve) INSERT elsewhere and keep the '{}'
 -- column default. Plan inference (M4) later union-merges via a separate UPDATE.
-INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve, wait_on_limit, mr_rework_enabled, plan_md, plan_source, agent_source, agent_exclusions, planned_base_commit, require_base_match, model, override_subagent_model, issue_comments, review_comments, required_capabilities, trigger_source)
-VALUES (@user_id, @repo_id::uuid, @issue_iid, @issue_title, @issue_description, sqlc.narg('origin_column'), now(), @auto_approve, @wait_on_limit, sqlc.narg('mr_rework_enabled'), sqlc.narg('plan_md'), @plan_source, sqlc.narg('agent_source'), sqlc.narg('agent_exclusions')::jsonb, sqlc.narg('planned_base_commit'), @require_base_match, sqlc.narg('model'), @override_subagent_model, sqlc.narg('issue_comments')::jsonb, sqlc.narg('review_comments')::jsonb, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), @trigger_source)
+--
+-- 🔴 completion_contract_version (PRD #1226 M1, D1) is listed here for the SAME reason as
+-- the fields above: it is a silently-omittable nullable param (sqlc.narg). createRun reads
+-- the completion_interlock_rollout switch (fail-safe OFF) and passes 1 ONLY when it is on,
+-- stamping the run as INTERLOCKED before its first claim; a legacy/rollout-off run passes
+-- NULL and stays the explicit legacy state. An omitted Go struct field would compile green
+-- and silently ship NULL for every run (the feature inert), so a per-path test guards it,
+-- not the compiler. Stamped BEFORE the first claim on purpose: approval does not re-claim,
+-- so stamping only at approval would make the D2 hard claim clause vacuous for the
+-- plan-phase worker. The contract CONTENT (completion_contract/contract_revision) is still
+-- absent here — it is frozen with milestones_frozen at approval / the first running report.
+INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve, wait_on_limit, mr_rework_enabled, plan_md, plan_source, agent_source, agent_exclusions, planned_base_commit, require_base_match, model, override_subagent_model, issue_comments, review_comments, required_capabilities, trigger_source, completion_contract_version)
+VALUES (@user_id, @repo_id::uuid, @issue_iid, @issue_title, @issue_description, sqlc.narg('origin_column'), now(), @auto_approve, @wait_on_limit, sqlc.narg('mr_rework_enabled'), sqlc.narg('plan_md'), @plan_source, sqlc.narg('agent_source'), sqlc.narg('agent_exclusions')::jsonb, sqlc.narg('planned_base_commit'), @require_base_match, sqlc.narg('model'), @override_subagent_model, sqlc.narg('issue_comments')::jsonb, sqlc.narg('review_comments')::jsonb, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), @trigger_source, sqlc.narg('completion_contract_version'))
 RETURNING *;
 
 -- name: GetRunByIDForUser :one
@@ -667,6 +687,18 @@ WHERE id = (
       -- PRD #84 M2 extends it: the run's required_capabilities must be a subset of the
       -- claiming worker's effective caps (@worker_caps ∪ docker), gated by @capability_aware.
       AND fn_worker_can_claim(@is_docker_worker::boolean, @docker_repo_allowlist::uuid[], r.repo_id, r.kind, @worker_caps::text[], r.required_capabilities, @capability_aware::boolean)
+      -- PRD #1226 M1 (D2): the NON-BYPASSABLE completion-protocol claim clause. An
+      -- INTERLOCKED run (completion_contract_version IS NOT NULL) may be claimed ONLY by a
+      -- worker whose SELF-REPORTED protocol_capabilities contain 'completion_interlock_v1';
+      -- a LEGACY run (version IS NULL) is unaffected and claimable by any worker. This clause
+      -- is a DEDICATED, standalone predicate INTENTIONALLY OUTSIDE fn_worker_can_claim,
+      -- required_capabilities, ClearRunRequiredCapabilities and the @capability_aware
+      -- kill-switch: an owner capability override or the kill-switch can neutralize the
+      -- ordinary required-capability match, but NONE of them may authorize a worker that does
+      -- not implement the completion protocol. @worker_protocol_caps is the claiming worker's
+      -- stored workers.protocol_capabilities column, passed by the Go caller.
+      AND (r.completion_contract_version IS NULL
+           OR 'completion_interlock_v1' = ANY(@worker_protocol_caps::text[]))
       -- PRD #529 Decision 4: an ephemeral worker exists to serve exactly one run and
       -- must never take foreign work — otherwise it could hold a non-owning run when
       -- its bound run terminates, blocking the busy-guarded teardown (M4). So an
@@ -719,6 +751,13 @@ WHERE id = (
                 AND (NOT p.ephemeral OR p.ephemeral_run_id = r.id)
                 AND p.max_concurrent_runs IS NOT NULL
                 AND fn_worker_can_claim(COALESCE(p.docker_enabled, false), @docker_repo_allowlist::uuid[], r.repo_id, r.kind, p.capabilities, r.required_capabilities, @capability_aware::boolean)
+                -- PRD #1226 M1 (D2): MIRROR the non-bypassable completion-protocol clause for
+                -- the peer, or fleet-spread could DEFER an interlocked run to an INCAPABLE peer
+                -- that would never be able to claim it — making the run unclaimable. Reads the
+                -- peer's OWN workers.protocol_capabilities column directly (no Go param, unlike
+                -- the claimant's @worker_protocol_caps above).
+                AND (r.completion_contract_version IS NULL
+                     OR 'completion_interlock_v1' = ANY(p.protocol_capabilities))
                 AND pa.active < p.max_concurrent_runs
                 AND pa.active * (SELECT w.max_concurrent_runs FROM workers w WHERE w.id = @worker_id)
                     < (SELECT count(*) FROM runs mr
@@ -986,6 +1025,32 @@ UPDATE runs SET
     --      wins and the stale round-2 candidate cannot overwrite it. The common heartbeat
     --      is likewise a no-op via clause 1.
     milestones_frozen = COALESCE(milestones_frozen, sqlc.narg('milestones_frozen')::jsonb, milestones_candidate),
+    -- PRD #1226 M1 (D1): freeze the STRUCTURAL COMPLETION CONTRACT at the SAME point the
+    -- AUTOPILOT path freezes milestones_frozen (the FIRST report that resolves a milestone
+    -- list), IDEMPOTENTLY and by the SAME rules as the human approve path
+    -- (CreateApprovePlanInput). The freeze condition is TIED to the milestone freeze: the run
+    -- is INTERLOCKED (completion_contract_version IS NOT NULL), the contract is not yet frozen
+    -- (completion_contract IS NULL), AND the resolved milestone source is present — the SAME
+    -- 3-way COALESCE(milestones_frozen, narg, milestones_candidate) that milestones_frozen
+    -- above freezes from. The milestone-source guard is LOAD-BEARING: an autopilot run reports
+    -- `running` at claim time BEFORE it resolves its milestones, and without this guard that
+    -- early report would freeze an EMPTY contract that a later milestone-carrying report could
+    -- never correct (the contract-IS-NULL idempotency would already be spent). Postgres
+    -- evaluates every SET RHS against the OLD row, so completion_contract/version and the
+    -- COALESCE source here read the pre-update tuple — the same mechanism the milestones_frozen
+    -- immutability COALESCE relies on. The Go caller (runningStateParams) builds
+    -- @completion_contract from that same resolved source. contract_revision is set to 1 in the
+    -- SAME condition so revision and contract are always frozen together, never one without the other.
+    completion_contract = CASE
+        WHEN completion_contract_version IS NOT NULL AND completion_contract IS NULL
+             AND COALESCE(milestones_frozen, sqlc.narg('milestones_frozen')::jsonb, milestones_candidate) IS NOT NULL
+        THEN sqlc.narg('completion_contract')::jsonb
+        ELSE completion_contract END,
+    contract_revision = CASE
+        WHEN completion_contract_version IS NOT NULL AND completion_contract IS NULL
+             AND COALESCE(milestones_frozen, sqlc.narg('milestones_frozen')::jsonb, milestones_candidate) IS NOT NULL
+        THEN 1
+        ELSE contract_revision END,
     -- PRD #122 M2 (Decision 5/5b): per-run budget derived SERVER-SIDE from the frozen
     -- milestone count at freeze, written IMMUTABLY. NULL for a 0/1-milestone run so its
     -- budget is byte-for-byte the global default. Count capped at milestone_budget_cap,
@@ -2405,6 +2470,26 @@ WHERE status = 'running'
                               + budget_paused_seconds))
   AND kind NOT IN ('chat', 'judge')
   AND interactive = false
+  -- PRD #1226 M3 (D3): completion-interlock carve-out. A run that has recorded at least one
+  -- completion attempt (completion_attempts > 0) AND whose worker is STILL ALIVE (a heartbeat
+  -- inside the same staleness bound the requeue path uses) is EXCLUDED from the wall-clock
+  -- sweep — its live lead is legitimately working the checkpoint-first completion protocol and
+  -- will itself enter the verified completion hold (M4) rather than being terminal-failed out
+  -- from under a live worker. The carve-out is DELIBERATELY NARROW (live worker only): a
+  -- post-attempt run whose worker went STALE is NOT protected here, so it still follows the
+  -- existing RequeueRunsOfStaleWorkers / FailRunsOfStaleWorkersOverCap path (the carve-out can
+  -- never silently become an infinite hold on a dead worker — PRD Risk "Wedged live worker").
+  -- A PRE-attempt run (completion_attempts = 0) past its wall is still failed, unchanged.
+  -- worker_stale_cutoff NULL (an older/unset caller) makes the subquery match no worker, so the
+  -- carve-out never fires and this is byte-identical to the pre-M3 sweep.
+  AND NOT (
+      completion_attempts > 0
+      AND worker_id IN (
+          SELECT w.id FROM workers w
+          WHERE w.last_heartbeat_at IS NOT NULL
+            AND w.last_heartbeat_at >= sqlc.arg('worker_stale_cutoff')::timestamptz
+      )
+  )
 RETURNING id, user_id, status;
 
 -- name: FailRunsOfStaleWorkersOverCap :many
@@ -2939,6 +3024,27 @@ WITH selected AS (
         -- resume) never changes a list that was frozen once. A run with no candidate
         -- freezes NULL, which is correct: nothing to approve, nothing frozen.
         milestones_frozen = COALESCE(runs.milestones_frozen, runs.milestones_candidate),
+        -- PRD #1226 M1 (D1): freeze the STRUCTURAL COMPLETION CONTRACT at the SAME approve
+        -- freeze as milestones_frozen, IDEMPOTENTLY. The freeze condition is TIED to the
+        -- milestone freeze: the run is INTERLOCKED (completion_contract_version IS NOT NULL,
+        -- stamped at CreateRun when the rollout switch was on), the contract is not yet frozen
+        -- (completion_contract IS NULL), AND the resolved milestone source is present — the SAME
+        -- COALESCE(milestones_frozen, milestones_candidate) milestones_frozen above freezes from.
+        -- So a double-approve or re-gate resume never re-freezes, a legacy/rollout-off run keeps
+        -- NULL, and a run with no candidate freezes no contract (consistent with milestones_frozen
+        -- staying NULL — the interlock still holds via the version). The Go caller (submitApproval)
+        -- builds @completion_contract from that same source. contract_revision is set to 1 in the
+        -- SAME condition so revision and contract are always frozen together, never one alone.
+        completion_contract = CASE
+            WHEN runs.completion_contract_version IS NOT NULL AND runs.completion_contract IS NULL
+                 AND COALESCE(runs.milestones_frozen, runs.milestones_candidate) IS NOT NULL
+            THEN sqlc.narg('completion_contract')::jsonb
+            ELSE runs.completion_contract END,
+        contract_revision = CASE
+            WHEN runs.completion_contract_version IS NOT NULL AND runs.completion_contract IS NULL
+                 AND COALESCE(runs.milestones_frozen, runs.milestones_candidate) IS NOT NULL
+            THEN 1
+            ELSE runs.contract_revision END,
         -- PRD #122 M2 (Decision 5/5b): the per-run budget is derived at the SAME freeze,
         -- from the same COALESCE'd frozen source, and written IDEMPOTENTLY via COALESCE —
         -- a double-approve or a re-gate resume never changes a budget frozen once. NULL for
@@ -3770,3 +3876,142 @@ WHERE id = @id AND user_id = @user_id;
 -- fail-open is keyed on created_at, so priority is orthogonal to the age clocks.
 UPDATE runs SET priority = sqlc.narg('priority')::smallint
 WHERE id = @id AND user_id = @user_id AND status = 'queued';
+
+-- name: GetRunOwnedByWorkerForUpdate :one
+-- PRD #1226 M2 (D4): the completion transaction's row lock. completeRunWithPermit opens a
+-- pgx transaction and SELECTs the run FOR UPDATE through this so two concurrent completed
+-- reports (a retry after response loss) serialize — the second blocks until the first
+-- commits and then sees the terminal row. Worker-scoped like GetRunOwnedByWorker: a run the
+-- worker does not hold returns pgx.ErrNoRows.
+SELECT * FROM runs WHERE id = @id AND worker_id = @worker_id FOR UPDATE;
+
+-- name: RecordCompletionAttempt :one
+-- PRD #1226 M2 (D4) + M3: record ONE gated completion attempt and return the run's new attempt
+-- count, ATOMICALLY and BOUNDED. Fired on the permit path's missing-milestones denial (with a
+-- head, no worktree fingerprint, no declaration) and by the same-lead nudge endpoint (with head,
+-- worktree fingerprint AND the lead's declared milestones_completed). In one statement it:
+--   1. inserts the attempt row (`ins`) GUARDED to an INTERLOCKED run OWNED by the worker
+--      (completion_contract_version IS NOT NULL); the INSERT ... SELECT ... FROM runs yields no
+--      row and inserts nothing when the guard fails. Data-modifying CTEs always run to
+--      completion even when the primary query does not read them.
+--   2. PRUNES the run's attempt log to the most recent N: it keeps the 49 newest EXISTING
+--      rows (the prune subquery reads the pre-INSERT snapshot, so the just-inserted row is not
+--      visible to it and can never be pruned) and this insert adds one, so the table lands at
+--      <= 50 rows per run — the bound that keeps the log from growing without limit. Gated on
+--      EXISTS(ins) so it only fires when the attempt was actually recorded.
+--   3. UNION-MERGES the lead's declared milestones_completed into runs.milestones_completed
+--      (PRD #1226 M3): the M3 review flagged the "agent must persist its declaration before the
+--      attempt" ordering hazard, so the attempt endpoint now persists it in the SAME statement.
+--      The CASE is copied VERBATIM from SetRunRunning's milestones_completed union (monotone,
+--      DISTINCT dedup); a NULL @milestones_completed (the permit path, which carries no
+--      declaration) leaves the column untouched, byte-identical to before. The ids are
+--      subset-validated against the frozen list SERVER-SIDE (progressParams) before this call.
+--   4. increments runs.completion_attempts (the SweepRunningTimeout carve-out reads it) and
+--      overwrites runs.latest_completion_attempt with the current summary (server now()), under
+--      the SAME guard so a non-owning/legacy call changes nothing. @unmet is the SERVER
+--      recompute done in Go AFTER the same union above (computeUnmetCriteria over the merged
+--      set), so the persisted unmet is consistent with the persisted milestones_completed. The
+--      final UPDATE takes the runs row lock (serializing concurrent attempts) and returns 0
+--      rows -> pgx.ErrNoRows when the guard fails — the caller's "not recorded" signal.
+--
+-- The outer references are qualified `runs.` on purpose: sqlc pulls the `ins` CTE (named in
+-- EXISTS below) into the outer name scope, so a bare `id`/`completion_attempts` would collide
+-- with ins's RETURNING column and trip its "column reference is ambiguous" analyzer.
+WITH ins AS (
+    INSERT INTO run_completion_attempts (run_id, contract_revision, unmet, head, worktree_fingerprint)
+    SELECT r.id, sqlc.narg('contract_revision'), @unmet::jsonb, sqlc.narg('head'), sqlc.narg('worktree_fingerprint')
+    FROM runs r
+    WHERE r.id = @run_id AND r.worker_id = @worker_id AND r.completion_contract_version IS NOT NULL
+    RETURNING run_completion_attempts.id
+),
+pruned AS (
+    DELETE FROM run_completion_attempts a
+    WHERE a.run_id = @run_id
+      AND EXISTS (SELECT 1 FROM ins)
+      AND a.id NOT IN (
+          SELECT b.id FROM run_completion_attempts b
+          WHERE b.run_id = @run_id
+          ORDER BY b.created_at DESC, b.id DESC
+          LIMIT 49
+      )
+    RETURNING a.id
+)
+UPDATE runs SET
+    completion_attempts = runs.completion_attempts + 1,
+    -- PRD #1226 M3: union-merge the lead's declaration (verbatim SetRunRunning semantics).
+    milestones_completed = CASE
+        WHEN sqlc.narg('milestones_completed')::jsonb IS NULL THEN runs.milestones_completed
+        ELSE COALESCE((SELECT jsonb_agg(DISTINCT e)
+                       FROM jsonb_array_elements_text(COALESCE(runs.milestones_completed, '[]'::jsonb) || sqlc.narg('milestones_completed')::jsonb) AS e), '[]'::jsonb)
+    END,
+    latest_completion_attempt = jsonb_build_object(
+        'unmet', @unmet::jsonb,
+        'head', sqlc.narg('head')::text,
+        'worktree_fingerprint', sqlc.narg('worktree_fingerprint')::text,
+        'at', now()
+    ),
+    updated_at = now()
+WHERE runs.id = @run_id AND runs.worker_id = @worker_id AND runs.completion_contract_version IS NOT NULL
+  AND EXISTS (SELECT 1 FROM ins)
+RETURNING runs.completion_attempts;
+
+-- name: UpsertCompletionPermit :one
+-- PRD #1226 M2 (D4/D5): idempotently ISSUE a structural completion permit bound to the exact
+-- identity (run_id, contract_revision, head). The UNIQUE (run_id, contract_revision, head) is
+-- the idempotency key: repeating an UNCHANGED request lands on the conflict path, which does a
+-- deliberate no-op UPDATE (branch = its own value) purely so RETURNING yields the PRE-EXISTING
+-- row — it NEVER resets consumed_at or issued_at, so a re-request returns the SAME permit
+-- rather than re-issuing or un-consuming one. audit is NULL and finding_ids is '{}' under
+-- profile=structural (reserved for #1231). issued_by_worker_id is the claim fence.
+--
+-- DO UPDATE SET branch = EXCLUDED.branch is the deliberate near-no-op forced by the
+-- idempotency contract: a re-request for the SAME (run_id, contract_revision, head) carries
+-- the same branch (a head fixes its branch), so this changes nothing; it exists only so
+-- RETURNING yields the PRE-EXISTING row on conflict. It touches ONLY branch — issued_at,
+-- issued_by_worker_id, consumed_at, audit and finding_ids are all preserved, so a re-request
+-- never re-issues nor un-consumes the permit. (EXCLUDED.branch, not the target table by name,
+-- because sqlc's analyzer treats a target-table self-reference in DO UPDATE as ambiguous.)
+--
+-- audit and finding_ids are DELIBERATELY OMITTED from the insert: their column defaults (NULL
+-- and '{}') are EXACTLY the structural values, and #1231 fills them by adding them here. This
+-- also keeps the statement in the plain @param / EXCLUDED shape sqlc's ON-CONFLICT analyzer
+-- accepts (a COALESCE(narg::text[], '{}') in the VALUES list trips its column resolver).
+INSERT INTO run_completion_permits (
+    run_id, contract_revision, branch, head, issued_by_worker_id
+) VALUES (
+    @run_id, @contract_revision, @branch, @head, sqlc.narg('issued_by_worker_id')
+)
+ON CONFLICT (run_id, contract_revision, head) DO UPDATE
+    SET branch = EXCLUDED.branch
+RETURNING *;
+
+-- name: GetUnconsumedCompletionPermit :one
+-- PRD #1226 M2 (D4/D5): fetch the UNCONSUMED permit for the exact identity, FOR UPDATE, inside
+-- the completion transaction. issued_by_worker_id fences it to the reporting worker (the claim
+-- fence). No row (identity/head/revision mismatch, already consumed, or a different worker)
+-- returns pgx.ErrNoRows, which completeRunWithPermit reads as "no matching permit -> the gated
+-- completion stays non-terminal".
+SELECT * FROM run_completion_permits
+WHERE run_id = @run_id AND contract_revision = @contract_revision AND head = @head
+  AND issued_by_worker_id = @issued_by_worker_id
+  AND consumed_at IS NULL
+FOR UPDATE;
+
+-- name: GetConsumedCompletionPermit :one
+-- PRD #1226 M2 (D4): the retry-after-response-loss probe. When a completed report arrives for
+-- an ALREADY-terminal run, completeRunWithPermit checks whether THIS worker's permit for the
+-- identity was already consumed (i.e. we completed it once and the response was lost); if so it
+-- returns idempotent success instead of a spurious denial. FOR UPDATE under the same
+-- run-row lock so the check serializes with a concurrent first completion.
+SELECT * FROM run_completion_permits
+WHERE run_id = @run_id AND contract_revision = @contract_revision AND head = @head
+  AND issued_by_worker_id = @issued_by_worker_id
+  AND consumed_at IS NOT NULL
+FOR UPDATE;
+
+-- name: ConsumeCompletionPermit :execrows
+-- PRD #1226 M2 (D4): consume the permit inside the completion transaction — stamp consumed_at
+-- once. Guarded on the worker fence and consumed_at IS NULL so a double-consume matches 0 rows;
+-- the caller requires exactly 1 row affected before writing `completed`.
+UPDATE run_completion_permits SET consumed_at = now()
+WHERE id = @id AND issued_by_worker_id = @issued_by_worker_id AND consumed_at IS NULL;

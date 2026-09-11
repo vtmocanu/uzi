@@ -229,6 +229,30 @@ func TestWorkerRegisterToleratesCapabilities(t *testing.T) {
 	}
 }
 
+func TestWorkerRegisterToleratesProtocolCapabilities(t *testing.T) {
+	// PRD #1226 M1 (D2): a capable worker sends
+	// {"protocol_capabilities":["completion_interlock_v1"]}. DecodeJSON rejects unknown
+	// fields, so register MUST declare the field or the capable worker 400s on register and
+	// wedges its retry loop — the compat rule (the api tolerates protocol_capabilities in the
+	// SAME release the worker starts sending it). An unknown, empty, or absent
+	// protocol_capabilities must never 400 register (the server FilterProtocol-s it).
+	for _, body := range []string{
+		`{"name":"laptop","version":"1.2.3","protocol_capabilities":["completion_interlock_v1"]}`,
+		`{"name":"laptop","version":"1.2.3","protocol_capabilities":["gpu"]}`,
+		`{"name":"laptop","version":"1.2.3","protocol_capabilities":[]}`,
+		`{"name":"laptop","version":"1.2.3"}`,
+		// Alongside the other optional self-reported fields.
+		`{"name":"laptop","version":"1.2.3","template":"base","capabilities":["docker"],"protocol_capabilities":["completion_interlock_v1"]}`,
+	} {
+		h := newProtocolHandler(t, &protocolStore{})
+		rec := httptest.NewRecorder()
+		h.WorkerRegister(rec, workerReq(http.MethodPost, body, uuid.Nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (protocol_capabilities must not 400 register) for %s, body %q", rec.Code, body, rec.Body.String())
+		}
+	}
+}
+
 func TestSanitizeSelfReported(t *testing.T) {
 	// Trims, strips control chars, caps length.
 	if got := sanitizeSelfReported("  1.2.3\x07-m4 \n ", maxSelfReportedBytes); got != "1.2.3-m4" {
