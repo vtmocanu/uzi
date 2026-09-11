@@ -7,7 +7,7 @@ import type { Options as SdkOptions, SDKMessage, HookInput } from "@anthropic-ai
 import { SdkExecutor, resolveLeadModel, embedSeededPlan, TransientRecoveryError, type SdkQueryFn, type SdkExecutorOptions, type ContextUsageReading } from "../src/sdk-executor.js";
 import { PlanRejectedError, type EmittedMessage, type RunContext } from "../src/executor.js";
 import type { PlanVerdict } from "../src/steering.js";
-import type { AgentTemplate, ClaimSkill, Milestone, MilestoneProgress } from "../src/protocol.js";
+import type { AgentTemplate, ClaimSkill, Milestone, MilestoneAgent, MilestoneProgress } from "../src/protocol.js";
 import type { JsDepsResult } from "../src/js-deps.js";
 import { skillsPluginDir } from "../src/skills-plugin.js";
 import { FINDINGS_SERVER_NAME, reportIncidentalIssueToolName } from "../src/findings-tools.js";
@@ -838,6 +838,31 @@ function reportProgress(
   } as unknown as SDKMessage;
 }
 
+// PRD #1224: a report_progress that ALSO declares per-milestone agent attribution. The
+// base `reportProgress` helper never carries milestones_agents, so a checkpoint-reset test
+// that needs the attribution to survive uses this variant.
+function reportProgressWithAgents(
+  completed: string[],
+  in_progress: string[],
+  milestones_agents: MilestoneAgent[],
+  sessionId = "sess-1",
+): SDKMessage {
+  return {
+    type: "assistant",
+    session_id: sessionId,
+    message: {
+      content: [
+        {
+          type: "tool_use",
+          id: "tp",
+          name: "mcp__uzi__report_progress",
+          input: { completed, in_progress, milestones_agents },
+        },
+      ],
+    },
+  } as unknown as SDKMessage;
+}
+
 describe("SdkExecutor budget resize + progress (PRD #122 M2)", () => {
   it("raises the iteration cap to the server-served budget so a scaled run runs past the default", async () => {
     // Default max_iterations is 5; the ack serves 35, so a run that signals done at
@@ -1022,6 +1047,41 @@ describe("SdkExecutor milestone checkpoint (PRD #122 M6)", () => {
     // `break` exits before the iteration-boundary fallback is reached.
     assert.deepStrictEqual(calls, []);
     assert.strictEqual(turns.length, 2, "one planning turn + one loop turn, then done");
+  });
+
+  it("a checkpoint with a still-active concurrent milestone preserves the sibling's in_progress id AND attribution in the next report (PRD #1224 rework, CR !1244)", async () => {
+    // The PRD's premise is concurrent milestones: the lead runs m1 and m2, finishes m1
+    // (reports it completed) while m2 is still in progress and attributed, then checkpoints.
+    // The checkpoint reset must drop ONLY m1 (now completed) from in_progress AND
+    // milestones_agents, preserving m2 and its agent. Under the pre-fix blanket reset,
+    // iteration 2's report carried in_progress:[] and milestones_agents:[], so the server
+    // would overwrite m2's active state — the data loss this pins.
+    const calls: Array<{ iteration: number; progress?: MilestoneProgress }> = [];
+    const { queryFn } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()], // plan
+      // iter 1: m1 completed, m2 still in progress (attributed), then checkpoint (not done).
+      [
+        reportProgressWithAgents(["m1"], ["m2"], [{ id: "m2", agent: "coder" }]),
+        checkpointSignal(),
+        resultSuccess(),
+      ],
+      [assistantText("done now"), signalDone(), resultSuccess()], // iter 2: done
+    ]);
+    const probe = makeCtx({
+      reportIteration: (iteration, progress) => {
+        calls.push({ iteration, progress });
+      },
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    const iter2 = calls.find((c) => c.iteration === 2);
+    assert.ok(iter2, "iteration 2 reported after the checkpoint continue");
+    // Fixed: the still-active sibling m2 and its attribution survive the reset. Unfixed:
+    // in_progress:[] and milestones_agents:[] (deepStrictEqual reddens — the pin).
+    assert.deepStrictEqual(
+      iter2!.progress,
+      { completed: ["m1"], in_progress: ["m2"], milestones_agents: [{ id: "m2", agent: "coder" }] },
+      "the checkpoint reset preserves the concurrent sibling m2 and its agent attribution",
+    );
   });
 });
 
