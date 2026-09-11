@@ -155,10 +155,16 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 	// frozen milestone list and a global-default budget is byte-for-byte unchanged — the
 	// same back-compat contract the DTO's nil slices and null budgets carry.
 	rows = append(rows, milestoneRows(r)...)
-	// The NOW row (PRD #1064 M5, D7): the run's server-derived current_activity, placed
-	// right after the MILESTONES block. nowRow returns nil for a terminal run or one with
-	// no activity, so a finished run and any pre-#1064 run are byte-for-byte unchanged.
-	if row := nowRow(r); row != nil {
+	// The NOW row(s) (PRD #1064 M5, D7; PRD #1224 M6). With EFFECTIVE per-milestone attribution
+	// on a non-terminal run (D8), milestoneNowRows emits one `NOW <id>` row per attributed
+	// in-progress milestone (declared role + label; live tool/age only on the D3 unique-matching
+	// lane) IN PLACE OF the single global NOW row. Otherwise — unattributed, [], invalid-only,
+	// stale-only, or terminal — nowRow renders the single global current_activity row exactly as
+	// before, so a finished run and any pre-#1064 or unattributed run are byte-for-byte unchanged
+	// (the M4 CLI baseline locks this).
+	if mrows := milestoneNowRows(r); len(mrows) > 0 {
+		rows = append(rows, mrows...)
+	} else if row := nowRow(r); row != nil {
 		rows = append(rows, row)
 	}
 	if r.BudgetMaxIterations != nil {
@@ -563,6 +569,71 @@ func nowRow(r apitypes.RunDTO) []string {
 	}
 	parts = append(parts, relAge(act.At)+" ago")
 	return []string{"NOW", strings.Join(parts, " · ")}
+}
+
+// milestoneNowRows is the ATTRIBUTED-case replacement for the single global nowRow (PRD #1224
+// M6): one `NOW <id>` row per effective-attributed in-progress milestone, each carrying that
+// milestone's DECLARED role + optional label (MilestoneAgent.Agent/.AgentLabel). The D3
+// unique-matching lane — the single declared agent whose value byte-matches
+// current_activity.agent — ALSO carries the live tool detail + age (the exact segments nowRow
+// builds); every other attributed milestone (a non-match, or ALL of them when a repeated role
+// suppresses enrichment) shows role + label only, never a guessed age, because the lead lacks the
+// agent_instance that would tell duplicate roles apart.
+//
+// Returns nil (so the caller falls back to the single global nowRow, keeping the unattributed /
+// [] / invalid-only / stale-only cases byte-for-byte, D8) UNLESS the run is non-terminal AND at
+// least one attribution survives the D6 read-time re-filter (effectiveMilestoneAgents). Rows emit
+// in FROZEN order (iterating r.Milestones) so they align with milestoneRows above.
+//
+// Agent, AgentLabel, Tool and Detail are UNTRUSTED, model-authored text (the server caps only
+// Detail/AgentLabel, leaving Agent/Tool unsanitized on the wire), so every display segment goes
+// through cellText — the same terminal-safety backstop nowRow and the milestone-title rows rely
+// on to keep a hostile value from breaking the table rail.
+func milestoneNowRows(r apitypes.RunDTO) [][]string {
+	if terminalRunStatuses[r.Status] {
+		return nil
+	}
+	eff := effectiveMilestoneAgents(r)
+	if len(eff) == 0 {
+		return nil
+	}
+	act := r.CurrentActivity
+	uniqueID := ""
+	if act != nil {
+		uniqueID = uniqueMilestoneAgentMatch(eff, act.Agent)
+	}
+	var rows [][]string
+	for _, mi := range r.Milestones {
+		e, ok := eff[mi.ID]
+		if !ok {
+			continue
+		}
+		parts := make([]string, 0, 4)
+		if role := cellText(e.Agent); role != "" {
+			parts = append(parts, role)
+		}
+		if label := cellText(e.AgentLabel); label != "" {
+			parts = append(parts, label)
+		}
+		// The live tool + its most identifying argument + the age ride ONLY the D3 unique-matching
+		// lane; a non-match (or any lane under a repeated role) stops at role + label. Empty
+		// segments drop, joined with " · " exactly like nowRow, so no dangling separator.
+		if act != nil && mi.ID == uniqueID {
+			tool := cellText(act.Tool)
+			detail := cellText(act.Detail)
+			switch {
+			case tool != "" && detail != "":
+				parts = append(parts, tool+" "+detail)
+			case tool != "":
+				parts = append(parts, tool)
+			case detail != "":
+				parts = append(parts, detail)
+			}
+			parts = append(parts, relAge(act.At)+" ago")
+		}
+		rows = append(rows, []string{"NOW " + mi.ID, strings.Join(parts, " · ")})
+	}
+	return rows
 }
 
 // summaryRows is the CLI surface of the plain-English run summaries (PRD #362 M5): the
