@@ -234,6 +234,7 @@ function makeHarness(
     cwd?: string;
     provider?: CodexProviderConfig;
     appServerAuth?: CodexAppServerAuthSession;
+    dispose?: () => Promise<void>;
     disposeThrows?: boolean;
     log?: Logger;
   } = {},
@@ -248,6 +249,7 @@ function makeHarness(
       cwd: opts.cwd ?? "/isolated/advice-home/work",
       dispose: async () => {
         disposeCalls += 1;
+        await opts.dispose?.();
         if (opts.disposeThrows) throw new Error("dispose boom");
       },
     };
@@ -412,6 +414,54 @@ describe("CodexAdviceHarness: kind + a text advice pass", () => {
     // Usage basis "turn" (Codex declares turn usage; harness-contract.md §Accounting).
     assert.deepEqual(result.usage, { basis: "turn", tokens: {}, wire: { usage: { total_tokens: 12 } } });
     assert.equal(bits.disposeCalls(), 1, "the isolated HOME is disposed after settlement");
+  });
+
+  it("does not return a successful result before an already-started root disposal settles", async () => {
+    let releaseDispose!: () => void;
+    let markDisposeStarted!: () => void;
+    let markFinalCleanupDrain!: () => void;
+    let drains = 0;
+    const disposeGate = new Promise<void>((resolve) => { releaseDispose = resolve; });
+    const disposeStarted = new Promise<void>((resolve) => { markDisposeStarted = resolve; });
+    const finalCleanupDrain = new Promise<void>((resolve) => { markFinalCleanupDrain = resolve; });
+    const appServerAuth: CodexAppServerAuthSession = {
+      mode: "api_key",
+      authenticate: async () => {},
+      handleServerRequest: async () => false,
+      closeAdmissionAndCancel: () => {},
+      drainInterceptedRequests: async () => {
+        drains += 1;
+        if (drains === 2) markFinalCleanupDrain();
+      },
+    };
+    const bits = makeHarness({
+      appServerAuth,
+      dispose: async () => {
+        markDisposeStarted();
+        await disposeGate;
+      },
+    });
+    bits.transport
+      .push(threadStarted())
+      .push(turnStarted())
+      .push(agentMessage("ok"))
+      .push(turnCompleted("completed"))
+      .end();
+
+    let runSettled = false;
+    const run = bits.harness.run(makeAdviceRequest(), noThrowPolicy).finally(() => {
+      runSettled = true;
+    });
+    await disposeStarted;
+    await finalCleanupDrain;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(runSettled, false, "run waits for the in-flight root disposer");
+
+    releaseDispose();
+    const result = await run;
+    assert.equal(result.text, "ok");
+    assert.equal(runSettled, true);
+    assert.equal(bits.disposeCalls(), 1, "the root disposer runs exactly once");
   });
 
   it("turn/start carries the rendered prompt + model + effort", async () => {

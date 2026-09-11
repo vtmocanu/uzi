@@ -267,15 +267,15 @@ export class CodexAdviceHarness implements AdviceHarness {
     // `disposeOnce` so it runs EXACTLY ONCE regardless of race ordering.
     let disposeSeam: (() => Promise<void>) | undefined;
     let transportSeam: CodexTransport | undefined;
-    let disposed = false;
-    const disposeOnce = async (): Promise<void> => {
-      if (disposed) return;
+    let disposePromise: Promise<void> | undefined;
+    const disposeOnce = (): Promise<void> => {
+      if (disposePromise !== undefined) return disposePromise;
       const d = disposeSeam;
-      if (d === undefined) return; // nothing launched yet (a launch that itself rejected leaves nothing)
-      disposed = true;
-      await d().catch((e) =>
+      if (d === undefined) return Promise.resolve(); // a launch failure leaves nothing to dispose
+      disposePromise = d().catch((e) =>
         this.log.warn(`${request.label} codex advice HOME cleanup failed`, { error: errMessage(e) }),
       );
+      return disposePromise;
     };
     const work = (async (): Promise<AdviceResult> => {
       const launched = await this.launchRoot({

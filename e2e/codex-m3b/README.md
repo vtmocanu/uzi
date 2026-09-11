@@ -95,14 +95,15 @@ the harness is authored + host-typechecked while the both-image run is executed 
 `live.sh` is the **only** place the same lifecycle can be pointed at a **real** Codex provider,
 and it is built so an automated / no-input invocation can never reach one:
 
-- `./live.sh --dry-run` — the credential-free loopback proof (no real credential); safe to
-  automate. It never touches a real provider even if a key is present in the environment.
-- `./live.sh` (no argument, no injected key) — **refuses** with a non-zero exit and a clear
+- `./live.sh --dry-run`: the credential-free loopback proof (no real credential), safe to
+  automate. It never touches a real provider merely because the purpose-named login is present.
+- `./live.sh` (no argument, no injected login): **refuses** with a non-zero exit and a clear
   message; there is no default that spends a real credential.
-- `./live.sh --live` — real provider, requires an **explicitly injected**
-  `CODEX_M3B_LIVE_PROVIDER_KEY` (+ `CODEX_M3B_LIVE_BASE_URL`). A real credential is never baked,
-  never a default, and never read from any other variable. Wiring the injected key into a real
-  run is a deliberate manual maintainer step, left guarded under review.
+- `./live.sh --live`: real subscription provider, requires an **explicitly injected**
+  `CODEX_M3B_LIVE_LOGIN_JSON` containing `access_token` and `refresh_token`, plus
+  `CODEX_M3B_LIVE_BASE_URL`. A real credential is never baked, never a default, and never read from
+  another variable. See `LIVE-ACCEPTANCE.md` for the default advice/cancel/no-leak gates and the
+  separately opt-in refresh probes.
 
 ## Files
 
