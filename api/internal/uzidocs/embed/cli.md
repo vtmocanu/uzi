@@ -819,10 +819,11 @@ also the TUI's own fallback when the live channel is unreachable (below).
   what the run reported and does not itself check the work. The
   in-progress row also carries a **now line** beneath it — `↳ <role> ·
   <age>` plus its task label — the crew rail's own current-activity read.
-  When the lead has attributed an agent to each in-progress milestone,
-  every attributed row instead carries its own `↳ <role>` line (its task
-  label beneath), with the live `· <age>` shown only on the lane that
-  uniquely matches the run's current activity; see
+  When the lead has attributed agents to one or more in-progress
+  milestones, every attributed row instead carries its own `↳ <role>` line
+  (its task label beneath), with the live `· <age>` shown only on the lane
+  that uniquely matches the run's current activity; an in-progress row the
+  lead did not attribute keeps its plain mark with no now line; see
   [Milestones and the now line](./run-activity.md#milestones-and-the-now-line)
   for the full rule. Directly above
   the ACCOUNTS block, a **SPEND** block shows the run's total cost (same
@@ -1312,11 +1313,13 @@ the web run view's now line and the TUI's crew-rail/board second line (see
 [Milestones and the now line](./run-activity.md#milestones-and-the-now-line)).
 It's emit-only-when-set: absent for a terminal run or one with no recorded
 activity, so a finished run and any pre-#1064 run print no such row.
-When the lead has attributed an agent to each in-progress milestone, `run
-get` prints a `NOW <id>` row per attributed milestone instead of the
+When the lead has attributed agents to one or more in-progress milestones,
+`run get` prints a `NOW <id>` row per attributed milestone instead of the
 single global row — folded the same way, with live tool/age on only the
-uniquely-matching lane and role · label alone on the rest; a run with no
-effective attribution keeps the single global `NOW` row unchanged.
+uniquely-matching lane and role · label alone on the rest; an in-progress
+milestone the lead did not attribute gets no `NOW` row at all, just its
+plain mark in the `MILESTONES` block. A run with no effective attribution
+keeps the single global `NOW` row unchanged.
 `--json` carries the full `current_activity` object; `current_activity` is
 an object, so `--field current_activity` is the documented usage error
 above (exit 2) even when the run has one — read it with `--json` instead.
