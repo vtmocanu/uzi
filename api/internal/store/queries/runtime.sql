@@ -3964,13 +3964,27 @@ RETURNING runs.completion_attempts;
 -- rather than re-issuing or un-consuming one. audit is NULL and finding_ids is '{}' under
 -- profile=structural (reserved for #1231). issued_by_worker_id is the claim fence.
 --
--- DO UPDATE SET branch = EXCLUDED.branch is the deliberate near-no-op forced by the
--- idempotency contract: a re-request for the SAME (run_id, contract_revision, head) carries
--- the same branch (a head fixes its branch), so this changes nothing; it exists only so
--- RETURNING yields the PRE-EXISTING row on conflict. It touches ONLY branch — issued_at,
--- issued_by_worker_id, consumed_at, audit and finding_ids are all preserved, so a re-request
--- never re-issues nor un-consumes the permit. (EXCLUDED.branch, not the target table by name,
--- because sqlc's analyzer treats a target-table self-reference in DO UPDATE as ambiguous.)
+-- DO UPDATE SET branch = EXCLUDED.branch, issued_by_worker_id = EXCLUDED.issued_by_worker_id
+-- REBINDS the permit to the REQUESTING worker on conflict. The idempotency contract still
+-- holds: a re-request by the SAME worker for the SAME (run_id, contract_revision, head)
+-- carries the same branch and worker id, so it changes nothing and RETURNING yields the
+-- PRE-EXISTING row. The rebind matters on an A->B REQUEUE: worker A issued a permit for
+-- (run, revision, head), the run requeued to worker B in a claimable state, and B re-requests
+-- for the same identity. Without the rebind the row keeps A's issued_by_worker_id, so B's
+-- completeRunWithPermit (which fences on B's id) can never find its permit -> the run is
+-- PERMANENTLY non-terminal. Rebinding issued_by_worker_id to EXCLUDED (B) hands the permit to
+-- whoever last requested it.
+--
+-- It touches ONLY branch and issued_by_worker_id — issued_at, consumed_at, audit and
+-- finding_ids are all PRESERVED (omitted columns keep their existing values). Leaving
+-- issued_at untouched preserves the M2 idempotency contract (a re-request returns the SAME
+-- permit rather than re-issuing one). Not touching consumed_at is provably correct: consumed_at
+-- is NULL on every ON CONFLICT path here, because consume+complete are atomic in
+-- completeRunWithPermit (so consumed ⇔ status='completed'), and a completed run's re-request is
+-- rejected at loadClaimedInterlockedRun's status gate (completion_permit.go) BEFORE it ever
+-- reaches this upsert. (EXCLUDED.<col>, not the target table by name, because sqlc's analyzer
+-- treats a target-table self-reference in a DO UPDATE SET value as ambiguous — so do NOT
+-- introduce a `CASE ... run_completion_permits.issued_at ...` to condition on the existing row.)
 --
 -- audit and finding_ids are DELIBERATELY OMITTED from the insert: their column defaults (NULL
 -- and '{}') are EXACTLY the structural values, and #1231 fills them by adding them here. This
@@ -3982,17 +3996,20 @@ INSERT INTO run_completion_permits (
     @run_id, @contract_revision, @branch, @head, sqlc.narg('issued_by_worker_id')
 )
 ON CONFLICT (run_id, contract_revision, head) DO UPDATE
-    SET branch = EXCLUDED.branch
+    SET branch = EXCLUDED.branch, issued_by_worker_id = EXCLUDED.issued_by_worker_id
 RETURNING *;
 
 -- name: GetUnconsumedCompletionPermit :one
 -- PRD #1226 M2 (D4/D5): fetch the UNCONSUMED permit for the exact identity, FOR UPDATE, inside
 -- the completion transaction. issued_by_worker_id fences it to the reporting worker (the claim
--- fence). No row (identity/head/revision mismatch, already consumed, or a different worker)
--- returns pgx.ErrNoRows, which completeRunWithPermit reads as "no matching permit -> the gated
+-- fence). branch binds the permit to the worker-reported source branch so a permit issued for
+-- branch A at head H cannot complete a report for branch B at the same head H. No row
+-- (identity/head/revision/branch mismatch, already consumed, or a different worker) returns
+-- pgx.ErrNoRows, which completeRunWithPermit reads as "no matching permit -> the gated
 -- completion stays non-terminal".
 SELECT * FROM run_completion_permits
 WHERE run_id = @run_id AND contract_revision = @contract_revision AND head = @head
+  AND branch = @branch
   AND issued_by_worker_id = @issued_by_worker_id
   AND consumed_at IS NULL
 FOR UPDATE;
@@ -4001,10 +4018,12 @@ FOR UPDATE;
 -- PRD #1226 M2 (D4): the retry-after-response-loss probe. When a completed report arrives for
 -- an ALREADY-terminal run, completeRunWithPermit checks whether THIS worker's permit for the
 -- identity was already consumed (i.e. we completed it once and the response was lost); if so it
--- returns idempotent success instead of a spurious denial. FOR UPDATE under the same
--- run-row lock so the check serializes with a concurrent first completion.
+-- returns idempotent success instead of a spurious denial. branch binds the probe to the
+-- worker-reported source branch, the same identity component the unconsumed lookup uses. FOR
+-- UPDATE under the same run-row lock so the check serializes with a concurrent first completion.
 SELECT * FROM run_completion_permits
 WHERE run_id = @run_id AND contract_revision = @contract_revision AND head = @head
+  AND branch = @branch
   AND issued_by_worker_id = @issued_by_worker_id
   AND consumed_at IS NOT NULL
 FOR UPDATE;

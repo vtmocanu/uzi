@@ -51,6 +51,12 @@ const (
 	// CompletionDenyMissingMilestones: one or more in-scope structural criteria are not declared
 	// complete. The bounded unmet id list accompanies the denial, and an attempt is recorded.
 	CompletionDenyMissingMilestones = "missing_milestones"
+	// CompletionDenyEmptyHead: the worker-reported head normalizes (NUL-strip + TrimSpace) to the
+	// empty string, so it cannot bind a permit's `head` identity — an empty head would issue a
+	// permit no completion could ever match. NON-TERMINAL so the worker keeps its session live and
+	// re-reports a real head rather than parking. Distinct from missing_milestones (which records a
+	// spurious attempt): this denial precedes the UpsertCompletionPermit write and records nothing.
+	CompletionDenyEmptyHead = "empty_head"
 )
 
 // Sentinel errors the completion-attempt endpoint returns for the claim-fence denials (the
@@ -221,18 +227,31 @@ func (s *Service) RequestCompletionPermit(ctx context.Context, wkr store.Worker,
 		}
 		return CompletionPermitResult{Granted: false, DenyReason: CompletionDenyMissingMilestones, Unmet: unmet}, nil
 	}
-	// NUL-strip the worker-authored branch and head before they reach the permit's `text NOT NULL`
-	// columns (migration 00212): a NUL raises Postgres 22021, which 500s the issue so the permit is
-	// never written — and because the interlocked run's terminal completion transaction can only
-	// consume a permit that was issued, that would PERMANENTLY block the run from completing (worse
-	// than the attempt path, which only loses an attempt log). This is the same worker-field
-	// discipline persistCompletionAttempt / stripNULParam apply everywhere else. head is stripped
-	// with the SAME helper (in the SAME order, before any trim) the CONSUME side
-	// (completeRunWithPermit) uses, so a real hex head matches at both issue and consume, and a NUL
-	// that strips to the same value matches too. Control/bidi/charset rejection is deliberately NOT
-	// done here — that render-boundary sanitization is M5's job.
-	cleanBranch, _ := stripNUL(req.Branch)
-	cleanHead, _ := stripNUL(req.Head)
+	// Normalize the worker-authored branch and head with the IDENTICAL two-step (NUL-strip THEN
+	// TrimSpace) the CONSUME side (completeRunWithPermit) and persistCompletionAttempt apply, so the
+	// value stored at issue is byte-for-byte what the consume-side lookup keys on. NUL-strip first:
+	// a NUL reaching the permit's `text NOT NULL` columns (migration 00212) raises Postgres 22021,
+	// which 500s the issue so the permit is never written — and because the interlocked run's
+	// terminal completion transaction can only consume a permit that was issued, that would
+	// PERMANENTLY block the run from completing (worse than the attempt path, which only loses an
+	// attempt log). TrimSpace second closes the asymmetry that a head issued untrimmed but looked up
+	// trimmed can never match: before this the issue side stripped NUL only while the consume side
+	// stripped-then-trimmed, so a head with surrounding whitespace stored untrimmed here and was
+	// never findable at consume. This is the same worker-field discipline stripNULParam applies
+	// everywhere else. Control/bidi/charset rejection is deliberately NOT done here — only NUL-strip
+	// + TrimSpace happen at this point, symmetric with the consume side; that render-boundary
+	// sanitization is STILL M5's job.
+	strippedBranch, _ := stripNUL(req.Branch)
+	strippedHead, _ := stripNUL(req.Head)
+	cleanBranch := strings.TrimSpace(strippedBranch)
+	cleanHead := strings.TrimSpace(strippedHead)
+	if cleanHead == "" {
+		// An empty-after-normalize head cannot bind a permit's head identity: issuing one would
+		// write a permit no completion could ever match. Deny NON-TERMINALLY before the upsert so
+		// the worker keeps its session live and re-reports a real head; unlike missing_milestones
+		// this records no attempt.
+		return CompletionPermitResult{Granted: false, DenyReason: CompletionDenyEmptyHead}, nil
+	}
 	permit, err := s.q.UpsertCompletionPermit(ctx, store.UpsertCompletionPermitParams{
 		RunID:            run.ID,
 		ContractRevision: run.ContractRevision.Int32,
@@ -395,6 +414,20 @@ func (s *Service) completeRunWithPermit(ctx context.Context, wkr store.Worker, o
 		clean, _ := stripNUL(*req.Head)
 		head = strings.TrimSpace(clean)
 	}
+	// The branch identity the permit lookups fence on is derived from the WORKER-REPORTED
+	// req.Branch with the IDENTICAL NUL-strip-then-TrimSpace the ISSUE side normalized with, so a
+	// permit issued for branch A cannot be consumed by a completion reporting branch B at the same
+	// head. It MUST come from req.Branch, NOT the locked-row run.Branch: runs.branch is written only
+	// by SetRunCompleted / ReconcileRunMR, both of which run AT or AFTER this completion, so
+	// run.Branch is NULL at this lookup for a first completion — pinning to it would make every
+	// legitimate interlocked completion fail forever. (This differs from revision, correctly
+	// re-derived from the locked row because it is server-authoritative and always present
+	// post-freeze.)
+	branch := ""
+	if req.Branch != nil {
+		clean, _ := stripNUL(*req.Branch)
+		branch = strings.TrimSpace(clean)
+	}
 	// No head or an unfrozen revision cannot match a permit → non-terminal (fail-closed). This is
 	// a cheap early-out on the pre-tx `owned` snapshot before we open a transaction; the
 	// AUTHORITATIVE revision is re-derived from the LOCKED row below.
@@ -439,7 +472,7 @@ func (s *Service) completeRunWithPermit(ctx context.Context, wkr store.Worker, o
 	// success. Otherwise the run is terminal but not by us → non-terminal signal.
 	if run.Status == "completed" {
 		if _, cerr := qtx.GetConsumedCompletionPermit(ctx, store.GetConsumedCompletionPermitParams{
-			RunID: run.ID, ContractRevision: rev, Head: head, IssuedByWorkerID: workerID,
+			RunID: run.ID, ContractRevision: rev, Head: head, Branch: branch, IssuedByWorkerID: workerID,
 		}); cerr != nil {
 			if errors.Is(cerr, pgx.ErrNoRows) {
 				return 0, false, nil
@@ -454,7 +487,7 @@ func (s *Service) completeRunWithPermit(ctx context.Context, wkr store.Worker, o
 
 	// Live run: fetch the unconsumed permit for the exact identity. None → non-terminal.
 	permit, perr := qtx.GetUnconsumedCompletionPermit(ctx, store.GetUnconsumedCompletionPermitParams{
-		RunID: run.ID, ContractRevision: rev, Head: head, IssuedByWorkerID: workerID,
+		RunID: run.ID, ContractRevision: rev, Head: head, Branch: branch, IssuedByWorkerID: workerID,
 	})
 	if perr != nil {
 		if errors.Is(perr, pgx.ErrNoRows) {
