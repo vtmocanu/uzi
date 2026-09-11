@@ -971,6 +971,21 @@ UPDATE runs SET
     -- evaluates the WHERE and every SET right-hand side against the OLD row, which is
     -- the same mechanism the health CASE arms below already rely on.
     open_question_id = NULL,
+    -- PRD #1226 M5 (D7): the completion hold is OVER the instant the worker reports running
+    -- again — a resumed completion-blocked run (paused → queued → claimed → running, or the
+    -- live awaiting_input window resuming in place) is once more executing, so the hold
+    -- annotations must not survive it. This is the D7 "clears the hold on the FIRST accepted
+    -- running report": ResumePausedRun deliberately leaves them set (the decision is not yet
+    -- acted on), and here the first running report clears them — the SAME "no setter leaves a
+    -- resolved park marker behind" discipline as open_question_id above. Cleared
+    -- UNCONDITIONALLY (not CASE'd on entry): a running → running heartbeat re-clears columns
+    -- that are already NULL on a running run, so it is a no-op there, and any resume path that
+    -- reaches running must end the hold. completion_budget_exhausted_at is the one-shot served
+    -- steer flag (D3) — clearing it here matches SetRunCompletionHold's "a stale ack cannot
+    -- re-arm the steer" contract once the run is running again.
+    hold_reason                    = NULL,
+    hold_captured_head             = NULL,
+    completion_budget_exhausted_at = NULL,
     started_at       = COALESCE(started_at, now()),
     iteration_count  = GREATEST(iteration_count, @iteration_count),
     session_id       = COALESCE(sqlc.narg('session_id'), session_id),
@@ -3304,10 +3319,14 @@ WITH pending AS (
     -- the worker must NEVER drain it. Draining would hit SteeringChannel.route's default arm
     -- and log a spurious "unknown input kind". PRD #1190 adds 'resume' to that server-only
     -- set (the resume endpoint writes it as an audit row; the run's return to 'queued' is a
-    -- server-side transition, not a worker steering input). 'pause' and 'pause_cancel' are
-    -- NOT excluded — the worker DOES consume them (the `now` abort and the flag clear).
-    -- Everything else consumes as before.
-    WHERE p.run_id = @run_id AND p.consumed_at IS NULL AND p.kind NOT IN ('scope', 'resume')
+    -- server-side transition, not a worker steering input). PRD #1226 M5 (D7) adds
+    -- 'completion_decision' for the SAME reason: the owner continue-decision is a dedicated
+    -- endpoint's AUDIT row — its control travels via the transition (paused → queued through
+    -- ResumePausedRun) plus a separate 'follow_up' guidance input the worker DOES drain, never
+    -- this raw row — so draining it would likewise hit the default arm. 'pause' and
+    -- 'pause_cancel' are NOT excluded — the worker DOES consume them (the `now` abort and the
+    -- flag clear). Everything else consumes as before.
+    WHERE p.run_id = @run_id AND p.consumed_at IS NULL AND p.kind NOT IN ('scope', 'resume', 'completion_decision')
     ORDER BY p.id ASC
     FOR UPDATE SKIP LOCKED
 ),

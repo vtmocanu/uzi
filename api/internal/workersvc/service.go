@@ -187,6 +187,13 @@ var (
 	// reply written against question N that arrives after the lead has already asked
 	// N+1. Applying it to N+1 would silently answer the wrong question.
 	ErrStaleAnswer = errors.New("answer does not match the run's open question")
+	// ErrCompletionNotBlocked rejects a completion-decision (PRD #1226 M5, D7) on a run that
+	// is NOT completion-blocked → 409. A continue-decision is valid only in the two states a
+	// completion interlock reaches: the live `awaiting_input` completion-question window (an
+	// interlocked run with a recorded completion attempt) OR the `paused` hold
+	// (hold_reason='completion_blocked'). Any other status/reason is neither, so the message
+	// names why rather than acting on a run that never asked for a decision.
+	ErrCompletionNotBlocked = errors.New("run is not waiting on a completion decision")
 	// ErrInvalidAnswer covers a malformed `answer` body (PRD #88 M1) → 400. Rejected
 	// rather than defaulted: an answer that cannot say what it answers has no safe
 	// interpretation.
