@@ -264,6 +264,28 @@ describe("SdkExecutor completion interlock (PRD #1226 M3)", () => {
     assert.ok(result.completionHeld);
   });
 
+  it("(e) a POST-attempt IDLE trip routes to enterCompletionHold", async () => {
+    // Mirrors the WALL case but trips the IDLE timer instead (idle_timeout_seconds small,
+    // run_timeout_seconds large so the wall never fires first). REASON_IDLE shares WALL's
+    // post-attempt routing branch, so a bug isolated to REASON_IDLE — e.g. a wrong constant —
+    // would slip past the WALL case; this pins the idle path + its reason string on its own.
+    const { queryFn } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+      (signal) => hangUntilAbort(signal), // idle trips on the re-prompt turn (no agent activity)
+    ]);
+    const probe = makeCompletionCtx({
+      unmetScript: [["m1"]],
+      config: { max_iterations: 10, idle_timeout_seconds: 0.05, run_timeout_seconds: 100 },
+    });
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.strictEqual(probe.attemptCalls.length, 1, "the idle trip is POST-attempt (>= 1 attempt)");
+    assert.deepStrictEqual(probe.holdReasons.length, 1, "post-attempt idle holds");
+    assert.match(probe.holdReasons[0]!, /no agent activity within the idle timeout/);
+    assert.ok(result.completionHeld);
+    assert.match(result.completionHeld!.reason, /no agent activity within the idle timeout/);
+  });
+
   it("(e) a POST-attempt NO_PROGRESS stall routes to enterCompletionHold", async () => {
     // iter1 signal_done → attempt → re-prompt; then three identical refusals with an unchanged tree
     // trip the #281 detector, which — post-attempt — enters the hold instead of failing.
@@ -289,6 +311,17 @@ describe("SdkExecutor completion interlock (PRD #1226 M3)", () => {
     });
     await assert.rejects(new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx), /wall-clock timeout/);
     assert.strictEqual(probe.attemptCalls.length, 0, "no completion attempt happened before the wall trip");
+    assert.deepStrictEqual(probe.holdReasons, [], "pre-attempt exhaustion must not enter the hold");
+  });
+
+  it("(f) a PRE-attempt IDLE trip still throws the legacy terminal failure (no hold)", async () => {
+    const { queryFn } = fakeTurns([[submitPlan("plan"), resultSuccess()], (signal) => hangUntilAbort(signal)]);
+    const probe = makeCompletionCtx({
+      unmetScript: [["m1"]],
+      config: { max_iterations: 10, idle_timeout_seconds: 0.05, run_timeout_seconds: 100 },
+    });
+    await assert.rejects(new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx), /no agent activity within the idle timeout/);
+    assert.strictEqual(probe.attemptCalls.length, 0, "no completion attempt happened before the idle trip");
     assert.deepStrictEqual(probe.holdReasons, [], "pre-attempt exhaustion must not enter the hold");
   });
 

@@ -479,3 +479,67 @@ func TestAttemptUnionMergesDeclarationLiveDB(t *testing.T) {
 		t.Fatalf("milestones_completed after declaring a non-member = %v, want unchanged [m1 m2]", got)
 	}
 }
+
+// attemptHeadFingerprint reads the single stored run_completion_attempts row's head and
+// worktree_fingerprint TEXT columns.
+func (e interlockLiveDB) attemptHeadFingerprint(t *testing.T, runID uuid.UUID) (head, fingerprint string) {
+	t.Helper()
+	if err := e.pool.QueryRow(e.ctx,
+		`SELECT head, worktree_fingerprint FROM run_completion_attempts WHERE run_id = $1`, runID).
+		Scan(&head, &fingerprint); err != nil {
+		t.Fatalf("read attempt head/worktree_fingerprint: %v", err)
+	}
+	return head, fingerprint
+}
+
+// latestAttemptHeadFingerprint reads runs.latest_completion_attempt's head and
+// worktree_fingerprint out of the jsonb summary — the SECOND 22021 surface a NUL would hit.
+func (e interlockLiveDB) latestAttemptHeadFingerprint(t *testing.T, runID uuid.UUID) (head, fingerprint string) {
+	t.Helper()
+	if err := e.pool.QueryRow(e.ctx,
+		`SELECT latest_completion_attempt->>'head', latest_completion_attempt->>'worktree_fingerprint' FROM runs WHERE id = $1`, runID).
+		Scan(&head, &fingerprint); err != nil {
+		t.Fatalf("read latest_completion_attempt summary: %v", err)
+	}
+	return head, fingerprint
+}
+
+// TestAttemptNULStrippedLiveDB (PRD #1226 M3 hardening): a worker-authored head or
+// worktree_fingerprint carrying a NUL byte is stored NUL-STRIPPED — the attempt is recorded, not
+// 500'd. A NUL in a text/jsonb column raises Postgres 22021, and here it would fire on BOTH the
+// run_completion_attempts text columns AND the latest_completion_attempt jsonb summary, aborting
+// the attempt and leaving an otherwise-complete run's completion unrecorded. This is the same
+// worker-field discipline every other worker-authored text field already carries (stripNULParam /
+// sanitizeFailureReason). It is mutation-sensitive: revert the strip in persistCompletionAttempt
+// and RecordCompletionAttempt returns a 22021 error here (the first assertion reddens).
+func TestAttemptNULStrippedLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	svc := e.permitService(t)
+	wid := e.seedWorker(t, []string{"completion_interlock_v1"})
+	runID := e.seedFrozenRun(t, wid, []string{"m1"}, nil, false)
+	wkr := store.Worker{ID: wid}
+
+	res, err := svc.RecordCompletionAttempt(e.ctx, wkr, runID,
+		CompletionAttemptRequest{Head: "de\x00adbeef", WorktreeFingerprint: "wf\x001"})
+	if err != nil {
+		t.Fatalf("a NUL in head/worktree_fingerprint must be stripped, not error (22021 -> 500): %v", err)
+	}
+	if res.AttemptCount != 1 {
+		t.Fatalf("attempt_count = %d, want 1 (the attempt must still be recorded)", res.AttemptCount)
+	}
+
+	// The attempt row's text columns store the NUL-stripped values.
+	head, wf := e.attemptHeadFingerprint(t, runID)
+	if head != "deadbeef" {
+		t.Fatalf("stored head = %q, want %q (NUL stripped)", head, "deadbeef")
+	}
+	if wf != "wf1" {
+		t.Fatalf("stored worktree_fingerprint = %q, want %q (NUL stripped)", wf, "wf1")
+	}
+
+	// The jsonb summary carries the same stripped values (the second 22021 surface).
+	jHead, jWF := e.latestAttemptHeadFingerprint(t, runID)
+	if jHead != "deadbeef" || jWF != "wf1" {
+		t.Fatalf("latest_completion_attempt summary = (%q, %q), want (deadbeef, wf1)", jHead, jWF)
+	}
+}

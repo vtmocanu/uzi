@@ -291,11 +291,22 @@ func (s *Service) persistCompletionAttempt(ctx context.Context, wkr store.Worker
 	if err != nil {
 		return 0, err
 	}
+	// NUL-strip the worker-authored head and worktree_fingerprint before they are stored — the
+	// same worker-field discipline stripNULParam/sanitizeFailureReason apply to every other
+	// worker-authored text field: a NUL in a text/jsonb column raises Postgres 22021. Here it
+	// would fire on BOTH the run_completion_attempts text columns AND the
+	// jsonb_build_object(...) latest_completion_attempt summary, 500 the attempt, and leave an
+	// otherwise-complete run's completion unrecorded. NUL is removed BEFORE the trim (a NUL is
+	// not whitespace, so a "\x00 h \x00" would survive a trim), matching stopReasonParam's
+	// order; the TrimSpace + ""->NULL behavior is unchanged. Control/bidi/charset rejection is
+	// deliberately NOT done here — that render-boundary sanitization is M5's job.
+	cleanHead, _ := stripNUL(head)
+	cleanFingerprint, _ := stripNUL(worktreeFingerprint)
 	return s.q.RecordCompletionAttempt(ctx, store.RecordCompletionAttemptParams{
 		MilestonesCompleted: milestonesCompletedJSON,
 		Unmet:               unmetJSON,
-		Head:                pgconv.TextOrNull(strings.TrimSpace(head)),
-		WorktreeFingerprint: pgconv.TextOrNull(strings.TrimSpace(worktreeFingerprint)),
+		Head:                pgconv.TextOrNull(strings.TrimSpace(cleanHead)),
+		WorktreeFingerprint: pgconv.TextOrNull(strings.TrimSpace(cleanFingerprint)),
 		RunID:               run.ID,
 		WorkerID:            pgconv.UUID(wkr.ID),
 		ContractRevision:    run.ContractRevision,
