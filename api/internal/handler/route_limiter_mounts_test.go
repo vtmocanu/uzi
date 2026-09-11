@@ -551,6 +551,7 @@ var wantRouteMounts = []routeMount{
 	// the other worker /runs/{id}/... writes; both are bounded server-side (the permit is
 	// idempotent, the attempt log is pruned to N) rather than by a per-user limiter.
 	{"POST", "/api/worker/runs/{id}/completion/attempt", noLimiter},
+	{"POST", "/api/worker/runs/{id}/completion/hold", noLimiter},
 	{"POST", "/api/worker/runs/{id}/completion/permit", noLimiter},
 	// PRD #333 M2: the incidental-findings capture route. It rides
 	// proposalLimiter.PerWorkerMiddleware (a per-WORKER, IP-fallback mount), which this

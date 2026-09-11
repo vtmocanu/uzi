@@ -310,6 +310,53 @@ func (s *Service) RecordCompletionAttempt(ctx context.Context, wkr store.Worker,
 	return CompletionAttemptResult{Unmet: unmet, AttemptCount: int(count)}, nil
 }
 
+// SetRunCompletionHold parks an owned, interlocked run on the completion interlock's dedicated
+// HOLD transition (PRD #1226 M4, D6): running/awaiting_input -> paused with
+// hold_reason='completion_blocked' and the worker-captured head recorded. It is the service seam
+// the worker's park order calls; applied is true IFF a row came back (the SetRunCompletionHold
+// guard admitted the run), which is the ACK the worker keys its cleanup carve-out off — a
+// non-paused ack (applied=false) means RETAIN the run live, never clean up.
+//
+// The captured head is normalized with the SAME worker-field discipline the permit path applies
+// (NUL-strip THEN TrimSpace); an empty captured head is ALLOWED (the column is nullable) and
+// stored NULL via pgconv.TextOrNull.
+//
+// A guard-failed hold is 0 rows (pgx.ErrNoRows): NON-TERMINAL, applied=false, no error. On that
+// path it RE-READS the owned run so the caller returns 409 with the run's REAL (non-paused)
+// status — exactly the SetState/WorkerRunState applied=false contract, where the worker reads its
+// live status off the body and retains the run. The re-read predates no snapshot: the hold's guard
+// and the re-read both key on (id, worker_id), so a run that failed the guard while still owned
+// re-reads cleanly, while a genuinely reclaimed run surfaces as ErrRunNotOwned (-> 404) — the
+// worker never sees `paused` in either case, so it never wrongly cleans up. Only an infra error
+// propagates.
+func (s *Service) SetRunCompletionHold(ctx context.Context, wkr store.Worker, runID uuid.UUID, capturedHead string) (store.Run, bool, error) {
+	// NUL-strip BEFORE the trim (a NUL is not whitespace, so a "\x00 h \x00" would survive a
+	// trim) — the same order RequestCompletionPermit / persistCompletionAttempt use for every
+	// worker-authored text field, and required because hold_captured_head accepts arbitrary
+	// worker input (a NUL in a text column raises Postgres 22021).
+	clean, _ := stripNUL(capturedHead)
+	run, err := s.q.SetRunCompletionHold(ctx, store.SetRunCompletionHoldParams{
+		ID:               runID,
+		WorkerID:         pgconv.UUID(wkr.ID),
+		HoldCapturedHead: pgconv.TextOrNull(strings.TrimSpace(clean)),
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// Guard rejected the hold (wrong status, not interlocked, or no recorded completion
+			// attempt) while the run may still be owned: re-read the authoritative row so the
+			// worker receives its real status through the applied=false / 409 contract. A reclaim
+			// re-reads as ErrRunNotOwned, which the handler maps to 404.
+			current, rerr := s.runOwnedByWorker(ctx, runID, wkr)
+			if rerr != nil {
+				return store.Run{}, false, rerr
+			}
+			return current, false, nil
+		}
+		return store.Run{}, false, err
+	}
+	return run, true, nil
+}
+
 // persistCompletionAttempt writes one bounded completion attempt through the store query
 // (insert row + increment counter + union the declaration into milestones_completed + set
 // summary + prune to N), returning the run's new attempt count. It is the single writer both

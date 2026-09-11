@@ -6,6 +6,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -616,6 +617,114 @@ func TestPermitNULStrippedEndToEndLiveDB(t *testing.T) {
 	}
 	if !consumed {
 		t.Fatal("the permit must be consumed by the NUL-head completion")
+	}
+}
+
+// openQuestionIDNull reports whether runs.open_question_id is NULL for the run.
+func (e interlockLiveDB) openQuestionIDNull(t *testing.T, runID uuid.UUID) bool {
+	t.Helper()
+	var isNull bool
+	if err := e.pool.QueryRow(e.ctx,
+		`SELECT open_question_id IS NULL FROM runs WHERE id = $1`, runID).Scan(&isNull); err != nil {
+		t.Fatalf("read open_question_id: %v", err)
+	}
+	return isNull
+}
+
+// TestSetRunCompletionHoldLiveDB (PRD #1226 M4, D6) proves the dedicated completion-HOLD
+// transition. An OWNED, INTERLOCKED run with at least one recorded completion attempt holds from
+// BOTH running and awaiting_input (-> paused, hold_reason='completion_blocked', captured head
+// recorded, open_question_id cleared). A run with completion_attempts==0 or in a non-
+// running/awaiting_input status is REFUSED (0 rows -> applied=false, status unchanged). And
+// SetRunPaused — the SIBLING this must not weaken — still pauses an owner-pause run, unchanged.
+func TestSetRunCompletionHoldLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	svc := e.permitService(t)
+	wid := e.seedWorker(t, []string{"completion_interlock_v1"})
+	wkr := store.Worker{ID: wid}
+
+	// Case 1: owned interlocked RUNNING run with completion_attempts>0 holds; the captured head
+	// is recorded and a resolved open_question_id is cleared.
+	running := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
+	e.exec(t, `UPDATE runs SET completion_attempts = 1, open_question_id = 'q-should-clear' WHERE id = $1`, running)
+	run, applied, err := svc.SetRunCompletionHold(e.ctx, wkr, running, "capturedhead1")
+	if err != nil {
+		t.Fatalf("SetRunCompletionHold (running): %v", err)
+	}
+	if !applied {
+		t.Fatal("an owned interlocked running run with an attempt must hold (applied)")
+	}
+	if run.Status != "paused" {
+		t.Fatalf("held run status = %q, want paused", run.Status)
+	}
+	if !run.HoldReason.Valid || run.HoldReason.String != "completion_blocked" {
+		t.Fatalf("hold_reason = %+v, want 'completion_blocked'", run.HoldReason)
+	}
+	if !run.HoldCapturedHead.Valid || run.HoldCapturedHead.String != "capturedhead1" {
+		t.Fatalf("hold_captured_head = %+v, want 'capturedhead1'", run.HoldCapturedHead)
+	}
+	if !e.openQuestionIDNull(t, running) {
+		t.Fatal("open_question_id must be cleared by the hold (NO SETTER MAY LEAVE A RESOLVED open_question_id BEHIND)")
+	}
+
+	// Case 2: owned interlocked AWAITING_INPUT run with an attempt also holds.
+	awaiting := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
+	e.exec(t, `UPDATE runs SET status = 'awaiting_input', completion_attempts = 2 WHERE id = $1`, awaiting)
+	run2, applied2, err := svc.SetRunCompletionHold(e.ctx, wkr, awaiting, "")
+	if err != nil {
+		t.Fatalf("SetRunCompletionHold (awaiting_input): %v", err)
+	}
+	if !applied2 || run2.Status != "paused" {
+		t.Fatalf("an awaiting_input interlocked run with an attempt must hold; applied=%v status=%q", applied2, run2.Status)
+	}
+	// An empty captured head is allowed and stored NULL.
+	if run2.HoldCapturedHead.Valid {
+		t.Fatalf("an empty captured head must store NULL; got %+v", run2.HoldCapturedHead)
+	}
+
+	// Case 3: completion_attempts==0 is REFUSED (the guard fails); status is unchanged. THIS is
+	// the assertion the completion_attempts>0 mutation check reddens.
+	noAttempts := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false) // attempts defaults to 0
+	run3, applied3, err := svc.SetRunCompletionHold(e.ctx, wkr, noAttempts, "h")
+	if err != nil {
+		t.Fatalf("SetRunCompletionHold (attempts=0): %v", err)
+	}
+	if applied3 {
+		t.Fatal("a run with completion_attempts=0 must NOT hold")
+	}
+	if run3.Status != "running" {
+		t.Fatalf("a refused hold must leave status unchanged; got %q, want running", run3.Status)
+	}
+	if s := e.runStatus(t, noAttempts); s != "running" {
+		t.Fatalf("db status after refused hold = %q, want running", s)
+	}
+
+	// Case 4: a non-running/awaiting_input status (queued) is REFUSED even with an attempt.
+	queued := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
+	e.exec(t, `UPDATE runs SET status = 'queued', completion_attempts = 3 WHERE id = $1`, queued)
+	run4, applied4, err := svc.SetRunCompletionHold(e.ctx, wkr, queued, "h")
+	if err != nil {
+		t.Fatalf("SetRunCompletionHold (queued): %v", err)
+	}
+	if applied4 {
+		t.Fatal("a queued run must NOT hold (source guard is running/awaiting_input only)")
+	}
+	if run4.Status != "queued" {
+		t.Fatalf("a refused hold must leave status unchanged; got %q, want queued", run4.Status)
+	}
+
+	// Case 5: SetRunPaused — the sibling this must not weaken — still pauses an owner-pause run.
+	ownerPause := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
+	e.exec(t, `UPDATE runs SET pause_requested_at = now() WHERE id = $1`, ownerPause)
+	rows, err := e.q.SetRunPaused(e.ctx, store.SetRunPausedParams{ID: ownerPause, WorkerID: pgconv.UUID(wid)})
+	if err != nil {
+		t.Fatalf("SetRunPaused: %v", err)
+	}
+	if rows != 1 {
+		t.Fatalf("SetRunPaused must still pause an owner-pause running run; rows=%d", rows)
+	}
+	if s := e.runStatus(t, ownerPause); s != "paused" {
+		t.Fatalf("owner-pause run status = %q, want paused", s)
 	}
 }
 

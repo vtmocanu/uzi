@@ -554,6 +554,13 @@ type Store interface {
 	// request without parking (the worker's pause_failed report); CreatePauseInput /
 	// CancelPauseInput are the owner's request / withdrawal CTEs.
 	SetRunPaused(ctx context.Context, arg store.SetRunPausedParams) (int64, error)
+	// SetRunCompletionHold parks an OWNED, INTERLOCKED run on the completion interlock's
+	// dedicated hold (PRD #1226 M4, D6): running/awaiting_input -> paused with
+	// hold_reason='completion_blocked'. A SIBLING of SetRunPaused, not a widening — its guard
+	// admits only an interlocked run with a recorded completion attempt (completion_attempts > 0)
+	// and leaves the pending-pause columns untouched, so the owner-pause path is unaffected. 0
+	// rows (guard fail) is the non-paused ack the worker's park order must retain the run on.
+	SetRunCompletionHold(ctx context.Context, arg store.SetRunCompletionHoldParams) (store.Run, error)
 	ResumePausedRun(ctx context.Context, arg store.ResumePausedRunParams) (store.ResumePausedRunRow, error)
 	ClearPauseRequest(ctx context.Context, arg store.ClearPauseRequestParams) (int64, error)
 	CreatePauseInput(ctx context.Context, arg store.CreatePauseInputParams) (store.RunUserInput, error)

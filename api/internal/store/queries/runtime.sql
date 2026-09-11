@@ -1724,6 +1724,56 @@ WHERE id = @id AND worker_id = @worker_id
   AND status = 'running'
   AND pause_requested_at IS NOT NULL;
 
+-- name: SetRunCompletionHold :one
+-- Park an OWNED, INTERLOCKED run on the completion interlock's dedicated HOLD transition
+-- (PRD #1226 M4, D6). This is a SIBLING of SetRunPaused, NOT a widening of it: the owner-pause
+-- park (SetRunPaused) and this completion hold are two different reasons a run reaches `paused`,
+-- and each keeps its own guard so neither can be reached by the other's report. running OR
+-- awaiting_input -> paused, NON-TERMINAL.
+--
+-- THE GUARD admits ONLY an owned interlocked run in `running` OR `awaiting_input` (unlike
+-- SetRunPaused, whose source is `running` + a pending pause request) that has RECORDED AT LEAST
+-- ONE completion attempt (completion_attempts > 0). awaiting_input is admitted because the M5
+-- completion-question path can leave a still-live interlocked run in that status when the worker
+-- decides to hold. completion_contract_version IS NOT NULL keeps a legacy run out (it never
+-- interlocks). 0 rows (the guard fails) is the ACK the worker's park order reads: a non-`paused`
+-- ack means the run must be RETAINED LIVE, never cleaned up.
+--
+-- hold_reason is set to the single reason this milestone defines, 'completion_blocked'; #1229
+-- adds further reasons additively (the column is unconstrained text). hold_captured_head records
+-- the EXACT head the worker captured at hold time (sqlc.narg — nullable; an empty captured head
+-- is allowed via pgconv.TextOrNull).
+--
+-- open_question_id is CLEARED, following the "NO SETTER MAY LEAVE A RESOLVED open_question_id
+-- BEHIND" convention (see SetRunRunning / SetRunAwaitingApproval): the (worker-authored, M5)
+-- completion question the run may have parked on is resolved by this hold, so its id must not
+-- survive. completion_budget_exhausted_at is CLEARED because the worker acting on the served
+-- steer is exactly the D3 "clears it so a stale ack cannot re-arm" contract.
+--
+-- It deliberately does NOT clear completion_attempts / latest_completion_attempt (M5's
+-- honest-state UI reads them), and it does NOT touch the pending-pause columns
+-- (pause_requested_at / pause_mode / pause_after_count) — this is not an owner pause, so
+-- SetRunPaused's consume-the-request semantics do not apply and are left untouched.
+--
+-- THE HEALTH RESET is mandatory for SetRunPaused's reason: ListActiveRunsForHealth is a positive
+-- allowlist that never revisits a park, so a flag live at hold time would freeze for the whole
+-- hold. session_id is COALESCE'd (sqlc.narg) so an omitting report preserves it.
+UPDATE runs SET
+    status                         = 'paused',
+    status_since                   = now(),
+    session_id                     = COALESCE(sqlc.narg('session_id'), session_id),
+    hold_reason                    = 'completion_blocked',
+    hold_captured_head             = sqlc.narg('hold_captured_head'),
+    open_question_id               = NULL,
+    completion_budget_exhausted_at = NULL,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at                     = now()
+WHERE id = @id AND worker_id = @worker_id
+  AND status IN ('running', 'awaiting_input')
+  AND completion_contract_version IS NOT NULL
+  AND completion_attempts > 0
+RETURNING *;
+
 -- name: ResumePausedRun :one
 -- Owner-scoped resume of ONE paused run (PRD #1190 M1): paused -> queued, the on-demand
 -- counterpart to PromoteLimitWaitRuns but with the GATE-PARK accounting (Decision 2), NOT the

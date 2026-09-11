@@ -893,6 +893,10 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// never asserts "milestones done". Fed from this one mount into both listeners.
 		r.Post("/runs/{id}/completion/permit", h.WorkerRunCompletionPermit)
 		r.Post("/runs/{id}/completion/attempt", h.WorkerRunCompletionAttempt)
+		// PRD #1226 M4 (D6): the dedicated completion-HOLD transition. The worker parks an
+		// interlocked run it cannot complete (running/awaiting_input -> paused); the returned
+		// status is the park-order ack (paused = clean up, anything else = retain live).
+		r.Post("/runs/{id}/completion/hold", h.WorkerRunCompletionHold)
 
 		// Ownership/terminality probe (#559): worker-authenticated, run-scoped,
 		// READ ONLY. The interactive park-SKIP path polls it to detect a mid-turn
