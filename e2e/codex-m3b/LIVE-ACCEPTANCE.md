@@ -48,6 +48,7 @@ Optional tunables (sane defaults; real-provider latency makes larger values advi
 | `CODEX_M3B_LIVE_ADVICE_TIMEOUT_MS` | `180000` | Inner cap on the gated real advice pass in ms. |
 | `CODEX_M3B_LIVE_SKIP_EXEC` | (unset) | `1` skips only the non-gating complete real-model run. Advice, cancel/root settlement, release/fail-closed, and no-leak gates still run. |
 | `CODEX_M3B_LIVE_REFRESH_PROBES` | (unset) | `1` explicitly enables the token-rotating sequential advance/replay and concurrent check-b probes. Default live acceptance does not execute or require them. |
+| `CODEX_M3B_LIVE_RELAX_TIMEOUTS` | (unset) | `1` enables diagnostic-only timeout relaxation: the worker client uses 30 seconds instead of the production 8-second budget, and the live test server removes its explicit identity and refresh limits. A run with this set is not production-equivalent acceptance. |
 | `UZI_M3B_SKIP_BUILD` | (unset) | `1` reuses an existing `uzi-agent-m3b:base` image instead of building it. |
 
 ### The login blob shape

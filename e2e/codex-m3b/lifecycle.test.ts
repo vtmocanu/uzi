@@ -1897,8 +1897,8 @@ async function refreshWithRetry(
   operationId: string,
   observedGeneration: number,
   maxAttempts = 8,
+  sleep: (ms: number) => Promise<void> = sleepMs,
 ): Promise<LiveRefreshResp> {
-  let lastErr: unknown;
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     try {
       return await client.refreshCodex(
@@ -1907,12 +1907,101 @@ async function refreshWithRetry(
         { authMode: "subscription", chatgptAccountId: account },
       );
     } catch (err) {
-      lastErr = err;
-      await sleepMs(250 * (attempt + 1));
+      const status = err !== null && typeof err === "object"
+        ? (err as { readonly status?: unknown }).status
+        : undefined;
+      if (status !== 409) throw new Error("live refresh probe failed with a non-retryable response");
+      if (attempt + 1 < maxAttempts) await sleep(250 * (attempt + 1));
     }
   }
-  throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
+  throw new Error("live refresh probe exhausted contention retries");
 }
+
+describe("codex-m3b live refresh retry classification", () => {
+  const response: LiveRefreshResp = {
+    auth_mode: "subscription",
+    access_token: "retry-test-token",
+    generation: 1,
+    chatgpt_account_id: "retry-test-account",
+    chatgpt_plan_type: null,
+    outcome: "advanced",
+  };
+
+  it("retries only 409 contention and preserves the operation inputs", async () => {
+    let calls = 0;
+    const sleeps: number[] = [];
+    const client = {
+      refreshCodex: async () => {
+        calls += 1;
+        if (calls === 1) throw Object.assign(new Error("contention"), { status: 409 });
+        return response;
+      },
+    } as unknown as WorkerClientInstance;
+
+    const result = await refreshWithRetry(
+      client,
+      "run",
+      "capability",
+      "account",
+      "operation",
+      0,
+      2,
+      async (ms) => { sleeps.push(ms); },
+    );
+    assert.equal(result, response);
+    assert.equal(calls, 2);
+    assert.deepEqual(sleeps, [250]);
+  });
+
+  it("does not retry or disclose a non-contention failure", async () => {
+    let calls = 0;
+    const providerText = "provider-body-must-not-escape";
+    const client = {
+      refreshCodex: async () => {
+        calls += 1;
+        throw Object.assign(new Error(providerText), { status: 500 });
+      },
+    } as unknown as WorkerClientInstance;
+
+    await assert.rejects(
+      refreshWithRetry(client, "run", "capability", "account", "operation", 0),
+      (error: unknown) => error instanceof Error
+        && error.message === "live refresh probe failed with a non-retryable response"
+        && !error.message.includes(providerText),
+    );
+    assert.equal(calls, 1);
+  });
+
+  it("stops at the contention retry bound without disclosing the response", async () => {
+    let calls = 0;
+    let sleeps = 0;
+    const providerText = "contention-body-must-not-escape";
+    const client = {
+      refreshCodex: async () => {
+        calls += 1;
+        throw Object.assign(new Error(providerText), { status: 409 });
+      },
+    } as unknown as WorkerClientInstance;
+
+    await assert.rejects(
+      refreshWithRetry(
+        client,
+        "run",
+        "capability",
+        "account",
+        "operation",
+        0,
+        1,
+        async () => { sleeps += 1; },
+      ),
+      (error: unknown) => error instanceof Error
+        && error.message === "live refresh probe exhausted contention retries"
+        && !error.message.includes(providerText),
+    );
+    assert.equal(calls, 1);
+    assert.equal(sleeps, 0, "the exhausted final attempt does not sleep");
+  });
+});
 
 interface LiveLoginSecrets {
   readonly accessToken: string;
