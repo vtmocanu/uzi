@@ -31,6 +31,19 @@ type routedCodexRefreshFake struct {
 	discoverCalls  int
 }
 
+type failingCodexResponseWriter struct {
+	header http.Header
+	status int
+}
+
+func (w *failingCodexResponseWriter) Header() http.Header { return w.header }
+func (w *failingCodexResponseWriter) WriteHeader(status int) {
+	w.status = status
+}
+func (*failingCodexResponseWriter) Write(_ []byte) (int, error) {
+	return 0, fmt.Errorf("response write failed")
+}
+
 func (f *routedCodexRefreshFake) Refresh(_ context.Context, refreshToken string) (codexauth.RefreshResult, error) {
 	f.refreshCalls++
 	f.refreshToken = refreshToken
@@ -148,6 +161,7 @@ func TestWorkerCodexRoutesReleaseAndRefreshLiveDB(t *testing.T) {
 		},
 	}
 	wsvc.SetCodexRefresh(provider)
+	timings := installTimingCapture(t)
 
 	doPost := func(path, body string) *httptest.ResponseRecorder {
 		t.Helper()
@@ -175,8 +189,9 @@ func TestWorkerCodexRoutesReleaseAndRefreshLiveDB(t *testing.T) {
 		t.Fatalf("release called refresh provider: refresh=%d discover=%d", provider.refreshCalls, provider.discoverCalls)
 	}
 
+	refreshOpID := uuid.New()
 	refresh := doPost("/api/worker/runs/"+runID.String()+"/codex/refresh",
-		fmt.Sprintf(`{"capability":%q,"operation_id":%q,"observed_generation":0}`, capability, uuid.NewString()))
+		fmt.Sprintf(`{"capability":%q,"operation_id":%q,"observed_generation":0}`, capability, refreshOpID.String()))
 	if refresh.Code != http.StatusOK {
 		t.Fatalf("routed refresh = %d, want 200: %s", refresh.Code, refresh.Body.String())
 	}
@@ -191,4 +206,52 @@ func TestWorkerCodexRoutesReleaseAndRefreshLiveDB(t *testing.T) {
 		t.Fatalf("provider calls/token = (%d,%d,%q), want (1,1,original refresh token)",
 			provider.refreshCalls, provider.discoverCalls, provider.refreshToken)
 	}
+
+	writeFailureOpID := uuid.New()
+	writeFailureReq := httptest.NewRequest(http.MethodPost,
+		"/api/worker/runs/"+runID.String()+"/codex/refresh",
+		strings.NewReader(fmt.Sprintf(`{"capability":%q,"operation_id":%q,"observed_generation":0}`,
+			capability, writeFailureOpID.String())))
+	writeFailureReq.Header.Set("Authorization", "Bearer "+joinToken)
+	writeFailureReq.Header.Set("Content-Type", "application/json")
+	writeFailure := &failingCodexResponseWriter{header: make(http.Header)}
+	router.ServeHTTP(writeFailure, writeFailureReq)
+	if writeFailure.status != http.StatusOK {
+		t.Fatalf("write-failure refresh status = %d, want 200 headers before the failed body write", writeFailure.status)
+	}
+	if provider.refreshCalls != 1 || provider.discoverCalls != 1 {
+		t.Fatalf("reconciled write-failure request repeated provider calls: refresh=%d discover=%d",
+			provider.refreshCalls, provider.discoverCalls)
+	}
+
+	assertResults := func(operationID uuid.UUID, wantService, wantRoute string) {
+		t.Helper()
+		serviceCount, routeCount := 0, 0
+		for _, rec := range timings.snapshot() {
+			opAttr, ok := rec.attrs["operation_id"]
+			if !ok || opAttr.String() != operationID.String() {
+				continue
+			}
+			switch rec.msg {
+			case "codex refresh service":
+				serviceCount++
+				assertTimingKeySet(t, rec, "operation_id", "service_total_ms", "result")
+				if got := rec.attrs["result"].String(); got != wantService {
+					t.Fatalf("service result for %s = %q, want %q", operationID, got, wantService)
+				}
+			case codexTimingMsgRoute:
+				routeCount++
+				assertTimingKeySet(t, rec, "operation_id", "route_total_ms", "result")
+				if got := rec.attrs["result"].String(); got != wantRoute {
+					t.Fatalf("route result for %s = %q, want %q", operationID, got, wantRoute)
+				}
+			}
+		}
+		if serviceCount != 1 || routeCount != 1 {
+			t.Fatalf("timing records for %s: service=%d route=%d, want 1 each",
+				operationID, serviceCount, routeCount)
+		}
+	}
+	assertResults(refreshOpID, "ok", "ok")
+	assertResults(writeFailureOpID, "ok", "error")
 }
