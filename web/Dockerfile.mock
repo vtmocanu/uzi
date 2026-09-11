@@ -26,6 +26,10 @@ COPY docs/ /app/docs/
 # modules; `npm run build`'s `tsc --noEmit` typechecks it, so the sibling dir must be
 # present here too (else TS2307). Mirrors web/Dockerfile.
 COPY fixtures/api-contract/ /app/fixtures/api-contract/
+# milestoneAttribution.fixture.test.ts likewise statically imports
+# fixtures/milestone-attribution/cases.json as a typed JSON module; tsc --noEmit needs it present
+# too (else TS2307). Mirrors web/Dockerfile.
+COPY fixtures/milestone-attribution/ /app/fixtures/milestone-attribution/
 ENV VITE_UZI_MOCK=1
 RUN npm run build
 
