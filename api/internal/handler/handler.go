@@ -887,6 +887,13 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		r.Post("/runs/{id}/state", h.WorkerRunState)
 		r.Get("/runs/{id}/inputs", h.WorkerRunInputs)
 
+		// Completion interlock (PRD #1226 M2): the permit-issue and same-lead attempt
+		// endpoints. Both inherit RequireWorker, derive (run, owner) from the OWNED run
+		// inside the service, and recompute the structural predicates server-side — a worker
+		// never asserts "milestones done". Fed from this one mount into both listeners.
+		r.Post("/runs/{id}/completion/permit", h.WorkerRunCompletionPermit)
+		r.Post("/runs/{id}/completion/attempt", h.WorkerRunCompletionAttempt)
+
 		// Ownership/terminality probe (#559): worker-authenticated, run-scoped,
 		// READ ONLY. The interactive park-SKIP path polls it to detect a mid-turn
 		// reclaim (404) or terminal transition early — restoring the ACK the

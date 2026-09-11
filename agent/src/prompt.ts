@@ -1333,10 +1333,14 @@ function milestoneStatusNote(
     "Keep this tracker honest as you go. At the start of each implement turn, call",
     "`report_progress` with the id of the milestone you are working on (its `in_progress`);",
     "call it again with that id in `completed` when it is done. It updates the tracker right",
-    "away and does NOT end your turn. When you finish, declare the milestones you ACTUALLY",
-    "completed on `signal_done` (its `milestones_completed` field): list only what you truly",
-    "finished, and leave any you deliberately left undone undeclared, so the tracker reflects",
-    "what actually shipped rather than reading as 0 on a run that succeeded.",
+    "away and does NOT end your turn. When you have DISPATCHED a subagent to work a milestone",
+    "that is `in_progress`, also pass `milestones_agents` with that milestone's id and the",
+    "EXACT `subagent_type` string you gave the Agent/Task dispatch (its kebab-case identifier),",
+    "plus an optional short label — this is what lets each in-progress milestone show which",
+    "agent is on it when several run at once. Best-effort. When you finish, declare the",
+    "milestones you ACTUALLY completed on `signal_done` (its `milestones_completed` field):",
+    "list only what you truly finished, and leave any you deliberately left undone undeclared,",
+    "so the tracker reflects what actually shipped rather than reading as 0 on a run that succeeded.",
   ];
   // PRD #390 M2/M3: the executor sets progressMissedLastTurn when the PREVIOUS work turn
   // marked no milestone in progress, escalating the standing requirement above into a direct

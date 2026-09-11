@@ -796,6 +796,10 @@ func TestTUIViewsStripControlBytesFromUntrustedText(t *testing.T) {
 	// "credsafe" carries the same hostile control/bidi bytes but a tail that only the rail's
 	// account-label render can put into the frame.
 	detailCredLabel := "\x1b[2J\u202E\x07\x01credsafe" //nolint:gosec // G101: not a credential - a hostile control/bidi-byte sanitization fixture whose display label happens to contain "cred"; the test asserts it is stripped, never a secret.
+	// The declared attribution label carries the same hostile control/bidi bytes as nasty but a
+	// distinct "milesafe" tail, so only railMilestoneAgentLines' render of MilestoneAgent.AgentLabel
+	// can put it in the frame (the title yields "safe", the account label "credsafe").
+	hostileMileLabel := "\x1b[2J\u202E\x07\x01milesafe"
 	// A hostile milestone title exercises renderMilestones' crew-rail draw (D7): the
 	// in-progress id makes the row render its title through renderer.Plain. The hostile
 	// AnthropicSecretLabel exercises the detail rail ACCOUNTS label (railRateMeters →
@@ -805,18 +809,35 @@ func TestTUIViewsStripControlBytesFromUntrustedText(t *testing.T) {
 	detail = applyDetail(detail, apitypes.RunDTO{ID: runID, Status: "running", IssueTitle: nasty,
 		AnthropicSecretID: &secretID, AnthropicSecretLabel: &detailCredLabel,
 		Milestones:           []apitypes.Milestone{{ID: "m1", Title: nasty}},
-		MilestonesInProgress: []string{"m1"}},
+		MilestonesInProgress: []string{"m1"},
+		// A hostile per-milestone agent attribution (PRD #1224 M6). With m1 in progress AND
+		// attributed, the effective-attribution branch (D8) draws the DECLARED role
+		// (MilestoneAgent.Agent) and label (MilestoneAgent.AgentLabel) via railMilestoneAgentLines,
+		// both folded through renderer.Plain (D4/D7). Agent is nasty (matching the seq-2 frame) so it
+		// byte-matches current_activity.agent and becomes the D3 unique-matching lane, exercising the
+		// live-age branch; the AgentLabel marker "milesafe" differs from the title's "safe" and the
+		// account label's "credsafe" so its survival proves THIS render path put it in the frame.
+		MilestonesAgents: []apitypes.MilestoneAgent{{ID: "m1", Agent: nasty, AgentLabel: hostileMileLabel}}},
 		[]apitypes.MessageDTO{
 			msgDTO(1, "text", nasty, "toolu_"+nasty, nasty, nasty, now),
-			// A hostile tool_use frame drives the crew rail's now line (renderMilestones →
-			// railNowLines, PRD #1064 D4): the role (Agent) and the italic task label
-			// (AgentLabel / the Bash description Detail) are model-authored, unsanitized on the
-			// wire, and must be drawn through renderer.Plain.
+			// A hostile tool_use frame supplies the live current_activity (renderMilestones →
+			// railActivity, PRD #1064 D4): its Agent is the D3 join key (byte-matched against the
+			// declared attribution) and its At drives the unique-match lane's age. Its role (Agent)
+			// and the italic task label (AgentLabel / the Bash description Detail) are model-authored,
+			// unsanitized on the wire, and are drawn through renderer.Plain (in the transcript pane
+			// here, and as the unattributed now-line when no attribution is present).
 			{Seq: 2, Kind: "tool_use", Agent: ptr(nasty), AgentLabel: ptr(nasty), CreatedAt: now,
 				Payload: json.RawMessage(`{"name":"Bash","input":{"description":` + quoteJSON(nasty) + `}}`)},
 		})
 	detailOut := detail.View().Content
 	assertNoRawControls(t, "detail", detailOut)
+	// The declared MilestoneAgent.AgentLabel sanitizes to "milesafe", which can ONLY reach detailOut
+	// via railMilestoneAgentLines' render of the attributed milestone's label (the title yields "safe",
+	// the account label "credsafe"). Its presence proves the PRD #1224 attribution render path ran and,
+	// paired with assertNoRawControls above, that it folded the hostile Agent/AgentLabel it drew.
+	if !strings.Contains(detailOut, "milesafe") {
+		t.Fatalf("the crew rail is not drawing MilestoneAgent attribution, so this test is not exercising the PRD #1224 render path\n%s", detailOut)
+	}
 	// The hostile AnthropicSecretLabel sanitizes to "credsafe", which can ONLY reach detailOut via
 	// the rail's render of the account label — the title produces "safe", not a superstring of
 	// "credsafe". Its presence proves the rail ACCOUNTS render path ran (PRD #623) and, paired with

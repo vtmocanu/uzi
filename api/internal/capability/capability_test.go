@@ -117,6 +117,43 @@ func TestSelfReportable_DedupesStableOrderAndEmpty(t *testing.T) {
 	}
 }
 
+// TestFilterProtocol_DropsUnknownsKeepsVocabulary proves the PROTOCOL gate keeps ONLY
+// the protocol vocabulary (today completion_interlock_v1) and DROPS scheduler-vocabulary
+// names (docker/jvm) and arbitrary strings — the two vocabularies are separate on purpose
+// (PRD #1226 M1 D2), so a scheduler capability must never survive the protocol filter.
+func TestFilterProtocol_DropsUnknownsKeepsVocabulary(t *testing.T) {
+	got := FilterProtocol([]string{"docker", "completion_interlock_v1", "rm -rf", "jvm", "COMPLETION_INTERLOCK_V1"})
+	want := []string{"completion_interlock_v1"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("FilterProtocol dropped/kept wrong names: got %v, want %v", got, want)
+	}
+}
+
+func TestFilterProtocol_DedupesStableOrderAndEmpty(t *testing.T) {
+	if got := FilterProtocol([]string{"completion_interlock_v1", "completion_interlock_v1"}); !reflect.DeepEqual(got, []string{"completion_interlock_v1"}) {
+		t.Errorf("FilterProtocol(dupes) = %v, want [completion_interlock_v1]", got)
+	}
+	if got := FilterProtocol(nil); len(got) != 0 {
+		t.Errorf("FilterProtocol(nil) = %v, want empty", got)
+	}
+	if got := FilterProtocol([]string{"docker", "jvm", "gpu"}); len(got) != 0 {
+		t.Errorf("FilterProtocol(no protocol names) = %v, want empty", got)
+	}
+}
+
+// TestFilterProtocol_SeparateFromSchedulerVocabulary pins the invariant that the protocol
+// vocabulary and the scheduler vocabulary do not overlap: no Vocabulary() member survives
+// FilterProtocol, and CompletionInterlockV1 is not a Filter (scheduler) member. This is
+// what keeps a protocol string out of the web capability picker.
+func TestFilterProtocol_SeparateFromSchedulerVocabulary(t *testing.T) {
+	if got := FilterProtocol(Vocabulary()); len(got) != 0 {
+		t.Errorf("FilterProtocol(scheduler vocabulary) = %v, want empty (vocabularies must not overlap)", got)
+	}
+	if got := Filter([]string{CompletionInterlockV1}); len(got) != 0 {
+		t.Errorf("Filter(%q) = %v, want empty (a protocol cap must not be a scheduler cap)", CompletionInterlockV1, got)
+	}
+}
+
 // TestUnmet_SubsetPresent pins the empty result when every required capability is present
 // in the effective set — the run is approvable/claimable by that worker (PRD #84 M4 4c).
 func TestUnmet_SubsetPresent(t *testing.T) {

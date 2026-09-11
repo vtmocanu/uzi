@@ -296,6 +296,12 @@ tasks:
       # carrying a raw NUL or other control byte passes lint/typecheck/tests invisibly),
       # so it belongs in gate:repo.
       - task: check:no-binary-text
+      # mktemp `-t` portability guard: a `mktemp -t <name>` template with too few X's
+      # (GNU needs >=3 consecutive X's) dies on GNU coreutils ("too few X's in
+      # template") but passes on BSD/macOS, so it fails only on the Linux worker/CI.
+      # Sub-second, offline, index-only -- runs before `scan:secrets` too. A tree fact,
+      # so it belongs in gate:repo.
+      - task: check:mktemp-portability
       - task: scan:secrets
       # Whole-tree Go+TS SAST scan (semgrep), BYO fail-open like lint:yaml. Ordered
       # LAST because a whole-tree scan dominates, same as scan:secrets above (PRD #862 M2).
@@ -861,6 +867,21 @@ tasks:
       # (instrument broken). The explicit canary arg makes this echo show what is scanned.
       # See the script header.
       - ./scripts/check-binary-text.sh scripts/binary-text-canary.go
+
+  check:mktemp-portability:
+    desc: no tracked *.sh carries a `mktemp -t <name>` template with too few X's (dies on GNU coreutils), with a canary proving the detector fired
+    cmds:
+      # A `mktemp -t <name>` template with too few X's (GNU needs >=3 consecutive X's)
+      # passes on a contributor's mac (BSD accepts it) and dies on the Linux worker/CI
+      # ("too few X's in template"), so only CI could show it -- commit f0e3c438 fixed
+      # the same class in scripts/{scan-secrets,deps-check-gate,govulncheck-gate,npm-
+      # audit-gate}.sh. The guard sweeps tracked *.sh with
+      # `git grep -P` (PCRE is required on this ugrep host for the negated class), and
+      # the explicit canary arg is scanned first as a positive control: if the detector
+      # does not fire on it the guard exits 2 (instrument broken) rather than passing
+      # silently. The explicit canary arg makes this echo show what is scanned. See the
+      # script header.
+      - ./scripts/check-mktemp-portability.sh scripts/mktemp-portability-canary.txt
 
   render:worker-tag-check:
     desc: assert the hosted-worker image tag is pinned independently of Chart.AppVersion (PRD 422 M1)

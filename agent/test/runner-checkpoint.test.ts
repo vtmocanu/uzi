@@ -1427,3 +1427,94 @@ describe("issue #1086: two-tip checkpoint reconciliation (F2)", () => {
     );
   });
 });
+
+describe("RunRunner — milestones_agents transport (PRD #1224 M1)", () => {
+  // A declared per-milestone agent attribution must actually reach the api on ALL THREE
+  // report paths. An optional field silently dropped from one projection in runner.ts is
+  // exactly the failure these guard: each asserts the mapping appears in the reportState
+  // body captured by the fake api (a real JSON round-trip over the fake HTTP transport).
+  const AGENTS = [
+    { id: "m2", agent: "coder", agent_label: "backend" },
+    { id: "m3", agent: "reviewer" },
+  ];
+
+  it("the immediate reportProgress push carries milestones_agents", async () => {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(95);
+    const exec: Executor = {
+      run: async (ctx) => {
+        await ctx.reportProgress!({
+          completed: [],
+          in_progress: ["m2", "m3"],
+          milestones_agents: AGENTS,
+        });
+        // Serialize behind the per-run chain so the push has landed on the api.
+        await ctx.reportIteration!(1, undefined);
+        return { branch: ctx.branch };
+      },
+      killAgentTree: () => {},
+    };
+    await runner(exec, gitlab).execute(claim);
+
+    const push = api.states
+      .filter((s) => s.runId === claim.run_id)
+      .map((s) => s.body)
+      .find((b) => b.status === "running" && !("iteration_count" in b) && Array.isArray(b.milestones_agents));
+    assert.ok(push, "an immediate running report carried milestones_agents");
+    assert.deepStrictEqual(push!.milestones_agents, AGENTS);
+  });
+
+  it("the iteration running report carries milestones_agents", async () => {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(96);
+    const exec: Executor = {
+      run: async (ctx) => {
+        await ctx.reportIteration!(1, {
+          completed: [],
+          in_progress: ["m2", "m3"],
+          milestones_agents: AGENTS,
+        });
+        return { branch: ctx.branch };
+      },
+      killAgentTree: () => {},
+    };
+    await runner(exec, gitlab).execute(claim);
+
+    const iter = api.states
+      .filter((s) => s.runId === claim.run_id)
+      .map((s) => s.body)
+      .find((b) => b.status === "running" && b.iteration_count === 1);
+    assert.ok(iter, "the turn-boundary running report was sent");
+    assert.deepStrictEqual(iter!.milestones_agents, AGENTS);
+  });
+
+  it("the checkpoint report carries milestones_agents", async () => {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(97);
+    const exec: Executor = {
+      run: async (ctx) => {
+        commitInClone(ctx.worktreePath, "NEW.txt");
+        await ctx.checkpoint!({
+          reap: true,
+          progress: {
+            completed: ["m1"],
+            in_progress: ["m2", "m3"],
+            milestones_agents: AGENTS,
+          },
+        });
+        return { branch: ctx.branch };
+      },
+      killAgentTree: () => {},
+    };
+    await runner(exec, gitlab).execute(claim);
+
+    const report = api.states
+      .filter((s) => s.runId === claim.run_id)
+      .map((s) => s.body)
+      .find((b) => b.status === "running" && Array.isArray(b.milestones_agents));
+    assert.ok(report, "a checkpoint running report carried milestones_agents");
+    assert.deepStrictEqual(report!.milestones_agents, AGENTS);
+    assert.deepStrictEqual(report!.milestones_completed, ["m1"]);
+    assert.deepStrictEqual(report!.milestones_in_progress, ["m2", "m3"]);
+  });
+});

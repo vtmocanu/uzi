@@ -630,6 +630,134 @@ describe("scanSignals report_progress (PRD #122 M2)", () => {
   });
 });
 
+describe("scanSignals report_progress milestones_agents (PRD #1224 M1)", () => {
+  const PROGRESS = "mcp__uzi__report_progress";
+
+  it("extracts a valid milestones_agents mapping onto out.progress", () => {
+    const r = scanSignals(
+      toolUse(PROGRESS, {
+        in_progress: ["m2", "m3"],
+        milestones_agents: [
+          { id: "m2", agent: "coder", agent_label: "backend" },
+          { id: "m3", agent: "reviewer" },
+        ],
+      }),
+    );
+    assert.deepStrictEqual(r.progress, {
+      completed: [],
+      in_progress: ["m2", "m3"],
+      milestones_agents: [
+        { id: "m2", agent: "coder", agent_label: "backend" },
+        { id: "m3", agent: "reviewer" },
+      ],
+    });
+  });
+
+  it("drops entries missing id or agent and handles a non-array, but does NOT dedup duplicate ids — never throwing", () => {
+    // Entry missing `id`, entry missing `agent`, blank `agent`, and a non-object are all
+    // dropped; a duplicate id is NO LONGER dropped here — the parser forwards both so the
+    // server's first-VALID-wins (milestoneAgentsParam) can resolve them. `agent` is trimmed
+    // only (not the clamp path). The trailing junk never throws.
+    const r = scanSignals(
+      toolUse(PROGRESS, {
+        in_progress: ["m1"],
+        milestones_agents: [
+          { agent: "coder" }, // no id -> dropped
+          { id: "m1" }, // no agent -> dropped
+          { id: "m4", agent: "  " }, // blank agent -> dropped
+          "nope", // non-object -> dropped
+          { id: " m1 ", agent: " coder " }, // trims to m1/coder -> kept
+          { id: "m1", agent: "reviewer" }, // duplicate id -> ALSO kept (server resolves first-valid-wins)
+        ],
+      }),
+    );
+    assert.deepStrictEqual(r.progress!.milestones_agents, [
+      { id: "m1", agent: "coder" },
+      { id: "m1", agent: "reviewer" },
+    ]);
+    // A non-array milestones_agents yields no attribution but still a real progress signal.
+    const nonArray = scanSignals(
+      toolUse(PROGRESS, { in_progress: ["m1"], milestones_agents: "nope" }),
+    );
+    assert.deepStrictEqual(nonArray.progress, { completed: [], in_progress: ["m1"] });
+    assert.ok(!("milestones_agents" in nonArray.progress!));
+  });
+
+  it("an invalid-first duplicate does NOT drop a later valid entry for the same id — the parser forwards both so the server keeps the valid one (CR !1244)", () => {
+    // The client cannot validate the agent name (that stays the server's authoritative,
+    // byte-exact check), so it must not reserve an id for an invalid-but-nonempty agent.
+    // Both entries are forwarded; the server's milestoneAgentsParam (first-VALID-wins) drops
+    // `BAD!` and keeps `coder`. Re-adding a client-side dedup here reddens this: it would
+    // reserve m1 for `BAD!` and lose `coder` before the server ever saw it.
+    const r = scanSignals(
+      toolUse(PROGRESS, {
+        in_progress: ["m1"],
+        milestones_agents: [
+          { id: "m1", agent: "BAD!" }, // invalid agent name, but non-empty -> forwarded
+          { id: "m1", agent: "coder" }, // same id, valid -> MUST survive to reach the server
+        ],
+      }),
+    );
+    assert.deepStrictEqual(r.progress!.milestones_agents, [
+      { id: "m1", agent: "BAD!" },
+      { id: "m1", agent: "coder" },
+    ]);
+  });
+
+  it("does not add the milestones_agents key when none is declared (empty/absent valid)", () => {
+    const r = scanSignals(toolUse(PROGRESS, { in_progress: ["m1"] }));
+    assert.deepStrictEqual(r.progress, { completed: [], in_progress: ["m1"] });
+    assert.ok(!("milestones_agents" in r.progress!), "no attribution key when the lead declared none");
+  });
+
+  it("attribution ALONE is NO SIGNAL — an all-empty report carrying only milestones_agents stays undefined (PRD #390 D3)", () => {
+    // The mapping must never manufacture a progress signal: with no real completed/in_progress
+    // id, out.progress stays undefined even though a well-formed milestones_agents was passed.
+    const r = scanSignals(
+      toolUse(PROGRESS, {
+        completed: [],
+        in_progress: [],
+        milestones_agents: [{ id: "m2", agent: "coder" }],
+      }),
+    );
+    assert.strictEqual(r.progress, undefined);
+  });
+
+  it("does NOT latch milestones_agents from a subagent frame — MUTATION: deleting the isSubagentFrame early-return at scanSignals top reddens this (a subagent attribution would leak)", () => {
+    // Pins the load-bearing isSubagentFrame firewall for the new field: a subagent frame
+    // carrying a milestones_agents declaration must set NO progress at all. If the
+    // `if (isSubagentFrame(msg)) return {};` guard at the top of scanSignals were removed,
+    // out.progress would be set and this assertion would fail.
+    const both = scanSignals(
+      subagentToolUse(PROGRESS, {
+        in_progress: ["m2"],
+        milestones_agents: [{ id: "m2", agent: "coder" }],
+      }),
+    );
+    assert.strictEqual(both.progress, undefined);
+    assert.strictEqual(
+      scanSignals(
+        subagentToolUse(
+          PROGRESS,
+          { in_progress: ["m2"], milestones_agents: [{ id: "m2", agent: "coder" }] },
+          { subagent_type: "coder" },
+        ),
+      ).progress,
+      undefined,
+    );
+    assert.strictEqual(
+      scanSignals(
+        subagentToolUse(
+          PROGRESS,
+          { in_progress: ["m2"], milestones_agents: [{ id: "m2", agent: "coder" }] },
+          { parent_tool_use_id: "toolu_x" },
+        ),
+      ).progress,
+      undefined,
+    );
+  });
+});
+
 describe("buildSignalMcpServer report_progress schema gate (PRD #122 M2)", () => {
   // Mirrors the milestones/prd_done_path schema-gate tests: the tool is registered only
   // for issue runs (Decision 13), so the model never sees it on a non-issue run.
@@ -654,6 +782,8 @@ describe("buildSignalMcpServer report_progress schema gate (PRD #122 M2)", () =>
     const shape = progress!.inputSchema?.shape;
     assert.ok(shape, "expected a zod object schema with a shape");
     assert.ok("completed" in shape! && "in_progress" in shape!, `expected completed + in_progress; got ${Object.keys(shape!).join(", ")}`);
+    // PRD #1224 M1: the optional per-milestone agent attribution field is on the schema.
+    assert.ok("milestones_agents" in shape!, `expected milestones_agents; got ${Object.keys(shape!).join(", ")}`);
   });
 });
 

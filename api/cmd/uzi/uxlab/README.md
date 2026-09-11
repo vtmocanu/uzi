@@ -73,6 +73,7 @@ Every scene is rendered from the SHIPPED model, `-dark` and `-light`.
 |---|---|
 | `board-populated` / `board-empty` / `board-admin` / `board-filter` | the run board: mixed statuses/health, empty state, factory-wide admin (OWNER), and the `/` filter |
 | `detail-running` | detail, live, crew rail focused, ⇣ following |
+| `detail-milestones-attributed` | two in-progress milestones each attributed to its subagent; the D3 unique-match lane also shows live age (PRD #1224) |
 | `detail-focus-transcript` | detail with the transcript pane focused |
 | `detail-paused` | transcript scrolled back: ⏸ N new · g ⇣ |
 | `detail-stalled` | a stalled run (▲ stalled cue in the header) |

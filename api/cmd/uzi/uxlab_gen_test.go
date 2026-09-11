@@ -78,29 +78,30 @@ func TestGenerateUXLabFrames(t *testing.T) {
 
 	// scenes maps a base name to a builder that returns the rendered frame for a theme.
 	scenes := map[string]func(dark bool) string{
-		"board-populated":          func(d bool) string { return boardPopulated(d, now) },
-		"board-empty":              boardEmpty,
-		"board-admin":              boardAdmin,
-		"board-filter":             func(d bool) string { return boardFilter(d, now) },
-		"board-planning":           func(d bool) string { return boardPlanning(d, now) },
-		"board-revising":           func(d bool) string { return boardRevising(d, now) },
-		"board-milestones":         func(d bool) string { return boardMilestones(d, now) },
-		"detail-running":           func(d bool) string { return detailRunning(d, now) },
-		"detail-planning":          func(d bool) string { return detailPlanning(d, now) },
-		"detail-focus-transcript":  func(d bool) string { return detailFocusTranscript(d, now) },
-		"detail-paused":            func(d bool) string { return detailPaused(d, now) },
-		"detail-stalled":           func(d bool) string { return detailStalled(d, now) },
-		"detail-awaiting-approval": func(d bool) string { return detailAwaitingApproval(d, now) },
-		"detail-awaiting-input":    func(d bool) string { return detailAwaitingInput(d, now) },
-		"detail-limit-wait":        func(d bool) string { return detailLimitWait(d, now) },
-		"detail-degraded":          func(d bool) string { return detailDegraded(d, now) },
-		"detail-steer-typing":      func(d bool) string { return detailSteerTyping(d, now) },
-		"detail-steer-confirm":     func(d bool) string { return detailSteerConfirm(d, now) },
-		"detail-steer-queue":       func(d bool) string { return detailSteerQueue(d, now) },
-		"review-overlay":           func(d bool) string { return reviewOverlay(d, now) },
-		"review-pending":           func(d bool) string { return reviewPending(d, now) },
-		"help":                     helpFrame,
-		"quit":                     quitFrame,
+		"board-populated":              func(d bool) string { return boardPopulated(d, now) },
+		"board-empty":                  boardEmpty,
+		"board-admin":                  boardAdmin,
+		"board-filter":                 func(d bool) string { return boardFilter(d, now) },
+		"board-planning":               func(d bool) string { return boardPlanning(d, now) },
+		"board-revising":               func(d bool) string { return boardRevising(d, now) },
+		"board-milestones":             func(d bool) string { return boardMilestones(d, now) },
+		"detail-running":               func(d bool) string { return detailRunning(d, now) },
+		"detail-milestones-attributed": func(d bool) string { return detailMilestonesAttributed(d, now) },
+		"detail-planning":              func(d bool) string { return detailPlanning(d, now) },
+		"detail-focus-transcript":      func(d bool) string { return detailFocusTranscript(d, now) },
+		"detail-paused":                func(d bool) string { return detailPaused(d, now) },
+		"detail-stalled":               func(d bool) string { return detailStalled(d, now) },
+		"detail-awaiting-approval":     func(d bool) string { return detailAwaitingApproval(d, now) },
+		"detail-awaiting-input":        func(d bool) string { return detailAwaitingInput(d, now) },
+		"detail-limit-wait":            func(d bool) string { return detailLimitWait(d, now) },
+		"detail-degraded":              func(d bool) string { return detailDegraded(d, now) },
+		"detail-steer-typing":          func(d bool) string { return detailSteerTyping(d, now) },
+		"detail-steer-confirm":         func(d bool) string { return detailSteerConfirm(d, now) },
+		"detail-steer-queue":           func(d bool) string { return detailSteerQueue(d, now) },
+		"review-overlay":               func(d bool) string { return reviewOverlay(d, now) },
+		"review-pending":               func(d bool) string { return reviewPending(d, now) },
+		"help":                         helpFrame,
+		"quit":                         quitFrame,
 	}
 
 	names := make([]string, 0, len(scenes))
@@ -394,6 +395,33 @@ func detailRunning(dark bool, now time.Time) string {
 	run.AnthropicSecretID, run.AnthropicSecretLabel = sp("sec-meta"), sp("meta")
 	// PRD #650: usage so the header's cost tag and the crew-rail SPEND block render, coherent with
 	// the board's runs[0] for this same run id (identical cost value).
+	run.Usage = &apitypes.UsageDTO{CostUSD: 9.55, InputTokens: 2_400_000, CacheReadTokens: 14_200_000, CacheCreationTokens: 120_000, OutputTokens: 88_400}
+	m := detailBase(dark, run, now, true)
+	m = withLiveStream(m)
+	return m.View().Content
+}
+
+// detailMilestonesAttributed renders the crew rail with PRD #1224 per-milestone agent attribution:
+// m3 and m4 are both in progress and BOTH declare the subagent working them, so each in-progress
+// milestone carries its own DECLARED role + label now-line (railMilestoneAgentLines) rather than
+// the single first-in-progress line. The live activity is the tester's regression-sweep frame
+// (laneMsgs' latest tool_use), so m3 (tester) is the D3 unique-matching lane and additionally shows
+// the live age; m4 (coder) shows its declared role + label only. Coherent with detailRunning's run
+// (same id, milestone list and completed/in-progress sets) so the two scenes read as one run.
+func detailMilestonesAttributed(dark bool, now time.Time) string {
+	run := apitypes.RunDTO{ID: detailRunID, Kind: "issue", Status: "running", Health: "ok",
+		IssueTitle:           "Add rate-limit headroom to the scheduler poll",
+		IssueIID:             ip(452),
+		IssueWebURL:          sp("https://github.com/vtmocanu/uzi/issues/452"),
+		StartedAt:            tp(now.Add(-4 * time.Minute)),
+		Milestones:           milestoneList,
+		MilestonesCompleted:  []string{"m1", "m2"},
+		MilestonesInProgress: []string{"m3", "m4"},
+		MilestonesAgents: []apitypes.MilestoneAgent{
+			{ID: "m3", Agent: "tester", AgentLabel: "regression sweep"},
+			{ID: "m4", Agent: "coder", AgentLabel: "scheduler docs"},
+		}}
+	run.AnthropicSecretID, run.AnthropicSecretLabel = sp("sec-meta"), sp("meta")
 	run.Usage = &apitypes.UsageDTO{CostUSD: 9.55, InputTokens: 2_400_000, CacheReadTokens: 14_200_000, CacheCreationTokens: 120_000, OutputTokens: 88_400}
 	m := detailBase(dark, run, now, true)
 	m = withLiveStream(m)

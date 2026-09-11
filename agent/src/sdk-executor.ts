@@ -159,6 +159,14 @@ const STALL_LIMIT = 3;
 // is already on the run feed as its per-turn text messages, which this references.
 const REASON_NO_PROGRESS =
   "the lead declined the task and made no progress: it repeated the same response with no new commits, no working-tree changes, and no subagent activity across consecutive iterations. Stopped early rather than exhausting the iteration budget; see the lead's response on the run feed.";
+// PRD #1226 M3 (D3): the completion-interlock no-progress reason. The lead declared the run
+// complete but the frozen completion contract still has unmet milestones, and repeated attempts
+// made no progress (the same unmet set, head and worktree fingerprint across STALL_LIMIT
+// attempts). Static and content-free (safe to persist as failure_reason on the LEGACY throw
+// fallback when the hold seam is unwired); when the seam IS wired this reason is passed to
+// enterCompletionHold instead, which parks the run without failing it.
+const REASON_COMPLETION_NO_PROGRESS =
+  "completion blocked: the lead declared the run complete but the frozen completion contract still has unmet milestones, and repeated completion attempts made no progress (the same unmet set, branch head and worktree across attempts). Held for an owner decision rather than shipping an incomplete run.";
 
 // issue #1197 (D-RC2b): bounded, budget-safe in-process retries on a POSITIVELY-EMPTY
 // SDK turn (0 turns, no model activity, no plan/questions/done). ONLY a positively-empty
@@ -1784,6 +1792,18 @@ export class SdkExecutor implements Executor {
         lastStallFingerprint = undefined;
         lastStallText = undefined;
       };
+      // PRD #1226 M3 (D3): completion-interlock attempt-loop state, DISTINCT from the #281 prose
+      // stall state above but sharing STALL_LIMIT. completionAttempted latches true once the
+      // first structural attempt has run — it gates the post-attempt failure routing (before it,
+      // wall/idle/max-iter/no-progress fail exactly as today). The completion fingerprint is
+      // (sorted unmet ids, head, worktree fingerprint); an identical fingerprint across
+      // consecutive attempts advances completionStallStreak, and STALL_LIMIT identical attempts
+      // route to the hold. completionHeld latches the reason when the run entered the hold, so it
+      // survives the `break` into the ExecutorResult (like pausedAt/scopeCapped).
+      let completionAttempted = false;
+      let completionStallStreak = 0;
+      let lastCompletionFingerprint: string | undefined;
+      let completionHeld: { reason: string } | undefined;
       // Hoisted: `turn` is declared INSIDE the loop, so the return below cannot see
       // it and the terminating turn's declaration would be discarded by `break`.
       let declaredPrdPath: string | undefined;
@@ -2036,6 +2056,20 @@ export class SdkExecutor implements Executor {
             state.tripReason = undefined;
             continue;
           }
+          // PRD #1226 M3 (D3): a POST-attempt WALL/IDLE trip routes to the completion hold (M4)
+          // instead of terminal-failing the run — its Git work is already captured by the
+          // checkpoint-first attempt above, and a live worker mid-completion must not be failed.
+          // PRE-attempt (or with the seam unwired) it rethrows exactly as before, so the wall/idle
+          // trip stays a legacy terminal failure. Only WALL/IDLE are routed here; a cancel
+          // (REASON_CANCELLED) or any other error rethrows unchanged.
+          if (
+            err instanceof Error &&
+            (err.message === REASON_WALL || err.message === REASON_IDLE) &&
+            (await this.routeCompletionHold(ctx, err.message, completionAttempted))
+          ) {
+            completionHeld = { reason: err.message };
+            break;
+          }
           throw err;
         }
         resumeId = turn.sessionId ?? resumeId;
@@ -2072,10 +2106,33 @@ export class SdkExecutor implements Executor {
           // (PRD #390 M1's no-signal invariant, enforced here on the executor side).
           progressMissedLastTurn = false;
           consecutiveMisses = 0;
-          latestProgress =
-            latestProgress && latestProgress.completed.length > 0
-              ? { completed: latestProgress.completed, in_progress: [] }
-              : undefined;
+          // PRD #1224 M1 (rework CR !1244): a cooperative checkpoint is a milestone
+          // boundary, but this PRD's premise is CONCURRENT in-progress milestones — the lead
+          // can finish one milestone while a sibling is still being worked. Blanking
+          // in_progress and milestones_agents wholesale would drop the still-active sibling
+          // (and its attribution) into the next running report, and the server would overwrite
+          // its active state with [] (milestones.go validateProgressIDs/milestoneAgentsParam).
+          // So remove ONLY the just-completed ids (those now in `completed`) from in_progress
+          // AND its attribution, preserving any still-active concurrent milestone. The
+          // just-finished milestone's own stale in_progress entry (if the lead left it in BOTH
+          // sets) is dropped by the same completed-set filter, so #390 M3's enforcement re-arm
+          // (the `!in_progress.length` nag below) still fires exactly as today on a
+          // single-milestone checkpoint. Keep the "nothing real reported -> undefined" fallback
+          // (PRD #390 M1's no-signal invariant) so the next running report never persists an
+          // empty [] over live state.
+          if (latestProgress && latestProgress.completed.length > 0) {
+            const done = new Set(latestProgress.completed);
+            const stillActive = latestProgress.in_progress.filter((id) => !done.has(id));
+            latestProgress = {
+              completed: latestProgress.completed,
+              in_progress: stillActive,
+              milestones_agents: (latestProgress.milestones_agents ?? []).filter((a) =>
+                stillActive.includes(a.id),
+              ),
+            };
+          } else {
+            latestProgress = undefined;
+          }
           resetStallState(); // a cooperative checkpoint is progress → breaks any refusal streak
           continue;
         }
@@ -2167,9 +2224,122 @@ export class SdkExecutor implements Executor {
             // signal (unlike `cancelled` above) — a graceful stop is a clean completion, not an
             // abort. Named explicitly so the three ended-reasons are exhaustively handled.
           }
+          // PRD #1226 M3 (D3): the structural completion interlock. On an INTERLOCKED,
+          // non-interactive issue run, a clean signal_done is NOT a finalize — it is a
+          // completion ATTEMPT. The interactive park above already returned/continued for an
+          // interactive run, and this guard is skipped for a legacy run (falls through to the
+          // normal break below), so this block only runs for a non-interactive interlocked
+          // issue run with the attempt seam wired.
+          if (
+            ctx.completionInterlock &&
+            isIssueRun &&
+            !ctx.interactive &&
+            ctx.recordCompletionAttempt
+          ) {
+            // 1. Checkpoint-FIRST: capture the turn's committed work (reap + fetch-back)
+            //    BEFORE any denial/feedback, so a rework prompt or a hold never loses it.
+            //    reap:true is the same reap-before-git ordering the done/interactive-park paths
+            //    use; the session transcript survives on disk so the SAME session resumes.
+            await ctx.checkpoint?.({ reap: true, progress: latestProgress });
+            // 2. Read the branch tip + worktree fingerprint. The runner's worktreeFingerprint is
+            //    `${tip}\n${porcelain}`, so the FIRST line is the branch head (null when the
+            //    fingerprint is unresolvable — then head is null too, which the server accepts).
+            const worktreeFingerprint = ctx.worktreeFingerprint
+              ? await ctx.worktreeFingerprint()
+              : null;
+            const head =
+              worktreeFingerprint !== null
+                ? (worktreeFingerprint.split("\n", 1)[0] ?? null)
+                : null;
+            // 3. Record the attempt SERVER-side: it unions THIS signal_done's declaration into
+            //    milestones_completed, recomputes unmet over the merged set (server authoritative)
+            //    and records a bounded attempt. Pass only this turn's declaration — the server
+            //    unions it with prior report_progress.
+            const { unmet } = await ctx.recordCompletionAttempt({
+              declared: turn.milestonesCompleted ?? [],
+              head,
+              worktreeFingerprint,
+            });
+            // Latch AFTER the attempt returns — the post-attempt failure routing (step 6) only
+            // arms once at least one attempt has actually completed. A thrown attempt call leaves
+            // this false, so the run fails legacy-style (no hold), which is correct.
+            completionAttempted = true;
+            // 4. Every frozen milestone is declared complete → break to the normal finalize path
+            //    (phasePublish); M4 adds the permit + PR-head verification there.
+            if (unmet.length === 0) break;
+            // 5. Unmet non-empty. The completion fingerprint (sorted unmet ids, head, worktree)
+            //    is DISTINCT from the #281 prose fingerprint but shares STALL_LIMIT. An identical
+            //    fingerprint across consecutive attempts advances the streak; any change resets it
+            //    to 1 (this attempt).
+            const completionFingerprint = JSON.stringify([
+              [...unmet].sort(),
+              head,
+              worktreeFingerprint,
+            ]);
+            completionStallStreak =
+              lastCompletionFingerprint !== undefined &&
+              completionFingerprint === lastCompletionFingerprint
+                ? completionStallStreak + 1
+                : 1;
+            lastCompletionFingerprint = completionFingerprint;
+            if (completionStallStreak >= STALL_LIMIT) {
+              // No progress across STALL_LIMIT identical attempts → the recoverable completion
+              // hold (M4), or the legacy throw when the seam is unwired (M3 production).
+              ctx.emit({
+                kind: "status",
+                agent: "worker",
+                payload: {
+                  text: `completion blocked: ${unmet.length} frozen milestone(s) still not complete after ${completionStallStreak} attempts with no progress`,
+                },
+              });
+              if (
+                await this.routeCompletionHold(
+                  ctx,
+                  REASON_COMPLETION_NO_PROGRESS,
+                  completionAttempted,
+                )
+              ) {
+                completionHeld = { reason: REASON_COMPLETION_NO_PROGRESS };
+                break;
+              }
+              throw new Error(REASON_COMPLETION_NO_PROGRESS);
+            }
+            // Progress is still possible: inject the unmet ids as an AUTONOMOUS same-session
+            // follow-up (like the mid-loop pullFollowUp injection, NOT the interactive owner
+            // park) and continue, resuming the SAME SDK session. The iteration/wall budgets are
+            // NOT reset — the loop is bounded by those budgets plus the completion STALL_LIMIT
+            // (exhausting iterations routes to the hold below via completionAttempted). No
+            // phasePublish and no forge call occur here.
+            ctx.emit({
+              kind: "status",
+              agent: "worker",
+              payload: {
+                text: `completion check: ${unmet.length} frozen milestone(s) not yet complete (${unmet.join(", ")}) — returning to the lead`,
+              },
+            });
+            followUp = this.buildCompletionReworkFollowUp(unmet, frozenMilestones);
+            resetStallState(); // a completion rework is new input → breaks any #281 refusal streak
+            turn.done = false;
+            continue;
+          }
           break;
         }
-        if (iteration >= maxIterations) throw new Error(REASON_MAX_ITERATIONS);
+        if (iteration >= maxIterations) {
+          // PRD #1226 M3 (D3): a POST-attempt iteration exhaustion routes to the completion hold
+          // (M4) rather than failing; PRE-attempt (or with the seam unwired) it throws the legacy
+          // REASON_MAX_ITERATIONS exactly as before.
+          if (
+            await this.routeCompletionHold(
+              ctx,
+              REASON_MAX_ITERATIONS,
+              completionAttempted,
+            )
+          ) {
+            completionHeld = { reason: REASON_MAX_ITERATIONS };
+            break;
+          }
+          throw new Error(REASON_MAX_ITERATIONS);
+        }
 
         // PRD #122 M6 (Decision 10b): iteration-boundary fallback checkpoint. Only reached
         // when the model did NOT cooperatively checkpoint this iteration (that path
@@ -2277,6 +2447,20 @@ export class SdkExecutor implements Executor {
                 text: "no progress: the lead repeated the same response with an unchanged tree and no subagent activity — stopping early",
               },
             });
+            // PRD #1226 M3 (D3): a POST-attempt #281 no-progress stall routes to the completion
+            // hold (M4) rather than terminal-failing; PRE-attempt (or seam unwired) it throws the
+            // legacy REASON_NO_PROGRESS. The #281 detector itself is unchanged for the
+            // NON-completion phase (before any completion attempt), which is the common case.
+            if (
+              await this.routeCompletionHold(
+                ctx,
+                REASON_NO_PROGRESS,
+                completionAttempted,
+              )
+            ) {
+              completionHeld = { reason: REASON_NO_PROGRESS };
+              break;
+            }
             throw new Error(REASON_NO_PROGRESS);
           }
         }
@@ -2378,6 +2562,12 @@ export class SdkExecutor implements Executor {
       // finalization (the run already reported `paused`). OMITTED (not undefined) on every normal
       // completion so the result shape is unchanged and existing deepStrictEqual assertions hold.
       if (pausedAt) result.pausedAt = pausedAt;
+      // PRD #1226 M3 (D3/D6): forward the completion-hold disposition. Set only when the run
+      // entered the hold (a repeated no-progress completion attempt, or a post-attempt
+      // budget/stall/wall/idle exhaustion routed to ctx.enterCompletionHold). phasePublish reads
+      // it to SKIP finalization exactly like pausedAt. OMITTED (not undefined) on every normal
+      // completion so the result shape is unchanged and existing deepStrictEqual assertions hold.
+      if (completionHeld) result.completionHeld = completionHeld;
       return result;
   }
 
@@ -2956,6 +3146,57 @@ export class SdkExecutor implements Executor {
       },
     });
     return (await ctx.parkForPause?.(at)) ?? false;
+  }
+
+  /**
+   * PRD #1226 M3 (D3): route a post-attempt terminal reason to the COMPLETION HOLD when the run
+   * has recorded at least one completion attempt AND the hold seam is wired, else fall back to the
+   * legacy throw. Returns true when it entered the hold (the caller latches completionHeld and
+   * breaks); false when it did not (the caller throws Error(reason) exactly as before). In M3 the
+   * runner leaves ctx.enterCompletionHold UNWIRED, so this always returns false in production and
+   * the legacy terminal behavior is unchanged; M4 wires it so a post-attempt exhaustion parks
+   * without failing. `attempted` is the loop's completionAttempted latch.
+   */
+  private async routeCompletionHold(
+    ctx: RunContext,
+    reason: string,
+    attempted: boolean,
+  ): Promise<boolean> {
+    if (attempted && ctx.enterCompletionHold) {
+      await ctx.enterCompletionHold(reason);
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * PRD #1226 M3 (D3): the same-session rework follow-up injected when a structural completion
+   * attempt still has unmet milestones. It names the exact frozen milestones not yet declared
+   * complete (id + title when the frozen list is known) and tells the lead to finish them or record
+   * a decision — folded into the next turn as ordinary UNTRUSTED user input (like the mid-loop
+   * pullFollowUp injection), so the SAME SDK session resumes with full context. Content is only
+   * frozen ids/titles, never secrets or model output.
+   */
+  private buildCompletionReworkFollowUp(
+    unmet: string[],
+    frozen?: Milestone[] | null,
+  ): string {
+    const titleFor = (id: string): string | undefined =>
+      frozen?.find((m) => m.id === id)?.title;
+    const lines = unmet.map((id) => {
+      const t = titleFor(id);
+      return t ? `- ${id}: ${t}` : `- ${id}`;
+    });
+    return [
+      "Completion check (structural interlock): you signalled done, but the frozen completion",
+      "contract still has milestone(s) NOT declared complete:",
+      "",
+      ...lines,
+      "",
+      "Finish the remaining milestone(s) and declare each complete (report_progress / signal_done),",
+      "or record an explicit decision if one genuinely cannot be completed. Do not signal done again",
+      "until every frozen milestone above is complete — an incomplete run cannot open its closing PR.",
+    ].join("\n");
   }
 
   /** The error a tripped turn throws (PRD #1190 M2). A `now` pause trip (REASON_PAUSE_NOW)

@@ -33,6 +33,13 @@
   "milestones_in_progress": [
     "x"
   ],
+  "milestones_agents": [
+    {
+      "id": "x",
+      "agent": "x",
+      "agent_label": "x"
+    }
+  ],
   "budget_max_iterations": 1,
   "budget_wall_seconds": 1,
   "scope_ceiling": 1,

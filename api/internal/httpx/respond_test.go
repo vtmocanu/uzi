@@ -262,6 +262,24 @@ func TestJSONWritesStatusBodyAndContentType(t *testing.T) {
 	}
 }
 
+type failingResponseWriter struct {
+	header   http.Header
+	writeErr error
+}
+
+func (w *failingResponseWriter) Header() http.Header         { return w.header }
+func (*failingResponseWriter) WriteHeader(_ int)             {}
+func (w *failingResponseWriter) Write(_ []byte) (int, error) { return 0, w.writeErr }
+
+func TestWriteJSONReturnsResponseWriteError(t *testing.T) {
+	writeErr := errors.New("response write failed")
+	w := &failingResponseWriter{header: make(http.Header), writeErr: writeErr}
+
+	if err := WriteJSON(w, http.StatusOK, payload{S: "ok"}); !errors.Is(err, writeErr) {
+		t.Fatalf("WriteJSON error = %v, want %v", err, writeErr)
+	}
+}
+
 func TestJSONNilWritesStatusWithNoBody(t *testing.T) {
 	rec := httptest.NewRecorder()
 	JSON(rec, http.StatusNoContent, nil)

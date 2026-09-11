@@ -44,6 +44,10 @@ COPY CHANGELOG.md /app/CHANGELOG.md
 # only if this sibling layout is preserved here. `tsc --noEmit` (in `npm run build`)
 # typechecks the test files, so a missing fixtures dir fails the build with TS2307.
 COPY fixtures/api-contract/ /app/fixtures/api-contract/
+# Same reason for the per-milestone attribution fixture: milestoneAttribution.fixture.test.ts
+# statically imports `../../../fixtures/milestone-attribution/cases.json` as a typed JSON module,
+# so `tsc --noEmit` needs this sibling dir present too (else TS2307). Mirrors api-contract above.
+COPY fixtures/milestone-attribution/ /app/fixtures/milestone-attribution/
 RUN npm run build
 
 # --- runtime stage ---

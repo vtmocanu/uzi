@@ -320,6 +320,15 @@ export interface RegisterRequest {
    *  query. Sent only when non-empty (same "only send when known" shape as `template`);
    *  compat rule: the api MUST tolerate it in the same release the worker sends it. */
   capabilities?: string[];
+  /** The PROTOCOL capabilities this worker self-reports as implemented (PRD #1226 M1,
+   *  D2): today `["completion_interlock_v1"]`, meaning this image implements the
+   *  structural completion protocol. Kept DELIBERATELY SEPARATE from `capabilities` (the
+   *  scheduler vocabulary) — the server stores it in workers.protocol_capabilities and the
+   *  hard ClaimRun clause reads it there, OUTSIDE required_capabilities and the
+   *  capability_aware kill-switch, so an old image that omits it can never claim an
+   *  interlocked run. Sent only when non-empty (same "only send when known" shape as
+   *  `capabilities`); the api Filter-s it against a server-owned protocol vocabulary. */
+  protocol_capabilities?: string[];
 }
 
 export interface RegisterResponse {
@@ -632,6 +641,13 @@ export interface ClaimConfig {
    *  (tool_packages) is already denylist-checked server-side and is NEVER filtered
    *  locally. Absent on an older server ⇒ undefined ⇒ no filtering (today's behavior). */
   denied_tool_packages?: string[];
+  /** PRD #1226 M3 (D1/D2): the completion-interlock discriminator. Non-nil (value 1 today)
+   *  ⇒ this run is INTERLOCKED and the worker must run the structural completion protocol
+   *  (checkpoint-first same-lead attempt loop, permit before PR). Read straight off
+   *  runs.completion_contract_version, stamped by the rollout switch at CreateRun (M1). This is
+   *  WORKER-ONLY claim config — deliberately NOT on the web RunDTO. Absent (a legacy run, or
+   *  rollout OFF) ⇒ the worker runs the legacy path, byte-identical to today. */
+  completion_contract_version?: number;
 }
 
 /**
@@ -669,6 +685,28 @@ export interface Proposal {
 export interface MilestoneProgress {
   completed: string[];
   in_progress: string[];
+  /**
+   * PRD #1224 M1: the lead's OPTIONAL per-in-progress-milestone agent attribution.
+   * Present only when the lead declared it on `report_progress`; absent otherwise, so a
+   * run that declares nothing behaves exactly as today. Rides `running` reports only,
+   * alongside `milestones_in_progress`. The api is the authority on validation.
+   */
+  milestones_agents?: MilestoneAgent[];
+}
+
+/**
+ * PRD #1224 M1: one lead-declared attribution linking an in-progress milestone to the
+ * agent working it. `agent` is the EXACT `subagent_type` identifier the lead passed to
+ * its Agent/Task dispatch — the only value that byte-matches the server's
+ * `current_activity.agent` (which is derived from `subagent_type`), so it is what the
+ * server joins on; it is stored byte-exact and must NOT be transformed beyond trimming.
+ * `agent_label` is optional short display text. Subagents never declare this (the
+ * `isSubagentFrame` firewall keeps holding); the api is the authority on validation.
+ */
+export interface MilestoneAgent {
+  id: string;
+  agent: string;
+  agent_label?: string;
 }
 
 /**
@@ -1205,6 +1243,27 @@ export interface CreateProposalRequest {
   labels: string[];
 }
 
+/** Request body for POST /api/worker/runs/:id/completion/attempt (PRD #1226 M3). The lead's
+ *  same-session structural completion attempt: the worker reports the signal_done declaration
+ *  (`milestones_completed`) plus the branch tip (`head`) and worktree fingerprint. The server
+ *  subset-validates the declaration against the frozen list, UNION-merges it into
+ *  runs.milestones_completed, recomputes the unmet structural criteria over the merged set, and
+ *  records a bounded attempt — all in one call. Everything is SERVER-authoritative; the worker
+ *  reworks against the returned unmet set, never its own belief. */
+export interface CompletionAttemptRequest {
+  milestones_completed: string[];
+  head: string | null;
+  worktree_fingerprint: string | null;
+}
+
+/** Response body for POST /api/worker/runs/:id/completion/attempt (PRD #1226 M3): the
+ *  server-authoritative unmet structural criteria (empty ⇒ every frozen milestone is declared
+ *  complete) and the run's new monotone attempt count. */
+export interface CompletionAttemptResponse {
+  unmet: string[];
+  attempt_count: number;
+}
+
 /** Request body for POST /api/worker/runs/:id/findings (PRD #333 M2). The server
  *  derives (user_id, repo_id) from the run claim — the worker NEVER sends them (D2/D3).
  *  `location` is a symbol-anchored, repo-root-relative coordinate with NO line number
@@ -1702,6 +1761,12 @@ export interface StateRequest {
    *  and an informational field never fails a run. */
   milestones_completed?: string[];
   milestones_in_progress?: string[];
+  /** PRD #1224 M1: the lead's OPTIONAL per-in-progress-milestone agent attribution.
+   *  Additive-optional: omitted entirely by a lead that declared nothing, so the wire
+   *  shape matches a pre-#1224 worker. Rides `running` reports only, ALONGSIDE
+   *  `milestones_in_progress` (each entry's `id` should also appear there). The api is the
+   *  authority on validation (per-entry drop, byte-exact `agent` join, label strip+cap). */
+  milestones_agents?: MilestoneAgent[];
   /** PRD #628 M4: the TREE signal that this run's clone reseeded from the DEFAULT branch
    *  on a cross-worker re-claim (`seededFrom === "default"` / `priorCommits === 0`) — no
    *  committed work was recovered, so pass-1's `milestones_completed` is stale and the

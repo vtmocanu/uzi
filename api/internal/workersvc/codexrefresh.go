@@ -304,6 +304,65 @@ func (s *Service) sealCodexLogin(userID uuid.UUID, plaintext []byte) (sealed []b
 	return sealed, store.SealedWithMaster, err
 }
 
+// Codex refresh timing observability (issue #1238). Secret-free structured slog fields that
+// let the pinned app-server external-auth budget be characterized: per-phase elapsed_ms
+// around the two serial provider calls and the durable commit, plus a service total. NEVER
+// logs a token, refresh token, ChatGPT account id, body, provider URL, or raw error text —
+// only elapsed integers, the non-secret operation_id, a fixed phase name, and a finite
+// result classification.
+const (
+	codexTimingMsgPhase   = "codex refresh phase"
+	codexTimingMsgService = "codex refresh service"
+
+	codexRefreshPhaseOAuthPost   = "oauth_post"
+	codexRefreshPhaseIdentityGet = "identity_get"
+	codexRefreshPhaseCommit      = "commit"
+)
+
+// CodexTimingResult classifies a call's terminal error into a finite, secret-free token for
+// the `result` slog field. The raw error text is never logged.
+func CodexTimingResult(err error) string {
+	switch {
+	case err == nil:
+		return "ok"
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "deadline"
+	default:
+		return "error"
+	}
+}
+
+// CodexTimingMS converts a duration to non-negative whole milliseconds for a *_ms field.
+func CodexTimingMS(d time.Duration) int64 {
+	if d < 0 {
+		return 0
+	}
+	return d.Milliseconds()
+}
+
+// logCodexRefreshPhase emits one secret-free per-phase timing record, correlated by the
+// non-secret operation_id. Called unconditionally after each phase so a cancellation/
+// deadline is captured even when no later phase runs.
+func logCodexRefreshPhase(operationID uuid.UUID, phase string, start time.Time, err error) {
+	slog.Info(codexTimingMsgPhase,
+		"operation_id", operationID.String(),
+		"phase", phase,
+		"elapsed_ms", CodexTimingMS(time.Since(start)),
+		"result", CodexTimingResult(err),
+	)
+}
+
+// logCodexRefreshService emits the service-total timing record for one coordinated refresh.
+func logCodexRefreshService(operationID uuid.UUID, start time.Time, err error) {
+	slog.Info(codexTimingMsgService,
+		"operation_id", operationID.String(),
+		"service_total_ms", CodexTimingMS(time.Since(start)),
+		"result", CodexTimingResult(err),
+	)
+}
+
 // CoordinatedCodexRefresh runs the B6 refresh state machine for the subscription account
 // backing the run's frozen binding (PRD #1147 M2). It authorizes ScopeStartRefresh,
 // resolves the account, and then advances / replays / reconciles per the rev-3 rule:
@@ -318,7 +377,9 @@ func (s *Service) sealCodexLogin(userID uuid.UUID, plaintext []byte) (sealed []b
 //
 // It NEVER returns an access token that was not durably committed, NEVER rotates two
 // operations in parallel, and NEVER blindly re-spends a refresh token after a crash.
-func (s *Service) CoordinatedCodexRefresh(ctx context.Context, wkr store.Worker, runID uuid.UUID, capability string, operationID uuid.UUID, observedGeneration int64) (CodexRefreshResult, error) {
+func (s *Service) CoordinatedCodexRefresh(ctx context.Context, wkr store.Worker, runID uuid.UUID, capability string, operationID uuid.UUID, observedGeneration int64) (res CodexRefreshResult, err error) {
+	serviceStart := time.Now()
+	defer func() { logCodexRefreshService(operationID, serviceStart, err) }()
 	operationBudget := codexRefreshOperationBudget(ctx)
 	if operationBudget <= codexRefreshCommitReserve {
 		return CodexRefreshResult{}, context.DeadlineExceeded
@@ -335,7 +396,7 @@ func (s *Service) CoordinatedCodexRefresh(ctx context.Context, wkr store.Worker,
 	if err != nil {
 		return CodexRefreshResult{}, err
 	}
-	res, err := s.coordinatedRefresh(operationCtx, authCtx.UserID, authCtx.AccountID, operationID, observedGeneration, leaseDeadline, providerDeadline)
+	res, err = s.coordinatedRefresh(operationCtx, authCtx.UserID, authCtx.AccountID, operationID, observedGeneration, leaseDeadline, providerDeadline)
 
 	// (7) Post-exchange release recheck (audit #3b), the recheck-before-release idiom
 	// ReleaseCodexCredential uses. CoordinatedCodexRefresh authorized ScopeStartRefresh
@@ -496,7 +557,9 @@ func (s *Service) advanceCodexRefresh(ctx context.Context, q codexRefreshStore, 
 	// token. The lease expires and routes to quarantine.
 	providerCtx, cancelProvider := context.WithDeadline(ctx, providerDeadline)
 	defer cancelProvider()
+	oauthStart := time.Now()
 	result, rerr := s.codexRefresh.Refresh(providerCtx, prev.RefreshToken)
+	logCodexRefreshPhase(operationID, codexRefreshPhaseOAuthPost, oauthStart, rerr)
 	if rerr != nil {
 		return CodexRefreshResult{Outcome: CodexRefreshContended}, fmt.Errorf("codex refresh: provider exchange: %w", rerr)
 	}
@@ -566,7 +629,9 @@ func (s *Service) advanceCodexRefresh(ctx context.Context, q codexRefreshStore, 
 	//     RETAINED, not discarded: protect it in the recovery slot at from_generation and leave
 	//     the intent 'rotating' so a later promotion re-verifies it. Return NO token, but do NOT
 	//     claim recovery is impossible (PRD #1147 M4, defect 5).
+	identityStart := time.Now()
 	id, derr := s.codexRefresh.DiscoverIdentity(providerCtx, result.AccessToken)
+	logCodexRefreshPhase(operationID, codexRefreshPhaseIdentityGet, identityStart, derr)
 	switch {
 	case derr == nil && id.ProviderUserID == acct.ProviderUserID && id.WorkspaceAccountID == acct.WorkspaceAccountID:
 		// MATCH → fall through to the commit below.
@@ -579,6 +644,7 @@ func (s *Service) advanceCodexRefresh(ctx context.Context, q codexRefreshStore, 
 	}
 
 	// (6c) Durable commit.
+	commitStart := time.Now()
 	row, cerr := q.CommitCodexRefresh(ctx, store.CommitCodexRefreshParams{
 		Sealed:         sealed,
 		SealedWith:     sealedWith,
@@ -587,6 +653,7 @@ func (s *Service) advanceCodexRefresh(ctx context.Context, q codexRefreshStore, 
 		UserID:         userID,
 		FromGeneration: acct.Generation,
 	})
+	logCodexRefreshPhase(operationID, codexRefreshPhaseCommit, commitStart, cerr)
 	if cerr != nil {
 		return s.handleCodexCommitFailure(ctx, q, userID, accountID, operationID, acct.Generation, sealed, sealedWith, cerr)
 	}

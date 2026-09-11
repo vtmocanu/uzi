@@ -1858,6 +1858,18 @@ export interface Milestone {
   title: string;
 }
 
+// MilestoneAgent is one entry of a run's per-in-progress-milestone agent attribution
+// (PRD #1224): the milestone id, the acting agent's validated kebab-case identifier
+// (byte-exact so it matches current_activity.agent for the live-enrichment join), and an
+// optional short display label. `agent_label` is model-authored UNTRUSTED display text a
+// consumer sanitizes before rendering, the same rule RunActivity.agent_label and Milestone
+// titles follow.
+export interface MilestoneAgent {
+  id: string;
+  agent: string;
+  agent_label: string;
+}
+
 /** The create-entrypoint family that started a run (server column `trigger_source`,
  *  a closed 13-value enum). Mirrors the Go CHECK constraint / RunDTO. */
 export type RunTriggerSource =
@@ -2081,6 +2093,12 @@ export interface Run {
   milestones?: Milestone[] | null;
   milestones_completed?: string[] | null;
   milestones_in_progress?: string[] | null;
+  /** PRD #1224: the validated per-in-progress-milestone agent attribution — the subset of the
+   *  lead's declaration whose ids survived membership + in-progress validation. Optional and
+   *  nullable for the same rollout-skew reason as the other milestone fields; null ⇒ no
+   *  effective attribution ⇒ render exactly as today. Each `agent_label` is UNTRUSTED display
+   *  text a consumer sanitizes. */
+  milestones_agents?: MilestoneAgent[] | null;
   milestones_candidate?: Milestone[] | null;
   budget_max_iterations?: number | null;
   budget_wall_seconds?: number | null;
