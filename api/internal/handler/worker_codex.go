@@ -217,12 +217,12 @@ func (h *Handler) WorkerCodexRefresh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var svcErr error
+	var routeErr error
 	wroteSuccess := false
-	defer func() { logCodexRouteTiming(opID, routeStart, codexRouteResult(svcErr, wroteSuccess)) }()
+	defer func() { logCodexRouteTiming(opID, routeStart, codexRouteResult(routeErr, wroteSuccess)) }()
 
 	res, err := h.wsvc.CoordinatedCodexRefresh(ctx, wkr, runID, req.Capability, opID, *req.ObservedGeneration)
-	svcErr = err
+	routeErr = err
 	if err != nil {
 		h.writeCodexError(w, "refresh", err)
 		return
@@ -231,7 +231,7 @@ func (h *Handler) WorkerCodexRefresh(w http.ResponseWriter, r *http.Request) {
 		h.writeCodexError(w, "refresh", errors.New("codex subscription refresh metadata missing"))
 		return
 	}
-	httpx.JSON(w, http.StatusOK, codexRefreshResponse{
+	routeErr = httpx.WriteJSON(w, http.StatusOK, codexRefreshResponse{
 		AuthMode:         "subscription",
 		AccessToken:      res.AccessToken,
 		Generation:       res.Generation,
@@ -239,7 +239,7 @@ func (h *Handler) WorkerCodexRefresh(w http.ResponseWriter, r *http.Request) {
 		ChatGPTPlanType:  nil,
 		Outcome:          codexRefreshOutcomeString(res.Outcome),
 	})
-	wroteSuccess = true
+	wroteSuccess = routeErr == nil
 }
 
 // writeCodexError maps a service error to its fixed HTTP status + coordinate-free body and
@@ -320,15 +320,14 @@ func codexHTTPError(err error) (int, string) {
 const codexTimingMsgRoute = "codex refresh route"
 
 // codexRouteResult classifies the route-total outcome from the two handler-known facts at
-// emit time. A returned service error dominates and is classified via CodexTimingResult;
-// otherwise the outcome is "ok" ONLY when the success response write was invoked, so a
-// success-metadata rejection (service err == nil but the handler answered 500) is "error",
-// as is any other post-parse terminal that did not reach the success write. Actual network
-// delivery / a ResponseWriter.Write failure is NOT reflected here — httpx.JSON returns no
-// error, so a partial/failed write after headers are sent is unobservable at this layer.
-func codexRouteResult(serviceErr error, wroteSuccess bool) string {
-	if serviceErr != nil {
-		return workersvc.CodexTimingResult(serviceErr)
+// emit time. A service error or an error reported by the response encoder dominates and is
+// classified via CodexTimingResult; otherwise the outcome is "ok" only when the encoder
+// completed. This observes ResponseWriter.Write errors, not network delivery: net/http may
+// buffer a normal-sized response until after the handler returns, so a client disconnect can
+// still emit "ok".
+func codexRouteResult(routeErr error, wroteSuccess bool) string {
+	if routeErr != nil {
+		return workersvc.CodexTimingResult(routeErr)
 	}
 	if wroteSuccess {
 		return "ok"
