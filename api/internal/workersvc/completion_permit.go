@@ -75,9 +75,10 @@ type CompletionPermitRequest struct {
 
 // CompletionAttemptRequest is the same-lead nudge (M3) request (PRD #1226 M2, D4): the worker
 // reports the current head and worktree fingerprint; the SERVER recomputes the unmet set and
-// records a bounded attempt.
+// records a bounded attempt. There is deliberately no contract_revision here — the attempt path
+// is server-authoritative and fences on run.ContractRevision, never on a worker-supplied revision
+// (only the permit endpoint checks a requested revision, for revision_drift).
 type CompletionAttemptRequest struct {
-	ContractRevision    int
 	Head                string
 	WorktreeFingerprint string
 }
@@ -298,11 +299,12 @@ func (s *Service) completeRunWithPermit(ctx context.Context, wkr store.Worker, o
 	if req.Head != nil {
 		head = strings.TrimSpace(*req.Head)
 	}
-	// No head or an unfrozen revision cannot match a permit → non-terminal (fail-closed).
+	// No head or an unfrozen revision cannot match a permit → non-terminal (fail-closed). This is
+	// a cheap early-out on the pre-tx `owned` snapshot before we open a transaction; the
+	// AUTHORITATIVE revision is re-derived from the LOCKED row below.
 	if head == "" || !owned.ContractRevision.Valid {
 		return 0, false, nil
 	}
-	rev := owned.ContractRevision.Int32
 	workerID := pgconv.UUID(wkr.ID)
 
 	tx, err := s.txBeginner.Begin(ctx)
@@ -322,6 +324,19 @@ func (s *Service) completeRunWithPermit(ctx context.Context, wkr store.Worker, o
 		}
 		return 0, false, err
 	}
+
+	// The revision that binds the permit identity MUST come from the LOCKED row, not the pre-tx
+	// `owned` snapshot. Revision is immutable post-freeze today, so the two agree; but #1227 will
+	// introduce contract-revision bumps, and a bump racing this completion would let a stale
+	// snapshot revision consume an OLD-revision permit under the lock — a revision-drift TOCTOU
+	// bypass. Reading `run.ContractRevision` closes it: if a bump landed in the race, the permit
+	// lookups below find nothing for the new revision → non-terminal → fail-closed, forcing a
+	// re-permit at the new revision. If the locked row is unfrozen (revision NULL — e.g. a
+	// split-state row), fail closed the same way the pre-tx no-head guard does.
+	if !run.ContractRevision.Valid {
+		return 0, false, nil
+	}
+	rev := run.ContractRevision.Int32
 
 	// Retry after response loss: the run is already completed. If THIS worker's permit for the
 	// identity was already consumed, we completed it once and the response was lost → idempotent

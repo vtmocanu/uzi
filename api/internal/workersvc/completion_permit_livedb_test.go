@@ -307,6 +307,61 @@ func TestCompletionWrongHeadStaysNonTerminalLiveDB(t *testing.T) {
 	}
 }
 
+// TestCompletionRevisionBumpUnderLockStaysNonTerminalLiveDB proves the permit identity fences on
+// the LOCKED row's contract_revision, not the pre-tx snapshot (the #1227 revision-bump TOCTOU).
+// A permit is issued for the frozen revision (1); then, simulating a #1227 revision bump that
+// races BETWEEN the pre-tx `owned` snapshot and the FOR UPDATE lock, the row's contract_revision
+// is bumped to 2 while `owned` still reflects revision 1. Completion must read the LOCKED row's
+// revision (2), find no permit for it, and stay non-terminal (fail-closed) WITHOUT consuming the
+// old-revision permit — forcing a re-permit at the new revision. (With the pre-fix code, which
+// derived rev from the stale `owned` snapshot, this consumed the revision-1 permit and completed.)
+func TestCompletionRevisionBumpUnderLockStaysNonTerminalLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	svc := e.permitService(t)
+	wid := e.seedWorker(t, []string{"completion_interlock_v1"})
+	runID := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
+	wkr := store.Worker{ID: wid}
+	const head = "beefcafe"
+
+	if p, err := svc.RequestCompletionPermit(e.ctx, wkr, runID,
+		CompletionPermitRequest{ContractRevision: 1, Branch: "b", Head: head}); err != nil || !p.Granted {
+		t.Fatalf("permit must be granted: %+v err=%v", p, err)
+	}
+
+	// The pre-tx snapshot the completion carries reflects the OLD (frozen) revision 1.
+	owned, err := svc.runOwnedByWorker(e.ctx, runID, wkr)
+	if err != nil {
+		t.Fatalf("load owned snapshot: %v", err)
+	}
+	if owned.ContractRevision.Int32 != 1 {
+		t.Fatalf("snapshot revision must be 1, got %d", owned.ContractRevision.Int32)
+	}
+
+	// A #1227 revision bump lands AFTER the snapshot but before the FOR UPDATE lock.
+	e.exec(t, `UPDATE runs SET contract_revision = 2 WHERE id = $1`, runID)
+
+	rows, idempotent, err := svc.completeRunWithPermit(e.ctx, wkr, owned,
+		StateRequest{Head: strPtr(head)},
+		store.SetRunCompletedParams{ID: runID, WorkerID: owned.WorkerID})
+	if err != nil {
+		t.Fatalf("completeRunWithPermit: %v", err)
+	}
+	if rows != 0 || idempotent {
+		t.Fatalf("a completion racing a revision bump must stay non-terminal; rows=%d idempotent=%v", rows, idempotent)
+	}
+	if s := e.runStatus(t, runID); s != "running" {
+		t.Fatalf("run must remain running; status = %q", s)
+	}
+	// The OLD-revision permit must NOT have been consumed.
+	var consumed bool
+	if err := e.pool.QueryRow(e.ctx, `SELECT consumed_at IS NOT NULL FROM run_completion_permits WHERE run_id = $1`, runID).Scan(&consumed); err != nil {
+		t.Fatalf("read permit: %v", err)
+	}
+	if consumed {
+		t.Fatal("the old-revision permit must NOT be consumed under a racing revision bump")
+	}
+}
+
 // TestLegacyCompletionPassthroughLiveDB: a legacy run (completion_contract_version NULL)
 // completes through the unchanged path, needing no permit.
 func TestLegacyCompletionPassthroughLiveDB(t *testing.T) {

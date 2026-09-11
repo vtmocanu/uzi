@@ -760,7 +760,6 @@ func (h *Handler) WorkerRunCompletionAttempt(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	var body struct {
-		ContractRevision    int    `json:"contract_revision"`
 		Head                string `json:"head"`
 		WorktreeFingerprint string `json:"worktree_fingerprint"`
 	}
@@ -769,7 +768,7 @@ func (h *Handler) WorkerRunCompletionAttempt(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	res, err := h.wsvc.RecordCompletionAttempt(r.Context(), wkr, runID, workersvc.CompletionAttemptRequest{
-		ContractRevision: body.ContractRevision, Head: strings.TrimSpace(body.Head), WorktreeFingerprint: strings.TrimSpace(body.WorktreeFingerprint),
+		Head: strings.TrimSpace(body.Head), WorktreeFingerprint: strings.TrimSpace(body.WorktreeFingerprint),
 	})
 	if err != nil {
 		switch {

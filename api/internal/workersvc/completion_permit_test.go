@@ -295,7 +295,7 @@ func TestRecordCompletionAttemptEndpoint(t *testing.T) {
 		run.Status = "queued"
 		fs := &fakeStore{runOwned: run}
 		svc := New(fs, newBox(t), testParams())
-		if _, err := svc.RecordCompletionAttempt(context.Background(), w, run.ID, CompletionAttemptRequest{ContractRevision: 1, Head: "h"}); !errors.Is(err, ErrCompletionStaleClaim) {
+		if _, err := svc.RecordCompletionAttempt(context.Background(), w, run.ID, CompletionAttemptRequest{Head: "h"}); !errors.Is(err, ErrCompletionStaleClaim) {
 			t.Fatalf("want ErrCompletionStaleClaim, got %v", err)
 		}
 	})
@@ -316,7 +316,7 @@ func TestRecordCompletionAttemptEndpoint(t *testing.T) {
 		run.MilestonesCompleted = idsJSON(t, "m1")
 		fs := &fakeStore{runOwned: run, recordAttemptCount: 4}
 		svc := New(fs, newBox(t), testParams())
-		res, err := svc.RecordCompletionAttempt(context.Background(), w, run.ID, CompletionAttemptRequest{ContractRevision: 1, Head: "h", WorktreeFingerprint: "wf"})
+		res, err := svc.RecordCompletionAttempt(context.Background(), w, run.ID, CompletionAttemptRequest{Head: "h", WorktreeFingerprint: "wf"})
 		if err != nil {
 			t.Fatalf("unexpected err: %v", err)
 		}
