@@ -1843,6 +1843,18 @@ describe("codex-m3b live no-leak oracle calibration", () => {
       throw new Error("live identifier no-leak calibration did not fail safely");
     }
   });
+
+  it("prepares the shared home ancestors owned by an injected real provider-launch seam", () => {
+    const scratch = fs.mkdtempSync(nodePath.join(process.env.TMPDIR ?? "/tmp", "codex-m3b-live-paths-"));
+    try {
+      const paths = makeLiveRunPaths(scratch, "cancel");
+      assert.equal(fs.statSync(paths.worktree).isDirectory(), true);
+      assert.equal(fs.statSync(paths.home).isDirectory(), true);
+      assert.equal(fs.statSync(nodePath.join(paths.home, "codex-data")).isDirectory(), true);
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
 });
 
 /** A proxy over the real WorkerClient that CAPTURES every plaintext access token a release/refresh
@@ -1931,7 +1943,15 @@ function makeLiveRunPaths(scratch: string, label: string): { readonly worktree: 
   const worktree = nodePath.join(scratch, `${label}-work`);
   fs.mkdirSync(worktree, { recursive: true, mode: 0o2770 });
   fs.chmodSync(worktree, 0o2770);
-  return { worktree, home: nodePath.join(scratch, `${label}-home`) };
+  // An injected launchProviderRoot owns its synthetic filesystem, so CodexExecutor deliberately
+  // skips prepareCodexRunHome. Create the worker-owned shared ancestors the real launcher expects;
+  // its runner-owned epoch mkdir is intentionally non-recursive and must not create these itself.
+  const home = nodePath.join(scratch, `${label}-home`);
+  const codexData = nodePath.join(home, "codex-data");
+  fs.mkdirSync(codexData, { recursive: true, mode: 0o2770 });
+  fs.chmodSync(home, 0o2770);
+  fs.chmodSync(codexData, 0o2770);
+  return { worktree, home };
 }
 
 function liveTimeoutMs(envName: string, fallback: number): number {
