@@ -591,9 +591,10 @@ function parseProgressIds(raw: unknown): string[] {
 /**
  * Parse the OPTIONAL `milestones_agents` argument of a report_progress call (PRD #1224 M1).
  * Defensive in the same register as parseProgressIds: a non-array yields []; each entry must
- * be an object with a non-empty string `id` (trimmed, clamped to MAX_PROGRESS_ID_RUNES,
- * deduped first-wins) and a non-empty string `agent`. The list is capped at MAX_PROGRESS_IDS.
- * Never throws.
+ * be an object with a non-empty string `id` (trimmed, clamped to MAX_PROGRESS_ID_RUNES) and a
+ * non-empty string `agent`. Entries are NOT deduped here — the server (milestoneAgentsParam)
+ * is first-VALID-wins, so a duplicate id is left for it to resolve; the raw list is capped at
+ * MAX_PROGRESS_IDS for hygiene. Never throws.
  *
  * `agent` is trimmed ONLY — NOT clamped or otherwise transformed — because the server stores
  * it byte-exact and joins on it against `current_activity.agent` (derived from `subagent_type`);
@@ -607,19 +608,20 @@ function parseProgressIds(raw: unknown): string[] {
 function parseMilestoneAgents(raw: unknown): MilestoneAgent[] {
   if (!Array.isArray(raw)) return [];
   const out: MilestoneAgent[] = [];
-  const seen = new Set<string>();
-  for (const item of raw) {
-    if (out.length >= MAX_PROGRESS_IDS) break;
+  // NO client-side dedup by id: the server's milestoneAgentsParam is first-VALID-wins — an
+  // invalid `agent` does NOT reserve its id, so a later valid entry for the same id can still
+  // win. Deduping here (which cannot cheaply replicate the server's IsValidName check without
+  // desyncing) would let an invalid-first duplicate reserve the id and drop the valid entry
+  // before the server ever sees it. So cap the RAW entries for payload hygiene and leave the
+  // per-id selection to the server.
+  for (const item of raw.slice(0, MAX_PROGRESS_IDS)) {
     const entry = asRecord(item);
     if (!entry) continue;
     const id = typeof entry["id"] === "string" ? entry["id"].trim() : "";
     if (id === "") continue;
     const agent = typeof entry["agent"] === "string" ? entry["agent"].trim() : "";
     if (agent === "") continue;
-    const clampedId = clamp(id, MAX_PROGRESS_ID_RUNES);
-    if (seen.has(clampedId)) continue; // first-wins on a duplicate id
-    seen.add(clampedId);
-    const parsed: MilestoneAgent = { id: clampedId, agent };
+    const parsed: MilestoneAgent = { id: clamp(id, MAX_PROGRESS_ID_RUNES), agent };
     if (typeof entry["agent_label"] === "string") {
       const label = entry["agent_label"].trim();
       if (label !== "") parsed.agent_label = clamp(label, MAX_MILESTONE_TITLE_RUNES);

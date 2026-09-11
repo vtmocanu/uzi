@@ -653,10 +653,11 @@ describe("scanSignals report_progress milestones_agents (PRD #1224 M1)", () => {
     });
   });
 
-  it("drops entries missing id or agent, handles a non-array, and dedupes first-wins — never throwing", () => {
+  it("drops entries missing id or agent and handles a non-array, but does NOT dedup duplicate ids — never throwing", () => {
     // Entry missing `id`, entry missing `agent`, blank `agent`, and a non-object are all
-    // dropped; a duplicate id keeps the FIRST valid entry. `agent` is trimmed only (not the
-    // clamp path). The trailing junk never throws.
+    // dropped; a duplicate id is NO LONGER dropped here — the parser forwards both so the
+    // server's first-VALID-wins (milestoneAgentsParam) can resolve them. `agent` is trimmed
+    // only (not the clamp path). The trailing junk never throws.
     const r = scanSignals(
       toolUse(PROGRESS, {
         in_progress: ["m1"],
@@ -665,13 +666,14 @@ describe("scanSignals report_progress milestones_agents (PRD #1224 M1)", () => {
           { id: "m1" }, // no agent -> dropped
           { id: "m4", agent: "  " }, // blank agent -> dropped
           "nope", // non-object -> dropped
-          { id: " m1 ", agent: " coder " }, // trims to m1/coder -> FIRST valid for m1
-          { id: "m1", agent: "reviewer" }, // duplicate id -> dropped (first-wins)
+          { id: " m1 ", agent: " coder " }, // trims to m1/coder -> kept
+          { id: "m1", agent: "reviewer" }, // duplicate id -> ALSO kept (server resolves first-valid-wins)
         ],
       }),
     );
     assert.deepStrictEqual(r.progress!.milestones_agents, [
       { id: "m1", agent: "coder" },
+      { id: "m1", agent: "reviewer" },
     ]);
     // A non-array milestones_agents yields no attribution but still a real progress signal.
     const nonArray = scanSignals(
@@ -679,6 +681,27 @@ describe("scanSignals report_progress milestones_agents (PRD #1224 M1)", () => {
     );
     assert.deepStrictEqual(nonArray.progress, { completed: [], in_progress: ["m1"] });
     assert.ok(!("milestones_agents" in nonArray.progress!));
+  });
+
+  it("an invalid-first duplicate does NOT drop a later valid entry for the same id — the parser forwards both so the server keeps the valid one (CR !1244)", () => {
+    // The client cannot validate the agent name (that stays the server's authoritative,
+    // byte-exact check), so it must not reserve an id for an invalid-but-nonempty agent.
+    // Both entries are forwarded; the server's milestoneAgentsParam (first-VALID-wins) drops
+    // `BAD!` and keeps `coder`. Re-adding a client-side dedup here reddens this: it would
+    // reserve m1 for `BAD!` and lose `coder` before the server ever saw it.
+    const r = scanSignals(
+      toolUse(PROGRESS, {
+        in_progress: ["m1"],
+        milestones_agents: [
+          { id: "m1", agent: "BAD!" }, // invalid agent name, but non-empty -> forwarded
+          { id: "m1", agent: "coder" }, // same id, valid -> MUST survive to reach the server
+        ],
+      }),
+    );
+    assert.deepStrictEqual(r.progress!.milestones_agents, [
+      { id: "m1", agent: "BAD!" },
+      { id: "m1", agent: "coder" },
+    ]);
   });
 
   it("does not add the milestones_agents key when none is declared (empty/absent valid)", () => {
