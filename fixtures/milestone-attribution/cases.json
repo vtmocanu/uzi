@@ -76,5 +76,30 @@
     ],
     "activity_agent": "coder",
     "expected": { "effective_ids": ["m2"], "unique_match_id": "m2" }
+  },
+  {
+    "name": "id-both-completed-and-in-progress-excluded",
+    "milestones": ["m1", "m2", "m3"],
+    "milestones_completed": ["m1", "m2"],
+    "milestones_in_progress": ["m2", "m3"],
+    "milestones_agents": [
+      { "id": "m2", "agent": "coder", "agent_label": "a" },
+      { "id": "m3", "agent": "tester", "agent_label": "b" }
+    ],
+    "activity_agent": "tester",
+    "expected": { "effective_ids": ["m3"], "unique_match_id": "m3" }
+  },
+  {
+    "name": "frozen-order-scrambled-second",
+    "milestones": ["m1", "m2", "m3", "m4"],
+    "milestones_completed": [],
+    "milestones_in_progress": ["m4", "m2", "m3"],
+    "milestones_agents": [
+      { "id": "m2", "agent": "a-one", "agent_label": "a" },
+      { "id": "m3", "agent": "b-two", "agent_label": "b" },
+      { "id": "m4", "agent": "c-three", "agent_label": "c" }
+    ],
+    "activity_agent": "b-two",
+    "expected": { "effective_ids": ["m2", "m3", "m4"], "unique_match_id": "m3" }
   }
 ]

@@ -28,6 +28,7 @@ describe("PRD #1224: per-milestone attribution cross-surface fixture (web half)"
         milestones: c.milestones.map(
           (id): Milestone => ({ id, title: id }),
         ),
+        milestones_completed: c.milestones_completed,
         milestones_in_progress: c.milestones_in_progress,
         milestones_agents: c.milestones_agents as MilestoneAgent[] | null,
       };
