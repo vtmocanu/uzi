@@ -133,15 +133,16 @@ type serverContract struct {
 	Live bool `json:"live"`
 }
 
-// liveSubscription carries the maintainer-injected REAL Codex subscription login and the
-// real codexauth client seedSubscriptionLive uses. A nil *liveSubscription selects the
-// default canary seeding; a non-nil one seals the real env-injected login and wires the real
-// refresh client. It exists ONLY when CODEX_M3B_LIVE=1 (see the file header). The two tokens
-// stay in memory and the sealed DB row — never written to a file.
+// liveSubscription carries the maintainer-injected REAL Codex subscription login and two
+// fixed-endpoint clients with distinct budgets. Initial identity establishment is outside the
+// app-server callback budget, while refreshClient preserves production's 2.5-second single-call
+// cap. A nil *liveSubscription selects the default canary seeding. The two tokens stay in memory
+// and the sealed DB row — never written to a file.
 type liveSubscription struct {
-	accessToken  string
-	refreshToken string
-	client       *codexauth.Client
+	accessToken    string
+	refreshToken   string
+	identityClient *codexauth.Client
+	refreshClient  *codexauth.Client
 }
 
 // buildLiveSubscription returns the live subscription seeding inputs when CODEX_M3B_LIVE=1,
@@ -169,17 +170,20 @@ func buildLiveSubscription() *liveSubscription {
 	if login.AccessToken == "" || login.RefreshToken == "" {
 		log.Fatal("codexm3btestserver: CODEX_M3B_LIVE_LOGIN_JSON must carry a non-empty access_token and refresh_token")
 	}
-	// Production-equivalent per-provider-call cap (mirrors cmd/server's
-	// WithPerRequestTimeout(codexProviderRequestTimeout)) so the acceptance measures the real budget.
-	// CODEX_M3B_LIVE_RELAX_TIMEOUTS=1 drops the cap as an explicit diagnostic mode only.
-	client := codexauth.NewClient(codexauth.WithPerRequestTimeout(2500 * time.Millisecond))
+	// Identity establishment seeds the fixture before any app-server callback exists, so it gets
+	// a separate bounded window. The refresh client retains production's 2.5-second single-call cap;
+	// otherwise a slow seed GET would force RELAX mode and silently stop testing the callback budget.
+	identityClient := codexauth.NewClient(codexauth.WithPerRequestTimeout(15 * time.Second))
+	refreshClient := codexauth.NewClient(codexauth.WithPerRequestTimeout(2500 * time.Millisecond))
 	if os.Getenv("CODEX_M3B_LIVE_RELAX_TIMEOUTS") == "1" {
-		client = codexauth.NewClient()
+		identityClient = codexauth.NewClient()
+		refreshClient = codexauth.NewClient()
 	}
 	return &liveSubscription{
-		accessToken:  login.AccessToken,
-		refreshToken: login.RefreshToken,
-		client:       client,
+		accessToken:    login.AccessToken,
+		refreshToken:   login.RefreshToken,
+		identityClient: identityClient,
+		refreshClient:  refreshClient,
 	}
 }
 
@@ -541,7 +545,7 @@ func diagnoseUsageShape(ctx context.Context, accessToken string) {
 //   - the REAL codexauth client is wired into the coordinated refresher, so POST /codex/refresh
 //     performs a real oauth rotation (the canary arm wires an in-process fake instead).
 func seedSubscriptionLive(ctx context.Context, pool *pgxpool.Pool, q *store.Queries, box *secretbox.Box, wsvc *workersvc.Service, ownerID, repoID, workerID uuid.UUID, live *liveSubscription) (subscriptionContract, error) {
-	id, accessToken, refreshToken, err := resolveLiveIdentity(ctx, live.client, live.accessToken, live.refreshToken)
+	id, accessToken, refreshToken, err := resolveLiveIdentity(ctx, live.identityClient, live.accessToken, live.refreshToken)
 	if err != nil {
 		return subscriptionContract{}, err
 	}
@@ -600,7 +604,7 @@ func seedSubscriptionLive(ctx context.Context, pool *pgxpool.Pool, q *store.Quer
 
 	// Wire the REAL codexauth client so POST /codex/refresh runs a real coordinated oauth
 	// rotation against the provider.
-	wsvc.SetCodexRefresh(live.client)
+	wsvc.SetCodexRefresh(live.refreshClient)
 
 	return subscriptionContract{
 		RunID:            runID.String(),

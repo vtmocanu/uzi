@@ -101,9 +101,11 @@ intentionally wants to reproduce acceptance check 2 adds
 - creates the docker network **without** `--internal` (egress-capable), so the worker and test-server
   reach the real provider and the real ChatGPT auth hosts;
 - passes the live env into the **test-server** container so it discovers identity, seals the real
-  login, and wires the real `codexauth` client; the lifecycle process receives the login blob only so
-  its no-leak oracle can scan the actual access and refresh values, while the launched production
-  root still receives neither value through its environment;
+  login, and wires the real `codexauth` clients; initial identity establishment is outside the callback
+  budget and gets a separate bounded 15-second client, while the refresh callback retains production's
+  2.5-second single-call cap. The lifecycle process receives the login blob only so its no-leak oracle
+  can scan the actual access and refresh values, while the launched production root still receives
+  neither value through its environment;
 - runs the unchanged Block A injected-fake proof, then the real subscription advice and cancellation
   passes, the optional complete run, and only when enabled the explicit refresh probes;
 - parses `CODEX_M3B_LIVE_SUB_COUNTS` as counts and booleans only. That summary prints no token,
