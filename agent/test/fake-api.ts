@@ -119,6 +119,17 @@ export class FakeApi {
   }> = [];
   private completionHoldStatus = "paused";
   private completionHoldHttpStatus = 200;
+  // PRD #1226 M4 (D5): the completion-permit endpoint. Records each request (run + body) and answers
+  // a configurable decision — {granted:true} by default, or {granted:false, deny_reason} — at a
+  // configurable HTTP status (a non-200 models a transport/HTTP error the client THROWS on, distinct
+  // from the granted:false denial which is a normal 200 body).
+  readonly completionPermitRequests: Array<{
+    runId: string;
+    body: Record<string, unknown>;
+  }> = [];
+  private completionPermitGranted = true;
+  private completionPermitDenyReason: string | undefined;
+  private completionPermitHttpStatus = 200;
 
   constructor(private readonly token: string) {
     this.server = http.createServer((req, res) => {
@@ -268,6 +279,19 @@ export class FakeApi {
   setCompletionHoldResponse(status: string, httpStatus = 200): void {
     this.completionHoldStatus = status;
     this.completionHoldHttpStatus = httpStatus;
+  }
+
+  /** PRD #1226 M4 (D5): set the completion-permit decision. `granted:true` is the issued permit;
+   *  `granted:false` (with an optional `denyReason`) is the NON-TERMINAL denial (a 200 body the
+   *  client does NOT throw on); `httpStatus` other than 200 models a transport/HTTP error the client
+   *  DOES throw on. */
+  setCompletionPermitResponse(
+    granted: boolean,
+    opts: { denyReason?: string; httpStatus?: number } = {},
+  ): void {
+    this.completionPermitGranted = granted;
+    this.completionPermitDenyReason = opts.denyReason;
+    this.completionPermitHttpStatus = opts.httpStatus ?? 200;
   }
 
   /** Observe each /state report as it lands, so a test can react to a value the
@@ -450,6 +474,23 @@ export class FakeApi {
       if (o.httpStatus !== 200)
         return send(res, o.httpStatus, { error: "run not found for this worker" });
       return send(res, 200, { status: o.status ?? "running" });
+    }
+
+    // PRD #1226 M4 (D5): the completion-permit endpoint. Records the request and answers the
+    // configured decision. A non-200 httpStatus models a transport/HTTP error (the client throws);
+    // otherwise {granted} rides a 200, with deny_reason on a denial.
+    const permitMatch = /^\/api\/worker\/runs\/([^/]+)\/completion\/permit$/.exec(p);
+    if (req.method === "POST" && permitMatch) {
+      const runId = permitMatch[1] as string;
+      this.completionPermitRequests.push({ runId, body: json });
+      if (this.completionPermitHttpStatus !== 200) {
+        return send(res, this.completionPermitHttpStatus, { error: "injected permit failure" });
+      }
+      const body: Record<string, unknown> = { granted: this.completionPermitGranted };
+      if (!this.completionPermitGranted && this.completionPermitDenyReason !== undefined) {
+        body["deny_reason"] = this.completionPermitDenyReason;
+      }
+      return send(res, 200, body);
     }
 
     // PRD #1226 M4 (D6): the completion-hold endpoint. Records the request and answers the

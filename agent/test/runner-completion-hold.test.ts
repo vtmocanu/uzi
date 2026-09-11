@@ -101,14 +101,17 @@ describe("RunRunner — recoverable completion hold (PRD #1226 M4 D6)", () => {
     }
   });
 
-  it("refused hold ACK (non-paused) → false: keeps the run live and preserves the clone and HOME (no cleanup)", async () => {
+  it("refused hold ACK (non-paused) → false: does NOT park, and clears the preserve flags so the run's normal terminal cleanup removes the clone and HOME", async () => {
     const { gitlab } = fakeGitlab();
     const { executor, held } = makeHoldExecutor(true);
     const home = seedHome();
     const claim = gitlabClaim(1251);
     try {
-      // The server refuses the hold: it answers running (a 409-style refusal reads its status off
-      // the body too). enterCompletionHold must return false and clean up NOTHING.
+      // The server refuses the hold: it answers running (a 409-style refusal reads its status off the
+      // body too). enterCompletionHold must return false. The retain-everything flags are held ONLY
+      // while the hold is being attempted; on a refusal it is NOT parked, so it clears them and the
+      // failing run (the executor's legacy throw) follows normal terminal cleanup — otherwise a run
+      // that attempts a hold, is kept live, then FAILS would leak its clone + HOME.
       api.setCompletionHoldResponse("running", 409);
       await runnerWith(() => ({ executor, homeDir: home.homeDir }), gitlab, undefined, undefined, {
         recoveryRetryMs: 1,
@@ -116,15 +119,15 @@ describe("RunRunner — recoverable completion hold (PRD #1226 M4 D6)", () => {
 
       assert.strictEqual(held.value, false, "a non-paused ACK ⇒ enterCompletionHold returns false");
       assert.strictEqual(api.completionHoldRequests.length, 1, "the hold WAS requested (capture verified)");
-      // The run is kept live with everything retained (the destructive cleanup never ran).
-      assert.strictEqual(fs.existsSync(worktreeDirFor(1251)), true, "the clone is retained on a refused ACK");
-      assert.strictEqual(fs.existsSync(home.sentinel), true, "the HOME is retained on a refused ACK");
+      // Not parked ⇒ the flags were cleared ⇒ the terminal (failed) run cleaned up.
+      assert.strictEqual(fs.existsSync(worktreeDirFor(1251)), false, "the clone is cleaned up on a refused ACK (not parked)");
+      assert.strictEqual(fs.existsSync(home.sentinel), false, "the HOME is cleaned up on a refused ACK (not parked)");
     } finally {
       fs.rmSync(home.root, { recursive: true, force: true });
     }
   });
 
-  it("unverified capture → false: never requests the hold and preserves the clone and HOME (no cleanup before positive capture)", async () => {
+  it("unverified capture → false: never requests the hold, and clears the preserve flags so the run's normal terminal cleanup removes the clone and HOME", async () => {
     const { gitlab } = fakeGitlab();
     const { executor, held } = makeHoldExecutor(false); // verifyRunnerTrackingCovers → false
     const home = seedHome();
@@ -141,9 +144,11 @@ describe("RunRunner — recoverable completion hold (PRD #1226 M4 D6)", () => {
         0,
         "the hold is NEVER requested before a positively-verified capture",
       );
-      // Nothing was cleaned up: the only Git work copy and the HOME are retained.
-      assert.strictEqual(fs.existsSync(worktreeDirFor(1252)), true, "the clone is retained on an unverified capture");
-      assert.strictEqual(fs.existsSync(home.sentinel), true, "the HOME is retained on an unverified capture");
+      // Giving up on an unverified capture is a NOT-parked outcome: the flags are cleared and the
+      // failing run cleans up (the AC's no-clean-while-uncertain protection covers the in-flight
+      // retries, not the terminal outcome once the bounded attempts are exhausted).
+      assert.strictEqual(fs.existsSync(worktreeDirFor(1252)), false, "the clone is cleaned up on an unverified capture (not parked)");
+      assert.strictEqual(fs.existsSync(home.sentinel), false, "the HOME is cleaned up on an unverified capture (not parked)");
     } finally {
       fs.rmSync(home.root, { recursive: true, force: true });
     }

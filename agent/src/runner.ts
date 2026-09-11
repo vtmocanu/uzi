@@ -73,10 +73,19 @@ import { REASON_NO_TOKEN, TransientRecoveryError } from "./sdk-executor.js";
 const MAX_FAILURE_REASON_LEN = 512;
 
 /** PRD #1226 M4 (D6): bounded in-call attempts to capture a VERIFIED completion-hold restore
- *  point before giving up and keeping the run live. Mirrors handleRecoveryExhausted's retain-and-
- *  retry, but bounded (this runs synchronously inside the executor's completion loop, not the
- *  server-parked recovery loop). A never-verified capture returns false — never a park/cleanup. */
+ *  point before giving up. Mirrors handleRecoveryExhausted's retain-and-retry, but bounded (this
+ *  runs synchronously inside the executor's completion loop, not the server-parked recovery loop).
+ *  A never-verified capture DOES NOT park: enterCompletionHold clears its preserve flags and returns
+ *  false, so the run's normal terminal cleanup runs (no park, no leak). */
 const COMPLETION_HOLD_CAPTURE_ATTEMPTS = 3;
+
+/** PRD #1226 M4 (D5): the STATIC, content-free failure_reason a worker reports when the completion
+ *  interlock cannot report completed AND cannot park the run for recovery (the restore point never
+ *  verified or the hold ACK was refused). It carries NO model output and NO repository text — the
+ *  taxonomy fact is all a human needs to route it, and the committed work is safe on the run's
+ *  branch (the finalize push already landed before the permit was requested). */
+const COMPLETION_INTERLOCK_UNHELD_REASON =
+  "completion interlock: could not verify the final head or park the run for recovery";
 
 /** PRD #1171 m4: a name-based CodexBoundaryError probe. The runner stays HARNESS-AGNOSTIC and
  *  never imports from agent/src/codex/**, so it recognizes the boundary-blocked error — thrown
@@ -2167,6 +2176,93 @@ export class RunRunner {
       return;
     }
 
+    // ── PRD #1226 M4 (D5): the completion permit + exact-head bind ──────────────
+    // ONLY an INTERLOCKED issue run (claim.config.completion_contract_version != null) runs this;
+    // a legacy/non-interlocked run skips the whole block and its MR creation + completed report are
+    // byte-for-byte unchanged. Reached AFTER the finalize push landed on origin (the normal push OR
+    // the PRD #456 align push), so `H` below is the tip that ACTUALLY landed — never the pre-align
+    // candidate. Interlocked runs are ISSUE runs that open MRs, so this sits on the openMr path only;
+    // the no-MR task completion above is never interlocked and stays untouched.
+    const interlocked = claim.config?.completion_contract_version != null;
+    // `Closes #N` renders for a LEGACY run (unchanged) OR an interlocked run with a GRANTED permit.
+    // It starts at the legacy default — true for legacy, false for interlocked — and only flips true
+    // once the permit is granted below, so no interlocked path can render `Closes` without a permit
+    // (AC: only a permitted full delivery contains `Closes #N`).
+    let renderCloses = !interlocked;
+    // H, the exact landed head. Set ONLY on the interlocked granted path; it rides the completed
+    // report (`head: completionHead`) and is compared against the created PR's head. Undefined for a
+    // legacy run, so JSON.stringify drops it and the legacy completed report is byte-for-byte the same
+    // on the wire.
+    let completionHead: string | undefined;
+    // Park the incomplete/unverifiable interlocked run, else report a typed failure. Shared by the
+    // permit-denied and PR-head-mismatch paths (D5's held-or-fail). enterCompletionHold reaps,
+    // captures a VERIFIED same-worker restore point and parks on a `paused` ACK (returns true), or
+    // parks nothing (returns false); on true we skip finalization exactly like the
+    // result.completionHeld branch above, and on false the run follows normal terminal cleanup
+    // (enterCompletionHold cleared its preserve flags) so we report a static, content-free failure.
+    // `holdReason` is a static hold-reason string, never raw model output.
+    const holdOrFailInterlocked = async (holdReason: string): Promise<void> => {
+      const held = await this.enterCompletionHold(flight, claim, holdReason, runLog);
+      if (held) {
+        executor.killAgentTree?.();
+        await closeBatcher().catch(() => undefined);
+        runLog.info("run entered the completion hold; skipping finalization", {
+          run_id: runId,
+          reason: holdReason,
+        });
+        return;
+      }
+      await closeBatcher();
+      await reportState({ status: "failed", failure_reason: COMPLETION_INTERLOCK_UNHELD_REASON });
+      runLog.info("run failed: completion interlock could not park the incomplete run", {
+        run_id: runId,
+        reason: holdReason,
+      });
+    };
+
+    if (interlocked) {
+      // 1. Capture the EXACT landed head H. pushBranch pushes refs/uzi-runner/<branch>, and BOTH the
+      //    normal finalize push (fetchAgentBranch at the top of this method) and the align push
+      //    (fetchAndPush's re-fetch of the aligned tip) wrote that ref to the tip they pushed — so
+      //    trackingTip reads the landed tip after either path. The frozen contract revision is echoed
+      //    verbatim so the server can reject a revision drift. If either is unresolvable a permit
+      //    cannot be bound to (run, revision, branch, head), so route to the hold rather than report
+      //    completed.
+      const head = await this.git.trackingTip(barePath, result.branch);
+      const contractRevision = claim.config?.contract_revision;
+      if (head === null || contractRevision === undefined) {
+        runLog.warn(
+          "completion interlock: the landed head or contract revision is unresolvable; holding rather than completing",
+          { run_id: runId },
+        );
+        await holdOrFailInterlocked("completion identity unresolvable");
+        return;
+      }
+      // 2. Request the permit bound to (run, contract_revision, branch, H). A denial is a normal 200
+      //    body (granted:false), never a throw — the throw path (a transport/HTTP error) propagates to
+      //    the generic catch, which fails the run without falsely completing.
+      const permit = await this.client.requestCompletionPermit(runId, {
+        contractRevision,
+        branch: result.branch,
+        head,
+      });
+      // 3. NOT granted: do NOT create the MR, do NOT render Closes, do NOT report completed — hold.
+      if (!permit.granted) {
+        batcher.emit({
+          kind: "status",
+          agent: "worker",
+          payload: {
+            text: "completion permit denied; holding the incomplete run instead of opening a merge request",
+          },
+        });
+        await holdOrFailInterlocked("completion permit denied");
+        return;
+      }
+      // 4. Granted: render `Closes` and carry H on the completed report below.
+      renderCloses = true;
+      completionHead = head;
+    }
+
     const targetBranch =
       claim.repo.default_branch?.trim() ||
       (await this.git.defaultBranchName(barePath)) ||
@@ -2206,6 +2302,7 @@ export class RunRunner {
             result.gatesUnverified,
             result.gatesDiscoveryTruncated,
             result.scopeCapped,
+            renderCloses,
           ),
         }, boundarySignal),
       { log: runLog, signal: boundarySignal },
@@ -2215,6 +2312,38 @@ export class RunRunner {
       agent: "worker",
       payload: { text: `merge request opened: !${mr.iid} ${mr.webUrl}` },
     });
+
+    // ── PRD #1226 M4 (D5): PR-head verification (create-then-verify) ────────────
+    // For an interlocked run (completionHead set on the granted path) the MR now exists; read its
+    // head SHA and require it to equal the permitted head H. A mismatch (the PR points at a different
+    // commit than the permit was bound to) or a read that THREW (a ForgeError = cannot verify) must
+    // NOT report completed — the run holds with its MR already open. A legacy run has no completionHead
+    // and never reads the PR head, so this block is skipped and its completion is unchanged.
+    if (completionHead !== undefined) {
+      let prHead: string;
+      try {
+        prHead = await forge.getMergeRequestHead(
+          claim.repo.url,
+          claim.secrets.forge_pat,
+          mr.iid,
+          boundarySignal,
+        );
+      } catch (e) {
+        runLog.warn("completion interlock: could not read the PR head to verify it; holding", {
+          run_id: runId,
+          error: errMessage(e),
+        });
+        await holdOrFailInterlocked("pr head mismatch");
+        return;
+      }
+      if (prHead !== completionHead) {
+        runLog.info("completion interlock: PR head does not match the permitted head; holding", {
+          run_id: runId,
+        });
+        await holdOrFailInterlocked("pr head mismatch");
+        return;
+      }
+    }
 
     // Persist the MR/PR web URL the forge just handed us (PRD #65 D8), so the web
     // links it directly instead of reconstructing the URL by string surgery. Omit
@@ -2240,6 +2369,11 @@ export class RunRunner {
       // stop_kind='scope_capped'. OMITTED (not false) on a normal completion, so the wire
       // shape is unchanged for every non-truncated run.
       scope_capped: result.scopeCapped ? true : undefined,
+      // PRD #1226 M4 (D5): the EXACT permitted+verified head H, so the server consumes the
+      // completion permit issued for (run, contract_revision, branch, H). Set only for an
+      // interlocked run; undefined for a legacy run, so JSON.stringify drops it and the legacy
+      // completed report is byte-for-byte unchanged on the wire.
+      head: completionHead,
     }, "run completed", { branch: result.branch, mr_iid: mr.iid });
   }
 
@@ -3378,8 +3512,9 @@ export class RunRunner {
       // server's budget_exhausted steer, the executor calls this INSTEAD of throwing a terminal
       // failure. enterCompletionHold reaps, captures a VERIFIED same-worker restore point, requests
       // the hold, and returns true ONLY on a `paused` ACK (parked; the finally preserves the clone
-      // and HOME); false keeps the run LIVE with nothing cleaned up, so the executor falls back to
-      // the legacy throw. The feature is rollout-OFF (completion_interlock_rollout defaults OFF)
+      // and HOME); false means it did NOT park (it cleared its preserve flags), so the executor falls
+      // back to the legacy throw and the run's normal terminal cleanup runs. The feature is
+      // rollout-OFF (completion_interlock_rollout defaults OFF)
       // until #1232, so this seam is inert in production — completionInterlock above is false.
       enterCompletionHold: (reason) =>
         this.enterCompletionHold(flight, claim, reason, runLog),
@@ -4235,23 +4370,27 @@ export class RunRunner {
    * PRD #1226 M4 (D3/D6): enter the recoverable COMPLETION HOLD. Modeled on
    * handleRecoveryExhausted (the hold-loop template) with the D6 FIXED park order:
    *   1. reap the agent tree (REAP-BEFORE-GIT, before any credentialed capture git).
-   *   2. set the preserve flags FIRST so no cleanup can strand the clone/session while capture or
-   *      the hold ACK is still uncertain — the retain-everything default is set before any
-   *      destructive possibility and NEVER cleared (AC safety invariant).
+   *   2. set the preserve flags FIRST so no cleanup can strand the clone/session WHILE capture or the
+   *      hold ACK is still uncertain — retain-everything is the default through the bounded capture
+   *      retry and the hold request. It is held SET only on the true (parked) path; every false-
+   *      return path CLEARS both flags before returning (mirroring handleRecoveryExhausted's non-
+   *      parked branches), so a run that could NOT be parked follows NORMAL terminal cleanup instead
+   *      of leaking its clone + HOME into a finally that skips cleanup while the flags are set.
    *   3-5. captureHoldContext (WIP-commit dirty → fetch-back → verifyRunnerTrackingCovers, REQUIRE
-   *      verified; publish best-effort) with a bounded retry; a never-verified capture returns
-   *      false WITHOUT requesting a hold and WITHOUT cleanup — the live clone is retained.
+   *      verified; publish best-effort) with a bounded retry; DURING the retries a never-yet-verified
+   *      capture retains the live clone (no hold requested), and only on GIVING UP does it clear the
+   *      flags and return false so the subsequent terminal outcome cleans up.
    *   6. client.requestCompletionHold({head}) and REQUIRE the RETURNED status === "paused" (the
    *      positive-ack contract, the same as the pause park). A non-paused status or a thrown error
-   *      keeps the run live with everything retained.
+   *      clears the flags and returns false (the run is not parked).
    *   7. only after a paused ACK: mark the flight parked (so the finally's park carve-out preserves
    *      the HOME + plugin dir, the clone staying via preserveRecoveryClone) and return true.
    *
    * Returns true = ENTERED the verified hold (parked; phasePublish's completionHeld branch
    * finalizes nothing and the finally preserves the clone + HOME for a same-worker resume). Returns
-   * false = could NOT capture a verified restore point OR the hold ACK was not `paused`, so the run
-   * is KEPT LIVE and NOTHING is cleaned up (the executor falls back to the legacy terminal throw).
-   * The destructive clone/HOME cleanup NEVER runs from here — retention is set up front and held.
+   * false = could NOT capture a verified restore point OR the hold ACK was not `paused`; the flags
+   * are CLEARED, so the run is NOT parked and its normal terminal outcome (the executor's legacy
+   * throw, or phasePublish's typed failure) cleans up the clone + HOME like any other failed run.
    * `reason` is a content-free failure-reason constant, never raw model output.
    */
   private async enterCompletionHold(
@@ -4265,14 +4404,18 @@ export class RunRunner {
     flight.executor.killAgentTree?.();
     // 2. Retain EVERYTHING up front: the runner clone is the only copy of the run's work until the
     //    tracking ref verifiably covers HEAD, and the session HOME must survive the same-worker
-    //    resume. Set before any destructive possibility and NEVER cleared, so an uncertain capture
-    //    or a refused hold ACK can never strand the work (AC: no hold cleans the only Git work copy
-    //    when capture or acknowledgement is uncertain).
+    //    resume. Set before any destructive possibility so an uncertain capture or a refused hold ACK
+    //    can never strand the work WHILE the hold is being attempted (AC: no hold cleans the only Git
+    //    work copy when capture or acknowledgement is uncertain). Held SET only on the true (parked)
+    //    path below; EVERY false-return path clears both flags first (mirroring
+    //    handleRecoveryExhausted's non-parked branches) so a run that could not be parked follows
+    //    normal terminal cleanup rather than leaking its clone + HOME.
     flight.preserveRecoveryClone = true;
     flight.preserveSession = true;
     // 3-5. Capture a VERIFIED same-worker restore point, retrying bounded (like recovery's retain-
-    //    and-retry, but bounded — this runs inside the executor's completion loop). An unverified
-    //    capture retains the live clone and does NOT request a hold or clean up anything.
+    //    and-retry, but bounded — this runs inside the executor's completion loop). DURING the retries
+    //    an unverified capture retains the live clone and does NOT request a hold; only on GIVING UP
+    //    does it clear the flags and return false so the subsequent terminal outcome cleans up.
     let captured:
       | { verified: boolean; published: boolean; mode: "same_worker_only"; head: string | null }
       | undefined;
@@ -4292,8 +4435,12 @@ export class RunRunner {
       if (attempt < COMPLETION_HOLD_CAPTURE_ATTEMPTS - 1) await this.waitRecoveryRetry(flight);
     }
     if (!captured || captured.head === null) {
+      // Gave up: no verified restore point after the bounded retries. Clear the preserve flags so the
+      // NOT-parked run follows normal terminal cleanup instead of leaking its clone + HOME.
+      flight.preserveRecoveryClone = false;
+      flight.preserveSession = false;
       runLog.warn(
-        "completion hold: restore point never verified; keeping the run live (no hold requested, nothing cleaned up)",
+        "completion hold: restore point never verified; not parking (flags cleared for normal terminal cleanup)",
         { run_id: flight.runId },
       );
       return false;
@@ -4301,20 +4448,25 @@ export class RunRunner {
     // 6. Request the hold and REQUIRE the RETURNED status to be literally "paused" (the positive-
     //    ack contract, keyed off the returned status exactly like the pause park — never off
     //    `applied`). requestCompletionHold reads the status off BOTH a 200 and a 409 body without
-    //    throwing; a non-paused status or a real transport error keeps the run live, retained.
+    //    throwing; a non-paused status or a real transport error means the run is NOT parked, so we
+    //    clear the flags (below) and it follows normal terminal cleanup.
     const head = captured.head;
     let status: string;
     try {
       ({ status } = await this.client.requestCompletionHold(flight.runId, { head }));
     } catch (holdError) {
-      runLog.warn("completion hold: hold request failed; keeping the run live with its work retained", {
+      flight.preserveRecoveryClone = false;
+      flight.preserveSession = false;
+      runLog.warn("completion hold: hold request failed; not parking (flags cleared for normal terminal cleanup)", {
         run_id: flight.runId,
         error: errMessage(holdError),
       });
       return false;
     }
     if (status !== "paused") {
-      runLog.warn("completion hold: server did not park the run; keeping it live with its work retained", {
+      flight.preserveRecoveryClone = false;
+      flight.preserveSession = false;
+      runLog.warn("completion hold: server did not park the run; not parking (flags cleared for normal terminal cleanup)", {
         run_id: flight.runId,
         server_status: status || "unknown",
       });
@@ -5024,6 +5176,11 @@ function mrDescription(
   gatesUnverified?: string[],
   gatesDiscoveryTruncated?: boolean,
   scopeCapped?: { completedCount: number; total?: number },
+  // PRD #1226 M4 (D5): render the `Closes #N` line only when told to. A legacy issue run passes
+  // true (unchanged); an interlocked run passes true ONLY with a granted structural permit. This
+  // makes the "no `Closes` without a permit" invariant structural — the function cannot emit a
+  // closing body on its own. Defaults true so the sole issue-arm caller keeps today's behavior.
+  renderCloses = true,
 ): string {
   const footer = `Opened automatically by the uzi agent from branch \`${branch}\`. Please review and merge manually — the agent never merges.`;
   const repoMarker =
@@ -5066,8 +5223,10 @@ function mrDescription(
       ]
     : [
         `Implements issue #${claim.issue_iid}.`,
-        "",
-        `Closes #${claim.issue_iid}`,
+        // PRD #1226 M4 (D5): the closing line is CONDITIONAL on a granted structural permit. When
+        // renderCloses is true (a legacy run, or an interlocked run that got its permit) this spreads
+        // to exactly the prior `"", "Closes #N"` pair, so the legacy body is byte-for-byte unchanged.
+        ...(renderCloses ? ["", `Closes #${claim.issue_iid}`] : []),
         ...repoMarker,
       ];
   const gatesSection = gatesUnverifiedMrSection(gatesUnverified, gatesDiscoveryTruncated);

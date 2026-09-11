@@ -95,8 +95,18 @@ export interface MrCall {
   body?: string;
 }
 
-/** A GitLab client whose transport is captured; opens MR !42 with no network. */
-export function fakeGitlab(): { gitlab: GitLabClient; calls: MrCall[] } {
+/** PRD #1226 M4 (D5): options for the PR-head read (getMergeRequestHead). `head` is the SHA the
+ *  fake answers on the single-item GET; `headStatus` (default 200) models an unverifiable read (a
+ *  non-200 makes getMergeRequestHead throw a ForgeError). Absent ⇒ no interlocked run reads the
+ *  head, so the GET branch is never exercised (legacy behavior). */
+export interface FakeForgeOpts {
+  head?: string;
+  headStatus?: number;
+}
+
+/** A GitLab client whose transport is captured; opens MR !42 with no network. The GET (D5 PR-head
+ *  read) answers `{ sha }` at `headStatus`, so an interlocked run can verify (or fail to verify) H. */
+export function fakeGitlab(opts: FakeForgeOpts = {}): { gitlab: GitLabClient; calls: MrCall[] } {
   const calls: MrCall[] = [];
   const fetchFn: FetchFn = async (url, init) => {
     calls.push({
@@ -105,6 +115,10 @@ export function fakeGitlab(): { gitlab: GitLabClient; calls: MrCall[] } {
       headers: init.headers,
       body: init.body,
     });
+    if (init.method === "GET") {
+      const status = opts.headStatus ?? 200;
+      return { status, text: async () => JSON.stringify({ sha: opts.head ?? "" }) };
+    }
     return {
       status: 201,
       text: async () =>
@@ -117,8 +131,9 @@ export function fakeGitlab(): { gitlab: GitLabClient; calls: MrCall[] } {
   return { gitlab: new GitLabClient({ fetchFn }), calls };
 }
 
-/** A Forgejo client whose transport is captured; opens PR #42 with no network. */
-export function fakeForgejo(): { forgejo: ForgejoClient; calls: MrCall[] } {
+/** A Forgejo client whose transport is captured; opens PR #42 with no network. The GET (D5 PR-head
+ *  read) answers `{ head: { sha } }` at `headStatus`. */
+export function fakeForgejo(opts: FakeForgeOpts = {}): { forgejo: ForgejoClient; calls: MrCall[] } {
   const calls: MrCall[] = [];
   const fetchFn: FetchFn = async (url, init) => {
     calls.push({
@@ -127,6 +142,10 @@ export function fakeForgejo(): { forgejo: ForgejoClient; calls: MrCall[] } {
       headers: init.headers,
       body: init.body,
     });
+    if (init.method === "GET") {
+      const status = opts.headStatus ?? 200;
+      return { status, text: async () => JSON.stringify({ head: { sha: opts.head ?? "" } }) };
+    }
     return {
       status: 201,
       text: async () =>
@@ -139,8 +158,9 @@ export function fakeForgejo(): { forgejo: ForgejoClient; calls: MrCall[] } {
   return { forgejo: new ForgejoClient({ fetchFn }), calls };
 }
 
-/** A GitHub client whose transport is captured; opens PR #42 with no network. */
-export function fakeGitHub(): { github: GitHubClient; calls: MrCall[] } {
+/** A GitHub client whose transport is captured; opens PR #42 with no network. The GET (D5 PR-head
+ *  read) answers `{ head: { sha } }` at `headStatus`. */
+export function fakeGitHub(opts: FakeForgeOpts = {}): { github: GitHubClient; calls: MrCall[] } {
   const calls: MrCall[] = [];
   const fetchFn: FetchFn = async (url, init) => {
     calls.push({
@@ -149,6 +169,10 @@ export function fakeGitHub(): { github: GitHubClient; calls: MrCall[] } {
       headers: init.headers,
       body: init.body,
     });
+    if (init.method === "GET") {
+      const status = opts.headStatus ?? 200;
+      return { status, text: async () => JSON.stringify({ head: { sha: opts.head ?? "" } }) };
+    }
     return {
       status: 201,
       text: async () =>
