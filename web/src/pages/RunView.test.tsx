@@ -17,6 +17,7 @@ import {
   JUDGE_POLL_MAX_TRIES,
   MilestoneBadge,
   MilestoneChecklist,
+  CompletionStatePanel,
   RunHeading,
   RunCompletedLine,
   RunFailureReason,
@@ -4780,6 +4781,84 @@ describe("MilestoneChecklist (done / in-progress / left, PRD #122)", () => {
     expect(title).toBeTruthy();
     expect(title.closest("a")).toBeNull();
     expect(container.querySelector("a")).toBeNull();
+  });
+});
+
+describe("CompletionStatePanel — honest completion-interlock detail (PRD #1226 M5, D8)", () => {
+  it("renders unmet ids, the attempt count, and the same-worker-only hold context when blocked", () => {
+    const { container } = render(
+      <CompletionStatePanel
+        run={run({
+          completion_phase: "blocked",
+          completion_unmet: ["m3", "m5"],
+          completion_attempts: 2,
+          hold_reason: "completion_blocked",
+          hold_context: "unavailable(same_worker_only)",
+        })}
+      />,
+    );
+    // The bounded unmet milestone ids.
+    expect(screen.getByText("m3")).toBeTruthy();
+    expect(screen.getByText("m5")).toBeTruthy();
+    // The structural attempt count.
+    expect(screen.getByText("2")).toBeTruthy();
+    // The hold context, verbatim — the durability limitation is VISIBLE.
+    expect(container.textContent).toContain("unavailable(same_worker_only)");
+    // D8: the copy states the hold is same-worker-only and explicitly disclaims
+    // cross-worker durability — it must NOT present the hold as cross-worker durable.
+    expect(container.textContent).toContain("same worker only");
+    expect(container.textContent).toContain("not durable across workers");
+    expect(container.textContent?.toLowerCase()).not.toContain("durable across all workers");
+    expect(container.textContent?.toLowerCase()).not.toContain("cross-worker durable");
+  });
+
+  it("renders while checking (live state) with no hold context box", () => {
+    const { container } = render(
+      <CompletionStatePanel
+        run={run({ completion_phase: "checking", completion_unmet: [], completion_attempts: 1 })}
+      />,
+    );
+    expect(screen.getByText("Completion state")).toBeTruthy();
+    expect(screen.getByText("1")).toBeTruthy();
+    // No hold while merely checking — the same-worker-only note is absent.
+    expect(container.textContent).not.toContain("same worker only");
+  });
+
+  it("sanitizes an unmet id at the render boundary (D8), stripping format characters", () => {
+    // The ids are server-validated milestone keys, but D8 says sanitize at the render
+    // boundary anyway — a bidi/zero-width character in the id must not survive to the DOM.
+    // Built from escapes at runtime (never raw control bytes in source): U+202E RIGHT-TO-
+    // LEFT OVERRIDE and U+200B ZERO WIDTH SPACE.
+    const rlo = "m\u202E7";
+    const zwsp = "m\u200B8";
+    render(
+      <CompletionStatePanel
+        run={run({
+          completion_phase: "reworking",
+          completion_unmet: [rlo, zwsp],
+          completion_attempts: 1,
+        })}
+      />,
+    );
+    // The override/zero-width characters are stripped, leaving the bare id text.
+    expect(screen.getByText("m7")).toBeTruthy();
+    expect(screen.getByText("m8")).toBeTruthy();
+  });
+
+  it("renders NOTHING when completion_phase is '' and hold_reason is null", () => {
+    const { container } = render(
+      <CompletionStatePanel
+        run={run({ completion_phase: "", hold_reason: null, completion_unmet: [], completion_attempts: 0 })}
+      />,
+    );
+    expect(container.textContent).toBe("");
+  });
+
+  it("renders NOTHING for a run that carries none of the completion fields (rollout skew / non-interlocked)", () => {
+    // The default run() builder sets no completion fields — a non-interlocked run (or an
+    // old api pod omitting them) must look exactly as today.
+    const { container } = render(<CompletionStatePanel run={run({})} />);
+    expect(container.textContent).toBe("");
   });
 });
 

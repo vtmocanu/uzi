@@ -350,6 +350,58 @@ export function MilestoneChecklist({ run, activity = null }: { run: Run; activit
   );
 }
 
+// CompletionStatePanel renders the HONEST completion-interlock detail (PRD #1226 M5, D8):
+// the bounded still-unmet milestone ids, the structural attempt count, and the hold
+// context. It renders ONLY these bounded server fields — never raw model output, repo
+// text, credentials or arbitrary logs — and sanitizes each untrusted id/string through
+// stripUnsafeChars at the render boundary (D8: the unmet ids are server-validated milestone
+// keys, but sanitized like milestone titles here, and hold_context is a fixed server
+// constant that is still scrubbed on the way to the DOM). The completion PHASE itself is
+// rendered by the run-header StatusPill via effectiveRunStatus (do NOT re-derive it); this
+// panel is the complementary detail. Shown when the run is in a live completion state
+// (completion_phase non-empty) OR parked in a completion hold (hold_reason set), and renders
+// nothing otherwise — so a non-interlocked run (legacy, or the rollout OFF) looks as today.
+//
+// D8 durability honesty: hold_context is the constant "unavailable(same_worker_only)", and
+// the copy states the hold is available on the same worker only — it must NOT claim the
+// completion hold is durable across workers.
+export function CompletionStatePanel({ run }: { run: Run }) {
+  const phase = run.completion_phase ?? "";
+  const held = run.hold_reason != null;
+  if (phase === "" && !held) return null;
+  const unmet = run.completion_unmet ?? [];
+  const attempts = run.completion_attempts ?? 0;
+  return (
+    <Card className="p-4">
+      <h2 className="text-sm font-semibold text-fg">Completion state</h2>
+      <p className="mt-1 text-xs text-muted">
+        Structural completion attempts:{" "}
+        <span className="font-mono tabular-nums text-fg">{attempts}</span>
+      </p>
+      {unmet.length > 0 && (
+        <div className="mt-3">
+          <h3 className="text-xs font-medium text-muted">Unmet milestones</h3>
+          <ul className="mt-1.5 space-y-1">
+            {unmet.map((id) => (
+              <li key={id} className="font-mono text-sm text-fg">
+                {stripUnsafeChars(id)}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {run.hold_context && (
+        <p className="mt-3 rounded border border-warn/40 bg-warn/10 p-2 text-xs text-warn">
+          Hold context:{" "}
+          <span className="font-mono">{stripUnsafeChars(run.hold_context)}</span>. This
+          completion hold is available on the same worker only — it is not durable across
+          workers.
+        </p>
+      )}
+    </Card>
+  );
+}
+
 // PRD #362 M4: one delta's kind → its badge tone, glyph and label. added is a green +,
 // changed a blue ~, dropped a red − — so the three read apart by shape AND colour, not
 // colour alone (Decision 6 wants them "visually distinct"). An unexpected kind (the server
@@ -1944,6 +1996,12 @@ export function RunView() {
           frozen list + the reported-complete/in-progress id sets. Renders nothing for a
           run with no milestones. */}
       <MilestoneChecklist run={run} activity={activity} />
+
+      {/* PRD #1226 M5 (D8): the honest completion-interlock detail — the bounded unmet
+          milestone ids, the structural attempt count, and the same-worker-only hold
+          context. Renders nothing for a non-interlocked run (completion_phase "" and no
+          hold), so a run that predates or opts out of the interlock looks as today. */}
+      <CompletionStatePanel run={run} />
 
       {(usage.hasLiveTokens || usage.hasConfirmed) && (
         <Card className="p-4">
