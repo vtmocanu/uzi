@@ -235,6 +235,33 @@ func TestCreateExtendInputSuccessLiveDB(t *testing.T) {
 	}
 }
 
+// TestCreateExtendInputQueuedRunLiveDB pins PRD #1189 D4 at the SQL level: the CTE admits a
+// parked (queued) run, since its predicate excludes only completed/failed/cancelled — not a
+// queued/running distinction. This is the live-DB counterpart to the Go-guard unit test; a
+// future tightening of the CTE predicate to status='running' would break parked-run extend and
+// reddens HERE (the in-memory fake cannot model the SQL predicate).
+func TestCreateExtendInputQueuedRunLiveDB(t *testing.T) {
+	ctx, pool, q := extendSteeringDB(t)
+	userID, repoID := extendSeedRepo(ctx, t, pool)
+	runID := extendSeedIssueRun(ctx, t, pool, userID, repoID, "queued", 8*60*60, 0, 0, time.Now())
+
+	total, err := q.CreateExtendInput(ctx, store.CreateExtendInputParams{
+		ID: runID, Secs: 3600, Cap: 57600, Body: extendBody("extend +1h → total extension 1h of 16h"),
+	})
+	if err != nil {
+		t.Fatalf("CreateExtendInput on a queued (parked) run must succeed (D4), got: %v", err)
+	}
+	if total != 3600 {
+		t.Fatalf("returned new total = %d, want 3600", total)
+	}
+	if got := extendColumn(ctx, t, pool, runID); got != 3600 {
+		t.Fatalf("budget_extension_seconds = %d, want 3600 on the parked run", got)
+	}
+	if n := len(extendAuditRows(ctx, t, pool, runID)); n != 1 {
+		t.Fatalf("extend audit rows = %d, want exactly 1 for the parked-run extend", n)
+	}
+}
+
 // TestCreateExtendInputRefusalsLiveDB pins that every guard failure returns pgx.ErrNoRows,
 // leaves the column UNCHANGED, and writes NO audit row (the INSERT selects from the empty CTE).
 // The five refusal shapes: over-cap, terminal, chat, judge, and interactive task.

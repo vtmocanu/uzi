@@ -59,11 +59,12 @@ func TestSubmitInputExtendAcceptsMinimum(t *testing.T) {
 
 // TestSubmitInputExtendQueuedRunSucceeds pins PRD #1189 D4: extend is allowed on any
 // non-terminal timed run, INCLUDING a parked (queued) one, so an owner can grant time the run
-// will need the moment it resumes. Both gates admit 'queued' — the Go terminal guard
-// (terminalStatuses = completed/failed/cancelled) and the CTE predicate (status NOT IN those
-// three) — and a future tightening of either to status='running' would silently break D4,
-// which this test would catch. A queued run has no wall deadline yet (runWallClock requires
-// 'running'), so DeadlineAt is nil while the extension is still written and returned.
+// will need the moment it resumes. This test pins the GO half — the terminalStatuses guard
+// (completed/failed/cancelled) admits 'queued', so the extend branch runs and returns the
+// extension. The fake CreateExtendInput bypasses the SQL, so the CTE predicate's own admission
+// of 'queued' is pinned separately by TestCreateExtendInputQueuedRunLiveDB (store). A queued
+// run has no wall deadline yet (runWallClock requires 'running'), so DeadlineAt is nil while
+// the extension is still written and returned.
 func TestSubmitInputExtendQueuedRunSucceeds(t *testing.T) {
 	fs, svc, user, runID := extendRunFixture(t, 57600)
 	fs.runByID.Status = "queued" // a parked run (started earlier, requeued); StartedAt stays set
