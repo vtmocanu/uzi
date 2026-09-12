@@ -491,7 +491,7 @@ jobs:
           # an unrelated PR, the drift lint:shell pins shellcheck against. No sha to
           # maintain (pip verifies from PyPI), so Renovate bumps this fully automatically.
           # renovate: datasource=pypi depName=zizmor versioning=pep440
-          pipx install zizmor==1.29.0
+          pipx install zizmor==1.30.0
       - name: Install semgrep (pinned; matches the baked worker toolchain)
         # semgrep is a PyPI-packaged tool, so pipx mirrors the yamllint/zizmor
         # installs above. Pinned to the SAME version baked into the worker toolchain
