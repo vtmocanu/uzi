@@ -528,6 +528,25 @@ describe("AdminSettings", () => {
     expect(btn.disabled).toBe(true);
   });
 
+  it("accepts EXACTLY 3600 for the extension allowance (lower-bound fencepost, PRD #1189)", async () => {
+    // 3600 is the inclusive floor: the client validator's own boundary is `n < 3600` reject.
+    // Paired with the 3599-reject test above this pins the fencepost at the UI layer — a
+    // `<`→`<=` flip (or a floor bump to 3601) would reject 3600 and redden this.
+    mockApi.updateSettings.mockResolvedValue(response({ run_extension_cap_seconds: "3600" }));
+    renderPage();
+    const cap = (await screen.findByLabelText(/Extension allowance per run/i)) as HTMLInputElement;
+    fireEvent.change(cap, { target: { value: "3600" } });
+
+    // No validation error, and Save is enabled.
+    expect(screen.queryByText(/between 3600 and 604800 seconds/i)).toBeNull();
+    const btn = screen.getByRole("button", { name: /save run health/i }) as HTMLButtonElement;
+    expect(btn.disabled).toBe(false);
+    fireEvent.click(btn);
+    await waitFor(() =>
+      expect(mockApi.updateSettings).toHaveBeenCalledWith({ run_extension_cap_seconds: "3600" }),
+    );
+  });
+
   it("accepts 0 to turn extending off, and saves it (PRD #1189)", async () => {
     mockApi.updateSettings.mockResolvedValue(response({ run_extension_cap_seconds: "0" }));
     renderPage();

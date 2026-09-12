@@ -78,6 +78,40 @@ describe("ExtendTimePopover (PRD #1189)", () => {
     expect(onSubmit).not.toHaveBeenCalled();
   });
 
+  it("keeps Confirm ENABLED at exactly the remaining allowance and DISABLES just over it (strict >)", () => {
+    const onSubmit = vi.fn();
+    // 16h cap, 14h already granted → EXACTLY 2h of allowance remains, so the +2h default sits
+    // right on the line. The disable is `effective > allowanceLeft` (strict), so a pick equal to
+    // the allowance must stay enabled; a `>`→`>=` flip would redden the first assertion.
+    render(
+      <ExtendTimePopover
+        run={runningRun({ budget_extension_seconds: 50400, budget_total_seconds: 28800 + 50400 })}
+        busy={false}
+        onSubmit={onSubmit}
+      />,
+    );
+    const panel = open();
+    const atEdge = within(panel).getByRole("button", { name: /Extend by 2h$/ }) as HTMLButtonElement;
+    expect(atEdge.disabled).toBe(false);
+    // One minute over the 2h allowance → now disabled.
+    fireEvent.change(within(panel).getByPlaceholderText(/custom/i), { target: { value: "2h1m" } });
+    const over = within(panel).getByRole("button", { name: /Extend by 2h 1m/ }) as HTMLButtonElement;
+    expect(over.disabled).toBe(true);
+  });
+
+  it("moves focus into the panel on open and returns it to the trigger on Escape", () => {
+    render(<ExtendTimePopover run={runningRun()} busy={false} onSubmit={vi.fn()} />);
+    const trigger = screen.getByRole("button", { name: /extend time/i });
+    fireEvent.click(trigger);
+    const panel = screen.getByRole("dialog", { name: /extend this run/i });
+    // Focus moves INTO the panel on open (not left on the trigger, not dropped to <body>).
+    expect(document.activeElement).toBe(panel);
+    fireEvent.keyDown(document, { key: "Escape" });
+    // Escape closes it AND returns focus to the trigger.
+    expect(screen.queryByRole("dialog", { name: /extend this run/i })).toBeNull();
+    expect(document.activeElement).toBe(trigger);
+  });
+
   it("says extensions are turned off when the cap is 0, and offers no Confirm", () => {
     const onSubmit = vi.fn();
     render(

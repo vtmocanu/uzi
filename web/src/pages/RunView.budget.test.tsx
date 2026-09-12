@@ -205,6 +205,28 @@ describe("RunView — conditional Extend action (PRD #1189)", () => {
   });
 });
 
+// The Extend header action AND the near-timeout panel are BOTH gated on
+// `shouldShowHealthFlag(...) && run.health === "slow"`. The other flaggable health values
+// (stalled/looping/waiting_worker/approval_idle) render a warn chip but must NOT surface
+// Extend or the near-timeout panel — that is a near-TIMEOUT affordance, not a general
+// unhealthy-run one. Folding away the `=== "slow"` conjunct leaves the happy-path tests green,
+// so these pin it: each redden if the conjunct is dropped from either gate.
+describe("RunView — Extend/near-timeout are gated to `slow`, not any flag (PRD #1189)", () => {
+  const flaggableNonSlow = ["stalled", "looping", "waiting_worker", "approval_idle"] as const;
+
+  it.each(flaggableNonSlow)(
+    "renders NO Extend button and NO near-timeout panel for health=%s",
+    async (health) => {
+      renderPage(budgeted({ health, health_since: "2026-01-01T00:00:00Z" }), true);
+      await screen.findByText("Add rate limiting");
+      // The flag chip itself still shows (it is flaggable) — but neither near-timeout surface.
+      expect(screen.queryByRole("button", { name: /extend time/i })).toBeNull();
+      expect(screen.queryByText(/close to its time limit/i)).toBeNull();
+      expect(screen.queryByText(/unless you extend it/i)).toBeNull();
+    },
+  );
+});
+
 describe("NearTimeoutPanel (PRD #1189)", () => {
   const slow = run(budgeted({ health: "slow", health_since: "2026-01-01T00:00:00Z" }));
 

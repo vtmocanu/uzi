@@ -135,13 +135,22 @@ function RunBudgetElapsed({ run }: { run: Run }) {
   const tip =
     `Budget ${budgetRightLabel(view)}. Paused time does not count.` +
     (deadline ? ` Times out ${deadline}.` : "");
+  // A `title` on a focusable generic element becomes its accessible NAME, which would announce
+  // the budget/deadline but SWALLOW the visible "used" figure. An explicit aria-label restores
+  // it: the used value alongside the budget and the deadline, so a screen-reader user hears the
+  // same three facts a sighted one reads.
+  const label =
+    `Used ${formatBudgetDuration(view.usedSec)} of ${budgetRightLabel(view)} budget.` +
+    (deadline ? ` Times out ${deadline}.` : "") +
+    " Paused time does not count.";
   return (
     <span
       tabIndex={0}
       title={tip}
-      className="cursor-help text-xs tabular-nums text-faint underline decoration-dotted decoration-faint underline-offset-2 focus:outline-none focus-visible:text-fg"
+      aria-label={label}
+      className="cursor-help text-xs tabular-nums text-faint underline decoration-dotted decoration-faint underline-offset-2 outline-hidden focus-visible:text-fg focus-visible:outline-2 focus-visible:outline-brand focus-visible:outline-offset-2"
     >
-      {formatBudgetDuration(view.usedSec)} <span className="text-faint/80">/ {budgetRightLabel(view)}</span>
+      {formatBudgetDuration(view.usedSec)} <span className="text-faint">/ {budgetRightLabel(view)}</span>
     </span>
   );
 }
@@ -163,7 +172,7 @@ function PausedElapsed({ run }: { run: Run }) {
   return (
     <span className="text-xs tabular-nums text-faint">
       {formatBudgetDuration(view.usedSec)}{" "}
-      <span className="text-faint/80">
+      <span className="text-faint">
         / {budgetRightLabel(view)} · {formatBudgetDuration(view.remainingSec)} left when resumed · clock stopped
       </span>
     </span>

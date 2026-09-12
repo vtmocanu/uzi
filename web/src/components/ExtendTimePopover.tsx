@@ -50,7 +50,13 @@ export function ExtendTimePopover({
   const [picked, setPicked] = useState<number>(DEFAULT_PICK);
   const [custom, setCustom] = useState("");
   const hostRef = useRef<HTMLDivElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
   const panelId = useId();
+  // How far to nudge the panel horizontally so it never renders off-screen. The panel is
+  // anchored `right-0`, so on a narrow (mobile) viewport its left edge — the +1h quick-pick and
+  // the left labels — can fall past the LEFT viewport edge when the trigger is not hard against
+  // the right. This shift, measured once the panel is laid out, pushes it back on-screen.
+  const [shiftPx, setShiftPx] = useState(0);
 
   // Tick only while open, and slowly (5s): the facts drift with the deadline countdown but a
   // per-second tick on a small chooser is waste, and the numbers are glance values.
@@ -58,13 +64,27 @@ export function ExtendTimePopover({
 
   // Escape closes it, and an outside click closes it — both attached only while open, so a shut
   // popover costs nothing (there can be several on the page).
+  //
+  // Focus management (a11y, role="dialog"): moving focus INTO the panel on open means a
+  // keyboard/AT user lands inside the chooser, and RETURNING focus to the trigger on close
+  // (Escape or click-away) keeps them where they were instead of dropping onto <body>.
   useEffect(() => {
     if (!open) return;
+    const focusTrigger = () =>
+      hostRef.current?.querySelector<HTMLButtonElement>(":scope > button")?.focus();
+    // Move focus into the panel itself (tabIndex=-1) so the first Tab lands on a control inside.
+    panelRef.current?.focus();
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setOpen(false);
+      if (e.key === "Escape") {
+        setOpen(false);
+        focusTrigger();
+      }
     };
     const onDown = (e: MouseEvent) => {
-      if (hostRef.current && !hostRef.current.contains(e.target as Node)) setOpen(false);
+      if (hostRef.current && !hostRef.current.contains(e.target as Node)) {
+        setOpen(false);
+        focusTrigger();
+      }
     };
     document.addEventListener("keydown", onKey);
     document.addEventListener("mousedown", onDown);
@@ -72,6 +92,35 @@ export function ExtendTimePopover({
       document.removeEventListener("keydown", onKey);
       document.removeEventListener("mousedown", onDown);
     };
+  }, [open]);
+
+  // Keep the panel inside the viewport at mobile width. Measured from the host's right edge and
+  // the panel's laid-out width (both independent of any shift already applied, so this is
+  // idempotent across re-measures), then re-run on resize. In a no-layout environment (jsdom in
+  // tests) clientWidth is 0, so we skip and apply no transform.
+  useEffect(() => {
+    if (!open) {
+      setShiftPx(0);
+      return;
+    }
+    const clamp = () => {
+      const host = hostRef.current;
+      const panel = panelRef.current;
+      if (!host || !panel) return;
+      const vw = document.documentElement.clientWidth;
+      if (!vw) return;
+      const margin = 8;
+      const width = panel.offsetWidth;
+      const hostRight = host.getBoundingClientRect().right;
+      const naturalLeft = hostRight - width; // right-0 anchors the panel to the host's right edge
+      let shift = 0;
+      if (naturalLeft < margin) shift = margin - naturalLeft; // off the LEFT edge → push right
+      else if (hostRight > vw - margin) shift = vw - margin - hostRight; // off the right → pull left
+      setShiftPx(shift);
+    };
+    clamp();
+    window.addEventListener("resize", clamp);
+    return () => window.removeEventListener("resize", clamp);
   }, [open]);
 
   const view = extendBudgetView(run, now);
@@ -125,9 +174,12 @@ export function ExtendTimePopover({
       {open && (
         <div
           id={panelId}
+          ref={panelRef}
           role="dialog"
           aria-label="Extend this run"
-          className="absolute right-0 top-full z-20 mt-2 w-72 rounded-xl border border-edge bg-raised p-3 text-left shadow-2xl"
+          tabIndex={-1}
+          style={shiftPx ? { transform: `translateX(${shiftPx}px)` } : undefined}
+          className="absolute right-0 top-full z-20 mt-2 w-72 max-w-[calc(100vw-1rem)] rounded-xl border border-edge bg-raised p-3 text-left shadow-2xl outline-hidden"
         >
           <p className="text-sm font-semibold text-fg">Extend time</p>
           {capDisabled || !view ? (
