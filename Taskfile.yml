@@ -2174,14 +2174,33 @@ tasks:
     # target). The individual unit files still run in node's DEFAULT PARALLEL mode.
     dir: agent
     cmds:
-      # Includes the e2e/codex-m3b Block-A lifecycle proof (host-side, injected fakes, no
-      # Docker): its canary-absence security assertions run IN this gate; Block B (the real
-      # image path) self-skips unless CODEX_M3B_PACKAGED=1 (set only by run-lifecycle.sh).
-      - node --import tsx --test --test-timeout=120000 test/codex-registry.test.ts test/codex-safety.test.ts test/codex-transport.test.ts test/runner-uid.test.ts test/codex-broker.test.ts test/codex-render.test.ts test/codex-harness.test.ts test/codex-advice-harness.test.ts test/codex-select.test.ts test/codex-session-state.test.ts test/codex-config.test.ts test/codex-launcher.test.ts test/codex-terminal-normalize.test.ts test/codex-delegation.test.ts test/codex-fileop-client.test.ts test/codex-run-builder.test.ts test/codex-render-mutation.test.ts test/codex-executor.test.ts test/codex-command-root-linux.test.ts test/runner-codex-sinks.test.ts ../e2e/codex-m3b/lifecycle.test.ts
+      # The agent-side Codex adapter UNIT/state bundle (default node parallel mode).
+      - node --import tsx --test --test-timeout=120000 test/codex-registry.test.ts test/codex-safety.test.ts test/codex-transport.test.ts test/runner-uid.test.ts test/codex-broker.test.ts test/codex-render.test.ts test/codex-harness.test.ts test/codex-advice-harness.test.ts test/codex-select.test.ts test/codex-session-state.test.ts test/codex-config.test.ts test/codex-launcher.test.ts test/codex-terminal-normalize.test.ts test/codex-delegation.test.ts test/codex-fileop-client.test.ts test/codex-run-builder.test.ts test/codex-render-mutation.test.ts test/codex-executor.test.ts test/codex-command-root-linux.test.ts test/runner-codex-sinks.test.ts
+      # The Block-A host-side lifecycle proof, FACTORED into test:codex-m3b:host (PRD #1287 C4 §4)
+      # so C4's gate can invoke that host-only target directly without rerunning this whole
+      # aggregate. Its canary-absence security assertions run IN this gate; Block B (the real image
+      # path) self-skips unless CODEX_M3B_PACKAGED=1 (set only by run-lifecycle.sh). The aggregate's
+      # coverage is unchanged in sum: the same lifecycle.test.ts cases, now via the delegate.
+      - task: test:codex-m3b:host
       # The both-image packaged proof. Its host tsc leg ALWAYS runs (cheap, host-only);
       # its docker leg is OPT-IN (UZI_CODEX_M3B_PACKAGED=1) so this aggregate stays green
       # in an environment without a docker daemon / with storage-flaky image builds.
       - task: test:codex-m3b:packaged
+
+  test:codex-m3b:host:
+    desc: PRD 1287 C4 - the Block-A host-side Codex lifecycle proof ONLY (injected fakes, no Docker)
+    # The Block-A host-side lifecycle proof factored out of test:codex-m3b's inline bundle (PRD
+    # #1287 C4 §4) so C4's gate can invoke JUST this host-only target instead of rerunning the
+    # whole m3b aggregate (whose agent unit files gate:agent already covers). This runs ONLY
+    # e2e/codex-m3b/lifecycle.test.ts: the host-side Block A (injected fakes, no Docker) whose
+    # credential/capability canary-absence security assertions execute in-process. Block B (the
+    # real packaged image path) SELF-SKIPS unless CODEX_M3B_PACKAGED=1 (set only by
+    # run-lifecycle.sh), so it never builds an image or needs a docker daemon here. Runs from
+    # `dir: agent` so tsx + the SDK deps resolve out of agent/node_modules, matching test:codex-m3b.
+    # Do NOT copy the Block-A recipe elsewhere: test:codex-m3b delegates to THIS target.
+    dir: agent
+    cmds:
+      - node --import tsx --test --test-timeout=120000 ../e2e/codex-m3b/lifecycle.test.ts
 
   test:codex-m3b:packaged:
     desc: Opt-in both-image packaged proof of the DARK CodexExecutor lifecycle (PRD 1171 m5)

@@ -26,6 +26,19 @@ import {
   CODEX_U_SIGNAL_REPLAY_TITLE,
   CODEX_U_TRUST_CONSTRUCTION_TITLE,
 } from "./titles-c3.js";
+import {
+  CODEX_U_LIFECYCLE_SYNC_CHILD_TITLE,
+  CODEX_U_LIFECYCLE_HELD_CALLBACK_TITLE,
+  CODEX_U_LIFECYCLE_LATE_CALLBACK_TITLE,
+  CODEX_U_LIFECYCLE_ROOT_ORDERING_TITLE,
+  CODEX_U_LIFECYCLE_TIMEOUT_UNCONFIRMED_TITLE,
+  CODEX_U_ADVICE_CEILING_TITLE,
+  CODEX_U_ADVICE_DISPOSE_RACE_TITLE,
+  CODEX_U_ADVICE_APIKEY_ZERO_REFRESH_TITLE,
+  CODEX_U_ADVICE_APIKEY_NO_FALLBACK_TITLE,
+  CODEX_U_FAILURE_HOOKS_DISABLED_TITLE,
+  CODEX_U_FAILURE_BROKER_CLOSURE_TITLE,
+} from "./titles-c4.js";
 
 export const CODEX_CLAUSES: ClauseRow[] = [
   {
@@ -71,9 +84,14 @@ export const CODEX_CLAUSES: ClauseRow[] = [
       imageDigest: "sha256:PENDING-CANDIDATE-DIGEST",
       target: "codex worker image (base + jvm)",
       unchangedJustification:
-        "C1 changes no agent/codex/** supervisor/fileop/launcher code, so the command-root "
-        + "HOME/credential separation mechanism is byte-identical to the M3b-proven images; "
-        + "the digest is refreshed to the merge candidate before parent M4 acceptance (D8).",
+        "C1-C4 change no agent/codex/** supervisor/fileop/launcher code — the C3 D6 repair is a "
+        + "POLICY-ONLY extra-secret-path addition (agent/src/codex/codex-executor.ts screenPolicy) "
+        + "and C4 adds only tests, so per D8 neither invalidates the unchanged OS mechanism: the "
+        + "command-root HOME/credential separation is byte-identical to the M3b-proven images. Its "
+        + "required regression is the C3 U/P HOME-screener case (codex-u-home-screening-executor-d6) "
+        + "plus the M3b host-side Block A evidence, now run via `task test:codex-m3b:host` (C4 §4). "
+        + "The digest stays the PENDING placeholder; the maintainer pins the real merge-candidate "
+        + "digest and re-runs UZI_CODEX_M3B_PACKAGED=1 test:codex-m3b:packaged before parent M4 (D8).",
     },
   },
   {
@@ -329,5 +347,263 @@ export const CODEX_CLAUSES: ClauseRow[] = [
       + "reasserts environments:[]; no repo trust surface rides any construction request",
     intendedOutcome: "untrusted repo content cannot install instructions, callbacks or execution authority at start, resume or a subsequent turn",
     tests: [CODEX_U_TRUST_CONSTRUCTION_TITLE],
+  },
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // C4 REAL rows (PRD #1287). All layer U: the REAL ExecutionRegistry + CodexExecutionSafety
+  // facade, the REAL CodexAdviceHarness (render ceiling + disposeOnce + appserver-auth), and the
+  // REAL broker/config builders — driven with injected fakes (D5: reuse the M3 primitives, not a
+  // replacement broker). Each pairs a positive control with a negative-effect oracle (sink-called
+  // counter / spawn counter / registry terminal / sticky poison / dispose-count / deny code),
+  // never denial text alone (D4). Distinct-angle additions to the agent/test unit corpus, not
+  // copies. C5 tightens the required matrix to also enforce these codex/U rows.
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  // ── Delegation and cleanup (lifecycle) ──
+  {
+    id: "codex-u-lifecycle-synchronous-child",
+    adapter: "codex",
+    layer: "U",
+    family: "Delegation and cleanup",
+    seam: "codex/registry.ts:reserveCallback/settleCallback + codex/safety.ts:withBoundary (quiesce)",
+    positiveControl:
+      "once the delegated child callback settles, the parent's real durability boundary quiesces "
+      + "and runs its sink exactly once (sink-called counter === 1)",
+    negativeOracle:
+      "with the child callback still in flight, withBoundary throws CodexBoundaryError(quiesce), "
+      + "the parent result sink stays UNCALLED (counter 0) and the epoch is poisoned — the parent "
+      + "cannot outrun the child",
+    intendedOutcome:
+      "a parent result/durability outcome cannot settle before a delegated child callback settles",
+    tests: [CODEX_U_LIFECYCLE_SYNC_CHILD_TITLE],
+  },
+  {
+    id: "codex-u-lifecycle-held-callback-drain",
+    adapter: "codex",
+    layer: "U",
+    family: "Delegation and cleanup",
+    seam: "codex/registry.ts:quiesceChildren (bounded settlement wait) via codex/safety.ts:withBoundary",
+    positiveControl:
+      "a held callback drained (settled) mid-wait lets the bounded quiesce complete clean and the "
+      + "protected sink runs once; the epoch is not poisoned",
+    negativeOracle:
+      "while the callback is held the boundary quiesce stays PENDING and the protected sink stays "
+      + "UNCALLED; a never-drained hold poisons at the deadline with the sink still uncalled",
+    intendedOutcome:
+      "a held/revoked callback reservation blocks quiesce (incomplete) until it settles; a protected "
+      + "sink stays uncalled while the callback is unconfirmed",
+    tests: [CODEX_U_LIFECYCLE_HELD_CALLBACK_TITLE],
+  },
+  {
+    id: "codex-u-lifecycle-late-callback",
+    adapter: "codex",
+    layer: "U",
+    family: "Delegation and cleanup",
+    seam: "codex/broker.ts:handleToolCall (cached terminal / admission_closed) over a closed codex/registry.ts epoch",
+    positiveControl:
+      "the original callback runs its command effect exactly once (spawn counter === 1) before the "
+      + "parent turn quiesces to closed",
+    negativeOracle:
+      "after completion, a replay of the same identity+payload returns the cached terminal (output "
+      + "{replay:true}) with NO second command spawn, and a NEW callback is denied admission_closed "
+      + "with the spawn counter unchanged — no second effect, no reducer transition",
+    intendedOutcome:
+      "a callback arriving after the parent completed is refused (cached terminal / admission closed) "
+      + "with no second effect",
+    tests: [CODEX_U_LIFECYCLE_LATE_CALLBACK_TITLE],
+  },
+  {
+    id: "codex-u-lifecycle-root-ordering",
+    adapter: "codex",
+    layer: "U",
+    family: "Delegation and cleanup",
+    seam: "codex/safety.ts:spawnBoundaryAction [R3-2] guard (hasLiveCommandRoot) + codex/registry.ts:reapRoot",
+    positiveControl:
+      "with a provider root and TWO command roots present, the worker_pat git action settles and its "
+      + "spawn seam fires exactly once — but ONLY after every command root reaps (lastIdentity worker_pat)",
+    negativeOracle:
+      "the worker_pat action is refused command_roots_live while ANY command root is still live "
+      + "(refused after reaping only one of two), and the boundary-action spawn seam stays at zero "
+      + "calls the whole time it is refused",
+    intendedOutcome:
+      "a worker_pat boundary action is refused while any command root is live and permitted only once "
+      + "EVERY command root reaps, so a model-authorized command process can never read the PAT",
+    // No `prerequisites`: this U row proves the registry/safety reap CONTRACT with injected fake
+    // roots on its own. The OS-level whole-root reaping it mirrors is the SEPARATE owed O row
+    // (codex-o-packaged-descendant-reaping); coupling a U row to an `owed` O prereq would (once C5
+    // makes codex/U required) read as an unmet prerequisite and wrongly deadlock the worker gate.
+    tests: [CODEX_U_LIFECYCLE_ROOT_ORDERING_TITLE],
+  },
+  {
+    id: "codex-u-lifecycle-timeout-unconfirmed",
+    adapter: "codex",
+    layer: "U",
+    family: "Delegation and cleanup",
+    seam: "codex/safety.ts:withBoundary (deadline poison) + codex/registry.ts sticky poison",
+    positiveControl:
+      "a clean boundary on a fresh registry reaches its durability sink (counter 1), proving the sink "
+      + "is reachable",
+    negativeOracle:
+      "a boundary whose quiesce settles only after the deadline poisons and leaves the durability sink "
+      + "UNCALLED (counter 0); the poison is STICKY so a later clean-seam boundary still fails at quiesce "
+      + "and the sink stays uncalled — an unconfirmed boundary permanently blocks the protected outcome",
+    intendedOutcome:
+      "a timed-out / deadline-aborted boundary leaves the sink uncalled and its unconfirmed (poisoned) "
+      + "state prevents protected durability outcomes thereafter",
+    tests: [CODEX_U_LIFECYCLE_TIMEOUT_UNCONFIRMED_TITLE],
+  },
+
+  // ── Advice ceiling ──
+  {
+    id: "codex-u-advice-ceiling",
+    adapter: "codex",
+    layer: "U",
+    family: "Advice ceiling",
+    seam: "codex/render.ts:renderCodexAdvice (runtime ceiling) + codex/codex-advice-harness.ts:CodexAdviceHarness options",
+    positiveControl:
+      "a clean advice pass (no run-tool keys) returns its accumulated text and disposes the isolated "
+      + "HOME once — the ceiling does not break legitimate advice",
+    negativeOracle:
+      "renderCodexAdvice THROWS for a request carrying tools/toolServers/cwd, the harness rejects a "
+      + "cwd-carrying request and launches NOTHING (launchSpecs 0, so no isolated root and hence no "
+      + "shell/file/network/delegation/credential surface), and the options type exposes no handler "
+      + "registry / registry / run workspace / cwd / delegate (compile-time)",
+    intendedOutcome:
+      "forbidden advice effects never occur: the advice lane offers no shell/files/network/delegation/"
+      + "run-worker-signal/credential surface, enforced at render runtime and by construction",
+    tests: [CODEX_U_ADVICE_CEILING_TITLE],
+  },
+  {
+    id: "codex-u-advice-dispose-race",
+    adapter: "codex",
+    layer: "U",
+    family: "Advice ceiling",
+    seam: "codex/codex-advice-harness.ts:disposeOnce (finally + late-work owners)",
+    positiveControl: "a clean advice pass disposes the isolated HOME exactly once (dispose-count === 1)",
+    negativeOracle:
+      "an external abort fired WHILE the disposer is already in flight does NOT cause a second "
+      + "disposal — dispose-count stays === 1 (never 2, never 0) and the primary result still stands",
+    intendedOutcome:
+      "the returned promise respects required cleanup: disposeOnce runs EXACTLY once even when abort "
+      + "races an in-flight disposal",
+    tests: [CODEX_U_ADVICE_DISPOSE_RACE_TITLE],
+  },
+  {
+    id: "codex-u-advice-apikey-zero-refresh",
+    adapter: "codex",
+    layer: "U",
+    family: "Advice ceiling",
+    seam: "codex/appserver-auth.ts:createCodexAppServerAuth(api_key) via codex/codex-advice-harness.ts:run",
+    positiveControl:
+      "the refresh seam is detectable: a SUBSCRIPTION advice pass whose stream carries a refresh "
+      + "request calls the bridge exactly once and delivers a token",
+    negativeOracle:
+      "a clean api_key advice pass performs ZERO refresh — the wire is exactly "
+      + "[initialize, account/login/start, thread/start, turn/start] with login type apiKey, no "
+      + "account/chatgptAuthTokens/refresh request, and zero refresh responses — while its accumulated "
+      + "text and turn-basis usage are preserved",
+    intendedOutcome:
+      "an api_key advice run assembles a synthetic credential at runtime, performs no credential "
+      + "refresh and no subscription fallback, and preserves the existing control's semantics",
+    tests: [CODEX_U_ADVICE_APIKEY_ZERO_REFRESH_TITLE],
+  },
+  {
+    id: "codex-u-advice-apikey-no-fallback",
+    adapter: "codex",
+    layer: "U",
+    family: "Advice ceiling",
+    seam: "codex/appserver-auth.ts refresh pump (api_key branch) via codex/codex-advice-harness.ts:run",
+    positiveControl:
+      "the api_key session authenticates (initialize + login) first, so the refusal below is a real "
+      + "deny rather than a broken setup",
+    negativeOracle:
+      "a subscription-refresh server request during an api_key advice pass is refused fail-closed: the "
+      + "response is an ERROR (no result), NO access token is minted anywhere, the run fails closed, and "
+      + "the isolated HOME is still disposed once",
+    intendedOutcome:
+      "the api_key advice lane never falls back to re-presenting the api key as a refreshed credential; "
+      + "an unsupported refresh fails closed with no credential effect",
+    tests: [CODEX_U_ADVICE_APIKEY_NO_FALLBACK_TITLE],
+  },
+
+  // ── Failure closure ──
+  {
+    id: "codex-u-failure-hooks-disabled",
+    adapter: "codex",
+    layer: "U",
+    family: "Failure closure",
+    seam: "codex/config.ts:buildCodexProductionConfigToml + buildCodexLoopbackTestConfigToml (native-disabled template)",
+    positiveControl:
+      "the builders emit their intended authenticated surface — production keeps the built-in openai "
+      + "provider (no override block) and the loopback builder wires an authenticated fake provider "
+      + "(requires_openai_auth=true) — so the disabled hooks are a real deny inside a working config",
+    negativeOracle:
+      "every builder (prod api_key, prod subscription, loopback) pins hooks=false with NO hooks=true, "
+      + "NO bypass_hook_trust / dangerously-bypass-hook-trust, every native execution feature "
+      + "(shell_tool/unified_exec/code_mode*/apply_patch_freeform/multi_agent*/plugins/apps/remote_models) "
+      + "off, project_doc_max_bytes=0 and trust_level=untrusted; a non-loopback provider URL is rejected. "
+      + "The upstream hook serialization/spawn/timeout/malformed-output CHARACTERIZATION is the M0 "
+      + "test-only process (e2e/codex-m0/hooks-stdin.test.mjs, harness-errors.test.mjs) — referenced "
+      + "(its files exist), NOT re-run in this gate; production hooks being off is the production-side proof",
+    intendedOutcome:
+      "an upstream hook serialization/spawn/timeout/malformed-output failure can NEVER become production "
+      + "permission, because production Codex hooks (and every native feature) are disabled",
+    tests: [CODEX_U_FAILURE_HOOKS_DISABLED_TITLE],
+  },
+  {
+    id: "codex-u-failure-broker-closure",
+    adapter: "codex",
+    layer: "U",
+    family: "Failure closure",
+    seam: "codex/broker.ts:dispatchMcp (handler_error/denied_tool) + handleToolCall try/catch (broker_error) over the real registry",
+    positiveControl:
+      "the SAME handler path returns success when the worker-tool handler behaves — the fail-closed "
+      + "denies are real refusals, not a broken fixture",
+    negativeOracle:
+      "a THROWING worker-tool handler denies handler_error, an UNWIRED granted handler denies "
+      + "denied_tool, and a REJECTING command spawn (callback/transport failure) denies broker_error — "
+      + "each with the command-spawn and fileop counters at 0 and NO fabricated success (the callback "
+      + "settled ERROR, so a replay returns replayed_error); an honest failure is a bounded deny, not a poison",
+    intendedOutcome:
+      "a throwing/malformed worker policy/handler or a callback/transport failure cannot authorize an "
+      + "effect or fabricate a successful completion — production policy/handler/transport fail closed",
+    tests: [CODEX_U_FAILURE_BROKER_CLOSURE_TITLE],
+  },
+
+  // ── C4 NEW O row (D8): a lifecycle/descendant PACKAGED invariant with no prior case that
+  //    proves it, so it is OWED to the maintainer (rejected by check:codex-m4-receipts, the lead's
+  //    pre-merge gate). The C4 U lifecycle cases prove the registry/safety REAP CONTRACT at the U
+  //    layer; the OS-level "the real Go supervisor reaps a boundary-action root's WHOLE descendant
+  //    set to ECHILD(+__WALL) before publication" is a packaged effect a direct harness spawn
+  //    cannot establish (PRD "Required clause inventory"). The lifecycle root-ordering U row
+  //    prerequisites this (its worker_pat/command-root reap ordering is only OS-real once the
+  //    supervisor's whole-root reaping is proven on the packaged image).
+  {
+    id: "codex-o-packaged-descendant-reaping",
+    adapter: "codex",
+    layer: "O",
+    family: "Delegation and cleanup",
+    seam: "agent/codex/supervisor: whole-root ECHILD(+__WALL) reaping of a boundary-action/command root",
+    positiveControl:
+      "M3b Block B drives a boundary-action/command root to completion on the packaged image and "
+      + "observes the supervisor reap its whole descendant set before the durability sink publishes",
+    negativeOracle:
+      "a packaged snapshot must show the supervisor reaching ECHILD(+__WALL) for every registered root "
+      + "(including a backgrounded/process-group-escapee descendant) BEFORE any checkpoint/finalize "
+      + "publication — a drained-but-not-reaped descendant must block observed_empty, never publish",
+    intendedOutcome:
+      "the registry/safety reap contract exercised at the U layer is backed by real supervisor "
+      + "descendant reaping on the packaged path: a durability outcome never outruns whole-root ECHILD",
+    tests: [],
+    o: {
+      kind: "owed",
+      target: "codex worker image (base + jvm) supervisor whole-root reaping snapshot",
+      reason:
+        "whole-root ECHILD(+__WALL) descendant reaping under the REAL Go supervisor is a packaged OS "
+        + "effect; the uzi worker's C4 U cases prove only the registry/safety CONTRACT with injected "
+        + "fake roots, so a fresh packaged snapshot below the real supervisor on a Landlock-capable "
+        + "runtime is required and is maintainer-owned (D8).",
+      owner: "maintainer (D8: fresh packaged O proof, k8s-first Linux runtime)",
+    },
   },
 ];
