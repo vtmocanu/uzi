@@ -123,7 +123,7 @@ func TestGitLabApprovals403FoldsToNone(t *testing.T) {
 		}
 	})
 
-	t.Run("reviewer requested ⇒ review_required", func(t *testing.T) {
+	t.Run("403 + reviewer requested ⇒ review_required", func(t *testing.T) {
 		m := newMockGitLab(t, map[string]http.HandlerFunc{
 			"/api/v4/projects/7/merge_requests": func(w http.ResponseWriter, _ *http.Request) {
 				_ = json.NewEncoder(w).Encode([]map[string]any{
@@ -132,6 +132,30 @@ func TestGitLabApprovals403FoldsToNone(t *testing.T) {
 				})
 			},
 			"/api/v4/projects/7/merge_requests/31/approvals": func(w http.ResponseWriter, _ *http.Request) {
+				http.Error(w, `{"message":"403 Forbidden"}`, http.StatusForbidden)
+			},
+		})
+		d := newTestDriver(t, m, "glpat-token-value-123456")
+		mrs, err := d.ListMergeRequests(context.Background(), 7, ListMergeRequestsOptions{})
+		if err != nil {
+			t.Fatalf("a 403 on approvals must NOT be fatal: %v", err)
+		}
+		if len(mrs) != 1 || mrs[0].ReviewDecision != ReviewRequired {
+			t.Fatalf("403 approvals + reviewer requested ⇒ review_required, got %+v", mrs)
+		}
+	})
+
+	// A 404 (endpoint absent on this instance) is treated identically to a 403 — keep
+	// it covered so a driver that later special-cases 403-only would redden here.
+	t.Run("404 + reviewer requested ⇒ review_required", func(t *testing.T) {
+		m := newMockGitLab(t, map[string]http.HandlerFunc{
+			"/api/v4/projects/7/merge_requests": func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode([]map[string]any{
+					{"iid": 32, "title": "t", "sha": "ff66", "blocking_discussions_resolved": true,
+						"reviewers": []map[string]any{{"username": "rev1"}}},
+				})
+			},
+			"/api/v4/projects/7/merge_requests/32/approvals": func(w http.ResponseWriter, _ *http.Request) {
 				http.Error(w, `{"message":"404 Not Found"}`, http.StatusNotFound)
 			},
 		})
@@ -144,6 +168,36 @@ func TestGitLabApprovals403FoldsToNone(t *testing.T) {
 			t.Fatalf("404 approvals + reviewer requested ⇒ review_required, got %+v", mrs)
 		}
 	})
+}
+
+// TestGitLabConflictsUnknownWhileChecking pins the *bool tri-state: while GitLab is
+// still computing mergeability (detailed_merge_status "checking"/"unchecked"/
+// "preparing") the driver reports Conflicts=nil (unknown), not a guessed &false.
+func TestGitLabConflictsUnknownWhileChecking(t *testing.T) {
+	for _, status := range []string{"checking", "unchecked", "preparing"} {
+		t.Run(status, func(t *testing.T) {
+			m := newMockGitLab(t, map[string]http.HandlerFunc{
+				"/api/v4/projects/7/merge_requests": func(w http.ResponseWriter, _ *http.Request) {
+					_ = json.NewEncoder(w).Encode([]map[string]any{
+						{"iid": 40, "title": "t", "sha": "aa99",
+							"has_conflicts": false, "detailed_merge_status": status,
+							"blocking_discussions_resolved": true},
+					})
+				},
+				"/api/v4/projects/7/merge_requests/40/approvals": func(w http.ResponseWriter, _ *http.Request) {
+					_ = json.NewEncoder(w).Encode(map[string]any{"approved": false})
+				},
+			})
+			d := newTestDriver(t, m, "glpat-token-value-123456")
+			mrs, err := d.ListMergeRequests(context.Background(), 7, ListMergeRequestsOptions{})
+			if err != nil {
+				t.Fatalf("ListMergeRequests: %v", err)
+			}
+			if len(mrs) != 1 || mrs[0].Conflicts != nil {
+				t.Fatalf("detailed_merge_status=%q must yield Conflicts=nil (unknown), got %+v", status, mrs)
+			}
+		})
+	}
 }
 
 // TestGitLabListChecks pins the sha-based check resolution: the newest pipeline for

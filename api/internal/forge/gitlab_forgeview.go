@@ -64,10 +64,22 @@ func (g *gitLab) ListMergeRequests(ctx context.Context, projectID int64, opts Li
 }
 
 // mergeRequestSummary folds one BasicMergeRequest row (plus its approvals) into a
-// neutral summary. Conflicts is HasConflicts OR a "conflict" DetailedMergeStatus
-// (both signal a real conflict); the two are OR-ed so neither is missed.
+// neutral summary. Conflicts honours the *bool tri-state (nil == unknown): while
+// GitLab is still computing mergeability (detailed_merge_status checking/unchecked/
+// preparing) the conflict answer is not yet known, so we report nil rather than
+// guessing false; otherwise it is HasConflicts OR a "conflict" detailed status
+// (OR-ed so neither signal is missed). An empty detailed status is NOT treated as
+// unknown — an older GitLab may omit it while still populating has_conflicts, so the
+// bare has_conflicts signal is preserved.
 func (g *gitLab) mergeRequestSummary(ctx context.Context, projectID int64, mr *gitlab.BasicMergeRequest) (MergeRequestSummary, error) {
-	conflicts := mr.HasConflicts || mr.DetailedMergeStatus == "conflict"
+	var conflicts *bool
+	switch mr.DetailedMergeStatus {
+	case "checking", "unchecked", "preparing":
+		// mergeability not yet computed — unknown, leave nil
+	default:
+		c := mr.HasConflicts || mr.DetailedMergeStatus == "conflict"
+		conflicts = &c
+	}
 	s := MergeRequestSummary{
 		IID:          mr.IID,
 		Title:        mr.Title,
@@ -75,7 +87,7 @@ func (g *gitLab) mergeRequestSummary(ctx context.Context, projectID int64, mr *g
 		TargetBranch: mr.TargetBranch,
 		HeadSHA:      mr.SHA,
 		Draft:        mr.Draft,
-		Conflicts:    &conflicts,
+		Conflicts:    conflicts,
 		WebURL:       mr.WebURL,
 	}
 	if mr.Author != nil {

@@ -53,9 +53,14 @@ var ErrForgeVersionUnsupported = errors.New("forge: server version is older than
 // no secret material.
 var ErrResolveUnsupported = errors.New("forge: resolve is not supported on this forge")
 
-// RateLimitError is the forge-neutral rate-limit error (PRD #1255 D4). A driver
-// wraps its forge's rate-limit shape into it so a caller can errors.As it once,
-// regardless of forge, and map it to HTTP 429 + Retry-After. Reset is the wall
+// RateLimitError is the forge-neutral rate-limit error (PRD #1255 D4). The GitHub
+// driver wraps GitHub's rate-limit shapes into it so a caller can errors.As it and
+// map it to HTTP 429 + Retry-After. Only the GitHub driver produces it today: GitHub
+// carries the 5 000/h primary budget the interactive reads share with the poller
+// (D4), so it is the driver whose limit must reach the caller. GitLab and Forgejo
+// return a plain redacted error instead — their limits are per-instance, the SDK/
+// transport handles a 429 differently, and D4's per-connection interactive budget in
+// the handler guards all three forges BEFORE the call regardless. Reset is the wall
 // time the primary budget refills (GitHub's Rate.Reset); Retry is a wait duration
 // where the forge supplies one directly (GitHub's AbuseRateLimitError.RetryAfter).
 // Err is the already-REDACTED underlying error — RateLimitError carries no
@@ -760,8 +765,9 @@ type Forge interface {
 	// rows. Each driver derives ReviewDecision (no forge exposes it on the row) and
 	// fills Conflicts/Additions/Deletions/Commits from whatever its SDK carries on
 	// the row, reading per-MR detail only where the list omits it (GitHub). Every
-	// string field is untrusted forge text; errors are PAT-redacted, and a forge
-	// rate-limit surfaces as *RateLimitError.
+	// string field is untrusted forge text; errors are PAT-redacted, and on GitHub a
+	// rate-limit surfaces as *RateLimitError (GitLab/Forgejo return a plain error; see
+	// RateLimitError).
 	ListMergeRequests(ctx context.Context, projectID int64, opts ListMergeRequestsOptions) ([]MergeRequestSummary, error)
 	// ListChecks returns every status/check for a commit sha (PRD #1255 D5), merging
 	// the forge's check and commit-status surfaces and DEDUPLICATING by Name so a bot
@@ -775,8 +781,8 @@ type Forge interface {
 	// One page (opts.Limit caps it, bounded by the driver's max page size);
 	// Branch/Event/Status are optional server-side filters. Where the forge version
 	// lacks the endpoint the driver returns an error wrapping ErrForgeVersionUnsupported
-	// (the honest degrade path). Errors are PAT-redacted; a rate-limit surfaces as
-	// *RateLimitError.
+	// (the honest degrade path). Errors are PAT-redacted; on GitHub a rate-limit
+	// surfaces as *RateLimitError (GitLab/Forgejo return a plain error; see RateLimitError).
 	ListWorkflowRuns(ctx context.Context, projectID int64, opts ListWorkflowRunsOptions) ([]WorkflowRun, error)
 	// ProjectCIConfigPath returns the project's configured CI config path (GitLab
 	// ci_config_path); empty string means the driver's default (.gitlab-ci.yml). It

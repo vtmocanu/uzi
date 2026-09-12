@@ -37,7 +37,11 @@ type forgejoReview struct {
 // ListMergeRequests lists the repo's open pull requests as neutral summaries. The
 // list row carries Draft, Mergeable, Head.Sha, Additions and Deletions; the review
 // decision is derived by reading each PR's reviews (raw GET) and folding them (D6).
-// Conflicts is the negation of Mergeable (Forgejo computes it on the row).
+// Conflicts is the negation of Mergeable (Forgejo computes it on the row). Unlike
+// GitLab, the gitea `mergeable` bool carries no "still computing" state, so we cannot
+// distinguish unknown from known-mergeable; a PR whose background merge check has not
+// finished reads mergeable=false ⇒ Conflicts=&true transiently. This is the best the
+// row exposes without an extra per-PR call, and the poll re-reads it as it settles.
 func (f *forgejo) ListMergeRequests(ctx context.Context, projectID int64, opts ListMergeRequestsOptions) ([]MergeRequestSummary, error) {
 	c, err := f.newClient(ctx)
 	if err != nil {
