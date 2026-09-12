@@ -1998,6 +1998,11 @@ tasks:
       # The unit is the lesson, not the number: under node's per-file cap a large
       # test file is a serialization point that no timeout value fixes.
       - npm test
+      # PRD 1287 C1 / D7 point 5: the strict Codex M4 conformance contract + the REAL-binary P
+      # startup smoke, run as a MANDATORY serial second step here (never from gate:agent directly)
+      # so gate:agent and existing Linux CI exercise the P layer EXACTLY ONCE per unchanged tree.
+      # C5 tightens the completeness matrix; it does NOT add another invocation.
+      - task: test:codex-m4
 
   test:codex-m0:
     desc: Opt-in credential-free Codex 0.153.2 app-server characterization
@@ -2218,6 +2223,45 @@ tasks:
           UZI_M3B_DOCKERFILE="agent/templates/${template}/Dockerfile" \
             ../e2e/codex-m3b/run-lifecycle.sh
         done
+
+  test:codex-m4:
+    desc: PRD 1287 C1 - strict Codex/Claude M4 conformance contract + the real-binary P startup smoke
+    # The C1 conformance subsystem (e2e/codex-m4): the machine-readable clause registry, the strict
+    # completeness checker, the map/receipts/provisioner/macOS-runner helpers, and the REAL pinned
+    # Codex app-server P startup smoke (one allowed uzi_bash callback through a REAL broker).
+    #
+    # dir: agent so tsx + tsc + the SDK deps resolve out of agent/node_modules and the smoke loads
+    # the adapter modules from agent/src (packaged-modules.ts CODEX_M4_SRC fallback), matching
+    # test:codex-m3b's host resolution.
+    #
+    # --test-concurrency=1 + --test-timeout=120000 (D7 point 4): the P smoke drives ONE real codex
+    # app-server serially and the timeout bounds a hang, so a wedged binary fails LOUDLY rather than
+    # hanging the gate. The tsc leg runs FIRST so a src-shape drift fails here, not only at runtime.
+    # run-completeness.ts runs LAST, after the tests have appended their executed-test evidence to
+    # CODEX_M4_EVIDENCE, so completeness is enforced on the ACTUAL run results (D3), never a
+    # hard-coded success list. The evidence file is recreated fresh each run so stale evidence
+    # cannot mask a regression. This target is a MANDATORY serial second step of test:agent (below),
+    # so gate:agent and CI exercise P exactly once (D7 point 5) - do NOT also call it from gate:agent.
+    dir: agent
+    env:
+      CODEX_M4_EVIDENCE: ../e2e/codex-m4/.evidence/current.jsonl
+    cmds:
+      - ./node_modules/.bin/tsc --noEmit -p ../e2e/codex-m4/tsconfig.json
+      - mkdir -p ../e2e/codex-m4/.evidence
+      - rm -f ../e2e/codex-m4/.evidence/current.jsonl
+      - node --import tsx --test --test-concurrency=1 --test-timeout=120000 ../e2e/codex-m4/*.test.ts
+      - node --import tsx ../e2e/codex-m4/run-completeness.ts
+
+  check:codex-m4-receipts:
+    desc: PRD 1287 C1 - LEAD merge gate; rejects any OWED O-layer conformance receipt (D8)
+    # The SEPARATE O-receipt merge gate (D8): it exits non-zero if ANY O-layer clause is still
+    # `owed` (packaged evidence the maintainer must run before parent M4 merge). Deliberately NOT
+    # folded into gate:agent / test:codex-m4 - an owed row must not redden the WORKER's ordinary
+    # gate (the worker cannot run packaged O proofs), only the lead's pre-merge check. At C1 this
+    # is EXPECTED to exit non-zero because clauses-codex.ts seeds an owed O row.
+    dir: agent
+    cmds:
+      - node --import tsx ../e2e/codex-m4/run-receipts.ts
 
   test:harness-m2:
     desc: Opt-in credential-free M2 neutral-harness-seam differential tests (PRD 1146 m4)

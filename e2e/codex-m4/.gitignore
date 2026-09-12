@@ -1,0 +1,12 @@
+# PRD #1287 C1 — runtime artifacts of the M4 conformance subsystem; none are committed.
+#   *.log / gate-log.*  : local gate/self-validation logs.
+#   .codex-cache/       : the gitignored rootless test-cache prefix the provisioner
+#                         installs into on a Linux host WITHOUT the image-baked package
+#                         (D7 point 2). On this worker the image-baked path is taken and
+#                         nothing lands here.
+#   .evidence/          : the per-run executed-test evidence JSONL the conformance tests
+#                         append to and run-completeness.ts reads (wired via CODEX_M4_EVIDENCE).
+*.log
+gate-log.*
+.codex-cache/
+.evidence/
