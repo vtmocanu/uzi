@@ -49,8 +49,10 @@ func (s *Service) AdminMarkDone(ctx context.Context, adminUserID uuid.UUID, item
 	}
 
 	// Only OPEN members: a filed or already-settled member keeps its state (PRD #98 Decision 2's
-	// definition of open, the SAME ladder scope=open uses). DO NOTHING is the durable backstop for
-	// a human settling between this read and the write; this Go filter is what keeps the common
+	// definition of open, the SAME ladder scope=open uses). The SQL is the durable backstop for a
+	// coordinate leaving `todo` between this read and the write: ON CONFLICT DO NOTHING catches a
+	// disposition landing, and the write's NOT EXISTS re-checks filed state atomically (filing writes
+	// no disposition, so DO NOTHING alone would miss it). This Go filter is what keeps the common
 	// case from even attempting to touch a settled row. Every value comes off the RESOLVED row.
 	reviewIDs := make([]uuid.UUID, 0, len(members))
 	writeCategories := make([]string, 0, len(members))

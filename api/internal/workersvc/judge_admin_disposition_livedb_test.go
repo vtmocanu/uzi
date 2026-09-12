@@ -229,6 +229,56 @@ func TestAdminMarkDoneDoNothingProtectsHumanVerdictLiveDB(t *testing.T) {
 	}
 }
 
+// TestAdminMarkDoneFiledRecheckSkipsFiledCoordLiveDB is the twin of the DO-NOTHING test above, at
+// the SQL layer, for the OTHER way a coordinate leaves `todo` between the resolve and the write: it
+// gets FILED. Filing writes NO disposition (SettleRecommendationFiledIssue only stamps
+// recommendation_filed_issues.filed_at), so ON CONFLICT DO NOTHING — which only guards a conflict
+// on an existing disposition — would NOT skip a member that became filed after the Go `todo` filter
+// resolved it, and an admin 'done' would land on a now-filed coordinate. The write's WHERE NOT
+// EXISTS filed recheck is the backstop for that race. As with the DO-NOTHING test, the Go filter
+// never hands the write a filed member, so this is observable only by calling the store query
+// DIRECTLY with a filed-but-undisposed review in the arrays. This is the test that fails if the
+// NOT EXISTS anti-join is ever removed: n == 1, a 'done'/'admin' row lands on the filed coordinate.
+func TestAdminMarkDoneFiledRecheckSkipsFiledCoordLiveDB(t *testing.T) {
+	_, q, pool := adminDispoLiveDB(t)
+	ctx := context.Background()
+
+	target := "filed-race-" + uuid.NewString()
+	rg := [2]string{"install_worker_tool", target}
+
+	admin, _ := adminSeedOwner(ctx, t, pool, "admin")
+	owner, repo := adminSeedOwner(ctx, t, pool, "o")
+	rev := adminSeedJudgedRun(ctx, t, pool, owner, repo, rg)
+
+	// The coordinate is SETTLED-FILED (filed_at set) with NO disposition row — exactly the state a
+	// filing produces, and the state DO NOTHING cannot see (there is no disposition to conflict on).
+	adminMustExec(ctx, t, pool,
+		`INSERT INTO recommendation_filed_issues (review_id, category, target, filed_issue_iid, filed_issue_url, filed_at, filing_since)
+		 VALUES ($1, $2, $3, 9, 'https://forge.e2e/i/9', now(), now())`, rev, rg[0], rg[1])
+
+	// Call the fan-out write DIRECTLY with this filed review in the arrays (bypassing the Go todo
+	// filter, modelling the resolve→filed→write race). The NOT EXISTS filed recheck must skip it:
+	// zero rows written, no disposition created on the filed coordinate.
+	n, err := q.UpsertAdminDispositionsForResolvedCoords(ctx, store.UpsertAdminDispositionsForResolvedCoordsParams{
+		AdminUserID:     pgconv.UUID(admin),
+		ReviewIds:       []uuid.UUID{rev},
+		Categories:      []string{rg[0]},
+		Targets:         []string{rg[1]},
+		RationaleHashes: []string{"newhash"},
+	})
+	if err != nil {
+		t.Fatalf("UpsertAdminDispositionsForResolvedCoords: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("execrows = %d, want 0 — WHERE NOT EXISTS must skip a filed coordinate (filing writes no disposition, so DO NOTHING alone would miss it)", n)
+	}
+
+	// No disposition landed on the filed coordinate: an admin 'done' must not overwrite a filing.
+	if exists, status, setVia, _ := adminDispoRow(ctx, t, pool, rev, rg[0], rg[1]); exists {
+		t.Fatalf("row = exists %v status %q set_via %v, want NO disposition — the NOT EXISTS filed recheck was removed and an admin 'done' landed on a filed coordinate", exists, status, setVia)
+	}
+}
+
 // TestAdminUndoRemovesOnlyAdminRowsLiveDB is (d): AdminUndoDone deletes the set_via='admin' rows
 // across users but leaves a human 'done' on the SAME coordinate standing.
 func TestAdminUndoRemovesOnlyAdminRowsLiveDB(t *testing.T) {

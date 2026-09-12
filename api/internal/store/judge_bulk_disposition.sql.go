@@ -322,6 +322,13 @@ INSERT INTO recommendation_dispositions
     (review_id, category, target, status, rationale_hash, set_via, set_by_user_id)
 SELECT m.review_id, m.category, m.target, 'done', m.rationale_hash, 'admin', $1
 FROM members m
+WHERE NOT EXISTS (
+    SELECT 1 FROM recommendation_filed_issues f
+    WHERE f.review_id = m.review_id
+      AND f.category = m.category
+      AND f.target = m.target
+      AND f.filed_at IS NOT NULL
+)
 ON CONFLICT (review_id, category, target) DO NOTHING
 `
 
@@ -336,13 +343,21 @@ type UpsertAdminDispositionsForResolvedCoordsParams struct {
 // Write the admin cross-user Mark done in ONE statement over the RESOLVED members (PRD #1184 M2) —
 // the twin of UpsertDispositionsForResolvedCoords, with two deliberate differences.
 //
-//  1. ON CONFLICT DO NOTHING, not DO UPDATE. This is the whole point of the admin write: a human's
-//     existing verdict on the coordinate — done OR dismissed, set by that owner — must NEVER be
-//     overwritten by an admin. An admin done only reaches coordinates that carry NO disposition yet
-//     (the resolve already filters to `todo` members in Go, but DO NOTHING is the durable backstop
-//     against a race where a human settles between the resolve and the write). Same non-clobbering
-//     semantics as SystemDismissDeniedCLIRecommendation, and the opposite of the owner human upsert
-//     whose DO UPDATE is last-writer-wins because THAT is the human speaking.
+//  1. ON CONFLICT DO NOTHING (not DO UPDATE) plus a WHERE NOT EXISTS filed recheck. Together these
+//     are the whole point of the admin write: a human's existing verdict on the coordinate — done OR
+//     dismissed, set by that owner — must NEVER be overwritten by an admin, and a coordinate a human
+//     FILED must never take an admin 'done'. An admin done only reaches coordinates still `todo` (the
+//     resolve already filters to `todo` members in Go); these two SQL guards are the durable backstop
+//     against a human settling between the resolve and the write, one guard per way a coordinate
+//     leaves `todo`:
+//     * a DISPOSITION landing (human done/dismissed) — caught by ON CONFLICT (review_id, category,
+//     target) DO NOTHING, since the insert would conflict on the coordinate key.
+//     * a FILING landing — caught by the WHERE NOT EXISTS anti-join, because filing writes NO
+//     disposition (SettleRecommendationFiledIssue only stamps recommendation_filed_issues.
+//     filed_at), so DO NOTHING alone would let an admin 'done' land on a now-filed coordinate.
+//     The anti-join adds no query parameter — it reads the members CTE's own columns.
+//     Same non-clobbering semantics as SystemDismissDeniedCLIRecommendation, and the opposite of the
+//     owner human upsert whose DO UPDATE is last-writer-wins because THAT is the human speaking.
 //
 //  2. set_via = 'admin' and set_by_user_id = @admin_user_id are written as LITERALS/params, NOT
 //     cleared. Unlike the two other server-side provenances, set_by_user_id is SET — the acting
