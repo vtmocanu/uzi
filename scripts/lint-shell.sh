@@ -299,7 +299,12 @@ shebang_is_shell() {
   return 1
 }
 
-FILES="$(git ls-files -- '*.sh')" || exit 2
+# `:(exclude)*/vendor/*` drops VENDORED third-party scripts (e.g. the x/sys module's
+# mkerrors.sh/mkall.sh under agent/codex/supervisor/vendor/) from the sweep. They are
+# upstream generator scripts we neither run nor own, and `go mod vendor` copies them
+# verbatim, so linting them just fails the gate on findings we cannot fix and would
+# never touch. Excluding vendor/ is standard; our own scripts live nowhere under it.
+FILES="$(git ls-files -- '*.sh' ':(exclude)*/vendor/*')" || exit 2
 
 # `|| true`: git grep exits 1 when nothing matches, which is a legitimate state
 # here (it would just mean no extension-less scripts) and must not abort the run.
@@ -309,6 +314,9 @@ CANDIDATES="$(git grep -I -l -E '^#!' -- . || true)"
 while IFS= read -r _f; do
   [ -n "$_f" ] || continue
   case "$_f" in *.sh) continue ;; esac
+  # Same vendor exclusion as the *.sh ls-files above, for an extension-less
+  # shebang script that lives under a vendor/ tree: not ours to lint.
+  case "$_f" in */vendor/*) continue ;; esac
   [ -f "$_f" ] || continue
   # `read` returns nonzero on a file with no trailing newline but still assigns,
   # so the status is deliberately ignored and `_first` is tested instead.
