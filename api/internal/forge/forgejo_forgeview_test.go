@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"testing"
+	"time"
 )
 
 // TestForgejoListMergeRequests pins the row mapping (Draft, Head.Sha, additions/
@@ -173,6 +174,55 @@ func TestForgejoListWorkflowRuns(t *testing.T) {
 	}
 	if r.Name != ".forgejo/workflows/ci.yml" || r.Title != "PRD continuation" || r.Actor != "uzi-bot" {
 		t.Fatalf("run name/title/actor mapping wrong: %+v", r)
+	}
+}
+
+// TestForgejoListMergeRequestReviews pins the detail-view review list (D6), which
+// does a real json.Unmarshal of the raw /pulls/{index}/reviews body into
+// forgejoReview: a normal review carries author + raw state verbatim + submitted_at;
+// a review whose `user` is null (or absent) must NOT panic and yields an empty
+// author; and the state is passed through verbatim (REQUEST_CHANGES stays raw, not
+// folded to the neutral CHANGES_REQUESTED the decision fold would produce).
+func TestForgejoListMergeRequestReviews(t *testing.T) {
+	m := newMockForgejo(t, map[string]http.HandlerFunc{
+		"/repos/acme/widgets/pulls/5/reviews": func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode([]map[string]any{
+				{"user": map[string]any{"login": "carol"}, "state": "APPROVED", "submitted_at": "2024-01-01T00:00:00Z"},
+				{"user": nil, "state": "REQUEST_CHANGES", "submitted_at": "2024-01-02T00:00:00Z"},
+				{"state": "COMMENT", "submitted_at": "2024-01-03T00:00:00Z"},
+			})
+		},
+	})
+	d := newForgejoDriver(t, m, "forgejo-token-value-123456")
+
+	reviews, err := d.ListMergeRequestReviews(context.Background(), 7, 5)
+	if err != nil {
+		t.Fatalf("ListMergeRequestReviews: %v", err)
+	}
+	if len(reviews) != 3 {
+		t.Fatalf("expected 3 reviews, got %d: %+v", len(reviews), reviews)
+	}
+	if reviews[0].Author != "carol" || reviews[0].State != "APPROVED" {
+		t.Errorf("review 0 author/state wrong: %+v", reviews[0])
+	}
+	want0, _ := time.Parse(time.RFC3339, "2024-01-01T00:00:00Z")
+	if !reviews[0].SubmittedAt.Equal(want0) {
+		t.Errorf("review 0 submitted_at = %v, want %v", reviews[0].SubmittedAt, want0)
+	}
+	// nil `user` must not panic and yields an empty author; the raw state passes
+	// through verbatim (NOT folded to CHANGES_REQUESTED).
+	if reviews[1].Author != "" {
+		t.Errorf("review 1 has a null user ⇒ empty author, got %q", reviews[1].Author)
+	}
+	if reviews[1].State != "REQUEST_CHANGES" {
+		t.Errorf("review 1 state must be verbatim REQUEST_CHANGES, got %q", reviews[1].State)
+	}
+	// A review object with no `user` key at all is the same guard.
+	if reviews[2].Author != "" {
+		t.Errorf("review 2 has no user ⇒ empty author, got %q", reviews[2].Author)
+	}
+	if reviews[2].State != "COMMENT" {
+		t.Errorf("review 2 state must be verbatim COMMENT, got %q", reviews[2].State)
 	}
 }
 

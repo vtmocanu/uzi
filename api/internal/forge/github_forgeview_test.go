@@ -315,6 +315,50 @@ func TestGitHubRateLimitTyped(t *testing.T) {
 	}
 }
 
+// TestGitHubListMergeRequestReviews pins the detail-view review list (D6): each
+// review's author, its RAW GitHub state passed through verbatim (not folded to the
+// neutral decision vocabulary), its submitted_at, and the oldest-first order GitHub
+// returns them in.
+func TestGitHubListMergeRequestReviews(t *testing.T) {
+	m := newMockGitHub(t, map[string]http.HandlerFunc{
+		"/repos/acme/widgets/pulls/7/reviews": func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode([]map[string]any{
+				{"user": map[string]any{"login": "alice"}, "state": "APPROVED", "submitted_at": "2024-01-01T00:00:00Z"},
+				{"user": map[string]any{"login": "bob"}, "state": "CHANGES_REQUESTED", "submitted_at": "2024-01-02T00:00:00Z"},
+				{"user": map[string]any{"login": "carol"}, "state": "COMMENTED", "submitted_at": "2024-01-03T00:00:00Z"},
+			})
+		},
+	})
+	d := newGitHubDriver(t, m, "ghp_classicTokenValue1234567890")
+
+	reviews, err := d.ListMergeRequestReviews(context.Background(), 7, 7)
+	if err != nil {
+		t.Fatalf("ListMergeRequestReviews: %v", err)
+	}
+	if len(reviews) != 3 {
+		t.Fatalf("expected 3 reviews, got %d: %+v", len(reviews), reviews)
+	}
+	if reviews[0].Author != "alice" || reviews[0].State != "APPROVED" {
+		t.Errorf("review 0 author/state wrong: %+v", reviews[0])
+	}
+	// State is GitHub's RAW state verbatim, not the folded neutral decision.
+	if reviews[1].Author != "bob" || reviews[1].State != "CHANGES_REQUESTED" {
+		t.Errorf("review 1 must carry the raw state verbatim: %+v", reviews[1])
+	}
+	if reviews[2].Author != "carol" || reviews[2].State != "COMMENTED" {
+		t.Errorf("review 2 author/state wrong: %+v", reviews[2])
+	}
+	want0, _ := time.Parse(time.RFC3339, "2024-01-01T00:00:00Z")
+	if !reviews[0].SubmittedAt.Equal(want0) {
+		t.Errorf("review 0 submitted_at = %v, want %v", reviews[0].SubmittedAt, want0)
+	}
+	// Oldest-first (GitHub returns them ascending by submission).
+	if !reviews[0].SubmittedAt.Before(reviews[1].SubmittedAt) || !reviews[1].SubmittedAt.Before(reviews[2].SubmittedAt) {
+		t.Errorf("reviews must be oldest-first, got %v / %v / %v",
+			reviews[0].SubmittedAt, reviews[1].SubmittedAt, reviews[2].SubmittedAt)
+	}
+}
+
 // TestGitHubAbuseRateLimitTyped pins that a secondary (abuse) 403 surfaces as
 // *RateLimitError carrying the Retry-After wait.
 func TestGitHubAbuseRateLimitTyped(t *testing.T) {

@@ -200,6 +200,35 @@ func TestGitLabConflictsUnknownWhileChecking(t *testing.T) {
 	}
 }
 
+// TestGitLabListMergeRequestReviews pins the documented empty-behavior (D6): GitLab
+// has no free-tier per-reviewer review stream, so the driver returns a non-nil empty
+// slice WITHOUT making any HTTP call (its decision is the BlockingDiscussionsResolved
+// / approvals approximation, computed elsewhere). The "/" catch-all fails the test if
+// the method unexpectedly hits the API.
+func TestGitLabListMergeRequestReviews(t *testing.T) {
+	m := newMockGitLab(t, map[string]http.HandlerFunc{
+		"/": func(w http.ResponseWriter, r *http.Request) {
+			t.Errorf("ListMergeRequestReviews must make no HTTP call, got %s %s", r.Method, r.URL.Path)
+			http.Error(w, "unexpected call", http.StatusInternalServerError)
+		},
+	})
+	d := newTestDriver(t, m, "glpat-token-value-123456")
+
+	reviews, err := d.ListMergeRequestReviews(context.Background(), 7, 13)
+	if err != nil {
+		t.Fatalf("ListMergeRequestReviews: %v", err)
+	}
+	if reviews == nil {
+		t.Fatal("GitLab ListMergeRequestReviews must return a non-nil empty slice, got nil")
+	}
+	if len(reviews) != 0 {
+		t.Fatalf("GitLab has no free-tier review stream ⇒ empty slice, got %+v", reviews)
+	}
+	if m.gotToken != "" {
+		t.Errorf("no request expected, but the mock recorded a PRIVATE-TOKEN header %q", m.gotToken)
+	}
+}
+
 // TestGitLabListChecks pins the sha-based check resolution: the newest pipeline for
 // the sha (max-by-id) supplies the jobs, and the commit's external statuses are
 // merged in, deduped by name.
