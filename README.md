@@ -11,7 +11,7 @@
 
 <p align="center">
   <img src=".github/readme/uzi-hero.jpg" width="640"
-       alt="A dark, unmanned factory corridor: a matte-black uzi sign reading 'Specs in. Pull requests out.' beside a row of server racks and a conveyor of robotic arms assembling glowing amber code crates, a night skyline at the far end">
+       alt="A dark factory corridor: a white-backlit uzi sign reading 'Specs in. Pull requests out.', a white humanoid robot labelled 'Lead' overseeing the floor with a tablet, and a conveyor of robotic arms assembling glowing amber code crates past a night skyline">
 </p>
 
 A **dark factory** runs with the lights off: no human on the floor. Machines take the raw input, do the work, and hand back a finished part. I built one for software. It is called **uzi** (Uzinele Întunecate, "dark factories"), and it is open source.
