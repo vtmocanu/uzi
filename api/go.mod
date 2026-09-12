@@ -16,7 +16,7 @@ require (
 	github.com/charmbracelet/colorprofile v0.4.3
 	github.com/charmbracelet/x/ansi v0.11.8
 	github.com/coder/websocket v1.8.15
-	github.com/coreos/go-oidc/v3 v3.20.0
+	github.com/coreos/go-oidc/v3 v3.21.0
 	github.com/go-chi/chi/v5 v5.3.2
 	github.com/go-git/go-git/v5 v5.19.2
 	github.com/golang-jwt/jwt/v5 v5.3.1
