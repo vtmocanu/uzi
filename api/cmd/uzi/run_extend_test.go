@@ -17,8 +17,10 @@ import (
 // TestParseExtendDuration pins the --by parse table: Go durations plus the `d` (day = 24h) unit
 // resolve to whole seconds, and a zero, negative or unparseable value is a usage error (exit 2).
 //
-// MUTATION PROOF: drop the `d`-suffix rewrite and `1d` no longer parses; drop the `d <= 0` guard
-// and `0`/negative stop being usage errors.
+// MUTATION PROOF: drop the `d`-suffix rewrite and `1d` no longer parses; drop the seconds<=0
+// guard and `0`/negative stop being usage errors; revert it to the old `d <= 0` guard (on the
+// nanosecond duration) and the sub-second cases (500ms, 900ms, 1ms, 0.5s) floor to 0 seconds
+// and pass instead of erroring.
 func TestParseExtendDuration(t *testing.T) {
 	ok := []struct {
 		in   string
@@ -40,7 +42,10 @@ func TestParseExtendDuration(t *testing.T) {
 		}
 	}
 
-	bad := []string{"0", "-2h", "abc", "", "5"}
+	// Sub-second inputs (500ms, 900ms, 1ms, 0.5s) are > 0 as a time.Duration but floor to 0
+	// whole seconds, so each MUST be a usage error rather than a silent no-op — the floor-to-0
+	// bug this fix closes.
+	bad := []string{"0", "-2h", "abc", "", "5", "500ms", "900ms", "1ms", "0.5s"}
 	for _, in := range bad {
 		_, err := parseExtendDuration(in)
 		if err == nil {
@@ -125,7 +130,8 @@ func TestExtendSuccessLine(t *testing.T) {
 }
 
 // TestRunExtendMissingByIsUsageError: `uzi run extend r1` with no --by is a usage error (exit 2)
-// that fires before any request, so nothing is posted.
+// that fires before any request, so nothing is posted — and it prints exactly ONE error line,
+// like the sibling verbs (run scope/pause), not a guidance line plus Main's "uzi: " line.
 func TestRunExtendMissingByIsUsageError(t *testing.T) {
 	fc := &uzicli.FakeClient{}
 	_, stderr, code := runCLI(t, fakeEnv(fc), "run", "extend", "r1")
@@ -134,6 +140,11 @@ func TestRunExtendMissingByIsUsageError(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "run extend needs --by") {
 		t.Errorf("expected the missing --by usage message, stderr = %q", stderr)
+	}
+	// Exactly one line. A regression that re-adds the redundant guidance Fprintln (printed
+	// alongside Main's own "uzi: <Exitf>" line) would make this two near-identical lines.
+	if lines := strings.Split(strings.TrimRight(stderr, "\n"), "\n"); len(lines) != 1 {
+		t.Errorf("missing --by must print exactly one error line, got %d:\n%s", len(lines), stderr)
 	}
 	if fc.LastInputKind != "" {
 		t.Errorf("no input must be posted on a usage error, got kind %q", fc.LastInputKind)
@@ -153,6 +164,29 @@ func TestRunExtendUnparseableByIsUsageError(t *testing.T) {
 	}
 	if fc.LastInputKind != "" {
 		t.Errorf("no input must be posted on a usage error, got kind %q", fc.LastInputKind)
+	}
+}
+
+// TestRunExtendSubSecondByIsUsageError: a sub-second --by (500ms, 900ms, 1ms, 0.5s) floors to 0
+// whole seconds, so it is a usage error (exit 2) that fires LOCALLY with NO input posted — the
+// spec says these fail fast client-side, not as a server-backstopped 400.
+//
+// MUTATION PROOF: re-introduce the floor-to-0 post (guard the raw nanosecond duration instead of
+// the whole seconds) and the CLI would POST body "0" — LastInputKind flips to kindExtend and this
+// reddens.
+func TestRunExtendSubSecondByIsUsageError(t *testing.T) {
+	for _, by := range []string{"500ms", "900ms", "1ms", "0.5s"} {
+		fc := &uzicli.FakeClient{}
+		_, stderr, code := runCLI(t, fakeEnv(fc), "run", "extend", "r1", "--by", by)
+		if code != uzicli.ExitUsage {
+			t.Errorf("--by %s: exit = %d, want %d (usage)", by, code, uzicli.ExitUsage)
+		}
+		if !strings.Contains(stderr, "at least 1 second") {
+			t.Errorf("--by %s: expected the sub-second usage message, stderr = %q", by, stderr)
+		}
+		if fc.LastInputKind != "" {
+			t.Errorf("--by %s: no input must be posted on a usage error, got kind %q", by, fc.LastInputKind)
+		}
 	}
 }
 

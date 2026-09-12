@@ -152,8 +152,8 @@ func newRunExtendCmd(env Env, gf *globalFlags) *cobra.Command {
 			"frozen budget rather than replacing it, and the run's per-run extension allowance is an " +
 			"admin setting.\n\n" +
 			"--by takes a duration: Go's `2h`, `90m`, `1h30m`, plus a `d` (day = 24h) unit — `1d` is " +
-			"24h. It must be positive; `0`, a negative value or an unparseable one is a usage error " +
-			"(exit 2).\n\n" +
+			"24h. It must be at least 1 second; `0`, a sub-second value, a negative value or an " +
+			"unparseable one is a usage error (exit 2).\n\n" +
 			"Valid on any non-terminal run of a kind the sweep can time out (an issue, task, prompt, " +
 			"self-improve, mr-rework or ci-fix run), including a queued or parked one. A chat, judge " +
 			"or interactive-task run never times out, so extending one is a 409 (exit 5); an over-cap " +
@@ -166,10 +166,10 @@ func newRunExtendCmd(env Env, gf *globalFlags) *cobra.Command {
 				return err
 			}
 			if !cmd.Flags().Changed("by") {
-				if !gf.quiet {
-					_, _ = fmt.Fprintln(env.Stderr, "run extend needs --by <duration> (e.g. --by 2h, --by 90m, --by 1h30m, --by 1d)")
-				}
-				return uzicli.Exitf(uzicli.ExitUsage, "run extend needs --by <duration>")
+				// One line only, like the sibling verbs (run scope/pause): Main already
+				// prints this Exitf message with the "uzi: " prefix, so a separate Fprintln
+				// guidance line would double-print near-identical text on stderr.
+				return uzicli.Exitf(uzicli.ExitUsage, "run extend needs --by <duration> (e.g. --by 2h, --by 90m, --by 1h30m, --by 1d)")
 			}
 			by, _ := cmd.Flags().GetString("by")
 			seconds, err := parseExtendDuration(by)
@@ -199,7 +199,7 @@ func newRunExtendCmd(env Env, gf *globalFlags) *cobra.Command {
 			return nil
 		},
 	}
-	extend.Flags().String("by", "", "how much wall-clock time to add: 2h, 90m, 1h30m, 1d (day = 24h); required, must be positive")
+	extend.Flags().String("by", "", "how much wall-clock time to add: 2h, 90m, 1h30m, 1d (day = 24h); required, at least 1 second")
 	return extend
 }
 
@@ -209,18 +209,25 @@ var extendDaysRe = regexp.MustCompile(`^(-?)(\d+(?:\.\d+)?)d(.*)$`)
 
 // parseExtendDuration parses the --by value into whole seconds for the `extend` body. It
 // accepts Go's time.ParseDuration syntax (2h, 90m, 1h30m) PLUS a `d` (day = 24h) unit that
-// time.ParseDuration does not know (1d, 1d12h). A zero, negative or unparseable value is a
-// usage error (ExitUsage) so a typo fails fast rather than posting a no-op extension.
+// time.ParseDuration does not know (1d, 1d12h). A value that resolves to zero whole seconds
+// — zero, a negative value, or a sub-second value like 500ms that floors to 0 — or an
+// unparseable value is a usage error (ExitUsage) so a typo (or a too-small unit) fails fast
+// locally rather than posting a no-op "0" extension.
 func parseExtendDuration(s string) (int, error) {
 	raw := strings.TrimSpace(s)
 	d, err := parseDurationWithDays(raw)
 	if err != nil {
 		return 0, uzicli.Exitf(uzicli.ExitUsage, "--by %q is not a valid duration (try 2h, 90m, 1h30m, 1d)", s)
 	}
-	if d <= 0 {
-		return 0, uzicli.Exitf(uzicli.ExitUsage, "--by must be a positive duration (got %q)", s)
+	// Reject on the WHOLE-SECONDS value, not the raw nanosecond duration: a sub-second
+	// input (500ms, 0.5s) is > 0 as a time.Duration but floors to 0 seconds, so guarding
+	// `d <= 0` would let it post a no-op "0". Rejecting seconds <= 0 (equivalently
+	// d < time.Second) fails it fast locally, like 0/negative/unparseable.
+	seconds := int(d / time.Second)
+	if seconds <= 0 {
+		return 0, uzicli.Exitf(uzicli.ExitUsage, "--by must be at least 1 second (got %q)", s)
 	}
-	return int(d / time.Second), nil
+	return seconds, nil
 }
 
 // parseDurationWithDays is time.ParseDuration extended with a leading `d` (day) unit. A
