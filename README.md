@@ -246,7 +246,7 @@ GitLab, GitHub, and Forgejo sit behind one driver. GitLab and GitHub are the pat
 
 ## Status: alpha (and uzi builds uzi)
 
-Treat it as **alpha**. Features land often, refactors happen often, and breaking changes are on the table. But it is not a toy: it is stable and it works well day to day, having already completed over 1,200 runs and spent over 19 billion tokens getting here.
+Treat it as **alpha**. Features land often, refactors happen often, and breaking changes are on the table. But it is not a toy: it is stable and it works well day to day, having already completed over 1,200 runs and spent over 20 billion tokens getting here.
 
 And the fun part: **uzi builds uzi**. A growing share of it is written by itself. I file the issues, it plans, implements, and opens the PRs, so the factory is quietly assembling its own next version while I review.
 
