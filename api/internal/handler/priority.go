@@ -72,5 +72,5 @@ func (h *Handler) SetRunPriority(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusConflict, "run is not queued")
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout)})
+	httpx.JSON(w, http.StatusOK, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.clock())})
 }

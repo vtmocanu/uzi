@@ -22,6 +22,14 @@ import {
 } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
 import { canToggleWaitOnLimit, formatCountdown, runWindowLabel } from "../lib/limitWait";
+import {
+  budgetRightLabel,
+  extendBudgetView,
+  extendEnabled,
+  formatBudgetDuration,
+  formatLocalTime,
+} from "../lib/budget";
+import { ExtendTimePopover } from "../components/ExtendTimePopover";
 import { canReworkNow, canToggleMrRework, effectiveMrRework } from "../lib/mrRework";
 import { stripUnsafeChars } from "../lib/safeText";
 import { useNow } from "../lib/useNow";
@@ -107,6 +115,153 @@ function LiveElapsed({ since }: { since: string }) {
   const start = new Date(since).getTime();
   if (!Number.isFinite(start)) return null;
   return <span className="text-xs tabular-nums text-faint">{formatDuration(now - start)}</span>;
+}
+
+// PRD #1189: the running run's elapsed text, budget-aware. When the run carries a wall-clock
+// budget (budget_total_seconds non-null) it reads `3h 48m / 8h` — the left side the paused-aware
+// active time aged client-side (see budget.ts, "one clock"), the right side the frozen budget
+// plus `+<ext>` once extended (`8h+2h`, never `10h`). It is focusable with a dotted underline so
+// the deadline detail opens on focus/tap as well as hover, not only through the title. A
+// null-budget kind (chat/judge/interactive) or an older api (rollout skew) falls back to today's
+// plain elapsed.
+function RunBudgetElapsed({ run }: { run: Run }) {
+  const now = useNow(1000);
+  const view = extendBudgetView(run, now);
+  if (!view) {
+    // Plain elapsed — today's behaviour, unchanged for a null-budget kind or an older api.
+    return run.started_at ? <LiveElapsed since={run.started_at} /> : null;
+  }
+  const deadline = formatLocalTime(view.deadlineIso);
+  const tip =
+    `Budget ${budgetRightLabel(view)}. Paused time does not count.` +
+    (deadline ? ` Times out ${deadline}.` : "");
+  // A `title` on a focusable generic element becomes its accessible NAME, which would announce
+  // the budget/deadline but SWALLOW the visible "used" figure. An explicit aria-label restores
+  // it: the used value alongside the budget and the deadline, so a screen-reader user hears the
+  // same three facts a sighted one reads.
+  const label =
+    `Used ${formatBudgetDuration(view.usedSec)} of ${budgetRightLabel(view)} budget.` +
+    (deadline ? ` Times out ${deadline}.` : "") +
+    " Paused time does not count.";
+  return (
+    <span
+      tabIndex={0}
+      title={tip}
+      aria-label={label}
+      className="cursor-help text-xs tabular-nums text-faint underline decoration-dotted decoration-faint underline-offset-2 outline-hidden focus-visible:text-fg focus-visible:outline-2 focus-visible:outline-brand focus-visible:outline-offset-2"
+    >
+      {formatBudgetDuration(view.usedSec)} <span className="text-faint">/ {budgetRightLabel(view)}</span>
+    </span>
+  );
+}
+
+// PRD #1189/#1190: a paused run's elapsed. The clock is stopped, so it is a STATIC span, not a
+// ticker: the frozen used time over the budget, then how much of the budget remains when the run
+// resumes (the deadline itself is omitted — it moves with the pause). A run with no wall budget
+// keeps today's plain "· clock stopped" line.
+function PausedElapsed({ run }: { run: Run }) {
+  if (!run.started_at) return null;
+  const view = extendBudgetView(run, Date.now());
+  if (!view) {
+    return (
+      <span className="text-xs tabular-nums text-faint">
+        {formatDuration(Date.parse(run.updated_at) - Date.parse(run.started_at))} · clock stopped
+      </span>
+    );
+  }
+  return (
+    <span className="text-xs tabular-nums text-faint">
+      {formatBudgetDuration(view.usedSec)}{" "}
+      <span className="text-faint">
+        / {budgetRightLabel(view)} · {formatBudgetDuration(view.remainingSec)} left when resumed · clock stopped
+      </span>
+    </span>
+  );
+}
+
+// PRD #1189: the near-timeout panel, modelled on LimitWaitPanel — a full-width warn card
+// rendered under the header while the near-timeout ("slow") flag is up. It states what will
+// happen and when, that committed work is safe (the checkpoint sentence, omitted when
+// checkpoint_tip_at is null), and offers the one action row: Extend (owner, when the cap allows)
+// and Stop. A non-owner sees inert text, never a button that 404s.
+//
+// Exported like the sibling park panels so its copy and gating are reachable without mounting
+// the whole page.
+export function NearTimeoutPanel({
+  run,
+  busy,
+  canSteer = true,
+  onExtend,
+  onStop,
+}: {
+  run: Run;
+  busy: boolean;
+  canSteer?: boolean;
+  onExtend: (seconds: number) => void | Promise<boolean | void>;
+  onStop: () => void;
+}) {
+  const now = useNow(1000);
+  // Only while the near-timeout flag is actually up (the same gate the header action uses).
+  if (!(shouldShowHealthFlag(run.health, run.status) && run.health === "slow")) return null;
+  const view = extendBudgetView(run, now);
+  // No budget on the wire (rollout skew): the flag chip in the header still shows, but this
+  // panel has nothing quantitative to say, so it stays out of the way.
+  if (!view) return null;
+
+  const deadline = formatLocalTime(view.deadlineIso);
+  const checkpoint = checkpointSentence(run, now);
+  const showExtend = canSteer && extendEnabled(run);
+
+  return (
+    <div className="rounded-xl border border-warn/40 bg-warn/10 p-4">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0">
+          <p role="status" className="text-sm font-semibold text-warn">
+            <span aria-hidden="true">⚠ </span>
+            This run is close to its time limit
+          </p>
+          <p className="mt-0.5 text-xs text-muted">
+            It has used <span className="tabular-nums text-fg">{formatBudgetDuration(view.usedSec)}</span> of its{" "}
+            {budgetRightLabel(view)} budget and will be stopped
+            {deadline ? (
+              <>
+                {" "}
+                at <span className="tabular-nums text-fg">{deadline}</span>
+              </>
+            ) : null}{" "}
+            unless you extend it.
+          </p>
+          {checkpoint && <p className="mt-1.5 text-xs text-muted">{checkpoint}</p>}
+        </div>
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+          {canSteer ? (
+            <>
+              {showExtend && (
+                <ExtendTimePopover run={run} busy={busy} onSubmit={onExtend} triggerVariant="primary" />
+              )}
+              <Button variant="danger" size="sm" disabled={busy} onClick={onStop}>
+                Stop run
+              </Button>
+            </>
+          ) : (
+            <span className="text-xs text-muted">Only the run's owner can extend or stop it.</span>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// checkpointSentence renders the near-timeout panel's "committed work is safe" line from
+// checkpoint_tip_at (a timestamp; there is no checkpoint-sha field on the DTO) and the branch.
+// Returns null when checkpoint_tip_at is absent — the sentence is then omitted entirely.
+function checkpointSentence(run: Run, nowMs: number): string | null {
+  if (!run.checkpoint_tip_at) return null;
+  const t = Date.parse(run.checkpoint_tip_at);
+  if (!Number.isFinite(t)) return null;
+  const age = formatElapsed(nowMs - t);
+  const where = run.branch ? ` (${stripUnsafeChars(run.branch)})` : "";
+  return `Work already committed is safe: the last checkpoint was pushed ${age} ago${where}.`;
 }
 
 // HealthFlag renders the run-health warn chip next to the LIVE STAGE label (PRD #47
@@ -829,17 +984,20 @@ function checkpointLine(run: Run): string {
 }
 
 /**
- * PRD #1190: the paused-run panel, modelled on LimitWaitPanel — a full-width parked card
- * rendered under `run.status === "paused"`. It says four things (mock frame C): the
- * checkpoint is safe, that nothing runs or is spent while it waits, what happens on resume
- * (behind a disclosure), and offers the one action row (Resume + Stop). It deliberately
- * OMITS the "N of the budget remains when you resume" sentence and the "Extend time…"
- * action — both depend on PRD #1189's budget_total_seconds, which has not landed; the copy
- * lands with #1189, not here (so the "Only the run's owner can resume or stop it." line
- * names two actions, not three).
+ * PRD #1190 + #1189: the paused-run panel, modelled on LimitWaitPanel — a full-width parked
+ * card rendered under `run.status === "paused"`. It says: the checkpoint is safe, how much of
+ * the budget remains when you resume (PRD #1189), that nothing runs or is spent while it
+ * waits, what happens on resume (behind a disclosure), and offers the action row (Resume,
+ * Extend when the cap allows, Stop). Extend stays available while paused (PRD #1189 D4: the
+ * extension is inert until the run resumes, but an owner may want to grant it now); the
+ * budget-remaining sentence and the Extend action landed here with #1189.
  *
- * Non-owner (canSteer=false): the two live controls are replaced by inert text (never a
- * button that 404s), the same rule LimitWaitPanel/QuestionPanel follow.
+ * The "remains when you resume" figure comes from the frozen budget_wall_seconds + extension −
+ * budget_used_seconds, NOT budget_total_seconds — which is null while paused because the
+ * deadline moves (see budget.ts). A run with no wall budget simply omits the sentence.
+ *
+ * Non-owner (canSteer=false): the live controls are replaced by inert text (never a button
+ * that 404s), the same rule LimitWaitPanel/QuestionPanel follow.
  */
 export function PausedPanel({
   run,
@@ -847,12 +1005,16 @@ export function PausedPanel({
   canSteer = true,
   onResume,
   onStop,
+  onExtend,
 }: {
   run: Run;
   busy: boolean;
   canSteer?: boolean;
   onResume: () => void;
   onStop: () => void;
+  // PRD #1189: grant more time while paused. Optional so a caller that does not wire it (or a
+  // run whose cap is 0/unknown, gated by extendEnabled below) simply shows no Extend.
+  onExtend?: (seconds: number) => void | Promise<boolean | void>;
 }) {
   // A completion hold (hold_reason='completion_blocked') also sits in `paused` but
   // recovers via the continue-decision path, not a plain resume — so it is excluded
@@ -867,6 +1029,11 @@ export function PausedPanel({
     ? new Date(pausedMs).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })
     : null;
 
+  // PRD #1189: "N of the M budget remains when you resume" — from the frozen budget, not the
+  // (null-while-paused) deadline. Omitted for a run with no wall budget.
+  const view = extendBudgetView(run, Date.now());
+  const showExtend = canSteer && !!onExtend && extendEnabled(run);
+
   return (
     <div className="rounded-xl border border-info/40 bg-info/10 p-4">
       <div className="flex flex-wrap items-start justify-between gap-3">
@@ -880,6 +1047,12 @@ export function PausedPanel({
             Paused by you{pausedAt ? ` at ${pausedAt}` : ""}
           </p>
           <p className="mt-0.5 text-xs text-muted">{checkpointLine(run)}</p>
+          {view && (
+            <p className="mt-1.5 text-xs text-muted">
+              <span className="tabular-nums text-fg">{formatBudgetDuration(view.remainingSec)}</span> of the{" "}
+              {budgetRightLabel(view)} budget remains when you resume.
+            </p>
+          )}
           <p className="mt-1.5 text-xs text-muted">
             Nothing runs and nothing is spent while it waits.
           </p>
@@ -895,13 +1068,16 @@ export function PausedPanel({
           </details>
         </div>
         <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
-          {/* Non-owner (mirrors LimitWaitPanel): no live Resume/Stop, inert text stating who
-              can, never a greyed button that 404s. */}
+          {/* Non-owner (mirrors LimitWaitPanel): no live Resume/Extend/Stop, inert text stating
+              who can, never a greyed button that 404s. */}
           {canSteer ? (
             <>
               <Button size="sm" disabled={busy} onClick={onResume}>
                 ▶ Resume
               </Button>
+              {showExtend && onExtend && (
+                <ExtendTimePopover run={run} busy={busy} onSubmit={onExtend} triggerVariant="secondary" />
+              )}
               <Button variant="danger" size="sm" disabled={busy} onClick={onStop}>
                 Stop run
               </Button>
@@ -1330,13 +1506,18 @@ export function RunView() {
       .catch(() => setMrReworkDefault(null));
   }, [showMrRework]);
 
-  const act = async (fn: () => Promise<unknown>) => {
+  // Returns true when the action settled, false when it threw (the error is surfaced on the
+  // page banner). Callers that must react to failure — the Extend chooser keeps itself open on a
+  // false so the owner's pick is not lost — read this; the rest ignore it.
+  const act = async (fn: () => Promise<unknown>): Promise<boolean> => {
     setActionErr("");
     setBusy(true);
     try {
       await fn();
+      return true;
     } catch (e) {
       setActionErr(errorMessage(e, "Action failed"));
+      return false;
     } finally {
       setBusy(false);
     }
@@ -1643,6 +1824,22 @@ export function RunView() {
               )}
               {/* Run-health warn chip (PRD #47), next to the LIVE STAGE label. */}
               <HealthFlag run={run} />
+              {/* PRD #1189: the conditional Extend action, the way Expedite appears only on a
+                  queued run — shown ONLY while the near-timeout ("slow") flag is up, and only when
+                  the admin cap allows extending (extendEnabled: a 0 or unknown cap hides it). Owner
+                  gets the chooser; a non-owner gets inert text, never a button that 404s. */}
+              {shouldShowHealthFlag(run.health, run.status) &&
+                run.health === "slow" &&
+                extendEnabled(run) &&
+                (canSteer ? (
+                  <ExtendTimePopover
+                    run={run}
+                    busy={busy}
+                    onSubmit={(seconds) => act(() => submit("extend", String(seconds)))}
+                  />
+                ) : (
+                  <span className="text-xs text-muted">Only the run's owner can extend it.</span>
+                ))}
               {/* The live/offline WS indicator is only meaningful while the run is
                   active; a terminal run has no stream, so never show "completed • live".
 
@@ -1689,16 +1886,14 @@ export function RunView() {
                   {connected ? "live" : "offline"}
                 </span>
               )}
-              {run.status === "running" && run.started_at && <LiveElapsed since={run.started_at} />}
-              {/* PRD #1190: a paused run's elapsed is the STATIC active span (started_at →
-                  the pause at updated_at) with "· clock stopped", not a live ticker — the
-                  clock stops while paused. The budget-remaining clause ("… left when
-                  resumed") lands with #1189's budget_total_seconds, not here. */}
-              {run.status === "paused" && run.started_at && (
-                <span className="text-xs tabular-nums text-faint">
-                  {formatDuration(Date.parse(run.updated_at) - Date.parse(run.started_at))} · clock stopped
-                </span>
-              )}
+              {/* PRD #1189: the running elapsed gains the budget (`3h 48m / 8h`, focusable,
+                  deadline in the tooltip) when the run carries one; a null-budget kind keeps
+                  today's plain elapsed. */}
+              {run.status === "running" && run.started_at && <RunBudgetElapsed run={run} />}
+              {/* PRD #1190/#1189: a paused run's elapsed is the STATIC active span with "· clock
+                  stopped", not a live ticker. PRD #1189 adds the budget-remaining clause ("… left
+                  when resumed") ahead of it when the run carries a wall budget. */}
+              {run.status === "paused" && run.started_at && <PausedElapsed run={run} />}
               {run.iteration_count > 0 && (
                 <Badge tone="neutral" title="implement ⇄ review iterations">
                   iteration {run.iteration_count}
@@ -1786,6 +1981,18 @@ export function RunView() {
             await refreshRun();
           })
         }
+        onStop={() => act(() => submit("cancel"))}
+        onExtend={(seconds) => act(() => submit("extend", String(seconds)))}
+      />
+
+      {/* PRD #1189: the near-timeout panel — modelled on LimitWaitPanel, rendered under the
+          header while the near-timeout ("slow") flag is up. It explains what will happen, when,
+          and what is already safe, then offers Extend + Stop in one row. Self-hides otherwise. */}
+      <NearTimeoutPanel
+        run={run}
+        busy={busy}
+        canSteer={canSteer}
+        onExtend={(seconds) => act(() => submit("extend", String(seconds)))}
         onStop={() => act(() => submit("cancel"))}
       />
 

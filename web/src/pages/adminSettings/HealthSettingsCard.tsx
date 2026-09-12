@@ -31,6 +31,15 @@ const HEALTH_FIELDS: {
     hint: "Active running time, excluding time parked at a human gate, as a share of RUN_TIMEOUT or the run's frozen budget. 0 disables.",
     validate: validateHealthPercent,
   },
+  {
+    // PRD #1189: the per-run wall-clock extension allowance. It lives in this card (below the
+    // near-timeout percent) because it governs the SAME near-timeout moment, but it is NOT a
+    // health threshold — its bounds are {0} ∪ [3600, 604800], so it carries its own validator.
+    key: "run_extension_cap_seconds",
+    label: "Extension allowance per run (seconds)",
+    hint: "Total extra wall-clock time an owner may grant a run through Extend; 57600 = 16h. 0 turns extending off.",
+    validate: validateExtensionCapSeconds,
+  },
   { key: "health_queued_seconds", label: "Stuck queued after (seconds)", validate: validateHealthSeconds },
   { key: "health_approval_seconds", label: "Awaiting approval after (seconds)", validate: validateHealthSeconds },
   { key: "health_nudge_cooldown_seconds", label: "Slack nudge cooldown (seconds)", validate: validateHealthSeconds },
@@ -64,6 +73,20 @@ function validateHealthPercent(value: string): string | null {
   return null;
 }
 
+// validateExtensionCapSeconds mirrors the server's validateExtensionCapSeconds (PRD #1189):
+// 0 (disable) or a whole number in the inclusive range [3600, 604800] (1h to 7d). The bounds
+// differ from the health-seconds fields, so this validator is distinct; the message matches
+// the server's, which stays the source of truth. Digit-only for strconv.Atoi parity.
+function validateExtensionCapSeconds(value: string): string | null {
+  const v = value.trim();
+  const msg = "must be 0 (disabled) or between 3600 and 604800 seconds";
+  if (!/^\d+$/.test(v)) return msg;
+  const n = Number(v);
+  if (n === 0) return null;
+  if (n < 3600 || n > 604800) return msg;
+  return null;
+}
+
 // HealthSettingsCard is the admin surface for the run-health detector (PRD #47, #1170):
 // an enable toggle plus five thresholds — four in seconds and one (near timeout) a
 // percent of the run's wall-clock budget. It saves independently of
@@ -81,7 +104,10 @@ export function HealthSettingsCard({
 }) {
   const [enabled, setEnabled] = useState(settings.health_enabled === "true");
   const [values, setValues] = useState<Record<string, string>>(() =>
-    Object.fromEntries(HEALTH_FIELDS.map((f) => [f.key, settings[f.key]])),
+    // `?? ""` guards a mid-deploy api pod that predates a key (e.g. run_extension_cap_seconds):
+    // an undefined value would make the input uncontrolled; empty reads honestly and the field's
+    // validator then flags it.
+    Object.fromEntries(HEALTH_FIELDS.map((f) => [f.key, settings[f.key] ?? ""])),
   );
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -120,7 +146,7 @@ export function HealthSettingsCard({
       const resp = await api.updateSettings(payload);
       onSaved(resp);
       setEnabled(resp.settings.health_enabled === "true");
-      setValues(Object.fromEntries(HEALTH_FIELDS.map((f) => [f.key, resp.settings[f.key]])));
+      setValues(Object.fromEntries(HEALTH_FIELDS.map((f) => [f.key, resp.settings[f.key] ?? ""])));
       setNotice("Run-health settings saved.");
     } catch (err) {
       setError(errorMessage(err, "Failed to save run-health settings"));

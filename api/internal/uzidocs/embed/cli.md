@@ -94,6 +94,7 @@ uzi run revise <id> [--message <text>]
 uzi run cancel <id>
 uzi run stop <id> [--message <text>]
 uzi run scope <id> --through <n>
+uzi run extend <id> --by <duration>
 uzi run pause <id> [--now|--cancel]
 uzi run resume <id>
 uzi run resume-now <id>
@@ -231,6 +232,22 @@ A few worth knowing:
   below, not in `scope`'s own output, since a read-back there would race
   the worker settling it. Owner-only; valid only on a milestone-structured
   issue run (409 otherwise).
+- **`run extend <id> --by <duration>`** (PRD #1189) grants a non-terminal,
+  time-limited run more wall-clock time on top of its frozen budget — see
+  [Giving a run more time](./run-health.md#giving-a-run-more-time). `--by`
+  is required and takes a duration in Go's `time.ParseDuration` syntax
+  (`2h`, `90m`, `1h30m`) plus a `d` unit (`1d` = 24h); it must resolve to at
+  least 60 seconds (the server's minimum), so `0`, anything under a minute, a
+  negative value, or an unparseable one is a usage error (exit 2). Valid on any non-terminal run
+  of a kind the sweep can time out (issue, task, prompt, self-improve,
+  mr-rework, ci-fix), including a queued or parked one — a chat, judge, or
+  interactive-task run never times out, so extending one is a 409 (exit 5).
+  Extending past the admin's per-run allowance, or while an admin has
+  turned extending off entirely, is also a 409, with the server's message
+  (naming the remaining allowance) printed verbatim. On success it prints
+  the new deadline and the running total against the allowance, e.g.
+  `Extended <id> by 2h. 3h05m left, times out 17:20. Extensions on this
+  run: 2h of 16h allowed.` Owner-only.
 - **`run pause <id> [--now|--cancel]`** (PRD #1190) parks a running run on a
   pushed checkpoint until you resume it — see [Pausing and resuming a
   run](./run-pause.md) for the full picture. The default finishes the
@@ -1364,7 +1381,10 @@ non-`interactive` run is actually `running`, so a queued run, a gated run, a
 chat, and a finished run all print nothing. `run get`'s human view prints it
 as a `DEADLINE` row right after `HEALTH`, folded to local time plus a
 countdown (`15:20 · 1h05m left`, or `15:20 · stopping` once past) instead of
-the raw timestamp, emit-only-when-set the same way `PRD_MOVE` is above.
+the raw timestamp, emit-only-when-set the same way `PRD_MOVE` is above. On a
+run [extended](./run-health.md#giving-a-run-more-time) past its frozen
+budget, the row gains a trailing `· +2h extended` clause naming the total
+extra time granted so far.
 
 `run get` also prints a `NOW` row right after the `MILESTONES` block: the
 run's server-derived current activity, folded to

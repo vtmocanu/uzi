@@ -172,6 +172,23 @@ type RunDTO struct {
 	// turn ceiling and wall clock mid-run.
 	BudgetMaxIterations *int `json:"budget_max_iterations"`
 	BudgetWallSeconds   *int `json:"budget_wall_seconds"`
+	// BudgetExtensionSeconds is the owner-granted wall-clock extension (PRD #1189 M1) added ON
+	// TOP of the frozen budget; 0 for a run that was never extended. BudgetExtensionCapSeconds
+	// is the effective admin cap (run_extension_cap_seconds; 0 = extending disabled), served
+	// here so the Extend chooser and the CLI need no separate settings call. Both are always
+	// present (a non-pointer int): 0 is a meaningful value, not "unknown".
+	BudgetExtensionSeconds    int `json:"budget_extension_seconds"`
+	BudgetExtensionCapSeconds int `json:"budget_extension_cap_seconds"`
+	// BudgetTotalSeconds is the run's total wall-clock budget: COALESCE(budget_wall_seconds,
+	// RUN_TIMEOUT) + budget_extension_seconds, computed server-side so a client never has to
+	// know RUN_TIMEOUT. Null for a kind/state that never times out (not running, chat/judge,
+	// interactive, or no started_at) — the same predicate RunDeadline uses. BudgetUsedSeconds
+	// is the ACTIVE time so far (now - started_at - budget_paused_seconds, clamped at 0), the
+	// paused-aware "used" the header measures against the budget, NOT raw wall elapsed; null
+	// when the run never started. A new SPA against an older api sees these undefined and falls
+	// back to plain elapsed (rollout-skew safe).
+	BudgetTotalSeconds *int `json:"budget_total_seconds"`
+	BudgetUsedSeconds  *int `json:"budget_used_seconds"`
 	// ScopeCeiling is the operator scope ceiling (PRD #634 M2): the count of milestones the
 	// run may complete over the immutable frozen list; NULL = unbounded. Like the budget
 	// fields it rides the running-report ACK and the claim payload (both built by runToDTO),
@@ -672,6 +689,11 @@ type RunInputResponse struct {
 	ServerSide bool       `json:"server_side"`
 	ID         *int64     `json:"id,omitempty"`
 	CreatedAt  *time.Time `json:"created_at,omitempty"`
+	// PRD #1189 M1: a successful `extend` carries the new TOTAL budget_extension_seconds and
+	// the run's projected wall-clock deadline back to the CLI/web so it can print the outcome
+	// without a follow-up read. Both omitempty — set only on the extend path.
+	ExtensionSeconds *int       `json:"extension_seconds,omitempty"`
+	DeadlineAt       *time.Time `json:"deadline_at,omitempty"`
 }
 
 // SteerInputDTO is one steer-queue entry (PRD #95, #634), served by

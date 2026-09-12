@@ -375,6 +375,11 @@ export class WorkerClient {
             ack.budgetMaxIterations = fields.budgetMaxIterations;
           if (fields.budgetWallSeconds !== undefined)
             ack.budgetWallSeconds = fields.budgetWallSeconds;
+          // PRD #1189 M1 (D6): the served TOTAL wall (frozen budget + extension) rides the same
+          // ACK so the sdk-executor can re-arm its hard wall upward when an owner extends a run
+          // already executing.
+          if (fields.budgetTotalSeconds !== undefined)
+            ack.budgetTotalSeconds = fields.budgetTotalSeconds;
           // PRD #634 M2: the scope ceiling + fresh completed count ride the same ACK so m3's
           // loop-top honor gate can read them.
           if (fields.scopeCeiling !== undefined)
@@ -941,6 +946,7 @@ export async function readRunAck(res: Response): Promise<{
   status?: string;
   budgetMaxIterations?: number;
   budgetWallSeconds?: number;
+  budgetTotalSeconds?: number;
   scopeCeiling?: number;
   completedCount?: number;
   pauseRequested?: boolean;
@@ -954,6 +960,7 @@ export async function readRunAck(res: Response): Promise<{
         status?: unknown;
         budget_max_iterations?: unknown;
         budget_wall_seconds?: unknown;
+        budget_total_seconds?: unknown;
         scope_ceiling?: unknown;
         milestones_completed?: unknown;
         pause_requested?: unknown;
@@ -965,6 +972,7 @@ export async function readRunAck(res: Response): Promise<{
       status?: string;
       budgetMaxIterations?: number;
       budgetWallSeconds?: number;
+      budgetTotalSeconds?: number;
       scopeCeiling?: number;
       completedCount?: number;
       pauseRequested?: boolean;
@@ -975,6 +983,11 @@ export async function readRunAck(res: Response): Promise<{
       out.budgetMaxIterations = run.budget_max_iterations;
     if (typeof run?.budget_wall_seconds === "number")
       out.budgetWallSeconds = run.budget_wall_seconds;
+    // PRD #1189 M1 (D6): the served TOTAL wall (frozen budget + extension). null (a run with no
+    // wall deadline) or absent (older server) leaves it undefined, and the sdk-executor falls
+    // back to budgetWallSeconds.
+    if (typeof run?.budget_total_seconds === "number")
+      out.budgetTotalSeconds = run.budget_total_seconds;
     // PRD #634 M2: the operator scope ceiling (control channel) and the server's fresh
     // completed-milestone count, both off the same {run: RunDTO} body. scope_ceiling is
     // null (unbounded) unless a scope directive was written. A run whose lead never reported

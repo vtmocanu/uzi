@@ -37,6 +37,12 @@ type Settings interface {
 	// HealthNudgeCooldownSeconds bounds how often a single run may DM its owner
 	// (PRD #47 M4). 0 means no cooldown (nudge on every ok→flagged transition).
 	HealthNudgeCooldownSeconds(ctx context.Context) (int, error)
+	// RunExtensionCapSeconds is the TOTAL extra wall-clock time an owner may grant a run
+	// through Extend (PRD #1189 M1); 0 disables extending. It rides this run-health-card
+	// reader (the setting lives in that admin card and is served by the same *settings.Cache)
+	// so the `extend` SubmitInput branch can enforce the cap; the health detector itself does
+	// not read it.
+	RunExtensionCapSeconds(ctx context.Context) (int, error)
 }
 
 // Health flag values. These mirror the CHECK constraint on runs.health; keep them
@@ -357,7 +363,7 @@ func (s *Service) runningTarget(ctx context.Context, now time.Time, r store.List
 	// RunDeadline so the arm and the served deadline_at can never disagree (D9). Static
 	// reason; the live number rides deadline_at on the DTO (D4).
 	if th.nearTimeoutPct > 0 {
-		if effTimeout, ok := runWallClock(r.BudgetWallSeconds, r.Kind, r.Interactive, r.Status, r.StartedAt.Valid, s.p.RunTimeout); ok {
+		if effTimeout, ok := runWallClock(r.BudgetWallSeconds, r.Kind, r.Interactive, r.Status, r.StartedAt.Valid, s.p.RunTimeout, r.BudgetExtensionSeconds); ok {
 			active := now.Sub(r.StartedAt.Time) - time.Duration(r.BudgetPausedSeconds)*time.Second
 			if active >= effTimeout/100*time.Duration(th.nearTimeoutPct) { // divide first: no overflow, sub-100ns loss
 				return healthSlow, reasonNearTimeout
@@ -751,7 +757,10 @@ func healthPct(pct int, _ error) int {
 // has a wall deadline at all (the SweepRunningTimeout exclusion set: not chat/judge,
 // not interactive, running, started_at present, positive effTimeout). Shared by
 // RunDeadline and the near-timeout health arm so they cannot disagree (D9).
-func runWallClock(budgetWallSeconds pgtype.Int4, kind string, interactive bool, status string, startedValid bool, globalTimeout time.Duration) (effTimeout time.Duration, ok bool) {
+// PRD #1189: budgetExtensionSeconds is folded into effTimeout, so an owner-granted
+// extension moves the near-timeout line AND the served deadline together — exactly the
+// term SweepRunningTimeout adds to its own interval.
+func runWallClock(budgetWallSeconds pgtype.Int4, kind string, interactive bool, status string, startedValid bool, globalTimeout time.Duration, budgetExtensionSeconds int32) (effTimeout time.Duration, ok bool) {
 	if !startedValid || interactive || status != "running" || kind == "chat" || kind == "judge" {
 		return 0, false
 	}
@@ -759,6 +768,7 @@ func runWallClock(budgetWallSeconds pgtype.Int4, kind string, interactive bool, 
 	if budgetWallSeconds.Valid && budgetWallSeconds.Int32 > 0 {
 		effTimeout = time.Duration(budgetWallSeconds.Int32) * time.Second
 	}
+	effTimeout += time.Duration(budgetExtensionSeconds) * time.Second
 	if effTimeout <= 0 {
 		return 0, false
 	}
@@ -766,11 +776,12 @@ func runWallClock(budgetWallSeconds pgtype.Int4, kind string, interactive bool, 
 }
 
 // RunDeadline is the one server-computed wall-clock deadline every surface shares
-// (D9): started_at + COALESCE(budget_wall_seconds, globalTimeout) + budget_paused_seconds,
-// or nil when the run has no wall deadline (not running, chat/judge, interactive, or no
-// started_at). Pure. The extend/pause follow-up adds budget_extension_seconds here.
-func RunDeadline(startedAt pgtype.Timestamptz, budgetWallSeconds pgtype.Int4, budgetPausedSeconds int32, kind string, interactive bool, status string, globalTimeout time.Duration) *time.Time {
-	effTimeout, ok := runWallClock(budgetWallSeconds, kind, interactive, status, startedAt.Valid, globalTimeout)
+// (D9): started_at + COALESCE(budget_wall_seconds, globalTimeout) + budget_paused_seconds
+// + budget_extension_seconds, or nil when the run has no wall deadline (not running,
+// chat/judge, interactive, or no started_at). Pure. The extend/pause follow-up adds
+// budget_extension_seconds here.
+func RunDeadline(startedAt pgtype.Timestamptz, budgetWallSeconds pgtype.Int4, budgetPausedSeconds int32, kind string, interactive bool, status string, globalTimeout time.Duration, budgetExtensionSeconds int32) *time.Time {
+	effTimeout, ok := runWallClock(budgetWallSeconds, kind, interactive, status, startedAt.Valid, globalTimeout, budgetExtensionSeconds)
 	if !ok {
 		return nil
 	}

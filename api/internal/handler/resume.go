@@ -89,5 +89,5 @@ func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusNotFound, "run not found")
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout)})
+	httpx.JSON(w, http.StatusOK, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.clock())})
 }

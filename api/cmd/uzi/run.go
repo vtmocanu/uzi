@@ -26,6 +26,12 @@ const (
 	kindAnswer      = "answer"
 	kindStop        = "stop"
 	kindScope       = "scope"
+	// kindExtend is the owner's wall-clock budget extension steering input (PRD #1189 M3):
+	// `extend` carries a body of whole seconds to ADD to the run's budget. Like `scope` it
+	// is server-only (drained by neither ConsumeRunInputs nor the worker's steering route)
+	// and takes effect in the same statement, so a successful extend comes back with the new
+	// total + deadline on the RunInputResponse rather than settling later.
+	kindExtend = "extend"
 	// kindPause / kindPauseCancel are the owner's pause steering inputs (PRD #1190 M4):
 	// `pause` carries a mode body ("milestone"|"now"), `pause_cancel` withdraws a pending
 	// request. Both ride the same POST /inputs path the sibling steering verbs use. Resume
@@ -244,6 +250,7 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 		newRunListCmd(env, gf), newRunGetCmd(env, gf), newRunLogsCmd(env, gf), newRunWaitCmd(env, gf),
 		newRunReviewCmd(env, gf), newRunCreateCmd(env, gf), newRunApproveCmd(env, gf), newRunRejectCmd(env, gf),
 		newRunReviseCmd(env, gf), newRunCancelCmd(env, gf), newRunStopCmd(env, gf), newRunScopeCmd(env, gf),
+		newRunExtendCmd(env, gf),
 		newRunFollowUpCmd(env, gf), newRunAnswerCmd(env, gf), newRunInputsCmd(env, gf), newRunExpediteCmd(env, gf),
 		newRunResumeNowCmd(env, gf), newRunMrReworkCmd(env, gf), newRunPauseCmd(env, gf), newRunResumeCmd(env, gf), newRunReworkCmd(env, gf),
 		newRunDecideCmd(env, gf),

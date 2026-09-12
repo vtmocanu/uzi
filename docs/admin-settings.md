@@ -207,6 +207,7 @@ signal off, from **Admin → Instance settings → Run health**:
 | Enable run-health detection | on | Turns the whole detector on or off. |
 | Stalled after | 300s (5m) | Seconds of silence, with no tool call in flight, before a running run is flagged stalled. |
 | Near timeout at (% of wall-clock budget) | 85 | `health_near_timeout_pct` — the share of a run's wall-clock budget (`RUN_TIMEOUT`, or its frozen `budget_wall_seconds` for a milestone-scaled run, PRD #122) it must have used, in **active** running time only (time parked at a gate is excluded), before it's flagged near timeout. |
+| Extension allowance per run (seconds) | 57600 (16h) | `run_extension_cap_seconds` — the total extra wall-clock time an owner may grant a single run through [Extend](./run-health.md#giving-a-run-more-time), on top of its frozen budget. `0` turns extending off instance-wide. |
 | Stuck queued after | 600s (10m) | Seconds a run may sit queued before it's flagged waiting for worker. |
 | Awaiting approval after | 3600s (1h) | Seconds a run may sit awaiting approval before it's flagged; skipped for autopilot runs. |
 | Slack nudge cooldown | 1800s (30m) | Minimum time between Slack DMs about the same run's flag — see [Slack notifications](./slack.md). |
@@ -281,6 +282,9 @@ the same picture from a terminal instead of the web UI — see
   thresholds, `0` **disables that signal**. For the Slack nudge cooldown, `0`
   means something different: no rate limit, so a nudge fires on every
   ok→flagged transition instead of at most once per window.
+- The extension allowance is `0` (extending disabled instance-wide) or a
+  whole number of seconds from 3600 to 604800 (1h to 7d); anything else —
+  negative, non-integer, or a value in between the two ranges — is rejected.
 - An invalid save is rejected before anything is written. The same rules run
   client-side first for immediate feedback, but the server is the source of
   truth.

@@ -477,7 +477,12 @@ interface DriveState {
   isIssueRun: boolean;
   baseConfig: ClaudeTurnConfig;
   initialWallMs: number;
-  wallScaled: boolean;
+  // PRD #1189 M1 (D6): the LARGEST served wall (ms) applied so far — the monotonic
+  // upward-only re-arm high-water mark that replaced the one-shot wall-scaling latch. Each
+  // served value strictly greater than this lifts the in-turn wall by the delta; the worker
+  // never shortens its own wall (an extension only ever grows it), so the first milestone
+  // scale AND every later extension each re-arm, and a second bump is not swallowed.
+  maxServedWallMs: number;
   state: RunDrive;
   idleMs: number;
   onSignal: () => void;
@@ -1104,8 +1109,12 @@ export class SdkExecutor implements Executor {
       ctx.config?.run_timeout_seconds,
       DEFAULT_RUN_TIMEOUT_SECONDS,
     );
-    // Applied-once latch so a repeated ACK cannot keep inflating the wall reference.
-    let wallScaled = false;
+    // PRD #1189 M1 (D6): the high-water mark for the monotonic upward-only wall re-arm. It
+    // starts at the run's initial wall and only ever grows to the largest served wall seen, so
+    // the first milestone scale and every later owner-granted extension each lift the in-turn
+    // wall by the delta — and a repeated or smaller served value can never re-inflate or shorten
+    // it. This replaced the applied-once `wallScaled` latch, which swallowed a second bump.
+    let maxServedWallMs = initialWallMs;
     const state: RunDrive = {
       currentChild: {},
       wallRemainingMs: initialWallMs,
@@ -1173,7 +1182,7 @@ export class SdkExecutor implements Executor {
       isIssueRun,
       baseConfig,
       initialWallMs,
-      wallScaled,
+      maxServedWallMs,
       state,
       idleMs,
       onSignal,
@@ -1649,7 +1658,7 @@ export class SdkExecutor implements Executor {
     let resumeId = drive.resumeId;
     let maxIterations = drive.maxIterations;
     let latestProgress = drive.latestProgress;
-    let wallScaled = drive.wallScaled;
+    let maxServedWallMs = drive.maxServedWallMs;
 
       // --- Join the JS dependency install (PRD #121 M2) ---------------------
       // The IMPLEMENT phase must never race the install. Past this point the agent
@@ -1864,16 +1873,22 @@ export class SdkExecutor implements Executor {
           ) {
             maxIterations = served.maxIterations;
           }
-          if (typeof served.wallSeconds === "number") {
-            const servedMs = served.wallSeconds * 1000;
-            // The wall is PAUSED across the plan gate and debited only in-turn
-            // (armWall/disarmWall), so at loop-top only the plan turn has been debited and
-            // essentially the full initial budget remains. Adding the delta ONCE scales the
-            // worker's soft reference to match the sweeper's effective timeout, so a
-            // legitimately-scaled run does not self-trip REASON_WALL at the global 2h.
-            if (servedMs > initialWallMs && !wallScaled) {
-              state.wallRemainingMs += servedMs - initialWallMs;
-              wallScaled = true;
+          // PRD #1189 M1 (D6): prefer the served TOTAL wall (frozen budget + owner extension)
+          // when present, falling back to the plain scaled wall for back-compat with an older
+          // api that does not serve the total. The wall is PAUSED across the plan gate and
+          // debited only in-turn (armWall/disarmWall), so at loop-top essentially the full
+          // remaining budget is intact; adding the DELTA above the largest served wall seen
+          // scales the worker's hard wall to match the sweeper's effective timeout. This is
+          // MONOTONIC and UPWARD-ONLY: it re-arms on the first milestone scale AND on every
+          // later extension (a second bump is not swallowed by a latch), and it never shortens
+          // the wall from a smaller-or-equal served value — an extension only ever grows it,
+          // and the worker never trips REASON_WALL before the (always >=) server deadline.
+          const servedWallSeconds = served.totalWallSeconds ?? served.wallSeconds;
+          if (typeof servedWallSeconds === "number") {
+            const servedMs = servedWallSeconds * 1000;
+            if (servedMs > maxServedWallMs) {
+              state.wallRemainingMs += servedMs - maxServedWallMs;
+              maxServedWallMs = servedMs;
             }
           }
         }
@@ -2215,12 +2230,14 @@ export class SdkExecutor implements Executor {
               // field armWall/disarmWall read/debit, so no stale wall accumulator survives.
               // The whole-session cap is the M5 idle timeout, not the per-follow-up wall.
               state.wallRemainingMs = initialWallMs;
-              // Re-arm the applied-once wall-scaling latch (matching Fix 2's
-              // state.wallRemainingMs reset): a follow-up is a fresh task, so the server's
-              // wall-budget scaling must re-apply. Without this the latch stays `true` from a
-              // prior turn and the next `served.wallSeconds > initialWallMs` scaling (~:1462)
-              // is skipped, leaving the resumed follow-up on the unscaled default wall.
-              wallScaled = false;
+              // Reset the monotonic wall re-arm high-water mark to the fresh per-run allowance
+              // (matching Fix 2's state.wallRemainingMs reset): a follow-up is a fresh task, so
+              // the server's wall scaling (and any extension) must re-apply from initialWallMs.
+              // Without this the mark stays at a prior turn's largest served wall and the next
+              // served value <= it would be treated as "no growth", leaving the resumed follow-up
+              // on the unscaled default wall. PRD #1189 M1 (D6): the upward-only re-arm on the
+              // next ACK then lifts it to whatever total the server currently serves.
+              maxServedWallMs = initialWallMs;
               resetStallState(); // a follow-up is new input → breaks any refusal streak
               continue;
             }
