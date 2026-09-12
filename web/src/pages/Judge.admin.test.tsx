@@ -8,17 +8,20 @@
 // occurrences render with no run link and no run title; and there is no Dismiss control under All
 // users (paired with the positive on Mine). It follows Judge.test.tsx's mock-API pattern.
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { Judge } from "./Judge";
+import { GroupRow } from "./judge/GroupRow";
 import {
   api,
   type JudgeAdminBacklog,
   type JudgeAdminGroup,
   type JudgeAdminOccurrence,
   type JudgeBacklog,
+  type RunReview,
   type TriageCounts,
 } from "../lib/api";
+import { deferred } from "../test-helpers";
 import { judgeScope as judgeScopePref } from "../lib/prefs";
 import { JudgeTodoContext } from "../components/JudgeTodoContext";
 import { useAuth } from "../auth/AuthContext";
@@ -337,3 +340,129 @@ describe("Judge admin scope — cross-user Mark done and Undo", () => {
     );
   });
 });
+
+// Finding [7]: on a scope switch mine→all the two backlog fetches (getJudgeBacklog under `mine`,
+// getAdminJudgeBacklog under `all`) can overlap. `load` stamps a monotonic generation and gates
+// every state update on it, so a late OWNER response can never overwrite the current `all`
+// backlog — which is what stops a cross-user dispose from sending an owner coordinate. Both
+// completion orders are covered; the owner group's rationale preview ("My own latency note.") is
+// the tell that an owner response leaked into the aggregate view.
+describe("Judge admin scope — a superseded owner backlog response is dropped (Finding [7])", () => {
+  const OWNER_PREVIEW = "My own latency note.";
+  const ADMIN_PREVIEW = "Queue-to-claim latency dominated across users.";
+
+  async function switchToAllWithBothInFlight() {
+    const ownerD = deferred<JudgeBacklog>();
+    const adminD = deferred<JudgeAdminBacklog>();
+    mockApi.getJudgeBacklog.mockReturnValue(ownerD.promise);
+    mockApi.getAdminJudgeBacklog.mockReturnValue(adminD.promise);
+
+    renderJudge(); // admin, default pref → opens on Mine, so the owner fetch is issued first
+    await waitFor(() => expect(mockApi.getJudgeBacklog).toHaveBeenCalled());
+
+    // Switch to All users while the owner fetch is still parked → the two fetches now overlap.
+    fireEvent.click(screen.getByRole("button", { name: "All users" }));
+    await waitFor(() => expect(mockApi.getAdminJudgeBacklog).toHaveBeenCalled());
+    return { ownerD, adminD };
+  }
+
+  it("admin (current) resolves first, then the late owner response is dropped", async () => {
+    const { ownerD, adminD } = await switchToAllWithBothInFlight();
+
+    // The current-scope aggregate lands first and renders.
+    adminD.resolve(adminBacklog({ groups: [adminGroup({ rationale_preview: ADMIN_PREVIEW })] }));
+    await screen.findByText(ADMIN_PREVIEW);
+
+    // The late owner (mine) response resolves — it is superseded, so it applies NO state.
+    await act(async () => {
+      ownerD.resolve(ownerBacklog({ groups: [ownerGroupWithPreview(OWNER_PREVIEW)] }));
+      await ownerD.promise;
+    });
+    expect(screen.getByText(ADMIN_PREVIEW)).toBeTruthy();
+    expect(screen.queryByText(OWNER_PREVIEW)).toBeNull();
+  });
+
+  it("owner (superseded) resolves first and applies nothing, then admin wins", async () => {
+    const { ownerD, adminD } = await switchToAllWithBothInFlight();
+
+    // The superseded owner fetch resolves BEFORE the admin one; it must not paint anything.
+    await act(async () => {
+      ownerD.resolve(ownerBacklog({ groups: [ownerGroupWithPreview(OWNER_PREVIEW)] }));
+      await ownerD.promise;
+    });
+    expect(screen.queryByText(OWNER_PREVIEW)).toBeNull();
+
+    // The current aggregate then lands and is the only backlog shown.
+    adminD.resolve(adminBacklog({ groups: [adminGroup({ rationale_preview: ADMIN_PREVIEW })] }));
+    await screen.findByText(ADMIN_PREVIEW);
+    expect(screen.queryByText(OWNER_PREVIEW)).toBeNull();
+  });
+});
+
+// Finding [8]: GroupRow caches the owner scope's FULL rationale (rationaleMd/rationaleFetchedFor).
+// Judge.tsx keys a row by coordKey alone, so the instance is reused across a scope switch; under
+// `all` the fetch effect no-ops (no run_id to fetch with). Without a clear, the stale owner full
+// text would keep rendering in the expander. The effect clears the cache on entering `all` so the
+// expander shows only the anonymized clamped preview. Exercised at the GroupRow unit level so the
+// reused-instance transition is observed directly (the page-level loading toggle would remount it).
+describe("Judge admin scope — the owner full rationale is cleared on entering All users (Finding [8])", () => {
+  it("drops the cached owner full rationale, leaving the clamped preview under All users", async () => {
+    const fetchReview = vi.fn().mockResolvedValue({
+      review: {
+        recommendations: [
+          { category: "improve_uzi", target: "api/internal/poller", rationale_md: "OWNER FULL RATIONALE DETAIL" },
+        ],
+      } as unknown as RunReview,
+      pending_judge: null,
+    });
+    const shared = {
+      selected: false,
+      onToggleSelect: () => {},
+      onDispose: () => {},
+      repos: [],
+      onFiled: () => {},
+    };
+    const ownerGroup = ownerGroupWithPreview("My own latency note.");
+    const { rerender } = render(
+      <MemoryRouter>
+        <GroupRow group={ownerGroup} scope="mine" fetchReview={fetchReview} {...shared} />
+      </MemoryRouter>,
+    );
+
+    // Expand under Mine → the full owner rationale replaces the clamped preview.
+    fireEvent.click(screen.getByRole("button", { name: "Expand occurrences" }));
+    await waitFor(() => expect(screen.getByText("OWNER FULL RATIONALE DETAIL")).toBeTruthy());
+
+    // Re-render the SAME instance into the admin scope (fetchReview omitted, an admin group at the
+    // same coordinate). The stale owner rationale must be cleared.
+    rerender(
+      <MemoryRouter>
+        <GroupRow
+          group={adminGroup({ rationale_preview: "Queue-to-claim latency dominated across users." })}
+          scope="all"
+          fetchReview={undefined}
+          {...shared}
+        />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(screen.queryByText("OWNER FULL RATIONALE DETAIL")).toBeNull());
+    // Only the anonymized clamped preview remains (header + expander both render it).
+    expect(screen.getAllByText("Queue-to-claim latency dominated across users.").length).toBeGreaterThan(0);
+  });
+});
+
+// ownerGroupWithPreview builds a one-occurrence owner group carrying a distinct rationale preview,
+// reused by the Finding [7]/[8] tests to tell an owner backlog apart from the admin aggregate.
+function ownerGroupWithPreview(preview: string): JudgeBacklog["groups"][number] {
+  return {
+    category: "improve_uzi",
+    target: "api/internal/poller",
+    bucket: "todo",
+    open_count: 1,
+    run_count: 1,
+    rationale_preview: preview,
+    occurrences: [
+      { run_id: "run-1", run_title: "My run", review_id: "rev-1", rec_id: "rec-1", verdict: "issues", confidence: "", bucket: "todo" },
+    ],
+  };
+}

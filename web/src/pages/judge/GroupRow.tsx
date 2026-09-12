@@ -163,6 +163,18 @@ export function GroupRow({
     };
   }, [expanded, fetchReview, newestOpenRunId, group.category, group.target]);
 
+  // Judge.tsx keys a row by coordKey alone, so this instance is REUSED across a scope switch.
+  // Under `all` the fetch effect above no-ops (newestOpenRunId is undefined), which would leave a
+  // full rationale cached from the `mine` scope still rendering in the expander. Clear the cache
+  // when entering the admin scope so `all` shows only the anonymized clamped preview (PRD #1184
+  // M4, Finding [8]). The `mine`-scope behaviour is untouched.
+  useEffect(() => {
+    if (isAdmin) {
+      setRationaleMd(null);
+      rationaleFetchedFor.current = null;
+    }
+  }, [isAdmin]);
+
   return (
     <li className="rounded-lg border border-edge bg-raised/40">
       <div className="flex flex-wrap items-start gap-2 px-3 py-2.5">

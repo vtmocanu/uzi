@@ -816,6 +816,68 @@ describe("mockApi judge category stats (PRD #270)", () => {
   });
 });
 
+describe("mockApi judge admin routes: gating + DTO hygiene (Findings [4]/[5]/[6])", () => {
+  // `as const` pins category to the RecommendationCategory literal so the coordinate is a
+  // JudgeDispositionCoord (a bare string would not narrow to that union).
+  const coord = { category: "improve_uzi", target: "api/internal/poller" } as const;
+  // The six cross-user admin methods, invoked lazily so the rejected promise is created inside
+  // the expect (never a dangling unhandled rejection).
+  const adminCalls: [string, (a: Awaited<ReturnType<typeof reload>>) => Promise<unknown>][] = [
+    ["getAdminJudgeBacklog", (a) => a.getAdminJudgeBacklog("todo")],
+    ["getAdminJudgeCategoryStats", (a) => a.getAdminJudgeCategoryStats()],
+    ["adminSetJudgeDisposition", (a) => a.adminSetJudgeDisposition([coord])],
+    ["adminUndoJudgeDisposition", (a) => a.adminUndoJudgeDisposition([coord])],
+    ["getAdminJudgeIssueDraft", (a) => a.getAdminJudgeIssueDraft(coord.category, coord.target)],
+    [
+      "adminFileJudgeIssue",
+      (a) => a.adminFileJudgeIssue({ ...coord, repoId: "repo1", title: "t", description: "d" }),
+    ],
+  ];
+
+  // Finding [5]: the six admin methods sit behind RequireAdmin on the real API, so the mock gates
+  // them with requireAdmin() — a signed-in NON-admin gets 403, not a silent cross-user read.
+  it("all six admin judge methods reject a NON-admin session with 403 (Finding [5])", async () => {
+    installStorage();
+    const api = await reload();
+    // Sign in AS a seeded non-admin persona (the login-based persona switch the demo uses).
+    await api.login("mira@uzi.local", "whatever");
+    for (const [name, call] of adminCalls) {
+      await expect(call(api), `${name} must reject a non-admin with 403`).rejects.toMatchObject({
+        status: 403,
+      });
+    }
+  });
+
+  it("an admin session reaches the admin backlog (the positive pair for the 403s)", async () => {
+    installStorage();
+    const api = await reload();
+    await api.login("admin@uzi.local", "whatever"); // an unknown email falls back to the admin
+    const backlog = await api.getAdminJudgeBacklog("todo");
+    expect(Array.isArray(backlog.groups)).toBe(true);
+  });
+
+  // Finding [4]: `owner` is an INTERNAL field on MockReview (it feeds the admin distinct-user
+  // count). The run-page ReviewDTO has no such field, so it must never ride the run-page wire.
+  it("keeps the internal owner field OFF the run-page review DTO (Finding [4])", async () => {
+    installStorage();
+    const api = await reload();
+    const { review } = await api.getRunReview("run-done");
+    expect(review).not.toBeNull();
+    expect("owner" in review!).toBe(false);
+  });
+
+  // Finding [6]: the admin issue-draft provenance identifies both the producing user AND run
+  // (the real API renders "from <user>'s worker, run <shortID>"). The newest open poller
+  // occurrence is the demo caller's run-done review.
+  it("names the producing run id in the admin issue-draft provenance (Finding [6])", async () => {
+    installStorage();
+    const api = await reload();
+    await api.login("admin@uzi.local", "whatever");
+    const { draft } = await api.getAdminJudgeIssueDraft("improve_uzi", "api/internal/poller");
+    expect(draft.provenance).toContain("run-done");
+  });
+});
+
 // PRD #104: the mock must CASCADE a token delete the way the schema does.
 // Migrations 00078/00079 hang composite FKs off user_secrets (user_id, id) with
 // ON DELETE SET NULL, so deleting a bound token unbinds its workers and the judge.

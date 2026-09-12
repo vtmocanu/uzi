@@ -140,8 +140,16 @@ export function Judge() {
   // mounted outside an AppShell (every unit test does that), which is exactly why the
   // BLK-BADGE regression test mounts the two TOGETHER — apart, both are already correct.
   const setJudgeTodo = useSetJudgeTodo();
+  // A monotonic generation stamp for `load`, mirroring the guard useAsyncData applies to
+  // categoryStats. On a scope switch mine→all the two backlog fetches (getAdminJudgeBacklog under
+  // `all`, getJudgeBacklog under `mine`) can overlap, and a late owner response could otherwise
+  // overwrite the `all` backlog while scope === "all" — after which a cross-user dispose would send
+  // an owner coordinate to adminSetJudgeDisposition. Every state update inside load is gated on this
+  // stamp so a superseded invocation applies NO state.
+  const loadGen = useRef(0);
 
   const load = useCallback(async () => {
+    const gen = ++loadGen.current;
     setLoading(true);
     setError("");
     try {
@@ -149,6 +157,7 @@ export function Judge() {
         // The admin cross-user aggregate (no ?run= anchor — an anchor names a run). `triage`
         // here is the ALL-USERS tally, which must NOT reach the nav badge.
         const data = await api.getAdminJudgeBacklog(bucket, categories);
+        if (loadGen.current !== gen) return;
         setBacklog(data);
         // BADGE INVARIANT (PRD #1184): the nav badge and the Mine-tab count are the CALLER'S OWN
         // count, never the aggregate. So under `all` the badge is fed from the owner /me/judge/stats
@@ -157,12 +166,13 @@ export function Judge() {
         // failing the page.
         try {
           const own = await api.getJudgeStats();
-          setJudgeTodo(own.todo);
+          if (loadGen.current === gen) setJudgeTodo(own.todo);
         } catch {
           /* leave the badge as-is; the aggregate must never stand in for the caller's count */
         }
       } else {
         const data = await api.getJudgeBacklog(bucket, runAnchor || undefined, categories);
+        if (loadGen.current !== gen) return;
         setBacklog(data);
         // Keep the nav badge in step with every canonical triage this page learns, not only
         // the ones a disposition produces (PRD #98 review BLK-BADGE). `triage` here IS the
@@ -172,9 +182,9 @@ export function Judge() {
         setJudgeTodo(data.triage.todo);
       }
     } catch (e) {
-      setError(errorMessage(e, "Failed to load the backlog"));
+      if (loadGen.current === gen) setError(errorMessage(e, "Failed to load the backlog"));
     } finally {
-      setLoading(false);
+      if (loadGen.current === gen) setLoading(false);
     }
   }, [scope, bucket, runAnchor, categories, setJudgeTodo]);
 

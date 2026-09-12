@@ -26,7 +26,7 @@ import { coordKey, recommendationLabel } from "../../lib/judge";
 import { mockAdminScenarioReviews, mockPendingJudges, mockReviews, type MockReview } from "../data";
 import { getRun, nextRunId } from "../store";
 import { repos } from "./forge";
-import { delay, mockScenario, requireSession } from "./shared";
+import { delay, mockScenario, requireAdmin, requireSession } from "./shared";
 
 export const reviews: MockReview[] = mockReviews.map((r) => ({
   ...r,
@@ -81,10 +81,14 @@ function recomputeTriage(review: MockReview): TriageCounts {
 // reviewDTO deep-clones a review for the wire and derives its server-computed fields:
 // triage (via the ladder) and the disposition list filtered to coordinates that still
 // have a current recommendation (D#7 — an orphaned disposition is inert, never sent).
-function reviewDTO(review: MockReview): MockReview {
+function reviewDTO(review: MockReview): Omit<MockReview, "owner"> {
   const recCoords = new Set(review.recommendations.map((r) => coordKey(r.category, r.target)));
+  // owner is an INTERNAL field: it feeds the admin aggregate's distinct-user count, but the
+  // run-page ReviewDTO has no such field, so it must never reach the run-page wire. Destructure
+  // it off before the spread so the returned object carries everything BUT owner (Finding [4]).
+  const { owner: _owner, ...rest } = review;
   return {
-    ...review,
+    ...rest,
     recommendations: review.recommendations.map((x) => ({ ...x })),
     filed_issues: review.filed_issues.map((x) => ({ ...x })),
     dispositions: review.dispositions
@@ -844,15 +848,15 @@ export const judgeApi = {
   // server hides it: the aggregate carries counts, not identifiers. The scope-switch demo lives
   // behind the `judge-admin` mock scenario (three synthetic owners sharing coordinates).
   getAdminJudgeBacklog: async (bucket: JudgeBacklogBucket = "todo", categories?: string[]) => {
-    requireSession();
+    requireAdmin();
     return delay(computeAdminBacklog(bucket, categories ?? []), 80);
   },
   getAdminJudgeCategoryStats: async () => {
-    requireSession();
+    requireAdmin();
     return delay(computeAdminCategoryStats(), 60);
   },
   adminSetJudgeDisposition: async (items: JudgeDispositionCoord[]) => {
-    requireSession();
+    requireAdmin();
     if (items.length === 0) throw new ApiError(400, "items required");
     const want = new Map<string, JudgeDispositionCoord>();
     for (const it of items) want.set(coordKey(it.category, it.target), it);
@@ -893,7 +897,7 @@ export const judgeApi = {
     return delay(result, 120);
   },
   adminUndoJudgeDisposition: async (items: JudgeDispositionCoord[]) => {
-    requireSession();
+    requireAdmin();
     if (items.length === 0) throw new ApiError(400, "items required");
     const want = new Set(items.map((it) => coordKey(it.category, it.target)));
     // Remove ONLY the set_via='admin' rows on these coordinates, across every owner — a human's
@@ -913,7 +917,7 @@ export const judgeApi = {
     return delay(result, 120);
   },
   getAdminJudgeIssueDraft: async (category: string, target: string) => {
-    requireSession();
+    requireAdmin();
     const occ = newestAdminOpenOccurrence(category, target);
     if (!occ) throw new ApiError(404, "no open occurrence");
     const label = recommendationLabel(category as RecommendationCategory);
@@ -933,7 +937,9 @@ export const judgeApi = {
       labels: ["uzi"],
       // The draft KEEPS attribution (Decision 8): filing publishes a user's worker text, so the
       // reader must see whose text it is — this is the one surface the aggregate does not anonymize.
-      provenance: `from ${occ.owner}'s worker (run retrospective)`,
+      // It names both the producing user AND run, mirroring the real API's "from <user>'s worker,
+      // run <shortID>" (Finding [6]).
+      provenance: `from ${occ.owner}'s worker, run ${occ.review.target_run_id} (run retrospective)`,
       default_note: "Pick the repo you have connected to file this against.",
     };
     return delay({ draft }, 80);
@@ -945,7 +951,7 @@ export const judgeApi = {
     title: string;
     description: string;
   }) => {
-    requireSession();
+    requireAdmin();
     // Resolve the newest open occurrence AGAIN at file time (a fresher review moves the link),
     // exactly as the server does.
     const occ = newestAdminOpenOccurrence(body.category, body.target);
