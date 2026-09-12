@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"regexp"
 	"strings"
+	"unicode"
 
+	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
 )
@@ -196,6 +198,109 @@ func DecodeMilestones(raw []byte) ([]apitypes.Milestone, error) {
 		return nil, nil
 	}
 	var out []apitypes.Milestone
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// milestoneAgentsParam is the Decision 5/6 per-entry validator for a run's per-milestone
+// agent attribution (PRD #1224). Unlike validateMilestones/validateProgressIDs, which reject
+// a whole list on any bad entry, this DROPS invalid entries PER ENTRY (Decision 5) and returns
+// the surviving subset — first-valid-wins on a duplicated id.
+//
+// It is COUPLED to the in_progress write (Decision 6): inProgressJSON is the ALREADY-VALIDATED
+// in_progress param (progressParams' output), nil when in_progress was not validly updated this
+// report. A nil inProgressJSON leaves milestones_agents UNTOUCHED (returns nil) — attribution
+// never rides on its own. A non-nil inProgressJSON always yields an encoded array ('[]' when no
+// entry survives), the value the SQL COALESCEs onto the column.
+//
+// Kind-gated to issue runs (Decision 13). Per surviving entry: the id must be in THIS report's
+// validated in_progress set (which, being a progressParams output, is already a frozen member),
+// no earlier valid entry claimed the same id, and the agent passes agenttmpl.IsValidName (D4:
+// kebab-case, ≤ MaxNameLen; also rejects empty). Agent is stored BYTE-EXACT (never trimmed or
+// lowercased) so it byte-matches current_activity.agent; the label is stripped+capped via
+// sanitizeAgentLabel. An invalid entry does NOT reserve its id, so a later valid entry for the
+// same id can still win. On an encode error the whole param drops to nil.
+func milestoneAgentsParam(kind string, inProgressJSON []byte, agents *[]apitypes.MilestoneAgent) []byte {
+	if kind != runkind.Issue {
+		return nil
+	}
+	if inProgressJSON == nil {
+		// in_progress not validly updated this report → leave the column untouched. Never
+		// write attribution on its own (Decision 6).
+		return nil
+	}
+	inProgressIDs, err := DecodeMilestoneIDs(inProgressJSON)
+	if err != nil {
+		return nil
+	}
+	inProg := make(map[string]bool, len(inProgressIDs))
+	for _, id := range inProgressIDs {
+		inProg[id] = true
+	}
+	out := make([]apitypes.MilestoneAgent, 0)
+	if agents != nil {
+		seen := make(map[string]bool, len(*agents))
+		for _, e := range *agents {
+			if !inProg[e.ID] {
+				continue // id not in the validated in-progress set this report
+			}
+			if seen[e.ID] {
+				continue // a valid entry already won this id (first-valid-wins)
+			}
+			if !agenttmpl.IsValidName(e.Agent) {
+				continue // D4: mis-shaped/empty agent; does NOT reserve the id
+			}
+			seen[e.ID] = true
+			out = append(out, apitypes.MilestoneAgent{
+				ID:         e.ID,
+				Agent:      e.Agent, // BYTE-EXACT: must match current_activity.agent
+				AgentLabel: sanitizeAgentLabel(e.AgentLabel),
+			})
+		}
+	}
+	encoded, err := encodeJSONArray(out)
+	if err != nil {
+		return nil
+	}
+	return encoded
+}
+
+// sanitizeAgentLabel mirrors runactivity.sanitize (the RunActivity.AgentLabel fold, PRD #1224
+// D4): it strips the terminal-unsafe runes (unicode.IsControl covers C0/C1/DEL, unicode.Cf the
+// format characters — bidi overrides, zero-widths, the BOM) and caps the result at
+// maxMilestoneTitleRunes runes. runactivity's rule is private to that package, so it is
+// replicated here rather than imported. An empty result is allowed (the label is optional).
+func sanitizeAgentLabel(s string) string {
+	if s == "" {
+		return ""
+	}
+	out := make([]rune, 0, len(s))
+	n := 0
+	for _, r := range s {
+		if unicode.IsControl(r) || unicode.In(r, unicode.Cf) {
+			continue
+		}
+		out = append(out, r)
+		n++
+		if n >= maxMilestoneTitleRunes {
+			break
+		}
+	}
+	return string(out)
+}
+
+// DecodeMilestoneAgents reads a runs.milestones_agents jsonb column into the wire shape,
+// mirroring DecodeMilestoneIDs. A NULL/empty column yields a NIL slice ("no attribution"),
+// which the DTO renders as JSON null. Malformed jsonb is an error the caller degrades to
+// nil-and-log. The stored value is the already-validated/sanitized subset milestoneAgentsParam
+// produced, so no re-validation happens here.
+func DecodeMilestoneAgents(raw []byte) ([]apitypes.MilestoneAgent, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	var out []apitypes.MilestoneAgent
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return nil, err
 	}

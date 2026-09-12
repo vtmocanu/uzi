@@ -19,6 +19,20 @@ type Milestone struct {
 	Title string `json:"title"`
 }
 
+// MilestoneAgent is one entry of a run's per-in-progress-milestone agent attribution
+// (PRD #1224): the milestone id, the acting agent's identifier (the subagent_type the lead
+// declared, IsValidName-validated and stored BYTE-EXACT server-side so it byte-matches
+// current_activity.agent for the live-enrichment join), and an optional short display label.
+// Agent is a validated kebab-case identifier and terminal-safe; AgentLabel is UNTRUSTED,
+// model-authored display text the server strips+caps (200 runes) before it lands here, and
+// every renderer still applies its own terminal-safety fold — the same obligation
+// RunActivity.AgentLabel and Milestone.Title carry.
+type MilestoneAgent struct {
+	ID         string `json:"id"`
+	Agent      string `json:"agent"`
+	AgentLabel string `json:"agent_label"`
+}
+
 // RunSummaryDelta is one entry of a run's plan-summary deltas list (PRD #362): how
 // the proposed plan diverged from the original ask. Kind is a closed enum
 // {added, changed, dropped} (validated-and-rejected on persist, Decision 6); Text is
@@ -143,6 +157,13 @@ type RunDTO struct {
 	// create/worker DTO paths.
 	MilestonesCompleted  []string `json:"milestones_completed"`
 	MilestonesInProgress []string `json:"milestones_in_progress"`
+	// MilestonesAgents is the validated per-in-progress-milestone agent attribution (PRD
+	// #1224, Decision 6/8): the subset of the lead's declaration whose ids survived
+	// membership + in-progress validation. Nil ⇒ JSON null ⇒ no effective attribution (every
+	// pre-feature run and every run the lead did not attribute), which every renderer treats
+	// as "render exactly as today" (Decision 8). Each entry's id is also a member of
+	// MilestonesInProgress; renderers re-filter against the live set as defense in depth.
+	MilestonesAgents []MilestoneAgent `json:"milestones_agents"`
 	// BudgetMaxIterations and BudgetWallSeconds are the run's EFFECTIVE budget (PRD #122
 	// M2, Decision 5/5b), derived server-side from the frozen milestone count at freeze
 	// and persisted. Each is null when the run is on the GLOBAL default (a 0/1-milestone

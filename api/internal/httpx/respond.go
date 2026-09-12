@@ -26,16 +26,27 @@ import (
 // instead of an ambiguous 400.
 const maxBodyBytes = 1 << 20
 
-// JSON writes v as a JSON response with the given status code.
+// JSON writes v as a JSON response with the given status code. Encoding and
+// response-write failures are logged; callers that need to observe them use WriteJSON.
 func JSON(w http.ResponseWriter, status int, v any) {
+	_ = WriteJSON(w, status, v)
+}
+
+// WriteJSON writes v as a JSON response and returns any error reported by the encoder,
+// including a ResponseWriter.Write error. The status and any partial body are already
+// committed when an error is returned, so callers may observe it but must not write another
+// response.
+func WriteJSON(w http.ResponseWriter, status int, v any) error {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	if v == nil {
-		return
+		return nil
 	}
 	if err := json.NewEncoder(w).Encode(v); err != nil {
 		slog.Error("encode json response", "error", err)
+		return err
 	}
+	return nil
 }
 
 // Error writes a JSON error body: {"error": "<message>"}.

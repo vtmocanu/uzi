@@ -90,6 +90,70 @@ func jwtWithAccountID(t *testing.T, accountID string) string {
 	return assembleJWT([]byte(`{"alg":"none","typ":"JWT"}`), payload, []byte("sig"))
 }
 
+func jwtWithFreshIdentityClaims(t *testing.T, accountID, chatGPTUserID, authUserID string) string {
+	t.Helper()
+	payload, err := json.Marshal(map[string]any{
+		"sub": "different-subject-domain",
+		"https://api.openai.com/auth": map[string]any{
+			"chatgpt_account_id":      accountID,
+			"chatgpt_user_id":         chatGPTUserID,
+			"chatgpt_account_user_id": "different-membership-domain",
+			"user_id":                 authUserID,
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal fresh identity claims: %v", err)
+	}
+	return assembleJWT([]byte(`{"alg":"none","typ":"JWT"}`), payload, []byte("sig"))
+}
+
+func TestParseFreshAccessTokenIdentityClaims(t *testing.T) {
+	header := []byte(`{"alg":"none","typ":"JWT"}`)
+	sig := []byte("sig")
+	tests := []struct {
+		name  string
+		token string
+		want  FreshAccessTokenIdentityClaims
+	}{
+		{
+			name:  "complete established claims",
+			token: jwtWithFreshIdentityClaims(t, "acct-a", "user-a", "user-a"),
+			want: FreshAccessTokenIdentityClaims{
+				ChatGPTAccountID: "acct-a",
+				ChatGPTUserID:    "user-a",
+				AuthUserID:       "user-a",
+			},
+		},
+		{
+			name:  "distinct user claims stay distinct",
+			token: jwtWithFreshIdentityClaims(t, "acct-a", "user-a", "user-b"),
+			want: FreshAccessTokenIdentityClaims{
+				ChatGPTAccountID: "acct-a",
+				ChatGPTUserID:    "user-a",
+				AuthUserID:       "user-b",
+			},
+		},
+		{
+			name:  "missing user claim remains empty",
+			token: assembleJWT(header, []byte(`{"https://api.openai.com/auth":{"chatgpt_account_id":"acct-a","chatgpt_user_id":"user-a"}}`), sig),
+			want:  FreshAccessTokenIdentityClaims{ChatGPTAccountID: "acct-a", ChatGPTUserID: "user-a"},
+		},
+		{
+			name:  "wrong claim type zeroes result",
+			token: assembleJWT(header, []byte(`{"https://api.openai.com/auth":{"chatgpt_account_id":"acct-a","chatgpt_user_id":123,"user_id":"user-a"}}`), sig),
+		},
+		{name: "malformed jwt zeroes result", token: "not-a-jwt"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ParseFreshAccessTokenIdentityClaims(tt.token); got != tt.want {
+				t.Fatalf("claims = %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
 // (a) Both identity fields present → Identity returned, and the oauth counter is 0
 // after DiscoverIdentity — the discovery path is nonrotating.
 func TestDiscoverIdentityBothPresent(t *testing.T) {
@@ -179,7 +243,7 @@ func TestDiscoverIdentityUnauthorized(t *testing.T) {
 // returns the new access token, proving the instrument observes oauth calls (so the
 // zero-counts in (a)-(d) are meaningful, not vacuous).
 func TestRefreshControlObservesOAuth(t *testing.T) {
-	newAccess := assembleToken("rotated-access")
+	newAccess := jwtWithFreshIdentityClaims(t, "acct-rotated", "user-rotated", "user-rotated")
 	newRefresh := assembleToken("rotated-refresh")
 	tr := newCountingTransport(func(key string, _ *http.Request) (*http.Response, error) {
 		if key != oauthKey {
@@ -198,6 +262,14 @@ func TestRefreshControlObservesOAuth(t *testing.T) {
 	}
 	if res.RefreshToken == nil || *res.RefreshToken != newRefresh {
 		t.Fatalf("refresh token = %v, want %q", res.RefreshToken, newRefresh)
+	}
+	wantClaims := FreshAccessTokenIdentityClaims{
+		ChatGPTAccountID: "acct-rotated",
+		ChatGPTUserID:    "user-rotated",
+		AuthUserID:       "user-rotated",
+	}
+	if res.IdentityClaims != wantClaims {
+		t.Fatalf("identity claims = %+v, want %+v", res.IdentityClaims, wantClaims)
 	}
 	if tr.counts[oauthKey] != 1 {
 		t.Fatalf("oauth endpoint hit %d times, want 1", tr.counts[oauthKey])

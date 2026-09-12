@@ -324,6 +324,13 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration) ap
 	} else {
 		dto.MilestonesInProgress = inProgress
 	}
+	// PRD #1224: the validated per-milestone agent attribution. Degrades to nil on a decode
+	// error (the stored value is the already-validated subset), same as the id arrays above.
+	if agents, err := workersvc.DecodeMilestoneAgents(r.MilestonesAgents); err != nil {
+		slog.Error("decode run milestones agents", "run_id", r.ID, "error", err)
+	} else {
+		dto.MilestonesAgents = agents
+	}
 	if r.BudgetMaxIterations.Valid {
 		v := int(r.BudgetMaxIterations.Int32)
 		dto.BudgetMaxIterations = &v

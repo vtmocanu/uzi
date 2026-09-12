@@ -1,16 +1,16 @@
 # PRD #1171: Complete Codex production adapter and execution safety
 
 **Parent:** [#1106](https://github.com/vtmocanu/uzi/issues/1106), remaining M3 (M3b) only.
-**Status (verified 2026-09-10):** PR #1220 contains the completed dark production adapter. The exact native AMD64 base and JVM worker images from implementation commit `e2e33ff` each passed `15/15` packaging controls and `14/14` lifecycle tests on an OKD cluster, using synthetic credentials and an internal no-egress network. Milestones 1-5 are complete. The child remains open only for final CodeRabbit confirmation, merge and post-merge CI; maintainer-only real-provider acceptance remains separate and parent #1106 M3 stays unchecked until that acceptance completes.
-**Execution:** When authorized, use a gated run so the milestone count scales the budget. Pre-flight must select a worker reporting `docker:true` with this repo allowlisted; block dispatch if none is available. Decide the MR-rework override at dispatch time. Implementation effort: high.
+**Status (verified 2026-09-11):** PR #1220 merged the completed dark production adapter, and child issue #1171 is closed. The exact native AMD64 base and JVM worker images from implementation commit `e2e33ff` each passed `15/15` packaging controls and `14/14` lifecycle tests on an isolated cluster, using synthetic credentials and an internal no-egress network. Milestones 1-5, merge and post-merge CI are complete. A first real-subscription pass separately proved identity, release and coordinated refresh; parent #1106 M3 remains unchecked only for the targeted subscription advice, live cancel/root-settlement and broad no-leak delta. The user moved the real API-key repeat to parent M6 on 2026-09-11; the offline API-key no-fallback controls remain unchanged.
+**Execution:** Complete; do not redispatch this child. Parent #1106 owns the remaining targeted maintainer acceptance and later milestones.
 
-M3a [#1156](https://github.com/vtmocanu/uzi/issues/1156) packages pinned Codex 0.153.2 in both worker images and supplies one isolated, observed-clean supervisor-root launcher. M2 [#1146](https://github.com/vtmocanu/uzi/issues/1146) supplies the neutral run/advice harness boundary while preserving Claude behavior. M1 [#1147](https://github.com/vtmocanu/uzi/issues/1147) supplies named credentials, immutable run binding, per-claim capability authorization and coordinated refresh/recovery. The remaining M3 work is to connect those three foundations into a production Codex run and advice adapter without enabling public Codex routing yet.
+M3a [#1156](https://github.com/vtmocanu/uzi/issues/1156) packaged pinned Codex 0.153.2 in both worker images and supplied the isolated supervisor-root launcher. M2 [#1146](https://github.com/vtmocanu/uzi/issues/1146) supplied the neutral run/advice harness boundary while preserving Claude behavior. M1 [#1147](https://github.com/vtmocanu/uzi/issues/1147) supplied named credentials, immutable run binding, per-claim capability authorization and coordinated refresh/recovery. This child connected those foundations into the dark production Codex run and advice adapter without enabling public routing.
 
-Use current `main` and a new working branch; never touch `main`. The accepted [ADR-1106 execution policy](../adr/1106-codex-harness.md#execution-policy), [neutral harness contract](../e2e/codex-m0/harness-contract.md#contracts), [M1 credential contract](done/1147-codex-credentials-foundation.md) and [M3a launcher contract](done/1156-codex-image-launcher.md) are authoritative. Complete only this child and hand off its PR. Do not start M4-M7, enable production routing, deploy, release, close the parent, or claim phase-1 Codex support.
+The accepted [ADR-1106 execution policy](../../adr/1106-codex-harness.md#execution-policy), [neutral harness contract](../../e2e/codex-m0/harness-contract.md#contracts), [M1 credential contract](1147-codex-credentials-foundation.md) and [M3a launcher contract](1156-codex-image-launcher.md) remain authoritative. Parent #1106 owns M4-M7, public routing, deployment, release and the phase-1 completion claim.
 
 ## Problem and outcome
 
-The repository can store Codex credentials and contains the stock app-server transport, callback broker, registry/safety owner, run/advice adapters and renderer delivered by #1188. The live worker still constructs only `ClaudeHarness`/`ClaudeAdviceHarness`: the merged Codex core has not been connected to production credential callbacks, child delegation, executor composition or durability sinks. M4 conformance and M5 routing remain blocked on that integration and acceptance. (AI-synced 2026-09-08)
+At the #1188 baseline, the repository could store Codex credentials and contained the dark transport, broker, registry/safety owner, run/advice adapters and renderer, but the live worker still constructed only `ClaudeHarness`/`ClaudeAdviceHarness`. This child connected that core to production credential callbacks, child delegation, executor composition and durability sinks. Parent M4 conformance and M5 routing remain separate. (AI-synced 2026-09-11)
 
 Deliver the complete **production execution spine** for a Codex-selected, already-bound claim:
 
@@ -70,7 +70,7 @@ The gated plan must name the concrete modules, state transitions and failure pre
 
 ## Remaining execution graph after #1188
 
-**Account-meter coordination (#1209, verified 2026-09-08):** [Codex account limits](1209-codex-account-rate-limits.md) is a separate visibility PRD. This child retains ownership of `codexauth.Client` production injection, worker release/refresh authorization and runtime durability boundaries. #1209 sequences its shared credential integration after this implementation lands, then adds an internal API-side account reader over the same coordinator. Do not add meter polling, UI or a worker callback for it here. #1209 does not depend on M4-M7 or authorize this child's dispatch.
+**Account-meter coordination (#1209, dependency satisfied 2026-09-11):** [Codex account limits](../1209-codex-account-rate-limits.md) is a separate visibility PRD. This child delivered `codexauth.Client` production injection, worker release/refresh authorization and runtime durability boundaries. #1209 may consume the landed coordinator for its internal API-side account reader; it does not depend on M4-M7.
 
 The merged dark core is a prerequisite, not work to reproduce. Preserve its transport, registry/safety owner, broker authority, renderer, run/advice harnesses, fd-anchored session store, file helper and OS identities. The new run implements only the deferred items recorded in the progress log.
 
@@ -96,12 +96,14 @@ The merged dark core is a prerequisite, not work to reproduce. Preserve its tran
 
 This section is deliberately **not** a uzi-worker milestone: restricted workers do not receive a maintainer Codex credential, and the currently deployed worker image predates M3a. Before checking parent #1106 M3 complete, the maintainer must run the child-provided injection-only probe in an isolated current worker image and record only sanitized evidence in the parent progress log:
 
-1. start and complete one production run-harness turn and one advice-harness pass with a Codex subscription login, then repeat startup with an OpenAI API key; no fallback between modes;
+1. start and complete one production run-harness turn and one advice-harness pass with a Codex subscription login; no credential fallback;
 2. run two app-server processes against the same subscription state, force an expired generation, observe exactly one coordinated refresh and both processes consuming the one durable generation;
 3. recreate the process/root and authenticate from the API's committed state, then exercise cancel and final boundary cleanup with every registered root settled;
 4. verify no secret, capability, account id, private endpoint, session/thread id or raw auth artifact appears in logs, git, image layers or the public evidence.
 
-If this live acceptance cannot be performed safely, merge may still close child #1171's implementation, but parent M3 remains unchecked and M4/M5 must not be dispatched as though the production integration were accepted.
+The user moved the real OpenAI API-key startup/advice repeat to parent M6 on 2026-09-11. M3 retains the completed offline API-key authorization, zero-refresh and no-fallback controls; a synthetic key cannot satisfy M6's deferred live check.
+
+If this subscription acceptance cannot be performed safely, merge may still close child #1171's implementation, but parent M3 remains unchecked and M4/M5 must not be dispatched as though the production integration were accepted.
 
 ## Success criteria
 
@@ -112,7 +114,7 @@ If this live acceptance cannot be performed safely, merge may still close child 
 5. Subscription and API-key modes are separately constructed with no fallback. Provider state is OS-inaccessible to command/file effects; no model-visible credential/capability or unbounded/secret-bearing diagnostic is emitted.
 6. Claude execution/advice behavior, prompts, wire projection, error ordering, cleanup timing and existing tests remain unchanged; discriminating mutations prove the new assertions can fail.
 7. Negative tests prove public manual/schedule/chat creation remains dark/Claude-compatible, ordinary claims omit `secrets.codex` byte-for-byte, and only the explicit internal bound-claim seam selects Codex; M5 still owns enablement and old-worker compatibility.
-8. `task test:codex-m3b:packaged` proves both `base` and `jvm` execute image-baked production code with nonzero expected test/callback/root counts and the dry maintainer probe; the aggregate offline gates pass, then maintainer-only live acceptance passes before parent M3 is checked.
+8. `task test:codex-m3b:packaged` proves both `base` and `jvm` execute image-baked production code with nonzero expected test/callback/root counts and the dry maintainer probe; the aggregate offline gates pass, then the maintainer-only subscription acceptance passes before parent M3 is checked. Parent M6 separately gates the D14 real API-key repeat.
 9. The branch diff and history contain no `.github/workflows/**` change, real credential/private deployment data or M0 characterization edit; the new constructor and worker-route Semgrep rules have discriminating red controls.
 
 ## Risks and stop conditions
@@ -128,6 +130,8 @@ If this live acceptance cannot be performed safely, merge may still close child 
 - **Unsafe live validation:** no uzi worker performs real-provider testing. If maintainer isolation or safe secret injection is unavailable, record the exact blocker and leave parent M3 open.
 
 ## Progress log
+
+- 2026-09-11 (live-acceptance timing decision): the user moved the real OpenAI API-key startup/advice repeat from the M3 gate to parent M6 because only a subscription credential is available for the targeted completion pass. The first subscription pass already proved identity, release and coordinated refresh; M3 still requires subscription advice, live cancel/root settlement and the broad no-leak delta. Existing offline API-key authorization, zero-refresh and no-fallback evidence remains mandatory. This decision changes validation timing only and does not mark parent M3 complete.
 
 - 2026-09-08 (account-meter conflict check): verified the latest issue body and PR #1200 while preparing #1209. Corrected the stale header requesting new authorization and the present-tense claim that the #1188 core did not exist. The issue already records conditional Auto authorization, with #1197 still pending; #1190 has merged. Added the separate meter PRD's file/authority boundary. Historical baseline facts below retain their original commit/date; no milestone or dispatch state was changed by this documentation update.
 

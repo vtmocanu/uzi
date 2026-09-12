@@ -1089,11 +1089,23 @@ UPDATE runs SET
     -- milestone count at freeze, written IMMUTABLY. NULL for a 0/1-milestone run so its
     -- budget is byte-for-byte the global default. Count capped at milestone_budget_cap,
     -- wall capped at budget_wall_ceiling_seconds. Frozen source = same COALESCE as above.
+    -- Issue #1181: mirror of the CreateApprovePlanInput size_class floor for the AUTOPILOT
+    -- path. The count<=1 arm floors an 'l' run instead of dropping to NULL; 's'/'m'/'' stay
+    -- NULL. Read COALESCE(sqlc.narg('size_class'), size_class) — this statement SETs size_class
+    -- (line above) and Postgres evaluates SET RHS against the OLD row, so bare size_class would
+    -- miss the size_class this self-contained running report carries at the freeze instant. The
+    -- count>=2 arm is unchanged. If you change this, change CreateApprovePlanInput too.
     budget_max_iterations = COALESCE(budget_max_iterations,
-        CASE WHEN COALESCE(jsonb_array_length(COALESCE(milestones_frozen, sqlc.narg('milestones_frozen')::jsonb, milestones_candidate)), 0) <= 1 THEN NULL
+        CASE WHEN COALESCE(jsonb_array_length(COALESCE(milestones_frozen, sqlc.narg('milestones_frozen')::jsonb, milestones_candidate)), 0) <= 1
+                 THEN CASE COALESCE(sqlc.narg('size_class'), size_class)
+                          WHEN 'l' THEN sqlc.arg('run_max_iterations')::int * sqlc.arg('size_budget_factor_l')::int
+                          ELSE NULL END
              ELSE sqlc.arg('run_max_iterations')::int * LEAST(jsonb_array_length(COALESCE(milestones_frozen, sqlc.narg('milestones_frozen')::jsonb, milestones_candidate)), sqlc.arg('milestone_budget_cap')::int) END),
     budget_wall_seconds = COALESCE(budget_wall_seconds,
-        CASE WHEN COALESCE(jsonb_array_length(COALESCE(milestones_frozen, sqlc.narg('milestones_frozen')::jsonb, milestones_candidate)), 0) <= 1 THEN NULL
+        CASE WHEN COALESCE(jsonb_array_length(COALESCE(milestones_frozen, sqlc.narg('milestones_frozen')::jsonb, milestones_candidate)), 0) <= 1
+                 THEN CASE COALESCE(sqlc.narg('size_class'), size_class)
+                          WHEN 'l' THEN LEAST(sqlc.arg('run_timeout_seconds')::int * sqlc.arg('size_budget_factor_l')::int, sqlc.arg('budget_wall_ceiling_seconds')::int)
+                          ELSE NULL END
              ELSE LEAST(sqlc.arg('run_timeout_seconds')::int * LEAST(jsonb_array_length(COALESCE(milestones_frozen, sqlc.narg('milestones_frozen')::jsonb, milestones_candidate)), sqlc.arg('milestone_budget_cap')::int), sqlc.arg('budget_wall_ceiling_seconds')::int) END),
     -- PRD #122 M2 (Decision 3): completed is UNIONED (monotone, dedup); in_progress is
     -- OVERWRITTEN wholesale. NULL param = "not reported this call" → column untouched.
@@ -1109,6 +1121,18 @@ UPDATE runs SET
     milestones_in_progress = CASE
         WHEN sqlc.narg('milestones_in_progress')::jsonb IS NULL THEN milestones_in_progress
         ELSE sqlc.narg('milestones_in_progress')::jsonb
+    END,
+    -- PRD #1224 M2 (Decision 6): the per-milestone agent attribution moves WITH the
+    -- validated in_progress write — keyed on the SAME milestones_in_progress narg gate, NOT
+    -- its own presence. So a report that does not validly update in_progress leaves this
+    -- column untouched; a report that DOES update in_progress overwrites this with the
+    -- validated attribution subset the service passes ('[]' when none survive, clearing a
+    -- departed lane's stale entry). The service (M3) only sets the milestones_agents param
+    -- when it also writes in_progress; a nil param here with a present in_progress means
+    -- "in_progress advanced, no attribution survived" → '[]'.
+    milestones_agents = CASE
+        WHEN sqlc.narg('milestones_in_progress')::jsonb IS NULL THEN milestones_agents
+        ELSE COALESCE(sqlc.narg('milestones_agents')::jsonb, '[]'::jsonb)
     END,
     -- Exit contract (PRD #47 Decision 3), guarded so it fires only on ENTRY to
     -- running. This statement is also the running→running heartbeat (idempotent),
@@ -2072,6 +2096,9 @@ UPDATE runs SET
     -- 'chat'-only, and progressParams gates milestone writes to issue runs, so its snapshot
     -- is always NULL — the clear there would be a no-op and is deliberately omitted.)
     milestones_in_progress = NULL,
+    -- PRD #1224 M2 (Decision 7): the per-milestone agent attribution rides the SAME
+    -- terminal clear as in_progress above — dead run, no in-progress lanes, no attribution.
+    milestones_agents = NULL,
     -- PRD #1190 M1: a terminal run carries no pending pause. Clearing the three
     -- pause columns on every terminal transition makes the design true at the root:
     -- a run that completes, fails or is cancelled while carrying an owner's pending
@@ -2140,6 +2167,7 @@ UPDATE runs SET
     finished_at        = now(),
     -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
     milestones_in_progress = NULL,
+    milestones_agents = NULL,
     -- PRD #1190 M1: a terminal run carries no pending pause (root-cause clear; see SetRunCompleted).
     pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
@@ -2166,6 +2194,7 @@ UPDATE runs SET
     finished_at        = now(),
     -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
     milestones_in_progress = NULL,
+    milestones_agents = NULL,
     -- PRD #1190 M1: a terminal run carries no pending pause (root-cause clear; see SetRunCompleted).
     pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
@@ -2186,6 +2215,7 @@ UPDATE runs SET status = 'cancelled', status_since = now(), stop_kind = 'cancell
     stop_reason = @stop_reason,
     -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
     milestones_in_progress = NULL,
+    milestones_agents = NULL,
     -- PRD #1190 M1: a terminal run carries no pending pause (root-cause clear; see SetRunCompleted).
     pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
@@ -2225,6 +2255,7 @@ UPDATE runs SET
     finished_at        = now(),
     -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
     milestones_in_progress = NULL,
+    milestones_agents = NULL,
     -- PRD #1190 M1: a terminal run carries no pending pause (root-cause clear; see SetRunCompleted).
     pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
@@ -2273,6 +2304,7 @@ UPDATE runs SET status = 'failed', status_since = now(),
     finished_at        = now(),
     -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
     milestones_in_progress = NULL,
+    milestones_agents = NULL,
     -- PRD #1190 M1: a terminal run carries no pending pause (root-cause clear; see SetRunCompleted).
     pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
@@ -2341,6 +2373,7 @@ UPDATE runs SET status = 'failed', status_since = now(), stop_kind = 'plan_rejec
     failure_reason = @failure_reason, move_pending_since = now(), finished_at = now(),
     -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
     milestones_in_progress = NULL,
+    milestones_agents = NULL,
     -- PRD #1190 M1: a terminal run carries no pending pause (root-cause clear; see SetRunCompleted).
     pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
@@ -2555,6 +2588,7 @@ UPDATE runs SET status = 'failed', status_since = now(), failure_reason = @failu
     move_pending_since = now(), finished_at = now(),
     -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
     milestones_in_progress = NULL,
+    milestones_agents = NULL,
     -- PRD #1190 M1: a terminal run carries no pending pause (root-cause clear; see SetRunCompleted).
     pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
     -- Exit contract (PRD #47 Decision 3): a timed-out run must not keep a stale ⚠.
@@ -2655,6 +2689,7 @@ UPDATE runs SET status = 'failed', status_since = now(), failure_reason = @failu
     move_pending_since = now(), finished_at = now(),
     -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
     milestones_in_progress = NULL,
+    milestones_agents = NULL,
     -- PRD #1190 M1: a terminal run carries no pending pause (root-cause clear; see SetRunCompleted).
     pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
@@ -2709,6 +2744,7 @@ UPDATE runs SET status = 'failed', status_since = now(), failure_reason = @failu
     move_pending_since = now(), finished_at = now(),
     -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
     milestones_in_progress = NULL,
+    milestones_agents = NULL,
     -- PRD #1190 M1: a terminal run carries no pending pause (root-cause clear; see SetRunCompleted).
     pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
@@ -3202,11 +3238,26 @@ WITH selected AS (
         -- a double-approve or a re-gate resume never changes a budget frozen once. NULL for
         -- a 0/1-milestone plan (byte-for-byte the global default). See SetRunRunning for the
         -- autopilot mirror of this compute.
+        -- Issue #1181: the count<=1 arm no longer drops straight to NULL. A LARGE-repo run
+        -- (size_class='l') floors to run_max_iterations*size_budget_factor_l iters and
+        -- LEAST(run_timeout*size_budget_factor_l, ceiling) wall, so a large gated run whose
+        -- lead wrote milestones as PROSE (0 structured milestones) still gets a size-scaled
+        -- budget rather than the 5-iter/2h global default. 's'/'m'/'' stay NULL (unchanged,
+        -- byte-for-byte the pre-feature default). Read bare runs.size_class: this statement
+        -- does NOT SET size_class (it was persisted by the pre-gate SetRunAwaitingApproval
+        -- report), so the OLD-row value is the committed one. The count>=2 arm is unchanged.
+        -- See SetRunRunning for the autopilot mirror (which reads COALESCE(narg,size_class)).
         budget_max_iterations = COALESCE(runs.budget_max_iterations,
-            CASE WHEN COALESCE(jsonb_array_length(COALESCE(runs.milestones_frozen, runs.milestones_candidate)), 0) <= 1 THEN NULL
+            CASE WHEN COALESCE(jsonb_array_length(COALESCE(runs.milestones_frozen, runs.milestones_candidate)), 0) <= 1
+                     THEN CASE runs.size_class
+                              WHEN 'l' THEN sqlc.arg('run_max_iterations')::int * sqlc.arg('size_budget_factor_l')::int
+                              ELSE NULL END
                  ELSE sqlc.arg('run_max_iterations')::int * LEAST(jsonb_array_length(COALESCE(runs.milestones_frozen, runs.milestones_candidate)), sqlc.arg('milestone_budget_cap')::int) END),
         budget_wall_seconds = COALESCE(runs.budget_wall_seconds,
-            CASE WHEN COALESCE(jsonb_array_length(COALESCE(runs.milestones_frozen, runs.milestones_candidate)), 0) <= 1 THEN NULL
+            CASE WHEN COALESCE(jsonb_array_length(COALESCE(runs.milestones_frozen, runs.milestones_candidate)), 0) <= 1
+                     THEN CASE runs.size_class
+                              WHEN 'l' THEN LEAST(sqlc.arg('run_timeout_seconds')::int * sqlc.arg('size_budget_factor_l')::int, sqlc.arg('budget_wall_ceiling_seconds')::int)
+                              ELSE NULL END
                  ELSE LEAST(sqlc.arg('run_timeout_seconds')::int * LEAST(jsonb_array_length(COALESCE(runs.milestones_frozen, runs.milestones_candidate)), sqlc.arg('milestone_budget_cap')::int), sqlc.arg('budget_wall_ceiling_seconds')::int) END),
         updated_at       = now()
     WHERE id = @run_id

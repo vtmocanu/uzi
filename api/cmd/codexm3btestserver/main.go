@@ -13,14 +13,26 @@
 // It ships NO production behavior: it is a cmd/ main package that reuses the same
 // seeding/mint sequence as worker_codex_livedb_test.go (WorkerRoutes, store.Migrate,
 // the fixture graph, SetRunCodexClaimCapability) and a fixed test secretbox key.
-// Every credential-shaped value it seeds is a CANARY string, never a real
-// credential, and the Codex refresh client is an in-process fake (no provider
-// network call), exactly as the live-DB test uses.
+//
+// It has TWO modes, selected by env:
+//
+//   - DEFAULT (canary): every credential-shaped value it seeds is a CANARY string,
+//     never a real credential, and the Codex refresh client is an in-process fake
+//     (no provider network call), exactly as the live-DB test uses. This is the
+//     credential-free path every automated run takes.
+//   - CODEX_M3B_LIVE=1 (maintainer-only, egress-capable): it seals the REAL
+//     env-injected subscription login from CODEX_M3B_LIVE_LOGIN_JSON
+//     ({"access_token":...,"refresh_token":...}), auto-discovers that login's
+//     canonical identity tuple with a NONROTATING codexauth.DiscoverIdentity (no
+//     account id is injected), wires the REAL codexauth client into the coordinated
+//     refresher so /codex/refresh performs a real oauth rotation, and seeds
+//     SUBSCRIPTION-ONLY (the api_key arm is skipped, its contract fields stay the
+//     zero value). The real credential is ENV-ONLY — it is never written to a file.
 //
 // It reads a DSN from -dsn or UZI_TEST_DATABASE_URL, seeds a subscription-mode run
-// and an api_key-mode run under one owner/worker, prints ONE machine-readable JSON
-// line describing everything a WorkerClient needs, then stays up until SIGTERM/
-// SIGINT and shuts the server down cleanly.
+// (plus, in the default mode, an api_key-mode run) under one owner/worker, prints ONE
+// machine-readable JSON line describing everything a WorkerClient needs, then stays up
+// until SIGTERM/SIGINT and shuts the server down cleanly.
 //
 // It binds 127.0.0.1:0 by default (the host loopback smoke) but takes a bind address
 // from -listen / CODEX_M3B_LISTEN so it can run as a CONTAINER on an internal network
@@ -38,11 +50,13 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"syscall"
 	"time"
 
@@ -62,9 +76,8 @@ import (
 
 // fakeCodexRefresh is the in-process CodexRefreshClient the server wires via
 // wsvc.SetCodexRefresh, mirroring worker_codex_livedb_test.go's routedCodexRefreshFake.
-// It performs NO provider network call: Refresh returns a canary rotated token pair and
-// DiscoverIdentity returns the frozen subscription tuple so a coordinated refresh commits
-// (advanced) rather than quarantining on a tuple mismatch.
+// It performs no provider network call: Refresh returns a canary token pair plus matching
+// fresh-token claims. DiscoverIdentity remains available for recovery promotion.
 type fakeCodexRefresh struct {
 	newAccessToken string
 	newRefresh     string
@@ -73,7 +86,15 @@ type fakeCodexRefresh struct {
 
 func (f *fakeCodexRefresh) Refresh(_ context.Context, _ string) (codexauth.RefreshResult, error) {
 	rotated := f.newRefresh
-	return codexauth.RefreshResult{AccessToken: f.newAccessToken, RefreshToken: &rotated}, nil
+	return codexauth.RefreshResult{
+		AccessToken:  f.newAccessToken,
+		RefreshToken: &rotated,
+		IdentityClaims: codexauth.FreshAccessTokenIdentityClaims{
+			ChatGPTAccountID: f.identity.WorkspaceAccountID,
+			ChatGPTUserID:    f.identity.ProviderUserID,
+			AuthUserID:       f.identity.ProviderUserID,
+		},
+	}, nil
 }
 
 func (f *fakeCodexRefresh) DiscoverIdentity(_ context.Context, _ string) (codexauth.Identity, error) {
@@ -104,6 +125,66 @@ type serverContract struct {
 	WorkerToken  string               `json:"worker_token"`
 	Subscription subscriptionContract `json:"subscription"`
 	APIKey       apiKeyContract       `json:"api_key"`
+	// Live reports whether this server seeded a REAL env-injected subscription login
+	// (CODEX_M3B_LIVE=1) rather than the default canary. It is informational for a
+	// maintainer reading the JSON line; the lifecycle harness keys its own live behaviour
+	// off CODEX_M3B_LIVE in its environment, not off this field. In live mode APIKey is the
+	// zero value (subscription-only).
+	Live bool `json:"live"`
+}
+
+// liveSubscription carries the maintainer-injected REAL Codex subscription login and two
+// fixed-endpoint clients with distinct budgets. Initial identity establishment is outside the
+// app-server callback budget, while refreshClient preserves production's 2.5-second single-call
+// cap. A nil *liveSubscription selects the default canary seeding. The two tokens stay in memory
+// and the sealed DB row — never written to a file.
+type liveSubscription struct {
+	accessToken    string
+	refreshToken   string
+	identityClient *codexauth.Client
+	refreshClient  *codexauth.Client
+}
+
+// buildLiveSubscription returns the live subscription seeding inputs when CODEX_M3B_LIVE=1,
+// or nil for the default canary path. In live mode it REQUIRES a real login blob in
+// CODEX_M3B_LIVE_LOGIN_JSON ({"access_token":...,"refresh_token":...}); an absent or
+// incomplete blob is a fatal misconfiguration, so a live run can never silently fall back to
+// a canary and read green. codexauth.NewClient's default endpoints hit the REAL
+// chatgpt.com/auth.openai.com hosts; codexauth exposes no base-URL override and must not get
+// one, so identity discovery and the coordinated refresh both target the real provider.
+func buildLiveSubscription() *liveSubscription {
+	if os.Getenv("CODEX_M3B_LIVE") != "1" {
+		return nil
+	}
+	raw := os.Getenv("CODEX_M3B_LIVE_LOGIN_JSON")
+	if raw == "" {
+		log.Fatal("codexm3btestserver: CODEX_M3B_LIVE=1 but CODEX_M3B_LIVE_LOGIN_JSON is empty; inject the real subscription login blob {\"access_token\":...,\"refresh_token\":...}")
+	}
+	var login struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+	}
+	if err := json.Unmarshal([]byte(raw), &login); err != nil {
+		log.Fatalf("codexm3btestserver: parse CODEX_M3B_LIVE_LOGIN_JSON: %v", err)
+	}
+	if login.AccessToken == "" || login.RefreshToken == "" {
+		log.Fatal("codexm3btestserver: CODEX_M3B_LIVE_LOGIN_JSON must carry a non-empty access_token and refresh_token")
+	}
+	// Identity establishment seeds the fixture before any app-server callback exists, so it gets
+	// a separate bounded window. The refresh client retains production's 2.5-second single-call cap;
+	// otherwise a slow seed GET would force RELAX mode and silently stop testing the callback budget.
+	identityClient := codexauth.NewClient(codexauth.WithPerRequestTimeout(15 * time.Second))
+	refreshClient := codexauth.NewClient(codexauth.WithPerRequestTimeout(2500 * time.Millisecond))
+	if os.Getenv("CODEX_M3B_LIVE_RELAX_TIMEOUTS") == "1" {
+		identityClient = codexauth.NewClient()
+		refreshClient = codexauth.NewClient()
+	}
+	return &liveSubscription{
+		accessToken:    login.AccessToken,
+		refreshToken:   login.RefreshToken,
+		identityClient: identityClient,
+		refreshClient:  refreshClient,
+	}
 }
 
 // seedResult carries the values the seeding step resolves for the printed contract.
@@ -125,6 +206,10 @@ func main() {
 		log.Fatal("codexm3btestserver: no DSN; set -dsn or UZI_TEST_DATABASE_URL to a throwaway, migrated Postgres")
 	}
 
+	// nil unless CODEX_M3B_LIVE=1, in which case it fatals here on a missing/incomplete
+	// real login blob rather than seeding a canary and reading green.
+	live := buildLiveSubscription()
+
 	ctx := context.Background()
 	if err := store.Migrate(ctx, *dsn); err != nil {
 		log.Fatalf("codexm3btestserver: migrate: %v", err)
@@ -139,7 +224,7 @@ func main() {
 	box := newTestBox()
 	wsvc := workersvc.New(q, box, workersvc.Params{})
 
-	seed, err := seedFixtures(ctx, pool, q, box, wsvc)
+	seed, err := seedFixtures(ctx, pool, q, box, wsvc, live)
 	if err != nil {
 		log.Fatalf("codexm3btestserver: seed: %v", err)
 	}
@@ -179,6 +264,7 @@ func main() {
 		WorkerToken:  seed.workerToken,
 		Subscription: seed.subscription,
 		APIKey:       seed.apiKey,
+		Live:         live != nil,
 	}
 	line, err := json.Marshal(contract)
 	if err != nil {
@@ -227,14 +313,16 @@ func newTestBox() *secretbox.Box {
 	return box
 }
 
-// seedFixtures builds the same fixture graph as worker_codex_livedb_test.go for BOTH a
-// subscription-mode run and an api_key-mode run, under ONE owner user and ONE worker (so
-// the printed contract carries a single worker token). AuthorizeCodexCredentialOp resolves
-// the alias/account by the WORKER's user id, so the worker, both runs and every secret must
-// share one owner.
+// seedFixtures builds the fixture graph as worker_codex_livedb_test.go does, under ONE owner
+// user and ONE worker (so the printed contract carries a single worker token).
+// AuthorizeCodexCredentialOp resolves the alias/account by the WORKER's user id, so the
+// worker, every run and every secret must share one owner.
 //
-// Every credential-shaped value is a CANARY string, never a real credential.
-func seedFixtures(ctx context.Context, pool *pgxpool.Pool, q *store.Queries, box *secretbox.Box, wsvc *workersvc.Service) (seedResult, error) {
+// In the DEFAULT mode (live == nil) it seeds BOTH a subscription-mode run and an api_key-mode
+// run, every credential-shaped value a CANARY string. In LIVE mode (live != nil) it seeds the
+// subscription arm from the real injected login and SKIPS seedAPIKey (subscription-only), so
+// the contract's APIKey stays the zero value.
+func seedFixtures(ctx context.Context, pool *pgxpool.Pool, q *store.Queries, box *secretbox.Box, wsvc *workersvc.Service, live *liveSubscription) (seedResult, error) {
 	ownerID, connectionID, repoID, workerID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
 
 	if err := exec(ctx, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
@@ -264,13 +352,18 @@ func seedFixtures(ctx context.Context, pool *pgxpool.Pool, q *store.Queries, box
 		return seedResult{}, fmt.Errorf("insert worker: %w", err)
 	}
 
-	sub, err := seedSubscription(ctx, pool, q, box, wsvc, ownerID, repoID, workerID)
+	sub, err := seedSubscription(ctx, pool, q, box, wsvc, ownerID, repoID, workerID, live)
 	if err != nil {
 		return seedResult{}, fmt.Errorf("subscription fixture: %w", err)
 	}
-	api, err := seedAPIKey(ctx, pool, q, box, wsvc, ownerID, repoID, workerID)
-	if err != nil {
-		return seedResult{}, fmt.Errorf("api_key fixture: %w", err)
+	// Live mode is subscription-only: seedAPIKey is skipped and the contract's APIKey stays
+	// the zero value (empty run_id/capability), which the live lifecycle harness tolerates.
+	var api apiKeyContract
+	if live == nil {
+		api, err = seedAPIKey(ctx, pool, q, box, wsvc, ownerID, repoID, workerID)
+		if err != nil {
+			return seedResult{}, fmt.Errorf("api_key fixture: %w", err)
+		}
 	}
 
 	return seedResult{workerToken: joinToken, subscription: sub, apiKey: api}, nil
@@ -281,7 +374,10 @@ func seedFixtures(ctx context.Context, pool *pgxpool.Pool, q *store.Queries, box
 // tuple, a linked credential state, a claimed run frozen to the binding, and a minted
 // per-claim capability. It also wires the in-process refresh fake to return the frozen
 // tuple so a coordinated refresh advances.
-func seedSubscription(ctx context.Context, pool *pgxpool.Pool, q *store.Queries, box *secretbox.Box, wsvc *workersvc.Service, ownerID, repoID, workerID uuid.UUID) (subscriptionContract, error) {
+func seedSubscription(ctx context.Context, pool *pgxpool.Pool, q *store.Queries, box *secretbox.Box, wsvc *workersvc.Service, ownerID, repoID, workerID uuid.UUID, live *liveSubscription) (subscriptionContract, error) {
+	if live != nil {
+		return seedSubscriptionLive(ctx, pool, q, box, wsvc, ownerID, repoID, workerID, live)
+	}
 	providerUserID := "canary-provider-" + uuid.NewString()
 	chatGPTAccountID := "canary-account-" + uuid.NewString()
 	accessToken, err := fakeChatGPTAccessToken(chatGPTAccountID, uuid.NewString())
@@ -357,6 +453,163 @@ func seedSubscription(ctx context.Context, pool *pgxpool.Pool, q *store.Queries,
 		RunID:            runID.String(),
 		Capability:       capability,
 		ChatGPTAccountID: chatGPTAccountID,
+		Generation:       account.Generation,
+	}, nil
+}
+
+// resolveLiveIdentity establishes the login's canonical identity tuple with a NONROTATING read,
+// refreshing first when the injected access token is already expired. ChatGPT access tokens are
+// short-lived, so a 401 on the identity read is expected and recoverable: it mints a fresh access
+// token from the durable refresh token (a single codexauth.Refresh), then discovers with it. It
+// returns the tuple plus the tokens to seal (rotated when a refresh happened). Only an invalid
+// refresh token or an unreachable provider fails here, before any run is seeded.
+func resolveLiveIdentity(ctx context.Context, client *codexauth.Client, accessToken, refreshToken string) (codexauth.Identity, string, string, error) {
+	id, err := client.DiscoverIdentity(ctx, accessToken)
+	if err == nil {
+		return id, accessToken, refreshToken, nil
+	}
+	var authErr *codexauth.AuthError
+	if !errors.As(err, &authErr) || !authErr.Unauthorized() {
+		// Not a 401: the token authenticated but identity did not resolve (e.g. ErrIdentityIncomplete).
+		// A refresh cannot help, so log the usage-response SHAPE (key names + field presence only,
+		// never values) to reveal whether the provider moved or omitted the identity fields.
+		diagnoseUsageShape(ctx, accessToken)
+		return codexauth.Identity{}, "", "", fmt.Errorf("discover live identity: %w", err)
+	}
+	// The injected access token is expired/invalid (401). Mint a fresh one from the durable refresh
+	// token, then discover with it. Refresh MAY rotate the refresh token; seal whichever it returns.
+	res, err := client.Refresh(ctx, refreshToken)
+	if err != nil {
+		return codexauth.Identity{}, "", "", fmt.Errorf("refresh live login after a 401 on identity (invalid refresh token? re-run 'codex login'): %w", err)
+	}
+	newRefresh := refreshToken
+	if res.RefreshToken != nil && *res.RefreshToken != "" {
+		newRefresh = *res.RefreshToken
+	}
+	id, err = client.DiscoverIdentity(ctx, res.AccessToken)
+	if err != nil {
+		diagnoseUsageShape(ctx, res.AccessToken)
+		return codexauth.Identity{}, "", "", fmt.Errorf("discover live identity after refresh: %w", err)
+	}
+	return id, res.AccessToken, newRefresh, nil
+}
+
+// diagnoseUsageShape logs the SHAPE of the /wham/usage response (its top-level key names, the HTTP
+// status, and whether account_id/user_id are present and non-empty) when identity discovery cannot
+// resolve the tuple. It logs field NAMES and booleans ONLY, never any value, so a maintainer can
+// tell a moved/renamed field or an empty usage record from a real outage without exposing the token
+// or any account data. It is best-effort: any failure is logged and swallowed.
+func diagnoseUsageShape(ctx context.Context, accessToken string) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, codexauth.DefaultUsageBaseURL+"/wham/usage", nil)
+	if err != nil {
+		log.Printf("codexm3btestserver: diag: build usage request: %v", err)
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Accept", "application/json")
+	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	if err != nil {
+		log.Printf("codexm3btestserver: diag: usage request: %v", err)
+		return
+	}
+	defer resp.Body.Close() //nolint:errcheck // best-effort diagnostic
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(body, &top); err != nil {
+		log.Printf("codexm3btestserver: diag: /wham/usage status=%d body is not a JSON object (len=%d)", resp.StatusCode, len(body))
+		return
+	}
+	keys := make([]string, 0, len(top))
+	for k := range top {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	nonEmpty := func(k string) bool {
+		v := string(top[k])
+		return len(top[k]) > 0 && v != `""` && v != "null"
+	}
+	log.Printf("codexm3btestserver: diag: /wham/usage status=%d top-level keys=%v account_id_present=%v user_id_present=%v",
+		resp.StatusCode, keys, nonEmpty("account_id"), nonEmpty("user_id"))
+}
+
+// seedSubscriptionLive seeds the subscription arm from the maintainer-injected REAL Codex
+// login (CODEX_M3B_LIVE=1). It mirrors seedSubscription's credential graph, but every value
+// except the two injected tokens comes from the provider, not a canary:
+//
+//   - resolveLiveIdentity establishes the login's canonical (provider_user_id, workspace_account_id)
+//     tuple with a NONROTATING read, refreshing first if the injected access token is already
+//     expired, so a stale access token (they are short-lived) is recovered via the durable refresh
+//     token before any run is seeded.
+//   - the real {access_token,refresh_token} blob is sealed and stored; it lives only in memory
+//     and the sealed DB row, never in a file.
+//   - the REAL codexauth client is wired into the coordinated refresher, so POST /codex/refresh
+//     performs a real oauth rotation (the canary arm wires an in-process fake instead).
+func seedSubscriptionLive(ctx context.Context, pool *pgxpool.Pool, q *store.Queries, box *secretbox.Box, wsvc *workersvc.Service, ownerID, repoID, workerID uuid.UUID, live *liveSubscription) (subscriptionContract, error) {
+	id, accessToken, refreshToken, err := resolveLiveIdentity(ctx, live.identityClient, live.accessToken, live.refreshToken)
+	if err != nil {
+		return subscriptionContract{}, err
+	}
+
+	login := fmt.Sprintf(`{"access_token":%q,"refresh_token":%q}`, accessToken, refreshToken)
+	sealedLogin, err := box.Seal([]byte(login))
+	if err != nil {
+		return subscriptionContract{}, fmt.Errorf("seal live login: %w", err)
+	}
+	secretRow, err := q.InsertCodexSecret(ctx, store.InsertCodexSecretParams{
+		UserID: ownerID, Kind: store.KindCodexAuth, Label: "m3b-subscription-live", WantDefault: true,
+		Ciphertext: sealedLogin, SealedWith: store.SealedWithMaster,
+	})
+	if err != nil {
+		return subscriptionContract{}, fmt.Errorf("insert live codex secret: %w", err)
+	}
+
+	account, err := q.InsertCodexProviderAccount(ctx, store.InsertCodexProviderAccountParams{
+		UserID: ownerID, ProviderUserID: id.ProviderUserID, WorkspaceAccountID: id.WorkspaceAccountID,
+		SealedLogin: sealedLogin, SealedWith: store.SealedWithMaster,
+	})
+	if err != nil {
+		return subscriptionContract{}, fmt.Errorf("insert live provider account: %w", err)
+	}
+	if _, err := q.InsertCodexCredentialState(ctx, store.InsertCodexCredentialStateParams{
+		UserSecretID: secretRow.ID, UserID: ownerID, Status: "staging",
+	}); err != nil {
+		return subscriptionContract{}, fmt.Errorf("insert live credential state: %w", err)
+	}
+	linked, err := q.LinkCodexCredentialState(ctx, store.LinkCodexCredentialStateParams{
+		ProviderAccountID: pgconv.UUID(account.ID), UserSecretID: secretRow.ID,
+		UserID: ownerID, MaterialRevision: 0,
+	})
+	if err != nil {
+		return subscriptionContract{}, fmt.Errorf("link live credential state: %w", err)
+	}
+	if linked != 1 {
+		return subscriptionContract{}, fmt.Errorf("link live credential state affected %d rows, want 1", linked)
+	}
+
+	runID := uuid.New()
+	if err := exec(ctx, pool, `INSERT INTO runs
+		(id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, status, worker_id)
+		VALUES ($1, $2, $3, 'issue', 1, 'm3b subscription live', 'm3b subscription live body', 'claimed', $4)`,
+		runID, ownerID, repoID, workerID); err != nil {
+		return subscriptionContract{}, fmt.Errorf("insert live run: %w", err)
+	}
+	if err := wsvc.FreezeCodexBinding(ctx, ownerID, runID, secretRow.ID, "subscription"); err != nil {
+		return subscriptionContract{}, fmt.Errorf("freeze live binding: %w", err)
+	}
+
+	capability, err := mintCapability(ctx, q, runID, workerID, "m3b-sub-live-cap-")
+	if err != nil {
+		return subscriptionContract{}, err
+	}
+
+	// Wire the REAL codexauth client so POST /codex/refresh runs a real coordinated oauth
+	// rotation against the provider.
+	wsvc.SetCodexRefresh(live.refreshClient)
+
+	return subscriptionContract{
+		RunID:            runID.String(),
+		Capability:       capability,
+		ChatGPTAccountID: id.WorkspaceAccountID,
 		Generation:       account.Generation,
 	}, nil
 }

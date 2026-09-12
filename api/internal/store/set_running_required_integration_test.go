@@ -41,6 +41,16 @@ func setRunning(fx *fleetFixture, runID, workerID uuid.UUID, caps, tools []strin
 		InferredCapabilities: caps,
 		InferredTools:        tools,
 		SizeClass:            sizeParam,
+		// Issue #1181: the freeze CASE now floors an 'l' run's count<=1 budget to
+		// run_max_iterations*size_budget_factor_l; the standard budget literals keep that a
+		// valid positive value (25 / 28800) instead of the 0 that would violate the
+		// budget_* IS NULL OR > 0 CHECK (migration 00099). Invisible to this suite's caps/
+		// tools/size_class assertions.
+		RunMaxIterations:         5,
+		RunTimeoutSeconds:        7200,
+		MilestoneBudgetCap:       12,
+		BudgetWallCeilingSeconds: 28800,
+		SizeBudgetFactorL:        5,
 	})
 	if err != nil {
 		fx.t.Fatalf("SetRunRunning: %v", err)

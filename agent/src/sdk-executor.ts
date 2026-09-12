@@ -2129,10 +2129,33 @@ export class SdkExecutor implements Executor {
           // (PRD #390 M1's no-signal invariant, enforced here on the executor side).
           progressMissedLastTurn = false;
           consecutiveMisses = 0;
-          latestProgress =
-            latestProgress && latestProgress.completed.length > 0
-              ? { completed: latestProgress.completed, in_progress: [] }
-              : undefined;
+          // PRD #1224 M1 (rework CR !1244): a cooperative checkpoint is a milestone
+          // boundary, but this PRD's premise is CONCURRENT in-progress milestones — the lead
+          // can finish one milestone while a sibling is still being worked. Blanking
+          // in_progress and milestones_agents wholesale would drop the still-active sibling
+          // (and its attribution) into the next running report, and the server would overwrite
+          // its active state with [] (milestones.go validateProgressIDs/milestoneAgentsParam).
+          // So remove ONLY the just-completed ids (those now in `completed`) from in_progress
+          // AND its attribution, preserving any still-active concurrent milestone. The
+          // just-finished milestone's own stale in_progress entry (if the lead left it in BOTH
+          // sets) is dropped by the same completed-set filter, so #390 M3's enforcement re-arm
+          // (the `!in_progress.length` nag below) still fires exactly as today on a
+          // single-milestone checkpoint. Keep the "nothing real reported -> undefined" fallback
+          // (PRD #390 M1's no-signal invariant) so the next running report never persists an
+          // empty [] over live state.
+          if (latestProgress && latestProgress.completed.length > 0) {
+            const done = new Set(latestProgress.completed);
+            const stillActive = latestProgress.in_progress.filter((id) => !done.has(id));
+            latestProgress = {
+              completed: latestProgress.completed,
+              in_progress: stillActive,
+              milestones_agents: (latestProgress.milestones_agents ?? []).filter((a) =>
+                stillActive.includes(a.id),
+              ),
+            };
+          } else {
+            latestProgress = undefined;
+          }
           resetStallState(); // a cooperative checkpoint is progress → breaks any refusal streak
           continue;
         }

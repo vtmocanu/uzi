@@ -29,24 +29,16 @@ Not a *fully* dark factory, and on purpose: those two decisions stay human, and 
 
 The unit of work is an **issue**, not a chat message. The forge stays the source of truth the whole way through, so the work shows up where your team already looks: as issues, branches, and pull requests. If the issue links a spec document, uzi picks it up automatically, but a full spec is not required to start.
 
-```mermaid
-flowchart TB
-  A(["Issue labeled uzi"]) --> B["Lead plans"]
-  B --> C{"Plan gate"}
-  C -- "reject with reason" --> B
-  C -- "approve" --> D
-  subgraph loop ["Lead orchestrates specialist agents"]
-    D["Coder implements"] --> E["Reviewer, auditor,<br/>tester, fact-checker validate"]
-    E -- "needs changes" --> D
-  end
-  E -- "looks good" --> F["Branch + Pull Request"]
-  F --> G{"Human review"}
-  G -- "merge" --> H(["Done"])
-  G -- "comments" --> I["uzi reworks the PR"]
-  I --> D
-  J(["Red pipeline"]) --> K["Fix CI run"]
-  K --> C
-```
+<p align="center">
+  <a href="https://htmlpreview.github.io/?https://github.com/vtmocanu/uzi/blob/main/docs/diagrams/how-it-works.html">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset=".github/readme/how-it-works-dark.png">
+      <img src=".github/readme/how-it-works-light.png" width="900"
+           alt="How uzi works: an issue labeled uzi (or a red pipeline) flows through Lead plans, a human plan gate, a coder-and-reviewers loop, a branch and pull request, human review, and merge; main is never touched.">
+    </picture>
+  </a>
+</p>
+<p align="center"><sub>▶ <a href="https://htmlpreview.github.io/?https://github.com/vtmocanu/uzi/blob/main/docs/diagrams/how-it-works.html">Explore the interactive diagram</a></sub></p>
 
 1. **Plan first.** A worker claims the issue and produces a plan, then parks at an approval gate with that plan in view. You approve it, or reject it with a reason and it re-plans. Nothing is written until you say go. (Prefer unattended? An [autopilot](docs/autopilot.md) mode skips the gate and takes an issue straight to a PR.)
 2. **Implement and review.** On approval, a **lead** agent orchestrates the work: a **coder** implements, then a **reviewer**, **auditor**, **tester**, and **fact-checker** validate in parallel, looping back to the coder until the work holds up. You can watch every agent's transcript stream live and steer mid-run.

@@ -206,7 +206,7 @@ Resolved edit sites:
 
 ## Milestones
 
-- [ ] **M1 - Reporting seam AND transport.** Add `milestones_agents` to the `report_progress`
+- [x] **M1 - Reporting seam AND transport.** Add `milestones_agents` to the `report_progress`
   schema (`signals.ts`), the `MilestoneProgress` mirror, `StateRequest`, and all three
   `runner.ts` `reportState` projections; clear it at the checkpoint `in_progress` reset
   (`sdk-executor.ts:2062`). Instruct the lead in `prompt.ts` to declare, per in-progress
@@ -216,7 +216,7 @@ Resolved edit sites:
   reddens); and a **transport assertion** that a declared mapping actually appears in the
   `reportState` body for the immediate push, the iteration report, and the checkpoint report
   (an optional field silently dropped from a projection is the failure this guards).
-- [ ] **M2 - Persist: migration + store SQL.** New nullable `jsonb` column (draft migration
+- [x] **M2 - Persist: migration + store SQL.** New nullable `jsonb` column (draft migration
   above `00210`), the `SetRunRunning` coupled write (D6) and `milestones_agents = NULL` beside
   all ten terminal clears (D7), `sqlc generate`. `*LiveDB` proofs in `store`/`workersvc`: the
   coupled write; the D6 no-stale case (a report advancing `in_progress` without attribution
@@ -225,19 +225,19 @@ Resolved edit sites:
   `task gate:api` does NOT run `*LiveDB` tests (they skip without `UZI_TEST_DATABASE_URL`); the
   worker AUTHORS them and CI's `test:api-store-it` runs them (proof = `RUN>0`, zero SKIP). Do
   not report green on a local skip.
-- [ ] **M3 - Server validation + DTO.** Per-entry validation with the D4 identifier/label
+- [x] **M3 - Server validation + DTO.** Per-entry validation with the D4 identifier/label
   split, the D5 predicates + duplicate resolution, and the D6 truth table, in **pure
   workersvc/fake-store tests** (offline-runnable, not only LiveDB): pin all four D6 cases and
   the one-bad-one-good drop. Add `MilestoneAgents` + the `MilestoneAgent` struct to `RunDTO`;
   re-record the four contract fixtures from the Go contract test's printed JSON (never
   hand-author); mirror in `apiTypes.ts`. Go + TS contract tests green.
-- [ ] **M4 - Baseline characterization goldens (before any renderer changes).** On the
+- [x] **M4 - Baseline characterization goldens (before any renderer changes).** On the
   pre-render-change tree, capture the unattributed multi-in-progress render for web
   (structural assertion), TUI (`View()` bytes), and CLI (`run get` text). These are
   **characterization** tests (pass on old and new) and exist so SC2's "identical to today" has
   a real baseline a single sequential worker cannot recreate once M5/M6 land. Must run before
   M5/M6.
-- [ ] **M5 - Web render.** `MilestoneChecklist` (`RunView.tsx`): a `MilestoneNowStrip` under
+- [x] **M5 - Web render.** `MilestoneChecklist` (`RunView.tsx`): a `MilestoneNowStrip` under
   every effective-attributed in-progress milestone (declared role + label), live tool/age per
   D3 unique-match, the D6 read-time re-filter, and the first-in-progress fallback for the
   unattributed/`[]`/invalid-only/stale-only cases (D8). Header marker unchanged (non-goal).
@@ -247,7 +247,7 @@ Resolved edit sites:
   repeated-role case suppressing live tool/age on both; each of null/`[]`/invalid-only/
   stale-only rendering exactly the first-in-progress strip; a hostile label sanitized. Runs in
   parallel with M6.
-- [ ] **M6 - TUI + CLI render.** TUI `renderMilestones` (`tui_detail_rail.go`): a now-line
+- [x] **M6 - TUI + CLI render.** TUI `renderMilestones` (`tui_detail_rail.go`): a now-line
   under every effective-attributed in-progress milestone (same D3/D6 rules); `renderer.Plain`
   on the label; add `MilestoneAgent.AgentLabel`/`.Agent` to `d7UntrustedFields` and extend the
   hostile render test with the new selectors. CLI `run_render.go`: in the unattributed case
@@ -257,7 +257,7 @@ Resolved edit sites:
   `renderer`). Deterministic `View()`/row assertions for the multi-attributed and the
   unattributed byte-identical cases; refresh a uxlab scene; dispatch the `tui-ux` agent.
   Parallel with M5.
-- [ ] **M7 - Cross-surface mutation verification.** One named, mutation-pinned test per
+- [x] **M7 - Cross-surface mutation verification.** One named, mutation-pinned test per
   behavior, each reddening under a stated mutation, citing the red's shape not a tally
   (`.claude/rules/go.md`): D3 forced always-first-in-progress; D3 repeated-role NOT suppressed;
   D4 `agent` validation weakened to accept-all; D5 drop weakened to accept-all and the
@@ -265,7 +265,7 @@ Resolved edit sites:
   re-filter removed; D7 clear omitted on a non-`SetRunCompleted` terminal path; D8 branch on
   `!= null` instead of effective-length; D9 an in-progress mark dropped. (Surface behavior
   tests live in M5/M6; M7 owns the enumerated mutation table + the cross-surface fixture.)
-- [ ] **M8 - Docs, specs, CLI parity.** Update `docs/run-activity.md` (the milestone/now-line
+- [x] **M8 - Docs, specs, CLI parity.** Update `docs/run-activity.md` (the milestone/now-line
   section ~`:272`) and `docs/cli.md` (`run get` output ~`:808`), then `task docs:sync` and
   commit the mirror (root CLAUDE.md); update `ARCHITECTURE.md` milestone-progress section
   (`~:884`, unconditional); record the decision in `specs/ai.md`.

@@ -17,6 +17,14 @@ export type CodexExecutorModule = typeof import("../../agent/src/codex/codex-exe
 export type SelectModule = typeof import("../../agent/src/codex/select.js");
 /** The credential-free session store used across real provider-root recreation. */
 export type SessionStateModule = typeof import("../../agent/src/codex/session-state.js");
+/** The packaged root-launch primitive + its fixed binary/argv constants. The LIVE
+ *  subscription legs (PRD #1106 M3b live-acceptance) build a TEST-ONLY provider-root /
+ *  advice-root launcher from `launchCodexRoot` exactly as the production module-private
+ *  `defaultLaunchProviderRoot` composes it — no production launch wiring is changed. */
+export type LauncherModule = typeof import("../../agent/src/codex/launcher.js");
+/** The packaged app-server transport factory (`createCodexTransport`), used to wrap a real
+ *  launched root's stdio into a `CodexTransport` — the same wrapping the production launcher does. */
+export type TransportModule = typeof import("../../agent/src/codex/transport.js");
 
 /** The image-baked (or host source-tree) `src` dir the packaged modules load from.
  *
@@ -45,6 +53,14 @@ export function loadPackagedSelect(): Promise<SelectModule> {
 
 export function loadPackagedSessionState(): Promise<SessionStateModule> {
   return load<SessionStateModule>("codex/session-state.ts");
+}
+
+export function loadPackagedLauncher(): Promise<LauncherModule> {
+  return load<LauncherModule>("codex/launcher.ts");
+}
+
+export function loadPackagedTransport(): Promise<TransportModule> {
+  return load<TransportModule>("codex/transport.ts");
 }
 
 // NOTE (main.ts): the DARK selection FACTORY lives in main.ts as a private const

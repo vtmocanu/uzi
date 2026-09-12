@@ -1,0 +1,416 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "How uzi ships an issue",
+    "quality_profile": "showcase",
+    "legend": {
+      "mode": "auto",
+      "entries": {
+        "security": {
+          "label": "Human decision"
+        },
+        "backend": {
+          "label": "uzi agents"
+        },
+        "messagebus": {
+          "label": "CI trigger"
+        },
+        "external": {
+          "label": "External"
+        }
+      }
+    }
+  },
+  "lanes": [
+    {
+      "id": "intake",
+      "label": "Intake & planning"
+    },
+    {
+      "id": "build",
+      "label": "Implementation loop"
+    },
+    {
+      "id": "ship",
+      "label": "Ship, review & merge"
+    }
+  ],
+  "groups": [
+    {
+      "id": "loop",
+      "label": "Lead orchestrates agents",
+      "lane": "build",
+      "fromCol": 3,
+      "toCol": 4,
+      "variant": "emphasis"
+    }
+  ],
+  "semanticChecks": {
+    "allowedRoots": [
+      "A",
+      "H"
+    ],
+    "allowedTerminals": [
+      "G"
+    ],
+    "requiredPaths": [
+      {
+        "from": "A",
+        "to": "G"
+      },
+      {
+        "from": "H",
+        "to": "C"
+      }
+    ]
+  },
+  "nodes": [
+    {
+      "id": "H",
+      "lane": "intake",
+      "col": 0,
+      "type": "messagebus",
+      "label": "Red pipeline",
+      "sublabel": "CI failed",
+      "width": 140,
+      "yOffset": 64
+    },
+    {
+      "id": "I",
+      "lane": "intake",
+      "col": 1,
+      "type": "backend",
+      "label": "Fix CI run",
+      "sublabel": "diagnose + fix",
+      "width": 150,
+      "yOffset": 64
+    },
+    {
+      "id": "A",
+      "lane": "intake",
+      "col": 0,
+      "type": "external",
+      "label": "uzi-labeled issue",
+      "sublabel": "or assigned to uzi-bot",
+      "width": 196,
+      "yOffset": -64
+    },
+    {
+      "id": "B",
+      "lane": "intake",
+      "col": 1,
+      "type": "backend",
+      "label": "Lead plans",
+      "sublabel": "reads repo",
+      "width": 140,
+      "yOffset": -64
+    },
+    {
+      "id": "C",
+      "lane": "intake",
+      "col": 2,
+      "type": "security",
+      "label": "Plan gate",
+      "sublabel": "human approval",
+      "width": 150,
+      "yOffset": 0
+    },
+    {
+      "id": "CO",
+      "lane": "build",
+      "col": 2,
+      "type": "backend",
+      "label": "coder implements",
+      "sublabel": "writes code",
+      "width": 160
+    },
+    {
+      "id": "R",
+      "lane": "build",
+      "col": 3,
+      "type": "backend",
+      "label": "reviewer",
+      "sublabel": "correctness",
+      "width": 132,
+      "yOffset": -108
+    },
+    {
+      "id": "AU",
+      "lane": "build",
+      "col": 3,
+      "type": "backend",
+      "label": "auditor",
+      "sublabel": "security scan",
+      "width": 132,
+      "yOffset": -36
+    },
+    {
+      "id": "TE",
+      "lane": "build",
+      "col": 3,
+      "type": "backend",
+      "label": "tester",
+      "sublabel": "runs the gate",
+      "width": 132,
+      "yOffset": 36
+    },
+    {
+      "id": "FC",
+      "lane": "build",
+      "col": 3,
+      "type": "backend",
+      "label": "fact-checker",
+      "sublabel": "verifies claims",
+      "width": 150,
+      "yOffset": 108
+    },
+    {
+      "id": "VG",
+      "lane": "build",
+      "col": 4,
+      "type": "backend",
+      "label": "validated?",
+      "sublabel": "all agents pass",
+      "width": 150,
+      "tag": "fan-in gate"
+    },
+    {
+      "id": "E",
+      "lane": "ship",
+      "col": 3,
+      "type": "backend",
+      "label": "Branch + PR",
+      "sublabel": "opens MR",
+      "width": 140,
+      "yOffset": -70
+    },
+    {
+      "id": "F",
+      "lane": "ship",
+      "col": 4,
+      "type": "security",
+      "label": "Human review",
+      "sublabel": "merge or comment",
+      "width": 160,
+      "yOffset": -70
+    },
+    {
+      "id": "G",
+      "lane": "ship",
+      "col": 5,
+      "type": "external",
+      "label": "Done",
+      "sublabel": "merged",
+      "width": 118,
+      "yOffset": -70
+    },
+    {
+      "id": "AR",
+      "lane": "ship",
+      "col": 4,
+      "type": "external",
+      "label": "CodeRabbit",
+      "sublabel": "+ AI reviewers",
+      "width": 150,
+      "yOffset": 70
+    },
+    {
+      "id": "RW",
+      "lane": "ship",
+      "col": 2,
+      "type": "backend",
+      "label": "uzi reworks PR",
+      "sublabel": "auto-approved",
+      "width": 158,
+      "yOffset": 70
+    }
+  ],
+  "edges": [
+    {
+      "id": "issue-plan",
+      "from": "A",
+      "to": "B",
+      "role": "main",
+      "width": 2.2
+    },
+    {
+      "id": "plan-gate",
+      "from": "B",
+      "to": "C",
+      "role": "main",
+      "width": 2.2
+    },
+    {
+      "id": "reject",
+      "from": "C",
+      "to": "B",
+      "label": "reject with reason",
+      "role": "error",
+      "variant": "dashed",
+      "width": 1.1
+    },
+    {
+      "id": "approve",
+      "from": "C",
+      "to": "CO",
+      "label": "approve",
+      "role": "main",
+      "width": 2.2,
+      "via": [[462, 390]]
+    },
+    {
+      "id": "co-r",
+      "from": "CO",
+      "to": "R",
+      "role": "branch",
+      "fromSide": "right"
+    },
+    {
+      "id": "co-au",
+      "from": "CO",
+      "to": "AU",
+      "role": "branch",
+      "fromSide": "right"
+    },
+    {
+      "id": "co-te",
+      "from": "CO",
+      "to": "TE",
+      "role": "branch",
+      "fromSide": "right"
+    },
+    {
+      "id": "co-fc",
+      "from": "CO",
+      "to": "FC",
+      "role": "branch",
+      "fromSide": "right"
+    },
+    {
+      "id": "r-vg",
+      "from": "R",
+      "to": "VG",
+      "role": "branch"
+    },
+    {
+      "id": "au-vg",
+      "from": "AU",
+      "to": "VG",
+      "role": "branch"
+    },
+    {
+      "id": "te-vg",
+      "from": "TE",
+      "to": "VG",
+      "role": "branch"
+    },
+    {
+      "id": "fc-vg",
+      "from": "FC",
+      "to": "VG",
+      "role": "branch"
+    },
+    {
+      "id": "needs-changes",
+      "from": "VG",
+      "to": "CO",
+      "label": "needs changes",
+      "role": "error",
+      "variant": "dashed",
+      "width": 1.1,
+      "toSide": "left"
+    },
+    {
+      "id": "looks-good",
+      "from": "VG",
+      "to": "E",
+      "label": "looks good",
+      "role": "main",
+      "width": 2.2
+    },
+    {
+      "id": "pr-human",
+      "from": "E",
+      "to": "F",
+      "role": "main",
+      "width": 2.2
+    },
+    {
+      "id": "pr-ai",
+      "from": "E",
+      "to": "AR",
+      "role": "branch"
+    },
+    {
+      "id": "merge",
+      "from": "F",
+      "to": "G",
+      "label": "merge",
+      "role": "main",
+      "width": 2.2
+    },
+    {
+      "id": "human-comments",
+      "from": "F",
+      "to": "RW",
+      "label": "comments",
+      "role": "branch"
+    },
+    {
+      "id": "ai-comments",
+      "from": "AR",
+      "to": "RW",
+      "label": "comments",
+      "role": "branch"
+    },
+    {
+      "id": "rework",
+      "from": "RW",
+      "to": "CO",
+      "label": "auto-approved fix",
+      "role": "branch",
+      "variant": "dashed",
+      "width": 1.1
+    },
+    {
+      "id": "red-fix",
+      "from": "H",
+      "to": "I",
+      "role": "branch"
+    },
+    {
+      "id": "fix-replan",
+      "from": "I",
+      "to": "C",
+      "role": "branch",
+      "toSide": "left"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "rose",
+      "title": "Two decisions stay human",
+      "items": [
+        "The Plan gate approves the approach before any code",
+        "Human review decides merge; everything between is agents"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "main is never touched",
+      "items": [
+        "Agents work a branch and open a pull request",
+        "A human merges; uzi only reworks on comments"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "Reviewers run in parallel",
+      "items": [
+        "reviewer, auditor, tester and fact-checker fan out at once",
+        "Work advances only when all of them pass"
+      ]
+    }
+  ]
+}

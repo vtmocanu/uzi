@@ -525,6 +525,7 @@ type Run struct {
 	CompletionContract          []byte             `json:"completion_contract"`
 	CompletionAttempts          int32              `json:"completion_attempts"`
 	LatestCompletionAttempt     []byte             `json:"latest_completion_attempt"`
+	MilestonesAgents            []byte             `json:"milestones_agents"`
 	HoldReason                  pgtype.Text        `json:"hold_reason"`
 	HoldCapturedHead            pgtype.Text        `json:"hold_captured_head"`
 	CompletionBudgetExhaustedAt pgtype.Timestamptz `json:"completion_budget_exhausted_at"`

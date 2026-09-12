@@ -1,8 +1,8 @@
 # PRD #1209: Codex account rate-limit visibility
 
-**Issue:** [#1209](https://github.com/vtmocanu/uzi/issues/1209) · **Priority:** Medium · **Status:** Reviewed; implementation blocked by #1171, not queued.
-**Blocked by:** [#1171](https://github.com/vtmocanu/uzi/issues/1171). Its remaining production credential/refresh integration must merge before this full PRD is started or dispatched. The partial dark-core merge in #1188 does not satisfy this dependency. The PRD itself can be published now.
-**Related:** [#1106](1106-codex-harness-phase1.md), [credential foundation #1147](done/1147-codex-credentials-foundation.md), [remaining production bridge #1171](1171-codex-production-adapter.md).
+**Issue:** [#1209](https://github.com/vtmocanu/uzi/issues/1209) · **Priority:** Medium · **Status:** Reviewed; #1171 dependency satisfied through PR #1220; not queued. (AI-synced 2026-09-11)
+**Dependency:** [#1171](https://github.com/vtmocanu/uzi/issues/1171) is closed and its production credential/refresh integration is merged. Planning must consume that landed contract without weakening worker authorization.
+**Related:** [#1106](1106-codex-harness-phase1.md), [credential foundation #1147](done/1147-codex-credentials-foundation.md), [production bridge #1171](done/1171-codex-production-adapter.md).
 **Evidence baseline:** `2ce64506b634a482974be97dbbd5b6f60e6ddf09`, checked 2026-09-08. Upstream Codex source is pinned below. No real credential, provider request or deployment was used to author this PRD.
 
 ## Problem and outcome
@@ -15,19 +15,19 @@ Show Codex account meters in Settings, the sidebar, Admin rate limits and the CL
 
 **Write and review this PRD now. Do not wait for the whole of #1106.** Credential storage, canonical identity and coordinated-refresh primitives landed in #1154; the remaining challenge is safely connecting them to an idle account reader. That is a narrower dependency than executing Codex runs.
 
-**Required implementation order (user-confirmed 2026-09-08):** #1197, then #1171's remaining implementation, then this PRD's shared credential integration. **#1171 is the blocking dependency for #1209.** This ordering avoids concurrent ownership of the credential foundation. It is a code-integration dependency, not a claim that a worker or app-server must run to read limits. Standalone schema, contract and mock work may proceed only as separately scoped work; keep this full PRD unqueued until #1171's remaining credential integration has merged and its relevant checks pass. Publication of this reviewed PRD does not need to wait.
+**Required implementation order (user-confirmed 2026-09-08, satisfied 2026-09-11):** #1197 closed, then #1171's production credential integration merged through PR #1220. This PRD may now plan against that landed baseline. The ordering avoided concurrent ownership of the credential foundation; it does not imply that a worker or app-server must run to read limits. Keep the full PRD unqueued until the user chooses it, not because the former dependency remains open.
 
-| Existing work | Verified state on 2026-09-08 | Effect here |
+| Existing work | Verified state on 2026-09-11 | Effect here |
 | --- | --- | --- |
 | #1147 / PR #1154 | Merged; named credentials, account identity, immutable run bindings and refresh/recovery primitives | Reuse these records and invariants. A saved `staging` login still needs real production identity reconciliation. |
-| #1171 / PR #1188 | Dark adapter core merged; remaining credential bridge, production composition, sink integration and packaged proof incomplete | **Blocking implementation dependency.** Wait for the remaining production credential integration to merge; #1188 alone is insufficient. #1171 owns production `codexauth.Client` injection, worker release/refresh routes and their authorization. This PRD must not duplicate or relax them. |
-| #1190 / PR #1200 | Merged at `3278480e` on 2026-09-08 | The earlier #1171 handoff's pause dependency is satisfied. Its new paused durability sink remains #1171's responsibility. |
-| #1197 | Open; latest #1171 issue body explicitly gates redispatch on its merge | Transitive sequencing dependency, not meter behavior. Recheck before dispatch. |
+| #1171 / PR #1220 | Production credential bridge, composition, sink integration and packaged proof merged; child closed | **Satisfied implementation dependency.** Reuse production `codexauth.Client` injection, worker release/refresh routes and their authorization. Do not duplicate or relax them. |
+| #1190 / PR #1200 | Merged at `3278480e` on 2026-09-08 | The earlier pause dependency is satisfied; the paused durability sink is implemented. |
+| #1197 | Closed on 2026-09-08 | The transitive sequencing dependency is satisfied. |
 | #1106 M4-M7 | Incomplete | Full harness conformance, public run routing/pickers, API-key pricing and worker rollout are not prerequisites for API-side account meters. This PRD does not mark any of them complete. |
 
-At implementation planning, re-read the live #1171 issue and its merged diff, since an issue remaining open for live acceptance does not mean its code is unmerged. Require its credential integration to be merged and its relevant tests green; any remaining maintainer-only harness acceptance stays attached to parent M3. Retain this feature's own independent live acceptance below.
+At implementation planning, re-read #1171's merged diff and consume its credential integration with the relevant tests green. The remaining maintainer-only harness acceptance stays attached to parent M3 and does not re-block this account-meter implementation. Retain this feature's own independent live acceptance below.
 
-The implementation plan must explicitly resolve recovery ownership against that #1171 baseline: reuse an equivalent landed repair or name the missing discriminator/transition this PRD will implement. Coordinate overlapping schema or credential changes with the #1171 owner if planning before its merge. #1209 owns successful recovery for accounts that have never been used by a worker; this acceptance criterion cannot be deferred on the assumption that a future run will quarantine the account.
+The implementation plan must explicitly resolve recovery ownership against that landed #1171 baseline: reuse an equivalent repair or name the missing discriminator/transition this PRD will implement. #1209 owns successful recovery for accounts that have never been used by a worker; this acceptance criterion cannot be deferred on the assumption that a future run will quarantine the account.
 
 | Shared seam | #1171 owns | #1209 owns after that seam lands |
 | --- | --- | --- |
@@ -58,7 +58,7 @@ Wake collection after a successful login save/replacement and vault unlock, with
 
 For linked accounts, open only the canonical durably committed credential under the vault rules. Poll once per `(uzi user, canonical provider account)`, even if several saved aliases refer to it. Send the verified workspace id as the upstream header. Treat a returned identity mismatch as an unusable reading, not a new account mapping. Respect revocation, material revision, credential revision, in-flight refresh and quarantined recovery state.
 
-Add an internal, non-HTTP account-reader authorization path to the same refresh coordinator after #1171 lands. The worker-facing wrapper must still require its existing run capability and current-worker checks. Do not fabricate a run, weaken those checks, or create a public token-release endpoint. A poll refresh and a worker refresh for the same generation must converge on one durable operation. Preserve operation-id retry/reconciliation, durable commit before release, recovery fencing and quarantine on ambiguous provider outcomes. A polling timeout never permits a blind second exchange of a possibly spent refresh token. No run-long account lock and no second OAuth refresher.
+Add an internal, non-HTTP account-reader authorization path to #1171's landed refresh coordinator. The worker-facing wrapper must still require its existing run capability and current-worker checks. Do not fabricate a run, weaken those checks, or create a public token-release endpoint. A poll refresh and a worker refresh for the same generation must converge on one durable operation. Preserve operation-id retry/reconciliation, durable commit before release, recovery fencing and quarantine on ambiguous provider outcomes. A polling timeout never permits a blind second exchange of a possibly spent refresh token. No run-long account lock and no second OAuth refresher.
 
 On rejected access, first re-read canonical generation; a concurrently committed newer token can support one bounded retry. A genuinely expired linked login uses the common coordinator only when its state permits rotation. Repeated auth rejection, missing renewal material or unrecoverable state is actionable in Settings. A bare 403 does not prove expiry and must not trigger a refresh loop. Honor bounded `Retry-After`/backoff for 429 and transient errors. Last successful readings survive failed requests with their original observation timestamp.
 
@@ -66,7 +66,7 @@ On rejected access, first re-read canonical generation; a concurrently committed
 
 `reauth_required` records proven inability to use/renew the current canonical generation, including rejected expired access with no renewal material. Its unset state is not proof that a login is usable. Bind writes to the observed account generation and credential revision: an old HTTP failure must not mark newly refreshed/replaced material unusable. A timeout, 429, vault lock, missing client injection or bare 403 alone must not set it. It survives API restarts and duplicate imports, applies to generation-zero accounts with no run history, and is cleared atomically when a verified usable generation is installed. Preserve in-flight intents, quarantine and recoverable newer material as independent coordination states.
 
-The canonical replacement predicate must handle `quarantined OR reauth_required`, subject to the existing recovery precedence, owner/identity checks, generation/credential-revision fencing and alias material-revision CAS. Being marked for re-authentication must not bypass an active refresh or overwrite recoverable newer state. Install the verified replacement, advance generation, clear the applicable re-authentication state and link the alias in one transaction; a failed link/restore CAS rolls back the replacement. Healthy duplicate imports retain canonical material. Plan-time coordination with #1171 decides which existing repair to reuse; #1209 remains responsible for the complete idle-account path if #1171 does not supply it.
+The canonical replacement predicate must handle `quarantined OR reauth_required`, subject to the existing recovery precedence, owner/identity checks, generation/credential-revision fencing and alias material-revision CAS. Being marked for re-authentication must not bypass an active refresh or overwrite recoverable newer state. Install the verified replacement, advance generation, clear the applicable re-authentication state and link the alias in one transaction; a failed link/restore CAS rolls back the replacement. Healthy duplicate imports retain canonical material. Plan-time comparison against #1171's landed implementation decides which existing repair to reuse; #1209 remains responsible for the complete idle-account path where that implementation does not supply it.
 
 ### 2. Account identity, windows and freshness
 
@@ -120,7 +120,7 @@ Resolve these contracts in the implementation plan before M1 freezes storage or 
 | Phase | Milestone | Dependencies | Owned files / conflict rule | Repo |
 | --- | --- | --- | --- | --- |
 | Phase 1 (sequential) | M1. Storage and frozen contract | Merged #1147; plan-gate contracts resolved against #1171 | New meter/preference/re-authentication migration and queries, meter and user-settings DTOs/fixtures; initial `web/src/lib/apiTypes.ts` types. Allocate shared-file ownership here. | `vtmocanu/uzi` |
-| Phase 2 (parallel) | M2. Account collector and credential integration | M1; remaining #1171 credential implementation merged and verified; internal-principal contract resolved | `api/internal/codexauth/`, internal shared credential coordinator and recovery transitions, new account poller, `api/cmd/server/main.go`, config and wake integration. Own these independently of M3. | `vtmocanu/uzi` |
+| Phase 2 (parallel) | M2. Account collector and credential integration | M1; landed #1171 credential contract consumed; internal-principal contract resolved | `api/internal/codexauth/`, internal shared credential coordinator and recovery transitions, new account poller, `api/cmd/server/main.go`, config and wake integration. Own these independently of M3. | `vtmocanu/uzi` |
 | Phase 2 (parallel) | M3. Cached API, display preference, web and terminal views | M1 contract | New handler/client files, `handler/user_settings.go`, router, web meters/settings/mocks, `api/internal/uzicli/`, `api/cmd/uzi/`; use fixtures while M2 runs. M2 must not edit these files; assign any shared auth/save router file to one owner at plan time. | `vtmocanu/uzi` |
 | Phase 3 (sequential) | M4. Integrated correctness and isolation proof | M2 + M3 | Integration tests in existing live-DB packages, e2e phase/registry, shared Taskfile recipes only if needed. | `vtmocanu/uzi` |
 | Phase 4 (sequential) | M5. Docs and maintainer acceptance handoff | M4 | User/operator docs plus embedded mirrors, architecture/spec progress and sanitized acceptance record. | `vtmocanu/uzi` |
@@ -139,17 +139,19 @@ Accept only when a linked subscription obtains a reading with zero active Codex 
 
 Also toggle an additional account's Settings checkmark on and off: the same account must appear/disappear in the web sidebar and running TUI after their settings refresh, while the subscription-default meter and existing Claude selections remain intact. Repeat after a browser reload/TUI restart; verify an unchecked account does not reappear when its utilization increases, and an API-key default is never mistaken for a subscription account.
 
-Do not tick live acceptance based on source inspection, synthetic-provider tests, a successful M3 harness run, or a UI mock. The implementation may land with this acceptance pending; feature readiness remains pending until it passes. Approval to create this PRD does not authorize starting a run, rotating a real login, deploying or closing #1106/#1171.
+Do not tick live acceptance based on source inspection, synthetic-provider tests, a successful M3 harness run, or a UI mock. The implementation may land with this acceptance pending; feature readiness remains pending until it passes. Approval to create this PRD does not authorize starting a run, rotating a real login, deploying or closing parent #1106.
 
 ## Risks and decisions
 
 - **Provider endpoint drift:** the backing HTTP endpoint is version-evidenced, not a stable public REST promise. Bound and isolate its decoder, ignore additive unknown fields, preserve last-good data on invalid known fields and provide truthful unavailable states.
-- **Credential coordination conflict:** #1171 and this feature touch the same authority/refresh code. Land #1171 first; the implementation plan must name the internal principal and prove worker authorization remains intact. Never make run id optional on a worker refresh route.
+- **Credential coordination conflict:** #1171 and this feature touch the same authority/refresh code. #1171 is landed; the implementation plan must consume it, name the internal principal and prove worker authorization remains intact. Never make run id optional on a worker refresh route.
 - **Credential linking is not already wired:** saving a login currently leaves it `staging`. M2 owns the meter-side production trigger using M1's reconciler. Skipping this would produce a correct-looking dashboard that can never populate.
 - **Alias is not quota:** account identity and budget deduplication are scoped to one uzi user; neither a different saved name nor a second login import creates capacity. Preserve workspace distinctions.
 - **Visibility is not admission:** utilization, estimates and provider limit flags do not grant run eligibility and do not alter Claude selection/parking behavior.
 
 ## Decision and progress log
+
+- 2026-09-11 (dependency satisfied): #1197 is closed and #1171's production credential/refresh integration merged through PR #1220 with its packaged proof complete. The full #1209 PRD is no longer dependency-blocked, but remains deliberately unqueued until the user selects it. Planning must consume the landed coordinator and preserve the worker authorization wrapper; parent #1106's remaining maintainer acceptance does not re-block API-side idle polling.
 
 - 2026-09-08 (user-confirmed dependency): the user requested that #1171 be explicitly identified as the dependency in both issue #1209 and this PRD. Added the prominent blocked-by declaration and made the implementation order required: publish the reviewed documentation now, keep #1209 unqueued, and wait for #1171's remaining production credential/refresh integration to merge before starting the full PRD. The earlier partial merge #1188 does not clear this dependency; the rest of parent #1106 is not required for account meters.
 

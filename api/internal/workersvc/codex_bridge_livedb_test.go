@@ -1,6 +1,8 @@
 package workersvc
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -18,18 +20,17 @@ import (
 // PRD #1171 M1 (ships DARK): prove the coordinated refresher through the REAL production
 // codexauth.Client (built over a fake httpDoer) injected via the REAL SetCodexRefresh
 // setter — "prove the route through real server construction rather than direct service
-// tests alone". The dark M4 suite already proves the refresh STATE MACHINE with an
+// tests alone". The dark M4 suite already proves the refresh state machine with an
 // in-process fake CodexRefreshClient; here the seam under test is the production client
-// wiring itself: request assembly, JSON decode, the two-call advance (oauth exchange +
-// nonrotating identity re-verify), and that an api_key run drives ZERO provider calls.
+// wiring itself: request assembly, JSON and JWT-claim decode, the single-call advance, and
+// that an api_key run drives zero provider calls.
 //
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres.
 
-// fakeCodexProviderDoer is a codexauth httpDoer that answers the two provider surfaces the
-// coordinated advance touches: POST /oauth/token (the token exchange) and GET /wham/usage
-// (the post-refresh identity re-verify, audit #2). It counts each so a test can assert the
-// EXACT provider-call shape — one exchange + one re-verify for a subscription advance, and
-// ZERO of either for an api_key run. Safe for concurrent use.
+// fakeCodexProviderDoer answers both codexauth provider surfaces but counts each so the
+// coordinated callback can prove it touches only POST /oauth/token. GET /wham/usage remains
+// implemented as a tripwire: a subscription advance wants one exchange and zero usage reads;
+// an api_key run wants zero of both. Safe for concurrent use.
 type fakeCodexProviderDoer struct {
 	mu         sync.Mutex
 	oauthCalls int
@@ -69,17 +70,32 @@ func codexJSONResp(body string) *http.Response {
 	}
 }
 
+func freshIdentityAccessToken(t *testing.T, accountID, userID string) string {
+	t.Helper()
+	payload, err := json.Marshal(map[string]any{
+		"https://api.openai.com/auth": map[string]any{
+			"chatgpt_account_id": accountID,
+			"chatgpt_user_id":    userID,
+			"user_id":            userID,
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal fresh access-token claims: %v", err)
+	}
+	enc := base64.RawURLEncoding.EncodeToString
+	return enc([]byte(`{"alg":"none","typ":"JWT"}`)) + "." + enc(payload) + "." + enc([]byte("sig"))
+}
+
 // TestCoordinatedRefreshThroughProductionCodexauthClientLiveDB drives a first refresh
 // (observedGeneration == current == 0 → ADVANCE) end to end through the production
 // codexauth.Client. It proves the account durably advances to generation 1, the freshly
-// EXCHANGED access token (never the pre-rotation one) is released, and the provider was
-// called exactly once for the exchange plus once for the identity re-verify.
+// exchanged access token is released, and the callback makes exactly one oauth exchange
+// with zero usage GETs.
 func TestCoordinatedRefreshThroughProductionCodexauthClientLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	f := newSubscriptionFixture(t, env)
 
-	// Resolve the account's frozen identity tuple so the fake /wham/usage re-verify MATCHES
-	// (audit #2) and the commit is allowed to land.
+	// Resolve the account's frozen tuple so the exchanged JWT can carry matching claims.
 	st := mustState(t, env, f.userID, f.aliasID)
 	if !st.ProviderAccountID.Valid {
 		t.Fatal("subscription alias must link a provider account")
@@ -90,7 +106,7 @@ func TestCoordinatedRefreshThroughProductionCodexauthClientLiveDB(t *testing.T) 
 		t.Fatalf("fixture account generation = %d, want 0 (initial login)", acct.Generation)
 	}
 
-	rotatedAccess := codexToken("access-rotated")
+	rotatedAccess := freshIdentityAccessToken(t, acct.WorkspaceAccountID, acct.ProviderUserID)
 	doer := &fakeCodexProviderDoer{
 		newAccess:  rotatedAccess,
 		newRefresh: codexToken("refresh-rotated"),
@@ -121,8 +137,8 @@ func TestCoordinatedRefreshThroughProductionCodexauthClientLiveDB(t *testing.T) 
 	if res.ChatGPTAccountID != acct.WorkspaceAccountID {
 		t.Fatalf("refresh chatgpt account id = %q, want verified %q", res.ChatGPTAccountID, acct.WorkspaceAccountID)
 	}
-	if oauth, usage := doer.calls(); oauth != 1 || usage != 1 {
-		t.Fatalf("provider calls = (oauth %d, usage %d), want (1, 1) for one advance", oauth, usage)
+	if oauth, usage := doer.calls(); oauth != 1 || usage != 0 {
+		t.Fatalf("provider calls = (oauth %d, usage %d), want (1, 0) for one advance", oauth, usage)
 	}
 
 	// The account durably advanced: generation 1, and its committed login is the new one.

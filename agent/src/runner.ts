@@ -3252,6 +3252,11 @@ export class RunRunner {
                 ? {
                     milestones_completed: progress.completed,
                     milestones_in_progress: progress.in_progress,
+                    // PRD #1224 M1: project the OPTIONAL per-milestone agent attribution,
+                    // omitted when undefined so an old-worker wire shape is preserved.
+                    ...(progress.milestones_agents
+                      ? { milestones_agents: progress.milestones_agents }
+                      : {}),
                   }
                 : {}),
             }),
@@ -3312,6 +3317,11 @@ export class RunRunner {
             status: "running",
             milestones_completed: progress.completed,
             milestones_in_progress: progress.in_progress,
+            // PRD #1224 M1: project the OPTIONAL per-milestone agent attribution, omitted
+            // when undefined so an old-worker wire shape is preserved.
+            ...(progress.milestones_agents
+              ? { milestones_agents: progress.milestones_agents }
+              : {}),
           }),
         ).catch((e) =>
           runLog.warn("could not report progress", { error: errMessage(e) }),
@@ -3426,6 +3436,11 @@ export class RunRunner {
                   ? {
                       milestones_completed: opts.progress.completed,
                       milestones_in_progress: opts.progress.in_progress,
+                      // PRD #1224 M1: project the OPTIONAL per-milestone agent attribution,
+                      // omitted when undefined so an old-worker wire shape is preserved.
+                      ...(opts.progress.milestones_agents
+                        ? { milestones_agents: opts.progress.milestones_agents }
+                        : {}),
                     }
                   : {}),
               }),

@@ -56,8 +56,8 @@ const (
 // codexWorkerOperationTimeout is the server-side slice of pinned app-server's fixed
 // 10-second external-auth callback budget. The worker caps this HTTP round trip at 8s;
 // finishing API work within 7.5s reserves 500ms for response delivery and 2.5s at the
-// callback layer. The coordinated refresh lease is shorter still (7s), and its two serial
-// provider calls are capped at 2.5s each, leaving durable-commit and recheck margin.
+// callback layer. The coordinated refresh lease is shorter still (7s); its one bounded
+// oauth exchange leaves margin for the local identity differential, commit and recheck.
 const codexWorkerOperationTimeout = 7500 * time.Millisecond
 
 // maxCodexRefreshObservedGeneration is the largest JSON integer the TypeScript worker can
@@ -182,6 +182,7 @@ func (h *Handler) WorkerCodexRelease(w http.ResponseWriter, r *http.Request) {
 // check (ScopeStartRefresh does not apply) and performs ZERO provider calls.
 func (h *Handler) WorkerCodexRefresh(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
+	routeStart := time.Now()
 	// Start the operation budget at handler entry, before authentication lookups and body
 	// decoding. The coordinated refresh lease and provider sub-deadlines derive from this
 	// context, so pre-provider work cannot silently extend the app-server callback budget.
@@ -216,7 +217,12 @@ func (h *Handler) WorkerCodexRefresh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var routeErr error
+	wroteSuccess := false
+	defer func() { logCodexRouteTiming(opID, routeStart, codexRouteResult(routeErr, wroteSuccess)) }()
+
 	res, err := h.wsvc.CoordinatedCodexRefresh(ctx, wkr, runID, req.Capability, opID, *req.ObservedGeneration)
+	routeErr = err
 	if err != nil {
 		h.writeCodexError(w, "refresh", err)
 		return
@@ -225,7 +231,7 @@ func (h *Handler) WorkerCodexRefresh(w http.ResponseWriter, r *http.Request) {
 		h.writeCodexError(w, "refresh", errors.New("codex subscription refresh metadata missing"))
 		return
 	}
-	httpx.JSON(w, http.StatusOK, codexRefreshResponse{
+	routeErr = httpx.WriteJSON(w, http.StatusOK, codexRefreshResponse{
 		AuthMode:         "subscription",
 		AccessToken:      res.AccessToken,
 		Generation:       res.Generation,
@@ -233,6 +239,7 @@ func (h *Handler) WorkerCodexRefresh(w http.ResponseWriter, r *http.Request) {
 		ChatGPTPlanType:  nil,
 		Outcome:          codexRefreshOutcomeString(res.Outcome),
 	})
+	wroteSuccess = routeErr == nil
 }
 
 // writeCodexError maps a service error to its fixed HTTP status + coordinate-free body and
@@ -306,6 +313,34 @@ func codexHTTPError(err error) (int, string) {
 		// text reaches the body; it is the generic 500, logged server-side by writeCodexError.
 		return http.StatusInternalServerError, codexErrInternal
 	}
+}
+
+// codex refresh route-total timing (issue #1238), secret-free. Correlated by the non-secret
+// operation_id; carries only route_total_ms and a finite result. No token/account/error text.
+const codexTimingMsgRoute = "codex refresh route"
+
+// codexRouteResult classifies the route-total outcome from the two handler-known facts at
+// emit time. A service error or an error reported by the response encoder dominates and is
+// classified via CodexTimingResult; otherwise the outcome is "ok" only when the encoder
+// completed. This observes ResponseWriter.Write errors, not network delivery: net/http may
+// buffer a normal-sized response until after the handler returns, so a client disconnect can
+// still emit "ok".
+func codexRouteResult(routeErr error, wroteSuccess bool) string {
+	if routeErr != nil {
+		return workersvc.CodexTimingResult(routeErr)
+	}
+	if wroteSuccess {
+		return "ok"
+	}
+	return "error"
+}
+
+func logCodexRouteTiming(operationID uuid.UUID, start time.Time, result string) {
+	slog.Info(codexTimingMsgRoute,
+		"operation_id", operationID.String(),
+		"route_total_ms", workersvc.CodexTimingMS(time.Since(start)),
+		"result", result,
+	)
 }
 
 // codexRefreshOutcomeString renders a CoordinatedCodexRefresh outcome as a stable wire

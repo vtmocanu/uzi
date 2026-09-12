@@ -183,13 +183,15 @@ export function PerUserUsageTable({ admin }: { admin: AdminUsage }) {
                     <Td>{formatTokens(u.b.out)}</Td>
                     <Td cost>{money(u.b.cost)}</Td>
                     <Td>
-                      {pct}%
-                      <span
-                        className="ml-2 inline-block h-1 w-16 overflow-hidden rounded bg-edge align-middle"
-                        role="img"
-                        aria-label={`${pct} percent of factory tokens`}
-                      >
-                        <span className="block h-full bg-brand" style={{ width: `${pct}%` }} />
+                      <span className="inline-flex items-center justify-end gap-2 whitespace-nowrap">
+                        {pct}%
+                        <span
+                          className="inline-block h-1 w-16 overflow-hidden rounded bg-edge align-middle"
+                          role="img"
+                          aria-label={`${pct} percent of factory tokens`}
+                        >
+                          <span className="block h-full bg-brand" style={{ width: `${pct}%` }} />
+                        </span>
                       </span>
                     </Td>
                   </tr>
