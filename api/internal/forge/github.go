@@ -123,9 +123,22 @@ func (g *github) wrapErr(op string, err error) error {
 	var arle *gh.AbuseRateLimitError
 	switch {
 	case errors.As(err, &rle):
-		return g.redact.error(fmt.Errorf("github: %s: rate limited by github: %w", op, err))
+		// Map the primary rate limit onto the neutral *RateLimitError so a caller can
+		// errors.As it (regardless of forge) and answer 429 + Retry-After. Rate.Reset
+		// is read from the RAW error before redaction; the wrapped message is redacted.
+		return &RateLimitError{
+			Reset: rle.Rate.Reset.Time,
+			Err:   g.redact.error(fmt.Errorf("github: %s: rate limited by github: %w", op, err)),
+		}
 	case errors.As(err, &arle):
-		return g.redact.error(fmt.Errorf("github: %s: secondary (abuse) rate limited by github: %w", op, err))
+		// Secondary (abuse) limit: it carries a RetryAfter wait rather than a reset.
+		rl := &RateLimitError{
+			Err: g.redact.error(fmt.Errorf("github: %s: secondary (abuse) rate limited by github: %w", op, err)),
+		}
+		if arle.RetryAfter != nil {
+			rl.Retry = *arle.RetryAfter
+		}
+		return rl
 	default:
 		return g.redact.error(fmt.Errorf("github: %s: %w", op, err))
 	}

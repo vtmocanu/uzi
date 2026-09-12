@@ -1,6 +1,6 @@
 // Package forgetest provides shared test-support scaffolding for the
 // forge.Forge driver contract. Its centrepiece is BaseFake: an embeddable
-// implementation of all 26 Forge methods with safe defaults, so a hand-written
+// implementation of all 29 Forge methods with safe defaults, so a hand-written
 // test fake can embed it and override only the methods it actually exercises.
 //
 // The point is the interface-change tax. Adding a method to forge.Forge used to
@@ -37,7 +37,7 @@ func notStubbed(method string) error {
 }
 
 // BaseFake is an empty struct that implements the entire forge.Forge interface
-// (all 26 methods) with safe defaults, designed to be embedded by value in a
+// (all 29 methods) with safe defaults, designed to be embedded by value in a
 // hand-written test fake used through a pointer. Every method has a pointer
 // receiver so method promotion works when the embedder is used as *fakeForge.
 //
@@ -177,6 +177,21 @@ func (*BaseFake) ListPipelineJobs(context.Context, int64, int64) ([]forge.Job, e
 // JobLogTail implements forge.Forge.
 func (*BaseFake) JobLogTail(context.Context, int64, int64, int) (string, error) {
 	return "", notStubbed("JobLogTail")
+}
+
+// ListMergeRequests implements forge.Forge.
+func (*BaseFake) ListMergeRequests(context.Context, int64, forge.ListMergeRequestsOptions) ([]forge.MergeRequestSummary, error) {
+	return nil, notStubbed("ListMergeRequests")
+}
+
+// ListChecks implements forge.Forge.
+func (*BaseFake) ListChecks(context.Context, int64, string) ([]forge.Check, error) {
+	return nil, notStubbed("ListChecks")
+}
+
+// ListWorkflowRuns implements forge.Forge.
+func (*BaseFake) ListWorkflowRuns(context.Context, int64, forge.ListWorkflowRunsOptions) ([]forge.WorkflowRun, error) {
+	return nil, notStubbed("ListWorkflowRuns")
 }
 
 // ProjectCIConfigPath implements forge.Forge.

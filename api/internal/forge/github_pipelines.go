@@ -667,13 +667,32 @@ func toGitHubPipeline(r *gh.WorkflowRun) Pipeline {
 }
 
 // toGitHubJob maps a workflow job to the neutral Job. Stage is empty (GitHub
-// Actions has no stage concept, unlike GitLab's pipeline model).
+// Actions has no stage concept, unlike GitLab's pipeline model). Steps and
+// StartedAt/FinishedAt are filled from the job's TaskStep slice and timestamps
+// (PRD #1255): each step's raw status/conclusion is carried verbatim, the same
+// D8 collapse the job and pipeline use.
 func toGitHubJob(j *gh.WorkflowJob) Job {
-	return Job{
-		ID:     j.GetID(),
-		Name:   j.GetName(),
-		Stage:  "",
-		Status: githubActionsStatus(j.GetStatus(), j.GetConclusion()),
-		WebURL: j.GetHTMLURL(),
+	job := Job{
+		ID:         j.GetID(),
+		Name:       j.GetName(),
+		Stage:      "",
+		Status:     githubActionsStatus(j.GetStatus(), j.GetConclusion()),
+		WebURL:     j.GetHTMLURL(),
+		StartedAt:  j.GetStartedAt().Time,
+		FinishedAt: j.GetCompletedAt().Time,
 	}
+	for _, s := range j.Steps {
+		if s == nil {
+			continue
+		}
+		job.Steps = append(job.Steps, Step{
+			Name:        s.GetName(),
+			Status:      s.GetStatus(),
+			Conclusion:  s.GetConclusion(),
+			Number:      int(s.GetNumber()),
+			StartedAt:   s.GetStartedAt().Time,
+			CompletedAt: s.GetCompletedAt().Time,
+		})
+	}
+	return job
 }
