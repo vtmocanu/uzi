@@ -193,6 +193,27 @@ export class PendingRecoveryCaptureError extends Error {
   }
 }
 
+/**
+ * issue #1308 — a DIFFERENT run's recovery-capture journal blocks this acquisition: the
+ * pending journal names a run id and/or clone path that is not this run's. The runner
+ * catches this to attempt self-heal (reclaim when the owner run is terminal-and-idle),
+ * and if it cannot, maps it to the `runner_clone_conflict` fail_origin. The message keeps
+ * the "another run" phrase the git-layer recovery tests match. `pendingRunId` /
+ * `pendingClonePath` name the JOURNAL's owner (the run to probe for terminality and whose
+ * clone to reclaim); `targetClonePath` is the clone THIS run wanted to seed.
+ */
+export class RunnerCloneConflictError extends Error {
+  constructor(
+    readonly pendingRunId: string,
+    readonly pendingClonePath: string,
+    readonly targetClonePath: string,
+    readonly branch: string,
+  ) {
+    super("refusing to replace a retained clone owned by another run");
+    this.name = "RunnerCloneConflictError";
+  }
+}
+
 function recoveryCaptureKey(branch: string): string {
   return `uzi-recovery.${branch}.clone`;
 }
@@ -569,7 +590,10 @@ export class GitCache {
         throw err;
       })) {
         if (pending.runId !== runId || pending.clonePath !== clonePath) {
-          throw new Error("refusing to replace a retained clone owned by another run");
+          // issue #1308 — a TYPED refuse so the runner can self-heal it (reclaim when the
+          // owner run is terminal-and-idle) and, failing that, stamp the closed-vocabulary
+          // `runner_clone_conflict` fail_origin instead of a generic agent_failure.
+          throw new RunnerCloneConflictError(pending.runId, pending.clonePath, clonePath, branch);
         }
         throw new PendingRecoveryCaptureError(clonePath, branch);
       }
@@ -1370,13 +1394,87 @@ export class GitCache {
     });
   }
 
-  async clearRecoveryCapture(barePath: string, branch: string, runId: string): Promise<void> {
+  /**
+   * issue #1308 — terminal-cleanup release of a run's runner clone AND its recovery journal,
+   * under the ONE per-bare lock, with an exact-owner compare-and-check on BOTH the delete and
+   * the clear.
+   *
+   * The clone is deleted ONLY while the journal still names exactly (runId, clonePath). A
+   * same-key SUCCESSOR run can reclaim this journal and reseed a FRESH clone at the same path
+   * BEFORE this finished execution's cleanup runs (the runner drops the run from activeRuns
+   * before this cleanup, and codex dispose can hold the finally open), so an UNCONDITIONAL
+   * delete would destroy that live successor clone. When the journal no longer names us — a
+   * successor reclaimed it, or this run failed before it ever journaled — we touch NOTHING:
+   * any leftover is then unjournaled and harmless (the next same-key reseed's pre-seed rm
+   * removes it, and no journal means no refuse).
+   *
+   * When it IS still ours, the journal is cleared whether the delete succeeded or FAILED
+   * (ENOTEMPTY/EBUSY): a terminal run's work is already pushed, so the journal protects
+   * nothing and must be released even when the leftover dir survives on disk — releasing it
+   * is exactly the #1308 availability fix. `refs/uzi-runner/<branch>` is never touched.
+   */
+  async removeRunnerCloneAndReleaseRecovery(barePath: string, clonePath: string, branch: string, runId: string): Promise<void> {
     await this.withLock(barePath, async () => {
       const pending = await this.readRecoveryCapture(barePath, branch);
-      if (pending?.runId === runId) {
-        await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
+      if (pending?.runId !== runId || pending?.clonePath !== clonePath) {
+        return;
       }
+      try {
+        await this.removeRunnerClone(clonePath);
+      } catch (e) {
+        this.log.warn("terminal cleanup: runner clone removal failed; releasing recovery journal anyway", {
+          clone: clonePath,
+          error: gitErrorMessage(e),
+        });
+      }
+      await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
     });
+  }
+
+  /**
+   * issue #1308 — reclaim a TERMINAL owner run's leftover recovery residue so a NEW run on
+   * the same branch is not bricked by a stale journal (the mr_rework-at-iteration-0 bug). The
+   * runner calls this ONLY after confirming, out of band, that the journal's owner run is
+   * terminal (completed/failed/cancelled) AND not locally active. Under the ONE per-bare lock,
+   * with the same exact-owner CAS as the terminal release:
+   *   - if the journal no longer names (ownerRunId, ownerClonePath) — a concurrent reclaimer
+   *     or the owner itself already handled it — do NOTHING;
+   *   - else best-effort delete the recorded owner clone, but ONLY when it is inside this
+   *     repo's runner root (containment: a recorded path elsewhere is never deleted), and
+   *     deletion NEVER gates the clear;
+   *   - then clear the journal (release protection).
+   * `refs/uzi-runner/<branch>` (the durable off-PVC recovery artifact) is never touched — the
+   * retained clone is only same-run recovery state.
+   */
+  async reclaimTerminalRecoveryClone(barePath: string, branch: string, ownerRunId: string, ownerClonePath: string): Promise<void> {
+    await this.withLock(barePath, async () => {
+      const pending = await this.readRecoveryCapture(barePath, branch);
+      if (pending?.runId !== ownerRunId || pending?.clonePath !== ownerClonePath) {
+        return;
+      }
+      if (this.isInsideRunnerRoot(ownerClonePath)) {
+        await this.removeRunnerClone(ownerClonePath).catch((e) =>
+          this.log.warn("reclaim: best-effort delete of terminal owner clone failed", {
+            clone: ownerClonePath,
+            error: gitErrorMessage(e),
+          }),
+        );
+      } else {
+        this.log.warn("reclaim: recorded clone path is outside the runner root; not deleting", {
+          clone: ownerClonePath,
+        });
+      }
+      await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
+    });
+  }
+
+  /** issue #1308 — true iff `p` resolves to a location strictly inside `this.runnerRoot`.
+   *  Guards the reclaim delete so a journal recording a path outside the runner root (a bug
+   *  or tampering) is never deleted. `path.relative` rejects `..` escapes and absolute
+   *  re-roots; the empty-relative (the root itself) is also rejected. */
+  private isInsideRunnerRoot(p: string): boolean {
+    const rel = path.relative(this.runnerRoot, path.resolve(p));
+    return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
   }
 
   private async readRecoveryCapture(barePath: string, branch: string): Promise<{ runId: string; clonePath: string } | undefined> {
