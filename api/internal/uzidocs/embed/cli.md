@@ -237,8 +237,8 @@ A few worth knowing:
   [Giving a run more time](./run-health.md#giving-a-run-more-time). `--by`
   is required and takes a duration in Go's `time.ParseDuration` syntax
   (`2h`, `90m`, `1h30m`) plus a `d` unit (`1d` = 24h); it must resolve to at
-  least 1 second, so `0`, a negative value, a sub-second value, or an
-  unparseable one is a usage error (exit 2). Valid on any non-terminal run
+  least 60 seconds (the server's minimum), so `0`, anything under a minute, a
+  negative value, or an unparseable one is a usage error (exit 2). Valid on any non-terminal run
   of a kind the sweep can time out (issue, task, prompt, self-improve,
   mr-rework, ci-fix), including a queued or parked one — a chat, judge, or
   interactive-task run never times out, so extending one is a 409 (exit 5).

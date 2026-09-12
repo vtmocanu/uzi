@@ -152,8 +152,8 @@ func newRunExtendCmd(env Env, gf *globalFlags) *cobra.Command {
 			"frozen budget rather than replacing it, and the run's per-run extension allowance is an " +
 			"admin setting.\n\n" +
 			"--by takes a duration: Go's `2h`, `90m`, `1h30m`, plus a `d` (day = 24h) unit — `1d` is " +
-			"24h. It must be at least 1 second; `0`, a sub-second value, a negative value or an " +
-			"unparseable one is a usage error (exit 2).\n\n" +
+			"24h. It must be at least 60 seconds (the server's minimum); `0`, a value under a minute, " +
+			"a negative value or an unparseable one is a usage error (exit 2).\n\n" +
 			"Valid on any non-terminal run of a kind the sweep can time out (an issue, task, prompt, " +
 			"self-improve, mr-rework or ci-fix run), including a queued or parked one. A chat, judge " +
 			"or interactive-task run never times out, so extending one is a 409 (exit 5); an over-cap " +
@@ -199,7 +199,7 @@ func newRunExtendCmd(env Env, gf *globalFlags) *cobra.Command {
 			return nil
 		},
 	}
-	extend.Flags().String("by", "", "how much wall-clock time to add: 2h, 90m, 1h30m, 1d (day = 24h); required, at least 1 second")
+	extend.Flags().String("by", "", "how much wall-clock time to add: 2h, 90m, 1h30m, 1d (day = 24h); required, at least 60 seconds")
 	return extend
 }
 
@@ -207,12 +207,17 @@ func newRunExtendCmd(env Env, gf *globalFlags) *cobra.Command {
 // can rewrite it into hours — time.ParseDuration knows h/m/s but not `d`.
 var extendDaysRe = regexp.MustCompile(`^(-?)(\d+(?:\.\d+)?)d(.*)$`)
 
+// extendMinSeconds is the smallest extension the server accepts (SubmitInput's `extend`
+// branch: `secs < 60` → ErrInvalidExtension, 400). The CLI enforces the same floor locally so
+// a too-small --by fails fast with a usage error instead of round-tripping to a 400.
+const extendMinSeconds = 60
+
 // parseExtendDuration parses the --by value into whole seconds for the `extend` body. It
 // accepts Go's time.ParseDuration syntax (2h, 90m, 1h30m) PLUS a `d` (day = 24h) unit that
-// time.ParseDuration does not know (1d, 1d12h). A value that resolves to zero whole seconds
-// — zero, a negative value, or a sub-second value like 500ms that floors to 0 — or an
-// unparseable value is a usage error (ExitUsage) so a typo (or a too-small unit) fails fast
-// locally rather than posting a no-op "0" extension.
+// time.ParseDuration does not know (1d, 1d12h). A value below the server's minimum extension
+// (60s) — zero, a negative value, a sub-second value like 500ms that floors to 0, or anything
+// under a minute like 30s — or an unparseable value is a usage error (ExitUsage) so a typo (or
+// a too-small unit) fails fast locally rather than posting a body the server would 400.
 func parseExtendDuration(s string) (int, error) {
 	raw := strings.TrimSpace(s)
 	d, err := parseDurationWithDays(raw)
@@ -220,12 +225,12 @@ func parseExtendDuration(s string) (int, error) {
 		return 0, uzicli.Exitf(uzicli.ExitUsage, "--by %q is not a valid duration (try 2h, 90m, 1h30m, 1d)", s)
 	}
 	// Reject on the WHOLE-SECONDS value, not the raw nanosecond duration: a sub-second
-	// input (500ms, 0.5s) is > 0 as a time.Duration but floors to 0 seconds, so guarding
-	// `d <= 0` would let it post a no-op "0". Rejecting seconds <= 0 (equivalently
-	// d < time.Second) fails it fast locally, like 0/negative/unparseable.
+	// input (500ms, 0.5s) is > 0 as a time.Duration but floors to 0 seconds. The floor is the
+	// server's own minimum (extendMinSeconds); a value under it (0, negative, sub-second, or
+	// e.g. 30s) fails fast locally instead of posting a body the server rejects with a 400.
 	seconds := int(d / time.Second)
-	if seconds <= 0 {
-		return 0, uzicli.Exitf(uzicli.ExitUsage, "--by must be at least 1 second (got %q)", s)
+	if seconds < extendMinSeconds {
+		return 0, uzicli.Exitf(uzicli.ExitUsage, "--by must be at least 60 seconds (got %q)", s)
 	}
 	return seconds, nil
 }

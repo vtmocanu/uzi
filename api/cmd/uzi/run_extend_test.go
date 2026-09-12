@@ -17,10 +17,10 @@ import (
 // TestParseExtendDuration pins the --by parse table: Go durations plus the `d` (day = 24h) unit
 // resolve to whole seconds, and a zero, negative or unparseable value is a usage error (exit 2).
 //
-// MUTATION PROOF: drop the `d`-suffix rewrite and `1d` no longer parses; drop the seconds<=0
-// guard and `0`/negative stop being usage errors; revert it to the old `d <= 0` guard (on the
-// nanosecond duration) and the sub-second cases (500ms, 900ms, 1ms, 0.5s) floor to 0 seconds
-// and pass instead of erroring.
+// MUTATION PROOF: drop the `d`-suffix rewrite and `1d` no longer parses; drop the
+// seconds<extendMinSeconds guard and `0`/negative stop being usage errors; loosen it to
+// `seconds <= 0` (the old floor) and the sub-minute cases (1s, 30s, 59s) pass instead of
+// erroring; loosen it to `d <= 0` (nanoseconds) and the sub-second cases floor to 0 and pass.
 func TestParseExtendDuration(t *testing.T) {
 	ok := []struct {
 		in   string
@@ -30,6 +30,8 @@ func TestParseExtendDuration(t *testing.T) {
 		{"90m", 90 * 60},
 		{"1h30m", 90 * 60},
 		{"1d", 24 * 60 * 60},
+		{"1m", 60},   // exactly the 60s floor is accepted
+		{"60s", 60},  // boundary, spelled in seconds
 	}
 	for _, tc := range ok {
 		got, err := parseExtendDuration(tc.in)
@@ -42,10 +44,10 @@ func TestParseExtendDuration(t *testing.T) {
 		}
 	}
 
-	// Sub-second inputs (500ms, 900ms, 1ms, 0.5s) are > 0 as a time.Duration but floor to 0
-	// whole seconds, so each MUST be a usage error rather than a silent no-op — the floor-to-0
-	// bug this fix closes.
-	bad := []string{"0", "-2h", "abc", "", "5", "500ms", "900ms", "1ms", "0.5s"}
+	// Below the server's 60s minimum MUST be a local usage error rather than a round-trip 400:
+	// sub-second inputs (500ms, 900ms, 1ms, 0.5s) floor to 0, and sub-minute inputs (1s, 30s,
+	// 59s) are positive but under the floor. Also 0/negative/unparseable/unitless.
+	bad := []string{"0", "-2h", "abc", "", "5", "500ms", "900ms", "1ms", "0.5s", "1s", "30s", "59s"}
 	for _, in := range bad {
 		_, err := parseExtendDuration(in)
 		if err == nil {
@@ -167,22 +169,23 @@ func TestRunExtendUnparseableByIsUsageError(t *testing.T) {
 	}
 }
 
-// TestRunExtendSubSecondByIsUsageError: a sub-second --by (500ms, 900ms, 1ms, 0.5s) floors to 0
-// whole seconds, so it is a usage error (exit 2) that fires LOCALLY with NO input posted — the
-// spec says these fail fast client-side, not as a server-backstopped 400.
+// TestRunExtendBelowMinimumByIsUsageError: a --by below the server's 60s minimum — a sub-second
+// value (500ms, 0.5s) that floors to 0, or a sub-minute value (30s, 59s) — is a usage error
+// (exit 2) that fires LOCALLY with NO input posted, so a too-small extension fails fast
+// client-side instead of round-tripping to a server 400.
 //
 // MUTATION PROOF: re-introduce the floor-to-0 post (guard the raw nanosecond duration instead of
-// the whole seconds) and the CLI would POST body "0" — LastInputKind flips to kindExtend and this
-// reddens.
-func TestRunExtendSubSecondByIsUsageError(t *testing.T) {
-	for _, by := range []string{"500ms", "900ms", "1ms", "0.5s"} {
+// the whole seconds) and 500ms would POST body "0"; loosen the floor to `seconds <= 0` and 30s
+// would POST body "30" — either way LastInputKind flips to kindExtend and this reddens.
+func TestRunExtendBelowMinimumByIsUsageError(t *testing.T) {
+	for _, by := range []string{"500ms", "0.5s", "1s", "30s", "59s"} {
 		fc := &uzicli.FakeClient{}
 		_, stderr, code := runCLI(t, fakeEnv(fc), "run", "extend", "r1", "--by", by)
 		if code != uzicli.ExitUsage {
 			t.Errorf("--by %s: exit = %d, want %d (usage)", by, code, uzicli.ExitUsage)
 		}
-		if !strings.Contains(stderr, "at least 1 second") {
-			t.Errorf("--by %s: expected the sub-second usage message, stderr = %q", by, stderr)
+		if !strings.Contains(stderr, "at least 60 seconds") {
+			t.Errorf("--by %s: expected the below-minimum usage message, stderr = %q", by, stderr)
 		}
 		if fc.LastInputKind != "" {
 			t.Errorf("--by %s: no input must be posted on a usage error, got kind %q", by, fc.LastInputKind)
