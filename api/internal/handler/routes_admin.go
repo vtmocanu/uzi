@@ -50,6 +50,13 @@ func (h *Handler) mountAdminRoutes(r chi.Router, forgeLimiter, authLimiter *mw.L
 			r.Get("/judge/recommendations", h.AdminJudgeRecommendations)
 			r.Get("/judge/stats", h.AdminJudgeStats)
 			r.Get("/judge/category-stats", h.AdminJudgeCategoryStats)
+			// Admin "All users" issue DRAFT (PRD #1184 M3): the #68 draft for a (category,
+			// target) coordinate's NEWEST OPEN occurrence across users. A READ (no forge write,
+			// no token spend), so it sits here in the CLI-reachable read group like the owner
+			// draft — the file WRITE below is cookie-only. The draft card is the ONE place
+			// attribution is shown (Decision 8): it names the producing run + user so the admin
+			// sees whose worker text they are about to publish.
+			r.Get("/judge/recommendations/issue-draft", h.AdminGetJudgeIssueDraft)
 			// PRD #66 M9 (D8): the admin cross-user blocked-repos list. A read of the
 			// STORED privilege_report across all users (no forge call), so it carries no
 			// per-user limiter — same shape as /runs and /workers.
@@ -117,6 +124,13 @@ func (h *Handler) mountAdminRoutes(r chi.Router, forgeLimiter, authLimiter *mw.L
 			// upsert, no token spend and no forge write.
 			r.Put("/judge/recommendations/disposition", h.AdminSetJudgeDisposition)
 			r.Delete("/judge/recommendations/disposition", h.AdminUndoJudgeDisposition)
+			// Admin "All users" FILE issue (PRD #1184 M3): files the coordinate's newest open
+			// occurrence through the existing owner filer (caller-owns-repo against the ADMIN's
+			// own repo, write-boundary sanitizer, server-side [uzi] label, claim-first). A forge
+			// WRITE, so it wears forgeLimiter.PerUserMiddleware exactly like the owner FileIssue,
+			// and is cookie-only in this group so a uza_ Bearer 401s before the handler (§379).
+			// The occurrence is resolved AGAIN at file time, so a fresher review moves the link.
+			r.With(forgeLimiter.PerUserMiddleware).Post("/judge/recommendations/issue", h.AdminFileJudgeIssue)
 			// Instance branding logo bytes (PRD #685 M1): admin upload/clear of the
 			// app-mark and POWERED BY logos. Cookie-only admin write like the settings
 			// PUT beside it; the bytes ride a dedicated raw-body route (off the 1 MiB

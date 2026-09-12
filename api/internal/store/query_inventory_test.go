@@ -558,6 +558,15 @@ var queryInventory = []queryPin{
 			"The test seeds two owners on ONE coordinate and asserts user_count 2 (proving the missing " +
 			"user predicate), the run-count/rollup, the SQL LIMIT cap binding (Truncated over a >cap " +
 			"seed), and that no owner/run/review id or run title reaches the serialized response"},
+	{"NewestOpenOccurrenceForCoord", "judge_recommendations.sql", "TestAdminFileJudgeIssueResolvesAtFileTimeLiveDB",
+		"PRD #1184 M3 admin filing resolve — the SINGLE newest OPEN occurrence of a (category, target) " +
+			"coordinate across ALL users, NO user predicate. Reached through svc.AdminNewestOpenOccurrence " +
+			"from the admin draft/file handlers (../handler). The pin folds the newest-resolution: the test " +
+			"seeds occurrence A, drafts it, then seeds a NEWER review B on the SAME coordinate and files — " +
+			"asserting the filed link lands on B (so ORDER BY updated_at DESC → the newest reddens if flipped) " +
+			"and A stays open. The open predicate (d.status IS NULL AND f.filed_at IS NULL) is separately " +
+			"folded by TestAdminFileJudgeIssueNewestOccurrenceLiveDB, which files the newest and then asserts " +
+			"the next resolve returns the older STILL-OPEN occurrence, not the just-filed one"},
 	{"ListJudgeTriageRowsForRuns", "judge_recommendations.sql", "TestJudgeRunTodoTriageRowsAreCoordinateScopedLiveDB",
 		"direct call, judge_recommendations_integration_test.go:1106"},
 

@@ -67,7 +67,12 @@ var limiterNames = [...]string{
 // error rather than a failing row. Spelled `lim*` rather than matching the parameter
 // names exactly, so nothing here shadows a parameter inside Routes.
 //
-// 189 as of this commit (PRD #1184 M2 added PUT and DELETE
+// 191 as of this commit (PRD #1184 M3 added GET /api/admin/judge/recommendations/issue-draft
+// and POST /api/admin/judge/recommendations/issue — the admin "All users" issue draft READ and
+// the FILE write. The draft is a read in the admin read group → noLimiter, like the aggregate
+// reads; the file is a forge WRITE in the admin write group behind forgeLimiter, like the owner
+// POST /api/runs/{id}/review/recommendations/{recID}/issue → limForge.)
+// It was 189 until then (PRD #1184 M2 added PUT and DELETE
 // /api/admin/judge/recommendations/disposition — the admin "All users" cross-user Mark done
 // and its Undo, mounted in the admin WRITE group beside /admin/settings, both cookie-only and
 // both noLimiter: a local upsert/delete, no forge call and no token spend.)
@@ -252,6 +257,10 @@ var wantRouteMounts = []routeMount{
 	// forge call → noLimiter, like /admin/runs beside them.
 	{"GET", "/api/admin/judge/category-stats", noLimiter},
 	{"GET", "/api/admin/judge/recommendations", noLimiter},
+	// PRD #1184 M3: the admin "All users" issue DRAFT read for a coordinate's newest open
+	// occurrence. A READ (no forge write, no token spend) in the admin read group → noLimiter,
+	// like the aggregate reads it sits beside; the FILE write is a separate POST below.
+	{"GET", "/api/admin/judge/recommendations/issue-draft", noLimiter},
 	{"GET", "/api/admin/judge/stats", noLimiter},
 	{"GET", "/api/admin/rate-limits", noLimiter},
 	{"GET", "/api/admin/runs", noLimiter},
@@ -418,6 +427,12 @@ var wantRouteMounts = []routeMount{
 	// app_settings upsert (no egress, no forge/model spend) → noLimiter, like the
 	// release-check "Check now" above.
 	{"POST", "/api/admin/release-check/snooze", noLimiter},
+	// PRD #1184 M3: the admin "All users" FILE issue write — files a coordinate's newest open
+	// occurrence through the owner filer's forge path (claim-first → CreateIssue → settle). A
+	// forge WRITE, so it carries forgeLimiter.PerUserMiddleware like the owner
+	// POST /api/runs/{id}/review/recommendations/{recID}/issue → limForge, and unlike the
+	// cookie-only, no-forge admin disposition writes it sits beside.
+	{"POST", "/api/admin/judge/recommendations/issue", limForge},
 	{"POST", "/api/agent-templates/", noLimiter},
 	{"POST", "/api/agent-templates/{id}/reset", noLimiter},
 	{"POST", "/api/auth/cli/approve", limAuth},

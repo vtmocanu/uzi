@@ -466,6 +466,12 @@ type Store interface {
 	// filed iid+url are never selected.
 	ListJudgeRecommendationRowsAll(ctx context.Context, arg store.ListJudgeRecommendationRowsAllParams) ([]store.ListJudgeRecommendationRowsAllRow, error)
 	ListJudgeTriageRowsAll(ctx context.Context) ([]store.ListJudgeTriageRowsAllRow, error)
+	// Admin "All users" issue-filing resolve (PRD #1184 M3): the SINGLE newest OPEN occurrence
+	// of a (category, target) coordinate across ALL users, with NO user predicate. The admin
+	// issue draft renders from it and the admin filer claims against its review_id; unlike the
+	// two aggregate reads it DOES project identifiers, because the draft card names the producing
+	// run + user by design (Decision 8). ErrNoRows means no open occurrence (a 404 at the handler).
+	NewestOpenOccurrenceForCoord(ctx context.Context, arg store.NewestOpenOccurrenceForCoordParams) (store.NewestOpenOccurrenceForCoordRow, error)
 	// Judge menu bulk-disposition resolve (PRD #98 M2): the owner-scoped lookup of a set
 	// of (category, target) coordinates' member recommendations. It is the security
 	// boundary of the fan-out — the disposition is written off the rows it returns, never
