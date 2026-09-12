@@ -149,6 +149,42 @@ func TestAdminGetJudgeIssueDraftLiveDB(t *testing.T) {
 	}
 }
 
+// TestAdminJudgeIssueDraftExcludesDisposedLiveDB pins the d.status IS NULL half of the open
+// predicate in NewestOpenOccurrenceForCoord. The f.filed_at IS NULL half is pinned by the newest-
+// occurrence test below (a filed occurrence is skipped); this pins the disposition half: once a
+// coordinate's only occurrence carries a disposition (a human/admin done or dismissed), it is no
+// longer OPEN, so the admin draft (and file, which resolves the same way) must 404 rather than
+// re-draft a coordinate the owner already resolved. Without this, a regression dropping
+// `AND d.status IS NULL` would let the admin re-file a settled recommendation, uncaught.
+func TestAdminJudgeIssueDraftExcludesDisposedLiveDB(t *testing.T) {
+	h, pool, _, box, fs := fileIssueLiveDB(t)
+	ctx := context.Background()
+	f := seedFileFixture(ctx, t, pool, store.New(pool), box, fs.server.URL) // the admin caller
+	category := "improve_uzi"
+	target := "m3-disposed-" + uuid.NewString()
+	occ := seedAdminOccurrence(ctx, t, pool, box, fs.server.URL, category, target, time.Now())
+
+	// Open: the draft resolves and renders (200).
+	rrOpen := httptest.NewRecorder()
+	h.AdminGetJudgeIssueDraft(rrOpen, adminDraftReq(f.admin, category, target))
+	if rrOpen.Code != http.StatusOK {
+		t.Fatalf("pre-disposition draft = %d, want 200; body=%s", rrOpen.Code, rrOpen.Body.String())
+	}
+
+	// Dispose the only occurrence (a human 'done'); d.status is now NOT NULL for the coordinate.
+	mustExecT(ctx, t, pool,
+		`INSERT INTO recommendation_dispositions (review_id, category, target, status, rationale_hash)
+		 VALUES ($1, $2, $3, 'done', 'x')`, occ.reviewID, category, target)
+
+	// No longer open: NewestOpenOccurrenceForCoord returns no row, so the draft must 404.
+	rrDisposed := httptest.NewRecorder()
+	h.AdminGetJudgeIssueDraft(rrDisposed, adminDraftReq(f.admin, category, target))
+	if rrDisposed.Code != http.StatusNotFound {
+		t.Fatalf("post-disposition draft = %d, want 404 (a disposed occurrence is not open); body=%s",
+			rrDisposed.Code, rrDisposed.Body.String())
+	}
+}
+
 // ── File: the link lands on the NEWEST open occurrence; the older one stays open ─────────────
 func TestAdminFileJudgeIssueNewestOccurrenceLiveDB(t *testing.T) {
 	h, pool, _, box, fs := fileIssueLiveDB(t)
