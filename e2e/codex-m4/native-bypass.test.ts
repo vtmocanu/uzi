@@ -10,9 +10,12 @@
 // command-identity effect. A reachable native authority here is a BLOCKING defect (D6).
 //
 // This separates the DYNAMIC WORKER tool name (`uzi_bash`) from every NATIVE name so an allowed
-// callback is never mistaken for native execution. The forced-dispatch RESULT with no forbidden
-// effect is the required evidence; the U layer (broker-policy.test.ts) additionally proves the
-// real broker denies a native name `unknown_tool` if one ever reached it.
+// callback is never mistaken for native execution. Per the PRD "Native execution bypass" clause,
+// BOTH halves are checked: (1) the ADVERTISED-SCHEMA absence — the real app-server offers the
+// model no native tool schema on any observed provider request (empty is a PASS; see the oracle
+// below), and (2) the forced-dispatch RESULT with no forbidden effect. The U layer
+// (broker-policy.test.ts) additionally proves the real broker denies a native name `unknown_tool`
+// if one ever reached it.
 //
 // The isolation leg asserts the real app-server was spawned under the sparse REPLACED env
 // (buildReplacedEnv) with no provider credential or worker-token shape (command/provider
@@ -25,9 +28,12 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 import {
+  advertisedToolIdentities,
   bashArgCanary,
+  CODEX_NATIVE_TOOL_NAMES,
   dummyCredential,
   nativeApplyPatchStep,
+  nativeToolsAdvertised,
   scriptedStepsResponder,
 } from "./fake-provider.js";
 import { loadProtocolModules, runProtocolTurn, P_SUITE_DEADLINE_MS, type ProtocolModules } from "./harness-p.js";
@@ -110,6 +116,49 @@ test(CODEX_P_NATIVE_ABSENT_TITLE, async (t) => {
     // name produced NO worker callback (so an allowed callback is never mistaken for native).
     const brokerTools = obs.callbacks.map((c) => c.tool);
     assert.deepEqual(brokerTools, ["uzi_bash"], "only the dynamic worker exec produced a worker callback; native names produced none");
+
+    // ── ADVERTISED-SCHEMA ABSENCE ORACLE ──────────────────────────────────────────
+    // The PRD "Native execution bypass" clause requires checking BOTH the advertised schemas
+    // (including nested/additional tool lists) AND the failed/unsupported dispatch result. The
+    // asserts above are the DISPATCH half (no native call is dispatchable / has any effect); this
+    // is the ADVERTISEMENT half — the real app-server must offer the model NO native execution
+    // schema. Collect the model-visible `tools` schema the app-server advertised on EVERY observed
+    // provider request (the harness's dedicated `advertisedTools` observation is the first
+    // request's; scanning all requests catches any nested/additional list on a later turn) and
+    // assert none of CODEX_NATIVE_TOOL_NAMES appears.
+    //
+    // On this production native-disabled path the app-server forwards no `tools` array to the
+    // provider (C3 finding: the native-disabled template advertises no native tool to the model,
+    // and the dynamic worker tools ride the app-server↔worker channel, not the provider Responses
+    // `tools` field). An absent/empty native-tool advertisement SATISFIES the absence property —
+    // the model is never offered a native execution schema — and the assertion is scoped over the
+    // real observed requests, so it is a truthful absence check, not a vacuous one.
+    const advertised = [
+      ...obs.advertisedTools,
+      ...obs.providerRequests.flatMap((body) => {
+        const tools = (body as { tools?: unknown }).tools;
+        return Array.isArray(tools)
+          ? tools.filter((tool): tool is Record<string, unknown> => tool !== null && typeof tool === "object")
+          : [];
+      }),
+    ];
+    t.diagnostic(
+      `advertised tool identities across ${obs.providerRequests.length} provider request(s): `
+      + JSON.stringify(advertisedToolIdentities(advertised)),
+    );
+    // Anchor the absence to REAL traffic: the app-server issued provider requests, so an empty
+    // native-tool advertisement is "the model was never offered a native schema", not "nothing
+    // was observed" — this keeps the absence check from silently going vacuous if the harness ever
+    // stopped capturing requests.
+    assert.ok(
+      obs.providerRequests.length > 0,
+      "the fake provider observed real requests (the advertised-schema absence reflects real traffic)",
+    );
+    assert.deepEqual(
+      nativeToolsAdvertised(advertised),
+      [],
+      `no native tool schema (${CODEX_NATIVE_TOOL_NAMES.slice(0, 3).join("/")}/…) is advertised to the model on the production native-disabled path`,
+    );
 
     // POSITIVE CONTROL: the intended worker exec reached its effect (the native absence is a real
     // deny, not a broken fixture / dead turn).

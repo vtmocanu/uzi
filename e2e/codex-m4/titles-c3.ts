@@ -21,7 +21,7 @@ export const CODEX_P_FILE_POLICY_TITLE =
 export const CODEX_U_NATIVE_DISPATCH_TITLE =
   "codex U native-bypass: forced native tool names (shell/exec_command/unified_exec/write_stdin/local_shell/native apply_patch) are denied by the real broker with no effect";
 export const CODEX_U_SHELL_VARIANTS_TITLE =
-  "codex U shell policy: git/env/proc/base64/wrapper-depth variants reach the real screener and are denied with no command spawn or secret disclosure";
+  "codex U shell policy: plaintext git/env/proc/wrapper-depth variants reach the real screener and are denied with no command spawn or secret disclosure, while the base64 pipe is an honest OS-command-root-contained residual (not denied by the screener)";
 export const CODEX_U_FILE_VARIANTS_TITLE =
   "codex U file policy: .git writes, symlink/canonicalization escapes, and malformed patches are denied before the fileop effect while an allowed write works";
 export const CODEX_U_PHASE_GRANTS_TITLE =

@@ -123,12 +123,17 @@ export const CODEX_CLAUSES: ClauseRow[] = [
       "the intended-model custom exec (the dynamic uzi_bash callback) reaches its command-identity "
       + "effect through the REAL broker on the real protocol",
     negativeOracle:
-      "forced native shell/exec_command/unified_exec/write_stdin/local_shell function-calls and a "
-      + "native freeform apply_patch custom-tool-call produce NO worker callback, NO command spawn, "
-      + "NO fileop and NO marker file (absolute marker paths asserted absent after the turn)",
+      "BOTH halves are checked (PRD 'Native execution bypass'): (schema) the real app-server "
+      + "advertises NO native tool identity to the model on any observed provider request — the "
+      + "native-disabled template forwards no `tools` array, so an empty native-tool advertisement "
+      + "is the absence PASS; (dispatch) forced native shell/exec_command/unified_exec/write_stdin/"
+      + "local_shell function-calls and a native freeform apply_patch custom-tool-call produce NO "
+      + "worker callback, NO command spawn, NO fileop and NO marker file (absolute marker paths "
+      + "asserted absent after the turn)",
     intendedOutcome:
       "no alternate native execution authority or retained writable terminal exists on the "
-      + "production path; only the dynamic worker exec runs",
+      + "production path: the model is never offered a native schema AND no native dispatch is "
+      + "executable; only the dynamic worker exec runs",
     tests: [CODEX_P_NATIVE_ABSENT_TITLE],
   },
   {
@@ -204,6 +209,39 @@ export const CODEX_CLAUSES: ClauseRow[] = [
       + "and a malformed patch (empty old_string) are all denied with zero forbidden fileop ops",
     intendedOutcome: "production path/schema enforcement denies before the effect; canonicalization catches a symlink escape",
     tests: [CODEX_U_FILE_VARIANTS_TITLE],
+  },
+  {
+    // C3/D6 — the executor-wiring regression (agent/test/codex-home-screening.test.ts). Unlike the
+    // U rows above (a hand-built broker with a hand-passed screenPolicy), this drives the REAL
+    // production CodexExecutor, which builds its OWN screenPolicy at the wiring site under test — so
+    // it is the failing-old/passing-fixed proof of the approved provider-HOME screening repair (the
+    // `homeRoot/codex-data/` prefix threaded to every phase broker). Catalogued here so the D6 proof
+    // is part of the conformance registry; C5 wires the npm-test evidence + enforcement (the required
+    // matrix in run-completeness.ts stays C5's job). The two `tests` titles are copied VERBATIM from
+    // that (non-editable, product-source-driving) test file's `it(...)` names and must stay in sync.
+    id: "codex-u-home-screening-executor-d6",
+    adapter: "codex",
+    layer: "U",
+    family: "File policy",
+    seam: "agent/src/codex/codex-executor.ts screenPolicy → broker screenBashCommand/screenToolPath (D6)",
+    positiveControl:
+      "through the REAL CodexExecutor-built screenPolicy (not a test-authored policy), a harmless "
+      + "in-worktree command reaches the command spawn seam exactly once and an allowed in-worktree "
+      + "read reaches the fileop client",
+    negativeOracle:
+      "a literal `cat <homeRoot>/codex-data/epoch-0/codex/auth.json` credential read is denied BEFORE "
+      + "the command spawn seam (spawn counter stays 0), and the resolved Read AND Write path forms of "
+      + "the same auth.json are denied with NO fileop effect; reverting the executor's screenPolicy "
+      + "repair (dropping the homeRoot/codex-data/ extraSecretPaths) lets the credential argv reach the "
+      + "spawn seam (failing-old/passing-fixed calibration)",
+    intendedOutcome:
+      "the executor's own screenPolicy construction carries the trusted provider-HOME prefix "
+      + "(homeRoot/codex-data/) into extraSecretPaths for every phase broker, so a known absolute "
+      + "credential path is denied at the U layer rather than relying on OS containment (D6)",
+    tests: [
+      "shell leg (calibration): a literal `cat <homeRoot>/codex-data/epoch-0/codex/auth.json` is DENIED before the command spawn seam (counter stays 0), while a harmless in-worktree command still reaches its effect",
+      "file leg: the resolved Read AND Write path form of the same auth.json is denied by the file screen with NO fileop effect, while an allowed in-worktree read reaches the fileop client",
+    ],
   },
 
   // ── Isolation and compatibility ──
