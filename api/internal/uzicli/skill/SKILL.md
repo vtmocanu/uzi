@@ -537,8 +537,10 @@ uzi version
   (or pipe it on stdin); an empty guidance is a valid trigger as long as there is a new review
   comment. Prints the created `mr_rework` run.
 - `uzi run decide <run-id> --continue [--guidance <text>]` — record the owner CONTINUE
-  decision on a run parked in a completion hold (PRD #1226): the run resumes and keeps
-  working past the completion check. Only the continue decision is supported today, so
+  decision on a run the completion interlock has blocked (PRD #1226) — EITHER a live
+  completion question (`awaiting_input`, whose answer is recorded and the current worker
+  resumes IN PLACE) OR a run already parked in the completion hold: the run resumes and
+  keeps working past the completion check. Only the continue decision is supported today, so
   `--continue` is **required** (its absence is a usage error, exit 2). `--guidance` is
   optional and steers the continued run (an empty continue simply resumes with no note). A
   run that is **not** completion-blocked is a 409 (exit 5); a foreign/unknown run is a 404

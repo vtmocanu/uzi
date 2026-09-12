@@ -391,6 +391,36 @@ func TestCompletionDecisionOrdinaryClarificationRefusedLiveDB(t *testing.T) {
 	}
 }
 
+// TestCompletionDecisionForeignUserRefusedLiveDB (PRD #1226 M5) pins the user_id authorization
+// predicate: ContinueCompletionDecision reads the run owner-scoped via GetRun FIRST, so a user who
+// is NOT the run's owner is refused with ErrRunNotFound BEFORE any answer/follow_up/completion_decision
+// write. Seed a completion-BLOCKED (paused, hold_reason='completion_blocked') run owned by e.userID,
+// then call the decision as a DIFFERENT user id: it errors, the run stays paused, and no input rows
+// are written. Mutation-check: drop the user_id scope in GetRun and the foreign user resolves the
+// run, the decision is accepted, and this test reddens.
+func TestCompletionDecisionForeignUserRefusedLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	svc := e.permitService(t)
+	wid := e.seedWorker(t, []string{"completion_interlock_v1"})
+	runID := e.seedFrozenRun(t, wid, []string{"m1", "m2"}, []string{"m1"}, false)
+	// Park it on the completion hold owned by e.userID, mirroring TestCompletionDecisionPausedResumesLiveDB.
+	e.exec(t, `UPDATE runs SET status = 'paused', hold_reason = 'completion_blocked',
+	               hold_captured_head = 'capturedhead1', completion_attempts = 1 WHERE id = $1`, runID)
+
+	foreignUserID := uuid.New() // a different owner than e.userID
+	if _, err := svc.ContinueCompletionDecision(e.ctx, foreignUserID, runID, "guidance"); !errors.Is(err, ErrRunNotFound) {
+		t.Fatalf("a foreign user must be refused ErrRunNotFound by GetRun; got %v", err)
+	}
+	if s := e.runStatus(t, runID); s != "paused" {
+		t.Fatalf("a refused foreign decision must leave status unchanged; got %q, want paused", s)
+	}
+	for _, kind := range []string{"completion_decision", "follow_up", "answer"} {
+		if got := e.countInputs(t, runID, kind); got != 0 {
+			t.Fatalf("a foreign-user decision must write no %s row; got %d", kind, got)
+		}
+	}
+}
+
 // TestSetRunAwaitingInputCompletionMarkerLiveDB (PRD #1226 M5) pins the SetState → SetRunAwaitingInput
 // stamping: a report that flags a COMPLETION question (StateRequest.CompletionQuestion=true) stamps
 // completion_question_at, while an ORDINARY ask_user report (the flag absent/false) leaves it NULL —

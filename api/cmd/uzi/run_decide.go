@@ -26,8 +26,10 @@ func newRunDecideCmd(env Env, gf *globalFlags) *cobra.Command {
 	decide := &cobra.Command{
 		Use:   "decide <run-id>",
 		Short: "Record the owner CONTINUE decision on a completion-blocked run (resumes it, with optional guidance)",
-		Long: "Record the owner's CONTINUE decision on a run parked in a completion hold (PRD #1226): the " +
-			"run resumes and keeps working past the completion check. Owner-only.\n\n" +
+		Long: "Record the owner's CONTINUE decision on a run the completion interlock has blocked (PRD #1226) " +
+			"— either a live completion question (awaiting_input, whose answer is recorded and the current " +
+			"worker resumes in place) or a run already parked in the completion hold: the run resumes and " +
+			"keeps working past the completion check. Owner-only.\n\n" +
 			"Only the continue decision is supported today, so `--continue` is REQUIRED (its absence is a " +
 			"usage error). Pass `--guidance <text>` to steer the continued run; it is optional (an empty " +
 			"continue simply resumes with no note).\n\n" +

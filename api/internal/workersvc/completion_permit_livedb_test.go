@@ -1,6 +1,7 @@
 package workersvc
 
 import (
+	"errors"
 	"sort"
 	"testing"
 
@@ -749,6 +750,41 @@ func TestSetRunCompletionHoldLiveDB(t *testing.T) {
 	if s := e.runStatus(t, legacy); s != "running" {
 		t.Fatalf("db status after refused legacy hold = %q, want running", s)
 	}
+
+	// Case 7: a FOREIGN worker cannot hold a run it does not own — this pins the worker_id
+	// authorization predicate (SetRunCompletionHold binds WHERE worker_id = @worker_id, so a
+	// non-owning worker matches 0 rows and the service re-read fails ErrRunNotOwned). Seed a second
+	// worker and a fresh owned interlocked RUNNING run with an attempt (mirror Case 1), then have
+	// the foreign worker attempt the hold: it is refused (ErrRunNotOwned), applied=false, the run
+	// stays running with its hold columns untouched, and no decision/follow_up/answer row is written.
+	otherWid := e.seedWorker(t, []string{"completion_interlock_v1"})
+	other := store.Worker{ID: otherWid}
+	foreign := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
+	e.exec(t, `UPDATE runs SET completion_attempts = 1 WHERE id = $1`, foreign)
+	run7, applied7, err := svc.SetRunCompletionHold(e.ctx, other, foreign, "foreignhead")
+	if !errors.Is(err, ErrRunNotOwned) {
+		t.Fatalf("a foreign worker must be refused ErrRunNotOwned; got run=%+v applied=%v err=%v", run7, applied7, err)
+	}
+	if applied7 {
+		t.Fatal("a foreign worker's hold must NOT be applied")
+	}
+	if s := e.runStatus(t, foreign); s != "running" {
+		t.Fatalf("a foreign hold attempt must leave status unchanged; got %q, want running", s)
+	}
+	// The hold columns must be untouched (never entered the hold).
+	reason, head, _ := e.holdColumns(t, foreign)
+	if reason != nil {
+		t.Fatalf("hold_reason must stay NULL after a foreign hold attempt; got %q", *reason)
+	}
+	if head != nil {
+		t.Fatalf("hold_captured_head must stay NULL after a foreign hold attempt; got %q", *head)
+	}
+	// And no run_user_inputs rows were written by the refused attempt.
+	for _, kind := range []string{"completion_decision", "follow_up", "answer"} {
+		if got := e.countInputs(t, foreign, kind); got != 0 {
+			t.Fatalf("a foreign hold attempt must write no %s row; got %d", kind, got)
+		}
+	}
 }
 
 // permitIssuedByWorker reads the single stored run_completion_permits row's issued_by_worker_id.
@@ -876,6 +912,38 @@ func TestPermitHeadNormalizationLiveDB(t *testing.T) {
 	}
 	if n != 0 {
 		t.Fatalf("an empty_head denial must write no permit; got %d rows", n)
+	}
+}
+
+// TestPermitEmptyBranchDeniedLiveDB (PRD #1226 M4.0): a branch that normalizes (NUL-strip +
+// TrimSpace) to the empty string is a NON-TERMINAL empty_branch denial that writes no permit — the
+// symmetric guard to empty_head, closing the reachable NUL path. A NUL-only branch survives the
+// handler's post-TrimSpace `== ""` reject (NUL is not unicode.IsSpace), so this calls
+// RequestCompletionPermit DIRECTLY with Branch="\x00" and a VALID non-empty head, mirroring
+// TestPermitHeadNormalizationLiveDB Part B. Mutation-check: drop the empty-branch guard in
+// RequestCompletionPermit and the NUL branch strips to "" and a permit is ISSUED (Granted becomes
+// true) -> the empty_branch assertion reddens.
+func TestPermitEmptyBranchDeniedLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	svc := e.permitService(t)
+	wid := e.seedWorker(t, []string{"completion_interlock_v1"})
+	wkr := store.Worker{ID: wid}
+	runID := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
+
+	deny, err := svc.RequestCompletionPermit(e.ctx, wkr, runID,
+		CompletionPermitRequest{ContractRevision: 1, Branch: "\x00", Head: "cafebabe"})
+	if err != nil {
+		t.Fatalf("a NUL-only branch must be a non-terminal denial, not an error: %v", err)
+	}
+	if deny.Granted || deny.DenyReason != CompletionDenyEmptyBranch {
+		t.Fatalf("a branch that normalizes to empty must be a non-terminal empty_branch denial; got %+v", deny)
+	}
+	var n int
+	if err := e.pool.QueryRow(e.ctx, `SELECT count(*) FROM run_completion_permits WHERE run_id = $1`, runID).Scan(&n); err != nil {
+		t.Fatalf("count permits: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("an empty_branch denial must write no permit; got %d rows", n)
 	}
 }
 

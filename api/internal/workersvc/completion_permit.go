@@ -51,6 +51,13 @@ const (
 	// CompletionDenyMissingMilestones: one or more in-scope structural criteria are not declared
 	// complete. The bounded unmet id list accompanies the denial, and an attempt is recorded.
 	CompletionDenyMissingMilestones = "missing_milestones"
+	// CompletionDenyEmptyBranch: the worker-reported branch normalizes (NUL-strip + TrimSpace) to
+	// the empty string, so it cannot bind a permit's `branch` identity — an empty branch would issue
+	// a permit no completion report could ever match, leaving the interlocked run non-terminal.
+	// NON-TERMINAL so the worker keeps its session live and re-reports a real branch rather than
+	// parking. Like empty_head (and unlike missing_milestones, which records a spurious attempt):
+	// this denial precedes the UpsertCompletionPermit write and records nothing.
+	CompletionDenyEmptyBranch = "empty_branch"
 	// CompletionDenyEmptyHead: the worker-reported head normalizes (NUL-strip + TrimSpace) to the
 	// empty string, so it cannot bind a permit's `head` identity — an empty head would issue a
 	// permit no completion could ever match. NON-TERMINAL so the worker keeps its session live and
@@ -245,6 +252,13 @@ func (s *Service) RequestCompletionPermit(ctx context.Context, wkr store.Worker,
 	strippedHead, _ := stripNUL(req.Head)
 	cleanBranch := strings.TrimSpace(strippedBranch)
 	cleanHead := strings.TrimSpace(strippedHead)
+	if cleanBranch == "" {
+		// An empty-after-normalize branch cannot bind a permit's branch identity: issuing one would
+		// write a permit no completion report could ever match, leaving the interlocked run
+		// non-terminal. Deny NON-TERMINALLY before the upsert so the worker keeps its session live
+		// and re-reports a real branch; like empty_head this records no attempt.
+		return CompletionPermitResult{Granted: false, DenyReason: CompletionDenyEmptyBranch}, nil
+	}
 	if cleanHead == "" {
 		// An empty-after-normalize head cannot bind a permit's head identity: issuing one would
 		// write a permit no completion could ever match. Deny NON-TERMINALLY before the upsert so

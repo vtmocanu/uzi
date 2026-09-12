@@ -54,9 +54,8 @@ func TestQueuedReasonCompletionCapableWorkerFallsThroughLiveDB(t *testing.T) {
 	runID := e.seedQueuedRun(t, &v1, nil)
 
 	got := svc.queuedReason(e.ctx, time.Now(), e.interlockedQueuedRow(runID))
-	if got == reasonNoCompletionCapableWorker {
-		t.Fatalf("queuedReason = %q, but a protocol-capable worker is online — the completion-capability "+
-			"rung must fall through to the generic reasons", got)
+	if got != reasonWaitingWorker {
+		t.Fatalf("queuedReason = %q, want %q when a protocol-capable worker is online", got, reasonWaitingWorker)
 	}
 }
 
