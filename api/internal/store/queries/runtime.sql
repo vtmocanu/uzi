@@ -632,17 +632,17 @@ SELECT * FROM runs WHERE id = @id AND worker_id = @worker_id;
 -- a run unclaimable), and a minimum-loaded worker never defers (guaranteeing
 -- claimability). Live = a heartbeat at/after @heartbeat_cutoff (D6). The spread
 -- clause is fully described inline at the WHERE below.
-UPDATE runs SET
-    status     = 'claimed',
-    status_since = now(),
-    worker_id  = @worker_id,
-    claimed_at = now(),
-    updated_at = now(),
-    -- Exit contract (PRD #47 Decision 3): leaving 'queued' clears any health flag
-    -- the detector raised (e.g. "no worker online"). health_notified_at is NOT reset.
-    health = 'ok', health_reason = NULL, health_since = NULL
-WHERE id = (
-    SELECT r.id FROM runs r
+--
+-- PRD #1296 M1 (D2/D3): the claim now runs as leading CTEs before the UPDATE so the hold
+-- is opened atomically in the SAME statement. `target` selects + LOCKS the single claimable
+-- run ONCE (carrying the columns the hold needs); `hold` opens the H-free custody hold for a
+-- recovery-capable worker on a code-publishing profile, reading FROM target so it inserts
+-- iff a run was actually claimable; then the UPDATE claims that same target row. The final
+-- statement is `UPDATE runs ... RETURNING *`, so the :one result is still store.Run — the
+-- hold is a side effect. target and hold share target's single snapshot/lock, so the hold's
+-- t.claim_generation + 1 equals the UPDATE's own increment.
+WITH target AS (
+    SELECT r.id, r.user_id, r.repo_id, r.kind, r.claim_generation FROM runs r
     WHERE r.user_id = @user_id
       AND r.kind <> 'chat'
       -- PRD #400 Decision 6: a task run is claimable ONLY after the CLI has seeded its
@@ -687,6 +687,19 @@ WHERE id = (
       -- PRD #84 M2 extends it: the run's required_capabilities must be a subset of the
       -- claiming worker's effective caps (@worker_caps ∪ docker), gated by @capability_aware.
       AND fn_worker_can_claim(@is_docker_worker::boolean, @docker_repo_allowlist::uuid[], r.repo_id, r.kind, @worker_caps::text[], r.required_capabilities, @capability_aware::boolean)
+      -- PRD #1296 M1 (D2/D4): custody-admission. Block the claim when the run's OWNER
+      -- already holds >= @custody_hold_limit UNRESOLVED (state='open') custody holds — the
+      -- owner has too much unpublished work awaiting recovery disposition. A gated claim
+      -- matches no row, so the run stays queued (the health resolver surfaces a distinct
+      -- custody-limit reason against this SAME predicate in a later milestone). This is an
+      -- OWNER-scoped admission gate (D4: the instance byte ceiling must never become a
+      -- global stop-claiming switch), placed alongside the existing eligibility checks. A
+      -- non-positive @custody_hold_limit DISABLES the gate (limit "<= 0" means unlimited),
+      -- so it never blocks an ordinary claim; the production caller always passes the
+      -- configured positive default (workersvc.custodyHoldLimit, 8).
+      AND (@custody_hold_limit::int <= 0
+           OR (SELECT count(*) FROM recovery_custody_holds ch
+                 WHERE ch.user_id = @user_id AND ch.state = 'open') < @custody_hold_limit::int)
       -- PRD #1226 M1 (D2): the NON-BYPASSABLE completion-protocol claim clause. An
       -- INTERLOCKED run (completion_contract_version IS NOT NULL) may be claimed ONLY by a
       -- worker whose SELF-REPORTED protocol_capabilities contain 'completion_interlock_v1';
@@ -780,8 +793,49 @@ WHERE id = (
              r.created_at ASC
     FOR UPDATE SKIP LOCKED
     LIMIT 1
+),
+hold AS (
+    -- PRD #1296 M1 (D2/D3): open the H-free custody hold atomically with the claim, for a
+    -- RECOVERY-CAPABLE worker (@recovery_capable, derived from the worker's advertised
+    -- recovery_archive_v1 protocol capability) on one of the six code-publishing profiles.
+    -- Reads FROM `target`, so it inserts exactly one hold iff a run was actually claimable
+    -- (an admission-gated or idle claim produces no `target` row and thus no hold). Both live
+    -- FKs point at the claimed run + claiming worker (ON DELETE RESTRICT while open), and the
+    -- immutable provenance columns record the taking worker's identity for a later
+    -- AAD-authenticated post-terminal recovery retry. t.claim_generation + 1 is the SAME
+    -- value the UPDATE below sets (same locked row, same snapshot).
+    INSERT INTO recovery_custody_holds
+        (id, user_id, repo_id, run_id, generation, state,
+         original_worker_id, original_worker_identity, live_worker_id, live_run_id,
+         created_at, updated_at)
+    SELECT gen_random_uuid(), t.user_id, t.repo_id, t.id, t.claim_generation + 1, 'open',
+           @worker_id, @worker_identity::text, @worker_id, t.id, now(), now()
+    FROM target t
+    WHERE @recovery_capable::boolean
+      AND t.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework')
+    RETURNING 1
 )
+UPDATE runs SET
+    status     = 'claimed',
+    status_since = now(),
+    worker_id  = @worker_id,
+    claimed_at = now(),
+    updated_at = now(),
+    -- PRD #1296 M1 (D2): the general claim-lane counter, incremented once per successful
+    -- claim. Returned in the claim payload; the hold above binds the identical value.
+    claim_generation = claim_generation + 1,
+    -- Exit contract (PRD #47 Decision 3): leaving 'queued' clears any health flag
+    -- the detector raised (e.g. "no worker online"). health_notified_at is NOT reset.
+    health = 'ok', health_reason = NULL, health_since = NULL
+WHERE id = (SELECT id FROM target)
 RETURNING *;
+
+-- name: CountUnresolvedCustodyHoldsForOwner :one
+-- PRD #1296 M1 (D2/D4): the owner's UNRESOLVED (state='open') custody-hold count — the
+-- same admission signal the ClaimRun predicate blocks on. A later milestone's health
+-- resolver reads this to surface a distinct custody-limit queued reason against the SAME
+-- decision the claim used, so the pill and the claim never disagree.
+SELECT count(*) FROM recovery_custody_holds WHERE user_id = @user_id AND state = 'open';
 
 -- name: GetRunClaimContext :one
 -- The repo + connection facts the claim payload needs, alongside the run. The

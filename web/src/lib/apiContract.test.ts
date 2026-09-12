@@ -35,6 +35,8 @@ import type {
   CIRunDetail,
   CIJob,
   CIStep,
+  RecoveryArchive,
+  RecoveryArchiveSummary,
 } from "./apiTypes";
 
 import runZero from "../../../fixtures/api-contract/run.zero.json";
@@ -105,6 +107,10 @@ import ciJobZero from "../../../fixtures/api-contract/ci_job.zero.json";
 import ciJobFull from "../../../fixtures/api-contract/ci_job.full.json";
 import ciStepZero from "../../../fixtures/api-contract/ci_step.zero.json";
 import ciStepFull from "../../../fixtures/api-contract/ci_step.full.json";
+import recoveryArchiveZero from "../../../fixtures/api-contract/recovery_archive.zero.json";
+import recoveryArchiveFull from "../../../fixtures/api-contract/recovery_archive.full.json";
+import recoveryArchiveSummaryZero from "../../../fixtures/api-contract/recovery_archive_summary.zero.json";
+import recoveryArchiveSummaryFull from "../../../fixtures/api-contract/recovery_archive_summary.full.json";
 
 // The api ⇄ SPA JSON wire-contract (PRD #982). This is the VITEST HALF; the Go
 // half is api/internal/apitypes/contract_test.go. Neither reads the other: each
@@ -724,6 +730,35 @@ type ZeroOf<T, NeverNull extends keyof T = never> = {
   void _ciStepFull;
 }
 
+// ── RecoveryArchive (PRD #1296 M1) ──────────────────────────────────────────
+// All optional fields are omitempty, so the zero.json carries no null (declared
+// nullable:false below) — the finding shape.
+{
+  const _recoveryArchiveMissing: never = null as unknown as Exclude<keyof RecoveryArchive, keyof typeof recoveryArchiveFull>;
+  const _recoveryArchiveExtra: never = null as unknown as Exclude<keyof typeof recoveryArchiveFull, keyof RecoveryArchive>;
+  const _recoveryArchiveZero: ZeroOf<RecoveryArchive> = recoveryArchiveZero;
+  const _recoveryArchiveFull: Widen<RecoveryArchive> = recoveryArchiveFull;
+  void _recoveryArchiveMissing;
+  void _recoveryArchiveExtra;
+  void _recoveryArchiveZero;
+  void _recoveryArchiveFull;
+}
+
+// ── RecoveryArchiveSummary (PRD #1296 M1) ────────────────────────────────────
+// ZeroOf exemption: archives — the summary endpoint (M2) returns [] for a run with no
+// captures, so the TS type is a never-null array though the nil-slice zero marshal is
+// null (the CIRunDetail.jobs shape). counts is a nested all-scalar object (no null).
+{
+  const _recoverySummaryMissing: never = null as unknown as Exclude<keyof RecoveryArchiveSummary, keyof typeof recoveryArchiveSummaryFull>;
+  const _recoverySummaryExtra: never = null as unknown as Exclude<keyof typeof recoveryArchiveSummaryFull, keyof RecoveryArchiveSummary>;
+  const _recoverySummaryZero: ZeroOf<RecoveryArchiveSummary, "archives"> = recoveryArchiveSummaryZero;
+  const _recoverySummaryFull: Widen<RecoveryArchiveSummary> = recoveryArchiveSummaryFull;
+  void _recoverySummaryMissing;
+  void _recoverySummaryExtra;
+  void _recoverySummaryZero;
+  void _recoverySummaryFull;
+}
+
 // ── Runtime self-checks ─────────────────────────────────────────────────────
 // A contract that passes on a missing fixture, or on a zero.json with no null in
 // it, is the false-green shape this repo documents repeatedly. These fatal
@@ -805,6 +840,11 @@ const dtos: { stem: string; nullable: boolean }[] = [
   { stem: "ci_job", nullable: true },
   // ci_step: all-scalar, no null.
   { stem: "ci_step", nullable: false },
+  // PRD #1296 M1: recovery_archive is all-omitempty optionals, so its zero.json carries no
+  // null (the finding shape). recovery_archive_summary's archives slice is non-omitempty,
+  // so its zero.json carries a null the M2 mapper normalizes to [].
+  { stem: "recovery_archive", nullable: false },
+  { stem: "recovery_archive_summary", nullable: true },
 ];
 
 describe("api-contract fixtures are present and discriminating", () => {

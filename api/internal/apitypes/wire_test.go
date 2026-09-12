@@ -842,3 +842,56 @@ func TestAdminBlockedReposDTOTags(t *testing.T) {
 		"id", "path", "owner_id", "owner_email", "forge_type", "blocked",
 		"block_messages", "guardrail_override", "privilege_status", "privilege_checked_at")
 }
+
+// ── PRD #1296 M1: durable run recovery wire shapes ────────────────────────────
+// The owner-facing archive DTO's optional fields are ALL omitempty, so the zero value
+// carries only the always-present keys; the populated pin asserts every optional key
+// surfaces when set (the finding.zero/full shape).
+func TestRecoveryArchiveDTOTags(t *testing.T) {
+	assertTags(t, "RecoveryArchiveDTO", RecoveryArchiveDTO{},
+		"id", "run_id", "state", "source_sha", "created_at")
+	h := "abc123"
+	sz := int64(42)
+	now := time.Unix(0, 0)
+	full := RecoveryArchiveDTO{
+		AttemptedHeadSha: &h, ByteSize: &sz, Checksum: "sha256:x", Reason: "quota",
+		PrerequisiteShas: []string{"deadbeef"}, ExpiresAt: &now,
+	}
+	assertTags(t, "RecoveryArchiveDTO(full)", full,
+		"id", "run_id", "state", "source_sha", "created_at",
+		"attempted_head_sha", "byte_size", "checksum", "reason", "prerequisite_shas", "expires_at")
+}
+
+// The summary's counts is a fixed struct (all six state keys always present); archives is a
+// non-omitempty slice, so it is present-as-null on the zero value (the mapper normalizes to
+// [] — see apiContract.test.ts), which is why it is asserted on the zero value here.
+func TestRecoveryArchiveSummaryDTOTags(t *testing.T) {
+	assertTags(t, "RecoveryArchiveStateCountsDTO", RecoveryArchiveStateCountsDTO{},
+		"preparing", "uploading", "available", "needs_action", "expired", "discarded")
+	assertTags(t, "RecoveryArchiveSummaryDTO", RecoveryArchiveSummaryDTO{},
+		"supported", "legacy", "has_open_hold", "counts", "archives")
+}
+
+// The worker-facing archive RPC shapes (M3 consumes; mirrored in agent/src/protocol.ts).
+// These are Bearer-only worker/owner exchanges, never SPA DTOs, so they are pinned here
+// rather than in the api-contract fixtures.
+func TestRecoveryWorkerRPCTags(t *testing.T) {
+	assertTags(t, "RecoveryReserveRequest", RecoveryReserveRequest{},
+		"run_id", "idempotency_key", "source_sha")
+	assertTags(t, "RecoveryReserveRequest(full)", RecoveryReserveRequest{AttemptedHeadSha: "h"},
+		"run_id", "idempotency_key", "source_sha", "attempted_head_sha")
+	assertTags(t, "RecoveryReserveResponse", RecoveryReserveResponse{}, "capture_id", "state")
+	assertTags(t, "RecoveryUploadManifest", RecoveryUploadManifest{},
+		"byte_size", "checksum", "chunk_count")
+	assertTags(t, "RecoveryUploadManifest(full)", RecoveryUploadManifest{PrerequisiteShas: []string{"x"}},
+		"byte_size", "checksum", "chunk_count", "prerequisite_shas")
+	assertTags(t, "RecoveryCaptureStatusResponse", RecoveryCaptureStatusResponse{},
+		"capture_id", "state", "manifest_bound")
+	sz := int64(1)
+	now := time.Unix(0, 0)
+	assertTags(t, "RecoveryCaptureStatusResponse(full)",
+		RecoveryCaptureStatusResponse{ByteSize: &sz, Checksum: "x", Reason: "r", ExpiresAt: &now},
+		"capture_id", "state", "manifest_bound", "byte_size", "checksum", "reason", "expires_at")
+	assertTags(t, "RecoveryReleaseResponse", RecoveryReleaseResponse{},
+		"run_id", "released", "holds_released")
+}

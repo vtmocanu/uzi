@@ -1,0 +1,14 @@
+{
+  "supported": false,
+  "legacy": false,
+  "has_open_hold": false,
+  "counts": {
+    "preparing": 0,
+    "uploading": 0,
+    "available": 0,
+    "needs_action": 0,
+    "expired": 0,
+    "discarded": 0
+  },
+  "archives": null
+}

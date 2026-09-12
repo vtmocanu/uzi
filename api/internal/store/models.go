@@ -361,6 +361,52 @@ type RecommendationFiledIssue struct {
 	CloseSyncedAt pgtype.Timestamptz `json:"close_synced_at"`
 }
 
+type RecoveryCapture struct {
+	ID                     uuid.UUID          `json:"id"`
+	HoldID                 uuid.UUID          `json:"hold_id"`
+	RunID                  uuid.UUID          `json:"run_id"`
+	UserID                 uuid.UUID          `json:"user_id"`
+	OriginalWorkerID       pgtype.UUID        `json:"original_worker_id"`
+	OriginalWorkerIdentity string             `json:"original_worker_identity"`
+	SourceSha              string             `json:"source_sha"`
+	AttemptedHeadSha       pgtype.Text        `json:"attempted_head_sha"`
+	IdempotencyKey         string             `json:"idempotency_key"`
+	State                  string             `json:"state"`
+	ManifestBound          bool               `json:"manifest_bound"`
+	ByteSize               pgtype.Int8        `json:"byte_size"`
+	Checksum               pgtype.Text        `json:"checksum"`
+	ChunkCount             pgtype.Int4        `json:"chunk_count"`
+	PrerequisiteShas       []string           `json:"prerequisite_shas"`
+	Reason                 pgtype.Text        `json:"reason"`
+	Context                pgtype.Text        `json:"context"`
+	ExpiresAt              pgtype.Timestamptz `json:"expires_at"`
+	CreatedAt              pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt              pgtype.Timestamptz `json:"updated_at"`
+}
+
+type RecoveryCaptureChunk struct {
+	CaptureID  uuid.UUID `json:"capture_id"`
+	ChunkIndex int32     `json:"chunk_index"`
+	Length     int32     `json:"length"`
+	Sealed     []byte    `json:"sealed"`
+}
+
+type RecoveryCustodyHold struct {
+	ID                     uuid.UUID          `json:"id"`
+	UserID                 uuid.UUID          `json:"user_id"`
+	RepoID                 pgtype.UUID        `json:"repo_id"`
+	RunID                  uuid.UUID          `json:"run_id"`
+	Generation             int64              `json:"generation"`
+	State                  string             `json:"state"`
+	OriginalWorkerID       uuid.UUID          `json:"original_worker_id"`
+	OriginalWorkerIdentity string             `json:"original_worker_identity"`
+	LiveWorkerID           pgtype.UUID        `json:"live_worker_id"`
+	LiveRunID              pgtype.UUID        `json:"live_run_id"`
+	CreatedAt              pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt              pgtype.Timestamptz `json:"updated_at"`
+	ReleasedAt             pgtype.Timestamptz `json:"released_at"`
+}
+
 type Repo struct {
 	ID                      uuid.UUID          `json:"id"`
 	ConnectionID            uuid.UUID          `json:"connection_id"`
@@ -530,6 +576,7 @@ type Run struct {
 	HoldCapturedHead            pgtype.Text        `json:"hold_captured_head"`
 	CompletionBudgetExhaustedAt pgtype.Timestamptz `json:"completion_budget_exhausted_at"`
 	CompletionQuestionAt        pgtype.Timestamptz `json:"completion_question_at"`
+	ClaimGeneration             int64              `json:"claim_generation"`
 }
 
 type RunCompletionAttempt struct {

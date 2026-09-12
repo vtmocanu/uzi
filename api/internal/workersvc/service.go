@@ -416,6 +416,25 @@ type Store interface {
 	GetRunForgeConnForWorker(ctx context.Context, arg store.GetRunForgeConnForWorkerParams) (store.GetRunForgeConnForWorkerRow, error)
 	ClaimRun(ctx context.Context, arg store.ClaimRunParams) (store.Run, error)
 	GetRunClaimContext(ctx context.Context, runID uuid.UUID) (store.GetRunClaimContextRow, error)
+
+	// Durable run recovery (PRD #1296 M1): the custody/archive store contract M2
+	// (upload/owner API), M3 (worker capture/retry) and M5 (owner UX) consume. Frozen
+	// here so those parallel milestones never edit the interface. The custody hold itself
+	// is opened atomically inside ClaimRun's CTE (D2); everything below operates on the
+	// already-open hold and its immutable captures.
+	CountUnresolvedCustodyHoldsForOwner(ctx context.Context, userID uuid.UUID) (int64, error)
+	ReserveCapture(ctx context.Context, arg store.ReserveCaptureParams) (store.RecoveryCapture, error)
+	BindCaptureManifest(ctx context.Context, arg store.BindCaptureManifestParams) (store.RecoveryCapture, error)
+	InsertCaptureChunk(ctx context.Context, arg store.InsertCaptureChunkParams) error
+	MarkCaptureReady(ctx context.Context, arg store.MarkCaptureReadyParams) (store.RecoveryCapture, error)
+	MarkCaptureState(ctx context.Context, arg store.MarkCaptureStateParams) (store.RecoveryCapture, error)
+	GetCaptureForOwner(ctx context.Context, arg store.GetCaptureForOwnerParams) (store.RecoveryCapture, error)
+	ListCapturesForRunOwner(ctx context.Context, arg store.ListCapturesForRunOwnerParams) ([]store.RecoveryCapture, error)
+	ListCaptureChunks(ctx context.Context, captureID uuid.UUID) ([]store.RecoveryCaptureChunk, error)
+	GetRecoverySummaryForRun(ctx context.Context, arg store.GetRecoverySummaryForRunParams) (store.GetRecoverySummaryForRunRow, error)
+	ReleaseCustodyForRun(ctx context.Context, runID uuid.UUID) (int64, error)
+	DiscardCaptureForOwner(ctx context.Context, arg store.DiscardCaptureForOwnerParams) (int64, error)
+	ExpireReadyCaptures(ctx context.Context, now pgtype.Timestamptz) (int64, error)
 	// Run judge (PRD #46 M3): terminal-funnel enqueue, judge-run-scoped trace/review
 	// authz, the command-not-found scan input, and the review upsert.
 	GetUserByID(ctx context.Context, id uuid.UUID) (store.User, error)
@@ -1611,6 +1630,19 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker) (*ClaimPayload, e
 		// drain gate above and the `NOT @claimant_draining OR r.worker_id = @worker_id`
 		// clause in ClaimRun). A non-draining worker passes false — a no-op.
 		ClaimantDraining: wkr.DrainingSince.Valid,
+		// PRD #1296 M1 (D2/D3/D4): the durable-recovery claim/custody contract.
+		//   - CustodyHoldLimit gates admission: a claim is blocked once the owner holds
+		//     >= this many unresolved (open) custody holds (owner-scoped, never global).
+		//   - RecoveryCapable derives from the worker's advertised recovery_archive_v1
+		//     protocol capability (D9 additive versioned contract): the custody hold is
+		//     opened in the claim CTE only for a capable worker on a code-publishing
+		//     profile, so an old worker on a supporting API is honestly unsupported rather
+		//     than falsely promised recovery.
+		//   - WorkerIdentity is the immutable provenance value recorded on the hold for a
+		//     later AAD-authenticated post-terminal recovery retry (never nulled).
+		CustodyHoldLimit: custodyHoldLimit,
+		RecoveryCapable:  slices.Contains(wkr.ProtocolCapabilities, capability.RecoveryArchiveV1),
+		WorkerIdentity:   workerIdentity(wkr),
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

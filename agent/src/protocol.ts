@@ -1968,3 +1968,64 @@ export interface InputsResponse {
 export interface RunOwnershipResponse {
   status: string;
 }
+
+// ── Durable run recovery worker RPC (PRD #1296 M1, D8) ─────────────────────────
+// The frozen worker↔API archive request/response shapes. TYPES ONLY here — no client
+// methods (that is M3). They mirror api/internal/apitypes/recovery.go verbatim (the Go
+// worker-facing DTOs), so a drift is a review-visible edit on both sides. Raw bundle
+// bytes never appear in JSON (D6): the upload streams them as the request body; the
+// manifest below carries only the metadata bound to those bytes.
+
+/** RecoveryReserveRequest reserves (or idempotently re-reserves) a capture under the
+ *  run's open custody hold. source_sha is the original committed head H; attempted_head_sha
+ *  is the provenance H' (omitted when no publish was attempted); idempotency_key is the
+ *  worker's durable source-journal identity, so a lost ACK re-reserves the SAME capture. */
+export interface RecoveryReserveRequest {
+  run_id: string;
+  idempotency_key: string;
+  source_sha: string;
+  attempted_head_sha?: string;
+}
+
+/** RecoveryReserveResponse is the reserve ACK: the server-minted capture id and its
+ *  current lifecycle state ('preparing' on a fresh reserve, or the existing state on an
+ *  idempotent retry). */
+export interface RecoveryReserveResponse {
+  capture_id: string;
+  state: string;
+}
+
+/** RecoveryUploadManifest is the byte-manifest the worker binds ONCE (compare-and-set)
+ *  before/at the streaming upload of the verified bundle. byte_size/checksum are the
+ *  complete-bundle facts the server verifies; chunk_count is the expected ordered-chunk
+ *  inventory; prerequisite_shas is the verified public prerequisite closure the bundle
+ *  imports against. The bundle bytes stream as the request body, never in this JSON. */
+export interface RecoveryUploadManifest {
+  byte_size: number;
+  checksum: string;
+  chunk_count: number;
+  prerequisite_shas?: string[];
+}
+
+/** RecoveryCaptureStatusResponse is the worker's by-id status poll of a capture, used to
+ *  handle lost ACKs and to decide on restart whether the manifest is already bound.
+ *  byte_size/checksum/expires_at surface the bound manifest and ready expiry when present;
+ *  reason carries a bounded sanitized needs_action/error reason. */
+export interface RecoveryCaptureStatusResponse {
+  capture_id: string;
+  state: string;
+  manifest_bound: boolean;
+  byte_size?: number;
+  checksum?: string;
+  reason?: string;
+  expires_at?: string;
+}
+
+/** RecoveryReleaseResponse is the release ACK for a run's custody: released is true when
+ *  the call transitioned any open hold to released, and holds_released is how many open
+ *  holds it settled (0 on an idempotent repeat once none remain open). */
+export interface RecoveryReleaseResponse {
+  run_id: string;
+  released: boolean;
+  holds_released: number;
+}

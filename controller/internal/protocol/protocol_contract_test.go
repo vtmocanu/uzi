@@ -82,6 +82,13 @@ func TestControllerParsesTheAPIsPollShape(t *testing.T) {
 	if pending.Ephemeral {
 		t.Fatal("ephemeral must parse as false for the golden's first worker (not run-bound)")
 	}
+	// CustodyHeld (PRD #1296 M1) is a distinct bool and must round-trip to its own field:
+	// the golden's first worker is custody-held, the second is not. Asserting both (not just
+	// one) fails a swapped tag — a CustodyHeld field tagged json:"ephemeral" would misparse
+	// and still satisfy DisallowUnknownFields, so only pinning the value catches it.
+	if !pending.CustodyHeld {
+		t.Fatal("custody_held must parse as true for the golden's first worker (retaining unpublished work)")
+	}
 
 	// A worker needing no Secret written: null token, still fully desired state. The
 	// nil is load-bearing — it means "write nothing", not "this worker has no token"
@@ -116,6 +123,11 @@ func TestControllerParsesTheAPIsPollShape(t *testing.T) {
 	}
 	if !noToken.Ephemeral {
 		t.Fatal("ephemeral must parse as true for the golden's second worker (run-bound)")
+	}
+	// The mirror of the first worker: this one is NOT custody-held, so the two assertions
+	// together fail either a swapped tag or a field collapse (PRD #1296 M1).
+	if noToken.CustodyHeld {
+		t.Fatal("custody_held must parse as false for the golden's second worker (not retaining work)")
 	}
 }
 

@@ -3293,3 +3293,51 @@ export interface CIRunDetail extends CIRun {
   jobs: CIJob[];
   unsupported: string;
 }
+
+// ── Durable run recovery (PRD #1296 M1) ───────────────────────────────────────
+// The owner-facing recovery metadata the run page and `uzi run export` render. Raw
+// archive bytes never appear here (D6) — only metadata. The Go source is
+// api/internal/apitypes/recovery.go; the api-contract fixtures pin the two in lockstep.
+
+// RecoveryArchive is one owner-visible capture's metadata. Optional fields are absent
+// until the capture reaches the relevant lifecycle stage: attempted_head_sha (H') is
+// absent when no publish was attempted; byte_size/checksum are absent until the manifest
+// is bound; expires_at is absent until the artifact is available.
+export interface RecoveryArchive {
+  id: string;
+  run_id: string;
+  state: string;
+  source_sha: string;
+  attempted_head_sha?: string;
+  byte_size?: number;
+  checksum?: string;
+  reason?: string;
+  prerequisite_shas?: string[];
+  created_at: string;
+  expires_at?: string;
+}
+
+// RecoveryArchiveStateCounts is the closed per-state capture tally on a run's recovery
+// summary. Every state key is always present.
+export interface RecoveryArchiveStateCounts {
+  preparing: number;
+  uploading: number;
+  available: number;
+  needs_action: number;
+  expired: number;
+  discarded: number;
+}
+
+// RecoveryArchiveSummary is the per-run recovery aggregate M5 renders WITHOUT gating on
+// archives.length: supported is true iff recovery was ever armed for the run (its absence
+// is the legacy/unsupported case, surfaced as legacy); has_open_hold is the pending signal.
+// archives is ALWAYS an array on the wire (the summary endpoint returns [] for a run with
+// none), so it is typed never-null — the nil-slice zero fixture is exempted in the contract
+// test, the same as CIRunDetail.jobs.
+export interface RecoveryArchiveSummary {
+  supported: boolean;
+  legacy: boolean;
+  has_open_hold: boolean;
+  counts: RecoveryArchiveStateCounts;
+  archives: RecoveryArchive[];
+}

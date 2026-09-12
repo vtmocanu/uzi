@@ -212,6 +212,10 @@ func (s *Service) Poll(ctx context.Context) (PollResponse, error) {
 			// SQL booleans, mapped straight through.
 			DiskPressure: row.DiskPressure,
 			Ephemeral:    row.Ephemeral,
+			// PRD #1296 M1 (D3/D9): the custody-held signal round-trips on the wire from now
+			// on, but M1 emits it FALSE — M4 wires the real value from the recovery custody
+			// store into this poll. Explicit (not an implicit zero) to mark the M4 obligation.
+			CustodyHeld: false,
 		}
 		if row.DrainingSince.Valid {
 			t := row.DrainingSince.Time

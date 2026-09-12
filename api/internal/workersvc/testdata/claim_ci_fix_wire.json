@@ -10,6 +10,7 @@
   "last_seq": 0,
   "iteration_count": 0,
   "requeue_count": 0,
+  "claim_generation": 0,
   "plan_md": null,
   "auto_approve": false,
   "open_mr": false,
