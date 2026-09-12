@@ -121,7 +121,11 @@ func (g *github) mergeRequestSummary(ctx context.Context, slug repoSlug, number 
 	if err != nil {
 		return MergeRequestSummary{}, err
 	}
-	s.ReviewDecision = foldReviewDecision(reviews, len(pr.RequestedReviewers), pr.GetUser().GetLogin())
+	// D6: pr.RequestedReviewers lists only USER review requests; a team-only review
+	// request lives in pr.RequestedTeams, which GitHub's GET pull request populates on
+	// the same fetch above. Count both so a team-only-requested PR folds to
+	// review_required rather than none — no extra forge call.
+	s.ReviewDecision = foldReviewDecision(reviews, len(pr.RequestedReviewers)+len(pr.RequestedTeams), pr.GetUser().GetLogin())
 	return s, nil
 }
 

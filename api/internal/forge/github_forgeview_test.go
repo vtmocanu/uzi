@@ -137,6 +137,69 @@ func TestGitHubGetMergeRequestSummaryConflictsUnknown(t *testing.T) {
 	}
 }
 
+// TestGitHubGetMergeRequestSummaryTeamOnlyRequested pins the D6 team-request gap: a
+// PR with a team review requested but no individual reviewers and no reviews must fold
+// to review_required, not none. pr.RequestedReviewers carries only USER requests; the
+// team request lives in pr.RequestedTeams, which the summary's existing Get already
+// populates — so both are counted at the single fold call site.
+func TestGitHubGetMergeRequestSummaryTeamOnlyRequested(t *testing.T) {
+	m := newMockGitHub(t, map[string]http.HandlerFunc{
+		"/repos/acme/widgets/pulls/11": func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"number": 11, "title": "Team review", "state": "open",
+				"user":                map[string]any{"login": "octo"},
+				"head":                map[string]any{"ref": "feature", "sha": "abc"},
+				"base":                map[string]any{"ref": "main"},
+				"requested_reviewers": []map[string]any{},
+				"requested_teams":     []map[string]any{{"id": 1, "slug": "backend"}},
+			})
+		},
+		"/repos/acme/widgets/pulls/11/reviews": func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode([]map[string]any{})
+		},
+	})
+	d := newGitHubDriver(t, m, "ghp_classicTokenValue1234567890")
+
+	got, err := d.GetMergeRequestSummary(context.Background(), 7, 11)
+	if err != nil {
+		t.Fatalf("GetMergeRequestSummary: %v", err)
+	}
+	if got.ReviewDecision != ReviewRequired {
+		t.Fatalf("a team-only-requested PR must fold to review_required, got %q", got.ReviewDecision)
+	}
+}
+
+// TestGitHubGetMergeRequestSummaryTeamRequestedButApproved locks the D6 fold ordering
+// against the team-request gap: an APPROVED review must win even while a team review is
+// still pending, so counting requested teams never overrides an existing approval.
+func TestGitHubGetMergeRequestSummaryTeamRequestedButApproved(t *testing.T) {
+	m := newMockGitHub(t, map[string]http.HandlerFunc{
+		"/repos/acme/widgets/pulls/12": func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"number": 12, "state": "open",
+				"user":            map[string]any{"login": "octo"},
+				"head":            map[string]any{"ref": "feature", "sha": "abc"},
+				"base":            map[string]any{"ref": "main"},
+				"requested_teams": []map[string]any{{"id": 1, "slug": "backend"}},
+			})
+		},
+		"/repos/acme/widgets/pulls/12/reviews": func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode([]map[string]any{
+				{"user": map[string]any{"login": "alice"}, "state": "APPROVED", "submitted_at": "2024-01-01T00:00:00Z"},
+			})
+		},
+	})
+	d := newGitHubDriver(t, m, "ghp_classicTokenValue1234567890")
+
+	got, err := d.GetMergeRequestSummary(context.Background(), 7, 12)
+	if err != nil {
+		t.Fatalf("GetMergeRequestSummary: %v", err)
+	}
+	if got.ReviewDecision != ReviewApproved {
+		t.Fatalf("an approval must win over a still-pending team request, got %q", got.ReviewDecision)
+	}
+}
+
 // TestGitHubGetMergeRequestSummaryNotFound pins that a 404 from PullRequests.Get
 // surfaces as ErrMergeRequestNotFound (errors.Is-matchable), not a redacted generic
 // error — so the handler can 404 a missing/raced-away PR.
