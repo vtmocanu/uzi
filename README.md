@@ -112,7 +112,7 @@ The board works against issues on your forge, through a per-user bot account so 
 
 ### Add your model token and a worker
 
-1. Under **Settings**, save your Anthropic token. Runs spend it on your own account, so cost and rate limits stay yours (see [docs/anthropic-token.md](docs/anthropic-token.md)).
+1. Under **Settings**, save your Anthropic token. Runs spend it on your own account, so cost and rate limits stay yours (see [docs/anthropic-token.md](docs/anthropic-token.md)). uzi is Anthropic-only today, on a Claude subscription or an API key; support for Codex and other OpenAI-compatible APIs is in progress.
 2. Add a **worker**, the container that claims runs and does the agent work. Locally, generate a join token under **Settings → Workers** and start the bundled worker with `docker compose --profile agent up`. On Kubernetes, turn on worker hosting in your Helm values and provision one straight from **Settings → Workers** (see [docs/worker-setup.md](docs/worker-setup.md)).
 
 That is the whole setup. Pick an issue, label it `uzi`, hit **Start run**, approve the plan when it pauses, and watch it work.
