@@ -8,13 +8,20 @@ owed packaged proof never reddens the worker's ordinary gate. At the exact teste
 (`6530f505`), `check:codex-m4-receipts` **exits non-zero by design**:
 
 ```
-run-receipts: 1 inherited/receipt-present O row(s) with an unresolved (placeholder) digest block merge (D8):
+run-receipts: 1 inherited/receipt-present O row(s) with an unresolved (placeholder) digest block merge (D8) — refresh to the real merge-candidate digest:
   - codex-o-command-root-home-denial
       digest: sha256:PENDING-CANDIDATE-DIGEST
 run-receipts: 2 owed O assertion(s) block merge (D8):
   - codex-o-descendant-code-mode-host-absence
+      target: codex worker image (base + jvm) descendant-reaping snapshot
+      reason: descendant/code-mode-host absence needs a fresh packaged snapshot below the REAL Go supervisor on a Landlock-capable runtime; the uzi worker cannot prove a descendant ABSENCE from a direct harness spawn.
+      owner:  maintainer (D8: fresh packaged O proof, k8s-first Linux runtime)
   - codex-o-packaged-descendant-reaping
+      target: codex worker image (base + jvm) supervisor whole-root reaping snapshot
+      reason: whole-root ECHILD(+__WALL) descendant reaping under the REAL Go supervisor is a packaged OS effect; the uzi worker's C4 U cases prove only the registry/safety CONTRACT with injected fake roots, so a fresh packaged snapshot below the real supervisor on a Landlock-capable runtime is required and is maintainer-owned (D8).
+      owner:  maintainer (D8: fresh packaged O proof, k8s-first Linux runtime)
 ```
+(Verbatim `run-receipts.ts` output at revision `6530f505`; exit status 1.)
 
 This is bookkeeping, not a gap left unnoticed: every O row is one of `inherited` /
 `receipt-present` / `owed` (D3/D8), and the ordinary worker gate accepts a well-formed `owed`
