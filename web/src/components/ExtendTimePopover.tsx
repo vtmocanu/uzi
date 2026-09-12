@@ -51,6 +51,9 @@ export function ExtendTimePopover({
   const [custom, setCustom] = useState("");
   const hostRef = useRef<HTMLDivElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
+  // Pending click-away refocus frame (see onDown). Held on a ref so it survives the close
+  // re-render and is cancelled only on unmount, never on the open→false toggle.
+  const refocusRaf = useRef(0);
   const panelId = useId();
   // How far to nudge the panel horizontally so it never renders off-screen. The panel is
   // anchored `right-0`, so on a narrow (mobile) viewport its left edge — the +1h quick-pick and
@@ -76,6 +79,7 @@ export function ExtendTimePopover({
     panelRef.current?.focus();
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
+        // keydown has no focus default action, so returning focus synchronously here wins.
         setOpen(false);
         focusTrigger();
       }
@@ -83,7 +87,12 @@ export function ExtendTimePopover({
     const onDown = (e: MouseEvent) => {
       if (hostRef.current && !hostRef.current.contains(e.target as Node)) {
         setOpen(false);
-        focusTrigger();
+        // A native mousedown's default action moves focus to <body> AFTER this handler runs,
+        // which would clobber a synchronous focusTrigger() (measured in a real browser; jsdom
+        // does not reproduce it). Defer the refocus one frame so it lands AFTER that native
+        // focus step and wins. The close itself stays synchronous (snappy). The frame is held
+        // on refocusRaf and cancelled on unmount, not on the open→false toggle this schedules.
+        refocusRaf.current = requestAnimationFrame(focusTrigger);
       }
     };
     document.addEventListener("keydown", onKey);
@@ -93,6 +102,15 @@ export function ExtendTimePopover({
       document.removeEventListener("mousedown", onDown);
     };
   }, [open]);
+
+  // Cancel any pending click-away refocus frame on unmount so focusTrigger never runs after
+  // teardown (it would no-op anyway — hostRef.current is null — but this leaves nothing dangling).
+  useEffect(
+    () => () => {
+      if (refocusRaf.current) cancelAnimationFrame(refocusRaf.current);
+    },
+    [],
+  );
 
   // Keep the panel inside the viewport at mobile width. Measured from the host's right edge and
   // the panel's laid-out width (both independent of any shift already applied, so this is

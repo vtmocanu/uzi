@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, describe, it, expect, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { ExtendTimePopover } from "./ExtendTimePopover";
 import type { BudgetRun } from "../lib/budget";
 
@@ -107,9 +107,27 @@ describe("ExtendTimePopover (PRD #1189)", () => {
     // Focus moves INTO the panel on open (not left on the trigger, not dropped to <body>).
     expect(document.activeElement).toBe(panel);
     fireEvent.keyDown(document, { key: "Escape" });
-    // Escape closes it AND returns focus to the trigger.
+    // Escape closes it AND returns focus to the trigger — synchronously (keydown has no focus
+    // default action to clobber it).
     expect(screen.queryByRole("dialog", { name: /extend this run/i })).toBeNull();
     expect(document.activeElement).toBe(trigger);
+  });
+
+  it("returns focus to the trigger after an outside click, on the DEFERRED frame", async () => {
+    render(<ExtendTimePopover run={runningRun()} busy={false} onSubmit={vi.fn()} />);
+    const trigger = screen.getByRole("button", { name: /extend time/i });
+    fireEvent.click(trigger);
+    const panel = screen.getByRole("dialog", { name: /extend this run/i });
+    expect(document.activeElement).toBe(panel);
+    // An outside mousedown closes the chooser immediately…
+    fireEvent.mouseDown(document.body);
+    expect(screen.queryByRole("dialog", { name: /extend this run/i })).toBeNull();
+    // …but the refocus is deferred one frame (requestAnimationFrame) so that in a REAL browser
+    // it lands AFTER mousedown's native focus-to-<body> default action instead of being clobbered
+    // by it. jsdom fires no such default action, so this MUST be awaited — asserting focus
+    // synchronously here would pass even with the refocus removed and could never catch the bug.
+    // Awaiting the frame makes the assertion fail (waitFor times out) if the refocus is dropped.
+    await waitFor(() => expect(document.activeElement).toBe(trigger));
   });
 
   it("says extensions are turned off when the cap is 0, and offers no Confirm", () => {
