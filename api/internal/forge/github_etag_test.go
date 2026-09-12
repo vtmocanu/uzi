@@ -1,11 +1,13 @@
 package forge
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // getBody issues a GET through client and returns the status and body.
@@ -161,10 +163,13 @@ func TestETagTransportPassesThroughNonGET(t *testing.T) {
 }
 
 // TestETagTransportSkipsOversizedBody proves a 200 body over the 512 KiB ceiling
-// is not cached: the second request sends no If-None-Match and re-fetches.
+// is not cached AND is still handed to the caller in FULL (Fix 2): the transport
+// buffers only cap+1 bytes and streams the rest, so the caller reads every byte,
+// and the second request sends no If-None-Match and re-fetches. The body is a few
+// KiB over the cap so the streamed remainder (past the cap+1 prefix) is exercised.
 func TestETagTransportSkipsOversizedBody(t *testing.T) {
 	const etag = `"big-v1"`
-	big := strings.Repeat("x", etagCacheMaxBytes+1)
+	big := strings.Repeat("x", etagCacheMaxBytes+1024)
 	var hits, conditional int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits++
@@ -194,5 +199,76 @@ func TestETagTransportSkipsOversizedBody(t *testing.T) {
 	}
 	if hits != 2 {
 		t.Fatalf("server hits = %d, want 2", hits)
+	}
+}
+
+// TestETagTransport304CarriesLiveRateLimitHeaders is Fix 1 at the go-github-client
+// level, the way the finding was demonstrated: a real driver built via newGitHub
+// points at an httptest server. The first PullRequests.List gets 200 + ETag +
+// X-RateLimit-Remaining: 4999; the second is answered 304 with the LIVE
+// X-RateLimit-Remaining: 10. The synthesized 200 the transport replays must carry
+// the LIVE rate headers (not the stale cached 4999), so go-github's rate tracker
+// updates from them and the returned *github.Response.Rate.Remaining reads 10.
+func TestETagTransport304CarriesLiveRateLimitHeaders(t *testing.T) {
+	const etag = `"pulls-rate-v1"`
+	const body = `[]`                              // an empty PR list decodes cleanly on both the 200 and the replayed 200
+	const token = "ghp_rateFixtureToken1234567890" //nolint:gosec // G101: fake fixture token, never a real secret //gitleaks:allow
+	var conditional int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/pulls") {
+			t.Errorf("unexpected path %q, want a /pulls list", r.URL.Path)
+		}
+		if inm := r.Header.Get("If-None-Match"); inm != "" {
+			conditional++
+			if inm != etag {
+				t.Errorf("If-None-Match = %q, want the previously served %q", inm, etag)
+			}
+			// LIVE rate state reported on the 304: the budget has dropped to 10.
+			w.Header().Set("ETag", etag)
+			w.Header().Set("X-RateLimit-Limit", "5000")
+			w.Header().Set("X-RateLimit-Remaining", "10")
+			w.Header().Set("X-RateLimit-Used", "4990")
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Header().Set("ETag", etag)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-RateLimit-Limit", "5000")
+		w.Header().Set("X-RateLimit-Remaining", "4999")
+		w.Header().Set("X-RateLimit-Used", "1")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, body)
+	}))
+	defer srv.Close()
+
+	d, err := newGitHub(srv.URL, token, 5*time.Second)
+	if err != nil {
+		t.Fatalf("newGitHub: %v", err)
+	}
+	ctx := context.Background()
+
+	// First List: 200 + ETag, live rate 4999, cached.
+	_, resp1, err := d.client.PullRequests.List(ctx, "o", "r", nil)
+	if err != nil {
+		t.Fatalf("first List: %v", err)
+	}
+	if resp1.Rate.Remaining != 4999 {
+		t.Fatalf("first List Rate.Remaining = %d, want 4999", resp1.Rate.Remaining)
+	}
+
+	// Second List: the transport sends If-None-Match, the server answers 304 with the
+	// LIVE remaining (10); the replayed 200 must surface that through go-github.
+	_, resp2, err := d.client.PullRequests.List(ctx, "o", "r", nil)
+	if err != nil {
+		t.Fatalf("second List: %v", err)
+	}
+	if conditional != 1 {
+		t.Fatalf("server saw %d conditional requests, want 1 (If-None-Match must be sent on the repeat)", conditional)
+	}
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("second List status = %d, want a replayed 200", resp2.StatusCode)
+	}
+	if resp2.Rate.Remaining != 10 {
+		t.Fatalf("after 304 replay Rate.Remaining = %d, want the LIVE 10, not the stale cached 4999", resp2.Rate.Remaining)
 	}
 }

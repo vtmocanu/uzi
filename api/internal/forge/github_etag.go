@@ -164,37 +164,52 @@ func (t *etagTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return resp, err
 	}
 
-	// 304 Not Modified: GitHub confirms our cached copy is current. Drain and
-	// close the empty 304 body and replay the cached body as a synthesized 200 so
-	// go-github never sees the 304 it would treat as an error.
+	// 304 Not Modified: GitHub confirms our cached copy is current. Replay the
+	// cached body as a synthesized 200 so go-github never sees the 304 it would
+	// treat as an error, but carry the LIVE rate-limit headers the 304 reported
+	// (see replay) so go-github's client-side rate tracker updates from current
+	// numbers, not the stale ones frozen in the cached entry. Drain and close the
+	// empty 304 body only after we have copied its headers.
 	if resp.StatusCode == http.StatusNotModified && hasCached {
+		replayed := t.replay(req, cached, resp)
 		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
-		return t.replay(req, cached), nil
+		return replayed, nil
 	}
 
-	// 200 with an ETag: buffer the body so we can both cache it and hand the
-	// caller a fresh reader. Bodies over the ceiling are returned but not cached.
+	// 200 with an ETag: buffer the body so we can both cache it and hand the caller
+	// a fresh reader. Read at most etagCacheMaxBytes+1 bytes up front so an
+	// oversized allowlisted response is never fully buffered just to be discarded
+	// for the cache — cap+1 is enough to tell "fits" from "there is more".
 	if resp.StatusCode == http.StatusOK {
 		etag := resp.Header.Get("ETag")
 		if etag == "" {
 			return resp, nil
 		}
-		body, rerr := io.ReadAll(resp.Body)
-		_ = resp.Body.Close()
+		buf, rerr := io.ReadAll(io.LimitReader(resp.Body, etagCacheMaxBytes+1))
 		if rerr != nil {
+			_ = resp.Body.Close()
 			return nil, rerr
 		}
-		if len(body) <= etagCacheMaxBytes {
+		if len(buf) <= etagCacheMaxBytes {
+			// Whole body fit: cache it and hand the caller a fresh reader over the
+			// buffered bytes; the original stream is drained, so close it.
+			_ = resp.Body.Close()
 			t.cache.put(&etagEntry{
 				key:    key,
 				etag:   etag,
-				body:   body,
+				body:   buf,
 				header: resp.Header.Clone(),
 			})
+			resp.Body = io.NopCloser(bytes.NewReader(buf))
+			resp.ContentLength = int64(len(buf))
+			return resp, nil
 		}
-		resp.Body = io.NopCloser(bytes.NewReader(body))
-		resp.ContentLength = int64(len(body))
+		// Oversized: do NOT cache. Hand the caller the already-read prefix followed
+		// by the rest of the still-open stream, closing the original on Close, so at
+		// most cap+1 bytes are ever buffered while the caller still gets the full
+		// body. ContentLength stays as the server reported it (the full length).
+		resp.Body = &multiReadCloser{r: io.MultiReader(bytes.NewReader(buf), resp.Body), c: resp.Body}
 		return resp, nil
 	}
 
@@ -203,13 +218,40 @@ func (t *etagTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	return resp, nil
 }
 
-// replay builds a synthesized 200 response from a cached entry: the buffered
-// body over a fresh reader and a copy of the cached headers (including the
-// ETag), with req attached.
-func (t *etagTransport) replay(req *http.Request, e *etagEntry) *http.Response {
+// etagLiveRateHeaders are the response headers whose values reflect the CURRENT
+// rate-limit state and so must come from the live 304 (not the cached 200) when a
+// replay is synthesized. GitHub sends fresh X-RateLimit-* on every 304, and
+// go-github ingests them into its client-side tracker for any response lacking an
+// X-From-Cache header — so if the replay carried the stale cached numbers the
+// tracker (and the returned *github.Response.Rate) would read a stale-high
+// Remaining after a 304. Retry-After is included for the secondary-limit case.
+var etagLiveRateHeaders = []string{
+	"X-RateLimit-Limit",
+	"X-RateLimit-Remaining",
+	"X-RateLimit-Used",
+	"X-RateLimit-Reset",
+	"X-RateLimit-Resource",
+	"Retry-After",
+}
+
+// replay builds a synthesized 200 response from a cached entry: the buffered body
+// over a fresh reader and a copy of the cached headers (so Content-Type / ETag are
+// the ones from the original 200), with req attached. The rate-limit-relevant
+// headers are then OVERWRITTEN from the live 304 (live), so the synthesized 200
+// carries the current rate numbers the 304 reported rather than the stale ones
+// frozen in the cache. It deliberately does NOT set X-From-Cache: we WANT
+// go-github to update its rate tracker from these live headers.
+func (t *etagTransport) replay(req *http.Request, e *etagEntry, live *http.Response) *http.Response {
 	h := e.header.Clone()
 	if h == nil {
 		h = make(http.Header)
+	}
+	if live != nil {
+		for _, name := range etagLiveRateHeaders {
+			if v := live.Header.Get(name); v != "" {
+				h.Set(name, v)
+			}
+		}
 	}
 	return &http.Response{
 		Status:        "200 OK",
@@ -223,3 +265,15 @@ func (t *etagTransport) replay(req *http.Request, e *etagEntry) *http.Response {
 		Request:       req,
 	}
 }
+
+// multiReadCloser hands back an already-buffered prefix (r's first reader)
+// followed by the rest of an underlying stream, and closes that underlying body
+// on Close. Used on the oversized 200 path so an allowlisted body over the cache
+// cap is streamed to the caller in full without being fully buffered.
+type multiReadCloser struct {
+	r io.Reader
+	c io.Closer
+}
+
+func (m *multiReadCloser) Read(p []byte) (int, error) { return m.r.Read(p) }
+func (m *multiReadCloser) Close() error               { return m.c.Close() }
