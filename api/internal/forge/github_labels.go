@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"strings"
 
-	gh "github.com/google/go-github/v90/github"
+	gh "github.com/google/go-github/v91/github"
 )
 
 func (g *github) ListLabels(ctx context.Context, projectID int64) ([]Label, error) {

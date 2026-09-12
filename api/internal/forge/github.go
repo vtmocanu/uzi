@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	gh "github.com/google/go-github/v90/github"
+	gh "github.com/google/go-github/v91/github"
 )
 
 // githubPerPage is the pagination page size for every GitHub list call. 100 is
@@ -26,7 +26,7 @@ const githubPerPage = 100
 const githubDefaultLabelColor = "ededed"
 
 // github is the GitHub REST driver (D3/D5): github.com only, classic PAT,
-// built on github.com/google/go-github/v90. Unlike the gitea SDK the Forgejo
+// built on github.com/google/go-github/v91. Unlike the gitea SDK the Forgejo
 // driver uses, go-github takes ctx PER METHOD, so a SINGLE long-lived
 // *github.Client is safe to reuse across calls — no per-call client rebuild
 // (D5's one ergonomic win over Forgejo). There is no version gate (D4):
