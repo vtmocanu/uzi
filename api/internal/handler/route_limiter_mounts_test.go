@@ -67,7 +67,12 @@ var limiterNames = [...]string{
 // error rather than a failing row. Spelled `lim*` rather than matching the parameter
 // names exactly, so nothing here shadows a parameter inside Routes.
 //
-// 184 as of this commit (PRD #1171 M1 added POST /api/worker/runs/{id}/codex/release and
+// 188 as of this commit (PRD #1255 M2a added the four forge-view GET reads
+// GET /api/repos/{id}/pulls, /pulls/{iid}, /ci/runs and /ci/runs/{run_id} — all limForge,
+// like the sibling /{id}/issues/{iid} forge read. POST /api/repos/{id}/ci-fix-runs also
+// MOVED from the cookie-only group to RequireUser (D12) but its method/pattern/limiter
+// row is unchanged, so it is not a count change — a move, not an add.)
+// It was 184 until then (PRD #1171 M1 added POST /api/worker/runs/{id}/codex/release and
 // POST /api/worker/runs/{id}/codex/refresh — the Bearer-only Codex credential
 // release/refresh bridge, both worker-authenticated and both noLimiter, like the other
 // worker /runs/{id}/... routes they sit beside.)
@@ -328,6 +333,13 @@ var wantRouteMounts = []routeMount{
 	// owner-or-admin group as the sibling routes → noLimiter, like the sibling reads.
 	{"GET", "/api/repos/{id}/github-project-sync/visibility", noLimiter},
 	{"GET", "/api/repos/{id}/issues/{iid}", limForge},
+	// PRD #1255 M2a forge views: read-only open-pulls and CI-runs reads. Each proxies
+	// the repo's forge on demand (ListMergeRequests/ListChecks/ListWorkflowRuns), so it
+	// carries the per-user forge budget, like GET /{id}/issues/{iid} above it.
+	{"GET", "/api/repos/{id}/pulls", limForge},
+	{"GET", "/api/repos/{id}/pulls/{iid}", limForge},
+	{"GET", "/api/repos/{id}/ci/runs", limForge},
+	{"GET", "/api/repos/{id}/ci/runs/{run_id}", limForge},
 	{"GET", "/api/repos/{id}/tool-profile", noLimiter},
 	{"GET", "/api/runs/", noLimiter},
 	{"GET", "/api/runs/{id}", noLimiter},

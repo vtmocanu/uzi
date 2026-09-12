@@ -174,6 +174,38 @@ func (f *forgejo) reviewDecision(ctx context.Context, slug repoSlug, pr *gitea.P
 	return foldReviewDecision(reviews, requested, author), nil
 }
 
+// ListMergeRequestReviews returns the PR's reviews (oldest-first) as neutral Review
+// records for the detail view (PRD #1255 D6), reading the same /pulls/{index}/reviews
+// raw endpoint reviewDecision folds. State is Forgejo's raw review state, passed
+// through verbatim.
+func (f *forgejo) ListMergeRequestReviews(ctx context.Context, projectID, mrIID int64) ([]Review, error) {
+	c, err := f.newClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+	slug, err := f.repoSlugFor(c, projectID)
+	if err != nil {
+		return nil, err
+	}
+	body, err := f.rawGetLimited(ctx, fmt.Sprintf("/repos/%s/%s/pulls/%d/reviews", slug.owner, slug.repo, mrIID), forgejoReviewsBodyLimit)
+	if err != nil {
+		return nil, f.wrapErr("list pull request reviews", err)
+	}
+	var parsed []forgejoReview
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, f.wrapErr("decode pull request reviews", err)
+	}
+	out := make([]Review, 0, len(parsed))
+	for _, r := range parsed {
+		login := ""
+		if r.User != nil {
+			login = r.User.Login
+		}
+		out = append(out, Review{Author: login, State: r.State, SubmittedAt: r.SubmittedAt})
+	}
+	return out, nil
+}
+
 // forgejoPRStateParam maps the neutral state onto gitea's StateType. The zero value
 // and "opened" both mean open.
 func forgejoPRStateParam(state string) gitea.StateType {

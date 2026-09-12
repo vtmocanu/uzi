@@ -143,6 +143,14 @@ func (g *gitLab) mrApproved(ctx context.Context, projectID, mrIID int64) (approv
 	return cfg.Approved, true, nil
 }
 
+// ListMergeRequestReviews returns no per-reviewer reviews for GitLab (PRD #1255 D6):
+// GitLab has no review stream on the free tier — its neutral decision is the
+// BlockingDiscussionsResolved / Premium-approvals approximation (reviewDecision), not
+// a list of reviewers. The detail view renders the empty slice as "no reviews".
+func (g *gitLab) ListMergeRequestReviews(context.Context, int64, int64) ([]Review, error) {
+	return []Review{}, nil
+}
+
 // gitlabMRStateParam maps the neutral state onto GitLab's MR list `state`
 // (opened/closed/merged/all). The zero value and "opened" both mean opened.
 func gitlabMRStateParam(state string) string {

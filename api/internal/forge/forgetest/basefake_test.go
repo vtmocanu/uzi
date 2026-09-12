@@ -111,13 +111,17 @@ func actionMethods() []struct {
 			_, err := b.ListWorkflowRuns(ctx, 1, forge.ListWorkflowRunsOptions{})
 			return err
 		}},
+		{"ListMergeRequestReviews", func(b *BaseFake) error {
+			_, err := b.ListMergeRequestReviews(ctx, 1, 2)
+			return err
+		}},
 	}
 }
 
 func TestBaseFakeActionMethodsNotStubbed(t *testing.T) {
 	methods := actionMethods()
-	if len(methods) != 27 {
-		t.Fatalf("expected 27 action methods, got %d", len(methods))
+	if len(methods) != 28 {
+		t.Fatalf("expected 28 action methods, got %d", len(methods))
 	}
 	b := &BaseFake{}
 	for _, m := range methods {

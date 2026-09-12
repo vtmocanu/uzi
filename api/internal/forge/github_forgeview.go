@@ -146,6 +146,26 @@ func (g *github) listPullRequestReviews(ctx context.Context, slug repoSlug, numb
 	})
 }
 
+// ListMergeRequestReviews returns the PR's reviews (oldest-first) as neutral Review
+// records for the detail view (PRD #1255 D6), reusing the same listPullRequestReviews
+// read the list route's D6 fold uses. State is GitHub's raw review state, passed
+// through verbatim.
+func (g *github) ListMergeRequestReviews(ctx context.Context, projectID, mrIID int64) ([]Review, error) {
+	slug, err := g.repoSlugFor(ctx, projectID)
+	if err != nil {
+		return nil, err
+	}
+	reviews, err := g.listPullRequestReviews(ctx, slug, int(mrIID))
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Review, 0, len(reviews))
+	for _, r := range reviews {
+		out = append(out, Review{Author: r.ReviewerLogin, State: r.State, SubmittedAt: r.SubmittedAt})
+	}
+	return out, nil
+}
+
 // githubPRStateParam maps the neutral state onto GitHub's PR list `state`
 // (open/closed/all). The zero value and "opened" both mean open — the only state
 // the pulls screen shows.

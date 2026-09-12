@@ -3169,3 +3169,127 @@ export interface RunSocketLike {
   onerror: (() => void) | null;
   close(): void;
 }
+
+// ── Forge views (PRD #1255): open pulls + CI runs, read-through the api ──────────
+// Every string field here is FORGE-AUTHORED UNTRUSTED text (titles, branch/check/job
+// names, logins, descriptions, URLs) — sanitize before rendering. Times are RFC3339
+// strings. checks/reviews/jobs/steps are never null on the wire (the api normalizes an
+// empty forge result to []), which is why the contract test exempts them from the
+// zero-fixture null check even though json.Marshal of the zero Go struct emits null.
+
+// Pull is one open PR/MR on the `pulls` list. conflicts is a tri-state (null = the
+// forge has not computed mergeability yet). run_id is the newest uzi run that opened
+// this PR (the `↳ run` link), null when none.
+export interface Pull {
+  iid: number;
+  title: string;
+  author: string;
+  source_branch: string;
+  target_branch: string;
+  head_sha: string;
+  draft: boolean;
+  conflicts: boolean | null;
+  review_decision: string;
+  web_url: string;
+  additions: number;
+  deletions: number;
+  commits: number;
+  created_at: string;
+  updated_at: string;
+  run_id: string | null;
+}
+
+// Check is one status/check for a PR's head sha. status is the run phase
+// (queued/in_progress/completed); conclusion is meaningful once completed and "" while
+// running. source is the reporting app slug or "status" for a commit-status surface.
+export interface Check {
+  name: string;
+  status: string;
+  conclusion: string;
+  description: string;
+  web_url: string;
+  started_at: string;
+  completed_at: string;
+  source: string;
+}
+
+// PullReview is one per-reviewer review. state is the RAW forge review state
+// (approved/changes_requested/commented/… — forge-specific vocabulary, verbatim).
+export interface PullReview {
+  author: string;
+  state: string;
+  submitted_at: string;
+}
+
+// MergeState is the PR's merge readiness. conflicts is the tri-state (null = unknown).
+// mergeable_state is the raw coarse forge state (may be ""). blocked_reason is derived
+// by the api (conflicts / changes requested / checks failing / waiting on checks / "").
+export interface MergeState {
+  conflicts: boolean | null;
+  mergeable_state: string;
+  blocked_reason: string;
+  required_checks_passed: boolean;
+}
+
+// PullDetail is the PR drill-in: the Pull scalars plus the head sha's checks, the
+// per-reviewer reviews, and the derived merge state.
+export interface PullDetail extends Pull {
+  checks: Check[];
+  reviews: PullReview[];
+  merge: MergeState;
+}
+
+// CIRun is one CI run on the `ci` list (a GitHub Actions run, a GitLab pipeline, or a
+// Forgejo Actions run). status is the run phase and conclusion the terminal outcome
+// where the forge splits them (GitHub); GitLab/Forgejo fold everything into status and
+// leave conclusion "". jobs_done/jobs_total are best-effort (0 unless filled for a
+// running row).
+export interface CIRun {
+  id: number;
+  name: string;
+  number: number;
+  event: string;
+  branch: string;
+  sha: string;
+  status: string;
+  conclusion: string;
+  title: string;
+  actor: string;
+  web_url: string;
+  created_at: string;
+  updated_at: string;
+  started_at: string;
+  jobs_done: number;
+  jobs_total: number;
+}
+
+// CIStep is one step of a CI job (GitHub Actions only; GitLab/Forgejo jobs have no
+// steps). number is the 1-based step index.
+export interface CIStep {
+  name: string;
+  status: string;
+  conclusion: string;
+  number: number;
+  started_at: string;
+  completed_at: string;
+}
+
+// CIJob is one job of a CI run with its steps (steps is [] on GitLab/Forgejo).
+export interface CIJob {
+  id: number;
+  name: string;
+  status: string;
+  conclusion: string;
+  web_url: string;
+  started_at: string;
+  finished_at: string;
+  steps: CIStep[];
+}
+
+// CIRunDetail is the CI-run drill-in: the CIRun scalars plus the run's jobs. unsupported
+// is a non-empty sentence only when the forge version lacks the Actions endpoint (jobs
+// is then empty and the sentence is shown instead of an error).
+export interface CIRunDetail extends CIRun {
+  jobs: CIJob[];
+  unsupported: string;
+}

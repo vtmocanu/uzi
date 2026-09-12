@@ -471,6 +471,21 @@ const (
 	ReviewNone ReviewDecision = "none"
 )
 
+// Review is one per-reviewer review on an open merge/pull request as the forge-view
+// DETAIL route renders it (PRD #1255 D6): the reviewer's login, the review's RAW
+// forge state (GitHub: APPROVED/CHANGES_REQUESTED/COMMENTED/DISMISSED/PENDING;
+// Forgejo: APPROVED/REQUEST_CHANGES/COMMENT/…), and when it was submitted. It is the
+// same review stream the drivers fold into ReviewDecision, returned verbatim so the
+// detail view can list each reviewer's latest state; the fold (foldReviewDecision) is
+// the classification, this is the display list. GitLab has no per-reviewer review
+// stream (approvals are a separate Premium concept), so its driver returns none.
+// Author and State are UNTRUSTED forge text.
+type Review struct {
+	Author      string
+	State       string
+	SubmittedAt time.Time
+}
+
 // MergeRequestSummary is one open merge/pull request as the forge-view list route
 // observes it (PRD #1255 D5). It is a LIST-row shape: only the fields the pulls
 // screen bands, sorts and renders. Conflicts is a pointer because "unknown" is a
@@ -784,6 +799,15 @@ type Forge interface {
 	// (the honest degrade path). Errors are PAT-redacted; on GitHub a rate-limit
 	// surfaces as *RateLimitError (GitLab/Forgejo return a plain error; see RateLimitError).
 	ListWorkflowRuns(ctx context.Context, projectID int64, opts ListWorkflowRunsOptions) ([]WorkflowRun, error)
+	// ListMergeRequestReviews returns an open MR's per-reviewer reviews for the
+	// forge-view detail route (PRD #1255 D6), oldest-first — the same review stream the
+	// driver folds into ReviewDecision, returned verbatim (State is the raw forge value)
+	// so the PR view can render each reviewer's latest state. GitHub reads
+	// PullRequests.ListReviews; Forgejo reads /pulls/{iid}/reviews; GitLab returns an
+	// empty slice (no per-reviewer review stream on the free tier — its decision is the
+	// BlockingDiscussionsResolved / approvals approximation, not a review list). Every
+	// string field is untrusted forge text; errors are PAT-redacted.
+	ListMergeRequestReviews(ctx context.Context, projectID, mrIID int64) ([]Review, error)
 	// ProjectCIConfigPath returns the project's configured CI config path (GitLab
 	// ci_config_path); empty string means the driver's default (.gitlab-ci.yml). It
 	// carries no secret material — a project's ci_config_path is a repo-relative
