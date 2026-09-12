@@ -72,3 +72,62 @@ func FailedStatuses() []string {
 func IsSuccess(status string) bool {
 	return status == "success"
 }
+
+// tones is the Go twin of web/src/lib/pipelineBadge.ts's PIPELINE_TONES: the ONE
+// merged, forge-BLIND map from a raw pipeline/job/check status to its five-tone UI
+// class (passed|failed|running|attention|neutral). It is transcribed verbatim from
+// that file, and TestMirrorsWebPipelineBadge parses the TS at test time and asserts
+// SET EQUALITY both ways plus per-key agreement, so the two classifiers cannot drift
+// silently. The forge view (PRD #1255) needs a Go tone classifier — the TUI colours
+// its checks/runs/PRs off it — where before only IsFailed/IsSuccess existed; those
+// two stay as-is (a deliberately narrower fix-trigger set, PRD #238 D8).
+//
+// Keep this map and pipelineBadge.ts's PIPELINE_TONES identical: add a status to
+// BOTH or the drift test reddens.
+var tones = map[string]string{
+	// shared, same meaning on both/all forges
+	"success": "passed",
+	"running": "running",
+	"pending": "running",
+	"skipped": "neutral",
+	// GitLab
+	"failed":               "failed",
+	"created":              "running",
+	"waiting_for_resource": "running",
+	"preparing":            "running",
+	"scheduled":            "running",
+	"manual":               "attention",
+	"canceled":             "neutral",
+	// Forgejo Actions run status (also covers GitHub's shared strings)
+	"failure":   "failed",
+	"cancelled": "neutral",
+	"waiting":   "running",
+	"blocked":   "running",
+	"unknown":   "neutral",
+	// Forgejo CommitStatusState extras
+	"error":   "failed",
+	"warning": "attention",
+	// GitHub Actions run/job status (in-flight)
+	"queued":      "running",
+	"in_progress": "running",
+	"requested":   "running",
+	// GitHub Actions conclusion (terminal)
+	"timed_out":       "failed",
+	"startup_failure": "failed",
+	"action_required": "attention",
+	"neutral":         "neutral",
+	"stale":           "neutral",
+}
+
+// Tone maps a raw forge pipeline/job/check status to its five-tone UI class
+// (passed|failed|running|attention|neutral), the Go twin of pipelineBadge.ts's
+// pipelineTone. An unknown status is "neutral" — never a crash and never a false
+// green/red — mirroring the web's `?? "neutral"` fallback. The driver stores each
+// forge's status verbatim (see the package doc), so this fold is what lets the TUI
+// and the web never colour one status two ways.
+func Tone(status string) string {
+	if t, ok := tones[status]; ok {
+		return t
+	}
+	return "neutral"
+}

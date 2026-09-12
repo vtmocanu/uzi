@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"text/tabwriter"
+	"time"
 )
 
 // Exit codes, documented in the SKILL.md so agents branch without parsing prose
@@ -34,6 +35,13 @@ const (
 type ExitError struct {
 	Code int
 	Err  error
+	// RetryAfter is the server's Retry-After hint on a 429 (a rate-limit shed),
+	// zero when the server sent none or the status is not 429. It is advisory: the
+	// exit code stays ExitUnreachable, but a polling caller (`uzi pr checks --watch`)
+	// reads it to back off for exactly the window the server asked for instead of a
+	// fixed cadence. Nothing depends on it for control flow, so a zero value simply
+	// falls back to the caller's own default interval.
+	RetryAfter time.Duration
 }
 
 func (e *ExitError) Error() string {

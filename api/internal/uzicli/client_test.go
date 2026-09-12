@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 )
@@ -559,6 +560,7 @@ func TestHTTPClientStatusMapping(t *testing.T) {
 		{http.StatusNotFound, ExitNotFound},
 		{http.StatusConflict, ExitConflict},
 		{http.StatusRequestEntityTooLarge, ExitUsage}, // oversize body keeps the 400's exit code across the 413 flip
+		{http.StatusTooManyRequests, ExitUnreachable}, // a 429 rate-limit shed is transient like a 5xx, NOT generic (PRD #1255 M3)
 		{http.StatusInternalServerError, ExitUnreachable},
 		{http.StatusBadGateway, ExitUnreachable},
 		{http.StatusTeapot, ExitGeneric}, // an unenumerated 4xx falls to generic
@@ -573,6 +575,32 @@ func TestHTTPClientStatusMapping(t *testing.T) {
 		if got != tc.want {
 			t.Errorf("status %d: exit = %d, want %d", tc.status, got, tc.want)
 		}
+	}
+}
+
+// A 429 maps to ExitUnreachable and its *ExitError carries the parsed Retry-After
+// so a polling caller (`uzi pr checks --watch`) can back off for exactly that window
+// (PRD #1255 M3). The message folds in both the server's reason and the hint.
+func TestHTTPClient429CarriesRetryAfter(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "7")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":"the forge rate-limited this request"}`))
+	}))
+	defer srv.Close()
+	_, err := newTestClient(srv).Whoami(context.Background())
+	if ExitCodeFor(err) != ExitUnreachable {
+		t.Fatalf("429 exit = %d, want %d", ExitCodeFor(err), ExitUnreachable)
+	}
+	var ee *ExitError
+	if !errors.As(err, &ee) {
+		t.Fatalf("429 err is not *ExitError: %v", err)
+	}
+	if ee.RetryAfter != 7*time.Second {
+		t.Errorf("RetryAfter = %v, want 7s", ee.RetryAfter)
+	}
+	if !strings.Contains(err.Error(), "rate-limited") {
+		t.Errorf("429 message = %q, want the server's rate-limit reason", err.Error())
 	}
 }
 

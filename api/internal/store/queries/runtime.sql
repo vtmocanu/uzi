@@ -2236,6 +2236,20 @@ WHERE repo_id = @repo_id::uuid AND mr_iid = @mr_iid
   AND kind = 'mr_rework'
   AND status NOT IN ('completed', 'failed', 'cancelled');
 
+-- name: NewestRunForMR :one
+-- The single newest run uzi opened against a (repo, MR), any kind and any status.
+-- The forge-view pulls list joins each open PR to its newest uzi run through this
+-- (repo_id, mr_iid) lookup so a `↳ run` link needs no second query (PRD #1255 D4).
+-- Unlike GetActiveMRReworkRunForMR above it drops the kind/status filters — the newest
+-- run of ANY kind is the link. The sole caller (newestRunIDForMR) needs only that newest
+-- row, and ListPulls repeats this lookup per open PR, so it is bounded to one row with
+-- LIMIT 1 rather than materializing every matching run. The (repo_id, mr_iid) index
+-- (migration 00167) serves the filter; no-row is pgx.ErrNoRows, mapped to "no link".
+SELECT * FROM runs
+WHERE repo_id = @repo_id::uuid AND mr_iid = @mr_iid
+ORDER BY created_at DESC
+LIMIT 1;
+
 -- name: CancelRunByWorker :execrows
 -- Live-worker cancel transition (PRD #503 M1). When a LIVE worker consumes a cancel
 -- verdict it reports `failed`; SetState's failed arm routes HERE off the run's already

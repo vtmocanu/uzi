@@ -72,6 +72,25 @@ func (h *Handler) mountRepoRoutes(r chi.Router, forgeLimiter, boardOrderLimiter 
 			// board-access controls stay on RequireAuth (cookie-only) below — web-only.
 			r.Get("/{id}/github-project-sync", h.GetGithubProjectSyncStatus)
 			r.Post("/{id}/github-project-sync/resync", h.ResyncGithubProjectSync)
+			// Forge views (PRD #1255 M2a): read-only open-pulls and CI-runs reads for the
+			// TUI/CLI. RequireUser (NOT the cookie-only RequireAuth group below) so the
+			// CLI's uzc_ Bearer reaches them — a cookie-only mount would 401 it. Each
+			// proxies the repo's forge on demand (ListMergeRequestRefs/ListChecks/
+			// ListWorkflowRuns), so it carries the per-user forge budget with
+			// forgeLimiter.PerUserMiddleware applied AFTER RequireUser (the :28-30 rule).
+			// Owner-scoped + enabled-gated inside each handler (repoForRequest → 404 for a
+			// foreign/unknown repo; a disabled repo 404s too).
+			r.With(forgeLimiter.PerUserMiddleware).Get("/{id}/pulls", h.ListPulls)
+			r.With(forgeLimiter.PerUserMiddleware).Get("/{id}/pulls/{iid}", h.GetPull)
+			r.With(forgeLimiter.PerUserMiddleware).Get("/{id}/ci/runs", h.ListCIRuns)
+			r.With(forgeLimiter.PerUserMiddleware).Get("/{id}/ci/runs/{run_id}", h.GetCIRun)
+			// Queue a CI-fix run for a failed pipeline (PRD #6, moved here by PRD #1255
+			// D12). It was cookie-only (RequireAuth) but the TUI's `f fix ci` and
+			// `uzi ci fix` need it over a uzc_ Bearer, and it has no IsAdmin-dependent
+			// branch (unlike PatchRepo/SetRepoEnabled which stay cookie-only) — same
+			// posture as POST /{id}/rework and /{id}/runs. Snapshots the failed pipeline's
+			// jobs + logs from the forge → per-user forge budget.
+			r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/ci-fix-runs", h.CreateCIFixRun)
 		})
 		r.Group(func(r chi.Router) {
 			r.Use(mw.RequireAuth(h.q, h.cfg))
@@ -141,9 +160,8 @@ func (h *Handler) mountRepoRoutes(r chi.Router, forgeLimiter, boardOrderLimiter 
 			r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/sync", h.SyncRepo)
 			// Create a PRD issue on the forge (source of truth) → per-user budget.
 			r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/issues", h.CreateIssue)
-			// Queue a CI-fix run for a failed pipeline (PRD #6). Snapshots the
-			// failed pipeline's jobs + logs from the forge → per-user budget.
-			r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/ci-fix-runs", h.CreateCIFixRun)
+			// POST /{id}/ci-fix-runs moved UP to the RequireUser group (PRD #1255 D12) so
+			// the TUI/CLI reach it over a Bearer token — see the mount there.
 		})
 	})
 }

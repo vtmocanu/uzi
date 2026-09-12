@@ -97,6 +97,18 @@ func contractCases() []contractCase {
 		// shape as AgentMemoryDTO. The zero-fixture check stays non-vacuous by pinning the
 		// always-present key set.
 		newContractCase[IncidentalFindingDTO]("finding"),
+		// PRD #1255 M2a: the forge-view read DTOs (pulls list + drill-in, CI runs list +
+		// drill-in). PullDetailDTO embeds PullDTO and CIRunDetailDTO embeds CIRunDTO, so
+		// their full fixtures carry the embedded scalars inline (like RunListItemDTO).
+		newContractCase[PullDTO]("pull"),
+		newContractCase[PullDetailDTO]("pull_detail"),
+		newContractCase[CheckDTO]("check"),
+		newContractCase[PullReviewDTO]("pull_review"),
+		newContractCase[MergeStateDTO]("merge_state"),
+		newContractCase[CIRunDTO]("ci_run"),
+		newContractCase[CIRunDetailDTO]("ci_run_detail"),
+		newContractCase[CIJobDTO]("ci_job"),
+		newContractCase[CIStepDTO]("ci_step"),
 	}
 }
 

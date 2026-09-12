@@ -1,0 +1,18 @@
+{
+  "iid": 0,
+  "title": "",
+  "author": "",
+  "source_branch": "",
+  "target_branch": "",
+  "head_sha": "",
+  "draft": false,
+  "conflicts": null,
+  "review_decision": "",
+  "web_url": "",
+  "additions": 0,
+  "deletions": 0,
+  "commits": 0,
+  "created_at": "0001-01-01T00:00:00Z",
+  "updated_at": "0001-01-01T00:00:00Z",
+  "run_id": null
+}

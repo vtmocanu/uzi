@@ -9,17 +9,17 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/forge"
 )
 
-// The forge.Forge interface has exactly 26 methods. This test invokes EVERY one
+// The forge.Forge interface has exactly 31 methods. This test invokes EVERY one
 // on a *BaseFake and asserts its default. It is both the contract proof (each
 // method returns what the package promises) AND the deadcode shield: the
 // compile-time `var _ forge.Forge = (*BaseFake)(nil)` assertion in basefake.go
 // creates NO reachability, so a BaseFake method that every fake overrides and
 // nothing else invokes could be flagged by `deadcode -test`. Actually calling
-// each method here is what keeps them all reachable — so all 26 must appear
-// below (24 action methods + 2 pipeline reads). A missing method defeats the
+// each method here is what keeps them all reachable — so all 31 must appear
+// below (29 action methods + 2 pipeline reads). A missing method defeats the
 // shield.
 
-// actionMethods are the 24 methods that default to notStubbed(<name>). Each
+// actionMethods are the 29 methods that default to notStubbed(<name>). Each
 // closure calls exactly one method and returns only its error return, so every
 // method is invoked and every arity collapses to a single comparable error.
 func actionMethods() []struct {
@@ -99,13 +99,33 @@ func actionMethods() []struct {
 			_, err := b.ProjectCIConfigPath(ctx, 1)
 			return err
 		}},
+		{"ListMergeRequestRefs", func(b *BaseFake) error {
+			_, err := b.ListMergeRequestRefs(ctx, 1, forge.ListMergeRequestsOptions{})
+			return err
+		}},
+		{"GetMergeRequestSummary", func(b *BaseFake) error {
+			_, err := b.GetMergeRequestSummary(ctx, 1, 2)
+			return err
+		}},
+		{"ListChecks", func(b *BaseFake) error {
+			_, err := b.ListChecks(ctx, 1, "deadbeef")
+			return err
+		}},
+		{"ListWorkflowRuns", func(b *BaseFake) error {
+			_, err := b.ListWorkflowRuns(ctx, 1, forge.ListWorkflowRunsOptions{})
+			return err
+		}},
+		{"ListMergeRequestReviews", func(b *BaseFake) error {
+			_, err := b.ListMergeRequestReviews(ctx, 1, 2)
+			return err
+		}},
 	}
 }
 
 func TestBaseFakeActionMethodsNotStubbed(t *testing.T) {
 	methods := actionMethods()
-	if len(methods) != 24 {
-		t.Fatalf("expected 24 action methods, got %d", len(methods))
+	if len(methods) != 29 {
+		t.Fatalf("expected 29 action methods, got %d", len(methods))
 	}
 	b := &BaseFake{}
 	for _, m := range methods {

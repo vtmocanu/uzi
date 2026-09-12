@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -26,6 +27,10 @@ type mockGitHub struct {
 	srv       *httptest.Server
 	gotAuth   string
 	labelPUTs int
+	// reqCount is the total number of HTTP requests the server received. It is
+	// atomic so the reserve-shed tests (github_rate_test.go) can assert a shed
+	// interactive read made ZERO forge calls without racing the server goroutine.
+	reqCount atomic.Int64
 }
 
 func newMockGitHub(t *testing.T, routes map[string]http.HandlerFunc) *mockGitHub {
@@ -55,6 +60,7 @@ func newMockGitHub(t *testing.T, routes map[string]http.HandlerFunc) *mockGitHub
 		mux.HandleFunc("/api/v3"+pattern, h)
 	}
 	m.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		m.reqCount.Add(1)
 		m.gotAuth = r.Header.Get("Authorization")
 		if r.Method == http.MethodPut && strings.HasSuffix(r.URL.Path, "/labels") {
 			m.labelPUTs++
@@ -586,7 +592,7 @@ func TestGitHubTokenInfo(t *testing.T) {
 // TestGitHubRedactsToken pins item-11: an error whose body echoes the PAT is
 // scrubbed before it leaves the package.
 func TestGitHubRedactsToken(t *testing.T) {
-	const token = "ghp_secretTokenValue1234567890abcd"
+	const token = "ghp_secretTokenValue1234567890abcd" //nolint:gosec // G101: fake fixture token, never a real secret //gitleaks:allow
 	m := newMockGitHub(t, map[string]http.HandlerFunc{
 		"/user": func(w http.ResponseWriter, _ *http.Request) {
 			// A hostile/broken forge reflecting the token into an error body.

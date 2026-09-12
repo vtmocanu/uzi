@@ -26,6 +26,15 @@ import type {
   AgentTemplate,
   SchedulePauseDTO,
   IncidentalFinding,
+  Pull,
+  PullDetail,
+  Check,
+  PullReview,
+  MergeState,
+  CIRun,
+  CIRunDetail,
+  CIJob,
+  CIStep,
 } from "./apiTypes";
 
 import runZero from "../../../fixtures/api-contract/run.zero.json";
@@ -78,6 +87,24 @@ import schedulePauseZero from "../../../fixtures/api-contract/schedule_pause.zer
 import schedulePauseFull from "../../../fixtures/api-contract/schedule_pause.full.json";
 import findingZero from "../../../fixtures/api-contract/finding.zero.json";
 import findingFull from "../../../fixtures/api-contract/finding.full.json";
+import pullZero from "../../../fixtures/api-contract/pull.zero.json";
+import pullFull from "../../../fixtures/api-contract/pull.full.json";
+import pullDetailZero from "../../../fixtures/api-contract/pull_detail.zero.json";
+import pullDetailFull from "../../../fixtures/api-contract/pull_detail.full.json";
+import checkZero from "../../../fixtures/api-contract/check.zero.json";
+import checkFull from "../../../fixtures/api-contract/check.full.json";
+import pullReviewZero from "../../../fixtures/api-contract/pull_review.zero.json";
+import pullReviewFull from "../../../fixtures/api-contract/pull_review.full.json";
+import mergeStateZero from "../../../fixtures/api-contract/merge_state.zero.json";
+import mergeStateFull from "../../../fixtures/api-contract/merge_state.full.json";
+import ciRunZero from "../../../fixtures/api-contract/ci_run.zero.json";
+import ciRunFull from "../../../fixtures/api-contract/ci_run.full.json";
+import ciRunDetailZero from "../../../fixtures/api-contract/ci_run_detail.zero.json";
+import ciRunDetailFull from "../../../fixtures/api-contract/ci_run_detail.full.json";
+import ciJobZero from "../../../fixtures/api-contract/ci_job.zero.json";
+import ciJobFull from "../../../fixtures/api-contract/ci_job.full.json";
+import ciStepZero from "../../../fixtures/api-contract/ci_step.zero.json";
+import ciStepFull from "../../../fixtures/api-contract/ci_step.full.json";
 
 // The api ⇄ SPA JSON wire-contract (PRD #982). This is the VITEST HALF; the Go
 // half is api/internal/apitypes/contract_test.go. Neither reads the other: each
@@ -570,6 +597,133 @@ type ZeroOf<T, NeverNull extends keyof T = never> = {
   void _findingFull;
 }
 
+// ── Pull (PRD #1255 M2a) ────────────────────────────────────────────────────
+// conflicts and run_id are typed `| null`, so the zero value's nulls are accepted with
+// no exemption. No slice fields on the list row (checks live only on PullDetail, D4).
+{
+  const _pullMissing: never = null as unknown as Exclude<keyof Pull, keyof typeof pullFull>;
+  const _pullExtra: never = null as unknown as Exclude<keyof typeof pullFull, keyof Pull>;
+  const _pullZero: ZeroOf<Pull> = pullZero;
+  const _pullFull: Widen<Pull> = pullFull;
+  void _pullMissing;
+  void _pullExtra;
+  void _pullZero;
+  void _pullFull;
+}
+
+// ── PullDetail (PRD #1255 M2a) ──────────────────────────────────────────────
+// PullDetail extends Pull, so its full fixture carries the Pull scalars inline. ZeroOf
+// exemptions: checks, reviews — the api always emits [] for an empty forge result, so
+// the wire is never null though json.Marshal(PullDetailDTO{}) marshals the nil slices
+// to null. merge is a nested object whose conflicts is natively `boolean | null`, so it
+// needs no exemption (Widen keeps it nullable).
+{
+  const _pullDetailMissing: never = null as unknown as Exclude<keyof PullDetail, keyof typeof pullDetailFull>;
+  const _pullDetailExtra: never = null as unknown as Exclude<keyof typeof pullDetailFull, keyof PullDetail>;
+  const _pullDetailZero: ZeroOf<PullDetail, "checks" | "reviews"> = pullDetailZero;
+  const _pullDetailFull: Widen<PullDetail> = pullDetailFull;
+  void _pullDetailMissing;
+  void _pullDetailExtra;
+  void _pullDetailZero;
+  void _pullDetailFull;
+}
+
+// ── Check (PRD #1255 M2a) ───────────────────────────────────────────────────
+// All-scalar (declared nullable:false below): its zero.json legitimately carries no null.
+{
+  const _checkMissing: never = null as unknown as Exclude<keyof Check, keyof typeof checkFull>;
+  const _checkExtra: never = null as unknown as Exclude<keyof typeof checkFull, keyof Check>;
+  const _checkZero: ZeroOf<Check> = checkZero;
+  const _checkFull: Widen<Check> = checkFull;
+  void _checkMissing;
+  void _checkExtra;
+  void _checkZero;
+  void _checkFull;
+}
+
+// ── PullReview (PRD #1255 M2a) ──────────────────────────────────────────────
+// All-scalar (declared nullable:false below): its zero.json legitimately carries no null.
+{
+  const _pullReviewMissing: never = null as unknown as Exclude<keyof PullReview, keyof typeof pullReviewFull>;
+  const _pullReviewExtra: never = null as unknown as Exclude<keyof typeof pullReviewFull, keyof PullReview>;
+  const _pullReviewZero: ZeroOf<PullReview> = pullReviewZero;
+  const _pullReviewFull: Widen<PullReview> = pullReviewFull;
+  void _pullReviewMissing;
+  void _pullReviewExtra;
+  void _pullReviewZero;
+  void _pullReviewFull;
+}
+
+// ── MergeState (PRD #1255 M2a) ──────────────────────────────────────────────
+// conflicts is typed `boolean | null`, so the zero value's null is accepted with no
+// exemption; the other fields are non-null scalars.
+{
+  const _mergeStateMissing: never = null as unknown as Exclude<keyof MergeState, keyof typeof mergeStateFull>;
+  const _mergeStateExtra: never = null as unknown as Exclude<keyof typeof mergeStateFull, keyof MergeState>;
+  const _mergeStateZero: ZeroOf<MergeState> = mergeStateZero;
+  const _mergeStateFull: Widen<MergeState> = mergeStateFull;
+  void _mergeStateMissing;
+  void _mergeStateExtra;
+  void _mergeStateZero;
+  void _mergeStateFull;
+}
+
+// ── CIRun (PRD #1255 M2a) ───────────────────────────────────────────────────
+// All-scalar (declared nullable:false below): its zero.json legitimately carries no null.
+{
+  const _ciRunMissing: never = null as unknown as Exclude<keyof CIRun, keyof typeof ciRunFull>;
+  const _ciRunExtra: never = null as unknown as Exclude<keyof typeof ciRunFull, keyof CIRun>;
+  const _ciRunZero: ZeroOf<CIRun> = ciRunZero;
+  const _ciRunFull: Widen<CIRun> = ciRunFull;
+  void _ciRunMissing;
+  void _ciRunExtra;
+  void _ciRunZero;
+  void _ciRunFull;
+}
+
+// ── CIRunDetail (PRD #1255 M2a) ─────────────────────────────────────────────
+// CIRunDetail extends CIRun (scalars inline in the full fixture). ZeroOf exemption:
+// jobs — the api always emits [] for an empty run, so the wire is never null though
+// the nil-slice zero marshals to null. unsupported is a non-null scalar.
+{
+  const _ciRunDetailMissing: never = null as unknown as Exclude<keyof CIRunDetail, keyof typeof ciRunDetailFull>;
+  const _ciRunDetailExtra: never = null as unknown as Exclude<keyof typeof ciRunDetailFull, keyof CIRunDetail>;
+  const _ciRunDetailZero: ZeroOf<CIRunDetail, "jobs"> = ciRunDetailZero;
+  const _ciRunDetailFull: Widen<CIRunDetail> = ciRunDetailFull;
+  void _ciRunDetailMissing;
+  void _ciRunDetailExtra;
+  void _ciRunDetailZero;
+  void _ciRunDetailFull;
+}
+
+// ── CIJob (PRD #1255 M2a) ───────────────────────────────────────────────────
+// ZeroOf exemption: steps — the api always emits [] (GitLab/Forgejo jobs have no
+// steps), so the wire is never null though the nil-slice zero marshals to null. This is
+// the only null in ci_job.zero.json, so ci_job is declared nullable:true below.
+{
+  const _ciJobMissing: never = null as unknown as Exclude<keyof CIJob, keyof typeof ciJobFull>;
+  const _ciJobExtra: never = null as unknown as Exclude<keyof typeof ciJobFull, keyof CIJob>;
+  const _ciJobZero: ZeroOf<CIJob, "steps"> = ciJobZero;
+  const _ciJobFull: Widen<CIJob> = ciJobFull;
+  void _ciJobMissing;
+  void _ciJobExtra;
+  void _ciJobZero;
+  void _ciJobFull;
+}
+
+// ── CIStep (PRD #1255 M2a) ──────────────────────────────────────────────────
+// All-scalar (declared nullable:false below): its zero.json legitimately carries no null.
+{
+  const _ciStepMissing: never = null as unknown as Exclude<keyof CIStep, keyof typeof ciStepFull>;
+  const _ciStepExtra: never = null as unknown as Exclude<keyof typeof ciStepFull, keyof CIStep>;
+  const _ciStepZero: ZeroOf<CIStep> = ciStepZero;
+  const _ciStepFull: Widen<CIStep> = ciStepFull;
+  void _ciStepMissing;
+  void _ciStepExtra;
+  void _ciStepZero;
+  void _ciStepFull;
+}
+
 // ── Runtime self-checks ─────────────────────────────────────────────────────
 // A contract that passes on a missing fixture, or on a zero.json with no null in
 // it, is the false-green shape this repo documents repeatedly. These fatal
@@ -633,6 +787,24 @@ const dtos: { stem: string; nullable: boolean }[] = [
   // AgentMemoryDTO, declared nullable:false rather than manufacturing a null by dropping an
   // existing field's omitempty (which would change the live findings wire).
   { stem: "finding", nullable: false },
+  // PRD #1255 M2a — the forge-view read DTOs.
+  // pull: conflicts + run_id are nullable, so zero.json carries a null.
+  { stem: "pull", nullable: true },
+  // pull_detail: conflicts/run_id/checks/reviews + merge.conflicts all null in zero.json.
+  { stem: "pull_detail", nullable: true },
+  // check / pull_review: all-scalar, zero.json legitimately carries no null.
+  { stem: "check", nullable: false },
+  { stem: "pull_review", nullable: false },
+  // merge_state: conflicts is nullable, so zero.json carries a null.
+  { stem: "merge_state", nullable: true },
+  // ci_run: all-scalar, no null.
+  { stem: "ci_run", nullable: false },
+  // ci_run_detail: jobs (nil slice) is null in zero.json.
+  { stem: "ci_run_detail", nullable: true },
+  // ci_job: steps (nil slice) is null in zero.json.
+  { stem: "ci_job", nullable: true },
+  // ci_step: all-scalar, no null.
+  { stem: "ci_step", nullable: false },
 ];
 
 describe("api-contract fixtures are present and discriminating", () => {

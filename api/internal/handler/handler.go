@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -20,6 +21,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/config"
 	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/forgememo"
 	"github.com/vtmocanu/uzi/api/internal/forgesvc"
 	"github.com/vtmocanu/uzi/api/internal/hostedsvc"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
@@ -54,6 +56,32 @@ type Handler struct {
 	// without a live database. nil in production — the accessor falls back to h.q.
 	// Deliberately narrow (see vaultNoticeClaimer), mirroring tmplWriteStore.
 	vaultNoticeStore vaultNoticeClaimer
+	// forgeFactory, when non-nil, replaces h.svc.ForgeForConnection for the forge-view
+	// read routes (PRD #1255 M2a), so their handlers can be exercised against a
+	// forgetest.BaseFake without a live forge or a wired forgesvc.Service (the auth
+	// live-DB suite injects one). nil in production — New leaves it unset and
+	// forgeForConnection falls back to h.svc. Mirrors tmplWriteStore/vaultNoticeStore.
+	forgeFactory func(forgeType, baseURL string, tokenCiphertext []byte) (forge.Forge, error)
+	// forgeMemo folds duplicate forge reads under the forge-view routes (PRD #1255
+	// M2b, D4): a short-TTL + singleflight memo so N terminals polling one PR cost
+	// one forge round-trip per TTL window, and an unchanged PR costs zero enrichment.
+	// It is effectively process-wide (one Handler per server), constructed in New.
+	// Every key is tenant-scoped by forgeMemoPrefix (connection + token-ciphertext
+	// hash + repo id) so singleflight never serves one connection's data to another.
+	// Accessed only through memo(), which lazily constructs it under forgeMemoOnce so
+	// a struct-literal test Handler (cliLiveDB builds one directly, not via New) is
+	// race-safe under -race without every construction site having to set the field.
+	forgeMemo     *forgememo.Cache
+	forgeMemoOnce sync.Once
+	// forgeBudget is the per-connection outbound SPEND budget over interactive forge
+	// reads (PRD #1255 D4): a token bucket refilling at cfg.ForgeInteractiveRateMax
+	// calls/min, charged at the forge-call site of the forge-view routes so the
+	// enrichment fan-out is charged too and an interactive reader cannot starve the
+	// poller (both ride the same PAT). Accessed only through budget(), which lazily
+	// constructs it under forgeBudgetOnce so a struct-literal test Handler (cliLiveDB)
+	// never nil-panics, mirroring forgeMemo/memo(). New sets it directly.
+	forgeBudget     *forgeBudget
+	forgeBudgetOnce sync.Once
 	// box is the generic secret cipher used by the per-user secret endpoints
 	// (Anthropic token). svc owns the forge-specific machinery (which also holds
 	// its own box for PAT sealing); the two share the same key material.
@@ -350,6 +378,46 @@ func (h *Handler) templateWriteStore() agentTemplateWriteStore {
 	return h.q
 }
 
+// forgeForConnection builds a forge driver for a repo's connection, going through the
+// injected forgeFactory when one is set (the forge-view auth test) and otherwise
+// through the real forgesvc.Service. nil-safe only when a factory is injected; in
+// production h.svc is always wired.
+func (h *Handler) forgeForConnection(forgeType, baseURL string, tokenCiphertext []byte) (forge.Forge, error) {
+	if h.forgeFactory != nil {
+		return h.forgeFactory(forgeType, baseURL, tokenCiphertext)
+	}
+	return h.svc.ForgeForConnection(forgeType, baseURL, tokenCiphertext)
+}
+
+// memo returns the process-wide forge-view read memo (PRD #1255 M2b), constructing
+// it lazily and exactly once. New sets h.forgeMemo directly; this accessor covers a
+// struct-literal test Handler (cliLiveDB) where New did not run, so the forge-view
+// routes never dereference a nil cache and two concurrent requests race-safely see
+// the same instance. forgememo.New(256, 512 KiB) is the D4 LRU/byte bound.
+func (h *Handler) memo() *forgememo.Cache {
+	h.forgeMemoOnce.Do(func() {
+		if h.forgeMemo == nil {
+			h.forgeMemo = forgememo.New(forgeMemoEntries, forgeMemoMaxBytes)
+		}
+	})
+	return h.forgeMemo
+}
+
+// budget returns the per-connection interactive-read outbound spend budget (PRD #1255
+// D4), constructing it lazily and exactly once. New sets h.forgeBudget directly; this
+// accessor covers a struct-literal test Handler (cliLiveDB) where New did not run, so
+// the forge-view routes never dereference a nil budget. It is built from
+// cfg.ForgeInteractiveRateMax with h.now as the clock (both zero on a struct-literal
+// handler: max 0 reads as unlimited, a nil clock defaults to time.Now). Mirrors memo().
+func (h *Handler) budget() *forgeBudget {
+	h.forgeBudgetOnce.Do(func() {
+		if h.forgeBudget == nil {
+			h.forgeBudget = newForgeBudget(h.cfg.ForgeInteractiveRateMax, h.now)
+		}
+	})
+	return h.forgeBudget
+}
+
 // vaultNoticeClaimer is the narrow slice of *store.Queries VaultLock touches to pre-ack a
 // deliberate lock (PRD #890 D6). Kept narrow, and injectable via vaultNoticeStore, so the
 // pre-ack can be unit-tested without a live database. *store.Queries satisfies it.
@@ -396,7 +464,7 @@ func New(pool *pgxpool.Pool, q *store.Queries, cfg config.Config, box *secretbox
 	// too (PRD #590 M1): the run-now scheduler is nil-safe on the vault (treated as always
 	// unlocked), so a manual self_improve run-now never skips on a vault it cannot see here.
 	scheduler := schedsvc.New(q, wsvc, svc, set, nil, nil, 0, slog.Default())
-	return &Handler{pool: pool, q: q, cfg: cfg, box: box, svc: svc, wsvc: wsvc, pcheck: pcheck, hub: h, settings: set, scheduler: scheduler, version: "dev", now: time.Now, startedAt: time.Now()}
+	return &Handler{pool: pool, q: q, cfg: cfg, box: box, svc: svc, wsvc: wsvc, pcheck: pcheck, hub: h, settings: set, scheduler: scheduler, forgeMemo: forgememo.New(forgeMemoEntries, forgeMemoMaxBytes), forgeBudget: newForgeBudget(cfg.ForgeInteractiveRateMax, time.Now), version: "dev", now: time.Now, startedAt: time.Now()}
 }
 
 // SetVersion stamps the server build version served at GET /api/version. Called
