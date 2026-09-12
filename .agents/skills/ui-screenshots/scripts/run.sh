@@ -22,7 +22,7 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$URL" ] || URL="$(uzi auth status 2>/dev/null | awk '/^URL/{print $2}')"
 [ -n "$URL" ] || { echo "no --url and could not read it from 'uzi auth status'" >&2; exit 2; }
-[ -n "$STAGE" ] || STAGE="${TMPDIR:-/tmp}/uzi-ui-shots"
+[ -n "$STAGE" ] || STAGE="$(mktemp -d "${TMPDIR:-/tmp}/uzi-ui-shots.XXXXXX")" # unique per run so stale shots from a prior capture can't be published
 
 command -v node >/dev/null 2>&1 || { echo "node not found on PATH" >&2; exit 4; }
 # Provision playwright-core into a cache dir OUTSIDE the skill (keeps the skill dir

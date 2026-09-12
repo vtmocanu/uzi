@@ -139,9 +139,11 @@ async function shoot(shot, theme) {
   if (shot.needs === "run") { if (!RUN) { console.log(`skip ${shot.slug}: needs --run (state: ${shot.state || ""})`); return; } route = route.replace("{run}", RUN); }
 
   // downgrade guard 1: run must be in an expected state, else the shot shows less than the current image.
-  if (shot.requireStatus && runStatusVal && !shot.requireStatus.includes(runStatusVal) && !FORCE_THIN) {
-    console.log(`  ⚠ SKIP ${shot.slug}-${theme}: run status '${runStatusVal}' not in [${shot.requireStatus.join(", ")}] — would be a downgrade, keep the current image`);
-    flags.push(`${shot.slug}: wrong run state (${runStatusVal}); want ${shot.requireStatus.join("/")}`);
+  // Fail closed: skip when the status is unknown (lookup failed) or does not match,
+  // so a null read never lets a possibly-wrong page through. FORCE_THIN still bypasses.
+  if (shot.requireStatus && !FORCE_THIN && !(runStatusVal && shot.requireStatus.includes(runStatusVal))) {
+    console.log(`  ⚠ SKIP ${shot.slug}-${theme}: run status '${runStatusVal ?? "unknown"}' not in [${shot.requireStatus.join(", ")}] — would be a downgrade, keep the current image`);
+    flags.push(`${shot.slug}: wrong run state (${runStatusVal ?? "unknown"}); want ${shot.requireStatus.join("/")}`);
     return;
   }
 

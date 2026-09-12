@@ -24,8 +24,16 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$URL" ] || URL="$(uzi auth status 2>/dev/null | awk '/^URL/{print $2}')"
 [ -n "$REPO" ] || { echo "--repo <uzi-repo-id> required (see 'uzi repo list')" >&2; exit 2; }
-[ -n "$STAGE" ] || STAGE="${TMPDIR:-/tmp}/uzi-ui-shots"
+[ -n "$STAGE" ] || STAGE="$(mktemp -d "${TMPDIR:-/tmp}/uzi-ui-shots.XXXXXX")" # unique per run so stale shots can't be published
 LABEL="screenshot-fixture"
+
+# Serialize: this fixture reuses one shared issue, and cleanup() removes ALL
+# agent/issue-$IID PRs plus the branch, so two overlapping runs would delete each
+# other's resources. Guard with an atomic mkdir lock (portable; flock is absent on
+# macOS), released by the cleanup trap (and by an early trap until that one is set).
+LOCKDIR="${TMPDIR:-/tmp}/uzi-plan-gate-fixture.$(printf '%s' "$GHREPO" | tr '/:' '__').lock"
+mkdir "$LOCKDIR" 2>/dev/null || { echo "another plan-gate-fixture run holds $LOCKDIR (remove it if stale)" >&2; exit 6; }
+trap 'rmdir "$LOCKDIR" 2>/dev/null || true' EXIT
 
 # 1) ensure the fixture label + a permanent fixture issue exist, with a 3-milestone
 # body so the PROPOSED PLAN reads as a real multi-milestone plan (not a no-op). Each
@@ -71,6 +79,7 @@ cleanup() {
   done
   gh api -X DELETE "repos/$GHREPO/git/refs/heads/agent/issue-$IID" >/dev/null 2>&1 || true
   gh issue close "$IID" --repo "$GHREPO" >/dev/null 2>&1 || true
+  rmdir "$LOCKDIR" 2>/dev/null || true
   echo "cleaned up: run cancelled, any branch/MR removed, issue #$IID closed."
 }
 trap cleanup EXIT

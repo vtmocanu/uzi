@@ -56,3 +56,4 @@ for (const shot of M.shots) {
   }
 }
 console.log(DRY ? "dry run: nothing copied" : `done: ${copied} file(s) copied${missing ? `, ${missing} missing in stage` : ""}`);
+if (missing) process.exitCode = 1; // a requested --only variant was missing: fail so a wrapper doesn't report success
