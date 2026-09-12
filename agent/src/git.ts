@@ -11,6 +11,7 @@ import type { BoundaryProcessHandle, BoundaryProcessRequest } from "./harness.js
 import { runnerCommand, runnerPath, runnerTmpdir } from "./runner-uid.js";
 import { withForgeRetry } from "./forge-retry.js";
 import { flagCIConfigPaths } from "./ci-config-guard.js";
+import { rmTreeForce } from "./rmtree.js";
 import {
   commitsScannedFromStderr,
   gitleaksArgs,
@@ -572,7 +573,13 @@ export class GitCache {
         }
         throw new PendingRecoveryCaptureError(clonePath, branch);
       }
-      await fs.rm(clonePath, { recursive: true, force: true });
+      // issue #1308 — pre-seed cleanup of a stale (unjournaled) leftover goes through the
+      // same hardened removal (`rmTreeForce`) as terminal cleanup, so an `ENOTEMPTY`/`EBUSY`
+      // leftover does not fail the reseed's `git clone` into a non-empty <key> dir. Calls
+      // `rmTreeForce` directly rather than `this.removeRunnerClone` so the reseed's pre-seed
+      // rm keeps its own identity — `removeRunnerClone` names ONLY the terminal-cleanup /
+      // reclaim removal that recovery tests intercept and barrier on.
+      await rmTreeForce(clonePath);
       // The clone's parent dir. Under the M4 split it must be group-`runner`-writable so
       // the runner-uid `git clone` can create <key> inside it: /data/runner is
       // worker:runner 2775 (setgid) from the entrypoint, and the worker runs with umask
@@ -1589,9 +1596,15 @@ export class GitCache {
   }
 
   /** Remove the run's runner clone (a standalone clone, not a linked worktree — no
-   *  bare interaction). The warm bare and the fetched refs/objects are kept. */
+   *  bare interaction). The warm bare and the fetched refs/objects are kept.
+   *
+   *  issue #1308 — routed through `rmTreeForce` so it gets BOTH the `EACCES`/`EPERM`
+   *  directory-writability repair (a `go build` leaves 0555 module-cache dirs) AND
+   *  the bounded `ENOTEMPTY`/`EBUSY` retries (a lingering writer under a cache dir,
+   *  e.g. `web/node_modules/.vite`). A plain `fs.rm` threw `ENOTEMPTY` here and leaked
+   *  the recovery journal, which bricked later runs on the branch. */
   async removeRunnerClone(clonePath: string): Promise<void> {
-    await fs.rm(clonePath, { recursive: true, force: true });
+    await rmTreeForce(clonePath);
   }
 
   /**
