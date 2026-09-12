@@ -419,22 +419,26 @@ var inventoryQueryFiles = []string{
 // parsed for the declared test function names. A pin living outside these fails with a
 // message saying so rather than silently passing.
 //
-// This list follows the rule the red note below states: it is extended in the SAME commit that
-// lands the first live-DB test in a new package needing a truthful pin. At `041c5291` the set was
-// two entries — internal/store and internal/handler — because those were the only dirs with a
-// `func Test*LiveDB(`. PRD #1184 M1 (admin "All users" judge aggregate) added the first live-DB
-// test in internal/workersvc, TestAdminJudgeAggregateLiveDB, which exercises
-// ListJudgeRecommendationRowsAll and ListJudgeTriageRowsAll through svc.AdminJudge* — so
-// ../workersvc is added here so those two pins can name a REAL test rather than a sentinel.
-// Re-run `rg -l 'func Test.*LiveDB\(' internal/ cmd/ | xargs -n1 dirname | sort -u` rather than
-// trusting this sentence.
+// A package belongs in this list exactly when some pin's `test` names a test DECLARED in that
+// package — NOT when the package merely happens to have live-DB tests. internal/workersvc, for
+// one, has had many `func Test*LiveDB(` functions all along, but no pin ever needed to name one:
+// every query was pinned to a test in internal/store or internal/handler. PRD #1184 M1 (admin
+// "All users" judge aggregate) is the first time a pin must name a workersvc test —
+// ListJudgeRecommendationRowsAll and ListJudgeTriageRowsAll are reached only through
+// svc.AdminJudge*, and the truthful pin for them names TestAdminJudgeAggregateLiveDB, which is
+// declared in ../workersvc. So ../workersvc is added here so those two pins can name a REAL test
+// rather than a sentinel/declared-gap row. Re-run
+// `rg -l 'func Test.*LiveDB\(' internal/ cmd/ | xargs -n1 dirname | sort -u` to see which dirs
+// HAVE live-DB tests, but remember the trigger is a pin, not that list.
 //
-// 🔴 THE DAY A NEW PACKAGE GETS ITS FIRST LIVE-DB TEST, EXTEND THIS LIST — DO NOT WRITE A
-// SENTINEL ROW. A live-DB test landing in internal/poller, internal/forgesvc or cmd/uzi makes a
-// TRUTHFUL pin fail the existence check below, and the cheapest way out is to record the query
-// as a declared gap, which is a lie that reads as an audit — the exact failure this file
-// exists to prevent. The failure message names this remedy FIRST for that reason. (../workersvc
-// was added exactly this way in PRD #1184 M1; do the same for the next package.)
+// 🔴 WHEN A PIN MUST NAME A TEST IN A NOT-YET-LISTED PACKAGE, EXTEND THIS LIST — DO NOT WRITE A
+// SENTINEL ROW. A truthful pin naming a test in internal/poller, internal/forgesvc,
+// internal/schedsvc or cmd/uzi fails the existence check below, and the cheapest way out is to
+// record the query as a declared gap, which is a lie that reads as an audit — the exact failure
+// this file exists to prevent. The failure message names this remedy FIRST for that reason.
+// (../workersvc was added exactly this way in PRD #1184 M1; do the same for the next package.)
+// A package having live-DB tests is NOT itself the trigger: internal/forgesvc and internal/schedsvc
+// both have live-DB tests today and are correctly ABSENT here, because no pin names a test in them.
 //
 // A package is added when the row that needs it exists, in that commit — never pre-extended,
 // because the check that proves an extension works is "a truthful pin naming a real test in the
