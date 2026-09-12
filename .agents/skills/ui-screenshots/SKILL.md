@@ -1,139 +1,94 @@
 ---
 name: ui-screenshots
-description: "Captures clean, demo-masked screenshots of the uzi web UI for the blog, docs, and README, fast. Fronts a logged-in browser window through Orca computer-use, retries until a Retina (2x) capture lands, and auto-crops the browser chrome (sidebar, toolbar, rounded window border) with no hardcoded coordinates. Takes the uzi instance URL as an argument and never hardcodes it, so it is safe in this public repo. Use when capturing or refreshing uzi UI screenshots for the blog, docs, or README. Triggers include uzi screenshots, blog screenshots, readme screenshots, refresh the screenshots, screenshot the uzi UI, capture the UI."
+description: "Captures clean, demo-masked uzi web UI screenshots in BOTH light (Dawn) and dark (Ember) themes for the blog and README, fast and deterministically. Drives a logged-in Chrome over CDP - ensures demo mode on, flips instance branding to vanilla (built-in uzi mark, no powered-by) then restores it, forces each theme, leak-scans, and captures the app viewport at 2x with no browser chrome. shots.json is the manifest of every screenshot and where it lands. Use when capturing or refreshing uzi UI screenshots for the blog or README. Triggers include uzi screenshots, blog screenshots, readme screenshots, refresh the screenshots, screenshot the uzi UI, regenerate screenshots."
 ---
 
-# ui-screenshots — capture clean uzi web UI screenshots
+# ui-screenshots — capture uzi web UI screenshots (light + dark)
 
-Turn the live uzi web UI into publication-ready screenshots: capture a browser
-window at Retina resolution, then crop away all browser chrome so only the uzi UI
-remains. Two bundled scripts do the deterministic work; you drive the browser
-between shots.
+Regenerate publication-ready uzi UI screenshots in both themes, straight from a
+logged-in Chrome over CDP. The engine captures the app **viewport only** (no browser
+chrome, no crop) at deviceScaleFactor 2, so light and dark both come out crisp.
+`shots.json` is the single source of truth: every screenshot, how to capture it, and
+whether it lands in the README, the blog, or both.
 
-**The instance URL is always an argument, never hardcoded.** This repo is public,
-so no concrete instance host (for example a company dev URL) belongs in this skill,
-a script, or a commit. Ask for the URL if it was not given, or read `UZI_URL` /
-`uzi auth status`.
+**The instance URL is always an argument** (or read from `uzi auth status`), never
+hardcoded — this repo is public, so no instance host belongs in a script or commit.
 
 ## Prerequisites
 
-- **macOS.** Capture uses `screencapture` (needs Screen Recording permission for the
-  terminal) and `osascript` (needs Automation permission for System Events).
-- **Orca computer-use** (`orca` on PATH, or `$ORCA_CLI_COMMAND`) is needed **only for
-  `--url` navigation** and for clicking between views. Load the `computer-use` skill for
-  selector discovery. The capture itself does not use Orca.
-- **A desktop browser logged in to the uzi instance.** The scripts screenshot an
-  existing window; they do not log in.
-- **Demo mode ON in that browser** (see below). Non-negotiable for anything public.
-- **ImageMagick** (`magick`) for cropping.
+- **macOS + Google Chrome** at `/Applications/Google Chrome.app`.
+- **node** on PATH (run.sh self-provisions `playwright-core` into a cache dir `~/.cache/uzi-ui-screenshots`, kept out of the skill tree).
+- **`uzi` CLI** logged in (`uzi auth status`) — used only to resolve the instance URL.
+- **Admin on the instance** — the branding vanilla-flip uses `PUT /api/admin/settings`. Without admin, pass `--no-branding` and set branding by hand first.
 
-## Step 1 — turn on demo mode (masks identifying data)
-
-Demo mode is a per-device toggle stored in the browser's `localStorage`, off by
-default, server-side data untouched. Turn it on in the target browser: **Settings
--> Demo mode**, or the quick toggle in the sidebar user area. It masks email and
-display name to a first name, repo owner/namespace to `demo/<repo>`, the forge host
-to a placeholder, and forge usernames to `demo-user` / `demo-bot`.
-
-It is per-browser and per-device, so it does not follow a login to another browser.
-**Always confirm the masking is visible in the captured image before saving it** (no
-real email, repo owner, or host). If a shot leaks real data, demo mode was off in
-that browser.
-
-## Step 2 — find the browser window
+## Flow
 
 ```
-orca computer list-apps --json
-orca computer list-windows --app <bundle-id> --json
+launch-chrome.sh <url>          # app-mode Chrome + CDP + persistent profile; log in ONCE
+  -> run.sh [--only …] [--repo …] [--run …]   # stages <slug>-light.png / <slug>-dark.png, leak-scans
+  -> review every staged PNG (Read it): layout right, nothing sensitive leaked
+  -> publish-shots.mjs           # copies reviewed pairs to README + blog dirs
+  -> swap-markup.mjs (first time only)   # README <img> -> <picture>, blog html.dark swap
 ```
 
-Common bundle ids: `app.zen-browser.zen`, `com.google.Chrome`, `com.apple.Safari`,
-`com.microsoft.edgemac`. Navigate that window to the uzi view you want (see
-*Navigating* below).
+1. **Launch + log in once:**
+   ```
+   <skill dir>/scripts/launch-chrome.sh "$(uzi auth status | awk '/^URL/{print $2}')"
+   ```
+   Log in in that window if the SSO page shows; the profile persists the session.
 
-## Step 3 — capture at Retina
+2. **Capture (stages both themes, leak-scans):**
+   ```
+   <skill dir>/scripts/run.sh --stage /tmp/uzi-ui-shots --only dashboard,schedules,mobile-overview,mobile-runs,mobile-nav
+   ```
+   Omit `--only` to shoot every `auto` shot plus any `repo-board`/`run-detail` whose
+   id you pass. run.sh resolves the URL, ensures demo mode on, flips branding to
+   vanilla and restores it, and prints a leak-scan summary.
 
-One call can navigate, resize, capture, and crop:
+3. **Review — mandatory.** `Read` each staged PNG. Confirm demo masking (no real
+   email, repo owner, or forge host), vanilla branding (uzi factory mark, no "powered
+   by"), correct theme, and clean layout. Any `⚠` from the leak scan must be resolved
+   before publishing.
 
-```
-<this skill's directory>/scripts/capture.sh --app <bundle-id> <out.png> \
-  --url <url> --size 1728x1080 --crop --width 1800
-```
+4. **Publish the reviewed pairs:**
+   ```
+   node <skill dir>/scripts/publish-shots.mjs --manifest <skill dir>/shots.json --stage /tmp/uzi-ui-shots --only <slugs>
+   ```
+   `--blog-dir` defaults to `~/stuff/gitrepos/wxs/wxs/hai/static/images/uzi`; README
+   dir is `<repo>/.github/readme`. `--dry-run` previews.
 
-`capture.sh` grabs the window's on-screen rectangle with macOS `screencapture -R`,
-which returns full native Retina pixels every time (a Retina display gives 2x). This
-deliberately avoids Orca's own screenshot, whose scale drops to a soft ~1280px
-"desktop-region" fallback whenever the target window is not the frontmost app, a
-non-deterministic trap. Orca is still used, but only to navigate.
+## The manifest (`shots.json`)
 
-- `--url <url>` opens the uzi URL in a **new tab** (leaves your other tabs alone) via
-  Orca, so the shot does not depend on what the window happened to be showing. Pass the
-  instance URL here; it is never hardcoded.
-- `--size WxH` resizes the window (via osascript) to fixed points for reproducible
-  framing.
-- `--crop` chains `crop-ui.sh` (below) so one call gives a finished image; `--width
-  1800` downscales for the blog.
+Each row: `slug`, `kind`, `route`, `viewport`, `themed`, `targets`, and (for
+non-`auto`) `needs` + `state`. Add a row and it flows to both consumers. `kind`:
 
-The window is force-activated before the grab. Because `screencapture -R` captures the
-screen region (not the window's private surface), the **only** requirement is that the
-window is visible and **unoccluded**: nothing overlapping the rectangle, not minimized.
-A non-Retina display yields 1x (expected). During a batch, keep the window on top and
-do not drag another window over it.
+- **auto** — deterministic route, captured with no extra input (dashboard, schedules, mobile-*).
+- **repo-board** — needs `--repo <id>` (`/repos/<id>/board`).
+- **run-detail** — needs `--run <id>` **and a live run in the right state**; several also need scrolling to a panel or expanding a transcript (the `arrange` field). These are operator judgment (see below).
+- **terminal** — `uzi tui`, captured by hand; not a web shot, not theme-swapped.
 
-## Step 4 — crop the browser chrome
+Themes are `light: dawn` / `dark: ember`. `denylist` drives the leak scan (the
+instance host is added automatically); extend per-run with `--deny a,b,c`.
 
-```
-<this skill's directory>/scripts/crop-ui.sh <in.png> <out.png> [--width 1800]
-```
+## Run-detail + board shots (operator judgment)
 
-`crop-ui.sh` finds the uzi UI (one large dark rectangle) inside a full-window
-screenshot and crops out the browser sidebar, toolbar, and rounded window border,
-with no hardcoded coordinates, at any window size or resolution. `--width N`
-downscales the result (blog default 1800, which is 2x for a 900px column).
+`run-cost`, `run-judge`, `run-plan-gate`, `milestones`, `activity`, and
+`lead-transcript` are panels/states of one run page, and `board` needs a repo. They
+depend on live data: a plan gate needs a run parked at approval; the activity feed
+and in-progress milestones need a run in flight. Pick a run that shows the panel
+well, pass `--run <id>` (and `--repo <id>` for the board), and **compare each new
+shot against the current published image — keep the better one** (a board with
+several populated columns beats one with two). Because a theme switch reloads the
+page, arrange the panel (scroll/expand) *after* the theme is applied, per theme.
 
-It assumes a **dark-themed UI**. On a light theme, raise `--darkmax` or crop by hand.
-If it reports "no dark UI region", the window was not showing the uzi UI, or the
-center of the shot was not dark; re-check the window.
+## Themes on the two consumers
 
-## Navigating between views
+- **README** (`.github/readme/`): `<picture>` with a `prefers-color-scheme: dark` source and the light PNG as the `<img>` fallback. This is GitHub's theme signal.
+- **Blog** (`static/images/uzi/`): the blog theme is a manual toggle (`html.dark`), not `prefers-color-scheme`, so swap with CSS keyed off `html.dark` (mirrors the existing archify diagram). `swap-markup.mjs` sets this up once; after that, regens reuse the same filenames and need no markup change.
 
-Firefox-based browsers (Zen) expose only browser chrome to the accessibility tree,
-not the web app, so you cannot click uzi's in-page nav by element index there. Drive
-it one of two ways:
+## Known gap
 
-- **By coordinate.** Screenshot, read the sidebar item's pixel position, convert to a
-  window-local click: `click_x = screenshot_pixel_x / scale` (the screenshot reports
-  `scale`, typically 2 on Retina). Click the uzi sidebar entries (Overview, Boards,
-  Runs, Schedules, and so on).
-- **By URL.** Focus the address bar and set `<url>/<route>` (Chrome and Safari also
-  expose page elements, so element-index clicks work there).
-
-## Views worth capturing
-
-Capture into the caller's image directory (the blog uses `static/images/uzi/`; docs
-and README have their own). Suggested slugs, kept stable across refreshes:
-
-| Slug | View |
-|------|------|
-| `dashboard` | Overview / factory-at-a-glance |
-| `board` | a repo board (kanban of issues) |
-| `schedules` | Schedules, default-jobs catalogue |
-| `run-cost` | a finished run's cost and token panel |
-| `run-judge` | a finished run's judge review |
-| `activity` | a run's per-agent activity feed |
-| `lead-transcript` | an expanded agent transcript |
-| `milestones` | a run's milestone checklist |
-| `run-plan-gate` | a run parked at the approval gate |
-| `mobile-*` | a phone-width window (narrow the window or use responsive mode) |
-
-`mobile-*` and terminal (`uzi tui`) shots are not handled by these scripts: resize
-the window narrow for mobile, or screenshot the terminal directly for the TUI.
-
-## Judgment — do not replace a shot with a worse one
-
-Some views only look right in a **live run state** (a plan gate needs a run parked at
-approval; the activity feed and in-progress milestones need a run in flight). If no
-such run exists, a fresh capture shows an empty or all-complete state that reads worse
-than the existing image. When refreshing, compare each new shot against the current
-one and **keep the better image** rather than always overwriting. A board with several
-populated columns beats one with two, and so on.
+Demo mode does not mask the run **working-dir path** (`github.com+<owner>+<repo>+issue-N`)
+shown briefly in the recent-runs list before the summary streams in. The capture
+settles 1.6s to avoid the flash and the leak scan catches it; a proper fix is to mask
+that field in demo mode (uzi web).

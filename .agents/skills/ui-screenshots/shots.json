@@ -1,0 +1,30 @@
+{
+  "$comment": "Single source of truth for uzi UI screenshots: what to capture, how, and where each lands (README vs blog). capture-ui.mjs reads this to shoot both themes; publish-shots.mjs copies the reviewed pairs to each target. Add a row here and it flows to both consumers. themed:true -> a -light.png + -dark.png pair; the README uses <picture>, the blog swaps on html.dark. kind: auto=deterministic route; repo-board=needs --repo (full viewport); run-detail=needs --run + a live state (element capture of one panel); terminal=captured by hand (uzi tui), not this web tool. panel=heading/label text to anchor element capture on (nearest border-edge Card). expand=click this row/label first. requireStatus=the run must be in one of these statuses or the shot is a downgrade (guard skips it). richness=DOM count guard (flag+skip if below min).",
+  "viewports": {
+    "desktop": { "width": 1440, "height": 1080, "dsf": 2, "mobile": false },
+    "mobile":  { "width": 390,  "height": 844,  "dsf": 3, "mobile": true }
+  },
+  "themes": { "light": "dawn", "dark": "ember" },
+  "denylist": ["metaminds", "keycloak", "powered by", "vtmocanu", "@gmail.com"],
+  "denylistComment": "Case-insensitive substrings the leak scan flags in the page text before each shot. The instance host (from --url) is added automatically. Extend at runtime with --deny a,b,c.",
+  "targets": {
+    "readme": { "kind": "picture", "dir": "<repo>/.github/readme" },
+    "blog":   { "kind": "css-swap", "dir": "<hai>/static/images/uzi", "note": "resolve with --blog-dir; default ~/stuff/gitrepos/wxs/wxs/hai/static/images/uzi" }
+  },
+  "shots": [
+    { "slug": "dashboard",       "kind": "auto",       "route": "/dashboard",         "viewport": "desktop", "themed": true, "targets": ["readme", "blog"] },
+    { "slug": "schedules",       "kind": "auto",       "route": "/schedules",         "viewport": "desktop", "themed": true, "targets": ["readme", "blog"] },
+    { "slug": "mobile-overview", "kind": "auto",       "route": "/dashboard",         "viewport": "mobile",  "themed": true, "targets": ["blog"] },
+    { "slug": "mobile-runs",     "kind": "auto",       "route": "/runs",              "viewport": "mobile",  "themed": true, "targets": ["blog"] },
+    { "slug": "mobile-nav",      "kind": "auto",       "route": "/dashboard",         "viewport": "mobile",  "action": "openNav", "themed": true, "targets": ["blog"] },
+    { "slug": "board",           "kind": "repo-board", "route": "/repos/{repo}/board", "viewport": "desktop", "themed": true, "targets": ["readme", "blog"], "needs": "repo", "richness": { "domSelector": "[draggable=\"true\"]", "min": 4, "label": "board cards" } },
+    { "slug": "run-plan-gate",   "kind": "run-detail", "route": "/runs/{run}",         "viewport": "desktop", "themed": true, "targets": ["readme", "blog"], "needs": "run", "panel": "awaiting your approval", "requireStatus": ["awaiting_approval"], "state": "a run parked at the plan-approval gate (use plan-gate-fixture.sh); panel = the 'Plan awaiting your approval' card, not the Run-summary PROPOSED PLAN subsection" },
+    { "slug": "run-cost",        "kind": "run-detail", "route": "/runs/{run}",         "viewport": "desktop", "themed": true, "targets": ["readme", "blog"], "needs": "run", "panel": "Per-phase breakdown", "requireStatus": ["running", "completed"], "state": "any run with a cost breakdown" },
+    { "slug": "run-judge",       "kind": "run-detail", "route": "/runs/{run}",         "viewport": "desktop", "themed": true, "targets": ["readme", "blog"], "needs": "run", "panel": "RUN REVIEW", "requireStatus": ["completed"], "state": "a judged (completed) run" },
+    { "slug": "milestones",      "kind": "run-detail", "route": "/runs/{run}",         "viewport": "desktop", "themed": true, "targets": ["readme", "blog"], "needs": "run", "panel": "Milestones", "requireStatus": ["running"], "state": "an in-flight run with a partial milestone checklist" },
+    { "slug": "activity",        "kind": "run-detail", "route": "/runs/{run}",         "viewport": "desktop", "themed": true, "targets": ["readme", "blog"], "needs": "run", "panel": "ACTIVITY", "requireStatus": ["running"], "state": "an in-flight run (per-agent activity feed)" },
+    { "slug": "lead-transcript", "kind": "run-detail", "route": "/runs/{run}",         "viewport": "desktop", "themed": false, "targets": [], "needs": "run", "panel": "ACTIVITY", "expand": "lead", "requireStatus": ["running", "completed"], "state": "a run whose lead transcript can be expanded", "note": "NOT PUBLISHED (themed:false, no targets): an EXPANDED transcript leaks real tool-call file paths (github.com+<owner>+<repo>+...) that demo mode does not mask, and runs very tall; a COLLAPSED one just duplicates `activity`. The expand logic works (clicks the lead's aria-expanded group header, falls back to 'Expand all'). Revisit if demo mode masks tool-call paths, then hand-crop a clean region." },
+    { "slug": "tui-floor",       "kind": "terminal",   "themed": true, "manual": true, "targets": ["readme", "blog"], "note": "`uzi tui` floor view, captured by hand in both themes (light+dark). README uses <picture>; blog uses a Floor/Transcript tabs widget. Not captured or published by the tool — save the PNGs into both image dirs by hand." },
+    { "slug": "tui-transcript",  "kind": "terminal",   "themed": true, "manual": true, "targets": ["readme", "blog"], "note": "`uzi tui` run/transcript view, captured by hand in both themes." }
+  ]
+}
