@@ -102,8 +102,20 @@ export interface MrCall {
 export interface FakeForgeOpts {
   head?: string;
   headStatus?: number;
+  /** PRD #1225 (CodeRabbit !1254): per-GET head sequence. When set, the Nth single-item GET answers
+   *  `heads[N]` (falling back to `head` once exhausted), so a test can model the PR head CHANGING
+   *  between the verify read and the post-add re-verify read (the TOCTOU bind). Absent ⇒ every GET
+   *  answers the fixed `head`. */
+  heads?: string[];
   /** Status for the body-rewrite PUT/PATCH (default 200); a non-2xx makes updateMergeRequestDescription throw a ForgeError (the add-Closes reconcile failure). */
   putStatus?: number;
+}
+
+/** The SHA the Nth single-item GET answers: `heads[n]` when a sequence is set and in range, else the
+ *  fixed `head` (or ""). Shared by the three driver fakes so the head-change model is identical. */
+function headForGet(opts: FakeForgeOpts, n: number): string {
+  if (opts.heads && n < opts.heads.length) return opts.heads[n]!;
+  return opts.head ?? "";
 }
 
 /** A GitLab client whose transport is captured; opens MR !42 with no network. The GET (D5 PR-head
@@ -119,7 +131,8 @@ export function fakeGitlab(opts: FakeForgeOpts = {}): { gitlab: GitLabClient; ca
     });
     if (init.method === "GET") {
       const status = opts.headStatus ?? 200;
-      return { status, text: async () => JSON.stringify({ sha: opts.head ?? "" }) };
+      const sha = headForGet(opts, calls.filter((c) => c.method === "GET").length - 1);
+      return { status, text: async () => JSON.stringify({ sha }) };
     }
     // PRD #1225 (CodeRabbit !1254): the interlock reconcile rewrites the MR body (GitLab uses
     // PUT). Answer 2xx so updateMergeRequestDescription succeeds; the call stays captured in `calls`.
@@ -151,7 +164,8 @@ export function fakeForgejo(opts: FakeForgeOpts = {}): { forgejo: ForgejoClient;
     });
     if (init.method === "GET") {
       const status = opts.headStatus ?? 200;
-      return { status, text: async () => JSON.stringify({ head: { sha: opts.head ?? "" } }) };
+      const sha = headForGet(opts, calls.filter((c) => c.method === "GET").length - 1);
+      return { status, text: async () => JSON.stringify({ head: { sha } }) };
     }
     // PRD #1225 (CodeRabbit !1254): the interlock reconcile rewrites the PR body (Forgejo uses
     // PATCH). Answer 2xx so updateMergeRequestDescription succeeds; the call stays captured in `calls`.
@@ -183,7 +197,8 @@ export function fakeGitHub(opts: FakeForgeOpts = {}): { github: GitHubClient; ca
     });
     if (init.method === "GET") {
       const status = opts.headStatus ?? 200;
-      return { status, text: async () => JSON.stringify({ head: { sha: opts.head ?? "" } }) };
+      const sha = headForGet(opts, calls.filter((c) => c.method === "GET").length - 1);
+      return { status, text: async () => JSON.stringify({ head: { sha } }) };
     }
     // PRD #1225 (CodeRabbit !1254): the interlock reconcile rewrites the PR body (GitHub uses
     // PATCH). Answer 2xx so updateMergeRequestDescription succeeds; the call stays captured in `calls`.

@@ -2221,6 +2221,22 @@ export class RunRunner {
       });
     };
 
+    // PRD #1225 (CodeRabbit !1254): fail CLOSED — a terminal failure with NO hold attempt. Used when a
+    // would-be hold path could NOT strip `Closes #N` from the MR (the non-closing reconcile write
+    // failed). `createMergeRequest` can ADOPT a pre-existing MR that already carries `Closes #N`, so a
+    // failed strip cannot guarantee the MR is non-closing; a hold is a nominally non-closing parked
+    // state, so we must not enter it here. Failing is the safe direction — loud and terminal — rather
+    // than parking a possibly-closing MR on an unverified head that a human could merge.
+    const failInterlockedClosed = async (reason: string): Promise<void> => {
+      executor.killAgentTree?.();
+      await closeBatcher().catch(() => undefined);
+      await reportState({ status: "failed", failure_reason: COMPLETION_INTERLOCK_UNHELD_REASON });
+      runLog.info("run failed closed: completion interlock could not guarantee a non-closing MR", {
+        run_id: runId,
+        reason,
+      });
+    };
+
     if (interlocked) {
       // 1. Capture the EXACT landed head H. pushBranch pushes refs/uzi-runner/<branch>, and BOTH the
       //    normal finalize push (fetchAgentBranch at the top of this method) and the align push
@@ -2324,14 +2340,17 @@ export class RunRunner {
     // and never reads the PR head, so this block is skipped and its completion is unchanged.
     //
     // PRD #1225 (CodeRabbit !1254): the interlocked MR was created WITHOUT a `Closes #N` body, so a
-    // held, unverified-head MR can never carry a closing line — the dangerous create-then-verify state
-    // (a human merge closing the issue on an unverified head) is now structurally impossible.
-    // reconcileMrDescription ADDS the canonical `Closes #N` body ONLY after the PR head is verified to
-    // equal H; if that write FAILS the run HOLDS rather than reporting completion (the completion
-    // contract requires the merged MR to carry Closes). The two hold branches instead add the
-    // unverified banner (still NO `Closes #N`) BEST-EFFORT — its boolean is ignored, since the MR
-    // already carries no Closes and the banner is only advisory. The whole block is skipped for a
-    // legacy run (completionHead === undefined), so its completion is byte-for-byte unchanged.
+    // freshly-created, unverified-head MR can never carry a closing line — the dangerous
+    // create-then-verify state (a human merge closing the issue on an unverified head) is structurally
+    // impossible for it. reconcileMrDescription ADDS the canonical `Closes #N` body ONLY after the PR
+    // head is verified to equal H, and the head is then RE-READ to bind that add to the verified head
+    // (a change in the read→add window strips Closes and holds); if the add FAILS the run HOLDS rather
+    // than reporting completion (the completion contract requires the merged MR to carry Closes). The
+    // hold branches strip Closes and add the unverified banner FIRST and REQUIRE that write to succeed:
+    // `createMergeRequest` can ADOPT a pre-existing MR that already carried `Closes #N`, so a failed
+    // strip cannot prove the MR is non-closing and we fail CLOSED instead of holding (stripClosesThenHold
+    // → failInterlockedClosed). The whole block is skipped for a legacy run (completionHead ===
+    // undefined), so its completion is byte-for-byte unchanged.
     const UNVERIFIED_BANNER =
       "> ⚠️ **Completion unverified.** uzi could not confirm this merge request's head matches the permitted completion head, so the run was held for owner review. This merge request does NOT close its issue and must not be merged as a completion until re-verified.";
     const reconcileMrDescription = async (withCloses: boolean, banner?: string): Promise<boolean> => {
@@ -2368,6 +2387,17 @@ export class RunRunner {
         return false;
       }
     };
+    // PRD #1225 (CodeRabbit !1254): strip any `Closes #N` (writing the unverified banner) BEFORE a
+    // hold. If that write FAILS we cannot guarantee the MR is non-closing — `createMergeRequest` can
+    // ADOPT a pre-existing MR that already carried `Closes #N` — so fail CLOSED rather than hold a
+    // possibly-closing MR on an unverified head.
+    const stripClosesThenHold = async (holdReason: string, failReason: string): Promise<void> => {
+      if (!(await reconcileMrDescription(false, UNVERIFIED_BANNER))) {
+        await failInterlockedClosed(failReason);
+        return;
+      }
+      await holdOrFailInterlocked(holdReason);
+    };
     if (completionHead !== undefined) {
       let prHead: string;
       try {
@@ -2382,25 +2412,62 @@ export class RunRunner {
           run_id: runId,
           error: errMessage(e),
         });
-        await reconcileMrDescription(false, UNVERIFIED_BANNER);
-        await holdOrFailInterlocked("pr head mismatch");
+        await stripClosesThenHold(
+          "pr head unreadable",
+          "could not strip Closes from an MR whose head is unreadable",
+        );
         return;
       }
       if (prHead !== completionHead) {
         runLog.info("completion interlock: PR head does not match the permitted head; holding", {
           run_id: runId,
         });
-        await reconcileMrDescription(false, UNVERIFIED_BANNER);
-        await holdOrFailInterlocked("pr head mismatch");
+        await stripClosesThenHold(
+          "pr head mismatch",
+          "could not strip Closes from an unverified-head MR",
+        );
         return;
       }
       // Verified: ADD the canonical `Closes #N` body. The interlocked MR was created WITHOUT Closes,
       // so this is the ONLY place a completion's closing line is written (it is also a REPAIR on an
       // ADOPTED MR whose body a prior hold rewrote to the unverified variant). The completion contract
-      // requires the merged MR to carry Closes, so if this write FAILS we hold/fail rather than report
+      // requires the merged MR to carry Closes, so if this write FAILS we hold rather than report
       // completion.
       if (!(await reconcileMrDescription(true))) {
         await holdOrFailInterlocked("could not assert Closes on the verified head");
+        return;
+      }
+      // BIND the Closes add to the verified head (CodeRabbit !1254): re-read the PR head AFTER writing
+      // Closes. A head change between the first read and the add would otherwise leave `Closes #N` on
+      // an unverified head. If the re-read is unreadable, or shows a changed head, strip Closes and
+      // hold (fail closed if the strip itself fails) rather than report completion.
+      let postHead: string;
+      try {
+        postHead = await forge.getMergeRequestHead(
+          claim.repo.url,
+          claim.secrets.forge_pat,
+          mr.iid,
+          boundarySignal,
+        );
+      } catch (e) {
+        runLog.warn("completion interlock: could not re-verify the PR head after adding Closes; holding", {
+          run_id: runId,
+          error: errMessage(e),
+        });
+        await stripClosesThenHold(
+          "pr head unreadable after Closes",
+          "could not strip Closes after an unreadable re-verify",
+        );
+        return;
+      }
+      if (postHead !== completionHead) {
+        runLog.info("completion interlock: PR head changed after adding Closes; stripping Closes and holding", {
+          run_id: runId,
+        });
+        await stripClosesThenHold(
+          "pr head changed after Closes",
+          "could not strip Closes after a post-add head change",
+        );
         return;
       }
     }

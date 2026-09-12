@@ -86,6 +86,15 @@ describe("RunRunner — completion permit + PR-head verification (PRD #1226 M4 D
     // MR was created WITHOUT it, and the verified-head reconcile ADDS the canonical Closes body.
     const reassert = mrPutBody(calls);
     assert.match(String(reassert.description), /Closes #1300/, "the verified completion is the ONLY place Closes is written");
+    // CodeRabbit !1254: assert the COMPLETE forge-call sequence, not just that each kind occurred —
+    // create (no Closes) → verify head → add Closes → RE-VERIFY head. A wrong ordering (e.g. adding
+    // Closes before the verify, or skipping the post-add re-verify) would leave the per-kind checks
+    // above green while breaking the head bind.
+    assert.deepStrictEqual(
+      calls.map((c) => c.method),
+      ["POST", "GET", "PUT", "GET"],
+      "forge calls run in the order: create MR (POST) → verify head (GET) → add Closes (PUT) → re-verify head (GET)",
+    );
   });
 
   it("permit DENIED → never creates the MR, never completes, holds the run", async () => {
@@ -188,6 +197,50 @@ describe("RunRunner — completion permit + PR-head verification (PRD #1226 M4 D
     assert.ok(!statuses(claim.run_id).includes("completed"), "a failed add-Closes never completes");
     assert.ok(!statuses(claim.run_id).includes("failed"), "it holds rather than fails");
     assert.strictEqual(api.completionHoldRequests.length, 1, "it enters the completion hold");
+  });
+
+  it("head matches at verify but CHANGES before the post-add re-verify → strips Closes and holds (bind to verified head, CodeRabbit !1254)", async () => {
+    // The first GET (verify) answers H so the add proceeds; the second GET (post-add re-verify) answers
+    // OTHER, modelling a head change in the read→add window. Closes must not be left on the changed head.
+    const { gitlab, calls } = fakeGitlab({ heads: [H, OTHER] });
+    const claim = interlockedClaim(1307);
+    api.setCompletionPermitResponse(true);
+    git.trackingTip = (async () => H) as typeof git.trackingTip;
+
+    await runnerWith(() => ({ executor: new StubExecutor(nullLogger()) }), gitlab, undefined, undefined, {
+      recoveryRetryMs: 1,
+    }).execute(claim);
+
+    assert.strictEqual(
+      calls.filter((c) => c.method === "GET").length,
+      2,
+      "the head is read twice: verify then post-add re-verify",
+    );
+    assert.ok(!statuses(claim.run_id).includes("completed"), "a head change after adding Closes never completes");
+    assert.strictEqual(api.completionHoldRequests.length, 1, "a post-add head change holds the run");
+    assert.ok(!statuses(claim.run_id).includes("failed"), "a post-add head change holds rather than fails");
+    // The LAST reconcile strips Closes back off and adds the unverified banner.
+    const reconciled = mrPutBody(calls);
+    assert.doesNotMatch(String(reconciled.description), /Closes #/, "the held MR no longer carries Closes after the head change");
+    assert.match(String(reconciled.description), /Completion unverified/, "the held MR body warns the completion is unverified");
+  });
+
+  it("PR head != H AND the non-closing strip write FAILS → fails CLOSED (never holds a possibly-closing MR, CodeRabbit !1254)", async () => {
+    // An adopted MR may already carry Closes; if the strip-to-non-closing write fails on the hold path
+    // we cannot prove the MR is non-closing, so the run must FAIL rather than park a possibly-closing MR.
+    const { gitlab, calls } = fakeGitlab({ head: OTHER, putStatus: 500 });
+    const claim = interlockedClaim(1308);
+    api.setCompletionPermitResponse(true);
+    git.trackingTip = (async () => H) as typeof git.trackingTip;
+
+    await runnerWith(() => ({ executor: new StubExecutor(nullLogger()) }), gitlab, undefined, undefined, {
+      recoveryRetryMs: 1,
+    }).execute(claim);
+
+    assert.ok(calls.some((c) => c.method === "PUT"), "the non-closing strip write was attempted");
+    assert.ok(!statuses(claim.run_id).includes("completed"), "it never completes");
+    assert.strictEqual(api.completionHoldRequests.length, 0, "it does NOT enter the hold when the strip failed");
+    assert.ok(statuses(claim.run_id).includes("failed"), "it fails closed instead of holding");
   });
 
   it("LEGACY (non-interlocked) run → no permit, no PR-head read, Closes as before, completes with NO head", async () => {
