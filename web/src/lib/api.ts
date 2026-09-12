@@ -1304,10 +1304,6 @@ const realApi = {
       `/admin/judge/recommendations${suffix ? `?${suffix}` : ""}`,
     );
   },
-  // getAdminJudgeStats is the cross-user triage strip tally (the admin twin of getJudgeStats).
-  // It is NOT the nav-badge source under All users: the badge stays the caller's OWN count, so
-  // the page keeps publishing getJudgeStats()'s .todo and never this aggregate's.
-  getAdminJudgeStats: () => request<TriageCounts>("GET", "/admin/judge/stats"),
   // getAdminJudgeCategoryStats is the cross-user filter-chip GROUP-count matrix (the admin twin
   // of getJudgeCategoryStats). No ?run= anchor on the admin path, so it takes no argument.
   getAdminJudgeCategoryStats: () =>

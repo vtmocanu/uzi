@@ -847,10 +847,6 @@ export const judgeApi = {
     requireSession();
     return delay(computeAdminBacklog(bucket, categories ?? []), 80);
   },
-  getAdminJudgeStats: async () => {
-    requireSession();
-    return delay(computeAdminTriage(), 60);
-  },
   getAdminJudgeCategoryStats: async () => {
     requireSession();
     return delay(computeAdminCategoryStats(), 60);

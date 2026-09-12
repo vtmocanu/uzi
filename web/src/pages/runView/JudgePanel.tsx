@@ -561,9 +561,11 @@ export function JudgePanel({
                         {/* Fed through judgeState so the run-page chip renders the disposition's
                             PROVENANCE too (PRD #1184 M4): a "done" now carries set_via, so an admin
                             cross-user done reads "Done by an admin" and an issue-close auto-done
-                            "Done via #N" here, matching the Judge occurrence chip. The shared
-                            adapter keeps the done/dismissed split and the dismiss reason as before;
-                            the filed link stays a SEPARATE chip beside it (rendered above). */}
+                            reads "Done via issue close". (The run-page DispositionDTO carries no
+                            filed iid, so unlike the Judge occurrence chip — which does — this one
+                            has no "#N" to name; the filed link stays a SEPARATE "Filed #N" chip
+                            beside it, rendered above.) The shared adapter keeps the done/dismissed
+                            split and the dismiss reason as before. */}
                         {disp ? (
                           <TriageStateChip {...judgeState(disp)} />
                         ) : (
