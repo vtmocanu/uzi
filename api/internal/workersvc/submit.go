@@ -199,6 +199,40 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 		return SubmitInputResult{ServerSide: false}, nil
 	}
 
+	// An `extend` (PRD #1189 M1) is an owner-only request to add wall-clock time ON TOP of the
+	// frozen budget. It ADDS @secs to runs.budget_extension_seconds (never mutating the immutable
+	// budget_wall_seconds) and writes a kind='extend' audit row in ONE statement, capped by the
+	// admin setting run_extension_cap_seconds (0 = extending disabled). Like `scope` the control
+	// is server-only — served to the worker as the column on the ACK/claim, excluded from
+	// ConsumeRunInputs — so it never routes through the worker's steering queue. A 0-row result
+	// is disambiguated into the 409 classes from the already-loaded run (extendRefusalReason).
+	// The projected total and deadline are computed BEFORE the CTE from the fetched row, so the
+	// write stays one statement and the CLI needs no read-back. Same accepted TOCTOU as scope.
+	if kind == "extend" {
+		secs, err := strconv.Atoi(strings.TrimSpace(body))
+		if err != nil || secs < 60 || secs > math.MaxInt32 {
+			return SubmitInputResult{}, ErrInvalidExtension
+		}
+		capSeconds, err := s.runExtensionCap(ctx)
+		if err != nil {
+			return SubmitInputResult{}, err
+		}
+		if capSeconds == 0 {
+			return SubmitInputResult{}, ErrExtendDisabled
+		}
+		// secs is user input. A request larger than the whole cap can never be applied and,
+		// left unbounded, would overflow the CTE's int4 budget_extension_seconds + @secs
+		// addition — so it is reported as a cap violation here. After this, secs ∈ [60,
+		// capSeconds], keeping every int32 cast in submitExtend and the DB arithmetic in range.
+		if secs > capSeconds {
+			return SubmitInputResult{}, extendRefusalReason(run, secs, capSeconds)
+		}
+		// The write is a helper taking secs/capSeconds as plain ints: crossing the function
+		// boundary is what keeps gosec G109 (strconv.Atoi result → int32) from firing at the
+		// casts, the same shape submitScopeCeiling uses for its Atoi-derived ceiling.
+		return s.submitExtend(ctx, run, secs, capSeconds)
+	}
+
 	// A graceful `stop` (PRD #517 M4) is the interactive-run wind-down: unlike cancel/
 	// reject_plan it has NO server-side !live transition branch, because only the worker can
 	// finalize it (push + open MR iff open_mr) and report `completed` with stop_kind='stopped'.
@@ -718,6 +752,46 @@ func (s *Service) submitScopeCeiling(ctx context.Context, run store.Run, ceiling
 	return SubmitInputResult{ServerSide: false, ScopeCeiling: &c}, nil
 }
 
+// submitExtend ADDS secs to runs.budget_extension_seconds AND writes the kind='extend' audit
+// row in one CTE (PRD #1189 M1), returning the new total extension and the run's projected
+// wall-clock deadline. secs and capSeconds arrive as plain ints — the caller parsed the body
+// and bounded them to secs ∈ [60, capSeconds] with capSeconds ≤ 604800 — so the int32 casts
+// here are provable to the integer-conversion analyzers (gosec G115 / CodeQL), and receiving
+// them across this function boundary is what keeps gosec G109 (a strconv.Atoi result converted
+// to int32) from firing, exactly as submitScopeCeiling does for its ceiling. The projected
+// total and deadline are computed from the already-fetched run BEFORE the CTE so the write
+// stays one statement and needs no read-back. A 0-row CTE (terminal / untimed kind / over the
+// cap) yields pgx.ErrNoRows, mapped to the specific 409 by extendRefusalReason over that row.
+func (s *Service) submitExtend(ctx context.Context, run store.Run, secs, capSeconds int) (SubmitInputResult, error) {
+	secs32, cap32 := int32(0), int32(0)
+	if secs >= 0 && secs <= math.MaxInt32 {
+		secs32 = int32(secs)
+	}
+	if capSeconds >= 0 && capSeconds <= math.MaxInt32 {
+		cap32 = int32(capSeconds)
+	}
+	projectedTotal := int(run.BudgetExtensionSeconds) + secs
+	projectedDeadline := RunDeadline(run.StartedAt, run.BudgetWallSeconds, run.BudgetPausedSeconds, run.Kind, run.Interactive, run.Status, s.p.RunTimeout, run.BudgetExtensionSeconds+secs32)
+	auditBody := fmt.Sprintf("extend +%s → total extension %s of %s", extendDurationLabel(secs), extendDurationLabel(projectedTotal), extendDurationLabel(capSeconds))
+	if projectedDeadline != nil {
+		auditBody += fmt.Sprintf("; times out %s", projectedDeadline.UTC().Format("Jan 2 15:04 MST"))
+	}
+	newTotal, err := s.q.CreateExtendInput(ctx, store.CreateExtendInputParams{
+		ID:   run.ID,
+		Secs: secs32,
+		Cap:  cap32,
+		Body: pgconv.TextOrNull(auditBody),
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return SubmitInputResult{}, extendRefusalReason(run, secs, capSeconds)
+		}
+		return SubmitInputResult{}, err
+	}
+	nt := int(newTotal)
+	return SubmitInputResult{ServerSide: false, ExtensionSeconds: &nt, DeadlineAt: projectedDeadline}, nil
+}
+
 // pauseRefusalReason turns a 0-row CreatePauseInput into the specific 409 the owner sees
 // (PRD #1190 M1), decided from the already-loaded run row — the two causes CreatePauseInput's
 // allowlist predicate collapses into "0 rows". Status first: a non-running run is a park with
@@ -744,6 +818,59 @@ func pauseRefusalReason(run store.Run) error {
 		why = "pause is not supported for this run"
 	}
 	return &PauseRefusedError{Msg: why, Sentinel: ErrPauseNotSupported}
+}
+
+// runExtensionCap reads the per-run extension cap from the run-health settings reader (PRD
+// #1189 M1). A nil reader (a deployment or test that never wired settings) reads as 0 —
+// extending disabled — the same fail-safe direction as a nil healthSettings disabling the
+// whole detector. Production wires it via SetHealthSettings alongside the health thresholds.
+func (s *Service) runExtensionCap(ctx context.Context) (int, error) {
+	if s.healthSettings == nil {
+		return 0, nil
+	}
+	return s.healthSettings.RunExtensionCapSeconds(ctx)
+}
+
+// extendRefusalReason turns a 0-row CreateExtendInput into the specific 409 the owner sees
+// (PRD #1189 M1), decided from the already-loaded run row — the causes the CTE's predicate
+// collapses into "0 rows". Terminal first (the run is dead, the clock is already stopped),
+// then a kind that never times out (chat/judge, or an interactive task — the runWallClock
+// exclusion set), then the residual cause: budget_extension_seconds + secs would exceed the
+// per-run cap, so the message names the remaining allowance. Same accepted TOCTOU as
+// pauseRefusalReason: a run that changed between GetRun and the CTE is reported as the guard
+// the stale row suggests, which is harmless (the run is dead or untimed either way).
+func extendRefusalReason(run store.Run, secs, capSeconds int) error {
+	if terminalStatuses[run.Status] {
+		return ErrRunTerminal
+	}
+	if run.Kind == runkind.Chat || run.Kind == runkind.Judge || run.Interactive {
+		return fmt.Errorf("%w (a %s run has no wall-clock timeout)", ErrExtendNotTimed, run.Kind)
+	}
+	remaining := capSeconds - int(run.BudgetExtensionSeconds)
+	if remaining < 0 {
+		remaining = 0
+	}
+	return fmt.Errorf("%w: %s exceeds the remaining extension cap (%s left of %s)", ErrExtensionCapExceeded,
+		extendDurationLabel(secs), extendDurationLabel(remaining), extendDurationLabel(capSeconds))
+}
+
+// extendDurationLabel renders a whole-second extension duration tersely for an audit body or
+// a 409 message: "2h", "1h30m", "45m". PRD #1189 extensions are whole minutes (>= 60s), so
+// sub-minute seconds are not shown.
+func extendDurationLabel(secs int) string {
+	if secs < 0 {
+		secs = 0
+	}
+	h := secs / 3600
+	m := (secs % 3600) / 60
+	switch {
+	case h > 0 && m > 0:
+		return fmt.Sprintf("%dh%dm", h, m)
+	case h > 0:
+		return fmt.Sprintf("%dh", h)
+	default:
+		return fmt.Sprintf("%dm", m)
+	}
 }
 
 func stopKindFor(kind string) string {

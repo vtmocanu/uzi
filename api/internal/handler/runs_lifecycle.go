@@ -30,6 +30,7 @@ var runInputKinds = map[string]bool{
 	"follow_up": true, "approve_plan": true, "reject_plan": true, "cancel": true, "revise_plan": true,
 	"answer": true, "stop": true, "scope": true, // PRD #634 M2: accept a scope directive (CLI verb is m5)
 	"pause": true, "pause_cancel": true, // PRD #1190 M1: owner-only pause request / withdrawal (resume is /resume-now, not an /inputs kind)
+	"extend": true, // PRD #1189 M1: owner-only wall-clock extension (server-only; served to the worker via budget_extension_seconds)
 }
 
 // -------------------------------------------------------------------------
@@ -139,7 +140,7 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 		h.writeStartRunError(w, r, err)
 		return
 	}
-	httpx.JSON(w, http.StatusCreated, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout)})
+	httpx.JSON(w, http.StatusCreated, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.clock())})
 }
 
 // CreateTaskRunRequest is the POST /repos/{id}/task-runs body (PRD #400): the inline
@@ -189,7 +190,7 @@ func (h *Handler) CreateTaskRun(w http.ResponseWriter, r *http.Request) {
 		h.writeStartRunError(w, r, err)
 		return
 	}
-	httpx.JSON(w, http.StatusCreated, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout)})
+	httpx.JSON(w, http.StatusCreated, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.clock())})
 }
 
 // DispatchTaskRun stamps a task run's dispatch gate (PRD #400 Decision 6): the CLI
@@ -218,7 +219,7 @@ func (h *Handler) DispatchTaskRun(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout)})
+	httpx.JSON(w, http.StatusOK, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.clock())})
 }
 
 // writeStartRunError maps the StartRunForUser* sentinels to an HTTP status + message.
@@ -326,7 +327,7 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	dto := runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout)
+	dto := runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.clock())
 	// PRD #1064 M2: the server-derived "now" line. runToDTO stays pure, so the field is
 	// set here in the caller from the batched lookup (one run this time). null for a
 	// terminal run (no "now") and, via the batched query, for a run with no tool_use
@@ -652,6 +653,17 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 			// 400: the scope body did not parse as an integer ceiling. Out-of-range
 			// values are clamped, not rejected — only a non-integer is a caller error.
 			httpx.Error(w, http.StatusBadRequest, err.Error())
+		case errors.Is(err, workersvc.ErrInvalidExtension):
+			// PRD #1189 M1: the extend body was not a whole number of seconds >= 60 → 400
+			// (a caller error).
+			httpx.Error(w, http.StatusBadRequest, err.Error())
+		case errors.Is(err, workersvc.ErrExtendDisabled),
+			errors.Is(err, workersvc.ErrExtensionCapExceeded),
+			errors.Is(err, workersvc.ErrExtendNotTimed):
+			// PRD #1189 M1: extending is off instance-wide, the request exceeds the per-run
+			// cap, or the run's kind never times out → 409. The service built the run-specific
+			// sentence (cap-exceeded names the remaining allowance), so surface it verbatim.
+			httpx.Error(w, http.StatusConflict, err.Error())
 		case errors.Is(err, workersvc.ErrReviseCapReached):
 			httpx.Error(w, http.StatusConflict, "plan revision limit reached")
 		case errors.Is(err, workersvc.ErrChatInputNotAllowed):
@@ -706,6 +718,12 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 		createdAt := res.CreatedAt
 		resp.ID = &id
 		resp.CreatedAt = &createdAt
+	}
+	// PRD #1189 M1: a successful `extend` carries the new total extension and the projected
+	// deadline back so the CLI/web can print the outcome without a read-back.
+	if req.Kind == "extend" {
+		resp.ExtensionSeconds = res.ExtensionSeconds
+		resp.DeadlineAt = res.DeadlineAt
 	}
 	httpx.JSON(w, http.StatusAccepted, resp)
 }

@@ -2596,6 +2596,14 @@ WHERE id = @id AND user_id = @user_id
 -- it in before persisting. This consumer trusts budget_wall_seconds as an already-capped,
 -- server-only, IMMUTABLE value — so a future writer that persists an UNCAPPED budget_wall_seconds
 -- would bypass the ceiling here, and the cap must stay at every write path, not be moved to reads.
+--
+-- PRD #1189 M1: budget_extension_seconds is a HUMAN-GRANTED additive term, added on top of
+-- the frozen budget so an owner can give a run more wall-clock time. It is DELIBERATELY
+-- OUTSIDE the 8h ceiling above: the ceiling bounds what a LEAD can buy itself through
+-- milestone count, whereas an extension is a different trust — a human grants it — so it is
+-- not re-capped here. The ceiling still lives at the freeze writers for budget_wall_seconds.
+-- budget_extension_seconds is NOT NULL DEFAULT 0 (migration 00215), so it is a plain additive
+-- term that is 0 for a run that was never extended.
 UPDATE runs SET status = 'failed', status_since = now(), failure_reason = @failure_reason,
     -- PRD #69 M7a: the trusted failure class for a run killed by RUN_TIMEOUT.
     fail_origin = 'run_timeout',
@@ -2615,7 +2623,8 @@ WHERE status = 'running'
   -- additive term that is 0 for a run that never parked.
   AND started_at < (sqlc.arg('now')::timestamptz
         - make_interval(secs => COALESCE(budget_wall_seconds, sqlc.arg('global_timeout_seconds')::int)
-                              + budget_paused_seconds))
+                              + budget_paused_seconds
+                              + budget_extension_seconds))
   AND kind NOT IN ('chat', 'judge')
   AND interactive = false
   -- PRD #1226 M3 (D3): completion-interlock carve-out. A run that has recorded at least one
@@ -3422,6 +3431,40 @@ INSERT INTO run_user_inputs (run_id, kind, body)
 SELECT cancelled.id, 'pause_cancel', NULL::text FROM cancelled
 RETURNING *;
 
+-- name: CreateExtendInput :one
+-- PRD #1189 M1: grant a run more wall-clock time AND write the kind='extend' audit row in
+-- ONE statement, mirroring CreatePauseInput/CreateScopeCeilingInput's atomicity (workersvc.Store
+-- exposes no transaction seam). The UPDATE ADDS @secs to budget_extension_seconds (additive —
+-- the frozen budget_wall_seconds is never touched); the run_user_inputs row is audit/surfacing
+-- ONLY (excluded from ConsumeRunInputs, so the worker never drains or routes it — the extension
+-- is served to the worker as runs.budget_extension_seconds on the ACK/claim instead).
+--
+-- The predicate is the same non-terminal + timed-kind allowlist the sweep uses PLUS the cap:
+-- a completed/failed/cancelled run, a chat/judge/interactive run (which never times out), or a
+-- request that would push the total extension past @cap all match 0 rows. A 0-row result is
+-- disambiguated in Go by re-reading the already-fetched run (terminal -> ErrRunTerminal; untimed
+-- kind -> ErrExtendNotTimed; else -> ErrExtensionCapExceeded). On 0 rows the INSERT selects from
+-- the empty CTE and writes NO audit row, so a refused extend leaves no trace.
+--
+-- disposition = 'applied' at insert (the CHECK from 00162 admits it): an extension takes effect
+-- in the SAME statement, so there is nothing left to settle later — a NULL would leave the row
+-- "pending" in `uzi run inputs` forever. The final RETURNING is a scalar over the CTE, COALESCEd
+-- and cast so sqlc types it as a plain int32 (the new total); on a refusal the INSERT returns 0
+-- rows and yields pgx.ErrNoRows, and the COALESCE default is never actually observed.
+WITH extended AS (
+    UPDATE runs SET budget_extension_seconds = budget_extension_seconds + sqlc.arg('secs')::int,
+                    updated_at = now()
+    WHERE id = sqlc.arg('id')
+      AND status NOT IN ('completed', 'failed', 'cancelled')
+      AND kind NOT IN ('chat', 'judge')
+      AND interactive = false
+      AND budget_extension_seconds + sqlc.arg('secs')::int <= sqlc.arg('cap')::int
+    RETURNING budget_extension_seconds
+)
+INSERT INTO run_user_inputs (run_id, kind, body, disposition)
+SELECT sqlc.arg('id'), 'extend', sqlc.narg('body'), 'applied' FROM extended
+RETURNING COALESCE((SELECT budget_extension_seconds FROM extended), 0)::int AS budget_extension_seconds;
+
 -- name: ConsumeRunInputs :many
 -- FIFO consume: mark and return every pending input for the run, oldest first.
 -- FOR UPDATE SKIP LOCKED keeps two concurrent polls from returning the same row.
@@ -3438,10 +3481,13 @@ WITH pending AS (
     -- (paused branch: a 'follow_up' the resumed claim's pullFollowUp reads, alongside the
     -- paused → queued transition through ResumePausedRun; live awaiting_input branch: an
     -- 'answer' that resolves the worker's completion-question await), never this raw row — so
-    -- draining it would likewise hit the default arm. 'pause' and
+    -- draining it would likewise hit the default arm. PRD #1189 adds 'extend' for the SAME
+    -- reason: the extend audit row is server-only exactly like 'scope' — its control travels
+    -- as runs.budget_extension_seconds on the ACK/claim, never through this queue — so the
+    -- worker must never drain or route it either. 'pause' and
     -- 'pause_cancel' are NOT excluded — the worker DOES consume them (the `now` abort and the
     -- flag clear). Everything else consumes as before.
-    WHERE p.run_id = @run_id AND p.consumed_at IS NULL AND p.kind NOT IN ('scope', 'resume', 'completion_decision')
+    WHERE p.run_id = @run_id AND p.consumed_at IS NULL AND p.kind NOT IN ('scope', 'resume', 'completion_decision', 'extend')
     ORDER BY p.id ASC
     FOR UPDATE SKIP LOCKED
 ),
@@ -3613,6 +3659,9 @@ UPDATE runs SET checkpoint_tip = @checkpoint_tip, checkpoint_tip_at = now() WHER
 -- the run's EFFECTIVE timeout (budget_wall_seconds when frozen, else the global RUN_TIMEOUT).
 -- budget_wall_seconds is NULL for a run on the global default. interactive lets the arm skip
 -- interactive runs, which SweepRunningTimeout never times out.
+-- PRD #1189: budget_extension_seconds rides this read too so the near-timeout arm measures
+-- against the EXTENDED effective timeout — the extension moves the 85% line and the flag
+-- clears on the next tick once the arm no longer fires.
 -- PRD #84 M3: repo_id, kind and required_capabilities ride this read so the queued
 -- arm can surface a capability-specific "no eligible worker" reason (required caps not
 -- a subset of any online worker's effective caps). kind was previously only a WHERE
@@ -3624,7 +3673,7 @@ UPDATE runs SET checkpoint_tip = @checkpoint_tip, checkpoint_tip_at = now() WHER
 SELECT id, user_id, status, auto_approve,
        started_at, last_activity_at, updated_at, status_since,
        health, health_reason, health_since, health_notified_at,
-       budget_wall_seconds, budget_paused_seconds, interactive,
+       budget_wall_seconds, budget_paused_seconds, budget_extension_seconds, interactive,
        repo_id, kind, required_capabilities, completion_contract_version
 FROM runs
 WHERE status IN ('queued', 'running', 'awaiting_approval')

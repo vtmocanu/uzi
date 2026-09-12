@@ -139,8 +139,10 @@ func decodeLatestUnmet(raw []byte) []string {
 // explicitly so this mapper stays a PURE function of its inputs — no now()/config
 // reaches into it. globalTimeout is the instance RUN_TIMEOUT (h.cfg.RunTimeout),
 // passed in the same way, so RunDeadline can be computed here without config access
-// (PRD #1170).
-func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration) apitypes.RunDTO {
+// (PRD #1170). extensionCapSeconds is the effective admin extension cap (PRD #1189,
+// RunExtensionCapSeconds; 0 = extending disabled) and now is the wall-clock instant used
+// for budget_used_seconds — both passed in so this mapper stays pure.
+func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, extensionCapSeconds int, now time.Time) apitypes.RunDTO {
 	dto := apitypes.RunDTO{
 		ID:               r.ID.String(),
 		Kind:             r.Kind,
@@ -178,7 +180,7 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration) ap
 		// PRD #1170: the server-computed wall-clock deadline the near-timeout badge
 		// counts down to. RunDeadline returns nil for a run with no wall deadline
 		// (not running, chat/judge/interactive, or no started_at).
-		DeadlineAt: workersvc.RunDeadline(r.StartedAt, r.BudgetWallSeconds, r.BudgetPausedSeconds, r.Kind, r.Interactive, r.Status, globalTimeout),
+		DeadlineAt: workersvc.RunDeadline(r.StartedAt, r.BudgetWallSeconds, r.BudgetPausedSeconds, r.Kind, r.Interactive, r.Status, globalTimeout, r.BudgetExtensionSeconds),
 		PlanMd:     textPtrValue(r.PlanMd.Valid, r.PlanMd.String),
 		PlanSource: r.PlanSource,
 		// PRD #362 M1: plain-English summaries. Intent/plan are nullable text; deltas
@@ -339,6 +341,35 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration) ap
 		v := int(r.BudgetWallSeconds.Int32)
 		dto.BudgetWallSeconds = &v
 	}
+	// PRD #1189: the owner-granted extension (NOT NULL DEFAULT 0 → plain int) and the
+	// effective admin cap, so the Extend chooser and the CLI need no second settings call.
+	// The cap is the same value RunExtensionCapSeconds returns (0 = extending disabled).
+	dto.BudgetExtensionSeconds = int(r.BudgetExtensionSeconds)
+	dto.BudgetExtensionCapSeconds = extensionCapSeconds
+	// PRD #1189: budget_total_seconds is COALESCE(budget_wall_seconds, RUN_TIMEOUT) +
+	// extension in seconds, but ONLY for a run that actually has a wall deadline — the same
+	// running/timed predicate RunDeadline/runWallClock use — so a client never shows a budget
+	// where none applies. Reusing dto.DeadlineAt (set above) as that predicate keeps the total
+	// and the deadline from ever disagreeing.
+	if dto.DeadlineAt != nil {
+		wall := int(globalTimeout / time.Second)
+		if r.BudgetWallSeconds.Valid && r.BudgetWallSeconds.Int32 > 0 {
+			wall = int(r.BudgetWallSeconds.Int32)
+		}
+		total := wall + int(r.BudgetExtensionSeconds)
+		dto.BudgetTotalSeconds = &total
+	}
+	// PRD #1189: budget_used_seconds is ACTIVE time so far — now - started_at - budget_paused,
+	// clamped at 0 — valid in every status (a paused/gated run reports a frozen figure) and nil
+	// when the run never started. This is the paused-aware "used" the header measures against
+	// the budget, NOT raw wall elapsed.
+	if r.StartedAt.Valid {
+		used := int(now.Sub(r.StartedAt.Time).Seconds()) - int(r.BudgetPausedSeconds)
+		if used < 0 {
+			used = 0
+		}
+		dto.BudgetUsedSeconds = &used
+	}
 	// PRD #634 M2: the operator scope ceiling rides the running-report ACK and the claim
 	// payload (both built here) so the worker honors it at the loop top and across a
 	// re-claim. pgtype.Int4 → *int, null (unbounded) when no scope directive was written.
@@ -409,6 +440,18 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration) ap
 		dto.PipelineWebURL = &url
 	}
 	return dto
+}
+
+// runExtensionCapSeconds reads the per-run extension cap (PRD #1189) best-effort for the DTO:
+// a nil settings cache or a read error reads as 0 (extending disabled / unknown), so a
+// momentarily-unreadable setting never fails a run read — the client falls back to plain
+// elapsed and the Extend button does not render (rollout-skew safe).
+func (h *Handler) runExtensionCapSeconds(ctx context.Context) int {
+	if h.settings == nil {
+		return 0
+	}
+	c, _ := h.settings.RunExtensionCapSeconds(ctx)
+	return c
 }
 
 // failureSnapshotWebURL pulls just the pipeline web URL out of a run's

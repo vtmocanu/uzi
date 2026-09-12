@@ -116,6 +116,12 @@ const (
 	KeyHealthQueuedSeconds        = "health_queued_seconds"
 	KeyHealthApprovalSeconds      = "health_approval_seconds"
 	KeyHealthNudgeCooldownSeconds = "health_nudge_cooldown_seconds"
+	// KeyRunExtensionCapSeconds (PRD #1189) is the TOTAL extra wall-clock time, in seconds,
+	// an owner may grant a single run through Extend (budget_extension_seconds). It is a
+	// per-run total, not per-extension, so repeating Extend cannot exceed it. 0 disables
+	// extending entirely; a non-zero value is [3600, 604800] (1h to 7d) — validated by
+	// validateExtensionCapSeconds, whose bounds differ from validateHealthSeconds.
+	KeyRunExtensionCapSeconds = "run_extension_cap_seconds"
 	// Hosted-worker per-user quota (PRD #58 Decision 8): the single knob bounding
 	// self-service provisioning. An integer in {0} ∪ [1, maxHostedWorkerQuota],
 	// where 0 disables self-service entirely (the API then 403s a provision).
@@ -326,6 +332,9 @@ const (
 	DefaultHealthQueuedSeconds        = "600"  // 10m stuck queued
 	DefaultHealthApprovalSeconds      = "3600" // 1h idle awaiting approval
 	DefaultHealthNudgeCooldownSeconds = "1800" // 30m between Slack nudges per run
+	// PRD #1189: 16h of total extension per run by default (two full 8h ceilings) —
+	// generous for a human decision and still finite. 0 turns extending off.
+	DefaultRunExtensionCapSeconds = "57600"
 	// PRD #58 Decision 8: two hosted workers per user by default. Hosting is itself
 	// off unless WORKER_HOSTING_ENABLED is set (the compose default), so this value
 	// only ever applies on a k8s deployment that deliberately turned hosting on —
@@ -452,6 +461,7 @@ var Defaults = map[string]string{
 	KeyCompletionInterlockRollout: DefaultCompletionInterlockRollout,
 	KeyHealthStallSeconds:         DefaultHealthStallSeconds,
 	KeyHealthNearTimeoutPct:       DefaultHealthNearTimeoutPct,
+	KeyRunExtensionCapSeconds:     DefaultRunExtensionCapSeconds,
 	KeyHealthQueuedSeconds:        DefaultHealthQueuedSeconds,
 	KeyHealthApprovalSeconds:      DefaultHealthApprovalSeconds,
 	KeyHealthNudgeCooldownSeconds: DefaultHealthNudgeCooldownSeconds,

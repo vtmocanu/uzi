@@ -156,6 +156,9 @@ func (f *healthFakeStore) SetRunHealth(_ context.Context, arg store.SetRunHealth
 type fakeHealthSettings struct {
 	enabled                                           bool
 	stall, nearTimeoutPct, queued, approval, cooldown int
+	// PRD #1189: the per-run extension cap the `extend` SubmitInput branch reads. Zero (the
+	// default) means extending is disabled, so a test opts in with a non-zero cap.
+	runExtensionCap int
 }
 
 func (s fakeHealthSettings) HealthEnabled(context.Context) (bool, error)     { return s.enabled, nil }
@@ -169,6 +172,9 @@ func (s fakeHealthSettings) HealthApprovalSeconds(context.Context) (int, error) 
 }
 func (s fakeHealthSettings) HealthNudgeCooldownSeconds(context.Context) (int, error) {
 	return s.cooldown, nil
+}
+func (s fakeHealthSettings) RunExtensionCapSeconds(context.Context) (int, error) {
+	return s.runExtensionCap, nil
 }
 
 // fakeAllowlistReader is a static DockerAllowlistReader (PRD #361): ids is the canned
@@ -388,6 +394,48 @@ func TestHealthNearTimeoutFrozenBudget(t *testing.T) {
 			r.BudgetWallSeconds = frozenBudget(8)
 			r.StartedAt = ago(time.Duration(tc.activeHrs) * time.Hour)
 			r.LastActivityAt = ago(1 * time.Minute) // recent → not stalled
+			fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}}
+			svc := healthSvc(fs, defaultHealthSettings())
+
+			n := svc.detectRunHealth(context.Background(), t0)
+			if tc.wantFlag {
+				if n != 1 {
+					t.Fatalf("changed = %d, want 1 (%s)", n, tc.name)
+				}
+				if w := lastWrite(t, fs, r.ID); w.Health != healthSlow {
+					t.Fatalf("health = %q, want slow", w.Health)
+				}
+			} else if n != 0 {
+				w := lastWrite(t, fs, r.ID)
+				t.Fatalf("changed = %d, want 0 (%s); wrote %q", n, tc.name, w.Health)
+			}
+		})
+	}
+}
+
+// TestHealthNearTimeoutMovesWithExtension: the near-timeout arm measures against the
+// EXTENDED budget (PRD #1189 M1). A frozen 8h budget with a 2h extension has an effective
+// 10h wall, so 85% is 8h30m: a run 7h active (70% of 10h) does NOT flag, and the same run
+// 8h30m active (exactly 85%) DOES. Without the extension a 7h-of-8h run would already flag
+// at 87.5%, so this pins that runWallClock folds budget_extension_seconds into effTimeout.
+// Mutation check: dropping `effTimeout += budget_extension_seconds` reddens both rows (the
+// 7h case flags spuriously and the 8h30m case would flag against the wrong 8h base).
+func TestHealthNearTimeoutMovesWithExtension(t *testing.T) {
+	cases := []struct {
+		name     string
+		active   time.Duration
+		wantFlag bool
+	}{
+		{"7h of 8h+2h (70%) does not flag", 7 * time.Hour, false},
+		{"8h30m of 8h+2h (85%) flags", 8*time.Hour + 30*time.Minute, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := runRow("running")
+			r.BudgetWallSeconds = frozenBudget(8)         // 28800s frozen budget
+			r.BudgetExtensionSeconds = int32(2 * 60 * 60) // +7200s human-granted extension
+			r.StartedAt = ago(tc.active)                  // active time since start
+			r.LastActivityAt = ago(1 * time.Minute)       // recent → not stalled
 			fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}}
 			svc := healthSvc(fs, defaultHealthSettings())
 
@@ -978,27 +1026,36 @@ func TestRunDeadline(t *testing.T) {
 		started     pgtype.Timestamptz
 		budget      pgtype.Int4
 		paused      int32
+		ext         int32 // PRD #1189 M1: budget_extension_seconds, added to the sum
 		kind        string
 		interactive bool
 		status      string
 		wantNil     bool
 		want        time.Time
 	}{
-		{"8h budget + 32m pause", started, budget8h, int32(32 * 60), "issue", false, "running", false, t0.Add(8*time.Hour + 32*time.Minute)},
-		{"null budget uses globalTimeout", started, nullBudget, 0, "issue", false, "running", false, t0.Add(globalTimeout)},
-		{"null started_at", pgtype.Timestamptz{}, budget8h, 0, "issue", false, "running", true, time.Time{}},
-		{"chat", started, budget8h, 0, "chat", false, "running", true, time.Time{}},
-		{"judge", started, budget8h, 0, "judge", false, "running", true, time.Time{}},
-		{"interactive", started, budget8h, 0, "task", true, "running", true, time.Time{}},
-		{"queued", started, budget8h, 0, "issue", false, "queued", true, time.Time{}},
-		{"awaiting_approval", started, budget8h, 0, "issue", false, "awaiting_approval", true, time.Time{}},
-		{"completed", started, budget8h, 0, "issue", false, "completed", true, time.Time{}},
-		{"failed", started, budget8h, 0, "issue", false, "failed", true, time.Time{}},
-		{"cancelled", started, budget8h, 0, "issue", false, "cancelled", true, time.Time{}},
+		{"8h budget + 32m pause", started, budget8h, int32(32 * 60), 0, "issue", false, "running", false, t0.Add(8*time.Hour + 32*time.Minute)},
+		{"null budget uses globalTimeout", started, nullBudget, 0, 0, "issue", false, "running", false, t0.Add(globalTimeout)},
+		// PRD #1189 M1: the extension is added on top of the frozen budget AND the pause.
+		// 8h wall + 30m pause + 2h extension = 10h30m. Mutation check: dropping the
+		// `effTimeout += budget_extension_seconds` fold in runWallClock reddens this case.
+		{"8h budget + 30m pause + 2h extension", started, budget8h, int32(30 * 60), int32(2 * 60 * 60), "issue", false, "running", false, t0.Add(10*time.Hour + 30*time.Minute)},
+		{"extension alone, no pause", started, budget8h, 0, int32(2 * 60 * 60), "issue", false, "running", false, t0.Add(10 * time.Hour)},
+		// A run with no wall deadline (chat) stays nil even when an extension is present:
+		// the extension only moves an EXISTING deadline, it never creates one.
+		{"chat with extension stays nil", started, budget8h, 0, int32(2 * 60 * 60), "chat", false, "running", true, time.Time{}},
+		{"null started_at", pgtype.Timestamptz{}, budget8h, 0, 0, "issue", false, "running", true, time.Time{}},
+		{"chat", started, budget8h, 0, 0, "chat", false, "running", true, time.Time{}},
+		{"judge", started, budget8h, 0, 0, "judge", false, "running", true, time.Time{}},
+		{"interactive", started, budget8h, 0, 0, "task", true, "running", true, time.Time{}},
+		{"queued", started, budget8h, 0, 0, "issue", false, "queued", true, time.Time{}},
+		{"awaiting_approval", started, budget8h, 0, 0, "issue", false, "awaiting_approval", true, time.Time{}},
+		{"completed", started, budget8h, 0, 0, "issue", false, "completed", true, time.Time{}},
+		{"failed", started, budget8h, 0, 0, "issue", false, "failed", true, time.Time{}},
+		{"cancelled", started, budget8h, 0, 0, "issue", false, "cancelled", true, time.Time{}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := RunDeadline(tc.started, tc.budget, tc.paused, tc.kind, tc.interactive, tc.status, globalTimeout)
+			got := RunDeadline(tc.started, tc.budget, tc.paused, tc.kind, tc.interactive, tc.status, globalTimeout, tc.ext)
 			if tc.wantNil {
 				if got != nil {
 					t.Fatalf("RunDeadline = %v, want nil", *got)

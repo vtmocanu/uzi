@@ -731,6 +731,16 @@ export interface IterationBudget {
   maxIterations?: number;
   wallSeconds?: number;
   /**
+   * PRD #1189 M1 (D6): the run's TOTAL wall-clock budget the server serves — COALESCE(
+   * budget_wall_seconds, RUN_TIMEOUT) + budget_extension_seconds — off the SAME running-report
+   * ACK as `wallSeconds`. When present it is the authoritative served wall; the sdk-executor
+   * re-arms its hard wall UPWARD to it (only ever grows) so an owner-granted extension lifts the
+   * wall of a run already executing and it does not self-trip REASON_WALL at the frozen budget.
+   * Absent ⇒ an older server that does not serve the total; the executor falls back to
+   * `wallSeconds` for back-compat.
+   */
+  totalWallSeconds?: number;
+  /**
    * The operator scope ceiling and the server's fresh completed-milestone count (PRD #634
    * M2), carried off the SAME running-report ACK as the budget fields. m3's loop-top honor
    * gate reads them to decide whether the run may start another milestone. `completedCount`
@@ -1923,6 +1933,13 @@ export interface StateAck {
    *  worker's current budget unchanged. */
   budgetMaxIterations?: number;
   budgetWallSeconds?: number;
+  /** PRD #1189 M1 (D6): the run's TOTAL wall-clock budget the server serves — the DTO's
+   *  `budget_total_seconds` field, COALESCE(budget_wall_seconds, RUN_TIMEOUT) +
+   *  budget_extension_seconds. When present it is the authoritative served wall and the
+   *  sdk-executor re-arms its hard wall UPWARD to it so an owner-granted extension lifts the
+   *  wall of a run already executing. Null/absent (older server, a run with no wall deadline,
+   *  an unparseable body) ⇒ the executor falls back to `budgetWallSeconds`. */
+  budgetTotalSeconds?: number;
   /** The operator scope ceiling and the server's fresh completed-milestone count (PRD #634
    *  M2), read off the SAME `{run: RunDTO}` body as `status` and the budget. `scopeCeiling`
    *  is the count of milestones the run may complete over the immutable frozen list (absent ⇒
