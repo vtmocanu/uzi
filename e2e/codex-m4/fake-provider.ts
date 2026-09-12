@@ -164,6 +164,109 @@ export function scriptedAllowedBashResponder(bashArg: string): (body: ResponsesB
   };
 }
 
+// ─── C3 scripted multi-step responders + native-authority inspection ────────────
+//
+// C1's responder emits ONE tool then finishes. C3 policy/native-bypass cases drive a SEQUENCE of
+// model-selected callbacks (a forbidden one, then an allowed one, then done) and inspect the
+// advertised tool schema, so the fixture — never a model — decides every step deterministically.
+
+/** One scripted step the model "chooses" on the Nth provider request. `call` emits a
+ *  function_call (the dynamic worker wire name or a native name for a bypass attempt); `raw`
+ *  emits a verbatim Responses output item (e.g. a native `custom_tool_call` freeform patch);
+ *  `finish` ends the turn with an assistant message. */
+export type ScriptedStep =
+  | { readonly kind: "call"; readonly callId: string; readonly name: string; readonly args: Record<string, unknown> }
+  | { readonly kind: "raw"; readonly item: ResponseItem }
+  | { readonly kind: "finish"; readonly text?: string };
+
+/**
+ * A responder that emits the Nth scripted step on the Nth request, then a finish message once the
+ * steps are exhausted (so the turn always completes). A `finish` step short-circuits. Every step is
+ * fixed — no model choice (D4).
+ */
+export function scriptedStepsResponder(steps: readonly ScriptedStep[]): (body: ResponsesBody) => ResponseItem[] {
+  let i = 0;
+  return (): ResponseItem[] => {
+    const step = steps[i++];
+    if (step === undefined || step.kind === "finish") {
+      return [message(step?.kind === "finish" && step.text !== undefined ? step.text : "m4 sequence finished") as ResponseItem];
+    }
+    if (step.kind === "raw") return [step.item];
+    return [tool(step.callId, step.name, step.args) as ResponseItem];
+  };
+}
+
+/** A native freeform `apply_patch` custom-tool call (the shipped-Codex native patch surface). The
+ *  worker advertises `uzi_apply_patch`, never bare `apply_patch`, so this is a native-bypass probe. */
+export function nativeApplyPatchStep(callId: string, filename = "native-marker"): ScriptedStep {
+  return {
+    kind: "raw",
+    item: {
+      type: "custom_tool_call",
+      call_id: callId,
+      name: "apply_patch",
+      input: `*** Begin Patch\n*** Add File: ${filename}\n+native marker\n*** End Patch`,
+    } as ResponseItem,
+  };
+}
+
+/** Representative NATIVE Codex tool identities that must NEVER be advertised to the model on the
+ *  production native-disabled path (config.ts turns shell/exec/unified_exec/apply_patch_freeform/
+ *  code_mode/view_image/web_search/… off). A dynamic WORKER tool is `uzi_*` / a recognized
+ *  callback name — deliberately distinct from every entry here, so an allowed worker callback is
+ *  never mistaken for native execution. */
+export const CODEX_NATIVE_TOOL_NAMES: readonly string[] = [
+  "shell",
+  "local_shell",
+  "exec_command",
+  "exec",
+  "unified_exec",
+  "write_stdin",
+  "container.exec",
+  "apply_patch",
+  "view_image",
+  "web_search",
+  "web_search_preview",
+  "read_file",
+  "list_dir",
+  "sleep",
+  "update_plan",
+  "code_interpreter",
+];
+
+/** Extract the identity of one advertised Responses tool: a `function`/`custom` tool is its
+ *  `name` (or `function.name`); a built-in tool IS its `type` (e.g. `{type:"local_shell"}`). */
+function advertisedToolIdentity(t: Record<string, unknown>): string | undefined {
+  const type = typeof t.type === "string" ? t.type : undefined;
+  if (type === "function" || type === "custom") {
+    if (typeof t.name === "string") return t.name;
+    const fn = t.function;
+    if (fn !== null && typeof fn === "object" && typeof (fn as Record<string, unknown>).name === "string") {
+      return (fn as Record<string, unknown>).name as string;
+    }
+    return undefined;
+  }
+  return type;
+}
+
+/** The set of advertised tool identities in a `tools` array (worker wire names AND any native
+ *  identity, so a caller can assert exactly which are present/absent). */
+export function advertisedToolIdentities(tools: readonly Record<string, unknown>[]): string[] {
+  const out: string[] = [];
+  for (const t of tools) {
+    const id = advertisedToolIdentity(t);
+    if (id !== undefined) out.push(id);
+  }
+  return out;
+}
+
+/** Any NATIVE tool identity found in an advertised `tools` array — a non-empty result is a
+ *  reachable native authority on the production path (a BLOCKING defect under D6). */
+export function nativeToolsAdvertised(tools: readonly Record<string, unknown>[]): string[] {
+  const identities = new Set(advertisedToolIdentities(tools));
+  return CODEX_NATIVE_TOOL_NAMES.filter((n) => identities.has(n));
+}
+
 /** Count the tool-call REPLIES (function/custom tool-call OUTPUT items) fed back across every
  *  recorded request — provider-visible evidence the broker executed a tool and returned its
  *  result to Codex. */

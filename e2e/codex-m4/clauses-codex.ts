@@ -12,6 +12,20 @@
 
 import type { ClauseRow } from "./clause.js";
 import { CODEX_STARTUP_SMOKE_TITLE } from "./titles.js";
+import {
+  CODEX_P_NATIVE_ABSENT_TITLE,
+  CODEX_P_ISOLATION_ENV_TITLE,
+  CODEX_P_SHELL_POLICY_TITLE,
+  CODEX_P_FILE_POLICY_TITLE,
+  CODEX_U_NATIVE_DISPATCH_TITLE,
+  CODEX_U_SHELL_VARIANTS_TITLE,
+  CODEX_U_FILE_VARIANTS_TITLE,
+  CODEX_U_PHASE_GRANTS_TITLE,
+  CODEX_U_ROLE_FAILCLOSED_TITLE,
+  CODEX_U_SIGNAL_ORIGIN_TITLE,
+  CODEX_U_SIGNAL_REPLAY_TITLE,
+  CODEX_U_TRUST_CONSTRUCTION_TITLE,
+} from "./titles-c3.js";
 
 export const CODEX_CLAUSES: ClauseRow[] = [
   {
@@ -89,5 +103,193 @@ export const CODEX_CLAUSES: ClauseRow[] = [
         + "ABSENCE from a direct harness spawn.",
       owner: "maintainer (D8: fresh packaged O proof, k8s-first Linux runtime)",
     },
+  },
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // C3 REAL rows (PRD #1287). P = real pinned app-server; U = real broker/registry/render/config.
+  // Each pairs a positive control with a negative-effect oracle (spawn/fileop/marker/registry),
+  // never denial text alone (D4). The C1 required matrix already enforces every codex/P row here;
+  // C5 tightens the matrix to also enforce the codex/U rows.
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  // ── Native execution bypass ──
+  {
+    id: "codex-p-native-bypass-forced-dispatch",
+    adapter: "codex",
+    layer: "P",
+    family: "Native execution bypass",
+    seam: "codex/launcher.ts:launchCodexRoot + config.ts native-disabled template (shell_tool/unified_exec/code_mode/apply_patch_freeform off) → app-server dispatch",
+    positiveControl:
+      "the intended-model custom exec (the dynamic uzi_bash callback) reaches its command-identity "
+      + "effect through the REAL broker on the real protocol",
+    negativeOracle:
+      "forced native shell/exec_command/unified_exec/write_stdin/local_shell function-calls and a "
+      + "native freeform apply_patch custom-tool-call produce NO worker callback, NO command spawn, "
+      + "NO fileop and NO marker file (absolute marker paths asserted absent after the turn)",
+    intendedOutcome:
+      "no alternate native execution authority or retained writable terminal exists on the "
+      + "production path; only the dynamic worker exec runs",
+    tests: [CODEX_P_NATIVE_ABSENT_TITLE],
+  },
+  {
+    id: "codex-u-native-bypass-broker-deny",
+    adapter: "codex",
+    layer: "U",
+    family: "Native execution bypass",
+    seam: "codex/broker.ts:authorizeAndDispatch (capabilityOf → unknown_tool)",
+    positiveControl: "the intended worker exec (Bash) reaches the command spawn seam exactly once",
+    negativeOracle:
+      "every native name (shell/exec_command/unified_exec/write_stdin/local_shell/container.exec/"
+      + "exec/code_interpreter) is denied unknown_tool with the spawn seam AND fileop client at zero calls",
+    intendedOutcome:
+      "a native tool name reaching the real broker gains no capability; a dynamic worker name is "
+      + "distinct and never mistaken for native execution",
+    tests: [CODEX_U_NATIVE_DISPATCH_TITLE],
+  },
+
+  // ── Shell policy ──
+  {
+    id: "codex-p-shell-policy",
+    adapter: "codex",
+    layer: "P",
+    family: "Shell policy",
+    seam: "codex/broker.ts:dispatchShell → guardrails.ts:screenBashCommand (real protocol)",
+    positiveControl: "a harmless in-worktree command reaches the command spawn seam exactly once and its result returns",
+    negativeOracle:
+      "git push and a synthetic provider-HOME secret read are denied and NEVER reach the command "
+      + "spawn seam (zero spawn count), so neither runs a marker nor discloses the synthetic secret",
+    intendedOutcome: "shell screening is reached on the real protocol; a forbidden command produces no effect while an allowed one does",
+    tests: [CODEX_P_SHELL_POLICY_TITLE],
+  },
+  {
+    id: "codex-u-shell-variants",
+    adapter: "codex",
+    layer: "U",
+    family: "Shell policy",
+    seam: "codex/broker.ts:dispatchShell → guardrails.ts:screenBashCommand (git/env/proc/secret/wrapper-depth)",
+    positiveControl: "a harmless command reaches the command spawn seam",
+    negativeOracle:
+      "git push / git -C x push / sh -c 'git push' / git config --get / bare env / a /proc environ read / "
+      + "a plaintext synthetic-secret read / wrapper-depth exhaustion are all denied with a zero spawn "
+      + "count; the ENCODED base64 pipe is ALLOWED (documented screener residual) and its recorded argv "
+      + "discloses no plaintext secret — OS command-root separation (codex-o-command-root-home-denial) is its containment",
+    intendedOutcome: "screening reaches production policy for every plaintext form; the base64 residual is characterized honestly, not as a fabricated denial",
+    tests: [CODEX_U_SHELL_VARIANTS_TITLE],
+    prerequisites: ["codex-o-command-root-home-denial"],
+  },
+
+  // ── File policy ──
+  {
+    id: "codex-p-file-policy",
+    adapter: "codex",
+    layer: "P",
+    family: "File policy",
+    seam: "codex/broker.ts:screenAndRelativize → guardrails.ts:screenToolPath (real protocol)",
+    positiveControl: "an allowed in-worktree write + read reach the fileop client",
+    negativeOracle:
+      "an outside-worktree path and a credential/secret path (the D6 codex-data prefix) are denied "
+      + "BEFORE the fileop client (no fileop op recorded against a forbidden path)",
+    intendedOutcome: "production path enforcement denies before the effect on the real protocol; allowed workspace ops work",
+    tests: [CODEX_P_FILE_POLICY_TITLE],
+  },
+  {
+    id: "codex-u-file-variants",
+    adapter: "codex",
+    layer: "U",
+    family: "File policy",
+    seam: "codex/broker.ts:screenAndRelativize → guardrails.ts:screenToolPath (realpath canonicalization) + dispatchFileWrite",
+    positiveControl: "an allowed in-worktree write reaches the fileop client exactly once",
+    negativeOracle:
+      "a .git write, an outside-worktree write, a symlink-escape read (real on-disk symlink → /etc), "
+      + "and a malformed patch (empty old_string) are all denied with zero forbidden fileop ops",
+    intendedOutcome: "production path/schema enforcement denies before the effect; canonicalization catches a symlink escape",
+    tests: [CODEX_U_FILE_VARIANTS_TITLE],
+  },
+
+  // ── Isolation and compatibility ──
+  {
+    id: "codex-p-isolation-sparse-env",
+    adapter: "codex",
+    layer: "P",
+    family: "Isolation and compatibility",
+    seam: "codex/launcher.ts:buildReplacedEnv (full-replacement sparse env) observed via the real launchCodexRoot spawn",
+    positiveControl: "the real app-server is spawned and completes a turn under the replaced env",
+    negativeOracle:
+      "the captured spawn env carries NO provider credential and NO inherited worker-token/OAuth "
+      + "shape, and is a bounded allowlist (not a merged process.env)",
+    intendedOutcome: "command/provider credential separation and full-replacement isolation hold; no credential or authority leaks into the app-server env",
+    tests: [CODEX_P_ISOLATION_ENV_TITLE],
+  },
+
+  // ── Roles and phases ──
+  {
+    id: "codex-u-phase-grants",
+    adapter: "codex",
+    layer: "U",
+    family: "Roles and phases",
+    seam: "codex/render.ts:renderCodexRun grants (phase) + codex/broker.ts:dispatchFileWrite (write_denied_in_plan)",
+    positiveControl: "the implement-phase write reaches the fileop client",
+    negativeOracle: "the plan-phase write is denied write_denied_in_plan with zero fileop ops; the grants are the REAL render output for each phase",
+    intendedOutcome: "the immutable per-phase grants decide: a plan-phase write is denied then a later implement-phase write is allowed",
+    tests: [CODEX_U_PHASE_GRANTS_TITLE],
+  },
+  {
+    id: "codex-u-role-failclosed",
+    adapter: "codex",
+    layer: "U",
+    family: "Roles and phases",
+    seam: "codex/render.ts grants + codex/broker.ts:authorizeAndDispatch/dispatchDelegate/dispatchMcp",
+    positiveControl: "a granted tool runs, a known-role delegation reaches the delegate seam, and a granted skill reaches its handler",
+    negativeOracle:
+      "an unknown tool (unknown_tool), a spoofed/unknown delegation role (unknown_role, delegate seam "
+      + "never reached), and a disallowed skill (denied_skill, handler never reached) all fail closed",
+    intendedOutcome: "immutable registry grants decide; unknown input fails closed while valid allocated actions still run",
+    tests: [CODEX_U_ROLE_FAILCLOSED_TITLE],
+  },
+
+  // ── Workflow signals ──
+  {
+    id: "codex-u-signal-origin",
+    adapter: "codex",
+    layer: "U",
+    family: "Workflow signals",
+    seam: "codex/broker.ts:dispatchSignal (origin/isRoot gate) + signals.ts:scanSignals",
+    positiveControl: "a valid root submit_plan/signal_done latches once and surfaces its scanned payload for the reducer",
+    negativeOracle:
+      "child and unknown-origin submit_plan/signal_done are denied signal_root_only with NO scanned "
+      + "output (nothing for a reducer to fold) and never touch the command/file surfaces",
+    intendedOutcome: "no unauthorized handler invocation or reducer transition; a valid root signal changes state exactly once",
+    tests: [CODEX_U_SIGNAL_ORIGIN_TITLE],
+  },
+  {
+    id: "codex-u-signal-replay",
+    adapter: "codex",
+    layer: "U",
+    family: "Workflow signals",
+    seam: "codex/registry.ts:reserveCallback (replay / changed_reuse) via codex/broker.ts:handleToolCall",
+    positiveControl: "the original callback runs its effect exactly once",
+    negativeOracle:
+      "a replayed (thread,turn,call) with the same payload returns the cached terminal with NO second "
+      + "effect (spawn count unchanged); a same-id reuse with a CHANGED payload is denied changed_reuse "
+      + "with no second effect; a settled root signal replayed returns the cached terminal (latches once)",
+    intendedOutcome: "direct malformed/replayed identity injection (a UNIT/broker layer) causes no unauthorized re-execution or extra reducer transition",
+    tests: [CODEX_U_SIGNAL_REPLAY_TITLE],
+  },
+
+  // ── Repository trust ──
+  {
+    id: "codex-u-trust-construction",
+    adapter: "codex",
+    layer: "U",
+    family: "Repository trust",
+    seam: "codex/config.ts:buildCodexProductionConfigToml/buildCodexLoopbackTestConfigToml + codex-harness.ts:threadConfig (start/resume)",
+    positiveControl: "the real executor completes a fresh-start run and a resumed run",
+    negativeOracle:
+      "the fixed config template pins project_doc_max_bytes=0 + trust_level untrusted and every native "
+      + "feature off, rejects any unknown (smuggled repo/hook) key, and references no AGENTS.md/.codex; "
+      + "thread/start (start) AND thread/resume (resume) RE-assert the untrusted config and turn/start "
+      + "reasserts environments:[]; no repo trust surface rides any construction request",
+    intendedOutcome: "untrusted repo content cannot install instructions, callbacks or execution authority at start, resume or a subsequent turn",
+    tests: [CODEX_U_TRUST_CONSTRUCTION_TITLE],
   },
 ];
