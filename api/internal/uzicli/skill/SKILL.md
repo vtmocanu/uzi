@@ -77,7 +77,7 @@ it.
 | 3 | auth required / invalid / wrong scope | (re)authenticate, or use an admin-scoped token for `admin`/`--json` admin views |
 | 4 | not found | the run/worker/repo id does not exist or is not visible to you |
 | 5 | conflict (e.g. the run already finished) | re-read state with `uzi run get`; the action no longer applies |
-| 6 | server unreachable / 5xx | transient; back off and retry |
+| 6 | server unreachable / 5xx, or 429 rate-limited | transient; back off and retry (a 429 carries a `Retry-After` hint in the message) |
 | 7 | a wait deadline elapsed (`run wait --timeout`) before any target state | the run is still working; re-`wait` or raise `--timeout` |
 
 ### Configuration and credentials
@@ -211,6 +211,11 @@ uzi repo list
 uzi repo remove <id> [--force]
 uzi project-sync status <repo>
 uzi project-sync resync <repo>
+uzi pr list [--repo <repo-id>]
+uzi pr checks <iid> [--repo <repo-id>] [--watch]
+uzi ci list [--repo <repo-id>] [--limit <n>]
+uzi ci jobs <run-id> [--repo <repo-id>]
+uzi ci fix <ref> [--repo <repo-id>]
 uzi handoff [--message <text>] [--file <path>] [--base <ref>] [--mr] [--review] [--then-fix] [--interactive] [--repo <repo-id>]
 uzi handoff rm <run-id>
 uzi handoff review <run-id>
@@ -1239,6 +1244,33 @@ into `file`/`dismiss`. `undo` keys on the `disposition_id` field (read it from
   reads the agent-source config (repo, ref, enabled, interval, and whether a
   credential is set — never its value) and sync status (last sync/apply, staged
   counts, pending); the "Sync now" and approve-and-apply writes stay web-only.
+
+### PR and CI views
+
+Read a repo's forge PR/MR and CI state through the api's stored connection PAT — no
+`gh`, no personal token. `--repo` defaults to your single enabled repo; with several
+enabled repos, pass `--repo <id>` (from `uzi repo list`) or you get exit 2 naming the
+choices.
+
+- `uzi pr list [--repo <repo-id>]` — the repo's open PRs/MRs: iid, review decision,
+  conflicts, branch, title, and the `↳ run` id when a uzi run opened it. `--json`
+  emits the array of pull objects. The list carries no per-PR checks by design —
+  drill in with `pr checks` for those.
+- `uzi pr checks <iid> [--repo <repo-id>] [--watch]` — one PR's checks (name, state,
+  description, elapsed), a reviews summary and the merge blocked-reason. `--json`
+  emits the full detail object. `--watch` re-fetches on a fixed cadence and **exits 0
+  once no check is still pending** (every check settled); a transient 429/5xx during
+  the watch prints one stderr line, backs off, and keeps going.
+- `uzi ci list [--repo <repo-id>] [--limit <n>]` — the repo's recent CI runs
+  (workflow/pipeline) newest-first: `<name> #<number>`, event, branch, status,
+  elapsed, title. `--json` emits the array. On a forge version without the runs
+  endpoint it prints a one-line notice and exits 0 with no rows.
+- `uzi ci jobs <run-id> [--repo <repo-id>]` — one run's jobs, with GitHub Actions
+  steps indented beneath each job. `--json` emits the full detail object.
+- `uzi ci fix <ref> [--repo <repo-id>]` — queue a `ci_fix` run for a ref whose latest
+  cached pipeline is failed. The server re-validates that precondition, so a ref that
+  is not failed (or has no cached pipeline) is refused with a 409 (exit 5) and a
+  reason. Prints the created run id.
 
 ### Handoff — ephemeral branch-scoped task runs
 

@@ -139,6 +139,8 @@ uzi token list
 uzi worker list | rm <id> | set-token <worker-id> <label> | set-token <worker-id> --default
 uzi repo list | remove <id> [--force]
 uzi project-sync status <repo> | resync <repo>
+uzi pr list [--repo <id>] | checks <iid> [--repo <id>] [--watch]
+uzi ci list [--repo <id>] [--limit <n>] | jobs <run-id> [--repo <id>] | fix <ref> [--repo <id>]
 uzi admin users | runs | workers | usage | rate-limits | cli-tokens | guardrail-impact | blocked-repos
 uzi admin agent-source get | status
 uzi skill status | install [--force] | install-hook | uninstall-hook
@@ -740,6 +742,50 @@ namespace, and refuses a run that opened an MR (delete it via the MR
 instead) or one that isn't a `task` run at all. There's no server-side
 auto-prune of stale task branches yet — `rm` is the v1 cleanup story; run it
 once you've pulled what you need.
+
+## Forge views from the CLI: `uzi pr` and `uzi ci`
+
+`uzi` reads a repo's open PRs/MRs and its CI runs straight through the API,
+which already holds the forge PAT — so you never install or authenticate `gh`,
+and you never leave the terminal to check whether a PR's checks went green.
+
+```sh
+uzi pr list                       # open PRs/MRs on your enabled repo
+uzi pr checks 1254                # one PR's checks, reviews, merge state
+uzi pr checks 1254 --watch        # re-poll until no check is pending, then exit 0
+uzi ci list --limit 20            # recent CI runs, newest first
+uzi ci jobs 34677104577           # one run's jobs and steps
+uzi ci fix agent/issue-1246       # queue a CI-fix run for a failed ref
+```
+
+Every command takes `--repo <id>`. Omit it and `uzi` defaults to your single
+**enabled** repo; if several are enabled it exits `2` and names the choices, so
+you always know which repo you're looking at. Get repo ids from `uzi repo list`.
+
+- **`uzi pr list`** shows each open PR's iid, review decision, conflicts,
+  branch, title, and the `↳ run` id when a uzi run opened it. It deliberately
+  carries no per-PR check counts — checks are a drill-in, so use `pr checks`
+  for those.
+- **`uzi pr checks <iid>`** shows one PR's checks (name, state, description,
+  elapsed), a reviews summary, and the merge blocked-reason. `--watch` re-fetches
+  and re-prints on a fixed cadence and **exits 0 the moment no check is still
+  pending** — the scriptable "wait for CI to settle" primitive. A transient
+  rate-limit (`429`) or server blip during a watch prints one line to stderr,
+  backs off (honouring the server's `Retry-After`), and keeps watching.
+- **`uzi ci list`** shows the repo's recent workflow/pipeline runs
+  (`<name> #<number>`, event, branch, status, elapsed, title), newest first;
+  `--limit <n>` bounds the page (server default 30, capped at 100). On a forge
+  version that has no CI-runs endpoint it prints a one-line notice and exits 0.
+- **`uzi ci jobs <run-id>`** shows one run's jobs, with GitHub Actions steps
+  indented beneath each job.
+- **`uzi ci fix <ref>`** queues a `ci_fix` run for a ref whose latest cached
+  pipeline is failed. The server re-checks that precondition, so a ref that is
+  not failed (or has no cached pipeline) is refused with a `409` (exit 5) and a
+  reason; on success it prints the created run id.
+
+All five support `--json` (a top-level array for the lists, one object for a
+detail), for agents. The human table's PR/MR noun follows the repo's forge
+(GitLab says MR).
 
 ## Watching runs live: `uzi tui`
 
