@@ -248,6 +248,15 @@ func (m tuiModel) pullsRepoReady() bool {
 	return m.repoChosen && m.repoIdx >= 0 && m.repoIdx < len(m.repos)
 }
 
+// reposReady reports whether the shared forge repo scope has resolved: a successful ListRepos
+// has landed with no error. It is false while still loading the first page AND after a failure
+// (reposErr set), which is exactly the "re-issue fetchReposCmd" condition the pulls-tick / r
+// self-heal keys off (PRD #1255). An empty-but-loaded set (no enabled repos) is READY — a
+// resolved state, not a failure to retry.
+func (m tuiModel) reposReady() bool {
+	return m.reposLoaded && m.reposErr == nil
+}
+
 // defaultRepoIdx implements D2's default: the repo of the newest non-chat board run when that
 // repo is in the enabled set (a chat run has a nil RepoID; the admin board lists other users'
 // runs, whose repos are not enabled for this viewer), else the first enabled repo.
@@ -386,6 +395,14 @@ func (m tuiModel) pullsKey(k string) (tea.Model, tea.Cmd) {
 		// the board's r. startPullsReq mints a fresh id so the next tick does not stack on it.
 		if m.pullsRepoReady() {
 			return m, (&m).startPullsReq()
+		}
+		// No repo resolved yet: when the shared repo scope is not ready (still loading, or a
+		// transient ListRepos failure), r retries fetchReposCmd — the precondition for any pulls
+		// fetch — so the user can recover the screen without restarting the TUI (PRD #1255). The
+		// reposInFlight guard keeps it from stacking a second outstanding repos fetch.
+		if !m.reposReady() && !m.reposInFlight {
+			m.reposInFlight = true
+			return m, m.fetchReposCmd()
 		}
 		return m, nil
 	case keyRepoCycle:
@@ -774,7 +791,11 @@ func (m tuiModel) pullsScopeState() string {
 }
 
 // pullsEmptyState covers a repo that is resolved but has no rows to show: still loading the
-// first page, a filter that matched nothing, or genuinely no open PRs.
+// first page, a filter that matched nothing, or genuinely no open PRs. The no-open-PRs line is
+// a left-aligned, sentence-case guiding line consistent with the sibling empty states (the
+// board's "No runs yet…", and this file's "No enabled repositories…" / "No pull requests match
+// the filter."), and names the scoped repo through renderer.Plain (PathWithNamespace is
+// forge-authored — D7) so it reads as guidance, not a bare label.
 func (m tuiModel) pullsEmptyState() string {
 	if !m.pulls.loaded {
 		return m.pal.faint.Render(" loading…") + "\n"
@@ -782,9 +803,11 @@ func (m tuiModel) pullsEmptyState() string {
 	if strings.TrimSpace(m.pulls.filter) != "" {
 		return m.pal.faint.Render(" No pull requests match the filter.") + "\n"
 	}
-	const msg = "no open PRs"
-	pad := max(0, (m.width-len(msg))/2)
-	return strings.Repeat(" ", pad) + m.pal.faint.Render(msg) + "\n"
+	msg := "No open pull requests."
+	if repo, ok := m.currentRepo(); ok {
+		msg = "No open pull requests on " + m.renderer.Plain(repo.PathWithNamespace, 40) + "."
+	}
+	return m.pal.faint.Render(" "+msg) + "\n"
 }
 
 // pullsFooter is the one-line key legend for the pulls screen (D13: only the keys M4a binds —

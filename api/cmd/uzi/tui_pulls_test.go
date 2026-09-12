@@ -386,14 +386,14 @@ func TestTUIPullsDefaultRepoAndCycle(t *testing.T) {
 	}
 }
 
-// (empty) A resolved repo with no open PRs shows the centered "no open PRs" line, not a dead
-// "loading…".
+// (empty) A resolved repo with no open PRs shows the left-aligned, sentence-case guiding line
+// naming the scoped repo (consistent with the sibling empty states), not a dead "loading…".
 func TestTUIPullsEmptyState(t *testing.T) {
 	fake := &uzicli.FakeClient{Repos: []apitypes.RepoDTO{oneRepo()}, PullsResult: nil}
 	m := loadedPulls(t, fake, nil)
 	out := stripANSI(m.View().Content)
-	if !strings.Contains(out, "no open PRs") {
-		t.Errorf("an empty-but-loaded pulls screen should say \"no open PRs\"\n%s", out)
+	if !strings.Contains(out, "No open pull requests on vtmocanu/uzi.") {
+		t.Errorf("an empty-but-loaded pulls screen should name the scoped repo in the empty state\n%s", out)
 	}
 }
 
@@ -419,5 +419,92 @@ func TestTUIPullsTabAndEscNavigation(t *testing.T) {
 	m = press(t, m, keyTab)
 	if m.view != viewBoard {
 		t.Fatalf("tab from the pulls screen did not return to the floor (view=%v)", m.view)
+	}
+}
+
+// firstReposMsg returns the first reposMsg among the messages a drained command produced, so a
+// test can prove a command re-issued fetchReposCmd (and inspect the recovered reply).
+func firstReposMsg(msgs []tea.Msg) (reposMsg, bool) {
+	for _, msg := range msgs {
+		if rm, ok := msg.(reposMsg); ok {
+			return rm, true
+		}
+	}
+	return reposMsg{}, false
+}
+
+// (self-heal) PRD #1255: a transient ListRepos failure at launch has no other retry path, so the
+// shared repo scope — and every forge screen — would stay stuck on "could not load repositories"
+// for the whole TUI session. Being on the pulls screen must retry the repos fetch on the ~10s
+// tick until it succeeds: the tick re-issues fetchReposCmd while repos are not ready, and a later
+// success resolves the default repo so the pulls fetch proceeds. This FAILS without the self-heal
+// (the tick would merely re-arm itself and never re-issue ListRepos).
+func TestTUIPullsRepoScopeSelfHealsAfterTransientFailure(t *testing.T) {
+	orig := pullsPollInterval
+	pullsPollInterval = time.Millisecond // the tick re-arm is a tea.Tick drainCmd must not block on
+	t.Cleanup(func() { pullsPollInterval = orig })
+
+	now := time.Now()
+	pulls := samplePulls(now)
+	// fake.Repos is what the SECOND (recovered) ListRepos returns; the first reply is injected as
+	// an error message below, so the fake's static ListRepos models only the recovery.
+	fake := &uzicli.FakeClient{Repos: []apitypes.RepoDTO{oneRepo()}, PullsResult: pulls}
+
+	m := tuiTestModel(t, fake, "")
+	m = press(t, m, keyViewPulls)
+	if m.view != viewPulls {
+		t.Fatalf("keyViewPulls did not switch to the pulls screen (view=%v)", m.view)
+	}
+
+	// First repos reply FAILS: the screen shows the repos-error scope state, and the in-flight
+	// guard is released so the tick can retry.
+	next, _ := m.Update(reposMsg{err: uzicli.Exitf(uzicli.ExitUnreachable, "forge unreachable")})
+	m = next.(tuiModel)
+	if m.reposErr == nil || m.reposReady() {
+		t.Fatal("the failed repos reply did not record the error scope state")
+	}
+	if m.reposInFlight {
+		t.Fatal("the failed repos reply did not release the in-flight guard, so the tick cannot retry")
+	}
+	if !strings.Contains(stripANSI(m.View().Content), "could not load repositories") {
+		t.Errorf("the repos-error scope state is not drawn\n%s", stripANSI(m.View().Content))
+	}
+
+	// The pulls tick self-heals: because repos are not ready it re-issues fetchReposCmd (NOT a
+	// pulls fetch — there is no repo yet). Draining the command yields a reposMsg, proving
+	// ListRepos was re-called; the fake now returns the repo.
+	m, cmd := pullsTick(t, m)
+	if !m.reposInFlight {
+		t.Fatal("the self-heal tick did not latch the repos in-flight guard")
+	}
+	drained := drainCmd(cmd)
+	recovered, ok := firstReposMsg(drained)
+	if !ok {
+		t.Fatalf("the pulls tick did not re-issue fetchReposCmd while the repo scope was unresolved; it cannot self-heal\n%v", drained)
+	}
+	if recovered.err != nil || len(recovered.repos) != 1 {
+		t.Fatalf("the recovered ListRepos reply did not carry the repo (err=%v, %d repos)", recovered.err, len(recovered.repos))
+	}
+	if fake.ListPullsCalls != 0 {
+		t.Fatalf("the self-heal tick issued a pulls fetch before a repo was resolved (ListPulls=%d)", fake.ListPullsCalls)
+	}
+
+	// Feeding the recovered reply clears the error, resolves the default repo, and the pulls fetch
+	// then proceeds (ListPulls is finally called against the resolved repo).
+	next, cmd = m.Update(recovered)
+	m = next.(tuiModel)
+	if m.reposErr != nil || !m.reposReady() {
+		t.Fatalf("the recovered repos reply did not clear the error scope state (err=%v)", m.reposErr)
+	}
+	repo, ok := m.currentRepo()
+	if !ok || repo.ID != "r1" {
+		t.Fatalf("the recovered repos reply did not resolve a current repo (ok=%v id=%q)", ok, repo.ID)
+	}
+	if m.pulls.waitID == 0 {
+		t.Error("the resolved repo did not latch the pulls in-flight guard for the kicked-off fetch")
+	}
+	drainCmd(cmd)
+	if fake.ListPullsCalls != 1 {
+		t.Fatalf("the resolved repo did not kick off the pulls fetch (ListPulls=%d, want 1)", fake.ListPullsCalls)
 	}
 }

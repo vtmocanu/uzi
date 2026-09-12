@@ -631,7 +631,7 @@ func pullsPopulated(dark bool, now time.Time) string {
 	return m.View().Content
 }
 
-// pullsEmpty renders the `pulls` list for a repo with no open PRs (the centered empty state).
+// pullsEmpty renders the `pulls` list for a repo with no open PRs (the empty state).
 func pullsEmpty(dark bool, now time.Time) string {
 	repo := apitypes.RepoDTO{ID: "r1", PathWithNamespace: "vtmocanu/uzi", Enabled: true,
 		WebURL: "https://github.com/vtmocanu/uzi"}

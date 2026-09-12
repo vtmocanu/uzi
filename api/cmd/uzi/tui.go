@@ -234,6 +234,11 @@ type tuiModel struct {
 	repoChosen  bool
 	reposLoaded bool
 	reposErr    error
+	// reposInFlight is the repos-fetch in-flight guard, the repos twin of pullsState.waitID: it
+	// is true while a fetchReposCmd is outstanding, so the pulls-tick / r self-heal (PRD #1255)
+	// cannot stack a second live repos fetch on one already running. Seeded true at Init (initCmds
+	// issues the first fetchReposCmd) and cleared by every reposMsg, success or failure.
+	reposInFlight bool
 	// detailGen counts detail sessions opened from the board; each drill-in stamps the new
 	// detailState.gen from it, so a reply issued under an earlier session (same run reopened)
 	// is rejected by the gen check in the detailRunMsg / detailPageMsg cases.
@@ -332,6 +337,10 @@ func newTUIModel(ctx context.Context, c uzicli.Client, startRun string) tuiModel
 	// The first fetch is minted by startPullsReq when the user opens the screen, or by the
 	// first tick once repos have loaded (newPullsState).
 	m.pulls = newPullsState()
+	// The repos scope fetch IS in flight at Init (initCmds issues fetchReposCmd), so seed the
+	// guard true — the reply clears it. Without this a pulls tick that fires before the Init
+	// reposMsg lands could stack a second repos fetch on top of the Init one.
+	m.reposInFlight = true
 	if startRun != "" {
 		m.view = viewDetail
 		m.detail = newDetailState(startRun)
@@ -731,6 +740,9 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// state explains it) rather than crashing. On success, keep only the ENABLED repos; if
 		// the user is already on the pulls screen, resolve the default repo and fetch now so they
 		// are not stuck on "loading…" until the next 10s tick.
+		// Every reply — success or failure — releases the in-flight guard, so the pulls-tick /
+		// r self-heal can re-issue the next repos fetch after a transient failure.
+		m.reposInFlight = false
 		m.reposLoaded = true
 		if msg.err != nil {
 			m.reposErr = msg.err
@@ -754,6 +766,22 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Keep the chain alive across the cancellable quit modal without polling.
 		if m.quitting {
 			return m, pullsTickAfter(pullsTickInterval(m.pulls.errStreak), m.pulls.tickGen)
+		}
+		// Self-heal the shared repo scope (PRD #1255): a transient ListRepos failure at Init has
+		// no other retry path, so every forge screen would show "could not load repositories" for
+		// the whole session. While the pulls screen is in focus and repos are NOT ready (still
+		// loading, or a failure left reposErr set), re-issue fetchReposCmd — gated on the
+		// reposInFlight guard so it never stacks a second live repos fetch — and re-arm this tick.
+		// It is gated on view==viewPulls like the pulls fetch so an idle board pays no forge cost
+		// (the D4 forge-budget guard). A later successful reposMsg clears reposErr and resolves the
+		// default repo, bringing the screen alive.
+		if m.view == viewPulls && !m.reposReady() {
+			cmds := []tea.Cmd{pullsTickAfter(pullsTickInterval(m.pulls.errStreak), m.pulls.tickGen)}
+			if !m.reposInFlight {
+				m.reposInFlight = true
+				cmds = append(cmds, m.fetchReposCmd())
+			}
+			return m, tea.Batch(cmds...)
 		}
 		// Poll the forge only while the pulls screen is in focus and a repo is selected (the
 		// forge budget is shared with the board poller — D4 — so a background tick does no forge
