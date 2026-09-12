@@ -11,7 +11,9 @@ package handler
 // enrichment fans out through a bounded pool (forgeMemoFanout). Each memoized load
 // first charges one token against the connection's per-connection interactive-read
 // outbound budget (chargeBudget, forge_budget.go), so the enrichment fan-out is charged
-// too and a shed request makes zero forge calls; the GitHub Rate.Remaining reserve half
+// too and a shed LOAD makes zero forge calls (a request that exhausts its budget
+// mid-fan-out may complete a few real calls before a later load sheds, but still returns
+// 429); the GitHub Rate.Remaining reserve half
 // of D4's budget is a later unit — not here. Every forge error is already PAT-redacted by the driver; a
 // *forge.RateLimitError maps to 429 + Retry-After (uncached through Do),
 // ErrForgeVersionUnsupported to an honest empty state, other errors to 502.

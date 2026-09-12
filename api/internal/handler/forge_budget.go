@@ -9,9 +9,11 @@ package handler
 // same PAT). It is charged AT THE FORGE-CALL SITE (inside forgeview.go's memoized load
 // closures), so the enrichment fan-out is charged too and a memo HIT costs nothing;
 // when a connection has exhausted its budget the load returns a *forge.RateLimitError
-// BEFORE the forge call, which writeForgeError maps to 429 + Retry-After — zero forge
-// calls on a shed request. The GitHub Rate.Remaining reserve (D4's other shedding rule)
-// is a separate follow-up and NOT implemented here.
+// BEFORE the forge call, which writeForgeError maps to 429 + Retry-After — a shed LOAD
+// makes zero forge calls (a request that exhausts its budget mid-fan-out may complete a
+// few real calls before a later load sheds, but still returns 429). The GitHub
+// Rate.Remaining reserve (D4's other shedding rule) is a separate follow-up and NOT
+// implemented here.
 
 import (
 	"sync"

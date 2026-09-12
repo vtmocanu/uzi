@@ -36,9 +36,12 @@ func TestForgeBudgetTakeDrainsAndRefills(t *testing.T) {
 	if ra <= 0 {
 		t.Fatalf("take after burst: retryAfter=%v, want > 0", ra)
 	}
-	// One token accrues in 60s/max = 20s; the empty-bucket hint must not exceed that.
-	if want := time.Duration(60/max) * time.Second; ra > want {
-		t.Fatalf("retryAfter=%v, want <= %v (time for one token at %d/min)", ra, want, max)
+	// The bucket is FULLY drained (exactly max takes, clock frozen so no refill), so the
+	// hint is EXACTLY the time to accrue one whole token: 60s/max = 20s. Asserting the
+	// value (not just an upper bound) catches a formula regression a bound check would
+	// miss — a constant 1s or a factor error would slip past ra <= 20s.
+	if want := time.Duration(60/max) * time.Second; ra != want {
+		t.Fatalf("retryAfter=%v, want exactly %v (time for one token at %d/min)", ra, want, max)
 	}
 
 	// Advancing by exactly one refill interval restores exactly one token: one take
