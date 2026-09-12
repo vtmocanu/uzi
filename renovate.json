@@ -18,6 +18,9 @@
   "vulnerabilityAlerts": {
     "labels": ["dependencies", "renovate", "security"]
   },
+  "lockFileMaintenance": {
+    "enabled": true
+  },
   "customManagers": [
     {
       "customType": "regex",
