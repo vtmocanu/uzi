@@ -83,6 +83,11 @@ only arms the feature instance-wide; each user still opts in under their own
 Settings, and the judge always spends that user's own Anthropic token, never
 the admin's.
 
+As an admin, you can also review every user's judge recommendations at once,
+in an attribution-hidden **All users** view on the Judge page, and mark them
+done or file an issue from there — see
+[Admins: the All users view](./judge.md#admins-the-all-users-view).
+
 **Upgrade note:** an instance that already had the judge enabled, with no
 `judge_model` pinned, starts spending `opus` the moment it upgrades to a
 version carrying this default — there's no migration that preserves the old

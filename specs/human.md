@@ -355,6 +355,11 @@ Tracked as GitLab issue vtmocanu/uzi#46; PRD at `prds/done/46-run-judge-self-imp
 - **Admin may file** another user's recommendation (kept, not restricted to the
   owner), conditioned on **prominent provenance** showing whose worker produced
   the (attacker-influencable) text. [user 2026-07-17]
+- **Admin may read the judge backlog aggregated across all users** with
+  attribution hidden (no owner, no run identity — a distinct-user count instead),
+  and may **mark a recommendation done across users** (each owner sees it was
+  done by an admin, and can undo); dismissing another user's recommendation stays
+  the owner's decision. [user 2026-09-07]
 - Works on **every existing recommendation**, with no backfill and no re-judge.
   [user 2026-07-17]
 - **When a backlog read is truncated the page says so**, in a plain warning
