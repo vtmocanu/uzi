@@ -168,7 +168,7 @@ func (h *Handler) FileIssue(w http.ResponseWriter, r *http.Request) {
 	// Forge-first done. Settle the link + cache the issue in one tx (Decision 9); a tx
 	// failure OR a swept-out claim (0 rows settled) is created-with-warning — the real
 	// issue exists, so we NEVER revert (would orphan it) and NEVER retry the forge write.
-	warning := h.settleFiledIssue(ctx, claimID, repo, created, description)
+	warning := h.settleFiledIssue(ctx, claimID, rec.Category, rec.Target, repo, created, description)
 
 	httpx.JSON(w, http.StatusCreated, fileIssueResponse{
 		Issue:   createdIssueDTO{IID: created.IID, WebURL: created.WebURL, Title: created.Title},
@@ -192,7 +192,7 @@ func (h *Handler) revertFiledClaim(ctx context.Context, claimID uuid.UUID) {
 // written (tx failure) or the claim was swept mid-flight (0 rows settled). The caller
 // NEVER reverts or retries on a non-empty warning — the forge issue is real and the next
 // sync reconciles the local state; a stranded filing_since is reaped by the sweeper.
-func (h *Handler) settleFiledIssue(ctx context.Context, claimID uuid.UUID, repo store.GetRepoForUserRow, created forge.Issue, description string) string {
+func (h *Handler) settleFiledIssue(ctx context.Context, claimID uuid.UUID, category, target string, repo store.GetRepoForUserRow, created forge.Issue, description string) string {
 	const warnUnlinked = "The issue was created on the forge, but linking it in uzi failed; the next sync will reconcile it."
 	const warnReclaimed = "The issue was created on the forge, but its draft claim had already been reclaimed, so it isn't linked to this recommendation."
 
@@ -218,6 +218,15 @@ func (h *Handler) settleFiledIssue(ctx context.Context, claimID uuid.UUID, repo 
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // no-op after a successful Commit
 	qtx := h.q.WithTx(tx)
+
+	// FIRST statement in the tx, before the settle UPDATE: serialize this filing's settle against a
+	// concurrent admin cross-user Mark-done write on the SAME coordinate (issue #1184 rework) — see
+	// store.JudgeDispositionCoordLockClass. A lock error is treated as created-with-warning, the same
+	// posture as the other tx failures below (the forge issue is real; the next sync reconciles).
+	if err := store.LockJudgeCoord(ctx, tx, category, target); err != nil {
+		slog.Warn("file issue: coord lock", "error", err)
+		return warnUnlinked
+	}
 
 	rows, err := qtx.SettleRecommendationFiledIssue(ctx, store.SettleRecommendationFiledIssueParams{
 		FiledRepoID:   pgtype.UUID{Bytes: repo.ID, Valid: true},

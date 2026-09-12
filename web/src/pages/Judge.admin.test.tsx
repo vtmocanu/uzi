@@ -249,6 +249,36 @@ describe("Judge admin scope — the badge stays the caller's own count", () => {
   });
 });
 
+// Finding A (CodeRabbit, Stability): under `all` the owner badge fetch (getJudgeStats) is a
+// SECONDARY input to the nav badge, not the backlog. The aggregate is ready the moment
+// getAdminJudgeBacklog resolves and setBacklog runs, so a slow or never-resolving badge fetch must
+// NOT hold the loading skeleton up behind it. Before the fix the badge fetch was awaited INSIDE the
+// load try, so its finally — setLoading(false) — could not run until the badge landed, and the
+// aggregate stayed hidden behind the skeleton. The fix makes the badge fetch fire-and-forget. This
+// drives the badge promise to NEVER resolve and asserts the aggregate group still renders — the
+// group row is gated on `!loading`, so its presence proves loading cleared right after setBacklog,
+// not after the badge.
+describe("Judge admin scope — a pending owner badge fetch does not hold the aggregate backlog (Finding A)", () => {
+  it("renders the All-users backlog with loading cleared while getJudgeStats is still pending", async () => {
+    seedScopeAll();
+    // The owner badge fetch is issued but never settles for the duration of the test.
+    const badge = deferred<TriageCounts>();
+    mockApi.getJudgeStats.mockReturnValue(badge.promise);
+
+    renderJudge(["/judge"]);
+    await waitFor(() => expect(mockApi.getAdminJudgeBacklog).toHaveBeenCalled());
+    // The badge fetch WAS issued (fire-and-forget) — it is simply left pending on purpose.
+    await waitFor(() => expect(mockApi.getJudgeStats).toHaveBeenCalled());
+
+    // The aggregate group renders even though the badge promise never resolved. The group row is
+    // gated on `!loading && backlog`, so its presence proves the loading skeleton cleared right
+    // after setBacklog rather than after the badge — which is exactly what the await regressed.
+    await waitFor(() => expect(screen.getByText("api/internal/poller")).toBeTruthy());
+    expect(screen.getByText("Queue-to-claim latency dominated across users.")).toBeTruthy();
+    // The badge promise is deliberately never resolved: nothing awaited it.
+  });
+});
+
 describe("Judge admin scope — attribution-hidden occurrences", () => {
   it("renders occurrences with no run link and no run title under All users", async () => {
     seedScopeAll();

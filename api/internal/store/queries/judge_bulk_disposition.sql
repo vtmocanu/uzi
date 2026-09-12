@@ -233,19 +233,34 @@ ORDER BY rv.id, rr.category, rr.target, rr.created_at ASC, rr.id ASC;
 -- Write the admin cross-user Mark done in ONE statement over the RESOLVED members (PRD #1184 M2) —
 -- the twin of UpsertDispositionsForResolvedCoords, with two deliberate differences.
 --
--- 1. ON CONFLICT DO NOTHING (not DO UPDATE) plus a WHERE NOT EXISTS filed recheck. Together these
---    are the whole point of the admin write: a human's existing verdict on the coordinate — done OR
---    dismissed, set by that owner — must NEVER be overwritten by an admin, and a coordinate a human
---    FILED must never take an admin 'done'. An admin done only reaches coordinates still `todo` (the
---    resolve already filters to `todo` members in Go); these two SQL guards are the durable backstop
---    against a human settling between the resolve and the write, one guard per way a coordinate
---    leaves `todo`:
+-- 1. ON CONFLICT DO NOTHING (not DO UPDATE) plus a WHERE NOT EXISTS filed recheck. The whole point
+--    of the admin write is that a human's existing verdict on the coordinate — done OR dismissed,
+--    set by that owner — must NEVER be overwritten by an admin, and a coordinate a human FILED must
+--    never take an admin 'done'. An admin done only reaches coordinates still `todo` (the resolve
+--    already filters to `todo` members in Go); the SQL is the durable backstop against a human
+--    settling between the resolve and the write, one guard per way a coordinate leaves `todo`, and
+--    the two guards are NOT symmetric — the NOT EXISTS is not atomic on its own:
 --      * a DISPOSITION landing (human done/dismissed) — caught by ON CONFLICT (review_id, category,
---        target) DO NOTHING, since the insert would conflict on the coordinate key.
---      * a FILING landing — caught by the WHERE NOT EXISTS anti-join, because filing writes NO
---        disposition (SettleRecommendationFiledIssue only stamps recommendation_filed_issues.
---        filed_at), so DO NOTHING alone would let an admin 'done' land on a now-filed coordinate.
---        The anti-join adds no query parameter — it reads the members CTE's own columns.
+--        target) DO NOTHING. That is a unique-index re-check on THIS table, so it needs no lock: the
+--        insert simply conflicts on the coordinate key and is dropped.
+--      * a FILING landing — caught by the WHERE NOT EXISTS anti-join TOGETHER WITH a per-coordinate
+--        advisory lock (store.LockJudgeCoord / JudgeDispositionCoordLockClass), NOT the anti-join
+--        alone. Filing writes NO disposition (SettleRecommendationFiledIssue only stamps
+--        recommendation_filed_issues.filed_at, a DIFFERENT table), so there is no unique conflict for
+--        DO NOTHING to catch and the NOT EXISTS is the only predicate. On its own the NOT EXISTS is
+--        NOT atomic: under the pool's default READ COMMITTED (OpenPool sets no isolation) it reads
+--        the filed table at this INSERT statement's snapshot, so a filing committing just after that
+--        snapshot is missed and both a settled filed row and an admin 'done' survive. The caller
+--        (AdminMarkDone) and the filing settle both take store.LockJudgeCoord on the coordinate as
+--        their transaction's first statement, so the loser blocks until the winner commits and, under
+--        READ COMMITTED, its NEXT statement (this INSERT / the settle UPDATE) re-snapshots and sees
+--        the committed row. This depends on READ COMMITTED: at REPEATABLE READ / SERIALIZABLE the
+--        snapshot would be fixed at the lock statement and the race would reopen — do not add an
+--        isolation level to the DSN without revisiting migrate.go's lock-class docs. The anti-join
+--        adds no query parameter — it reads the members CTE's own columns.
+--    Residual, deliberately not serialized (the filed==settled design; tracked in a follow-up): a
+--    CLAIMED-but-not-yet-SETTLED filing (filed_at still NULL) and an admin 'done' on a genuinely-todo
+--    coordinate filed AFTERWARDS are both uncovered.
 --    Same non-clobbering semantics as SystemDismissDeniedCLIRecommendation, and the opposite of the
 --    owner human upsert whose DO UPDATE is last-writer-wins because THAT is the human speaking.
 --

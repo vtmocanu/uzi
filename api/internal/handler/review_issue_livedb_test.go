@@ -459,7 +459,7 @@ func TestFileIssueSettleZeroRowsWarnsLiveDB(t *testing.T) {
 	created := forge.Issue{IID: 999, WebURL: "https://forge.example/g/ra/-/issues/999", Title: "t", State: "opened", Labels: []string{"uzi"}}
 
 	// A random claim id that does not exist → settle updates 0 rows → warnReclaimed.
-	if warn := h.settleFiledIssue(ctx, uuid.New(), repo, created, "body"); warn == "" {
+	if warn := h.settleFiledIssue(ctx, uuid.New(), f.category, f.target, repo, created, "body"); warn == "" {
 		t.Fatal("settleFiledIssue with a missing claim must return a created-with-warning message, got empty")
 	}
 	// A real, freshly settled claim → no warning.
@@ -469,7 +469,7 @@ func TestFileIssueSettleZeroRowsWarnsLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
-	if warn := h.settleFiledIssue(ctx, claimID, repo, created, "body"); warn != "" {
+	if warn := h.settleFiledIssue(ctx, claimID, f.category, f.target, repo, created, "body"); warn != "" {
 		t.Fatalf("a clean settle must return no warning, got %q", warn)
 	}
 	_ = fs

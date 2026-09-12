@@ -277,7 +277,7 @@ func (h *Handler) AdminFileJudgeIssue(w http.ResponseWriter, r *http.Request) {
 
 	// Forge-first done: settle the link + cache the issue in one tx (Decision 9). A tx failure or
 	// a swept-out claim is created-with-warning — the real issue exists, so never revert/retry.
-	warning := h.settleFiledIssue(ctx, claimID, repo, created, description)
+	warning := h.settleFiledIssue(ctx, claimID, occ.Category, occ.Target, repo, created, description)
 
 	httpx.JSON(w, http.StatusCreated, fileIssueResponse{
 		Issue:   createdIssueDTO{IID: created.IID, WebURL: created.WebURL, Title: created.Title},

@@ -2,6 +2,8 @@ package workersvc
 
 import (
 	"context"
+	"fmt"
+	"sort"
 
 	"github.com/google/uuid"
 
@@ -49,11 +51,31 @@ func (s *Service) AdminMarkDone(ctx context.Context, adminUserID uuid.UUID, item
 	}
 
 	// Only OPEN members: a filed or already-settled member keeps its state (PRD #98 Decision 2's
-	// definition of open, the SAME ladder scope=open uses). The SQL is the durable backstop for a
-	// coordinate leaving `todo` between this read and the write: ON CONFLICT DO NOTHING catches a
-	// disposition landing, and the write's NOT EXISTS re-checks filed state atomically (filing writes
-	// no disposition, so DO NOTHING alone would miss it). This Go filter is what keeps the common
-	// case from even attempting to touch a settled row. Every value comes off the RESOLVED row.
+	// definition of open, the SAME ladder scope=open uses). This Go filter is what keeps the common
+	// case from even attempting to touch a settled row; the write below is the durable backstop for a
+	// coordinate leaving `todo` between this read and the write, and it takes THREE mechanisms
+	// together — never the NOT EXISTS alone (issue #1184 rework):
+	//   * ON CONFLICT (review_id, category, target) DO NOTHING catches a concurrent HUMAN disposition
+	//     landing. That is a unique-index re-check on the disposition table itself, so it needs no
+	//     lock: the loser's INSERT simply conflicts on the coordinate key and is dropped.
+	//   * the WHERE NOT EXISTS filed recheck PLUS the per-coordinate advisory lock (below) catches a
+	//     concurrent FILING. Filing writes NO disposition row (SettleRecommendationFiledIssue only
+	//     stamps recommendation_filed_issues.filed_at, a DIFFERENT table), so there is no unique
+	//     conflict for DO NOTHING to catch — the NOT EXISTS is the only guard, and on its own it is
+	//     NOT atomic: under the pool's default READ COMMITTED (OpenPool sets none) the NOT EXISTS
+	//     reads the filed table at the INSERT statement's snapshot, so a filing committing just after
+	//     that snapshot is missed, leaving both a settled filed row and an admin 'done' (BucketOf
+	//     renders that as 'done', masking the filing). store.LockJudgeCoord — taken as the tx's first
+	//     statement here AND by the filing settle (settleFiledIssue) — serializes the two on the
+	//     coordinate: the loser blocks until the winner commits and, under READ COMMITTED, its NEXT
+	//     statement takes a fresh snapshot that sees the winner's committed row. This depends on READ
+	//     COMMITTED (see migrate.go's lock-class docs): at REPEATABLE READ or SERIALIZABLE the tx
+	//     snapshot would be fixed at the lock statement — before the winner commits — and the race
+	//     would reopen.
+	// Residual, deliberately not serialized (the filed==settled design; tracked in a follow-up): a
+	// CLAIMED-but-not-yet-SETTLED filing (filed_at still NULL, in the claim→forge→settle window) is
+	// not covered, and an admin 'done' on a genuinely-`todo` coordinate that is filed AFTERWARDS is
+	// not covered either. Every value below comes off the RESOLVED row.
 	reviewIDs := make([]uuid.UUID, 0, len(members))
 	writeCategories := make([]string, 0, len(members))
 	writeTargets := make([]string, 0, len(members))
@@ -70,7 +92,45 @@ func (s *Service) AdminMarkDone(ctx context.Context, adminUserID uuid.UUID, item
 
 	updated := int64(0)
 	if len(reviewIDs) > 0 {
-		n, err := s.q.UpsertAdminDispositionsForResolvedCoords(ctx, store.UpsertAdminDispositionsForResolvedCoordsParams{
+		// Fail-closed if the tx beginner was never wired (mirror completeRunWithPermit): the write
+		// needs to take the per-coordinate advisory lock as the first statement of a real
+		// transaction, so it can never run non-atomically. This is INSIDE the write block, so the
+		// too-many-items and empty-resolve paths never reach it.
+		if s.txBeginner == nil {
+			return apitypes.JudgeAdminDispositionResultDTO{}, fmt.Errorf("admin mark-done transaction unavailable: no tx beginner wired")
+		}
+		tx, err := s.txBeginner.Begin(ctx)
+		if err != nil {
+			return apitypes.JudgeAdminDispositionResultDTO{}, err
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		qtx := store.New(tx)
+
+		// Acquire the per-coordinate advisory locks BEFORE the write, sorted ascending by the NUMERIC
+		// objid (tie-break Category then Target for determinism). Sorting on the objid — the value the
+		// lock actually keys on, not the tuple — is what keeps two concurrent admin writes deadlock-free
+		// even when two coordinates collide on the hash. Sort a COPY; the write arrays keep their
+		// resolve order.
+		lockCoords := make([]JudgeDispositionCoord, len(coords))
+		copy(lockCoords, coords)
+		sort.Slice(lockCoords, func(i, j int) bool {
+			oi := store.JudgeCoordLockObjID(lockCoords[i].Category, lockCoords[i].Target)
+			oj := store.JudgeCoordLockObjID(lockCoords[j].Category, lockCoords[j].Target)
+			if oi != oj {
+				return oi < oj
+			}
+			if lockCoords[i].Category != lockCoords[j].Category {
+				return lockCoords[i].Category < lockCoords[j].Category
+			}
+			return lockCoords[i].Target < lockCoords[j].Target
+		})
+		for _, c := range lockCoords {
+			if err := store.LockJudgeCoord(ctx, tx, c.Category, c.Target); err != nil {
+				return apitypes.JudgeAdminDispositionResultDTO{}, err
+			}
+		}
+
+		n, err := qtx.UpsertAdminDispositionsForResolvedCoords(ctx, store.UpsertAdminDispositionsForResolvedCoordsParams{
 			AdminUserID:     pgconv.UUID(adminUserID),
 			ReviewIds:       reviewIDs,
 			Categories:      writeCategories,
@@ -78,6 +138,9 @@ func (s *Service) AdminMarkDone(ctx context.Context, adminUserID uuid.UUID, item
 			RationaleHashes: hashes,
 		})
 		if err != nil {
+			return apitypes.JudgeAdminDispositionResultDTO{}, err
+		}
+		if err := tx.Commit(ctx); err != nil {
 			return apitypes.JudgeAdminDispositionResultDTO{}, err
 		}
 		updated = n

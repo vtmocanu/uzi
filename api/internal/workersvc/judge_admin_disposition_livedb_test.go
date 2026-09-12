@@ -5,11 +5,13 @@ import (
 	"fmt"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -41,7 +43,11 @@ func adminDispoLiveDB(t *testing.T) (*Service, *store.Queries, *pgxpool.Pool) {
 	}
 	t.Cleanup(pool.Close)
 	q := store.New(pool)
-	return New(q, newBox(t), testParams()), q, pool
+	svc := New(q, newBox(t), testParams())
+	// Wire the tx beginner so AdminMarkDone can open its coord-lock transaction, exactly as
+	// production does in api/cmd/server/main.go (wsvc.SetTxBeginner(pool)).
+	svc.SetTxBeginner(pool)
+	return svc, q, pool
 }
 
 // adminMustExec runs a seed statement, failing the test on error.
@@ -276,6 +282,123 @@ func TestAdminMarkDoneFiledRecheckSkipsFiledCoordLiveDB(t *testing.T) {
 	// No disposition landed on the filed coordinate: an admin 'done' must not overwrite a filing.
 	if exists, status, setVia, _ := adminDispoRow(ctx, t, pool, rev, rg[0], rg[1]); exists {
 		t.Fatalf("row = exists %v status %q set_via %v, want NO disposition — the NOT EXISTS filed recheck was removed and an admin 'done' landed on a filed coordinate", exists, status, setVia)
+	}
+}
+
+// TestAdminMarkDoneFiledRaceSerializedLiveDB is the REAL two-transaction race the advisory lock
+// exists for (issue #1184 rework), the counterpart to the pure-SQL guard above. It proves the lock
+// makes the admin cross-user Mark-done serialize behind a concurrent, in-flight filing settle on the
+// same coordinate, so the admin write re-snapshots under READ COMMITTED and skips the now-filed
+// coordinate.
+//
+// Fails WITHOUT the fix / passes WITH it: on unfixed code AdminMarkDone takes no lock, so it never
+// blocks — it runs its INSERT while T1's settled filed row is still UNCOMMITTED (invisible to its
+// snapshot), its NOT EXISTS passes, and an admin 'done' lands on a coordinate that is about to be
+// filed (Updated==1, a 'done'/'admin' row). With the fix, AdminMarkDone takes the per-coordinate
+// advisory lock as the tx's first statement, blocks behind T1 (which holds the same lock), and only
+// after T1 commits does its next statement re-snapshot, see the committed filed row, and skip it
+// (Updated==0, no disposition). T1 is held uncommitted for the whole poll window precisely so the
+// unfixed write has its chance to do the damage before the lock is released.
+func TestAdminMarkDoneFiledRaceSerializedLiveDB(t *testing.T) {
+	svc, _, pool := adminDispoLiveDB(t)
+	ctx := context.Background()
+
+	target := "filed-live-race-" + uuid.NewString()
+	rg := [2]string{"install_worker_tool", target}
+
+	admin, _ := adminSeedOwner(ctx, t, pool, "admin")
+	owner, repo := adminSeedOwner(ctx, t, pool, "o")
+	rev := adminSeedJudgedRun(ctx, t, pool, owner, repo, rg) // one OPEN (todo) member
+
+	// T1: acquire the coord lock and insert a SETTLED filed row, then HOLD the tx open (do not
+	// commit). This models a filing settle mid-flight, exactly as settleFiledIssue does: lock first,
+	// then stamp recommendation_filed_issues.filed_at. Its filed row stays invisible to any other
+	// snapshot until commit.
+	t1, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin T1: %v", err)
+	}
+	defer func() { _ = t1.Rollback(ctx) }() // no-op after commit; safety net if an assert fails early
+	if err := store.LockJudgeCoord(ctx, t1, rg[0], rg[1]); err != nil {
+		t.Fatalf("T1 LockJudgeCoord: %v", err)
+	}
+	if _, err := t1.Exec(ctx,
+		`INSERT INTO recommendation_filed_issues (review_id, category, target, filed_issue_iid, filed_issue_url, filed_at, filing_since)
+		 VALUES ($1, $2, $3, 11, 'https://forge.e2e/i/11', now(), now())`, rev, rg[0], rg[1]); err != nil {
+		t.Fatalf("T1 insert settled filed row: %v", err)
+	}
+
+	// Launch the admin Mark-done concurrently. Its resolve runs on the pool (outside T1's tx) under
+	// READ COMMITTED, so it sees the coordinate as `todo` (T1's filed row is uncommitted) and reaches
+	// the write — where, fixed, it must block on the lock T1 holds.
+	type result struct {
+		res apitypes.JudgeAdminDispositionResultDTO
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		res, err := svc.AdminMarkDone(ctx, admin, []JudgeDispositionCoord{{Category: rg[0], Target: rg[1]}})
+		done <- result{res, err}
+	}()
+
+	// Poll pg_locks (on the pool, NOT T1) for a session WAITING on the advisory lock for this
+	// coordinate. classid/objid for the two-int pg_advisory_xact_lock form are exposed as oid, so
+	// compare against the UNSIGNED 32-bit values of the two int4 keys. Bounded: up to ~4s at ~50ms.
+	// T1 stays uncommitted until this resolves (waiter seen OR timeout) — that is what lets the
+	// unfixed write insert its 'done' before the lock is ever released.
+	wantClassID := int64(uint32(store.JudgeDispositionCoordLockClass))  // a positive constant; classid is oid (unsigned)
+	wantObjID := int64(uint32(store.JudgeCoordLockObjID(rg[0], rg[1]))) //nolint:gosec // objid is oid (unsigned): wraparound is fine
+	waiterSeen := false
+	for i := 0; i < 80; i++ {
+		var n int
+		if err := pool.QueryRow(ctx,
+			`SELECT count(*) FROM pg_locks
+			  WHERE locktype = 'advisory' AND NOT granted
+			    AND classid::bigint = $1 AND objid::bigint = $2`,
+			wantClassID, wantObjID).Scan(&n); err != nil {
+			t.Fatalf("poll pg_locks: %v", err)
+		}
+		if n > 0 {
+			waiterSeen = true
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// Commit T1: the settled filed row becomes visible, and the advisory lock releases so a blocked
+	// admin write unblocks and re-snapshots.
+	if err := t1.Commit(ctx); err != nil {
+		t.Fatalf("commit T1: %v", err)
+	}
+
+	got := <-done
+	if got.err != nil {
+		t.Fatalf("AdminMarkDone: %v", got.err)
+	}
+	// The core assertion: the admin write skipped the now-filed coordinate. On unfixed code it did
+	// not block, ran while T1 was uncommitted, and wrote a 'done' (Updated==1).
+	if got.res.Updated != 0 {
+		t.Fatalf("Updated = %d, want 0 — the admin done must skip a coordinate a concurrent filing settled; without the coord lock it races in an admin 'done' (waiterSeen=%v)", got.res.Updated, waiterSeen)
+	}
+	// No 'done'/'admin' disposition landed on the coordinate.
+	if exists, status, setVia, _ := adminDispoRow(ctx, t, pool, rev, rg[0], rg[1]); exists {
+		t.Fatalf("row = exists %v status %q set_via %v, want NO disposition — an admin 'done' raced past the concurrent filing (waiterSeen=%v)", exists, status, setVia, waiterSeen)
+	}
+	// The filed row is still settled (the filing won the race, as it must).
+	var filedSettled bool
+	if err := pool.QueryRow(ctx,
+		`SELECT filed_at IS NOT NULL FROM recommendation_filed_issues
+		  WHERE review_id = $1 AND category = $2 AND target = $3`,
+		rev, rg[0], rg[1]).Scan(&filedSettled); err != nil {
+		t.Fatalf("read filed row: %v", err)
+	}
+	if !filedSettled {
+		t.Fatalf("filed row is not settled after the race, want it still settled")
+	}
+	// With the fix the waiter is observable; a timeout here (waiterSeen=false) on green code would
+	// mean the write never blocked — surface it rather than passing silently on a lucky schedule.
+	if !waiterSeen {
+		t.Errorf("never observed the admin write WAITING on the coord advisory lock — the lock is not being taken before the write (this is the unfixed shape)")
 	}
 }
 

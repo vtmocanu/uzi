@@ -100,6 +100,28 @@ const SecretMutationLockClass int32 = 0x757A736B // "uzsk"
 // same assumption; do not add an isolation level to the DSN without revisiting this.
 const SettingsMutationLockKey int64 = 0x757A7365 // "uzse"
 
+// JudgeDispositionCoordLockClass is the class half of the two-int advisory lock that
+// serializes an admin cross-user "Mark done" write against a concurrent issue-filing on
+// the SAME judge recommendation coordinate (category, target) (issue #1184 rework, MR !1258).
+//
+// It exists because the admin write UpsertAdminDispositionsForResolvedCoords checks
+// recommendation_filed_issues (a DIFFERENT table) for a settled filing, then inserts into
+// recommendation_dispositions. Its ON CONFLICT (review_id, category, target) DO NOTHING only
+// re-checks the disposition table under READ COMMITTED, so it catches a concurrent human
+// disposition but NOT a concurrent filing (filing writes no disposition row). Under READ
+// COMMITTED the write's NOT EXISTS reads the filed table at its statement snapshot, so a filing
+// committing just after that snapshot is missed and BOTH a settled filed row and an admin 'done'
+// survive (BucketOf renders that as 'done', masking the filing). An advisory lock taken by BOTH
+// the admin write and the filing settle serializes them on the coordinate: the loser blocks and,
+// under READ COMMITTED, its next statement takes a fresh snapshot that sees the winner's
+// committed row — the same mechanism SettingsMutationLockKey documents above.
+//
+// Two-int space, disjoint from HostedProvisionLockClass / SecretMutationLockClass, so none can
+// collide. XACT-scoped: released on commit or rollback, no unlock to forget. Depends on the
+// pool's default READ COMMITTED isolation (OpenPool sets none): do NOT add an isolation level to
+// the DSN without revisiting this and its siblings above.
+const JudgeDispositionCoordLockClass int32 = 0x757A6A64 // "uzjd"
+
 // Migrate runs all pending goose migrations against the database at dsn. It
 // retries the initial connection so the API can start slightly ahead of
 // Postgres becoming ready.

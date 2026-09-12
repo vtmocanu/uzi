@@ -75,7 +75,11 @@ func TestAdminJudgeRoutesCeilingLiveDB(t *testing.T) {
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres; ./e2e/run-store-it.sh
 // provides one and sweeps this package for the LiveDB suffix.
 func TestAdminJudgeWriteRoutesCeilingLiveDB(t *testing.T) {
-	_, router, pool := cliLiveDB(t)
+	h, router, pool := cliLiveDB(t)
+	// The admin cross-user Mark-done write opens a per-coordinate advisory-lock transaction and is
+	// fail-closed without a tx beginner (issue #1184 rework). Wire it as production does
+	// (api/cmd/server/main.go: wsvc.SetTxBeginner(pool)) so the valid admin PUT below reaches 200.
+	h.wsvc.SetTxBeginner(pool)
 
 	admin := cliSeedUser(t, pool, true)
 	member := cliSeedUser(t, pool, false)

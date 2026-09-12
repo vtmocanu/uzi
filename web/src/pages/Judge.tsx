@@ -160,16 +160,19 @@ export function Judge() {
         if (loadGen.current !== gen) return;
         setBacklog(data);
         // BADGE INVARIANT (PRD #1184): the nav badge and the Mine-tab count are the CALLER'S OWN
-        // count, never the aggregate. So under `all` the badge is fed from the owner /me/judge/stats
-        // (getJudgeStats), and the aggregate's data.triage.todo is deliberately never published.
-        // Best-effort: a failed owner-stat fetch leaves the badge at its last value rather than
-        // failing the page.
-        try {
-          const own = await api.getJudgeStats();
-          if (loadGen.current === gen) setJudgeTodo(own.todo);
-        } catch {
-          /* leave the badge as-is; the aggregate must never stand in for the caller's count */
-        }
+        // count, never the aggregate. Under `all` the badge is fed from the owner /me/judge/stats
+        // (getJudgeStats); the aggregate's data.triage.todo is deliberately never published.
+        // Fire-and-forget: a slow/pending badge request must NOT hold the aggregate backlog behind
+        // the loading skeleton, so this is NOT awaited in the load path. Generation-guarded, and a
+        // failed owner-stat fetch leaves the badge at its last value rather than failing the page.
+        void api
+          .getJudgeStats()
+          .then((own) => {
+            if (loadGen.current === gen) setJudgeTodo(own.todo);
+          })
+          .catch(() => {
+            /* leave the badge as-is; the aggregate must never stand in for the caller's count */
+          });
       } else {
         const data = await api.getJudgeBacklog(bucket, runAnchor || undefined, categories);
         if (loadGen.current !== gen) return;
