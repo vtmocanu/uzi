@@ -108,6 +108,15 @@ func (h *Handler) mountAdminRoutes(r chi.Router, forgeLimiter, authLimiter *mw.L
 			// RequireAdmin, target from the path, never the body.
 			r.Put("/users/{id}/ci-autofix", h.SetUserCIAutofixEnabled)
 			r.Put("/settings", h.UpdateSettings)
+			// Admin "All users" cross-user Mark done + its Undo (PRD #1184 M2): mark every
+			// user's OPEN member of a (category, target) coordinate done with set_via='admin'
+			// (ON CONFLICT DO NOTHING, so a human verdict is never overwritten), and delete only
+			// those admin rows again. Cookie-only by decision (§379's read/write split): the
+			// aggregate reads above are CLI-reachable with a uza_ token, but the writes sit here
+			// under RequireAuth so a Bearer 401s before the handler. No forge limiter — a local
+			// upsert, no token spend and no forge write.
+			r.Put("/judge/recommendations/disposition", h.AdminSetJudgeDisposition)
+			r.Delete("/judge/recommendations/disposition", h.AdminUndoJudgeDisposition)
 			// Instance branding logo bytes (PRD #685 M1): admin upload/clear of the
 			// app-mark and POWERED BY logos. Cookie-only admin write like the settings
 			// PUT beside it; the bytes ride a dedicated raw-body route (off the 1 MiB

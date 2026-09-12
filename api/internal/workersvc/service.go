@@ -483,6 +483,15 @@ type Store interface {
 	// The fan-out write itself: ONE multi-row upsert over the RESOLVED coordinates, so a
 	// bulk call is a single round-trip that cannot half-apply (PRD #98 M2, audit NB-A).
 	UpsertDispositionsForResolvedCoords(ctx context.Context, arg store.UpsertDispositionsForResolvedCoordsParams) (int64, error)
+	// Admin cross-user Mark done + Undo (PRD #1184 M2): the CROSS-USER twins of the two owner
+	// coordinate queries above, with NO user predicate at all. ListRecommendationsForCoordsAll
+	// resolves every owner's member of a coordinate; UpsertAdminDispositionsForResolvedCoords
+	// writes status='done'/set_via='admin' with ON CONFLICT DO NOTHING (a human verdict is never
+	// overwritten); DeleteAdminDispositionsForCoords removes only set_via='admin' rows on the
+	// coordinate across all users. Reachable only through the cookie-only admin write handlers.
+	ListRecommendationsForCoordsAll(ctx context.Context, arg store.ListRecommendationsForCoordsAllParams) ([]store.ListRecommendationsForCoordsAllRow, error)
+	UpsertAdminDispositionsForResolvedCoords(ctx context.Context, arg store.UpsertAdminDispositionsForResolvedCoordsParams) (int64, error)
+	DeleteAdminDispositionsForCoords(ctx context.Context, arg store.DeleteAdminDispositionsForCoordsParams) (int64, error)
 	// Incidental findings capture (PRD #333 M2): the per-run evidence insert + cap
 	// count, and the coordinate-keyed `open` disposition upsert with its two follow-up
 	// UPDATEs (re-open on a materially-different content_hash; refresh an already-open

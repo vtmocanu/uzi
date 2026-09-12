@@ -463,6 +463,43 @@ func TestJudgeSettledMemberDTOTags(t *testing.T) {
 	assertTags(t, "JudgeSettledMemberDTO", JudgeSettledMemberDTO{}, "run_id", "rec_id")
 }
 
+// The admin cross-user Mark done / Undo body (PRD #1184 M2). Its tag set is exactly
+// {items, status} — no scope and no reason field, so the strict decoder makes a stray
+// `scope: all` or `reason: wont_do` a 400 rather than a silent no-op.
+func TestJudgeAdminDispositionRequestTags(t *testing.T) {
+	assertTags(t, "JudgeAdminDispositionRequest", JudgeAdminDispositionRequest{}, "items", "status")
+}
+
+// TestJudgeAdminDispositionResultDTOTags pins the admin write result at exactly
+// {updated, groups, truncated, triage}. The critical negative is that it carries NO `settled`
+// list and NO identifier: the admin write has no run address (the Undo is by coordinate, not by a
+// (run, recommendation) pair), so nothing that could name a run crosses the wire — the fourth
+// attribution-hiding layer applied to the write path. assertTags is order-free and EXACT, so a
+// `settled` field sneaking back in would fail here.
+func TestJudgeAdminDispositionResultDTOTags(t *testing.T) {
+	assertTags(t, "JudgeAdminDispositionResultDTO", JudgeAdminDispositionResultDTO{},
+		"updated", "groups", "truncated", "triage")
+	// Belt-and-braces on the one field this DTO must NOT have: scan a populated tree for a
+	// `settled` key and any identifier, since a leak could ride a nested group's value.
+	res := JudgeAdminDispositionResultDTO{
+		Updated: 1,
+		Groups: []JudgeAdminGroupDTO{{
+			Category: "improve_uzi", Target: "docs", Bucket: "done", UserCount: 2,
+			Occurrences: []JudgeAdminOccurrenceDTO{{Bucket: "done", SetVia: "admin"}},
+		}},
+		Triage: TriageDTO{Total: 1, Done: 1},
+	}
+	b, err := json.Marshal(res)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	for _, key := range []string{`"settled"`, `"run_id"`, `"rec_id"`, `"user_id"`, `"owner"`, `"review_id"`} {
+		if strings.Contains(string(b), key) {
+			t.Errorf("JudgeAdminDispositionResultDTO serialized with forbidden key %s — the admin write carries no run address and no attribution\njson: %s", key, b)
+		}
+	}
+}
+
 // An empty fan-out must marshal `settled` as [], never null: the client iterates it to build
 // its undo set, and a null would make "nothing was settled" an error case at every consumer
 // instead of an empty loop. Concretely, `undo: res.settled` → null → UndoToast reading

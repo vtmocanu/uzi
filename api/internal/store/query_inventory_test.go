@@ -528,6 +528,23 @@ var queryInventory = []queryPin{
 	{"UpsertDispositionsForResolvedCoords", "judge_bulk_disposition.sql", "TestBulkDispositionFansOutAcrossRunsLiveDB",
 		"named in NO test source: the write half of the same handler path; the test asserts the " +
 			"fan-out landed by reading recommendation_dispositions back from the table"},
+	{"ListRecommendationsForCoordsAll", "judge_bulk_disposition.sql", "TestAdminMarkDoneFansOutOpenMembersLiveDB",
+		"PRD #1184 M2 admin cross-user resolve — NO user predicate. Reached through " +
+			"svc.AdminMarkDone in ../workersvc; the test seeds the SAME coordinate under two owners plus " +
+			"a filed and an already-disposed member, and asserts updated=3 (only the three OPEN members " +
+			"across both owners, proving the missing user predicate AND the todo filter)"},
+	{"UpsertAdminDispositionsForResolvedCoords", "judge_bulk_disposition.sql", "TestAdminMarkDoneDoNothingProtectsHumanVerdictLiveDB",
+		"PRD #1184 M2 admin done write — status='done'/set_via='admin', ON CONFLICT DO NOTHING. " +
+			"Called DIRECTLY (bypassing the Go todo filter to model the race) against a coordinate that " +
+			"already carries a human 'dismissed': asserts execrows=0 and the human verdict unchanged, so " +
+			"relaxing DO NOTHING to DO UPDATE reddens it. TestAdminMarkDoneFansOutOpenMembersLiveDB also " +
+			"pins the set_via='admin'/set_by_user_id=<admin> stamp through svc.AdminMarkDone"},
+	{"DeleteAdminDispositionsForCoords", "judge_bulk_disposition.sql", "TestAdminUndoRemovesOnlyAdminRowsLiveDB",
+		"PRD #1184 M2 admin undo — deletes only set_via='admin' rows on a coordinate across users. " +
+			"Reached through svc.AdminUndoDone in ../workersvc; the test marks two owners done via admin " +
+			"and leaves a THIRD owner's human 'done' on the same coordinate, then asserts the undo removes " +
+			"exactly the two admin rows (updated=2) and the human 'done' survives — so dropping the " +
+			"set_via='admin' predicate would over-delete and redden it"},
 	{"ListFiledIssueCloseEdges", "judge_issue_close.sql", "TestJudgeBacklogProjectsEveryColumnLiveDB",
 		"direct call, judge_recommendations_integration_test.go:492"},
 	{"ApplyFiledIssueCloseEdge", "judge_issue_close.sql", "TestJudgeBacklogProjectsEveryColumnLiveDB",

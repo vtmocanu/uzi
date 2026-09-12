@@ -1,10 +1,12 @@
 package handler
 
 import (
+	"errors"
 	"log/slog"
 	"net/http"
 	"strings"
 
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
@@ -104,4 +106,99 @@ func (h *Handler) AdminJudgeCategoryStats(w http.ResponseWriter, r *http.Request
 		return
 	}
 	httpx.JSON(w, http.StatusOK, stats)
+}
+
+// AdminSetJudgeDisposition is the admin cross-user "Mark done" (PRD #1184 M2): PUT
+// /api/admin/judge/recommendations/disposition marks every user's OPEN member of each requested
+// (category, target) coordinate done, stamped set_via='admin' and set_by_user_id=<the admin>,
+// with ON CONFLICT DO NOTHING so a human's existing verdict is never overwritten.
+//
+// It is mounted in the admin WRITE group (RequireAuth + RequireAdmin), which is cookie-only: a
+// uza_ admin_ro Bearer token structurally 401s at RequireAuth before this handler exists, so the
+// aggregate stays CLI-readable while the writes are not (§379's read/write split). There is no
+// forge limiter — this is a local upsert, no token spend and no forge write.
+//
+// The body is JudgeAdminDispositionRequest, decoded with DisallowUnknownFields, so a stray
+// `scope` or `reason` field is a 400 rather than a silent no-op. Status carries ONLY "done":
+// there is no cross-user Dismiss (dismissing another user's recommendation is their judgment), so
+// any other value — including "dismissed" — is a 400. Items must be non-empty and are capped at
+// the owner coordinate cap (JudgeDispositionMaxItems); dedup and the cap live in the service,
+// shared with the owner path. Success is 200 with the updated groups + recomputed all-users
+// triage, carrying NO run address (the response has no `settled` list).
+func (h *Handler) AdminSetJudgeDisposition(w http.ResponseWriter, r *http.Request) {
+	user, ok := mw.UserFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	var req apitypes.JudgeAdminDispositionRequest
+	if err := httpx.DecodeJSON(r, &req); err != nil {
+		// A stray scope/reason field, an unknown key, or malformed JSON all land here — the
+		// strict decoder is what makes `scope: all` a 400 rather than an ignored field.
+		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	// "done" ONLY. "dismissed" (and anything else) is a 400 — the cross-user path offers no
+	// Dismiss, by decision. Checked BEFORE the empty-items check so a `status: dismissed` body is
+	// unambiguously rejected as the wrong verdict.
+	if req.Status != "done" {
+		httpx.Error(w, http.StatusBadRequest, "status must be done")
+		return
+	}
+	if len(req.Items) == 0 {
+		httpx.Error(w, http.StatusBadRequest, "items required")
+		return
+	}
+
+	res, err := h.wsvc.AdminMarkDone(r.Context(), user.ID, req.Items)
+	if err != nil {
+		if errors.Is(err, workersvc.ErrTooManyItems) {
+			httpx.Error(w, http.StatusBadRequest, "too many items")
+			return
+		}
+		slog.Error("admin set judge disposition", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	httpx.JSON(w, http.StatusOK, res)
+}
+
+// AdminUndoJudgeDisposition is the admin cross-user Undo (PRD #1184 M2): DELETE
+// /api/admin/judge/recommendations/disposition removes ONLY the set_via='admin' rows on each
+// requested coordinate, across every user, leaving any human done/dismissed verdict intact. Same
+// cookie-only admin WRITE group as the PUT above.
+//
+// The body is the SAME JudgeAdminDispositionRequest, decoded with the same strict decoder (so a
+// stray `scope`/`reason` is still a 400), but Status is IGNORED here — the undo is coordinate-only,
+// there is no verdict to set. Items must be non-empty. Success is 200 with the same
+// attribution-hidden result shape as the PUT. (A DELETE carrying a JSON body is unusual but
+// well-formed; net/http reads it regardless of method.)
+func (h *Handler) AdminUndoJudgeDisposition(w http.ResponseWriter, r *http.Request) {
+	user, ok := mw.UserFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	_ = user // authorization is the route's RequireAdmin; the undo is coordinate-scoped, not per-user.
+	var req apitypes.JudgeAdminDispositionRequest
+	if err := httpx.DecodeJSON(r, &req); err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if len(req.Items) == 0 {
+		httpx.Error(w, http.StatusBadRequest, "items required")
+		return
+	}
+
+	res, err := h.wsvc.AdminUndoDone(r.Context(), req.Items)
+	if err != nil {
+		if errors.Is(err, workersvc.ErrTooManyItems) {
+			httpx.Error(w, http.StatusBadRequest, "too many items")
+			return
+		}
+		slog.Error("admin undo judge disposition", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	httpx.JSON(w, http.StatusOK, res)
 }

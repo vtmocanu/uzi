@@ -98,6 +98,14 @@ func adminJudgeReq(user store.User, path, query string) *http.Request {
 	return req.WithContext(mw.ContextWithUser(req.Context(), user))
 }
 
+// adminJudgeWriteReq builds a PUT/DELETE disposition request carrying a JSON body, authenticated
+// as user via the context (the middleware chain is exercised separately in the live-DB router
+// tests; these unit tests drive the handler directly to pin its body validation).
+func adminJudgeWriteReq(user store.User, method, body string) *http.Request {
+	req := httptest.NewRequest(method, "/api/admin/judge/recommendations/disposition", strings.NewReader(body))
+	return req.WithContext(mw.ContextWithUser(req.Context(), user))
+}
+
 // ---- 401: no user in context, and the store is never touched -------------------------------
 
 func TestAdminJudgeHandlersUnauthenticatedIs401(t *testing.T) {
@@ -407,6 +415,104 @@ func TestAdminJudgeRecommendationsReportsTruncation(t *testing.T) {
 	}
 	if got.Truncated {
 		t.Fatal("a small backlog must not be flagged truncated")
+	}
+}
+
+// ---- the admin cross-user Mark done / Undo body validation (PRD #1184 M2) ------------------
+
+// TestAdminSetJudgeDispositionRejectsBadBody pins the PUT handler's validation, every case of
+// which rejects BEFORE the service is reached — so the embedded nil workersvc.Store (which panics
+// on any call) is itself the proof that nothing was written. The strict decoder is what turns a
+// stray `scope`/`reason` field into a 400 rather than a silent no-op, and `status` must be exactly
+// "done" (there is no cross-user Dismiss, so "dismissed" is a 400).
+func TestAdminSetJudgeDispositionRejectsBadBody(t *testing.T) {
+	admin := store.User{ID: uuid.New(), IsAdmin: true}
+	for _, tc := range []struct {
+		name string
+		body string
+		want int
+	}{
+		{"dismissed is not allowed cross-user", `{"items":[{"category":"improve_uzi","target":"docs"}],"status":"dismissed"}`, http.StatusBadRequest},
+		{"empty status", `{"items":[{"category":"improve_uzi","target":"docs"}],"status":""}`, http.StatusBadRequest},
+		{"a scope field is rejected by the strict decoder", `{"items":[{"category":"improve_uzi","target":"docs"}],"status":"done","scope":"all"}`, http.StatusBadRequest},
+		{"a reason field is rejected by the strict decoder", `{"items":[{"category":"improve_uzi","target":"docs"}],"status":"done","reason":"wont_do"}`, http.StatusBadRequest},
+		{"an unknown field is rejected", `{"items":[],"status":"done","bogus":1}`, http.StatusBadRequest},
+		{"empty items with a valid status", `{"items":[],"status":"done"}`, http.StatusBadRequest},
+		{"malformed JSON", `{`, http.StatusBadRequest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := &adminBacklogStore{} // nil Store: any service call panics, proving the reject is pre-service
+			h := newRunsHandler(t, st)
+			rec := httptest.NewRecorder()
+			h.AdminSetJudgeDisposition(rec, adminJudgeWriteReq(admin, http.MethodPut, tc.body))
+			if rec.Code != tc.want {
+				t.Fatalf("PUT %s = %d, want %d; body=%s", tc.body, rec.Code, tc.want, rec.Body.String())
+			}
+			if len(st.calls) != 0 {
+				t.Fatalf("a rejected PUT must not reach the store, calls=%v", st.calls)
+			}
+		})
+	}
+}
+
+// TestAdminUndoJudgeDispositionRejectsBadBody: the DELETE ignores status (the undo is
+// coordinate-only) but still rejects an unknown field via the shared strict decoder and requires
+// non-empty items. All cases reject before the service.
+func TestAdminUndoJudgeDispositionRejectsBadBody(t *testing.T) {
+	admin := store.User{ID: uuid.New(), IsAdmin: true}
+	for _, tc := range []struct {
+		name string
+		body string
+		want int
+	}{
+		{"empty items", `{"items":[]}`, http.StatusBadRequest},
+		{"a scope field is rejected by the strict decoder", `{"items":[{"category":"improve_uzi","target":"docs"}],"scope":"all"}`, http.StatusBadRequest},
+		{"malformed JSON", `{`, http.StatusBadRequest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := &adminBacklogStore{}
+			h := newRunsHandler(t, st)
+			rec := httptest.NewRecorder()
+			h.AdminUndoJudgeDisposition(rec, adminJudgeWriteReq(admin, http.MethodDelete, tc.body))
+			if rec.Code != tc.want {
+				t.Fatalf("DELETE %s = %d, want %d; body=%s", tc.body, rec.Code, tc.want, rec.Body.String())
+			}
+			if len(st.calls) != 0 {
+				t.Fatalf("a rejected DELETE must not reach the store, calls=%v", st.calls)
+			}
+		})
+	}
+}
+
+// TestAdminJudgeWriteHandlersUnauthenticatedIs401: no user in context is a 401 before the body is
+// even decoded, and the store is never touched.
+func TestAdminJudgeWriteHandlersUnauthenticatedIs401(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		call func(h *Handler, rec *httptest.ResponseRecorder, req *http.Request)
+		verb string
+	}{
+		{"set", func(h *Handler, rec *httptest.ResponseRecorder, req *http.Request) {
+			h.AdminSetJudgeDisposition(rec, req)
+		}, http.MethodPut},
+		{"undo", func(h *Handler, rec *httptest.ResponseRecorder, req *http.Request) {
+			h.AdminUndoJudgeDisposition(rec, req)
+		}, http.MethodDelete},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := &adminBacklogStore{}
+			h := newRunsHandler(t, st)
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(tc.verb, "/api/admin/judge/recommendations/disposition",
+				strings.NewReader(`{"items":[{"category":"improve_uzi","target":"docs"}],"status":"done"}`))
+			tc.call(h, rec, req)
+			if rec.Code != http.StatusUnauthorized {
+				t.Fatalf("unauthenticated %s = %d, want 401", tc.verb, rec.Code)
+			}
+			if len(st.calls) != 0 {
+				t.Fatalf("an unauthenticated write must not reach the store, calls=%v", st.calls)
+			}
+		})
 	}
 }
 

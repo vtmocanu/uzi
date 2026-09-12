@@ -300,6 +300,46 @@ type JudgeAdminBacklogDTO struct {
 	Triage    TriageDTO            `json:"triage"`
 }
 
+// JudgeAdminDispositionRequest is the body of the admin cross-user Mark done and its Undo
+// (PRD #1184 M2): PUT /api/admin/judge/recommendations/disposition marks Items done across
+// every user's open member of each coordinate; DELETE with the same body removes the admin
+// rows again. It reuses JudgeDispositionCoordDTO for Items — the coordinate is the display
+// grain, never a recommendation id, and nothing here is written to the database (the values
+// only match against review_recommendations; the write reads its columns off the resolved row).
+//
+// Status carries ONLY "done": there is no cross-user Dismiss (dismissing another user's
+// recommendation is their judgment — decision log 2026-09-07), so the PUT handler 400s any
+// other value, including "dismissed". There is deliberately NO scope field and NO reason
+// field: the admin done always settles OPEN members only, and the handler decodes with
+// DisallowUnknownFields, so a stray `scope`/`reason`/`status: dismissed` is a 400 rather than a
+// silent no-op. The DELETE ignores Status (the undo is coordinate-only) but rejects the same
+// unknown fields via the shared strict decoder.
+type JudgeAdminDispositionRequest struct {
+	Items  []JudgeDispositionCoordDTO `json:"items"`
+	Status string                     `json:"status"`
+}
+
+// JudgeAdminDispositionResultDTO is the response to the admin cross-user Mark done / Undo
+// (PRD #1184 M2). It is the attribution-hidden cousin of JudgeDispositionResultDTO and carries
+// deliberately NO `settled` list: the admin write has no run address (the fan-out spans every
+// user's rows, and the admin Undo is BY COORDINATE, not by a (run, recommendation) pair), so
+// there is nothing to undo through and nothing that could name a run.
+//
+// Updated counts the member COORDINATES actually written (an ON CONFLICT DO NOTHING skip, where
+// a human already holds a verdict, does not count), never a per-item breakdown — the same
+// one-404 rule (#94 Decision 5) as the owner result. Groups are the affected coordinates
+// re-read after the write through the all-users aggregate (all buckets, so a group that just
+// left To triage still comes back at its new rollup), and Triage is the recomputed canonical
+// all-users tally. Truncated carries through from that re-read, bounded by the same hard row cap
+// as the aggregate backlog (workersvc.JudgeBacklogMaxRows) — treat a missing group as UNKNOWN,
+// not settled, when it is true.
+type JudgeAdminDispositionResultDTO struct {
+	Updated   int                  `json:"updated"`
+	Groups    []JudgeAdminGroupDTO `json:"groups"`
+	Truncated bool                 `json:"truncated"`
+	Triage    TriageDTO            `json:"triage"`
+}
+
 // JudgeDispositionResultDTO is the response to the bulk group-disposition fan-out
 // (PRD #98 M2, Decision 3).
 //
