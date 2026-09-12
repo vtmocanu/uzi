@@ -2244,14 +2244,25 @@ tasks:
         done
 
   test:codex-m4:
-    desc: PRD 1287 C1 - strict Codex/Claude M4 conformance contract + the real-binary P startup smoke
-    # The C1 conformance subsystem (e2e/codex-m4): the machine-readable clause registry, the strict
+    desc: PRD 1287 C5 - strict Codex/Claude M4 conformance gate (claude/U + codex/U + codex/P) + the real-binary P startup smoke
+    # The M4 conformance subsystem (e2e/codex-m4): the machine-readable clause registry, the strict
     # completeness checker, the map/receipts/provisioner/macOS-runner helpers, and the REAL pinned
     # Codex app-server P startup smoke (one allowed uzi_bash callback through a REAL broker).
     #
+    # No longer C1-only: C5 tightens the required matrix (run-completeness.ts REQUIRED_MATRIX_C5) to
+    # the full required U/P set and folds in the Claude preservation (C2) + D6 HOME-screening (C3)
+    # conformance evidence, so the strict completeness gate covers claude/U + codex/U + codex/P in ONE
+    # place. Those four agent/test conformance files ALSO run under `npm test`; re-running them here is
+    # a small, correct redundancy (they are fast, no app-server, and idempotent) that lets this target
+    # assemble ALL required U/P evidence whether it is invoked standalone or via the full gate. They
+    # append the SAME {title,result} JSONL (agent/test/conformance-evidence.ts, format-compatible with
+    # e2e/codex-m4/evidence.ts) keyed on the exact test title, which run-completeness.ts matches to the
+    # clause `tests` entries. O rows are NOT enforced here; check:codex-m4-receipts is their gate (D8).
+    #
     # dir: agent so tsx + tsc + the SDK deps resolve out of agent/node_modules and the smoke loads
     # the adapter modules from agent/src (packaged-modules.ts CODEX_M4_SRC fallback), matching
-    # test:codex-m3b's host resolution.
+    # test:codex-m3b's host resolution. The four agent conformance files run from the same dir, so
+    # their paths are test/*.test.ts alongside the ../e2e/codex-m4/*.test.ts glob.
     #
     # --test-concurrency=1 + --test-timeout=120000 (D7 point 4): the P smoke drives ONE real codex
     # app-server serially and the timeout bounds a hang, so a wedged binary fails LOUDLY rather than
@@ -2268,7 +2279,7 @@ tasks:
       - ./node_modules/.bin/tsc --noEmit -p ../e2e/codex-m4/tsconfig.json
       - mkdir -p ../e2e/codex-m4/.evidence
       - rm -f ../e2e/codex-m4/.evidence/current.jsonl
-      - node --import tsx --test --test-concurrency=1 --test-timeout=120000 ../e2e/codex-m4/*.test.ts
+      - node --import tsx --test --test-concurrency=1 --test-timeout=120000 test/claude-conformance-advice-ceiling.test.ts test/claude-conformance-invariant-mappings.test.ts test/claude-conformance-reducer.test.ts test/codex-home-screening.test.ts ../e2e/codex-m4/*.test.ts
       - node --import tsx ../e2e/codex-m4/run-completeness.ts
 
   check:codex-m4-receipts:

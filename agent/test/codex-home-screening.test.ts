@@ -51,6 +51,9 @@ import type { CodexNotification, CodexTransport } from "../src/codex/transport.j
 import type { RunContext, EmittedMessage } from "../src/executor.js";
 import type { Logger } from "../src/log.js";
 import type { CodexEffectLaunchSpec, CodexRootHandle } from "../src/codex/launcher.js";
+// PRD #1287 C5: record executed-test evidence for the strict completeness gate. `t.name` is the
+// exact clause `tests` title; a no-op under a bare `npm test` (CODEX_M4_EVIDENCE unset).
+import { recordConformanceEvidence } from "./conformance-evidence.js";
 
 // The executor's homeRoot is KNOWN so the test can name the literal epoch-0 provider-HOME path.
 const HOME_ROOT = "/data/agent-home/run-1";
@@ -376,7 +379,7 @@ function replySuccess(rig: Rig, requestId: number): boolean | undefined {
 
 // ================================================================================
 describe("PRD #1287 D6: provider-HOME screening through the REAL CodexExecutor screenPolicy", () => {
-  it("shell leg (calibration): a literal `cat <homeRoot>/codex-data/epoch-0/codex/auth.json` is DENIED before the command spawn seam (counter stays 0), while a harmless in-worktree command still reaches its effect", async () => {
+  it("shell leg (calibration): a literal `cat <homeRoot>/codex-data/epoch-0/codex/auth.json` is DENIED before the command spawn seam (counter stays 0), while a harmless in-worktree command still reaches its effect", async (t) => {
     const rig = makeRig(defaultResponder);
     const exec = makeExecutor(rig);
 
@@ -406,9 +409,10 @@ describe("PRD #1287 D6: provider-HOME screening through the REAL CodexExecutor s
 
     // Exactly one command reached the seam in total: the allowed one, never the forbidden one.
     assert.equal(rig.spawnCommandCalls.length, 1, "exactly one (allowed) command spawn occurred");
+    recordConformanceEvidence(t.name, "pass");
   });
 
-  it("file leg: the resolved Read AND Write path form of the same auth.json is denied by the file screen with NO fileop effect, while an allowed in-worktree read reaches the fileop client", async () => {
+  it("file leg: the resolved Read AND Write path form of the same auth.json is denied by the file screen with NO fileop effect, while an allowed in-worktree read reaches the fileop client", async (t) => {
     const rig = makeRig(defaultResponder);
     const exec = makeExecutor(rig);
 
@@ -438,5 +442,6 @@ describe("PRD #1287 D6: provider-HOME screening through the REAL CodexExecutor s
     const allowedReads = rig.fileopOps.filter((o) => o.op === "read" && o.path === "notes.txt");
     assert.equal(allowedReads.length, 1, "the allowed in-worktree read reached the fileop client exactly once");
     assert.equal(replySuccess(rig, 53), true, "the allowed in-worktree read succeeded");
+    recordConformanceEvidence(t.name, "pass");
   });
 });

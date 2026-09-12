@@ -28,6 +28,9 @@ import { ClaudeAdviceHarness } from "../src/claude-advice-harness.js";
 import type { AdviceRequest, AdviceResult } from "../src/harness.js";
 import type { SdkQueryFn } from "../src/sdk-executor.js";
 import { nullLogger } from "./helpers.js";
+// PRD #1287 C5: record executed-test evidence for the strict completeness gate. `t.name` is the
+// exact clause `tests` title; a no-op under a bare `npm test` (CODEX_M4_EVIDENCE unset).
+import { recordConformanceEvidence } from "./conformance-evidence.js";
 
 /** The deny reason the advice lane is constructed with; asserted to prove the deny came
  *  from the advice deny-all path rather than some default. */
@@ -107,48 +110,55 @@ const successResult = () => ({ type: "result", subtype: "success", is_error: fal
 
 // -- Per-category denies -----------------------------------------------------
 
-test("claude C2 advice ceiling: deny-all hook denies a shell/Bash tool with no side effect", async () => {
+test("claude C2 advice ceiling: deny-all hook denies a shell/Bash tool with no side effect", async (t) => {
   await assertDenied("Bash", { command: "git push origin main" });
+  recordConformanceEvidence(t.name, "pass");
 });
 
-test("claude C2 advice ceiling: deny-all hook denies filesystem read and write tools", async () => {
+test("claude C2 advice ceiling: deny-all hook denies filesystem read and write tools", async (t) => {
   await assertDenied("Read", { file_path: "/etc/passwd" });
   await assertDenied("Write", { file_path: "/tmp/uzi-c2-advice-should-not-write", content: "x" });
+  recordConformanceEvidence(t.name, "pass");
 });
 
-test("claude C2 advice ceiling: deny-all hook denies a network/WebFetch tool", async () => {
+test("claude C2 advice ceiling: deny-all hook denies a network/WebFetch tool", async (t) => {
   await assertDenied("WebFetch", { url: "https://exfil.example/leak" });
+  recordConformanceEvidence(t.name, "pass");
 });
 
-test("claude C2 advice ceiling: deny-all hook denies a delegation/Agent tool", async () => {
+test("claude C2 advice ceiling: deny-all hook denies a delegation/Agent tool", async (t) => {
   await assertDenied("Agent", { subagent_type: "coder", prompt: "do work" });
+  recordConformanceEvidence(t.name, "pass");
 });
 
-test("claude C2 advice ceiling: deny-all hook denies run/worker signal tools submit_plan and signal_done", async () => {
+test("claude C2 advice ceiling: deny-all hook denies run/worker signal tools submit_plan and signal_done", async (t) => {
   await assertDenied("mcp__uzi__submit_plan", { plan_md: "a plan" });
   await assertDenied("mcp__uzi__signal_done", {});
+  recordConformanceEvidence(t.name, "pass");
 });
 
-test("claude C2 advice ceiling: deny-all hook denies credential access", async () => {
+test("claude C2 advice ceiling: deny-all hook denies credential access", async (t) => {
   // A shell read of the worker credential mount, and a file read of the SDK credentials.
   await assertDenied("Bash", { command: "cat /run/secrets/worker_token" });
   await assertDenied("Read", { file_path: "/home/agent/.claude/.credentials.json" });
+  recordConformanceEvidence(t.name, "pass");
 });
 
 // -- Positive control: legitimate text/analysis result is preserved unchanged --
 
-test("claude C2 advice ceiling: a legitimate text result is preserved as a positive control", async () => {
+test("claude C2 advice ceiling: a legitimate text result is preserved as a positive control", async (t) => {
   const { result } = await captureAdvice([assistantText("analysis: looks good"), successResult()]);
   assert.equal(result.text, "analysis: looks good", "advice text result is preserved");
   assert.equal(result.end.kind, "terminal");
   if (result.end.kind === "terminal") {
     assert.equal(result.end.terminal.outcome, "success");
   }
+  recordConformanceEvidence(t.name, "pass");
 });
 
 // -- The capability ceiling: no run workspace / handler registry (runtime + type) --
 
-test("claude C2 advice ceiling: advice options carry no mcpServers handler registry", async () => {
+test("claude C2 advice ceiling: advice options carry no mcpServers handler registry", async (t) => {
   const { options } = await captureAdvice([]);
   // D5: advice receives no run workspace or handler registry — the run-lane signal/findings
   // MCP servers, the file/bash guard hooks and the subagent map are ALL absent here.
@@ -159,6 +169,7 @@ test("claude C2 advice ceiling: advice options carry no mcpServers handler regis
   assert.equal(options.allowDangerouslySkipPermissions, true);
   // Exactly ONE PreToolUse matcher (the deny-all), with no per-tool allow matcher.
   assert.equal(options.hooks?.PreToolUse?.length, 1, "advice wires a single deny-all matcher");
+  recordConformanceEvidence(t.name, "pass");
 });
 
 // Compile-time ceiling (D5): AdviceRequest must expose NO run-workspace / handler-registry
@@ -176,7 +187,7 @@ const _adviceCeilingTypeGuard: [
 ] = [false, false, false, false, false];
 void _adviceCeilingTypeGuard;
 
-test("claude C2 advice ceiling: AdviceRequest exposes no cwd/agents/mcpServers/registry", () => {
+test("claude C2 advice ceiling: AdviceRequest exposes no cwd/agents/mcpServers/registry", (t) => {
   const request: AdviceRequest = {
     label: "review",
     systemPrompt: "sys",
@@ -190,4 +201,5 @@ test("claude C2 advice ceiling: AdviceRequest exposes no cwd/agents/mcpServers/r
   }
   // The construction above is the executed evidence; the compile-time _adviceCeilingTypeGuard
   // enforces the same ceiling at the type level under tsc.
+  recordConformanceEvidence(t.name, "pass");
 });

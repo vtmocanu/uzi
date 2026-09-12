@@ -22,6 +22,9 @@ import { scanSignals } from "../src/signals.js";
 import type { RunTurnRequest } from "../src/harness.js";
 import type { SdkQueryFn } from "../src/sdk-executor.js";
 import { nullLogger } from "./helpers.js";
+// PRD #1287 C5: record executed-test evidence for the strict completeness gate. `t.name` is the
+// exact clause `tests` title; a no-op under a bare `npm test` (CODEX_M4_EVIDENCE unset).
+import { recordConformanceEvidence } from "./conformance-evidence.js";
 
 function decisionOf(out: HookJSONOutput): string | undefined {
   return (out as { hookSpecificOutput?: { permissionDecision?: string } }).hookSpecificOutput
@@ -41,7 +44,7 @@ function updatedInputOf(out: HookJSONOutput): Record<string, unknown> | undefine
 // (No invented write_stdin hook — the invariant is the absence of a retained interpreter.)
 // ---------------------------------------------------------------------------
 
-test("claude C2 mapping shell-boundary: run-lane buildPreToolUseHook denies a hostile Bash command and allows a harmless one", async () => {
+test("claude C2 mapping shell-boundary: run-lane buildPreToolUseHook denies a hostile Bash command and allows a harmless one", async (t) => {
   const hook = buildPreToolUseHook(nullLogger());
   const denied = await hook({
     hook_event_name: "PreToolUse",
@@ -57,9 +60,10 @@ test("claude C2 mapping shell-boundary: run-lane buildPreToolUseHook denies a ho
   } as unknown as HookInput);
   // A passing command returns no decision (the tool proceeds under bypassPermissions).
   assert.deepEqual(allowed, {}, "a harmless command reaches its effect (no deny)");
+  recordConformanceEvidence(t.name, "pass");
 });
 
-test("claude C2 mapping shell-boundary: each Bash command is re-screened (no retained interpreter) so a later /proc read is denied", () => {
+test("claude C2 mapping shell-boundary: each Bash command is re-screened (no retained interpreter) so a later /proc read is denied", (t) => {
   // Codex's reusable interpreter + write_stdin has no Claude analog: the screener is stateless,
   // so a first harmless command does not open a session a second hostile write could ride.
   assert.equal(screenBashCommand("echo hello").denied, false, "first harmless command allowed");
@@ -70,9 +74,10 @@ test("claude C2 mapping shell-boundary: each Bash command is re-screened (no ret
     true,
     "a subsequent /proc environment read is denied on its own screening",
   );
+  recordConformanceEvidence(t.name, "pass");
 });
 
-test("claude C2 mapping shell-boundary: the advice deny-all hook denies a Bash shell tool", async () => {
+test("claude C2 mapping shell-boundary: the advice deny-all hook denies a Bash shell tool", async (t) => {
   // The advice lane has no shell at all; the deny-all hook is the boundary (mirrors the
   // Codex advice lane's isolated calculation — no exec_command equivalent is added to Claude).
   const { options } = await captureAdviceOptions();
@@ -85,6 +90,7 @@ test("claude C2 mapping shell-boundary: the advice deny-all hook denies a Bash s
     tool_input: { command: "sh -c 'id'" },
   });
   assert.equal(decisionOf(out), "deny", "advice lane denies any shell tool");
+  recordConformanceEvidence(t.name, "pass");
 });
 
 // ---------------------------------------------------------------------------
@@ -94,7 +100,7 @@ test("claude C2 mapping shell-boundary: the advice deny-all hook denies a Bash s
 // via ClaudeHarness) and the advice lane (ClaudeAdviceHarness construction).
 // ---------------------------------------------------------------------------
 
-test("claude C2 mapping repo-trust: run-lane buildSdkOptions emits literal settingSources: []", async () => {
+test("claude C2 mapping repo-trust: run-lane buildSdkOptions emits literal settingSources: []", async (t) => {
   const options = await captureRunLaneOptions();
   assert.deepEqual(
     options.settingSources,
@@ -103,15 +109,17 @@ test("claude C2 mapping repo-trust: run-lane buildSdkOptions emits literal setti
   );
   // The run lane is allow-by-default-deny-specific: bypassPermissions + the deny hooks.
   assert.equal(options.permissionMode, "bypassPermissions");
+  recordConformanceEvidence(t.name, "pass");
 });
 
-test("claude C2 mapping repo-trust: advice-lane ClaudeAdviceHarness emits literal settingSources: []", async () => {
+test("claude C2 mapping repo-trust: advice-lane ClaudeAdviceHarness emits literal settingSources: []", async (t) => {
   const { options } = await captureAdviceOptions();
   assert.deepEqual(
     options.settingSources,
     [],
     "advice lane: repo-borne .claude cannot grant permissions (settingSources empty)",
   );
+  recordConformanceEvidence(t.name, "pass");
 });
 
 // ---------------------------------------------------------------------------
@@ -122,7 +130,7 @@ test("claude C2 mapping repo-trust: advice-lane ClaudeAdviceHarness emits litera
 // a valid allocated one still runs.
 // ---------------------------------------------------------------------------
 
-test("claude C2 mapping unknown-identity: buildAgentGuardHook denies an unassembled subagent_type", async () => {
+test("claude C2 mapping unknown-identity: buildAgentGuardHook denies an unassembled subagent_type", async (t) => {
   const hook = buildAgentGuardHook(["coder", "reviewer"], nullLogger());
   const out = await hook({
     hook_event_name: "PreToolUse",
@@ -130,9 +138,10 @@ test("claude C2 mapping unknown-identity: buildAgentGuardHook denies an unassemb
     tool_input: { subagent_type: "general-purpose" },
   } as unknown as HookInput);
   assert.equal(decisionOf(out), "deny", "the SDK's built-in general-purpose agent is denied");
+  recordConformanceEvidence(t.name, "pass");
 });
 
-test("claude C2 mapping unknown-identity: buildAgentGuardHook denies a spoofed/unregistered role name", async () => {
+test("claude C2 mapping unknown-identity: buildAgentGuardHook denies a spoofed/unregistered role name", async (t) => {
   const hook = buildAgentGuardHook(["coder", "reviewer"], nullLogger());
   const out = await hook({
     hook_event_name: "PreToolUse",
@@ -140,9 +149,10 @@ test("claude C2 mapping unknown-identity: buildAgentGuardHook denies a spoofed/u
     tool_input: { subagent_type: "attacker-role" },
   } as unknown as HookInput);
   assert.equal(decisionOf(out), "deny", "an unregistered role name fails closed");
+  recordConformanceEvidence(t.name, "pass");
 });
 
-test("claude C2 mapping unknown-identity: buildAgentGuardHook allows an assembled subagent and forces synchronous execution", async () => {
+test("claude C2 mapping unknown-identity: buildAgentGuardHook allows an assembled subagent and forces synchronous execution", async (t) => {
   const hook = buildAgentGuardHook(["coder", "reviewer"], nullLogger());
   const out = await hook({
     hook_event_name: "PreToolUse",
@@ -155,9 +165,10 @@ test("claude C2 mapping unknown-identity: buildAgentGuardHook allows an assemble
     false,
     "an assembled subagent is forced to run synchronously in-turn",
   );
+  recordConformanceEvidence(t.name, "pass");
 });
 
-test("claude C2 mapping unknown-identity: buildAgentGuardHook leaves an already-synchronous assembled subagent unchanged", async () => {
+test("claude C2 mapping unknown-identity: buildAgentGuardHook leaves an already-synchronous assembled subagent unchanged", async (t) => {
   const hook = buildAgentGuardHook(["coder", "reviewer"], nullLogger());
   const out = await hook({
     hook_event_name: "PreToolUse",
@@ -165,6 +176,7 @@ test("claude C2 mapping unknown-identity: buildAgentGuardHook leaves an already-
     tool_input: { subagent_type: "coder", run_in_background: false },
   } as unknown as HookInput);
   assert.deepEqual(out, {}, "an already-synchronous assembled subagent passes through untouched");
+  recordConformanceEvidence(t.name, "pass");
 });
 
 // ---------------------------------------------------------------------------
@@ -199,24 +211,28 @@ function signalDoneFrame(opts: { subagent?: boolean } = {}) {
   return msg;
 }
 
-test("claude C2 mapping workflow-signals: a submit_plan from a subagent frame is ignored", () => {
+test("claude C2 mapping workflow-signals: a submit_plan from a subagent frame is ignored", (t) => {
   const scanned = scanSignals(submitPlanFrame("child plan", { subagent: true }));
   assert.deepEqual(scanned, {}, "a child/stale-origin submit_plan latches no plan");
+  recordConformanceEvidence(t.name, "pass");
 });
 
-test("claude C2 mapping workflow-signals: a signal_done from a subagent frame is ignored", () => {
+test("claude C2 mapping workflow-signals: a signal_done from a subagent frame is ignored", (t) => {
   const scanned = scanSignals(signalDoneFrame({ subagent: true }));
   assert.deepEqual(scanned, {}, "a child/stale-origin signal_done latches no done");
+  recordConformanceEvidence(t.name, "pass");
 });
 
-test("claude C2 mapping workflow-signals: a main-thread submit_plan is honored exactly once", () => {
+test("claude C2 mapping workflow-signals: a main-thread submit_plan is honored exactly once", (t) => {
   const scanned = scanSignals(submitPlanFrame("root plan"));
   assert.deepEqual(scanned, { plan: "root plan" }, "a main-thread submit_plan is honored, once");
+  recordConformanceEvidence(t.name, "pass");
 });
 
-test("claude C2 mapping workflow-signals: a main-thread signal_done is honored", () => {
+test("claude C2 mapping workflow-signals: a main-thread signal_done is honored", (t) => {
   const scanned = scanSignals(signalDoneFrame());
   assert.deepEqual(scanned, { done: true }, "a main-thread signal_done latches done");
+  recordConformanceEvidence(t.name, "pass");
 });
 
 // -- shared capture helpers --------------------------------------------------

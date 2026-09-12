@@ -576,8 +576,11 @@ export const CODEX_CLAUSES: ClauseRow[] = [
   //    layer; the OS-level "the real Go supervisor reaps a boundary-action root's WHOLE descendant
   //    set to ECHILD(+__WALL) before publication" is a packaged effect a direct harness spawn
   //    cannot establish (PRD "Required clause inventory"). The lifecycle root-ordering U row
-  //    prerequisites this (its worker_pat/command-root reap ordering is only OS-real once the
-  //    supervisor's whole-root reaping is proven on the packaged image).
+  //    (codex-u-lifecycle-root-ordering) does NOT — and MUST NOT — prerequisite this owed O row:
+  //    that U row proves the registry/safety reap ordering CONTRACT with injected fake roots on its
+  //    own, and coupling it to an `owed` O prereq would make checkCompleteness read it as an unmet
+  //    prerequisite and wrongly fail the worker gate once codex/U is required (which C5 now makes
+  //    it). The two rows are related in intent but deliberately decoupled in the registry.
   {
     id: "codex-o-packaged-descendant-reaping",
     adapter: "codex",
