@@ -161,6 +161,11 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 	if row := nowRow(r); row != nil {
 		rows = append(rows, row)
 	}
+	// The honest completion-interlock block (PRD #1226 M5, D8): the phase label, the unmet
+	// milestone ids, the attempt count and the same-worker-only HOLD_CONTEXT. Placed right after
+	// the milestone block it references (COMPLETION_UNMET names frozen-list ids). Every row is
+	// emit-only-when-set, so a non-interlocked run (the rollout OFF) adds nothing here.
+	rows = append(rows, completionRows(r)...)
 	if r.BudgetMaxIterations != nil {
 		rows = append(rows, []string{"BUDGET_ITERATIONS", itoa(*r.BudgetMaxIterations)})
 	}
@@ -262,6 +267,60 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 		}
 	}
 	return nil
+}
+
+// completionPhaseLabel maps the SERVER-COMPUTED completion_phase enum to the SAME human label
+// the web renders (ui.tsx RUN_STATUS_LABEL: completion_checking/_reworking/_blocked), so the
+// CLI and web read the same state off the one server-computed field (PRD #1226 M5, D8). The
+// phase is the single source of truth — this NEVER re-derives it from interlock/attempts. An
+// unrecognised value (a newer server than this binary), and the inert "" a non-interlocked run
+// carries, both fall through to "": the caller then emits NO COMPLETION row rather than
+// inventing a label.
+func completionPhaseLabel(phase string) string {
+	switch phase {
+	case "checking":
+		return "Checking completion"
+	case "reworking":
+		return "Reworking unmet milestones"
+	case "blocked":
+		return "Completion blocked"
+	default:
+		return ""
+	}
+}
+
+// completionRows renders the honest completion-interlock state of `uzi run get` (PRD #1226 M5,
+// D8), the CLI twin of the web's CompletionStatePanel. Every row is emit-only-when-set, so a
+// NON-interlocked run (legacy, or the rollout OFF) — completion_phase "", an empty unmet list,
+// zero attempts and a null hold_context — adds NOTHING and renders byte-for-byte as today.
+//
+//   - COMPLETION: the phase as a human label, via completionPhaseLabel (the SINGLE
+//     server-computed source the web shares, never re-derived). Emitted only when the phase maps
+//     to a known label.
+//   - COMPLETION_UNMET: the bounded still-unmet milestone ids, comma-joined. The ids are
+//     server-validated milestone keys, but each is UNTRUSTED display text at render, so the
+//     joined cell goes through sanitizeTTY like the milestone-title rows — never raw model
+//     output. Emitted only when non-empty.
+//   - COMPLETION_ATTEMPTS: how many structural completion attempts the run recorded. Emitted
+//     only when > 0.
+//   - HOLD_CONTEXT: the D8 provider-context constant ("unavailable(same_worker_only)") a
+//     completion hold states, through sanitizeTTY, so the same-worker-only durability limitation
+//     is VISIBLE in the CLI. Emitted only when set.
+func completionRows(r apitypes.RunDTO) [][]string {
+	var rows [][]string
+	if label := completionPhaseLabel(r.CompletionPhase); label != "" {
+		rows = append(rows, []string{"COMPLETION", label})
+	}
+	if len(r.CompletionUnmet) > 0 {
+		rows = append(rows, []string{"COMPLETION_UNMET", sanitizeTTY(strings.Join(r.CompletionUnmet, ","))})
+	}
+	if r.CompletionAttempts > 0 {
+		rows = append(rows, []string{"COMPLETION_ATTEMPTS", itoa(r.CompletionAttempts)})
+	}
+	if r.HoldContext != nil && *r.HoldContext != "" {
+		rows = append(rows, []string{"HOLD_CONTEXT", sanitizeTTY(*r.HoldContext)})
+	}
+	return rows
 }
 
 // limitWaitRows is the usage-limit park block of `uzi run get` (PRD #35), split out
