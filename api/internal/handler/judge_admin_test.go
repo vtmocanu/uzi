@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -511,6 +512,49 @@ func TestAdminJudgeWriteHandlersUnauthenticatedIs401(t *testing.T) {
 			}
 			if len(st.calls) != 0 {
 				t.Fatalf("an unauthenticated write must not reach the store, calls=%v", st.calls)
+			}
+		})
+	}
+}
+
+// TestAdminJudgeWriteRejectsTooManyItems pins the amplification guard on BOTH write verbs: more
+// than JudgeDispositionMaxItems distinct coordinates in one body is a 400 (workersvc.ErrTooManyItems),
+// and the reject happens in the service's dedupe-then-cap BEFORE any store query runs — so the nil
+// embedded Store is never reached (no resolve, no fan-out). This is the bound that keeps one request
+// from resolving an unbounded cross-user member set; without it a caller could drive the resolve
+// with an arbitrarily long coordinate list.
+func TestAdminJudgeWriteRejectsTooManyItems(t *testing.T) {
+	admin := store.User{ID: uuid.New(), IsAdmin: true}
+	items := make([]apitypes.JudgeDispositionCoordDTO, 0, workersvc.JudgeDispositionMaxItems+1)
+	for i := 0; i <= workersvc.JudgeDispositionMaxItems; i++ { // MaxItems+1 DISTINCT coordinates
+		items = append(items, apitypes.JudgeDispositionCoordDTO{Category: "improve_uzi", Target: fmt.Sprintf("t%d", i)})
+	}
+	body, err := json.Marshal(apitypes.JudgeAdminDispositionRequest{Items: items, Status: "done"})
+	if err != nil {
+		t.Fatalf("marshal body: %v", err)
+	}
+	for _, tc := range []struct {
+		name string
+		verb string
+		call func(h *Handler, rec *httptest.ResponseRecorder, req *http.Request)
+	}{
+		{"set", http.MethodPut, func(h *Handler, rec *httptest.ResponseRecorder, req *http.Request) {
+			h.AdminSetJudgeDisposition(rec, req)
+		}},
+		{"undo", http.MethodDelete, func(h *Handler, rec *httptest.ResponseRecorder, req *http.Request) {
+			h.AdminUndoJudgeDisposition(rec, req)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := &adminBacklogStore{} // nil Store: a fan-out resolve would panic, proving the cap fires first
+			h := newRunsHandler(t, st)
+			rec := httptest.NewRecorder()
+			tc.call(h, rec, adminJudgeWriteReq(admin, tc.verb, string(body)))
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("%s with %d items = %d, want 400; body=%s", tc.verb, len(items), rec.Code, rec.Body.String())
+			}
+			if len(st.calls) != 0 {
+				t.Fatalf("an over-cap %s must reject before any store query, calls=%v", tc.verb, st.calls)
 			}
 		})
 	}
