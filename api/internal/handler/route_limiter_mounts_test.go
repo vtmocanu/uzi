@@ -343,6 +343,12 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/repos/{id}/tool-profile", noLimiter},
 	{"GET", "/api/runs/", noLimiter},
 	{"GET", "/api/runs/{id}", noLimiter},
+	// PRD #1296 M2 owner recovery-archive routes. noLimiter — owner-scoped DB reads/writes
+	// with no forge call and no token spend (the streaming download is bounded by the
+	// recovery service's own per-process concurrency cap, not a per-user limiter).
+	{"GET", "/api/runs/{id}/archives", noLimiter},
+	{"GET", "/api/runs/{id}/archives/{captureID}/download", noLimiter},
+	{"DELETE", "/api/runs/{id}/archives/{captureID}", noLimiter},
 	{"GET", "/api/runs/{id}/inputs", noLimiter},
 	{"GET", "/api/runs/{id}/messages", noLimiter},
 	{"GET", "/api/runs/{id}/review", noLimiter},
@@ -580,6 +586,13 @@ var wantRouteMounts = []routeMount{
 	// worker forge READ routes above.
 	{"POST", "/api/worker/runs/{id}/forge/mr-threads/reply", noLimiter},
 	{"POST", "/api/worker/runs/{id}/forge/mr-threads/resolve", noLimiter},
+	// PRD #1296 M2 worker recovery-archive routes. noLimiter — worker-authenticated,
+	// run/hold-scoped, no forge call and no token spend; the upload's cost is bounded by the
+	// recovery service's per-process concurrent-upload cap, not a per-user limiter.
+	{"GET", "/api/worker/runs/{id}/archives/{captureID}", noLimiter},
+	{"POST", "/api/worker/runs/{id}/archives/release", noLimiter},
+	{"POST", "/api/worker/runs/{id}/archives/reserve", noLimiter},
+	{"POST", "/api/worker/runs/{id}/archives/{captureID}/upload", noLimiter},
 	{"POST", "/api/worker/runs/{id}/memory", noLimiter},
 	{"POST", "/api/worker/runs/{id}/messages", noLimiter},
 	{"POST", "/api/worker/runs/{id}/proposals", noLimiter},

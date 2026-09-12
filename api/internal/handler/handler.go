@@ -30,6 +30,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/notifysvc"
 	"github.com/vtmocanu/uzi/api/internal/oidc"
 	"github.com/vtmocanu/uzi/api/internal/privcheck"
+	"github.com/vtmocanu/uzi/api/internal/recovery"
 	"github.com/vtmocanu/uzi/api/internal/releasecheck"
 	"github.com/vtmocanu/uzi/api/internal/schedsvc"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
@@ -82,6 +83,12 @@ type Handler struct {
 	// never nil-panics, mirroring forgeMemo/memo(). New sets it directly.
 	forgeBudget     *forgeBudget
 	forgeBudgetOnce sync.Once
+	// recoverySvc is the durable-recovery archive service (PRD #1296 M2). Accessed only
+	// through recovery(), which lazily constructs it under recoveryOnce from h.q/h.pool/
+	// h.box + the cfg limits, so a struct-literal test Handler (which does not call New)
+	// is race-safe without every construction site wiring it. New sets it directly.
+	recoverySvc  *recovery.Service
+	recoveryOnce sync.Once
 	// box is the generic secret cipher used by the per-user secret endpoints
 	// (Anthropic token). svc owns the forge-specific machinery (which also holds
 	// its own box for PAT sealing); the two share the same key material.
@@ -416,6 +423,34 @@ func (h *Handler) budget() *forgeBudget {
 		}
 	})
 	return h.forgeBudget
+}
+
+// recovery returns the durable-recovery archive service (PRD #1296 M2), lazily built from
+// h.q (the M1 recovery.sql store), h.pool (streaming + bounded upload transactions), h.box
+// (chunk encryption) and the cfg limits. Constructed under recoveryOnce so a struct-literal
+// test handler is race-safe; New sets recoverySvc directly for production. Mirrors budget().
+func (h *Handler) recovery() *recovery.Service {
+	h.recoveryOnce.Do(func() {
+		if h.recoverySvc == nil {
+			h.recoverySvc = recovery.New(h.q, h.pool, h.box, h.recoveryLimits(), h.now)
+		}
+	})
+	return h.recoverySvc
+}
+
+// recoveryLimits maps the operator-configurable cfg fields onto recovery.Limits.
+func (h *Handler) recoveryLimits() recovery.Limits {
+	return recovery.Limits{
+		MaxBundleBytes:         h.cfg.RecoveryMaxBundleBytes,
+		ReadyPayloadPerOwner:   h.cfg.RecoveryReadyPayloadPerOwner,
+		InstanceBytes:          h.cfg.RecoveryInstanceBytes,
+		MaxCapturesPerClaim:    h.cfg.RecoveryMaxCapturesPerClaim,
+		MaxCapturesPerOwner:    h.cfg.RecoveryMaxCapturesPerOwner,
+		ReadyRetention:         h.cfg.RecoveryReadyRetention,
+		MaxConcurrentUploads:   h.cfg.RecoveryMaxConcurrentUploads,
+		MaxConcurrentDownloads: h.cfg.RecoveryMaxConcurrentDownloads,
+		RequestDeadline:        h.cfg.RecoveryRequestDeadline,
+	}
 }
 
 // vaultNoticeClaimer is the narrow slice of *store.Queries VaultLock touches to pre-ack a
@@ -872,6 +907,15 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// forge on every call, exactly as the manual Fix CI button does. Owner-scoped
 				// in SQL (foreign run → 404).
 				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/rework", h.StartRunRework)
+				// Durable recovery archive — owner side (PRD #1296 M2, D6/D7). RequireUser
+				// (browser cookie OR uzc_/uza_ Bearer) so both the web run page and the CLI
+				// reach it. Each handler resolves ownership through h.wsvc.GetRun (owner-only,
+				// admin refused) exactly like ListRunInputs — NOT GetRunForViewer — then the
+				// recovery service's own owner-scoped queries. Download streams decrypted bytes
+				// with private/no-store/nosniff + a server-generated filename and no redirect.
+				r.Get("/{id}/archives", h.ListRecoveryArchives)
+				r.Get("/{id}/archives/{captureID}/download", h.DownloadRecoveryArchive)
+				r.Delete("/{id}/archives/{captureID}", h.DiscardRecoveryArchive)
 			})
 			r.Group(func(r chi.Router) {
 				r.Use(mw.RequireAuth(h.q, h.cfg))
@@ -1070,6 +1114,20 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// control (the generator is tool-less, the text renders inert).
 		r.Post("/runs/{id}/summary/intent", h.WorkerSetIntentSummary)
 		r.Post("/runs/{id}/summary/plan", h.WorkerSetPlanSummary)
+
+		// Durable recovery archive — worker side (PRD #1296 M2, D2/D4). Bearer-only
+		// (RequireWorker), authorized by the caller's worker identity against the
+		// capture's/hold's immutable original_worker_id and an OPEN hold, so a
+		// different/later worker cannot adopt authority and a terminated run is still
+		// serviceable (post-terminal recovery). None mutates run state. The upload is ONE
+		// streaming octet-stream request the API splits into AAD-sealed chunks and commits
+		// with the ready transition in one transaction; a retry starts from zero under the
+		// same capture id. The two static paths (reserve/release) are registered before the
+		// {captureID} wildcard so chi routes them by their static segment.
+		r.Post("/runs/{id}/archives/reserve", h.WorkerRecoveryReserve)
+		r.Post("/runs/{id}/archives/release", h.WorkerRecoveryRelease)
+		r.Post("/runs/{id}/archives/{captureID}/upload", h.WorkerRecoveryUpload)
+		r.Get("/runs/{id}/archives/{captureID}", h.WorkerRecoveryStatus)
 	})
 }
 
