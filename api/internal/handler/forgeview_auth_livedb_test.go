@@ -20,8 +20,12 @@ type fakeForgeView struct {
 	forgetest.BaseFake
 }
 
-func (*fakeForgeView) ListMergeRequests(context.Context, int64, forge.ListMergeRequestsOptions) ([]forge.MergeRequestSummary, error) {
-	return []forge.MergeRequestSummary{{IID: 7, Title: "t", HeadSHA: "deadbeef"}}, nil
+func (*fakeForgeView) ListMergeRequestRefs(context.Context, int64, forge.ListMergeRequestsOptions) ([]forge.MergeRequestRef, error) {
+	return []forge.MergeRequestRef{{IID: 7, HeadSHA: "deadbeef"}}, nil
+}
+
+func (*fakeForgeView) GetMergeRequestSummary(_ context.Context, _ int64, iid int64) (forge.MergeRequestSummary, error) {
+	return forge.MergeRequestSummary{IID: iid, Title: "t", HeadSHA: "deadbeef", State: forge.MRStateOpened}, nil
 }
 
 func (*fakeForgeView) ListChecks(context.Context, int64, string) ([]forge.Check, error) {

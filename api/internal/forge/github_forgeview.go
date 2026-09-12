@@ -1,9 +1,10 @@
 package forge
 
-// github_forgeview.go is the GitHub driver's forge-view read seam (PRD #1255 D5):
-// ListMergeRequests, ListChecks, ListWorkflowRuns, and their neutral mappers. These
-// are read-only, on-demand reads behind the api; every error routes through wrapErr
-// (so the PAT is redacted and a rate-limit surfaces as *RateLimitError).
+// github_forgeview.go is the GitHub driver's forge-view read seam (PRD #1255 D5/M2b):
+// ListMergeRequestRefs, GetMergeRequestSummary, ListChecks, ListWorkflowRuns, and
+// their neutral mappers. These are read-only, on-demand reads behind the api; every
+// error routes through wrapErr (so the PAT is redacted and a rate-limit surfaces as
+// *RateLimitError), except a per-iid 404 which returns ErrMergeRequestNotFound directly.
 
 import (
 	"context"
@@ -12,12 +13,11 @@ import (
 	gh "github.com/google/go-github/v91/github"
 )
 
-// ListMergeRequests lists the repo's open pull requests as neutral summaries,
-// newest-activity first. GitHub's PR List omits mergeability, additions/deletions
-// and the commit count (documented on the struct), so the driver reads
-// PullRequests.Get per PR to fill them, and derives ReviewDecision from
-// PullRequests.ListReviews via the D6 fold. opts.Limit caps the rows collected.
-func (g *github) ListMergeRequests(ctx context.Context, projectID int64, opts ListMergeRequestsOptions) ([]MergeRequestSummary, error) {
+// ListMergeRequestRefs lists the repo's open pull requests as cheap refs,
+// newest-activity first, in one paginated list call — just IID/HeadSHA/UpdatedAt per
+// row, with NO per-PR enrichment (that is GetMergeRequestSummary's job). opts.Limit
+// caps the rows collected.
+func (g *github) ListMergeRequestRefs(ctx context.Context, projectID int64, opts ListMergeRequestsOptions) ([]MergeRequestRef, error) {
 	slug, err := g.repoSlugFor(ctx, projectID)
 	if err != nil {
 		return nil, err
@@ -31,7 +31,7 @@ func (g *github) ListMergeRequests(ctx context.Context, projectID int64, opts Li
 	if opts.Limit > 0 && opts.Limit < githubPerPage {
 		opt.PerPage = opts.Limit
 	}
-	var out []MergeRequestSummary
+	var out []MergeRequestRef
 	for page := 0; ; {
 		page++
 		prs, resp, err := g.client.PullRequests.List(ctx, slug.owner, slug.repo, opt)
@@ -42,11 +42,11 @@ func (g *github) ListMergeRequests(ctx context.Context, projectID int64, opts Li
 			if pr == nil {
 				continue
 			}
-			summary, err := g.mergeRequestSummary(ctx, slug, pr.GetNumber())
-			if err != nil {
-				return nil, err
-			}
-			out = append(out, summary)
+			out = append(out, MergeRequestRef{
+				IID:       int64(pr.GetNumber()),
+				HeadSHA:   pr.GetHead().GetSHA(),
+				UpdatedAt: pr.GetUpdatedAt().Time,
+			})
 			if opts.Limit > 0 && len(out) >= opts.Limit {
 				return out, nil
 			}
@@ -65,13 +65,33 @@ func (g *github) ListMergeRequests(ctx context.Context, projectID int64, opts Li
 	return out, nil
 }
 
+// GetMergeRequestSummary reads one PR's full neutral summary by iid, reusing the
+// mergeRequestSummary helper (PullRequests.Get + the D6 reviews fold). A 404 from
+// PullRequests.Get is mapped to ErrMergeRequestNotFound (in mergeRequestSummary).
+func (g *github) GetMergeRequestSummary(ctx context.Context, projectID, iid int64) (MergeRequestSummary, error) {
+	slug, err := g.repoSlugFor(ctx, projectID)
+	if err != nil {
+		return MergeRequestSummary{}, err
+	}
+	num, err := ghNum(iid)
+	if err != nil {
+		return MergeRequestSummary{}, g.wrapErr("get merge request detail", err)
+	}
+	return g.mergeRequestSummary(ctx, slug, num)
+}
+
 // mergeRequestSummary reads one PR's full detail (PullRequests.Get) and its reviews
 // and folds them into a neutral summary. The detail GET is what populates
-// MergeableState (dirty ⇒ conflicts), Additions, Deletions and Commits, none of
-// which the list row carries.
+// MergeableState (dirty ⇒ conflicts), Additions, Deletions, Commits and State, none
+// of which the list row carries. A 404 (PR absent / raced closed-and-purged) is
+// mapped to ErrMergeRequestNotFound BEFORE wrapErr — the redactor would sever the
+// Unwrap chain, and the sentinel carries no token material.
 func (g *github) mergeRequestSummary(ctx context.Context, slug repoSlug, number int) (MergeRequestSummary, error) {
-	pr, _, err := g.client.PullRequests.Get(ctx, slug.owner, slug.repo, number)
+	pr, resp, err := g.client.PullRequests.Get(ctx, slug.owner, slug.repo, number)
 	if err != nil {
+		if resp != nil && resp.StatusCode == http.StatusNotFound {
+			return MergeRequestSummary{}, ErrMergeRequestNotFound
+		}
 		return MergeRequestSummary{}, g.wrapErr("get merge request detail", err)
 	}
 	s := MergeRequestSummary{
@@ -83,6 +103,7 @@ func (g *github) mergeRequestSummary(ctx context.Context, slug repoSlug, number 
 		HeadSHA:      pr.GetHead().GetSHA(),
 		Draft:        pr.GetDraft(),
 		Conflicts:    githubConflicts(pr.GetMergeableState()),
+		State:        githubMRState(pr),
 		WebURL:       pr.GetHTMLURL(),
 		Additions:    pr.GetAdditions(),
 		Deletions:    pr.GetDeletions(),

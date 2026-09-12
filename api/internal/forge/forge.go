@@ -53,6 +53,17 @@ var ErrForgeVersionUnsupported = errors.New("forge: server version is older than
 // no secret material.
 var ErrResolveUnsupported = errors.New("forge: resolve is not supported on this forge")
 
+// ErrMergeRequestNotFound is returned by GetMergeRequestSummary when the forge 404s
+// the requested iid — the PR does not exist, or raced closed-and-purged between a
+// ListMergeRequestRefs row and the per-iid read (PRD #1255 M2b). It is a distinct
+// sentinel (not a redacted generic error) so a caller can errors.Is it: GetPull maps
+// it to 404, and ListPulls SKIPS the raced-away row rather than failing the whole
+// list. Each driver detects the forge 404 BEFORE wrapErr and returns this sentinel
+// directly — the redactor severs the Unwrap chain (see redactor.error), so a wrapped
+// sentinel would not survive errors.Is; the sentinel carries no token material, so
+// returning it unredacted is safe.
+var ErrMergeRequestNotFound = errors.New("forge: merge request not found")
+
 // RateLimitError is the forge-neutral rate-limit error (PRD #1255 D4). The GitHub
 // driver wraps GitHub's rate-limit shapes into it so a caller can errors.As it and
 // map it to HTTP 429 + Retry-After. Only the GitHub driver produces it today: GitHub
@@ -486,8 +497,8 @@ type Review struct {
 	SubmittedAt time.Time
 }
 
-// MergeRequestSummary is one open merge/pull request as the forge-view list route
-// observes it (PRD #1255 D5). It is a LIST-row shape: only the fields the pulls
+// MergeRequestSummary is one merge/pull request's full neutral summary as
+// GetMergeRequestSummary returns it per iid (PRD #1255 D5/M2b): the fields the pulls
 // screen bands, sorts and renders. Conflicts is a pointer because "unknown" is a
 // real third state — GitHub omits mergeability on the list and computes it lazily,
 // so a driver reports nil rather than guessing false. Every string field is
@@ -502,12 +513,30 @@ type MergeRequestSummary struct {
 	Draft          bool
 	Conflicts      *bool
 	ReviewDecision ReviewDecision
-	WebURL         string
-	Additions      int
-	Deletions      int
-	Commits        int
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	// State is one of the MRState* constants (opened/closed/merged/locked),
+	// populated by GetMergeRequestSummary so GetPull can 404 a non-open PR. It is
+	// deliberately NOT carried on the wire DTOs — the forge view is open-only.
+	State     string
+	WebURL    string
+	Additions int
+	Deletions int
+	Commits   int
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+// MergeRequestRef is the cheap list-row identity ListMergeRequestRefs returns for
+// each open merge/pull request (PRD #1255 M2b): just what the forge yields in ONE
+// list call, enough for the caller to address each PR by iid and enrich it with a
+// per-iid GetMergeRequestSummary. Splitting the old bundled list into refs + per-iid
+// summaries is what lets the memo (M2b part 2) make each PR's enrichment individually
+// addressable, and what lets GetPull find ANY open PR by iid rather than scanning the
+// most-recently-updated page. IID and HeadSHA are forge-authored identifiers,
+// UpdatedAt the activity timestamp the list is ordered by.
+type MergeRequestRef struct {
+	IID       int64
+	HeadSHA   string
+	UpdatedAt time.Time
 }
 
 // Check is one status/check for a commit sha (PRD #1255 D5), merging the two
@@ -559,7 +588,7 @@ type WorkflowRun struct {
 	JobsTotal  int
 }
 
-// ListMergeRequestsOptions filters ListMergeRequests. State's zero value means
+// ListMergeRequestsOptions filters ListMergeRequestRefs. State's zero value means
 // "opened" (the only state the pulls screen shows); Limit == 0 means the driver's
 // default page (no explicit cap), a positive value stops once that many rows are
 // collected.
@@ -774,16 +803,27 @@ type Forge interface {
 	// the returned tail is NOT itself a secret-safe log scrubber for arbitrary
 	// third-party tokens — see the snapshot scrubber in the ci-fix handler.
 	JobLogTail(ctx context.Context, projectID, jobID int64, maxBytes int) (string, error)
-	// ListMergeRequests returns the project's open merge requests as list-row
-	// summaries (PRD #1255 D5), newest activity first, paginated internally.
-	// opts.State defaults to "opened"; opts.Limit optionally caps the number of
-	// rows. Each driver derives ReviewDecision (no forge exposes it on the row) and
-	// fills Conflicts/Additions/Deletions/Commits from whatever its SDK carries on
-	// the row, reading per-MR detail only where the list omits it (GitHub). Every
+	// ListMergeRequestRefs returns the project's open merge requests as cheap
+	// list-row refs (PRD #1255 M2b) in ONE list call, newest activity first,
+	// paginated internally — just IID/HeadSHA/UpdatedAt per row, with NO per-PR
+	// enrichment (that is GetMergeRequestSummary's job). opts.State defaults to
+	// "opened" (the only state the pulls screen shows); opts.Limit optionally caps
+	// the rows. Pagination is bounded by the driver's caps; errors are PAT-redacted,
+	// and on GitHub a rate-limit surfaces as *RateLimitError (GitLab/Forgejo return a
+	// plain error; see RateLimitError).
+	ListMergeRequestRefs(ctx context.Context, projectID int64, opts ListMergeRequestsOptions) ([]MergeRequestRef, error)
+	// GetMergeRequestSummary returns ONE merge/pull request's full neutral summary by
+	// iid (PRD #1255 M2b): IID, Title, Author, branches, HeadSHA, Draft, the Conflicts
+	// tri-state, ReviewDecision, State, WebURL and (where the forge exposes them)
+	// Additions/Deletions/Commits and timestamps. Each driver derives ReviewDecision
+	// (no forge exposes it on the row) and reads whatever per-MR detail the summary
+	// needs (GitHub: PullRequests.Get + ListReviews; GitLab: GetMergeRequest +
+	// approvals; Forgejo: GetPullRequest + the raw reviews fold). Returns
+	// ErrMergeRequestNotFound (errors.Is-matchable) when the forge 404s the iid. Every
 	// string field is untrusted forge text; errors are PAT-redacted, and on GitHub a
 	// rate-limit surfaces as *RateLimitError (GitLab/Forgejo return a plain error; see
 	// RateLimitError).
-	ListMergeRequests(ctx context.Context, projectID int64, opts ListMergeRequestsOptions) ([]MergeRequestSummary, error)
+	GetMergeRequestSummary(ctx context.Context, projectID, iid int64) (MergeRequestSummary, error)
 	// ListChecks returns every status/check for a commit sha (PRD #1255 D5), merging
 	// the forge's check and commit-status surfaces and DEDUPLICATING by Name so a bot
 	// reporting through either appears once. GitHub: ListCheckRunsForRef +

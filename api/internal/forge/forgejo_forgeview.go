@@ -1,11 +1,12 @@
 package forge
 
-// forgejo_forgeview.go is the Forgejo driver's forge-view read seam (PRD #1255 D5):
-// ListMergeRequests, ListChecks, ListWorkflowRuns, and their neutral mappers. The
-// gitea SDK has no pull-review listing, so ListMergeRequests reads reviews through
-// the driver's raw GET helper and folds them (D6). Where the Actions endpoint is
-// absent for the server version, ListWorkflowRuns returns ErrForgeVersionUnsupported
-// (the honest degrade path).
+// forgejo_forgeview.go is the Forgejo driver's forge-view read seam (PRD #1255 D5/M2b):
+// ListMergeRequestRefs, GetMergeRequestSummary, ListChecks, ListWorkflowRuns, and
+// their neutral mappers. The gitea SDK has no pull-review listing, so the summary
+// reads reviews through the driver's raw GET helper and folds them (D6). Where the
+// Actions endpoint is absent for the server version, ListWorkflowRuns returns
+// ErrForgeVersionUnsupported (the honest degrade path). A per-iid 404 returns
+// ErrMergeRequestNotFound directly.
 
 import (
 	"context"
@@ -34,15 +35,11 @@ type forgejoReview struct {
 	SubmittedAt time.Time `json:"submitted_at"`
 }
 
-// ListMergeRequests lists the repo's open pull requests as neutral summaries. The
-// list row carries Draft, Mergeable, Head.Sha, Additions and Deletions; the review
-// decision is derived by reading each PR's reviews (raw GET) and folding them (D6).
-// Conflicts is the negation of Mergeable (Forgejo computes it on the row). Unlike
-// GitLab, the gitea `mergeable` bool carries no "still computing" state, so we cannot
-// distinguish unknown from known-mergeable; a PR whose background merge check has not
-// finished reads mergeable=false ⇒ Conflicts=&true transiently. This is the best the
-// row exposes without an extra per-PR call, and the poll re-reads it as it settles.
-func (f *forgejo) ListMergeRequests(ctx context.Context, projectID int64, opts ListMergeRequestsOptions) ([]MergeRequestSummary, error) {
+// ListMergeRequestRefs lists the repo's open pull requests as cheap refs,
+// newest-activity first, in one paginated list call — just IID/HeadSHA/UpdatedAt per
+// row, with NO per-PR enrichment (that is GetMergeRequestSummary's job). opts.Limit
+// caps the rows collected.
+func (f *forgejo) ListMergeRequestRefs(ctx context.Context, projectID int64, opts ListMergeRequestsOptions) ([]MergeRequestRef, error) {
 	c, err := f.newClient(ctx)
 	if err != nil {
 		return nil, err
@@ -59,7 +56,7 @@ func (f *forgejo) ListMergeRequests(ctx context.Context, projectID int64, opts L
 	if opts.Limit > 0 && opts.Limit < forgejoPerPage {
 		opt.PageSize = opts.Limit
 	}
-	var out []MergeRequestSummary
+	var out []MergeRequestRef
 	for page := 0; ; {
 		page++
 		prs, resp, err := c.ListRepoPullRequests(slug.owner, slug.repo, opt)
@@ -70,11 +67,14 @@ func (f *forgejo) ListMergeRequests(ctx context.Context, projectID int64, opts L
 			if pr == nil {
 				continue
 			}
-			s, err := f.mergeRequestSummary(ctx, slug, pr)
-			if err != nil {
-				return nil, err
+			ref := MergeRequestRef{IID: pr.Index}
+			if pr.Head != nil {
+				ref.HeadSHA = pr.Head.Sha
 			}
-			out = append(out, s)
+			if pr.Updated != nil {
+				ref.UpdatedAt = *pr.Updated
+			}
+			out = append(out, ref)
 			if opts.Limit > 0 && len(out) >= opts.Limit {
 				return out, nil
 			}
@@ -93,8 +93,33 @@ func (f *forgejo) ListMergeRequests(ctx context.Context, projectID int64, opts L
 	return out, nil
 }
 
+// GetMergeRequestSummary reads one PR's full neutral summary by iid via
+// GetPullRequest, folding the same mergeRequestSummary mapping (incl. the !Mergeable
+// conflicts and the raw-GET reviews fold). A 404 (PR absent / raced closed-and-purged)
+// is mapped to ErrMergeRequestNotFound BEFORE wrapErr — the redactor would sever the
+// Unwrap chain, and the sentinel carries no token material.
+func (f *forgejo) GetMergeRequestSummary(ctx context.Context, projectID, iid int64) (MergeRequestSummary, error) {
+	c, err := f.newClient(ctx)
+	if err != nil {
+		return MergeRequestSummary{}, err
+	}
+	slug, err := f.repoSlugFor(c, projectID)
+	if err != nil {
+		return MergeRequestSummary{}, err
+	}
+	pr, resp, err := c.GetPullRequest(slug.owner, slug.repo, iid)
+	if err != nil {
+		if resp != nil && resp.StatusCode == http.StatusNotFound {
+			return MergeRequestSummary{}, ErrMergeRequestNotFound
+		}
+		return MergeRequestSummary{}, f.wrapErr("get merge request summary", err)
+	}
+	return f.mergeRequestSummary(ctx, slug, pr)
+}
+
 // mergeRequestSummary folds one gitea PullRequest (plus its reviews) into a neutral
-// summary.
+// summary. State is Forgejo's PR lifecycle folded onto the MRState* vocabulary (see
+// forgejoMRState).
 func (f *forgejo) mergeRequestSummary(ctx context.Context, slug repoSlug, pr *gitea.PullRequest) (MergeRequestSummary, error) {
 	conflicts := !pr.Mergeable
 	s := MergeRequestSummary{
@@ -102,6 +127,7 @@ func (f *forgejo) mergeRequestSummary(ctx context.Context, slug repoSlug, pr *gi
 		Title:     pr.Title,
 		Draft:     pr.Draft,
 		Conflicts: &conflicts,
+		State:     forgejoMRState(pr),
 		WebURL:    pr.HTMLURL,
 	}
 	if pr.Poster != nil {

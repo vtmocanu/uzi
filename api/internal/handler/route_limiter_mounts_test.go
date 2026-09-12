@@ -334,7 +334,7 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/repos/{id}/github-project-sync/visibility", noLimiter},
 	{"GET", "/api/repos/{id}/issues/{iid}", limForge},
 	// PRD #1255 M2a forge views: read-only open-pulls and CI-runs reads. Each proxies
-	// the repo's forge on demand (ListMergeRequests/ListChecks/ListWorkflowRuns), so it
+	// the repo's forge on demand (ListMergeRequestRefs/ListChecks/ListWorkflowRuns), so it
 	// carries the per-user forge budget, like GET /{id}/issues/{iid} above it.
 	{"GET", "/api/repos/{id}/pulls", limForge},
 	{"GET", "/api/repos/{id}/pulls/{iid}", limForge},

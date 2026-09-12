@@ -10,22 +10,56 @@ import (
 	"time"
 )
 
-// TestGitHubListMergeRequests pins the cold path: the list row is enriched via a
-// per-PR Get (mergeable_state=dirty ⇒ conflicts, plus additions/deletions/commits)
-// and the review decision is folded from ListReviews (D6).
-func TestGitHubListMergeRequests(t *testing.T) {
+// TestGitHubListMergeRequestRefs pins the cheap list call: it returns one ref per
+// open PR (IID/HeadSHA/UpdatedAt), preserves the newest-activity-first order GitHub
+// returns them in, honours Limit, and does NOT enrich per-PR — no /pulls/{n} or
+// /reviews route is registered, so a stray per-PR Get would 404 the mux and fail.
+func TestGitHubListMergeRequestRefs(t *testing.T) {
 	m := newMockGitHub(t, map[string]http.HandlerFunc{
 		"/repos/acme/widgets/pulls": func(w http.ResponseWriter, _ *http.Request) {
 			_ = json.NewEncoder(w).Encode([]map[string]any{
-				{
-					"number": 7, "title": "Add widget", "state": "open", "draft": false,
-					"user":     map[string]any{"login": "octo"},
-					"head":     map[string]any{"ref": "feature", "sha": "abc123"},
-					"base":     map[string]any{"ref": "main"},
-					"html_url": "https://github.com/acme/widgets/pull/7",
-				},
+				{"number": 7, "state": "open",
+					"head": map[string]any{"ref": "feature", "sha": "abc123"}, "updated_at": "2024-03-02T00:00:00Z"},
+				{"number": 6, "state": "open",
+					"head": map[string]any{"ref": "old", "sha": "def456"}, "updated_at": "2024-03-01T00:00:00Z"},
 			})
 		},
+	})
+	d := newGitHubDriver(t, m, "ghp_classicTokenValue1234567890")
+
+	refs, err := d.ListMergeRequestRefs(context.Background(), 7, ListMergeRequestsOptions{})
+	if err != nil {
+		t.Fatalf("ListMergeRequestRefs: %v", err)
+	}
+	if len(refs) != 2 {
+		t.Fatalf("expected 2 refs, got %d", len(refs))
+	}
+	if refs[0].IID != 7 || refs[0].HeadSHA != "abc123" {
+		t.Fatalf("ref 0 wrong: %+v", refs[0])
+	}
+	wantUpd, _ := time.Parse(time.RFC3339, "2024-03-02T00:00:00Z")
+	if !refs[0].UpdatedAt.Equal(wantUpd) {
+		t.Errorf("ref 0 UpdatedAt = %v, want %v", refs[0].UpdatedAt, wantUpd)
+	}
+	// Order preserved (newest activity first as GitHub returns them).
+	if refs[1].IID != 6 || refs[1].HeadSHA != "def456" {
+		t.Fatalf("ref 1 wrong: %+v", refs[1])
+	}
+
+	limited, err := d.ListMergeRequestRefs(context.Background(), 7, ListMergeRequestsOptions{Limit: 1})
+	if err != nil {
+		t.Fatalf("ListMergeRequestRefs (limited): %v", err)
+	}
+	if len(limited) != 1 || limited[0].IID != 7 {
+		t.Fatalf("Limit=1 must cap to the first row, got %+v", limited)
+	}
+}
+
+// TestGitHubGetMergeRequestSummary pins the per-iid enrichment: PullRequests.Get
+// fills mergeable_state=dirty ⇒ conflicts, additions/deletions/commits and State, and
+// the review decision is folded from ListReviews (D6).
+func TestGitHubGetMergeRequestSummary(t *testing.T) {
+	m := newMockGitHub(t, map[string]http.HandlerFunc{
 		"/repos/acme/widgets/pulls/7": func(w http.ResponseWriter, _ *http.Request) {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"number": 7, "title": "Add widget", "state": "open", "draft": false,
@@ -49,14 +83,10 @@ func TestGitHubListMergeRequests(t *testing.T) {
 	})
 	d := newGitHubDriver(t, m, "ghp_classicTokenValue1234567890")
 
-	mrs, err := d.ListMergeRequests(context.Background(), 7, ListMergeRequestsOptions{})
+	got, err := d.GetMergeRequestSummary(context.Background(), 7, 7)
 	if err != nil {
-		t.Fatalf("ListMergeRequests: %v", err)
+		t.Fatalf("GetMergeRequestSummary: %v", err)
 	}
-	if len(mrs) != 1 {
-		t.Fatalf("expected 1 MR, got %d", len(mrs))
-	}
-	got := mrs[0]
 	if got.IID != 7 || got.Title != "Add widget" || got.Author != "octo" {
 		t.Fatalf("basic fields wrong: %+v", got)
 	}
@@ -72,19 +102,16 @@ func TestGitHubListMergeRequests(t *testing.T) {
 	if got.ReviewDecision != ReviewChangesRequested {
 		t.Fatalf("ReviewDecision = %q, want changes_requested (carol's latest non-comment review)", got.ReviewDecision)
 	}
+	if got.State != MRStateOpened {
+		t.Fatalf("state=open must map to MRStateOpened, got %q", got.State)
+	}
 }
 
-// TestGitHubListMergeRequestsConflictsUnknown pins that a not-yet-computed
+// TestGitHubGetMergeRequestSummaryConflictsUnknown pins that a not-yet-computed
 // mergeability ("unknown"/empty) yields a nil Conflicts (a real third state), not a
 // guessed false.
-func TestGitHubListMergeRequestsConflictsUnknown(t *testing.T) {
+func TestGitHubGetMergeRequestSummaryConflictsUnknown(t *testing.T) {
 	m := newMockGitHub(t, map[string]http.HandlerFunc{
-		"/repos/acme/widgets/pulls": func(w http.ResponseWriter, _ *http.Request) {
-			_ = json.NewEncoder(w).Encode([]map[string]any{
-				{"number": 8, "title": "WIP", "state": "open",
-					"head": map[string]any{"ref": "wip", "sha": "d00d"}, "base": map[string]any{"ref": "main"}},
-			})
-		},
 		"/repos/acme/widgets/pulls/8": func(w http.ResponseWriter, _ *http.Request) {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"number": 8, "title": "WIP", "state": "open",
@@ -98,18 +125,35 @@ func TestGitHubListMergeRequestsConflictsUnknown(t *testing.T) {
 	})
 	d := newGitHubDriver(t, m, "ghp_classicTokenValue1234567890")
 
-	mrs, err := d.ListMergeRequests(context.Background(), 7, ListMergeRequestsOptions{})
+	got, err := d.GetMergeRequestSummary(context.Background(), 7, 8)
 	if err != nil {
-		t.Fatalf("ListMergeRequests: %v", err)
+		t.Fatalf("GetMergeRequestSummary: %v", err)
 	}
-	if len(mrs) != 1 {
-		t.Fatalf("expected 1 MR, got %d", len(mrs))
+	if got.Conflicts != nil {
+		t.Fatalf("unknown mergeability must be nil Conflicts, got %v", *got.Conflicts)
 	}
-	if mrs[0].Conflicts != nil {
-		t.Fatalf("unknown mergeability must be nil Conflicts, got %v", *mrs[0].Conflicts)
+	if got.ReviewDecision != ReviewNone {
+		t.Fatalf("no reviews, no requested reviewers ⇒ none, got %q", got.ReviewDecision)
 	}
-	if mrs[0].ReviewDecision != ReviewNone {
-		t.Fatalf("no reviews, no requested reviewers ⇒ none, got %q", mrs[0].ReviewDecision)
+}
+
+// TestGitHubGetMergeRequestSummaryNotFound pins that a 404 from PullRequests.Get
+// surfaces as ErrMergeRequestNotFound (errors.Is-matchable), not a redacted generic
+// error — so the handler can 404 a missing/raced-away PR.
+func TestGitHubGetMergeRequestSummaryNotFound(t *testing.T) {
+	m := newMockGitHub(t, map[string]http.HandlerFunc{
+		"/repos/acme/widgets/pulls/999": func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, `{"message":"Not Found"}`, http.StatusNotFound)
+		},
+	})
+	d := newGitHubDriver(t, m, "ghp_classicTokenValue1234567890")
+
+	_, err := d.GetMergeRequestSummary(context.Background(), 7, 999)
+	if err == nil {
+		t.Fatal("expected an error for an absent PR")
+	}
+	if !errors.Is(err, ErrMergeRequestNotFound) {
+		t.Fatalf("a 404 must map to ErrMergeRequestNotFound, got %v", err)
 	}
 }
 
@@ -302,7 +346,7 @@ func TestGitHubRateLimitTyped(t *testing.T) {
 	})
 	d := newGitHubDriver(t, m, "ghp_classicTokenValue1234567890")
 
-	_, err := d.ListMergeRequests(context.Background(), 7, ListMergeRequestsOptions{})
+	_, err := d.ListMergeRequestRefs(context.Background(), 7, ListMergeRequestsOptions{})
 	if err == nil {
 		t.Fatal("expected a rate-limit error")
 	}
@@ -370,7 +414,7 @@ func TestGitHubAbuseRateLimitTyped(t *testing.T) {
 	})
 	d := newGitHubDriver(t, m, "ghp_classicTokenValue1234567890")
 
-	_, err := d.ListMergeRequests(context.Background(), 7, ListMergeRequestsOptions{})
+	_, err := d.ListMergeRequestRefs(context.Background(), 7, ListMergeRequestsOptions{})
 	if err == nil {
 		t.Fatal("expected an abuse rate-limit error")
 	}

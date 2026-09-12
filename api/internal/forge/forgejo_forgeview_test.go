@@ -9,22 +9,64 @@ import (
 	"time"
 )
 
-// TestForgejoListMergeRequests pins the row mapping (Draft, Head.Sha, additions/
-// deletions, Conflicts=!Mergeable) and the D6 fold over reviews read via the raw GET
-// helper (the gitea SDK has no ListPullRequestReviews).
-func TestForgejoListMergeRequests(t *testing.T) {
+// TestForgejoListMergeRequestRefs pins the cheap list call: one ref per open PR
+// (IID/HeadSHA/UpdatedAt), order preserved (recentupdate), Limit honoured, and NO
+// per-PR enrichment — no /pulls/{n}/reviews route is registered, so a stray reviews
+// fold would 404 the mux.
+func TestForgejoListMergeRequestRefs(t *testing.T) {
 	m := newMockForgejo(t, map[string]http.HandlerFunc{
 		"/repos/acme/widgets/pulls": func(w http.ResponseWriter, _ *http.Request) {
 			_ = json.NewEncoder(w).Encode([]map[string]any{
-				{
-					"number": 5, "title": "Add widget", "state": "open", "draft": false,
-					"mergeable": false,
-					"user":      map[string]any{"login": "octo"},
-					"head":      map[string]any{"ref": "feature", "sha": "abc123"},
-					"base":      map[string]any{"ref": "main"},
-					"html_url":  "https://forgejo/acme/widgets/pulls/5",
-					"additions": 12, "deletions": 3,
-				},
+				{"number": 5, "state": "open",
+					"head": map[string]any{"ref": "feature", "sha": "abc123"}, "updated_at": "2024-03-02T00:00:00Z"},
+				{"number": 4, "state": "open",
+					"head": map[string]any{"ref": "old", "sha": "def456"}, "updated_at": "2024-03-01T00:00:00Z"},
+			})
+		},
+	})
+	d := newForgejoDriver(t, m, "forgejo-token-value-123456")
+
+	refs, err := d.ListMergeRequestRefs(context.Background(), 7, ListMergeRequestsOptions{})
+	if err != nil {
+		t.Fatalf("ListMergeRequestRefs: %v", err)
+	}
+	if len(refs) != 2 {
+		t.Fatalf("expected 2 refs, got %d", len(refs))
+	}
+	if refs[0].IID != 5 || refs[0].HeadSHA != "abc123" {
+		t.Fatalf("ref 0 wrong: %+v", refs[0])
+	}
+	wantUpd, _ := time.Parse(time.RFC3339, "2024-03-02T00:00:00Z")
+	if !refs[0].UpdatedAt.Equal(wantUpd) {
+		t.Errorf("ref 0 UpdatedAt = %v, want %v", refs[0].UpdatedAt, wantUpd)
+	}
+	if refs[1].IID != 4 || refs[1].HeadSHA != "def456" {
+		t.Fatalf("ref 1 wrong: %+v", refs[1])
+	}
+
+	limited, err := d.ListMergeRequestRefs(context.Background(), 7, ListMergeRequestsOptions{Limit: 1})
+	if err != nil {
+		t.Fatalf("ListMergeRequestRefs (limited): %v", err)
+	}
+	if len(limited) != 1 || limited[0].IID != 5 {
+		t.Fatalf("Limit=1 must cap to the first row, got %+v", limited)
+	}
+}
+
+// TestForgejoGetMergeRequestSummary pins the per-iid enrichment: GetPullRequest fills
+// Head.Sha, additions/deletions, Conflicts=!Mergeable and State, and the D6 fold runs
+// over reviews read via the raw GET helper (the gitea SDK has no ListPullRequestReviews).
+func TestForgejoGetMergeRequestSummary(t *testing.T) {
+	m := newMockForgejo(t, map[string]http.HandlerFunc{
+		"/repos/acme/widgets/pulls/5": func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"number": 5, "title": "Add widget", "state": "open", "draft": false,
+				"mergeable": false,
+				"user":      map[string]any{"login": "octo"},
+				"head":      map[string]any{"ref": "feature", "sha": "abc123"},
+				"base":      map[string]any{"ref": "main"},
+				"html_url":  "https://forgejo/acme/widgets/pulls/5",
+				"additions": 12, "deletions": 3,
 			})
 		},
 		"/repos/acme/widgets/pulls/5/reviews": func(w http.ResponseWriter, _ *http.Request) {
@@ -36,16 +78,12 @@ func TestForgejoListMergeRequests(t *testing.T) {
 	})
 	d := newForgejoDriver(t, m, "forgejo-token-value-123456")
 
-	mrs, err := d.ListMergeRequests(context.Background(), 7, ListMergeRequestsOptions{})
+	got, err := d.GetMergeRequestSummary(context.Background(), 7, 5)
 	if err != nil {
-		t.Fatalf("ListMergeRequests: %v", err)
+		t.Fatalf("GetMergeRequestSummary: %v", err)
 	}
-	if len(mrs) != 1 {
-		t.Fatalf("expected 1 MR, got %d", len(mrs))
-	}
-	got := mrs[0]
 	if got.IID != 5 || got.Author != "octo" || got.HeadSHA != "abc123" || got.SourceBranch != "feature" || got.TargetBranch != "main" {
-		t.Fatalf("row fields wrong: %+v", got)
+		t.Fatalf("fields wrong: %+v", got)
 	}
 	if got.Additions != 12 || got.Deletions != 3 {
 		t.Fatalf("diff stats wrong: %+v", got)
@@ -56,26 +94,29 @@ func TestForgejoListMergeRequests(t *testing.T) {
 	if got.ReviewDecision != ReviewChangesRequested {
 		t.Fatalf("carol's latest non-comment review is REQUEST_CHANGES ⇒ changes_requested, got %q", got.ReviewDecision)
 	}
+	if got.State != MRStateOpened {
+		t.Fatalf("state=open must map to MRStateOpened, got %q", got.State)
+	}
 }
 
-// TestForgejoListMergeRequestsApproved pins the approved fold and a requested
-// reviewer with no decision.
-func TestForgejoListMergeRequestsApproved(t *testing.T) {
+// TestForgejoGetMergeRequestSummaryApproved pins the approved fold and a requested
+// reviewer with no decision, per iid.
+func TestForgejoGetMergeRequestSummaryApproved(t *testing.T) {
 	m := newMockForgejo(t, map[string]http.HandlerFunc{
-		"/repos/acme/widgets/pulls": func(w http.ResponseWriter, _ *http.Request) {
-			_ = json.NewEncoder(w).Encode([]map[string]any{
-				{"number": 6, "title": "t", "state": "open", "mergeable": true,
-					"user": map[string]any{"login": "octo"},
-					"head": map[string]any{"ref": "f", "sha": "d0d0"}, "base": map[string]any{"ref": "main"}},
-				{"number": 7, "title": "t2", "state": "open", "mergeable": true,
-					"user": map[string]any{"login": "octo"},
-					"head": map[string]any{"ref": "g", "sha": "e1e1"}, "base": map[string]any{"ref": "main"}},
-			})
+		"/repos/acme/widgets/pulls/6": func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{"number": 6, "title": "t", "state": "open", "mergeable": true,
+				"user": map[string]any{"login": "octo"},
+				"head": map[string]any{"ref": "f", "sha": "d0d0"}, "base": map[string]any{"ref": "main"}})
 		},
 		"/repos/acme/widgets/pulls/6/reviews": func(w http.ResponseWriter, _ *http.Request) {
 			_ = json.NewEncoder(w).Encode([]map[string]any{
 				{"user": map[string]any{"login": "carol"}, "state": "APPROVED", "submitted_at": "2024-01-02T00:00:00Z"},
 			})
+		},
+		"/repos/acme/widgets/pulls/7": func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{"number": 7, "title": "t2", "state": "open", "mergeable": true,
+				"user": map[string]any{"login": "octo"},
+				"head": map[string]any{"ref": "g", "sha": "e1e1"}, "base": map[string]any{"ref": "main"}})
 		},
 		"/repos/acme/widgets/pulls/7/reviews": func(w http.ResponseWriter, _ *http.Request) {
 			_ = json.NewEncoder(w).Encode([]map[string]any{
@@ -85,19 +126,40 @@ func TestForgejoListMergeRequestsApproved(t *testing.T) {
 	})
 	d := newForgejoDriver(t, m, "forgejo-token-value-123456")
 
-	mrs, err := d.ListMergeRequests(context.Background(), 7, ListMergeRequestsOptions{})
+	mr6, err := d.GetMergeRequestSummary(context.Background(), 7, 6)
 	if err != nil {
-		t.Fatalf("ListMergeRequests: %v", err)
+		t.Fatalf("GetMergeRequestSummary(6): %v", err)
 	}
-	byIID := map[int64]MergeRequestSummary{}
-	for _, mr := range mrs {
-		byIID[mr.IID] = mr
+	if mr6.ReviewDecision != ReviewApproved {
+		t.Errorf("PR 6 approved, got %q", mr6.ReviewDecision)
 	}
-	if byIID[6].ReviewDecision != ReviewApproved {
-		t.Errorf("PR 6 approved, got %q", byIID[6].ReviewDecision)
+
+	mr7, err := d.GetMergeRequestSummary(context.Background(), 7, 7)
+	if err != nil {
+		t.Fatalf("GetMergeRequestSummary(7): %v", err)
 	}
-	if byIID[7].ReviewDecision != ReviewRequired {
-		t.Errorf("PR 7 has only a requested reviewer ⇒ review_required, got %q", byIID[7].ReviewDecision)
+	if mr7.ReviewDecision != ReviewRequired {
+		t.Errorf("PR 7 has only a requested reviewer ⇒ review_required, got %q", mr7.ReviewDecision)
+	}
+}
+
+// TestForgejoGetMergeRequestSummaryNotFound pins that a 404 from GetPullRequest
+// surfaces as ErrMergeRequestNotFound (errors.Is-matchable), not a redacted generic
+// error.
+func TestForgejoGetMergeRequestSummaryNotFound(t *testing.T) {
+	m := newMockForgejo(t, map[string]http.HandlerFunc{
+		"/repos/acme/widgets/pulls/999": func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, `{"message":"Not Found"}`, http.StatusNotFound)
+		},
+	})
+	d := newForgejoDriver(t, m, "forgejo-token-value-123456")
+
+	_, err := d.GetMergeRequestSummary(context.Background(), 7, 999)
+	if err == nil {
+		t.Fatal("expected an error for an absent PR")
+	}
+	if !errors.Is(err, ErrMergeRequestNotFound) {
+		t.Fatalf("a 404 must map to ErrMergeRequestNotFound, got %v", err)
 	}
 }
 

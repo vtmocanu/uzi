@@ -75,7 +75,7 @@ func (h *Handler) mountRepoRoutes(r chi.Router, forgeLimiter, boardOrderLimiter 
 			// Forge views (PRD #1255 M2a): read-only open-pulls and CI-runs reads for the
 			// TUI/CLI. RequireUser (NOT the cookie-only RequireAuth group below) so the
 			// CLI's uzc_ Bearer reaches them — a cookie-only mount would 401 it. Each
-			// proxies the repo's forge on demand (ListMergeRequests/ListChecks/
+			// proxies the repo's forge on demand (ListMergeRequestRefs/ListChecks/
 			// ListWorkflowRuns), so it carries the per-user forge budget with
 			// forgeLimiter.PerUserMiddleware applied AFTER RequireUser (the :28-30 rule).
 			// Owner-scoped + enabled-gated inside each handler (repoForRequest → 404 for a

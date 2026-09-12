@@ -1,6 +1,6 @@
 // Package forgetest provides shared test-support scaffolding for the
 // forge.Forge driver contract. Its centrepiece is BaseFake: an embeddable
-// implementation of all 30 Forge methods with safe defaults, so a hand-written
+// implementation of all 31 Forge methods with safe defaults, so a hand-written
 // test fake can embed it and override only the methods it actually exercises.
 //
 // The point is the interface-change tax. Adding a method to forge.Forge used to
@@ -37,7 +37,7 @@ func notStubbed(method string) error {
 }
 
 // BaseFake is an empty struct that implements the entire forge.Forge interface
-// (all 30 methods) with safe defaults, designed to be embedded by value in a
+// (all 31 methods) with safe defaults, designed to be embedded by value in a
 // hand-written test fake used through a pointer. Every method has a pointer
 // receiver so method promotion works when the embedder is used as *fakeForge.
 //
@@ -179,9 +179,14 @@ func (*BaseFake) JobLogTail(context.Context, int64, int64, int) (string, error) 
 	return "", notStubbed("JobLogTail")
 }
 
-// ListMergeRequests implements forge.Forge.
-func (*BaseFake) ListMergeRequests(context.Context, int64, forge.ListMergeRequestsOptions) ([]forge.MergeRequestSummary, error) {
-	return nil, notStubbed("ListMergeRequests")
+// ListMergeRequestRefs implements forge.Forge.
+func (*BaseFake) ListMergeRequestRefs(context.Context, int64, forge.ListMergeRequestsOptions) ([]forge.MergeRequestRef, error) {
+	return nil, notStubbed("ListMergeRequestRefs")
+}
+
+// GetMergeRequestSummary implements forge.Forge.
+func (*BaseFake) GetMergeRequestSummary(context.Context, int64, int64) (forge.MergeRequestSummary, error) {
+	return forge.MergeRequestSummary{}, notStubbed("GetMergeRequestSummary")
 }
 
 // ListChecks implements forge.Forge.

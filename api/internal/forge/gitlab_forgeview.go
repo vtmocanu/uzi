@@ -1,10 +1,11 @@
 package forge
 
-// gitlab_forgeview.go is the GitLab driver's forge-view read seam (PRD #1255 D5):
-// ListMergeRequests, ListChecks, ListWorkflowRuns, and their neutral mappers. All
-// errors route through wrapErr (PAT-redacted). GitLab has no review-decision
-// concept, so the decision is a free-tier approximation (D6); it has no workflow/
-// run split, so a pipeline is a "run".
+// gitlab_forgeview.go is the GitLab driver's forge-view read seam (PRD #1255 D5/M2b):
+// ListMergeRequestRefs, GetMergeRequestSummary, ListChecks, ListWorkflowRuns, and
+// their neutral mappers. All errors route through wrapErr (PAT-redacted), except a
+// per-iid 404 which returns ErrMergeRequestNotFound directly. GitLab has no
+// review-decision concept, so the decision is a free-tier approximation (D6); it has
+// no workflow/run split, so a pipeline is a "run".
 
 import (
 	"context"
@@ -13,13 +14,11 @@ import (
 	gitlab "gitlab.com/gitlab-org/api/client-go/v2"
 )
 
-// ListMergeRequests lists the project's open merge requests as neutral summaries,
-// newest-activity first. The list row already carries SHA, Draft, HasConflicts,
-// DetailedMergeStatus, BlockingDiscussionsResolved, Author, branches, WebURL and
-// Reviewers, so the only per-MR read is the approvals configuration (Premium; a CE
-// instance answers 403/404, folded away). Additions/Deletions/Commits are not on
-// the row and are left zero (D5).
-func (g *gitLab) ListMergeRequests(ctx context.Context, projectID int64, opts ListMergeRequestsOptions) ([]MergeRequestSummary, error) {
+// ListMergeRequestRefs lists the project's open merge requests as cheap refs,
+// newest-activity first, in one paginated list call — just IID/HeadSHA/UpdatedAt per
+// row, with NO per-MR enrichment (that is GetMergeRequestSummary's job). opts.Limit
+// caps the rows collected.
+func (g *gitLab) ListMergeRequestRefs(ctx context.Context, projectID int64, opts ListMergeRequestsOptions) ([]MergeRequestRef, error) {
 	opt := &gitlab.ListProjectMergeRequestsOptions{
 		ListOptions: gitlab.ListOptions{Page: 1, PerPage: perPage},
 		State:       gitlab.Ptr(gitlabMRStateParam(opts.State)),
@@ -29,7 +28,7 @@ func (g *gitLab) ListMergeRequests(ctx context.Context, projectID int64, opts Li
 	if opts.Limit > 0 && int64(opts.Limit) < opt.PerPage {
 		opt.PerPage = int64(opts.Limit)
 	}
-	var out []MergeRequestSummary
+	var out []MergeRequestRef
 	for page := 0; ; {
 		page++
 		mrs, resp, err := g.client.MergeRequests.ListProjectMergeRequests(projectID, opt, gitlab.WithContext(ctx))
@@ -40,11 +39,11 @@ func (g *gitLab) ListMergeRequests(ctx context.Context, projectID int64, opts Li
 			if mr == nil {
 				continue
 			}
-			s, err := g.mergeRequestSummary(ctx, projectID, mr)
-			if err != nil {
-				return nil, err
+			ref := MergeRequestRef{IID: mr.IID, HeadSHA: mr.SHA}
+			if mr.UpdatedAt != nil {
+				ref.UpdatedAt = *mr.UpdatedAt
 			}
-			out = append(out, s)
+			out = append(out, ref)
 			if opts.Limit > 0 && len(out) >= opts.Limit {
 				return out, nil
 			}
@@ -63,14 +62,33 @@ func (g *gitLab) ListMergeRequests(ctx context.Context, projectID int64, opts Li
 	return out, nil
 }
 
-// mergeRequestSummary folds one BasicMergeRequest row (plus its approvals) into a
-// neutral summary. Conflicts honours the *bool tri-state (nil == unknown): while
-// GitLab is still computing mergeability (detailed_merge_status checking/unchecked/
-// preparing) the conflict answer is not yet known, so we report nil rather than
-// guessing false; otherwise it is HasConflicts OR a "conflict" detailed status
-// (OR-ed so neither signal is missed). An empty detailed status is NOT treated as
-// unknown — an older GitLab may omit it while still populating has_conflicts, so the
-// bare has_conflicts signal is preserved.
+// GetMergeRequestSummary reads one MR's full neutral summary by iid via
+// MergeRequests.GetMergeRequest, whose *MergeRequest is a superset of the
+// BasicMergeRequest the shared summary mapper expects (it embeds it), so the mapper
+// is reused unchanged via &mr.BasicMergeRequest. A 404 (MR absent / raced
+// closed-and-purged) is mapped to ErrMergeRequestNotFound BEFORE wrapErr — the
+// redactor would sever the Unwrap chain, and the sentinel carries no token material.
+func (g *gitLab) GetMergeRequestSummary(ctx context.Context, projectID, iid int64) (MergeRequestSummary, error) {
+	mr, resp, err := g.client.MergeRequests.GetMergeRequest(projectID, iid, nil, gitlab.WithContext(ctx))
+	if err != nil {
+		if resp != nil && resp.StatusCode == http.StatusNotFound {
+			return MergeRequestSummary{}, ErrMergeRequestNotFound
+		}
+		return MergeRequestSummary{}, g.wrapErr("get merge request summary", err)
+	}
+	return g.mergeRequestSummary(ctx, projectID, &mr.BasicMergeRequest)
+}
+
+// mergeRequestSummary folds one BasicMergeRequest (plus its approvals) into a neutral
+// summary. Conflicts honours the *bool tri-state (nil == unknown): while GitLab is
+// still computing mergeability (detailed_merge_status checking/unchecked/preparing)
+// the conflict answer is not yet known, so we report nil rather than guessing false;
+// otherwise it is HasConflicts OR a "conflict" detailed status (OR-ed so neither
+// signal is missed). An empty detailed status is NOT treated as unknown — an older
+// GitLab may omit it while still populating has_conflicts, so the bare has_conflicts
+// signal is preserved. State is GitLab's raw MR state, which already matches the
+// MRState* vocabulary (opened/closed/merged/locked). Additions/Deletions/Commits are
+// not on the summary and are left zero (D5).
 func (g *gitLab) mergeRequestSummary(ctx context.Context, projectID int64, mr *gitlab.BasicMergeRequest) (MergeRequestSummary, error) {
 	var conflicts *bool
 	switch mr.DetailedMergeStatus {
@@ -88,6 +106,7 @@ func (g *gitLab) mergeRequestSummary(ctx context.Context, projectID int64, mr *g
 		HeadSHA:      mr.SHA,
 		Draft:        mr.Draft,
 		Conflicts:    conflicts,
+		State:        mr.State,
 		WebURL:       mr.WebURL,
 	}
 	if mr.Author != nil {

@@ -29,9 +29,11 @@ import (
 )
 
 const (
-	// forgeViewPullsLimit caps the open-PR page the pulls list fetches, and with it the
-	// per-PR enrichment fan-out the drivers bound to opts.Limit (D4: cold-list cost
-	// 1 + 2×min(PRs,30)). The pull DETAIL route reuses it to locate one PR by iid.
+	// forgeViewPullsLimit caps the open-PR refs page the pulls list fetches, and with it
+	// the per-PR summary fan-out (one GetMergeRequestSummary per ref; D4: cold-list cost
+	// 1 + 2×min(PRs,30)). The pull DETAIL route no longer reuses it — it fetches one PR
+	// by iid directly (GetMergeRequestSummary), so it finds ANY open PR, not only one on
+	// this page.
 	forgeViewPullsLimit = 30
 	// forgeViewCIRunsDefault / forgeViewCIRunsMax bound the `ci` list page (?limit=).
 	forgeViewCIRunsDefault = 30
@@ -96,8 +98,12 @@ func forgeRetryAfterSeconds(rl *forge.RateLimitError) int {
 }
 
 // ListPulls serves GET /api/repos/{id}/pulls: the repo's open PRs as list rows, each
-// linked to the newest uzi run on that (repo, mr_iid). It calls ListMergeRequests only
-// (D4: the list must NOT fan out a per-PR checks call — checks appear on the drill-in).
+// linked to the newest uzi run on that (repo, mr_iid). It reads the cheap open-PR refs
+// in one list call (ListMergeRequestRefs), then a per-iid GetMergeRequestSummary for
+// each (a SEQUENTIAL loop for now — the pool-of-4 + memo is M2b part 2). It must NOT
+// fan out a per-PR checks call (checks appear on the drill-in, D4). A PR that raced
+// closed between the refs list and its summary fetch (ErrMergeRequestNotFound) is
+// SKIPPED, not fatal — the list still returns the PRs that survived.
 func (h *Handler) ListPulls(w http.ResponseWriter, r *http.Request) {
 	repo, ok := h.forgeViewRepo(w, r)
 	if !ok {
@@ -109,25 +115,36 @@ func (h *Handler) ListPulls(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	summaries, err := f.ListMergeRequests(r.Context(), repo.ForgeProjectID,
+	refs, err := f.ListMergeRequestRefs(r.Context(), repo.ForgeProjectID,
 		forge.ListMergeRequestsOptions{State: forge.MRStateOpened, Limit: forgeViewPullsLimit})
 	if err != nil {
 		h.writeForgeError(w, "list pulls", err)
 		return
 	}
-	pulls := make([]apitypes.PullDTO, 0, len(summaries))
-	for _, s := range summaries {
+	pulls := make([]apitypes.PullDTO, 0, len(refs))
+	for _, ref := range refs {
+		s, err := f.GetMergeRequestSummary(r.Context(), repo.ForgeProjectID, ref.IID)
+		if err != nil {
+			if errors.Is(err, forge.ErrMergeRequestNotFound) {
+				continue // raced closed between the list and the fetch — skip, don't fail the list
+			}
+			h.writeForgeError(w, "get pull summary", err)
+			return
+		}
 		p := pullDTOFromSummary(s)
-		p.RunID = h.newestRunIDForMR(r.Context(), repo.ID, s.IID)
+		p.RunID = h.newestRunIDForMR(r.Context(), repo.ID, ref.IID)
 		pulls = append(pulls, p)
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"pulls": pulls})
 }
 
 // GetPull serves GET /api/repos/{id}/pulls/{iid}: one open PR with its checks, reviews
-// and derived merge state. It locates the PR in the opened list (which yields head_sha,
-// review decision, conflicts and diff stats), then reads ListChecks(head_sha) and
-// ListMergeRequestReviews(iid). A closed/merged PR (absent from the opened list) 404s.
+// and derived merge state. It fetches the PR's summary directly by iid
+// (GetMergeRequestSummary — head_sha, review decision, conflicts, diff stats, state),
+// then reads ListChecks(head_sha) and ListMergeRequestReviews(iid). A PR the forge 404s
+// (ErrMergeRequestNotFound) or one whose State is not opened (closed/merged/locked)
+// 404s here too. This finds ANY open PR by iid (≤4 forge calls), not only one on the
+// most-recently-updated page.
 func (h *Handler) GetPull(w http.ResponseWriter, r *http.Request) {
 	repo, ok := h.forgeViewRepo(w, r)
 	if !ok {
@@ -144,24 +161,20 @@ func (h *Handler) GetPull(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	summaries, err := f.ListMergeRequests(r.Context(), repo.ForgeProjectID,
-		forge.ListMergeRequestsOptions{State: forge.MRStateOpened, Limit: forgeViewPullsLimit})
+	s, err := f.GetMergeRequestSummary(r.Context(), repo.ForgeProjectID, iid)
 	if err != nil {
+		if errors.Is(err, forge.ErrMergeRequestNotFound) {
+			httpx.Error(w, http.StatusNotFound, "pull request not found")
+			return
+		}
 		h.writeForgeError(w, "get pull", err)
 		return
 	}
-	var found *forge.MergeRequestSummary
-	for i := range summaries {
-		if summaries[i].IID == iid {
-			found = &summaries[i]
-			break
-		}
-	}
-	if found == nil {
+	if s.State != forge.MRStateOpened {
 		httpx.Error(w, http.StatusNotFound, "pull request not found")
 		return
 	}
-	checks, err := f.ListChecks(r.Context(), repo.ForgeProjectID, found.HeadSHA)
+	checks, err := f.ListChecks(r.Context(), repo.ForgeProjectID, s.HeadSHA)
 	if err != nil {
 		h.writeForgeError(w, "list checks", err)
 		return
@@ -172,10 +185,10 @@ func (h *Handler) GetPull(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	detail := apitypes.PullDetailDTO{
-		PullDTO: pullDTOFromSummary(*found),
+		PullDTO: pullDTOFromSummary(s),
 		Checks:  checkDTOs(checks),
 		Reviews: reviewDTOs(reviews),
-		Merge:   mergeStateDTO(*found, checks),
+		Merge:   mergeStateDTO(s, checks),
 	}
 	detail.RunID = h.newestRunIDForMR(r.Context(), repo.ID, iid)
 	httpx.JSON(w, http.StatusOK, detail)
