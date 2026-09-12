@@ -185,7 +185,11 @@ func (g *github) ListMergeRequestReviews(ctx context.Context, projectID, mrIID i
 	if err != nil {
 		return nil, err
 	}
-	reviews, err := g.listPullRequestReviews(ctx, slug, int(mrIID))
+	num, err := ghNum(mrIID)
+	if err != nil {
+		return nil, err
+	}
+	reviews, err := g.listPullRequestReviews(ctx, slug, num)
 	if err != nil {
 		return nil, err
 	}
