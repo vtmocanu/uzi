@@ -2,12 +2,15 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"testing"
 
 	"github.com/google/uuid"
 
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/clitoken"
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/forge/forgetest"
@@ -16,16 +19,37 @@ import (
 // fakeForgeView is the injected forge for the auth suite: it returns canned rows so an
 // authorized, enabled-repo read reaches a 200 without a live forge. Only the forge-view
 // reads are overridden; everything else keeps BaseFake's loud default.
+//
+// The three fields make the two forge-view reads controllable per iid without disturbing
+// the default: all are nil in the zero fake, so ListMergeRequestRefs returns the single
+// canned ref and GetMergeRequestSummary returns an OPENED summary with no error — the
+// exact behavior the router-auth subtests below rely on. A non-nil field overrides only
+// that axis: refs the ref list; summaryErr[iid] an error GetMergeRequestSummary returns
+// for that iid (e.g. forge.ErrMergeRequestNotFound); summaryState[iid] the State it
+// reports (default forge.MRStateOpened).
 type fakeForgeView struct {
 	forgetest.BaseFake
+	refs         []forge.MergeRequestRef
+	summaryErr   map[int64]error
+	summaryState map[int64]string
 }
 
-func (*fakeForgeView) ListMergeRequestRefs(context.Context, int64, forge.ListMergeRequestsOptions) ([]forge.MergeRequestRef, error) {
+func (f *fakeForgeView) ListMergeRequestRefs(context.Context, int64, forge.ListMergeRequestsOptions) ([]forge.MergeRequestRef, error) {
+	if f.refs != nil {
+		return f.refs, nil
+	}
 	return []forge.MergeRequestRef{{IID: 7, HeadSHA: "deadbeef"}}, nil
 }
 
-func (*fakeForgeView) GetMergeRequestSummary(_ context.Context, _ int64, iid int64) (forge.MergeRequestSummary, error) {
-	return forge.MergeRequestSummary{IID: iid, Title: "t", HeadSHA: "deadbeef", State: forge.MRStateOpened}, nil
+func (f *fakeForgeView) GetMergeRequestSummary(_ context.Context, _ int64, iid int64) (forge.MergeRequestSummary, error) {
+	if err := f.summaryErr[iid]; err != nil {
+		return forge.MergeRequestSummary{}, err
+	}
+	state := forge.MRStateOpened
+	if s, ok := f.summaryState[iid]; ok {
+		state = s
+	}
+	return forge.MergeRequestSummary{IID: iid, Title: "t", HeadSHA: "deadbeef", State: state}, nil
 }
 
 func (*fakeForgeView) ListChecks(context.Context, int64, string) ([]forge.Check, error) {
@@ -130,6 +154,85 @@ func TestForgeViewRoutesAuthLiveDB(t *testing.T) {
 		// Another user's repo → 404 (owner-scoped).
 		if rec := bearerReqBody(router, http.MethodPost, ciFix(foreign), uzc, body); rec.Code != http.StatusNotFound {
 			t.Fatalf("Bearer POST ci-fix foreign repo = %d, want 404\nbody: %s", rec.Code, rec.Body.String())
+		}
+	})
+
+	// The following M2b subtests reconfigure the injected forge per case. They run AFTER
+	// the table + ci_fix subtests above (t.Run executes in call order), so reassigning
+	// h.forgeFactory here never perturbs the default-behavior cases already run.
+
+	// GetPull: a PR that EXISTS but is not open (closed/merged/locked) must 404 — the
+	// forge returns a summary with no error, so only the `s.State != MRStateOpened` guard
+	// stops it. Genuine gate: drop that guard and this reaches ListChecks/ListReviews
+	// (both canned-OK in the fake) and returns 200, failing this 404 assertion.
+	t.Run("pull_detail_non_open_404", func(t *testing.T) {
+		const iid = 42
+		h.forgeFactory = func(string, string, []byte) (forge.Forge, error) {
+			return &fakeForgeView{summaryState: map[int64]string{iid: forge.MRStateMerged}}, nil
+		}
+		path := fmt.Sprintf("/api/repos/%s/pulls/%d", enabled, iid)
+		if rec := bearerReq(router, http.MethodGet, path, uzc); rec.Code != http.StatusNotFound {
+			t.Fatalf("Bearer GET merged pull = %d, want 404 (PR exists but not open)\nbody: %s", rec.Code, rec.Body.String())
+		}
+	})
+
+	// GetPull: a PR the forge 404s (ErrMergeRequestNotFound) also 404s here. Genuine
+	// gate: drop the errors.Is branch and this error maps through writeForgeError to 502.
+	t.Run("pull_detail_not_found_404", func(t *testing.T) {
+		const iid = 43
+		h.forgeFactory = func(string, string, []byte) (forge.Forge, error) {
+			return &fakeForgeView{summaryErr: map[int64]error{iid: forge.ErrMergeRequestNotFound}}, nil
+		}
+		path := fmt.Sprintf("/api/repos/%s/pulls/%d", enabled, iid)
+		if rec := bearerReq(router, http.MethodGet, path, uzc); rec.Code != http.StatusNotFound {
+			t.Fatalf("Bearer GET not-found pull = %d, want 404\nbody: %s", rec.Code, rec.Body.String())
+		}
+	})
+
+	// ListPulls: the refs list yields two PRs (A, B); B races closed between the list and
+	// its per-iid summary fetch (ErrMergeRequestNotFound). The list must SURVIVE, returning
+	// only A. Genuine gate: drop the `continue` skip and B's ErrMergeRequestNotFound maps
+	// through writeForgeError to 502 — the list would not return 200 with A at all.
+	t.Run("pulls_list_skips_raced_closed", func(t *testing.T) {
+		const iidA, iidB = 11, 22
+		h.forgeFactory = func(string, string, []byte) (forge.Forge, error) {
+			return &fakeForgeView{
+				refs:       []forge.MergeRequestRef{{IID: iidA, HeadSHA: "aaa"}, {IID: iidB, HeadSHA: "bbb"}},
+				summaryErr: map[int64]error{iidB: forge.ErrMergeRequestNotFound},
+			}, nil
+		}
+		rec := bearerReq(router, http.MethodGet, fmt.Sprintf("/api/repos/%s/pulls", enabled), uzc)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("Bearer GET pulls with one raced-closed = %d, want 200 (raced-closed skipped, not fatal)\nbody: %s", rec.Code, rec.Body.String())
+		}
+		var got struct {
+			Pulls []apitypes.PullDTO `json:"pulls"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+			t.Fatalf("decode pulls body: %v\nbody: %s", err, rec.Body.String())
+		}
+		if len(got.Pulls) != 1 {
+			t.Fatalf("pulls len = %d, want 1 (only the surviving PR)\nbody: %s", len(got.Pulls), rec.Body.String())
+		}
+		if got.Pulls[0].IID != iidA {
+			t.Fatalf("surviving pull IID = %d, want %d (PR A, not the raced-closed B)", got.Pulls[0].IID, iidA)
+		}
+	})
+
+	// ListPulls: a NON-sentinel error from one ref's summary fetch must still fail the
+	// whole list (writeForgeError → 502), proving only ErrMergeRequestNotFound is skipped
+	// — the skip is not a blanket swallow of every per-iid error.
+	t.Run("pulls_list_real_error_502", func(t *testing.T) {
+		const iidA, iidB = 11, 22
+		h.forgeFactory = func(string, string, []byte) (forge.Forge, error) {
+			return &fakeForgeView{
+				refs:       []forge.MergeRequestRef{{IID: iidA, HeadSHA: "aaa"}, {IID: iidB, HeadSHA: "bbb"}},
+				summaryErr: map[int64]error{iidB: errors.New("boom")},
+			}, nil
+		}
+		rec := bearerReq(router, http.MethodGet, fmt.Sprintf("/api/repos/%s/pulls", enabled), uzc)
+		if rec.Code != http.StatusBadGateway {
+			t.Fatalf("Bearer GET pulls with a non-sentinel error = %d, want 502 (only ErrMergeRequestNotFound is skipped)\nbody: %s", rec.Code, rec.Body.String())
 		}
 	})
 }
