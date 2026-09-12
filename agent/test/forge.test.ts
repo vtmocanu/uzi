@@ -502,6 +502,89 @@ describe("GitHubClient.getMergeRequestHead", () => {
   });
 });
 
+// PRD #1225 (CodeRabbit !1254): the completion interlock reconciles the MR/PR body (drops the
+// `Closes #N` line on an unverified-head hold, re-asserts it on a verified completion) via
+// updateMergeRequestDescription. Each driver must hit the SAME single-item resource as
+// getMergeRequestHead with the FORGE-CORRECT method + body field: GitLab PUT + `description`,
+// Forgejo/GitHub PATCH + `body`. This pins the per-driver updateMethod()/updateBody() split so a
+// flip on the non-GitLab drivers (which the runner-level interlock test only covers for GitLab)
+// is caught here. The PAT rides the auth header only.
+const RECONCILED_BODY = "Implements issue #5.\n\n---\nunverified";
+
+describe("GitLabClient.updateMergeRequestDescription", () => {
+  it("PUTs the single-MR endpoint with a `description` field (PAT header only)", async () => {
+    const { fetchFn, calls } = recorder([{ status: 200, body: { iid: 42 } }]);
+    await new GitLabClient({ fetchFn }).updateMergeRequestDescription(base.repoUrl, PAT, 42, RECONCILED_BODY);
+
+    const call = calls[0]!;
+    assert.strictEqual(call.method, "PUT");
+    assert.match(call.url, /\/api\/v4\/projects\/group%2Fsub%2Frepo\/merge_requests\/42$/);
+    assert.strictEqual(call.headers["PRIVATE-TOKEN"], PAT);
+    assert.ok(!call.url.includes(PAT), "PAT not in URL");
+    const body = JSON.parse(call.body ?? "{}") as Record<string, unknown>;
+    assert.strictEqual(body.description, RECONCILED_BODY);
+    assert.ok(!("body" in body), "GitLab uses `description`, not `body`");
+  });
+
+  it("accepts a 2xx and throws a ForgeError on a non-2xx (no PAT in the message)", async () => {
+    const ok = recorder([{ status: 200, body: {} }]);
+    await new GitLabClient({ fetchFn: ok.fetchFn }).updateMergeRequestDescription(base.repoUrl, PAT, 42, RECONCILED_BODY);
+    const bad = recorder([{ status: 404, body: { message: "404 Not found" } }]);
+    await assert.rejects(
+      new GitLabClient({ fetchFn: bad.fetchFn }).updateMergeRequestDescription(base.repoUrl, PAT, 42, RECONCILED_BODY),
+      (err: unknown) => err instanceof ForgeError && err.status === 404 && !err.message.includes(PAT),
+    );
+  });
+});
+
+describe("ForgejoClient.updateMergeRequestDescription", () => {
+  it("PATCHes the single-PR endpoint with a `body` field (token header only); accepts 201", async () => {
+    const { fetchFn, calls } = recorder([{ status: 201, body: { number: 42 } }]);
+    await new ForgejoClient({ fetchFn }).updateMergeRequestDescription(fjBase.repoUrl, PAT, 42, RECONCILED_BODY);
+
+    const call = calls[0]!;
+    assert.strictEqual(call.method, "PATCH");
+    assert.match(call.url, /\/api\/v1\/repos\/org\/repo\/pulls\/42$/);
+    assert.strictEqual(call.headers["Authorization"], `token ${PAT}`);
+    assert.ok(!call.url.includes(PAT), "PAT not in URL");
+    const body = JSON.parse(call.body ?? "{}") as Record<string, unknown>;
+    assert.strictEqual(body.body, RECONCILED_BODY);
+    assert.ok(!("description" in body), "Forgejo uses `body`, not `description`");
+  });
+
+  it("throws a ForgeError on a non-2xx", async () => {
+    const { fetchFn } = recorder([{ status: 404, body: { message: "not found" } }]);
+    await assert.rejects(
+      new ForgejoClient({ fetchFn }).updateMergeRequestDescription(fjBase.repoUrl, PAT, 42, RECONCILED_BODY),
+      (err: unknown) => err instanceof ForgeError && err.status === 404,
+    );
+  });
+});
+
+describe("GitHubClient.updateMergeRequestDescription", () => {
+  it("PATCHes api.github.com/repos/{o}/{r}/pulls/{n} with a `body` field (Bearer header only)", async () => {
+    const { fetchFn, calls } = recorder([{ status: 200, body: { number: 42 } }]);
+    await new GitHubClient({ fetchFn }).updateMergeRequestDescription(ghBase.repoUrl, PAT, 42, RECONCILED_BODY);
+
+    const call = calls[0]!;
+    assert.strictEqual(call.method, "PATCH");
+    assert.strictEqual(call.url, "https://api.github.com/repos/octo/repo/pulls/42");
+    assert.strictEqual(call.headers["Authorization"], `Bearer ${PAT}`);
+    assert.ok(!call.url.includes(PAT), "PAT not in URL");
+    const body = JSON.parse(call.body ?? "{}") as Record<string, unknown>;
+    assert.strictEqual(body.body, RECONCILED_BODY);
+    assert.ok(!("description" in body), "GitHub uses `body`, not `description`");
+  });
+
+  it("throws a ForgeError on a non-2xx", async () => {
+    const { fetchFn } = recorder([{ status: 403, body: { message: "forbidden" } }]);
+    await assert.rejects(
+      new GitHubClient({ fetchFn }).updateMergeRequestDescription(ghBase.repoUrl, PAT, 42, RECONCILED_BODY),
+      (err: unknown) => err instanceof ForgeError && err.status === 403,
+    );
+  });
+});
+
 describe("forgeClientFor", () => {
   it("selects GitLab for absent/gitlab, Forgejo for forgejo, GitHub for github", () => {
     assert.ok(forgeClientFor(undefined) instanceof GitLabClient);
