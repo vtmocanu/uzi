@@ -21,7 +21,7 @@ You point it at a forge (GitLab, GitHub, or Forgejo), label an issue `uzi`, and 
 Not a *fully* dark factory, and on purpose: those two decisions stay human, and (unless you opt into autopilot) nothing is written until you sign off on the plan. The lights are off for the work, not for the call to ship.
 
 > [!NOTE]
-> uzi ships both a light and a dark theme, and the screenshots below follow yours. Switch your browser (or GitHub) between light and dark and they change with it.
+> uzi ships both a light and a dark theme, and the screenshots below match your theme. Switch your browser (or GitHub) between light and dark and they change with it.
 
 <p align="center">
   <picture>
