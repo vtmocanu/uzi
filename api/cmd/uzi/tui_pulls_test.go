@@ -414,11 +414,19 @@ func TestTUIPullsTabAndEscNavigation(t *testing.T) {
 	if m.view != viewBoard {
 		t.Fatalf("esc on the pulls screen did not return to the floor (view=%v)", m.view)
 	}
-	// tab back, then tab again returns to the floor (ci lands in M4b).
+	// tab reopens pulls, tab again advances to ci, tab again returns to the floor (the full
+	// floor → pulls → ci → floor cycle, completed in M4b).
 	m = press(t, m, keyTab)
+	if m.view != viewPulls {
+		t.Fatalf("tab from the floor did not reopen the pulls screen (view=%v)", m.view)
+	}
+	m = press(t, m, keyTab)
+	if m.view != viewCI {
+		t.Fatalf("tab from the pulls screen did not advance to the ci screen (view=%v)", m.view)
+	}
 	m = press(t, m, keyTab)
 	if m.view != viewBoard {
-		t.Fatalf("tab from the pulls screen did not return to the floor (view=%v)", m.view)
+		t.Fatalf("tab from the ci screen did not return to the floor (view=%v)", m.view)
 	}
 }
 

@@ -94,6 +94,12 @@ func helpLines(v tuiView) []string {
 			"1 / 2      jump to the floor / the pulls list",
 			"R          cycle the scoped repo (when several are enabled)",
 		}, common...)
+	case viewCI:
+		return append([]string{
+			"tab        switch screen (floor · pulls · ci)",
+			"1 / 2 / 3  jump to the floor / pulls / ci",
+			"R          cycle the scoped repo (when several are enabled)",
+		}, common...)
 	default:
 		return append([]string{
 			"a          toggle the factory-wide admin board (needs a uza_ token)",

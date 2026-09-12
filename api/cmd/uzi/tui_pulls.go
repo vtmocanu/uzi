@@ -417,15 +417,18 @@ func (m tuiModel) pullsKey(k string) (tea.Model, tea.Cmd) {
 			return m, (&m).startPullsReq()
 		}
 		return m, nil
-	case keyTab, keyViewFloor:
-		// tab cycles floor → pulls → ci → floor (ci lands in M4b, so for now pulls returns to
-		// the floor); 1 jumps to the floor directly.
+	case keyTab:
+		// tab cycles floor → pulls → ci → floor, so from the pulls list it advances to ci.
+		return m.gotoCI()
+	case keyViewFloor:
+		// 1 jumps to the floor directly.
 		m.view = viewBoard
 		return m, nil
 	case keyViewPulls:
 		return m, nil // already here
 	case keyViewCI:
-		return m, nil // the ci screen lands in M4b
+		// 3 jumps to the ci list directly.
+		return m.gotoCI()
 	case keyEsc:
 		// esc on a list returns to the floor (D1).
 		m.view = viewBoard

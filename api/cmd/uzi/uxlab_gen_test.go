@@ -102,6 +102,8 @@ func TestGenerateUXLabFrames(t *testing.T) {
 		"review-pending":               func(d bool) string { return reviewPending(d, now) },
 		"pulls-populated":              func(d bool) string { return pullsPopulated(d, now) },
 		"pulls-empty":                  func(d bool) string { return pullsEmpty(d, now) },
+		"ci-populated":                 func(d bool) string { return ciPopulated(d, now) },
+		"ci-unsupported":               func(d bool) string { return ciUnsupported(d, now) },
 		"help":                         helpFrame,
 		"quit":                         quitFrame,
 	}
@@ -640,6 +642,36 @@ func pullsEmpty(dark bool, now time.Time) string {
 	m = step(m, reposMsg{repos: fake.Repos})
 	m = key(m, keyViewPulls)
 	m = step(m, pullsMsg{reqID: m.pulls.waitID, pulls: nil})
+	return m.View().Content
+}
+
+// ---- ci fixtures ----------------------------------------------------------
+
+// ciPopulated renders the forge `ci` list (PRD #1255 M4b) with a realistic spread of CI runs
+// across the three bands (RUNNING / FAILED / RECENT), scoped to one enabled repo. The RUNNING
+// rows carry the `▰▱ done/total` jobs micro-bar (D8).
+func ciPopulated(dark bool, now time.Time) string {
+	repo := apitypes.RepoDTO{ID: "r1", PathWithNamespace: "vtmocanu/uzi", Enabled: true,
+		WebURL: "https://github.com/vtmocanu/uzi"}
+	fake := &uzicli.FakeClient{Repos: []apitypes.RepoDTO{repo}, CIRunsResult: sampleCIRuns(now)}
+	m := uxModel(fake, "", dark)
+	m = step(m, reposMsg{repos: fake.Repos})
+	m = key(m, keyViewCI)
+	m = step(m, ciMsg{reqID: m.ci.waitID, runs: sampleCIRuns(now)})
+	return m.View().Content
+}
+
+// ciUnsupported renders the `ci` list's degrade state: a forge version without the runs endpoint
+// returns an empty list plus a sentence (ErrForgeVersionUnsupported), drawn verbatim (D5/R2).
+func ciUnsupported(dark bool, now time.Time) string {
+	repo := apitypes.RepoDTO{ID: "r1", PathWithNamespace: "acme/legacy", Enabled: true,
+		WebURL: "https://forge.example/acme/legacy"}
+	fake := &uzicli.FakeClient{Repos: []apitypes.RepoDTO{repo},
+		CIRunsUnsupported: "CI runs need Forgejo v16.0.0 or newer on this connection."}
+	m := uxModel(fake, "", dark)
+	m = step(m, reposMsg{repos: fake.Repos})
+	m = key(m, keyViewCI)
+	m = step(m, ciMsg{reqID: m.ci.waitID, unsupported: fake.CIRunsUnsupported})
 	return m.View().Content
 }
 

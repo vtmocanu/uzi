@@ -133,8 +133,23 @@ var d7UntrustedFields = []string{
 	// WebURL is the PR's forge URL, drawn only as an OSC-8 hyperlink target via oscLink
 	// (pullLink, https-gated). Like IssueWebURL it stays here as a tripwire for any DIRECT
 	// draw; the AST guard does not gate the oscLink path (oscLink is not a recognised writer),
-	// so the hostile-URL render test is the real defence.
+	// so the hostile-URL render test is the real defence. (CIRunDTO.WebURL reuses this path
+	// via ciLink, tui_ci.go.)
 	"WebURL",
+	// Forge CIRunDTO text drawn on the `ci` screen (PRD #1255 M4b, D7). The CIRunDTO fields
+	// Name / Event / Branch / SHA / Actor are copied into DISTINCTLY-NAMED internal struct
+	// fields (ciRowText, tui_ci.go) before they are drawn, because the BARE wire names collide
+	// with unrelated pre-existing `.Name`/… draws in other tui_*.go files (e.g. the tool payload
+	// `.Name` in tui_detail_transcript.go), so adding the bare names here would redden the guard
+	// on code this screen does not own. The distinct names are listed instead, each drawn only
+	// through renderer.Plain (ciRow / ciSecondLine). runTitle is distinct from Title (already
+	// listed) for the same reason the others are — CIRunDTO is projected whole, not field-by-field.
+	"runName",
+	"eventName",
+	"runBranch",
+	"runSHA",
+	"runTitle",
+	"actorLogin",
 }
 
 // d7Writers are the calls that put a string on the screen. lipgloss's Render is one:

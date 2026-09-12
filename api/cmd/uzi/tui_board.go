@@ -286,10 +286,12 @@ func (m tuiModel) boardKey(k string) (tea.Model, tea.Cmd) {
 		m.detail.gen = m.detailGen
 		return m, tea.Batch(m.loadRunCmd(sel.ID), m.loadTailCmd(sel.ID), m.openStreamCmd(sel.ID))
 	case keyTab, keyViewPulls:
-		// tab / 2 leave the floor for the forge `pulls` list (PRD #1255 D1).
+		// tab / 2 leave the floor for the forge `pulls` list (PRD #1255 D1). tab advances the
+		// cycle floor → pulls; 2 jumps to pulls directly.
 		return m.gotoPulls()
 	case keyViewCI:
-		return m, nil // the ci screen lands in M4b
+		// 3 jumps straight to the forge `ci` list (PRD #1255 M4b).
+		return m.gotoCI()
 	}
 	return m, nil
 }
@@ -312,7 +314,7 @@ func (m tuiModel) tabStrip() string {
 	}{
 		{floorLabel, m.view == viewBoard},
 		{"pulls", m.view == viewPulls},
-		{"ci", false}, // the ci screen lands in M4b; shown but never active yet
+		{"ci", m.view == viewCI},
 	}
 	out := m.pal.title.Render("▚▚ uzi") + m.pal.faint.Render(" · ")
 	for i, t := range tabs {
@@ -325,7 +327,7 @@ func (m tuiModel) tabStrip() string {
 			out += m.pal.faint.Render(t.label)
 		}
 	}
-	if m.view == viewPulls {
+	if m.view == viewPulls || m.view == viewCI {
 		if repo, ok := m.currentRepo(); ok {
 			// PathWithNamespace is forge-authored (D7) → renderer.Plain.
 			out += m.pal.faint.Render("   " + m.renderer.Plain(repo.PathWithNamespace, 40))

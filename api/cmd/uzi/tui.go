@@ -60,10 +60,11 @@ type tuiView int
 const (
 	viewBoard tuiView = iota
 	viewDetail
-	// viewPulls is the forge `pulls` list screen (PRD #1255 M4a). viewCI / the two
-	// drill-ins (viewPR / viewCIRun) land in later milestones; the tab strip already
-	// shows a (never-active) `ci` tab so M4b adds its active state in one place.
+	// viewPulls is the forge `pulls` list screen (PRD #1255 M4a). viewCI is the forge
+	// `ci` list screen (PRD #1255 M4b); the two drill-ins (viewPR / viewCIRun) land in
+	// later milestones.
 	viewPulls
+	viewCI
 )
 
 // ---- messages -------------------------------------------------------------
@@ -224,6 +225,9 @@ type tuiModel struct {
 	// reqSeq/waitID/tickGen poll-guard counters (a copy of the board's chain, not a share)
 	// so the two lists poll independently.
 	pulls pullsState
+	// ci is the forge `ci` screen's state (PRD #1255 M4b), with its OWN poll-guard counters
+	// like pulls, so the two forge lists poll independently over the SAME scoped repo.
+	ci ciState
 	// repos / repoIdx / repoChosen scope the forge views to one repo at a time (PRD #1255
 	// D2). repos is the viewer's ENABLED repos (from ListRepos); repoIdx is the current one;
 	// R cycles it; repoChosen records whether the default-repo rule has resolved (or the user
@@ -337,6 +341,9 @@ func newTUIModel(ctx context.Context, c uzicli.Client, startRun string) tuiModel
 	// The first fetch is minted by startPullsReq when the user opens the screen, or by the
 	// first tick once repos have loaded (newPullsState).
 	m.pulls = newPullsState()
+	// The ci list seeds its own tick chain the same way as pulls (generation 1, no request in
+	// flight until the repo scope resolves); both forge lists share the repo scope below.
+	m.ci = newCIState()
 	// The repos scope fetch IS in flight at Init (initCmds issues fetchReposCmd), so seed the
 	// guard true — the reply clears it. Without this a pulls tick that fires before the Init
 	// reposMsg lands could stack a second repos fetch on top of the Init one.
@@ -361,6 +368,10 @@ func (m tuiModel) initCmds() []tea.Cmd {
 		// The tick is armed now but polls the forge only while the pulls screen is in focus
 		// (pullsTickMsg), so an idle board pays no forge cost for it.
 		m.fetchReposCmd(), pullsTickAfter(pullsPollInterval, m.pulls.tickGen),
+		// The `ci` list's own 10s tick chain (PRD #1255 M4b). Like the pulls tick it is armed
+		// now but polls the forge only while the ci screen is in focus, so an idle board pays no
+		// forge cost for it.
+		ciTickAfter(ciPollInterval, m.ci.tickGen),
 		tea.RequestBackgroundColor}
 	if m.skewCheck {
 		cmds = append(cmds, m.fetchBuildInfoCmd(), skewTickCmd())
@@ -750,10 +761,19 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.reposErr = nil
 		m.repos = enabledRepos(msg.repos)
-		if m.view == viewPulls {
+		// If the user is already on a forge screen, resolve the default repo and fetch now so they
+		// are not stuck on "loading…" until the next 10s tick. Both forge lists share the repo scope
+		// (D2), so whichever is in focus kicks off its own fetch.
+		switch m.view {
+		case viewPulls:
 			(&m).resolveDefaultRepo()
 			if m.pulls.waitID == 0 && m.pullsRepoReady() {
 				return m, (&m).startPullsReq()
+			}
+		case viewCI:
+			(&m).resolveDefaultRepo()
+			if m.ci.waitID == 0 && m.pullsRepoReady() {
+				return m, (&m).startCIReq()
 			}
 		}
 		return m, nil
@@ -806,6 +826,52 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// the backed-off interval; bump tickGen so this chain supersedes any pending tick.
 		m.pulls.tickGen++
 		return m, pullsTickAfter(pullsTickInterval(m.pulls.errStreak), m.pulls.tickGen)
+
+	case ciTickMsg:
+		// The ci tick chain mirrors the pulls tick exactly (PRD #1255 M4b): drop a superseded
+		// chain, keep alive across the cancellable quit modal without polling, self-heal the shared
+		// repo scope while the ci screen is in focus and repos are not ready, else poll the forge
+		// only while the ci screen is in focus and a repo is selected.
+		if msg.gen != m.ci.tickGen {
+			return m, nil
+		}
+		if m.quitting {
+			return m, ciTickAfter(ciTickInterval(m.ci.errStreak), m.ci.tickGen)
+		}
+		// Self-heal the shared repo scope (PRD #1255): a transient ListRepos failure at Init has no
+		// other retry path, so every forge screen would show "could not load repositories" for the
+		// whole session. While the ci screen is in focus and repos are NOT ready, re-issue
+		// fetchReposCmd — gated on the reposInFlight guard so it never stacks a second live repos
+		// fetch — and re-arm this tick. Gated on view==viewCI so an idle board pays no forge cost.
+		if m.view == viewCI && !m.reposReady() {
+			cmds := []tea.Cmd{ciTickAfter(ciTickInterval(m.ci.errStreak), m.ci.tickGen)}
+			if !m.reposInFlight {
+				m.reposInFlight = true
+				cmds = append(cmds, m.fetchReposCmd())
+			}
+			return m, tea.Batch(cmds...)
+		}
+		// Poll the forge only while the ci screen is in focus and a repo is selected (the forge
+		// budget is shared with the board poller — D4), and only when no poll is outstanding (the
+		// in-flight guard). When it DOES fetch, the reply re-arms the chain; when it does NOT, this
+		// tick re-arms ITSELF (the fetch is conditional, so the reply is the only OTHER re-arm site).
+		if m.view == viewCI && m.ci.waitID == 0 && m.pullsRepoReady() {
+			return m, (&m).startCIReq()
+		}
+		return m, ciTickAfter(ciTickInterval(m.ci.errStreak), m.ci.tickGen)
+
+	case ciMsg:
+		// Drop a stale/out-of-order reply (mirrors pullsMsg): honour only the reply whose reqID
+		// matches the request we are waiting on.
+		if msg.reqID != m.ci.waitID {
+			return m, nil
+		}
+		m.ci.waitID = 0
+		m.ci.apply(msg)
+		// Reschedule AFTER apply updated errStreak so the first retry after a failed poll uses the
+		// backed-off interval; bump tickGen so this chain supersedes any pending tick.
+		m.ci.tickGen++
+		return m, ciTickAfter(ciTickInterval(m.ci.errStreak), m.ci.tickGen)
 
 	case blinkTickMsg:
 		if !m.blinkWanted() {
@@ -1103,6 +1169,8 @@ func (m tuiModel) handleKey(k string) (tea.Model, tea.Cmd) {
 		return m.boardKey(k)
 	case viewPulls:
 		return m.pullsKey(k)
+	case viewCI:
+		return m.ciKey(k)
 	default:
 		return m.detailKey(k)
 	}
@@ -1110,7 +1178,8 @@ func (m tuiModel) handleKey(k string) (tea.Model, tea.Cmd) {
 
 func (m tuiModel) filtering() bool {
 	return (m.view == viewBoard && m.board.filtering) ||
-		(m.view == viewPulls && m.pulls.filtering)
+		(m.view == viewPulls && m.pulls.filtering) ||
+		(m.view == viewCI && m.ci.filtering)
 }
 
 func (m tuiModel) transcriptWidth() int {
@@ -1137,6 +1206,8 @@ func (m tuiModel) View() tea.View {
 		body = m.renderDetail()
 	case m.view == viewPulls:
 		body = m.renderPulls()
+	case m.view == viewCI:
+		body = m.renderCI()
 	default:
 		body = m.renderBoard()
 	}
