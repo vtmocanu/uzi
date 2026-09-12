@@ -569,6 +569,13 @@ type Store interface {
 	// rows (guard fail) is the non-paused ack the worker's park order must retain the run on.
 	SetRunCompletionHold(ctx context.Context, arg store.SetRunCompletionHoldParams) (store.Run, error)
 	ResumePausedRun(ctx context.Context, arg store.ResumePausedRunParams) (store.ResumePausedRunRow, error)
+	// ClearCompletionBudgetExhausted clears the served budget_exhausted steer
+	// (completion_budget_exhausted_at) on the owner's CONTINUE decision (PRD #1226 M5, D3): a
+	// new owner decision is the third of D3's clears (alongside the worker acting on it /
+	// parking, SetRunCompletionHold). ContinueCompletionDecision calls it on both branches —
+	// a no-op on the already-cleared paused branch, and the clear that stops a resumed
+	// live-window worker being re-steered into the hold off a since-consumed ACK.
+	ClearCompletionBudgetExhausted(ctx context.Context, id uuid.UUID) (int64, error)
 	ClearPauseRequest(ctx context.Context, arg store.ClearPauseRequestParams) (int64, error)
 	CreatePauseInput(ctx context.Context, arg store.CreatePauseInputParams) (store.RunUserInput, error)
 	CancelPauseInput(ctx context.Context, id uuid.UUID) (store.RunUserInput, error)
@@ -644,6 +651,13 @@ type Store interface {
 	// counts above, and off the hot path for the same reason — it runs only for a queued
 	// run already past its health threshold.
 	CountOnlineWorkersSatisfyingCaps(ctx context.Context, arg store.CountOnlineWorkersSatisfyingCapsParams) (int64, error)
+	// CountOnlineWorkersSatisfyingProtocol backs PRD #1226 M1's queued-reason rung: an
+	// INTERLOCKED queued run whose owner has NO online worker self-reporting the
+	// 'completion_interlock_v1' protocol capability gets reasonNoCompletionCapableWorker — the
+	// run's non-bypassable claim clause can never be satisfied. A per-run lookup like
+	// CountOnlineWorkersSatisfyingCaps above, and off the hot path for the same reason — it runs
+	// only for an interlocked queued run already past its health threshold.
+	CountOnlineWorkersSatisfyingProtocol(ctx context.Context, userID uuid.UUID) (int64, error)
 	// CountOnlineEligibleWorkersForRepo backs PRD #361's queued Docker-allowlist reason:
 	// how many of the caller's online workers fn_worker_can_claim accepts for this repo/kind,
 	// ignoring availability (free slots AND draining). Since issue #512 M2 it is capability-

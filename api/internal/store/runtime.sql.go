@@ -615,6 +615,28 @@ func (q *Queries) ClaimRun(ctx context.Context, arg ClaimRunParams) (Run, error)
 	return i, err
 }
 
+const clearCompletionBudgetExhausted = `-- name: ClearCompletionBudgetExhausted :execrows
+UPDATE runs SET completion_budget_exhausted_at = NULL, updated_at = now() WHERE id = $1
+`
+
+// PRD #1226 M5 (D3): a NEW OWNER DECISION clears the served `budget_exhausted` steer
+// (completion_budget_exhausted_at). D3's clears are "acting on it, parking, or a new owner
+// decision"; StampCompletionBudgetExhausted arms the one-shot flag and SetRunCompletionHold
+// (the worker acting on it / parking) clears it — this is the third clear, the owner's
+// CONTINUE decision (ContinueCompletionDecision). It is unconditional and id-scoped: on the
+// paused branch the flag is already NULL (SetRunCompletionHold cleared it on hold entry), so
+// this is a no-op there; on the LIVE awaiting_input completion-question branch the flag may
+// still be set (the worker was steered into the completion question before entering a hold),
+// and clearing it prevents the resumed worker being immediately re-steered into the hold off a
+// since-consumed ACK. Owner scoping is enforced by the caller (GetRun read) before this runs.
+func (q *Queries) ClearCompletionBudgetExhausted(ctx context.Context, id uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, clearCompletionBudgetExhausted, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const clearIssueRunsMovePending = `-- name: ClearIssueRunsMovePending :execrows
 UPDATE runs SET move_pending_since = NULL, updated_at = now()
 WHERE repo_id = $1::uuid AND issue_iid = $2 AND move_pending_since IS NOT NULL
@@ -775,9 +797,11 @@ WITH pending AS (
     -- set (the resume endpoint writes it as an audit row; the run's return to 'queued' is a
     -- server-side transition, not a worker steering input). PRD #1226 M5 (D7) adds
     -- 'completion_decision' for the SAME reason: the owner continue-decision is a dedicated
-    -- endpoint's AUDIT row — its control travels via the transition (paused → queued through
-    -- ResumePausedRun) plus a separate 'follow_up' guidance input the worker DOES drain, never
-    -- this raw row — so draining it would likewise hit the default arm. 'pause' and
+    -- endpoint's AUDIT row — its control travels via a SEPARATE input the worker DOES drain
+    -- (paused branch: a 'follow_up' the resumed claim's pullFollowUp reads, alongside the
+    -- paused → queued transition through ResumePausedRun; live awaiting_input branch: an
+    -- 'answer' that resolves the worker's completion-question await), never this raw row — so
+    -- draining it would likewise hit the default arm. 'pause' and
     -- 'pause_cancel' are NOT excluded — the worker DOES consume them (the ` + "`" + `now` + "`" + ` abort and the
     -- flag clear). Everything else consumes as before.
     WHERE p.run_id = $1 AND p.consumed_at IS NULL AND p.kind NOT IN ('scope', 'resume', 'completion_decision')
@@ -956,6 +980,39 @@ type CountOnlineWorkersSatisfyingCapsParams struct {
 // is only ever "who could run THIS if it were free", and a bound worker never could.
 func (q *Queries) CountOnlineWorkersSatisfyingCaps(ctx context.Context, arg CountOnlineWorkersSatisfyingCapsParams) (int64, error) {
 	row := q.db.QueryRow(ctx, countOnlineWorkersSatisfyingCaps, arg.UserID, arg.RequiredCapabilities)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
+const countOnlineWorkersSatisfyingProtocol = `-- name: CountOnlineWorkersSatisfyingProtocol :one
+SELECT count(*) FROM workers w
+WHERE w.user_id = $1
+  AND w.status = 'online'
+  AND w.draining_since IS NULL
+  AND NOT w.ephemeral
+  AND 'completion_interlock_v1' = ANY(w.protocol_capabilities)
+`
+
+// PRD #1226 M1: how many of a user's ONLINE, non-draining, non-ephemeral workers self-report
+// the 'completion_interlock_v1' PROTOCOL capability (workers.protocol_capabilities). This is the
+// completion-interlock analogue of CountOnlineWorkersSatisfyingCaps: it answers "does the fleet
+// have ANY worker that implements the completion protocol?", NOT "can THIS run be claimed right
+// now?". It drives the queued-reason resolver's completion-capability rung (reasonNoCompletion
+// CapableWorker): a 0 here for an INTERLOCKED queued run means every online worker predates the
+// protocol, so the run's NON-BYPASSABLE claim clause (ClaimRun's `'completion_interlock_v1' =
+// ANY(@worker_protocol_caps)`) can never be satisfied — a persistent block distinct from the
+// generic wait, an ordinary capability gap, or the docker-allowlist fence.
+//
+// It reads workers.protocol_capabilities DIRECTLY (the server-authoritative FilterProtocol'd
+// column), NOT the effective-caps fold: the completion protocol is a self-reported protocol
+// capability, deliberately OUTSIDE required_capabilities / the docker union / the capability-aware
+// kill-switch (see ClaimRun's dedicated clause). draining_since IS NULL and NOT w.ephemeral mirror
+// CountOnlineWorkersSatisfyingCaps for the same reasons (a draining worker claims nothing; an
+// ephemeral worker is bound to one run and can never satisfy a different one). Only called for an
+// interlocked queued run already past its health threshold, so it is off the hot path.
+func (q *Queries) CountOnlineWorkersSatisfyingProtocol(ctx context.Context, userID uuid.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, countOnlineWorkersSatisfyingProtocol, userID)
 	var count int64
 	err := row.Scan(&count)
 	return count, err
@@ -3833,31 +3890,32 @@ SELECT id, user_id, status, auto_approve,
        started_at, last_activity_at, updated_at, status_since,
        health, health_reason, health_since, health_notified_at,
        budget_wall_seconds, budget_paused_seconds, interactive,
-       repo_id, kind, required_capabilities
+       repo_id, kind, required_capabilities, completion_contract_version
 FROM runs
 WHERE status IN ('queued', 'running', 'awaiting_approval')
   AND kind <> 'chat'
 `
 
 type ListActiveRunsForHealthRow struct {
-	ID                   uuid.UUID          `json:"id"`
-	UserID               uuid.UUID          `json:"user_id"`
-	Status               string             `json:"status"`
-	AutoApprove          bool               `json:"auto_approve"`
-	StartedAt            pgtype.Timestamptz `json:"started_at"`
-	LastActivityAt       pgtype.Timestamptz `json:"last_activity_at"`
-	UpdatedAt            pgtype.Timestamptz `json:"updated_at"`
-	StatusSince          pgtype.Timestamptz `json:"status_since"`
-	Health               string             `json:"health"`
-	HealthReason         pgtype.Text        `json:"health_reason"`
-	HealthSince          pgtype.Timestamptz `json:"health_since"`
-	HealthNotifiedAt     pgtype.Timestamptz `json:"health_notified_at"`
-	BudgetWallSeconds    pgtype.Int4        `json:"budget_wall_seconds"`
-	BudgetPausedSeconds  int32              `json:"budget_paused_seconds"`
-	Interactive          bool               `json:"interactive"`
-	RepoID               pgtype.UUID        `json:"repo_id"`
-	Kind                 string             `json:"kind"`
-	RequiredCapabilities []string           `json:"required_capabilities"`
+	ID                        uuid.UUID          `json:"id"`
+	UserID                    uuid.UUID          `json:"user_id"`
+	Status                    string             `json:"status"`
+	AutoApprove               bool               `json:"auto_approve"`
+	StartedAt                 pgtype.Timestamptz `json:"started_at"`
+	LastActivityAt            pgtype.Timestamptz `json:"last_activity_at"`
+	UpdatedAt                 pgtype.Timestamptz `json:"updated_at"`
+	StatusSince               pgtype.Timestamptz `json:"status_since"`
+	Health                    string             `json:"health"`
+	HealthReason              pgtype.Text        `json:"health_reason"`
+	HealthSince               pgtype.Timestamptz `json:"health_since"`
+	HealthNotifiedAt          pgtype.Timestamptz `json:"health_notified_at"`
+	BudgetWallSeconds         pgtype.Int4        `json:"budget_wall_seconds"`
+	BudgetPausedSeconds       int32              `json:"budget_paused_seconds"`
+	Interactive               bool               `json:"interactive"`
+	RepoID                    pgtype.UUID        `json:"repo_id"`
+	Kind                      string             `json:"kind"`
+	RequiredCapabilities      []string           `json:"required_capabilities"`
+	CompletionContractVersion pgtype.Int4        `json:"completion_contract_version"`
 }
 
 // Run health detector (PRD #47) ----------------------------------------------
@@ -3881,6 +3939,9 @@ type ListActiveRunsForHealthRow struct {
 // a subset of any online worker's effective caps). kind was previously only a WHERE
 // filter; it is projected now so the resolver can branch on it too. No sweeper change —
 // a parked run stays queued and every sweep pass is scoped away from it by construction.
+// PRD #1226 M1: completion_contract_version rides this read so the queued arm can surface a
+// completion-capability reason for an INTERLOCKED run (version non-null) that no online worker
+// implements the completion protocol — the non-bypassable claim clause can never be satisfied.
 func (q *Queries) ListActiveRunsForHealth(ctx context.Context) ([]ListActiveRunsForHealthRow, error) {
 	rows, err := q.db.Query(ctx, listActiveRunsForHealth)
 	if err != nil {
@@ -3909,6 +3970,7 @@ func (q *Queries) ListActiveRunsForHealth(ctx context.Context) ([]ListActiveRuns
 			&i.RepoID,
 			&i.Kind,
 			&i.RequiredCapabilities,
+			&i.CompletionContractVersion,
 		); err != nil {
 			return nil, err
 		}

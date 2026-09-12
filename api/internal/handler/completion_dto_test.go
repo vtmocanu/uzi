@@ -13,8 +13,9 @@ import (
 // the single derived label the web and CLI both render, so the two surfaces cannot disagree
 // about which of D8's three states an interlocked run is in. The table walks every arm:
 // non-interlocked is always ""; a completion hold is "blocked" (winning over the running
-// states); a running run past its first attempt is "reworking" (unmet) or "checking" (none
-// unmet); everything else (no attempt yet, not running) is "".
+// states); the LIVE completion-question window (awaiting_input, interlocked, past a first
+// attempt) is also "blocked"; a running run past its first attempt is "reworking" (unmet) or
+// "checking" (none unmet); everything else (no attempt yet, not running) is "".
 func TestCompletionPhaseRule(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -29,6 +30,9 @@ func TestCompletionPhaseRule(t *testing.T) {
 		{"not interlocked even when blocked", false, "paused", "completion_blocked", 3, 1, ""},
 		{"blocked hold", true, "paused", "completion_blocked", 3, 1, "blocked"},
 		{"blocked wins over running/reworking", true, "running", "completion_blocked", 2, 4, "blocked"},
+		{"live completion-question window is blocked", true, "awaiting_input", "", 2, 1, "blocked"},
+		{"awaiting_input with no attempt yet is empty", true, "awaiting_input", "", 0, 0, ""},
+		{"awaiting_input not interlocked is empty", false, "awaiting_input", "", 2, 1, ""},
 		{"running past attempt with unmet is reworking", true, "running", "", 1, 2, "reworking"},
 		{"running past attempt none unmet is checking", true, "running", "", 1, 0, "checking"},
 		{"running but no attempt yet is empty", true, "running", "", 0, 0, ""},

@@ -1,6 +1,7 @@
 package workersvc
 
 import (
+	"encoding/json"
 	"errors"
 	"testing"
 
@@ -57,23 +58,49 @@ func (e interlockLiveDB) pendingFollowUpBody(t *testing.T, runID uuid.UUID) stri
 	return body.String
 }
 
-// TestCompletionDecisionPausedResumesLiveDB (PRD #1226 M5, D7): a paused run held on the completion
-// interlock (hold_reason='completion_blocked') accepts a continue decision — it resumes THROUGH
-// queued via ResumePausedRun, the hold columns are STILL set (cleared only on the first running
-// report, not prematurely), a completion_decision audit row and the guidance follow_up are
-// enqueued. THEN a SetRunRunning report clears hold_reason/hold_captured_head — the D7 "clears the
-// hold on the first accepted running report". completion_budget_exhausted_at is the M4/D3 served
-// steer flag and is DELIBERATELY NOT cleared by SetRunRunning (its only clear is SetRunCompletionHold
-// on hold entry); this test pins that it SURVIVES both the resume and the running report.
+// pendingAnswer returns the body + question_id column of the run's single UNCONSUMED `answer`
+// (the delivery the live worker's steering.awaitAnswer resolves on), failing if there is not
+// exactly one.
+func (e interlockLiveDB) pendingAnswer(t *testing.T, runID uuid.UUID) (body, questionID string) {
+	t.Helper()
+	var b, q pgtype.Text
+	if err := e.pool.QueryRow(e.ctx,
+		`SELECT body, question_id FROM run_user_inputs WHERE run_id = $1 AND kind = 'answer' AND consumed_at IS NULL`, runID).
+		Scan(&b, &q); err != nil {
+		t.Fatalf("read pending answer: %v", err)
+	}
+	return b.String, q.String
+}
+
+// exhaustedSet reports whether completion_budget_exhausted_at is currently set on the run.
+func (e interlockLiveDB) exhaustedSet(t *testing.T, runID uuid.UUID) bool {
+	t.Helper()
+	var set bool
+	if err := e.pool.QueryRow(e.ctx,
+		`SELECT completion_budget_exhausted_at IS NOT NULL FROM runs WHERE id = $1`, runID).Scan(&set); err != nil {
+		t.Fatalf("read completion_budget_exhausted_at: %v", err)
+	}
+	return set
+}
+
+// TestCompletionDecisionPausedResumesLiveDB (PRD #1226 M5, D7/D3): a paused run held on the
+// completion interlock (hold_reason='completion_blocked') accepts a continue decision — it resumes
+// THROUGH queued via ResumePausedRun, the hold columns are STILL set (cleared only on the first
+// running report, not prematurely), and a completion_decision audit row plus the guidance follow_up
+// are enqueued. The owner decision CLEARS completion_budget_exhausted_at (D3: "a new owner decision
+// clears it"); on the paused branch a real completion hold carries the flag NULL already
+// (SetRunCompletionHold cleared it on hold entry), so this test seeds it SET to make the decision's
+// clear observable. THEN a SetRunRunning report clears hold_reason/hold_captured_head — the D7
+// "clears the hold on the first accepted running report".
 func TestCompletionDecisionPausedResumesLiveDB(t *testing.T) {
 	e := setupInterlockLiveDB(t)
 	svc := e.permitService(t)
 	wid := e.seedWorker(t, []string{"completion_interlock_v1"})
 	runID := e.seedFrozenRun(t, wid, []string{"m1", "m2"}, []string{"m1"}, false)
 	// Park it on the completion hold: paused, hold_reason='completion_blocked', a captured head, and
-	// an attempt recorded. completion_budget_exhausted_at is also set here to prove SetRunRunning
-	// leaves the served-steer flag UNTOUCHED (in production SetRunCompletionHold clears it on hold
-	// entry, so a real completion hold carries it NULL; setting it here makes the non-clear observable).
+	// an attempt recorded. completion_budget_exhausted_at is set here (SET, not NULL) so the owner
+	// decision's D3 clear is observable — in production SetRunCompletionHold already NULLs it on hold
+	// entry, so a real paused completion hold carries it NULL and the clear is a no-op there.
 	e.exec(t, `UPDATE runs SET status = 'paused', hold_reason = 'completion_blocked',
 	               hold_captured_head = 'capturedhead1', completion_attempts = 1,
 	               completion_budget_exhausted_at = now() WHERE id = $1`, runID)
@@ -88,6 +115,7 @@ func TestCompletionDecisionPausedResumesLiveDB(t *testing.T) {
 	}
 
 	// The hold columns are STILL set — D7 clears them on the first running report, NOT in the resume.
+	// completion_budget_exhausted_at is CLEARED by the owner decision (D3).
 	reason, head, exhausted := e.holdColumns(t, runID)
 	if reason == nil || *reason != "completion_blocked" {
 		t.Fatalf("hold_reason must survive the resume (cleared only on running); got %v", reason)
@@ -95,16 +123,22 @@ func TestCompletionDecisionPausedResumesLiveDB(t *testing.T) {
 	if head == nil || *head != "capturedhead1" {
 		t.Fatalf("hold_captured_head must survive the resume; got %v", head)
 	}
-	if !exhausted {
-		t.Fatal("completion_budget_exhausted_at must survive the resume (cleared only on running)")
+	if exhausted {
+		t.Fatal("completion_budget_exhausted_at must be CLEARED by the owner CONTINUE decision (D3: a new " +
+			"owner decision clears the served budget_exhausted steer)")
 	}
 
 	// Exactly one completion_decision audit row, and the guidance follow_up enqueued unconsumed.
+	// The paused branch delivers guidance as a follow_up (the resumed claim's pullFollowUp drains
+	// it) — NOT an answer, which is the live-window delivery.
 	if got := e.countInputs(t, runID, "completion_decision"); got != 1 {
 		t.Fatalf("completion_decision audit rows = %d, want 1", got)
 	}
 	if got := e.countInputs(t, runID, "follow_up"); got != 1 {
 		t.Fatalf("guidance follow_up rows = %d, want 1", got)
+	}
+	if got := e.countInputs(t, runID, "answer"); got != 0 {
+		t.Fatalf("the paused branch must NOT write an answer (no live await); answer rows = %d, want 0", got)
 	}
 	if body := e.pendingFollowUpBody(t, runID); body != guidance {
 		t.Fatalf("guidance follow_up body = %q, want %q", body, guidance)
@@ -131,30 +165,34 @@ func TestCompletionDecisionPausedResumesLiveDB(t *testing.T) {
 	if s := e.runStatus(t, runID); s != "running" {
 		t.Fatalf("run status after the running report = %q, want running", s)
 	}
-	reason, head, exhausted = e.holdColumns(t, runID)
+	reason, head, _ = e.holdColumns(t, runID)
 	if reason != nil {
 		t.Fatalf("hold_reason must be CLEARED on the first running report; got %q", *reason)
 	}
 	if head != nil {
 		t.Fatalf("hold_captured_head must be CLEARED on the first running report; got %q", *head)
 	}
-	if !exhausted {
-		t.Fatal("completion_budget_exhausted_at must SURVIVE the running report — it is the M4/D3 served " +
-			"steer flag the worker reads off this report's ACK to route into the completion hold; SetRunRunning " +
-			"must not disarm it (its only clear is SetRunCompletionHold on hold entry)")
-	}
 }
 
-// TestCompletionDecisionAwaitingInputResumesInPlaceLiveDB (PRD #1226 M5, D7): a run in the LIVE
-// completion-question window (awaiting_input, interlocked, with a recorded attempt) accepts a
-// continue decision that writes the worker-consumed guidance follow_up + the completion_decision
-// audit row and does NOT force-transition the status — the live worker reports running itself.
+// TestCompletionDecisionAwaitingInputResumesInPlaceLiveDB (PRD #1226 M5, D7/D3): a run in the LIVE
+// completion-question window (awaiting_input, interlocked, with a recorded attempt AND an
+// open_question_id) accepts a continue decision. The delivery is an ANSWER — NOT a follow_up —
+// because the worker's completion-question await is steering.awaitAnswer(questionId), which route()
+// resolves ONLY on an `answer`-kind input (parseAnswerBody requires {question_id, answers}); a
+// follow_up would never resolve it. The answer names the run's OWN open_question_id and carries the
+// guidance as its single answer. The completion_decision audit row is still written, the served
+// budget_exhausted steer is CLEARED (D3), and the status is NOT force-transitioned — the live
+// worker reports running itself.
 func TestCompletionDecisionAwaitingInputResumesInPlaceLiveDB(t *testing.T) {
 	e := setupInterlockLiveDB(t)
 	svc := e.permitService(t)
 	wid := e.seedWorker(t, []string{"completion_interlock_v1"})
 	runID := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
-	e.exec(t, `UPDATE runs SET status = 'awaiting_input', completion_attempts = 2 WHERE id = $1`, runID)
+	const qid = "completion-q-abc123"
+	// Seed the live window: awaiting_input, a recorded attempt, the completion question's open id,
+	// and the served steer flag SET so the D3 clear is observable.
+	e.exec(t, `UPDATE runs SET status = 'awaiting_input', completion_attempts = 2,
+	               open_question_id = $2, completion_budget_exhausted_at = now() WHERE id = $1`, runID, qid)
 
 	const guidance = "resolve the open TODO in handler.go"
 	run, err := svc.ContinueCompletionDecision(e.ctx, e.userID, runID, guidance)
@@ -167,11 +205,67 @@ func TestCompletionDecisionAwaitingInputResumesInPlaceLiveDB(t *testing.T) {
 	if got := e.countInputs(t, runID, "completion_decision"); got != 1 {
 		t.Fatalf("completion_decision audit rows = %d, want 1", got)
 	}
-	if got := e.countInputs(t, runID, "follow_up"); got != 1 {
-		t.Fatalf("worker-consumed follow_up rows = %d, want 1", got)
+	// The delivery is an ANSWER, not a follow_up: a follow_up would never resolve awaitAnswer.
+	if got := e.countInputs(t, runID, "follow_up"); got != 0 {
+		t.Fatalf("the live window must NOT write a follow_up (it can't resolve awaitAnswer); follow_up rows = %d, want 0", got)
 	}
-	if body := e.pendingFollowUpBody(t, runID); body != guidance {
-		t.Fatalf("follow_up body = %q, want %q", body, guidance)
+	if got := e.countInputs(t, runID, "answer"); got != 1 {
+		t.Fatalf("worker-consumed answer rows = %d, want 1", got)
+	}
+	body, questionID := e.pendingAnswer(t, runID)
+	if questionID != qid {
+		t.Fatalf("answer question_id column = %q, want the run's open_question_id %q", questionID, qid)
+	}
+	var ab struct {
+		QuestionID string   `json:"question_id"`
+		Answers    []string `json:"answers"`
+	}
+	if err := json.Unmarshal([]byte(body), &ab); err != nil {
+		t.Fatalf("answer body %q is not the {question_id, answers} wire shape parseAnswerBody expects: %v", body, err)
+	}
+	if ab.QuestionID != qid {
+		t.Fatalf("answer body question_id = %q, want %q", ab.QuestionID, qid)
+	}
+	if len(ab.Answers) != 1 || ab.Answers[0] != guidance {
+		t.Fatalf("answer body answers = %v, want [%q]", ab.Answers, guidance)
+	}
+	// D3: the owner decision cleared the served budget_exhausted steer, so a resumed worker is not
+	// immediately re-steered into the hold off a since-consumed ACK.
+	if e.exhaustedSet(t, runID) {
+		t.Fatal("completion_budget_exhausted_at must be CLEARED by the owner CONTINUE decision (D3)")
+	}
+}
+
+// TestCompletionDecisionAwaitingInputEmptyGuidanceSendsContinueSentinelLiveDB (PRD #1226 M5, D7):
+// an EMPTY guidance in the live window still delivers an answer, with a non-empty continue sentinel
+// (["continue"]) so steering.awaitAnswer resolves and the worker gets an unambiguous continue.
+func TestCompletionDecisionAwaitingInputEmptyGuidanceSendsContinueSentinelLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	svc := e.permitService(t)
+	wid := e.seedWorker(t, []string{"completion_interlock_v1"})
+	runID := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
+	const qid = "completion-q-empty"
+	e.exec(t, `UPDATE runs SET status = 'awaiting_input', completion_attempts = 1, open_question_id = $2 WHERE id = $1`, runID, qid)
+
+	if _, err := svc.ContinueCompletionDecision(e.ctx, e.userID, runID, ""); err != nil {
+		t.Fatalf("ContinueCompletionDecision (awaiting_input, empty guidance): %v", err)
+	}
+	if got := e.countInputs(t, runID, "answer"); got != 1 {
+		t.Fatalf("empty guidance must still write exactly one answer; answer rows = %d, want 1", got)
+	}
+	body, questionID := e.pendingAnswer(t, runID)
+	if questionID != qid {
+		t.Fatalf("answer question_id column = %q, want %q", questionID, qid)
+	}
+	var ab struct {
+		QuestionID string   `json:"question_id"`
+		Answers    []string `json:"answers"`
+	}
+	if err := json.Unmarshal([]byte(body), &ab); err != nil {
+		t.Fatalf("answer body %q is not valid JSON: %v", body, err)
+	}
+	if len(ab.Answers) != 1 || ab.Answers[0] != "continue" {
+		t.Fatalf("empty guidance must send the continue sentinel; answers = %v, want [continue]", ab.Answers)
 	}
 }
 
@@ -197,6 +291,9 @@ func TestCompletionDecisionNotBlockedRefusedLiveDB(t *testing.T) {
 		if got := e.countInputs(t, runID, "follow_up"); got != 0 {
 			t.Fatalf("a refused decision must write no follow_up; got %d", got)
 		}
+		if got := e.countInputs(t, runID, "answer"); got != 0 {
+			t.Fatalf("a refused decision must write no answer; got %d", got)
+		}
 	}
 
 	t.Run("plain running interlocked run, no attempt", func(t *testing.T) {
@@ -220,6 +317,17 @@ func TestCompletionDecisionNotBlockedRefusedLiveDB(t *testing.T) {
 	t.Run("awaiting_input with no completion attempt (ordinary question)", func(t *testing.T) {
 		runID := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
 		e.exec(t, `UPDATE runs SET status = 'awaiting_input' WHERE id = $1`, runID) // attempts=0
+		assertRefused(t, runID)
+		if s := e.runStatus(t, runID); s != "awaiting_input" {
+			t.Fatalf("a refused decision must leave status unchanged; got %q", s)
+		}
+	})
+
+	t.Run("awaiting_input completion window but no open_question_id", func(t *testing.T) {
+		// Interlocked, past a first attempt (so completionQuestionOpen admits it) but with NO
+		// open_question_id — the answer could never resolve the worker's await, so it is refused.
+		runID := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
+		e.exec(t, `UPDATE runs SET status = 'awaiting_input', completion_attempts = 2, open_question_id = NULL WHERE id = $1`, runID)
 		assertRefused(t, runID)
 		if s := e.runStatus(t, runID); s != "awaiting_input" {
 			t.Fatalf("a refused decision must leave status unchanged; got %q", s)

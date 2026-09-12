@@ -2607,6 +2607,19 @@ WHERE status = 'running'
         AND w.last_heartbeat_at >= sqlc.arg('worker_stale_cutoff')::timestamptz
   );
 
+-- name: ClearCompletionBudgetExhausted :execrows
+-- PRD #1226 M5 (D3): a NEW OWNER DECISION clears the served `budget_exhausted` steer
+-- (completion_budget_exhausted_at). D3's clears are "acting on it, parking, or a new owner
+-- decision"; StampCompletionBudgetExhausted arms the one-shot flag and SetRunCompletionHold
+-- (the worker acting on it / parking) clears it — this is the third clear, the owner's
+-- CONTINUE decision (ContinueCompletionDecision). It is unconditional and id-scoped: on the
+-- paused branch the flag is already NULL (SetRunCompletionHold cleared it on hold entry), so
+-- this is a no-op there; on the LIVE awaiting_input completion-question branch the flag may
+-- still be set (the worker was steered into the completion question before entering a hold),
+-- and clearing it prevents the resumed worker being immediately re-steered into the hold off a
+-- since-consumed ACK. Owner scoping is enforced by the caller (GetRun read) before this runs.
+UPDATE runs SET completion_budget_exhausted_at = NULL, updated_at = now() WHERE id = @id;
+
 -- name: FailRunsOfStaleWorkersOverCap :many
 -- A stale worker's non-terminal run that has already used its re-queue budget →
 -- failed instead of re-queued. Stamps move_pending_since (reconcile restores the
@@ -3332,9 +3345,11 @@ WITH pending AS (
     -- set (the resume endpoint writes it as an audit row; the run's return to 'queued' is a
     -- server-side transition, not a worker steering input). PRD #1226 M5 (D7) adds
     -- 'completion_decision' for the SAME reason: the owner continue-decision is a dedicated
-    -- endpoint's AUDIT row — its control travels via the transition (paused → queued through
-    -- ResumePausedRun) plus a separate 'follow_up' guidance input the worker DOES drain, never
-    -- this raw row — so draining it would likewise hit the default arm. 'pause' and
+    -- endpoint's AUDIT row — its control travels via a SEPARATE input the worker DOES drain
+    -- (paused branch: a 'follow_up' the resumed claim's pullFollowUp reads, alongside the
+    -- paused → queued transition through ResumePausedRun; live awaiting_input branch: an
+    -- 'answer' that resolves the worker's completion-question await), never this raw row — so
+    -- draining it would likewise hit the default arm. 'pause' and
     -- 'pause_cancel' are NOT excluded — the worker DOES consume them (the `now` abort and the
     -- flag clear). Everything else consumes as before.
     WHERE p.run_id = @run_id AND p.consumed_at IS NULL AND p.kind NOT IN ('scope', 'resume', 'completion_decision')
@@ -3514,11 +3529,14 @@ UPDATE runs SET checkpoint_tip = @checkpoint_tip, checkpoint_tip_at = now() WHER
 -- a subset of any online worker's effective caps). kind was previously only a WHERE
 -- filter; it is projected now so the resolver can branch on it too. No sweeper change —
 -- a parked run stays queued and every sweep pass is scoped away from it by construction.
+-- PRD #1226 M1: completion_contract_version rides this read so the queued arm can surface a
+-- completion-capability reason for an INTERLOCKED run (version non-null) that no online worker
+-- implements the completion protocol — the non-bypassable claim clause can never be satisfied.
 SELECT id, user_id, status, auto_approve,
        started_at, last_activity_at, updated_at, status_since,
        health, health_reason, health_since, health_notified_at,
        budget_wall_seconds, budget_paused_seconds, interactive,
-       repo_id, kind, required_capabilities
+       repo_id, kind, required_capabilities, completion_contract_version
 FROM runs
 WHERE status IN ('queued', 'running', 'awaiting_approval')
   AND kind <> 'chat';
@@ -3685,6 +3703,31 @@ WHERE w.user_id = @user_id
   AND w.draining_since IS NULL
   AND NOT w.ephemeral
   AND @required_capabilities::text[] <@ fn_effective_worker_caps(w.capabilities, COALESCE(w.docker_enabled, false));
+
+-- name: CountOnlineWorkersSatisfyingProtocol :one
+-- PRD #1226 M1: how many of a user's ONLINE, non-draining, non-ephemeral workers self-report
+-- the 'completion_interlock_v1' PROTOCOL capability (workers.protocol_capabilities). This is the
+-- completion-interlock analogue of CountOnlineWorkersSatisfyingCaps: it answers "does the fleet
+-- have ANY worker that implements the completion protocol?", NOT "can THIS run be claimed right
+-- now?". It drives the queued-reason resolver's completion-capability rung (reasonNoCompletion
+-- CapableWorker): a 0 here for an INTERLOCKED queued run means every online worker predates the
+-- protocol, so the run's NON-BYPASSABLE claim clause (ClaimRun's `'completion_interlock_v1' =
+-- ANY(@worker_protocol_caps)`) can never be satisfied — a persistent block distinct from the
+-- generic wait, an ordinary capability gap, or the docker-allowlist fence.
+--
+-- It reads workers.protocol_capabilities DIRECTLY (the server-authoritative FilterProtocol'd
+-- column), NOT the effective-caps fold: the completion protocol is a self-reported protocol
+-- capability, deliberately OUTSIDE required_capabilities / the docker union / the capability-aware
+-- kill-switch (see ClaimRun's dedicated clause). draining_since IS NULL and NOT w.ephemeral mirror
+-- CountOnlineWorkersSatisfyingCaps for the same reasons (a draining worker claims nothing; an
+-- ephemeral worker is bound to one run and can never satisfy a different one). Only called for an
+-- interlocked queued run already past its health threshold, so it is off the hot path.
+SELECT count(*) FROM workers w
+WHERE w.user_id = @user_id
+  AND w.status = 'online'
+  AND w.draining_since IS NULL
+  AND NOT w.ephemeral
+  AND 'completion_interlock_v1' = ANY(w.protocol_capabilities);
 
 -- name: ListUnplaceableQueuedRunsForEphemeral :many
 -- The trigger query for the ephemeral auto-provisioner (PRD #529 M2). It returns the

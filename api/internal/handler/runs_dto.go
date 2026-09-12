@@ -83,6 +83,16 @@ func pauseRequestedRule(pauseMode string, frozenLen, completedLen, afterCount in
 // it lives in exactly one place and one test table.
 //   - not interlocked → "" (a legacy / rollout-OFF run has no completion phase).
 //   - held ("completion_blocked") → "blocked" (takes precedence over the running states below).
+//   - parked in the LIVE completion-question window (awaiting_input, interlocked, past a first
+//     attempt, before the hold so hold_reason is still empty) → "blocked". Without this arm such
+//     a run derives "" — indistinguishable from a legacy run — so the web/CLI would show nothing
+//     while the run is in fact blocked pending the owner's continue decision. It reuses the SAME
+//     interlock+attempts proxy completionQuestionOpen (the decision endpoint's admit condition)
+//     uses, and shows the SAME honest "blocked" label as the paused hold. KNOWN IMPRECISION: an
+//     interlocked run with a prior attempt parked on an ORDINARY ask_user clarification (not a
+//     completion question) would also match this proxy and read as "blocked". This is the same
+//     rollout-OFF-inert imprecision completionQuestionOpen carries, to be tightened with a
+//     dedicated completion-question marker before rollout.
 //   - running past a first attempt, some criteria still unmet → "reworking".
 //   - running past a first attempt, none unmet → "checking".
 //   - anything else (no attempt yet, not running) → "".
@@ -91,6 +101,9 @@ func completionPhaseRule(interlocked bool, status, holdReason string, attempts, 
 		return ""
 	}
 	if holdReason == "completion_blocked" {
+		return "blocked"
+	}
+	if status == "awaiting_input" && attempts > 0 {
 		return "blocked"
 	}
 	if status == "running" && attempts > 0 {

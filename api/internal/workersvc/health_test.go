@@ -82,6 +82,17 @@ type healthFakeStore struct {
 	// capsCalls records every lookup's params, so a test can prove the arm asks about
 	// THIS run's user and required set, and that the guards ahead of it short-circuit.
 	capsCalls []store.CountOnlineWorkersSatisfyingCapsParams
+	// satisfyingProtocol is the canned CountOnlineWorkersSatisfyingProtocol answer (PRD #1226
+	// M1): how many online, non-draining workers self-report the completion protocol. 0 for an
+	// INTERLOCKED run drives reasonNoCompletionCapableWorker. satisfyingProtocolErr forces the
+	// read to fail (falls through to the generic queuedReason). The ANY(protocol_capabilities)
+	// predicate itself is NOT reimplemented here — it is pinned against a real Postgres by the
+	// queuedReason completion-capability LiveDB tests; this side pins the ARM.
+	satisfyingProtocol    int64
+	satisfyingProtocolErr error
+	// protocolCalls records every lookup's user id, so a test can prove the rung asks about THIS
+	// run's user and that the guards ahead of it (and the non-interlocked case) short-circuit.
+	protocolCalls []uuid.UUID
 }
 
 func (f *healthFakeStore) ListActiveRunsForHealth(context.Context) ([]store.ListActiveRunsForHealthRow, error) {
@@ -106,6 +117,13 @@ func (f *healthFakeStore) CountOnlineWorkersSatisfyingCaps(_ context.Context, ar
 		return 0, f.satisfyingCapsErr
 	}
 	return f.satisfyingCaps, nil
+}
+func (f *healthFakeStore) CountOnlineWorkersSatisfyingProtocol(_ context.Context, userID uuid.UUID) (int64, error) {
+	f.protocolCalls = append(f.protocolCalls, userID)
+	if f.satisfyingProtocolErr != nil {
+		return 0, f.satisfyingProtocolErr
+	}
+	return f.satisfyingProtocol, nil
 }
 func (f *healthFakeStore) CountOnlineEligibleWorkersForRepo(_ context.Context, arg store.CountOnlineEligibleWorkersForRepoParams) (int64, error) {
 	f.eligCalls = append(f.eligCalls, arg)
