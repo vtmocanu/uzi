@@ -20,13 +20,14 @@ ALTER TABLE run_user_inputs ADD CONSTRAINT run_user_inputs_kind_check
 -- +goose Down
 
 -- Narrowing is best-effort and DATA-DEPENDENT, mirroring 00204's Down: the re-added
--- narrower CHECK FAILS if any row already holds 'completion_decision', and this migration
--- then refuses to come down — the correct outcome, since a down that silently stranded
--- rows violating the constraint it just installed would be worse. Goose downs are not run
--- in this deployment (store.Migrate only ever goes up); drain first if you must. Re-added
--- NOT VALID (not validated), so the pre-'completion_decision' list is restored in the same
--- shape 00215's Down leaves the widened one — goose runs 00215's Down first, re-adding the
--- 'completion_decision' list NOT VALID, then this drops and re-adds the narrower list NOT VALID.
+-- narrower CHECK is VALIDATED (no NOT VALID), so it scans existing rows and FAILS if any
+-- row already holds 'completion_decision', and this migration then refuses to come down —
+-- the correct outcome, since a down that silently stranded rows violating the constraint
+-- it just installed would be worse. Goose downs are not run in this deployment
+-- (store.Migrate only ever goes up); drain first if you must. The validated re-add restores
+-- the pre-'completion_decision' state — validated, exactly as 00205 left the pre-00216 list
+-- — matching 00204's Down verbatim: goose runs 00217's Down first (re-adding the
+-- 'completion_decision' list NOT VALID), then this drops and re-adds the narrower list validated.
 ALTER TABLE run_user_inputs DROP CONSTRAINT run_user_inputs_kind_check;
 ALTER TABLE run_user_inputs ADD CONSTRAINT run_user_inputs_kind_check
-    CHECK (kind IN ('follow_up', 'approve_plan', 'reject_plan', 'cancel', 'revise_plan', 'answer', 'stop', 'scope', 'pause', 'pause_cancel', 'resume')) NOT VALID;
+    CHECK (kind IN ('follow_up', 'approve_plan', 'reject_plan', 'cancel', 'revise_plan', 'answer', 'stop', 'scope', 'pause', 'pause_cancel', 'resume'));
