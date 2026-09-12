@@ -99,7 +99,14 @@ interface CompletionProbe {
   attemptCalls: AttemptCall[];
   holdReasons: string[];
   iterations: number[];
+  // PRD #1226 M5 (D6): the unmet id set passed to each askCompletionQuestion call, one entry per
+  // call, in order. Empty when the live-window seam was never wired/consulted.
+  askQuestionCalls: string[][];
 }
+
+type CompletionDecision =
+  | { outcome: "continue"; guidance?: string }
+  | { outcome: "expired" };
 
 // makeCompletionCtx builds a minimal issue-run ctx wired for the interlock path. `unmetScript` is
 // consumed one entry per recordCompletionAttempt call (the last entry sticks). `wireHold` false
@@ -119,12 +126,19 @@ function makeCompletionCtx(
     // PRD #1226 M4 (D3): from this iteration number on, reportIteration serves budgetExhausted:true
     // (the server's steer). undefined ⇒ never served.
     budgetExhaustedFromIteration?: number;
+    // PRD #1226 M5 (D6): scripted completion-question decisions, one consumed per
+    // askCompletionQuestion call (the LAST entry sticks). When provided, wires
+    // ctx.askCompletionQuestion (the live-window seam); absent leaves it UNWIRED (the M4 fallback —
+    // the stall routes straight to the hold).
+    askQuestionScript?: CompletionDecision[];
   } = {},
 ): CompletionProbe {
   const order: string[] = [];
   const attemptCalls: AttemptCall[] = [];
   const holdReasons: string[] = [];
   const iterations: number[] = [];
+  const askQuestionCalls: string[][] = [];
+  let askQuestionN = 0;
   const unmetScript = opts.unmetScript ?? [[]];
   let attemptN = 0;
   const wf = opts.worktreeFingerprint === undefined ? "TIP\n M src/x.ts" : opts.worktreeFingerprint;
@@ -177,7 +191,17 @@ function makeCompletionCtx(
       return opts.holdReturns ?? true;
     };
   }
-  return { ctx, order, attemptCalls, holdReasons, iterations };
+  if (opts.askQuestionScript) {
+    const script = opts.askQuestionScript;
+    ctx.askCompletionQuestion = async (unmet) => {
+      order.push("askQuestion");
+      askQuestionCalls.push(unmet);
+      const decision = script[Math.min(askQuestionN, script.length - 1)]!;
+      askQuestionN++;
+      return decision;
+    };
+  }
+  return { ctx, order, attemptCalls, holdReasons, iterations, askQuestionCalls };
 }
 
 let homeDir: string;
@@ -406,5 +430,67 @@ describe("SdkExecutor completion interlock (PRD #1226 M3)", () => {
     assert.deepStrictEqual(probe.holdReasons, [], "a pre-attempt budget steer must not hold");
     assert.strictEqual(result.branch, "agent/issue-5", "the run finalized normally");
     assert.strictEqual(result.completionHeld, undefined);
+  });
+
+  // PRD #1226 M5 (D6): the completion-question LIVE window at the completion-STALL point ONLY. The
+  // stall now asks the owner (askCompletionQuestion) BEFORE parking; a "continue" resumes the SAME
+  // session, an "expired" routes to the M4 hold, and an UNWIRED seam keeps the M4 direct-park.
+  it("(m5) a 'continue' at the stall resumes the SAME session with the guidance injected, resets the streak, and does NOT park", async () => {
+    // Three identical no-progress attempts trip the stall; the owner answers 'continue' with
+    // guidance. The streak resets so the SAME session runs a 4th attempt, which finds the contract
+    // satisfied (unmet empties) and finalizes — proving the window RESUMED rather than parked, the
+    // streak reset (a 4th attempt ran), and the owner guidance rode the rework follow-up.
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCompletionCtx({
+      unmetScript: [["m1"], ["m1"], ["m1"], []],
+      askQuestionScript: [
+        { outcome: "continue", guidance: "wire up the m1 handler and add a test" },
+      ],
+    });
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+
+    assert.strictEqual(probe.askQuestionCalls.length, 1, "the stall asked the owner exactly once");
+    assert.deepStrictEqual(probe.askQuestionCalls[0], ["m1"], "the unmet set was passed to the question");
+    assert.strictEqual(probe.attemptCalls.length, 4, "the streak reset let a 4th attempt run in the SAME session");
+    assert.deepStrictEqual(probe.holdReasons, [], "a continued run never parks");
+    assert.strictEqual(result.branch, "agent/issue-5", "the resumed attempt emptied unmet → finalize");
+    assert.strictEqual(result.completionHeld, undefined);
+    assert.ok(
+      turns.some((t) => (t.promptText ?? "").includes("wire up the m1 handler")),
+      "the owner guidance was injected into the resumed completion-rework follow-up",
+    );
+  });
+
+  it("(m5) an 'expired' window routes to enterCompletionHold (park) and never throws REASON_QUESTION_TIMEOUT", async () => {
+    const { queryFn } = fakeTurns([[submitPlan("plan"), resultSuccess()], [signalDone(), resultSuccess()]]);
+    const probe = makeCompletionCtx({
+      unmetScript: [["m1"]], // constant unmet → the stall trips at STALL_LIMIT
+      askQuestionScript: [{ outcome: "expired" }],
+    });
+    // The run RESOLVES (no reject): the expired window parks via enterCompletionHold and does NOT
+    // surface REASON_QUESTION_TIMEOUT — this window has no fail-closed throw.
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.strictEqual(probe.askQuestionCalls.length, 1, "the stall asked the owner");
+    assert.strictEqual(probe.attemptCalls.length, 3, "bounded by STALL_LIMIT; the expired window did not reset the streak");
+    assert.strictEqual(probe.holdReasons.length, 1, "the expired window routed to enterCompletionHold exactly once");
+    assert.match(probe.holdReasons[0]!, /completion blocked/);
+    assert.ok(result.completionHeld, "the run parked (completionHeld latched)");
+    assert.match(result.completionHeld!.reason, /completion blocked/);
+  });
+
+  it("(m5) with askCompletionQuestion UNWIRED the stall parks directly (M4 fallback, unchanged)", async () => {
+    // No askQuestionScript ⇒ ctx.askCompletionQuestion is unset. The stall must route STRAIGHT to
+    // enterCompletionHold at attempt 3, exactly as M4 behaved — no question, no streak reset.
+    const { queryFn } = fakeTurns([[submitPlan("plan"), resultSuccess()], [signalDone(), resultSuccess()]]);
+    const probe = makeCompletionCtx({ unmetScript: [["m1"]] });
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.strictEqual(probe.askQuestionCalls.length, 0, "the unwired seam is never consulted");
+    assert.strictEqual(probe.attemptCalls.length, 3, "parks at STALL_LIMIT with no extra attempts");
+    assert.strictEqual(probe.holdReasons.length, 1, "routed straight to the hold");
+    assert.ok(result.completionHeld);
+    assert.match(result.completionHeld!.reason, /completion blocked/);
   });
 });

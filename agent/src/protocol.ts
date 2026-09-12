@@ -1675,6 +1675,14 @@ export interface StateRequest {
    *  park with no question identity can never satisfy the resume guard, so the run
    *  would park and then be unresumable no matter what the user answered. */
   open_question_id?: string;
+  /** PRD #1226 M5 (D6): marks an `awaiting_input` report as a COMPLETION-interlock question (the
+   *  live owner-continue window), NOT an ordinary #88 clarification. The api stamps
+   *  runs.completion_question_at and the owner continue-decision endpoint resolves THIS question by
+   *  delivering an `answer` naming open_question_id. Sent (true) ONLY on the completion-question park
+   *  (the worker's askCompletionQuestion); an ordinary ask_user park omits it. Additive + optional
+   *  and OMITTED ENTIRELY (never `false`) on every other report, so an old worker's payload and an
+   *  ordinary clarification park stay identical on the wire. */
+  completion_question?: boolean;
   /** completed carries the pushed branch + opened MR. */
   branch?: string;
   mr_iid?: number;

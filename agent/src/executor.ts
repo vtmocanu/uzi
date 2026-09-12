@@ -451,6 +451,25 @@ export interface RunContext {
    *  cleanup). The implementation MUST NOT run the destructive clone/HOME cleanup on the false
    *  path. */
   enterCompletionHold?(reason: string): Promise<boolean>;
+  /** PRD #1226 M5 (D6): the completion-question LIVE window. Called at the completion-STALL point
+   *  ONLY (STALL_LIMIT identical no-progress completion attempts) INSTEAD of routing straight to the
+   *  hold. Authors a completion-interlock question (reports `awaiting_input` marked
+   *  `completion_question` so the api stamps runs.completion_question_at and the owner
+   *  continue-decision endpoint resolves THIS question), then awaits the owner's continue decision
+   *  for up to the claim's `completion_hold_window_seconds` (default 900s).
+   *
+   *  Resolves `{ outcome: "continue", guidance? }` on an owner answer WITHIN the window — the
+   *  executor then resumes the SAME session for another completion attempt, folding the guidance
+   *  into the rework follow-up. Resolves `{ outcome: "expired" }` on the window elapsing — the
+   *  executor then routes to the verified park (routeCompletionHold, M4). It NEVER throws
+   *  REASON_QUESTION_TIMEOUT: expiry is a normal outcome, not a failure, and it must not surface as a
+   *  `failed` report. `unmet` is the server-authoritative unmet-milestone id set at the stall.
+   *
+   *  Optional: nil in tests/legacy (and while the completion interlock is rollout-OFF) ⇒ the
+   *  executor falls back to routeCompletionHold at the stall exactly as M4 behaved. */
+  askCompletionQuestion?(
+    unmet: string[],
+  ): Promise<{ outcome: "continue"; guidance?: string } | { outcome: "expired" }>;
 }
 
 export interface ExecutorResult {

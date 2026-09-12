@@ -2283,8 +2283,47 @@ export class SdkExecutor implements Executor {
                 : 1;
             lastCompletionFingerprint = completionFingerprint;
             if (completionStallStreak >= STALL_LIMIT) {
-              // No progress across STALL_LIMIT identical attempts → the recoverable completion
-              // hold (M4), or the legacy throw when the seam is unwired (M3 production).
+              // No progress across STALL_LIMIT identical completion attempts. The run is
+              // STRUCTURALLY blocked (not resource-exhausted): this is the completion-question
+              // moment (PRD #1226 M5 D6) — "completion is blocked; owner, continue with guidance or
+              // let it park?". When the LIVE-window seam is wired, ask the owner and give them up to
+              // completion_hold_window_seconds (default 900s) to answer BEFORE parking; when it is
+              // NOT wired the behaviour is byte-for-byte the M4 direct-park below.
+              if (completionAttempted && ctx.askCompletionQuestion) {
+                const decision = await ctx.askCompletionQuestion(unmet);
+                if (decision.outcome === "continue") {
+                  // The owner answered within the window: resume the SAME session for another
+                  // completion attempt, folding any guidance into the rework follow-up, and RESET
+                  // the completion streak so the next attempt gets a fresh STALL_LIMIT budget. The
+                  // iteration/wall budgets are UNCHANGED — a genuinely exhausted run still routes to
+                  // the hold at the budget checks. No phasePublish and no forge call occur here.
+                  ctx.emit({
+                    kind: "status",
+                    agent: "worker",
+                    payload: {
+                      text: decision.guidance
+                        ? "owner chose to continue with guidance — resuming for another completion attempt"
+                        : "owner chose to continue — resuming for another completion attempt",
+                    },
+                  });
+                  followUp = this.buildCompletionReworkFollowUp(
+                    unmet,
+                    frozenMilestones,
+                    decision.guidance,
+                  );
+                  resetStallState(); // owner input is new input → breaks any #281 refusal streak
+                  lastCompletionFingerprint = undefined;
+                  completionStallStreak = 0;
+                  turn.done = false;
+                  continue;
+                }
+                // decision.outcome === "expired": the window elapsed (or the park was not ACKed) —
+                // fall through to the verified park (M4), exactly like the direct route below. The
+                // window NEVER threw REASON_QUESTION_TIMEOUT; expiry routes here.
+              }
+              // The recoverable completion hold (M4), or the legacy throw when the seam is unwired
+              // (M3 production, and the M4 fallback when askCompletionQuestion is not wired) — and
+              // the "expired" landing from the live window above.
               ctx.emit({
                 kind: "status",
                 agent: "worker",
@@ -3180,6 +3219,11 @@ export class SdkExecutor implements Executor {
   private buildCompletionReworkFollowUp(
     unmet: string[],
     frozen?: Milestone[] | null,
+    // PRD #1226 M5 (D6): the owner's continue-with-guidance direction from the live completion
+    // window. When present it is appended as OWNER DIRECTION (untrusted, like the rest of the
+    // follow-up, folded into the next turn as ordinary user input). Absent on the autonomous
+    // same-session rework (the M3 progress-still-possible branch), which passes only unmet/frozen.
+    ownerGuidance?: string,
   ): string {
     const titleFor = (id: string): string | undefined =>
       frozen?.find((m) => m.id === id)?.title;
@@ -3187,7 +3231,7 @@ export class SdkExecutor implements Executor {
       const t = titleFor(id);
       return t ? `- ${id}: ${t}` : `- ${id}`;
     });
-    return [
+    const base = [
       "Completion check (structural interlock): you signalled done, but the frozen completion",
       "contract still has milestone(s) NOT declared complete:",
       "",
@@ -3196,6 +3240,15 @@ export class SdkExecutor implements Executor {
       "Finish the remaining milestone(s) and declare each complete (report_progress / signal_done),",
       "or record an explicit decision if one genuinely cannot be completed. Do not signal done again",
       "until every frozen milestone above is complete — an incomplete run cannot open its closing PR.",
+    ].join("\n");
+    const guidance = ownerGuidance?.trim();
+    if (!guidance) return base;
+    return [
+      base,
+      "",
+      "The run owner reviewed this completion block and chose to CONTINUE, with direction:",
+      "",
+      guidance,
     ].join("\n");
   }
 

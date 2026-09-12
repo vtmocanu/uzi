@@ -3518,6 +3518,26 @@ export class RunRunner {
       // until #1232, so this seam is inert in production — completionInterlock above is false.
       enterCompletionHold: (reason) =>
         this.enterCompletionHold(flight, claim, reason, runLog),
+      // PRD #1226 M5 (D6): the completion-question LIVE window, wired as a SIBLING to
+      // enterCompletionHold. The executor calls THIS at the completion-STALL point (STALL_LIMIT
+      // identical no-progress completion attempts) INSTEAD of parking straight away — it authors an
+      // awaiting_input question (marked completion_question so the api stamps completion_question_at
+      // and the owner continue-decision endpoint resolves it) and gives the owner a live window
+      // (completion_hold_window_seconds, default 900s) to continue-with-guidance before the run
+      // parks. On expiry (or a park the server won't ACK) it resolves "expired" and the executor
+      // routes to enterCompletionHold (M4) — it NEVER throws a timeout. Inert while the interlock is
+      // rollout-OFF (completionInterlock above is false, so the stall path is never reached in
+      // production). Sources its window from claim.config, exactly like askUser sources its deadline.
+      askCompletionQuestion: (unmet) =>
+        this.askCompletionQuestion(
+          runId,
+          unmet,
+          batcher,
+          steering,
+          reportState,
+          runLog,
+          claim.config ?? null,
+        ),
     };
 
     // PRD #1064 M1: drain the per-run running-report chain before this phase yields control,
@@ -5057,6 +5077,148 @@ export class RunRunner {
       cancel?.();
     }
   }
+
+  /**
+   * PRD #1226 M5 (D6): the completion-interlock LIVE window. Author a completion-question
+   * (awaiting_input, marked `completion_question`), then await the owner's continue decision for up
+   * to the claim's `completion_hold_window_seconds` (default 900s). Called at the completion-STALL
+   * point ONLY (STALL_LIMIT identical no-progress completion attempts), INSTEAD of routing straight
+   * to the hold.
+   *
+   * Deliberately SEPARATE from askUser, not a reuse of it — two things it MUST NOT share:
+   *  - askUser's timeout REJECTS with REASON_QUESTION_TIMEOUT (fail-closed). This window must NEVER
+   *    throw: expiry is a normal outcome that routes to the verified park, so the timer here
+   *    RESOLVES with `{ outcome: "expired" }` instead.
+   *  - askUser's #88 `questionDeadlines`/`questionCounts` bookkeeping. This window is timed by the
+   *    completion-hold config, not the clarification deadline, and its own deadline is local. It
+   *    shares ONLY `openQuestionIds` — the resume-safe question-id map — because a resumed worker
+   *    re-parks on the SAME question id, and clearing it on resolution keeps a later ask_user
+   *    unaffected (mirroring askUser's settle cleanup).
+   *
+   * Resolves `{ outcome: "continue", guidance? }` on an owner ANSWER within the window. The API
+   * delivers the owner continue-decision as an `answer` naming the run's open_question_id, carrying
+   * `["continue"]` (the sentinel) for empty guidance or `[guidance]` otherwise — so a lone
+   * "continue" is treated as no guidance and any other text as guidance. Resolves
+   * `{ outcome: "expired" }` on the window elapsing, on a non-answer verdict (a cancel resolves the
+   * wait too), or when the server would not ACK the park (unable-to-park → the caller parks).
+   */
+  private async askCompletionQuestion(
+    runId: string,
+    unmet: string[],
+    batcher: MessageBatcher,
+    steering: SteeringChannel,
+    reportState: (body: StateRequest) => Promise<unknown>,
+    runLog: Logger,
+    config: ClaimConfig | null,
+  ): Promise<{ outcome: "continue"; guidance?: string } | { outcome: "expired" }> {
+    // Reuse the id this run is already parked on (a resume re-parks on the SAME question); mint one
+    // only for a genuinely new question. Same resume-safe map askUser uses.
+    let questionId = this.openQuestionIds.get(runId);
+    if (questionId === undefined) {
+      questionId = randomUUID();
+      this.openQuestionIds.set(runId, questionId);
+    }
+
+    const milestoneLines = unmet.length
+      ? unmet.map((id) => `- ${id}`).join("\n")
+      : "- (the frozen completion contract is not yet satisfied)";
+    batcher.emit({
+      kind: "question",
+      agent: "lead",
+      payload: {
+        question_id: questionId,
+        questions: [
+          {
+            header: "Completion blocked",
+            question: [
+              "This run is structurally blocked: it signalled done, but the frozen completion",
+              "contract still has milestone(s) not complete, and repeated completion attempts made",
+              "no progress:",
+              "",
+              milestoneLines,
+              "",
+              "Continue with guidance (tell it how to finish), or let it park for a later decision?",
+            ].join("\n"),
+          },
+        ],
+      },
+    });
+    // Durable before the park is announced — same ordering askUser documents.
+    await batcher.flush().catch(() => undefined);
+
+    // Positive ACK, read the PRD #35 way: status === "awaiting_input", NEVER `applied`. A park the
+    // server will not ACK is treated as unable-to-park → "expired" so the caller routes to the hold
+    // (rather than awaiting an answer no surface can produce).
+    const ack = await reportState({
+      status: "awaiting_input",
+      open_question_id: questionId,
+      completion_question: true,
+    });
+    const parked = (ack as { status?: string } | undefined)?.status;
+    if (parked !== "awaiting_input") {
+      this.openQuestionIds.delete(runId);
+      runLog.warn("completion question: park not acknowledged, routing to hold", {
+        run_id: runId,
+        question_id: questionId,
+        status: parked ?? "unreadable",
+      });
+      return { outcome: "expired" };
+    }
+    runLog.info("completion question: awaiting owner continue decision", {
+      run_id: runId,
+      question_id: questionId,
+    });
+
+    // OWN deadline bookkeeping — NOT this.questionDeadlines/questionCounts (those are #88-specific).
+    // The window is sourced from completion_hold_window_seconds (default 900s), NOT
+    // question_timeout_seconds.
+    const windowMs = completionHoldWindowMs(config, COMPLETION_HOLD_WINDOW_DEFAULT_MS);
+    let cancelTimer: (() => void) | undefined;
+    // The timer RESOLVES to expired (it never rejects) — expiry is a normal outcome, so this window
+    // never throws REASON_QUESTION_TIMEOUT.
+    const expiry = new Promise<{ outcome: "expired" }>((resolve) => {
+      cancelTimer = this.setTimer(() => resolve({ outcome: "expired" }), windowMs);
+    });
+    try {
+      const verdict = await Promise.race([
+        steering.awaitAnswer(questionId),
+        expiry,
+      ]);
+      if ("outcome" in verdict) {
+        // The timer fired: the window elapsed with no owner answer → expired (the caller parks). We
+        // stop racing the awaitAnswer (a later answer resolves a promise nobody awaits — harmless,
+        // the run parks and the channel is discarded); the finally clears the timer and the open id.
+        runLog.info("completion question: window expired, routing to hold", {
+          run_id: runId,
+          question_id: questionId,
+        });
+        return { outcome: "expired" };
+      }
+      if (verdict.kind !== "answer") {
+        // A cancel resolves the wait too. Treat any non-answer verdict as expired (park), NEVER
+        // throw — this window has no fail-closed path.
+        return { outcome: "expired" };
+      }
+      // The owner continued. `["continue"]` is the empty-guidance sentinel; any other text is
+      // guidance (the answer is index-aligned with the single question above).
+      const answers = verdict.answers;
+      const guidance =
+        answers.length === 1 && answers[0] === "continue"
+          ? undefined
+          : answers.join("\n").trim() || undefined;
+      runLog.info("completion question: owner chose continue", {
+        run_id: runId,
+        question_id: questionId,
+        has_guidance: guidance !== undefined,
+      });
+      return { outcome: "continue", guidance };
+    } finally {
+      cancelTimer?.();
+      // Drop the open question id (mirrors askUser's settle cleanup) so a later ask_user mints a
+      // fresh id and is unaffected. We do NOT touch questionDeadlines — this window never wrote it.
+      this.openQuestionIds.delete(runId);
+    }
+  }
 }
 
 /** PRD #332 / issue #334 — the `run_usage` lineage-break marker. Tagged onto the
@@ -5139,6 +5301,22 @@ function questionTimeoutMs(
   fallbackMs: number,
 ): number {
   const secs = config?.question_timeout_seconds;
+  return typeof secs === "number" && secs > 0 ? secs * 1000 : fallbackMs;
+}
+
+/** PRD #1226 M5 (D6): the completion-question live-window default, used when the claim omits
+ *  completion_hold_window_seconds (an older server) or sends a non-positive value. 900s = 15m. */
+const COMPLETION_HOLD_WINDOW_DEFAULT_MS = 900_000;
+
+/** The effective completion-question window: the server-configured claim value when present and
+ *  positive, else the worker default. Sibling to questionTimeoutMs but keyed on the DISTINCT
+ *  completion_hold_window_seconds — the completion window and the #88 clarification deadline are
+ *  configured independently (see ClaimConfig). */
+function completionHoldWindowMs(
+  config: ClaimConfig | null,
+  fallbackMs: number,
+): number {
+  const secs = config?.completion_hold_window_seconds;
   return typeof secs === "number" && secs > 0 ? secs * 1000 : fallbackMs;
 }
 
