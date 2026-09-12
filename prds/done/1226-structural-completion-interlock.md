@@ -2,7 +2,7 @@
 
 **Issue:** [#1226](https://github.com/vtmocanu/uzi/issues/1226)
 **Parent epic:** [#1225](https://github.com/vtmocanu/uzi/issues/1225)
-**Status:** Ready for implementation. First child in the #1225 sequence.
+**Status:** Complete (2026-09-12) — M1–M6 landed on `agent/issue-1246`. First child in the #1225 sequence. Rollout stays gated by `completion_interlock_rollout` (off by default; the flip is #1232, per Excluded).
 **Priority:** High.
 **Execution:** Queued for the next Planned sweep with `PRD`, `Planned` and `uzi`. No other #1225 child or #1214 may carry `uzi` while this runs.
 
