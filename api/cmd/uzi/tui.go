@@ -60,6 +60,10 @@ type tuiView int
 const (
 	viewBoard tuiView = iota
 	viewDetail
+	// viewPulls is the forge `pulls` list screen (PRD #1255 M4a). viewCI / the two
+	// drill-ins (viewPR / viewCIRun) land in later milestones; the tab strip already
+	// shows a (never-active) `ci` tab so M4b adds its active state in one place.
+	viewPulls
 )
 
 // ---- messages -------------------------------------------------------------
@@ -216,6 +220,20 @@ type tuiModel struct {
 	view   tuiView
 	board  boardState
 	detail detailState
+	// pulls is the forge `pulls` screen's state (PRD #1255 M4a). It carries its OWN
+	// reqSeq/waitID/tickGen poll-guard counters (a copy of the board's chain, not a share)
+	// so the two lists poll independently.
+	pulls pullsState
+	// repos / repoIdx / repoChosen scope the forge views to one repo at a time (PRD #1255
+	// D2). repos is the viewer's ENABLED repos (from ListRepos); repoIdx is the current one;
+	// R cycles it; repoChosen records whether the default-repo rule has resolved (or the user
+	// has cycled), so the default is computed once rather than on every view entry. reposLoaded
+	// / reposErr drive the "loading…" / can't-load scope states.
+	repos       []apitypes.RepoDTO
+	repoIdx     int
+	repoChosen  bool
+	reposLoaded bool
+	reposErr    error
 	// detailGen counts detail sessions opened from the board; each drill-in stamps the new
 	// detailState.gen from it, so a reply issued under an earlier session (same run reopened)
 	// is rejected by the gen check in the detailRunMsg / detailPageMsg cases.
@@ -308,6 +326,12 @@ func newTUIModel(ctx context.Context, c uzicli.Client, startRun string) tuiModel
 	m.board.reqSeq = 1
 	m.board.waitID = 1
 	m.board.tickGen = 1
+	// The pulls list seeds its tick chain at generation 1 (the Init-armed pulls tick is
+	// honoured) but, UNLIKE the board, no request is in flight at Init: the repo the `pulls`
+	// route needs is not known until ListRepos returns, so reqSeq/waitID start at 0 (idle).
+	// The first fetch is minted by startPullsReq when the user opens the screen, or by the
+	// first tick once repos have loaded (newPullsState).
+	m.pulls = newPullsState()
 	if startRun != "" {
 		m.view = viewDetail
 		m.detail = newDetailState(startRun)
@@ -324,6 +348,10 @@ func newTUIModel(ctx context.Context, c uzicli.Client, startRun string) tuiModel
 func (m tuiModel) initCmds() []tea.Cmd {
 	cmds := []tea.Cmd{m.fetchRunsCmd(m.board.admin, m.board.waitID), m.fetchSecretsCmd(),
 		m.fetchRateLimitsCmd(), m.fetchSettingsCmd(), tickAfter(boardPollInterval, m.board.tickGen), stripTickCmd(),
+		// The forge views' repo scope (PRD #1255 D2) and the `pulls` list's own 10s tick chain.
+		// The tick is armed now but polls the forge only while the pulls screen is in focus
+		// (pullsTickMsg), so an idle board pays no forge cost for it.
+		m.fetchReposCmd(), pullsTickAfter(pullsPollInterval, m.pulls.tickGen),
 		tea.RequestBackgroundColor}
 	if m.skewCheck {
 		cmds = append(cmds, m.fetchBuildInfoCmd(), skewTickCmd())
@@ -698,6 +726,59 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.board.tickGen++
 		return m, tea.Batch(tickAfter(boardTickInterval(m.board.errStreak), m.board.tickGen), m.maybeArmBlink())
 
+	case reposMsg:
+		// The forge views' repo scope (PRD #1255 D2). A failure is recorded (the pulls scope
+		// state explains it) rather than crashing. On success, keep only the ENABLED repos; if
+		// the user is already on the pulls screen, resolve the default repo and fetch now so they
+		// are not stuck on "loading…" until the next 10s tick.
+		m.reposLoaded = true
+		if msg.err != nil {
+			m.reposErr = msg.err
+			return m, nil
+		}
+		m.reposErr = nil
+		m.repos = enabledRepos(msg.repos)
+		if m.view == viewPulls {
+			(&m).resolveDefaultRepo()
+			if m.pulls.waitID == 0 && m.pullsRepoReady() {
+				return m, (&m).startPullsReq()
+			}
+		}
+		return m, nil
+
+	case pullsTickMsg:
+		// Drop a tick from a superseded chain (mirrors the board's tickGen guard).
+		if msg.gen != m.pulls.tickGen {
+			return m, nil
+		}
+		// Keep the chain alive across the cancellable quit modal without polling.
+		if m.quitting {
+			return m, pullsTickAfter(pullsTickInterval(m.pulls.errStreak), m.pulls.tickGen)
+		}
+		// Poll the forge only while the pulls screen is in focus and a repo is selected (the
+		// forge budget is shared with the board poller — D4 — so a background tick does no forge
+		// work), and only when no poll is already outstanding (the in-flight guard). When it DOES
+		// fetch, the reply re-arms the chain (as on the board). When it does NOT, this tick must
+		// re-arm ITSELF — here the fetch is conditional, so the reply is the only OTHER re-arm
+		// site and a non-fetching tick would otherwise let the chain lapse.
+		if m.view == viewPulls && m.pulls.waitID == 0 && m.pullsRepoReady() {
+			return m, (&m).startPullsReq()
+		}
+		return m, pullsTickAfter(pullsTickInterval(m.pulls.errStreak), m.pulls.tickGen)
+
+	case pullsMsg:
+		// Drop a stale/out-of-order reply (mirrors boardRunsMsg): honour only the reply whose
+		// reqID matches the request we are waiting on.
+		if msg.reqID != m.pulls.waitID {
+			return m, nil
+		}
+		m.pulls.waitID = 0
+		m.pulls.apply(msg)
+		// Reschedule AFTER apply updated errStreak so the first retry after a failed poll uses
+		// the backed-off interval; bump tickGen so this chain supersedes any pending tick.
+		m.pulls.tickGen++
+		return m, pullsTickAfter(pullsTickInterval(m.pulls.errStreak), m.pulls.tickGen)
+
 	case blinkTickMsg:
 		if !m.blinkWanted() {
 			// Nothing in progress any more (or the blink is disabled): drop to the static
@@ -992,13 +1073,16 @@ func (m tuiModel) handleKey(k string) (tea.Model, tea.Cmd) {
 	switch m.view {
 	case viewBoard:
 		return m.boardKey(k)
+	case viewPulls:
+		return m.pullsKey(k)
 	default:
 		return m.detailKey(k)
 	}
 }
 
 func (m tuiModel) filtering() bool {
-	return m.view == viewBoard && m.board.filtering
+	return (m.view == viewBoard && m.board.filtering) ||
+		(m.view == viewPulls && m.pulls.filtering)
 }
 
 func (m tuiModel) transcriptWidth() int {
@@ -1023,6 +1107,8 @@ func (m tuiModel) View() tea.View {
 		body = m.renderHelp()
 	case m.view == viewDetail:
 		body = m.renderDetail()
+	case m.view == viewPulls:
+		body = m.renderPulls()
 	default:
 		body = m.renderBoard()
 	}
@@ -1031,7 +1117,7 @@ func (m tuiModel) View() tea.View {
 }
 
 func (m tuiModel) renderHelp() string {
-	lines := helpLines(m.view == viewDetail)
+	lines := helpLines(m.view)
 	return m.pal.title.Render("keybindings") + "\n\n" +
 		strings.Join(lines, "\n") + "\n\n" +
 		m.pal.faint.Render("any key returns")

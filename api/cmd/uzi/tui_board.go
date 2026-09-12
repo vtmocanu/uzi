@@ -285,22 +285,64 @@ func (m tuiModel) boardKey(k string) (tea.Model, tea.Cmd) {
 		m.detailGen++
 		m.detail.gen = m.detailGen
 		return m, tea.Batch(m.loadRunCmd(sel.ID), m.loadTailCmd(sel.ID), m.openStreamCmd(sel.ID))
+	case keyTab, keyViewPulls:
+		// tab / 2 leave the floor for the forge `pulls` list (PRD #1255 D1).
+		return m.gotoPulls()
+	case keyViewCI:
+		return m, nil // the ci screen lands in M4b
 	}
 	return m, nil
+}
+
+// tabStrip builds the wordmark + the floor · pulls · ci tab strip shared by the board
+// and the forge views (PRD #1255 D1): the active screen's tab is tungsten-bold, the rest
+// faint. The active tab is read from m.view, so M4b adds the ci screen's active state in
+// exactly one place. The board's admin sub-mode relabels its own tab "active runs"
+// (AdminListRuns returns non-terminal runs only), keeping the board's wordmark promise.
+// The per-repo forge screens name the scoped repo (D2) after the tabs; the board is
+// cross-repo and names none.
+func (m tuiModel) tabStrip() string {
+	floorLabel := "floor"
+	if m.view == viewBoard && m.board.admin {
+		floorLabel = "active runs"
+	}
+	tabs := []struct {
+		label  string
+		active bool
+	}{
+		{floorLabel, m.view == viewBoard},
+		{"pulls", m.view == viewPulls},
+		{"ci", false}, // the ci screen lands in M4b; shown but never active yet
+	}
+	out := m.pal.title.Render("▚▚ uzi") + m.pal.faint.Render(" · ")
+	for i, t := range tabs {
+		if i > 0 {
+			out += m.pal.faint.Render("  ")
+		}
+		if t.active {
+			out += m.pal.title.Render(t.label)
+		} else {
+			out += m.pal.faint.Render(t.label)
+		}
+	}
+	if m.view == viewPulls {
+		if repo, ok := m.currentRepo(); ok {
+			// PathWithNamespace is forge-authored (D7) → renderer.Plain.
+			out += m.pal.faint.Render("   " + m.renderer.Plain(repo.PathWithNamespace, 40))
+		}
+	}
+	return out
 }
 
 func (m tuiModel) renderBoard() string {
 	var sb strings.Builder
 	rows := m.board.visible()
 
-	// The wordmark, dark and quiet: ▚▚ uzi · <where>. The admin board stays labelled "active
-	// runs" — AdminListRuns returns non-terminal runs only, so promising completed rows would
-	// be a claim the API cannot satisfy.
-	where := "floor"
-	if m.board.admin {
-		where = "active runs"
-	}
-	brand := m.pal.title.Render("▚▚ uzi") + m.pal.faint.Render(" · "+where)
+	// The wordmark is now a tab strip (PRD #1255 D1): ▚▚ uzi · floor  pulls  ci, the active
+	// tab bold. tabStrip relabels the floor tab "active runs" on the admin board (AdminListRuns
+	// returns non-terminal runs only, so promising completed rows would be a claim the API
+	// cannot satisfy).
+	brand := m.tabStrip()
 	if m.board.hideDone && !m.board.admin {
 		brand += m.pal.faint.Render("   active only")
 	}

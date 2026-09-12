@@ -123,6 +123,18 @@ var d7UntrustedFields = []string{
 	// GET /api/version, drawn in the board footer skew banner (boardFooterLine) only inside
 	// cellText(...) before SkewWarning embeds it.
 	"serverVersion",
+	// Forge PullDTO / RepoDTO text drawn on the `pulls` screen (PRD #1255 M4a, D7): the PR
+	// source/target branch and the scoped repo's path are forge-authored free text, drawn
+	// through renderer.Plain (pullRow / pullSecondLine / tabStrip). PullDTO.Title is already
+	// guarded above (shared with Milestone.Title) and is likewise drawn through Plain.
+	"SourceBranch",
+	"TargetBranch",
+	"PathWithNamespace",
+	// WebURL is the PR's forge URL, drawn only as an OSC-8 hyperlink target via oscLink
+	// (pullLink, https-gated). Like IssueWebURL it stays here as a tripwire for any DIRECT
+	// draw; the AST guard does not gate the oscLink path (oscLink is not a recognised writer),
+	// so the hostile-URL render test is the real defence.
+	"WebURL",
 }
 
 // d7Writers are the calls that put a string on the screen. lipgloss's Render is one:

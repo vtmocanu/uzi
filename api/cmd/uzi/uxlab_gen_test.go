@@ -100,6 +100,8 @@ func TestGenerateUXLabFrames(t *testing.T) {
 		"detail-steer-queue":           func(d bool) string { return detailSteerQueue(d, now) },
 		"review-overlay":               func(d bool) string { return reviewOverlay(d, now) },
 		"review-pending":               func(d bool) string { return reviewPending(d, now) },
+		"pulls-populated":              func(d bool) string { return pullsPopulated(d, now) },
+		"pulls-empty":                  func(d bool) string { return pullsEmpty(d, now) },
 		"help":                         helpFrame,
 		"quit":                         quitFrame,
 	}
@@ -611,6 +613,33 @@ func reviewPending(dark bool, now time.Time) string {
 	m = applyDetail(m, run, laneMsgs(now))
 	m = key(m, "v")
 	m = step(m, reviewLoadedMsg{runID: detailRunID, review: nil, pendingJudge: &apitypes.PendingJudgeDTO{State: "running", EnqueuedAt: now.Add(-30 * time.Second)}})
+	return m.View().Content
+}
+
+// ---- pulls fixtures -------------------------------------------------------
+
+// pullsPopulated renders the forge `pulls` list (PRD #1255 M4a) with a realistic spread of
+// open PRs across the three bands (NEEDS YOU / IN FLIGHT / READY), scoped to one enabled repo.
+func pullsPopulated(dark bool, now time.Time) string {
+	repo := apitypes.RepoDTO{ID: "r1", PathWithNamespace: "vtmocanu/uzi", Enabled: true,
+		WebURL: "https://github.com/vtmocanu/uzi"}
+	fake := &uzicli.FakeClient{Repos: []apitypes.RepoDTO{repo}, PullsResult: samplePulls(now)}
+	m := uxModel(fake, "", dark)
+	m = step(m, reposMsg{repos: fake.Repos})
+	m = key(m, keyViewPulls)
+	m = step(m, pullsMsg{reqID: m.pulls.waitID, pulls: samplePulls(now)})
+	return m.View().Content
+}
+
+// pullsEmpty renders the `pulls` list for a repo with no open PRs (the centered empty state).
+func pullsEmpty(dark bool, now time.Time) string {
+	repo := apitypes.RepoDTO{ID: "r1", PathWithNamespace: "vtmocanu/uzi", Enabled: true,
+		WebURL: "https://github.com/vtmocanu/uzi"}
+	fake := &uzicli.FakeClient{Repos: []apitypes.RepoDTO{repo}}
+	m := uxModel(fake, "", dark)
+	m = step(m, reposMsg{repos: fake.Repos})
+	m = key(m, keyViewPulls)
+	m = step(m, pullsMsg{reqID: m.pulls.waitID, pulls: nil})
 	return m.View().Content
 }
 
