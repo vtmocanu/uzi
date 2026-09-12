@@ -1260,7 +1260,10 @@ choices.
   description, elapsed), a reviews summary and the merge blocked-reason. `--json`
   emits the full detail object. `--watch` re-fetches on a fixed cadence and **exits 0
   once no check is still pending** (every check settled); a transient 429/5xx during
-  the watch prints one stderr line, backs off, and keeps going.
+  the watch prints one stderr line, backs off, and keeps going. Caveat: "no checks
+  reported" also counts as settled, so `--watch` exits 0 immediately on a just-opened
+  PR whose CI has not registered its first check yet; wait for the first check to
+  appear before relying on a `--watch` result.
 - `uzi ci list [--repo <repo-id>] [--limit <n>]` — the repo's recent CI runs
   (workflow/pipeline) newest-first: `<name> #<number>`, event, branch, status,
   elapsed, title. `--json` emits the array. On a forge version without the runs

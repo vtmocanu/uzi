@@ -771,7 +771,10 @@ you always know which repo you're looking at. Get repo ids from `uzi repo list`.
   and re-prints on a fixed cadence and **exits 0 the moment no check is still
   pending** — the scriptable "wait for CI to settle" primitive. A transient
   rate-limit (`429`) or server blip during a watch prints one line to stderr,
-  backs off (honouring the server's `Retry-After`), and keeps watching.
+  backs off (honouring the server's `Retry-After`), and keeps watching. Caveat:
+  a PR with **no checks reported** counts as settled, so `--watch` exits 0
+  immediately on a just-opened PR whose CI has not registered its first check
+  yet; wait for that first check to appear before a script trusts the result.
 - **`uzi ci list`** shows the repo's recent workflow/pipeline runs
   (`<name> #<number>`, event, branch, status, elapsed, title), newest first;
   `--limit <n>` bounds the page (server default 30, capped at 100). On a forge

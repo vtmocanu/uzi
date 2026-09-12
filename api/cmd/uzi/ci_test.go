@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -79,6 +80,60 @@ func TestCIJobsTable(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("jobs table missing %q:\n%s", want, out)
 		}
+	}
+}
+
+// --json for `ci jobs` emits ONE CIRunDetailDTO object; decode the captured stdout
+// and assert the jobs / steps shape survives the marshal, so a DTO decode-shape
+// regression (a dropped/renamed json tag, or a lost nested steps slice) reddens.
+func TestCIJobsJSON(t *testing.T) {
+	fc := &uzicli.FakeClient{
+		CIRunDetailResult: apitypes.CIRunDetailDTO{
+			CIRunDTO: apitypes.CIRunDTO{ID: 42, Name: "CI", Number: 1039},
+			Jobs: []apitypes.CIJobDTO{{
+				Name:   "build",
+				Status: "completed",
+				Steps: []apitypes.CIStepDTO{
+					{Name: "checkout", Status: "completed", Conclusion: "success"},
+				},
+			}},
+		},
+	}
+	out, _, code := runCLI(t, fakeEnv(fc), "ci", "jobs", "42", "--repo", "r1", "--json")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	var got apitypes.CIRunDetailDTO
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("decode --json CIRunDetailDTO: %v\n%s", err, out)
+	}
+	if got.ID != 42 {
+		t.Errorf("run id = %d, want 42", got.ID)
+	}
+	if len(got.Jobs) != 1 || got.Jobs[0].Name != "build" {
+		t.Fatalf("jobs did not survive the marshal: %+v", got.Jobs)
+	}
+	if len(got.Jobs[0].Steps) != 1 || got.Jobs[0].Steps[0].Name != "checkout" || got.Jobs[0].Steps[0].Conclusion != "success" {
+		t.Errorf("nested steps did not survive the marshal: %+v", got.Jobs[0].Steps)
+	}
+}
+
+// With no --repo and ZERO enabled repos, `ci list` is a usage error (exit 2) and
+// makes no forge read — the ci-side proof of resolveRepo's zero-enabled branch,
+// asserting ListCIRuns is untouched.
+func TestCIListZeroEnabledIsExit2(t *testing.T) {
+	fc := &uzicli.FakeClient{
+		Repos: []apitypes.RepoDTO{{ID: "disabled", Enabled: false}},
+	}
+	_, errOut, code := runCLI(t, fakeEnv(fc), "ci", "list")
+	if code != uzicli.ExitUsage {
+		t.Fatalf("exit = %d, want %d (usage)", code, uzicli.ExitUsage)
+	}
+	if fc.ListCIRunsCalls != 0 {
+		t.Errorf("ListCIRuns called %d times, want 0 (no enabled repo must not read the forge)", fc.ListCIRunsCalls)
+	}
+	if !strings.Contains(errOut, "no enabled repositories") {
+		t.Errorf("exit-2 message missing the 'no enabled repositories' guidance:\n%s", errOut)
 	}
 }
 
