@@ -702,6 +702,27 @@ chain in the diagram above, with no intervening `running`.
   and the guards that must not be relaxed — that a future edit could break
   silently.
 
+- **running → paused (structural completion hold)** ([PRD #1226](prds/1226-structural-completion-interlock.md),
+  rollout switch `completion_interlock_rollout`, default off). A distinct reason a
+  run reaches `paused`, separate from an owner pause: an **interlocked** issue run
+  (a versioned, frozen structural completion contract stamped before its first
+  claim) that signals done with a frozen milestone still undeclared is checkpointed
+  and returned to the **same lead session** first — no forge call happens while
+  anything is unmet. Only after repeated no-progress does the worker capture a
+  verified same-worker restore point and call the dedicated `SetRunCompletionHold`
+  transition (a sibling of `SetRunPaused`, not a widening of it) requiring a
+  positive `paused` acknowledgement before releasing anything. Only a worker that
+  self-reports the `completion_interlock_v1` protocol capability can claim an
+  interlocked run at all — a **non-bypassable** `ClaimRun` clause deliberately
+  outside `required_capabilities`, `ClearRunRequiredCapabilities` and the
+  `capability_aware` kill-switch below. A claim-fenced permit bound to the exact
+  final head gates every `Closes #N`. The owner's only decision today is
+  continue-with-guidance (`uzi run decide <id> --continue`); provider-context
+  durability is honestly `same_worker_only`. See
+  [docs/run-completion-hold.md](docs/run-completion-hold.md) and
+  [adr/1225-structural-completion-interlock-invariants.md](adr/1225-structural-completion-interlock-invariants.md)
+  for the negative-space invariants a future edit could break silently.
+
 - **Affinity holds through a worker roll** ([PRD #1030](prds/done/1030-worker-resume-durability.md)).
   The fix distinguishes a **roll** (sets `draining_since`, keeps the worker row)
   from a **teardown** (deletes the row API-side), so `teardown ⟺ row absent` and
@@ -775,6 +796,12 @@ chain in the diagram above, with no intervening `running`.
   mismatched run degrades to the pre-#84 mid-run failure) while the pre-existing
   docker-worker→repo-allowlist enforcement (PRD #83/#89, `docker_repo_allowlist`)
   is unaffected. See [docs/capability-scheduling.md](docs/capability-scheduling.md).
+  **The structural completion interlock's `completion_interlock_v1` claim clause
+  (PRD #1226) is a separate, non-bypassable predicate outside this whole
+  mechanism** — neither the `capability_aware` kill-switch nor an owner's
+  required-capability override can authorize a worker that does not implement the
+  completion protocol. See
+  [adr/1225-structural-completion-interlock-invariants.md](adr/1225-structural-completion-interlock-invariants.md).
 - **Ephemeral, run-bound hosted workers** (PRD #529, second trigger PRD #747): on
   an unmet capability with zero eligible workers, or (debounced) a saturated fleet,
   an opted-in owner gets ONE auto-provisioned hosted worker, and only while the admin instance kill-switch (`EphemeralWorkersEnabled`) is on
