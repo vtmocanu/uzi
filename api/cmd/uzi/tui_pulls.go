@@ -137,6 +137,15 @@ func (p *pullsState) apply(msg pullsMsg) {
 	p.clampCursor()
 }
 
+// resetForRepoChange drops the cached rows, cursor, scroll and loaded flag so the screen reads
+// "loading…" under the new repo rather than flashing the prior repo's PRs. It is called on BOTH
+// list states when the SHARED repoIdx cycles (R), since the pulls and ci screens scope to the
+// same repo and both caches go stale the instant it changes.
+func (p *pullsState) resetForRepoChange() {
+	p.cursor, p.scroll = 0, 0
+	p.pulls, p.loaded = nil, false
+}
+
 func (p *pullsState) clampCursor() {
 	n := len(p.visible())
 	if p.cursor >= n {
@@ -407,13 +416,15 @@ func (m tuiModel) pullsKey(k string) (tea.Model, tea.Cmd) {
 		return m, nil
 	case keyRepoCycle:
 		// R cycles the enabled repos (D2); hidden from the legend when only one is enabled, so
-		// this is a no-op then. The choice persists for the session (repoChosen). The old repo's
-		// pulls are cleared so the new repo reads "loading…" rather than flashing stale rows.
+		// this is a no-op then. The choice persists for the session (repoChosen) and is SHARED
+		// with the ci screen — so BOTH caches go stale the instant repoIdx changes. Clear them
+		// both (the ci screen would otherwise render repo A's runs under repo B's header on its
+		// next visit, until its own poll lands), then refetch only the CURRENT (pulls) screen.
 		if len(m.repos) > 1 {
 			m.repoIdx = (m.repoIdx + 1) % len(m.repos)
 			m.repoChosen = true
-			m.pulls.cursor, m.pulls.scroll = 0, 0
-			m.pulls.pulls, m.pulls.loaded = nil, false
+			m.pulls.resetForRepoChange()
+			m.ci.resetForRepoChange()
 			return m, (&m).startPullsReq()
 		}
 		return m, nil

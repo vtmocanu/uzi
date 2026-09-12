@@ -139,6 +139,15 @@ func (c *ciState) apply(msg ciMsg) {
 	c.clampCursor()
 }
 
+// resetForRepoChange drops the cached rows, cursor, scroll, loaded flag and unsupported sentence
+// so the screen reads "loading…" under the new repo rather than flashing the prior repo's runs.
+// It is called on BOTH list states when the SHARED repoIdx cycles (R), since the ci and pulls
+// screens scope to the same repo and both caches go stale the instant it changes.
+func (c *ciState) resetForRepoChange() {
+	c.cursor, c.scroll = 0, 0
+	c.runs, c.loaded, c.unsupported = nil, false, ""
+}
+
 func (c *ciState) clampCursor() {
 	n := len(c.visible())
 	if c.cursor >= n {
@@ -268,26 +277,70 @@ func ciTextOf(r apitypes.CIRunDTO) ciRowText {
 // ---- render ---------------------------------------------------------------
 
 // Fixed column widths for a ci row. The title takes what remains; narrow terminals drop the
-// branch column, right-to-left before the title, like the board.
+// optional columns right-to-left before the title, like the board.
 const (
-	ciNameWidth      = 14 // `<Name> #<Number>`
-	ciEventWidth     = 12 // event
-	ciBranchWidth    = 16 // branch
-	ciStatusWidth    = 8  // forgeState word (running / queued / passed / failed / done)
-	ciElapsedWidth   = 6  // ciRunElapsed duration
-	ciTitleMax       = 44 // title cap, so a long title does not run a wide terminal
-	ciRightWidth     = 11 // the `▰▱ done/total` jobs micro-bar, or the run age
-	ciSHAWidth       = 12 // short sha on the selected row's second line
-	ciBranchMinWidth = 94 // below this the branch column drops so the title is never squeezed
-	ciJobBarCells    = 5  // glyph cells in the jobs micro-bar (above this it scales; the count text carries the numbers)
+	ciNameWidth    = 14 // `<Name> #<Number>`
+	ciEventWidth   = 12 // event
+	ciBranchWidth  = 16 // branch
+	ciStatusWidth  = 8  // forgeState word (running / queued / passed / failed / done)
+	ciElapsedWidth = 6  // ciRunElapsed duration
+	ciTitleMin     = 10 // narrowest title a row ever draws; below this the row clampVisual's
+	ciTitleMax     = 44 // title cap, so a long title does not run a wide terminal
+	ciRightWidth   = 11 // the `▰▱ done/total` jobs micro-bar, or the run age
+	ciSHAWidth     = 12 // short sha on the selected row's second line
+	ciJobBarCells  = 5  // glyph cells in the jobs micro-bar (above this it scales; the count text carries the numbers)
 )
 
-func ciRowPrefixWidth(branch bool) int {
-	// cursor(1)+spine(1)+glyph(1)+space(1), then two-space gaps around the name/event/status/
-	// elapsed cells, plus the branch cell when shown.
-	w := 4 + ciNameWidth + 2 + ciEventWidth + 2 + ciStatusWidth + 2 + ciElapsedWidth + 2
-	if branch {
+// ciCols is the set of OPTIONAL columns a ci row draws at a given terminal width. As the
+// terminal narrows the columns are shed right-to-left before the title — branch first, then
+// event, then the status+elapsed pair, then the right cell last — so a narrow terminal degrades
+// gracefully (drops columns) instead of overflowing m.width and wrapping, which would corrupt
+// every row below it. The name cell and the title are never dropped (the title clamps instead),
+// and ciRow's final clampVisual is the ultimate backstop below the narrowest tier.
+type ciCols struct {
+	branch        bool
+	event         bool
+	statusElapsed bool
+	right         bool
+}
+
+// ciColumnsFor picks the richest column set that still leaves room for the title floor (and the
+// reserved right cell) at width w, dropping columns in the order above. It mirrors the board /
+// pulls pattern of dropping columns before squeezing the title.
+func ciColumnsFor(w int) ciCols {
+	c := ciCols{branch: true, event: true, statusElapsed: true, right: true}
+	for _, drop := range []*bool{&c.branch, &c.event, &c.statusElapsed, &c.right} {
+		if ciRowLayoutWidth(c) <= w {
+			return c
+		}
+		*drop = false
+	}
+	return c
+}
+
+// ciRowLayoutWidth is the width a row with column set c needs to hold its prefix, the title
+// floor, and the reserved right cell (with its 2-col gap) when shown — the fit test ciColumnsFor
+// degrades against.
+func ciRowLayoutWidth(c ciCols) int {
+	w := ciRowPrefixWidth(c) + ciTitleMin
+	if c.right {
+		w += ciRightWidth + 2
+	}
+	return w
+}
+
+func ciRowPrefixWidth(c ciCols) int {
+	// cursor(1)+spine(1)+glyph(1)+space(1), the name cell + its trailing gap, then the event,
+	// branch and status+elapsed cells + their trailing gaps when shown.
+	w := 4 + ciNameWidth + 2
+	if c.event {
+		w += ciEventWidth + 2
+	}
+	if c.branch {
 		w += ciBranchWidth + 2
+	}
+	if c.statusElapsed {
+		w += ciStatusWidth + 2 + ciElapsedWidth + 2
 	}
 	return w
 }
@@ -333,7 +386,7 @@ func (m tuiModel) renderCI() string {
 		for i := start; i < end; i++ {
 			switch it := items[i]; it.kind {
 			case biEyebrow:
-				sb.WriteString(m.ciEyebrow(it) + "\n")
+				sb.WriteString(clampVisual(m.ciEyebrow(it), m.width) + "\n")
 			case biRow:
 				r := rows[it.runIdx]
 				sel := it.runIdx == m.ci.cursor
@@ -419,6 +472,7 @@ func (m tuiModel) ciRow(r apitypes.CIRunDTO, sel bool) string {
 	band := ciBand(r)
 	t := ciTextOf(r)
 	glyph, glyphC := m.ciGlyph(r)
+	cols := ciColumnsFor(m.width)
 
 	var bg color.Color
 	if sel {
@@ -450,33 +504,46 @@ func (m tuiModel) ciRow(r apitypes.CIRunDTO, sel bool) string {
 		paintSeg(nil, bg, false, " ") +
 		m.ciLink(r, nameCell) + gap
 
-	row += paintSeg(m.pal.faintC, bg, false, padCell(m.renderer.Plain(t.eventName, ciEventWidth), ciEventWidth)) + gap
-
-	showBranch := m.width >= ciBranchMinWidth
-	if showBranch {
+	if cols.event {
+		row += paintSeg(m.pal.faintC, bg, false, padCell(m.renderer.Plain(t.eventName, ciEventWidth), ciEventWidth)) + gap
+	}
+	if cols.branch {
 		row += paintSeg(m.pal.faintC, bg, false, padCell(m.renderer.Plain(t.runBranch, ciBranchWidth), ciBranchWidth)) + gap
 	}
+	if cols.statusElapsed {
+		// Status word (mirror the CLI's forgeState vocabulary). forgeState can echo an unknown forge
+		// status verbatim, so it is sanitized through renderer.Plain before drawing.
+		row += paintSeg(m.pal.faintC, bg, false, padCell(m.renderer.Plain(forgeState(r.Status, r.Conclusion), ciStatusWidth), ciStatusWidth)) + gap
+		row += paintSeg(m.pal.faintC, bg, false, padCell(ciRunElapsed(r), ciElapsedWidth)) + gap
+	}
 
-	// Status word (mirror the CLI's forgeState vocabulary). forgeState can echo an unknown forge
-	// status verbatim, so it is sanitized through renderer.Plain before drawing.
-	row += paintSeg(m.pal.faintC, bg, false, padCell(m.renderer.Plain(forgeState(r.Status, r.Conclusion), ciStatusWidth), ciStatusWidth)) + gap
-
-	row += paintSeg(m.pal.faintC, bg, false, padCell(ciRunElapsed(r), ciElapsedWidth)) + gap
-
-	avail := m.width - ciRowPrefixWidth(showBranch) - (ciRightWidth + 2)
-	if avail < 10 {
-		avail = 10
+	rightReserve := 0
+	if cols.right {
+		rightReserve = ciRightWidth + 2
+	}
+	avail := m.width - ciRowPrefixWidth(cols) - rightReserve
+	if avail < ciTitleMin {
+		avail = ciTitleMin
 	}
 	if avail > ciTitleMax {
 		avail = ciTitleMax
 	}
 	row += paintSeg(m.ciTitleColor(band, sel), bg, false, clampVisual(m.renderer.Plain(t.runTitle, avail), avail))
 
-	// The right cell (jobs micro-bar or age) is flushed to the board's right edge, aligned in a
-	// fixed cell so the title width stays stable down the list (the board pattern).
-	row = padSeg(row, m.width-ciRightWidth, bg)
-	row += padSeg(m.ciRightCell(r, band, bg), ciRightWidth, bg)
-	return row
+	if cols.right {
+		// The right cell (jobs micro-bar or age) is flushed to the right edge, aligned in a fixed
+		// cell so the title width stays stable down the list (the board pattern). clampVisual caps
+		// it to its reserved width so a wide cell (e.g. a ≥100-job `done/total`) can never overrun.
+		row = padSeg(row, m.width-ciRightWidth, bg)
+		row += padSeg(clampVisual(m.ciRightCell(r, band, bg), ciRightWidth), ciRightWidth, bg)
+	} else if sel {
+		// No right cell at this width: still span the warm selection bar to the full width.
+		row = padSeg(row, m.width, bg)
+	}
+	// Final backstop: no rendered row may exceed the terminal width at ANY width — below the
+	// narrowest column tier the name cell + title floor alone can overrun, so clamp unconditionally
+	// rather than let the terminal wrap the row and corrupt every row beneath it.
+	return clampVisual(row, m.width)
 }
 
 // ciGlyph is the row's spine glyph + colour, by Tone of the effective status (D3/D8): ● running,
@@ -524,9 +591,10 @@ func (m tuiModel) ciRightCell(r apitypes.CIRunDTO, band int, bg color.Color) str
 
 // ciJobBar renders the running-row jobs progress as a ▰/▱ micro-bar (the milestoneMarker
 // vocabulary, tui_board_rows.go) that ALWAYS keeps its `done/total` count text (D8) — unlike the
-// board's milestoneMarker, which drops the count below boardMileCap. The glyph cells are capped
-// at ciJobBarCells (proportionally filled above that) so a run with many jobs cannot blow the
-// cell; the count text carries the real numbers.
+// board's milestoneMarker, which drops the count below boardMileCap. The count carries the real
+// numbers and is reserved FIRST so it is never the field cut; the glyph cells then take whatever
+// of ciRightWidth remains (capped at ciJobBarCells, proportionally filled), so a run with many
+// jobs — e.g. `▰▱ 100/200` — cannot blow the fixed right cell (padSeg never truncates).
 func (m tuiModel) ciJobBar(done, total int, bg color.Color) string {
 	if done < 0 {
 		done = 0
@@ -534,14 +602,25 @@ func (m tuiModel) ciJobBar(done, total int, bg color.Color) string {
 	if done > total {
 		done = total
 	}
-	cells, filled := total, done
+	count := " " + itoa(done) + "/" + itoa(total)
+	// Fit the glyph cells into what the count leaves of the reserved right-cell width.
+	cells := total
 	if cells > ciJobBarCells {
 		cells = ciJobBarCells
-		filled = done * ciJobBarCells / total
+	}
+	if budget := ciRightWidth - visualWidth(count); cells > budget {
+		cells = budget
+	}
+	if cells < 0 {
+		cells = 0
+	}
+	filled := done
+	if total > cells {
+		filled = done * cells / total
 	}
 	bar := paintSeg(m.pal.tungsten, bg, false, strings.Repeat("▰", filled)) +
 		paintSeg(m.pal.faintC, bg, false, strings.Repeat("▱", cells-filled))
-	return bar + paintSeg(m.pal.faintC, bg, false, " "+itoa(done)+"/"+itoa(total))
+	return bar + paintSeg(m.pal.faintC, bg, false, count)
 }
 
 // ciSecondLine is the selected row's faint detail line (D3): only what the LIST CIRunDTO carries
@@ -750,13 +829,14 @@ func (m tuiModel) ciKey(k string) (tea.Model, tea.Cmd) {
 	case keyRepoCycle:
 		// R cycles the enabled repos (D2); hidden from the legend when only one is enabled, so this
 		// is a no-op then. The choice persists for the session (repoChosen) and is SHARED with the
-		// pulls screen. The old repo's runs are cleared so the new repo reads "loading…" rather than
-		// flashing stale rows.
+		// pulls screen — so BOTH caches go stale the instant repoIdx changes. Clear them both (the
+		// pulls screen would otherwise render repo A's PRs under repo B's header on its next visit,
+		// until its own poll lands), then refetch only the CURRENT (ci) screen.
 		if len(m.repos) > 1 {
 			m.repoIdx = (m.repoIdx + 1) % len(m.repos)
 			m.repoChosen = true
-			m.ci.cursor, m.ci.scroll = 0, 0
-			m.ci.runs, m.ci.loaded, m.ci.unsupported = nil, false, ""
+			m.ci.resetForRepoChange()
+			m.pulls.resetForRepoChange()
 			return m, (&m).startCIReq()
 		}
 		return m, nil

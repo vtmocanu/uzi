@@ -368,6 +368,92 @@ func TestTUICIFilterSwallowsQuit(t *testing.T) {
 	}
 }
 
+// (width) No rendered ci line — header, sub-header, eyebrow, row, selected row's second line, or
+// footer — may ever exceed the terminal width. A line wider than m.width is wrapped by the
+// terminal and corrupts every row beneath it, so the row must DROP columns right-to-left and
+// clampVisual as a backstop instead (the narrow-width rework). The fixture carries a ≥100-job
+// running row so the `▰▱ done/total` right cell is exercised at its widest (fix #2). This test
+// FAILS on the pre-rework ciRow at width 70 (and at 100 for the 100/200 right cell) and passes
+// after the fix — sanity-check both directions.
+func TestTUICIRowsNeverExceedWidth(t *testing.T) {
+	now := time.Now()
+	runs := append(sampleCIRuns(now),
+		// A ≥100-job run: "▰▱ 100/200" is ~13 visual cols against the ~11-col right cell, and padSeg
+		// only pads up (never truncates), so this overran the cell before the fit/clamp fix. Its long
+		// title would also overrun a narrow row if the row were not clamped.
+		apitypes.CIRunDTO{ID: 2048, Name: "matrix", Number: 2048, Event: "pull_request",
+			Branch: "agent/issue-9999", SHA: "abcdef012345", Status: "in_progress",
+			Title: "A deliberately long CI run title that would overrun a narrow terminal unless the row is clamped",
+			Actor: "uzi-bot", WebURL: "https://github.com/vtmocanu/uzi/actions/runs/2048",
+			StartedAt: now.Add(-9 * time.Minute), CreatedAt: now.Add(-9 * time.Minute), UpdatedAt: now,
+			JobsDone: 100, JobsTotal: 200})
+	fake := &uzicli.FakeClient{Repos: []apitypes.RepoDTO{oneRepo()}, CIRunsResult: runs}
+	m := loadedCI(t, fake, runs)
+
+	for _, w := range []int{100, 84, 76, 73, 70, 60, 40} {
+		m.width = w
+		for _, line := range strings.Split(m.View().Content, "\n") {
+			if got := visualWidth(line); got > w {
+				t.Errorf("at width %d a ci line is %d cols wide — it overflows and will wrap, corrupting the rows below:\n%q",
+					w, got, line)
+			}
+		}
+	}
+}
+
+// (repo-cycle clears siblings) R cycles the SHARED repo scope, so it must invalidate BOTH list
+// screens' cached rows — not just the one in focus — or the sibling briefly renders the prior
+// repo's rows under the new repo's header until its next poll. An R on the ci screen clears the
+// pulls cache; an R on the pulls screen clears the ci cache.
+func TestTUIRepoCycleClearsBothListCaches(t *testing.T) {
+	now := time.Now()
+	repoA := apitypes.RepoDTO{ID: "ra", PathWithNamespace: "org/alpha", Enabled: true, WebURL: "https://x/alpha"}
+	repoB := apitypes.RepoDTO{ID: "rb", PathWithNamespace: "org/bravo", Enabled: true, WebURL: "https://x/bravo"}
+	fake := &uzicli.FakeClient{Repos: []apitypes.RepoDTO{repoA, repoB},
+		CIRunsResult: sampleCIRuns(now), PullsResult: samplePulls(now)}
+
+	// Load BOTH list screens' caches for the first repo: pulls first, then ci.
+	m := tuiTestModel(t, fake, "")
+	next, _ := m.Update(reposMsg{repos: fake.Repos})
+	m = next.(tuiModel)
+	m = press(t, m, keyViewPulls)
+	next, _ = m.Update(pullsMsg{reqID: m.pulls.waitID, pulls: samplePulls(now)})
+	m = next.(tuiModel)
+	m = press(t, m, keyViewCI)
+	next, _ = m.Update(ciMsg{reqID: m.ci.waitID, runs: sampleCIRuns(now)})
+	m = next.(tuiModel)
+	if len(m.pulls.pulls) == 0 || len(m.ci.runs) == 0 {
+		t.Fatalf("setup: both caches should be populated (pulls=%d ci=%d)", len(m.pulls.pulls), len(m.ci.runs))
+	}
+
+	// R on the ci screen clears the SIBLING pulls cache (rows + cursor + scroll + loaded), so the
+	// pulls screen reads "loading…" under the new repo rather than flashing the prior repo's PRs.
+	m = press(t, m, keyRepoCycle)
+	if m.pulls.pulls != nil || m.pulls.loaded || m.pulls.cursor != 0 || m.pulls.scroll != 0 {
+		t.Errorf("R on the ci screen did not clear the sibling pulls cache (rows=%d loaded=%v cursor=%d scroll=%d)",
+			len(m.pulls.pulls), m.pulls.loaded, m.pulls.cursor, m.pulls.scroll)
+	}
+	// Its own (ci) cache is cleared too — the current screen is refetched.
+	if m.ci.runs != nil || m.ci.loaded {
+		t.Errorf("R on the ci screen did not clear its own ci cache (rows=%d loaded=%v)", len(m.ci.runs), m.ci.loaded)
+	}
+
+	// Reload both for the new repo, switch to pulls, and R there: it must clear the ci cache.
+	next, _ = m.Update(ciMsg{reqID: m.ci.waitID, runs: sampleCIRuns(now)})
+	m = next.(tuiModel)
+	m = press(t, m, keyViewPulls)
+	next, _ = m.Update(pullsMsg{reqID: m.pulls.waitID, pulls: samplePulls(now)})
+	m = next.(tuiModel)
+	if len(m.pulls.pulls) == 0 || len(m.ci.runs) == 0 {
+		t.Fatalf("setup (second repo): both caches should be populated again (pulls=%d ci=%d)", len(m.pulls.pulls), len(m.ci.runs))
+	}
+	m = press(t, m, keyRepoCycle)
+	if m.ci.runs != nil || m.ci.loaded || m.ci.cursor != 0 || m.ci.scroll != 0 {
+		t.Errorf("R on the pulls screen did not clear the sibling ci cache (rows=%d loaded=%v cursor=%d scroll=%d)",
+			len(m.ci.runs), m.ci.loaded, m.ci.cursor, m.ci.scroll)
+	}
+}
+
 // (nav) 3 jumps to the ci screen from the floor, R cycles the scoped repo, and esc returns to the
 // floor (D1, D2).
 func TestTUICINavAndRepoCycle(t *testing.T) {
