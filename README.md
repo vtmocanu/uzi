@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img src=".github/readme/uzi-hero.jpg" width="640"
+  <img src=".github/readme/uzi-hero.jpg" width="100%"
        alt="A dark factory corridor: a white-backlit uzi sign reading 'Specs in. Pull requests out.', a white humanoid robot labelled 'Lead' overseeing the floor with a tablet, and a conveyor of robotic arms assembling glowing amber code crates past a night skyline">
 </p>
 
