@@ -17,7 +17,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // TestMergeStateDTO pins the fixed BlockedReason priority (conflicts → changes
@@ -197,4 +200,63 @@ func TestForgeRetryAfterSeconds(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestForgeMemoPrefixIsolatesTenants pins the ONE invariant that keeps the forge-view
+// memo from leaking across tenants: forgeMemoPrefix must yield a DISTINCT prefix whenever
+// the connection identity or repo changes, because singleflight collapses concurrent
+// misses on a single key — an under-scoped prefix would serve connection A's data to B.
+// It also confirms determinism (identical rows share one prefix, else co-polling clients
+// never share a load) and that the RAW sealed ciphertext never lands in the key (only its
+// sha256). DB-free: forgeMemoPrefix is a pure function of three GetRepoForUserRow fields.
+func TestForgeMemoPrefixIsolatesTenants(t *testing.T) {
+	connA, connB := uuid.New(), uuid.New()
+	repoA, repoB := uuid.New(), uuid.New()
+	// Recognizable, non-token-shaped markers so the "raw ciphertext absent from the key"
+	// assertion below is meaningful (the key hex-encodes only the sha256, never these bytes).
+	ctA := []byte("SEALED-CIPHERTEXT-TENANT-A")
+	ctB := []byte("SEALED-CIPHERTEXT-TENANT-B")
+
+	base := store.GetRepoForUserRow{ConnectionID: connA, TokenCiphertext: ctA, ID: repoA}
+
+	t.Run("differs on ConnectionID alone", func(t *testing.T) {
+		other := base
+		other.ConnectionID = connB
+		if forgeMemoPrefix(base) == forgeMemoPrefix(other) {
+			t.Fatalf("two connections must not share a memo prefix (connID is the tenant boundary)")
+		}
+	})
+
+	t.Run("differs on TokenCiphertext alone (PAT rotation)", func(t *testing.T) {
+		rotated := base
+		rotated.TokenCiphertext = ctB
+		if forgeMemoPrefix(base) == forgeMemoPrefix(rotated) {
+			t.Fatalf("a rotated PAT (new sealed ciphertext) must yield a fresh prefix so it misses the old tenant's entries")
+		}
+	})
+
+	t.Run("differs on repo ID alone", func(t *testing.T) {
+		other := base
+		other.ID = repoB
+		if forgeMemoPrefix(base) == forgeMemoPrefix(other) {
+			t.Fatalf("PR #5 on repo A must not collide with PR #5 on repo B")
+		}
+	})
+
+	t.Run("identical rows yield the same prefix (determinism)", func(t *testing.T) {
+		same := store.GetRepoForUserRow{
+			ConnectionID:    connA,
+			TokenCiphertext: append([]byte(nil), ctA...), // distinct backing array, same bytes
+			ID:              repoA,
+		}
+		if forgeMemoPrefix(base) != forgeMemoPrefix(same) {
+			t.Fatalf("identical (connID, ciphertext, repoID) must map to one prefix, else co-polling clients never share a load")
+		}
+	})
+
+	t.Run("raw token ciphertext never appears in the prefix", func(t *testing.T) {
+		if strings.Contains(forgeMemoPrefix(base), string(ctA)) {
+			t.Fatalf("the raw sealed ciphertext must not leak into the memo key (only its sha256)")
+		}
+	})
 }

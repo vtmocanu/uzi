@@ -168,11 +168,19 @@ func (h *Handler) ListPulls(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
+	// loadCtx detaches the memoized forge loads from the REQUEST's cancellation
+	// (context.WithoutCancel, Go 1.21+): singleflight collapses N co-polling clients onto
+	// ONE shared load, so if the leader disconnects mid-load its r.Context() cancellation
+	// would otherwise surface as context.Canceled to a still-connected follower and 502 a
+	// healthy request. The driver's own client Timeout still bounds each HTTP call, so
+	// detaching does not remove the per-call deadline. The DB run-link read below stays on
+	// ctx (r.Context()) — it is per-request, not singleflighted.
+	loadCtx := context.WithoutCancel(r.Context())
 	prefix := forgeMemoPrefix(repo)
 
 	refsKey := prefix + "refs|" + forge.MRStateOpened + "|" + strconv.Itoa(forgeViewPullsLimit)
 	refsV, err := h.memo().Do(refsKey, forgeMemoTTL, func() (any, int, error) {
-		refs, e := f.ListMergeRequestRefs(ctx, repo.ForgeProjectID,
+		refs, e := f.ListMergeRequestRefs(loadCtx, repo.ForgeProjectID,
 			forge.ListMergeRequestsOptions{State: forge.MRStateOpened, Limit: forgeViewPullsLimit})
 		if e != nil {
 			return nil, 0, e
@@ -189,8 +197,10 @@ func (h *Handler) ListPulls(w http.ResponseWriter, r *http.Request) {
 	// goroutine writes only its own results[i], so the pre-sized, position-indexed slice
 	// carries no data race (distinct elements) and preserves the input ref order; the
 	// errgroup's zero value does NOT cancel on error, so g.Wait returns the first
-	// non-sentinel error while every goroutine (and its memo entry) runs to completion —
-	// which also keeps the memo's singleflight free of a shared context cancellation.
+	// non-sentinel error while every goroutine (and its memo entry) runs to completion (no
+	// errgroup-induced cancellation of a sibling's shared load). Decoupling from the
+	// REQUEST's cancellation is handled separately by loadCtx (context.WithoutCancel), so
+	// a disconnecting client cannot cancel a singleflight load a follower is awaiting.
 	type pullResult struct {
 		dto  apitypes.PullDTO
 		skip bool // raced closed (ErrMergeRequestNotFound) — omitted from the list
@@ -202,7 +212,7 @@ func (h *Handler) ListPulls(w http.ResponseWriter, r *http.Request) {
 		g.Go(func() error {
 			sumKey := prefix + "sum|" + strconv.FormatInt(ref.IID, 10) + "|" + ref.UpdatedAt.UTC().Format(time.RFC3339Nano)
 			v, e := h.memo().Do(sumKey, forgeMemoTTL, func() (any, int, error) {
-				s, se := f.GetMergeRequestSummary(ctx, repo.ForgeProjectID, ref.IID)
+				s, se := f.GetMergeRequestSummary(loadCtx, repo.ForgeProjectID, ref.IID)
 				if se != nil {
 					return nil, 0, se
 				}
@@ -259,6 +269,10 @@ func (h *Handler) GetPull(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
+	// loadCtx detaches the memoized forge reads from the request's cancellation so a
+	// leader's mid-load disconnect cannot poison a co-polling follower's shared
+	// singleflight load (see ListPulls). The DB run-link read below stays on ctx.
+	loadCtx := context.WithoutCancel(r.Context())
 	prefix := forgeMemoPrefix(repo)
 	iidStr := strconv.FormatInt(iid, 10)
 
@@ -268,7 +282,7 @@ func (h *Handler) GetPull(w http.ResponseWriter, r *http.Request) {
 	// the list route's job); the 404 / non-open guards run AFTER the fetch and propagate
 	// uncached through Do (errors are never memoised).
 	sumV, err := h.memo().Do(prefix+"pull|"+iidStr, forgeMemoTTL, func() (any, int, error) {
-		s, e := f.GetMergeRequestSummary(ctx, repo.ForgeProjectID, iid)
+		s, e := f.GetMergeRequestSummary(loadCtx, repo.ForgeProjectID, iid)
 		if e != nil {
 			return nil, 0, e
 		}
@@ -288,7 +302,7 @@ func (h *Handler) GetPull(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	checksV, err := h.memo().Do(prefix+"checks|"+s.HeadSHA, forgeMemoTTL, func() (any, int, error) {
-		cs, e := f.ListChecks(ctx, repo.ForgeProjectID, s.HeadSHA)
+		cs, e := f.ListChecks(loadCtx, repo.ForgeProjectID, s.HeadSHA)
 		if e != nil {
 			return nil, 0, e
 		}
@@ -300,7 +314,7 @@ func (h *Handler) GetPull(w http.ResponseWriter, r *http.Request) {
 	}
 	checks := checksV.([]forge.Check)
 	reviewsV, err := h.memo().Do(prefix+"reviews|"+iidStr, forgeMemoTTL, func() (any, int, error) {
-		rv, e := f.ListMergeRequestReviews(ctx, repo.ForgeProjectID, iid)
+		rv, e := f.ListMergeRequestReviews(loadCtx, repo.ForgeProjectID, iid)
 		if e != nil {
 			return nil, 0, e
 		}
@@ -344,10 +358,13 @@ func (h *Handler) ListCIRuns(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	ctx := r.Context()
+	// loadCtx detaches the memoized forge read from the request's cancellation so a
+	// leader's mid-load disconnect cannot poison a co-polling follower's shared
+	// singleflight load (see ListPulls). This route has no per-request DB read.
+	loadCtx := context.WithoutCancel(r.Context())
 	runsKey := forgeMemoPrefix(repo) + "ciruns|" + strconv.Itoa(limit)
 	runsV, err := h.memo().Do(runsKey, forgeMemoTTL, func() (any, int, error) {
-		runs, e := f.ListWorkflowRuns(ctx, repo.ForgeProjectID, forge.ListWorkflowRunsOptions{Limit: limit})
+		runs, e := f.ListWorkflowRuns(loadCtx, repo.ForgeProjectID, forge.ListWorkflowRunsOptions{Limit: limit})
 		if e != nil {
 			return nil, 0, e
 		}
@@ -389,11 +406,14 @@ func (h *Handler) GetCIRun(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	ctx := r.Context()
+	// loadCtx detaches the memoized forge read from the request's cancellation so a
+	// leader's mid-load disconnect cannot poison a co-polling follower's shared
+	// singleflight load (see ListPulls). This route has no per-request DB read.
+	loadCtx := context.WithoutCancel(r.Context())
 	detail := apitypes.CIRunDetailDTO{CIRunDTO: apitypes.CIRunDTO{ID: runID}, Jobs: []apitypes.CIJobDTO{}}
 	jobsKey := forgeMemoPrefix(repo) + "cijobs|" + strconv.FormatInt(runID, 10)
 	jobsV, err := h.memo().Do(jobsKey, forgeMemoTTL, func() (any, int, error) {
-		jobs, e := f.ListPipelineJobs(ctx, repo.ForgeProjectID, runID)
+		jobs, e := f.ListPipelineJobs(loadCtx, repo.ForgeProjectID, runID)
 		if e != nil {
 			return nil, 0, e
 		}
