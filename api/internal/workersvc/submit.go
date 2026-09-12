@@ -770,12 +770,12 @@ func (s *Service) submitExtend(ctx context.Context, run store.Run, secs, capSeco
 	if capSeconds >= 0 && capSeconds <= math.MaxInt32 {
 		cap32 = int32(capSeconds)
 	}
-	projectedTotal := int(run.BudgetExtensionSeconds) + secs
-	projectedDeadline := RunDeadline(run.StartedAt, run.BudgetWallSeconds, run.BudgetPausedSeconds, run.Kind, run.Interactive, run.Status, s.p.RunTimeout, run.BudgetExtensionSeconds+secs32)
-	auditBody := fmt.Sprintf("extend +%s → total extension %s of %s", extendDurationLabel(secs), extendDurationLabel(projectedTotal), extendDurationLabel(capSeconds))
-	if projectedDeadline != nil {
-		auditBody += fmt.Sprintf("; times out %s", projectedDeadline.UTC().Format("Jan 2 15:04 MST"))
-	}
+	// The audit body records only the applied DELTA and the cap — never a projected total or
+	// deadline computed from the pre-write run row. CreateExtendInput adds @secs to the row's
+	// CURRENT budget_extension_seconds atomically, so a total derived from run.BudgetExtensionSeconds
+	// can be stale under concurrent extends; the committed total (newTotal) is the only source of
+	// truth, and the running total is reconstructable from the run row plus these delta rows.
+	auditBody := fmt.Sprintf("extend +%s (cap %s)", extendDurationLabel(secs), extendDurationLabel(capSeconds))
 	newTotal, err := s.q.CreateExtendInput(ctx, store.CreateExtendInputParams{
 		ID:   run.ID,
 		Secs: secs32,
@@ -788,8 +788,11 @@ func (s *Service) submitExtend(ctx context.Context, run store.Run, secs, capSeco
 		}
 		return SubmitInputResult{}, err
 	}
+	// Deadline is computed from the COMMITTED total (newTotal), not run.BudgetExtensionSeconds+secs,
+	// so two concurrent extends can never return a DeadlineAt that disagrees with ExtensionSeconds.
+	deadline := RunDeadline(run.StartedAt, run.BudgetWallSeconds, run.BudgetPausedSeconds, run.Kind, run.Interactive, run.Status, s.p.RunTimeout, newTotal)
 	nt := int(newTotal)
-	return SubmitInputResult{ServerSide: false, ExtensionSeconds: &nt, DeadlineAt: projectedDeadline}, nil
+	return SubmitInputResult{ServerSide: false, ExtensionSeconds: &nt, DeadlineAt: deadline}, nil
 }
 
 // pauseRefusalReason turns a 0-row CreatePauseInput into the specific 409 the owner sees

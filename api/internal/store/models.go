@@ -529,8 +529,8 @@ type Run struct {
 	HoldReason                  pgtype.Text        `json:"hold_reason"`
 	HoldCapturedHead            pgtype.Text        `json:"hold_captured_head"`
 	CompletionBudgetExhaustedAt pgtype.Timestamptz `json:"completion_budget_exhausted_at"`
-	BudgetExtensionSeconds      int32              `json:"budget_extension_seconds"`
 	CompletionQuestionAt        pgtype.Timestamptz `json:"completion_question_at"`
+	BudgetExtensionSeconds      int32              `json:"budget_extension_seconds"`
 }
 
 type RunCompletionAttempt struct {

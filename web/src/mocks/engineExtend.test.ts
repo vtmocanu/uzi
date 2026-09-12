@@ -67,4 +67,15 @@ describe("mock engine: extend (PRD #1189)", () => {
     const rej = handleInput("run-judge-meta", "extend", "3600");
     expect(rej).toMatchObject({ status: 409 });
   });
+
+  it("extends a queued (parked, not-yet-claimed) run — the run-queued fixture seeds its cap (issue #1259)", () => {
+    // A queued issue run is a non-terminal timed kind, so extend must succeed (the column is inert
+    // until it runs). This relies on the run-queued FIXTURE carrying budget_extension_cap_seconds:
+    // before #1259 the fixture omitted the extension fields, so the mock read the cap as 0 and
+    // returned a spurious "extensions are turned off" 409. Deliberately does NOT patch the fields
+    // here — the fixture's seeding is what is under test.
+    const before = state.runs.get("run-queued")!.budget_extension_seconds ?? 0;
+    expect(handleInput("run-queued", "extend", "3600")).toBeNull();
+    expect(state.runs.get("run-queued")!.budget_extension_seconds).toBe(before + 3600);
+  });
 });

@@ -80,6 +80,11 @@ export const mockRuns: Run[] = [
     claimed_at: null,
     started_at: null,
     finished_at: null,
+    // PRD #1189: a queued run is a non-terminal timed kind, so it is extendable (the column is
+    // inert until it runs). Seed the extension fields so the mock extend path succeeds instead of
+    // reading a missing cap as 0 (disabled) and returning a spurious 409.
+    budget_extension_seconds: 0,
+    budget_extension_cap_seconds: 57600,
     created_at: minsAgo(1),
     updated_at: minsAgo(1),
   },

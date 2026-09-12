@@ -166,6 +166,40 @@ func TestSubmitInputExtendSuccess(t *testing.T) {
 	}
 }
 
+// TestSubmitInputExtendDeadlineFromCommittedTotal pins PRD #1189 D4 concurrency correctness
+// (CodeRabbit !1259): submitExtend must derive the returned DeadlineAt from the COMMITTED total
+// CreateExtendInput returns, NOT from the pre-write run.BudgetExtensionSeconds + secs. If a
+// concurrent extend already bumped the row, the pre-write projection is stale; the response must
+// reflect the real committed total so ExtensionSeconds and DeadlineAt never disagree. The unfixed
+// code computed the deadline from 0+3600 and would fail both the committed-total and the
+// not-the-stale-projection assertions below.
+func TestSubmitInputExtendDeadlineFromCommittedTotal(t *testing.T) {
+	fs, svc, user, runID := extendRunFixture(t, 57600)
+	fs.runByID.BudgetExtensionSeconds = 0 // the value we read BEFORE the write
+	const committed = 10800               // a concurrent extend already pushed the total past 0+3600
+	fs.extendReturn = committed
+
+	res, err := svc.SubmitInput(context.Background(), user, runID, "extend", "3600", nil)
+	if err != nil {
+		t.Fatalf("SubmitInput extend 3600: %v", err)
+	}
+	if res.ExtensionSeconds == nil || *res.ExtensionSeconds != committed {
+		t.Fatalf("result ExtensionSeconds = %v, want %d (the committed total)", res.ExtensionSeconds, committed)
+	}
+	run := fs.runByID
+	wantDeadline := RunDeadline(run.StartedAt, run.BudgetWallSeconds, run.BudgetPausedSeconds, run.Kind, run.Interactive, run.Status, svc.p.RunTimeout, committed)
+	staleDeadline := RunDeadline(run.StartedAt, run.BudgetWallSeconds, run.BudgetPausedSeconds, run.Kind, run.Interactive, run.Status, svc.p.RunTimeout, 3600)
+	if res.DeadlineAt == nil || wantDeadline == nil {
+		t.Fatal("a running issue run must have a non-nil deadline")
+	}
+	if !res.DeadlineAt.Equal(*wantDeadline) {
+		t.Fatalf("DeadlineAt = %v, want %v (from the committed total %d)", res.DeadlineAt, wantDeadline, committed)
+	}
+	if staleDeadline != nil && res.DeadlineAt.Equal(*staleDeadline) {
+		t.Fatal("DeadlineAt matches the stale pre-write projection (0+3600); it must use the committed total")
+	}
+}
+
 // TestSubmitInputExtendCTERefusal: a 0-row CreateExtendInput (pgx.ErrNoRows) is disambiguated
 // from the already-fetched run row. A chat run (which never times out) that somehow reached the
 // CTE maps to ErrExtendNotTimed; a run whose column-stored extension leaves no room under the

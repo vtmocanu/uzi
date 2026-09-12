@@ -41,8 +41,10 @@ export function ExtendTimePopover({
   run: BudgetRun;
   busy: boolean;
   // Wired by the page to act(() => submit("extend", String(seconds))) → refreshRun. Awaited so
-  // the panel closes only once the write settled (or its error surfaced on the page banner).
-  onSubmit: (seconds: number) => void | Promise<void>;
+  // the panel closes only once the write settled; a resolved `false` (the write failed, its error
+  // is on the page banner) KEEPS the chooser open so the owner's pick is not lost. A void return
+  // (a caller that does not report success) closes as before.
+  onSubmit: (seconds: number) => void | Promise<boolean | void>;
   triggerLabel?: string;
   triggerVariant?: Variant;
 }) {
@@ -170,7 +172,11 @@ export function ExtendTimePopover({
 
   const submit = async () => {
     if (!canConfirm || effective == null) return;
-    await onSubmit(effective);
+    // Keep the chooser open (and the pick intact) when the extend failed: onSubmit resolves
+    // false on a rejected write. A void/undefined return (a caller that does not report success)
+    // still closes, preserving the prior behavior.
+    const ok = await onSubmit(effective);
+    if (ok === false) return;
     setOpen(false);
     setCustom("");
     setPicked(DEFAULT_PICK);

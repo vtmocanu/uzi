@@ -197,7 +197,7 @@ export function NearTimeoutPanel({
   run: Run;
   busy: boolean;
   canSteer?: boolean;
-  onExtend: (seconds: number) => void;
+  onExtend: (seconds: number) => void | Promise<boolean | void>;
   onStop: () => void;
 }) {
   const now = useNow(1000);
@@ -1014,7 +1014,7 @@ export function PausedPanel({
   onStop: () => void;
   // PRD #1189: grant more time while paused. Optional so a caller that does not wire it (or a
   // run whose cap is 0/unknown, gated by extendEnabled below) simply shows no Extend.
-  onExtend?: (seconds: number) => void;
+  onExtend?: (seconds: number) => void | Promise<boolean | void>;
 }) {
   // A completion hold (hold_reason='completion_blocked') also sits in `paused` but
   // recovers via the continue-decision path, not a plain resume — so it is excluded
@@ -1506,13 +1506,18 @@ export function RunView() {
       .catch(() => setMrReworkDefault(null));
   }, [showMrRework]);
 
-  const act = async (fn: () => Promise<unknown>) => {
+  // Returns true when the action settled, false when it threw (the error is surfaced on the
+  // page banner). Callers that must react to failure — the Extend chooser keeps itself open on a
+  // false so the owner's pick is not lost — read this; the rest ignore it.
+  const act = async (fn: () => Promise<unknown>): Promise<boolean> => {
     setActionErr("");
     setBusy(true);
     try {
       await fn();
+      return true;
     } catch (e) {
       setActionErr(errorMessage(e, "Action failed"));
+      return false;
     } finally {
       setBusy(false);
     }

@@ -116,6 +116,11 @@ describe("extendBudgetView (PRD #1189)", () => {
     expect(extendBudgetView({ status: "running", budget_total_seconds: null }, nowMs)).toBeNull();
     expect(extendBudgetView({ status: "running" }, nowMs)).toBeNull(); // older api omits it
     expect(extendBudgetView({ status: "paused" }, nowMs)).toBeNull(); // paused, no wall
+    // Rollout skew: a paused run can carry budget_wall_seconds WITHOUT budget_used_seconds.
+    // Coercing the missing used to 0 would fabricate "0s used" and a full remaining budget, so
+    // the view is null and the caller keeps the legacy plain elapsed. (Fails on the pre-fix code,
+    // which returned usedSec: 0.)
+    expect(extendBudgetView({ status: "paused", budget_wall_seconds: 28800 }, nowMs)).toBeNull();
     expect(extendBudgetView({ status: "queued" }, nowMs)).toBeNull();
     expect(extendBudgetView({ status: "completed", budget_total_seconds: null }, nowMs)).toBeNull();
   });

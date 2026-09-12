@@ -117,6 +117,38 @@ func TestHealthNudgeBlocksSlowShowsExtendCommandWhenCapHasRoom(t *testing.T) {
 	}
 }
 
+func TestHealthNudgeBlocksSlowExtendFitsRemainingAllowance(t *testing.T) {
+	// With less than 2h of allowance left, the nudge must NOT suggest the fixed `--by 2h`
+	// (the server 409s an over-cap extend); it renders the remaining allowance floored to
+	// whole minutes instead. cap 7200, already extended 3601 → 3599s (59m 59s) remain, so the
+	// command is `--by 59m` (3540s, within the remainder and above the 60s extend floor). The
+	// unfixed renderer emitted `--by 2h` whenever extension < cap and would fail the first check.
+	rc := slowRow()
+	rc.BudgetExtensionSeconds = 3601
+	blocks, _ := healthNudgeBlocks(healthSlow, "", "https://uzi.example", rc, slowDeadline(), 7200, slowNow)
+	ctx := contextText(blocks)
+
+	if strings.Contains(ctx, "--by 2h") {
+		t.Fatalf("slow context = %q, must NOT suggest --by 2h with only 3599s of allowance left (it would 409)", ctx)
+	}
+	want := "Extend: `uzi run extend " + rc.ID.String() + " --by 59m`"
+	if !strings.Contains(ctx, want) {
+		t.Fatalf("slow context = %q, want the fitted extend command %q", ctx, want)
+	}
+}
+
+func TestHealthNudgeBlocksSlowOmitsExtendWhenRemainderBelowFloor(t *testing.T) {
+	// A remaining allowance under the 60s extend floor cannot be extended, so the line is
+	// omitted rather than suggesting a `--by 0m` the server rejects. cap 7200, extended 7159 →
+	// 41s left. The unfixed renderer (extension < cap) still emitted a command here.
+	rc := slowRow()
+	rc.BudgetExtensionSeconds = 7159
+	blocks, _ := healthNudgeBlocks(healthSlow, "", "https://uzi.example", rc, slowDeadline(), 7200, slowNow)
+	if strings.Contains(contextText(blocks), "uzi run extend") {
+		t.Fatalf("slow context carries the extend command though only 41s (< 60s floor) of allowance remain")
+	}
+}
+
 func TestHealthNudgeBlocksSlowOmitsExtendCommandAtCap(t *testing.T) {
 	// extension_seconds >= cap: no room left, so the DM never suggests a command that
 	// would 409. The boundary (equal) is the omit case.

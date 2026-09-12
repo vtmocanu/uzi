@@ -190,9 +190,11 @@ func healthNudgeHead(health, reason string) string {
 //     checkpoint clause is omitted when checkpointTipAt is null, and the whole line is
 //     omitted when deadline is nil (a run with no wall deadline never gets the slow flag,
 //     so this is only a defensive guard).
-//   - a second context line: `Extend: ` + a `uzi run extend <id> --by 2h` code span —
-//     omitted when extending is exhausted (budget_extension_seconds >= extensionCap) or
-//     turned off (extensionCap == 0), so the DM never suggests a command that would 409.
+//   - a second context line: `Extend: ` + a `uzi run extend <id> --by <dur>` code span —
+//     the duration FITS the remaining allowance (2h when there is room, else the remaining
+//     allowance floored to whole minutes), and the line is omitted when extending is exhausted
+//     (budget_extension_seconds >= extensionCap), turned off (extensionCap == 0), or the sliver
+//     left is under the 60s extend floor — so the DM never suggests a command that would 409.
 //
 // Both extras are entirely server-computed (a unix stamp, two durations, the run uuid,
 // and a fixed verb), so they carry no forge/worker text and need no escaping; the
@@ -215,8 +217,13 @@ func healthNudgeBlocks(health, reason, base string, rc store.GetSlackRunContextR
 			}
 			section += "\n" + line
 		}
-		if extensionCap > 0 && int(rc.BudgetExtensionSeconds) < extensionCap {
-			extendCtx = "Extend: `uzi run extend " + rc.ID.String() + " --by 2h`"
+		if extensionCap > 0 {
+			// Render a duration that FITS the remaining allowance, not a fixed 2h: with less
+			// than 2h left the server 409s a `--by 2h`, so the nudge would suggest a command
+			// that fails. extendNudgeBy returns "" when under the 60s extend floor (line omitted).
+			if by := extendNudgeBy(extensionCap - int(rc.BudgetExtensionSeconds)); by != "" {
+				extendCtx = "Extend: `uzi run extend " + rc.ID.String() + " --by " + by + "`"
+			}
 		}
 	}
 	blocks = []slack.Block{slack.NewSectionBlock(
@@ -230,6 +237,38 @@ func healthNudgeBlocks(health, reason, base string, rc store.GetSlackRunContextR
 			slack.NewTextBlockObject(slack.MarkdownType, extendCtx, false, false)))
 	}
 	return blocks, head
+}
+
+// extendNudgeBy renders the `--by` duration for the near-timeout Extend command as a
+// Go-duration-parseable label with NO spaces ("2h", "1h58m", "45m"): the friendly 2h default
+// when the remaining allowance leaves room, otherwise the remaining allowance floored to whole
+// minutes so the suggested command always fits under the cap (a fixed 2h would 409 once under
+// two hours remain). Returns "" when the remaining allowance is under the 60s extend floor, so
+// the caller omits the line rather than suggest a command the server would reject. Mirrors
+// workersvc.extendDurationLabel without importing workersvc (this file keeps no workersvc
+// dependency — the deadline is computed by the caller).
+func extendNudgeBy(remaining int) string {
+	const (
+		minExtendSeconds     = 60
+		defaultExtendSeconds = 7200 // 2h
+	)
+	if remaining < minExtendSeconds {
+		return ""
+	}
+	by := remaining
+	if by > defaultExtendSeconds {
+		by = defaultExtendSeconds
+	}
+	h := by / 3600
+	m := (by % 3600) / 60
+	switch {
+	case h > 0 && m > 0:
+		return fmt.Sprintf("%dh%dm", h, m)
+	case h > 0:
+		return fmt.Sprintf("%dh", h)
+	default:
+		return fmt.Sprintf("%dm", m)
+	}
 }
 
 // nearTimeoutLeft renders the time remaining before a run's wall-clock deadline for the

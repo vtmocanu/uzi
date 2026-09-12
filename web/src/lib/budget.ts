@@ -138,7 +138,12 @@ export function extendBudgetView(run: BudgetRun, nowMs: number): BudgetView | nu
     // show and the caller keeps today's plain elapsed.
     const wall = run.budget_wall_seconds;
     if (wall == null) return null;
-    const used = Math.max(0, run.budget_used_seconds ?? 0);
+    // Rollout skew: an older payload can carry budget_wall_seconds WITHOUT budget_used_seconds.
+    // Coercing the missing value to 0 would fabricate "0s used" and a full remaining budget, so
+    // return null instead — the caller falls back to the legacy plain-elapsed display and omits
+    // the remaining-budget sentence, rather than showing an invented number.
+    if (run.budget_used_seconds == null) return null;
+    const used = Math.max(0, run.budget_used_seconds);
     const remaining = Math.max(0, wall + ext - used);
     return {
       usedSec: used,
