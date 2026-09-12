@@ -11,9 +11,9 @@ package handler
 // when a connection has exhausted its budget the load returns a *forge.RateLimitError
 // BEFORE the forge call, which writeForgeError maps to 429 + Retry-After — a shed LOAD
 // makes zero forge calls (a request that exhausts its budget mid-fan-out may complete a
-// few real calls before a later load sheds, but still returns 429). The GitHub
-// Rate.Remaining reserve (D4's other shedding rule) is a separate follow-up and NOT
-// implemented here.
+// few real calls before a later load sheds, but still returns 429). This token bucket
+// is one of D4's two shedding rules; the other, the GitHub Rate.Remaining reserve, is
+// implemented in the forge driver (see forge/github_rate.go shedIfReserved).
 
 import (
 	"sync"
