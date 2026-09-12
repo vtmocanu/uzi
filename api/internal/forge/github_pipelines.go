@@ -460,6 +460,14 @@ func combineCheckRunStatuses(runs []*gh.CheckRun) string {
 // exactly the Pipeline.ID that LatestPipeline / LatestMRPipeline returned. Paginated
 // internally to honour the interface contract.
 func (g *github) ListPipelineJobs(ctx context.Context, projectID, pipelineID int64) ([]Job, error) {
+	// ListPipelineJobs is shared: the INTERACTIVE ci-run drill-in (GetCIRun) and the
+	// poller's ci-fix snapshot both call it. Gating the reserve-shed on the interactive
+	// flag means the drill-in can shed while the poller's unmarked ci-fix read never
+	// does (PRD #1255 D4). LatestPipeline/LatestMRPipeline/JobLogTail carry no flag and
+	// get no reserve check at all.
+	if err := g.shedIfReserved(ctx); err != nil {
+		return nil, err
+	}
 	slug, err := g.repoSlugFor(ctx, projectID)
 	if err != nil {
 		return nil, err

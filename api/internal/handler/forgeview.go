@@ -13,8 +13,11 @@ package handler
 // outbound budget (chargeBudget, forge_budget.go), so the enrichment fan-out is charged
 // too and a shed LOAD makes zero forge calls (a request that exhausts its budget
 // mid-fan-out may complete a few real calls before a later load sheds, but still returns
-// 429); the GitHub Rate.Remaining reserve half
-// of D4's budget is a later unit — not here. Every forge error is already PAT-redacted by the driver; a
+// 429). The OTHER half of D4's outbound budget, the GitHub primary-rate reserve, is wired here
+// too: loadCtx is marked forge.WithInteractiveRead, so the GitHub driver sheds the read BEFORE any
+// forge call while the connection's recorded Remaining sits below max(500, 10% of Limit), reserving
+// that headroom for the poller (whose unmarked reads are never shed). Every forge error is already
+// PAT-redacted by the driver; a
 // *forge.RateLimitError maps to 429 + Retry-After (uncached through Do),
 // ErrForgeVersionUnsupported to an honest empty state, other errors to 502.
 
@@ -194,8 +197,10 @@ func (h *Handler) ListPulls(w http.ResponseWriter, r *http.Request) {
 	// would otherwise surface as context.Canceled to a still-connected follower and 502 a
 	// healthy request. The driver's own client Timeout still bounds each HTTP call, so
 	// detaching does not remove the per-call deadline. The DB run-link read below stays on
-	// ctx (r.Context()) — it is per-request, not singleflighted.
-	loadCtx := context.WithoutCancel(r.Context())
+	// ctx (r.Context()) — it is per-request, not singleflighted. WithInteractiveRead marks
+	// every forge-view forge read INTERACTIVE, so the GitHub driver sheds it against the
+	// primary-rate reserve while the poller's unmarked reads pass through (PRD #1255 D4).
+	loadCtx := forge.WithInteractiveRead(context.WithoutCancel(r.Context()))
 	prefix := forgeMemoPrefix(repo)
 
 	refsKey := prefix + "refs|" + forge.MRStateOpened + "|" + strconv.Itoa(forgeViewPullsLimit)
@@ -298,7 +303,7 @@ func (h *Handler) GetPull(w http.ResponseWriter, r *http.Request) {
 	// loadCtx detaches the memoized forge reads from the request's cancellation so a
 	// leader's mid-load disconnect cannot poison a co-polling follower's shared
 	// singleflight load (see ListPulls). The DB run-link read below stays on ctx.
-	loadCtx := context.WithoutCancel(r.Context())
+	loadCtx := forge.WithInteractiveRead(context.WithoutCancel(r.Context()))
 	prefix := forgeMemoPrefix(repo)
 	iidStr := strconv.FormatInt(iid, 10)
 
@@ -396,7 +401,7 @@ func (h *Handler) ListCIRuns(w http.ResponseWriter, r *http.Request) {
 	// loadCtx detaches the memoized forge read from the request's cancellation so a
 	// leader's mid-load disconnect cannot poison a co-polling follower's shared
 	// singleflight load (see ListPulls). This route has no per-request DB read.
-	loadCtx := context.WithoutCancel(r.Context())
+	loadCtx := forge.WithInteractiveRead(context.WithoutCancel(r.Context()))
 	runsKey := forgeMemoPrefix(repo) + "ciruns|" + strconv.Itoa(limit)
 	runsV, err := h.memo().Do(runsKey, forgeMemoTTL, func() (any, int, error) {
 		if e := h.chargeBudget(repo.ConnectionID); e != nil {
@@ -447,7 +452,7 @@ func (h *Handler) GetCIRun(w http.ResponseWriter, r *http.Request) {
 	// loadCtx detaches the memoized forge read from the request's cancellation so a
 	// leader's mid-load disconnect cannot poison a co-polling follower's shared
 	// singleflight load (see ListPulls). This route has no per-request DB read.
-	loadCtx := context.WithoutCancel(r.Context())
+	loadCtx := forge.WithInteractiveRead(context.WithoutCancel(r.Context()))
 	detail := apitypes.CIRunDetailDTO{CIRunDTO: apitypes.CIRunDTO{ID: runID}, Jobs: []apitypes.CIJobDTO{}}
 	jobsKey := forgeMemoPrefix(repo) + "cijobs|" + strconv.FormatInt(runID, 10)
 	jobsV, err := h.memo().Do(jobsKey, forgeMemoTTL, func() (any, int, error) {

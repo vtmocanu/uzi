@@ -3,12 +3,12 @@ package forge
 import (
 	"bytes"
 	"container/list"
-	"crypto/sha256"
-	"encoding/hex"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // GitHub conditional-request layer (PRD #1255 D4).
@@ -115,8 +115,10 @@ func newETagTransportWithCache(base http.RoundTripper, token string, cache *etag
 	if base == nil {
 		base = http.DefaultTransport
 	}
-	sum := sha256.Sum256([]byte(token))
-	return &etagTransport{base: base, salt: hex.EncodeToString(sum[:]), cache: cache}
+	// salt is derived through githubTokenHash — the same function the driver's
+	// tokenHash uses — so the key this transport RECORDS a rate under agrees with the
+	// key the driver SHEDS against for one PAT (PRD #1255 D4).
+	return &etagTransport{base: base, salt: githubTokenHash(token), cache: cache}
 }
 
 // etagAllowlisted reports whether path is one of the new forge-view read paths
@@ -146,7 +148,14 @@ func etagAllowlisted(path string) bool {
 // allowlist pass straight through the wrapped transport untouched.
 func (t *etagTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if req.Method != http.MethodGet || !etagAllowlisted(req.URL.Path) {
-		return t.base.RoundTrip(req)
+		// Non-conditional passthrough: still record the response's rate state so the
+		// reserve reflects the true current Remaining for EVERY GitHub call this PAT
+		// makes, not only the allowlisted read paths (PRD #1255 D4).
+		resp, err := t.base.RoundTrip(req)
+		if err == nil {
+			t.recordRate(resp)
+		}
+		return resp, err
 	}
 
 	key := t.salt + "\x00" + req.Method + " " + req.URL.String()
@@ -163,6 +172,11 @@ func (t *etagTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if err != nil {
 		return resp, err
 	}
+	// Record from the LIVE response (200, 304 or other) before any 304 replay: GitHub
+	// sends fresh X-RateLimit-* on every response including a 304, so this captures the
+	// true current Remaining regardless of which lane made the call and whether the body
+	// was replayed from cache.
+	t.recordRate(resp)
 
 	// 304 Not Modified: GitHub confirms our cached copy is current. Replay the
 	// cached body as a synthesized 200 so go-github never sees the 304 it would
@@ -216,6 +230,39 @@ func (t *etagTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	// Any other status (or a 304 with no cache entry, which should not occur):
 	// pass through untouched, cache nothing.
 	return resp, nil
+}
+
+// recordRate parses GitHub's standard primary rate-limit headers off a response and
+// records them for this PAT (keyed by t.salt = githubTokenHash(token)), feeding D4's
+// reserve. It requires all three of X-RateLimit-Remaining / -Limit / -Reset (epoch
+// seconds); a response missing any of them (e.g. a non-GitHub or error response
+// without the headers) is ignored, leaving the last good record untouched. Recording
+// is side-effect-only and never alters the ETag 304/replay/allowlist behavior.
+func (t *etagTransport) recordRate(resp *http.Response) {
+	if resp == nil {
+		return
+	}
+	remaining, ok1 := atoiHeader(resp.Header, "X-RateLimit-Remaining")
+	limit, ok2 := atoiHeader(resp.Header, "X-RateLimit-Limit")
+	resetEpoch, ok3 := atoiHeader(resp.Header, "X-RateLimit-Reset")
+	if !ok1 || !ok2 || !ok3 {
+		return
+	}
+	recordGitHubRate(t.salt, remaining, limit, time.Unix(int64(resetEpoch), 0))
+}
+
+// atoiHeader reads header name as a base-10 int. ok is false when the header is
+// absent or not a valid integer.
+func atoiHeader(h http.Header, name string) (int, bool) {
+	v := h.Get(name)
+	if v == "" {
+		return 0, false
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
 }
 
 // etagLiveRateHeaders are the response headers whose values reflect the CURRENT

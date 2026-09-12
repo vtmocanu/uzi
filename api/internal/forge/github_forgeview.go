@@ -18,6 +18,9 @@ import (
 // row, with NO per-PR enrichment (that is GetMergeRequestSummary's job). opts.Limit
 // caps the rows collected.
 func (g *github) ListMergeRequestRefs(ctx context.Context, projectID int64, opts ListMergeRequestsOptions) ([]MergeRequestRef, error) {
+	if err := g.shedIfReserved(ctx); err != nil {
+		return nil, err
+	}
 	slug, err := g.repoSlugFor(ctx, projectID)
 	if err != nil {
 		return nil, err
@@ -69,6 +72,9 @@ func (g *github) ListMergeRequestRefs(ctx context.Context, projectID int64, opts
 // mergeRequestSummary helper (PullRequests.Get + the D6 reviews fold). A 404 from
 // PullRequests.Get is mapped to ErrMergeRequestNotFound (in mergeRequestSummary).
 func (g *github) GetMergeRequestSummary(ctx context.Context, projectID, iid int64) (MergeRequestSummary, error) {
+	if err := g.shedIfReserved(ctx); err != nil {
+		return MergeRequestSummary{}, err
+	}
 	slug, err := g.repoSlugFor(ctx, projectID)
 	if err != nil {
 		return MergeRequestSummary{}, err
@@ -207,6 +213,9 @@ func githubPRStateParam(state string) string {
 // API appears exactly once. ListCheckRunsForRef defaults to filter=latest, so the
 // check-runs are already one-per-name.
 func (g *github) ListChecks(ctx context.Context, projectID int64, sha string) ([]Check, error) {
+	if err := g.shedIfReserved(ctx); err != nil {
+		return nil, err
+	}
 	slug, err := g.repoSlugFor(ctx, projectID)
 	if err != nil {
 		return nil, err
@@ -342,6 +351,9 @@ func githubStatusStateToCheck(state string) (status, conclusion string) {
 // optional Branch/Event/Status server-side filters. JobsDone/JobsTotal are left
 // zero — the runs list carries no jobs; the route layer fills them for RUNNING rows.
 func (g *github) ListWorkflowRuns(ctx context.Context, projectID int64, opts ListWorkflowRunsOptions) ([]WorkflowRun, error) {
+	if err := g.shedIfReserved(ctx); err != nil {
+		return nil, err
+	}
 	slug, err := g.repoSlugFor(ctx, projectID)
 	if err != nil {
 		return nil, err
