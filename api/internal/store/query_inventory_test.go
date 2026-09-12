@@ -564,9 +564,12 @@ var queryInventory = []queryPin{
 			"from the admin draft/file handlers (../handler). The pin folds the newest-resolution: the test " +
 			"seeds occurrence A, drafts it, then seeds a NEWER review B on the SAME coordinate and files — " +
 			"asserting the filed link lands on B (so ORDER BY updated_at DESC → the newest reddens if flipped) " +
-			"and A stays open. The open predicate (d.status IS NULL AND f.filed_at IS NULL) is separately " +
-			"folded by TestAdminFileJudgeIssueNewestOccurrenceLiveDB, which files the newest and then asserts " +
-			"the next resolve returns the older STILL-OPEN occurrence, not the just-filed one"},
+			"and A stays open. The open predicate's two halves are folded SEPARATELY, one test each: the " +
+			"f.filed_at IS NULL half by TestAdminFileJudgeIssueNewestOccurrenceLiveDB (files the newest, then " +
+			"asserts the next resolve returns the older STILL-OPEN occurrence, not the just-filed one), and the " +
+			"d.status IS NULL half by TestAdminJudgeIssueDraftExcludesDisposedLiveDB (disposes the only " +
+			"occurrence, then asserts the draft 404s — filing never writes a disposition, so only that test " +
+			"reddens if AND d.status IS NULL is dropped)"},
 	{"ListJudgeTriageRowsForRuns", "judge_recommendations.sql", "TestJudgeRunTodoTriageRowsAreCoordinateScopedLiveDB",
 		"direct call, judge_recommendations_integration_test.go:1106"},
 
