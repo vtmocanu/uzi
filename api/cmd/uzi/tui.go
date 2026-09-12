@@ -61,10 +61,12 @@ const (
 	viewBoard tuiView = iota
 	viewDetail
 	// viewPulls is the forge `pulls` list screen (PRD #1255 M4a). viewCI is the forge
-	// `ci` list screen (PRD #1255 M4b); the two drill-ins (viewPR / viewCIRun) land in
-	// later milestones.
+	// `ci` list screen (PRD #1255 M4b). viewPR is the PR drill-in (PRD #1255 M5) — a peer of
+	// viewDetail, opened from the pulls list (enter/→) or the run view (m); the CI-run drill-in
+	// (viewCIRun) lands in M6.
 	viewPulls
 	viewCI
+	viewPR
 )
 
 // ---- messages -------------------------------------------------------------
@@ -228,6 +230,23 @@ type tuiModel struct {
 	// ci is the forge `ci` screen's state (PRD #1255 M4b), with its OWN poll-guard counters
 	// like pulls, so the two forge lists poll independently over the SAME scoped repo.
 	ci ciState
+	// pr is the PR drill-in's state (PRD #1255 M5), with its OWN reqSeq/waitID/tickGen poll-guard
+	// counters and a 5s live re-poll chain, independent of the two list screens.
+	pr prState
+	// prReturn / detailReturn record WHERE a drill-in was opened from, so its esc returns there
+	// (D1): the PR view returns to prReturn (the pulls list, or the run view on detail→m→PR), and
+	// the run view returns to detailReturn (the board by default, or pulls / PR on a u ↳ run jump).
+	// prReturn defaults to viewPulls; detailReturn to viewBoard (the zero value), so the existing
+	// board↔detail behaviour is unchanged. The state returned to is never clobbered — m.pulls /
+	// m.detail persist on the model — so it is still loaded when esc lands back on it.
+	prReturn     tuiView
+	detailReturn tuiView
+	// forgeNotice is the transient one-line confirmation / server-reason a w (rework) / f (fix ci)
+	// action leaves, drawn in the PR view's and the pulls screen's header-note area (D1/D12). It is
+	// set by prActionMsg, overwritten by the next action, and cleared when a PR view is opened fresh
+	// or the repo cycles. The success text is static + a short run id; the error text is fmtErr-
+	// sanitized, so drawing it is safe.
+	forgeNotice string
 	// repos / repoIdx / repoChosen scope the forge views to one repo at a time (PRD #1255
 	// D2). repos is the viewer's ENABLED repos (from ListRepos); repoIdx is the current one;
 	// R cycles it; repoChosen records whether the default-repo rule has resolved (or the user
@@ -344,6 +363,12 @@ func newTUIModel(ctx context.Context, c uzicli.Client, startRun string) tuiModel
 	// The ci list seeds its own tick chain the same way as pulls (generation 1, no request in
 	// flight until the repo scope resolves); both forge lists share the repo scope below.
 	m.ci = newCIState()
+	// The PR drill-in seeds its tick chain at generation 1 (the Init-armed PR tick is honoured)
+	// with no PR loaded (repoID ""), so the tick never polls until the user opens a PR view and
+	// startPRReq mints the first fetch. prReturn defaults to viewPulls; detailReturn keeps the
+	// viewBoard zero value so board↔detail is unchanged (PRD #1255 M5 D1).
+	m.pr = newPRState("", 0)
+	m.prReturn = viewPulls
 	// The repos scope fetch IS in flight at Init (initCmds issues fetchReposCmd), so seed the
 	// guard true — the reply clears it. Without this a pulls tick that fires before the Init
 	// reposMsg lands could stack a second repos fetch on top of the Init one.
@@ -372,6 +397,10 @@ func (m tuiModel) initCmds() []tea.Cmd {
 		// now but polls the forge only while the ci screen is in focus, so an idle board pays no
 		// forge cost for it.
 		ciTickAfter(ciPollInterval, m.ci.tickGen),
+		// The PR drill-in's own 5s live re-poll chain (PRD #1255 M5). Armed now but polls the forge
+		// only while the PR view is in focus and a PR is loaded; the open path's immediate startPRReq
+		// is what actually begins the chain, the reply re-arms it, so an idle board pays nothing.
+		prTickAfter(prPollInterval, m.pr.tickGen),
 		tea.RequestBackgroundColor}
 	if m.skewCheck {
 		cmds = append(cmds, m.fetchBuildInfoCmd(), skewTickCmd())
@@ -873,6 +902,41 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.ci.tickGen++
 		return m, ciTickAfter(ciTickInterval(m.ci.errStreak), m.ci.tickGen)
 
+	case prTickMsg:
+		// The PR drill-in's 5s live re-poll (PRD #1255 M5). Drop a superseded chain, keep alive
+		// across the cancellable quit modal without polling, else poll the forge only while the PR
+		// view is in focus and a PR is loaded and no poll is outstanding. When it DOES fetch, the
+		// reply re-arms the chain (as on the board); when it does NOT, this tick re-arms ITSELF.
+		if msg.gen != m.pr.tickGen {
+			return m, nil
+		}
+		if m.quitting {
+			return m, prTickAfter(prTickInterval(m.pr.errStreak), m.pr.tickGen)
+		}
+		if m.view == viewPR && m.pr.waitID == 0 && m.pr.repoID != "" {
+			return m, (&m).startPRReq()
+		}
+		return m, prTickAfter(prTickInterval(m.pr.errStreak), m.pr.tickGen)
+
+	case prMsg:
+		// Drop a stale/out-of-order reply (mirrors pullsMsg): honour only the reply whose reqID
+		// matches the request we are waiting on.
+		if msg.reqID != m.pr.waitID {
+			return m, nil
+		}
+		m.pr.waitID = 0
+		m.pr.apply(msg)
+		// Reschedule AFTER apply updated errStreak so the first retry after a failed poll uses the
+		// backed-off interval; bump tickGen so this chain supersedes any pending tick.
+		m.pr.tickGen++
+		return m, prTickAfter(prTickInterval(m.pr.errStreak), m.pr.tickGen)
+
+	case prActionMsg:
+		// A w (rework) / f (fix ci) result from the PR view or a pulls list row: a success
+		// confirmation or the server's typed 4xx/409 reason, drawn inline (never a crash).
+		m.forgeNotice = prActionNotice(msg)
+		return m, nil
+
 	case blinkTickMsg:
 		if !m.blinkWanted() {
 			// Nothing in progress any more (or the blink is disabled): drop to the static
@@ -1171,6 +1235,8 @@ func (m tuiModel) handleKey(k string) (tea.Model, tea.Cmd) {
 		return m.pullsKey(k)
 	case viewCI:
 		return m.ciKey(k)
+	case viewPR:
+		return m.prKey(k)
 	default:
 		return m.detailKey(k)
 	}
@@ -1208,6 +1274,8 @@ func (m tuiModel) View() tea.View {
 		body = m.renderPulls()
 	case m.view == viewCI:
 		body = m.renderCI()
+	case m.view == viewPR:
+		body = m.renderPR()
 	default:
 		body = m.renderBoard()
 	}

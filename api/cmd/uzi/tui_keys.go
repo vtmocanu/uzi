@@ -39,6 +39,13 @@ const (
 	keyViewPulls = "2"
 	keyViewCI    = "3"
 	keyRepoCycle = "R"
+	// Forge actions (PRD #1255 M5, D1/D12), bound on BOTH the pulls list row and the PR drill-in:
+	// u opens the PR's linked uzi run in the run view, w reworks that run, f queues a CI-fix run
+	// for the PR's head branch. keyPRView (m) is the run view → PR view cross-link.
+	keyRunLink = "u"
+	keyRework  = "w"
+	keyFixCI   = "f"
+	keyPRView  = "m"
 )
 
 // keyString normalizes a v2 key press to the string form the switches below compare
@@ -87,11 +94,16 @@ func helpLines(v tuiView) []string {
 			"↑ / ↓      move within the focused pane (agents · scroll)",
 			"g          follow live: re-attach and jump to newest (live runs)",
 			"c          collapse the crew list (keeps the milestone block in view)",
+			"m          open the PR view for this run's merge request (when it has one)",
 		}, common...)
 	case viewPulls:
 		return append([]string{
+			"enter / →  open the selected PR (checks · reviews · merge)",
+			"u          open the PR's linked uzi run (when one exists)",
+			"w          rework the linked run",
+			"f          fix ci: queue a CI-fix run for the PR's branch",
 			"tab        switch screen (floor · pulls · ci)",
-			"1 / 2      jump to the floor / the pulls list",
+			"1 / 2 / 3  jump to the floor / pulls / ci",
 			"R          cycle the scoped repo (when several are enabled)",
 		}, common...)
 	case viewCI:
@@ -99,6 +111,14 @@ func helpLines(v tuiView) []string {
 			"tab        switch screen (floor · pulls · ci)",
 			"1 / 2 / 3  jump to the floor / pulls / ci",
 			"R          cycle the scoped repo (when several are enabled)",
+		}, common...)
+	case viewPR:
+		return append([]string{
+			"↑ / ↓      move the cursor over the checks",
+			"↗          the selected check's URL is a clickable link",
+			"u          open the PR's linked uzi run (when one exists)",
+			"w          rework the linked run (fix review findings)",
+			"f          fix ci: queue a CI-fix run for the PR's branch",
 		}, common...)
 	default:
 		return append([]string{

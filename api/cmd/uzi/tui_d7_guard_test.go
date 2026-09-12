@@ -150,6 +150,23 @@ var d7UntrustedFields = []string{
 	"runSHA",
 	"runTitle",
 	"actorLogin",
+	// Forge PR-drill-in text drawn on the PR view (PRD #1255 M5, D7, tui_pr.go). PullDTO.Author is
+	// drawn in the PR header (and already sanitized via cellText in the pulls filter), so the bare
+	// wire name "Author" is added directly. The CheckDTO / PullReviewDTO / MergeStateDTO fields
+	// (Name / Description / State / BlockedReason / MergeableState) are generic and COLLIDE with
+	// unrelated pre-existing draws in other tui_*.go files (the tool payload .Name in
+	// tui_detail_transcript.go drawn raw, pendingJudge.State in tui_review.go), so those bare names
+	// cannot be added here — they would redden the guard on code this screen does not own. Each is
+	// projected into a DISTINCTLY-NAMED internal field (prCheckText / prReviewText / prMergeText,
+	// tui_pr.go) and the distinct names are listed instead, each drawn only through renderer.Plain.
+	// CheckDTO.WebURL reuses the existing "WebURL" tripwire via prCheckURLLine (like pullLink).
+	"Author",
+	"checkName",
+	"checkDesc",
+	"reviewerLogin",
+	"reviewState",
+	"mergeBlocked",
+	"mergeableState",
 }
 
 // d7Writers are the calls that put a string on the screen. lipgloss's Render is one:

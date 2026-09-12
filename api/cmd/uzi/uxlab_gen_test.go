@@ -104,6 +104,9 @@ func TestGenerateUXLabFrames(t *testing.T) {
 		"pulls-empty":                  func(d bool) string { return pullsEmpty(d, now) },
 		"ci-populated":                 func(d bool) string { return ciPopulated(d, now) },
 		"ci-unsupported":               func(d bool) string { return ciUnsupported(d, now) },
+		"pr-live":                      func(d bool) string { return prLive(d, now) },
+		"pr-changes-requested":         func(d bool) string { return prChangesRequested(d, now) },
+		"pr-failing":                   func(d bool) string { return prFailing(d, now) },
 		"help":                         helpFrame,
 		"quit":                         quitFrame,
 	}
@@ -673,6 +676,120 @@ func ciUnsupported(dark bool, now time.Time) string {
 	m = key(m, keyViewCI)
 	m = step(m, ciMsg{reqID: m.ci.waitID, unsupported: fake.CIRunsUnsupported})
 	return m.View().Content
+}
+
+// ---- pr drill-in fixtures -------------------------------------------------
+
+// openPRScene drives the model to the PR drill-in (PRD #1255 M5) the real way: repos load, the
+// user opens the pulls list, the list lands, enter opens the PR view (minting the first fetch), and
+// the detail reply is applied. It returns the rendered frame.
+func openPRScene(dark bool, detail apitypes.PullDetailDTO) string {
+	repo := apitypes.RepoDTO{ID: "r1", PathWithNamespace: "vtmocanu/uzi", Enabled: true,
+		WebURL: "https://github.com/vtmocanu/uzi"}
+	fake := &uzicli.FakeClient{Repos: []apitypes.RepoDTO{repo}, PullDetailResult: detail}
+	m := uxModel(fake, "", dark)
+	m = step(m, reposMsg{repos: fake.Repos})
+	m = key(m, keyViewPulls)
+	m = step(m, pullsMsg{reqID: m.pulls.waitID, pulls: []apitypes.PullDTO{detail.PullDTO}})
+	m = key(m, keyEnter) // open the PR drill-in
+	m = step(m, prMsg{reqID: m.pr.waitID, detail: detail})
+	return m.View().Content
+}
+
+func prBasePull(now time.Time) apitypes.PullDTO {
+	return apitypes.PullDTO{
+		IID: 1254, Title: "Completion interlock M4–M6: rollout switch + permit finalize",
+		Author: "uzi-bot", SourceBranch: "agent/issue-1246", TargetBranch: "main",
+		HeadSHA: "f8064ef5deadbeef", WebURL: "https://github.com/vtmocanu/uzi/pull/1254",
+		RunID:     sp("f8064ef5-1111-2222-3333-444444444444"),
+		Additions: 842, Deletions: 131, Commits: 14,
+		CreatedAt: now.Add(-2 * time.Hour), UpdatedAt: now.Add(-3 * time.Minute),
+	}
+}
+
+func ckURL(job string) string {
+	return "https://github.com/vtmocanu/uzi/actions/runs/34677104577/job/" + job
+}
+
+// prLive renders the PR view while checks are still landing (the mock's live frame): five in
+// progress, five passed — so the header rollup reads `● 5 pending · ✓ 5/10`.
+func prLive(dark bool, now time.Time) string {
+	pull := prBasePull(now)
+	pull.ReviewDecision = "review_required"
+	checks := []apitypes.CheckDTO{
+		{Name: "CodeRabbit", Status: "in_progress", Description: "Waiting for status — Review in progress", Source: "coderabbitai", WebURL: ckURL("103508797991"), StartedAt: now.Add(-3 * time.Minute)},
+		{Name: "CodeQL / Analyze (javascript-typescript)", Status: "in_progress", Description: "in progress", StartedAt: now.Add(-68 * time.Second)},
+		{Name: "CI / test-api", Status: "in_progress", Description: "in progress", StartedAt: now.Add(-130 * time.Second)},
+		{Name: "CI / test-web", Status: "in_progress", Description: "in progress", StartedAt: now.Add(-96 * time.Second)},
+		{Name: "CodeQL", Status: "queued", Description: "waiting on 1 analysis"},
+		{Name: "CodeQL / Analyze (actions)", Status: "completed", Conclusion: "success", StartedAt: now.Add(-90 * time.Second), CompletedAt: now.Add(-45 * time.Second)},
+		{Name: "CodeQL / Analyze (go)", Status: "completed", Conclusion: "success", StartedAt: now.Add(-5 * time.Minute), CompletedAt: now.Add(-3 * time.Minute)},
+		{Name: "CodeQL / Analyze (python)", Status: "completed", Conclusion: "success", StartedAt: now.Add(-110 * time.Second), CompletedAt: now.Add(-55 * time.Second)},
+		{Name: "CI / lint-api", Status: "completed", Conclusion: "success", StartedAt: now.Add(-4 * time.Minute), CompletedAt: now.Add(-90 * time.Second)},
+		{Name: "KinD Smoke", Status: "completed", Conclusion: "success", StartedAt: now.Add(-30 * time.Second), CompletedAt: now.Add(-14 * time.Second)},
+	}
+	detail := apitypes.PullDetailDTO{
+		PullDTO: pull,
+		Checks:  checks,
+		Reviews: []apitypes.PullReviewDTO{
+			{Author: "coderabbitai", State: "commented", SubmittedAt: now.Add(-3 * time.Minute)},
+			{Author: "vtmocanu", State: "pending", SubmittedAt: now.Add(-2 * time.Hour)},
+		},
+		Merge: apitypes.MergeStateDTO{Conflicts: bp(false), RequiredChecksPassed: false, MergeableState: "blocked"},
+	}
+	return openPRScene(dark, detail)
+}
+
+// prChangesRequested renders the settled frame: all ten checks green, CodeRabbit requested changes
+// — so the rollup reads `✓ 10/10 · ✎ changes requested` and MERGE is blocked on the review.
+func prChangesRequested(dark bool, now time.Time) string {
+	pull := prBasePull(now)
+	pull.ReviewDecision = "changes_requested"
+	var checks []apitypes.CheckDTO
+	names := []string{"CodeRabbit", "CodeQL", "CodeQL / Analyze (actions)", "CodeQL / Analyze (go)",
+		"CodeQL / Analyze (python)", "CI / lint-api", "CI / test-api", "CI / test-web",
+		"CI / lint-web", "KinD Smoke"}
+	for i, n := range names {
+		checks = append(checks, apitypes.CheckDTO{Name: n, Status: "completed", Conclusion: "success",
+			StartedAt: now.Add(-time.Duration(5+i) * time.Minute), CompletedAt: now.Add(-time.Duration(i) * time.Minute)})
+	}
+	checks[0].Description = "Review completed"
+	checks[0].WebURL = ckURL("103508797991")
+	detail := apitypes.PullDetailDTO{
+		PullDTO: pull,
+		Checks:  checks,
+		Reviews: []apitypes.PullReviewDTO{
+			{Author: "coderabbitai", State: "changes_requested", SubmittedAt: now.Add(-30 * time.Second)},
+			{Author: "vtmocanu", State: "pending", SubmittedAt: now.Add(-2 * time.Hour)},
+		},
+		Merge: apitypes.MergeStateDTO{Conflicts: bp(false), RequiredChecksPassed: true,
+			BlockedReason: "changes requested · admin override", MergeableState: "blocked"},
+	}
+	return openPRScene(dark, detail)
+}
+
+// prFailing renders a PR with a failing check (the rollup reads `✗ 1 failing`) and a conflict with
+// the target branch, so both NEEDS-YOU carriers are on show.
+func prFailing(dark bool, now time.Time) string {
+	pull := prBasePull(now)
+	pull.ReviewDecision = "review_required"
+	pull.Conflicts = bp(true)
+	checks := []apitypes.CheckDTO{
+		{Name: "CI / lint-api", Status: "completed", Conclusion: "failure", Description: "golangci-lint: 2 issues", WebURL: ckURL("103508700001"), StartedAt: now.Add(-6 * time.Minute), CompletedAt: now.Add(-4 * time.Minute)},
+		{Name: "CI / test-api", Status: "in_progress", Description: "in progress", StartedAt: now.Add(-3 * time.Minute)},
+		{Name: "CodeQL / Analyze (go)", Status: "completed", Conclusion: "success", StartedAt: now.Add(-5 * time.Minute), CompletedAt: now.Add(-3 * time.Minute)},
+		{Name: "KinD Smoke", Status: "completed", Conclusion: "skipped", Description: "skipped"},
+	}
+	detail := apitypes.PullDetailDTO{
+		PullDTO: pull,
+		Checks:  checks,
+		Reviews: []apitypes.PullReviewDTO{
+			{Author: "vtmocanu", State: "pending", SubmittedAt: now.Add(-90 * time.Minute)},
+		},
+		Merge: apitypes.MergeStateDTO{Conflicts: bp(true), RequiredChecksPassed: false,
+			BlockedReason: "1 required check failing", MergeableState: "dirty"},
+	}
+	return openPRScene(dark, detail)
 }
 
 // ---- overlays -------------------------------------------------------------

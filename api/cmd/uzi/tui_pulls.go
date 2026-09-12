@@ -396,6 +396,49 @@ func (m tuiModel) pullsKey(k string) (tea.Model, tea.Cmd) {
 	}
 
 	switch k {
+	case keyEnter, keyRight:
+		// enter / → opens the PR drill-in for the selected PR (PRD #1255 M5 D1): a fresh prState
+		// scoped to the current repo + the row's iid, the esc-provenance set to this list, and an
+		// immediate fetch so the drill-in is not stuck on "loading…" until the next 5s tick.
+		pr, ok := m.pulls.selected()
+		if !ok {
+			return m, nil
+		}
+		repo, rok := m.currentRepo()
+		if !rok {
+			return m, nil
+		}
+		m.pr = newPRState(repo.ID, pr.IID)
+		m.view = viewPR
+		m.prReturn = viewPulls
+		m.forgeNotice = ""
+		return m, (&m).startPRReq()
+	case keyRunLink:
+		// u (↳ run): open the selected PR's linked uzi run in the run view, returning here on esc. A
+		// nil RunID is a no-op (the legend hides u then).
+		if pr, ok := m.pulls.selected(); ok {
+			return m.openLinkedRun(pr.RunID, viewPulls)
+		}
+		return m, nil
+	case keyRework:
+		// w: rework the selected PR's linked run. Shown only when RunID != nil; the server enforces
+		// the completed / open-MR / reworkable preconditions and its 409 reason is drawn inline.
+		if pr, ok := m.pulls.selected(); ok && pr.RunID != nil && *pr.RunID != "" {
+			return m, m.reworkCmd(*pr.RunID)
+		}
+		return m, nil
+	case keyFixCI:
+		// f: queue a CI-fix run for the selected PR's head branch; the server 409s an unwatched/green
+		// ref (R6) and that reason is drawn inline.
+		pr, ok := m.pulls.selected()
+		if !ok {
+			return m, nil
+		}
+		repo, rok := m.currentRepo()
+		if !rok {
+			return m, nil
+		}
+		return m, m.fixCICmd(repo.ID, pr.SourceBranch)
 	case keyFilter:
 		m.pulls.filtering = true
 		return m, nil
@@ -425,6 +468,7 @@ func (m tuiModel) pullsKey(k string) (tea.Model, tea.Cmd) {
 			m.repoChosen = true
 			m.pulls.resetForRepoChange()
 			m.ci.resetForRepoChange()
+			m.forgeNotice = "" // a row action on the prior repo is no longer relevant
 			return m, (&m).startPullsReq()
 		}
 		return m, nil
@@ -773,9 +817,14 @@ func (m tuiModel) pullsSummary() string {
 	return strings.Join(segs, m.pal.faint.Render(" · "))
 }
 
-// pullsHeaderNote is the sub-header line: the forge rate-limit state (D4) takes priority over
-// a generic refresh error, so a 429 reads as a backoff rather than a failure.
+// pullsHeaderNote is the sub-header line: a transient row-action notice (a w/f confirmation or the
+// server's 409 reason, PRD #1255 M5) takes priority — the user just acted, so that is the most
+// relevant thing — then the forge rate-limit state (D4) over a generic refresh error, so a 429
+// reads as a backoff rather than a failure. forgeNotice is already sanitized where it is set.
 func (m tuiModel) pullsHeaderNote() string {
+	if m.forgeNotice != "" {
+		return m.pal.faint.Render(" " + m.forgeNotice)
+	}
 	if m.pulls.rateLimited {
 		retry := "soon"
 		if m.pulls.retryAfter > 0 {
@@ -824,11 +873,15 @@ func (m tuiModel) pullsEmptyState() string {
 	return m.pal.faint.Render(" "+msg) + "\n"
 }
 
-// pullsFooter is the one-line key legend for the pulls screen (D13: only the keys M4a binds —
-// the u/w/f row actions and `enter open` land in M5). R is dropped when only one repo is
-// enabled.
+// pullsFooter is the one-line key legend for the pulls screen (D13). enter opens the PR drill-in
+// and f queues a CI-fix for the selected row's branch (always offered); u (↳ run) and w (rework)
+// are shown only when the selected PR has a linked run. R is dropped when only one repo is enabled.
 func (m tuiModel) pullsFooter() string {
-	parts := []string{m.keyHint("↑↓", "move"), m.keyHint("/", "filter")}
+	parts := []string{m.keyHint("↑↓", "move"), m.keyHint("enter", "open")}
+	if pr, ok := m.pulls.selected(); ok && pr.RunID != nil && *pr.RunID != "" {
+		parts = append(parts, m.keyHint("u", "run"), m.keyHint("w", "rework"))
+	}
+	parts = append(parts, m.keyHint("f", "fix ci"), m.keyHint("/", "filter"))
 	if len(m.repos) > 1 {
 		parts = append(parts, m.keyHint("R", "repo"))
 	}

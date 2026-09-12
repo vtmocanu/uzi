@@ -428,18 +428,23 @@ func (d *detailState) selectedLane() (agentLane, bool) {
 	return d.lanes[d.laneIdx], true
 }
 
-// exitToBoard leaves the run detail and returns to the factory-floor board: it closes the live
-// stream, drops the detail state, and refetches the board. Shared by esc and by ← at the left
-// pane boundary so the two cannot drift.
+// exitToBoard leaves the run detail and returns to WHERE the drill-in was opened from (PRD #1255
+// M5 D1): m.detailReturn — the factory-floor board by default (board→detail→esc is unchanged), or
+// the pulls list / the PR view when the run was opened via a u ↳ run jump. It closes the live
+// stream, drops the detail state, and refetches the board. Shared by esc and by ← at the left pane
+// boundary so the two cannot drift. The name is kept for continuity; it now honours detailReturn.
 func (m tuiModel) exitToBoard() (tea.Model, tea.Cmd) {
 	if m.detail.stream != nil {
 		m.detail.stream.Close()
 	}
-	m.view = viewBoard
+	m.view = m.detailReturn
+	m.detailReturn = viewBoard // reset to the default for the next drill-in
 	m.detail = detailState{}
 	// Mint a new id via startBoardReq so this refetch can't clear a periodic poll's guard: a
 	// board poll may be outstanding when the user backs out, and reusing its id would let this
-	// reply (or that stale one) be mistaken for the other (PRD #1130 M1 D2).
+	// reply (or that stale one) be mistaken for the other (PRD #1130 M1 D2). The board poll stays
+	// live regardless of the screen returned to, so refetching it is harmless when returning to
+	// pulls / the PR view and keeps the board fresh for when the user comes back.
 	return m, (&m).startBoardReq()
 }
 
@@ -464,6 +469,19 @@ func (m tuiModel) detailKey(k string) (tea.Model, tea.Cmd) {
 	switch k {
 	case keyEsc:
 		return m.exitToBoard()
+	case keyPRView:
+		// m: open the PR drill-in for this run's merge request (PRD #1255 M5 D1), the run → PR
+		// cross-link. No-op (hidden from the legend) when the run has no MR/repo. m.detail is NOT
+		// clobbered — it persists on the model — so the PR view's esc (prReturn = viewDetail) returns
+		// to the still-loaded run view.
+		if m.detail.run.MrIID != nil && m.detail.run.RepoID != nil && *m.detail.run.RepoID != "" {
+			m.pr = newPRState(*m.detail.run.RepoID, *m.detail.run.MrIID)
+			m.view = viewPR
+			m.prReturn = viewDetail
+			m.forgeNotice = ""
+			return m, (&m).startPRReq()
+		}
+		return m, nil
 	case keyRefresh:
 		var cmds []tea.Cmd
 		if m.detail.metaWaitID == 0 {
@@ -847,6 +865,11 @@ func (m tuiModel) detailFooter() string {
 		// g re-attaches the transcript follow (M5); it is a view affordance, so it shows for
 		// owner and non-owner alike, but only when there is live output to follow.
 		parts = append(parts, m.keyHint("g", "live"))
+	}
+	if m.detail.run.MrIID != nil {
+		// m opens the PR view for this run's merge request (PRD #1255 M5 D1); shown only when the
+		// run actually has an MR, so the key is never advertised when it is inert.
+		parts = append(parts, m.keyHint("m", "pr"))
 	}
 	if owner {
 		// v review is meaningless at a plan gate (no verdict yet); everywhere else the owner
