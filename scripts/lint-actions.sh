@@ -31,7 +31,12 @@
 #   * --min-confidence=high: after SHA-pinning every `uses:`, the only High-confidence
 #     findings are `unpinned-uses` (which now gates any FUTURE unpinned action) and
 #     High-confidence `template-injection` (a `${{ }}` context that can carry
-#     attacker input into a shell). The remaining audits on this repo -- `artipacked`
+#     attacker input into a shell). zizmor 1.30 adds a third High-confidence
+#     (Low-severity) audit, `self-repository`, flagging workspace-relative
+#     `uses: ./` local-action refs; it passes this --min-confidence=high filter but
+#     is suppressed in .github/zizmor.yml because actionlint (pinned) rejects the
+#     recommended `$/` self-repo syntax (rhysd/actionlint#711) -- re-enable it once
+#     actionlint supports `$/`. The remaining audits on this repo -- `artipacked`
 #     (Medium/Low: persist-credentials on checkout) and Low-confidence
 #     template-injection -- are REPORTED by a bare `zizmor` run but are NOT gated,
 #     the same severity-staging this repo uses for golangci's warn tier. Lowering
