@@ -168,7 +168,7 @@ func TestListMRWatchCandidatesLiveDB(t *testing.T) {
 	// the board: without the `kind NOT IN ('prompt','self_improve')` filter in the CTE it
 	// satisfies Lane A (opened + Human Review) and the board-coupled syncOneMRState would
 	// move the SHARED tracking-issue card on the MR close/reopen edge — the R1 violation.
-	// The kind filter drops it here; ListScheduledMRStateWatchCandidates owns it board-free
+	// The kind filter drops it here; ListBoardFreeMRStateWatchCandidates owns it board-free
 	// instead. Designed to FAIL on the pre-fix query (112 would appear as a 6th candidate);
 	// its exclusion plus the exact count of 5 below is the non-vacuous proof.
 	issue(112, "opened", hr)
@@ -226,6 +226,89 @@ func TestListMRWatchCandidatesLiveDB(t *testing.T) {
 	}
 	if c := got[109]; c.MrIid.Int64 != 209 || c.MrState.String != "locked" {
 		t.Errorf("candidate 109 = {mr_iid:%d mr_state:%q}, want {209 \"locked\"}", c.MrIid.Int64, c.MrState.String)
+	}
+}
+
+// TestBoardFreeAndBoardCoupledLanesDisjointLiveDB is the D1 disjointness invariant for issue
+// #1253: an issue-less MR-bearing helper run (ci_fix, issue_iid NULL) must be owned by EXACTLY
+// ONE watch lane — the board-free ListBoardFreeMRStateWatchCandidates, NOT the board-coupled
+// ListMRWatchCandidates. The widened board-free predicate
+// (issue_iid IS NULL OR kind IN ('prompt','self_improve')) and the board-coupled query's issues
+// JOIN make the two sets disjoint by construction; this guards against a future predicate change
+// reopening double-ownership (two lanes racing to record the same run's mr_state, one of them
+// also able to move a shared board card). An `issues` row is seeded so the board-lane query has
+// something to JOIN and the "absent from the board lane" assertion is meaningful rather than
+// vacuously empty.
+//
+// Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres; `go test ./...` SKIPs.
+func TestBoardFreeAndBoardCoupledLanesDisjointLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
+	}
+	ctx := context.Background()
+	if err := store.Migrate(ctx, dsn); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	pool, err := store.OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	defer pool.Close()
+	q := store.New(pool)
+
+	userID, connID, repoID := uuid.New(), uuid.New(), uuid.New()
+	mustExec(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
+		userID, fmt.Sprintf("bf-disjoint-%s@e2e", userID))
+	mustExec(ctx, t, pool,
+		`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
+		 VALUES ($1, $2, 'gitlab', 'https://forge.e2e', 'bot', 1, $3)`, connID, userID, []byte{0x1})
+	mustExec(ctx, t, pool,
+		`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, enabled)
+		 VALUES ($1, $2, 1, 'g/disjoint', 'https://forge.e2e/g/disjoint', true)`, repoID, connID)
+
+	// An issue row so the board-coupled lane's issues JOIN is non-empty — a closed issue whose
+	// completed run's MR is terminal would itself be a Lane-B candidate, so to keep the board
+	// lane empty we give it an OPEN, non-Human-Review card (Lane A rejects it, Lane B is
+	// closed-issue-only). The disjointness pin is about the ci_fix run below, not this issue.
+	mustExec(ctx, t, pool,
+		`INSERT INTO issues (repo_id, forge_issue_iid, title, state, labels, web_url, has_prd_link, forge_updated_at, synced_at)
+		 VALUES ($1, 501, 't', 'opened', '["PRD"]'::jsonb, 'https://x', true, now(), now())`, repoID)
+
+	// The subject: a completed, issue-less ci_fix run sharing a PR, mr_state NULL. runs_kind_shape
+	// (00167) requires pipeline_id + pipeline_ref for ci_fix.
+	ciFixID := uuid.New()
+	const mrIID int64 = 7700
+	mustExec(ctx, t, pool,
+		`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, branch, pipeline_id, pipeline_ref, mr_iid, mr_state, status)
+		 VALUES ($1, $2, $3, 'ci_fix', NULL, 't', 'd', $4, 5150, $4, $5, NULL, 'completed')`,
+		ciFixID, userID, repoID, "uzi/ci-fix-"+uuid.New().String(), mrIID)
+
+	// Present in the board-free lane.
+	bf, err := q.ListBoardFreeMRStateWatchCandidates(ctx, repoID)
+	if err != nil {
+		t.Fatalf("ListBoardFreeMRStateWatchCandidates: %v", err)
+	}
+	foundBF := false
+	for _, c := range bf {
+		if c.ID == ciFixID {
+			foundBF = true
+		}
+	}
+	if !foundBF {
+		t.Errorf("issue-less ci_fix run %s must be in the board-free lane; got %+v", ciFixID, bf)
+	}
+
+	// Absent from the board-coupled lane (it has no issue_iid to JOIN, so the board-move watcher
+	// can never own it).
+	bc, err := q.ListMRWatchCandidates(ctx, repoID)
+	if err != nil {
+		t.Fatalf("ListMRWatchCandidates: %v", err)
+	}
+	for _, c := range bc {
+		if c.ID == ciFixID {
+			t.Errorf("issue-less ci_fix run %s must NOT be in the board-coupled lane (double ownership); got %+v", ciFixID, bc)
+		}
 	}
 }
 

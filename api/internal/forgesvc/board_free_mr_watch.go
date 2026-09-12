@@ -10,18 +10,20 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// SyncScheduledMRStates is the board-FREE MR-state recorder for the scheduled lanes
-// (prompt, self_improve) — PRD #908. The poller calls it once per repo per tick, right
-// after SyncMRStates. Unlike SyncMRStates it moves NO board card: prompt runs are
-// issue-less and the self_improve tracking issue is not board-promoted. It only records
-// runs.mr_state (via the existing recordMRState, the sole SQL writer — invariant preserved)
-// and, on the opened->closed / ->merged edge, cancels an in-flight rework via the existing
+// SyncBoardFreeMRStates is the board-FREE MR-state recorder — PRD #908. It owns every
+// completed, MR-bearing run with no board card: the scheduled lanes (prompt, self_improve)
+// AND every issue-less MR-bearing helper run (mr_rework, ci_fix, any issue-less kind sharing
+// another run's PR). The poller calls it once per repo per tick, right after SyncMRStates.
+// Unlike SyncMRStates it moves NO board card: an issue-less run has no card by construction,
+// and the self_improve tracking issue is not board-promoted. It only records runs.mr_state
+// (via the existing recordMRState, the sole SQL writer — invariant preserved) and, on the
+// opened->closed / ->merged edge, cancels an in-flight rework via the existing
 // cancelReworkOnClosedMR (issue #853 contract, reused verbatim). Reads the run set from
-// ListScheduledMRStateWatchCandidates, which self-evicts a run once its mr_state is terminal.
+// ListBoardFreeMRStateWatchCandidates, which self-evicts a run once its mr_state is terminal.
 //
 // SCOPE BOUNDARY (PRD #908 design, "self-bounding like Lane B"): closed AND merged are
 // terminal for this lane — the candidate query drops a run at mr_state='closed', so a
-// scheduled MR that a reviewer closes then REOPENS is not re-watched and does not regain
+// board-free MR that a reviewer closes then REOPENS is not re-watched and does not regain
 // mr_rework eligibility. That is deliberate: unlike the issue lane's board-coupled Lane A
 // (which keeps watching a closed-issue run for the reopen edge), a board-free recorder that
 // kept polling closed MRs forever would reintroduce the unbounded-growth cost the design
@@ -29,8 +31,8 @@ import (
 //
 // Like SyncMRStates it never returns a per-candidate error (log-and-skip); only a failure
 // to enumerate candidates surfaces to the poller.
-func (s *Service) SyncScheduledMRStates(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, f forge.Forge) error {
-	candidates, err := s.q.ListScheduledMRStateWatchCandidates(ctx, repoID)
+func (s *Service) SyncBoardFreeMRStates(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, f forge.Forge) error {
+	candidates, err := s.q.ListBoardFreeMRStateWatchCandidates(ctx, repoID)
 	if err != nil {
 		return err
 	}
@@ -38,26 +40,26 @@ func (s *Service) SyncScheduledMRStates(ctx context.Context, repoID uuid.UUID, f
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		s.recordScheduledMRState(ctx, repoID, forgeProjectID, f, c)
+		s.recordBoardFreeMRState(ctx, repoID, forgeProjectID, f, c)
 	}
 	return nil
 }
 
-// recordScheduledMRState reconciles one scheduled run's MR state against the stored value,
+// recordBoardFreeMRState reconciles one board-free run's MR state against the stored value,
 // board-free. It is a second implementation of syncOneMRState's observe->persist->cancel
 // contract WITHOUT the board move; the two must agree on: unknown-state -> no write; the
 // NULL bootstrap records without acting; opened->closed and ->merged cancel exactly once;
 // locked is transient (no cancel); a forge read failure or a cancel failure leaves mr_state
 // unadvanced so the next tick retries.
-func (s *Service) recordScheduledMRState(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, f forge.Forge, c store.ListScheduledMRStateWatchCandidatesRow) {
+func (s *Service) recordBoardFreeMRState(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, f forge.Forge, c store.ListBoardFreeMRStateWatchCandidatesRow) {
 	mr, err := f.GetMergeRequest(ctx, forgeProjectID, c.MrIid.Int64)
 	if err != nil {
-		slog.Warn("forgesvc: scheduled MR-state read failed", "repo", repoID, "run", c.ID, "mr", c.MrIid.Int64, "error", err)
+		slog.Warn("forgesvc: board-free MR-state read failed", "repo", repoID, "run", c.ID, "mr", c.MrIid.Int64, "error", err)
 		return
 	}
 	observed := mr.State
 	if !forge.IsKnownMRState(observed) {
-		slog.Warn("forgesvc: ignoring unknown scheduled MR state", "repo", repoID, "run", c.ID, "mr", c.MrIid.Int64, "state", observed)
+		slog.Warn("forgesvc: ignoring unknown board-free MR state", "repo", repoID, "run", c.ID, "mr", c.MrIid.Int64, "state", observed)
 		return
 	}
 	if !c.MrState.Valid {
@@ -83,7 +85,7 @@ func (s *Service) recordScheduledMRState(ctx context.Context, repoID uuid.UUID, 
 		// cancelling. No board move (board-free). On cancel failure leave mr_state
 		// unadvanced so the next tick re-observes the edge and retries.
 		if err := s.cancelReworkOnClosedMR(ctx, repoID, c.MrIid.Int64); err != nil {
-			slog.Warn("forgesvc: cancel scheduled rework on MR terminal state failed, will retry", "repo", repoID, "run", c.ID, "mr", c.MrIid.Int64, "state", observed, "error", err)
+			slog.Warn("forgesvc: cancel board-free rework on MR terminal state failed, will retry", "repo", repoID, "run", c.ID, "mr", c.MrIid.Int64, "state", observed, "error", err)
 			return
 		}
 		s.recordMRState(ctx, c.ID, observed)
