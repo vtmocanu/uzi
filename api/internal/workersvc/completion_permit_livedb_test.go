@@ -1,11 +1,13 @@
 package workersvc
 
 import (
+	"errors"
 	"sort"
 	"testing"
 
 	"github.com/google/uuid"
 
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -616,5 +618,375 @@ func TestPermitNULStrippedEndToEndLiveDB(t *testing.T) {
 	}
 	if !consumed {
 		t.Fatal("the permit must be consumed by the NUL-head completion")
+	}
+}
+
+// openQuestionIDNull reports whether runs.open_question_id is NULL for the run.
+func (e interlockLiveDB) openQuestionIDNull(t *testing.T, runID uuid.UUID) bool {
+	t.Helper()
+	var isNull bool
+	if err := e.pool.QueryRow(e.ctx,
+		`SELECT open_question_id IS NULL FROM runs WHERE id = $1`, runID).Scan(&isNull); err != nil {
+		t.Fatalf("read open_question_id: %v", err)
+	}
+	return isNull
+}
+
+// TestSetRunCompletionHoldLiveDB (PRD #1226 M4, D6) proves the dedicated completion-HOLD
+// transition. An OWNED, INTERLOCKED run with at least one recorded completion attempt holds from
+// BOTH running and awaiting_input (-> paused, hold_reason='completion_blocked', captured head
+// recorded, open_question_id cleared). A run with completion_attempts==0, in a non-
+// running/awaiting_input status, or LEGACY (completion_contract_version NULL) is REFUSED (0 rows ->
+// applied=false, status unchanged). And SetRunPaused — the SIBLING this must not weaken — still
+// pauses an owner-pause run, unchanged.
+func TestSetRunCompletionHoldLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	svc := e.permitService(t)
+	wid := e.seedWorker(t, []string{"completion_interlock_v1"})
+	wkr := store.Worker{ID: wid}
+
+	// Case 1: owned interlocked RUNNING run with completion_attempts>0 holds; the captured head
+	// is recorded and a resolved open_question_id is cleared.
+	running := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
+	e.exec(t, `UPDATE runs SET completion_attempts = 1, open_question_id = 'q-should-clear' WHERE id = $1`, running)
+	run, applied, err := svc.SetRunCompletionHold(e.ctx, wkr, running, "capturedhead1")
+	if err != nil {
+		t.Fatalf("SetRunCompletionHold (running): %v", err)
+	}
+	if !applied {
+		t.Fatal("an owned interlocked running run with an attempt must hold (applied)")
+	}
+	if run.Status != "paused" {
+		t.Fatalf("held run status = %q, want paused", run.Status)
+	}
+	if !run.HoldReason.Valid || run.HoldReason.String != "completion_blocked" {
+		t.Fatalf("hold_reason = %+v, want 'completion_blocked'", run.HoldReason)
+	}
+	if !run.HoldCapturedHead.Valid || run.HoldCapturedHead.String != "capturedhead1" {
+		t.Fatalf("hold_captured_head = %+v, want 'capturedhead1'", run.HoldCapturedHead)
+	}
+	if !e.openQuestionIDNull(t, running) {
+		t.Fatal("open_question_id must be cleared by the hold (NO SETTER MAY LEAVE A RESOLVED open_question_id BEHIND)")
+	}
+
+	// Case 2: owned interlocked AWAITING_INPUT run with an attempt also holds.
+	awaiting := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
+	e.exec(t, `UPDATE runs SET status = 'awaiting_input', completion_attempts = 2 WHERE id = $1`, awaiting)
+	run2, applied2, err := svc.SetRunCompletionHold(e.ctx, wkr, awaiting, "")
+	if err != nil {
+		t.Fatalf("SetRunCompletionHold (awaiting_input): %v", err)
+	}
+	if !applied2 || run2.Status != "paused" {
+		t.Fatalf("an awaiting_input interlocked run with an attempt must hold; applied=%v status=%q", applied2, run2.Status)
+	}
+	// An empty captured head is allowed and stored NULL.
+	if run2.HoldCapturedHead.Valid {
+		t.Fatalf("an empty captured head must store NULL; got %+v", run2.HoldCapturedHead)
+	}
+
+	// Case 3: completion_attempts==0 is REFUSED (the guard fails); status is unchanged. THIS is
+	// the assertion the completion_attempts>0 mutation check reddens.
+	noAttempts := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false) // attempts defaults to 0
+	run3, applied3, err := svc.SetRunCompletionHold(e.ctx, wkr, noAttempts, "h")
+	if err != nil {
+		t.Fatalf("SetRunCompletionHold (attempts=0): %v", err)
+	}
+	if applied3 {
+		t.Fatal("a run with completion_attempts=0 must NOT hold")
+	}
+	if run3.Status != "running" {
+		t.Fatalf("a refused hold must leave status unchanged; got %q, want running", run3.Status)
+	}
+	if s := e.runStatus(t, noAttempts); s != "running" {
+		t.Fatalf("db status after refused hold = %q, want running", s)
+	}
+
+	// Case 4: a non-running/awaiting_input status (queued) is REFUSED even with an attempt.
+	queued := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
+	e.exec(t, `UPDATE runs SET status = 'queued', completion_attempts = 3 WHERE id = $1`, queued)
+	run4, applied4, err := svc.SetRunCompletionHold(e.ctx, wkr, queued, "h")
+	if err != nil {
+		t.Fatalf("SetRunCompletionHold (queued): %v", err)
+	}
+	if applied4 {
+		t.Fatal("a queued run must NOT hold (source guard is running/awaiting_input only)")
+	}
+	if run4.Status != "queued" {
+		t.Fatalf("a refused hold must leave status unchanged; got %q, want queued", run4.Status)
+	}
+
+	// Case 5: SetRunPaused — the sibling this must not weaken — still pauses an owner-pause run.
+	ownerPause := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
+	e.exec(t, `UPDATE runs SET pause_requested_at = now() WHERE id = $1`, ownerPause)
+	rows, err := e.q.SetRunPaused(e.ctx, store.SetRunPausedParams{ID: ownerPause, WorkerID: pgconv.UUID(wid)})
+	if err != nil {
+		t.Fatalf("SetRunPaused: %v", err)
+	}
+	if rows != 1 {
+		t.Fatalf("SetRunPaused must still pause an owner-pause running run; rows=%d", rows)
+	}
+	if s := e.runStatus(t, ownerPause); s != "paused" {
+		t.Fatalf("owner-pause run status = %q, want paused", s)
+	}
+
+	// Case 6: a LEGACY (non-interlocked) running run with completion_attempts>0 is REFUSED — the
+	// completion_contract_version IS NOT NULL guard clause keeps a run that never interlocks out of
+	// the hold, even though it satisfies the status and attempt predicates. Seed a frozen run, then
+	// NULL its contract version so only that clause distinguishes it from Case 1. Mutation-check:
+	// drop `completion_contract_version IS NOT NULL` from SetRunCompletionHold and this reddens.
+	legacy := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
+	e.exec(t, `UPDATE runs SET completion_contract_version = NULL, completion_attempts = 4 WHERE id = $1`, legacy)
+	run6, applied6, err := svc.SetRunCompletionHold(e.ctx, wkr, legacy, "h")
+	if err != nil {
+		t.Fatalf("SetRunCompletionHold (legacy): %v", err)
+	}
+	if applied6 {
+		t.Fatal("a LEGACY (completion_contract_version NULL) run must NOT hold, even with an attempt " +
+			"(completion_contract_version IS NOT NULL guard)")
+	}
+	if run6.Status != "running" {
+		t.Fatalf("a refused legacy hold must leave status unchanged; got %q, want running", run6.Status)
+	}
+	if s := e.runStatus(t, legacy); s != "running" {
+		t.Fatalf("db status after refused legacy hold = %q, want running", s)
+	}
+
+	// Case 7: a FOREIGN worker cannot hold a run it does not own — this pins the worker_id
+	// authorization predicate (SetRunCompletionHold binds WHERE worker_id = @worker_id, so a
+	// non-owning worker matches 0 rows and the service re-read fails ErrRunNotOwned). Seed a second
+	// worker and a fresh owned interlocked RUNNING run with an attempt (mirror Case 1), then have
+	// the foreign worker attempt the hold: it is refused (ErrRunNotOwned), applied=false, the run
+	// stays running with its hold columns untouched, and no decision/follow_up/answer row is written.
+	otherWid := e.seedWorker(t, []string{"completion_interlock_v1"})
+	other := store.Worker{ID: otherWid}
+	foreign := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
+	e.exec(t, `UPDATE runs SET completion_attempts = 1 WHERE id = $1`, foreign)
+	run7, applied7, err := svc.SetRunCompletionHold(e.ctx, other, foreign, "foreignhead")
+	if !errors.Is(err, ErrRunNotOwned) {
+		t.Fatalf("a foreign worker must be refused ErrRunNotOwned; got run=%+v applied=%v err=%v", run7, applied7, err)
+	}
+	if applied7 {
+		t.Fatal("a foreign worker's hold must NOT be applied")
+	}
+	if s := e.runStatus(t, foreign); s != "running" {
+		t.Fatalf("a foreign hold attempt must leave status unchanged; got %q, want running", s)
+	}
+	// The hold columns must be untouched (never entered the hold).
+	reason, head, _ := e.holdColumns(t, foreign)
+	if reason != nil {
+		t.Fatalf("hold_reason must stay NULL after a foreign hold attempt; got %q", *reason)
+	}
+	if head != nil {
+		t.Fatalf("hold_captured_head must stay NULL after a foreign hold attempt; got %q", *head)
+	}
+	// And no run_user_inputs rows were written by the refused attempt.
+	for _, kind := range []string{"completion_decision", "follow_up", "answer"} {
+		if got := e.countInputs(t, foreign, kind); got != 0 {
+			t.Fatalf("a foreign hold attempt must write no %s row; got %d", kind, got)
+		}
+	}
+}
+
+// permitIssuedByWorker reads the single stored run_completion_permits row's issued_by_worker_id.
+func (e interlockLiveDB) permitIssuedByWorker(t *testing.T, runID uuid.UUID) uuid.UUID {
+	t.Helper()
+	var id uuid.UUID
+	if err := e.pool.QueryRow(e.ctx,
+		`SELECT issued_by_worker_id FROM run_completion_permits WHERE run_id = $1`, runID).Scan(&id); err != nil {
+		t.Fatalf("read permit issued_by_worker_id: %v", err)
+	}
+	return id
+}
+
+// TestPermitRequeueRebindsWorkerLiveDB (PRD #1226 M4.0, FIX 1): on an A->B requeue the permit
+// upsert's ON CONFLICT must REBIND issued_by_worker_id to the re-requesting worker. Worker A
+// issues a permit for (run, rev, H); the run requeues to worker B (still running, now owned by
+// B); B re-requests the SAME (rev, branch, H) and the row's issued_by_worker_id becomes B, so B's
+// completeRunWithPermit (which fences on B's id) can find and consume it and the run completes.
+// Mutation-sensitive: revert the upsert SET to `branch = EXCLUDED.branch` only and the row keeps
+// A's id, so B's completion can never match its permit -> the "B completes" assertion reddens.
+func TestPermitRequeueRebindsWorkerLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	svc := e.permitService(t)
+	workerA := e.seedWorker(t, []string{"completion_interlock_v1"})
+	workerB := e.seedWorker(t, []string{"completion_interlock_v1"})
+	runID := e.seedFrozenRun(t, workerA, []string{"m1"}, []string{"m1"}, false)
+	const (
+		head   = "d00df00d"
+		branch = "agent/issue-1"
+	)
+
+	// Worker A obtains the permit; the row is issued by A.
+	if p, err := svc.RequestCompletionPermit(e.ctx, store.Worker{ID: workerA}, runID,
+		CompletionPermitRequest{ContractRevision: 1, Branch: branch, Head: head}); err != nil || !p.Granted {
+		t.Fatalf("worker A permit must be granted: %+v err=%v", p, err)
+	}
+	if got := e.permitIssuedByWorker(t, runID); got != workerA {
+		t.Fatalf("permit must initially be issued by A (%s), got %s", workerA, got)
+	}
+
+	// Requeue: the run moves to worker B, still in a live claimed (running) state.
+	e.exec(t, `UPDATE runs SET worker_id = $1 WHERE id = $2`, workerB, runID)
+
+	// Worker B re-requests the SAME identity: the ON CONFLICT must rebind the permit to B.
+	second, err := svc.RequestCompletionPermit(e.ctx, store.Worker{ID: workerB}, runID,
+		CompletionPermitRequest{ContractRevision: 1, Branch: branch, Head: head})
+	if err != nil || !second.Granted {
+		t.Fatalf("worker B re-request must be granted: %+v err=%v", second, err)
+	}
+	if got := e.permitIssuedByWorker(t, runID); got != workerB {
+		t.Fatalf("after B's re-request the permit must be REBOUND to B (%s); got %s (stale worker A binding)", workerB, got)
+	}
+
+	// B's completion must terminate the run — impossible if the permit still carries A's id.
+	run, applied, err := svc.SetState(e.ctx, store.Worker{ID: workerB}, runID,
+		StateRequest{State: "completed", Head: strPtr(head), Branch: strPtr(branch)})
+	if err != nil {
+		t.Fatalf("SetState completed (worker B): %v", err)
+	}
+	if !applied || run.Status != "completed" {
+		t.Fatalf("worker B must complete the requeued run via its rebound permit; applied=%v status=%q", applied, run.Status)
+	}
+}
+
+// TestPermitHeadNormalizationLiveDB (PRD #1226 M4.0, FIX 2): the issue side must normalize head
+// with the SAME NUL-strip-then-TrimSpace the consume side uses. A head with surrounding
+// whitespace is stored TRIMMED (so a subsequent trimmed consume-side lookup matches and the run
+// completes), and an all-whitespace head that normalizes to "" is a NON-TERMINAL empty_head
+// denial that writes no permit. Mutation-sensitive: drop the TrimSpace on the issue side and the
+// stored head stays untrimmed (the whitespace completion no longer matches -> that assertion
+// reddens) AND the all-whitespace head is no longer empty-after-normalize (Granted becomes true ->
+// the empty_head assertion reddens); independently, remove the empty-head guard and the
+// all-whitespace request issues a head="" permit (Granted becomes true -> the empty_head assertion
+// reddens).
+func TestPermitHeadNormalizationLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	svc := e.permitService(t)
+	wid := e.seedWorker(t, []string{"completion_interlock_v1"})
+	wkr := store.Worker{ID: wid}
+
+	// Part A: a head with surrounding whitespace is stored trimmed and completes end to end.
+	runID := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
+	const (
+		paddedHead = "  cafebabe  "
+		cleanHead  = "cafebabe"
+	)
+	res, err := svc.RequestCompletionPermit(e.ctx, wkr, runID,
+		CompletionPermitRequest{ContractRevision: 1, Branch: "b", Head: paddedHead})
+	if err != nil {
+		t.Fatalf("padded-head permit request: %v", err)
+	}
+	if !res.Granted || res.Permit == nil {
+		t.Fatalf("a padded head must be granted (normalized): %+v", res)
+	}
+	if res.Permit.Head != cleanHead {
+		t.Fatalf("issued permit head = %q, want %q (TrimSpace at issue)", res.Permit.Head, cleanHead)
+	}
+	if _, h := e.permitBranchHead(t, runID); h != cleanHead {
+		t.Fatalf("stored permit head = %q, want %q (TrimSpace at issue)", h, cleanHead)
+	}
+	// The consume side trims identically; a completed report carrying the padded head matches the
+	// trimmed stored head and terminates the run.
+	run, applied, err := svc.SetState(e.ctx, wkr, runID,
+		StateRequest{State: "completed", Head: strPtr(paddedHead), Branch: strPtr("b")})
+	if err != nil {
+		t.Fatalf("SetState completed (padded head): %v", err)
+	}
+	if !applied || run.Status != "completed" {
+		t.Fatalf("a padded head must complete via the symmetric trim; applied=%v status=%q", applied, run.Status)
+	}
+
+	// Part B: an all-whitespace head normalizes to "" -> a non-terminal empty_head denial, no permit.
+	emptyRun := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
+	deny, err := svc.RequestCompletionPermit(e.ctx, wkr, emptyRun,
+		CompletionPermitRequest{ContractRevision: 1, Branch: "b", Head: "   "})
+	if err != nil {
+		t.Fatalf("all-whitespace-head request: %v", err)
+	}
+	if deny.Granted || deny.DenyReason != CompletionDenyEmptyHead {
+		t.Fatalf("an all-whitespace head must be a non-terminal empty_head denial; got %+v", deny)
+	}
+	var n int
+	if err := e.pool.QueryRow(e.ctx, `SELECT count(*) FROM run_completion_permits WHERE run_id = $1`, emptyRun).Scan(&n); err != nil {
+		t.Fatalf("count permits: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("an empty_head denial must write no permit; got %d rows", n)
+	}
+}
+
+// TestPermitEmptyBranchDeniedLiveDB (PRD #1226 M4.0): a branch that normalizes (NUL-strip +
+// TrimSpace) to the empty string is a NON-TERMINAL empty_branch denial that writes no permit — the
+// symmetric guard to empty_head, closing the reachable NUL path. A NUL-only branch survives the
+// handler's post-TrimSpace `== ""` reject (NUL is not unicode.IsSpace), so this calls
+// RequestCompletionPermit DIRECTLY with Branch="\x00" and a VALID non-empty head, mirroring
+// TestPermitHeadNormalizationLiveDB Part B. Mutation-check: drop the empty-branch guard in
+// RequestCompletionPermit and the NUL branch strips to "" and a permit is ISSUED (Granted becomes
+// true) -> the empty_branch assertion reddens.
+func TestPermitEmptyBranchDeniedLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	svc := e.permitService(t)
+	wid := e.seedWorker(t, []string{"completion_interlock_v1"})
+	wkr := store.Worker{ID: wid}
+	runID := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
+
+	deny, err := svc.RequestCompletionPermit(e.ctx, wkr, runID,
+		CompletionPermitRequest{ContractRevision: 1, Branch: "\x00", Head: "cafebabe"})
+	if err != nil {
+		t.Fatalf("a NUL-only branch must be a non-terminal denial, not an error: %v", err)
+	}
+	if deny.Granted || deny.DenyReason != CompletionDenyEmptyBranch {
+		t.Fatalf("a branch that normalizes to empty must be a non-terminal empty_branch denial; got %+v", deny)
+	}
+	var n int
+	if err := e.pool.QueryRow(e.ctx, `SELECT count(*) FROM run_completion_permits WHERE run_id = $1`, runID).Scan(&n); err != nil {
+		t.Fatalf("count permits: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("an empty_branch denial must write no permit; got %d rows", n)
+	}
+}
+
+// TestPermitBoundToBranchLiveDB (PRD #1226 M4.0, FIX 3): the permit is bound to the
+// worker-reported source branch, so a permit issued for branch A at head H cannot be consumed by
+// a completion reporting branch B at the same head H. A completion reporting branch B is
+// non-terminal (no permit match); reporting branch A completes. Mutation-sensitive: remove
+// `AND branch = @branch` from the Get queries (and its call-site field) and the branch-B
+// completion succeeds -> the "branch B stays non-terminal" assertion reddens.
+func TestPermitBoundToBranchLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	svc := e.permitService(t)
+	wid := e.seedWorker(t, []string{"completion_interlock_v1"})
+	runID := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
+	wkr := store.Worker{ID: wid}
+	const head = "feedface"
+
+	// Permit issued for branch "A".
+	if p, err := svc.RequestCompletionPermit(e.ctx, wkr, runID,
+		CompletionPermitRequest{ContractRevision: 1, Branch: "A", Head: head}); err != nil || !p.Granted {
+		t.Fatalf("permit for branch A must be granted: %+v err=%v", p, err)
+	}
+
+	// A completion reporting branch "B" at the same head must NOT match the branch-A permit.
+	run, applied, err := svc.SetState(e.ctx, wkr, runID,
+		StateRequest{State: "completed", Head: strPtr(head), Branch: strPtr("B")})
+	if err != nil {
+		t.Fatalf("SetState completed (branch B): %v", err)
+	}
+	if applied || run.Status == "completed" {
+		t.Fatalf("a completion reporting branch B must stay non-terminal against a branch-A permit; applied=%v status=%q", applied, run.Status)
+	}
+	if s := e.runStatus(t, runID); s != "running" {
+		t.Fatalf("run must remain running after the branch-mismatch completion; status = %q", s)
+	}
+
+	// A completion reporting the matching branch "A" completes the run.
+	run2, applied2, err := svc.SetState(e.ctx, wkr, runID,
+		StateRequest{State: "completed", Head: strPtr(head), Branch: strPtr("A")})
+	if err != nil {
+		t.Fatalf("SetState completed (branch A): %v", err)
+	}
+	if !applied2 || run2.Status != "completed" {
+		t.Fatalf("a completion reporting the matching branch A must complete the run; applied=%v status=%q", applied2, run2.Status)
 	}
 }

@@ -23,7 +23,7 @@
 -- throwaway Postgres 17 (the live-DB integration test) — a wrong name would fail the DROP.
 --
 -- Added NOT VALID so the ADD skips the validating table scan (and the ACCESS EXCLUSIVE lock it
--- would otherwise hold); 00216 runs VALIDATE CONSTRAINT under a lock-cheap scan, the same two-step
+-- would otherwise hold); 00220 runs VALIDATE CONSTRAINT under a lock-cheap scan, the same two-step
 -- pattern 00209/00210 use for a CHECK on a live table.
 ALTER TABLE recommendation_dispositions DROP CONSTRAINT recommendation_dispositions_set_via_check;
 ALTER TABLE recommendation_dispositions ADD CONSTRAINT recommendation_dispositions_set_via_check

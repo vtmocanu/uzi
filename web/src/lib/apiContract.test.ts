@@ -133,15 +133,21 @@ type ZeroOf<T, NeverNull extends keyof T = never> = {
 };
 
 // ── Run ─────────────────────────────────────────────────────────────────────
-// ZeroOf exemptions for Run (all three normalized to [] by capsOrEmpty in
-// runToDTO): plan_changed_files (handler/workers.go:448), required_capabilities
-// (:442), required_tools (:443); capsOrEmpty is handler/forge.go:148.
+// ZeroOf exemptions for Run (all normalized to [] by a mapper in runToDTO):
+// plan_changed_files (handler/workers.go:448), required_capabilities (:442),
+// required_tools (:443); capsOrEmpty is handler/forge.go:148. completion_unmet (PRD
+// #1226 M5, D8) is the fourth — decodeLatestUnmet (handler/runs_dto.go) always returns
+// [] (never null), so the TS type is a never-null string[] and the null zero fixture is
+// exempted here like the capsOrEmpty trio.
 {
   // 1. key-set equality, both directions.
   const _runMissing: never = null as unknown as Exclude<keyof Run, keyof typeof runFull>;
   const _runExtra: never = null as unknown as Exclude<keyof typeof runFull, keyof Run>;
   // 2. nullability with the mapper-normalized exemptions applied.
-  const _runZero: ZeroOf<Run, "plan_changed_files" | "required_capabilities" | "required_tools"> = runZero;
+  const _runZero: ZeroOf<
+    Run,
+    "plan_changed_files" | "required_capabilities" | "required_tools" | "completion_unmet"
+  > = runZero;
   // 3. value kinds, literal unions widened.
   const _runFull: Widen<Run> = runFull;
   void _runMissing;
@@ -151,14 +157,16 @@ type ZeroOf<T, NeverNull extends keyof T = never> = {
 }
 
 // ── RunListItem ─────────────────────────────────────────────────────────────
-// RunListItem extends Run, so its extra keys inherit the same 7 drift fields; its
+// RunListItem extends Run, so its extra keys inherit the same drift fields; its
 // own fields (repo_path, worker_name, owner_email, judge_verdict, judge_todo_count,
-// is_revising) match. Same three ZeroOf exemptions, inherited from Run.
+// is_revising) match. Same four ZeroOf exemptions, inherited from Run.
 {
   const _runListItemMissing: never = null as unknown as Exclude<keyof RunListItem, keyof typeof runListItemFull>;
   const _runListItemExtra: never = null as unknown as Exclude<keyof typeof runListItemFull, keyof RunListItem>;
-  const _runListItemZero: ZeroOf<RunListItem, "plan_changed_files" | "required_capabilities" | "required_tools"> =
-    runListItemZero;
+  const _runListItemZero: ZeroOf<
+    RunListItem,
+    "plan_changed_files" | "required_capabilities" | "required_tools" | "completion_unmet"
+  > = runListItemZero;
   const _runListItemFull: Widen<RunListItem> = runListItemFull;
   void _runListItemMissing;
   void _runListItemExtra;

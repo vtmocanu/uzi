@@ -65,6 +65,20 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 		s.maybeEnqueueJudgeByID(ctx, r.ID)
 	}
 
+	// PRD #1226 M4 (D3): the served `budget_exhausted` steer, run RIGHT AFTER the sweep with the
+	// SAME now/global_timeout_seconds/worker_stale_cutoff, so it stamps EXACTLY the post-attempt
+	// live-worker interlocked rows the carve-out just spared — arming the one-shot flag the worker
+	// reads off its running-report ACK to enter the completion hold. No broadcast/judge fan-out:
+	// the run stays `running` (a live worker still owns it), so this only sets a flag the worker
+	// acts on; nothing transitions here.
+	if res.CompletionBudgetExhausted, err = s.q.StampCompletionBudgetExhausted(ctx, store.StampCompletionBudgetExhaustedParams{
+		Now:                  pgconv.Time(now),
+		GlobalTimeoutSeconds: int32(s.p.RunTimeout.Seconds()),
+		WorkerStaleCutoff:    staleCutoff,
+	}); err != nil {
+		return res, fmt.Errorf("stamp completion budget exhausted: %w", err)
+	}
+
 	// Fail-over-cap before re-queue: the two are disjoint on requeue_count, but
 	// failing first keeps a run that just hit the cap from being re-queued.
 	failed, err := s.q.FailRunsOfStaleWorkersOverCap(ctx, store.FailRunsOfStaleWorkersOverCapParams{

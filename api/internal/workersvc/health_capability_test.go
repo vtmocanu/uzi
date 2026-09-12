@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/vault"
@@ -232,12 +233,158 @@ func TestHealthQueuedCapsGuardShortCircuits(t *testing.T) {
 	}
 }
 
+// -------------------------------------------------------------------------
+// PRD #1226 M1: the completion-capability rung. An INTERLOCKED queued run whose owner has NO
+// online worker implementing the completion protocol surfaces reasonNoCompletionCapableWorker.
+// These are ARM tests like the M3 caps tests above: they pin the mapping (interlocked + count 0
+// → the reason; count > 0 → the generic reason; not interlocked → never the reason; read error →
+// degrade), and the queuedReason completion-capability LiveDB tests pin the SQL. interlocked() sets
+// completion_contract_version so the run is interlocked; no required_capabilities keeps the caps
+// rung out of the way so the protocol rung is the deciding one.
+
+// protoSvc wires a queued-past-threshold INTERLOCKED run, a canned protocol-worker count, and an
+// online worker with a free slot so the fall-through resolves to reasonWaitingWorker (a DIFFERENT
+// string, so a passing test cannot be vacuous).
+func protoSvc(interlocked bool, count int64) (*healthFakeStore, *Service, store.ListActiveRunsForHealthRow) {
+	r := queuedRunPastThreshold()
+	if interlocked {
+		r.CompletionContractVersion = pgtype.Int4{Int32: 1, Valid: true}
+	}
+	fs := &healthFakeStore{
+		active:             []store.ListActiveRunsForHealthRow{r},
+		satisfyingProtocol: count,
+		onlineWorkers:      1,
+		freeSlotWorkers:    1,
+	}
+	return fs, healthSvc(fs, defaultHealthSettings()), r
+}
+
+// interlocked run + no protocol-capable worker → the completion-capability reason.
+func TestHealthQueuedNoCompletionCapableWorkerFlagsReason(t *testing.T) {
+	fs, svc, r := protoSvc(true, 0)
+
+	if n := svc.detectRunHealth(context.Background(), t0); n != 1 {
+		t.Fatalf("changed = %d, want 1", n)
+	}
+	w := lastWrite(t, fs, r.ID)
+	if w.Health != healthWaitingWorker {
+		t.Fatalf("health = %q, want waiting_worker — the flag maps to the existing enum, only the reason differs", w.Health)
+	}
+	if w.HealthReason.String != reasonNoCompletionCapableWorker {
+		t.Fatalf("reason = %q, want %q", w.HealthReason.String, reasonNoCompletionCapableWorker)
+	}
+	// Not vacuous: the generic wait it would otherwise emit is a DIFFERENT string.
+	if w.HealthReason.String == reasonWaitingWorker {
+		t.Fatal("used the generic queued reason for an interlocked run no worker can serve")
+	}
+	// The lookup asked about THIS run's user, exactly once.
+	if len(fs.protocolCalls) != 1 || fs.protocolCalls[0] != r.UserID {
+		t.Fatalf("protocol lookups = %v, want exactly one for user %s", fs.protocolCalls, r.UserID)
+	}
+}
+
+// interlocked run + a protocol-capable worker → falls through to the generic reason.
+func TestHealthQueuedCompletionCapableWorkerFallsThrough(t *testing.T) {
+	fs, svc, r := protoSvc(true, 1)
+
+	svc.detectRunHealth(context.Background(), t0)
+	w := lastWrite(t, fs, r.ID)
+	if w.HealthReason.String == reasonNoCompletionCapableWorker {
+		t.Fatal("emitted the no-completion-capable-worker reason while a protocol worker is online")
+	}
+	if w.Health != healthWaitingWorker || w.HealthReason.String != reasonWaitingWorker {
+		t.Fatalf("got %q/%q, want waiting_worker/%q — a serviceable interlocked run keeps the generic reason", w.Health, w.HealthReason.String, reasonWaitingWorker)
+	}
+}
+
+// a LEGACY (non-interlocked) run never reaches the rung: no protocol lookup, never the reason.
+func TestHealthQueuedNonInterlockedNeverCompletionCapableReason(t *testing.T) {
+	fs, svc, r := protoSvc(false, 0)
+
+	svc.detectRunHealth(context.Background(), t0)
+	w := lastWrite(t, fs, r.ID)
+	if w.HealthReason.String == reasonNoCompletionCapableWorker {
+		t.Fatal("emitted the completion-capability reason for a non-interlocked run")
+	}
+	if len(fs.protocolCalls) != 0 {
+		t.Fatalf("issued %d protocol lookups for a non-interlocked run, want 0", len(fs.protocolCalls))
+	}
+}
+
+// a protocol Count read error falls through to the generic queuedReason rather than inventing a
+// reason on a failed lookup — the conservative degrade the sibling per-run lookups use.
+func TestHealthQueuedCompletionProtocolReadErrorDegradesToGenericReason(t *testing.T) {
+	fs, svc, r := protoSvc(true, 0)
+	fs.satisfyingProtocolErr = errors.New("boom")
+
+	svc.detectRunHealth(context.Background(), t0)
+	w := lastWrite(t, fs, r.ID)
+	if w.HealthReason.String == reasonNoCompletionCapableWorker {
+		t.Fatal("invented the completion-capability reason on a failed Count lookup")
+	}
+	if w.Health != healthWaitingWorker || w.HealthReason.String != reasonWaitingWorker {
+		t.Fatalf("got %q/%q, want waiting_worker/%q when the protocol Count read fails", w.Health, w.HealthReason.String, reasonWaitingWorker)
+	}
+}
+
+// the completion-capability block wins over the priority-class re-label, mirroring the caps rung:
+// a demoted (background) interlocked run with no protocol worker reports the actionable block.
+func TestHealthQueuedNoCompletionCapableWorkerBeatsPriorityClass(t *testing.T) {
+	fs, svc, r := protoSvc(true, 0)
+	fs.priorityClass = map[uuid.UUID]string{r.ID: "background"} // would say "deprioritized" if it won
+
+	svc.detectRunHealth(context.Background(), t0)
+	w := lastWrite(t, fs, r.ID)
+	if w.HealthReason.String != reasonNoCompletionCapableWorker {
+		t.Fatalf("reason = %q, want %q — the completion-capability block must win over the deprioritized re-label", w.HealthReason.String, reasonNoCompletionCapableWorker)
+	}
+	// The priority lookup must not even be reached once the run is unplaceable.
+	if len(fs.priorityCalls) != 0 {
+		t.Fatalf("issued %d priority lookups after the completion-capability early-return, want 0", len(fs.priorityCalls))
+	}
+}
+
+// the ordinary capability-gap rung stays AHEAD of the completion-protocol rung: a run that is BOTH
+// cap-gapped and protocol-gapped reports reasonNoEligibleWorker, and the protocol lookup is not
+// reached (the caps rung returns first).
+func TestHealthQueuedCapGapBeatsCompletionProtocol(t *testing.T) {
+	r := queuedRunPastThreshold()
+	r.RequiredCapabilities = []string{"docker"}
+	r.CompletionContractVersion = pgtype.Int4{Int32: 1, Valid: true}
+	fs := &healthFakeStore{
+		active:             []store.ListActiveRunsForHealthRow{r},
+		satisfyingCaps:     0, // cap-gapped
+		satisfyingProtocol: 0, // also protocol-gapped
+		onlineWorkers:      1,
+		freeSlotWorkers:    1,
+	}
+	svc := healthSvc(fs, defaultHealthSettings())
+	svc.capabilitySettings = fakeCapabilitySettings{on: true}
+
+	svc.detectRunHealth(context.Background(), t0)
+	if w := lastWrite(t, fs, r.ID); w.HealthReason.String != reasonNoEligibleWorker {
+		t.Fatalf("reason = %q, want %q — the ordinary caps rung precedes the completion-protocol rung", w.HealthReason.String, reasonNoEligibleWorker)
+	}
+	if len(fs.protocolCalls) != 0 {
+		t.Fatalf("issued %d protocol lookups after the caps rung returned, want 0", len(fs.protocolCalls))
+	}
+}
+
 // The two-word reason string is the PRD #84 M3 wording, verbatim. A reword here without
 // matching the PRD (and any downstream mirror) reddens deliberately.
 func TestReasonNoEligibleWorkerWording(t *testing.T) {
 	const want = "no online worker can run this — it needs a capability none of your workers has; provision a capable worker"
 	if reasonNoEligibleWorker != want {
 		t.Fatalf("reasonNoEligibleWorker = %q, does not match the PRD #84 M3 wording", reasonNoEligibleWorker)
+	}
+}
+
+// TestReasonNoCompletionCapableWorkerWording pins the exact PRD #1226 M1 wording so a reword of the
+// completion-capability reason is a deliberate, reviewed change (mirrors the M3 wording pin above).
+func TestReasonNoCompletionCapableWorkerWording(t *testing.T) {
+	const want = "no online worker implements the completion interlock (completion_interlock_v1); provision a capable worker"
+	if reasonNoCompletionCapableWorker != want {
+		t.Fatalf("reasonNoCompletionCapableWorker = %q, does not match the PRD #1226 M1 wording", reasonNoCompletionCapableWorker)
 	}
 }
 

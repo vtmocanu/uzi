@@ -1,0 +1,449 @@
+<title>Failed Runs on the Dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<style>
+  /* uzi's own tokens: the "dawn" light theme as the base, "ember" for dark. */
+  :root {
+    color-scheme: light;
+    --bg: 242 244 247;
+    --surface: 255 255 255;
+    --raised: 235 238 243;
+    --edge: 214 219 228;
+    --edge-strong: 174 182 196;
+    --fg: 21 26 34;
+    --muted: 74 85 103;
+    --faint: 95 106 130;
+    --brand: 185 60 11;
+    --ok: 3 112 90;
+    --warn: 154 74 5;
+    --danger: 190 18 60;
+    --info: 3 105 161;
+    --plan: 79 70 229;
+    --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --bg: 8 10 15; --surface: 15 18 26; --raised: 23 27 38; --edge: 39 45 60; --edge-strong: 58 66 86;
+      --fg: 228 232 240; --muted: 148 158 176; --faint: 122 133 154;
+      --brand: 251 146 60; --ok: 52 211 153; --warn: 251 191 36; --danger: 251 113 133; --info: 56 189 248; --plan: 129 140 248;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: 8 10 15; --surface: 15 18 26; --raised: 23 27 38; --edge: 39 45 60; --edge-strong: 58 66 86;
+    --fg: 228 232 240; --muted: 148 158 176; --faint: 122 133 154;
+    --brand: 251 146 60; --ok: 52 211 153; --warn: 251 191 36; --danger: 251 113 133; --info: 56 189 248; --plan: 129 140 248;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: rgb(var(--bg));
+    color: rgb(var(--fg));
+    font-family: var(--font-sans);
+    font-size: 14px;
+    line-height: 1.45;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: rgb(var(--info)); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .num { font-variant-numeric: tabular-nums; }
+  .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+  .fg { color: rgb(var(--fg)); }
+  .muted { color: rgb(var(--muted)); }
+  .faint { color: rgb(var(--faint)); }
+  .brand { color: rgb(var(--brand)); }
+  .danger { color: rgb(var(--danger)); }
+
+  /* ---- the mock's own chrome, kept visually apart from the app ---- */
+  .mockbar {
+    position: sticky; top: 0; z-index: 5;
+    display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px;
+    padding: 10px 24px;
+    background: rgb(var(--fg));
+    color: rgb(var(--bg));
+    font-size: 12.5px;
+  }
+  .mockbar .tag {
+    font-family: var(--font-mono); font-size: 11px; letter-spacing: .08em; text-transform: uppercase;
+    padding: 2px 7px; border-radius: 4px;
+    background: rgb(var(--brand)); color: rgb(var(--surface));
+  }
+  .seg { display: inline-flex; border: 1px solid rgb(var(--bg) / .35); border-radius: 8px; overflow: hidden; }
+  .seg button {
+    appearance: none; border: 0; margin: 0; cursor: pointer;
+    padding: 5px 12px; font: inherit; font-size: 12.5px;
+    background: transparent; color: rgb(var(--bg) / .8);
+  }
+  .seg button + button { border-left: 1px solid rgb(var(--bg) / .35); }
+  .seg button[aria-pressed="true"] { background: rgb(var(--bg)); color: rgb(var(--fg)); font-weight: 600; }
+  .seg button:focus-visible { outline: 2px solid rgb(var(--brand)); outline-offset: -2px; }
+  .mockbar .hint { opacity: .75; }
+
+  /* ---- app shell ---- */
+  .page { max-width: 1180px; margin: 0 auto; padding-block: 28px 40px; padding-inline: 24px; display: grid; gap: 22px; }
+  h1 { margin: 0; font-size: 22px; font-weight: 600; letter-spacing: -.01em; text-wrap: balance; }
+  .sub { margin: 4px 0 0; color: rgb(var(--muted)); font-size: 14px; }
+
+  .card { border: 1px solid rgb(var(--edge)); background: rgb(var(--surface)); border-radius: 12px; padding: 20px; }
+  .tile { border: 1px solid rgb(var(--edge)); background: rgb(var(--surface)); border-radius: 12px; padding: 16px; transition: border-color .15s; }
+  .tile:hover { border-color: rgb(var(--edge-strong)); }
+  .label { margin: 0; font-size: 12px; font-weight: 500; text-transform: uppercase; letter-spacing: .08em; color: rgb(var(--faint)); }
+  .tile .value { margin: 6px 0 0; font-size: 24px; font-weight: 600; color: rgb(var(--fg)); }
+  .tile .hint { margin: 2px 0 0; font-size: 12px; color: rgb(var(--faint)); }
+  h2.section { margin: 0; font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .08em; color: rgb(var(--faint)); }
+  .head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+  .head a { font-size: 13px; color: rgb(var(--brand)); }
+
+  .tiles { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; }
+  .two { display: grid; grid-template-columns: 1fr; gap: 12px; }
+  @media (min-width: 900px) {
+    .tiles { grid-template-columns: repeat(4, 1fr); }
+    .two { grid-template-columns: 1fr 1fr; }
+  }
+
+  /* worker load */
+  .rows { margin: 8px 0 0; padding: 0; list-style: none; }
+  .rows li { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 0; border-top: 1px solid rgb(var(--edge)); font-size: 14px; }
+  .rows li:first-child { border-top: 0; }
+  .pill { display: inline-flex; align-items: center; gap: 6px; padding: 2px 9px; border-radius: 999px; font-size: 12.5px; border: 1px solid; }
+  .pill::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+  .pill.ok { color: rgb(var(--ok)); border-color: rgb(var(--ok) / .35); background: rgb(var(--ok) / .1); }
+  .pill.danger { color: rgb(var(--danger)); border-color: rgb(var(--danger) / .35); background: rgb(var(--danger) / .1); }
+  .pill.plan { color: rgb(var(--plan)); border-color: rgb(var(--plan) / .35); background: rgb(var(--plan) / .1); }
+  .pill.neutral { color: rgb(var(--muted)); border-color: rgb(var(--edge)); background: rgb(var(--raised)); }
+  .load { color: rgb(var(--muted)); font-size: 13px; }
+
+  /* usage cards */
+  .big { margin: 4px 0 0; font-family: var(--font-mono); font-size: 26px; font-weight: 600; letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
+  .big em { font-style: normal; font-size: 14px; color: rgb(var(--faint)); margin-left: 6px; font-family: var(--font-sans); font-weight: 500; }
+  .subrow { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 8px; font-size: 12px; color: rgb(var(--muted)); }
+  .fine { margin: 10px 0 0; font-size: 11px; color: rgb(var(--faint)); }
+
+  /* ---- the new part: failed-runs block ---- */
+  .rel { margin-top: 16px; padding-top: 14px; border-top: 1px solid rgb(var(--edge)); }
+  .rel-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; }
+  .rel-head .label { margin: 0; }
+  .rate { font-family: var(--font-mono); font-size: 22px; font-weight: 600; letter-spacing: -.02em; font-variant-numeric: tabular-nums; color: rgb(var(--fg)); }
+  .rate.hero { font-size: 26px; margin-top: 4px; display: block; }
+  .rate .pct { font-family: var(--font-sans); font-size: 14px; font-weight: 500; color: rgb(var(--faint)); margin-left: 1px; }
+  .rel-head .of { font-size: 12px; color: rgb(var(--muted)); }
+  .bar { display: flex; height: 8px; margin-top: 10px; gap: 2px; border-radius: 4px; overflow: hidden; }
+  .bar span { display: block; height: 100%; }
+  .seg-ok { background: rgb(var(--ok)); border-radius: 4px 0 0 4px; }
+  .seg-cancel { background: rgb(var(--edge-strong)); }
+  .seg-reject { background: repeating-linear-gradient(135deg, rgb(var(--edge-strong)) 0 2px, rgb(var(--surface)) 2px 4px); }
+  .seg-fail { background: rgb(var(--danger)); border-radius: 0 4px 4px 0; }
+  .legend { display: flex; flex-wrap: wrap; gap: 4px 14px; margin: 8px 0 0; padding: 0; list-style: none; font-size: 11.5px; color: rgb(var(--muted)); }
+  .legend li { display: inline-flex; align-items: center; gap: 6px; }
+  .legend i { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
+  .legend .n { color: rgb(var(--fg)); font-variant-numeric: tabular-nums; }
+  .causes { margin: 8px 0 0; font-size: 11.5px; color: rgb(var(--faint)); }
+  .causes .n { color: rgb(var(--muted)); font-variant-numeric: tabular-nums; }
+  .causes .k { color: rgb(var(--muted)); }
+
+  /* variant switching */
+  .page[data-variant="a"] .only-b { display: none; }
+  .page[data-variant="b"] .only-a { display: none; }
+
+  /* per-user table */
+  .scroll { overflow-x: auto; margin-top: 8px; }
+  table { width: 100%; min-width: 720px; border-collapse: collapse; font-size: 12px; }
+  th { padding: 6px 10px; border-bottom: 1px solid rgb(var(--edge)); font-size: 10.5px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; color: rgb(var(--faint)); text-align: right; }
+  th.l, td.l { text-align: left; }
+  td { padding: 6px 10px; text-align: right; font-family: var(--font-mono); font-variant-numeric: tabular-nums; color: rgb(var(--muted)); border-bottom: 1px solid rgb(var(--edge) / .5); }
+  td.l { font-family: var(--font-sans); color: rgb(var(--fg)); }
+  td.cost { color: rgb(var(--brand)); }
+  tr.total td { font-weight: 600; color: rgb(var(--fg)); border-bottom: 0; }
+  tr.total td.l { font-family: var(--font-sans); }
+  th.new, td.new { background: rgb(var(--brand) / .05); }
+  th.new { color: rgb(var(--brand)); }
+  .share { display: inline-flex; align-items: center; gap: 8px; white-space: nowrap; }
+  .share i { display: inline-block; width: 64px; height: 4px; border-radius: 2px; background: rgb(var(--edge)); overflow: hidden; }
+  .share i b { display: block; height: 100%; background: rgb(var(--brand)); }
+
+  /* recent runs */
+  .runs { margin: 8px 0 0; padding: 0; list-style: none; }
+  .runs li { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 12px 0; border-top: 1px solid rgb(var(--edge)); }
+  .runs li:first-child { border-top: 0; }
+  .runs .t { margin: 0; font-size: 15px; font-weight: 500; }
+  .runs .m { margin: 2px 0 0; font-size: 13px; color: rgb(var(--faint)); display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .chip { border: 1px solid rgb(var(--edge)); background: rgb(var(--raised)); border-radius: 6px; padding: 1px 7px; font-size: 12px; color: rgb(var(--muted)); }
+  .runs .r { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+
+  /* design notes */
+  .notes { max-width: 1180px; margin: 0 auto; padding-block: 8px 48px; padding-inline: 24px; }
+  .notes .card { padding: 20px 22px; }
+  .notes h3 { margin: 0 0 6px; font-size: 13px; font-weight: 600; }
+  .notes p, .notes li { font-size: 13px; color: rgb(var(--muted)); max-width: 72ch; }
+  .notes ul { margin: 0; padding-left: 18px; display: grid; gap: 6px; }
+  .notes code { font-family: var(--font-mono); font-size: 12px; color: rgb(var(--fg)); background: rgb(var(--raised)); padding: 1px 5px; border-radius: 4px; }
+  .notes .cols { display: grid; gap: 18px 32px; grid-template-columns: 1fr; }
+  @media (min-width: 900px) { .notes .cols { grid-template-columns: 1fr 1fr; } }
+
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+
+<div class="mockbar">
+  <span class="tag">Mock</span>
+  <span class="hint">Example figures. Where should the failure rate live?</span>
+  <div class="seg" role="group" aria-label="Placement">
+    <button type="button" id="pick-a" data-variant="a" aria-pressed="true">Inside the usage cards</button>
+    <button type="button" id="pick-b" data-variant="b" aria-pressed="false">Own cards</button>
+  </div>
+  <span class="hint" id="pick-note">Recommended: inside the usage cards, same scopes, same 7-day window, no new endpoint.</span>
+</div>
+
+<main class="page" id="page" data-variant="a">
+  <header>
+    <h1>Welcome, Vlad Mocanu</h1>
+    <p class="sub">The factory floor at a glance.</p>
+  </header>
+
+  <section class="tiles" aria-label="Stats">
+    <div class="tile"><p class="label">Active runs</p><p class="value num">1</p><p class="hint">agents at work</p></div>
+    <div class="tile"><p class="label">Workers online</p><p class="value num">2/2</p><p class="hint">your fleet</p></div>
+    <div class="tile"><p class="label">Boards</p><p class="value num">2</p><p class="hint">enabled repos</p></div>
+    <div class="tile"><p class="label">Agent templates</p><p class="value num">15</p><p class="hint">roles available</p></div>
+  </section>
+
+  <section class="card">
+    <div class="head"><h2 class="section">Worker load</h2><a href="#">Workers →</a></div>
+    <ul class="rows">
+      <li><span><span class="pill ok">online</span> &nbsp;<strong>base.l-da4a</strong></span><span class="load num">cpu 1% · mem 1.4/12 GiB · disk 3.4/19.6 GiB</span></li>
+      <li><span><span class="pill ok">online</span> &nbsp;<strong>base.l-43f4</strong></span><span class="load num">cpu 0% · mem 2.1/12 GiB · disk 5.4/19.5 GiB</span></li>
+    </ul>
+  </section>
+
+  <section class="two" aria-label="Usage">
+    <div class="card">
+      <h2 class="section">Your usage</h2>
+      <p class="big">18.61B<em>tokens</em></p>
+      <div class="subrow">
+        <span>in <span class="num fg">833.50M</span></span>
+        <span>cached <span class="num fg">17.64B</span></span>
+        <span>out <span class="num fg">140.94M</span></span>
+        <span>cost <span class="num brand">$18312</span></span>
+      </div>
+      <p class="fine">Across <span class="num muted">1030</span> runs, all time · <span class="num muted">5.08B</span> tok / <span class="num muted">$4629</span> in the last 7 days · <a href="#">see per-run detail&nbsp;→</a></p>
+
+      <!-- Variant A: folded into the usage card -->
+      <div class="rel only-a">
+        <div class="rel-head">
+          <p class="label">Failed runs</p>
+          <span class="rate">10.4<span class="pct">%</span></span>
+          <span class="of"><span class="num fg">106</span> of <span class="num fg">1024</span> finished runs · <span class="num fg">8%</span> (3 of 38) in the last 7 days</span>
+        </div>
+        <div class="bar" role="img" aria-label="Finished runs: 861 completed, 45 cancelled, 12 plan rejected, 106 failed">
+          <span class="seg-ok" style="width:84.1%"></span>
+          <span class="seg-cancel" style="width:4.4%"></span>
+          <span class="seg-reject" style="width:1.2%"></span>
+          <span class="seg-fail" style="width:10.3%"></span>
+        </div>
+        <ul class="legend">
+          <li><i class="seg-ok"></i>completed <span class="n">861</span></li>
+          <li><i class="seg-cancel"></i>cancelled <span class="n">45</span></li>
+          <li><i class="seg-reject"></i>plan rejected <span class="n">12</span></li>
+          <li><i class="seg-fail"></i>failed <span class="n">106</span></li>
+        </ul>
+        <p class="causes">Top causes <span class="k">agent failure</span> <span class="n">48</span> · <span class="k">run timeout</span> <span class="n">31</span> · <span class="k">worker lost</span> <span class="n">14</span> · <span class="k">rate limited</span> <span class="n">9</span></p>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2 class="section">Factory total · all users · admin</h2>
+      <p class="big">20.83B<em>tokens</em></p>
+      <div class="subrow">
+        <span>in <span class="num fg">957.99M</span></span>
+        <span>cached <span class="num fg">19.70B</span></span>
+        <span>out <span class="num fg">169.39M</span></span>
+        <span>cost <span class="num brand">$20988</span></span>
+      </div>
+      <p class="fine"><span class="num muted">1241</span> runs by <span class="num muted">3</span> users since 17 Jul 2026</p>
+
+      <div class="rel only-a">
+        <div class="rel-head">
+          <p class="label">Failed runs</p>
+          <span class="rate">10.2<span class="pct">%</span></span>
+          <span class="of"><span class="num fg">126</span> of <span class="num fg">1233</span> finished runs · <span class="num fg">9%</span> (4 of 46) in the last 7 days</span>
+        </div>
+        <div class="bar" role="img" aria-label="Finished runs: 1041 completed, 52 cancelled, 14 plan rejected, 126 failed">
+          <span class="seg-ok" style="width:84.4%"></span>
+          <span class="seg-cancel" style="width:4.2%"></span>
+          <span class="seg-reject" style="width:1.2%"></span>
+          <span class="seg-fail" style="width:10.2%"></span>
+        </div>
+        <ul class="legend">
+          <li><i class="seg-ok"></i>completed <span class="n">1041</span></li>
+          <li><i class="seg-cancel"></i>cancelled <span class="n">52</span></li>
+          <li><i class="seg-reject"></i>plan rejected <span class="n">14</span></li>
+          <li><i class="seg-fail"></i>failed <span class="n">126</span></li>
+        </ul>
+        <p class="causes">Top causes <span class="k">agent failure</span> <span class="n">55</span> · <span class="k">run timeout</span> <span class="n">36</span> · <span class="k">worker lost</span> <span class="n">18</span> · <span class="k">rate limited</span> <span class="n">12</span></p>
+      </div>
+    </div>
+  </section>
+
+  <!-- Variant B: a second pair of cards -->
+  <section class="two only-b" aria-label="Reliability">
+    <div class="card">
+      <h2 class="section">Your failed runs</h2>
+      <span class="rate hero">10.4<span class="pct">%</span></span>
+      <div class="subrow">
+        <span>failed <span class="num danger">106</span></span>
+        <span>finished <span class="num fg">1024</span></span>
+        <span>last 7 days <span class="num fg">8%</span> <span class="faint">(3 of 38)</span></span>
+      </div>
+      <div class="bar" role="img" aria-label="Finished runs: 861 completed, 45 cancelled, 12 plan rejected, 106 failed">
+        <span class="seg-ok" style="width:84.1%"></span>
+        <span class="seg-cancel" style="width:4.4%"></span>
+        <span class="seg-reject" style="width:1.2%"></span>
+        <span class="seg-fail" style="width:10.3%"></span>
+      </div>
+      <ul class="legend">
+        <li><i class="seg-ok"></i>completed <span class="n">861</span></li>
+        <li><i class="seg-cancel"></i>cancelled <span class="n">45</span></li>
+        <li><i class="seg-reject"></i>plan rejected <span class="n">12</span></li>
+        <li><i class="seg-fail"></i>failed <span class="n">106</span></li>
+      </ul>
+      <p class="causes">Top causes <span class="k">agent failure</span> <span class="n">48</span> · <span class="k">run timeout</span> <span class="n">31</span> · <span class="k">worker lost</span> <span class="n">14</span> · <span class="k">rate limited</span> <span class="n">9</span> · <a href="#">failed runs&nbsp;→</a></p>
+    </div>
+    <div class="card">
+      <h2 class="section">Factory failed runs · all users · admin</h2>
+      <span class="rate hero">10.2<span class="pct">%</span></span>
+      <div class="subrow">
+        <span>failed <span class="num danger">126</span></span>
+        <span>finished <span class="num fg">1233</span></span>
+        <span>last 7 days <span class="num fg">9%</span> <span class="faint">(4 of 46)</span></span>
+      </div>
+      <div class="bar" role="img" aria-label="Finished runs: 1041 completed, 52 cancelled, 14 plan rejected, 126 failed">
+        <span class="seg-ok" style="width:84.4%"></span>
+        <span class="seg-cancel" style="width:4.2%"></span>
+        <span class="seg-reject" style="width:1.2%"></span>
+        <span class="seg-fail" style="width:10.2%"></span>
+      </div>
+      <ul class="legend">
+        <li><i class="seg-ok"></i>completed <span class="n">1041</span></li>
+        <li><i class="seg-cancel"></i>cancelled <span class="n">52</span></li>
+        <li><i class="seg-reject"></i>plan rejected <span class="n">14</span></li>
+        <li><i class="seg-fail"></i>failed <span class="n">126</span></li>
+      </ul>
+      <p class="causes">Top causes <span class="k">agent failure</span> <span class="n">55</span> · <span class="k">run timeout</span> <span class="n">36</span> · <span class="k">worker lost</span> <span class="n">18</span> · <span class="k">rate limited</span> <span class="n">12</span></p>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2 class="section">Per-user breakdown · admin</h2>
+    <div class="scroll">
+      <table>
+        <thead>
+          <tr>
+            <th class="l">User</th>
+            <th>Runs</th>
+            <th class="new">Failed</th>
+            <th class="new">Fail rate</th>
+            <th>Tokens</th>
+            <th>Out</th>
+            <th>Cost</th>
+            <th>Share</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="l">you@example.com</td>
+            <td>1030</td><td class="new">106</td><td class="new" title="106 of 1024 finished runs">10.4%</td><td>18.61B</td><td>140.94M</td>
+            <td class="cost">$18312</td>
+            <td><span class="share">89% <i><b style="width:89%"></b></i></span></td>
+          </tr>
+          <tr>
+            <td class="l">user-b@example.com</td>
+            <td>189</td><td class="new">17</td><td class="new" title="17 of 187 finished runs">9.1%</td><td>1.75B</td><td>22.89M</td>
+            <td class="cost">$2125</td>
+            <td><span class="share">9% <i><b style="width:9%"></b></i></span></td>
+          </tr>
+          <tr>
+            <td class="l">user-c@example.com</td>
+            <td>22</td><td class="new">3</td><td class="new" title="3 of 22 finished runs">13.6%</td><td>467.93M</td><td>5.55M</td>
+            <td class="cost">$550.59</td>
+            <td><span class="share">2% <i><b style="width:2%"></b></i></span></td>
+          </tr>
+          <tr class="total">
+            <td class="l">uzi total</td>
+            <td>1241</td><td class="new">126</td><td class="new" title="126 of 1233 finished runs">10.2%</td><td>20.83B</td><td>169.39M</td>
+            <td>$20988</td>
+            <td></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="head"><h2 class="section">Recent runs</h2><a href="#">All runs →</a></div>
+    <ul class="runs">
+      <li>
+        <div><p class="t">PRD: Codex guardrail conformance (#1106 M4)</p><p class="m"><span class="ok" style="color:rgb(var(--ok))">● researcher</span> <em>Map M3a/M3b real-CLI test harness</em> · vtmocanu/uzi #1287</p></div>
+        <div class="r"><span class="faint mono">0s</span><span class="pill plan">planning</span></div>
+      </li>
+      <li>
+        <div><p class="t">Rework MR review: agent/issue-1189 (!1259)</p><p class="m">vtmocanu/uzi <span class="chip">MR rework</span> <a href="#" style="color:rgb(var(--ok))">PR #1259</a></p></div>
+        <div class="r"><span class="pill danger">failed</span></div>
+      </li>
+      <li>
+        <div><p class="t">Rework MR review: agent/issue-1184 (!1258)</p><p class="m">vtmocanu/uzi <span class="chip">MR rework</span> <a href="#" style="color:rgb(var(--ok))">PR #1258</a></p></div>
+        <div class="r"><span class="chip">iter 1</span><span class="pill ok">completed</span></div>
+      </li>
+    </ul>
+  </section>
+</main>
+
+<section class="notes">
+  <div class="card">
+    <div class="cols">
+      <div>
+        <h3>What the number means</h3>
+        <ul>
+          <li><strong>Fail rate</strong> = failed ÷ finished, where finished = completed + cancelled + plan rejected + failed. Active runs never enter the denominator.</li>
+          <li><strong>Plan rejected</strong> is your decision, not a factory failure. It stays in the denominator but out of the numerator, and gets its own hatched segment.</li>
+          <li><code>chat</code> and <code>judge</code> runs are excluded, matching what the Runs page shows.</li>
+          <li>Two windows, all-time and last 7 days, same as the usage figures beside it.</li>
+          <li>Top causes come from <code>fail_origin</code>, counted over the same scope and window.</li>
+        </ul>
+      </div>
+      <div>
+        <h3>What changes to ship it</h3>
+        <ul>
+          <li><code>UsageDTO</code> gains <code>finished_runs</code>, <code>failed_runs</code>, <code>cancelled_runs</code>, <code>rejected_runs</code> and a small <code>fail_origins</code> map. No migration.</li>
+          <li>Three queries in <code>runtime.sql</code> grow the counts: <code>SelfUsage</code>, <code>AdminUsageTotals</code>, <code>AdminUsagePerUser</code>.</li>
+          <li>Web: the block inside <code>UsageCards.tsx</code> plus two table columns. CLI: <code>uzi admin usage</code> gets the same two columns.</li>
+          <li>Variant A adds nothing to the page's height on a fresh install: the block hides until the scope has one finished run.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<script>
+  (function () {
+    var page = document.getElementById('page');
+    var a = document.getElementById('pick-a');
+    var b = document.getElementById('pick-b');
+    var note = document.getElementById('pick-note');
+    var notes = {
+      a: 'Recommended: inside the usage cards, same scopes, same 7-day window, no new endpoint.',
+      b: 'Louder, but a second row of cards for a number most days you glance past.'
+    };
+    function pick(v) {
+      page.dataset.variant = v;
+      a.setAttribute('aria-pressed', String(v === 'a'));
+      b.setAttribute('aria-pressed', String(v === 'b'));
+      note.textContent = notes[v];
+      try { localStorage.setItem('failed-runs-variant', v); } catch (e) {}
+    }
+    a.addEventListener('click', function () { pick('a'); });
+    b.addEventListener('click', function () { pick('b'); });
+    try { var saved = localStorage.getItem('failed-runs-variant'); if (saved === 'b') pick('b'); } catch (e) {}
+  })();
+</script>

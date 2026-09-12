@@ -50,6 +50,25 @@ describe("readRunAck", () => {
     assert.equal(nonBool.pauseRequested, undefined, "a non-boolean value is ignored, never coerced");
   });
 
+  // PRD #1226 M4 (D3) — the server-decided budget_exhausted steer rides the same {run: RunDTO}
+  // body beside pause_requested, off the run's completion_budget_exhausted field.
+  it("reads completion_budget_exhausted:true off the run body", async () => {
+    const out = await readRunAck(jsonResponse({ run: { completion_budget_exhausted: true } }));
+    assert.equal(out.budgetExhausted, true, "the server-decided budget steer is passed through");
+  });
+
+  it("reads completion_budget_exhausted:false off the run body", async () => {
+    const out = await readRunAck(jsonResponse({ run: { completion_budget_exhausted: false } }));
+    assert.equal(out.budgetExhausted, false, "a false steer is passed through, not dropped");
+  });
+
+  it("leaves budgetExhausted absent when the field is missing or non-boolean (older server)", async () => {
+    const absent = await readRunAck(jsonResponse({ run: { milestones_completed: [] } }));
+    assert.equal(absent.budgetExhausted, undefined, "absent field ⇒ absent (read as no steer)");
+    const nonBool = await readRunAck(jsonResponse({ run: { completion_budget_exhausted: "yes" } }));
+    assert.equal(nonBool.budgetExhausted, undefined, "a non-boolean value is ignored, never coerced");
+  });
+
   it("returns {} on an empty body (existing catch/total behavior)", async () => {
     const out = await readRunAck(new Response(""));
     assert.deepEqual(out, {}, "an empty body yields the fields absent");

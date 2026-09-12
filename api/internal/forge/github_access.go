@@ -7,7 +7,7 @@ package forge
 import (
 	"context"
 
-	gh "github.com/google/go-github/v90/github"
+	gh "github.com/google/go-github/v91/github"
 )
 
 func (g *github) ProjectRole(ctx context.Context, projectID, forgeUserID int64) (Role, bool, error) {

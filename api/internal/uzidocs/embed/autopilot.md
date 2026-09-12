@@ -66,11 +66,16 @@ candidates once the autopilot label lands.
 - **Eligible**: the issue moves to In Progress, a run starts unattended
   (never shows "awaiting approval"), the plan is recorded, and on success a
   comment lands on the issue with the merge request link.
-- **The agent never stops to ask you something, either.** If it would
-  otherwise pause for a clarifying question (see [Answering a
-  question](./run-activity.md#answering-a-question)), an autopilot run
-  auto-resolves instead — "proceed on your best judgment" — and notes the
-  assumption it made in the run feed rather than parking.
+- **The agent never stops to ask you something, either** — with one
+  exception. If it would otherwise pause for an ordinary clarifying question
+  (see [Answering a question](./run-activity.md#answering-a-question)), an
+  autopilot run auto-resolves instead — "proceed on your best judgment" —
+  and notes the assumption it made in the run feed rather than parking. A
+  [structural completion hold](./run-completion-hold.md) is not
+  auto-resolved this way: guessing past a frozen milestone the run couldn't
+  actually finish is exactly the failure the interlock exists to catch, so
+  an autopilot run still asks and, absent an answer, still parks like any
+  other run would.
 - **No eligible user**: one comment explaining why, and no run — never
   repeats on later polls, even across a full resync.
 - **Failed run**: one comment with a link to the run, not the failure

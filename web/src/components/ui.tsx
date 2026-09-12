@@ -421,6 +421,18 @@ export const RUN_STATUS_TONES: Record<
    *  badge (runBadge) and TUI use, and the two label surfaces stay in agreement
    *  (ui.test.tsx's label-agreement loop). */
   paused: { tone: "info" },
+  /** PRD #1226 M5 (D8): the derived completion-interlock states — effectiveRunStatus maps
+   *  the server's completion_phase to these pseudo-statuses (render, NEVER re-derive). A run
+   *  CHECKING or REWORKING is doing live structural completion work → `info`, pulsing like
+   *  running. A BLOCKED run is a hold the owner must clear → `warning` (a completion-blocked
+   *  run's raw status is "paused", but the completion_phase overlay wins in effectiveRunStatus
+   *  so it renders "Completion blocked", not the owner "‖ paused" pill), and NOT pulsing —
+   *  a held run does no work until it is cleared. Kept in step with runStatusTone AND
+   *  runBadge: the runBadge.test.ts tone loop and the ui.test.tsx label loop over this map
+   *  assert one colour and one word per status. Labels below in RUN_STATUS_LABELS. */
+  completion_checking: { tone: "info", pulse: true },
+  completion_reworking: { tone: "info", pulse: true },
+  completion_blocked: { tone: "warning" },
   completed: { tone: "ok" },
   failed: { tone: "danger" },
   cancelled: { tone: "neutral" },
@@ -451,6 +463,13 @@ const RUN_STATUS_LABELS: Record<string, string> = {
   // "‖ paused" label — the ui.test.tsx label-agreement loop over RUN_STATUS_TONES asserts
   // the pill and the board badge print one word for this status too.
   paused: "‖ paused",
+  // PRD #1226 M5 (D8): honest completion-interlock copy — full sentences the default
+  // `status.replace(/_/g," ")` ("completion checking") cannot produce. Kept in step with
+  // runBadge's matching labels — the ui.test.tsx label-agreement loop over RUN_STATUS_TONES
+  // asserts the pill and the board badge print one word per status.
+  completion_checking: "Checking completion",
+  completion_reworking: "Reworking unmet milestones",
+  completion_blocked: "Completion blocked",
 };
 
 export function StatusPill({ status }: { status: string }) {

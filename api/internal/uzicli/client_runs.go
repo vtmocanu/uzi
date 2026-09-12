@@ -249,6 +249,35 @@ func (c *HTTPClient) RunRework(ctx context.Context, runID, guidance string) (api
 	return env.Run, nil
 }
 
+// completionDecisionRequest is the POST /api/runs/{id}/completion/decision body (PRD #1226 M5,
+// D7): the owner's decision on a completion-blocked run. This client supports ONLY the
+// "continue" decision — the only value the endpoint accepts today (the server 400s any other) —
+// so Decision is set to the constant "continue" here rather than taken as a parameter. Guidance
+// rides verbatim like RunRework's, with NO omitempty: an empty guidance is a valid continue
+// (resume with no note), so the key is always sent as `"guidance":""` rather than dropped.
+type completionDecisionRequest struct {
+	Decision string `json:"decision"`
+	Guidance string `json:"guidance"`
+}
+
+// ContinueCompletionDecision records the owner's CONTINUE decision on a completion-blocked run
+// and resumes it (PRD #1226 M5, D7): POST /api/runs/{id}/completion/decision
+// {decision:"continue", guidance}, unwrapping the {run: RunDTO} envelope. It is the sibling of
+// ResumeRunNow but body-carrying (like RunRework). The exit-code mapping comes for free through
+// statusError/postJSON: a foreign/unknown run is 404 → ExitNotFound (4); a run that is NOT
+// completion-blocked is 409 → ExitConflict (5); guidance too long / a bad decision is 400 →
+// ExitUsage (2).
+func (c *HTTPClient) ContinueCompletionDecision(ctx context.Context, id string, guidance string) (apitypes.RunDTO, error) {
+	body := completionDecisionRequest{Decision: "continue", Guidance: guidance}
+	var env struct {
+		Run apitypes.RunDTO `json:"run"`
+	}
+	if err := c.postJSON(ctx, "/api/runs/"+url.PathEscape(id)+"/completion/decision", body, &env); err != nil {
+		return apitypes.RunDTO{}, err
+	}
+	return env.Run, nil
+}
+
 // CreateRunSeed is PRD #209's optional seeded plan for CreateRun: an
 // externally-authored plan and the run's subagent roster. Nil ⇒ an ordinary run
 // planned from the issue. It mirrors the server's workersvc.SeededPlan and keeps the

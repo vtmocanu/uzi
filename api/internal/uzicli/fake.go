@@ -196,6 +196,16 @@ type FakeClient struct {
 	ReworkRun          apitypes.RunDTO
 	RunReworkErr       error
 
+	// ContinueCompletionDecision capture (PRD #1226 M5, D7): LastDecideRunID is the run id
+	// `uzi run decide --continue` targeted; LastDecideGuidance is the guidance it sent (from
+	// --guidance, "" when none). DecideRun is the canned success reply; ContinueCompletionDecisionErr
+	// wins over the blanket Err so a test can model the 409/404/400 on the write while the
+	// capture still proves it was reached with the right args.
+	LastDecideRunID               string
+	LastDecideGuidance            string
+	DecideRun                     apitypes.RunDTO
+	ContinueCompletionDecisionErr error
+
 	// SelfMeters drives SelfRateLimits (PRD #111 D23): the caller's own per-token
 	// meters, each carrying the server-computed auto-selection status.
 	SelfMeters []apitypes.TokenRateLimitDTO

@@ -8,7 +8,7 @@ import (
 	"net/http"
 	"net/url"
 
-	gh "github.com/google/go-github/v90/github"
+	gh "github.com/google/go-github/v91/github"
 
 	"github.com/vtmocanu/uzi/api/internal/pipelinestatus"
 )

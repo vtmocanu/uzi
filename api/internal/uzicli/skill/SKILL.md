@@ -165,6 +165,7 @@ uzi run resume-now <run-id>
 uzi run resume <run-id>
 uzi run mr-rework <run-id> [--enabled[=false]] [--clear]
 uzi run rework <run-id> [-m|--message <text>]
+uzi run decide <run-id> --continue [--guidance <text>]
 uzi schedule create --repo <repo-id> [--repo <repo-id>]... (--issue <iid> | --sweep [--label <l>]... [--create-missing-labels] | --prompt <text>) (--at <rfc3339> | --cron <expr>) [--tz <iana>] [--enabled[=false]] [--auto-approve[=false]] [--wait-on-limit] [--mr-rework[=false]] [--output mr|issues]
 uzi schedule list
 uzi schedule get <schedule-id>
@@ -537,6 +538,15 @@ uzi version
   rework — is a 409 (exit 5). `-m`/`--message` carries optional guidance to steer the rework
   (or pipe it on stdin); an empty guidance is a valid trigger as long as there is a new review
   comment. Prints the created `mr_rework` run.
+- `uzi run decide <run-id> --continue [--guidance <text>]` — record the owner CONTINUE
+  decision on a run the completion interlock has blocked (PRD #1226) — EITHER a live
+  completion question (`awaiting_input`, whose answer is recorded and the current worker
+  resumes IN PLACE) OR a run already parked in the completion hold: the run resumes and
+  keeps working past the completion check. Only the continue decision is supported today, so
+  `--continue` is **required** (its absence is a usage error, exit 2). `--guidance` is
+  optional and steers the continued run (an empty continue simply resumes with no note). A
+  run that is **not** completion-blocked is a 409 (exit 5); a foreign/unknown run is a 404
+  (exit 4). Prints the run's new status; `--json` emits the resumed run object.
 
 ### Schedules — time-driven runs
 

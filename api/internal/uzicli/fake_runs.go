@@ -210,6 +210,22 @@ func (f *FakeClient) RunRework(_ context.Context, runID, guidance string) (apity
 	return f.ReworkRun, nil
 }
 
+// ContinueCompletionDecision records the run id and guidance it was called with and returns the
+// canned run. It captures BEFORE the error branch (mirroring RunRework) so a test asserting a
+// 409/404/400 still proves the write was reached with the right args; ContinueCompletionDecisionErr
+// wins over the blanket Err.
+func (f *FakeClient) ContinueCompletionDecision(_ context.Context, id string, guidance string) (apitypes.RunDTO, error) {
+	f.LastDecideRunID = id
+	f.LastDecideGuidance = guidance
+	if f.ContinueCompletionDecisionErr != nil {
+		return apitypes.RunDTO{}, f.ContinueCompletionDecisionErr
+	}
+	if f.Err != nil {
+		return apitypes.RunDTO{}, f.Err
+	}
+	return f.DecideRun, nil
+}
+
 func (f *FakeClient) CreateRun(_ context.Context, repoID string, issueIID int64, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *CreateRunSeed) (apitypes.RunDTO, error) {
 	f.LastCreateRepoID = repoID
 	f.LastCreateIssueIID = issueIID

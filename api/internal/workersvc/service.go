@@ -188,6 +188,13 @@ var (
 	// reply written against question N that arrives after the lead has already asked
 	// N+1. Applying it to N+1 would silently answer the wrong question.
 	ErrStaleAnswer = errors.New("answer does not match the run's open question")
+	// ErrCompletionNotBlocked rejects a completion-decision (PRD #1226 M5, D7) on a run that
+	// is NOT completion-blocked → 409. A continue-decision is valid only in the two states a
+	// completion interlock reaches: the live `awaiting_input` completion-question window (an
+	// interlocked run with a recorded completion attempt) OR the `paused` hold
+	// (hold_reason='completion_blocked'). Any other status/reason is neither, so the message
+	// names why rather than acting on a run that never asked for a decision.
+	ErrCompletionNotBlocked = errors.New("run is not waiting on a completion decision")
 	// ErrInvalidAnswer covers a malformed `answer` body (PRD #88 M1) → 400. Rejected
 	// rather than defaulted: an answer that cannot say what it answers has no safe
 	// interpretation.
@@ -577,7 +584,21 @@ type Store interface {
 	// request without parking (the worker's pause_failed report); CreatePauseInput /
 	// CancelPauseInput are the owner's request / withdrawal CTEs.
 	SetRunPaused(ctx context.Context, arg store.SetRunPausedParams) (int64, error)
+	// SetRunCompletionHold parks an OWNED, INTERLOCKED run on the completion interlock's
+	// dedicated hold (PRD #1226 M4, D6): running/awaiting_input -> paused with
+	// hold_reason='completion_blocked'. A SIBLING of SetRunPaused, not a widening — its guard
+	// admits only an interlocked run with a recorded completion attempt (completion_attempts > 0)
+	// and leaves the pending-pause columns untouched, so the owner-pause path is unaffected. 0
+	// rows (guard fail) is the non-paused ack the worker's park order must retain the run on.
+	SetRunCompletionHold(ctx context.Context, arg store.SetRunCompletionHoldParams) (store.Run, error)
 	ResumePausedRun(ctx context.Context, arg store.ResumePausedRunParams) (store.ResumePausedRunRow, error)
+	// ClearCompletionBudgetExhausted clears the served budget_exhausted steer
+	// (completion_budget_exhausted_at) on the owner's CONTINUE decision (PRD #1226 M5, D3): a
+	// new owner decision is the third of D3's clears (alongside the worker acting on it /
+	// parking, SetRunCompletionHold). ContinueCompletionDecision calls it on both branches —
+	// a no-op on the already-cleared paused branch, and the clear that stops a resumed
+	// live-window worker being re-steered into the hold off a since-consumed ACK.
+	ClearCompletionBudgetExhausted(ctx context.Context, id uuid.UUID) (int64, error)
 	ClearPauseRequest(ctx context.Context, arg store.ClearPauseRequestParams) (int64, error)
 	CreatePauseInput(ctx context.Context, arg store.CreatePauseInputParams) (store.RunUserInput, error)
 	CancelPauseInput(ctx context.Context, id uuid.UUID) (store.RunUserInput, error)
@@ -629,6 +650,11 @@ type Store interface {
 	// backs createRun's create-time open-MR refusal (the open-MR dedup that --force bypasses).
 	GetOpenMRRunForIssue(ctx context.Context, arg store.GetOpenMRRunForIssueParams) (pgtype.Int8, error)
 	SweepRunningTimeout(ctx context.Context, arg store.SweepRunningTimeoutParams) ([]store.SweepRunningTimeoutRow, error)
+	// StampCompletionBudgetExhausted (PRD #1226 M4, D3) arms the server-side served
+	// `budget_exhausted` steer on EXACTLY the post-attempt live-worker interlocked rows
+	// SweepRunningTimeout's carve-out spared. Same now/global_timeout_seconds/worker_stale_cutoff
+	// args the sweep receives; returns the execrows count of rows freshly stamped this tick.
+	StampCompletionBudgetExhausted(ctx context.Context, arg store.StampCompletionBudgetExhaustedParams) (int64, error)
 	FailRunsOfStaleWorkersOverCap(ctx context.Context, arg store.FailRunsOfStaleWorkersOverCapParams) ([]store.FailRunsOfStaleWorkersOverCapRow, error)
 	RequeueRunsOfStaleWorkers(ctx context.Context, arg store.RequeueRunsOfStaleWorkersParams) ([]store.RequeueRunsOfStaleWorkersRow, error)
 	FailWorkerRunsOverCap(ctx context.Context, arg store.FailWorkerRunsOverCapParams) ([]uuid.UUID, error)
@@ -648,6 +674,13 @@ type Store interface {
 	// counts above, and off the hot path for the same reason — it runs only for a queued
 	// run already past its health threshold.
 	CountOnlineWorkersSatisfyingCaps(ctx context.Context, arg store.CountOnlineWorkersSatisfyingCapsParams) (int64, error)
+	// CountOnlineWorkersSatisfyingProtocol backs PRD #1226 M1's queued-reason rung: an
+	// INTERLOCKED queued run whose owner has NO online worker self-reporting the
+	// 'completion_interlock_v1' protocol capability gets reasonNoCompletionCapableWorker — the
+	// run's non-bypassable claim clause can never be satisfied. A per-run lookup like
+	// CountOnlineWorkersSatisfyingCaps above, and off the hot path for the same reason — it runs
+	// only for an interlocked queued run already past its health threshold.
+	CountOnlineWorkersSatisfyingProtocol(ctx context.Context, userID uuid.UUID) (int64, error)
 	// CountOnlineEligibleWorkersForRepo backs PRD #361's queued Docker-allowlist reason:
 	// how many of the caller's online workers fn_worker_can_claim accepts for this repo/kind,
 	// ignoring availability (free slots AND draining). Since issue #512 M2 it is capability-
@@ -869,8 +902,13 @@ type Params struct {
 	// tuning var into a hosted worker pod, so an env knob would be unreachable on k8s.
 	QuestionMax            int
 	QuestionTimeoutSeconds int
-	RunMaxRequeues         int
-	WorkerHeartbeatStale   time.Duration
+	// CompletionHoldWindowSeconds (PRD #1226 M5, D6) is the live owner-continue window a
+	// completion-blocked run waits before parking. Configured server-side (like the question
+	// bounds above) and shipped in the claim so the worker's completion-question timer uses it
+	// instead of QuestionTimeoutSeconds for the completion hold.
+	CompletionHoldWindowSeconds int
+	RunMaxRequeues              int
+	WorkerHeartbeatStale        time.Duration
 	// DiskPressureThreshold (PRD #837 M4, UZI_DISK_PRESSURE_THRESHOLD) is the used/total
 	// fraction in (0,1] at/above which a self-reported disk volume counts as "over
 	// threshold" for one heartbeat. Heartbeat feeds it to diskOverThreshold, which drives
@@ -2058,6 +2096,18 @@ type StateRequest struct {
 	// answer guard, which asks "was THIS question answered" rather than "has this run
 	// ever been answered". Required for `awaiting_input`; ignored on every other state.
 	OpenQuestionID *string `json:"open_question_id"`
+	// CompletionQuestion (PRD #1226 M5) is the worker's DECLARATION, on an `awaiting_input`
+	// report, that the question it is parking on is a COMPLETION-interlock question (the
+	// worker authored it while awaiting the owner's continue decision) rather than an
+	// ordinary PRD #88 ask_user clarification. It drives the dedicated completion-question
+	// marker (completion_question_at): true → SetState stamps the marker to now(), so
+	// completionQuestionOpen / completionPhaseRule can tell the D6 completion-question window
+	// from an ordinary clarification and an owner completion-continue can never resolve the
+	// wrong question. Absent/false on an ordinary ask_user report (byte-identical to the
+	// pre-marker behavior) and ignored on every non-`awaiting_input` state. The agent unit
+	// sends it in a later change; httpx.DecodeJSON rejects unknown fields, so this field MUST
+	// exist here or a new worker's report 400s.
+	CompletionQuestion bool `json:"completion_question"`
 	// OpenFollowupID is the park-scoped follow_up watermark reported by the worker on
 	// the `awaiting_followup` transition ONLY (issue #559 M1): the highest follow_up id
 	// the worker has already APPLIED to a turn at the moment it parks. The server CLAMPS
@@ -2312,8 +2362,18 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		if len([]rune(qid)) > maxQuestionIDRunes {
 			return store.Run{}, false, fmt.Errorf("%w: open_question_id is too long", ErrInvalidState)
 		}
+		// PRD #1226 M5: stamp the completion-question marker to now() ONLY when the worker
+		// flags this park as a COMPLETION question; an ordinary ask_user clarification passes
+		// nil → SQL NULL, leaving the column NULL (byte-identical to the pre-marker behavior).
+		var completionQuestionAt *time.Time
+		if req.CompletionQuestion {
+			now := time.Now().UTC()
+			completionQuestionAt = &now
+		}
 		rows, err = s.q.SetRunAwaitingInput(ctx, store.SetRunAwaitingInputParams{
-			OpenQuestionID: pgconv.TextOrNull(qid), SessionID: sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
+			OpenQuestionID:       pgconv.TextOrNull(qid),
+			CompletionQuestionAt: pgconv.TimePtr(completionQuestionAt),
+			SessionID:            sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
 		})
 	case "awaiting_followup":
 		// PRD #517 M2/M3 (Decision 3): the interactive-task park. On signal_done an
@@ -4316,6 +4376,13 @@ type SweepResult struct {
 	// partial index this reads covers only parked runs, a set that is empty on a healthy
 	// instance. Counted like LimitPromoted (len of the returned slice).
 	RecoveryPromoted int64
+	// CompletionBudgetExhausted is the number of runs this pass armed with the server-side
+	// served `budget_exhausted` steer (PRD #1226 M4, D3): the post-attempt live-worker
+	// interlocked rows past their wall budget that SweepRunningTimeout's carve-out spared, now
+	// stamped so their live lead is steered into the completion hold. Set from the execrows
+	// count. Normally 0 (the completion interlock is rollout-OFF and this only fires on a spared,
+	// budget-exhausted run).
+	CompletionBudgetExhausted int64
 }
 
 // -------------------------------------------------------------------------

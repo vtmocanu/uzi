@@ -18,6 +18,12 @@
   "vulnerabilityAlerts": {
     "labels": ["dependencies", "renovate", "security"]
   },
+  "lockFileMaintenance": {
+    "enabled": true
+  },
+  "devbox": {
+    "enabled": false
+  },
   "customManagers": [
     {
       "customType": "regex",

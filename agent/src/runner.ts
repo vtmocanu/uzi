@@ -72,6 +72,21 @@ import { REASON_NO_TOKEN, TransientRecoveryError } from "./sdk-executor.js";
  *  (forge.ts) so a runaway SDK error can't bloat the run row or the stream. */
 const MAX_FAILURE_REASON_LEN = 512;
 
+/** PRD #1226 M4 (D6): bounded in-call attempts to capture a VERIFIED completion-hold restore
+ *  point before giving up. Mirrors handleRecoveryExhausted's retain-and-retry, but bounded (this
+ *  runs synchronously inside the executor's completion loop, not the server-parked recovery loop).
+ *  A never-verified capture DOES NOT park: enterCompletionHold clears its preserve flags and returns
+ *  false, so the run's normal terminal cleanup runs (no park, no leak). */
+const COMPLETION_HOLD_CAPTURE_ATTEMPTS = 3;
+
+/** PRD #1226 M4 (D5): the STATIC, content-free failure_reason a worker reports when the completion
+ *  interlock cannot report completed AND cannot park the run for recovery (the restore point never
+ *  verified or the hold ACK was refused). It carries NO model output and NO repository text — the
+ *  taxonomy fact is all a human needs to route it, and the committed work is safe on the run's
+ *  branch (the finalize push already landed before the permit was requested). */
+const COMPLETION_INTERLOCK_UNHELD_REASON =
+  "completion interlock: could not verify the final head or park the run for recovery";
+
 /** PRD #1171 m4: a name-based CodexBoundaryError probe. The runner stays HARNESS-AGNOSTIC and
  *  never imports from agent/src/codex/**, so it recognizes the boundary-blocked error — thrown
  *  by the executor-owned safety facade when a durability sink could not reap/reconcile (sink
@@ -2161,6 +2176,112 @@ export class RunRunner {
       return;
     }
 
+    // ── PRD #1226 M4 (D5): the completion permit + exact-head bind ──────────────
+    // ONLY an INTERLOCKED issue run (claim.config.completion_contract_version != null) runs this;
+    // a legacy/non-interlocked run skips the whole block and its MR creation + completed report are
+    // byte-for-byte unchanged. Reached AFTER the finalize push landed on origin (the normal push OR
+    // the PRD #456 align push), so `H` below is the tip that ACTUALLY landed — never the pre-align
+    // candidate. Interlocked runs are ISSUE runs that open MRs, so this sits on the openMr path only;
+    // the no-MR task completion above is never interlocked and stays untouched.
+    const interlocked = claim.config?.completion_contract_version != null;
+    // `Closes #N` renders at MR creation for a LEGACY run only (unchanged). For an INTERLOCKED run it
+    // starts false and STAYS false at creation: Closes is NEVER rendered at creation for an interlocked
+    // run; it is added ONLY after the PR head is verified to equal H (the verification block below), so
+    // a held, unverified-head MR can never carry a closing line (AC: only a verified full delivery
+    // contains `Closes #N`).
+    const renderCloses = !interlocked;
+    // H, the exact landed head. Set ONLY on the interlocked granted path; it rides the completed
+    // report (`head: completionHead`) and is compared against the created PR's head. Undefined for a
+    // legacy run, so JSON.stringify drops it and the legacy completed report is byte-for-byte the same
+    // on the wire.
+    let completionHead: string | undefined;
+    // Park the incomplete/unverifiable interlocked run, else report a typed failure. Shared by the
+    // permit-denied and PR-head-mismatch paths (D5's held-or-fail). enterCompletionHold reaps,
+    // captures a VERIFIED same-worker restore point and parks on a `paused` ACK (returns true), or
+    // parks nothing (returns false); on true we skip finalization exactly like the
+    // result.completionHeld branch above, and on false the run follows normal terminal cleanup
+    // (enterCompletionHold cleared its preserve flags) so we report a static, content-free failure.
+    // `holdReason` is a static hold-reason string, never raw model output.
+    const holdOrFailInterlocked = async (holdReason: string): Promise<void> => {
+      const held = await this.enterCompletionHold(flight, claim, holdReason, runLog);
+      if (held) {
+        executor.killAgentTree?.();
+        await closeBatcher().catch(() => undefined);
+        runLog.info("run entered the completion hold; skipping finalization", {
+          run_id: runId,
+          reason: holdReason,
+        });
+        return;
+      }
+      await closeBatcher();
+      await reportState({ status: "failed", failure_reason: COMPLETION_INTERLOCK_UNHELD_REASON });
+      runLog.info("run failed: completion interlock could not park the incomplete run", {
+        run_id: runId,
+        reason: holdReason,
+      });
+    };
+
+    // PRD #1225 (CodeRabbit !1254): fail CLOSED — a terminal failure with NO hold attempt. Used when a
+    // would-be hold path could NOT strip `Closes #N` from the MR (the non-closing reconcile write
+    // failed). `createMergeRequest` can ADOPT a pre-existing MR that already carries `Closes #N`, so a
+    // failed strip cannot guarantee the MR is non-closing; a hold is a nominally non-closing parked
+    // state, so we must not enter it here. Failing is the safe direction — loud and terminal — rather
+    // than parking a possibly-closing MR on an unverified head that a human could merge.
+    const failInterlockedClosed = async (reason: string): Promise<void> => {
+      executor.killAgentTree?.();
+      await closeBatcher().catch(() => undefined);
+      await reportState({ status: "failed", failure_reason: COMPLETION_INTERLOCK_UNHELD_REASON });
+      runLog.info("run failed closed: completion interlock could not guarantee a non-closing MR", {
+        run_id: runId,
+        reason,
+      });
+    };
+
+    if (interlocked) {
+      // 1. Capture the EXACT landed head H. pushBranch pushes refs/uzi-runner/<branch>, and BOTH the
+      //    normal finalize push (fetchAgentBranch at the top of this method) and the align push
+      //    (fetchAndPush's re-fetch of the aligned tip) wrote that ref to the tip they pushed — so
+      //    trackingTip reads the landed tip after either path. The frozen contract revision is echoed
+      //    verbatim so the server can reject a revision drift. If either is unresolvable a permit
+      //    cannot be bound to (run, revision, branch, head), so route to the hold rather than report
+      //    completed.
+      const head = await this.git.trackingTip(barePath, result.branch);
+      const contractRevision = claim.config?.contract_revision;
+      if (head === null || contractRevision === undefined) {
+        runLog.warn(
+          "completion interlock: the landed head or contract revision is unresolvable; holding rather than completing",
+          { run_id: runId },
+        );
+        await holdOrFailInterlocked("completion identity unresolvable");
+        return;
+      }
+      // 2. Request the permit bound to (run, contract_revision, branch, H). A denial is a normal 200
+      //    body (granted:false), never a throw — the throw path (a transport/HTTP error) propagates to
+      //    the generic catch, which fails the run without falsely completing.
+      const permit = await this.client.requestCompletionPermit(runId, {
+        contractRevision,
+        branch: result.branch,
+        head,
+      });
+      // 3. NOT granted: do NOT create the MR, do NOT render Closes, do NOT report completed — hold.
+      if (!permit.granted) {
+        batcher.emit({
+          kind: "status",
+          agent: "worker",
+          payload: {
+            text: "completion permit denied; holding the incomplete run instead of opening a merge request",
+          },
+        });
+        await holdOrFailInterlocked("completion permit denied");
+        return;
+      }
+      // 4. Granted: carry H on the completed report below. Closes is NEVER rendered at creation for an
+      //    interlocked run — it is added ONLY after the PR head is verified to equal H (the verification
+      //    block below re-asserts the canonical `Closes #N` body on a verified head), so a held,
+      //    unverified-head MR can never carry a closing line.
+      completionHead = head;
+    }
+
     const targetBranch =
       claim.repo.default_branch?.trim() ||
       (await this.git.defaultBranchName(barePath)) ||
@@ -2200,6 +2321,7 @@ export class RunRunner {
             result.gatesUnverified,
             result.gatesDiscoveryTruncated,
             result.scopeCapped,
+            renderCloses,
           ),
         }, boundarySignal),
       { log: runLog, signal: boundarySignal },
@@ -2209,6 +2331,146 @@ export class RunRunner {
       agent: "worker",
       payload: { text: `merge request opened: !${mr.iid} ${mr.webUrl}` },
     });
+
+    // ── PRD #1226 M4 (D5): PR-head verification (create-then-verify) ────────────
+    // For an interlocked run (completionHead set on the granted path) the MR now exists; read its
+    // head SHA and require it to equal the permitted head H. A mismatch (the PR points at a different
+    // commit than the permit was bound to) or a read that THREW (a ForgeError = cannot verify) must
+    // NOT report completed — the run holds with its MR already open. A legacy run has no completionHead
+    // and never reads the PR head, so this block is skipped and its completion is unchanged.
+    //
+    // PRD #1225 (CodeRabbit !1254): the interlocked MR was created WITHOUT a `Closes #N` body, so a
+    // freshly-created, unverified-head MR can never carry a closing line — the dangerous
+    // create-then-verify state (a human merge closing the issue on an unverified head) is structurally
+    // impossible for it. reconcileMrDescription ADDS the canonical `Closes #N` body ONLY after the PR
+    // head is verified to equal H, and the head is then RE-READ to bind that add to the verified head
+    // (a change in the read→add window strips Closes and holds); if the add FAILS the run HOLDS rather
+    // than reporting completion (the completion contract requires the merged MR to carry Closes). The
+    // hold branches strip Closes and add the unverified banner FIRST and REQUIRE that write to succeed:
+    // `createMergeRequest` can ADOPT a pre-existing MR that already carried `Closes #N`, so a failed
+    // strip cannot prove the MR is non-closing and we fail CLOSED instead of holding (stripClosesThenHold
+    // → failInterlockedClosed). The whole block is skipped for a legacy run (completionHead ===
+    // undefined), so its completion is byte-for-byte unchanged.
+    const UNVERIFIED_BANNER =
+      "> ⚠️ **Completion unverified.** uzi could not confirm this merge request's head matches the permitted completion head, so the run was held for owner review. This merge request does NOT close its issue and must not be merged as a completion until re-verified.";
+    const reconcileMrDescription = async (withCloses: boolean, banner?: string): Promise<boolean> => {
+      try {
+        const base = mrDescription(
+          claim,
+          result.branch,
+          result.agentSelection,
+          selfImproveSection,
+          promptGuardSection,
+          result.gatesUnverified,
+          result.gatesDiscoveryTruncated,
+          result.scopeCapped,
+          withCloses,
+        );
+        const desc = banner ? `${banner}\n\n${base}` : base;
+        await withForgeRetry(
+          () =>
+            forge.updateMergeRequestDescription(
+              claim.repo.url,
+              claim.secrets.forge_pat,
+              mr.iid,
+              desc,
+              boundarySignal,
+            ),
+          { log: runLog, signal: boundarySignal },
+        );
+        return true;
+      } catch (e) {
+        runLog.warn(
+          "completion interlock: could not reconcile the MR description; leaving the created MR as-is",
+          { run_id: runId, error: errMessage(e) },
+        );
+        return false;
+      }
+    };
+    // PRD #1225 (CodeRabbit !1254): strip any `Closes #N` (writing the unverified banner) BEFORE a
+    // hold. If that write FAILS we cannot guarantee the MR is non-closing — `createMergeRequest` can
+    // ADOPT a pre-existing MR that already carried `Closes #N` — so fail CLOSED rather than hold a
+    // possibly-closing MR on an unverified head.
+    const stripClosesThenHold = async (holdReason: string, failReason: string): Promise<void> => {
+      if (!(await reconcileMrDescription(false, UNVERIFIED_BANNER))) {
+        await failInterlockedClosed(failReason);
+        return;
+      }
+      await holdOrFailInterlocked(holdReason);
+    };
+    if (completionHead !== undefined) {
+      let prHead: string;
+      try {
+        prHead = await forge.getMergeRequestHead(
+          claim.repo.url,
+          claim.secrets.forge_pat,
+          mr.iid,
+          boundarySignal,
+        );
+      } catch (e) {
+        runLog.warn("completion interlock: could not read the PR head to verify it; holding", {
+          run_id: runId,
+          error: errMessage(e),
+        });
+        await stripClosesThenHold(
+          "pr head unreadable",
+          "could not strip Closes from an MR whose head is unreadable",
+        );
+        return;
+      }
+      if (prHead !== completionHead) {
+        runLog.info("completion interlock: PR head does not match the permitted head; holding", {
+          run_id: runId,
+        });
+        await stripClosesThenHold(
+          "pr head mismatch",
+          "could not strip Closes from an unverified-head MR",
+        );
+        return;
+      }
+      // Verified: ADD the canonical `Closes #N` body. The interlocked MR was created WITHOUT Closes,
+      // so this is the ONLY place a completion's closing line is written (it is also a REPAIR on an
+      // ADOPTED MR whose body a prior hold rewrote to the unverified variant). The completion contract
+      // requires the merged MR to carry Closes, so if this write FAILS we hold rather than report
+      // completion.
+      if (!(await reconcileMrDescription(true))) {
+        await holdOrFailInterlocked("could not assert Closes on the verified head");
+        return;
+      }
+      // BIND the Closes add to the verified head (CodeRabbit !1254): re-read the PR head AFTER writing
+      // Closes. A head change between the first read and the add would otherwise leave `Closes #N` on
+      // an unverified head. If the re-read is unreadable, or shows a changed head, strip Closes and
+      // hold (fail closed if the strip itself fails) rather than report completion.
+      let postHead: string;
+      try {
+        postHead = await forge.getMergeRequestHead(
+          claim.repo.url,
+          claim.secrets.forge_pat,
+          mr.iid,
+          boundarySignal,
+        );
+      } catch (e) {
+        runLog.warn("completion interlock: could not re-verify the PR head after adding Closes; holding", {
+          run_id: runId,
+          error: errMessage(e),
+        });
+        await stripClosesThenHold(
+          "pr head unreadable after Closes",
+          "could not strip Closes after an unreadable re-verify",
+        );
+        return;
+      }
+      if (postHead !== completionHead) {
+        runLog.info("completion interlock: PR head changed after adding Closes; stripping Closes and holding", {
+          run_id: runId,
+        });
+        await stripClosesThenHold(
+          "pr head changed after Closes",
+          "could not strip Closes after a post-add head change",
+        );
+        return;
+      }
+    }
 
     // Persist the MR/PR web URL the forge just handed us (PRD #65 D8), so the web
     // links it directly instead of reconstructing the URL by string surgery. Omit
@@ -2234,6 +2496,11 @@ export class RunRunner {
       // stop_kind='scope_capped'. OMITTED (not false) on a normal completion, so the wire
       // shape is unchanged for every non-truncated run.
       scope_capped: result.scopeCapped ? true : undefined,
+      // PRD #1226 M4 (D5): the EXACT permitted+verified head H, so the server consumes the
+      // completion permit issued for (run, contract_revision, branch, H). Set only for an
+      // interlocked run; undefined for a legacy run, so JSON.stringify drops it and the legacy
+      // completed report is byte-for-byte unchanged on the wire.
+      head: completionHead,
     }, "run completed", { branch: result.branch, mr_iid: mr.iid });
   }
 
@@ -3136,6 +3403,11 @@ export class RunRunner {
           // loop-top pause branch reads it off `served`.
           if (typeof ack.pauseRequested === "boolean")
             b.pauseRequested = ack.pauseRequested;
+          // PRD #1226 M4 (D3): carry the server-decided budget_exhausted steer off the SAME ACK,
+          // beside pauseRequested, so a live post-attempt interlocked run learns it must enter the
+          // completion hold (the loop-top budget-steer branch reads it off `served`).
+          if (typeof ack.budgetExhausted === "boolean")
+            b.budgetExhausted = ack.budgetExhausted;
           // Without the scope/completed fields in this return guard, a non-budget-scaled
           // run's ACK (no budget fields) would return `undefined` and m3's loop-top gate at
           // `if (served)` would never see the ceiling. This is behavior-preserving for the
@@ -3146,7 +3418,8 @@ export class RunRunner {
             b.wallSeconds !== undefined ||
             b.scopeCeiling !== undefined ||
             b.completedCount !== undefined ||
-            b.pauseRequested !== undefined
+            b.pauseRequested !== undefined ||
+            b.budgetExhausted !== undefined
             ? b
             : undefined;
         } catch (e) {
@@ -3376,12 +3649,37 @@ export class RunRunner {
           head,
           worktreeFingerprint,
         }),
-      // PRD #1226 M4 wires enterCompletionHold — the recoverable completion-hold seam
-      // (SetRunCompletionHold + captureHoldContext + the fixed park order). Deliberately LEFT
-      // UNWIRED in M3: the executor treats it as optional and falls back to the legacy terminal
-      // throw when it is absent, so a repeated-no-progress or post-attempt exhaustion fails as
-      // today until M4 lands. The feature is rollout-OFF (completion_interlock_rollout defaults
-      // OFF) until #1232 and M3+M4 ship together, so this unwired seam never fires in production.
+      // PRD #1226 M4 (D3/D6): the recoverable completion-hold seam is now WIRED. On a repeated
+      // no-progress completion attempt, a post-attempt budget/stall/wall/idle exhaustion, or the
+      // server's budget_exhausted steer, the executor calls this INSTEAD of throwing a terminal
+      // failure. enterCompletionHold reaps, captures a VERIFIED same-worker restore point, requests
+      // the hold, and returns true ONLY on a `paused` ACK (parked; the finally preserves the clone
+      // and HOME); false means it did NOT park (it cleared its preserve flags), so the executor falls
+      // back to the legacy throw and the run's normal terminal cleanup runs. The feature is
+      // rollout-OFF (completion_interlock_rollout defaults OFF)
+      // until #1232, so this seam is inert in production — completionInterlock above is false.
+      enterCompletionHold: (reason) =>
+        this.enterCompletionHold(flight, claim, reason, runLog),
+      // PRD #1226 M5 (D6): the completion-question LIVE window, wired as a SIBLING to
+      // enterCompletionHold. The executor calls THIS at the completion-STALL point (STALL_LIMIT
+      // identical no-progress completion attempts) INSTEAD of parking straight away — it authors an
+      // awaiting_input question (marked completion_question so the api stamps completion_question_at
+      // and the owner continue-decision endpoint resolves it) and gives the owner a live window
+      // (completion_hold_window_seconds, default 900s) to continue-with-guidance before the run
+      // parks. On expiry (or a park the server won't ACK) it resolves "expired" and the executor
+      // routes to enterCompletionHold (M4) — it NEVER throws a timeout. Inert while the interlock is
+      // rollout-OFF (completionInterlock above is false, so the stall path is never reached in
+      // production). Sources its window from claim.config, exactly like askUser sources its deadline.
+      askCompletionQuestion: (unmet) =>
+        this.askCompletionQuestion(
+          runId,
+          unmet,
+          batcher,
+          steering,
+          reportState,
+          runLog,
+          claim.config ?? null,
+        ),
     };
 
     // PRD #1064 M1: drain the per-run running-report chain before this phase yields control,
@@ -4231,6 +4529,216 @@ export class RunRunner {
   }
 
   /**
+   * PRD #1226 M4 (D3/D6): enter the recoverable COMPLETION HOLD. Modeled on
+   * handleRecoveryExhausted (the hold-loop template) with the D6 FIXED park order:
+   *   1. reap the agent tree (REAP-BEFORE-GIT, before any credentialed capture git).
+   *   2. set the preserve flags FIRST so no cleanup can strand the clone/session WHILE capture or the
+   *      hold ACK is still uncertain — retain-everything is the default through the bounded capture
+   *      retry and the hold request. It is held SET only on the true (parked) path; every false-
+   *      return path CLEARS both flags before returning (mirroring handleRecoveryExhausted's non-
+   *      parked branches), so a run that could NOT be parked follows NORMAL terminal cleanup instead
+   *      of leaking its clone + HOME into a finally that skips cleanup while the flags are set.
+   *   3-5. captureHoldContext (WIP-commit dirty → fetch-back → verifyRunnerTrackingCovers, REQUIRE
+   *      verified; publish best-effort) with a bounded retry; DURING the retries a never-yet-verified
+   *      capture retains the live clone (no hold requested), and only on GIVING UP does it clear the
+   *      flags and return false so the subsequent terminal outcome cleans up.
+   *   6. client.requestCompletionHold({head}) and REQUIRE the RETURNED status === "paused" (the
+   *      positive-ack contract, the same as the pause park). A non-paused status or a thrown error
+   *      clears the flags and returns false (the run is not parked).
+   *   7. only after a paused ACK: mark the flight parked (so the finally's park carve-out preserves
+   *      the HOME + plugin dir, the clone staying via preserveRecoveryClone) and return true.
+   *
+   * Returns true = ENTERED the verified hold (parked; phasePublish's completionHeld branch
+   * finalizes nothing and the finally preserves the clone + HOME for a same-worker resume). Returns
+   * false = could NOT capture a verified restore point OR the hold ACK was not `paused`; the flags
+   * are CLEARED, so the run is NOT parked and its normal terminal outcome (the executor's legacy
+   * throw, or phasePublish's typed failure) cleans up the clone + HOME like any other failed run.
+   * `reason` is a content-free failure-reason constant, never raw model output.
+   */
+  private async enterCompletionHold(
+    flight: RunFlight,
+    claim: ClaimResponse,
+    reason: string,
+    runLog: Logger,
+  ): Promise<boolean> {
+    // 1. Reap the agent tree BEFORE any credentialed capture git (REAP-BEFORE-GIT), exactly like
+    //    handleRecoveryExhausted. Idempotent — phasePublish's completionHeld branch reaps again.
+    flight.executor.killAgentTree?.();
+    // 2. Retain EVERYTHING up front: the runner clone is the only copy of the run's work until the
+    //    tracking ref verifiably covers HEAD, and the session HOME must survive the same-worker
+    //    resume. Set before any destructive possibility so an uncertain capture or a refused hold ACK
+    //    can never strand the work WHILE the hold is being attempted (AC: no hold cleans the only Git
+    //    work copy when capture or acknowledgement is uncertain). Held SET only on the true (parked)
+    //    path below; EVERY false-return path clears both flags first (mirroring
+    //    handleRecoveryExhausted's non-parked branches) so a run that could not be parked follows
+    //    normal terminal cleanup rather than leaking its clone + HOME.
+    flight.preserveRecoveryClone = true;
+    flight.preserveSession = true;
+    // 3-5. Capture a VERIFIED same-worker restore point, retrying bounded (like recovery's retain-
+    //    and-retry, but bounded — this runs inside the executor's completion loop). DURING the retries
+    //    an unverified capture retains the live clone and does NOT request a hold; only on GIVING UP
+    //    does it clear the flags and return false so the subsequent terminal outcome cleans up.
+    let captured:
+      | { verified: boolean; published: boolean; mode: "same_worker_only"; head: string | null }
+      | undefined;
+    for (let attempt = 0; attempt < COMPLETION_HOLD_CAPTURE_ATTEMPTS; attempt++) {
+      if (flight.active?.shuttingDown || flight.steering.isCancelled()) break;
+      try {
+        const result = await this.captureHoldContext(claim, flight, runLog);
+        if (result.verified) {
+          captured = result;
+          break;
+        }
+      } catch (captureError) {
+        runLog.warn("completion hold capture failed; retaining live work for retry", {
+          error: errMessage(captureError),
+        });
+      }
+      if (attempt < COMPLETION_HOLD_CAPTURE_ATTEMPTS - 1) await this.waitRecoveryRetry(flight);
+    }
+    if (!captured || captured.head === null) {
+      // Gave up: no verified restore point after the bounded retries. Clear the preserve flags so the
+      // NOT-parked run follows normal terminal cleanup instead of leaking its clone + HOME.
+      flight.preserveRecoveryClone = false;
+      flight.preserveSession = false;
+      runLog.warn(
+        "completion hold: restore point never verified; not parking (flags cleared for normal terminal cleanup)",
+        { run_id: flight.runId },
+      );
+      return false;
+    }
+    // 6. Request the hold and REQUIRE the RETURNED status to be literally "paused" (the positive-
+    //    ack contract, keyed off the returned status exactly like the pause park — never off
+    //    `applied`). requestCompletionHold reads the status off BOTH a 200 and a 409 body without
+    //    throwing; a non-paused status or a real transport error means the run is NOT parked, so we
+    //    clear the flags (below) and it follows normal terminal cleanup.
+    const head = captured.head;
+    let status: string;
+    try {
+      ({ status } = await this.client.requestCompletionHold(flight.runId, { head }));
+    } catch (holdError) {
+      flight.preserveRecoveryClone = false;
+      flight.preserveSession = false;
+      runLog.warn("completion hold: hold request failed; not parking (flags cleared for normal terminal cleanup)", {
+        run_id: flight.runId,
+        error: errMessage(holdError),
+      });
+      return false;
+    }
+    if (status !== "paused") {
+      flight.preserveRecoveryClone = false;
+      flight.preserveSession = false;
+      runLog.warn("completion hold: server did not park the run; not parking (flags cleared for normal terminal cleanup)", {
+        run_id: flight.runId,
+        server_status: status || "unknown",
+      });
+      return false;
+    }
+    // 7. Durably held. Mark the flight parked so the finally's park carve-out preserves the HOME and
+    //    plugin dir for the same-worker resume (the clone stays via preserveRecoveryClone, set
+    //    above). phasePublish's completionHeld branch reaps again (idempotent) and skips finalize.
+    flight.parked = true;
+    runLog.info("run entered the recoverable completion hold; preserving its clone and HOME for resume", {
+      run_id: flight.runId,
+      reason,
+      published: captured.published,
+      head,
+    });
+    return true;
+  }
+
+  /**
+   * PRD #1226 M4 (D6): capture a VERIFIED same-worker-only completion-hold restore point. Modeled
+   * on captureRecoveryRestorePoint: worktreeStatus (null ⇒ unverified) → dirty? commitWipMarker
+   * (require committed) → fetchAgentBranch (throws on fail) → verifyRunnerTrackingCovers (POSITIVE
+   * verify) → publishCheckpointBestEffort (SEPARATE, best-effort). Returns an explicit
+   * `same_worker_only` result whose `head` is the captured tracking tip (via git.trackingTip) after
+   * a verified capture. `verified:false` (with `head:null`) means the source clone remains the only
+   * authoritative copy — the caller retains it and never requests a hold. `published:false` is
+   * acceptable (the local verified capture is what gates "captured"); a same-worker resume reseeds
+   * from the worker-owned tracking ref, not from origin.
+   */
+  private async captureHoldContext(
+    claim: ClaimResponse,
+    flight: RunFlight,
+    runLog: Logger,
+  ): Promise<{ verified: boolean; published: boolean; mode: "same_worker_only"; head: string | null }> {
+    const NONE = {
+      verified: false,
+      published: false,
+      mode: "same_worker_only" as const,
+      head: null,
+    };
+    const barePath = flight.barePath;
+    const worktreePath = flight.worktreePath;
+    const branch = flight.branch;
+    if (!barePath || !worktreePath || !branch) {
+      runLog.warn("completion hold capture skipped: no clone paths on the flight; nothing to capture");
+      return NONE;
+    }
+    // Distinguish dirty vs clean EXPLICITLY (runner-uid porcelain) rather than trusting
+    // commitWipMarker's ambiguous false. A null (unreadable) status cannot assert clean ⇒ not
+    // verified: retain the clone and retry.
+    const status = await this.git.worktreeStatus(worktreePath);
+    if (status === null) {
+      runLog.warn("completion hold capture: worktree status unreadable (cannot assert clean)");
+      return NONE;
+    }
+    if (status.length > 0) {
+      // DIRTY → commit the WIP marker and REQUIRE it committed; a false here is unambiguously a
+      // commit FAILURE (we already know the tree is dirty), so the local restore point is not
+      // verified for this attempt.
+      const committed = await this.git.commitWipMarker(worktreePath);
+      if (!committed) {
+        runLog.warn("completion hold capture: WIP commit of a dirty tree failed");
+        return NONE;
+      }
+    }
+    // Fetch the run's tip into the worker bare's tracking ref (refs/uzi-runner/<branch>).
+    // fetchAgentBranch THROWS on failure (unlike the void fetchBackBestEffort), so a failed
+    // fetch-back is caught here rather than swallowed.
+    try {
+      await this.git.fetchAgentBranch(barePath, worktreePath, branch, flight.runId);
+    } catch (e) {
+      runLog.warn("completion hold capture: fetch-back failed", { error: errMessage(e) });
+      return NONE;
+    }
+    // POSITIVELY VERIFY the LOCAL restore point: the bare's tracking ref now covers the run's
+    // current HEAD (incl. any WIP marker), so a same-worker reseed recovers exactly this tip.
+    const verified = await this.git.verifyRunnerTrackingCovers(barePath, worktreePath, branch);
+    if (!verified) return NONE;
+    // The captured head is the verified tracking tip. A verified ref whose tip is unresolvable is
+    // treated as unverified (retain) — the hold contract requires a real head H for the permit.
+    const head = await this.git.trackingTip(barePath, branch);
+    if (head === null) {
+      runLog.warn("completion hold capture: tracking ref verified but its tip is unresolvable");
+      return NONE;
+    }
+    // Remote publish is SEPARATE and best-effort. The agent tree was already reaped by the caller
+    // (enterCompletionHold's killAgentTree), so the overlay's PAT default-fetch is permitted; for a
+    // Codex run the publish runs under the finalize-class boundary facade (withCodexBoundaryOnly),
+    // idempotent like the recovery path. A blocked boundary leaves `published` false — the restore
+    // point is still VERIFIED locally, which is what gates "captured".
+    let published = false;
+    try {
+      await this.withCodexBoundaryOnly(
+        flight.executor,
+        { boundary: "shutdown", deadlineMs: this.codexBoundaryDeadlineMs },
+        async (permit) => {
+          const overlay = await this.buildCheckpointOverlay(claim, flight, barePath);
+          published = await this.publishCheckpointBestEffort(flight, barePath, branch, overlay, permit?.signal);
+        },
+      );
+    } catch (err) {
+      if (!isCodexBoundaryError(err)) throw err;
+      runLog.warn("completion hold checkpoint boundary blocked; restore point saved locally but not published", {
+        error: errMessage(err),
+      });
+    }
+    return { verified: true, published, mode: "same_worker_only", head };
+  }
+
+  /**
    * Parse the clone's `.claude/agents/*.md` (PRD #37), logging every skipped or
    * clamped file to the run stream. Detection is best-effort by construction: a
    * repo without the directory has no agents (ok: true, agents: []), and an
@@ -4711,6 +5219,148 @@ export class RunRunner {
       cancel?.();
     }
   }
+
+  /**
+   * PRD #1226 M5 (D6): the completion-interlock LIVE window. Author a completion-question
+   * (awaiting_input, marked `completion_question`), then await the owner's continue decision for up
+   * to the claim's `completion_hold_window_seconds` (default 900s). Called at the completion-STALL
+   * point ONLY (STALL_LIMIT identical no-progress completion attempts), INSTEAD of routing straight
+   * to the hold.
+   *
+   * Deliberately SEPARATE from askUser, not a reuse of it — two things it MUST NOT share:
+   *  - askUser's timeout REJECTS with REASON_QUESTION_TIMEOUT (fail-closed). This window must NEVER
+   *    throw: expiry is a normal outcome that routes to the verified park, so the timer here
+   *    RESOLVES with `{ outcome: "expired" }` instead.
+   *  - askUser's #88 `questionDeadlines`/`questionCounts` bookkeeping. This window is timed by the
+   *    completion-hold config, not the clarification deadline, and its own deadline is local. It
+   *    shares ONLY `openQuestionIds` — the resume-safe question-id map — because a resumed worker
+   *    re-parks on the SAME question id, and clearing it on resolution keeps a later ask_user
+   *    unaffected (mirroring askUser's settle cleanup).
+   *
+   * Resolves `{ outcome: "continue", guidance? }` on an owner ANSWER within the window. The API
+   * delivers the owner continue-decision as an `answer` naming the run's open_question_id, carrying
+   * `["continue"]` (the sentinel) for empty guidance or `[guidance]` otherwise — so a lone
+   * "continue" is treated as no guidance and any other text as guidance. Resolves
+   * `{ outcome: "expired" }` on the window elapsing, on a non-answer verdict (a cancel resolves the
+   * wait too), or when the server would not ACK the park (unable-to-park → the caller parks).
+   */
+  private async askCompletionQuestion(
+    runId: string,
+    unmet: string[],
+    batcher: MessageBatcher,
+    steering: SteeringChannel,
+    reportState: (body: StateRequest) => Promise<unknown>,
+    runLog: Logger,
+    config: ClaimConfig | null,
+  ): Promise<{ outcome: "continue"; guidance?: string } | { outcome: "expired" }> {
+    // Reuse the id this run is already parked on (a resume re-parks on the SAME question); mint one
+    // only for a genuinely new question. Same resume-safe map askUser uses.
+    let questionId = this.openQuestionIds.get(runId);
+    if (questionId === undefined) {
+      questionId = randomUUID();
+      this.openQuestionIds.set(runId, questionId);
+    }
+
+    const milestoneLines = unmet.length
+      ? unmet.map((id) => `- ${id}`).join("\n")
+      : "- (the frozen completion contract is not yet satisfied)";
+    batcher.emit({
+      kind: "question",
+      agent: "lead",
+      payload: {
+        question_id: questionId,
+        questions: [
+          {
+            header: "Completion blocked",
+            question: [
+              "This run is structurally blocked: it signalled done, but the frozen completion",
+              "contract still has milestone(s) not complete, and repeated completion attempts made",
+              "no progress:",
+              "",
+              milestoneLines,
+              "",
+              "Continue with guidance (tell it how to finish), or let it park for a later decision?",
+            ].join("\n"),
+          },
+        ],
+      },
+    });
+    // Durable before the park is announced — same ordering askUser documents.
+    await batcher.flush().catch(() => undefined);
+
+    // Positive ACK, read the PRD #35 way: status === "awaiting_input", NEVER `applied`. A park the
+    // server will not ACK is treated as unable-to-park → "expired" so the caller routes to the hold
+    // (rather than awaiting an answer no surface can produce).
+    const ack = await reportState({
+      status: "awaiting_input",
+      open_question_id: questionId,
+      completion_question: true,
+    });
+    const parked = (ack as { status?: string } | undefined)?.status;
+    if (parked !== "awaiting_input") {
+      this.openQuestionIds.delete(runId);
+      runLog.warn("completion question: park not acknowledged, routing to hold", {
+        run_id: runId,
+        question_id: questionId,
+        status: parked ?? "unreadable",
+      });
+      return { outcome: "expired" };
+    }
+    runLog.info("completion question: awaiting owner continue decision", {
+      run_id: runId,
+      question_id: questionId,
+    });
+
+    // OWN deadline bookkeeping — NOT this.questionDeadlines/questionCounts (those are #88-specific).
+    // The window is sourced from completion_hold_window_seconds (default 900s), NOT
+    // question_timeout_seconds.
+    const windowMs = completionHoldWindowMs(config, COMPLETION_HOLD_WINDOW_DEFAULT_MS);
+    let cancelTimer: (() => void) | undefined;
+    // The timer RESOLVES to expired (it never rejects) — expiry is a normal outcome, so this window
+    // never throws REASON_QUESTION_TIMEOUT.
+    const expiry = new Promise<{ outcome: "expired" }>((resolve) => {
+      cancelTimer = this.setTimer(() => resolve({ outcome: "expired" }), windowMs);
+    });
+    try {
+      const verdict = await Promise.race([
+        steering.awaitAnswer(questionId),
+        expiry,
+      ]);
+      if ("outcome" in verdict) {
+        // The timer fired: the window elapsed with no owner answer → expired (the caller parks). We
+        // stop racing the awaitAnswer (a later answer resolves a promise nobody awaits — harmless,
+        // the run parks and the channel is discarded); the finally clears the timer and the open id.
+        runLog.info("completion question: window expired, routing to hold", {
+          run_id: runId,
+          question_id: questionId,
+        });
+        return { outcome: "expired" };
+      }
+      if (verdict.kind !== "answer") {
+        // A cancel resolves the wait too. Treat any non-answer verdict as expired (park), NEVER
+        // throw — this window has no fail-closed path.
+        return { outcome: "expired" };
+      }
+      // The owner continued. `["continue"]` is the empty-guidance sentinel; any other text is
+      // guidance (the answer is index-aligned with the single question above).
+      const answers = verdict.answers;
+      const guidance =
+        answers.length === 1 && answers[0] === "continue"
+          ? undefined
+          : answers.join("\n").trim() || undefined;
+      runLog.info("completion question: owner chose continue", {
+        run_id: runId,
+        question_id: questionId,
+        has_guidance: guidance !== undefined,
+      });
+      return { outcome: "continue", guidance };
+    } finally {
+      cancelTimer?.();
+      // Drop the open question id (mirrors askUser's settle cleanup) so a later ask_user mints a
+      // fresh id and is unaffected. We do NOT touch questionDeadlines — this window never wrote it.
+      this.openQuestionIds.delete(runId);
+    }
+  }
 }
 
 /** PRD #332 / issue #334 — the `run_usage` lineage-break marker. Tagged onto the
@@ -4796,6 +5446,22 @@ function questionTimeoutMs(
   return typeof secs === "number" && secs > 0 ? secs * 1000 : fallbackMs;
 }
 
+/** PRD #1226 M5 (D6): the completion-question live-window default, used when the claim omits
+ *  completion_hold_window_seconds (an older server) or sends a non-positive value. 900s = 15m. */
+const COMPLETION_HOLD_WINDOW_DEFAULT_MS = 900_000;
+
+/** The effective completion-question window: the server-configured claim value when present and
+ *  positive, else the worker default. Sibling to questionTimeoutMs but keyed on the DISTINCT
+ *  completion_hold_window_seconds — the completion window and the #88 clarification deadline are
+ *  configured independently (see ClaimConfig). */
+function completionHoldWindowMs(
+  config: ClaimConfig | null,
+  fallbackMs: number,
+): number {
+  const secs = config?.completion_hold_window_seconds;
+  return typeof secs === "number" && secs > 0 ? secs * 1000 : fallbackMs;
+}
+
 /** MR title from the issue snapshot (never empty). */
 function mrTitle(
   claim: ClaimResponse,
@@ -4830,6 +5496,12 @@ function mrDescription(
   gatesUnverified?: string[],
   gatesDiscoveryTruncated?: boolean,
   scopeCapped?: { completedCount: number; total?: number },
+  // PRD #1226 M4 (D5): render the `Closes #N` line only when told to. A legacy issue run passes true
+  // at MR creation (unchanged); an interlocked run passes false at creation and true ONLY on the
+  // verified-head reconcile that ADDS Closes after PR-head verification (PRD #1225). This makes the
+  // "no `Closes` on an unverified head" invariant structural — the function cannot emit a closing body
+  // on its own. Defaults true so the sole issue-arm caller keeps today's behavior.
+  renderCloses = true,
 ): string {
   const footer = `Opened automatically by the uzi agent from branch \`${branch}\`. Please review and merge manually — the agent never merges.`;
   const repoMarker =
@@ -4872,8 +5544,10 @@ function mrDescription(
       ]
     : [
         `Implements issue #${claim.issue_iid}.`,
-        "",
-        `Closes #${claim.issue_iid}`,
+        // PRD #1226 M4 (D5): the closing line is CONDITIONAL. When renderCloses is true (a legacy run
+        // at creation, or an interlocked run's verified-head reconcile — PRD #1225) this spreads to
+        // exactly the prior `"", "Closes #N"` pair, so the legacy body is byte-for-byte unchanged.
+        ...(renderCloses ? ["", `Closes #${claim.issue_iid}`] : []),
         ...repoMarker,
       ];
   const gatesSection = gatesUnverifiedMrSection(gatesUnverified, gatesDiscoveryTruncated);

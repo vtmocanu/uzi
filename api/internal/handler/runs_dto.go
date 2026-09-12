@@ -77,6 +77,63 @@ func pauseRequestedRule(pauseMode string, frozenLen, completedLen, afterCount in
 	}
 }
 
+// completionPhaseRule is the SINGLE, server-side completion-phase decision (PRD #1226 M5,
+// D8): the one derived label the web and CLI both render, so the two surfaces cannot
+// disagree about which of D8's three states an interlocked run is in. Like pauseRequestedRule
+// it lives in exactly one place and one test table.
+//   - not interlocked → "" (a legacy / rollout-OFF run has no completion phase).
+//   - held ("completion_blocked") → "blocked" (takes precedence over the running states below).
+//   - parked in the LIVE completion-question window (awaiting_input, interlocked, with the
+//     dedicated completion-question marker set, before the hold so hold_reason is still empty) →
+//     "blocked". Without this arm such a run derives "" — indistinguishable from a legacy run — so
+//     the web/CLI would show nothing while the run is in fact blocked pending the owner's continue
+//     decision. It keys on completionQuestionOpen (run.CompletionQuestionAt.Valid), the SAME
+//     dedicated marker the decision endpoint admits on, and shows the SAME honest "blocked" label
+//     as the paused hold. The marker is authored ONLY by a worker completion-question report, so
+//     an ORDINARY ask_user clarification — even on an interlocked run past a completion attempt —
+//     no longer matches this arm (the imprecision the old interlock+attempts proxy carried is
+//     gone: the arm is now precise).
+//   - running past a first attempt, some criteria still unmet → "reworking".
+//   - running past a first attempt, none unmet → "checking".
+//   - anything else (no attempt yet, not running) → "".
+func completionPhaseRule(interlocked bool, status, holdReason string, completionQuestionOpen bool, attempts, unmetCount int) string {
+	if !interlocked {
+		return ""
+	}
+	if holdReason == "completion_blocked" {
+		return "blocked"
+	}
+	if status == "awaiting_input" && completionQuestionOpen {
+		return "blocked"
+	}
+	if status == "running" && attempts > 0 {
+		if unmetCount > 0 {
+			return "reworking"
+		}
+		return "checking"
+	}
+	return ""
+}
+
+// decodeLatestUnmet pulls the bounded unmet milestone-id list out of a run's
+// latest_completion_attempt jsonb summary (PRD #1226 M5, D8, key "unmet"). It ALWAYS returns a
+// NON-NIL slice — `[]` for a run with no attempt (empty jsonb), a malformed summary, or an
+// attempt with nothing unmet — so completion_unmet is a stable array on the wire, never null.
+// The ids are server-validated milestone keys; a decode error degrades to `[]` rather than
+// failing the read of an otherwise-fine run (the summary is server-built via jsonb_build_object).
+func decodeLatestUnmet(raw []byte) []string {
+	if len(raw) == 0 {
+		return []string{}
+	}
+	var summary struct {
+		Unmet []string `json:"unmet"`
+	}
+	if err := json.Unmarshal(raw, &summary); err != nil || summary.Unmet == nil {
+		return []string{}
+	}
+	return summary.Unmet
+}
+
 // runToDTO maps a bare run row to its wire DTO. priorityClass is the D8 display class
 // (from fn_run_priority_class via a list column or h.runPriorityClass), passed in
 // explicitly so this mapper stays a PURE function of its inputs — no now()/config
@@ -310,6 +367,32 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration) ap
 		mode = r.PauseMode.String
 	}
 	dto.PauseRequested = pauseRequestedRule(mode, len(dto.Milestones), len(dto.MilestonesCompleted), afterCount)
+	// PRD #1226 M4 (D3): the server-decided served `budget_exhausted` steer rides the running-report
+	// ACK exactly like PauseRequested. It is true iff the sweeper has stamped
+	// completion_budget_exhausted_at (StampCompletionBudgetExhausted) — a one-shot flag the live
+	// post-attempt worker reads to enter the completion hold; false whenever the column is NULL.
+	dto.CompletionBudgetExhausted = r.CompletionBudgetExhaustedAt.Valid
+	// PRD #1226 M5 (D8): the honest-state completion fields — the wire contract the web + CLI
+	// render the interlock states from. CompletionInterlock is the discriminator (non-null
+	// completion_contract_version); the rest carry inert defaults on a non-interlocked run.
+	// completion_unmet is the bounded unmet-milestone list from the latest attempt's jsonb
+	// summary, ALWAYS a non-nil slice ([] over null). hold_context is the constant D8
+	// provider-context string, stated ONLY in a completion hold so a surface never claims
+	// cross-worker durability. completion_phase is the ONE derived label (completionPhaseRule),
+	// so the web and CLI cannot disagree about which of D8's three states the run is in.
+	dto.CompletionInterlock = r.CompletionContractVersion.Valid
+	dto.CompletionAttempts = int(r.CompletionAttempts)
+	dto.CompletionUnmet = decodeLatestUnmet(r.LatestCompletionAttempt)
+	dto.HoldReason = textPtrValue(r.HoldReason.Valid, r.HoldReason.String)
+	holdReason := ""
+	if r.HoldReason.Valid {
+		holdReason = r.HoldReason.String
+	}
+	if holdReason == "completion_blocked" {
+		holdCtx := "unavailable(same_worker_only)"
+		dto.HoldContext = &holdCtx
+	}
+	dto.CompletionPhase = completionPhaseRule(dto.CompletionInterlock, r.Status, holdReason, r.CompletionQuestionAt.Valid, dto.CompletionAttempts, len(dto.CompletionUnmet))
 	// PRD #362 M1, Decision 6 (tolerate-on-read): decode the summary_deltas jsonb into
 	// the typed slice; a malformed or unexpected value renders as NO deltas (nil), logged
 	// and never a panic — the deltas are advisory and a prior write's data, not an

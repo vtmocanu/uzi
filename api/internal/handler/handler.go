@@ -781,6 +781,14 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// (foreign run → 404) and POOL_WAIT-ONLY (non-held → 409); it only flips the
 				// hold to queued, so no token spend and no forge write.
 				r.Post("/{id}/resume-now", h.ResumeRunNow)
+				// Owner/admin completion decision (PRD #1226 M5, D7): continue a
+				// completion-blocked run with optional guidance, valid in BOTH the live
+				// awaiting_input completion-question window and the paused hold. RequireUser so
+				// the `uzi run decide` CLI verb (a uzc_ Bearer) reaches it — NOT the cookie+CSRF
+				// RequireAuth group. Owner-scoped (foreign run → 404) and completion-blocked-only
+				// (a run in neither state → 409); it resumes the run (paused → queued) or delivers
+				// the decision to the live worker, spending no forge and minting nothing.
+				r.Post("/{id}/completion/decision", h.ContinueCompletionDecision)
 				// Per-run MR-rework override (PRD #841 M2, Decision D3). RequireUser — NOT the
 				// cookie-only RequireAuth group where wait-on-limit sits — because this is a
 				// pure preference toggle with no resource-consent dimension (parking a run
@@ -893,6 +901,10 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// never asserts "milestones done". Fed from this one mount into both listeners.
 		r.Post("/runs/{id}/completion/permit", h.WorkerRunCompletionPermit)
 		r.Post("/runs/{id}/completion/attempt", h.WorkerRunCompletionAttempt)
+		// PRD #1226 M4 (D6): the dedicated completion-HOLD transition. The worker parks an
+		// interlocked run it cannot complete (running/awaiting_input -> paused); the returned
+		// status is the park-order ack (paused = clean up, anything else = retain live).
+		r.Post("/runs/{id}/completion/hold", h.WorkerRunCompletionHold)
 
 		// Ownership/terminality probe (#559): worker-authenticated, run-scoped,
 		// READ ONLY. The interactive park-SKIP path polls it to detect a mid-turn

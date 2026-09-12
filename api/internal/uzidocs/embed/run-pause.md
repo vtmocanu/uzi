@@ -79,6 +79,17 @@ remaining budget on resume is exactly what it was at the moment you paused
 it — unlike a usage-limit wait, whose resume gives the run a fresh full
 clock.
 
+## Not the same as a completion hold
+
+A `paused` run is not always a pause **you** asked for. A run with the
+[structural completion interlock](run-completion-hold.md) turned on can also
+land in `paused` on its own, after it repeatedly can't finish a milestone its
+plan was approved with — a **completion hold**, not an owner pause. The two
+look alike (both a parked `paused` run) but resolve differently: an owner
+pause only ever resumes when you ask (this page), while a completion hold
+resumes through `uzi run decide <id> --continue`. The run page tells the two
+apart.
+
 ## Not the same as a usage-limit wait
 
 A pause (this page) is something *you* asked for; [a usage-limit
@@ -103,5 +114,6 @@ uzi run resume <id>
 `--now` and `--cancel` are mutually exclusive. See [uzi CLI](cli.md) for the
 full command reference.
 
-Related: [Paused on a usage limit](run-limit-wait.md) · [Run activity
+Related: [Completion holds and the structural interlock](run-completion-hold.md)
+· [Paused on a usage limit](run-limit-wait.md) · [Run activity
 pane](run-activity.md) · [CLI](cli.md)
