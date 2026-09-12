@@ -75,6 +75,53 @@ func (q *Queries) ListDispositionsForReview(ctx context.Context, reviewID uuid.U
 	return items, nil
 }
 
+const listJudgeTriageRowsAll = `-- name: ListJudgeTriageRowsAll :many
+SELECT
+    d.status AS disposition_status,
+    d.dismiss_reason AS dismiss_reason,
+    (f.filed_at IS NOT NULL)::bool AS filed_settled
+FROM run_reviews rv
+JOIN review_recommendations rr ON rr.review_id = rv.id
+LEFT JOIN recommendation_dispositions d
+    ON d.review_id = rv.id AND d.category = rr.category AND d.target = rr.target
+LEFT JOIN recommendation_filed_issues f
+    ON f.review_id = rv.id AND f.category = rr.category AND f.target = rr.target
+`
+
+type ListJudgeTriageRowsAllRow struct {
+	DispositionStatus pgtype.Text `json:"disposition_status"`
+	DismissReason     pgtype.Text `json:"dismiss_reason"`
+	FiledSettled      bool        `json:"filed_settled"`
+}
+
+// The ADMIN "All users" triage aggregate (PRD #1184 M1): the cross-user twin of
+// ListJudgeTriageRowsForUser above, with the owner predicate removed. A SEPARATE query with NO
+// user predicate at all (never a nullable user sentinel on the owner query), so the owner path
+// stays byte-identical and its "owner-scoped" comment stays true. It carries the SAME three
+// flat facts the shared Go BucketOf/BucketTriage ladder consumes — no SQL CASE, no bucketing
+// here (§332) — so the admin strip cannot drift from the admin backlog's rollup. Both
+// side-table joins are UNIQUE on the coordinate, so neither fans out; the ::bool cast is
+// REQUIRED, exactly as in the owner query. No LIMIT, matching the owner version.
+func (q *Queries) ListJudgeTriageRowsAll(ctx context.Context) ([]ListJudgeTriageRowsAllRow, error) {
+	rows, err := q.db.Query(ctx, listJudgeTriageRowsAll)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListJudgeTriageRowsAllRow{}
+	for rows.Next() {
+		var i ListJudgeTriageRowsAllRow
+		if err := rows.Scan(&i.DispositionStatus, &i.DismissReason, &i.FiledSettled); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listJudgeTriageRowsForUser = `-- name: ListJudgeTriageRowsForUser :many
 SELECT
     d.status AS disposition_status,

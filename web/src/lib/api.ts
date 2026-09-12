@@ -56,6 +56,8 @@ import type {
   IncidentalFindingIssueDraft,
   IssueDetail,
   IssueDraft,
+  JudgeAdminBacklog,
+  JudgeAdminDispositionResult,
   JudgeBacklog,
   JudgeBacklogBucket,
   JudgeCategoryStats,
@@ -1279,6 +1281,84 @@ const realApi = {
         status,
         scope,
         ...(status === "dismissed" ? { reason } : {}),
+      },
+    ),
+
+  // ── Judge menu — admin "All users" aggregate (PRD #1184) ────────────────────
+  // The admin-only cross-user surface, mirroring the owner judge functions above but hitting
+  // the separate /admin/judge/* routes so the owner path stays byte-identical. The READS
+  // (backlog/stats/category-stats/issue-draft) are CLI-reachable with a uza_ token
+  // (RequireAdminRO); the WRITES (disposition set/undo, file issue) are cookie-only
+  // (RequireAdmin), so a uza_ Bearer 401s before them. A non-admin gets 403 on all of them.
+  //
+  // getAdminJudgeBacklog has NO ?run= anchor (an anchor names a run — attribution the aggregate
+  // hides) and NO run echo on the response. Its groups carry user_count and attribution-hidden
+  // occurrences; `triage` is the canonical all-users tally — render it, never re-derive.
+  getAdminJudgeBacklog: (bucket?: JudgeBacklogBucket, categories?: string[]) => {
+    const qs = new URLSearchParams();
+    if (bucket) qs.set("bucket", bucket);
+    if (categories && categories.length) qs.set("category", categories.join(","));
+    const suffix = qs.toString();
+    return request<JudgeAdminBacklog>(
+      "GET",
+      `/admin/judge/recommendations${suffix ? `?${suffix}` : ""}`,
+    );
+  },
+  // getAdminJudgeCategoryStats is the cross-user filter-chip GROUP-count matrix (the admin twin
+  // of getJudgeCategoryStats). No ?run= anchor on the admin path, so it takes no argument.
+  getAdminJudgeCategoryStats: () =>
+    request<JudgeCategoryStats>("GET", "/admin/judge/category-stats"),
+  // adminSetJudgeDisposition is the cross-user Mark done: it marks every user's OPEN member of
+  // each (category, target) coordinate done with `set_via='admin'` provenance, never overwriting
+  // a human verdict (ON CONFLICT DO NOTHING server-side). Status is fixed "done" — there is no
+  // cross-user Dismiss (dismissing another user's recommendation is their judgment). Returns the
+  // attribution-hidden result (no `settled` list — the undo is by coordinate, not run address).
+  adminSetJudgeDisposition: (items: JudgeDispositionCoord[]) =>
+    request<JudgeAdminDispositionResult>(
+      "PUT",
+      "/admin/judge/recommendations/disposition",
+      { items, status: "done" },
+    ),
+  // adminUndoJudgeDisposition is the admin Undo: it removes ONLY the set_via='admin' rows on
+  // each coordinate across every user, leaving any human done/dismissed verdict intact. Same
+  // coordinate body as the set; Status is ignored server-side (the undo is coordinate-only).
+  adminUndoJudgeDisposition: (items: JudgeDispositionCoord[]) =>
+    request<JudgeAdminDispositionResult>(
+      "DELETE",
+      "/admin/judge/recommendations/disposition",
+      { items },
+    ),
+  // getAdminJudgeIssueDraft reads the #68 draft for a coordinate's NEWEST OPEN occurrence across
+  // users (a READ, CLI-reachable). The draft card is the ONE surface that KEEPS attribution
+  // (Decision 8): filing publishes a user's worker text, so its `provenance` names whose text it
+  // is. Keyed by (category, target), not a run/rec id — the occurrence is resolved server-side.
+  getAdminJudgeIssueDraft: (category: string, target: string) => {
+    const qs = new URLSearchParams({ category, target });
+    return request<{ draft: IssueDraft }>(
+      "GET",
+      `/admin/judge/recommendations/issue-draft?${qs.toString()}`,
+    );
+  },
+  // adminFileJudgeIssue files a forge issue from a coordinate's newest open occurrence (a cookie-
+  // only forge WRITE, per-user forge limiter). The occurrence is resolved AGAIN at file time, so
+  // a fresher review moves the link. The issue is filed into the ADMIN's own repo (repo_id).
+  // Response is the owner file shape: {issue:{iid,web_url,title}, warning?}.
+  adminFileJudgeIssue: (body: {
+    category: string;
+    target: string;
+    repoId: string;
+    title: string;
+    description: string;
+  }) =>
+    request<{ issue: CreatedIssue; warning?: string }>(
+      "POST",
+      "/admin/judge/recommendations/issue",
+      {
+        category: body.category,
+        target: body.target,
+        repo_id: body.repoId,
+        title: body.title,
+        description: body.description,
       },
     ),
 

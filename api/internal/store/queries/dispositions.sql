@@ -93,3 +93,23 @@ LEFT JOIN recommendation_dispositions d
 LEFT JOIN recommendation_filed_issues f
     ON f.review_id = rv.id AND f.category = rr.category AND f.target = rr.target
 WHERE rv.user_id = @user_id;
+
+-- name: ListJudgeTriageRowsAll :many
+-- The ADMIN "All users" triage aggregate (PRD #1184 M1): the cross-user twin of
+-- ListJudgeTriageRowsForUser above, with the owner predicate removed. A SEPARATE query with NO
+-- user predicate at all (never a nullable user sentinel on the owner query), so the owner path
+-- stays byte-identical and its "owner-scoped" comment stays true. It carries the SAME three
+-- flat facts the shared Go BucketOf/BucketTriage ladder consumes — no SQL CASE, no bucketing
+-- here (§332) — so the admin strip cannot drift from the admin backlog's rollup. Both
+-- side-table joins are UNIQUE on the coordinate, so neither fans out; the ::bool cast is
+-- REQUIRED, exactly as in the owner query. No LIMIT, matching the owner version.
+SELECT
+    d.status AS disposition_status,
+    d.dismiss_reason AS dismiss_reason,
+    (f.filed_at IS NOT NULL)::bool AS filed_settled
+FROM run_reviews rv
+JOIN review_recommendations rr ON rr.review_id = rv.id
+LEFT JOIN recommendation_dispositions d
+    ON d.review_id = rv.id AND d.category = rr.category AND d.target = rr.target
+LEFT JOIN recommendation_filed_issues f
+    ON f.review_id = rv.id AND f.category = rr.category AND f.target = rr.target;

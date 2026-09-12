@@ -18,13 +18,16 @@ import { useSearchParams } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import {
   api,
+  type JudgeAdminBacklog,
   type JudgeBacklog,
   type JudgeBacklogBucket,
   type JudgeDispositionCoord,
+  type JudgeScope,
   type RecommendationCategory,
   type Repo,
 } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
+import { judgeScope as judgeScopePref } from "../lib/prefs";
 import { useAsyncData } from "../lib/useAsyncData";
 import {
   bucketTabCount,
@@ -59,6 +62,19 @@ import { UndoToast } from "./judge/UndoToast";
 // realistic undo is not perceptibly serial.
 const UNDO_CONCURRENCY = 6;
 
+// The instance-level recommendation categories the admin "All users" view defaults to (PRD
+// #1184 M4, decision log 2026-09-07): the categories about improving uzi itself, the reason the
+// aggregate exists. The SERVER default stays "all categories"; the CLIENT writes this set into
+// the URL on the first switch to All users when no ?category= is present, so the API and the CLI
+// keep one meaning for "no filter". These must all be members of JUDGE_CATEGORIES.
+const INSTANCE_CATEGORIES: RecommendationCategory[] = [
+  "install_worker_tool",
+  "adjust_template",
+  "improve_agent",
+  "add_agent",
+  "improve_uzi",
+];
+
 export function Judge() {
   const { user } = useAuth();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -88,7 +104,16 @@ export function Judge() {
     return JUDGE_CATEGORIES.filter((c) => set.has(c));
   }, [categoryParam]);
 
-  const [backlog, setBacklog] = useState<JudgeBacklog | null>(null);
+  // Admin "All users" scope (PRD #1184 M4). A non-admin NEVER sees the switch and NEVER reads
+  // the pref — so the pref is only consulted when isAdmin, and scopePref stays "mine" otherwise.
+  const isAdmin = !!user?.is_admin;
+  const [scopePref, setScopePref] = useState<JudgeScope>(() => (isAdmin ? judgeScopePref.get() : "mine"));
+  // A ?run= anchor is a notification deep-link into the CALLER'S OWN run, so it FORCES `mine`
+  // for that view (the switch is hidden) regardless of the stored pref. A non-admin is always
+  // "mine". The effective scope drives every fetch, the badge invariant and the row rendering.
+  const scope: JudgeScope = !isAdmin || runAnchor ? "mine" : scopePref;
+
+  const [backlog, setBacklog] = useState<JudgeBacklog | JudgeAdminBacklog | null>(null);
   // The per-category chip-count MATRIX (PRD #270), the canonical /me/judge/category-stats
   // aggregate: bucket → category → group count, held WHOLE in state and indexed at render by
   // the active bucket (categoryCounts below). Uncapped and anchor-aware, but now TAB-SCOPED
@@ -115,25 +140,53 @@ export function Judge() {
   // mounted outside an AppShell (every unit test does that), which is exactly why the
   // BLK-BADGE regression test mounts the two TOGETHER — apart, both are already correct.
   const setJudgeTodo = useSetJudgeTodo();
+  // A monotonic generation stamp for `load`, mirroring the guard useAsyncData applies to
+  // categoryStats. On a scope switch mine→all the two backlog fetches (getAdminJudgeBacklog under
+  // `all`, getJudgeBacklog under `mine`) can overlap, and a late owner response could otherwise
+  // overwrite the `all` backlog while scope === "all" — after which a cross-user dispose would send
+  // an owner coordinate to adminSetJudgeDisposition. Every state update inside load is gated on this
+  // stamp so a superseded invocation applies NO state.
+  const loadGen = useRef(0);
 
   const load = useCallback(async () => {
+    const gen = ++loadGen.current;
     setLoading(true);
     setError("");
     try {
-      const data = await api.getJudgeBacklog(bucket, runAnchor || undefined, categories);
-      setBacklog(data);
-      // Keep the nav badge in step with every canonical triage this page learns, not only
-      // the ones a disposition produces (PRD #98 review BLK-BADGE). `triage` here IS the
-      // /me/judge/stats aggregate — the server sources it from that query rather than
-      // tallying the returned rows — so this publishes the same number the badge's own poll
-      // would fetch, without the round-trip.
-      setJudgeTodo(data.triage.todo);
+      if (scope === "all") {
+        // The admin cross-user aggregate (no ?run= anchor — an anchor names a run). `triage`
+        // here is the ALL-USERS tally, which must NOT reach the nav badge.
+        const data = await api.getAdminJudgeBacklog(bucket, categories);
+        if (loadGen.current !== gen) return;
+        setBacklog(data);
+        // BADGE INVARIANT (PRD #1184): the nav badge and the Mine-tab count are the CALLER'S OWN
+        // count, never the aggregate. So under `all` the badge is fed from the owner /me/judge/stats
+        // (getJudgeStats), and the aggregate's data.triage.todo is deliberately never published.
+        // Best-effort: a failed owner-stat fetch leaves the badge at its last value rather than
+        // failing the page.
+        try {
+          const own = await api.getJudgeStats();
+          if (loadGen.current === gen) setJudgeTodo(own.todo);
+        } catch {
+          /* leave the badge as-is; the aggregate must never stand in for the caller's count */
+        }
+      } else {
+        const data = await api.getJudgeBacklog(bucket, runAnchor || undefined, categories);
+        if (loadGen.current !== gen) return;
+        setBacklog(data);
+        // Keep the nav badge in step with every canonical triage this page learns, not only
+        // the ones a disposition produces (PRD #98 review BLK-BADGE). `triage` here IS the
+        // /me/judge/stats aggregate — the server sources it from that query rather than
+        // tallying the returned rows — so this publishes the same number the badge's own poll
+        // would fetch, without the round-trip.
+        setJudgeTodo(data.triage.todo);
+      }
     } catch (e) {
-      setError(errorMessage(e, "Failed to load the backlog"));
+      if (loadGen.current === gen) setError(errorMessage(e, "Failed to load the backlog"));
     } finally {
-      setLoading(false);
+      if (loadGen.current === gen) setLoading(false);
     }
-  }, [bucket, runAnchor, categories, setJudgeTodo]);
+  }, [scope, bucket, runAnchor, categories, setJudgeTodo]);
 
   useEffect(() => {
     // Selection is keyed on coordinates that may not survive a reload; drop it whenever
@@ -169,13 +222,18 @@ export function Judge() {
     reload: reloadCategoryStats,
   } = useAsyncData(
     async ({ isCurrent }) => {
-      const stats = await api.getJudgeCategoryStats(runAnchor || undefined);
+      // Under `all` the chip counts come from the admin cross-user matrix (no ?run= anchor on the
+      // admin path); under `mine` from the owner matrix, anchor-aware. Keyed on scope too, so the
+      // chips refetch when the switch flips.
+      const stats = scope === "all"
+        ? await api.getAdminJudgeCategoryStats()
+        : await api.getJudgeCategoryStats(runAnchor || undefined);
       // Only the latest issued fetch may flip the freshness flag true — the hook's gen guard
       // drops a superseded result, and isCurrent() is the same stamp for our own side-effect.
       if (isCurrent()) setCategoryStatsFresh(true);
       return stats.counts_by_bucket;
     },
-    [runAnchor],
+    [runAnchor, scope],
     {
       // Reset every fetch (deps-driven and reload) so a post-mutation refetch hides the bridge
       // until the fresh matrix lands — the pre-hook setCategoryStatsFresh(false) opener.
@@ -277,6 +335,23 @@ export function Judge() {
     setSearchParams(next, { replace: true });
   };
 
+  // switchScope flips the admin Mine / All-users scope (PRD #1184 M4): it writes the pref (so the
+  // choice is remembered per browser) and, on a switch to All users when the URL carries NO
+  // ?category=, seeds the five instance-level categories into the URL — the client-side default
+  // (the server default stays "all"). The guard on ?category= being absent makes this a
+  // once-per-empty-filter write, never clobbering a filter the admin set. Selection is dropped so
+  // a stale checkbox from the other scope can never drive an action.
+  const switchScope = (next: JudgeScope) => {
+    setScopePref(next);
+    judgeScopePref.set(next);
+    setSelected(new Set());
+    if (next === "all" && !searchParams.get("category")) {
+      const params = new URLSearchParams(searchParams);
+      params.set("category", INSTANCE_CATEGORIES.join(","));
+      setSearchParams(params, { replace: true });
+    }
+  };
+
   // dispose fans one verdict out to every OPEN member of the given coordinates (scope=open
   // — a filed/settled member is left alone), then reconciles the page from the response's
   // bucket=all re-read (DELIBERATELY not a client-side filter): the acted-on rows RE-RENDER
@@ -289,6 +364,42 @@ export function Judge() {
       if (coords.length === 0) return;
       setActionErr("");
       try {
+        if (scope === "all") {
+          // Admin cross-user Mark done (PRD #1184 M4): the only verdict offered under `all` (no
+          // cross-user Dismiss), so `status`/`reason` are ignored — adminSetJudgeDisposition is
+          // done-only. The response is attribution-hidden (no per-run `settled` address), so Undo
+          // is BY COORDINATE via the admin DELETE. Reconcile the acted-on rows in place from the
+          // bucket=all re-read, exactly as the owner path does, so a just-done row re-renders at
+          // its new rollup rather than vanishing mid-interaction.
+          const res = await api.adminSetJudgeDisposition(coords);
+          setBacklog((prev) => {
+            if (!prev) return prev;
+            const fresh = new Map(res.groups.map((g) => [coordKey(g.category, g.target), g]));
+            const groups = (prev.groups as JudgeAdminBacklog["groups"]).map(
+              (g) => fresh.get(coordKey(g.category, g.target)) ?? g,
+            );
+            return { ...(prev as JudgeAdminBacklog), groups, triage: res.triage, truncated: prev.truncated || res.truncated };
+          });
+          // The badge stays the CALLER'S OWN count under `all` (PRD badge invariant): never
+          // publish res.triage (the aggregate). An admin marking OTHER users' coordinates done
+          // does not change the caller's own to-triage count, so leaving the badge as load() set
+          // it is correct.
+          reloadCategoryStats();
+          setSelected(new Set());
+          showToast({
+            message:
+              res.updated === 0
+                ? "Nothing to update — those coordinates were already settled or filed."
+                : `${res.updated} ${res.updated === 1 ? "coordinate" : "coordinates"} marked done${
+                    res.truncated ? " (backlog partial — some may be off-page)" : ""
+                  }.`,
+            undo: [],
+            // The admin Undo removes only the set_via='admin' rows on these coordinates; skip it
+            // when nothing was written (an all-already-settled action has nothing to revert).
+            adminUndoCoords: res.updated > 0 ? coords : undefined,
+          });
+          return;
+        }
         const res = await api.bulkSetJudgeDisposition(coords, status, reason, "open");
         // Reconcile IN PLACE from res.groups (the bucket=all re-read). Replace each acted-on
         // row with its fresh version so it re-renders at its new rollup; NEVER filter a row
@@ -297,9 +408,11 @@ export function Judge() {
         setBacklog((prev) => {
           if (!prev) return prev;
           const fresh = new Map(res.groups.map((g) => [coordKey(g.category, g.target), g]));
-          const groups = prev.groups.map((g) => fresh.get(coordKey(g.category, g.target)) ?? g);
+          // The owner branch runs only under scope="mine", so prev is a JudgeBacklog; the cast
+          // narrows the union backlog state's groups off the union-of-arrays .map.
+          const groups = (prev as JudgeBacklog).groups.map((g) => fresh.get(coordKey(g.category, g.target)) ?? g);
           return {
-            ...prev,
+            ...(prev as JudgeBacklog),
             groups,
             triage: res.triage,
             truncated: prev.truncated || res.truncated,
@@ -339,10 +452,29 @@ export function Judge() {
         setActionErr(errorMessage(e, "Could not apply the disposition"));
       }
     },
-    [showToast, setJudgeTodo, reloadCategoryStats],
+    [scope, showToast, setJudgeTodo, reloadCategoryStats],
   );
 
   const undo = useCallback(async () => {
+    // Admin cross-user Undo (PRD #1184 M4): by COORDINATE via the admin DELETE, not the
+    // per-member deleteDisposition loop below (the admin write has no run address). It removes
+    // only the set_via='admin' rows, so a coordinate a human already settled keeps its verdict.
+    const adminCoords = toast?.adminUndoCoords ?? [];
+    if (adminCoords.length > 0) {
+      setToast(null);
+      if (toastTimer.current) clearTimeout(toastTimer.current);
+      setActionErr("");
+      try {
+        await api.adminUndoJudgeDisposition(adminCoords);
+      } catch (e) {
+        setActionErr(errorMessage(e, "Could not undo"));
+      }
+      // Reload the aggregate + chip matrix (an undo moves groups back between buckets). load()
+      // also republishes the caller's OWN count to the badge, keeping the invariant intact.
+      await load();
+      reloadCategoryStats();
+      return;
+    }
     const members = toast?.undo ?? [];
     setToast(null);
     if (toastTimer.current) clearTimeout(toastTimer.current);
@@ -411,7 +543,10 @@ export function Judge() {
   // of) the selection — the same coordKey the row checkboxes toggle, so MultiSelectBar's own
   // selectedCoords.length count stays correct without change.
   const visibleKeys = useMemo(
-    () => (backlog?.groups ?? []).map((g) => coordKey(g.category, g.target)),
+    () =>
+      ((backlog?.groups ?? []) as (JudgeBacklog["groups"][number] | JudgeAdminBacklog["groups"][number])[]).map((g) =>
+        coordKey(g.category, g.target),
+      ),
     [backlog],
   );
   const allSelected = visibleKeys.length > 0 && visibleKeys.every((k) => selected.has(k));
@@ -430,12 +565,22 @@ export function Judge() {
   // be full of other labels — so a filter narrows out of the zero-state into the "no groups
   // match these labels" empty state below.
   const showZeroState =
+    scope === "mine" &&
     bucket === "todo" &&
     !runAnchor &&
     categories.length === 0 &&
     triage != null &&
     triage.todo === 0 &&
     (backlog?.groups.length ?? 0) === 0;
+
+  // The distinct-user tail for the admin strip. The aggregate carries no instance-wide distinct-
+  // user total, so this is derived as the MAX user_count across the returned groups (the widest
+  // single coordinate) — the honest number the wire actually carries; when there are no groups it
+  // is omitted rather than invented (PRD #1184 M4, decision log).
+  const maxUserCount =
+    scope === "all" && backlog
+      ? (backlog as JudgeAdminBacklog).groups.reduce((m, g) => Math.max(m, g.user_count), 0)
+      : 0;
 
   return (
     <div className="space-y-6 pb-24">
@@ -448,7 +593,42 @@ export function Judge() {
             Judge
           </h1>
         }
-        description="Recommendations across all your runs. Triage a whole group in one action."
+        description={
+          scope === "all"
+            ? "Recommendations across every user's runs, attribution hidden. Instance-level categories by default."
+            : "Recommendations across all your runs. Triage a whole group in one action."
+        }
+        // The Mine / All-users switch (PRD #1184 M4), admins only, and hidden while a ?run= anchor
+        // forces `mine` (a deep link into the caller's own run). The segmented control mirrors
+        // Notifications' — border-edge / bg-raised, no new tailwind stems.
+        actions={
+          isAdmin && !runAnchor ? (
+            <div className="inline-flex overflow-hidden rounded-lg border border-edge text-sm">
+              <button
+                type="button"
+                onClick={() => switchScope("mine")}
+                aria-pressed={scope === "mine"}
+                className={cx(
+                  "px-3 py-1.5 transition-colors",
+                  scope === "mine" ? "bg-raised font-medium text-fg" : "text-muted hover:bg-raised/60",
+                )}
+              >
+                Mine
+              </button>
+              <button
+                type="button"
+                onClick={() => switchScope("all")}
+                aria-pressed={scope === "all"}
+                className={cx(
+                  "border-l border-edge px-3 py-1.5 transition-colors",
+                  scope === "all" ? "bg-raised font-medium text-fg" : "text-muted hover:bg-raised/60",
+                )}
+              >
+                All users
+              </button>
+            </div>
+          ) : undefined
+        }
       />
 
       {error && <Alert message={error} />}
@@ -467,9 +647,21 @@ export function Judge() {
         </div>
       )}
 
-      {/* The aggregate strip's new home (Decision 7): the count that used to live on /runs. */}
+      {/* The aggregate strip's new home (Decision 7): the count that used to live on /runs. Under
+          the admin `all` scope it is titled "Recommendations · all users" with an "across N users"
+          tail (N = the widest coordinate's distinct-user count; omitted when no groups). */}
       {triage && triage.total > 0 && (
-        <TriageSummary triage={triage} title="Recommendations · all your runs" aside="all time" />
+        <TriageSummary
+          triage={triage}
+          title={scope === "all" ? "Recommendations · all users" : "Recommendations · all your runs"}
+          aside={
+            scope === "all"
+              ? maxUserCount > 0
+                ? `across ${maxUserCount} ${maxUserCount === 1 ? "user" : "users"}`
+                : undefined
+              : "all time"
+          }
+        />
       )}
 
       {/* Recommendation-label filter (PRD #235): multi-select chips ABOVE the bucket tabs.
@@ -599,17 +791,20 @@ export function Judge() {
                 />
               </div>
               <ul className="space-y-2">
-                {backlog.groups.map((g) => (
+                {(backlog.groups as (JudgeBacklog["groups"][number] | JudgeAdminBacklog["groups"][number])[]).map((g) => (
                   <GroupRow
                     key={coordKey(g.category, g.target)}
                     group={g}
+                    scope={scope}
                     selected={selected.has(coordKey(g.category, g.target))}
                     onToggleSelect={() => toggleSelect(coordKey(g.category, g.target))}
                     onDispose={(status, reason) => dispose([{ category: g.category, target: g.target }], status, reason)}
                     repos={repos}
                     onFiled={reloadAfterMutation}
-                    // The omittable full-rationale fetch for the expander (PRD #1183 M2).
-                    fetchReview={api.getRunReview}
+                    // The omittable full-rationale fetch for the expander (PRD #1183 M2). Omitted
+                    // under `all` — the admin occurrence carries no run_id to fetch with, so the
+                    // expander shows only the clamped preview (PRD #1184 M4).
+                    fetchReview={scope === "all" ? undefined : api.getRunReview}
                   />
                 ))}
               </ul>
@@ -623,6 +818,8 @@ export function Judge() {
           count={selectedCoords.length}
           onClear={() => setSelected(new Set())}
           onDispose={(status, reason) => dispose(selectedCoords, status, reason)}
+          // No cross-user Dismiss under `all` — the multi-select bar offers Mark done only.
+          allowDismiss={scope !== "all"}
         />
       )}
 

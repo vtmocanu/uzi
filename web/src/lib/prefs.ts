@@ -115,3 +115,22 @@ export const selectedForge = {
     prefs.set<SelectedForgeEntry>(SELECTED_FORGE_KEY, { id, savedAt: now });
   },
 };
+
+// PRD #1184 M4: the admin's remembered Judge PAGE scope ("mine" | "all"). Follows the
+// selectedForge single-scalar precedent but SIMPLER — no TTL: the scope is a persistent
+// choice, not a stale-after-a-week one, so an entry simply reads back until the next set.
+// A non-admin never reads or writes it (the switch never renders for them). Default "mine".
+// A malformed / foreign value reads as the default rather than throwing (prefs.get guards).
+const JUDGE_SCOPE_KEY = "uzi.judgeScope";
+
+export const judgeScope = {
+  // get returns the remembered scope, defaulting to "mine" (owner backlog) when unset or when
+  // the stored value is not one of the two known scopes.
+  get(): "mine" | "all" {
+    return prefs.get<"mine" | "all">(JUDGE_SCOPE_KEY, "mine") === "all" ? "all" : "mine";
+  },
+  // set records the chosen scope. Called on every switch.
+  set(scope: "mine" | "all"): void {
+    prefs.set<"mine" | "all">(JUDGE_SCOPE_KEY, scope);
+  },
+};

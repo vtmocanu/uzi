@@ -419,28 +419,35 @@ var inventoryQueryFiles = []string{
 // parsed for the declared test function names. A pin living outside these fails with a
 // message saying so rather than silently passing.
 //
-// NOT widened alongside inventoryQueryFiles, and that is MEASURED rather than assumed. At
-// `041c5291`, `rg -l 'func Test.*LiveDB\(' internal/ cmd/ | xargs -n1 dirname | sort -u`
-// returns exactly two directories — internal/store (27 files) and internal/handler (9) — so
-// there is no live-DB test anywhere else for a pin to name. Re-run that command rather than
-// trusting this sentence; it is the whole justification for the list being two entries long.
+// A package belongs in this list exactly when some pin's `test` names a test DECLARED in that
+// package — NOT when the package merely happens to have live-DB tests. internal/workersvc, for
+// one, has had many `func Test*LiveDB(` functions all along, but no pin ever needed to name one:
+// every query was pinned to a test in internal/store or internal/handler. PRD #1184 M1 (admin
+// "All users" judge aggregate) is the first time a pin must name a workersvc test —
+// ListJudgeRecommendationRowsAll and ListJudgeTriageRowsAll are reached only through
+// svc.AdminJudge*, and the truthful pin for them names TestAdminJudgeAggregateLiveDB, which is
+// declared in ../workersvc. So ../workersvc is added here so those two pins can name a REAL test
+// rather than a sentinel/declared-gap row. Re-run
+// `rg -l 'func Test.*LiveDB\(' internal/ cmd/ | xargs -n1 dirname | sort -u` to see which dirs
+// HAVE live-DB tests, but remember the trigger is a pin, not that list.
 //
-// 🔴 THE DAY THAT STOPS BEING TRUE, EXTEND THIS LIST — DO NOT WRITE A SENTINEL ROW. A live-DB
-// test landing in internal/poller, internal/forgesvc, internal/workersvc or cmd/uzi makes a
-// TRUTHFUL pin fail the existence check below, and the cheapest way out is to record the query
-// as a declared gap, which is a lie that reads as an audit — the exact failure this file
-// exists to prevent. The failure message names this remedy FIRST for that reason.
+// 🔴 WHEN A PIN MUST NAME A TEST IN A NOT-YET-LISTED PACKAGE, EXTEND THIS LIST — DO NOT WRITE A
+// SENTINEL ROW. A truthful pin naming a test in internal/poller, internal/forgesvc,
+// internal/schedsvc or cmd/uzi fails the existence check below, and the cheapest way out is to
+// record the query as a declared gap, which is a lie that reads as an audit — the exact failure
+// this file exists to prevent. The failure message names this remedy FIRST for that reason.
+// (../workersvc was added exactly this way in PRD #1184 M1; do the same for the next package.)
+// A package having live-DB tests is NOT itself the trigger: internal/forgesvc and internal/schedsvc
+// both have live-DB tests today and are correctly ABSENT here, because no pin names a test in them.
 //
-// The reason this list was NOT pre-extended: the check that would prove an extension works is
-// "a truthful pin naming a real test in the newly-covered package goes green", and with no
-// live-DB test in any other package there is no truthful pin to write. Extending now would
-// mean inventing a row to justify the extension — the same failure, arrived at from the
-// opposite direction. Add the package when the row that needs it exists, in that commit.
+// A package is added when the row that needs it exists, in that commit — never pre-extended,
+// because the check that proves an extension works is "a truthful pin naming a real test in the
+// newly-covered package goes green", and with no such test there is no truthful pin to write.
 //
 // The store-layer queries reached only through middleware (cli_tokens.sql) are pinned by
 // handler tests, because those drive the REAL router — middleware included — rather than
 // calling handlers directly. That is why widening to cli_tokens.sql needed no new package.
-var inventoryPackages = []string{".", "../handler"}
+var inventoryPackages = []string{".", "../handler", "../workersvc"}
 
 // queryInventory is the declaration. Every row was verified by opening the call site named in
 // `why`; none was inferred.
@@ -456,6 +463,10 @@ var queryInventory = []queryPin{
 		"reached through the listDispositions helper (:260), called at :225 — NOT visible to a body scan"},
 	{"ListJudgeTriageRowsForUser", "dispositions.sql", "TestJudgeTriageRowsForUserAreCoordinateScopedLiveDB",
 		"the coordinate-scoping pin; also called directly by TestRecommendationDispositionsLiveDB:183"},
+	{"ListJudgeTriageRowsAll", "dispositions.sql", "TestAdminJudgeAggregateLiveDB",
+		"PRD #1184 M1 admin \"All users\" triage aggregate — no user predicate. Reached through " +
+			"svc.AdminJudgeTriageStats in ../workersvc (added to inventoryPackages for this); the test " +
+			"asserts the cross-user tally is reachable and non-empty over the shared DB"},
 	{"CreateJudgeRun", "judge.sql", "TestJudgeQueriesLiveDB",
 		"direct call, judge_integration_test.go:65 (TestClaimRunDockerRepoAllowlistLiveDB also calls it, but only as fixture setup)"},
 	{"GetActiveJudgeRunForWorkerTarget", "judge.sql", "TestJudgeQueriesLiveDB",
@@ -517,6 +528,23 @@ var queryInventory = []queryPin{
 	{"UpsertDispositionsForResolvedCoords", "judge_bulk_disposition.sql", "TestBulkDispositionFansOutAcrossRunsLiveDB",
 		"named in NO test source: the write half of the same handler path; the test asserts the " +
 			"fan-out landed by reading recommendation_dispositions back from the table"},
+	{"ListRecommendationsForCoordsAll", "judge_bulk_disposition.sql", "TestAdminMarkDoneFansOutOpenMembersLiveDB",
+		"PRD #1184 M2 admin cross-user resolve — NO user predicate. Reached through " +
+			"svc.AdminMarkDone in ../workersvc; the test seeds the SAME coordinate under two owners plus " +
+			"a filed and an already-disposed member, and asserts updated=3 (only the three OPEN members " +
+			"across both owners, proving the missing user predicate AND the todo filter)"},
+	{"UpsertAdminDispositionsForResolvedCoords", "judge_bulk_disposition.sql", "TestAdminMarkDoneDoNothingProtectsHumanVerdictLiveDB",
+		"PRD #1184 M2 admin done write — status='done'/set_via='admin', ON CONFLICT DO NOTHING. " +
+			"Called DIRECTLY (bypassing the Go todo filter to model the race) against a coordinate that " +
+			"already carries a human 'dismissed': asserts execrows=0 and the human verdict unchanged, so " +
+			"relaxing DO NOTHING to DO UPDATE reddens it. TestAdminMarkDoneFansOutOpenMembersLiveDB also " +
+			"pins the set_via='admin'/set_by_user_id=<admin> stamp through svc.AdminMarkDone"},
+	{"DeleteAdminDispositionsForCoords", "judge_bulk_disposition.sql", "TestAdminUndoRemovesOnlyAdminRowsLiveDB",
+		"PRD #1184 M2 admin undo — deletes only set_via='admin' rows on a coordinate across users. " +
+			"Reached through svc.AdminUndoDone in ../workersvc; the test marks two owners done via admin " +
+			"and leaves a THIRD owner's human 'done' on the same coordinate, then asserts the undo removes " +
+			"exactly the two admin rows (updated=2) and the human 'done' survives — so dropping the " +
+			"set_via='admin' predicate would over-delete and redden it"},
 	{"ListFiledIssueCloseEdges", "judge_issue_close.sql", "TestJudgeBacklogProjectsEveryColumnLiveDB",
 		"direct call, judge_recommendations_integration_test.go:492"},
 	{"ApplyFiledIssueCloseEdge", "judge_issue_close.sql", "TestJudgeBacklogProjectsEveryColumnLiveDB",
@@ -524,6 +552,24 @@ var queryInventory = []queryPin{
 	{"ListJudgeRecommendationRowsForUser", "judge_recommendations.sql", "TestJudgeBacklogProjectsEveryColumnLiveDB",
 		"direct call, judge_recommendations_integration_test.go:521 — the M1 read model, also " +
 			"exercised by the anchor/recency/tenant tests in the same file"},
+	{"ListJudgeRecommendationRowsAll", "judge_recommendations.sql", "TestAdminJudgeAggregateLiveDB",
+		"PRD #1184 M1 admin \"All users\" aggregate read — NO user predicate. Reached through " +
+			"svc.AdminJudgeRecommendationBacklog in ../workersvc (added to inventoryPackages for this). " +
+			"The test seeds two owners on ONE coordinate and asserts user_count 2 (proving the missing " +
+			"user predicate), the run-count/rollup, the SQL LIMIT cap binding (Truncated over a >cap " +
+			"seed), and that no owner/run/review id or run title reaches the serialized response"},
+	{"NewestOpenOccurrenceForCoord", "judge_recommendations.sql", "TestAdminFileJudgeIssueResolvesAtFileTimeLiveDB",
+		"PRD #1184 M3 admin filing resolve — the SINGLE newest OPEN occurrence of a (category, target) " +
+			"coordinate across ALL users, NO user predicate. Reached through svc.AdminNewestOpenOccurrence " +
+			"from the admin draft/file handlers (../handler). The pin folds the newest-resolution: the test " +
+			"seeds occurrence A, drafts it, then seeds a NEWER review B on the SAME coordinate and files — " +
+			"asserting the filed link lands on B (so ORDER BY updated_at DESC → the newest reddens if flipped) " +
+			"and A stays open. The open predicate's two halves are folded SEPARATELY, one test each: the " +
+			"f.filed_at IS NULL half by TestAdminFileJudgeIssueNewestOccurrenceLiveDB (files the newest, then " +
+			"asserts the next resolve returns the older STILL-OPEN occurrence, not the just-filed one), and the " +
+			"d.status IS NULL half by TestAdminJudgeIssueDraftExcludesDisposedLiveDB (disposes the only " +
+			"occurrence, then asserts the draft 404s — filing never writes a disposition, so only that test " +
+			"reddens if AND d.status IS NULL is dropped)"},
 	{"ListJudgeTriageRowsForRuns", "judge_recommendations.sql", "TestJudgeRunTodoTriageRowsAreCoordinateScopedLiveDB",
 		"direct call, judge_recommendations_integration_test.go:1106"},
 

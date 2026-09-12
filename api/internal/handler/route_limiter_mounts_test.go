@@ -67,7 +67,19 @@ var limiterNames = [...]string{
 // error rather than a failing row. Spelled `lim*` rather than matching the parameter
 // names exactly, so nothing here shadows a parameter inside Routes.
 //
-// 184 as of this commit (PRD #1171 M1 added POST /api/worker/runs/{id}/codex/release and
+// 191 as of this commit (PRD #1184 M3 added GET /api/admin/judge/recommendations/issue-draft
+// and POST /api/admin/judge/recommendations/issue — the admin "All users" issue draft READ and
+// the FILE write. The draft is a read in the admin read group → noLimiter, like the aggregate
+// reads; the file is a forge WRITE in the admin write group behind forgeLimiter, like the owner
+// POST /api/runs/{id}/review/recommendations/{recID}/issue → limForge.)
+// It was 189 until then (PRD #1184 M2 added PUT and DELETE
+// /api/admin/judge/recommendations/disposition — the admin "All users" cross-user Mark done
+// and its Undo, mounted in the admin WRITE group beside /admin/settings, both cookie-only and
+// both noLimiter: a local upsert/delete, no forge call and no token spend.)
+// It was 187 until then (PRD #1184 M1 added GET /api/admin/judge/recommendations,
+// GET /api/admin/judge/stats and GET /api/admin/judge/category-stats — the admin "All users"
+// judge aggregate reads, mounted in the admin read group beside /admin/runs, all noLimiter.)
+// It was 184 until then (PRD #1171 M1 added POST /api/worker/runs/{id}/codex/release and
 // POST /api/worker/runs/{id}/codex/refresh — the Bearer-only Codex credential
 // release/refresh bridge, both worker-authenticated and both noLimiter, like the other
 // worker /runs/{id}/... routes they sit beside.)
@@ -196,6 +208,9 @@ var wantRouteMounts = []routeMount{
 	// forge call → noLimiter, like the settings PUT and guardrail-override it sits
 	// beside.
 	{"DELETE", "/api/admin/branding/logo/{slot}", noLimiter},
+	// PRD #1184 M2: admin cross-user Mark-done UNDO — a cookie-only admin DB delete of the
+	// set_via='admin' rows on a coordinate, no forge call → noLimiter.
+	{"DELETE", "/api/admin/judge/recommendations/disposition", noLimiter},
 	// PRD #66 M8 (D8): admin per-repo guardrail override revoke — an admin-only,
 	// unscoped-by-id DB write, no forge call → noLimiter.
 	{"DELETE", "/api/admin/repos/{id}/guardrail-override", noLimiter},
@@ -237,6 +252,16 @@ var wantRouteMounts = []routeMount{
 	// like POST /{id}/privilege-check — it makes the same class of upstream forge
 	// reads (2 + 2×repos), so it draws from the forge pocket rather than none.
 	{"GET", "/api/admin/guardrail-impact", limForge},
+	// PRD #1184 M1: the admin "All users" judge aggregate reads — deduped recommendations,
+	// the cross-user triage strip and filter-chip counts. Reads of stored review rows, no
+	// forge call → noLimiter, like /admin/runs beside them.
+	{"GET", "/api/admin/judge/category-stats", noLimiter},
+	{"GET", "/api/admin/judge/recommendations", noLimiter},
+	// PRD #1184 M3: the admin "All users" issue DRAFT read for a coordinate's newest open
+	// occurrence. A READ (no forge write, no token spend) in the admin read group → noLimiter,
+	// like the aggregate reads it sits beside; the FILE write is a separate POST below.
+	{"GET", "/api/admin/judge/recommendations/issue-draft", noLimiter},
+	{"GET", "/api/admin/judge/stats", noLimiter},
 	{"GET", "/api/admin/rate-limits", noLimiter},
 	{"GET", "/api/admin/runs", noLimiter},
 	{"GET", "/api/admin/agent-source", noLimiter},
@@ -402,6 +427,12 @@ var wantRouteMounts = []routeMount{
 	// app_settings upsert (no egress, no forge/model spend) → noLimiter, like the
 	// release-check "Check now" above.
 	{"POST", "/api/admin/release-check/snooze", noLimiter},
+	// PRD #1184 M3: the admin "All users" FILE issue write — files a coordinate's newest open
+	// occurrence through the owner filer's forge path (claim-first → CreateIssue → settle). A
+	// forge WRITE, so it carries forgeLimiter.PerUserMiddleware like the owner
+	// POST /api/runs/{id}/review/recommendations/{recID}/issue → limForge, and unlike the
+	// cookie-only, no-forge admin disposition writes it sits beside.
+	{"POST", "/api/admin/judge/recommendations/issue", limForge},
 	{"POST", "/api/agent-templates/", noLimiter},
 	{"POST", "/api/agent-templates/{id}/reset", noLimiter},
 	{"POST", "/api/auth/cli/approve", limAuth},
@@ -588,6 +619,9 @@ var wantRouteMounts = []routeMount{
 	// off the JSON PUT cap (Risk R4), no forge call → noLimiter, like the settings PUT
 	// beside it.
 	{"PUT", "/api/admin/branding/logo/{slot}", noLimiter},
+	// PRD #1184 M2: admin cross-user Mark done — a cookie-only admin local upsert
+	// (set_via='admin', ON CONFLICT DO NOTHING), no forge call and no token spend → noLimiter.
+	{"PUT", "/api/admin/judge/recommendations/disposition", noLimiter},
 	{"PUT", "/api/admin/settings", noLimiter},
 	{"PUT", "/api/admin/users/{id}/ci-autofix", noLimiter},
 	{"PUT", "/api/admin/users/{id}/judge", noLimiter},

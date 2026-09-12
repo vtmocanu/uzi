@@ -12,6 +12,37 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const deleteAdminDispositionsForCoords = `-- name: DeleteAdminDispositionsForCoords :execrows
+WITH want AS (
+    SELECT c.val AS category, t.val AS target
+    FROM unnest($1::text[]) WITH ORDINALITY AS c(val, ord)
+    JOIN unnest($2::text[]) WITH ORDINALITY AS t(val, ord) ON t.ord = c.ord
+)
+DELETE FROM recommendation_dispositions d
+USING want w
+WHERE d.category = w.category AND d.target = w.target AND d.set_via = 'admin'
+`
+
+type DeleteAdminDispositionsForCoordsParams struct {
+	Categories []string `json:"categories"`
+	Targets    []string `json:"targets"`
+}
+
+// The admin Undo (PRD #1184 M2): delete ONLY the rows this admin fan-out created —
+// set_via = 'admin' — on the requested coordinates, across every user. A human's own done/dismissed
+// verdict on the same coordinate (set_via NULL) is LEFT STANDING, and so is the Filed→Done sync's
+// 'issue_close' or the denied-CLI net's 'denied_cli'. Coordinate-scoped with no user predicate, by
+// design: an admin who marked done across users undoes across users. The coordinates are zipped by
+// ordinal into `want` exactly as the resolve above. :execrows returns the rows removed as the
+// aggregate `updated`.
+func (q *Queries) DeleteAdminDispositionsForCoords(ctx context.Context, arg DeleteAdminDispositionsForCoordsParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteAdminDispositionsForCoords, arg.Categories, arg.Targets)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const listOwnedRecommendationsForCoords = `-- name: ListOwnedRecommendationsForCoords :many
 
 WITH want AS (
@@ -181,6 +212,179 @@ func (q *Queries) ListOwnedRecommendationsForCoords(ctx context.Context, arg Lis
 		return nil, err
 	}
 	return items, nil
+}
+
+const listRecommendationsForCoordsAll = `-- name: ListRecommendationsForCoordsAll :many
+
+WITH want AS (
+    -- The two arrays are zipped BY ORDINAL, so row i is exactly (categories[i], targets[i]) — a
+    -- pairwise list, never the cross product a naive two-array join would produce.
+    SELECT c.val AS category, t.val AS target
+    FROM unnest($1::text[]) WITH ORDINALITY AS c(val, ord)
+    JOIN unnest($2::text[]) WITH ORDINALITY AS t(val, ord) ON t.ord = c.ord
+)
+SELECT DISTINCT ON (rv.id, rr.category, rr.target)
+    rv.id                          AS review_id,
+    rr.category                    AS category,
+    rr.target                      AS target,
+    rr.rationale_md                AS rationale_md,
+    d.status                       AS disposition_status,
+    (f.filed_at IS NOT NULL)::bool AS filed_settled
+FROM run_reviews rv
+JOIN review_recommendations rr ON rr.review_id = rv.id
+JOIN want ON want.category = rr.category AND want.target = rr.target
+LEFT JOIN recommendation_dispositions d
+    ON d.review_id = rv.id AND d.category = rr.category AND d.target = rr.target
+LEFT JOIN recommendation_filed_issues f
+    ON f.review_id = rv.id AND f.category = rr.category AND f.target = rr.target
+ORDER BY rv.id, rr.category, rr.target, rr.created_at ASC, rr.id ASC
+`
+
+type ListRecommendationsForCoordsAllParams struct {
+	Categories []string `json:"categories"`
+	Targets    []string `json:"targets"`
+}
+
+type ListRecommendationsForCoordsAllRow struct {
+	ReviewID          uuid.UUID   `json:"review_id"`
+	Category          string      `json:"category"`
+	Target            string      `json:"target"`
+	RationaleMd       string      `json:"rationale_md"`
+	DispositionStatus pgtype.Text `json:"disposition_status"`
+	FiledSettled      bool        `json:"filed_settled"`
+}
+
+// The ADMIN "All users" cross-user Mark done (PRD #1184 M2). The owner twins above resolve and
+// write only the CALLER's rows; these two write across EVERY user's copy of a coordinate. They are
+// SEPARATE queries (never a relaxation of the owner ones), so the owner query's
+// `WHERE rv.user_id = @user_id` and its "IsAdmin is never consulted" comment stay literally true.
+// The cross-user resolve for the admin Mark done: every user's member recommendations for a set of
+// (category, target) coordinates. It is ListOwnedRecommendationsForCoords with the owner predicate
+// REMOVED — the one intentional no-user-predicate resolve (decision log 2026-09-07) — so a
+// coordinate resolves to the OPEN members of EVERY owner, which is exactly what the fan-out must
+// reach. There is no security regression: this query is reachable only through AdminMarkDone, whose
+// handler sits in the cookie-only admin WRITE group (RequireAuth + RequireAdmin); a uza_ admin_ro
+// Bearer 401s before the handler exists.
+//
+// The projection is DELIBERATELY LEANER than the owner twin: the admin result carries NO run
+// address (no `settled` list — the admin Undo is by coordinate, decision log 2026-09-07), so
+// run_id, rec_id and user_id are all dropped. Only review_id (the disposition's key half the write
+// unnests), category, target, rationale_md (the hash the write re-stamps, #94 Decision 3), and the
+// two bucket inputs disposition_status + filed_settled (feeding the Go BucketOf ladder so the fan
+// reaches only `todo` members) are needed.
+//
+// SECURITY, same as the owner twin: the SELECT reads `rr.category`/`rr.target`, NOT `want.*`. The
+// JOIN plus the coordinate arrays are what yield zero rows for a coordinate that does not exist, so
+// a body value can never reach the coordinate columns (00071/00073 omit a category CHECK on that
+// exact ground). Selecting from `rr` rather than `want` is defence in depth — the equality join
+// makes them interchangeable TODAY, and they diverge the moment the match is loosened. DISTINCT ON
+// is REQUIRED for the same reason as the owner twin: review_recommendations has no unique
+// constraint on the coordinate, so a judge may emit it twice in one review, and two rows for the
+// same (review_id, category, target) would make the single multi-row upsert raise SQLSTATE 21000.
+// ORDER BY ... rr.created_at ASC, rr.id ASC keeps WHICH duplicate survives deterministic (the
+// oldest, so the stamped rationale_hash is stable), matching the owner twin.
+func (q *Queries) ListRecommendationsForCoordsAll(ctx context.Context, arg ListRecommendationsForCoordsAllParams) ([]ListRecommendationsForCoordsAllRow, error) {
+	rows, err := q.db.Query(ctx, listRecommendationsForCoordsAll, arg.Categories, arg.Targets)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListRecommendationsForCoordsAllRow{}
+	for rows.Next() {
+		var i ListRecommendationsForCoordsAllRow
+		if err := rows.Scan(
+			&i.ReviewID,
+			&i.Category,
+			&i.Target,
+			&i.RationaleMd,
+			&i.DispositionStatus,
+			&i.FiledSettled,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const upsertAdminDispositionsForResolvedCoords = `-- name: UpsertAdminDispositionsForResolvedCoords :execrows
+WITH members AS (
+    SELECT r.val AS review_id, c.val AS category, t.val AS target, h.val AS rationale_hash
+    FROM unnest($2::uuid[]) WITH ORDINALITY AS r(val, ord)
+    JOIN unnest($3::text[]) WITH ORDINALITY AS c(val, ord) ON c.ord = r.ord
+    JOIN unnest($4::text[]) WITH ORDINALITY AS t(val, ord) ON t.ord = r.ord
+    JOIN unnest($5::text[]) WITH ORDINALITY AS h(val, ord) ON h.ord = r.ord
+)
+INSERT INTO recommendation_dispositions
+    (review_id, category, target, status, rationale_hash, set_via, set_by_user_id)
+SELECT m.review_id, m.category, m.target, 'done', m.rationale_hash, 'admin', $1
+FROM members m
+WHERE NOT EXISTS (
+    SELECT 1 FROM recommendation_filed_issues f
+    WHERE f.review_id = m.review_id
+      AND f.category = m.category
+      AND f.target = m.target
+      AND f.filed_at IS NOT NULL
+)
+ON CONFLICT (review_id, category, target) DO NOTHING
+`
+
+type UpsertAdminDispositionsForResolvedCoordsParams struct {
+	AdminUserID     pgtype.UUID `json:"admin_user_id"`
+	ReviewIds       []uuid.UUID `json:"review_ids"`
+	Categories      []string    `json:"categories"`
+	Targets         []string    `json:"targets"`
+	RationaleHashes []string    `json:"rationale_hashes"`
+}
+
+// Write the admin cross-user Mark done in ONE statement over the RESOLVED members (PRD #1184 M2) —
+// the twin of UpsertDispositionsForResolvedCoords, with two deliberate differences.
+//
+//  1. ON CONFLICT DO NOTHING (not DO UPDATE) plus a WHERE NOT EXISTS filed recheck. Together these
+//     are the whole point of the admin write: a human's existing verdict on the coordinate — done OR
+//     dismissed, set by that owner — must NEVER be overwritten by an admin, and a coordinate a human
+//     FILED must never take an admin 'done'. An admin done only reaches coordinates still `todo` (the
+//     resolve already filters to `todo` members in Go); these two SQL guards are the durable backstop
+//     against a human settling between the resolve and the write, one guard per way a coordinate
+//     leaves `todo`:
+//     * a DISPOSITION landing (human done/dismissed) — caught by ON CONFLICT (review_id, category,
+//     target) DO NOTHING, since the insert would conflict on the coordinate key.
+//     * a FILING landing — caught by the WHERE NOT EXISTS anti-join, because filing writes NO
+//     disposition (SettleRecommendationFiledIssue only stamps recommendation_filed_issues.
+//     filed_at), so DO NOTHING alone would let an admin 'done' land on a now-filed coordinate.
+//     The anti-join adds no query parameter — it reads the members CTE's own columns.
+//     Same non-clobbering semantics as SystemDismissDeniedCLIRecommendation, and the opposite of the
+//     owner human upsert whose DO UPDATE is last-writer-wins because THAT is the human speaking.
+//
+//  2. set_via = 'admin' and set_by_user_id = @admin_user_id are written as LITERALS/params, NOT
+//     cleared. Unlike the two other server-side provenances, set_by_user_id is SET — the acting
+//     admin is recorded in the row for accountability (a forensic "who did this"), while the
+//     user-facing chip never names them (it reads only "Done by an admin"). status is the literal
+//     'done'; a 'done' carries no dismiss_reason, so the column is omitted (defaults NULL, satisfying
+//     the table's status/reason CHECK).
+//
+// The coordinates are the RESOLVED ones: review_id / category / target / rationale_hash all come
+// from ListRecommendationsForCoordsAll, never from a request body, so the 00071/00073 no-category-
+// CHECK invariant holds. The four arrays are zipped BY ORDINAL into one member per row, the same
+// shape sqlc forced on the owner twin. rationale_hash is stamped from each member's CURRENT
+// rationale (#94 Decision 3, the stale flag's key). :execrows returns the members actually written
+// (a DO NOTHING skip does not count), reported as an aggregate `updated` — never per-item, which
+// would rebuild the existence oracle #94 Decision 5 forbids.
+func (q *Queries) UpsertAdminDispositionsForResolvedCoords(ctx context.Context, arg UpsertAdminDispositionsForResolvedCoordsParams) (int64, error) {
+	result, err := q.db.Exec(ctx, upsertAdminDispositionsForResolvedCoords,
+		arg.AdminUserID,
+		arg.ReviewIds,
+		arg.Categories,
+		arg.Targets,
+		arg.RationaleHashes,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const upsertDispositionsForResolvedCoords = `-- name: UpsertDispositionsForResolvedCoords :execrows

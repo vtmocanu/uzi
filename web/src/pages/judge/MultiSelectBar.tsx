@@ -13,10 +13,15 @@ export function MultiSelectBar({
   count,
   onClear,
   onDispose,
+  allowDismiss = true,
 }: {
   count: number;
   onClear: () => void;
   onDispose: (status: "done" | "dismissed", reason?: "wont_do" | "not_an_issue") => void;
+  // allowDismiss gates the Dismiss ▾ button (PRD #1184 M4): false under the admin `all` scope,
+  // where there is no cross-user Dismiss — the bar then offers Mark done only. Default true keeps
+  // every owner call site unchanged.
+  allowDismiss?: boolean;
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
   const wrapRef = useRef<HTMLDivElement>(null);
@@ -64,39 +69,41 @@ export function MultiSelectBar({
           <Button size="sm" variant="secondary" onClick={() => onDispose("done")}>
             Mark done
           </Button>
-          <div className="relative" ref={wrapRef}>
-            <Button
-              size="sm"
-              variant="secondary"
-              aria-haspopup="menu"
-              aria-expanded={menuOpen}
-              onClick={() => setMenuOpen((o) => !o)}
-            >
-              Dismiss ▾
-            </Button>
-            {menuOpen && (
-              <div
-                role="menu"
-                className="absolute bottom-full right-0 z-10 mb-1 w-56 rounded-lg border border-edge-strong bg-surface p-1 shadow-lg"
+          {allowDismiss && (
+            <div className="relative" ref={wrapRef}>
+              <Button
+                size="sm"
+                variant="secondary"
+                aria-haspopup="menu"
+                aria-expanded={menuOpen}
+                onClick={() => setMenuOpen((o) => !o)}
               >
-                {dismissMenuItems("judge").map((item) => (
-                  <button
-                    key={item.reason}
-                    type="button"
-                    role="menuitem"
-                    onClick={() => {
-                      setMenuOpen(false);
-                      onDispose("dismissed", item.reason);
-                    }}
-                    className="flex w-full flex-col gap-0.5 rounded-md px-2.5 py-2 text-left text-sm text-fg transition-colors hover:bg-raised"
-                  >
-                    {item.label}
-                    <span className="text-xs text-faint">{item.subline}</span>
-                  </button>
-                ))}
-              </div>
-            )}
-          </div>
+                Dismiss ▾
+              </Button>
+              {menuOpen && (
+                <div
+                  role="menu"
+                  className="absolute bottom-full right-0 z-10 mb-1 w-56 rounded-lg border border-edge-strong bg-surface p-1 shadow-lg"
+                >
+                  {dismissMenuItems("judge").map((item) => (
+                    <button
+                      key={item.reason}
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        setMenuOpen(false);
+                        onDispose("dismissed", item.reason);
+                      }}
+                      className="flex w-full flex-col gap-0.5 rounded-md px-2.5 py-2 text-left text-sm text-fg transition-colors hover:bg-raised"
+                    >
+                      {item.label}
+                      <span className="text-xs text-faint">{item.subline}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
           <Button size="sm" variant="ghost" onClick={onClear}>
             Clear
           </Button>

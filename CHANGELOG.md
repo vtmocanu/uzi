@@ -18,6 +18,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Added
+
+- **An admin can review every user's judge recommendations at once, on a new All users view on the Judge page ([#1184](https://github.com/vtmocanu/uzi/issues/1184)).**
+  A Mine / All users switch, admin-only and remembered per browser, groups every user's recommendations by category and target with a count of distinct users instead of an owner, run title or run link, so an admin can gauge how widespread a pattern is without seeing whose it is; rationale text can still name a repo or file, so the view is aggregated across users, not anonymous. File issue still drafts with full provenance (whose worker text it publishes), and Mark done settles the coordinate across every user's open occurrence, leaving each owner's row reading "Done by an admin" with a working Undo; there's no cross-user Dismiss, since that stays each owner's own call. Reads are also on the CLI (`uzi admin review backlog`/`stats`); the writes are web-only.
+
 ## [0.82.0] - 2026-09-10
 
 ### Added

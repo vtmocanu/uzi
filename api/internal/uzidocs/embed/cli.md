@@ -141,6 +141,7 @@ uzi repo list | remove <id> [--force]
 uzi project-sync status <repo> | resync <repo>
 uzi admin users | runs | workers | usage | rate-limits | cli-tokens | guardrail-impact | blocked-repos
 uzi admin agent-source get | status
+uzi admin review backlog [--bucket todo|filed|done|dismissed|all] [--category label,label] | stats [--json]
 uzi skill status | install [--force] | install-hook | uninstall-hook
 uzi docs list [--audience user|operator|design|contributor|all]
 uzi docs show <slug>
@@ -608,6 +609,21 @@ A few worth knowing:
   to produce them. Read-only, same as every other `admin` verb here —
   setting up the source, and triggering **Sync now**, **Check for
   updates**, **Bump pin**, and **Approve & apply** stay web-only.
+- **`admin review backlog` and `admin review stats` are the admin "All users"
+  judge aggregate** (PRD #1184) — every user's judge recommendations deduped by
+  `(category, target)` across the whole factory, with **attribution hidden**.
+  `backlog` prints one line per group as `K users · M runs · N open` (how many
+  distinct users hit the pattern, how many runs it recurs in, how many are still
+  open) plus the rationale preview, and **no per-run or occurrence line**: no
+  owner, run id or run title is shown, so a group tells you how widespread a
+  recommendation is without saying whose it is. It takes `--bucket` and
+  `--category` — forwarded verbatim and server-validated exactly like
+  [`uzi review backlog`](#reviewing-and-triaging-from-the-cli), so an unknown
+  value is a usage error (exit 2), not a silent empty list — but has **no
+  `--run`** anchor, because an anchor names a run. `stats` is the all-users
+  triage tally, the cross-user twin of `uzi review stats`. Both are read-only and
+  need an `admin_ro` (`uza_`) token, same ceiling as every other `admin` verb;
+  the cross-user Mark done and Undo stay cookie-only in the web UI.
 - **`uzi repo remove <id>` deletes a single stale repo** — the surgical
   counterpart to deleting a whole forge connection. It only works on a
   **disabled** repo, so disable it first (`enabled` shows in `uzi repo list`);
