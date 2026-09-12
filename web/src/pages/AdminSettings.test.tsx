@@ -59,6 +59,7 @@ const settings = (over: Partial<import("../lib/api").AppSettings> = {}) => ({
   health_queued_seconds: "600",
   health_approval_seconds: "3600",
   health_nudge_cooldown_seconds: "1800",
+  run_extension_cap_seconds: "57600",
   docker_repo_allowlist: "",
   capability_aware_scheduling: "true",
   github_project_sync_enabled: "false",
@@ -512,6 +513,32 @@ describe("AdminSettings", () => {
     fireEvent.click(btn);
     await waitFor(() =>
       expect(mockApi.updateSettings).toHaveBeenCalledWith({ health_near_timeout_pct: "50" }),
+    );
+  });
+
+  it("rejects 3599 for the extension allowance (its bounds differ from the health seconds, PRD #1189)", async () => {
+    // 3599 discriminates the extension-allowance rule ([3600, 604800]) from the health-seconds
+    // rule ([60, 86400]): the health validator accepts 3599, this one rejects it.
+    renderPage();
+    const cap = (await screen.findByLabelText(/Extension allowance per run/i)) as HTMLInputElement;
+    fireEvent.change(cap, { target: { value: "3599" } });
+
+    expect(screen.getByText(/between 3600 and 604800 seconds/i)).toBeTruthy();
+    const btn = screen.getByRole("button", { name: /save run health/i }) as HTMLButtonElement;
+    expect(btn.disabled).toBe(true);
+  });
+
+  it("accepts 0 to turn extending off, and saves it (PRD #1189)", async () => {
+    mockApi.updateSettings.mockResolvedValue(response({ run_extension_cap_seconds: "0" }));
+    renderPage();
+    const cap = (await screen.findByLabelText(/Extension allowance per run/i)) as HTMLInputElement;
+    fireEvent.change(cap, { target: { value: "0" } });
+
+    const btn = screen.getByRole("button", { name: /save run health/i }) as HTMLButtonElement;
+    expect(btn.disabled).toBe(false);
+    fireEvent.click(btn);
+    await waitFor(() =>
+      expect(mockApi.updateSettings).toHaveBeenCalledWith({ run_extension_cap_seconds: "0" }),
     );
   });
 });

@@ -792,6 +792,11 @@ export interface AppSettings {
   health_queued_seconds: string;
   health_approval_seconds: string;
   health_nudge_cooldown_seconds: string;
+  // Per-run wall-clock extension allowance (PRD #1189): the total extra time an owner may
+  // grant one run through Extend, integer seconds as a string. 0 turns extending off
+  // instance-wide. Its bounds differ from the health-seconds keys ({0} ∪ [3600, 604800]),
+  // so it carries its OWN client validator in HealthSettingsCard, not validateHealthSeconds.
+  run_extension_cap_seconds: string;
   // Docker-worker repo allowlist (PRD #89 M-allow): a comma-separated list of repo
   // ids (UUIDs). A docker-capable worker may only claim runs for repos on this list;
   // empty is fail-closed (a docker worker then claims no repo-bearing run). Non-docker
@@ -2102,6 +2107,29 @@ export interface Run {
   milestones_candidate?: Milestone[] | null;
   budget_max_iterations?: number | null;
   budget_wall_seconds?: number | null;
+  /** PRD #1189: the run's wall-clock EXTENSION contract, all four OPTIONAL for api/web
+   *  rollout skew (an older api pod omits them) — and that fallback is load-bearing, not
+   *  cosmetic: an absent `budget_extension_cap_seconds` reads as "unknown", so the header
+   *  falls back to plain elapsed and the Extend button does NOT render, whereas a real `0`
+   *  means extending is turned off. Never conflate the two.
+   *
+   *  `budget_extension_seconds` is the owner-granted extension added ON TOP of the frozen
+   *  budget (0 when never extended). `budget_extension_cap_seconds` is the effective admin
+   *  cap (run_extension_cap_seconds; 0 = disabled), served here so the Extend chooser needs
+   *  no separate admin-settings read.
+   *
+   *  `budget_total_seconds` is COALESCE(budget_wall_seconds, RUN_TIMEOUT) + extension, so a
+   *  client never has to know RUN_TIMEOUT; null for a kind/state with no wall deadline (not
+   *  running, chat/judge, interactive, or no started_at) — the SAME predicate deadline_at
+   *  uses, so the total and the deadline can never disagree. `budget_used_seconds` is the
+   *  ACTIVE time so far (now − started_at − paused, clamped ≥0), the paused-aware "used" the
+   *  header measures against the budget — NOT raw wall elapsed; null when the run never
+   *  started. Age it client-side for a RUNNING run against deadline_at (used = total − time
+   *  left) so it agrees with the same-header deadline. */
+  budget_extension_seconds?: number;
+  budget_extension_cap_seconds?: number;
+  budget_total_seconds?: number | null;
+  budget_used_seconds?: number | null;
   claimed_at: string | null;
   started_at: string | null;
   finished_at: string | null;
@@ -2989,7 +3017,12 @@ export type RunInputKind =
    *  NOT a kind here — resume is the widened POST /runs/{id}/resume-now endpoint (D14),
    *  so there is exactly one resume mechanism. */
   | "pause"
-  | "pause_cancel";
+  | "pause_cancel"
+  /** PRD #1189: an owner's wall-clock extension (`extend`, body = whole seconds), POSTed to
+   *  /runs/{id}/inputs like `scope`. Server-only (drained by the sweep/health arm and the
+   *  worker's served wall, never routed to the worker's steering channel), owner-gated, and
+   *  refused with 409 on a kind/state that never times out. */
+  | "extend";
 
 // SteerInput is one steer-queue entry (PRD #95, extended by PRD #634), from
 // GET /api/runs/{id}/inputs. `kind` is "follow_up" or "scope" (an operator
