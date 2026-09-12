@@ -3,7 +3,7 @@
 **Status**: Accepted (implemented, issue #1184, M1–M5)
 **Date**: 2026-09-12
 **Deciders**: architect (design + decision log 2026-09-07); coder (implementation); reviewer.
-**PRD**: [prds/1184-admin-judge-scope.md](../prds/1184-admin-judge-scope.md) — carries the full milestone breakdown, code anchors and Decision Log; this ADR restates the four durable decisions a future edit to the read path, the grouper, or the disposition write is most likely to erode without ever touching a line this PRD's diff touched.
+**PRD**: [prds/done/1184-admin-judge-scope.md](../prds/done/1184-admin-judge-scope.md) — carries the full milestone breakdown, code anchors and Decision Log; this ADR restates the four durable decisions a future edit to the read path, the grouper, or the disposition write is most likely to erode without ever touching a line this PRD's diff touched.
 **Related**: `specs/ai.md` §379 (the four-layer attribution-hiding template, first used for the admin CLI-token inventory); PRD #68 Decision 8 (an admin filing another user's recommendation shows provenance); PRD #94 (the disposition provenance model this PRD extends with a third `set_via` value).
 
 ## Decision (summary)
