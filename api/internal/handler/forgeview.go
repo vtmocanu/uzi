@@ -34,6 +34,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
@@ -483,15 +484,14 @@ func (h *Handler) GetCIRun(w http.ResponseWriter, r *http.Request) {
 // appear) rather than failing the whole list — the run link is an enrichment, not the
 // forge data itself.
 func (h *Handler) newestRunIDForMR(ctx context.Context, repoID uuid.UUID, iid int64) *string {
-	runs, err := h.q.ListRunsForMR(ctx, store.ListRunsForMRParams{RepoID: repoID, MrIid: pgconv.Int8Ptr(&iid)})
+	run, err := h.q.NewestRunForMR(ctx, store.NewestRunForMRParams{RepoID: repoID, MrIid: pgconv.Int8Ptr(&iid)})
 	if err != nil {
-		slog.Warn("forge view: list runs for mr", "error", err)
+		if !errors.Is(err, pgx.ErrNoRows) {
+			slog.Warn("forge view: newest run for mr", "error", err)
+		}
 		return nil
 	}
-	if len(runs) == 0 {
-		return nil
-	}
-	id := runs[0].ID.String()
+	id := run.ID.String()
 	return &id
 }
 

@@ -2,25 +2,27 @@ package store_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// TestListRunsForMRLiveDB exercises ListRunsForMR (PRD #1255 M2a) against a REAL
-// Postgres: it returns every run on a (repo, mr_iid) newest-first regardless of kind or
-// status, and an empty slice for an unmatched pair. The forge-view pulls list uses it to
+// TestNewestRunForMRLiveDB exercises NewestRunForMR (PRD #1255 M2a) against a REAL
+// Postgres: it returns the single newest run on a (repo, mr_iid) regardless of kind or
+// status, and pgx.ErrNoRows for an unmatched pair. The forge-view pulls list uses it to
 // link each open PR to its newest uzi run.
 //
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres; the store-it
 // sweep runs it (the LiveDB suffix). Never exported into `task gate:api`.
-func TestListRunsForMRLiveDB(t *testing.T) {
+func TestNewestRunForMRLiveDB(t *testing.T) {
 	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
@@ -74,27 +76,19 @@ func TestListRunsForMRLiveDB(t *testing.T) {
 	_ = seedRun(repoID, &iid99, "issue", "completed", now)
 	_ = seedRun(otherRepoID, &iid42, "issue", "completed", now)
 
-	got, err := q.ListRunsForMR(ctx, store.ListRunsForMRParams{RepoID: repoID, MrIid: pgtype.Int8{Int64: iid42, Valid: true}})
+	got, err := q.NewestRunForMR(ctx, store.NewestRunForMRParams{RepoID: repoID, MrIid: pgtype.Int8{Int64: iid42, Valid: true}})
 	if err != nil {
-		t.Fatalf("ListRunsForMR: %v", err)
+		t.Fatalf("NewestRunForMR: %v", err)
 	}
-	if len(got) != 2 {
-		t.Fatalf("ListRunsForMR(repo, 42) returned %d runs, want 2 (both kinds/statuses on this MR)", len(got))
-	}
-	if got[0].ID != newer {
-		t.Errorf("ListRunsForMR must return newest first: got[0]=%s, want the newer run %s", got[0].ID, newer)
-	}
-	if !got[0].CreatedAt.Time.After(got[1].CreatedAt.Time) {
-		t.Errorf("rows not ordered created_at DESC: got[0]=%s got[1]=%s", got[0].CreatedAt.Time, got[1].CreatedAt.Time)
+	// The newer completed issue run wins over the older cancelled self_improve run on the
+	// same MR — newest regardless of kind/status, bounded to that one row.
+	if got.ID != newer {
+		t.Errorf("NewestRunForMR must return the newest run: got %s, want %s", got.ID, newer)
 	}
 
-	// An unmatched (repo, mr_iid) pair returns empty, not an error.
-	empty, err := q.ListRunsForMR(ctx, store.ListRunsForMRParams{RepoID: repoID, MrIid: pgtype.Int8{Int64: 12345, Valid: true}})
-	if err != nil {
-		t.Fatalf("ListRunsForMR(unmatched): %v", err)
-	}
-	if len(empty) != 0 {
-		t.Errorf("ListRunsForMR(repo, 12345) returned %d runs, want 0", len(empty))
+	// An unmatched (repo, mr_iid) pair yields pgx.ErrNoRows (mapped to "no link" by the caller).
+	if _, err := q.NewestRunForMR(ctx, store.NewestRunForMRParams{RepoID: repoID, MrIid: pgtype.Int8{Int64: 12345, Valid: true}}); !errors.Is(err, pgx.ErrNoRows) {
+		t.Errorf("NewestRunForMR(unmatched) error = %v, want pgx.ErrNoRows", err)
 	}
 }
 
