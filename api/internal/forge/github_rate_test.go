@@ -177,6 +177,33 @@ func TestGitHubReserveShedsInteractiveRead(t *testing.T) {
 	}
 }
 
+// TestGitHubReserveShedsListMergeRequestReviews covers the sibling that GetPull reaches
+// via the interactive loadCtx: like the other forge-view reads it must shed BEFORE any
+// forge call under a low reserve, so no interactive forge-view read escapes the reserve.
+func TestGitHubReserveShedsListMergeRequestReviews(t *testing.T) {
+	const token = "ghp" + "_reserveShedReviews1234567890"
+	m := newMockGitHub(t, map[string]http.HandlerFunc{
+		// Registered so a NON-shed call would succeed; a shed call must never reach it.
+		"/repos/acme/widgets/pulls/7/reviews": func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = io.WriteString(w, "[]")
+		},
+	})
+	d := newGitHubDriver(t, m, token)
+	reset := seedLowReserve(token)
+
+	_, err := d.ListMergeRequestReviews(WithInteractiveRead(context.Background()), 7, 7)
+	var rl *RateLimitError
+	if !errors.As(err, &rl) {
+		t.Fatalf("interactive ListMergeRequestReviews under a low reserve must return *RateLimitError, got %v", err)
+	}
+	if !rl.Reset.Equal(reset) {
+		t.Errorf("RateLimitError.Reset = %v, want the recorded reset %v", rl.Reset, reset)
+	}
+	if n := m.reqCount.Load(); n != 0 {
+		t.Fatalf("a shed interactive ListMergeRequestReviews made %d HTTP calls, want 0", n)
+	}
+}
+
 // TestGitHubReserveDoesNotShedPoller is the "we don't starve the poller's lane and we
 // don't shed it either" assertion: with the SAME low reserve, a NON-interactive read
 // (plain ctx, the poller/worker lane) proceeds and hits the mock. It covers both a

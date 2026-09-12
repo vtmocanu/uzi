@@ -178,6 +178,9 @@ func (g *github) listPullRequestReviews(ctx context.Context, slug repoSlug, numb
 // read the list route's D6 fold uses. State is GitHub's raw review state, passed
 // through verbatim.
 func (g *github) ListMergeRequestReviews(ctx context.Context, projectID, mrIID int64) ([]Review, error) {
+	if err := g.shedIfReserved(ctx); err != nil {
+		return nil, err
+	}
 	slug, err := g.repoSlugFor(ctx, projectID)
 	if err != nil {
 		return nil, err
