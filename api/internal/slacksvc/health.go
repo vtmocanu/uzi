@@ -1,7 +1,9 @@
 package slacksvc
 
 import (
-	"github.com/google/uuid"
+	"fmt"
+	"time"
+
 	"github.com/slack-go/slack"
 
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -177,17 +179,71 @@ func healthNudgeHead(health, reason string) string {
 //
 // The fallback is the head sentence alone (plain, no markup): it is a fixed per-enum
 // string, never a raw reason, so it is a safe OS-notification line on its own.
-func healthNudgeBlocks(health, reason, base string, runID uuid.UUID) (blocks []slack.Block, fallback string) {
+//
+// PRD #1189 (M4) — the near-timeout (`slow`) flag ONLY gains two extras, guarded so
+// every OTHER flag's blocks stay byte-identical to before:
+//
+//   - a line appended to the section: `Stops at <!date^<unix>^{time}|HH:MM UTC>
+//     (1h 05m left). Last checkpoint pushed 9m ago.` — the deadline in the viewer's own
+//     locale via Slack's <!date^…> form (D9: no stored time zone; the fallback is UTC),
+//     the time left as deadline − now, and the checkpoint age from checkpointTipAt. The
+//     checkpoint clause is omitted when checkpointTipAt is null, and the whole line is
+//     omitted when deadline is nil (a run with no wall deadline never gets the slow flag,
+//     so this is only a defensive guard).
+//   - a second context line: `Extend: ` + a `uzi run extend <id> --by 2h` code span —
+//     omitted when extending is exhausted (budget_extension_seconds >= extensionCap) or
+//     turned off (extensionCap == 0), so the DM never suggests a command that would 409.
+//
+// Both extras are entirely server-computed (a unix stamp, two durations, the run uuid,
+// and a fixed verb), so they carry no forge/worker text and need no escaping; the
+// <!date^…> token and the backticks are intentional Slack markup. deadline is computed
+// by the caller (workersvc.RunDeadline over the rc fields) so this file keeps no
+// workersvc import, and now is passed in so the durations are testable.
+func healthNudgeBlocks(health, reason, base string, rc store.GetSlackRunContextRow, deadline *time.Time, extensionCap int, now time.Time) (blocks []slack.Block, fallback string) {
 	head := healthNudgeHead(health, reason)
 	section := head
 	if reason != "" {
 		section += " " + EscapeMrkdwn(ScrubSecrets(reason)) + "."
 	}
+	var extendCtx string
+	if health == healthSlow {
+		if deadline != nil {
+			line := fmt.Sprintf("Stops at <!date^%d^{time}|%s UTC> (%s left).",
+				deadline.Unix(), deadline.UTC().Format("15:04"), nearTimeoutLeft(deadline.Sub(now)))
+			if rc.CheckpointTipAt.Valid {
+				line += " Last checkpoint pushed " + humanWait(now.Sub(rc.CheckpointTipAt.Time)) + " ago."
+			}
+			section += "\n" + line
+		}
+		if extensionCap > 0 && int(rc.BudgetExtensionSeconds) < extensionCap {
+			extendCtx = "Extend: `uzi run extend " + rc.ID.String() + " --by 2h`"
+		}
+	}
 	blocks = []slack.Block{slack.NewSectionBlock(
 		slack.NewTextBlockObject(slack.MarkdownType, section, false, false), nil, nil)}
-	if link := runLink(base, runID); link != "" {
+	if link := runLink(base, rc.ID); link != "" {
 		blocks = append(blocks, slack.NewContextBlock("slack_health_nudge_ctx",
 			slack.NewTextBlockObject(slack.MarkdownType, ScrubSecrets("🔗 "+link), false, false)))
 	}
+	if extendCtx != "" {
+		blocks = append(blocks, slack.NewContextBlock("slack_health_nudge_extend",
+			slack.NewTextBlockObject(slack.MarkdownType, extendCtx, false, false)))
+	}
 	return blocks, head
+}
+
+// nearTimeoutLeft renders the time remaining before a run's wall-clock deadline for the
+// near-timeout nudge, matching the PRD literal: "1h 05m" once an hour is in play (minutes
+// zero-padded to two digits), "9m" under an hour, and "0m" at or past the deadline (a
+// defensive clamp — the slow flag fires while the deadline is still ahead). It is a
+// distinct, padded formatter from humanWait (which the checkpoint-age clause reuses),
+// because the PRD writes the two clauses in different styles on purpose.
+func nearTimeoutLeft(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	if d < time.Hour {
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	}
+	return fmt.Sprintf("%dh %02dm", int(d.Hours()), int(d.Minutes())%60)
 }

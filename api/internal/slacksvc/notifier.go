@@ -139,6 +139,36 @@ type Notifier struct {
 	// after the drain has classified it. sync.Map because it is written by the drain and
 	// read by many publishers.
 	chatDecided sync.Map
+	// runTimeout is the instance-global RUN_TIMEOUT (config.RunTimeout): the wall-clock
+	// fallback RunDeadline uses for a run with no frozen budget_wall_seconds (PRD #1189).
+	// It lets the near-timeout DM name the same deadline the sweep and the run page use.
+	// Zero until wired via WithRunTimeout; a zero value only affects the rare null-budget
+	// run's deadline line, never the extension logic.
+	runTimeout time.Duration
+	// extensionCap reads the per-run extension allowance (settings.RunExtensionCapSeconds)
+	// so the near-timeout DM offers the `uzi run extend` command only while the cap has
+	// room (PRD #1189 D9: never suggest a command that would 409). nil until wired via
+	// WithExtensionCap; nil or a read error is treated as 0 (command omitted).
+	extensionCap func(context.Context) (int, error)
+}
+
+// NotifierOption wires the optional collaborators the near-timeout health DM needs
+// (PRD #1189): the RUN_TIMEOUT fallback and the extension-cap reader. They are options
+// rather than positional NewNotifier params so every existing caller and test keeps
+// compiling; main.go passes them at startup.
+type NotifierOption func(*Notifier)
+
+// WithRunTimeout sets the instance-global RUN_TIMEOUT used as the wall-clock fallback for
+// a run with no frozen budget_wall_seconds when the notifier computes a run's deadline.
+func WithRunTimeout(d time.Duration) NotifierOption {
+	return func(n *Notifier) { n.runTimeout = d }
+}
+
+// WithExtensionCap sets the reader for the per-run extension allowance
+// (settings.RunExtensionCapSeconds), so the near-timeout DM omits the extend command
+// once the cap is exhausted or extending is disabled.
+func WithExtensionCap(fn func(context.Context) (int, error)) NotifierOption {
+	return func(n *Notifier) { n.extensionCap = fn }
 }
 
 type stateEvent struct {
@@ -174,11 +204,11 @@ type healthEvent struct {
 
 // NewNotifier builds a Notifier. baseURL supplies the public base URL for deep
 // links (settings.PublicBaseURL). Call Run in a goroutine.
-func NewNotifier(s NotifierStore, poster Poster, baseURL func(context.Context) (string, error), logger *slog.Logger) *Notifier {
+func NewNotifier(s NotifierStore, poster Poster, baseURL func(context.Context) (string, error), logger *slog.Logger, opts ...NotifierOption) *Notifier {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Notifier{
+	n := &Notifier{
 		store:      s,
 		poster:     poster,
 		baseURL:    baseURL,
@@ -189,6 +219,10 @@ func NewNotifier(s NotifierStore, poster Poster, baseURL func(context.Context) (
 		msgCh:      make(chan chatMsgEvent, notifierMsgQueue),
 		chatConvos: make(map[uuid.UUID]*chatConvo),
 	}
+	for _, o := range opts {
+		o(n)
+	}
+	return n
 }
 
 // PublishNotification enqueues a generic inbox notification for delivery to the
