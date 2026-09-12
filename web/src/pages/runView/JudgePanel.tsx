@@ -24,6 +24,7 @@ import { Alert, Badge, Button, Card, Spinner, cx } from "../../components/ui";
 import { TriageActions } from "../../components/triage/TriageActions";
 import { TriageDisposedRow } from "../../components/triage/TriageDisposedRow";
 import { TriageStateChip } from "../../components/triage/TriageStateChip";
+import { judgeState } from "../../components/triage/triageCopy";
 import { IssueDraftCard, type IssueDraftSeed, type IssueDraftValues } from "../../components/triage/IssueDraftCard";
 
 // STALE_FILED_WARNING is the one line that survives the deleted "Issue created." box: a filed
@@ -557,15 +558,14 @@ export function JudgePanel({
                             <TriageStateChip state="filed" filed={{ issue_iid: jf.iid, issue_url: jf.web_url }} />
                           )
                         )}
+                        {/* Fed through judgeState so the run-page chip renders the disposition's
+                            PROVENANCE too (PRD #1184 M4): a "done" now carries set_via, so an admin
+                            cross-user done reads "Done by an admin" and an issue-close auto-done
+                            "Done via #N" here, matching the Judge occurrence chip. The shared
+                            adapter keeps the done/dismissed split and the dismiss reason as before;
+                            the filed link stays a SEPARATE chip beside it (rendered above). */}
                         {disp ? (
-                          disp.status === "done" ? (
-                            <TriageStateChip state="done" />
-                          ) : (
-                            <TriageStateChip
-                              state="dismissed"
-                              reason={disp.reason === "not_an_issue" ? "not_an_issue" : "wont_do"}
-                            />
-                          )
+                          <TriageStateChip {...judgeState(disp)} />
                         ) : (
                           !filed && !jf && <TriageStateChip state="to_triage" />
                         )}

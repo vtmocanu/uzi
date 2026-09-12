@@ -654,11 +654,13 @@ describe("mockApi judge backlog (PRD #98 M3)", () => {
     expect(occ.set_via).toBe("denied_cli");
   });
 
-  // The mock must not invent wire fields. set_via is a mock-side extension of the STORED
-  // disposition; the run-page DispositionDTO has no such field, so GET /runs/{id}/review
-  // must not carry it (PRD #98 review N-b). A mock that ships more than the API does makes a
-  // future RunView provenance feature work in demo mode and fail in production.
-  it("does not leak set_via onto the run-page review DTO", async () => {
+  // The run-page DispositionDTO NOW carries set_via (PRD #1184 M4): the run-page DispositionChip
+  // renders provenance too — "Done via #N" for an issue_close, "Done by an admin" for an admin
+  // cross-user done — matching the Judge occurrence chip. Before M4 the mock STRIPPED set_via
+  // here because the DTO had no such field; the real API now sends it, so the mock carries it,
+  // or a run-page provenance chip would work in production and show nothing in demo mode. The
+  // seeded run-closed ripgrep disposition is an issue-close auto-done, so it surfaces set_via.
+  it("carries set_via onto the run-page review DTO (PRD #1184 M4)", async () => {
     installStorage();
     const api = await reload();
 
@@ -666,7 +668,7 @@ describe("mockApi judge backlog (PRD #98 M3)", () => {
     const { review } = await api.getRunReview("run-closed");
     const disp = review!.dispositions.find((d) => d.category === "enable_tool" && d.target === "ripgrep");
     expect(disp).toBeTruthy();
-    expect("set_via" in (disp as object)).toBe(false);
+    expect(disp!.set_via).toBe("issue_close");
   });
 });
 

@@ -1,5 +1,11 @@
 import type {
+  CreatedIssue,
   Disposition,
+  IssueDraft,
+  JudgeAdminBacklog,
+  JudgeAdminDispositionResult,
+  JudgeAdminGroup,
+  JudgeAdminOccurrence,
   JudgeBacklog,
   JudgeBacklogBucket,
   JudgeCategoryStats,
@@ -16,12 +22,25 @@ import type {
   TriageCounts,
 } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
-import { coordKey } from "../../lib/judge";
-import { mockPendingJudges, mockReviews, type MockReview } from "../data";
+import { coordKey, recommendationLabel } from "../../lib/judge";
+import { mockAdminScenarioReviews, mockPendingJudges, mockReviews, type MockReview } from "../data";
 import { getRun, nextRunId } from "../store";
+import { repos } from "./forge";
 import { delay, mockScenario, requireSession } from "./shared";
 
 export const reviews: MockReview[] = mockReviews.map((r) => ({
+  ...r,
+  recommendations: r.recommendations.map((x) => ({ ...x })),
+  filed_issues: r.filed_issues.map((x) => ({ ...x })),
+  dispositions: r.dispositions.map((x) => ({ ...x })),
+}));
+
+// The three synthetic OTHER owners' reviews for the admin "All users" aggregate (PRD #1184 M4).
+// A mutable copy like `reviews` so an admin Mark done / Undo mutates it in place; the seed stays
+// pristine so a module reload re-seeds a clean demo. Folded into the admin functions ONLY under
+// the `judge-admin` scenario (adminScenarioReviews below); the owner-scoped functions never read
+// it, so `mine` shows the demo caller's reviews exactly as before.
+const adminExtraReviews: MockReview[] = mockAdminScenarioReviews.map((r) => ({
   ...r,
   recommendations: r.recommendations.map((x) => ({ ...x })),
   filed_issues: r.filed_issues.map((x) => ({ ...x })),
@@ -70,13 +89,14 @@ function reviewDTO(review: MockReview): MockReview {
     filed_issues: review.filed_issues.map((x) => ({ ...x })),
     dispositions: review.dispositions
       .filter((d) => recCoords.has(coordKey(d.category, d.target)))
-      // set_via is STRIPPED here, deliberately. It is a mock-side extension of the stored
-      // disposition (PRD #98 B3) because the run-page DispositionDTO carries no provenance —
-      // only the Judge menu's occurrence does. A spread would leak it onto
-      // GET /runs/{id}/review, where the real API sends no such field, and the mock would be
-      // lying about the wire: a future RunView provenance feature would work in demo mode
-      // and have nothing to read in production.
-      .map(({ set_via: _setVia, ...d }) => ({ ...d })),
+      // set_via is now CARRIED THROUGH (PRD #1184 M4): the run-page DispositionDTO grew a
+      // `set_via` field so the run-page DispositionChip can render provenance ("Done via #N"
+      // for an issue_close, "Done by an admin" for an admin cross-user done), matching the
+      // Judge occurrence chip. It was STRIPPED before M4 because the DTO carried no provenance
+      // — the real API now sends it, so the mock must too, or a run-page provenance chip would
+      // work in production and show nothing in demo mode. Spread (never strip) keeps it on the
+      // wire; omitempty on the Go side means an absent set_via simply does not appear.
+      .map((d) => ({ ...d })),
     triage: recomputeTriage(review),
   };
 }
@@ -462,6 +482,184 @@ function computeBacklog(
   };
 }
 
+// ── Admin "All users" aggregate (PRD #1184 M4) ───────────────────────────────
+// The mock's cross-user aggregate, with the SAME attribution stripping as the server: it groups
+// EVERY owner's reviews by (category, target) and ships a user_count + attribution-hidden
+// occurrences (judged_at + verdict + bucket + set_via — NO owner, run id or run title). The owner
+// path is untouched. adminScenarioReviews folds in the three synthetic owners ONLY under the
+// `judge-admin` scenario, so an ordinary admin All-users view over the base reviews reads
+// user_count=1 while the scenario demos a real multi-owner aggregate.
+function adminScenarioReviews(): MockReview[] {
+  return mockScenario() === "judge-admin" ? [...reviews, ...adminExtraReviews] : [...reviews];
+}
+
+// AdminBacklogRow is the admin flat row: the owner-carrying stand-in for the SQL join. `owner`
+// feeds the distinct-user count; it is never emitted onto an occurrence.
+type AdminBacklogRow = {
+  owner: string;
+  run_id: string;
+  verdict: string;
+  judged_at: string;
+  category: RecommendationCategory;
+  target: string;
+  rationale_md: string;
+  disposition_status: string | null;
+  set_via: string | null;
+  filed_settled: boolean;
+};
+
+function adminBacklogRows(): AdminBacklogRow[] {
+  const ordered = [...adminScenarioReviews()].sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+  const rows: AdminBacklogRow[] = [];
+  for (const review of ordered) {
+    for (const rec of review.recommendations) {
+      const disp = review.dispositions.find((d) => d.category === rec.category && d.target === rec.target);
+      const filed = review.filed_issues.find((f) => f.category === rec.category && f.target === rec.target);
+      rows.push({
+        owner: review.owner,
+        run_id: review.target_run_id,
+        verdict: review.verdict,
+        judged_at: review.updated_at,
+        category: rec.category,
+        target: rec.target,
+        rationale_md: rec.rationale_md,
+        disposition_status: disp?.status ?? null,
+        set_via: disp?.set_via ?? null,
+        filed_settled: filed !== undefined,
+      });
+    }
+  }
+  return rows;
+}
+
+// groupAdmin mirrors workersvc.GroupJudgeRecommendationsAll: dedup by coordinate, roll up the
+// bucket, count distinct runs AND distinct owners, and emit attribution-hidden occurrences. It
+// ranks by user_count DESC, then run_count DESC, then open_count DESC — how many PEOPLE hit a
+// pattern is the strongest cross-user priority signal.
+function groupAdmin(rows: AdminBacklogRow[]): JudgeAdminGroup[] {
+  const byCoord = new Map<string, JudgeAdminGroup>();
+  const runsSeen = new Map<string, Set<string>>();
+  const usersSeen = new Map<string, Set<string>>();
+  const topRung = new Map<string, number>();
+
+  for (const row of rows) {
+    const key = coordKey(row.category, row.target);
+    const b = bucketOf(row.disposition_status, row.filed_settled);
+    const occ: JudgeAdminOccurrence = {
+      judged_at: row.judged_at,
+      verdict: row.verdict as ReviewVerdict,
+      bucket: b,
+      // Provenance rides alongside the bucket (issue_close / denied_cli / admin); omitted when
+      // absent, matching Go's `json:"set_via,omitempty"`. No run id/title — attribution hidden.
+      ...(row.set_via ? { set_via: row.set_via as JudgeAdminOccurrence["set_via"] } : {}),
+    };
+    let g = byCoord.get(key);
+    if (!g) {
+      g = {
+        category: row.category,
+        target: row.target,
+        bucket: "todo",
+        open_count: 0,
+        run_count: 0,
+        user_count: 0,
+        rationale_preview: rationalePreview(row.rationale_md),
+        occurrences: [],
+      };
+      byCoord.set(key, g);
+      runsSeen.set(key, new Set());
+      usersSeen.set(key, new Set());
+      topRung.set(key, 0);
+    }
+    g.occurrences.push(occ);
+    if (b === "todo") g.open_count += 1;
+    const rs = runsSeen.get(key)!;
+    if (!rs.has(row.run_id)) {
+      rs.add(row.run_id);
+      g.run_count += 1;
+    }
+    const us = usersSeen.get(key)!;
+    if (!us.has(row.owner)) {
+      us.add(row.owner);
+      g.user_count += 1;
+    }
+    topRung.set(key, Math.max(topRung.get(key)!, BUCKET_RANK[b]));
+  }
+
+  const groups = [...byCoord.values()];
+  for (const g of groups) {
+    const key = coordKey(g.category, g.target);
+    g.bucket = g.open_count > 0 ? "todo" : RANK_BUCKET[topRung.get(key)!];
+  }
+  groups.sort(
+    (a, b) => b.user_count - a.user_count || b.run_count - a.run_count || b.open_count - a.open_count,
+  );
+  return groups;
+}
+
+// computeAdminTriage is the canonical ALL-USERS tally over every owner's reviews — read from the
+// same per-recommendation ladder, never tallied from the returned groups (the same rule as the
+// owner strip). This is NOT the nav-badge source: the badge stays the caller's own count.
+function computeAdminTriage(): TriageCounts {
+  const total: TriageCounts = { total: 0, todo: 0, filed: 0, done: 0, dismissed: 0, false_positives: 0 };
+  for (const review of adminScenarioReviews()) {
+    const t = recomputeTriage(review);
+    total.total += t.total;
+    total.todo += t.todo;
+    total.filed += t.filed;
+    total.done += t.done;
+    total.dismissed += t.dismissed;
+    total.false_positives += t.false_positives;
+  }
+  return total;
+}
+
+function computeAdminCategoryStats(): JudgeCategoryStats {
+  const groups = groupAdmin(adminBacklogRows());
+  const matrix: Record<string, Record<string, number>> = { todo: {}, filed: {}, done: {}, dismissed: {}, all: {} };
+  for (const g of groups) {
+    for (const bucketKey of [g.bucket, "all"]) {
+      matrix[bucketKey][g.category] = (matrix[bucketKey][g.category] ?? 0) + 1;
+    }
+  }
+  return { counts_by_bucket: matrix };
+}
+
+function computeAdminBacklog(bucket: JudgeBacklogBucket, categories: string[] = []): JudgeAdminBacklog {
+  const rows = adminBacklogRows();
+  const selected = categories.length ? rows.filter((r) => categories.includes(r.category)) : rows;
+  const max = backlogMaxRows();
+  const truncated = selected.length > max;
+  const capped = truncated ? selected.slice(0, max) : selected;
+  const groups = groupAdmin(capped);
+  return {
+    bucket,
+    groups: bucket === "all" ? groups : groups.filter((g) => g.bucket === bucket),
+    truncated,
+    // The canonical all-users tally from the separate query, never tallied from `groups`.
+    triage: computeAdminTriage(),
+  };
+}
+
+// newestAdminOpenOccurrence resolves a coordinate's newest OPEN member across every owner (the
+// coordinate the admin draft/file target). The draft is the ONE surface that keeps attribution
+// (Decision 8), so it returns the owner too — for the provenance line only.
+function newestAdminOpenOccurrence(
+  category: string,
+  target: string,
+): { review: MockReview; rec: MockReview["recommendations"][number]; owner: string } | undefined {
+  let best: { review: MockReview; rec: MockReview["recommendations"][number]; owner: string } | undefined;
+  for (const review of adminScenarioReviews()) {
+    for (const rec of review.recommendations) {
+      if (rec.category !== category || rec.target !== target) continue;
+      if (bucketOfRec(review, rec.category, rec.target) !== "todo") continue;
+      if (!best || review.updated_at > best.review.updated_at) best = { review, rec, owner: review.owner };
+    }
+  }
+  return best;
+}
+
+let nextAdminFiledIid = 700;
+
 export const judgeApi = {
   // ── Run judge review (PRD #46 M4, PRD #119) ────────────────────────────────
   // The two-key envelope the server emits: BOTH keys always present, either nullable
@@ -512,7 +710,7 @@ export const judgeApi = {
     // read "✓ Done", not "Done via #91". Object.assign copies only the keys `next` HAS, so
     // omitting this would leave a stale set_via on the existing row and the mock would demo
     // exactly the misattribution the server's literal NULL exists to prevent.
-    const next: Disposition & { set_via?: "issue_close" | "denied_cli" } = {
+    const next: Disposition = {
       category: rec.category,
       target: rec.target,
       status,
@@ -604,7 +802,7 @@ export const judgeApi = {
         // set_via explicitly cleared: a bulk group action is a HUMAN write too, so it must
         // drop any issue-close provenance rather than inherit it (see the single-coordinate
         // path above for why Object.assign makes the omission a live bug, not a tidiness nit).
-        const next: Disposition & { set_via?: "issue_close" | "denied_cli" } = {
+        const next: Disposition = {
           category: rec.category,
           target: rec.target,
           status,
@@ -638,6 +836,138 @@ export const judgeApi = {
       triage: backlog.triage,
     };
     return delay(result, 120);
+  },
+
+  // ── Admin "All users" aggregate (PRD #1184 M4) ─────────────────────────────
+  // The cross-user reads (backlog/stats/category-stats) and the coordinate-scoped writes
+  // (mark done / undo) and the coordinate-scoped file. Attribution is hidden the same way the
+  // server hides it: the aggregate carries counts, not identifiers. The scope-switch demo lives
+  // behind the `judge-admin` mock scenario (three synthetic owners sharing coordinates).
+  getAdminJudgeBacklog: async (bucket: JudgeBacklogBucket = "todo", categories?: string[]) => {
+    requireSession();
+    return delay(computeAdminBacklog(bucket, categories ?? []), 80);
+  },
+  getAdminJudgeStats: async () => {
+    requireSession();
+    return delay(computeAdminTriage(), 60);
+  },
+  getAdminJudgeCategoryStats: async () => {
+    requireSession();
+    return delay(computeAdminCategoryStats(), 60);
+  },
+  adminSetJudgeDisposition: async (items: JudgeDispositionCoord[]) => {
+    requireSession();
+    if (items.length === 0) throw new ApiError(400, "items required");
+    const want = new Map<string, JudgeDispositionCoord>();
+    for (const it of items) want.set(coordKey(it.category, it.target), it);
+    if (want.size > 100) throw new ApiError(400, "too many items");
+
+    // Mark every user's OPEN member done with set_via='admin'. A todo member has no disposition,
+    // so there is never a conflict to overwrite — an already-settled member (a human done/
+    // dismissed, an issue-close auto-done, a filed one) is not todo and is left untouched, which
+    // is exactly the server's ON CONFLICT DO NOTHING (never overwrite a human verdict). `updated`
+    // counts the member coordinates actually written.
+    let updated = 0;
+    for (const review of adminScenarioReviews()) {
+      for (const rec of review.recommendations) {
+        const key = coordKey(rec.category, rec.target);
+        if (!want.has(key)) continue;
+        if (bucketOfRec(review, rec.category, rec.target) !== "todo") continue;
+        review.dispositions.push({
+          category: rec.category,
+          target: rec.target,
+          status: "done",
+          reason: "",
+          set_at: new Date().toISOString(),
+          stale: false,
+          set_via: "admin",
+        });
+        updated += 1;
+      }
+    }
+
+    const backlog = computeAdminBacklog("all");
+    const acted = new Set(want.keys());
+    const result: JudgeAdminDispositionResult = {
+      updated,
+      groups: backlog.groups.filter((g) => acted.has(coordKey(g.category, g.target))),
+      truncated: backlog.truncated,
+      triage: backlog.triage,
+    };
+    return delay(result, 120);
+  },
+  adminUndoJudgeDisposition: async (items: JudgeDispositionCoord[]) => {
+    requireSession();
+    if (items.length === 0) throw new ApiError(400, "items required");
+    const want = new Set(items.map((it) => coordKey(it.category, it.target)));
+    // Remove ONLY the set_via='admin' rows on these coordinates, across every owner — a human's
+    // own done/dismissed on the same coordinate survives (the owner's judgment stands).
+    for (const review of adminScenarioReviews()) {
+      review.dispositions = review.dispositions.filter(
+        (d) => !(want.has(coordKey(d.category, d.target)) && d.set_via === "admin"),
+      );
+    }
+    const backlog = computeAdminBacklog("all");
+    const result: JudgeAdminDispositionResult = {
+      updated: 0,
+      groups: backlog.groups.filter((g) => want.has(coordKey(g.category, g.target))),
+      truncated: backlog.truncated,
+      triage: backlog.triage,
+    };
+    return delay(result, 120);
+  },
+  getAdminJudgeIssueDraft: async (category: string, target: string) => {
+    requireSession();
+    const occ = newestAdminOpenOccurrence(category, target);
+    if (!occ) throw new ApiError(404, "no open occurrence");
+    const label = recommendationLabel(category as RecommendationCategory);
+    const draft: IssueDraft = {
+      default_repo_id: "",
+      title: target ? `${label}: ${target}` : label,
+      description: [
+        "## What the judge found",
+        "",
+        "````",
+        occ.rec.rationale_md,
+        "````",
+        "",
+        "---",
+        "Opened by uzi on behalf of an admin, from another user's run retrospective. The quoted text above is LLM-authored and unverified.",
+      ].join("\n"),
+      labels: ["uzi"],
+      // The draft KEEPS attribution (Decision 8): filing publishes a user's worker text, so the
+      // reader must see whose text it is — this is the one surface the aggregate does not anonymize.
+      provenance: `from ${occ.owner}'s worker (run retrospective)`,
+      default_note: "Pick the repo you have connected to file this against.",
+    };
+    return delay({ draft }, 80);
+  },
+  adminFileJudgeIssue: async (body: {
+    category: string;
+    target: string;
+    repoId: string;
+    title: string;
+    description: string;
+  }) => {
+    requireSession();
+    // Resolve the newest open occurrence AGAIN at file time (a fresher review moves the link),
+    // exactly as the server does.
+    const occ = newestAdminOpenOccurrence(body.category, body.target);
+    if (!occ) throw new ApiError(404, "no open occurrence");
+    const repo = repos.find((r) => r.id === body.repoId);
+    if (!repo) throw new ApiError(404, "repo not found");
+    const iid = nextAdminFiledIid++;
+    const web_url = `${repo.web_url}/-/issues/${iid}`;
+    // The link lands on the resolved occurrence's coordinate, so that owner's row moves to `filed`.
+    occ.review.filed_issues.push({
+      category: body.category as RecommendationCategory,
+      target: body.target,
+      issue_iid: iid,
+      issue_url: web_url,
+      filed_at: new Date().toISOString(),
+    });
+    const issue: CreatedIssue = { iid, web_url, title: body.title };
+    return delay({ issue }, 200);
   },
   rerunJudge: async (id: string) => {
     const run = getRun(id);

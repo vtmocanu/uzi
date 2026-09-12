@@ -16,6 +16,12 @@ import { daysAgo, minsAgo, secsAgo } from "./time";
 export interface MockReview {
   id: string;
   target_run_id: string;
+  // owner is the user id whose run produced this review (PRD #1184 M4). The owner-scoped mock
+  // functions ignore it (every seeded review is the demo caller's), but the admin "All users"
+  // aggregate counts DISTINCT owners per coordinate for the user_count evidence chip — so a
+  // multi-owner scenario needs each synthetic review to carry a distinct owner. Attribution is
+  // still hidden on the wire: the admin DTOs carry a COUNT of owners, never an owner id.
+  owner: string;
   verdict: ReviewVerdict;
   summary_md: string;
   judge_model: string;
@@ -44,13 +50,13 @@ export interface MockReview {
   // `triage` from these + filed_issues on every mutation, matching the server ladder.
   //
   // `set_via` mirrors the recommendation_dispositions column (PRD #98 Decision 6): absent
-  // means a PERSON set it, "issue_close" means the M6 poller sync did, and "denied_cli"
-  // (issue #167) means the system auto-dismissed a recommendation naming a policy-barred
-  // credential-bearing CLI. It is a MOCK-side extension of Disposition because the run-page
-  // DTO does not carry provenance — only the Judge menu's occurrence does — and without it
-  // the mock cannot render an auto-done or an auto-dismissal at all, the two states the
-  // "Done via #IID" and "Dismissed · barred CLI" labels exist for.
-  dispositions: (Disposition & { set_via?: "issue_close" | "denied_cli" })[];
+  // means a PERSON set it, "issue_close" means the M6 poller sync did, "denied_cli" (issue
+  // #167) means the system auto-dismissed a recommendation naming a policy-barred
+  // credential-bearing CLI, and "admin" (PRD #1184 M4) means an admin cross-user Mark done.
+  // It is now a FIELD OF Disposition itself (the run-page DTO grew `set_via` in M4), not a
+  // mock-side extension: the run page renders provenance too, so the stored shape and the wire
+  // shape are the same. The judge-admin scenario stamps "admin" here on a cross-user done.
+  dispositions: Disposition[];
   triage: TriageCounts;
   // The judge run's OWN timing + token/cost usage (PRD #69 M6), for the panel's
   // time/tokens/cost strip. Shape mirrors the real ReviewDTO.judge_run: `usage` is null
@@ -75,6 +81,7 @@ export const mockReviews: MockReview[] = [
   {
     id: "rev-done",
     target_run_id: "run-done",
+    owner: "u-mira",
     verdict: "issues",
     summary_md:
       "The run **delivered the feature** and opened an MR, but it lost time on two avoidable things:\n\n" +
@@ -204,6 +211,7 @@ export const mockReviews: MockReview[] = [
   {
     id: "rev-closed",
     target_run_id: "run-closed",
+    owner: "u-mira",
     verdict: "issues",
     summary_md:
       "The retry landed, but the worker was still missing shellcheck and the first poll tick lagged — both recurring across recent runs.",
@@ -296,6 +304,7 @@ export const mockReviews: MockReview[] = [
   {
     id: "rev-cancelled",
     target_run_id: "run-cancelled",
+    owner: "u-mira",
     verdict: "ok",
     summary_md: "A short run; the healthcheck landed cleanly. The poller latency note recurs, and a template tweak is worth doing.",
     judge_model: "haiku",
@@ -357,6 +366,115 @@ export const mockReviews: MockReview[] = [
       finished_at: secsAgo(480),
       usage: null,
     },
+  },
+];
+
+// ── Admin "All users" scenario (PRD #1184 M4) ────────────────────────────────
+// Three synthetic OTHER owners' reviews, sharing coordinates with each other and with the demo
+// caller's seeded reviews above, so the admin aggregate's distinct-user (`user_count`) chip reads
+// more than 1 and a cross-user Mark done has several owners' open members to settle. Only the
+// `judge-admin` mock scenario folds these into the admin functions; the owner-scoped surfaces
+// never see them (they show the demo caller's reviews only). Each review carries a distinct
+// `owner`, but attribution stays hidden on the wire — the admin DTOs ship a COUNT of owners, a
+// verdict and a judged-at, never an owner id, run id or run title. `improve_uzi/api/internal/poller`
+// recurs across all three (and the base reviews), the widest coordinate; each owner also carries
+// one distinct coordinate so the aggregate has more than one row.
+export const mockAdminScenarioReviews: MockReview[] = [
+  {
+    id: "rev-adm-andrei",
+    target_run_id: "run-adm-andrei",
+    owner: "u-andrei",
+    verdict: "issues",
+    summary_md: "First-poll latency again dominated; shellcheck was missing on the worker.",
+    judge_model: "haiku",
+    status: "complete",
+    created_at: minsAgo(50),
+    updated_at: minsAgo(50),
+    recommendations: [
+      {
+        id: "adm-andrei-1",
+        category: "improve_uzi",
+        target: "api/internal/poller",
+        rationale_md: "Queue-to-claim latency again — the most-recurring recommendation across users.",
+        confidence: "medium",
+        created_at: minsAgo(50),
+      },
+      {
+        id: "adm-andrei-2",
+        category: "install_worker_tool",
+        target: "shellcheck",
+        rationale_md: "`shellcheck` was missing on this worker image too.",
+        confidence: "high",
+        created_at: minsAgo(50),
+      },
+    ],
+    filed_issues: [],
+    dispositions: [],
+    triage: { total: 2, todo: 2, filed: 0, done: 0, dismissed: 0, false_positives: 0 },
+  },
+  {
+    id: "rev-adm-dan",
+    target_run_id: "run-adm-dan",
+    owner: "u-dan",
+    verdict: "issues",
+    summary_md: "The poller latency note recurs; the coder re-ran a failing test without reading it.",
+    judge_model: "haiku",
+    status: "complete",
+    created_at: minsAgo(35),
+    updated_at: minsAgo(35),
+    recommendations: [
+      {
+        id: "adm-dan-1",
+        category: "improve_uzi",
+        target: "api/internal/poller",
+        rationale_md: "Same first-poll latency; a webhook path keeps coming up across runs.",
+        confidence: "medium",
+        created_at: minsAgo(35),
+      },
+      {
+        id: "adm-dan-2",
+        category: "adjust_template",
+        target: "coder",
+        rationale_md: "A template line to read the error before re-running would help the coder.",
+        confidence: "low",
+        created_at: minsAgo(35),
+      },
+    ],
+    filed_issues: [],
+    dispositions: [],
+    triage: { total: 2, todo: 2, filed: 0, done: 0, dismissed: 0, false_positives: 0 },
+  },
+  {
+    id: "rev-adm-radu",
+    target_run_id: "run-adm-radu",
+    owner: "u-radu",
+    verdict: "issues",
+    summary_md: "Poller latency again; the reviewer approved without checking migration ordering.",
+    judge_model: "haiku",
+    status: "complete",
+    created_at: minsAgo(20),
+    updated_at: minsAgo(20),
+    recommendations: [
+      {
+        id: "adm-radu-1",
+        category: "improve_uzi",
+        target: "api/internal/poller",
+        rationale_md: "Queue-to-claim latency once more — a webhook path would cut it.",
+        confidence: "high",
+        created_at: minsAgo(20),
+      },
+      {
+        id: "adm-radu-2",
+        category: "improve_agent",
+        target: "reviewer",
+        rationale_md: "Tightening the reviewer's checklist would catch the migration-ordering class.",
+        confidence: "medium",
+        created_at: minsAgo(20),
+      },
+    ],
+    filed_issues: [],
+    dispositions: [],
+    triage: { total: 2, todo: 2, filed: 0, done: 0, dismissed: 0, false_positives: 0 },
   },
 ];
 

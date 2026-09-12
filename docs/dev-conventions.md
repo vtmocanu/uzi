@@ -616,6 +616,16 @@ scenarios are mutually exclusive by construction. Known values:
   truthful throughout — so the screen's own inconsistency between a group's
   count and the tallies above it is visible in one view, not just asserted
   in a warning banner. (PRD #98.)
+- `judge-admin` — `/judge?mock=judge-admin` folds three synthetic OTHER
+  owners' reviews into the admin ["All users"](./judge-menu.md) aggregate, so
+  an admin who flips the Mine / All-users switch sees a real cross-user view:
+  coordinates shared across owners (e.g. `improve_uzi / api/internal/poller`)
+  read a `user_count` above 1, and a cross-user Mark done has several owners'
+  open members to settle. Attribution stays hidden — the aggregate ships a
+  distinct-user COUNT, a verdict and a judged-at, never an owner id, run id or
+  run title. Requires a signed-in admin user for the switch to render; the
+  owner-scoped `Mine` view is unchanged (it never reads the synthetic owners).
+  (PRD #1184.)
 
 ### What keeps the mock build current
 

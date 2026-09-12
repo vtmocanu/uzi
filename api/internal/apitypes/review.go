@@ -87,6 +87,16 @@ type DispositionDTO struct {
 	Reason   string    `json:"reason"`
 	SetAt    time.Time `json:"set_at"`
 	Stale    bool      `json:"stale"`
+	// SetVia is the disposition's PROVENANCE (PRD #1184 M4), mirroring JudgeOccurrenceDTO.SetVia
+	// so the run-page chip can render it too: "" (omitted) means a PERSON set it, "issue_close"
+	// the M6 poller sync did when the filed issue closed, "denied_cli" the denied-CLI dismiss,
+	// and "admin" a cross-user admin Mark done (PRD #1184). Until this field existed the run-page
+	// DispositionChip had no way to tell a hand-set done from an issue-close or admin one — the
+	// comment at JudgePanel.tsx that said "the setter is always the owner" is what this corrects.
+	//
+	// omitempty because a hand-set (or absent) disposition carries no provenance; the field
+	// carries meaning only when present, the same rule as JudgeOccurrenceDTO.SetVia.
+	SetVia string `json:"set_via,omitempty"`
 }
 
 // TriageDTO is the recommendation tally, per-review and global (PRD #94 Decisions 2/7/8).

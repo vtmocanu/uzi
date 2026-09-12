@@ -308,8 +308,13 @@ func TestFiledIssueDTOTags(t *testing.T) {
 }
 
 func TestDispositionDTOTags(t *testing.T) {
+	// set_via is omitempty (PRD #1184 M4): a hand-set (or absent) disposition omits it, so the
+	// base shape has the six always-present keys; a provenance-carrying disposition adds it,
+	// letting the run-page DispositionChip render "Done via #N" / "Done by an admin".
 	assertTags(t, "DispositionDTO", DispositionDTO{},
 		"category", "target", "status", "reason", "set_at", "stale")
+	assertTags(t, "DispositionDTO(admin)", DispositionDTO{SetVia: "admin"},
+		"category", "target", "status", "reason", "set_at", "stale", "set_via")
 }
 
 func TestTriageDTOTags(t *testing.T) {

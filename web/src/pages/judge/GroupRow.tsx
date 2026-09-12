@@ -2,11 +2,14 @@ import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import {
   api,
+  type JudgeAdminGroup,
+  type JudgeAdminOccurrence,
   type JudgeBacklogBucket,
   type JudgeOccurrence,
   type JudgeRecommendationGroup,
   type PendingJudge,
   type Repo,
+  type ReviewVerdict,
   type RunReview,
 } from "../../lib/api";
 import { recommendationLabel } from "../../lib/judge";
@@ -39,11 +42,17 @@ import { ChevronDownIcon, ChevronRightIcon } from "../../components/icons";
 //
 // fetchReview is the OMITTABLE capability that upgrades the expander's clamped preview to the
 // newest occurrence's full rationale on first expand (PRD #1183 M2). Judge.tsx passes
-// api.getRunReview; PRD #1184's admin scope has no run_id to fetch with and omits it, and the
-// expander then shows only the clamped preview.
+// api.getRunReview under `mine`; PRD #1184's admin scope (`all`) has no run_id to fetch with and
+// omits it, and the expander then shows only the clamped preview.
 type FetchReview = (
   runId: string,
 ) => Promise<{ review: RunReview | null; pending_judge: PendingJudge | null }>;
+
+// AnyOccurrence is either scope's occurrence: the owner JudgeOccurrence (carries run_id/rec_id/
+// run_title) or the attribution-hidden JudgeAdminOccurrence (no ids, no title). Both share the
+// `bucket` and `judged_at` newestOpenOccurrence and the state chip read, so the picker and the
+// chip work over the union; the owner-only file flow narrows back to JudgeOccurrence.
+type AnyOccurrence = JudgeOccurrence | JudgeAdminOccurrence;
 
 // newestOpenOccurrence picks the group's newest OPEN member — the coordinate the File-issue
 // draft targets. Among the bucket "todo" occurrences it takes the largest judged_at compared
@@ -52,11 +61,13 @@ type FetchReview = (
 // yet .1s is earlier than .12s), which would target the wrong occurrence. A member missing (or
 // unparseable) judged_at never wins over one carrying a valid later value, and with none present
 // it falls back to wire order (the backlog query delivers rv.updated_at DESC, so the first todo
-// is already the newest).
-function newestOpenOccurrence(group: JudgeRecommendationGroup): JudgeOccurrence | undefined {
-  return group.occurrences
+// is already the newest). Generic over AnyOccurrence so the admin scope (PRD #1184) reuses it —
+// under `all` the picker only gates whether File issue is offered (canAct); the coordinate, not
+// the occurrence, is what the admin filer resolves server-side.
+function newestOpenOccurrence<T extends AnyOccurrence>(occurrences: T[]): T | undefined {
+  return occurrences
     .filter((o) => o.bucket === "todo")
-    .reduce<JudgeOccurrence | undefined>((best, o) => {
+    .reduce<T | undefined>((best, o) => {
       if (!best) return o;
       const ot = o.judged_at ? Date.parse(o.judged_at) : NaN;
       const bt = best.judged_at ? Date.parse(best.judged_at) : NaN;
@@ -65,8 +76,19 @@ function newestOpenOccurrence(group: JudgeRecommendationGroup): JudgeOccurrence 
     }, undefined);
 }
 
+// GroupRow renders BOTH judge scopes off one component (PRD #1184 M4 — "do not fork a second
+// row component"): the owner backlog (`scope="mine"`, a JudgeRecommendationGroup) and the admin
+// cross-user aggregate (`scope="all"`, a JudgeAdminGroup). Under `all` it (a) shows the distinct
+// user_count beside the frequency chip, (b) renders attribution-hidden occurrences — "A run,
+// judged <time>" with a verdict + state chip and NO link/title — and (c) drives the File-issue
+// flow through the admin draft/file endpoints (keyed by coordinate, not run/rec id). Whether the
+// Dismiss button renders is the CALLER's choice: Judge.tsx passes no onDismiss under `all`, so
+// TriageActions hides it (there is no cross-user Dismiss — dismissing another user's
+// recommendation is their judgment). `scope` defaults to "mine" so every owner call site is
+// unchanged.
 export function GroupRow({
   group,
+  scope = "mine",
   selected,
   onToggleSelect,
   onDispose,
@@ -74,7 +96,8 @@ export function GroupRow({
   onFiled,
   fetchReview,
 }: {
-  group: JudgeRecommendationGroup;
+  group: JudgeRecommendationGroup | JudgeAdminGroup;
+  scope?: "mine" | "all";
   selected: boolean;
   onToggleSelect: () => void;
   onDispose: (status: "done" | "dismissed", reason?: "wont_do" | "not_an_issue") => void;
@@ -82,6 +105,7 @@ export function GroupRow({
   onFiled: () => void;
   fetchReview?: FetchReview;
 }) {
+  const isAdmin = scope === "all";
   const [expanded, setExpanded] = useState(false);
   const [filing, setFiling] = useState(false);
   // Local just-filed override: the issue a Create click produced plus fileIssue's `warning`.
@@ -94,8 +118,11 @@ export function GroupRow({
   // (the row keeps its coordKey key).
   const [justFiled, setJustFiled] = useState<{ iid: number; web_url: string; warning: string } | null>(null);
   const openCount = group.open_count;
-  const newestOpen = newestOpenOccurrence(group);
-  const newestOpenRunId = newestOpen?.run_id;
+  const newestOpen = newestOpenOccurrence<AnyOccurrence>(group.occurrences);
+  // The full-rationale fetch is owner-only: the admin occurrence carries no run_id (attribution
+  // is hidden) and Judge.tsx omits fetchReview under `all`, so newestOpenRunId is undefined there
+  // and the expander's fetch effect no-ops, leaving the clamped preview.
+  const newestOpenRunId = !isAdmin ? (newestOpen as JudgeOccurrence | undefined)?.run_id : undefined;
   const canAct = openCount > 0;
 
   // The newest open occurrence's FULL rationale, fetched ONCE per newest-open run on first
@@ -155,8 +182,13 @@ export function GroupRow({
               </code>
             )}
             {/* One frequency chip folding "seen in M runs" and the open count into one phrase
-                (PRD #1183 M2): "N open of M runs", or "M runs, all settled" once none remain. */}
-            <span className="text-xs text-faint">{openOfRunsLabel(group.open_count, group.run_count)}</span>
+                (PRD #1183 M2): "N open of M runs", or "M runs, all settled" once none remain.
+                Under the admin `all` scope a distinct-user tail follows — "· K users" — the
+                cross-user "how widespread" signal the aggregate ranks by (PRD #1184 M4). */}
+            <span className="text-xs text-faint">
+              {openOfRunsLabel(group.open_count, group.run_count)}
+              {isAdmin && ` · ${(group as JudgeAdminGroup).user_count} ${(group as JudgeAdminGroup).user_count === 1 ? "user" : "users"}`}
+            </span>
             {/* The local just-filed override wins and shows the "Filed #N" link chip; otherwise
                 the group rollup chip (never rendered for a still-`todo` group). */}
             {justFiled ? (
@@ -184,7 +216,10 @@ export function GroupRow({
             // done and Dismiss stay available.
             onFile={!justFiled && canAct && newestOpen ? () => setFiling(true) : undefined}
             onMarkDone={canAct ? () => onDispose("done") : undefined}
-            onDismiss={canAct ? (reason) => onDispose("dismissed", reason) : undefined}
+            // Dismiss is offered under `mine` only: there is no cross-user Dismiss (dismissing
+            // another user's recommendation is their judgment, PRD #1184). Under `all` the absent
+            // handler makes TriageActions render no Dismiss button.
+            onDismiss={!isAdmin && canAct ? (reason) => onDispose("dismissed", reason) : undefined}
           />
           <button
             type="button"
@@ -215,7 +250,17 @@ export function GroupRow({
           <IssueDraftCard
             repos={repos}
             loadDraft={async () => {
-              const { draft } = await api.getIssueDraft(newestOpen.run_id, newestOpen.rec_id);
+              // Under `all` the draft is keyed by COORDINATE (the admin endpoint resolves the
+              // newest open occurrence server-side, since the wire carries no run/rec id); under
+              // `mine` it is keyed by the newest open occurrence's run/rec id. Both KEEP the
+              // provenance line (Decision 8) — filing publishes a user's worker text, so the
+              // reader must see whose text it is, even in the anonymized aggregate.
+              const { draft } = isAdmin
+                ? await api.getAdminJudgeIssueDraft(group.category, group.target)
+                : await api.getIssueDraft(
+                    (newestOpen as JudgeOccurrence).run_id,
+                    (newestOpen as JudgeOccurrence).rec_id,
+                  );
               return {
                 title: draft.title,
                 description: draft.description,
@@ -226,11 +271,26 @@ export function GroupRow({
               };
             }}
             onCreate={async (values) => {
-              const res = await api.fileIssue(newestOpen.run_id, newestOpen.rec_id, {
-                repo_id: values.repoId,
-                title: values.title,
-                description: values.description,
-              });
+              // The admin file resolves the coordinate's newest open occurrence AGAIN at file
+              // time (a fresher review moves the link) and files into the ADMIN's own repo; the
+              // owner file targets the resolved run/rec id. Both return {issue, warning?}.
+              const res = isAdmin
+                ? await api.adminFileJudgeIssue({
+                    category: group.category,
+                    target: group.target,
+                    repoId: values.repoId,
+                    title: values.title,
+                    description: values.description,
+                  })
+                : await api.fileIssue(
+                    (newestOpen as JudgeOccurrence).run_id,
+                    (newestOpen as JudgeOccurrence).rec_id,
+                    {
+                      repo_id: values.repoId,
+                      title: values.title,
+                      description: values.description,
+                    },
+                  );
               // Record the created issue + any warning locally so the row reflects the filing
               // even when the refetch below does not settle the link (created-with-warning).
               setJustFiled({ iid: res.issue.iid, web_url: res.issue.web_url, warning: res.warning ?? "" });
@@ -261,9 +321,15 @@ export function GroupRow({
             )
           )}
           <ul className="space-y-2">
-            {group.occurrences.map((occ) => (
-              <OccurrenceRow key={`${occ.run_id} ${occ.rec_id}`} occ={occ} />
-            ))}
+            {isAdmin
+              ? (group.occurrences as JudgeAdminOccurrence[]).map((occ, i) => (
+                  // No stable id under `all` (attribution hidden — no run/rec id), so the index
+                  // keys it; the list is read-only and never reordered within a render.
+                  <AdminOccurrenceRow key={i} occ={occ} />
+                ))
+              : (group.occurrences as JudgeOccurrence[]).map((occ) => (
+                  <OccurrenceRow key={`${occ.run_id} ${occ.rec_id}`} occ={occ} />
+                ))}
           </ul>
         </div>
       )}
@@ -303,11 +369,45 @@ function OccurrenceRow({ occ }: { occ: JudgeOccurrence }) {
         >
           {stripUnsafeChars(occ.run_title) || "Untitled run"}
         </Link>
-        <OccurrenceVerdictBadge occ={occ} />
+        <OccurrenceVerdictBadge verdict={occ.verdict} />
         <TriageStateChip {...judgeState(occ)} />
       </div>
     </li>
   );
+}
+
+// AdminOccurrenceRow is one run's instance in the admin `all` scope (PRD #1184 M4): the
+// attribution-hidden twin of OccurrenceRow. The admin occurrence carries NO run_id/run_title —
+// naming a run is attribution the aggregate hides — so there is NO link and NO title: it reads
+// "A run, judged <relative time>" with the same verdict + state chips beside it. The state chip
+// renders "Done by an admin" for a set_via='admin' occurrence, the cross-user done's provenance.
+function AdminOccurrenceRow({ occ }: { occ: JudgeAdminOccurrence }) {
+  return (
+    <li className="rounded-md border border-edge bg-surface/60 px-2.5 py-2">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="text-sm font-medium text-fg" title={occ.judged_at ? new Date(occ.judged_at).toLocaleString() : undefined}>
+          A run{occ.judged_at ? `, judged ${relativeTime(occ.judged_at)}` : ""}
+        </span>
+        <OccurrenceVerdictBadge verdict={occ.verdict} />
+        <TriageStateChip {...judgeState(occ)} />
+      </div>
+    </li>
+  );
+}
+
+// relativeTime renders an ISO instant as a coarse "time ago" (mirrors ActivityFeed's private
+// helper). The absolute value lives in the row's title attribute. An unparseable value yields
+// "" — the caller then shows the bare "A run".
+function relativeTime(iso: string, now: number = Date.now()): string {
+  const t = new Date(iso).getTime();
+  if (!Number.isFinite(t)) return "";
+  const s = Math.max(0, Math.floor((now - t) / 1000));
+  if (s < 60) return "just now";
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  return `${Math.floor(h / 24)}d ago`;
 }
 
 // OccurrenceVerdictBadge renders the run's judge verdict in the ONE grammar the product
@@ -326,8 +426,8 @@ function OccurrenceRow({ occ }: { occ: JudgeOccurrence }) {
 // an occurrence is a single coordinate, not a run — synthesising a count would state a
 // number this DTO does not carry. judgeBadge drops the count entirely at 0, so the label is
 // the bare `⚖ issues`: the same grammar, minus a claim we cannot make.
-function OccurrenceVerdictBadge({ occ }: { occ: JudgeOccurrence }) {
-  const badge = judgeBadge({ judge_verdict: occ.verdict, judge_todo_count: 0 });
+function OccurrenceVerdictBadge({ verdict }: { verdict: ReviewVerdict }) {
+  const badge = judgeBadge({ judge_verdict: verdict, judge_todo_count: 0 });
   // Unreachable while the DTO types verdict as a non-null enum; judgeBadge returns null only
   // for an unjudged run, and an occurrence exists because a review produced it.
   if (!badge) return null;
@@ -344,7 +444,7 @@ function OccurrenceVerdictBadge({ occ }: { occ: JudgeOccurrence }) {
   // false inference for the two-grammars problem N8 just removed. The distinguishing claim
   // belongs where the claim actually lives.
   return (
-    <Badge tone={badge.tone} title={`This run's judge verdict: ${occ.verdict}. Triage state is the chip beside it.`}>
+    <Badge tone={badge.tone} title={`This run's judge verdict: ${verdict}. Triage state is the chip beside it.`}>
       {badge.label}
     </Badge>
   );
