@@ -59,6 +59,14 @@ export class Worker {
     }
     await this.registerWithRetry(signal);
     if (signal.aborted) return;
+    // PRD #1296 M3 (D3/D5) — after registering (so the worker is authenticated), re-drive
+    // any durable-recovery capture the previous life left journaled: re-upload the exact
+    // journaled bundle bytes with NO forge PAT. Fire-and-forget and fully swallowed — a
+    // resume failure must never block the claim loops, and the source stays protected by
+    // the journal + the server custody hold regardless.
+    void this.runner.resumePendingRecoveries(signal).catch((err) => {
+      this.log.warn("recovery: restart resume sweep failed", { error: errMessage(err) });
+    });
     // Heartbeat, the run lane, and the chat lane run concurrently until abort.
     await Promise.all([this.heartbeatLoop(signal), this.claimLoop(signal), this.chatClaimLoop(signal)]);
   }
@@ -75,12 +83,15 @@ export class Worker {
         const capabilities = this.config.dockerWiring?.dockerHost ? ["docker"] : undefined;
         // Self-report the PROTOCOL capabilities this image implements (PRD #1226 M1, D2).
         // This image always implements the structural completion protocol, so it
-        // unconditionally announces completion_interlock_v1. Kept SEPARATE from
-        // `capabilities` (the scheduler vocabulary) on the wire: the server stores it in
+        // unconditionally announces completion_interlock_v1. It also implements the PRD
+        // #1296 durable-recovery archive protocol (D9), so it announces
+        // recovery_archive_v1 — the flag M1's ClaimRun reads to open a custody hold for
+        // this worker on a code-publishing run. Kept SEPARATE from `capabilities` (the
+        // scheduler vocabulary) on the wire: the server stores it in
         // workers.protocol_capabilities and the ClaimRun hard clause reads it there,
         // OUTSIDE required_capabilities and the capability_aware kill-switch, so an old
-        // image that omits it can never claim an interlocked run.
-        const protocolCapabilities = ["completion_interlock_v1"];
+        // image that omits it can never claim an interlocked run or open a custody hold.
+        const protocolCapabilities = ["completion_interlock_v1", "recovery_archive_v1"];
         const res = await this.client.register(
           this.config.workerName,
           this.config.workerTemplate,

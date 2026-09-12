@@ -43,6 +43,11 @@ import {
   type CodexReleaseResponse,
   type CodexRefreshRequest,
   type CodexRefreshResponse,
+  type RecoveryReserveRequest,
+  type RecoveryReserveResponse,
+  type RecoveryUploadManifest,
+  type RecoveryCaptureStatusResponse,
+  type RecoveryReleaseResponse,
 } from "./protocol.js";
 
 /** Error carrying the server's HTTP status + (truncated) body for retry logic. */
@@ -468,6 +473,86 @@ export class WorkerClient {
     // outcome carrying the 2xx code rather than fabricating a body.
     if (!text) return { ok: false, httpStatus: res.status };
     return { ok: true, body: JSON.parse(text) as PublishResponse };
+  }
+
+  // ── Durable run recovery archive RPC (PRD #1296 M3, D3/D5) ─────────────────────
+  // The Bearer-authenticated worker↔API archive endpoints. Shapes are the M1-frozen
+  // protocol types (agent/src/protocol.ts, mirrored from apitypes/recovery.go). The bundle
+  // bytes NEVER travel in JSON (D6): the upload streams the raw bundle as the request body
+  // and carries its manifest in the X-Uzi-Recovery-Manifest header. reserve/status/release
+  // are ordinary JSON. All four are idempotent by the M1 contract (a lost ACK re-reserves
+  // the same capture; a retry re-uploads from zero; release is idempotent once none remain).
+
+  /** Reserve (or idempotently re-reserve) a capture under the run's open custody hold.
+   *  JSON POST → capture_id + lifecycle state. Throws RequestError on 4xx/5xx so the
+   *  caller retries within the model-free window. */
+  async reserveRecoveryCapture(
+    runId: string,
+    req: RecoveryReserveRequest,
+  ): Promise<RecoveryReserveResponse> {
+    return (await this.postJSON(
+      `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/recovery/reserve`,
+      req,
+    )) as RecoveryReserveResponse;
+  }
+
+  /** By-id status poll of a capture (handles lost ACKs; on restart tells whether the byte
+   *  manifest is already bound). JSON GET. Throws RequestError on 4xx/5xx. */
+  async getRecoveryCaptureStatus(
+    runId: string,
+    captureId: string,
+  ): Promise<RecoveryCaptureStatusResponse> {
+    return (await this.getJSON(
+      `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/recovery/captures/${encodeURIComponent(captureId)}`,
+    )) as RecoveryCaptureStatusResponse;
+  }
+
+  /**
+   * Bind the byte manifest (compare-and-set) and stream the verified bundle in ONE request
+   * (D4: one streaming binary request per upload, the server splits it into encrypted
+   * chunks). Mirrors publishCheckpoint's transport: the raw bundle is the
+   * `application/octet-stream` body (a Readable, so `duplex: "half"` is required by undici),
+   * and the manifest rides the `X-Uzi-Recovery-Manifest` JSON header rather than a JSON
+   * field. A non-2xx throws RequestError (the caller keeps the source pinned and retries);
+   * a 2xx returns the capture's post-upload status. The per-request timeout matches the
+   * other terminal-boundary RPCs.
+   */
+  async uploadRecoveryBundle(
+    runId: string,
+    captureId: string,
+    manifest: RecoveryUploadManifest,
+    bundle: Readable,
+    boundarySignal?: AbortSignal,
+  ): Promise<RecoveryCaptureStatusResponse> {
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/recovery/captures/${encodeURIComponent(captureId)}/bundle`;
+    const init: RequestInit = {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${this.token}`,
+        "X-Client-Version": this.version,
+        "Content-Type": "application/octet-stream",
+        "X-Uzi-Recovery-Manifest": JSON.stringify(manifest),
+      },
+      body: bundle,
+      duplex: "half",
+      signal: boundarySignal
+        ? AbortSignal.any([boundarySignal, AbortSignal.timeout(this.httpTimeoutMs)])
+        : AbortSignal.timeout(this.httpTimeoutMs),
+    };
+    const res = await fetch(this.baseUrl + path, init);
+    if (res.status >= 400) throw await this.toError("POST", path, res);
+    const text = await res.text();
+    return (text ? JSON.parse(text) : {}) as RecoveryCaptureStatusResponse;
+  }
+
+  /** Release the run's custody after a successful full publication (D3). JSON POST with an
+   *  empty body; idempotent (holds_released is 0 once none remain open). Throws
+   *  RequestError on 4xx/5xx. */
+  async releaseRecoveryCustody(runId: string): Promise<RecoveryReleaseResponse> {
+    return (await this.postJSON(
+      `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/recovery/release`,
+      {},
+    )) as RecoveryReleaseResponse;
   }
 
   async getInputs(runId: string): Promise<UserInput[]> {

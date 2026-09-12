@@ -634,6 +634,23 @@ type Config struct {
 	// param. parseDuration's >0 guard means =0 falls back to 90s (anti-churn safety),
 	// so the path cannot be accidentally disabled via env.
 	EphemeralSaturationDelay time.Duration
+
+	// Durable-recovery archive limits (PRD #1296 M2, D4/D6). Every knob is
+	// operator-configurable via env with the PRD default; byte ceilings are int64 so
+	// a 4 GiB instance quota is representable on every platform. They bound the
+	// authenticated archive API: an upload over the bundle ceiling is REJECTED (413),
+	// never truncated, and a quota/transport/integrity failure records needs_action
+	// and retains the source rather than evicting an existing last copy.
+	RecoveryMaxBundleBytes         int64         // UZI_RECOVERY_MAX_BUNDLE_BYTES — max complete bundle. Default 64 MiB.
+	RecoveryReadyPayloadPerOwner   int64         // UZI_RECOVERY_READY_PAYLOAD_PER_OWNER_BYTES — ready payload quota per owner. Default 1 GiB.
+	RecoveryInstanceBytes          int64         // UZI_RECOVERY_INSTANCE_BYTES — instance-wide byte quota (scoped to the affected owner on breach, never a global stop). Default 4 GiB.
+	RecoveryMaxCapturesPerClaim    int           // UZI_RECOVERY_MAX_CAPTURES_PER_CLAIM — captures admitted under one hold. Default 16.
+	RecoveryMaxCapturesPerOwner    int           // UZI_RECOVERY_MAX_CAPTURES_PER_OWNER — retained (non-discarded) captures per owner. Default 256.
+	RecoveryReadyRetention         time.Duration // UZI_RECOVERY_READY_RETENTION — ready-artifact TTL, begins at durable capture. Default 168h (7d).
+	RecoveryUploadRetryWindow      time.Duration // UZI_RECOVERY_UPLOAD_RETRY_WINDOW — automatic upload-retry window (consumed by M3/M4). Default 24h.
+	RecoveryMaxConcurrentUploads   int           // UZI_RECOVERY_MAX_CONCURRENT_UPLOADS — concurrent uploads per API process. Default 2.
+	RecoveryMaxConcurrentDownloads int           // UZI_RECOVERY_MAX_CONCURRENT_DOWNLOADS — concurrent downloads per API process. Default 2.
+	RecoveryRequestDeadline        time.Duration // UZI_RECOVERY_REQUEST_DEADLINE — per upload/download request+transaction deadline. Default 120s.
 }
 
 // placeholderSecrets are values that must never be accepted as a real signing
@@ -1078,6 +1095,21 @@ func Load() (Config, error) {
 	// used as the hosted-worker upgrade-badge target. Optional, unvalidated at load (empty
 	// falls back to the api's own release at classification time — today's behavior).
 	cfg.HostedWorkerVersion = getenv("HOSTED_WORKER_VERSION", "")
+
+	// Durable-recovery archive limits (PRD #1296 M2, D4/D6). parseInt/parseInt64/
+	// parseDuration all floor at >0, so a non-positive or malformed override falls back
+	// to the PRD default rather than disabling a ceiling.
+	cfg.RecoveryMaxBundleBytes = parseInt64("UZI_RECOVERY_MAX_BUNDLE_BYTES", 64<<20)
+	cfg.RecoveryReadyPayloadPerOwner = parseInt64("UZI_RECOVERY_READY_PAYLOAD_PER_OWNER_BYTES", 1<<30)
+	cfg.RecoveryInstanceBytes = parseInt64("UZI_RECOVERY_INSTANCE_BYTES", 4<<30)
+	cfg.RecoveryMaxCapturesPerClaim = parseInt("UZI_RECOVERY_MAX_CAPTURES_PER_CLAIM", 16)
+	cfg.RecoveryMaxCapturesPerOwner = parseInt("UZI_RECOVERY_MAX_CAPTURES_PER_OWNER", 256)
+	cfg.RecoveryReadyRetention = parseDuration("UZI_RECOVERY_READY_RETENTION", 7*24*time.Hour)
+	cfg.RecoveryUploadRetryWindow = parseDuration("UZI_RECOVERY_UPLOAD_RETRY_WINDOW", 24*time.Hour)
+	cfg.RecoveryMaxConcurrentUploads = parseInt("UZI_RECOVERY_MAX_CONCURRENT_UPLOADS", 2)
+	cfg.RecoveryMaxConcurrentDownloads = parseInt("UZI_RECOVERY_MAX_CONCURRENT_DOWNLOADS", 2)
+	cfg.RecoveryRequestDeadline = parseDuration("UZI_RECOVERY_REQUEST_DEADLINE", 120*time.Second)
+
 	// Must run after Addr and TLSAddr are set (it rejects the two colliding).
 	if err := loadTLS(&cfg); err != nil {
 		return Config{}, err
@@ -1746,6 +1778,20 @@ func parseInt(key string, def int) int {
 	}
 	var n int
 	if _, err := fmt.Sscanf(raw, "%d", &n); err == nil && n > 0 {
+		return n
+	}
+	return def
+}
+
+// parseInt64 parses a signed 64-bit int env var, flooring at >0 like parseInt. It
+// exists for byte ceilings a 32-bit int cannot hold (e.g. the 4 GiB recovery instance
+// quota); an empty, non-positive or malformed value returns def.
+func parseInt64(key string, def int64) int64 {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return def
+	}
+	if n, err := strconv.ParseInt(raw, 10, 64); err == nil && n > 0 {
 		return n
 	}
 	return def

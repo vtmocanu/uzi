@@ -2,9 +2,10 @@ import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { promisify } from "node:util";
 import fs from "node:fs/promises";
+import { createReadStream } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { Readable } from "node:stream";
 import type { Logger } from "./log.js";
 import type { BoundaryProcessHandle, BoundaryProcessRequest } from "./harness.js";
@@ -143,6 +144,59 @@ interface BoundaryProcessScope {
 // diff is truncated at this size with a marker. 512 KiB is generous for a task-run diff
 // while staying an order of magnitude under runGit's 64 MiB maxBuffer.
 const REVIEW_DIFF_MAX_BYTES = 512 * 1024;
+
+// PRD #1296 M3 (D4/D5) — durable-recovery bundle limits.
+// The maximum COMPLETE bundle byte size the worker will produce before it declares the
+// source un-archivable within limits (needs_action) rather than emitting an oversized
+// artifact the API's 64 MiB ceiling would reject. Mirrors the lead-design default in D4.
+export const RECOVERY_MAX_BUNDLE_BYTES = 64 * 1024 * 1024;
+// The nominal ~1 MiB chunk size the API splits an upload stream into (D4). The worker
+// records chunk_count = ceil(byteSize / this) in the upload manifest so the server can
+// verify its ordered-chunk inventory. This MUST agree with the server's chunk size.
+export const RECOVERY_CHUNK_BYTES = 1024 * 1024;
+// The named ref the produced bundle carries H under (D5: "a named source ref", never
+// `--all`/unrelated refs/reflogs). A dedicated, non-branch name that a fresh forge clone
+// checks out on `git clone recovered.bundle`, and that can never collide with a real run
+// branch or a stale bare mirror ref (it is created and deleted under the bare lock).
+export const RECOVERY_BUNDLE_REF = "refs/heads/recovered-source";
+
+/** The verified-bundle facts the recovery uploader binds into the upload manifest and
+ *  journals BEFORE upload (PRD #1296 D5). Produced from trusted bare-object operations
+ *  only — no source checkout, no repo-controlled hooks/filters. */
+export interface RecoveryBundleResult {
+  /** Absolute path of the produced bundle file. */
+  bundlePath: string;
+  /** Complete-bundle byte size. */
+  byteSize: number;
+  /** Lowercase hex SHA-256 of the complete bundle bytes. */
+  checksum: string;
+  /** Expected ordered-chunk inventory = ceil(byteSize / RECOVERY_CHUNK_BYTES). */
+  chunkCount: number;
+  /** The verified public prerequisite closure the bundle imports against — the
+   *  merge-base(H, fresh forge tip) SHA(s), or [] for a self-contained bundle (D5). */
+  prerequisiteShas: string[];
+  /** The resolved original committed head H (40-hex). */
+  sourceSha: string;
+  /** True when no forge-reachable prerequisite existed and the bundle carries H's full
+   *  reachable history self-contained within the size limit (D5). */
+  selfContained: boolean;
+  /** True when H is ALREADY reachable from the fresh forge tip (merge-base(H, forgeTip) ==
+   *  H) — i.e. the committed head is already published, so there is NOTHING to archive.
+   *  No bundle file is written; the caller releases custody against this verified forge
+   *  history (D3's no-unpublished-output disposition) rather than emitting a redundant
+   *  full-history bundle. bundlePath is empty in this case. */
+  alreadyPublished: boolean;
+}
+
+/** PRD #1296 D5 — a produced bundle exceeded RECOVERY_MAX_BUNDLE_BYTES. The caller
+ *  retains custody and surfaces needs_action rather than truncating or force-shipping an
+ *  oversized artifact. */
+export class RecoveryBundleTooLargeError extends Error {
+  constructor(readonly byteSize: number, readonly maxBytes: number) {
+    super(`recovery bundle is ${byteSize} bytes, over the ${maxBytes}-byte limit`);
+    this.name = "RecoveryBundleTooLargeError";
+  }
+}
 
 // PRD #974 M2 — cap the gitleaks JSON report read in secretScanRange. The report grows with
 // the finding COUNT over attacker-authored commits, so an adversarial repo could inflate it
@@ -370,6 +424,12 @@ export class GitCache {
    *  worker-only `repos/` bare cache, so the M3 ownership carve-out is a clean
    *  boundary: `runner/` is runner-writable, `repos/` stays worker-only. */
   private readonly runnerRoot: string;
+  /** PRD #1296 M3 — the durable durable-recovery journal + verified-bundle store, a
+   *  DISTINCT /data subtree from `repos/` (worker bare) and `runner/` (torn-down clones),
+   *  and separate from the unrelated issue #1187 git-config recovery-capture journal.
+   *  It survives runner-clone removal and worker restart, so a terminal/restart retry can
+   *  re-upload the exact journaled bytes with no forge PAT (D5). Worker-owned. */
+  readonly recoveryRoot: string;
   /** Per-bare-path serialization: git's lockfiles can't take parallel mutations. */
   private readonly locks = new Map<string, Promise<unknown>>();
   private readonly boundaryProcesses = new AsyncLocalStorage<BoundaryProcessScope>();
@@ -383,6 +443,7 @@ export class GitCache {
   ) {
     this.reposRoot = path.join(dataDir, "repos");
     this.runnerRoot = path.join(dataDir, "runner");
+    this.recoveryRoot = path.join(dataDir, "recovery");
   }
 
   /** Scope every subprocess and bare-lock acquisition created by `action` to the
@@ -2013,6 +2074,121 @@ export class GitCache {
         );
       }
       return sha;
+    });
+  }
+
+  /**
+   * PRD #1296 M3 (D5) — produce a REAL, independently-usable Git bundle carrying the
+   * original committed head H under a single named ref, from the trusted WORKER bare.
+   *
+   * This is a bare-OBJECT operation only: NO source checkout, NO repo-controlled
+   * hooks/filters (gitEnv pins core.hooksPath at a root-owned 0555 dir), and it exports
+   * EXACTLY one ref (RECOVERY_BUNDLE_REF at H) — never `--all`, unrelated refs, reflogs,
+   * filesystem paths or worker config (D1/D6). It cannot capture uncommitted files or the
+   * worker HOME: a bundle is an object graph, and only committed objects reachable from H
+   * are included.
+   *
+   * Prerequisite resolution (D5): when `forgeTip` (a FRESH, verified forge default tip the
+   * caller fetched under the reap-before-credentialed-git boundary) is supplied and shares
+   * a real merge-base with H, that merge-base is the bundle's prerequisite — so a user's
+   * CLEAN forge clone (which already has the merge-base) can import it. The runner clone's
+   * private `origin/main`, a prior checkpoint wrapper, or an unpublished private base are
+   * NEVER used: the caller passes only a freshly forge-fetched tip, and this method reads
+   * nothing else. When no forge-reachable prerequisite exists (unrelated histories, or H is
+   * already fully on the forge), it falls back to a SELF-CONTAINED bundle within the size
+   * limit; if that exceeds RECOVERY_MAX_BUNDLE_BYTES it throws RecoveryBundleTooLargeError
+   * so the caller retains custody and surfaces needs_action rather than truncating.
+   *
+   * The bundle is `git bundle verify`d against the bare (a producer self-check that its
+   * prerequisites resolve) before the size/checksum are recorded. The transient named ref
+   * is created and deleted under the SAME bare lock, so a concurrent op never observes it.
+   */
+  async produceRecoveryBundle(
+    barePath: string,
+    opts: { sourceSha: string; outPath: string; forgeTip?: string; maxBytes?: number },
+  ): Promise<RecoveryBundleResult> {
+    const maxBytes = opts.maxBytes ?? RECOVERY_MAX_BUNDLE_BYTES;
+    return this.withLock(barePath, async () => {
+      // Resolve + verify H is a real commit present in the trusted bare. Never trust a
+      // caller-supplied SHA blindly; a missing object here means the source is not
+      // reproducible and the caller must surface needs_action.
+      const h = (
+        await this.runGit(barePath, ["rev-parse", "--verify", `${opts.sourceSha}^{commit}`]).catch(
+          () => "",
+        )
+      ).trim();
+      if (!/^[0-9a-f]{40}$/.test(h)) {
+        throw new Error("produceRecoveryBundle: source commit is not present in the trusted bare");
+      }
+      // Resolve the prerequisite against the FRESH forge tip only. merge-base guarantees the
+      // result is an ancestor of BOTH H and forgeTip, i.e. it is genuinely forge-reachable.
+      // When merge-base == H, H is already fully on the forge (already published) — there is
+      // nothing to archive; report that so the caller releases custody against verified forge
+      // history rather than shipping a redundant full-history bundle.
+      let prereqs: string[] = [];
+      if (opts.forgeTip && /^[0-9a-f]{40}$/.test(opts.forgeTip)) {
+        const mb = (
+          await this.runGit(barePath, ["merge-base", h, opts.forgeTip]).catch(() => "")
+        ).trim();
+        if (/^[0-9a-f]{40}$/.test(mb)) {
+          if (mb === h) {
+            return {
+              bundlePath: "",
+              byteSize: 0,
+              checksum: "",
+              chunkCount: 0,
+              prerequisiteShas: [],
+              sourceSha: h,
+              selfContained: false,
+              alreadyPublished: true,
+            };
+          }
+          prereqs = [mb];
+        }
+      }
+      // Create the transient named ref at H, build the bundle from EXACTLY that ref, verify
+      // it, then delete the ref in a finally so the bare's namespace is left untouched.
+      await this.runGit(barePath, ["update-ref", RECOVERY_BUNDLE_REF, h]);
+      try {
+        const args = ["bundle", "create", opts.outPath, RECOVERY_BUNDLE_REF];
+        for (const p of prereqs) args.push(`^${p}`);
+        await this.runGit(barePath, args);
+        // Producer self-check: the bundle's prerequisites resolve against the bare. The
+        // authoritative proof is the clean-clone import in the conformance tests.
+        await this.runGit(barePath, ["bundle", "verify", opts.outPath]);
+      } finally {
+        await this.tryGit(barePath, ["update-ref", "-d", RECOVERY_BUNDLE_REF]);
+      }
+      // Stream the produced file to compute size + SHA-256 without buffering the whole
+      // (up to 64 MiB) bundle in memory.
+      const hash = createHash("sha256");
+      let byteSize = 0;
+      await new Promise<void>((resolve, reject) => {
+        const rs = createReadStream(opts.outPath);
+        rs.on("data", (c: Buffer | string) => {
+          const buf = Buffer.isBuffer(c) ? c : Buffer.from(c);
+          byteSize += buf.length;
+          hash.update(buf);
+        });
+        rs.on("error", reject);
+        rs.on("end", resolve);
+      });
+      if (byteSize > maxBytes) {
+        await fs.rm(opts.outPath, { force: true });
+        throw new RecoveryBundleTooLargeError(byteSize, maxBytes);
+      }
+      const checksum = hash.digest("hex");
+      const chunkCount = Math.max(1, Math.ceil(byteSize / RECOVERY_CHUNK_BYTES));
+      return {
+        bundlePath: opts.outPath,
+        byteSize,
+        checksum,
+        chunkCount,
+        prerequisiteShas: prereqs,
+        sourceSha: h,
+        selfContained: prereqs.length === 0,
+        alreadyPublished: false,
+      };
     });
   }
 
