@@ -20,9 +20,15 @@ You point it at a forge (GitLab, GitHub, or Forgejo), label an issue `uzi`, and 
 
 Not a *fully* dark factory, and on purpose: those two decisions stay human, and (unless you opt into autopilot) nothing is written until you sign off on the plan. The lights are off for the work, not for the call to ship.
 
+> [!NOTE]
+> uzi ships both a light and a dark theme, and the screenshots below follow yours. Switch your browser (or GitHub) between light and dark and they change with it.
+
 <p align="center">
-  <img src=".github/readme/dashboard.png" width="820"
-       alt="The uzi dashboard: active runs, workers online, recent runs, and usage">
+  <picture>
+      <source media="(prefers-color-scheme: dark)" srcset=".github/readme/dashboard-dark.png">
+      <img src=".github/readme/dashboard-light.png" width="820"
+           alt="The uzi dashboard: active runs, workers online, recent runs, and usage">
+    </picture>
 </p>
 
 ## How it works
@@ -45,8 +51,11 @@ The unit of work is an **issue**, not a chat message. The forge stays the source
 3. **Branch and PR, never `main`.** On completion, uzi opens a branch and a pull request and moves the issue to human review. `main` is never touched, by design, even under an adversarial prompt: see [ARCHITECTURE.md](ARCHITECTURE.md#guardrail-layers-the-primary-directive) for why that holds.
 
 <p align="center">
-  <img src=".github/readme/run-plan-gate.png" width="820"
-       alt="A run paused at the plan-approval gate, with the proposed plan in view">
+  <picture>
+      <source media="(prefers-color-scheme: dark)" srcset=".github/readme/run-plan-gate-dark.png">
+      <img src=".github/readme/run-plan-gate-light.png" width="820"
+           alt="A run paused at the plan-approval gate, with the proposed plan in view">
+    </picture>
 </p>
 
 ## Quick start
@@ -94,8 +103,11 @@ The board works against issues on your forge, through a per-user bot account so 
 4. Open its board from the sidebar. Your issues show up as cards; label one `uzi` to hand it to the factory (see [docs/board.md](docs/board.md)).
 
 <p align="center">
-  <img src=".github/readme/board.png" width="820"
-       alt="The uzi board: uzi-labeled issues as cards moving across columns, kept in sync with the forge">
+  <picture>
+      <source media="(prefers-color-scheme: dark)" srcset=".github/readme/board-dark.png">
+      <img src=".github/readme/board-light.png" width="820"
+           alt="The uzi board: uzi-labeled issues as cards moving across columns, kept in sync with the forge">
+    </picture>
 </p>
 
 ### Add your model token and a worker
@@ -110,15 +122,21 @@ That is the whole setup. Pick an issue, label it `uzi`, hit **Start run**, appro
 Nothing about a run is a black box. A per-agent activity feed shows what each role is doing right now, so you can see the lead orchestrating while the coder implements one milestone and the reviewer and auditor check the last. Expand any entry and it streams that agent's own transcript, its reasoning and each tool call, as it happens. You can also send a follow-up mid-run to steer it.
 
 <p align="center">
-  <img src=".github/readme/activity.png" width="760"
-       alt="The run activity feed grouped by agent: lead, coder, reviewer, auditor, and fact-checker, each with its current step and milestone">
+  <picture>
+      <source media="(prefers-color-scheme: dark)" srcset=".github/readme/activity-dark.png">
+      <img src=".github/readme/activity-light.png" width="760"
+           alt="The run activity feed grouped by agent: lead, coder, reviewer, auditor, and fact-checker, each with its current step and milestone">
+    </picture>
 </p>
 
 The lead works the approved plan one **milestone** at a time, committing each as its own reviewed slice and ticking it off as it lands, so even a long run shows honest progress instead of a spinner.
 
 <p align="center">
-  <img src=".github/readme/milestones.png" width="760"
-       alt="A run's milestone checklist, some milestones reported complete and struck through">
+  <picture>
+      <source media="(prefers-color-scheme: dark)" srcset=".github/readme/milestones-dark.png">
+      <img src=".github/readme/milestones-light.png" width="760"
+           alt="A run's milestone checklist, some milestones reported complete and struck through">
+    </picture>
 </p>
 
 ## Fix a red pipeline
@@ -134,8 +152,11 @@ The loop does not stop at "PR opened". When a pull request from a completed run 
 An optional **run judge** gives every finished run a retrospective: it reads the whole run trace and produces a verdict plus concrete recommendations. It is advice, not a gate, and it never changes code. A judge menu collects those recommendations across runs, deduped and ranked by how often each recurs, so you can triage a whole class at once. Off by default, and it runs on your own Anthropic token. See [docs/judge.md](docs/judge.md).
 
 <p align="center">
-  <img src=".github/readme/run-judge.png" width="820"
-       alt="A finished run's judge review: a verdict, a retrospective, token and cost stats, and a triage panel">
+  <picture>
+      <source media="(prefers-color-scheme: dark)" srcset=".github/readme/run-judge-dark.png">
+      <img src=".github/readme/run-judge-light.png" width="820"
+           alt="A finished run's judge review: a verdict, a retrospective, token and cost stats, and a triage panel">
+    </picture>
 </p>
 
 ## Schedules: the factory on a cadence
@@ -156,8 +177,11 @@ uzi ships a catalogue of standing automations you can enable per repo, so the fa
 `feature-bingo` is the factory designing its own next machine: once a week it reads the existing ideas, checks what already exists so it does not repeat itself, and opens a PR proposing exactly one concrete new feature. Every scheduled job falls back to a plain report when it has nothing worth landing, so a quiet week produces no empty pull requests. See [docs/scheduling.md](docs/scheduling.md).
 
 <p align="center">
-  <img src=".github/readme/schedules.png" width="820"
-       alt="The schedules page, showing the standing automations including feature bingo">
+  <picture>
+      <source media="(prefers-color-scheme: dark)" srcset=".github/readme/schedules-dark.png">
+      <img src=".github/readme/schedules-light.png" width="820"
+           alt="The schedules page, showing the standing automations including feature bingo">
+    </picture>
 </p>
 
 ## Every run is costed
@@ -165,8 +189,11 @@ uzi ships a catalogue of standing automations you can enable per repo, so the fa
 Runs use your own Anthropic token, so every run is fully costed. Its stats panel gives the total tokens in and out, how much came from cache, the wall-clock duration, and the dollar cost, then breaks that down per phase and per agent, so you can see exactly where a run spent its budget. A hosted run is usually cheaper than doing the same work in a local agent session on the same model tier: [why a hosted run costs less](docs/run-cost.md).
 
 <p align="center">
-  <img src=".github/readme/run-cost.png" width="820"
-       alt="A run's cost and token stats: tokens in and out, cache hit rate, duration, dollar cost, and per-phase and per-agent breakdowns">
+  <picture>
+      <source media="(prefers-color-scheme: dark)" srcset=".github/readme/run-cost-dark.png">
+      <img src=".github/readme/run-cost-light.png" width="820"
+           alt="A run's cost and token stats: tokens in and out, cache hit rate, duration, dollar cost, and per-phase and per-agent breakdowns">
+    </picture>
 </p>
 
 ## Drive it from the terminal
@@ -187,8 +214,19 @@ uzi run logs <id> -f                 # follow the transcript live
 An agent drives it fully headless with a Bearer token in `UZI_TOKEN`: no browser, no cookie. The CLI also carries uzi's full docs offline (`uzi docs search`, `uzi docs show`), and `uzi tui` opens a full-screen terminal dashboard of runs that need you, runs in flight, and rate-limit meters. See [docs/cli.md](docs/cli.md).
 
 <p align="center">
-  <img src=".github/readme/tui.png" width="760"
-       alt="The uzi TUI: runs waiting at the plan gate, runs in flight, and account rate-limit meters">
+  <picture>
+      <source media="(prefers-color-scheme: dark)" srcset=".github/readme/tui-floor-dark.png">
+      <img src=".github/readme/tui-floor-light.png" width="760"
+           alt="The uzi TUI floor view: runs waiting at the plan gate, runs in flight, and account rate-limit meters">
+    </picture>
+</p>
+
+<p align="center">
+  <picture>
+      <source media="(prefers-color-scheme: dark)" srcset=".github/readme/tui-transcript-dark.png">
+      <img src=".github/readme/tui-transcript-light.png" width="760"
+           alt="The uzi TUI run view: the crew, milestones, account rate-limit meters, and the live agent transcript">
+    </picture>
 </p>
 
 ## And more
@@ -208,7 +246,7 @@ GitLab, GitHub, and Forgejo sit behind one driver. GitLab and GitHub are the pat
 
 ## Status: alpha (and uzi builds uzi)
 
-Treat it as **alpha**. Features land often, refactors happen often, and breaking changes are on the table. But it is not a toy: it is stable and it works well day to day, having already completed over 1,000 runs and spent over 15 billion tokens getting here.
+Treat it as **alpha**. Features land often, refactors happen often, and breaking changes are on the table. But it is not a toy: it is stable and it works well day to day, having already completed over 1,200 runs and spent over 19 billion tokens getting here.
 
 And the fun part: **uzi builds uzi**. A growing share of it is written by itself. I file the issues, it plans, implements, and opens the PRs, so the factory is quietly assembling its own next version while I review.
 
