@@ -171,6 +171,47 @@ func TestLoadAgentRuntimeDefaults(t *testing.T) {
 	}
 }
 
+// TestLoadForgeInteractiveRateMax pins the PRD #1255 D4 outbound-budget knob: unset →
+// the 120 calls/min default, a positive value is parsed, and a non-positive override
+// floors back to the default the same way parseInt handles every other int knob here.
+func TestLoadForgeInteractiveRateMax(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://uzi:pw@db:5432/uzi?sslmode=disable")
+	t.Setenv("JWT_SECRET", "unit-test-jwt-signing-key-not-a-real-secret")
+	varied := make([]byte, secretbox.KeySize)
+	for i := range varied {
+		varied[i] = byte(i + 1)
+	}
+	t.Setenv("UZI_SECRET_KEY", base64.StdEncoding.EncodeToString(varied))
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load(): %v", err)
+	}
+	if cfg.ForgeInteractiveRateMax != 120 {
+		t.Errorf("ForgeInteractiveRateMax default = %d, want 120", cfg.ForgeInteractiveRateMax)
+	}
+
+	t.Setenv("FORGE_INTERACTIVE_RATE_MAX", "240")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load() with FORGE_INTERACTIVE_RATE_MAX=240: %v", err)
+	}
+	if cfg.ForgeInteractiveRateMax != 240 {
+		t.Errorf("ForgeInteractiveRateMax = %d, want 240 (parsed override)", cfg.ForgeInteractiveRateMax)
+	}
+
+	// parseInt floors a non-positive value back to the default (a 0/negative budget is
+	// expressed as unlimited at the bucket, not via this env var).
+	t.Setenv("FORGE_INTERACTIVE_RATE_MAX", "0")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load() with FORGE_INTERACTIVE_RATE_MAX=0: %v", err)
+	}
+	if cfg.ForgeInteractiveRateMax != 120 {
+		t.Errorf("ForgeInteractiveRateMax = %d for non-positive override, want the 120 default", cfg.ForgeInteractiveRateMax)
+	}
+}
+
 // TestProposalConfirmStuckTimeoutClamped pins the load-bearing ordering invariant:
 // the stuck-confirming sweep timeout must sit safely above the forge HTTP timeout, so
 // a slow CreateIssue can never be reverted mid-flight and re-confirmed into a

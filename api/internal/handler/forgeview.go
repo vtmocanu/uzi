@@ -8,9 +8,11 @@ package handler
 // Every forge read rides the tenant-scoped forgememo (M2b): a short-TTL + singleflight
 // memo keyed by forgeMemoPrefix, so N terminals polling one route cost one forge
 // round-trip per TTL window and an unchanged PR costs zero enrichment; the per-PR
-// enrichment fans out through a bounded pool (forgeMemoFanout). The GitHub ETag
-// transport and the per-connection outbound budget / rate-shedding are a later M2b
-// unit — not here. Every forge error is already PAT-redacted by the driver; a
+// enrichment fans out through a bounded pool (forgeMemoFanout). Each memoized load
+// first charges one token against the connection's per-connection interactive-read
+// outbound budget (chargeBudget, forge_budget.go), so the enrichment fan-out is charged
+// too and a shed request makes zero forge calls; the GitHub Rate.Remaining reserve half
+// of D4's budget is a later unit — not here. Every forge error is already PAT-redacted by the driver; a
 // *forge.RateLimitError maps to 429 + Retry-After (uncached through Do),
 // ErrForgeVersionUnsupported to an honest empty state, other errors to 502.
 
@@ -144,6 +146,22 @@ func forgeRetryAfterSeconds(rl *forge.RateLimitError) int {
 	return secs
 }
 
+// chargeBudget takes one interactive-read token from the connection's outbound spend
+// budget (PRD #1255 D4). It is called at the TOP of every memoized forge load closure
+// — INSIDE the memo, so a memo HIT (which never runs load) is not charged and only an
+// actual forge round-trip spends a token, and each per-PR enrichment load is charged
+// too. On an exhausted budget it returns a *forge.RateLimitError carrying the
+// Retry-After, which propagates uncached through memo.Do (errors are never cached) and
+// is mapped by writeForgeError to 429 + Retry-After BEFORE any forge call — zero forge
+// calls on a shed request. A non-nil Err makes Error() read sensibly and never leaks a
+// token (it carries none). nil means a token was spent and the load may call the forge.
+func (h *Handler) chargeBudget(connID uuid.UUID) error {
+	if ok, ra := h.budget().Take(connID); !ok {
+		return &forge.RateLimitError{Retry: ra, Err: errors.New("forge: interactive read budget exhausted for this connection")}
+	}
+	return nil
+}
+
 // ListPulls serves GET /api/repos/{id}/pulls: the repo's open PRs as list rows, each
 // linked to the newest uzi run on that (repo, mr_iid). It reads the cheap open-PR refs
 // in one list call (ListMergeRequestRefs), then a per-iid GetMergeRequestSummary for
@@ -180,6 +198,9 @@ func (h *Handler) ListPulls(w http.ResponseWriter, r *http.Request) {
 
 	refsKey := prefix + "refs|" + forge.MRStateOpened + "|" + strconv.Itoa(forgeViewPullsLimit)
 	refsV, err := h.memo().Do(refsKey, forgeMemoTTL, func() (any, int, error) {
+		if e := h.chargeBudget(repo.ConnectionID); e != nil {
+			return nil, 0, e
+		}
 		refs, e := f.ListMergeRequestRefs(loadCtx, repo.ForgeProjectID,
 			forge.ListMergeRequestsOptions{State: forge.MRStateOpened, Limit: forgeViewPullsLimit})
 		if e != nil {
@@ -212,6 +233,9 @@ func (h *Handler) ListPulls(w http.ResponseWriter, r *http.Request) {
 		g.Go(func() error {
 			sumKey := prefix + "sum|" + strconv.FormatInt(ref.IID, 10) + "|" + ref.UpdatedAt.UTC().Format(time.RFC3339Nano)
 			v, e := h.memo().Do(sumKey, forgeMemoTTL, func() (any, int, error) {
+				if ce := h.chargeBudget(repo.ConnectionID); ce != nil {
+					return nil, 0, ce
+				}
 				s, se := f.GetMergeRequestSummary(loadCtx, repo.ForgeProjectID, ref.IID)
 				if se != nil {
 					return nil, 0, se
@@ -282,6 +306,9 @@ func (h *Handler) GetPull(w http.ResponseWriter, r *http.Request) {
 	// the list route's job); the 404 / non-open guards run AFTER the fetch and propagate
 	// uncached through Do (errors are never memoised).
 	sumV, err := h.memo().Do(prefix+"pull|"+iidStr, forgeMemoTTL, func() (any, int, error) {
+		if e := h.chargeBudget(repo.ConnectionID); e != nil {
+			return nil, 0, e
+		}
 		s, e := f.GetMergeRequestSummary(loadCtx, repo.ForgeProjectID, iid)
 		if e != nil {
 			return nil, 0, e
@@ -302,6 +329,9 @@ func (h *Handler) GetPull(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	checksV, err := h.memo().Do(prefix+"checks|"+s.HeadSHA, forgeMemoTTL, func() (any, int, error) {
+		if e := h.chargeBudget(repo.ConnectionID); e != nil {
+			return nil, 0, e
+		}
 		cs, e := f.ListChecks(loadCtx, repo.ForgeProjectID, s.HeadSHA)
 		if e != nil {
 			return nil, 0, e
@@ -314,6 +344,9 @@ func (h *Handler) GetPull(w http.ResponseWriter, r *http.Request) {
 	}
 	checks := checksV.([]forge.Check)
 	reviewsV, err := h.memo().Do(prefix+"reviews|"+iidStr, forgeMemoTTL, func() (any, int, error) {
+		if e := h.chargeBudget(repo.ConnectionID); e != nil {
+			return nil, 0, e
+		}
 		rv, e := f.ListMergeRequestReviews(loadCtx, repo.ForgeProjectID, iid)
 		if e != nil {
 			return nil, 0, e
@@ -364,6 +397,9 @@ func (h *Handler) ListCIRuns(w http.ResponseWriter, r *http.Request) {
 	loadCtx := context.WithoutCancel(r.Context())
 	runsKey := forgeMemoPrefix(repo) + "ciruns|" + strconv.Itoa(limit)
 	runsV, err := h.memo().Do(runsKey, forgeMemoTTL, func() (any, int, error) {
+		if e := h.chargeBudget(repo.ConnectionID); e != nil {
+			return nil, 0, e
+		}
 		runs, e := f.ListWorkflowRuns(loadCtx, repo.ForgeProjectID, forge.ListWorkflowRunsOptions{Limit: limit})
 		if e != nil {
 			return nil, 0, e
@@ -413,6 +449,9 @@ func (h *Handler) GetCIRun(w http.ResponseWriter, r *http.Request) {
 	detail := apitypes.CIRunDetailDTO{CIRunDTO: apitypes.CIRunDTO{ID: runID}, Jobs: []apitypes.CIJobDTO{}}
 	jobsKey := forgeMemoPrefix(repo) + "cijobs|" + strconv.FormatInt(runID, 10)
 	jobsV, err := h.memo().Do(jobsKey, forgeMemoTTL, func() (any, int, error) {
+		if e := h.chargeBudget(repo.ConnectionID); e != nil {
+			return nil, 0, e
+		}
 		jobs, e := f.ListPipelineJobs(loadCtx, repo.ForgeProjectID, runID)
 		if e != nil {
 			return nil, 0, e

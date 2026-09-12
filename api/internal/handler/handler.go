@@ -73,6 +73,15 @@ type Handler struct {
 	// race-safe under -race without every construction site having to set the field.
 	forgeMemo     *forgememo.Cache
 	forgeMemoOnce sync.Once
+	// forgeBudget is the per-connection outbound SPEND budget over interactive forge
+	// reads (PRD #1255 D4): a token bucket refilling at cfg.ForgeInteractiveRateMax
+	// calls/min, charged at the forge-call site of the forge-view routes so the
+	// enrichment fan-out is charged too and an interactive reader cannot starve the
+	// poller (both ride the same PAT). Accessed only through budget(), which lazily
+	// constructs it under forgeBudgetOnce so a struct-literal test Handler (cliLiveDB)
+	// never nil-panics, mirroring forgeMemo/memo(). New sets it directly.
+	forgeBudget     *forgeBudget
+	forgeBudgetOnce sync.Once
 	// box is the generic secret cipher used by the per-user secret endpoints
 	// (Anthropic token). svc owns the forge-specific machinery (which also holds
 	// its own box for PAT sealing); the two share the same key material.
@@ -394,6 +403,21 @@ func (h *Handler) memo() *forgememo.Cache {
 	return h.forgeMemo
 }
 
+// budget returns the per-connection interactive-read outbound spend budget (PRD #1255
+// D4), constructing it lazily and exactly once. New sets h.forgeBudget directly; this
+// accessor covers a struct-literal test Handler (cliLiveDB) where New did not run, so
+// the forge-view routes never dereference a nil budget. It is built from
+// cfg.ForgeInteractiveRateMax with h.now as the clock (both zero on a struct-literal
+// handler: max 0 reads as unlimited, a nil clock defaults to time.Now). Mirrors memo().
+func (h *Handler) budget() *forgeBudget {
+	h.forgeBudgetOnce.Do(func() {
+		if h.forgeBudget == nil {
+			h.forgeBudget = newForgeBudget(h.cfg.ForgeInteractiveRateMax, h.now)
+		}
+	})
+	return h.forgeBudget
+}
+
 // vaultNoticeClaimer is the narrow slice of *store.Queries VaultLock touches to pre-ack a
 // deliberate lock (PRD #890 D6). Kept narrow, and injectable via vaultNoticeStore, so the
 // pre-ack can be unit-tested without a live database. *store.Queries satisfies it.
@@ -440,7 +464,7 @@ func New(pool *pgxpool.Pool, q *store.Queries, cfg config.Config, box *secretbox
 	// too (PRD #590 M1): the run-now scheduler is nil-safe on the vault (treated as always
 	// unlocked), so a manual self_improve run-now never skips on a vault it cannot see here.
 	scheduler := schedsvc.New(q, wsvc, svc, set, nil, nil, 0, slog.Default())
-	return &Handler{pool: pool, q: q, cfg: cfg, box: box, svc: svc, wsvc: wsvc, pcheck: pcheck, hub: h, settings: set, scheduler: scheduler, forgeMemo: forgememo.New(forgeMemoEntries, forgeMemoMaxBytes), version: "dev", now: time.Now, startedAt: time.Now()}
+	return &Handler{pool: pool, q: q, cfg: cfg, box: box, svc: svc, wsvc: wsvc, pcheck: pcheck, hub: h, settings: set, scheduler: scheduler, forgeMemo: forgememo.New(forgeMemoEntries, forgeMemoMaxBytes), forgeBudget: newForgeBudget(cfg.ForgeInteractiveRateMax, time.Now), version: "dev", now: time.Now, startedAt: time.Now()}
 }
 
 // SetVersion stamps the server build version served at GET /api/version. Called
