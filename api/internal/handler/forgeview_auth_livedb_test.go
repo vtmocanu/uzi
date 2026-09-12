@@ -159,7 +159,12 @@ func TestForgeViewRoutesAuthLiveDB(t *testing.T) {
 
 	// The following M2b subtests reconfigure the injected forge per case. They run AFTER
 	// the table + ci_fix subtests above (t.Run executes in call order), so reassigning
-	// h.forgeFactory here never perturbs the default-behavior cases already run.
+	// h.forgeFactory here never perturbs the default-behavior cases already run. Since
+	// M2b wired the forgememo under these routes, a subtest that re-requests a repo the
+	// table cases already hit would be served the cached refs/summary rather than its
+	// reconfigured fake; the two ListPulls cases therefore each seed their OWN enabled
+	// repo (a distinct tenant prefix → cold memo), and the two GetPull cases use iids no
+	// earlier case requested (cold summary keys), so each reconfigured fake is consulted.
 
 	// GetPull: a PR that EXISTS but is not open (closed/merged/locked) must 404 — the
 	// forge returns a summary with no error, so only the `s.State != MRStateOpened` guard
@@ -195,13 +200,14 @@ func TestForgeViewRoutesAuthLiveDB(t *testing.T) {
 	// through writeForgeError to 502 — the list would not return 200 with A at all.
 	t.Run("pulls_list_skips_raced_closed", func(t *testing.T) {
 		const iidA, iidB = 11, 22
+		repo := rmSeedRepo(t, pool, connID, 1255004, true) // fresh repo → cold memo for this case
 		h.forgeFactory = func(string, string, []byte) (forge.Forge, error) {
 			return &fakeForgeView{
 				refs:       []forge.MergeRequestRef{{IID: iidA, HeadSHA: "aaa"}, {IID: iidB, HeadSHA: "bbb"}},
 				summaryErr: map[int64]error{iidB: forge.ErrMergeRequestNotFound},
 			}, nil
 		}
-		rec := bearerReq(router, http.MethodGet, fmt.Sprintf("/api/repos/%s/pulls", enabled), uzc)
+		rec := bearerReq(router, http.MethodGet, fmt.Sprintf("/api/repos/%s/pulls", repo), uzc)
 		if rec.Code != http.StatusOK {
 			t.Fatalf("Bearer GET pulls with one raced-closed = %d, want 200 (raced-closed skipped, not fatal)\nbody: %s", rec.Code, rec.Body.String())
 		}
@@ -224,13 +230,14 @@ func TestForgeViewRoutesAuthLiveDB(t *testing.T) {
 	// — the skip is not a blanket swallow of every per-iid error.
 	t.Run("pulls_list_real_error_502", func(t *testing.T) {
 		const iidA, iidB = 11, 22
+		repo := rmSeedRepo(t, pool, connID, 1255005, true) // fresh repo → cold memo for this case
 		h.forgeFactory = func(string, string, []byte) (forge.Forge, error) {
 			return &fakeForgeView{
 				refs:       []forge.MergeRequestRef{{IID: iidA, HeadSHA: "aaa"}, {IID: iidB, HeadSHA: "bbb"}},
 				summaryErr: map[int64]error{iidB: errors.New("boom")},
 			}, nil
 		}
-		rec := bearerReq(router, http.MethodGet, fmt.Sprintf("/api/repos/%s/pulls", enabled), uzc)
+		rec := bearerReq(router, http.MethodGet, fmt.Sprintf("/api/repos/%s/pulls", repo), uzc)
 		if rec.Code != http.StatusBadGateway {
 			t.Fatalf("Bearer GET pulls with a non-sentinel error = %d, want 502 (only ErrMergeRequestNotFound is skipped)\nbody: %s", rec.Code, rec.Body.String())
 		}

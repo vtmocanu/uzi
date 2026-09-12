@@ -4,14 +4,22 @@ package handler
 // drill-in with checks/reviews/merge) and CI runs (list + drill-in with jobs/steps).
 // The routes are owner-scoped (repoForRequest) AND enabled-gated (a disabled repo has
 // no forge view, so it 404s like an unknown one), carry the per-user forge budget, and
-// read the forge on-demand through the connection PAT — nothing is persisted (D4). In
-// M2a the forge is called directly, with no memo/ETag (that is M2b). Every forge error
-// is already PAT-redacted by the driver; a *forge.RateLimitError maps to 429 +
-// Retry-After, ErrForgeVersionUnsupported to an honest empty state, other errors to 502.
+// read the forge on-demand through the connection PAT — nothing is persisted (D4).
+// Every forge read rides the tenant-scoped forgememo (M2b): a short-TTL + singleflight
+// memo keyed by forgeMemoPrefix, so N terminals polling one route cost one forge
+// round-trip per TTL window and an unchanged PR costs zero enrichment; the per-PR
+// enrichment fans out through a bounded pool (forgeMemoFanout). The GitHub ETag
+// transport and the per-connection outbound budget / rate-shedding are a later M2b
+// unit — not here. Every forge error is already PAT-redacted by the driver; a
+// *forge.RateLimitError maps to 429 + Retry-After (uncached through Do),
+// ErrForgeVersionUnsupported to an honest empty state, other errors to 502.
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -19,6 +27,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/forge"
@@ -41,7 +50,45 @@ const (
 	// forgeViewUnsupportedMsg is the honest empty-state sentence for a forge version
 	// without the CI-runs endpoint (ErrForgeVersionUnsupported).
 	forgeViewUnsupportedMsg = "CI runs are not available on this forge version"
+
+	// forgeMemoEntries / forgeMemoMaxBytes bound the process-wide forge-view read memo
+	// (PRD #1255 D4): an LRU of 256 entries, with values over 512 KiB returned to the
+	// caller but never stored. The forge-view DTOs are small, so the byte cap rarely
+	// bites. Referenced by New (handler.go) and memo() (handler.go).
+	forgeMemoEntries  = 256
+	forgeMemoMaxBytes = 512 * 1024
+	// forgeMemoTTL is the memo freshness window (D4): within it, N terminals polling a
+	// route cost one forge round-trip and an unchanged PR costs zero enrichment calls.
+	forgeMemoTTL = 5 * time.Second
+	// forgeMemoFanout bounds the per-PR summary fan-out ListPulls runs, so a burst of
+	// enrichment calls never trips a forge's secondary rate limit (D4: a pool of 4).
+	forgeMemoFanout = 4
 )
+
+// forgeMemoPrefix builds the tenant-scoped key prefix every forge-view memo key starts
+// with (PRD #1255 D4). It ISOLATES tenants: singleflight collapses concurrent misses on
+// one key, so an under-scoped key would serve connection A's data to connection B. The
+// prefix is the connection identity + repo: the connection_id, a sha256 of the sealed
+// token ciphertext (so a rotated PAT — different ciphertext — misses naturally and two
+// connections never share an entry), and the repo id (an iid like PR #5 exists on every
+// repo, so no key may start below the repo). The RAW token never enters the key — only
+// its hash. The trailing "|" keeps the per-route suffix from abutting the repo id.
+func forgeMemoPrefix(repo store.GetRepoForUserRow) string {
+	sum := sha256.Sum256(repo.TokenCiphertext)
+	return fmt.Sprintf("%s|%x|%s|", repo.ConnectionID, sum, repo.ID)
+}
+
+// memoSize is the cheap byte-size estimate the memo's LRU/512-KiB ceiling uses: the
+// length of the value's JSON encoding. The forge-view values are small structs, so an
+// exact accounting is not worth the cost; a marshal failure (never expected for these
+// plain DTO-shaped structs) reports 0 so the value is still cached as a tiny entry.
+func memoSize(v any) int {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return 0
+	}
+	return len(b)
+}
 
 // forgeViewRepo runs the owner-scope preflight AND the enabled gate shared by every
 // forge-view route: repoForRequest 404s an unknown/foreign repo, and a disabled repo
@@ -100,10 +147,15 @@ func forgeRetryAfterSeconds(rl *forge.RateLimitError) int {
 // ListPulls serves GET /api/repos/{id}/pulls: the repo's open PRs as list rows, each
 // linked to the newest uzi run on that (repo, mr_iid). It reads the cheap open-PR refs
 // in one list call (ListMergeRequestRefs), then a per-iid GetMergeRequestSummary for
-// each (a SEQUENTIAL loop for now — the pool-of-4 + memo is M2b part 2). It must NOT
-// fan out a per-PR checks call (checks appear on the drill-in, D4). A PR that raced
-// closed between the refs list and its summary fetch (ErrMergeRequestNotFound) is
-// SKIPPED, not fatal — the list still returns the PRs that survived.
+// each, fanned out through a bounded pool of forgeMemoFanout (D4). Both layers ride the
+// tenant-scoped memo (M2b): the refs call is keyed on (state,limit) so N terminals cost
+// one round-trip per TTL, and each per-PR summary is keyed on the ref's UpdatedAt — the
+// CHANGE KEY — so an unchanged PR within the TTL window costs zero calls while a PR
+// whose activity moved gets a fresh key and reloads. It must NOT fan out a per-PR checks
+// call (checks appear on the drill-in, D4). A PR that raced closed between the refs list
+// and its summary fetch (ErrMergeRequestNotFound) is SKIPPED, not fatal; any other
+// per-PR error aborts the request (writeForgeError). The run_id linkage (newestRunIDForMR,
+// a cheap local DB read) is deliberately NOT memoised.
 func (h *Handler) ListPulls(w http.ResponseWriter, r *http.Request) {
 	repo, ok := h.forgeViewRepo(w, r)
 	if !ok {
@@ -115,25 +167,70 @@ func (h *Handler) ListPulls(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	refs, err := f.ListMergeRequestRefs(r.Context(), repo.ForgeProjectID,
-		forge.ListMergeRequestsOptions{State: forge.MRStateOpened, Limit: forgeViewPullsLimit})
+	ctx := r.Context()
+	prefix := forgeMemoPrefix(repo)
+
+	refsKey := prefix + "refs|" + forge.MRStateOpened + "|" + strconv.Itoa(forgeViewPullsLimit)
+	refsV, err := h.memo().Do(refsKey, forgeMemoTTL, func() (any, int, error) {
+		refs, e := f.ListMergeRequestRefs(ctx, repo.ForgeProjectID,
+			forge.ListMergeRequestsOptions{State: forge.MRStateOpened, Limit: forgeViewPullsLimit})
+		if e != nil {
+			return nil, 0, e
+		}
+		return refs, memoSize(refs), nil
+	})
 	if err != nil {
 		h.writeForgeError(w, "list pulls", err)
 		return
 	}
-	pulls := make([]apitypes.PullDTO, 0, len(refs))
-	for _, ref := range refs {
-		s, err := f.GetMergeRequestSummary(r.Context(), repo.ForgeProjectID, ref.IID)
-		if err != nil {
-			if errors.Is(err, forge.ErrMergeRequestNotFound) {
-				continue // raced closed between the list and the fetch — skip, don't fail the list
+	refs := refsV.([]forge.MergeRequestRef)
+
+	// Fan the per-PR enrichment out through a pool bounded at forgeMemoFanout. Each
+	// goroutine writes only its own results[i], so the pre-sized, position-indexed slice
+	// carries no data race (distinct elements) and preserves the input ref order; the
+	// errgroup's zero value does NOT cancel on error, so g.Wait returns the first
+	// non-sentinel error while every goroutine (and its memo entry) runs to completion —
+	// which also keeps the memo's singleflight free of a shared context cancellation.
+	type pullResult struct {
+		dto  apitypes.PullDTO
+		skip bool // raced closed (ErrMergeRequestNotFound) — omitted from the list
+	}
+	results := make([]pullResult, len(refs))
+	var g errgroup.Group
+	g.SetLimit(forgeMemoFanout)
+	for i, ref := range refs {
+		g.Go(func() error {
+			sumKey := prefix + "sum|" + strconv.FormatInt(ref.IID, 10) + "|" + ref.UpdatedAt.UTC().Format(time.RFC3339Nano)
+			v, e := h.memo().Do(sumKey, forgeMemoTTL, func() (any, int, error) {
+				s, se := f.GetMergeRequestSummary(ctx, repo.ForgeProjectID, ref.IID)
+				if se != nil {
+					return nil, 0, se
+				}
+				return s, memoSize(s), nil
+			})
+			if e != nil {
+				if errors.Is(e, forge.ErrMergeRequestNotFound) {
+					results[i].skip = true
+					return nil // raced closed between the list and the fetch — skip, don't fail the list
+				}
+				return e
 			}
-			h.writeForgeError(w, "get pull summary", err)
-			return
+			p := pullDTOFromSummary(v.(forge.MergeRequestSummary))
+			p.RunID = h.newestRunIDForMR(ctx, repo.ID, ref.IID)
+			results[i].dto = p
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		h.writeForgeError(w, "get pull summary", err)
+		return
+	}
+	pulls := make([]apitypes.PullDTO, 0, len(refs))
+	for _, res := range results {
+		if res.skip {
+			continue
 		}
-		p := pullDTOFromSummary(s)
-		p.RunID = h.newestRunIDForMR(r.Context(), repo.ID, ref.IID)
-		pulls = append(pulls, p)
+		pulls = append(pulls, res.dto)
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"pulls": pulls})
 }
@@ -161,7 +258,22 @@ func (h *Handler) GetPull(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	s, err := f.GetMergeRequestSummary(r.Context(), repo.ForgeProjectID, iid)
+	ctx := r.Context()
+	prefix := forgeMemoPrefix(repo)
+	iidStr := strconv.FormatInt(iid, 10)
+
+	// Each of the three forge reads is memoised separately under the tenant prefix so a
+	// drill-in polled by several terminals collapses to one round-trip per read per TTL.
+	// The summary key is iid-only (the detail view has no UpdatedAt change key — that is
+	// the list route's job); the 404 / non-open guards run AFTER the fetch and propagate
+	// uncached through Do (errors are never memoised).
+	sumV, err := h.memo().Do(prefix+"pull|"+iidStr, forgeMemoTTL, func() (any, int, error) {
+		s, e := f.GetMergeRequestSummary(ctx, repo.ForgeProjectID, iid)
+		if e != nil {
+			return nil, 0, e
+		}
+		return s, memoSize(s), nil
+	})
 	if err != nil {
 		if errors.Is(err, forge.ErrMergeRequestNotFound) {
 			httpx.Error(w, http.StatusNotFound, "pull request not found")
@@ -170,27 +282,42 @@ func (h *Handler) GetPull(w http.ResponseWriter, r *http.Request) {
 		h.writeForgeError(w, "get pull", err)
 		return
 	}
+	s := sumV.(forge.MergeRequestSummary)
 	if s.State != forge.MRStateOpened {
 		httpx.Error(w, http.StatusNotFound, "pull request not found")
 		return
 	}
-	checks, err := f.ListChecks(r.Context(), repo.ForgeProjectID, s.HeadSHA)
+	checksV, err := h.memo().Do(prefix+"checks|"+s.HeadSHA, forgeMemoTTL, func() (any, int, error) {
+		cs, e := f.ListChecks(ctx, repo.ForgeProjectID, s.HeadSHA)
+		if e != nil {
+			return nil, 0, e
+		}
+		return cs, memoSize(cs), nil
+	})
 	if err != nil {
 		h.writeForgeError(w, "list checks", err)
 		return
 	}
-	reviews, err := f.ListMergeRequestReviews(r.Context(), repo.ForgeProjectID, iid)
+	checks := checksV.([]forge.Check)
+	reviewsV, err := h.memo().Do(prefix+"reviews|"+iidStr, forgeMemoTTL, func() (any, int, error) {
+		rv, e := f.ListMergeRequestReviews(ctx, repo.ForgeProjectID, iid)
+		if e != nil {
+			return nil, 0, e
+		}
+		return rv, memoSize(rv), nil
+	})
 	if err != nil {
 		h.writeForgeError(w, "list reviews", err)
 		return
 	}
+	reviews := reviewsV.([]forge.Review)
 	detail := apitypes.PullDetailDTO{
 		PullDTO: pullDTOFromSummary(s),
 		Checks:  checkDTOs(checks),
 		Reviews: reviewDTOs(reviews),
 		Merge:   mergeStateDTO(s, checks),
 	}
-	detail.RunID = h.newestRunIDForMR(r.Context(), repo.ID, iid)
+	detail.RunID = h.newestRunIDForMR(ctx, repo.ID, iid)
 	httpx.JSON(w, http.StatusOK, detail)
 }
 
@@ -217,7 +344,15 @@ func (h *Handler) ListCIRuns(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	runs, err := f.ListWorkflowRuns(r.Context(), repo.ForgeProjectID, forge.ListWorkflowRunsOptions{Limit: limit})
+	ctx := r.Context()
+	runsKey := forgeMemoPrefix(repo) + "ciruns|" + strconv.Itoa(limit)
+	runsV, err := h.memo().Do(runsKey, forgeMemoTTL, func() (any, int, error) {
+		runs, e := f.ListWorkflowRuns(ctx, repo.ForgeProjectID, forge.ListWorkflowRunsOptions{Limit: limit})
+		if e != nil {
+			return nil, 0, e
+		}
+		return runs, memoSize(runs), nil
+	})
 	if err != nil {
 		if errors.Is(err, forge.ErrForgeVersionUnsupported) {
 			httpx.JSON(w, http.StatusOK, map[string]any{"runs": []apitypes.CIRunDTO{}, "unsupported": forgeViewUnsupportedMsg})
@@ -226,6 +361,7 @@ func (h *Handler) ListCIRuns(w http.ResponseWriter, r *http.Request) {
 		h.writeForgeError(w, "list ci runs", err)
 		return
 	}
+	runs := runsV.([]forge.WorkflowRun)
 	dtos := make([]apitypes.CIRunDTO, 0, len(runs))
 	for _, run := range runs {
 		dtos = append(dtos, ciRunDTO(run))
@@ -253,8 +389,16 @@ func (h *Handler) GetCIRun(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
+	ctx := r.Context()
 	detail := apitypes.CIRunDetailDTO{CIRunDTO: apitypes.CIRunDTO{ID: runID}, Jobs: []apitypes.CIJobDTO{}}
-	jobs, err := f.ListPipelineJobs(r.Context(), repo.ForgeProjectID, runID)
+	jobsKey := forgeMemoPrefix(repo) + "cijobs|" + strconv.FormatInt(runID, 10)
+	jobsV, err := h.memo().Do(jobsKey, forgeMemoTTL, func() (any, int, error) {
+		jobs, e := f.ListPipelineJobs(ctx, repo.ForgeProjectID, runID)
+		if e != nil {
+			return nil, 0, e
+		}
+		return jobs, memoSize(jobs), nil
+	})
 	if err != nil {
 		if errors.Is(err, forge.ErrForgeVersionUnsupported) {
 			detail.Unsupported = forgeViewUnsupportedMsg
@@ -264,7 +408,7 @@ func (h *Handler) GetCIRun(w http.ResponseWriter, r *http.Request) {
 		h.writeForgeError(w, "ci run jobs", err)
 		return
 	}
-	detail.Jobs = ciJobDTOs(jobs)
+	detail.Jobs = ciJobDTOs(jobsV.([]forge.Job))
 	httpx.JSON(w, http.StatusOK, detail)
 }
 
