@@ -57,6 +57,33 @@ func TestSubmitInputExtendAcceptsMinimum(t *testing.T) {
 	}
 }
 
+// TestSubmitInputExtendQueuedRunSucceeds pins PRD #1189 D4: extend is allowed on any
+// non-terminal timed run, INCLUDING a parked (queued) one, so an owner can grant time the run
+// will need the moment it resumes. Both gates admit 'queued' — the Go terminal guard
+// (terminalStatuses = completed/failed/cancelled) and the CTE predicate (status NOT IN those
+// three) — and a future tightening of either to status='running' would silently break D4,
+// which this test would catch. A queued run has no wall deadline yet (runWallClock requires
+// 'running'), so DeadlineAt is nil while the extension is still written and returned.
+func TestSubmitInputExtendQueuedRunSucceeds(t *testing.T) {
+	fs, svc, user, runID := extendRunFixture(t, 57600)
+	fs.runByID.Status = "queued" // a parked run (started earlier, requeued); StartedAt stays set
+	fs.extendReturn = 3600
+
+	res, err := svc.SubmitInput(context.Background(), user, runID, "extend", "3600", nil)
+	if err != nil {
+		t.Fatalf("SubmitInput extend on a queued run: %v", err)
+	}
+	if fs.createdExtend == nil || fs.createdExtend.Secs != 3600 {
+		t.Fatalf("queued extend must reach CreateExtendInput with Secs=3600, got %+v", fs.createdExtend)
+	}
+	if res.ExtensionSeconds == nil || *res.ExtensionSeconds != 3600 {
+		t.Fatalf("result ExtensionSeconds = %v, want 3600", res.ExtensionSeconds)
+	}
+	if res.DeadlineAt != nil {
+		t.Fatalf("a queued (not-running) run has no wall deadline yet, want DeadlineAt nil, got %v", *res.DeadlineAt)
+	}
+}
+
 // TestSubmitInputExtendInvalidBody: a body that is not a whole number of seconds >= 60 is
 // rejected with ErrInvalidExtension BEFORE the cap is read or any row is written. 59 (below
 // the floor), 0, a negative, a non-integer and the empty string all reject.

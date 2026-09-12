@@ -78,6 +78,28 @@ func TestRunToDTOExtendBudgetTotalNilForChat(t *testing.T) {
 	}
 }
 
+// TestRunToDTOExtendBudgetUsedClampedAtZero pins the clamp: when banked pause time exceeds the
+// wall time since started_at (now - started_at - budget_paused_seconds < 0), budget_used_seconds
+// is clamped to 0 rather than reported negative. Here started_at is 10m before `now` but 1h of
+// pause is banked, so the raw figure is -3000s → clamped to 0. Without the clamp the field would
+// go negative and the header/chooser would show nonsense.
+func TestRunToDTOExtendBudgetUsedClampedAtZero(t *testing.T) {
+	dto := runToDTO(store.Run{
+		Kind:                "issue",
+		Status:              "running",
+		StartedAt:           pgtype.Timestamptz{Time: dtoTestNow.Add(-10 * time.Minute), Valid: true},
+		BudgetWallSeconds:   pgtype.Int4{Int32: 8 * 60 * 60, Valid: true},
+		BudgetPausedSeconds: 60 * 60, // 1h banked pause > 10m elapsed → raw used is negative
+	}, "normal", 2*time.Hour, 57600, dtoTestNow)
+
+	if dto.BudgetUsedSeconds == nil {
+		t.Fatal("budget_used_seconds must be non-nil when started_at is set, got nil")
+	}
+	if *dto.BudgetUsedSeconds != 0 {
+		t.Errorf("budget_used_seconds = %d, want 0 (clamped: 1h pause banked exceeds 10m elapsed)", *dto.BudgetUsedSeconds)
+	}
+}
+
 // TestRunToDTOExtendBudgetUsedNilWhenNotStarted pins that budget_used_seconds is null when the run
 // never started (started_at invalid): there is no active-time origin to measure from.
 func TestRunToDTOExtendBudgetUsedNilWhenNotStarted(t *testing.T) {

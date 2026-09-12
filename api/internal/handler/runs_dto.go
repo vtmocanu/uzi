@@ -360,9 +360,12 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 		dto.BudgetTotalSeconds = &total
 	}
 	// PRD #1189: budget_used_seconds is ACTIVE time so far — now - started_at - budget_paused,
-	// clamped at 0 — valid in every status (a paused/gated run reports a frozen figure) and nil
-	// when the run never started. This is the paused-aware "used" the header measures against
-	// the budget, NOT raw wall elapsed.
+	// clamped at 0 — valid in every status and nil when the run never started. It subtracts only
+	// BANKED pause time (budget_paused_seconds is credited at resume), so a currently-paused run's
+	// figure keeps creeping until resume banks the in-progress pause; that drift is display-only
+	// and self-corrects on resume — the sweep and the health arm, which own the kill, run only
+	// while status='running'. This is the paused-aware "used" the header measures against the
+	// budget (aged client-side for a running run), NOT raw wall elapsed.
 	if r.StartedAt.Valid {
 		used := int(now.Sub(r.StartedAt.Time).Seconds()) - int(r.BudgetPausedSeconds)
 		if used < 0 {
