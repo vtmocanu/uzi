@@ -2,7 +2,7 @@
 
 **Status**: Accepted (implemented, epic #1225, first child issue #1226, M1–M6)
 **Date**: 2026-09-12
-**PRD**: [prds/1226-structural-completion-interlock.md](../prds/1226-structural-completion-interlock.md) — carries the full milestone breakdown, code anchors and Decision Log D1–D8; this ADR restates the negative-space invariants a future edit to a claim clause, a hold's park order or a status list would break silently. ADR-1225 is created by #1226, the epic's first child, per the epic's own numbering convention.
+**PRD**: [prds/done/1226-structural-completion-interlock.md](../prds/done/1226-structural-completion-interlock.md) — carries the full milestone breakdown, code anchors and Decision Log D1–D8; this ADR restates the negative-space invariants a future edit to a claim clause, a hold's park order or a status list would break silently. ADR-1225 is created by #1226, the epic's first child, per the epic's own numbering convention.
 **Related**: reuses [ADR-1190](1190-run-pause-invariants.md)'s `paused`-status discipline for the dedicated hold transition, [ADR-628](0628-cross-worker-resume-durability.md)'s worker-affinity ceiling for the honest `same_worker_only` limitation, and [ADR-1197](1197-transient-recovery-park.md)'s verified-capture-before-park template for `captureHoldContext`.
 
 ## Decision (summary)

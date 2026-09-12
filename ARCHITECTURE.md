@@ -702,7 +702,7 @@ chain in the diagram above, with no intervening `running`.
   and the guards that must not be relaxed — that a future edit could break
   silently.
 
-- **running → paused (structural completion hold)** ([PRD #1226](prds/1226-structural-completion-interlock.md),
+- **running → paused (structural completion hold)** ([PRD #1226](prds/done/1226-structural-completion-interlock.md),
   rollout switch `completion_interlock_rollout`, default off). A distinct reason a
   run reaches `paused`, separate from an owner pause: an **interlocked** issue run
   (a versioned, frozen structural completion contract stamped before its first

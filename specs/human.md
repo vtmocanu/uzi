@@ -763,7 +763,7 @@ Mock at `prds/mockups/1167-lights-on-themes-mock.html`.
 
 ## Feature #1226 — Structural completion interlock
 
-Tracked as GitHub issue vtmocanu/uzi#1226 (parent epic #1225); PRD at `prds/1226-structural-completion-interlock.md`.
+Tracked as GitHub issue vtmocanu/uzi#1226 (parent epic #1225); PRD at `prds/done/1226-structural-completion-interlock.md`.
 
 - An issue run may open a closing PR only after every in-scope approved milestone is declared complete against a frozen contract for the exact final head, or the owner records an explicit later decision. An incomplete attempt returns to the same lead and otherwise holds without discarding its work. [user, #1226]
 
