@@ -75,6 +75,14 @@ export interface ForgeClient {
    *  caller treats a failed head-read as "cannot verify H" (NON-TERMINAL, keeps the
    *  session live). The PAT rides the auth header only, same as createMergeRequest. */
   getMergeRequestHead(repoUrl: string, pat: string, iid: number, signal?: AbortSignal): Promise<string>;
+  /** Forge-neutral, best-effort rewrite of an existing MR/PR body (PRD #1225, CodeRabbit
+   *  !1254). Used by the completion interlock to reconcile the `Closes #N` line: when the
+   *  interlock holds an unverified/unreadable PR head it rewrites the body to an unverified
+   *  variant that carries NO `Closes #N`, and on a verified completion it re-asserts the
+   *  canonical body. Each driver derives the single-item update URL and body-field name; the
+   *  https-only, redirect:"error" and transient-5xx guards are inherited from `request`.
+   *  Throws a ForgeError on a non-2xx so the caller can log-and-continue best-effort. */
+  updateMergeRequestDescription(repoUrl: string, pat: string, iid: number, description: string, signal?: AbortSignal): Promise<void>;
 }
 
 export interface ForgeClientOptions {
@@ -152,6 +160,21 @@ abstract class HttpForgeClient implements ForgeClient {
     return this.parseHead(await res.text());
   }
 
+  /**
+   * Rewrite an existing MR/PR body through the shared transport (PRD #1225). The
+   * single-item URL is the SAME resource as `headUrl` for all three drivers (GitLab
+   * `merge_requests/{iid}`, Forgejo/GitHub `pulls/{iid}`), so it is reused rather than
+   * duplicated. The HTTP method and body-field name are the only per-driver bits
+   * (updateMethod/updateBody): GitLab uses PUT + `description`, Forgejo/GitHub use
+   * PATCH + `body`. Any 2xx is success (GitLab/GitHub answer 200, Forgejo/Gitea 201).
+   * A non-2xx throws a ForgeError; the interlock caller treats a failed rewrite as
+   * best-effort and leaves the created MR/PR as-is.
+   */
+  async updateMergeRequestDescription(repoUrl: string, pat: string, iid: number, description: string, signal?: AbortSignal): Promise<void> {
+    const res = await this.request(this.updateMethod(), this.headUrl(repoUrl, iid), pat, this.updateBody(description), signal);
+    if (res.status < 200 || res.status >= 300) throw new ForgeError(res.status, (await safeText(res)).slice(0, 512));
+  }
+
   protected async request(
     method: string,
     url: string,
@@ -210,6 +233,18 @@ abstract class HttpForgeClient implements ForgeClient {
   /** Parse a 200 single-MR/PR response body into the validated 40-hex head SHA;
    *  throw a ForgeError when the head field is absent or malformed. */
   protected abstract parseHead(text: string): string;
+
+  /** HTTP method for the single-item body rewrite. PATCH is correct for Forgejo and
+   *  GitHub; GitLabClient overrides to PUT. */
+  protected updateMethod(): string {
+    return "PATCH";
+  }
+
+  /** Request body for the single-item body rewrite. Forgejo and GitHub name the field
+   *  `body`; GitLabClient overrides to `description`. */
+  protected updateBody(description: string): unknown {
+    return { body: description };
+  }
 }
 
 /** GitLab REST driver (`/api/v4`, `PRIVATE-TOKEN` header). */
@@ -260,6 +295,15 @@ export class GitLabClient extends HttpForgeClient {
     const head = parseGitlabHead(safeJson(text));
     if (!head) throw new ForgeError(200, "merge request response missing a valid head sha");
     return head;
+  }
+
+  /** GitLab rewrites the MR resource with PUT and a `description` field (not PATCH/`body`). */
+  protected override updateMethod(): string {
+    return "PUT";
+  }
+
+  protected override updateBody(description: string): unknown {
+    return { description };
   }
 }
 

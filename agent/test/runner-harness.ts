@@ -119,6 +119,11 @@ export function fakeGitlab(opts: FakeForgeOpts = {}): { gitlab: GitLabClient; ca
       const status = opts.headStatus ?? 200;
       return { status, text: async () => JSON.stringify({ sha: opts.head ?? "" }) };
     }
+    // PRD #1225 (CodeRabbit !1254): the interlock reconcile rewrites the MR body (GitLab uses
+    // PUT). Answer 2xx so updateMergeRequestDescription succeeds; the call stays captured in `calls`.
+    if (init.method === "PUT" || init.method === "PATCH") {
+      return { status: 200, text: async () => "{}" };
+    }
     return {
       status: 201,
       text: async () =>
@@ -146,6 +151,11 @@ export function fakeForgejo(opts: FakeForgeOpts = {}): { forgejo: ForgejoClient;
       const status = opts.headStatus ?? 200;
       return { status, text: async () => JSON.stringify({ head: { sha: opts.head ?? "" } }) };
     }
+    // PRD #1225 (CodeRabbit !1254): the interlock reconcile rewrites the PR body (Forgejo uses
+    // PATCH). Answer 2xx so updateMergeRequestDescription succeeds; the call stays captured in `calls`.
+    if (init.method === "PUT" || init.method === "PATCH") {
+      return { status: 200, text: async () => "{}" };
+    }
     return {
       status: 201,
       text: async () =>
@@ -172,6 +182,11 @@ export function fakeGitHub(opts: FakeForgeOpts = {}): { github: GitHubClient; ca
     if (init.method === "GET") {
       const status = opts.headStatus ?? 200;
       return { status, text: async () => JSON.stringify({ head: { sha: opts.head ?? "" } }) };
+    }
+    // PRD #1225 (CodeRabbit !1254): the interlock reconcile rewrites the PR body (GitHub uses
+    // PATCH). Answer 2xx so updateMergeRequestDescription succeeds; the call stays captured in `calls`.
+    if (init.method === "PUT" || init.method === "PATCH") {
+      return { status: 200, text: async () => "{}" };
     }
     return {
       status: 201,

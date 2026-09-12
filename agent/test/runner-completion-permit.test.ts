@@ -48,6 +48,15 @@ function mrPostBody(calls: { method: string; body?: string }[]): Record<string, 
   return JSON.parse(post.body ?? "{}") as Record<string, unknown>;
 }
 
+/** PRD #1225 (CodeRabbit !1254): the reconcile rewrite is a PUT on GitLab (updateMergeRequestDescription).
+ *  Return the LAST PUT's parsed body, so a success path that reconciles once (re-assert) and a hold path
+ *  that reconciles once (unverified) both resolve to the write that actually landed on the MR. */
+function mrPutBody(calls: { method: string; body?: string }[]): Record<string, unknown> {
+  const puts = calls.filter((c) => c.method === "PUT");
+  assert.ok(puts.length > 0, "the MR description was reconciled (a PUT reached the forge)");
+  return JSON.parse(puts[puts.length - 1]!.body ?? "{}") as Record<string, unknown>;
+}
+
 describe("RunRunner — completion permit + PR-head verification (PRD #1226 M4 D5)", () => {
   it("granted + PR head matches H → opens the MR with Closes, and completes WITH head H", async () => {
     const { gitlab, calls } = fakeGitlab({ head: H });
@@ -73,6 +82,10 @@ describe("RunRunner — completion permit + PR-head verification (PRD #1226 M4 D
     assert.strictEqual(done!.mr_iid, 42);
     // No hold was needed.
     assert.strictEqual(api.completionHoldRequests.length, 0, "a clean interlocked completion never holds");
+    // PRD #1225 (CodeRabbit !1254): on the verified success path the MR body is re-asserted to the
+    // canonical Closes variant (a no-op on this freshly-created MR, a REPAIR on an adopted one).
+    const reassert = mrPutBody(calls);
+    assert.match(String(reassert.description), /Closes #1300/, "the verified completion keeps the MR authoritative WITH Closes");
   });
 
   it("permit DENIED → never creates the MR, never completes, holds the run", async () => {
@@ -109,6 +122,35 @@ describe("RunRunner — completion permit + PR-head verification (PRD #1226 M4 D
     // A head mismatch must not report completed; the run holds.
     assert.ok(!statuses(claim.run_id).includes("completed"), "a PR-head mismatch never completes");
     assert.strictEqual(api.completionHoldRequests.length, 1, "a PR-head mismatch holds the run");
+    // PRD #1225 (CodeRabbit !1254): before holding, the MR body is reconciled to the unverified
+    // variant so a human merge cannot close the issue for an unverified head — NO Closes, WITH banner.
+    const reconciled = mrPutBody(calls);
+    assert.doesNotMatch(String(reconciled.description), /Closes #/, "the held MR no longer carries Closes");
+    assert.match(String(reconciled.description), /Completion unverified/, "the held MR body warns the completion is unverified");
+  });
+
+  it("granted but the PR head read THROWS → MR is created, run holds, and the body is reconciled off Closes", async () => {
+    // A non-200 single-item GET makes getMergeRequestHead throw a ForgeError (the "cannot verify"
+    // branch), distinct from the value-mismatch branch above.
+    const { gitlab, calls } = fakeGitlab({ head: H, headStatus: 404 });
+    const claim = interlockedClaim(1305);
+    api.setCompletionPermitResponse(true);
+    git.trackingTip = (async () => H) as typeof git.trackingTip;
+
+    await runnerWith(() => ({ executor: new StubExecutor(nullLogger()) }), gitlab, undefined, undefined, {
+      recoveryRetryMs: 1,
+    }).execute(claim);
+
+    // The MR exists (create-then-verify) and the head read was attempted (a GET) before it threw.
+    assert.ok(calls.some((c) => c.method === "POST"), "the MR was created before the head verify");
+    assert.ok(calls.some((c) => c.method === "GET"), "the PR head read was attempted");
+    // An unreadable head must not report completed; the run holds.
+    assert.ok(!statuses(claim.run_id).includes("completed"), "an unreadable PR head never completes");
+    assert.strictEqual(api.completionHoldRequests.length, 1, "an unreadable PR head holds the run");
+    // PRD #1225 (CodeRabbit !1254): before holding, the MR body is reconciled off Closes with the banner.
+    const reconciled = mrPutBody(calls);
+    assert.doesNotMatch(String(reconciled.description), /Closes #/, "the held MR no longer carries Closes");
+    assert.match(String(reconciled.description), /Completion unverified/, "the held MR body warns the completion is unverified");
   });
 
   it("permit request THROWS (transport/HTTP error) → the run does not falsely complete", async () => {

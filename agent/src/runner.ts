@@ -2319,6 +2319,49 @@ export class RunRunner {
     // commit than the permit was bound to) or a read that THREW (a ForgeError = cannot verify) must
     // NOT report completed — the run holds with its MR already open. A legacy run has no completionHead
     // and never reads the PR head, so this block is skipped and its completion is unchanged.
+    //
+    // PRD #1225 (CodeRabbit !1254): the MR was created with a `Closes #N` body BEFORE this
+    // verification. Both hold branches would otherwise leave that closing body published, so a
+    // human merge of an unverified head would close the issue. reconcileMrDescription rewrites the
+    // body to an unverified variant (no `Closes #N`, with a banner) before each hold, and re-asserts
+    // the canonical `Closes #N` body on the verified success path (a no-op on a freshly-created MR,
+    // a REPAIR of an ADOPTED MR whose body a prior hold reconciled). Best-effort: a rewrite failure
+    // is logged and the created MR is left as-is. The whole block is skipped for a legacy run
+    // (completionHead === undefined), so its completion is byte-for-byte unchanged.
+    const UNVERIFIED_BANNER =
+      "> ⚠️ **Completion unverified.** uzi could not confirm this merge request's head matches the permitted completion head, so the run was held for owner review. This merge request does NOT close its issue and must not be merged as a completion until re-verified.";
+    const reconcileMrDescription = async (withCloses: boolean, banner?: string): Promise<void> => {
+      try {
+        const base = mrDescription(
+          claim,
+          result.branch,
+          result.agentSelection,
+          selfImproveSection,
+          promptGuardSection,
+          result.gatesUnverified,
+          result.gatesDiscoveryTruncated,
+          result.scopeCapped,
+          withCloses,
+        );
+        const desc = banner ? `${banner}\n\n${base}` : base;
+        await withForgeRetry(
+          () =>
+            forge.updateMergeRequestDescription(
+              claim.repo.url,
+              claim.secrets.forge_pat,
+              mr.iid,
+              desc,
+              boundarySignal,
+            ),
+          { log: runLog, signal: boundarySignal },
+        );
+      } catch (e) {
+        runLog.warn(
+          "completion interlock: could not reconcile the MR description; leaving the created MR as-is",
+          { run_id: runId, error: errMessage(e) },
+        );
+      }
+    };
     if (completionHead !== undefined) {
       let prHead: string;
       try {
@@ -2333,6 +2376,7 @@ export class RunRunner {
           run_id: runId,
           error: errMessage(e),
         });
+        await reconcileMrDescription(false, UNVERIFIED_BANNER);
         await holdOrFailInterlocked("pr head mismatch");
         return;
       }
@@ -2340,9 +2384,14 @@ export class RunRunner {
         runLog.info("completion interlock: PR head does not match the permitted head; holding", {
           run_id: runId,
         });
+        await reconcileMrDescription(false, UNVERIFIED_BANNER);
         await holdOrFailInterlocked("pr head mismatch");
         return;
       }
+      // Verified: re-assert the canonical `Closes #N` body. No-op on a freshly-created MR (already
+      // canonical), a repair on an ADOPTED MR whose body a prior hold rewrote to the unverified
+      // variant.
+      await reconcileMrDescription(true);
     }
 
     // Persist the MR/PR web URL the forge just handed us (PRD #65 D8), so the web

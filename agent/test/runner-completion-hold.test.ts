@@ -29,22 +29,39 @@ const CAPTURED_HEAD = "cafef00dcafef00dcafef00dcafef00dcafef00d";
 interface HoldProbe {
   executor: Executor;
   held: { value: boolean | undefined };
+  /** PRD #1225 (CodeRabbit !1254): number of verifyRunnerTrackingCovers calls = capture attempts the
+   *  bounded retry loop actually ran. Lets a test pin the retry count against a "shrink attempts to 1"
+   *  or "drop the try/catch" mutant. */
+  captureAttempts: { count: number };
 }
 
-// makeHoldExecutor returns an executor whose run() stubs the capture git to the given `verified`
-// verdict, calls ctx.enterCompletionHold, and — modelling the sdk-executor call sites — latches
-// completionHeld on a true return (the hold was entered) or THROWS the legacy terminal error on a
-// false return (kept live, falls back to the legacy throw). It records the boolean for the test.
-function makeHoldExecutor(verified: boolean): HoldProbe {
+// makeHoldExecutor returns an executor whose run() stubs the capture git to the given verdict, calls
+// ctx.enterCompletionHold, and — modelling the sdk-executor call sites — latches completionHeld on a
+// true return (the hold was entered) or THROWS the legacy terminal error on a false return (kept
+// live, falls back to the legacy throw). It records the boolean for the test.
+//
+// `verdict` is either a single constant verdict (used by every attempt) or a SCRIPT of per-attempt
+// verdicts (`"throw"` makes verifyRunnerTrackingCovers throw that attempt, a boolean makes it
+// return that value). The script drives enterCompletionHold's bounded capture-retry loop across a
+// throw, a false, and a true so the loop — not a single constant verdict — is exercised.
+function makeHoldExecutor(verdict: boolean | Array<"throw" | boolean>): HoldProbe {
   const held: { value: boolean | undefined } = { value: undefined };
+  const captureAttempts = { count: 0 };
   const executor: Executor = {
     run: async (ctx: RunContext) => {
       // Stub the capture git deterministically (the runner already seeded the real clone).
       git.worktreeStatus = (async () => []) as typeof git.worktreeStatus; // clean tree
       git.fetchAgentBranch = (async () =>
         `refs/uzi-runner/${ctx.branch}`) as typeof git.fetchAgentBranch;
-      git.verifyRunnerTrackingCovers = (async () =>
-        verified) as typeof git.verifyRunnerTrackingCovers;
+      git.verifyRunnerTrackingCovers = (async () => {
+        // Count every attempt that reaches the positive-verify step (one per capture attempt).
+        const i = captureAttempts.count++;
+        const step = Array.isArray(verdict)
+          ? verdict[Math.min(i, verdict.length - 1)]!
+          : verdict;
+        if (step === "throw") throw new Error("capture attempt failed (scripted throw)");
+        return step;
+      }) as typeof git.verifyRunnerTrackingCovers;
       git.trackingTip = (async () => CAPTURED_HEAD) as typeof git.trackingTip;
       git.checkpointPack = (async () => null) as typeof git.checkpointPack; // publish is a no-op
 
@@ -55,7 +72,7 @@ function makeHoldExecutor(verified: boolean): HoldProbe {
       throw new Error("legacy terminal (kept live, could not hold)");
     },
   };
-  return { executor, held };
+  return { executor, held, captureAttempts };
 }
 
 function statuses(runId: string): string[] {
@@ -95,6 +112,40 @@ describe("RunRunner — recoverable completion hold (PRD #1226 M4 D6)", () => {
       assert.strictEqual(calls.length, 0, "a held run opens no MR");
       // The destructive cleanup did NOT run: the clone and the HOME are preserved for resume.
       assert.strictEqual(fs.existsSync(worktreeDirFor(1250)), true, "the runner clone is preserved");
+      assert.strictEqual(fs.existsSync(home.sentinel), true, "the run HOME (SDK session) is preserved");
+    } finally {
+      fs.rmSync(home.root, { recursive: true, force: true });
+    }
+  });
+
+  it("capture retries across throw→false→true: holds on the third attempt, preserving the clone and HOME (bounded retry loop)", async () => {
+    // The scripted verdict drives enterCompletionHold's bounded capture-retry loop: attempt 0 throws
+    // (the try/catch retains and retries), attempt 1 returns false (unverified ⇒ retry), attempt 2
+    // returns true (verified ⇒ capture, then request the hold). A "shrink attempts to 1" or "drop the
+    // try/catch" mutant would abort on the throw/false attempts before ever reaching the true verdict,
+    // so held.value would be false and no hold would be requested.
+    const { gitlab, calls } = fakeGitlab();
+    const { executor, held, captureAttempts } = makeHoldExecutor(["throw", false, true]);
+    const home = seedHome();
+    const claim = gitlabClaim(1253);
+    try {
+      api.setCompletionHoldResponse("paused", 200);
+      await runnerWith(() => ({ executor, homeDir: home.homeDir }), gitlab, undefined, undefined, {
+        recoveryRetryMs: 1,
+      }).execute(claim);
+
+      assert.strictEqual(captureAttempts.count, 3, "the bounded retry loop ran all three capture attempts (throw, false, true)");
+      assert.strictEqual(held.value, true, "the third, verified attempt entered the hold");
+      // The hold was requested exactly once, only after the retries produced a verified capture.
+      assert.strictEqual(api.completionHoldRequests.length, 1, "the hold was requested exactly once, after the retries");
+      assert.strictEqual(api.completionHoldRequests[0]!.runId, claim.run_id);
+      assert.strictEqual(api.completionHoldRequests[0]!.body.head, CAPTURED_HEAD, "the captured head H rode the hold request");
+      // A hold is non-terminal: no completed/failed report, and NO push/MR.
+      assert.ok(!statuses(claim.run_id).includes("completed"), "a held run is not completed");
+      assert.ok(!statuses(claim.run_id).includes("failed"), "a held run is not failed");
+      assert.strictEqual(calls.length, 0, "a held run opens no MR");
+      // The destructive cleanup did NOT run: the clone and the HOME are preserved for resume.
+      assert.strictEqual(fs.existsSync(worktreeDirFor(1253)), true, "the runner clone is preserved");
       assert.strictEqual(fs.existsSync(home.sentinel), true, "the run HOME (SDK session) is preserved");
     } finally {
       fs.rmSync(home.root, { recursive: true, force: true });
