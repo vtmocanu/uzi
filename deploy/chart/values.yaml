@@ -687,7 +687,7 @@ workers:
     # `dind`; nonRootlessImage is a plain `docker:*-dind` image (the retired GitLab pipeline used a `docker:28-dind` service for the same purpose).
     # One image ref serves both the sidecar and the tiny root socket-prep helper.
     rootlessImage: docker:29-dind-rootless@sha256:e17fa54c2ffd511d8407c746eec77f7814e6f74fe20caf822dad1870599984c0
-    nonRootlessImage: docker:29-dind@sha256:12e683a161823b2a839aeea999b9d960e6e1f9a97b1679ad6b441982e2d9cf07
+    nonRootlessImage: docker:29-dind@sha256:5efed980cba3fc126cf54e21a5a6ff8849d05b6e0623d6e7612f48e9cd6cd17e
     # Explicit image override: non-empty is used VERBATIM instead of the posture
     # selection above (still subject to the coherence fail-guard, which rejects a
     # -dind-rootless image with rootless:false, or a plain -dind image with
