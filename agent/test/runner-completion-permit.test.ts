@@ -58,7 +58,7 @@ function mrPutBody(calls: { method: string; body?: string }[]): Record<string, u
 }
 
 describe("RunRunner — completion permit + PR-head verification (PRD #1226 M4 D5)", () => {
-  it("granted + PR head matches H → opens the MR with Closes, and completes WITH head H", async () => {
+  it("granted + PR head matches H → opens the MR WITHOUT Closes, adds Closes only after verifying head H, and completes WITH head H", async () => {
     const { gitlab, calls } = fakeGitlab({ head: H });
     const claim = interlockedClaim(1300);
     api.setCompletionPermitResponse(true);
@@ -73,7 +73,7 @@ describe("RunRunner — completion permit + PR-head verification (PRD #1226 M4 D
     assert.strictEqual(api.completionPermitRequests[0]!.body.branch, "agent/issue-1300");
     // The MR was created and the PR head was read back (a GET) to verify it.
     const body = mrPostBody(calls);
-    assert.match(String(body.description), /Closes #1300/, "a granted permit renders Closes");
+    assert.doesNotMatch(String(body.description), /Closes #/, "an interlocked MR is created WITHOUT Closes; the closing line is added only after head verification");
     assert.ok(calls.some((c) => c.method === "GET"), "the PR head was read to verify it");
     // Completed WITH head H (the permit-bound head rides the terminal report).
     const done = completedBody(claim.run_id);
@@ -82,10 +82,10 @@ describe("RunRunner — completion permit + PR-head verification (PRD #1226 M4 D
     assert.strictEqual(done!.mr_iid, 42);
     // No hold was needed.
     assert.strictEqual(api.completionHoldRequests.length, 0, "a clean interlocked completion never holds");
-    // PRD #1225 (CodeRabbit !1254): on the verified success path the MR body is re-asserted to the
-    // canonical Closes variant (a no-op on this freshly-created MR, a REPAIR on an adopted one).
+    // PRD #1225 (CodeRabbit !1254): the verified completion is the ONLY place Closes is written — the
+    // MR was created WITHOUT it, and the verified-head reconcile ADDS the canonical Closes body.
     const reassert = mrPutBody(calls);
-    assert.match(String(reassert.description), /Closes #1300/, "the verified completion keeps the MR authoritative WITH Closes");
+    assert.match(String(reassert.description), /Closes #1300/, "the verified completion is the ONLY place Closes is written");
   });
 
   it("permit DENIED → never creates the MR, never completes, holds the run", async () => {
@@ -122,6 +122,7 @@ describe("RunRunner — completion permit + PR-head verification (PRD #1226 M4 D
     // A head mismatch must not report completed; the run holds.
     assert.ok(!statuses(claim.run_id).includes("completed"), "a PR-head mismatch never completes");
     assert.strictEqual(api.completionHoldRequests.length, 1, "a PR-head mismatch holds the run");
+    assert.ok(!statuses(claim.run_id).includes("failed"), "a PR-head mismatch holds rather than fails");
     // PRD #1225 (CodeRabbit !1254): before holding, the MR body is reconciled to the unverified
     // variant so a human merge cannot close the issue for an unverified head — NO Closes, WITH banner.
     const reconciled = mrPutBody(calls);
@@ -147,6 +148,7 @@ describe("RunRunner — completion permit + PR-head verification (PRD #1226 M4 D
     // An unreadable head must not report completed; the run holds.
     assert.ok(!statuses(claim.run_id).includes("completed"), "an unreadable PR head never completes");
     assert.strictEqual(api.completionHoldRequests.length, 1, "an unreadable PR head holds the run");
+    assert.ok(!statuses(claim.run_id).includes("failed"), "an unreadable PR head holds rather than fails");
     // PRD #1225 (CodeRabbit !1254): before holding, the MR body is reconciled off Closes with the banner.
     const reconciled = mrPutBody(calls);
     assert.doesNotMatch(String(reconciled.description), /Closes #/, "the held MR no longer carries Closes");
@@ -167,6 +169,25 @@ describe("RunRunner — completion permit + PR-head verification (PRD #1226 M4 D
     // A transport error propagates to the generic terminal path; the run fails rather than completing.
     assert.ok(statuses(claim.run_id).includes("failed"), "the run fails on a permit transport error");
     assert.strictEqual(api.completionHoldRequests.length, 0, "a thrown permit request does not enter the hold");
+  });
+
+  it("granted + head matches H but the add-Closes reconcile FAILS → MR holds (no Closes), never completes", async () => {
+    const { gitlab, calls } = fakeGitlab({ head: H, putStatus: 404 });
+    const claim = interlockedClaim(1306);
+    api.setCompletionPermitResponse(true);
+    git.trackingTip = (async () => H) as typeof git.trackingTip;
+
+    await runnerWith(() => ({ executor: new StubExecutor(nullLogger()) }), gitlab, undefined, undefined, {
+      recoveryRetryMs: 1,
+    }).execute(claim);
+
+    const body = mrPostBody(calls);
+    assert.doesNotMatch(String(body.description), /Closes #/, "the interlocked MR is created WITHOUT Closes");
+    assert.ok(calls.some((c) => c.method === "GET"), "the PR head was read to verify it");
+    assert.ok(calls.some((c) => c.method === "PUT"), "the add-Closes reconcile was attempted");
+    assert.ok(!statuses(claim.run_id).includes("completed"), "a failed add-Closes never completes");
+    assert.ok(!statuses(claim.run_id).includes("failed"), "it holds rather than fails");
+    assert.strictEqual(api.completionHoldRequests.length, 1, "it enters the completion hold");
   });
 
   it("LEGACY (non-interlocked) run → no permit, no PR-head read, Closes as before, completes with NO head", async () => {

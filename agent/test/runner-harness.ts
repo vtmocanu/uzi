@@ -102,6 +102,8 @@ export interface MrCall {
 export interface FakeForgeOpts {
   head?: string;
   headStatus?: number;
+  /** Status for the body-rewrite PUT/PATCH (default 200); a non-2xx makes updateMergeRequestDescription throw a ForgeError (the add-Closes reconcile failure). */
+  putStatus?: number;
 }
 
 /** A GitLab client whose transport is captured; opens MR !42 with no network. The GET (D5 PR-head
@@ -122,7 +124,7 @@ export function fakeGitlab(opts: FakeForgeOpts = {}): { gitlab: GitLabClient; ca
     // PRD #1225 (CodeRabbit !1254): the interlock reconcile rewrites the MR body (GitLab uses
     // PUT). Answer 2xx so updateMergeRequestDescription succeeds; the call stays captured in `calls`.
     if (init.method === "PUT" || init.method === "PATCH") {
-      return { status: 200, text: async () => "{}" };
+      return { status: opts.putStatus ?? 200, text: async () => "{}" };
     }
     return {
       status: 201,
@@ -154,7 +156,7 @@ export function fakeForgejo(opts: FakeForgeOpts = {}): { forgejo: ForgejoClient;
     // PRD #1225 (CodeRabbit !1254): the interlock reconcile rewrites the PR body (Forgejo uses
     // PATCH). Answer 2xx so updateMergeRequestDescription succeeds; the call stays captured in `calls`.
     if (init.method === "PUT" || init.method === "PATCH") {
-      return { status: 200, text: async () => "{}" };
+      return { status: opts.putStatus ?? 200, text: async () => "{}" };
     }
     return {
       status: 201,
@@ -186,7 +188,7 @@ export function fakeGitHub(opts: FakeForgeOpts = {}): { github: GitHubClient; ca
     // PRD #1225 (CodeRabbit !1254): the interlock reconcile rewrites the PR body (GitHub uses
     // PATCH). Answer 2xx so updateMergeRequestDescription succeeds; the call stays captured in `calls`.
     if (init.method === "PUT" || init.method === "PATCH") {
-      return { status: 200, text: async () => "{}" };
+      return { status: opts.putStatus ?? 200, text: async () => "{}" };
     }
     return {
       status: 201,

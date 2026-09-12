@@ -2184,11 +2184,12 @@ export class RunRunner {
     // candidate. Interlocked runs are ISSUE runs that open MRs, so this sits on the openMr path only;
     // the no-MR task completion above is never interlocked and stays untouched.
     const interlocked = claim.config?.completion_contract_version != null;
-    // `Closes #N` renders for a LEGACY run (unchanged) OR an interlocked run with a GRANTED permit.
-    // It starts at the legacy default — true for legacy, false for interlocked — and only flips true
-    // once the permit is granted below, so no interlocked path can render `Closes` without a permit
-    // (AC: only a permitted full delivery contains `Closes #N`).
-    let renderCloses = !interlocked;
+    // `Closes #N` renders at MR creation for a LEGACY run only (unchanged). For an INTERLOCKED run it
+    // starts false and STAYS false at creation: Closes is NEVER rendered at creation for an interlocked
+    // run; it is added ONLY after the PR head is verified to equal H (the verification block below), so
+    // a held, unverified-head MR can never carry a closing line (AC: only a verified full delivery
+    // contains `Closes #N`).
+    const renderCloses = !interlocked;
     // H, the exact landed head. Set ONLY on the interlocked granted path; it rides the completed
     // report (`head: completionHead`) and is compared against the created PR's head. Undefined for a
     // legacy run, so JSON.stringify drops it and the legacy completed report is byte-for-byte the same
@@ -2258,8 +2259,10 @@ export class RunRunner {
         await holdOrFailInterlocked("completion permit denied");
         return;
       }
-      // 4. Granted: render `Closes` and carry H on the completed report below.
-      renderCloses = true;
+      // 4. Granted: carry H on the completed report below. Closes is NEVER rendered at creation for an
+      //    interlocked run — it is added ONLY after the PR head is verified to equal H (the verification
+      //    block below re-asserts the canonical `Closes #N` body on a verified head), so a held,
+      //    unverified-head MR can never carry a closing line.
       completionHead = head;
     }
 
@@ -2320,17 +2323,18 @@ export class RunRunner {
     // NOT report completed — the run holds with its MR already open. A legacy run has no completionHead
     // and never reads the PR head, so this block is skipped and its completion is unchanged.
     //
-    // PRD #1225 (CodeRabbit !1254): the MR was created with a `Closes #N` body BEFORE this
-    // verification. Both hold branches would otherwise leave that closing body published, so a
-    // human merge of an unverified head would close the issue. reconcileMrDescription rewrites the
-    // body to an unverified variant (no `Closes #N`, with a banner) before each hold, and re-asserts
-    // the canonical `Closes #N` body on the verified success path (a no-op on a freshly-created MR,
-    // a REPAIR of an ADOPTED MR whose body a prior hold reconciled). Best-effort: a rewrite failure
-    // is logged and the created MR is left as-is. The whole block is skipped for a legacy run
-    // (completionHead === undefined), so its completion is byte-for-byte unchanged.
+    // PRD #1225 (CodeRabbit !1254): the interlocked MR was created WITHOUT a `Closes #N` body, so a
+    // held, unverified-head MR can never carry a closing line — the dangerous create-then-verify state
+    // (a human merge closing the issue on an unverified head) is now structurally impossible.
+    // reconcileMrDescription ADDS the canonical `Closes #N` body ONLY after the PR head is verified to
+    // equal H; if that write FAILS the run HOLDS rather than reporting completion (the completion
+    // contract requires the merged MR to carry Closes). The two hold branches instead add the
+    // unverified banner (still NO `Closes #N`) BEST-EFFORT — its boolean is ignored, since the MR
+    // already carries no Closes and the banner is only advisory. The whole block is skipped for a
+    // legacy run (completionHead === undefined), so its completion is byte-for-byte unchanged.
     const UNVERIFIED_BANNER =
       "> ⚠️ **Completion unverified.** uzi could not confirm this merge request's head matches the permitted completion head, so the run was held for owner review. This merge request does NOT close its issue and must not be merged as a completion until re-verified.";
-    const reconcileMrDescription = async (withCloses: boolean, banner?: string): Promise<void> => {
+    const reconcileMrDescription = async (withCloses: boolean, banner?: string): Promise<boolean> => {
       try {
         const base = mrDescription(
           claim,
@@ -2355,11 +2359,13 @@ export class RunRunner {
             ),
           { log: runLog, signal: boundarySignal },
         );
+        return true;
       } catch (e) {
         runLog.warn(
           "completion interlock: could not reconcile the MR description; leaving the created MR as-is",
           { run_id: runId, error: errMessage(e) },
         );
+        return false;
       }
     };
     if (completionHead !== undefined) {
@@ -2388,10 +2394,15 @@ export class RunRunner {
         await holdOrFailInterlocked("pr head mismatch");
         return;
       }
-      // Verified: re-assert the canonical `Closes #N` body. No-op on a freshly-created MR (already
-      // canonical), a repair on an ADOPTED MR whose body a prior hold rewrote to the unverified
-      // variant.
-      await reconcileMrDescription(true);
+      // Verified: ADD the canonical `Closes #N` body. The interlocked MR was created WITHOUT Closes,
+      // so this is the ONLY place a completion's closing line is written (it is also a REPAIR on an
+      // ADOPTED MR whose body a prior hold rewrote to the unverified variant). The completion contract
+      // requires the merged MR to carry Closes, so if this write FAILS we hold/fail rather than report
+      // completion.
+      if (!(await reconcileMrDescription(true))) {
+        await holdOrFailInterlocked("could not assert Closes on the verified head");
+        return;
+      }
     }
 
     // Persist the MR/PR web URL the forge just handed us (PRD #65 D8), so the web
@@ -5418,10 +5429,11 @@ function mrDescription(
   gatesUnverified?: string[],
   gatesDiscoveryTruncated?: boolean,
   scopeCapped?: { completedCount: number; total?: number },
-  // PRD #1226 M4 (D5): render the `Closes #N` line only when told to. A legacy issue run passes
-  // true (unchanged); an interlocked run passes true ONLY with a granted structural permit. This
-  // makes the "no `Closes` without a permit" invariant structural — the function cannot emit a
-  // closing body on its own. Defaults true so the sole issue-arm caller keeps today's behavior.
+  // PRD #1226 M4 (D5): render the `Closes #N` line only when told to. A legacy issue run passes true
+  // at MR creation (unchanged); an interlocked run passes false at creation and true ONLY on the
+  // verified-head reconcile that ADDS Closes after PR-head verification (PRD #1225). This makes the
+  // "no `Closes` on an unverified head" invariant structural — the function cannot emit a closing body
+  // on its own. Defaults true so the sole issue-arm caller keeps today's behavior.
   renderCloses = true,
 ): string {
   const footer = `Opened automatically by the uzi agent from branch \`${branch}\`. Please review and merge manually — the agent never merges.`;
@@ -5465,9 +5477,9 @@ function mrDescription(
       ]
     : [
         `Implements issue #${claim.issue_iid}.`,
-        // PRD #1226 M4 (D5): the closing line is CONDITIONAL on a granted structural permit. When
-        // renderCloses is true (a legacy run, or an interlocked run that got its permit) this spreads
-        // to exactly the prior `"", "Closes #N"` pair, so the legacy body is byte-for-byte unchanged.
+        // PRD #1226 M4 (D5): the closing line is CONDITIONAL. When renderCloses is true (a legacy run
+        // at creation, or an interlocked run's verified-head reconcile — PRD #1225) this spreads to
+        // exactly the prior `"", "Closes #N"` pair, so the legacy body is byte-for-byte unchanged.
         ...(renderCloses ? ["", `Closes #${claim.issue_iid}`] : []),
         ...repoMarker,
       ];
