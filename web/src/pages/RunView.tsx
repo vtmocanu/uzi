@@ -854,7 +854,11 @@ export function PausedPanel({
   onResume: () => void;
   onStop: () => void;
 }) {
-  if (run.status !== "paused") return null;
+  // A completion hold (hold_reason='completion_blocked') also sits in `paused` but
+  // recovers via the continue-decision path, not a plain resume — so it is excluded
+  // here; the informational CompletionStatePanel + the "Completion blocked" StatusPill
+  // cover it.
+  if (run.status !== "paused" || run.hold_reason === "completion_blocked") return null;
 
   // The pause landed when the run entered the state; updated_at is status_since on the
   // wire. Rendered as a local wall-clock time ("11:02"), matching the mock heading.
@@ -1549,7 +1553,12 @@ export function RunView() {
                   on the queued-only Expedite above — a primary Button for the owner, inert
                   text for a non-owner (never a button that would 404). It self-hides on
                   every other status. */}
+              {/* A completion hold (hold_reason='completion_blocked') also sits in
+                  `paused` but recovers via the continue-decision path, not a plain
+                  resume — so it is excluded here; the informational CompletionStatePanel
+                  + the "Completion blocked" StatusPill cover it. */}
               {run.status === "paused" &&
+                run.hold_reason !== "completion_blocked" &&
                 (canSteer ? (
                   <Button
                     size="sm"

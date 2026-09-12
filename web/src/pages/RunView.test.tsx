@@ -1253,6 +1253,17 @@ describe("RunView — paused header: Resume + pending-pause chip (PRD #1190)", (
     expect(screen.getByText(/clock stopped/i)).toBeTruthy();
   });
 
+  // A completion hold sits in `paused` too, but recovers via the continue-decision path
+  // (uzi run decide --continue), NOT a plain resume — a plain resume would wrongly promote
+  // it to queued while leaving a stale hold_reason. So the owner-pause Resume controls
+  // (header + PausedPanel) must self-hide for hold_reason === "completion_blocked"; the
+  // CompletionStatePanel + the "Completion blocked" StatusPill cover it instead.
+  it("hides every Resume control on a completion-blocked run, even for the owner", async () => {
+    renderPage({ ...PAUSED, hold_reason: "completion_blocked" }, true);
+    await screen.findByText("Add rate limiting");
+    expect(screen.queryByRole("button", { name: /resume/i })).toBeNull();
+  });
+
   it("clicking Resume calls api.resumeRun(id) then refreshRun", async () => {
     const { refreshRun } = renderPage(PAUSED, true);
     await screen.findByText("Add rate limiting");
