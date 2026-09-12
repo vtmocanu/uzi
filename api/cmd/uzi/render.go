@@ -185,6 +185,13 @@ func cellText(s string) string {
 // codepoint into invalid UTF-8. The neighbouring compactText caps on runes for the
 // same reason (issue #554); the two are now consistent.
 func capCell(s string, max int) string {
+	// A zero or negative cap underflows the []rune(s)[:max-1] slice below, so it was
+	// ALWAYS a panic, never a valid result (a narrow TUI pane can drive a width-derived
+	// cap to ≤0). Returning "" is purely additive safety for every caller; behaviour for
+	// max ≥ 1 is unchanged. Callers that want graceful truncation floor the cap higher.
+	if max <= 0 {
+		return ""
+	}
 	if utf8.RuneCountInString(s) <= max {
 		return s
 	}

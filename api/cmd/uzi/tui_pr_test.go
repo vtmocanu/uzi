@@ -62,7 +62,7 @@ func openPRWith(t *testing.T, fake *uzicli.FakeClient, detail apitypes.PullDetai
 	if m.view != viewPR {
 		t.Fatalf("enter on a pulls row did not open the PR view (view=%v)", m.view)
 	}
-	next, _ = m.Update(prMsg{reqID: m.pr.waitID, detail: detail})
+	next, _ = m.Update(prMsg{reqID: m.pr.waitID, gen: m.pr.gen, detail: detail})
 	return next.(tuiModel)
 }
 
@@ -124,6 +124,58 @@ func TestTUIPRHeaderRollups(t *testing.T) {
 				t.Errorf("the re-polled proof is not drawn\n%s", frame)
 			}
 		})
+	}
+}
+
+// TestTUIPRHeaderLine2KeepsDiffstatWithLongTitle pins the SHOULD-FIX: a real-world long title used
+// to push the right-hand `−dels` count off the hard m.width clamp at the standard 100 cols, losing
+// the deletions. The diffstat is now right-anchored, so the title truncates and the `−dels` survives.
+func TestTUIPRHeaderLine2KeepsDiffstatWithLongTitle(t *testing.T) {
+	detail := prDetail(55, "review_required", []apitypes.CheckDTO{ckPassed("a")}, nil, apitypes.MergeStateDTO{})
+	detail.Title = "Completion interlock across M4 through M6: rollout switch plus permit finalize step"
+	if n := len([]rune(detail.Title)); n < 60 {
+		t.Fatalf("the fixture title must be ≥60 runes to reproduce the clamp (got %d)", n)
+	}
+	detail.Additions = 842
+	detail.Deletions = 131
+
+	fake := &uzicli.FakeClient{Repos: []apitypes.RepoDTO{oneRepo()}}
+	m := openPRWith(t, fake, detail)
+	m.width = 100
+	frame := stripANSI(m.View().Content)
+	if !strings.Contains(frame, "−131") {
+		t.Errorf("the deletions diffstat (−131) was dropped at width 100 with a long title\n%s", frame)
+	}
+}
+
+// TestTUIPRRendersAtNarrowWidthsWithoutPanic pins BLOCKING fix #1: a non-empty BlockedReason, an
+// https check URL and a coarse mergeable-state each drove a width-derived renderer.Plain cap to ≤0,
+// underflowing capCell and panicking the whole TUI at terminal width ≤14 (and ≤6). With the floors
+// and the capCell guard, every width degrades gracefully — no panic, and no rendered line overflows
+// m.width. (Pre-fix this panics at width 14 with `slice bounds out of range [:-5]`.)
+func TestTUIPRRendersAtNarrowWidthsWithoutPanic(t *testing.T) {
+	merge := apitypes.MergeStateDTO{Conflicts: bp(true), RequiredChecksPassed: false,
+		MergeableState: "blocked", BlockedReason: "changes requested by a required reviewer"}
+	failing := ckFailed("a-very-long-check-name-that-needs-clamping")
+	failing.WebURL = "https://github.com/vtmocanu/uzi/actions/runs/1234567890/job/9876543210"
+	failing.Description = "the lint job found a problem in a source file"
+	checks := []apitypes.CheckDTO{failing, ckPassed("build")}
+	reviews := []apitypes.PullReviewDTO{
+		{Author: "a-reviewer-with-a-fairly-long-login", State: "changes_requested", SubmittedAt: time.Now().Add(-time.Minute)}}
+	detail := prDetail(42, "changes_requested", checks, reviews, merge)
+
+	fake := &uzicli.FakeClient{Repos: []apitypes.RepoDTO{oneRepo()}}
+	m := openPRWith(t, fake, detail)
+
+	for _, width := range []int{100, 60, 40, 20, 14, 6, 1} {
+		m.width, m.height = width, 40
+		content := m.View().Content // must not panic at any width
+		for i, line := range strings.Split(content, "\n") {
+			if w := visualWidth(line); w > width {
+				t.Errorf("width %d: rendered line %d is %d cols wide (exceeds %d): %q",
+					width, i, w, width, stripANSI(line))
+			}
+		}
 	}
 }
 
@@ -207,7 +259,7 @@ func TestTUIPRTickInFlightGuard(t *testing.T) {
 	}
 
 	// The reply clears the guard, so the next tick fetches again.
-	next, _ := m.Update(prMsg{reqID: m.pr.waitID, detail: detail})
+	next, _ := m.Update(prMsg{reqID: m.pr.waitID, gen: m.pr.gen, detail: detail})
 	m = next.(tuiModel)
 	if m.pr.waitID != 0 {
 		t.Fatal("the PR reply did not clear the guard")
@@ -245,6 +297,80 @@ func TestTUIPRStaleReplyDropped(t *testing.T) {
 	}
 }
 
+// TestTUIPRReopenStaleReplyDropped reproduces the CROSS-PR collision: newPRState resets reqSeq on
+// every open, so a prior PR's still-in-flight reply mints the SAME reqID as the freshly-opened PR
+// and passes the reqID==waitID guard. Without the monotonic session gen, PR A's late detail
+// (Title/Checks/RunID) would be applied to the PR B view — the header still reads #B, but w then
+// reworks A's run and u opens A's run, an action against the wrong run. The prGen guard drops it.
+func TestTUIPRReopenStaleReplyDropped(t *testing.T) {
+	const (
+		runA = "aaaaaaaa-1111-2222-3333-444444444444"
+		runB = "bbbbbbbb-1111-2222-3333-444444444444"
+	)
+	prA := prDetail(100, "review_required", []apitypes.CheckDTO{ckRunning("a")}, nil, apitypes.MergeStateDTO{})
+	prA.RunID = sp(runA)
+	prB := prDetail(200, "review_required", []apitypes.CheckDTO{ckRunning("b")}, nil, apitypes.MergeStateDTO{})
+	prB.RunID = sp(runB)
+
+	fake := &uzicli.FakeClient{Repos: []apitypes.RepoDTO{oneRepo()}}
+	m := tuiTestModel(t, fake, "")
+	next, _ := m.Update(reposMsg{repos: fake.Repos})
+	m = next.(tuiModel)
+
+	// Open PR A via the pulls enter path and leave its GetPull in flight (no reply fed).
+	m = press(t, m, keyViewPulls)
+	next, _ = m.Update(pullsMsg{reqID: m.pulls.waitID, pulls: []apitypes.PullDTO{prA.PullDTO}})
+	m = next.(tuiModel)
+	m = press(t, m, keyEnter)
+	if m.view != viewPR || m.pr.iid != 100 {
+		t.Fatalf("enter did not open PR A (view=%v iid=%d)", m.view, m.pr.iid)
+	}
+	aWait, aGen := m.pr.waitID, m.pr.gen
+	if aWait == 0 {
+		t.Fatal("opening PR A did not mint an in-flight request")
+	}
+
+	// esc back to the pulls list, swap the row to PR B, and open it: newPRState resets reqSeq, so B
+	// mints the SAME reqID as A's still-in-flight request (the collision), under a NEW gen.
+	m = press(t, m, keyEsc)
+	if m.view != viewPulls {
+		t.Fatalf("esc did not return to the pulls list (view=%v)", m.view)
+	}
+	next, _ = m.Update(pullsMsg{reqID: m.pulls.waitID, pulls: []apitypes.PullDTO{prB.PullDTO}})
+	m = next.(tuiModel)
+	m = press(t, m, keyEnter)
+	if m.view != viewPR || m.pr.iid != 200 {
+		t.Fatalf("enter did not open PR B (view=%v iid=%d)", m.view, m.pr.iid)
+	}
+	if m.pr.waitID != aWait {
+		t.Fatalf("the reopen did not mint the colliding reqID (B waitID=%d, A waitID=%d)", m.pr.waitID, aWait)
+	}
+	if m.pr.gen == aGen {
+		t.Fatalf("the reopen did not advance the PR session generation (gen still %d)", aGen)
+	}
+
+	// PR A's late reply arrives while B's request is in flight: reqID collides with B's waitID, but
+	// the session gen does not — it MUST be dropped, never applied to the B view.
+	next, _ = m.Update(prMsg{reqID: aWait, gen: aGen, detail: prA})
+	m = next.(tuiModel)
+	if m.pr.detail.RunID != nil && *m.pr.detail.RunID == runA {
+		t.Fatalf("PR A's stale reply was applied to the PR B view (RunID=%s)", runA)
+	}
+	if m.pr.waitID != aWait {
+		t.Fatalf("the dropped stale reply cleared B's in-flight guard (waitID=%d, want %d)", m.pr.waitID, aWait)
+	}
+
+	// B's own reply (matching gen) is still honoured, so the view loads B's run.
+	next, _ = m.Update(prMsg{reqID: m.pr.waitID, gen: m.pr.gen, detail: prB})
+	m = next.(tuiModel)
+	if m.pr.detail.RunID == nil || *m.pr.detail.RunID != runB {
+		t.Fatalf("PR B's own reply was not applied (RunID=%v, want %s)", m.pr.detail.RunID, runB)
+	}
+	if m.pr.iid != 200 {
+		t.Fatalf("the PR view is no longer scoped to B (iid=%d)", m.pr.iid)
+	}
+}
+
 func TestTUIPRErrStreakBacksOff(t *testing.T) {
 	orig := prPollInterval
 	prPollInterval = time.Millisecond
@@ -260,7 +386,7 @@ func TestTUIPRErrStreakBacksOff(t *testing.T) {
 		if m.pr.waitID == 0 {
 			t.Fatalf("tick %d did not mint a PR request", want)
 		}
-		next, _ := m.Update(prMsg{reqID: m.pr.waitID, err: pollErr})
+		next, _ := m.Update(prMsg{reqID: m.pr.waitID, gen: m.pr.gen, err: pollErr})
 		m = next.(tuiModel)
 		if m.pr.errStreak != want {
 			t.Fatalf("after %d error replies errStreak = %d, want %d", want, m.pr.errStreak, want)
@@ -272,7 +398,7 @@ func TestTUIPRErrStreakBacksOff(t *testing.T) {
 
 	// A success reply resets the streak.
 	m, _ = prTick(t, m)
-	next, _ := m.Update(prMsg{reqID: m.pr.waitID, detail: detail})
+	next, _ := m.Update(prMsg{reqID: m.pr.waitID, gen: m.pr.gen, detail: detail})
 	m = next.(tuiModel)
 	if m.pr.errStreak != 0 {
 		t.Fatalf("a success reply left errStreak = %d, want 0", m.pr.errStreak)
@@ -496,7 +622,7 @@ func TestTUIDetailMToPRRoundTrip(t *testing.T) {
 	if m.prReturn != viewDetail {
 		t.Fatalf("prReturn was not set to the run view (got %v)", m.prReturn)
 	}
-	next, _ := m.Update(prMsg{reqID: m.pr.waitID, detail: detail})
+	next, _ := m.Update(prMsg{reqID: m.pr.waitID, gen: m.pr.gen, detail: detail})
 	m = next.(tuiModel)
 
 	m = press(t, m, keyEsc)
@@ -614,10 +740,11 @@ func TestTUIPRStripsControlBytesPerField(t *testing.T) {
 		t.Errorf("a non-https check URL was emitted as an OSC-8 hyperlink\n%s", out)
 	}
 
-	// The MergeableState field (drawn only when no blocked reason) is sanitized on its own path.
+	// The MergeableState field (drawn only when no blocked reason AND nothing else explains the
+	// merge state, i.e. required checks passed) is sanitized on its own path.
 	const mergeableN = "\x1b[2J\u202e\x07\x01mergeablestate"
 	detail2 := detail
-	detail2.Merge = apitypes.MergeStateDTO{Conflicts: bp(false), MergeableState: mergeableN}
+	detail2.Merge = apitypes.MergeStateDTO{Conflicts: bp(false), RequiredChecksPassed: true, MergeableState: mergeableN}
 	m2 := openPRWith(t, fake, detail2)
 	out2 := m2.View().Content
 	assertNoRawControls(t, "pr merge state", out2)

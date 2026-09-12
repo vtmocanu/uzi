@@ -27,11 +27,14 @@ import (
 
 // prMsg carries a GetPull reply for the PR drill-in, the PR analogue of pullsMsg. reqID is the
 // request-generation id this reply belongs to; the model honours it only when reqID ==
-// m.pr.waitID, so an older poll that resolves after a newer request was minted is dropped.
+// m.pr.waitID, so an older poll that resolves after a newer request was minted is dropped. gen is
+// the PR SESSION generation (prState.gen) the request was issued under: a reopen resets reqSeq so a
+// prior PR's reply can collide on reqID, and the gen check is what rejects it (see prState.gen).
 type prMsg struct {
 	detail apitypes.PullDetailDTO
 	err    error
 	reqID  uint64
+	gen    uint64
 }
 
 // prTickMsg drives the PR drill-in's own 5s live re-poll chain, carrying the tick-chain generation
@@ -89,6 +92,14 @@ type prState struct {
 	detail apitypes.PullDetailDTO
 	cursor int // over the sorted CHECKS list
 	err    error
+
+	// gen is this PR session's generation, stamped from tuiModel.prGen by startPRReq on the first
+	// fetch of each drill-in (from the pulls row or the run view). newPRState resets reqSeq/waitID to
+	// 0 on every open, so a prior PR's in-flight GetPull mints the SAME reqID as this one and passes
+	// the reqID==waitID guard; the monotonic gen is the session check that rejects it, mirroring
+	// detailState.gen. esc cannot cancel a command in flight, and reopening the SAME PR also advances
+	// gen, so a stale reply is dropped on gen before its detail can be applied to the wrong PR.
+	gen uint64
 
 	// reqSeq / waitID / tickGen are the request-generation guard, a copy of the board's (see
 	// boardState): waitID == 0 is idle and a tick polls ONLY while idle (the in-flight guard); a
@@ -153,20 +164,32 @@ func (p *prState) clampCursor() {
 // fetchPRCmd reads one PR's detail (checks/reviews/merge), tagged with the request-generation id so
 // a stale reply is dropped (PRD #1255 D4; the #1130 poll-guard pattern).
 func (m tuiModel) fetchPRCmd(repoID string, iid int64, reqID uint64) tea.Cmd {
-	c, parent := m.client, m.ctx
+	c, parent, gen := m.client, m.ctx, m.pr.gen
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(parent, boardPollTimeout)
 		defer cancel()
 		detail, err := c.GetPull(ctx, repoID, iid)
-		return prMsg{detail: detail, err: err, reqID: reqID}
+		return prMsg{detail: detail, err: err, reqID: reqID, gen: gen}
 	}
 }
 
 // startPRReq mints the next PR request id, records it as the one the model is waiting on, and
 // returns the tagged fetch — the PR twin of startPullsReq. It returns nil when no PR is resolved.
+//
+// It also advances the model-level PR SESSION generation on the FIRST request of each drill-in —
+// the PR twin of the board's detailGen stamp (tui_board.go). newPRState resets reqSeq to 0 on every
+// open, so reqSeq == 0 here is true exactly once per open (the immediate fetch the open path issues,
+// never a re-poll or a refresh, whose reqSeq is already > 0). Stamping prGen there — rather than at
+// the pulls-row / run-view open sites — keeps the guard self-contained while giving each session a
+// unique, never-reset gen, so a previous PR's in-flight reply (whose reset reqSeq minted the SAME
+// reqID as this session) is rejected on gen by the prMsg handler.
 func (m *tuiModel) startPRReq() tea.Cmd {
 	if m.pr.repoID == "" {
 		return nil
+	}
+	if m.pr.reqSeq == 0 {
+		m.prGen++
+		m.pr.gen = m.prGen
 	}
 	m.pr.reqSeq++
 	m.pr.waitID = m.pr.reqSeq
@@ -442,7 +465,22 @@ const (
 	prCheckStateW    = 8 // forgeState word: running / queued / passed / failed / done
 	prElapsedWidth   = 7 // checkElapsed (e.g. 3m00s)
 	prCheckDescMin   = 6
+	// prReviewLoginWidth is the REVIEWS login column, padded so the state/age columns align (the
+	// review twin of prCheckNameWidth). 24 matches the prior cap, so no login clips differently.
+	prReviewLoginWidth = 24
 )
+
+// prPlainWidth floors a width-derived renderer.Plain / capCell cap so a narrow pane TRUNCATES
+// gracefully instead of underflowing capCell's rune slice (a ≤0 cap was a panic: [:max-1] goes
+// negative). Every m.width-N cap in this file passes through it; renderPR's clampVisual to m.width
+// is still the backstop for the whole line. prCheckRow's descW keeps its own larger
+// prCheckDescMin floor (a description narrower than that is not worth a cell).
+func prPlainWidth(n int) int {
+	if n < 1 {
+		return 1
+	}
+	return n
+}
 
 func (m tuiModel) renderPR() string {
 	var sb strings.Builder
@@ -455,7 +493,7 @@ func (m tuiModel) renderPR() string {
 	}
 
 	if !m.pr.loaded {
-		sb.WriteString("\n" + m.pal.faint.Render(" loading…"))
+		sb.WriteString("\n" + clampVisual(m.pal.faint.Render(" loading…"), m.width))
 		return sb.String()
 	}
 	sb.WriteString("\n")
@@ -468,7 +506,7 @@ func (m tuiModel) renderPR() string {
 	sb.WriteString(clampVisual(m.prChecksHeading(), m.width) + "\n")
 	sorted := prSortedChecks(d.Checks)
 	if len(sorted) == 0 {
-		sb.WriteString(m.pal.faint.Render("  · no checks reported") + "\n")
+		sb.WriteString(clampVisual(m.pal.faint.Render("  · no checks reported"), m.width) + "\n")
 	} else {
 		start, end := prChecksWindow(m.pr.cursor, len(sorted), m.prChecksCapacity())
 		for i := start; i < end; i++ {
@@ -484,9 +522,9 @@ func (m tuiModel) renderPR() string {
 	}
 
 	// REVIEWS: one line per reviewer, the backend already folded to the latest per reviewer (D6).
-	sb.WriteString("\n" + m.pal.title.Render(" REVIEWS") + "\n")
+	sb.WriteString("\n" + clampVisual(m.pal.title.Render(" REVIEWS"), m.width) + "\n")
 	if len(d.Reviews) == 0 {
-		sb.WriteString(m.pal.faint.Render("  · no reviews yet") + "\n")
+		sb.WriteString(clampVisual(m.pal.faint.Render("  · no reviews yet"), m.width) + "\n")
 	} else {
 		for _, rv := range d.Reviews {
 			sb.WriteString(clampVisual(m.prReviewLine(rv), m.width) + "\n")
@@ -494,7 +532,7 @@ func (m tuiModel) renderPR() string {
 	}
 
 	// MERGE: conflicts / required-checks / blocked-reason — informational only, uzi never merges.
-	sb.WriteString("\n" + m.pal.title.Render(" MERGE") + "\n")
+	sb.WriteString("\n" + clampVisual(m.pal.title.Render(" MERGE"), m.width) + "\n")
 	for _, line := range m.prMergeLines(d) {
 		sb.WriteString(clampVisual(line, m.width) + "\n")
 	}
@@ -575,19 +613,26 @@ func (m tuiModel) prHeaderLine1() string {
 	return padVisual(clampVisual(left, target), target) + " " + right
 }
 
-// prHeaderLine2 is the title (untrusted, clipped) · author · run <id> (only when linked) · age ·
-// +adds −dels.
+// prHeaderLine2 is the title (untrusted, clipped) · author · run <id> (only when linked) · age, with
+// the +adds −dels diffstat RIGHT-ANCHORED (mirroring how line 1 anchors its rollup). Anchoring is
+// what keeps the diffstat alive: concatenated inline and hard-clamped to m.width, a real-world title
+// ≳57 chars at the standard 100 cols cut the `−dels` off, losing the deletions and reading as an
+// ambiguous `+842 …`. The title truncates instead, so the diffstat always survives.
 func (m tuiModel) prHeaderLine2() string {
 	d := m.pr.detail
 	bold := lipgloss.NewStyle().Bold(true)
-	seg := m.pal.faint.Render(" ") + bold.Render(m.renderer.Plain(d.Title, 80))
-	seg += m.pal.faint.Render(" · ") + paintSeg(m.pal.sage, nil, false, m.renderer.Plain(d.Author, 24))
+	left := m.pal.faint.Render(" ") + bold.Render(m.renderer.Plain(d.Title, 80))
+	left += m.pal.faint.Render(" · ") + paintSeg(m.pal.sage, nil, false, m.renderer.Plain(d.Author, 24))
 	if d.RunID != nil && *d.RunID != "" {
-		seg += m.pal.faint.Render(" · run " + shortRunID(*d.RunID))
+		left += m.pal.faint.Render(" · run " + shortRunID(*d.RunID))
 	}
-	seg += m.pal.faint.Render(" · " + relAge(d.CreatedAt))
-	seg += m.pal.faint.Render(" · +" + itoa(d.Additions) + " −" + itoa(d.Deletions))
-	return seg
+	left += m.pal.faint.Render(" · " + relAge(d.CreatedAt))
+	right := m.pal.faint.Render("+" + itoa(d.Additions) + " −" + itoa(d.Deletions))
+	target := m.width - visualWidth(right) - 1
+	if target < 1 {
+		return left
+	}
+	return padVisual(clampVisual(left, target), target) + " " + right
 }
 
 // prRollup is the header's top-right checks+review rollup (D3): `✗ F failing`, or `● N pending · ✓
@@ -714,7 +759,7 @@ func (m tuiModel) prCheckURLLine(ck apitypes.CheckDTO) string {
 	if ck.WebURL == "" {
 		return ""
 	}
-	text := m.pal.faint.Render("   ↗ " + m.renderer.Plain(ck.WebURL, m.width-6))
+	text := m.pal.faint.Render("   ↗ " + m.renderer.Plain(ck.WebURL, prPlainWidth(m.width-6)))
 	if m.linksEnabled() && isHTTPSURL(ck.WebURL) {
 		return oscLink(ck.WebURL, text)
 	}
@@ -728,15 +773,19 @@ func (m tuiModel) prReviewLine(rv apitypes.PullReviewDTO) string {
 	glyph, c := m.reviewGlyph(t.reviewState)
 	var b strings.Builder
 	b.WriteString(paintSeg(c, nil, false, " "+glyph+" "))
-	b.WriteString(paintSeg(m.pal.sage, nil, false, m.renderer.Plain(t.reviewerLogin, 24)))
+	// Pad the login to a fixed cell (like prCheckRow pads the check name) so the state/age columns
+	// line up down the REVIEWS list instead of sitting ragged after a variable-length login.
+	b.WriteString(paintSeg(m.pal.sage, nil, false, padCell(m.renderer.Plain(t.reviewerLogin, prReviewLoginWidth), prReviewLoginWidth)))
 	b.WriteString("  " + m.renderer.Plain(reviewStateWord(t.reviewState), 20))
 	b.WriteString(m.pal.faint.Render("  " + relAge(rv.SubmittedAt)))
 	return b.String()
 }
 
 // prMergeLines is the MERGE section from MergeStateDTO (D3), informational only: a conflicts line, a
-// required-checks line, and the blocked reason (or, when none, the raw coarse mergeable state). The
-// blocked reason and mergeable state are forge-authored → renderer.Plain.
+// required-checks line, and the blocked reason — or, only when neither a blocked reason nor a
+// waiting-on-checks line is shown, the raw coarse mergeable state (so the bare word does not just
+// echo a line already on screen). The blocked reason and mergeable state are forge-authored →
+// renderer.Plain.
 func (m tuiModel) prMergeLines(d apitypes.PullDetailDTO) []string {
 	ms := d.Merge
 	t := prMergeTextOf(ms)
@@ -755,11 +804,15 @@ func (m tuiModel) prMergeLines(d apitypes.PullDetailDTO) []string {
 	} else {
 		lines = append(lines, paintSeg(m.pal.wait, nil, false, " ● waiting on checks"))
 	}
+	// The blocked reason is the most specific line; the waiting-on-checks line (drawn above when
+	// RequiredChecksPassed is false) already explains a held merge. The raw coarse mergeable state
+	// (e.g. "blocked") only ECHOES those when one is shown — reading like leftover debug — so it is
+	// drawn only when neither is, i.e. when it is the sole remaining signal.
 	if t.mergeBlocked != "" {
 		lines = append(lines, paintSeg(m.pal.amber, nil, false, " ✎ blocked: ")+
-			m.pal.faint.Render(m.renderer.Plain(t.mergeBlocked, m.width-14)))
-	} else if t.mergeableState != "" {
-		lines = append(lines, m.pal.faint.Render(" · "+m.renderer.Plain(t.mergeableState, m.width-6)))
+			m.pal.faint.Render(m.renderer.Plain(t.mergeBlocked, prPlainWidth(m.width-14))))
+	} else if t.mergeableState != "" && ms.RequiredChecksPassed {
+		lines = append(lines, m.pal.faint.Render(" · "+m.renderer.Plain(t.mergeableState, prPlainWidth(m.width-6))))
 	}
 	return lines
 }

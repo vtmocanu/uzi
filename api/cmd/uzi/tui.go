@@ -266,6 +266,11 @@ type tuiModel struct {
 	// detailState.gen from it, so a reply issued under an earlier session (same run reopened)
 	// is rejected by the gen check in the detailRunMsg / detailPageMsg cases.
 	detailGen uint64
+	// prGen counts PR drill-in sessions opened from the pulls row or the run view; startPRReq stamps
+	// the new prState.gen from it on each open's first fetch, so a reply issued under an earlier
+	// session — a different PR whose reset reqSeq minted the SAME reqID, or the same PR reopened — is
+	// rejected by the gen check in the prMsg case. The PR twin of detailGen.
+	prGen uint64
 
 	// quitting is the ctrl+c confirm modal (q quits immediately and does NOT route through
 	// it); ctrlCSeen makes a second ctrl+c quit immediately, which is the escape hatch a user
@@ -920,8 +925,12 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case prMsg:
 		// Drop a stale/out-of-order reply (mirrors pullsMsg): honour only the reply whose reqID
-		// matches the request we are waiting on.
-		if msg.reqID != m.pr.waitID {
+		// matches the request we are waiting on AND whose PR session generation is the current one.
+		// The gen check is load-bearing across a reopen: newPRState resets reqSeq, so a prior PR's
+		// in-flight reply mints the SAME reqID and passes the reqID==waitID guard — only gen tells
+		// them apart, so without it PR A's late detail (Title/Checks/RunID) would be applied to the
+		// PR B view and w/u would then act on the wrong run.
+		if msg.reqID != m.pr.waitID || msg.gen != m.pr.gen {
 			return m, nil
 		}
 		m.pr.waitID = 0
