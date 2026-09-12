@@ -30,8 +30,8 @@ func TestParseExtendDuration(t *testing.T) {
 		{"90m", 90 * 60},
 		{"1h30m", 90 * 60},
 		{"1d", 24 * 60 * 60},
-		{"1m", 60},   // exactly the 60s floor is accepted
-		{"60s", 60},  // boundary, spelled in seconds
+		{"1m", 60},  // exactly the 60s floor is accepted
+		{"60s", 60}, // boundary, spelled in seconds
 	}
 	for _, tc := range ok {
 		got, err := parseExtendDuration(tc.in)
