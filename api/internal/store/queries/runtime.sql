@@ -971,6 +971,14 @@ UPDATE runs SET
     -- evaluates the WHERE and every SET right-hand side against the OLD row, which is
     -- the same mechanism the health CASE arms below already rely on.
     open_question_id = NULL,
+    -- PRD #1226 M5: the completion-QUESTION marker is RESOLVED when the run resumes to running
+    -- (the owner's continue was accepted and the worker picked up the answer), so it must not
+    -- survive — the SAME "no setter leaves a resolved park marker behind" discipline as
+    -- open_question_id directly above (both mark a resolved question). Cleared UNCONDITIONALLY:
+    -- a running run never carries the marker, so a running → running heartbeat re-clears an
+    -- already-NULL column (a no-op), and the completion-question window can only resolve to
+    -- running (here) or the hold (SetRunCompletionHold).
+    completion_question_at = NULL,
     -- PRD #1226 M5 (D7): the completion hold is OVER the instant the worker reports running
     -- again — a resumed completion-blocked run (paused → queued → claimed → running, or the
     -- live awaiting_input window resuming in place) is once more executing, so the hold
@@ -1773,8 +1781,11 @@ WHERE id = @id AND worker_id = @worker_id
 -- open_question_id is CLEARED, following the "NO SETTER MAY LEAVE A RESOLVED open_question_id
 -- BEHIND" convention (see SetRunRunning / SetRunAwaitingApproval): the (worker-authored, M5)
 -- completion question the run may have parked on is resolved by this hold, so its id must not
--- survive. completion_budget_exhausted_at is CLEARED because the worker acting on the served
--- steer is exactly the D3 "clears it so a stale ack cannot re-arm" contract.
+-- survive. completion_question_at (the PRD #1226 M5 completion-QUESTION marker) is CLEARED for
+-- the SAME reason and by the SAME convention: entering the hold resolves the completion
+-- question the run was parked on, so the marker must not survive alongside a resolved
+-- open_question_id. completion_budget_exhausted_at is CLEARED because the worker acting on the
+-- served steer is exactly the D3 "clears it so a stale ack cannot re-arm" contract.
 --
 -- It deliberately does NOT clear completion_attempts / latest_completion_attempt (M5's
 -- honest-state UI reads them), and it does NOT touch the pending-pause columns
@@ -1791,6 +1802,7 @@ UPDATE runs SET
     hold_reason                    = 'completion_blocked',
     hold_captured_head             = sqlc.narg('hold_captured_head'),
     open_question_id               = NULL,
+    completion_question_at         = NULL,
     completion_budget_exhausted_at = NULL,
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at                     = now()
@@ -1866,10 +1878,22 @@ WHERE id = @id AND worker_id = @worker_id;
 -- resumed worker re-parking on the SAME question re-stamps the SAME value (it reads
 -- it back off the claim), which is what makes the SetRunRunning guard above a no-op
 -- across a requeue instead of a silent rejection of an already-submitted answer.
+--
+-- completion_question_at is the PRD #1226 M5 completion-QUESTION discriminator marker. The
+-- caller passes a non-NULL timestamp ONLY when the worker's report flags a COMPLETION
+-- question (SetState maps req.CompletionQuestion → now()); an ordinary PRD #88 ask_user
+-- clarification passes NULL, so the column stays NULL and the behavior is byte-identical to
+-- the pre-marker park. It is assigned UNCONDITIONALLY (not COALESCE'd) so a re-park as an
+-- ordinary question after a completion question clears a stale marker — but a resumed worker
+-- re-parking on the SAME completion question re-stamps a fresh now(). completionQuestionOpen
+-- (the decision endpoint's admit condition) and completionPhaseRule key on this marker, so an
+-- ordinary clarification on an interlocked post-attempt run no longer reads as a completion
+-- window and an owner completion-continue can never resolve the wrong question.
 UPDATE runs SET
     status           = 'awaiting_input',
     status_since     = now(),
     open_question_id = @open_question_id,
+    completion_question_at = sqlc.narg('completion_question_at'),
     session_id       = COALESCE(sqlc.narg('session_id'), session_id),
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()

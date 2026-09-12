@@ -2068,6 +2068,18 @@ type StateRequest struct {
 	// answer guard, which asks "was THIS question answered" rather than "has this run
 	// ever been answered". Required for `awaiting_input`; ignored on every other state.
 	OpenQuestionID *string `json:"open_question_id"`
+	// CompletionQuestion (PRD #1226 M5) is the worker's DECLARATION, on an `awaiting_input`
+	// report, that the question it is parking on is a COMPLETION-interlock question (the
+	// worker authored it while awaiting the owner's continue decision) rather than an
+	// ordinary PRD #88 ask_user clarification. It drives the dedicated completion-question
+	// marker (completion_question_at): true → SetState stamps the marker to now(), so
+	// completionQuestionOpen / completionPhaseRule can tell the D6 completion-question window
+	// from an ordinary clarification and an owner completion-continue can never resolve the
+	// wrong question. Absent/false on an ordinary ask_user report (byte-identical to the
+	// pre-marker behavior) and ignored on every non-`awaiting_input` state. The agent unit
+	// sends it in a later change; httpx.DecodeJSON rejects unknown fields, so this field MUST
+	// exist here or a new worker's report 400s.
+	CompletionQuestion bool `json:"completion_question"`
 	// OpenFollowupID is the park-scoped follow_up watermark reported by the worker on
 	// the `awaiting_followup` transition ONLY (issue #559 M1): the highest follow_up id
 	// the worker has already APPLIED to a turn at the moment it parks. The server CLAMPS
@@ -2321,8 +2333,18 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		if len([]rune(qid)) > maxQuestionIDRunes {
 			return store.Run{}, false, fmt.Errorf("%w: open_question_id is too long", ErrInvalidState)
 		}
+		// PRD #1226 M5: stamp the completion-question marker to now() ONLY when the worker
+		// flags this park as a COMPLETION question; an ordinary ask_user clarification passes
+		// nil → SQL NULL, leaving the column NULL (byte-identical to the pre-marker behavior).
+		var completionQuestionAt *time.Time
+		if req.CompletionQuestion {
+			now := time.Now().UTC()
+			completionQuestionAt = &now
+		}
 		rows, err = s.q.SetRunAwaitingInput(ctx, store.SetRunAwaitingInputParams{
-			OpenQuestionID: pgconv.TextOrNull(qid), SessionID: sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
+			OpenQuestionID:       pgconv.TextOrNull(qid),
+			CompletionQuestionAt: pgconv.TimePtr(completionQuestionAt),
+			SessionID:            sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
 		})
 	case "awaiting_followup":
 		// PRD #517 M2/M3 (Decision 3): the interactive-task park. On signal_done an

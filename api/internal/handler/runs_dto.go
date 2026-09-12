@@ -83,27 +83,27 @@ func pauseRequestedRule(pauseMode string, frozenLen, completedLen, afterCount in
 // it lives in exactly one place and one test table.
 //   - not interlocked → "" (a legacy / rollout-OFF run has no completion phase).
 //   - held ("completion_blocked") → "blocked" (takes precedence over the running states below).
-//   - parked in the LIVE completion-question window (awaiting_input, interlocked, past a first
-//     attempt, before the hold so hold_reason is still empty) → "blocked". Without this arm such
-//     a run derives "" — indistinguishable from a legacy run — so the web/CLI would show nothing
-//     while the run is in fact blocked pending the owner's continue decision. It reuses the SAME
-//     interlock+attempts proxy completionQuestionOpen (the decision endpoint's admit condition)
-//     uses, and shows the SAME honest "blocked" label as the paused hold. KNOWN IMPRECISION: an
-//     interlocked run with a prior attempt parked on an ORDINARY ask_user clarification (not a
-//     completion question) would also match this proxy and read as "blocked". This is the same
-//     rollout-OFF-inert imprecision completionQuestionOpen carries, to be tightened with a
-//     dedicated completion-question marker before rollout.
+//   - parked in the LIVE completion-question window (awaiting_input, interlocked, with the
+//     dedicated completion-question marker set, before the hold so hold_reason is still empty) →
+//     "blocked". Without this arm such a run derives "" — indistinguishable from a legacy run — so
+//     the web/CLI would show nothing while the run is in fact blocked pending the owner's continue
+//     decision. It keys on completionQuestionOpen (run.CompletionQuestionAt.Valid), the SAME
+//     dedicated marker the decision endpoint admits on, and shows the SAME honest "blocked" label
+//     as the paused hold. The marker is authored ONLY by a worker completion-question report, so
+//     an ORDINARY ask_user clarification — even on an interlocked run past a completion attempt —
+//     no longer matches this arm (the imprecision the old interlock+attempts proxy carried is
+//     gone: the arm is now precise).
 //   - running past a first attempt, some criteria still unmet → "reworking".
 //   - running past a first attempt, none unmet → "checking".
 //   - anything else (no attempt yet, not running) → "".
-func completionPhaseRule(interlocked bool, status, holdReason string, attempts, unmetCount int) string {
+func completionPhaseRule(interlocked bool, status, holdReason string, completionQuestionOpen bool, attempts, unmetCount int) string {
 	if !interlocked {
 		return ""
 	}
 	if holdReason == "completion_blocked" {
 		return "blocked"
 	}
-	if status == "awaiting_input" && attempts > 0 {
+	if status == "awaiting_input" && completionQuestionOpen {
 		return "blocked"
 	}
 	if status == "running" && attempts > 0 {
@@ -385,7 +385,7 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration) ap
 		holdCtx := "unavailable(same_worker_only)"
 		dto.HoldContext = &holdCtx
 	}
-	dto.CompletionPhase = completionPhaseRule(dto.CompletionInterlock, r.Status, holdReason, dto.CompletionAttempts, len(dto.CompletionUnmet))
+	dto.CompletionPhase = completionPhaseRule(dto.CompletionInterlock, r.Status, holdReason, r.CompletionQuestionAt.Valid, dto.CompletionAttempts, len(dto.CompletionUnmet))
 	// PRD #362 M1, Decision 6 (tolerate-on-read): decode the summary_deltas jsonb into
 	// the typed slice; a malformed or unexpected value renders as NO deltas (nil), logged
 	// and never a panic — the deltas are advisory and a prior write's data, not an

@@ -26,9 +26,12 @@ import (
 //     decision resumes IN PLACE. There is NO status transition here — the worker reports
 //     `running` itself when its steering poll picks up the ANSWER and it resumes its loop
 //     (SetRunRunning then clears the hold on that first accepted running report). The window is
-//     identified the SAME way SetRunCompletionHold admits awaiting_input: an INTERLOCKED run
-//     (completion_contract_version set) with at least one recorded completion attempt. A live
-//     completion question ALWAYS carries an open_question_id (the worker names it at the ask);
+//     identified by the DEDICATED completion-question marker (completion_question_at, set by
+//     SetRunAwaitingInput only when the worker's report flagged a COMPLETION question) via
+//     completionQuestionOpen — NOT the old interlock+attempts proxy, which also matched an
+//     ordinary PRD #88 clarification on an interlocked post-attempt run. The marker distinguishes
+//     the question KIND; the open_question_id below distinguishes only its identity. A live
+//     completion question ALSO carries an open_question_id (the worker names it at the ask);
 //     without one the worker's await (steering.awaitAnswer) can never resolve, so a missing id
 //     is not a real completion window and is refused like any non-blocked run.
 //   - paused with hold_reason='completion_blocked': the lead was reaped (or the owner already
@@ -76,9 +79,12 @@ func (s *Service) ContinueCompletionDecision(ctx context.Context, userID, runID 
 	paused := false
 	switch {
 	case run.Status == "awaiting_input" && completionQuestionOpen(run):
-		// Live window: no transition — the worker reports running itself on resume. A completion
-		// question always names an open_question_id; without one the answer cannot resolve the
-		// worker's await, so this is not a real completion window (refuse like any non-blocked run).
+		// Live window: no transition — the worker reports running itself on resume.
+		// completionQuestionOpen already proved this is a COMPLETION question (the marker), not an
+		// ordinary clarification, so the answer written below cannot resolve the wrong question. The
+		// open_question_id is a SEPARATE requirement — it names WHICH question, not its kind: a
+		// completion question always names one, and without it the answer cannot resolve the worker's
+		// await (steering.awaitAnswer keys on the id), so a missing id is refused like a non-blocked run.
 		if !run.OpenQuestionID.Valid || run.OpenQuestionID.String == "" {
 			return store.Run{}, ErrCompletionNotBlocked
 		}
@@ -145,12 +151,15 @@ func (s *Service) ContinueCompletionDecision(ctx context.Context, userID, runID 
 }
 
 // completionQuestionOpen reports whether an awaiting_input run is parked on the completion
-// interlock's question window rather than an ordinary PRD #88 clarification question. It uses the
-// SAME discriminator SetRunCompletionHold admits awaiting_input on: an INTERLOCKED run
-// (completion_contract_version set) that has recorded at least one completion attempt. A dedicated
-// completion-question marker is a later M5 refinement; until then this interlock+attempt pair is
-// the available, correct signal, and it keeps the decision endpoint in lockstep with the hold
-// transition's own admit condition.
+// interlock's question window rather than an ordinary PRD #88 clarification question. It keys on
+// the DEDICATED completion-question marker (completion_question_at), which SetRunAwaitingInput sets
+// ONLY when the worker's report flags a COMPLETION question and BOTH SetRunRunning and
+// SetRunCompletionHold clear on resolution. Because the marker is authored solely by a completion
+// question report, an ordinary ask_user clarification — even on an interlocked run past a
+// completion attempt — no longer matches, so the owner completion-continue can no longer deliver
+// its `answer` to (and wrongly resolve) the wrong question. This REPLACES the old
+// interlock+completion_attempts proxy, which matched any interlocked post-attempt awaiting_input
+// run regardless of what it was actually asking.
 func completionQuestionOpen(run store.Run) bool {
-	return run.CompletionContractVersion.Valid && run.CompletionAttempts > 0
+	return run.CompletionQuestionAt.Valid
 }

@@ -83,6 +83,18 @@ func (e interlockLiveDB) exhaustedSet(t *testing.T, runID uuid.UUID) bool {
 	return set
 }
 
+// completionMarkerSet reports whether the PRD #1226 M5 completion-question marker
+// (completion_question_at) is currently set on the run.
+func (e interlockLiveDB) completionMarkerSet(t *testing.T, runID uuid.UUID) bool {
+	t.Helper()
+	var set bool
+	if err := e.pool.QueryRow(e.ctx,
+		`SELECT completion_question_at IS NOT NULL FROM runs WHERE id = $1`, runID).Scan(&set); err != nil {
+		t.Fatalf("read completion_question_at: %v", err)
+	}
+	return set
+}
+
 // TestCompletionDecisionPausedResumesLiveDB (PRD #1226 M5, D7/D3): a paused run held on the
 // completion interlock (hold_reason='completion_blocked') accepts a continue decision — it resumes
 // THROUGH queued via ResumePausedRun, the hold columns are STILL set (cleared only on the first
@@ -190,9 +202,11 @@ func TestCompletionDecisionAwaitingInputResumesInPlaceLiveDB(t *testing.T) {
 	runID := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
 	const qid = "completion-q-abc123"
 	// Seed the live window: awaiting_input, a recorded attempt, the completion question's open id,
-	// and the served steer flag SET so the D3 clear is observable.
+	// the DEDICATED completion-question marker SET (completionQuestionOpen keys on it), and the
+	// served steer flag SET so the D3 clear is observable.
 	e.exec(t, `UPDATE runs SET status = 'awaiting_input', completion_attempts = 2,
-	               open_question_id = $2, completion_budget_exhausted_at = now() WHERE id = $1`, runID, qid)
+	               open_question_id = $2, completion_question_at = now(),
+	               completion_budget_exhausted_at = now() WHERE id = $1`, runID, qid)
 
 	const guidance = "resolve the open TODO in handler.go"
 	run, err := svc.ContinueCompletionDecision(e.ctx, e.userID, runID, guidance)
@@ -245,7 +259,8 @@ func TestCompletionDecisionAwaitingInputEmptyGuidanceSendsContinueSentinelLiveDB
 	wid := e.seedWorker(t, []string{"completion_interlock_v1"})
 	runID := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
 	const qid = "completion-q-empty"
-	e.exec(t, `UPDATE runs SET status = 'awaiting_input', completion_attempts = 1, open_question_id = $2 WHERE id = $1`, runID, qid)
+	e.exec(t, `UPDATE runs SET status = 'awaiting_input', completion_attempts = 1, open_question_id = $2,
+	               completion_question_at = now() WHERE id = $1`, runID, qid)
 
 	if _, err := svc.ContinueCompletionDecision(e.ctx, e.userID, runID, ""); err != nil {
 		t.Fatalf("ContinueCompletionDecision (awaiting_input, empty guidance): %v", err)
@@ -270,10 +285,10 @@ func TestCompletionDecisionAwaitingInputEmptyGuidanceSendsContinueSentinelLiveDB
 }
 
 // TestCompletionDecisionNotBlockedRefusedLiveDB (PRD #1226 M5, D7): a run in NEITHER
-// completion-blocked state is refused with ErrCompletionNotBlocked, and no rows are written. Three
+// completion-blocked state is refused with ErrCompletionNotBlocked, and no rows are written. Four
 // shapes: a plain running interlocked run with no attempt, a paused run held for a DIFFERENT reason
-// (owner pause, hold_reason NULL), and an awaiting_input run that is not in the completion window
-// (no recorded attempt — an ordinary clarification question).
+// (owner pause, hold_reason NULL), an awaiting_input run with NO completion-question marker (an
+// ordinary clarification), and a marker-set awaiting_input run missing its open_question_id.
 func TestCompletionDecisionNotBlockedRefusedLiveDB(t *testing.T) {
 	e := setupInterlockLiveDB(t)
 	svc := e.permitService(t)
@@ -314,23 +329,175 @@ func TestCompletionDecisionNotBlockedRefusedLiveDB(t *testing.T) {
 		}
 	})
 
-	t.Run("awaiting_input with no completion attempt (ordinary question)", func(t *testing.T) {
+	t.Run("awaiting_input with no completion marker (ordinary question)", func(t *testing.T) {
+		// No completion-question marker (completion_question_at NULL) — an ordinary clarification,
+		// which completionQuestionOpen no longer admits regardless of the attempt count.
 		runID := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
-		e.exec(t, `UPDATE runs SET status = 'awaiting_input' WHERE id = $1`, runID) // attempts=0
+		e.exec(t, `UPDATE runs SET status = 'awaiting_input' WHERE id = $1`, runID) // marker NULL, attempts=0
 		assertRefused(t, runID)
 		if s := e.runStatus(t, runID); s != "awaiting_input" {
 			t.Fatalf("a refused decision must leave status unchanged; got %q", s)
 		}
 	})
 
-	t.Run("awaiting_input completion window but no open_question_id", func(t *testing.T) {
-		// Interlocked, past a first attempt (so completionQuestionOpen admits it) but with NO
+	t.Run("awaiting_input completion window (marker set) but no open_question_id", func(t *testing.T) {
+		// The completion-question marker is SET (so completionQuestionOpen admits it) but there is NO
 		// open_question_id — the answer could never resolve the worker's await, so it is refused.
 		runID := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
-		e.exec(t, `UPDATE runs SET status = 'awaiting_input', completion_attempts = 2, open_question_id = NULL WHERE id = $1`, runID)
+		e.exec(t, `UPDATE runs SET status = 'awaiting_input', completion_attempts = 2,
+		               completion_question_at = now(), open_question_id = NULL WHERE id = $1`, runID)
 		assertRefused(t, runID)
 		if s := e.runStatus(t, runID); s != "awaiting_input" {
 			t.Fatalf("a refused decision must leave status unchanged; got %q", s)
 		}
 	})
+}
+
+// TestCompletionDecisionOrdinaryClarificationRefusedLiveDB (PRD #1226 M5) is the wrong-question-
+// refusal test the dedicated completion-question marker fixes. A run that is INTERLOCKED, past a
+// completion attempt (completion_attempts > 0) AND carries an open_question_id, but parked on an
+// ORDINARY PRD #88 ask_user clarification (completion_question_at NULL), used to match the old
+// interlock+attempts proxy — so an owner completion-continue would write an `answer` naming the
+// ordinary clarification's open_question_id and WRONGLY resolve it (a state mutation on the wrong
+// question). Keyed on the marker, completionQuestionOpen no longer admits it, so the decision is
+// REFUSED with ErrCompletionNotBlocked and NO answer/follow_up/completion_decision row is written.
+// This is the mutation-check target: neuter the marker (make completionQuestionOpen ignore
+// completion_question_at, or stop stamping it) and this test reddens (the decision is wrongly
+// accepted and an answer is written).
+func TestCompletionDecisionOrdinaryClarificationRefusedLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	svc := e.permitService(t)
+	wid := e.seedWorker(t, []string{"completion_interlock_v1"})
+	runID := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
+	// Interlocked, past an attempt, WITH an open_question_id — but NO completion-question marker:
+	// an ordinary clarification. The old proxy (interlock && attempts>0) would have accepted this.
+	e.exec(t, `UPDATE runs SET status = 'awaiting_input', completion_attempts = 2,
+	               open_question_id = 'ordinary-clarification-q' WHERE id = $1`, runID)
+
+	if _, err := svc.ContinueCompletionDecision(e.ctx, e.userID, runID, "guidance for the wrong question"); !errors.Is(err, ErrCompletionNotBlocked) {
+		t.Fatalf("an ordinary clarification (marker NULL) must be REFUSED with ErrCompletionNotBlocked; got %v", err)
+	}
+	if got := e.countInputs(t, runID, "answer"); got != 0 {
+		t.Fatalf("the refused decision must NOT write an answer (that would resolve the wrong question); answer rows = %d, want 0", got)
+	}
+	if got := e.countInputs(t, runID, "completion_decision"); got != 0 {
+		t.Fatalf("a refused decision must write no completion_decision row; got %d", got)
+	}
+	if got := e.countInputs(t, runID, "follow_up"); got != 0 {
+		t.Fatalf("a refused decision must write no follow_up; got %d", got)
+	}
+	if s := e.runStatus(t, runID); s != "awaiting_input" {
+		t.Fatalf("a refused decision must leave status unchanged; got %q", s)
+	}
+}
+
+// TestSetRunAwaitingInputCompletionMarkerLiveDB (PRD #1226 M5) pins the SetState → SetRunAwaitingInput
+// stamping: a report that flags a COMPLETION question (StateRequest.CompletionQuestion=true) stamps
+// completion_question_at, while an ORDINARY ask_user report (the flag absent/false) leaves it NULL —
+// byte-identical to the pre-marker park.
+func TestSetRunAwaitingInputCompletionMarkerLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	svc := e.permitService(t)
+	wid := e.seedWorker(t, []string{"completion_interlock_v1"})
+	wkr := store.Worker{ID: wid}
+
+	completionRun := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
+	if _, applied, err := svc.SetState(e.ctx, wkr, completionRun, StateRequest{
+		State:              "awaiting_input",
+		OpenQuestionID:     strPtr("completion-q-1"),
+		CompletionQuestion: true,
+	}); err != nil || !applied {
+		t.Fatalf("SetState(awaiting_input, completion): applied=%v err=%v", applied, err)
+	}
+	if !e.completionMarkerSet(t, completionRun) {
+		t.Fatal("a completion-question report (CompletionQuestion=true) must stamp completion_question_at")
+	}
+
+	ordinaryRun := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
+	if _, applied, err := svc.SetState(e.ctx, wkr, ordinaryRun, StateRequest{
+		State:          "awaiting_input",
+		OpenQuestionID: strPtr("ordinary-q-1"),
+	}); err != nil || !applied {
+		t.Fatalf("SetState(awaiting_input, ordinary): applied=%v err=%v", applied, err)
+	}
+	if e.completionMarkerSet(t, ordinaryRun) {
+		t.Fatal("an ordinary ask_user report (CompletionQuestion absent) must leave completion_question_at NULL")
+	}
+}
+
+// TestSetRunRunningClearsCompletionMarkerLiveDB (PRD #1226 M5): the completion-question marker is
+// RESOLVED when the run resumes to running (the owner's continue was accepted and the worker picked
+// up the answer), so SetRunRunning clears it — the "no setter leaves a resolved park marker behind"
+// convention. Seeds the live-window resume: awaiting_input with the marker + open_question_id and a
+// CONSUMED answer naming that id (which satisfies SetRunRunning's awaiting_input→running guard), then
+// the running report clears the marker.
+func TestSetRunRunningClearsCompletionMarkerLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	wid := e.seedWorker(t, []string{"completion_interlock_v1"})
+	runID := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
+	const qid = "completion-q-resume"
+	e.exec(t, `UPDATE runs SET status = 'awaiting_input', completion_attempts = 1,
+	               open_question_id = $2, completion_question_at = now() WHERE id = $1`, runID, qid)
+	// A consumed answer naming the open question — the awaiting_input→running guard requires it.
+	e.exec(t, `INSERT INTO run_user_inputs (run_id, kind, body, question_id, consumed_at)
+	           VALUES ($1, 'answer', '{"question_id":"`+qid+`","answers":["continue"]}', $2, now())`,
+		runID, qid)
+	if !e.completionMarkerSet(t, runID) {
+		t.Fatal("precondition: the marker must be set before the running report")
+	}
+
+	rows, err := e.q.SetRunRunning(e.ctx, store.SetRunRunningParams{
+		IterationCount:           1,
+		RunMaxIterations:         5,
+		MilestoneBudgetCap:       milestoneBudgetCap,
+		RunTimeoutSeconds:        7200,
+		BudgetWallCeilingSeconds: budgetWallCeilingSeconds,
+		ID:                       runID,
+		WorkerID:                 pgtype.UUID{Bytes: wid, Valid: true},
+	})
+	if err != nil {
+		t.Fatalf("SetRunRunning (live-window resume): %v", err)
+	}
+	if rows != 1 {
+		t.Fatalf("SetRunRunning affected %d rows, want 1 (the answer guard must admit the resume)", rows)
+	}
+	if s := e.runStatus(t, runID); s != "running" {
+		t.Fatalf("status after the running report = %q, want running", s)
+	}
+	if e.completionMarkerSet(t, runID) {
+		t.Fatal("SetRunRunning must CLEAR completion_question_at on the first running report")
+	}
+}
+
+// TestSetRunCompletionHoldClearsCompletionMarkerLiveDB (PRD #1226 M5): a run in the live
+// completion-question window (awaiting_input, interlocked, past an attempt, marker set) that the
+// worker decides to hold enters the completion hold — SetRunCompletionHold resolves the question and
+// clears the marker alongside open_question_id, by the same convention.
+func TestSetRunCompletionHoldClearsCompletionMarkerLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	wid := e.seedWorker(t, []string{"completion_interlock_v1"})
+	runID := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
+	e.exec(t, `UPDATE runs SET status = 'awaiting_input', completion_attempts = 1,
+	               open_question_id = 'completion-q-hold', completion_question_at = now() WHERE id = $1`, runID)
+	if !e.completionMarkerSet(t, runID) {
+		t.Fatal("precondition: the marker must be set before the hold")
+	}
+
+	held, err := e.q.SetRunCompletionHold(e.ctx, store.SetRunCompletionHoldParams{
+		ID:               runID,
+		WorkerID:         pgtype.UUID{Bytes: wid, Valid: true},
+		HoldCapturedHead: pgtype.Text{String: "capturedhead-hold", Valid: true},
+	})
+	if err != nil {
+		t.Fatalf("SetRunCompletionHold (awaiting_input source): %v", err)
+	}
+	if held.Status != "paused" {
+		t.Fatalf("SetRunCompletionHold must park the run at paused; got %q", held.Status)
+	}
+	if held.CompletionQuestionAt.Valid {
+		t.Fatal("SetRunCompletionHold must CLEAR completion_question_at on hold entry")
+	}
+	if e.completionMarkerSet(t, runID) {
+		t.Fatal("completion_question_at must be NULL in the row after the hold")
+	}
 }
