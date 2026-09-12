@@ -166,6 +166,26 @@ type Client interface {
 	// snapshot (PRD #602 M6): GET /api/admin/agent-source. READ-ONLY — the sync/
 	// apply writes stay web-only (cookie-only), so the CLI never triggers a fetch.
 	AdminAgentSource(ctx context.Context) (apitypes.AgentSourceDTO, error)
+	// AdminJudgeBacklog reads the admin "All users" aggregate backlog (PRD #1184 M5):
+	// GET /api/admin/judge/recommendations. Every user's recommendations deduped by
+	// (category, target), attribution hidden — the reply is an unenveloped
+	// JudgeAdminBacklogDTO whose groups carry user_count/run_count/open_count and
+	// occurrences with NO run id, title or rec id. Mounted in the admin READ group
+	// (RequireUser + RequireAdminRO), so a uza_ token reads it and a masked uzc_/
+	// non-admin session is a 403 (exit 3).
+	//
+	// bucket and category are forwarded VERBATIM like the owner JudgeBacklog, empty
+	// omits the parameter so the server's default applies (todo / all labels), and the
+	// server owns both validators — an unknown value comes back as its own 400 → the
+	// usage exit code, never a silently empty list. There is deliberately NO runAnchor
+	// parameter: the admin path has no ?run= anchor (an anchor names a run, which is
+	// the attribution this view hides).
+	AdminJudgeBacklog(ctx context.Context, bucket, category string) (apitypes.JudgeAdminBacklogDTO, error)
+	// AdminJudgeStats reads the admin "All users" triage tally (PRD #1184 M5): GET
+	// /api/admin/judge/stats. Attribution-free by construction — it is a count. Same
+	// admin READ group as AdminJudgeBacklog; the reply is an unenveloped TriageDTO,
+	// exactly like the owner JudgeStats.
+	AdminJudgeStats(ctx context.Context) (apitypes.TriageDTO, error)
 
 	// StartCLIAuth begins a browser-brokered login: POST /api/auth/cli/start with the
 	// PKCE S256 challenge and a client description. UNAUTH by design (the CLI has no

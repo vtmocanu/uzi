@@ -254,10 +254,21 @@ type FakeClient struct {
 	LastBacklogRun        string
 	LastBacklogCategory   string
 	BulkDispositionResult apitypes.JudgeDispositionResultDTO
-	LastBulkItems         []apitypes.JudgeDispositionCoordDTO
-	LastBulkStatus        string
-	LastBulkReason        string
-	BulkDispositionErr    error
+
+	// Admin "All users" judge reads (PRD #1184 M5). AdminJudgeBacklogResult /
+	// AdminJudgeStatsResult are the canned `uzi admin review backlog` / `stats` replies;
+	// LastAdminBacklogBucket / LastAdminBacklogCategory record the params the command
+	// forwarded, empty meaning the flag was unset and the parameter omitted (server
+	// default), so the fake must NOT substitute one — mirroring LastBacklogBucket. There is
+	// deliberately no LastAdminBacklogRun: the admin backlog has no --run flag.
+	AdminJudgeBacklogResult  apitypes.JudgeAdminBacklogDTO
+	AdminJudgeStatsResult    apitypes.TriageDTO
+	LastAdminBacklogBucket   string
+	LastAdminBacklogCategory string
+	LastBulkItems            []apitypes.JudgeDispositionCoordDTO
+	LastBulkStatus           string
+	LastBulkReason           string
+	BulkDispositionErr       error
 
 	// Live stream (PRD #112 M2). StreamEvents is replayed to the subscriber in
 	// order; StreamErr models a socket that cannot be opened at all.

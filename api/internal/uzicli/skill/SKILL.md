@@ -223,6 +223,8 @@ uzi admin guardrail-impact
 uzi admin blocked-repos
 uzi admin agent-source get
 uzi admin agent-source status
+uzi admin review backlog [--bucket todo|filed|done|dismissed|all] [--category <label,label>]
+uzi admin review stats
 uzi skill status [--target claude|codex|all]
 uzi skill install [--force] [--target claude|codex|all]
 uzi skill install-hook [--target claude|codex|all]
@@ -1229,6 +1231,14 @@ into `file`/`dismiss`. `undo` keys on the `disposition_id` field (read it from
   reads the agent-source config (repo, ref, enabled, interval, and whether a
   credential is set — never its value) and sync status (last sync/apply, staged
   counts, pending); the "Sync now" and approve-and-apply writes stay web-only.
+- `uzi admin review backlog|stats` (PRD #1184) — the read-only admin **"All users"**
+  judge aggregate: every user's recommendations deduped by `(category, target)` across
+  the whole factory, with **attribution hidden**. `backlog` prints one line per group as
+  `K users · M runs · N open` and NO per-run or occurrence line — no owner, run id or run
+  title is shown — and takes `--bucket`/`--category` (same verbatim, server-validated
+  forwarding as `uzi review backlog`, but no `--run`: an anchor names a run). `stats` is
+  the all-users triage tally. Same `uza_`-token, read-only ceiling as every other `uzi
+  admin` verb; the cross-user Mark done / Undo stay cookie-only in the web UI.
 
 ### Handoff — ephemeral branch-scoped task runs
 
