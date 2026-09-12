@@ -87,7 +87,14 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 	// the server set a deadline (a running issue run) — right after HEALTH, and emit-only-
 	// when-set like HEALTH_REASON below, so a chat/judge/non-running run prints no new row.
 	if r.DeadlineAt != nil {
-		rows = append(rows, []string{"DEADLINE", deadlineCell(*r.DeadlineAt, time.Now())})
+		cell := deadlineCell(*r.DeadlineAt, time.Now())
+		// PRD #1189 M3: name the owner-granted extension folded into this deadline, so the row
+		// reads "15:20 · 1h05m left · +2h extended" on an extended run. budget_extension_seconds
+		// is a non-pointer int (0 = never extended), so the clause is emit-only-when-positive.
+		if r.BudgetExtensionSeconds > 0 {
+			cell += " · +" + shortDuration(time.Duration(r.BudgetExtensionSeconds)*time.Second) + " extended"
+		}
+		rows = append(rows, []string{"DEADLINE", cell})
 	}
 	if r.HealthReason != nil && *r.HealthReason != "" {
 		rows = append(rows, []string{"HEALTH_REASON", sanitizeTTY(*r.HealthReason)})

@@ -6,11 +6,14 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
@@ -124,6 +127,148 @@ func newRunPauseCmd(env Env, gf *globalFlags) *cobra.Command {
 	pause.Flags().Bool("now", false, "drop the turn in flight and park on the last checkpoint (default: finish the current milestone first)")
 	pause.Flags().Bool("cancel", false, "withdraw a pending pause request (the run keeps running)")
 	return pause
+}
+
+// newRunExtendCmd builds `uzi run extend` (PRD #1189 M3).
+//
+// It rides the SAME POST /inputs path the sibling steering verbs use (c.SubmitRunInput),
+// posting kind=extend with a body of whole seconds parsed from --by, but prints its own
+// data-carrying line (like newRunPauseCmd) because a successful extend comes back with the
+// new deadline + running total on the response. The cap ("of 16h allowed") is NOT on the
+// response, so it is read best-effort off a `run get` fetch; if that read fails the line
+// stays truthful by dropping the "of <cap> allowed" tail rather than inventing a number.
+//
+// The kind allowlist and the extend guards are the server's: a disabled cap
+// (ErrExtendDisabled), an over-cap request (ErrExtensionCapExceeded) and an untimed kind
+// (ErrExtendNotTimed) all come back as 409 (exit 5), and a body under the minimum as 400
+// (exit 2), each with the server's message printed verbatim — the same `return err` flow
+// scope/pause use.
+func newRunExtendCmd(env Env, gf *globalFlags) *cobra.Command {
+	extend := &cobra.Command{
+		Use:   "extend <run-id>",
+		Short: "Extend a run's wall-clock budget by a duration (owner-only): --by 2h",
+		Long: "Grant a non-terminal, time-limited run MORE wall-clock time so the sweep does not " +
+			"kill it at its current deadline (PRD #1189). Owner-only; the added time stacks on the " +
+			"frozen budget rather than replacing it, and the run's per-run extension allowance is an " +
+			"admin setting.\n\n" +
+			"--by takes a duration: Go's `2h`, `90m`, `1h30m`, plus a `d` (day = 24h) unit — `1d` is " +
+			"24h. It must be positive; `0`, a negative value or an unparseable one is a usage error " +
+			"(exit 2).\n\n" +
+			"Valid on any non-terminal run of a kind the sweep can time out (an issue, task, prompt, " +
+			"self-improve, mr-rework or ci-fix run), including a queued or parked one. A chat, judge " +
+			"or interactive-task run never times out, so extending one is a 409 (exit 5); an over-cap " +
+			"request, or extending while the admin has turned extensions off, is also a 409, with the " +
+			"server's message printed verbatim.",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := env.client(gf)
+			if err != nil {
+				return err
+			}
+			if !cmd.Flags().Changed("by") {
+				if !gf.quiet {
+					_, _ = fmt.Fprintln(env.Stderr, "run extend needs --by <duration> (e.g. --by 2h, --by 90m, --by 1h30m, --by 1d)")
+				}
+				return uzicli.Exitf(uzicli.ExitUsage, "run extend needs --by <duration>")
+			}
+			by, _ := cmd.Flags().GetString("by")
+			seconds, err := parseExtendDuration(by)
+			if err != nil {
+				return err
+			}
+			runID := args[0]
+			res, err := c.SubmitRunInput(cmd.Context(), runID, kindExtend, strconv.Itoa(seconds), nil)
+			if err != nil {
+				return err
+			}
+			p := env.printer(gf)
+			if p.Format == uzicli.FormatJSON {
+				return p.JSON(res)
+			}
+			if gf.quiet {
+				return nil
+			}
+			// The response carries the new total + deadline; the per-run cap is a stable admin
+			// setting the response does not repeat, so read it best-effort off the run. A failed
+			// read leaves capSeconds 0 and extendSuccessLine drops the "of <cap> allowed" tail.
+			capSeconds := 0
+			if run, gerr := c.GetRun(cmd.Context(), runID); gerr == nil {
+				capSeconds = run.BudgetExtensionCapSeconds
+			}
+			p.Printf("%s\n", extendSuccessLine(runID, seconds, res, capSeconds, time.Now()))
+			return nil
+		},
+	}
+	extend.Flags().String("by", "", "how much wall-clock time to add: 2h, 90m, 1h30m, 1d (day = 24h); required, must be positive")
+	return extend
+}
+
+// extendDaysRe matches a LEADING days token ("1d", "2d", "1d12h", "-1d") so parseExtendDuration
+// can rewrite it into hours — time.ParseDuration knows h/m/s but not `d`.
+var extendDaysRe = regexp.MustCompile(`^(-?)(\d+(?:\.\d+)?)d(.*)$`)
+
+// parseExtendDuration parses the --by value into whole seconds for the `extend` body. It
+// accepts Go's time.ParseDuration syntax (2h, 90m, 1h30m) PLUS a `d` (day = 24h) unit that
+// time.ParseDuration does not know (1d, 1d12h). A zero, negative or unparseable value is a
+// usage error (ExitUsage) so a typo fails fast rather than posting a no-op extension.
+func parseExtendDuration(s string) (int, error) {
+	raw := strings.TrimSpace(s)
+	d, err := parseDurationWithDays(raw)
+	if err != nil {
+		return 0, uzicli.Exitf(uzicli.ExitUsage, "--by %q is not a valid duration (try 2h, 90m, 1h30m, 1d)", s)
+	}
+	if d <= 0 {
+		return 0, uzicli.Exitf(uzicli.ExitUsage, "--by must be a positive duration (got %q)", s)
+	}
+	return int(d / time.Second), nil
+}
+
+// parseDurationWithDays is time.ParseDuration extended with a leading `d` (day) unit. A
+// leading days token is rewritten into hours (1 day = 24h) and the remainder handed to
+// time.ParseDuration, whose repeated units sum — so "1d12h" becomes "24h12h" = 36h. A
+// leading sign applies to the whole duration. Everything without a `d` token goes straight
+// to time.ParseDuration unchanged.
+func parseDurationWithDays(s string) (time.Duration, error) {
+	if m := extendDaysRe.FindStringSubmatch(s); m != nil {
+		days, err := strconv.ParseFloat(m[2], 64)
+		if err != nil {
+			return 0, err
+		}
+		rewritten := m[1] + strconv.FormatFloat(days*24, 'f', -1, 64) + "h" + m[3]
+		return time.ParseDuration(rewritten)
+	}
+	return time.ParseDuration(s)
+}
+
+// extendSuccessLine is the human confirmation for a successful `run extend` (PRD #1189 M3):
+//
+//	Extended <id> by 2h. 3h05m left, times out 17:20. Extensions on this run: 2h of 16h allowed.
+//
+// "by" is the REQUESTED duration; the "left"/"times out" clause is derived from the response's
+// deadline_at (local zone, via the CLI's existing formatters); and the allowance is the new
+// running total (response) against the per-run cap (fetched run DTO). Clauses the response does
+// not carry are dropped rather than fabricated: a run extended while queued/parked carries no
+// deadline_at yet (the sweep only computes one for a running run), so the deadline clause is
+// omitted; and a failed cap read drops just the "of <cap> allowed" tail.
+func extendSuccessLine(runID string, requestedSeconds int, res apitypes.RunInputResponse, capSeconds int, now time.Time) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Extended %s by %s.", runID, shortDuration(time.Duration(requestedSeconds)*time.Second))
+	if res.DeadlineAt != nil {
+		left := res.DeadlineAt.Sub(now)
+		if left < 0 {
+			left = 0
+		}
+		fmt.Fprintf(&b, " %s left, times out %s.", fmtUntil(left), res.DeadlineAt.Local().Format("15:04"))
+	}
+	if res.ExtensionSeconds != nil {
+		total := shortDuration(time.Duration(*res.ExtensionSeconds) * time.Second)
+		if capSeconds > 0 {
+			fmt.Fprintf(&b, " Extensions on this run: %s of %s allowed.", total, shortDuration(time.Duration(capSeconds)*time.Second))
+		} else {
+			fmt.Fprintf(&b, " Extensions on this run: %s.", total)
+		}
+	}
+	return b.String()
 }
 
 // newRunFollowUpCmd builds `uzi run follow-up`.
