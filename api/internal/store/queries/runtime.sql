@@ -971,6 +971,40 @@ UPDATE runs SET
     -- evaluates the WHERE and every SET right-hand side against the OLD row, which is
     -- the same mechanism the health CASE arms below already rely on.
     open_question_id = NULL,
+    -- PRD #1226 M5: the completion-QUESTION marker is RESOLVED when the run resumes to running
+    -- (the owner's continue was accepted and the worker picked up the answer), so it must not
+    -- survive — the SAME "no setter leaves a resolved park marker behind" discipline as
+    -- open_question_id directly above (both mark a resolved question). Cleared UNCONDITIONALLY:
+    -- a running run never carries the marker, so a running → running heartbeat re-clears an
+    -- already-NULL column (a no-op), and the completion-question window can only resolve to
+    -- running (here) or the hold (SetRunCompletionHold).
+    completion_question_at = NULL,
+    -- PRD #1226 M5 (D7): the completion hold is OVER the instant the worker reports running
+    -- again — a resumed completion-blocked run (paused → queued → claimed → running, or the
+    -- live awaiting_input window resuming in place) is once more executing, so the hold
+    -- ANNOTATIONS must not survive it. This is the D7 "clears the hold on the FIRST accepted
+    -- running report": ResumePausedRun deliberately leaves them set (the decision is not yet
+    -- acted on), and here the first running report clears them — the SAME "no setter leaves a
+    -- resolved park marker behind" discipline as open_question_id above. Cleared
+    -- UNCONDITIONALLY (not CASE'd on entry): a running → running heartbeat re-clears columns
+    -- that are already NULL on a running run, so it is a no-op there, and any resume path that
+    -- reaches running must end the hold.
+    --
+    -- ONLY hold_reason/hold_captured_head are cleared here — they are paused-run annotations,
+    -- never set on a running run, so this is a no-op on a heartbeat and the real clear happens on
+    -- the resume→running transition. completion_budget_exhausted_at is deliberately NOT cleared
+    -- here: it is the M4/D3 one-shot SERVED steer flag, ARMED by StampCompletionBudgetExhausted on
+    -- a `status='running'` run and read off the SAME running-report ACK the worker routes to the
+    -- completion hold (RunDTO.CompletionBudgetExhausted). Clearing it in this statement would
+    -- disarm the steer with the very report meant to carry it — SetState calls SetRunRunning and
+    -- THEN re-reads the row for the ACK, so a clear here always ACKs budgetExhausted=false and the
+    -- worker could never enter the hold on the server's steer. Its ONLY clear is SetRunCompletionHold
+    -- (the worker actually entering the hold — the D3 "a stale ack cannot re-arm the steer" contract)
+    -- or an owner decision acting on it. On a resume-from-hold it is already NULL (SetRunCompletionHold
+    -- cleared it on hold entry); on a normal running heartbeat a set flag is the ACTIVE steer that MUST
+    -- survive to reach the worker's ACK.
+    hold_reason                    = NULL,
+    hold_captured_head             = NULL,
     started_at       = COALESCE(started_at, now()),
     iteration_count  = GREATEST(iteration_count, @iteration_count),
     session_id       = COALESCE(sqlc.narg('session_id'), session_id),
@@ -1748,6 +1782,60 @@ WHERE id = @id AND worker_id = @worker_id
   AND status = 'running'
   AND pause_requested_at IS NOT NULL;
 
+-- name: SetRunCompletionHold :one
+-- Park an OWNED, INTERLOCKED run on the completion interlock's dedicated HOLD transition
+-- (PRD #1226 M4, D6). This is a SIBLING of SetRunPaused, NOT a widening of it: the owner-pause
+-- park (SetRunPaused) and this completion hold are two different reasons a run reaches `paused`,
+-- and each keeps its own guard so neither can be reached by the other's report. running OR
+-- awaiting_input -> paused, NON-TERMINAL.
+--
+-- THE GUARD admits ONLY an owned interlocked run in `running` OR `awaiting_input` (unlike
+-- SetRunPaused, whose source is `running` + a pending pause request) that has RECORDED AT LEAST
+-- ONE completion attempt (completion_attempts > 0). awaiting_input is admitted because the M5
+-- completion-question path can leave a still-live interlocked run in that status when the worker
+-- decides to hold. completion_contract_version IS NOT NULL keeps a legacy run out (it never
+-- interlocks). 0 rows (the guard fails) is the ACK the worker's park order reads: a non-`paused`
+-- ack means the run must be RETAINED LIVE, never cleaned up.
+--
+-- hold_reason is set to the single reason this milestone defines, 'completion_blocked'; #1229
+-- adds further reasons additively (the column is unconstrained text). hold_captured_head records
+-- the EXACT head the worker captured at hold time (sqlc.narg — nullable; an empty captured head
+-- is allowed via pgconv.TextOrNull).
+--
+-- open_question_id is CLEARED, following the "NO SETTER MAY LEAVE A RESOLVED open_question_id
+-- BEHIND" convention (see SetRunRunning / SetRunAwaitingApproval): the (worker-authored, M5)
+-- completion question the run may have parked on is resolved by this hold, so its id must not
+-- survive. completion_question_at (the PRD #1226 M5 completion-QUESTION marker) is CLEARED for
+-- the SAME reason and by the SAME convention: entering the hold resolves the completion
+-- question the run was parked on, so the marker must not survive alongside a resolved
+-- open_question_id. completion_budget_exhausted_at is CLEARED because the worker acting on the
+-- served steer is exactly the D3 "clears it so a stale ack cannot re-arm" contract.
+--
+-- It deliberately does NOT clear completion_attempts / latest_completion_attempt (M5's
+-- honest-state UI reads them), and it does NOT touch the pending-pause columns
+-- (pause_requested_at / pause_mode / pause_after_count) — this is not an owner pause, so
+-- SetRunPaused's consume-the-request semantics do not apply and are left untouched.
+--
+-- THE HEALTH RESET is mandatory for SetRunPaused's reason: ListActiveRunsForHealth is a positive
+-- allowlist that never revisits a park, so a flag live at hold time would freeze for the whole
+-- hold. session_id is COALESCE'd (sqlc.narg) so an omitting report preserves it.
+UPDATE runs SET
+    status                         = 'paused',
+    status_since                   = now(),
+    session_id                     = COALESCE(sqlc.narg('session_id'), session_id),
+    hold_reason                    = 'completion_blocked',
+    hold_captured_head             = sqlc.narg('hold_captured_head'),
+    open_question_id               = NULL,
+    completion_question_at         = NULL,
+    completion_budget_exhausted_at = NULL,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at                     = now()
+WHERE id = @id AND worker_id = @worker_id
+  AND status IN ('running', 'awaiting_input')
+  AND completion_contract_version IS NOT NULL
+  AND completion_attempts > 0
+RETURNING *;
+
 -- name: ResumePausedRun :one
 -- Owner-scoped resume of ONE paused run (PRD #1190 M1): paused -> queued, the on-demand
 -- counterpart to PromoteLimitWaitRuns but with the GATE-PARK accounting (Decision 2), NOT the
@@ -1814,10 +1902,22 @@ WHERE id = @id AND worker_id = @worker_id;
 -- resumed worker re-parking on the SAME question re-stamps the SAME value (it reads
 -- it back off the claim), which is what makes the SetRunRunning guard above a no-op
 -- across a requeue instead of a silent rejection of an already-submitted answer.
+--
+-- completion_question_at is the PRD #1226 M5 completion-QUESTION discriminator marker. The
+-- caller passes a non-NULL timestamp ONLY when the worker's report flags a COMPLETION
+-- question (SetState maps req.CompletionQuestion → now()); an ordinary PRD #88 ask_user
+-- clarification passes NULL, so the column stays NULL and the behavior is byte-identical to
+-- the pre-marker park. It is assigned UNCONDITIONALLY (not COALESCE'd) so a re-park as an
+-- ordinary question after a completion question clears a stale marker — but a resumed worker
+-- re-parking on the SAME completion question re-stamps a fresh now(). completionQuestionOpen
+-- (the decision endpoint's admit condition) and completionPhaseRule key on this marker, so an
+-- ordinary clarification on an interlocked post-attempt run no longer reads as a completion
+-- window and an owner completion-continue can never resolve the wrong question.
 UPDATE runs SET
     status           = 'awaiting_input',
     status_since     = now(),
     open_question_id = @open_question_id,
+    completion_question_at = sqlc.narg('completion_question_at'),
     session_id       = COALESCE(sqlc.narg('session_id'), session_id),
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
@@ -2525,6 +2625,58 @@ WHERE status = 'running'
       )
   )
 RETURNING id, user_id, status;
+
+-- name: StampCompletionBudgetExhausted :execrows
+-- PRD #1226 M4 (D3): the server-side served `budget_exhausted` steer. It is the COMPLEMENT of
+-- SweepRunningTimeout — it stamps EXACTLY the rows that sweep DELIBERATELY SPARED via its
+-- completion-interlock carve-out (the `AND NOT (completion_attempts > 0 AND worker_id IN
+-- <live-heartbeat>)` clause above). Those spared rows are past their wall budget but held live
+-- by a working lead, and they must not run forever: this stamp arms a ONE-SHOT served flag
+-- (completion_budget_exhausted_at) that the worker reads off its running-report ACK (the SAME
+-- delivery the pause_requested flag rides, surfaced as RunDTO.CompletionBudgetExhausted) and then
+-- routes to the completion hold — steering the live lead INTO the verified hold rather than
+-- terminal-failing it out from under a live worker.
+--
+-- The deadline math and the kind/interactive exemptions MIRROR SweepRunningTimeout EXACTLY (same
+-- per-run wall = COALESCE(budget_wall_seconds, global_timeout_seconds) + budget_paused_seconds,
+-- same 'chat'/'judge' and interactive=false exemptions), and the two carve-out predicates
+-- (completion_attempts > 0 AND the live-heartbeat worker subquery keyed on the SAME
+-- worker_stale_cutoff) are applied POSITIVELY here — so the stamp set is byte-for-byte the set the
+-- sweep excluded. completion_contract_version IS NOT NULL keeps a legacy run out (it never
+-- interlocks and so is never a candidate for the hold).
+--
+-- It is ONE-SHOT: `completion_budget_exhausted_at IS NULL` means a run is stamped at most once per
+-- exhaustion. The worker acting on the served steer CLEARS the flag — SetRunCompletionHold sets
+-- completion_budget_exhausted_at back to NULL (the D3 "clears it so a stale ACK cannot re-arm"
+-- contract) — so a running-report ACK that echoes a since-consumed flag can never re-arm the steer.
+UPDATE runs SET completion_budget_exhausted_at = now(), updated_at = now()
+WHERE status = 'running'
+  AND started_at < (sqlc.arg('now')::timestamptz
+        - make_interval(secs => COALESCE(budget_wall_seconds, sqlc.arg('global_timeout_seconds')::int)
+                              + budget_paused_seconds))
+  AND kind NOT IN ('chat', 'judge')
+  AND interactive = false
+  AND completion_attempts > 0
+  AND completion_contract_version IS NOT NULL
+  AND completion_budget_exhausted_at IS NULL
+  AND worker_id IN (
+      SELECT w.id FROM workers w
+      WHERE w.last_heartbeat_at IS NOT NULL
+        AND w.last_heartbeat_at >= sqlc.arg('worker_stale_cutoff')::timestamptz
+  );
+
+-- name: ClearCompletionBudgetExhausted :execrows
+-- PRD #1226 M5 (D3): a NEW OWNER DECISION clears the served `budget_exhausted` steer
+-- (completion_budget_exhausted_at). D3's clears are "acting on it, parking, or a new owner
+-- decision"; StampCompletionBudgetExhausted arms the one-shot flag and SetRunCompletionHold
+-- (the worker acting on it / parking) clears it — this is the third clear, the owner's
+-- CONTINUE decision (ContinueCompletionDecision). It is unconditional and id-scoped: on the
+-- paused branch the flag is already NULL (SetRunCompletionHold cleared it on hold entry), so
+-- this is a no-op there; on the LIVE awaiting_input completion-question branch the flag may
+-- still be set (the worker was steered into the completion question before entering a hold),
+-- and clearing it prevents the resumed worker being immediately re-steered into the hold off a
+-- since-consumed ACK. Owner scoping is enforced by the caller (GetRun read) before this runs.
+UPDATE runs SET completion_budget_exhausted_at = NULL, updated_at = now() WHERE id = @id;
 
 -- name: FailRunsOfStaleWorkersOverCap :many
 -- A stale worker's non-terminal run that has already used its re-queue budget →
@@ -3266,10 +3418,16 @@ WITH pending AS (
     -- the worker must NEVER drain it. Draining would hit SteeringChannel.route's default arm
     -- and log a spurious "unknown input kind". PRD #1190 adds 'resume' to that server-only
     -- set (the resume endpoint writes it as an audit row; the run's return to 'queued' is a
-    -- server-side transition, not a worker steering input). 'pause' and 'pause_cancel' are
-    -- NOT excluded — the worker DOES consume them (the `now` abort and the flag clear).
-    -- Everything else consumes as before.
-    WHERE p.run_id = @run_id AND p.consumed_at IS NULL AND p.kind NOT IN ('scope', 'resume')
+    -- server-side transition, not a worker steering input). PRD #1226 M5 (D7) adds
+    -- 'completion_decision' for the SAME reason: the owner continue-decision is a dedicated
+    -- endpoint's AUDIT row — its control travels via a SEPARATE input the worker DOES drain
+    -- (paused branch: a 'follow_up' the resumed claim's pullFollowUp reads, alongside the
+    -- paused → queued transition through ResumePausedRun; live awaiting_input branch: an
+    -- 'answer' that resolves the worker's completion-question await), never this raw row — so
+    -- draining it would likewise hit the default arm. 'pause' and
+    -- 'pause_cancel' are NOT excluded — the worker DOES consume them (the `now` abort and the
+    -- flag clear). Everything else consumes as before.
+    WHERE p.run_id = @run_id AND p.consumed_at IS NULL AND p.kind NOT IN ('scope', 'resume', 'completion_decision')
     ORDER BY p.id ASC
     FOR UPDATE SKIP LOCKED
 ),
@@ -3446,11 +3604,14 @@ UPDATE runs SET checkpoint_tip = @checkpoint_tip, checkpoint_tip_at = now() WHER
 -- a subset of any online worker's effective caps). kind was previously only a WHERE
 -- filter; it is projected now so the resolver can branch on it too. No sweeper change —
 -- a parked run stays queued and every sweep pass is scoped away from it by construction.
+-- PRD #1226 M1: completion_contract_version rides this read so the queued arm can surface a
+-- completion-capability reason for an INTERLOCKED run (version non-null) that no online worker
+-- implements the completion protocol — the non-bypassable claim clause can never be satisfied.
 SELECT id, user_id, status, auto_approve,
        started_at, last_activity_at, updated_at, status_since,
        health, health_reason, health_since, health_notified_at,
        budget_wall_seconds, budget_paused_seconds, interactive,
-       repo_id, kind, required_capabilities
+       repo_id, kind, required_capabilities, completion_contract_version
 FROM runs
 WHERE status IN ('queued', 'running', 'awaiting_approval')
   AND kind <> 'chat';
@@ -3617,6 +3778,31 @@ WHERE w.user_id = @user_id
   AND w.draining_since IS NULL
   AND NOT w.ephemeral
   AND @required_capabilities::text[] <@ fn_effective_worker_caps(w.capabilities, COALESCE(w.docker_enabled, false));
+
+-- name: CountOnlineWorkersSatisfyingProtocol :one
+-- PRD #1226 M1: how many of a user's ONLINE, non-draining, non-ephemeral workers self-report
+-- the 'completion_interlock_v1' PROTOCOL capability (workers.protocol_capabilities). This is the
+-- completion-interlock analogue of CountOnlineWorkersSatisfyingCaps: it answers "does the fleet
+-- have ANY worker that implements the completion protocol?", NOT "can THIS run be claimed right
+-- now?". It drives the queued-reason resolver's completion-capability rung (reasonNoCompletion
+-- CapableWorker): a 0 here for an INTERLOCKED queued run means every online worker predates the
+-- protocol, so the run's NON-BYPASSABLE claim clause (ClaimRun's `'completion_interlock_v1' =
+-- ANY(@worker_protocol_caps)`) can never be satisfied — a persistent block distinct from the
+-- generic wait, an ordinary capability gap, or the docker-allowlist fence.
+--
+-- It reads workers.protocol_capabilities DIRECTLY (the server-authoritative FilterProtocol'd
+-- column), NOT the effective-caps fold: the completion protocol is a self-reported protocol
+-- capability, deliberately OUTSIDE required_capabilities / the docker union / the capability-aware
+-- kill-switch (see ClaimRun's dedicated clause). draining_since IS NULL and NOT w.ephemeral mirror
+-- CountOnlineWorkersSatisfyingCaps for the same reasons (a draining worker claims nothing; an
+-- ephemeral worker is bound to one run and can never satisfy a different one). Only called for an
+-- interlocked queued run already past its health threshold, so it is off the hot path.
+SELECT count(*) FROM workers w
+WHERE w.user_id = @user_id
+  AND w.status = 'online'
+  AND w.draining_since IS NULL
+  AND NOT w.ephemeral
+  AND 'completion_interlock_v1' = ANY(w.protocol_capabilities);
 
 -- name: ListUnplaceableQueuedRunsForEphemeral :many
 -- The trigger query for the ephemeral auto-provisioner (PRD #529 M2). It returns the
@@ -4015,13 +4201,27 @@ RETURNING runs.completion_attempts;
 -- rather than re-issuing or un-consuming one. audit is NULL and finding_ids is '{}' under
 -- profile=structural (reserved for #1231). issued_by_worker_id is the claim fence.
 --
--- DO UPDATE SET branch = EXCLUDED.branch is the deliberate near-no-op forced by the
--- idempotency contract: a re-request for the SAME (run_id, contract_revision, head) carries
--- the same branch (a head fixes its branch), so this changes nothing; it exists only so
--- RETURNING yields the PRE-EXISTING row on conflict. It touches ONLY branch — issued_at,
--- issued_by_worker_id, consumed_at, audit and finding_ids are all preserved, so a re-request
--- never re-issues nor un-consumes the permit. (EXCLUDED.branch, not the target table by name,
--- because sqlc's analyzer treats a target-table self-reference in DO UPDATE as ambiguous.)
+-- DO UPDATE SET branch = EXCLUDED.branch, issued_by_worker_id = EXCLUDED.issued_by_worker_id
+-- REBINDS the permit to the REQUESTING worker on conflict. The idempotency contract still
+-- holds: a re-request by the SAME worker for the SAME (run_id, contract_revision, head)
+-- carries the same branch and worker id, so it changes nothing and RETURNING yields the
+-- PRE-EXISTING row. The rebind matters on an A->B REQUEUE: worker A issued a permit for
+-- (run, revision, head), the run requeued to worker B in a claimable state, and B re-requests
+-- for the same identity. Without the rebind the row keeps A's issued_by_worker_id, so B's
+-- completeRunWithPermit (which fences on B's id) can never find its permit -> the run is
+-- PERMANENTLY non-terminal. Rebinding issued_by_worker_id to EXCLUDED (B) hands the permit to
+-- whoever last requested it.
+--
+-- It touches ONLY branch and issued_by_worker_id — issued_at, consumed_at, audit and
+-- finding_ids are all PRESERVED (omitted columns keep their existing values). Leaving
+-- issued_at untouched preserves the M2 idempotency contract (a re-request returns the SAME
+-- permit rather than re-issuing one). Not touching consumed_at is provably correct: consumed_at
+-- is NULL on every ON CONFLICT path here, because consume+complete are atomic in
+-- completeRunWithPermit (so consumed ⇔ status='completed'), and a completed run's re-request is
+-- rejected at loadClaimedInterlockedRun's status gate (completion_permit.go) BEFORE it ever
+-- reaches this upsert. (EXCLUDED.<col>, not the target table by name, because sqlc's analyzer
+-- treats a target-table self-reference in a DO UPDATE SET value as ambiguous — so do NOT
+-- introduce a `CASE ... run_completion_permits.issued_at ...` to condition on the existing row.)
 --
 -- audit and finding_ids are DELIBERATELY OMITTED from the insert: their column defaults (NULL
 -- and '{}') are EXACTLY the structural values, and #1231 fills them by adding them here. This
@@ -4033,17 +4233,20 @@ INSERT INTO run_completion_permits (
     @run_id, @contract_revision, @branch, @head, sqlc.narg('issued_by_worker_id')
 )
 ON CONFLICT (run_id, contract_revision, head) DO UPDATE
-    SET branch = EXCLUDED.branch
+    SET branch = EXCLUDED.branch, issued_by_worker_id = EXCLUDED.issued_by_worker_id
 RETURNING *;
 
 -- name: GetUnconsumedCompletionPermit :one
 -- PRD #1226 M2 (D4/D5): fetch the UNCONSUMED permit for the exact identity, FOR UPDATE, inside
 -- the completion transaction. issued_by_worker_id fences it to the reporting worker (the claim
--- fence). No row (identity/head/revision mismatch, already consumed, or a different worker)
--- returns pgx.ErrNoRows, which completeRunWithPermit reads as "no matching permit -> the gated
+-- fence). branch binds the permit to the worker-reported source branch so a permit issued for
+-- branch A at head H cannot complete a report for branch B at the same head H. No row
+-- (identity/head/revision/branch mismatch, already consumed, or a different worker) returns
+-- pgx.ErrNoRows, which completeRunWithPermit reads as "no matching permit -> the gated
 -- completion stays non-terminal".
 SELECT * FROM run_completion_permits
 WHERE run_id = @run_id AND contract_revision = @contract_revision AND head = @head
+  AND branch = @branch
   AND issued_by_worker_id = @issued_by_worker_id
   AND consumed_at IS NULL
 FOR UPDATE;
@@ -4052,10 +4255,12 @@ FOR UPDATE;
 -- PRD #1226 M2 (D4): the retry-after-response-loss probe. When a completed report arrives for
 -- an ALREADY-terminal run, completeRunWithPermit checks whether THIS worker's permit for the
 -- identity was already consumed (i.e. we completed it once and the response was lost); if so it
--- returns idempotent success instead of a spurious denial. FOR UPDATE under the same
--- run-row lock so the check serializes with a concurrent first completion.
+-- returns idempotent success instead of a spurious denial. branch binds the probe to the
+-- worker-reported source branch, the same identity component the unconsumed lookup uses. FOR
+-- UPDATE under the same run-row lock so the check serializes with a concurrent first completion.
 SELECT * FROM run_completion_permits
 WHERE run_id = @run_id AND contract_revision = @contract_revision AND head = @head
+  AND branch = @branch
   AND issued_by_worker_id = @issued_by_worker_id
   AND consumed_at IS NOT NULL
 FOR UPDATE;

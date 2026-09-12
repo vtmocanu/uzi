@@ -107,7 +107,7 @@ func (e *Engine) runOnce(ctx context.Context) {
 	}
 	// Only log when the pass actually did something, to keep the log quiet on an
 	// idle system.
-	if res.WorkersOffline+res.ClaimedReset+res.RunningTimeout+res.StaleFailed+res.StaleRequeued+res.ChatIdleCompleted+res.ProposalsRecovered+res.HealthChanged+res.AutoStopped+res.LimitPromoted+res.PoolResumed+res.RecoveryPromoted > 0 {
+	if res.WorkersOffline+res.ClaimedReset+res.RunningTimeout+res.StaleFailed+res.StaleRequeued+res.ChatIdleCompleted+res.ProposalsRecovered+res.HealthChanged+res.AutoStopped+res.LimitPromoted+res.PoolResumed+res.RecoveryPromoted+res.CompletionBudgetExhausted > 0 {
 		slog.Info("sweeper pass",
 			"workers_offline", res.WorkersOffline,
 			"claimed_reset", res.ClaimedReset,
@@ -133,6 +133,10 @@ func (e *Engine) runOnce(ctx context.Context) {
 			// tick that only promotes a run out of recovery_wait (recovery_retry_not_before
 			// elapsed) still raises this line rather than resuming a held run invisibly.
 			"recovery_promoted", res.RecoveryPromoted,
+			// PRD #1226 M4 (D3): same reasoning — in the sum above as well as emitted here, so a
+			// tick that only arms the served budget_exhausted steer (a spared post-attempt
+			// live-worker run past its wall) still raises this line rather than steering invisibly.
+			"completion_budget_exhausted", res.CompletionBudgetExhausted,
 		)
 	}
 }

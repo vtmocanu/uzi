@@ -22,7 +22,7 @@ The final product rejects an incomplete completion attempt without failing the r
 
 | Order | Child | Delivery | Depends on |
 |---|---|---|---|
-| 1 | [#1226 Structural completion interlock and exact-head permit](1226-structural-completion-interlock.md) | Frozen structural contract, hard claim clause, same-lead rework, permit and recoverable same-worker hold | none |
+| 1 | [#1226 Structural completion interlock and exact-head permit](done/1226-structural-completion-interlock.md) | Frozen structural contract, hard claim clause, same-lead rework, permit and recoverable same-worker hold | none |
 | 2 | [#1227 Owner completion decisions and scope-reduced delivery](1227-completion-owner-decisions.md) | Continue/partial/accept authority, real contract revisions and truthful closing behavior | #1226 |
 | 3 | [#1228 Shared encrypted provider-context generations](1228-shared-context-generations.md) | One dark storage/codec primitive for run holds and #1214 PR sessions | #1227 by queue policy; no technical dependency |
 | 4 | [#1229 Durable run-hold capture and cross-worker resume](1229-durable-run-holds.md) | Verified provider context plus Git before park; restore before inspect on another worker | #1226 + #1228 |

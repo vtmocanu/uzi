@@ -257,6 +257,13 @@ type fakeStore struct {
 	runNow                  pgtype.Timestamptz
 	runGlobalTimeoutSeconds int32
 	sweepMax                int32
+	// PRD #1226 M4 (D3): StampCompletionBudgetExhausted must receive the SAME now /
+	// global-timeout / worker-stale-cutoff SweepRunningTimeout does. These capture what the
+	// sweep passed the stamp, so the order test can assert the args match.
+	stampNow               pgtype.Timestamptz
+	stampGlobalTimeout     int32
+	stampWorkerStaleCutoff pgtype.Timestamptz
+	stampRows              int64
 	// Rows the sweep queries return (PRD #25 M3): each drives a published transition.
 	sweptClaimed  []store.SweepClaimedNeverStartedRow
 	sweptTimeout  []store.SweepRunningTimeoutRow
@@ -1037,6 +1044,13 @@ func (f *fakeStore) SweepRunningTimeout(_ context.Context, arg store.SweepRunnin
 	f.runGlobalTimeoutSeconds = arg.GlobalTimeoutSeconds
 	f.callOrder = append(f.callOrder, "running_timeout")
 	return f.sweptTimeout, nil
+}
+func (f *fakeStore) StampCompletionBudgetExhausted(_ context.Context, arg store.StampCompletionBudgetExhaustedParams) (int64, error) {
+	f.stampNow = arg.Now
+	f.stampGlobalTimeout = arg.GlobalTimeoutSeconds
+	f.stampWorkerStaleCutoff = arg.WorkerStaleCutoff
+	f.callOrder = append(f.callOrder, "stamp_budget_exhausted")
+	return f.stampRows, nil
 }
 func (f *fakeStore) FailRunsOfStaleWorkersOverCap(_ context.Context, arg store.FailRunsOfStaleWorkersOverCapParams) ([]store.FailRunsOfStaleWorkersOverCapRow, error) {
 	f.sweepMax = arg.MaxRequeues
@@ -3422,9 +3436,22 @@ func TestSweepComputesCutoffsAndOrder(t *testing.T) {
 	if _, err := svc.Sweep(context.Background()); err != nil {
 		t.Fatalf("Sweep: %v", err)
 	}
-	want := []string{"mark_stale", "claimed_never_started", "running_timeout", "stale_fail_over_cap", "stale_requeue"}
+	// PRD #1226 M4 (D3): the served-steer stamp runs RIGHT AFTER running_timeout (it stamps the
+	// rows that sweep's carve-out just spared), before the stale-worker recovery passes.
+	want := []string{"mark_stale", "claimed_never_started", "running_timeout", "stamp_budget_exhausted", "stale_fail_over_cap", "stale_requeue"}
 	if strings.Join(fs.callOrder, ",") != strings.Join(want, ",") {
 		t.Fatalf("sweep order = %v, want %v", fs.callOrder, want)
+	}
+	// The stamp must receive the SAME now / global-timeout / worker-stale-cutoff SweepRunningTimeout
+	// does, so it targets exactly the set the carve-out spared.
+	if !fs.stampNow.Time.Equal(fs.runNow.Time) {
+		t.Fatalf("stamp now = %v, want the same as SweepRunningTimeout's %v", fs.stampNow.Time, fs.runNow.Time)
+	}
+	if fs.stampGlobalTimeout != fs.runGlobalTimeoutSeconds {
+		t.Fatalf("stamp global timeout = %d, want the same as SweepRunningTimeout's %d", fs.stampGlobalTimeout, fs.runGlobalTimeoutSeconds)
+	}
+	if !fs.stampWorkerStaleCutoff.Time.Equal(fs.staleCutoff.Time) {
+		t.Fatalf("stamp worker-stale-cutoff = %v, want the same staleCutoff %v", fs.stampWorkerStaleCutoff.Time, fs.staleCutoff.Time)
 	}
 	if !fs.staleCutoff.Time.Equal(fixed.Add(-45 * time.Second)) {
 		t.Fatalf("stale cutoff = %v, want now-45s", fs.staleCutoff.Time)

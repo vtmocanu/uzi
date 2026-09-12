@@ -1029,6 +1029,51 @@ func TestRunReworkWire(t *testing.T) {
 	}
 }
 
+// TestContinueCompletionDecisionWire asserts `ContinueCompletionDecision` POSTs to
+// /api/runs/{id}/completion/decision with decision="continue" ALWAYS set and the guidance carried
+// verbatim (PRD #1226 M5, D7), path-escapes the id, and unwraps the {run: <dto>} envelope. An
+// empty guidance is a valid continue, so the field is always sent (no omitempty) — asserted on
+// raw bytes so the empty case is not collapsed by decoding.
+func TestContinueCompletionDecisionWire(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		guidance string
+		wantJSON []string
+	}{
+		{"with guidance", "keep going, ignore the flaky test", []string{`"decision":"continue"`, `"guidance":"keep going, ignore the flaky test"`}},
+		{"empty guidance still sent", "", []string{`"decision":"continue"`, `"guidance":""`}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotMethod, gotPath, body string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotMethod, gotPath = r.Method, r.URL.Path
+				b := make([]byte, r.ContentLength)
+				_, _ = io.ReadFull(r.Body, b)
+				body = string(b)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"run":{"id":"r1","status":"running"}}`))
+			}))
+			defer srv.Close()
+
+			run, err := newTestClient(srv).ContinueCompletionDecision(context.Background(), "r1", tc.guidance)
+			if err != nil {
+				t.Fatalf("ContinueCompletionDecision: %v", err)
+			}
+			if gotMethod != http.MethodPost || gotPath != "/api/runs/r1/completion/decision" {
+				t.Errorf("request = %s %s, want POST /api/runs/r1/completion/decision", gotMethod, gotPath)
+			}
+			for _, want := range tc.wantJSON {
+				if !strings.Contains(body, want) {
+					t.Errorf("body = %s, want it to contain %s", body, want)
+				}
+			}
+			if run.ID != "r1" || run.Status != "running" {
+				t.Errorf("decoded run = %+v, want the r1 running run from the envelope", run)
+			}
+		})
+	}
+}
+
 // TestCreateRunWireBodySeededPlan pins PRD #209's seed → wire mapping at the RAW body,
 // which the command-level (fake-client) tests cannot see. The load-bearing case is the
 // first: a nil seed must send NEITHER plan_md nor agent_selection, so a run created

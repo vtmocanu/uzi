@@ -439,11 +439,37 @@ export interface RunContext {
    *  or a post-attempt budget/stall/wall/idle exhaustion, the executor routes here INSTEAD of
    *  throwing a terminal failure, so the run enters a recoverable hold that preserves its Git work
    *  rather than failing. M4 wires the real implementation (SetRunCompletionHold + captureHoldContext
-   *  + the fixed park order); in M3 the runner leaves it UNWIRED, so the executor falls back to the
+   *  + the fixed park order); when the runner leaves it UNWIRED the executor falls back to the
    *  legacy throw (the feature is rollout-OFF until #1232 and M3+M4 ship together, so an unwired
-   *  seam never fires in production). When present, the executor calls it, latches
-   *  {@link ExecutorResult.completionHeld}, and breaks so the runner skips finalization. */
-  enterCompletionHold?(reason: string): Promise<void>;
+   *  seam never fires in production).
+   *
+   *  Returns TRUE when the run ENTERED the verified hold (parked; the runner preserved the clone
+   *  and HOME and the caller latches {@link ExecutorResult.completionHeld} and breaks so the runner
+   *  skips finalization). Returns FALSE when the hold could NOT be entered — capture was never
+   *  verified, or the server did not ACK `paused` — so the run is KEPT LIVE and nothing was cleaned
+   *  up; the caller then falls through to the LEGACY terminal throw (never the destructive
+   *  cleanup). The implementation MUST NOT run the destructive clone/HOME cleanup on the false
+   *  path. */
+  enterCompletionHold?(reason: string): Promise<boolean>;
+  /** PRD #1226 M5 (D6): the completion-question LIVE window. Called at the completion-STALL point
+   *  ONLY (STALL_LIMIT identical no-progress completion attempts) INSTEAD of routing straight to the
+   *  hold. Authors a completion-interlock question (reports `awaiting_input` marked
+   *  `completion_question` so the api stamps runs.completion_question_at and the owner
+   *  continue-decision endpoint resolves THIS question), then awaits the owner's continue decision
+   *  for up to the claim's `completion_hold_window_seconds` (default 900s).
+   *
+   *  Resolves `{ outcome: "continue", guidance? }` on an owner answer WITHIN the window — the
+   *  executor then resumes the SAME session for another completion attempt, folding the guidance
+   *  into the rework follow-up. Resolves `{ outcome: "expired" }` on the window elapsing — the
+   *  executor then routes to the verified park (routeCompletionHold, M4). It NEVER throws
+   *  REASON_QUESTION_TIMEOUT: expiry is a normal outcome, not a failure, and it must not surface as a
+   *  `failed` report. `unmet` is the server-authoritative unmet-milestone id set at the stall.
+   *
+   *  Optional: nil in tests/legacy (and while the completion interlock is rollout-OFF) ⇒ the
+   *  executor falls back to routeCompletionHold at the stall exactly as M4 behaved. */
+  askCompletionQuestion?(
+    unmet: string[],
+  ): Promise<{ outcome: "continue"; guidance?: string } | { outcome: "expired" }>;
 }
 
 export interface ExecutorResult {

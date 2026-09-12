@@ -590,6 +590,11 @@ export interface ClaimConfig {
    *  k8s. Absent or <= 0 from an older server ⇒ the worker's own defaults. */
   question_max?: number;
   question_timeout_seconds?: number;
+  /** PRD #1226 M5 (D6): the live owner-continue window (seconds) before a completion-blocked
+   *  run parks. The worker's completion-question timer uses THIS instead of
+   *  question_timeout_seconds for the completion hold. Default 900s; consumed in a later unit.
+   *  Absent or <= 0 from an older server ⇒ the worker falls back to its own default. */
+  completion_hold_window_seconds?: number;
   /** The run owner's per-user default model (PRD #17). When present it overrides
    *  the lead template's model for the main thread; absent when the owner set no
    *  default, so the worker falls back to the lead template's model. */
@@ -648,6 +653,11 @@ export interface ClaimConfig {
    *  WORKER-ONLY claim config — deliberately NOT on the web RunDTO. Absent (a legacy run, or
    *  rollout OFF) ⇒ the worker runs the legacy path, byte-identical to today. */
   completion_contract_version?: number;
+  /** PRD #1226 M4 (D5): the FROZEN structural completion-contract revision, read straight off
+   *  runs.contract_revision. The worker echoes it VERBATIM in its completion permit request so
+   *  the server can reject a revision drift. WORKER-ONLY claim config (NOT the web RunDTO).
+   *  Absent (a legacy/non-interlocked run, or a contract not yet frozen) ⇒ no permit request. */
+  contract_revision?: number;
 }
 
 /**
@@ -735,6 +745,11 @@ export interface IterationBudget {
    *  to decide whether to park the run at this boundary; the worker honours the boolean and the
    *  server owns the rule (Decision 4). Absent ⇒ no pause requested this iteration. */
   pauseRequested?: boolean;
+  /** PRD #1226 M4 (D3): the server-decided one-shot steer that a LIVE post-attempt run past its
+   *  wall must enter the completion hold, carried off the SAME running-report ACK as the
+   *  pause/budget fields (StateAck.budgetExhausted, the DTO's `completion_budget_exhausted`).
+   *  Same delivery seam as `pauseRequested`; absent ⇒ no budget-exhausted steer this iteration. */
+  budgetExhausted?: boolean;
 }
 
 /** One human comment on the worked issue, snapshotted at run creation (PRD #381).
@@ -1264,6 +1279,38 @@ export interface CompletionAttemptResponse {
   attempt_count: number;
 }
 
+/** Request body for POST /api/worker/runs/:id/completion/permit (PRD #1226 M4, D5). The
+ *  worker asks the server to issue a completion permit: the frozen `contract_revision` it
+ *  believes it is completing against, the source `branch`, and the EXACT final `head` H the
+ *  alignment/push path landed. The server recomputes its OWNED structural predicates and
+ *  never trusts a "milestones done" claim — there is none in the request. */
+export interface CompletionPermitRequest {
+  contract_revision: number;
+  branch: string;
+  head: string;
+}
+
+/** Response body for POST /api/worker/runs/:id/completion/permit (PRD #1226 M4, D5), the
+ *  server's permit decision. `granted:true` carries `permit` (bound to run,
+ *  contract_revision, branch, head); `granted:false` carries a `deny_reason` from the
+ *  server taxonomy (stale_claim / not_interlocked / revision_drift / contract_not_frozen /
+ *  missing_milestones / empty_branch / empty_head) and, for missing_milestones, the `unmet`
+ *  id list. EVERY
+ *  denial is NON-TERMINAL — the run keeps its status and the worker acts on the reason. */
+export interface CompletionPermitResponse {
+  granted: boolean;
+  deny_reason?: string;
+  unmet?: string[];
+  permit?: {
+    id: string;
+    contract_revision: number;
+    branch: string;
+    head: string;
+    issued_at: string;
+    finding_ids: string[];
+  };
+}
+
 /** Request body for POST /api/worker/runs/:id/findings (PRD #333 M2). The server
  *  derives (user_id, repo_id) from the run claim — the worker NEVER sends them (D2/D3).
  *  `location` is a symbol-anchored, repo-root-relative coordinate with NO line number
@@ -1651,6 +1698,14 @@ export interface StateRequest {
    *  park with no question identity can never satisfy the resume guard, so the run
    *  would park and then be unresumable no matter what the user answered. */
   open_question_id?: string;
+  /** PRD #1226 M5 (D6): marks an `awaiting_input` report as a COMPLETION-interlock question (the
+   *  live owner-continue window), NOT an ordinary #88 clarification. The api stamps
+   *  runs.completion_question_at and the owner continue-decision endpoint resolves THIS question by
+   *  delivering an `answer` naming open_question_id. Sent (true) ONLY on the completion-question park
+   *  (the worker's askCompletionQuestion); an ordinary ask_user park omits it. Additive + optional
+   *  and OMITTED ENTIRELY (never `false`) on every other report, so an old worker's payload and an
+   *  ordinary clarification park stay identical on the wire. */
+  completion_question?: boolean;
   /** completed carries the pushed branch + opened MR. */
   branch?: string;
   mr_iid?: number;
@@ -1817,6 +1872,13 @@ export interface StateRequest {
    *  excludes a follow-up consumed mid-round-trip from the watermark, so its later wake
    *  succeeds instead of stranding the run. Additive + optional. */
   open_followup_id?: number;
+  /** PRD #1226 M4 (D5): the EXACT final head H a COMPLETED report is made against — the
+   *  commit the alignment/push path landed. The api consumes the completion permit issued
+   *  for (run, contract_revision, branch, head), so the head reported here must be the same
+   *  40-hex commit the permit was bound to. Additive + optional and ABSENT on a legacy /
+   *  non-completed report — an old worker omits it and a non-interlocked completion has no
+   *  permit to match. */
+  head?: string;
 }
 
 /**
@@ -1875,6 +1937,13 @@ export interface StateAck {
    *  pause branch reads it (via IterationBudget). Absent/non-boolean (older server, unparseable
    *  body) ⇒ treated as false = "no pause requested". */
   pauseRequested?: boolean;
+  /** PRD #1226 M4 (D3): the SERVER-DECIDED one-shot `budget_exhausted` steer, read off the SAME
+   *  `{run: RunDTO}` body as `status` (the DTO's `completion_budget_exhausted` field, built beside
+   *  `pause_requested`). true when the server has stamped the run's completion budget exhausted,
+   *  steering a live post-attempt worker into the completion hold. The worker just HONOURS the
+   *  boolean; the server owns the rule. Absent/non-boolean (older server, unparseable body) ⇒
+   *  treated as false = "no budget-exhausted steer". */
+  budgetExhausted?: boolean;
 }
 
 export interface UserInput {

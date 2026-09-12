@@ -112,6 +112,19 @@ const (
 	// healthWaitingWorker enum (no migration — runs.health_reason is free text). Gated
 	// by KeyCapabilityAwareScheduling: when the flag is off this reason is never emitted.
 	reasonNoEligibleWorker = "no online worker can run this — it needs a capability none of your workers has; provision a capable worker"
+	// reasonNoCompletionCapableWorker (PRD #1226 M1) is emitted for an INTERLOCKED queued run
+	// (completion_contract_version set) whose owner has NO online worker self-reporting the
+	// 'completion_interlock_v1' protocol capability. Distinct from reasonNoEligibleWorker: that
+	// is an ordinary required_capabilities gap an owner CAN override or the kill-switch CAN
+	// neutralize, whereas the completion-protocol clause is NON-BYPASSABLE (ClaimRun's dedicated
+	// `'completion_interlock_v1' = ANY(worker_protocol_caps)` clause, outside fn_worker_can_claim
+	// and the capability-aware flag), so an interlocked run in an all-legacy fleet is genuinely
+	// unclaimable until a protocol-capable worker comes online. Maps to the SAME
+	// healthWaitingWorker enum (no migration — runs.health_reason is free text). NOT gated by the
+	// interlock rollout switch: a run that IS interlocked stays subject to the claim clause
+	// regardless of the flag, so the reason reflects the run's actual state (rollout-OFF, no run
+	// is interlocked, so this stays inert).
+	reasonNoCompletionCapableWorker = "no online worker implements the completion interlock (completion_interlock_v1); provision a capable worker"
 	// reasonRepoNotDockerAllowed (PRD #361) is the queued reason for a repo-bearing run
 	// that no online worker is eligible to claim because every online worker is a Docker
 	// worker and the repo is not on the Docker-worker allowlist (fn_worker_can_claim,
@@ -481,20 +494,22 @@ func stallBaseline(r store.ListActiveRunsForHealthRow) time.Time {
 }
 
 // queuedReason resolves the human reason a queued run past its threshold is not
-// running, MOST-FUNDAMENTAL first (Decision 8, extended by PRD #216, #361, #84 M3 and
-// #320 D9): a locked owner vault (they unlock and it claims within a poll), then no
+// running, MOST-FUNDAMENTAL first (Decision 8, extended by PRD #216, #361, #84 M3, #320 D9
+// and #1226 M1): a locked owner vault (they unlock and it claims within a poll), then no
 // online worker at all, then (PRD #84 M3) no online worker whose capabilities can satisfy
-// the run's required set, then (PRD #320 D9) the deprioritized/restored re-label for a
-// kind-demoted run, then (PRD #361) a repo no online worker is eligible to claim because
-// every online worker is a Docker worker and the repo is not allowlisted, then a saturated
-// fleet where every online worker is at its cap (add capacity), else a plain wait for an
-// idle worker to claim.
+// the run's required set, then (PRD #1226 M1) an interlocked run no online worker can serve
+// because none implements the completion protocol, then (PRD #320 D9) the deprioritized/
+// restored re-label for a kind-demoted run, then (PRD #361) a repo no online worker is
+// eligible to claim because every online worker is a Docker worker and the repo is not
+// allowlisted, then a saturated fleet where every online worker is at its cap (add capacity),
+// else a plain wait for an idle worker to claim.
 //
 // ORDERING (review finding): vault-lock and no-online-worker come FIRST — ahead of the
-// capability reason — because a locked vault or an empty fleet is the real block, and a
-// capability-specific "no eligible worker" for such a run would name the wrong cause. The
-// capability check stays AHEAD of the priority-class re-label, so a demoted-but-unplaceable
-// run still reports the actionable capability block rather than a yield message.
+// capability reasons — because a locked vault or an empty fleet is the real block, and a
+// capability-specific "no eligible worker" for such a run would name the wrong cause. Both
+// the capability-gap and the completion-protocol checks stay AHEAD of the priority-class
+// re-label, so a demoted-but-unplaceable run still reports the actionable capability block
+// rather than a yield message.
 func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListActiveRunsForHealthRow) string {
 	if s.vlt != nil && !s.vlt.Unlocked(r.UserID) {
 		return reasonVaultLocked
@@ -530,6 +545,25 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 			slog.Error("health: count online workers satisfying caps", "run_id", r.ID, "error", cerr)
 		} else if m == 0 {
 			return reasonNoEligibleWorker
+		}
+	}
+	// PRD #1226 M1: an INTERLOCKED run (completion_contract_version set) whose owner has NO online
+	// worker implementing the completion protocol is genuinely UNPLACEABLE — the run's
+	// non-bypassable claim clause (ClaimRun's 'completion_interlock_v1' = ANY(worker_protocol_caps))
+	// can never be satisfied. Placed right after the ordinary capability-gap rung and AHEAD of the
+	// priority-class re-label, for the same reason that rung is: an actionable "provision a capable
+	// worker" block must not be hidden behind a yield/restored message. NOT gated by the interlock
+	// rollout switch — a run that IS interlocked is subject to the claim clause regardless of the
+	// flag, and with rollout OFF no run is interlocked so this stays inert. The per-run Count sits
+	// behind the queued-threshold guard in healthTargetFor, so it runs for ~0 runs/tick; a read
+	// error falls through to the generic reasons below rather than inventing a reason on a failed
+	// lookup (the conservative degrade the sibling per-run lookups use).
+	if r.CompletionContractVersion.Valid {
+		p, perr := s.q.CountOnlineWorkersSatisfyingProtocol(ctx, r.UserID)
+		if perr != nil {
+			slog.Error("health: count online workers satisfying completion protocol", "run_id", r.ID, "error", perr)
+		} else if p == 0 {
+			return reasonNoCompletionCapableWorker
 		}
 	}
 	// A queued run the kind-derived priority DEMOTED (PRD #320 D9) is not stuck — it is

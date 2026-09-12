@@ -793,6 +793,59 @@ func (h *Handler) WorkerRunCompletionAttempt(w http.ResponseWriter, r *http.Requ
 	httpx.JSON(w, http.StatusOK, res)
 }
 
+// WorkerRunCompletionHold is the completion-interlock HOLD endpoint (PRD #1226 M4, D6): the worker
+// reports the head it captured at hold time, and the service parks an owned, interlocked run with
+// a recorded completion attempt (running/awaiting_input -> paused, hold_reason='completion_blocked').
+//
+// It mirrors WorkerRunState's applied/409 shape EXACTLY, and that shape is load-bearing for the
+// park-order ack contract: on success it returns 200 with the paused run, and on a REFUSED hold it
+// returns 409 with the run's ACTUAL status. That status is usually non-paused (a still-live run the
+// guard rejected, or one that moved to queued/terminal), but it CAN be `paused`: an idempotent
+// retry after a hold already landed — or a run an owner already paused — re-reads as `paused` while
+// the guard (source running/awaiting_input) legitimately refuses. The worker keys its cleanup
+// (removes the clone / plugin dir / HOME) off a `paused` status; a `paused` 409 is SAFE, not a bug,
+// because the run IS already held and cleaning up an already-held run is idempotent (a later resume
+// re-clones). A non-paused body means retain the run live. (A reclaim surfaces as ErrRunNotOwned ->
+// 404, which the worker never reads as `paused`.)
+func (h *Handler) WorkerRunCompletionHold(w http.ResponseWriter, r *http.Request) {
+	wkr, ok := mw.WorkerFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "worker authentication required")
+		return
+	}
+	runID, ok := httpx.PathUUID(w, r, "id", "run")
+	if !ok {
+		return
+	}
+	var body struct {
+		// The exact head the worker captured at hold time. Empty is allowed (the column is
+		// nullable); the service NUL-strips + TrimSpaces it, matching the permit path.
+		Head string `json:"head"`
+	}
+	if err := httpx.DecodeJSON(r, &body); err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	run, applied, err := h.wsvc.SetRunCompletionHold(r.Context(), wkr, runID, body.Head)
+	if err != nil {
+		if errors.Is(err, workersvc.ErrRunNotOwned) {
+			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
+			return
+		}
+		slog.Error("worker run completion hold", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if !applied {
+		// The hold's guard refused (wrong status, not interlocked, or no recorded completion
+		// attempt): 409 with the run's REAL status, which the worker reads off the body and
+		// retains the run on (it cleans up ONLY on a `paused` ack).
+		httpx.JSON(w, http.StatusConflict, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout)})
+		return
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout)})
+}
+
 // workerMemoryToDTO maps a stored entry to the worker-facing DTO. It carries run_id
 // (provenance) but OMITS repo_id/repo_name — the worker already knows the run's repo
 // and the write derives it server-side, so echoing it would be redundant surface.

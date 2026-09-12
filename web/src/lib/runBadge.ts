@@ -147,10 +147,31 @@ export function isRevisingRun(run: { status: string; is_revising?: boolean }): b
 // status=awaiting_approval, so the two are mutually exclusive — order does not matter,
 // but each is checked explicitly against its own guard.
 export function effectiveRunStatus(
-  run: { status: string; is_planning?: boolean; is_revising?: boolean },
+  run: {
+    status: string;
+    is_planning?: boolean;
+    is_revising?: boolean;
+    completion_phase?: "checking" | "reworking" | "blocked" | "";
+  },
 ): string {
   if (isPlanningRun(run)) return "planning";
   if (isRevisingRun(run)) return "revising";
+  // PRD #1226 M5 (D8): completion_phase is a SINGLE server-computed field — render it,
+  // never re-derive it here (re-deriving would risk the web and CLI disagreeing). When it
+  // is non-empty the run is in a live completion-interlock state, which OVERLAYS the raw
+  // status: a `blocked` run's real status is "paused" (shared with the PRD #1190
+  // owner-pause), so this check MUST precede the raw-status fallback below — otherwise a
+  // completion-blocked hold would render as the owner "‖ paused" pill instead of
+  // "Completion blocked". planning/revising stay AHEAD of it, matching their existing
+  // order: they are pre-approval phases the server never co-emits with a completion phase.
+  switch (run.completion_phase) {
+    case "checking":
+      return "completion_checking";
+    case "reworking":
+      return "completion_reworking";
+    case "blocked":
+      return "completion_blocked";
+  }
   return run.status;
 }
 
@@ -256,6 +277,14 @@ export function runStatusTone(
   // and the run-view VersionChip's parked state), deliberately NOT the awaiting warn:
   // the run is not waiting on the human right now, the planner is reworking the plan.
   if (status === "revising") return "info";
+  // PRD #1226 M5 (D8): the derived completion-interlock pseudo-statuses (from
+  // effectiveRunStatus's completion_phase mapping). checking/reworking are live
+  // structural completion work → calm INFO (like claimed/running); blocked is a hold the
+  // owner must clear → WARN, never danger (it has not failed). Kept in step with
+  // RUN_STATUS_TONES — the runBadge.test.ts tone-agreement loop asserts the two surfaces
+  // print one colour per status.
+  if (status === "completion_checking" || status === "completion_reworking") return "info";
+  if (status === "completion_blocked") return "warning";
   if (status === "awaiting_approval" || status === "awaiting_input")
     return "warning";
   // PRD #517: an interactive run parked awaiting the owner's next follow-up.
@@ -485,6 +514,27 @@ export function runBadge(run: LatestRun, nowMs: number): RunBadge {
     // next `plan` flips is_revising false server-side and it returns to awaiting_approval.
     case "revising":
       return { kind: "badge", label: "revising", tone: "info", pulse: true };
+    // PRD #1226 M5 (D8): the derived completion-interlock states, from effectiveRunStatus's
+    // completion_phase mapping. checking/reworking are live structural completion work →
+    // calm pulsing INFO; blocked is a hold the owner must clear → static WARN. The labels
+    // are EXACTLY the words StatusPill prints (RUN_STATUS_LABELS), so the pill and the board
+    // badge agree — the ui.test.tsx label-agreement loop over RUN_STATUS_TONES asserts it.
+    case "completion_checking":
+      return { kind: "badge", label: "Checking completion", tone: "info", pulse: true };
+    case "completion_reworking":
+      return {
+        kind: "badge",
+        label: "Reworking unmet milestones",
+        tone: "info",
+        pulse: true,
+      };
+    case "completion_blocked":
+      return {
+        kind: "badge",
+        label: "Completion blocked",
+        tone: "warning",
+        pulse: false,
+      };
     case "running":
       // The running elapsed moved OUT of the badge to the uniform per-card duration
       // token (issue #256 M4, Decision 4) — the board now renders `running <elapsed>`

@@ -95,8 +95,32 @@ export interface MrCall {
   body?: string;
 }
 
-/** A GitLab client whose transport is captured; opens MR !42 with no network. */
-export function fakeGitlab(): { gitlab: GitLabClient; calls: MrCall[] } {
+/** PRD #1226 M4 (D5): options for the PR-head read (getMergeRequestHead). `head` is the SHA the
+ *  fake answers on the single-item GET; `headStatus` (default 200) models an unverifiable read (a
+ *  non-200 makes getMergeRequestHead throw a ForgeError). Absent ⇒ no interlocked run reads the
+ *  head, so the GET branch is never exercised (legacy behavior). */
+export interface FakeForgeOpts {
+  head?: string;
+  headStatus?: number;
+  /** PRD #1225 (CodeRabbit !1254): per-GET head sequence. When set, the Nth single-item GET answers
+   *  `heads[N]` (falling back to `head` once exhausted), so a test can model the PR head CHANGING
+   *  between the verify read and the post-add re-verify read (the TOCTOU bind). Absent ⇒ every GET
+   *  answers the fixed `head`. */
+  heads?: string[];
+  /** Status for the body-rewrite PUT/PATCH (default 200); a non-2xx makes updateMergeRequestDescription throw a ForgeError (the add-Closes reconcile failure). */
+  putStatus?: number;
+}
+
+/** The SHA the Nth single-item GET answers: `heads[n]` when a sequence is set and in range, else the
+ *  fixed `head` (or ""). Shared by the three driver fakes so the head-change model is identical. */
+function headForGet(opts: FakeForgeOpts, n: number): string {
+  if (opts.heads && n < opts.heads.length) return opts.heads[n]!;
+  return opts.head ?? "";
+}
+
+/** A GitLab client whose transport is captured; opens MR !42 with no network. The GET (D5 PR-head
+ *  read) answers `{ sha }` at `headStatus`, so an interlocked run can verify (or fail to verify) H. */
+export function fakeGitlab(opts: FakeForgeOpts = {}): { gitlab: GitLabClient; calls: MrCall[] } {
   const calls: MrCall[] = [];
   const fetchFn: FetchFn = async (url, init) => {
     calls.push({
@@ -105,6 +129,16 @@ export function fakeGitlab(): { gitlab: GitLabClient; calls: MrCall[] } {
       headers: init.headers,
       body: init.body,
     });
+    if (init.method === "GET") {
+      const status = opts.headStatus ?? 200;
+      const sha = headForGet(opts, calls.filter((c) => c.method === "GET").length - 1);
+      return { status, text: async () => JSON.stringify({ sha }) };
+    }
+    // PRD #1225 (CodeRabbit !1254): the interlock reconcile rewrites the MR body (GitLab uses
+    // PUT). Answer 2xx so updateMergeRequestDescription succeeds; the call stays captured in `calls`.
+    if (init.method === "PUT" || init.method === "PATCH") {
+      return { status: opts.putStatus ?? 200, text: async () => "{}" };
+    }
     return {
       status: 201,
       text: async () =>
@@ -117,8 +151,9 @@ export function fakeGitlab(): { gitlab: GitLabClient; calls: MrCall[] } {
   return { gitlab: new GitLabClient({ fetchFn }), calls };
 }
 
-/** A Forgejo client whose transport is captured; opens PR #42 with no network. */
-export function fakeForgejo(): { forgejo: ForgejoClient; calls: MrCall[] } {
+/** A Forgejo client whose transport is captured; opens PR #42 with no network. The GET (D5 PR-head
+ *  read) answers `{ head: { sha } }` at `headStatus`. */
+export function fakeForgejo(opts: FakeForgeOpts = {}): { forgejo: ForgejoClient; calls: MrCall[] } {
   const calls: MrCall[] = [];
   const fetchFn: FetchFn = async (url, init) => {
     calls.push({
@@ -127,6 +162,16 @@ export function fakeForgejo(): { forgejo: ForgejoClient; calls: MrCall[] } {
       headers: init.headers,
       body: init.body,
     });
+    if (init.method === "GET") {
+      const status = opts.headStatus ?? 200;
+      const sha = headForGet(opts, calls.filter((c) => c.method === "GET").length - 1);
+      return { status, text: async () => JSON.stringify({ head: { sha } }) };
+    }
+    // PRD #1225 (CodeRabbit !1254): the interlock reconcile rewrites the PR body (Forgejo uses
+    // PATCH). Answer 2xx so updateMergeRequestDescription succeeds; the call stays captured in `calls`.
+    if (init.method === "PUT" || init.method === "PATCH") {
+      return { status: opts.putStatus ?? 200, text: async () => "{}" };
+    }
     return {
       status: 201,
       text: async () =>
@@ -139,8 +184,9 @@ export function fakeForgejo(): { forgejo: ForgejoClient; calls: MrCall[] } {
   return { forgejo: new ForgejoClient({ fetchFn }), calls };
 }
 
-/** A GitHub client whose transport is captured; opens PR #42 with no network. */
-export function fakeGitHub(): { github: GitHubClient; calls: MrCall[] } {
+/** A GitHub client whose transport is captured; opens PR #42 with no network. The GET (D5 PR-head
+ *  read) answers `{ head: { sha } }` at `headStatus`. */
+export function fakeGitHub(opts: FakeForgeOpts = {}): { github: GitHubClient; calls: MrCall[] } {
   const calls: MrCall[] = [];
   const fetchFn: FetchFn = async (url, init) => {
     calls.push({
@@ -149,6 +195,16 @@ export function fakeGitHub(): { github: GitHubClient; calls: MrCall[] } {
       headers: init.headers,
       body: init.body,
     });
+    if (init.method === "GET") {
+      const status = opts.headStatus ?? 200;
+      const sha = headForGet(opts, calls.filter((c) => c.method === "GET").length - 1);
+      return { status, text: async () => JSON.stringify({ head: { sha } }) };
+    }
+    // PRD #1225 (CodeRabbit !1254): the interlock reconcile rewrites the PR body (GitHub uses
+    // PATCH). Answer 2xx so updateMergeRequestDescription succeeds; the call stays captured in `calls`.
+    if (init.method === "PUT" || init.method === "PATCH") {
+      return { status: opts.putStatus ?? 200, text: async () => "{}" };
+    }
     return {
       status: 201,
       text: async () =>

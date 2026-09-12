@@ -113,6 +113,15 @@ type Client interface {
 	// / not reworkable / already running / nothing new) is 409 → ExitConflict (5); guidance
 	// too long is 400 → ExitUsage (2) — all via the shared status→exit mapping.
 	RunRework(ctx context.Context, runID, guidance string) (apitypes.RunDTO, error)
+	// ContinueCompletionDecision records the owner's CONTINUE decision on a completion-blocked
+	// run and resumes it (PRD #1226 M5, D7): POST /api/runs/{id}/completion/decision
+	// {decision:"continue", guidance}, RequireUser so a `uzc_` token reaches it. This client
+	// sends ONLY the "continue" decision (the only value the endpoint accepts). guidance is the
+	// optional operator note (empty is valid — resume with no note). Returns the resumed run. A
+	// foreign/unknown run is 404 → ExitNotFound (4); a run that is NOT completion-blocked is 409
+	// → ExitConflict (5); guidance too long is 400 → ExitUsage (2) — via the shared status→exit
+	// mapping.
+	ContinueCompletionDecision(ctx context.Context, id string, guidance string) (apitypes.RunDTO, error)
 	// SelfRateLimits returns the caller's OWN per-token rate-limit meters, each
 	// carrying the server-computed auto-selection status: GET /api/me/rate-limits.
 	//

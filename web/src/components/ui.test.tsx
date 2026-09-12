@@ -136,7 +136,33 @@ describe("StatusPill", () => {
     // runBadge's "‖ paused" label; a missing entry would leave StatusPill printing "paused"
     // against runBadge's "‖ paused", which this loop then catches.
     expect(checked).toContain("paused");
+    // PRD #1226 M5 (D8): each completion-interlock pseudo-status must print one word on
+    // BOTH surfaces — the default `status.replace(/_/g," ")` would yield "completion
+    // checking" on the pill against runBadge's "Checking completion", which this loop then
+    // catches. Their RUN_STATUS_LABELS overrides are what keep the two in step.
+    expect(checked).toContain("completion_checking");
+    expect(checked).toContain("completion_reworking");
+    expect(checked).toContain("completion_blocked");
     expect(checked.length).toBeGreaterThanOrEqual(5);
+  });
+
+  it("renders the three completion-interlock labels + tones (PRD #1226 M5, D8)", () => {
+    // The honest completion copy: full sentences, and the tones the run-view seam renders
+    // — checking/reworking are calm info (live structural work), blocked is warn (a hold
+    // the owner must clear).
+    const checking = render(<StatusPill status="completion_checking" />);
+    expect(checking.container.textContent).toContain("Checking completion");
+    expect((checking.container.firstElementChild as HTMLElement).className).toContain("text-info");
+
+    const reworking = render(<StatusPill status="completion_reworking" />);
+    expect(reworking.container.textContent).toContain("Reworking unmet milestones");
+    expect((reworking.container.firstElementChild as HTMLElement).className).toContain("text-info");
+
+    const blocked = render(<StatusPill status="completion_blocked" />);
+    expect(blocked.container.textContent).toContain("Completion blocked");
+    // warn tone — the amber attention treatment, distinct from the neutral fallback a
+    // missing RUN_STATUS_TONES entry would give.
+    expect((blocked.container.firstElementChild as HTMLElement).className).toContain("text-warn");
   });
 });
 

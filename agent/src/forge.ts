@@ -67,6 +67,22 @@ export class ForgeError extends Error {
  *  pipelines; that surface is the Go driver's. */
 export interface ForgeClient {
   createMergeRequest(p: CreateMrParams, signal?: AbortSignal): Promise<MergeRequest>;
+  /** Read the current head SHA of an existing MR/PR (PRD #1226 M4, D5). Forge-neutral:
+   *  each driver derives its own single-item URL and parses the true source-branch head
+   *  out of the response, returning a validated 40-hex commit id. The exact-head verify
+   *  consumes it to bind a completion permit to (run, contract_revision, branch, head).
+   *  Throws a ForgeError on a non-200, a missing head field, or a malformed SHA — the
+   *  caller treats a failed head-read as "cannot verify H" (NON-TERMINAL, keeps the
+   *  session live). The PAT rides the auth header only, same as createMergeRequest. */
+  getMergeRequestHead(repoUrl: string, pat: string, iid: number, signal?: AbortSignal): Promise<string>;
+  /** Forge-neutral, best-effort rewrite of an existing MR/PR body (PRD #1225, CodeRabbit
+   *  !1254). Used by the completion interlock to reconcile the `Closes #N` line: when the
+   *  interlock holds an unverified/unreadable PR head it rewrites the body to an unverified
+   *  variant that carries NO `Closes #N`, and on a verified completion it re-asserts the
+   *  canonical body. Each driver derives the single-item update URL and body-field name; the
+   *  https-only, redirect:"error" and transient-5xx guards are inherited from `request`.
+   *  Throws a ForgeError on a non-2xx so the caller can log-and-continue best-effort. */
+  updateMergeRequestDescription(repoUrl: string, pat: string, iid: number, description: string, signal?: AbortSignal): Promise<void>;
 }
 
 export interface ForgeClientOptions {
@@ -125,6 +141,40 @@ abstract class HttpForgeClient implements ForgeClient {
     return [409];
   }
 
+  /**
+   * Read the head SHA of an existing MR/PR through the shared transport (PRD #1226 M4,
+   * D5). The forge-specific single-item URL and the head-SHA parse are the only
+   * per-driver bits (headUrl/parseHead), mirroring the createUrl/parseMr split — so a new
+   * driver inherits the https-only, redirect:"error" and transient-5xx guards from
+   * `request` by construction.
+   *
+   * A transient status (5xx/408/429) already surfaced as a transient ForgeError inside
+   * `request`, so the Layer A forge-retry loop can re-run. A non-transient non-200 (a 404
+   * for an unknown MR, a 403 for a scope) is a HARD read failure here: it throws a
+   * ForgeError the caller reads as "cannot verify H" and keeps the run live. The PAT never
+   * leaves the auth header.
+   */
+  async getMergeRequestHead(repoUrl: string, pat: string, iid: number, signal?: AbortSignal): Promise<string> {
+    const res = await this.request("GET", this.headUrl(repoUrl, iid), pat, undefined, signal);
+    if (res.status !== 200) throw new ForgeError(res.status, (await safeText(res)).slice(0, 512));
+    return this.parseHead(await res.text());
+  }
+
+  /**
+   * Rewrite an existing MR/PR body through the shared transport (PRD #1225). The
+   * single-item URL is the SAME resource as `headUrl` for all three drivers (GitLab
+   * `merge_requests/{iid}`, Forgejo/GitHub `pulls/{iid}`), so it is reused rather than
+   * duplicated. The HTTP method and body-field name are the only per-driver bits
+   * (updateMethod/updateBody): GitLab uses PUT + `description`, Forgejo/GitHub use
+   * PATCH + `body`. Any 2xx is success (GitLab/GitHub answer 200, Forgejo/Gitea 201).
+   * A non-2xx throws a ForgeError; the interlock caller treats a failed rewrite as
+   * best-effort and leaves the created MR/PR as-is.
+   */
+  async updateMergeRequestDescription(repoUrl: string, pat: string, iid: number, description: string, signal?: AbortSignal): Promise<void> {
+    const res = await this.request(this.updateMethod(), this.headUrl(repoUrl, iid), pat, this.updateBody(description), signal);
+    if (res.status < 200 || res.status >= 300) throw new ForgeError(res.status, (await safeText(res)).slice(0, 512));
+  }
+
   protected async request(
     method: string,
     url: string,
@@ -178,6 +228,23 @@ abstract class HttpForgeClient implements ForgeClient {
   protected abstract findOpenMr(p: CreateMrParams, signal?: AbortSignal): Promise<MergeRequest | undefined>;
   /** Parse a create (201) response body into a MergeRequest. */
   protected abstract parseMr(text: string): MergeRequest;
+  /** The single-MR/PR read endpoint derived from the repo web URL + iid (D5). */
+  protected abstract headUrl(repoUrl: string, iid: number): string;
+  /** Parse a 200 single-MR/PR response body into the validated 40-hex head SHA;
+   *  throw a ForgeError when the head field is absent or malformed. */
+  protected abstract parseHead(text: string): string;
+
+  /** HTTP method for the single-item body rewrite. PATCH is correct for Forgejo and
+   *  GitHub; GitLabClient overrides to PUT. */
+  protected updateMethod(): string {
+    return "PATCH";
+  }
+
+  /** Request body for the single-item body rewrite. Forgejo and GitHub name the field
+   *  `body`; GitLabClient overrides to `description`. */
+  protected updateBody(description: string): unknown {
+    return { body: description };
+  }
 }
 
 /** GitLab REST driver (`/api/v4`, `PRIVATE-TOKEN` header). */
@@ -218,6 +285,26 @@ export class GitLabClient extends HttpForgeClient {
     if (!mr) throw new ForgeError(201, "merge request response missing iid");
     return mr;
   }
+
+  protected headUrl(repoUrl: string, iid: number): string {
+    const projectSeg = encodeURIComponent(gitlabProjectPath(repoUrl));
+    return `${gitlabBaseUrl(repoUrl)}/api/v4/projects/${projectSeg}/merge_requests/${encodeURIComponent(String(iid))}`;
+  }
+
+  protected parseHead(text: string): string {
+    const head = parseGitlabHead(safeJson(text));
+    if (!head) throw new ForgeError(200, "merge request response missing a valid head sha");
+    return head;
+  }
+
+  /** GitLab rewrites the MR resource with PUT and a `description` field (not PATCH/`body`). */
+  protected override updateMethod(): string {
+    return "PUT";
+  }
+
+  protected override updateBody(description: string): unknown {
+    return { description };
+  }
 }
 
 /** Forgejo REST driver (`/api/v1`, `Authorization: token` header). PRs are modelled
@@ -257,6 +344,17 @@ export class ForgejoClient extends HttpForgeClient {
     const mr = parseForgejoMr(safeJson(text));
     if (!mr) throw new ForgeError(201, "pull request response missing number");
     return mr;
+  }
+
+  protected headUrl(repoUrl: string, iid: number): string {
+    const { apiBase, owner, repo } = forgejoRepoParts(repoUrl);
+    return `${apiBase}/api/v1/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls/${encodeURIComponent(String(iid))}`;
+  }
+
+  protected parseHead(text: string): string {
+    const head = parseForgejoHead(safeJson(text));
+    if (!head) throw new ForgeError(200, "pull request response missing a valid head sha");
+    return head;
   }
 }
 
@@ -308,6 +406,17 @@ export class GitHubClient extends HttpForgeClient {
     const mr = parseGitHubMr(safeJson(text));
     if (!mr) throw new ForgeError(201, "pull request response missing number");
     return mr;
+  }
+
+  protected headUrl(repoUrl: string, iid: number): string {
+    const { apiBase, owner, repo } = githubRepoParts(repoUrl);
+    return `${apiBase}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls/${encodeURIComponent(String(iid))}`;
+  }
+
+  protected parseHead(text: string): string {
+    const head = parseGitHubHead(safeJson(text));
+    if (!head) throw new ForgeError(200, "pull request response missing a valid head sha");
+    return head;
   }
 }
 
@@ -406,6 +515,50 @@ function parseGitHubMr(obj: unknown): MergeRequest | undefined {
   if (typeof iid !== "number") return undefined;
   const webUrl = typeof rec["html_url"] === "string" ? (rec["html_url"] as string) : "";
   return { iid, webUrl };
+}
+
+/** A git commit id is exactly 40 lowercase-or-uppercase hex chars. The forges emit
+ *  lowercase; case-insensitive here keeps the validator lenient without normalizing —
+ *  the exact string is returned verbatim for the head identity. */
+function isCommitSha(v: unknown): v is string {
+  return typeof v === "string" && /^[0-9a-f]{40}$/i.test(v);
+}
+
+/** Parse a GitLab MR object's head SHA (D5). PREFERS `diff_refs.head_sha` (the true
+ *  source-branch tip) and falls back to the top-level `sha`, which can LAG the branch
+ *  tip in some MR states. Returns undefined when neither is a valid 40-hex commit id. */
+function parseGitlabHead(obj: unknown): string | undefined {
+  if (!obj || typeof obj !== "object") return undefined;
+  const rec = obj as Record<string, unknown>;
+  const diffRefs = rec["diff_refs"];
+  if (diffRefs && typeof diffRefs === "object") {
+    const headSha = (diffRefs as Record<string, unknown>)["head_sha"];
+    if (isCommitSha(headSha)) return headSha;
+  }
+  const sha = rec["sha"];
+  if (isCommitSha(sha)) return sha;
+  return undefined;
+}
+
+/** Parse a Forgejo PR object's head SHA from `head.sha` (D5); undefined when absent or
+ *  not a valid 40-hex commit id. */
+function parseForgejoHead(obj: unknown): string | undefined {
+  return prHeadSha(obj);
+}
+
+/** Parse a GitHub PR object's head SHA from `head.sha` (D5); undefined when absent or
+ *  not a valid 40-hex commit id. */
+function parseGitHubHead(obj: unknown): string | undefined {
+  return prHeadSha(obj);
+}
+
+/** Forgejo and GitHub both nest the source-branch tip at `head.sha`; shared extractor. */
+function prHeadSha(obj: unknown): string | undefined {
+  if (!obj || typeof obj !== "object") return undefined;
+  const head = (obj as Record<string, unknown>)["head"];
+  if (!head || typeof head !== "object") return undefined;
+  const sha = (head as Record<string, unknown>)["sha"];
+  return isCommitSha(sha) ? sha : undefined;
 }
 
 function safeJson(text: string): unknown {

@@ -761,6 +761,12 @@ Mock at `prds/mockups/1167-lights-on-themes-mock.html`.
 
 - An owner can start one MR rework cycle on demand from a completed run's page or with uzi run rework, with optional guidance, even after the automatic cap; on-demand cycles never count against the cap. [user, #1202]
 
+## Feature #1226 — Structural completion interlock
+
+Tracked as GitHub issue vtmocanu/uzi#1226 (parent epic #1225); PRD at `prds/done/1226-structural-completion-interlock.md`.
+
+- An issue run may open a closing PR only after every in-scope approved milestone is declared complete against a frozen contract for the exact final head, or the owner records an explicit later decision. An incomplete attempt returns to the same lead and otherwise holds without discarding its work. [user, #1226]
+
 ## Startup admin seed
 
 - Seed an admin user from env at startup (`UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME`) so the user survives DB wipes.

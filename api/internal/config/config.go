@@ -364,16 +364,21 @@ type Config struct {
 	PlanMaxRevisions        int           // PRD #41 plan-revision cap at the approval gate (server + worker)
 	QuestionMax             int           // PRD #88 clarification-question cap per run (worker-enforced)
 	QuestionTimeoutSeconds  int           // PRD #88 answer deadline before a parked run fails (worker-enforced)
-	RunMaxRequeues          int           // worker-death re-queues allowed before a run is failed
-	WorkerHeartbeatInterval time.Duration // how often a worker heartbeats
-	WorkerHeartbeatStale    time.Duration // no heartbeat past this ⇒ worker offline + runs re-queued
-	DiskPressureThreshold   float64       // PRD #837 M4: used/total fraction in (0,1] at/above which a worker's self-reported volume counts as under disk pressure (display/lifecycle-only)
-	SweepInterval           time.Duration // run-liveness sweep cadence; 0 ⇒ sweeper's built-in 15s default
-	WorkerPollInterval      time.Duration // worker claim-poll cadence
-	WorkerAffinityGrace     time.Duration // a re-queued run waits this long for its prior worker (chat lane; ClaimChatRun)
-	WorkerAffinityCeiling   time.Duration // PRD #628 D3a: run-lane affinity ceiling — a promoted run stays pinned to a LIVE, non-draining prior worker (liveness leg) but never longer than this, bounding the live-but-wedged case
-	WorkerSpreadGrace       time.Duration // PRD #216: a queued run older than this is exempt from the fleet-aware spread
-	WorkerBackgroundGrace   time.Duration // PRD #320: a demoted (judge/self_improve) run older than this fails open to normal priority so background work never starves
+	// CompletionHoldWindowSeconds (PRD #1226 M5, D6) is the live owner-continue window a
+	// completion-blocked run waits before it parks: the worker's completion-question timer uses
+	// it INSTEAD of QuestionTimeoutSeconds for the completion hold. Shipped in the claim like the
+	// other worker-enforced timers. Default 900s.
+	CompletionHoldWindowSeconds int
+	RunMaxRequeues              int           // worker-death re-queues allowed before a run is failed
+	WorkerHeartbeatInterval     time.Duration // how often a worker heartbeats
+	WorkerHeartbeatStale        time.Duration // no heartbeat past this ⇒ worker offline + runs re-queued
+	DiskPressureThreshold       float64       // PRD #837 M4: used/total fraction in (0,1] at/above which a worker's self-reported volume counts as under disk pressure (display/lifecycle-only)
+	SweepInterval               time.Duration // run-liveness sweep cadence; 0 ⇒ sweeper's built-in 15s default
+	WorkerPollInterval          time.Duration // worker claim-poll cadence
+	WorkerAffinityGrace         time.Duration // a re-queued run waits this long for its prior worker (chat lane; ClaimChatRun)
+	WorkerAffinityCeiling       time.Duration // PRD #628 D3a: run-lane affinity ceiling — a promoted run stays pinned to a LIVE, non-draining prior worker (liveness leg) but never longer than this, bounding the live-but-wedged case
+	WorkerSpreadGrace           time.Duration // PRD #216: a queued run older than this is exempt from the fleet-aware spread
+	WorkerBackgroundGrace       time.Duration // PRD #320: a demoted (judge/self_improve) run older than this fails open to normal priority so background work never starves
 
 	// Anthropic usage-limit park (PRD #35). Both are server-side bounds on a
 	// WORKER-REPORTED event, which is why they are here and not in the claim payload:
@@ -863,6 +868,8 @@ func Load() (Config, error) {
 	cfg.PlanMaxRevisions = parseInt("PLAN_MAX_REVISIONS", 3)
 	cfg.QuestionMax = parseInt("QUESTION_MAX", 5)
 	cfg.QuestionTimeoutSeconds = parseInt("QUESTION_TIMEOUT_SECONDS", 86400)
+	// PRD #1226 M5 (D6): the completion-hold owner-continue window, default 900s.
+	cfg.CompletionHoldWindowSeconds = parseInt("COMPLETION_HOLD_WINDOW_SECONDS", 900)
 	cfg.RunMaxRequeues = parseNonNegInt("RUN_MAX_REQUEUES", 1)
 	cfg.WorkerHeartbeatInterval = parseDuration("WORKER_HEARTBEAT_INTERVAL", 15*time.Second)
 	cfg.WorkerHeartbeatStale = parseDuration("WORKER_HEARTBEAT_STALE", 45*time.Second)

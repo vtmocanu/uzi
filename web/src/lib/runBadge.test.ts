@@ -458,6 +458,93 @@ describe("revising phase (issue #750)", () => {
   });
 });
 
+describe("completion-interlock phase (PRD #1226 M5, D8)", () => {
+  it("effectiveRunStatus maps each completion_phase to its pseudo-status", () => {
+    // The phase is a SINGLE server-computed field the web renders directly (never
+    // re-derives). Each of the three live phases maps to one pseudo-status key.
+    expect(effectiveRunStatus({ status: "running", completion_phase: "checking" })).toBe(
+      "completion_checking",
+    );
+    expect(effectiveRunStatus({ status: "running", completion_phase: "reworking" })).toBe(
+      "completion_reworking",
+    );
+    expect(effectiveRunStatus({ status: "paused", completion_phase: "blocked" })).toBe(
+      "completion_blocked",
+    );
+  });
+
+  it("effectiveRunStatus: an empty/absent completion_phase falls through to the raw status", () => {
+    // "" is a non-interlocked run (or one not in a live completion state) — it must render
+    // exactly as today, and an absent field (api/web rollout skew) reads the same.
+    expect(effectiveRunStatus({ status: "running", completion_phase: "" })).toBe("running");
+    expect(effectiveRunStatus({ status: "paused", completion_phase: "" })).toBe("paused");
+    expect(effectiveRunStatus({ status: "running" })).toBe("running");
+  });
+
+  it("completion_phase 'blocked' OVERRIDES the plain 'paused' rendering (precedence)", () => {
+    // The load-bearing precedence: a completion-blocked run's REAL status is "paused"
+    // (shared with the PRD #1190 owner-pause). Without the completion_phase overlay
+    // winning, it would render as the owner "‖ paused" pill. The overlay must win so it
+    // reads "Completion blocked".
+    expect(effectiveRunStatus({ status: "paused", completion_phase: "blocked" })).toBe(
+      "completion_blocked",
+    );
+    // A genuinely owner-paused run (no completion phase) still renders as "paused".
+    expect(effectiveRunStatus({ status: "paused", completion_phase: "" })).toBe("paused");
+    expect(effectiveRunStatus({ status: "paused" })).toBe("paused");
+  });
+
+  it("planning/revising stay AHEAD of the completion overlay (existing order preserved)", () => {
+    // planning (running + is_planning) and revising (awaiting_approval + is_revising) are
+    // pre-approval phases the server never co-emits with a completion phase. Keeping them
+    // first matches their existing precedence; assert the order explicitly.
+    expect(
+      effectiveRunStatus({ status: "running", is_planning: true, completion_phase: "checking" }),
+    ).toBe("planning");
+    expect(
+      effectiveRunStatus({
+        status: "awaiting_approval",
+        is_revising: true,
+        completion_phase: "checking",
+      }),
+    ).toBe("revising");
+  });
+
+  it("runBadge renders each completion pseudo-status with its exact label + tone", () => {
+    // The board's LatestRun projection deliberately does NOT carry completion_phase, so a
+    // completion pseudo-status reaches runBadge only as the EFFECTIVE status string (the
+    // run-view seam derives it from the full Run; the board card passes it through
+    // effectiveRunStatus like every other status). Pass it via `status` — cast because it
+    // is a derived pseudo-status, not a real runs.status value — exactly as the
+    // ui.test.tsx label-agreement loop does for planning/revising.
+    expect(runBadge(run({ status: "completion_checking" as RunStatus }), NOW)).toEqual({
+      kind: "badge",
+      label: "Checking completion",
+      tone: "info",
+      pulse: true,
+    });
+    expect(runBadge(run({ status: "completion_reworking" as RunStatus }), NOW)).toEqual({
+      kind: "badge",
+      label: "Reworking unmet milestones",
+      tone: "info",
+      pulse: true,
+    });
+    expect(runBadge(run({ status: "completion_blocked" as RunStatus }), NOW)).toEqual({
+      kind: "badge",
+      label: "Completion blocked",
+      tone: "warning",
+      pulse: false,
+    });
+  });
+
+  it("runStatusTone maps the derived completion pseudo-statuses to their tones", () => {
+    expect(runStatusTone("completion_checking", null)).toBe("info");
+    expect(runStatusTone("completion_reworking", null)).toBe("info");
+    // blocked → warn (an attention hold), never danger: the run has not failed.
+    expect(runStatusTone("completion_blocked", null)).toBe("warning");
+  });
+});
+
 // PRD #35. runBadge.ts's header has always CLAIMED its tones mirror StatusPill's
 // RUN_STATUS_TONES "so one status renders one color everywhere". Until this, nothing
 // enforced it: the two maps live in different files, neither imports the other, and a
@@ -505,6 +592,19 @@ describe("RUN_STATUS_TONES ↔ runStatusTone agreement", () => {
     // two cannot drift.
     expect(RUN_STATUS_TONES["paused"]).toEqual({ tone: "info" });
     expect(runStatusTone("paused", null)).toBe("info");
+  });
+
+  it("covers the completion-interlock states specifically, on both surfaces (PRD #1226 M5)", () => {
+    // Same reasoning as the parks above: the loop iterates the pill map, so an absent key
+    // is an absent assertion — this pins each completion pseudo-status to its tone on BOTH
+    // the pill map and the list-row tone so the two cannot drift. checking/reworking are
+    // info (live work); blocked is warn (an attention hold), never danger.
+    expect(RUN_STATUS_TONES["completion_checking"]).toEqual({ tone: "info", pulse: true });
+    expect(runStatusTone("completion_checking", null)).toBe("info");
+    expect(RUN_STATUS_TONES["completion_reworking"]).toEqual({ tone: "info", pulse: true });
+    expect(runStatusTone("completion_reworking", null)).toBe("info");
+    expect(RUN_STATUS_TONES["completion_blocked"]).toEqual({ tone: "warning" });
+    expect(runStatusTone("completion_blocked", null)).toBe("warning");
   });
 
   it("leaves the unknown-status fallback alone", () => {

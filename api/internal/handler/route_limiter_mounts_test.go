@@ -528,6 +528,11 @@ var wantRouteMounts = []routeMount{
 	// UPDATE of runs (status → queued), no token spend, no forge write → noLimiter,
 	// mirroring the priority verb's posture.
 	{"POST", "/api/runs/{id}/resume-now", noLimiter},
+	// Owner completion decision (PRD #1226 M5, D7): one owner-scoped resume of a
+	// completion-blocked run (paused → queued via ResumePausedRun, or delivering the decision
+	// to the live worker) plus an audit/guidance input row — no token spend, no forge write →
+	// noLimiter, mirroring resume-now's posture.
+	{"POST", "/api/runs/{id}/completion/decision", noLimiter},
 	{"POST", "/api/runs/{id}/review/recommendations/{recID}/issue", limForge},
 	// On-demand MR rework (PRD #1202): reads the MR's review comments off the forge on
 	// every call, so it carries the per-user forge limiter, like ci-fix-runs.
@@ -551,6 +556,7 @@ var wantRouteMounts = []routeMount{
 	// the other worker /runs/{id}/... writes; both are bounded server-side (the permit is
 	// idempotent, the attempt log is pruned to N) rather than by a per-user limiter.
 	{"POST", "/api/worker/runs/{id}/completion/attempt", noLimiter},
+	{"POST", "/api/worker/runs/{id}/completion/hold", noLimiter},
 	{"POST", "/api/worker/runs/{id}/completion/permit", noLimiter},
 	// PRD #333 M2: the incidental-findings capture route. It rides
 	// proposalLimiter.PerWorkerMiddleware (a per-WORKER, IP-fallback mount), which this

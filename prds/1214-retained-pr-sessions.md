@@ -10,7 +10,7 @@ Implement on a new branch from current `main`. The core spans api, agent, web an
 
 ## Dependency update (verified 2026-09-09)
 
-Epic #1225 split its completion work after review proved one combined run was too large. [#1228](1228-shared-context-generations.md) now owns the neutral generation schema, chunk transport, encryption, bounds, CAS, GC primitives and Claude codec. [#1226](1226-structural-completion-interlock.md) owns the exact-head completion permit and transaction hook. This PRD owns only `pr_session` policy, authorization, capture/activation, rework restore, controls, placement and measurement on top of those shared seams.
+Epic #1225 split its completion work after review proved one combined run was too large. [#1228](1228-shared-context-generations.md) now owns the neutral generation schema, chunk transport, encryption, bounds, CAS, GC primitives and Claude codec. [#1226](done/1226-structural-completion-interlock.md) owns the exact-head completion permit and transaction hook. This PRD owns only `pr_session` policy, authorization, capture/activation, rework restore, controls, placement and measurement on top of those shared seams.
 
 The detailed constraints retained below remain binding requirements for the shared primitive, not permission to duplicate it. If either dependency is absent or an overlapping implementation is active, stop report-only before editing; never work around the dependency with a partial closing PR.
 

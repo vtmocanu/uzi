@@ -97,6 +97,7 @@ uzi run scope <id> --through <n>
 uzi run pause <id> [--now|--cancel]
 uzi run resume <id>
 uzi run resume-now <id>
+uzi run decide <id> --continue [--guidance <text>]
 uzi run follow-up <id> [--message <text>]
 uzi run answer <id> [--message <text> ...]
 uzi run inputs <id> [--json]
@@ -250,6 +251,16 @@ A few worth knowing:
   the remaining milestones if it's gone. A run that isn't paused is a 409
   (exit 5). It posts to the same endpoint as `run resume-now` below, which
   now also resumes a paused run in addition to a pool-held one.
+- **`run decide <id> --continue [--guidance <text>]`** (PRD #1226) records
+  the owner's continue decision on a run the [structural completion
+  interlock](./run-completion-hold.md) has blocked — either a live
+  completion question or a run already parked in the completion hold.
+  `--continue` is required (the only decision supported today); an optional
+  `--guidance <text>` rides along to steer the run past the check. Answered
+  live, the run resumes in place with no new claim; answered after it has
+  parked, it resumes through `queued` like `run resume`. A run that is not
+  completion-blocked is a 409 (exit 5); a foreign or unknown run is a 404
+  (exit 4).
 - **`run answer <id>`** answers the clarifying question a run is parked on
   (`awaiting_input`) — see [Answering a
   question](./run-activity.md#answering-a-question). It reads the open
@@ -1372,7 +1383,19 @@ A run's `status` (on `run get` and `run list`) is one of exactly **thirteen** va
   turn](run-recovery-wait.md).
 - `paused`: an owner-requested hold (`uzi run pause`), resumed on demand from
   the run page or `uzi run resume <id>`. See [Pausing and resuming a
-  run](run-pause.md). It does **not** auto-resume.
+  run](run-pause.md). It does **not** auto-resume. A `paused` run can instead
+  be a **completion-blocked hold** on a run whose [structural completion
+  interlock](run-completion-hold.md) couldn't finish a frozen milestone —
+  same status, a different reason, and a different resume path
+  (`uzi run decide <id> --continue`, not `run resume`). `run get` prints the
+  distinction as a `COMPLETION` row reading `Completion blocked`, alongside
+  emit-only-when-set `COMPLETION_UNMET`/`COMPLETION_ATTEMPTS`/`HOLD_CONTEXT`
+  rows (the same fields under `--json`: `completion_phase`, `hold_reason`,
+  `completion_unmet`, `completion_attempts`, `hold_context`) — a plain owner
+  pause carries none of them. Before it parks that way, an interlocked run
+  also passes through two running-state `COMPLETION` labels of its own —
+  **Checking completion** and **Reworking unmet milestones** — still `status:
+  running` underneath, not a distinct CLI status value.
 
 `limit_wait` and `recovery_wait` auto-resume on their own on a timer — nothing
 to do but wait or cancel; `pool_wait` instead clears only when a token is
