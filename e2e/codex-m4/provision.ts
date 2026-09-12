@@ -11,7 +11,9 @@
 // architecture, an unexpected /etc/codex present, or an incomplete package. The pure decision
 // helpers (arch, lock parse, digest, receipt match, reinstall decision) and the hard-prereq
 // branches are unit-tested with synthetic inputs (provision.test.ts) — no real install runs in
-// a test; on this worker the image-baked path is taken and the smoke needs no install.
+// a test; on this worker the image-baked path is taken and the smoke needs no install. The
+// incomplete-package-after-provisioning throw is exercised by injecting the `exists`/`installer`
+// seams (an installer that "succeeds" but leaves an incomplete layout), never a real install.
 
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -147,6 +149,26 @@ export interface ProvisionResult {
   readonly source: "image-baked" | "cache-install";
 }
 
+/** What the installer step is asked to do; returns the process outcome. */
+export interface InstallRequest {
+  readonly arch: Arch;
+  readonly prefix: string;
+  readonly lockPath: string;
+}
+
+/** The rootless install step; injectable so a test can drive {@link resolveCodexBin}'s post-
+ *  install branches (e.g. an installer that "succeeds" but leaves an INCOMPLETE layout) without
+ *  a real network install. Production uses {@link defaultInstaller} (spawns install-codex.sh). */
+export type Installer = (req: InstallRequest) => { status: number | null; stderr: string };
+
+function defaultInstaller(req: InstallRequest): { status: number | null; stderr: string } {
+  const install = spawnSync(INSTALL_SCRIPT, [req.arch], {
+    encoding: "utf8",
+    env: { ...process.env, UZI_CODEX_PREFIX: req.prefix, UZI_CODEX_LOCK: req.lockPath },
+  });
+  return { status: install.status, stderr: String(install.stderr ?? "") };
+}
+
 /** Injectable seams for {@link resolveCodexBin}; production uses the real fs/spawn defaults. */
 export interface ProvisionDeps {
   readonly nodeArch?: string;
@@ -155,6 +177,11 @@ export interface ProvisionDeps {
   readonly cachePrefix?: string;
   readonly etcLstat?: (p: string) => { present: boolean };
   readonly versionRunner?: VersionRunner;
+  /** Layout-membership probe (default: `existsSync`); injected to simulate an incomplete layout. */
+  readonly exists?: (p: string) => boolean;
+  /** The rootless install step (default: {@link defaultInstaller}); injected to avoid a real
+   *  network install in a test. */
+  readonly installer?: Installer;
 }
 
 const M4_DIR = __dirname;
@@ -176,10 +203,12 @@ export function resolveCodexBin(deps: ProvisionDeps = {}): ProvisionResult {
   const facts = parseLock(readFileSync(lockPath, "utf8"));
   const { version } = facts;
   const run = deps.versionRunner ?? defaultVersionRunner;
+  const exists = deps.exists ?? existsSync;
+  const installer = deps.installer ?? defaultInstaller;
 
   // 1. Prefer the image-baked absolute package.
   const imagePrefix = path.join(deps.imageRoot ?? DEFAULT_IMAGE_ROOT, version);
-  if (layoutComplete(imagePrefix)) {
+  if (layoutComplete(imagePrefix, exists)) {
     const codexBin = path.join(imagePrefix, "bin", "codex");
     assertBinaryVersion(codexBin, version, run); // HARD on mismatch (never a skip)
     return { codexBin, prefix: imagePrefix, source: "image-baked" };
@@ -192,19 +221,16 @@ export function resolveCodexBin(deps: ProvisionDeps = {}): ProvisionResult {
   const expected: Receipt = { version, arch, lockDigest: lockDigest(lockText) };
   const receiptPath = path.join(cachePrefix, "receipt.json");
   const receipt = readReceipt(receiptPath);
-  const decision = decideProvision({ receipt, layoutComplete: layoutComplete(installedPrefix), expected });
+  const decision = decideProvision({ receipt, layoutComplete: layoutComplete(installedPrefix, exists), expected });
   if (decision === "reinstall") {
     mkdirSync(cachePrefix, { recursive: true });
-    const install = spawnSync(INSTALL_SCRIPT, [arch], {
-      encoding: "utf8",
-      env: { ...process.env, UZI_CODEX_PREFIX: cachePrefix, UZI_CODEX_LOCK: lockPath },
-    });
+    const install = installer({ arch, prefix: cachePrefix, lockPath });
     if (install.status !== 0) {
-      throw new CodexProvisionError(`install-codex.sh ${arch} exited ${String(install.status)}: ${String(install.stderr)}`);
+      throw new CodexProvisionError(`install-codex.sh ${arch} exited ${String(install.status)}: ${install.stderr}`);
     }
     writeFileSync(receiptPath, `${JSON.stringify(expected, null, 2)}\n`, "utf8");
   }
-  if (!layoutComplete(installedPrefix)) {
+  if (!layoutComplete(installedPrefix, exists)) {
     throw new CodexProvisionError(`incomplete Codex package at ${installedPrefix} after provisioning`);
   }
   const codexBin = path.join(installedPrefix, "bin", "codex");

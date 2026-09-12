@@ -17,6 +17,16 @@ function main(): void {
     console.error(`run-receipts: ${report.malformed.length} O row(s) with a missing/malformed o-state:`);
     for (const id of report.malformed) console.error(`  - ${id}`);
   }
+  if (report.unresolved.length > 0) {
+    console.error(
+      `run-receipts: ${report.unresolved.length} inherited/receipt-present O row(s) with an `
+      + "unresolved (placeholder) digest block merge (D8) — refresh to the real merge-candidate digest:",
+    );
+    for (const row of report.unresolved) {
+      console.error(`  - ${row.id}`);
+      console.error(`      digest: ${row.digest}`);
+    }
+  }
   if (report.owed.length > 0) {
     console.error(`run-receipts: ${report.owed.length} owed O assertion(s) block merge (D8):`);
     for (const owed of report.owed) {
