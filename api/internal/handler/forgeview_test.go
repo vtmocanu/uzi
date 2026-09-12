@@ -70,6 +70,20 @@ func TestMergeStateDTO(t *testing.T) {
 		}
 	})
 
+	t.Run("failing beats pending when both are present", func(t *testing.T) {
+		// The failing-vs-pending priority only bites when a PR has BOTH at once; the
+		// disjoint fixtures above never co-occur, so a silent case-order swap would go
+		// undetected without this. A failing check outranks a pending one.
+		s := forge.MergeRequestSummary{Conflicts: &fls, ReviewDecision: forge.ReviewApproved}
+		m := mergeStateDTO(s, []forge.Check{pending, failing})
+		if m.BlockedReason != "checks failing" {
+			t.Fatalf("failing must outrank pending, got %q", m.BlockedReason)
+		}
+		if m.RequiredChecksPassed {
+			t.Errorf("a failing (and pending) check ⇒ RequiredChecksPassed=false")
+		}
+	})
+
 	t.Run("clean when nothing blocks", func(t *testing.T) {
 		s := forge.MergeRequestSummary{Conflicts: &fls, ReviewDecision: forge.ReviewApproved}
 		m := mergeStateDTO(s, []forge.Check{passing})
