@@ -31,6 +31,18 @@ const (
 	focusTranscript
 )
 
+// railFoldMode is the crew rail's tri-state fold (PRD #1257 D3). The zero value is railFoldAuto,
+// so a freshly opened run (newDetailState) always starts on the height-driven decision; `c` pins
+// it Open or Closed for that run, and only reopening it returns to Auto. A resize never clears a
+// pin — it only re-decides while the mode is Auto.
+type railFoldMode int
+
+const (
+	railFoldAuto   railFoldMode = iota // height decides (railAutoFolded)
+	railFoldOpen                       // user pinned the roster open (`c`)
+	railFoldClosed                     // user pinned the roster folded (`c`)
+)
+
 // detailState is one run's live view: the lane rail plus the selected lane's
 // transcript, fed by the REST replay for history and StreamRun for live frames.
 type detailState struct {
@@ -61,12 +73,15 @@ type detailState struct {
 	scroll int
 	focus  int  // focusRail | focusTranscript — which pane ↑/↓ drives (M4)
 	follow bool // M5: auto-tail the transcript (tail -f). Reset true on open / lane switch.
-	// railCollapsed folds the crew list to a one-line summary + the selected lane (`c`), so a
-	// tall roster cannot push the milestone block below the fold — the rail does not scroll,
-	// it is clamped to the transcript height (issue #379).
-	railCollapsed bool
-	runLoaded     bool // the first GetRun has landed: header/milestones/accounts can render
-	tailLoaded    bool // the newest transcript page has landed
+	// railFold is the crew list's fold mode (PRD #1257 D3): railFoldAuto lets the terminal
+	// height decide (railAutoFolded folds the roster to a one-line summary + the selected lane
+	// whenever the expanded roster would push MILESTONES / SPEND / the run's own account meters
+	// off the height-clamped, non-scrolling rail — issue #379), while `c` pins it Open or Closed.
+	// The zero value is railFoldAuto, so newDetailState restores auto on every reopen; a resize
+	// re-decides while Auto but never clears a pin.
+	railFold   railFoldMode
+	runLoaded  bool // the first GetRun has landed: header/milestones/accounts can render
+	tailLoaded bool // the newest transcript page has landed
 	// lowSeq / highSeq bound the seq-carrying frames held (0 = none). lowSeq is the backfill
 	// cursor: the background walk requests the newest page strictly below it and the reply
 	// lowers it, until the start of history is reached. highSeq is the total, since seq is
@@ -490,11 +505,19 @@ func (m tuiModel) detailKey(k string) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(cmds...)
 	case keyCollapseCrew:
 		// Fold / unfold the crew list so the milestone block below it is always reachable
-		// (the rail is height-clamped and does not scroll). No-op with no lanes: there is
-		// nothing to fold and the caret/hint are hidden, so toggling would only leave a run
-		// that later gains lanes silently opening collapsed.
+		// (the rail is height-clamped and does not scroll). `c` is a sticky override (PRD #1257
+		// D3): it pins the roster to the OPPOSITE of what the user currently sees, so the first
+		// press always flips the visible state (whether that was the auto decision or a prior
+		// pin) and later presses toggle between the two pins. A resize never clears the pin;
+		// only reopening the run (newDetailState) returns to the height-driven auto mode. No-op
+		// with no lanes: there is nothing to fold and the caret/hint are hidden, so toggling
+		// would only leave a run that later gains lanes silently opening folded.
 		if len(m.detail.lanes) > 0 {
-			m.detail.railCollapsed = !m.detail.railCollapsed
+			if m.effectiveRailFolded(time.Now()) {
+				m.detail.railFold = railFoldOpen
+			} else {
+				m.detail.railFold = railFoldClosed
+			}
 		}
 		return m, nil
 	case keyTab:
