@@ -215,23 +215,28 @@ func completionQuestionOpen(run store.Run) bool {
 	return run.CompletionQuestionAt.Valid
 }
 
-// DecideCompletion is the widened owner/admin completion-decision entry point (PRD #1227 M1). It
+// DecideCompletion is the widened owner-scoped completion-decision entry point (PRD #1227 M1). It
 // dispatches on req.Decision:
 //
 //   - "continue": preserved EXACTLY as #1226 — owner-only via ContinueCompletionDecision, no
 //     transaction, no contract change.
-//   - "partial" / "accept": owner-or-admin (GetRunForViewer authorizes the caller), then ONE
-//     transaction that, under the run's FOR UPDATE row lock (the mutex, like completeRunWithPermit):
-//     re-authorizes against the locked row, fences on the contract revision (fresh apply /
-//     idempotent no-op / conflict), validates the decision against the LOCKED contract, bumps the
-//     revision to N+1 with the revised contract, invalidates every prior unconsumed permit, records
-//     the audit input + resumes the run, and commits. Every write is atomic: a validation failure or
-//     a not-blocked run rolls the whole transaction back.
-func (s *Service) DecideCompletion(ctx context.Context, userID uuid.UUID, isAdmin bool, runID uuid.UUID, req CompletionDecisionInput) (store.Run, error) {
+//   - "partial" / "accept": OWNER-SCOPED (GetRun authorizes the caller, exactly like continue and
+//     CreateRunInput), then ONE transaction that, under the run's FOR UPDATE row lock (the mutex,
+//     like completeRunWithPermit): re-checks ownership against the locked row, fences on the
+//     contract revision (fresh apply / idempotent no-op / conflict), validates the decision against
+//     the LOCKED contract, bumps the revision to N+1 with the revised contract, invalidates every
+//     prior unconsumed permit, records the audit input + resumes the run, and commits. Every write
+//     is atomic: a validation failure or a not-blocked run rolls the whole transaction back.
+//
+// A partial/accept decision is a WRITE that reduces/accepts scope, so it is strictly owner-only: a
+// foreign caller — INCLUDING a read-only admin_ro (uza_) Bearer token, which keeps IsAdmin=true
+// through RequireUser — gets ErrRunNotFound (→ 404) and cannot write another user's run. This
+// preserves the read-only-ceiling invariant every other admin write in this repo enforces
+// cookie-only; the binding spec's "the OWNER records an explicit later decision" is honored here.
+func (s *Service) DecideCompletion(ctx context.Context, userID uuid.UUID, runID uuid.UUID, req CompletionDecisionInput) (store.Run, error) {
 	switch req.Decision {
 	case "continue":
-		// Owner-only, byte-identical to #1226. (isAdmin is deliberately NOT consulted: continue
-		// stays owner-scoped via ContinueCompletionDecision's GetRun.)
+		// Owner-only, byte-identical to #1226 (ContinueCompletionDecision's GetRun is owner-scoped).
 		return s.ContinueCompletionDecision(ctx, userID, runID, req.Guidance)
 	case "partial", "accept":
 		// handled below
@@ -239,21 +244,28 @@ func (s *Service) DecideCompletion(ctx context.Context, userID uuid.UUID, isAdmi
 		return store.Run{}, fmt.Errorf("%w: unknown decision", ErrCompletionDecisionInvalid)
 	}
 
-	// Authorize the caller (owner-or-admin) BEFORE opening the transaction: a foreign non-admin is
-	// hidden as ErrRunNotFound, exactly as an unknown id. The locked row re-checks this after the
-	// lock so the authorization cannot be raced by an ownership change.
-	if _, err := s.GetRunForViewer(ctx, userID, isAdmin, runID); err != nil {
+	// Authorize the caller OWNER-SCOPED BEFORE opening the transaction: GetRun returns
+	// ErrRunNotFound for a foreign/absent run (exactly as an unknown id), so a partial/accept WRITE
+	// cannot touch another user's run — a read-only admin_ro (uza_) Bearer token is hidden as 404
+	// like any non-owner. The locked row re-checks ownership after the lock so it cannot be raced by
+	// an ownership change.
+	if _, err := s.GetRun(ctx, userID, runID); err != nil {
 		return store.Run{}, err
 	}
 
 	// Common validation independent of the locked contract: a non-empty, bounded reason and a
-	// positive fenced revision. (The handler also caps the reason for shape; this re-checks
-	// non-empty per D1 and is the authoritative gate for the CLI path.)
-	reason := strings.TrimSpace(req.Reason)
+	// positive fenced revision. reason is owner-supplied free text, so NUL-strip it FIRST (a NUL is
+	// not whitespace, so it would survive TrimSpace and later raise a Postgres jsonb 22P05/22021 on
+	// the contract/audit write, 500ing the decision) — the SAME stripNUL-then-TrimSpace order the
+	// sibling completion path uses on the reported head/branch. Then the non-empty + cap checks run
+	// on the cleaned value. (The handler also caps the reason for shape; this re-checks non-empty
+	// per D1 and is the authoritative gate for the CLI path.)
+	cleanReason, _ := stripNUL(req.Reason)
+	reason := strings.TrimSpace(cleanReason)
 	if reason == "" {
 		return store.Run{}, fmt.Errorf("%w: reason required", ErrCompletionDecisionInvalid)
 	}
-	if len(req.Reason) > maxCompletionReasonBytes {
+	if len(reason) > maxCompletionReasonBytes {
 		return store.Run{}, fmt.Errorf("%w: reason is too long", ErrCompletionDecisionInvalid)
 	}
 	if req.ContractRevision <= 0 {
@@ -284,9 +296,10 @@ func (s *Service) DecideCompletion(ctx context.Context, userID uuid.UUID, isAdmi
 		}
 		return store.Run{}, err
 	}
-	// Re-authorize under the lock: a non-admin caller must own the LOCKED row. A foreign run is
-	// hidden as ErrRunNotFound (no existence leak), matching GetRunForViewer.
-	if !isAdmin && locked.UserID != userID {
+	// Re-check ownership under the lock: the caller must own the LOCKED row. A foreign run is hidden
+	// as ErrRunNotFound (no existence leak), matching the pre-lock GetRun. This closes the ownership
+	// TOCTOU while staying strictly owner-only — no admin bypass, so no admin_ro token can write.
+	if locked.UserID != userID {
 		return store.Run{}, ErrRunNotFound
 	}
 	// The revision fence. An unfrozen row (revision NULL) is not revisable → conflict (fail-closed;
@@ -306,8 +319,8 @@ func (s *Service) DecideCompletion(ctx context.Context, userID uuid.UUID, isAdmi
 		// fresh apply — fall through to validation + write.
 	case cur == req.ContractRevision+1 && decisionAlreadyEncoded(locked, dec, cur):
 		// Idempotent repeat: nothing to write. The deferred Rollback releases the lock; the re-read
-		// runs on a separate pool connection (a plain SELECT does not block on the row lock).
-		return s.GetRunForViewer(ctx, userID, isAdmin, runID)
+		// runs owner-scoped on a separate pool connection (a plain SELECT does not block on the lock).
+		return s.GetRun(ctx, userID, runID)
 	default:
 		return store.Run{}, ErrCompletionRevisionConflict
 	}
@@ -350,9 +363,9 @@ func (s *Service) DecideCompletion(ctx context.Context, userID uuid.UUID, isAdmi
 	// Record the audit input and resume the run — the SAME mechanics the continue path uses. The
 	// reason rides as the follow_up guidance (paused branch) and the audit body is the decision
 	// JSON. A not-blocked run returns ErrCompletionNotBlocked here, rolling the whole transaction
-	// back (the bump + invalidation never commit). Resume is scoped to the RUN'S OWNER
-	// (locked.UserID), not the caller: an ADMIN deciding a foreign run must still resume its
-	// paused hold, and ResumePausedRun fences on user_id.
+	// back (the bump + invalidation never commit). Resume is scoped to the run's owner
+	// (locked.UserID, which now equals userID since the caller must own the locked row); ResumePausedRun
+	// fences on user_id.
 	auditBody, err := decisionAuditBody(dec, frozenMs, newRev)
 	if err != nil {
 		return store.Run{}, err
@@ -363,7 +376,7 @@ func (s *Service) DecideCompletion(ctx context.Context, userID uuid.UUID, isAdmi
 	if err := tx.Commit(ctx); err != nil {
 		return store.Run{}, err
 	}
-	return s.GetRunForViewer(ctx, userID, isAdmin, runID)
+	return s.GetRun(ctx, userID, runID)
 }
 
 // validateDecision applies the D1 semantic rules for a partial/accept decision against the LOCKED
@@ -386,6 +399,14 @@ func validateDecision(locked store.Run, dec CompletionDecisionInput, frozenMs []
 			currentDeferred[d.MilestoneID] = true
 		}
 	}
+	// Milestone ids that already carry an owner-accepted criterion (PRD #1227 D3). A partial must not
+	// defer such a milestone: the revised contract would then place it in scope.out AND keep its
+	// criterion in accepted — contradictory for the M4 DTO. This is symmetric with the accept arm
+	// refusing to accept a criterion whose milestone is already deferred.
+	acceptedMilestone := make(map[string]bool, len(prior.Accepted))
+	for _, a := range prior.Accepted {
+		acceptedMilestone[a.MilestoneID] = true
+	}
 
 	switch dec.Decision {
 	case "partial":
@@ -405,6 +426,13 @@ func validateDecision(locked store.Run, dec CompletionDecisionInput, frozenMs []
 			// not a partial. keep must be a subset of the current in-scope set (frozen − currentOut).
 			if currentDeferred[id] {
 				return fmt.Errorf("%w: milestone is out of scope", ErrCompletionDecisionInvalid)
+			}
+		}
+		// A milestone being deferred (frozen − keep) must not already have an owner-accepted
+		// criterion, or the revised contract would contradict itself (scope.out ∩ accepted).
+		for _, m := range frozenMs {
+			if !seen[m.ID] && acceptedMilestone[m.ID] {
+				return fmt.Errorf("%w: cannot defer an already-accepted milestone", ErrCompletionDecisionInvalid)
 			}
 		}
 		// The decision must STRICTLY add at least one new deferral (a frozen milestone that is

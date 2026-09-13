@@ -4411,9 +4411,10 @@ WHERE id = @id AND issued_by_worker_id = @issued_by_worker_id AND consumed_at IS
 -- transaction and SELECTs the run FOR UPDATE through this so a partial/accept decision
 -- serializes against a racing decision (or a completeRunWithPermit consume) on the same run —
 -- the FOR UPDATE row lock is the mutex, exactly as GetRunOwnedByWorkerForUpdate is for the
--- completion transaction. It is NOT owner-scoped: DecideCompletion re-authorizes owner-or-admin
--- against the LOCKED row (locked.user_id) after the lock, so a foreign non-admin is hidden the
--- same way GetRunForViewer hides it. An absent run returns pgx.ErrNoRows (-> ErrRunNotFound).
+-- completion transaction. DecideCompletion is OWNER-SCOPED: it re-checks ownership against the
+-- LOCKED row (locked.user_id == caller) after the lock, so a foreign caller — including an
+-- admin_ro Bearer, which keeps IsAdmin — is hidden as ErrRunNotFound (never a write), preserving
+-- the read-only ceiling. An absent run returns pgx.ErrNoRows (-> ErrRunNotFound).
 SELECT * FROM runs WHERE id = @id FOR UPDATE;
 
 -- name: BumpContractRevision :one

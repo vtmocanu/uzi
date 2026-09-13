@@ -32,10 +32,12 @@ type completionDecisionRequest struct {
 	ContractRevision int      `json:"contract_revision"`
 }
 
-// ContinueCompletionDecision records the owner/admin decision on a completion-blocked run (PRD
+// ContinueCompletionDecision records the owner's decision on a completion-blocked run (PRD
 // #1226 M5, D7 + #1227 M1) and resumes it. It is mounted RequireUser so the CLI's uzc_ Bearer
-// reaches it — NOT the cookie-only RequireAuth group. continue stays owner-scoped; partial/accept
-// are owner-or-admin (the service authorizes and, for partial/accept, hides a foreign run as 404).
+// reaches it — NOT the cookie-only RequireAuth group. ALL three decisions (continue, partial,
+// accept) are OWNER-SCOPED: the service authorizes via the owner-only GetRun and hides a foreign
+// run — including a read-only admin_ro (uza_) Bearer, which keeps IsAdmin=true through RequireUser —
+// as 404, so no admin_ro token can WRITE (reduce/accept scope) on another user's run.
 //
 // It validates the request SHAPE here, then hands the dispatch, ID validation, revision fence and
 // writes to workersvc.DecideCompletion so web and CLI (one endpoint) cannot drift. (The handler
@@ -75,7 +77,7 @@ func (h *Handler) ContinueCompletionDecision(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	run, err := h.wsvc.DecideCompletion(r.Context(), user.ID, user.IsAdmin, runID, workersvc.CompletionDecisionInput{
+	run, err := h.wsvc.DecideCompletion(r.Context(), user.ID, runID, workersvc.CompletionDecisionInput{
 		Decision:         req.Decision,
 		Guidance:         req.Guidance,
 		Keep:             req.Keep,

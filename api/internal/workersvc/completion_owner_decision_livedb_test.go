@@ -54,7 +54,7 @@ func TestDecideCompletionPartialHappyPathLiveDB(t *testing.T) {
 	e.seedPermit(t, runID, wid, 1, "deadbeef")
 
 	const reason = "priorities changed; ship m1 only"
-	run, err := svc.DecideCompletion(e.ctx, e.userID, false, runID, CompletionDecisionInput{
+	run, err := svc.DecideCompletion(e.ctx, e.userID, runID, CompletionDecisionInput{
 		Decision: "partial", Keep: []string{"m1"}, Reason: reason, ContractRevision: 1,
 	})
 	if err != nil {
@@ -127,7 +127,7 @@ func TestDecideCompletionAcceptHappyPathLiveDB(t *testing.T) {
 	runID := e.seedFrozenRun(t, wid, []string{"m1", "m2"}, []string{"m1"}, false) // m1 done
 	e.parkCompletionBlocked(t, runID)
 
-	run, err := svc.DecideCompletion(e.ctx, e.userID, false, runID, CompletionDecisionInput{
+	run, err := svc.DecideCompletion(e.ctx, e.userID, runID, CompletionDecisionInput{
 		Decision: "accept", Criteria: []string{"m2.c1"}, Reason: "accepted as delivered", ContractRevision: 1,
 	})
 	if err != nil {
@@ -180,7 +180,7 @@ func TestDecideCompletionRejectionsLiveDB(t *testing.T) {
 			// A fresh run per case: m1 completed so "already satisfied" fires on m1.c1.
 			runID := e.seedFrozenRun(t, wid, []string{"m1", "m2", "m3"}, []string{"m1"}, false)
 			e.parkCompletionBlocked(t, runID)
-			_, err := svc.DecideCompletion(e.ctx, e.userID, false, runID, tc.dec)
+			_, err := svc.DecideCompletion(e.ctx, e.userID, runID, tc.dec)
 			if !errors.Is(err, ErrCompletionDecisionInvalid) {
 				t.Fatalf("want ErrCompletionDecisionInvalid, got %v", err)
 			}
@@ -201,14 +201,14 @@ func TestDecideCompletionRejectionsLiveDB(t *testing.T) {
 		runID := e.seedFrozenRun(t, wid, []string{"m1", "m2", "m3"}, nil, false)
 		e.parkCompletionBlocked(t, runID)
 		// First partial: keep m1, defer m2,m3 → revision 2.
-		if _, err := svc.DecideCompletion(e.ctx, e.userID, false, runID, CompletionDecisionInput{
+		if _, err := svc.DecideCompletion(e.ctx, e.userID, runID, CompletionDecisionInput{
 			Decision: "partial", Keep: []string{"m1"}, Reason: "r1", ContractRevision: 1,
 		}); err != nil {
 			t.Fatalf("first partial: %v", err)
 		}
 		// Re-park (the run resumed to queued) and try to RESTORE m2 (keep it) at revision 2 → invalid.
 		e.parkCompletionBlocked(t, runID)
-		_, err := svc.DecideCompletion(e.ctx, e.userID, false, runID, CompletionDecisionInput{
+		_, err := svc.DecideCompletion(e.ctx, e.userID, runID, CompletionDecisionInput{
 			Decision: "partial", Keep: []string{"m1", "m2"}, Reason: "restore m2", ContractRevision: 2,
 		})
 		if !errors.Is(err, ErrCompletionDecisionInvalid) {
@@ -217,8 +217,11 @@ func TestDecideCompletionRejectionsLiveDB(t *testing.T) {
 	})
 }
 
-// TestDecideCompletionNonOwnerHiddenLiveDB: a non-owner non-admin caller is hidden (ErrRunNotFound)
-// before any write, while an ADMIN (a different user id, isAdmin=true) may decide the same run.
+// TestDecideCompletionNonOwnerHiddenLiveDB: ANY foreign caller is hidden (ErrRunNotFound) before any
+// write. A partial/accept is a WRITE (reduce/accept scope), so it is strictly OWNER-SCOPED — a
+// foreign user id is refused whether or not they are an admin (a read-only admin_ro uza_ Bearer keeps
+// IsAdmin=true through RequireUser, so admin must NOT grant a foreign write here). DecideCompletion no
+// longer takes an isAdmin argument; ownership is the only gate.
 func TestDecideCompletionNonOwnerHiddenLiveDB(t *testing.T) {
 	e := setupInterlockLiveDB(t)
 	svc := e.permitService(t)
@@ -228,7 +231,7 @@ func TestDecideCompletionNonOwnerHiddenLiveDB(t *testing.T) {
 		runID := e.seedFrozenRun(t, wid, []string{"m1", "m2"}, nil, false)
 		e.parkCompletionBlocked(t, runID)
 		foreign := uuid.New()
-		_, err := svc.DecideCompletion(e.ctx, foreign, false, runID, CompletionDecisionInput{
+		_, err := svc.DecideCompletion(e.ctx, foreign, runID, CompletionDecisionInput{
 			Decision: "partial", Keep: []string{"m1"}, Reason: "r", ContractRevision: 1,
 		})
 		if !errors.Is(err, ErrRunNotFound) {
@@ -240,22 +243,34 @@ func TestDecideCompletionNonOwnerHiddenLiveDB(t *testing.T) {
 		}
 	})
 
-	t.Run("foreign admin may decide", func(t *testing.T) {
+	t.Run("foreign caller is refused even though it would be an admin", func(t *testing.T) {
+		// The security fix: a partial/accept WRITE is owner-only, so a foreign caller is refused
+		// with ErrRunNotFound REGARDLESS of any admin status (a read-only admin_ro uza_ token would
+		// reach here IsAdmin=true). DecideCompletion is owner-scoped and takes no isAdmin argument,
+		// so a foreign user id can never write another user's run.
 		runID := e.seedFrozenRun(t, wid, []string{"m1", "m2"}, nil, false)
 		e.parkCompletionBlocked(t, runID)
-		admin := uuid.New() // a DIFFERENT user id than the run owner e.userID
-		run, err := svc.DecideCompletion(e.ctx, admin, true, runID, CompletionDecisionInput{
+		e.seedPermit(t, runID, wid, 1, "deadbeef")
+		foreignAdmin := uuid.New() // a DIFFERENT user id than the run owner e.userID
+		_, err := svc.DecideCompletion(e.ctx, foreignAdmin, runID, CompletionDecisionInput{
 			Decision: "partial", Keep: []string{"m1"}, Reason: "admin reduce", ContractRevision: 1,
 		})
-		if err != nil {
-			t.Fatalf("an admin must be allowed to decide a foreign run: %v", err)
+		if !errors.Is(err, ErrRunNotFound) {
+			t.Fatalf("a foreign caller — even one that would be an admin — must be hidden as ErrRunNotFound; got %v", err)
 		}
-		if run.Status != "queued" {
-			t.Fatalf("admin decision must resume the run through queued; status = %q", run.Status)
-		}
+		// The run is unchanged: revision stays at 1, no resume, no audit row, permit not invalidated.
 		_, rev := e.readContract(t, runID)
-		if rev == nil || *rev != 2 {
-			t.Fatalf("admin decision must bump the revision; got %v", rev)
+		if rev == nil || *rev != 1 {
+			t.Fatalf("a refused foreign decision must change nothing; contract_revision = %v, want 1", rev)
+		}
+		if s := e.runStatus(t, runID); s != "paused" {
+			t.Fatalf("a refused foreign decision must leave the run paused (no resume); got %q", s)
+		}
+		if got := e.countInputs(t, runID, "completion_decision"); got != 0 {
+			t.Fatalf("a refused foreign decision must write no audit row; got %d", got)
+		}
+		if e.permitConsumed(t, runID, 1, "deadbeef") {
+			t.Fatal("a refused foreign decision must NOT invalidate the permit")
 		}
 	})
 }
@@ -271,7 +286,7 @@ func TestDecideCompletionConflictLiveDB(t *testing.T) {
 		runID := e.seedFrozenRun(t, wid, []string{"m1", "m2", "m3"}, nil, false)
 		e.parkCompletionBlocked(t, runID)
 		// First partial → revision 2.
-		if _, err := svc.DecideCompletion(e.ctx, e.userID, false, runID, CompletionDecisionInput{
+		if _, err := svc.DecideCompletion(e.ctx, e.userID, runID, CompletionDecisionInput{
 			Decision: "partial", Keep: []string{"m1", "m2"}, Reason: "r1", ContractRevision: 1,
 		}); err != nil {
 			t.Fatalf("first partial: %v", err)
@@ -279,7 +294,7 @@ func TestDecideCompletionConflictLiveDB(t *testing.T) {
 		e.parkCompletionBlocked(t, runID)
 		// A second decision still fencing on revision 1 with a DIFFERENT keep set → conflict
 		// (cur==2, req+1==2 but the encoded decision differs).
-		_, err := svc.DecideCompletion(e.ctx, e.userID, false, runID, CompletionDecisionInput{
+		_, err := svc.DecideCompletion(e.ctx, e.userID, runID, CompletionDecisionInput{
 			Decision: "partial", Keep: []string{"m1"}, Reason: "r2", ContractRevision: 1,
 		})
 		if !errors.Is(err, ErrCompletionRevisionConflict) {
@@ -294,20 +309,20 @@ func TestDecideCompletionConflictLiveDB(t *testing.T) {
 	t.Run("far-stale revision", func(t *testing.T) {
 		runID := e.seedFrozenRun(t, wid, []string{"m1", "m2", "m3", "m4"}, nil, false)
 		e.parkCompletionBlocked(t, runID)
-		if _, err := svc.DecideCompletion(e.ctx, e.userID, false, runID, CompletionDecisionInput{
+		if _, err := svc.DecideCompletion(e.ctx, e.userID, runID, CompletionDecisionInput{
 			Decision: "partial", Keep: []string{"m1", "m2", "m3"}, Reason: "r1", ContractRevision: 1,
 		}); err != nil {
 			t.Fatalf("first partial: %v", err)
 		}
 		e.parkCompletionBlocked(t, runID)
-		if _, err := svc.DecideCompletion(e.ctx, e.userID, false, runID, CompletionDecisionInput{
+		if _, err := svc.DecideCompletion(e.ctx, e.userID, runID, CompletionDecisionInput{
 			Decision: "partial", Keep: []string{"m1", "m2"}, Reason: "r2", ContractRevision: 2,
 		}); err != nil {
 			t.Fatalf("second partial: %v", err)
 		}
 		e.parkCompletionBlocked(t, runID)
 		// Now at revision 3; a decision fencing on revision 1 is far-stale → conflict.
-		_, err := svc.DecideCompletion(e.ctx, e.userID, false, runID, CompletionDecisionInput{
+		_, err := svc.DecideCompletion(e.ctx, e.userID, runID, CompletionDecisionInput{
 			Decision: "partial", Keep: []string{"m1"}, Reason: "r3", ContractRevision: 1,
 		})
 		if !errors.Is(err, ErrCompletionRevisionConflict) {
@@ -327,11 +342,11 @@ func TestDecideCompletionIdempotentRepeatLiveDB(t *testing.T) {
 		runID := e.seedFrozenRun(t, wid, []string{"m1", "m2", "m3"}, nil, false)
 		e.parkCompletionBlocked(t, runID)
 		dec := CompletionDecisionInput{Decision: "partial", Keep: []string{"m1"}, Reason: "same reason", ContractRevision: 1}
-		if _, err := svc.DecideCompletion(e.ctx, e.userID, false, runID, dec); err != nil {
+		if _, err := svc.DecideCompletion(e.ctx, e.userID, runID, dec); err != nil {
 			t.Fatalf("first partial: %v", err)
 		}
 		// Repeat the identical decision (still fencing on revision 1). It is idempotent: no writes.
-		run, err := svc.DecideCompletion(e.ctx, e.userID, false, runID, dec)
+		run, err := svc.DecideCompletion(e.ctx, e.userID, runID, dec)
 		if err != nil {
 			t.Fatalf("idempotent repeat must succeed; got %v", err)
 		}
@@ -347,10 +362,10 @@ func TestDecideCompletionIdempotentRepeatLiveDB(t *testing.T) {
 		runID := e.seedFrozenRun(t, wid, []string{"m1", "m2"}, []string{"m1"}, false)
 		e.parkCompletionBlocked(t, runID)
 		dec := CompletionDecisionInput{Decision: "accept", Criteria: []string{"m2.c1"}, Reason: "same", ContractRevision: 1}
-		if _, err := svc.DecideCompletion(e.ctx, e.userID, false, runID, dec); err != nil {
+		if _, err := svc.DecideCompletion(e.ctx, e.userID, runID, dec); err != nil {
 			t.Fatalf("first accept: %v", err)
 		}
-		run, err := svc.DecideCompletion(e.ctx, e.userID, false, runID, dec)
+		run, err := svc.DecideCompletion(e.ctx, e.userID, runID, dec)
 		if err != nil {
 			t.Fatalf("idempotent accept repeat must succeed; got %v", err)
 		}
@@ -373,7 +388,7 @@ func TestDecideCompletionNotBlockedRolledBackLiveDB(t *testing.T) {
 	runID := e.seedFrozenRun(t, wid, []string{"m1", "m2"}, nil, false) // running, not blocked
 	e.seedPermit(t, runID, wid, 1, "deadbeef")
 
-	_, err := svc.DecideCompletion(e.ctx, e.userID, false, runID, CompletionDecisionInput{
+	_, err := svc.DecideCompletion(e.ctx, e.userID, runID, CompletionDecisionInput{
 		Decision: "partial", Keep: []string{"m1"}, Reason: "r", ContractRevision: 1,
 	})
 	if !errors.Is(err, ErrCompletionNotBlocked) {
@@ -389,5 +404,103 @@ func TestDecideCompletionNotBlockedRolledBackLiveDB(t *testing.T) {
 	}
 	if got := e.countInputs(t, runID, "completion_decision"); got != 0 {
 		t.Fatalf("a rolled-back decision must write no audit row; got %d", got)
+	}
+}
+
+// TestDecideCompletionReasonNULStrippedLiveDB proves a NUL byte in the owner-supplied reason is
+// stripped BEFORE validation/marshal (Finding 2), so it can never reach the completion_contract /
+// audit jsonb and raise a Postgres jsonb error that would 500 the decision. A reason that is only
+// NUL strips to empty → the empty-reason 400 (ErrCompletionDecisionInvalid); a reason with an
+// embedded NUL is cleanly stored (the persisted follow_up carries the stripped text, no DB error).
+func TestDecideCompletionReasonNULStrippedLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	svc := e.permitService(t)
+	wid := e.seedWorker(t, []string{"completion_interlock_v1"})
+
+	t.Run("nul-only reason is the empty-reason 400", func(t *testing.T) {
+		runID := e.seedFrozenRun(t, wid, []string{"m1", "m2"}, nil, false)
+		e.parkCompletionBlocked(t, runID)
+		_, err := svc.DecideCompletion(e.ctx, e.userID, runID, CompletionDecisionInput{
+			Decision: "partial", Keep: []string{"m1"}, Reason: "\x00\x00", ContractRevision: 1,
+		})
+		if !errors.Is(err, ErrCompletionDecisionInvalid) {
+			t.Fatalf("a reason of only NUL bytes must strip to empty and be ErrCompletionDecisionInvalid; got %v", err)
+		}
+		_, rev := e.readContract(t, runID)
+		if rev == nil || *rev != 1 {
+			t.Fatalf("a rejected NUL-only reason must change nothing; contract_revision = %v, want 1", rev)
+		}
+	})
+
+	t.Run("embedded nul reason is cleanly stored (no 500/DB error)", func(t *testing.T) {
+		runID := e.seedFrozenRun(t, wid, []string{"m1", "m2"}, nil, false)
+		e.parkCompletionBlocked(t, runID)
+		const want = "ship m1 only" // the reason after the NUL is stripped
+		run, err := svc.DecideCompletion(e.ctx, e.userID, runID, CompletionDecisionInput{
+			Decision: "partial", Keep: []string{"m1"}, Reason: "ship m1\x00 only", ContractRevision: 1,
+		})
+		if err != nil {
+			t.Fatalf("an embedded-NUL reason must strip cleanly and store, not error; got %v", err)
+		}
+		if run.Status != "queued" {
+			t.Fatalf("the decision must apply and resume through queued; status = %q", run.Status)
+		}
+		// The stored contract must round-trip (no jsonb error) with the STRIPPED reason and no NUL.
+		contract, rev := e.readContract(t, runID)
+		if rev == nil || *rev != 2 {
+			t.Fatalf("contract_revision = %v, want 2", rev)
+		}
+		var c completionContract
+		if err := json.Unmarshal(contract, &c); err != nil {
+			t.Fatalf("unmarshal contract: %v", err)
+		}
+		if c.Scope == nil || len(c.Scope.Out) != 1 || c.Scope.Out[0].Reason != want {
+			t.Fatalf("scope.out reason = %+v, want the stripped %q with no NUL", c.Scope.Out, want)
+		}
+		// The follow_up guidance the resumed worker drains carries the stripped reason too.
+		if body := e.pendingFollowUpBody(t, runID); body != want {
+			t.Fatalf("follow_up body = %q, want the stripped reason %q", body, want)
+		}
+	})
+}
+
+// TestDecideCompletionAcceptThenPartialLiveDB proves the Finding-3 contradiction is refused: after an
+// owner accepts a criterion (m1.c1), a later partial that would defer that milestone (keep excludes
+// m1) is ErrCompletionDecisionInvalid — m1 must not be in scope.out AND m1.c1 in accepted at once.
+func TestDecideCompletionAcceptThenPartialLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	svc := e.permitService(t)
+	wid := e.seedWorker(t, []string{"completion_interlock_v1"})
+	runID := e.seedFrozenRun(t, wid, []string{"m1", "m2"}, nil, false) // neither done
+	e.parkCompletionBlocked(t, runID)
+
+	// Accept m1.c1 → revision 2.
+	if _, err := svc.DecideCompletion(e.ctx, e.userID, runID, CompletionDecisionInput{
+		Decision: "accept", Criteria: []string{"m1.c1"}, Reason: "accepted as delivered", ContractRevision: 1,
+	}); err != nil {
+		t.Fatalf("accept m1.c1: %v", err)
+	}
+	// Re-park (the run resumed to queued), then a partial keeping only m2 would defer m1 → invalid.
+	e.parkCompletionBlocked(t, runID)
+	_, err := svc.DecideCompletion(e.ctx, e.userID, runID, CompletionDecisionInput{
+		Decision: "partial", Keep: []string{"m2"}, Reason: "drop m1", ContractRevision: 2,
+	})
+	if !errors.Is(err, ErrCompletionDecisionInvalid) {
+		t.Fatalf("deferring an already-accepted milestone must be ErrCompletionDecisionInvalid; got %v", err)
+	}
+	// The contract stays at revision 2 (the partial rolled back), m1.c1 still accepted.
+	contract, rev := e.readContract(t, runID)
+	if rev == nil || *rev != 2 {
+		t.Fatalf("the refused partial must leave contract_revision at 2; got %v", rev)
+	}
+	var c completionContract
+	if err := json.Unmarshal(contract, &c); err != nil {
+		t.Fatalf("unmarshal contract: %v", err)
+	}
+	if len(c.Accepted) != 1 || c.Accepted[0].ID != "m1.c1" {
+		t.Fatalf("accepted = %+v, want [m1.c1] unchanged", c.Accepted)
+	}
+	if c.Scope != nil {
+		t.Fatalf("the refused partial must not have written a scope block; got %+v", c.Scope)
 	}
 }

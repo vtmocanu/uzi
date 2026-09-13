@@ -885,13 +885,17 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// (foreign run → 404) and POOL_WAIT-ONLY (non-held → 409); it only flips the
 				// hold to queued, so no token spend and no forge write.
 				r.Post("/{id}/resume-now", h.ResumeRunNow)
-				// Owner/admin completion decision (PRD #1226 M5, D7): continue a
-				// completion-blocked run with optional guidance, valid in BOTH the live
-				// awaiting_input completion-question window and the paused hold. RequireUser so
-				// the `uzi run decide` CLI verb (a uzc_ Bearer) reaches it — NOT the cookie+CSRF
-				// RequireAuth group. Owner-scoped (foreign run → 404) and completion-blocked-only
-				// (a run in neither state → 409); it resumes the run (paused → queued) or delivers
-				// the decision to the live worker, spending no forge and minting nothing.
+				// Owner completion decision (PRD #1226 M5, D7 + #1227 M1): continue, partial
+				// (reduce scope) or accept (accept unmet criteria) a completion-blocked run,
+				// valid in BOTH the live awaiting_input completion-question window and the paused
+				// hold. RequireUser so the `uzi run decide` CLI verb (a uzc_ Bearer) reaches it —
+				// NOT the cookie+CSRF RequireAuth group. ALL three decisions are OWNER-SCOPED (a
+				// foreign caller — including a read-only admin_ro uza_ Bearer, which keeps
+				// IsAdmin=true through RequireUser — gets 404), so this Bearer-reachable WRITE
+				// preserves the read-only-ceiling invariant: no admin_ro token can reduce/accept
+				// scope on another user's run. Completion-blocked-only (a run in neither state →
+				// 409); it resumes the run (paused → queued) or delivers the decision to the live
+				// worker, spending no forge and minting nothing.
 				r.Post("/{id}/completion/decision", h.ContinueCompletionDecision)
 				// Per-run MR-rework override (PRD #841 M2, Decision D3). RequireUser — NOT the
 				// cookie-only RequireAuth group where wait-on-limit sits — because this is a

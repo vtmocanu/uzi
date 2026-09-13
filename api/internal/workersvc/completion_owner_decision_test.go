@@ -329,6 +329,26 @@ func TestValidateDecision(t *testing.T) {
 			t.Fatalf("accepting an out-of-scope criterion must be invalid; got %v", err)
 		}
 	})
+
+	t.Run("cannot defer an already-accepted milestone (Finding 3)", func(t *testing.T) {
+		// Accept m2.c1 at rev2 (m2 is neither done nor deferred), then a partial keeping only m1
+		// would defer m2 — but m2.c1 is accepted, so the revised contract would place m2 in scope.out
+		// AND m2.c1 in accepted. That contradiction must be rejected (symmetric with accept refusing
+		// an already-deferred milestone).
+		acceptedRev2, err := buildRevisedContract(lockedRev1.CompletionContract,
+			CompletionDecisionInput{Decision: "accept", Criteria: []string{"m2.c1"}, Reason: "r"}, frozenMs, 2)
+		if err != nil {
+			t.Fatalf("buildRevisedContract accept: %v", err)
+		}
+		lockedAccepted := store.Run{
+			CompletionContract:  acceptedRev2,
+			MilestonesFrozen:    frozenJSON(t, "m1", "m2", "m3"),
+			MilestonesCompleted: idsJSON(t, "m1"),
+		}
+		if err := validateDecision(lockedAccepted, CompletionDecisionInput{Decision: "partial", Keep: []string{"m1"}, Reason: "r"}, frozenMs); !errors.Is(err, ErrCompletionDecisionInvalid) {
+			t.Fatalf("deferring an already-accepted milestone must be invalid; got %v", err)
+		}
+	})
 }
 
 // TestDecisionAlreadyEncoded pins the idempotency comparison for both decisions: the SAME request
