@@ -33,6 +33,35 @@ func hInt8(n int64) pgtype.Int8 { return pgtype.Int8{Int64: n, Valid: true} }
 // micro builds a numeric(12,6) cost from an exact microdollar count (no float rounding).
 func micro(n int64) pgtype.Numeric { return pgtype.Numeric{Int: big.NewInt(n), Exp: -6, Valid: true} }
 
+// microsOf reads a numeric cost back as an exact microdollar integer (numeric(12,6) carries
+// six fractional digits), independent of how pgx normalizes the scanned value's Exp. It fails
+// the test on a NULL/NaN numeric or on sub-microdollar precision, so a value comparison can
+// never silently pass on a mangled read.
+func microsOf(t *testing.T, n pgtype.Numeric) int64 {
+	t.Helper()
+	if !n.Valid || n.NaN {
+		t.Fatalf("cost_usd is not a valid finite numeric: %+v", n)
+	}
+	if n.Int == nil {
+		return 0
+	}
+	// value = Int * 10^Exp; microdollars = value * 10^6 = Int * 10^(Exp+6).
+	shift := int(n.Exp) + 6
+	v := new(big.Int).Set(n.Int)
+	ten := big.NewInt(10)
+	if shift >= 0 {
+		v.Mul(v, new(big.Int).Exp(ten, big.NewInt(int64(shift)), nil))
+	} else {
+		div := new(big.Int).Exp(ten, big.NewInt(int64(-shift)), nil)
+		var rem big.Int
+		v.QuoRem(v, div, &rem)
+		if rem.Sign() != 0 {
+			t.Fatalf("cost_usd %+v carries sub-microdollar precision", n)
+		}
+	}
+	return v.Int64()
+}
+
 // harnessEnv holds the live-DB handles + a fresh user/connection/repo for one test.
 type harnessEnv struct {
 	ctx    context.Context
@@ -73,9 +102,14 @@ func setupHarnessEnv(t *testing.T) *harnessEnv {
 
 // TestRunCreationOriginsWriteClaudeHarnessLiveDB reaches EVERY one of the twelve production
 // INSERT INTO runs origins and asserts the resulting runs.harness='claude' — pinned by
-// query/path, not a count (PRD #1332 M5A / D2). If any origin's column list is not updated,
-// the DB default would mask it; writing the literal 'claude' at each origin is what this
-// proves is actually happening.
+// query/path, not a count (PRD #1332 M5A / D2). What this proves is narrow and exact: every
+// origin yields a run with harness='claude'. It does NOT prove each origin writes the literal
+// 'claude' explicitly — because runs.harness DEFAULTs to 'claude' and the literal each origin
+// writes equals that default, an explicit write and a silently-omitted harness column are
+// indistinguishable here (both surface 'claude'). That literal-vs-default distinction only
+// becomes observable once an origin can resolve a non-'claude' harness — a flag for M5B, when
+// origins must resolve Codex; until the literal can diverge from the default, this test cannot
+// catch a dropped harness column.
 func TestRunCreationOriginsWriteClaudeHarnessLiveDB(t *testing.T) {
 	e := setupHarnessEnv(t)
 	ctx, q := e.ctx, e.q
@@ -487,5 +521,122 @@ func TestCrossRunCostStatusCountsLiveDB(t *testing.T) {
 	if totals.Last7SubscriptionRunCount < 1 || totals.Last7UnreportedRunCount < 1 {
 		t.Fatalf("AdminUsageTotals last-7 counts = sub %d/unrep %d, want >= 1/1",
 			totals.Last7SubscriptionRunCount, totals.Last7UnreportedRunCount)
+	}
+}
+
+// TestRunUsageTotalsCrossModelCostStatusFoldLiveDB closes the CROSS-MODEL gap in the
+// run_usage_totals fold (PRD #1332 M5A / C1, D2/D5). The existing fold tests each use ONE
+// run_usage row per run, so they exercise only the trivial single-status fold; this builds
+// runs with TWO run_usage rows for DIFFERENT models carrying DIFFERENT cost_status, which is
+// the only shape that reaches the OUTER per-run fold's mixed-dominance branch
+// (bool_or(metered) AND bool_or(subscription) → unreported). Each model's single row folds to
+// its own status at the inner (run_id, model, lineage_epoch) level, so the cross-model
+// combination happens at the outer level under test.
+//
+// The two rows share the run's harness ('claude'): the view folds on cost_status, not harness,
+// and run_usage carries no harness↔cost_status coherence CHECK (only runs does), so a
+// 'claude' row with cost_status 'subscription'/'unreported' is legal as long as it carries
+// cost_usd=0 (00224's run_usage_nonmetered_zero_check) — which every non-metered row here does.
+//
+// Mutation sensitivity, so a cross-model regression cannot ride in green:
+//   - reverting the mixed-dominance AND to OR misfolds the all-subscription run (run3) and the
+//     all-metered run (run4) to 'unreported' (and moves the SelfUsage counts);
+//   - dropping the mixed-dominance branch misfolds the metered+subscription run (run1) to
+//     'subscription' (and moves the SelfUsage counts).
+func TestRunUsageTotalsCrossModelCostStatusFoldLiveDB(t *testing.T) {
+	e := setupHarnessEnv(t)
+	ctx, q := e.ctx, e.q
+
+	// newRun creates a fresh 'claude' issue run (harness defaults to 'claude').
+	newRun := func(iid int64) uuid.UUID {
+		t.Helper()
+		id := uuid.New()
+		mustExec(ctx, t, e.pool,
+			`INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, status, kind)
+			 VALUES ($1, $2, $3, $4, 't', 'd', 'completed', 'issue')`, id, e.userID, e.repoID, iid)
+		return id
+	}
+	// addModel writes one run_usage row for a DISTINCT model of the run via the production
+	// UpsertRunUsage. harness stays 'claude' across the run's rows; non-metered rows MUST carry
+	// cost_usd=0 (the non-metered→zero CHECK), so callers pass 0 for subscription/unreported.
+	addModel := func(runID uuid.UUID, model, status string, costMicros int64) {
+		t.Helper()
+		if err := q.UpsertRunUsage(ctx, store.UpsertRunUsageParams{
+			RunID: runID, SessionID: "s", Model: model, LineageEpoch: 0,
+			InputTokens: 100, CacheReadTokens: 0, CacheCreationTokens: 0, OutputTokens: 50,
+			CostUsd: micro(costMicros), Harness: "claude", CostStatus: status,
+		}); err != nil {
+			t.Fatalf("UpsertRunUsage(run=%s model=%s status=%s): %v", runID, model, status, err)
+		}
+	}
+	fold := func(runID uuid.UUID) store.GetRunUsageTotalRow {
+		t.Helper()
+		got, err := q.GetRunUsageTotal(ctx, runID)
+		if err != nil {
+			t.Fatalf("GetRunUsageTotal(%s): %v", runID, err)
+		}
+		return got
+	}
+
+	// Run 1 — metered($0.07) + subscription($0): the mixed-dominance branch. Folds to
+	// 'unreported', and cost_usd is the metered row's cost ALONE (the subscription row is 0),
+	// proving SUM(cost_usd) is the metered-only dollar total even for a mixed run.
+	run1 := newRun(201)
+	addModel(run1, "m1-metered", "metered", 70000)
+	addModel(run1, "m1-subscription", "subscription", 0)
+	if r := fold(run1); r.CostStatus != "unreported" {
+		t.Fatalf("run1 (metered+subscription) cost_status = %q, want unreported", r.CostStatus)
+	} else if got := microsOf(t, r.CostUsd); got != 70000 {
+		t.Fatalf("run1 cost_usd = %d micros, want 70000 (only the metered row)", got)
+	}
+
+	// Run 2 — metered($0.04) + unreported($0): folds to 'unreported'.
+	run2 := newRun(202)
+	addModel(run2, "m2-metered", "metered", 40000)
+	addModel(run2, "m2-unreported", "unreported", 0)
+	if r := fold(run2); r.CostStatus != "unreported" {
+		t.Fatalf("run2 (metered+unreported) cost_status = %q, want unreported", r.CostStatus)
+	}
+
+	// Run 3 — subscription($0) + subscription($0) across two models: folds to 'subscription'.
+	// (Reverting the mixed-dominance AND to OR would misfold this to 'unreported'.)
+	run3 := newRun(203)
+	addModel(run3, "m3-a", "subscription", 0)
+	addModel(run3, "m3-b", "subscription", 0)
+	if r := fold(run3); r.CostStatus != "subscription" {
+		t.Fatalf("run3 (subscription+subscription) cost_status = %q, want subscription", r.CostStatus)
+	} else if got := microsOf(t, r.CostUsd); got != 0 {
+		t.Fatalf("run3 cost_usd = %d micros, want 0", got)
+	}
+
+	// Run 4 — metered($0.03) + metered($0.025) across two models: folds to 'metered', cost_usd
+	// is the SUM. (Reverting the mixed-dominance AND to OR would misfold this to 'unreported'.)
+	run4 := newRun(204)
+	addModel(run4, "m4-a", "metered", 30000)
+	addModel(run4, "m4-b", "metered", 25000)
+	if r := fold(run4); r.CostStatus != "metered" {
+		t.Fatalf("run4 (metered+metered) cost_status = %q, want metered", r.CostStatus)
+	} else if got := microsOf(t, r.CostUsd); got != 55000 {
+		t.Fatalf("run4 cost_usd = %d micros, want 55000 (the sum of both metered rows)", got)
+	}
+
+	// The cross-run counts must see each run by its FOLDED per-run cost_status, so a cross-model
+	// mislabel would move them: run1+run2 fold to 'unreported', run3 to 'subscription', run4 to
+	// 'metered'. The user is fresh (setupHarnessEnv), so these four are its only usage-bearing,
+	// non-chat runs and the counts are exact.
+	self, err := q.SelfUsage(ctx, e.userID)
+	if err != nil {
+		t.Fatalf("SelfUsage: %v", err)
+	}
+	if self.LifetimeUnreportedRunCount != 2 {
+		t.Fatalf("SelfUsage lifetime_unreported_run_count = %d, want 2 (run1+run2 fold to unreported)",
+			self.LifetimeUnreportedRunCount)
+	}
+	if self.LifetimeSubscriptionRunCount != 1 {
+		t.Fatalf("SelfUsage lifetime_subscription_run_count = %d, want 1 (only run3; the mixed run1 must NOT count as subscription)",
+			self.LifetimeSubscriptionRunCount)
+	}
+	if self.RunCount != 4 {
+		t.Fatalf("SelfUsage run_count = %d, want 4", self.RunCount)
 	}
 }
