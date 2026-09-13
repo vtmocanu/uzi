@@ -32,6 +32,7 @@ import type {
 } from "./protocol.js";
 import { resolveAgentSelection } from "./protocol.js";
 import { resolveRunKind, RUN_KIND_PROFILES } from "./run-kind.js";
+import { RecoveryCoordinator, isCodePublishingKind, type RecoveryRecord } from "./recovery.js";
 import {
   describeRepoAgentNote,
   detectRepoAgents,
@@ -460,6 +461,9 @@ export interface RunnerOptions {
    *  fact about the `remaining` the second park arms — instead of racing a wall-clock
    *  bound that flakes under CPU contention. Returns a canceller. */
   setTimer?: (cb: () => void, ms: number) => () => void;
+  /** PRD #1296 M3 — inject a pre-built recovery coordinator (a fake client/git) for tests;
+   *  production builds one from the run lane's own client + git cache + join token. */
+  recovery?: RecoveryCoordinator;
 }
 
 /**
@@ -487,6 +491,9 @@ export class RunRunner {
   private readonly gitlab: ForgeClient;
   private readonly forgejo: ForgeClient;
   private readonly github: ForgeClient;
+  /** PRD #1296 M3 — durable-recovery capture/journal/upload coordinator (D1/D3/D5).
+   *  Disabled when the worker has no join token (a token-less test harness). */
+  private readonly recovery: RecoveryCoordinator;
   private readonly detect: (
     worktreePath: string,
   ) => Promise<DetectedRepoAgents>;
@@ -574,6 +581,19 @@ export class RunRunner {
     this.gitlab = opts.gitlab ?? new GitLabClient();
     this.forgejo = opts.forgejo ?? new ForgejoClient();
     this.github = opts.github ?? new GitHubClient();
+    // PRD #1296 M3 — the recovery coordinator reuses the run lane's client + git cache; its
+    // MAC key derives from the worker join token (absent ⇒ disabled). Test-injectable via
+    // opts.recovery so a unit test can supply a fake client/git without a real worker.
+    this.recovery =
+      opts.recovery ??
+      new RecoveryCoordinator({
+        client: this.client,
+        git: this.git,
+        log: this.log,
+        recoveryRoot: this.git.recoveryRoot,
+        workerToken: this.joinToken,
+        now: opts.now,
+      });
     this.detect = opts.detectRepoAgents ?? detectRepoAgents;
     this.checkRunner = opts.checkRunner;
     this.checkpointIntervalMs = opts.checkpointIntervalMs ?? 20 * 60_000;
@@ -592,6 +612,15 @@ export class RunRunner {
         t.unref?.();
         return () => clearTimeout(t);
       });
+  }
+
+  /** PRD #1296 M3 — restart-safe recovery resume (called once by the worker after
+   *  registration). Re-uploads any journaled bundle BYTE-IDENTICALLY with no forge PAT.
+   *  Best-effort; never throws to the caller. */
+  async resumePendingRecoveries(signal?: AbortSignal): Promise<void> {
+    await this.recovery.resumePending(signal).catch((err) => {
+      this.log.warn("recovery: resume sweep failed", { error: errMessage(err) });
+    });
   }
 
   async execute(claim: ClaimResponse): Promise<void> {
@@ -1177,8 +1206,58 @@ export class RunRunner {
     deferCommittedTerminal?: (report: () => Promise<void>) => void,
   ): Promise<void> {
     const { runLog, batcher, redactText, executor, runHome } = flight;
-    const reportState = (body: Parameters<RunFlight["reportState"]>[0]) =>
-      flight.reportState(body, boundarySignal);
+    // PRD #1296 M3 — the source pinned at the finalization boundary (set below, after the
+    // fetch-back). Undefined until then and for non-code-publishing / early-return kinds, so
+    // the terminal drive is a no-op for report-only / not_code / pause / empty-diff exits.
+    let recoveryRecord: RecoveryRecord | undefined;
+    // Drive the durable-recovery terminal action off the reported status, once H is pinned:
+    // a `completed` full publication releases custody; a `failed` finalization captures +
+    // uploads the verified bundle (model-free). Best-effort — it MUST NOT disturb the run's
+    // honest terminal reporting (the source is protected by the pin + server hold regardless),
+    // so every error is swallowed. Runs AFTER the state report lands.
+    const driveRecoveryTerminal = async (
+      body: Parameters<RunFlight["reportState"]>[0],
+    ): Promise<void> => {
+      if (!recoveryRecord) return;
+      const status = (body as { status?: string }).status;
+      try {
+        if (status === "completed") {
+          await this.recovery.release(claim.run_id);
+        } else if (status === "failed") {
+          const capBarePath = flight.barePath;
+          if (!capBarePath) return;
+          const capDefaultBranch =
+            claim.repo.default_branch?.trim() ||
+            (await this.git.defaultBranchName(capBarePath)) ||
+            "main";
+          const outcome = await this.recovery.captureAndUpload({
+            record: recoveryRecord,
+            barePath: capBarePath,
+            defaultBranch: capDefaultBranch,
+            forgePat: claim.secrets.forge_pat,
+            cloneUrl: claim.repo.clone_url,
+            forgeUsername: claim.secrets.forge_username,
+            signal: boundarySignal,
+          });
+          runLog.info("recovery: finalization-failure capture outcome", {
+            run_id: claim.run_id,
+            capture_id: outcome.captureId,
+            state: outcome.state,
+            reason: outcome.reason,
+          });
+        }
+      } catch (err) {
+        runLog.warn("recovery: terminal drive failed (execution reporting is unaffected)", {
+          run_id: claim.run_id,
+          error: errMessage(err),
+        });
+      }
+    };
+    const reportState = async (body: Parameters<RunFlight["reportState"]>[0]) => {
+      const res = await flight.reportState(body, boundarySignal);
+      await driveRecoveryTerminal(body);
+      return res;
+    };
     const closeBatcher = () => batcher.close(boundarySignal);
     const finishCommittedPublish = async (
       body: Parameters<RunFlight["reportState"]>[0],
@@ -1189,6 +1268,7 @@ export class RunRunner {
         deferCommittedTerminal(async () => {
           await batcher.close();
           await flight.reportState(body);
+          await driveRecoveryTerminal(body);
           runLog.info(logMessage, fields);
         });
         return;
@@ -1338,6 +1418,32 @@ export class RunRunner {
       result.branch,
       runId,
     );
+
+    // PRD #1296 M3 (D1) — the protected finalization boundary. Pin the ORIGINAL committed
+    // head H into the authenticated durable journal FIRST, unconditionally, and BEFORE any
+    // workflow overlay / merge / rebase / base-align that could replace the ordinary
+    // tracking ref with a transformed H'. H is the pre-align agent tip read from the RUNNER
+    // clone (the same source `originalAgentTip` uses further down) — NEVER the post-align
+    // tracking ref, `checkpoint_tip`, or the private origin/<default>. Only the six
+    // code-publishing kinds open a custody hold (D9), so only they pin here. Local and
+    // credential-free: this never waits on the server and never uses a forge PAT. The
+    // capture bundle + upload happens later, on a finalization failure, via the terminal
+    // drive; a successful publication releases the hold.
+    if (isCodePublishingKind(resolveRunKind(claim.kind))) {
+      const originalH = await this.git.branchTip(runnerClone.path, result.branch);
+      if (originalH) {
+        recoveryRecord = await this.recovery.pin({
+          runId,
+          sourceSha: originalH,
+          kind: resolveRunKind(claim.kind),
+          branch: result.branch,
+        });
+      } else {
+        runLog.warn("recovery: could not resolve the original committed head to pin", {
+          run_id: runId,
+        });
+      }
+    }
 
     // issue #279: an UNDECLARED zero-diff guard, ISSUE runs only. A declared report_only
     // already returned above, so reaching here on an issue run with a confirmed-empty diff
