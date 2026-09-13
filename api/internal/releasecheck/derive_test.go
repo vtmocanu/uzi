@@ -25,6 +25,14 @@ func TestUpdateAvailable(t *testing.T) {
 		{"empty running", "", "v0.15.0", false},
 		{"malformed latest", "0.14.0", "not-a-version", false},
 		{"both malformed", "dev", "nightly", false},
+		// Prerelease running versions (PRD 1265 M5). Under the RC-first train the running
+		// version is routinely an RC while a candidate is deployed; latest stays a stable
+		// (releases/latest never returns a prerelease). SemVer precedence orders
+		// X.Y.Z-rc.N < X.Y.Z, and these pin that no surface can be misled.
+		{"running an RC ahead of latest stable", "0.84.0-rc.1", "v0.83.0", false},
+		{"running an RC of the just-promoted version (update)", "0.83.0-rc.2", "v0.83.0", true},
+		{"stable running is newer than its own RC", "0.83.0", "v0.83.0-rc.9", false},
+		{"running an earlier RC than the latest stable RC-less", "0.83.0-rc.1", "v0.84.0", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -61,6 +69,11 @@ func TestFarBehind(t *testing.T) {
 		{"behind but published_at unparseable → age clause false", "0.14.0", "v0.14.1", "garbage", false},
 		{"behind, empty published_at → age clause false", "0.14.0", "v0.14.1", "", false},
 		{"up to date is never far behind even if old string present", "0.14.0", "v0.14.0", old, false},
+		// Prerelease running versions (PRD 1265 M5): the major/minor math uses the base
+		// (semver.MajorMinor strips the -rc.N), so an RC of the same minor as latest is a
+		// small gap, and an RC several minors behind is far behind.
+		{"RC of the just-promoted version is a small, recent gap", "0.14.0-rc.2", "v0.14.0", recent, false},
+		{"RC several minors behind is far behind", "0.14.0-rc.1", "v0.17.0", recent, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -18,9 +18,11 @@
 #      NOT as a `sha256-<digest>.sig` TAG — so we prove signing from the JOB LOG,
 #      never by grepping the tag list for `.sig` (that reads empty on a correctly
 #      signed image; see release.md).
-#   4. The GitHub Release exists and is marked latest (tag_name == vX.Y.Z). Uses
-#      the API, not `gh release view --json isLatest`, which errored on the
-#      installed gh cutting v0.59.0 (release.md).
+#   4. The GitHub Release channel is correct. Stable: the Release is marked latest
+#      (releases/latest tag_name == vX.Y.Z). RC (vX.Y.Z-rc.N): the Release is flagged
+#      pre-release and releases/latest is unchanged (a lower stable, never the RC). Uses
+#      the API, not `gh release view --json isLatest`, which errored on the installed gh
+#      cutting v0.59.0 (release.md).
 #
 # Exit codes:
 #   0  every check passed
@@ -38,6 +40,15 @@ if [ -z "$VERSION" ] || [ "$VERSION" = "-h" ] || [ "$VERSION" = "--help" ]; then
 fi
 VERSION="${VERSION#v}"          # normalize: accept v0.74.0 or 0.74.0
 TAG="v$VERSION"
+
+# Release channel (PRD 1265 M3): a stable tag must be marked latest; an RC tag
+# (vX.Y.Z-rc.N) must be flagged pre-release and must NOT be latest (latest stays the
+# previous stable). Checks 1-3 (images, chart, cosign) are identical either way. The
+# channel comes from the shared helper, so watch and verify never disagree.
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || { echo "release-verify: not in a git checkout" >&2; exit 3; }
+# shellcheck source=scripts/lib/release-mode.sh
+. "$ROOT/scripts/lib/release-mode.sh"
+MODE="$(release_mode "$VERSION")"
 
 # Owner/repo from the checkout so a fork works unedited.
 read -r OWNER REPO < <(gh repo view --json owner,name --jq '.owner.login + " " + .name' 2>/dev/null)
@@ -129,10 +140,21 @@ else
   fi
 fi
 
-# --- 4. GitHub Release exists and is latest ----------------------------------
+# --- 4. GitHub Release channel ------------------------------------------------
+# Stable: releases/latest == the tag. RC: the tag's Release is prerelease AND
+# releases/latest is unchanged (some LOWER stable, never the RC). releases/latest is the
+# newest non-prerelease Release, so on an RC it correctly returns the previous stable.
 latest="$(gh api "repos/${OWNER}/${REPO}/releases/latest" --jq '.tag_name' 2>/dev/null || true)"
-if [ "$latest" = "$TAG" ]; then pass "GitHub Release $TAG is marked latest"
-else fail "releases/latest is '${latest:-<none>}', expected $TAG"; fi
+if [ "$MODE" = stable ]; then
+  if [ "$latest" = "$TAG" ]; then pass "GitHub Release $TAG is marked latest"
+  else fail "releases/latest is '${latest:-<none>}', expected $TAG"; fi
+else
+  pre="$(gh api "repos/${OWNER}/${REPO}/releases/tags/${TAG}" --jq '.prerelease' 2>/dev/null || true)"
+  if [ "$pre" = "true" ]; then pass "GitHub Release $TAG is flagged pre-release"
+  else fail "Release $TAG prerelease flag is '${pre:-<none>}', expected true (an RC must never be latest)"; fi
+  if [ "$latest" != "$TAG" ]; then pass "releases/latest is '${latest:-<none>}' — unchanged, not the RC"
+  else fail "releases/latest is the RC $TAG; an RC must never be marked latest"; fi
+fi
 
 echo
 if [ "$fails" -eq 0 ]; then

@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# release-watch.sh — watch a tag's publish workflows (release.yml + brew.yml) to
-# green, JOB level, AUTO-RERUNNING a transient publish failure a bounded number of
+# release-watch.sh — watch a tag's publish workflows to green, JOB level,
+# AUTO-RERUNNING a transient publish failure a bounded number of
+# times. A stable tag runs release.yml + brew.yml; an RC tag (vX.Y.Z-rc.N) runs
+# release.yml only, since brew.yml does not trigger for a prerelease (PRD 1265 M3/M4).
 # times. This is the release analog of watch-run-ci.sh: publish jobs push an image
 # tag and sign it (idempotent, network-flavored), so a lone flaked job — a cosign
 # installer download, a registry hiccup — should be re-run, not surfaced to a human.
@@ -25,7 +27,8 @@
 # but not which jobs are gates).
 #
 # Exit codes:
-#   0  both release.yml and brew.yml all-green (after any auto-reruns)
+#   0  every watched workflow all-green (after any auto-reruns): release.yml + brew.yml
+#      for a stable tag, release.yml only for an RC
 #   1  a non-transient failure, or reruns exhausted (failing jobs printed)
 #   2  timed out (still pending after --max-ticks)
 #   3  usage / gh error
@@ -50,7 +53,18 @@ if [ -z "$VERSION" ]; then
   exit 3
 fi
 VERSION="${VERSION#v}"; TAG="v$VERSION"
-WORKFLOWS="release.yml brew.yml"
+
+# Which publish workflows to wait for depends on the release channel (PRD 1265 M3).
+# brew.yml has NO run on an RC tag (its trigger negates v*-* after M4), so waiting for it
+# on an RC would loop until --max-ticks and exit 2 on every candidate. A stable tag runs
+# both. The channel comes from the shared release-mode helper, so watch and verify never
+# disagree about whether a tag is an RC.
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || { echo "release-watch: not in a git checkout" >&2; exit 3; }
+# shellcheck source=scripts/lib/release-mode.sh
+. "$ROOT/scripts/lib/release-mode.sh"
+MODE="$(release_mode "$VERSION")"
+if [ "$MODE" = rc ]; then WORKFLOWS="release.yml"; else WORKFLOWS="release.yml brew.yml"; fi
+echo "release-watch: $TAG is a $MODE release; watching: $WORKFLOWS"
 
 # Resolve the run id for one workflow on the tag ref (empty until it appears).
 resolve_run() { gh run list --workflow "$1" --branch "$TAG" --limit 1 \
@@ -155,7 +169,7 @@ while [ "$tick" -lt "$MAX_TICKS" ]; do
 
   if [ "$all_green" -eq 1 ]; then
     used=0; for wf in $WORKFLOWS; do k="RR_${wf//[^a-zA-Z0-9]/_}"; used=$((used + MAX_RERUNS - ${!k})); done
-    echo "=== $TAG: release.yml AND brew.yml all-green after $((tick*INTERVAL))s (reruns used: $used) ==="
+    echo "=== $TAG: $WORKFLOWS all-green after $((tick*INTERVAL))s (reruns used: $used) ==="
     exit 0
   fi
   [ "$any_pending" -eq 1 ] || true

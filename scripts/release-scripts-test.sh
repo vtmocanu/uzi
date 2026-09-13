@@ -550,6 +550,16 @@ if git -C "$S9" rev-parse -q --verify refs/heads/release/0.2.0 >/dev/null; then 
 
 rm -rf "$S1" "$S3" "$S4" "$S6" "$S7" "$S8" "$S9"
 
+echo "=== M3: release-mode lib (shared by watch + verify) ==="
+# shellcheck source=scripts/lib/release-mode.sh
+. "$REPO_ROOT/scripts/lib/release-mode.sh"
+assert_eq "release_mode rc"        "rc"     "$(release_mode 0.83.0-rc.1)"
+assert_eq "release_mode rc (v)"    "rc"     "$(release_mode v0.83.0-rc.2)"
+assert_eq "release_mode stable"    "stable" "$(release_mode 0.83.0)"
+assert_eq "release_mode stable(v)" "stable" "$(release_mode v0.83.0)"
+assert_eq "release_base rc"        "0.83.0" "$(release_base 0.83.0-rc.10)"
+assert_eq "release_base stable"    "0.83.0" "$(release_base v0.83.0)"
+
 echo
 echo "=== release-scripts-test: $PASSES passed, $FAILS failed ==="
 [ "$FAILS" -eq 0 ]
