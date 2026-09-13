@@ -92,9 +92,12 @@ task test:codex-m4
 # inherited O row's required regression alongside the codex-u-home-screening-executor-d6 case.
 task test:codex-m3b:host
 
-# The LEAD's pre-merge gate: rejects any O-layer clause still `owed` or citing an unresolved
-# (placeholder) base/jvm image digest (BOTH must resolve). Currently non-zero by design — see
-# MAINTAINER-HANDOFF.md.
+# The LEAD's pre-merge gate: BINDS each recorded {base,jvm} image digest to a trusted candidate
+# manifest for the expected merge-candidate commit (not just digest syntax) — fails closed when the
+# manifest is absent, malformed, built for the wrong commit, missing an image, swapped (base
+# recorded as jvm or vice versa), or mismatched. Reads CODEX_M4_RECEIPT_MANIFEST (path to the
+# manifest; schema template at receipt-manifest.example.json) and CODEX_M4_CANDIDATE_COMMIT
+# (defaults to `git rev-parse HEAD`). Currently non-zero by design — see MAINTAINER-HANDOFF.md.
 task check:codex-m4-receipts
 ```
 
@@ -131,6 +134,14 @@ Current-head CI `test-agent` confirmation is owed to the lead: the worker does n
 URL for this exact revision to cite, and inventing one would misstate the evidence. Record the
 CI URL/counts when the lead confirms them, per D7's "the lead owns CI and macOS-container
 confirmation."
+
+**Refreshed at revision `089b6184`** (D8's manifest-binding rework, test-infra + docs only, no
+`agent/src` product code): `task test:codex-m4`'s unit-test tally is `tests 138`, `pass 138`,
+`fail 0`, `skipped 0`; `run-completeness.ts` still reports `OK — 35 clauses catalogued, 53
+executed test result(s), required matrix [claude/U, codex/U, codex/P] satisfied.` `task
+check:codex-m4-receipts` still exits non-zero by design, now failing closed as manifest `absent`
+(no `CODEX_M4_RECEIPT_MANIFEST` supplied at this revision — see MAINTAINER-HANDOFF.md) rather than
+only citing the unresolved placeholder/owed rows.
 
 ## Mutation calibration (D4/C5)
 
