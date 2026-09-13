@@ -2349,6 +2349,7 @@ tasks:
       - mkdir -p "$(dirname "$CODEX_M4_EVIDENCE")"
       - rm -f "$CODEX_M4_EVIDENCE"
       - node --import tsx ../e2e/codex-m4/run-macos-linux.ts
+      - rm -f "$CODEX_M4_EVIDENCE"                       # best-effort cleanup of THIS run's file (gitignored; left in place if the run failed, for debugging), matching test:codex-m4
 
   test:harness-m2:
     desc: Opt-in credential-free M2 neutral-harness-seam differential tests (PRD 1146 m4)

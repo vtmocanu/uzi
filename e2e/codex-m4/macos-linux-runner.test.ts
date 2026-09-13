@@ -146,6 +146,31 @@ describe("buildMacosLinuxRunPlan argv invariants", () => {
       "execute mounts the host .evidence dir read-WRITE so recordEvidence reaches the host file",
     );
   });
+
+  it("execute honors a per-invocation evidenceHostFile: container env basename + host-dir mount both track it", () => {
+    // Regression for the per-invocation evidence isolation: buildMacosLinuxRunPlan must DERIVE the
+    // container CODEX_M4_EVIDENCE basename and the .evidence bind-mount SOURCE from opts.evidenceHostFile,
+    // not a fixed current.jsonl. A custom file in a DISTINCT directory discriminates: if the builder
+    // ignored evidenceHostFile it would emit the default current.jsonl env + the ${e2eDir} mount, and
+    // two concurrent runs would clobber one shared host file.
+    const custom = buildMacosLinuxRunPlan({ ...OPTS, evidenceHostFile: "/tmp/uzi-m4-run/run-98765.jsonl" });
+    assert.ok(
+      custom.execute.includes("CODEX_M4_EVIDENCE=/work/e2e/codex-m4/.evidence/run-98765.jsonl"),
+      "the container CODEX_M4_EVIDENCE uses the per-invocation file's basename",
+    );
+    assert.ok(
+      custom.execute.some((a) => a === "/tmp/uzi-m4-run:/work/e2e/codex-m4/.evidence"),
+      "the .evidence bind-mount SOURCE is the per-invocation file's OWN host directory",
+    );
+    assert.ok(
+      !custom.execute.includes("CODEX_M4_EVIDENCE=/work/e2e/codex-m4/.evidence/current.jsonl"),
+      "the fixed current.jsonl env is NOT emitted when a per-invocation file is supplied",
+    );
+    assert.ok(
+      !custom.execute.some((a) => a === `${OPTS.e2eDir}/codex-m4/.evidence:/work/e2e/codex-m4/.evidence`),
+      "the fixed ${e2eDir} .evidence mount is NOT emitted when a per-invocation file is supplied",
+    );
+  });
 });
 
 describe("executeMacosLinuxRun orchestration", () => {
