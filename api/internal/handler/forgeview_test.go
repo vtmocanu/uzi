@@ -110,6 +110,83 @@ func TestMergeStateDTO(t *testing.T) {
 	})
 }
 
+// TestCIRunDetailFromRun pins the pure CI-run drill-in mapper (PRD #1335): the header
+// scalars are populated from the run (the fix for the `#0 · · ·` bug where the route
+// left them zero), ID is pinned to the path's runID even when the forge echoes a
+// different run.ID, and Jobs is always non-nil (empty [] for nil jobs). DB-free: it
+// composes ciRunDTO + ciJobDTOs and needs no handler, router or forge.
+func TestCIRunDetailFromRun(t *testing.T) {
+	created := time.Date(2026, 9, 13, 10, 0, 0, 0, time.UTC)
+	run := forge.WorkflowRun{
+		ID:         999, // deliberately != runID below; must be overridden
+		Number:     100,
+		Event:      "push",
+		Branch:     "main",
+		SHA:        "deadbeef",
+		Name:       "CI",
+		Title:      "PRD continuation",
+		Actor:      "uzi-bot",
+		Status:     "completed",
+		Conclusion: "success",
+		WebURL:     "https://forge.example/runs/100",
+		CreatedAt:  created,
+	}
+	jobs := []forge.Job{{ID: 1, Name: "build", Status: "success"}, {ID: 2, Name: "test", Status: "success"}}
+
+	const runID = 100
+	got := ciRunDetailFromRun(runID, run, jobs)
+
+	// Header scalars carry the run's values AND are non-zero, so a regression that drops
+	// population (the `#0 · · ·` bug) reddens.
+	if got.Number != run.Number || got.Number == 0 {
+		t.Errorf("Number = %d, want %d (non-zero)", got.Number, run.Number)
+	}
+	if got.Event != run.Event || got.Event == "" {
+		t.Errorf("Event = %q, want %q (non-empty)", got.Event, run.Event)
+	}
+	if got.Branch != run.Branch || got.Branch == "" {
+		t.Errorf("Branch = %q, want %q (non-empty)", got.Branch, run.Branch)
+	}
+	if got.SHA != run.SHA || got.SHA == "" {
+		t.Errorf("SHA = %q, want %q (non-empty)", got.SHA, run.SHA)
+	}
+	if got.Name != run.Name || got.Name == "" {
+		t.Errorf("Name = %q, want %q (non-empty)", got.Name, run.Name)
+	}
+	if got.Title != run.Title || got.Title == "" {
+		t.Errorf("Title = %q, want %q (non-empty)", got.Title, run.Title)
+	}
+	if got.Actor != run.Actor || got.Actor == "" {
+		t.Errorf("Actor = %q, want %q (non-empty)", got.Actor, run.Actor)
+	}
+	if !got.CreatedAt.Equal(run.CreatedAt) || got.CreatedAt.IsZero() {
+		t.Errorf("CreatedAt = %v, want %v (non-zero)", got.CreatedAt, run.CreatedAt)
+	}
+
+	// ID is pinned to the path's runID, NOT the forge-echoed run.ID.
+	if got.ID != runID {
+		t.Errorf("ID = %d, want %d (path runID pinned, not the forge-echoed run.ID %d)", got.ID, runID, run.ID)
+	}
+
+	// Jobs is non-nil and one per passed job.
+	if got.Jobs == nil {
+		t.Fatalf("Jobs must be non-nil")
+	}
+	if len(got.Jobs) != len(jobs) {
+		t.Errorf("Jobs len = %d, want %d", len(got.Jobs), len(jobs))
+	}
+
+	t.Run("nil jobs ⇒ non-nil empty Jobs", func(t *testing.T) {
+		d := ciRunDetailFromRun(runID, run, nil)
+		if d.Jobs == nil {
+			t.Fatalf("Jobs must be non-nil even for nil jobs")
+		}
+		if len(d.Jobs) != 0 {
+			t.Errorf("Jobs len = %d, want 0", len(d.Jobs))
+		}
+	})
+}
+
 // TestWriteForgeError pins the forge-error → HTTP mapping on a zero-value &Handler{}
 // (writeForgeError touches no DB): a *forge.RateLimitError becomes 429 + Retry-After
 // (from Retry or the Reset wall time, rounded up), and any other error becomes 502

@@ -430,10 +430,11 @@ func (h *Handler) ListCIRuns(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, map[string]any{"runs": dtos, "unsupported": ""})
 }
 
-// GetCIRun serves GET /api/repos/{id}/ci/runs/{run_id}: the run's jobs and steps. The
-// run-level scalars the drill-in header shows come from the list row the client drilled
-// in from, so this route fills only id (from the path) and jobs. On a forge version
-// without the endpoint it answers 200 with empty jobs and the "unsupported" sentence.
+// GetCIRun serves GET /api/repos/{id}/ci/runs/{run_id}: the drill-in header (the
+// run-level scalars, via GetWorkflowRun) plus the run's jobs and steps. The header is
+// fetched first, then jobs, and both are composed by ciRunDetailFromRun. On a forge
+// version without the Actions/pipelines API either fetch degrades to 200 with the
+// "unsupported" sentence (empty jobs), rather than surfacing an error.
 func (h *Handler) GetCIRun(w http.ResponseWriter, r *http.Request) {
 	repo, ok := h.forgeViewRepo(w, r)
 	if !ok {
@@ -454,7 +455,28 @@ func (h *Handler) GetCIRun(w http.ResponseWriter, r *http.Request) {
 	// leader's mid-load disconnect cannot poison a co-polling follower's shared
 	// singleflight load (see ListPulls). This route has no per-request DB read.
 	loadCtx := forge.WithInteractiveRead(context.WithoutCancel(r.Context()))
-	detail := apitypes.CIRunDetailDTO{CIRunDTO: apitypes.CIRunDTO{ID: runID}, Jobs: []apitypes.CIJobDTO{}}
+	runKey := forgeMemoPrefix(repo) + "cirun|" + strconv.FormatInt(runID, 10)
+	runV, err := h.memo().Do(runKey, forgeMemoTTL, func() (any, int, error) {
+		if e := h.chargeBudget(repo.ConnectionID); e != nil {
+			return nil, 0, e
+		}
+		run, e := f.GetWorkflowRun(loadCtx, repo.ForgeProjectID, runID)
+		if e != nil {
+			return nil, 0, e
+		}
+		return run, memoSize(run), nil
+	})
+	if err != nil {
+		if errors.Is(err, forge.ErrForgeVersionUnsupported) {
+			detail := ciRunDetailFromRun(runID, forge.WorkflowRun{ID: runID}, nil)
+			detail.Unsupported = forgeViewUnsupportedMsg
+			httpx.JSON(w, http.StatusOK, detail)
+			return
+		}
+		h.writeForgeError(w, "ci run", err)
+		return
+	}
+	run := runV.(forge.WorkflowRun)
 	jobsKey := forgeMemoPrefix(repo) + "cijobs|" + strconv.FormatInt(runID, 10)
 	jobsV, err := h.memo().Do(jobsKey, forgeMemoTTL, func() (any, int, error) {
 		if e := h.chargeBudget(repo.ConnectionID); e != nil {
@@ -468,6 +490,7 @@ func (h *Handler) GetCIRun(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		if errors.Is(err, forge.ErrForgeVersionUnsupported) {
+			detail := ciRunDetailFromRun(runID, run, nil)
 			detail.Unsupported = forgeViewUnsupportedMsg
 			httpx.JSON(w, http.StatusOK, detail)
 			return
@@ -475,7 +498,7 @@ func (h *Handler) GetCIRun(w http.ResponseWriter, r *http.Request) {
 		h.writeForgeError(w, "ci run jobs", err)
 		return
 	}
-	detail.Jobs = ciJobDTOs(jobsV.([]forge.Job))
+	detail := ciRunDetailFromRun(runID, run, jobsV.([]forge.Job))
 	httpx.JSON(w, http.StatusOK, detail)
 }
 
@@ -586,6 +609,16 @@ func checkFailing(c forge.Check) bool {
 // checkPending reports whether a check has not reached the completed phase yet.
 func checkPending(c forge.Check) bool {
 	return c.Status != "completed"
+}
+
+// ciRunDetailFromRun builds the CI-run drill-in DTO from the run's header and its jobs
+// (PRD #1335). It composes the existing scalar/job mappers so the wire shape stays
+// identical, and pins ID to the path's runID (the id the client asked for) rather than
+// trusting the forge to echo it back.
+func ciRunDetailFromRun(runID int64, run forge.WorkflowRun, jobs []forge.Job) apitypes.CIRunDetailDTO {
+	dto := ciRunDTO(run)
+	dto.ID = runID
+	return apitypes.CIRunDetailDTO{CIRunDTO: dto, Jobs: ciJobDTOs(jobs)}
 }
 
 // ciRunDTO maps a neutral WorkflowRun to the wire CIRunDTO.
