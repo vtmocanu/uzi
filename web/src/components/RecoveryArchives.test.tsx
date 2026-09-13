@@ -1,0 +1,196 @@
+// @vitest-environment jsdom
+import { afterEach, describe, it, expect, vi } from "vitest";
+import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import { RecoveryArchivesPanel } from "./RecoveryArchives";
+import { api, type RecoveryArchive, type RecoveryArchiveSummary, type Run } from "../lib/api";
+
+// The panel fetches its own owner-scoped summary via api.getRunArchives. Mock ONLY that
+// call; keep runArchiveDownloadUrl and the recovery display helpers real, since the whole
+// point of these pins is the real render path (D6/D7).
+vi.mock("../lib/api", async (importActual) => {
+  const actual = await importActual<typeof import("../lib/api")>();
+  return {
+    ...actual,
+    api: { getRunArchives: vi.fn() },
+  };
+});
+const mockApi = vi.mocked(api);
+
+afterEach(() => {
+  cleanup();
+  vi.clearAllMocks();
+});
+
+// The panel reads only run.id and run.status; a minimal cast matches the repo convention
+// (SteerQueueCard.test.tsx) rather than spelling out the whole Run.
+function aRun(over: Partial<Run> = {}): Run {
+  return { id: "r1", status: "failed", ...over } as Run;
+}
+
+function archive(over: Partial<RecoveryArchive> = {}): RecoveryArchive {
+  return {
+    id: "cap1",
+    run_id: "r1",
+    state: "available",
+    source_sha: "0123456789abcdef0123456789abcdef01234567",
+    created_at: "2026-09-13T00:00:00Z",
+    ...over,
+  };
+}
+
+function summary(over: Partial<RecoveryArchiveSummary> = {}): RecoveryArchiveSummary {
+  return {
+    supported: true,
+    legacy: false,
+    has_open_hold: false,
+    counts: {
+      preparing: 0,
+      uploading: 0,
+      available: 0,
+      needs_action: 0,
+      expired: 0,
+      discarded: 0,
+    },
+    archives: [],
+    ...over,
+  };
+}
+
+// Render the panel and wait for its async fetch + state update to settle. The panel returns
+// null until the summary resolves, so a bare render would race the effect.
+async function renderPanel(run: Run, s: RecoveryArchiveSummary) {
+  mockApi.getRunArchives.mockResolvedValue(s);
+  const utils = render(<RecoveryArchivesPanel run={run} />);
+  await waitFor(() => expect(mockApi.getRunArchives).toHaveBeenCalledWith(run.id));
+  // Flush the resolved promise's .then so the setSummary re-render lands before assertions.
+  await act(async () => {
+    await Promise.resolve();
+  });
+  return utils;
+}
+
+const SECRET_WARNING = /Treat every archive as if it contains secrets/;
+
+describe("RecoveryArchivesPanel — zero-capture truthfulness", () => {
+  it("shows the legacy/unsupported note on a failed run recovery never armed for", async () => {
+    await renderPanel(aRun({ status: "failed" }), summary({ supported: false, legacy: true }));
+    expect(screen.getByText(/Durable recovery was not available for this run/)).toBeTruthy();
+    // No capture list, so no download surface and no secret warning.
+    expect(screen.queryByText(SECRET_WARNING)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Download bundle" })).toBeNull();
+  });
+
+  it("shows the preparing note on a terminal run with an open hold and no capture", async () => {
+    await renderPanel(aRun({ status: "failed" }), summary({ has_open_hold: true }));
+    expect(screen.getByText(/Preparing the recovery archive/)).toBeTruthy();
+    expect(screen.queryByText(SECRET_WARNING)).toBeNull();
+  });
+
+  it("renders nothing on a healthy run with neither a capture nor a hold", async () => {
+    const { container } = await renderPanel(
+      aRun({ status: "completed" }),
+      summary({ supported: true, has_open_hold: false }),
+    );
+    // The fetch resolved (waitFor above), and the section still chose to say nothing.
+    expect(container.innerHTML).toBe("");
+    expect(screen.queryByText("Recovery archives")).toBeNull();
+  });
+});
+
+describe("RecoveryArchivesPanel — download gating (D7)", () => {
+  it("enables the download only for an 'available' capture, disabling every other state", async () => {
+    await renderPanel(
+      aRun({ status: "failed" }),
+      summary({
+        archives: [
+          archive({ id: "cap-needs", state: "needs_action", source_sha: "aaaaaaaaaaaa1111" }),
+          archive({ id: "cap-ok", state: "available", source_sha: "bbbbbbbbbbbb2222" }),
+        ],
+      }),
+    );
+
+    // Exactly ONE download link exists — the available capture's — proving the other state
+    // did not render a usable download. If the gate were removed both rows would link.
+    const links = screen.getAllByRole("link");
+    expect(links).toHaveLength(1);
+    expect(links[0].getAttribute("href")).toBe("/api/runs/r1/archives/cap-ok/download");
+    // The link's own row is the available one.
+    expect(within(links[0].closest("li") as HTMLElement).getByText("Available")).toBeTruthy();
+
+    // Both rows still render a "Download bundle" control; the needs_action one is a disabled
+    // button not wrapped in a link.
+    const buttons = screen.getAllByRole("button", { name: "Download bundle" });
+    expect(buttons).toHaveLength(2);
+    const disabled = buttons.filter((b) => (b as HTMLButtonElement).disabled);
+    const enabled = buttons.filter((b) => !(b as HTMLButtonElement).disabled);
+    expect(disabled).toHaveLength(1);
+    expect(enabled).toHaveLength(1);
+    // The disabled control belongs to the needs_action row and is NOT inside a link.
+    expect(disabled[0].closest("a")).toBeNull();
+    expect(within(disabled[0].closest("li") as HTMLElement).getByText("Needs action")).toBeTruthy();
+    // The enabled control IS the one inside the sole link.
+    expect(enabled[0].closest("a")).toBe(links[0]);
+  });
+
+  it("shows the secret-review warning on the download surface whenever captures render", async () => {
+    await renderPanel(aRun({ status: "failed" }), summary({ archives: [archive({ state: "available" })] }));
+    expect(screen.getByText(SECRET_WARNING)).toBeTruthy();
+  });
+});
+
+describe("RecoveryArchivesPanel — untrusted-text escaping (D6)", () => {
+  // Hostile characters are written as \u ESCAPES, never literals — a literal U+202E would
+  // reorder THIS source in a reviewer's editor (the very attack), and the repo forbids raw
+  // invisible bytes in source (safeText.test.ts makes the same choice for the same reason).
+  const ZWSP = String.fromCharCode(0x200b); // ZERO WIDTH SPACE
+  const RLO = String.fromCharCode(0x202e); // RIGHT-TO-LEFT OVERRIDE
+
+  // A hostile capture reason carrying BOTH an HTML-injection payload and invisible chars.
+  // React escapes HTML on its own; only stripUnsafeChars removes the invisible chars — the
+  // two tests below deliberately distinguish the two guards, so removing either reddens.
+  const HOSTILE_REASON = `boom<img src=x onerror="steal()">wo${ZWSP}rd${RLO}evil`;
+
+  it("never injects HTML from a capture reason (React escaping)", async () => {
+    const { container } = await renderPanel(
+      aRun({ status: "failed" }),
+      summary({ archives: [archive({ state: "needs_action", reason: HOSTILE_REASON })] }),
+    );
+    // HTML-INJECTION-SAFE: no real <img> element was created from the payload...
+    expect(container.querySelector("img")).toBeNull();
+    // ...and the tag is present as literal, visible text instead of markup.
+    expect(container.textContent).toContain('<img src=x onerror="steal()">');
+  });
+
+  it("strips invisible/control characters from a capture reason (stripUnsafeChars)", async () => {
+    await renderPanel(
+      aRun({ status: "failed" }),
+      summary({ archives: [archive({ state: "needs_action", reason: HOSTILE_REASON })] }),
+    );
+    const reasonEl = screen.getByText(/boom<img/);
+    const text = reasonEl.textContent ?? "";
+    // INVISIBLE-CHAR-STRIPPED: the zero-width space and the RTL override are gone — a proof
+    // distinct from HTML escaping, which would leave both in place.
+    expect(text).not.toContain(ZWSP);
+    expect(text).not.toContain(RLO);
+    // The letters they hid between are now contiguous.
+    expect(text).toContain("word");
+    expect(text).toContain("evil");
+  });
+
+  it("escapes and sanitizes the source_sha the row renders, too", async () => {
+    // shortSha only trims >12 chars, so keep the payload short enough to survive to the
+    // render site: a full <img> tag plus a zero-width space, 7 chars total.
+    const { container } = await renderPanel(
+      aRun({ status: "failed" }),
+      summary({ archives: [archive({ state: "available", source_sha: `<img>${ZWSP}z` })] }),
+    );
+    // No <img> from the source_sha (rendered twice — the badge row and "Original head").
+    expect(container.querySelector("img")).toBeNull();
+    // The literal tag survives as text, and the zero-width space does not.
+    const shaEls = screen.getAllByText(/<img>z/);
+    expect(shaEls.length).toBeGreaterThan(0);
+    for (const el of shaEls) {
+      expect(el.textContent ?? "").not.toContain(ZWSP);
+    }
+  });
+});

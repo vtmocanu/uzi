@@ -87,6 +87,23 @@ vi.mock("../lib/api", async (importOriginal) => {
       resumeRun: vi.fn().mockResolvedValue({ run: null }),
       pauseRun: vi.fn().mockResolvedValue({ server_side: false }),
       cancelPause: vi.fn().mockResolvedValue({ server_side: false }),
+      // PRD #1296 M5: the run page's Recovery archives section fetches its own summary.
+      // Defaulted to a supported-but-empty aggregate so a full-page render settles and the
+      // section renders nothing (no archive, no open hold) on these non-recovery fixtures.
+      getRunArchives: vi.fn().mockResolvedValue({
+        supported: false,
+        legacy: true,
+        has_open_hold: false,
+        counts: {
+          preparing: 0,
+          uploading: 0,
+          available: 0,
+          needs_action: 0,
+          expired: 0,
+          discarded: 0,
+        },
+        archives: [],
+      }),
     },
   };
 });

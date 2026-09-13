@@ -43,6 +43,55 @@ func TestWorkerRmConflict(t *testing.T) {
 	}
 }
 
+// TestWorkerRmCustodyConflict is PRD #1296 M4b (D3): `uzi worker rm` against a worker
+// still retaining unpublished committed work for durable recovery must refuse with a
+// nonzero exit (ExitConflict), print actionable recover-or-discard guidance to stderr,
+// and still have ATTEMPTED the delete exactly once — never silently succeed, never
+// force-discard, never auto-delete.
+func TestWorkerRmCustodyConflict(t *testing.T) {
+	fc := &uzicli.FakeClient{Err: &uzicli.WorkerCustodyConflictError{
+		Holds: 2,
+		Err:   uzicli.Exitf(uzicli.ExitConflict, "this worker is retaining unpublished committed work for recovery in 2 custody hold(s)"),
+	}}
+	out, errb, code := runCLI(t, fakeEnv(fc), "worker", "rm", "w1")
+	if code != uzicli.ExitConflict {
+		t.Fatalf("exit = %d, want %d (conflict)\nstderr: %s", code, uzicli.ExitConflict, errb)
+	}
+	// The delete was ATTEMPTED once — the refusal came from the server, not a silent skip.
+	if fc.DeleteWorkerCalls != 1 || fc.LastDeletedWorkerID != "w1" {
+		t.Fatalf("DeleteWorker calls=%d id=%q, want exactly one attempt on w1", fc.DeleteWorkerCalls, fc.LastDeletedWorkerID)
+	}
+	// The guidance reaches stderr (Main prints the returned error there). It must name
+	// the recovery command, the discard alternative and the retry — the actionable trio,
+	// not a bare "conflict".
+	for _, want := range []string{"uzi run export", "discard", "retry"} {
+		if !strings.Contains(errb, want) {
+			t.Errorf("rm custody refusal missing %q on stderr; got stderr=%q stdout=%q", want, errb, out)
+		}
+	}
+}
+
+// TestWorkerRmCustodyConflictJSON is the --json half of M4b: the refusal still exits
+// nonzero and still attempts the delete once, but emits a STRUCTURED refusal on stdout
+// (deleted:false plus the hold count) so an agent parsing the machine channel gets the
+// reason, not just a stderr sentence.
+func TestWorkerRmCustodyConflictJSON(t *testing.T) {
+	fc := &uzicli.FakeClient{Err: &uzicli.WorkerCustodyConflictError{
+		Holds: 2,
+		Err:   uzicli.Exitf(uzicli.ExitConflict, "custody"),
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "worker", "rm", "w1", "--json")
+	if code != uzicli.ExitConflict {
+		t.Fatalf("exit = %d, want %d", code, uzicli.ExitConflict)
+	}
+	if fc.DeleteWorkerCalls != 1 {
+		t.Fatalf("DeleteWorker calls=%d, want 1", fc.DeleteWorkerCalls)
+	}
+	if !strings.Contains(out, `"deleted": false`) || !strings.Contains(out, `"custody_holds": 2`) {
+		t.Errorf("rm --json custody = %q, want a structured refusal carrying the count", out)
+	}
+}
+
 func TestWorkerRmRequiresArg(t *testing.T) {
 	fc := &uzicli.FakeClient{}
 	_, _, code := runCLI(t, fakeEnv(fc), "worker", "rm")

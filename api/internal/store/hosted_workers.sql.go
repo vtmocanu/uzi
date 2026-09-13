@@ -285,6 +285,16 @@ WHERE w.ephemeral
       WHERE r.worker_id = w.id
         AND r.status NOT IN ('completed', 'failed', 'cancelled')
   )
+  -- PRD #1296 M4 (D3): SKIP a worker still holding an OPEN custody hold, so teardown
+  -- gracefully leaves the last local source in place instead of erroring on the hold's
+  -- ON DELETE RESTRICT live_worker_id FK. Belt-and-braces: the FK still fail-closes if a
+  -- caller ever bypasses this query, but the predicate makes the common path a clean
+  -- no-op that the custody-release reconciler unblocks once release is warranted (a
+  -- completed run, a ready capture, or an explicit discard nulls the live FK).
+  AND NOT EXISTS (
+      SELECT 1 FROM recovery_custody_holds h
+      WHERE h.live_worker_id = w.id AND h.state = 'open'
+  )
 `
 
 // Teardown primitive (PRD #529 M4): drop the ephemeral worker bound to a now-terminal
@@ -395,6 +405,17 @@ SELECT w.id,
         AND w.last_heartbeat_at IS NOT NULL
         AND w.last_heartbeat_at >= $2, false)::boolean AS disk_pressure,
        w.ephemeral,
+       -- custody_held (PRD #1296 M4, D3/D9): does this worker hold any OPEN custody hold?
+       -- A distinct desired-worker signal, independent of busy/draining_since — a held
+       -- worker is NOT free, and both ordinary controller teardown and the data-PVC recycle
+       -- paths must honor it (M4b consumes this to keep a custody-held PVC alive). EXISTS is
+       -- cast to a NON-NULL Go bool (an uncast EXISTS types as interface{}), mirroring the
+       -- disk_pressure column's ::boolean above, so DesiredWorker.CustodyHeld stays a plain
+       -- bool like Busy.
+       (EXISTS (
+           SELECT 1 FROM recovery_custody_holds h
+           WHERE h.live_worker_id = w.id AND h.state = 'open'
+       ))::boolean AS custody_held,
        t.token_ciphertext
 FROM workers w
 LEFT JOIN hosted_worker_tokens t ON t.worker_id = w.id
@@ -417,6 +438,7 @@ type ListHostedWorkersForControllerRow struct {
 	DrainingSince    pgtype.Timestamptz `json:"draining_since"`
 	DiskPressure     bool               `json:"disk_pressure"`
 	Ephemeral        bool               `json:"ephemeral"`
+	CustodyHeld      bool               `json:"custody_held"`
 	TokenCiphertext  []byte             `json:"token_ciphertext"`
 }
 
@@ -457,6 +479,7 @@ func (q *Queries) ListHostedWorkersForController(ctx context.Context, arg ListHo
 			&i.DrainingSince,
 			&i.DiskPressure,
 			&i.Ephemeral,
+			&i.CustodyHeld,
 			&i.TokenCiphertext,
 		); err != nil {
 			return nil, err
@@ -550,6 +573,15 @@ WHERE w.ephemeral
       SELECT 1 FROM runs br
       WHERE br.worker_id = w.id
         AND br.status NOT IN ('completed', 'failed', 'cancelled')
+  )
+  -- PRD #1296 M4 (D3): the SAME custody skip as DeleteEphemeralWorkerForRun above — the
+  -- reaper must never drop the last local source of a custody-held worker. The hold's
+  -- live_worker_id FK is ON DELETE RESTRICT (a bypass fail-closes), and this predicate
+  -- turns that into a graceful skip: the custody-release reconciler releases the hold once
+  -- release is warranted, after which the next reap tick finds no open hold and proceeds.
+  AND NOT EXISTS (
+      SELECT 1 FROM recovery_custody_holds h
+      WHERE h.live_worker_id = w.id AND h.state = 'open'
   )
   AND (
       NOT EXISTS (

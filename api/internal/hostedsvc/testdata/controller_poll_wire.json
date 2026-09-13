@@ -9,6 +9,7 @@
       "draining_since": null,
       "disk_pressure": true,
       "ephemeral": false,
+      "custody_held": true,
       "generation": 1,
       "join_token": "uzw_EXAMPLE-NOT-A-REAL-TOKEN"
     },
@@ -21,6 +22,7 @@
       "draining_since": "2026-01-02T03:04:05Z",
       "disk_pressure": false,
       "ephemeral": true,
+      "custody_held": false,
       "generation": 4,
       "join_token": null
     }

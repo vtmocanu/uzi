@@ -915,6 +915,18 @@ chain in the diagram above, with no intervening `running`.
   branch that *modifies* a workflow file. See
   [ADR-456](adr/0456-rebase-before-finalize-push.md) for the mechanism, its
   2026-08-23 overlay amendment, and why merge precedes rebase.
+- **Durable recovery of unpublished work at the finalization boundary** (PRD
+  #1296): before any of the finalization failures above (a secret/workflow
+  preflight, a rejected push, or exhausted base alignment) can leave a run's
+  original committed history unreachable, uzi captures that history into an
+  encrypted, owner-only Git bundle durably stored in Postgres — independent
+  of the worker or its disk surviving. This is separate from the
+  `recovery_wait` transient park above: that mechanism resumes a live,
+  still-running turn from a local checkpoint, while this one preserves a
+  run's original commits across a `failed` finalization and the worker's
+  eventual teardown. See [docs/run-recovery.md](docs/run-recovery.md),
+  [PRD #1296](prds/1296-durable-run-recovery.md) and
+  [adr/1296-durable-run-recovery.md](adr/1296-durable-run-recovery.md).
 - **Milestone tracker reconciliation** (PRD #122/#265/#390) — a milestone-structured
   `issue` run shows a *reported-complete* tracker (`runs.milestones_completed`,
   monotone union, never "verified"), fed by mid-run `report_progress` and the lead's

@@ -2,6 +2,7 @@ package uzicli
 
 import (
 	"context"
+	"io"
 	"time"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
@@ -142,8 +143,11 @@ type FakeClient struct {
 	GetTaskReviewErr error
 	LastTaskReviewID string
 
-	// DeleteWorker capture: records the id it was asked to delete.
+	// DeleteWorker capture: records the id it was asked to delete and how many times
+	// it was called. DeleteWorkerCalls proves `uzi worker rm` attempted the delete
+	// exactly once on a custody refusal — never silently swallowed it (PRD #1296 M4b).
 	LastDeletedWorkerID string
+	DeleteWorkerCalls   int
 
 	// DeleteRepo capture (PRD #357 M3): records the id `uzi repo remove` asked to
 	// delete. It stays empty when the confirm gate declines, which is what proves
@@ -264,10 +268,21 @@ type FakeClient struct {
 	LastBacklogRun        string
 	LastBacklogCategory   string
 	BulkDispositionResult apitypes.JudgeDispositionResultDTO
-	LastBulkItems         []apitypes.JudgeDispositionCoordDTO
-	LastBulkStatus        string
-	LastBulkReason        string
-	BulkDispositionErr    error
+
+	// Admin "All users" judge reads (PRD #1184 M5). AdminJudgeBacklogResult /
+	// AdminJudgeStatsResult are the canned `uzi admin review backlog` / `stats` replies;
+	// LastAdminBacklogBucket / LastAdminBacklogCategory record the params the command
+	// forwarded, empty meaning the flag was unset and the parameter omitted (server
+	// default), so the fake must NOT substitute one — mirroring LastBacklogBucket. There is
+	// deliberately no LastAdminBacklogRun: the admin backlog has no --run flag.
+	AdminJudgeBacklogResult  apitypes.JudgeAdminBacklogDTO
+	AdminJudgeStatsResult    apitypes.TriageDTO
+	LastAdminBacklogBucket   string
+	LastAdminBacklogCategory string
+	LastBulkItems            []apitypes.JudgeDispositionCoordDTO
+	LastBulkStatus           string
+	LastBulkReason           string
+	BulkDispositionErr       error
 
 	// Live stream (PRD #112 M2). StreamEvents is replayed to the subscriber in
 	// order; StreamErr models a socket that cannot be opened at all.
@@ -487,6 +502,24 @@ type FakeClient struct {
 	LastCIFixRepoID   string
 	LastCIFixRef      string
 	CreateCIFixRunErr error
+
+	// Durable-recovery archive reads (PRD #1296 M5). RecoverySummaries backs
+	// RecoveryArchives, keyed by run id — an absent key yields the zero-value summary,
+	// mirroring the server's empty Archives=[] for a run with no captures, so a run-detail
+	// summary test can exercise the honest "none" path without a special flag.
+	// RecoveryBytes maps a capture id to the exact bundle bytes DownloadRecoveryArchive
+	// streams; RecoveryDownloadHook, when non-nil, drives the download instead — the seam a
+	// truncated/interrupted/corrupt-stream test needs (write some bytes, then return an
+	// error, or write the WRONG bytes). RecoveryDownloadCalls records EACH downloaded
+	// capture id IN ORDER, so a test proves NO download was attempted when selection should
+	// have failed first (the >1-available-without-selection case). The *Err fields win over
+	// the blanket Err so a test can model a summary that reads fine and a download that fails.
+	RecoverySummaries     map[string]apitypes.RecoveryArchiveSummaryDTO
+	RecoveryArchivesErr   error
+	RecoveryBytes         map[string][]byte
+	RecoveryDownloadHook  func(runID, captureID string, w io.Writer) (int64, error)
+	RecoveryDownloadCalls []string
+	RecoveryDownloadErr   error
 
 	// Err, when non-nil, is returned by every method (before any lookup).
 	Err error

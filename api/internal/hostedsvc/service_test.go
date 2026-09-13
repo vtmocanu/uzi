@@ -465,6 +465,7 @@ func TestPollCarriesDiskPressureAndEphemeral(t *testing.T) {
 
 	pressuredID := uuid.New()
 	ephemeralID := uuid.New()
+	custodyID := uuid.New()
 	st.workers = append(st.workers,
 		store.ListHostedWorkersForControllerRow{
 			ID:               pressuredID,
@@ -482,6 +483,15 @@ func TestPollCarriesDiskPressureAndEphemeral(t *testing.T) {
 			DiskPressure:     false,
 			Ephemeral:        true,
 		},
+		// PRD #1296 M4 (D3/D9): a custody-held worker — the signal must round-trip from the
+		// DB column into DesiredWorker.CustodyHeld (M1 hardcoded it false).
+		store.ListHostedWorkersForControllerRow{
+			ID:               custodyID,
+			TemplateDeclared: pgtype.Text{String: "base", Valid: true},
+			HostedSize:       pgtype.Text{String: "m", Valid: true},
+			HostedGeneration: 3,
+			CustodyHeld:      true,
+		},
 	)
 
 	resp, err := svc.Poll(context.Background())
@@ -492,11 +502,14 @@ func TestPollCarriesDiskPressureAndEphemeral(t *testing.T) {
 	for _, w := range resp.Workers {
 		byID[w.ID] = w
 	}
-	if got := byID[pressuredID.String()]; !got.DiskPressure || got.Ephemeral {
-		t.Fatalf("pressured worker = %+v, want DiskPressure=true Ephemeral=false", got)
+	if got := byID[pressuredID.String()]; !got.DiskPressure || got.Ephemeral || got.CustodyHeld {
+		t.Fatalf("pressured worker = %+v, want DiskPressure=true Ephemeral=false CustodyHeld=false", got)
 	}
 	if got := byID[ephemeralID.String()]; got.DiskPressure || !got.Ephemeral {
 		t.Fatalf("ephemeral worker = %+v, want DiskPressure=false Ephemeral=true", got)
+	}
+	if got := byID[custodyID.String()]; !got.CustodyHeld {
+		t.Fatalf("custody-held worker = %+v, want CustodyHeld=true (mapped from the DB, not hardcoded false)", got)
 	}
 }
 

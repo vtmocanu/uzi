@@ -16,6 +16,7 @@ import { DEFAULT_WORKER_TEMPLATE, WORKER_TEMPLATES, hasTemplateDrift } from "../
 import { HostedWorkers } from "../components/HostedWorkers";
 import { WorkerRunBadge } from "../components/WorkerRunBadge";
 import { WorkerCordonBadge } from "../components/WorkerCordonBadge";
+import { WorkerCustodyBadge } from "../components/WorkerCustodyBadge";
 import { WorkerStatGauges, formatBytes } from "../components/WorkerStats";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import { useAsyncData } from "../lib/useAsyncData";
@@ -689,6 +690,7 @@ export function WorkersSettings() {
                       </Badge>
                       <WorkerCordonBadge worker={w} />
                       <WorkerRunBadge worker={w} />
+                      <WorkerCustodyBadge worker={w} />
                     </div>
                   </div>
 

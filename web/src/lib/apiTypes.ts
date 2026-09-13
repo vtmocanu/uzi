@@ -1621,6 +1621,11 @@ export interface Worker {
   // "N/M runs" saturation badge (workerRunBadge in lib/workerRuns.ts).
   active_runs: number;
   max_concurrent_runs: number | null;
+  // retaining_unpublished_work (PRD #1296 M4): true when the worker holds an OPEN
+  // durable-recovery custody hold (unpublished committed work not yet archived), so
+  // teardown is deferred. Distinct from busy/active_runs — it consumes no run slot.
+  // Optional in TS (mocks/older payloads may omit it); the api always sends it.
+  retaining_unpublished_work?: boolean;
   // Worker template (PRD #18): the choice recorded at issuance and the value the
   // worker self-reports at register. Either may be null (no choice / older
   // image); a mismatch is surfaced as a drift badge, never a rejection.
@@ -2644,6 +2649,14 @@ export interface Disposition {
   reason: "" | "wont_do" | "not_an_issue";
   set_at: string;
   stale: boolean;
+  // The disposition's PROVENANCE (PRD #1184 M4), mirroring JudgeOccurrence.set_via so the
+  // run-page DispositionChip can render "Done via #N" (issue_close) and "Done by an admin"
+  // (a cross-user admin Mark done) instead of a bare "Done". Absent means a PERSON set it.
+  // omitempty on the wire, so OPTIONAL here; typed as a literal union like JudgeOccurrence,
+  // which narrows harder than Go's `SetVia string` and falls safe to the plain chip on an
+  // unrecognised value. "denied_cli" is included for parity though a run-page disposition is
+  // never a system CLI auto-dismissal (that is a dismissed occurrence, not a done disposition).
+  set_via?: "issue_close" | "denied_cli" | "admin";
 }
 
 // TriageCounts is the bucketed tally the server computes with ONE Go helper (the
@@ -2801,8 +2814,9 @@ export interface JudgeOccurrence {
   // rather than mis-labelling — but the guarantee lives in Go's SQL writers, not in this
   // declaration. The third value is "denied_cli" (issue #167): a system auto-dismissal of a
   // recommendation whose target names a credential-bearing CLI that policy permanently bars
-  // (glab, gh, aws, az, …). Widen the union here when a further value is added server-side.
-  set_via?: "issue_close" | "denied_cli";
+  // (glab, gh, aws, az, …). The fourth is "admin" (PRD #1184 M4): a cross-user admin Mark done,
+  // rendered "Done by an admin". Widen the union here when a further value is added server-side.
+  set_via?: "issue_close" | "denied_cli" | "admin";
   filed_issue?: JudgeFiledIssueRef;
 }
 
@@ -2868,6 +2882,74 @@ export interface JudgeDispositionResult {
   updated: number;
   settled: JudgeSettledMember[];
   groups: JudgeRecommendationGroup[];
+  truncated: boolean;
+  triage: TriageCounts;
+}
+
+// ── Judge menu — admin "All users" aggregate (PRD #1184) ─────────────────────
+// The admin-only cross-user view: every user's recommendations deduped by (category, target)
+// with attribution HIDDEN. It mirrors the owner backlog's shape but the occurrence and group
+// DTOs deliberately carry NO identifier — no run_id/run_title/review_id/rec_id, no owner/user
+// id — because a run id/title names a run and a rec/review id is an address into one user's
+// data (Success Criterion #2). What survives is how WIDESPREAD a coordinate is (a distinct
+// user_count and run_count) and how SETTLED it is (bucket + provenance), never whose it is.
+
+// JudgeScope is the Judge PAGE scope for an admin (PRD #1184 M4): "mine" is the owner backlog
+// (/me/judge/*), "all" is the cross-user aggregate (/admin/judge/*). It is a SEPARATE concept
+// from JudgeDispositionScope ("open" | "all"), which is the bulk fan-out's member scope — the
+// two share the word "all" and nothing else, so they are distinct types.
+export type JudgeScope = "mine" | "all";
+
+// JudgeAdminOccurrence is one run's instance in the admin aggregate — the attribution-hidden
+// cousin of JudgeOccurrence. No run_id/run_title/review_id/rec_id: an admin occurrence names no
+// run, so the expander renders "A run, judged <time>" with a verdict + state chip and no link.
+// `set_via` widens to include "admin" (a cross-user admin Mark done), rendered "Done by an
+// admin". judged_at is always present on the wire; kept optional here by this file's convention
+// for an always-present field.
+export interface JudgeAdminOccurrence {
+  judged_at?: string;
+  verdict: ReviewVerdict;
+  bucket: JudgeBacklogBucket;
+  set_via?: "issue_close" | "denied_cli" | "admin";
+}
+
+// JudgeAdminGroup is one (category, target) coordinate deduped across EVERY user's runs. It
+// adds `user_count` (the distinct owner count — the "K users" evidence chip) to the owner
+// group's shape and carries attribution-hidden occurrences. The backlog ranks by user_count,
+// then run_count, then open_count. rationale_preview is plain text rendered as escaped text
+// (the no-raw-render guarantee is client-side), exactly like the owner group.
+export interface JudgeAdminGroup {
+  category: RecommendationCategory;
+  target: string;
+  bucket: JudgeBacklogBucket;
+  open_count: number;
+  run_count: number;
+  user_count: number;
+  rationale_preview: string;
+  occurrences: JudgeAdminOccurrence[];
+}
+
+// JudgeAdminBacklog is GET /api/admin/judge/recommendations (PRD #1184 M1): the cross-user
+// aggregate backlog. Like JudgeBacklog minus the `run` echo (there is no ?run= anchor on the
+// admin path — an anchor names a run). `triage` is the canonical all-users tally from the
+// separate stats query, never tallied from `groups`; `truncated` carries the same
+// pre-grouping-cut caveat as the owner backlog.
+export interface JudgeAdminBacklog {
+  bucket: JudgeBacklogBucket;
+  groups: JudgeAdminGroup[];
+  truncated: boolean;
+  triage: TriageCounts;
+}
+
+// JudgeAdminDispositionResult is the response to the admin cross-user Mark done / Undo (PRD
+// #1184 M2). It is the attribution-hidden cousin of JudgeDispositionResult and carries NO
+// `settled` list: the admin write has no run address (the fan-out spans every user's rows, and
+// the admin Undo is BY COORDINATE, not by a (run, recommendation) pair). `updated` counts the
+// coordinates actually written (an ON CONFLICT DO NOTHING skip does not count); `groups` are
+// the affected coordinates re-read at bucket=all; `triage` is the recomputed all-users tally.
+export interface JudgeAdminDispositionResult {
+  updated: number;
+  groups: JudgeAdminGroup[];
   truncated: boolean;
   triage: TriageCounts;
 }
@@ -3325,4 +3407,52 @@ export interface CIJob {
 export interface CIRunDetail extends CIRun {
   jobs: CIJob[];
   unsupported: string;
+}
+
+// ── Durable run recovery (PRD #1296 M1) ───────────────────────────────────────
+// The owner-facing recovery metadata the run page and `uzi run export` render. Raw
+// archive bytes never appear here (D6) — only metadata. The Go source is
+// api/internal/apitypes/recovery.go; the api-contract fixtures pin the two in lockstep.
+
+// RecoveryArchive is one owner-visible capture's metadata. Optional fields are absent
+// until the capture reaches the relevant lifecycle stage: attempted_head_sha (H') is
+// absent when no publish was attempted; byte_size/checksum are absent until the manifest
+// is bound; expires_at is absent until the artifact is available.
+export interface RecoveryArchive {
+  id: string;
+  run_id: string;
+  state: string;
+  source_sha: string;
+  attempted_head_sha?: string;
+  byte_size?: number;
+  checksum?: string;
+  reason?: string;
+  prerequisite_shas?: string[];
+  created_at: string;
+  expires_at?: string;
+}
+
+// RecoveryArchiveStateCounts is the closed per-state capture tally on a run's recovery
+// summary. Every state key is always present.
+export interface RecoveryArchiveStateCounts {
+  preparing: number;
+  uploading: number;
+  available: number;
+  needs_action: number;
+  expired: number;
+  discarded: number;
+}
+
+// RecoveryArchiveSummary is the per-run recovery aggregate M5 renders WITHOUT gating on
+// archives.length: supported is true iff recovery was ever armed for the run (its absence
+// is the legacy/unsupported case, surfaced as legacy); has_open_hold is the pending signal.
+// archives is ALWAYS an array on the wire (the summary endpoint returns [] for a run with
+// none), so it is typed never-null — the nil-slice zero fixture is exempted in the contract
+// test, the same as CIRunDetail.jobs.
+export interface RecoveryArchiveSummary {
+  supported: boolean;
+  legacy: boolean;
+  has_open_hold: boolean;
+  counts: RecoveryArchiveStateCounts;
+  archives: RecoveryArchive[];
 }

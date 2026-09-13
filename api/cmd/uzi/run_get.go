@@ -71,7 +71,14 @@ func newRunGetCmd(env Env, gf *globalFlags) *cobra.Command {
 			if p.Format == uzicli.FormatJSON {
 				return p.JSON(run)
 			}
-			return renderRunDetail(p, run)
+			if err := renderRunDetail(p, run); err != nil {
+				return err
+			}
+			// Metadata-only durable-recovery summary (PRD #1296 D7): best-effort, human-only,
+			// appended after the detail block. It NEVER widens raw access and prints nothing
+			// when the run has no recovery content, so an ordinary run's output is unchanged.
+			renderRunRecoverySummary(cmd.Context(), env, gf, c, run)
+			return nil
 		},
 	}
 	get.Flags().StringSlice("field", nil,
