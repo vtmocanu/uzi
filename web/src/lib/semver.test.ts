@@ -8,13 +8,20 @@ describe("parseSemver", () => {
     expect(parseSemver("0.10.0")).toEqual([0, 10, 0]);
   });
 
-  it("returns null for non-semver, pseudo, prerelease, and unshaped input", () => {
+  it("parses an X.Y.Z-rc.N candidate to its stable base (PRD 1265)", () => {
+    expect(parseSemver("0.83.0-rc.1")).toEqual([0, 83, 0]);
+    expect(parseSemver("0.83.0-rc.10")).toEqual([0, 83, 0]);
+    expect(parseSemver("1.2.3-rc.2")).toEqual([1, 2, 3]);
+  });
+
+  it("returns null for non-semver, pseudo, and unshaped input", () => {
     expect(parseSemver("dev")).toBeNull();
     expect(parseSemver("demo")).toBeNull();
     expect(parseSemver("")).toBeNull();
     expect(parseSemver("Unreleased")).toBeNull();
-    // -rc.N prerelease is a documented Model-B limitation → null.
-    expect(parseSemver("1.2.3-rc.1")).toBeNull();
+    // A non-rc prerelease suffix is still rejected (only -rc.N is a uzi shape, D2).
+    expect(parseSemver("1.2.3-beta.1")).toBeNull();
+    expect(parseSemver("1.2.3-rc")).toBeNull();
     // Not three fields.
     expect(parseSemver("1.2")).toBeNull();
     expect(parseSemver("v1.2.3")).toBeNull();
@@ -43,5 +50,13 @@ describe("compareSemver", () => {
     expect(compareSemver("dev", "0.48.0")).toBeGreaterThan(0); // dev sorts last
     expect(compareSemver("0.48.0", "dev")).toBeLessThan(0);
     expect(compareSemver("dev", "demo")).toBe(0);
+  });
+
+  it("compares a running RC as its stable base (PRD 1265)", () => {
+    // Running 0.83.0-rc.1: the [0.83.0] section is the candidate you're running (equal),
+    // a later [0.84.0] is Newer, and [0.82.0] is older. No false "available" for 0.83.0.
+    expect(compareSemver("0.83.0", "0.83.0-rc.1")).toBe(0);
+    expect(compareSemver("0.84.0", "0.83.0-rc.1")).toBeGreaterThan(0);
+    expect(compareSemver("0.82.0", "0.83.0-rc.1")).toBeLessThan(0);
   });
 });
