@@ -1416,19 +1416,11 @@ export class GitCache {
 
   /** Record clone ownership BEFORE running the model, so disk pressure during a
    * later capture cannot prevent the restart guard from knowing whose work it is.
-   * The runner clears this journal only after removing a safely disposable clone. */
+   * The runner clears this journal only after atomically retiring the clone
+   * (retireRunnerClone), never before the rename. */
   async markRecoveryCapture(barePath: string, clonePath: string, branch: string, runId: string): Promise<void> {
     await this.withLock(barePath, async () => {
       await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), JSON.stringify({ runId, clonePath })]);
-    });
-  }
-
-  async clearRecoveryCapture(barePath: string, branch: string, runId: string): Promise<void> {
-    await this.withLock(barePath, async () => {
-      const pending = await this.readRecoveryCapture(barePath, branch);
-      if (pending?.runId === runId) {
-        await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
-      }
     });
   }
 
@@ -1676,9 +1668,9 @@ export class GitCache {
    * runnerRoot. `opts.discard` distinguishes the owner's own terminal trash (dispose the
    * holding dir, best-effort) from a foreign quarantine (retain it forever).
    *
-   * NOT re-entrant with markRecoveryCapture/clearRecoveryCapture (each takes its OWN
-   * withLock) — this runs the whole validate→rename→clear sequence under one lock via
-   * readRecoveryCapture (lock-free) + a direct runGit config write.
+   * NOT re-entrant with markRecoveryCapture (which takes its OWN withLock) — this runs
+   * the whole validate→rename→clear sequence under one lock via readRecoveryCapture
+   * (lock-free) + a direct runGit config write.
    */
   async retireRunnerClone(
     barePath: string,
