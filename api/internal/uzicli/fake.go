@@ -441,6 +441,53 @@ type FakeClient struct {
 	// vacuous "not called".
 	RunLogsPageCalls []LogsPageQuery
 
+	// Forge-view reads (PRD #1255 M3). PullsResult / CIRunsResult / CIRunDetailResult
+	// are the canned list/detail replies; the Last* fields capture the exact wire args
+	// so a test can assert the repo id / iid / run id / limit the command forwarded.
+	// The *Err fields win over the blanket Err so a test can model a per-verb 404/429
+	// while the call capture still proves the read was reached. The *Calls counters
+	// mirror ListRunsCalls (no mutex — every consumer is a single-goroutine command
+	// test): the --watch termination test asserts GetPull was called ≥2× before it
+	// exited 0 on a settled poll.
+	PullsResult         []apitypes.PullDTO
+	ListPullsCalls      int
+	LastListPullsRepoID string
+	ListPullsErr        error
+
+	// PullDetailResult is the static GetPull reply; GetPullHook, when non-nil, drives
+	// GetPull instead (mirroring GetRunHook), which is the sequencing seam the --watch
+	// tests need: the poll loop calls GetPull repeatedly, so a test scripts a per-call
+	// SEQUENCE (a pending check first, all-settled next; a transient 429 mid-stream)
+	// by returning different values across calls. A nil hook keeps the static reply.
+	PullDetailResult  apitypes.PullDetailDTO
+	GetPullHook       func(repoID string, iid int64) (apitypes.PullDetailDTO, error)
+	GetPullCalls      int
+	LastGetPullRepoID string
+	LastGetPullIID    int64
+	GetPullErr        error
+
+	CIRunsResult      []apitypes.CIRunDTO
+	CIRunsUnsupported string
+	ListCIRunsCalls   int
+	LastCIRunsRepoID  string
+	LastCIRunsLimit   int
+	ListCIRunsErr     error
+
+	CIRunDetailResult  apitypes.CIRunDetailDTO
+	GetCIRunCalls      int
+	LastGetCIRunRepoID string
+	LastGetCIRunID     int64
+	GetCIRunErr        error
+
+	// CreateCIFixRun capture (PRD #1255 M3/D12): CIFixRunResult is the canned created
+	// run; the Last* fields record the repo id and ref the command POSTed.
+	// CreateCIFixRunErr wins over Err so a test can model the 409 "not failed" precisely
+	// while the capture still proves the write was reached.
+	CIFixRunResult    apitypes.RunDTO
+	LastCIFixRepoID   string
+	LastCIFixRef      string
+	CreateCIFixRunErr error
+
 	// Err, when non-nil, is returned by every method (before any lookup).
 	Err error
 }

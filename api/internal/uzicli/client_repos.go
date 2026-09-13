@@ -3,6 +3,7 @@ package uzicli
 import (
 	"context"
 	"net/url"
+	"strconv"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 )
@@ -69,4 +70,65 @@ func (c *HTTPClient) GetProjectSyncStatus(ctx context.Context, repoID string) (P
 
 func (c *HTTPClient) ResyncProjectSync(ctx context.Context, repoID string) error {
 	return c.postJSON(ctx, "/api/repos/"+url.PathEscape(repoID)+"/github-project-sync/resync", nil, nil)
+}
+
+// forge-view reads (PRD #1255 M3, D10): the CLI twins of the pulls/CI routes.
+// Every method decodes the exact apitypes DTOs the handler serialises (no CLI DTO),
+// and every non-2xx is mapped to a documented exit code by the shared get/postJSON
+// path (a 429 → ExitUnreachable now that statusError has the case).
+
+func (c *HTTPClient) ListPulls(ctx context.Context, repoID string) ([]apitypes.PullDTO, error) {
+	var env struct {
+		Pulls []apitypes.PullDTO `json:"pulls"`
+	}
+	if err := c.get(ctx, "/api/repos/"+url.PathEscape(repoID)+"/pulls", &env); err != nil {
+		return nil, err
+	}
+	return env.Pulls, nil
+}
+
+func (c *HTTPClient) GetPull(ctx context.Context, repoID string, iid int64) (apitypes.PullDetailDTO, error) {
+	var out apitypes.PullDetailDTO
+	path := "/api/repos/" + url.PathEscape(repoID) + "/pulls/" + strconv.FormatInt(iid, 10)
+	if err := c.get(ctx, path, &out); err != nil {
+		return apitypes.PullDetailDTO{}, err
+	}
+	return out, nil
+}
+
+func (c *HTTPClient) ListCIRuns(ctx context.Context, repoID string, limit int) ([]apitypes.CIRunDTO, string, error) {
+	var env struct {
+		Runs        []apitypes.CIRunDTO `json:"runs"`
+		Unsupported string              `json:"unsupported"`
+	}
+	path := "/api/repos/" + url.PathEscape(repoID) + "/ci/runs"
+	if limit > 0 {
+		path += "?limit=" + strconv.Itoa(limit)
+	}
+	if err := c.get(ctx, path, &env); err != nil {
+		return nil, "", err
+	}
+	return env.Runs, env.Unsupported, nil
+}
+
+func (c *HTTPClient) GetCIRun(ctx context.Context, repoID string, runID int64) (apitypes.CIRunDetailDTO, error) {
+	var out apitypes.CIRunDetailDTO
+	path := "/api/repos/" + url.PathEscape(repoID) + "/ci/runs/" + strconv.FormatInt(runID, 10)
+	if err := c.get(ctx, path, &out); err != nil {
+		return apitypes.CIRunDetailDTO{}, err
+	}
+	return out, nil
+}
+
+func (c *HTTPClient) CreateCIFixRun(ctx context.Context, repoID, ref string) (apitypes.RunDTO, error) {
+	body := struct {
+		Ref string `json:"ref"`
+	}{Ref: ref}
+	var env struct {
+		Run apitypes.RunDTO `json:"run"`
+	}
+	if err := c.postJSON(ctx, "/api/repos/"+url.PathEscape(repoID)+"/ci-fix-runs", body, &env); err != nil {
+		return apitypes.RunDTO{}, err
+	}
+	return env.Run, nil
 }

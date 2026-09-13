@@ -20,7 +20,7 @@ require (
 	github.com/go-chi/chi/v5 v5.3.2
 	github.com/go-git/go-git/v5 v5.19.2
 	github.com/golang-jwt/jwt/v5 v5.3.1
-	github.com/google/go-github/v90 v90.0.0
+	github.com/google/go-github/v91 v91.0.0
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/pressly/goose/v3 v3.28.0
@@ -28,7 +28,7 @@ require (
 	github.com/slack-go/slack v0.29.0
 	github.com/spf13/cobra v1.10.2
 	github.com/yuin/goldmark v1.8.6
-	gitlab.com/gitlab-org/api/client-go/v2 v2.63.0
+	gitlab.com/gitlab-org/api/client-go/v2 v2.64.0
 	golang.org/x/crypto v0.56.0
 	golang.org/x/mod v0.41.0
 	golang.org/x/oauth2 v0.37.0

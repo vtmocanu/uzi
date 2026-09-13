@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"time"
 
 	gitlab "gitlab.com/gitlab-org/api/client-go/v2"
 )
@@ -79,10 +80,28 @@ func (g *gitLab) ListPipelineJobs(ctx context.Context, projectID, pipelineID int
 			if j == nil {
 				continue
 			}
-			items = append(items, Job{ID: j.ID, Name: j.Name, Stage: j.Stage, Status: j.Status, WebURL: j.WebURL})
+			items = append(items, toGitLabJob(j))
 		}
 		return items, int(resp.NextPage), nil
 	})
+}
+
+// toGitLabJob maps a client-go Job to the neutral Job. GitLab jobs carry no steps
+// (Steps stays nil). StartedAt/FinishedAt come from the job's timestamps; when the
+// job is still settling and FinishedAt is absent, it is derived from StartedAt plus
+// Duration (seconds), which GitLab reports as the job runs (PRD #1255).
+func toGitLabJob(j *gitlab.Job) Job {
+	job := Job{ID: j.ID, Name: j.Name, Stage: j.Stage, Status: j.Status, WebURL: j.WebURL}
+	if j.StartedAt != nil {
+		job.StartedAt = *j.StartedAt
+	}
+	switch {
+	case j.FinishedAt != nil:
+		job.FinishedAt = *j.FinishedAt
+	case j.StartedAt != nil && j.Duration > 0:
+		job.FinishedAt = j.StartedAt.Add(time.Duration(j.Duration * float64(time.Second)))
+	}
+	return job
 }
 
 func (g *gitLab) JobLogTail(ctx context.Context, projectID, jobID int64, maxBytes int) (string, error) {

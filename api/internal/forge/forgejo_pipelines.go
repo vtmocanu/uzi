@@ -216,13 +216,17 @@ func toForgejoPipeline(r *gitea.ActionWorkflowRun) Pipeline {
 
 // toForgejoJob maps a gitea Actions workflow job to the neutral Job. Status is the
 // same passthrough Actions enum as the run's. Forgejo Actions has no "stage" concept
-// (that is GitLab's pipeline model), so Stage is left empty rather than invented.
+// (that is GitLab's pipeline model), so Stage is left empty rather than invented,
+// and no per-step breakdown, so Steps stays nil. StartedAt/CompletedAt come from the
+// job's timestamps (PRD #1255); a zero time (not yet started/finished) stays zero.
 func toForgejoJob(j *gitea.ActionWorkflowJob) Job {
 	return Job{
-		ID:     j.ID,
-		Name:   j.Name,
-		Stage:  "",
-		Status: j.Status,
-		WebURL: j.HTMLURL,
+		ID:         j.ID,
+		Name:       j.Name,
+		Stage:      "",
+		Status:     j.Status,
+		WebURL:     j.HTMLURL,
+		StartedAt:  j.StartedAt,
+		FinishedAt: j.CompletedAt,
 	}
 }

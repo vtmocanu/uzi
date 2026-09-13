@@ -234,6 +234,8 @@ func newRootCmd(env Env) *cobra.Command {
 		newContextCmd(env, gf),
 		newWhoamiCmd(env, gf),
 		newRunCmd(env, gf),
+		newPRCmd(env, gf),
+		newCICmd(env, gf),
 		newScheduleCmd(env, gf),
 		newTUICmd(env, gf),
 		newReviewCmd(env, gf),

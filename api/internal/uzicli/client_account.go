@@ -154,7 +154,7 @@ func (c *HTTPClient) PollCLIAuth(ctx context.Context, requestID, verifier string
 		return CLIAuthPollResult{Status: CLIAuthTerminal, Reason: pollStatusField(body)}, nil
 	default:
 		// 400/401/429/5xx etc. — map to the documented exit code (auth/usage/...).
-		return CLIAuthPollResult{}, statusError(resp.StatusCode, body)
+		return CLIAuthPollResult{}, statusError(resp.StatusCode, body, resp.Header.Get("Retry-After"))
 	}
 }
 

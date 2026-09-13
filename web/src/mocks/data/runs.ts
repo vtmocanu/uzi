@@ -80,6 +80,11 @@ export const mockRuns: Run[] = [
     claimed_at: null,
     started_at: null,
     finished_at: null,
+    // PRD #1189: a queued run is a non-terminal timed kind, so it is extendable (the column is
+    // inert until it runs). Seed the extension fields so the mock extend path succeeds instead of
+    // reading a missing cap as 0 (disabled) and returning a spurious 409.
+    budget_extension_seconds: 0,
+    budget_extension_cap_seconds: 57600,
     created_at: minsAgo(1),
     updated_at: minsAgo(1),
   },
@@ -432,6 +437,12 @@ export const mockRuns: Run[] = [
     },
     budget_max_iterations: 12,
     budget_wall_seconds: 7200,
+    // PRD #1189: the budget wire contract. This healthy running run shows `1m / 2h` in the
+    // header elapsed (used aged off deadline_at); no extension yet, a 16h allowance.
+    budget_extension_seconds: 0,
+    budget_extension_cap_seconds: 57600,
+    budget_total_seconds: 7200,
+    budget_used_seconds: 60,
     // PRD #1170: a running run with a frozen wall-clock budget carries a server-computed
     // deadline (started_at + budget). ~2h out here (started 1m ago, 7200s budget). The
     // near-timeout badge counts down to it once the run is flagged; this run is healthy,
@@ -543,6 +554,12 @@ export const mockRuns: Run[] = [
     size_class: "m",
     budget_max_iterations: 8,
     budget_wall_seconds: 5400,
+    // PRD #1189: budget_total_seconds is null off `running` (a gated run has no live
+    // deadline); the extension columns still ride the wire.
+    budget_extension_seconds: 0,
+    budget_extension_cap_seconds: 57600,
+    budget_total_seconds: null,
+    budget_used_seconds: 540,
     anthropic_secret_id: "sec-default",
     anthropic_secret_label: "default",
     // M5: an ordinary default, for contrast with the fallback above.
@@ -819,6 +836,12 @@ export const mockRuns: Run[] = [
     milestones_candidate: null,
     budget_max_iterations: 10,
     budget_wall_seconds: 7200,
+    // PRD #1189: terminal run — budget_total_seconds null (no live deadline); used is the
+    // final active span, and the extension columns ride the wire.
+    budget_extension_seconds: 0,
+    budget_extension_cap_seconds: 57600,
+    budget_total_seconds: null,
+    budget_used_seconds: 13140,
     anthropic_secret_id: "sec-console",
     anthropic_secret_label: "console-key",
     // M5: D10's best-of-pool. Every pooled token was under the floor and the emptiest was
@@ -886,6 +909,11 @@ export const mockRuns: Run[] = [
     milestones_candidate: null,
     budget_max_iterations: 10,
     budget_wall_seconds: 7200,
+    // PRD #1189: terminal — no live deadline, so budget_total_seconds is null.
+    budget_extension_seconds: 0,
+    budget_extension_cap_seconds: 57600,
+    budget_total_seconds: null,
+    budget_used_seconds: 8340,
     anthropic_secret_id: "sec-console",
     anthropic_secret_label: "console-key",
     anthropic_select_reason: "default",
@@ -1148,6 +1176,11 @@ export const mockRuns: Run[] = [
     milestones_candidate: null,
     budget_max_iterations: 4,
     budget_wall_seconds: 7200,
+    // PRD #1189: terminal (timed out) — budget_total_seconds null; used ran up to the budget.
+    budget_extension_seconds: 0,
+    budget_extension_cap_seconds: 57600,
+    budget_total_seconds: null,
+    budget_used_seconds: 7200,
     anthropic_secret_id: "sec-default",
     anthropic_secret_label: "default",
     // M5: the judge lane's own mode. Rendered `judge binding` and NOT `pinned`, which
@@ -1232,6 +1265,11 @@ export const mockRuns: Run[] = [
     milestones_candidate: null,
     budget_max_iterations: 4,
     budget_wall_seconds: 7200,
+    // PRD #1189: terminal (workflow-scope failure) — no live deadline, so total is null.
+    budget_extension_seconds: 0,
+    budget_extension_cap_seconds: 57600,
+    budget_total_seconds: null,
+    budget_used_seconds: 5400,
     anthropic_secret_id: "sec-default",
     anthropic_secret_label: "default",
     anthropic_select_reason: "pinned",
@@ -1574,6 +1612,13 @@ export const mockRuns: Run[] = [
     checkpoint_tip_at: minsAgo(160),
     budget_max_iterations: 12,
     budget_wall_seconds: 28800,
+    // PRD #1189: paused with an 8h budget, 3h42m used → 4h18m remains when resumed (mock frame
+    // C). budget_total_seconds is null while paused (the deadline moves); the paused elapsed and
+    // panel derive "remains when you resume" from wall + extension − used instead.
+    budget_extension_seconds: 0,
+    budget_extension_cap_seconds: 57600,
+    budget_total_seconds: null,
+    budget_used_seconds: 13320,
     anthropic_secret_id: "sec-console",
     anthropic_secret_label: "console-key",
     anthropic_select_reason: "auto",

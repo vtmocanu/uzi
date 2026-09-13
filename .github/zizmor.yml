@@ -1,0 +1,14 @@
+# zizmor configuration.
+#
+# self-repository: zizmor >= 1.30 flags workspace-relative local-action refs
+# (`uses: ./.github/actions/...`) and recommends GitHub's `$/...` self-repository
+# syntax (GA 2026-07-30). We keep `uses: ./` because actionlint (the other half of
+# `lint:actions`, pinned v1.7.12, upstream maintenance stalled) does not yet parse
+# `$/` and rejects it as an invalid `uses:` format (rhysd/actionlint#711). Adopt the
+# rewrite once actionlint ships `$/` support; until then this audit is a false gate.
+rules:
+  self-repository:
+    ignore:
+      - ci.yml
+      - main-guard.yml
+      - release.yml

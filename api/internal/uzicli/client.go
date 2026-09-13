@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -494,6 +495,37 @@ type Client interface {
 	// foreign/unknown repo, or one with no link row, is a 404 (exit 4) straight from
 	// statusError.
 	ResyncProjectSync(ctx context.Context, repoID string) error
+
+	// ListPulls returns a repo's open PRs/MRs as list rows (PRD #1255 M3, D10): GET
+	// /api/repos/{id}/pulls, decoded from the {"pulls":[…]} envelope. Owner-scoped +
+	// enabled-gated server-side, so a foreign/unknown/disabled repo is a 404 (exit 4);
+	// a forge rate-limit shed is a 429 → ExitUnreachable (6). The list carries no
+	// per-PR checks by design — check detail is GetPull's job (D4).
+	ListPulls(ctx context.Context, repoID string) ([]apitypes.PullDTO, error)
+	// GetPull returns one open PR with its checks, reviews and derived merge state
+	// (PRD #1255 M3): GET /api/repos/{id}/pulls/{iid}. A PR the forge 404s, or one no
+	// longer open, is a 404 (exit 4); a rate-limit shed is a 429 → ExitUnreachable (6).
+	// `uzi pr checks --watch` polls this until no check is pending.
+	GetPull(ctx context.Context, repoID string, iid int64) (apitypes.PullDetailDTO, error)
+	// ListCIRuns returns a repo's CI runs newest-first (PRD #1255 M3): GET
+	// /api/repos/{id}/ci/runs?limit=. It returns the runs AND the "unsupported"
+	// sentence the {"runs":[…],"unsupported":s} envelope carries — non-empty only on a
+	// forge version without the runs endpoint, where the runs list is empty and the
+	// caller prints the sentence and exits 0 rather than erroring. limit ≤ 0 omits the
+	// query param, so the server's default (30, capped at 100) applies.
+	ListCIRuns(ctx context.Context, repoID string, limit int) ([]apitypes.CIRunDTO, string, error)
+	// GetCIRun returns one CI run's jobs and steps (PRD #1255 M3): GET
+	// /api/repos/{id}/ci/runs/{run_id}. The returned CIRunDetailDTO carries its own
+	// Unsupported sentence (non-empty on the ErrForgeVersionUnsupported degrade path,
+	// where Jobs is empty), so unlike ListCIRuns it needs no second return.
+	GetCIRun(ctx context.Context, repoID string, runID int64) (apitypes.CIRunDetailDTO, error)
+	// CreateCIFixRun queues a ci_fix run for a failed pipeline on a ref (PRD #1255
+	// M3/D12): POST /api/repos/{id}/ci-fix-runs {"ref"}. D12 moved this route into the
+	// Bearer-reachable RequireUser group so a uzc_ token can trigger it. Returns the
+	// created run (201). The server re-validates the Fix-CI preconditions, so a ref
+	// whose latest cached pipeline is not failed (or has no cached pipeline) is a 409 →
+	// ExitConflict (5); a foreign/unknown repo is a 404 (exit 4).
+	CreateCIFixRun(ctx context.Context, repoID, ref string) (apitypes.RunDTO, error)
 }
 
 // ProjectSyncStatus mirrors the handler's getGithubProjectSyncStatusResponse JSON
@@ -770,7 +802,7 @@ func (c *HTTPClient) delRead(ctx context.Context, path string, out any) error {
 // is identical across verbs.
 func decode2xx(resp *http.Response, body []byte, path string, out any) error {
 	if resp.StatusCode/100 != 2 {
-		return statusError(resp.StatusCode, body)
+		return statusError(resp.StatusCode, body, resp.Header.Get("Retry-After"))
 	}
 	if out != nil {
 		if err := json.Unmarshal(body, out); err != nil {
@@ -791,10 +823,28 @@ func transportMsg(err error) string {
 }
 
 // statusError maps a non-2xx status to an *ExitError with the documented exit
-// code, folding in the server's {"error": "..."} message when present.
-func statusError(status int, body []byte) *ExitError {
+// code, folding in the server's {"error": "..."} message when present. retryAfter
+// is the response's Retry-After header (empty when absent), read only for a 429.
+func statusError(status int, body []byte, retryAfter string) *ExitError {
 	msg := serverErrMsg(body)
 	switch {
+	case status == http.StatusTooManyRequests:
+		// A 429 is a rate-limit shed, not a bad request: the server (or the forge it
+		// proxies) is temporarily unwilling to serve, so it exits ExitUnreachable (6)
+		// like a 5xx — transient, back off and retry — NOT ExitGeneric, which a 429
+		// fell through to before this case existed. The Retry-After hint is folded
+		// into the message AND carried structurally on the *ExitError so a polling
+		// caller (`uzi pr checks --watch`) backs off for exactly that window.
+		d := parseRetryAfter(retryAfter)
+		if msg == "" {
+			msg = "the server rate-limited this request; back off and retry"
+		}
+		if d > 0 {
+			msg = fmt.Sprintf("%s (retry after %s)", msg, d)
+		}
+		e := Exitf(ExitUnreachable, "%s", msg)
+		e.RetryAfter = d
+		return e
 	case status == http.StatusBadRequest:
 		if msg == "" {
 			msg = "bad request"
@@ -858,4 +908,28 @@ func serverErrMsg(body []byte) string {
 		return strings.TrimSpace(e.Error)
 	}
 	return ""
+}
+
+// parseRetryAfter parses a Retry-After header into a backoff duration. The api's
+// forge-view routes send whole seconds (strconv.Itoa on a rounded-up count), which
+// is the common form; the HTTP-date form is also accepted so a proxy that rewrites
+// it does not silently zero the hint. An unparseable or non-positive value is 0
+// (no hint), so the caller falls back to its own default interval.
+func parseRetryAfter(v string) time.Duration {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(v); err == nil {
+		if secs <= 0 {
+			return 0
+		}
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		if d := time.Until(t); d > 0 {
+			return d
+		}
+	}
+	return 0
 }

@@ -69,6 +69,32 @@ describe("readRunAck", () => {
     assert.equal(nonBool.budgetExhausted, undefined, "a non-boolean value is ignored, never coerced");
   });
 
+  // PRD #1189 M1 (D6) — the served TOTAL wall (frozen budget + owner extension) rides the same
+  // {run: RunDTO} body as the other budget fields. The sdk-executor prefers it over
+  // budget_wall_seconds; readRunAck must surface it as a number, and leave it ABSENT (never coerced)
+  // for null / missing / non-number so the executor's back-compat fallback to budget_wall_seconds fires.
+  it("reads budget_total_seconds off the run body as budgetTotalSeconds", async () => {
+    const out = await readRunAck(jsonResponse({ run: { status: "running", budget_total_seconds: 36000 } }));
+    assert.equal(out.budgetTotalSeconds, 36000, "the served total wall is passed through as a number");
+  });
+
+  it("leaves budgetTotalSeconds absent when budget_total_seconds is null (a run with no wall deadline)", async () => {
+    const out = await readRunAck(jsonResponse({ run: { status: "running", budget_total_seconds: null } }));
+    assert.equal(out.budgetTotalSeconds, undefined, "null ⇒ absent, so the executor falls back to budget_wall_seconds");
+  });
+
+  it("leaves budgetTotalSeconds absent when the field is missing (older api)", async () => {
+    const out = await readRunAck(jsonResponse({ run: { status: "running" } }));
+    assert.equal(out.budgetTotalSeconds, undefined, "an older api that omits the field ⇒ absent");
+  });
+
+  it("ignores a non-number budget_total_seconds, never coercing it", async () => {
+    const str = await readRunAck(jsonResponse({ run: { budget_total_seconds: "36000" } }));
+    assert.equal(str.budgetTotalSeconds, undefined, "a string is ignored, not coerced to a number");
+    const bool = await readRunAck(jsonResponse({ run: { budget_total_seconds: true } }));
+    assert.equal(bool.budgetTotalSeconds, undefined, "a boolean is ignored");
+  });
+
   it("returns {} on an empty body (existing catch/total behavior)", async () => {
     const out = await readRunAck(new Response(""));
     assert.deepEqual(out, {}, "an empty body yields the fields absent");

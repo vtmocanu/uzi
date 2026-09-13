@@ -7,7 +7,7 @@ import (
 	"context"
 	"strings"
 
-	gh "github.com/google/go-github/v90/github"
+	gh "github.com/google/go-github/v91/github"
 )
 
 func (g *github) ListIssues(ctx context.Context, projectID int64, opts ListIssuesOptions) ([]Issue, error) {
@@ -207,7 +207,7 @@ func (g *github) CreateIssueNote(ctx context.Context, projectID, issueIID int64,
 	if err != nil {
 		return IssueNote{}, g.wrapErr("create issue note", err)
 	}
-	c, _, err := g.client.Issues.CreateComment(ctx, slug.owner, slug.repo, num, &gh.IssueComment{Body: &body})
+	c, _, err := g.client.Issues.CreateComment(ctx, slug.owner, slug.repo, num, gh.IssueCommentRequest{Body: body})
 	if err != nil {
 		return IssueNote{}, g.wrapErr("create issue note", err)
 	}

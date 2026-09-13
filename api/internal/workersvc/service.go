@@ -171,6 +171,16 @@ var (
 	// so CreateRunInput can map it to 400 with the reason verbatim, rather than letting an
 	// invalid mode fall through to the 500 default arm.
 	ErrInvalidPauseMode = errors.New("invalid pause mode")
+	// The four `extend` sentinels (PRD #1189 M1). ErrInvalidExtension rejects a body that is
+	// not a whole number of seconds >= 60 → 400. ErrExtendDisabled is the admin off-switch
+	// (run_extension_cap_seconds = 0) → 409. ErrExtensionCapExceeded is the per-run cap gate,
+	// whose message names the remaining allowance → 409. ErrExtendNotTimed rejects a run of a
+	// kind that never times out (chat/judge/interactive) → 409. The last two are disambiguated
+	// from a 0-row CreateExtendInput by extendRefusalReason over the already-fetched run.
+	ErrInvalidExtension     = errors.New("invalid extension")
+	ErrExtendDisabled       = errors.New("extending runs is turned off")
+	ErrExtensionCapExceeded = errors.New("extension cap exceeded")
+	ErrExtendNotTimed       = errors.New("this run has no wall-clock timeout to extend")
 	// ErrReviseCapReached rejects a revise_plan once the run has hit
 	// PLAN_MAX_REVISIONS persisted revisions (PRD #41). Counted over ALL
 	// revise_plan rows for the run (a consumed revise still counts), so the cap is
@@ -715,6 +725,13 @@ type Store interface {
 	// in one statement (PRD #634 M2). The audit row is excluded from ConsumeRunInputs; the
 	// control travels as runs.scope_ceiling on the ACK/claim.
 	CreateScopeCeilingInput(ctx context.Context, arg store.CreateScopeCeilingInputParams) (store.RunUserInput, error)
+	// CreateExtendInput ADDS @secs to runs.budget_extension_seconds AND writes the
+	// kind='extend' audit row in one statement (PRD #1189 M1), returning the new total
+	// extension. The audit row is excluded from ConsumeRunInputs; the control travels as
+	// runs.budget_extension_seconds on the ACK/claim. A refused request (terminal / untimed
+	// kind / over the cap) matches 0 rows and yields pgx.ErrNoRows, which the service maps
+	// to the extend 409 classes via extendRefusalReason over the already-fetched run.
+	CreateExtendInput(ctx context.Context, arg store.CreateExtendInputParams) (int32, error)
 	// SettleScopeInputDisposition settles the still-pending scope audit row(s) at
 	// completion (PRD #634 M4). Idempotent (WHERE disposition IS NULL); never overwrites an
 	// already-settled ('superseded'/'applied') row.
@@ -4278,6 +4295,12 @@ type SubmitInputResult struct {
 	// or by a milestone-run `stop` mapped to a scope write (PRD #634 M2), so m5's CLI can
 	// report the clamped value back to the operator. Nil on every non-scope path.
 	ScopeCeiling *int
+	// ExtensionSeconds is the new TOTAL budget_extension_seconds after a successful `extend`
+	// (PRD #1189 M1) — the value CreateExtendInput's RETURNING gives back — and DeadlineAt is
+	// the run's projected wall-clock deadline once the extension applies, both so the CLI can
+	// print the outcome without a read-back. Nil on every non-extend path.
+	ExtensionSeconds *int
+	DeadlineAt       *time.Time
 }
 
 // hasLivePoller reports whether a worker is currently polling this run's inputs:

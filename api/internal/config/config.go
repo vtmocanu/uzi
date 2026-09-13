@@ -161,6 +161,15 @@ type Config struct {
 	// upstream forge from a single user's abuse.
 	ForgeRateLimitMax    int
 	ForgeRateLimitWindow time.Duration
+	// ForgeInteractiveRateMax is the per-connection interactive-read forge SPEND
+	// budget (PRD #1255 D4): a token bucket refilling at this many forge calls per
+	// minute (burst == max, window fixed at 1 minute). It is charged at the forge-call
+	// site of the forge-view read routes, so the enrichment fan-out is charged too and
+	// an interactive reader cannot starve the poller (both ride the same PAT). Distinct
+	// from ForgeRateLimitMax, which caps INBOUND HTTP requests per user/route, not forge
+	// spend. <= 0 means unlimited (never shed) — though parseInt floors a non-positive
+	// override back to the default.
+	ForgeInteractiveRateMax int
 	// SlackDMRateLimitMax/Window bound how often one authenticated user may hit
 	// the two Slack-DM-triggering endpoints (PUT /me/slack/override, POST
 	// /me/slack/test-dm). A dedicated, tighter budget than the forge one (PRD #25
@@ -754,6 +763,7 @@ func Load() (Config, error) {
 	cfg.SettingsCacheTTL = parseDuration("SETTINGS_CACHE_TTL", 5*time.Second)
 	cfg.ForgeRateLimitMax = parseInt("FORGE_RATE_LIMIT_MAX", 30)
 	cfg.ForgeRateLimitWindow = parseDuration("FORGE_RATE_LIMIT_WINDOW", time.Minute)
+	cfg.ForgeInteractiveRateMax = parseInt("FORGE_INTERACTIVE_RATE_MAX", 120)
 	// Deliberately tighter than the forge budget: these two routes DM an arbitrary
 	// member id, so a low per-user burst cap plus the per-target cooldown is the
 	// abuse control.

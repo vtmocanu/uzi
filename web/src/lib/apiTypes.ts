@@ -792,6 +792,11 @@ export interface AppSettings {
   health_queued_seconds: string;
   health_approval_seconds: string;
   health_nudge_cooldown_seconds: string;
+  // Per-run wall-clock extension allowance (PRD #1189): the total extra time an owner may
+  // grant one run through Extend, integer seconds as a string. 0 turns extending off
+  // instance-wide. Its bounds differ from the health-seconds keys ({0} ∪ [3600, 604800]),
+  // so it carries its OWN client validator in HealthSettingsCard, not validateHealthSeconds.
+  run_extension_cap_seconds: string;
   // Docker-worker repo allowlist (PRD #89 M-allow): a comma-separated list of repo
   // ids (UUIDs). A docker-capable worker may only claim runs for repos on this list;
   // empty is fail-closed (a docker worker then claims no repo-bearing run). Non-docker
@@ -2102,6 +2107,29 @@ export interface Run {
   milestones_candidate?: Milestone[] | null;
   budget_max_iterations?: number | null;
   budget_wall_seconds?: number | null;
+  /** PRD #1189: the run's wall-clock EXTENSION contract, all four OPTIONAL for api/web
+   *  rollout skew (an older api pod omits them) — and that fallback is load-bearing, not
+   *  cosmetic: an absent `budget_extension_cap_seconds` reads as "unknown", so the header
+   *  falls back to plain elapsed and the Extend button does NOT render, whereas a real `0`
+   *  means extending is turned off. Never conflate the two.
+   *
+   *  `budget_extension_seconds` is the owner-granted extension added ON TOP of the frozen
+   *  budget (0 when never extended). `budget_extension_cap_seconds` is the effective admin
+   *  cap (run_extension_cap_seconds; 0 = disabled), served here so the Extend chooser needs
+   *  no separate admin-settings read.
+   *
+   *  `budget_total_seconds` is COALESCE(budget_wall_seconds, RUN_TIMEOUT) + extension, so a
+   *  client never has to know RUN_TIMEOUT; null for a kind/state with no wall deadline (not
+   *  running, chat/judge, interactive, or no started_at) — the SAME predicate deadline_at
+   *  uses, so the total and the deadline can never disagree. `budget_used_seconds` is the
+   *  ACTIVE time so far (now − started_at − paused, clamped ≥0), the paused-aware "used" the
+   *  header measures against the budget — NOT raw wall elapsed; null when the run never
+   *  started. Age it client-side for a RUNNING run against deadline_at (used = total − time
+   *  left) so it agrees with the same-header deadline. */
+  budget_extension_seconds?: number;
+  budget_extension_cap_seconds?: number;
+  budget_total_seconds?: number | null;
+  budget_used_seconds?: number | null;
   claimed_at: string | null;
   started_at: string | null;
   finished_at: string | null;
@@ -2989,7 +3017,12 @@ export type RunInputKind =
    *  NOT a kind here — resume is the widened POST /runs/{id}/resume-now endpoint (D14),
    *  so there is exactly one resume mechanism. */
   | "pause"
-  | "pause_cancel";
+  | "pause_cancel"
+  /** PRD #1189: an owner's wall-clock extension (`extend`, body = whole seconds), POSTed to
+   *  /runs/{id}/inputs like `scope`. Server-only (drained by the sweep/health arm and the
+   *  worker's served wall, never routed to the worker's steering channel), owner-gated, and
+   *  refused with 409 on a kind/state that never times out. */
+  | "extend";
 
 // SteerInput is one steer-queue entry (PRD #95, extended by PRD #634), from
 // GET /api/runs/{id}/inputs. `kind` is "follow_up" or "scope" (an operator
@@ -3168,4 +3201,128 @@ export interface RunSocketLike {
   onclose: (() => void) | null;
   onerror: (() => void) | null;
   close(): void;
+}
+
+// ── Forge views (PRD #1255): open pulls + CI runs, read-through the api ──────────
+// Every string field here is FORGE-AUTHORED UNTRUSTED text (titles, branch/check/job
+// names, logins, descriptions, URLs) — sanitize before rendering. Times are RFC3339
+// strings. checks/reviews/jobs/steps are never null on the wire (the api normalizes an
+// empty forge result to []), which is why the contract test exempts them from the
+// zero-fixture null check even though json.Marshal of the zero Go struct emits null.
+
+// Pull is one open PR/MR on the `pulls` list. conflicts is a tri-state (null = the
+// forge has not computed mergeability yet). run_id is the newest uzi run that opened
+// this PR (the `↳ run` link), null when none.
+export interface Pull {
+  iid: number;
+  title: string;
+  author: string;
+  source_branch: string;
+  target_branch: string;
+  head_sha: string;
+  draft: boolean;
+  conflicts: boolean | null;
+  review_decision: string;
+  web_url: string;
+  additions: number;
+  deletions: number;
+  commits: number;
+  created_at: string;
+  updated_at: string;
+  run_id: string | null;
+}
+
+// Check is one status/check for a PR's head sha. status is the run phase
+// (queued/in_progress/completed); conclusion is meaningful once completed and "" while
+// running. source is the reporting app slug or "status" for a commit-status surface.
+export interface Check {
+  name: string;
+  status: string;
+  conclusion: string;
+  description: string;
+  web_url: string;
+  started_at: string;
+  completed_at: string;
+  source: string;
+}
+
+// PullReview is one per-reviewer review. state is the RAW forge review state
+// (approved/changes_requested/commented/… — forge-specific vocabulary, verbatim).
+export interface PullReview {
+  author: string;
+  state: string;
+  submitted_at: string;
+}
+
+// MergeState is the PR's merge readiness. conflicts is the tri-state (null = unknown).
+// mergeable_state is the raw coarse forge state (may be ""). blocked_reason is derived
+// by the api (conflicts / changes requested / checks failing / waiting on checks / "").
+export interface MergeState {
+  conflicts: boolean | null;
+  mergeable_state: string;
+  blocked_reason: string;
+  required_checks_passed: boolean;
+}
+
+// PullDetail is the PR drill-in: the Pull scalars plus the head sha's checks, the
+// per-reviewer reviews, and the derived merge state.
+export interface PullDetail extends Pull {
+  checks: Check[];
+  reviews: PullReview[];
+  merge: MergeState;
+}
+
+// CIRun is one CI run on the `ci` list (a GitHub Actions run, a GitLab pipeline, or a
+// Forgejo Actions run). status is the run phase and conclusion the terminal outcome
+// where the forge splits them (GitHub); GitLab/Forgejo fold everything into status and
+// leave conclusion "". jobs_done/jobs_total are best-effort (0 unless filled for a
+// running row).
+export interface CIRun {
+  id: number;
+  name: string;
+  number: number;
+  event: string;
+  branch: string;
+  sha: string;
+  status: string;
+  conclusion: string;
+  title: string;
+  actor: string;
+  web_url: string;
+  created_at: string;
+  updated_at: string;
+  started_at: string;
+  jobs_done: number;
+  jobs_total: number;
+}
+
+// CIStep is one step of a CI job (GitHub Actions only; GitLab/Forgejo jobs have no
+// steps). number is the 1-based step index.
+export interface CIStep {
+  name: string;
+  status: string;
+  conclusion: string;
+  number: number;
+  started_at: string;
+  completed_at: string;
+}
+
+// CIJob is one job of a CI run with its steps (steps is [] on GitLab/Forgejo).
+export interface CIJob {
+  id: number;
+  name: string;
+  status: string;
+  conclusion: string;
+  web_url: string;
+  started_at: string;
+  finished_at: string;
+  steps: CIStep[];
+}
+
+// CIRunDetail is the CI-run drill-in: the CIRun scalars plus the run's jobs. unsupported
+// is a non-empty sentence only when the forge version lacks the Actions endpoint (jobs
+// is then empty and the sentence is shown instead of an error).
+export interface CIRunDetail extends CIRun {
+  jobs: CIJob[];
+  unsupported: string;
 }

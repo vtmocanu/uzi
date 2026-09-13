@@ -160,12 +160,20 @@ RETURNING *;
 -- no other way to reach it through this query. It is a nullable TEXT column (00185), NULL/empty
 -- for a run that never published a checkpoint, which the Go side omits (the arm's "omit when
 -- absent" convention).
+--
+-- started_at / budget_wall_seconds / budget_paused_seconds / interactive / budget_extension_seconds
+-- (PRD #1189) are the exact inputs RunDeadline needs so the near-timeout DM can name the run's
+-- deadline and time-left; checkpoint_tip_at (PRD #1189/#1190) is the TIMESTAMP the tip was last
+-- published so the DM can say how old the last checkpoint is (checkpoint_tip above is the SHA
+-- text, which cannot answer "how long ago"). All ride the same one-row read.
 SELECT r.id, r.user_id, r.status, r.issue_iid, r.issue_title,
        r.mr_iid, r.mr_web_url, r.branch, r.failure_reason, r.stop_kind, r.kind,
        r.health, r.plan_md,
        r.rate_limit_type, r.retry_not_before, r.limit_wait_count, r.status_since,
        r.milestones_frozen, r.milestones_completed, r.milestones_in_progress,
        r.checkpoint_tip,
+       r.started_at, r.budget_wall_seconds, r.budget_paused_seconds, r.interactive,
+       r.budget_extension_seconds, r.checkpoint_tip_at,
        rp.path_with_namespace, rp.web_url, c.forge_type,
        COALESCE(
            (SELECT array_agg(elem->>'name' ORDER BY ord)

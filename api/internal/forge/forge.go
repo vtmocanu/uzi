@@ -53,6 +53,51 @@ var ErrForgeVersionUnsupported = errors.New("forge: server version is older than
 // no secret material.
 var ErrResolveUnsupported = errors.New("forge: resolve is not supported on this forge")
 
+// ErrMergeRequestNotFound is returned by GetMergeRequestSummary when the forge 404s
+// the requested iid — the PR does not exist, or raced closed-and-purged between a
+// ListMergeRequestRefs row and the per-iid read (PRD #1255 M2b). It is a distinct
+// sentinel (not a redacted generic error) so a caller can errors.Is it: GetPull maps
+// it to 404, and ListPulls SKIPS the raced-away row rather than failing the whole
+// list. Each driver detects the forge 404 BEFORE wrapErr and returns this sentinel
+// directly — the redactor severs the Unwrap chain (see redactor.error), so a wrapped
+// sentinel would not survive errors.Is; the sentinel carries no token material, so
+// returning it unredacted is safe.
+var ErrMergeRequestNotFound = errors.New("forge: merge request not found")
+
+// RateLimitError is the forge-neutral rate-limit error (PRD #1255 D4). The GitHub
+// driver wraps GitHub's rate-limit shapes into it so a caller can errors.As it and
+// map it to HTTP 429 + Retry-After. Only the GitHub driver produces it today: GitHub
+// carries the 5 000/h primary budget the interactive reads share with the poller
+// (D4), so it is the driver whose limit must reach the caller. GitLab and Forgejo
+// return a plain redacted error instead — their limits are per-instance, the SDK/
+// transport handles a 429 differently, and D4's per-connection interactive budget in
+// the handler guards all three forges BEFORE the call regardless. Reset is the wall
+// time the primary budget refills (GitHub's Rate.Reset); Retry is a wait duration
+// where the forge supplies one directly (GitHub's AbuseRateLimitError.RetryAfter).
+// Err is the already-REDACTED underlying error — RateLimitError carries no
+// unredacted material, and Unwrap exposes only that redacted error, so errors.As
+// through this type can never surface a token.
+type RateLimitError struct {
+	// Reset is when the primary rate-limit window refills; zero when unknown.
+	Reset time.Time
+	// Retry is an explicit wait hint from the forge; zero when none was supplied.
+	Retry time.Duration
+	// Err is the redacted underlying error (its message is authoritative).
+	Err error
+}
+
+// Error returns the redacted underlying message, or a generic fallback.
+func (e *RateLimitError) Error() string {
+	if e.Err != nil {
+		return e.Err.Error()
+	}
+	return "forge: rate limited by the forge"
+}
+
+// Unwrap exposes the redacted underlying error (never the raw forge error, whose
+// message could carry the token).
+func (e *RateLimitError) Unwrap() error { return e.Err }
+
 // Type identifies a forge driver. It maps 1:1 to the forge_connections.forge_type
 // column, which is CHECK-constrained to the same set.
 type Type string
@@ -381,12 +426,185 @@ type Pipeline struct {
 // Job is one job of a pipeline (PRD #6). The CI-fix path snapshots a failed
 // pipeline's jobs (name/stage/status/url) plus each one's log tail so the run
 // stays self-contained. Status is the raw GitLab job status.
+//
+// Steps and StartedAt/FinishedAt were added for the forge view (PRD #1255): a
+// GitHub Actions job exposes per-step detail (WorkflowJob.Steps) and both
+// timestamps; GitLab/Forgejo jobs carry no steps (Steps stays nil) but do carry
+// timing. A driver fills what its SDK exposes and leaves the rest zero.
 type Job struct {
 	ID     int64
 	Name   string
 	Stage  string
 	Status string
 	WebURL string
+	// Steps are the job's ordered steps (GitHub Actions only). Nil on GitLab and
+	// Forgejo, whose job APIs expose no step breakdown.
+	Steps []Step
+	// StartedAt / FinishedAt bound the job's execution; zero when the SDK omits
+	// them (a not-yet-started or not-yet-finished job), which stores as NULL.
+	StartedAt  time.Time
+	FinishedAt time.Time
+}
+
+// Step is one step of a job (PRD #1255). Only GitHub Actions exposes steps
+// (WorkflowJob.Steps → TaskStep); the neutral type carries the raw Status and
+// Conclusion verbatim so pipelinestatus.Tone classifies them exactly as the job
+// and pipeline statuses. Number is the 1-based step index.
+type Step struct {
+	Name        string
+	Status      string
+	Conclusion  string
+	Number      int
+	StartedAt   time.Time
+	CompletedAt time.Time
+}
+
+// ReviewDecision is the forge-neutral, closed review-decision enum for an open
+// merge request (PRD #1255 D6). GitHub has no REST reviewDecision, GitLab has no
+// review-decision concept at all, and Forgejo has neither — so every driver
+// DERIVES this value (foldReviewDecision for GitHub/Forgejo, a free-tier
+// approximation for GitLab), never trusts a single field. The four values are the
+// only ones a driver may produce; an unrecognized state folds to ReviewNone.
+type ReviewDecision string
+
+const (
+	// ReviewChangesRequested means a reviewer's latest decision asks for changes.
+	// On GitLab it ALSO covers an unresolved blocking discussion (the closest
+	// free-tier signal; see D6), so an MR with one open thread bands as NEEDS YOU
+	// by design, not by bug.
+	ReviewChangesRequested ReviewDecision = "changes_requested"
+	// ReviewApproved means at least one reviewer approved and none of the latest
+	// per-reviewer decisions requests changes.
+	ReviewApproved ReviewDecision = "approved"
+	// ReviewRequired means a review is requested but none has landed a decision.
+	ReviewRequired ReviewDecision = "review_required"
+	// ReviewNone means no review is requested and none has landed a decision.
+	ReviewNone ReviewDecision = "none"
+)
+
+// Review is one per-reviewer review on an open merge/pull request as the forge-view
+// DETAIL route renders it (PRD #1255 D6): the reviewer's login, the review's RAW
+// forge state (GitHub: APPROVED/CHANGES_REQUESTED/COMMENTED/DISMISSED/PENDING;
+// Forgejo: APPROVED/REQUEST_CHANGES/COMMENT/…), and when it was submitted. It is the
+// same review stream the drivers fold into ReviewDecision, returned verbatim so the
+// detail view can list each reviewer's latest state; the fold (foldReviewDecision) is
+// the classification, this is the display list. GitLab has no per-reviewer review
+// stream (approvals are a separate Premium concept), so its driver returns none.
+// Author and State are UNTRUSTED forge text.
+type Review struct {
+	Author      string
+	State       string
+	SubmittedAt time.Time
+}
+
+// MergeRequestSummary is one merge/pull request's full neutral summary as
+// GetMergeRequestSummary returns it per iid (PRD #1255 D5/M2b): the fields the pulls
+// screen bands, sorts and renders. Conflicts is a pointer because "unknown" is a
+// real third state — GitHub omits mergeability on the list and computes it lazily,
+// so a driver reports nil rather than guessing false. Every string field is
+// forge-authored UNTRUSTED text (same class as Issue.Title / MRComment.Body).
+type MergeRequestSummary struct {
+	IID            int64
+	Title          string
+	Author         string
+	SourceBranch   string
+	TargetBranch   string
+	HeadSHA        string
+	Draft          bool
+	Conflicts      *bool
+	ReviewDecision ReviewDecision
+	// State is one of the MRState* constants (opened/closed/merged/locked),
+	// populated by GetMergeRequestSummary so GetPull can 404 a non-open PR. It is
+	// deliberately NOT carried on the wire DTOs — the forge view is open-only.
+	State     string
+	WebURL    string
+	Additions int
+	Deletions int
+	Commits   int
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+// MergeRequestRef is the cheap list-row identity ListMergeRequestRefs returns for
+// each open merge/pull request (PRD #1255 M2b): just what the forge yields in ONE
+// list call, enough for the caller to address each PR by iid and enrich it with a
+// per-iid GetMergeRequestSummary. Splitting the old bundled list into refs + per-iid
+// summaries is what lets the memo (M2b part 2) make each PR's enrichment individually
+// addressable, and what lets GetPull find ANY open PR by iid rather than scanning the
+// most-recently-updated page. IID and HeadSHA are forge-authored identifiers,
+// UpdatedAt the activity timestamp the list is ordered by.
+type MergeRequestRef struct {
+	IID       int64
+	HeadSHA   string
+	UpdatedAt time.Time
+}
+
+// Check is one status/check for a commit sha (PRD #1255 D5), merging the two
+// GitHub surfaces (check-runs and commit statuses) and their GitLab/Forgejo
+// analogues into one neutral shape, deduplicated by Name so a bot reporting
+// through either surface appears once. Status is the run phase — one of
+// "queued", "in_progress" or "completed" — and Conclusion, meaningful only once
+// completed, is one of "success", "failure", "neutral", "cancelled", "skipped",
+// "timed_out", "action_required" or "" (empty while still running). A consumer
+// collapses the pair the same way the driver collapses a job status (Conclusion
+// once completed, else Status) and classifies it with pipelinestatus.Tone. Source
+// is the reporting app's slug (a check-run's App.Slug) or the literal "status" for
+// a commit-status surface. Name and Description are UNTRUSTED forge text.
+type Check struct {
+	Name        string
+	Status      string
+	Conclusion  string
+	Description string
+	WebURL      string
+	StartedAt   time.Time
+	CompletedAt time.Time
+	Source      string
+}
+
+// WorkflowRun is one CI run for the forge view's `ci` screen (PRD #1255 D5): a
+// GitHub Actions workflow run, a GitLab pipeline, or a Forgejo Actions run. Status
+// carries the raw run phase and Conclusion the terminal outcome where the forge
+// splits them (GitHub); GitLab/Forgejo fold everything into Status and leave
+// Conclusion empty, so a consumer collapses the pair exactly as for Check.
+// JobsDone/JobsTotal are best-effort and filled only for in-flight rows by the
+// route layer (no forge's runs list includes jobs), so a driver leaves them zero.
+// Name, Title, Actor, Branch are UNTRUSTED forge text.
+type WorkflowRun struct {
+	ID         int64
+	Name       string
+	Number     int64
+	Event      string
+	Branch     string
+	SHA        string
+	Status     string
+	Conclusion string
+	Title      string
+	Actor      string
+	WebURL     string
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
+	StartedAt  time.Time
+	JobsDone   int
+	JobsTotal  int
+}
+
+// ListMergeRequestsOptions filters ListMergeRequestRefs. State's zero value means
+// "opened" (the only state the pulls screen shows); Limit == 0 means the driver's
+// default page (no explicit cap), a positive value stops once that many rows are
+// collected.
+type ListMergeRequestsOptions struct {
+	State string
+	Limit int
+}
+
+// ListWorkflowRunsOptions filters ListWorkflowRuns. Limit == 0 means the driver's
+// default page; Branch/Event/Status are optional server-side filters passed
+// through to the forge (an unset field is not filtered on).
+type ListWorkflowRunsOptions struct {
+	Limit  int
+	Branch string
+	Event  string
+	Status string
 }
 
 // IssueState is the neutral issue-state vocabulary, matching the values the
@@ -585,6 +803,51 @@ type Forge interface {
 	// the returned tail is NOT itself a secret-safe log scrubber for arbitrary
 	// third-party tokens — see the snapshot scrubber in the ci-fix handler.
 	JobLogTail(ctx context.Context, projectID, jobID int64, maxBytes int) (string, error)
+	// ListMergeRequestRefs returns the project's open merge requests as cheap
+	// list-row refs (PRD #1255 M2b) in ONE list call, newest activity first,
+	// paginated internally — just IID/HeadSHA/UpdatedAt per row, with NO per-PR
+	// enrichment (that is GetMergeRequestSummary's job). opts.State defaults to
+	// "opened" (the only state the pulls screen shows); opts.Limit optionally caps
+	// the rows. Pagination is bounded by the driver's caps; errors are PAT-redacted,
+	// and on GitHub a rate-limit surfaces as *RateLimitError (GitLab/Forgejo return a
+	// plain error; see RateLimitError).
+	ListMergeRequestRefs(ctx context.Context, projectID int64, opts ListMergeRequestsOptions) ([]MergeRequestRef, error)
+	// GetMergeRequestSummary returns ONE merge/pull request's full neutral summary by
+	// iid (PRD #1255 M2b): IID, Title, Author, branches, HeadSHA, Draft, the Conflicts
+	// tri-state, ReviewDecision, State, WebURL and (where the forge exposes them)
+	// Additions/Deletions/Commits and timestamps. Each driver derives ReviewDecision
+	// (no forge exposes it on the row) and reads whatever per-MR detail the summary
+	// needs (GitHub: PullRequests.Get + ListReviews; GitLab: GetMergeRequest +
+	// approvals; Forgejo: GetPullRequest + the raw reviews fold). Returns
+	// ErrMergeRequestNotFound (errors.Is-matchable) when the forge 404s the iid. Every
+	// string field is untrusted forge text; errors are PAT-redacted, and on GitHub a
+	// rate-limit surfaces as *RateLimitError (GitLab/Forgejo return a plain error; see
+	// RateLimitError).
+	GetMergeRequestSummary(ctx context.Context, projectID, iid int64) (MergeRequestSummary, error)
+	// ListChecks returns every status/check for a commit sha (PRD #1255 D5), merging
+	// the forge's check and commit-status surfaces and DEDUPLICATING by Name so a bot
+	// reporting through either appears once. GitHub: ListCheckRunsForRef +
+	// GetCombinedStatus. GitLab: the sha's newest pipeline's jobs + GetCommitStatuses.
+	// Forgejo: the Actions jobs of the runs on that sha + ListStatuses. Paginated
+	// internally; errors are PAT-redacted.
+	ListChecks(ctx context.Context, projectID int64, sha string) ([]Check, error)
+	// ListWorkflowRuns returns the project's CI runs newest-first for the `ci` screen
+	// (PRD #1255 D5): GitHub workflow runs, GitLab pipelines, or Forgejo Actions runs.
+	// One page (opts.Limit caps it, bounded by the driver's max page size);
+	// Branch/Event/Status are optional server-side filters. Where the forge version
+	// lacks the endpoint the driver returns an error wrapping ErrForgeVersionUnsupported
+	// (the honest degrade path). Errors are PAT-redacted; on GitHub a rate-limit
+	// surfaces as *RateLimitError (GitLab/Forgejo return a plain error; see RateLimitError).
+	ListWorkflowRuns(ctx context.Context, projectID int64, opts ListWorkflowRunsOptions) ([]WorkflowRun, error)
+	// ListMergeRequestReviews returns an open MR's per-reviewer reviews for the
+	// forge-view detail route (PRD #1255 D6), oldest-first — the same review stream the
+	// driver folds into ReviewDecision, returned verbatim (State is the raw forge value)
+	// so the PR view can render each reviewer's latest state. GitHub reads
+	// PullRequests.ListReviews; Forgejo reads /pulls/{iid}/reviews; GitLab returns an
+	// empty slice (no per-reviewer review stream on the free tier — its decision is the
+	// BlockingDiscussionsResolved / approvals approximation, not a review list). Every
+	// string field is untrusted forge text; errors are PAT-redacted.
+	ListMergeRequestReviews(ctx context.Context, projectID, mrIID int64) ([]Review, error)
 	// ProjectCIConfigPath returns the project's configured CI config path (GitLab
 	// ci_config_path); empty string means the driver's default (.gitlab-ci.yml). It
 	// carries no secret material — a project's ci_config_path is a repo-relative

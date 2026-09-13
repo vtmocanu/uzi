@@ -171,7 +171,7 @@ type latestRunDTO struct {
 // the email (PRD #33 Decision 5): a shared board must not leak another user's email
 // on a card, and the web already renders a no-owner badge for empty. The query no
 // longer even selects the email, so there is nothing to fall back to here.
-func mapLatestRun(runID, ownerID uuid.UUID, status string, kind string, iterationCount int32, hasPlanMd bool, mrIID pgtype.Int8, mrWebURL, mrState, failureReason, stopKind, stopReason pgtype.Text, health string, healthReason pgtype.Text, healthSince pgtype.Timestamptz, startedAt pgtype.Timestamptz, budgetWallSeconds pgtype.Int4, budgetPausedSeconds int32, interactive bool, ownerName, workerName pgtype.Text, runCount int64, createdAt, updatedAt pgtype.Timestamptz, viewerID uuid.UUID, globalTimeout time.Duration) *latestRunDTO {
+func mapLatestRun(runID, ownerID uuid.UUID, status string, kind string, iterationCount int32, hasPlanMd bool, mrIID pgtype.Int8, mrWebURL, mrState, failureReason, stopKind, stopReason pgtype.Text, health string, healthReason pgtype.Text, healthSince pgtype.Timestamptz, startedAt pgtype.Timestamptz, budgetWallSeconds pgtype.Int4, budgetPausedSeconds, budgetExtensionSeconds int32, interactive bool, ownerName, workerName pgtype.Text, runCount int64, createdAt, updatedAt pgtype.Timestamptz, viewerID uuid.UUID, globalTimeout time.Duration) *latestRunDTO {
 	dto := &latestRunDTO{
 		ID:          runID.String(),
 		Status:      status,
@@ -182,7 +182,7 @@ func mapLatestRun(runID, ownerID uuid.UUID, status string, kind string, iteratio
 		HealthSince: timePtr(healthSince.Valid, healthSince.Time),
 		// PRD #1170: the wall-clock deadline the near-timeout badge counts down to; nil
 		// for a run with no wall deadline (not running, chat/judge/interactive, no start).
-		DeadlineAt: workersvc.RunDeadline(startedAt, budgetWallSeconds, budgetPausedSeconds, kind, interactive, status, globalTimeout),
+		DeadlineAt: workersvc.RunDeadline(startedAt, budgetWallSeconds, budgetPausedSeconds, kind, interactive, status, globalTimeout, budgetExtensionSeconds),
 		IsPlanning: isPlanningPhase(kind, status, iterationCount, hasPlanMd),
 		WorkerName: textPtrValue(workerName.Valid, workerName.String),
 		IsMine:     ownerID == viewerID,
@@ -581,7 +581,7 @@ func assembleCards(issues []store.Issue, runRows []store.ListLatestRunsForRepoRo
 	for _, rr := range runRows {
 		dto := mapLatestRun(rr.ID, rr.UserID, rr.Status, rr.Kind, rr.IterationCount, rr.HasPlanMd.Bool, rr.MrIid, rr.MrWebUrl,
 			rr.MrState, rr.FailureReason, rr.StopKind, rr.StopReason, rr.Health, rr.HealthReason, rr.HealthSince,
-			rr.StartedAt, rr.BudgetWallSeconds, rr.BudgetPausedSeconds, rr.Interactive,
+			rr.StartedAt, rr.BudgetWallSeconds, rr.BudgetPausedSeconds, rr.BudgetExtensionSeconds, rr.Interactive,
 			rr.OwnerName, rr.WorkerName, rr.RunCount, rr.CreatedAt, rr.UpdatedAt, viewerID, globalTimeout)
 		dto.IsRevising = revising[rr.ID] // nil map ⇒ false (issue #750)
 		latestByIID[rr.IssueIid.Int64] = dto
@@ -983,7 +983,7 @@ func (h *Handler) MoveIssue(w http.ResponseWriter, r *http.Request) {
 	if lr, err := h.q.GetLatestRunForIssue(r.Context(), store.GetLatestRunForIssueParams{RepoID: repo.ID, IssueIid: pgtype.Int8{Int64: iid, Valid: true}}); err == nil {
 		card.LatestRun = mapLatestRun(lr.ID, lr.UserID, lr.Status, lr.Kind, lr.IterationCount, lr.HasPlanMd.Bool, lr.MrIid, lr.MrWebUrl,
 			lr.MrState, lr.FailureReason, lr.StopKind, lr.StopReason, lr.Health, lr.HealthReason, lr.HealthSince,
-			lr.StartedAt, lr.BudgetWallSeconds, lr.BudgetPausedSeconds, lr.Interactive,
+			lr.StartedAt, lr.BudgetWallSeconds, lr.BudgetPausedSeconds, lr.BudgetExtensionSeconds, lr.Interactive,
 			lr.OwnerName, lr.WorkerName, lr.RunCount, lr.CreatedAt, lr.UpdatedAt, repo.UserID, h.cfg.RunTimeout)
 		h.setLatestRunRevising(r.Context(), card.LatestRun, lr.ID) // issue #750
 	} else if !errors.Is(err, pgx.ErrNoRows) {
@@ -1088,7 +1088,7 @@ func (h *Handler) PromoteIssue(w http.ResponseWriter, r *http.Request) {
 	if lr, err := h.q.GetLatestRunForIssue(r.Context(), store.GetLatestRunForIssueParams{RepoID: repo.ID, IssueIid: pgtype.Int8{Int64: iid, Valid: true}}); err == nil {
 		card.LatestRun = mapLatestRun(lr.ID, lr.UserID, lr.Status, lr.Kind, lr.IterationCount, lr.HasPlanMd.Bool, lr.MrIid, lr.MrWebUrl,
 			lr.MrState, lr.FailureReason, lr.StopKind, lr.StopReason, lr.Health, lr.HealthReason, lr.HealthSince,
-			lr.StartedAt, lr.BudgetWallSeconds, lr.BudgetPausedSeconds, lr.Interactive,
+			lr.StartedAt, lr.BudgetWallSeconds, lr.BudgetPausedSeconds, lr.BudgetExtensionSeconds, lr.Interactive,
 			lr.OwnerName, lr.WorkerName, lr.RunCount, lr.CreatedAt, lr.UpdatedAt, repo.UserID, h.cfg.RunTimeout)
 		h.setLatestRunRevising(r.Context(), card.LatestRun, lr.ID) // issue #750
 	} else if !errors.Is(err, pgx.ErrNoRows) {

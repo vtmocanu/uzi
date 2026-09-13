@@ -22,7 +22,7 @@ import (
 func TestRunToDTOTriggerSource(t *testing.T) {
 	for _, want := range []string{"schedule", "ci_fix", "judge_rerun"} {
 		t.Run(want, func(t *testing.T) {
-			dto := runToDTO(store.Run{ID: uuid.New(), TriggerSource: want}, "normal", 0)
+			dto := runToDTO(store.Run{ID: uuid.New(), TriggerSource: want}, "normal", 0, 0, dtoTestNow)
 			if dto.TriggerSource != want {
 				t.Fatalf("dto.TriggerSource = %q, want %q", dto.TriggerSource, want)
 			}

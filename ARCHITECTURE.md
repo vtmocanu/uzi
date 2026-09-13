@@ -80,7 +80,7 @@ uzi's second surface connects each user to a git forge (**GitLab, Forgejo, and G
 
 The Forgejo driver (`code.gitea.io/sdk/gitea`, Forgejo ≥16.0.0 — [ADR-65](adr/0065-forgejo-driver.md) for why both) proved the abstraction was more than Go-deep by finding the three places it was **not**: (1) the worker held a second, un-abstracted GitLab client, now a minimal TS forge seam (`agent/src/forge.ts`, `GitLabClient`/`ForgejoClient`/`GitHubClient`); (2) the web reconstructed forge URLs by string surgery, now a per-card/run `forge_type` DTO field mapped only at `web/src/lib/forgeNoun.ts` (`forgeNoun`/`forgePlatform`, one Go twin in `slacksvc/notifier_state.go`, one CLI twin in `api/cmd/uzi/render.go`); (3) each forge stored its pipeline status verbatim, so `api/internal/pipelinestatus` is the one Go-side classifier that folds all three vocabularies — the domain twin of `web/src/lib/pipelineBadge.ts`, kept in sync by `TestMirrorsWebPipelineBadge`. Merge-permission is now modelled on all three forges (`BranchProtection.WriteRoleCanMerge`/`BotCanMerge`); the drivers **report** it, and **enforcement is implemented** — [PRD #66](prds/done/66-guardrail-enforcement.md) refuses a run whenever the bot could push or merge to the default branch, at repo-enable, at run creation, and at claim, live and fail-closed, with an admin-only per-repo override for the deliberate, audited exception.
 
-The GitHub driver (`github.com/google/go-github/v90`, github.com only, classic PAT — [ADR-238](adr/0238-github-driver.md) for the design) filled the same four per-forge seams: a `privcheck.requiredScopesFor(github)` scope rule (exactly `{repo}`, with a `workflow`-scoped token refused as over-privilege — a deliberate CI-integrity boundary), the Actions two-field (`status`/`conclusion`) status fold into `pipelinestatus`/`pipelineBadge`, the `forgeNoun`/`forgePlatform` "Pull Request"/"PR"/"#" vocabulary, and `agent/src/forge.ts`'s `GitHubClient` (whose one shared-base change was widening the worker's duplicate-PR detection to a **driver-declared** status set, since GitHub signals a duplicate PR with 422 rather than GitLab/Forgejo's 409). GitHub's branch-protection guardrail is materially weaker than Forgejo's: a write-role bot can read GitHub's newer *rulesets* but not classic branch protection, so on a classically-protected repo `BranchProtection` gains an additive `ProtectionUnverified` field rather than a fabricated safe/unsafe answer — see [ADR-238](adr/0238-github-driver.md) for the accepted limitation and the fail-closed requirement it places on PRD #66.
+The GitHub driver (`github.com/google/go-github/v91`, github.com only, classic PAT — [ADR-238](adr/0238-github-driver.md) for the design) filled the same four per-forge seams: a `privcheck.requiredScopesFor(github)` scope rule (exactly `{repo}`, with a `workflow`-scoped token refused as over-privilege — a deliberate CI-integrity boundary), the Actions two-field (`status`/`conclusion`) status fold into `pipelinestatus`/`pipelineBadge`, the `forgeNoun`/`forgePlatform` "Pull Request"/"PR"/"#" vocabulary, and `agent/src/forge.ts`'s `GitHubClient` (whose one shared-base change was widening the worker's duplicate-PR detection to a **driver-declared** status set, since GitHub signals a duplicate PR with 422 rather than GitLab/Forgejo's 409). GitHub's branch-protection guardrail is materially weaker than Forgejo's: a write-role bot can read GitHub's newer *rulesets* but not classic branch protection, so on a classically-protected repo `BranchProtection` gains an additive `ProtectionUnverified` field rather than a fabricated safe/unsafe answer — see [ADR-238](adr/0238-github-driver.md) for the accepted limitation and the fail-closed requirement it places on PRD #66.
 
 ### Issue comments as untrusted worker input (PRD #381)
 
@@ -730,8 +730,11 @@ chain in the diagram above, with no intervening `running`.
   heartbeat-staleness (bounded by `WORKER_AFFINITY_CEILING`). Independently, the
   forge-checkpoint `pushbroker.Publish` no longer fails when `main` advanced past
   the clone base (a server-side compare-and-swap on the fetched checkpoint tip),
-  publish outcomes now surface on the run feed, and every terminal transition
-  deletes the run's `refs/uzi-checkpoints/<branch>`. See
+  publish outcomes now surface on the run feed, and a worker-reported terminal
+  transition (`SetState`) or a server-side cancel/reject attempts tip-fenced
+  checkpoint cleanup on the run's `refs/uzi-checkpoints/<branch>`; a
+  sweeper-driven terminal transition (timeout, worker-lost-over-cap) does not:
+  it only broadcasts the status, leaving that ref in place. See
   [ADR-628](adr/0628-cross-worker-resume-durability.md)'s #1030 amendment.
   This same affinity leg is what lets a **paused** run's `resume` fall open
   to a different worker once the pinned one is stale or gone; see
@@ -901,13 +904,17 @@ chain in the diagram above, with no intervening `running`.
   tip's `.github/workflows/**` tree differs from the current default branch, even
   when the run's branch never touched a workflow file but only fell behind as main
   advanced mid-run. Just before the push, uzi fetches the default tip and, only
-  when the workflow trees differ, aligns the branch: a SHA-preserving merge first,
-  falling back to a rebase if still refused. An unresolvable conflict fails the run
-  typed (`fail_origin = finalize_base_align_conflict`) with the pre-align diff
-  preserved on the failed-run card via the same `preserved_patch` mechanism PRD
-  #377 built for a branch that *modifies* a workflow file. See
-  [ADR-456](adr/0456-rebase-before-finalize-push.md) for the mechanism and why
-  merge precedes rebase.
+  when the workflow trees differ, aligns the branch: when the branch provably
+  touched no workflow file, a fast-forward overlay of just the default's
+  `.github/workflows/` subtree onto the agent tip (issue #627, every original
+  commit SHA preserved); otherwise, or when that overlay does not clear the
+  rejection, a SHA-preserving merge, falling back to a rebase if still refused.
+  An unresolvable conflict fails the run typed (`fail_origin =
+  finalize_base_align_conflict`) with the pre-align diff preserved on the
+  failed-run card via the same `preserved_patch` mechanism PRD #377 built for a
+  branch that *modifies* a workflow file. See
+  [ADR-456](adr/0456-rebase-before-finalize-push.md) for the mechanism, its
+  2026-08-23 overlay amendment, and why merge precedes rebase.
 - **Milestone tracker reconciliation** (PRD #122/#265/#390) — a milestone-structured
   `issue` run shows a *reported-complete* tracker (`runs.milestones_completed`,
   monotone union, never "verified"), fed by mid-run `report_progress` and the lead's
