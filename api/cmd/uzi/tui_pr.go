@@ -247,6 +247,12 @@ func (m tuiModel) openLinkedRun(runID *string, from tuiView) (tea.Model, tea.Cmd
 	if runID == nil || *runID == "" {
 		return m, nil
 	}
+	// Close the prior run's live stream before reassigning m.detail: reached via detail→m (PR
+	// view)→u, m.detail still holds the run we drilled into (its stream live), so overwriting it
+	// without a Close would orphan that SSE connection for the session. Mirrors exitToBoard.
+	if m.detail.stream != nil {
+		m.detail.stream.Close()
+	}
 	m.view = viewDetail
 	m.detail = newDetailState(*runID)
 	m.detailGen++

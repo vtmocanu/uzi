@@ -636,9 +636,9 @@ func (m tuiModel) pullsSyncedScroll() int {
 func (m tuiModel) pullEyebrow(it boardItem) string {
 	name := pullBandNames[it.band]
 	if it.band == pullBandNeedsYou {
-		return " " + lipgloss.NewStyle().Foreground(m.pal.amber).Bold(true).Render(name) + m.pal.faint.Render(" · "+itoa(it.count))
+		return clampVisual(" "+lipgloss.NewStyle().Foreground(m.pal.amber).Bold(true).Render(name)+m.pal.faint.Render(" · "+itoa(it.count)), m.width)
 	}
-	return " " + m.pal.faint.Render(name+" · "+itoa(it.count))
+	return clampVisual(" "+m.pal.faint.Render(name+" · "+itoa(it.count)), m.width)
 }
 
 // pullRow renders one pull: the ▌ andon spine + state glyph, the #<iid> (an OSC-8 link to the
@@ -715,7 +715,11 @@ func (m tuiModel) pullRow(pr apitypes.PullDTO, sel bool, runLinkW int) string {
 	} else if sel {
 		row = padSeg(row, m.width, bg)
 	}
-	return row
+	// Final backstop, matching ciRow/renderPR/ciRunJobRow: a forge-authored source branch of
+	// double-width runes caps by RUNE count in padCell but not by visual columns, so an
+	// attacker-influenced branch name can overrun m.width and wrap the terminal, corrupting every
+	// row beneath. Clamp unconditionally rather than trust the per-cell rune budgets.
+	return clampVisual(row, m.width)
 }
 
 // pullGlyph is the row's spine glyph + colour, by priority: changes requested (✎), conflict

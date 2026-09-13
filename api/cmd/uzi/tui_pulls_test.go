@@ -516,3 +516,42 @@ func TestTUIPullsRepoScopeSelfHealsAfterTransientFailure(t *testing.T) {
 		t.Fatalf("the resolved repo did not kick off the pulls fetch (ListPulls=%d, want 1)", fake.ListPullsCalls)
 	}
 }
+
+// TestTUIPullsRowFitsNarrowWidth pins the row-level clampVisual backstop the pulls path was
+// missing. A forge PR author controls the source branch; a name of double-width runes caps by
+// RUNE count in padCell but not by VISUAL columns, so without the final clampVisual (which
+// ciRow/renderPR/ciRunJobRow all apply) the pulls row overruns m.width and the terminal wraps
+// it, corrupting every row beneath. This is the m4b width lesson the M4a pulls screen missed.
+// Fails before the fix (the row measured ~130 cols at width 120), passes after.
+func TestTUIPullsRowFitsNarrowWidth(t *testing.T) {
+	now := time.Now()
+	pulls := []apitypes.PullDTO{{
+		IID: 42, Title: strings.Repeat("t", 60), Author: "author",
+		SourceBranch:   strings.Repeat("測", 40), // 40 runes = 80 visual columns
+		TargetBranch:   "main",
+		ReviewDecision: "changes_requested",
+		WebURL:         "https://example.com/x/-/merge_requests/42",
+		RunID:          sp("aaaaaaaa-1111-2222-3333-444444444444"),
+		UpdatedAt:      now.Add(-time.Minute),
+	}}
+	fake := &uzicli.FakeClient{Repos: []apitypes.RepoDTO{oneRepo()}, PullsResult: pulls}
+	m := tuiTestModel(t, fake, "")
+	next, _ := m.Update(reposMsg{repos: fake.Repos})
+	m = next.(tuiModel)
+	m = press(t, m, keyViewPulls)
+	m.width, m.height = 120, 34
+	next, _ = m.Update(pullsMsg{reqID: m.pulls.waitID, pulls: pulls})
+	m = next.(tuiModel)
+
+	out := m.View().Content
+	for i, r := range strings.Split(out, "\n") {
+		if w := visualWidth(r); w > 120 {
+			t.Errorf("pulls line %d is %d visual columns at m.width=120 (overflows the edge, wraps the terminal): %q", i, w, r)
+		}
+	}
+	// Guard against a vacuous pass: the wide branch's sanitized runes must actually reach the
+	// frame, proving the row render path ran and the clamp is what kept it in bounds.
+	if !strings.Contains(out, "測") {
+		t.Fatalf("the pulls row did not draw the wide source branch; the test is vacuous\n%s", out)
+	}
+}

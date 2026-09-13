@@ -319,7 +319,7 @@ const (
 	ciRunElapsedW      = 7 // elapsedBetween → shortDuration (coarse, e.g. 3m / 3h4m)
 )
 
-// shortSHA is the first 7 runes of a forge-authored commit SHA for the `sha7` header cell. The SHA
+// shortSHACell is the first 7 runes of a forge-authored commit SHA for the `sha7` header cell. The SHA
 // is sliced through its sanitized (cellText) form so the count is over sanitized runes, and the
 // ≤7-rune result is still drawn through renderer.Plain by the caller (the D7 sink) — a SHA is hex so
 // no control rune survives the slice, but the Plain draw keeps the guard honest. Slicing first is
