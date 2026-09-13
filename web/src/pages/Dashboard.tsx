@@ -224,8 +224,16 @@ export function Dashboard() {
       ? `${working} at work · ${waiting.length} waiting to resume`
       : "agents at work";
   const recent = data?.runs.slice(0, 5) ?? [];
+  // Step 4 is a SETUP fact, not live health: a worker counts as brought online if
+  // it is online now OR has ever registered (last_heartbeat_at is stamped at
+  // register/heartbeat and never cleared by the offline sweep), so a fleet mid-roll
+  // (every worker offline + upgrading) does not reopen the step. Live health stays
+  // on the "Workers online N/M" tile.
+  const workerJoined = (data?.workers ?? []).some(
+    (w) => w.status === "online" || w.last_heartbeat_at != null,
+  );
   const steps = data
-    ? [data.hasToken, data.hasForge, data.reposEnabled > 0, data.workersOnline > 0]
+    ? [data.hasToken, data.hasForge, data.reposEnabled > 0, workerJoined]
     : [];
   const ready = steps.length > 0 && steps.every(Boolean);
 
@@ -323,7 +331,7 @@ export function Dashboard() {
               cta="Repos"
             />
             <Step
-              done={data.workersOnline > 0}
+              done={workerJoined}
               index={4}
               title="Bring a worker online"
               hint="Generate a join token and start the uzi-agent container with it."
