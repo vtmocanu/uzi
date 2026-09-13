@@ -18,6 +18,7 @@ import {
   MilestoneBadge,
   MilestoneChecklist,
   CompletionStatePanel,
+  CompletionDecisionPanel,
   RunHeading,
   RunCompletedLine,
   RunFailureReason,
@@ -87,6 +88,11 @@ vi.mock("../lib/api", async (importOriginal) => {
       resumeRun: vi.fn().mockResolvedValue({ run: null }),
       pauseRun: vi.fn().mockResolvedValue({ server_side: false }),
       cancelPause: vi.fn().mockResolvedValue({ server_side: false }),
+      // PRD #1227 M4: the owner completion decisions. Defaulted to resolve so a submit +
+      // refreshRun settles; the decision cases assert the call args or reject to surface a 409/400.
+      continueCompletionDecision: vi.fn().mockResolvedValue({ run: null }),
+      partialCompletionDecision: vi.fn().mockResolvedValue({ run: null }),
+      acceptCompletionDecision: vi.fn().mockResolvedValue({ run: null }),
       // PRD #1296 M5: the run page's Recovery archives section fetches its own summary.
       // Defaulted to a supported-but-empty aggregate so a full-page render settles and the
       // section renders nothing (no archive, no open hold) on these non-recovery fixtures.
@@ -4902,6 +4908,243 @@ describe("CompletionStatePanel — honest completion-interlock detail (PRD #1226
     // The default run() builder sets no completion fields — a non-interlocked run (or an
     // old api pod omitting them) must look exactly as today.
     const { container } = render(<CompletionStatePanel run={run({})} />);
+    expect(container.textContent).toBe("");
+  });
+});
+
+// PRD #1227 M4: the owner completion-decision surface. Rendered whole-page (useRunStream
+// mocked) so the controls are exercised where they live — the act() wiring (page banner +
+// busy), canSteer gating and refreshRun are all real. A realistic completion-blocked DTO
+// (completion_phase "blocked", frozen milestones, a fenced revision) backs every case.
+describe("RunView — owner completion decisions (PRD #1227 M4)", () => {
+  const BLOCKED: Partial<Run> = {
+    status: "paused",
+    completion_interlock: true,
+    completion_phase: "blocked",
+    completion_attempts: 2,
+    completion_revision: 3,
+    completion_unmet: ["m2"],
+    hold_reason: "completion_blocked",
+    hold_context: "unavailable(same_worker_only)",
+    milestones: [
+      { id: "m1", title: "Add the endpoint" },
+      { id: "m2", title: "Write the tests" },
+      { id: "m3", title: "Update the docs" },
+    ],
+    milestones_completed: ["m1"],
+  };
+
+  function renderPage(over: Partial<Run>, canSteer: boolean) {
+    const refreshRun = vi.fn();
+    const submit = vi.fn();
+    mockUseRunStream.mockReturnValue({
+      run: run(over),
+      messages: [],
+      connected: true,
+      error: "",
+      submit,
+      refreshRun,
+      inputs: [],
+      canSteer,
+    } as unknown as ReturnType<typeof useRunStream>);
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
+    const utils = render(
+      <MemoryRouter initialEntries={["/runs/r1"]}>
+        <RunView />
+      </MemoryRouter>,
+    );
+    return { ...utils, refreshRun, submit };
+  }
+
+  it("shows the owner decision controls (tabs + revision) on a completion-blocked run", async () => {
+    renderPage(BLOCKED, true);
+    await screen.findByText("Completion decision");
+    // The three decision modes + the current revision are all present for the owner.
+    expect(screen.getByRole("button", { name: "Continue" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Reduce scope" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Accept criteria" })).toBeTruthy();
+    expect(screen.getByText("revision 3")).toBeTruthy();
+    // Continue is the default mode, so its submit is reachable straight away.
+    expect(screen.getByRole("button", { name: "Continue run" })).toBeTruthy();
+  });
+
+  it("a NON-OWNER sees inert explanatory text and NO decision buttons", async () => {
+    renderPage(BLOCKED, false);
+    await screen.findByText("Completion decision");
+    expect(
+      screen.getByText(/only the run's owner can decide how to resolve a completion block/i),
+    ).toBeTruthy();
+    // None of the write affordances render for a non-owner (never a button that would 404).
+    expect(screen.queryByRole("button", { name: "Reduce scope" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Accept criteria" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Continue run" })).toBeNull();
+  });
+
+  it("continue submit posts api.continueCompletionDecision(id, guidance) then refreshRun", async () => {
+    const { refreshRun } = renderPage(BLOCKED, true);
+    await screen.findByText("Completion decision");
+    fireEvent.change(screen.getByLabelText(/guidance \(optional\)/i), {
+      target: { value: "try the alternative approach for m2" },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Continue run" }));
+    });
+    await waitFor(() =>
+      expect(mockApi.continueCompletionDecision).toHaveBeenCalledWith(
+        "r1",
+        "try the alternative approach for m2",
+      ),
+    );
+    await waitFor(() => expect(refreshRun).toHaveBeenCalled());
+  });
+
+  it("partial submit (after Review & confirm) posts the kept set + fenced revision", async () => {
+    const { refreshRun } = renderPage(BLOCKED, true);
+    await screen.findByText("Completion decision");
+    fireEvent.click(screen.getByRole("button", { name: "Reduce scope" }));
+    // Defer m3 (uncheck "keep in scope"); m1 + m2 stay in scope.
+    fireEvent.click(screen.getByRole("checkbox", { name: /keep update the docs in scope/i }));
+    fireEvent.change(screen.getByLabelText(/reason \(required\)/i), {
+      target: { value: "Docs are deprioritized for this release." },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Review & confirm" }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Confirm scope reduction" }));
+    });
+    await waitFor(() =>
+      expect(mockApi.partialCompletionDecision).toHaveBeenCalledWith(
+        "r1",
+        ["m1", "m2"],
+        "Docs are deprioritized for this release.",
+        3,
+      ),
+    );
+    await waitFor(() => expect(refreshRun).toHaveBeenCalled());
+  });
+
+  it("accept submit (after Review & confirm) posts the exact criterion ids + fenced revision", async () => {
+    const { refreshRun } = renderPage(BLOCKED, true);
+    await screen.findByText("Completion decision");
+    fireEvent.click(screen.getByRole("button", { name: "Accept criteria" }));
+    // Only in-scope, not-completed, not-accepted milestones offer a criterion — m1 is
+    // completed, so the candidates are m2 and m3. Accept m2's criterion only.
+    fireEvent.click(screen.getByRole("checkbox", { name: /accept write the tests/i }));
+    fireEvent.change(screen.getByLabelText(/reason \(required\)/i), {
+      target: { value: "Manual QA covers this criterion." },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Review & confirm" }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Confirm acceptance" }));
+    });
+    await waitFor(() =>
+      expect(mockApi.acceptCompletionDecision).toHaveBeenCalledWith(
+        "r1",
+        ["m2.c1"],
+        "Manual QA covers this criterion.",
+        3,
+      ),
+    );
+    await waitFor(() => expect(refreshRun).toHaveBeenCalled());
+  });
+
+  it("a completed milestone offers no accept criterion (m1 is completed)", async () => {
+    renderPage(BLOCKED, true);
+    await screen.findByText("Completion decision");
+    fireEvent.click(screen.getByRole("button", { name: "Accept criteria" }));
+    expect(screen.getByRole("checkbox", { name: /accept write the tests/i })).toBeTruthy();
+    expect(screen.getByRole("checkbox", { name: /accept update the docs/i })).toBeTruthy();
+    // m1 ("Add the endpoint") is completed, so its criterion is never offered.
+    expect(screen.queryByRole("checkbox", { name: /accept add the endpoint/i })).toBeNull();
+  });
+
+  it("a 409 revision conflict surfaces the server message inline (role=alert) and does not crash", async () => {
+    mockApi.partialCompletionDecision.mockRejectedValue(
+      new ApiError(409, "the contract revision has changed; re-read and re-decide"),
+    );
+    renderPage(BLOCKED, true);
+    await screen.findByText("Completion decision");
+    fireEvent.click(screen.getByRole("button", { name: "Reduce scope" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: /keep update the docs in scope/i }));
+    fireEvent.change(screen.getByLabelText(/reason \(required\)/i), {
+      target: { value: "Docs later." },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Review & confirm" }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Confirm scope reduction" }));
+    });
+    // The conflict message is legible at the form (and on the page banner) — never a crash.
+    expect(
+      (await screen.findAllByText(/the contract revision has changed/i)).length,
+    ).toBeGreaterThan(0);
+    expect(screen.getAllByRole("alert").length).toBeGreaterThan(0);
+    expect(screen.getByText("Completion decision")).toBeTruthy();
+  });
+
+  it("a 400 on the accept call (unknown criterion) is surfaced inline", async () => {
+    mockApi.acceptCompletionDecision.mockRejectedValue(
+      new ApiError(400, 'criterion "m9.c1" is not a known unmet criterion'),
+    );
+    renderPage(BLOCKED, true);
+    await screen.findByText("Completion decision");
+    fireEvent.click(screen.getByRole("button", { name: "Accept criteria" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: /accept write the tests/i }));
+    fireEvent.change(screen.getByLabelText(/reason \(required\)/i), {
+      target: { value: "Waiving this one." },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Review & confirm" }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Confirm acceptance" }));
+    });
+    expect(
+      (await screen.findAllByText(/is not a known unmet criterion/i)).length,
+    ).toBeGreaterThan(0);
+  });
+
+  it("renders the immutable deferred/accepted history, and shows an already-deferred milestone read-only in the partial control", async () => {
+    renderPage(
+      {
+        ...BLOCKED,
+        // m3 already deferred at rev 2; m2's criterion already accepted at rev 3.
+        completion_revision: 4,
+        completion_deferred: [{ milestone_id: "m3", reason: "Out of scope now", revision: 2 }],
+        completion_accepted: [
+          { id: "m2.c1", milestone_id: "m2", text: "Write the tests", reason: "Manual QA covers it", revision: 3 },
+        ],
+      },
+      true,
+    );
+    await screen.findByText("Completion decision");
+    // The read-only history lists both decisions with their revision + reason.
+    expect(screen.getByText(/deferred at rev 2/)).toBeTruthy();
+    expect(screen.getByText(/Out of scope now/)).toBeTruthy();
+    expect(screen.getByText(/accepted at rev 3/)).toBeTruthy();
+    expect(screen.getByText(/Manual QA covers it/)).toBeTruthy();
+
+    // In the partial control, m3 is no longer selectable (it is already deferred), and an
+    // accepted milestone (m2) is keep-locked so it can never be deferred.
+    fireEvent.click(screen.getByRole("button", { name: "Reduce scope" }));
+    expect(screen.queryByRole("checkbox", { name: /keep update the docs in scope/i })).toBeNull();
+    expect(screen.getByText(/Already deferred/)).toBeTruthy();
+    const acceptedKeep = screen.getByRole("checkbox", {
+      name: /keep write the tests in scope/i,
+    }) as HTMLInputElement;
+    expect(acceptedKeep.disabled).toBe(true);
+    expect(acceptedKeep.checked).toBe(true);
+  });
+
+  it("self-hides on a run that is not completion-blocked (direct component render)", () => {
+    const { container } = render(
+      <CompletionDecisionPanel
+        run={run({ completion_phase: "checking", completion_interlock: true })}
+        canSteer
+        busy={false}
+        act={async (fn) => {
+          await fn();
+          return true;
+        }}
+        refreshRun={vi.fn()}
+      />,
+    );
     expect(container.textContent).toBe("");
   });
 });

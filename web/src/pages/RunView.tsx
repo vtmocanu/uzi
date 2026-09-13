@@ -70,6 +70,7 @@ import { summaryCollapse } from "../lib/prefs";
 import { ExternalLinkIcon } from "../components/icons";
 import { PlanPanel, SeededPlanPanel } from "./runView/PlanPanel";
 import { JudgePanel } from "./runView/JudgePanel";
+import { CompletionDecisionPanel } from "./runView/CompletionDecisionPanel";
 
 // The Plan cluster moved to ./runView/PlanPanel; re-exported so external importers
 // and tests stay byte-identical.
@@ -78,6 +79,10 @@ export { PlanPanel, SeededPlanPanel, derivePlanRevision } from "./runView/PlanPa
 // The Judge cluster moved to ./runView/JudgePanel; re-exported so external importers
 // (Judge.tsx's TriageSummary) and tests stay byte-identical.
 export { JudgePanel, JUDGE_POLL_MAX_TRIES, TriageSummary } from "./runView/JudgePanel";
+
+// PRD #1227 M4: the owner completion-decision surface, an exported component re-exported here
+// (mirroring CompletionStatePanel's exported shape) so its tests can import it from ./RunView.
+export { CompletionDecisionPanel, milestoneCriterionId } from "./runView/CompletionDecisionPanel";
 
 // stageForMessages: latest-message → human stage label (a tool-slug → stage
 // map, adapted to uzi's message kinds).
@@ -2292,6 +2297,19 @@ export function RunView() {
           context. Renders nothing for a non-interlocked run (completion_phase "" and no
           hold), so a run that predates or opts out of the interlock looks as today. */}
       <CompletionStatePanel run={run} />
+
+      {/* PRD #1227 M4: the owner completion-decision controls — continue / reduce scope /
+          accept criteria, plus the immutable decision history. Self-hides unless the run is
+          completion-blocked (completion_phase === "blocked"). Gated on canSteer: a non-owner
+          sees inert text, never a button that would 404. Writes go through `act` so errors land
+          on the page banner and buttons disable on `busy`, then refreshRun re-reads the DTO. */}
+      <CompletionDecisionPanel
+        run={run}
+        canSteer={canSteer}
+        busy={busy}
+        act={act}
+        refreshRun={refreshRun}
+      />
 
       {(usage.hasLiveTokens || usage.hasConfirmed) && (
         <Card className="p-4">

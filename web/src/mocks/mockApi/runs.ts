@@ -329,6 +329,94 @@ export const runsApi = {
     return delay({ run: { ...newRun } }, 80);
   },
 
+  // ── Owner completion decisions (PRD #1227 M4) ─────────────────────────────────
+  // The three owner/admin decisions on a completion-BLOCKED run. Mirror the server: the demo
+  // caller owns every non-other-user run so a missing run is the only 404; a 409 on a run that
+  // is not completion-blocked; and — for partial/accept — a 409 when the fenced
+  // contract_revision no longer matches, plus a new revision N+1 with the deferred/accepted
+  // history appended. `continue` just un-parks the hold (guidance is ignored by the mock —
+  // dropping the param keeps the method assignable to realApi's wider type with no unused arg).
+  continueCompletionDecision: async (id: string) => {
+    const run = getRun(id);
+    if (!run) throw new ApiError(404, "run not found");
+    if (run.completion_phase !== "blocked")
+      throw new ApiError(409, "run is not completion-blocked");
+    patchRun(id, {
+      status: "queued",
+      completion_phase: "reworking",
+      hold_reason: null,
+      hold_context: null,
+      updated_at: new Date().toISOString(),
+    });
+    return delay({ run: { ...getRun(id)! } }, 80);
+  },
+  partialCompletionDecision: async (
+    id: string,
+    keep: string[],
+    reason: string,
+    contractRevision: number,
+  ) => {
+    const run = getRun(id);
+    if (!run) throw new ApiError(404, "run not found");
+    if (run.completion_phase !== "blocked")
+      throw new ApiError(409, "run is not completion-blocked");
+    if ((run.completion_revision ?? 0) !== contractRevision)
+      throw new ApiError(409, "the contract revision has changed; re-read and re-decide");
+    const keepSet = new Set(keep);
+    const alreadyDeferred = new Set((run.completion_deferred ?? []).map((d) => d.milestone_id));
+    const newRev = (run.completion_revision ?? 0) + 1;
+    const removed = (run.milestones ?? [])
+      .filter((m) => !alreadyDeferred.has(m.id) && !keepSet.has(m.id))
+      .map((m) => ({ milestone_id: m.id, reason, revision: newRev }));
+    if (removed.length === 0)
+      throw new ApiError(400, "a partial decision must remove at least one milestone");
+    patchRun(id, {
+      status: "queued",
+      completion_phase: "reworking",
+      hold_reason: null,
+      hold_context: null,
+      completion_revision: newRev,
+      completion_deferred: [...(run.completion_deferred ?? []), ...removed],
+      updated_at: new Date().toISOString(),
+    });
+    return delay({ run: { ...getRun(id)! } }, 80);
+  },
+  acceptCompletionDecision: async (
+    id: string,
+    criteria: string[],
+    reason: string,
+    contractRevision: number,
+  ) => {
+    const run = getRun(id);
+    if (!run) throw new ApiError(404, "run not found");
+    if (run.completion_phase !== "blocked")
+      throw new ApiError(409, "run is not completion-blocked");
+    if ((run.completion_revision ?? 0) !== contractRevision)
+      throw new ApiError(409, "the contract revision has changed; re-read and re-decide");
+    const newRev = (run.completion_revision ?? 0) + 1;
+    const wanted = new Set(criteria);
+    const added = (run.milestones ?? [])
+      .filter((m) => wanted.has(`${m.id}.c1`))
+      .map((m) => ({
+        id: `${m.id}.c1`,
+        milestone_id: m.id,
+        text: m.title,
+        reason,
+        revision: newRev,
+      }));
+    if (added.length === 0) throw new ApiError(400, "no known criterion to accept");
+    patchRun(id, {
+      status: "queued",
+      completion_phase: "reworking",
+      hold_reason: null,
+      hold_context: null,
+      completion_revision: newRev,
+      completion_accepted: [...(run.completion_accepted ?? []), ...added],
+      updated_at: new Date().toISOString(),
+    });
+    return delay({ run: { ...getRun(id)! } }, 80);
+  },
+
   // Issue #754: resume an auto-lane run parked at `pool_wait` right now. Mirrors the
   // server: owner-scoped (the demo caller owns every non-other-user run) and
   // pool_wait-ONLY — a 409 ("run is not waiting for a pooled token") on any other
