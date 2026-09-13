@@ -1,0 +1,19 @@
+{
+  "id": 1,
+  "name": "x",
+  "status": "x",
+  "conclusion": "x",
+  "web_url": "x",
+  "started_at": "2020-01-02T03:04:05Z",
+  "finished_at": "2020-01-02T03:04:05Z",
+  "steps": [
+    {
+      "name": "x",
+      "status": "x",
+      "conclusion": "x",
+      "number": 1,
+      "started_at": "2020-01-02T03:04:05Z",
+      "completed_at": "2020-01-02T03:04:05Z"
+    }
+  ]
+}

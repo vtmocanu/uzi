@@ -433,7 +433,12 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			// persisted columns, falling back to the global default when NULL (a 0/1-
 			// milestone run, byte-for-byte today). The worker also reads the scaled wall
 			// clock off the state-ack, but the claim carries it too for a fresh resume.
-			RunTimeoutSeconds:      coalesceInt(run.BudgetWallSeconds, int(s.p.RunTimeout.Seconds())),
+			// PRD #1189 M1 (D6, THE CRUX): add budget_extension_seconds so a run extended
+			// while queued/parked arms the ALREADY-LARGER hard wall when it starts — without
+			// this the worker trips REASON_WALL at the frozen budget before the server's
+			// extended deadline, and the extend is a silent no-op. budget_extension_seconds is
+			// NOT NULL DEFAULT 0, so this is byte-identical for a run that was never extended.
+			RunTimeoutSeconds:      coalesceInt(run.BudgetWallSeconds, int(s.p.RunTimeout.Seconds())) + int(run.BudgetExtensionSeconds),
 			IdleTimeoutSeconds:     int(s.p.RunIdleTimeout.Seconds()),
 			TaskIdleTimeoutSeconds: taskIdleTimeoutSeconds,
 			MaxIterations:          coalesceInt(run.BudgetMaxIterations, s.p.RunMaxIterations),

@@ -1500,13 +1500,29 @@ describe("PausedPanel (PRD #1190)", () => {
     expect(screen.getByText("What happens on resume")).toBeTruthy();
   });
 
-  it("OMITS the budget-remaining sentence (PRD #1189's budget_total_seconds has not landed)", () => {
-    render(<PausedPanel run={paused()} busy={false} onResume={vi.fn()} onStop={vi.fn()} />);
-    expect(screen.queryByText(/left when you resume/i)).toBeNull();
-    expect(screen.queryByText(/budget remains/i)).toBeNull();
-    expect(screen.queryByText(/left when resumed/i)).toBeNull();
-    // And the action-row who-can line names two actions, not three (no "extend").
-    expect(screen.queryByText(/only the run's owner can resume, extend or stop/i)).toBeNull();
+  it("shows the budget-remaining sentence AND the Extend affordance on a budgeted paused run (PRD #1189)", () => {
+    // M2 LANDED the budget sentence and the Extend affordance, so the old vacuous fixture (no
+    // budget on the wire → view null → nothing to omit) no longer tests anything. A BUDGETED
+    // paused run must SHOW both: 28800 wall − 3600 used = 25200 = 7h remains when resumed.
+    render(
+      <PausedPanel
+        run={paused({
+          budget_wall_seconds: 28800,
+          budget_used_seconds: 3600,
+          budget_extension_seconds: 0,
+          budget_extension_cap_seconds: 57600,
+        })}
+        busy={false}
+        canSteer
+        onResume={vi.fn()}
+        onStop={vi.fn()}
+        onExtend={vi.fn()}
+      />,
+    );
+    expect(screen.getByText(/7h/)).toBeTruthy();
+    expect(screen.getByText(/budget remains when you resume/i)).toBeTruthy();
+    // Extend is offered while paused (owner + cap>0 + onExtend wired) — D4: inert until resume.
+    expect(screen.getByRole("button", { name: /extend time/i })).toBeTruthy();
   });
 
   it("offers Resume + Stop for the owner", () => {

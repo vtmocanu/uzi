@@ -367,7 +367,17 @@ type fakeStore struct {
 	// prove last-writer-wins across two directives.
 	createdScopeCeiling  *store.CreateScopeCeilingInputParams
 	createdScopeCeilings []store.CreateScopeCeilingInputParams
-	cancelled            *store.CancelRunServerSideParams
+	// PRD #1189 M1: capture the extend write submitInput's `extend` branch makes.
+	// createdExtend holds the LAST call (nil until reached); createdExtends records every
+	// call in order. extendReturn is the new total budget_extension_seconds the fake reports
+	// back (the CTE's RETURNING); extendErr programs a refusal — set it to pgx.ErrNoRows to
+	// simulate a 0-row CreateExtendInput (terminal / untimed kind / over the cap), which the
+	// service disambiguates via extendRefusalReason over the already-fetched run.
+	createdExtend  *store.CreateExtendInputParams
+	createdExtends []store.CreateExtendInputParams
+	extendReturn   int32
+	extendErr      error
+	cancelled      *store.CancelRunServerSideParams
 	// cancelledByWorker captures the PRD #503 M1 live-worker cancel transition; SetState's
 	// failed arm calls it (instead of SetRunFailed) when the loaded run's stop_kind is
 	// 'cancelled'. cancelledByWorkerRows is the rows-affected it returns (defaults to 1 →
@@ -1191,6 +1201,18 @@ func (f *fakeStore) CreateScopeCeilingInput(_ context.Context, arg store.CreateS
 	f.createdScopeCeiling = &arg
 	f.createdScopeCeilings = append(f.createdScopeCeilings, arg)
 	return store.RunUserInput{ID: 1, RunID: arg.RunID, Kind: "scope", Body: arg.Body}, nil
+}
+
+// CreateExtendInput (PRD #1189 M1) captures the extend write and returns the programmed new
+// total (extendReturn), or a programmed refusal (extendErr, e.g. pgx.ErrNoRows for a 0-row
+// CTE). Mirrors the CreateScopeCeilingInput fake above.
+func (f *fakeStore) CreateExtendInput(_ context.Context, arg store.CreateExtendInputParams) (int32, error) {
+	f.createdExtend = &arg
+	f.createdExtends = append(f.createdExtends, arg)
+	if f.extendErr != nil {
+		return 0, f.extendErr
+	}
+	return f.extendReturn, nil
 }
 func (f *fakeStore) CreateApprovePlanInput(_ context.Context, arg store.CreateApprovePlanInputParams) (store.RunUserInput, error) {
 	f.createdApproval = &arg

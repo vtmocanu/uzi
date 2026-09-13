@@ -3393,6 +3393,11 @@ export class RunRunner {
             b.maxIterations = ack.budgetMaxIterations;
           if (typeof ack.budgetWallSeconds === "number")
             b.wallSeconds = ack.budgetWallSeconds;
+          // PRD #1189 M1 (D6): carry the served TOTAL wall (frozen budget + extension) off the
+          // SAME ACK so the sdk-executor re-arms its hard wall upward when a run is extended
+          // while already executing. Kept ALONGSIDE the wallSeconds mapping above (back-compat).
+          if (typeof ack.budgetTotalSeconds === "number")
+            b.totalWallSeconds = ack.budgetTotalSeconds;
           // PRD #634 M2: carry the operator scope ceiling + fresh completed count off the
           // ACK so m3's loop-top gate can read them off `served`.
           if (typeof ack.scopeCeiling === "number")
@@ -3416,6 +3421,7 @@ export class RunRunner {
           // newly enables m3's scope read).
           return b.maxIterations !== undefined ||
             b.wallSeconds !== undefined ||
+            b.totalWallSeconds !== undefined ||
             b.scopeCeiling !== undefined ||
             b.completedCount !== undefined ||
             b.pauseRequested !== undefined ||

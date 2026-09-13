@@ -19,7 +19,7 @@ left to the deadline (e.g. `1h 5m left`).
 |---|---|---|
 | ⚠ looping | The agent has repeated the exact same tool call 4+ times recently — or its updates can't be saved, so it keeps resending them. | Open the run view and check what it's stuck repeating (or whether it's stuck retrying a save); it may need a nudge or a cancel. |
 | ⚠ stalled | No new activity for a while, and nothing is currently running (a long build or test suite in progress does **not** count as stalled). | Open the run view — it's either quietly working on something the flag doesn't see, or genuinely wedged. |
-| ⚠ near timeout | Has used most (default 85%) of its wall-clock budget while running, gate time excluded; it will be stopped at the timeout. | Let it finish if it is on its last milestone, or `uzi run scope --through N` / `run stop` to finalize what is committed. Raising `RUN_TIMEOUT` only helps a run whose budget isn't already frozen — a milestone-scaled run freezes its `budget_wall_seconds` at plan approval, so a later `RUN_TIMEOUT` bump won't extend it. |
+| ⚠ near timeout | Has used most (default 85%) of its wall-clock budget while running, gate time excluded; it will be stopped at the timeout. | Let it finish if it is on its last milestone, `uzi run scope --through N` / `run stop` to finalize what is committed, or [give it more time](#giving-a-run-more-time) instead. Raising `RUN_TIMEOUT` only helps a run whose budget isn't already frozen — a milestone-scaled run freezes its `budget_wall_seconds` at plan approval, so a later `RUN_TIMEOUT` bump won't extend it. |
 | ⚠ waiting for worker | Queued longer than expected with no worker claiming it. | The reason names why, if you own the run: no worker online, your vault is locked, or just a wait — start a worker or unlock your vault as needed. A judge or self-improve run instead reads **deprioritized** (yielding to interactive work on purpose, not stuck) or, once it's waited past the grace window, **priority restored** — see [Queue priority](#queue-priority). |
 | ⚠ needs approval | Sitting at `awaiting_approval` longer than expected (never shown for autopilot runs, which approve themselves). | Approve, reject, or request changes to the plan — see [Plan approval gate](./run-activity.md#plan-approval-gate). |
 
@@ -33,6 +33,31 @@ repo to the allowlist, not to start another worker.
 
 Only the run's owner (and admins) see the reason text behind a flag; everyone
 else viewing a shared board sees just the ⚠ badge.
+
+## Giving a run more time
+
+A run that can time out shows its wall-clock budget in the header, right
+next to the elapsed time — `3h 48m / 8h`, or `3h 48m / 8h+2h` once it's been
+extended. When it crosses **near timeout**, the run's owner gets an
+**Extend time…** button in the header and a panel explaining what will
+happen: a chooser offering +1h / +2h / +4h / +8h or a custom duration (`2h`,
+`90m`, `1h30m`), with the used time, the remaining allowance and the
+resulting deadline shown before you confirm. The extension adds to the
+run's existing budget — it never replaces it, and the underlying frozen
+budget described in [Milestone-scaled
+budgets](configuration.md#milestone-scaled-budgets-prd-122-m2) never moves.
+From the CLI, the same action is `uzi run extend <run-id> --by 2h`
+(see [the CLI reference](./cli.md#commands) for the accepted duration
+formats and what a refusal looks like).
+
+Only the run's owner can extend it; everyone else sees inert text in the
+same spot. Extending a run clears its near-timeout flag on the next health
+sweep, though a long-enough run can cross 85% of the new, larger budget
+later and get flagged again — that's expected, not a bug. Total extra time
+per run is bounded by an admin-set allowance (default 16h); once a run has
+used up its allowance, or an admin has turned extending off entirely, the
+button and the CLI command both stop working — see [Admin
+settings](admin-settings.md#run-health) for that setting.
 
 ## Queue priority
 

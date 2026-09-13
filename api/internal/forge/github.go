@@ -69,8 +69,17 @@ type github struct {
 // is NOT GHES support (out of scope, not validated or advertised): it is the same
 // base-URL injection the gitlab/forgejo test harnesses use to reach a local server.
 func newGitHub(baseURL, token string, timeout time.Duration) (*github, error) {
+	// Wrap the HTTP client's transport with the process-wide ETag RoundTripper
+	// (D4) so conditional GETs on the new read paths replay a cached 200 on 304
+	// instead of spending primary rate-limit budget. WithAuthToken then wraps this
+	// transport with the Bearer-adding one, so the outbound request carries both
+	// Authorization and If-None-Match; every non-allowlisted request passes through
+	// untouched (the poller/worker lanes see no change). The cache is package-level
+	// because ForgeForConnection rebuilds the driver per request.
+	httpClient := timeoutClient(timeout)
+	httpClient.Transport = newETagTransport(httpClient.Transport, token)
 	opts := []gh.ClientOptionsFunc{
-		gh.WithHTTPClient(timeoutClient(timeout)),
+		gh.WithHTTPClient(httpClient),
 		gh.WithAuthToken(token),
 	}
 	if b := strings.TrimRight(strings.TrimSpace(baseURL), "/"); b != "" && !isDefaultGitHubBase(b) {
@@ -123,9 +132,22 @@ func (g *github) wrapErr(op string, err error) error {
 	var arle *gh.AbuseRateLimitError
 	switch {
 	case errors.As(err, &rle):
-		return g.redact.error(fmt.Errorf("github: %s: rate limited by github: %w", op, err))
+		// Map the primary rate limit onto the neutral *RateLimitError so a caller can
+		// errors.As it (regardless of forge) and answer 429 + Retry-After. Rate.Reset
+		// is read from the RAW error before redaction; the wrapped message is redacted.
+		return &RateLimitError{
+			Reset: rle.Rate.Reset.Time,
+			Err:   g.redact.error(fmt.Errorf("github: %s: rate limited by github: %w", op, err)),
+		}
 	case errors.As(err, &arle):
-		return g.redact.error(fmt.Errorf("github: %s: secondary (abuse) rate limited by github: %w", op, err))
+		// Secondary (abuse) limit: it carries a RetryAfter wait rather than a reset.
+		rl := &RateLimitError{
+			Err: g.redact.error(fmt.Errorf("github: %s: secondary (abuse) rate limited by github: %w", op, err)),
+		}
+		if arle.RetryAfter != nil {
+			rl.Retry = *arle.RetryAfter
+		}
+		return rl
 	default:
 		return g.redact.error(fmt.Errorf("github: %s: %w", op, err))
 	}

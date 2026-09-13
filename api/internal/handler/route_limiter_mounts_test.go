@@ -67,18 +67,23 @@ var limiterNames = [...]string{
 // error rather than a failing row. Spelled `lim*` rather than matching the parameter
 // names exactly, so nothing here shadows a parameter inside Routes.
 //
-// 191 as of this commit (PRD #1184 M3 added GET /api/admin/judge/recommendations/issue-draft
+// 195 as of this commit (PRD #1184 M3 added GET /api/admin/judge/recommendations/issue-draft
 // and POST /api/admin/judge/recommendations/issue — the admin "All users" issue draft READ and
 // the FILE write. The draft is a read in the admin read group → noLimiter, like the aggregate
 // reads; the file is a forge WRITE in the admin write group behind forgeLimiter, like the owner
 // POST /api/runs/{id}/review/recommendations/{recID}/issue → limForge.)
-// It was 189 until then (PRD #1184 M2 added PUT and DELETE
+// It was 193 until then (PRD #1184 M2 added PUT and DELETE
 // /api/admin/judge/recommendations/disposition — the admin "All users" cross-user Mark done
 // and its Undo, mounted in the admin WRITE group beside /admin/settings, both cookie-only and
 // both noLimiter: a local upsert/delete, no forge call and no token spend.)
-// It was 187 until then (PRD #1184 M1 added GET /api/admin/judge/recommendations,
+// It was 191 until then (PRD #1184 M1 added GET /api/admin/judge/recommendations,
 // GET /api/admin/judge/stats and GET /api/admin/judge/category-stats — the admin "All users"
 // judge aggregate reads, mounted in the admin read group beside /admin/runs, all noLimiter.)
+// It was 188 until then (PRD #1255 M2a added the four forge-view GET reads
+// GET /api/repos/{id}/pulls, /pulls/{iid}, /ci/runs and /ci/runs/{run_id} — all limForge,
+// like the sibling /{id}/issues/{iid} forge read. POST /api/repos/{id}/ci-fix-runs also
+// MOVED from the cookie-only group to RequireUser (D12) but its method/pattern/limiter
+// row is unchanged, so it is not a count change — a move, not an add.)
 // It was 184 until then (PRD #1171 M1 added POST /api/worker/runs/{id}/codex/release and
 // POST /api/worker/runs/{id}/codex/refresh — the Bearer-only Codex credential
 // release/refresh bridge, both worker-authenticated and both noLimiter, like the other
@@ -353,6 +358,13 @@ var wantRouteMounts = []routeMount{
 	// owner-or-admin group as the sibling routes → noLimiter, like the sibling reads.
 	{"GET", "/api/repos/{id}/github-project-sync/visibility", noLimiter},
 	{"GET", "/api/repos/{id}/issues/{iid}", limForge},
+	// PRD #1255 M2a forge views: read-only open-pulls and CI-runs reads. Each proxies
+	// the repo's forge on demand (ListMergeRequestRefs/ListChecks/ListWorkflowRuns), so it
+	// carries the per-user forge budget, like GET /{id}/issues/{iid} above it.
+	{"GET", "/api/repos/{id}/pulls", limForge},
+	{"GET", "/api/repos/{id}/pulls/{iid}", limForge},
+	{"GET", "/api/repos/{id}/ci/runs", limForge},
+	{"GET", "/api/repos/{id}/ci/runs/{run_id}", limForge},
 	{"GET", "/api/repos/{id}/tool-profile", noLimiter},
 	{"GET", "/api/runs/", noLimiter},
 	{"GET", "/api/runs/{id}", noLimiter},

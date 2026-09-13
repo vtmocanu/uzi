@@ -103,6 +103,10 @@ var runDTOKeys = []string{
 	// wire; the subset of the lead's declaration whose ids survived in-progress validation.
 	"milestones_agents",
 	"budget_max_iterations", "budget_wall_seconds",
+	// PRD #1189 M1: the owner-granted extension + effective cap (always present ints, 0 is
+	// meaningful) and the derived total/used seconds (nil for a kind that never times out /
+	// a run that never started).
+	"budget_extension_seconds", "budget_extension_cap_seconds", "budget_total_seconds", "budget_used_seconds",
 	// PRD #634 M2: the operator scope ceiling (nil ⇒ null ⇒ unbounded), always on the wire;
 	// like budget_* it is load-bearing on the state-ack, not just display — the worker honors
 	// it at the loop top.

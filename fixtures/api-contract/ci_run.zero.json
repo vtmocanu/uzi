@@ -1,0 +1,18 @@
+{
+  "id": 0,
+  "name": "",
+  "number": 0,
+  "event": "",
+  "branch": "",
+  "sha": "",
+  "status": "",
+  "conclusion": "",
+  "title": "",
+  "actor": "",
+  "web_url": "",
+  "created_at": "0001-01-01T00:00:00Z",
+  "updated_at": "0001-01-01T00:00:00Z",
+  "started_at": "0001-01-01T00:00:00Z",
+  "jobs_done": 0,
+  "jobs_total": 0
+}

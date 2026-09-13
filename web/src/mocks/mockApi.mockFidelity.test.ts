@@ -136,6 +136,9 @@ describe("mockApi — F3 updateSettings accepts the nine missing AppSettings key
     await check("github_project_sync_enabled", { github_project_sync_enabled: "true" }, "true");
     await check("docker_repo_allowlist", { docker_repo_allowlist: VALID_UUID }, VALID_UUID);
     await check("docker_repo_allowlist", { docker_repo_allowlist: "" }, "");
+    // PRD #1189: the extension allowance — 0 (off) and an in-range value.
+    await check("run_extension_cap_seconds", { run_extension_cap_seconds: "0" }, "0");
+    await check("run_extension_cap_seconds", { run_extension_cap_seconds: "3600" }, "3600");
   });
 
   it("still 400s on invalid values for those keys", async () => {
@@ -150,5 +153,10 @@ describe("mockApi — F3 updateSettings accepts the nine missing AppSettings key
     await expect(api.updateSettings({ docker_repo_allowlist: "not-a-uuid" })).rejects.toMatchObject(
       { status: 400 },
     );
+    // PRD #1189: 3599 is below the extension-allowance floor (3600), a distinct bound from the
+    // health-seconds floor (60).
+    await expect(api.updateSettings({ run_extension_cap_seconds: "3599" })).rejects.toMatchObject({
+      status: 400,
+    });
   });
 });

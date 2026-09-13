@@ -437,6 +437,35 @@ describe("reportState acknowledgement (PRD #35)", () => {
   });
 });
 
+// PRD #1189 M1 (D6): the server serves a run's TOTAL wall budget (frozen budget + owner
+// extension) as budget_total_seconds on the running-report ACK's {run: RunDTO}. reportState must
+// surface it onto the returned StateAck (as budgetTotalSeconds) so the sdk-executor can re-arm its
+// hard wall upward for a run extended while already executing. sendRawState pins the exact wire body.
+describe("reportState budget acknowledgement (PRD #1189 M1)", () => {
+  it("surfaces the served budget_total_seconds onto the ACK as budgetTotalSeconds", async () => {
+    api.sendRawState("run-1", 200, JSON.stringify({ run: { status: "running", budget_total_seconds: 36000 } }));
+    const client = newClient();
+    const ack = await client.reportState("run-1", { status: "running" });
+    assert.strictEqual(ack.budgetTotalSeconds, 36000, "the served total wall reaches the caller off the ACK");
+    assert.strictEqual(ack.status, "running");
+    assert.strictEqual(ack.applied, true);
+  });
+
+  it("leaves budgetTotalSeconds absent when the server omits it (older api)", async () => {
+    api.sendRawState("run-1", 200, JSON.stringify({ run: { status: "running" } }));
+    const client = newClient();
+    const ack = await client.reportState("run-1", { status: "running" });
+    assert.strictEqual(ack.budgetTotalSeconds, undefined, "an older api that omits the field ⇒ absent on the ACK");
+  });
+
+  it("leaves budgetTotalSeconds absent when budget_total_seconds is null (no wall deadline)", async () => {
+    api.sendRawState("run-1", 200, JSON.stringify({ run: { status: "running", budget_total_seconds: null } }));
+    const client = newClient();
+    const ack = await client.reportState("run-1", { status: "running" });
+    assert.strictEqual(ack.budgetTotalSeconds, undefined, "null ⇒ absent, so the executor falls back to wallSeconds");
+  });
+});
+
 describe("MessageBatcher seq numbering", () => {
   it("continues gapless numbering from last_seq across flushes", async () => {
     const client = newClient();

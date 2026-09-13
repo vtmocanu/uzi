@@ -472,6 +472,10 @@ func Validate(key, value string) error {
 		return validateHealthSeconds(value)
 	case KeyHealthNearTimeoutPct:
 		return validateHealthPercent(value)
+	case KeyRunExtensionCapSeconds:
+		// {0} ∪ [3600, 604800] (PRD #1189 D3) — bounds differ from the run-health seconds
+		// range, so this has its own validator rather than reusing validateHealthSeconds.
+		return validateExtensionCapSeconds(value)
 	case KeyJudgeCooldownSeconds:
 		// {0} ∪ [60, 86400], identical to the run-health seconds bounds (PRD #69 M5
 		// Decision 9), so validateHealthSeconds enforces it verbatim — 0 disables the

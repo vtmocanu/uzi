@@ -460,6 +460,14 @@ func combineCheckRunStatuses(runs []*gh.CheckRun) string {
 // exactly the Pipeline.ID that LatestPipeline / LatestMRPipeline returned. Paginated
 // internally to honour the interface contract.
 func (g *github) ListPipelineJobs(ctx context.Context, projectID, pipelineID int64) ([]Job, error) {
+	// ListPipelineJobs is shared: the INTERACTIVE ci-run drill-in (GetCIRun) and the
+	// poller's ci-fix snapshot both call it. Gating the reserve-shed on the interactive
+	// flag means the drill-in can shed while the poller's unmarked ci-fix read never
+	// does (PRD #1255 D4). LatestPipeline/LatestMRPipeline/JobLogTail carry no flag and
+	// get no reserve check at all.
+	if err := g.shedIfReserved(ctx); err != nil {
+		return nil, err
+	}
 	slug, err := g.repoSlugFor(ctx, projectID)
 	if err != nil {
 		return nil, err
@@ -667,13 +675,32 @@ func toGitHubPipeline(r *gh.WorkflowRun) Pipeline {
 }
 
 // toGitHubJob maps a workflow job to the neutral Job. Stage is empty (GitHub
-// Actions has no stage concept, unlike GitLab's pipeline model).
+// Actions has no stage concept, unlike GitLab's pipeline model). Steps and
+// StartedAt/FinishedAt are filled from the job's TaskStep slice and timestamps
+// (PRD #1255): each step's raw status/conclusion is carried verbatim, the same
+// D8 collapse the job and pipeline use.
 func toGitHubJob(j *gh.WorkflowJob) Job {
-	return Job{
-		ID:     j.GetID(),
-		Name:   j.GetName(),
-		Stage:  "",
-		Status: githubActionsStatus(j.GetStatus(), j.GetConclusion()),
-		WebURL: j.GetHTMLURL(),
+	job := Job{
+		ID:         j.GetID(),
+		Name:       j.GetName(),
+		Stage:      "",
+		Status:     githubActionsStatus(j.GetStatus(), j.GetConclusion()),
+		WebURL:     j.GetHTMLURL(),
+		StartedAt:  j.GetStartedAt().Time,
+		FinishedAt: j.GetCompletedAt().Time,
 	}
+	for _, s := range j.Steps {
+		if s == nil {
+			continue
+		}
+		job.Steps = append(job.Steps, Step{
+			Name:        s.GetName(),
+			Status:      s.GetStatus(),
+			Conclusion:  s.GetConclusion(),
+			Number:      int(s.GetNumber()),
+			StartedAt:   s.GetStartedAt().Time,
+			CompletedAt: s.GetCompletedAt().Time,
+		})
+	}
+	return job
 }
