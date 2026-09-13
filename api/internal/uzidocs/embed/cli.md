@@ -910,9 +910,10 @@ when only one is enabled), defaulting to the repo of your newest run — and
 - **`pulls`** lists every open PR/MR on the scoped repo, banded **NEEDS
   YOU** (changes requested, or a conflict), **IN FLIGHT** (a draft, or a
   review still pending), and **READY** (approved, or no review required,
-  with no conflict). Each row carries a checks cell (`✓ 6/6` / `✗ 1/6` /
-  `● 3/6`), a review cell, the branch, the title, and a `↳ <run>` link when
-  a uzi run opened it. Polls every 10s.
+  with no conflict). Each row carries a review cell, the branch, the title,
+  and a `↳ <run>` link when a uzi run opened it; per-check counts live in the
+  PR view, not the list row (the list read carries no per-check detail). Polls
+  every 10s.
 - **`ci`** lists the repo's CI/workflow runs, banded **RUNNING**,
   **FAILED**, and **RECENT**, each row carrying a `▰▱ done/total` jobs
   micro-bar while it's running. On a forge version with no Actions/CI-runs
@@ -994,16 +995,17 @@ enter / →    open the selected row (pulls → PR view · ci → CI run view)
 ↑ / ↓        move the cursor (PR view: over CHECKS · CI run view: over JOBS)
 u            open the PR's linked uzi run (pulls row, PR view; shown only when linked)
 w            rework the linked run (pulls row, PR view; shown only when linked)
-f            fix ci: queue a CI-fix run for the branch (pulls, ci, PR view, CI run view)
+f            fix ci: queue a CI-fix run for the branch (pulls row, PR view, CI run view)
 m            detail: open the PR view for this run's merge request (when it has one)
 esc          back: a drill-in returns to its list, a list returns to the floor
 ```
 
 `f` means something different here than in the run detail table above — a
-follow-up there, "fix ci" on every forge screen — but the two views never
-overlap, so the key never carries two meanings at once. `u` and `w` drop out
-of the legend on a PR with no linked run, and a `ci` row never offers them at
-all: there's no run to open or rework from a bare CI run, only `f`.
+follow-up there, "fix ci" on the forge screens that bind it — but the two
+views never overlap, so the key never carries two meanings at once. `u` and
+`w` drop out of the legend on a PR with no linked run. A `ci` list row offers
+no row actions (just `enter` to drill in); `f fix ci` lives on the CI run
+view, where the run's branch is known.
 
 ### Steering is run-level, not per-agent
 
