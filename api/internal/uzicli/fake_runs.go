@@ -226,6 +226,44 @@ func (f *FakeClient) ContinueCompletionDecision(_ context.Context, id string, gu
 	return f.DecideRun, nil
 }
 
+// PartialCompletionDecision records the run id, the keep id set, the (trimmed) reason and the
+// fenced contract_revision it was called with and returns the canned DecideRun. It captures BEFORE
+// the error branch (mirroring ContinueCompletionDecision) so a test asserting a 409/404/400 still
+// proves the write was reached with the right args; PartialCompletionDecisionErr wins over the
+// blanket Err.
+func (f *FakeClient) PartialCompletionDecision(_ context.Context, id string, keep []string, reason string, contractRevision int) (apitypes.RunDTO, error) {
+	f.LastDecideRunID = id
+	f.LastDecideKeep = keep
+	f.LastDecideReason = reason
+	f.LastDecideRevision = contractRevision
+	if f.PartialCompletionDecisionErr != nil {
+		return apitypes.RunDTO{}, f.PartialCompletionDecisionErr
+	}
+	if f.Err != nil {
+		return apitypes.RunDTO{}, f.Err
+	}
+	return f.DecideRun, nil
+}
+
+// AcceptCompletionDecision records the run id, the criteria id set, the (trimmed) reason and the
+// fenced contract_revision it was called with and returns the canned DecideRun. It captures BEFORE
+// the error branch (mirroring PartialCompletionDecision) so a test asserting a 409/404/400 still
+// proves the write was reached with the right args; AcceptCompletionDecisionErr wins over the
+// blanket Err.
+func (f *FakeClient) AcceptCompletionDecision(_ context.Context, id string, criteria []string, reason string, contractRevision int) (apitypes.RunDTO, error) {
+	f.LastDecideRunID = id
+	f.LastDecideCriteria = criteria
+	f.LastDecideReason = reason
+	f.LastDecideRevision = contractRevision
+	if f.AcceptCompletionDecisionErr != nil {
+		return apitypes.RunDTO{}, f.AcceptCompletionDecisionErr
+	}
+	if f.Err != nil {
+		return apitypes.RunDTO{}, f.Err
+	}
+	return f.DecideRun, nil
+}
+
 func (f *FakeClient) CreateRun(_ context.Context, repoID string, issueIID int64, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *CreateRunSeed) (apitypes.RunDTO, error) {
 	f.LastCreateRepoID = repoID
 	f.LastCreateIssueIID = issueIID

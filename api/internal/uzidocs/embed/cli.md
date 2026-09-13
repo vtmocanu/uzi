@@ -98,7 +98,7 @@ uzi run extend <id> --by <duration>
 uzi run pause <id> [--now|--cancel]
 uzi run resume <id>
 uzi run resume-now <id>
-uzi run decide <id> --continue [--guidance <text>]
+uzi run decide <id> (--continue [--guidance <text>] | --partial <ids> --reason <text> | --accept <ids> --reason <text>)
 uzi run follow-up <id> [--message <text>]
 uzi run answer <id> [--message <text> ...]
 uzi run inputs <id> [--json]
@@ -272,16 +272,29 @@ A few worth knowing:
   the remaining milestones if it's gone. A run that isn't paused is a 409
   (exit 5). It posts to the same endpoint as `run resume-now` below, which
   now also resumes a paused run in addition to a pool-held one.
-- **`run decide <id> --continue [--guidance <text>]`** (PRD #1226) records
-  the owner's continue decision on a run the [structural completion
-  interlock](./run-completion-hold.md) has blocked — either a live
-  completion question or a run already parked in the completion hold.
-  `--continue` is required (the only decision supported today); an optional
-  `--guidance <text>` rides along to steer the run past the check. Answered
-  live, the run resumes in place with no new claim; answered after it has
-  parked, it resumes through `queued` like `run resume`. A run that is not
-  completion-blocked is a 409 (exit 5); a foreign or unknown run is a 404
-  (exit 4).
+- **`run decide <id>`** (PRD #1226/#1227) records the owner's decision on a
+  run the [structural completion interlock](./run-completion-hold.md) has
+  blocked — either a live completion question or a run already parked in the
+  completion hold. It is **owner-scoped**: a foreign run (including from a
+  read-only admin token) is hidden as a 404 (exit 4). Exactly one decision is
+  required (its absence, or more than one, is a usage error, exit 2):
+  - `--continue [--guidance <text>]` resumes the run past the check; the
+    optional `--guidance <text>` steers it. Answered live, the run resumes in
+    place with no new claim; answered after it has parked, it resumes through
+    `queued` like `run resume`.
+  - `--partial <ids> --reason <text>` reduces scope to the comma-separated
+    milestone ids to **keep**; the rest are deferred, and the run's closing
+    pull/merge request does **not** close the issue (it lists the deferred
+    ids). `--reason` is required.
+  - `--accept <ids> --reason <text>` waives the comma-separated criterion ids
+    as met; a closing pull/merge request then names them in a warning block.
+    `--reason` is required.
+
+  `--guidance` is valid only with `--continue`, and `--reason` only with
+  `--partial`/`--accept`. A partial or accept first reads the run's **current**
+  contract revision and sends it, which the server fences: a stale revision
+  (someone has already decided) is a 409 (exit 5), as is a run that is not
+  completion-blocked. `--json` emits the resumed run object.
 - **`run answer <id>`** answers the clarifying question a run is parked on
   (`awaiting_input`) — see [Answering a
   question](./run-activity.md#answering-a-question). It reads the open

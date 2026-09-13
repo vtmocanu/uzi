@@ -556,15 +556,25 @@ uzi version
   rework — is a 409 (exit 5). `-m`/`--message` carries optional guidance to steer the rework
   (or pipe it on stdin); an empty guidance is a valid trigger as long as there is a new review
   comment. Prints the created `mr_rework` run.
-- `uzi run decide <run-id> --continue [--guidance <text>]` — record the owner CONTINUE
-  decision on a run the completion interlock has blocked (PRD #1226) — EITHER a live
-  completion question (`awaiting_input`, whose answer is recorded and the current worker
-  resumes IN PLACE) OR a run already parked in the completion hold: the run resumes and
-  keeps working past the completion check. Only the continue decision is supported today, so
-  `--continue` is **required** (its absence is a usage error, exit 2). `--guidance` is
-  optional and steers the continued run (an empty continue simply resumes with no note). A
-  run that is **not** completion-blocked is a 409 (exit 5); a foreign/unknown run is a 404
-  (exit 4). Prints the run's new status; `--json` emits the resumed run object.
+- `uzi run decide <run-id> (--continue [--guidance <text>] | --partial <ids> --reason <text> | --accept <ids> --reason <text>)` —
+  record the owner's decision on a run the completion interlock has blocked (PRD #1226/#1227)
+  — EITHER a live completion question (`awaiting_input`, whose answer is recorded and the
+  current worker resumes IN PLACE) OR a run already parked in the completion hold. Owner-only.
+  Exactly ONE decision is **required** (zero, or more than one, is a usage error, exit 2):
+  - `--continue [--guidance <text>]` resumes the run past the completion check; `--guidance`
+    optionally steers it (an empty continue simply resumes with no note).
+  - `--partial <ids> --reason <text>` reduces scope to the comma-separated milestone ids to
+    **keep**; the rest are deferred and the run's PR does **not** close the issue (it lists the
+    deferred ids). `--reason` is required.
+  - `--accept <ids> --reason <text>` waives the comma-separated criterion ids as met; a closing
+    PR then names them in a warning block. `--reason` is required.
+
+  `--guidance` is valid only with `--continue`; `--reason` only with `--partial`/`--accept`. A
+  partial/accept first reads the run's **current** contract revision and sends it, which the
+  server fences: a stale revision (someone already decided) is a 409 (exit 5). A run that is
+  **not** completion-blocked is a 409 (exit 5); a foreign/unknown run is a 404 (exit 4). Prints
+  the run's new status (plus the deferred/accepted ids for partial/accept); `--json` emits the
+  resumed run object.
 
 ### Schedules — time-driven runs
 
