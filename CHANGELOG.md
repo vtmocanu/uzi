@@ -22,13 +22,14 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
-### Changed
-
-- **`specs/ai.md` is frozen at section 637; AI design decisions now live in the PRD Decision Logs and `adr/`** (issue #1317)
-  The file is read-only history with a `FROZEN` banner and a freeze gate (`task check:spec-numbering`: unique numbers, none above 637, count 637, canary proving both detectors), so the tail-append numbering collisions between parallel PRs are gone and every existing `§N` reference keeps resolving. The spec-keeper builtin moves to library v6 (never creates a `specs/ai.md`; honors the marker), the dev roster and `AGENTS.md` specs contract follow, and unfinished PRD milestones that still said "append `specs/ai.md`" carry a superseded note.
+## [0.83.0] - 2026-09-13
 
 ### Added
 
+- **TUI forge view: browse the repo's open PRs, live PR checks, and CI runs from the terminal ([#1255](https://github.com/vtmocanu/uzi/issues/1255), [#1295](https://github.com/vtmocanu/uzi/pull/1295), [#1312](https://github.com/vtmocanu/uzi/pull/1312)).**
+  Two new TUI list screens read the connected forge through the connection bot PAT, memoised and never persisted: a pulls list with a PR drill-in (summary plus live check state), and a CI-runs list with a run drill-in (job status). RUN 1 shipped the plumbing and first screens ([#1295](https://github.com/vtmocanu/uzi/pull/1295)); RUN 2 added the pulls/CI list screens and their drill-ins ([#1312](https://github.com/vtmocanu/uzi/pull/1312)). Rendered rows are clamped to the terminal width so an attacker-controlled forge branch name cannot overflow the board. The failed-job log tail is deferred to a follow-up.
+- **Per-milestone agent attribution on the web run page and the TUI ([#1224](https://github.com/vtmocanu/uzi/issues/1224)).**
+  When two or more milestones are in progress at once, the run views now show which agent is working which milestone instead of a single aggregate line, on both the web run page and the TUI.
 - **An admin can review every user's judge recommendations at once, on a new All users view on the Judge page ([#1184](https://github.com/vtmocanu/uzi/issues/1184)).**
   A Mine / All users switch, admin-only and remembered per browser, groups every user's recommendations by category and target with a count of distinct users instead of an owner, run title or run link, so an admin can gauge how widespread a pattern is without seeing whose it is; rationale text can still name a repo or file, so the view is aggregated across users, not anonymous. File issue still drafts with full provenance (whose worker text it publishes), and Mark done settles the coordinate across every user's open occurrence, leaving each owner's row reading "Done by an admin" with a working Undo; there's no cross-user Dismiss, since that stays each owner's own call. Reads are also on the CLI (`uzi admin review backlog`/`stats`); the writes are web-only.
 - **Extend a run's wall-clock budget from the web or CLI ([#1189](https://github.com/vtmocanu/uzi/issues/1189)).**
@@ -36,13 +37,29 @@ through `[0.52.0]`.)
 
 ### Changed
 
+- **`specs/ai.md` is frozen at section 637; AI design decisions now live in the PRD Decision Logs and `adr/`** (issue [#1317](https://github.com/vtmocanu/uzi/pull/1317))
+  The file is read-only history with a `FROZEN` banner and a freeze gate (`task check:spec-numbering`: unique numbers, none above 637, count 637, canary proving both detectors), so the tail-append numbering collisions between parallel PRs are gone and every existing `§N` reference keeps resolving. The spec-keeper builtin moves to library v6 (never creates a `specs/ai.md`; honors the marker), the dev roster and `AGENTS.md` specs contract follow, and unfinished PRD milestones that still said "append `specs/ai.md`" carry a superseded note.
 - **Releases now ship as release candidates first, and no stable surface ever points at a candidate ([#1265](https://github.com/vtmocanu/uzi/issues/1265)).**
   A release is cut as a candidate (`vX.Y.Z-rc.1`) by default and later promoted to stable from the candidate's own tested commit, in lockstep with cutting the next candidate, so what was run is what ships. Stable-only surfaces stay stable-only: the Homebrew formula, the GitHub Release marked latest, and the in-app update check never name a candidate, and the changelog drawer treats an instance running a candidate as running that version's section rather than showing it a phantom "update available". This is release-toolchain plumbing (no change to how the app behaves for an issue run); a deployment opts into running candidates by tracking the chart range `0.*-0`.
+- **Run budget now scales with run size, not just milestone count ([#1181](https://github.com/vtmocanu/uzi/issues/1181)).**
+  A large gated run whose milestones are prose-only used to fall back to the single-unit default (5 iterations / 2h) because the budget keyed off milestone count alone; it now scales off the run's size, so a big run gets a size-scaled budget rather than the default.
+- **The TUI crew rail auto-folds when the blocks below it would not otherwise fit ([#1310](https://github.com/vtmocanu/uzi/issues/1310)).**
+  On a short terminal the crew rail collapses so the panels beneath it stay visible instead of being pushed off-screen.
+- **Structural completion interlock and exact-head permit groundwork, shipped dormant ([#1226](https://github.com/vtmocanu/uzi/issues/1226), [#1245](https://github.com/vtmocanu/uzi/pull/1245), [#1254](https://github.com/vtmocanu/uzi/pull/1254)).**
+  The completion-interlock work (completion-hold wiring, honest run state, exact-head permit, and permit-path fixes) landed behind an off-by-default rollout switch, so there is no behavior change yet; the rollout stays disabled until the remaining follow-up work is complete.
+- **Codex worker lane internals, still dark ([#1237](https://github.com/vtmocanu/uzi/issues/1237), [#1241](https://github.com/vtmocanu/uzi/issues/1241), [#1248](https://github.com/vtmocanu/uzi/pull/1248), [#1287](https://github.com/vtmocanu/uzi/issues/1287), [#1309](https://github.com/vtmocanu/uzi/pull/1309)).**
+  Not user-visible and public Codex routing stays disabled: Codex subscription identity now resolves for personal ChatGPT seats where `/wham/usage` returns an empty `account_id` ([#1237](https://github.com/vtmocanu/uzi/pull/1237)), subscription refresh is reworked to fit the pinned app-server external-auth budget under real provider latency with a single call ([#1241](https://github.com/vtmocanu/uzi/pull/1241)), and M3 live acceptance is completed ([#1248](https://github.com/vtmocanu/uzi/pull/1248)). The Codex worker lane's guardrails are brought into conformance (M4, #1287): credential-file reads (including provider-managed Codex data) are denied, and the shell-command, file-operation, native-tool, role, phase, and repository-trust boundaries are enforced, with a conformance test suite.
+- **Dependency updates.**
+  A Go module batch ([#1288](https://github.com/vtmocanu/uzi/pull/1288)), go-github v90 to v91 ([#1290](https://github.com/vtmocanu/uzi/pull/1290)), gitlab-client v2.64.0 ([#1304](https://github.com/vtmocanu/uzi/pull/1304)), the `@anthropic-ai/claude-agent-sdk` bump to v0.3.263 ([#1269](https://github.com/vtmocanu/uzi/pull/1269)), and the `docker:29-dind` / `-rootless` image digests ([#1261](https://github.com/vtmocanu/uzi/pull/1261), [#1262](https://github.com/vtmocanu/uzi/pull/1262)).
 
 ### Fixed
 
-- **A completed run's failed clone cleanup no longer wedges its branch ([#1315](https://github.com/vtmocanu/uzi/issues/1315)).**
-  Terminal cleanup used to delete a run's clone in place and only then clear its ownership journal; when a background `git` maintenance daemon made that recursive delete fail partway (`ENOTEMPTY`), the journal survived pointing at leftover residue, so every later run on the branch failed immediately with `refusing to replace a retained clone owned by another run` and the branch stayed permanently wedged. Clones are now released with a same-filesystem atomic rename to a worker-only holding area, and the journal is cleared only after that rename succeeds, so a failed disposal can no longer wedge the branch. A later run that finds an orphaned clone whose owning run has finished now moves it aside (retained, never deleted) and re-clones cleanly, while a clone still owned by a live run stays protected.
+- **A completed run's failed clone cleanup no longer wedges its branch ([#1315](https://github.com/vtmocanu/uzi/issues/1315), [#1326](https://github.com/vtmocanu/uzi/pull/1326)).**
+  Terminal cleanup used to delete a run's clone in place and only then clear its ownership journal; when a background `git` maintenance daemon made that recursive delete fail partway (`ENOTEMPTY`), the journal survived pointing at leftover residue, so every later run on the branch failed immediately with `refusing to replace a retained clone owned by another run` and the branch stayed permanently wedged. Clones are now released with a same-filesystem atomic rename to a worker-only holding area, and the journal is cleared only after that rename succeeds, so a failed disposal can no longer wedge the branch. A later run that finds an orphaned clone whose owning run has finished now moves it aside (retained, never deleted) and re-clones cleanly, while a clone still owned by a live run stays protected; the reclaim now also covers other run kinds and worker moves ([#1326](https://github.com/vtmocanu/uzi/pull/1326)).
+- **Completed work from a push-rejected run is now self-serve to recover ([#1296](https://github.com/vtmocanu/uzi/issues/1296), [#1316](https://github.com/vtmocanu/uzi/pull/1316)).**
+  A run whose branch push was rejected (for example the worker PAT's missing `workflow` scope) used to leave its finished work reachable only by manual PVC surgery; the completed work is now recoverable through a self-serve path so a push rejection no longer strands the branch.
+- **The Dashboard per-user breakdown SHARE cell no longer wraps inconsistently on mobile ([#1250](https://github.com/vtmocanu/uzi/pull/1250)).**
+  The per-user SHARE cell now stays on one line on narrow screens.
 
 ## [0.82.0] - 2026-09-10
 
@@ -3972,7 +3989,8 @@ Re-ships the PRD #87 browser prebake + `web-ux` builtin (v0.11.0, rolled back to
 
 - Worker-side redaction now covers the `agent` and `kind` message fields, not just the payload and `agent_instance`/`agent_label`, closing a gap where a secret placed in either field reached the API, the WebSocket frame, the browser, and `uzi run logs` unscrubbed (PRD #108).
 
-[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.82.0...HEAD
+[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.83.0...HEAD
+[0.83.0]: https://github.com/vtmocanu/uzi/compare/v0.82.0...v0.83.0
 [0.82.0]: https://github.com/vtmocanu/uzi/compare/v0.81.0...v0.82.0
 [0.81.0]: https://github.com/vtmocanu/uzi/compare/v0.80.0...v0.81.0
 [0.80.0]: https://github.com/vtmocanu/uzi/compare/v0.79.0...v0.80.0
