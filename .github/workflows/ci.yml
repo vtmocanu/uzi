@@ -514,6 +514,12 @@ jobs:
           # semgrep gate on IN CI; before it, CI skipped semgrep gracefully.
           UZI_SAST_REQUIRED: "1"
         run: task gate:repo
+      # Offline fixture test of the release-train scripts (PRD 1265 M1). A `gate`
+      # member, not a `gate:repo` member (it builds a multi-commit git repo), so it
+      # is a distinct step here in the repo-wide job. Needs only git + bash, both
+      # present on the runner and set up by the checkout above.
+      - name: test:release-scripts (release-train fixture)
+        run: task test:release-scripts
 
   # ------------------------------------------------------------- Helm chart ----
   helm-chart:
