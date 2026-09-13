@@ -74,9 +74,8 @@ number, never by ADR sequence) and linked from `ARCHITECTURE.md`; there is no
 `docs/adr/` or `docs/design/` tree, do not create one. Other design rationale lives
 in `prds/*.md` Decision Logs (completed → `prds/done/`), linked from `ARCHITECTURE.md`
 rather than duplicated. Respect the specs contract: `specs/human.md` is user-stated
-requirements (no edits without user approval), `specs/ai.md` records AI design
-decisions; the `spec-keeper` role owns both, so feed it decisions rather than writing
-them.
+requirements (no edits without user approval) and `specs/ai.md` is frozen (issue #1317);
+the `spec-keeper` role owns `human.md`, so feed it decisions rather than writing them.
 
 Two constraints that outrank design elegance: (1) the primary directive, `main` is
 never touched, is enforced by four independent guardrail layers (forge Developer role

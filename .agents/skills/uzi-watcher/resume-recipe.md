@@ -70,9 +70,8 @@ cd <the repo>                              # your normal checkout; work happens 
    ```sh
    git fetch origin main && git rebase origin/main
    ```
-   Common conflicts: a `specs/ai.md` section-number collision (keep both, renumber the
-   incoming one); a new goose migration (rename to the next free number above the live head
-   in `api/internal/store/migrations/`, sequenced after any sibling PR's migration); a
+   Common conflicts: a new goose migration (rename to the next free number above the live
+   head in `api/internal/store/migrations/`, sequenced after any sibling PR's migration); a
    hand-edited shared doc (keep both sides).
 5. **Restore the uncommitted state** the tracking ref never held — the whole point for a
    task run. Skip cleanly when the run had none, but do NOT mask a real apply failure (a

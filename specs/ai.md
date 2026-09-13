@@ -1,5 +1,12 @@
 # uzi — AI Design & Implementation Decisions
 
+> **FROZEN 2026-09-13 (issue #1317), at §637.** Read-only history: never append, renumber
+> or edit a section. This supersedes the append-at-tail numbering convention described in
+> the numbering notes further down. New AI design decisions go to the originating PRD's
+> Decision Log (`prds/`, completed in `prds/done/`) and, when a decision outlives the work,
+> an ADR in `adr/`. `specs/human.md` stays the maintained binding contract. Existing `§N`
+> references keep resolving here; `task check:spec-numbering` enforces the freeze.
+
 Decisions the AI made within the human constraints in [specs/human.md](./human.md).
 Records the *why* and the human item each serves. This file is replaceable: a
 rebuild may decide differently, but must still satisfy every item in human.md.

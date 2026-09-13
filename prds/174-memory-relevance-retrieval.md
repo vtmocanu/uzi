@@ -42,7 +42,7 @@ Two honest notes, in the tone PRD #90 set:
 - [ ] **M4 — pgvector: infra + embedding provider.** Extension enabled, compose image moved off `postgres:17` (pinned by digest at `docker-compose.yml:12`) and the CNPG per-cluster image updated; embedding on write behind a config flag; **degrade to M1 ranking whenever embeddings are unavailable, never fail the read.** Blocked on OQ-A.
 - [ ] **M5 — Hybrid rank (RRF over FTS + vector).** Fuse the two rankings. Ship with a way to compare the three modes (FTS-only / vector-only / hybrid) on real memory, so "hybrid is better" is measured rather than assumed.
 - [ ] **M6 — Visibility.** Web UI + `uzi memory` show tags, expiry, and last-injected/hit-count; the CLI gains a way to preview what *would* be injected for a given issue. Per-entry purge unchanged. (Repo rule: new API ⇒ check `api/cmd/uzi/`.)
-- [ ] **M7 — Tests + specs.** Live-DB tests for ranking, budget, eviction, dedup, and TTL sweep; scope-isolation tests re-run unchanged (no cross-user/cross-repo bleed through the new query paths); a regression test that the nonce fence and untrusted framing are byte-identical. `specs/ai.md` records the retrieval model and the FTS-vs-vector split.
+- [ ] **M7 — Tests + specs.** Live-DB tests for ranking, budget, eviction, dedup, and TTL sweep; scope-isolation tests re-run unchanged (no cross-user/cross-repo bleed through the new query paths); a regression test that the nonce fence and untrusted framing are byte-identical. `specs/ai.md` records the retrieval model and the FTS-vs-vector split. *(Superseded 2026-09-13, issue #1317: `specs/ai.md` is frozen; record the design in this PRD's Decision Log or an ADR instead.)*
 
 ### Phases / parallelism
 
