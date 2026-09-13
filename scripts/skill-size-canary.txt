@@ -1,0 +1,4 @@
+Liveness canary for scripts/check-skill-size.sh.
+This file exists only to be non-empty: the check measures its byte size with wc -c and
+asserts it registers as over a threshold one byte below its own size, proving the size
+detector fires before any SKILL.md verdict is trusted. Plain ASCII, no control bytes.
