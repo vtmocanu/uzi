@@ -20,10 +20,10 @@ function main(): void {
   if (report.unresolved.length > 0) {
     console.error(
       `run-receipts: ${report.unresolved.length} inherited/receipt-present O row(s) with an `
-      + "unresolved (placeholder) digest block merge (D8) — refresh to the real merge-candidate digest:",
+      + "unresolved (placeholder) base/jvm digest block merge (D8) — refresh BOTH to the real merge-candidate digests:",
     );
     for (const row of report.unresolved) {
-      console.error(`  - ${row.id}`);
+      console.error(`  - ${row.id} [${row.image}]`);
       console.error(`      digest: ${row.digest}`);
     }
   }

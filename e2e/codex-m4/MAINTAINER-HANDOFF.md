@@ -31,19 +31,21 @@ resolved.
 
 ## What is owed
 
-### 1. Inherited row — pin the real digest
+### 1. Inherited row — pin BOTH real digests
 
 **`codex-o-command-root-home-denial`** (File policy: command-root HOME/credential OS
 separation) cites `e2e/codex-m3b/lifecycle.test.ts` Block B (PRD #1171 m5) as its prior proof,
 and D8's unchanged-mechanism argument holds: C1-C4 changed no `agent/codex/**`
 supervisor/fileop/launcher code, and the C3 D6 repair is a policy-only `extraSecretPaths`
-addition. But its `imageDigest` is still the C1-seeded placeholder
-`sha256:PENDING-CANDIDATE-DIGEST` — `run-receipts.ts` treats a non-real digest as "unresolved"
-and blocks the merge gate exactly like an owed row, so citing a real historical case is not
-enough on its own.
+addition. But its `imageDigests` are still the C1-seeded placeholders
+`sha256:PENDING-CANDIDATE-DIGEST-BASE` / `sha256:PENDING-CANDIDATE-DIGEST-JVM` — a merge candidate
+ships TWO images (`base` and `jvm`) and one proven image cannot vouch for the other, so
+`run-receipts.ts` treats a non-real digest on EITHER image as "unresolved" and blocks the merge
+gate exactly like an owed row, naming which image is still unresolved. Citing a real historical
+case is not enough on its own.
 
-**Action:** pin `imageDigest` in `e2e/codex-m4/clauses-codex.ts` to the actual merge-candidate
-image's `sha256:<64-hex>` digest before accepting parent M4.
+**Action:** pin BOTH `imageDigests.base` and `imageDigests.jvm` in `e2e/codex-m4/clauses-codex.ts`
+to the actual merge-candidate images' `sha256:<64-hex>` digests before accepting parent M4.
 
 ### 2. Owed rows — fresh packaged proof
 
@@ -104,10 +106,11 @@ Also required before parent M4 acceptance:
    positive per-image Block A counts and the Block B real-path counts described in
    `e2e/codex-m3b/README.md`.
 3. Update `e2e/codex-m4/clauses-codex.ts`:
-   - Set `codex-o-command-root-home-denial`'s `imageDigest` to the real `sha256:<64-hex>` value.
+   - Set `codex-o-command-root-home-denial`'s `imageDigests.base` AND `imageDigests.jvm` to the
+     real `sha256:<64-hex>` values of the two merge-candidate images (both are required).
    - Flip `codex-o-descendant-code-mode-host-absence` and `codex-o-packaged-descendant-reaping`
      from `owed` to `receipt-present` (or a fresh `inherited` citation for a later candidate),
-     each with `source`, `imageDigest`, `target`, and optionally `recordedAt`.
+     each with `source`, `imageDigests` (`{ base, jvm }`), `target`, and optionally `recordedAt`.
 4. Re-run `task check:codex-m4-receipts` and confirm it prints
    `run-receipts: OK — every O-layer clause has an inherited/receipt-present record; none owed.`
 5. Run the strict macOS Linux-container invocation and confirm current-head CI `test-agent`.

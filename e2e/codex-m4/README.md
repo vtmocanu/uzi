@@ -14,7 +14,7 @@ proves *every required clause*, not one lifecycle path.
 |---|---|---|
 | **U**: unit/adapter | Recorded payloads, real hook/broker/renderer/reducer policy, grants and injected failure paths | Additive `agent/test/*.test.ts` (ordinary `npm test`) plus `e2e/codex-m4/*.test.ts` |
 | **P**: real protocol, OS effects injected | Pinned real app-server, production isolation template, broker/registry/builders/delegation and fixed provider scripts; only launcher/setpriv, fileop and command OS effects are injected through existing production seam types | `task test:codex-m4`, a mandatory serial second step of `test:agent` (and therefore `gate:agent` and CI) |
-| **O**: packaged OS | uid separation, Landlock, openat2, supervisor descendant reaping and actual provider/command-root effects | Maintainer-only, both packaged images; recorded as `inherited` / `receipt-present` / `owed` (D3/D8), gated by `task check:codex-m4-receipts` |
+| **O**: packaged OS | uid separation, Landlock, openat2, supervisor descendant reaping and actual provider/command-root effects | Maintainer-only; each proof binds BOTH packaged images (`base` + `jvm` `sha256` digests, one cannot vouch for the other); recorded as `inherited` / `receipt-present` / `owed` (D3/D8), gated by `task check:codex-m4-receipts` |
 
 The machine-readable registry (`clauses-claude.ts` + `clauses-codex.ts`, aggregated by
 `registry.ts`) is the **source of truth** for every clause. The strict completeness checker
@@ -93,7 +93,8 @@ task test:codex-m4
 task test:codex-m3b:host
 
 # The LEAD's pre-merge gate: rejects any O-layer clause still `owed` or citing an unresolved
-# (placeholder) image digest. Currently non-zero by design — see MAINTAINER-HANDOFF.md.
+# (placeholder) base/jvm image digest (BOTH must resolve). Currently non-zero by design — see
+# MAINTAINER-HANDOFF.md.
 task check:codex-m4-receipts
 ```
 

@@ -23,25 +23,34 @@ export type Layer = "U" | "P" | "O";
  * The O-evidence three-state model (D8). An O row can never be "executed" in this worker
  * (no Landlock/uid-split/descendant-reaping proof runs here), so its evidence is one of:
  *   - `inherited`      — a previously tested source/image proves the SAME unchanged mechanism
- *                        (cite the source, image digest, target, case, and WHY the enforcement
- *                        path is unchanged at this candidate);
+ *                        (cites the source, image digests (base+jvm), target, case, and WHY the
+ *                        enforcement path is unchanged at this candidate);
  *   - `receipt-present`— a fresh packaged case has been run and recorded for this candidate;
  *   - `owed`           — no valid proof exists yet; the maintainer owns running it. `owed` is a
  *                        VALID record for the ordinary completeness gate (it is not executed
  *                        evidence) but the SEPARATE receipts gate (receipts.ts) rejects it.
  */
+/** The pair of distinct merge-candidate image digests every O proof must bind (D8): a merge
+ *  candidate ships TWO images — `base` and `jvm` — and one proven image cannot vouch for the
+ *  other. Both must independently resolve to a real `sha256:<64-hex>` before the receipts gate
+ *  passes. */
+export interface ImageDigests {
+  readonly base: string;
+  readonly jvm: string;
+}
+
 export type OState =
   | {
       readonly kind: "inherited";
       readonly source: string;
-      readonly imageDigest: string;
+      readonly imageDigests: ImageDigests;
       readonly target: string;
       readonly unchangedJustification: string;
     }
   | {
       readonly kind: "receipt-present";
       readonly source: string;
-      readonly imageDigest: string;
+      readonly imageDigests: ImageDigests;
       readonly target: string;
       readonly recordedAt?: string;
     }
@@ -90,11 +99,16 @@ export function isOState(value: unknown): value is OState {
   if (value === null || typeof value !== "object") return false;
   const o = value as Record<string, unknown>;
   const str = (v: unknown): v is string => typeof v === "string" && v.length > 0;
+  const digestsOk = (v: unknown): boolean => {
+    if (v === null || typeof v !== "object") return false;
+    const d = v as Record<string, unknown>;
+    return str(d.base) && str(d.jvm);
+  };
   switch (o.kind) {
     case "inherited":
-      return str(o.source) && str(o.imageDigest) && str(o.target) && str(o.unchangedJustification);
+      return digestsOk(o.imageDigests) && str(o.source) && str(o.target) && str(o.unchangedJustification);
     case "receipt-present":
-      return str(o.source) && str(o.imageDigest) && str(o.target)
+      return digestsOk(o.imageDigests) && str(o.source) && str(o.target)
         && (o.recordedAt === undefined || str(o.recordedAt));
     case "owed":
       return str(o.target) && str(o.reason) && str(o.owner);

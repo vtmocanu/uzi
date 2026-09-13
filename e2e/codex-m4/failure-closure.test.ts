@@ -53,6 +53,24 @@ const NATIVE_FEATURES = [
   "remote_models",
 ];
 
+/** Split a config.toml TEXT into sections keyed by table header ("" = the root table,
+ *  before the first [header]). Only bare `key = value` lines are collected per section —
+ *  enough to assert a key lands in its EFFECTIVE table, without a full TOML parser. */
+function tomlSections(toml: string): Map<string, string[]> {
+  const sections = new Map<string, string[]>([["", []]]);
+  let current = "";
+  for (const raw of toml.split("\n")) {
+    const line = raw.trim();
+    if (line.startsWith("[") && line.endsWith("]")) {
+      current = line.slice(1, -1);
+      if (!sections.has(current)) sections.set(current, []);
+      continue;
+    }
+    if (line.length > 0) sections.get(current)!.push(line);
+  }
+  return sections;
+}
+
 describe("codex U failure closure (a): production hooks are DISABLED (config.ts)", () => {
   it(CODEX_U_FAILURE_HOOKS_DISABLED_TITLE, () => {
     const opts = { model: "gpt-6-astra", projectPath: "/work/repo" } as const;
@@ -63,15 +81,28 @@ describe("codex U failure closure (a): production hooks are DISABLED (config.ts)
     // NEGATIVE oracle: hooks are OFF and every native execution feature is OFF, in EVERY builder.
     // An upstream hook failure therefore has nothing to become — production ships no hook surface.
     for (const [label, toml] of [["prod api_key", prodApi], ["prod subscription", prodSub], ["loopback", loopback]] as const) {
-      assert.match(toml, /hooks = false/, `${label}: hooks are disabled`);
+      const sections = tomlSections(toml);
+      const root = sections.get("") ?? [];
+      const features = sections.get("features") ?? [];
+      const projectsKey = [...sections.keys()].find((k) => k.startsWith("projects."));
+      const projects = projectsKey !== undefined ? sections.get(projectsKey)! : [];
+
+      // Global hook-trust invariants (never a per-thread/CLI bypass anywhere in the text).
       assert.doesNotMatch(toml, /hooks = true/, `${label}: hooks are NEVER enabled`);
       assert.ok(!toml.includes("bypass_hook_trust"), `${label}: no per-thread hook-trust bypass`);
       assert.ok(!toml.includes("dangerously-bypass-hook-trust"), `${label}: no CLI hook-trust bypass`);
+
+      // EFFECTIVE-TABLE oracle (a key moved to an ineffective table now fails):
+      // hooks + every native execution feature are disabled UNDER [features].
+      assert.ok(features.includes("hooks = false"), `${label}: [features].hooks = false`);
       for (const feature of NATIVE_FEATURES) {
-        assert.match(toml, new RegExp(`${feature} = false`), `${label}: native feature "${feature}" is disabled`);
+        assert.ok(features.includes(`${feature} = false`), `${label}: [features].${feature} = false (effective table)`);
       }
-      assert.match(toml, /project_doc_max_bytes = 0/, `${label}: repo docs are not ingested`);
-      assert.match(toml, /trust_level = "untrusted"/, `${label}: the canonical project is untrusted`);
+      // repo docs are not ingested — project_doc_max_bytes is a ROOT key, not a nested one.
+      assert.ok(root.includes("project_doc_max_bytes = 0"), `${label}: project_doc_max_bytes = 0 is a ROOT key`);
+      // the canonical project is untrusted under its own [projects."<path>"] table.
+      assert.equal(projectsKey, `projects.${JSON.stringify(opts.projectPath)}`, `${label}: the [projects."<path>"] table exists`);
+      assert.ok(projects.includes(`trust_level = "untrusted"`), `${label}: [projects."${opts.projectPath}"].trust_level = "untrusted"`);
     }
 
     // POSITIVE control: the builders are reachable and DO emit their intended authenticated

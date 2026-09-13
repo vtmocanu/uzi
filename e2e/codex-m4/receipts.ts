@@ -3,9 +3,10 @@
 // The ordinary gate (completeness.ts) permits a well-formed `owed` O row AND a well-formed
 // `inherited`/`receipt-present` row whose digest is still a placeholder: both are valid RECORDS
 // for the worker's gate, not test failures. This gate is stricter and is the LEAD's merge gate:
-// it rejects if ANY O row is still `owed`, OR if an `inherited`/`receipt-present` row carries a
-// digest that is not a real merge-candidate sha256 (an "unresolved" digest — a placeholder like
-// `sha256:PENDING-CANDIDATE-DIGEST` or any non-`sha256:<64-hex>` value). This keeps the C1 seed
+// it rejects if ANY O row is still `owed`, OR if an `inherited`/`receipt-present` row carries
+// either merge-candidate digest (base or jvm) that is not a real merge-candidate sha256 (an
+// "unresolved" digest — a placeholder like `sha256:PENDING-CANDIDATE-DIGEST` or any
+// non-`sha256:<64-hex>` value). This keeps the C1 seed
 // honest: an inherited row that merely CLAIMS a receipt without a real digest cannot let parent
 // M4 be marked complete before the maintainer refreshes it to the actual merge-candidate digest.
 //
@@ -28,17 +29,22 @@ export interface OwedRow {
   readonly owner: string;
 }
 
-/** One inherited/receipt-present O row whose digest is not a real merge-candidate sha256. */
+/** One inherited/receipt-present O row with an unresolved (placeholder/non-real) image digest.
+ *  `image` names WHICH merge-candidate image failed (base or jvm); a row can appear once per
+ *  unresolved image, so a half-proven row (one real, one placeholder) still blocks the gate. */
 export interface UnresolvedRow {
   readonly id: string;
+  readonly image: "base" | "jvm";
   readonly digest: string;
 }
 
 export interface ReceiptsReport {
   readonly ok: boolean;
   readonly owed: OwedRow[];
-  /** inherited/receipt-present O rows whose `imageDigest` is a placeholder/non-real sha256 — a
-   *  distinct blocking category from `owed`: the receipt cites no real merge-candidate image. */
+  /** inherited/receipt-present O rows whose base/jvm `imageDigests` carry a placeholder/non-real
+   *  sha256 — a distinct blocking category from `owed`: the receipt cites no real merge-candidate
+   *  image. One row per unresolved image, so a half-proven row (one real, one placeholder) shows up
+   *  once for the failing image. */
   readonly unresolved: UnresolvedRow[];
   /** O rows whose `o` field is missing/malformed — also a rejection (a receipt cannot be read). */
   readonly malformed: string[];
@@ -60,10 +66,14 @@ export function checkReceipts(clauses: readonly ClauseRow[]): ReceiptsReport {
       owed.push({ id: c.id, target: c.o.target, reason: c.o.reason, owner: c.o.owner });
       continue;
     }
-    // inherited | receipt-present: the cited digest must be a real merge-candidate sha256, not a
-    // placeholder. (isOState already rejected an empty/missing digest as malformed above.)
-    if (!REAL_IMAGE_DIGEST.test(c.o.imageDigest)) {
-      unresolved.push({ id: c.id, digest: c.o.imageDigest });
+    // inherited | receipt-present: BOTH merge-candidate images (base AND jvm) must resolve to a
+    // real sha256; one proven image cannot vouch for the other. (isOState already rejected a
+    // missing/empty base or jvm as malformed above.)
+    for (const image of ["base", "jvm"] as const) {
+      const digest = c.o.imageDigests[image];
+      if (!REAL_IMAGE_DIGEST.test(digest)) {
+        unresolved.push({ id: c.id, image, digest });
+      }
     }
   }
   return {

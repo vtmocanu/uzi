@@ -2,7 +2,8 @@
 // any owed (or malformed) O row, rejects an inherited/receipt-present row whose digest is an
 // unresolved placeholder, and accepts an all-inherited/receipt-present set with REAL digests. It
 // also asserts the REAL registry is red at C1 for BOTH the seeded owed row AND the seeded inherited
-// row's placeholder `sha256:PENDING-CANDIDATE-DIGEST` — both are maintainer-owed before merge. A
+// row's placeholder base/jvm digests (`sha256:PENDING-CANDIDATE-DIGEST-BASE`/`-JVM`) — both are
+// maintainer-owed before merge. A
 // cross-check confirms the ORDINARY completeness checker still treats that placeholder row as
 // well-formed (the divergence is deliberate: the worker gate stays green, the merge gate goes red).
 
@@ -29,20 +30,22 @@ function orow(id: string, o: OState | undefined): ClauseRow {
   };
 }
 
-/** A real, resolved merge-candidate digest (sha256: + 64 lowercase hex). */
-const REAL_DIGEST = `sha256:${"deadbeef".repeat(8)}`;
-/** The exact placeholder the C1 registry seeds into its inherited O row. */
-const PLACEHOLDER_DIGEST = "sha256:PENDING-CANDIDATE-DIGEST";
+/** Real, resolved merge-candidate digests (sha256: + 64 lowercase hex) for the two images. */
+const REAL_BASE = `sha256:${"deadbeef".repeat(8)}`;
+const REAL_JVM = `sha256:${"feedface".repeat(8)}`;
+/** The exact placeholders the C1 registry seeds into its inherited O row's base/jvm digests. */
+const PLACEHOLDER_BASE = "sha256:PENDING-CANDIDATE-DIGEST-BASE";
+const PLACEHOLDER_JVM = "sha256:PENDING-CANDIDATE-DIGEST-JVM";
 
 const INHERITED: OState = {
   kind: "inherited",
   source: "src",
-  imageDigest: REAL_DIGEST,
+  imageDigests: { base: REAL_BASE, jvm: REAL_JVM },
   target: "image",
   unchangedJustification: "unchanged",
 };
-const INHERITED_PLACEHOLDER: OState = { ...INHERITED, imageDigest: PLACEHOLDER_DIGEST };
-const RECEIPT: OState = { kind: "receipt-present", source: "src", imageDigest: REAL_DIGEST, target: "image" };
+const INHERITED_PLACEHOLDER: OState = { ...INHERITED, imageDigests: { base: PLACEHOLDER_BASE, jvm: PLACEHOLDER_JVM } };
+const RECEIPT: OState = { kind: "receipt-present", source: "src", imageDigests: { base: REAL_BASE, jvm: REAL_JVM }, target: "image" };
 const OWED: OState = { kind: "owed", target: "image", reason: "needs proof", owner: "maintainer" };
 
 describe("checkReceipts", () => {
@@ -69,20 +72,39 @@ describe("checkReceipts", () => {
     assert.equal(report.ok, true);
   });
 
-  it("(b) an inherited row with a placeholder digest is flagged as unresolved (not owed)", () => {
+  it("(b) an inherited row with placeholder digests is flagged as unresolved (not owed)", () => {
     const report = checkReceipts([orow("pend", INHERITED_PLACEHOLDER)]);
     assert.equal(report.ok, false);
     assert.deepEqual(report.owed, [], "a placeholder digest is a distinct category from owed");
-    assert.equal(report.unresolved.length, 1);
-    assert.equal(report.unresolved[0]?.id, "pend");
-    assert.equal(report.unresolved[0]?.digest, PLACEHOLDER_DIGEST);
+    // BOTH base and jvm are placeholders → one unresolved row per image.
+    assert.equal(report.unresolved.length, 2);
+    for (const row of report.unresolved) assert.equal(row.id, "pend");
+    assert.deepEqual(report.unresolved.map((r) => r.image).sort(), ["base", "jvm"]);
+  });
+
+  it("binds BOTH merge-candidate images: one proven image cannot vouch for the other", () => {
+    // base real, jvm placeholder → still unresolved (only jvm), NOT accepted.
+    const halfProven: OState = { ...INHERITED, imageDigests: { base: REAL_BASE, jvm: PLACEHOLDER_JVM } };
+    const half = checkReceipts([orow("half", halfProven)]);
+    assert.equal(half.ok, false, "a real base cannot vouch for an unresolved jvm");
+    assert.equal(half.unresolved.length, 1);
+    assert.equal(half.unresolved[0]?.id, "half");
+    assert.equal(half.unresolved[0]?.image, "jvm");
+    assert.equal(half.unresolved[0]?.digest, PLACEHOLDER_JVM);
+    // both real → passes.
+    const bothReal: OState = { ...INHERITED, imageDigests: { base: REAL_BASE, jvm: REAL_JVM } };
+    const full = checkReceipts([orow("full", bothReal)]);
+    assert.equal(full.ok, true, "both images proven → the receipts gate passes");
+    assert.deepEqual(full.unresolved, []);
   });
 
   it("flags a receipt-present row whose digest is not sha256:<64-hex>", () => {
-    const badReceipt: OState = { ...RECEIPT, imageDigest: "sha256:cafe" };
+    const badReceipt: OState = { ...RECEIPT, imageDigests: { base: REAL_BASE, jvm: "sha256:cafe" } };
     const report = checkReceipts([orow("shortdigest", badReceipt)]);
     assert.equal(report.ok, false);
+    assert.equal(report.unresolved.length, 1);
     assert.equal(report.unresolved[0]?.id, "shortdigest");
+    assert.equal(report.unresolved[0]?.image, "jvm");
     assert.equal(report.unresolved[0]?.digest, "sha256:cafe");
   });
 
@@ -126,13 +148,15 @@ describe("checkReceipts", () => {
       report.owed.some((row) => row.id === "codex-o-descendant-code-mode-host-absence"),
       "the descendant code-mode-host absence O row is owed to the maintainer",
     );
-    // The seeded inherited row cites sha256:PENDING-CANDIDATE-DIGEST — a placeholder, not a real
-    // merge-candidate digest — so the merge gate now also blocks on it as unresolved.
+    // The seeded inherited row cites two placeholders (base + jvm), not real merge-candidate
+    // digests — so the merge gate now blocks on BOTH as unresolved.
     assert.ok(
-      report.unresolved.some(
-        (row) => row.id === "codex-o-command-root-home-denial" && row.digest === "sha256:PENDING-CANDIDATE-DIGEST",
-      ),
-      "the inherited command-root HOME-denial row's placeholder digest is flagged unresolved",
+      report.unresolved.some((r) => r.id === "codex-o-command-root-home-denial" && r.image === "base" && r.digest === "sha256:PENDING-CANDIDATE-DIGEST-BASE"),
+      "the inherited command-root HOME-denial row's placeholder BASE digest is flagged unresolved",
+    );
+    assert.ok(
+      report.unresolved.some((r) => r.id === "codex-o-command-root-home-denial" && r.image === "jvm" && r.digest === "sha256:PENDING-CANDIDATE-DIGEST-JVM"),
+      "... and its placeholder JVM digest is flagged unresolved",
     );
   });
 });

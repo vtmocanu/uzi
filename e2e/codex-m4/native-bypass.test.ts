@@ -204,7 +204,7 @@ test(CODEX_P_ISOLATION_ENV_TITLE, { skip: P_LAYER_SKIP }, async (t) => {
   // A deterministic parent-env canary proves this is a full replacement, not a merge that happens
   // to omit the credential-shaped names below.
   assert.equal(env.UZI_M4_ENV_CANARY, undefined, "the replaced child env drops a parent-env canary");
-  assert.doesNotMatch(envBlob, new RegExp(inheritedCanary), "the parent-env canary value is absent");
+  assert.ok(!envBlob.includes(inheritedCanary), "the parent-env canary value is absent");
 
   // The credential rides the app-server login RPC, NEVER the launcher/app-server env. The sparse
   // REPLACED env must not carry the provider credential (command/provider credential separation).
@@ -219,9 +219,19 @@ test(CODEX_P_ISOLATION_ENV_TITLE, { skip: P_LAYER_SKIP }, async (t) => {
     /CLAUDE_CODE_OAUTH_TOKEN|UZI_WORKER_TOKEN|GITHUB_TOKEN|GITLAB_TOKEN|OPENAI_API_KEY/,
     "no inherited credential-shaped env var",
   );
-  // A bounded allowlist, not the worker's whole environment.
-  assert.ok(Object.keys(env).length > 0, "the app-server received a (replaced) env");
-  assert.ok(Object.keys(env).length < 40, "the app-server env is a bounded sparse allowlist, not a merged process.env");
+  // EXACT allowlist (not a merged process.env): buildReplacedEnv emits precisely these keys
+  // for an app-server-auth root — HOME/CODEX_HOME/the four XDG_*/TMPDIR plus a fixed
+  // PATH/SHELL/LANG/TERM, and NO provider credential var (the credential rides the login RPC).
+  const REPLACED_ENV_ALLOWLIST = [
+    "HOME", "CODEX_HOME",
+    "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME",
+    "TMPDIR", "PATH", "SHELL", "LANG", "TERM",
+  ].sort();
+  assert.deepEqual(
+    Object.keys(env).sort(),
+    REPLACED_ENV_ALLOWLIST,
+    "the app-server env is EXACTLY the sparse replaced allowlist, not a merged process.env",
+  );
   assert.deepEqual(obs.providerErrors, [], "the fake provider recorded no errors");
 
   recordEvidence(CODEX_P_ISOLATION_ENV_TITLE, "pass");

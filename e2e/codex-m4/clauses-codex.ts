@@ -81,7 +81,10 @@ export const CODEX_CLAUSES: ClauseRow[] = [
     o: {
       kind: "inherited",
       source: "e2e/codex-m3b/lifecycle.test.ts Block B (PRD #1171 m5)",
-      imageDigest: "sha256:PENDING-CANDIDATE-DIGEST",
+      imageDigests: {
+        base: "sha256:PENDING-CANDIDATE-DIGEST-BASE",
+        jvm: "sha256:PENDING-CANDIDATE-DIGEST-JVM",
+      },
       target: "codex worker image (base + jvm)",
       unchangedJustification:
         "C1-C4 change no agent/codex/** supervisor/fileop/launcher code — the C3 D6 repair is a "
@@ -90,8 +93,8 @@ export const CODEX_CLAUSES: ClauseRow[] = [
         + "command-root HOME/credential separation is byte-identical to the M3b-proven images. Its "
         + "required regression is the C3 U/P HOME-screener case (codex-u-home-screening-executor-d6) "
         + "plus the M3b host-side Block A evidence, now run via `task test:codex-m3b:host` (C4 §4). "
-        + "The digest stays the PENDING placeholder; the maintainer pins the real merge-candidate "
-        + "digest and re-runs UZI_CODEX_M3B_PACKAGED=1 test:codex-m3b:packaged before parent M4 (D8).",
+        + "The digests stay the PENDING placeholders; the maintainer pins BOTH real merge-candidate "
+        + "digests (base and jvm) and re-runs UZI_CODEX_M3B_PACKAGED=1 test:codex-m3b:packaged before parent M4 (D8).",
     },
   },
   {
