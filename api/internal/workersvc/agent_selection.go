@@ -64,7 +64,7 @@ type RepoAgent = apitypes.RepoAgent
 type AgentSelection = apitypes.AgentSelection
 
 // guardRoles are subagent roles whose deliberate exclusion at approve time warrants an
-// owner heads-up (PRD #319 M3, D4). spec-keeper guards specs/human.md + specs/ai.md.
+// owner heads-up (PRD #319 M3, D4). spec-keeper guards specs/human.md (specs/ai.md is frozen, #1317).
 // Extensible: add a role here to make its exclusion notify.
 var guardRoles = map[string]bool{"spec-keeper": true}
 

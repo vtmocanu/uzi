@@ -99,7 +99,7 @@ Phase 1 (parallel, disjoint files): M1 and M2 touch non-overlapping trees (api S
   - `task gate:web` green.
 
 - [ ] **M3 — Docs, specs, and full gate.**
-  - `specs/ai.md`: note the board-free lane now covers all issue-less MR-bearing runs (D1) and the merged-chip inline treatment (D6). No `specs/human.md` change is required (bug fix + presentation polish, no new user-stated requirement); if a terse sync line is warranted, tag it `(AI-synced YYYY-MM-DD)`.
+  - `specs/ai.md`: note the board-free lane now covers all issue-less MR-bearing runs (D1) and the merged-chip inline treatment (D6). No `specs/human.md` change is required (bug fix + presentation polish, no new user-stated requirement); if a terse sync line is warranted, tag it `(AI-synced YYYY-MM-DD)`. *(Superseded 2026-09-13, issue #1317: `specs/ai.md` is frozen; record the design in this PRD's Decision Log or an ADR instead.)*
   - Confirm no doc comment left stale by the rename remains (`forge.sql`, `scheduled_mr_watch.go`, `poller.go`); M1 owns those under D2's floor, so this is a verification pass, not a second edit of the same comments.
   - `check:migration-numbering` and `check-docs` unaffected (no migration, no `docs/*.md` change expected); run `task gate` (all components) green.
 

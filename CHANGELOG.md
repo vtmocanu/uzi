@@ -18,6 +18,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Changed
+
+- **`specs/ai.md` is frozen at section 637; AI design decisions now live in the PRD Decision Logs and `adr/`** (issue #1317)
+  The file is read-only history with a `FROZEN` banner and a freeze gate (`task check:spec-numbering`: unique numbers, none above 637, count 637, canary proving both detectors), so the tail-append numbering collisions between parallel PRs are gone and every existing `§N` reference keeps resolving. The spec-keeper builtin moves to library v6 (never creates a `specs/ai.md`; honors the marker), the dev roster and `AGENTS.md` specs contract follow, and unfinished PRD milestones that still said "append `specs/ai.md`" carry a superseded note.
+
 ### Added
 
 - **An admin can review every user's judge recommendations at once, on a new All users view on the Judge page ([#1184](https://github.com/vtmocanu/uzi/issues/1184)).**

@@ -63,7 +63,8 @@ tools. Default flow:
 4. **Resolve** blocking findings (route them back to coder via SendMessage).
 5. **Spec-keeper**, once findings are resolved, with the change summary plus a
    user-vs-AI provenance split (only the lead has seen the conversation).
-   `specs/ai.md` applies directly; `specs/human.md` edits go to the user first.
+   `specs/ai.md` is frozen (issue #1317); decisions go to the PRD Decision Log or an
+   ADR, and `specs/human.md` edits go to the user first.
 
 ## Context handoff (CRITICAL)
 
@@ -679,7 +680,7 @@ over raising the timeout.
   GitOps via ArgoCD to dev-cluster. See CLAUDE.md "Cutting a release",
   `.claude/agents/release.md`, and `deploy/`.
 - **Spec dir:** `specs/` — `human.md` (user contract, edits need user approval),
-  `ai.md` (AI design decisions, applied directly).
+  `ai.md` (frozen at §637, issue #1317; AI decisions go to `prds/` Decision Logs and `adr/`).
 - **Authoring rules:** root `CLAUDE.md` plus the on-demand `.claude/rules/*.md`;
   read `ARCHITECTURE.md` for cross-service work.
 - **CI:** `.github/workflows/ci.yml` runs the same `task` targets per toolchain

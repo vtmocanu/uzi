@@ -266,7 +266,7 @@ Full docs live in [docs/](docs/), and the same golden-path pages are browsable i
 
 **Design:** [Auth design](docs/auth-design.md) · [Proc hardening](docs/proc-hardening.md) · [Security gate](docs/security-gate.md) · [Vault threat model](docs/vault-threat-model.md) · [Why a hosted run costs less](docs/run-cost.md) · [Developer conventions](docs/dev-conventions.md)
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the system shape, [prds/](prds/) for product specs, and [specs/](specs/) for the requirements contract ([human.md](specs/human.md)) and design decisions ([ai.md](specs/ai.md)).
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the system shape, [prds/](prds/) for product specs, and [specs/](specs/) for the requirements contract ([human.md](specs/human.md)); AI design decisions live in the PRD Decision Logs and [adr/](adr/), with [ai.md](specs/ai.md) frozen as history.
 
 ## Contributing
 
