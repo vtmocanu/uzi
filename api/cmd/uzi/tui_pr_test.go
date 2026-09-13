@@ -152,7 +152,7 @@ func TestTUIPRHeaderLine2KeepsDiffstatWithLongTitle(t *testing.T) {
 // https check URL and a coarse mergeable-state each drove a width-derived renderer.Plain cap to ≤0,
 // underflowing capCell and panicking the whole TUI at terminal width ≤14 (and ≤6). With the floors
 // and the capCell guard, every width degrades gracefully — no panic, and no rendered line overflows
-// m.width. (Pre-fix this panics at width 14 with `slice bounds out of range [:-5]`.)
+// m.width. (Pre-fix this panics at width 14 with `slice bounds out of range [:-1]`.)
 func TestTUIPRRendersAtNarrowWidthsWithoutPanic(t *testing.T) {
 	merge := apitypes.MergeStateDTO{Conflicts: bp(true), RequiredChecksPassed: false,
 		MergeableState: "blocked", BlockedReason: "changes requested by a required reviewer"}
@@ -368,6 +368,65 @@ func TestTUIPRReopenStaleReplyDropped(t *testing.T) {
 	}
 	if m.pr.iid != 200 {
 		t.Fatalf("the PR view is no longer scoped to B (iid=%d)", m.pr.iid)
+	}
+}
+
+// TestTUIPRReqIDGuardDropsStaleSameSessionReply pins the reqID defence INDEPENDENTLY of the gen
+// guard. Within ONE PR session (same gen) two polls can be in flight at once — an earlier poll's
+// reply can land after a newer poll was minted — and both carry the SAME session gen, so the gen
+// guard (TestTUIPRReopenStaleReplyDropped) can never tell them apart: only reqID == waitID does.
+// This test delivers a reply carrying the CURRENT gen (so the gen guard does NOT fire) but an
+// earlier in-session reqID, and asserts it is dropped — the whole point being that removing the
+// reqID!=waitID clause from the prMsg handler (keeping only the gen guard) reddens exactly here
+// while TestTUIPRStaleReplyDropped / the reopen test stay green on gen alone.
+func TestTUIPRReqIDGuardDropsStaleSameSessionReply(t *testing.T) {
+	orig := prPollInterval
+	prPollInterval = time.Millisecond
+	t.Cleanup(func() { prPollInterval = orig })
+
+	const staleRunID = "deadbeef-1111-2222-3333-444444444444"
+	cur := prDetail(77, "review_required", []apitypes.CheckDTO{ckRunning("current-check")}, nil, apitypes.MergeStateDTO{})
+	fake := &uzicli.FakeClient{Repos: []apitypes.RepoDTO{oneRepo()}, PullDetailResult: cur}
+	m := openPRWith(t, fake, cur)
+
+	// The open's first reply has landed (gen stamped, guard idle). A tick mints a SECOND in-session
+	// poll under the SAME gen: reqSeq advances (≠0) so startPRReq does NOT bump gen.
+	sessionGen := m.pr.gen
+	m, _ = prTick(t, m)
+	waitID := m.pr.waitID
+	if waitID == 0 {
+		t.Fatal("the tick did not mint an in-session PR request")
+	}
+	if m.pr.gen != sessionGen {
+		t.Fatalf("a same-session re-poll advanced the session gen (gen=%d, want %d)", m.pr.gen, sessionGen)
+	}
+
+	// A stale EARLIER in-session poll replies late: reqID is a prior poll's id (≠ waitID) but the gen
+	// is the current session's, so the gen guard does NOT catch it — only the reqID clause can.
+	staleReqID := waitID - 1
+	if staleReqID == waitID {
+		t.Fatalf("the stale reqID must differ from waitID to exercise the reqID guard (both %d)", waitID)
+	}
+	stale := prDetail(77, "approved", []apitypes.CheckDTO{ckPassed("stale-check")}, nil, apitypes.MergeStateDTO{})
+	stale.Title = "stale in-session reply"
+	stale.RunID = sp(staleRunID)
+	next, _ := m.Update(prMsg{reqID: staleReqID, gen: sessionGen, detail: stale})
+	m = next.(tuiModel)
+
+	// The reply was dropped: the in-flight guard is untouched AND the view still shows the current
+	// session's detail (RunID / Title / Checks), never the stale reply's.
+	if m.pr.waitID != waitID {
+		t.Fatalf("a same-session stale reply cleared the in-flight guard: waitID=%d, want %d", m.pr.waitID, waitID)
+	}
+	if m.pr.detail.ReviewDecision == "approved" || m.pr.detail.Title == "stale in-session reply" {
+		t.Fatalf("a same-session stale reply applied its detail (decision=%q title=%q)",
+			m.pr.detail.ReviewDecision, m.pr.detail.Title)
+	}
+	if m.pr.detail.RunID == nil || *m.pr.detail.RunID != prLinkedRunID {
+		t.Fatalf("the stale reply overwrote the current RunID (got %v, want %s)", m.pr.detail.RunID, prLinkedRunID)
+	}
+	if len(m.pr.detail.Checks) != 1 || m.pr.detail.Checks[0].Name != "current-check" {
+		t.Fatalf("the stale reply overwrote the current session's checks (%+v)", m.pr.detail.Checks)
 	}
 }
 
