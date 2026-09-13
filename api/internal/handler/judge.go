@@ -272,6 +272,7 @@ func reviewToDTO(rw workersvc.ReviewWithRecommendations) apitypes.ReviewDTO {
 				Reason:   d.DismissReason.String, // "" when not dismissed
 				SetAt:    d.SetAt.Time,
 				Stale:    workersvc.RationaleHash(rc.RationaleMd) != d.RationaleHash,
+				SetVia:   d.SetVia.String, // "" when a person set it; issue_close/denied_cli/admin otherwise (PRD #1184 M4)
 			})
 		}
 	}
@@ -481,5 +482,5 @@ func (h *Handler) RerunJudge(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	httpx.JSON(w, http.StatusAccepted, map[string]any{"run": runToDTO(judge, h.runPriorityClass(r.Context(), judge), h.cfg.RunTimeout)})
+	httpx.JSON(w, http.StatusAccepted, map[string]any{"run": runToDTO(judge, h.runPriorityClass(r.Context(), judge), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.clock())})
 }

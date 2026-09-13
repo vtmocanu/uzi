@@ -97,6 +97,15 @@ SELECT w.*,
              AND r.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
              AND r.kind <> 'chat'
        ) AS active_runs,
+       -- retaining_unpublished_work (PRD #1296 M4, D4): does this worker hold any OPEN
+       -- custody hold? A held worker consumes NO active run/LLM slot (so it is not counted
+       -- in busy/active_runs above), but it is NOT free capacity — it still counts against
+       -- the per-owner hosted quota, and the owner surface distinguishes it. A top-level
+       -- EXISTS types as a plain Go bool here, exactly like the busy column above.
+       EXISTS (
+           SELECT 1 FROM recovery_custody_holds h
+           WHERE h.live_worker_id = w.id AND h.state = 'open'
+       ) AS retaining_unpublished_work,
        -- Roll health (PRD #113 M4), LEFT JOINed so a worker with no report — every
        -- external worker, any hosted worker the controller has not reached, and the
        -- entire fleet under docker-compose where no controller runs — still lists.
@@ -632,17 +641,17 @@ SELECT * FROM runs WHERE id = @id AND worker_id = @worker_id;
 -- a run unclaimable), and a minimum-loaded worker never defers (guaranteeing
 -- claimability). Live = a heartbeat at/after @heartbeat_cutoff (D6). The spread
 -- clause is fully described inline at the WHERE below.
-UPDATE runs SET
-    status     = 'claimed',
-    status_since = now(),
-    worker_id  = @worker_id,
-    claimed_at = now(),
-    updated_at = now(),
-    -- Exit contract (PRD #47 Decision 3): leaving 'queued' clears any health flag
-    -- the detector raised (e.g. "no worker online"). health_notified_at is NOT reset.
-    health = 'ok', health_reason = NULL, health_since = NULL
-WHERE id = (
-    SELECT r.id FROM runs r
+--
+-- PRD #1296 M1 (D2/D3): the claim now runs as leading CTEs before the UPDATE so the hold
+-- is opened atomically in the SAME statement. `target` selects + LOCKS the single claimable
+-- run ONCE (carrying the columns the hold needs); `hold` opens the H-free custody hold for a
+-- recovery-capable worker on a code-publishing profile, reading FROM target so it inserts
+-- iff a run was actually claimable; then the UPDATE claims that same target row. The final
+-- statement is `UPDATE runs ... RETURNING *`, so the :one result is still store.Run — the
+-- hold is a side effect. target and hold share target's single snapshot/lock, so the hold's
+-- t.claim_generation + 1 equals the UPDATE's own increment.
+WITH target AS (
+    SELECT r.id, r.user_id, r.repo_id, r.kind, r.claim_generation FROM runs r
     WHERE r.user_id = @user_id
       AND r.kind <> 'chat'
       -- PRD #400 Decision 6: a task run is claimable ONLY after the CLI has seeded its
@@ -687,6 +696,19 @@ WHERE id = (
       -- PRD #84 M2 extends it: the run's required_capabilities must be a subset of the
       -- claiming worker's effective caps (@worker_caps ∪ docker), gated by @capability_aware.
       AND fn_worker_can_claim(@is_docker_worker::boolean, @docker_repo_allowlist::uuid[], r.repo_id, r.kind, @worker_caps::text[], r.required_capabilities, @capability_aware::boolean)
+      -- PRD #1296 M1 (D2/D4): custody-admission. Block the claim when the run's OWNER
+      -- already holds >= @custody_hold_limit UNRESOLVED (state='open') custody holds — the
+      -- owner has too much unpublished work awaiting recovery disposition. A gated claim
+      -- matches no row, so the run stays queued (the health resolver surfaces a distinct
+      -- custody-limit reason against this SAME predicate in a later milestone). This is an
+      -- OWNER-scoped admission gate (D4: the instance byte ceiling must never become a
+      -- global stop-claiming switch), placed alongside the existing eligibility checks. A
+      -- non-positive @custody_hold_limit DISABLES the gate (limit "<= 0" means unlimited),
+      -- so it never blocks an ordinary claim; the production caller always passes the
+      -- configured positive default (workersvc.custodyHoldLimit, 8).
+      AND (@custody_hold_limit::int <= 0
+           OR (SELECT count(*) FROM recovery_custody_holds ch
+                 WHERE ch.user_id = @user_id AND ch.state = 'open') < @custody_hold_limit::int)
       -- PRD #1226 M1 (D2): the NON-BYPASSABLE completion-protocol claim clause. An
       -- INTERLOCKED run (completion_contract_version IS NOT NULL) may be claimed ONLY by a
       -- worker whose SELF-REPORTED protocol_capabilities contain 'completion_interlock_v1';
@@ -780,8 +802,49 @@ WHERE id = (
              r.created_at ASC
     FOR UPDATE SKIP LOCKED
     LIMIT 1
+),
+hold AS (
+    -- PRD #1296 M1 (D2/D3): open the H-free custody hold atomically with the claim, for a
+    -- RECOVERY-CAPABLE worker (@recovery_capable, derived from the worker's advertised
+    -- recovery_archive_v1 protocol capability) on one of the six code-publishing profiles.
+    -- Reads FROM `target`, so it inserts exactly one hold iff a run was actually claimable
+    -- (an admission-gated or idle claim produces no `target` row and thus no hold). Both live
+    -- FKs point at the claimed run + claiming worker (ON DELETE RESTRICT while open), and the
+    -- immutable provenance columns record the taking worker's identity for a later
+    -- AAD-authenticated post-terminal recovery retry. t.claim_generation + 1 is the SAME
+    -- value the UPDATE below sets (same locked row, same snapshot).
+    INSERT INTO recovery_custody_holds
+        (id, user_id, repo_id, run_id, generation, state,
+         original_worker_id, original_worker_identity, live_worker_id, live_run_id,
+         created_at, updated_at)
+    SELECT gen_random_uuid(), t.user_id, t.repo_id, t.id, t.claim_generation + 1, 'open',
+           @worker_id, @worker_identity::text, @worker_id, t.id, now(), now()
+    FROM target t
+    WHERE @recovery_capable::boolean
+      AND t.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework')
+    RETURNING 1
 )
+UPDATE runs SET
+    status     = 'claimed',
+    status_since = now(),
+    worker_id  = @worker_id,
+    claimed_at = now(),
+    updated_at = now(),
+    -- PRD #1296 M1 (D2): the general claim-lane counter, incremented once per successful
+    -- claim. Returned in the claim payload; the hold above binds the identical value.
+    claim_generation = claim_generation + 1,
+    -- Exit contract (PRD #47 Decision 3): leaving 'queued' clears any health flag
+    -- the detector raised (e.g. "no worker online"). health_notified_at is NOT reset.
+    health = 'ok', health_reason = NULL, health_since = NULL
+WHERE id = (SELECT id FROM target)
 RETURNING *;
+
+-- name: CountUnresolvedCustodyHoldsForOwner :one
+-- PRD #1296 M1 (D2/D4): the owner's UNRESOLVED (state='open') custody-hold count — the
+-- same admission signal the ClaimRun predicate blocks on. A later milestone's health
+-- resolver reads this to surface a distinct custody-limit queued reason against the SAME
+-- decision the claim used, so the pill and the claim never disagree.
+SELECT count(*) FROM recovery_custody_holds WHERE user_id = @user_id AND state = 'open';
 
 -- name: GetRunClaimContext :one
 -- The repo + connection facts the claim payload needs, alongside the run. The
@@ -2596,6 +2659,14 @@ WHERE id = @id AND user_id = @user_id
 -- it in before persisting. This consumer trusts budget_wall_seconds as an already-capped,
 -- server-only, IMMUTABLE value — so a future writer that persists an UNCAPPED budget_wall_seconds
 -- would bypass the ceiling here, and the cap must stay at every write path, not be moved to reads.
+--
+-- PRD #1189 M1: budget_extension_seconds is a HUMAN-GRANTED additive term, added on top of
+-- the frozen budget so an owner can give a run more wall-clock time. It is DELIBERATELY
+-- OUTSIDE the 8h ceiling above: the ceiling bounds what a LEAD can buy itself through
+-- milestone count, whereas an extension is a different trust — a human grants it — so it is
+-- not re-capped here. The ceiling still lives at the freeze writers for budget_wall_seconds.
+-- budget_extension_seconds is NOT NULL DEFAULT 0 (migration 00215), so it is a plain additive
+-- term that is 0 for a run that was never extended.
 UPDATE runs SET status = 'failed', status_since = now(), failure_reason = @failure_reason,
     -- PRD #69 M7a: the trusted failure class for a run killed by RUN_TIMEOUT.
     fail_origin = 'run_timeout',
@@ -2615,7 +2686,8 @@ WHERE status = 'running'
   -- additive term that is 0 for a run that never parked.
   AND started_at < (sqlc.arg('now')::timestamptz
         - make_interval(secs => COALESCE(budget_wall_seconds, sqlc.arg('global_timeout_seconds')::int)
-                              + budget_paused_seconds))
+                              + budget_paused_seconds
+                              + budget_extension_seconds))
   AND kind NOT IN ('chat', 'judge')
   AND interactive = false
   -- PRD #1226 M3 (D3): completion-interlock carve-out. A run that has recorded at least one
@@ -3422,6 +3494,40 @@ INSERT INTO run_user_inputs (run_id, kind, body)
 SELECT cancelled.id, 'pause_cancel', NULL::text FROM cancelled
 RETURNING *;
 
+-- name: CreateExtendInput :one
+-- PRD #1189 M1: grant a run more wall-clock time AND write the kind='extend' audit row in
+-- ONE statement, mirroring CreatePauseInput/CreateScopeCeilingInput's atomicity (workersvc.Store
+-- exposes no transaction seam). The UPDATE ADDS @secs to budget_extension_seconds (additive —
+-- the frozen budget_wall_seconds is never touched); the run_user_inputs row is audit/surfacing
+-- ONLY (excluded from ConsumeRunInputs, so the worker never drains or routes it — the extension
+-- is served to the worker as runs.budget_extension_seconds on the ACK/claim instead).
+--
+-- The predicate is the same non-terminal + timed-kind allowlist the sweep uses PLUS the cap:
+-- a completed/failed/cancelled run, a chat/judge/interactive run (which never times out), or a
+-- request that would push the total extension past @cap all match 0 rows. A 0-row result is
+-- disambiguated in Go by re-reading the already-fetched run (terminal -> ErrRunTerminal; untimed
+-- kind -> ErrExtendNotTimed; else -> ErrExtensionCapExceeded). On 0 rows the INSERT selects from
+-- the empty CTE and writes NO audit row, so a refused extend leaves no trace.
+--
+-- disposition = 'applied' at insert (the CHECK from 00162 admits it): an extension takes effect
+-- in the SAME statement, so there is nothing left to settle later — a NULL would leave the row
+-- "pending" in `uzi run inputs` forever. The final RETURNING is a scalar over the CTE, COALESCEd
+-- and cast so sqlc types it as a plain int32 (the new total); on a refusal the INSERT returns 0
+-- rows and yields pgx.ErrNoRows, and the COALESCE default is never actually observed.
+WITH extended AS (
+    UPDATE runs SET budget_extension_seconds = budget_extension_seconds + sqlc.arg('secs')::int,
+                    updated_at = now()
+    WHERE id = sqlc.arg('id')
+      AND status NOT IN ('completed', 'failed', 'cancelled')
+      AND kind NOT IN ('chat', 'judge')
+      AND interactive = false
+      AND budget_extension_seconds + sqlc.arg('secs')::int <= sqlc.arg('cap')::int
+    RETURNING budget_extension_seconds
+)
+INSERT INTO run_user_inputs (run_id, kind, body, disposition)
+SELECT sqlc.arg('id'), 'extend', sqlc.narg('body'), 'applied' FROM extended
+RETURNING COALESCE((SELECT budget_extension_seconds FROM extended), 0)::int AS budget_extension_seconds;
+
 -- name: ConsumeRunInputs :many
 -- FIFO consume: mark and return every pending input for the run, oldest first.
 -- FOR UPDATE SKIP LOCKED keeps two concurrent polls from returning the same row.
@@ -3438,10 +3544,13 @@ WITH pending AS (
     -- (paused branch: a 'follow_up' the resumed claim's pullFollowUp reads, alongside the
     -- paused → queued transition through ResumePausedRun; live awaiting_input branch: an
     -- 'answer' that resolves the worker's completion-question await), never this raw row — so
-    -- draining it would likewise hit the default arm. 'pause' and
+    -- draining it would likewise hit the default arm. PRD #1189 adds 'extend' for the SAME
+    -- reason: the extend audit row is server-only exactly like 'scope' — its control travels
+    -- as runs.budget_extension_seconds on the ACK/claim, never through this queue — so the
+    -- worker must never drain or route it either. 'pause' and
     -- 'pause_cancel' are NOT excluded — the worker DOES consume them (the `now` abort and the
     -- flag clear). Everything else consumes as before.
-    WHERE p.run_id = @run_id AND p.consumed_at IS NULL AND p.kind NOT IN ('scope', 'resume', 'completion_decision')
+    WHERE p.run_id = @run_id AND p.consumed_at IS NULL AND p.kind NOT IN ('scope', 'resume', 'completion_decision', 'extend')
     ORDER BY p.id ASC
     FOR UPDATE SKIP LOCKED
 ),
@@ -3613,6 +3722,9 @@ UPDATE runs SET checkpoint_tip = @checkpoint_tip, checkpoint_tip_at = now() WHER
 -- the run's EFFECTIVE timeout (budget_wall_seconds when frozen, else the global RUN_TIMEOUT).
 -- budget_wall_seconds is NULL for a run on the global default. interactive lets the arm skip
 -- interactive runs, which SweepRunningTimeout never times out.
+-- PRD #1189: budget_extension_seconds rides this read too so the near-timeout arm measures
+-- against the EXTENDED effective timeout — the extension moves the 85% line and the flag
+-- clears on the next tick once the arm no longer fires.
 -- PRD #84 M3: repo_id, kind and required_capabilities ride this read so the queued
 -- arm can surface a capability-specific "no eligible worker" reason (required caps not
 -- a subset of any online worker's effective caps). kind was previously only a WHERE
@@ -3624,7 +3736,7 @@ UPDATE runs SET checkpoint_tip = @checkpoint_tip, checkpoint_tip_at = now() WHER
 SELECT id, user_id, status, auto_approve,
        started_at, last_activity_at, updated_at, status_since,
        health, health_reason, health_since, health_notified_at,
-       budget_wall_seconds, budget_paused_seconds, interactive,
+       budget_wall_seconds, budget_paused_seconds, budget_extension_seconds, interactive,
        repo_id, kind, required_capabilities, completion_contract_version
 FROM runs
 WHERE status IN ('queued', 'running', 'awaiting_approval')

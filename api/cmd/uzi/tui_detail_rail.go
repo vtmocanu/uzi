@@ -17,14 +17,16 @@ import (
 func (m tuiModel) renderLaneRail() string {
 	d := &m.detail
 	now := time.Now()
-	active := activeLaneKey(d.run.Status, d.frames)
 
 	var sb strings.Builder
-	// A caret advertises the collapse state (`c`) once there is a roster to collapse: ▾ open,
-	// ▸ with the lane count when folded to a summary + the selected lane.
+	// A caret advertises the fold state (`c`) once there is a roster to fold: ▾ open, ▸ with the
+	// lane count when folded to a summary + the selected lane. The fold is the tri-state decision
+	// (a `c` pin, or the height-driven auto-fold), resolved by effectiveRailFolded (PRD #1257 D3).
+	// Auto and manual folds render identically (D4): no distinct caret for "folded by itself".
+	folded := len(d.lanes) > 0 && m.effectiveRailFolded(now)
 	title := m.paneTitle("crew", d.focus == focusRail)
 	if len(d.lanes) > 0 {
-		if d.railCollapsed {
+		if folded {
 			title += m.pal.faint.Render("  " + itoa(len(d.lanes)) + " ▸")
 		} else {
 			title += m.pal.faint.Render("  ▾")
@@ -35,54 +37,159 @@ func (m tuiModel) renderLaneRail() string {
 	if len(d.lanes) == 0 {
 		sb.WriteString(m.pal.faint.Render("(no activity yet)"))
 		// A milestone-structured run has a frozen list before any frame arrives (queued /
-		// just-claimed), so the block must show even with no lanes yet.
-		if block := m.renderMilestones(); block != "" {
-			sb.WriteString("\n\n" + block)
-		}
+		// just-claimed), so the block must show even with no lanes yet. usedRows for the budgeted
+		// blocks is counted BEFORE appendRailBlock, so the boundary is unmoved (D6/R3).
+		appendRailBlock(&sb, m.renderMilestones())
 		if sp := m.renderSpend(strings.Count(sb.String(), "\n") + 1); sp != "" {
-			sb.WriteString("\n\n" + sp)
+			appendRailBlock(&sb, sp)
 		}
 		if rb := m.railRateMeters(now, strings.Count(sb.String(), "\n")+1); rb != "" {
-			sb.WriteString("\n\n" + rb)
+			appendRailBlock(&sb, rb)
 		}
 		return sb.String()
 	}
 
-	suffixes := laneSuffixes(d.lanes)
-	// The ALL row wears a fixed neutral ◉ (laneRow ignores the state it is handed), so short-circuit
-	// it here rather than computing a crew state nothing reads. Every real row is a plain per-key
-	// ladder — no rollup.
-	st := func(l agentLane) crewState {
-		if l.Key == laneAllKey {
-			return crewIdle
-		}
-		return crewStateFor(d.run.Status, d.run.Health, l.Key, active, l.LastActivity, now)
-	}
-	// The lead's context-window meter (#565): latest-wins across LEAD frames only, memoized in
-	// rebuild() (d.leadCtx) so a render does not re-scan+unmarshal lead frames, and shown ONLY on
-	// the lead lane. A subagent lane and the synthetic ALL lane never get it.
-	fill, hasCtx := d.leadCtx, d.leadCtxOK
-	if d.railCollapsed {
+	if folded {
 		// Just the selected lane, so the reader still knows whose transcript is on screen while
 		// the milestones get the rest of the column.
 		if l, ok := d.selectedLane(); ok {
-			sb.WriteString(m.laneRow(l, true, st(l), suffixes[l.Key], fill, hasCtx && l.Key == laneLead))
+			active := activeLaneKey(d.run.Status, d.frames)
+			suffixes := laneSuffixes(d.lanes)
+			sb.WriteString(m.laneRow(l, true, m.laneCrewState(l, active, now), suffixes[l.Key], d.leadCtx, d.leadCtxOK && l.Key == laneLead))
 		}
 	} else {
-		for i, l := range d.lanes {
-			sb.WriteString(m.laneRow(l, i == d.laneIdx, st(l), suffixes[l.Key], fill, hasCtx && l.Key == laneLead))
-		}
+		sb.WriteString(m.expandedRoster(now))
 	}
-	if block := m.renderMilestones(); block != "" {
-		sb.WriteString("\n" + block)
-	}
+	// usedRows for renderSpend/railRateMeters is counted on the builder BEFORE appendRailBlock, so
+	// the whole-block-or-nothing budgets keep the exact boundary they had (D6/R3); appendRailBlock
+	// only collapses the previously double-drawn blank separator to one row.
+	appendRailBlock(&sb, m.renderMilestones())
 	if sp := m.renderSpend(strings.Count(sb.String(), "\n") + 1); sp != "" {
-		sb.WriteString("\n\n" + sp)
+		appendRailBlock(&sb, sp)
 	}
 	if rb := m.railRateMeters(now, strings.Count(sb.String(), "\n")+1); rb != "" {
-		sb.WriteString("\n\n" + rb)
+		appendRailBlock(&sb, rb)
 	}
 	return sb.String()
+}
+
+// appendRailBlock appends a protected rail block beneath the content already built, separated by
+// EXACTLY one blank row regardless of whether the builder currently ends in a newline (PRD #1257
+// D6). Every laneRow ends in "\n", so a hand-written "\n\n" join after the roster used to yield a
+// DOUBLE blank row whenever no MILESTONES list sat between the roster and SPEND; trimming the
+// builder's trailing newlines first collapses that to the single separator the MILESTONES-present
+// join already had. It does NOT touch the usedRows the caller feeds renderSpend/railRateMeters —
+// those are counted on the builder BEFORE this runs — so the whole-block-or-nothing budget boundary
+// does not move (R3): the MILESTONES-present output is byte-identical to before, and the
+// MILESTONES-absent output loses exactly the one wasted blank row.
+func appendRailBlock(sb *strings.Builder, block string) {
+	if block == "" {
+		return
+	}
+	cur := strings.TrimRight(sb.String(), "\n")
+	sb.Reset()
+	sb.WriteString(cur)
+	sb.WriteString("\n\n")
+	sb.WriteString(block)
+}
+
+// laneCrewState is the crew-state dot for one lane row. The synthetic ALL row wears a fixed neutral
+// ◉ (laneRow ignores the state it is handed for it), so it short-circuits to crewIdle rather than
+// computing a rollup nothing reads; every real row is a plain per-key ladder. Shared by the
+// expanded roster and the folded single-lane row so the two paths cannot disagree.
+func (m tuiModel) laneCrewState(l agentLane, active string, now time.Time) crewState {
+	if l.Key == laneAllKey {
+		return crewIdle
+	}
+	d := &m.detail
+	return crewStateFor(d.run.Status, d.run.Health, l.Key, active, l.LastActivity, now)
+}
+
+// expandedRoster renders every crew lane row (the expanded rail's roster) into one joined string,
+// each row ending in "\n" as laneRow emits it. renderLaneRail's expanded branch AND railAutoFolded
+// both call it, so the auto-fold decision counts EXACTLY the rows the expanded branch draws — the
+// decision and the render cannot disagree (PRD #1257 D1/R2). now dates the per-lane crew-state dots
+// (crewStateFor), matching renderLaneRail's own now.
+//
+// The lead's context-window meter (#565) is latest-wins across LEAD frames only, memoized in
+// rebuild() (d.leadCtx) so a render does not re-scan lead frames, and shown ONLY on the lead lane;
+// a subagent lane and the synthetic ALL lane never get it.
+func (m tuiModel) expandedRoster(now time.Time) string {
+	d := &m.detail
+	active := activeLaneKey(d.run.Status, d.frames)
+	suffixes := laneSuffixes(d.lanes)
+	fill, hasCtx := d.leadCtx, d.leadCtxOK
+	var sb strings.Builder
+	for i, l := range d.lanes {
+		sb.WriteString(m.laneRow(l, i == d.laneIdx, m.laneCrewState(l, active, now), suffixes[l.Key], fill, hasCtx && l.Key == laneLead))
+	}
+	return sb.String()
+}
+
+// effectiveRailFolded resolves the tri-state fold (PRD #1257 D3) to the boolean the render uses: a
+// Closed pin folds, an Open pin stays expanded, and Auto (the newDetailState zero value) defers to
+// the height-driven railAutoFolded. now is threaded to railAutoFolded, whose roster render dates
+// the per-lane state dots; the row count itself is clock-independent, so the decision is stable
+// across ticks with unchanged inputs (D8).
+func (m tuiModel) effectiveRailFolded(now time.Time) bool {
+	return m.detail.railFold == railFoldClosed ||
+		(m.detail.railFold == railFoldAuto && m.railAutoFolded(now))
+}
+
+// railAutoFolded reports whether the EXPANDED rail's roster plus every PRESENT protected block
+// would overrun transcriptViewport(), so the rail must fold by itself (PRD #1257 D1/D2). The
+// protected set is: the whole MILESTONES list (no budget of its own — clamped by joinColumns), the
+// 3-line SPEND block, and — the PRD #623 floor — the run's OWN ACCOUNTS entry (3 rows under a
+// 1-row header). Sibling accounts stay best-effort and drop bottom-up as today, so they are NOT
+// counted (D2). A run with no lanes has nothing to fold; a run with an empty required set (no
+// milestone list, no usage, no own account) never folds either — its roster just clips at the
+// bottom exactly as today (D2/D5).
+//
+// The decision REPLAYS renderLaneRail's expanded builder (expandedRoster + the same appendRailBlock
+// joins) and applies the SAME whole-block-or-nothing budget renderSpend/railRateMeters use,
+// computing usedRows the identical way (strings.Count(sb,"\n")+1 BEFORE each block's join). Counting
+// this way makes the fold conservative by exactly the one row those budgets are, so whenever the
+// rail stays expanded every present block is guaranteed to render whole — the silent-vanish bug this
+// PRD fixes. R2's exception is ACCOUNTS: the decision counts only the run's own entry while the
+// render draws every fitted entry, which is safe because railRateMeters forces the run's entry first
+// (PRD #623), so it is the one guaranteed on screen whenever the rail is expanded.
+func (m tuiModel) railAutoFolded(now time.Time) bool {
+	d := &m.detail
+	if len(d.lanes) == 0 {
+		return false
+	}
+	block := m.renderMilestones()
+	spend := d.run.Usage != nil
+	ownAccount := d.run.AnthropicSecretID != nil
+	if block == "" && !spend && !ownAccount {
+		return false // empty required set: nothing below the roster to protect (D2/D5)
+	}
+	vp := m.transcriptViewport()
+	var sb strings.Builder
+	sb.WriteString("crew\n") // stand-in title row: only its trailing "\n" counts toward the budget
+	sb.WriteString(m.expandedRoster(now))
+	appendRailBlock(&sb, block)
+	if spend {
+		// renderSpend drops its 3 lines whole unless they + the 1-row separator fit under usedRows.
+		usedRows := strings.Count(sb.String(), "\n") + 1
+		if 3 > vp-usedRows-1 {
+			return true
+		}
+		appendRailBlock(&sb, "x\nx\nx") // advance past SPEND's 3 rows so ACCOUNTS is measured below it
+	}
+	if ownAccount {
+		// railRateMeters draws the run's own entry (label + 5h + 7d = 3 rows) under a 1-row ACCOUNTS
+		// header, whole-block-or-nothing: header + 3 <= budget (vp - usedRows - 1).
+		usedRows := strings.Count(sb.String(), "\n") + 1
+		if 1+3 > vp-usedRows-1 {
+			return true
+		}
+	}
+	// The roster (+ any present MILESTONES) alone overflowing the height-clamped rail folds too
+	// (D5): joinColumns drops the bottom rows, so folding maximizes what shows. strings.Count(sb,
+	// "\n") is the content-rows-beneath-the-title count (the title's own "\n" cancels the trailing
+	// row the final block lacks). This is the binding case for a MILESTONES-only run.
+	return strings.Count(sb.String(), "\n") > vp
 }
 
 // laneIdentities maps each real lane's key to the identity string the crew rail shows for it,

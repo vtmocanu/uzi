@@ -176,6 +176,26 @@ type Client interface {
 	// snapshot (PRD #602 M6): GET /api/admin/agent-source. READ-ONLY — the sync/
 	// apply writes stay web-only (cookie-only), so the CLI never triggers a fetch.
 	AdminAgentSource(ctx context.Context) (apitypes.AgentSourceDTO, error)
+	// AdminJudgeBacklog reads the admin "All users" aggregate backlog (PRD #1184 M5):
+	// GET /api/admin/judge/recommendations. Every user's recommendations deduped by
+	// (category, target), attribution hidden — the reply is an unenveloped
+	// JudgeAdminBacklogDTO whose groups carry user_count/run_count/open_count and
+	// occurrences with NO run id, title or rec id. Mounted in the admin READ group
+	// (RequireUser + RequireAdminRO), so a uza_ token reads it and a masked uzc_/
+	// non-admin session is a 403 (exit 3).
+	//
+	// bucket and category are forwarded VERBATIM like the owner JudgeBacklog, empty
+	// omits the parameter so the server's default applies (todo / all labels), and the
+	// server owns both validators — an unknown value comes back as its own 400 → the
+	// usage exit code, never a silently empty list. There is deliberately NO runAnchor
+	// parameter: the admin path has no ?run= anchor (an anchor names a run, which is
+	// the attribution this view hides).
+	AdminJudgeBacklog(ctx context.Context, bucket, category string) (apitypes.JudgeAdminBacklogDTO, error)
+	// AdminJudgeStats reads the admin "All users" triage tally (PRD #1184 M5): GET
+	// /api/admin/judge/stats. Attribution-free by construction — it is a count. Same
+	// admin READ group as AdminJudgeBacklog; the reply is an unenveloped TriageDTO,
+	// exactly like the owner JudgeStats.
+	AdminJudgeStats(ctx context.Context) (apitypes.TriageDTO, error)
 
 	// StartCLIAuth begins a browser-brokered login: POST /api/auth/cli/start with the
 	// PKCE S256 challenge and a client description. UNAUTH by design (the CLI has no
@@ -526,6 +546,26 @@ type Client interface {
 	// whose latest cached pipeline is not failed (or has no cached pipeline) is a 409 →
 	// ExitConflict (5); a foreign/unknown repo is a 404 (exit 4).
 	CreateCIFixRun(ctx context.Context, repoID, ref string) (apitypes.RunDTO, error)
+	// RecoveryArchives returns a run's owner-scoped durable-recovery summary — metadata
+	// ONLY, never raw bytes (PRD #1296 D6/D7): GET /api/runs/{id}/archives. RequireUser
+	// and strict owner-or-404 server-side (an admin viewing a foreign run is refused,
+	// mirroring ListRunInputs), so a uzc_/uza_ CLI token reaches its OWN runs and nobody
+	// else's. A run with no captures returns a zero-value summary (Supported=false,
+	// Archives=[]), which the run-detail summary renders as an honest "none/unsupported"
+	// rather than a false claim of an available archive.
+	RecoveryArchives(ctx context.Context, runID string) (apitypes.RecoveryArchiveSummaryDTO, error)
+	// DownloadRecoveryArchive streams ONE owner-owned capture's decrypted bundle bytes to
+	// w and returns the number of bytes written (PRD #1296 D4/D7): GET
+	// /api/runs/{id}/archives/{captureID}/download. It is deliberately NOT built on the
+	// JSON read path (doJSONRead caps at 32 MiB and JSON-decodes — unusable for a 64 MiB
+	// binary): it streams straight from the response body through io.Copy, so neither the
+	// client nor the caller buffers a whole bundle. A non-2xx status is mapped to the
+	// documented exit code BEFORE any byte reaches w (a 409 expired/unavailable → exit 5, a
+	// 404 → exit 4); a mid-stream transport failure returns the bytes-so-far and an
+	// ExitUnreachable error, so the caller detects the short read and refuses to publish a
+	// partial file. The Bearer credential rides through the same credentialSafeBase guard
+	// every other request uses, so a plaintext base URL is refused before the token leaves.
+	DownloadRecoveryArchive(ctx context.Context, runID, captureID string, w io.Writer) (int64, error)
 }
 
 // ProjectSyncStatus mirrors the handler's getGithubProjectSyncStatusResponse JSON

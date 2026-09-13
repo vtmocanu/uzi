@@ -103,6 +103,10 @@ var runDTOKeys = []string{
 	// wire; the subset of the lead's declaration whose ids survived in-progress validation.
 	"milestones_agents",
 	"budget_max_iterations", "budget_wall_seconds",
+	// PRD #1189 M1: the owner-granted extension + effective cap (always present ints, 0 is
+	// meaningful) and the derived total/used seconds (nil for a kind that never times out /
+	// a run that never started).
+	"budget_extension_seconds", "budget_extension_cap_seconds", "budget_total_seconds", "budget_used_seconds",
 	// PRD #634 M2: the operator scope ceiling (nil ⇒ null ⇒ unbounded), always on the wire;
 	// like budget_* it is load-bearing on the state-ack, not just display — the worker honors
 	// it at the loop top.
@@ -319,8 +323,13 @@ func TestFiledIssueDTOTags(t *testing.T) {
 }
 
 func TestDispositionDTOTags(t *testing.T) {
+	// set_via is omitempty (PRD #1184 M4): a hand-set (or absent) disposition omits it, so the
+	// base shape has the six always-present keys; a provenance-carrying disposition adds it,
+	// letting the run-page DispositionChip render "Done via #N" / "Done by an admin".
 	assertTags(t, "DispositionDTO", DispositionDTO{},
 		"category", "target", "status", "reason", "set_at", "stale")
+	assertTags(t, "DispositionDTO(admin)", DispositionDTO{SetVia: "admin"},
+		"category", "target", "status", "reason", "set_at", "stale", "set_via")
 }
 
 func TestTriageDTOTags(t *testing.T) {
@@ -393,6 +402,74 @@ func TestJudgeBacklogDTOTags(t *testing.T) {
 	assertTags(t, "JudgeBacklogDTO", JudgeBacklogDTO{}, "bucket", "run", "groups", "truncated", "triage")
 }
 
+// The admin "All users" aggregate DTOs (PRD #1184 M1). Their tag sets are the THIRD of the
+// four attribution-hiding layers (§379): the wire must carry no identifier at all. set_via is
+// omitempty on the occurrence exactly like JudgeOccurrenceDTO — absent on a zero value, present
+// only when a disposition provenance exists.
+func TestJudgeAdminOccurrenceDTOTags(t *testing.T) {
+	assertTags(t, "JudgeAdminOccurrenceDTO", JudgeAdminOccurrenceDTO{},
+		"judged_at", "verdict", "bucket")
+	// With a provenance set, set_via joins — the auto-done / admin-done shape.
+	assertTags(t, "JudgeAdminOccurrenceDTO(with set_via)", JudgeAdminOccurrenceDTO{SetVia: "admin"},
+		"judged_at", "verdict", "bucket", "set_via")
+}
+
+func TestJudgeAdminGroupDTOTags(t *testing.T) {
+	assertTags(t, "JudgeAdminGroupDTO", JudgeAdminGroupDTO{},
+		"category", "target", "bucket", "open_count", "run_count", "user_count",
+		"rationale_preview", "occurrences")
+}
+
+func TestJudgeAdminBacklogDTOTags(t *testing.T) {
+	assertTags(t, "JudgeAdminBacklogDTO", JudgeAdminBacklogDTO{},
+		"bucket", "groups", "truncated", "triage")
+}
+
+// TestJudgeAdminDTOsCarryNoIdentifier is Success Criterion #2 pinned on the wire: the admin
+// aggregate response must carry NO owner, run id, run title, review id, recommendation id,
+// user id or email — at ANY nesting level, on EVERY variant (an occurrence with set_via, a
+// populated group, a full backlog). The tag-set tests above pin the exact top-level keys;
+// this scans the FULL serialized JSON of a populated tree for the forbidden key names, so a
+// leak riding a nested struct is caught too. It is the tag-layer companion to the live-DB test
+// that scans for forbidden VALUES.
+func TestJudgeAdminDTOsCarryNoIdentifier(t *testing.T) {
+	forbidden := []string{
+		`"run_id"`, `"run_title"`, `"review_id"`, `"rec_id"`,
+		`"user_id"`, `"owner"`, `"owner_email"`, `"email"`, `"filed_issue"`,
+		`"issue_iid"`, `"issue_url"`,
+	}
+	// A populated tree that exercises every variant: a group with two occurrences (one carrying
+	// set_via), inside a full backlog with a triage tally.
+	backlog := JudgeAdminBacklogDTO{
+		Bucket: "todo",
+		Groups: []JudgeAdminGroupDTO{{
+			Category: "improve_uzi", Target: "docs", Bucket: "todo",
+			OpenCount: 1, RunCount: 2, UserCount: 2, RationalePreview: "because",
+			Occurrences: []JudgeAdminOccurrenceDTO{
+				{JudgedAt: time.Now(), Verdict: "issues", Bucket: "todo"},
+				{JudgedAt: time.Now(), Verdict: "ok", Bucket: "done", SetVia: "admin"},
+			},
+		}},
+		Truncated: false,
+		Triage:    TriageDTO{Total: 2, Todo: 1, Done: 1},
+	}
+	for _, v := range []any{
+		backlog,
+		JudgeAdminGroupDTO{Category: "c", Target: "t", Occurrences: []JudgeAdminOccurrenceDTO{{SetVia: "issue_close"}}},
+		JudgeAdminOccurrenceDTO{SetVia: "admin"},
+	} {
+		b, err := json.Marshal(v)
+		if err != nil {
+			t.Fatalf("marshal %T: %v", v, err)
+		}
+		for _, key := range forbidden {
+			if strings.Contains(string(b), key) {
+				t.Errorf("%T serialized with a forbidden identifier key %s — attribution must be hidden at the wire layer\njson: %s", v, key, b)
+			}
+		}
+	}
+}
+
 // The bulk fan-out's reply had NO wire pin at all until PRD #98 review BLK-UNDO, which is
 // why `settled` could be added without anything noticing the shape moved. `settled` is
 // deliberately NOT omitempty: a consumer must be able to distinguish "this call settled
@@ -404,6 +481,43 @@ func TestJudgeDispositionResultDTOTags(t *testing.T) {
 
 func TestJudgeSettledMemberDTOTags(t *testing.T) {
 	assertTags(t, "JudgeSettledMemberDTO", JudgeSettledMemberDTO{}, "run_id", "rec_id")
+}
+
+// The admin cross-user Mark done / Undo body (PRD #1184 M2). Its tag set is exactly
+// {items, status} — no scope and no reason field, so the strict decoder makes a stray
+// `scope: all` or `reason: wont_do` a 400 rather than a silent no-op.
+func TestJudgeAdminDispositionRequestTags(t *testing.T) {
+	assertTags(t, "JudgeAdminDispositionRequest", JudgeAdminDispositionRequest{}, "items", "status")
+}
+
+// TestJudgeAdminDispositionResultDTOTags pins the admin write result at exactly
+// {updated, groups, truncated, triage}. The critical negative is that it carries NO `settled`
+// list and NO identifier: the admin write has no run address (the Undo is by coordinate, not by a
+// (run, recommendation) pair), so nothing that could name a run crosses the wire — the fourth
+// attribution-hiding layer applied to the write path. assertTags is order-free and EXACT, so a
+// `settled` field sneaking back in would fail here.
+func TestJudgeAdminDispositionResultDTOTags(t *testing.T) {
+	assertTags(t, "JudgeAdminDispositionResultDTO", JudgeAdminDispositionResultDTO{},
+		"updated", "groups", "truncated", "triage")
+	// Belt-and-braces on the one field this DTO must NOT have: scan a populated tree for a
+	// `settled` key and any identifier, since a leak could ride a nested group's value.
+	res := JudgeAdminDispositionResultDTO{
+		Updated: 1,
+		Groups: []JudgeAdminGroupDTO{{
+			Category: "improve_uzi", Target: "docs", Bucket: "done", UserCount: 2,
+			Occurrences: []JudgeAdminOccurrenceDTO{{Bucket: "done", SetVia: "admin"}},
+		}},
+		Triage: TriageDTO{Total: 1, Done: 1},
+	}
+	b, err := json.Marshal(res)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	for _, key := range []string{`"settled"`, `"run_id"`, `"rec_id"`, `"user_id"`, `"owner"`, `"review_id"`} {
+		if strings.Contains(string(b), key) {
+			t.Errorf("JudgeAdminDispositionResultDTO serialized with forbidden key %s — the admin write carries no run address and no attribution\njson: %s", key, b)
+		}
+	}
 }
 
 // An empty fan-out must marshal `settled` as [], never null: the client iterates it to build
@@ -615,7 +729,12 @@ var workerDTOKeys = []string{
 	// worker's self-report and its template-derived caps, v1 vocabulary {docker, jvm}).
 	// Read-only display for the workers UI.
 	"capabilities",
-	"max_concurrent_runs", "template_declared", "template_reported", "version",
+	"max_concurrent_runs",
+	// PRD #1296 M4 (D4): true when the worker holds an OPEN durable-recovery custody hold —
+	// it retained committed work a run could not publish. Distinct from busy (a held worker
+	// consumes no run/LLM slot) but still counts against the per-owner hosted quota.
+	"retaining_unpublished_work",
+	"template_declared", "template_reported", "version",
 	// PRD #113: derived upgrade health, computed at read time from `version` against
 	// the control-plane release. Derived rather than stored, so nothing in the store
 	// layer pins it — this tag set is the only wire contract these two fields have.
@@ -841,4 +960,57 @@ func TestAdminBlockedReposDTOTags(t *testing.T) {
 	assertTags(t, "BlockedRepoDTO", BlockedRepoDTO{},
 		"id", "path", "owner_id", "owner_email", "forge_type", "blocked",
 		"block_messages", "guardrail_override", "privilege_status", "privilege_checked_at")
+}
+
+// ── PRD #1296 M1: durable run recovery wire shapes ────────────────────────────
+// The owner-facing archive DTO's optional fields are ALL omitempty, so the zero value
+// carries only the always-present keys; the populated pin asserts every optional key
+// surfaces when set (the finding.zero/full shape).
+func TestRecoveryArchiveDTOTags(t *testing.T) {
+	assertTags(t, "RecoveryArchiveDTO", RecoveryArchiveDTO{},
+		"id", "run_id", "state", "source_sha", "created_at")
+	h := "abc123"
+	sz := int64(42)
+	now := time.Unix(0, 0)
+	full := RecoveryArchiveDTO{
+		AttemptedHeadSha: &h, ByteSize: &sz, Checksum: "sha256:x", Reason: "quota",
+		PrerequisiteShas: []string{"deadbeef"}, ExpiresAt: &now,
+	}
+	assertTags(t, "RecoveryArchiveDTO(full)", full,
+		"id", "run_id", "state", "source_sha", "created_at",
+		"attempted_head_sha", "byte_size", "checksum", "reason", "prerequisite_shas", "expires_at")
+}
+
+// The summary's counts is a fixed struct (all six state keys always present); archives is a
+// non-omitempty slice, so it is present-as-null on the zero value (the mapper normalizes to
+// [] — see apiContract.test.ts), which is why it is asserted on the zero value here.
+func TestRecoveryArchiveSummaryDTOTags(t *testing.T) {
+	assertTags(t, "RecoveryArchiveStateCountsDTO", RecoveryArchiveStateCountsDTO{},
+		"preparing", "uploading", "available", "needs_action", "expired", "discarded")
+	assertTags(t, "RecoveryArchiveSummaryDTO", RecoveryArchiveSummaryDTO{},
+		"supported", "legacy", "has_open_hold", "counts", "archives")
+}
+
+// The worker-facing archive RPC shapes (M3 consumes; mirrored in agent/src/protocol.ts).
+// These are Bearer-only worker/owner exchanges, never SPA DTOs, so they are pinned here
+// rather than in the api-contract fixtures.
+func TestRecoveryWorkerRPCTags(t *testing.T) {
+	assertTags(t, "RecoveryReserveRequest", RecoveryReserveRequest{},
+		"run_id", "idempotency_key", "source_sha")
+	assertTags(t, "RecoveryReserveRequest(full)", RecoveryReserveRequest{AttemptedHeadSha: "h"},
+		"run_id", "idempotency_key", "source_sha", "attempted_head_sha")
+	assertTags(t, "RecoveryReserveResponse", RecoveryReserveResponse{}, "capture_id", "state")
+	assertTags(t, "RecoveryUploadManifest", RecoveryUploadManifest{},
+		"byte_size", "checksum", "chunk_count")
+	assertTags(t, "RecoveryUploadManifest(full)", RecoveryUploadManifest{PrerequisiteShas: []string{"x"}},
+		"byte_size", "checksum", "chunk_count", "prerequisite_shas")
+	assertTags(t, "RecoveryCaptureStatusResponse", RecoveryCaptureStatusResponse{},
+		"capture_id", "state", "manifest_bound")
+	sz := int64(1)
+	now := time.Unix(0, 0)
+	assertTags(t, "RecoveryCaptureStatusResponse(full)",
+		RecoveryCaptureStatusResponse{ByteSize: &sz, Checksum: "x", Reason: "r", ExpiresAt: &now},
+		"capture_id", "state", "manifest_bound", "byte_size", "checksum", "reason", "expires_at")
+	assertTags(t, "RecoveryReleaseResponse", RecoveryReleaseResponse{},
+		"run_id", "released", "holds_released")
 }

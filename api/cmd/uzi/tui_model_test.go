@@ -1192,8 +1192,10 @@ func TestTUIDetailFillsHeight(t *testing.T) {
 }
 
 // A tall crew rail (many lanes + the milestone block) must NOT push the footer off-screen
-// (issue #379 tui-ux finding 1): the two-pane body is clamped to the viewport, so the rail
-// truncates rather than overflowing past the footer, which carries the pane/esc/? controls.
+// (issue #379 tui-ux finding 1): the two-pane body is clamped to the viewport, so the footer,
+// which carries the pane/esc/? controls, always survives. Under PRD #1257 this run auto-folds
+// (its milestone list is a protected block the expanded roster would push off at 100x20), and the
+// footer must survive the folded rail just as it survived the clamped one.
 func TestTUIDetailFooterSurvivesTallRail(t *testing.T) {
 	now := time.Now()
 	runID := "44444444-1111"

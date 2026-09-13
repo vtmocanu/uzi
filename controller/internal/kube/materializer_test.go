@@ -1716,6 +1716,216 @@ func TestRecycleToggleOffSuppressesBothArms(t *testing.T) {
 	})
 }
 
+// --- durable-recovery custody honored on every destructive path (PRD #1296 D3) ---
+
+// #1296-T1, the baseline (unchanged behavior): an ordinary DRIFT roll converges via a
+// Deployment PATCH, which is data-preserving — it never deletes a PVC. This is the floor
+// the custody guards must not disturb, so it is asserted for BOTH a non-custody worker
+// (the classic case) and a custody-held one (the pod/image roll may still proceed while
+// /data is retained: "ForceRoll may replace a pod/image while retaining data").
+func TestOrdinaryDriftRollPreservesDataAndCustodyDoesNotBlockThePodRoll(t *testing.T) {
+	roll := func(t *testing.T, custody bool) *fake.Clientset {
+		ctx := context.Background()
+		// A stale spec hash on the deployed pod template ⇒ drift; /nix is LIVE at the
+		// desired 20Gi so the M3 size arm stays inert and the drift roll is the only action.
+		m, client := newMatWithRecycle(t, &fakeCordoner{}, DrainPolicy{Deadline: 24 * time.Hour},
+			RecyclePolicy{Enabled: true, Cooldown: time.Hour}, io.Discard,
+			deployedWorker("w1", 0, "the-old-releases-hash"), pvcNix("w1", "20Gi"), pvcFor("w1", "data"))
+		observed, err := m.Observe(ctx)
+		if err != nil {
+			t.Fatalf("Observe: %v", err)
+		}
+		w := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", Generation: 0, CustodyHeld: custody}
+		if err := m.Reconcile(ctx, []protocol.DesiredWorker{w}, observed); err != nil {
+			t.Fatalf("Reconcile: %v", err)
+		}
+		return client
+	}
+
+	t.Run("non-custody: drift roll patches and deletes nothing", func(t *testing.T) {
+		client := roll(t, false)
+		if !wasPatched(client) {
+			t.Fatal("a drifted idle worker was not rolled (no Deployment patch)")
+		}
+		if del := deletedSet(client); len(del) != 0 {
+			t.Fatalf("the ordinary roll path deleted a volume (%v); a drift roll only PATCHES the Deployment, it never recycles a PVC", keysOf(del))
+		}
+	})
+
+	t.Run("custody-held: pod roll still proceeds, /data preserved", func(t *testing.T) {
+		client := roll(t, true)
+		if !wasPatched(client) {
+			t.Fatal("a custody-held drifted worker was not rolled; custody must not block a data-preserving pod roll")
+		}
+		if del := deletedSet(client); len(del) != 0 {
+			t.Fatalf("a custody-held drift roll deleted a volume (%v); the ordinary roll path must never touch a PVC", keysOf(del))
+		}
+	})
+}
+
+// #1296-T2: an ELAPSED drain deadline overrides the busy-defer so a BUSY worker's recycle
+// proceeds (rollDespiteBusy). Custody is INDEPENDENT of that override: the custody-held
+// worker's /data PVC is preserved even though the deadline elapsed, while a non-custody
+// worker's /data is recycled. The held sub-test asserts BOTH that the recycle actually ran
+// (Deployment + /nix deleted — proof the override fired, so /data survival is the custody
+// guard and not a vacuous busy-defer) AND that /data survived.
+//
+// Positive control: drop `w.CustodyHeld` from recycleWorkerVolumes' `vols.Data && w.CustodyHeld`
+// guard (always recycle Data) and the held sub-test's "/data preserved" assertion goes RED —
+// the elapsed deadline discards the custody-held /data.
+func TestElapsedDrainDeadlineDoesNotRecycleCustodyHeldData(t *testing.T) {
+	ns := testConfig().Namespace
+	deadline := time.Hour
+	elapsed := m5Now.Add(-2 * time.Hour) // draining_since 2h ago > 1h deadline ⇒ rollDespiteBusy
+
+	recycle := func(t *testing.T, custody bool) map[string]bool {
+		ctx := context.Background()
+		hash := currentHash(t, "w1", 0)
+		m, client := newMatWithRecycle(t, &fakeCordoner{}, DrainPolicy{Deadline: deadline},
+			RecyclePolicy{Enabled: true, Cooldown: time.Hour}, io.Discard,
+			deployedWorker("w1", 0, hash), pvcNix("w1", "20Gi"), pvcFor("w1", "data"))
+		observed, err := m.Observe(ctx)
+		if err != nil {
+			t.Fatalf("Observe: %v", err)
+		}
+		// BUSY + draining PAST the deadline ⇒ the busy-guard is overridden and the recycle runs.
+		w := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", Generation: 0,
+			Busy: true, DrainingSince: &elapsed, CustodyHeld: custody}
+		if err := m.recycleWorkerVolumes(ctx, w, observed[0], ns, recycleVolumes{Nix: true, Data: true}); err != nil {
+			t.Fatalf("recycleWorkerVolumes: %v", err)
+		}
+		return deletedSet(client)
+	}
+
+	t.Run("custody-held: /data preserved, pod/nix roll still proceeds", func(t *testing.T) {
+		del := recycle(t, true)
+		if !del["deployments/uzi-hw-w1"] {
+			t.Fatalf("the elapsed deadline must let the recycle proceed (Deployment deleted); got %v", keysOf(del))
+		}
+		if !del["persistentvolumeclaims/uzi-hw-w1-nix"] {
+			t.Fatalf("/nix (a re-seedable cache) should still recycle under the override; got %v", keysOf(del))
+		}
+		if del["persistentvolumeclaims/uzi-hw-w1-data"] {
+			t.Fatalf("a custody-held /data PVC was discarded by an elapsed drain deadline; custody must survive it. deletes: %v", keysOf(del))
+		}
+	})
+
+	t.Run("non-custody: /data IS recycled once the deadline elapses", func(t *testing.T) {
+		del := recycle(t, false)
+		if !del["persistentvolumeclaims/uzi-hw-w1-data"] {
+			t.Fatalf("a non-custody worker's /data must recycle once the drain deadline elapses; got %v", keysOf(del))
+		}
+	})
+}
+
+// #1296-T3: ForceRoll overrides the busy-defer so a BUSY, never-cordoned worker's recycle
+// proceeds. Custody is INDEPENDENT of ForceRoll: force-roll may replace a pod/image while
+// retaining data, but is NOT consent to discard a custody-held PVC. The held sub-test again
+// asserts the recycle ran (Deployment + /nix deleted) AND that /data survived.
+//
+// Positive control: drop `w.CustodyHeld` from recycleWorkerVolumes' `vols.Data && w.CustodyHeld`
+// guard and the held sub-test's "/data preserved" assertion goes RED — ForceRoll discards the
+// custody-held /data.
+func TestForceRollDoesNotDiscardCustodyHeldData(t *testing.T) {
+	ns := testConfig().Namespace
+
+	recycle := func(t *testing.T, custody bool) map[string]bool {
+		ctx := context.Background()
+		hash := currentHash(t, "w1", 0)
+		m, client := newMatWithRecycle(t, &fakeCordoner{}, DrainPolicy{Deadline: 24 * time.Hour, ForceRoll: true},
+			RecyclePolicy{Enabled: true, Cooldown: time.Hour}, io.Discard,
+			deployedWorker("w1", 0, hash), pvcNix("w1", "20Gi"), pvcFor("w1", "data"))
+		observed, err := m.Observe(ctx)
+		if err != nil {
+			t.Fatalf("Observe: %v", err)
+		}
+		// BUSY, never cordoned (DrainingSince nil): only ForceRoll overrides the busy-guard here.
+		w := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", Generation: 0,
+			Busy: true, DrainingSince: nil, CustodyHeld: custody}
+		if err := m.recycleWorkerVolumes(ctx, w, observed[0], ns, recycleVolumes{Nix: true, Data: true}); err != nil {
+			t.Fatalf("recycleWorkerVolumes: %v", err)
+		}
+		return deletedSet(client)
+	}
+
+	t.Run("custody-held: /data preserved, pod/nix roll still proceeds", func(t *testing.T) {
+		del := recycle(t, true)
+		if !del["deployments/uzi-hw-w1"] {
+			t.Fatalf("ForceRoll must let the recycle proceed (Deployment deleted); got %v", keysOf(del))
+		}
+		if !del["persistentvolumeclaims/uzi-hw-w1-nix"] {
+			t.Fatalf("/nix should still recycle under ForceRoll; got %v", keysOf(del))
+		}
+		if del["persistentvolumeclaims/uzi-hw-w1-data"] {
+			t.Fatalf("ForceRoll discarded a custody-held /data PVC; force-roll may replace a pod/image but is NOT consent to discard custody-held data. deletes: %v", keysOf(del))
+		}
+	})
+
+	t.Run("non-custody: ForceRoll DOES recycle /data", func(t *testing.T) {
+		del := recycle(t, false)
+		if !del["persistentvolumeclaims/uzi-hw-w1-data"] {
+			t.Fatalf("a non-custody worker's /data must recycle under ForceRoll; got %v", keysOf(del))
+		}
+	})
+}
+
+// #1296-T4: the disk-pressure recycle arm (the only path that passes Data:true in production)
+// is SKIPPED for a custody-held worker — its /data may hold unpublished committed work, and
+// disk pressure is never consent to discard it. Nothing is deleted and the fixed token
+// `disk-recycle-skipped-custody worker=<id>` is logged; the SAME setup without custody recycles
+// BOTH volumes, proving the arm otherwise fires.
+//
+// Positive control: drop the `case w.CustodyHeld` arm from reconcileWorker's disk-pressure
+// switch (fall through to the recycle) and the held sub-test's zero-deletes assertion goes RED
+// — the disk-pressure arm tears the Deployment and /nix down (recycleWorkerVolumes' own custody
+// guard still spares /data, so the redness is the Deployment/nix deletes, not a /data loss).
+func TestDiskPressureRecycleSkippedForCustodyHeldWorker(t *testing.T) {
+	t.Run("custody-held: disk-pressure recycle skipped, nothing deleted, token logged", func(t *testing.T) {
+		ctx := context.Background()
+		hash := currentHash(t, "w1", 0)
+		var logs strings.Builder
+		// /nix LIVE at the desired 20Gi (M3 size arm inert) + /data LIVE, far outside the cooldown.
+		m, client := newMatWithRecycle(t, &fakeCordoner{}, DrainPolicy{Deadline: 24 * time.Hour},
+			RecyclePolicy{Enabled: true, Cooldown: time.Hour}, &logs,
+			deployedWorker("w1", 0, hash), pvcNix("w1", "20Gi"), pvcFor("w1", "data"))
+		observed, err := m.Observe(ctx)
+		if err != nil {
+			t.Fatalf("Observe: %v", err)
+		}
+		w := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", Generation: 0, DiskPressure: true, CustodyHeld: true, JoinToken: nil}
+		if err := m.Reconcile(ctx, []protocol.DesiredWorker{w}, observed); err != nil {
+			t.Fatalf("Reconcile: %v", err)
+		}
+		if del := deletedSet(client); len(del) != 0 {
+			t.Fatalf("a custody-held worker under disk pressure was recycled (deletes %v); custody must skip the whole disk-pressure arm", keysOf(del))
+		}
+		if tok := "disk-recycle-skipped-custody worker=w1"; !strings.Contains(logs.String(), tok) {
+			t.Fatalf("logs missing the custody deferral token %q; got:\n%s", tok, logs.String())
+		}
+		assertNoSecretReads(t, client)
+	})
+
+	t.Run("non-custody: disk-pressure recycle fires (both volumes deleted)", func(t *testing.T) {
+		ctx := context.Background()
+		hash := currentHash(t, "w1", 0)
+		m, client := newMatWithRecycle(t, &fakeCordoner{}, DrainPolicy{Deadline: 24 * time.Hour},
+			RecyclePolicy{Enabled: true, Cooldown: time.Hour}, io.Discard,
+			deployedWorker("w1", 0, hash), pvcNix("w1", "20Gi"), pvcFor("w1", "data"))
+		observed, err := m.Observe(ctx)
+		if err != nil {
+			t.Fatalf("Observe: %v", err)
+		}
+		w := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", Generation: 0, DiskPressure: true, CustodyHeld: false, JoinToken: nil}
+		if err := m.Reconcile(ctx, []protocol.DesiredWorker{w}, observed); err != nil {
+			t.Fatalf("Reconcile: %v", err)
+		}
+		del := deletedSet(client)
+		if !del["persistentvolumeclaims/uzi-hw-w1-data"] || !del["persistentvolumeclaims/uzi-hw-w1-nix"] {
+			t.Fatalf("a non-custody worker under disk pressure must recycle BOTH volumes; got %v", keysOf(del))
+		}
+	})
+}
+
 // M4-T5, the data-strand guard: mid disk-pressure recycle, the /data PVC is Terminating
 // and the Deployment is already gone. The Deployment must NOT be recreated over the doomed
 // /data volume — /data has no size, so its liveness (DataPVCLive) is the gate, mirroring

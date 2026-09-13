@@ -367,7 +367,17 @@ type fakeStore struct {
 	// prove last-writer-wins across two directives.
 	createdScopeCeiling  *store.CreateScopeCeilingInputParams
 	createdScopeCeilings []store.CreateScopeCeilingInputParams
-	cancelled            *store.CancelRunServerSideParams
+	// PRD #1189 M1: capture the extend write submitInput's `extend` branch makes.
+	// createdExtend holds the LAST call (nil until reached); createdExtends records every
+	// call in order. extendReturn is the new total budget_extension_seconds the fake reports
+	// back (the CTE's RETURNING); extendErr programs a refusal — set it to pgx.ErrNoRows to
+	// simulate a 0-row CreateExtendInput (terminal / untimed kind / over the cap), which the
+	// service disambiguates via extendRefusalReason over the already-fetched run.
+	createdExtend  *store.CreateExtendInputParams
+	createdExtends []store.CreateExtendInputParams
+	extendReturn   int32
+	extendErr      error
+	cancelled      *store.CancelRunServerSideParams
 	// cancelledByWorker captures the PRD #503 M1 live-worker cancel transition; SetState's
 	// failed arm calls it (instead of SetRunFailed) when the loaded run's stop_kind is
 	// 'cancelled'. cancelledByWorkerRows is the rows-affected it returns (defaults to 1 →
@@ -482,6 +492,35 @@ type fakeStore struct {
 	// not, for a non-ephemeral worker).
 	delEphemeralRuns int64
 	delEphemeralArg  *uuid.UUID
+
+	// PRD #1296 M4 (D3/D4) custody. openCustodyHolds is the count both the DeleteWorker
+	// guard (CountOpenCustodyHoldsForWorker) and the queued-reason rung
+	// (CountUnresolvedCustodyHoldsForOwner) read; default 0 → no custody, so pre-#1296
+	// tests are unaffected. countCustodyWorkerParams captures the last DeleteWorker guard
+	// call so a test can prove it was owner-scoped. releasableHolds seeds the reconciler
+	// candidate list; releaseCustodyRows is what the release queries report.
+	// releasedCustodyRuns records every (run, worker) ReleaseCustodyForRunWorker was called
+	// with (SetState terminal completion), and releasedCustodyHolds records every hold id
+	// ReleaseCustodyHold was called with (the reconciler).
+	openCustodyHolds         int64
+	countCustodyWorkerParams *store.CountOpenCustodyHoldsForWorkerParams
+	releasableHolds          []store.RecoveryCustodyHold
+	releaseCustodyRows       int64
+	releasedCustodyRuns      []uuid.UUID
+	releasedCustodyWorkers   []uuid.UUID
+	releasedCustodyHolds     []uuid.UUID
+	// PRD #1296 D3/D4 upload-retry-window sweep. stalledUploadsRows is what
+	// ExpireStalledUploads reports; expireStalledWindows records every retry_window it was
+	// called with, so a test can prove the sweep passes the configured window AND (by an empty
+	// slice) that a non-positive window disables the call entirely.
+	stalledUploadsRows   int64
+	expireStalledWindows []pgtype.Interval
+	// PRD #1296 D4 ready-artifact retention sweep. expiredCapturesRows is what
+	// ExpireReadyCaptures reports; expireReadyNows records every `now` it was called with, so a
+	// test can prove the sweep runs the expiry pass with a valid clock AND (by an empty slice)
+	// that a non-positive retention disables the call entirely.
+	expiredCapturesRows int64
+	expireReadyNows     []pgtype.Timestamptz
 
 	// Chat (PRD #39).
 	chatClaimRun          store.Run
@@ -1192,6 +1231,18 @@ func (f *fakeStore) CreateScopeCeilingInput(_ context.Context, arg store.CreateS
 	f.createdScopeCeilings = append(f.createdScopeCeilings, arg)
 	return store.RunUserInput{ID: 1, RunID: arg.RunID, Kind: "scope", Body: arg.Body}, nil
 }
+
+// CreateExtendInput (PRD #1189 M1) captures the extend write and returns the programmed new
+// total (extendReturn), or a programmed refusal (extendErr, e.g. pgx.ErrNoRows for a 0-row
+// CTE). Mirrors the CreateScopeCeilingInput fake above.
+func (f *fakeStore) CreateExtendInput(_ context.Context, arg store.CreateExtendInputParams) (int32, error) {
+	f.createdExtend = &arg
+	f.createdExtends = append(f.createdExtends, arg)
+	if f.extendErr != nil {
+		return 0, f.extendErr
+	}
+	return f.extendReturn, nil
+}
 func (f *fakeStore) CreateApprovePlanInput(_ context.Context, arg store.CreateApprovePlanInputParams) (store.RunUserInput, error) {
 	f.createdApproval = &arg
 	return store.RunUserInput{}, nil
@@ -1326,6 +1377,35 @@ func (f *fakeStore) DeleteWorkerForUser(_ context.Context, arg store.DeleteWorke
 func (f *fakeStore) DeleteEphemeralWorkerForRun(_ context.Context, arg uuid.UUID) (int64, error) {
 	f.delEphemeralArg = &arg
 	return f.delEphemeralRuns, nil
+}
+
+// PRD #1296 M4 (D3/D4) custody stubs.
+func (f *fakeStore) CountOpenCustodyHoldsForWorker(_ context.Context, arg store.CountOpenCustodyHoldsForWorkerParams) (int64, error) {
+	f.countCustodyWorkerParams = &arg
+	return f.openCustodyHolds, nil
+}
+func (f *fakeStore) CountUnresolvedCustodyHoldsForOwner(_ context.Context, _ uuid.UUID) (int64, error) {
+	return f.openCustodyHolds, nil
+}
+func (f *fakeStore) ListReleasableCustodyHolds(_ context.Context) ([]store.RecoveryCustodyHold, error) {
+	return f.releasableHolds, nil
+}
+func (f *fakeStore) ReleaseCustodyHold(_ context.Context, id uuid.UUID) (int64, error) {
+	f.releasedCustodyHolds = append(f.releasedCustodyHolds, id)
+	return f.releaseCustodyRows, nil
+}
+func (f *fakeStore) ReleaseCustodyForRunWorker(_ context.Context, arg store.ReleaseCustodyForRunWorkerParams) (int64, error) {
+	f.releasedCustodyRuns = append(f.releasedCustodyRuns, arg.RunID)
+	f.releasedCustodyWorkers = append(f.releasedCustodyWorkers, arg.WorkerID)
+	return f.releaseCustodyRows, nil
+}
+func (f *fakeStore) ExpireStalledUploads(_ context.Context, retryWindow pgtype.Interval) (int64, error) {
+	f.expireStalledWindows = append(f.expireStalledWindows, retryWindow)
+	return f.stalledUploadsRows, nil
+}
+func (f *fakeStore) ExpireReadyCaptures(_ context.Context, now pgtype.Timestamptz) (int64, error) {
+	f.expireReadyNows = append(f.expireReadyNows, now)
+	return f.expiredCapturesRows, nil
 }
 func (f *fakeStore) GetRepoToolProfile(_ context.Context, _ store.GetRepoToolProfileParams) (store.RepoToolProfile, error) {
 	return f.toolProfile, f.toolProfileErr
@@ -2772,6 +2852,70 @@ func TestSetStateAppliedOnLiveRun(t *testing.T) {
 	}
 	if !applied {
 		t.Fatal("a transition on a non-terminal run must be applied (handler answers 200)")
+	}
+}
+
+// TestSetStateCompletedReleasesCustody proves the PRD #1296 M4 (D3) terminal SUCCESS
+// custody release: an APPLIED `completed` transition releases ONLY THE REPORTING WORKER'S
+// custody hold on the run (a completed code-publishing run published its head, so its
+// unpublished-work custody is moot). It is scoped to the reporting worker (wkr.ID) via
+// ReleaseCustodyForRunWorker, NOT the whole run: a sibling older-generation orphan hold held
+// by a different worker must survive. Uses checkpointDeleteSvc so the whole terminal-automation
+// block runs.
+func TestSetStateCompletedReleasesCustody(t *testing.T) {
+	runID := uuid.New()
+	wkr := worker()
+	fs := &fakeStore{
+		runOwned: store.Run{
+			ID: runID, Kind: runkind.Issue,
+			IssueIid: pgtype.Int8{Int64: 5, Valid: true}, Status: "completed",
+		},
+		setCompletedRows:   1,
+		releaseCustodyRows: 1,
+	}
+	svc, _ := checkpointDeleteSvc(t, fs, nil)
+	_, applied, err := svc.SetState(context.Background(), wkr, runID, StateRequest{State: "completed"})
+	if err != nil {
+		t.Fatalf("SetState(completed): %v", err)
+	}
+	if !applied {
+		t.Fatal("applied = false, want true")
+	}
+	if len(fs.releasedCustodyRuns) != 1 || fs.releasedCustodyRuns[0] != runID {
+		t.Fatalf("ReleaseCustodyForRunWorker run calls = %v, want exactly [%s]", fs.releasedCustodyRuns, runID)
+	}
+	// The release is scoped to the REPORTING worker, not the whole run — the multi-hold guard
+	// that preserves a sibling older-generation orphan hold.
+	if len(fs.releasedCustodyWorkers) != 1 || fs.releasedCustodyWorkers[0] != wkr.ID {
+		t.Fatalf("ReleaseCustodyForRunWorker worker calls = %v, want exactly [%s] (release must be worker-scoped)", fs.releasedCustodyWorkers, wkr.ID)
+	}
+}
+
+// TestSetStateFailedRetainsCustody proves the negative half of D3: a `failed` terminal
+// transition does NOT release custody — the source is retained for capture or explicit
+// discard. (cancelled follows the same path; the switch routes both, and neither is
+// 'completed'.)
+func TestSetStateFailedRetainsCustody(t *testing.T) {
+	runID := uuid.New()
+	fs := &fakeStore{
+		runOwned: store.Run{
+			ID: runID, Kind: runkind.Issue,
+			IssueIid: pgtype.Int8{Int64: 5, Valid: true}, Status: "failed",
+		},
+	}
+	svc, _ := checkpointDeleteSvc(t, fs, nil)
+	_, applied, err := svc.SetState(context.Background(), worker(), runID, StateRequest{State: "failed"})
+	if err != nil {
+		t.Fatalf("SetState(failed): %v", err)
+	}
+	if !applied {
+		t.Fatal("applied = false, want true")
+	}
+	if len(fs.releasedCustodyRuns) != 0 {
+		t.Fatalf("ReleaseCustodyForRunWorker was called on a failed run (%v); failed runs must RETAIN custody", fs.releasedCustodyRuns)
+	}
+	if fs.setFailed == nil {
+		t.Fatal("SetRunFailed was not called; the failed transition must be recorded")
 	}
 }
 
@@ -4341,6 +4485,35 @@ func TestDeleteWorkerNotFoundWhenNoRowDeleted(t *testing.T) {
 	svc := New(fs, newBox(t), testParams())
 	if err := svc.DeleteWorker(context.Background(), uuid.New(), uuid.New()); err != ErrWorkerNotFound {
 		t.Fatalf("err = %v, want ErrWorkerNotFound", err)
+	}
+}
+
+func TestDeleteWorkerRejectedWhileHoldingCustody(t *testing.T) {
+	// PRD #1296 M4 (D3): an idle worker (no active runs) is STILL refused while it holds an
+	// open custody hold — deleting it would cascade the token an upload may still need. The
+	// error names the count so M4b's CLI confirmation can enumerate the affected captures.
+	fs := &fakeStore{countActiveRuns: 0, openCustodyHolds: 2, deleteWorkerRows: 1}
+	svc := New(fs, newBox(t), testParams())
+	user, wkrID := uuid.New(), uuid.New()
+	err := svc.DeleteWorker(context.Background(), user, wkrID)
+	if !errors.Is(err, ErrWorkerHasCustody) {
+		t.Fatalf("err = %v, want ErrWorkerHasCustody", err)
+	}
+	var ce *WorkerHasCustodyError
+	if !errors.As(err, &ce) || ce.Holds != 2 {
+		t.Fatalf("err = %v, want *WorkerHasCustodyError naming 2 holds", err)
+	}
+	// The guard runs BEFORE the delete: no token-cascading DELETE while custody is open.
+	if fs.deleteWorkerParams != nil {
+		t.Fatal("no delete should be issued while the worker holds custody")
+	}
+	// The custody guard is OWNER-SCOPED (FIX 2): DeleteWorker passes the requesting user's id
+	// so a FOREIGN owner's held worker counts 0 in SQL and 404s instead of leaking a 409. The
+	// fake cannot re-run the SQL filter, but it proves the userID/workerID reach the query.
+	if fs.countCustodyWorkerParams == nil ||
+		fs.countCustodyWorkerParams.UserID != user ||
+		fs.countCustodyWorkerParams.WorkerID != wkrID {
+		t.Fatalf("custody guard params = %+v, want worker %s scoped to user %s", fs.countCustodyWorkerParams, wkrID, user)
 	}
 }
 

@@ -301,6 +301,14 @@ func run() error {
 		// per-run cap — a park always becomes promotable again.
 		RunRecoveryParkBase: cfg.RunRecoveryParkBase,
 		RunRecoveryMaxPark:  cfg.RunRecoveryMaxPark,
+		// PRD #1296 D3/D4 durable-archive upload-retry window: the sweep flips a capture stuck
+		// in a non-terminal upload state past this to needs_action WITHOUT releasing its
+		// custody hold (source retained). Non-positive disables the pass.
+		RecoveryUploadRetryWindow: cfg.RecoveryUploadRetryWindow,
+		// PRD #1296 D4 ready-artifact retention: the enforcement toggle for the expiry sweep,
+		// which flips 'available' captures past their (capture-time-set) expires_at to 'expired'
+		// AND reclaims their bytes. Non-positive disables the pass.
+		RecoveryReadyRetention: cfg.RecoveryReadyRetention,
 	})
 
 	// Plan-approval gatekeeper (PRD #25 M4): handles the Slack Approve / Reject /
@@ -533,6 +541,11 @@ func run() error {
 		slackPoster,
 		settingsCache.PublicBaseURL,
 		slog.Default(),
+		// PRD #1189 M4: the near-timeout DM names the run's wall-clock deadline (needs the
+		// instance RUN_TIMEOUT for a run on the global default) and offers the `run extend`
+		// command unless the extension cap is exhausted or extending is disabled (cap 0).
+		slacksvc.WithRunTimeout(cfg.RunTimeout),
+		slacksvc.WithExtensionCap(settingsCache.RunExtensionCapSeconds),
 	)
 	// Notifications write seam (PRD #46 M2): the one place that creates inbox rows.
 	// It persists the row first, then delivers best-effort through slackNotifier

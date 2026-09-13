@@ -94,6 +94,7 @@ uzi run revise <id> [--message <text>]
 uzi run cancel <id>
 uzi run stop <id> [--message <text>]
 uzi run scope <id> --through <n>
+uzi run extend <id> --by <duration>
 uzi run pause <id> [--now|--cancel]
 uzi run resume <id>
 uzi run resume-now <id>
@@ -103,6 +104,7 @@ uzi run answer <id> [--message <text> ...]
 uzi run inputs <id> [--json]
 uzi run expedite <id> [--clear]
 uzi run rework <id> [-m|--message <text>]
+uzi run export <id> --output <path> [--capture <id>]
 uzi schedule create --repo <id> [--repo <id> ...] (--issue <iid> | --sweep [--label <l> ...] [--create-missing-labels] | --prompt <text>)
                     (--at <rfc3339> | --cron <expr>) [--tz <iana>]
                     [--auto-approve[=false]] [--wait-on-limit[=false]]
@@ -143,6 +145,7 @@ uzi pr list [--repo <id>] | checks <iid> [--repo <id>] [--watch]
 uzi ci list [--repo <id>] [--limit <n>] | jobs <run-id> [--repo <id>] | fix <ref> [--repo <id>]
 uzi admin users | runs | workers | usage | rate-limits | cli-tokens | guardrail-impact | blocked-repos
 uzi admin agent-source get | status
+uzi admin review backlog [--bucket todo|filed|done|dismissed|all] [--category label,label] | stats [--json]
 uzi skill status | install [--force] | install-hook | uninstall-hook
 uzi docs list [--audience user|operator|design|contributor|all]
 uzi docs show <slug>
@@ -231,6 +234,22 @@ A few worth knowing:
   below, not in `scope`'s own output, since a read-back there would race
   the worker settling it. Owner-only; valid only on a milestone-structured
   issue run (409 otherwise).
+- **`run extend <id> --by <duration>`** (PRD #1189) grants a non-terminal,
+  time-limited run more wall-clock time on top of its frozen budget — see
+  [Giving a run more time](./run-health.md#giving-a-run-more-time). `--by`
+  is required and takes a duration in Go's `time.ParseDuration` syntax
+  (`2h`, `90m`, `1h30m`) plus a `d` unit (`1d` = 24h); it must resolve to at
+  least 60 seconds (the server's minimum), so `0`, anything under a minute, a
+  negative value, or an unparseable one is a usage error (exit 2). Valid on any non-terminal run
+  of a kind the sweep can time out (issue, task, prompt, self-improve,
+  mr-rework, ci-fix), including a queued or parked one — a chat, judge, or
+  interactive-task run never times out, so extending one is a 409 (exit 5).
+  Extending past the admin's per-run allowance, or while an admin has
+  turned extending off entirely, is also a 409, with the server's message
+  (naming the remaining allowance) printed verbatim. On success it prints
+  the new deadline and the running total against the allowance, e.g.
+  `Extended <id> by 2h. 3h05m left, times out 17:20. Extensions on this
+  run: 2h of 16h allowed.` Owner-only.
 - **`run pause <id> [--now|--cancel]`** (PRD #1190) parks a running run on a
   pushed checkpoint until you resume it — see [Pausing and resuming a
   run](./run-pause.md) for the full picture. The default finishes the
@@ -610,6 +629,21 @@ A few worth knowing:
   to produce them. Read-only, same as every other `admin` verb here —
   setting up the source, and triggering **Sync now**, **Check for
   updates**, **Bump pin**, and **Approve & apply** stay web-only.
+- **`admin review backlog` and `admin review stats` are the admin "All users"
+  judge aggregate** (PRD #1184) — every user's judge recommendations deduped by
+  `(category, target)` across the whole factory, with **attribution hidden**.
+  `backlog` prints one line per group as `K users · M runs · N open` (how many
+  distinct users hit the pattern, how many runs it recurs in, how many are still
+  open) plus the rationale preview, and **no per-run or occurrence line**: no
+  owner, run id or run title is shown, so a group tells you how widespread a
+  recommendation is without saying whose it is. It takes `--bucket` and
+  `--category` — forwarded verbatim and server-validated exactly like
+  [`uzi review backlog`](#reviewing-and-triaging-from-the-cli), so an unknown
+  value is a usage error (exit 2), not a silent empty list — but has **no
+  `--run`** anchor, because an anchor names a run. `stats` is the all-users
+  triage tally, the cross-user twin of `uzi review stats`. Both are read-only and
+  need an `admin_ro` (`uza_`) token, same ceiling as every other `admin` verb;
+  the cross-user Mark done and Undo stay cookie-only in the web UI.
 - **`uzi repo remove <id>` deletes a single stale repo** — the surgical
   counterpart to deleting a whole forge connection. It only works on a
   **disabled** repo, so disable it first (`enabled` shows in `uzi repo list`);
@@ -639,6 +673,46 @@ A few worth knowing:
   credential (its stored URL is left intact, so a later re-login needs no
   re-typed URL); it does **not** revoke it server-side (see
   [Managing tokens](#managing-tokens) below).
+
+## Recovering unpublished work: `uzi run export`
+
+When a run commits useful work but then fails to publish its head (a workflow or
+secret preflight, a rejected push, exhausted base alignment), uzi captures the run's
+original committed history into a durable, owner-only recovery archive — a real Git
+bundle that imports into a fresh clone even after the worker and its disk are gone.
+`uzi run export` downloads that archive to a local file:
+
+```
+uzi run export <run-id> --output ./recovered.bundle
+```
+
+- **Owner-only.** You can export only your own runs; an admin viewing someone else's
+  run is refused. The download reaches the API directly — no contact with the worker,
+  which may no longer exist.
+- **Explicit capture selection.** A run can retain more than one capture. When more
+  than one is *available*, export refuses to guess: it exits with a usage error listing
+  every capture's id and state, and you re-run with `--capture <id>`. It never silently
+  picks a different attempt. When exactly one is available it is used automatically. A
+  capture that is not in the `available` state (still preparing/uploading, `needs_action`,
+  `expired` or discarded) is refused with its honest state rather than downloaded.
+- **Verified, atomic, no-clobber writes.** The download is streamed into a private
+  `0600` temp file, its byte count and checksum are verified against the server manifest,
+  and only then is the destination created — by an atomic link that **refuses to overwrite
+  an existing file or symlink** at `--output`. The final file only ever appears
+  fully-formed and verified.
+- **Nonzero exit, no partial file, on failure.** An interrupted, corrupt or expired
+  download exits nonzero and leaves **no file** at the destination, so a truncated
+  bundle is never mistaken for a complete one.
+- **Review before you publish.** The archive is the run's *original* committed history
+  and may contain secrets. Review it before publishing anywhere; a real credential must
+  be revoked/rotated and removed from the affected history. No raw bytes are ever printed
+  to stdout — `--json` prints the metadata result only (`capture_id`, `output`,
+  `byte_size`, `checksum`, `source_sha`, `verified`).
+
+`uzi run get` also shows a metadata-only recovery summary for a terminal run that has
+captures (the archive count, per-state tally, and each available capture's id) so you
+know what `--capture` can fetch. It is metadata only and never claims an archive is
+available when it is not.
 
 ## uzi handoff: ephemeral branch-scoped task runs
 
@@ -891,7 +965,15 @@ also the TUI's own fallback when the live channel is unreachable (below).
   cache-creation tokens), `out` (output tokens), and a `cache` line with the
   cached-read token count and its share of the total input (`in` + `cache`)
   as a percentage; it's
-  omitted for a run with no recorded usage.
+  omitted for a run with no recorded usage. The rail itself doesn't scroll —
+  it's clamped to the transcript's height — so when the expanded roster plus
+  MILESTONES, SPEND, and the run's own account meters wouldn't all fit, the
+  rail folds the crew list by itself down to a count caret (`N ▸`, N being the
+  lane count) plus the selected lane, keeping those blocks on screen; a
+  roster that fits stays expanded (`▾`). Pressing `c` overrides the automatic
+  call for that run — folding an expanded rail or unfolding a folded one —
+  and the override sticks until the run is reopened, which returns it to the
+  automatic behaviour.
 - **Review overlay** (`[v]` from run detail). The judge's verdict, summary,
   and recommendations, with the same resolve/dismiss/undo triage described
   under [Reviewing and triaging from the CLI](#reviewing-and-triaging-from-the-cli).
@@ -943,6 +1025,7 @@ run's merge request, when it has one.
 ←/→, h/l, tab detail: focus the crew rail / the transcript (h/← rail, l/→ transcript; tab cycles). Detail opens focused on the crew rail.
 j/k, ↑/↓     move within the focused pane (board: row · detail: between agents on the rail, or scroll the transcript)
 g            detail: follow live — re-attach and jump to the newest output (live runs only)
+c            detail: fold / unfold the crew list; it also folds by itself when MILESTONES/SPEND/ACCOUNTS would not fit
 enter        open the selected run (board)
 /            filter the board
 a            toggle the factory-wide admin board (board only)
@@ -1428,7 +1511,10 @@ non-`interactive` run is actually `running`, so a queued run, a gated run, a
 chat, and a finished run all print nothing. `run get`'s human view prints it
 as a `DEADLINE` row right after `HEALTH`, folded to local time plus a
 countdown (`15:20 · 1h05m left`, or `15:20 · stopping` once past) instead of
-the raw timestamp, emit-only-when-set the same way `PRD_MOVE` is above.
+the raw timestamp, emit-only-when-set the same way `PRD_MOVE` is above. On a
+run [extended](./run-health.md#giving-a-run-more-time) past its frozen
+budget, the row gains a trailing `· +2h extended` clause naming the total
+extra time granted so far.
 
 `run get` also prints a `NOW` row right after the `MILESTONES` block: the
 run's server-derived current activity, folded to

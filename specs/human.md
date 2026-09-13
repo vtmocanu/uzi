@@ -355,6 +355,11 @@ Tracked as GitLab issue vtmocanu/uzi#46; PRD at `prds/done/46-run-judge-self-imp
 - **Admin may file** another user's recommendation (kept, not restricted to the
   owner), conditioned on **prominent provenance** showing whose worker produced
   the (attacker-influencable) text. [user 2026-07-17]
+- **Admin may read the judge backlog aggregated across all users** with
+  attribution hidden (no owner, no run identity — a distinct-user count instead),
+  and may **mark a recommendation done across users** (each owner sees it was
+  done by an admin, and can undo); dismissing another user's recommendation stays
+  the owner's decision. [user 2026-09-07]
 - Works on **every existing recommendation**, with no backfill and no re-judge.
   [user 2026-07-17]
 - **When a backlog read is truncated the page says so**, in a plain warning
@@ -407,6 +412,7 @@ Tracked as GitLab issue vtmocanu/uzi#47; PRD at `prds/done/47-loop-hang-detectio
     because a requirement that changed is not the same artifact as one that was wrong.
     [AI-proposed; NEEDS USER RATIFICATION]
 - The "slow" health flag is a near-timeout warning at a share of the run's wall-clock budget, not a bare timer. [user, #1170]
+- A run's owner can extend its wall-clock budget from the web or CLI, up to an admin-set allowance; the frozen budget itself never changes. [user, #1189]
 
 ## Feature #49 — Worker resource stats (live per-worker CPU/memory)
 
@@ -724,6 +730,7 @@ Redesigns the shipped `uzi tui` (PRD #112). TUI/CLI-only.
 - Keep the health words visible on the board (not colour-only). [user]
 - The interactive demo is rebuilt on the shipped views (not retired, not a separate prototype). [user, D1]
 - The run detail opens on the run and its newest messages first and fills older history in the background, so a slow link never sits on an empty pane; refetches continue from what is already held. [user, #1137]
+- The run view's crew rail folds by itself when the expanded roster would push MILESTONES, SPEND or the run's own account meters off the rail; a roster that fits stays open; `c` overrides for that run. [user 2026-09-12, #1257]
 
 ## Feature #1093 — Pause all schedules
 

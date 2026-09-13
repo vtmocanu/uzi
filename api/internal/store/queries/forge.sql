@@ -192,6 +192,18 @@ SELECT count(*) FROM runs
 WHERE repo_id = @repo_id::uuid
   AND status NOT IN ('completed', 'failed', 'cancelled');
 
+-- name: CountOpenCustodyHoldsForRepo :one
+-- PRD #1296 M4 (D3): the repo-delete custody guard's predicate. DeleteRepoForUser cascades
+-- the repo's runs (runs.repo_id ON DELETE CASCADE), which would hit a still-open hold's
+-- ON DELETE RESTRICT live_run_id FK and error mid-cascade. This counts the OPEN custody
+-- holds on the repo's runs so the delete path can refuse GRACEFULLY with an enumerated
+-- count instead — the owner must explicitly discard those captures (or let recovery
+-- complete) before the last local source is destroyed. Scoped through the repo's runs,
+-- reading recovery_custody_holds.repo_id (recorded at claim) directly so it stays correct
+-- even after a run row is later reaped (the hold's run_id FK is SET NULL-free by design).
+SELECT count(*) FROM recovery_custody_holds
+WHERE repo_id = @repo_id::uuid AND state = 'open';
+
 -- name: SetRepoDevboxOptInForUser :one
 -- Tier-2 repo devbox.json opt-in toggle (PRD #18 M5), authorized through the
 -- repo's owning connection. A non-owned or unknown id returns no rows (404).
@@ -498,7 +510,10 @@ SELECT DISTINCT ON (r.issue_iid)
        -- PRD #1170: the near-timeout inputs the card's deadline_at needs (RunDeadline):
        -- started_at + COALESCE(budget_wall_seconds, RUN_TIMEOUT) + budget_paused_seconds,
        -- null unless running & not chat/judge/interactive.
+       -- PRD #1189: budget_extension_seconds is the extra term RunDeadline adds so the card's
+       -- deadline_at reflects a granted extension.
        r.started_at, r.budget_wall_seconds, r.budget_paused_seconds, r.interactive,
+       r.budget_extension_seconds,
        r.created_at, r.updated_at,
        ru.display_name AS owner_name, rw.name AS worker_name,
        COUNT(*) OVER (PARTITION BY r.issue_iid) AS run_count
@@ -523,7 +538,10 @@ SELECT r.id, r.user_id, r.status, r.mr_iid, r.mr_web_url, r.mr_state, r.failure_
        r.kind, r.iteration_count, (r.plan_md IS NOT NULL AND btrim(r.plan_md, E' \t\n\r\f\v\u0085\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000') <> '') AS has_plan_md,
        r.health, r.health_reason, r.health_since,
        -- PRD #1170: the near-timeout inputs the card's deadline_at needs (RunDeadline).
+       -- PRD #1189: budget_extension_seconds is the extra term RunDeadline adds so the card's
+       -- deadline_at reflects a granted extension.
        r.started_at, r.budget_wall_seconds, r.budget_paused_seconds, r.interactive,
+       r.budget_extension_seconds,
        r.created_at, r.updated_at,
        ru.display_name AS owner_name, rw.name AS worker_name,
        COUNT(*) OVER () AS run_count

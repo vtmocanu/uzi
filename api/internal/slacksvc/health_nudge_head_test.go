@@ -10,8 +10,11 @@ package slacksvc
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // TestReasonPersistFailingMirrorsWorkersvc is the slacksvc half of the mirror pin.
@@ -84,7 +87,8 @@ func reasonLooping() string { return "the agent keeps repeating the same action"
 func TestHealthNudgeBlocksThreadTheReasonThrough(t *testing.T) {
 	// The head is chosen by the reason and the section then appends it, so the two must
 	// not contradict each other in the same message.
-	blocks, _ := healthNudgeBlocks(healthLooping, reasonPersistFailing, "https://uzi.example", uuid.New())
+	blocks, _ := healthNudgeBlocks(healthLooping, reasonPersistFailing, "https://uzi.example",
+		store.GetSlackRunContextRow{ID: uuid.New()}, nil, 0, time.Now())
 	_, body := blockSummary(blocks)
 	if strings.Contains(body, "repeating the same step") {
 		t.Fatalf("nudge section = %q: the head still carries the tool-repetition framing", body)
@@ -176,7 +180,8 @@ func reasonNoWorker() string      { return "no worker is online to pick up this 
 //
 //	⏳ This run is still waiting for a worker to pick it up. the worker hasn't picked up your response yet.
 func TestHealthNudgeBlocksUndeliveredVerdictDoNotContradictThemselves(t *testing.T) {
-	blocks, _ := healthNudgeBlocks(healthWaitingWorker, reasonVerdictUndelivered, "https://uzi.example", uuid.New())
+	blocks, _ := healthNudgeBlocks(healthWaitingWorker, reasonVerdictUndelivered, "https://uzi.example",
+		store.GetSlackRunContextRow{ID: uuid.New()}, nil, 0, time.Now())
 	_, body := blockSummary(blocks)
 	if strings.Contains(body, "waiting for a worker to pick it up") {
 		t.Fatalf("nudge section = %q: the head still carries the unclaimed-run framing while the reason says a worker is holding it", body)

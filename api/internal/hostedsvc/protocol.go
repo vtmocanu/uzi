@@ -93,6 +93,15 @@ type DesiredWorker struct {
 	// Always present on the wire (no omitempty) so a drop is a visible contract change,
 	// not a silent false.
 	Ephemeral bool `json:"ephemeral"`
+	// CustodyHeld is true when the worker is retaining unpublished run work under a durable
+	// recovery custody hold (PRD #1296 M1, D3/D9): a distinct desired-worker signal,
+	// INDEPENDENT of Busy and DrainingSince, that the controller must honor on every
+	// teardown/data-PVC-recycle path (ordinary roll, drain deadline, ForceRoll, disk
+	// pressure) so a held PVC is never discarded. The wire field is frozen here; M1's api
+	// Poll mapping sets it false (M4 wires the real value from the custody store), so the
+	// contract round-trips now without changing behavior. Always present (no omitempty) so
+	// a drop is a visible contract change, not a silent false, exactly like Busy/Ephemeral.
+	CustodyHeld bool `json:"custody_held"`
 	// Generation is bumped whenever the desired spec changes; the controller
 	// compares it against what it observes to decide whether to roll (Decision 9).
 	Generation int64 `json:"generation"`

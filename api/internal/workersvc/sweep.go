@@ -6,6 +6,7 @@ import (
 	"log/slog"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/autoselectrow"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
@@ -202,6 +203,51 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 		return res, fmt.Errorf("resume pool-wait runs: %w", err)
 	}
 
+	// Custody-release reconciler (PRD #1296 M4, D3): the boot/periodic backstop that
+	// settles a recorded successful publication whose best-effort terminal release
+	// (SetState) failed, leaving an open hold's live FKs set and its worker un-reapable.
+	// It releases ONLY holds whose disposition is durable (a completed run, or a ready
+	// capture) — never inferring success from a failed/cancelled/partial/running status —
+	// so a failed run with no ready capture keeps its custody. Placed before the reap
+	// backstop (ephemeral reap is a separate sweeper.Pass in main.go, run each tick) so a
+	// hold released this tick lets the SAME tick's/next tick's reap delete the worker.
+	// Partial best-effort: inside ReconcileCustodyReleases a per-hold ReleaseCustodyHold
+	// error is logged and skipped (one stuck hold does not sink the reconcile), but a
+	// candidate-LIST read error fails the pass and surfaces here — see that method's doc.
+	if res.CustodyReleased, err = s.ReconcileCustodyReleases(ctx); err != nil {
+		return res, fmt.Errorf("reconcile custody releases: %w", err)
+	}
+
+	// Upload-retry-window sweep (PRD #1296 D3/D4): the LIVE consumer of
+	// UZI_RECOVERY_UPLOAD_RETRY_WINDOW. A reserved capture advances to 'available' within
+	// seconds of a healthy upload, so one still non-terminal (preparing/uploading) past the
+	// window has genuinely stalled — surface it as needs_action so the owner sees a
+	// retain-and-decide artifact. The custody hold is NOT released (needs_action is a
+	// non-releasing state), so the source is RETAINED until capture succeeds or the owner
+	// explicitly discards. Disabled when the window is non-positive, matching the
+	// ChatIdleTimeout/ProposalConfirmStuckTimeout "0 disables" convention above.
+	if s.p.RecoveryUploadRetryWindow > 0 {
+		if res.RecoveryStalled, err = s.q.ExpireStalledUploads(ctx, pgtype.Interval{
+			Microseconds: s.p.RecoveryUploadRetryWindow.Microseconds(), Valid: true,
+		}); err != nil {
+			return res, fmt.Errorf("expire stalled recovery uploads: %w", err)
+		}
+	}
+
+	// Ready-artifact retention sweep (PRD #1296 D4): the LIVE enforcement of
+	// UZI_RECOVERY_READY_RETENTION. Each capture's expires_at is baked in at durable capture
+	// (MarkCaptureReady) from the retention window; this pass flips every 'available' capture
+	// now past its expires_at to 'expired' AND deletes its encrypted chunk rows in one atomic
+	// statement, so a retention-expired artifact stops costing byte storage while its metadata
+	// row stays visible in state 'expired'. Custody is NOT touched — an expired capture whose
+	// hold is still open stays retained per D3. Disabled when the retention is non-positive,
+	// matching the RecoveryUploadRetryWindow "0 disables" guard above.
+	if s.p.RecoveryReadyRetention > 0 {
+		if res.RecoveryExpired, err = s.q.ExpireReadyCaptures(ctx, pgconv.Time(now)); err != nil {
+			return res, fmt.Errorf("expire ready recovery captures: %w", err)
+		}
+	}
+
 	// Bound the in-process persistence-failure tracker (PRD #108 M4). This is the
 	// memory bound for the one case no other eviction path reaches: a run whose
 	// worker vanished without the run ever reaching terminal. Pruned BEFORE the
@@ -305,6 +351,48 @@ func (s *Service) resumePoolWaitRuns(ctx context.Context) (int64, error) {
 		s.publishSwept(r.ID, "queued")
 	}
 	return resumed, nil
+}
+
+// ReconcileCustodyReleases is the boot/periodic custody-release backstop (PRD #1296 M4,
+// D3). It finds OPEN custody holds whose release is now WARRANTED but was never applied —
+// the best-effort terminal release in SetState failed after a successful publication, or a
+// worker uploaded a ready capture for a still-open hold without releasing it — and applies
+// the idempotent release, so the hold's ON DELETE RESTRICT live FKs are nulled and normal
+// reap can then delete the worker.
+//
+// Release is warranted ONLY on a durable disposition for THIS hold, decided in SQL by
+// ListReleasableCustodyHolds: the hold's run is 'completed' AND the hold is the completed
+// generation (h.generation = runs.claim_generation), or a READY capture ('available') exists
+// for THIS hold. It NEVER infers success from an arbitrary terminal status — a
+// 'failed'/'cancelled'/future 'partial' run with no ready capture keeps its custody for
+// capture or explicit discard.
+//
+// It releases EXACTLY the selected hold via ReleaseCustodyHold(h.ID), NOT the whole run: a
+// run can carry MORE THAN ONE open hold (a cross-worker re-claim after a transient worker loss
+// opens a generation-2 hold while the crashed worker's generation-1 hold stays open), whose
+// committed work is a different, uncaptured copy. Releasing per-run would null that sibling
+// orphan's live FKs and let its worker be reaped, dropping the only copy of its work — so
+// selection and release must agree PER HOLD. Returns the number of holds released this tick
+// (summed from the per-hold execrows). A ReleaseCustodyHold error is logged and skipped so one
+// stuck hold does not sink the whole reconcile — the same best-effort stance the pool-resume
+// pass takes; a candidate-list read error, by contrast, fails the pass like the sibling reads.
+func (s *Service) ReconcileCustodyReleases(ctx context.Context) (int64, error) {
+	holds, err := s.q.ListReleasableCustodyHolds(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("list releasable custody holds: %w", err)
+	}
+	var released int64
+	for _, h := range holds {
+		n, err := s.q.ReleaseCustodyHold(ctx, h.ID)
+		if err != nil {
+			// Best-effort: skip this hold, keep reconciling the rest. The hold stays open and
+			// the next tick retries it.
+			slog.Error("sweeper: custody release failed", "hold", h.ID, "run", h.RunID, "error", err)
+			continue
+		}
+		released += n
+	}
+	return released, nil
 }
 
 // publishSwept fans a sweeper-driven run transition out to the same seams a

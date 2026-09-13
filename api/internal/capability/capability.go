@@ -37,16 +37,28 @@ const (
 // interlocked run through any of those bypass paths.
 const CompletionInterlockV1 = "completion_interlock_v1"
 
+// RecoveryArchiveV1 is the PROTOCOL capability a worker self-reports (PRD #1296 M1, D9)
+// to declare it implements the durable-recovery archive path (pin H, reserve/bind/upload
+// a capture, retry custody). Like CompletionInterlockV1 it is a worker/server protocol
+// fact, NOT a scheduler capability or a user-chosen repo requirement — so it lives in the
+// protocol vocabulary below, never in `vocabulary` and never in the web capability picker.
+// The ClaimRun custody CTE (D2) opens a hold only for a worker advertising it, and the Go
+// caller derives @recovery_capable from whether workers.protocol_capabilities contains it,
+// so an old worker on a supporting API is explicitly unsupported (D9) rather than falsely
+// promised recovery.
+const RecoveryArchiveV1 = "recovery_archive_v1"
+
 // protocolVocabulary is the closed set of legal PROTOCOL capability names — kept
 // entirely separate from `vocabulary` so a protocol string is never offered to users
 // through Vocabulary()/the web mirror. FilterProtocol drops anything not in here.
 var protocolVocabulary = map[string]struct{}{
 	CompletionInterlockV1: {},
+	RecoveryArchiveV1:     {},
 }
 
 // protocolOrder fixes FilterProtocol's stable output order (protocolVocabulary is a map,
 // so its own iteration order is not stable). Keep in lockstep with protocolVocabulary.
-var protocolOrder = []string{CompletionInterlockV1}
+var protocolOrder = []string{CompletionInterlockV1, RecoveryArchiveV1}
 
 // FilterProtocol returns the members of in that are in the PROTOCOL vocabulary, DROPPING
 // unknowns silently (never an error), deduped, in stable order. It mirrors Filter but

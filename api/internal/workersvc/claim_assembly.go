@@ -72,6 +72,19 @@ func (s *Service) openWithAutoRetry(ctx context.Context, run store.Run, choice s
 	return cred, choice, nil
 }
 
+// workerIdentity is the immutable, non-secret provenance label recorded on a custody
+// hold and its captures (PRD #1296 M1, D1/D2). It must be reproducible by the SAME worker
+// at a post-terminal recovery retry and is bound into the capture AAD, so it is derived
+// from stable worker facts — the worker's name, falling back to its id when unnamed. It is
+// NEVER the join token or token hash (those are secrets and rotate); it is only an
+// identity label paired with the immutable original_worker_id the authorization enforces.
+func workerIdentity(wkr store.Worker) string {
+	if strings.TrimSpace(wkr.Name) != "" {
+		return wkr.Name
+	}
+	return wkr.ID.String()
+}
+
 // assembleClaim builds the claim payload for an already-claimed run. It takes the
 // CLAIMING worker, not just the run, because since PRD #104 M3 the credential a
 // run spends can depend on which worker picked it up.
@@ -329,8 +342,11 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		LastSeq:        run.LastSeq,
 		IterationCount: run.IterationCount,
 		RequeueCount:   run.RequeueCount,
-		PlanMd:         textPtr(run.PlanMd),
-		AutoApprove:    run.AutoApprove,
+		// PRD #1296 M1 (D2): the claim-lane counter the ClaimRun CTE just incremented, read
+		// straight off the returned run row and returned in the claim payload.
+		ClaimGeneration: run.ClaimGeneration,
+		PlanMd:          textPtr(run.PlanMd),
+		AutoApprove:     run.AutoApprove,
 		// PRD #400 M2: task-run MR gate + source ref. open_mr is a plain bool (false
 		// for every non-task run); base_branch is pgtype.Text (nil for a run that has
 		// none). Both re-read from the row on every claim, like AutoApprove above.
@@ -433,7 +449,12 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			// persisted columns, falling back to the global default when NULL (a 0/1-
 			// milestone run, byte-for-byte today). The worker also reads the scaled wall
 			// clock off the state-ack, but the claim carries it too for a fresh resume.
-			RunTimeoutSeconds:      coalesceInt(run.BudgetWallSeconds, int(s.p.RunTimeout.Seconds())),
+			// PRD #1189 M1 (D6, THE CRUX): add budget_extension_seconds so a run extended
+			// while queued/parked arms the ALREADY-LARGER hard wall when it starts — without
+			// this the worker trips REASON_WALL at the frozen budget before the server's
+			// extended deadline, and the extend is a silent no-op. budget_extension_seconds is
+			// NOT NULL DEFAULT 0, so this is byte-identical for a run that was never extended.
+			RunTimeoutSeconds:      coalesceInt(run.BudgetWallSeconds, int(s.p.RunTimeout.Seconds())) + int(run.BudgetExtensionSeconds),
 			IdleTimeoutSeconds:     int(s.p.RunIdleTimeout.Seconds()),
 			TaskIdleTimeoutSeconds: taskIdleTimeoutSeconds,
 			MaxIterations:          coalesceInt(run.BudgetMaxIterations, s.p.RunMaxIterations),

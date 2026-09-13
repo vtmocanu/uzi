@@ -58,7 +58,13 @@ export function TriageStateChip({
       return (
         <Badge
           tone="ok"
-          title={setVia === "issue_close" ? "Marked done automatically when the filed issue was closed" : undefined}
+          title={
+            setVia === "issue_close"
+              ? "Marked done automatically when the filed issue was closed"
+              : setVia === "admin"
+                ? "Marked done by an admin across every user's runs"
+                : undefined
+          }
         >
           <span aria-hidden="true">✓</span> {doneLabel(setVia, filed?.issue_iid)}
         </Badge>

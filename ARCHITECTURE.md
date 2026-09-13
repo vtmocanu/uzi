@@ -732,8 +732,11 @@ chain in the diagram above, with no intervening `running`.
   heartbeat-staleness (bounded by `WORKER_AFFINITY_CEILING`). Independently, the
   forge-checkpoint `pushbroker.Publish` no longer fails when `main` advanced past
   the clone base (a server-side compare-and-swap on the fetched checkpoint tip),
-  publish outcomes now surface on the run feed, and every terminal transition
-  deletes the run's `refs/uzi-checkpoints/<branch>`. See
+  publish outcomes now surface on the run feed, and a worker-reported terminal
+  transition (`SetState`) or a server-side cancel/reject attempts tip-fenced
+  checkpoint cleanup on the run's `refs/uzi-checkpoints/<branch>`; a
+  sweeper-driven terminal transition (timeout, worker-lost-over-cap) does not:
+  it only broadcasts the status, leaving that ref in place. See
   [ADR-628](adr/0628-cross-worker-resume-durability.md)'s #1030 amendment.
   This same affinity leg is what lets a **paused** run's `resume` fall open
   to a different worker once the pinned one is stale or gone; see
@@ -903,13 +906,29 @@ chain in the diagram above, with no intervening `running`.
   tip's `.github/workflows/**` tree differs from the current default branch, even
   when the run's branch never touched a workflow file but only fell behind as main
   advanced mid-run. Just before the push, uzi fetches the default tip and, only
-  when the workflow trees differ, aligns the branch: a SHA-preserving merge first,
-  falling back to a rebase if still refused. An unresolvable conflict fails the run
-  typed (`fail_origin = finalize_base_align_conflict`) with the pre-align diff
-  preserved on the failed-run card via the same `preserved_patch` mechanism PRD
-  #377 built for a branch that *modifies* a workflow file. See
-  [ADR-456](adr/0456-rebase-before-finalize-push.md) for the mechanism and why
-  merge precedes rebase.
+  when the workflow trees differ, aligns the branch: when the branch provably
+  touched no workflow file, a fast-forward overlay of just the default's
+  `.github/workflows/` subtree onto the agent tip (issue #627, every original
+  commit SHA preserved); otherwise, or when that overlay does not clear the
+  rejection, a SHA-preserving merge, falling back to a rebase if still refused.
+  An unresolvable conflict fails the run typed (`fail_origin =
+  finalize_base_align_conflict`) with the pre-align diff preserved on the
+  failed-run card via the same `preserved_patch` mechanism PRD #377 built for a
+  branch that *modifies* a workflow file. See
+  [ADR-456](adr/0456-rebase-before-finalize-push.md) for the mechanism, its
+  2026-08-23 overlay amendment, and why merge precedes rebase.
+- **Durable recovery of unpublished work at the finalization boundary** (PRD
+  #1296): before any of the finalization failures above (a secret/workflow
+  preflight, a rejected push, or exhausted base alignment) can leave a run's
+  original committed history unreachable, uzi captures that history into an
+  encrypted, owner-only Git bundle durably stored in Postgres — independent
+  of the worker or its disk surviving. This is separate from the
+  `recovery_wait` transient park above: that mechanism resumes a live,
+  still-running turn from a local checkpoint, while this one preserves a
+  run's original commits across a `failed` finalization and the worker's
+  eventual teardown. See [docs/run-recovery.md](docs/run-recovery.md),
+  [PRD #1296](prds/1296-durable-run-recovery.md) and
+  [adr/1296-durable-run-recovery.md](adr/1296-durable-run-recovery.md).
 - **Milestone tracker reconciliation** (PRD #122/#265/#390) — a milestone-structured
   `issue` run shows a *reported-complete* tracker (`runs.milestones_completed`,
   monotone union, never "verified"), fed by mid-run `report_progress` and the lead's
