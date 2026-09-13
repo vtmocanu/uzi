@@ -60,6 +60,14 @@ type tuiView int
 const (
 	viewBoard tuiView = iota
 	viewDetail
+	// viewPulls is the forge `pulls` list screen (PRD #1255 M4a). viewCI is the forge
+	// `ci` list screen (PRD #1255 M4b). viewPR is the PR drill-in (PRD #1255 M5) — a peer of
+	// viewDetail, opened from the pulls list (enter/→) or the run view (m). viewCIRun is the
+	// CI-run drill-in (PRD #1255 M6) — a peer of viewPR, opened from the ci list (enter/→).
+	viewPulls
+	viewCI
+	viewPR
+	viewCIRun
 )
 
 // ---- messages -------------------------------------------------------------
@@ -216,10 +224,63 @@ type tuiModel struct {
 	view   tuiView
 	board  boardState
 	detail detailState
+	// pulls is the forge `pulls` screen's state (PRD #1255 M4a). It carries its OWN
+	// reqSeq/waitID/tickGen poll-guard counters (a copy of the board's chain, not a share)
+	// so the two lists poll independently.
+	pulls pullsState
+	// ci is the forge `ci` screen's state (PRD #1255 M4b), with its OWN poll-guard counters
+	// like pulls, so the two forge lists poll independently over the SAME scoped repo.
+	ci ciState
+	// pr is the PR drill-in's state (PRD #1255 M5), with its OWN reqSeq/waitID/tickGen poll-guard
+	// counters and a 5s live re-poll chain, independent of the two list screens.
+	pr prState
+	// cirun is the CI-run drill-in's state (PRD #1255 M6), the ci-run twin of pr: its OWN
+	// reqSeq/waitID/tickGen poll-guard counters and a 5s live re-poll chain, independent of the two
+	// list screens and of the PR view.
+	cirun ciRunState
+	// prReturn / detailReturn record WHERE a drill-in was opened from, so its esc returns there
+	// (D1): the PR view returns to prReturn (the pulls list, or the run view on detail→m→PR), and
+	// the run view returns to detailReturn (the board by default, or pulls / PR on a u ↳ run jump).
+	// prReturn defaults to viewPulls; detailReturn to viewBoard (the zero value), so the existing
+	// board↔detail behaviour is unchanged. The state returned to is never clobbered — m.pulls /
+	// m.detail persist on the model — so it is still loaded when esc lands back on it.
+	prReturn     tuiView
+	detailReturn tuiView
+	// forgeNotice is the transient one-line confirmation / server-reason a w (rework) / f (fix ci)
+	// action leaves, drawn in the PR view's and the pulls screen's header-note area (D1/D12). It is
+	// set by prActionMsg, overwritten by the next action, and cleared when a PR view is opened fresh
+	// or the repo cycles. The success text is static + a short run id; the error text is fmtErr-
+	// sanitized, so drawing it is safe.
+	forgeNotice string
+	// repos / repoIdx / repoChosen scope the forge views to one repo at a time (PRD #1255
+	// D2). repos is the viewer's ENABLED repos (from ListRepos); repoIdx is the current one;
+	// R cycles it; repoChosen records whether the default-repo rule has resolved (or the user
+	// has cycled), so the default is computed once rather than on every view entry. reposLoaded
+	// / reposErr drive the "loading…" / can't-load scope states.
+	repos       []apitypes.RepoDTO
+	repoIdx     int
+	repoChosen  bool
+	reposLoaded bool
+	reposErr    error
+	// reposInFlight is the repos-fetch in-flight guard, the repos twin of pullsState.waitID: it
+	// is true while a fetchReposCmd is outstanding, so the pulls-tick / r self-heal (PRD #1255)
+	// cannot stack a second live repos fetch on one already running. Seeded true at Init (initCmds
+	// issues the first fetchReposCmd) and cleared by every reposMsg, success or failure.
+	reposInFlight bool
 	// detailGen counts detail sessions opened from the board; each drill-in stamps the new
 	// detailState.gen from it, so a reply issued under an earlier session (same run reopened)
 	// is rejected by the gen check in the detailRunMsg / detailPageMsg cases.
 	detailGen uint64
+	// prGen counts PR drill-in sessions opened from the pulls row or the run view; startPRReq stamps
+	// the new prState.gen from it on each open's first fetch, so a reply issued under an earlier
+	// session — a different PR whose reset reqSeq minted the SAME reqID, or the same PR reopened — is
+	// rejected by the gen check in the prMsg case. The PR twin of detailGen.
+	prGen uint64
+	// ciRunGen counts CI-run drill-in sessions opened from the ci row; startCIRunReq stamps the new
+	// ciRunState.gen from it on each open's first fetch, so a reply issued under an earlier session —
+	// a different run whose reset reqSeq minted the SAME reqID, or the same run reopened — is rejected
+	// by the gen check in the ciRunMsg case. The ci-run twin of prGen.
+	ciRunGen uint64
 
 	// quitting is the ctrl+c confirm modal (q quits immediately and does NOT route through
 	// it); ctrlCSeen makes a second ctrl+c quit immediately, which is the escape hatch a user
@@ -308,6 +369,29 @@ func newTUIModel(ctx context.Context, c uzicli.Client, startRun string) tuiModel
 	m.board.reqSeq = 1
 	m.board.waitID = 1
 	m.board.tickGen = 1
+	// The pulls list seeds its tick chain at generation 1 (the Init-armed pulls tick is
+	// honoured) but, UNLIKE the board, no request is in flight at Init: the repo the `pulls`
+	// route needs is not known until ListRepos returns, so reqSeq/waitID start at 0 (idle).
+	// The first fetch is minted by startPullsReq when the user opens the screen, or by the
+	// first tick once repos have loaded (newPullsState).
+	m.pulls = newPullsState()
+	// The ci list seeds its own tick chain the same way as pulls (generation 1, no request in
+	// flight until the repo scope resolves); both forge lists share the repo scope below.
+	m.ci = newCIState()
+	// The PR drill-in seeds its tick chain at generation 1 (the Init-armed PR tick is honoured)
+	// with no PR loaded (repoID ""), so the tick never polls until the user opens a PR view and
+	// startPRReq mints the first fetch. prReturn defaults to viewPulls; detailReturn keeps the
+	// viewBoard zero value so board↔detail is unchanged (PRD #1255 M5 D1).
+	m.pr = newPRState("", 0)
+	m.prReturn = viewPulls
+	// The CI-run drill-in seeds its tick chain at generation 1 (the Init-armed CI-run tick is
+	// honoured) with no run loaded (repoID ""), so the tick never polls until the user opens a CI-run
+	// view and startCIRunReq mints the first fetch (PRD #1255 M6) — the ci-run twin of pr.
+	m.cirun = newCIRunState("", 0)
+	// The repos scope fetch IS in flight at Init (initCmds issues fetchReposCmd), so seed the
+	// guard true — the reply clears it. Without this a pulls tick that fires before the Init
+	// reposMsg lands could stack a second repos fetch on top of the Init one.
+	m.reposInFlight = true
 	if startRun != "" {
 		m.view = viewDetail
 		m.detail = newDetailState(startRun)
@@ -324,6 +408,23 @@ func newTUIModel(ctx context.Context, c uzicli.Client, startRun string) tuiModel
 func (m tuiModel) initCmds() []tea.Cmd {
 	cmds := []tea.Cmd{m.fetchRunsCmd(m.board.admin, m.board.waitID), m.fetchSecretsCmd(),
 		m.fetchRateLimitsCmd(), m.fetchSettingsCmd(), tickAfter(boardPollInterval, m.board.tickGen), stripTickCmd(),
+		// The forge views' repo scope (PRD #1255 D2) and the `pulls` list's own 10s tick chain.
+		// The tick is armed now but polls the forge only while the pulls screen is in focus
+		// (pullsTickMsg), so an idle board pays no forge cost for it.
+		m.fetchReposCmd(), pullsTickAfter(pullsPollInterval, m.pulls.tickGen),
+		// The `ci` list's own 10s tick chain (PRD #1255 M4b). Like the pulls tick it is armed
+		// now but polls the forge only while the ci screen is in focus, so an idle board pays no
+		// forge cost for it.
+		ciTickAfter(ciPollInterval, m.ci.tickGen),
+		// The PR drill-in's own 5s live re-poll chain (PRD #1255 M5). Armed now but polls the forge
+		// only while the PR view is in focus and a PR is loaded; the open path's immediate startPRReq
+		// is what actually begins the chain, the reply re-arms it, so an idle board pays nothing.
+		prTickAfter(prPollInterval, m.pr.tickGen),
+		// The CI-run drill-in's own 5s live re-poll chain (PRD #1255 M6). Like the PR tick it is armed
+		// now but polls the forge only while the CI-run view is in focus and a run is loaded; the open
+		// path's immediate startCIRunReq begins the chain, the reply re-arms it, so an idle board pays
+		// nothing.
+		ciRunTickAfter(ciRunPollInterval, m.cirun.tickGen),
 		tea.RequestBackgroundColor}
 	if m.skewCheck {
 		cmds = append(cmds, m.fetchBuildInfoCmd(), skewTickCmd())
@@ -698,6 +799,205 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.board.tickGen++
 		return m, tea.Batch(tickAfter(boardTickInterval(m.board.errStreak), m.board.tickGen), m.maybeArmBlink())
 
+	case reposMsg:
+		// The forge views' repo scope (PRD #1255 D2). A failure is recorded (the pulls scope
+		// state explains it) rather than crashing. On success, keep only the ENABLED repos; if
+		// the user is already on the pulls screen, resolve the default repo and fetch now so they
+		// are not stuck on "loading…" until the next 10s tick.
+		// Every reply — success or failure — releases the in-flight guard, so the pulls-tick /
+		// r self-heal can re-issue the next repos fetch after a transient failure.
+		m.reposInFlight = false
+		m.reposLoaded = true
+		if msg.err != nil {
+			m.reposErr = msg.err
+			return m, nil
+		}
+		m.reposErr = nil
+		m.repos = enabledRepos(msg.repos)
+		// If the user is already on a forge screen, resolve the default repo and fetch now so they
+		// are not stuck on "loading…" until the next 10s tick. Both forge lists share the repo scope
+		// (D2), so whichever is in focus kicks off its own fetch.
+		switch m.view {
+		case viewPulls:
+			(&m).resolveDefaultRepo()
+			if m.pulls.waitID == 0 && m.pullsRepoReady() {
+				return m, (&m).startPullsReq()
+			}
+		case viewCI:
+			(&m).resolveDefaultRepo()
+			if m.ci.waitID == 0 && m.pullsRepoReady() {
+				return m, (&m).startCIReq()
+			}
+		}
+		return m, nil
+
+	case pullsTickMsg:
+		// Drop a tick from a superseded chain (mirrors the board's tickGen guard).
+		if msg.gen != m.pulls.tickGen {
+			return m, nil
+		}
+		// Keep the chain alive across the cancellable quit modal without polling.
+		if m.quitting {
+			return m, pullsTickAfter(pullsTickInterval(m.pulls.errStreak), m.pulls.tickGen)
+		}
+		// Self-heal the shared repo scope (PRD #1255): a transient ListRepos failure at Init has
+		// no other retry path, so every forge screen would show "could not load repositories" for
+		// the whole session. While the pulls screen is in focus and repos are NOT ready (still
+		// loading, or a failure left reposErr set), re-issue fetchReposCmd — gated on the
+		// reposInFlight guard so it never stacks a second live repos fetch — and re-arm this tick.
+		// It is gated on view==viewPulls like the pulls fetch so an idle board pays no forge cost
+		// (the D4 forge-budget guard). A later successful reposMsg clears reposErr and resolves the
+		// default repo, bringing the screen alive.
+		if m.view == viewPulls && !m.reposReady() {
+			cmds := []tea.Cmd{pullsTickAfter(pullsTickInterval(m.pulls.errStreak), m.pulls.tickGen)}
+			if !m.reposInFlight {
+				m.reposInFlight = true
+				cmds = append(cmds, m.fetchReposCmd())
+			}
+			return m, tea.Batch(cmds...)
+		}
+		// Poll the forge only while the pulls screen is in focus and a repo is selected (the
+		// forge budget is shared with the board poller — D4 — so a background tick does no forge
+		// work), and only when no poll is already outstanding (the in-flight guard). When it DOES
+		// fetch, the reply re-arms the chain (as on the board). When it does NOT, this tick must
+		// re-arm ITSELF — here the fetch is conditional, so the reply is the only OTHER re-arm
+		// site and a non-fetching tick would otherwise let the chain lapse.
+		if m.view == viewPulls && m.pulls.waitID == 0 && m.pullsRepoReady() {
+			return m, (&m).startPullsReq()
+		}
+		return m, pullsTickAfter(pullsTickInterval(m.pulls.errStreak), m.pulls.tickGen)
+
+	case pullsMsg:
+		// Drop a stale/out-of-order reply (mirrors boardRunsMsg): honour only the reply whose
+		// reqID matches the request we are waiting on.
+		if msg.reqID != m.pulls.waitID {
+			return m, nil
+		}
+		m.pulls.waitID = 0
+		m.pulls.apply(msg)
+		// Reschedule AFTER apply updated errStreak so the first retry after a failed poll uses
+		// the backed-off interval; bump tickGen so this chain supersedes any pending tick.
+		m.pulls.tickGen++
+		return m, pullsTickAfter(pullsTickInterval(m.pulls.errStreak), m.pulls.tickGen)
+
+	case ciTickMsg:
+		// The ci tick chain mirrors the pulls tick exactly (PRD #1255 M4b): drop a superseded
+		// chain, keep alive across the cancellable quit modal without polling, self-heal the shared
+		// repo scope while the ci screen is in focus and repos are not ready, else poll the forge
+		// only while the ci screen is in focus and a repo is selected.
+		if msg.gen != m.ci.tickGen {
+			return m, nil
+		}
+		if m.quitting {
+			return m, ciTickAfter(ciTickInterval(m.ci.errStreak), m.ci.tickGen)
+		}
+		// Self-heal the shared repo scope (PRD #1255): a transient ListRepos failure at Init has no
+		// other retry path, so every forge screen would show "could not load repositories" for the
+		// whole session. While the ci screen is in focus and repos are NOT ready, re-issue
+		// fetchReposCmd — gated on the reposInFlight guard so it never stacks a second live repos
+		// fetch — and re-arm this tick. Gated on view==viewCI so an idle board pays no forge cost.
+		if m.view == viewCI && !m.reposReady() {
+			cmds := []tea.Cmd{ciTickAfter(ciTickInterval(m.ci.errStreak), m.ci.tickGen)}
+			if !m.reposInFlight {
+				m.reposInFlight = true
+				cmds = append(cmds, m.fetchReposCmd())
+			}
+			return m, tea.Batch(cmds...)
+		}
+		// Poll the forge only while the ci screen is in focus and a repo is selected (the forge
+		// budget is shared with the board poller — D4), and only when no poll is outstanding (the
+		// in-flight guard). When it DOES fetch, the reply re-arms the chain; when it does NOT, this
+		// tick re-arms ITSELF (the fetch is conditional, so the reply is the only OTHER re-arm site).
+		if m.view == viewCI && m.ci.waitID == 0 && m.pullsRepoReady() {
+			return m, (&m).startCIReq()
+		}
+		return m, ciTickAfter(ciTickInterval(m.ci.errStreak), m.ci.tickGen)
+
+	case ciMsg:
+		// Drop a stale/out-of-order reply (mirrors pullsMsg): honour only the reply whose reqID
+		// matches the request we are waiting on.
+		if msg.reqID != m.ci.waitID {
+			return m, nil
+		}
+		m.ci.waitID = 0
+		m.ci.apply(msg)
+		// Reschedule AFTER apply updated errStreak so the first retry after a failed poll uses the
+		// backed-off interval; bump tickGen so this chain supersedes any pending tick.
+		m.ci.tickGen++
+		return m, ciTickAfter(ciTickInterval(m.ci.errStreak), m.ci.tickGen)
+
+	case prTickMsg:
+		// The PR drill-in's 5s live re-poll (PRD #1255 M5). Drop a superseded chain, keep alive
+		// across the cancellable quit modal without polling, else poll the forge only while the PR
+		// view is in focus and a PR is loaded and no poll is outstanding. When it DOES fetch, the
+		// reply re-arms the chain (as on the board); when it does NOT, this tick re-arms ITSELF.
+		if msg.gen != m.pr.tickGen {
+			return m, nil
+		}
+		if m.quitting {
+			return m, prTickAfter(prTickInterval(m.pr.errStreak), m.pr.tickGen)
+		}
+		if m.view == viewPR && m.pr.waitID == 0 && m.pr.repoID != "" {
+			return m, (&m).startPRReq()
+		}
+		return m, prTickAfter(prTickInterval(m.pr.errStreak), m.pr.tickGen)
+
+	case prMsg:
+		// Drop a stale/out-of-order reply (mirrors pullsMsg): honour only the reply whose reqID
+		// matches the request we are waiting on AND whose PR session generation is the current one.
+		// The gen check is load-bearing across a reopen: newPRState resets reqSeq, so a prior PR's
+		// in-flight reply mints the SAME reqID and passes the reqID==waitID guard — only gen tells
+		// them apart, so without it PR A's late detail (Title/Checks/RunID) would be applied to the
+		// PR B view and w/u would then act on the wrong run.
+		if msg.reqID != m.pr.waitID || msg.gen != m.pr.gen {
+			return m, nil
+		}
+		m.pr.waitID = 0
+		m.pr.apply(msg)
+		// Reschedule AFTER apply updated errStreak so the first retry after a failed poll uses the
+		// backed-off interval; bump tickGen so this chain supersedes any pending tick.
+		m.pr.tickGen++
+		return m, prTickAfter(prTickInterval(m.pr.errStreak), m.pr.tickGen)
+
+	case ciRunTickMsg:
+		// The CI-run drill-in's 5s live re-poll (PRD #1255 M6), mirroring the PR tick exactly: drop a
+		// superseded chain, keep alive across the cancellable quit modal without polling, else poll
+		// the forge only while the CI-run view is in focus and a run is loaded and no poll is
+		// outstanding. When it DOES fetch, the reply re-arms the chain; when it does NOT, this tick
+		// re-arms ITSELF.
+		if msg.gen != m.cirun.tickGen {
+			return m, nil
+		}
+		if m.quitting {
+			return m, ciRunTickAfter(ciRunTickInterval(m.cirun.errStreak), m.cirun.tickGen)
+		}
+		if m.view == viewCIRun && m.cirun.waitID == 0 && m.cirun.repoID != "" {
+			return m, (&m).startCIRunReq()
+		}
+		return m, ciRunTickAfter(ciRunTickInterval(m.cirun.errStreak), m.cirun.tickGen)
+
+	case ciRunMsg:
+		// Drop a stale/out-of-order reply (mirrors prMsg): honour only the reply whose reqID matches
+		// the request we are waiting on AND whose CI-run session generation is the current one. The
+		// gen check is load-bearing across a reopen: newCIRunState resets reqSeq, so a prior run's
+		// in-flight reply mints the SAME reqID and passes the reqID==waitID guard — only gen tells them
+		// apart, so without it run A's late jobs/steps would be applied to the run B view.
+		if msg.reqID != m.cirun.waitID || msg.gen != m.cirun.gen {
+			return m, nil
+		}
+		m.cirun.waitID = 0
+		m.cirun.apply(msg)
+		// Reschedule AFTER apply updated errStreak so the first retry after a failed poll uses the
+		// backed-off interval; bump tickGen so this chain supersedes any pending tick.
+		m.cirun.tickGen++
+		return m, ciRunTickAfter(ciRunTickInterval(m.cirun.errStreak), m.cirun.tickGen)
+
+	case prActionMsg:
+		// A w (rework) / f (fix ci) result from the PR view or a pulls list row: a success
+		// confirmation or the server's typed 4xx/409 reason, drawn inline (never a crash).
+		m.forgeNotice = prActionNotice(msg)
+		return m, nil
+
 	case blinkTickMsg:
 		if !m.blinkWanted() {
 			// Nothing in progress any more (or the blink is disabled): drop to the static
@@ -992,13 +1292,23 @@ func (m tuiModel) handleKey(k string) (tea.Model, tea.Cmd) {
 	switch m.view {
 	case viewBoard:
 		return m.boardKey(k)
+	case viewPulls:
+		return m.pullsKey(k)
+	case viewCI:
+		return m.ciKey(k)
+	case viewPR:
+		return m.prKey(k)
+	case viewCIRun:
+		return m.ciRunKey(k)
 	default:
 		return m.detailKey(k)
 	}
 }
 
 func (m tuiModel) filtering() bool {
-	return m.view == viewBoard && m.board.filtering
+	return (m.view == viewBoard && m.board.filtering) ||
+		(m.view == viewPulls && m.pulls.filtering) ||
+		(m.view == viewCI && m.ci.filtering)
 }
 
 func (m tuiModel) transcriptWidth() int {
@@ -1023,6 +1333,14 @@ func (m tuiModel) View() tea.View {
 		body = m.renderHelp()
 	case m.view == viewDetail:
 		body = m.renderDetail()
+	case m.view == viewPulls:
+		body = m.renderPulls()
+	case m.view == viewCI:
+		body = m.renderCI()
+	case m.view == viewPR:
+		body = m.renderPR()
+	case m.view == viewCIRun:
+		body = m.renderCIRun()
 	default:
 		body = m.renderBoard()
 	}
@@ -1031,7 +1349,7 @@ func (m tuiModel) View() tea.View {
 }
 
 func (m tuiModel) renderHelp() string {
-	lines := helpLines(m.view == viewDetail)
+	lines := helpLines(m.view)
 	return m.pal.title.Render("keybindings") + "\n\n" +
 		strings.Join(lines, "\n") + "\n\n" +
 		m.pal.faint.Render("any key returns")

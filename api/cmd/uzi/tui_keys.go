@@ -31,6 +31,21 @@ const (
 	keyHome         = "home"
 	keyEnd          = "end"
 	keySpaceName    = "space" // v2 names the space key "space", never " "
+	// Forge-view navigation (PRD #1255 D1). tab cycles the list screens (floor → pulls →
+	// ci → floor; ci lands in M4b, so for now it cycles floor ↔ pulls); 1/2/3 jump directly;
+	// R cycles the scoped repo. R is shift+r (distinct from r = refresh) so it does not
+	// collide with the board/list refresh key.
+	keyViewFloor = "1"
+	keyViewPulls = "2"
+	keyViewCI    = "3"
+	keyRepoCycle = "R"
+	// Forge actions (PRD #1255 M5, D1/D12), bound on BOTH the pulls list row and the PR drill-in:
+	// u opens the PR's linked uzi run in the run view, w reworks that run, f queues a CI-fix run
+	// for the PR's head branch. keyPRView (m) is the run view → PR view cross-link.
+	keyRunLink = "u"
+	keyRework  = "w"
+	keyFixCI   = "f"
+	keyPRView  = "m"
 )
 
 // keyString normalizes a v2 key press to the string form the switches below compare
@@ -57,9 +72,10 @@ func motionDelta(k string) int {
 	return 0
 }
 
-// helpLines is the `?` overlay content. It lists what M3 actually binds; M4 adds the
-// mutation keys to the same list rather than a second one.
-func helpLines(inDetail bool) []string {
+// helpLines is the `?` overlay content, per the focused screen. It lists what each
+// milestone actually binds (D13: a key appears in the legend of the milestone that binds
+// it), so the pulls screen shows its own navigation legend rather than the board's.
+func helpLines(v tuiView) []string {
 	common := []string{
 		"j / ↓      down",
 		"k / ↑      up",
@@ -70,17 +86,52 @@ func helpLines(inDetail bool) []string {
 		"?          this help",
 		"q          quit immediately (ctrl+c asks to confirm; twice quits at once)",
 	}
-	if inDetail {
+	switch v {
+	case viewDetail:
 		return append([]string{
 			"← / →      focus the crew rail / the transcript",
 			"tab        cycle the focused pane",
 			"↑ / ↓      move within the focused pane (agents · scroll)",
 			"g          follow live: re-attach and jump to newest (live runs)",
 			"c          fold / unfold the crew list (folds by itself when the blocks below would not fit)",
+			"m          open the PR view for this run's merge request (when it has one)",
+		}, common...)
+	case viewPulls:
+		return append([]string{
+			"enter / →  open the selected PR (checks · reviews · merge)",
+			"u          open the PR's linked uzi run (when one exists)",
+			"w          rework the linked run",
+			"f          fix ci: queue a CI-fix run for the PR's branch",
+			"tab        switch screen (floor · pulls · ci)",
+			"1 / 2 / 3  jump to the floor / pulls / ci",
+			"R          cycle the scoped repo (when several are enabled)",
+		}, common...)
+	case viewCI:
+		return append([]string{
+			"enter / →  open the selected run's jobs (jobs · steps)",
+			"tab        switch screen (floor · pulls · ci)",
+			"1 / 2 / 3  jump to the floor / pulls / ci",
+			"R          cycle the scoped repo (when several are enabled)",
+		}, common...)
+	case viewPR:
+		return append([]string{
+			"↑ / ↓      move the cursor over the checks",
+			"↗          the selected check's URL is a clickable link",
+			"u          open the PR's linked uzi run (when one exists)",
+			"w          rework the linked run (fix review findings)",
+			"f          fix ci: queue a CI-fix run for the PR's branch",
+		}, common...)
+	case viewCIRun:
+		return append([]string{
+			"↑ / ↓      move the cursor over the jobs (the selected job expands its steps)",
+			"↗          the selected job's URL is a clickable link",
+			"f          fix ci: queue a CI-fix run for this run's branch",
+		}, common...)
+	default:
+		return append([]string{
+			"a          toggle the factory-wide admin board (needs a uza_ token)",
+			"h          hide finished runs (completed/failed/cancelled); keeps active + needs-you",
+			"tab        switch screen (floor · pulls · ci)",
 		}, common...)
 	}
-	return append([]string{
-		"a          toggle the factory-wide admin board (needs a uza_ token)",
-		"h          hide finished runs (completed/failed/cancelled); keeps active + needs-you",
-	}, common...)
 }

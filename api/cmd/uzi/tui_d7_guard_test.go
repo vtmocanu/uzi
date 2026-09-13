@@ -123,6 +123,62 @@ var d7UntrustedFields = []string{
 	// GET /api/version, drawn in the board footer skew banner (boardFooterLine) only inside
 	// cellText(...) before SkewWarning embeds it.
 	"serverVersion",
+	// Forge PullDTO / RepoDTO text drawn on the `pulls` screen (PRD #1255 M4a, D7): the PR
+	// source/target branch and the scoped repo's path are forge-authored free text, drawn
+	// through renderer.Plain (pullRow / pullSecondLine / tabStrip). PullDTO.Title is already
+	// guarded above (shared with Milestone.Title) and is likewise drawn through Plain.
+	"SourceBranch",
+	"TargetBranch",
+	"PathWithNamespace",
+	// WebURL is the PR's forge URL, drawn only as an OSC-8 hyperlink target via oscLink
+	// (pullLink, https-gated). Like IssueWebURL it stays here as a tripwire for any DIRECT
+	// draw; the AST guard does not gate the oscLink path (oscLink is not a recognised writer),
+	// so the hostile-URL render test is the real defence. (CIRunDTO.WebURL reuses this path
+	// via ciLink, tui_ci.go.)
+	"WebURL",
+	// Forge CIRunDTO text drawn on the `ci` screen (PRD #1255 M4b, D7). The CIRunDTO fields
+	// Name / Event / Branch / SHA / Actor are copied into DISTINCTLY-NAMED internal struct
+	// fields (ciRowText, tui_ci.go) before they are drawn, because the BARE wire names collide
+	// with unrelated pre-existing `.Name`/… draws in other tui_*.go files (e.g. the tool payload
+	// `.Name` in tui_detail_transcript.go), so adding the bare names here would redden the guard
+	// on code this screen does not own. The distinct names are listed instead, each drawn only
+	// through renderer.Plain (ciRow / ciSecondLine). runTitle is distinct from Title (already
+	// listed) for the same reason the others are — CIRunDTO is projected whole, not field-by-field.
+	"runName",
+	"eventName",
+	"runBranch",
+	"runSHA",
+	"runTitle",
+	"actorLogin",
+	// Forge PR-drill-in text drawn on the PR view (PRD #1255 M5, D7, tui_pr.go). PullDTO.Author is
+	// drawn in the PR header (and already sanitized via cellText in the pulls filter), so the bare
+	// wire name "Author" is added directly. The CheckDTO / PullReviewDTO / MergeStateDTO fields
+	// (Name / Description / State / BlockedReason / MergeableState) are generic and COLLIDE with
+	// unrelated pre-existing draws in other tui_*.go files (the tool payload .Name in
+	// tui_detail_transcript.go drawn raw, pendingJudge.State in tui_review.go), so those bare names
+	// cannot be added here — they would redden the guard on code this screen does not own. Each is
+	// projected into a DISTINCTLY-NAMED internal field (prCheckText / prReviewText / prMergeText,
+	// tui_pr.go) and the distinct names are listed instead, each drawn only through renderer.Plain.
+	// CheckDTO.WebURL reuses the existing "WebURL" tripwire via prCheckURLLine (like pullLink).
+	"Author",
+	"checkName",
+	"checkDesc",
+	"reviewerLogin",
+	"reviewState",
+	"mergeBlocked",
+	"mergeableState",
+	// Forge CI-run-drill-in text drawn on the CI-run view (PRD #1255 M6, D7, tui_cirun.go). CIJobDTO.Name
+	// and CIStepDTO.Name share the bare selector name ".Name" with unrelated pre-existing draws in other
+	// tui_*.go files (the tool payload .Name in tui_detail_transcript.go drawn raw, and others), so the
+	// bare "Name" cannot be added here — it would redden the guard on code this view does not own. Each is
+	// projected into a DISTINCTLY-NAMED internal field (ciJobText.jobName / ciStepText.stepName,
+	// tui_cirun.go) and the distinct names are listed instead, each drawn only through renderer.Plain
+	// (ciRunJobRow / ciRunStepRow). The embedded CIRunDTO header fields (workflow Name / Event / Branch /
+	// SHA / Title / Actor) reuse the ci-list projection ciTextOf, whose distinct names (runName /
+	// eventName / runBranch / runSHA / runTitle / actorLogin) are already listed above. CIJobDTO.WebURL
+	// reuses the existing "WebURL" tripwire via ciRunJobURLLine (like prCheckURLLine / pullLink).
+	"jobName",
+	"stepName",
 }
 
 // d7Writers are the calls that put a string on the screen. lipgloss's Render is one:

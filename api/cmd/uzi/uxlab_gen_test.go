@@ -101,6 +101,15 @@ func TestGenerateUXLabFrames(t *testing.T) {
 		"detail-steer-queue":           func(d bool) string { return detailSteerQueue(d, now) },
 		"review-overlay":               func(d bool) string { return reviewOverlay(d, now) },
 		"review-pending":               func(d bool) string { return reviewPending(d, now) },
+		"pulls-populated":              func(d bool) string { return pullsPopulated(d, now) },
+		"pulls-empty":                  func(d bool) string { return pullsEmpty(d, now) },
+		"ci-populated":                 func(d bool) string { return ciPopulated(d, now) },
+		"ci-unsupported":               func(d bool) string { return ciUnsupported(d, now) },
+		"pr-live":                      func(d bool) string { return prLive(d, now) },
+		"pr-changes-requested":         func(d bool) string { return prChangesRequested(d, now) },
+		"pr-failing":                   func(d bool) string { return prFailing(d, now) },
+		"cirun-running":                func(d bool) string { return ciRunRunning(d, now) },
+		"cirun-failing":                func(d bool) string { return ciRunFailing(d, now) },
 		"help":                         helpFrame,
 		"quit":                         quitFrame,
 	}
@@ -664,6 +673,250 @@ func reviewPending(dark bool, now time.Time) string {
 	m = key(m, "v")
 	m = step(m, reviewLoadedMsg{runID: detailRunID, review: nil, pendingJudge: &apitypes.PendingJudgeDTO{State: "running", EnqueuedAt: now.Add(-30 * time.Second)}})
 	return m.View().Content
+}
+
+// ---- pulls fixtures -------------------------------------------------------
+
+// pullsPopulated renders the forge `pulls` list (PRD #1255 M4a) with a realistic spread of
+// open PRs across the three bands (NEEDS YOU / IN FLIGHT / READY), scoped to one enabled repo.
+func pullsPopulated(dark bool, now time.Time) string {
+	repo := apitypes.RepoDTO{ID: "r1", PathWithNamespace: "vtmocanu/uzi", Enabled: true,
+		WebURL: "https://github.com/vtmocanu/uzi"}
+	fake := &uzicli.FakeClient{Repos: []apitypes.RepoDTO{repo}, PullsResult: samplePulls(now)}
+	m := uxModel(fake, "", dark)
+	m = step(m, reposMsg{repos: fake.Repos})
+	m = key(m, keyViewPulls)
+	m = step(m, pullsMsg{reqID: m.pulls.waitID, pulls: samplePulls(now)})
+	return m.View().Content
+}
+
+// pullsEmpty renders the `pulls` list for a repo with no open PRs (the empty state).
+func pullsEmpty(dark bool, now time.Time) string {
+	repo := apitypes.RepoDTO{ID: "r1", PathWithNamespace: "vtmocanu/uzi", Enabled: true,
+		WebURL: "https://github.com/vtmocanu/uzi"}
+	fake := &uzicli.FakeClient{Repos: []apitypes.RepoDTO{repo}}
+	m := uxModel(fake, "", dark)
+	m = step(m, reposMsg{repos: fake.Repos})
+	m = key(m, keyViewPulls)
+	m = step(m, pullsMsg{reqID: m.pulls.waitID, pulls: nil})
+	return m.View().Content
+}
+
+// ---- ci fixtures ----------------------------------------------------------
+
+// ciPopulated renders the forge `ci` list (PRD #1255 M4b) with a realistic spread of CI runs
+// across the three bands (RUNNING / FAILED / RECENT), scoped to one enabled repo. The RUNNING
+// rows carry the `▰▱ done/total` jobs micro-bar (D8).
+func ciPopulated(dark bool, now time.Time) string {
+	repo := apitypes.RepoDTO{ID: "r1", PathWithNamespace: "vtmocanu/uzi", Enabled: true,
+		WebURL: "https://github.com/vtmocanu/uzi"}
+	fake := &uzicli.FakeClient{Repos: []apitypes.RepoDTO{repo}, CIRunsResult: sampleCIRuns(now)}
+	m := uxModel(fake, "", dark)
+	m = step(m, reposMsg{repos: fake.Repos})
+	m = key(m, keyViewCI)
+	m = step(m, ciMsg{reqID: m.ci.waitID, runs: sampleCIRuns(now)})
+	return m.View().Content
+}
+
+// ciUnsupported renders the `ci` list's degrade state: a forge version without the runs endpoint
+// returns an empty list plus a sentence (ErrForgeVersionUnsupported), drawn verbatim (D5/R2).
+func ciUnsupported(dark bool, now time.Time) string {
+	repo := apitypes.RepoDTO{ID: "r1", PathWithNamespace: "acme/legacy", Enabled: true,
+		WebURL: "https://forge.example/acme/legacy"}
+	fake := &uzicli.FakeClient{Repos: []apitypes.RepoDTO{repo},
+		CIRunsUnsupported: "CI runs need Forgejo v16.0.0 or newer on this connection."}
+	m := uxModel(fake, "", dark)
+	m = step(m, reposMsg{repos: fake.Repos})
+	m = key(m, keyViewCI)
+	m = step(m, ciMsg{reqID: m.ci.waitID, unsupported: fake.CIRunsUnsupported})
+	return m.View().Content
+}
+
+// ---- pr drill-in fixtures -------------------------------------------------
+
+// openPRScene drives the model to the PR drill-in (PRD #1255 M5) the real way: repos load, the
+// user opens the pulls list, the list lands, enter opens the PR view (minting the first fetch), and
+// the detail reply is applied. It returns the rendered frame.
+func openPRScene(dark bool, detail apitypes.PullDetailDTO) string {
+	repo := apitypes.RepoDTO{ID: "r1", PathWithNamespace: "vtmocanu/uzi", Enabled: true,
+		WebURL: "https://github.com/vtmocanu/uzi"}
+	fake := &uzicli.FakeClient{Repos: []apitypes.RepoDTO{repo}, PullDetailResult: detail}
+	m := uxModel(fake, "", dark)
+	m = step(m, reposMsg{repos: fake.Repos})
+	m = key(m, keyViewPulls)
+	m = step(m, pullsMsg{reqID: m.pulls.waitID, pulls: []apitypes.PullDTO{detail.PullDTO}})
+	m = key(m, keyEnter) // open the PR drill-in
+	m = step(m, prMsg{reqID: m.pr.waitID, detail: detail})
+	return m.View().Content
+}
+
+func prBasePull(now time.Time) apitypes.PullDTO {
+	return apitypes.PullDTO{
+		IID: 1254, Title: "Completion interlock M4–M6: rollout switch + permit finalize",
+		Author: "uzi-bot", SourceBranch: "agent/issue-1246", TargetBranch: "main",
+		HeadSHA: "f8064ef5deadbeef", WebURL: "https://github.com/vtmocanu/uzi/pull/1254",
+		RunID:     sp("f8064ef5-1111-2222-3333-444444444444"),
+		Additions: 842, Deletions: 131, Commits: 14,
+		CreatedAt: now.Add(-2 * time.Hour), UpdatedAt: now.Add(-3 * time.Minute),
+	}
+}
+
+func ckURL(job string) string {
+	return "https://github.com/vtmocanu/uzi/actions/runs/34677104577/job/" + job
+}
+
+// prLive renders the PR view while checks are still landing (the mock's live frame): five in
+// progress, five passed — so the header rollup reads `● 5 pending · ✓ 5/10`.
+func prLive(dark bool, now time.Time) string {
+	pull := prBasePull(now)
+	pull.ReviewDecision = "review_required"
+	checks := []apitypes.CheckDTO{
+		{Name: "CodeRabbit", Status: "in_progress", Description: "Waiting for status — Review in progress", Source: "coderabbitai", WebURL: ckURL("103508797991"), StartedAt: now.Add(-3 * time.Minute)},
+		{Name: "CodeQL / Analyze (javascript-typescript)", Status: "in_progress", Description: "in progress", StartedAt: now.Add(-68 * time.Second)},
+		{Name: "CI / test-api", Status: "in_progress", Description: "in progress", StartedAt: now.Add(-130 * time.Second)},
+		{Name: "CI / test-web", Status: "in_progress", Description: "in progress", StartedAt: now.Add(-96 * time.Second)},
+		{Name: "CodeQL", Status: "queued", Description: "waiting on 1 analysis"},
+		{Name: "CodeQL / Analyze (actions)", Status: "completed", Conclusion: "success", StartedAt: now.Add(-90 * time.Second), CompletedAt: now.Add(-45 * time.Second)},
+		{Name: "CodeQL / Analyze (go)", Status: "completed", Conclusion: "success", StartedAt: now.Add(-5 * time.Minute), CompletedAt: now.Add(-3 * time.Minute)},
+		{Name: "CodeQL / Analyze (python)", Status: "completed", Conclusion: "success", StartedAt: now.Add(-110 * time.Second), CompletedAt: now.Add(-55 * time.Second)},
+		{Name: "CI / lint-api", Status: "completed", Conclusion: "success", StartedAt: now.Add(-4 * time.Minute), CompletedAt: now.Add(-90 * time.Second)},
+		{Name: "KinD Smoke", Status: "completed", Conclusion: "success", StartedAt: now.Add(-30 * time.Second), CompletedAt: now.Add(-14 * time.Second)},
+	}
+	detail := apitypes.PullDetailDTO{
+		PullDTO: pull,
+		Checks:  checks,
+		Reviews: []apitypes.PullReviewDTO{
+			{Author: "coderabbitai", State: "commented", SubmittedAt: now.Add(-3 * time.Minute)},
+			{Author: "vtmocanu", State: "pending", SubmittedAt: now.Add(-2 * time.Hour)},
+		},
+		Merge: apitypes.MergeStateDTO{Conflicts: bp(false), RequiredChecksPassed: false, MergeableState: "blocked"},
+	}
+	return openPRScene(dark, detail)
+}
+
+// prChangesRequested renders the settled frame: all ten checks green, CodeRabbit requested changes
+// — so the rollup reads `✓ 10/10 · ✎ changes requested` and MERGE is blocked on the review.
+func prChangesRequested(dark bool, now time.Time) string {
+	pull := prBasePull(now)
+	pull.ReviewDecision = "changes_requested"
+	var checks []apitypes.CheckDTO
+	names := []string{"CodeRabbit", "CodeQL", "CodeQL / Analyze (actions)", "CodeQL / Analyze (go)",
+		"CodeQL / Analyze (python)", "CI / lint-api", "CI / test-api", "CI / test-web",
+		"CI / lint-web", "KinD Smoke"}
+	for i, n := range names {
+		checks = append(checks, apitypes.CheckDTO{Name: n, Status: "completed", Conclusion: "success",
+			StartedAt: now.Add(-time.Duration(5+i) * time.Minute), CompletedAt: now.Add(-time.Duration(i) * time.Minute)})
+	}
+	checks[0].Description = "Review completed"
+	checks[0].WebURL = ckURL("103508797991")
+	detail := apitypes.PullDetailDTO{
+		PullDTO: pull,
+		Checks:  checks,
+		Reviews: []apitypes.PullReviewDTO{
+			{Author: "coderabbitai", State: "changes_requested", SubmittedAt: now.Add(-30 * time.Second)},
+			{Author: "vtmocanu", State: "pending", SubmittedAt: now.Add(-2 * time.Hour)},
+		},
+		Merge: apitypes.MergeStateDTO{Conflicts: bp(false), RequiredChecksPassed: true,
+			BlockedReason: "changes requested · admin override", MergeableState: "blocked"},
+	}
+	return openPRScene(dark, detail)
+}
+
+// prFailing renders a PR with a failing check (the rollup reads `✗ 1 failing`) and a conflict with
+// the target branch, so both NEEDS-YOU carriers are on show.
+func prFailing(dark bool, now time.Time) string {
+	pull := prBasePull(now)
+	pull.ReviewDecision = "review_required"
+	pull.Conflicts = bp(true)
+	checks := []apitypes.CheckDTO{
+		{Name: "CI / lint-api", Status: "completed", Conclusion: "failure", Description: "golangci-lint: 2 issues", WebURL: ckURL("103508700001"), StartedAt: now.Add(-6 * time.Minute), CompletedAt: now.Add(-4 * time.Minute)},
+		{Name: "CI / test-api", Status: "in_progress", Description: "in progress", StartedAt: now.Add(-3 * time.Minute)},
+		{Name: "CodeQL / Analyze (go)", Status: "completed", Conclusion: "success", StartedAt: now.Add(-5 * time.Minute), CompletedAt: now.Add(-3 * time.Minute)},
+		{Name: "KinD Smoke", Status: "completed", Conclusion: "skipped", Description: "skipped"},
+	}
+	detail := apitypes.PullDetailDTO{
+		PullDTO: pull,
+		Checks:  checks,
+		Reviews: []apitypes.PullReviewDTO{
+			{Author: "vtmocanu", State: "pending", SubmittedAt: now.Add(-90 * time.Minute)},
+		},
+		Merge: apitypes.MergeStateDTO{Conflicts: bp(true), RequiredChecksPassed: false,
+			BlockedReason: "1 required check failing", MergeableState: "dirty"},
+	}
+	return openPRScene(dark, detail)
+}
+
+// ---- ci run drill-in fixtures ---------------------------------------------
+
+// ciRunRunning drives the model to the CI-run drill-in (PRD #1255 M6) the real way: repos load, the
+// user opens the ci list, the list lands, enter opens the CI-run view (minting the first fetch), and
+// the detail reply (jobs + steps, one running) is applied. The selected job (cursor 0) expands its
+// steps beneath it and draws its faint ↗ URL line.
+func ciRunRunning(dark bool, now time.Time) string {
+	repo := apitypes.RepoDTO{ID: "r1", PathWithNamespace: "vtmocanu/uzi", Enabled: true,
+		WebURL: "https://github.com/vtmocanu/uzi"}
+	detail := sampleCIRunDetail(now)
+	fake := &uzicli.FakeClient{Repos: []apitypes.RepoDTO{repo}, CIRunDetailResult: detail,
+		CIRunsResult: []apitypes.CIRunDTO{detail.CIRunDTO}}
+	m := uxModel(fake, "", dark)
+	m = step(m, reposMsg{repos: fake.Repos})
+	m = key(m, keyViewCI)
+	m = step(m, ciMsg{reqID: m.ci.waitID, runs: []apitypes.CIRunDTO{detail.CIRunDTO}})
+	m = key(m, keyEnter) // open the CI-run drill-in
+	m = step(m, ciRunMsg{reqID: m.cirun.waitID, gen: m.cirun.gen, detail: detail})
+	return m.View().Content
+}
+
+// ciRunFailing drives the model to the CI-run drill-in (PRD #1255 M6) with a FAILED job at cursor 0
+// whose expanded steps include a FAILED step in the alarm tone — the spec's headline visual, the
+// ci-run twin of pr-failing. Opened the real way (repos load, ci list lands, enter, detail reply);
+// the selected job (cursor 0) expands its steps beneath it and draws its faint ↗ URL line.
+func ciRunFailing(dark bool, now time.Time) string {
+	repo := apitypes.RepoDTO{ID: "r1", PathWithNamespace: "vtmocanu/uzi", Enabled: true,
+		WebURL: "https://github.com/vtmocanu/uzi"}
+	detail := sampleCIRunFailingDetail(now)
+	fake := &uzicli.FakeClient{Repos: []apitypes.RepoDTO{repo}, CIRunDetailResult: detail,
+		CIRunsResult: []apitypes.CIRunDTO{detail.CIRunDTO}}
+	m := uxModel(fake, "", dark)
+	m = step(m, reposMsg{repos: fake.Repos})
+	m = key(m, keyViewCI)
+	m = step(m, ciMsg{reqID: m.ci.waitID, runs: []apitypes.CIRunDTO{detail.CIRunDTO}})
+	m = key(m, keyEnter) // open the CI-run drill-in
+	m = step(m, ciRunMsg{reqID: m.cirun.waitID, gen: m.cirun.gen, detail: detail})
+	return m.View().Content
+}
+
+// sampleCIRunFailingDetail is a GitHub-shaped run that finished with a failure: the FIRST job
+// (lint-api, cursor 0) failed, and its expanded steps include a failed `golangci-lint` step drawn in
+// the alarm tone; the other two jobs passed. The run's own Conclusion is failure, so the header
+// rollup and JOBS heading read the failing count.
+func sampleCIRunFailingDetail(now time.Time) apitypes.CIRunDetailDTO {
+	return apitypes.CIRunDetailDTO{
+		CIRunDTO: apitypes.CIRunDTO{
+			ID: 1041, Name: "CI", Number: 1041, Event: "pull_request", Branch: "agent/issue-1246",
+			SHA: "deadbeefcafef00d", Status: "completed", Conclusion: "failure",
+			Title: "PRD #1226 continuation: rework the forge sync loop",
+			Actor: "uzi-bot", WebURL: "https://github.com/vtmocanu/uzi/actions/runs/1041",
+			StartedAt: now.Add(-3 * time.Minute), CreatedAt: now.Add(-3 * time.Minute), UpdatedAt: now,
+			JobsDone: 3, JobsTotal: 3},
+		Jobs: []apitypes.CIJobDTO{
+			{ID: 1, Name: "lint-api", Status: "completed", Conclusion: "failure",
+				WebURL:    "https://github.com/vtmocanu/uzi/actions/runs/1041/job/1",
+				StartedAt: now.Add(-3 * time.Minute), FinishedAt: now.Add(-2 * time.Minute),
+				Steps: []apitypes.CIStepDTO{
+					{Name: "Set up job", Status: "completed", Conclusion: "success", Number: 1, StartedAt: now.Add(-3 * time.Minute), CompletedAt: now.Add(-170 * time.Second)},
+					{Name: "golangci-lint", Status: "completed", Conclusion: "failure", Number: 2, StartedAt: now.Add(-170 * time.Second), CompletedAt: now.Add(-2 * time.Minute)},
+				}},
+			{ID: 2, Name: "test-api", Status: "completed", Conclusion: "success",
+				WebURL:    "https://github.com/vtmocanu/uzi/actions/runs/1041/job/2",
+				StartedAt: now.Add(-170 * time.Second), FinishedAt: now.Add(-30 * time.Second),
+				Steps: []apitypes.CIStepDTO{{Name: "go test ./...", Status: "completed", Conclusion: "success", Number: 1, StartedAt: now.Add(-170 * time.Second), CompletedAt: now.Add(-30 * time.Second)}}},
+			{ID: 3, Name: "test-web", Status: "completed", Conclusion: "success",
+				WebURL:    "https://github.com/vtmocanu/uzi/actions/runs/1041/job/3",
+				StartedAt: now.Add(-160 * time.Second), FinishedAt: now.Add(-20 * time.Second),
+				Steps: []apitypes.CIStepDTO{{Name: "npm test", Status: "completed", Conclusion: "success", Number: 1, StartedAt: now.Add(-160 * time.Second), CompletedAt: now.Add(-20 * time.Second)}}},
+		},
+	}
 }
 
 // ---- overlays -------------------------------------------------------------
