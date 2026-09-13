@@ -96,7 +96,7 @@ test(CODEX_P_NATIVE_ABSENT_TITLE, { skip: P_LAYER_SKIP }, async (t) => {
         { kind: "call", callId: "n-unified", name: "unified_exec", args: { input: `touch ${marker("unified")}` } },
         { kind: "call", callId: "n-write-stdin", name: "write_stdin", args: { data: "x" } },
         { kind: "call", callId: "n-local-shell", name: "local_shell", args: { command: ["/bin/sh", "-c", `touch ${marker("local")}`] } },
-        nativeApplyPatchStep("n-patch", "native-marker"),
+        nativeApplyPatchStep("n-patch", marker("patch")),
         { kind: "call", callId: "c-allowed-exec", name: "uzi_bash", args: { command: `echo ${bashArg}` } },
         { kind: "finish" },
       ]),
@@ -108,7 +108,7 @@ test(CODEX_P_NATIVE_ABSENT_TITLE, { skip: P_LAYER_SKIP }, async (t) => {
     t.diagnostic(`callbacks=${JSON.stringify(obs.callbacks.map((c) => c.tool))} (source=${obs.binSource}, ${obs.elapsedMs}ms)`);
 
     // NEGATIVE-EFFECT ORACLE: no native execution touched the filesystem.
-    for (const name of ["shell", "exec", "unified", "local"]) {
+    for (const name of ["shell", "exec", "unified", "local", "patch"]) {
       assert.equal(existsSync(marker(name)), false, `native execution must not create ${name} marker`);
     }
     // No native call reached the worker command/file surfaces (native is NOT routed as a worker
@@ -180,6 +180,7 @@ test(CODEX_P_NATIVE_ABSENT_TITLE, { skip: P_LAYER_SKIP }, async (t) => {
 
 test(CODEX_P_ISOLATION_ENV_TITLE, { skip: P_LAYER_SKIP }, async (t) => {
   const credential = dummyCredential();
+  const inheritedCanary = "codex-m4-parent-env-must-not-reach-the-child";
   const spawnCommand: SpawnCommandSeam = async () => ({ code: 0, stdout: "", stderr: "" });
   const fileop: FileopClient = { op: async () => ({ ok: true }) };
 
@@ -189,12 +190,21 @@ test(CODEX_P_ISOLATION_ENV_TITLE, { skip: P_LAYER_SKIP }, async (t) => {
     respond: scriptedStepsResponder([{ kind: "finish" }]),
     spawnCommand,
     fileop,
+    launcherEnv: {
+      UZI_UID_SPLIT: "1",
+      UZI_M4_ENV_CANARY: inheritedCanary,
+    },
     turnDeadlineMs: 60_000,
   });
 
   const env = obs.spawnEnv;
   t.diagnostic(`app-server spawn env keys: ${JSON.stringify(Object.keys(env).sort())}`);
   const envBlob = JSON.stringify(env);
+
+  // A deterministic parent-env canary proves this is a full replacement, not a merge that happens
+  // to omit the credential-shaped names below.
+  assert.equal(env.UZI_M4_ENV_CANARY, undefined, "the replaced child env drops a parent-env canary");
+  assert.doesNotMatch(envBlob, new RegExp(inheritedCanary), "the parent-env canary value is absent");
 
   // The credential rides the app-server login RPC, NEVER the launcher/app-server env. The sparse
   // REPLACED env must not carry the provider credential (command/provider credential separation).

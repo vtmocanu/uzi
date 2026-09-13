@@ -27,8 +27,10 @@
 // resolveCodexBin succeed inside it.
 //
 // Every argv pins the `@sha256:` digest, selects the native architecture, drops all capabilities,
-// sets no-new-privileges, runs unprivileged, and mounts ONLY disposable fixture/test inputs. NONE
-// mounts the Docker socket or any HOME. Treat the digest as a hand-reviewed pin (D7 point 3).
+// sets no-new-privileges, and mounts ONLY disposable fixture/test inputs. The two preparation stages
+// run as root so they can initialize root-owned named volumes; EXECUTE stays unprivileged and sees
+// those volumes read-only. NONE mounts the Docker socket or any HOME. Treat the digest as a
+// hand-reviewed pin (D7 point 3).
 
 import { resolveArch, type Arch } from "./provision.js";
 
@@ -69,7 +71,7 @@ export interface MacosLinuxRunOptions {
    *  writes ${UZI_CODEX_PREFIX}/<version> here in PREP; EXECUTE mounts it read-only. NEVER a bind
    *  mount of a host codex install, and its binaries never join PATH. */
   readonly codexVolume: string;
-  /** Unprivileged container user, `uid:gid`. Defaults to 1000:1000. */
+  /** Unprivileged EXECUTE-stage user, `uid:gid`. Defaults to 1000:1000. */
   readonly user?: string;
 }
 
@@ -100,7 +102,7 @@ function baseArgs(arch: Arch, user: string): string[] {
 export function buildMacosLinuxRunPlan(opts: MacosLinuxRunOptions): MacosLinuxRunPlan {
   const user = opts.user ?? DEFAULT_USER;
   const prep = [
-    ...baseArgs(opts.arch, user),
+    ...baseArgs(opts.arch, "0:0"),
     // Committed lockfile source (read-only); node_modules is the disposable volume npm ci fills.
     "-v", `${opts.agentDir}:/prep/agent:ro`,
     "-v", `${opts.depsVolume}:/prep/agent/node_modules`,
@@ -110,7 +112,7 @@ export function buildMacosLinuxRunPlan(opts: MacosLinuxRunOptions): MacosLinuxRu
     "npm", "ci",
   ];
   const prepCodex = [
-    ...baseArgs(opts.arch, user),
+    ...baseArgs(opts.arch, "0:0"),
     // The installer reads UZI_CODEX_PREFIX from the env; point it at the codex volume mountpoint.
     // UZI_CODEX_LOCK defaults to the sibling lock in the mounted agent tree.
     "-e", `UZI_CODEX_PREFIX=${CODEX_PREFIX_MOUNT}`,
@@ -143,8 +145,8 @@ export function buildMacosLinuxRunPlan(opts: MacosLinuxRunOptions): MacosLinuxRu
     "-v", `${opts.codexVolume}:${CODEX_PREFIX_MOUNT}:ro`,
     "-w", "/work/agent",
     MACOS_LINUX_RUNNER_REF,
-    // The strict, serial, bounded P suite: all three P files (mirrors test:codex-m4's node
-    // invocation), writing evidence to the host via the read-write .evidence mount above.
+    // The strict, serial, bounded P subset of test:codex-m4: all three P files, writing evidence
+    // to the host via the read-write .evidence mount above.
     "node", "--import", "tsx", "--test", "--test-concurrency=1", "--test-timeout=120000",
     ...STRICT_P_SUITE.map((f) => `../e2e/codex-m4/${f}`),
   ];

@@ -2244,10 +2244,10 @@ tasks:
         done
 
   test:codex-m4:
-    desc: PRD 1287 C5 - strict Codex/Claude M4 conformance gate (claude/U + codex/U + codex/P) + the real-binary P startup smoke
+    desc: PRD 1287 C5 - strict Codex/Claude M4 conformance gate (claude/U + codex/U + codex/P)
     # The M4 conformance subsystem (e2e/codex-m4): the machine-readable clause registry, the strict
-    # completeness checker, the map/receipts/provisioner/macOS-runner helpers, and the REAL pinned
-    # Codex app-server P startup smoke (one allowed uzi_bash callback through a REAL broker).
+    # completeness checker, the map/receipts/provisioner/macOS-runner helpers, and the complete REAL
+    # pinned Codex app-server P suite.
     #
     # No longer C1-only: C5 tightens the required matrix (run-completeness.ts REQUIRED_MATRIX_C5) to
     # the full required U/P set and folds in the Claude preservation (C2) + D6 HOME-screening (C3)

@@ -37,6 +37,7 @@ import {
   SMOKE_BASH_CALL_ID,
 } from "./fake-provider.js";
 import { resolveCodexBin } from "./provision.js";
+import { buildProviderLaunchPlan } from "./provider-launch-plan.js";
 import { recordEvidence } from "./evidence.js";
 import { P_LAYER_SKIP } from "./p-platform.js";
 import { CODEX_STARTUP_SMOKE_TITLE } from "./titles.js";
@@ -58,7 +59,6 @@ import {
 } from "./packaged-modules.js";
 
 import type {
-  CodexLaunchSpec,
   CodexRootHandle,
   LauncherDeps,
   MakeRunnerTrees,
@@ -223,8 +223,13 @@ test(CODEX_STARTUP_SMOKE_TITLE, { skip: P_LAYER_SKIP }, async (t) => {
   const startedAt = Date.now();
 
   // 1. Resolve the real pinned binary (image-baked on this worker; else a rootless cache install).
+  // The executable path may differ from the immutable production contract path because this P-layer
+  // test injects the direct process spawn; resolveCodexBin has already verified its version/layout.
   const resolved = resolveCodexBin();
-  assert.equal(resolved.codexBin, CODEX_BIN, "the resolved binary is the launcher's pinned path");
+  assert.ok(
+    resolved.source === "image-baked" || resolved.source === "cache-install",
+    "the binary came from a verified provisioner source",
+  );
 
   const runnerUid = process.getuid?.() ?? 10001;
   const model = "gpt-6-astra";
@@ -286,28 +291,31 @@ test(CODEX_STARTUP_SMOKE_TITLE, { skip: P_LAYER_SKIP }, async (t) => {
   });
 
   // 4. Launch the REAL app-server through the PRODUCTION launcher + loopback config builder.
-  const spec: CodexLaunchSpec = {
-    kind: "provider",
-    provider: { name: "openai", baseUrl: provider.baseUrl, envKey: "FAKE_PROVIDER_API_KEY" },
-    model,
-    codexBin: resolved.codexBin,
-    supervisorBin: SUPERVISOR_BIN,
-    childArgv: [...PROVIDER_CHILD_ARGV],
-    cwd,
-    ownedDataRoot,
-    useAppServerAuth: true,
-    authMode: "api_key",
-  };
+  const launchPlan = buildProviderLaunchPlan(
+    { CODEX_BIN, SUPERVISOR_BIN, PROVIDER_CHILD_ARGV },
+    {
+      executableBin: resolved.codexBin,
+      provider: { name: "openai", baseUrl: provider.baseUrl, envKey: "FAKE_PROVIDER_API_KEY" },
+      model,
+      cwd,
+      ownedDataRoot,
+    },
+  );
+  assert.equal(
+    launchPlan.spec.codexBin,
+    CODEX_BIN,
+    "the provider spec keeps the immutable production target",
+  );
   const deps: LauncherDeps = {
     env: { UZI_UID_SPLIT: "1" }, // this worker is single-uid; the smoke injects the profile gate input
     resolveRunnerUid: () => runnerUid,
     makeRunnerTrees: fakeMakeRunnerTrees,
     removeRunnerTree: fakeRemoveRunnerTree,
-    spawnSupervisor: makeDirectCodexSpawn(resolved.codexBin, runnerUid),
+    spawnSupervisor: makeDirectCodexSpawn(launchPlan.executableBin, runnerUid),
     appServerAuthOpenAIBaseUrlForTest: provider.baseUrl, // → buildCodexLoopbackTestConfigToml
     deadlines: { started: 60_000 }, // the 258 MB pinned binary can be slow to cold-start
   };
-  handle = await launchCodexRoot(spec, deps);
+  handle = await launchCodexRoot(launchPlan.spec, deps);
   assert.ok(handle.transport.stdin && handle.transport.stdout, "the app-server transport is available");
 
   // 5. Production transport + production app-server auth handshake (initialize/login).

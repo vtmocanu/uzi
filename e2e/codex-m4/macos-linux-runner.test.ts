@@ -52,11 +52,9 @@ describe("buildMacosLinuxRunPlan argv invariants", () => {
       const i = argv.indexOf("--platform");
       assert.ok(i >= 0 && argv[i + 1] === "linux/arm64");
     });
-    it(`${name}: drops all capabilities and sets no-new-privileges, unprivileged user`, () => {
+    it(`${name}: drops all capabilities and sets no-new-privileges`, () => {
       assert.ok(argv.includes("--cap-drop=ALL"));
       assert.ok(argv.includes("--security-opt=no-new-privileges"));
-      const u = argv.indexOf("--user");
-      assert.ok(u >= 0 && argv[u + 1] === "1000:1000");
     });
     it(`${name}: mounts NO docker socket and NO HOME`, () => {
       const joined = argv.join(" ");
@@ -66,6 +64,18 @@ describe("buildMacosLinuxRunPlan argv invariants", () => {
       assert.ok(!argv.some((a) => a.includes(":/home/")), "no HOME mount");
     });
   }
+
+  it("initializes named volumes as root and executes the P suite unprivileged", () => {
+    for (const [name, argv] of [["prep", plan.prep], ["prepCodex", plan.prepCodex]] as const) {
+      const user = argv.indexOf("--user");
+      assert.ok(user >= 0 && argv[user + 1] === "0:0", `${name} initializes its root-owned volume as root`);
+    }
+    const executeUser = plan.execute.indexOf("--user");
+    assert.ok(
+      executeUser >= 0 && plan.execute[executeUser + 1] === "1000:1000",
+      "execute remains unprivileged",
+    );
+  });
 
   it("prep runs npm ci (dependency preparation stage)", () => {
     assert.ok(plan.prep.includes("npm") && plan.prep.includes("ci"), "prep runs npm ci");

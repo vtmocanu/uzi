@@ -26,6 +26,7 @@ import { PassThrough } from "node:stream";
 import { deadline } from "../codex-m0/harness.mjs";
 import { FakeProvider, type ResponseItem, type ResponsesBody } from "./fake-provider.js";
 import { resolveCodexBin } from "./provision.js";
+import { buildProviderLaunchPlan } from "./provider-launch-plan.js";
 import {
   loadPackagedLauncher,
   loadPackagedBroker,
@@ -37,7 +38,6 @@ import {
 } from "./packaged-modules.js";
 
 import type {
-  CodexLaunchSpec,
   LauncherDeps,
   MakeRunnerTrees,
   RemoveRunnerTree,
@@ -143,6 +143,8 @@ export interface ProtocolTurnOptions {
   readonly spawnCommand: SpawnCommandSeam;
   /** The openat2 fileop client the broker calls for an allowed file effect (test-owned). */
   readonly fileop: FileopClient;
+  /** Trusted parent env presented to the launcher before it constructs the fully replaced child env. */
+  readonly launcherEnv?: NodeJS.ProcessEnv;
   /** The model id (default gpt-6-astra, a contract model). */
   readonly model?: string;
   /** Optional per-callback origin (default "root"). */
@@ -306,28 +308,23 @@ export async function runProtocolTurn(mods: ProtocolModules, opts: ProtocolTurnO
   let transport: ReturnType<ProtocolModules["createCodexTransport"]> | undefined;
 
   try {
-    const spec: CodexLaunchSpec = {
-      kind: "provider",
+    const launchPlan = buildProviderLaunchPlan(mods, {
+      executableBin: resolved.codexBin,
       provider: { name: "openai", baseUrl: provider.baseUrl, envKey: "FAKE_PROVIDER_API_KEY" },
       model,
-      codexBin: resolved.codexBin,
-      supervisorBin: mods.SUPERVISOR_BIN,
-      childArgv: [...mods.PROVIDER_CHILD_ARGV],
       cwd,
       ownedDataRoot,
-      useAppServerAuth: true,
-      authMode: "api_key",
-    };
+    });
     const deps: LauncherDeps = {
-      env: { UZI_UID_SPLIT: "1" },
+      env: opts.launcherEnv ?? { UZI_UID_SPLIT: "1" },
       resolveRunnerUid: () => runnerUid,
       makeRunnerTrees: fakeMakeRunnerTrees,
       removeRunnerTree: fakeRemoveRunnerTree,
-      spawnSupervisor: makeDirectCodexSpawn(resolved.codexBin, runnerUid, envSink),
+      spawnSupervisor: makeDirectCodexSpawn(launchPlan.executableBin, runnerUid, envSink),
       appServerAuthOpenAIBaseUrlForTest: provider.baseUrl,
       deadlines: { started: 60_000 },
     };
-    handle = await mods.launchCodexRoot(spec, deps);
+    handle = await mods.launchCodexRoot(launchPlan.spec, deps);
     const inbound = handle.transport.stdout;
     const outbound = handle.transport.stdin;
     if (inbound === null || outbound === null) throw new Error("the app-server transport streams are unavailable");
