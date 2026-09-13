@@ -22,12 +22,16 @@
 # real Major finding rode into main unseen (2026-09-07, PR #1175). Use THIS script; do
 # not re-derive the check against the wrong endpoint.
 #
-# 🔴 ABSENT TALLY != CLEAN. A PR with no review tally was NOT reviewed (rate-limited, the
-# <10-star auto-skip, or CR is down) — the OPPOSITE of a clean "Actionable comments
-# posted: 0". This script names the specific reason per PR AND exits 3 if ANY named PR was
-# not reviewed, so a caller that gates on the exit code cannot merge past a missing review.
-# Exit 0 = every PR reviewed (findings or clean); 3 = at least one PR unreviewed
-# (re-trigger '@coderabbitai review', or fall back to /code-review); 2 = usage.
+# 🔴 A MISSING tally is not automatically "not reviewed". CodeRabbit prints "Actionable
+# comments posted: N" only on a review that CARRIES findings; a clean pass is an APPROVED
+# review with an empty, tally-less body. So key on the review's existence/state, not the
+# tally alone: a tally-less CR review (e.g. APPROVED) is reviewed-and-clean, while a TOTAL
+# absence of any CR review is genuinely "not reviewed" (rate-limited, the <10-star
+# auto-skip, or CR is down) — the OPPOSITE of clean. This script reports the state per PR
+# AND exits 3 only when NO CR review exists on a named PR, so a caller gating on the exit
+# code cannot merge past a truly missing review. Exit 0 = every PR reviewed (findings, or
+# clean/APPROVED); 3 = at least one PR unreviewed (re-trigger '@coderabbitai review', or
+# fall back to /code-review); 2 = usage.
 set -euo pipefail
 
 repo=${1:?usage: pr-findings.sh OWNER/REPO PR [PR ...]}
@@ -43,19 +47,28 @@ for n in "$@"; do
   if [ -n "$tally" ]; then
     echo "  ${tally}"   # reviewed; N is the finding count (0 = genuinely clean)
   else
-    # No tally => NOT reviewed. The reason is in CR's latest issue comment (which carries
-    # no tally). Name it, record the PR for the exit-3 summary, never read it as clean.
-    note=$(gh api "repos/${repo}/issues/${n}/comments" \
-      --jq '[.[]|select(.user.login|test("coderabbit";"i"))]|last|.body' 2>/dev/null || true)
-    reason="absent (no CodeRabbit comment at all — review may not have landed yet)"
-    case "$note" in
-      *"Review rate limited"*|*"rate limited"*) reason="RATE LIMITED — CR did not review" ;;
-      *"does not receive automatic reviews"*)   reason="NO AUTO-REVIEW (repo under 10 stars)" ;;
-      *"Trigger review"*|*"trigger review"*)    reason="NOT TRIGGERED" ;;
-    esac
-    echo "  ⚠️  NO CodeRabbit review — DO NOT treat as clean: ${reason}"
-    echo "      Force one: gh pr comment ${n} --body '@coderabbitai review'  (or fall back to /code-review)"
-    unreviewed="${unreviewed} #${n}"
+    # No "Actionable comments posted" tally. A tally-less CR REVIEW still means reviewed:
+    # CR approves with an empty body when there are no actionable comments. Only a TOTAL
+    # absence of any CR review is "not reviewed". Distinguish by the review state.
+    crstate=$(gh api "repos/${repo}/pulls/${n}/reviews" \
+      --jq '[.[]|select(.user.login|test("coderabbit";"i"))]|last|.state' 2>/dev/null || true)
+    if [ -n "$crstate" ] && [ "$crstate" != "null" ]; then
+      echo "  reviewed: ${crstate} (no actionable-comments tally — clean, e.g. APPROVED)"
+    else
+      # Genuinely absent. The reason is in CR's latest issue comment (which carries no
+      # tally). Name it, record the PR for the exit-3 summary, never read it as clean.
+      note=$(gh api "repos/${repo}/issues/${n}/comments" \
+        --jq '[.[]|select(.user.login|test("coderabbit";"i"))]|last|.body' 2>/dev/null || true)
+      reason="absent (no CodeRabbit comment at all — review may not have landed yet)"
+      case "$note" in
+        *"Review rate limited"*|*"rate limited"*) reason="RATE LIMITED — CR did not review" ;;
+        *"does not receive automatic reviews"*)   reason="NO AUTO-REVIEW (repo under 10 stars)" ;;
+        *"Trigger review"*|*"trigger review"*)    reason="NOT TRIGGERED" ;;
+      esac
+      echo "  ⚠️  NO CodeRabbit review — DO NOT treat as clean: ${reason}"
+      echo "      Force one: gh pr comment ${n} --body '@coderabbitai review'  (or fall back to /code-review)"
+      unreviewed="${unreviewed} #${n}"
+    fi
   fi
   # $sev/$t below are jq variables, not shell expansions — single quotes are correct.
   # shellcheck disable=SC2016
