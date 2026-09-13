@@ -3,6 +3,7 @@ package handler
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -358,9 +359,23 @@ func (h *Handler) DeleteWorker(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.wsvc.DeleteWorker(r.Context(), user.ID, id); err != nil {
+		var custody *workersvc.WorkerHasCustodyError
 		switch {
 		case errors.Is(err, workersvc.ErrWorkerNotFound):
 			httpx.Error(w, http.StatusNotFound, "worker not found")
+		case errors.As(err, &custody):
+			// PRD #1296 M4 (D3): a worker still holding an OPEN custody hold is refused
+			// with a DISTINCT 409 from the active-runs case above — deleting it cascades
+			// the worker's token, and a preauthorized recovery upload may still need that
+			// token, so this delete would destroy the last durable copy of unpublished
+			// committed work. Name the hold count and point to recover/discard, mirroring
+			// DeleteRepo's `custody_holds` 409 (forge.go): a deliberate destructive delete
+			// that would drop the final source must require an explicit discard decision,
+			// never inherit a generic cleanup path.
+			httpx.JSON(w, http.StatusConflict, map[string]any{
+				"error":         fmt.Sprintf("this worker is retaining unpublished committed work for recovery in %d custody hold(s); recover it (uzi run export) or explicitly discard those recovery archives before removing it", custody.Holds),
+				"custody_holds": custody.Holds,
+			})
 		case errors.Is(err, workersvc.ErrWorkerHasActiveRuns):
 			httpx.Error(w, http.StatusConflict, "worker has active runs; cancel them before deleting it")
 		default:

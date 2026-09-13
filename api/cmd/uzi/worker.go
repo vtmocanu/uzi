@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -99,6 +100,36 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 				return err
 			}
 			if err := c.DeleteWorker(cmd.Context(), args[0]); err != nil {
+				// PRD #1296 M4b (D3): the server refuses the delete when the worker still
+				// retains unpublished committed work for durable recovery — deleting it
+				// would destroy the last copy. Do NOT force-discard and do NOT auto-delete:
+				// tell the user to recover the work or explicitly discard the archive first,
+				// then retry, and exit nonzero (ExitConflict). The worker id is omitted from
+				// the sentence so a 36-char UUID cannot push the actionable tail past the
+				// stderr line's 200-rune cap; --json carries it as a field instead.
+				//
+				// `uzi run export` (D7) is named WITHOUT backticks on purpose: it is the M5
+				// recovery command and is not wired in this branch yet, so a backticked (i.e.
+				// liftable) reference would trip the printed-instruction drift test
+				// (instructions_test.go), whose assertCommandPathResolves demands every printed
+				// runnable instruction resolve in the live cobra tree. A prose reference names
+				// the recovery path the PRD mandates without asserting it is runnable today.
+				var custody *uzicli.WorkerCustodyConflictError
+				if errors.As(err, &custody) {
+					guidance := fmt.Sprintf(
+						"this worker holds unpublished committed work in %d durable-recovery archive(s); "+
+							"recover it (uzi run export) or explicitly discard those archives, then retry the delete",
+						custody.Holds)
+					if p := env.printer(gf); p.Format == uzicli.FormatJSON {
+						_ = p.JSON(map[string]any{
+							"id":            args[0],
+							"deleted":       false,
+							"error":         guidance,
+							"custody_holds": custody.Holds,
+						})
+					}
+					return uzicli.Exitf(uzicli.ExitConflict, "%s", guidance)
+				}
 				return err
 			}
 			p := env.printer(gf)

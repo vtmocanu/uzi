@@ -142,8 +142,11 @@ type FakeClient struct {
 	GetTaskReviewErr error
 	LastTaskReviewID string
 
-	// DeleteWorker capture: records the id it was asked to delete.
+	// DeleteWorker capture: records the id it was asked to delete and how many times
+	// it was called. DeleteWorkerCalls proves `uzi worker rm` attempted the delete
+	// exactly once on a custody refusal — never silently swallowed it (PRD #1296 M4b).
 	LastDeletedWorkerID string
+	DeleteWorkerCalls   int
 
 	// DeleteRepo capture (PRD #357 M3): records the id `uzi repo remove` asked to
 	// delete. It stays empty when the confirm gate declines, which is what proves

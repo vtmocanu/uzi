@@ -1619,7 +1619,8 @@ export interface Worker {
   // retaining_unpublished_work (PRD #1296 M4): true when the worker holds an OPEN
   // durable-recovery custody hold (unpublished committed work not yet archived), so
   // teardown is deferred. Distinct from busy/active_runs — it consumes no run slot.
-  retaining_unpublished_work: boolean;
+  // Optional in TS (mocks/older payloads may omit it); the api always sends it.
+  retaining_unpublished_work?: boolean;
   // Worker template (PRD #18): the choice recorded at issuance and the value the
   // worker self-reports at register. Either may be null (no choice / older
   // image); a mismatch is surfaced as a drift badge, never a rejection.
