@@ -52,7 +52,7 @@ import { withForgeRetry } from "./forge-retry.js";
 import { makeRedactor, makeTextRedactor } from "./redact.js";
 import { sessionTranscriptResolvable } from "./sdk-session.js";
 import { errMessage, RUN_ID_RE, sleep } from "./util.js";
-import { PendingRecoveryCaptureError } from "./git.js";
+import { ForeignCaptureBlockedError, PendingRecoveryCaptureError } from "./git.js";
 import {
   buildCheckEnv,
   defaultCheckRunner,
@@ -72,6 +72,11 @@ import { REASON_NO_TOKEN, TransientRecoveryError } from "./sdk-executor.js";
 /** Cap on a reported failure_reason, matching the forge error-body cap
  *  (forge.ts) so a runaway SDK error can't bloat the run row or the stream. */
 const MAX_FAILURE_REASON_LEN = 512;
+
+/** The three authoritative TERMINAL run statuses. A run in any of these can never
+ *  write again, so its retained recovery clone is safe to reclaim. Used by the
+ *  handleRecoveryExhausted loop and by phaseClone's foreign-capture probe (#1315). */
+const TERMINAL_RUN_STATUSES = new Set(["cancelled", "completed", "failed"]);
 
 /** PRD #1226 M4 (D6): bounded in-call attempts to capture a VERIFIED completion-hold restore
  *  point before giving up. Mirrors handleRecoveryExhausted's retain-and-retry, but bounded (this
@@ -1138,9 +1143,23 @@ export class RunRunner {
       //     code says otherwise. A hang here is this bug until proven otherwise.
       if (flight.worktreePath && !flight.preserveRecoveryClone) {
         try {
-          await this.git.removeRunnerClone(flight.worktreePath);
           if (flight.barePath && flight.branch) {
-            await this.git.clearRecoveryCapture(flight.barePath, flight.branch, runId);
+            // issue #1315: retire the clone ATOMICALLY (rename-to-holding, THEN clear the
+            // journal) instead of the old removeRunnerClone + clearRecoveryCapture pair.
+            // A daemon racing a recursive rm could throw ENOTEMPTY between the two and
+            // leave the journal pointing at partial residue, wedging the branch forever.
+            // discard: this is the owner's own terminal trash, so dispose the holding dir.
+            await this.git.retireRunnerClone(
+              flight.barePath,
+              flight.worktreePath,
+              flight.branch,
+              runId,
+              { discard: true },
+            );
+          } else {
+            // No bare/branch to key the journal on (a run that never journaled): fall
+            // back to the bare recursive remove.
+            await this.git.removeRunnerClone(flight.worktreePath);
           }
         } catch (e) {
           runLog.warn("runner clone cleanup failed", { error: errMessage(e) });
@@ -2795,14 +2814,43 @@ export class RunRunner {
       flight.worktreePath = runnerClone.path;
       flight.branch = runnerClone.branch;
     } catch (err) {
-      if (!(err instanceof PendingRecoveryCaptureError)) throw err;
-      // The git layer stopped BEFORE rm. Capture this same run's retained source
-      // clone with the ordinary recovery loop; never start a model on it first.
-      flight.worktreePath = err.clonePath;
-      flight.branch = err.branch;
-      flight.preserveRecoveryClone = true;
-      flight.preserveSession = true;
-      retained = true;
+      if (err instanceof PendingRecoveryCaptureError) {
+        // The git layer stopped BEFORE rm. Capture this same run's retained source
+        // clone with the ordinary recovery loop; never start a model on it first.
+        flight.worktreePath = err.clonePath;
+        flight.branch = err.branch;
+        flight.preserveRecoveryClone = true;
+        flight.preserveSession = true;
+        retained = true;
+      } else if (err instanceof ForeignCaptureBlockedError) {
+        // issue #1315: the canonical clone is journaled to ANOTHER run's retained
+        // capture. Probe that EXACT owner authoritatively — the git layer never
+        // probes. Only a TERMINAL owner lets us reclaim; a 404 (ownership moved) or
+        // ANY transient probe error, and a still-live owner, all fail closed with the
+        // journal and clone untouched (never quarantine on an unproven owner).
+        let status: string;
+        try {
+          status = (await this.client.getRunOwnership(err.ownerRunId)).status;
+        } catch {
+          throw err;
+        }
+        if (!TERMINAL_RUN_STATUSES.has(status)) throw err;
+        // Terminal owner: atomically quarantine the foreign residue (RETAINED, not
+        // deleted — discard:false) so the canonical path is freed race-free and the
+        // journal cleared, then reseed a fresh clone from the bare exactly as the
+        // non-error path does (mirror the seed above). Control then falls through to
+        // the normal markRecoveryCapture below.
+        await this.git.retireRunnerClone(barePath, err.clonePath, err.branch, err.ownerRunId, {
+          discard: false,
+        });
+        const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim));
+        flight.worktreePath = runnerClone.path;
+        flight.branch = runnerClone.branch;
+      } else {
+        // Everything else — including StaleCaptureJournalError (never reclaimable) —
+        // propagates and fails the run closed.
+        throw err;
+      }
     }
     const active: ActiveRun = (flight.active = { cancel, shuttingDown: false });
     this.activeRuns.set(runId, active);
@@ -4248,7 +4296,7 @@ export class RunRunner {
     flight.preserveSession = true;
     let capture: { verified: boolean; published: boolean } | undefined;
     let notified = false;
-    const terminal = new Set(["cancelled", "completed", "failed"]);
+    const terminal = TERMINAL_RUN_STATUSES;
     try {
       for (;;) {
         if (flight.active?.shuttingDown) return false;

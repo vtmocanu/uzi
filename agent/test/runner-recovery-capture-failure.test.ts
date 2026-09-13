@@ -3,12 +3,12 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { GitCache, PendingRecoveryCaptureError } from "../src/git.js";
+import { ForeignCaptureBlockedError, GitCache, PendingRecoveryCaptureError, StaleCaptureJournalError } from "../src/git.js";
 import { RunRunner, type ExecutorFactory } from "../src/runner.js";
 import { TransientRecoveryError } from "../src/sdk-executor.js";
 import { skillsPluginDir } from "../src/skills-plugin.js";
 import { nullLogger } from "./helpers.js";
-import { api, client, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness, runnerWith } from "./runner-harness.js";
+import { api, client, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness, runnerWith, worktreeDirFor } from "./runner-harness.js";
 
 installHarness();
 
@@ -127,14 +127,32 @@ describe("recovery capture retry and restart safety (#1197)", () => {
       PendingRecoveryCaptureError,
       "the durable worker journal blocks same-run destructive reseeding",
     );
+    // issue #1315: the same-path foreign case is now the RECLAIMABLE
+    // ForeignCaptureBlockedError, carrying the exact owner/clone/branch the runner
+    // needs for its authoritative owner probe. (Case B — matched canonical pair.)
+    const foreign = "99999999-9999-4999-8999-999999999999";
     await assert.rejects(
-      restartedGit.createOrAttachRunnerClone(bare, iid, "99999999-9999-4999-8999-999999999999"),
-      /another run/,
+      restartedGit.createOrAttachRunnerClone(bare, iid, foreign),
+      (err: unknown) => {
+        assert.ok(err instanceof ForeignCaptureBlockedError, "same-path foreign owner -> ForeignCaptureBlockedError");
+        assert.equal(err.ownerRunId, claim.run_id);
+        assert.equal(err.clonePath, worktreeDirFor(iid));
+        assert.equal(err.branch, `agent/issue-${iid}`);
+        return true;
+      },
       "a foreign run cannot adopt or erase retained work",
     );
+    // A DIFFERENT clone key computes a different canonical path, so the journal is
+    // stale-for-this-path: NEVER reclaimable, StaleCaptureJournalError (Case A). The
+    // git layer never probes owner status here.
     await assert.rejects(
-      restartedGit.runnerCloneForBranch(bare, `agent/issue-${iid}`, "different-kind-clone", "99999999-9999-4999-8999-999999999999"),
-      /another run/,
+      restartedGit.runnerCloneForBranch(bare, `agent/issue-${iid}`, "different-kind-clone", foreign),
+      (err: unknown) => {
+        assert.ok(err instanceof StaleCaptureJournalError, "different clone key -> StaleCaptureJournalError");
+        assert.equal(err.journaledPath, worktreeDirFor(iid));
+        assert.equal(err.branch, `agent/issue-${iid}`);
+        return true;
+      },
       "a different clone key cannot bypass the retained branch ownership journal",
     );
     let modelStarted = false;
@@ -247,11 +265,14 @@ describe("recovery capture retry and restart safety (#1197)", () => {
       }
       return ack;
     };
-    const originalRemove = git.removeRunnerClone.bind(git);
+    // issue #1315: terminal cleanup now retires the clone ATOMICALLY (rename-to-holding
+    // then journal-clear) instead of removeRunnerClone + clearRecoveryCapture. Intercept
+    // the SAME cleanup step to keep the duplicate-claim serialization coverage.
+    const originalRetire = git.retireRunnerClone.bind(git);
     let removals = 0;
-    git.removeRunnerClone = async (clone) => {
+    git.retireRunnerClone = async (bareArg, clone, branchArg, runIdArg, opts) => {
       if (++removals === 1) { cleanupReached.resolve(); await releaseCleanup.promise; }
-      await originalRemove(clone);
+      await originalRetire(bareArg, clone, branchArg, runIdArg, opts);
     };
     const pages: Array<{ after: number; count: number }> = [];
     client.getChatRunMessages = async (runId, after = 0, limit = 200) => {

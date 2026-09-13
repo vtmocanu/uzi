@@ -310,7 +310,7 @@ agent (SDK child)                    api                          Anthropic
   substituters) and the new api→`api.anthropic.com` egress; `docs/proc-hardening.md`
   gains the proxy as the Anthropic-token close; ARCHITECTURE.md trust-boundary +
   run-lifecycle sections; `specs/ai.md` decision record; issue #36 updated (option B →
-  delivered).
+  delivered). *(Superseded 2026-09-13, issue #1317: `specs/ai.md` is frozen; record the design in this PRD's Decision Log or an ADR instead.)*
 
 ## Success criteria
 

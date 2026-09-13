@@ -810,11 +810,12 @@ tasks:
       - ./scripts/check-e2e-driver.sh
 
   check:spec-numbering:
-    desc: specs/ai.md section numbers are unique (whole-file), with a canary proving the detector fired
+    desc: specs/ai.md is frozen at section 637 (issue 1317), unique numbers, none above the head, count 637, with a canary proving both detectors fired
     cmds:
-      # Uniqueness ONLY -- never order/gaps/contiguity (specs/ai.md is appended at
-      # the tail, not sorted). The canary carries a planted duplicate the check must
-      # detect, or it exits 2 (instrument broken). See the script header.
+      # Freeze gate, never order/gaps (specs/ai.md is appended in landing order, not
+      # sorted, and that layout is now permanent). The canary carries a planted
+      # duplicate AND a planted section 638 the check must detect, or it exits 2
+      # (instrument broken). See the script header.
       - ./scripts/check-spec-numbering.sh specs/ai.md scripts/spec-numbering-canary.md
 
   check:migration-additive:

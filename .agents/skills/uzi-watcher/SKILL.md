@@ -249,9 +249,8 @@ they are deployment-specific, do not hard-code them** (and this is a public file
    BUNDLE 'refs/uzi-runner/agent/issue-N:refs/heads/recover/issue-N'`; `git worktree
    add DIR recover/issue-N`.
 4. **Rebase onto current main** (adopts main's workflow files → clears base-staleness): `git
-   rebase origin/main`. Common conflicts: a `specs/ai.md` section-number collision (keep
-   both sections, renumber the incoming one); a new goose migration (renumber to the next
-   free number above the live head, sequenced after any sibling PR's migration).
+   rebase origin/main`. Common conflict: a new goose migration (renumber to the next free
+   number above the live head, sequenced after any sibling PR's migration).
 5. **Verify + land:** both `git diff --name-only origin/main..HEAD -- .github/workflows/` and
    `git log --name-only origin/main..HEAD -- .github/workflows/` empty; run the touched `task
    gate:*`; push `recover/issue-N` (your token carries `workflow` scope); open a maintainer
@@ -795,15 +794,10 @@ review + up-to-date branch (`strict`) + required status checks.
   conflicts` or `the merge commit cannot be cleanly created` is a git-level conflict —
   resolve it locally (`git merge origin/main` in the branch's own worktree, fix, push),
   then merge.
-- **Parallel PRs collide on append-only files, and each merge re-conflicts the next.**
-  `specs/ai.md` (append-only, numbered `## NNN.` sections) is the classic case, measured
-  2026-08-24 driving a 7-PR batch: two open PRs both grab the next free number, and every
-  merge into `main` re-stales the others' resolution, so the same PR conflicts again after
-  each sibling lands. Assign DISTINCT section numbers up front, merge in that numeric order,
-  and expect to re-resolve after each sibling: `git checkout --theirs specs/ai.md` (take
-  main's file) then re-append your section renumbered above the new head. The same shape
-  hits any hand-edited shared file (ARCHITECTURE.md, a shared handler); a two-PR edit of
-  DIFFERENT regions three-way-merges clean, only overlapping hunks conflict.
+- **Parallel PRs collide on hand-edited shared files (ARCHITECTURE.md, a shared handler),
+  and each merge re-conflicts the next.** A two-PR edit of DIFFERENT regions three-way-merges
+  clean; only overlapping hunks conflict. `specs/ai.md` is frozen (issue #1317) and no
+  longer a conflict site.
 - **After merging PRs that edited `docs/`, watch for the embedded-docs drift guard.**
   `TestEmbeddedDocsMatchSource` requires `api/internal/uzidocs/embed/*.md` to mirror
   `docs/*.md` byte-for-byte (PRD #567). A PR that changed `docs/` but branched before the

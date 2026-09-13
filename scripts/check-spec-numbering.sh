@@ -1,38 +1,40 @@
 #!/bin/sh
-# Gate specs/ai.md on section-number UNIQUENESS, whole-file (issue #181).
+# Gate specs/ai.md on its FREEZE (issue #1317): the file is read-only history,
+# frozen at section 637, and this check is what makes "read-only" enforceable.
 #
 # usage: scripts/check-spec-numbering.sh <spec-file> <canary-file>
 #   e.g. scripts/check-spec-numbering.sh specs/ai.md scripts/spec-numbering-canary.md
 #
-# 🔴 UNIQUENESS ONLY -- NEVER ORDER, GAPS OR CONTIGUITY. specs/ai.md is
-# append-numbered and DELIBERATELY NOT SORTED BY SECTION NUMBER: the file says so
-# at specs/ai.md:15084 ("New sections are APPENDED AT THE TAIL, in LANDING order
-# ... which is not a mistake and must not be 'tidied'"), and its gaps (e.g. the
-# buried §403-416 / §447-454 blocks) are intentional too. So this check asserts one
-# thing: that no section number appears twice. A check that flagged out-of-order
-# placement or a gap would be a PERMANENT false positive on that intentional layout,
-# which is why the extraction below reports duplicates and nothing else.
+# Three arms, each read whole-file and fenced-code-block aware:
+#   1. no section number appears twice   (catches an in-place renumber)
+#   2. no section number exceeds the head (catches an append)
+#   3. the section count equals the head  (catches a deleted or merged section;
+#      today the numbers are exactly 1..637, so count == head)
+# Order and gaps are NEVER checked: the file is appended in landing order and
+# carries intentional out-of-order blocks. Both are now permanent.
 #
-# 🔴 A LIVENESS CANARY, BECAUSE A SILENT PASS IS THE FAILURE MODE. If the awk
-# extraction ever matches nothing (a pattern change, a bad edit), the spec would
-# read "0 duplicates" and this gate would pass VACUOUSLY. The canary file carries a
-# deliberately planted duplicate; the identical extraction is run over it and MUST
-# find that duplicate, or the instrument is declared broken. A clean run therefore
-# PRINTS the canary duplicate it detected -- a positive observation, so a green here
-# is not "the detector never looked".
+# The enforced form is exactly `## N.` at column 1. A near-miss (`## 638 x`,
+# `### 638.`, an indented heading) is invisible to the extractor, so the gate
+# holds the conforming form airtight and nothing else; a review still owns the
+# rest of the file.
 #
-# NO SKIP BRANCH AND NO *_REQUIRED ENV VAR, deliberately -- the asymmetry with
-# lint-yaml.sh / lint-formula.sh is that those wrap brew/pip tools a contributor may
-# lack, whereas this check needs only sh/git/awk/sort, which are always present.
-# There is nothing to fail open on, so there is no fail-open branch to guard.
+# LIVENESS CANARY, BECAUSE A SILENT PASS IS THE FAILURE MODE. The canary plants a
+# duplicate section number AND a section above the frozen head. Arms 1 and 2 must
+# both fire on it, or the instrument is declared broken. A clean run prints what
+# the canary tripped, so a green is a positive observation rather than "the
+# detector never looked".
+#
+# NO SKIP BRANCH AND NO *_REQUIRED ENV VAR: this needs only sh/git/awk, which are
+# always present, so there is nothing to fail open on.
 #
 # EXIT CODES (the convention lint-yaml.sh / scan-secrets.sh set):
-#     2 = the instrument is broken (a file missing, spec extraction empty, or the
-#         canary duplicate did not fire)
-#     1 = there are findings (a section number appears more than once)
-#     0 = clean, and the canary duplicate was seen
+#     2 = the instrument is broken (a file missing, extraction empty, canary did not fire)
+#     1 = there are findings (a duplicate, a section above the head, a count mismatch)
+#     0 = clean, and both canary arms were seen
 # `task`'s own rc is 201 for all of them.
 set -eu
+
+FROZEN_HEAD=637
 
 if [ "$#" -lt 2 ]; then
   echo "usage: scripts/check-spec-numbering.sh <spec-file> <canary-file>" >&2
@@ -43,7 +45,6 @@ fi
 SPEC="$1"
 CANARY="$2"
 
-# Run from the repo root whatever the caller's directory, like the sibling scripts.
 ROOT="$(git rev-parse --show-toplevel)" || {
   echo "check-spec-numbering: not inside a git work tree (git rev-parse --show-toplevel failed)" >&2
   exit 2
@@ -53,25 +54,18 @@ cd "$ROOT" || {
   exit 2
 }
 
-if [ ! -f "$SPEC" ]; then
-  echo "check-spec-numbering: spec file not found: $SPEC" >&2
-  echo "  Without it there is nothing to check; this is an instrument failure." >&2
-  exit 2
-fi
-if [ ! -f "$CANARY" ]; then
-  echo "check-spec-numbering: canary file not found: $CANARY" >&2
-  echo "  The canary is what proves the duplicate detector fires; without it a" >&2
-  echo "  clean spec cannot be told from a detector that matched nothing." >&2
-  exit 2
-fi
+for f in "$SPEC" "$CANARY"; do
+  if [ ! -f "$f" ]; then
+    echo "check-spec-numbering: file not found: $f (instrument failure, nothing to check)" >&2
+    exit 2
+  fi
+done
 
-# 🔴 EXTRACTION IS FENCED-CODE-BLOCK AWARE, AND IT IS ALL DONE IN awk (portable --
-# no gawk-only 3-arg match, no ugrep negated-class/brace pitfalls). Toggle an
-# "inside fence" flag on any line whose first non-space run is a triple backtick or
-# triple tilde; while inside a fence, skip. Outside fences, a line matching
-# `^## [0-9]+\.` yields its leading integer (strip the `## ` prefix, then cut at the
-# first `.`). Emit `linenumber<TAB>number` so a duplicate can be reported with the
-# lines it occurs on.
+# Extraction is all awk (portable: no gawk-only 3-arg match, no ugrep negated-class or
+# brace pitfalls). Toggle an "inside fence" flag on a line whose first non-space run is
+# a triple backtick or triple tilde and skip while inside. Outside fences, a line
+# matching `^## [0-9]+\.` yields `linenumber<TAB>number`; `+ 0` canonicalises the digits
+# so `## 07.` and `## 7.` collide as the one section they both read as.
 extract() {
   awk '
     {
@@ -80,73 +74,65 @@ extract() {
       if (t ~ /^```/ || t ~ /^~~~/) { infence = !infence; next }
       if (infence) next
       if ($0 ~ /^## [0-9]+\./) {
-        s = substr($0, 4)          # strip the "## " prefix
+        s = substr($0, 4)
         i = index(s, ".")
-        # `+ 0` canonicalises the digits to their NUMERIC value so `## 07.` and
-        # `## 7.` collide as the one section §7 they both read as -- a duplicate
-        # detector must not go blind on a leading-zero spelling. No-op on the
-        # plain integers this file actually uses.
         print NR "\t" (substr(s, 1, i - 1) + 0)
       }
     }
   ' "$1"
 }
 
-# 🔴 CANARY FIRST: prove the instrument fires before trusting any spec verdict. A
-# broken extraction would report the spec "clean" AND the canary "no duplicate", so
-# checking the canary up front closes the vacuous-pass hole for both paths.
-canary_dups="$(extract "$CANARY" | awk -F'\t' '{ c[$2]++ } END { d = 0; for (k in c) if (c[k] > 1) d++; print d }')"
-if [ "$canary_dups" -lt 1 ]; then
-  echo "check-spec-numbering: ================================================================" >&2
-  echo "check-spec-numbering: INSTRUMENT BROKEN -- the duplicate detector did not fire on the" >&2
-  echo "check-spec-numbering: canary ($CANARY)." >&2
-  echo "check-spec-numbering:" >&2
-  echo "check-spec-numbering: That fixture carries a deliberately planted duplicate section" >&2
-  echo "check-spec-numbering: number. Finding none means the awk extraction matched nothing" >&2
-  echo "check-spec-numbering: (a changed pattern, a mangled canary), so a \"clean\" spec would" >&2
-  echo "check-spec-numbering: mean nothing. Restore the canary's duplicate or fix extract()." >&2
-  echo "check-spec-numbering: ================================================================" >&2
+# stats <file> -> "dups max count", where dups counts numbers seen more than once.
+stats() {
+  extract "$1" | awk -F'\t' '
+    { c[$2]++; if ($2 + 0 > max) max = $2 + 0 }
+    END { d = 0; n = 0; for (k in c) { n++; if (c[k] > 1) d++ }; print d " " max + 0 " " n }'
+}
+
+# CANARY FIRST: prove both arms fire before trusting any spec verdict.
+canary_stats="$(stats "$CANARY")"
+canary_dups="${canary_stats%% *}"; canary_rest="${canary_stats#* }"; canary_max="${canary_rest%% *}"
+if [ "$canary_dups" -lt 1 ] || [ "$canary_max" -le "$FROZEN_HEAD" ]; then
+  echo "check-spec-numbering: INSTRUMENT BROKEN -- the canary ($CANARY) must carry a duplicate" >&2
+  echo "check-spec-numbering: section number AND a section above $FROZEN_HEAD; detector saw" >&2
+  echo "check-spec-numbering: duplicates=$canary_dups highest=$canary_max. Restore the canary or fix extract()." >&2
   exit 2
 fi
 
-# Duplicate numbers in the spec, each with the line numbers it appears on, sorted
-# numerically. Non-empty means findings.
-dup_report="$(extract "$SPEC" | awk -F'\t' '
-  { lines[$2] = lines[$2] (lines[$2] == "" ? "" : ", ") $1; cnt[$2]++ }
-  END { for (k in cnt) if (cnt[k] > 1) print k "\t" lines[k] }
-' | sort -n)"
+spec_stats="$(stats "$SPEC")"
+dups="${spec_stats%% *}"; spec_rest="${spec_stats#* }"; highest="${spec_rest%% *}"; count="${spec_rest#* }"
 
-# Whole-file stats: unique-section count and the highest number seen.
-stats="$(extract "$SPEC" | awk -F'\t' '
-  { c[$2]++; if ($2 + 0 > max) max = $2 + 0 }
-  END { n = 0; for (k in c) n++; print n " " max }')"
-unique_count="${stats% *}"
-highest="${stats#* }"
-
-if [ "$unique_count" -lt 1 ]; then
+if [ "$count" -lt 1 ]; then
   echo "check-spec-numbering: INSTRUMENT BROKEN -- no section headings found in $SPEC." >&2
-  echo "  Expected lines like '## 455. PRD #88 -- ...'. Extraction matched nothing," >&2
-  echo "  so a 'clean' verdict would be vacuous. Check the file and extract()." >&2
+  echo "  Expected lines like '## 455. PRD #88 -- ...'. Extraction matched nothing." >&2
   exit 2
 fi
 
-if [ -n "$dup_report" ]; then
+rc=0
+if [ "$dups" -gt 0 ]; then
   echo "check-spec-numbering: DUPLICATE section number(s) in $SPEC:" >&2
-  printf '%s\n' "$dup_report" | while IFS='	' read -r num where; do
-    echo "  §${num} appears on lines: ${where}" >&2
+  extract "$SPEC" | awk -F'\t' '
+    { lines[$2] = lines[$2] (lines[$2] == "" ? "" : ", ") $1; cnt[$2]++ }
+    END { for (k in cnt) if (cnt[k] > 1) print k "\t" lines[k] }' | sort -n |
+  while IFS='	' read -r num where; do
+    echo "  section ${num} appears on lines: ${where}" >&2
   done
-  echo "" >&2
-  echo "  Section numbers must be UNIQUE. Order and gaps are fine (this file is" >&2
-  echo "  append-numbered and not sorted -- see $SPEC:15084), so the fix is to" >&2
-  echo "  RENUMBER one of the collisions above the highest number in the whole file," >&2
-  echo "  never to reorder or close a gap." >&2
-  exit 1
+  rc=1
 fi
+if [ "$highest" -gt "$FROZEN_HEAD" ]; then
+  echo "check-spec-numbering: $SPEC is FROZEN at section $FROZEN_HEAD (issue #1317) but carries section(s) above it:" >&2
+  extract "$SPEC" | awk -F'\t' -v h="$FROZEN_HEAD" '$2 + 0 > h { print "  section " $2 " on line " $1 }' >&2
+  echo "  Do not append to $SPEC. Record the design in the PRD Decision Log or an ADR." >&2
+  rc=1
+fi
+if [ "$count" -ne "$FROZEN_HEAD" ]; then
+  echo "check-spec-numbering: $SPEC is FROZEN with exactly $FROZEN_HEAD sections (issue #1317); found $count." >&2
+  echo "  A section was removed or merged. Restore it: the file is read-only history." >&2
+  rc=1
+fi
+[ "$rc" -eq 0 ] || exit "$rc"
 
-next=$((highest + 1))
-echo "check-spec-numbering: clean -- $unique_count unique section number(s) in $SPEC, all distinct."
-echo "check-spec-numbering: highest section = $highest; next landing number = $next"
-echo "check-spec-numbering:   (read across the WHOLE file, not the tail: the tail is not the max)."
-echo "check-spec-numbering: canary duplicate DETECTED in $CANARY -- the detector is live, so this"
+echo "check-spec-numbering: clean -- $SPEC frozen at section $FROZEN_HEAD: $count sections, all distinct, none above the head."
+echo "check-spec-numbering: canary tripped both arms in $CANARY (duplicates=$canary_dups, highest=$canary_max), so this"
 echo "check-spec-numbering: green is a positive observation rather than a check that never looked."
 exit 0

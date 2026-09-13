@@ -18,12 +18,22 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Changed
+
+- **`specs/ai.md` is frozen at section 637; AI design decisions now live in the PRD Decision Logs and `adr/`** (issue #1317)
+  The file is read-only history with a `FROZEN` banner and a freeze gate (`task check:spec-numbering`: unique numbers, none above 637, count 637, canary proving both detectors), so the tail-append numbering collisions between parallel PRs are gone and every existing `§N` reference keeps resolving. The spec-keeper builtin moves to library v6 (never creates a `specs/ai.md`; honors the marker), the dev roster and `AGENTS.md` specs contract follow, and unfinished PRD milestones that still said "append `specs/ai.md`" carry a superseded note.
+
 ### Added
 
 - **An admin can review every user's judge recommendations at once, on a new All users view on the Judge page ([#1184](https://github.com/vtmocanu/uzi/issues/1184)).**
   A Mine / All users switch, admin-only and remembered per browser, groups every user's recommendations by category and target with a count of distinct users instead of an owner, run title or run link, so an admin can gauge how widespread a pattern is without seeing whose it is; rationale text can still name a repo or file, so the view is aggregated across users, not anonymous. File issue still drafts with full provenance (whose worker text it publishes), and Mark done settles the coordinate across every user's open occurrence, leaving each owner's row reading "Done by an admin" with a working Undo; there's no cross-user Dismiss, since that stays each owner's own call. Reads are also on the CLI (`uzi admin review backlog`/`stats`); the writes are web-only.
 - **Extend a run's wall-clock budget from the web or CLI ([#1189](https://github.com/vtmocanu/uzi/issues/1189)).**
   A run's owner can grant it more wall-clock time on top of its frozen budget, up to a new admin-set allowance (`run_extension_cap_seconds`, default 16h per run, `0` disables extending instance-wide). From the web, once a run crosses its near-timeout flag, an Extend time… button and near-timeout panel appear (quick picks +1h/+2h/+4h/+8h or a custom duration); from the CLI, `uzi run extend <run-id> --by 2h` works on any non-terminal run the sweep can time out (including a queued or parked one). The frozen budget itself never changes; a running run's header now shows its budget (`3h 48m / 8h`, or `/ 8h+2h` once extended), the extension is served to the worker so it does not self-trip its own wall before the new deadline, extending clears the near-timeout flag on the next sweep, `uzi run get`'s `DEADLINE` row gains a `· +2h extended` clause, and the near-timeout Slack DM now names the deadline, time left, checkpoint age, and the exact CLI command to extend.
+
+### Fixed
+
+- **A completed run's failed clone cleanup no longer wedges its branch ([#1315](https://github.com/vtmocanu/uzi/issues/1315)).**
+  Terminal cleanup used to delete a run's clone in place and only then clear its ownership journal; when a background `git` maintenance daemon made that recursive delete fail partway (`ENOTEMPTY`), the journal survived pointing at leftover residue, so every later run on the branch failed immediately with `refusing to replace a retained clone owned by another run` and the branch stayed permanently wedged. Clones are now released with a same-filesystem atomic rename to a worker-only holding area, and the journal is cleared only after that rename succeeds, so a failed disposal can no longer wedge the branch. A later run that finds an orphaned clone whose owning run has finished now moves it aside (retained, never deleted) and re-clones cleanly, while a clone still owned by a live run stays protected.
 
 ## [0.82.0] - 2026-09-10
 
