@@ -8,8 +8,9 @@
 // evidence is skip|cancel|todo|fail each reject individually, so one listed title passing no
 // longer masks a sibling that did not run; an unmet prerequisite of a required row; and any O
 // row whose `o` field is missing or malformed. It PERMITS a well-formed `owed` O row (owed is
-// a valid record for the ORDINARY gate — the separate receipts gate rejects it) and accepts
-// well-formed `inherited`/`receipt-present` O rows.
+// a valid record for the ORDINARY gate — the separate receipts gate requires a discharging
+// manifest record) and accepts well-formed `inherited` O rows. (The committed registry's O model is
+// two-state, `inherited`|`owed`; `receipt-present` is a manifest-only disposition, see receipts.ts.)
 //
 // A PREREQUISITE (below) still needs only ≥1 passing test — it is not tightened to require every
 // listed title, so `hasPassingTest` remains its oracle.
@@ -116,7 +117,7 @@ export function checkCompleteness(
     }
 
     // Prerequisites of a required row must be satisfied: a U/P prereq needs ≥1 passing test,
-    // an O prereq must be inherited/receipt-present (an owed prereq is unmet).
+    // an O prereq must be inherited (a committed `owed` prereq is unmet).
     for (const prereq of c.prerequisites ?? []) {
       const dep = byId.get(prereq);
       if (dep === undefined) continue; // already reported as unknown id in step 2

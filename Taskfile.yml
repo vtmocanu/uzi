@@ -2309,17 +2309,25 @@ tasks:
       - rm -f "$CODEX_M4_EVIDENCE"                       # best-effort cleanup of THIS run's file (gitignored; left in place if a prior cmd failed, for debugging)
 
   check:codex-m4-receipts:
-    desc: PRD 1287 C1 - LEAD merge gate; rejects any OWED O-layer conformance receipt (D8)
-    # The SEPARATE O-receipt merge gate (D8): it exits non-zero if ANY O-layer clause is still
-    # `owed` (packaged evidence the maintainer must run before parent M4 merge). Deliberately NOT
-    # folded into gate:agent / test:codex-m4 - an owed row must not redden the WORKER's ordinary
-    # gate (the worker cannot run packaged O proofs), only the lead's pre-merge check. At C1 this
-    # is EXPECTED to exit non-zero because clauses-codex.ts seeds an owed O row.
-    # Now BINDS each recorded base/jvm digest to a trusted candidate manifest for the expected
-    # commit (not just digest syntax): fails closed if the manifest is absent, malformed, for the
-    # wrong commit, missing an image, swapped, or mismatched. With no manifest supplied (the default
-    # at this revision, intentional - no `env:` block here) it fails closed as "manifest absent".
-    # Reproducible lead invocation (mind `dir: agent`):
+    desc: PRD 1287 - LEAD merge gate; certifies the candidate's O-layer packaged proofs (D8)
+    # The SEPARATE O-receipt merge gate (D8), redesigned to have a FIXED POINT. Deliberately NOT
+    # folded into gate:agent / test:codex-m4 - the worker cannot run packaged O proofs or supply the
+    # manifest, so none of its categories may redden the WORKER's ordinary gate, only the lead's
+    # pre-merge check. With NO manifest supplied (the default at this revision, intentional - no
+    # `env:` block here) it fails closed as "manifest absent" and lists every committed O clause.
+    #
+    # It reads a TRUSTED, out-of-band, GITIGNORED candidate manifest (receipt-manifest.json; schema
+    # template: e2e/codex-m4/receipt-manifest.example.json) that pins a `provenBaseCommit` + the two
+    # proven image digests + one discharging record per committed O clause. It certifies the current
+    # candidate iff (a) the proven base is an ANCESTOR of the candidate AND (b) the
+    # provenBaseCommit..candidate tail is EVIDENCE-ONLY (touches no shipped guardrail-runtime path).
+    # It fails closed on: manifest absent/malformed/invalid-image, base-not-ancestor, any
+    # runtime-affecting or unclassified tail drift, and any O clause that is missing / has an extra /
+    # duplicate / undischarged / mismatched / swapped / disposition-mismatched record. Because the
+    # manifest is gitignored, recording it makes NO commit, so it cannot invalidate the candidate it
+    # certifies - the lead can reuse an already-successful packaged proof (its provenBaseCommit) after
+    # evidence-only commits land on top, with no circular commit. See e2e/codex-m4/MAINTAINER-HANDOFF.md.
+    # Reproducible lead invocation (mind `dir: agent`; CODEX_M4_CANDIDATE_COMMIT defaults to HEAD):
     #   CODEX_M4_RECEIPT_MANIFEST="$(git rev-parse --show-toplevel)/e2e/codex-m4/receipt-manifest.json" \
     #     CODEX_M4_CANDIDATE_COMMIT=$(git rev-parse HEAD) \
     #     task check:codex-m4-receipts

@@ -4,60 +4,77 @@ Parent #1106 M4 acceptance requires **maintainer-only evidence the uzi worker ca
 a fresh packaged snapshot below the REAL Go supervisor on a Landlock-capable runtime, run on the
 actual merge-candidate images. That evidence is gated by `task check:codex-m4-receipts` — the
 lead's pre-merge gate, deliberately **not** folded into `gate:agent` / `test:codex-m4` so an
-owed packaged proof never reddens the worker's ordinary gate. The gate no longer checks digest
-SYNTAX alone: it BINDS each recorded `{base,jvm}` image digest to a trusted candidate manifest for
-the expected merge-candidate commit, and fails closed when the manifest is absent, malformed,
-built for the wrong commit, missing an image, swapped (base recorded as jvm or vice versa), or
-mismatched (see "Trust boundary" below). At the exact tested revision (`089b6184`), with no
-manifest supplied (the default at this revision, intentional), `check:codex-m4-receipts` **exits
-non-zero by design**:
+owed packaged proof never reddens the worker's ordinary gate.
+
+## The gate, redesigned around a fixed point
+
+The committed O registry (`e2e/codex-m4/clauses-codex.ts`) now holds **stable requirements
+only** — each O row is `inherited` (a prior source proves the same unchanged mechanism) or
+`owed` (no proof exists; the maintainer owns running it). It carries **no image digest and no
+`receipt-present` disposition**. All candidate-specific evidence — the two proven merge-candidate
+image digests and the per-clause discharging records — lives in a **trusted, out-of-band,
+gitignored manifest** at `e2e/codex-m4/receipt-manifest.json` (schema template committed at
+`e2e/codex-m4/receipt-manifest.example.json`; never commit the real one).
+
+This replaces the earlier design, which pinned candidate digests directly into
+`clauses-codex.ts` and required `manifest.candidateCommit == git rev-parse HEAD` — a design with
+**no fixed point**: committing a digest changes HEAD, and because the worker Dockerfiles `COPY .
+/opt/uzi-src` and stamp `UZI_SRC_SHA`, changing HEAD changes the image digest too, so the
+just-committed digest could never match the image it named.
+
+`task check:codex-m4-receipts` now certifies the **current candidate** (HEAD, or
+`CODEX_M4_CANDIDATE_COMMIT`) iff:
+
+1. the manifest is present, well-formed, and its proven `base`/`jvm` digests are real
+   `sha256:<64-hex>` values;
+2. the manifest's `provenBaseCommit` is an **ancestor** of the candidate;
+3. the `provenBaseCommit..candidate` tail is **evidence-only** — every changed path classifies as
+   evidence (`e2e/`, `prds/`, `docs/`, `adr/`, `specs/`, `.claude/`, `agent/test/`, `Taskfile.yml`,
+   or any `*.md`); a runtime path (anything under `agent/` except `agent/test/`) or an
+   unrecognized path fails closed;
+4. every committed O clause has **exactly one** discharging manifest record — no missing, extra,
+   or duplicate;
+5. each record's `images` match the manifest's proven pair — no mismatch, no base/jvm swap;
+6. a committed `owed` clause is discharged **only** by a `receipt-present` record — an `inherited`
+   record can never discharge it (that would falsely claim a prior proof that does not exist). A
+   committed `inherited` clause accepts either disposition.
+
+Because the manifest is gitignored, **recording it makes no commit**, so it can never invalidate
+the very candidate it certifies — that is the fixed point. Practically: the lead can reuse an
+**already-successful** packaged proof (e.g. the base+jvm proof that succeeded for commit
+`d054eace` in GitHub Actions run 34757302169) by setting `provenBaseCommit=d054eace` and letting
+any number of evidence-only rework commits sit in the tail, with **no edit to
+`clauses-codex.ts`** and no circular commit.
+
+At the exact tested revision (`9d680c93`), with no manifest supplied (the default at this
+revision, intentional), `check:codex-m4-receipts` **exits non-zero by design**:
 
 ```
 run-receipts: manifest unusable [absent]: candidate manifest absent — supply CODEX_M4_RECEIPT_MANIFEST (fail closed, D8)
-run-receipts: 2 inherited/receipt-present O row(s) with an unresolved (placeholder) base/jvm digest block merge (D8) — refresh BOTH to the real merge-candidate digests:
-  - codex-o-command-root-home-denial [base]
-      digest: sha256:PENDING-CANDIDATE-DIGEST-BASE
-  - codex-o-command-root-home-denial [jvm]
-      digest: sha256:PENDING-CANDIDATE-DIGEST-JVM
-run-receipts: 2 owed O assertion(s) block merge (D8):
+run-receipts: 3 committed O clause(s) with no manifest record (undischarged):
+  - codex-o-command-root-home-denial
   - codex-o-descendant-code-mode-host-absence
-      target: codex worker image (base + jvm) descendant-reaping snapshot
-      reason: descendant/code-mode-host absence needs a fresh packaged snapshot below the REAL Go supervisor on a Landlock-capable runtime; the uzi worker cannot prove a descendant ABSENCE from a direct harness spawn.
-      owner:  maintainer (D8: fresh packaged O proof, k8s-first Linux runtime)
   - codex-o-packaged-descendant-reaping
-      target: codex worker image (base + jvm) supervisor whole-root reaping snapshot
-      reason: whole-root ECHILD(+__WALL) descendant reaping under the REAL Go supervisor is a packaged OS effect; the uzi worker's C4 U cases prove only the registry/safety CONTRACT with injected fake roots, so a fresh packaged snapshot below the real supervisor on a Landlock-capable runtime is required and is maintainer-owned (D8).
-      owner:  maintainer (D8: fresh packaged O proof, k8s-first Linux runtime)
 ```
-(Verbatim `run-receipts.ts` output at revision `089b6184`; exit status 1.)
+(Verbatim `run-receipts.ts` output at revision `9d680c93`; exit status 1.)
 
-This is bookkeeping, not a gap left unnoticed: every O row is one of `inherited` /
-`receipt-present` / `owed` (D3/D8), and the ordinary worker gate accepts a well-formed `owed`
-record while this separate lead gate rejects it. Do **not** mark parent M4 complete, and do
-**not** move `prds/1287-codex-guardrail-conformance.md` to `prds/done/`, until every row below is
-resolved.
+This is bookkeeping, not a gap left unnoticed: every committed O row is `inherited` or `owed`
+(D3/D8), and the ordinary worker gate accepts a well-formed `owed` record while this separate
+lead gate rejects it until a discharging manifest record exists. Do **not** mark parent M4
+complete, and do **not** move `prds/1287-codex-guardrail-conformance.md` to `prds/done/`, until
+every row below is resolved.
 
 ## What is owed
 
-### 1. Inherited row — pin BOTH real digests
+### 1. Inherited row — needs a manifest record, no code edit
 
 **`codex-o-command-root-home-denial`** (File policy: command-root HOME/credential OS
 separation) cites `e2e/codex-m3b/lifecycle.test.ts` Block B (PRD #1171 m5) as its prior proof,
-and D8's unchanged-mechanism argument holds: C1-C4 changed no `agent/codex/**`
+and D8's unchanged-mechanism argument holds: C1-C5 change no `agent/codex/**`
 supervisor/fileop/launcher code, and the C3 D6 repair is a policy-only `extraSecretPaths`
-addition. But its `imageDigests` are still the C1-seeded placeholders
-`sha256:PENDING-CANDIDATE-DIGEST-BASE` / `sha256:PENDING-CANDIDATE-DIGEST-JVM` — a merge candidate
-ships TWO images (`base` and `jvm`) and one proven image cannot vouch for the other, so
-`run-receipts.ts` treats a non-real digest on EITHER image as "unresolved" and blocks the merge
-gate exactly like an owed row, naming which image is still unresolved. Citing a real historical
-case is not enough on its own.
-
-**Action:** pin BOTH `imageDigests.base` and `imageDigests.jvm` in `e2e/codex-m4/clauses-codex.ts`
-to the actual merge-candidate images' `sha256:<64-hex>` digests, and produce the trusted candidate
-manifest (below) recording the SAME digests for the SAME commit. The gate now binds each recorded
-digest to that manifest, so pasting a real-looking digest into `clauses-codex.ts` is no longer
-sufficient on its own — it must match the manifest for the expected merge-candidate commit before
-accepting parent M4.
+addition. Its committed row carries no digest — it needs only a matching `inherited` (or a fresh
+`receipt-present`) record in the manifest, bound to the proven image pair. No edit to
+`clauses-codex.ts` is required.
 
 ### 2. Owed rows — fresh packaged proof
 
@@ -77,56 +94,56 @@ snapshot below the real supervisor can:
   registry/safety reap-ordering CONTRACT with injected fake roots; this row is the OS-level
   backing proof under the real supervisor that no packaged snapshot has yet run.
 
-**Action:** run the required packaged proof (below) on a Landlock-capable runtime and record a
-`receipt-present` O-state for each row (source, image digest, target, `recordedAt`).
+Because these are committed `owed` clauses, the manifest must discharge each with a
+`receipt-present` record (never `inherited` — the gate rejects that as a disposition mismatch).
 
-## The required packaged proof
+## How to discharge
 
-```sh
-UZI_CODEX_M3B_PACKAGED=1 task test:codex-m3b:packaged
-```
+1. **Obtain the two proven image digests** (`base` and `jvm`) from an already-successful packaged
+   proof for a chosen `provenBaseCommit` — e.g. the base+jvm proof that already succeeded for
+   commit `d054eace` (GitHub Actions run 34757302169) — or run
+   `UZI_CODEX_M3B_PACKAGED=1 task test:codex-m3b:packaged` on both merge-candidate images and read
+   their digests (e.g. `docker image inspect --format '{{.Id}}'`). This is the same both-image
+   packaged run `e2e/codex-m3b/README.md` documents; it is CI/maintainer-only because it needs
+   native image builds plus a Landlock-capable kernel (in-worker image builds are storage-flaky
+   and arm64 is unsupported for this proof — the worker builds no image and needs no cluster
+   credential).
+2. **Write the manifest** at `e2e/codex-m4/receipt-manifest.json` (gitignored, never committed —
+   `e2e/codex-m4/receipt-manifest.example.json` is the committed schema template) with:
+   - `provenBaseCommit` — the full proven-revision commit hex (40 or 64 lowercase hex).
+   - `images.base` / `images.jvm` — the two real `sha256:<64-hex>` digests from step 1.
+   - `provenance` — a non-empty description of how the proof was produced (cite the run URL/
+     command/date).
+   - `clauses` — one record per committed O clause: `codex-o-command-root-home-denial` recorded
+     as `inherited`; `codex-o-descendant-code-mode-host-absence` and
+     `codex-o-packaged-descendant-reaping` recorded as `receipt-present` (each needs a FRESH
+     packaged snapshot below the real Go supervisor on a Landlock-capable runtime — that fresh
+     proof is still owed). Each record's `images` is the same proven pair from step 1.
+3. **Confirm the tail is evidence-only.** `provenBaseCommit` must be an ancestor of the current
+   HEAD, and the `provenBaseCommit..HEAD` diff must touch only evidence paths: `e2e/`, `prds/`,
+   `docs/`, `adr/`, `specs/`, `.claude/`, `agent/test/`, `Taskfile.yml`, or any `*.md`. A change
+   under `agent/` (except `agent/test/`) is a runtime change and requires a FRESH proof at a new
+   `provenBaseCommit` — it cannot ride an old proof's fixed point.
+4. **Run the gate** (mind `dir: agent` in the Taskfile, so use an absolute manifest path via
+   `--show-toplevel`):
+   ```sh
+   CODEX_M4_RECEIPT_MANIFEST="$(git rev-parse --show-toplevel)/e2e/codex-m4/receipt-manifest.json" \
+     CODEX_M4_CANDIDATE_COMMIT=$(git rev-parse HEAD) \
+     task check:codex-m4-receipts
+   ```
+   and confirm it prints `run-receipts: OK — proven base <provenBaseCommit> → candidate <HEAD>;
+   evidence-only tail; every O clause bound to the trusted manifest (none drifting, missing,
+   extra, duplicate, undischarged, mismatched, or disposition-mismatched).`
+5. **No edit to `clauses-codex.ts` is needed.** The old "pin digests into `clauses-codex.ts`" step
+   — the one that created the circular commit — is gone; that is the whole point of the redesign.
+6. Still required before parent M4: the strict macOS Linux-container run (below) and current-head
+   CI `test-agent` confirmation (lead-owned).
+7. Only then tick parent #1106 M4 and move `prds/1287-codex-guardrail-conformance.md` to
+   `prds/done/`.
 
-on **both** merge-candidate images (`base` and `jvm`), recording their digests (D8). This is the
-same both-image packaged run `e2e/codex-m3b/README.md` documents; it is CI/maintainer-only
-because it needs native image builds plus a Landlock-capable kernel (in-worker image builds are
-storage-flaky and arm64 is unsupported for this proof — the worker builds no image and needs no
-cluster credential).
+## Also required before parent M4 acceptance
 
-From that proof, produce the trusted candidate manifest at `e2e/codex-m4/receipt-manifest.json`
-(gitignored, never committed — `e2e/codex-m4/receipt-manifest.example.json` is the committed
-schema template) recording:
-
-- `candidateCommit` — the full merge-candidate commit hex (40 or 64 lowercase hex; `git rev-parse
-  HEAD` on the candidate).
-- `images.base` / `images.jvm` — the two real `sha256:<64-hex>` digests the packaged proof
-  produced for the candidate's two images.
-- `provenance` — a non-empty description of how the proof was produced (e.g. the
-  `UZI_CODEX_M3B_PACKAGED=1 task test:codex-m3b:packaged` invocation, runtime, and date).
-
-Then run the gate bound to that manifest (note `check:codex-m4-receipts` runs with `dir: agent` in
-the Taskfile, so use an absolute manifest path via `--show-toplevel`):
-
-```sh
-CODEX_M4_RECEIPT_MANIFEST="$(git rev-parse --show-toplevel)/e2e/codex-m4/receipt-manifest.json" \
-  CODEX_M4_CANDIDATE_COMMIT=$(git rev-parse HEAD) \
-  task check:codex-m4-receipts
-```
-
-The gate binds every recorded `{base,jvm}` digest in `clauses-codex.ts` to this manifest for the
-expected commit — absent, malformed, wrong-commit, missing-image, swapped (base recorded as jvm or
-vice versa), or mismatched all fail closed. It is no longer enough to merely paste a real-looking
-digest into `clauses-codex.ts`; the pasted digests must match the manifest for the expected commit.
-
-## Trust boundary
-
-The gate binds each recorded digest to the manifest for the exact expected commit; `provenance` is
-a presence-checked FREE-TEXT field, not independently verified. The gate does NOT itself prove the
-images exist, were built, or are signed — that assurance comes from the maintainer actually running
-the packaged proof that produces the manifest.
-
-Also required before parent M4 acceptance:
-
-- **The strict macOS Linux-container invocation** (D7 point 3): now reproducibly callable as
+- **The strict macOS Linux-container invocation** (D7 point 3): reproducibly callable as
   `task test:codex-m4:macos` (and `task gate:agent` / `task test:codex-m4` auto-route the
   Linux-only P leg through the same pinned container on macOS). The runner
   (`executeMacosLinuxRun` in `macos-linux-runner.ts`) runs the COMPLETE strict P suite (all
@@ -142,37 +159,16 @@ Also required before parent M4 acceptance:
   tested revision to cite honestly; the lead owns confirming CI is green on this revision (or
   the revision that supersedes it) and recording the URL/counts.
 
-## How to discharge
+## Trust boundary
 
-1. Identify the actual merge-candidate `base` and `jvm` image digests (post-merge or from a
-   candidate build), and the exact merge-candidate commit hex.
-2. Run `UZI_CODEX_M3B_PACKAGED=1 task test:codex-m3b:packaged` against both images; confirm the
-   positive per-image Block A counts and the Block B real-path counts described in
-   `e2e/codex-m3b/README.md`.
-3. Produce the trusted candidate manifest at `e2e/codex-m4/receipt-manifest.json` (schema in
-   `e2e/codex-m4/receipt-manifest.example.json`; gitignored, never committed) with
-   `candidateCommit`, the real `images.base`/`images.jvm` digests from step 2, and a `provenance`
-   description.
-4. Update `e2e/codex-m4/clauses-codex.ts`:
-   - Set `codex-o-command-root-home-denial`'s `imageDigests.base` AND `imageDigests.jvm` to the
-     SAME real `sha256:<64-hex>` values recorded in the manifest (both are required, and both must
-     match the manifest for the expected commit — the gate rejects a mismatched or swapped digest).
-   - Flip `codex-o-descendant-code-mode-host-absence` and `codex-o-packaged-descendant-reaping`
-     from `owed` to `receipt-present` (or a fresh `inherited` citation for a later candidate),
-     each with `source`, `imageDigests` (`{ base, jvm }`) matching the manifest, `target`, and
-     optionally `recordedAt`.
-5. Re-run the gate bound to the manifest:
-   ```sh
-   CODEX_M4_RECEIPT_MANIFEST="$(git rev-parse --show-toplevel)/e2e/codex-m4/receipt-manifest.json" \
-     CODEX_M4_CANDIDATE_COMMIT=$(git rev-parse HEAD) \
-     task check:codex-m4-receipts
-   ```
-   and confirm it prints `run-receipts: OK — every O-layer clause is inherited/receipt-present
-   with base/jvm digests bound to the trusted candidate manifest for <commit>; none owed,
-   unresolved, or mismatched.`
-6. Run the strict macOS Linux-container invocation and confirm current-head CI `test-agent`.
-7. Only then tick parent #1106 M4 and move `prds/1287-codex-guardrail-conformance.md` to
-   `prds/done/`.
+The gate TRUSTS the out-of-band manifest (the maintainer produced it from a real
+`UZI_CODEX_M3B_PACKAGED=1 task test:codex-m3b:packaged` proof). It verifies the manifest's
+internal consistency (well-formed, real image digests), full coverage (every committed O clause
+has exactly one discharging record whose digests match the proven pair and whose disposition
+matches the committed requirement), and no runtime drift in the tail. It does **not** — and
+cannot, from inside the worker — verify that the digests were truly built from
+`provenBaseCommit`; that assurance comes from the maintainer actually running the packaged proof
+that produced the manifest.
 
 No real provider credential, cluster access, or deployment rollout is required for any of the
 above — every step here is the existing test/proof machinery pointed at real packaged images.

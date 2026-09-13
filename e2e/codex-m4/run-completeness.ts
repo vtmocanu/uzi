@@ -16,8 +16,8 @@ import { ALL_CLAUSES } from "./registry.js";
 
 /** C5's tightened required matrix — the full required U/P set. claude/U (C2 preservation) and
  *  codex/U (C3/C4 policy/lifecycle/failure + the D6 HOME-screener) are now execution-enforced
- *  alongside the codex/P real-protocol cases. O rows stay OUT: they are records under the
- *  three-state model and gated separately by check:codex-m4-receipts (D3/D8). */
+ *  alongside the codex/P real-protocol cases. O rows stay OUT: they are committed two-state
+ *  (`inherited`|`owed`) requirement records, gated separately by check:codex-m4-receipts (D3/D8). */
 const REQUIRED_MATRIX_C5: readonly RequiredCell[] = [
   { adapter: "claude", layer: "U" },
   { adapter: "codex", layer: "U" },

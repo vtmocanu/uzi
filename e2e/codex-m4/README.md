@@ -14,15 +14,18 @@ proves *every required clause*, not one lifecycle path.
 |---|---|---|
 | **U**: unit/adapter | Recorded payloads, real hook/broker/renderer/reducer policy, grants and injected failure paths | Additive `agent/test/*.test.ts` (ordinary `npm test`) plus `e2e/codex-m4/*.test.ts` |
 | **P**: real protocol, OS effects injected | Pinned real app-server, production isolation template, broker/registry/builders/delegation and fixed provider scripts; only launcher/setpriv, fileop and command OS effects are injected through existing production seam types | `task test:codex-m4`, a mandatory serial second step of `test:agent` (and therefore `gate:agent` and CI) |
-| **O**: packaged OS | uid separation, Landlock, openat2, supervisor descendant reaping and actual provider/command-root effects | Maintainer-only; each proof binds BOTH packaged images (`base` + `jvm` `sha256` digests, one cannot vouch for the other); recorded as `inherited` / `receipt-present` / `owed` (D3/D8), gated by `task check:codex-m4-receipts` |
+| **O**: packaged OS | uid separation, Landlock, openat2, supervisor descendant reaping and actual provider/command-root effects | Maintainer-only. The COMMITTED registry records each row as `inherited` or `owed` (two-state, D3/D8); the candidate-specific `receipt-present` disposition and the two proven packaged-image (`base` + `jvm` `sha256`) digests live in a trusted, gitignored candidate manifest, gated by `task check:codex-m4-receipts` |
 
 The machine-readable registry (`clauses-claude.ts` + `clauses-codex.ts`, aggregated by
 `registry.ts`) is the **source of truth** for every clause. The strict completeness checker
 (`completeness.ts` / `run-completeness.ts`) enforces the required matrix
 **`[claude/U, codex/U, codex/P]`** against the ACTUAL executed-test evidence a run produced — a
 hard-coded success list or a grep for test names is not accepted evidence (D3). `codex/O` is not
-in this matrix: O-layer rows are three-state records (`inherited` / `receipt-present` / `owed`)
-gated separately by `check:codex-m4-receipts`, so an owed packaged proof never deadlocks the
+in this matrix: the COMMITTED O-layer registry is a two-state model — each row is `inherited` or
+`owed`, a STABLE requirement carrying no candidate-specific evidence. The candidate's proven
+image digests and its per-clause `receipt-present`/`inherited` discharging records live in a
+trusted, out-of-band, gitignored manifest (`receipt-manifest.json`) that the separate
+`check:codex-m4-receipts` gate binds against, so an owed packaged proof never deadlocks the
 worker's ordinary gate.
 
 ## The clause → layer map
@@ -92,12 +95,17 @@ task test:codex-m4
 # inherited O row's required regression alongside the codex-u-home-screening-executor-d6 case.
 task test:codex-m3b:host
 
-# The LEAD's pre-merge gate: BINDS each recorded {base,jvm} image digest to a trusted candidate
-# manifest for the expected merge-candidate commit (not just digest syntax) — fails closed when the
-# manifest is absent, malformed, built for the wrong commit, missing an image, swapped (base
-# recorded as jvm or vice versa), or mismatched. Reads CODEX_M4_RECEIPT_MANIFEST (path to the
-# manifest; schema template at receipt-manifest.example.json) and CODEX_M4_CANDIDATE_COMMIT
-# (defaults to `git rev-parse HEAD`). Currently non-zero by design — see MAINTAINER-HANDOFF.md.
+# The LEAD's pre-merge gate, redesigned around a fixed point (D8): reads a trusted, out-of-band,
+# gitignored candidate manifest (schema template at receipt-manifest.example.json) that pins a
+# `provenBaseCommit` + its two proven {base,jvm} image digests + one discharging record per
+# committed O clause. It certifies the current candidate iff the proven base is an ANCESTOR of the
+# candidate AND the provenBaseCommit..candidate tail is EVIDENCE-ONLY (touches no shipped
+# guardrail-runtime path) AND every O clause is covered/matched/disposition-honest — fails closed
+# on manifest absent/malformed/invalid-image, base-not-ancestor, any runtime/unclassified tail
+# drift, or any missing/extra/duplicate/undischarged/mismatched/disposition-mismatched record.
+# Reads CODEX_M4_RECEIPT_MANIFEST (manifest path) and CODEX_M4_CANDIDATE_COMMIT (defaults to
+# `git rev-parse HEAD`). Currently non-zero by design (no manifest supplied) — see
+# MAINTAINER-HANDOFF.md.
 task check:codex-m4-receipts
 ```
 
@@ -142,6 +150,19 @@ executed test result(s), required matrix [claude/U, codex/U, codex/P] satisfied.
 check:codex-m4-receipts` still exits non-zero by design, now failing closed as manifest `absent`
 (no `CODEX_M4_RECEIPT_MANIFEST` supplied at this revision — see MAINTAINER-HANDOFF.md) rather than
 only citing the unresolved placeholder/owed rows.
+
+**Refreshed at revision `9d680c93`** (D8's redesign to a fixed-point manifest, replacing the
+committed-digest/`candidateCommit == HEAD` binding above — see MAINTAINER-HANDOFF.md's "The gate,
+redesigned around a fixed point"): `task test:codex-m4` reports `tests 151`, `pass 151`, `fail
+0`, `skipped 0`; `run-completeness.ts` still reports `OK — 35 clauses catalogued, 53 executed
+test result(s), required matrix [claude/U, codex/U, codex/P] satisfied.` With no manifest
+supplied, `task check:codex-m4-receipts` exits non-zero by design, now listing every committed O
+clause as undischarged (see the exact output in MAINTAINER-HANDOFF.md) rather than a
+placeholder-digest/owed split. Pointed at a manifest with `provenBaseCommit=d054eace` (the commit
+whose base+jvm packaged proof succeeded in GitHub Actions run 34757302169) and real-shaped digests
+for all three committed clauses, the gate certifies this revision (`run-receipts: OK`) because the
+`d054eace..9d680c93` tail touches only `e2e/codex-m4/**` and `Taskfile.yml` — evidence-only,
+confirming the fixed-point property functions as designed.
 
 ## Mutation calibration (D4/C5)
 
