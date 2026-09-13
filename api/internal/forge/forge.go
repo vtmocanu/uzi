@@ -839,6 +839,10 @@ type Forge interface {
 	// (the honest degrade path). Errors are PAT-redacted; on GitHub a rate-limit
 	// surfaces as *RateLimitError (GitLab/Forgejo return a plain error; see RateLimitError).
 	ListWorkflowRuns(ctx context.Context, projectID int64, opts ListWorkflowRunsOptions) ([]WorkflowRun, error)
+	// GetWorkflowRun returns one CI run's header (the neutral WorkflowRun) by its
+	// forge-native run/pipeline id, for the `ci` drill-in. ErrForgeVersionUnsupported
+	// on a forge whose Actions/pipelines API is absent (mirrors ListWorkflowRuns).
+	GetWorkflowRun(ctx context.Context, projectID, runID int64) (WorkflowRun, error)
 	// ListMergeRequestReviews returns an open MR's per-reviewer reviews for the
 	// forge-view detail route (PRD #1255 D6), oldest-first — the same review stream the
 	// driver folds into ReviewDecision, returned verbatim (State is the raw forge value)
