@@ -325,7 +325,7 @@ const (
 // no control rune survives the slice, but the Plain draw keeps the guard honest. Slicing first is
 // what makes `sha7` honest: Plain(sha, 7) on a full 40-char SHA would append an ellipsis (6 hex + …),
 // whereas Plain on an already-≤7-rune value adds none (e.g. `deadbee`, not `deadbe…`).
-func shortSHA(sha string) string {
+func shortSHACell(sha string) string {
 	r := []rune(cellText(sha))
 	if len(r) > 7 {
 		r = r[:7]
@@ -456,7 +456,7 @@ func (m tuiModel) ciRunHeaderLine1() string {
 		m.pal.faint.Render(" · ") +
 		m.pal.faint.Render(m.renderer.Plain(t.runBranch, 22)) +
 		m.pal.faint.Render(" · ") +
-		m.pal.faint.Render(m.renderer.Plain(shortSHA(t.runSHA), 7))
+		m.pal.faint.Render(m.renderer.Plain(shortSHACell(t.runSHA), 7))
 	right := m.ciRunRollup() +
 		m.pal.faint.Render("   ") +
 		paintSeg(m.pal.wait, nil, false, "● live") +
