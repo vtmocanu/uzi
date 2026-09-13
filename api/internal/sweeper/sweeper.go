@@ -107,7 +107,7 @@ func (e *Engine) runOnce(ctx context.Context) {
 	}
 	// Only log when the pass actually did something, to keep the log quiet on an
 	// idle system.
-	if res.WorkersOffline+res.ClaimedReset+res.RunningTimeout+res.StaleFailed+res.StaleRequeued+res.ChatIdleCompleted+res.ProposalsRecovered+res.HealthChanged+res.AutoStopped+res.LimitPromoted+res.PoolResumed+res.RecoveryPromoted+res.CompletionBudgetExhausted+res.CustodyReleased > 0 {
+	if res.WorkersOffline+res.ClaimedReset+res.RunningTimeout+res.StaleFailed+res.StaleRequeued+res.ChatIdleCompleted+res.ProposalsRecovered+res.HealthChanged+res.AutoStopped+res.LimitPromoted+res.PoolResumed+res.RecoveryPromoted+res.CompletionBudgetExhausted+res.CustodyReleased+res.RecoveryStalled+res.RecoveryExpired > 0 {
 		slog.Info("sweeper pass",
 			"workers_offline", res.WorkersOffline,
 			"claimed_reset", res.ClaimedReset,
@@ -142,6 +142,16 @@ func (e *Engine) runOnce(ctx context.Context) {
 			// terminal release failed) still raises this line rather than unblocking teardown
 			// invisibly.
 			"custody_released", res.CustodyReleased,
+			// PRD #1296 D3/D4: same reasoning — in the sum above as well as emitted here, so a
+			// tick that only flips a stalled durable-archive upload to needs_action (past the
+			// UZI_RECOVERY_UPLOAD_RETRY_WINDOW, source retained) still raises this line rather
+			// than surfacing the needs_action transition invisibly.
+			"recovery_stalled", res.RecoveryStalled,
+			// PRD #1296 D4: same reasoning — in the sum above as well as emitted here, so a tick
+			// that only expires a ready durable-archive capture past its retention (flipping it
+			// to expired and reclaiming its bytes) still raises this line rather than reclaiming
+			// storage invisibly.
+			"recovery_expired", res.RecoveryExpired,
 		)
 	}
 }

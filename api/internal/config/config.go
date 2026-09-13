@@ -647,7 +647,7 @@ type Config struct {
 	RecoveryMaxCapturesPerClaim    int           // UZI_RECOVERY_MAX_CAPTURES_PER_CLAIM — captures admitted under one hold. Default 16.
 	RecoveryMaxCapturesPerOwner    int           // UZI_RECOVERY_MAX_CAPTURES_PER_OWNER — retained (non-discarded) captures per owner. Default 256.
 	RecoveryReadyRetention         time.Duration // UZI_RECOVERY_READY_RETENTION — ready-artifact TTL, begins at durable capture. Default 168h (7d).
-	RecoveryUploadRetryWindow      time.Duration // UZI_RECOVERY_UPLOAD_RETRY_WINDOW — automatic upload-retry window (consumed by M3/M4). Default 24h.
+	RecoveryUploadRetryWindow      time.Duration // UZI_RECOVERY_UPLOAD_RETRY_WINDOW — governs the periodic stalled→needs_action sweep (workersvc ExpireStalledUploads), NOT an in-request loop: a capture stuck in a non-terminal upload state longer than this is surfaced as needs_action with the source retained. Default 24h; the sweep disables on a non-positive value.
 	RecoveryMaxConcurrentUploads   int           // UZI_RECOVERY_MAX_CONCURRENT_UPLOADS — concurrent uploads per API process. Default 2.
 	RecoveryMaxConcurrentDownloads int           // UZI_RECOVERY_MAX_CONCURRENT_DOWNLOADS — concurrent downloads per API process. Default 2.
 	RecoveryRequestDeadline        time.Duration // UZI_RECOVERY_REQUEST_DEADLINE — per upload/download request+transaction deadline. Default 120s.

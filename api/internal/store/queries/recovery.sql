@@ -167,13 +167,53 @@ SET state = 'discarded', updated_at = now()
 WHERE c.id = @id AND c.run_id = @run_id AND c.user_id = @user_id;
 
 -- name: ExpireReadyCaptures :execrows
--- D4: the expiry sweep. Moves 'available' captures past their expires_at to 'expired'.
--- Scoped to available+expired-at-past so it NEVER touches an open hold, a pending
--- (preparing/uploading) capture, or a needs_action capture — a ready artifact's TTL must
--- not expire uncaptured custody.
-UPDATE recovery_captures
+-- D4: the retention-enforcement sweep. Moves 'available' captures past their expires_at to
+-- 'expired' AND reclaims their bytes — the encrypted chunk rows of the expired captures are
+-- deleted in the SAME statement, so a capture past its retention window no longer costs the
+-- instance/owner byte storage. Scoped to available+expired-at-past so it NEVER touches an open
+-- hold, a pending (preparing/uploading) capture, or a needs_action capture — a ready
+-- artifact's TTL must not expire uncaptured custody. The capture METADATA row is kept in state
+-- 'expired' (audit + an honest owner-visible state); only its bytes go.
+--
+-- Ordered exactly like DiscardCaptureForOwner so the whole thing is ONE atomic statement:
+-- `expiring` SELECTs the target ids under one snapshot, `del` deletes their chunks, and the
+-- final UPDATE flips exactly those ids to 'expired'. Because every CTE reads that same
+-- snapshot, a partially-expired capture can never leave orphan chunks or a chunk-less
+-- 'available' row, and :execrows reports the capture UPDATE's row count (not the chunk
+-- deletes'). Custody is NEVER touched — expiry is a capture-artifact operation, never a custody
+-- release (an expired capture whose hold is still open stays retained per D3).
+WITH expiring AS (
+    SELECT rc.id AS capture_id FROM recovery_captures rc
+    WHERE rc.state = 'available' AND rc.expires_at IS NOT NULL AND rc.expires_at < @now
+),
+del AS (
+    DELETE FROM recovery_capture_chunks
+    WHERE capture_id IN (SELECT expiring.capture_id FROM expiring)
+)
+UPDATE recovery_captures c
 SET state = 'expired', updated_at = now()
-WHERE state = 'available' AND expires_at IS NOT NULL AND expires_at < @now;
+WHERE c.id IN (SELECT expiring.capture_id FROM expiring);
+
+-- name: ExpireStalledUploads :execrows
+-- PRD #1296 D3/D4: the upload-retry-window sweep — the LIVE consumer of
+-- UZI_RECOVERY_UPLOAD_RETRY_WINDOW. A healthy upload advances a reserved capture from
+-- 'preparing' to 'available' within seconds, so a capture still in a NON-TERMINAL upload
+-- state (preparing/uploading) whose reserve time is older than the operator's window has
+-- genuinely stalled. created_at is the reserve anchor (the upload never restamps it), so a
+-- capture unreserved-to-ready for longer than the window is the stall this surfaces. It flips
+-- the capture to 'needs_action' with a specific reason so the owner sees a retain-and-decide
+-- artifact, stamping updated_at.
+--
+-- RETAINS THE SOURCE (D3): needs_action is a NON-RELEASING state and this query NEVER touches
+-- the custody hold, so the last copy is held until capture succeeds or the owner explicitly
+-- discards — ListReleasableCustodyHolds does not qualify a needs_action-only hold. Scoped to
+-- the two non-terminal upload states so it NEVER touches an available/expired/discarded/
+-- already-needs_action capture. The caller DISABLES this pass when the window is non-positive
+-- (the sweep's >0 guard); the query itself is always time-bounded by @retry_window.
+UPDATE recovery_captures
+SET state = 'needs_action', reason = 'upload_retry_window_exhausted', updated_at = now()
+WHERE state IN ('preparing', 'uploading')
+  AND created_at < now() - @retry_window::interval;
 
 -- name: ListReleasableCustodyHolds :many
 -- PRD #1296 M4 (D3): the custody-release RECONCILER's candidate set — OPEN holds whose

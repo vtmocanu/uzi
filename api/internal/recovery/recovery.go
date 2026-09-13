@@ -87,6 +87,13 @@ type Limits struct {
 	MaxConcurrentUploads   int           // concurrent uploads per API process.
 	MaxConcurrentDownloads int           // concurrent downloads per API process.
 	RequestDeadline        time.Duration // per upload/download request+transaction deadline.
+	// UploadRetryWindow is the durable-archive upload-retry window (UZI_RECOVERY_UPLOAD_RETRY_WINDOW).
+	// The upload handler itself is single-request (it never loops on this bound); the window
+	// governs the PERIODIC stalled→needs_action transition run by the workersvc sweep
+	// (ExpireStalledUploads), which is the value's live consumer. It lives here so every
+	// UZI_RECOVERY_* knob maps onto one recovery.Limits, keeping the archive bounds discoverable
+	// in one place. A non-positive value disables the sweep (the sweep's own >0 guard).
+	UploadRetryWindow time.Duration
 }
 
 // Service is the durable archive service. It is safe for concurrent use.

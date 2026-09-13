@@ -149,6 +149,16 @@ func TestSweeperPassLogsResumeOnlyTicks(t *testing.T) {
 		// too — the guard sum AND emit list both include CustodyReleased, else a release-only
 		// tick logs nothing and the teardown-unblock is invisible.
 		{name: "custody released alone", res: workersvc.SweepResult{CustodyReleased: 1}, attr: "custody_released"},
+		// PRD #1296 D3/D4: a tick that ONLY flips a stalled durable-archive upload to
+		// needs_action must raise the line too — the guard sum AND emit list both include
+		// RecoveryStalled, else a stall-only tick logs nothing and the needs_action transition
+		// (with its retained source) is invisible.
+		{name: "recovery stalled alone", res: workersvc.SweepResult{RecoveryStalled: 1}, attr: "recovery_stalled"},
+		// PRD #1296 D4: a tick that ONLY expires a ready durable-archive capture past its
+		// retention (flipping it to expired and reclaiming its bytes) must raise the line too —
+		// the guard sum AND emit list both include RecoveryExpired, else a retention-only tick
+		// logs nothing and the byte reclamation is invisible.
+		{name: "recovery expired alone", res: workersvc.SweepResult{RecoveryExpired: 1}, attr: "recovery_expired"},
 		{name: "idle tick logs nothing", res: workersvc.SweepResult{}, attr: ""},
 	}
 	for _, tc := range cases {

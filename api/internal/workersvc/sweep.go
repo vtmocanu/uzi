@@ -6,6 +6,7 @@ import (
 	"log/slog"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/autoselectrow"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
@@ -214,6 +215,36 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 	// best-effort sub-steps.
 	if res.CustodyReleased, err = s.ReconcileCustodyReleases(ctx); err != nil {
 		return res, fmt.Errorf("reconcile custody releases: %w", err)
+	}
+
+	// Upload-retry-window sweep (PRD #1296 D3/D4): the LIVE consumer of
+	// UZI_RECOVERY_UPLOAD_RETRY_WINDOW. A reserved capture advances to 'available' within
+	// seconds of a healthy upload, so one still non-terminal (preparing/uploading) past the
+	// window has genuinely stalled — surface it as needs_action so the owner sees a
+	// retain-and-decide artifact. The custody hold is NOT released (needs_action is a
+	// non-releasing state), so the source is RETAINED until capture succeeds or the owner
+	// explicitly discards. Disabled when the window is non-positive, matching the
+	// ChatIdleTimeout/ProposalConfirmStuckTimeout "0 disables" convention above.
+	if s.p.RecoveryUploadRetryWindow > 0 {
+		if res.RecoveryStalled, err = s.q.ExpireStalledUploads(ctx, pgtype.Interval{
+			Microseconds: s.p.RecoveryUploadRetryWindow.Microseconds(), Valid: true,
+		}); err != nil {
+			return res, fmt.Errorf("expire stalled recovery uploads: %w", err)
+		}
+	}
+
+	// Ready-artifact retention sweep (PRD #1296 D4): the LIVE enforcement of
+	// UZI_RECOVERY_READY_RETENTION. Each capture's expires_at is baked in at durable capture
+	// (MarkCaptureReady) from the retention window; this pass flips every 'available' capture
+	// now past its expires_at to 'expired' AND deletes its encrypted chunk rows in one atomic
+	// statement, so a retention-expired artifact stops costing byte storage while its metadata
+	// row stays visible in state 'expired'. Custody is NOT touched — an expired capture whose
+	// hold is still open stays retained per D3. Disabled when the retention is non-positive,
+	// matching the RecoveryUploadRetryWindow "0 disables" guard above.
+	if s.p.RecoveryReadyRetention > 0 {
+		if res.RecoveryExpired, err = s.q.ExpireReadyCaptures(ctx, pgconv.Time(now)); err != nil {
+			return res, fmt.Errorf("expire ready recovery captures: %w", err)
+		}
 	}
 
 	// Bound the in-process persistence-failure tracker (PRD #108 M4). This is the

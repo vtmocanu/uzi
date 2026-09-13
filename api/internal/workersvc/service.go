@@ -460,7 +460,17 @@ type Store interface {
 	ReleaseCustodyHold(ctx context.Context, id uuid.UUID) (int64, error)
 	ReleaseCustodyForRunWorker(ctx context.Context, arg store.ReleaseCustodyForRunWorkerParams) (int64, error)
 	DiscardCaptureForOwner(ctx context.Context, arg store.DiscardCaptureForOwnerParams) (int64, error)
+	// ExpireReadyCaptures is the periodic ready-artifact retention sweep (PRD #1296 D4): it
+	// flips every 'available' capture past its expires_at to 'expired' AND deletes that
+	// capture's encrypted chunk rows in one atomic statement (byte reclamation), keeping the
+	// metadata row in state 'expired'. It NEVER touches custody — an expired capture whose hold
+	// is still open stays retained per D3.
 	ExpireReadyCaptures(ctx context.Context, now pgtype.Timestamptz) (int64, error)
+	// ExpireStalledUploads is the periodic upload-retry-window sweep (PRD #1296 D3/D4): it
+	// flips a capture stuck in a non-terminal upload state (preparing/uploading) past the
+	// UZI_RECOVERY_UPLOAD_RETRY_WINDOW to needs_action WITHOUT releasing its custody hold, so
+	// the source is retained until capture succeeds or the owner explicitly discards.
+	ExpireStalledUploads(ctx context.Context, retryWindow pgtype.Interval) (int64, error)
 	// M4 (D3) cleanup-safety reads: ListReleasableCustodyHolds is the custody-release
 	// reconciler's candidate set (OPEN holds whose release is now warranted but unapplied);
 	// CountOpenCustodyHoldsForWorker backs the DeleteWorker custody guard.
@@ -1033,6 +1043,24 @@ type Params struct {
 	// cancels). recovery_wait_count shapes the curve only. The defaults live in config.go.
 	RunRecoveryParkBase time.Duration
 	RunRecoveryMaxPark  time.Duration
+
+	// RecoveryUploadRetryWindow (PRD #1296 D3/D4, UZI_RECOVERY_UPLOAD_RETRY_WINDOW) is the
+	// durable-archive upload-retry window: a capture reserved but still non-terminal
+	// (preparing/uploading) longer than this has stalled, and the sweep flips it to
+	// needs_action WITHOUT releasing its custody hold (the source is retained). Mirrored from
+	// config. Like ChatIdleTimeout/ProposalConfirmStuckTimeout, a NON-POSITIVE value DISABLES
+	// the sweep (the zero value is the safe off direction, so a Params literal that omits it
+	// simply never runs the pass); the positive default lives in config.go where the env is read.
+	RecoveryUploadRetryWindow time.Duration
+
+	// RecoveryReadyRetention (PRD #1296 D4, UZI_RECOVERY_READY_RETENTION) is the ready-artifact
+	// TTL. The window itself is baked into each capture's expires_at at durable capture
+	// (MarkCaptureReady, from config); this field is the ENFORCEMENT toggle for the periodic
+	// expiry sweep (ExpireReadyCaptures), which flips 'available' captures past their expires_at
+	// to 'expired' AND reclaims their bytes. Like RecoveryUploadRetryWindow above, a NON-POSITIVE
+	// value DISABLES the sweep (the zero value is the safe off direction, so a Params literal that
+	// omits it never runs the pass); the positive default lives in config.go where the env is read.
+	RecoveryReadyRetention time.Duration
 }
 
 // Broadcaster receives run events after they are persisted, for live fan-out to
@@ -4478,6 +4506,21 @@ type SweepResult struct {
 	// normal reap can then delete the worker. Normally 0: the candidate query reads only
 	// stuck holds, a set that is empty on a healthy instance.
 	CustodyReleased int64
+	// RecoveryStalled is the number of durable-archive captures this pass flipped from a
+	// non-terminal upload state (preparing/uploading) to needs_action because they sat past
+	// the UZI_RECOVERY_UPLOAD_RETRY_WINDOW (PRD #1296 D3/D4). The custody hold is NOT released
+	// — the source is retained until capture succeeds or the owner explicitly discards.
+	// Normally 0 (a healthy upload becomes available in seconds), and 0 when the window is
+	// non-positive (the sweep disables the pass).
+	RecoveryStalled int64
+	// RecoveryExpired is the number of durable-archive captures this pass flipped from
+	// 'available' to 'expired' because they sat past their expires_at — the enforcement of the
+	// UZI_RECOVERY_READY_RETENTION window (PRD #1296 D4). The same statement also DELETES those
+	// captures' encrypted chunk rows (byte reclamation); the capture metadata row is kept in
+	// state 'expired'. Custody is never touched (an expired capture whose hold is still open
+	// stays retained per D3). Normally 0, and 0 when the retention is non-positive (the sweep
+	// disables the pass).
+	RecoveryExpired int64
 }
 
 // -------------------------------------------------------------------------

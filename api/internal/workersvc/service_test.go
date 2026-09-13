@@ -499,6 +499,18 @@ type fakeStore struct {
 	releasedCustodyRuns      []uuid.UUID
 	releasedCustodyWorkers   []uuid.UUID
 	releasedCustodyHolds     []uuid.UUID
+	// PRD #1296 D3/D4 upload-retry-window sweep. stalledUploadsRows is what
+	// ExpireStalledUploads reports; expireStalledWindows records every retry_window it was
+	// called with, so a test can prove the sweep passes the configured window AND (by an empty
+	// slice) that a non-positive window disables the call entirely.
+	stalledUploadsRows   int64
+	expireStalledWindows []pgtype.Interval
+	// PRD #1296 D4 ready-artifact retention sweep. expiredCapturesRows is what
+	// ExpireReadyCaptures reports; expireReadyNows records every `now` it was called with, so a
+	// test can prove the sweep runs the expiry pass with a valid clock AND (by an empty slice)
+	// that a non-positive retention disables the call entirely.
+	expiredCapturesRows int64
+	expireReadyNows     []pgtype.Timestamptz
 
 	// Chat (PRD #39).
 	chatClaimRun          store.Run
@@ -1364,6 +1376,14 @@ func (f *fakeStore) ReleaseCustodyForRunWorker(_ context.Context, arg store.Rele
 	f.releasedCustodyRuns = append(f.releasedCustodyRuns, arg.RunID)
 	f.releasedCustodyWorkers = append(f.releasedCustodyWorkers, arg.WorkerID)
 	return f.releaseCustodyRows, nil
+}
+func (f *fakeStore) ExpireStalledUploads(_ context.Context, retryWindow pgtype.Interval) (int64, error) {
+	f.expireStalledWindows = append(f.expireStalledWindows, retryWindow)
+	return f.stalledUploadsRows, nil
+}
+func (f *fakeStore) ExpireReadyCaptures(_ context.Context, now pgtype.Timestamptz) (int64, error) {
+	f.expireReadyNows = append(f.expireReadyNows, now)
+	return f.expiredCapturesRows, nil
 }
 func (f *fakeStore) GetRepoToolProfile(_ context.Context, _ store.GetRepoToolProfileParams) (store.RepoToolProfile, error) {
 	return f.toolProfile, f.toolProfileErr

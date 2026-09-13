@@ -450,6 +450,7 @@ func (h *Handler) recoveryLimits() recovery.Limits {
 		MaxConcurrentUploads:   h.cfg.RecoveryMaxConcurrentUploads,
 		MaxConcurrentDownloads: h.cfg.RecoveryMaxConcurrentDownloads,
 		RequestDeadline:        h.cfg.RecoveryRequestDeadline,
+		UploadRetryWindow:      h.cfg.RecoveryUploadRetryWindow,
 	}
 }
 
