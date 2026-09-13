@@ -36,8 +36,10 @@ reaches a final status. Each retained capture is in one of these six states:
 - **Discarded** — the archive was explicitly discarded and its bytes deleted.
 
 When a run has **no** retained captures at all, the section reports one of
-two whole-section conditions instead of a per-capture state:
+three whole-section conditions instead of a per-capture state:
 
+- **Preparing** — recovery is armed and a custody hold is open, but no
+  capture has been registered yet (the archive is still being produced).
 - **Unsupported / legacy** — the run predates durable recovery (an old
   worker or server never captured anything for it).
 - **Unavailable source** — recovery was armed but nothing needed capturing,
