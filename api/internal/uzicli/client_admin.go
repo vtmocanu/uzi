@@ -2,6 +2,7 @@ package uzicli
 
 import (
 	"context"
+	"net/url"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 )
@@ -103,4 +104,41 @@ func (c *HTTPClient) AdminRateLimits(ctx context.Context) ([]apitypes.AdminRateL
 		return nil, err
 	}
 	return env.Users, nil
+}
+
+// AdminJudgeBacklog reads the admin "All users" aggregate backlog (PRD #1184 M5): GET
+// /api/admin/judge/recommendations. The handler serves an UNENVELOPED JudgeAdminBacklogDTO
+// (httpx.JSON of the DTO directly), so decode straight into it — no {"backlog": …} wrapper,
+// matching the owner JudgeBacklog. bucket and category are omitted when empty (the handler's
+// default branches apply the server defaults) and escaped because both are user input off a
+// flag; there is no ?run= anchor on the admin path.
+func (c *HTTPClient) AdminJudgeBacklog(ctx context.Context, bucket, category string) (apitypes.JudgeAdminBacklogDTO, error) {
+	path := "/api/admin/judge/recommendations"
+	q := url.Values{}
+	if bucket != "" {
+		q.Set("bucket", bucket)
+	}
+	if category != "" {
+		// Forwarded verbatim as the comma-separated `?category=a,b` list the server splits
+		// and validates; the CLI never parses it into labels of its own.
+		q.Set("category", category)
+	}
+	if len(q) > 0 {
+		path += "?" + q.Encode()
+	}
+	var out apitypes.JudgeAdminBacklogDTO
+	if err := c.get(ctx, path, &out); err != nil {
+		return apitypes.JudgeAdminBacklogDTO{}, err
+	}
+	return out, nil
+}
+
+// AdminJudgeStats reads the admin "All users" triage tally (PRD #1184 M5): GET
+// /api/admin/judge/stats. The reply is an unenveloped TriageDTO, exactly like JudgeStats.
+func (c *HTTPClient) AdminJudgeStats(ctx context.Context) (apitypes.TriageDTO, error) {
+	var out apitypes.TriageDTO
+	if err := c.get(ctx, "/api/admin/judge/stats", &out); err != nil {
+		return apitypes.TriageDTO{}, err
+	}
+	return out, nil
 }

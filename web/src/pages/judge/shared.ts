@@ -1,4 +1,4 @@
-import type { JudgeSettledMember } from "../../lib/api";
+import type { JudgeDispositionCoord, JudgeSettledMember } from "../../lib/api";
 
 // A member the page can Undo: the (run, rec) it will clear a disposition on. Taken from the
 // RESPONSE's `settled` list — the members the server actually wrote — never from this page's
@@ -17,6 +17,12 @@ type UndoMember = JudgeSettledMember;
 export type Toast = {
   message: string;
   // The members a bulk action settled; Undo clears each one's disposition. Empty when
-  // there is nothing to undo (e.g. the action matched no open member).
+  // there is nothing to undo (e.g. the action matched no open member). Used by the OWNER
+  // scope, where a disposition has a (run, rec) address.
   undo: UndoMember[];
+  // The admin cross-user Undo (PRD #1184 M4): the coordinates to clear the set_via='admin'
+  // disposition on. Present only under scope="all" — the admin write spans every user's rows
+  // and has NO run address, so its undo is BY COORDINATE, through the admin DELETE endpoint,
+  // not the per-member deleteDisposition loop `undo` drives. Absent/empty under the owner scope.
+  adminUndoCoords?: JudgeDispositionCoord[];
 };

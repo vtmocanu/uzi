@@ -17,6 +17,15 @@ export function requireSession(): User {
   return state.session;
 }
 
+// requireAdmin gates the admin-only routes the way the real API's RequireAdmin does:
+// a session is required first, then admin, else 403 — the same precedent as the
+// { all: true } notifications view and the global-template/skill writes.
+export function requireAdmin(): User {
+  const me = requireSession();
+  if (!me.is_admin) throw new ApiError(403, "admin only");
+  return me;
+}
+
 // Mutable copy of the seed roster (CRUD operates on this). Lives in shared
 // because several domains read it, and keeping it in its own users module would
 // make a settings → users → settings cycle later. Never reassigned.
