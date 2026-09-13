@@ -2,9 +2,9 @@
 
 **Issue:** [#1227](https://github.com/vtmocanu/uzi/issues/1227)
 **Parent epic:** [#1225](https://github.com/vtmocanu/uzi/issues/1225)
-**Status:** Planned, blocked on #1226.
+**Status:** Planned, unblocked. #1226 merged 2026-09-12 (PR #1254, M1-M6 + permit-path fixes); the completion-decision seam is live on `main`.
 **Priority:** High.
-**Execution:** Keep `Planned` without `uzi`. Add `uzi` only after #1226 merges and main CI is green.
+**Execution:** `Planned` + `uzi` (queued for the nightly sweep). Note: #1226 shipped rollout-OFF/inert, so this child extends dormant machinery and is user-visible only once the completion interlock is enabled.
 
 This child extends #1226's single completion-decision path. It does not add semantic auditing or durable cross-worker context. No implementation or validation may modify `.github/workflows/**`.
 
