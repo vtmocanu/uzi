@@ -64,13 +64,14 @@ func TestJudgeClaimCarriesFailureClass(t *testing.T) {
 	})
 }
 
-// TestPreStartInfraFailureSkipsJudge (Decision 12): a failed run at iteration_count == 0
-// whose fail_origin is one of the three pre-start policy/config-denied origins is NOT
-// judged — there is no agent behavior to retrospect, and skipping avoids the most
-// expensive per-run call. The deterministic failure notification is delivered separately
-// by RunFailureNotifier on the same PublishState transition (asserted by trace, not here).
+// TestPreStartInfraFailureSkipsJudge (Decision 12; extended by issue #1308): a failed run
+// at iteration_count == 0 whose fail_origin is a pre-start setup origin — a permanent
+// policy/config denial OR the transient runner_clone_conflict — is NOT judged: there is
+// no agent behavior to retrospect, and skipping avoids the most expensive per-run call.
+// The deterministic failure notification is delivered separately by RunFailureNotifier on
+// the same PublishState transition (asserted by trace, not here).
 func TestPreStartInfraFailureSkipsJudge(t *testing.T) {
-	for _, origin := range []string{"provisioning_failed", "credential_unavailable", "guardrail_blocked"} {
+	for _, origin := range []string{"provisioning_failed", "credential_unavailable", "guardrail_blocked", "runner_clone_conflict"} {
 		t.Run(origin+" at iter 0 is not enqueued", func(t *testing.T) {
 			fs, svc, run := eligibleFixture(t)
 			run.Status = "failed"
