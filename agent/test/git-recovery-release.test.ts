@@ -211,4 +211,39 @@ describe("reclaimTerminalRecoveryClone (issue #1308 m2 self-heal primitive)", ()
       fs.rmSync(outsidePath, { recursive: true, force: true });
     }
   });
+
+  it("never follows a runner-planted ANCESTOR symlink out of the runner root, even for a lexically-inside path; the sentinel survives and the journal is still cleared", async () => {
+    const bare = await git.ensureClone(fx.originPath);
+    const branch = "agent/issue-9006";
+    const owner = "20000000-0000-4000-8000-000000000004";
+    // An OUTSIDE sentinel directory the reclaim delete must never reach. The sentinel file sits
+    // at <outside>/clone/... so that following the planted symlink resolves the journalled delete
+    // target ONTO real content — a purely lexical guard would actually destroy it.
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-recover-symlink-outside-"));
+    const sentinelDir = path.join(outside, "clone");
+    const sentinel = path.join(sentinelDir, "sentinel.txt");
+    try {
+      fs.mkdirSync(sentinelDir, { recursive: true });
+      fs.writeFileSync(sentinel, "must survive\n");
+      // A REAL repo dir inside the runner root, and under it an ANCESTOR symlink pointing at the
+      // outside sentinel dir — the group-writable-parent vector the on-disk guard exists for. The
+      // journalled clone path (runner/<repoDir>/<symlink>/clone) is LEXICALLY inside runnerRoot,
+      // so a purely lexical guard would follow the link and delete <outside>/clone (the sentinel).
+      const runnerRoot = path.join(fx.dataDir, "runner");
+      const repoDir = path.join(runnerRoot, "reclaim-symlink");
+      fs.mkdirSync(repoDir, { recursive: true });
+      const symlinkedAncestor = path.join(repoDir, "evil");
+      fs.symlinkSync(outside, symlinkedAncestor);
+      const journalledClone = path.join(symlinkedAncestor, "clone");
+      await git.markRecoveryCapture(bare, journalledClone, branch, owner);
+
+      await git.reclaimTerminalRecoveryClone(bare, branch, owner, journalledClone);
+
+      assert.strictEqual(fs.existsSync(sentinel), true, "a symlinked ancestor must not be followed out of the runner root");
+      assert.strictEqual(fs.existsSync(sentinelDir), true, "the outside sentinel tree survives entirely");
+      assertJournalCleared(bare, branch, "the journal is still released — the symlink guard gates the DELETE, not the clear");
+    } finally {
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
 });

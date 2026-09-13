@@ -4923,6 +4923,19 @@ export class RunRunner {
       });
       return false;
     }
+    // issue #1308 — the getRunOwnership probe above awaited, yielding the event loop; if the
+    // owner registered into activeRuns during that window it is live locally, so its journal
+    // is not stale. Fail closed rather than delete a now-active owner's retained clone. (The
+    // deeper invariant — a terminal run cannot re-enter activeRuns, since no status transition
+    // leaves the terminal set — makes this window unreachable in practice; this is defense in
+    // depth, mirroring the pre-probe guard above.)
+    if (this.activeRuns.has(err.pendingRunId)) {
+      this.log.warn("runner clone conflict: owner run became active during the ownership probe; not reclaiming", {
+        owner_run_id: err.pendingRunId,
+        branch: err.branch,
+      });
+      return false;
+    }
     this.log.info("runner clone conflict: reclaiming a terminal owner's stale recovery residue", {
       owner_run_id: err.pendingRunId,
       owner_status: status,

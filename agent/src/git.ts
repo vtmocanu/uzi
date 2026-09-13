@@ -1452,7 +1452,7 @@ export class GitCache {
       if (pending?.runId !== ownerRunId || pending?.clonePath !== ownerClonePath) {
         return;
       }
-      if (this.isInsideRunnerRoot(ownerClonePath)) {
+      if (await this.resolvesInsideRunnerRoot(ownerClonePath)) {
         await this.removeRunnerClone(ownerClonePath).catch((e) =>
           this.log.warn("reclaim: best-effort delete of terminal owner clone failed", {
             clone: ownerClonePath,
@@ -1468,13 +1468,45 @@ export class GitCache {
     });
   }
 
-  /** issue #1308 — true iff `p` resolves to a location strictly inside `this.runnerRoot`.
-   *  Guards the reclaim delete so a journal recording a path outside the runner root (a bug
-   *  or tampering) is never deleted. `path.relative` rejects `..` escapes and absolute
-   *  re-roots; the empty-relative (the root itself) is also rejected. */
-  private isInsideRunnerRoot(p: string): boolean {
-    const rel = path.relative(this.runnerRoot, path.resolve(p));
-    return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
+  /** issue #1308 — resolves true iff `p` resolves to a location strictly inside
+   *  `this.runnerRoot`, with no runner-planted symlink on the way. Guards the reclaim delete:
+   *  `/data/runner` (= `this.runnerRoot`) is `worker:runner` mode 2775 setgid group-write and
+   *  the clone's parent dir is group-`runner`-writable, so a runner CAN replace an in-root
+   *  ancestor (or the leaf) with a symlink pointing outside runnerRoot and steer the worker-uid
+   *  `fs.rm` off the tree. A purely LEXICAL containment check cannot see that, so this walks the
+   *  on-disk shape, cheapest layer first:
+   *    1. lexical pre-reject — `path.relative` rejects `..` escapes, absolute re-roots, and the
+   *       empty-relative (the root itself);
+   *    2. `lstat` each accumulated path component from runnerRoot down to the leaf, rejecting a
+   *       component that does NOT exist (ENOENT — a broken/missing recorded path is nothing we can
+   *       safely delete) or that IS a symlink (a runner-planted ancestor/leaf must not be followed);
+   *    3. a realpath-vs-realpath final check — the real parent of `p` must still be inside the real
+   *       runnerRoot. Both sides are realpath'd so a symlinked prefix on runnerRoot itself does not
+   *       cause a false negative. Any realpath error fails closed (false).
+   *
+   *  RESIDUAL, stated honestly: a mid-walk TOCTOU swap of an intermediate directory for a symlink
+   *  by the SAME (runner) uid, between this check and the `fs.rm`, is NOT preventable in Node —
+   *  there is no `openat` (see rmtree.ts:80-87), so a fully race-free no-follow delete is
+   *  impossible. This guard rejects symlinked ancestors and paths that resolve outside runnerRoot
+   *  AT CHECK TIME; the delete stays best-effort and the journal-clear is decoupled from it. */
+  private async resolvesInsideRunnerRoot(p: string): Promise<boolean> {
+    const abs = path.resolve(p);
+    const rel = path.relative(this.runnerRoot, abs);
+    if (rel === "" || rel.startsWith("..") || path.isAbsolute(rel)) return false;
+    try {
+      let acc = this.runnerRoot;
+      for (const segment of rel.split(path.sep)) {
+        acc = path.join(acc, segment);
+        const st = await fs.lstat(acc);
+        if (st.isSymbolicLink()) return false;
+      }
+      const realRoot = await fs.realpath(this.runnerRoot);
+      const realParent = await fs.realpath(path.dirname(abs));
+      const relParent = path.relative(realRoot, realParent);
+      return !relParent.startsWith("..") && !path.isAbsolute(relParent);
+    } catch {
+      return false;
+    }
   }
 
   private async readRecoveryCapture(barePath: string, branch: string): Promise<{ runId: string; clonePath: string } | undefined> {

@@ -7,6 +7,7 @@ import { type ExecutorFactory } from "../src/runner.js";
 import { recordingLogger } from "./helpers.js";
 import {
   api,
+  client,
   deferred,
   fakeGitlab,
   fx,
@@ -321,5 +322,66 @@ describe("cross-run clone-conflict self-heal (issue #1308 m2/m3)", () => {
       releaseOwner.resolve();
       await ownerExecution;
     }
+  });
+
+  it("(case 12) an owner that registers into activeRuns DURING the ownership probe is not reclaimed — the post-probe re-check fails closed", async () => {
+    const iid = 9217;
+    const ownerRunId = "30000000-0000-4000-8000-000000000014";
+    const { bare, branch, clonePath } = await seedStaleOwnerJournal(iid, ownerRunId);
+    // The server row already reads terminal — the ONLY thing that must stop the reclaim is the
+    // owner landing in this worker's local activeRuns between the pre-probe guard and the
+    // probe's return.
+    api.setOwnershipStatus(ownerRunId, "completed");
+    const reclaim = spyReclaim();
+    const { logger, lines } = recordingLogger();
+
+    let modelStarted = false;
+    const claim = gitlabClaim(iid);
+    const { gitlab } = fakeGitlab();
+    const runner = runnerWith(modelReachedFactory(claim.run_id, () => { modelStarted = true; }), gitlab, undefined, logger);
+
+    // The getRunOwnership probe awaits, yielding the event loop; model the owner registering
+    // during that window by inserting it into the runner's activeRuns exactly when the probe
+    // is called. The owner is ABSENT before this fires, so the pre-probe guard passes and the
+    // post-probe re-check is the guard under test.
+    let probeCalls = 0;
+    const originalProbe = client.getRunOwnership.bind(client);
+    client.getRunOwnership = (async (runId: string) => {
+      probeCalls++;
+      (runner as unknown as {
+        activeRuns: Map<string, { cancel: AbortController; shuttingDown: boolean }>;
+      }).activeRuns.set(ownerRunId, { cancel: new AbortController(), shuttingDown: false });
+      return originalProbe(runId);
+    }) as typeof client.getRunOwnership;
+
+    await runner.execute(claim);
+
+    assert.strictEqual(probeCalls, 1, "the ownership probe fired exactly once");
+    assert.strictEqual(reclaim.calls.length, 0, "an owner that became active during the probe must not be reclaimed");
+    assert.strictEqual(modelStarted, false, "the challenger fails closed, never reaching the model");
+    assert.strictEqual(
+      fs.existsSync(path.join(clonePath, "OWNER_MARKER.txt")),
+      true,
+      "the now-active owner's clone is untouched",
+    );
+    const failed = failedStateFor(claim.run_id);
+    assert.ok(failed, "the challenger run fails");
+    assert.strictEqual(failed!.fail_origin, "runner_clone_conflict");
+    assert.deepStrictEqual(
+      JSON.parse(readJournalRaw(bare, branch)!),
+      { runId: ownerRunId, clonePath },
+      "the journal is unchanged",
+    );
+    assert.ok(
+      lines.some((l) => {
+        const r = l as { level?: string; msg?: string; owner_run_id?: string };
+        return (
+          r.level === "warn" &&
+          r.msg === "runner clone conflict: owner run became active during the ownership probe; not reclaiming" &&
+          r.owner_run_id === ownerRunId
+        );
+      }),
+      "the post-probe re-check guard must fire and be observable, naming the correct owner",
+    );
   });
 });
