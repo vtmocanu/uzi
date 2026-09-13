@@ -239,6 +239,53 @@ func TestDeleteRepoCascadesAndSpareSiblingLiveDB(t *testing.T) {
 	_ = siblingRun
 }
 
+// (e2) PRD #1296 M4 (D3) repo-delete custody guard: a DISABLED repo whose (terminal)
+// run still holds an OPEN custody hold → 409 with an enumerated count, and the row
+// survives — the enumerated refusal that forces an explicit discard decision before the
+// last local recovery source is destroyed. Without the guard the runs.repo_id cascade
+// would hit the hold's live_run_id ON DELETE RESTRICT FK and error mid-cascade. The run
+// is FAILED (terminal), so the active-run guard passes first and the 409 is specifically
+// the custody guard — proven by releasing the hold and re-deleting to a clean 204.
+func TestDeleteRepoWithOpenCustodyIs409LiveDB(t *testing.T) {
+	_, router, pool := cliLiveDB(t)
+	owner := cliSeedUser(t, pool, false)
+	jwt := cliMintJWT(t, pool, owner)
+	connID := rmSeedConn(t, pool, owner)
+	repoID := rmSeedRepo(t, pool, connID, 211, false)
+	runID := rmSeedRun(t, pool, owner, repoID, "failed") // terminal → active-run guard passes
+
+	// An OPEN custody hold on the repo's run (live_run_id set → the cascade would RESTRICT).
+	holdID := uuid.New()
+	cliMustExec(t, pool,
+		`INSERT INTO recovery_custody_holds
+		   (id, user_id, repo_id, run_id, generation, state,
+		    original_worker_id, original_worker_identity, live_run_id)
+		 VALUES ($1, $2, $3, $4, 1, 'open', $5, 'ident', $4)`,
+		holdID, owner, repoID, runID, uuid.New())
+
+	rec := cookieReq(t, router, http.MethodDelete, "/api/repos/"+repoID.String(), jwt, "")
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("DELETE repo with open custody = %d, want 409\nbody: %s", rec.Code, rec.Body.String())
+	}
+	if !rmRepoExists(t, pool, repoID) {
+		t.Errorf("a repo retaining unpublished work refused with 409 must survive")
+	}
+
+	// Release the hold → the guard clears and the delete succeeds (204), proving the 409
+	// was specifically the custody guard, not the disabled state or the terminal run.
+	// Releasing nulls the live FKs alongside the state flip, exactly as the custody-release
+	// queries do — dropping the ON DELETE RESTRICT that would otherwise block the cascade.
+	cliMustExec(t, pool,
+		`UPDATE recovery_custody_holds SET state = 'released', live_run_id = NULL, live_worker_id = NULL WHERE id = $1`, holdID)
+	rec = cookieReq(t, router, http.MethodDelete, "/api/repos/"+repoID.String(), jwt, "")
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("DELETE repo after custody release = %d, want 204\nbody: %s", rec.Code, rec.Body.String())
+	}
+	if rmRepoExists(t, pool, repoID) {
+		t.Errorf("the repo row must be gone after the custody-cleared 204")
+	}
+}
+
 // (f) Differential auth (the mis-mount guard, issue #428). A valid uzc_ Bearer with
 // NO cookie hitting DELETE /api/repos/{id} gets the REAL 204 (disabled) / 409
 // (enabled) / 404 (foreign) — proving the route is on the RequireUser mount, since a

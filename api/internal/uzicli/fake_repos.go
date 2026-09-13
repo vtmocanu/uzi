@@ -16,6 +16,7 @@ func (f *FakeClient) ListWorkers(context.Context) ([]apitypes.WorkerDTO, error) 
 }
 
 func (f *FakeClient) DeleteWorker(_ context.Context, id string) error {
+	f.DeleteWorkerCalls++
 	f.LastDeletedWorkerID = id
 	return f.Err
 }

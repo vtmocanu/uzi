@@ -301,6 +301,14 @@ func run() error {
 		// per-run cap — a park always becomes promotable again.
 		RunRecoveryParkBase: cfg.RunRecoveryParkBase,
 		RunRecoveryMaxPark:  cfg.RunRecoveryMaxPark,
+		// PRD #1296 D3/D4 durable-archive upload-retry window: the sweep flips a capture stuck
+		// in a non-terminal upload state past this to needs_action WITHOUT releasing its
+		// custody hold (source retained). Non-positive disables the pass.
+		RecoveryUploadRetryWindow: cfg.RecoveryUploadRetryWindow,
+		// PRD #1296 D4 ready-artifact retention: the enforcement toggle for the expiry sweep,
+		// which flips 'available' captures past their (capture-time-set) expires_at to 'expired'
+		// AND reclaims their bytes. Non-positive disables the pass.
+		RecoveryReadyRetention: cfg.RecoveryReadyRetention,
 	})
 
 	// Plan-approval gatekeeper (PRD #25 M4): handles the Slack Approve / Reject /

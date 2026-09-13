@@ -72,6 +72,7 @@ import type {
   PrivilegeReport,
   ProjectSyncOwnerKind,
   ProjectSyncStatus,
+  RecoveryArchiveSummary,
   ReleaseCheckStatus,
   Repo,
   Run,
@@ -164,6 +165,18 @@ export function preferForgeUrl(
   legacy: string | null,
 ): string | null {
   return isHttpsUrl(persisted) ? persisted! : legacy;
+}
+
+// runArchiveDownloadUrl builds the same-origin attachment URL for one recovery
+// capture's bytes (PRD #1296 M5, D6/D7). The download is NOT a request() call:
+// request() is JSON-only, and the archive is an opaque binary Git bundle the server
+// streams with Content-Disposition: attachment + Cache-Control: private, no-store +
+// X-Content-Type-Options: nosniff. An <a href> to this path is a same-origin GET, so
+// the browser sends the HttpOnly session cookie automatically and a GET needs no CSRF
+// header. No presigned/public URL is ever minted — the RequireUser + owner-only
+// GetRun gate on the server is the sole authorization, evaluated per download.
+export function runArchiveDownloadUrl(runId: string, captureId: string): string {
+  return `/api/runs/${encodeURIComponent(runId)}/archives/${encodeURIComponent(captureId)}/download`;
 }
 
 // ApiError moved to the ./apiError leaf module to break the api → mockApi → api
@@ -1003,6 +1016,15 @@ const realApi = {
   // non-owner (incl. admin_ro) gets 404, which the caller treats as "no queue".
   getRunInputs: (id: string) =>
     request<{ inputs: SteerInput[] }>("GET", `/runs/${id}/inputs`),
+  // Durable run recovery (PRD #1296 M5, D6/D7): the owner-scoped recovery aggregate for
+  // a run — supported/legacy, the open-hold pending signal, per-state counts, and every
+  // retained capture's metadata (never raw bytes). Owner-only, like getRunInputs above:
+  // a non-owner (incl. admin) gets 404, which the recovery section treats as "no
+  // recovery data" and renders nothing. The DOWNLOAD of a capture's bytes does NOT go
+  // through request() (which is JSON-only) — it is an authenticated same-origin
+  // attachment link, see runArchiveDownloadUrl.
+  getRunArchives: (id: string) =>
+    request<RecoveryArchiveSummary>("GET", `/runs/${id}/archives`),
   // A follow_up write returns the created row's id + created_at (PRD #95 S2) so the
   // web's optimistic queue entry adopts the real id and reconciles; other kinds omit
   // them (they are server-side or own their own UI). Both fields optional on the wire.

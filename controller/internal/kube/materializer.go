@@ -624,6 +624,22 @@ func (m *Materializer) recycleWorkerVolumes(ctx context.Context, w protocol.Desi
 		return nil
 	}
 
+	// Custody guard (PRD #1296 D3), INDEPENDENT of rollDespiteBusy above. A worker
+	// holding unpublished committed work under a durable-recovery custody hold must
+	// never have its /data PVC discarded — not by ForceRoll, and not by an elapsed
+	// drain deadline. "ForceRoll may replace a pod/image while retaining data, but is
+	// NOT consent to discard a custody-held PVC" (only an explicit recovery discard or
+	// forced external destruction crosses that boundary). So we drop ONLY /data from
+	// this recycle rather than deferring the whole thing: /nix is a re-seedable cache
+	// and the pod may still roll, but the custody-held data volume is preserved. The
+	// disk-pressure call site additionally skips this whole arm for a held worker; this
+	// stays as a DEFENSIVE floor for any caller that passes Data:true, so the sacrosanct
+	// volume is protected inside the shared destruction path itself, not only at a caller.
+	if vols.Data && w.CustodyHeld {
+		m.log.Info("hosted worker holds a durable-recovery custody hold; retaining unpublished work; deferring /data recycle (a pod/nix roll may still proceed)", "worker_id", w.ID)
+		vols.Data = false
+	}
+
 	var errs []error
 
 	// Phase 1: delete the Deployment so no pod mounts the volume while it is being
@@ -743,11 +759,20 @@ func (m *Materializer) reconcileWorker(ctx context.Context, w protocol.DesiredWo
 	// M4: disk-pressure recycle (nix + data). Ephemeral (run-bound) workers excluded.
 	// Within-cooldown = a just-recycled worker back at pressure = a CAPACITY signal, surfaced
 	// via a fixed token, NOT recycled again. Otherwise drain-then-recycle both volumes.
+	// PRD #1296 D3: a custody-held worker is ALSO excluded (effectively `&& !w.CustodyHeld`)
+	// — its /data may hold unpublished committed work, and disk pressure is never consent to
+	// discard it. It falls through to normal reconcile (like the cooldown case) with a fixed
+	// deferral token, rather than recycling. recycleWorkerVolumes itself also refuses to drop
+	// a held /data volume, so this arm is doubly guarded.
 	if m.recycle.Enabled && w.DiskPressure && !w.Ephemeral {
-		if m.withinRecycleCooldown(obs) {
+		switch {
+		case w.CustodyHeld:
+			m.log.Info(fmt.Sprintf("disk-recycle-skipped-custody worker=%s", w.ID))
+			// custody protects unpublished work: fall through to normal reconcile; do NOT recycle.
+		case m.withinRecycleCooldown(obs):
 			m.log.Info(fmt.Sprintf("disk-recycle-skipped-cooldown worker=%s", w.ID))
 			// display-only capacity-warn: fall through to normal reconcile; do NOT return.
-		} else {
+		default:
 			return m.recycleWorkerVolumes(ctx, w, obs, ns, recycleVolumes{Nix: true, Data: true})
 		}
 	}
@@ -930,13 +955,24 @@ func patchFor(dep *appsv1.Deployment) ([]byte, error) {
 // the name is derived from the worker id we recovered off the Deployment/PVC
 // labels, so no enumeration — and therefore no read — is ever needed.
 //
-// Safe by construction even though a hosted worker's volumes are destroyed here:
-// /nix is a cache (re-seedable from the image), /data is the clone cache plus
-// per-run workspaces (the forge holds the durable output — branch and MR — and runs
-// are tracked in the DB and requeued), the dind data root is the daemon's image and
-// build cache (re-pullable, and none of it worker state — issue #224 M-a), and a
-// worker whose row is gone has no workers.token_hash, so its pod cannot
-// authenticate and is already dead weight.
+// Safe by construction even though a hosted worker's volumes are destroyed here —
+// but NOT because "the forge holds the durable output". Since PRD #1296 (durable
+// run recovery), /data can hold UNPUBLISHED committed work: a run may commit useful
+// history and then fail before publishing its head, so the forge does not always
+// hold it. What makes THIS teardown safe is an UPSTREAM interlock, not the local
+// volume contents. The api refuses to drop a custody-held worker from the desired
+// set (M4a puts that predicate inside both DeleteEphemeralWorkerForRun and
+// ReapEphemeralWorkers), so a still-held worker stays desired and this teardown pass
+// — which runs ONLY over workers the api has already removed from the desired set —
+// never reaches one. By the time teardown() sees a worker, the api has released its
+// custody (durable capture succeeded, the run produced nothing to archive, or the
+// owner explicitly discarded) and removed its row. /nix is a re-seedable cache
+// (from the image), the dind data root is the daemon's re-pullable image and build
+// cache (none of it worker state — issue #224 M-a), and a worker whose row is gone
+// has no workers.token_hash, so its pod cannot authenticate and is already dead
+// weight. (The recycle path CAN run for a still-DESIRED worker, so it honors
+// CustodyHeld directly rather than relying on this interlock; see recycleWorkerVolumes
+// and the disk-pressure arm.)
 //
 // The dind claim is deleted UNCONDITIONALLY, not behind a docker check, and that is
 // the only correct shape: teardown runs against a worker the api has DROPPED, so its

@@ -104,6 +104,7 @@ uzi run answer <id> [--message <text> ...]
 uzi run inputs <id> [--json]
 uzi run expedite <id> [--clear]
 uzi run rework <id> [-m|--message <text>]
+uzi run export <id> --output <path> [--capture <id>]
 uzi schedule create --repo <id> [--repo <id> ...] (--issue <iid> | --sweep [--label <l> ...] [--create-missing-labels] | --prompt <text>)
                     (--at <rfc3339> | --cron <expr>) [--tz <iana>]
                     [--auto-approve[=false]] [--wait-on-limit[=false]]
@@ -672,6 +673,46 @@ A few worth knowing:
   credential (its stored URL is left intact, so a later re-login needs no
   re-typed URL); it does **not** revoke it server-side (see
   [Managing tokens](#managing-tokens) below).
+
+## Recovering unpublished work: `uzi run export`
+
+When a run commits useful work but then fails to publish its head (a workflow or
+secret preflight, a rejected push, exhausted base alignment), uzi captures the run's
+original committed history into a durable, owner-only recovery archive — a real Git
+bundle that imports into a fresh clone even after the worker and its disk are gone.
+`uzi run export` downloads that archive to a local file:
+
+```
+uzi run export <run-id> --output ./recovered.bundle
+```
+
+- **Owner-only.** You can export only your own runs; an admin viewing someone else's
+  run is refused. The download reaches the API directly — no contact with the worker,
+  which may no longer exist.
+- **Explicit capture selection.** A run can retain more than one capture. When more
+  than one is *available*, export refuses to guess: it exits with a usage error listing
+  every capture's id and state, and you re-run with `--capture <id>`. It never silently
+  picks a different attempt. When exactly one is available it is used automatically. A
+  capture that is not in the `available` state (still preparing/uploading, `needs_action`,
+  `expired` or discarded) is refused with its honest state rather than downloaded.
+- **Verified, atomic, no-clobber writes.** The download is streamed into a private
+  `0600` temp file, its byte count and checksum are verified against the server manifest,
+  and only then is the destination created — by an atomic link that **refuses to overwrite
+  an existing file or symlink** at `--output`. The final file only ever appears
+  fully-formed and verified.
+- **Nonzero exit, no partial file, on failure.** An interrupted, corrupt or expired
+  download exits nonzero and leaves **no file** at the destination, so a truncated
+  bundle is never mistaken for a complete one.
+- **Review before you publish.** The archive is the run's *original* committed history
+  and may contain secrets. Review it before publishing anywhere; a real credential must
+  be revoked/rotated and removed from the affected history. No raw bytes are ever printed
+  to stdout — `--json` prints the metadata result only (`capture_id`, `output`,
+  `byte_size`, `checksum`, `source_sha`, `verified`).
+
+`uzi run get` also shows a metadata-only recovery summary for a terminal run that has
+captures (the archive count, per-state tally, and each available capture's id) so you
+know what `--capture` can fetch. It is metadata only and never claims an archive is
+available when it is not.
 
 ## uzi handoff: ephemeral branch-scoped task runs
 

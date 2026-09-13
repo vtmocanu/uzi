@@ -43,6 +43,7 @@ import { useNow } from "../lib/rateLimits";
 import { hasTemplateDrift } from "../lib/workerTemplates";
 import { WorkerRunBadge } from "../components/WorkerRunBadge";
 import { WorkerCordonBadge } from "../components/WorkerCordonBadge";
+import { WorkerCustodyBadge } from "../components/WorkerCustodyBadge";
 import { RunHealthBadge } from "../components/RunHealthBadge";
 import { JudgeRunBadge } from "../components/JudgeRunBadge";
 import { RunCredential } from "../components/RunCredential";
@@ -690,6 +691,7 @@ export function RunsList() {
                       </Badge>
                       <WorkerCordonBadge worker={w} />
                       <WorkerRunBadge worker={w} />
+                      <WorkerCustodyBadge worker={w} />
                     </div>
                   </li>
                 ))}

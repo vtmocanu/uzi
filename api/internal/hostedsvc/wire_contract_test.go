@@ -48,7 +48,11 @@ func samplePollResponse() PollResponse {
 			// Docker/Busy above.
 			DiskPressure: true,
 			Ephemeral:    false,
-			JoinToken:    &token,
+			// CustodyHeld true here, false on the second worker: both states of the new
+			// PRD #1296 M1 field ride one wire so a drop on either side reddens, the same
+			// both-states rationale as Docker/Busy/DiskPressure above.
+			CustodyHeld: true,
+			JoinToken:   &token,
 		},
 		{
 			ID:         "22222222-2222-2222-2222-222222222222",
@@ -68,6 +72,9 @@ func samplePollResponse() PollResponse {
 			// states of both M4 fields appear on one wire (PRD #837 M4).
 			DiskPressure: false,
 			Ephemeral:    true,
+			// CustodyHeld false: the mirror of the first worker, so both states of the
+			// PRD #1296 M1 field appear on one wire.
+			CustodyHeld: false,
 			// No token to write: a pod already proved it holds one (its plaintext
 			// lives only in the cluster Secret now), or the buffer expired unread.
 			JoinToken: nil,

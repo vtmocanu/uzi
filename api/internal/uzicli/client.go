@@ -546,6 +546,26 @@ type Client interface {
 	// whose latest cached pipeline is not failed (or has no cached pipeline) is a 409 →
 	// ExitConflict (5); a foreign/unknown repo is a 404 (exit 4).
 	CreateCIFixRun(ctx context.Context, repoID, ref string) (apitypes.RunDTO, error)
+	// RecoveryArchives returns a run's owner-scoped durable-recovery summary — metadata
+	// ONLY, never raw bytes (PRD #1296 D6/D7): GET /api/runs/{id}/archives. RequireUser
+	// and strict owner-or-404 server-side (an admin viewing a foreign run is refused,
+	// mirroring ListRunInputs), so a uzc_/uza_ CLI token reaches its OWN runs and nobody
+	// else's. A run with no captures returns a zero-value summary (Supported=false,
+	// Archives=[]), which the run-detail summary renders as an honest "none/unsupported"
+	// rather than a false claim of an available archive.
+	RecoveryArchives(ctx context.Context, runID string) (apitypes.RecoveryArchiveSummaryDTO, error)
+	// DownloadRecoveryArchive streams ONE owner-owned capture's decrypted bundle bytes to
+	// w and returns the number of bytes written (PRD #1296 D4/D7): GET
+	// /api/runs/{id}/archives/{captureID}/download. It is deliberately NOT built on the
+	// JSON read path (doJSONRead caps at 32 MiB and JSON-decodes — unusable for a 64 MiB
+	// binary): it streams straight from the response body through io.Copy, so neither the
+	// client nor the caller buffers a whole bundle. A non-2xx status is mapped to the
+	// documented exit code BEFORE any byte reaches w (a 409 expired/unavailable → exit 5, a
+	// 404 → exit 4); a mid-stream transport failure returns the bytes-so-far and an
+	// ExitUnreachable error, so the caller detects the short read and refuses to publish a
+	// partial file. The Bearer credential rides through the same credentialSafeBase guard
+	// every other request uses, so a plaintext base URL is refused before the token leaves.
+	DownloadRecoveryArchive(ctx context.Context, runID, captureID string, w io.Writer) (int64, error)
 }
 
 // ProjectSyncStatus mirrors the handler's getGithubProjectSyncStatusResponse JSON

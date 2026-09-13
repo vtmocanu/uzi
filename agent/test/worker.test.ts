@@ -19,6 +19,13 @@ const noJudge = { execute: async () => {} } as unknown as JudgeRunner;
 // claim with review_target_run_id set); the review lane has its own test file.
 const noReview = { execute: async () => {} } as unknown as ReviewRunner;
 
+// PRD #1296 M3: after registering, worker.run() calls runner.resumePendingRecoveries()
+// once (the restart-safe recovery sweep). The stub RunRunners below are cast from partial
+// literals, so this no-op field keeps that call from throwing on a fake that only defines
+// `execute`. It never asserts anything — the resume sweep has its own coverage in the
+// recovery-coordinator / producer tests.
+const noResumeRecoveries = { resumePendingRecoveries: async () => {} };
+
 // PRD #92 M3: the real boot toolchain preflight would fail on this (non-image) test host
 // (no /opt/uzi-toolchain, no baked go/gcc on PATH), so the concurrency/semaphore tests
 // inject a passing preflight; the dedicated preflight-gate test below drives a failing one.
@@ -56,6 +63,7 @@ function parkingRunRunner(release: AbortSignal, hooks: {
   let active = 0;
   let peak = 0;
   const runner = {
+    ...noResumeRecoveries,
     execute: async (claim: ClaimResponse) => {
       active++;
       peak = Math.max(peak, active);
@@ -119,6 +127,7 @@ describe("Worker — concurrent run + chat lanes (Decision 4)", () => {
 
     const { logger } = recordingLogger(); // shared across both lanes
     const runRunner = {
+      ...noResumeRecoveries,
       execute: async () => {
         events.push("run:start");
         logger.addSecret("run-secret-000000"); // concurrent shared-registry mutation
@@ -180,7 +189,7 @@ describe("Worker — concurrent run + chat lanes (Decision 4)", () => {
         active--;
       },
     } as unknown as ChatRunner;
-    const runRunner = { execute: async () => {} } as unknown as RunRunner;
+    const runRunner = { ...noResumeRecoveries, execute: async () => {} } as unknown as RunRunner;
 
     const worker = new Worker(fakeConfig({ chatSessions: 2 }), client, runRunner, chatRunner, noJudge,
       noReview, recordingLogger().logger, okPreflight);
@@ -211,7 +220,7 @@ describe("Worker — heartbeat carries a resource sample (PRD #49 M1)", () => {
       claimChat: async (): Promise<ChatClaimResponse | null> => null,
     } as unknown as WorkerClient;
 
-    const worker = new Worker(fakeConfig(), client, { execute: async () => {} } as unknown as RunRunner, {} as unknown as ChatRunner, noJudge,
+    const worker = new Worker(fakeConfig(), client, { ...noResumeRecoveries, execute: async () => {} } as unknown as RunRunner, {} as unknown as ChatRunner, noJudge,
       noReview, recordingLogger().logger, okPreflight);
     const done = worker.run(controller.signal);
     for (let i = 0; i < 500 && seen.length === 0; i++) await tick();
@@ -329,6 +338,7 @@ describe("Worker — RUN lane slot semaphore (PRD #42 M2)", () => {
       claimChat: async (): Promise<ChatClaimResponse | null> => null,
     } as unknown as WorkerClient;
     const runner = {
+      ...noResumeRecoveries,
       execute: async (claim: ClaimResponse) => {
         executed.push(claim.run_id);
         if (claim.run_id === "throws") throw new Error("execute boom");
@@ -376,6 +386,7 @@ describe("Worker — RUN lane slot semaphore (PRD #42 M2)", () => {
     // run-2 runs to completion on the second slot alongside it.
     let run2Done = false;
     const runner = {
+      ...noResumeRecoveries,
       execute: async (claim: ClaimResponse) => {
         order.push(`start:${claim.run_id}`);
         if (claim.run_id === "run-1") {
@@ -474,7 +485,7 @@ describe("Worker — boot toolchain preflight gate (PRD #92 M3)", () => {
     const worker = new Worker(
       fakeConfig(),
       client,
-      { execute: async () => {} } as unknown as RunRunner,
+      { ...noResumeRecoveries, execute: async () => {} } as unknown as RunRunner,
       {} as unknown as ChatRunner,
       noJudge,
       noReview,
@@ -506,7 +517,7 @@ describe("Worker — boot toolchain preflight gate (PRD #92 M3)", () => {
     const worker = new Worker(
       fakeConfig(),
       client,
-      { execute: async () => {} } as unknown as RunRunner,
+      { ...noResumeRecoveries, execute: async () => {} } as unknown as RunRunner,
       {} as unknown as ChatRunner,
       noJudge,
       noReview,
@@ -543,7 +554,7 @@ describe("Worker — register auth-rejection classification (issue #109)", () =>
       const worker = new Worker(
         fakeConfig(),
         client,
-        { execute: async () => {} } as unknown as RunRunner,
+        { ...noResumeRecoveries, execute: async () => {} } as unknown as RunRunner,
         {} as unknown as ChatRunner,
         noJudge,
       noReview,
@@ -578,7 +589,7 @@ describe("Worker — register auth-rejection classification (issue #109)", () =>
     const worker = new Worker(
       fakeConfig(),
       client,
-      { execute: async () => {} } as unknown as RunRunner,
+      { ...noResumeRecoveries, execute: async () => {} } as unknown as RunRunner,
       {} as unknown as ChatRunner,
       noJudge,
       noReview,
@@ -615,7 +626,7 @@ describe("Worker — register auth-rejection classification (issue #109)", () =>
     const worker = new Worker(
       fakeConfig(),
       client,
-      { execute: async () => {} } as unknown as RunRunner,
+      { ...noResumeRecoveries, execute: async () => {} } as unknown as RunRunner,
       {} as unknown as ChatRunner,
       noJudge,
       noReview,
@@ -654,7 +665,7 @@ describe("Worker — diff-review dispatch (PRD #400 M4b)", () => {
       claimChat: async (): Promise<ChatClaimResponse | null> => null,
     } as unknown as WorkerClient;
 
-    const runRunner = { execute: async () => { routed.push("runner"); } } as unknown as RunRunner;
+    const runRunner = { ...noResumeRecoveries, execute: async () => { routed.push("runner"); } } as unknown as RunRunner;
     const judgeRunner = { execute: async () => { routed.push("judge"); } } as unknown as JudgeRunner;
     const reviewRunner = { execute: async (c: ClaimResponse) => { routed.push(`review:${c.review_target_run_id}`); } } as unknown as ReviewRunner;
 
@@ -684,7 +695,7 @@ describe("Worker — diff-review dispatch (PRD #400 M4b)", () => {
       claimChat: async (): Promise<ChatClaimResponse | null> => null,
     } as unknown as WorkerClient;
 
-    const runRunner = { execute: async () => { routed.push("runner"); } } as unknown as RunRunner;
+    const runRunner = { ...noResumeRecoveries, execute: async () => { routed.push("runner"); } } as unknown as RunRunner;
     const reviewRunner = { execute: async () => { routed.push("review"); } } as unknown as ReviewRunner;
 
     const worker = new Worker(fakeConfig(), client, runRunner, {} as unknown as ChatRunner, noJudge, reviewRunner, recordingLogger().logger, okPreflight);

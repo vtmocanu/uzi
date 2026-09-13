@@ -136,6 +136,68 @@ func newTestClient(srv *httptest.Server) *HTTPClient {
 	return &HTTPClient{BaseURL: srv.URL, Token: "uzc_test", HTTP: srv.Client()}
 }
 
+// TestHTTPClientDeleteWorkerCustodyConflict pins the M4b client contract (PRD #1296):
+// a 409 carrying a `custody_holds` count is surfaced as a DISTINGUISHABLE
+// *WorkerCustodyConflictError carrying the count and the server message, while still
+// resolving to ExitConflict for a caller that returns it straight to main; an ordinary
+// active-runs 409 (no count) stays a plain *ExitError; and a 204 is success.
+func TestHTTPClientDeleteWorkerCustodyConflict(t *testing.T) {
+	t.Run("custody 409 is the typed error", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodDelete || r.URL.Path != "/api/workers/w1" {
+				t.Errorf("request = %s %s", r.Method, r.URL.Path)
+			}
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(`{"error":"this worker is retaining unpublished committed work for recovery in 4 custody hold(s); recover it or discard the archives before removing it","custody_holds":4}`))
+		}))
+		defer srv.Close()
+
+		err := newTestClient(srv).DeleteWorker(context.Background(), "w1")
+		var custody *WorkerCustodyConflictError
+		if !errors.As(err, &custody) {
+			t.Fatalf("err = %v (%T), want *WorkerCustodyConflictError", err, err)
+		}
+		if custody.Holds != 4 {
+			t.Errorf("Holds = %d, want 4", custody.Holds)
+		}
+		if !strings.Contains(custody.Error(), "recover") {
+			t.Errorf("Error() = %q, want it to carry the server message", custody.Error())
+		}
+		// A caller that returns it straight to main still exits conflict, not generic.
+		if ExitCodeFor(err) != ExitConflict {
+			t.Errorf("ExitCodeFor = %d, want %d", ExitCodeFor(err), ExitConflict)
+		}
+	})
+
+	t.Run("active-runs 409 stays a plain ExitError", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(`{"error":"worker has active runs; cancel them before deleting it"}`))
+		}))
+		defer srv.Close()
+
+		err := newTestClient(srv).DeleteWorker(context.Background(), "w1")
+		var custody *WorkerCustodyConflictError
+		if errors.As(err, &custody) {
+			t.Fatalf("an active-runs 409 (no custody_holds) must NOT be the custody type: %v", err)
+		}
+		if ExitCodeFor(err) != ExitConflict {
+			t.Errorf("ExitCodeFor = %d, want %d", ExitCodeFor(err), ExitConflict)
+		}
+	})
+
+	t.Run("204 is success", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusNoContent)
+		}))
+		defer srv.Close()
+
+		if err := newTestClient(srv).DeleteWorker(context.Background(), "w1"); err != nil {
+			t.Fatalf("204 DeleteWorker = %v, want nil", err)
+		}
+	})
+}
+
 func TestHTTPClientWhoami(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Authorization"); got != "Bearer uzc_test" {
