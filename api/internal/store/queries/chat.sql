@@ -19,8 +19,11 @@ WITH seed AS (
     INSERT INTO run_user_inputs (run_id, kind, body)
     VALUES (@run_id, 'follow_up', @issue_description)
 )
-INSERT INTO runs (id, user_id, kind, issue_title, issue_description, title, trigger_source)
-VALUES (@run_id, @user_id, 'chat', @issue_title, @issue_description, @title, 'chat')
+-- harness (PRD #1332 M5A / D2): SQL literal 'claude', not a param. A chat run never folds
+-- run_usage (the fold skips kind='chat'), but every production INSERT INTO runs writes the
+-- harness explicitly anyway, so the DEFAULT can never mask an omitted origin.
+INSERT INTO runs (id, user_id, kind, issue_title, issue_description, title, trigger_source, harness)
+VALUES (@run_id, @user_id, 'chat', @issue_title, @issue_description, @title, 'chat', 'claude')
 RETURNING *;
 
 -- name: CreateChatContinueRun :one
@@ -29,8 +32,9 @@ RETURNING *;
 -- for resume affinity (the claim's affinity ordering prefers the worker whose disk
 -- still holds the SDK session). issue_description is empty — a Continue seeds no new
 -- prompt; the worker resumes the prior session and parks awaiting the next message.
-INSERT INTO runs (user_id, kind, issue_title, issue_description, title, resume_of_run_id, worker_id, trigger_source)
-VALUES (@user_id, 'chat', @issue_title, '', @title, @resume_of_run_id, @worker_id, 'resume')
+-- harness (PRD #1332 M5A / D2): SQL literal 'claude', not a param — a Claude production origin.
+INSERT INTO runs (user_id, kind, issue_title, issue_description, title, resume_of_run_id, worker_id, trigger_source, harness)
+VALUES (@user_id, 'chat', @issue_title, '', @title, @resume_of_run_id, @worker_id, 'resume', 'claude')
 RETURNING *;
 
 -- name: ListChatRunsForUser :many

@@ -578,6 +578,7 @@ type Run struct {
 	CompletionQuestionAt        pgtype.Timestamptz `json:"completion_question_at"`
 	BudgetExtensionSeconds      int32              `json:"budget_extension_seconds"`
 	ClaimGeneration             int64              `json:"claim_generation"`
+	Harness                     string             `json:"harness"`
 }
 
 type RunCompletionAttempt struct {
@@ -659,6 +660,7 @@ type RunSchedule struct {
 	SiblingGroupID        pgtype.UUID        `json:"sibling_group_id"`
 	MrReworkEnabled       pgtype.Bool        `json:"mr_rework_enabled"`
 	OutputMode            pgtype.Text        `json:"output_mode"`
+	Harness               pgtype.Text        `json:"harness"`
 }
 
 type RunUsage struct {
@@ -672,6 +674,8 @@ type RunUsage struct {
 	CostUsd             pgtype.Numeric     `json:"cost_usd"`
 	UpdatedAt           pgtype.Timestamptz `json:"updated_at"`
 	LineageEpoch        int32              `json:"lineage_epoch"`
+	Harness             string             `json:"harness"`
+	CostStatus          string             `json:"cost_status"`
 }
 
 type RunUsageTotal struct {
@@ -681,6 +685,7 @@ type RunUsageTotal struct {
 	CacheCreationTokens int64          `json:"cache_creation_tokens"`
 	OutputTokens        int64          `json:"output_tokens"`
 	CostUsd             pgtype.Numeric `json:"cost_usd"`
+	CostStatus          string         `json:"cost_status"`
 }
 
 type RunUserInput struct {
@@ -793,6 +798,7 @@ type User struct {
 	LightTheme              pgtype.Text        `json:"light_theme"`
 	DarkTheme               pgtype.Text        `json:"dark_theme"`
 	Typeface                pgtype.Text        `json:"typeface"`
+	DefaultHarness          pgtype.Text        `json:"default_harness"`
 }
 
 type UserSecret struct {

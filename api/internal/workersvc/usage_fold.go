@@ -519,6 +519,10 @@ func foldUsageFrames(ctx context.Context, q usageFoldQuerier, run store.Run, fra
 				continue
 			}
 			model = truncateRunes(model, maxUsageModelRunes)
+			// The row's harness and cost status are DERIVED from the persisted run harness
+			// (PRD #1332 M5A / D2), never from a worker-supplied field: Claude stays metered
+			// under THIS model's provider costUSD, Codex is unreported with a zero placeholder.
+			costStatus, costUSD := deriveUsageCost(run.Harness, mu.CostUSD)
 			if err := q.UpsertRunUsage(ctx, store.UpsertRunUsageParams{
 				RunID:               run.ID,
 				SessionID:           sessionID,
@@ -528,7 +532,9 @@ func foldUsageFrames(ctx context.Context, q usageFoldQuerier, run store.Run, fra
 				CacheReadTokens:     nonNegTokens(mu.CacheReadInputTokens),
 				CacheCreationTokens: nonNegTokens(mu.CacheCreationInputTokens),
 				OutputTokens:        nonNegTokens(mu.OutputTokens),
-				CostUsd:             numericUSD(mu.CostUSD),
+				CostUsd:             costUSD,
+				Harness:             run.Harness,
+				CostStatus:          costStatus,
 			}); err != nil {
 				return fmt.Errorf("fold run usage (run %s, model %s): %w", run.ID, model, err)
 			}
@@ -550,6 +556,33 @@ func numericUSD(usd float64) pgtype.Numeric {
 		usd = maxCostUSD
 	}
 	return pgtype.Numeric{Int: big.NewInt(int64(math.Round(usd * 1e6))), Exp: -6, Valid: true}
+}
+
+// Harness and cost-status literals, matching the run_usage.harness / run_usage.cost_status
+// CHECK vocabularies (migration 00224) and runs.harness. Kept here (not a shared package)
+// because C1 is the only writer of these into run_usage; the pure D11 resolver (C3) and the
+// C4b cost projection add their own use of the same tokens.
+const (
+	harnessClaude = "claude"
+	harnessCodex  = "codex"
+
+	costStatusMetered    = "metered"
+	costStatusUnreported = "unreported"
+)
+
+// deriveUsageCost maps a run's persisted harness to the (cost_status, cost_usd) a folded
+// run_usage row carries in C1 (PRD #1332 M5A / D2, D5). It DERIVES from runs.harness (never a
+// worker-supplied field): a Claude run stays 'metered' under its existing provider-reported
+// costUSD, so Claude accounting is unchanged; a Codex run is 'unreported' with a zero dollar
+// placeholder (C4b adds subscription/metered Codex semantics later). Forcing cost_usd to 0 for
+// a non-metered row is what keeps the insert within 00224's run_usage_nonmetered_zero_check
+// (cost_status='metered' OR cost_usd=0). An unexpected harness (impossible under the runs CHECK)
+// falls to the Claude/metered branch, preserving existing accounting rather than zeroing it.
+func deriveUsageCost(harness string, providerCostUSD float64) (costStatus string, costUSD pgtype.Numeric) {
+	if harness == harnessCodex {
+		return costStatusUnreported, numericUSD(0)
+	}
+	return costStatusMetered, numericUSD(providerCostUSD)
 }
 
 // nonNegTokens clamps a token count to >= 0 at fold time. GREATEST only protects an

@@ -427,8 +427,12 @@ WHERE status = 'online'
 -- so stamping only at approval would make the D2 hard claim clause vacuous for the
 -- plan-phase worker. The contract CONTENT (completion_contract/contract_revision) is still
 -- absent here — it is frozen with milestones_frozen at approval / the first running report.
-INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve, wait_on_limit, mr_rework_enabled, plan_md, plan_source, agent_source, agent_exclusions, planned_base_commit, require_base_match, model, override_subagent_model, issue_comments, review_comments, required_capabilities, trigger_source, completion_contract_version)
-VALUES (@user_id, @repo_id::uuid, @issue_iid, @issue_title, @issue_description, sqlc.narg('origin_column'), now(), @auto_approve, @wait_on_limit, sqlc.narg('mr_rework_enabled'), sqlc.narg('plan_md'), @plan_source, sqlc.narg('agent_source'), sqlc.narg('agent_exclusions')::jsonb, sqlc.narg('planned_base_commit'), @require_base_match, sqlc.narg('model'), @override_subagent_model, sqlc.narg('issue_comments')::jsonb, sqlc.narg('review_comments')::jsonb, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), @trigger_source, sqlc.narg('completion_contract_version'))
+-- 🔴 harness (PRD #1332 M5A / D2) is the SQL literal 'claude', NOT a param: every current
+-- production origin is Claude, and writing the literal (rather than relying on the column
+-- DEFAULT) means a future omitted column-list update fails loudly instead of the default
+-- silently masking it. M5A is dark, so no origin resolves Codex here; M5B adds that seam.
+INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve, wait_on_limit, mr_rework_enabled, plan_md, plan_source, agent_source, agent_exclusions, planned_base_commit, require_base_match, model, override_subagent_model, issue_comments, review_comments, required_capabilities, trigger_source, completion_contract_version, harness)
+VALUES (@user_id, @repo_id::uuid, @issue_iid, @issue_title, @issue_description, sqlc.narg('origin_column'), now(), @auto_approve, @wait_on_limit, sqlc.narg('mr_rework_enabled'), sqlc.narg('plan_md'), @plan_source, sqlc.narg('agent_source'), sqlc.narg('agent_exclusions')::jsonb, sqlc.narg('planned_base_commit'), @require_base_match, sqlc.narg('model'), @override_subagent_model, sqlc.narg('issue_comments')::jsonb, sqlc.narg('review_comments')::jsonb, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), @trigger_source, sqlc.narg('completion_contract_version'), 'claude')
 RETURNING *;
 
 -- name: GetRunByIDForUser :one
@@ -2944,19 +2948,43 @@ LIMIT @lim;
 -- idempotent monotonic merge = correct totals with no crash window. The run_usage_totals
 -- view (00177) MAXes within (run_id, model, lineage_epoch) then SUMs across, which is
 -- exactly the per-leg rule once every leg has its own epoch.
+--
+-- PRD #1332 M5A (D2/D5): harness and cost_status ride the fold. harness is the run's
+-- immutable, run-derived harness (foldUsageFrames sources it from runs.harness, never a
+-- worker field), so on conflict the two sides are always equal and the existing value is
+-- kept. cost_status resolves conservatively: EQUAL statuses retain; ANY disagreement (which
+-- necessarily includes any existing/incoming 'unreported' paired with a different status,
+-- and two-of-{metered,subscription,unreported}) resolves to 'unreported'. cost_usd is
+-- GREATEST only when the RESOLVED status is 'metered' (which requires both sides already
+-- 'metered'), else 0 — so a redelivery can never combine an unreported/subscription status
+-- with a positive dollar amount, and the result always satisfies 00224's
+-- run_usage_nonmetered_zero_check (cost_status='metered' OR cost_usd=0).
 INSERT INTO run_usage (
     run_id, session_id, model, lineage_epoch,
-    input_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, cost_usd, updated_at
+    input_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, cost_usd, harness, cost_status, updated_at
 ) VALUES (
     @run_id, @session_id, @model, @lineage_epoch,
-    @input_tokens, @cache_read_tokens, @cache_creation_tokens, @output_tokens, @cost_usd, now()
+    @input_tokens, @cache_read_tokens, @cache_creation_tokens, @output_tokens, @cost_usd, @harness, @cost_status, now()
 )
 ON CONFLICT (run_id, session_id, model, lineage_epoch) DO UPDATE SET
     input_tokens          = GREATEST(run_usage.input_tokens,          EXCLUDED.input_tokens),
     cache_read_tokens     = GREATEST(run_usage.cache_read_tokens,     EXCLUDED.cache_read_tokens),
     cache_creation_tokens = GREATEST(run_usage.cache_creation_tokens, EXCLUDED.cache_creation_tokens),
     output_tokens         = GREATEST(run_usage.output_tokens,         EXCLUDED.output_tokens),
-    cost_usd              = GREATEST(run_usage.cost_usd,              EXCLUDED.cost_usd),
+    -- The run's harness is immutable, so existing == EXCLUDED on conflict; keep existing.
+    harness               = run_usage.harness,
+    cost_status           = CASE
+                                WHEN run_usage.cost_status = EXCLUDED.cost_status THEN run_usage.cost_status
+                                ELSE 'unreported'
+                            END,
+    -- GREATEST only when the resolved status is 'metered' (recomputed inline — the SET-list
+    -- expressions all read the OLD row's run_usage.* and EXCLUDED.*, so order is irrelevant),
+    -- else 0 to keep a non-metered row at the numeric placeholder.
+    cost_usd              = CASE
+                                WHEN (CASE WHEN run_usage.cost_status = EXCLUDED.cost_status THEN run_usage.cost_status ELSE 'unreported' END) = 'metered'
+                                    THEN GREATEST(run_usage.cost_usd, EXCLUDED.cost_usd)
+                                ELSE 0
+                            END,
     updated_at            = now();
 
 -- name: CountRunInitFramesBefore :one
@@ -2978,7 +3006,11 @@ WHERE run_id = @run_id AND kind = 'status'
 -- ROW for a run with no usage — the handler maps pgx.ErrNoRows to "no usage" (absent,
 -- never a fake 0), so it does not gate detail visibility on ownership here (the
 -- caller has already authorized the viewer).
-SELECT input_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, cost_usd
+--
+-- PRD #1332 M5A (D2): the per-run folded cost_status rides along so a reader can tell a real
+-- metered dollar total from a subscription/unreported one that cost_usd cannot represent.
+-- M5A adds no public DTO field for it (the response shape stays unchanged); M5B consumes it.
+SELECT input_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, cost_usd, cost_status
 FROM run_usage_totals
 WHERE run_id = @run_id;
 
@@ -2988,8 +3020,12 @@ WHERE run_id = @run_id;
 -- run's created_at (laptop scale ≈ when it spent). COALESCE(...,0) so a user with no
 -- usage gets zeros + run_count 0 (the client reads run_count==0 as "nothing yet").
 -- Chat runs are excluded (belt-and-suspenders: the fold never writes chat rows).
+-- PRD #1332 M5A (D2): each dollar sum now travels with subscription/unreported RUN COUNTS
+-- for the SAME window, so no partial dollar total can read as complete — a run is counted by
+-- its folded per-run cost_status from the view. M5A adds no public DTO field for these
+-- counts (the /api/usage response shape stays unchanged); M5B consumes them.
 WITH scoped AS (
-    SELECT r.created_at,
+    SELECT r.created_at, t.cost_status,
            t.input_tokens, t.cache_read_tokens, t.cache_creation_tokens, t.output_tokens, t.cost_usd
     FROM run_usage_totals t
     JOIN runs r ON r.id = t.run_id
@@ -3001,11 +3037,15 @@ SELECT
     COALESCE(SUM(cache_creation_tokens), 0)::bigint  AS lifetime_cache_creation_tokens,
     COALESCE(SUM(output_tokens), 0)::bigint          AS lifetime_output_tokens,
     COALESCE(SUM(cost_usd), 0)::numeric              AS lifetime_cost_usd,
+    count(*) FILTER (WHERE cost_status = 'subscription')::bigint AS lifetime_subscription_run_count,
+    count(*) FILTER (WHERE cost_status = 'unreported')::bigint   AS lifetime_unreported_run_count,
     COALESCE(SUM(input_tokens)          FILTER (WHERE created_at >= now() - interval '7 days'), 0)::bigint  AS last7_input_tokens,
     COALESCE(SUM(cache_read_tokens)      FILTER (WHERE created_at >= now() - interval '7 days'), 0)::bigint  AS last7_cache_read_tokens,
     COALESCE(SUM(cache_creation_tokens)  FILTER (WHERE created_at >= now() - interval '7 days'), 0)::bigint  AS last7_cache_creation_tokens,
     COALESCE(SUM(output_tokens)          FILTER (WHERE created_at >= now() - interval '7 days'), 0)::bigint  AS last7_output_tokens,
     COALESCE(SUM(cost_usd)               FILTER (WHERE created_at >= now() - interval '7 days'), 0)::numeric AS last7_cost_usd,
+    count(*) FILTER (WHERE cost_status = 'subscription' AND created_at >= now() - interval '7 days')::bigint AS last7_subscription_run_count,
+    count(*) FILTER (WHERE cost_status = 'unreported'   AND created_at >= now() - interval '7 days')::bigint AS last7_unreported_run_count,
     count(*)::bigint AS run_count
 FROM scoped;
 
@@ -3014,8 +3054,11 @@ FROM scoped;
 -- Same shape as SelfUsage without the user filter; by construction this equals the
 -- SUM of the AdminUsagePerUser rows (both read run_usage_totals joined to non-chat
 -- runs), which the handler test asserts.
+-- PRD #1332 M5A (D2): the factory-wide dollar sums carry subscription/unreported RUN COUNTS
+-- for both windows, mirroring SelfUsage, so a partial dollar total can never read as
+-- complete. M5A adds no public DTO field for the counts; M5B consumes them.
 WITH scoped AS (
-    SELECT r.created_at,
+    SELECT r.created_at, t.cost_status,
            t.input_tokens, t.cache_read_tokens, t.cache_creation_tokens, t.output_tokens, t.cost_usd
     FROM run_usage_totals t
     JOIN runs r ON r.id = t.run_id
@@ -3027,11 +3070,15 @@ SELECT
     COALESCE(SUM(cache_creation_tokens), 0)::bigint  AS lifetime_cache_creation_tokens,
     COALESCE(SUM(output_tokens), 0)::bigint          AS lifetime_output_tokens,
     COALESCE(SUM(cost_usd), 0)::numeric              AS lifetime_cost_usd,
+    count(*) FILTER (WHERE cost_status = 'subscription')::bigint AS lifetime_subscription_run_count,
+    count(*) FILTER (WHERE cost_status = 'unreported')::bigint   AS lifetime_unreported_run_count,
     COALESCE(SUM(input_tokens)          FILTER (WHERE created_at >= now() - interval '7 days'), 0)::bigint  AS last7_input_tokens,
     COALESCE(SUM(cache_read_tokens)      FILTER (WHERE created_at >= now() - interval '7 days'), 0)::bigint  AS last7_cache_read_tokens,
     COALESCE(SUM(cache_creation_tokens)  FILTER (WHERE created_at >= now() - interval '7 days'), 0)::bigint  AS last7_cache_creation_tokens,
     COALESCE(SUM(output_tokens)          FILTER (WHERE created_at >= now() - interval '7 days'), 0)::bigint  AS last7_output_tokens,
     COALESCE(SUM(cost_usd)               FILTER (WHERE created_at >= now() - interval '7 days'), 0)::numeric AS last7_cost_usd,
+    count(*) FILTER (WHERE cost_status = 'subscription' AND created_at >= now() - interval '7 days')::bigint AS last7_subscription_run_count,
+    count(*) FILTER (WHERE cost_status = 'unreported'   AND created_at >= now() - interval '7 days')::bigint AS last7_unreported_run_count,
     count(*)::bigint AS run_count,
     -- The earliest usage-bearing run's creation time, for the factory card's "since
     -- <date>" (PRD #40 M6). NULL when the factory has no usage yet.
@@ -3043,12 +3090,18 @@ FROM scoped;
 -- per user WITH usage; the client computes each user's share against the factory
 -- total. Ordered heaviest-cost first (output tokens tiebreak). Sums the same
 -- run_usage_totals as AdminUsageTotals, so the rows sum to the factory lifetime total.
+-- PRD #1332 M5A (D2): each user's lifetime dollar sum carries subscription/unreported RUN
+-- COUNTS so a partial dollar total cannot read as complete. Lifetime-only here (this row is
+-- the admin per-user lifetime breakdown; the windowed counts live in AdminUsageTotals). M5A
+-- adds no public DTO field for the counts; M5B consumes them.
 SELECT u.id AS user_id, u.email,
     COALESCE(SUM(t.input_tokens), 0)::bigint          AS input_tokens,
     COALESCE(SUM(t.cache_read_tokens), 0)::bigint      AS cache_read_tokens,
     COALESCE(SUM(t.cache_creation_tokens), 0)::bigint  AS cache_creation_tokens,
     COALESCE(SUM(t.output_tokens), 0)::bigint          AS output_tokens,
     COALESCE(SUM(t.cost_usd), 0)::numeric              AS cost_usd,
+    count(*) FILTER (WHERE t.cost_status = 'subscription')::bigint AS subscription_run_count,
+    count(*) FILTER (WHERE t.cost_status = 'unreported')::bigint   AS unreported_run_count,
     count(t.run_id)::bigint AS run_count
 FROM run_usage_totals t
 JOIN runs r ON r.id = t.run_id
