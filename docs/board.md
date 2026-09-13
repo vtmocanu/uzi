@@ -265,6 +265,13 @@ any chip for "as of last sync". A stale **closed** is the case to watch for
 practice, since merging an MR closes its issue and the card leaves the
 board before the state would ever go stale.
 
+For a live read on that PR — its checks, reviews, and conflicts, beyond
+this chip's best-effort snapshot — see the terminal, not the browser:
+`uzi tui`'s `pulls` screen lists every open PR/MR on a repo banded by what
+needs you, with a drill-in for the full checks/reviews/merge picture, and
+its sibling `ci` screen does the same for the repo's workflow runs. See
+[The forge screens: `pulls` and `ci`](./cli.md#the-forge-screens-pulls-and-ci).
+
 ## Card labels
 
 Each card also shows its GitLab labels as small chips, so `bug`, `security`,

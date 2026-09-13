@@ -896,6 +896,46 @@ also the TUI's own fallback when the live channel is unreachable (below).
   and recommendations, with the same resolve/dismiss/undo triage described
   under [Reviewing and triaging from the CLI](#reviewing-and-triaging-from-the-cli).
 
+### The forge screens: `pulls` and `ci`
+
+A tab strip in the header — `▚▚ uzi · floor  pulls  ci` — sits beside the
+board (labelled `floor` on screen) and adds two more top-level screens, both
+read straight through the API's stored forge connection PAT: no `gh`, no
+personal token, no leaving the terminal to see whether a PR went green.
+`tab` cycles floor → pulls → ci → floor; `1`/`2`/`3` jump directly. Both
+screens scope to one repo at a time — `R` cycles your enabled repos (hidden
+when only one is enabled), defaulting to the repo of your newest run — and
+`/` filters a list by title, branch, author, or workflow name.
+
+- **`pulls`** lists every open PR/MR on the scoped repo, banded **NEEDS
+  YOU** (changes requested, or a conflict), **IN FLIGHT** (a draft, or a
+  review still pending), and **READY** (approved, or no review required,
+  with no conflict). Each row carries a checks cell (`✓ 6/6` / `✗ 1/6` /
+  `● 3/6`), a review cell, the branch, the title, and a `↳ <run>` link when
+  a uzi run opened it. Polls every 10s.
+- **`ci`** lists the repo's CI/workflow runs, banded **RUNNING**,
+  **FAILED**, and **RECENT**, each row carrying a `▰▱ done/total` jobs
+  micro-bar while it's running. On a forge version with no Actions/CI-runs
+  API it degrades to a one-line notice instead of an empty list. Polls
+  every 10s.
+- **PR view** (`enter`/`→` on a `pulls` row) drills into one PR: CHECKS
+  (failing → pending → passed → skipped, each with its description and
+  elapsed time — `↑↓` moves the cursor and shows the selected check's URL),
+  REVIEWS (the latest state per reviewer), and MERGE (conflicts, required
+  checks, the blocked reason). Re-polls live every 5s, with a `● live · 5s`
+  header state and `re-polled Ns ago`.
+- **CI run view** (`enter`/`→` on a `ci` row) drills into one run's JOBS,
+  expanding the selected job's steps beneath it (GitHub Actions only —
+  GitLab and Forgejo jobs carry no steps). Same 5s live re-poll.
+
+A rate-limited forge read draws `~ rate-limited · retry in Ns` in the
+header in place of an error and keeps polling once the wait is over — the
+same per-connection budget `FORGE_INTERACTIVE_RATE_MAX` documents in
+[Configuration](./configuration.md). `esc` backs a drill-in out to the list
+it opened from; `esc` on a list returns to the floor. The run detail view
+above gains its own cross-link into this: `m` opens the PR view for that
+run's merge request, when it has one.
+
 ### Keybindings
 
 ```
@@ -942,6 +982,28 @@ composer** — it renders the same "blocked on a human" waiting treatment a
 plan gate gets, but `y`/`n` don't apply to it. Answer from another terminal
 with `uzi run answer <id>` (see [Commands](#commands)), from the web run
 view, or from Slack; the TUI picks the change up on its next refresh.
+
+The `pulls`, `ci`, and their two drill-ins (PR view, CI run view) share a
+second set of bindings:
+
+```
+tab          switch screens: floor → pulls → ci → floor (pulls, ci)
+1 / 2 / 3    jump straight to floor / pulls / ci
+R            cycle the scoped repo (pulls, ci; hidden with one enabled repo)
+enter / →    open the selected row (pulls → PR view · ci → CI run view)
+↑ / ↓        move the cursor (PR view: over CHECKS · CI run view: over JOBS)
+u            open the PR's linked uzi run (pulls row, PR view; shown only when linked)
+w            rework the linked run (pulls row, PR view; shown only when linked)
+f            fix ci: queue a CI-fix run for the branch (pulls, ci, PR view, CI run view)
+m            detail: open the PR view for this run's merge request (when it has one)
+esc          back: a drill-in returns to its list, a list returns to the floor
+```
+
+`f` means something different here than in the run detail table above — a
+follow-up there, "fix ci" on every forge screen — but the two views never
+overlap, so the key never carries two meanings at once. `u` and `w` drop out
+of the legend on a PR with no linked run, and a `ci` row never offers them at
+all: there's no run to open or rework from a bare CI run, only `f`.
 
 ### Steering is run-level, not per-agent
 
