@@ -222,7 +222,11 @@ func TestRunDecidePartialEmptyIDList(t *testing.T) {
 // MUTATION PROOF: this guards the accept-branch `len(criteria)==0` check. The fake is seeded with a
 // revisable run (non-nil CompletionRevision), so deleting that guard lets an empty --accept fall
 // through GetRun to AcceptCompletionDecision — the exit becomes ExitOK (not ExitUsage) AND
-// LastDecideRunID is set. Both assertions below then fail, so each is load-bearing.
+// LastDecideRunID is set. The three checks below use t.Errorf, not the usual Fatalf, so ALL of them
+// execute and report on the mutation, keeping each independently load-bearing — in particular the
+// LastDecideRunID check, which alone would also catch a hypothetical guard that errors only AFTER
+// reaching the client. Continuing past a wrong exit code is safe here: the later reads are plain
+// string fields.
 func TestRunDecideAcceptEmptyIDList(t *testing.T) {
 	rev := 2
 	fc := &uzicli.FakeClient{
@@ -231,7 +235,7 @@ func TestRunDecideAcceptEmptyIDList(t *testing.T) {
 	}
 	_, stderr, code := runCLI(t, fakeEnv(fc), "run", "decide", "r1", "--accept", " , ", "--reason", "x")
 	if code != uzicli.ExitUsage {
-		t.Fatalf("exit = %d, want ExitUsage(%d) (stderr: %s)", code, uzicli.ExitUsage, stderr)
+		t.Errorf("exit = %d, want ExitUsage(%d) (stderr: %s)", code, uzicli.ExitUsage, stderr)
 	}
 	if fc.LastDecideRunID != "" {
 		t.Errorf("an empty id list reached the client (id %q); it must fail first", fc.LastDecideRunID)
