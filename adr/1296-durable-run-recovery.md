@@ -166,9 +166,14 @@ not an implicit consequence of either existing one.
 - **A cross-generation orphaned hold is a visible, actionable cost, not a silent one.** It
   counts against `CountUnresolvedCustodyHoldsForOwner`'s per-owner ceiling (default 8) and
   keeps its worker undeleteable, surfaced as the `retaining_unpublished_work` worker flag
-  and the `reasonCustodyLimit` queued-run reason. Only the owner can recover or
-  explicitly discard it to clear either effect — there is no automatic eviction and no
-  admin override.
+  and the `reasonCustodyLimit` queued-run reason. The cost clears when the hold's work is
+  durably captured (which releases the hold via the reconciler) — there is no automatic
+  eviction and no admin override. A capless orphan (one whose worker died before it
+  reserved any capture) has **no owner self-serve discharge today**: `DiscardCaptureForOwner`
+  discards a *capture*, not the hold, and there is no discard-hold action yet, so such a
+  hold is retained until an operator clears it. Adding an owner-scoped discard-hold action
+  (the D3 "owner explicitly confirms discard" leg for the capless case) is tracked in
+  [#1318](https://github.com/vtmocanu/uzi/issues/1318).
 - **Mixed fleets degrade honestly, not silently.** A worker or API that predates this
   contract simply never opens a hold, so a run executed there reports `unsupported`
   recovery rather than a promise that was never kept. Rolling the fleet forward protects

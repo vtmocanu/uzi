@@ -211,8 +211,9 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 	// so a failed run with no ready capture keeps its custody. Placed before the reap
 	// backstop (ephemeral reap is a separate sweeper.Pass in main.go, run each tick) so a
 	// hold released this tick lets the SAME tick's/next tick's reap delete the worker.
-	// Best-effort: an error is logged and does not fail the sweep, matching the other
-	// best-effort sub-steps.
+	// Partial best-effort: inside ReconcileCustodyReleases a per-hold ReleaseCustodyHold
+	// error is logged and skipped (one stuck hold does not sink the reconcile), but a
+	// candidate-LIST read error fails the pass and surfaces here — see that method's doc.
 	if res.CustodyReleased, err = s.ReconcileCustodyReleases(ctx); err != nil {
 		return res, fmt.Errorf("reconcile custody releases: %w", err)
 	}
