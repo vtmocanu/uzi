@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { act, cleanup, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { Dashboard } from "./Dashboard";
-import { api, type RunListItem, type Worker } from "../lib/api";
+import { api, type ForgeConnection, type Repo, type RunListItem, type SecretMeta, type Worker } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
 
 // The overview fetches six endpoints on first load and re-polls only listRuns +
@@ -279,6 +279,114 @@ describe("Dashboard onboarding checklist (PRD #60)", () => {
 
     // Sanity: an open step is not struck at all.
     expect(screen.getByText("Add your Anthropic token").className).not.toContain("line-through");
+  });
+});
+
+// Issue #1331: step 4 "Bring a worker online" must reflect a DURABLE fact — that a
+// worker has ever registered (online right now, OR a non-null last_heartbeat_at) —
+// not the momentary `status === "online"`. During a fleet roll every worker can sit
+// offline for minutes while its container upgrades, yet the factory is plainly set
+// up; the old predicate (workersOnline > 0) re-opened the step and dropped the
+// counter to 0/4 on that exact screen. These pin the intended `workerJoined`
+// behavior: cases 1 and 3 FAIL on the unfixed tree, case 2 is the boundary control.
+describe("Dashboard onboarding step 4 is durable (PRD #1331)", () => {
+  const flush = async () => {
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 0));
+    });
+  };
+
+  it("counts a registered-but-offline fleet (mid-roll) as joined", async () => {
+    // The bug's exact screen: both workers offline mid-upgrade, but each carries a
+    // last_heartbeat_at, so the fleet has demonstrably registered before.
+    mockApi.listWorkers.mockResolvedValue({
+      workers: [
+        aWorker({ id: "w1", status: "offline", upgrade_status: "upgrading", last_heartbeat_at: "2026-09-13T10:00:00Z" }),
+        aWorker({ id: "w2", status: "offline", upgrade_status: "upgrading", last_heartbeat_at: "2026-09-13T10:00:05Z" }),
+      ],
+    });
+    const { container } = renderDashboard();
+    await flush();
+
+    // Steps 1-3 are open (beforeEach defaults) so the card renders; step 4 must read
+    // as done — struck through, and folded into the "N/4 done" counter.
+    const step4 = screen.getByText("Bring a worker online");
+    expect(step4.className.split(/\s+/).filter(Boolean)).toContain("line-through");
+    expect(container.textContent).toContain("1/4 done");
+  });
+
+  it("leaves step 4 open for a worker that never registered", async () => {
+    // The boundary control: a row exists but has never sent a heartbeat and is not
+    // online, so it has not joined. The fix must not over-reach to "any worker row
+    // exists" — this case passes on the unfixed tree too.
+    mockApi.listWorkers.mockResolvedValue({
+      workers: [aWorker({ id: "w1", status: "offline", last_heartbeat_at: null })],
+    });
+    const { container } = renderDashboard();
+    await flush();
+
+    expect(screen.getByText("Bring a worker online").className).not.toContain("line-through");
+    expect(container.textContent).toContain("0/4 done");
+  });
+
+  it("hides the checklist card once steps 1-3 are done and the fleet has registered, while the Workers tile still shows 0/N", async () => {
+    // Steps 1-3 done, plus a registered-but-offline fleet → all four steps done → the
+    // "Get the factory running" card hides. A positive control against a vacuous
+    // negative: the Workers-online tile lives outside the !ready gate, so it survives
+    // the card hiding and still reads 0/2 for the two offline workers.
+    const secret: SecretMeta = {
+      id: "s1",
+      kind: "anthropic_token",
+      label: "tok",
+      is_default: true,
+      auto_eligible: false,
+      created_at: "2026-09-13T00:00:00Z",
+      updated_at: "2026-09-13T00:00:00Z",
+    };
+    const connection: ForgeConnection = {
+      id: "c1",
+      forge_type: "github",
+      base_url: "https://github.com",
+      bot_username: "uzi-bot",
+      bot_forge_user_id: 1,
+      human_username: null,
+      created_at: "2026-09-13T00:00:00Z",
+      last_verified_at: null,
+      privilege_status: null,
+      privilege_checked_at: null,
+      privilege_report: null,
+    };
+    const repo: Repo = {
+      id: "repo-1",
+      connection_id: "c1",
+      forge_project_id: 1,
+      path_with_namespace: "vtmocanu/uzi",
+      web_url: "https://github.com/vtmocanu/uzi",
+      default_branch: "main",
+      enabled: true,
+      repo_skills_enabled: false,
+      repo_claudemd_enabled: false,
+      repo_devbox_opt_in: false,
+      repo_fold_improve_uzi_backlog: false,
+      pipeline: null,
+      guardrail_blocked: false,
+      docker_allowlisted: false,
+      docker_blocked: false,
+    };
+    mockApi.listSecrets.mockResolvedValue({ secrets: [secret] });
+    mockApi.listConnections.mockResolvedValue({ connections: [connection] });
+    mockApi.listRepos.mockResolvedValue({ repos: [repo] });
+    mockApi.listWorkers.mockResolvedValue({
+      workers: [
+        aWorker({ id: "w1", status: "offline", upgrade_status: "upgrading", last_heartbeat_at: "2026-09-13T10:00:00Z" }),
+        aWorker({ id: "w2", status: "offline", upgrade_status: "upgrading", last_heartbeat_at: "2026-09-13T10:00:05Z" }),
+      ],
+    });
+    const { container } = renderDashboard();
+    await flush();
+
+    expect(screen.queryByText("Get the factory running")).toBeNull();
+    expect(container.textContent).toContain("0/2");
   });
 });
 
