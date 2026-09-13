@@ -22,12 +22,21 @@
 # real Major finding rode into main unseen (2026-09-07, PR #1175). Use THIS script; do
 # not re-derive the check against the wrong endpoint.
 #
-# 🔴 ABSENT TALLY != CLEAN. A PR with no review tally was NOT reviewed (rate-limited, the
-# <10-star auto-skip, or CR is down) — the OPPOSITE of a clean "Actionable comments
-# posted: 0". This script names the specific reason per PR AND exits 3 if ANY named PR was
-# not reviewed, so a caller that gates on the exit code cannot merge past a missing review.
-# Exit 0 = every PR reviewed (findings or clean); 3 = at least one PR unreviewed
-# (re-trigger '@coderabbitai review', or fall back to /code-review); 2 = usage.
+# 🔴 A MISSING tally is not automatically "not reviewed" — but a tally-less review is only
+# clean when it is APPROVED. CodeRabbit prints "Actionable comments posted: N" only on a
+# review that CARRIES findings; a clean pass is an APPROVED review with an empty, tally-less
+# body. So key on the review's existence/state, not the tally alone, and split three ways:
+#   - tally present, or a clean APPROVED review  -> reviewed, gate may clear;
+#   - a tally-less NON-APPROVED review (e.g. a COMMENTED review whose grouped/outside-diff
+#     findings live in the review BODY, which the inline loop does NOT surface) -> reviewed
+#     but NOT confirmed clean, inspect the body before merging;
+#   - TOTAL absence of any CR review (rate-limited, the <10-star auto-skip, or CR is down)
+#     -> genuinely "not reviewed", the OPPOSITE of clean.
+# This script reports the state per PR AND exits 3 on either of the last two, so a caller
+# gating on the exit code cannot merge past a missing OR an unconfirmed-clean review.
+# Exit 0 = every PR reviewed and clean/APPROVED (or with findings shown); 3 = at least one
+# PR unreviewed (re-trigger '@coderabbitai review', or fall back to /code-review) OR
+# reviewed without a confirmable-clean verdict (inspect the review body); 2 = usage.
 set -euo pipefail
 
 repo=${1:?usage: pr-findings.sh OWNER/REPO PR [PR ...]}
@@ -35,16 +44,33 @@ shift
 [ "$#" -ge 1 ] || { echo "usage: pr-findings.sh OWNER/REPO PR [PR ...]" >&2; exit 2; }
 
 unreviewed=""
+unconfirmed=""
 for n in "$@"; do
   echo "========== PR #${n} =========="
-  tally=$(gh api "repos/${repo}/pulls/${n}/reviews" \
-    --jq '.[]|select(.user.login|test("coderabbit";"i"))|.body' 2>/dev/null \
+  # Fetch CodeRabbit's reviews ONCE, then derive both the tally and the latest state from
+  # that one snapshot (avoids a second API call and a read-your-writes race between them).
+  crreviews=$(gh api "repos/${repo}/pulls/${n}/reviews" \
+    --jq '[.[]|select(.user.login|test("coderabbit";"i"))]' 2>/dev/null || true)
+  [ -n "$crreviews" ] || crreviews='[]'
+  tally=$(printf '%s' "$crreviews" | jq -r '.[].body' 2>/dev/null \
     | grep -oiE 'Actionable comments posted: [0-9]+' | tail -1 || true)
+  crstate=$(printf '%s' "$crreviews" | jq -r 'last | .state // empty' 2>/dev/null || true)
   if [ -n "$tally" ]; then
     echo "  ${tally}"   # reviewed; N is the finding count (0 = genuinely clean)
+  elif [ "$crstate" = "APPROVED" ]; then
+    # A tally-less APPROVED review is CR's clean pass (empty body, no tally). The only
+    # state on which it is safe to auto-clear the merge gate.
+    echo "  reviewed: APPROVED (no actionable comments — clean)"
+  elif [ -n "$crstate" ]; then
+    # A CR review exists but is neither tallied nor a clean APPROVED (e.g. a tally-less
+    # COMMENTED review whose grouped/outside-diff findings live in the review BODY — the
+    # inline-comments loop below does NOT surface those). Reviewed, but NOT confirmed
+    # clean: flag it so an exit-code gate does not merge without a human reading the body.
+    echo "  ⚠️  CodeRabbit state '${crstate}' with no actionable-comments tally — inspect the review body (grouped/outside-diff findings are not shown inline); NOT auto-clean."
+    unconfirmed="${unconfirmed} #${n}"
   else
-    # No tally => NOT reviewed. The reason is in CR's latest issue comment (which carries
-    # no tally). Name it, record the PR for the exit-3 summary, never read it as clean.
+    # No CR review at all => NOT reviewed. The reason is in CR's latest issue comment
+    # (which carries no tally). Name it, record the PR for the exit-3 summary, never clean.
     note=$(gh api "repos/${repo}/issues/${n}/comments" \
       --jq '[.[]|select(.user.login|test("coderabbit";"i"))]|last|.body' 2>/dev/null || true)
     reason="absent (no CodeRabbit comment at all — review may not have landed yet)"
@@ -66,8 +92,13 @@ for n in "$@"; do
       | "  \(.path):\(.line)  [\($sev)] \($t|gsub("\\*";""))"' 2>/dev/null || true
 done
 
-if [ -n "$unreviewed" ]; then
+if [ -n "$unreviewed" ] || [ -n "$unconfirmed" ]; then
   echo "=========================================="
-  echo "🔴 NOT REVIEWED by CodeRabbit:${unreviewed} — do not merge as clean (exit 3)."
+  if [ -n "$unreviewed" ]; then
+    echo "🔴 NOT REVIEWED by CodeRabbit:${unreviewed} — re-trigger '@coderabbitai review' or fall back to /code-review; do not merge as clean."
+  fi
+  if [ -n "$unconfirmed" ]; then
+    echo "🔴 REVIEWED but NOT confirmed clean:${unconfirmed} — tally-less non-APPROVED review; inspect the review body before merging."
+  fi
   exit 3
 fi
