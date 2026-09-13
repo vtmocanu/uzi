@@ -192,6 +192,18 @@ SELECT count(*) FROM runs
 WHERE repo_id = @repo_id::uuid
   AND status NOT IN ('completed', 'failed', 'cancelled');
 
+-- name: CountOpenCustodyHoldsForRepo :one
+-- PRD #1296 M4 (D3): the repo-delete custody guard's predicate. DeleteRepoForUser cascades
+-- the repo's runs (runs.repo_id ON DELETE CASCADE), which would hit a still-open hold's
+-- ON DELETE RESTRICT live_run_id FK and error mid-cascade. This counts the OPEN custody
+-- holds on the repo's runs so the delete path can refuse GRACEFULLY with an enumerated
+-- count instead — the owner must explicitly discard those captures (or let recovery
+-- complete) before the last local source is destroyed. Scoped through the repo's runs,
+-- reading recovery_custody_holds.repo_id (recorded at claim) directly so it stays correct
+-- even after a run row is later reaped (the hold's run_id FK is SET NULL-free by design).
+SELECT count(*) FROM recovery_custody_holds
+WHERE repo_id = @repo_id::uuid AND state = 'open';
+
 -- name: SetRepoDevboxOptInForUser :one
 -- Tier-2 repo devbox.json opt-in toggle (PRD #18 M5), authorized through the
 -- repo's owning connection. A non-owned or unknown id returns no rows (404).

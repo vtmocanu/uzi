@@ -109,6 +109,13 @@ func contractCases() []contractCase {
 		newContractCase[CIRunDetailDTO]("ci_run_detail"),
 		newContractCase[CIJobDTO]("ci_job"),
 		newContractCase[CIStepDTO]("ci_step"),
+		// PRD #1296 M1: the owner-facing recovery DTOs. RecoveryArchiveDTO is all-omitempty
+		// optionals (its zero.json carries no null, the finding shape); the summary's
+		// archives slice is non-omitempty (its zero.json carries a null the mapper
+		// normalizes to []). Their nested RecoveryArchiveStateCountsDTO rides inside the
+		// summary fixtures (no standalone row — it is never returned alone).
+		newContractCase[RecoveryArchiveDTO]("recovery_archive"),
+		newContractCase[RecoveryArchiveSummaryDTO]("recovery_archive_summary"),
 	}
 }
 

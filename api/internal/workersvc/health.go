@@ -139,6 +139,17 @@ const (
 	// healthWaitingWorker enum (no migration owed; runs.health_reason is free text).
 	// Distinct from reasonAllWorkersBusy: allowlisting, not a free slot, unblocks it.
 	reasonRepoNotDockerAllowed = "this repo isn't on the Docker worker allowlist, so no Docker worker can run it"
+	// reasonCustodyLimit (PRD #1296 M4, D4) is emitted for a queued run whose OWNER is at
+	// the custody-hold admission limit — they hold >= custodyHoldLimit UNRESOLVED (open)
+	// custody holds, so ClaimRun's owner-scoped custody-admission clause matches no row and
+	// the run stays queued until the owner resolves or discards some unpublished-work
+	// archives. Resolved against the SAME predicate the claim gates on
+	// (CountUnresolvedCustodyHoldsForOwner vs the same custodyHoldLimit constant), so the
+	// pill and the claim can never disagree. Maps to the SAME healthWaitingWorker enum (no
+	// migration — runs.health_reason is free text). A NEW const, never a reuse of the
+	// pool_wait/recovery_wait park reasons (D4): this is an owner-admission block, not a
+	// credential-pool or transient-recovery hold, and its fix is archive retry/discard.
+	reasonCustodyLimit = "you have too much unpublished work awaiting recovery; resolve or discard some recovery archives to start new runs"
 )
 
 // Persistence-failure FLAG thresholds (PRD #108 M4), code constants for the same
@@ -500,8 +511,10 @@ func stallBaseline(r store.ListActiveRunsForHealthRow) time.Time {
 }
 
 // queuedReason resolves the human reason a queued run past its threshold is not
-// running, MOST-FUNDAMENTAL first (Decision 8, extended by PRD #216, #361, #84 M3, #320 D9
-// and #1226 M1): a locked owner vault (they unlock and it claims within a poll), then no
+// running, MOST-FUNDAMENTAL first (Decision 8, extended by PRD #216, #361, #84 M3, #320 D9,
+// #1226 M1 and #1296 M4): a locked owner vault (they unlock and it claims within a poll),
+// then (PRD #1296 M4) an owner at the custody-hold admission limit (another fleet-independent
+// owner-state block), then no
 // online worker at all, then (PRD #84 M3) no online worker whose capabilities can satisfy
 // the run's required set, then (PRD #1226 M1) an interlocked run no online worker can serve
 // because none implements the completion protocol, then (PRD #320 D9) the deprioritized/
@@ -519,6 +532,28 @@ func stallBaseline(r store.ListActiveRunsForHealthRow) time.Time {
 func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListActiveRunsForHealthRow) string {
 	if s.vlt != nil && !s.vlt.Unlocked(r.UserID) {
 		return reasonVaultLocked
+	}
+	// PRD #1296 M4 (D4): the owner-scoped custody-admission block. When the owner holds
+	// >= custodyHoldLimit UNRESOLVED (open) custody holds, ClaimRun's custody-admission
+	// clause matches no row and the run stays queued no matter how many idle, capable
+	// workers exist — so this is a FUNDAMENTAL, fleet-independent block, resolved right
+	// after the vault-lock (the only other owner-account-state block) and AHEAD of every
+	// worker-availability reason: bringing a worker online cannot clear it, and naming a
+	// worker reason would point at the wrong cause. Read against the SAME predicate the
+	// claim gates on (the same CountUnresolvedCustodyHoldsForOwner count and the same
+	// custodyHoldLimit constant), so the pill and the claim never disagree. A non-positive
+	// limit DISABLES the gate on the claim side too, so this rung stays silent then. The
+	// per-run Count sits behind the queued-threshold guard in healthTargetFor, so it runs
+	// for ~0 runs/tick; a read error falls through to the generic reasons below rather than
+	// inventing a reason on a failed lookup (the conservative degrade the sibling per-run
+	// lookups use).
+	if custodyHoldLimit > 0 {
+		held, cerr := s.q.CountUnresolvedCustodyHoldsForOwner(ctx, r.UserID)
+		if cerr != nil {
+			slog.Error("health: count unresolved custody holds", "run_id", r.ID, "error", cerr)
+		} else if held >= int64(custodyHoldLimit) {
+			return reasonCustodyLimit
+		}
 	}
 	n, err := s.q.CountOnlineWorkersForUser(ctx, r.UserID)
 	if err != nil {

@@ -404,6 +404,65 @@ export const runsApi = {
     const inputs = (mockRunInputs[id] ?? []).map((i) => ({ ...i }));
     return delay({ inputs }, 60);
   },
+  // PRD #1296 M5 (D6/D7): the owner-scoped recovery aggregate. Demo mode shows a
+  // realistic AVAILABLE archive for a failed run so the "Recovery archives" section
+  // renders its committed-history + secret-review copy and the enabled download; every
+  // other run reports the honest supported-but-empty aggregate (which renders nothing
+  // unless the run actually failed). A missing run 404s, which the section treats as
+  // "no recovery data".
+  getRunArchives: async (id: string) => {
+    const r = getRun(id);
+    if (!r) throw new ApiError(404, "run not found");
+    if (r.status === "failed") {
+      return delay(
+        {
+          supported: true,
+          legacy: false,
+          has_open_hold: true,
+          counts: {
+            preparing: 0,
+            uploading: 0,
+            available: 1,
+            needs_action: 0,
+            expired: 0,
+            discarded: 0,
+          },
+          archives: [
+            {
+              id: `${id}-cap1`,
+              run_id: id,
+              state: "available",
+              source_sha: "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+              attempted_head_sha: "f0e1d2c3b4a5968778695a4b3c2d1e0f01234567",
+              byte_size: 4718592,
+              checksum: "sha256:3f786850e387550fdab836ed7e6dc881de23001b",
+              prerequisite_shas: ["9988776655443322110099887766554433221100"],
+              created_at: new Date(Date.now() - 3_600_000).toISOString(),
+              expires_at: new Date(Date.now() + 6 * 86_400_000).toISOString(),
+            },
+          ],
+        },
+        60,
+      );
+    }
+    return delay(
+      {
+        supported: true,
+        legacy: false,
+        has_open_hold: false,
+        counts: {
+          preparing: 0,
+          uploading: 0,
+          available: 0,
+          needs_action: 0,
+          expired: 0,
+          discarded: 0,
+        },
+        archives: [],
+      },
+      60,
+    );
+  },
   submitRunInput: async (
     id: string,
     kind: RunInputKind,

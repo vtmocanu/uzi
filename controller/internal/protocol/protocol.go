@@ -78,6 +78,13 @@ type DesiredWorker struct {
 	// when its run ends anyway. Mirrors the api's hostedsvc.DesiredWorker.Ephemeral; the
 	// shared golden pins the two in lockstep.
 	Ephemeral bool `json:"ephemeral"`
+	// CustodyHeld is true when the worker retains unpublished run work under a durable
+	// recovery custody hold (PRD #1296 M1, D3/D9): a distinct signal, INDEPENDENT of Busy
+	// and DrainingSince, that this side must honor on every teardown / data-PVC recycle path
+	// (ordinary roll, drain deadline, ForceRoll, disk pressure) so a held PVC is never
+	// discarded (the real reconcile wiring lands in M4). Mirrors the api's
+	// hostedsvc.DesiredWorker.CustodyHeld; the shared golden pins the two in lockstep.
+	CustodyHeld bool `json:"custody_held"`
 	// JoinToken is the plaintext, present only until a pod proves it holds it (by
 	// registering) or the api's buffer expires unread.
 	//

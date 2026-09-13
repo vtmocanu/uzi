@@ -2,6 +2,8 @@ package uzicli
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
 	"net/url"
 	"strconv"
 
@@ -10,6 +12,27 @@ import (
 
 // client_repos.go holds the repo, worker and project-sync verbs (uzi repo /
 // uzi worker / uzi project-sync) of the Client/HTTPClient split out of client.go (PRD #1017).
+
+// WorkerCustodyConflictError is the DISTINGUISHABLE typed error DeleteWorker returns
+// when the server refuses the delete with a 409 because the worker still retains
+// unpublished committed work for durable recovery (PRD #1296 M4b, D3) — as opposed to
+// the ordinary active-runs 409, which stays a plain *ExitError. It carries the open-hold
+// count and the server's message so `uzi worker rm` can print the recover-or-discard
+// guidance instead of a bare "conflict".
+//
+// It wraps the *ExitError (ExitConflict) via Unwrap so ExitCodeFor still resolves exit 5
+// for a caller that returns it straight to main, while errors.As reaches BOTH this type
+// (to read Holds) and the underlying *ExitError.
+type WorkerCustodyConflictError struct {
+	// Holds is the number of open custody holds the delete would have destroyed.
+	Holds int64
+	// Err is the shared 409 → ExitConflict error, whose message is the server's
+	// {"error": "..."} body verbatim.
+	Err *ExitError
+}
+
+func (e *WorkerCustodyConflictError) Error() string { return e.Err.Error() }
+func (e *WorkerCustodyConflictError) Unwrap() error { return e.Err }
 
 func (c *HTTPClient) ListWorkers(ctx context.Context) ([]apitypes.WorkerDTO, error) {
 	var env struct {
@@ -22,7 +45,39 @@ func (c *HTTPClient) ListWorkers(ctx context.Context) ([]apitypes.WorkerDTO, err
 }
 
 func (c *HTTPClient) DeleteWorker(ctx context.Context, id string) error {
-	return c.del(ctx, "/api/workers/"+url.PathEscape(id))
+	path := "/api/workers/" + url.PathEscape(id)
+	resp, body, err := c.doJSONRead(ctx, http.MethodDelete, path, nil)
+	if err != nil {
+		return err
+	}
+	// A 409 carrying a `custody_holds` count is the recovery-custody refusal (PRD #1296
+	// M4b): the worker still retains unpublished committed work whose only durable copy
+	// this delete would destroy. Surface it as a DISTINGUISHABLE typed error so
+	// `uzi worker rm` can print the recover-or-discard guidance; the ordinary active-runs
+	// 409 (no count) falls through to the shared statusError → ExitConflict path unchanged.
+	if resp.StatusCode == http.StatusConflict {
+		if holds, ok := custodyHoldsFromBody(body); ok {
+			return &WorkerCustodyConflictError{
+				Holds: holds,
+				Err:   statusError(resp.StatusCode, body, resp.Header.Get("Retry-After")),
+			}
+		}
+	}
+	return decode2xx(resp, body, path, nil)
+}
+
+// custodyHoldsFromBody reads the `custody_holds` count from a delete-refusal body and
+// reports whether the field was present. Its presence is what distinguishes the
+// recovery-custody 409 (PRD #1296 M4b) from the ordinary active-runs 409, which omits
+// it; a pointer target keeps an explicit zero-count field distinct from an absent one.
+func custodyHoldsFromBody(body []byte) (int64, bool) {
+	var b struct {
+		CustodyHolds *int64 `json:"custody_holds"`
+	}
+	if json.Unmarshal(body, &b) != nil || b.CustodyHolds == nil {
+		return 0, false
+	}
+	return *b.CustodyHolds, true
 }
 
 func (c *HTTPClient) DeleteRepo(ctx context.Context, id string) error {

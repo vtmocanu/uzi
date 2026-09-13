@@ -167,6 +167,7 @@ uzi run resume <run-id>
 uzi run mr-rework <run-id> [--enabled[=false]] [--clear]
 uzi run rework <run-id> [-m|--message <text>]
 uzi run decide <run-id> --continue [--guidance <text>]
+uzi run export <run-id> --output <path> [--capture <id>]
 uzi schedule create --repo <repo-id> [--repo <repo-id>]... (--issue <iid> | --sweep [--label <l>]... [--create-missing-labels] | --prompt <text>) (--at <rfc3339> | --cron <expr>) [--tz <iana>] [--enabled[=false]] [--auto-approve[=false]] [--wait-on-limit] [--mr-rework[=false]] [--output mr|issues]
 uzi schedule list
 uzi schedule get <schedule-id>
