@@ -1,10 +1,32 @@
-# codex-m4 maintainer handoff — the O-layer acceptance parent #1106 M4 still owes
+# codex-m4 maintainer acceptance record
 
 Parent #1106 M4 acceptance requires **maintainer-only evidence the uzi worker cannot produce**:
 a fresh packaged snapshot below the REAL Go supervisor on a Landlock-capable runtime, run on the
-actual merge-candidate images. That evidence is gated by `task check:codex-m4-receipts` — the
+actual merge-candidate images. That evidence is gated by `task check:codex-m4-receipts`, the
 lead's pre-merge gate, deliberately **not** folded into `gate:agent` / `test:codex-m4` so an
 owed packaged proof never reddens the worker's ordinary gate.
+
+For PR #1309, the packaged O proof and strict macOS Linux-container run are complete. Current-head
+GitHub CI after the recovered evidence-only commits remains the final acceptance item before parent
+M4 is marked complete.
+
+## Candidate evidence (2026-09-13)
+
+- Proven runtime revision: `d054eace7ebb0dcb8dbdb56eef4e40daa737c243`.
+- Packaged proof: [GitHub Actions run 34757302169](https://github.com/vtmocanu/uzi/actions/runs/34757302169), both jobs green at 19/19 tests.
+- `base` digest: `sha256:d818a9b17848cdf01e77527e510ed6b576ebacd339691e8793fa6481037d0260`.
+- `jvm` digest: `sha256:586fa43a4d277d601d0c737f01c8ee66ea0fa12075e8935f7f0fd4cb6430e4a5`.
+- Both images reported `tests=7`, `callbacks=1`, `delegations=1`, `roots=5`; each real-path record
+  reported nonzero provider turns, callbacks, delegation, roots, checkpoints, signals and
+  finalization, with API-key refresh equal to zero.
+- The real manifest bound all three O clauses to that proof and passed
+  `task check:codex-m4-receipts` at recovered head `704eadad` with an evidence-only tail.
+- `task gate:agent` passed at `704eadad` on macOS, including the offline container P suite at 5/5
+  and the 53-result `[claude/U, codex/U, codex/P]` completeness matrix.
+- Independent reviewer and security-auditor passes found no blocking issue.
+
+The machine manifest remains gitignored as the lead's out-of-band attestation. This committed record
+preserves the proof coordinates and image digests for long-term audit.
 
 ## The gate, redesigned around a fixed point
 
@@ -64,9 +86,9 @@ lead gate rejects it until a discharging manifest record exists. Do **not** mark
 complete, and do **not** move `prds/1287-codex-guardrail-conformance.md` to `prds/done/`, until
 every row below is resolved.
 
-## What is owed
+## Stable O requirements
 
-### 1. Inherited row — needs a manifest record, no code edit
+### 1. Inherited row: discharged by the candidate manifest
 
 **`codex-o-command-root-home-denial`** (File policy: command-root HOME/credential OS
 separation) cites `e2e/codex-m3b/lifecycle.test.ts` Block B (PRD #1171 m5) as its prior proof,
@@ -76,7 +98,7 @@ addition. Its committed row carries no digest — it needs only a matching `inhe
 `receipt-present`) record in the manifest, bound to the proven image pair. No edit to
 `clauses-codex.ts` is required.
 
-### 2. Owed rows — fresh packaged proof
+### 2. Owed rows: discharged by the fresh packaged proof
 
 Two rows have **no prior packaged evidence at all** — a direct harness spawn cannot prove the
 absence of a descendant process or the completeness of supervisor reaping, only a real packaged
@@ -116,9 +138,10 @@ Because these are committed `owed` clauses, the manifest must discharge each wit
      command/date).
    - `clauses` — one record per committed O clause: `codex-o-command-root-home-denial` recorded
      as `inherited`; `codex-o-descendant-code-mode-host-absence` and
-     `codex-o-packaged-descendant-reaping` recorded as `receipt-present` (each needs a FRESH
-     packaged snapshot below the real Go supervisor on a Landlock-capable runtime — that fresh
-     proof is still owed). Each record's `images` is the same proven pair from step 1.
+     `codex-o-packaged-descendant-reaping` recorded as `receipt-present` (each needs a fresh
+     packaged snapshot below the real Go supervisor on a Landlock-capable runtime). For PR #1309,
+     Actions run 34757302169 supplied that proof. Each record's `images` is the same proven pair
+     from step 1.
 3. **Confirm the tail is evidence-only.** `provenBaseCommit` must be an ancestor of the current
    HEAD, and the `provenBaseCommit..HEAD` diff must touch only evidence paths: `e2e/`, `prds/`,
    `docs/`, `adr/`, `specs/`, `.claude/`, `agent/test/`, `Taskfile.yml`, or any `*.md`. A change
@@ -136,8 +159,8 @@ Because these are committed `owed` clauses, the manifest must discharge each wit
    extra, duplicate, undischarged, mismatched, or disposition-mismatched).`
 5. **No edit to `clauses-codex.ts` is needed.** The old "pin digests into `clauses-codex.ts`" step
    — the one that created the circular commit — is gone; that is the whole point of the redesign.
-6. Still required before parent M4: the strict macOS Linux-container run (below) and current-head
-   CI `test-agent` confirmation (lead-owned).
+6. For PR #1309, the strict macOS Linux-container run is complete. Current-head CI
+   `test-agent` confirmation after the recovered commits remains lead-owned.
 7. Only then tick parent #1106 M4 and move `prds/1287-codex-guardrail-conformance.md` to
    `prds/done/`.
 
@@ -153,8 +176,8 @@ Because these are committed `owed` clauses, the manifest must discharge each wit
   disabled during tests, no Docker socket or maintainer HOME mounted, and hard-fails on missing
   Docker or an unsupported architecture (never a silent platform skip). `e2e/codex-m4/README.md`
   documents the reproduction commands; the worker unit-tests the plan builder, the orchestrator
-  and the hard-prerequisite gate (`macos-linux-runner.test.ts`), but actually running it on a
-  real macOS host with Docker remains the maintainer's to execute before parent M4 acceptance.
+  and the hard-prerequisite gate (`macos-linux-runner.test.ts`). The actual macOS run passed for
+  PR #1309 at recovered head `704eadad`; future candidates repeat it when the runner or P suite changes.
 - **Current-head CI `test-agent` confirmation.** The worker has no CI run URL for the exact
   tested revision to cite honestly; the lead owns confirming CI is green on this revision (or
   the revision that supersedes it) and recording the URL/counts.
