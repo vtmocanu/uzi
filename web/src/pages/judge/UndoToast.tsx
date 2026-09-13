@@ -14,7 +14,7 @@ export function UndoToast({ toast, onUndo, onDismiss }: { toast: Toast; onUndo: 
         className="flex items-center gap-3 rounded-lg border border-edge-strong bg-surface px-4 py-2.5 text-sm shadow-lg"
       >
         <span className="text-fg">{toast.message}</span>
-        {toast.undo.length > 0 && (
+        {(toast.undo.length > 0 || (toast.adminUndoCoords?.length ?? 0) > 0) && (
           <button
             type="button"
             onClick={onUndo}

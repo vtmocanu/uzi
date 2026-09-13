@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -309,8 +310,158 @@ func newAdminCmd(env Env, gf *globalFlags) *cobra.Command {
 		},
 	}
 
-	cmd.AddCommand(users, runs, workers, usage, rateLimits, cliTokens, guardrailImpact, blockedRepos, newAdminAgentSourceCmd(env, gf))
+	cmd.AddCommand(users, runs, workers, usage, rateLimits, cliTokens, guardrailImpact, blockedRepos, newAdminAgentSourceCmd(env, gf), newAdminReviewCmd(env, gf))
 	return cmd
+}
+
+// newAdminReviewCmd — `uzi admin review`. A container group (no RunE) of two READ-ONLY
+// leaves onto the admin "All users" judge aggregate (PRD #1184 M5): `backlog` reads GET
+// /admin/judge/recommendations and `stats` reads GET /admin/judge/stats. Both mount in the
+// admin READ group server-side (RequireUser + RequireAdminRO), so a uza_ (admin_ro) token
+// reads them; a masked uzc_/non-admin session is a 403 (exit 3).
+//
+// There is deliberately NO write verb here — the cross-user Mark done / Undo are cookie-only
+// (§379's read/write split), so there is nothing for the CLI to call — and NO --run flag on
+// backlog: the admin path has no ?run= anchor, because an anchor names a run and this view
+// hides attribution. Rendering shows only the aggregate counts ("K users · M runs · N open")
+// and never a per-run/occurrence line, so no owner, run id or run title reaches the terminal.
+func newAdminReviewCmd(env Env, gf *globalFlags) *cobra.Command {
+	group := &cobra.Command{
+		Use:   "review",
+		Short: "Read-only admin \"All users\" judge aggregate (attribution hidden)",
+	}
+
+	backlog := &cobra.Command{
+		Use:   "backlog",
+		Short: "List every user's judge recommendations, deduped and attribution-hidden",
+		Long: "List every recommendation across ALL users' runs, deduped by (category, target),\n" +
+			"with attribution hidden: each group reads \"K users · M runs · N open\" and there\n" +
+			"are NO per-run or occurrence lines — no owner, run id or run title is shown. This is\n" +
+			"the terminal form of the Judge page's admin \"All users\" view. Needs a uza_\n" +
+			"(admin_ro) token; there is no --run anchor (an anchor names a run).",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := env.client(gf)
+			if err != nil {
+				return err
+			}
+			return runAdminReviewBacklog(env, gf, c, cmd)
+		},
+	}
+	// Reuse the owner backlog's help text verbatim (the ONE place the CLI writes each set
+	// down), and forward both values verbatim: the server owns the validators, so an unknown
+	// bucket/category is its own 400 → the usage exit code, never a silently empty list.
+	backlog.Flags().String("bucket", "", backlogBucketFlagUsage)
+	backlog.Flags().String("category", "", backlogCategoryFlagUsage)
+
+	stats := &cobra.Command{
+		Use:   "stats",
+		Short: "Show the \"All users\" judge triage totals across every user's runs",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := env.client(gf)
+			if err != nil {
+				return err
+			}
+			t, err := c.AdminJudgeStats(cmd.Context())
+			if err != nil {
+				return err
+			}
+			p := env.printer(gf)
+			if p.Format == uzicli.FormatJSON {
+				return p.JSON(t)
+			}
+			rows := [][]string{
+				{"TOTAL", fmt.Sprintf("%d", t.Total)},
+				{"TO DO", fmt.Sprintf("%d", t.Todo)},
+				{"FILED", fmt.Sprintf("%d", t.Filed)},
+				{"DONE", fmt.Sprintf("%d", t.Done)},
+				{"DISMISSED", fmt.Sprintf("%d", t.Dismissed)},
+				{"FALSE POSITIVES", fmt.Sprintf("%d", t.FalsePositives)},
+			}
+			return p.Table(nil, rows)
+		},
+	}
+
+	group.AddCommand(backlog, stats)
+	return group
+}
+
+// runAdminReviewBacklog fetches and renders the admin "All users" aggregate. --bucket and
+// --category are forwarded verbatim (empty omits the parameter, so the server's default
+// applies — "todo" for bucket, "all labels" for category); an unknown value is the server's
+// 400, never a silent empty list. --json passes the server's envelope through unchanged, so an
+// agent sees `truncated` and the canonical `triage` alongside the attribution-hidden groups.
+func runAdminReviewBacklog(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command) error {
+	bucket, _ := cmd.Flags().GetString("bucket")
+	category, _ := cmd.Flags().GetString("category")
+	b, err := c.AdminJudgeBacklog(cmd.Context(), strings.TrimSpace(bucket), strings.TrimSpace(category))
+	if err != nil {
+		return err
+	}
+	p := env.printer(gf)
+	if p.Format == uzicli.FormatJSON {
+		return p.JSON(b)
+	}
+	return renderAdminBacklog(p, b)
+}
+
+// renderAdminBacklog is the human view of the admin "All users" aggregate: the canonical
+// triage line, then one block per group showing ONLY the aggregate counts
+// ("K users · M runs · N open") and the rationale preview. It deliberately prints NO per-run
+// or occurrence line — no owner, run id or run title — which is the CLI half of the
+// four-layer attribution hiding (§379); the DTO carries none of those fields to leak.
+//
+// The tally comes from the response's Triage, which the server sources from the separate
+// all-users stats query rather than tallying off these rows, so it stays correct under both
+// the bucket filter and truncation. Do NOT recompute it from the groups on screen.
+func renderAdminBacklog(p *uzicli.Printer, b apitypes.JudgeAdminBacklogDTO) error {
+	p.Println(triageLine(b.Triage))
+	if b.Truncated {
+		// The cap bounds ROWS and applies BEFORE grouping, so a surviving group's counts can
+		// be understated and a group whose only open occurrence fell outside the cut is missing
+		// from a todo view entirely. A MISSING group is UNKNOWN, not settled. Unlike the owner
+		// backlog there is no --run remedy — the admin path has no anchor — so the warning only
+		// states the caveat.
+		p.Println("warning: backlog truncated at the server's row cap — counts below may be understated and groups may be missing; a missing group is UNKNOWN, not settled")
+	}
+	if len(b.Groups) == 0 {
+		p.Println("no recommendations in this bucket")
+		return nil
+	}
+	p.Printf("groups (%d):\n", len(b.Groups))
+	for _, g := range b.Groups {
+		// Target and the rationale preview are attacker-influencable free text rendered into a
+		// terminal, so both go through sanitizeTTY — the same treatment the owner backlog gives.
+		// g.Category is CHECK-constrained to the closed taxonomy and bucket is a closed server
+		// enum, so both print raw, matching renderBacklog's considered exception.
+		p.Printf("- [%s] %s → %s · %s\n",
+			g.Bucket, g.Category, sanitizeTTY(g.Target), adminGroupCountsPhrase(g.UserCount, g.RunCount, g.OpenCount))
+		if r := sanitizeTTY(strings.TrimSpace(g.RationalePreview)); r != "" {
+			for _, line := range strings.Split(r, "\n") {
+				p.Printf("    %s\n", line)
+			}
+		}
+	}
+	return nil
+}
+
+// adminGroupCountsPhrase renders an admin aggregate group's evidence chip:
+// "K users · M runs · N open" (PRD #1184 M5), the cross-user cousin of the owner backlog's
+// openOfRunsPhrase. The user count leads because how many distinct people hit a pattern is the
+// strongest cross-user priority signal (the backlog ranks by it). The user and run nouns
+// singularise at 1; "open" is a bare count, matching the aggregate's spoken form.
+func adminGroupCountsPhrase(users, runs, open int) string {
+	return usersPhrase(users) + " · " + runsPhrase(runs) + " · " + fmt.Sprintf("%d open", open)
+}
+
+// usersPhrase renders the distinct-user evidence chip, singular at 1. The admin aggregate's
+// answer to runsPhrase.
+func usersPhrase(n int) string {
+	if n == 1 {
+		return "1 user"
+	}
+	return fmt.Sprintf("%d users", n)
 }
 
 // newAdminAgentSourceCmd — `uzi admin agent-source`. A container group (no RunE) of

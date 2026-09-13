@@ -23,6 +23,12 @@ judge for any individual user from **Admin → Users**. See
 [Admin settings](./admin-settings.md#run-judge) for the full set of
 instance-wide judge controls.
 
+Opting in also means your instance admin can see your recommendations: they
+get an attribution-hidden aggregate across every user's — your name, your
+runs, and everyone else's, left out. See
+[Admins: the All users view](#admins-the-all-users-view) below for what
+that aggregate does and doesn't show.
+
 ## Judge mode: off, optional, enforced
 
 The kill-switch above combines with a second instance setting — enforce the
@@ -377,6 +383,51 @@ amber if one is awaiting your approval or you have something unread here,
 ember while work is running, and no dot when everything's idle. It's a
 convenience for a backgrounded or pinned tab, updating live in Chrome and
 Firefox (Safari shows the plain uzi mark, without the live dot).
+
+## Admins: the All users view
+
+If you're an instance admin, a **Mine / All users** switch appears at the
+top of the Judge page. **Mine** is everything above, unchanged. **All
+users** groups the same coordinates (category + target) across *every*
+user's recommendations, so alongside how many runs a recommendation recurs
+in you also see a count of **distinct users** who hit the pattern — how
+widespread a recommendation is across the factory, not who's raising it.
+
+**Attribution is hidden**: no owner, no run title, no link into a run. Each
+occurrence in the expanded group reads only "A run, judged \<time\>" with
+its verdict and triage state. The aggregate is a view over *patterns*,
+where the person is noise — and, on a small team, a temptation. Say this
+plainly, though: it's **aggregated across users, not anonymous**. A
+recommendation's rationale is free text the judge wrote from your run's
+trace, and it can still name a repo or a file, so a determined reader may
+be able to infer whose it was from the text alone.
+
+Two actions are offered, one of them a deliberate exception to the hiding
+above:
+
+- **File issue** drafts from the coordinate's newest open occurrence — and
+  that draft card *does* name the producing run and its user. Filing
+  publishes that user's (LLM-authored, unverified) worker text to a forge,
+  so before clicking Create the admin needs to see whose text they're about
+  to publish — the same rule that already governs an admin filing from a
+  single run (see [Filing an issue from a recommendation](#filing-an-issue-from-a-recommendation)
+  above).
+- **Mark done** settles the coordinate across every user's open occurrence
+  in one action. Each affected owner's own row then reads **"Done by an
+  admin"**, with a working **Undo** on their side — undoing it only removes
+  what the admin set; a verdict a user set for themselves is left alone.
+
+There's **no Dismiss** here: dismissing someone else's recommendation is
+that person's judgment to make, not an admin's.
+
+The Mine / All users choice is remembered in that browser (default
+**Mine**); switching to All users never changes what your own nav badge
+counts — it's always your own To-triage total, whichever scope you're
+looking at.
+
+Reads are on the CLI too — `uzi admin review backlog` and `uzi admin review
+stats` (see [Reviewing and triaging from the CLI](./cli.md#reviewing-and-triaging-from-the-cli))
+— but File issue, Mark done, and Undo across users are web-only.
 
 ## Good to know
 
