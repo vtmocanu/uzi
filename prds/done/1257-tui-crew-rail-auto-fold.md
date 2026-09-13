@@ -1,7 +1,7 @@
 # PRD 1257: TUI crew rail auto-folds when the blocks below it would not fit
 
 - **Issue**: #1257
-- **Status**: Draft, queued for the `Planned` sweep
+- **Status**: Done — all milestones M1–M5 landed on `agent/issue-1257` (2026-09-13)
 - **Priority**: Medium
 - **Surfaces**: the `uzi tui` run detail view only (`api/cmd/uzi/tui_detail_rail.go`, `tui_detail.go`, `tui_keys.go`, their tests, one uxlab scene, `docs/cli.md`, specs). Everything is in the `api` Go module, so `task gate:api` is the gate for every milestone. No route, DTO, migration, web or worker change; the board is untouched.
 - **Trust boundary**: none crossed. The fold decision reads terminal geometry and row counts; no new untrusted field is drawn (every cell the rail shows already rides `m.renderer.Plain`, D7 of `.claude/rules/tui.md`).
