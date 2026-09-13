@@ -711,6 +711,24 @@ func TestTUIDetailMNoOpWithoutMR(t *testing.T) {
 	}
 }
 
+// TestTUIPRLeftArrowGoesBack pins that ← backs out of the PR drill-in to where it was opened from
+// (viewPulls on the default open path), sharing esc's back body — the drill-in binds → to open but
+// pre-fix left ← inert, so only esc went back (the asymmetry #1335 fixes). Pre-fix keyLeft is
+// unhandled in prKey, so the view stays viewPR and this reddens.
+func TestTUIPRLeftArrowGoesBack(t *testing.T) {
+	detail := prDetail(1335, "review_required", []apitypes.CheckDTO{ckPassed("a")}, nil, apitypes.MergeStateDTO{})
+	fake := &uzicli.FakeClient{Repos: []apitypes.RepoDTO{oneRepo()}}
+	m := openPRWith(t, fake, detail)
+	want := m.prReturn // viewPulls on the default open path
+	m = press(t, m, keyLeft)
+	if m.view != want {
+		t.Fatalf("← on the PR view did not return to the open-from view (view=%v, want %v)", m.view, want)
+	}
+	if want != viewPulls {
+		t.Fatalf("the default open path should set prReturn to the pulls list (got %v)", want)
+	}
+}
+
 // The PR view is a drill-in (no `/` filter), so q quits and ? opens help from it (D13).
 func TestTUIPRQuitAndHelpNotFiltered(t *testing.T) {
 	detail := prDetail(17, "approved", []apitypes.CheckDTO{ckPassed("a")}, nil, apitypes.MergeStateDTO{})

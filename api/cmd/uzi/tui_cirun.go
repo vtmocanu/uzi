@@ -204,9 +204,10 @@ func (m tuiModel) ciRunKey(k string) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	switch k {
-	case keyEsc:
-		// esc returns to the ci list — the only entry point — which is never clobbered (m.ci persists
-		// on the model), so it is still loaded on return (D1).
+	case keyEsc, keyLeft:
+		// ←/esc both return to the ci list — the only entry point — which is never clobbered (m.ci
+		// persists on the model), so it is still loaded on return (D1). → opens a row, so ← is its
+		// symmetric back (issue #1335).
 		m.view = viewCI
 		return m, nil
 	case keyRefresh:

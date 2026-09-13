@@ -272,10 +272,11 @@ func (m tuiModel) prKey(k string) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	switch k {
-	case keyEsc:
-		// esc returns to where the drill-in was opened from (D1): the pulls list, or the run view on
-		// the detail→m→PR path. The state returned to persists on the model (m.pulls / m.detail are
-		// never clobbered), so it is still loaded. Reset to the default for the next open.
+	case keyEsc, keyLeft:
+		// ←/esc both return to where the drill-in was opened from (D1): the pulls list, or the run view
+		// on the detail→m→PR path. → opens a row, so ← is its symmetric back (issue #1335). The state
+		// returned to persists on the model (m.pulls / m.detail are never clobbered), so it is still
+		// loaded. Reset to the default for the next open.
 		m.view = m.prReturn
 		m.prReturn = viewPulls
 		return m, nil
