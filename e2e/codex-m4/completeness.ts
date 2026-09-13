@@ -3,11 +3,16 @@
 // `checkCompleteness` is a PURE function over (clauses, executed-test evidence, required
 // matrix). It fails on: duplicate id; unknown id (a prerequisite referencing an undefined
 // clause); a missing required (adapter,layer) row; an adapter omitted from a required layer;
-// a required U/P row that matches ZERO executed evidence (zero-test match); a required U/P
-// case whose evidence is skip|cancel|todo|fail (hard failure); an unmet prerequisite of a
-// required row; and any O row whose `o` field is missing or malformed. It PERMITS a
-// well-formed `owed` O row (owed is a valid record for the ORDINARY gate — the separate
-// receipts gate rejects it) and accepts well-formed `inherited`/`receipt-present` O rows.
+// a required U/P row that lists no test title (zero-test match); a required U/P row EVERY
+// listed title of which must be `pass` — a title with no executed evidence (missing) OR whose
+// evidence is skip|cancel|todo|fail each reject individually, so one listed title passing no
+// longer masks a sibling that did not run; an unmet prerequisite of a required row; and any O
+// row whose `o` field is missing or malformed. It PERMITS a well-formed `owed` O row (owed is
+// a valid record for the ORDINARY gate — the separate receipts gate rejects it) and accepts
+// well-formed `inherited`/`receipt-present` O rows.
+//
+// A PREREQUISITE (below) still needs only ≥1 passing test — it is not tightened to require every
+// listed title, so `hasPassingTest` remains its oracle.
 //
 // The required matrix is a PARAMETER so C5 can widen it (add rows/cells) without rewriting
 // this checker. At C1 the matrix is minimal (only the real, executed codex P smoke); the
@@ -18,7 +23,7 @@
 
 import type { Adapter, ClauseRow, Layer } from "./clause.js";
 import { isOState } from "./clause.js";
-import type { EvidenceMap, EvidenceResult } from "./evidence.js";
+import type { EvidenceMap } from "./evidence.js";
 
 /** One required (adapter, layer) coverage cell the milestone demands. */
 export interface RequiredCell {
@@ -31,9 +36,6 @@ export interface CompletenessReport {
   /** Human-readable, most-specific-first failure lines; empty when `ok`. */
   readonly failures: string[];
 }
-
-/** A required U/P case must be exactly `pass`; every other executed result is a failure. */
-const BAD_RESULTS: ReadonlySet<EvidenceResult> = new Set(["fail", "skip", "cancel", "todo"]);
 
 function cellKey(adapter: Adapter, layer: Layer): string {
   return `${adapter}/${layer}`;
@@ -93,22 +95,21 @@ export function checkCompleteness(
   }
 
   // 4. Execution + prerequisite enforcement for REQUIRED rows only. A U/P row under a
-  //    required cell must match ≥1 executed test, and every one it matched must be `pass`;
-  //    an O row under a required cell is accepted when well-formed (owed included).
+  //    required cell must list ≥1 title, and EVERY listed title must have `pass` evidence
+  //    (a missing/skip/cancel/todo/fail title each rejects); an O row under a required cell
+  //    is accepted when well-formed (owed included).
   for (const c of clauses) {
     if (!requiredCells.has(cellKey(c.adapter, c.layer))) continue;
 
     if (c.layer === "U" || c.layer === "P") {
-      const executed = c.tests.filter((title) => evidence[title] !== undefined);
-      if (executed.length === 0) {
-        failures.push(
-          `zero-test match: required ${cellKey(c.adapter, c.layer)} clause "${c.id}" has no executed test `
-          + `(tests: ${c.tests.length === 0 ? "<none listed>" : c.tests.join(", ")})`,
-        );
+      if (c.tests.length === 0) {
+        failures.push(`zero-test match: required ${cellKey(c.adapter, c.layer)} clause "${c.id}" lists no test title`);
       }
-      for (const title of executed) {
+      for (const title of c.tests) {
         const result = evidence[title];
-        if (result !== undefined && BAD_RESULTS.has(result)) {
+        if (result === undefined) {
+          failures.push(`required ${cellKey(c.adapter, c.layer)} clause "${c.id}" test "${title}" has NO executed evidence (missing)`);
+        } else if (result !== "pass") {
           failures.push(`required ${cellKey(c.adapter, c.layer)} clause "${c.id}" test "${title}" is "${result}"`);
         }
       }

@@ -184,7 +184,8 @@ const _adviceCeilingTypeGuard: [
   AssertFalse<Has<"mcpServers">>,
   AssertFalse<Has<"registry">>,
   AssertFalse<Has<"handlers">>,
-] = [false, false, false, false, false];
+  AssertFalse<Has<"toolServers">>,
+] = [false, false, false, false, false, false];
 void _adviceCeilingTypeGuard;
 
 test("claude C2 advice ceiling: AdviceRequest exposes no cwd/agents/mcpServers/registry", (t) => {

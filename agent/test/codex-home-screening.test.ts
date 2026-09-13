@@ -377,6 +377,18 @@ function replySuccess(rig: Rig, requestId: number): boolean | undefined {
   return result.success as boolean | undefined;
 }
 
+/** The broker deny message the wire response carries for `requestId`. A broker deny maps to
+ *  `{ result: { success:false, contentItems:[{ type:"inputText", text: <deny message> }] } }`
+ *  (codex-harness replyOf), so the human `message` — here the guardrail reason — rides in the
+ *  first content item's `text`. Returns undefined when no such text is present. */
+function replyReason(rig: Rig, requestId: number): string | undefined {
+  const response = rig.transport.responses.find((r) => r.requestId === requestId)?.response;
+  const items = rec(rec(response).result).contentItems;
+  if (!Array.isArray(items)) return undefined;
+  const first = rec(items[0]);
+  return typeof first.text === "string" ? first.text : undefined;
+}
+
 // ================================================================================
 describe("PRD #1287 D6: provider-HOME screening through the REAL CodexExecutor screenPolicy", () => {
   it("shell leg (calibration): a literal `cat <homeRoot>/codex-data/epoch-0/codex/auth.json` is DENIED before the command spawn seam (counter stays 0), while a harmless in-worktree command still reaches its effect", async (t) => {
@@ -431,12 +443,33 @@ describe("PRD #1287 D6: provider-HOME screening through the REAL CodexExecutor s
     await withTimeout(exec.run(ctx), 5000, "file-leg run");
 
     // NEGATIVE-EFFECT ORACLE: no fileop op ever ran against the credential path (denied before the
-    // effect — by the codex-data/ secret prefix under the repair, and by the outside-worktree jail
-    // regardless, since the provider HOME sits outside /work/repo: defense in depth).
+    // effect). The D6 repair is what fires FIRST here: guardrails' classifyResolvedPath checks the
+    // configured secret prefix (hitsSecret → REASON_SECRET_FILE) BEFORE the containment check, so the
+    // executor's `extraSecretPaths: [<homeRoot>/codex-data/]` denies the credential path as a SECRET,
+    // not merely as an outside-the-worktree escape. The outside-worktree jail (the provider HOME sits
+    // outside /work/repo) remains as defense-in-depth BEHIND the secret classification.
     const opsOnAuth = rig.fileopOps.filter((o) => (o.path ?? "").includes("auth.json") || (o.path ?? "").includes("codex-data"));
     assert.equal(opsOnAuth.length, 0, "no fileop op reached the credential path");
     assert.equal(replySuccess(rig, 51), false, "the forbidden Read path form was denied");
     assert.equal(replySuccess(rig, 52), false, "the forbidden Write path form was denied");
+
+    // REASON ORACLE (the D6 secret-prefix repair, not the outside-worktree jail): the deny message
+    // the wire response carries is REASON_SECRET_FILE. The constant is not exported, so match its
+    // literal substring, and assert it is NOT the outside-worktree text — proving secret
+    // classification denied FIRST rather than the defense-in-depth containment check.
+    for (const id of [51, 52]) {
+      const reason = replyReason(rig, id);
+      assert.match(
+        reason ?? "",
+        /reading the worker credential file is not permitted/,
+        `request ${id} was denied as a SECRET (the D6 repair), carrying REASON_SECRET_FILE`,
+      );
+      assert.doesNotMatch(
+        reason ?? "",
+        /file access outside the run worktree/,
+        `request ${id} was NOT denied merely as an outside-worktree escape`,
+      );
+    }
 
     // POSITIVE CONTROL: the allowed in-worktree read reached the fileop client (allowed workspace access preserved).
     const allowedReads = rig.fileopOps.filter((o) => o.op === "read" && o.path === "notes.txt");

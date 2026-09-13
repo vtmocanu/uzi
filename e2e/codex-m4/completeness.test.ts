@@ -85,13 +85,25 @@ describe("checkCompleteness failure modes", () => {
     assert.match(firstFailure(checkCompleteness(clauses, evidence, req)), /adapter "claude" omitted from required layer "P"/);
   });
 
-  it("fires on a zero-test match for a required U/P row", () => {
-    const clauses = [uprow({ id: "p1", adapter: "codex", layer: "P", tests: ["never-run"] })];
-    const evidence: EvidenceMap = {}; // nothing executed
-    assert.match(firstFailure(checkCompleteness(clauses, evidence, REQ_CODEX_P)), /zero-test match: required codex\/P clause "p1"/);
+  it("fires on a zero-test match for a required U/P row that lists no test title", () => {
+    const clauses = [uprow({ id: "p1", adapter: "codex", layer: "P", tests: [] })];
+    const evidence: EvidenceMap = {}; // nothing to run
+    assert.match(firstFailure(checkCompleteness(clauses, evidence, REQ_CODEX_P)), /zero-test match: required codex\/P clause "p1" lists no test title/);
   });
 
-  it("fires on a required U/P case whose evidence is skip|cancel|todo|fail", () => {
+  it("fires when a listed title of a required U/P row is MISSING even though a sibling title passed", () => {
+    // The discriminating case: under the OLD "filter to only executed titles" logic this passed
+    // (the one executed title was `pass`, the un-run one was silently ignored). The stricter rule
+    // requires EVERY listed title to have `pass` evidence, so a title with no evidence rejects.
+    const clauses = [uprow({ id: "p1", adapter: "codex", layer: "P", tests: ["ran", "never-run"] })];
+    const evidence: EvidenceMap = { ran: "pass" }; // "never-run" has NO executed evidence
+    assert.match(
+      firstFailure(checkCompleteness(clauses, evidence, REQ_CODEX_P)),
+      /test "never-run" has NO executed evidence \(missing\)/,
+    );
+  });
+
+  it("fires on a required U/P case whose evidence is skip|cancel|todo|fail (each listed title)", () => {
     const clauses = [uprow({ id: "p1", adapter: "codex", layer: "P", tests: ["t"] })];
     for (const bad of ["skip", "cancel", "todo", "fail"] as const) {
       const evidence: EvidenceMap = { t: bad };
