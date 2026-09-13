@@ -485,7 +485,9 @@ export class WorkerClient {
    *  the caller distinguishes a DEFINITIVE 404 (run not owned / reclaimed) from a transient
    *  error via `err.status`. Reuses GetRunOwnedByWorker server-side; no new query. */
   async getRunOwnership(runId: string): Promise<RunOwnershipResponse> {
-    return (await this.getJSON(`${WORKER_API_PREFIX}/runs/${runId}/ownership`)) as RunOwnershipResponse;
+    // issue #1308 — encode the id (matching the sibling getChatRun): the #1308 self-heal is
+    // the first caller to pass a journal-derived value rather than a claim's own UUID.
+    return (await this.getJSON(`${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/ownership`)) as RunOwnershipResponse;
   }
 
   // ── Chat agent read surface (PRD #39 M3) ───────────────────────────────────
