@@ -26,7 +26,6 @@ function uprow(overrides: Partial<ClauseRow> & Pick<ClauseRow, "id" | "adapter" 
 const INHERITED_O: OState = {
   kind: "inherited",
   source: "src",
-  imageDigests: { base: "sha256:deadbeef", jvm: "sha256:deadbeef" },
   target: "image",
   unchangedJustification: "unchanged",
 };

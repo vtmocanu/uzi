@@ -4,11 +4,11 @@
 //
 // C1 SEEDS this file with:
 //   1. the C1 P-smoke's OWN row (the real, executed startup + allowed-callback clause), and
-//   2. two O rows demonstrating each of the three-state model's non-`receipt-present` arms —
-//      one `inherited` (a prior M3b packaged assertion) and one `owed` (descendant /
-//      code-mode-host absence, owned by the maintainer). The `owed` row is a deliberate C1
-//      seed: it makes `check:codex-m4-receipts` (the LEAD merge gate) exit non-zero, which is
-//      correct — an owed O assertion blocks merge until the maintainer records its receipt.
+//   2. two O rows demonstrating each arm of the committed two-state O model — one `inherited`
+//      (a prior M3b packaged assertion) and one `owed` (descendant / code-mode-host absence,
+//      owned by the maintainer). Both are STABLE requirements carrying NO candidate image digest;
+//      the receipts gate (`check:codex-m4-receipts`, the LEAD merge gate) exits non-zero until the
+//      maintainer discharges every O clause with a record in the gitignored candidate manifest.
 
 import type { ClauseRow } from "./clause.js";
 import { CODEX_STARTUP_SMOKE_TITLE } from "./titles.js";
@@ -62,8 +62,10 @@ export const CODEX_CLAUSES: ClauseRow[] = [
   },
   {
     // C1 SEED — an `inherited` O row: a prior M3b packaged assertion whose OS mechanism is
-    // unchanged at this candidate (D8). C4/C5 replace the citation with the exact merge
-    // candidate's digest; this seeds the shape and is accepted (well-formed) by the checker.
+    // unchanged at any candidate (D8). This committed row is a STABLE REQUIREMENT and carries NO
+    // candidate image digest; the two proven merge-candidate digests live in the gitignored
+    // candidate manifest that receipts.ts binds, never in this file. It is accepted (well-formed)
+    // by the ordinary completeness checker.
     id: "codex-o-command-root-home-denial",
     adapter: "codex",
     layer: "O",
@@ -81,10 +83,6 @@ export const CODEX_CLAUSES: ClauseRow[] = [
     o: {
       kind: "inherited",
       source: "e2e/codex-m3b/lifecycle.test.ts Block B (PRD #1171 m5)",
-      imageDigests: {
-        base: "sha256:PENDING-CANDIDATE-DIGEST-BASE",
-        jvm: "sha256:PENDING-CANDIDATE-DIGEST-JVM",
-      },
       target: "codex worker image (base + jvm)",
       unchangedJustification:
         "C1-C4 change no agent/codex/** supervisor/fileop/launcher code — the C3 D6 repair is a "
@@ -93,8 +91,9 @@ export const CODEX_CLAUSES: ClauseRow[] = [
         + "command-root HOME/credential separation is byte-identical to the M3b-proven images. Its "
         + "required regression is the C3 U/P HOME-screener case (codex-u-home-screening-executor-d6) "
         + "plus the M3b host-side Block A evidence, now run via `task test:codex-m3b:host` (C4 §4). "
-        + "The digests stay the PENDING placeholders; the maintainer pins BOTH real merge-candidate "
-        + "digests (base and jvm) and re-runs UZI_CODEX_M3B_PACKAGED=1 test:codex-m3b:packaged before parent M4 (D8).",
+        + "Binding this STABLE requirement to the actual merge-candidate images (the two proven "
+        + "base/jvm digests from UZI_CODEX_M3B_PACKAGED=1 test:codex-m3b:packaged) is the gitignored "
+        + "candidate manifest's job (receipts.ts), not this committed row's.",
     },
   },
   {

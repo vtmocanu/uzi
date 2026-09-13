@@ -12,15 +12,14 @@ function cell(value: string): string {
   return value.replace(/\\/g, "\\\\").replace(/\|/g, "\\|").replace(/\r?\n/g, " ");
 }
 
-/** The O-evidence state, compacted for the table's last column. */
+/** The committed O-evidence state (two-state: inherited | owed), compacted for the table's last
+ *  column. The candidate receipt/digests are manifest-only (receipts.ts), so they never render here. */
 function oSummary(c: ClauseRow): string {
   if (c.layer !== "O") return "";
   if (c.o === undefined) return "MALFORMED (missing)";
   switch (c.o.kind) {
     case "inherited":
       return `inherited ← ${c.o.source}`;
-    case "receipt-present":
-      return `receipt ← ${c.o.source}`;
     case "owed":
       return `OWED → ${c.o.owner}`;
   }
@@ -28,7 +27,7 @@ function oSummary(c: ClauseRow): string {
 
 /** Render the whole registry as a readable clause→layer markdown table. Every clause row
  *  appears exactly once, in registry order, with its adapter, layer, family, seam, intended
- *  outcome, the executed tests that cover it, and (for O rows) its three-state summary. */
+ *  outcome, the executed tests that cover it, and (for O rows) its two-state summary. */
 export function renderClauseMap(clauses: readonly ClauseRow[]): string {
   const header = [
     "# Codex/Claude M4 conformance clause map",

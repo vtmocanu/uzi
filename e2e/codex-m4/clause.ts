@@ -1,4 +1,4 @@
-// PRD #1287 C1 — the machine-readable clause-row TYPE and the O-evidence three-state model.
+// PRD #1287 C1 — the machine-readable clause-row TYPE and the committed O-evidence two-state model.
 //
 // A clause is one adversarial case with a STABLE unique id, an adapter, a layer (U/P/O per
 // D7), the production seam it exercises, a positive control, a negative-effect oracle, the
@@ -16,43 +16,45 @@
 export type Adapter = "claude" | "codex";
 
 /** The three evidence layers (D7). U/P are executed here (unit + real protocol); O is
- *  packaged-OS evidence that is inherited, receipted, or explicitly owed (D8). */
+ *  packaged-OS evidence that is `inherited` or explicitly `owed` in the committed registry (D8) —
+ *  the candidate receipts (and their image digests) live in the gitignored manifest receipts.ts
+ *  binds, never in this registry. */
 export type Layer = "U" | "P" | "O";
 
-/**
- * The O-evidence three-state model (D8). An O row can never be "executed" in this worker
- * (no Landlock/uid-split/descendant-reaping proof runs here), so its evidence is one of:
- *   - `inherited`      — a previously tested source/image proves the SAME unchanged mechanism
- *                        (cites the source, image digests (base+jvm), target, case, and WHY the
- *                        enforcement path is unchanged at this candidate);
- *   - `receipt-present`— a fresh packaged case has been run and recorded for this candidate;
- *   - `owed`           — no valid proof exists yet; the maintainer owns running it. `owed` is a
- *                        VALID record for the ordinary completeness gate (it is not executed
- *                        evidence) but the SEPARATE receipts gate (receipts.ts) rejects it.
- */
-/** The pair of distinct merge-candidate image digests every O proof must bind (D8): a merge
- *  candidate ships TWO images — `base` and `jvm` — and one proven image cannot vouch for the
- *  other. Both must independently resolve to a real `sha256:<64-hex>` before the receipts gate
- *  passes. */
+/** The pair of distinct proven merge-candidate image digests the candidate MANIFEST binds (D8): a
+ *  merge candidate ships TWO images — `base` and `jvm` — and one proven image cannot vouch for the
+ *  other. This type is imported by receipts.ts for the manifest's proven-image pair and each
+ *  per-clause record's digests; it is NO LONGER embedded in the committed clause rows (candidate
+ *  digests live only in the gitignored manifest). Both must independently resolve to a real
+ *  `sha256:<64-hex>` before the receipts gate passes. */
 export interface ImageDigests {
   readonly base: string;
   readonly jvm: string;
 }
 
+/**
+ * The committed O-evidence TWO-state model (D8). The registry describes STABLE requirements, not
+ * candidate-specific evidence — an O row can never be "executed" in this worker (no
+ * Landlock/uid-split/descendant-reaping proof runs here), so its `o` field is one of:
+ *   - `inherited` — a previously tested source proves the SAME unchanged mechanism (cites the
+ *                   source, target, and WHY the enforcement path is unchanged at any candidate);
+ *   - `owed`      — no valid proof exists yet; the maintainer owns running it. `owed` is a VALID
+ *                   record for the ordinary completeness gate (it is not executed evidence) but the
+ *                   SEPARATE receipts gate (receipts.ts) requires a discharging manifest record.
+ *
+ * The `receipt-present` disposition and the actual candidate image digests are NO LONGER part of
+ * this committed model: they are MANIFEST-only, candidate-specific evidence (a gitignored
+ * receipt-manifest.json checked by receipts.ts). Committing a digest into a row would change HEAD
+ * and — because the worker Dockerfiles `COPY . /opt/uzi-src` and stamp UZI_SRC_SHA — the image
+ * digest itself, so there is no fixed point; candidate digests are therefore kept OUT of the
+ * committed registry.
+ */
 export type OState =
   | {
       readonly kind: "inherited";
       readonly source: string;
-      readonly imageDigests: ImageDigests;
       readonly target: string;
       readonly unchangedJustification: string;
-    }
-  | {
-      readonly kind: "receipt-present";
-      readonly source: string;
-      readonly imageDigests: ImageDigests;
-      readonly target: string;
-      readonly recordedAt?: string;
     }
   | {
       readonly kind: "owed";
@@ -89,27 +91,22 @@ export interface ClauseRow {
   /** Clause ids that must be satisfied first (their tests must have executed pass). Each must
    *  be a defined clause id, else the checker reports an unknown id. */
   readonly prerequisites?: readonly string[];
-  /** REQUIRED for `layer === "O"`, ignored otherwise. The three-state O evidence record. */
+  /** REQUIRED for `layer === "O"`, ignored otherwise. The committed two-state O requirement record. */
   readonly o?: OState;
 }
 
-/** True when `value` is a well-formed {@link OState}. Used by the completeness checker to
- *  reject an O row whose `o` field is missing or malformed (D8), and by the receipts gate. */
+/** True when `value` is a well-formed {@link OState}. Used by the completeness checker to reject an
+ *  O row whose `o` field is missing or malformed (D8), and by the receipts gate. Validates exactly
+ *  the two committed variants: `inherited` needs non-empty string source/target/unchangedJustification;
+ *  `owed` needs non-empty string target/reason/owner. Anything else — including the retired
+ *  `receipt-present` variant or a row that still embeds `imageDigests` — is rejected. */
 export function isOState(value: unknown): value is OState {
   if (value === null || typeof value !== "object") return false;
   const o = value as Record<string, unknown>;
   const str = (v: unknown): v is string => typeof v === "string" && v.length > 0;
-  const digestsOk = (v: unknown): boolean => {
-    if (v === null || typeof v !== "object") return false;
-    const d = v as Record<string, unknown>;
-    return str(d.base) && str(d.jvm);
-  };
   switch (o.kind) {
     case "inherited":
-      return digestsOk(o.imageDigests) && str(o.source) && str(o.target) && str(o.unchangedJustification);
-    case "receipt-present":
-      return digestsOk(o.imageDigests) && str(o.source) && str(o.target)
-        && (o.recordedAt === undefined || str(o.recordedAt));
+      return str(o.source) && str(o.target) && str(o.unchangedJustification);
     case "owed":
       return str(o.target) && str(o.reason) && str(o.owner);
     default:
