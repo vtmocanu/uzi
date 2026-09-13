@@ -15,7 +15,10 @@
 -- Postgres auto-named it <table>_<column>_check; widened by 00137 for
 -- workflow_scope_missing, by 00139 for finalize_base_align_conflict, and by 00186 for
 -- push_secret_blocked). Drop and re-add it with the widened set — the twelve values
--- carried verbatim from 00186's Up plus runner_clone_conflict.
+-- carried verbatim from 00186's Up plus runner_clone_conflict. The re-add is NOT VALID so
+-- it is lock-cheap (no validating full-table scan under ACCESS EXCLUSIVE at add-time);
+-- 00224_validate_run_runner_clone_conflict.sql runs VALIDATE CONSTRAINT to confirm the
+-- backlog under a lock-cheap SHARE UPDATE EXCLUSIVE scan, per the 00219/00220 two-step.
 -- TestFailOriginVocabularyMatchesCheck parses THIS migration's CHECK and asserts it
 -- equals AllFailOrigins(), so adding a member on one side without the other reddens at
 -- `go test` rather than raising 23514 on a user's failed run.
@@ -26,6 +29,9 @@
 -- from #1184). Strict goose refuses to boot on a version below an already-applied head
 -- (store/migrate.go), per the CLAUDE.md goose convention (no allow-missing).
 ALTER TABLE runs DROP CONSTRAINT runs_fail_origin_check;
+-- Added NOT VALID: skip the validating table scan (and the ACCESS EXCLUSIVE lock it would
+-- otherwise hold to check every existing row) at add-time; new/updated rows are still
+-- enforced. 00224 runs VALIDATE CONSTRAINT to confirm the backlog under a lock-cheap scan.
 ALTER TABLE runs ADD CONSTRAINT runs_fail_origin_check
     CHECK (fail_origin IN (
         'provisioning_failed',
@@ -41,7 +47,7 @@ ALTER TABLE runs ADD CONSTRAINT runs_fail_origin_check
         'finalize_base_align_conflict',
         'push_secret_blocked',
         'runner_clone_conflict'
-    ));
+    )) NOT VALID;
 
 -- +goose Down
 
