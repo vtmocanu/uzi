@@ -246,6 +246,42 @@ export class PendingRecoveryCaptureError extends Error {
   }
 }
 
+/**
+ * issue #1315 — the canonical clone for this branch is journaled to ANOTHER run's
+ * recovery capture. The git layer is claim-agnostic and NEVER probes owner status, so
+ * it fails closed here; the runner probes the named `ownerRunId` authoritatively and
+ * reclaims (via retireRunnerClone) only when that owner is terminal. This is the ONLY
+ * reclaimable guard case: the journaled path equals the computed canonical clone path.
+ */
+export class ForeignCaptureBlockedError extends Error {
+  constructor(
+    readonly clonePath: string,
+    readonly branch: string,
+    readonly ownerRunId: string,
+  ) {
+    super("refusing to replace a retained clone owned by another run");
+    this.name = "ForeignCaptureBlockedError";
+  }
+}
+
+/**
+ * issue #1315 — the recovery journal for this branch names a clone path that is NOT
+ * this branch's computed canonical clone: a malformed or stale-for-this-branch journal
+ * (e.g. a different clone key, or a path that no longer maps to this branch). NEVER
+ * reclaimable — fail closed always, even when the journaled path is itself under
+ * runnerRoot. The runner must NOT owner-probe or retire on this error; it propagates.
+ */
+export class StaleCaptureJournalError extends Error {
+  constructor(
+    readonly journaledPath: string,
+    readonly computedPath: string,
+    readonly branch: string,
+  ) {
+    super("recovery journal points at a stale or malformed clone path for this branch");
+    this.name = "StaleCaptureJournalError";
+  }
+}
+
 function recoveryCaptureKey(branch: string): string {
   return `uzi-recovery.${branch}.clone`;
 }
@@ -424,6 +460,12 @@ export class GitCache {
    *  worker-only `repos/` bare cache, so the M3 ownership carve-out is a clean
    *  boundary: `runner/` is runner-writable, `repos/` stays worker-only. */
   private readonly runnerRoot: string;
+  /** issue #1315 — worker-only 0700 holding subtree for atomically-released clones.
+   *  A SIBLING of runnerRoot under the SAME dataDir (so a rename cannot hit EXDEV),
+   *  but OUTSIDE the runner-writable `runner/<repo>` tree: a retired clone lands here
+   *  where the untrusted runner uid cannot reach it. Terminal trash is disposed from
+   *  here; a foreign quarantine is retained here for forensics. */
+  private readonly runnerHoldingRoot: string;
   /** PRD #1296 M3 — the durable durable-recovery journal + verified-bundle store, a
    *  DISTINCT /data subtree from `repos/` (worker bare) and `runner/` (torn-down clones),
    *  and separate from the unrelated issue #1187 git-config recovery-capture journal.
@@ -443,6 +485,7 @@ export class GitCache {
   ) {
     this.reposRoot = path.join(dataDir, "repos");
     this.runnerRoot = path.join(dataDir, "runner");
+    this.runnerHoldingRoot = path.join(dataDir, "runner-quarantine");
     this.recoveryRoot = path.join(dataDir, "recovery");
   }
 
@@ -628,9 +671,22 @@ export class GitCache {
         if (err.code === "ENOENT") return false;
         throw err;
       })) {
-        if (pending.runId !== runId || pending.clonePath !== clonePath) {
-          throw new Error("refusing to replace a retained clone owned by another run");
+        // issue #1315 — three fail-closed cases. The git layer NEVER probes owner
+        // status and NEVER disposes; it only classifies. Only Case B is reclaimable,
+        // and only the runner reclaims, after an authoritative owner probe.
+        if (pending.clonePath !== clonePath) {
+          // Case A: the journal names a DIFFERENT path than this branch's canonical
+          // clone (a stale/malformed journal, or a different clone key). Never
+          // reclaimable — fail closed ALWAYS, even when that path is under runnerRoot.
+          throw new StaleCaptureJournalError(pending.clonePath, clonePath, branch);
         }
+        if (pending.runId !== runId) {
+          // Case B: the matched canonical pair, owned by ANOTHER run. The only
+          // reclaimable condition — the runner probes `pending.runId` and, iff it is
+          // terminal, retires the residue before reseeding.
+          throw new ForeignCaptureBlockedError(clonePath, branch, pending.runId);
+        }
+        // Case C: this run's own retained work — capture before reseeding.
         throw new PendingRecoveryCaptureError(clonePath, branch);
       }
       await fs.rm(clonePath, { recursive: true, force: true });
@@ -944,8 +1000,12 @@ export class GitCache {
       // --detach` per object-writing command (fetch/commit/push) outlives the git we awaited
       // and keeps writing inside `.git`; it spawns a repack/pack-objects subtree only once
       // `gc.auto`'s threshold is met, which a per-run `--shared` clone never reaches.
-      // removeRunnerClone (runner.ts:454) `fs.rm`s this tree moments after the agent's last
-      // commit and our push, and `force: true` suppresses ENOENT, not ENOTEMPTY.
+      // The terminal cleanup (retireRunnerClone, runner.ts terminal-cleanup block)
+      // releases this tree moments after the agent's last commit and our push; issue
+      // #1315 made that release an ATOMIC RENAME precisely because `force: true`
+      // suppresses ENOENT, not ENOTEMPTY, and a daemon still writing inside `.git` races
+      // a recursive rm (issue #1197). The reseed path still deletes recursively, so
+      // disabling the daemon below stays load-bearing.
       //
       // As RUNNER, matching the clone: `<clone>/.git/config` is runner-owned, so this
       // rewrites it in place as the same uid. Doing it as WORKER would plant a worker-owned
@@ -1417,19 +1477,11 @@ export class GitCache {
 
   /** Record clone ownership BEFORE running the model, so disk pressure during a
    * later capture cannot prevent the restart guard from knowing whose work it is.
-   * The runner clears this journal only after removing a safely disposable clone. */
+   * The runner clears this journal only after atomically retiring the clone
+   * (retireRunnerClone), never before the rename. */
   async markRecoveryCapture(barePath: string, clonePath: string, branch: string, runId: string): Promise<void> {
     await this.withLock(barePath, async () => {
       await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), JSON.stringify({ runId, clonePath })]);
-    });
-  }
-
-  async clearRecoveryCapture(barePath: string, branch: string, runId: string): Promise<void> {
-    await this.withLock(barePath, async () => {
-      const pending = await this.readRecoveryCapture(barePath, branch);
-      if (pending?.runId === runId) {
-        await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
-      }
     });
   }
 
@@ -1653,6 +1705,108 @@ export class GitCache {
    *  bare interaction). The warm bare and the fetched refs/objects are kept. */
   async removeRunnerClone(clonePath: string): Promise<void> {
     await fs.rm(clonePath, { recursive: true, force: true });
+  }
+
+  /**
+   * issue #1315 — ATOMICALLY RELEASE a runner clone the recovery journal points at.
+   *
+   * The bug this replaces: terminal cleanup did `removeRunnerClone` (a recursive
+   * `fs.rm`) then `clearRecoveryCapture` in one try/catch. On Linux, a detached `git
+   * maintenance`/`fsmonitor` daemon still holding a file open makes that recursive rm
+   * race and throw ENOTEMPTY (`force: true` suppresses ENOENT, not ENOTEMPTY — see the
+   * comment above the clone seed), so the journal-clear never ran, the journal survived
+   * pointing at partial residue, and a later foreign run wedged forever on the guard.
+   *
+   * The fix rests on one OS fact: `rename(2)` of a directory whose files a daemon still
+   * holds open SUCCEEDS (the open fds keep the old inode alive), where recursive delete
+   * races. So we RENAME the canonical clone to a worker-only holding location on the
+   * SAME filesystem — a race-free release — and only THEN clear the journal. A crash
+   * between the two can only leave a cleared-at-canonical / journal-still-set state that
+   * a re-run resolves; it can never leave the journal pointing at residue at canonical.
+   *
+   * Fail-closed in every disagreement: the move only ever touches a path that EXACTLY
+   * equals the journaled `clonePath` (validated before the rename) AND resolves under
+   * runnerRoot. `opts.discard` distinguishes the owner's own terminal trash (dispose the
+   * holding dir, best-effort) from a foreign quarantine (retain it forever).
+   *
+   * NOT re-entrant with markRecoveryCapture (which takes its OWN withLock) — this runs
+   * the whole validate→rename→clear sequence under one lock via readRecoveryCapture
+   * (lock-free) + a direct runGit config write.
+   */
+  async retireRunnerClone(
+    barePath: string,
+    clonePath: string,
+    branch: string,
+    ownerRunId: string,
+    opts: { discard: boolean },
+  ): Promise<void> {
+    const holding = await this.withLock(barePath, async () => {
+      // 1. Pre-rename pair validation. Require the EXACT (ownerRunId, clonePath) pair
+      //    to STILL be journaled before moving anything. A missing/malformed journal, or
+      //    a lock-gap rewrite to a different runId/path, moves NOTHING and fails closed.
+      const pending = await this.readRecoveryCapture(barePath, branch);
+      if (pending?.runId !== ownerRunId || pending.clonePath !== clonePath) {
+        throw new StaleCaptureJournalError(pending?.clonePath ?? "", clonePath, branch);
+      }
+      // 2. Containment. Only ever move a path strictly UNDER runnerRoot. Resolve both
+      //    sides and require a path-separator boundary so a sibling like
+      //    `<runnerRoot>-evil` cannot satisfy a bare prefix test. A path outside
+      //    runnerRoot (whatever the journal claims) fails closed and moves nothing.
+      const resolvedClone = path.resolve(clonePath);
+      const resolvedRoot = path.resolve(this.runnerRoot);
+      if (!resolvedClone.startsWith(resolvedRoot + path.sep)) {
+        throw new StaleCaptureJournalError(clonePath, this.runnerRoot, branch);
+      }
+      // 3. Worker-only 0700 holding destination: a SIBLING of runnerRoot under the same
+      //    dataDir (same filesystem — no EXDEV), NOT under the runner-writable tree.
+      //    Sanitized, generated components. Create-or-assert the parent 0700 BEFORE the
+      //    rename, so a rename ENOENT below unambiguously means the SOURCE is missing.
+      const holdingDest = path.join(
+        this.runnerHoldingRoot,
+        `${ownerRunId.replace(/[^A-Za-z0-9_-]/g, "_")}-${randomUUID()}`,
+      );
+      await fs.mkdir(path.dirname(holdingDest), { recursive: true, mode: 0o700 });
+      // 4. Atomic move + ENOENT disambiguation.
+      let renamed = true;
+      try {
+        await fs.rename(clonePath, holdingDest);
+      } catch (err) {
+        const e = err as NodeJS.ErrnoException;
+        if (e.code !== "ENOENT") throw err;
+        // The destination parent was asserted in step 3, so a rename ENOENT is about the
+        // SOURCE. Confirm: if the source is gone, the canonical is already free — proceed
+        // to clear the journal. If the source STILL exists, the ENOENT is a real,
+        // unexpected failure (e.g. a destination parent that vanished under us) and must
+        // surface with the journal left intact.
+        const sourceGone = await fs.lstat(clonePath).then(
+          () => false,
+          (le: NodeJS.ErrnoException) => {
+            if (le.code === "ENOENT") return true;
+            throw le;
+          },
+        );
+        if (!sourceGone) throw err;
+        renamed = false;
+      }
+      // 5. Journal clear — ONLY after a confirmed rename or a confirmed source-already-
+      //    free. Re-read and clear only if it STILL matches (ownerRunId, clonePath); a
+      //    concurrent successor must never have its journal cleared by us.
+      const still = await this.readRecoveryCapture(barePath, branch);
+      if (still?.runId === ownerRunId && still.clonePath === clonePath) {
+        await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
+      }
+      return renamed ? holdingDest : undefined;
+    });
+    // 6. Disposal, OUTSIDE the lock. Terminal trash (discard) — best-effort delete the
+    //    holding dir. Foreign quarantine (!discard) — RETAIN it forever (never delete).
+    if (holding && opts.discard) {
+      await fs.rm(holding, { recursive: true, force: true }).catch((e) =>
+        this.log.warn("retireRunnerClone: holding dispose failed", {
+          path: holding,
+          error: gitErrorMessage(e),
+        }),
+      );
+    }
   }
 
   /**
