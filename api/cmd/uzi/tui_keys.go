@@ -76,7 +76,7 @@ func helpLines(inDetail bool) []string {
 			"tab        cycle the focused pane",
 			"↑ / ↓      move within the focused pane (agents · scroll)",
 			"g          follow live: re-attach and jump to newest (live runs)",
-			"c          collapse the crew list (keeps the milestone block in view)",
+			"c          fold / unfold the crew list (folds by itself when the blocks below would not fit)",
 		}, common...)
 	}
 	return append([]string{
