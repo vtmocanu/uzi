@@ -121,6 +121,14 @@ describe("TriageStateChip — fed by judgeState (occurrence)", () => {
     render(<TriageStateChip {...judgeState(occ({ bucket: "dismissed" }))} />);
     expect(screen.getByText("Dismissed")).toBeTruthy();
   });
+
+  // PRD #1184 M4: an admin cross-user Mark done. With no filed iid on the aggregate occurrence it
+  // reads the bare "Done by an admin", carrying the admin-provenance title.
+  it("maps an admin done occurrence to 'Done by an admin'", () => {
+    render(<TriageStateChip {...judgeState(occ({ bucket: "done", set_via: "admin" }))} />);
+    expect(screen.getByText("Done by an admin")).toBeTruthy();
+    expect(screen.getByTitle("Marked done by an admin across every user's runs")).toBeTruthy();
+  });
 });
 
 describe("TriageStateChip — fed by judgeState (disposition)", () => {
@@ -141,6 +149,18 @@ describe("TriageStateChip — fed by judgeState (disposition)", () => {
   it("maps an empty-reason dismissed disposition to Won't do (the run page's precedence)", () => {
     render(<TriageStateChip {...judgeState(disp({ status: "dismissed", reason: "" }))} />);
     expect(screen.getByText("Dismissed · Won't do")).toBeTruthy();
+  });
+
+  // PRD #1184 M4: the run-page disposition now carries set_via, so an admin cross-user done reads
+  // "Done by an admin" on the run page too — the same label the Judge occurrence shows.
+  it("maps an admin done disposition to 'Done by an admin' (the run-page path)", () => {
+    render(<TriageStateChip {...judgeState(disp({ status: "done", reason: "", set_via: "admin" }))} />);
+    expect(screen.getByText("Done by an admin")).toBeTruthy();
+  });
+
+  it("maps an issue_close done disposition to 'Done via issue close' (no iid on the run page)", () => {
+    render(<TriageStateChip {...judgeState(disp({ status: "done", reason: "", set_via: "issue_close" }))} />);
+    expect(screen.getByText("Done via issue close")).toBeTruthy();
   });
 });
 

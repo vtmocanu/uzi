@@ -11,7 +11,7 @@
 // (rationale_preview, run_title, target, location) is NOT touched here — it is stripped with
 // lib/safeText at each render site, exactly as before (issue #124).
 
-import type { Disposition, JudgeOccurrence } from "../../lib/api";
+import type { Disposition, JudgeAdminOccurrence, JudgeOccurrence } from "../../lib/api";
 
 // TriageState is the NORMALISED open→settled ladder, the same four rungs on every surface.
 // The two wires key the open rung differently — the judge ships `todo`, findings ship
@@ -51,10 +51,17 @@ export function filedLabel(iid: number): string {
   return `Filed #${iid}`;
 }
 
-// doneLabel splits done by provenance (issue #167): a person's plain "Done" versus the
-// issue-close sync's "Done via #N" (or the unnamed "Done via issue close" when the filed iid
-// was cascaded away). The "✓" the chip shows is decorative (aria-hidden), not part of this.
+// doneLabel splits done by provenance (issue #167, PRD #1184 M4): a person's plain "Done";
+// the issue-close sync's "Done via #N" (or the unnamed "Done via issue close" when the filed
+// iid was cascaded away); and an admin cross-user Mark done's "Done by an admin via #N" (or
+// "Done by an admin" when no filed iid is present). The `admin` provenance renders on ALL three
+// surfaces that share this chip — the Judge occurrence, the run-page disposition and Findings —
+// because an owner whose coordinate an admin marked done should read that everywhere it shows.
+// The "✓" the chip shows is decorative (aria-hidden), not part of this.
 export function doneLabel(setVia?: string, iid?: number): string {
+  if (setVia === "admin") {
+    return iid != null ? `Done by an admin via #${iid}` : "Done by an admin";
+  }
   if (setVia === "issue_close") {
     return iid != null ? `Done via #${iid}` : "Done via issue close";
   }
@@ -99,19 +106,22 @@ export function dismissMenuItems(surface: "judge" | "finding"): DismissMenuItem[
 
 // judgeState normalises a judge OCCURRENCE (bucket-keyed, per-coordinate) OR a run-page
 // DISPOSITION (status + reason) onto one TriageStateView. The two are discriminated by the
-// `bucket` field, which only the occurrence carries.
+// `bucket` field, which only the occurrence carries. The occurrence may be an owner
+// JudgeOccurrence OR the attribution-hidden JudgeAdminOccurrence (PRD #1184 M4) — the admin one
+// carries no filed_issue, so the filed link is read defensively via `"filed_issue" in input`.
 //
 // An occurrence carries no wont_do/not_an_issue distinction (only its group's Disposition
 // does), so a hand-dismissed occurrence reads the bare "Dismissed"; only a `denied_cli`
 // occurrence gets a reason. A Disposition, by contrast, always has the wont_do/not_an_issue
 // reason, and an empty reason reads as wont_do — the run page's own precedence.
-export function judgeState(input: JudgeOccurrence | Disposition): TriageStateView {
+export function judgeState(input: JudgeOccurrence | JudgeAdminOccurrence | Disposition): TriageStateView {
   if ("bucket" in input) {
+    const filed = "filed_issue" in input ? input.filed_issue : undefined;
     switch (input.bucket) {
       case "filed":
-        return { state: "filed", filed: input.filed_issue };
+        return { state: "filed", filed };
       case "done":
-        return { state: "done", setVia: input.set_via, filed: input.filed_issue };
+        return { state: "done", setVia: input.set_via, filed };
       case "dismissed":
         return input.set_via === "denied_cli"
           ? { state: "dismissed", reason: "barred_cli" }
@@ -120,7 +130,10 @@ export function judgeState(input: JudgeOccurrence | Disposition): TriageStateVie
         return { state: "to_triage" };
     }
   }
-  if (input.status === "done") return { state: "done" };
+  // A run-page Disposition now carries set_via too (PRD #1184 M4): pass it through so the chip
+  // renders "Done via #N" (issue_close) or "Done by an admin" (admin) on the run page, matching
+  // the Judge occurrence chip. Absent set_via reads the plain "Done" as before.
+  if (input.status === "done") return { state: "done", setVia: input.set_via };
   return { state: "dismissed", reason: input.reason === "not_an_issue" ? "not_an_issue" : "wont_do" };
 }
 
