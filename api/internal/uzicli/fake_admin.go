@@ -72,3 +72,23 @@ func (f *FakeClient) AdminAgentSource(context.Context) (apitypes.AgentSourceDTO,
 	}
 	return f.AgentSourceV, nil
 }
+
+// AdminJudgeBacklog records the (bucket, category) it was forwarded and returns the canned
+// aggregate. Empty means the flag was unset and the parameter omitted (server default), so the
+// fake records "" rather than substituting a default — mirroring JudgeBacklog's capture. There
+// is no run-anchor capture: the admin backlog has no --run flag.
+func (f *FakeClient) AdminJudgeBacklog(_ context.Context, bucket, category string) (apitypes.JudgeAdminBacklogDTO, error) {
+	f.LastAdminBacklogBucket = bucket
+	f.LastAdminBacklogCategory = category
+	if f.Err != nil {
+		return apitypes.JudgeAdminBacklogDTO{}, f.Err
+	}
+	return f.AdminJudgeBacklogResult, nil
+}
+
+func (f *FakeClient) AdminJudgeStats(context.Context) (apitypes.TriageDTO, error) {
+	if f.Err != nil {
+		return apitypes.TriageDTO{}, f.Err
+	}
+	return f.AdminJudgeStatsResult, nil
+}

@@ -3,9 +3,11 @@ import { Badge } from "../ui";
 
 // resolvedAgo renders a disposition's resolve time as a coarse "resolved Xh ago", lifted from
 // the run panel's DispositionControls. It reuses the app's one duration helper (formatElapsed,
-// runBadge) so the wording matches the running badge and every other elapsed string. The panel
-// shows only a relative time, never the actor — under owner-only scope the setter is always the
-// owner. An unparseable timestamp degrades to a bare "resolved".
+// runBadge) so the wording matches the running badge and every other elapsed string. This row
+// shows only a relative time, never the actor: the disposition's provenance (a human, the
+// issue-close sync, or — since PRD #1184 — an admin) is carried by the adjacent state chip
+// ("Done by an admin" etc.), so the resolved line stays a plain time + Undo. An unparseable
+// timestamp degrades to a bare "resolved".
 function resolvedAgo(at: string | Date): string {
   const t = at instanceof Date ? at.getTime() : Date.parse(at);
   if (!Number.isFinite(t)) return "resolved";

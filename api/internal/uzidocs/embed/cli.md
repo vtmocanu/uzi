@@ -145,6 +145,7 @@ uzi pr list [--repo <id>] | checks <iid> [--repo <id>] [--watch]
 uzi ci list [--repo <id>] [--limit <n>] | jobs <run-id> [--repo <id>] | fix <ref> [--repo <id>]
 uzi admin users | runs | workers | usage | rate-limits | cli-tokens | guardrail-impact | blocked-repos
 uzi admin agent-source get | status
+uzi admin review backlog [--bucket todo|filed|done|dismissed|all] [--category label,label] | stats [--json]
 uzi skill status | install [--force] | install-hook | uninstall-hook
 uzi docs list [--audience user|operator|design|contributor|all]
 uzi docs show <slug>
@@ -628,6 +629,21 @@ A few worth knowing:
   to produce them. Read-only, same as every other `admin` verb here —
   setting up the source, and triggering **Sync now**, **Check for
   updates**, **Bump pin**, and **Approve & apply** stay web-only.
+- **`admin review backlog` and `admin review stats` are the admin "All users"
+  judge aggregate** (PRD #1184) — every user's judge recommendations deduped by
+  `(category, target)` across the whole factory, with **attribution hidden**.
+  `backlog` prints one line per group as `K users · M runs · N open` (how many
+  distinct users hit the pattern, how many runs it recurs in, how many are still
+  open) plus the rationale preview, and **no per-run or occurrence line**: no
+  owner, run id or run title is shown, so a group tells you how widespread a
+  recommendation is without saying whose it is. It takes `--bucket` and
+  `--category` — forwarded verbatim and server-validated exactly like
+  [`uzi review backlog`](#reviewing-and-triaging-from-the-cli), so an unknown
+  value is a usage error (exit 2), not a silent empty list — but has **no
+  `--run`** anchor, because an anchor names a run. `stats` is the all-users
+  triage tally, the cross-user twin of `uzi review stats`. Both are read-only and
+  need an `admin_ro` (`uza_`) token, same ceiling as every other `admin` verb;
+  the cross-user Mark done and Undo stay cookie-only in the web UI.
 - **`uzi repo remove <id>` deletes a single stale repo** — the surgical
   counterpart to deleting a whole forge connection. It only works on a
   **disabled** repo, so disable it first (`enabled` shows in `uzi repo list`);
@@ -949,7 +965,15 @@ also the TUI's own fallback when the live channel is unreachable (below).
   cache-creation tokens), `out` (output tokens), and a `cache` line with the
   cached-read token count and its share of the total input (`in` + `cache`)
   as a percentage; it's
-  omitted for a run with no recorded usage.
+  omitted for a run with no recorded usage. The rail itself doesn't scroll —
+  it's clamped to the transcript's height — so when the expanded roster plus
+  MILESTONES, SPEND, and the run's own account meters wouldn't all fit, the
+  rail folds the crew list by itself down to a count caret (`N ▸`, N being the
+  lane count) plus the selected lane, keeping those blocks on screen; a
+  roster that fits stays expanded (`▾`). Pressing `c` overrides the automatic
+  call for that run — folding an expanded rail or unfolding a folded one —
+  and the override sticks until the run is reopened, which returns it to the
+  automatic behaviour.
 - **Review overlay** (`[v]` from run detail). The judge's verdict, summary,
   and recommendations, with the same resolve/dismiss/undo triage described
   under [Reviewing and triaging from the CLI](#reviewing-and-triaging-from-the-cli).
@@ -960,6 +984,7 @@ also the TUI's own fallback when the live channel is unreachable (below).
 ←/→, h/l, tab detail: focus the crew rail / the transcript (h/← rail, l/→ transcript; tab cycles). Detail opens focused on the crew rail.
 j/k, ↑/↓     move within the focused pane (board: row · detail: between agents on the rail, or scroll the transcript)
 g            detail: follow live — re-attach and jump to the newest output (live runs only)
+c            detail: fold / unfold the crew list; it also folds by itself when MILESTONES/SPEND/ACCOUNTS would not fit
 enter        open the selected run (board)
 /            filter the board
 a            toggle the factory-wide admin board (board only)

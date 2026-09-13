@@ -87,6 +87,7 @@ func TestGenerateUXLabFrames(t *testing.T) {
 		"board-milestones":             func(d bool) string { return boardMilestones(d, now) },
 		"detail-running":               func(d bool) string { return detailRunning(d, now) },
 		"detail-milestones-attributed": func(d bool) string { return detailMilestonesAttributed(d, now) },
+		"detail-crew-autofold":         func(d bool) string { return detailCrewAutofold(d, now) },
 		"detail-planning":              func(d bool) string { return detailPlanning(d, now) },
 		"detail-focus-transcript":      func(d bool) string { return detailFocusTranscript(d, now) },
 		"detail-paused":                func(d bool) string { return detailPaused(d, now) },
@@ -424,6 +425,57 @@ func detailMilestonesAttributed(dark bool, now time.Time) string {
 	run.AnthropicSecretID, run.AnthropicSecretLabel = sp("sec-meta"), sp("meta")
 	run.Usage = &apitypes.UsageDTO{CostUSD: 9.55, InputTokens: 2_400_000, CacheReadTokens: 14_200_000, CacheCreationTokens: 120_000, OutputTokens: 88_400}
 	m := detailBase(dark, run, now, true)
+	m = withLiveStream(m)
+	return m.View().Content
+}
+
+// crewAutofoldMsgs is a WIDE multi-lane transcript — a lead orchestrating a large crew of
+// subagents, mirroring the reference instance's 15+-lane run — so the expanded roster plus the
+// MILESTONES, SPEND and ACCOUNTS blocks cannot fit the 100x34 rail. Kept local to the
+// detail-crew-autofold scene (NOT in the shared laneMsgs), so the other detail scenes keep their
+// compact roster and stay expanded. Repeated roles (researcher x3, coder x2) exercise the ·N
+// ordinal suffix (laneSuffixes) the reference run shows.
+func crewAutofoldMsgs(now time.Time) []apitypes.MessageDTO {
+	return []apitypes.MessageDTO{
+		msgDTO(1, "text", "lead", "", "", "Planning the change across the scheduler, the tests, the web surface and the docs; dispatching the crew now.", now.Add(-6*time.Minute)),
+		msgDTO(2, "tool_use", "researcher", "toolu_res01aaaa", "Research scheduler poll", "`Grep`", now.Add(-5*time.Minute)),
+		msgDTO(3, "tool_use", "researcher", "toolu_res02bbbb", "Research usage folding", "`Read`", now.Add(-5*time.Minute)),
+		msgDTO(4, "tool_use", "researcher", "toolu_res03cccc", "Research web + CLI surface", "`Read`", now.Add(-4*time.Minute)),
+		msgDTO(5, "tool_use", "coder", "toolu_cod01dddd", "Implement scheduler backoff", "`Edit`", now.Add(-3*time.Minute)),
+		msgDTO(6, "tool_use", "coder", "toolu_cod02eeee", "Write the near-cap test", "`Write`", now.Add(-3*time.Minute)),
+		msgDTO(7, "tool_use", "tester", "toolu_tes01ffff", "Regression sweep", "`Bash`", now.Add(-2*time.Minute)),
+		msgDTO(8, "tool_use", "reviewer", "toolu_rev01gggg", "Review the backoff diff", "`Read`", now.Add(-90*time.Second)),
+		msgDTO(9, "tool_use", "auditor", "toolu_aud01hhhh", "Audit the trust boundary", "`Grep`", now.Add(-80*time.Second)),
+		msgDTO(10, "tool_use", "documenter", "toolu_doc01iiii", "Update the scheduler docs", "`Edit`", now.Add(-30*time.Second)),
+		// A lead usage frame so the crew rail's inline context-window meter (#565) shows on the
+		// lead lane, matching detail-running. Placed last: addFrame appends in ascending seq.
+		leadCtxMsg(11, 124000, 200000, 62, now.Add(-20*time.Second)),
+	}
+}
+
+// detailCrewAutofold is detail-running's run (a milestone-structured run with SPEND and the run's
+// own `meta` account) but with the WIDE crew of crewAutofoldMsgs, so at 100x34 the expanded roster
+// would push MILESTONES / SPEND / ACCOUNTS off the height-clamped, non-scrolling rail and
+// railAutoFolded folds the crew by itself (PRD #1257): the count caret (`N ▸`) + the selected lane,
+// with all three protected blocks in view. No `c` key is pressed — the fold is the auto decision.
+func detailCrewAutofold(dark bool, now time.Time) string {
+	run := apitypes.RunDTO{ID: detailRunID, Kind: "issue", Status: "running", Health: "ok",
+		IssueTitle:          "Add rate-limit headroom to the scheduler poll",
+		IssueIID:            ip(452),
+		IssueWebURL:         sp("https://github.com/vtmocanu/uzi/issues/452"),
+		StartedAt:           tp(now.Add(-6 * time.Minute)),
+		Milestones:          milestoneList,
+		MilestonesCompleted: []string{"m1", "m2"}, MilestonesInProgress: []string{"m3", "m4"}}
+	run.AnthropicSecretID, run.AnthropicSecretLabel = sp("sec-meta"), sp("meta")
+	run.Usage = &apitypes.UsageDTO{CostUSD: 9.55, InputTokens: 2_400_000, CacheReadTokens: 14_200_000, CacheCreationTokens: 120_000, OutputTokens: 88_400}
+	fake := &uzicli.FakeClient{}
+	m := uxModel(fake, detailRunID, dark)
+	m = applyDetail(m, run, crewAutofoldMsgs(now))
+	// The viewer's own rate-limit meters + the sec-meta sidebar selection, exactly as detailBase
+	// wires them, so the crew rail's ACCOUNTS block renders the run's own `meta` entry.
+	m = step(m, rateLimitsMsg{tokens: boardMeters()})
+	m = step(m, settingsMsg{settings: apitypes.UserSettingsDTO{SidebarTokenIds: []string{"sec-meta"}}})
+	m = step(m, runInputsMsg{runID: detailRunID, err: nil})
 	m = withLiveStream(m)
 	return m.View().Content
 }

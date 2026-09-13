@@ -654,11 +654,13 @@ describe("mockApi judge backlog (PRD #98 M3)", () => {
     expect(occ.set_via).toBe("denied_cli");
   });
 
-  // The mock must not invent wire fields. set_via is a mock-side extension of the STORED
-  // disposition; the run-page DispositionDTO has no such field, so GET /runs/{id}/review
-  // must not carry it (PRD #98 review N-b). A mock that ships more than the API does makes a
-  // future RunView provenance feature work in demo mode and fail in production.
-  it("does not leak set_via onto the run-page review DTO", async () => {
+  // The run-page DispositionDTO NOW carries set_via (PRD #1184 M4): the run-page DispositionChip
+  // renders provenance too — "Done via #N" for an issue_close, "Done by an admin" for an admin
+  // cross-user done — matching the Judge occurrence chip. Before M4 the mock STRIPPED set_via
+  // here because the DTO had no such field; the real API now sends it, so the mock carries it,
+  // or a run-page provenance chip would work in production and show nothing in demo mode. The
+  // seeded run-closed ripgrep disposition is an issue-close auto-done, so it surfaces set_via.
+  it("carries set_via onto the run-page review DTO (PRD #1184 M4)", async () => {
     installStorage();
     const api = await reload();
 
@@ -666,7 +668,7 @@ describe("mockApi judge backlog (PRD #98 M3)", () => {
     const { review } = await api.getRunReview("run-closed");
     const disp = review!.dispositions.find((d) => d.category === "enable_tool" && d.target === "ripgrep");
     expect(disp).toBeTruthy();
-    expect("set_via" in (disp as object)).toBe(false);
+    expect(disp!.set_via).toBe("issue_close");
   });
 });
 
@@ -811,6 +813,68 @@ describe("mockApi judge category stats (PRD #270)", () => {
     for (const cat of Object.keys(anchored.all)) {
       expect(anchored.all[cat]).toBeLessThanOrEqual(whole.all[cat]);
     }
+  });
+});
+
+describe("mockApi judge admin routes: gating + DTO hygiene (Findings [4]/[5]/[6])", () => {
+  // `as const` pins category to the RecommendationCategory literal so the coordinate is a
+  // JudgeDispositionCoord (a bare string would not narrow to that union).
+  const coord = { category: "improve_uzi", target: "api/internal/poller" } as const;
+  // The six cross-user admin methods, invoked lazily so the rejected promise is created inside
+  // the expect (never a dangling unhandled rejection).
+  const adminCalls: [string, (a: Awaited<ReturnType<typeof reload>>) => Promise<unknown>][] = [
+    ["getAdminJudgeBacklog", (a) => a.getAdminJudgeBacklog("todo")],
+    ["getAdminJudgeCategoryStats", (a) => a.getAdminJudgeCategoryStats()],
+    ["adminSetJudgeDisposition", (a) => a.adminSetJudgeDisposition([coord])],
+    ["adminUndoJudgeDisposition", (a) => a.adminUndoJudgeDisposition([coord])],
+    ["getAdminJudgeIssueDraft", (a) => a.getAdminJudgeIssueDraft(coord.category, coord.target)],
+    [
+      "adminFileJudgeIssue",
+      (a) => a.adminFileJudgeIssue({ ...coord, repoId: "repo1", title: "t", description: "d" }),
+    ],
+  ];
+
+  // Finding [5]: the six admin methods sit behind RequireAdmin on the real API, so the mock gates
+  // them with requireAdmin() — a signed-in NON-admin gets 403, not a silent cross-user read.
+  it("all six admin judge methods reject a NON-admin session with 403 (Finding [5])", async () => {
+    installStorage();
+    const api = await reload();
+    // Sign in AS a seeded non-admin persona (the login-based persona switch the demo uses).
+    await api.login("mira@uzi.local", "whatever");
+    for (const [name, call] of adminCalls) {
+      await expect(call(api), `${name} must reject a non-admin with 403`).rejects.toMatchObject({
+        status: 403,
+      });
+    }
+  });
+
+  it("an admin session reaches the admin backlog (the positive pair for the 403s)", async () => {
+    installStorage();
+    const api = await reload();
+    await api.login("admin@uzi.local", "whatever"); // an unknown email falls back to the admin
+    const backlog = await api.getAdminJudgeBacklog("todo");
+    expect(Array.isArray(backlog.groups)).toBe(true);
+  });
+
+  // Finding [4]: `owner` is an INTERNAL field on MockReview (it feeds the admin distinct-user
+  // count). The run-page ReviewDTO has no such field, so it must never ride the run-page wire.
+  it("keeps the internal owner field OFF the run-page review DTO (Finding [4])", async () => {
+    installStorage();
+    const api = await reload();
+    const { review } = await api.getRunReview("run-done");
+    expect(review).not.toBeNull();
+    expect("owner" in review!).toBe(false);
+  });
+
+  // Finding [6]: the admin issue-draft provenance identifies both the producing user AND run
+  // (the real API renders "from <user>'s worker, run <shortID>"). The newest open poller
+  // occurrence is the demo caller's run-done review.
+  it("names the producing run id in the admin issue-draft provenance (Finding [6])", async () => {
+    installStorage();
+    const api = await reload();
+    await api.login("admin@uzi.local", "whatever");
+    const { draft } = await api.getAdminJudgeIssueDraft("improve_uzi", "api/internal/poller");
+    expect(draft.provenance).toContain("run-done");
   });
 });
 

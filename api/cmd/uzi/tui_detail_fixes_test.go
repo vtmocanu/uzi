@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	tea "charm.land/bubbletea/v2"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
@@ -206,10 +207,11 @@ func TestDetailHeaderFitsWidthWithDuration(t *testing.T) {
 	}
 }
 
-// The collapsible crew rail (`c`) exists so a tall roster cannot hide the milestone block: the
-// rail is height-clamped and does not scroll. Expanded, a many-lane run pushes MILESTONES below
-// the fold; collapsed shows a count caret + only the selected lane, revealing the block. Toggling
-// with no lanes is a no-op.
+// The crew rail auto-folds (PRD #1257): a tall roster that would push the MILESTONES block below
+// the height-clamped, non-scrolling rail folds by itself, with no key press, to a count caret +
+// the selected lane so the block stays in view. `c` is a sticky override that pins the OPPOSITE of
+// what the user currently sees — first press pins Open (roster back, MILESTONES pushed off again),
+// next press pins Closed (folded again). Toggling with no lanes is a no-op.
 func TestDetailCollapsibleCrewRevealsMilestones(t *testing.T) {
 	now := time.Now()
 	runID := "beefbeef-1111"
@@ -231,31 +233,353 @@ func TestDetailCollapsibleCrewRevealsMilestones(t *testing.T) {
 	m.width, m.height = 100, 20
 	m = applyDetail(m, run, msgs)
 
-	expanded := m.View().Content
-	if strings.Contains(expanded, "MILESTONES") {
-		t.Fatalf("precondition: a tall crew rail should push MILESTONES below the fold when expanded\n%s", expanded)
-	}
-	if !strings.Contains(expanded, "▾") {
-		t.Errorf("expanded rail should show the open caret ▾\n%s", expanded)
-	}
-
-	collapsed := press(t, m, keyCollapseCrew).View().Content
-	if !strings.Contains(collapsed, "MILESTONES") {
-		t.Errorf("collapsing the crew should reveal the MILESTONES block\n%s", collapsed)
+	// Opens FOLDED with no key press: the expanded roster would push MILESTONES below the fold, so
+	// the rail auto-folds to the count caret + selected lane, keeping MILESTONES in view.
+	auto := m.View().Content
+	if !strings.Contains(auto, "MILESTONES") {
+		t.Errorf("an auto-folded rail should keep the MILESTONES block in view\n%s", auto)
 	}
 	// 8 real lanes plus the aggregated "all agents" lane the rail prepends = 9 rows.
-	if !strings.Contains(collapsed, "9 ▸") {
-		t.Errorf("collapsed rail should show the closed caret with the lane count (9 ▸)\n%s", collapsed)
+	if !strings.Contains(auto, "9 ▸") {
+		t.Errorf("an auto-folded rail should show the closed caret with the lane count (9 ▸)\n%s", auto)
 	}
-	if !strings.Contains(collapsed, "crew") {
-		t.Errorf("footer should carry the 'c crew' hint\n%s", collapsed)
+	if !strings.Contains(auto, "crew") {
+		t.Errorf("footer should carry the 'c crew' hint\n%s", auto)
 	}
 
-	// Toggling with no lanes is a no-op (the caret and footer hint are hidden there).
+	// `c` pins OPEN: the roster returns (open caret ▾) and pushes MILESTONES back below the fold.
+	pinnedOpen := press(t, m, keyCollapseCrew)
+	openView := pinnedOpen.View().Content
+	if !strings.Contains(openView, "▾") {
+		t.Errorf("first `c` should pin the roster open (▾)\n%s", openView)
+	}
+	if strings.Contains(openView, "MILESTONES") {
+		t.Errorf("a pinned-open tall roster should push MILESTONES below the fold\n%s", openView)
+	}
+
+	// `c` again pins CLOSED: folded to the count caret, MILESTONES revealed once more.
+	pinnedClosed := press(t, pinnedOpen, keyCollapseCrew)
+	closedView := pinnedClosed.View().Content
+	if !strings.Contains(closedView, "9 ▸") {
+		t.Errorf("second `c` should pin the roster folded (9 ▸)\n%s", closedView)
+	}
+	if !strings.Contains(closedView, "MILESTONES") {
+		t.Errorf("a pinned-closed rail should reveal the MILESTONES block\n%s", closedView)
+	}
+
+	// Toggling with no lanes is a no-op (the caret and footer hint are hidden there): the mode
+	// stays at the auto zero value.
 	m0 := tuiTestModel(t, &uzicli.FakeClient{}, runID)
 	m0 = applyDetail(m0, run, nil)
-	if press(t, m0, keyCollapseCrew).detail.railCollapsed {
-		t.Errorf("collapse toggled with no lanes; should be a no-op")
+	if press(t, m0, keyCollapseCrew).detail.railFold != railFoldAuto {
+		t.Errorf("collapse toggled with no lanes; should be a no-op leaving railFoldAuto")
+	}
+}
+
+// railTitleLine is the crew rail's first line — the pane title carrying the fold caret (▾ / N ▸)
+// and nothing that moves per tick (no relAge, no blink phase). Tests assert on this alone so a
+// caret check does not chase legitimately-shifting cells elsewhere in the frame.
+func railTitleLine(m tuiModel) string {
+	return strings.SplitN(stripANSI(m.renderLaneRail()), "\n", 2)[0]
+}
+
+// autoFoldRun is the 8-lane (+ synthetic "all agents" = 9) / 4-milestone run the auto-fold seam
+// tests share, optionally carrying Usage (SPEND) and the run's own account (ACCOUNTS).
+func autoFoldRun(withUsage, withAccount bool) (apitypes.RunDTO, []apitypes.MessageDTO) {
+	now := time.Now()
+	run := apitypes.RunDTO{ID: "beefbeef-1111", Status: "running", Health: "ok", IssueTitle: "many lanes",
+		Milestones: []apitypes.Milestone{{ID: "m1", Title: "Alpha"}, {ID: "m2", Title: "Beta"},
+			{ID: "m3", Title: "Gamma"}, {ID: "m4", Title: "Delta"}},
+		MilestonesCompleted: []string{"m1", "m2"}, MilestonesInProgress: []string{"m3"}}
+	if withUsage {
+		run.Usage = spendUsage()
+	}
+	if withAccount {
+		sid, lbl := "sec-run", "runacct"
+		run.AnthropicSecretID, run.AnthropicSecretLabel = &sid, &lbl
+	}
+	msgs := []apitypes.MessageDTO{
+		msgDTO(1, "text", "lead", "", "plan", "p", now),
+		msgDTO(2, "text", "coder", "toolu_a", "impl", "a", now),
+		msgDTO(3, "text", "tester", "toolu_b", "sweep", "b", now),
+		msgDTO(4, "text", "reviewer", "toolu_c", "review", "c", now),
+		msgDTO(5, "text", "auditor", "toolu_d", "audit", "d", now),
+		msgDTO(6, "text", "researcher", "toolu_e", "dig", "e", now),
+		msgDTO(7, "text", "documenter", "toolu_f", "docs", "f", now),
+		msgDTO(8, "text", "release", "toolu_g", "ship", "g", now),
+	}
+	return run, msgs
+}
+
+// A tall terminal fits the whole expanded rail, so the same many-lane/milestone run that folds at
+// 100x20 opens EXPANDED at 100x60: the open caret, every lane, and MILESTONES + SPEND + ACCOUNTS
+// all present (PRD #1257 D1 — the roster stays when it fits).
+func TestDetailRailExpandsWhenTall(t *testing.T) {
+	run, msgs := autoFoldRun(true, true)
+	m := tuiTestModel(t, &uzicli.FakeClient{}, run.ID)
+	m.width, m.height = 100, 60
+	next, _ := m.Update(rateLimitsMsg{tokens: []apitypes.TokenRateLimitDTO{okMeter(*run.AnthropicSecretID, "runacct", true, 33, 61)}})
+	m = next.(tuiModel)
+	m = applyDetail(m, run, msgs)
+
+	rail := stripANSI(m.renderLaneRail())
+	if !strings.Contains(railTitleLine(m), "▾") {
+		t.Errorf("a tall terminal should open the rail expanded (▾)\n%s", rail)
+	}
+	// Every lane visible: the synthetic "all agents" row through the last real lane ("release").
+	for _, want := range []string{"all agents", "release", "MILESTONES", "SPEND", "ACCOUNTS"} {
+		if !strings.Contains(rail, want) {
+			t.Errorf("expanded rail at 100x60 missing %q\n%s", want, rail)
+		}
+	}
+}
+
+// The auto-fold is a pure function of height with no stored state, so a resize re-decides on the
+// next render with no key press (PRD #1257 D1): 60→20 folds, 20→60 unfolds.
+func TestDetailRailAutoFoldFollowsResize(t *testing.T) {
+	run, msgs := autoFoldRun(false, false)
+	m := tuiTestModel(t, &uzicli.FakeClient{}, run.ID)
+	m.width, m.height = 100, 60
+	m = applyDetail(m, run, msgs)
+	if !strings.Contains(railTitleLine(m), "▾") {
+		t.Fatalf("precondition: 100x60 should be expanded (▾), got %q", railTitleLine(m))
+	}
+
+	n2, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 20})
+	m = n2.(tuiModel)
+	if !strings.Contains(railTitleLine(m), "9 ▸") {
+		t.Errorf("resize to 100x20 should auto-fold with no key press (9 ▸), got %q", railTitleLine(m))
+	}
+
+	n3, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 60})
+	m = n3.(tuiModel)
+	if !strings.Contains(railTitleLine(m), "▾") {
+		t.Errorf("resize back to 100x60 should unfold with no key press (▾), got %q", railTitleLine(m))
+	}
+}
+
+// A `c` pin is sticky: a resize re-decides only while the mode is Auto, never clearing a pin (PRD
+// #1257 D3). An Open pin taken at 100x20 (where the rail auto-folds, so `c` flips it Open) keeps
+// the roster expanded across a resize to 100x60 and back to 100x20 — the blocks drop at 20 as they
+// did before this PRD, which is fine.
+func TestDetailRailOpenPinSurvivesResize(t *testing.T) {
+	run, msgs := autoFoldRun(false, false)
+	m := tuiTestModel(t, &uzicli.FakeClient{}, run.ID)
+	m.width, m.height = 100, 20
+	m = applyDetail(m, run, msgs)
+	if !strings.Contains(railTitleLine(m), "9 ▸") {
+		t.Fatalf("precondition: 100x20 should auto-fold (9 ▸), got %q", railTitleLine(m))
+	}
+
+	m = press(t, m, keyCollapseCrew) // auto-folded → `c` pins Open
+	if m.detail.railFold != railFoldOpen {
+		t.Fatalf("`c` on an auto-folded rail should pin it Open, got %v", m.detail.railFold)
+	}
+	if !strings.Contains(railTitleLine(m), "▾") {
+		t.Errorf("a pinned-open rail should show the open caret at 100x20 (▾), got %q", railTitleLine(m))
+	}
+	// Blocks drop at 100x20 with the roster open (the pre-PRD expanded behavior): the height-clamped
+	// View drops MILESTONES below the fold (joinColumns clamps the composed frame, not the rail
+	// string, so this asserts on View().Content).
+	if strings.Contains(m.View().Content, "MILESTONES") {
+		t.Errorf("a pinned-open tall roster at 100x20 should push MILESTONES below the fold")
+	}
+
+	n2, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 60})
+	m = n2.(tuiModel)
+	if !strings.Contains(railTitleLine(m), "▾") {
+		t.Errorf("the Open pin should hold at 100x60 (▾), got %q", railTitleLine(m))
+	}
+	n3, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 20})
+	m = n3.(tuiModel)
+	if m.detail.railFold != railFoldOpen {
+		t.Errorf("a resize must not clear the Open pin, got %v", m.detail.railFold)
+	}
+	if !strings.Contains(railTitleLine(m), "▾") {
+		t.Errorf("the Open pin should survive the resize back to 100x20 (▾, roster stays), got %q", railTitleLine(m))
+	}
+}
+
+// Reopening a run resets the fold to Auto (PRD #1257 D3): the pin is a per-run view preference, so
+// the drill-in path (newDetailState) restores the height-driven decision, and a run pinned Open at
+// 100x20 folds by itself again on reopen.
+func TestDetailRailReopenReturnsToAuto(t *testing.T) {
+	run, msgs := autoFoldRun(false, false)
+	m := tuiTestModel(t, &uzicli.FakeClient{}, run.ID)
+	m.width, m.height = 100, 20
+	m = applyDetail(m, run, msgs)
+	m = press(t, m, keyCollapseCrew) // pin Open
+	if m.detail.railFold != railFoldOpen || !strings.Contains(railTitleLine(m), "▾") {
+		t.Fatalf("precondition: expected an Open pin (▾), got fold=%v title=%q", m.detail.railFold, railTitleLine(m))
+	}
+
+	// Reopen the run exactly as the board drill-in does: a fresh per-run view state.
+	m.detail = newDetailState(run.ID)
+	m = applyDetail(m, run, msgs)
+	if m.detail.railFold != railFoldAuto {
+		t.Errorf("reopening the run should reset the fold to Auto, got %v", m.detail.railFold)
+	}
+	if !strings.Contains(railTitleLine(m), "9 ▸") {
+		t.Errorf("a reopened run should auto-fold again at 100x20 (9 ▸), got %q", railTitleLine(m))
+	}
+}
+
+// The run's own account is the fold floor (PRD #1257 D2, #623): a run whose roster + MILESTONES
+// would fit stays expanded, but adding the requirement that its OWN account entry also fit tips it
+// into an auto-fold at a height where the account would not fit; give it one more row of height and
+// the account fits, so the rail stays expanded.
+func TestDetailRailAccountsBoundary(t *testing.T) {
+	now := time.Now()
+	sid, lbl := "sec-run", "runacct"
+	base := apitypes.RunDTO{ID: "acct-boundary", Status: "running", Health: "ok", IssueTitle: "boundary",
+		Milestones:          []apitypes.Milestone{{ID: "m1", Title: "a"}, {ID: "m2", Title: "b"}},
+		MilestonesCompleted: []string{"m1"}}
+	withAcct := base
+	withAcct.AnthropicSecretID, withAcct.AnthropicSecretLabel = &sid, &lbl
+	msgs := []apitypes.MessageDTO{
+		msgDTO(1, "text", "lead", "", "", "plan", now),
+		msgDTO(2, "text", "coder", "toolu_a", "", "impl", now),
+	}
+	mk := func(run apitypes.RunDTO, h int) tuiModel {
+		m := tuiTestModel(t, &uzicli.FakeClient{}, run.ID)
+		m.width, m.height = 100, h
+		if run.AnthropicSecretID != nil {
+			next, _ := m.Update(rateLimitsMsg{tokens: []apitypes.TokenRateLimitDTO{okMeter(sid, lbl, true, 33, 61)}})
+			m = next.(tuiModel)
+		}
+		return applyDetail(m, run, msgs)
+	}
+
+	// At 100x16 the roster + MILESTONES fit, so the run WITHOUT an own account stays expanded —
+	// isolating the account requirement as the sole reason the WITH-account run folds.
+	if !strings.Contains(railTitleLine(mk(base, 16)), "▾") {
+		t.Errorf("without an own account, roster + MILESTONES fit at 100x16 and should stay expanded (▾)")
+	}
+	// Same geometry, but now the run's own account must also fit — it does not, so the rail folds.
+	if !strings.Contains(railTitleLine(mk(withAcct, 16)), "3 ▸") {
+		t.Errorf("with an own account that would not fit at 100x16, the rail should auto-fold (3 ▸)")
+	}
+	// Two more rows and the own account fits, so the rail stays expanded.
+	if !strings.Contains(railTitleLine(mk(withAcct, 18)), "▾") {
+		t.Errorf("with two more rows of height the own account fits and the rail should stay expanded (▾)")
+	}
+}
+
+// The empty required set never folds (PRD #1257 D2/D5): a run with NO milestone list, NO usage and
+// NO own account has nothing below the roster to protect, so a tall roster in a short terminal
+// stays EXPANDED and simply clips at the bottom, exactly as before this PRD.
+func TestDetailRailEmptyRequiredSetNeverFolds(t *testing.T) {
+	now := time.Now()
+	var msgs []apitypes.MessageDTO
+	for i := 0; i < 12; i++ {
+		msgs = append(msgs, msgDTO(int32(i+1), "text", "agent"+itoa(i), "toolu_"+itoa(i), "", "x", now))
+	}
+	run := apitypes.RunDTO{ID: "empty-set", Status: "running", IssueTitle: "no blocks"}
+	for _, h := range []int{12, 16, 20} {
+		m := tuiTestModel(t, &uzicli.FakeClient{}, run.ID)
+		m.width, m.height = 100, h
+		m = applyDetail(m, run, msgs)
+		if !strings.Contains(railTitleLine(m), "▾") {
+			t.Errorf("a run with no protected blocks must never auto-fold, even at 100x%d (expected ▾), got %q", h, railTitleLine(m))
+		}
+	}
+}
+
+// The fold caret is stable (PRD #1257 D8): with unchanged inputs the glyph is identical across two
+// consecutive renders and across a blink-phase flip — the row count is clock- and phase-independent,
+// so nothing about the fold decision oscillates on a tick. Only the caret line is asserted; the
+// blink phase legitimately moves the milestone micro-bar cells elsewhere in the frame.
+func TestDetailRailCaretStableAcrossRenders(t *testing.T) {
+	run, msgs := autoFoldRun(false, false)
+	m := tuiTestModel(t, &uzicli.FakeClient{}, run.ID)
+	m.width, m.height = 100, 20
+	m = applyDetail(m, run, msgs)
+
+	first := railTitleLine(m)
+	if first != railTitleLine(m) {
+		t.Errorf("caret changed across two consecutive renders with no input change")
+	}
+	m.blinkOn = !m.blinkOn
+	if got := railTitleLine(m); got != first {
+		t.Errorf("caret changed across a blink-phase flip: %q -> %q", first, got)
+	}
+}
+
+// A run with no lanes shows no fold caret and `c` is a no-op (PRD #1257 D3/D4): there is no roster
+// to fold, so the caret and the toggle are both suppressed and the mode stays Auto.
+func TestDetailRailZeroLanesNoCaret(t *testing.T) {
+	run := apitypes.RunDTO{ID: "no-lanes", Status: "running", IssueTitle: "queued",
+		Milestones: []apitypes.Milestone{{ID: "m1", Title: "a"}}}
+	m := tuiTestModel(t, &uzicli.FakeClient{}, run.ID)
+	m.width, m.height = 100, 20
+	m = applyDetail(m, run, nil)
+
+	title := railTitleLine(m)
+	if strings.Contains(title, "▾") || strings.Contains(title, "▸") {
+		t.Errorf("a no-lanes rail should carry no fold caret, got %q", title)
+	}
+	if press(t, m, keyCollapseCrew).detail.railFold != railFoldAuto {
+		t.Errorf("`c` with no lanes should be a no-op leaving railFoldAuto")
+	}
+}
+
+// M2 / D6 property: exactly one blank row separates any two consecutive rendered rail blocks —
+// never the double blank the roster→SPEND join produced before the appendRailBlock helper. Asserted
+// across the four presence combinations (MILESTONES present/absent × SPEND present/absent, ACCOUNTS
+// present) in the expanded, folded and no-lanes render paths. A block's own rows are never blank
+// (roster rows, milestone rows, spend/account lines all carry glyphs or padding), so "no two
+// consecutive blank rows anywhere in the rail" is exactly the no-double-blank invariant.
+func TestDetailRailBlocksSingleBlankSeparator(t *testing.T) {
+	now := time.Now()
+	sid, lbl := "sec-run", "runacct"
+	msgs := []apitypes.MessageDTO{
+		msgDTO(1, "text", "lead", "", "", "plan", now),
+		msgDTO(2, "text", "coder", "toolu_a", "", "impl", now),
+	}
+	noDoubleBlank := func(t *testing.T, label, rail string) {
+		t.Helper()
+		lines := strings.Split(stripANSI(rail), "\n")
+		for i := 1; i < len(lines); i++ {
+			if strings.TrimSpace(lines[i]) == "" && strings.TrimSpace(lines[i-1]) == "" {
+				t.Errorf("%s: double blank row at lines %d-%d (only one blank should separate blocks):\n%s", label, i-1, i, rail)
+				return
+			}
+		}
+	}
+
+	for _, milestones := range []bool{false, true} {
+		for _, usage := range []bool{false, true} {
+			run := apitypes.RunDTO{ID: "sep", Status: "running", Health: "ok", IssueTitle: "sep",
+				AnthropicSecretID: &sid, AnthropicSecretLabel: &lbl} // ACCOUNTS always present
+			if milestones {
+				run.Milestones = []apitypes.Milestone{{ID: "m1", Title: "a"}, {ID: "m2", Title: "b"}}
+				run.MilestonesCompleted = []string{"m1"}
+			}
+			if usage {
+				run.Usage = spendUsage()
+			}
+			label := "M=" + boolStr(milestones) + " S=" + boolStr(usage)
+
+			// Expanded and folded: a lane roster present, at a tall height so every block renders.
+			build := func(frames []apitypes.MessageDTO, h int) tuiModel {
+				m := tuiTestModel(t, &uzicli.FakeClient{}, run.ID)
+				m.width, m.height = 100, h
+				next, _ := m.Update(rateLimitsMsg{tokens: []apitypes.TokenRateLimitDTO{okMeter(sid, lbl, true, 33, 61)}})
+				m = next.(tuiModel)
+				return applyDetail(m, run, frames)
+			}
+			mExp := build(msgs, 50)
+			mExp.detail.railFold = railFoldOpen
+			noDoubleBlank(t, label+" expanded", mExp.renderLaneRail())
+
+			mFold := build(msgs, 50)
+			mFold.detail.railFold = railFoldClosed
+			noDoubleBlank(t, label+" folded", mFold.renderLaneRail())
+
+			// No-lanes path: no frames, so the rail draws "(no activity yet)" + the blocks.
+			mNo := build(nil, 50)
+			noDoubleBlank(t, label+" no-lanes", mNo.renderLaneRail())
+		}
 	}
 }
 

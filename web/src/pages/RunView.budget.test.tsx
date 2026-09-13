@@ -21,6 +21,23 @@ vi.mock("../lib/api", async (importOriginal) => {
       listWorkers: vi.fn().mockResolvedValue({ workers: [] }),
       getMySettings: vi.fn().mockResolvedValue({ settings: { mr_rework_enabled: null } }),
       setRunMrRework: vi.fn().mockResolvedValue({ run: null }),
+      // PRD #1296 M5: the run page's Recovery archives section fetches its own summary on
+      // mount. Defaulted to a supported-but-empty aggregate so a full-page render settles
+      // and the section renders nothing on these non-recovery budget fixtures.
+      getRunArchives: vi.fn().mockResolvedValue({
+        supported: false,
+        legacy: true,
+        has_open_hold: false,
+        counts: {
+          preparing: 0,
+          uploading: 0,
+          available: 0,
+          needs_action: 0,
+          expired: 0,
+          discarded: 0,
+        },
+        archives: [],
+      }),
     },
   };
 });
