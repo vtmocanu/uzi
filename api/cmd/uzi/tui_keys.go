@@ -108,6 +108,7 @@ func helpLines(v tuiView) []string {
 		}, common...)
 	case viewCI:
 		return append([]string{
+			"enter / →  open the selected run's jobs (jobs · steps)",
 			"tab        switch screen (floor · pulls · ci)",
 			"1 / 2 / 3  jump to the floor / pulls / ci",
 			"R          cycle the scoped repo (when several are enabled)",
@@ -119,6 +120,12 @@ func helpLines(v tuiView) []string {
 			"u          open the PR's linked uzi run (when one exists)",
 			"w          rework the linked run (fix review findings)",
 			"f          fix ci: queue a CI-fix run for the PR's branch",
+		}, common...)
+	case viewCIRun:
+		return append([]string{
+			"↑ / ↓      move the cursor over the jobs (the selected job expands its steps)",
+			"↗          the selected job's URL is a clickable link",
+			"f          fix ci: queue a CI-fix run for this run's branch",
 		}, common...)
 	default:
 		return append([]string{

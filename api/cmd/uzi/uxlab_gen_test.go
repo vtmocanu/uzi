@@ -107,6 +107,7 @@ func TestGenerateUXLabFrames(t *testing.T) {
 		"pr-live":                      func(d bool) string { return prLive(d, now) },
 		"pr-changes-requested":         func(d bool) string { return prChangesRequested(d, now) },
 		"pr-failing":                   func(d bool) string { return prFailing(d, now) },
+		"cirun-running":                func(d bool) string { return ciRunRunning(d, now) },
 		"help":                         helpFrame,
 		"quit":                         quitFrame,
 	}
@@ -790,6 +791,27 @@ func prFailing(dark bool, now time.Time) string {
 			BlockedReason: "1 required check failing", MergeableState: "dirty"},
 	}
 	return openPRScene(dark, detail)
+}
+
+// ---- ci run drill-in fixtures ---------------------------------------------
+
+// ciRunRunning drives the model to the CI-run drill-in (PRD #1255 M6) the real way: repos load, the
+// user opens the ci list, the list lands, enter opens the CI-run view (minting the first fetch), and
+// the detail reply (jobs + steps, one running) is applied. The selected job (cursor 0) expands its
+// steps beneath it and draws its faint ↗ URL line.
+func ciRunRunning(dark bool, now time.Time) string {
+	repo := apitypes.RepoDTO{ID: "r1", PathWithNamespace: "vtmocanu/uzi", Enabled: true,
+		WebURL: "https://github.com/vtmocanu/uzi"}
+	detail := sampleCIRunDetail(now)
+	fake := &uzicli.FakeClient{Repos: []apitypes.RepoDTO{repo}, CIRunDetailResult: detail,
+		CIRunsResult: []apitypes.CIRunDTO{detail.CIRunDTO}}
+	m := uxModel(fake, "", dark)
+	m = step(m, reposMsg{repos: fake.Repos})
+	m = key(m, keyViewCI)
+	m = step(m, ciMsg{reqID: m.ci.waitID, runs: []apitypes.CIRunDTO{detail.CIRunDTO}})
+	m = key(m, keyEnter) // open the CI-run drill-in
+	m = step(m, ciRunMsg{reqID: m.cirun.waitID, gen: m.cirun.gen, detail: detail})
+	return m.View().Content
 }
 
 // ---- overlays -------------------------------------------------------------

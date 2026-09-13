@@ -729,11 +729,10 @@ func (m tuiModel) ciEmptyState() string {
 	return m.pal.faint.Render(" "+msg) + "\n"
 }
 
-// ciFooter is the one-line key legend for the ci screen (D13: only the keys M4b binds — enter/→
-// opening the CI run drill-in lands in M6, so it is deliberately NOT promised here). R is dropped
-// when only one repo is enabled.
+// ciFooter is the one-line key legend for the ci screen (D13). enter/→ opens the CI-run drill-in
+// (jobs + steps, PRD #1255 M6). R is dropped when only one repo is enabled.
 func (m tuiModel) ciFooter() string {
-	parts := []string{m.keyHint("↑↓", "move"), m.keyHint("/", "filter")}
+	parts := []string{m.keyHint("↑↓", "move"), m.keyHint("enter", "jobs"), m.keyHint("/", "filter")}
 	if len(m.repos) > 1 {
 		parts = append(parts, m.keyHint("R", "repo"))
 	}
@@ -808,6 +807,24 @@ func (m tuiModel) ciKey(k string) (tea.Model, tea.Cmd) {
 	}
 
 	switch k {
+	case keyEnter, keyRight:
+		// enter / → opens the CI-run drill-in for the selected run (PRD #1255 M6 D1): a fresh
+		// ciRunState scoped to the current repo + the row's run ID, forgeNotice cleared, and an
+		// immediate fetch so the drill-in is not stuck on "loading…" until the next 5s tick.
+		// startCIRunReq stamps the session gen (ciRunGen) so a prior run's in-flight reply can never
+		// apply to this one.
+		run, ok := m.ci.selected()
+		if !ok {
+			return m, nil
+		}
+		repo, rok := m.currentRepo()
+		if !rok {
+			return m, nil
+		}
+		m.cirun = newCIRunState(repo.ID, run.ID)
+		m.view = viewCIRun
+		m.forgeNotice = ""
+		return m, (&m).startCIRunReq()
 	case keyFilter:
 		m.ci.filtering = true
 		return m, nil

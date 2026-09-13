@@ -167,6 +167,18 @@ var d7UntrustedFields = []string{
 	"reviewState",
 	"mergeBlocked",
 	"mergeableState",
+	// Forge CI-run-drill-in text drawn on the CI-run view (PRD #1255 M6, D7, tui_cirun.go). CIJobDTO.Name
+	// and CIStepDTO.Name share the bare selector name ".Name" with unrelated pre-existing draws in other
+	// tui_*.go files (the tool payload .Name in tui_detail_transcript.go drawn raw, and others), so the
+	// bare "Name" cannot be added here — it would redden the guard on code this view does not own. Each is
+	// projected into a DISTINCTLY-NAMED internal field (ciJobText.jobName / ciStepText.stepName,
+	// tui_cirun.go) and the distinct names are listed instead, each drawn only through renderer.Plain
+	// (ciRunJobRow / ciRunStepRow). The embedded CIRunDTO header fields (workflow Name / Event / Branch /
+	// SHA / Title / Actor) reuse the ci-list projection ciTextOf, whose distinct names (runName /
+	// eventName / runBranch / runSHA / runTitle / actorLogin) are already listed above. CIJobDTO.WebURL
+	// reuses the existing "WebURL" tripwire via ciRunJobURLLine (like prCheckURLLine / pullLink).
+	"jobName",
+	"stepName",
 }
 
 // d7Writers are the calls that put a string on the screen. lipgloss's Render is one:

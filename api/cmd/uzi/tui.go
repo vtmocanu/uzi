@@ -62,11 +62,12 @@ const (
 	viewDetail
 	// viewPulls is the forge `pulls` list screen (PRD #1255 M4a). viewCI is the forge
 	// `ci` list screen (PRD #1255 M4b). viewPR is the PR drill-in (PRD #1255 M5) — a peer of
-	// viewDetail, opened from the pulls list (enter/→) or the run view (m); the CI-run drill-in
-	// (viewCIRun) lands in M6.
+	// viewDetail, opened from the pulls list (enter/→) or the run view (m). viewCIRun is the
+	// CI-run drill-in (PRD #1255 M6) — a peer of viewPR, opened from the ci list (enter/→).
 	viewPulls
 	viewCI
 	viewPR
+	viewCIRun
 )
 
 // ---- messages -------------------------------------------------------------
@@ -233,6 +234,10 @@ type tuiModel struct {
 	// pr is the PR drill-in's state (PRD #1255 M5), with its OWN reqSeq/waitID/tickGen poll-guard
 	// counters and a 5s live re-poll chain, independent of the two list screens.
 	pr prState
+	// cirun is the CI-run drill-in's state (PRD #1255 M6), the ci-run twin of pr: its OWN
+	// reqSeq/waitID/tickGen poll-guard counters and a 5s live re-poll chain, independent of the two
+	// list screens and of the PR view.
+	cirun ciRunState
 	// prReturn / detailReturn record WHERE a drill-in was opened from, so its esc returns there
 	// (D1): the PR view returns to prReturn (the pulls list, or the run view on detail→m→PR), and
 	// the run view returns to detailReturn (the board by default, or pulls / PR on a u ↳ run jump).
@@ -271,6 +276,11 @@ type tuiModel struct {
 	// session — a different PR whose reset reqSeq minted the SAME reqID, or the same PR reopened — is
 	// rejected by the gen check in the prMsg case. The PR twin of detailGen.
 	prGen uint64
+	// ciRunGen counts CI-run drill-in sessions opened from the ci row; startCIRunReq stamps the new
+	// ciRunState.gen from it on each open's first fetch, so a reply issued under an earlier session —
+	// a different run whose reset reqSeq minted the SAME reqID, or the same run reopened — is rejected
+	// by the gen check in the ciRunMsg case. The ci-run twin of prGen.
+	ciRunGen uint64
 
 	// quitting is the ctrl+c confirm modal (q quits immediately and does NOT route through
 	// it); ctrlCSeen makes a second ctrl+c quit immediately, which is the escape hatch a user
@@ -374,6 +384,10 @@ func newTUIModel(ctx context.Context, c uzicli.Client, startRun string) tuiModel
 	// viewBoard zero value so board↔detail is unchanged (PRD #1255 M5 D1).
 	m.pr = newPRState("", 0)
 	m.prReturn = viewPulls
+	// The CI-run drill-in seeds its tick chain at generation 1 (the Init-armed CI-run tick is
+	// honoured) with no run loaded (repoID ""), so the tick never polls until the user opens a CI-run
+	// view and startCIRunReq mints the first fetch (PRD #1255 M6) — the ci-run twin of pr.
+	m.cirun = newCIRunState("", 0)
 	// The repos scope fetch IS in flight at Init (initCmds issues fetchReposCmd), so seed the
 	// guard true — the reply clears it. Without this a pulls tick that fires before the Init
 	// reposMsg lands could stack a second repos fetch on top of the Init one.
@@ -406,6 +420,11 @@ func (m tuiModel) initCmds() []tea.Cmd {
 		// only while the PR view is in focus and a PR is loaded; the open path's immediate startPRReq
 		// is what actually begins the chain, the reply re-arms it, so an idle board pays nothing.
 		prTickAfter(prPollInterval, m.pr.tickGen),
+		// The CI-run drill-in's own 5s live re-poll chain (PRD #1255 M6). Like the PR tick it is armed
+		// now but polls the forge only while the CI-run view is in focus and a run is loaded; the open
+		// path's immediate startCIRunReq begins the chain, the reply re-arms it, so an idle board pays
+		// nothing.
+		ciRunTickAfter(ciRunPollInterval, m.cirun.tickGen),
 		tea.RequestBackgroundColor}
 	if m.skewCheck {
 		cmds = append(cmds, m.fetchBuildInfoCmd(), skewTickCmd())
@@ -940,6 +959,39 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.pr.tickGen++
 		return m, prTickAfter(prTickInterval(m.pr.errStreak), m.pr.tickGen)
 
+	case ciRunTickMsg:
+		// The CI-run drill-in's 5s live re-poll (PRD #1255 M6), mirroring the PR tick exactly: drop a
+		// superseded chain, keep alive across the cancellable quit modal without polling, else poll
+		// the forge only while the CI-run view is in focus and a run is loaded and no poll is
+		// outstanding. When it DOES fetch, the reply re-arms the chain; when it does NOT, this tick
+		// re-arms ITSELF.
+		if msg.gen != m.cirun.tickGen {
+			return m, nil
+		}
+		if m.quitting {
+			return m, ciRunTickAfter(ciRunTickInterval(m.cirun.errStreak), m.cirun.tickGen)
+		}
+		if m.view == viewCIRun && m.cirun.waitID == 0 && m.cirun.repoID != "" {
+			return m, (&m).startCIRunReq()
+		}
+		return m, ciRunTickAfter(ciRunTickInterval(m.cirun.errStreak), m.cirun.tickGen)
+
+	case ciRunMsg:
+		// Drop a stale/out-of-order reply (mirrors prMsg): honour only the reply whose reqID matches
+		// the request we are waiting on AND whose CI-run session generation is the current one. The
+		// gen check is load-bearing across a reopen: newCIRunState resets reqSeq, so a prior run's
+		// in-flight reply mints the SAME reqID and passes the reqID==waitID guard — only gen tells them
+		// apart, so without it run A's late jobs/steps would be applied to the run B view.
+		if msg.reqID != m.cirun.waitID || msg.gen != m.cirun.gen {
+			return m, nil
+		}
+		m.cirun.waitID = 0
+		m.cirun.apply(msg)
+		// Reschedule AFTER apply updated errStreak so the first retry after a failed poll uses the
+		// backed-off interval; bump tickGen so this chain supersedes any pending tick.
+		m.cirun.tickGen++
+		return m, ciRunTickAfter(ciRunTickInterval(m.cirun.errStreak), m.cirun.tickGen)
+
 	case prActionMsg:
 		// A w (rework) / f (fix ci) result from the PR view or a pulls list row: a success
 		// confirmation or the server's typed 4xx/409 reason, drawn inline (never a crash).
@@ -1246,6 +1298,8 @@ func (m tuiModel) handleKey(k string) (tea.Model, tea.Cmd) {
 		return m.ciKey(k)
 	case viewPR:
 		return m.prKey(k)
+	case viewCIRun:
+		return m.ciRunKey(k)
 	default:
 		return m.detailKey(k)
 	}
@@ -1285,6 +1339,8 @@ func (m tuiModel) View() tea.View {
 		body = m.renderCI()
 	case m.view == viewPR:
 		body = m.renderPR()
+	case m.view == viewCIRun:
+		body = m.renderCIRun()
 	default:
 		body = m.renderBoard()
 	}
