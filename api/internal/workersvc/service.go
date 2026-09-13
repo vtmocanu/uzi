@@ -439,6 +439,7 @@ type Store interface {
 	ListActiveRunsAll(ctx context.Context, backgroundGraceCutoff pgtype.Timestamptz) ([]store.ListActiveRunsAllRow, error)
 	ListAllWorkers(ctx context.Context) ([]store.ListAllWorkersRow, error)
 	GetRunOwnedByWorker(ctx context.Context, arg store.GetRunOwnedByWorkerParams) (store.Run, error)
+	GetRunOrphanIdentity(ctx context.Context, arg store.GetRunOrphanIdentityParams) (store.GetRunOrphanIdentityRow, error)
 	// GetRunForgeConnForWorker returns the forge connection facts for a run the
 	// worker holds (PRD #158 M1): forge_project_id + the connection. Worker-scoped
 	// by construction (its predicate carries r.worker_id), so a run the worker does
@@ -3228,6 +3229,53 @@ func (s *Service) runOwnedByWorker(ctx context.Context, runID uuid.UUID, wkr sto
 		return store.Run{}, err
 	}
 	return run, nil
+}
+
+// RunOrphanIdentity is the authoritative owner-run identity a worker needs to derive an
+// orphan clone's canonical path (issue #1319). Pointers carry SQL NULL as JSON null.
+type RunOrphanIdentity struct {
+	Status      string
+	RepoID      uuid.UUID
+	Kind        string
+	IssueIID    *int64
+	Branch      *string
+	PipelineRef *string
+	PipelineID  *int64
+}
+
+// RunOrphanClassification returns the authoritative identity of a terminal-orphan OWNER
+// run, scoped to the worker's owner (user) AND the claimant run's repo — NOT worker_id, so
+// an owner that moved workers is still found (issue #1319, Gap 2). The claimant run (which
+// the worker DOES hold) is the authz anchor and the source of the current repo. Read-only.
+// Distinct from RunOwnership, whose worker-scope protects same-run recovery.
+func (s *Service) RunOrphanClassification(ctx context.Context, wkr store.Worker, claimantRunID, ownerRunID uuid.UUID) (RunOrphanIdentity, error) {
+	claimant, err := s.runOwnedByWorker(ctx, claimantRunID, wkr) // ErrRunNotOwned if not held
+	if err != nil {
+		return RunOrphanIdentity{}, err
+	}
+	if !claimant.RepoID.Valid {
+		return RunOrphanIdentity{}, ErrRunNotOwned // a repo-less claimant cannot reclaim
+	}
+	row, err := s.q.GetRunOrphanIdentity(ctx, store.GetRunOrphanIdentityParams{
+		ID:     ownerRunID,
+		UserID: wkr.UserID, // owner-scope; wkr.UserID == claimant.user_id by ClaimRun
+		RepoID: claimant.RepoID,
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return RunOrphanIdentity{}, ErrRunNotOwned
+		}
+		return RunOrphanIdentity{}, err
+	}
+	return RunOrphanIdentity{
+		Status:      row.Status,
+		RepoID:      uuid.UUID(row.RepoID.Bytes),
+		Kind:        row.Kind,
+		IssueIID:    int64Ptr(row.IssueIid),
+		Branch:      textPtr(row.Branch),
+		PipelineRef: textPtr(row.PipelineRef),
+		PipelineID:  int64Ptr(row.PipelineID),
+	}, nil
 }
 
 // ForgeConn is the connection facts a worker-authenticated forge read needs to build

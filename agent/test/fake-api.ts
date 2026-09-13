@@ -4,6 +4,7 @@ import type { AddressInfo } from "node:net";
 import type {
   ClaimResponse,
   OutgoingMessage,
+  RunOrphanClassificationResponse,
   StateRequest,
   UserInput,
   WorkerRunDetail,
@@ -78,6 +79,10 @@ export class FakeApi {
     string,
     { httpStatus: number; status?: string }
   >();
+  // issue #1319: the owner-scoped orphan-classification read. Keyed by OWNER run id (the
+  // fake trusts the test for the claimant/authz; the runner's predicate logic is what's under
+  // test). No override for an owner => 404 (fail closed), matching the server's not-found.
+  private readonly orphanByRun = new Map<string, { httpStatus: number; identity?: RunOrphanClassificationResponse }>();
   private codexDelayMs = 0;
   private codexResponseOverride: unknown | undefined;
 
@@ -263,6 +268,19 @@ export class FakeApi {
    *  neither a 404 nor a terminal status, so the skip path logs and PROCEEDS. */
   failOwnership(runId: string, httpStatus = 503): void {
     this.ownershipByRun.set(runId, { httpStatus });
+  }
+
+  /** issue #1319: answer the orphan-classification read for OWNER runId with 200 + identity. */
+  setOrphanClassification(ownerRunId: string, identity: RunOrphanClassificationResponse): void {
+    this.orphanByRun.set(ownerRunId, { httpStatus: 200, identity });
+  }
+  /** issue #1319: answer with 404 (owner not in this owner+repo scope) — the fail-closed signal. */
+  setOrphanNotFound(ownerRunId: string): void {
+    this.orphanByRun.set(ownerRunId, { httpStatus: 404 });
+  }
+  /** issue #1319: answer with a TRANSIENT transport error (default 503). */
+  failOrphanClassification(ownerRunId: string, httpStatus = 503): void {
+    this.orphanByRun.set(ownerRunId, { httpStatus });
   }
 
   /** PRD #1190 M2: make this run's running-report ACK carry `pause_requested: true` — the
@@ -474,6 +492,18 @@ export class FakeApi {
       if (o.httpStatus !== 200)
         return send(res, o.httpStatus, { error: "run not found for this worker" });
       return send(res, 200, { status: o.status ?? "running" });
+    }
+
+    // issue #1319: the owner-scoped orphan-classification read. The `owner` query param is
+    // the OWNER run id; the path segment is the CLAIMANT (authz anchor, trusted by the fake).
+    const orphanMatch = /^\/api\/worker\/runs\/([^/]+)\/orphan-classification$/.exec(p);
+    if (req.method === "GET" && orphanMatch) {
+      const owner = url.searchParams.get("owner");
+      const o = owner ? this.orphanByRun.get(owner) : undefined;
+      // No override, an explicit 404, or a missing owner param => 404 (fail closed).
+      if (!o || o.httpStatus === 404) return send(res, 404, { error: "run not found for this worker" });
+      if (o.httpStatus !== 200 || !o.identity) return send(res, o.httpStatus, { error: "injected orphan failure" });
+      return send(res, 200, o.identity);
     }
 
     // PRD #1226 M4 (D5): the completion-permit endpoint. Records the request and answers the

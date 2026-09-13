@@ -701,6 +701,43 @@ func (h *Handler) WorkerRunOwnership(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, map[string]any{"status": status})
 }
 
+// WorkerRunOrphanClassification classifies a clone orphan's OWNER run (issue #1319): the
+// {id} path param is the CLAIMANT run the worker currently holds (the authz anchor + source
+// of the current repo), and the ?owner query param is the orphan's owner run id. The service
+// scopes the read to the worker's OWNER (user) + the claimant's repo — NOT worker_id — so a
+// terminal owner that moved workers is still found. ErrRunNotOwned (claimant not held, a
+// repo-less claimant, or no matching owner run) maps to 404, mirroring WorkerRunOwnership.
+func (h *Handler) WorkerRunOrphanClassification(w http.ResponseWriter, r *http.Request) {
+	wkr, ok := mw.WorkerFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "worker authentication required")
+		return
+	}
+	claimantRunID, ok := httpx.PathUUID(w, r, "id", "run")
+	if !ok {
+		return
+	}
+	ownerRunID, err := uuid.Parse(r.URL.Query().Get("owner"))
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid owner run id")
+		return
+	}
+	id, err := h.wsvc.RunOrphanClassification(r.Context(), wkr, claimantRunID, ownerRunID)
+	if err != nil {
+		if errors.Is(err, workersvc.ErrRunNotOwned) {
+			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
+			return
+		}
+		slog.Error("worker run orphan classification", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{
+		"status": id.Status, "repo_id": id.RepoID.String(), "kind": id.Kind,
+		"issue_iid": id.IssueIID, "branch": id.Branch, "pipeline_ref": id.PipelineRef, "pipeline_id": id.PipelineID,
+	})
+}
+
 // WorkerRunCompletionPermit is the completion-interlock permit endpoint (PRD #1226 M2, D4/D5):
 // the worker requests a permit bound to the frozen contract revision, the source branch, and the
 // EXACT final head. The service applies the claim fence, recomputes the unmet structural

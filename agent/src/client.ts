@@ -22,6 +22,7 @@ import {
   type UserInput,
   type InputsResponse,
   type RunOwnershipResponse,
+  type RunOrphanClassificationResponse,
   type WorkerProposal,
   type WorkerRunDetail,
   type WorkerRunListItem,
@@ -571,6 +572,16 @@ export class WorkerClient {
    *  error via `err.status`. Reuses GetRunOwnedByWorker server-side; no new query. */
   async getRunOwnership(runId: string): Promise<RunOwnershipResponse> {
     return (await this.getJSON(`${WORKER_API_PREFIX}/runs/${runId}/ownership`)) as RunOwnershipResponse;
+  }
+
+  /** issue #1319 — the orphan-classification read: authoritative identity of a clone-orphan
+   *  OWNER run, for the runner's owner-derived reclaim validation. `{id}` is the CLAIMANT run
+   *  this worker holds (authz anchor); `owner` is the orphan owner's run id. A 404 (owner not
+   *  in this owner+repo scope) throws RequestError, which the caller treats as fail-closed. */
+  async getRunOrphanClassification(claimantRunId: string, ownerRunId: string): Promise<RunOrphanClassificationResponse> {
+    return (await this.getJSON(
+      `${WORKER_API_PREFIX}/runs/${claimantRunId}/orphan-classification?owner=${encodeURIComponent(ownerRunId)}`,
+    )) as RunOrphanClassificationResponse;
   }
 
   // ── Chat agent read surface (PRD #39 M3) ───────────────────────────────────

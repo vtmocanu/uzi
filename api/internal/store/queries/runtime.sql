@@ -614,6 +614,14 @@ ORDER BY w.created_at DESC;
 -- Worker-endpoint authz: a worker may only touch a run it currently holds.
 SELECT * FROM runs WHERE id = @id AND worker_id = @worker_id;
 
+-- name: GetRunOrphanIdentity :one
+-- Orphan-classification read (issue #1319): DISTINCT from GetRunOwnedByWorker. Scoped to
+-- the worker's OWNER (user) and the claimant's repo, NOT worker_id, so a terminal owner
+-- that moved workers is still found (Gap 2). pipeline_id + pipeline_ref are required to
+-- derive the owner's ci_fix clone branch exactly.
+SELECT status, repo_id, kind, issue_iid, branch, pipeline_ref, pipeline_id
+FROM runs WHERE id = @id AND user_id = @user_id AND repo_id = @repo_id;
+
 -- name: ClaimRun :one
 -- The RUN claim lane (Decision 4): atomic claim of the oldest claimable queued run
 -- for the worker's user, EXCLUDING chat runs (which the chat lane claims via
