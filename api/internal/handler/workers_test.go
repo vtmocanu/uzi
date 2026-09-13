@@ -34,7 +34,7 @@ func (s *deleteWorkerStore) CountWorkerNonTerminalRuns(context.Context, store.Co
 	return s.activeRuns, nil
 }
 
-func (s *deleteWorkerStore) CountOpenCustodyHoldsForWorker(context.Context, uuid.UUID) (int64, error) {
+func (s *deleteWorkerStore) CountOpenCustodyHoldsForWorker(context.Context, store.CountOpenCustodyHoldsForWorkerParams) (int64, error) {
 	return s.holds, nil
 }
 

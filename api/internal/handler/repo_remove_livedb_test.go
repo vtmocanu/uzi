@@ -273,8 +273,8 @@ func TestDeleteRepoWithOpenCustodyIs409LiveDB(t *testing.T) {
 
 	// Release the hold → the guard clears and the delete succeeds (204), proving the 409
 	// was specifically the custody guard, not the disabled state or the terminal run.
-	// Releasing nulls the live FKs alongside the state flip, exactly as ReleaseCustodyForRun
-	// does — dropping the ON DELETE RESTRICT that would otherwise block the cascade.
+	// Releasing nulls the live FKs alongside the state flip, exactly as the custody-release
+	// queries do — dropping the ON DELETE RESTRICT that would otherwise block the cascade.
 	cliMustExec(t, pool,
 		`UPDATE recovery_custody_holds SET state = 'released', live_run_id = NULL, live_worker_id = NULL WHERE id = $1`, holdID)
 	rec = cookieReq(t, router, http.MethodDelete, "/api/repos/"+repoID.String(), jwt, "")

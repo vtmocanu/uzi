@@ -75,8 +75,13 @@ func (q *Queries) BindCaptureManifest(ctx context.Context, arg BindCaptureManife
 
 const countOpenCustodyHoldsForWorker = `-- name: CountOpenCustodyHoldsForWorker :one
 SELECT count(*) FROM recovery_custody_holds
-WHERE live_worker_id = $1::uuid AND state = 'open'
+WHERE live_worker_id = $1::uuid AND user_id = $2 AND state = 'open'
 `
+
+type CountOpenCustodyHoldsForWorkerParams struct {
+	WorkerID uuid.UUID `json:"worker_id"`
+	UserID   uuid.UUID `json:"user_id"`
+}
 
 // PRD #1296 M4 (D3): the DeleteWorker custody guard's predicate — how many OPEN custody
 // holds name this worker as their LIVE holder. Non-zero refuses the delete (deleting the
@@ -84,8 +89,13 @@ WHERE live_worker_id = $1::uuid AND state = 'open'
 // token to authenticate), so the caller surfaces the count of affected captures and
 // requires an explicit discard decision before the source's last authenticated retry path
 // is destroyed. Reads the same live_worker_id FK the M4 teardown DELETE skip predicate does.
-func (q *Queries) CountOpenCustodyHoldsForWorker(ctx context.Context, workerID uuid.UUID) (int64, error) {
-	row := q.db.QueryRow(ctx, countOpenCustodyHoldsForWorker, workerID)
+// OWNER-SCOPED (@user_id): the hold carries user_id, and DeleteWorker runs this BEFORE the
+// owner-scoped DeleteWorkerForUser, so without the owner filter a FOREIGN owner's held worker
+// would return a non-zero count and leak its existence + hold count as a 409 instead of the
+// 404 every other sibling ownership check yields. A non-owner therefore counts 0 and falls
+// through to the 404 (ErrWorkerNotFound) path.
+func (q *Queries) CountOpenCustodyHoldsForWorker(ctx context.Context, arg CountOpenCustodyHoldsForWorkerParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countOpenCustodyHoldsForWorker, arg.WorkerID, arg.UserID)
 	var count int64
 	err := row.Scan(&count)
 	return count, err
@@ -360,7 +370,10 @@ const listReleasableCustodyHolds = `-- name: ListReleasableCustodyHolds :many
 SELECT h.id, h.user_id, h.repo_id, h.run_id, h.generation, h.state, h.original_worker_id, h.original_worker_identity, h.live_worker_id, h.live_run_id, h.created_at, h.updated_at, h.released_at FROM recovery_custody_holds h
 WHERE h.state = 'open'
   AND (
-      EXISTS (SELECT 1 FROM runs r WHERE r.id = h.run_id AND r.status = 'completed')
+      EXISTS (SELECT 1 FROM runs r
+                WHERE r.id = h.run_id
+                  AND r.status = 'completed'
+                  AND h.generation = r.claim_generation)
       OR EXISTS (SELECT 1 FROM recovery_captures c
                    WHERE c.hold_id = h.id AND c.state = 'available')
   )
@@ -370,17 +383,31 @@ ORDER BY h.created_at ASC
 // PRD #1296 M4 (D3): the custody-release RECONCILER's candidate set — OPEN holds whose
 // release is now WARRANTED but was never applied (e.g. the best-effort terminal release in
 // SetState failed after a full publication, leaving the live FKs set and blocking teardown).
-// Release is warranted ONLY when the recorded disposition proves the work is durable:
+// Release is warranted ONLY when the recorded disposition proves THIS hold's work is durable.
 //
-//	(a) the hold's run is 'completed' — a completed code-publishing run published its head,
-//	    so its unpublished-work custody is moot (full publication, D3); or
-//	(b) a READY capture ('available') exists for the hold — the required source is durably
-//	    archived, which itself releases the covered source's custody (D3).
+// MULTI-HOLD HAZARD (why this is PER-HOLD and generation-aware): a run can carry MORE THAN
+// ONE open hold. A cross-worker re-claim after a transient worker loss opens a second hold
+// (generation 2, a different live_worker_id) while the crashed worker's generation-1 hold
+// stays open and never released. Generation 2 typically reseeds from the default branch, so
+// generation 1's committed work is NOT in generation 2's tree — the generation-1 hold
+// protects the ONLY copy of that work. So a per-hold candidate set must never qualify an
+// OLDER-generation orphan on the strength of a NEWER generation's disposition:
+//
+//	(a) the hold's run is 'completed' AND h.generation = r.claim_generation — only the
+//	    generation that actually completed/published published its head (full publication,
+//	    D3). runs.claim_generation is the LATEST generation; an older orphaned hold on the
+//	    same completed run has h.generation < claim_generation and is NOT releasable via this
+//	    path (its uncaptured committed work would otherwise be dropped); or
+//	(b) a READY capture ('available') exists for THIS hold (c.hold_id = h.id) — the source
+//	    covered by THIS hold is durably archived, which releases THIS hold's custody (D3).
+//	    This is already a strict per-hold test, so a sibling hold's ready capture never
+//	    qualifies it.
 //
 // It NEVER infers success from an arbitrary terminal status: a 'failed'/'cancelled'/future
 // 'partial' run with no ready capture, and a 'running'/'queued' run, are excluded (a failed
 // run retains custody for capture/discard). Returns oldest-first for stable reconcile order;
-// the reconciler releases by run_id (idempotent) and lets normal reap proceed.
+// the reconciler releases the SPECIFIC selected hold by id (ReleaseCustodyHold), so selection
+// and release agree per-hold and a sibling hold is never collaterally released.
 func (q *Queries) ListReleasableCustodyHolds(ctx context.Context) ([]RecoveryCustodyHold, error) {
 	rows, err := q.db.Query(ctx, listReleasableCustodyHolds)
 	if err != nil {
@@ -504,20 +531,52 @@ func (q *Queries) MarkCaptureState(ctx context.Context, arg MarkCaptureStatePara
 	return i, err
 }
 
-const releaseCustodyForRun = `-- name: ReleaseCustodyForRun :execrows
+const releaseCustodyForRunWorker = `-- name: ReleaseCustodyForRunWorker :execrows
 UPDATE recovery_custody_holds
 SET live_worker_id = NULL, live_run_id = NULL, state = 'released',
     released_at = now(), updated_at = now()
-WHERE run_id = $1 AND state = 'open'
+WHERE run_id = $1 AND live_worker_id = $2::uuid AND state = 'open'
 `
 
-// D3: the RELEASE mechanism. Nulls both live FKs (dropping the ON DELETE RESTRICT that
-// blocks worker/run teardown), flips state to 'released' and stamps released_at, for every
-// OPEN hold on the run. Idempotent: a second call moves zero rows (no open holds remain).
-// Captures survive (hold_id -> capture is ON DELETE RESTRICT, and this never deletes the
-// hold). The immutable provenance columns are untouched.
-func (q *Queries) ReleaseCustodyForRun(ctx context.Context, runID uuid.UUID) (int64, error) {
-	result, err := q.db.Exec(ctx, releaseCustodyForRun, runID)
+type ReleaseCustodyForRunWorkerParams struct {
+	RunID    uuid.UUID `json:"run_id"`
+	WorkerID uuid.UUID `json:"worker_id"`
+}
+
+// D3: the terminal-completion RELEASE mechanism, scoped to ONE worker's hold on the run.
+// Nulls both live FKs, flips state to 'released' and stamps released_at, for the open hold on
+// @run_id held by @worker_id (the completing/reporting worker). Idempotent: a second call
+// moves zero rows. Scoping to the reporting worker's own (current-generation) hold is the
+// multi-hold guard on the completion path: a completed run reported by generation 2's worker
+// releases only generation 2's hold and PRESERVES a still-open generation-1 orphan hold, whose
+// uncaptured committed work is retained until capture/discard (surfaced as retaining-
+// unpublished-work), rather than being stranded by a release-by-run that nulls every open
+// hold's FKs. Captures survive; the immutable provenance columns are untouched.
+func (q *Queries) ReleaseCustodyForRunWorker(ctx context.Context, arg ReleaseCustodyForRunWorkerParams) (int64, error) {
+	result, err := q.db.Exec(ctx, releaseCustodyForRunWorker, arg.RunID, arg.WorkerID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const releaseCustodyHold = `-- name: ReleaseCustodyHold :execrows
+UPDATE recovery_custody_holds
+SET live_worker_id = NULL, live_run_id = NULL, state = 'released',
+    released_at = now(), updated_at = now()
+WHERE id = $1 AND state = 'open'
+`
+
+// D3: the PER-HOLD RELEASE mechanism. Nulls both live FKs (dropping the ON DELETE RESTRICT
+// that blocks worker/run teardown), flips state to 'released' and stamps released_at, for the
+// ONE hold named by @id. Idempotent: a second call moves zero rows (the hold is no longer
+// open). Captures survive (hold_id -> capture is ON DELETE RESTRICT, and this never deletes
+// the hold). The immutable provenance columns are untouched. This is the reconciler's release:
+// it releases EXACTLY the hold ListReleasableCustodyHolds qualified, so a sibling
+// older-generation orphan hold on the same run is never collaterally released (the multi-hold
+// hazard documented on ListReleasableCustodyHolds).
+func (q *Queries) ReleaseCustodyHold(ctx context.Context, id uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, releaseCustodyHold, id)
 	if err != nil {
 		return 0, err
 	}

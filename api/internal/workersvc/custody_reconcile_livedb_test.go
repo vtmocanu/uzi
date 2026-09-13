@@ -72,7 +72,9 @@ func TestReconcileCustodyReleasesLiveDB(t *testing.T) {
 		exec(`INSERT INTO workers (id, user_id, name, token_hash, template_declared, kind, hosted_size, docker_enabled, ephemeral, ephemeral_run_id, status)
 		      VALUES ($1, $2, $3, $4, 'base', 'hosted', 'm', false, true, $5, 'online')`,
 			workerID, userID, "eph-"+workerID.String(), workerID[:], runID)
-		exec(`UPDATE runs SET status = $2, worker_id = $3 WHERE id = $1`, runID, status, workerID)
+		// claim_generation = 1 matches the hold's generation below, so the completed-path
+		// release disjunct (h.generation = r.claim_generation) qualifies the single hold.
+		exec(`UPDATE runs SET status = $2, worker_id = $3, claim_generation = 1 WHERE id = $1`, runID, status, workerID)
 		exec(`INSERT INTO recovery_custody_holds
 		        (id, user_id, repo_id, run_id, generation, state,
 		         original_worker_id, original_worker_identity, live_worker_id, live_run_id)

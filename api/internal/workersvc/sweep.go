@@ -328,40 +328,34 @@ func (s *Service) resumePoolWaitRuns(ctx context.Context) (int64, error) {
 // the idempotent release, so the hold's ON DELETE RESTRICT live FKs are nulled and normal
 // reap can then delete the worker.
 //
-// Release is warranted ONLY on a durable disposition, decided in SQL by
-// ListReleasableCustodyHolds: the hold's run is 'completed' (full publication), or a READY
-// capture ('available') exists for the hold. It NEVER infers success from an arbitrary
-// terminal status — a 'failed'/'cancelled'/future 'partial' run with no ready capture keeps
-// its custody for capture or explicit discard.
+// Release is warranted ONLY on a durable disposition for THIS hold, decided in SQL by
+// ListReleasableCustodyHolds: the hold's run is 'completed' AND the hold is the completed
+// generation (h.generation = runs.claim_generation), or a READY capture ('available') exists
+// for THIS hold. It NEVER infers success from an arbitrary terminal status — a
+// 'failed'/'cancelled'/future 'partial' run with no ready capture keeps its custody for
+// capture or explicit discard.
 //
-// It releases by DISTINCT run_id via ReleaseCustodyForRun (the same frozen primitive the
-// terminal path uses, which releases every open hold on the run): a completed run's holds
-// are all releasable, and a run normally carries a single open hold. Returns the number of
-// holds released this tick (summed from the per-run execrows). A ReleaseCustodyForRun error
-// is logged and skipped so one stuck run does not sink the whole reconcile — the same
-// best-effort stance the pool-resume pass takes; a candidate-list read error, by contrast,
-// fails the pass like the sibling reads.
+// It releases EXACTLY the selected hold via ReleaseCustodyHold(h.ID), NOT the whole run: a
+// run can carry MORE THAN ONE open hold (a cross-worker re-claim after a transient worker loss
+// opens a generation-2 hold while the crashed worker's generation-1 hold stays open), whose
+// committed work is a different, uncaptured copy. Releasing per-run would null that sibling
+// orphan's live FKs and let its worker be reaped, dropping the only copy of its work — so
+// selection and release must agree PER HOLD. Returns the number of holds released this tick
+// (summed from the per-hold execrows). A ReleaseCustodyHold error is logged and skipped so one
+// stuck hold does not sink the whole reconcile — the same best-effort stance the pool-resume
+// pass takes; a candidate-list read error, by contrast, fails the pass like the sibling reads.
 func (s *Service) ReconcileCustodyReleases(ctx context.Context) (int64, error) {
 	holds, err := s.q.ListReleasableCustodyHolds(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("list releasable custody holds: %w", err)
 	}
-	// Dedupe by run_id: ReleaseCustodyForRun releases EVERY open hold on the run, so a
-	// second call for a sibling hold on the same run would move zero rows. Releasing once
-	// per distinct run and summing the returned counts reports the true holds-released
-	// total without double-counting.
-	seen := make(map[uuid.UUID]bool, len(holds))
 	var released int64
 	for _, h := range holds {
-		if seen[h.RunID] {
-			continue
-		}
-		seen[h.RunID] = true
-		n, err := s.q.ReleaseCustodyForRun(ctx, h.RunID)
+		n, err := s.q.ReleaseCustodyHold(ctx, h.ID)
 		if err != nil {
-			// Best-effort: skip this run, keep reconciling the rest. The hold stays open and
+			// Best-effort: skip this hold, keep reconciling the rest. The hold stays open and
 			// the next tick retries it.
-			slog.Error("sweeper: custody release failed", "run", h.RunID, "error", err)
+			slog.Error("sweeper: custody release failed", "hold", h.ID, "run", h.RunID, "error", err)
 			continue
 		}
 		released += n

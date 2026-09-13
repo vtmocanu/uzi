@@ -31,9 +31,16 @@ import (
 // PASS=0 is INVALID, not green.
 
 // insertCustodyHold opens a custody hold row directly (bypassing ClaimRun so the test can
-// control state, live FKs, repo and run precisely). liveWorker/liveRun nil-valued means a
-// released-style hold with the FK nulled. Returns the hold id.
+// control state, live FKs, repo and run precisely) at generation 1. liveWorker/liveRun
+// nil-valued means a released-style hold with the FK nulled. Returns the hold id.
 func insertCustodyHold(fx *fleetFixture, runID uuid.UUID, repoID pgtype.UUID, liveWorker pgtype.UUID, state string) uuid.UUID {
+	return insertCustodyHoldGen(fx, runID, repoID, liveWorker, state, 1)
+}
+
+// insertCustodyHoldGen is insertCustodyHold with an explicit generation, for multi-hold
+// fixtures where a run carries a generation-1 orphan hold alongside a generation-2 hold (a
+// cross-worker re-claim after a transient worker loss).
+func insertCustodyHoldGen(fx *fleetFixture, runID uuid.UUID, repoID pgtype.UUID, liveWorker pgtype.UUID, state string, generation int64) uuid.UUID {
 	fx.t.Helper()
 	holdID := uuid.New()
 	origWorker := uuid.New()
@@ -46,8 +53,8 @@ func insertCustodyHold(fx *fleetFixture, runID uuid.UUID, repoID pgtype.UUID, li
 		`INSERT INTO recovery_custody_holds
 		   (id, user_id, repo_id, run_id, generation, state,
 		    original_worker_id, original_worker_identity, live_worker_id, live_run_id)
-		 VALUES ($1, $2, $3, $4, 1, $5, $6, 'ident', $7, $8)`,
-		holdID, fx.userID, repoID, runID, state, origWorker, liveWorker, liveRun)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, 'ident', $8, $9)`,
+		holdID, fx.userID, repoID, runID, generation, state, origWorker, liveWorker, liveRun)
 	return holdID
 }
 
@@ -84,12 +91,12 @@ func TestTeardownDeletesSkipCustodyHeldWorkerLiveDB(t *testing.T) {
 			t.Fatalf("worker %s deleted despite holding an open custody hold", wID)
 		}
 
-		// Release custody (null the live FK, state released) — as ReleaseCustodyForRun does.
-		if _, err := fx.q.ReleaseCustodyForRun(fx.ctx, runA); err != nil {
-			t.Fatalf("ReleaseCustodyForRun: %v", err)
+		// Release custody (null the live FK, state released) — the per-hold release primitive.
+		if _, err := fx.q.ReleaseCustodyHold(fx.ctx, holdID); err != nil {
+			t.Fatalf("ReleaseCustodyHold: %v", err)
 		}
 		if holdIsOpen(fx, holdID) {
-			t.Fatalf("hold %s still open after ReleaseCustodyForRun", holdID)
+			t.Fatalf("hold %s still open after ReleaseCustodyHold", holdID)
 		}
 
 		// Now the SAME teardown deletes it.
@@ -123,8 +130,8 @@ func TestTeardownDeletesSkipCustodyHeldWorkerLiveDB(t *testing.T) {
 			t.Fatalf("worker %s reaped despite holding an open custody hold", wID)
 		}
 
-		if _, err := fx.q.ReleaseCustodyForRun(fx.ctx, runA); err != nil {
-			t.Fatalf("ReleaseCustodyForRun: %v", err)
+		if _, err := fx.q.ReleaseCustodyHold(fx.ctx, holdID); err != nil {
+			t.Fatalf("ReleaseCustodyHold: %v", err)
 		}
 		if holdIsOpen(fx, holdID) {
 			t.Fatalf("hold %s still open after release", holdID)
@@ -156,9 +163,12 @@ func TestListReleasableCustodyHoldsLiveDB(t *testing.T) {
 		return id
 	}
 
-	// (1) completed run, open hold → releasable (full publication).
+	// (1) completed run, open hold → releasable (full publication). claim_generation = 1
+	// matches the hold's generation (insertCustodyHold hardcodes 1), so the generation-aware
+	// completed disjunct (h.generation = r.claim_generation) qualifies it.
 	completedRun := newRun("completed")
 	completedHold := insertCustodyHold(fx, completedRun, repo, liveW, "open")
+	mustExec(fx.ctx, fx.t, fx.pool, `UPDATE runs SET claim_generation = 1 WHERE id = $1`, completedRun)
 
 	// (2) failed run, open hold, NO capture → NOT releasable (never infer success from failed).
 	failedRun := newRun("failed")
@@ -180,6 +190,18 @@ func TestListReleasableCustodyHoldsLiveDB(t *testing.T) {
 	// (5) already-released hold on a completed run → NOT in list (state != 'open').
 	releasedRun := newRun("completed")
 	releasedHold := insertCustodyHold(fx, releasedRun, repo, pgtype.UUID{}, "released")
+
+	// (6) MULTI-HOLD generation guard: a COMPLETED run at claim_generation = 2 carries an
+	// orphaned generation-1 hold (a crashed worker's, never released) alongside the current
+	// generation-2 hold. Only the CURRENT generation actually completed/published, so only the
+	// generation-2 hold is releasable via the completed path; the generation-1 orphan (whose
+	// uncaptured committed work is a different copy) must NOT be listed. Without the
+	// h.generation = r.claim_generation guard, BOTH would be listed and a per-run release would
+	// then drop generation-1's last copy — the exact HIGH hazard.
+	multiRun := newRun("completed")
+	mustExec(fx.ctx, fx.t, fx.pool, `UPDATE runs SET claim_generation = 2 WHERE id = $1`, multiRun)
+	orphanGen1Hold := insertCustodyHoldGen(fx, multiRun, repo, liveW, "open", 1)
+	currentGen2Hold := insertCustodyHoldGen(fx, multiRun, repo, liveW, "open", 2)
 
 	holds, err := fx.q.ListReleasableCustodyHolds(fx.ctx)
 	if err != nil {
@@ -205,6 +227,13 @@ func TestListReleasableCustodyHoldsLiveDB(t *testing.T) {
 	if got[releasedHold] {
 		t.Errorf("already-released hold %s listed — only OPEN holds are candidates", releasedHold)
 	}
+	// (6) generation guard on the completed path.
+	if !got[currentGen2Hold] {
+		t.Errorf("current-generation hold %s not listed — the completed generation must be releasable", currentGen2Hold)
+	}
+	if got[orphanGen1Hold] {
+		t.Errorf("orphaned generation-1 hold %s listed on a completed run — an older generation's uncaptured work must be RETAINED (generation guard)", orphanGen1Hold)
+	}
 }
 
 func TestCountOpenCustodyHoldsForWorkerAndRepoLiveDB(t *testing.T) {
@@ -223,13 +252,20 @@ func TestCountOpenCustodyHoldsForWorkerAndRepoLiveDB(t *testing.T) {
 	}
 
 	run1, run2 := newRun("failed"), newRun("failed")
-	insertCustodyHold(fx, run1, repo, liveW, "open")
+	hold1 := insertCustodyHold(fx, run1, repo, liveW, "open")
 	insertCustodyHold(fx, run2, repo, liveW, "open")
 
-	if n, err := fx.q.CountOpenCustodyHoldsForWorker(fx.ctx, wID); err != nil {
+	if n, err := fx.q.CountOpenCustodyHoldsForWorker(fx.ctx, store.CountOpenCustodyHoldsForWorkerParams{WorkerID: wID, UserID: fx.userID}); err != nil {
 		t.Fatalf("CountOpenCustodyHoldsForWorker: %v", err)
 	} else if n != 2 {
 		t.Fatalf("open holds for worker = %d, want 2", n)
+	}
+	// FIX 2 (owner scope): a FOREIGN owner counts 0 for the SAME worker — the guard filters on
+	// user_id, so a non-owner never learns the worker holds custody (falls through to the 404).
+	if n, err := fx.q.CountOpenCustodyHoldsForWorker(fx.ctx, store.CountOpenCustodyHoldsForWorkerParams{WorkerID: wID, UserID: uuid.New()}); err != nil {
+		t.Fatalf("CountOpenCustodyHoldsForWorker(foreign owner): %v", err)
+	} else if n != 0 {
+		t.Fatalf("open holds for worker under a foreign owner = %d, want 0 (guard must be owner-scoped)", n)
 	}
 	if n, err := fx.q.CountOpenCustodyHoldsForRepo(fx.ctx, fx.repoID); err != nil {
 		t.Fatalf("CountOpenCustodyHoldsForRepo: %v", err)
@@ -238,10 +274,10 @@ func TestCountOpenCustodyHoldsForWorkerAndRepoLiveDB(t *testing.T) {
 	}
 
 	// Releasing run1's custody drops both counts by one.
-	if _, err := fx.q.ReleaseCustodyForRun(fx.ctx, run1); err != nil {
-		t.Fatalf("ReleaseCustodyForRun: %v", err)
+	if _, err := fx.q.ReleaseCustodyHold(fx.ctx, hold1); err != nil {
+		t.Fatalf("ReleaseCustodyHold: %v", err)
 	}
-	if n, err := fx.q.CountOpenCustodyHoldsForWorker(fx.ctx, wID); err != nil {
+	if n, err := fx.q.CountOpenCustodyHoldsForWorker(fx.ctx, store.CountOpenCustodyHoldsForWorkerParams{WorkerID: wID, UserID: fx.userID}); err != nil {
 		t.Fatalf("CountOpenCustodyHoldsForWorker(after release): %v", err)
 	} else if n != 1 {
 		t.Fatalf("open holds for worker after release = %d, want 1", n)
@@ -311,8 +347,8 @@ func TestCustodyControllerAndOwnerListSignalsLiveDB(t *testing.T) {
 	}
 
 	// Release custody → both signals clear.
-	if _, err := fx.q.ReleaseCustodyForRun(ctx, runID); err != nil {
-		t.Fatalf("ReleaseCustodyForRun: %v", err)
+	if _, err := fx.q.ReleaseCustodyHold(ctx, holdID); err != nil {
+		t.Fatalf("ReleaseCustodyHold: %v", err)
 	}
 	if holdIsOpen(fx, holdID) {
 		t.Fatalf("hold %s still open after release", holdID)

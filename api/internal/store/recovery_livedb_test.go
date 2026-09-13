@@ -297,11 +297,13 @@ func TestRecoveryStoreLifecycleLiveDB(t *testing.T) {
 		t.Fatalf("open holds after expiry = %d, want 1 (expiry must not touch custody)", n)
 	}
 
-	// ── (c) ReleaseCustodyForRun: live FKs null, state released, captures survive. ──
-	if n, err := q.ReleaseCustodyForRun(ctx, runID); err != nil {
-		t.Fatalf("ReleaseCustodyForRun: %v", err)
+	// ── (c) ReleaseCustodyForRunWorker: live FKs null, state released, captures survive. ──
+	// The single-hold run is reported completed by its own worker, so the worker-scoped
+	// terminal release releases exactly this hold.
+	if n, err := q.ReleaseCustodyForRunWorker(ctx, store.ReleaseCustodyForRunWorkerParams{RunID: runID, WorkerID: workerID}); err != nil {
+		t.Fatalf("ReleaseCustodyForRunWorker: %v", err)
 	} else if n != 1 {
-		t.Fatalf("ReleaseCustodyForRun moved %d rows, want 1", n)
+		t.Fatalf("ReleaseCustodyForRunWorker moved %d rows, want 1", n)
 	}
 	var (
 		relState                  string
@@ -321,10 +323,10 @@ func TestRecoveryStoreLifecycleLiveDB(t *testing.T) {
 		t.Fatalf("capture must survive release: %v", err)
 	}
 	// Idempotent: a second release moves zero rows.
-	if n, err := q.ReleaseCustodyForRun(ctx, runID); err != nil {
-		t.Fatalf("ReleaseCustodyForRun(again): %v", err)
+	if n, err := q.ReleaseCustodyForRunWorker(ctx, store.ReleaseCustodyForRunWorkerParams{RunID: runID, WorkerID: workerID}); err != nil {
+		t.Fatalf("ReleaseCustodyForRunWorker(again): %v", err)
 	} else if n != 0 {
-		t.Fatalf("second ReleaseCustodyForRun moved %d rows, want 0 (idempotent)", n)
+		t.Fatalf("second ReleaseCustodyForRunWorker moved %d rows, want 0 (idempotent)", n)
 	}
 
 	// ── DiscardCaptureForOwner: chunks deleted, capture marked discarded. ──

@@ -452,14 +452,20 @@ type Store interface {
 	ListCapturesForRunOwner(ctx context.Context, arg store.ListCapturesForRunOwnerParams) ([]store.RecoveryCapture, error)
 	ListCaptureChunks(ctx context.Context, captureID uuid.UUID) ([]store.RecoveryCaptureChunk, error)
 	GetRecoverySummaryForRun(ctx context.Context, arg store.GetRecoverySummaryForRunParams) (store.GetRecoverySummaryForRunRow, error)
-	ReleaseCustodyForRun(ctx context.Context, runID uuid.UUID) (int64, error)
+	// PRD #1296 M4 (D3) custody RELEASE, per-hold and per-worker (never per-run, which
+	// would strand a sibling older-generation orphan hold): ReleaseCustodyHold releases the
+	// ONE selected hold (the reconciler's release, agreeing with ListReleasableCustodyHolds);
+	// ReleaseCustodyForRunWorker releases only the completing worker's own hold on the run
+	// (the terminal-completion release in SetState).
+	ReleaseCustodyHold(ctx context.Context, id uuid.UUID) (int64, error)
+	ReleaseCustodyForRunWorker(ctx context.Context, arg store.ReleaseCustodyForRunWorkerParams) (int64, error)
 	DiscardCaptureForOwner(ctx context.Context, arg store.DiscardCaptureForOwnerParams) (int64, error)
 	ExpireReadyCaptures(ctx context.Context, now pgtype.Timestamptz) (int64, error)
 	// M4 (D3) cleanup-safety reads: ListReleasableCustodyHolds is the custody-release
 	// reconciler's candidate set (OPEN holds whose release is now warranted but unapplied);
 	// CountOpenCustodyHoldsForWorker backs the DeleteWorker custody guard.
 	ListReleasableCustodyHolds(ctx context.Context) ([]store.RecoveryCustodyHold, error)
-	CountOpenCustodyHoldsForWorker(ctx context.Context, workerID uuid.UUID) (int64, error)
+	CountOpenCustodyHoldsForWorker(ctx context.Context, arg store.CountOpenCustodyHoldsForWorkerParams) (int64, error)
 	// Run judge (PRD #46 M3): terminal-funnel enqueue, judge-run-scoped trace/review
 	// authz, the command-not-found scan input, and the review upsert.
 	GetUserByID(ctx context.Context, id uuid.UUID) (store.User, error)
@@ -2658,18 +2664,27 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// maybeEnqueueTaskReview's review_target_run_id-null gate makes the two mutually
 		// exclusive. Best-effort — never fails the report.
 		s.maybeEnqueueThenFix(ctx, run)
-		// PRD #1296 M4 (D3): on a terminal SUCCESS (status='completed'), release the run's
-		// custody idempotently — a completed code-publishing run published its head, so its
-		// unpublished-work custody is moot. Placed BEFORE the ephemeral teardown so the
-		// release nulls the hold's ON DELETE RESTRICT live FKs and the teardown DELETE's
-		// custody-skip predicate then finds no open hold and can reap the worker in the same
-		// report. BEST-EFFORT: a release failure must NOT fail or block the completion report
-		// (D3) — the M4 custody-release reconciler is the backstop that settles a recorded
-		// successful publication later, after which reap proceeds. Deliberately NOT called on
-		// failed/cancelled: those retain custody for capture or explicit discard.
+		// PRD #1296 M4 (D3): on a terminal SUCCESS (status='completed'), release the
+		// COMPLETING WORKER'S OWN custody hold idempotently — a completed code-publishing run
+		// published its head, so its unpublished-work custody is moot. Scoped to wkr.ID (via
+		// ReleaseCustodyForRunWorker), NOT the whole run: a run can carry a sibling
+		// older-generation orphan hold (a cross-worker re-claim after a transient worker loss),
+		// and a release-by-run would null that orphan's live FKs and let its worker be reaped,
+		// dropping its uncaptured committed work. Releasing only this worker's
+		// (current-generation) hold preserves the orphan, which is retained until
+		// capture/discard (D3). Placed BEFORE the ephemeral teardown so the release nulls this
+		// hold's ON DELETE RESTRICT live FKs and the teardown DELETE's custody-skip predicate
+		// can reap the worker in the same report. BEST-EFFORT: a release failure must NOT fail
+		// or block the completion report (D3) — the M4 custody-release reconciler is the
+		// backstop that settles a recorded successful publication later, after which reap
+		// proceeds. Deliberately NOT called on failed/cancelled: those retain custody for
+		// capture or explicit discard.
 		if run.Status == "completed" {
-			if _, relErr := s.q.ReleaseCustodyForRun(ctx, runID); relErr != nil {
-				slog.Warn("release custody on completion", "run", runID, "error", relErr)
+			if _, relErr := s.q.ReleaseCustodyForRunWorker(ctx, store.ReleaseCustodyForRunWorkerParams{
+				RunID:    runID,
+				WorkerID: wkr.ID,
+			}); relErr != nil {
+				slog.Warn("release custody on completion", "run", runID, "worker", wkr.ID, "error", relErr)
 			}
 		}
 		// PRD #529 M4: an ephemeral worker exists only to serve its bound run, so a
@@ -3720,7 +3735,14 @@ func (s *Service) DeleteWorker(ctx context.Context, userID, workerID uuid.UUID) 
 	if active > 0 {
 		return ErrWorkerHasActiveRuns
 	}
-	holds, err := s.q.CountOpenCustodyHoldsForWorker(ctx, workerID)
+	// OWNER-SCOPED (userID): the count filters on user_id so a FOREIGN owner's held worker
+	// returns 0 here and falls through to the owner-scoped DeleteWorkerForUser → 404, instead
+	// of leaking the worker's existence + hold count as a 409. Every other sibling check in
+	// this method is owner-scoped for the same reason.
+	holds, err := s.q.CountOpenCustodyHoldsForWorker(ctx, store.CountOpenCustodyHoldsForWorkerParams{
+		WorkerID: workerID,
+		UserID:   userID,
+	})
 	if err != nil {
 		return err
 	}

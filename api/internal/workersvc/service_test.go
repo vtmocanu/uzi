@@ -486,13 +486,19 @@ type fakeStore struct {
 	// PRD #1296 M4 (D3/D4) custody. openCustodyHolds is the count both the DeleteWorker
 	// guard (CountOpenCustodyHoldsForWorker) and the queued-reason rung
 	// (CountUnresolvedCustodyHoldsForOwner) read; default 0 → no custody, so pre-#1296
-	// tests are unaffected. releasableHolds seeds the reconciler candidate list;
-	// releaseCustodyRows is what ReleaseCustodyForRun reports, and releasedCustodyRuns
-	// records every run id it was called with (SetState terminal release + reconciler).
-	openCustodyHolds    int64
-	releasableHolds     []store.RecoveryCustodyHold
-	releaseCustodyRows  int64
-	releasedCustodyRuns []uuid.UUID
+	// tests are unaffected. countCustodyWorkerParams captures the last DeleteWorker guard
+	// call so a test can prove it was owner-scoped. releasableHolds seeds the reconciler
+	// candidate list; releaseCustodyRows is what the release queries report.
+	// releasedCustodyRuns records every (run, worker) ReleaseCustodyForRunWorker was called
+	// with (SetState terminal completion), and releasedCustodyHolds records every hold id
+	// ReleaseCustodyHold was called with (the reconciler).
+	openCustodyHolds         int64
+	countCustodyWorkerParams *store.CountOpenCustodyHoldsForWorkerParams
+	releasableHolds          []store.RecoveryCustodyHold
+	releaseCustodyRows       int64
+	releasedCustodyRuns      []uuid.UUID
+	releasedCustodyWorkers   []uuid.UUID
+	releasedCustodyHolds     []uuid.UUID
 
 	// Chat (PRD #39).
 	chatClaimRun          store.Run
@@ -1340,7 +1346,8 @@ func (f *fakeStore) DeleteEphemeralWorkerForRun(_ context.Context, arg uuid.UUID
 }
 
 // PRD #1296 M4 (D3/D4) custody stubs.
-func (f *fakeStore) CountOpenCustodyHoldsForWorker(_ context.Context, _ uuid.UUID) (int64, error) {
+func (f *fakeStore) CountOpenCustodyHoldsForWorker(_ context.Context, arg store.CountOpenCustodyHoldsForWorkerParams) (int64, error) {
+	f.countCustodyWorkerParams = &arg
 	return f.openCustodyHolds, nil
 }
 func (f *fakeStore) CountUnresolvedCustodyHoldsForOwner(_ context.Context, _ uuid.UUID) (int64, error) {
@@ -1349,8 +1356,13 @@ func (f *fakeStore) CountUnresolvedCustodyHoldsForOwner(_ context.Context, _ uui
 func (f *fakeStore) ListReleasableCustodyHolds(_ context.Context) ([]store.RecoveryCustodyHold, error) {
 	return f.releasableHolds, nil
 }
-func (f *fakeStore) ReleaseCustodyForRun(_ context.Context, runID uuid.UUID) (int64, error) {
-	f.releasedCustodyRuns = append(f.releasedCustodyRuns, runID)
+func (f *fakeStore) ReleaseCustodyHold(_ context.Context, id uuid.UUID) (int64, error) {
+	f.releasedCustodyHolds = append(f.releasedCustodyHolds, id)
+	return f.releaseCustodyRows, nil
+}
+func (f *fakeStore) ReleaseCustodyForRunWorker(_ context.Context, arg store.ReleaseCustodyForRunWorkerParams) (int64, error) {
+	f.releasedCustodyRuns = append(f.releasedCustodyRuns, arg.RunID)
+	f.releasedCustodyWorkers = append(f.releasedCustodyWorkers, arg.WorkerID)
 	return f.releaseCustodyRows, nil
 }
 func (f *fakeStore) GetRepoToolProfile(_ context.Context, _ store.GetRepoToolProfileParams) (store.RepoToolProfile, error) {
@@ -2802,11 +2814,15 @@ func TestSetStateAppliedOnLiveRun(t *testing.T) {
 }
 
 // TestSetStateCompletedReleasesCustody proves the PRD #1296 M4 (D3) terminal SUCCESS
-// custody release: an APPLIED `completed` transition releases the run's custody
-// idempotently (a completed code-publishing run published its head, so unpublished-work
-// custody is moot). Uses checkpointDeleteSvc so the whole terminal-automation block runs.
+// custody release: an APPLIED `completed` transition releases ONLY THE REPORTING WORKER'S
+// custody hold on the run (a completed code-publishing run published its head, so its
+// unpublished-work custody is moot). It is scoped to the reporting worker (wkr.ID) via
+// ReleaseCustodyForRunWorker, NOT the whole run: a sibling older-generation orphan hold held
+// by a different worker must survive. Uses checkpointDeleteSvc so the whole terminal-automation
+// block runs.
 func TestSetStateCompletedReleasesCustody(t *testing.T) {
 	runID := uuid.New()
+	wkr := worker()
 	fs := &fakeStore{
 		runOwned: store.Run{
 			ID: runID, Kind: runkind.Issue,
@@ -2816,7 +2832,7 @@ func TestSetStateCompletedReleasesCustody(t *testing.T) {
 		releaseCustodyRows: 1,
 	}
 	svc, _ := checkpointDeleteSvc(t, fs, nil)
-	_, applied, err := svc.SetState(context.Background(), worker(), runID, StateRequest{State: "completed"})
+	_, applied, err := svc.SetState(context.Background(), wkr, runID, StateRequest{State: "completed"})
 	if err != nil {
 		t.Fatalf("SetState(completed): %v", err)
 	}
@@ -2824,7 +2840,12 @@ func TestSetStateCompletedReleasesCustody(t *testing.T) {
 		t.Fatal("applied = false, want true")
 	}
 	if len(fs.releasedCustodyRuns) != 1 || fs.releasedCustodyRuns[0] != runID {
-		t.Fatalf("ReleaseCustodyForRun calls = %v, want exactly [%s]", fs.releasedCustodyRuns, runID)
+		t.Fatalf("ReleaseCustodyForRunWorker run calls = %v, want exactly [%s]", fs.releasedCustodyRuns, runID)
+	}
+	// The release is scoped to the REPORTING worker, not the whole run — the multi-hold guard
+	// that preserves a sibling older-generation orphan hold.
+	if len(fs.releasedCustodyWorkers) != 1 || fs.releasedCustodyWorkers[0] != wkr.ID {
+		t.Fatalf("ReleaseCustodyForRunWorker worker calls = %v, want exactly [%s] (release must be worker-scoped)", fs.releasedCustodyWorkers, wkr.ID)
 	}
 }
 
@@ -2849,7 +2870,7 @@ func TestSetStateFailedRetainsCustody(t *testing.T) {
 		t.Fatal("applied = false, want true")
 	}
 	if len(fs.releasedCustodyRuns) != 0 {
-		t.Fatalf("ReleaseCustodyForRun was called on a failed run (%v); failed runs must RETAIN custody", fs.releasedCustodyRuns)
+		t.Fatalf("ReleaseCustodyForRunWorker was called on a failed run (%v); failed runs must RETAIN custody", fs.releasedCustodyRuns)
 	}
 	if fs.setFailed == nil {
 		t.Fatal("SetRunFailed was not called; the failed transition must be recorded")
@@ -4431,7 +4452,8 @@ func TestDeleteWorkerRejectedWhileHoldingCustody(t *testing.T) {
 	// error names the count so M4b's CLI confirmation can enumerate the affected captures.
 	fs := &fakeStore{countActiveRuns: 0, openCustodyHolds: 2, deleteWorkerRows: 1}
 	svc := New(fs, newBox(t), testParams())
-	err := svc.DeleteWorker(context.Background(), uuid.New(), uuid.New())
+	user, wkrID := uuid.New(), uuid.New()
+	err := svc.DeleteWorker(context.Background(), user, wkrID)
 	if !errors.Is(err, ErrWorkerHasCustody) {
 		t.Fatalf("err = %v, want ErrWorkerHasCustody", err)
 	}
@@ -4442,6 +4464,14 @@ func TestDeleteWorkerRejectedWhileHoldingCustody(t *testing.T) {
 	// The guard runs BEFORE the delete: no token-cascading DELETE while custody is open.
 	if fs.deleteWorkerParams != nil {
 		t.Fatal("no delete should be issued while the worker holds custody")
+	}
+	// The custody guard is OWNER-SCOPED (FIX 2): DeleteWorker passes the requesting user's id
+	// so a FOREIGN owner's held worker counts 0 in SQL and 404s instead of leaking a 409. The
+	// fake cannot re-run the SQL filter, but it proves the userID/workerID reach the query.
+	if fs.countCustodyWorkerParams == nil ||
+		fs.countCustodyWorkerParams.UserID != user ||
+		fs.countCustodyWorkerParams.WorkerID != wkrID {
+		t.Fatalf("custody guard params = %+v, want worker %s scoped to user %s", fs.countCustodyWorkerParams, wkrID, user)
 	}
 }
 
