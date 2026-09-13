@@ -5057,6 +5057,97 @@ describe("RunView — owner completion decisions (PRD #1227 M4)", () => {
     expect(screen.queryByRole("checkbox", { name: /accept add the endpoint/i })).toBeNull();
   });
 
+  // ── Client-side submit guards (partialOk / acceptOk) and the accept-mode exclusion ─────
+  // The "Review & confirm" gate stays DISABLED until a decision is actually valid, so an
+  // invalid request is never formed. These pin each disabling arm so a regression weakening
+  // partialOk / acceptOk / acceptCandidates is caught rather than silently round-tripping.
+  it("partial: keeping ALL milestones (nothing deferred) + a reason keeps Review & confirm disabled", async () => {
+    renderPage(BLOCKED, true);
+    await screen.findByText("Completion decision");
+    fireEvent.click(screen.getByRole("button", { name: "Reduce scope" }));
+    // Every in-scope milestone stays kept (no checkbox toggled) — defer set is empty.
+    fireEvent.change(screen.getByLabelText(/reason \(required\)/i), {
+      target: { value: "A reason, but nothing is being deferred." },
+    });
+    expect(
+      (screen.getByRole("button", { name: "Review & confirm" }) as HTMLButtonElement).disabled,
+    ).toBe(true);
+  });
+
+  it("partial: deferring ALL in-scope milestones (nothing kept) + a reason keeps Review & confirm disabled", async () => {
+    renderPage(BLOCKED, true);
+    await screen.findByText("Completion decision");
+    fireEvent.click(screen.getByRole("button", { name: "Reduce scope" }));
+    // Uncheck every in-scope milestone (m1, m2, m3) — the kept set becomes empty.
+    fireEvent.click(screen.getByRole("checkbox", { name: /keep add the endpoint in scope/i }));
+    fireEvent.click(screen.getByRole("checkbox", { name: /keep write the tests in scope/i }));
+    fireEvent.click(screen.getByRole("checkbox", { name: /keep update the docs in scope/i }));
+    fireEvent.change(screen.getByLabelText(/reason \(required\)/i), {
+      target: { value: "Deferring everything is not a partial." },
+    });
+    expect(
+      (screen.getByRole("button", { name: "Review & confirm" }) as HTMLButtonElement).disabled,
+    ).toBe(true);
+  });
+
+  it("partial: a valid kept/deferred split but a BLANK reason keeps Review & confirm disabled", async () => {
+    renderPage(BLOCKED, true);
+    await screen.findByText("Completion decision");
+    fireEvent.click(screen.getByRole("button", { name: "Reduce scope" }));
+    // Defer m3, keep m1 + m2 — a valid split, but leave the required reason empty.
+    fireEvent.click(screen.getByRole("checkbox", { name: /keep update the docs in scope/i }));
+    expect(
+      (screen.getByRole("button", { name: "Review & confirm" }) as HTMLButtonElement).disabled,
+    ).toBe(true);
+  });
+
+  it("accept: no criterion checked + a reason keeps Review & confirm disabled", async () => {
+    renderPage(BLOCKED, true);
+    await screen.findByText("Completion decision");
+    fireEvent.click(screen.getByRole("button", { name: "Accept criteria" }));
+    // A reason but no criterion selected — an accept must name ≥1 criterion.
+    fireEvent.change(screen.getByLabelText(/reason \(required\)/i), {
+      target: { value: "Nothing is actually selected to accept." },
+    });
+    expect(
+      (screen.getByRole("button", { name: "Review & confirm" }) as HTMLButtonElement).disabled,
+    ).toBe(true);
+  });
+
+  it("accept: one criterion checked but a BLANK reason keeps Review & confirm disabled", async () => {
+    renderPage(BLOCKED, true);
+    await screen.findByText("Completion decision");
+    fireEvent.click(screen.getByRole("button", { name: "Accept criteria" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: /accept write the tests/i }));
+    // Criterion selected but the required reason is left empty.
+    expect(
+      (screen.getByRole("button", { name: "Review & confirm" }) as HTMLButtonElement).disabled,
+    ).toBe(true);
+  });
+
+  it("accept: excludes completed/accepted/deferred milestones, leaving the empty state", async () => {
+    renderPage(
+      {
+        ...BLOCKED,
+        completion_revision: 4,
+        // m1 completed (milestones_completed from BLOCKED), m2 accepted, m3 deferred — so no
+        // milestone is a candidate and acceptCandidates is empty.
+        completion_deferred: [{ milestone_id: "m3", reason: "Out of scope now", revision: 2 }],
+        completion_accepted: [
+          { id: "m2.c1", milestone_id: "m2", text: "Write the tests", reason: "Manual QA covers it", revision: 3 },
+        ],
+      },
+      true,
+    );
+    await screen.findByText("Completion decision");
+    fireEvent.click(screen.getByRole("button", { name: "Accept criteria" }));
+    expect(screen.getByText("No unmet criteria are available to accept.")).toBeTruthy();
+    // None of the milestones offers an accept checkbox.
+    expect(screen.queryByRole("checkbox", { name: /accept add the endpoint/i })).toBeNull();
+    expect(screen.queryByRole("checkbox", { name: /accept write the tests/i })).toBeNull();
+    expect(screen.queryByRole("checkbox", { name: /accept update the docs/i })).toBeNull();
+  });
+
   it("a 409 revision conflict surfaces the server message inline (role=alert) and does not crash", async () => {
     mockApi.partialCompletionDecision.mockRejectedValue(
       new ApiError(409, "the contract revision has changed; re-read and re-decide"),
@@ -5078,6 +5169,29 @@ describe("RunView — owner completion decisions (PRD #1227 M4)", () => {
     ).toBeGreaterThan(0);
     expect(screen.getAllByRole("alert").length).toBeGreaterThan(0);
     expect(screen.getByText("Completion decision")).toBeTruthy();
+  });
+
+  it("a FAILED decision (409 conflict) still refreshes the run so the panel leaves the stale revision", async () => {
+    mockApi.partialCompletionDecision.mockRejectedValue(
+      new ApiError(409, "the contract revision has changed; re-read and re-decide"),
+    );
+    const { refreshRun } = renderPage(BLOCKED, true);
+    await screen.findByText("Completion decision");
+    fireEvent.click(screen.getByRole("button", { name: "Reduce scope" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: /keep update the docs in scope/i }));
+    fireEvent.change(screen.getByLabelText(/reason \(required\)/i), {
+      target: { value: "Docs later." },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Review & confirm" }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Confirm scope reduction" }));
+    });
+    // The submit failed, yet the run is refreshed so a re-submit sees the server's current
+    // revision instead of looping on the same stale contract_revision, and the error still shows.
+    await waitFor(() => expect(refreshRun).toHaveBeenCalled());
+    expect(
+      (await screen.findAllByText(/the contract revision has changed/i)).length,
+    ).toBeGreaterThan(0);
   });
 
   it("a 400 on the accept call (unknown criterion) is surfaced inline", async () => {

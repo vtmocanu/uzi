@@ -147,6 +147,12 @@ export function CompletionDecisionPanel({
   // runDecision wires the mutation through the page's `act` (banner + busy) AND captures the
   // specific message inline. The inner catch sets inlineErr then re-throws, so `act` still
   // lands the same message on the page banner and returns false; on success it resets the form.
+  //
+  // On FAILURE it ALSO refreshes the run: a 409 ErrCompletionRevisionConflict means the sent
+  // contract_revision is stale, so without re-reading the DTO the panel would keep rendering the
+  // stale `revision N` badge and re-submitting the SAME stale revision, looping on 409. The
+  // refresh re-renders the panel against the server's current revision/state while the error is
+  // surfaced, closing the loop. It is guarded so a refresh error can't mask the decision error.
   const runDecision = async (call: () => Promise<{ run: Run }>) => {
     setInlineErr("");
     const ok = await act(async () => {
@@ -154,6 +160,11 @@ export function CompletionDecisionPanel({
         await call();
       } catch (e) {
         setInlineErr(errorMessage(e, "The decision could not be applied."));
+        try {
+          await refreshRun();
+        } catch {
+          // A refresh failure must not overwrite the decision error the owner needs to see.
+        }
         throw e;
       }
       await refreshRun();

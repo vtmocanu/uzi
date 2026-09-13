@@ -330,12 +330,14 @@ export const runsApi = {
   },
 
   // ── Owner completion decisions (PRD #1227 M4) ─────────────────────────────────
-  // The three owner/admin decisions on a completion-BLOCKED run. Mirror the server: the demo
-  // caller owns every non-other-user run so a missing run is the only 404; a 409 on a run that
-  // is not completion-blocked; and — for partial/accept — a 409 when the fenced
-  // contract_revision no longer matches, plus a new revision N+1 with the deferred/accepted
-  // history appended. `continue` just un-parks the hold (guidance is ignored by the mock —
-  // dropping the param keeps the method assignable to realApi's wider type with no unused arg).
+  // Demo-mode stubs for the three owner/admin decisions on a completion-BLOCKED run. These do
+  // NOT replicate every server validation arm — just enough to satisfy the api key-set parity
+  // guard and drive the demo: the demo caller owns every non-other-user run so a missing run is
+  // the only 404; a 409 on a run that is not completion-blocked; and — for partial/accept — a
+  // 409 when the fenced contract_revision no longer matches, plus a new revision N+1 with the
+  // deferred/accepted history appended. `continue` just un-parks the hold; it DROPS the guidance
+  // arg (the mock has nowhere to record it), which also keeps the method assignable to realApi's
+  // wider type with no unused arg.
   continueCompletionDecision: async (id: string) => {
     const run = getRun(id);
     if (!run) throw new ApiError(404, "run not found");
