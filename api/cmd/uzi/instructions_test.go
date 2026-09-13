@@ -451,6 +451,33 @@ var knownInstructions = []knownInstruction{
 			"in e2e/run-e2e.sh next to the other three rows, not here.",
 	},
 	{
+		command:  "uzi run export",
+		evidence: evidenceGoTest,
+		where:    "TestWorkerRmCustodyConflict",
+		// ARRIVED WITH PRD #1296 M5. `uzi worker rm`'s custody refusal (worker.go) names the
+		// recovery command an operator must run before a held worker can be deleted — now that
+		// M5 wired `uzi run export` into the tree, the reference is BACKTICKED (before M5 it was
+		// deliberately unbackticked prose, because a liftable reference to a command that did
+		// not exist yet would have tripped assertCommandPathResolves).
+		//
+		// RUNTIME, derived: the span sits inside the fmt.Sprintf whose result `guidance` is
+		// handed to Exitf (and p.JSON) — a literal bound to a name then emitted, which
+		// classifyKind's binding arm reads as RUNTIME (the strictest bar). The entry is a claim
+		// the emitting path was EXECUTED and its outcome asserted, which is what
+		// TestWorkerRmCustodyConflict does: it drives the real cobra parse of `worker rm` against
+		// a fake client returning a WorkerCustodyConflictError and asserts the OUTCOME — exit 5
+		// (ExitConflict), exactly one DeleteWorker attempt, and the stderr NAMES `uzi run export`.
+		//
+		// Its honest limit: executed against a FAKE client, so it proves the refusal, the argv
+		// shape and that the message names the command, not that `uzi run export` succeeds
+		// against a booted API.
+		note: "RUNTIME: `uzi worker rm`'s custody refusal (worker.go) names `uzi run export` as " +
+			"the recovery command to run before a custody-holding worker can be deleted, through " +
+			"Exitf (STDERR, exit 5). EXECUTED by TestWorkerRmCustodyConflict, which asserts exit " +
+			"ExitConflict, one delete attempt, and that the stderr names the command. Not executed " +
+			"against a booted API.",
+	},
+	{
 		command:  "uzi schedule clone",
 		evidence: evidenceGoTest,
 		where:    "TestScheduleEditDefaultCatalogOwnedFlagsRejected",

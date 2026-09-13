@@ -46,6 +46,7 @@ import { forgeNounLower, mrAbbrev, mrRefSymbol } from "../lib/forgeNoun";
 import { useRunStream } from "../lib/useRunStream";
 import { deriveRunUsage } from "../lib/runUsage";
 import { CIFixRunHeader } from "../components/CIFixRunHeader";
+import { RecoveryArchivesPanel } from "../components/RecoveryArchives";
 import { RunIssueRef } from "../components/RunIssueRef";
 import { RunCredential } from "../components/RunCredential";
 import { RunPriorityBadge } from "../components/RunPriorityBadge";
@@ -2002,6 +2003,14 @@ export function RunView() {
           )}
         </div>
       )}
+
+      {/* Durable run recovery (PRD #1296 M5, D6/D7). A TOP-LEVEL section, deliberately
+          NOT nested in the failed-card conditional above and NOT gated on captures.length:
+          the panel fetches its own owner-scoped summary and decides truthfully — from the
+          aggregate — whether to render (a real archive, a still-preparing capture, or an
+          honest legacy/unavailable note on a finalization-blocked run), rendering nothing
+          for an ordinary run. Owner-only: a non-owner's 404 renders nothing. */}
+      <RecoveryArchivesPanel run={run} />
 
       {/* Run retrospective (PRD #46 M4): the LLM judge's verdict + recommendations,
           shown once a run is finished. The panel fetches its own review and owns the

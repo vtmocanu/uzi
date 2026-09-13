@@ -2,6 +2,7 @@ package uzicli
 
 import (
 	"context"
+	"io"
 	"time"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
@@ -490,6 +491,24 @@ type FakeClient struct {
 	LastCIFixRepoID   string
 	LastCIFixRef      string
 	CreateCIFixRunErr error
+
+	// Durable-recovery archive reads (PRD #1296 M5). RecoverySummaries backs
+	// RecoveryArchives, keyed by run id — an absent key yields the zero-value summary,
+	// mirroring the server's empty Archives=[] for a run with no captures, so a run-detail
+	// summary test can exercise the honest "none" path without a special flag.
+	// RecoveryBytes maps a capture id to the exact bundle bytes DownloadRecoveryArchive
+	// streams; RecoveryDownloadHook, when non-nil, drives the download instead — the seam a
+	// truncated/interrupted/corrupt-stream test needs (write some bytes, then return an
+	// error, or write the WRONG bytes). RecoveryDownloadCalls records EACH downloaded
+	// capture id IN ORDER, so a test proves NO download was attempted when selection should
+	// have failed first (the >1-available-without-selection case). The *Err fields win over
+	// the blanket Err so a test can model a summary that reads fine and a download that fails.
+	RecoverySummaries     map[string]apitypes.RecoveryArchiveSummaryDTO
+	RecoveryArchivesErr   error
+	RecoveryBytes         map[string][]byte
+	RecoveryDownloadHook  func(runID, captureID string, w io.Writer) (int64, error)
+	RecoveryDownloadCalls []string
+	RecoveryDownloadErr   error
 
 	// Err, when non-nil, is returned by every method (before any lookup).
 	Err error

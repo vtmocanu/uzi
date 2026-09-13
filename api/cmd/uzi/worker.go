@@ -108,17 +108,17 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 				// the sentence so a 36-char UUID cannot push the actionable tail past the
 				// stderr line's 200-rune cap; --json carries it as a field instead.
 				//
-				// `uzi run export` (D7) is named WITHOUT backticks on purpose: it is the M5
-				// recovery command and is not wired in this branch yet, so a backticked (i.e.
-				// liftable) reference would trip the printed-instruction drift test
-				// (instructions_test.go), whose assertCommandPathResolves demands every printed
-				// runnable instruction resolve in the live cobra tree. A prose reference names
-				// the recovery path the PRD mandates without asserting it is runnable today.
+				// `uzi run export` (D7) is now BACKTICKED: PRD #1296 M5 wired the recovery
+				// command into the cobra tree, so a liftable reference resolves under
+				// assertCommandPathResolves and is registered in instructions_test.go
+				// (evidenceGoTest → TestWorkerRmCustodyConflict, the test that executes this very
+				// refusal). Before M5 it was deliberately unbackticked prose, because a liftable
+				// reference to a command that did not exist yet would have tripped that drift test.
 				var custody *uzicli.WorkerCustodyConflictError
 				if errors.As(err, &custody) {
 					guidance := fmt.Sprintf(
 						"this worker holds unpublished committed work in %d durable-recovery archive(s); "+
-							"recover it (uzi run export) or explicitly discard those archives, then retry the delete",
+							"recover it (`uzi run export`) or explicitly discard those archives, then retry the delete",
 						custody.Holds)
 					if p := env.printer(gf); p.Format == uzicli.FormatJSON {
 						_ = p.JSON(map[string]any{
