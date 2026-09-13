@@ -117,8 +117,9 @@ by anything on the PR itself.
      finding was *explicitly* skipped or resolved-without-code; if so, proceed to merge on
      the existing green state, otherwise return it to triage or local handling.
 4. **When it pushed a commit, that push retriggers CodeRabbit.** Wait for the re-review on
-   the **new head** (signal (c), the walkthrough `recent_review` range covering the new SHA
-   — see the *Triaging CodeRabbit findings* runbook in `coderabbit-triage.md`
+   the **new head** (signal (c), the walkthrough `final_review_risk` block's `up to
+   <short-sha>` marker covering the new SHA — the `recent_review` range is a retired
+   format; see the *Triaging CodeRabbit findings* runbook in `coderabbit-triage.md`
    (this skill dir)),
    confirm no active `mr_rework` remains and CI is green on that head, THEN merge.
 
@@ -129,8 +130,8 @@ by anything on the PR itself.
    findings to triage, **4** when an `mr_rework` run is active on the MR (defer, then re-run
    it), and **2** on timeout — where **exit 0 is trustworthy but exit 2 means inspect
    manually, never merge**. "Reviewed this head" is the union of a review whose `commit_id`
-   is the head SHA and the walkthrough range ending at it, because a zero-actionable
-   incremental posts no new review object.
+   is the head SHA and the walkthrough `final_review_risk` block's `up to` short-sha
+   matching it, because a zero-actionable incremental posts no new review object.
 
 **When this session still fixes locally (mr_rework will not or cannot):**
 - the owner is **opted out**, or the admin **kill-switch** is engaged

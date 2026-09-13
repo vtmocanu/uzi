@@ -79,8 +79,9 @@ fi
 
 # 🔴 THE SIZE PREDICATE, USED BY BOTH PHASES. True iff $1's byte size (`wc -c`) is
 # STRICTLY GREATER than the threshold $2 -- byte-for-byte the runtime's
-# repo-skills.ts:151 test. `wc -c < file` (redirect, not a filename arg) yields a bare
-# integer with no filename, so the arithmetic comparison is clean.
+# repo-skills.ts:151 test. `wc -c < file` (redirect, not a filename arg) prints only the
+# byte count with no filename; BSD/macOS `wc` left-pads it with spaces, which `[ -gt ]`
+# strips when it coerces to an integer, so the comparison is clean on GNU and BSD alike.
 over() {
   [ "$(wc -c < "$1")" -gt "$2" ]
 }
