@@ -21,10 +21,10 @@
 -- `go test` rather than raising 23514 on a user's failed run.
 --
 -- NUMBER ASSIGNED AT LANDING. Drafted as 00221 against a live head of
--- 00220_validate_run_budget_extension.sql; renumber above the live head on the landing
--- rebase if another migration merged first (strict goose refuses to boot on a version
--- below an already-applied head — store/migrate.go), per the CLAUDE.md goose convention
--- (no allow-missing).
+-- 00220_validate_run_budget_extension.sql; renumbered to 00223 on the landing merge, above
+-- the live head 00222_validate_admin_disposition_provenance.sql (00221/00222 landed first
+-- from #1184). Strict goose refuses to boot on a version below an already-applied head
+-- (store/migrate.go), per the CLAUDE.md goose convention (no allow-missing).
 ALTER TABLE runs DROP CONSTRAINT runs_fail_origin_check;
 ALTER TABLE runs ADD CONSTRAINT runs_fail_origin_check
     CHECK (fail_origin IN (
