@@ -33,7 +33,13 @@ name: Brew
 # Quoted so yamllint's `truthy` rule does not read the key as the boolean `on`.
 "on":
   push:
-    tags: ["v*"]
+    # Stable tags only. The negative pattern excludes any prerelease (vX.Y.Z-rc.N) so an
+    # RC tag creates NO brew run at all (PRD 1265 M4): Homebrew must never point at a
+    # candidate, and release-watch.sh would otherwise wait forever for a run that never
+    # starts. A negative pattern after a positive one excludes the ref, and at least one
+    # positive pattern (v*) remains, per GitHub's workflow-syntax. The Validate step's
+    # strict regex stays as the second line of defense for workflow_dispatch.
+    tags: ["v*", "!v*-*"]
   workflow_dispatch:
     inputs:
       tag:
