@@ -686,3 +686,50 @@ func TestTUICIRunQuitAndHelpNotFiltered(t *testing.T) {
 		t.Fatalf("esc on the CI-run view did not return to the ci list (view=%v)", m.view)
 	}
 }
+
+// ---- ← back symmetry (issue #1335) ----------------------------------------
+
+// TestTUICIRunLeftArrowGoesBack pins that ← backs out of the CI-run drill-in to the ci list,
+// sharing esc's back body — the forge drill-ins bind → to open a row but pre-fix left ← inert, so
+// only esc went back (the asymmetry #1335 fixes). Pre-fix keyLeft is unhandled in ciRunKey, so the
+// view stays viewCIRun and this reddens.
+func TestTUICIRunLeftArrowGoesBack(t *testing.T) {
+	fake := &uzicli.FakeClient{Repos: []apitypes.RepoDTO{oneRepo()}}
+	m := openCIRun(t, fake, ciRunDetailOf("agent/issue-1335", []apitypes.CIJobDTO{cjPassed("a")}))
+	m = press(t, m, keyLeft)
+	if m.view != viewCI {
+		t.Fatalf("← on the CI-run view did not return to the ci list (view=%v)", m.view)
+	}
+}
+
+// TestTUIDetailLeftArrowFocusesCrewRail is the scope guard for issue #1335: ← in the run-detail
+// view must STAY bound to crew-rail focus (exactly like h), never rebound to a drill-in "back". From
+// the transcript pane, both keyLeft and "h" move focus to the crew rail and stay inside viewDetail.
+// This passes on the current code and must keep passing after the drill-in ← binding lands.
+func TestTUIDetailLeftArrowFocusesCrewRail(t *testing.T) {
+	runID := "left-guard-1"
+	now := time.Now()
+	build := func() tuiModel {
+		m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
+		m = applyDetail(m, apitypes.RunDTO{ID: runID, Status: "running", IssueTitle: "multi-lane"},
+			[]apitypes.MessageDTO{
+				msgDTO(1, "text", "lead", "toolu_a", "impl", "hi", now),
+				msgDTO(2, "text", "coder", "toolu_b", "impl", "yo", now),
+			})
+		m.detail.focus = focusTranscript
+		return m
+	}
+
+	left := press(t, build(), keyLeft)
+	if left.view != viewDetail || left.detail.focus != focusRail {
+		t.Fatalf("← from the transcript should focus the crew rail, not back out; view=%v focus=%d", left.view, left.detail.focus)
+	}
+	h := press(t, build(), "h")
+	if h.view != viewDetail || h.detail.focus != focusRail {
+		t.Fatalf("h from the transcript should focus the crew rail; view=%v focus=%d", h.view, h.detail.focus)
+	}
+	if left.view != h.view || left.detail.focus != h.detail.focus {
+		t.Fatalf("← and h diverged in the detail view (← view=%v focus=%d; h view=%v focus=%d)",
+			left.view, left.detail.focus, h.view, h.detail.focus)
+	}
+}

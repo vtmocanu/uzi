@@ -379,3 +379,44 @@ func TestGitLabListWorkflowRuns(t *testing.T) {
 		t.Fatalf("run 1 named pipeline should keep its Name, got %q", runs[1].Name)
 	}
 }
+
+// TestGitLabGetWorkflowRun pins the single-pipeline GET mapping (the `ci` drill-in
+// header), which maps the RICHER *gitlab.Pipeline through
+// toGitLabWorkflowRunFromPipeline: IID as Number, Source as Event, ref as Branch,
+// the name-or-ref fallback for an unnamed pipeline, and — the enrichment the list
+// row lacks — Actor from the pipeline's user.
+func TestGitLabGetWorkflowRun(t *testing.T) {
+	m := newMockGitLab(t, map[string]http.HandlerFunc{
+		"/api/v4/projects/7/pipelines/900": func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": 900, "iid": 42, "status": "running", "source": "push", "ref": "main",
+				"sha": "cafe", "web_url": "https://gl/p/900",
+				"created_at": "2024-01-01T00:00:00Z",
+				"updated_at": "2024-01-01T00:05:00Z",
+				"started_at": "2024-01-01T00:01:00Z",
+				"user":       map[string]any{"username": "uzi-bot"},
+			})
+		},
+	})
+	d := newTestDriver(t, m, "glpat-token-value-123456")
+
+	r, err := d.GetWorkflowRun(context.Background(), 7, 900)
+	if err != nil {
+		t.Fatalf("GetWorkflowRun: %v", err)
+	}
+	if r.ID != 900 || r.Number != 42 || r.Event != "push" || r.Branch != "main" || r.SHA != "cafe" {
+		t.Fatalf("run mapping wrong: %+v", r)
+	}
+	// Unnamed pipeline ⇒ Name falls back to the ref (same as the list mapper).
+	if r.Name != "main" {
+		t.Fatalf("unnamed pipeline should use ref as Name, got %q", r.Name)
+	}
+	// D5 enrichment: the single GET returns the user, which the list row omits.
+	if r.Actor != "uzi-bot" {
+		t.Fatalf("Actor should come from the pipeline user, got %q", r.Actor)
+	}
+	wantStarted, _ := time.Parse(time.RFC3339, "2024-01-01T00:01:00Z")
+	if !r.StartedAt.Equal(wantStarted) {
+		t.Fatalf("StartedAt should come from the pipeline's started_at, got %v", r.StartedAt)
+	}
+}

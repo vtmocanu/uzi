@@ -120,12 +120,14 @@ func helpLines(v tuiView) []string {
 			"u          open the PR's linked uzi run (when one exists)",
 			"w          rework the linked run (fix review findings)",
 			"f          fix ci: queue a CI-fix run for the PR's branch",
+			"←          back",
 		}, common...)
 	case viewCIRun:
 		return append([]string{
 			"↑ / ↓      move the cursor over the jobs (the selected job expands its steps)",
 			"↗          the selected job's URL is a clickable link",
 			"f          fix ci: queue a CI-fix run for this run's branch",
+			"←          back",
 		}, common...)
 	default:
 		return append([]string{

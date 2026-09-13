@@ -398,6 +398,27 @@ func (g *github) ListWorkflowRuns(ctx context.Context, projectID int64, opts Lis
 	return out, nil
 }
 
+// GetWorkflowRun returns one workflow run's header (the neutral WorkflowRun) by its
+// GitHub run id, for the `ci` drill-in. Mirrors ListWorkflowRuns' guard/slug prelude
+// and reuses toGitHubWorkflowRun so the mapping stays identical to the list rows.
+func (g *github) GetWorkflowRun(ctx context.Context, projectID, runID int64) (WorkflowRun, error) {
+	if err := g.shedIfReserved(ctx); err != nil {
+		return WorkflowRun{}, err
+	}
+	slug, err := g.repoSlugFor(ctx, projectID)
+	if err != nil {
+		return WorkflowRun{}, err
+	}
+	run, _, err := g.client.Actions.GetWorkflowRunByID(ctx, slug.owner, slug.repo, runID)
+	if err != nil {
+		return WorkflowRun{}, g.wrapErr("get workflow run", err)
+	}
+	if run == nil {
+		return WorkflowRun{}, nil
+	}
+	return toGitHubWorkflowRun(run), nil
+}
+
 // toGitHubWorkflowRun maps a workflow run to the neutral WorkflowRun. Status is the
 // run phase (queued/in_progress/completed) and Conclusion the terminal outcome, the
 // same split the neutral Check uses.
