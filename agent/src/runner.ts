@@ -51,7 +51,7 @@ import { withForgeRetry } from "./forge-retry.js";
 import { makeRedactor, makeTextRedactor } from "./redact.js";
 import { sessionTranscriptResolvable } from "./sdk-session.js";
 import { errMessage, RUN_ID_RE, sleep } from "./util.js";
-import { PendingRecoveryCaptureError } from "./git.js";
+import { PendingRecoveryCaptureError, RunnerCloneConflictError } from "./git.js";
 import {
   buildCheckEnv,
   defaultCheckRunner,
@@ -995,11 +995,16 @@ export class RunRunner {
         // structured origin the judge can key on; an ordinary agent failure maps to
         // undefined and the server defaults it to 'agent_failure'. PRD #1077: a
         // TerminalReportError carries its own typed origin (push_secret_blocked) whose
-        // terminal report threw after exhausting retries — honor it verbatim.
+        // terminal report threw after exhausting retries — honor it verbatim. issue #1308:
+        // a RunnerCloneConflictError that survived self-heal (owner nonterminal / still
+        // active / unreachable) is a pre-start infra refuse — stamp runner_clone_conflict so
+        // it is diagnosable and does not enqueue the Judge at iteration 0.
         const failOrigin =
           err instanceof TerminalReportError
             ? err.failOrigin
-            : failOriginForReason(rawReason);
+            : err instanceof RunnerCloneConflictError
+              ? "runner_clone_conflict"
+              : failOriginForReason(rawReason);
         runLog.error("run failed", { error: reason });
         batcher.emit({
           kind: "error",
@@ -1109,9 +1114,20 @@ export class RunRunner {
       //     code says otherwise. A hang here is this bug until proven otherwise.
       if (flight.worktreePath && !flight.preserveRecoveryClone) {
         try {
-          await this.git.removeRunnerClone(flight.worktreePath);
           if (flight.barePath && flight.branch) {
-            await this.git.clearRecoveryCapture(flight.barePath, flight.branch, runId);
+            // issue #1308 — delete-then-clear under ONE per-bare lock, with an exact-owner
+            // CAS gating BOTH the delete and the clear: the journal is released even when the
+            // rm fails (ENOTEMPTY/EBUSY), so a leftover no longer bricks the branch, and a
+            // same-key successor's freshly reclaimed clone is never destroyed by this run.
+            await this.git.removeRunnerCloneAndReleaseRecovery(
+              flight.barePath,
+              flight.worktreePath,
+              flight.branch,
+              runId,
+            );
+          } else {
+            // No bare/branch context (no journal to release): plain best-effort remove.
+            await this.git.removeRunnerClone(flight.worktreePath);
           }
         } catch (e) {
           runLog.warn("runner clone cleanup failed", { error: errMessage(e) });
@@ -4839,18 +4855,81 @@ export class RunRunner {
       claim,
       runId,
     );
-    if (cloneBranch)
-      return this.git.runnerCloneForBranch(
-        barePath,
-        cloneBranch.branch,
-        cloneBranch.slug,
-        runId,
-        resume,
-        expectedCheckpointTip,
-      );
-    if (claim.issue_iid == null)
-      throw new Error("issue run claim is missing issue_iid");
-    return this.git.createOrAttachRunnerClone(barePath, claim.issue_iid, runId, resume, expectedCheckpointTip);
+    const seed = async (): Promise<RunnerClone> => {
+      if (cloneBranch)
+        return this.git.runnerCloneForBranch(
+          barePath,
+          cloneBranch.branch,
+          cloneBranch.slug,
+          runId,
+          resume,
+          expectedCheckpointTip,
+        );
+      if (claim.issue_iid == null)
+        throw new Error("issue run claim is missing issue_iid");
+      return this.git.createOrAttachRunnerClone(barePath, claim.issue_iid, runId, resume, expectedCheckpointTip);
+    };
+    // issue #1308 — a DIFFERENT run's stale recovery-capture journal (left behind when its
+    // clone cleanup failed, e.g. ENOTEMPTY) refuses this seed. When that owner run is
+    // definitively terminal-and-idle, self-heal by reclaiming its residue and retry the seed
+    // ONCE; otherwise fail closed (the RunnerCloneConflictError propagates and stamps the
+    // runner_clone_conflict fail_origin). The same-run PendingRecoveryCaptureError path is
+    // untouched — that error type is not caught here.
+    try {
+      return await seed();
+    } catch (err) {
+      if (!(err instanceof RunnerCloneConflictError)) throw err;
+      if (!(await this.tryReclaimTerminalRecovery(barePath, err))) throw err;
+      return await seed();
+    }
+  }
+
+  /**
+   * issue #1308 — decide whether a cross-run clone-conflict can self-heal, and if so, reclaim
+   * the terminal owner's residue so the caller can retry the seed ONCE. Returns true IFF the
+   * journal's owner run is DEFINITIVELY terminal AND not locally active, after which the
+   * journal has been exact-CAS-cleared and its contained clone best-effort deleted. Returns
+   * false — FAIL CLOSED, changing NOTHING — in every uncertain case:
+   *   - the owner is still in local `activeRuns` (a server-terminal status can race a
+   *     partitioned worker; the journal is live, not stale);
+   *   - the ownership probe throws — a definitive 404 (not owned / reclaimed by another
+   *     worker) or any transient/API error;
+   *   - the probe returns a non-terminal or unknown status.
+   */
+  private async tryReclaimTerminalRecovery(barePath: string, err: RunnerCloneConflictError): Promise<boolean> {
+    if (this.activeRuns.has(err.pendingRunId)) {
+      this.log.warn("runner clone conflict: owner run still active locally; not reclaiming", {
+        owner_run_id: err.pendingRunId,
+        branch: err.branch,
+      });
+      return false;
+    }
+    let status: string;
+    try {
+      status = (await this.client.getRunOwnership(err.pendingRunId)).status;
+    } catch (probeErr) {
+      this.log.warn("runner clone conflict: owner terminality probe failed; not reclaiming", {
+        owner_run_id: err.pendingRunId,
+        branch: err.branch,
+        error: errMessage(probeErr),
+      });
+      return false;
+    }
+    if (!FOLLOWUP_TERMINAL_STATUSES.has(status)) {
+      this.log.warn("runner clone conflict: owner run not terminal; not reclaiming", {
+        owner_run_id: err.pendingRunId,
+        branch: err.branch,
+        owner_status: status,
+      });
+      return false;
+    }
+    this.log.info("runner clone conflict: reclaiming a terminal owner's stale recovery residue", {
+      owner_run_id: err.pendingRunId,
+      owner_status: status,
+      branch: err.branch,
+    });
+    await this.git.reclaimTerminalRecoveryClone(barePath, err.branch, err.pendingRunId, err.pendingClonePath);
+    return true;
   }
 
   /** Post awaiting_approval with the plan and await the steering verdict, bounded.

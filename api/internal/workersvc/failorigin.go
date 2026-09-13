@@ -56,6 +56,10 @@ var failOrigins = []string{
 	// PARSES the remote reject, failing typed with the diff preserved instead of a raw
 	// `remote rejected` (worker-reportable — see workerReportableFailOrigins).
 	"push_secret_blocked",
+	// issue #1308: a cross-run recovery-clone conflict that survived self-heal at iteration 0
+	// (the journal's owner run is nonterminal / still active / unreachable). Worker-reportable,
+	// and a pre-start infra origin (see workerReportableFailOrigins / preStartInfraFailOrigins).
+	"runner_clone_conflict",
 }
 
 // failOriginSet is the lookup form. Built once; failOrigins stays the declaration so
@@ -90,9 +94,12 @@ func AllFailOrigins() []string {
 // workflow_scope_missing (PRD #377: the finalize detection that the branch touches
 // .github/workflows/** the bot PAT cannot push), finalize_base_align_conflict
 // (PRD #456: the finalize base-align merge AND rebase both conflict, so the worker
-// aborts and preserves the diff), and push_secret_blocked (issue #974: the finalize
+// aborts and preserves the diff), push_secret_blocked (issue #974: the finalize
 // pre-push gitleaks range scan finds a secret, or the push is rejected by GitHub Push
-// Protection / GH013, so the worker fails typed and preserves the diff); agent_failure
+// Protection / GH013, so the worker fails typed and preserves the diff), and
+// runner_clone_conflict (issue #1308: a cross-run runner-clone conflict the runner
+// reports at iteration 0 when self-heal cannot reclaim the clone directory because the
+// journal's owner run is still active/unreachable); agent_failure
 // is included because it is the judgeable
 // default the `failed` arm applies anyway, so an explicit worker agent_failure is
 // harmless and semantically correct. The partition (worker-reportable + server-only ==
@@ -105,6 +112,7 @@ var workerReportableFailOrigins = map[string]bool{
 	"workflow_scope_missing":       true,
 	"finalize_base_align_conflict": true,
 	"push_secret_blocked":          true,
+	"runner_clone_conflict":        true,
 }
 
 // CoerceFailOrigin maps a worker-reported fail_origin onto the WORKER-REPORTABLE subset.

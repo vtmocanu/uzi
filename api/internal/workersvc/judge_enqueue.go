@@ -17,17 +17,22 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// preStartInfraFailOrigins is the fail_origin set that means a run failed BEFORE the
-// agent did anything reviewable (PRD #69 M7a Pass B, Decision 12): a
-// provisioning/credential/guardrail block that is permanent until the config or policy
-// is fixed. Gate 4b skips the judge for such a run at iteration_count == 0 — there is no
-// agent behavior to retrospect. Deliberately EXACTLY these three: not
-// rate_limited/worker_lost/run_timeout (transient) and not agent_failure (judgeable).
-// The members are a strict subset of failorigin.go's vocabulary.
+// preStartInfraFailOrigins is the fail_origin set naming a failure that struck during
+// run SETUP, before the agent produced anything reviewable (PRD #69 M7a Pass B,
+// Decision 12; extended by issue #1308). Gate 4b skips the judge for such a run at
+// iteration_count == 0: with no agent behavior to retrospect, the judge is skipped
+// whatever the cause — a PERMANENT policy/config denial (provisioning_failed /
+// credential_unavailable / guardrail_blocked, cleared only by fixing the config or
+// policy) or a TRANSIENT setup conflict a later retry may clear (runner_clone_conflict,
+// issue #1308, stamped when the runner cannot reclaim a cross-run recovery clone whose
+// owner run is still active). It excludes rate_limited/worker_lost/run_timeout (runtime
+// failure classes, not run-setup) and agent_failure (judgeable). The members are a
+// strict subset of failorigin.go's vocabulary.
 var preStartInfraFailOrigins = map[string]bool{
 	"provisioning_failed":    true,
 	"credential_unavailable": true,
 	"guardrail_blocked":      true,
+	"runner_clone_conflict":  true,
 }
 
 // maybeEnqueueJudgeByID reloads a run by id and runs the judge gate. Used by the
@@ -103,27 +108,28 @@ func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 		}
 		return // no token ⇒ nothing to spend ⇒ no judge run
 	}
-	// Gate 4b (PRD #69 M7a Pass B, Decision 12): skip the judge for a PRE-START INFRA
-	// failure — a run that failed BEFORE the agent did anything worth retrospecting.
-	// The set is EXACTLY the three policy/config-denied origins, AND only at
-	// iteration_count == 0. An agent that started and crashed at iteration 0 carries
-	// 'agent_failure' (the worker-reported default), stays out of this set, and is still
-	// judged (SC3); the iteration conjunct is the PRD's defensive guard for that. NOT
-	// rate_limited/worker_lost/run_timeout (transient) and NOT agent_failure (judgeable).
-	// This is the ACCURACY+SPEND fix: a pre-start infra failure has no agent behavior to
-	// review, and skipping avoids the most expensive per-run call (opus) on a run that
-	// did nothing.
+	// Gate 4b (PRD #69 M7a Pass B, Decision 12; extended by issue #1308): skip the judge
+	// for a PRE-START INFRA failure — a run that failed during SETUP, before the agent did
+	// anything worth retrospecting. The set is preStartInfraFailOrigins (see its
+	// declaration), AND only at iteration_count == 0. An agent that started and crashed at
+	// iteration 0 carries 'agent_failure' (the worker-reported default), stays out of this
+	// set, and is still judged (SC3); the iteration conjunct is the PRD's defensive guard
+	// for that. The set excludes rate_limited/worker_lost/run_timeout (runtime failure
+	// classes, not run-setup) and agent_failure (judgeable). This is the ACCURACY+SPEND
+	// fix: a pre-start failure has no agent behavior to review, and skipping avoids the
+	// most expensive per-run call (opus) on a run that did nothing.
 	//
 	// DETERMINISTIC INFRA NOTIFICATION — delivered here by the EXISTING RunFailureNotifier,
 	// NOT injected. The judge is a REPLACEMENT for these runs, not an addition, so they
 	// still owe a failure notification. Every path that can reach this gate carrying one
-	// of these three origins is the worker-reported SetState terminal transition, which
+	// of these pre-start origins is the worker-reported SetState terminal transition, which
 	// fires s.bcast.PublishState(runID,"failed") BEFORE calling maybeEnqueueJudge; the
 	// RunFailureNotifier subscribes to that PublishState and notifies every
 	// non-cancelled/non-plan_rejected failure (infra included), so the notification has
 	// already been delivered on the SAME transition and this gate need only skip the
-	// judge. (The server-side claim-assembly failer that also stamps these three origins
-	// via MarkRunFailedByID never calls maybeEnqueueJudge at all, so it is not
+	// judge. (The server-side claim-assembly failer that also stamps the three server-side
+	// infra origins — provisioning_failed/credential_unavailable/guardrail_blocked — via
+	// MarkRunFailedByID never calls maybeEnqueueJudge at all, so it is not
 	// gate-reachable; it notifies through its own s.notify.) No notifysvc injection is
 	// possible anyway — notifysvc imports workersvc (RunFailureNotifier is a
 	// workersvc.Broadcaster), so injecting it would create an import cycle.

@@ -1,4 +1,4 @@
-import { describe, it } from "node:test";
+import { describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -110,6 +110,66 @@ describe("rmTreeForce (PRD #108 M6)", () => {
     const root = await mktmp();
     await fs.rm(root, { recursive: true, force: true });
     await rmTreeForce(path.join(root, "never-existed"));
+  });
+
+  // issue #1308 m1. `restoreTreeWritability`'s chmod walk targets EACCES/EPERM — a
+  // permission problem — and does nothing for ENOTEMPTY/EBUSY, a lingering-writer
+  // problem (a `git maintenance` child, `web/node_modules/.vite`). Node's own
+  // `fs.rm(recursive, { maxRetries, retryDelay })` retries THOSE transient codes
+  // internally, inside a single call — invisible to rmTreeForce's own try/catch, which
+  // never sees more than one rejection either way. So the fix IS the `RM_RETRY` options
+  // object reaching every `fs.rm` call: drop it and a transient ENOTEMPTY/EBUSY that a
+  // real retry would have ridden out instead propagates straight out, unfixed.
+  //
+  // A REAL race (an actual concurrent writer) would make this flaky and timing-bound —
+  // exactly what this repo's rules forbid asserting on. So this pins the same contract
+  // deterministically: fs.rm is mocked to fail the underlying removal once with a
+  // synthetic ENOTEMPTY and only succeed on a second attempt IF it was handed a retry
+  // budget (opts.maxRetries) — mirroring, at the call-argument level, exactly what
+  // Node's real implementation conditions its internal retry on. No real timer is
+  // exercised (the retry is immediate), so this is a call-count / completion assertion,
+  // never a wall-clock one.
+  it("resolves through a transient ENOTEMPTY when fs.rm carries a retry budget (deterministic, no timing assertion)", async () => {
+    const root = await mktmp();
+    try {
+      const nested = path.join(root, "nested");
+      await fs.mkdir(nested, { recursive: true });
+      await fs.writeFile(path.join(nested, "f.txt"), "x", "utf8");
+      const realRm = fs.rm.bind(fs);
+      let attempts = 0;
+      const m = mock.method(
+        fs,
+        "rm",
+        async (p: Parameters<typeof fs.rm>[0], opts?: { maxRetries?: number }) => {
+          attempts++;
+          if (attempts === 1) {
+            if (!opts?.maxRetries) {
+              // No retry budget was passed — exactly the unfixed #1308 m1 shape: one
+              // attempt, no retry, the transient error propagates.
+              const err: NodeJS.ErrnoException = new Error("ENOTEMPTY: directory not empty");
+              err.code = "ENOTEMPTY";
+              throw err;
+            }
+            // A retry budget IS present: mirror Node's own internal retry — the
+            // caller's single `await fs.rm(...)` still resolves, having ridden out one
+            // transient failure underneath. Counted as a second attempt.
+            attempts++;
+            return realRm(p, opts);
+          }
+          return realRm(p, opts);
+        },
+      );
+      try {
+        await rmTreeForce(root);
+
+        assert.strictEqual(await exists(root), false, "the tree is eventually removed");
+        assert.ok(attempts >= 2, `the retry budget must be exercised at least twice, got ${attempts}`);
+      } finally {
+        m.mock.restore();
+      }
+    } finally {
+      await forceCleanup(root);
+    }
   });
 
   it("never follows a symlink out of the tree while restoring permissions", async (t) => {

@@ -26,10 +26,22 @@ import path from "node:path";
  * when it fails with a permission error do we walk the tree restoring owner
  * write+execute on directories and retry. A partially-removed tree is fine: `rm`
  * is idempotent, and the second pass finishes what the first started.
+ *
+ * issue #1308 — both `fs.rm` calls carry a small bounded retry. Node applies
+ * `maxRetries`/`retryDelay` to `ENOTEMPTY`/`EBUSY` (among `EPERM`/`EMFILE`/
+ * `ENFILE`), the transient class a lingering writer under a cache dir raises (the
+ * incident's `web/node_modules/.vite`). The chmod walk above does NOT help those —
+ * they are not a permission problem — so the retry is what makes a leftover rare.
+ * `maxRetries` is kept small: the SUCCESS path removes on the first attempt and
+ * pays nothing, and the other best-effort callers (home-reclaim, model-pass, the
+ * runHome sweep) must not stall for long on a genuinely stuck tree. Only a FAILING
+ * rm pays, and even then only until it clears or the bound is hit.
  */
+const RM_RETRY = { maxRetries: 3, retryDelay: 100 } as const;
+
 export async function rmTreeForce(target: string): Promise<void> {
   try {
-    await fs.rm(target, { recursive: true, force: true });
+    await fs.rm(target, { recursive: true, force: true, ...RM_RETRY });
     return;
   } catch (err) {
     if (!isPermissionError(err)) throw err;
@@ -38,7 +50,7 @@ export async function rmTreeForce(target: string): Promise<void> {
   // Anything still un-removable after this throws, and the caller decides. The
   // run-terminal caller logs and continues: cleanup is best-effort by design and
   // must never turn a completed run into a failed one.
-  await fs.rm(target, { recursive: true, force: true });
+  await fs.rm(target, { recursive: true, force: true, ...RM_RETRY });
 }
 
 /** EACCES (no write on the parent) or EPERM (the same refusal on some platforms
