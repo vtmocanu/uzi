@@ -2269,25 +2269,44 @@ tasks:
     # hanging the gate. The tsc leg runs FIRST so a src-shape drift fails here, not only at runtime.
     # run-completeness.ts runs LAST, after the tests have appended their executed-test evidence to
     # CODEX_M4_EVIDENCE, so completeness is enforced on the ACTUAL run results (D3), never a
-    # hard-coded success list. The evidence file is recreated fresh each run so stale evidence
-    # cannot mask a regression. This target is a MANDATORY serial second step of test:agent (below),
-    # so gate:agent and CI exercise P exactly once (D7 point 5) - do NOT also call it from gate:agent.
+    # hard-coded success list. The evidence file is UNIQUE PER INVOCATION (see the vars: block
+    # below): two concurrent `task test:codex-m4` runs - or the native leg and the macOS container
+    # leg it spawns - never share one `.evidence/current.jsonl` and so cannot clobber each other's
+    # evidence; the file is created empty at the start of THIS run so stale evidence cannot mask a
+    # regression, and removed on success. This target is a MANDATORY serial second step of
+    # test:agent (below), so gate:agent and CI exercise P exactly once (D7 point 5) - do NOT also
+    # call it from gate:agent.
     dir: agent
+    vars:
+      # TASK-scoped, NOT a root var: this `sh:` runs ONLY when this target runs, never on a bare
+      # `task --list` or an unrelated target, so it does not trip header ban 4 (dynamic ROOT vars).
+      # A UNIQUE per-invocation evidence file: `$$` is the sh PID, distinct across concurrent
+      # `task test:codex-m4` processes, so two runs (or the native leg and the macOS container leg
+      # it spawns) never share `.evidence/current.jsonl`. Portable (echo + $$; no mktemp-suffix or
+      # `date +%N` BSD-vs-GNU traps). Absolute via --show-toplevel so both the node legs (dir:
+      # agent) and the macOS runner's host->container mount resolve it unambiguously.
+      EVIDENCE:
+        sh: echo "$(git rev-parse --show-toplevel)/e2e/codex-m4/.evidence/run-$$.jsonl"
     env:
-      CODEX_M4_EVIDENCE: ../e2e/codex-m4/.evidence/current.jsonl
+      # Quoted template into the process ENV (NOT a `sh -c` splice, so the splicing ban does not
+      # apply), so every leg - the native tests, the macOS container runner, run-completeness.ts -
+      # reads the SAME per-invocation file.
+      CODEX_M4_EVIDENCE: "{{.EVIDENCE}}"
     cmds:
       - ./node_modules/.bin/tsc --noEmit -p ../e2e/codex-m4/tsconfig.json
-      - mkdir -p ../e2e/codex-m4/.evidence
-      - rm -f ../e2e/codex-m4/.evidence/current.jsonl
+      - mkdir -p "$(dirname "$CODEX_M4_EVIDENCE")"
+      - rm -f "$CODEX_M4_EVIDENCE"                       # only THIS invocation's file
       - node --import tsx --test --test-concurrency=1 --test-timeout=120000 test/claude-conformance-advice-ceiling.test.ts test/claude-conformance-invariant-mappings.test.ts test/claude-conformance-reducer.test.ts test/codex-home-screening.test.ts ../e2e/codex-m4/*.test.ts
       # macOS/non-Linux: the Linux-only P leg cannot run a Linux-musl codex binary natively (the P
       # files self-route to a skip there via p-platform.ts). Route it through the pinned Linux
-      # container, which appends the codex/P evidence to the SAME ../e2e/codex-m4/.evidence file the
-      # native U run wrote, so run-completeness below sees the full merged matrix. On Linux this cmd
-      # is a no-op (platforms filter). Missing Docker / unsupported arch fail LOUDLY (D7 point 3).
+      # container, which reads CODEX_M4_EVIDENCE from the env and appends the codex/P evidence to the
+      # SAME per-invocation host file the native U run wrote, so run-completeness below sees the full
+      # merged matrix. On Linux this cmd is a no-op (platforms filter). Missing Docker / unsupported
+      # arch / a missing CODEX_M4_EVIDENCE fail LOUDLY (D7 point 3).
       - platforms: [darwin]
         cmd: node --import tsx ../e2e/codex-m4/run-macos-linux.ts
       - node --import tsx ../e2e/codex-m4/run-completeness.ts
+      - rm -f "$CODEX_M4_EVIDENCE"                       # best-effort cleanup of THIS run's file (gitignored; left in place if a prior cmd failed, for debugging)
 
   check:codex-m4-receipts:
     desc: PRD 1287 C1 - LEAD merge gate; rejects any OWED O-layer conformance receipt (D8)
@@ -2316,7 +2335,19 @@ tasks:
     # platform skip), provisions deps + the lock-verified codex package into disposable volumes, then
     # runs the strict, offline, --network=none P suite. gate:agent/test:codex-m4 auto-route the P leg
     # through this same builder on macOS; this target is the standalone maintainer entry.
+    vars:
+      # Same TASK-scoped unique-per-invocation evidence file as test:codex-m4 (NOT a root var; see
+      # that target's note). run-macos-linux.ts now HARD-FAILS on a missing CODEX_M4_EVIDENCE, so this
+      # standalone maintainer entry must supply one too. Here the container writes the codex/P evidence
+      # to its own per-run file (this target does not run run-completeness; it is the reproducible P
+      # smoke), so a maintainer running it alongside test:codex-m4 never clobbers that run's evidence.
+      EVIDENCE:
+        sh: echo "$(git rev-parse --show-toplevel)/e2e/codex-m4/.evidence/run-macos-$$.jsonl"
+    env:
+      CODEX_M4_EVIDENCE: "{{.EVIDENCE}}"
     cmds:
+      - mkdir -p "$(dirname "$CODEX_M4_EVIDENCE")"
+      - rm -f "$CODEX_M4_EVIDENCE"
       - node --import tsx ../e2e/codex-m4/run-macos-linux.ts
 
   test:harness-m2:

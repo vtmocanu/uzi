@@ -32,6 +32,8 @@
 // those volumes read-only. NONE mounts the Docker socket or any HOME. Treat the digest as a
 // hand-reviewed pin (D7 point 3).
 
+import path from "node:path";
+
 import { resolveArch, type Arch } from "./provision.js";
 
 /** The pinned multiarch runner image (verified amd64 + arm64 on 2026-09-12, PRD D7 point 3). */
@@ -73,6 +75,13 @@ export interface MacosLinuxRunOptions {
   readonly codexVolume: string;
   /** Unprivileged EXECUTE-stage user, `uid:gid`. Defaults to 1000:1000. */
   readonly user?: string;
+  /** Host path to THIS invocation's evidence JSONL (wired from CODEX_M4_EVIDENCE, unique per run).
+   *  Its directory is bind-mounted to the container .evidence dir and its basename becomes the
+   *  container CODEX_M4_EVIDENCE, so the offline P suite appends to exactly the per-invocation host
+   *  file the native U leg + run-completeness share (never a fixed current.jsonl two concurrent runs
+   *  collide on). Optional only so the pure-builder unit tests can omit it; the real entry
+   *  (run-macos-linux.ts) HARD-FAILS when CODEX_M4_EVIDENCE is unset and always supplies it. */
+  readonly evidenceHostFile?: string;
 }
 
 /** The three-stage plan. Each stage is a full argv (argv[0] === "docker"). `prep` and `prepCodex`
@@ -101,6 +110,17 @@ function baseArgs(arch: Arch, user: string): string[] {
  */
 export function buildMacosLinuxRunPlan(opts: MacosLinuxRunOptions): MacosLinuxRunPlan {
   const user = opts.user ?? DEFAULT_USER;
+  // The per-invocation evidence file on the HOST. Its directory is bind-mounted as the container
+  // .evidence dir; its basename is what the container writes under that mount, so the container's
+  // append lands on the exact host file the native leg + run-completeness use. Defaults to the
+  // legacy current.jsonl ONLY for the pure-builder unit tests; the real entry (run-macos-linux.ts)
+  // always passes the CODEX_M4_EVIDENCE path (and hard-fails when it is unset). Use path.posix:
+  // these are always Unix-style host paths and the container path is Unix, so this stays
+  // deterministic regardless of the platform building the plan.
+  const evidenceHostFile =
+    opts.evidenceHostFile ?? `${opts.e2eDir}/codex-m4/.evidence/current.jsonl`;
+  const evidenceHostDir = path.posix.dirname(evidenceHostFile);
+  const evidenceBasename = path.posix.basename(evidenceHostFile);
   const prep = [
     ...baseArgs(opts.arch, "0:0"),
     // Committed lockfile source (read-only); node_modules is the disposable volume npm ci fills.
@@ -129,15 +149,18 @@ export function buildMacosLinuxRunPlan(opts: MacosLinuxRunOptions): MacosLinuxRu
     ...baseArgs(opts.arch, user),
     // External network disabled during tests (D7 point 3).
     "--network=none",
-    // Point the P suite's recordEvidence at the mounted host evidence file so the container's
-    // codex/P evidence lands on the HOST alongside the native U run's (run-completeness merges them).
-    "-e", "CODEX_M4_EVIDENCE=/work/e2e/codex-m4/.evidence/current.jsonl",
+    // Point the P suite's recordEvidence at the mounted host evidence file (this invocation's
+    // unique basename under the .evidence mount) so the container's codex/P evidence lands on the
+    // HOST in the exact per-invocation file the native U run wrote (run-completeness merges them).
+    "-e", `CODEX_M4_EVIDENCE=/work/e2e/codex-m4/.evidence/${evidenceBasename}`,
     // Test inputs read-only; the prepared Linux deps volume mounted read-only.
     "-v", `${opts.agentDir}:/work/agent:ro`,
     "-v", `${opts.e2eDir}:/work/e2e:ro`,
     // A nested READ-WRITE mount over the read-only e2e parent (docker layers the more-specific
     // path as writable) so recordEvidence can append the P evidence to the HOST .evidence file.
-    "-v", `${opts.e2eDir}/codex-m4/.evidence:/work/e2e/codex-m4/.evidence`,
+    // The host source is the evidence file's OWN directory, so the container writes back to exactly
+    // that per-invocation file (not a fixed current.jsonl two concurrent runs would collide on).
+    "-v", `${evidenceHostDir}:/work/e2e/codex-m4/.evidence`,
     "-v", `${opts.depsVolume}:/work/agent/node_modules:ro`,
     // The provisioned codex volume mounted READ-ONLY at the image-baked prefix root, so
     // resolveCodexBin's existing image-baked branch finds /opt/uzi-codex/<version>/bin/codex
@@ -189,6 +212,10 @@ export interface MacosLinuxExecDeps {
   readonly depsVolume?: string;
   readonly codexVolume?: string;
   readonly user?: string;
+  /** Host path to THIS invocation's evidence file (from CODEX_M4_EVIDENCE), threaded into
+   *  buildMacosLinuxRunPlan. Optional here only so the orchestration unit tests can omit it (they
+   *  don't assert the path); the entry always sets it and hard-fails when the env var is unset. */
+  readonly evidenceHostFile?: string;
   /** Run one docker stage argv; returns its exit code (0 = ok). */
   readonly runStage: (argv: readonly string[]) => number;
   readonly log?: (message: string) => void;
@@ -212,6 +239,7 @@ export function executeMacosLinuxRun(deps: MacosLinuxExecDeps): void {
     e2eDir: deps.e2eDir,
     depsVolume: deps.depsVolume ?? "uzi-codex-m4-deps",
     codexVolume: deps.codexVolume ?? "uzi-codex-m4-codex",
+    evidenceHostFile: deps.evidenceHostFile,
     user: deps.user,
   });
   const stages: readonly [string, readonly string[]][] = [
