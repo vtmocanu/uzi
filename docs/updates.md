@@ -52,6 +52,15 @@ Dismissing the banner snoozes it for that release **tag**, server-side — not o
 timer and not per browser session. The snooze clears itself automatically the moment
 a newer release ships, so it can't accidentally silence a future warning.
 
+## Release candidates
+
+A release candidate (`vX.Y.Z-rc.N`) never shows up as an available update. GitHub's
+`releases/latest`, which the check reads, excludes prereleases server-side, so a candidate
+release never becomes "the latest" the api polls for. And on an instance that runs a
+candidate itself (possible if it opts into the RC-first release train), the check compares
+versions by semver, which orders `X.Y.Z-rc.N` before `X.Y.Z`, so a candidate never shows as
+"behind" its own eventual stable.
+
 ## Air-gapped and privacy installs
 
 Two independent admin toggles, both **on by default**, both editable at runtime from

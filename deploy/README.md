@@ -15,6 +15,12 @@
 > deliberate **public-repo placeholders** (`example.com`, `dev-cluster`, RFC 5737 CIDRs) and some
 > have not been re-verified since the migration; confirm against the live cluster and the private
 > `argo-apps` values before relying on them.
+>
+> **RC-first release train (ADR-1265).** Releases are now cut as candidates
+> (`vX.Y.Z-rc.N`) by default and promoted to stable only when the maintainer chooses — see the
+> Release procedure section below and [ADR-1265](../adr/1265-rc-release-train.md). A deployment
+> that wants to run candidates tracks the Helm `targetRevision` range `0.*-0` instead of the
+> `0.*` shown above.
 
 The release + deploy runbook for uzi (PRD #52). Two deploy topologies:
 
@@ -79,9 +85,28 @@ atomically, it does not ship a half-version.
 
 ## Release procedure
 
-Cutting a release is **two steps** on dev-cluster (the third — the ArgoCD `targetRevision`
-bump — is gone now that this cluster auto-tracks `0.*`; it survives below only as the
-rollback/other-cluster note). Only the tag push publishes anything. Step 1 (the chart-version
+**Releases are cut RC-first** (ADR-1265, PRD #1265). `release-cut X.Y.Z`
+(`.agents/skills/uzi-release/`) cuts a release **candidate** `vX.Y.Z-rc.1` by default: it
+publishes the five images and the chart at that version, opens a GitHub Release flagged
+pre-release (never latest), and does not publish the Homebrew formula. A stable `vX.Y.Z` is a
+**promotion** of the in-flight candidate — built from the candidate's own commit, never from
+whatever `main` has moved on to since — cut in lockstep with the next candidate by
+`release-cut Y.Z.W --promote`. The verbs, terse (`.agents/skills/uzi-release/SKILL.md` owns the
+full operational detail): no flag cuts the next candidate, or refuses with the facts if a lower
+base's candidate is still in flight; `--promote` promotes the in-flight candidate to stable,
+then cuts the next candidate; `--skip-promote` abandons the in-flight base and cuts a new
+`vX.Y.Z-rc.1` candidate (renaming the open section and folding `[Unreleased]` in), never a
+stable tag; `--stable` is the old one-step model, refused while a candidate is in
+flight. **Push order on a promote: the stable tag, then `main`, then the next candidate's
+tag** — the candidate's changelog-coverage gate needs the new stable tag visible first. A
+hotfix onto an already-promoted stable is a separate, manual procedure — see **Hotfix**, below.
+Full design: [ADR-1265](../adr/1265-rc-release-train.md).
+
+Within a single cut — whether a candidate or a promotion — it is still **two steps** on
+dev-cluster (the third — the ArgoCD `targetRevision` bump — is gone now that this cluster
+auto-tracks `0.*`, or `0.*-0` for a deployment that opts into candidates instead (ADR-1265
+D8); it survives below only as the rollback/other-cluster note). Only the tag push publishes
+anything. Step 1 (the chart-version
 bump) can land **two ways** — a **direct-to-`main` commit** or an **MR**. **Direct-to-`main`
 is the default and preferred at this early dev stage**; the MR way is there for when you want
 the change reviewed. Step 2 (the tag) is identical either way. Both repos (`vtmocanu/uzi` and
@@ -189,6 +214,12 @@ version** (e.g. `0.28.0`) and push; ArgoCD re-syncs to that older, still-publish
 image rebuild; old versions stay in GHCR). Because `0.*` would otherwise re-advance to the
 bad version, resuming auto-tracking means cutting a **fix release** (`0.Y.Z+1`) first, then
 setting `targetRevision` back to `0.*`.
+
+**Hotfix** is a separate, documented **manual** procedure — not a `release-cut` verb: worktree
+at the promoted stable `vB`, cherry-pick the already-merged fix commit(s), a `## [B.1]`
+CHANGELOG section citing them, `deploy/chart/Chart.yaml` bumped to `B.1`, tag `vB.1`, and push.
+See [ADR-1265](../adr/1265-rc-release-train.md) (D4) and `.agents/skills/uzi-release/SKILL.md`
+for the exact steps.
 
 ## Platform-admin prerequisites (one-time)
 

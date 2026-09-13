@@ -215,6 +215,11 @@ tasks:
       # shellcheck four ways would need a per-component file scope, which is exactly
       # the hand-maintained glob list M5 replaced with `git ls-files`.
       - task: gate:repo
+      # A gate member, not a gate:repo member (PRD 1265 M1): it builds a multi-commit
+      # git repo, so it does not belong in gate:repo's sub-second offline band, but it
+      # IS a function of the tree (the release scripts) with no component, so it rides
+      # here right after gate:repo rather than inside a gate:<component>.
+      - task: test:release-scripts
       - task: gate:api
       - task: gate:controller
       - task: gate:web
@@ -813,6 +818,19 @@ tasks:
       # asserts the tally exists, c == p, and c >= 8 (the 8 PRD #966 M2 driver behaviours;
       # the test emits more as sub-cases are added). See the script header.
       - ./scripts/check-e2e-driver.sh
+
+  test:release-scripts:
+    desc: offline fixture test of the release-train scripts (builds a temp git repo; PRD 1265)
+    cmds:
+      # Its own gate member (see the `gate` list), deliberately NOT in gate:repo's
+      # sub-second band: it builds a multi-commit git repo with an RC/hotfix tag
+      # topology and drives assert-changelog-covers-release.sh + changelog-section.sh
+      # (later release-cut.sh) against it, asserting the RC-first behaviour — section
+      # lookup strips `-rc.N`, PREV is the highest STABLE tag below the base (D4), the
+      # hotfix tag does not move the next RC's window. Prints `N passed, N failed` and
+      # exits nonzero on any failure. Watch it fail on the unmodified scripts. See the
+      # script header.
+      - ./scripts/release-scripts-test.sh
 
   check:spec-numbering:
     desc: specs/ai.md is frozen at section 637 (issue 1317), unique numbers, none above the head, count 637, with a canary proving both detectors fired

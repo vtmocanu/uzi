@@ -79,14 +79,24 @@ if (chartVersion === null) {
   die("no top-level `version:` line found in deploy/chart/Chart.yaml");
 }
 
-if (changelogVersion !== chartVersion) {
+// Under the RC-first release train (PRD 1265) the chart version is `X.Y.Z-rc.N` while
+// the RC is in flight, but the CHANGELOG section stays keyed by the stable base
+// `## [X.Y.Z]` (D3: one section per stable version, opened at the first RC). So compare
+// the CHANGELOG heading against the chart version with any prerelease suffix stripped;
+// a plain stable `X.Y.Z` is unaffected. This still catches genuine drift (a chart bump
+// with no matching base section makes the base mismatch the newest heading).
+const chartBase = chartVersion.replace(/-.*$/, "");
+
+if (changelogVersion !== chartBase) {
   console.error(`ERROR changelog/chart version mismatch:`);
   console.error(`  CHANGELOG.md newest released section: ${changelogVersion}  (${changelogLine.trim()})`);
-  console.error(`  deploy/chart/Chart.yaml version:      ${chartVersion}  (${chartLine.trim()})`);
+  console.error(`  deploy/chart/Chart.yaml version:      ${chartVersion}  (base ${chartBase}) (${chartLine.trim()})`);
   console.error(
-    "\ncheck-changelog: FAILED - the newest released CHANGELOG section must match Chart.yaml `version`",
+    "\ncheck-changelog: FAILED - the newest released CHANGELOG section must match Chart.yaml `version` (prerelease base)",
   );
   process.exit(1);
 }
 
-console.log(`check-changelog: OK - newest released CHANGELOG section ${changelogVersion} matches Chart.yaml version`);
+console.log(
+  `check-changelog: OK - newest released CHANGELOG section ${changelogVersion} matches Chart.yaml version ${chartVersion}`,
+);

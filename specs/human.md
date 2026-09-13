@@ -774,6 +774,12 @@ Tracked as GitHub issue vtmocanu/uzi#1226 (parent epic #1225); PRD at `prds/done
 
 - An issue run may open a closing PR only after every in-scope approved milestone is declared complete against a frozen contract for the exact final head, or the owner records an explicit later decision. An incomplete attempt returns to the same lead and otherwise holds without discarding its work. [user, #1226]
 
+## Feature #1265 — RC-first release train
+
+Tracked as GitHub issue vtmocanu/uzi#1265; PRD at `prds/1265-rc-release-train.md`.
+
+- Releases are cut as release candidates by default; a stable release is promoted from the candidate's own commit; surfaces meant for stable users (the Homebrew formula, the GitHub Release marked latest, the in-app update check) never surface a candidate. [user, #1265]
+
 ## Startup admin seed
 
 - Seed an admin user from env at startup (`UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME`) so the user survives DB wipes.

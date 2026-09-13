@@ -1,17 +1,21 @@
 // Plain-semver parse and compare for the changelog's current/newer markers
 // (PRD #415 M3). Model B pins the release coordinate to `X.Y.Z` (chart version ==
-// appVersion == git tag), so ONLY that exact shape parses. A `-rc.N` prerelease is
-// a documented limitation and returns null; so do the `dev`/`demo` pseudo-versions
-// and anything unshaped. The drawer treats a null-parsing running version as
-// NEUTRAL — no markers, no banner — rather than mis-ordering it, which is why the
-// null case is a first-class return here and not a throw.
+// appVersion == git tag). Under the RC-first release train (PRD 1265) the running
+// version may be an `X.Y.Z-rc.N` candidate, so that shape parses to its STABLE BASE
+// `X.Y.Z`: a running RC is treated as running the `[X.Y.Z]` candidate whose changelog
+// section is keyed by the base (D3), so that section marks "You're running this" and no
+// false "available" banner fires (precise rc < stable ordering would wrongly flag the
+// in-progress version as an available update). `dev`/`demo` and anything unshaped still
+// return null; the drawer treats a null-parsing running version as NEUTRAL — no markers,
+// no banner — which is why null is a first-class return and not a throw.
 
-// parseSemver returns the three numeric fields, or null when the input is not a
-// plain `X.Y.Z`. Fields compare NUMERICALLY (see compareSemver), so `0.10.0`
-// sorts after `0.9.0` — a lexical compare would get that backwards.
+// parseSemver returns the three numeric fields of the STABLE BASE, or null when the
+// input is not a plain `X.Y.Z` or an `X.Y.Z-rc.N` candidate. Fields compare NUMERICALLY
+// (see compareSemver), so `0.10.0` sorts after `0.9.0` — a lexical compare would get
+// that backwards. The `-rc.N` suffix is dropped for the triple by design (see header).
 export function parseSemver(v: string | null | undefined): [number, number, number] | null {
   if (typeof v !== "string") return null;
-  const m = /^(\d+)\.(\d+)\.(\d+)$/.exec(v);
+  const m = /^(\d+)\.(\d+)\.(\d+)(?:-rc\.\d+)?$/.exec(v);
   if (!m) return null;
   return [Number(m[1]), Number(m[2]), Number(m[3])];
 }

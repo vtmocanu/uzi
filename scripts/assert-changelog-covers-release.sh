@@ -38,33 +38,51 @@ REF="${1:-HEAD}"
 PREV="${2:-}"
 VERSION="${3:-}"
 
-# MATCH ONLY RELEASE TAGS. `git describe --abbrev=0` returns the nearest tag by
-# ANCESTRY, not the nearest release, so any scratch tag between the last release and
-# HEAD silently narrows the window this gate checks. Measured 2026-07-28: with
-# `prd111-premerge-backup` sitting between v0.11.12 and main, the default run reported
-# "OK ... since prd111-premerge-backup" while the release actually spanned 15
-# first-parent commits from v0.11.12. It passed anyway that time, which is the point:
-# a gate that silently checks less than it claims fails open, and the failure is
-# invisible in its own output. `--match 'v[0-9]*'` binds it to the release tags Model B
-# defines. Pass $2 explicitly to override.
-if [ -z "$PREV" ]; then
-  exact="$(git describe --tags --exact-match --match 'v[0-9]*' "$REF" 2>/dev/null || echo '')"
-  if [ -n "$exact" ]; then
-    PREV="$(git describe --tags --abbrev=0 --match 'v[0-9]*' --exclude="$exact" "$REF" 2>/dev/null || true)"
-  else
-    PREV="$(git describe --tags --abbrev=0 --match 'v[0-9]*' "$REF" 2>/dev/null || true)"
-  fi
-fi
-
-if [ -z "$PREV" ]; then
-  echo "assert-changelog-covers-release: no previous tag before $REF; nothing to compare."
-  exit 0
-fi
+# THE COVERAGE WINDOW IS "SINCE THE HIGHEST LOWER STABLE TAG BY VERSION" (PRD 1265 D4),
+# not `git describe` ancestry. Two reasons the old ancestry lookup is wrong under the
+# RC-first train: (a) a promoted stable tag (vX.Y.Z) lives on a throwaway release branch
+# and is NOT an ancestor of main, so `git describe` on main would never find it; (b) a
+# scratch/prerelease tag between the last release and HEAD silently narrows an
+# ancestry-nearest window (the failure measured 2026-07-28 with `prd111-premerge-backup`
+# between v0.11.12 and main: the run reported "OK ... since prd111-premerge-backup" while
+# the release spanned 15 first-parent commits from v0.11.12 — a gate that checks less
+# than it claims, invisibly). Selecting the highest STABLE tag strictly below the base
+# version is immune to both: it ignores topology and never lets a `-rc.N` tag enter the
+# sort (mixing prereleases into a version sort is the ordering trap D1 documents). Pass
+# $2 explicitly to override (a repair).
 
 # The version being released: the chart's appVersion at REF (Model B keeps chart
 # version == appVersion == tag, and publish:assert-version already enforces that).
 if [ -z "$VERSION" ]; then
   VERSION="$(git show "$REF:deploy/chart/Chart.yaml" | awk '/^appVersion:/ {gsub(/[":]/,"",$2); print $2; exit}')"
+fi
+# A tag may be vX.Y.Z-rc.N; the CHANGELOG section and the coverage window are keyed by
+# the STABLE base X.Y.Z. BASE strips any prerelease suffix.
+BASE="${VERSION%%-*}"
+
+# PREV: the highest STABLE tag (vX.Y.Z, no prerelease) strictly below BASE. Stable tags
+# are filtered FIRST and compared numerically, so git's prerelease ordering never enters.
+# Empty => first release.
+if [ -z "$PREV" ]; then
+  PREV="$(git tag -l 'v*' | awk -v base="$BASE" '
+    function lt(x, y,   ax, ay) {
+      # Force numeric compare with +0 (matching the release-cut.sh comparators) so the
+      # oracle PREV and release-cut PREV can never drift on a strnum-coercion edge.
+      split(x, ax, "\\."); split(y, ay, "\\.")
+      if (ax[1]+0 != ay[1]+0) return ax[1]+0 < ay[1]+0
+      if (ax[2]+0 != ay[2]+0) return ax[2]+0 < ay[2]+0
+      return ax[3]+0 < ay[3]+0
+    }
+    /^v[0-9]+\.[0-9]+\.[0-9]+$/ {
+      v = $0; sub(/^v/, "", v)
+      if (lt(v, base) && (best == "" || lt(best, v))) best = v
+    }
+    END { if (best != "") print "v" best }')"
+fi
+
+if [ -z "$PREV" ]; then
+  echo "assert-changelog-covers-release: no previous stable tag below $VERSION; nothing to compare."
+  exit 0
 fi
 
 echo "Checking CHANGELOG coverage for $PREV..$REF (version $VERSION)"
@@ -142,7 +160,7 @@ BODY_FILE="$WORK/body.txt"
 # bug -- but it fails CLOSED and noisily, aborting the script under `set -e` with
 # no output but the header, which is precisely the defect 2d60c573 just repaired.
 git show "$REF:CHANGELOG.md" > "$CHANGELOG_FILE"
-awk -v v="$VERSION" '
+awk -v v="$BASE" '
   $0 ~ "^## \\[" v "\\]" { inside = 1; next }
   inside && /^## \[/     { exit }
   inside                 { print }
@@ -152,7 +170,7 @@ awk -v v="$VERSION" '
 # on a command substitution, which strips trailing newlines, so a section of
 # nothing but blank lines counted as empty. `-s` would quietly start passing it.
 if [ -z "$(cat "$SECTION_FILE")" ]; then
-  echo "FAIL: CHANGELOG.md at $REF has no '## [$VERSION]' section, or it is empty."
+  echo "FAIL: CHANGELOG.md at $REF has no '## [$BASE]' section, or it is empty."
   echo "      A release must describe itself before it is tagged."
   exit 1
 fi
@@ -188,6 +206,7 @@ while read -r sha; do
 
   touched_changelog=0
   touched_shipping=0
+  touched_nonmeta=0
   shipping_example=""
   while read -r f; do
     [ -n "$f" ] || continue
@@ -197,9 +216,24 @@ while read -r sha; do
       touched_shipping=1
       [ -n "$shipping_example" ] || shipping_example="$f"
     fi
+    # A path OUTSIDE the release-metadata allowlist (the same set the promote diff-guard
+    # uses). Used only to bound the chore(release): exemption below.
+    case "$f" in
+      CHANGELOG.md|deploy/chart/Chart.yaml|deploy/chart/values.yaml|scripts/assert-worker-tag-decoupled.sh) ;;
+      *) touched_nonmeta=1 ;;
+    esac
   done <<EOF
 $files
 EOF
+
+  # A `chore(release):` commit is the release commit itself — a mechanical version bump —
+  # and never cites an issue. Today's single-step cut always folds CHANGELOG, so it was
+  # exempt by the touched-CHANGELOG rule below; under the RC train a next-candidate cut
+  # (rc.N+1) bumps only Chart.yaml and does NOT touch CHANGELOG (D3), so that rule misses
+  # it. Exempt the prefix, but ONLY when the commit touched exclusively release-metadata
+  # paths — a `chore(release):` that changed a shipping path is still checked, so the
+  # message alone cannot bypass the gate (PRD 1265; CR review of PR #1322).
+  if [ "$touched_nonmeta" = 0 ] && grep -qE '^chore\(release\):' "$SUBJECT_FILE"; then continue; fi
 
   [ "$touched_shipping" = 1 ] || continue
   [ "$touched_changelog" = 0 ] || continue
@@ -245,7 +279,7 @@ EOF
   if grep -qF -- "$short" "$SECTION_FILE"; then continue; fi
 
   if [ -z "$refs" ]; then
-    if [ "$missing" = 0 ]; then printf '\nFAIL: merges not accounted for in the [%s] section:\n\n' "$VERSION"; fi
+    if [ "$missing" = 0 ]; then printf '\nFAIL: merges not accounted for in the [%s] section:\n\n' "$BASE"; fi
     printf '  %s  %s\n' "$short" "$subject"
     printf '        changed %s but cites no issue number; cite #<issue> or the short SHA %s in the section\n' \
       "$shipping_example" "$short"
@@ -259,7 +293,7 @@ EOF
   done
 
   if [ "$found" = 0 ]; then
-    if [ "$missing" = 0 ]; then printf '\nFAIL: merges not accounted for in the [%s] section:\n\n' "$VERSION"; fi
+    if [ "$missing" = 0 ]; then printf '\nFAIL: merges not accounted for in the [%s] section:\n\n' "$BASE"; fi
     printf '  %s  %s\n' "$short" "$subject"
     printf '        changed %s; neither #%s nor the short SHA %s appears in the section\n' \
       "$shipping_example" "$(printf '%s' "$refs" | tr '\n' ',' | sed 's/,$//; s/,/, #/g')" "$short"
@@ -272,7 +306,7 @@ EOF
 if [ "$missing" -gt 0 ]; then
   cat <<MSG
 
-Add these to the [$VERSION] section, then re-tag, citing either the issue number
+Add these to the [$BASE] section, then re-tag, citing either the issue number
 (#NNN) or the short SHA printed above. If a merge genuinely has nothing to
 announce, put
 
@@ -288,4 +322,4 @@ MSG
   exit 1
 fi
 
-echo "OK: every shipping merge since $PREV is cited in the [$VERSION] section"
+echo "OK: every shipping merge since $PREV is cited in the [$BASE] section"

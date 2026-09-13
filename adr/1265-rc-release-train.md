@@ -1,0 +1,81 @@
+# ADR-1265: RC-first release train (prerelease channel, lockstep promote)
+
+**Status**: Accepted (PRD #1265 M1–M6 merged; M7 first-live-cycle is the maintainer's, out of band)
+**Date**: 2026-09-13
+**Deciders**: Vlad Mocanu + agent team (PRD #1265 Decision Log)
+**PRD**: [prds/1265-rc-release-train.md](../prds/1265-rc-release-train.md) — the PRD carries the full Decision Log, milestone tests, and the measured semver table; this ADR carries the durable design shape and the seams a future change would break silently.
+
+## Decision (summary)
+
+Releases are cut as **release candidates by default**. `release-cut X.Y.Z` cuts `vX.Y.Z-rc.1`; the tag publishes the five images and the chart at `X.Y.Z-rc.1` exactly as a stable tag does, creates a GitHub Release flagged **pre-release** (never latest), and does **not** publish the Homebrew formula. A stable `vX.Y.Z` is a **promotion** of the in-flight candidate, built from the candidate's own commit on a throwaway release branch, cut in **lockstep** with the next candidate by a single `release-cut Y.Z.W --promote`. Stable-only surfaces — the Homebrew formula, the GitHub Release marked latest, and the in-app update check — never surface a candidate. A deployment opts into running candidates by tracking the Helm `targetRevision` range `0.*-0` instead of `0.*`.
+
+## Context
+
+A `vX.Y.Z` tag was one irreversible step: it published every artifact, marked the Release latest, published the Homebrew formula, and (because the GitOps-tracked ArgoCD Application tracks the chart with a semver range) rolled the running instance within minutes. The first real exercise of a build was also its publication to every stable-only surface. There was no channel between "green on main" and "stable", and no way to promote *what was actually run* rather than whatever `main` had moved on to.
+
+The publish pipeline was already largely prerelease-aware: `release.yml`'s `assert-version` accepts a SemVer prerelease tag, `publish-release` marks any `-`-carrying tag pre-release (never latest), and the in-app update check reads GitHub's `releases/latest` (which excludes prereleases server-side) and compares with `golang.org/x/mod/semver` (which orders `X.Y.Z-rc.N < X.Y.Z`). What was missing was the *cutting* side: the changelog gates, the tag-selection logic, and the release scripts all assumed a single stable shape.
+
+## The decisions
+
+### D1 — RC by default; stable is a promotion, or an explicit escape
+
+`release-cut <X.Y.Z>` names the version a candidate is cut **for**; the tag shape is derived. `release-cut.sh` (`.agents/skills/uzi-release/scripts/`) is a tag-derived state machine. From the tags it derives the highest stable `S` and the **in-flight RC** — the highest-versioned `vX.Y.Z-rc.N` whose base has no stable tag. Verbs:
+
+- default, no RC in flight → `vX.Y.Z-rc.1`;
+- default, RC in flight for **this** base (`release-cut B` while `vB-rc.N` exists) → the next candidate `vB-rc.(N+1)` (requires `[Unreleased]` empty, D3);
+- default, RC in flight for a **lower** base → refuse (exit 3) and print the facts, so the lead picks a verb;
+- `--promote` → promote the in-flight RC to stable (D5), then cut `vX.Y.Z-rc.1` on main;
+- `--skip-promote` → abandon the RC, rename its open section to `X.Y.Z` and fold `[Unreleased]` in, cut `vX.Y.Z-rc.1`;
+- `--stable` → a plain `vX.Y.Z` from main's tip (the old one-step model), refused while an RC is in flight.
+
+**Tag discovery never sorts a mixed stable/prerelease list.** Git's `version:refname` orders `-rc.N` against its base by string length; the scripts filter stable tags first, and find the in-flight RC by grouping `v*-rc.*` per base and comparing `N` numerically. The script never prompts (D7): refusals exit 3 with the facts and the `uzi-release` skill owns the conversation.
+
+### D3 — One changelog section per stable version, opened at the first RC
+
+The first RC of `X.Y.Z` folds `[Unreleased]` into `## [X.Y.Z] - <date>`; later RCs of the same base append to that open section (re-spin entries are written into it by hand, so `rc.(N+1)` requires an empty `[Unreleased]` rather than an automatic subsection-aware merge, which is the one transform nothing else in the toolchain does); promotion refreshes the date. Every gate finds the section by stripping the `-rc.N` suffix (`${VERSION%%-*}`), so an RC's Release notes are the real `[X.Y.Z]` section, titled `vX.Y.Z-rc.N`, and the stable Release reuses it.
+
+The `chore(release):` commit is now exempt from the coverage oracle by its conventional message. Today's single-step cut always folds CHANGELOG, so the release commit was exempt by the touched-CHANGELOG rule; a next-candidate cut (`rc.N+1`) bumps only `Chart.yaml` and does not touch CHANGELOG, so that rule no longer covers it. Exempting `chore(release):` is principled — a release commit is a mechanical version bump, never a feature merge — and only widens exemptions.
+
+### D4 — The coverage window is "since the highest lower stable tag by version", never `git describe`
+
+`assert-changelog-covers-release.sh` derives PREV as the highest **stable** tag (`vX.Y.Z`, no prerelease) strictly below the base version, filtering stable tags first and comparing numerically. `git describe` ancestry is wrong under the train for two reasons: a promoted stable tag lives on a throwaway release branch and is **not** an ancestor of main, and a prerelease tag between releases would silently narrow an ancestry-nearest window. A hotfix tag (`vX.Y.Z` off a promoted `vX.Y.W`) does not change the next RC's window, because it shares main's merge-base (the RC commit) with the promoted stable.
+
+### D5 — Promotion builds stable from the RC commit on a throwaway release branch
+
+`--promote` creates a `release/X.Y.Z` worktree at the in-flight RC commit, makes metadata-only edits (`Chart.yaml` version/appVersion to the stable, the `## [X.Y.Z]` section date to today, the worker autobump — which leaves the pin at the RC tag when the runtime surface is unchanged, D11), commits `chore(release): vX.Y.Z (promotes vX.Y.Z-rc.N)`, and asserts the commit's diff is a subset of `{CHANGELOG.md, deploy/chart/Chart.yaml, deploy/chart/values.yaml, scripts/assert-worker-tag-decoupled.sh}` **before any tag exists**; anything else aborts and removes the worktree and branch. The stable tag is created locally; the branch is never pushed and is removed (the tag holds the commit). Stable tags are therefore not ancestors of main — the Kubernetes release-branch shape, not git-flow's merge-back (D4 makes ancestry irrelevant). **Push order is stable tag, then main, then the RC tag**, because the RC's `assert-changelog` computes PREV from the tags it can see and needs the new stable present; the wrong order fails loudly in CI, not silently.
+
+### D6 — Promotion rebuilds; artifact retagging is deferred
+
+`release.yml` rebuilds the stable images from the promote commit rather than retagging the RC's digests. With digest-pinned base images and a metadata-only promote commit, the only intended difference is the ldflags version stamps (the binaries must report `X.Y.Z`, not `-rc.N`, in `/api/version`, the TUI and the footer). Retagging would still need the chart re-packaged and a commit under Model B, and would not avoid the deployment re-roll. Revisit only for digest-level provenance.
+
+### D11 — The worker pin is never rewritten on a stable cut
+
+The hosted-worker pin (`workers.image.tag`) is a concrete image tag that moves only when the agent runtime surface changes (ADR-422), RC or stable alike. `release.yml` builds a promote tag's `agent-*:X.Y.Z` images by re-tagging the RC's digest when that surface is unchanged, so those images still report the baked `X.Y.Z-rc.N` version. The api classifies worker upgrade health by semver ordering, and `X.Y.Z-rc.N < X.Y.Z`, so **normalizing the pin to the stable on promotion would leave the whole fleet `outdated` forever** — the cry-wolf failure ADR-422's roll-health code exists to avoid. Forcing a rebuild instead would roll the fleet on every promotion, reintroducing the churn ADR-422 removed. So `0.83.0-rc.2` inside the `0.83.0` chart is correct and names the exact worker image that was tested.
+
+### D8 — The deployment opts in with `0.*-0`, out of tree
+
+A deployment that should run candidates tracks the Helm `targetRevision` range `0.*-0`; one that should only ever see stable keeps `0.*`. Measured against Masterminds/semver v3 (the engine ArgoCD uses), `0.*-0` admits `0.x` and `0.x-rc.N` and excludes `1.0.0` and `1.0.0-rc.1`; the explicit-range spelling `>= 0.0.0-0, < 1.0.0` leaks `1.0.0-rc.1` and was rejected. The flip is the maintainer's, in the out-of-tree GitOps repo; only `deploy/README.md` describes it generically. It is a no-op until the first RC chart is published (with only stable `0.x` charts present, `0.*-0` resolves to the same version as `0.*`).
+
+## Stable-only surfaces (D9), and how the train protects them
+
+- **Homebrew** — `brew.yml`'s tag trigger is `["v*", "!v*-*"]`, so an RC tag creates no run at all (the fix is "do not run", not "run and fail", so `release-watch.sh` has nothing to wait for). The strict Validate regex remains the second line of defense for `workflow_dispatch`.
+- **The GitHub Release "Latest" badge** — `publish-release` marks any `-`-carrying tag pre-release.
+- **The in-app update check** — `releasecheck` reads `releases/latest` (server-side non-prerelease) and compares with `x/mod/semver`. No test pinned a prerelease running version; M5 added them (no behaviour change).
+- **`release-verify.sh`** is channel-aware: stable asserts the Release is latest; RC asserts it is flagged pre-release and `releases/latest` is unchanged. **`release-watch.sh`** watches `release.yml` only for an RC, both for a stable. Both read the channel from the shared `scripts/lib/release-mode.sh`, so they never disagree about whether a tag is an RC.
+- **The web changelog drawer** — `web/src/lib/semver.ts` parses an `X.Y.Z-rc.N` running version to its stable base, so on the RC-dogfooding instance the `[X.Y.Z]` section still marks "You're running this" and no false "available" banner fires (precise `rc < stable` ordering would wrongly flag the in-progress section as an update).
+
+## Scope beyond the PRD's stated list
+
+The M1 tree sweep found two sites the PRD's "Needs changing" list omitted, both fixed in the train:
+
+- `web/scripts/check-changelog.mjs` compared the newest CHANGELOG heading to `Chart.yaml`'s `version` exactly; at `rc.1` (`version: 0.83.0-rc.1`, section `[0.83.0]`) that mismatch would redden `gate:web` / `validate-web` on the first RC commit. It now strips the prerelease suffix before comparing, and still catches genuine drift.
+- `web/src/lib/semver.ts` (above, D9).
+
+The PRD's M1 text also referred to a `release-verify.sh` `img_has_tag` previous-tag sort that does not exist; the real channel-dependent site is check 4 (`releases/latest`). The PRD was corrected.
+
+## Consequences
+
+- Cutting is one command per cycle (the Rust beta/stable shape); the in-flight state is derived from tags at every run, with no state file.
+- Lockstep means one bug can block both the promotion and the next RC at release time; the offline fixture (`scripts/release-scripts-test.sh`, `task test:release-scripts`) drives every verb before the first live cycle, and the promote half aborts before any tag exists.
+- The single dogfooding instance runs candidates only; rollback is `rc.(N+1)` or a temporary exact pin.
+- A stable chart legitimately pins an RC worker image (D11); `uzi worker list` shows it as `up_to_date`.

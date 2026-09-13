@@ -34,6 +34,9 @@ usage() {
 [ $# -eq 2 ] || usage
 mode="$1"
 version="$2"
+# A tag may be vX.Y.Z-rc.N (PRD 1265): the CHANGELOG section is keyed by the STABLE
+# base X.Y.Z, but the Release TITLE keeps the full tag. base strips any -suffix.
+base="${version%%-*}"
 file="${UZI_CHANGELOG_FILE:-CHANGELOG.md}"
 
 [ -f "$file" ] || { echo "changelog-section: $file not found" >&2; exit 2; }
@@ -45,7 +48,7 @@ section="$work/section.md"
 # Content between this version's heading and the next `## [` heading. Same
 # extraction assert-changelog-covers-release.sh uses, so the two agree on what a
 # "section" is.
-awk -v v="$version" '
+awk -v v="$base" '
   $0 ~ "^## \\[" v "\\]" { inside = 1; next }
   inside && /^## \[/     { exit }
   inside                 { print }
@@ -54,7 +57,7 @@ awk -v v="$version" '
 # Reject an absent or blank-only section (a release must describe itself). awk
 # reads the file to EOF, so no early-exit SIGPIPE.
 if ! awk 'NF { found = 1 } END { exit found ? 0 : 1 }' "$section"; then
-  echo "changelog-section: no non-empty '## [$version]' section in $file" >&2
+  echo "changelog-section: no non-empty '## [$base]' section in $file" >&2
   exit 1
 fi
 
