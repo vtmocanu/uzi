@@ -2296,6 +2296,14 @@ tasks:
     # folded into gate:agent / test:codex-m4 - an owed row must not redden the WORKER's ordinary
     # gate (the worker cannot run packaged O proofs), only the lead's pre-merge check. At C1 this
     # is EXPECTED to exit non-zero because clauses-codex.ts seeds an owed O row.
+    # Now BINDS each recorded base/jvm digest to a trusted candidate manifest for the expected
+    # commit (not just digest syntax): fails closed if the manifest is absent, malformed, for the
+    # wrong commit, missing an image, swapped, or mismatched. With no manifest supplied (the default
+    # at this revision, intentional - no `env:` block here) it fails closed as "manifest absent".
+    # Reproducible lead invocation (mind `dir: agent`):
+    #   CODEX_M4_RECEIPT_MANIFEST="$(git rev-parse --show-toplevel)/e2e/codex-m4/receipt-manifest.json" \
+    #     CODEX_M4_CANDIDATE_COMMIT=$(git rev-parse HEAD) \
+    #     task check:codex-m4-receipts
     dir: agent
     cmds:
       - node --import tsx ../e2e/codex-m4/run-receipts.ts

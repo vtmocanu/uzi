@@ -1,0 +1,8 @@
+{
+  "candidateCommit": "0000000000000000000000000000000000000000",
+  "images": {
+    "base": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "jvm": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "provenance": "EXAMPLE ONLY — replace with the real UZI_CODEX_M3B_PACKAGED=1 task test:codex-m3b:packaged proof output (both merge-candidate images, runtime, date)"
+}

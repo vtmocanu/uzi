@@ -6,7 +6,12 @@
 #                         nothing lands here.
 #   .evidence/          : the per-run executed-test evidence JSONL the conformance tests
 #                         append to and run-completeness.ts reads (wired via CODEX_M4_EVIDENCE).
+#   receipt-manifest.json : the REAL maintainer-produced candidate manifest (the packaged-proof
+#                         base/jvm digests bound to the merge candidate) the D8 receipts gate binds
+#                         against — real evidence, never committed. receipt-manifest.example.json IS
+#                         tracked as the schema template, so this rule names the real file, not *.json.
 *.log
 gate-log.*
 .codex-cache/
 .evidence/
+receipt-manifest.json
