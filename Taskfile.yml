@@ -302,6 +302,11 @@ tasks:
       # Sub-second, offline, index-only -- runs before `scan:secrets` too. A tree fact,
       # so it belongs in gate:repo.
       - task: check:mktemp-portability
+      # Over-cap SKILL.md guard: a repo skill whose SKILL.md exceeds the 65536-byte
+      # runtime cap is dropped silently at run time (agent/src/repo-skills.ts:151), so it
+      # looks committed but never loads. Sub-second, offline, tree-fact -- runs before
+      # `scan:secrets` too. Belongs in gate:repo, not a component gate.
+      - task: check:skill-size
       - task: scan:secrets
       # Whole-tree Go+TS SAST scan (semgrep), BYO fail-open like lint:yaml. Ordered
       # LAST because a whole-tree scan dominates, same as scan:secrets above (PRD #862 M2).
@@ -882,6 +887,20 @@ tasks:
       # silently. The explicit canary arg makes this echo show what is scanned. See the
       # script header.
       - ./scripts/check-mktemp-portability.sh scripts/mktemp-portability-canary.txt
+
+  check:skill-size:
+    desc: no repo skill's SKILL.md exceeds the 65536-byte runtime cap (over-cap skills are dropped silently at run time), with a canary proving the detector fired
+    cmds:
+      # A repo skill whose SKILL.md exceeds the runtime byte cap is DROPPED SILENTLY at
+      # run time (agent/src/repo-skills.ts:151, a strictly-greater whole-file byte test
+      # against the 65536-byte SKILL_MAX_BYTES/DEFAULT_SKILL_MAX_BYTES default) -- the
+      # worker never loads it and nothing in the tree says so. This flags any
+      # .agents/skills/*/SKILL.md over the cap so the drop reddens CI instead of vanishing
+      # at run time. `.claude/skills` is a symlink to `.agents/skills`, so scanning the
+      # latter covers every skill once. The canary is a small file the detector must
+      # register as over a tiny threshold, or it exits 2 (instrument broken); the explicit
+      # canary arg makes this echo show what is scanned. See the script header.
+      - ./scripts/check-skill-size.sh scripts/skill-size-canary.txt .agents/skills
 
   render:worker-tag-check:
     desc: assert the hosted-worker image tag is pinned independently of Chart.AppVersion (PRD 422 M1)
