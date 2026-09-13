@@ -9,7 +9,7 @@ import type { ClauseRow } from "./clause.js";
 
 /** Escape a cell value for a GitHub-flavored markdown table (pipes + newlines). */
 function cell(value: string): string {
-  return value.replace(/\|/g, "\\|").replace(/\r?\n/g, " ");
+  return value.replace(/\\/g, "\\\\").replace(/\|/g, "\\|").replace(/\r?\n/g, " ");
 }
 
 /** The O-evidence state, compacted for the table's last column. */

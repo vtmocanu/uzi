@@ -5,6 +5,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
+import type { ClauseRow } from "./clause.js";
 import { renderClauseMap } from "./map.js";
 import { ALL_CLAUSES } from "./registry.js";
 
@@ -30,6 +31,24 @@ describe("renderClauseMap", () => {
       assert.ok(row.includes(`| ${clause.adapter} |`), `${clause.id} adapter`);
       assert.ok(row.includes(`| ${clause.layer} |`), `${clause.id} layer`);
     }
+  });
+
+  it("escapes a literal backslash before a table delimiter", () => {
+    const clause: ClauseRow = {
+      id: "escape-probe",
+      adapter: "codex",
+      layer: "U",
+      family: String.raw`x\|y`,
+      seam: "probe",
+      positiveControl: "probe",
+      negativeOracle: "probe",
+      intendedOutcome: "probe",
+      tests: [],
+    };
+    const row = renderClauseMap([clause]).split("\n")
+      .find((line) => line.startsWith(`| ${clause.id} |`));
+    assert.ok(row !== undefined, "escape-probe row");
+    assert.ok(row.includes(`| ${String.raw`x\\\|y`} |`), row);
   });
 
   it("reports a total that matches the registry size", () => {
