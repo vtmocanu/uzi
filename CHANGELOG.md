@@ -2,7 +2,11 @@
 
 Notable changes to uzi, loosely following [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions are release git tags (`deploy/chart/Chart.yaml`'s `version`/`appVersion`, Model B) — this
-file is not bumped per-commit; `[Unreleased]` collects everything since the last tag.
+file is not bumped per-commit; `[Unreleased]` collects everything since the last tag. Under the
+release-candidate train (PRD #1265) a `## [X.Y.Z]` section is opened by folding `[Unreleased]` at
+the FIRST candidate cut for that version (`vX.Y.Z-rc.1`); later candidates of the same version append
+to that open section, and promotion to stable only refreshes its date. So a section keyed by the
+stable `X.Y.Z` may describe a version that is still a candidate; the git tag carries the `-rc.N`.
 
 Format each bullet as a bold title on its own physical line, then the description directly on the
 next physical line (NO blank line between them), the description on ONE physical line (no
@@ -29,6 +33,11 @@ through `[0.52.0]`.)
   A Mine / All users switch, admin-only and remembered per browser, groups every user's recommendations by category and target with a count of distinct users instead of an owner, run title or run link, so an admin can gauge how widespread a pattern is without seeing whose it is; rationale text can still name a repo or file, so the view is aggregated across users, not anonymous. File issue still drafts with full provenance (whose worker text it publishes), and Mark done settles the coordinate across every user's open occurrence, leaving each owner's row reading "Done by an admin" with a working Undo; there's no cross-user Dismiss, since that stays each owner's own call. Reads are also on the CLI (`uzi admin review backlog`/`stats`); the writes are web-only.
 - **Extend a run's wall-clock budget from the web or CLI ([#1189](https://github.com/vtmocanu/uzi/issues/1189)).**
   A run's owner can grant it more wall-clock time on top of its frozen budget, up to a new admin-set allowance (`run_extension_cap_seconds`, default 16h per run, `0` disables extending instance-wide). From the web, once a run crosses its near-timeout flag, an Extend time… button and near-timeout panel appear (quick picks +1h/+2h/+4h/+8h or a custom duration); from the CLI, `uzi run extend <run-id> --by 2h` works on any non-terminal run the sweep can time out (including a queued or parked one). The frozen budget itself never changes; a running run's header now shows its budget (`3h 48m / 8h`, or `/ 8h+2h` once extended), the extension is served to the worker so it does not self-trip its own wall before the new deadline, extending clears the near-timeout flag on the next sweep, `uzi run get`'s `DEADLINE` row gains a `· +2h extended` clause, and the near-timeout Slack DM now names the deadline, time left, checkpoint age, and the exact CLI command to extend.
+
+### Changed
+
+- **Releases now ship as release candidates first, and no stable surface ever points at a candidate ([#1265](https://github.com/vtmocanu/uzi/issues/1265)).**
+  A release is cut as a candidate (`vX.Y.Z-rc.1`) by default and later promoted to stable from the candidate's own tested commit, in lockstep with cutting the next candidate, so what was run is what ships. Stable-only surfaces stay stable-only: the Homebrew formula, the GitHub Release marked latest, and the in-app update check never name a candidate, and the changelog drawer treats an instance running a candidate as running that version's section rather than showing it a phantom "update available". This is release-toolchain plumbing (no change to how the app behaves for an issue run); a deployment opts into running candidates by tracking the chart range `0.*-0`.
 
 ### Fixed
 
