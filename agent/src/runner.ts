@@ -27,11 +27,12 @@ import type {
   ClaimResponse,
   IterationBudget,
   Milestone,
+  RunOrphanClassificationResponse,
   StateAck,
   StateRequest,
 } from "./protocol.js";
 import { resolveAgentSelection } from "./protocol.js";
-import { resolveRunKind, RUN_KIND_PROFILES } from "./run-kind.js";
+import { deriveCloneKey, resolveRunKind, RUN_KIND_PROFILES } from "./run-kind.js";
 import { RecoveryCoordinator, isCodePublishingKind, type RecoveryRecord } from "./recovery.js";
 import {
   describeRepoAgentNote,
@@ -52,7 +53,7 @@ import { withForgeRetry } from "./forge-retry.js";
 import { makeRedactor, makeTextRedactor } from "./redact.js";
 import { sessionTranscriptResolvable } from "./sdk-session.js";
 import { errMessage, RUN_ID_RE, sleep } from "./util.js";
-import { ForeignCaptureBlockedError, PendingRecoveryCaptureError } from "./git.js";
+import { CapturePathMismatchError, ForeignCaptureBlockedError, PendingRecoveryCaptureError } from "./git.js";
 import {
   buildCheckEnv,
   defaultCheckRunner,
@@ -2793,6 +2794,57 @@ export class RunRunner {
     return flight;
   }
 
+  /** issue #1319 — authoritative owner-derived reclaim for a terminal-owner clone orphan.
+   *  Runs the NEW owner-scoped orphan-classification read and quarantines the journaled
+   *  residue (RETAINED, discard:false) ONLY when EVERY predicate holds: (a) the owner run is
+   *  terminal, (b) its repo equals the claimant's, (c) its OWNER-derived clone branch equals
+   *  the journal/current branch, (d) its owner-derived canonical path equals the journaled
+   *  path. On a 404 / non-terminal owner / repo|branch|path mismatch / malformed identity /
+   *  any transport or probe failure it re-throws `original` so phaseClone fails closed with the
+   *  journal and clone UNTOUCHED (never quarantine on an unproven owner). retireRunnerClone's
+   *  own pre-rename (ownerRunId, clonePath) re-validation stays authoritative. Serves BOTH
+   *  Case B (ForeignCaptureBlockedError, same-slug) and Case A (CapturePathMismatchError,
+   *  cross-kind slug divergence). */
+  private async reclaimTerminalOrphan(
+    barePath: string,
+    claim: ClaimResponse,
+    journaledPath: string,
+    branch: string,
+    ownerRunId: string,
+    original: Error,
+  ): Promise<void> {
+    let id: RunOrphanClassificationResponse;
+    try {
+      id = await this.client.getRunOrphanClassification(claim.run_id, ownerRunId);
+    } catch {
+      throw original; // 404 (owner not in this owner+repo scope) or any transport error
+    }
+    if (!TERMINAL_RUN_STATUSES.has(id.status)) throw original;           // (a) terminal owner
+    if (id.repo_id !== claim.repo.id) throw original;                    // (b) same repo
+    // (c)+(d): the OWNER's own kind/identity must reproduce this branch and the journaled path.
+    // mr_rework carries its branch in pipeline_ref (runs.branch is NULL) — mirror the server's
+    // claim_assembly normalization. self_improve/prompt derive from the owner runId, so the
+    // persisted branch is never the source (predicate (c) IS the equality check for them).
+    const ownerKind = resolveRunKind(id.kind);
+    const owner = deriveCloneKey({
+      kind: ownerKind,
+      runId: ownerRunId,
+      issueIid: id.issue_iid,
+      branch: ownerKind === "mr_rework" ? id.pipeline_ref : id.branch,
+      pipelineId: id.pipeline_id,
+      pipelineRef: id.pipeline_ref,
+      defaultBranch: claim.repo.default_branch,
+    });
+    if (!owner) throw original;                                          // malformed identity
+    if (owner.branch !== branch) throw original;                         // (c) owner-derived branch
+    if (this.git.runnerClonePath(barePath, owner.slug) !== journaledPath) throw original; // (d)
+    try {
+      await this.git.retireRunnerClone(barePath, journaledPath, branch, ownerRunId, { discard: false });
+    } catch {
+      throw original; // journal moved under us / containment failure -> fail closed
+    }
+  }
+
   private async phaseClone(claim: ClaimResponse, flight: RunFlight): Promise<void> {
     const { runLog, reportState, steering, batcher, cancel } = flight;
     const runId = claim.run_id;
@@ -2823,34 +2875,25 @@ export class RunRunner {
         flight.preserveSession = true;
         retained = true;
       } else if (err instanceof ForeignCaptureBlockedError) {
-        // issue #1315: the canonical clone is journaled to ANOTHER run's retained
-        // capture. Probe that EXACT owner authoritatively — the git layer never
-        // probes. Only a TERMINAL owner lets us reclaim; a 404 (ownership moved) or
-        // ANY transient probe error, and a still-live owner, all fail closed with the
-        // journal and clone untouched (never quarantine on an unproven owner).
-        let status: string;
-        try {
-          status = (await this.client.getRunOwnership(err.ownerRunId)).status;
-        } catch {
-          throw err;
-        }
-        if (!TERMINAL_RUN_STATUSES.has(status)) throw err;
-        // Terminal owner: atomically quarantine the foreign residue (RETAINED, not
-        // deleted — discard:false) so the canonical path is freed race-free and the
-        // journal cleared, then reseed a fresh clone from the bare exactly as the
-        // non-error path does (mirror the seed above). Control then falls through to
-        // the normal markRecoveryCapture below.
-        await this.git.retireRunnerClone(barePath, err.clonePath, err.branch, err.ownerRunId, {
-          discard: false,
-        });
+        // issue #1315/#1319 Case B: the canonical clone is journaled to ANOTHER run's
+        // retained capture (a matched canonical pair). The authoritative owner-derived
+        // validation decides — a TERMINAL owner in the same repo whose derived branch +
+        // canonical path match the journal is reclaimed (residue quarantined, RETAINED),
+        // else fail closed. Replaces the old worker-scoped getRunOwnership probe, which
+        // 404'd on a worker move (Gap 2).
+        await this.reclaimTerminalOrphan(barePath, claim, err.clonePath, err.branch, err.ownerRunId, err);
+        const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim));
+        flight.worktreePath = runnerClone.path;
+        flight.branch = runnerClone.branch;
+      } else if (err instanceof CapturePathMismatchError) {
+        // issue #1319 Case A: a claimant-relative clone-path mismatch (the cross-kind slug
+        // divergence, e.g. an issue owner's `issue-N` vs this mr_rework's `agent-issue-N`).
+        // The SAME owner-derived validation decides; any unmet predicate fails closed.
+        await this.reclaimTerminalOrphan(barePath, claim, err.journaledPath, err.branch, err.ownerRunId, err);
         const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim));
         flight.worktreePath = runnerClone.path;
         flight.branch = runnerClone.branch;
       } else {
-        // Everything else — including CapturePathMismatchError — propagates and fails the
-        // run closed here. M3 (issue #1319) will add a dedicated catch that runs the
-        // authoritative owner-canonical validation for CapturePathMismatchError; until then
-        // it falls through to `throw err` unchanged.
         throw err;
       }
     }

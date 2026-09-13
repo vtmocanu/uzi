@@ -9,7 +9,6 @@ import { type ExecutorFactory } from "../src/runner.js";
 import { nullLogger } from "./helpers.js";
 import {
   api,
-  client,
   fakeGitlab,
   fx,
   git,
@@ -72,65 +71,287 @@ async function seedResidue(
   return { bare, branch, clonePath: clone.path };
 }
 
-describe("atomic runner-clone release (#1315)", () => {
-  it("T2: a TERMINAL foreign owner is quarantined (retained) and the reclaiming run seeds fresh", async () => {
+/** Like seedResidue, but for a NON-issue clone keyed on an arbitrary branch+slug (the
+ *  ci_fix / mr_rework shapes): seed the canonical clone for `branch` at `<runnerRoot>/…/<key>`,
+ *  drop an owner-only marker, and journal (ownerRunId, canonicalPath). */
+async function seedResidueForBranch(
+  branch: string,
+  key: string,
+  ownerRunId: string,
+  marker: string,
+): Promise<{ bare: string; branch: string; clonePath: string }> {
+  const bare = await git.ensureClone(fx.originPath);
+  const clone = await git.runnerCloneForBranch(bare, branch, key, ownerRunId);
+  fs.writeFileSync(path.join(clone.path, marker), "owner-only bytes\n");
+  await git.markRecoveryCapture(bare, clone.path, branch, ownerRunId);
+  return { bare, branch, clonePath: clone.path };
+}
+
+describe("atomic runner-clone release (#1315) + owner-derived reclaim (#1319)", () => {
+  it("Test 1 (Gap 1, Case A cross-kind): an mr_rework reclaims a TERMINAL issue owner's residue and reseeds at its own slug", async () => {
     const { gitlab } = fakeGitlab();
     const iid = 1401;
     const ownerRunId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-    const foreignRunId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
-    const { bare, branch, clonePath } = await seedResidue(iid, ownerRunId, "FOREIGN_RESIDUE.txt");
-    api.setOwnershipStatus(ownerRunId, "completed"); // authoritatively terminal
+    const claimantRunId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    // An ISSUE owner seeded at `.../issue-N`, journaled under branch `agent/issue-N`.
+    const { bare, branch, clonePath } = await seedResidue(iid, ownerRunId, "FOREIGN.txt");
+    // The claimant is an mr_rework on the SAME branch → slug `agent-issue-N`, so the journal
+    // path (`.../issue-N`) diverges from this claimant's computed clone → Case A.
+    const freshPath = git.runnerClonePath(bare, `agent-issue-${iid}`);
+    // branch NULL exercises the issue_iid-only derivation (the realistic pre-completion case).
+    api.setOrphanClassification(ownerRunId, {
+      status: "completed",
+      repo_id: "r1",
+      kind: "issue",
+      issue_iid: iid,
+      branch: null,
+      pipeline_ref: null,
+      pipeline_id: null,
+    });
 
     let observed:
-      | { worktree: string; freshExists: boolean; residueGone: boolean; journal: ReturnType<typeof readJournal>; quarantineHasResidue: boolean }
+      | { worktree: string; freshExists: boolean; residueGone: boolean; journal: ReturnType<typeof readJournal>; quarantineHasResidue: boolean; oldGone: boolean }
       | undefined;
     const factory: ExecutorFactory = () => ({
-      homeDir: path.join(homeDir, foreignRunId),
+      homeDir: path.join(homeDir, claimantRunId),
       executor: {
         run: async (ctx) => {
-          // phaseClone has quarantined the foreign residue and reseeded a FRESH clone.
           const dirs = fs.existsSync(holdingRoot()) ? fs.readdirSync(holdingRoot()) : [];
           observed = {
             worktree: ctx.worktreePath,
             freshExists: fs.existsSync(ctx.worktreePath),
-            residueGone: !fs.existsSync(path.join(ctx.worktreePath, "FOREIGN_RESIDUE.txt")),
+            residueGone: !fs.existsSync(path.join(ctx.worktreePath, "FOREIGN.txt")),
             journal: readJournal(bare, branch),
-            quarantineHasResidue: dirs.some((d) => fs.existsSync(path.join(holdingRoot(), d, "FOREIGN_RESIDUE.txt"))),
+            quarantineHasResidue: dirs.some((d) => fs.existsSync(path.join(holdingRoot(), d, "FOREIGN.txt"))),
+            oldGone: !fs.existsSync(clonePath),
           };
           throw new Error("stop after phaseClone reseed");
         },
       },
     });
     const runner = runnerWith(factory, gitlab, undefined, nullLogger(), { recoveryRetryMs: 5 });
-    await runner.execute(gitlabClaim(iid, { run_id: foreignRunId }));
+    await runner.execute(gitlabClaim(iid, { run_id: claimantRunId, kind: "mr_rework", branch: `agent/issue-${iid}` }));
 
     assert.ok(observed, "executor.run was reached, so phaseClone reseeded");
-    assert.equal(observed!.worktree, clonePath, "the reseed lands at the canonical clone path");
+    assert.equal(observed!.worktree, freshPath, "the reseed lands at the mr_rework slug `agent-issue-N`");
     assert.equal(observed!.freshExists, true);
-    assert.equal(observed!.residueGone, true, "the fresh clone carries NONE of the foreign residue bytes");
-    assert.equal(observed!.journal?.runId, foreignRunId, "the journal is re-owned by the reclaiming run");
-    assert.equal(observed!.journal?.clonePath, clonePath);
-    assert.equal(observed!.quarantineHasResidue, true, "the foreign residue was RENAMED to a retained quarantine");
-    // The foreign quarantine is RETAINED forever (discard:false) — the reclaiming run's OWN
-    // terminal cleanup retires its reseeded clone but never touches the foreign quarantine.
-    const survivors = fs.existsSync(holdingRoot()) ? fs.readdirSync(holdingRoot()) : [];
-    assert.ok(
-      survivors.some((d) => fs.existsSync(path.join(holdingRoot(), d, "FOREIGN_RESIDUE.txt"))),
-      "the foreign quarantine survives the run",
-    );
+    assert.equal(observed!.residueGone, true, "the fresh clone carries NONE of the owner residue bytes");
+    assert.equal(observed!.oldGone, true, "the old `.../issue-N` was RENAMED into the quarantine");
+    assert.equal(observed!.quarantineHasResidue, true, "the owner residue was RENAMED to a retained quarantine");
+    assert.equal(observed!.journal?.runId, claimantRunId, "the journal is re-owned by the claimant");
+    assert.equal(observed!.journal?.clonePath, freshPath, "the journal points at the fresh `agent-issue-N` clone");
   });
 
-  for (const scenario of ["running", "notOwned404", "transient503"] as const) {
-    it(`T3: a ${scenario} foreign owner fails closed — journal, clone untouched, no quarantine`, async () => {
+  it("Test 2 (Gap 2, Case B same-slug worker-move): reclaim succeeds via the NEW owner-scoped read despite an ownership 404", async () => {
+    const { gitlab } = fakeGitlab();
+    const iid = 1402;
+    const ownerRunId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    const claimantRunId = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    const { bare, branch, clonePath } = await seedResidue(iid, ownerRunId, "FOREIGN.txt");
+    // Simulate the worker move: the OLD worker-scoped ownership probe 404s (owner not on this
+    // worker), but the NEW owner-scoped orphan-classification read is authoritative.
+    api.setOwnershipNotOwned(ownerRunId);
+    api.setOrphanClassification(ownerRunId, {
+      status: "completed",
+      repo_id: "r1",
+      kind: "issue",
+      issue_iid: iid,
+      branch: null,
+      pipeline_ref: null,
+      pipeline_id: null,
+    });
+
+    let observed:
+      | { worktree: string; freshExists: boolean; residueGone: boolean; journal: ReturnType<typeof readJournal>; quarantineHasResidue: boolean }
+      | undefined;
+    const factory: ExecutorFactory = () => ({
+      homeDir: path.join(homeDir, claimantRunId),
+      executor: {
+        run: async (ctx) => {
+          const dirs = fs.existsSync(holdingRoot()) ? fs.readdirSync(holdingRoot()) : [];
+          observed = {
+            worktree: ctx.worktreePath,
+            freshExists: fs.existsSync(ctx.worktreePath),
+            residueGone: !fs.existsSync(path.join(ctx.worktreePath, "FOREIGN.txt")),
+            journal: readJournal(bare, branch),
+            quarantineHasResidue: dirs.some((d) => fs.existsSync(path.join(holdingRoot(), d, "FOREIGN.txt"))),
+          };
+          throw new Error("stop after phaseClone reseed");
+        },
+      },
+    });
+    const runner = runnerWith(factory, gitlab, undefined, nullLogger(), { recoveryRetryMs: 5 });
+    await runner.execute(gitlabClaim(iid, { run_id: claimantRunId }));
+
+    assert.ok(observed, "executor.run was reached, so phaseClone reseeded via the owner-scoped read");
+    assert.equal(observed!.worktree, clonePath, "the reseed lands at the canonical `.../issue-N`");
+    assert.equal(observed!.freshExists, true);
+    assert.equal(observed!.residueGone, true, "the fresh clone carries NONE of the owner residue bytes");
+    assert.equal(observed!.quarantineHasResidue, true, "the residue was RENAMED to a retained quarantine");
+    assert.equal(observed!.journal?.runId, claimantRunId, "the journal is re-owned by the claimant");
+    assert.equal(observed!.journal?.clonePath, clonePath);
+  });
+
+  it("Test 2b (ci_fix pipeline_id arm, moved-worker default-branch reclaim end-to-end)", async () => {
+    const { gitlab } = fakeGitlab();
+    const pid = 5150;
+    const ownerRunId = "e1111111-1111-4111-8111-111111111111";
+    const claimantRunId = "e2222222-2222-4222-8222-222222222222";
+    // A ci_fix owner on the default branch: branch `ci-fix/pipeline-5150`, slug `ci-fix-pipeline-5150`.
+    const { bare, branch, clonePath } = await seedResidueForBranch(
+      `ci-fix/pipeline-${pid}`,
+      `ci-fix-pipeline-${pid}`,
+      ownerRunId,
+      "FOREIGN.txt",
+    );
+    // The owner-side deriveCloneKey reconstructs `ci-fix/pipeline-5150` from pipeline_id +
+    // pipeline_ref + the claimant's default branch "main" → predicates (c)/(d) hold.
+    api.setOrphanClassification(ownerRunId, {
+      status: "failed",
+      repo_id: "r1",
+      kind: "ci_fix",
+      issue_iid: null,
+      branch: null,
+      pipeline_ref: "main",
+      pipeline_id: pid,
+    });
+
+    let observed:
+      | { worktree: string; freshExists: boolean; residueGone: boolean; journal: ReturnType<typeof readJournal>; quarantineHasResidue: boolean }
+      | undefined;
+    const factory: ExecutorFactory = () => ({
+      homeDir: path.join(homeDir, claimantRunId),
+      executor: {
+        run: async (ctx) => {
+          const dirs = fs.existsSync(holdingRoot()) ? fs.readdirSync(holdingRoot()) : [];
+          observed = {
+            worktree: ctx.worktreePath,
+            freshExists: fs.existsSync(ctx.worktreePath),
+            residueGone: !fs.existsSync(path.join(ctx.worktreePath, "FOREIGN.txt")),
+            journal: readJournal(bare, branch),
+            quarantineHasResidue: dirs.some((d) => fs.existsSync(path.join(holdingRoot(), d, "FOREIGN.txt"))),
+          };
+          throw new Error("stop after phaseClone reseed");
+        },
+      },
+    });
+    const runner = runnerWith(factory, gitlab, undefined, nullLogger(), { recoveryRetryMs: 5 });
+    await runner.execute(
+      gitlabClaim(0, {
+        run_id: claimantRunId,
+        kind: "ci_fix",
+        pipeline: { id: pid, ref: "main", sha: "0".repeat(40), web_url: "https://x/p", failed_jobs: [] },
+        repo: { id: "r1", url: "https://x/r", clone_url: fx.originPath, default_branch: "main" },
+      }),
+    );
+
+    assert.ok(observed, "executor.run was reached, so phaseClone reseeded");
+    assert.equal(observed!.worktree, clonePath, "the reseed lands at the ci-fix slug `ci-fix-pipeline-5150`");
+    assert.equal(observed!.freshExists, true);
+    assert.equal(observed!.residueGone, true, "the fresh clone carries NONE of the owner residue bytes");
+    assert.equal(observed!.quarantineHasResidue, true, "the residue was RENAMED to a retained quarantine");
+    assert.equal(observed!.journal?.runId, claimantRunId, "the journal is re-owned by the claimant");
+    assert.equal(observed!.journal?.clonePath, clonePath);
+  });
+
+  // Test 3 — fail closed, one row per predicate. Each row asserts: the model never starts,
+  // retireRunnerClone is NEVER called, the run ends failed, the journal + seeded clone are
+  // untouched, and no quarantine subtree is created.
+  interface FailClosedRow {
+    name: string;
+    iid: number;
+    /** Build the (bare, branch, residue, expected journal) fixture and set the fake's read.
+     *  The claimant is an issue run on `iid`, so each row is Case A or Case B as noted. */
+    setup: (ctx: {
+      iid: number;
+      ownerRunId: string;
+    }) => Promise<{ bare: string; branch: string; residuePath: string; expectJournal: { runId: string; clonePath: string } }>;
+  }
+
+  const failClosedRows: FailClosedRow[] = [
+    {
+      name: "(b) wrong repo",
+      iid: 1411,
+      setup: async ({ iid, ownerRunId }) => {
+        const { bare, branch, clonePath } = await seedResidue(iid, ownerRunId, "FOREIGN.txt");
+        api.setOrphanClassification(ownerRunId, {
+          status: "completed",
+          repo_id: "r2",
+          kind: "issue",
+          issue_iid: iid,
+          branch: null,
+          pipeline_ref: null,
+          pipeline_id: null,
+        });
+        return { bare, branch, residuePath: clonePath, expectJournal: { runId: ownerRunId, clonePath } };
+      },
+    },
+    {
+      name: "(c) wrong owner-derived branch",
+      iid: 1412,
+      setup: async ({ iid, ownerRunId }) => {
+        const { bare, branch, clonePath } = await seedResidue(iid, ownerRunId, "FOREIGN.txt");
+        api.setOrphanClassification(ownerRunId, {
+          status: "completed",
+          repo_id: "r1",
+          kind: "issue",
+          issue_iid: 9999, // → owner-derived branch `agent/issue-9999` ≠ journal branch
+          branch: null,
+          pipeline_ref: null,
+          pipeline_id: null,
+        });
+        return { bare, branch, residuePath: clonePath, expectJournal: { runId: ownerRunId, clonePath } };
+      },
+    },
+    {
+      name: "(d) wrong in-tree journal path",
+      iid: 1413,
+      setup: async ({ iid, ownerRunId }) => {
+        const bare = await git.ensureClone(fx.originPath);
+        const branch = `agent/issue-${iid}`;
+        // A DIFFERENT in-tree clone; journal THIS branch to point at it → Case A. (c) passes
+        // (owner branch `agent/issue-N`), (d) fails (owner slug `issue-N` ≠ `.../issue-9470`).
+        const other = await git.createOrAttachRunnerClone(bare, 9470, ownerRunId);
+        fs.writeFileSync(path.join(other.path, "FOREIGN.txt"), "owner-only bytes\n");
+        await git.markRecoveryCapture(bare, other.path, branch, ownerRunId);
+        api.setOrphanClassification(ownerRunId, {
+          status: "completed",
+          repo_id: "r1",
+          kind: "issue",
+          issue_iid: iid,
+          branch: null,
+          pipeline_ref: null,
+          pipeline_id: null,
+        });
+        return { bare, branch, residuePath: other.path, expectJournal: { runId: ownerRunId, clonePath: other.path } };
+      },
+    },
+    {
+      name: "(malformed) insufficient identity",
+      iid: 1414,
+      setup: async ({ iid, ownerRunId }) => {
+        const { bare, branch, clonePath } = await seedResidue(iid, ownerRunId, "FOREIGN.txt");
+        // mr_rework with no branch (pipeline_ref null) → deriveCloneKey returns undefined.
+        api.setOrphanClassification(ownerRunId, {
+          status: "completed",
+          repo_id: "r1",
+          kind: "mr_rework",
+          issue_iid: null,
+          branch: null,
+          pipeline_ref: null,
+          pipeline_id: null,
+        });
+        return { bare, branch, residuePath: clonePath, expectJournal: { runId: ownerRunId, clonePath } };
+      },
+    },
+  ];
+
+  for (const row of failClosedRows) {
+    it(`Test 3: fail closed ${row.name} — no probe-driven reclaim, journal & clone untouched`, async () => {
       const { gitlab } = fakeGitlab();
-      const n = scenario === "running" ? 1 : scenario === "notOwned404" ? 2 : 3;
-      const iid = 1410 + n;
-      const ownerRunId = `c0000000-0000-4000-8000-00000000000${n}`;
-      const foreignRunId = `d0000000-0000-4000-8000-00000000000${n}`;
-      const { bare, branch, clonePath } = await seedResidue(iid, ownerRunId, "FOREIGN_RESIDUE.txt");
-      if (scenario === "running") api.setOwnershipStatus(ownerRunId, "running");
-      else if (scenario === "notOwned404") api.setOwnershipNotOwned(ownerRunId);
-      else api.failOwnership(ownerRunId, 503);
+      const ownerRunId = `f0000000-0000-4000-8000-00000000${row.iid}`;
+      const claimantRunId = `f1000000-0000-4000-8000-00000000${row.iid}`;
+      const { bare, branch, residuePath, expectJournal } = await row.setup({ iid: row.iid, ownerRunId });
 
       let retireCalls = 0;
       const origRetire = git.retireRunnerClone.bind(git);
@@ -140,7 +361,7 @@ describe("atomic runner-clone release (#1315)", () => {
       };
       let ran = false;
       const factory: ExecutorFactory = () => ({
-        homeDir: path.join(homeDir, foreignRunId),
+        homeDir: path.join(homeDir, claimantRunId),
         executor: {
           run: async () => {
             ran = true;
@@ -150,17 +371,78 @@ describe("atomic runner-clone release (#1315)", () => {
       });
       const runner = runnerWith(factory, gitlab, undefined, nullLogger(), { recoveryRetryMs: 5 });
       try {
-        await runner.execute(gitlabClaim(iid, { run_id: foreignRunId }));
+        await runner.execute(gitlabClaim(row.iid, { run_id: claimantRunId }));
       } finally {
         git.retireRunnerClone = origRetire;
       }
 
       assert.equal(ran, false, "the model never starts");
-      assert.equal(retireCalls, 0, "no quarantine on an unproven (non-terminal / 404 / transient) owner");
+      assert.equal(retireCalls, 0, "retireRunnerClone is NEVER called on an unmet predicate");
+      assert.ok(api.states.some((s) => s.body.status === "failed"), "the run fails closed");
+      assert.deepEqual(readJournal(bare, branch), expectJournal, "the journal is untouched");
+      assert.equal(
+        fs.readFileSync(path.join(residuePath, "FOREIGN.txt"), "utf8"),
+        "owner-only bytes\n",
+        "the seeded clone is untouched",
+      );
+      assert.equal(fs.existsSync(holdingRoot()), false, "no quarantine subtree is created");
+    });
+  }
+
+  // Test 4 — fail closed on the probe itself. issue owner + claimant issue run (Case B).
+  for (const scenario of ["non-terminal", "404", "transient"] as const) {
+    it(`Test 4: fail closed on probe (${scenario}) — no reclaim, journal & clone untouched`, async () => {
+      const { gitlab } = fakeGitlab();
+      const n = scenario === "non-terminal" ? 1 : scenario === "404" ? 2 : 3;
+      const iid = 1420 + n;
+      const ownerRunId = `a3000000-0000-4000-8000-00000000000${n}`;
+      const claimantRunId = `a4000000-0000-4000-8000-00000000000${n}`;
+      const { bare, branch, clonePath } = await seedResidue(iid, ownerRunId, "FOREIGN.txt");
+      if (scenario === "non-terminal") {
+        api.setOrphanClassification(ownerRunId, {
+          status: "running",
+          repo_id: "r1",
+          kind: "issue",
+          issue_iid: iid,
+          branch: null,
+          pipeline_ref: null,
+          pipeline_id: null,
+        });
+      } else if (scenario === "404") {
+        api.setOrphanNotFound(ownerRunId);
+      } else {
+        api.failOrphanClassification(ownerRunId, 503);
+      }
+
+      let retireCalls = 0;
+      const origRetire = git.retireRunnerClone.bind(git);
+      git.retireRunnerClone = async (b, c, br, r, o) => {
+        retireCalls++;
+        return origRetire(b, c, br, r, o);
+      };
+      let ran = false;
+      const factory: ExecutorFactory = () => ({
+        homeDir: path.join(homeDir, claimantRunId),
+        executor: {
+          run: async () => {
+            ran = true;
+            throw new Error("the model must never start on a fail-closed clone");
+          },
+        },
+      });
+      const runner = runnerWith(factory, gitlab, undefined, nullLogger(), { recoveryRetryMs: 5 });
+      try {
+        await runner.execute(gitlabClaim(iid, { run_id: claimantRunId }));
+      } finally {
+        git.retireRunnerClone = origRetire;
+      }
+
+      assert.equal(ran, false, "the model never starts");
+      assert.equal(retireCalls, 0, "no reclaim on a non-terminal / 404 / transient probe");
       assert.ok(api.states.some((s) => s.body.status === "failed"), "the run fails closed");
       assert.deepEqual(readJournal(bare, branch), { runId: ownerRunId, clonePath }, "the journal is untouched");
       assert.equal(
-        fs.readFileSync(path.join(clonePath, "FOREIGN_RESIDUE.txt"), "utf8"),
+        fs.readFileSync(path.join(clonePath, "FOREIGN.txt"), "utf8"),
         "owner-only bytes\n",
         "the canonical clone is untouched",
       );
@@ -296,64 +578,6 @@ describe("atomic runner-clone release (#1315)", () => {
     assert.deepEqual(readJournal(bare, branch), { runId: ownerRunId, clonePath: outside }, "the journal is untouched");
   });
 
-  it("T9: an in-tree DIFFERENT clone journaled to a TERMINAL owner is Case A — no probe, no retire", async () => {
-    const { gitlab } = fakeGitlab();
-    const iid = 1470;
-    const ownerRunId = "77777777-7777-4777-8777-777777777777";
-    const foreignRunId = "88888888-8888-4888-8888-888888888888";
-    const bare = await git.ensureClone(fx.originPath);
-    const branch = `agent/issue-${iid}`;
-    // A DIFFERENT in-tree clone (both under runnerRoot): seed the canonical for a DIFFERENT
-    // issue, then journal THIS branch to point at it — a stale-for-this-branch journal whose
-    // journaled path still exists on disk and is itself under runnerRoot.
-    const other = await git.createOrAttachRunnerClone(bare, 9470, ownerRunId);
-    fs.writeFileSync(path.join(other.path, "OTHER_TREE.txt"), "other in-tree bytes\n");
-    await git.markRecoveryCapture(bare, other.path, branch, ownerRunId);
-    api.setOwnershipStatus(ownerRunId, "completed"); // authoritatively terminal — must NOT matter
-
-    let ownershipProbes = 0;
-    const origOwn = client.getRunOwnership.bind(client);
-    client.getRunOwnership = async (runId) => {
-      if (runId === ownerRunId) ownershipProbes++;
-      return origOwn(runId);
-    };
-    let retireCalls = 0;
-    const origRetire = git.retireRunnerClone.bind(git);
-    git.retireRunnerClone = async (b, c, br, r, o) => {
-      retireCalls++;
-      return origRetire(b, c, br, r, o);
-    };
-    let ran = false;
-    const factory: ExecutorFactory = () => ({
-      homeDir: path.join(homeDir, foreignRunId),
-      executor: {
-        run: async () => {
-          ran = true;
-          throw new Error("the model must never start");
-        },
-      },
-    });
-    const runner = runnerWith(factory, gitlab, undefined, nullLogger(), { recoveryRetryMs: 5 });
-    try {
-      await runner.execute(gitlabClaim(iid, { run_id: foreignRunId }));
-    } finally {
-      client.getRunOwnership = origOwn;
-      git.retireRunnerClone = origRetire;
-    }
-
-    assert.equal(ran, false, "the model never starts");
-    assert.ok(api.states.some((s) => s.body.status === "failed"), "Case A fails the run closed");
-    assert.equal(ownershipProbes, 0, "the runner NEVER owner-probes on a CapturePathMismatchError");
-    assert.equal(retireCalls, 0, "the runner NEVER retires on a CapturePathMismatchError");
-    assert.equal(
-      fs.readFileSync(path.join(other.path, "OTHER_TREE.txt"), "utf8"),
-      "other in-tree bytes\n",
-      "the journaled in-tree residue is untouched",
-    );
-    assert.deepEqual(readJournal(bare, branch), { runId: ownerRunId, clonePath: other.path }, "the journal is untouched");
-    assert.equal(fs.existsSync(holdingRoot()), false, "no quarantine is created");
-  });
-
   it("T1(git): the guard classifies same-run / same-path-foreign / different-path", async () => {
     const iid = 1480;
     const ownerRunId = "99999999-9999-4999-8999-999999999999";
@@ -388,9 +612,11 @@ describe("atomic runner-clone release (#1315)", () => {
         assert.ok(err instanceof CapturePathMismatchError);
         assert.equal(err.journaledPath, clonePath);
         assert.equal(err.branch, branch);
+        // issue #1319: ownerRunId is now load-bearing — the runner's Case A reclaim probes it.
+        assert.equal(err.ownerRunId, ownerRunId);
         return true;
       },
-      "a different clone key is never reclaimable",
+      "a different clone key is the runner's owner-derived reclaim case (#1319)",
     );
     // The journal is untouched by all three fail-closed classifications.
     assert.deepEqual(readJournal(bare, branch), { runId: ownerRunId, clonePath });

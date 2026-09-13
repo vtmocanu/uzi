@@ -1986,6 +1986,21 @@ export interface RunOwnershipResponse {
   status: string;
 }
 
+/** Response of the issue #1319 orphan-classification read (GET
+ *  /worker/runs/{claimantId}/orphan-classification?owner=<ownerRunId>): the authoritative
+ *  identity of a clone-orphan OWNER run, scoped server-side to the worker's owner (user) +
+ *  the claimant's repo. Nullable columns carry SQL NULL as JSON null. Mirrors the api's
+ *  RunOrphanIdentity handler response. A 404 (owner not in that scope) throws RequestError. */
+export interface RunOrphanClassificationResponse {
+  status: string;
+  repo_id: string;
+  kind: RunKind;
+  issue_iid: number | null;
+  branch: string | null;
+  pipeline_ref: string | null;
+  pipeline_id: number | null;
+}
+
 // ── Durable run recovery worker RPC (PRD #1296 M1, D8) ─────────────────────────
 // The frozen worker↔API archive request/response shapes. TYPES ONLY here — no client
 // methods (that is M3). They mirror api/internal/apitypes/recovery.go verbatim (the Go
