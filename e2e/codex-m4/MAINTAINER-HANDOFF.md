@@ -83,7 +83,7 @@ run-receipts: 3 committed O clause(s) with no manifest record (undischarged):
 This is bookkeeping, not a gap left unnoticed: every committed O row is `inherited` or `owed`
 (D3/D8), and the ordinary worker gate accepts a well-formed `owed` record while this separate
 lead gate rejects it until a discharging manifest record exists. Do **not** mark parent M4
-complete, and do **not** move `prds/1287-codex-guardrail-conformance.md` to `prds/done/`, until
+complete, and do **not** move `prds/done/1287-codex-guardrail-conformance.md` to `prds/done/`, until
 every row below is resolved.
 
 ## Stable O requirements
@@ -161,7 +161,7 @@ Because these are committed `owed` clauses, the manifest must discharge each wit
    — the one that created the circular commit — is gone; that is the whole point of the redesign.
 6. For PR #1309, the strict macOS Linux-container run is complete. Current-head CI
    `test-agent` confirmation after the recovered commits remains lead-owned.
-7. Only then tick parent #1106 M4 and move `prds/1287-codex-guardrail-conformance.md` to
+7. Only then tick parent #1106 M4 and move `prds/done/1287-codex-guardrail-conformance.md` to
    `prds/done/`.
 
 ## Also required before parent M4 acceptance
