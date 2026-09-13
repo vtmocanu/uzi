@@ -1,8 +1,8 @@
 # ADR-1296: custody holds are H-free and claim-scoped; archive captures are H-bound and immutable
 
-**Status**: Implemented (PRD #1296, M1-M4 committed); M5 (owner-facing UX) and M6/M7
-(docs, integration proof, hosted acceptance) land alongside or after this ADR, ahead of
-merge/feature acceptance.
+**Status**: Implemented (PRD #1296, M1-M6 committed on this branch — M5, owner-facing
+UX, landed in `9e3e7362`, before this ADR); M7 (integration proof and hosted
+acceptance handoff) is still pending, ahead of merge/feature acceptance.
 **Date**: 2026-09-13
 **Issue**: [vtmocanu/uzi#1296](https://github.com/vtmocanu/uzi/issues/1296)
 **PRD**: [prds/1296-durable-run-recovery.md](../prds/1296-durable-run-recovery.md) — carries

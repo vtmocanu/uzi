@@ -23,19 +23,25 @@ died before it reached this protected boundary.
 
 The run page shows a **Recovery archives** section on any run that failed to
 finalize, and on any run that already has a retained capture even before it
-reaches a final status. Each retained capture is in one of these states:
+reaches a final status. Each retained capture is in one of these six states:
 
-- **Preparing / Uploading** — the history is being captured or stored;
-  nothing is downloadable yet.
+- **Preparing** — the original committed history is being captured at the
+  protected boundary; nothing is downloadable yet.
+- **Uploading** — the encrypted archive is being stored; nothing is
+  downloadable yet.
 - **Available** — the original committed history is ready to download.
 - **Needs action** — the archive could not be completed (for example, a
   storage limit was hit); the source is still retained and will be retried.
 - **Expired** — the ready download window passed and the bytes were purged.
 - **Discarded** — the archive was explicitly discarded and its bytes deleted.
-- **Unsupported** — the run predates durable recovery (an old worker or
-  server never captured anything for it).
-- **Unavailable** — recovery was armed but nothing needed capturing, or the
-  source could not be preserved.
+
+When a run has **no** retained captures at all, the section reports one of
+two whole-section conditions instead of a per-capture state:
+
+- **Unsupported / legacy** — the run predates durable recovery (an old
+  worker or server never captured anything for it).
+- **Unavailable source** — recovery was armed but nothing needed capturing,
+  or the source could not be preserved.
 
 Every download surface warns that the original may contain secrets: review
 it before publishing anywhere, and if it exposed a real credential, revoke
@@ -99,7 +105,7 @@ operator-configurable environment variable on the API:
 | Automatic upload-retry window | 24 hours | How long uzi keeps retrying a stalled upload before it needs your attention. |
 | Captures per claim | 16 | Distinct capture attempts one worker claim can accumulate. |
 | Retained captures per owner | 256 | Total captures you can have on file at once. |
-| Unresolved recovery holds per owner | 8 | At the limit, uzi pauses admitting **new** code-generating runs for you — existing runs are unaffected — until you resolve or discard some. Fixed today, not yet an environment variable. |
+| Unresolved recovery holds per owner | 8 | At the limit, uzi pauses admitting **new** runs for you — existing runs are unaffected — until you resolve or discard some. Fixed today, not yet an environment variable. |
 
 ## Custody: why a worker won't disappear
 
@@ -108,9 +114,14 @@ While a run's committed work is unpublished and not yet durably captured
 that holds it is kept around rather than torn down, even if it would
 otherwise be idle or recycled. Such a worker shows a **retaining work**
 badge in the worker list. Deleting that worker is refused until the work is
-recovered or explicitly discarded, and the refusal tells you which command
-to run. Removing a repo that still has a run retaining custody this way is
-refused the same way, naming how many archives are at stake.
+recovered or explicitly discarded, and the refusal names the recovery
+command (`uzi run export`) and how many holds are blocking the delete.
+Discarding an archive is an owner action against the API
+(`DELETE /api/runs/{run}/archives/{capture}`), not a CLI subcommand or a web
+button; left untouched, an archive simply expires after its retention
+window instead (see Limits above). Removing a repo that still has a run
+retaining custody this way is refused the same way, naming how many runs
+are retaining unpublished work.
 
 ## What this is not: the threat model
 
