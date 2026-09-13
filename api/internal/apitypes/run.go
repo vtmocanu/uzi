@@ -82,6 +82,27 @@ func IsTerminalRunStatus(status string) bool {
 	}
 }
 
+// CompletionDeferredDTO is one owner-deferred (out-of-scope) milestone on a revised completion
+// contract (PRD #1227 M1, D2): the milestone id, the owner's reason, and the contract revision the
+// deferral was recorded at. A milestone deferred in an earlier revision keeps its original
+// reason/revision across later partial decisions.
+type CompletionDeferredDTO struct {
+	MilestoneID string `json:"milestone_id"`
+	Reason      string `json:"reason"`
+	Revision    int    `json:"revision"`
+}
+
+// CompletionAcceptedDTO is one owner-accepted unmet criterion on a revised completion contract (PRD
+// #1227 M1, D3): the exact criterion id, its milestone id and text (copied from the contract's
+// criteria[] entry), the owner's reason, and the revision the acceptance was recorded at.
+type CompletionAcceptedDTO struct {
+	ID          string `json:"id"`
+	MilestoneID string `json:"milestone_id"`
+	Text        string `json:"text"`
+	Reason      string `json:"reason"`
+	Revision    int    `json:"revision"`
+}
+
 // RunDTO is the web view of a run. session_id and last_seq are intentionally
 // omitted — they are worker-internal (resume plumbing), not browser state.
 type RunDTO struct {
@@ -254,9 +275,20 @@ type RunDTO struct {
 	// so the two surfaces cannot disagree. Computed in ONE place (completionPhaseRule, runs_dto.go),
 	// the pause_requested precedent; "" for a non-interlocked run and any run not in one of the
 	// three live states. Always on the wire.
-	CompletionPhase string  `json:"completion_phase"`
-	WorkerID        *string `json:"worker_id"`
-	Branch          *string `json:"branch"`
+	CompletionPhase string `json:"completion_phase"`
+	// The OWNER-DECISION contract projection (PRD #1227 M1) — contract-derived, no extra DB read
+	// (runToDTO decodes the run's frozen completion_contract via workersvc.CompletionScopeView).
+	// CompletionRevision is the run's current contract_revision (int(run.ContractRevision.Int32)
+	// when frozen, else null): it bumps by 1 on each partial/accept decision. CompletionDeferred is
+	// the owner-deferred (out-of-scope) milestones from a `partial` decision; CompletionAccepted is
+	// the owner-accepted unmet criteria from an `accept` decision. Both are STABLE arrays, NEVER
+	// null — `[]` when the run has no such decision or is not interlocked (the completion_unmet
+	// convention), so a consumer reads a length without a null guard. All three always on the wire.
+	CompletionRevision *int                    `json:"completion_revision"`
+	CompletionDeferred []CompletionDeferredDTO `json:"completion_deferred"`
+	CompletionAccepted []CompletionAcceptedDTO `json:"completion_accepted"`
+	WorkerID           *string                 `json:"worker_id"`
+	Branch             *string                 `json:"branch"`
 	// BaseBranch and OpenMr are the task/handoff columns (PRD #400), meaningful only
 	// for a kind='task' run. BaseBranch is the source ref the task branched from (null
 	// when it inherited the caller's local HEAD, and on every non-task run); OpenMr is

@@ -61,6 +61,23 @@
   "hold_reason": "x",
   "hold_context": "x",
   "completion_phase": "x",
+  "completion_revision": 1,
+  "completion_deferred": [
+    {
+      "milestone_id": "x",
+      "reason": "x",
+      "revision": 1
+    }
+  ],
+  "completion_accepted": [
+    {
+      "id": "x",
+      "milestone_id": "x",
+      "text": "x",
+      "reason": "x",
+      "revision": 1
+    }
+  ],
   "worker_id": "x",
   "branch": "x",
   "base_branch": "x",

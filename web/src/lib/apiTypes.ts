@@ -1897,6 +1897,24 @@ export type RunTriggerSource =
   | "judge_rerun"
   | "resume";
 
+/** PRD #1227 M1: one owner-deferred (out-of-scope) milestone on a revised completion contract —
+ *  the milestone id, the owner's reason, and the contract revision the deferral was recorded at. */
+export interface CompletionDeferred {
+  milestone_id: string;
+  reason: string;
+  revision: number;
+}
+
+/** PRD #1227 M1: one owner-accepted unmet criterion on a revised completion contract — the exact
+ *  criterion id, its milestone id and text, the owner's reason, and the revision it was accepted at. */
+export interface CompletionAccepted {
+  id: string;
+  milestone_id: string;
+  text: string;
+  reason: string;
+  revision: number;
+}
+
 export interface Run {
   id: string;
   /** Nullable since PRD #39: a chat run has no repo (issue/ci_fix runs always do). */
@@ -2295,6 +2313,19 @@ export interface Run {
   hold_reason?: string | null;
   hold_context?: string | null;
   completion_phase?: "checking" | "reworking" | "blocked" | "";
+  /** PRD #1227 M1: the owner-decision contract projection — contract-derived (no extra DB read),
+   *  all OPTIONAL for api/web rollout skew exactly like the completion block above; the server
+   *  always sends them.
+   *
+   *  `completion_revision` is the run's current contract_revision (null when the contract is not
+   *  yet frozen); it bumps by 1 on each `partial`/`accept` owner decision.
+   *  `completion_deferred` is the owner-deferred (out-of-scope) milestones a `partial` decision
+   *  recorded; `completion_accepted` is the owner-accepted unmet criteria an `accept` decision
+   *  recorded. Both are STABLE arrays, never null ([] when the run has no such decision or is not
+   *  interlocked), so read a length without a null guard. */
+  completion_revision?: number | null;
+  completion_deferred?: CompletionDeferred[];
+  completion_accepted?: CompletionAccepted[];
   /** PRD #400: the task/handoff source ref a kind='task' run branched from — null when it
    *  inherited the caller's local HEAD, and on every non-task run. For a handoff created
    *  without --base (issue #403 F3) it is the resolved SEED COMMIT sha the auto-review uses

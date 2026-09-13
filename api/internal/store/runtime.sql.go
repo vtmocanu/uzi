@@ -137,6 +137,44 @@ func (q *Queries) AdminUsageTotals(ctx context.Context) (AdminUsageTotalsRow, er
 	return i, err
 }
 
+const bumpContractRevision = `-- name: BumpContractRevision :one
+UPDATE runs SET
+    contract_revision = $1,
+    completion_contract = $2::jsonb,
+    updated_at = now()
+WHERE id = $3
+  AND completion_contract_version IS NOT NULL
+  AND completion_contract IS NOT NULL
+  AND contract_revision = $4
+RETURNING contract_revision
+`
+
+type BumpContractRevisionParams struct {
+	NewRevision        pgtype.Int4 `json:"new_revision"`
+	CompletionContract []byte      `json:"completion_contract"`
+	RunID              uuid.UUID   `json:"run_id"`
+	ExpectedRevision   pgtype.Int4 `json:"expected_revision"`
+}
+
+// PRD #1227 M1: create contract revision N+1 for an owner decision (partial/accept). It writes
+// the NEW revision and the revised jsonb contract ATOMICALLY, guarded so it fires ONLY for an
+// interlocked, frozen run at the EXPECTED revision — the optimistic fence that makes a decision
+// idempotent/conflict-safe under the FOR UPDATE lock: contract_revision = @expected_revision is
+// the compare-and-set, so a concurrent bump that already moved the revision matches 0 rows
+// (pgx.ErrNoRows -> ErrCompletionRevisionConflict). completion_contract_version IS NOT NULL keeps
+// a legacy run out; completion_contract IS NOT NULL keeps a split-state (never-frozen) run out.
+func (q *Queries) BumpContractRevision(ctx context.Context, arg BumpContractRevisionParams) (pgtype.Int4, error) {
+	row := q.db.QueryRow(ctx, bumpContractRevision,
+		arg.NewRevision,
+		arg.CompletionContract,
+		arg.RunID,
+		arg.ExpectedRevision,
+	)
+	var contract_revision pgtype.Int4
+	err := row.Scan(&contract_revision)
+	return contract_revision, err
+}
+
 const cancelPauseInput = `-- name: CancelPauseInput :one
 WITH cancelled AS (
     UPDATE runs SET
@@ -2694,6 +2732,154 @@ func (q *Queries) GetRunByID(ctx context.Context, id uuid.UUID) (Run, error) {
 	return i, err
 }
 
+const getRunByIDForUpdate = `-- name: GetRunByIDForUpdate :one
+SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash, pause_requested_at, pause_mode, pause_after_count, checkpoint_tip_at, recovery_wait_count, recovery_retry_not_before, completion_contract_version, contract_revision, completion_contract, completion_attempts, latest_completion_attempt, milestones_agents, hold_reason, hold_captured_head, completion_budget_exhausted_at, completion_question_at, budget_extension_seconds, claim_generation FROM runs WHERE id = $1 FOR UPDATE
+`
+
+// PRD #1227 M1: the owner-decision transaction's row lock. DecideCompletion opens a pgx
+// transaction and SELECTs the run FOR UPDATE through this so a partial/accept decision
+// serializes against a racing decision (or a completeRunWithPermit consume) on the same run —
+// the FOR UPDATE row lock is the mutex, exactly as GetRunOwnedByWorkerForUpdate is for the
+// completion transaction. It is NOT owner-scoped: DecideCompletion re-authorizes owner-or-admin
+// against the LOCKED row (locked.user_id) after the lock, so a foreign non-admin is hidden the
+// same way GetRunForViewer hides it. An absent run returns pgx.ErrNoRows (-> ErrRunNotFound).
+func (q *Queries) GetRunByIDForUpdate(ctx context.Context, id uuid.UUID) (Run, error) {
+	row := q.db.QueryRow(ctx, getRunByIDForUpdate, id)
+	var i Run
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.RepoID,
+		&i.IssueIid,
+		&i.IssueTitle,
+		&i.IssueDescription,
+		&i.Status,
+		&i.RequeueCount,
+		&i.WorkerID,
+		&i.SessionID,
+		&i.LastSeq,
+		&i.Branch,
+		&i.MrIid,
+		&i.FailureReason,
+		&i.PlanMd,
+		&i.IterationCount,
+		&i.ClaimedAt,
+		&i.StartedAt,
+		&i.FinishedAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.OriginColumn,
+		&i.BoardColumn,
+		&i.MovePendingSince,
+		&i.MrState,
+		&i.AutoApprove,
+		&i.AutopilotCommentedAt,
+		&i.Kind,
+		&i.PipelineID,
+		&i.PipelineRef,
+		&i.FailureSnapshot,
+		&i.FixVerdict,
+		&i.StopKind,
+		&i.AgentSource,
+		&i.AgentExclusions,
+		&i.RepoAgents,
+		&i.Title,
+		&i.ResumeOfRunID,
+		&i.LastActivityAt,
+		&i.Health,
+		&i.HealthReason,
+		&i.HealthSince,
+		&i.HealthNotifiedAt,
+		&i.TargetRunID,
+		&i.MrWebUrl,
+		&i.PrdDonePath,
+		&i.PrdPatchSettledAt,
+		&i.AnthropicSecretID,
+		&i.AnthropicSecretLabel,
+		&i.AnthropicSelectReason,
+		&i.AnthropicHeadroomPct,
+		&i.WaitOnLimit,
+		&i.LimitResetsAt,
+		&i.RetryNotBefore,
+		&i.LimitWaitCount,
+		&i.RateLimitType,
+		&i.OpenQuestionID,
+		&i.ReviseCount,
+		&i.PlanSource,
+		&i.PlannedBaseCommit,
+		&i.RequireBaseMatch,
+		&i.MilestonesCandidate,
+		&i.MilestonesFrozen,
+		&i.MilestonesCompleted,
+		&i.MilestonesInProgress,
+		&i.BudgetMaxIterations,
+		&i.BudgetWallSeconds,
+		&i.ScheduleID,
+		&i.LimitDeadSecretID,
+		&i.ReportOnly,
+		&i.ReportMd,
+		&i.CiConfigPaths,
+		&i.Model,
+		&i.OverrideSubagentModel,
+		&i.FailOrigin,
+		&i.Priority,
+		&i.SummaryIntent,
+		&i.SummaryPlan,
+		&i.SummaryDeltas,
+		&i.IssueComments,
+		&i.BaseBranch,
+		&i.OpenMr,
+		&i.DispatchedAt,
+		&i.ReviewTargetRunID,
+		&i.ReviewRequested,
+		&i.ThenFixRequested,
+		&i.ThenFixOfRunID,
+		&i.PreservedPatch,
+		&i.RequiredCapabilities,
+		&i.StopReason,
+		&i.RequiredTools,
+		&i.SizeClass,
+		&i.Interactive,
+		&i.OpenFollowupID,
+		&i.PlanChangedFiles,
+		&i.ScopeCeiling,
+		&i.StatusSince,
+		&i.ReviewComments,
+		&i.BudgetPausedSeconds,
+		&i.MrReworkEnabled,
+		&i.TriggerSource,
+		&i.CheckpointTip,
+		&i.UsageRefolded,
+		&i.CodexSecretID,
+		&i.CodexAuthMode,
+		&i.CodexSecretLabel,
+		&i.CodexAccountKey,
+		&i.CodexMaterialRevision,
+		&i.CodexAccountRevision,
+		&i.CodexClaimEpoch,
+		&i.CodexCapHash,
+		&i.PauseRequestedAt,
+		&i.PauseMode,
+		&i.PauseAfterCount,
+		&i.CheckpointTipAt,
+		&i.RecoveryWaitCount,
+		&i.RecoveryRetryNotBefore,
+		&i.CompletionContractVersion,
+		&i.ContractRevision,
+		&i.CompletionContract,
+		&i.CompletionAttempts,
+		&i.LatestCompletionAttempt,
+		&i.MilestonesAgents,
+		&i.HoldReason,
+		&i.HoldCapturedHead,
+		&i.CompletionBudgetExhaustedAt,
+		&i.CompletionQuestionAt,
+		&i.BudgetExtensionSeconds,
+		&i.ClaimGeneration,
+	)
+	return i, err
+}
+
 const getRunByIDForUser = `-- name: GetRunByIDForUser :one
 SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash, pause_requested_at, pause_mode, pause_after_count, checkpoint_tip_at, recovery_wait_count, recovery_retry_not_before, completion_contract_version, contract_revision, completion_contract, completion_attempts, latest_completion_attempt, milestones_agents, hold_reason, hold_captured_head, completion_budget_exhausted_at, completion_question_at, budget_extension_seconds, claim_generation FROM runs WHERE id = $1 AND user_id = $2
 `
@@ -3854,6 +4040,29 @@ func (q *Queries) InsertRunMessage(ctx context.Context, arg InsertRunMessagePara
 		arg.AgentLabel,
 		arg.Payload,
 	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const invalidatePriorCompletionPermits = `-- name: InvalidatePriorCompletionPermits :execrows
+UPDATE run_completion_permits SET consumed_at = now()
+WHERE run_id = $1 AND consumed_at IS NULL AND contract_revision < $2
+`
+
+type InvalidatePriorCompletionPermitsParams struct {
+	RunID       uuid.UUID `json:"run_id"`
+	NewRevision int32     `json:"new_revision"`
+}
+
+// PRD #1227 M1: after a decision bumps the contract revision to @new_revision, every UNCONSUMED
+// permit issued against an OLDER revision is stale — a completion report could otherwise consume
+// one and complete against a scope the owner just changed. Stamp consumed_at on each so the
+// completion transaction's GetUnconsumedCompletionPermit lookup (consumed_at IS NULL) can never
+// match it; the worker must re-request a permit at the new revision. Returns the count invalidated.
+func (q *Queries) InvalidatePriorCompletionPermits(ctx context.Context, arg InvalidatePriorCompletionPermitsParams) (int64, error) {
+	result, err := q.db.Exec(ctx, invalidatePriorCompletionPermits, arg.RunID, arg.NewRevision)
 	if err != nil {
 		return 0, err
 	}

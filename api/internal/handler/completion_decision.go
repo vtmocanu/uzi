@@ -4,31 +4,42 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strings"
 
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
-// completionDecisionRequest is the POST /api/runs/{id}/completion/decision body (PRD #1226 M5,
-// D7): the owner/admin decision on a completion-blocked run, with optional guidance. This child
-// supports ONLY decision="continue"; any other value is a 400 (the other decisions are reserved
-// for a later child). Guidance is optional and capped by MaxGuidanceBytes, like StartRunRework's.
+// completionDecisionRequest is the POST /api/runs/{id}/completion/decision body (PRD #1226 M5, D7 +
+// #1227 M1): the owner/admin decision on a completion-blocked run. Decision is one of:
+//
+//   - "continue" (#1226, owner-only): resume with optional guidance (capped by MaxGuidanceBytes).
+//   - "partial" (#1227, owner/admin): reduce scope to the keep milestone-id set, with a required
+//     reason and the fenced contract_revision.
+//   - "accept" (#1227, owner/admin): accept the criteria criterion-id set, with a required reason
+//     and the fenced contract_revision.
+//
+// Any other value is a 400. The service (DecideCompletion) performs the ID validation, revision
+// fence and transaction; the handler validates the request SHAPE (decision domain, reason cap +
+// non-empty for partial/accept) and maps the typed errors to status codes.
 type completionDecisionRequest struct {
-	Decision string `json:"decision"`
-	Guidance string `json:"guidance"`
+	Decision         string   `json:"decision"`
+	Guidance         string   `json:"guidance"`
+	Keep             []string `json:"keep"`
+	Criteria         []string `json:"criteria"`
+	Reason           string   `json:"reason"`
+	ContractRevision int      `json:"contract_revision"`
 }
 
-// ContinueCompletionDecision records the owner's CONTINUE decision on a completion-blocked run
-// (PRD #1226 M5, D7) and resumes it. It is the sibling of ResumeRunNow: owner-scoped (a
-// foreign/absent run is 404 before any write, enforced by GetRunByIDForUser inside the service),
-// mounted RequireUser so the CLI's uzc_ Bearer reaches it — NOT the cookie-only RequireAuth group.
+// ContinueCompletionDecision records the owner/admin decision on a completion-blocked run (PRD
+// #1226 M5, D7 + #1227 M1) and resumes it. It is mounted RequireUser so the CLI's uzc_ Bearer
+// reaches it — NOT the cookie-only RequireAuth group. continue stays owner-scoped; partial/accept
+// are owner-or-admin (the service authorizes and, for partial/accept, hides a foreign run as 404).
 //
-// It validates the request shape (decision + guidance cap) HERE, then hands the run-state dispatch
-// and the writes to workersvc.ContinueCompletionDecision so web and CLI (one endpoint) cannot
-// drift. The service resolves BOTH completion-blocked states — the live `awaiting_input`
-// completion-question window and the `paused` hold — and 409s (ErrCompletionNotBlocked) a run in
-// neither.
+// It validates the request SHAPE here, then hands the dispatch, ID validation, revision fence and
+// writes to workersvc.DecideCompletion so web and CLI (one endpoint) cannot drift. (The handler
+// method name is unchanged for its existing route mount; it now covers all three decisions.)
 func (h *Handler) ContinueCompletionDecision(w http.ResponseWriter, r *http.Request) {
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {
@@ -44,24 +55,46 @@ func (h *Handler) ContinueCompletionDecision(w http.ResponseWriter, r *http.Requ
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if req.Decision != "continue" {
-		httpx.Error(w, http.StatusBadRequest, "decision must be \"continue\"")
-		return
-	}
-	if len(req.Guidance) > MaxGuidanceBytes {
-		httpx.Error(w, http.StatusBadRequest, "guidance is too long")
+	switch req.Decision {
+	case "continue":
+		if len(req.Guidance) > MaxGuidanceBytes {
+			httpx.Error(w, http.StatusBadRequest, "guidance is too long")
+			return
+		}
+	case "partial", "accept":
+		if len(req.Reason) > MaxGuidanceBytes {
+			httpx.Error(w, http.StatusBadRequest, "reason is too long")
+			return
+		}
+		if strings.TrimSpace(req.Reason) == "" {
+			httpx.Error(w, http.StatusBadRequest, "reason is required")
+			return
+		}
+	default:
+		httpx.Error(w, http.StatusBadRequest, "decision must be one of \"continue\", \"partial\", \"accept\"")
 		return
 	}
 
-	run, err := h.wsvc.ContinueCompletionDecision(r.Context(), user.ID, runID, req.Guidance)
+	run, err := h.wsvc.DecideCompletion(r.Context(), user.ID, user.IsAdmin, runID, workersvc.CompletionDecisionInput{
+		Decision:         req.Decision,
+		Guidance:         req.Guidance,
+		Keep:             req.Keep,
+		Criteria:         req.Criteria,
+		Reason:           req.Reason,
+		ContractRevision: req.ContractRevision,
+	})
 	if err != nil {
 		switch {
 		case errors.Is(err, workersvc.ErrRunNotFound):
 			httpx.Error(w, http.StatusNotFound, "run not found")
 		case errors.Is(err, workersvc.ErrCompletionNotBlocked):
 			httpx.Error(w, http.StatusConflict, err.Error())
+		case errors.Is(err, workersvc.ErrCompletionRevisionConflict):
+			httpx.Error(w, http.StatusConflict, err.Error())
+		case errors.Is(err, workersvc.ErrCompletionDecisionInvalid):
+			httpx.Error(w, http.StatusBadRequest, err.Error())
 		default:
-			slog.Error("continue completion decision", "run_id", runID, "error", err)
+			slog.Error("completion decision", "run_id", runID, "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 		}
 		return
