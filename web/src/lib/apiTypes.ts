@@ -1815,11 +1815,17 @@ export type RunStatus =
 // gracefully stopped (board.go). It is NOT a human-stopped failure/cancel — the
 // run lands status="completed" (green success) — so it is deliberately NOT in
 // runBadge's HUMAN_STOP_KINDS; see the note there.
+// PRD #634 M3: "scope_capped" is stamped on a completed run an operator scope-ceiling
+// directive truncated. PRD #1227 M2: "scope_reduced" is stamped on a completed run whose
+// owner `partial` decision deferred part of its frozen scope. Both land
+// status="completed" (green success), so — like "stopped" — neither is a HUMAN_STOP_KIND.
 export type StopKind =
   | "cancelled"
   | "plan_rejected"
   | "auto_stopped"
-  | "stopped";
+  | "stopped"
+  | "scope_capped"
+  | "scope_reduced";
 
 // RunHealth is the server-side run-health flag (PRD #47): a non-terminal,
 // self-clearing signal that a run looks stuck, looping, or close to its timeout. "ok"

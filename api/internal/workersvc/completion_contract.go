@@ -262,3 +262,59 @@ func CompletionScopeView(contract []byte) (deferred []apitypes.CompletionDeferre
 	}
 	return deferred, accepted
 }
+
+// CompletionScopeClaim projects a run's frozen completion_contract into the WORKER-ONLY claim seam
+// (PRD #1227 M2): the deferred (out-of-scope) milestones — each with its TITLE looked up from the
+// matching criterion's text — and the owner-accepted criteria. Unlike CompletionScopeView (which
+// returns the owner-facing apitypes DTOs WITHOUT titles), this carries the milestone title the
+// worker needs to render the partial-delivery PR.
+//
+// It returns nil when the contract is empty/unfrozen/undecodable OR encodes NEITHER a deferred set
+// NOR an accepted set — so the ClaimConfig field's omitempty drops the key for a legacy,
+// non-interlocked, or revision-1 run, keeping that run's claim byte-identical to today's. A
+// non-nil result leaves an absent half as a nil slice (omitempty), so a `partial`-only revision
+// carries only `deferred` and an `accept`-only revision only `accepted`.
+func CompletionScopeClaim(contract []byte) *CompletionScopeConfig {
+	c, err := parseCompletionContract(contract)
+	if err != nil {
+		return nil
+	}
+	hasDeferred := c.Scope != nil && len(c.Scope.Out) > 0
+	hasAccepted := len(c.Accepted) > 0
+	if !hasDeferred && !hasAccepted {
+		return nil
+	}
+	out := &CompletionScopeConfig{}
+	if hasDeferred {
+		// Title source: the criterion whose milestone_id matches the deferred milestone; its Text is
+		// the milestone title (buildCompletionContract mints one criterion per milestone with
+		// text = the milestone title). A deferred milestone with no matching criterion (a corrupt
+		// contract) yields an empty title rather than dropping the entry.
+		titleByMilestone := make(map[string]string, len(c.Criteria))
+		for _, cr := range c.Criteria {
+			if _, ok := titleByMilestone[cr.MilestoneID]; !ok {
+				titleByMilestone[cr.MilestoneID] = cr.Text
+			}
+		}
+		out.Deferred = make([]CompletionScopeDeferred, 0, len(c.Scope.Out))
+		for _, d := range c.Scope.Out {
+			out.Deferred = append(out.Deferred, CompletionScopeDeferred{
+				MilestoneID: d.MilestoneID,
+				Title:       titleByMilestone[d.MilestoneID],
+				Reason:      d.Reason,
+			})
+		}
+	}
+	if hasAccepted {
+		out.Accepted = make([]CompletionScopeAccepted, 0, len(c.Accepted))
+		for _, a := range c.Accepted {
+			out.Accepted = append(out.Accepted, CompletionScopeAccepted{
+				ID:          a.ID,
+				MilestoneID: a.MilestoneID,
+				Text:        a.Text,
+				Reason:      a.Reason,
+			})
+		}
+	}
+	return out
+}
