@@ -52,7 +52,7 @@ Two honest notes, in the tone PRD #90 set:
 | 2 | **M2**, **M4** | M1 | M2: migrations/queries/`memory-tools.ts`; M4: `docker-compose.yml`, `deploy/`, new embed client | **yes** — disjoint files |
 | 3 | **M3**, **M5** | M2 (M3), M4 (M5) | M3: `workersvc` eviction; M5: ranking query | **yes** — disjoint |
 | 4 | **M6** | M2 | `web/`, `api/cmd/uzi/` | no |
-| 5 | **M7** | all | tests, `specs/ai.md` | no |
+| 5 | **M7** | all | tests, this PRD's Decision Log (`specs/ai.md` is frozen, issue #1317) | no |
 
 **M1 is independently shippable and is the recommended stopping point if the OQ-A answer is unattractive.** M2/M3/M6 need no embedding provider either — the entire pgvector track (M4/M5) can be dropped without stranding the rest.
 

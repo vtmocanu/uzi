@@ -792,7 +792,7 @@ func buildGuardRoleExcludedNotification(baseURL string, userID, runID uuid.UUID,
 // guards; any other guard role degrades to a generic sentence keyed on its name.
 func guardRoleExcludedBody(roles []string) string {
 	if len(roles) == 1 && roles[0] == "spec-keeper" {
-		return "You approved this run with the spec-keeper guard role excluded — the role that guards specs/human.md and specs/ai.md from silent drift."
+		return "You approved this run with the spec-keeper guard role excluded — the role that guards specs/human.md from silent drift."
 	}
 	return "You approved this run with " + strings.Join(roles, ", ") + " excluded — a guard role whose exclusion leaves the specs it protects unwatched for this run."
 }

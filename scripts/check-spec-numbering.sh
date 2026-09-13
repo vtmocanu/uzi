@@ -13,6 +13,11 @@
 # Order and gaps are NEVER checked: the file is appended in landing order and
 # carries intentional out-of-order blocks. Both are now permanent.
 #
+# The enforced form is exactly `## N.` at column 1. A near-miss (`## 638 x`,
+# `### 638.`, an indented heading) is invisible to the extractor, so the gate
+# holds the conforming form airtight and nothing else; a review still owns the
+# rest of the file.
+#
 # LIVENESS CANARY, BECAUSE A SILENT PASS IS THE FAILURE MODE. The canary plants a
 # duplicate section number AND a section above the frozen head. Arms 1 and 2 must
 # both fire on it, or the instrument is declared broken. A clean run prints what

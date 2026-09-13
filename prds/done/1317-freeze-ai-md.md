@@ -23,7 +23,7 @@ Freeze the file. `specs/ai.md` stays at its path so every `§N` reference keeps 
 - [x] **M1 Library.** spec-keeper v6 in vtmocanu/skills: never creates a `specs/ai.md`; records decisions in ADRs and PRD Decision Logs; honors a `FROZEN` marker on an existing file (legacy repos keep theirs until frozen). Regenerated `product-agents/`.
 - [x] **M2 uzi agents.** Builtin and dev-roster spec-keeper at v6, vendored manifest `spec-keeper: 6` at the library merge SHA, `architect` and `release` tails, `.claude/agent-team.md`.
 - [x] **M3 Freeze gate.** `scripts/check-spec-numbering.sh` asserts unique numbers, none above 637, count 637; the canary plants a duplicate and a 638 so both arms prove live.
-- [x] **M4 Docs.** `AGENTS.md` specs contract, README, the uzi-watcher and uzi-release skills (collision recipes retired), the `ai.md` banner, superseded notes on twelve unfinished PRD milestones, CHANGELOG.
+- [x] **M4 Docs.** `AGENTS.md` specs contract, README, the uzi-watcher and uzi-release skills (collision recipes retired), the `ai.md` banner, superseded notes on ten unfinished PRD milestones and two plan bullets that reserved a section number, CHANGELOG.
 
 ## Decision Log
 

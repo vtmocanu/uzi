@@ -85,11 +85,11 @@ strictly separated by decision provenance.
 
 `specs/human.md` is the binding contract; `specs/ai.md` is FROZEN at §637 (issue #1317):
 never append, renumber or edit it. Record AI design decisions in the originating PRD's
-Decision Log (`prds/`, completed in `prds/done/`) and, when a decision outlives the work,
-an ADR in `adr/`. The goal stays rebuild-from-specs. **This repo
-relaxes the generic "never edit human.md" rule above**: you MAY apply terse sync/hygiene
-edits to `human.md` on your own authority — retire an item whose feature was removed, rename
-a retired term, fix a line reality made stale — tagging each `(AI-synced YYYY-MM-DD)`; but
-adding a new requirement or changing what an existing one means still goes to the lead for
-user approval (and lands unmarked, as user-stated). PRD doc changes push straight to `main`, but keep spec edits provenance-clean regardless
-of how they land.
+Decision Log (`prds/`, completed in `prds/done/`) and, when a decision outlives the
+work, an ADR in `adr/`. The goal stays rebuild-from-specs. **This repo relaxes the
+generic "never edit human.md" rule above**: you MAY apply terse sync/hygiene edits to
+`human.md` on your own authority — retire an item whose feature was removed, rename a
+retired term, fix a line reality made stale — tagging each `(AI-synced YYYY-MM-DD)`; but
+adding a new requirement or changing what an existing one means still goes to the lead
+for user approval (and lands unmarked, as user-stated). PRD doc changes push straight to
+`main`, but keep spec edits provenance-clean regardless of how they land.
