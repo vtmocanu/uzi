@@ -3,10 +3,12 @@ package slacksvc
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // The run-health thread seam (PRD #47): handleHealth re-renders the run root on a
@@ -66,7 +68,20 @@ func (n *Notifier) handleHealth(ctx context.Context, ev healthEvent) {
 	if ev.health == healthApprovalIdle && anchor.GateTs.Valid && anchor.GateTs.String != "" {
 		threadTS = anchor.GateTs.String
 	}
-	hblocks, hfallback := healthNudgeBlocks(ev.health, ev.reason, base, rc.ID)
+	// PRD #1189 (M4): the near-timeout (`slow`) nudge names the run's wall-clock deadline
+	// and, unless extending is exhausted/disabled, the exact `uzi run extend` command.
+	// RunDeadline is the same server-side helper the sweep and the run page share (D9), so
+	// the DM can never disagree with them; it returns nil for a run with no wall deadline,
+	// which healthNudgeBlocks treats as "omit the line". The extension cap comes from the
+	// admin setting (nil reader / read error → 0 → the command is omitted, the safe
+	// default). Both inputs are ignored for every flag other than `slow`.
+	deadline := workersvc.RunDeadline(rc.StartedAt, rc.BudgetWallSeconds, rc.BudgetPausedSeconds,
+		rc.Kind, rc.Interactive, rc.Status, n.runTimeout, rc.BudgetExtensionSeconds)
+	extensionCap := 0
+	if n.extensionCap != nil {
+		extensionCap, _ = n.extensionCap(ctx)
+	}
+	hblocks, hfallback := healthNudgeBlocks(ev.health, ev.reason, base, rc, deadline, extensionCap, time.Now())
 	if _, perr := n.poster.PostBlocks(ctx, channel, threadTS, hfallback, hblocks); perr != nil {
 		n.logf("post health nudge", perr)
 	}

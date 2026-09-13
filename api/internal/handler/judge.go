@@ -481,5 +481,5 @@ func (h *Handler) RerunJudge(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	httpx.JSON(w, http.StatusAccepted, map[string]any{"run": runToDTO(judge, h.runPriorityClass(r.Context(), judge), h.cfg.RunTimeout)})
+	httpx.JSON(w, http.StatusAccepted, map[string]any{"run": runToDTO(judge, h.runPriorityClass(r.Context(), judge), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.clock())})
 }

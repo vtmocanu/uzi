@@ -237,6 +237,8 @@ SELECT r.id, r.user_id, r.status, r.issue_iid, r.issue_title,
        r.rate_limit_type, r.retry_not_before, r.limit_wait_count, r.status_since,
        r.milestones_frozen, r.milestones_completed, r.milestones_in_progress,
        r.checkpoint_tip,
+       r.started_at, r.budget_wall_seconds, r.budget_paused_seconds, r.interactive,
+       r.budget_extension_seconds, r.checkpoint_tip_at,
        rp.path_with_namespace, rp.web_url, c.forge_type,
        COALESCE(
            (SELECT array_agg(elem->>'name' ORDER BY ord)
@@ -251,31 +253,37 @@ WHERE r.id = $1
 `
 
 type GetSlackRunContextRow struct {
-	ID                   uuid.UUID          `json:"id"`
-	UserID               uuid.UUID          `json:"user_id"`
-	Status               string             `json:"status"`
-	IssueIid             pgtype.Int8        `json:"issue_iid"`
-	IssueTitle           string             `json:"issue_title"`
-	MrIid                pgtype.Int8        `json:"mr_iid"`
-	MrWebUrl             pgtype.Text        `json:"mr_web_url"`
-	Branch               pgtype.Text        `json:"branch"`
-	FailureReason        pgtype.Text        `json:"failure_reason"`
-	StopKind             pgtype.Text        `json:"stop_kind"`
-	Kind                 string             `json:"kind"`
-	Health               string             `json:"health"`
-	PlanMd               pgtype.Text        `json:"plan_md"`
-	RateLimitType        pgtype.Text        `json:"rate_limit_type"`
-	RetryNotBefore       pgtype.Timestamptz `json:"retry_not_before"`
-	LimitWaitCount       int32              `json:"limit_wait_count"`
-	StatusSince          pgtype.Timestamptz `json:"status_since"`
-	MilestonesFrozen     []byte             `json:"milestones_frozen"`
-	MilestonesCompleted  []byte             `json:"milestones_completed"`
-	MilestonesInProgress []byte             `json:"milestones_in_progress"`
-	CheckpointTip        pgtype.Text        `json:"checkpoint_tip"`
-	PathWithNamespace    string             `json:"path_with_namespace"`
-	WebUrl               string             `json:"web_url"`
-	ForgeType            string             `json:"forge_type"`
-	RepoAgentNames       []string           `json:"repo_agent_names"`
+	ID                     uuid.UUID          `json:"id"`
+	UserID                 uuid.UUID          `json:"user_id"`
+	Status                 string             `json:"status"`
+	IssueIid               pgtype.Int8        `json:"issue_iid"`
+	IssueTitle             string             `json:"issue_title"`
+	MrIid                  pgtype.Int8        `json:"mr_iid"`
+	MrWebUrl               pgtype.Text        `json:"mr_web_url"`
+	Branch                 pgtype.Text        `json:"branch"`
+	FailureReason          pgtype.Text        `json:"failure_reason"`
+	StopKind               pgtype.Text        `json:"stop_kind"`
+	Kind                   string             `json:"kind"`
+	Health                 string             `json:"health"`
+	PlanMd                 pgtype.Text        `json:"plan_md"`
+	RateLimitType          pgtype.Text        `json:"rate_limit_type"`
+	RetryNotBefore         pgtype.Timestamptz `json:"retry_not_before"`
+	LimitWaitCount         int32              `json:"limit_wait_count"`
+	StatusSince            pgtype.Timestamptz `json:"status_since"`
+	MilestonesFrozen       []byte             `json:"milestones_frozen"`
+	MilestonesCompleted    []byte             `json:"milestones_completed"`
+	MilestonesInProgress   []byte             `json:"milestones_in_progress"`
+	CheckpointTip          pgtype.Text        `json:"checkpoint_tip"`
+	StartedAt              pgtype.Timestamptz `json:"started_at"`
+	BudgetWallSeconds      pgtype.Int4        `json:"budget_wall_seconds"`
+	BudgetPausedSeconds    int32              `json:"budget_paused_seconds"`
+	Interactive            bool               `json:"interactive"`
+	BudgetExtensionSeconds int32              `json:"budget_extension_seconds"`
+	CheckpointTipAt        pgtype.Timestamptz `json:"checkpoint_tip_at"`
+	PathWithNamespace      string             `json:"path_with_namespace"`
+	WebUrl                 string             `json:"web_url"`
+	ForgeType              string             `json:"forge_type"`
+	RepoAgentNames         []string           `json:"repo_agent_names"`
 }
 
 // Everything the notifier renders into a run DM (content-minimized): owner,
@@ -331,6 +339,12 @@ type GetSlackRunContextRow struct {
 // no other way to reach it through this query. It is a nullable TEXT column (00185), NULL/empty
 // for a run that never published a checkpoint, which the Go side omits (the arm's "omit when
 // absent" convention).
+//
+// started_at / budget_wall_seconds / budget_paused_seconds / interactive / budget_extension_seconds
+// (PRD #1189) are the exact inputs RunDeadline needs so the near-timeout DM can name the run's
+// deadline and time-left; checkpoint_tip_at (PRD #1189/#1190) is the TIMESTAMP the tip was last
+// published so the DM can say how old the last checkpoint is (checkpoint_tip above is the SHA
+// text, which cannot answer "how long ago"). All ride the same one-row read.
 func (q *Queries) GetSlackRunContext(ctx context.Context, id uuid.UUID) (GetSlackRunContextRow, error) {
 	row := q.db.QueryRow(ctx, getSlackRunContext, id)
 	var i GetSlackRunContextRow
@@ -356,6 +370,12 @@ func (q *Queries) GetSlackRunContext(ctx context.Context, id uuid.UUID) (GetSlac
 		&i.MilestonesCompleted,
 		&i.MilestonesInProgress,
 		&i.CheckpointTip,
+		&i.StartedAt,
+		&i.BudgetWallSeconds,
+		&i.BudgetPausedSeconds,
+		&i.Interactive,
+		&i.BudgetExtensionSeconds,
+		&i.CheckpointTipAt,
 		&i.PathWithNamespace,
 		&i.WebUrl,
 		&i.ForgeType,

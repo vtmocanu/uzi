@@ -101,6 +101,9 @@ const SEED_APP_SETTINGS: AppSettings = {
   health_queued_seconds: "600",
   health_approval_seconds: "3600",
   health_nudge_cooldown_seconds: "1800",
+  // PRD #1189: per-run wall-clock extension allowance, default 16h (matching the server's
+  // DefaultRunExtensionCapSeconds). 0 would turn extending off instance-wide.
+  run_extension_cap_seconds: "57600",
   docker_repo_allowlist: "",
   // PRD #84 M2: capability-aware scheduling kill-switch, default ON.
   capability_aware_scheduling: "true",
@@ -195,6 +198,10 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
     typeof a.health_queued_seconds === "string" &&
     typeof a.health_approval_seconds === "string" &&
     typeof a.health_nudge_cooldown_seconds === "string" &&
+    // PRD #1189: accept a legacy blob that predates run_extension_cap_seconds (undefined) — the
+    // seed default ("57600") fills it on load — but reject a malformed non-string, so a bad blob
+    // can't violate the AppSettings contract. Mirrors the health_near_timeout_pct tolerance.
+    (a.run_extension_cap_seconds === undefined || typeof a.run_extension_cap_seconds === "string") &&
     typeof a.docker_repo_allowlist === "string";
   return okUser && okApp;
 }
@@ -755,6 +762,17 @@ export const settingsApi = {
           throw new ApiError(400, `${key}: must be 0 (disabled) or between 50 and 99 percent`);
         }
         (nonSecret as Record<string, string>)[key] = String(n);
+        continue;
+      }
+      // Per-run extension allowance (PRD #1189), mirroring the server's
+      // validateExtensionCapSeconds: a whole number that is 0 (disable) or in the inclusive
+      // range [3600, 604800] (1h to 7d). Note the bounds differ from the health-seconds fields.
+      if (key === "run_extension_cap_seconds") {
+        const msg = "run_extension_cap_seconds: must be 0 (disabled) or between 3600 and 604800 seconds";
+        if (!/^\d+$/.test(value)) throw new ApiError(400, msg);
+        const n = Number(value);
+        if (n !== 0 && (n < 3600 || n > 604800)) throw new ApiError(400, msg);
+        nonSecret.run_extension_cap_seconds = String(n);
         continue;
       }
       // docker_repo_allowlist (PRD #957): a comma-separated list of repo ids, mirroring the

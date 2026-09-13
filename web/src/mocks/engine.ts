@@ -712,6 +712,55 @@ export function handleInput(runId: string, kind: RunInputKind, body: string): In
       appendMessage(runId, "status", null, { text: "pause request withdrawn — the run continues" });
       return null;
     }
+    // PRD #1189: grant the run more wall-clock time. Server-only like `scope` (never routed to
+    // the worker's steering channel), owner-gated on the real api. The mock mirrors the real
+    // rejections — a body under 60s (400), an untimed kind/terminal run (409), and over-cap
+    // (409) — then applies the extension in place: the extension column grows, the deadline and
+    // total move by the granted seconds, and a near-timeout ("slow") flag CLEARS, because the
+    // near-timeout line moves with the extension (the same reason the real health arm re-clears).
+    case "extend": {
+      const secs = Math.floor(Number(body));
+      if (!Number.isFinite(secs) || secs < 60) {
+        return { status: 400, message: "extension must be at least 60 seconds" };
+      }
+      if (isTerminalRun(run.status)) {
+        return { status: 409, message: "run is already finished" };
+      }
+      if (run.kind === "chat" || run.kind === "judge" || run.interactive) {
+        return { status: 409, message: "this run kind never times out, so it cannot be extended" };
+      }
+      const currentExt = run.budget_extension_seconds ?? 0;
+      const cap = run.budget_extension_cap_seconds ?? 0;
+      if (cap <= 0) {
+        return { status: 409, message: "extensions are turned off for this instance" };
+      }
+      if (currentExt + secs > cap) {
+        const leftSec = Math.max(0, cap - currentExt);
+        return {
+          status: 409,
+          message: `${secs}s exceeds the remaining extension cap (${leftSec}s left of ${cap}s)`,
+        };
+      }
+      const newExt = currentExt + secs;
+      const wasSlow = run.health === "slow";
+      patchRun(runId, {
+        budget_extension_seconds: newExt,
+        // The deadline and total move by exactly the granted seconds (the extension is additive).
+        deadline_at: run.deadline_at
+          ? new Date(Date.parse(run.deadline_at) + secs * 1000).toISOString()
+          : run.deadline_at,
+        budget_total_seconds:
+          run.budget_total_seconds != null ? run.budget_total_seconds + secs : run.budget_total_seconds,
+        // Extending moves the near-timeout line past "used", so a slow flag clears to ok.
+        health: wasSlow ? "ok" : run.health,
+        health_reason: wasSlow ? null : run.health_reason,
+        health_since: wasSlow ? null : run.health_since,
+      });
+      appendMessage(runId, "status", null, {
+        text: `extended by ${secs}s — new total extension ${newExt}s`,
+      });
+      return null;
+    }
     default: {
       // Exhaustiveness guard — see the header. If this line stops compiling, a new
       // RunInputKind was added and this switch must learn it; do NOT widen the type
