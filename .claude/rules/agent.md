@@ -46,6 +46,13 @@ cd agent && node --import tsx --test --test-timeout=120000 test/worker.test.ts  
 
 - It prints `ℹ fail 0` while tests are failing, when they fail by TIMEOUT: the failures surface under `✖ failing tests:` and go uncounted in the tally, while `$?` is 1 throughout. Read the exit code and the named failing tests, never a bare tally. Mirror image of the `PASS=0` trap in `.claude/rules/go.md`.
 
+## macOS: the Codex M4 P layer runs in a Linux container
+
+- The M4 P-layer conformance tests (`e2e/codex-m4/{startup-smoke,policy-real,native-bypass}.test.ts`) drive the pinned Linux `codex` binary, so they cannot run natively on macOS.
+- On macOS, `task gate:agent` / `task test:codex-m4` auto-route that P leg through a pinned Linux container (a `platforms: [darwin]` command running `e2e/codex-m4/run-macos-linux.ts`); the U-layer tests still run natively. `task test:codex-m4:macos` is the standalone maintainer entry for the same container path.
+- Prerequisite: a working Docker on the macOS host. Missing Docker, an unsupported architecture, or an unexpected `/etc/codex` is a hard failure (loud throw), never a silent platform skip.
+- On Linux (the worker/CI) nothing changes: the P files run natively in the single `test:codex-m4` invocation.
+
 ## Worker runtime
 
 - The guardrail DENIES reading the process environment (bare `env`), the process table (`ps` / `pgrep`) and `/proc` — `agent/src/guardrails.ts`, `REASON_ENV` / `REASON_PS` / `REASON_PROC` — because they leak the worker's join token. A trace that burned a retry on a denied read is showing the environment, not a broken tool.

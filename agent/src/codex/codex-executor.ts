@@ -1058,7 +1058,22 @@ export class CodexExecutor implements Executor {
         boundaryDeadlineMs,
         childTurnDeadlineMs: this.deps.childTurnDeadlineMs ?? DEFAULT_CHILD_TURN_DEADLINE_MS,
         commandEnv,
-        screenPolicy: { dockerWired: false },
+        // D6 (PRD #1287, user-approved 2026-09-12): carry the trusted provider-HOME prefix into
+        // the shell/file screener so a literal read of a provider-owned credential file UNDER
+        // codex-data/ is DENIED before the command launcher, not left to OS containment. The
+        // absence of CODEX_HOME from the command env does NOT protect a known absolute path, so
+        // the prefix is what closes the literal-resolved-path form. `homeRoot/codex-data/` is a
+        // STATIC parent of every `epoch-*/codex` owned HOME (startProviderEpoch, below), so the
+        // trailing-separator prefix survives epoch recreation and reaches child turns via this
+        // same object threaded through delegation.ts — no per-epoch rebuild is needed.
+        //
+        // KNOWN bare-directory boundary: the trailing `path.sep` guards the credential FILES under
+        // codex-data/; a reference to the bare directory string with NO trailing separator is
+        // intentionally not matched (it discloses no secret) and policy is not widened to catch
+        // it. The provision root (dirname(homeRoot)/provision) and codex-session-store are
+        // deliberately NOT added, and no `$CODEX_HOME` literal is used (D6 forbids paths derived
+        // from model arguments).
+        screenPolicy: { dockerWired: false, extraSecretPaths: [path.join(this.homeRoot, "codex-data") + path.sep] },
         toolHandlers,
         registerToken,
         committedGeneration,

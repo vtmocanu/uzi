@@ -1,0 +1,28 @@
+{
+  "//": "PRD #1287 C1 — typecheck the M4 conformance subsystem (clause registry,",
+  "//1": "completeness/receipts/provisioner/macOS-runner helpers, and the real-binary P",
+  "//2": "startup smoke). Cloned from e2e/codex-m3b/tsconfig.json (NodeNext, strict,",
+  "//3": "skipLibCheck, types node) so the '../../agent/src/...' NodeNext specifiers the",
+  "//4": "type-only bridges use resolve exactly as the agent module compiles them.",
+  "//5": "typeRoots points at the agent module's @types because this directory has no",
+  "//6": "node_modules of its own; harness-m0.d.ts supplies the ambient types for the frozen",
+  "//7": "'../codex-m0/harness.mjs' pure helpers the loopback fake reuses.",
+  "//8": "include is a GLOB (*.ts) so C2/C3 contribution/test files need no tsconfig edit.",
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2024"],
+    "typeRoots": ["../../agent/node_modules/@types"],
+    "types": ["node"],
+    "strict": true,
+    "noEmit": true,
+    "allowJs": false,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "forceConsistentCasingInFileNames": true
+  },
+  "include": ["*.ts"],
+  "exclude": ["node_modules", ".bin", ".codex-cache", ".evidence"]
+}

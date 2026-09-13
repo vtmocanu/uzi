@@ -2036,6 +2036,11 @@ tasks:
       # The unit is the lesson, not the number: under node's per-file cap a large
       # test file is a serialization point that no timeout value fixes.
       - npm test
+      # PRD 1287 C1 / D7 point 5: the strict Codex M4 conformance contract + the REAL-binary P
+      # startup smoke, run as a MANDATORY serial second step here (never from gate:agent directly)
+      # so gate:agent and existing Linux CI exercise the P layer EXACTLY ONCE per unchanged tree.
+      # C5 tightens the completeness matrix; it does NOT add another invocation.
+      - task: test:codex-m4
 
   test:codex-m0:
     desc: Opt-in credential-free Codex 0.153.2 app-server characterization
@@ -2207,14 +2212,33 @@ tasks:
     # target). The individual unit files still run in node's DEFAULT PARALLEL mode.
     dir: agent
     cmds:
-      # Includes the e2e/codex-m3b Block-A lifecycle proof (host-side, injected fakes, no
-      # Docker): its canary-absence security assertions run IN this gate; Block B (the real
-      # image path) self-skips unless CODEX_M3B_PACKAGED=1 (set only by run-lifecycle.sh).
-      - node --import tsx --test --test-timeout=120000 test/codex-registry.test.ts test/codex-safety.test.ts test/codex-transport.test.ts test/runner-uid.test.ts test/codex-broker.test.ts test/codex-render.test.ts test/codex-harness.test.ts test/codex-advice-harness.test.ts test/codex-select.test.ts test/codex-session-state.test.ts test/codex-config.test.ts test/codex-launcher.test.ts test/codex-terminal-normalize.test.ts test/codex-delegation.test.ts test/codex-fileop-client.test.ts test/codex-run-builder.test.ts test/codex-render-mutation.test.ts test/codex-executor.test.ts test/codex-command-root-linux.test.ts test/runner-codex-sinks.test.ts ../e2e/codex-m3b/lifecycle.test.ts
+      # The agent-side Codex adapter UNIT/state bundle (default node parallel mode).
+      - node --import tsx --test --test-timeout=120000 test/codex-registry.test.ts test/codex-safety.test.ts test/codex-transport.test.ts test/runner-uid.test.ts test/codex-broker.test.ts test/codex-render.test.ts test/codex-harness.test.ts test/codex-advice-harness.test.ts test/codex-select.test.ts test/codex-session-state.test.ts test/codex-config.test.ts test/codex-launcher.test.ts test/codex-terminal-normalize.test.ts test/codex-delegation.test.ts test/codex-fileop-client.test.ts test/codex-run-builder.test.ts test/codex-render-mutation.test.ts test/codex-executor.test.ts test/codex-command-root-linux.test.ts test/runner-codex-sinks.test.ts
+      # The Block-A host-side lifecycle proof, FACTORED into test:codex-m3b:host (PRD #1287 C4 §4)
+      # so C4's gate can invoke that host-only target directly without rerunning this whole
+      # aggregate. Its canary-absence security assertions run IN this gate; Block B (the real image
+      # path) self-skips unless CODEX_M3B_PACKAGED=1 (set only by run-lifecycle.sh). The aggregate's
+      # coverage is unchanged in sum: the same lifecycle.test.ts cases, now via the delegate.
+      - task: test:codex-m3b:host
       # The both-image packaged proof. Its host tsc leg ALWAYS runs (cheap, host-only);
       # its docker leg is OPT-IN (UZI_CODEX_M3B_PACKAGED=1) so this aggregate stays green
       # in an environment without a docker daemon / with storage-flaky image builds.
       - task: test:codex-m3b:packaged
+
+  test:codex-m3b:host:
+    desc: PRD 1287 C4 - the Block-A host-side Codex lifecycle proof ONLY (injected fakes, no Docker)
+    # The Block-A host-side lifecycle proof factored out of test:codex-m3b's inline bundle (PRD
+    # #1287 C4 §4) so C4's gate can invoke JUST this host-only target instead of rerunning the
+    # whole m3b aggregate (whose agent unit files gate:agent already covers). This runs ONLY
+    # e2e/codex-m3b/lifecycle.test.ts: the host-side Block A (injected fakes, no Docker) whose
+    # credential/capability canary-absence security assertions execute in-process. Block B (the
+    # real packaged image path) SELF-SKIPS unless CODEX_M3B_PACKAGED=1 (set only by
+    # run-lifecycle.sh), so it never builds an image or needs a docker daemon here. Runs from
+    # `dir: agent` so tsx + the SDK deps resolve out of agent/node_modules, matching test:codex-m3b.
+    # Do NOT copy the Block-A recipe elsewhere: test:codex-m3b delegates to THIS target.
+    dir: agent
+    cmds:
+      - node --import tsx --test --test-timeout=120000 ../e2e/codex-m3b/lifecycle.test.ts
 
   test:codex-m3b:packaged:
     desc: Opt-in both-image packaged proof of the DARK CodexExecutor lifecycle (PRD 1171 m5)
@@ -2256,6 +2280,122 @@ tasks:
           UZI_M3B_DOCKERFILE="agent/templates/${template}/Dockerfile" \
             ../e2e/codex-m3b/run-lifecycle.sh
         done
+
+  test:codex-m4:
+    desc: PRD 1287 C5 - strict Codex/Claude M4 conformance gate (claude/U + codex/U + codex/P)
+    # The M4 conformance subsystem (e2e/codex-m4): the machine-readable clause registry, the strict
+    # completeness checker, the map/receipts/provisioner/macOS-runner helpers, and the complete REAL
+    # pinned Codex app-server P suite.
+    #
+    # No longer C1-only: C5 tightens the required matrix (run-completeness.ts REQUIRED_MATRIX_C5) to
+    # the full required U/P set and folds in the Claude preservation (C2) + D6 HOME-screening (C3)
+    # conformance evidence, so the strict completeness gate covers claude/U + codex/U + codex/P in ONE
+    # place. Those four agent/test conformance files ALSO run under `npm test`; re-running them here is
+    # a small, correct redundancy (they are fast, no app-server, and idempotent) that lets this target
+    # assemble ALL required U/P evidence whether it is invoked standalone or via the full gate. They
+    # append the SAME {title,result} JSONL (agent/test/conformance-evidence.ts, format-compatible with
+    # e2e/codex-m4/evidence.ts) keyed on the exact test title, which run-completeness.ts matches to the
+    # clause `tests` entries. O rows are NOT enforced here; check:codex-m4-receipts is their gate (D8).
+    #
+    # dir: agent so tsx + tsc + the SDK deps resolve out of agent/node_modules and the smoke loads
+    # the adapter modules from agent/src (packaged-modules.ts CODEX_M4_SRC fallback), matching
+    # test:codex-m3b's host resolution. The four agent conformance files run from the same dir, so
+    # their paths are test/*.test.ts alongside the ../e2e/codex-m4/*.test.ts glob.
+    #
+    # --test-concurrency=1 + --test-timeout=120000 (D7 point 4): the P smoke drives ONE real codex
+    # app-server serially and the timeout bounds a hang, so a wedged binary fails LOUDLY rather than
+    # hanging the gate. The tsc leg runs FIRST so a src-shape drift fails here, not only at runtime.
+    # run-completeness.ts runs LAST, after the tests have appended their executed-test evidence to
+    # CODEX_M4_EVIDENCE, so completeness is enforced on the ACTUAL run results (D3), never a
+    # hard-coded success list. The evidence file is UNIQUE PER INVOCATION (see the vars: block
+    # below): two concurrent `task test:codex-m4` runs - or the native leg and the macOS container
+    # leg it spawns - never share one `.evidence/current.jsonl` and so cannot clobber each other's
+    # evidence; the file is created empty at the start of THIS run so stale evidence cannot mask a
+    # regression, and removed on success. This target is a MANDATORY serial second step of
+    # test:agent (below), so gate:agent and CI exercise P exactly once (D7 point 5) - do NOT also
+    # call it from gate:agent.
+    dir: agent
+    vars:
+      # TASK-scoped, NOT a root var: this `sh:` runs ONLY when this target runs, never on a bare
+      # `task --list` or an unrelated target, so it does not trip header ban 4 (dynamic ROOT vars).
+      # A UNIQUE per-invocation evidence file: `$$` is the sh PID, distinct across concurrent
+      # `task test:codex-m4` processes, so two runs (or the native leg and the macOS container leg
+      # it spawns) never share `.evidence/current.jsonl`. Portable (echo + $$; no mktemp-suffix or
+      # `date +%N` BSD-vs-GNU traps). Absolute via --show-toplevel so both the node legs (dir:
+      # agent) and the macOS runner's host->container mount resolve it unambiguously.
+      EVIDENCE:
+        sh: echo "$(git rev-parse --show-toplevel)/e2e/codex-m4/.evidence/run-$$.jsonl"
+    env:
+      # Quoted template into the process ENV (NOT a `sh -c` splice, so the splicing ban does not
+      # apply), so every leg - the native tests, the macOS container runner, run-completeness.ts -
+      # reads the SAME per-invocation file.
+      CODEX_M4_EVIDENCE: "{{.EVIDENCE}}"
+    cmds:
+      - ./node_modules/.bin/tsc --noEmit -p ../e2e/codex-m4/tsconfig.json
+      - mkdir -p "$(dirname "$CODEX_M4_EVIDENCE")"
+      - rm -f "$CODEX_M4_EVIDENCE"                       # only THIS invocation's file
+      - node --import tsx --test --test-concurrency=1 --test-timeout=120000 test/claude-conformance-advice-ceiling.test.ts test/claude-conformance-invariant-mappings.test.ts test/claude-conformance-reducer.test.ts test/codex-home-screening.test.ts ../e2e/codex-m4/*.test.ts
+      # macOS/non-Linux: the Linux-only P leg cannot run a Linux-musl codex binary natively (the P
+      # files self-route to a skip there via p-platform.ts). Route it through the pinned Linux
+      # container, which reads CODEX_M4_EVIDENCE from the env and appends the codex/P evidence to the
+      # SAME per-invocation host file the native U run wrote, so run-completeness below sees the full
+      # merged matrix. On Linux this cmd is a no-op (platforms filter). Missing Docker / unsupported
+      # arch / a missing CODEX_M4_EVIDENCE fail LOUDLY (D7 point 3).
+      - platforms: [darwin]
+        cmd: node --import tsx ../e2e/codex-m4/run-macos-linux.ts
+      - node --import tsx ../e2e/codex-m4/run-completeness.ts
+      - rm -f "$CODEX_M4_EVIDENCE"                       # best-effort cleanup of THIS run's file (gitignored; left in place if a prior cmd failed, for debugging)
+
+  check:codex-m4-receipts:
+    desc: PRD 1287 - LEAD merge gate; certifies the candidate's O-layer packaged proofs (D8)
+    # The SEPARATE O-receipt merge gate (D8), redesigned to have a FIXED POINT. Deliberately NOT
+    # folded into gate:agent / test:codex-m4 - the worker cannot run packaged O proofs or supply the
+    # manifest, so none of its categories may redden the WORKER's ordinary gate, only the lead's
+    # pre-merge check. With NO manifest supplied (the default at this revision, intentional - no
+    # `env:` block here) it fails closed as "manifest absent" and lists every committed O clause.
+    #
+    # It reads a TRUSTED, out-of-band, GITIGNORED candidate manifest (receipt-manifest.json; schema
+    # template: e2e/codex-m4/receipt-manifest.example.json) that pins a `provenBaseCommit` + the two
+    # proven image digests + one discharging record per committed O clause. It certifies the current
+    # candidate iff (a) the proven base is an ANCESTOR of the candidate AND (b) the
+    # provenBaseCommit..candidate tail is EVIDENCE-ONLY (touches no shipped guardrail-runtime path).
+    # It fails closed on: manifest absent/malformed/invalid-image, base-not-ancestor, any
+    # runtime-affecting or unclassified tail drift, and any O clause that is missing / has an extra /
+    # duplicate / undischarged / mismatched / swapped / disposition-mismatched record. Because the
+    # manifest is gitignored, recording it makes NO commit, so it cannot invalidate the candidate it
+    # certifies - the lead can reuse an already-successful packaged proof (its provenBaseCommit) after
+    # evidence-only commits land on top, with no circular commit. See e2e/codex-m4/MAINTAINER-HANDOFF.md.
+    # Reproducible lead invocation (mind `dir: agent`; CODEX_M4_CANDIDATE_COMMIT defaults to HEAD):
+    #   CODEX_M4_RECEIPT_MANIFEST="$(git rev-parse --show-toplevel)/e2e/codex-m4/receipt-manifest.json" \
+    #     CODEX_M4_CANDIDATE_COMMIT=$(git rev-parse HEAD) \
+    #     task check:codex-m4-receipts
+    dir: agent
+    cmds:
+      - node --import tsx ../e2e/codex-m4/run-receipts.ts
+
+  test:codex-m4:macos:
+    desc: PRD 1287 D7 point 3 - run the strict Codex M4 P suite inside the pinned Linux container (macOS/maintainer path)
+    dir: agent
+    # The PRD-approved macOS acceptance path, reproducibly callable. Runs run-macos-linux.ts, which
+    # HARD-FAILS on missing Docker / unsupported architecture / unexpected /etc/codex (never a
+    # platform skip), provisions deps + the lock-verified codex package into disposable volumes, then
+    # runs the strict, offline, --network=none P suite. gate:agent/test:codex-m4 auto-route the P leg
+    # through this same builder on macOS; this target is the standalone maintainer entry.
+    vars:
+      # Same TASK-scoped unique-per-invocation evidence file as test:codex-m4 (NOT a root var; see
+      # that target's note). run-macos-linux.ts now HARD-FAILS on a missing CODEX_M4_EVIDENCE, so this
+      # standalone maintainer entry must supply one too. Here the container writes the codex/P evidence
+      # to its own per-run file (this target does not run run-completeness; it is the reproducible P
+      # smoke), so a maintainer running it alongside test:codex-m4 never clobbers that run's evidence.
+      EVIDENCE:
+        sh: echo "$(git rev-parse --show-toplevel)/e2e/codex-m4/.evidence/run-macos-$$.jsonl"
+    env:
+      CODEX_M4_EVIDENCE: "{{.EVIDENCE}}"
+    cmds:
+      - mkdir -p "$(dirname "$CODEX_M4_EVIDENCE")"
+      - rm -f "$CODEX_M4_EVIDENCE"
+      - node --import tsx ../e2e/codex-m4/run-macos-linux.ts
+      - rm -f "$CODEX_M4_EVIDENCE"                       # best-effort cleanup of THIS run's file (gitignored; left in place if the run failed, for debugging), matching test:codex-m4
 
   test:harness-m2:
     desc: Opt-in credential-free M2 neutral-harness-seam differential tests (PRD 1146 m4)

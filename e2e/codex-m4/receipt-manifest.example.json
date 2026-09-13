@@ -1,0 +1,13 @@
+{
+  "provenBaseCommit": "0000000000000000000000000000000000000000",
+  "images": {
+    "base": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "jvm": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "provenance": "EXAMPLE ONLY — replace with the real UZI_CODEX_M3B_PACKAGED=1 task test:codex-m3b:packaged proof for provenBaseCommit (both merge-candidate images, runtime, date, CI run URL)",
+  "clauses": [
+    { "id": "codex-o-command-root-home-denial", "disposition": "inherited", "images": { "base": "sha256:0000000000000000000000000000000000000000000000000000000000000000", "jvm": "sha256:0000000000000000000000000000000000000000000000000000000000000000" }, "provenance": "EXAMPLE — unchanged mechanism inherited from e2e/codex-m3b Block B" },
+    { "id": "codex-o-descendant-code-mode-host-absence", "disposition": "receipt-present", "images": { "base": "sha256:0000000000000000000000000000000000000000000000000000000000000000", "jvm": "sha256:0000000000000000000000000000000000000000000000000000000000000000" }, "provenance": "EXAMPLE — fresh packaged snapshot below the real supervisor" },
+    { "id": "codex-o-packaged-descendant-reaping", "disposition": "receipt-present", "images": { "base": "sha256:0000000000000000000000000000000000000000000000000000000000000000", "jvm": "sha256:0000000000000000000000000000000000000000000000000000000000000000" }, "provenance": "EXAMPLE — fresh packaged snapshot below the real supervisor" }
+  ]
+}
