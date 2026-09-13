@@ -19,12 +19,16 @@ import path from "node:path";
 import { bashArgCanary, dummyCredential, scriptedStepsResponder } from "./fake-provider.js";
 import { loadProtocolModules, runProtocolTurn, P_SUITE_DEADLINE_MS, type ProtocolModules } from "./harness-p.js";
 import { recordEvidence } from "./evidence.js";
+import { P_LAYER_SKIP } from "./p-platform.js";
 import { CODEX_P_SHELL_POLICY_TITLE, CODEX_P_FILE_POLICY_TITLE } from "./titles-c3.js";
 
 import type { RunGrants, SpawnCommandSeam, FileopClient, FileopRequest } from "../../agent/src/codex/broker.js";
 
 let mods: ProtocolModules;
 before(async () => {
+  // node:test runs before() even when all tests skip; on a non-Linux host route to the container
+  // (P_LAYER_SKIP) and do NO load/resolve work here.
+  if (P_LAYER_SKIP !== false) return;
   mods = await loadProtocolModules();
 });
 
@@ -43,7 +47,7 @@ function leadGrants(): RunGrants {
   };
 }
 
-test(CODEX_P_SHELL_POLICY_TITLE, async (t) => {
+test(CODEX_P_SHELL_POLICY_TITLE, { skip: P_LAYER_SKIP }, async (t) => {
   const credential = dummyCredential();
   const bashArg = bashArgCanary();
   const spawnCalls: { argv: readonly string[] }[] = [];
@@ -88,7 +92,7 @@ test(CODEX_P_SHELL_POLICY_TITLE, async (t) => {
   recordEvidence(CODEX_P_SHELL_POLICY_TITLE, "pass");
 });
 
-test(CODEX_P_FILE_POLICY_TITLE, async (t) => {
+test(CODEX_P_FILE_POLICY_TITLE, { skip: P_LAYER_SKIP }, async (t) => {
   const credential = dummyCredential();
   const fileopOps: FileopRequest[] = [];
   const fileop: FileopClient = {

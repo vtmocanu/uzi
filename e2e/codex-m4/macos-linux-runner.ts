@@ -42,6 +42,14 @@ export const MACOS_LINUX_RUNNER_REF = `${MACOS_LINUX_RUNNER_IMAGE}@${MACOS_LINUX
 /** An unprivileged default (node:bookworm ships the `node` user at uid 1000). */
 const DEFAULT_USER = "1000:1000";
 
+/** The strict P-layer suite (real-binary protocol tests). Single source of truth for the execute
+ *  argv AND the maintainer's macOS container run. */
+export const STRICT_P_SUITE: readonly string[] = [
+  "startup-smoke.test.ts",
+  "policy-real.test.ts",
+  "native-bypass.test.ts",
+];
+
 /** Where the disposable codex volume is provisioned and, read-only, mounted for EXECUTE. It
  *  matches resolveCodexBin's DEFAULT_IMAGE_ROOT so the existing image-baked branch resolves the
  *  package offline (install-codex.sh writes to ${UZI_CODEX_PREFIX}/<version>). */
@@ -119,9 +127,15 @@ export function buildMacosLinuxRunPlan(opts: MacosLinuxRunOptions): MacosLinuxRu
     ...baseArgs(opts.arch, user),
     // External network disabled during tests (D7 point 3).
     "--network=none",
+    // Point the P suite's recordEvidence at the mounted host evidence file so the container's
+    // codex/P evidence lands on the HOST alongside the native U run's (run-completeness merges them).
+    "-e", "CODEX_M4_EVIDENCE=/work/e2e/codex-m4/.evidence/current.jsonl",
     // Test inputs read-only; the prepared Linux deps volume mounted read-only.
     "-v", `${opts.agentDir}:/work/agent:ro`,
     "-v", `${opts.e2eDir}:/work/e2e:ro`,
+    // A nested READ-WRITE mount over the read-only e2e parent (docker layers the more-specific
+    // path as writable) so recordEvidence can append the P evidence to the HOST .evidence file.
+    "-v", `${opts.e2eDir}/codex-m4/.evidence:/work/e2e/codex-m4/.evidence`,
     "-v", `${opts.depsVolume}:/work/agent/node_modules:ro`,
     // The provisioned codex volume mounted READ-ONLY at the image-baked prefix root, so
     // resolveCodexBin's existing image-baked branch finds /opt/uzi-codex/<version>/bin/codex
@@ -129,9 +143,10 @@ export function buildMacosLinuxRunPlan(opts: MacosLinuxRunOptions): MacosLinuxRu
     "-v", `${opts.codexVolume}:${CODEX_PREFIX_MOUNT}:ro`,
     "-w", "/work/agent",
     MACOS_LINUX_RUNNER_REF,
-    // The strict, serial, bounded P suite (mirrors test:codex-m4's node invocation).
+    // The strict, serial, bounded P suite: all three P files (mirrors test:codex-m4's node
+    // invocation), writing evidence to the host via the read-write .evidence mount above.
     "node", "--import", "tsx", "--test", "--test-concurrency=1", "--test-timeout=120000",
-    "../e2e/codex-m4/startup-smoke.test.ts",
+    ...STRICT_P_SUITE.map((f) => `../e2e/codex-m4/${f}`),
   ];
   return { prep, prepCodex, execute };
 }
@@ -160,4 +175,51 @@ export function assertPrerequisites(env: MacosLinuxPrereqEnv): Arch {
     throw new Error("macOS Linux-container runner refuses to run with an unexpected /etc/codex present");
   }
   return arch;
+}
+
+/** Injectable seams so the worker can unit-test the orchestrator without a real macOS/docker run. */
+export interface MacosLinuxExecDeps {
+  readonly whichDocker: () => string | undefined;
+  readonly nodeArch: string;
+  readonly etcCodexPresent: boolean;
+  readonly agentDir: string;
+  readonly e2eDir: string;
+  readonly depsVolume?: string;
+  readonly codexVolume?: string;
+  readonly user?: string;
+  /** Run one docker stage argv; returns its exit code (0 = ok). */
+  readonly runStage: (argv: readonly string[]) => number;
+  readonly log?: (message: string) => void;
+}
+
+/**
+ * Prereq-gate (HARD-FAIL on missing docker / unsupported arch / unexpected /etc/codex via
+ * {@link assertPrerequisites}), build the plan, then run prep → prepCodex → execute in order,
+ * throwing on the first non-zero stage. Pure orchestration over injected seams; the entry
+ * (run-macos-linux.ts) wires the real docker/child_process seams.
+ */
+export function executeMacosLinuxRun(deps: MacosLinuxExecDeps): void {
+  const arch = assertPrerequisites({
+    dockerPath: deps.whichDocker(),
+    nodeArch: deps.nodeArch,
+    etcCodexPresent: deps.etcCodexPresent,
+  });
+  const plan = buildMacosLinuxRunPlan({
+    arch,
+    agentDir: deps.agentDir,
+    e2eDir: deps.e2eDir,
+    depsVolume: deps.depsVolume ?? "uzi-codex-m4-deps",
+    codexVolume: deps.codexVolume ?? "uzi-codex-m4-codex",
+    user: deps.user,
+  });
+  const stages: readonly [string, readonly string[]][] = [
+    ["prep (npm ci)", plan.prep],
+    ["prepCodex (install-codex.sh)", plan.prepCodex],
+    ["execute (strict P suite)", plan.execute],
+  ];
+  for (const [name, argv] of stages) {
+    deps.log?.(`[codex-m4 macos] ${name}: ${argv.join(" ")}`);
+    const code = deps.runStage(argv);
+    if (code !== 0) throw new Error(`macOS Linux-container stage "${name}" exited ${code}`);
+  }
 }

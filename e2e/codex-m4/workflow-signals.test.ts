@@ -94,6 +94,20 @@ describe("codex U workflow signals + callback identity (real broker / registry)"
     if (!changed.ok) assert.equal(changed.code, "changed_reuse", "the changed reuse poisons the epoch");
     assert.equal(forge.spawn.calls.length, 1, "NEGATIVE ORACLE: the forged reuse ran NO second effect");
 
+    // Sticky poison: the epoch stays poisoned after a changed-reuse forgery (registry.ts poison() is
+    // never cleared), and admission is now CLOSED — a later, otherwise-VALID callback (fresh id,
+    // root origin, well-formed) is refused `admission_closed` and runs NO effect.
+    assert.equal(forge.registry.isPoisoned(), true, "changed reuse permanently poisons the epoch");
+    const afterPoison = await forge.broker.handleToolCall(
+      { threadId: "th-1", turnId: "tn-1", callId: "c-after-poison" },
+      "Bash",
+      { command: "echo valid" },
+      "root",
+    );
+    assert.equal(afterPoison.ok, false, "a later valid callback is refused once the epoch is poisoned");
+    if (!afterPoison.ok) assert.equal(afterPoison.code, "admission_closed", "poison closes admission to new callbacks");
+    assert.equal(forge.spawn.calls.length, 1, "NEGATIVE ORACLE: the later valid callback ran NO effect");
+
     recordEvidence(CODEX_U_SIGNAL_REPLAY_TITLE, "pass");
   });
 });

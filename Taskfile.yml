@@ -2280,6 +2280,13 @@ tasks:
       - mkdir -p ../e2e/codex-m4/.evidence
       - rm -f ../e2e/codex-m4/.evidence/current.jsonl
       - node --import tsx --test --test-concurrency=1 --test-timeout=120000 test/claude-conformance-advice-ceiling.test.ts test/claude-conformance-invariant-mappings.test.ts test/claude-conformance-reducer.test.ts test/codex-home-screening.test.ts ../e2e/codex-m4/*.test.ts
+      # macOS/non-Linux: the Linux-only P leg cannot run a Linux-musl codex binary natively (the P
+      # files self-route to a skip there via p-platform.ts). Route it through the pinned Linux
+      # container, which appends the codex/P evidence to the SAME ../e2e/codex-m4/.evidence file the
+      # native U run wrote, so run-completeness below sees the full merged matrix. On Linux this cmd
+      # is a no-op (platforms filter). Missing Docker / unsupported arch fail LOUDLY (D7 point 3).
+      - platforms: [darwin]
+        cmd: node --import tsx ../e2e/codex-m4/run-macos-linux.ts
       - node --import tsx ../e2e/codex-m4/run-completeness.ts
 
   check:codex-m4-receipts:
@@ -2292,6 +2299,17 @@ tasks:
     dir: agent
     cmds:
       - node --import tsx ../e2e/codex-m4/run-receipts.ts
+
+  test:codex-m4:macos:
+    desc: PRD 1287 D7 point 3 - run the strict Codex M4 P suite inside the pinned Linux container (macOS/maintainer path)
+    dir: agent
+    # The PRD-approved macOS acceptance path, reproducibly callable. Runs run-macos-linux.ts, which
+    # HARD-FAILS on missing Docker / unsupported architecture / unexpected /etc/codex (never a
+    # platform skip), provisions deps + the lock-verified codex package into disposable volumes, then
+    # runs the strict, offline, --network=none P suite. gate:agent/test:codex-m4 auto-route the P leg
+    # through this same builder on macOS; this target is the standalone maintainer entry.
+    cmds:
+      - node --import tsx ../e2e/codex-m4/run-macos-linux.ts
 
   test:harness-m2:
     desc: Opt-in credential-free M2 neutral-harness-seam differential tests (PRD 1146 m4)

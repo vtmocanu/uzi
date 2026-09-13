@@ -13,6 +13,8 @@ import {
   MACOS_LINUX_RUNNER_REF,
   assertPrerequisites,
   buildMacosLinuxRunPlan,
+  executeMacosLinuxRun,
+  type MacosLinuxExecDeps,
   type MacosLinuxRunOptions,
 } from "./macos-linux-runner.js";
 import { CodexProvisionError } from "./provision.js";
@@ -114,6 +116,85 @@ describe("buildMacosLinuxRunPlan argv invariants", () => {
     assert.ok(!joined.includes("docker.sock"), "execute mounts no docker socket");
     assert.ok(!plan.execute.some((a) => a.includes(":/root")), "execute mounts no HOME/root");
     assert.ok(!plan.execute.some((a) => a.includes(":/home/")), "execute mounts no HOME");
+  });
+
+  it("execute runs the complete strict P suite (all three P files)", () => {
+    for (const f of ["startup-smoke.test.ts", "policy-real.test.ts", "native-bypass.test.ts"]) {
+      assert.ok(
+        plan.execute.includes(`../e2e/codex-m4/${f}`),
+        `execute runs ${f}`,
+      );
+    }
+  });
+  it("execute writes codex/P evidence to the host (env + read-write .evidence mount)", () => {
+    assert.ok(
+      plan.execute.includes("CODEX_M4_EVIDENCE=/work/e2e/codex-m4/.evidence/current.jsonl"),
+      "execute points CODEX_M4_EVIDENCE at the mounted host evidence file",
+    );
+    assert.ok(
+      plan.execute.some((a) => a === `${OPTS.e2eDir}/codex-m4/.evidence:/work/e2e/codex-m4/.evidence`),
+      "execute mounts the host .evidence dir read-WRITE so recordEvidence reaches the host file",
+    );
+  });
+});
+
+describe("executeMacosLinuxRun orchestration", () => {
+  /** Build injectable deps with a recording runStage over the healthy-host defaults. */
+  function makeDeps(overrides: Partial<MacosLinuxExecDeps> = {}): {
+    deps: MacosLinuxExecDeps;
+    argvs: (readonly string[])[];
+  } {
+    const argvs: (readonly string[])[] = [];
+    const deps: MacosLinuxExecDeps = {
+      whichDocker: () => "docker",
+      nodeArch: "arm64",
+      etcCodexPresent: false,
+      agentDir: OPTS.agentDir,
+      e2eDir: OPTS.e2eDir,
+      runStage: (argv) => {
+        argvs.push(argv);
+        return 0;
+      },
+      ...overrides,
+    };
+    return { deps, argvs };
+  }
+
+  it("runs prep → prepCodex → execute in order, each a docker invocation", () => {
+    const { deps, argvs } = makeDeps();
+    executeMacosLinuxRun(deps);
+    assert.equal(argvs.length, 3, "three stages ran");
+    for (const argv of argvs) assert.equal(argv[0], "docker", "each stage is a docker invocation");
+    assert.ok(!argvs[0].includes("--network=none"), "stage 1 (prep) is not the offline stage");
+    assert.ok(!argvs[1].includes("--network=none"), "stage 2 (prepCodex) is not the offline stage");
+    assert.ok(argvs[2].includes("--network=none"), "stage 3 is the offline execute stage");
+  });
+
+  it("hard-fails when docker is missing (before running any stage)", () => {
+    const { deps, argvs } = makeDeps({ whichDocker: () => undefined });
+    assert.throws(() => executeMacosLinuxRun(deps), /requires docker/);
+    assert.equal(argvs.length, 0, "no stage ran on the prereq failure");
+  });
+
+  it("hard-fails on an unsupported architecture (before running any stage)", () => {
+    const { deps, argvs } = makeDeps({ nodeArch: "ia32" });
+    assert.throws(() => executeMacosLinuxRun(deps), CodexProvisionError);
+    assert.equal(argvs.length, 0, "no stage ran on the prereq failure");
+  });
+
+  it("throws on the first non-zero stage and does NOT run the execute stage", () => {
+    let call = 0;
+    const argvs: (readonly string[])[] = [];
+    const { deps } = makeDeps({
+      runStage: (argv) => {
+        argvs.push(argv);
+        call += 1;
+        return call === 2 ? 1 : 0; // prepCodex fails
+      },
+    });
+    assert.throws(() => executeMacosLinuxRun(deps), /exited 1/);
+    assert.equal(argvs.length, 2, "stopped after the failing prepCodex stage");
+    assert.ok(!argvs.some((a) => a.includes("--network=none")), "the offline execute stage never ran");
   });
 });
 

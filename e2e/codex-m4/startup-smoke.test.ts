@@ -38,6 +38,7 @@ import {
 } from "./fake-provider.js";
 import { resolveCodexBin } from "./provision.js";
 import { recordEvidence } from "./evidence.js";
+import { P_LAYER_SKIP } from "./p-platform.js";
 import { CODEX_STARTUP_SMOKE_TITLE } from "./titles.js";
 import {
   loadPackagedLauncher,
@@ -85,6 +86,9 @@ let ExecutionRegistry: RegistryModule["ExecutionRegistry"];
 let newLocalExecutionEpoch: RegistryModule["newLocalExecutionEpoch"];
 
 before(async () => {
+  // node:test runs before() even when all tests skip; on a non-Linux host route to the container
+  // (P_LAYER_SKIP) and do NO load/resolve work here.
+  if (P_LAYER_SKIP !== false) return;
   const launcher = await loadPackagedLauncher();
   launchCodexRoot = launcher.launchCodexRoot;
   SUPERVISOR_BIN = launcher.SUPERVISOR_BIN;
@@ -215,7 +219,7 @@ const fakeRemoveRunnerTree: RemoveRunnerTree = (request) => {
   rmSync(request.root, { recursive: true, force: true });
 };
 
-test(CODEX_STARTUP_SMOKE_TITLE, async (t) => {
+test(CODEX_STARTUP_SMOKE_TITLE, { skip: P_LAYER_SKIP }, async (t) => {
   const startedAt = Date.now();
 
   // 1. Resolve the real pinned binary (image-baked on this worker; else a rootless cache install).

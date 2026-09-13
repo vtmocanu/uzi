@@ -38,12 +38,16 @@ import {
 } from "./fake-provider.js";
 import { loadProtocolModules, runProtocolTurn, P_SUITE_DEADLINE_MS, type ProtocolModules } from "./harness-p.js";
 import { recordEvidence } from "./evidence.js";
+import { P_LAYER_SKIP } from "./p-platform.js";
 import { CODEX_P_NATIVE_ABSENT_TITLE, CODEX_P_ISOLATION_ENV_TITLE } from "./titles-c3.js";
 
 import type { RunGrants, SpawnCommandSeam, FileopClient, FileopRequest } from "../../agent/src/codex/broker.js";
 
 let mods: ProtocolModules;
 before(async () => {
+  // node:test runs before() even when all tests skip; on a non-Linux host route to the container
+  // (P_LAYER_SKIP) and do NO load/resolve work here.
+  if (P_LAYER_SKIP !== false) return;
   mods = await loadProtocolModules();
 });
 
@@ -58,7 +62,7 @@ function leadEffectGrants(): RunGrants {
   };
 }
 
-test(CODEX_P_NATIVE_ABSENT_TITLE, async (t) => {
+test(CODEX_P_NATIVE_ABSENT_TITLE, { skip: P_LAYER_SKIP }, async (t) => {
   const credential = dummyCredential();
   const bashArg = bashArgCanary();
 
@@ -174,7 +178,7 @@ test(CODEX_P_NATIVE_ABSENT_TITLE, async (t) => {
   }
 });
 
-test(CODEX_P_ISOLATION_ENV_TITLE, async (t) => {
+test(CODEX_P_ISOLATION_ENV_TITLE, { skip: P_LAYER_SKIP }, async (t) => {
   const credential = dummyCredential();
   const spawnCommand: SpawnCommandSeam = async () => ({ code: 0, stdout: "", stderr: "" });
   const fileop: FileopClient = { op: async () => ({ ok: true }) };
