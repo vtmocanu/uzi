@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { ForeignCaptureBlockedError, GitCache, PendingRecoveryCaptureError, StaleCaptureJournalError } from "../src/git.js";
+import { ForeignCaptureBlockedError, GitCache, PendingRecoveryCaptureError, CapturePathMismatchError } from "../src/git.js";
 import { RunRunner, type ExecutorFactory } from "../src/runner.js";
 import { TransientRecoveryError } from "../src/sdk-executor.js";
 import { skillsPluginDir } from "../src/skills-plugin.js";
@@ -142,13 +142,14 @@ describe("recovery capture retry and restart safety (#1197)", () => {
       },
       "a foreign run cannot adopt or erase retained work",
     );
-    // A DIFFERENT clone key computes a different canonical path, so the journal is
-    // stale-for-this-path: NEVER reclaimable, StaleCaptureJournalError (Case A). The
-    // git layer never probes owner status here.
+    // A DIFFERENT clone key computes a different canonical path: the git layer classifies a
+    // claimant-relative path mismatch (CapturePathMismatchError, Case A) and never probes
+    // owner status here — reclaimability is now decided by the runner's owner validation
+    // (issue #1319), not the git layer.
     await assert.rejects(
       restartedGit.runnerCloneForBranch(bare, `agent/issue-${iid}`, "different-kind-clone", foreign),
       (err: unknown) => {
-        assert.ok(err instanceof StaleCaptureJournalError, "different clone key -> StaleCaptureJournalError");
+        assert.ok(err instanceof CapturePathMismatchError, "different clone key -> CapturePathMismatchError");
         assert.equal(err.journaledPath, worktreeDirFor(iid));
         assert.equal(err.branch, `agent/issue-${iid}`);
         return true;

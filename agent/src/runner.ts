@@ -2847,8 +2847,10 @@ export class RunRunner {
         flight.worktreePath = runnerClone.path;
         flight.branch = runnerClone.branch;
       } else {
-        // Everything else — including StaleCaptureJournalError (never reclaimable) —
-        // propagates and fails the run closed.
+        // Everything else — including CapturePathMismatchError — propagates and fails the
+        // run closed here. M3 (issue #1319) will add a dedicated catch that runs the
+        // authoritative owner-canonical validation for CapturePathMismatchError; until then
+        // it falls through to `throw err` unchanged.
         throw err;
       }
     }

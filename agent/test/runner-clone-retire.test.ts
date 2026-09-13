@@ -4,7 +4,7 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { ForeignCaptureBlockedError, StaleCaptureJournalError } from "../src/git.js";
+import { ForeignCaptureBlockedError, CapturePathMismatchError } from "../src/git.js";
 import { type ExecutorFactory } from "../src/runner.js";
 import { nullLogger } from "./helpers.js";
 import {
@@ -210,7 +210,7 @@ describe("atomic runner-clone release (#1315)", () => {
 
     await assert.rejects(
       git.retireRunnerClone(bare, clonePath, branch, ownerRunId, { discard: false }),
-      StaleCaptureJournalError,
+      CapturePathMismatchError,
       "retire fails closed on a pre-rename pair mismatch",
     );
 
@@ -288,7 +288,7 @@ describe("atomic runner-clone release (#1315)", () => {
 
     await assert.rejects(
       git.retireRunnerClone(bare, outside, branch, ownerRunId, { discard: true }),
-      StaleCaptureJournalError,
+      CapturePathMismatchError,
       "a path outside runnerRoot is never retired, whatever the journal claims",
     );
     assert.equal(fs.existsSync(outside), true, "the out-of-tree path is not moved");
@@ -343,8 +343,8 @@ describe("atomic runner-clone release (#1315)", () => {
 
     assert.equal(ran, false, "the model never starts");
     assert.ok(api.states.some((s) => s.body.status === "failed"), "Case A fails the run closed");
-    assert.equal(ownershipProbes, 0, "the runner NEVER owner-probes on a StaleCaptureJournalError");
-    assert.equal(retireCalls, 0, "the runner NEVER retires on a StaleCaptureJournalError");
+    assert.equal(ownershipProbes, 0, "the runner NEVER owner-probes on a CapturePathMismatchError");
+    assert.equal(retireCalls, 0, "the runner NEVER retires on a CapturePathMismatchError");
     assert.equal(
       fs.readFileSync(path.join(other.path, "OTHER_TREE.txt"), "utf8"),
       "other in-tree bytes\n",
@@ -381,11 +381,11 @@ describe("atomic runner-clone release (#1315)", () => {
       },
       "same-path foreign owner is the reclaimable case",
     );
-    // Case A — a different clone key computes a different path: StaleCaptureJournalError.
+    // Case A — a different clone key computes a different path: CapturePathMismatchError.
     await assert.rejects(
       git.runnerCloneForBranch(bare, branch, "different-kind-clone", foreignRunId),
       (err: unknown) => {
-        assert.ok(err instanceof StaleCaptureJournalError);
+        assert.ok(err instanceof CapturePathMismatchError);
         assert.equal(err.journaledPath, clonePath);
         assert.equal(err.branch, branch);
         return true;

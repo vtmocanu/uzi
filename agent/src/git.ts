@@ -265,20 +265,25 @@ export class ForeignCaptureBlockedError extends Error {
 }
 
 /**
- * issue #1315 — the recovery journal for this branch names a clone path that is NOT
- * this branch's computed canonical clone: a malformed or stale-for-this-branch journal
- * (e.g. a different clone key, or a path that no longer maps to this branch). NEVER
- * reclaimable — fail closed always, even when the journaled path is itself under
- * runnerRoot. The runner must NOT owner-probe or retire on this error; it propagates.
+ * issue #1315/#1319 — the recovery journal for this branch names a clone path that is NOT
+ * this branch's CLAIMANT-computed canonical clone (a different clone key — e.g. the
+ * cross-kind slug divergence `issue-N` vs `agent-issue-N`). The git layer is claim-agnostic
+ * and NEVER probes owner status; it fails closed here carrying `ownerRunId`. This is NO
+ * LONGER "never reclaimable": the runner (issue #1319) may catch it and run the authoritative
+ * owner-canonical validation — probing the named owner and, ONLY when the owner is terminal
+ * AND the owner-derived branch and canonical path match the journal, quarantining the residue
+ * and reseeding. On any unmet predicate the runner fails closed exactly as before. The git
+ * layer itself still never probes or retires on this error.
  */
-export class StaleCaptureJournalError extends Error {
+export class CapturePathMismatchError extends Error {
   constructor(
     readonly journaledPath: string,
     readonly computedPath: string,
     readonly branch: string,
+    readonly ownerRunId: string,
   ) {
-    super("recovery journal points at a stale or malformed clone path for this branch");
-    this.name = "StaleCaptureJournalError";
+    super("recovery journal points at a different clone path than this branch's computed clone");
+    this.name = "CapturePathMismatchError";
   }
 }
 
@@ -580,6 +585,15 @@ export class GitCache {
     return this.runnerCloneForBranch(barePath, `agent/issue-${issueIid}`, `issue-${issueIid}`, runId, resume, expectedCheckpointTip);
   }
 
+  /** The canonical runner-clone path for a clone key under a bare's repo dir: the single
+   *  definition of `<runnerRoot>/<repoDir>/<key>`. runnerCloneForBranch and the runner's
+   *  owner-canonical reclaim validation (issue #1319) both derive it here, so predicate (d)
+   *  compares against exactly what the seed creates. */
+  runnerClonePath(barePath: string, key: string): string {
+    const repoDir = path.basename(barePath).replace(/\.git$/, "");
+    return path.join(this.runnerRoot, repoDir, key);
+  }
+
   /**
    * Seed a RUNNER CLONE for an EXPLICIT branch — the PRD #6 ci_fix targets (a fresh
    * `ci-fix/pipeline-{id}` off the default branch, or an existing `agent/issue-{iid}`
@@ -661,8 +675,7 @@ export class GitCache {
    */
   async runnerCloneForBranch(barePath: string, branch: string, key: string, runId?: string, resume = false, expectedCheckpointTip?: string): Promise<RunnerClone> {
     return this.withLock(barePath, async () => {
-      const repoDir = path.basename(barePath).replace(/\.git$/, "");
-      const clonePath = path.join(this.runnerRoot, repoDir, key);
+      const clonePath = this.runnerClonePath(barePath, key);
       // #1197, verified 2026-09-08: the clone is the only remaining copy when a
       // recovery capture failed. The journal is in WORKER-owned bare config, never
       // in the runner-owned clone. An unreadable journal fails closed before rm.
@@ -676,9 +689,10 @@ export class GitCache {
         // and only the runner reclaims, after an authoritative owner probe.
         if (pending.clonePath !== clonePath) {
           // Case A: the journal names a DIFFERENT path than this branch's canonical
-          // clone (a stale/malformed journal, or a different clone key). Never
-          // reclaimable — fail closed ALWAYS, even when that path is under runnerRoot.
-          throw new StaleCaptureJournalError(pending.clonePath, clonePath, branch);
+          // clone — a claimant-relative clone-path mismatch (e.g. a cross-kind slug); the
+          // git layer fails closed here and NEVER probes, but the runner MAY resolve it via
+          // authoritative owner validation (issue #1319).
+          throw new CapturePathMismatchError(pending.clonePath, clonePath, branch, pending.runId);
         }
         if (pending.runId !== runId) {
           // Case B: the matched canonical pair, owned by ANOTHER run. The only
@@ -1746,7 +1760,7 @@ export class GitCache {
       //    a lock-gap rewrite to a different runId/path, moves NOTHING and fails closed.
       const pending = await this.readRecoveryCapture(barePath, branch);
       if (pending?.runId !== ownerRunId || pending.clonePath !== clonePath) {
-        throw new StaleCaptureJournalError(pending?.clonePath ?? "", clonePath, branch);
+        throw new CapturePathMismatchError(pending?.clonePath ?? "", clonePath, branch, ownerRunId);
       }
       // 2. Containment. Only ever move a path strictly UNDER runnerRoot. Resolve both
       //    sides and require a path-separator boundary so a sibling like
@@ -1755,7 +1769,7 @@ export class GitCache {
       const resolvedClone = path.resolve(clonePath);
       const resolvedRoot = path.resolve(this.runnerRoot);
       if (!resolvedClone.startsWith(resolvedRoot + path.sep)) {
-        throw new StaleCaptureJournalError(clonePath, this.runnerRoot, branch);
+        throw new CapturePathMismatchError(clonePath, this.runnerRoot, branch, ownerRunId);
       }
       // 3. Worker-only 0700 holding destination: a SIBLING of runnerRoot under the same
       //    dataDir (same filesystem — no EXDEV), NOT under the runner-writable tree.
