@@ -124,7 +124,11 @@ func TestCompletionDecisionHandlerStatusMappingLiveDB(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			rec := postCompletionDecision(t, h, tc.user, runID, tc.req)
+			// The foreign caller is given IsAdmin=true to pin the security fix: even an
+			// admin_ro-shaped caller (IsAdmin kept through RequireUser) must be hidden as
+			// 404 and write nothing, because DecideCompletion is owner-scoped and never
+			// consults IsAdmin. A future re-widening that threaded IsAdmin would redden this.
+			rec := postCompletionDecision(t, h, tc.user, tc.user == stranger, runID, tc.req)
 			if rec.Code != tc.want {
 				t.Fatalf("status = %d, want %d; body=%s", rec.Code, tc.want, rec.Body.String())
 			}
@@ -140,7 +144,7 @@ func TestCompletionDecisionHandlerStatusMappingLiveDB(t *testing.T) {
 
 // postCompletionDecision issues POST /api/runs/{id}/completion/decision as user with the given body,
 // calling the handler method directly with a user context and the chi {id} route param.
-func postCompletionDecision(t *testing.T, h *Handler, user, runID uuid.UUID, req completionDecisionRequest) *httptest.ResponseRecorder {
+func postCompletionDecision(t *testing.T, h *Handler, user uuid.UUID, isAdmin bool, runID uuid.UUID, req completionDecisionRequest) *httptest.ResponseRecorder {
 	t.Helper()
 	body, err := json.Marshal(req)
 	if err != nil {
@@ -149,7 +153,7 @@ func postCompletionDecision(t *testing.T, h *Handler, user, runID uuid.UUID, req
 	r := httptest.NewRequest(http.MethodPost, "/api/runs/x/completion/decision", bytes.NewReader(body))
 	rctx := chi.NewRouteContext()
 	rctx.URLParams.Add("id", runID.String())
-	r = r.WithContext(context.WithValue(mw.ContextWithUser(r.Context(), store.User{ID: user}), chi.RouteCtxKey, rctx))
+	r = r.WithContext(context.WithValue(mw.ContextWithUser(r.Context(), store.User{ID: user, IsAdmin: isAdmin}), chi.RouteCtxKey, rctx))
 	rec := httptest.NewRecorder()
 	h.ContinueCompletionDecision(rec, r)
 	return rec
