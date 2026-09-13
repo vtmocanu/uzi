@@ -2,16 +2,21 @@
 // certifies the current candidate against a trusted, gitignored candidate MANIFEST by proving three
 // things: the manifest/ancestry is usable, the provenBaseCommit..candidate tail is EVIDENCE-ONLY
 // (touches no shipped guardrail runtime path), and every committed O clause is discharged by exactly
-// one manifest record whose digests match the proven image pair. The key SELF-REFERENCE test shows
-// the fixed point — recording the gitignored manifest makes no commit, so an evidence-only (or
-// empty) tail keeps the candidate certified, while a runtime tail rejects it. A DOCKERFILE-COPY
-// pinning test binds classifyPath's deny/allow lists to the worker image's real COPY surface so they
-// cannot silently drift, and a registry assertion confirms no committed O row embeds candidate
-// digests (they are manifest-only now).
+// one manifest record whose digests match the proven image pair AND whose disposition matches the
+// committed requirement (a committed `owed` clause needs a FRESH receipt-present proof). The key
+// SELF-REFERENCE test shows the fixed point — recording the gitignored manifest makes no commit, so
+// an evidence-only (or empty) tail keeps the candidate certified, while a runtime tail rejects it. A
+// DOCKERFILE-COPY pinning test binds classifyPath's deny/allow lists to the worker image's real COPY
+// surface so they cannot silently drift, and a registry assertion confirms no committed O row embeds
+// candidate digests (they are manifest-only now). A `computeTail` regression test (against a throwaway
+// scratch repo) proves `--no-renames` closes the runtime→evidence rename bypass, and a .gitignore
+// test pins the fixed-point property (the real manifest is never committed).
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 import {
@@ -23,6 +28,7 @@ import {
   type Disposition,
   type TailInput,
 } from "./receipts.js";
+import { computeTail } from "./receipts-io.js";
 import { ALL_CLAUSES } from "./registry.js";
 import type { ClauseRow, ImageDigests, OState } from "./clause.js";
 
@@ -94,6 +100,7 @@ describe("checkReceipts", () => {
     assert.deepEqual(report.duplicate, []);
     assert.deepEqual(report.undischarged, []);
     assert.deepEqual(report.mismatch, []);
+    assert.deepEqual(report.dispositionMismatch, []);
     assert.deepEqual(report.malformedClauses, []);
     assert.equal(report.manifestError, undefined);
   });
@@ -218,6 +225,28 @@ describe("checkReceipts", () => {
     assert.equal(base?.expected, REAL_BASE);
     assert.equal(jvm?.recorded, REAL_BASE);
     assert.equal(jvm?.expected, REAL_JVM);
+  });
+
+  it("dispositionMismatch: a committed `owed` clause discharged by an `inherited` record → ok:false", () => {
+    // codex-o-b is committed `owed` — by definition it has NO prior proof, so an `inherited` record
+    // would falsely claim a prior unchanged mechanism that does not exist. Only a FRESH receipt-present
+    // record discharges it. (codex-o-a is committed `inherited`, discharged by `inherited` → fine.)
+    const m = baseManifest([rec("codex-o-a", "inherited"), rec("codex-o-b", "inherited")]);
+    const report = checkReceipts(committed(), m, EVIDENCE_TAIL);
+    assert.equal(report.ok, false);
+    assert.deepEqual(report.dispositionMismatch, [{ id: "codex-o-b", committed: "owed", recorded: "inherited" }]);
+    // The record is otherwise valid — it is NOT also listed as missing/extra/undischarged/mismatched.
+    assert.deepEqual(report.missing, []);
+    assert.deepEqual(report.undischarged, []);
+    assert.deepEqual(report.mismatch, []);
+  });
+
+  it("a committed `owed` clause discharged by a `receipt-present` record → ok:true (fresh proof)", () => {
+    // The fresh packaged snapshot is exactly what an owed clause requires; with full coverage and an
+    // evidence-only tail the candidate certifies and dispositionMismatch stays empty.
+    const report = checkReceipts(committed(), baseManifest(fullRecords()), EVIDENCE_TAIL);
+    assert.equal(report.ok, true);
+    assert.deepEqual(report.dispositionMismatch, []);
   });
 
   it("malformedClauses: a committed O row with a broken o-state is listed (its requirement can't be read)", () => {
@@ -361,5 +390,73 @@ describe("classifyPath is pinned to the Dockerfile COPY surface (anti-drift)", (
     for (const src of sources) {
       assert.equal(classifyPath(src), "runtime", `COPY source ${src} must classify as runtime`);
     }
+  });
+});
+
+describe("computeTail (receipts-io) defeats rename detection (--no-renames)", () => {
+  it("a RUNTIME→EVIDENCE rename surfaces the runtime SOURCE path so classifyPath flags drift", () => {
+    // Regression for the rename-detection bypass: `git mv agent/src/foo.ts docs/foo.ts` moves a
+    // shipped-guardrail RUNTIME file to an EVIDENCE path. With git's DEFAULT rename detection the diff
+    // shows ONLY docs/foo.ts (evidence), so the gate would see an evidence-only tail and wrongly
+    // certify a candidate whose guardrail runtime moved. `--no-renames` must surface the deleted
+    // agent/src/foo.ts SOURCE too, restoring the drift. Driven against a throwaway scratch repo so the
+    // assertion is real git behavior, not a stub.
+    const tmp = mkdtempSync(path.join(os.tmpdir(), "codex-m4-receipts-io-"));
+    // A deterministic identity via env so the scratch commits succeed without any global git config.
+    const env = {
+      ...process.env,
+      GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@example.invalid",
+      GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@example.invalid",
+    };
+    const git = (...args: string[]): string => execFileSync("git", args, { cwd: tmp, encoding: "utf8", env });
+    try {
+      git("init", "-q");
+      // base commit: a RUNTIME file under agent/src/ (classifyPath → runtime).
+      mkdirSync(path.join(tmp, "agent", "src"), { recursive: true });
+      writeFileSync(path.join(tmp, "agent", "src", "foo.ts"), "export const x = 1;\n");
+      git("add", "agent/src/foo.ts");
+      git("commit", "-q", "-m", "base");
+      const baseSha = git("rev-parse", "HEAD").trim();
+
+      // candidate: relocate the runtime file to an EVIDENCE path (docs/).
+      mkdirSync(path.join(tmp, "docs"), { recursive: true });
+      git("mv", "agent/src/foo.ts", "docs/foo.ts");
+      git("commit", "-q", "-m", "candidate");
+      const candSha = git("rev-parse", "HEAD").trim();
+
+      const tail = computeTail(baseSha, candSha, tmp);
+      assert.ok(tail !== null, "computeTail returns a tail for a valid ancestor pair");
+      assert.equal(tail.baseIsAncestor, true);
+      // THE REGRESSION ASSERTION: the runtime SOURCE path is present in the tail, so classifyPath
+      // flags drift — proving --no-renames closed the bypass.
+      assert.ok(
+        tail.paths.includes("agent/src/foo.ts"),
+        `--no-renames must surface the runtime source path; got ${JSON.stringify(tail.paths)}`,
+      );
+      assert.equal(classifyPath("agent/src/foo.ts"), "runtime");
+
+      // A bogus base (40 zeros — not a real object) fails closed as not-an-ancestor, no throw.
+      const bogus = computeTail("0".repeat(40), candSha, tmp);
+      assert.deepEqual(bogus, { paths: [], baseIsAncestor: false });
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+describe(".gitignore pins the manifest fixed point (finding: recording the real manifest makes no commit)", () => {
+  it("e2e/codex-m4/.gitignore has an exact `receipt-manifest.json` line", () => {
+    // This pins the fixed-point property: the REAL maintainer-produced manifest is gitignored, so
+    // recording it makes no commit and cannot invalidate the candidate it certifies. A future edit
+    // that removes the ignore reddens this test.
+    const gitignore = readFileSync(path.join(__dirname, ".gitignore"), "utf8");
+    const lines = gitignore
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0 && !line.startsWith("#"));
+    assert.ok(
+      lines.includes("receipt-manifest.json"),
+      `.gitignore must ignore the real manifest; non-comment lines were ${JSON.stringify(lines)}`,
+    );
   });
 });

@@ -38,9 +38,12 @@
 // THE TRUST BOUNDARY. The gate TRUSTS the out-of-band manifest (the maintainer produced it from a
 // real `UZI_CODEX_M3B_PACKAGED=1 task test:codex-m3b:packaged` proof). It verifies the manifest's
 // INTERNAL CONSISTENCY (well-formed, real image digests), full COVERAGE (every committed O clause
-// has exactly one discharging record whose digests match the proven pair), and NO RUNTIME DRIFT in
-// the tail. It does NOT — and cannot, from inside the worker — verify that the digests were truly
-// built from `provenBaseCommit`; that is the maintainer's out-of-band responsibility.
+// has exactly one discharging record whose digests match the proven pair AND whose disposition
+// matches the committed requirement — a committed `owed` clause has NO prior proof, so it must be
+// discharged by a FRESH `receipt-present` record, never an `inherited` one that would falsely claim a
+// prior unchanged mechanism; a committed `inherited` clause accepts either disposition), and NO
+// RUNTIME DRIFT in the tail. It does NOT — and cannot, from inside the worker — verify that the
+// digests were truly built from `provenBaseCommit`; that is the maintainer's out-of-band responsibility.
 
 import type { ClauseRow, ImageDigests } from "./clause.js";
 import { isOState } from "./clause.js";
@@ -216,14 +219,22 @@ export interface ReceiptsReport {
   /** Records whose real digest does NOT match the manifest's proven pair for that image. `swapped`
    *  is true when the recorded digest is instead the OTHER image (base recorded as jvm, or v.v.). */
   readonly mismatch: { readonly id: string; readonly image: "base" | "jvm"; readonly recorded: string; readonly expected: string; readonly swapped: boolean }[];
+  /** Otherwise-valid records (known id, valid disposition, real images) whose disposition does NOT
+   *  match the committed requirement: a committed `owed` clause has no prior proof, so it must be
+   *  discharged by a FRESH `receipt-present` record — an `inherited` record would falsely claim a
+   *  prior unchanged mechanism that does not exist. (A committed `inherited` clause accepts either
+   *  disposition, so it is never listed here.) */
+  readonly dispositionMismatch: { readonly id: string; readonly committed: "owed"; readonly recorded: Disposition }[];
   /** Committed O rows whose o-state is missing/malformed (their requirement cannot be read). */
   readonly malformedClauses: string[];
 }
 
 /** Pure receipts check. ok=false if the manifest/ancestry is unusable, the tail is not evidence-only,
- *  or any committed O clause is uncovered / any record is extra, duplicate, undischarged, or
- *  mismatched, or any committed O row is malformed. Fails closed: a null manifest reports every O
- *  clause as `missing`; a non-ancestor base or an invalid proven-image pair sets `manifestError`. */
+ *  or any committed O clause is uncovered / any record is extra, duplicate, undischarged, mismatched,
+ *  or disposition-mismatched (a committed `owed` clause discharged by something other than a fresh
+ *  `receipt-present` record), or any committed O row is malformed. Fails closed: a null manifest
+ *  reports every O clause as `missing`; a non-ancestor base or an invalid proven-image pair sets
+ *  `manifestError`. */
 export function checkReceipts(
   clauses: readonly ClauseRow[],
   manifest: CandidateManifest | null,
@@ -235,11 +246,16 @@ export function checkReceipts(
   const requiredOIds: string[] = [];
   const requiredOIdSet = new Set<string>();
   const malformedClauses: string[] = [];
+  // The committed disposition requirement per O clause id (only for isOState-valid rows): an `owed`
+  // clause has no prior proof and needs a fresh `receipt-present` record; an `inherited` clause
+  // accepts either. A malformed O row contributes no entry, so its record is never disposition-checked.
+  const committedOKind = new Map<string, "inherited" | "owed">();
   for (const c of clauses) {
     if (c.layer !== "O") continue;
     requiredOIds.push(c.id);
     requiredOIdSet.add(c.id);
     if (!isOState(c.o)) malformedClauses.push(c.id);
+    else committedOKind.set(c.id, c.o.kind);
   }
 
   const drift: ReceiptsReport["drift"] = [];
@@ -248,6 +264,7 @@ export function checkReceipts(
   const duplicate: string[] = [];
   const undischarged: string[] = [];
   const mismatch: ReceiptsReport["mismatch"] = [];
+  const dispositionMismatch: ReceiptsReport["dispositionMismatch"] = [];
 
   // 2. No manifest → fail closed. Every O requirement is `missing` (nothing binds it); the report
   //    stays a complete maintainer TODO list (malformed committed rows still surface).
@@ -264,6 +281,7 @@ export function checkReceipts(
       duplicate,
       undischarged,
       mismatch,
+      dispositionMismatch,
       malformedClauses,
     };
   }
@@ -331,6 +349,13 @@ export function checkReceipts(
       }
       continue;
     }
+    // Cross-check the record disposition against the committed requirement. Only reachable for an
+    // otherwise-valid record (known id, valid disposition, real images). A committed `owed` clause has
+    // NO prior proof, so an `inherited` record cannot discharge it — only a fresh `receipt-present`
+    // one can. (A committed `inherited` clause accepts either, and a malformed O row has no entry.)
+    if (committedOKind.get(rec.id) === "owed" && rec.disposition !== "receipt-present") {
+      dispositionMismatch.push({ id: rec.id, committed: "owed", recorded: rec.disposition });
+    }
     if (imagesUsable) {
       for (const image of IMAGES) {
         const recorded = rec.images[image];
@@ -354,6 +379,7 @@ export function checkReceipts(
     && duplicate.length === 0
     && undischarged.length === 0
     && mismatch.length === 0
+    && dispositionMismatch.length === 0
     && malformedClauses.length === 0;
 
   return {
@@ -365,6 +391,7 @@ export function checkReceipts(
     duplicate,
     undischarged,
     mismatch,
+    dispositionMismatch,
     malformedClauses,
   };
 }

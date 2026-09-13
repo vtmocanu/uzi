@@ -96,10 +96,13 @@ export interface ClauseRow {
 }
 
 /** True when `value` is a well-formed {@link OState}. Used by the completeness checker to reject an
- *  O row whose `o` field is missing or malformed (D8), and by the receipts gate. Validates exactly
- *  the two committed variants: `inherited` needs non-empty string source/target/unchangedJustification;
- *  `owed` needs non-empty string target/reason/owner. Anything else — including the retired
- *  `receipt-present` variant or a row that still embeds `imageDigests` — is rejected. */
+ *  O row whose `o` field is missing or malformed (D8), and by the receipts gate. Validates ONLY the
+ *  two committed variants' required string fields — `inherited` needs non-empty string
+ *  source/target/unchangedJustification; `owed` needs non-empty string target/reason/owner — and
+ *  IGNORES any extra properties, so a row that still embeds `imageDigests` is NOT rejected here (the
+ *  switch simply does not look at it). The "committed rows carry no candidate digests" invariant is
+ *  enforced SEPARATELY by receipts.test.ts, not by isOState. The retired `receipt-present` variant,
+ *  however, IS rejected — an unrecognized `kind` falls to the default arm and returns false. */
 export function isOState(value: unknown): value is OState {
   if (value === null || typeof value !== "object") return false;
   const o = value as Record<string, unknown>;
