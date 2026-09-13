@@ -548,7 +548,28 @@ if [ "$RC_RC" -ne 0 ]; then pass "--promote aborts on a non-allowlisted change";
 if git -C "$S9" rev-parse -q --verify refs/tags/v0.2.0 >/dev/null; then fail "aborted promote leaves NO v0.2.0 tag"; else pass "aborted promote leaves NO v0.2.0 tag"; fi
 if git -C "$S9" rev-parse -q --verify refs/heads/release/0.2.0 >/dev/null; then fail "aborted promote leaves NO release/0.2.0 branch"; else pass "aborted promote leaves NO release/0.2.0 branch"; fi
 
-rm -rf "$S1" "$S3" "$S4" "$S6" "$S7" "$S8" "$S9"
+echo "=== M2b: --promote rolls back the local stable tag when the main half fails ==="
+S10="$(mktemp -d)"; seed_repo "$S10"; add_feature "$S10" 201
+put_changelog "$S10" <<'MD'
+# Changelog
+
+## [Unreleased]
+### Added
+- **Feature 201** (#201)
+
+## [0.1.0] - 2026-09-01
+### Added
+- **Initial** (#100)
+MD
+run_rc "$S10" 0.2.0; git -C "$S10" tag v0.2.0-rc.1
+add_feature "$S10" 301               # merges since the RC, so NOT the promote-only path
+# but leave [Unreleased] EMPTY and pass no --changelog-file, so the main-half fold fails
+# AFTER promote_inflight has already tagged v0.2.0. The trap must roll that tag back.
+run_rc "$S10" 0.3.0 --promote
+if [ "$RC_RC" -ne 0 ]; then pass "promote main-half failure exits nonzero"; else fail "promote main-half failure exits nonzero"; fi
+if git -C "$S10" rev-parse -q --verify refs/tags/v0.2.0 >/dev/null; then fail "failed promote leaves NO local v0.2.0 tag (rolled back)"; else pass "failed promote leaves NO local v0.2.0 tag (rolled back)"; fi
+
+rm -rf "$S1" "$S3" "$S4" "$S6" "$S7" "$S8" "$S9" "$S10"
 
 echo "=== M3: release-mode lib (shared by watch + verify) ==="
 # shellcheck source=scripts/lib/release-mode.sh

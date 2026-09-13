@@ -39,7 +39,7 @@
 # Exit codes: 0 ready;  1 a step/verify failed (tree left recoverable);  3 usage /
 #             precondition failure, or a refusal that needs a verb.
 #
-# NEVER [skip ci] a release commit (release.yml assumes ci.yml is green on it).
+# NEVER skip-ci a release commit (release.yml assumes ci.yml is green on it).
 set -uo pipefail
 
 VERSION=""; VERB=""; CL_FILE=""; DO_COMMIT=1; PREV_OVERRIDE=""
@@ -364,14 +364,28 @@ commit_and_verify() { # $1 tag  $2 prev  $3 base
 echo "=== release-cut $TAG (op=$OP) on $DEFBRANCH ==="
 
 # --- promote half (before touching main) --------------------------------------
-PROMOTED_TAG=""
+PROMOTED_TAG=""; PROMOTE_FINALIZED=0
+# The promote half tags a LOCAL (unpushed) stable vB before the main half runs. If the
+# main half then fails (an empty [Unreleased] with no --changelog-file, a bad oracle,
+# anything), roll that tag back so a re-run starts clean instead of refusing with "tag
+# vB already exists". The tag is not pushed, so deleting it loses nothing; a successful
+# run sets PROMOTE_FINALIZED=1 first so the guard is a no-op.
+promote_guard() {
+  local rc=$?
+  if [ "$rc" -ne 0 ] && [ -n "$PROMOTED_TAG" ] && [ "$PROMOTE_FINALIZED" -eq 0 ]; then
+    git tag -d "$PROMOTED_TAG" >/dev/null 2>&1 \
+      && echo "release-cut: rolled back the local promote tag $PROMOTED_TAG (the RC cut did not complete); fix the cause and re-run." >&2
+  fi
+}
 if [ "$OP" = promote ]; then
   # If main has not moved since the RC and [Unreleased] is empty, there is nothing to
   # cut: promote only (D1). main's Chart.yaml then stays at the RC version, harmless.
   merges="$(git log --first-parent --format=%H "$INFLIGHT..HEAD" 2>/dev/null | grep -c . || true)"
   unrel="$(changelog_unreleased_body | tr -d '[:space:]')"
+  trap promote_guard EXIT
   promote_inflight
   if [ "$merges" -eq 0 ] && [ -z "$unrel" ]; then
+    PROMOTE_FINALIZED=1
     echo
     echo "=== promoted $PROMOTED_TAG only (nothing shipped since $INFLIGHT, [Unreleased] empty) ==="
     echo "Next:  git push origin $PROMOTED_TAG"
@@ -436,6 +450,7 @@ else
   commit_and_verify "$TAG" "$PREV" "$BASE"
 fi
 
+PROMOTE_FINALIZED=1   # the RC cut committed and verified; the promote tag (if any) stands
 echo
 echo "=== $TAG cut and verified on main (NOT pushed) ==="
 echo "Next:"

@@ -66,10 +66,12 @@ BASE="${VERSION%%-*}"
 if [ -z "$PREV" ]; then
   PREV="$(git tag -l 'v*' | awk -v base="$BASE" '
     function lt(x, y,   ax, ay) {
+      # Force numeric compare with +0 (matching the release-cut.sh comparators) so the
+      # oracle PREV and release-cut PREV can never drift on a strnum-coercion edge.
       split(x, ax, "\\."); split(y, ay, "\\.")
-      if (ax[1] != ay[1]) return ax[1] < ay[1]
-      if (ax[2] != ay[2]) return ax[2] < ay[2]
-      return ax[3] < ay[3]
+      if (ax[1]+0 != ay[1]+0) return ax[1]+0 < ay[1]+0
+      if (ax[2]+0 != ay[2]+0) return ax[2]+0 < ay[2]+0
+      return ax[3]+0 < ay[3]+0
     }
     /^v[0-9]+\.[0-9]+\.[0-9]+$/ {
       v = $0; sub(/^v/, "", v)
