@@ -258,6 +258,298 @@ assert_eq "section title is the full tag" "v0.2.0-rc.1" "$title"
 body="$( cd "$REPO" && bash "$SECTION" body 0.2.0-rc.1 2>&1 )"
 assert_contains "section body reads [0.2.0]" "Feature A" "$body"
 
+# =============================================================================
+# M2: release-cut.sh state machine (D1) + lockstep promote (D5)
+# =============================================================================
+REPO_ROOT="$(cd "$SCRIPTS_DIR/.." && pwd)"
+RC="$REPO_ROOT/.agents/skills/uzi-release/scripts/release-cut.sh"
+[ -f "$RC" ] || { echo "release-scripts-test: $RC not found" >&2; exit 2; }
+
+D2N=0
+d2tick() { D2N=$((D2N + 1)); printf '2026-10-%02dT00:00:00' "$D2N"; }
+gcommit() { # gcommit <dir> <msg>
+  local when; when="$(d2tick)"
+  GIT_AUTHOR_DATE="$when" GIT_COMMITTER_DATE="$when" git -C "$1" commit -q -m "$2"
+}
+
+# A fresh minimal repo carrying the sibling scripts release-cut orchestrates, plus a
+# v0.1.0 stable baseline. UZI_CHANGELOG_REPO_URL is exported at call time so
+# changelog-links needs no remote.
+seed_repo() {
+  local d="$1"
+  mkdir -p "$d/scripts" "$d/deploy/chart" "$d/api"
+  local s
+  for s in worker-tag-autobump changelog-links assert-changelog-covers-release changelog-section assert-worker-tag-decoupled; do
+    [ -f "$SCRIPTS_DIR/$s.sh" ] && { cp "$SCRIPTS_DIR/$s.sh" "$d/scripts/$s.sh"; chmod +x "$d/scripts/$s.sh"; }
+  done
+  cat > "$d/deploy/chart/Chart.yaml" <<'YAML'
+apiVersion: v2
+name: uzi
+version: 0.1.0
+appVersion: "0.1.0"
+YAML
+  cat > "$d/deploy/chart/values.yaml" <<'YAML'
+workers:
+  image:
+    repository: ghcr.io/x/worker
+    tag: "0.1.0"
+YAML
+  cat > "$d/CHANGELOG.md" <<'MD'
+# Changelog
+
+## [Unreleased]
+
+## [0.1.0] - 2026-09-01
+### Added
+- **Initial** (#100)
+MD
+  echo 'package main' > "$d/api/base.go"
+  git -C "$d" init -q
+  git -C "$d" config user.email t@example.com
+  git -C "$d" config user.name test
+  git -C "$d" symbolic-ref HEAD refs/heads/main
+  git -C "$d" add -A
+  gcommit "$d" "chore(release): v0.1.0"
+  git -C "$d" tag v0.1.0
+}
+add_feature() { # add_feature <dir> <issue>
+  echo "package main // $2" > "$1/api/feature_$2.go"
+  git -C "$1" add -A
+  gcommit "$1" "Feature $2 (#$2)"
+}
+put_changelog() { # put_changelog <dir> ; stdin -> CHANGELOG.md, committed
+  cat > "$1/CHANGELOG.md"
+  git -C "$1" add CHANGELOG.md
+  gcommit "$1" "docs: changelog"
+}
+run_rc() { # run_rc <dir> <args...>  -> sets RC_RC / RC_OUT
+  local d="$1"; shift
+  RC_OUT="$( cd "$d" && UZI_CHANGELOG_REPO_URL="https://github.com/vtmocanu/uzi" bash "$RC" "$@" 2>&1 )"; RC_RC=$?
+}
+chart_ver()   { awk '/^version:/{print $2; exit}' "$1/deploy/chart/Chart.yaml"; }
+pin_tag()     { awk '/^workers:/{w=1} w&&/^    tag:/{gsub(/"/,"",$2);print $2;exit}' "$1/deploy/chart/values.yaml"; }
+head_msg()    { git -C "$1" log -1 --format=%s; }
+has_heading() { grep -qE "^## \[$2\]" "$1/CHANGELOG.md"; }
+
+echo "=== M2: release-cut first RC ==="
+S1="$(mktemp -d)"; seed_repo "$S1"; add_feature "$S1" 201
+put_changelog "$S1" <<'MD'
+# Changelog
+
+## [Unreleased]
+### Added
+- **Feature 201** (#201)
+
+## [0.1.0] - 2026-09-01
+### Added
+- **Initial** (#100)
+MD
+run_rc "$S1" 0.2.0
+assert_eq "first RC exits 0"                 "0"                          "$RC_RC"
+assert_eq "first RC chart is 0.2.0-rc.1"     "0.2.0-rc.1"                 "$(chart_ver "$S1")"
+assert_eq "first RC commit message"          "chore(release): v0.2.0-rc.1" "$(head_msg "$S1")"
+if has_heading "$S1" 0.2.0; then pass "first RC opens [0.2.0] section"; else fail "first RC opens [0.2.0] section"; fi
+if git -C "$S1" rev-parse -q --verify refs/tags/v0.2.0-rc.1 >/dev/null; then fail "script must NOT tag the RC"; else pass "script does NOT tag the RC (lead tags after CI)"; fi
+
+echo "=== M2: next RC (empty [Unreleased]) ==="
+git -C "$S1" tag v0.2.0-rc.1
+run_rc "$S1" 0.2.0
+assert_eq "next RC exits 0"                  "0"          "$RC_RC"
+assert_eq "next RC chart is 0.2.0-rc.2"      "0.2.0-rc.2" "$(chart_ver "$S1")"
+
+echo "=== M2: next RC refused on non-empty [Unreleased] ==="
+S3="$(mktemp -d)"; seed_repo "$S3"; add_feature "$S3" 201
+put_changelog "$S3" <<'MD'
+# Changelog
+
+## [Unreleased]
+### Added
+- **Feature 201** (#201)
+
+## [0.1.0] - 2026-09-01
+### Added
+- **Initial** (#100)
+MD
+run_rc "$S3" 0.2.0                # first RC
+git -C "$S3" tag v0.2.0-rc.1
+put_changelog "$S3" <<'MD'
+# Changelog
+
+## [Unreleased]
+### Added
+- **Late thing** (#250)
+
+## [0.2.0] - 2026-10-01
+### Added
+- **Feature 201** (#201)
+
+## [0.1.0] - 2026-09-01
+### Added
+- **Initial** (#100)
+MD
+run_rc "$S3" 0.2.0
+assert_eq "next RC refused (non-empty [Unreleased]) exits 3" "3" "$RC_RC"
+assert_contains "next RC refusal explains EMPTY rule" "must be EMPTY" "$RC_OUT"
+
+echo "=== M2: refuse a new version with no verb + --stable refused in flight ==="
+S4="$(mktemp -d)"; seed_repo "$S4"; add_feature "$S4" 201
+put_changelog "$S4" <<'MD'
+# Changelog
+
+## [Unreleased]
+### Added
+- **Feature 201** (#201)
+
+## [0.1.0] - 2026-09-01
+### Added
+- **Initial** (#100)
+MD
+run_rc "$S4" 0.2.0; git -C "$S4" tag v0.2.0-rc.1
+run_rc "$S4" 0.3.0
+assert_eq "new version, no verb -> exit 3"      "3"          "$RC_RC"
+assert_contains "refusal prints the in-flight facts" "in flight" "$RC_OUT"
+run_rc "$S4" 0.3.0 --stable
+assert_eq "--stable refused while RC in flight"  "3"         "$RC_RC"
+assert_contains "--stable refusal names the RC"  "refused while" "$RC_OUT"
+
+echo "=== M2: --skip-promote (abandon the RC) ==="
+S6="$(mktemp -d)"; seed_repo "$S6"; add_feature "$S6" 201
+put_changelog "$S6" <<'MD'
+# Changelog
+
+## [Unreleased]
+### Added
+- **Feature 201** (#201)
+
+## [0.1.0] - 2026-09-01
+### Added
+- **Initial** (#100)
+MD
+run_rc "$S6" 0.2.0; git -C "$S6" tag v0.2.0-rc.1
+add_feature "$S6" 301
+put_changelog "$S6" <<'MD'
+# Changelog
+
+## [Unreleased]
+### Added
+- **Feature 301** (#301)
+
+## [0.2.0] - 2026-10-01
+### Added
+- **Feature 201** (#201)
+
+## [0.1.0] - 2026-09-01
+### Added
+- **Initial** (#100)
+MD
+run_rc "$S6" 0.3.0 --skip-promote
+assert_eq "--skip-promote exits 0"           "0"          "$RC_RC"
+assert_eq "--skip-promote chart is 0.3.0-rc.1" "0.3.0-rc.1" "$(chart_ver "$S6")"
+if has_heading "$S6" 0.3.0; then pass "--skip-promote renames to [0.3.0]"; else fail "--skip-promote renames to [0.3.0]"; fi
+if has_heading "$S6" 0.2.0; then fail "--skip-promote drops the old [0.2.0]"; else pass "--skip-promote drops the old [0.2.0]"; fi
+
+echo "=== M2: --stable with no RC in flight ==="
+S7="$(mktemp -d)"; seed_repo "$S7"; add_feature "$S7" 201
+put_changelog "$S7" <<'MD'
+# Changelog
+
+## [Unreleased]
+### Added
+- **Feature 201** (#201)
+
+## [0.1.0] - 2026-09-01
+### Added
+- **Initial** (#100)
+MD
+run_rc "$S7" 0.2.0 --stable
+assert_eq "--stable exits 0"          "0"       "$RC_RC"
+assert_eq "--stable chart is 0.2.0 (no rc)" "0.2.0" "$(chart_ver "$S7")"
+
+echo "=== M2b: --promote (lockstep) ==="
+S8="$(mktemp -d)"; seed_repo "$S8"; add_feature "$S8" 201
+put_changelog "$S8" <<'MD'
+# Changelog
+
+## [Unreleased]
+### Added
+- **Feature 201** (#201)
+
+## [0.1.0] - 2026-09-01
+### Added
+- **Initial** (#100)
+MD
+run_rc "$S8" 0.2.0; git -C "$S8" tag v0.2.0-rc.1
+add_feature "$S8" 301
+put_changelog "$S8" <<'MD'
+# Changelog
+
+## [Unreleased]
+### Added
+- **Feature 301** (#301)
+
+## [0.2.0] - 2026-10-01
+### Added
+- **Feature 201** (#201)
+
+## [0.1.0] - 2026-09-01
+### Added
+- **Initial** (#100)
+MD
+pin_before="$(pin_tag "$S8")"
+run_rc "$S8" 0.3.0 --promote
+assert_eq "--promote exits 0" "0" "$RC_RC"
+if git -C "$S8" rev-parse -q --verify refs/tags/v0.2.0 >/dev/null; then pass "--promote creates stable tag v0.2.0"; else fail "--promote creates stable tag v0.2.0"; fi
+assert_eq "v0.2.0 tag chart is stable 0.2.0" "0.2.0" "$(git -C "$S8" show v0.2.0:deploy/chart/Chart.yaml | awk '/^version:/{print $2;exit}')"
+assert_eq "main chart is 0.3.0-rc.1"         "0.3.0-rc.1" "$(chart_ver "$S8")"
+if has_heading "$S8" 0.3.0; then pass "--promote opens [0.3.0] on main"; else fail "--promote opens [0.3.0] on main"; fi
+if git -C "$S8" rev-parse -q --verify refs/heads/release/0.2.0 >/dev/null; then fail "--promote leaves no release/0.2.0 branch"; else pass "--promote leaves no release/0.2.0 branch"; fi
+assert_eq "--promote leaves the worker pin unchanged (D11)" "$pin_before" "$(pin_tag "$S8")"
+
+echo "=== M2b: --promote allowlist abort ==="
+S9="$(mktemp -d)"; seed_repo "$S9"; add_feature "$S9" 201
+put_changelog "$S9" <<'MD'
+# Changelog
+
+## [Unreleased]
+### Added
+- **Feature 201** (#201)
+
+## [0.1.0] - 2026-09-01
+### Added
+- **Initial** (#100)
+MD
+run_rc "$S9" 0.2.0; git -C "$S9" tag v0.2.0-rc.1
+add_feature "$S9" 301
+put_changelog "$S9" <<'MD'
+# Changelog
+
+## [Unreleased]
+### Added
+- **Feature 301** (#301)
+
+## [0.2.0] - 2026-10-01
+### Added
+- **Feature 201** (#201)
+
+## [0.1.0] - 2026-09-01
+### Added
+- **Initial** (#100)
+MD
+# make autobump ALSO touch a non-allowlisted file, so the promote commit's diff leaves
+# the allowlist and the guard must abort before any tag exists.
+cat > "$S9/scripts/worker-tag-autobump.sh" <<'SH'
+#!/usr/bin/env bash
+echo 'package main // injected' > api/injected.go
+exit 0
+SH
+chmod +x "$S9/scripts/worker-tag-autobump.sh"
+run_rc "$S9" 0.3.0 --promote
+if [ "$RC_RC" -ne 0 ]; then pass "--promote aborts on a non-allowlisted change"; else fail "--promote aborts on a non-allowlisted change"; fi
+if git -C "$S9" rev-parse -q --verify refs/tags/v0.2.0 >/dev/null; then fail "aborted promote leaves NO v0.2.0 tag"; else pass "aborted promote leaves NO v0.2.0 tag"; fi
+if git -C "$S9" rev-parse -q --verify refs/heads/release/0.2.0 >/dev/null; then fail "aborted promote leaves NO release/0.2.0 branch"; else pass "aborted promote leaves NO release/0.2.0 branch"; fi
+
+rm -rf "$S1" "$S3" "$S4" "$S6" "$S7" "$S8" "$S9"
+
 echo
 echo "=== release-scripts-test: $PASSES passed, $FAILS failed ==="
 [ "$FAILS" -eq 0 ]

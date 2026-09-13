@@ -200,6 +200,15 @@ while read -r sha; do
   # comments-only commit to upgrade.go was one of two hits.
   grep -qE '^docs(\([^)]*\))?:' "$SUBJECT_FILE" && continue
 
+  # A `chore(release):` commit is the release commit itself — a mechanical chart /
+  # CHANGELOG version bump — never a feature merge, so it never cites an issue. Today's
+  # single-step cut always folds CHANGELOG, so this commit was exempt by the
+  # touched-CHANGELOG rule below; under the RC train a next-candidate cut (rc.N+1) bumps
+  # only Chart.yaml and does NOT touch CHANGELOG (the section is already open, D3), so
+  # that rule no longer covers it. Exempt it by its conventional message instead, which
+  # is also true of every prior release commit already in the window (PRD 1265).
+  grep -qE '^chore\(release\):' "$SUBJECT_FILE" && continue
+
   files="$(git diff --name-only "$sha^1" "$sha" 2>/dev/null || git show --name-only --format= "$sha")"
 
   touched_changelog=0
