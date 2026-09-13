@@ -202,6 +202,20 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 		return res, fmt.Errorf("resume pool-wait runs: %w", err)
 	}
 
+	// Custody-release reconciler (PRD #1296 M4, D3): the boot/periodic backstop that
+	// settles a recorded successful publication whose best-effort terminal release
+	// (SetState) failed, leaving an open hold's live FKs set and its worker un-reapable.
+	// It releases ONLY holds whose disposition is durable (a completed run, or a ready
+	// capture) — never inferring success from a failed/cancelled/partial/running status —
+	// so a failed run with no ready capture keeps its custody. Placed before the reap
+	// backstop (ephemeral reap is a separate sweeper.Pass in main.go, run each tick) so a
+	// hold released this tick lets the SAME tick's/next tick's reap delete the worker.
+	// Best-effort: an error is logged and does not fail the sweep, matching the other
+	// best-effort sub-steps.
+	if res.CustodyReleased, err = s.ReconcileCustodyReleases(ctx); err != nil {
+		return res, fmt.Errorf("reconcile custody releases: %w", err)
+	}
+
 	// Bound the in-process persistence-failure tracker (PRD #108 M4). This is the
 	// memory bound for the one case no other eviction path reaches: a run whose
 	// worker vanished without the run ever reaching terminal. Pruned BEFORE the
@@ -305,6 +319,54 @@ func (s *Service) resumePoolWaitRuns(ctx context.Context) (int64, error) {
 		s.publishSwept(r.ID, "queued")
 	}
 	return resumed, nil
+}
+
+// ReconcileCustodyReleases is the boot/periodic custody-release backstop (PRD #1296 M4,
+// D3). It finds OPEN custody holds whose release is now WARRANTED but was never applied —
+// the best-effort terminal release in SetState failed after a successful publication, or a
+// worker uploaded a ready capture for a still-open hold without releasing it — and applies
+// the idempotent release, so the hold's ON DELETE RESTRICT live FKs are nulled and normal
+// reap can then delete the worker.
+//
+// Release is warranted ONLY on a durable disposition, decided in SQL by
+// ListReleasableCustodyHolds: the hold's run is 'completed' (full publication), or a READY
+// capture ('available') exists for the hold. It NEVER infers success from an arbitrary
+// terminal status — a 'failed'/'cancelled'/future 'partial' run with no ready capture keeps
+// its custody for capture or explicit discard.
+//
+// It releases by DISTINCT run_id via ReleaseCustodyForRun (the same frozen primitive the
+// terminal path uses, which releases every open hold on the run): a completed run's holds
+// are all releasable, and a run normally carries a single open hold. Returns the number of
+// holds released this tick (summed from the per-run execrows). A ReleaseCustodyForRun error
+// is logged and skipped so one stuck run does not sink the whole reconcile — the same
+// best-effort stance the pool-resume pass takes; a candidate-list read error, by contrast,
+// fails the pass like the sibling reads.
+func (s *Service) ReconcileCustodyReleases(ctx context.Context) (int64, error) {
+	holds, err := s.q.ListReleasableCustodyHolds(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("list releasable custody holds: %w", err)
+	}
+	// Dedupe by run_id: ReleaseCustodyForRun releases EVERY open hold on the run, so a
+	// second call for a sibling hold on the same run would move zero rows. Releasing once
+	// per distinct run and summing the returned counts reports the true holds-released
+	// total without double-counting.
+	seen := make(map[uuid.UUID]bool, len(holds))
+	var released int64
+	for _, h := range holds {
+		if seen[h.RunID] {
+			continue
+		}
+		seen[h.RunID] = true
+		n, err := s.q.ReleaseCustodyForRun(ctx, h.RunID)
+		if err != nil {
+			// Best-effort: skip this run, keep reconciling the rest. The hold stays open and
+			// the next tick retries it.
+			slog.Error("sweeper: custody release failed", "run", h.RunID, "error", err)
+			continue
+		}
+		released += n
+	}
+	return released, nil
 }
 
 // publishSwept fans a sweeper-driven run transition out to the same seams a

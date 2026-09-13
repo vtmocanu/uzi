@@ -44,6 +44,14 @@ type WorkerDTO struct {
 	// (PRD #42).
 	ActiveRuns        int  `json:"active_runs"`
 	MaxConcurrentRuns *int `json:"max_concurrent_runs"`
+	// RetainingUnpublishedWork marks a worker holding an OPEN durable-recovery custody
+	// hold (PRD #1296 M4, D4): it committed work a run could not publish and is keeping
+	// the last local source until the archive is captured or the owner discards it.
+	// Distinct from Busy — such a worker consumes no active run or LLM slot, but it is
+	// NOT free fleet capacity and still counts against the per-owner hosted quota, so the
+	// owner surface flags it as "retaining unpublished work" rather than idle. Always
+	// false once custody is released or discarded.
+	RetainingUnpublishedWork bool `json:"retaining_unpublished_work"`
 	// Worker template (PRD #18): the UI-declared choice and the worker's
 	// self-reported value. Either may be null (no choice / older image); the UI
 	// badges drift when both are set and differ.

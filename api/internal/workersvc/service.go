@@ -227,6 +227,14 @@ var (
 	// non-terminal run: the FK is ON DELETE SET NULL, so deleting would orphan the
 	// run past every sweep (and the one-active-run index would then block re-runs).
 	ErrWorkerHasActiveRuns = errors.New("worker has active runs")
+	// ErrWorkerHasCustody rejects deletion of a worker that still holds an OPEN custody
+	// hold (PRD #1296 M4, D3): deleting the worker cascades hosted_worker_tokens, and a
+	// preauthorized recovery upload may still need that token to authenticate, so the last
+	// authenticated retry path must survive until custody is released or explicitly
+	// discarded. Carried by a *WorkerHasCustodyError so the caller can name the count of
+	// affected custody holds (M4b's CLI confirmation enumerates the captures); errors.Is
+	// against this sentinel matches via Unwrap.
+	ErrWorkerHasCustody = errors.New("worker holds unpublished work awaiting recovery")
 	// ErrUnknownSecretLabel is a token label that names none of the user's
 	// credentials (PRD #104 M3) → 400. Case-insensitive, matching the unique index
 	// on lower(label), so it means "you have no token by that name" and never "you
@@ -302,6 +310,18 @@ func (e *CapabilityUnmetError) Error() string {
 	return fmt.Sprintf("%s: %s", ErrCapabilityUnmet.Error(), strings.Join(e.Unmet, ", "))
 }
 func (e *CapabilityUnmetError) Unwrap() error { return ErrCapabilityUnmet }
+
+// WorkerHasCustodyError carries the COUNT of open custody holds that block a worker
+// delete (PRD #1296 M4, D3), so the handler/CLI (M4b) can name how many captures a
+// forced discard would destroy. It unwraps to ErrWorkerHasCustody, so the handler both
+// matches the sentinel (→ 409) and surfaces the specific count via err.Error(). Same
+// shape as CapabilityUnmetError.
+type WorkerHasCustodyError struct{ Holds int64 }
+
+func (e *WorkerHasCustodyError) Error() string {
+	return fmt.Sprintf("%s (%d custody hold(s) still open)", ErrWorkerHasCustody.Error(), e.Holds)
+}
+func (e *WorkerHasCustodyError) Unwrap() error { return ErrWorkerHasCustody }
 
 // PauseRefusedError carries the SPECIFIC user-facing reason a pause was refused (PRD #1190
 // M1) and unwraps to ErrPauseNotRunning or ErrPauseNotSupported, so the handler both matches
@@ -435,6 +455,11 @@ type Store interface {
 	ReleaseCustodyForRun(ctx context.Context, runID uuid.UUID) (int64, error)
 	DiscardCaptureForOwner(ctx context.Context, arg store.DiscardCaptureForOwnerParams) (int64, error)
 	ExpireReadyCaptures(ctx context.Context, now pgtype.Timestamptz) (int64, error)
+	// M4 (D3) cleanup-safety reads: ListReleasableCustodyHolds is the custody-release
+	// reconciler's candidate set (OPEN holds whose release is now warranted but unapplied);
+	// CountOpenCustodyHoldsForWorker backs the DeleteWorker custody guard.
+	ListReleasableCustodyHolds(ctx context.Context) ([]store.RecoveryCustodyHold, error)
+	CountOpenCustodyHoldsForWorker(ctx context.Context, workerID uuid.UUID) (int64, error)
 	// Run judge (PRD #46 M3): terminal-funnel enqueue, judge-run-scoped trace/review
 	// authz, the command-not-found scan input, and the review upsert.
 	GetUserByID(ctx context.Context, id uuid.UUID) (store.User, error)
@@ -2633,6 +2658,20 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// maybeEnqueueTaskReview's review_target_run_id-null gate makes the two mutually
 		// exclusive. Best-effort — never fails the report.
 		s.maybeEnqueueThenFix(ctx, run)
+		// PRD #1296 M4 (D3): on a terminal SUCCESS (status='completed'), release the run's
+		// custody idempotently — a completed code-publishing run published its head, so its
+		// unpublished-work custody is moot. Placed BEFORE the ephemeral teardown so the
+		// release nulls the hold's ON DELETE RESTRICT live FKs and the teardown DELETE's
+		// custody-skip predicate then finds no open hold and can reap the worker in the same
+		// report. BEST-EFFORT: a release failure must NOT fail or block the completion report
+		// (D3) — the M4 custody-release reconciler is the backstop that settles a recorded
+		// successful publication later, after which reap proceeds. Deliberately NOT called on
+		// failed/cancelled: those retain custody for capture or explicit discard.
+		if run.Status == "completed" {
+			if _, relErr := s.q.ReleaseCustodyForRun(ctx, runID); relErr != nil {
+				slog.Warn("release custody on completion", "run", runID, "error", relErr)
+			}
+		}
 		// PRD #529 M4: an ephemeral worker exists only to serve its bound run, so a
 		// genuinely-applied terminal transition (rows>0) on that run — completed /
 		// worker-cancel / failed alike — is its cue to tear down. Fires on the SAME
@@ -3661,6 +3700,16 @@ func (s *Service) ListWorkers(ctx context.Context, userID uuid.UUID) ([]store.Li
 // count-then-delete is not one statement, but the worst a lost race does is
 // re-queue one run to a now-deleted worker_id, which the next claim's affinity
 // fallback and the running/claimed sweeps still recover.
+//
+// PRD #1296 M4 (D3): it is ALSO refused when the worker still holds an OPEN custody
+// hold (ErrWorkerHasCustody), because deleting the worker cascades hosted_worker_tokens
+// and a preauthorized recovery upload may still need that token to authenticate — the
+// last authenticated retry path must survive until custody is released or explicitly
+// discarded. The error carries the count so M4b's CLI confirmation can name the
+// affected captures. This guard is placed BEFORE the delete so the token row is never
+// cascaded away while an upload could still need it. (The M1 live_worker_id
+// ON DELETE RESTRICT FK is the fail-closed backstop; this guard turns it into a clean,
+// enumerated 409 instead of a raw constraint 500.)
 func (s *Service) DeleteWorker(ctx context.Context, userID, workerID uuid.UUID) error {
 	active, err := s.q.CountWorkerNonTerminalRuns(ctx, store.CountWorkerNonTerminalRunsParams{
 		WorkerID: pgconv.UUID(workerID), UserID: userID,
@@ -3670,6 +3719,13 @@ func (s *Service) DeleteWorker(ctx context.Context, userID, workerID uuid.UUID) 
 	}
 	if active > 0 {
 		return ErrWorkerHasActiveRuns
+	}
+	holds, err := s.q.CountOpenCustodyHoldsForWorker(ctx, workerID)
+	if err != nil {
+		return err
+	}
+	if holds > 0 {
+		return &WorkerHasCustodyError{Holds: holds}
 	}
 	n, err := s.q.DeleteWorkerForUser(ctx, store.DeleteWorkerForUserParams{ID: workerID, UserID: userID})
 	if err != nil {
@@ -4393,6 +4449,13 @@ type SweepResult struct {
 	// count. Normally 0 (the completion interlock is rollout-OFF and this only fires on a spared,
 	// budget-exhausted run).
 	CompletionBudgetExhausted int64
+	// CustodyReleased is the number of OPEN custody holds this pass released because
+	// their release was warranted (a completed run, or a ready capture) but never
+	// applied — the backstop for a best-effort terminal release that failed after a
+	// successful publication (PRD #1296 M4, D3). Releasing nulls the hold's live FKs so
+	// normal reap can then delete the worker. Normally 0: the candidate query reads only
+	// stuck holds, a set that is empty on a healthy instance.
+	CustodyReleased int64
 }
 
 // -------------------------------------------------------------------------

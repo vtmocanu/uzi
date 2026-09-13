@@ -5534,6 +5534,15 @@ SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.v
              AND r.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
              AND r.kind <> 'chat'
        ) AS active_runs,
+       -- retaining_unpublished_work (PRD #1296 M4, D4): does this worker hold any OPEN
+       -- custody hold? A held worker consumes NO active run/LLM slot (so it is not counted
+       -- in busy/active_runs above), but it is NOT free capacity — it still counts against
+       -- the per-owner hosted quota, and the owner surface distinguishes it. A top-level
+       -- EXISTS types as a plain Go bool here, exactly like the busy column above.
+       EXISTS (
+           SELECT 1 FROM recovery_custody_holds h
+           WHERE h.live_worker_id = w.id AND h.state = 'open'
+       ) AS retaining_unpublished_work,
        -- Roll health (PRD #113 M4), LEFT JOINed so a worker with no report — every
        -- external worker, any hosted worker the controller has not reached, and the
        -- entire fleet under docker-compose where no controller runs — still lists.
@@ -5560,52 +5569,53 @@ ORDER BY w.created_at ASC
 `
 
 type ListWorkersByUserRow struct {
-	ID                      uuid.UUID          `json:"id"`
-	UserID                  uuid.UUID          `json:"user_id"`
-	Name                    string             `json:"name"`
-	TokenHash               []byte             `json:"token_hash"`
-	Status                  string             `json:"status"`
-	LastHeartbeatAt         pgtype.Timestamptz `json:"last_heartbeat_at"`
-	Version                 pgtype.Text        `json:"version"`
-	CreatedAt               pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt               pgtype.Timestamptz `json:"updated_at"`
-	TemplateDeclared        pgtype.Text        `json:"template_declared"`
-	TemplateReported        pgtype.Text        `json:"template_reported"`
-	MaxConcurrentRuns       pgtype.Int4        `json:"max_concurrent_runs"`
-	StatsCpuPct             pgtype.Float4      `json:"stats_cpu_pct"`
-	StatsMemBytes           pgtype.Int8        `json:"stats_mem_bytes"`
-	StatsMemLimitBytes      pgtype.Int8        `json:"stats_mem_limit_bytes"`
-	StatsSource             pgtype.Text        `json:"stats_source"`
-	Kind                    string             `json:"kind"`
-	HostedSize              pgtype.Text        `json:"hosted_size"`
-	HostedGeneration        int64              `json:"hosted_generation"`
-	DockerEnabled           pgtype.Bool        `json:"docker_enabled"`
-	AnthropicSecretID       pgtype.UUID        `json:"anthropic_secret_id"`
-	AnthropicBindMode       string             `json:"anthropic_bind_mode"`
-	OnlineSince             pgtype.Timestamptz `json:"online_since"`
-	DrainingSince           pgtype.Timestamptz `json:"draining_since"`
-	Capabilities            []string           `json:"capabilities"`
-	Ephemeral               bool               `json:"ephemeral"`
-	EphemeralRunID          pgtype.UUID        `json:"ephemeral_run_id"`
-	StatsDiskNixBytes       pgtype.Int8        `json:"stats_disk_nix_bytes"`
-	StatsDiskNixTotalBytes  pgtype.Int8        `json:"stats_disk_nix_total_bytes"`
-	StatsDiskDataBytes      pgtype.Int8        `json:"stats_disk_data_bytes"`
-	StatsDiskDataTotalBytes pgtype.Int8        `json:"stats_disk_data_total_bytes"`
-	StatsDiskPressureStreak int32              `json:"stats_disk_pressure_streak"`
-	ProtocolCapabilities    []string           `json:"protocol_capabilities"`
-	AnthropicSecretLabel    pgtype.Text        `json:"anthropic_secret_label"`
-	Busy                    bool               `json:"busy"`
-	ActiveRuns              int64              `json:"active_runs"`
-	RollPhase               pgtype.Text        `json:"roll_phase"`
-	RollPhaseSince          pgtype.Timestamptz `json:"roll_phase_since"`
-	RollPodPhase            pgtype.Text        `json:"roll_pod_phase"`
-	RollBlockingContainer   pgtype.Text        `json:"roll_blocking_container"`
-	RollBlockingReason      pgtype.Text        `json:"roll_blocking_reason"`
-	RollRestartCount        pgtype.Int4        `json:"roll_restart_count"`
-	RollLastExitCode        pgtype.Int4        `json:"roll_last_exit_code"`
-	RollObservedAt          pgtype.Timestamptz `json:"roll_observed_at"`
-	RollUpgradingSince      pgtype.Timestamptz `json:"roll_upgrading_since"`
-	RollWorkerImageTag      pgtype.Text        `json:"roll_worker_image_tag"`
+	ID                       uuid.UUID          `json:"id"`
+	UserID                   uuid.UUID          `json:"user_id"`
+	Name                     string             `json:"name"`
+	TokenHash                []byte             `json:"token_hash"`
+	Status                   string             `json:"status"`
+	LastHeartbeatAt          pgtype.Timestamptz `json:"last_heartbeat_at"`
+	Version                  pgtype.Text        `json:"version"`
+	CreatedAt                pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt                pgtype.Timestamptz `json:"updated_at"`
+	TemplateDeclared         pgtype.Text        `json:"template_declared"`
+	TemplateReported         pgtype.Text        `json:"template_reported"`
+	MaxConcurrentRuns        pgtype.Int4        `json:"max_concurrent_runs"`
+	StatsCpuPct              pgtype.Float4      `json:"stats_cpu_pct"`
+	StatsMemBytes            pgtype.Int8        `json:"stats_mem_bytes"`
+	StatsMemLimitBytes       pgtype.Int8        `json:"stats_mem_limit_bytes"`
+	StatsSource              pgtype.Text        `json:"stats_source"`
+	Kind                     string             `json:"kind"`
+	HostedSize               pgtype.Text        `json:"hosted_size"`
+	HostedGeneration         int64              `json:"hosted_generation"`
+	DockerEnabled            pgtype.Bool        `json:"docker_enabled"`
+	AnthropicSecretID        pgtype.UUID        `json:"anthropic_secret_id"`
+	AnthropicBindMode        string             `json:"anthropic_bind_mode"`
+	OnlineSince              pgtype.Timestamptz `json:"online_since"`
+	DrainingSince            pgtype.Timestamptz `json:"draining_since"`
+	Capabilities             []string           `json:"capabilities"`
+	Ephemeral                bool               `json:"ephemeral"`
+	EphemeralRunID           pgtype.UUID        `json:"ephemeral_run_id"`
+	StatsDiskNixBytes        pgtype.Int8        `json:"stats_disk_nix_bytes"`
+	StatsDiskNixTotalBytes   pgtype.Int8        `json:"stats_disk_nix_total_bytes"`
+	StatsDiskDataBytes       pgtype.Int8        `json:"stats_disk_data_bytes"`
+	StatsDiskDataTotalBytes  pgtype.Int8        `json:"stats_disk_data_total_bytes"`
+	StatsDiskPressureStreak  int32              `json:"stats_disk_pressure_streak"`
+	ProtocolCapabilities     []string           `json:"protocol_capabilities"`
+	AnthropicSecretLabel     pgtype.Text        `json:"anthropic_secret_label"`
+	Busy                     bool               `json:"busy"`
+	ActiveRuns               int64              `json:"active_runs"`
+	RetainingUnpublishedWork bool               `json:"retaining_unpublished_work"`
+	RollPhase                pgtype.Text        `json:"roll_phase"`
+	RollPhaseSince           pgtype.Timestamptz `json:"roll_phase_since"`
+	RollPodPhase             pgtype.Text        `json:"roll_pod_phase"`
+	RollBlockingContainer    pgtype.Text        `json:"roll_blocking_container"`
+	RollBlockingReason       pgtype.Text        `json:"roll_blocking_reason"`
+	RollRestartCount         pgtype.Int4        `json:"roll_restart_count"`
+	RollLastExitCode         pgtype.Int4        `json:"roll_last_exit_code"`
+	RollObservedAt           pgtype.Timestamptz `json:"roll_observed_at"`
+	RollUpgradingSince       pgtype.Timestamptz `json:"roll_upgrading_since"`
+	RollWorkerImageTag       pgtype.Text        `json:"roll_worker_image_tag"`
 }
 
 // Worker list for the owning user. Two derived signals (PRD #42 Decision 10):
@@ -5673,6 +5683,7 @@ func (q *Queries) ListWorkersByUser(ctx context.Context, userID uuid.UUID) ([]Li
 			&i.AnthropicSecretLabel,
 			&i.Busy,
 			&i.ActiveRuns,
+			&i.RetainingUnpublishedWork,
 			&i.RollPhase,
 			&i.RollPhaseSince,
 			&i.RollPodPhase,

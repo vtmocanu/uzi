@@ -615,7 +615,12 @@ var workerDTOKeys = []string{
 	// worker's self-report and its template-derived caps, v1 vocabulary {docker, jvm}).
 	// Read-only display for the workers UI.
 	"capabilities",
-	"max_concurrent_runs", "template_declared", "template_reported", "version",
+	"max_concurrent_runs",
+	// PRD #1296 M4 (D4): true when the worker holds an OPEN durable-recovery custody hold —
+	// it retained committed work a run could not publish. Distinct from busy (a held worker
+	// consumes no run/LLM slot) but still counts against the per-owner hosted quota.
+	"retaining_unpublished_work",
+	"template_declared", "template_reported", "version",
 	// PRD #113: derived upgrade health, computed at read time from `version` against
 	// the control-plane release. Derived rather than stored, so nothing in the store
 	// layer pins it — this tag set is the only wire contract these two fields have.

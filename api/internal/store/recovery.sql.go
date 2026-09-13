@@ -73,6 +73,24 @@ func (q *Queries) BindCaptureManifest(ctx context.Context, arg BindCaptureManife
 	return i, err
 }
 
+const countOpenCustodyHoldsForWorker = `-- name: CountOpenCustodyHoldsForWorker :one
+SELECT count(*) FROM recovery_custody_holds
+WHERE live_worker_id = $1::uuid AND state = 'open'
+`
+
+// PRD #1296 M4 (D3): the DeleteWorker custody guard's predicate — how many OPEN custody
+// holds name this worker as their LIVE holder. Non-zero refuses the delete (deleting the
+// worker cascades hosted_worker_tokens, and a preauthorized upload may still need that
+// token to authenticate), so the caller surfaces the count of affected captures and
+// requires an explicit discard decision before the source's last authenticated retry path
+// is destroyed. Reads the same live_worker_id FK the M4 teardown DELETE skip predicate does.
+func (q *Queries) CountOpenCustodyHoldsForWorker(ctx context.Context, workerID uuid.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, countOpenCustodyHoldsForWorker, workerID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const discardCaptureForOwner = `-- name: DiscardCaptureForOwner :execrows
 WITH owned AS (
     SELECT rc.id AS capture_id FROM recovery_captures rc
@@ -327,6 +345,65 @@ func (q *Queries) ListCapturesForRunOwner(ctx context.Context, arg ListCapturesF
 			&i.ExpiresAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listReleasableCustodyHolds = `-- name: ListReleasableCustodyHolds :many
+SELECT h.id, h.user_id, h.repo_id, h.run_id, h.generation, h.state, h.original_worker_id, h.original_worker_identity, h.live_worker_id, h.live_run_id, h.created_at, h.updated_at, h.released_at FROM recovery_custody_holds h
+WHERE h.state = 'open'
+  AND (
+      EXISTS (SELECT 1 FROM runs r WHERE r.id = h.run_id AND r.status = 'completed')
+      OR EXISTS (SELECT 1 FROM recovery_captures c
+                   WHERE c.hold_id = h.id AND c.state = 'available')
+  )
+ORDER BY h.created_at ASC
+`
+
+// PRD #1296 M4 (D3): the custody-release RECONCILER's candidate set — OPEN holds whose
+// release is now WARRANTED but was never applied (e.g. the best-effort terminal release in
+// SetState failed after a full publication, leaving the live FKs set and blocking teardown).
+// Release is warranted ONLY when the recorded disposition proves the work is durable:
+//
+//	(a) the hold's run is 'completed' — a completed code-publishing run published its head,
+//	    so its unpublished-work custody is moot (full publication, D3); or
+//	(b) a READY capture ('available') exists for the hold — the required source is durably
+//	    archived, which itself releases the covered source's custody (D3).
+//
+// It NEVER infers success from an arbitrary terminal status: a 'failed'/'cancelled'/future
+// 'partial' run with no ready capture, and a 'running'/'queued' run, are excluded (a failed
+// run retains custody for capture/discard). Returns oldest-first for stable reconcile order;
+// the reconciler releases by run_id (idempotent) and lets normal reap proceed.
+func (q *Queries) ListReleasableCustodyHolds(ctx context.Context) ([]RecoveryCustodyHold, error) {
+	rows, err := q.db.Query(ctx, listReleasableCustodyHolds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []RecoveryCustodyHold{}
+	for rows.Next() {
+		var i RecoveryCustodyHold
+		if err := rows.Scan(
+			&i.ID,
+			&i.UserID,
+			&i.RepoID,
+			&i.RunID,
+			&i.Generation,
+			&i.State,
+			&i.OriginalWorkerID,
+			&i.OriginalWorkerIdentity,
+			&i.LiveWorkerID,
+			&i.LiveRunID,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.ReleasedAt,
 		); err != nil {
 			return nil, err
 		}

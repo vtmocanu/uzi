@@ -156,3 +156,35 @@ WHERE c.id = @id AND c.run_id = @run_id AND c.user_id = @user_id;
 UPDATE recovery_captures
 SET state = 'expired', updated_at = now()
 WHERE state = 'available' AND expires_at IS NOT NULL AND expires_at < @now;
+
+-- name: ListReleasableCustodyHolds :many
+-- PRD #1296 M4 (D3): the custody-release RECONCILER's candidate set — OPEN holds whose
+-- release is now WARRANTED but was never applied (e.g. the best-effort terminal release in
+-- SetState failed after a full publication, leaving the live FKs set and blocking teardown).
+-- Release is warranted ONLY when the recorded disposition proves the work is durable:
+--   (a) the hold's run is 'completed' — a completed code-publishing run published its head,
+--       so its unpublished-work custody is moot (full publication, D3); or
+--   (b) a READY capture ('available') exists for the hold — the required source is durably
+--       archived, which itself releases the covered source's custody (D3).
+-- It NEVER infers success from an arbitrary terminal status: a 'failed'/'cancelled'/future
+-- 'partial' run with no ready capture, and a 'running'/'queued' run, are excluded (a failed
+-- run retains custody for capture/discard). Returns oldest-first for stable reconcile order;
+-- the reconciler releases by run_id (idempotent) and lets normal reap proceed.
+SELECT h.* FROM recovery_custody_holds h
+WHERE h.state = 'open'
+  AND (
+      EXISTS (SELECT 1 FROM runs r WHERE r.id = h.run_id AND r.status = 'completed')
+      OR EXISTS (SELECT 1 FROM recovery_captures c
+                   WHERE c.hold_id = h.id AND c.state = 'available')
+  )
+ORDER BY h.created_at ASC;
+
+-- name: CountOpenCustodyHoldsForWorker :one
+-- PRD #1296 M4 (D3): the DeleteWorker custody guard's predicate — how many OPEN custody
+-- holds name this worker as their LIVE holder. Non-zero refuses the delete (deleting the
+-- worker cascades hosted_worker_tokens, and a preauthorized upload may still need that
+-- token to authenticate), so the caller surfaces the count of affected captures and
+-- requires an explicit discard decision before the source's last authenticated retry path
+-- is destroyed. Reads the same live_worker_id FK the M4 teardown DELETE skip predicate does.
+SELECT count(*) FROM recovery_custody_holds
+WHERE live_worker_id = @worker_id::uuid AND state = 'open';

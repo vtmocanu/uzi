@@ -93,6 +93,16 @@ type healthFakeStore struct {
 	// protocolCalls records every lookup's user id, so a test can prove the rung asks about THIS
 	// run's user and that the guards ahead of it (and the non-interlocked case) short-circuit.
 	protocolCalls []uuid.UUID
+	// custodyHolds is the canned CountUnresolvedCustodyHoldsForOwner answer (PRD #1296 M4): the
+	// owner's OPEN custody-hold count. >= custodyHoldLimit drives reasonCustodyLimit.
+	// custodyErr forces the read to fail (falls through to the generic queuedReason). The count
+	// predicate itself is pinned against a real Postgres by the store package; this side pins the
+	// ARM (count vs limit → reason mapping).
+	custodyHolds int64
+	custodyErr   error
+	// custodyCalls records every lookup's user id, so a test can prove the rung asks about THIS
+	// run's owner (the SAME predicate the claim gates on) and that vault-lock short-circuits it.
+	custodyCalls []uuid.UUID
 }
 
 func (f *healthFakeStore) ListActiveRunsForHealth(context.Context) ([]store.ListActiveRunsForHealthRow, error) {
@@ -104,6 +114,13 @@ func (f *healthFakeStore) ListRunToolWindow(_ context.Context, arg store.ListRun
 	}
 	f.windowCalls[arg.RunID]++
 	return f.window[arg.RunID], nil
+}
+func (f *healthFakeStore) CountUnresolvedCustodyHoldsForOwner(_ context.Context, userID uuid.UUID) (int64, error) {
+	f.custodyCalls = append(f.custodyCalls, userID)
+	if f.custodyErr != nil {
+		return 0, f.custodyErr
+	}
+	return f.custodyHolds, nil
 }
 func (f *healthFakeStore) CountOnlineWorkersForUser(context.Context, uuid.UUID) (int64, error) {
 	return f.onlineWorkers, nil
@@ -518,6 +535,55 @@ func TestHealthQueuedReasons(t *testing.T) {
 			}
 			if w.HealthReason.String != tc.want {
 				t.Fatalf("reason = %q, want %q", w.HealthReason.String, tc.want)
+			}
+		})
+	}
+}
+
+// TestHealthQueuedCustodyLimit drives the PRD #1296 M4 (D4) custody-limit rung through
+// detectRunHealth: a queued run whose OWNER is at the custody-hold admission limit reports
+// reasonCustodyLimit (flag healthWaitingWorker), resolved against the SAME predicate the
+// claim gates on (CountUnresolvedCustodyHoldsForOwner vs custodyHoldLimit) and AHEAD of every
+// worker-availability reason — so even a zero-worker fleet reports the custody block, because
+// bringing a worker online cannot clear it. Below the limit, or on a read error, it falls
+// through to the generic worker reasons rather than inventing one.
+func TestHealthQueuedCustodyLimit(t *testing.T) {
+	cases := []struct {
+		name    string
+		holds   int64
+		holdErr error
+		// zero online workers, so the fall-through reason is reasonNoWorker: proves the
+		// custody rung is checked AHEAD of worker availability (it wins despite 0 workers).
+		want string
+	}{
+		{"at the limit fires custody reason (beats no-worker)", int64(custodyHoldLimit), nil, reasonCustodyLimit},
+		{"over the limit fires custody reason", int64(custodyHoldLimit) + 3, nil, reasonCustodyLimit},
+		{"one below the limit falls through", int64(custodyHoldLimit) - 1, nil, reasonNoWorker},
+		{"read error falls through (no invented reason)", int64(custodyHoldLimit), errors.New("boom"), reasonNoWorker},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := runRow("queued")
+			r.StatusSince = ago(15 * time.Minute) // > 10m queued
+			fs := &healthFakeStore{
+				active:        []store.ListActiveRunsForHealthRow{r},
+				custodyHolds:  tc.holds,
+				custodyErr:    tc.holdErr,
+				onlineWorkers: 0, // no worker online → fall-through reason is reasonNoWorker
+			}
+			svc := healthSvc(fs, defaultHealthSettings()) // vlt nil → treated unlocked
+
+			svc.detectRunHealth(context.Background(), t0)
+			w := lastWrite(t, fs, r.ID)
+			if w.Health != healthWaitingWorker {
+				t.Fatalf("health = %q, want waiting_worker (the enum never changes)", w.Health)
+			}
+			if w.HealthReason.String != tc.want {
+				t.Fatalf("reason = %q, want %q", w.HealthReason.String, tc.want)
+			}
+			// The rung asks about THIS run's owner — the same predicate/owner the claim gates on.
+			if len(fs.custodyCalls) != 1 || fs.custodyCalls[0] != r.UserID {
+				t.Fatalf("custody lookups = %v, want exactly [%s] (the run's owner)", fs.custodyCalls, r.UserID)
 			}
 		})
 	}

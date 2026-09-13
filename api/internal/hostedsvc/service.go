@@ -212,10 +212,12 @@ func (s *Service) Poll(ctx context.Context) (PollResponse, error) {
 			// SQL booleans, mapped straight through.
 			DiskPressure: row.DiskPressure,
 			Ephemeral:    row.Ephemeral,
-			// PRD #1296 M1 (D3/D9): the custody-held signal round-trips on the wire from now
-			// on, but M1 emits it FALSE — M4 wires the real value from the recovery custody
-			// store into this poll. Explicit (not an implicit zero) to mark the M4 obligation.
-			CustodyHeld: false,
+			// PRD #1296 M4 (D3/D9): the custody-held signal, now sourced from the DB — true
+			// when the worker holds any OPEN custody hold (ListHostedWorkersForController's
+			// custody_held EXISTS column). A distinct desired-worker signal, independent of
+			// Busy/DrainingSince, that M4b's controller consumes so ordinary teardown and the
+			// data-PVC recycle path both keep a custody-held worker (and its PVC) alive.
+			CustodyHeld: row.CustodyHeld,
 		}
 		if row.DrainingSince.Valid {
 			t := row.DrainingSince.Time

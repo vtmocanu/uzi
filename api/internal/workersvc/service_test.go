@@ -483,6 +483,17 @@ type fakeStore struct {
 	delEphemeralRuns int64
 	delEphemeralArg  *uuid.UUID
 
+	// PRD #1296 M4 (D3/D4) custody. openCustodyHolds is the count both the DeleteWorker
+	// guard (CountOpenCustodyHoldsForWorker) and the queued-reason rung
+	// (CountUnresolvedCustodyHoldsForOwner) read; default 0 → no custody, so pre-#1296
+	// tests are unaffected. releasableHolds seeds the reconciler candidate list;
+	// releaseCustodyRows is what ReleaseCustodyForRun reports, and releasedCustodyRuns
+	// records every run id it was called with (SetState terminal release + reconciler).
+	openCustodyHolds    int64
+	releasableHolds     []store.RecoveryCustodyHold
+	releaseCustodyRows  int64
+	releasedCustodyRuns []uuid.UUID
+
 	// Chat (PRD #39).
 	chatClaimRun          store.Run
 	chatClaimErr          error
@@ -1326,6 +1337,21 @@ func (f *fakeStore) DeleteWorkerForUser(_ context.Context, arg store.DeleteWorke
 func (f *fakeStore) DeleteEphemeralWorkerForRun(_ context.Context, arg uuid.UUID) (int64, error) {
 	f.delEphemeralArg = &arg
 	return f.delEphemeralRuns, nil
+}
+
+// PRD #1296 M4 (D3/D4) custody stubs.
+func (f *fakeStore) CountOpenCustodyHoldsForWorker(_ context.Context, _ uuid.UUID) (int64, error) {
+	return f.openCustodyHolds, nil
+}
+func (f *fakeStore) CountUnresolvedCustodyHoldsForOwner(_ context.Context, _ uuid.UUID) (int64, error) {
+	return f.openCustodyHolds, nil
+}
+func (f *fakeStore) ListReleasableCustodyHolds(_ context.Context) ([]store.RecoveryCustodyHold, error) {
+	return f.releasableHolds, nil
+}
+func (f *fakeStore) ReleaseCustodyForRun(_ context.Context, runID uuid.UUID) (int64, error) {
+	f.releasedCustodyRuns = append(f.releasedCustodyRuns, runID)
+	return f.releaseCustodyRows, nil
 }
 func (f *fakeStore) GetRepoToolProfile(_ context.Context, _ store.GetRepoToolProfileParams) (store.RepoToolProfile, error) {
 	return f.toolProfile, f.toolProfileErr
@@ -2772,6 +2798,61 @@ func TestSetStateAppliedOnLiveRun(t *testing.T) {
 	}
 	if !applied {
 		t.Fatal("a transition on a non-terminal run must be applied (handler answers 200)")
+	}
+}
+
+// TestSetStateCompletedReleasesCustody proves the PRD #1296 M4 (D3) terminal SUCCESS
+// custody release: an APPLIED `completed` transition releases the run's custody
+// idempotently (a completed code-publishing run published its head, so unpublished-work
+// custody is moot). Uses checkpointDeleteSvc so the whole terminal-automation block runs.
+func TestSetStateCompletedReleasesCustody(t *testing.T) {
+	runID := uuid.New()
+	fs := &fakeStore{
+		runOwned: store.Run{
+			ID: runID, Kind: runkind.Issue,
+			IssueIid: pgtype.Int8{Int64: 5, Valid: true}, Status: "completed",
+		},
+		setCompletedRows:   1,
+		releaseCustodyRows: 1,
+	}
+	svc, _ := checkpointDeleteSvc(t, fs, nil)
+	_, applied, err := svc.SetState(context.Background(), worker(), runID, StateRequest{State: "completed"})
+	if err != nil {
+		t.Fatalf("SetState(completed): %v", err)
+	}
+	if !applied {
+		t.Fatal("applied = false, want true")
+	}
+	if len(fs.releasedCustodyRuns) != 1 || fs.releasedCustodyRuns[0] != runID {
+		t.Fatalf("ReleaseCustodyForRun calls = %v, want exactly [%s]", fs.releasedCustodyRuns, runID)
+	}
+}
+
+// TestSetStateFailedRetainsCustody proves the negative half of D3: a `failed` terminal
+// transition does NOT release custody — the source is retained for capture or explicit
+// discard. (cancelled follows the same path; the switch routes both, and neither is
+// 'completed'.)
+func TestSetStateFailedRetainsCustody(t *testing.T) {
+	runID := uuid.New()
+	fs := &fakeStore{
+		runOwned: store.Run{
+			ID: runID, Kind: runkind.Issue,
+			IssueIid: pgtype.Int8{Int64: 5, Valid: true}, Status: "failed",
+		},
+	}
+	svc, _ := checkpointDeleteSvc(t, fs, nil)
+	_, applied, err := svc.SetState(context.Background(), worker(), runID, StateRequest{State: "failed"})
+	if err != nil {
+		t.Fatalf("SetState(failed): %v", err)
+	}
+	if !applied {
+		t.Fatal("applied = false, want true")
+	}
+	if len(fs.releasedCustodyRuns) != 0 {
+		t.Fatalf("ReleaseCustodyForRun was called on a failed run (%v); failed runs must RETAIN custody", fs.releasedCustodyRuns)
+	}
+	if fs.setFailed == nil {
+		t.Fatal("SetRunFailed was not called; the failed transition must be recorded")
 	}
 }
 
@@ -4341,6 +4422,26 @@ func TestDeleteWorkerNotFoundWhenNoRowDeleted(t *testing.T) {
 	svc := New(fs, newBox(t), testParams())
 	if err := svc.DeleteWorker(context.Background(), uuid.New(), uuid.New()); err != ErrWorkerNotFound {
 		t.Fatalf("err = %v, want ErrWorkerNotFound", err)
+	}
+}
+
+func TestDeleteWorkerRejectedWhileHoldingCustody(t *testing.T) {
+	// PRD #1296 M4 (D3): an idle worker (no active runs) is STILL refused while it holds an
+	// open custody hold — deleting it would cascade the token an upload may still need. The
+	// error names the count so M4b's CLI confirmation can enumerate the affected captures.
+	fs := &fakeStore{countActiveRuns: 0, openCustodyHolds: 2, deleteWorkerRows: 1}
+	svc := New(fs, newBox(t), testParams())
+	err := svc.DeleteWorker(context.Background(), uuid.New(), uuid.New())
+	if !errors.Is(err, ErrWorkerHasCustody) {
+		t.Fatalf("err = %v, want ErrWorkerHasCustody", err)
+	}
+	var ce *WorkerHasCustodyError
+	if !errors.As(err, &ce) || ce.Holds != 2 {
+		t.Fatalf("err = %v, want *WorkerHasCustodyError naming 2 holds", err)
+	}
+	// The guard runs BEFORE the delete: no token-cascading DELETE while custody is open.
+	if fs.deleteWorkerParams != nil {
+		t.Fatal("no delete should be issued while the worker holds custody")
 	}
 }
 

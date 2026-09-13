@@ -97,6 +97,15 @@ SELECT w.*,
              AND r.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
              AND r.kind <> 'chat'
        ) AS active_runs,
+       -- retaining_unpublished_work (PRD #1296 M4, D4): does this worker hold any OPEN
+       -- custody hold? A held worker consumes NO active run/LLM slot (so it is not counted
+       -- in busy/active_runs above), but it is NOT free capacity — it still counts against
+       -- the per-owner hosted quota, and the owner surface distinguishes it. A top-level
+       -- EXISTS types as a plain Go bool here, exactly like the busy column above.
+       EXISTS (
+           SELECT 1 FROM recovery_custody_holds h
+           WHERE h.live_worker_id = w.id AND h.state = 'open'
+       ) AS retaining_unpublished_work,
        -- Roll health (PRD #113 M4), LEFT JOINed so a worker with no report — every
        -- external worker, any hosted worker the controller has not reached, and the
        -- entire fleet under docker-compose where no controller runs — still lists.

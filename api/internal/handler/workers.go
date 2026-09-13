@@ -177,6 +177,7 @@ func workerDTOFromRow(w store.ListWorkersByUserRow, cpVersion, pinnedWorkerVersi
 		Busy:                     w.Busy,
 		ActiveRuns:               int(w.ActiveRuns),
 		MaxConcurrentRuns:        intPtrValue(w.MaxConcurrentRuns),
+		RetainingUnpublishedWork: w.RetainingUnpublishedWork,
 		TemplateDeclared:         textPtrValue(w.TemplateDeclared.Valid, w.TemplateDeclared.String),
 		TemplateReported:         textPtrValue(w.TemplateReported.Valid, w.TemplateReported.String),
 		Version:                  textPtrValue(w.Version.Valid, w.Version.String),

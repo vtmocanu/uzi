@@ -1616,6 +1616,10 @@ export interface Worker {
   // "N/M runs" saturation badge (workerRunBadge in lib/workerRuns.ts).
   active_runs: number;
   max_concurrent_runs: number | null;
+  // retaining_unpublished_work (PRD #1296 M4): true when the worker holds an OPEN
+  // durable-recovery custody hold (unpublished committed work not yet archived), so
+  // teardown is deferred. Distinct from busy/active_runs — it consumes no run slot.
+  retaining_unpublished_work: boolean;
   // Worker template (PRD #18): the choice recorded at issuance and the value the
   // worker self-reports at register. Either may be null (no choice / older
   // image); a mismatch is surfaced as a drift badge, never a rejection.

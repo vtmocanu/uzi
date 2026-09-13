@@ -145,6 +145,10 @@ func TestSweeperPassLogsResumeOnlyTicks(t *testing.T) {
 		// line too — the guard sum AND emit list both include CompletionBudgetExhausted, else a
 		// steer-only tick logs nothing and the steer is invisible.
 		{name: "completion budget exhausted alone", res: workersvc.SweepResult{CompletionBudgetExhausted: 1}, attr: "completion_budget_exhausted"},
+		// PRD #1296 M4 (D3): a tick that ONLY releases a stuck custody hold must raise the line
+		// too — the guard sum AND emit list both include CustodyReleased, else a release-only
+		// tick logs nothing and the teardown-unblock is invisible.
+		{name: "custody released alone", res: workersvc.SweepResult{CustodyReleased: 1}, attr: "custody_released"},
 		{name: "idle tick logs nothing", res: workersvc.SweepResult{}, attr: ""},
 	}
 	for _, tc := range cases {

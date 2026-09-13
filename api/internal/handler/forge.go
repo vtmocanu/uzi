@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -859,6 +860,27 @@ func (h *Handler) DeleteRepo(w http.ResponseWriter, r *http.Request) {
 	}
 	if active > 0 {
 		httpx.JSON(w, http.StatusConflict, map[string]any{"error": "this repo has a run in progress; wait for it to finish before removing"})
+		return
+	}
+	// PRD #1296 M4 (D3): refuse GRACEFULLY when the repo's runs still hold OPEN custody —
+	// DeleteRepoForUser cascades the repo's runs (runs.repo_id ON DELETE CASCADE), which
+	// would otherwise hit an open hold's live_run_id ON DELETE RESTRICT FK and error
+	// mid-cascade, and — worse — destroy the last local source of unpublished work. Convert
+	// that into an enumerated 409 naming how many recovery archives the delete would
+	// destroy, so the owner must explicitly discard them (or let recovery complete) first.
+	// A deliberate destructive delete that would drop the final source must name affected
+	// captures and require an explicit discard decision, never inherit a generic cleanup.
+	custody, err := h.q.CountOpenCustodyHoldsForRepo(r.Context(), id)
+	if err != nil {
+		slog.Error("count custody holds for delete", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if custody > 0 {
+		httpx.JSON(w, http.StatusConflict, map[string]any{
+			"error":         fmt.Sprintf("this repo is retaining unpublished work for recovery in %d run(s); discard or download those recovery archives before removing it", custody),
+			"custody_holds": custody,
+		})
 		return
 	}
 	// The :execrows return may be 0 if a concurrent enable slipped in between the

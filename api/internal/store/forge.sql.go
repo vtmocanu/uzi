@@ -186,6 +186,26 @@ func (q *Queries) CountBoardColumns(ctx context.Context, repoID uuid.UUID) (int6
 	return count, err
 }
 
+const countOpenCustodyHoldsForRepo = `-- name: CountOpenCustodyHoldsForRepo :one
+SELECT count(*) FROM recovery_custody_holds
+WHERE repo_id = $1::uuid AND state = 'open'
+`
+
+// PRD #1296 M4 (D3): the repo-delete custody guard's predicate. DeleteRepoForUser cascades
+// the repo's runs (runs.repo_id ON DELETE CASCADE), which would hit a still-open hold's
+// ON DELETE RESTRICT live_run_id FK and error mid-cascade. This counts the OPEN custody
+// holds on the repo's runs so the delete path can refuse GRACEFULLY with an enumerated
+// count instead — the owner must explicitly discard those captures (or let recovery
+// complete) before the last local source is destroyed. Scoped through the repo's runs,
+// reading recovery_custody_holds.repo_id (recorded at claim) directly so it stays correct
+// even after a run row is later reaped (the hold's run_id FK is SET NULL-free by design).
+func (q *Queries) CountOpenCustodyHoldsForRepo(ctx context.Context, repoID uuid.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, countOpenCustodyHoldsForRepo, repoID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const deleteBoardColumnsByRepo = `-- name: DeleteBoardColumnsByRepo :exec
 DELETE FROM board_columns WHERE repo_id = $1
 `

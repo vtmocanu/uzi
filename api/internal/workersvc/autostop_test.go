@@ -1077,6 +1077,13 @@ func (f *autoStopSweepStore) ListPoolWaitRuns(context.Context) ([]store.ListPool
 func (f *autoStopSweepStore) PromotePoolWaitRun(context.Context, store.PromotePoolWaitRunParams) (int64, error) {
 	return 0, nil
 }
+
+// PRD #1296 M4's custody-release reconciler pass. Empty for the same reason as the other
+// passes this fixture does not exercise: its subject is the auto-stop streak, so no hold is
+// releasable and Sweep still runs end to end.
+func (f *autoStopSweepStore) ListReleasableCustodyHolds(context.Context) ([]store.RecoveryCustodyHold, error) {
+	return nil, nil
+}
 func (f *autoStopSweepStore) ListActiveRunsForHealth(context.Context) ([]store.ListActiveRunsForHealthRow, error) {
 	return f.active, nil
 }
