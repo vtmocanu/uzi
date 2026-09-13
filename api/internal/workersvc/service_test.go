@@ -172,6 +172,12 @@ type fakeStore struct {
 	// Ownership + messages + state.
 	runOwned    store.Run
 	runOwnedErr error
+	// Orphan-classification read (issue #1319): orphanParams captures the args so a test
+	// can prove the owner-scope (user_id + the claimant's repo_id, NOT worker_id);
+	// orphanRow/orphanErr drive the return.
+	orphanParams *store.GetRunOrphanIdentityParams
+	orphanRow    store.GetRunOrphanIdentityRow
+	orphanErr    error
 	// checkpointTips records every SetRunCheckpointTip write (PRD #1042 M2) in order,
 	// so a Publish test can prove the tip is persisted on each successful publish and
 	// NOT on a benign-skip publish. checkpointTipErr forces the best-effort write to
@@ -858,6 +864,10 @@ func (f *fakeStore) MarkRunFailedByID(_ context.Context, arg store.MarkRunFailed
 }
 func (f *fakeStore) GetRunOwnedByWorker(context.Context, store.GetRunOwnedByWorkerParams) (store.Run, error) {
 	return f.runOwned, f.runOwnedErr
+}
+func (f *fakeStore) GetRunOrphanIdentity(_ context.Context, arg store.GetRunOrphanIdentityParams) (store.GetRunOrphanIdentityRow, error) {
+	f.orphanParams = &arg
+	return f.orphanRow, f.orphanErr
 }
 func (f *fakeStore) GetRunForgeConnForWorker(context.Context, store.GetRunForgeConnForWorkerParams) (store.GetRunForgeConnForWorkerRow, error) {
 	return store.GetRunForgeConnForWorkerRow{}, nil
@@ -3400,6 +3410,109 @@ func TestConsumeInputsRequiresOwnership(t *testing.T) {
 	fs := &fakeStore{runOwnedErr: pgx.ErrNoRows}
 	svc := New(fs, newBox(t), testParams())
 	if _, err := svc.ConsumeInputs(context.Background(), worker(), uuid.New()); err != ErrRunNotOwned {
+		t.Fatalf("err = %v, want ErrRunNotOwned", err)
+	}
+}
+
+// -------------------------------------------------------------------------
+// Orphan classification (issue #1319)
+// -------------------------------------------------------------------------
+
+// TestRunOrphanClassificationRequiresClaimant pins that a claimant run the worker does
+// NOT hold (GetRunOwnedByWorker → ErrNoRows) is ErrRunNotOwned, before the owner read runs.
+func TestRunOrphanClassificationRequiresClaimant(t *testing.T) {
+	fs := &fakeStore{runOwnedErr: pgx.ErrNoRows}
+	svc := New(fs, newBox(t), testParams())
+	if _, err := svc.RunOrphanClassification(context.Background(), worker(), uuid.New(), uuid.New()); err != ErrRunNotOwned {
+		t.Fatalf("err = %v, want ErrRunNotOwned", err)
+	}
+	if fs.orphanParams != nil {
+		t.Fatal("owner read must not run when the claimant is not held")
+	}
+}
+
+// TestRunOrphanClassificationRepoLessClaimant pins that a repo-less claimant (a chat/
+// self_improve run) cannot reclaim — ErrRunNotOwned, and the owner read never runs.
+func TestRunOrphanClassificationRepoLessClaimant(t *testing.T) {
+	w := worker()
+	fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID)}} // RepoID zero (NULL)
+	svc := New(fs, newBox(t), testParams())
+	if _, err := svc.RunOrphanClassification(context.Background(), w, uuid.New(), uuid.New()); err != ErrRunNotOwned {
+		t.Fatalf("err = %v, want ErrRunNotOwned", err)
+	}
+	if fs.orphanParams != nil {
+		t.Fatal("owner read must not run for a repo-less claimant")
+	}
+}
+
+// TestRunOrphanClassificationOwnerScope is the crux of #1319: the owner read is scoped to
+// the worker's OWNER (user) + the CLAIMANT's repo, NOT worker_id, so a terminal owner that
+// moved workers is still found. It also pins that the row's nullable columns unwrap to
+// value-or-nil pointers.
+func TestRunOrphanClassificationOwnerScope(t *testing.T) {
+	w := worker()
+	repoID := uuid.New()
+	ownerRunID := uuid.New()
+	fs := &fakeStore{
+		runOwned: store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), RepoID: pgconv.UUID(repoID)},
+		orphanRow: store.GetRunOrphanIdentityRow{
+			Status:      "completed",
+			RepoID:      pgconv.UUID(repoID),
+			Kind:        "issue",
+			IssueIid:    pgtype.Int8{Int64: 1319, Valid: true},
+			Branch:      pgtype.Text{String: "uzi/ci-fix", Valid: true},
+			PipelineRef: pgtype.Text{}, // NULL → nil pointer
+			PipelineID:  pgtype.Int8{Int64: 42, Valid: true},
+		},
+	}
+	svc := New(fs, newBox(t), testParams())
+	id, err := svc.RunOrphanClassification(context.Background(), w, uuid.New(), ownerRunID)
+	if err != nil {
+		t.Fatalf("RunOrphanClassification: %v", err)
+	}
+	// Owner-scope: user_id (NOT worker_id) + the claimant's repo_id, keyed on the owner id.
+	if fs.orphanParams == nil {
+		t.Fatal("owner read was not performed")
+	}
+	if fs.orphanParams.UserID != w.UserID {
+		t.Fatalf("owner read scoped to user %v, want the worker's owner %v", fs.orphanParams.UserID, w.UserID)
+	}
+	if fs.orphanParams.RepoID.Bytes != repoID || !fs.orphanParams.RepoID.Valid {
+		t.Fatalf("owner read scoped to repo %+v, want the claimant's repo %v", fs.orphanParams.RepoID, repoID)
+	}
+	if fs.orphanParams.ID != ownerRunID {
+		t.Fatalf("owner read keyed on %v, want the owner run id %v", fs.orphanParams.ID, ownerRunID)
+	}
+	// Identity unwrap: terminal status flows through; NULL columns become nil pointers.
+	if id.Status != "completed" || id.RepoID != repoID || id.Kind != "issue" {
+		t.Fatalf("identity = %+v, want completed/issue in repo %v", id, repoID)
+	}
+	if id.IssueIID == nil || *id.IssueIID != 1319 {
+		t.Fatalf("issue_iid = %v, want 1319", id.IssueIID)
+	}
+	if id.Branch == nil || *id.Branch != "uzi/ci-fix" {
+		t.Fatalf("branch = %v, want uzi/ci-fix", id.Branch)
+	}
+	if id.PipelineRef != nil {
+		t.Fatalf("pipeline_ref = %v, want nil (NULL column)", *id.PipelineRef)
+	}
+	if id.PipelineID == nil || *id.PipelineID != 42 {
+		t.Fatalf("pipeline_id = %v, want 42", id.PipelineID)
+	}
+}
+
+// TestRunOrphanClassificationOwnerNotFound pins that when no owner run matches the
+// owner+repo scope (GetRunOrphanIdentity → ErrNoRows), the service returns ErrRunNotOwned
+// (which the handler maps to 404) rather than a bare pgx error.
+func TestRunOrphanClassificationOwnerNotFound(t *testing.T) {
+	w := worker()
+	repoID := uuid.New()
+	fs := &fakeStore{
+		runOwned:  store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), RepoID: pgconv.UUID(repoID)},
+		orphanErr: pgx.ErrNoRows,
+	}
+	svc := New(fs, newBox(t), testParams())
+	if _, err := svc.RunOrphanClassification(context.Background(), w, uuid.New(), uuid.New()); err != ErrRunNotOwned {
 		t.Fatalf("err = %v, want ErrRunNotOwned", err)
 	}
 }

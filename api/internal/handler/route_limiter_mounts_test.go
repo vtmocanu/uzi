@@ -67,7 +67,10 @@ var limiterNames = [...]string{
 // error rather than a failing row. Spelled `lim*` rather than matching the parameter
 // names exactly, so nothing here shadows a parameter inside Routes.
 //
-// 195 as of this commit (PRD #1184 M3 added GET /api/admin/judge/recommendations/issue-draft
+// 196 as of this commit (issue #1319 added GET /api/worker/runs/{id}/orphan-classification —
+// the worker-authenticated, owner-scoped orphan-classification read; {id}=claimant, ?owner=
+// the orphan owner run. noLimiter, like the other worker /runs/{id}/... reads it sits beside.)
+// It was 195 until then (PRD #1184 M3 added GET /api/admin/judge/recommendations/issue-draft
 // and POST /api/admin/judge/recommendations/issue — the admin "All users" issue draft READ and
 // the FILE write. The draft is a read in the admin read group → noLimiter, like the aggregate
 // reads; the file is a forge WRITE in the admin write group behind forgeLimiter, like the owner
@@ -398,6 +401,7 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/worker/runs/{id}/forge/pipelines/{pipeline_id}/jobs", noLimiter},
 	{"GET", "/api/worker/runs/{id}/inputs", noLimiter},
 	{"GET", "/api/worker/runs/{id}/memory", noLimiter},
+	{"GET", "/api/worker/runs/{id}/orphan-classification", noLimiter},
 	{"GET", "/api/worker/runs/{id}/ownership", noLimiter},
 	{"GET", "/api/worker/runs/{id}/trace", noLimiter},
 	{"GET", "/api/workers/", noLimiter},

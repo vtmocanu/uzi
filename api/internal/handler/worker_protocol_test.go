@@ -34,6 +34,9 @@ type protocolStore struct {
 	ownedErr      error
 	completedRows int64
 	heartbeatArg  store.HeartbeatWorkerParams
+	// Orphan-classification read (issue #1319): the owner-run row/error the orphan query returns.
+	orphanRow store.GetRunOrphanIdentityRow
+	orphanErr error
 }
 
 func (p *protocolStore) ClaimRun(context.Context, store.ClaimRunParams) (store.Run, error) {
@@ -41,6 +44,9 @@ func (p *protocolStore) ClaimRun(context.Context, store.ClaimRunParams) (store.R
 }
 func (p *protocolStore) GetRunOwnedByWorker(context.Context, store.GetRunOwnedByWorkerParams) (store.Run, error) {
 	return p.ownedRun, p.ownedErr
+}
+func (p *protocolStore) GetRunOrphanIdentity(context.Context, store.GetRunOrphanIdentityParams) (store.GetRunOrphanIdentityRow, error) {
+	return p.orphanRow, p.orphanErr
 }
 func (p *protocolStore) SetRunCompleted(context.Context, store.SetRunCompletedParams) (int64, error) {
 	return p.completedRows, nil
@@ -862,6 +868,94 @@ func TestWorkerRunOwnershipTerminalReturnsStatus(t *testing.T) {
 	}
 	if got.Status != "completed" {
 		t.Fatalf("status = %q, want %q", got.Status, "completed")
+	}
+}
+
+// orphanReq is workerReq with an ?owner=<uuid> query param — {id} is the CLAIMANT run
+// the worker holds, ?owner is the orphan owner run id (issue #1319).
+func orphanReq(claimantID uuid.UUID, ownerRaw string) *http.Request {
+	req := workerReq(http.MethodGet, "", claimantID)
+	req.URL.RawQuery = "owner=" + ownerRaw
+	return req
+}
+
+// TestWorkerRunOrphanClassificationForeignClaimantReturns404 pins that a claimant run
+// the worker does not hold (GetRunOwnedByWorker → ErrNoRows → ErrRunNotOwned) is a 404,
+// mirroring WorkerRunOwnership's reclaim signal.
+func TestWorkerRunOrphanClassificationForeignClaimantReturns404(t *testing.T) {
+	h := newProtocolHandler(t, &protocolStore{ownedErr: pgx.ErrNoRows})
+	rec := httptest.NewRecorder()
+	h.WorkerRunOrphanClassification(rec, orphanReq(uuid.New(), uuid.New().String()))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (claimant not owned by this worker)", rec.Code)
+	}
+}
+
+// TestWorkerRunOrphanClassificationMalformedOwnerReturns400 pins that a non-UUID ?owner
+// query param is a 400, before the service is reached.
+func TestWorkerRunOrphanClassificationMalformedOwnerReturns400(t *testing.T) {
+	h := newProtocolHandler(t, &protocolStore{})
+	rec := httptest.NewRecorder()
+	h.WorkerRunOrphanClassification(rec, orphanReq(uuid.New(), "not-a-uuid"))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (malformed owner id)", rec.Code)
+	}
+}
+
+// TestWorkerRunOrphanClassificationHappyPath pins the success wire: an owner run in the
+// claimant's repo returns 200 with the identity JSON — the exact keys the agent decodes,
+// with a terminal status flowing through and NULL columns serialized as JSON null.
+func TestWorkerRunOrphanClassificationHappyPath(t *testing.T) {
+	repoID := uuid.New()
+	h := newProtocolHandler(t, &protocolStore{
+		ownedRun: store.Run{ID: uuid.New(), RepoID: pgtype.UUID{Bytes: repoID, Valid: true}},
+		orphanRow: store.GetRunOrphanIdentityRow{
+			Status:      "completed",
+			RepoID:      pgtype.UUID{Bytes: repoID, Valid: true},
+			Kind:        "issue",
+			IssueIid:    pgtype.Int8{Int64: 1319, Valid: true},
+			Branch:      pgtype.Text{String: "uzi/ci-fix", Valid: true},
+			PipelineRef: pgtype.Text{}, // NULL → JSON null
+			PipelineID:  pgtype.Int8{Int64: 42, Valid: true},
+		},
+	})
+	rec := httptest.NewRecorder()
+	h.WorkerRunOrphanClassification(rec, orphanReq(uuid.New(), uuid.New().String()))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%q", rec.Code, rec.Body.String())
+	}
+	var got struct {
+		Status      string  `json:"status"`
+		RepoID      string  `json:"repo_id"`
+		Kind        string  `json:"kind"`
+		IssueIID    *int64  `json:"issue_iid"`
+		Branch      *string `json:"branch"`
+		PipelineRef *string `json:"pipeline_ref"`
+		PipelineID  *int64  `json:"pipeline_id"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if got.Status != "completed" {
+		t.Fatalf("status = %q, want completed (terminal flows through)", got.Status)
+	}
+	if got.RepoID != repoID.String() {
+		t.Fatalf("repo_id = %q, want %q", got.RepoID, repoID.String())
+	}
+	if got.Kind != "issue" {
+		t.Fatalf("kind = %q, want issue", got.Kind)
+	}
+	if got.IssueIID == nil || *got.IssueIID != 1319 {
+		t.Fatalf("issue_iid = %v, want 1319", got.IssueIID)
+	}
+	if got.Branch == nil || *got.Branch != "uzi/ci-fix" {
+		t.Fatalf("branch = %v, want uzi/ci-fix", got.Branch)
+	}
+	if got.PipelineRef != nil {
+		t.Fatalf("pipeline_ref = %v, want null (NULL column)", *got.PipelineRef)
+	}
+	if got.PipelineID == nil || *got.PipelineID != 42 {
+		t.Fatalf("pipeline_id = %v, want 42", got.PipelineID)
 	}
 }
 

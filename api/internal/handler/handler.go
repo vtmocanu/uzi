@@ -1026,6 +1026,13 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// GetRunOwnedByWorker; no new query.
 		r.Get("/runs/{id}/ownership", h.WorkerRunOwnership)
 
+		// Orphan-classification read (issue #1319): worker-authenticated, READ ONLY.
+		// {id} = the CLAIMANT run the worker holds (authz anchor + current repo);
+		// ?owner = the orphan owner run id. Scoped to the worker's OWNER (user) +
+		// the claimant's repo, NOT worker_id, so a terminal owner that moved workers
+		// is still found (Gap 2). Distinct query from GetRunOwnedByWorker.
+		r.Get("/runs/{id}/orphan-classification", h.WorkerRunOrphanClassification)
+
 		// Checkpoint publish (PRD #122 M8): the worker POSTs a raw delta packfile +
 		// tip OID; the api derives repo/branch/PAT from the run row and pushes it
 		// NON-FORCED to refs/uzi-checkpoints/<branch>. Inherits RequireWorker; feeds

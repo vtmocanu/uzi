@@ -101,6 +101,17 @@ func intPtr(v pgtype.Int4) *int {
 	return &i
 }
 
+// int64Ptr returns the persisted int8 as *int64, nil when the column is NULL — the int8
+// sibling of intPtr, used to unwrap the orphan-classification row's nullable issue_iid /
+// pipeline_id (issue #1319) so SQL NULL serializes as JSON null.
+func int64Ptr(v pgtype.Int8) *int64 {
+	if !v.Valid {
+		return nil
+	}
+	n := v.Int64
+	return &n
+}
+
 // resolveEffortPtr resolves the owner's per-user default reasoning effort to the
 // level the worker applies (PRD #617 + issue #1157): the owner's explicit choice,
 // or the uzi default (xhigh) when the column is NULL/blank. The wire field stays
