@@ -144,8 +144,15 @@ fi
 # Stable: releases/latest == the tag. RC: the tag's Release is prerelease AND
 # releases/latest is unchanged (some LOWER stable, never the RC). releases/latest is the
 # newest non-prerelease Release, so on an RC it correctly returns the previous stable.
-latest="$(gh api "repos/${OWNER}/${REPO}/releases/latest" --jq '.tag_name' 2>/dev/null || true)"
-if [ "$MODE" = stable ]; then
+latest="$(gh api "repos/${OWNER}/${REPO}/releases/latest" --jq '.tag_name' 2>/dev/null)"; latest_rc=$?
+# Fail CLOSED on a lookup error, same as the GHCR image checks above. An empty $latest
+# from a rate-limited or auth-failed query must NOT silently pass the RC check below
+# (`"" != $TAG` would read as "latest unchanged" without ever confirming it). A 404 here
+# means no stable release exists yet; the train always cuts above a prior stable, so that
+# is not a normal RC state — re-run verify.
+if [ "$latest_rc" -ne 0 ]; then
+  fail "could not query releases/latest (gh/network error) — re-run verify"
+elif [ "$MODE" = stable ]; then
   if [ "$latest" = "$TAG" ]; then pass "GitHub Release $TAG is marked latest"
   else fail "releases/latest is '${latest:-<none>}', expected $TAG"; fi
 else

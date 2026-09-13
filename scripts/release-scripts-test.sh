@@ -507,6 +507,23 @@ assert_eq "--promote leaves the worker pin unchanged (D11)" "$pin_before" "$(pin
 
 echo "=== M2b: --promote allowlist abort ==="
 S9="$(mktemp -d)"; seed_repo "$S9"; add_feature "$S9" 201
+# Replace worker-tag-autobump.sh with a version-conditional stub and COMMIT it, so it
+# rides into the v0.2.0-rc.1 promote worktree (a stub written after the RC tag would not
+# exist there, and an uncommitted one would trip release-cut's clean-tree precondition
+# before promote_inflight — CR review of PR #1322). When promote_inflight runs it for the
+# stable base (arg 0.2.0) it creates AND stages a non-allowlisted file, so the promote
+# commit's diff leaves the allowlist and the guard must abort BEFORE any tag exists. The
+# bare-base condition leaves the first RC cut (which calls it with 0.2.0-rc.1) unaffected.
+cat > "$S9/scripts/worker-tag-autobump.sh" <<'SH'
+#!/usr/bin/env bash
+if [ "${1#v}" = "0.2.0" ]; then
+  echo 'package main // injected' > api/injected.go
+  git add api/injected.go
+fi
+exit 0
+SH
+chmod +x "$S9/scripts/worker-tag-autobump.sh"
+git -C "$S9" add scripts/worker-tag-autobump.sh; gcommit "$S9" "test: version-conditional injecting autobump stub"
 put_changelog "$S9" <<'MD'
 # Changelog
 
@@ -535,16 +552,9 @@ put_changelog "$S9" <<'MD'
 ### Added
 - **Initial** (#100)
 MD
-# make autobump ALSO touch a non-allowlisted file, so the promote commit's diff leaves
-# the allowlist and the guard must abort before any tag exists.
-cat > "$S9/scripts/worker-tag-autobump.sh" <<'SH'
-#!/usr/bin/env bash
-echo 'package main // injected' > api/injected.go
-exit 0
-SH
-chmod +x "$S9/scripts/worker-tag-autobump.sh"
 run_rc "$S9" 0.3.0 --promote
 if [ "$RC_RC" -ne 0 ]; then pass "--promote aborts on a non-allowlisted change"; else fail "--promote aborts on a non-allowlisted change"; fi
+assert_contains "abort names the non-allowlisted file" "non-allowlisted file:" "$RC_OUT"
 if git -C "$S9" rev-parse -q --verify refs/tags/v0.2.0 >/dev/null; then fail "aborted promote leaves NO v0.2.0 tag"; else pass "aborted promote leaves NO v0.2.0 tag"; fi
 if git -C "$S9" rev-parse -q --verify refs/heads/release/0.2.0 >/dev/null; then fail "aborted promote leaves NO release/0.2.0 branch"; else pass "aborted promote leaves NO release/0.2.0 branch"; fi
 

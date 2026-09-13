@@ -94,8 +94,9 @@ whatever `main` has moved on to since — cut in lockstep with the next candidat
 `release-cut Y.Z.W --promote`. The verbs, terse (`.agents/skills/uzi-release/SKILL.md` owns the
 full operational detail): no flag cuts the next candidate, or refuses with the facts if a lower
 base's candidate is still in flight; `--promote` promotes the in-flight candidate to stable,
-then cuts the next candidate; `--skip-promote` abandons the in-flight candidate and folds it
-into a plain release; `--stable` is the old one-step model, refused while a candidate is in
+then cuts the next candidate; `--skip-promote` abandons the in-flight base and cuts a new
+`vX.Y.Z-rc.1` candidate (renaming the open section and folding `[Unreleased]` in), never a
+stable tag; `--stable` is the old one-step model, refused while a candidate is in
 flight. **Push order on a promote: the stable tag, then `main`, then the next candidate's
 tag** — the candidate's changelog-coverage gate needs the new stable tag visible first. A
 hotfix onto an already-promoted stable is a separate, manual procedure — see **Hotfix**, below.

@@ -202,19 +202,11 @@ while read -r sha; do
   # comments-only commit to upgrade.go was one of two hits.
   grep -qE '^docs(\([^)]*\))?:' "$SUBJECT_FILE" && continue
 
-  # A `chore(release):` commit is the release commit itself — a mechanical chart /
-  # CHANGELOG version bump — never a feature merge, so it never cites an issue. Today's
-  # single-step cut always folds CHANGELOG, so this commit was exempt by the
-  # touched-CHANGELOG rule below; under the RC train a next-candidate cut (rc.N+1) bumps
-  # only Chart.yaml and does NOT touch CHANGELOG (the section is already open, D3), so
-  # that rule no longer covers it. Exempt it by its conventional message instead, which
-  # is also true of every prior release commit already in the window (PRD 1265).
-  grep -qE '^chore\(release\):' "$SUBJECT_FILE" && continue
-
   files="$(git diff --name-only "$sha^1" "$sha" 2>/dev/null || git show --name-only --format= "$sha")"
 
   touched_changelog=0
   touched_shipping=0
+  touched_nonmeta=0
   shipping_example=""
   while read -r f; do
     [ -n "$f" ] || continue
@@ -224,9 +216,24 @@ while read -r sha; do
       touched_shipping=1
       [ -n "$shipping_example" ] || shipping_example="$f"
     fi
+    # A path OUTSIDE the release-metadata allowlist (the same set the promote diff-guard
+    # uses). Used only to bound the chore(release): exemption below.
+    case "$f" in
+      CHANGELOG.md|deploy/chart/Chart.yaml|deploy/chart/values.yaml|scripts/assert-worker-tag-decoupled.sh) ;;
+      *) touched_nonmeta=1 ;;
+    esac
   done <<EOF
 $files
 EOF
+
+  # A `chore(release):` commit is the release commit itself — a mechanical version bump —
+  # and never cites an issue. Today's single-step cut always folds CHANGELOG, so it was
+  # exempt by the touched-CHANGELOG rule below; under the RC train a next-candidate cut
+  # (rc.N+1) bumps only Chart.yaml and does NOT touch CHANGELOG (D3), so that rule misses
+  # it. Exempt the prefix, but ONLY when the commit touched exclusively release-metadata
+  # paths — a `chore(release):` that changed a shipping path is still checked, so the
+  # message alone cannot bypass the gate (PRD 1265; CR review of PR #1322).
+  if [ "$touched_nonmeta" = 0 ] && grep -qE '^chore\(release\):' "$SUBJECT_FILE"; then continue; fi
 
   [ "$touched_shipping" = 1 ] || continue
   [ "$touched_changelog" = 0 ] || continue
