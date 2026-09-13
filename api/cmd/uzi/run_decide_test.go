@@ -215,6 +215,27 @@ func TestRunDecidePartialEmptyIDList(t *testing.T) {
 	}
 }
 
+// TestRunDecideAcceptEmptyIDList: an --accept value with no non-empty ids after the split/trim is
+// a usage error (exit 2) naming criterion ids, before any request — the accept sibling of
+// TestRunDecidePartialEmptyIDList.
+//
+// MUTATION PROOF: this guards the accept-branch `len(criteria)==0` check. Delete that guard and an
+// empty --accept falls through to runCompletionRevision/AcceptCompletionDecision, so LastDecideRunID
+// is set and the exit is no longer ExitUsage — this test then fails.
+func TestRunDecideAcceptEmptyIDList(t *testing.T) {
+	fc := &uzicli.FakeClient{}
+	_, stderr, code := runCLI(t, fakeEnv(fc), "run", "decide", "r1", "--accept", " , ", "--reason", "x")
+	if code != uzicli.ExitUsage {
+		t.Fatalf("exit = %d, want ExitUsage(%d) (stderr: %s)", code, uzicli.ExitUsage, stderr)
+	}
+	if fc.LastDecideRunID != "" {
+		t.Errorf("an empty id list reached the client (id %q); it must fail first", fc.LastDecideRunID)
+	}
+	if !strings.Contains(stderr, "criterion ids") {
+		t.Errorf("usage error should mention criterion ids, got: %s", stderr)
+	}
+}
+
 // TestRunDecidePartial: `--partial m2,m3 --reason " drop m4 "` first reads the run's CURRENT
 // revision via GetRun, then calls PartialCompletionDecision with keep=[m2,m3], the TRIMMED reason
 // and the fetched revision. The confirmation carries the resumed status, the NEW revision from the
