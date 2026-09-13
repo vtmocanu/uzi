@@ -460,10 +460,29 @@ jobs:
             --tag "${REPO}:${SHORT_SHA}" \
             "${REPO}@${SRC_DIGEST}"
           # Prove the new tags point at the signed source digest (not a rewrapped index).
+          # The verify races GHCR's tag read-after-write: right after a successful create the
+          # tag is briefly 'not found' (inspect exits non-zero) or resolves to no digest, so a
+          # single immediate inspect intermittently reddens an otherwise-good publish (issue
+          # #1102). Poll with bounded backoff, treating an inspect failure / empty read /
+          # digest-mismatch as retryable and failing closed only after the window elapses. The
+          # anti-unsigned-rewrap assertion is UNCHANGED (the digest must still equal SRC_DIGEST);
+          # this only stops it racing the registry. The assignment sits in the `if` condition so
+          # `set -e` does not abort on a transient inspect failure during the poll.
+          attempts=5
           for t in "${VERSION}" "${SHORT_SHA}"; do
-            got="$(docker buildx imagetools inspect "${REPO}:${t}" --format '{{.Manifest.Digest}}')"
+            got=""
+            for ((i=1; i<=attempts; i++)); do
+              if got="$(docker buildx imagetools inspect "${REPO}:${t}" --format '{{.Manifest.Digest}}' 2>/dev/null)" \
+                 && [ "$got" = "${SRC_DIGEST}" ]; then
+                break
+              fi
+              if [ "$i" -lt "$attempts" ]; then
+                echo "verify ${REPO}:${t} attempt ${i}/${attempts}: got '${got:-<inspect failed>}', want ${SRC_DIGEST} -- retrying in $((i * 2))s" >&2
+                sleep "$((i * 2))"
+              fi
+            done
             if [ "$got" != "${SRC_DIGEST}" ]; then
-              echo "reuse produced ${REPO}:${t}@${got}, expected ${SRC_DIGEST} (unsigned rewrap) -- failing." >&2
+              echo "reuse produced ${REPO}:${t}@${got:-<not found>}, expected ${SRC_DIGEST} (unsigned rewrap, or the registry never converged after ${attempts} attempts) -- failing." >&2
               exit 1
             fi
           done
