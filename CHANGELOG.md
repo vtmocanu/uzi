@@ -25,7 +25,8 @@ through `[0.52.0]`.)
 
 ### Fixed
 
-- **A completed run's failed clone cleanup no longer wedges its branch ([#1315](https://github.com/vtmocanu/uzi/issues/1315)).** Terminal cleanup used to delete a run's clone in place and only then clear its ownership journal; when a background `git` maintenance daemon made that recursive delete fail partway (`ENOTEMPTY`), the journal survived pointing at leftover residue, so every later run on the branch failed immediately with `refusing to replace a retained clone owned by another run` and the branch stayed permanently wedged. Clones are now released with a same-filesystem atomic rename to a worker-only holding area, and the journal is cleared only after that rename succeeds, so a failed disposal can no longer wedge the branch. A later run that finds an orphaned clone whose owning run has finished now moves it aside (retained, never deleted) and re-clones cleanly, while a clone still owned by a live run stays protected.
+- **A completed run's failed clone cleanup no longer wedges its branch ([#1315](https://github.com/vtmocanu/uzi/issues/1315)).**
+  Terminal cleanup used to delete a run's clone in place and only then clear its ownership journal; when a background `git` maintenance daemon made that recursive delete fail partway (`ENOTEMPTY`), the journal survived pointing at leftover residue, so every later run on the branch failed immediately with `refusing to replace a retained clone owned by another run` and the branch stayed permanently wedged. Clones are now released with a same-filesystem atomic rename to a worker-only holding area, and the journal is cleared only after that rename succeeds, so a failed disposal can no longer wedge the branch. A later run that finds an orphaned clone whose owning run has finished now moves it aside (retained, never deleted) and re-clones cleanly, while a clone still owned by a live run stays protected.
 
 ## [0.82.0] - 2026-09-10
 
