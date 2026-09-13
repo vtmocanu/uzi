@@ -219,11 +219,16 @@ func TestRunDecidePartialEmptyIDList(t *testing.T) {
 // a usage error (exit 2) naming criterion ids, before any request — the accept sibling of
 // TestRunDecidePartialEmptyIDList.
 //
-// MUTATION PROOF: this guards the accept-branch `len(criteria)==0` check. Delete that guard and an
-// empty --accept falls through to runCompletionRevision/AcceptCompletionDecision, so LastDecideRunID
-// is set and the exit is no longer ExitUsage — this test then fails.
+// MUTATION PROOF: this guards the accept-branch `len(criteria)==0` check. The fake is seeded with a
+// revisable run (non-nil CompletionRevision), so deleting that guard lets an empty --accept fall
+// through GetRun to AcceptCompletionDecision — the exit becomes ExitOK (not ExitUsage) AND
+// LastDecideRunID is set. Both assertions below then fail, so each is load-bearing.
 func TestRunDecideAcceptEmptyIDList(t *testing.T) {
-	fc := &uzicli.FakeClient{}
+	rev := 2
+	fc := &uzicli.FakeClient{
+		RunByID:   map[string]apitypes.RunDTO{"r1": {ID: "r1", Status: statusPaused, CompletionRevision: &rev}},
+		DecideRun: apitypes.RunDTO{ID: "r1", Status: "running"},
+	}
 	_, stderr, code := runCLI(t, fakeEnv(fc), "run", "decide", "r1", "--accept", " , ", "--reason", "x")
 	if code != uzicli.ExitUsage {
 		t.Fatalf("exit = %d, want ExitUsage(%d) (stderr: %s)", code, uzicli.ExitUsage, stderr)
