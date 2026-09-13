@@ -260,6 +260,11 @@ describe("atomic runner-clone release (#1315) + owner-derived reclaim (#1319)", 
   interface FailClosedRow {
     name: string;
     iid: number;
+    /** Optional claim-field overrides merged into the claimant's `gitlabClaim`. Absent ⇒ a
+     *  plain ISSUE claim on `iid` (the four original rows). A row sets this to make the
+     *  claimant a different kind (e.g. a `task` run, whose slug is DECOUPLED from its branch)
+     *  so a single predicate can be isolated. */
+    claimOverrides?: Record<string, unknown>;
     /** Build the (bare, branch, residue, expected journal) fixture and set the fake's read.
      *  The claimant is an issue run on `iid`, so each row is Case A or Case B as noted. */
     setup: (ctx: {
@@ -344,6 +349,41 @@ describe("atomic runner-clone release (#1315) + owner-derived reclaim (#1319)", 
         return { bare, branch, residuePath: clonePath, expectJournal: { runId: ownerRunId, clonePath } };
       },
     },
+    {
+      // Isolates predicate (c) — it is the ONLY guard a `task` owner can trip here, because a
+      // task's slug is `task-<runId>` (DECOUPLED from its branch), so a mismatched owner-derived
+      // BRANCH still reproduces the journaled PATH: (d) passes, only (c) fires. (The issue-kind
+      // "(c) wrong owner-derived branch" row above ALSO trips (d), since issue derives both from
+      // issue_iid — deleting the (c) line leaves it green, but reddens THIS row.)
+      name: "(c-isolated) task owner: branch mismatch but slug/path match",
+      iid: 1415,
+      claimOverrides: { kind: "task", branch: "uzi/task/foo" },
+      setup: async ({ ownerRunId }) => {
+        // Seed the OWNER's task clone at branch `uzi/task/foo`, slug `task-<ownerRunId>`: the
+        // journal is keyed under `uzi/task/foo` and points at `.../task-<ownerRunId>`. The
+        // claimant (a task on `uzi/task/foo`, slug `task-<claimantRunId>`) reads that journal
+        // and computes a DIFFERENT path → Case A / CapturePathMismatchError.
+        const { bare, branch, clonePath } = await seedResidueForBranch(
+          "uzi/task/foo",
+          `task-${ownerRunId}`,
+          ownerRunId,
+          "FOREIGN.txt",
+        );
+        // Owner-derived branch `uzi/task/DIFFERENT` ≠ journal branch `uzi/task/foo` → (c) FIRES,
+        // but owner-derived slug `task-<ownerRunId>` reproduces the journaled path exactly → (d)
+        // PASSES. This is the scenario predicate (c) exclusively guards.
+        api.setOrphanClassification(ownerRunId, {
+          status: "completed",
+          repo_id: "r1",
+          kind: "task",
+          issue_iid: null,
+          branch: "uzi/task/DIFFERENT",
+          pipeline_ref: null,
+          pipeline_id: null,
+        });
+        return { bare, branch, residuePath: clonePath, expectJournal: { runId: ownerRunId, clonePath } };
+      },
+    },
   ];
 
   for (const row of failClosedRows) {
@@ -371,7 +411,7 @@ describe("atomic runner-clone release (#1315) + owner-derived reclaim (#1319)", 
       });
       const runner = runnerWith(factory, gitlab, undefined, nullLogger(), { recoveryRetryMs: 5 });
       try {
-        await runner.execute(gitlabClaim(row.iid, { run_id: claimantRunId }));
+        await runner.execute(gitlabClaim(row.iid, { run_id: claimantRunId, ...row.claimOverrides }));
       } finally {
         git.retireRunnerClone = origRetire;
       }
