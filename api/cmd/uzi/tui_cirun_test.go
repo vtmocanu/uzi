@@ -40,6 +40,12 @@ func cjRunning(name string) apitypes.CIJobDTO {
 	return c
 }
 
+// cjAttention is a completed job in the attention tone (GitHub action_required / GitLab manual /
+// Forgejo warning all map to pipelinestatus.Tone == "attention"): counted in total, but NOT in
+// passed/failing/running. cjSkipped is the neutral/skipped tone, likewise counted only in total.
+func cjAttention(name string) apitypes.CIJobDTO { return cjOf(name, "completed", "action_required") }
+func cjSkipped(name string) apitypes.CIJobDTO   { return cjOf(name, "completed", "skipped") }
+
 // ciRunDetailOf builds a CI-run drill-in fixture with the given branch and jobs.
 func ciRunDetailOf(branch string, jobs []apitypes.CIJobDTO) apitypes.CIRunDetailDTO {
 	now := time.Now()
@@ -156,6 +162,51 @@ func TestTUICIRunHeaderRollups(t *testing.T) {
 			}
 			if !strings.Contains(frame, "re-polled") {
 				t.Errorf("the re-polled proof is not drawn\n%s", frame)
+			}
+		})
+	}
+}
+
+// TestTUICIRunJobsHeadingHonestCount pins the BLOCKING fix: the JOBS heading must NOT claim
+// "all jobs passed" when some jobs sit in the attention (action_required) or neutral/skipped tone —
+// those are counted in total but never in passed, so passed != total. It must instead show the
+// honest "✓ P/T passed" count, matching the top-right rollup. Asserted on the JOBS heading LINE
+// alone (not the whole frame) so it is non-vacuous in BOTH directions: the false phrase is absent
+// AND the honest count is present. Pre-fix the heading's default arm fired "all jobs passed"
+// whenever failing==0 && running==0, regardless of passed==total, so this reddens pre-fix.
+func TestTUICIRunJobsHeadingHonestCount(t *testing.T) {
+	cases := []struct {
+		name      string
+		jobs      []apitypes.CIJobDTO
+		wantCount string
+	}{
+		// passed + action_required: passed=1, total=2 → the rollup already shows ✓ 1/2 passed; the
+		// heading must agree, not read "all jobs passed".
+		{"passed+attention", []apitypes.CIJobDTO{cjPassed("a"), cjAttention("b")}, "✓ 1/2 passed"},
+		// an all-skipped run: 0 actually passed out of 2 — the worst case of the false phrase.
+		{"all-skipped", []apitypes.CIJobDTO{cjSkipped("a"), cjSkipped("b")}, "✓ 0/2 passed"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &uzicli.FakeClient{Repos: []apitypes.RepoDTO{oneRepo()}}
+			m := openCIRun(t, fake, ciRunDetailOf("agent/issue-1", tc.jobs))
+			frame := stripANSI(m.View().Content)
+
+			var heading string
+			for _, ln := range strings.Split(frame, "\n") {
+				if strings.Contains(ln, "JOBS") {
+					heading = ln
+					break
+				}
+			}
+			if heading == "" {
+				t.Fatalf("the JOBS heading line was not found\n%s", frame)
+			}
+			if strings.Contains(heading, "all jobs passed") {
+				t.Errorf("the JOBS heading falsely claims all jobs passed: %q", heading)
+			}
+			if !strings.Contains(heading, tc.wantCount) {
+				t.Errorf("the JOBS heading does not show the honest count %q: %q", tc.wantCount, heading)
 			}
 		})
 	}
@@ -452,6 +503,40 @@ func TestTUICIRunFixCIConflict(t *testing.T) {
 	}
 	if frame := stripANSI(m.View().Content); !strings.Contains(frame, "ref is not a watched failed ref") {
 		t.Errorf("the 409 reason is not drawn inline\n%s", frame)
+	}
+}
+
+// TestTUICIRunFixCIUsesRowBranchBeforeDetailLoads pins the fold-in fix: the ci-list open path seeds
+// the selected row's CIRunDTO into the drill-in state, so pressing f in the window BEFORE the first
+// GetCIRun reply lands targets the row's branch — not an empty ref (which the server 409s). It opens
+// the drill-in without feeding any ciRunMsg (so loaded is false), then presses f and asserts
+// CreateCIFixRun was reached with the row's branch.
+func TestTUICIRunFixCIUsesRowBranchBeforeDetailLoads(t *testing.T) {
+	row := ciRunDetailOf("agent/issue-1255", []apitypes.CIJobDTO{cjFailed("lint-api")}).CIRunDTO
+	fake := &uzicli.FakeClient{Repos: []apitypes.RepoDTO{oneRepo()},
+		CIFixRunResult: apitypes.RunDTO{ID: "cccccccc-1111-2222-3333-444444444444"}}
+	m := tuiTestModel(t, fake, "")
+	next, _ := m.Update(reposMsg{repos: fake.Repos})
+	m = next.(tuiModel)
+	m = press(t, m, keyViewCI)
+	next, _ = m.Update(ciMsg{reqID: m.ci.waitID, runs: []apitypes.CIRunDTO{row}})
+	m = next.(tuiModel)
+	m = press(t, m, keyEnter)
+	if m.view != viewCIRun {
+		t.Fatalf("enter on a ci row did not open the CI-run view (view=%v)", m.view)
+	}
+	if m.cirun.loaded {
+		t.Fatalf("no GetCIRun reply was fed, so the drill-in must not be marked loaded yet")
+	}
+
+	// f in this pre-reply window must target the seeded row branch, not an empty ref.
+	nm, cmd := m.handleKey(keyFixCI)
+	m = feedCIRun(t, nm.(tuiModel), cmd)
+	if fake.LastCIFixRef != "agent/issue-1255" {
+		t.Fatalf("f before the first GetCIRun reply called CreateCIFixRun with %q, want the row's branch", fake.LastCIFixRef)
+	}
+	if fake.LastCIFixRepoID != "r1" {
+		t.Fatalf("CreateCIFixRun was not scoped to the repo (got %q)", fake.LastCIFixRepoID)
 	}
 }
 

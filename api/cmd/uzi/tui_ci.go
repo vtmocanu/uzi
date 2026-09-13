@@ -822,6 +822,13 @@ func (m tuiModel) ciKey(k string) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.cirun = newCIRunState(repo.ID, run.ID)
+		// Seed the list row's CIRunDTO as the drill-in's detail so the header shows the run's
+		// identity (name / number / event / branch / sha / title / actor) and `f fix ci` targets
+		// the row's branch immediately, BEFORE the first GetCIRun reply lands. Without it, f pressed
+		// in that window would call CreateCIFixRun with an empty ref (the server 409s). loaded stays
+		// false, so the body still reads "loading…"; the first reply replaces this with the full
+		// jobs/steps.
+		m.cirun.detail.CIRunDTO = run
 		m.view = viewCIRun
 		m.forgeNotice = ""
 		return m, (&m).startCIRunReq()

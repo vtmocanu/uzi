@@ -316,8 +316,22 @@ const (
 	ciRunJobNameWidth  = 36
 	ciRunStepNameWidth = 32
 	ciRunStateW        = 8 // forgeState word: running / queued / passed / failed / done
-	ciRunElapsedW      = 7 // elapsedBetween (e.g. 3m00s)
+	ciRunElapsedW      = 7 // elapsedBetween → shortDuration (coarse, e.g. 3m / 3h4m)
 )
+
+// shortSHA is the first 7 runes of a forge-authored commit SHA for the `sha7` header cell. The SHA
+// is sliced through its sanitized (cellText) form so the count is over sanitized runes, and the
+// ≤7-rune result is still drawn through renderer.Plain by the caller (the D7 sink) — a SHA is hex so
+// no control rune survives the slice, but the Plain draw keeps the guard honest. Slicing first is
+// what makes `sha7` honest: Plain(sha, 7) on a full 40-char SHA would append an ellipsis (6 hex + …),
+// whereas Plain on an already-≤7-rune value adds none (e.g. `deadbee`, not `deadbe…`).
+func shortSHA(sha string) string {
+	r := []rune(cellText(sha))
+	if len(r) > 7 {
+		r = r[:7]
+	}
+	return string(r)
+}
 
 // ciRunPlainWidth floors a width-derived renderer.Plain / capCell cap so a narrow pane TRUNCATES
 // gracefully instead of underflowing the rune slice; every m.width-N cap in this file passes through
@@ -442,7 +456,7 @@ func (m tuiModel) ciRunHeaderLine1() string {
 		m.pal.faint.Render(" · ") +
 		m.pal.faint.Render(m.renderer.Plain(t.runBranch, 22)) +
 		m.pal.faint.Render(" · ") +
-		m.pal.faint.Render(m.renderer.Plain(t.runSHA, 7))
+		m.pal.faint.Render(m.renderer.Plain(shortSHA(t.runSHA), 7))
 	right := m.ciRunRollup() +
 		m.pal.faint.Render("   ") +
 		paintSeg(m.pal.wait, nil, false, "● live") +
@@ -540,8 +554,15 @@ func (m tuiModel) ciRunJobsHeading() string {
 	case running > 0:
 		summary = paintSeg(m.pal.wait, nil, false, "● "+itoa(running)+" running") +
 			m.pal.faint.Render(" · "+itoa(passed)+" passed · "+itoa(failing)+" failing")
-	default:
+	case passed == total:
 		summary = paintSeg(m.pal.sage, nil, false, "✓ all jobs passed") +
+			m.pal.faint.Render(" · "+itoa(total)+" jobs")
+	default:
+		// failing == 0 && running == 0, but some jobs sit in the attention (action_required /
+		// manual / warning → Tone "attention") or neutral/skipped tone — counted in total, never in
+		// passed. Mirror ciRunRollup: show an honest count, never a false "all jobs passed" (an
+		// all-skipped run would otherwise read "all jobs passed · N jobs" with 0 actually passed).
+		summary = paintSeg(m.pal.sage, nil, false, "✓ "+itoa(passed)+"/"+itoa(total)+" passed") +
 			m.pal.faint.Render(" · "+itoa(total)+" jobs")
 	}
 	repolled := ""

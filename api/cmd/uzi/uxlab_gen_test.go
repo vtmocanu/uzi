@@ -108,6 +108,7 @@ func TestGenerateUXLabFrames(t *testing.T) {
 		"pr-changes-requested":         func(d bool) string { return prChangesRequested(d, now) },
 		"pr-failing":                   func(d bool) string { return prFailing(d, now) },
 		"cirun-running":                func(d bool) string { return ciRunRunning(d, now) },
+		"cirun-failing":                func(d bool) string { return ciRunFailing(d, now) },
 		"help":                         helpFrame,
 		"quit":                         quitFrame,
 	}
@@ -812,6 +813,58 @@ func ciRunRunning(dark bool, now time.Time) string {
 	m = key(m, keyEnter) // open the CI-run drill-in
 	m = step(m, ciRunMsg{reqID: m.cirun.waitID, gen: m.cirun.gen, detail: detail})
 	return m.View().Content
+}
+
+// ciRunFailing drives the model to the CI-run drill-in (PRD #1255 M6) with a FAILED job at cursor 0
+// whose expanded steps include a FAILED step in the alarm tone — the spec's headline visual, the
+// ci-run twin of pr-failing. Opened the real way (repos load, ci list lands, enter, detail reply);
+// the selected job (cursor 0) expands its steps beneath it and draws its faint ↗ URL line.
+func ciRunFailing(dark bool, now time.Time) string {
+	repo := apitypes.RepoDTO{ID: "r1", PathWithNamespace: "vtmocanu/uzi", Enabled: true,
+		WebURL: "https://github.com/vtmocanu/uzi"}
+	detail := sampleCIRunFailingDetail(now)
+	fake := &uzicli.FakeClient{Repos: []apitypes.RepoDTO{repo}, CIRunDetailResult: detail,
+		CIRunsResult: []apitypes.CIRunDTO{detail.CIRunDTO}}
+	m := uxModel(fake, "", dark)
+	m = step(m, reposMsg{repos: fake.Repos})
+	m = key(m, keyViewCI)
+	m = step(m, ciMsg{reqID: m.ci.waitID, runs: []apitypes.CIRunDTO{detail.CIRunDTO}})
+	m = key(m, keyEnter) // open the CI-run drill-in
+	m = step(m, ciRunMsg{reqID: m.cirun.waitID, gen: m.cirun.gen, detail: detail})
+	return m.View().Content
+}
+
+// sampleCIRunFailingDetail is a GitHub-shaped run that finished with a failure: the FIRST job
+// (lint-api, cursor 0) failed, and its expanded steps include a failed `golangci-lint` step drawn in
+// the alarm tone; the other two jobs passed. The run's own Conclusion is failure, so the header
+// rollup and JOBS heading read the failing count.
+func sampleCIRunFailingDetail(now time.Time) apitypes.CIRunDetailDTO {
+	return apitypes.CIRunDetailDTO{
+		CIRunDTO: apitypes.CIRunDTO{
+			ID: 1041, Name: "CI", Number: 1041, Event: "pull_request", Branch: "agent/issue-1246",
+			SHA: "deadbeefcafef00d", Status: "completed", Conclusion: "failure",
+			Title: "PRD #1226 continuation: rework the forge sync loop",
+			Actor: "uzi-bot", WebURL: "https://github.com/vtmocanu/uzi/actions/runs/1041",
+			StartedAt: now.Add(-3 * time.Minute), CreatedAt: now.Add(-3 * time.Minute), UpdatedAt: now,
+			JobsDone: 3, JobsTotal: 3},
+		Jobs: []apitypes.CIJobDTO{
+			{ID: 1, Name: "lint-api", Status: "completed", Conclusion: "failure",
+				WebURL:    "https://github.com/vtmocanu/uzi/actions/runs/1041/job/1",
+				StartedAt: now.Add(-3 * time.Minute), FinishedAt: now.Add(-2 * time.Minute),
+				Steps: []apitypes.CIStepDTO{
+					{Name: "Set up job", Status: "completed", Conclusion: "success", Number: 1, StartedAt: now.Add(-3 * time.Minute), CompletedAt: now.Add(-170 * time.Second)},
+					{Name: "golangci-lint", Status: "completed", Conclusion: "failure", Number: 2, StartedAt: now.Add(-170 * time.Second), CompletedAt: now.Add(-2 * time.Minute)},
+				}},
+			{ID: 2, Name: "test-api", Status: "completed", Conclusion: "success",
+				WebURL:    "https://github.com/vtmocanu/uzi/actions/runs/1041/job/2",
+				StartedAt: now.Add(-170 * time.Second), FinishedAt: now.Add(-30 * time.Second),
+				Steps: []apitypes.CIStepDTO{{Name: "go test ./...", Status: "completed", Conclusion: "success", Number: 1, StartedAt: now.Add(-170 * time.Second), CompletedAt: now.Add(-30 * time.Second)}}},
+			{ID: 3, Name: "test-web", Status: "completed", Conclusion: "success",
+				WebURL:    "https://github.com/vtmocanu/uzi/actions/runs/1041/job/3",
+				StartedAt: now.Add(-160 * time.Second), FinishedAt: now.Add(-20 * time.Second),
+				Steps: []apitypes.CIStepDTO{{Name: "npm test", Status: "completed", Conclusion: "success", Number: 1, StartedAt: now.Add(-160 * time.Second), CompletedAt: now.Add(-20 * time.Second)}}},
+		},
+	}
 }
 
 // ---- overlays -------------------------------------------------------------
