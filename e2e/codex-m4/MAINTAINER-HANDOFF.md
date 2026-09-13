@@ -80,15 +80,18 @@ cluster credential).
 
 Also required before parent M4 acceptance:
 
-- **The strict macOS Linux-container invocation** (D7 point 3): the same strict P suite
-  (`test:codex-m4`) run inside `buildMacosLinuxRunPlan`'s pinned container —
+- **The strict macOS Linux-container invocation** (D7 point 3): now reproducibly callable as
+  `task test:codex-m4:macos` (and `task gate:agent` / `task test:codex-m4` auto-route the
+  Linux-only P leg through the same pinned container on macOS). The runner
+  (`executeMacosLinuxRun` in `macos-linux-runner.ts`) runs the COMPLETE strict P suite (all
+  three P files — startup-smoke, policy-real, native-bypass) inside the pinned container —
   `docker.io/library/node:24-bookworm@sha256:6dac556d980b7f0e5498d08f08cee0ca67798b4ad6c23964a9214920e67758d0`
   (multiarch-verified amd64/arm64) — mounting only the disposable fixture/test inputs, network
-  disabled during tests, no Docker socket or maintainer HOME mounted. `e2e/codex-m4/README.md`
-  documents the reproduction commands; `macos-linux-runner.ts` implements the plan builder and
-  hard-prerequisite gate the worker already exercises in unit form
-  (`macos-linux-runner.test.ts`), but the actual container run on a macOS host is the
-  maintainer's to execute.
+  disabled during tests, no Docker socket or maintainer HOME mounted, and hard-fails on missing
+  Docker or an unsupported architecture (never a silent platform skip). `e2e/codex-m4/README.md`
+  documents the reproduction commands; the worker unit-tests the plan builder, the orchestrator
+  and the hard-prerequisite gate (`macos-linux-runner.test.ts`), but actually running it on a
+  real macOS host with Docker remains the maintainer's to execute before parent M4 acceptance.
 - **Current-head CI `test-agent` confirmation.** The worker has no CI run URL for the exact
   tested revision to cite honestly; the lead owns confirming CI is green on this revision (or
   the revision that supersedes it) and recording the URL/counts.

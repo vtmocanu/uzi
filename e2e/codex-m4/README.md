@@ -100,10 +100,17 @@ task check:codex-m4-receipts
 `test:codex-m4` needs the pinned `codex-cli 0.153.2` package (`agent/codex/codex-package.lock`):
 either the image-baked absolute path at `/opt/uzi-codex/0.153.2`, or a rootless test-cache
 provision via `provision.ts` (`install-codex.sh` with SHA256-verified layout) on a Linux
-contributor/CI host without the baked package. D7 point 3 also documents the strict macOS
-Linux-container invocation (`buildMacosLinuxRunPlan` in `macos-linux-runner.ts`, pinned to
-`docker.io/library/node:24-bookworm@sha256:6dac556d980b7f0e5498d08f08cee0ca67798b4ad6c23964a9214920e67758d0`)
-for a maintainer running the same strict P suite from a macOS host.
+contributor/CI host without the baked package. D7 point 3's strict macOS Linux-container
+invocation is now reproducibly callable: `task test:codex-m4:macos` runs
+`executeMacosLinuxRun` (`macos-linux-runner.ts`), and `task test:codex-m4` / `task gate:agent`
+auto-route the Linux-only P leg through the same pinned container on macOS (a `platforms:
+[darwin]` command; the P files self-route to a skip on non-Linux via `p-platform.ts`). It runs
+the complete strict P suite (all three P files — startup-smoke, policy-real, native-bypass)
+unprivileged, pinned to
+`docker.io/library/node:24-bookworm@sha256:6dac556d980b7f0e5498d08f08cee0ca67798b4ad6c23964a9214920e67758d0`,
+with the network disabled during tests and no Docker socket or maintainer HOME mounted. Docker
+on the macOS host is required; missing Docker or an unsupported architecture fail loudly
+(`assertPrerequisites` throws), never a silent platform skip.
 
 ## Exact tested-revision evidence (worker, 2026-09-12)
 
