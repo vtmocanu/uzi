@@ -404,7 +404,7 @@ func TestRecoveryLifecycleE2ELiveDB(t *testing.T) {
 	}
 
 	// The successful capture releases the covered source's custody (the worker release op).
-	rel, err := svc.Release(e.ctx, e.worker, e.run)
+	rel, err := svc.Release(e.ctx, e.worker, e.run, apitypes.RecoveryReleaseRequest{})
 	if err != nil || !rel.Released || rel.HoldsReleased != 1 {
 		t.Fatalf("release = (%+v, %v), want 1 hold released", rel, err)
 	}

@@ -875,6 +875,11 @@ export interface ClaimResponse {
   checkpoint_tip?: string | null;
   /** High-water mark of run_messages.seq; the worker continues numbering here. */
   last_seq: number;
+  /** The claim generation this claim was taken at (PRD #1349 M1, D2). The server already
+   *  sends it (workersvc.ClaimPayload.ClaimGeneration); the generation-exact recovery
+   *  reserve/release name it so a capture/release binds to the exact hold this claim opened.
+   *  Optional so a pre-#1296 payload without it still decodes. */
+  claim_generation?: number;
   /** Structured PRD #3 templates — the lead plus any subagents — consumed
    *  programmatically by M3 (mapped to SDK AgentDefinitions). M2 ignores them. */
   agents: AgentTemplate[];
@@ -2031,6 +2036,11 @@ export interface RecoveryReserveRequest {
   idempotency_key: string;
   source_sha: string;
   attempted_head_sha?: string;
+  /** The exact claim generation this capture belongs to (PRD #1349 M1). A v2 worker sends
+   *  it so the reserve binds to the ONE hold it took at that generation; a v1 worker omits
+   *  it (the server falls back to the newest-hold reserve). The call sites that populate it
+   *  are M2's — M1 only threads the field onto the wire. */
+  generation?: number;
 }
 
 /** RecoveryReserveResponse is the reserve ACK: the server-minted capture id and its
@@ -2074,4 +2084,35 @@ export interface RecoveryReleaseResponse {
   run_id: string;
   released: boolean;
   holds_released: number;
+  /** retained is true when the server LEFT a hold open pending owner attention rather than
+   *  releasing it (PRD #1349 M1) — the v1/ambiguous case where the worker could not prove
+   *  its generation's work is durable; reason is a bounded server reason when retained. */
+  retained?: boolean;
+  reason?: string;
+}
+
+/** RecoveryReleaseRequest is the worker's request to settle custody for the EXACT generation
+ *  it names (PRD #1349 M1, D1/D2). A v2 worker sends generation so the server releases only
+ *  the hold it took at that claim generation; a v1 worker omits it (settle by run+worker).
+ *  The call sites that populate it are M2's — M1 only freezes the shape. */
+export interface RecoveryReleaseRequest {
+  generation?: number;
+}
+
+/** RecoveryHold is one open custody hold this worker holds on a run, in the worker-facing
+ *  post-clone inventory (PRD #1349 M1, D3). hold_id + generation are the exact hold identity;
+ *  has_available_capture is true when a ready archive already covers this hold's source, and
+ *  capture_state is the latest capture's lifecycle state ('' when the hold has no capture). */
+export interface RecoveryHold {
+  hold_id: string;
+  generation: number;
+  has_available_capture: boolean;
+  capture_state?: string;
+}
+
+/** RecoveryHoldsResponse is the worker's post-clone hold inventory for one run (PRD #1349
+ *  M1, D3). holds is ALWAYS an array, never null — the server initializes it to []. */
+export interface RecoveryHoldsResponse {
+  run_id: string;
+  holds: RecoveryHold[];
 }

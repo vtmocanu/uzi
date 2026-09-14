@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import type { Options as SdkOptions, SDKMessage, HookInput } from "@anthropic-ai/claude-agent-sdk";
 import { SdkExecutor, resolveLeadModel, embedSeededPlan, TransientRecoveryError, type SdkQueryFn, type SdkExecutorOptions, type ContextUsageReading } from "../src/sdk-executor.js";
+import { LimitReachedError } from "../src/limit.js";
 import { PlanRejectedError, type EmittedMessage, type RunContext } from "../src/executor.js";
 import type { PlanVerdict } from "../src/steering.js";
 import type { AgentTemplate, ClaimSkill, Milestone, MilestoneAgent, MilestoneProgress } from "../src/protocol.js";
@@ -119,6 +120,21 @@ function subagentText(text: string, subagentType = "coder", sessionId = "sess-1"
     subagent_type: subagentType,
     parent_tool_use_id: "p1",
     message: { content: [{ type: "text", text }] },
+  } as unknown as SDKMessage;
+}
+// PRD #1349 M3: an SDK `rate_limit_event` frame. The ClaudeHarness feeds the latest-wins
+// RateLimitObserver before decode and maps this frame to an `activity` event (NOT model
+// activity), so the newest such frame of a turn becomes the terminal's limitEvidence.latest
+// and flows to TurnResult.rateLimit without making an otherwise-empty turn non-empty.
+function rateLimitEvent(
+  status: string,
+  opts: { resetsAt?: number; rateLimitType?: string } = {},
+  sessionId = "sess-1",
+): SDKMessage {
+  return {
+    type: "rate_limit_event",
+    session_id: sessionId,
+    rate_limit_info: { status, resetsAt: opts.resetsAt, rateLimitType: opts.rateLimitType },
   } as unknown as SDKMessage;
 }
 
@@ -4644,5 +4660,130 @@ describe("SdkExecutor empty-turn recovery (issue #1197 D-RC2b)", () => {
       probe.emits.some((m) => m.kind === "status" && RETRY_NOTICE.test(String(m.payload["text"]))),
       "the implement empty turn emitted a retry notice",
     );
+  });
+});
+
+// PRD #1349 M3: a POSITIVELY-empty turn caused by a HARD rate limit routes to the
+// usage-limit wait path (LimitReachedError → runner.ts handleLimitReached, which respects
+// wait_on_limit) instead of the endless-local recovery_wait park (TransientRecoveryError).
+// The routing keys ONLY on THIS attempt's FINAL latest-wins verdict being `rejected`, and —
+// unlike classifyLimitEvidence — does NOT require a future reset. Every other empty case
+// (no verdict, allowed/allowed_warning, utilization-only, rejected-then-allowed, or a
+// rejected verdict from a PRIOR attempt) stays the generic recovery_wait park.
+describe("SdkExecutor empty-turn limit routing (PRD #1349 M3)", () => {
+  const IN_5H = Date.now() + 5 * 60 * 60 * 1000;
+  const AN_HOUR_AGO = Date.now() - 60 * 60 * 1000;
+  const recovery = (queryFn: SdkQueryFn, maxRetries = 2): SdkExecutorOptions => ({
+    queryFn,
+    emptyTurnBackoffBaseMs: 0, // no real sleeps in tests
+    emptyTurnMaxRetries: maxRetries,
+  });
+
+  it("positively-empty + final verdict `rejected` → LimitReachedError (usage-limit path, not recovery_wait)", async () => {
+    const { queryFn } = fakeTurns([
+      [rateLimitEvent("rejected", { resetsAt: IN_5H, rateLimitType: "five_hour" }), resultEmpty()],
+    ]);
+    await assert.rejects(
+      new SdkExecutor(nullLogger(), homeDir, recovery(queryFn)).run(makeCtx().ctx),
+      (err: unknown) =>
+        err instanceof LimitReachedError &&
+        err.rateLimitType === "five_hour" &&
+        err.resetsAtMs === IN_5H,
+    );
+  });
+
+  for (const [label, resetsAt] of [
+    ["a PAST reset", AN_HOUR_AGO],
+    ["a MISSING reset", undefined],
+  ] as const) {
+    it(`positively-empty + rejected with ${label} → still LimitReachedError (the limit arm does NOT require a future reset)`, async () => {
+      const { queryFn } = fakeTurns([
+        [rateLimitEvent("rejected", { resetsAt, rateLimitType: "five_hour" }), resultEmpty()],
+      ]);
+      await assert.rejects(
+        new SdkExecutor(nullLogger(), homeDir, recovery(queryFn)).run(makeCtx().ctx),
+        // The verdict alone routes; the reset (past/missing) rides verbatim for the SERVER
+        // to validate. If this arm reused classifyLimitEvidence's future-reset gate, a
+        // past/missing reset would fall through to TransientRecoveryError here.
+        (err: unknown) => err instanceof LimitReachedError && err.resetsAtMs === resetsAt,
+      );
+    });
+  }
+
+  it("positively-empty + `rejected`-then-`allowed` (latest-wins → allowed) → TransientRecoveryError (recovery_wait)", async () => {
+    const { queryFn } = fakeTurns([
+      [
+        rateLimitEvent("rejected", { resetsAt: IN_5H, rateLimitType: "five_hour" }),
+        rateLimitEvent("allowed"),
+        resultEmpty(),
+      ],
+    ]);
+    await assert.rejects(
+      new SdkExecutor(nullLogger(), homeDir, recovery(queryFn)).run(makeCtx().ctx),
+      // The limit cleared mid-turn: the FINAL verdict is `allowed`, so this must NOT route
+      // to the limit path (keys on latest-wins, not "any rejected seen").
+      (err: unknown) => err instanceof TransientRecoveryError,
+    );
+  });
+
+  it("positively-empty + `allowed_warning` verdict → TransientRecoveryError (only `rejected` routes)", async () => {
+    const { queryFn } = fakeTurns([[rateLimitEvent("allowed_warning"), resultEmpty()]]);
+    await assert.rejects(
+      new SdkExecutor(nullLogger(), homeDir, recovery(queryFn)).run(makeCtx().ctx),
+      (err: unknown) => err instanceof TransientRecoveryError,
+    );
+  });
+
+  it("positively-empty + utilization-only frame (no usable status) → TransientRecoveryError", async () => {
+    // A rate_limit_event carrying only utilization data and NO status string: the observer
+    // ignores it, so there is no verdict and the empty turn stays recovery_wait — proving
+    // the routing does not fire on the mere presence of a rate-limit frame.
+    const utilizationOnly = {
+      type: "rate_limit_event",
+      session_id: "sess-1",
+      rate_limit_info: { utilization: 0.9 },
+    } as unknown as SDKMessage;
+    const { queryFn } = fakeTurns([[utilizationOnly, resultEmpty()]]);
+    await assert.rejects(
+      new SdkExecutor(nullLogger(), homeDir, recovery(queryFn)).run(makeCtx().ctx),
+      (err: unknown) => err instanceof TransientRecoveryError,
+    );
+  });
+
+  it("positively-empty + NO rate-limit frame at all → TransientRecoveryError (no verdict)", async () => {
+    const { queryFn } = fakeTurns([[resultEmpty()]]);
+    await assert.rejects(
+      new SdkExecutor(nullLogger(), homeDir, recovery(queryFn)).run(makeCtx().ctx),
+      (err: unknown) => err instanceof TransientRecoveryError,
+    );
+  });
+
+  it("a `rejected` verdict from a PRIOR attempt does NOT leak into a later empty attempt (cross-attempt isolation)", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [rateLimitEvent("rejected", { resetsAt: IN_5H, rateLimitType: "five_hour" }), resultEmpty()], // attempt 0: rejected + empty
+      [resultEmpty()], // retry 1: empty, NO verdict
+      [resultEmpty()], // retry 2 (FINAL): empty, NO verdict → decision must use THIS attempt's (absent) verdict
+    ]);
+    await assert.rejects(
+      new SdkExecutor(nullLogger(), homeDir, recovery(queryFn, 2)).run(makeCtx().ctx),
+      (err: unknown) => err instanceof TransientRecoveryError,
+    );
+    assert.strictEqual(turns.length, 3, "original drive + two retries, each a distinct attempt");
+  });
+
+  it("NONEMPTY success + `rejected` verdict → normal completion (the empty-check gates the limit routing)", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [rateLimitEvent("rejected", { resetsAt: IN_5H, rateLimitType: "five_hour" }), submitPlan("# Plan"), resultSuccess()],
+      [assistantText("impl"), signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx({ agents: [lead, coder, reviewer] });
+    const result = await new SdkExecutor(nullLogger(), homeDir, recovery(queryFn)).run(probe.ctx);
+    assert.strictEqual(result.branch, "agent/issue-5");
+    assert.deepStrictEqual(
+      probe.gated,
+      ["# Plan"],
+      "a rejected verdict on a NON-empty (planning) turn is normal work, never a limit park",
+    );
+    assert.strictEqual(turns.length, 2, "no retry, no escalation — the turn was not positively empty");
   });
 });

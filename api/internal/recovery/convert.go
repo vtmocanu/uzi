@@ -85,6 +85,89 @@ func captureToDTO(c store.RecoveryCapture) apitypes.RecoveryArchiveDTO {
 	return out
 }
 
+// Owner custody-hold Attention states (PRD #1349 M5, D6/D8): the SERVER-DERIVED
+// action/attention classification on each owner hold row, DISTINCT from the capture
+// lifecycle State. The board alert and Workers surface (M6) key severity off these, and
+// DecisionNeeded counts the two that require an owner decision (needs_action + source_only).
+const (
+	attentionActive       = "active"        // OPEN, run still live — healthy protection, no decision.
+	attentionCapturing    = "capturing"     // OPEN, capture in progress (preparing/uploading).
+	attentionArchiveReady = "archive_ready" // OPEN, a ready archive covers it — auto-releases.
+	attentionNeedsAction  = "needs_action"  // OPEN, a stalled/failed capture needs a decision.
+	attentionSourceOnly   = "source_only"   // OPEN, no capture, run terminal — needs a decision.
+	attentionReleased     = "released"      // custody settled.
+	attentionDiscarded    = "discarded"     // custody explicitly discarded.
+)
+
+// custodyRunTerminalStatuses mirrors workersvc.terminalStatuses (completed/failed/cancelled),
+// replicated here rather than imported because internal/recovery must not import workersvc
+// (recovery.go's package doc). It is the notion of "the hold's run has ended", which
+// separates an OPEN capture-less hold that still protects a LIVE run (active) from one whose
+// run has ended and now needs an owner decision (source_only).
+var custodyRunTerminalStatuses = map[string]bool{"completed": true, "failed": true, "cancelled": true}
+
+// deriveHoldAttention computes a hold's server-derived Attention from its state, capture
+// summary and run status (PRD #1349 M5, D6/D8). Precedence for an OPEN hold: a ready archive
+// (archive_ready, self-releasing) → a capture in flight (capturing) → a stalled/failed capture
+// (needs_action) → a still-live run (active protection) → otherwise a capture-less hold whose
+// run has ended, or whose run is gone/unknown, needs an owner decision (source_only). A
+// non-open hold reports its terminal disposition directly.
+func deriveHoldAttention(row store.ListCustodyHoldsForOwnerRow) string {
+	switch row.State {
+	case "discarded":
+		return attentionDiscarded
+	case "released":
+		return attentionReleased
+	}
+	switch {
+	case row.HasAvailableCapture:
+		return attentionArchiveReady
+	case row.CaptureState == "preparing" || row.CaptureState == "uploading":
+		return attentionCapturing
+	case row.CaptureState == "needs_action":
+		return attentionNeedsAction
+	case row.RunStatus != "" && !custodyRunTerminalStatuses[row.RunStatus]:
+		return attentionActive
+	default:
+		return attentionSourceOnly
+	}
+}
+
+// isDecisionAttention reports whether an attention state is one that awaits an OWNER decision
+// (PRD #1349 M5, D10): needs_action or source_only. active protection and self-releasing
+// archive_ready/release-pending rows are EXCLUDED — they are not owner decisions. This is the
+// DecisionNeeded predicate the aggregate counts.
+func isDecisionAttention(attention string) bool {
+	return attention == attentionNeedsAction || attention == attentionSourceOnly
+}
+
+// custodyHoldToDTO builds the owner-facing custody-hold DTO from a listing row (D7). It carries
+// the OPAQUE original_worker_id and the bounded owner-safe worker display name only — never
+// original_worker_identity (raw provenance) — and stamps the server-derived Attention.
+func custodyHoldToDTO(row store.ListCustodyHoldsForOwnerRow) apitypes.RecoveryCustodyHoldDTO {
+	out := apitypes.RecoveryCustodyHoldDTO{
+		ID:                  row.ID.String(),
+		RunID:               row.RunID.String(),
+		Generation:          row.Generation,
+		State:               row.State,
+		Attention:           deriveHoldAttention(row),
+		WorkerID:            row.OriginalWorkerID.String(),
+		WorkerName:          row.WorkerName,
+		HasAvailableCapture: row.HasAvailableCapture,
+		CaptureState:        row.CaptureState,
+	}
+	if row.CreatedAt.Valid {
+		out.CreatedAt = row.CreatedAt.Time
+	}
+	if row.UpdatedAt.Valid {
+		out.UpdatedAt = row.UpdatedAt.Time
+	}
+	if row.ReleasedAt.Valid {
+		out.ReleasedAt = timePtr(row.ReleasedAt.Time)
+	}
+	return out
+}
+
 // uuidLike is satisfied by uuid.UUID; it lets statusFromLocked take the capture id
 // without importing uuid into this conversion file for a single method set.
 type uuidLike interface{ String() string }

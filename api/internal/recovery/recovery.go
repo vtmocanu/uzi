@@ -63,6 +63,12 @@ type Store interface {
 	GetRecoverySummaryForRun(ctx context.Context, arg store.GetRecoverySummaryForRunParams) (store.GetRecoverySummaryForRunRow, error)
 	MarkCaptureState(ctx context.Context, arg store.MarkCaptureStateParams) (store.RecoveryCapture, error)
 	DiscardCaptureForOwner(ctx context.Context, arg store.DiscardCaptureForOwnerParams) (int64, error)
+	// PRD #1349 M1 (D3): the worker-facing post-clone hold inventory read.
+	ListCustodyHoldsForWorkerRun(ctx context.Context, arg store.ListCustodyHoldsForWorkerRunParams) ([]store.ListCustodyHoldsForWorkerRunRow, error)
+	// PRD #1349 M5 (D6/D7): the owner-facing hold list + aggregate reads. ListHoldsForOwner
+	// maps these to the RecoveryCustodyHoldsDTO and derives each hold's server-side Attention.
+	ListCustodyHoldsForOwner(ctx context.Context, arg store.ListCustodyHoldsForOwnerParams) ([]store.ListCustodyHoldsForOwnerRow, error)
+	GetCustodyAggregateForOwner(ctx context.Context, arg store.GetCustodyAggregateForOwnerParams) (store.GetCustodyAggregateForOwnerRow, error)
 }
 
 // DB is the pgx pool surface the service needs for the streaming download cursor and the
@@ -87,6 +93,15 @@ type Limits struct {
 	MaxConcurrentUploads   int           // concurrent uploads per API process.
 	MaxConcurrentDownloads int           // concurrent downloads per API process.
 	RequestDeadline        time.Duration // per upload/download request+transaction deadline.
+	// CustodyHoldLimit is the owner-admission ceiling (PRD #1349 M5, D6/D10) — the maximum
+	// UNRESOLVED (state='open') custody holds one owner may accumulate before code-run
+	// admission pauses. The handler sets it from workersvc.CustodyHoldLimit so the owner
+	// hold aggregate (ListHoldsForOwner) reports the SAME limit ClaimRun/health gate on, and
+	// passes it to GetCustodyAggregateForOwner's blocked-runs CASE. A non-positive value
+	// disables the blocked-runs gate exactly like the claim path. Typed int32 to map directly
+	// onto the store param (GetCustodyAggregateForOwnerParams.CustodyHoldLimit) with no lossy
+	// conversion; the owner DTO widens it to int.
+	CustodyHoldLimit int32
 	// UploadRetryWindow is the durable-archive upload-retry window (UZI_RECOVERY_UPLOAD_RETRY_WINDOW).
 	// The upload handler itself is single-request (it never loops on this bound); the window
 	// governs the PERIODIC stalled→needs_action transition run by the workersvc sweep

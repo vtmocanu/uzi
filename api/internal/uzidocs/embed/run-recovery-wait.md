@@ -15,6 +15,15 @@ This recovery is automatic and requires no per-run setting. A missing plan
 after a turn that actually did work, missing turn-count metadata, a real
 timeout, and cancellation are not classified as an empty-result recovery.
 
+One empty result is routed elsewhere on purpose: if the turn came back empty
+**because that attempt hit a hard usage limit** (its final rate-limit verdict
+was a rejection), uzi treats it as a usage limit rather than retrying here. It
+enters [`limit_wait`](run-limit-wait.md) and respects your `wait_on_limit`
+setting — so it parks for the reset only if you opted into limit waiting, and
+otherwise fails fast instead of cycling through recovery. An empty turn from
+any other cause, or one where a later signal in the same turn cleared the
+limit, still parks here as `recovery_wait`.
+
 ## What you'll see
 
 - A **recovery wait** badge on the run.

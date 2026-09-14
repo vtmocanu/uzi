@@ -153,23 +153,24 @@ func TestRecoveryStoreLifecycleLiveDB(t *testing.T) {
 		t.Fatalf("gated run status = %q, want queued", gatedStatus)
 	}
 
-	// ── (b) reserve a capture, idempotency, manifest CAS. ──
+	// ── (b) reserve a capture, idempotency, manifest CAS. Generation-exact bind to the gen-1
+	// hold the claim opened above (PRD #1349 M4 flipped the reserve path onto ReserveCaptureExact). ──
 	origWkr := pgtype.UUID{Bytes: workerID, Valid: true}
-	reserve := store.ReserveCaptureParams{
+	reserve := store.ReserveCaptureExactParams{
 		RunID: runID, UserID: userID, OriginalWorkerID: origWkr, OriginalWorkerIdentity: workerName,
-		SourceSha: "H0", AttemptedHeadSha: pgtype.Text{String: "Hprime", Valid: true}, IdempotencyKey: "k1",
+		SourceSha: "H0", AttemptedHeadSha: pgtype.Text{String: "Hprime", Valid: true}, IdempotencyKey: "k1", Generation: 1,
 	}
-	cap1, err := q.ReserveCapture(ctx, reserve)
+	cap1, err := q.ReserveCaptureExact(ctx, reserve)
 	if err != nil {
-		t.Fatalf("ReserveCapture: %v", err)
+		t.Fatalf("ReserveCaptureExact: %v", err)
 	}
 	if cap1.State != "preparing" || cap1.HoldID != holdID || cap1.SourceSha != "H0" {
 		t.Fatalf("reserved capture = %+v, want preparing under hold %s with source H0", cap1, holdID)
 	}
 	// Re-reserving the SAME idempotency key returns the SAME capture (lost-ACK safe).
-	cap1b, err := q.ReserveCapture(ctx, reserve)
+	cap1b, err := q.ReserveCaptureExact(ctx, reserve)
 	if err != nil {
-		t.Fatalf("ReserveCapture(retry): %v", err)
+		t.Fatalf("ReserveCaptureExact(retry): %v", err)
 	}
 	if cap1b.ID != cap1.ID {
 		t.Fatalf("idempotent re-reserve minted a new capture %s (want %s)", cap1b.ID, cap1.ID)
@@ -237,12 +238,12 @@ func TestRecoveryStoreLifecycleLiveDB(t *testing.T) {
 	}
 
 	// A second capture in needs_action, to exercise MarkCaptureState + the summary counts.
-	cap2, err := q.ReserveCapture(ctx, store.ReserveCaptureParams{
+	cap2, err := q.ReserveCaptureExact(ctx, store.ReserveCaptureExactParams{
 		RunID: runID, UserID: userID, OriginalWorkerID: origWkr, OriginalWorkerIdentity: workerName,
-		SourceSha: "H0", IdempotencyKey: "k2",
+		SourceSha: "H0", IdempotencyKey: "k2", Generation: 1,
 	})
 	if err != nil {
-		t.Fatalf("ReserveCapture(k2): %v", err)
+		t.Fatalf("ReserveCaptureExact(k2): %v", err)
 	}
 	if cap2.ID == cap1.ID {
 		t.Fatalf("a distinct idempotency key must mint a distinct capture")
@@ -297,13 +298,13 @@ func TestRecoveryStoreLifecycleLiveDB(t *testing.T) {
 		t.Fatalf("open holds after expiry = %d, want 1 (expiry must not touch custody)", n)
 	}
 
-	// ── (c) ReleaseCustodyForRunWorker: live FKs null, state released, captures survive. ──
-	// The single-hold run is reported completed by its own worker, so the worker-scoped
-	// terminal release releases exactly this hold.
-	if n, err := q.ReleaseCustodyForRunWorker(ctx, store.ReleaseCustodyForRunWorkerParams{RunID: runID, WorkerID: workerID}); err != nil {
-		t.Fatalf("ReleaseCustodyForRunWorker: %v", err)
+	// ── (c) ReleaseCustodyHoldExact: live FKs null, state released, captures survive. ──
+	// The single-hold run is reported completed by its own worker at generation 1, so the
+	// generation-exact terminal release releases exactly this hold (PRD #1349 M4).
+	if n, err := q.ReleaseCustodyHoldExact(ctx, store.ReleaseCustodyHoldExactParams{RunID: runID, Generation: 1, WorkerID: workerID}); err != nil {
+		t.Fatalf("ReleaseCustodyHoldExact: %v", err)
 	} else if n != 1 {
-		t.Fatalf("ReleaseCustodyForRunWorker moved %d rows, want 1", n)
+		t.Fatalf("ReleaseCustodyHoldExact moved %d rows, want 1", n)
 	}
 	var (
 		relState                  string
@@ -323,10 +324,10 @@ func TestRecoveryStoreLifecycleLiveDB(t *testing.T) {
 		t.Fatalf("capture must survive release: %v", err)
 	}
 	// Idempotent: a second release moves zero rows.
-	if n, err := q.ReleaseCustodyForRunWorker(ctx, store.ReleaseCustodyForRunWorkerParams{RunID: runID, WorkerID: workerID}); err != nil {
-		t.Fatalf("ReleaseCustodyForRunWorker(again): %v", err)
+	if n, err := q.ReleaseCustodyHoldExact(ctx, store.ReleaseCustodyHoldExactParams{RunID: runID, Generation: 1, WorkerID: workerID}); err != nil {
+		t.Fatalf("ReleaseCustodyHoldExact(again): %v", err)
 	} else if n != 0 {
-		t.Fatalf("second ReleaseCustodyForRunWorker moved %d rows, want 0 (idempotent)", n)
+		t.Fatalf("second ReleaseCustodyHoldExact moved %d rows, want 0 (idempotent)", n)
 	}
 
 	// ── DiscardCaptureForOwner: chunks deleted, capture marked discarded. ──

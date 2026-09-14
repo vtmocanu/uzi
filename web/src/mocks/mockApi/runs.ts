@@ -1,5 +1,7 @@
 import {
   type AgentSelectionInput,
+  type RecoveryCustodyHold,
+  type RecoveryCustodyHolds,
   type Run,
   type RunPriority,
   type RunInputKind,
@@ -17,11 +19,78 @@ import {
 } from "../data";
 import { ensureLive, handleInput, startNewRun } from "../engine";
 import { getRun, nextRunId, patchRun, state } from "../store";
-import { delay, requireSession } from "./shared";
+import { delay, mockScenario, requireSession } from "./shared";
 import { LEAD_NAME_RE, templates } from "./agents";
 
 function listRunsFor(): Run[] {
   return [...state.runs.values()].sort((a, b) => b.created_at.localeCompare(a.created_at));
+}
+
+// ── Custody recovery mock (PRD #1349 M6) ──────────────────────────────────────
+// The `?mock=custody` scenario seeds a full spread of owner custody holds — every
+// server-derived attention across several workers — so the board alert and the Workers
+// resolution surface can be seen and driven offline. Any other scenario reports zero open
+// holds, so the alert self-hides and the existing demos stay clean.
+//
+// Discards are persisted in module-level sets so a hold/archive stays gone across the 10s
+// polls (the surface re-fetches, and a mutation that reappeared would read as a no-op).
+const discardedHolds = new Set<string>();
+const discardedCaptures = new Set<string>();
+
+// Hostile worker name (a ZWSP, an RTL override and an HTML-injection payload, all as \u
+// ESCAPES — never raw bytes, so this source file carries no invisible characters) so the
+// surface's stripUnsafeChars + React escaping are visible offline. It renders as sanitized,
+// contiguous text with no <script> element.
+const HOSTILE_WORKER_NAME = "ci\u200brunner\u202e<script>alert(1)</script>";
+
+function seedCustodyHolds(): RecoveryCustodyHold[] {
+  const t = (minsAgo: number) => new Date(Date.now() - minsAgo * 60_000).toISOString();
+  const mk = (o: Partial<RecoveryCustodyHold> & Pick<RecoveryCustodyHold, "id" | "run_id" | "worker_id" | "attention">): RecoveryCustodyHold => ({
+    generation: 1,
+    state: o.attention === "released" || o.attention === "discarded" ? "released" : "open",
+    has_available_capture: false,
+    created_at: t(180),
+    updated_at: t(20),
+    ...o,
+  });
+  return [
+    // Worker A — base(M): the full lifecycle on one worker.
+    mk({ id: "hold-a4", run_id: "run-a4", worker_id: "wkr-base-m", worker_name: "base (M)", generation: 4, attention: "active" }),
+    mk({ id: "hold-a3", run_id: "run-a3", worker_id: "wkr-base-m", worker_name: "base (M)", generation: 3, attention: "capturing", capture_state: "uploading" }),
+    mk({ id: "hold-a2", run_id: "run-a2", worker_id: "wkr-base-m", worker_name: "base (M)", generation: 2, attention: "archive_ready", has_available_capture: true, capture_state: "available" }),
+    mk({ id: "hold-a1", run_id: "run-a1", worker_id: "wkr-base-m", worker_name: "base (M)", generation: 1, attention: "source_only" }),
+    // Worker B — jvm-worker: an actionable capture failure + a source-only hold.
+    mk({ id: "hold-b2", run_id: "run-b2", worker_id: "wkr-jvm", worker_name: "jvm-worker", generation: 2, attention: "needs_action", capture_state: "needs_action" }),
+    mk({ id: "hold-b1", run_id: "run-b1", worker_id: "wkr-jvm", worker_name: "jvm-worker", generation: 1, attention: "source_only" }),
+    // Worker C — hostile name: a source-only decision + healthy protection.
+    mk({ id: "hold-c2", run_id: "run-c2", worker_id: "wkr-ext", worker_name: HOSTILE_WORKER_NAME, generation: 2, attention: "active" }),
+    mk({ id: "hold-c1", run_id: "run-c1", worker_id: "wkr-ext", worker_name: HOSTILE_WORKER_NAME, generation: 1, attention: "source_only" }),
+    // A resolved hold whose archive survives — released, exportable on the run.
+    mk({ id: "hold-r1", run_id: "run-r1", worker_id: "wkr-base-m", worker_name: "base (M)", generation: 7, attention: "released", has_available_capture: true, capture_state: "available", released_at: t(5) }),
+  ];
+}
+
+function currentCustodyHolds(): RecoveryCustodyHold[] {
+  if (mockScenario() !== "custody") return [];
+  return seedCustodyHolds().filter((h) => !discardedHolds.has(h.id));
+}
+
+function custodyResponse(): RecoveryCustodyHolds {
+  const holds = currentCustodyHolds();
+  const open = holds.filter((h) => h.state === "open");
+  const decisionNeeded = open.filter(
+    (h) => h.attention === "source_only" || h.attention === "needs_action",
+  ).length;
+  return {
+    aggregate: {
+      open_holds: open.length,
+      custody_hold_limit: 8,
+      decision_needed: decisionNeeded,
+      // Two queued code runs are wedged behind the owner limit in this scenario.
+      blocked_runs: open.length >= 8 ? 2 : 0,
+    },
+    holds,
+  };
 }
 
 export const runsApi = {
@@ -503,7 +572,8 @@ export const runsApi = {
   getRunArchives: async (id: string) => {
     const r = getRun(id);
     if (!r) throw new ApiError(404, "run not found");
-    if (r.status === "failed") {
+    const capId = `${id}-cap1`;
+    if (r.status === "failed" && !discardedCaptures.has(capId)) {
       return delay(
         {
           supported: true,
@@ -519,7 +589,7 @@ export const runsApi = {
           },
           archives: [
             {
-              id: `${id}-cap1`,
+              id: capId,
               run_id: id,
               state: "available",
               source_sha: "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
@@ -552,6 +622,27 @@ export const runsApi = {
       },
       60,
     );
+  },
+  // PRD #1349 M6 (D7/D8): the owner-wide custody hold listing + aggregate the board alert and
+  // the Workers resolution surface read. Rich under ?mock=custody; empty otherwise so the
+  // alert self-hides and the other demos stay clean.
+  getRecoveryHolds: async () => delay(custodyResponse(), 80),
+  // PRD #1296 / #1349 M6 (D7/D9): delete one recovery ARCHIVE artifact. Artifact cleanup
+  // only — it does NOT disposition the parent hold. Persisted so the capture stays gone on
+  // the run view's reload.
+  discardRunArchive: async (runId: string, captureId: string) => {
+    if (!getRun(runId)) throw new ApiError(404, "run not found");
+    discardedCaptures.add(captureId);
+    return delay({ discarded: true }, 80);
+  },
+  // PRD #1349 M5/M6 (D7/D9): discard one exact custody hold — the possible-only-copy source
+  // disposition. Removes it from the owner listing so the surface reflects the discard on the
+  // next poll. Mirrors the server: an unknown hold in the custody scenario 404s.
+  discardHold: async (runId: string, holdId: string) => {
+    const exists = currentCustodyHolds().some((h) => h.id === holdId && h.run_id === runId);
+    if (!exists) throw new ApiError(404, "hold not found");
+    discardedHolds.add(holdId);
+    return delay({ discarded: true }, 80);
   },
   submitRunInput: async (
     id: string,

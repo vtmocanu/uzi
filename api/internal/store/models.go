@@ -192,6 +192,11 @@ type CodexRefreshIntent struct {
 	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
 }
 
+type CustodyEpisodeNotice struct {
+	UserID     uuid.UUID          `json:"user_id"`
+	NotifiedAt pgtype.Timestamptz `json:"notified_at"`
+}
+
 type FindingDisposition struct {
 	ID            uuid.UUID          `json:"id"`
 	UserID        uuid.UUID          `json:"user_id"`

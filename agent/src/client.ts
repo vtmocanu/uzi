@@ -49,6 +49,8 @@ import {
   type RecoveryUploadManifest,
   type RecoveryCaptureStatusResponse,
   type RecoveryReleaseResponse,
+  type RecoveryReleaseRequest,
+  type RecoveryHoldsResponse,
 } from "./protocol.js";
 
 /** Error carrying the server's HTTP status + (truncated) body for retry logic. */
@@ -554,11 +556,25 @@ export class WorkerClient {
   /** Release the run's custody after a successful full publication (D3). JSON POST with an
    *  empty body; idempotent (holds_released is 0 once none remain open). Throws
    *  RequestError on 4xx/5xx. */
-  async releaseRecoveryCustody(runId: string): Promise<RecoveryReleaseResponse> {
+  async releaseRecoveryCustody(
+    runId: string,
+    generation?: number,
+  ): Promise<RecoveryReleaseResponse> {
+    // Backward-compatible: an omitted generation posts an empty body (the v1 settle-by-
+    // run+worker path); a v2 caller names the exact generation (PRD #1349 M1, D1/D2).
+    const body: RecoveryReleaseRequest = generation !== undefined ? { generation } : {};
     return (await this.postJSON(
       `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/archives/release`,
-      {},
+      body,
     )) as RecoveryReleaseResponse;
+  }
+
+  /** listRecoveryHolds returns this worker's own open custody holds on a run — the
+   *  post-clone generation-exact inventory (PRD #1349 M1, D3). holds is always an array. */
+  async listRecoveryHolds(runId: string): Promise<RecoveryHoldsResponse> {
+    return (await this.getJSON(
+      `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/recovery-holds`,
+    )) as RecoveryHoldsResponse;
   }
 
   async getInputs(runId: string): Promise<UserInput[]> {

@@ -844,6 +844,37 @@ func run() error {
 		slog.Info("vault-lock notice disabled (UZI_VAULT_LOCK_NOTICE_ENABLED=false)")
 	}
 
+	// Owner blocked-custody episode Slack DM (PRD #1349 M6, Decision D10): when an owner's
+	// unpublished-work custody holds cross the admission limit and block new runs, this
+	// STANDALONE reconciler DMs the owner ONCE per episode (coalesced by owner, never one DM per
+	// queued run — the per-run custody-limit health nudge is suppressed in workersvc/health.go so
+	// this owns the crossing). It is wired like the vault-lock reconciler above, on its OWN
+	// goroutine, but reuses the health-notification ENABLEMENT gate (read inside Reconcile) rather
+	// than a new enable flag (D10), so it has no dedicated kill-switch — HealthEnabled(false)
+	// suppresses it, exactly as it suppresses the per-run health nudge. It ticks on the sweep
+	// cadence (the SAME cadence the per-run health detector runs on), falling back to 15s when
+	// SWEEP_INTERVAL is unset (0), matching the sweeper's own default.
+	custodyEpisodeRec := slacksvc.NewCustodyEpisodeReconciler(q, notifier, settingsCache, workersvc.CustodyHoldLimit, slog.Default())
+	custodyEpisodeInterval := cfg.SweepInterval
+	if custodyEpisodeInterval <= 0 {
+		custodyEpisodeInterval = 15 * time.Second
+	}
+	bgWG.Add(1)
+	go func() {
+		defer bgWG.Done()
+		custodyEpisodeRec.Reconcile(ctx) // immediate boot pass so a live episode notifies promptly
+		tick := time.NewTicker(custodyEpisodeInterval)
+		defer tick.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tick.C:
+				custodyEpisodeRec.Reconcile(ctx)
+			}
+		}
+	}()
+
 	// History usage refold (PRD #1079 M3): the 00188 migration marked every pre-migration
 	// non-chat run usage_refolded=false, because those runs' run_usage rows were collapsed
 	// by the old MAX-per-model key. This boot one-shot re-folds each such TERMINAL run

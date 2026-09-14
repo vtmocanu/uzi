@@ -67,7 +67,15 @@ var limiterNames = [...]string{
 // error rather than a failing row. Spelled `lim*` rather than matching the parameter
 // names exactly, so nothing here shadows a parameter inside Routes.
 //
-// 196 as of this commit (issue #1319 added GET /api/worker/runs/{id}/orphan-classification —
+// 199 as of this commit (PRD #1349 M5 added GET /api/recovery/holds — the owner-wide custody
+// hold list + aggregate the board/Workers surface and `uzi run recovery` read — and DELETE
+// /api/runs/{id}/recovery-holds/{holdID} — the exact owner hold DISCARD. Both are owner-scoped
+// RequireUser routes with no forge call and no token spend → noLimiter, like the owner archive
+// routes they sit beside; the DISCARD gate is the handler's pre-SQL ?confirm=discard check.)
+// It was 197 until then (PRD #1349 M1 added GET /api/worker/runs/{id}/recovery-holds — the
+// worker-authenticated post-clone generation-exact custody-hold inventory read; noLimiter,
+// like the other worker /runs/{id}/... reads it sits beside.)
+// It was 196 until then (issue #1319 added GET /api/worker/runs/{id}/orphan-classification —
 // the worker-authenticated, owner-scoped orphan-classification read; {id}=claimant, ?owner=
 // the orphan owner run. noLimiter, like the other worker /runs/{id}/... reads it sits beside.)
 // It was 195 until then (PRD #1184 M3 added GET /api/admin/judge/recommendations/issue-draft
@@ -347,6 +355,9 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/me/slack/", noLimiter},
 	{"GET", "/api/notifications/", noLimiter},
 	{"GET", "/api/notifications/unread_count", noLimiter},
+	// PRD #1349 M5: the owner-wide custody hold list + aggregate. Owner-scoped RequireUser read,
+	// no forge call, no token spend → noLimiter, like the owner recovery-archive reads.
+	{"GET", "/api/recovery/holds", noLimiter},
 	{"GET", "/api/repos/", noLimiter},
 	{"GET", "/api/repos/{id}/board", noLimiter},
 	{"GET", "/api/repos/{id}/board/prefs", noLimiter},
@@ -377,6 +388,10 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/runs/{id}/archives", noLimiter},
 	{"GET", "/api/runs/{id}/archives/{captureID}/download", noLimiter},
 	{"DELETE", "/api/runs/{id}/archives/{captureID}", noLimiter},
+	// PRD #1349 M5: the exact owner custody-hold DISCARD, in the same RequireUser /runs group
+	// and same owner-or-404 gate as the archive DELETE above. Owner-scoped, no forge call, no
+	// token spend → noLimiter; the ?confirm=discard mutation gate is the handler's, not a limiter.
+	{"DELETE", "/api/runs/{id}/recovery-holds/{holdID}", noLimiter},
 	{"GET", "/api/runs/{id}/inputs", noLimiter},
 	{"GET", "/api/runs/{id}/messages", noLimiter},
 	{"GET", "/api/runs/{id}/review", noLimiter},
@@ -403,6 +418,7 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/worker/runs/{id}/memory", noLimiter},
 	{"GET", "/api/worker/runs/{id}/orphan-classification", noLimiter},
 	{"GET", "/api/worker/runs/{id}/ownership", noLimiter},
+	{"GET", "/api/worker/runs/{id}/recovery-holds", noLimiter},
 	{"GET", "/api/worker/runs/{id}/trace", noLimiter},
 	{"GET", "/api/workers/", noLimiter},
 	{"GET", "/api/workers/hosted/config", noLimiter},

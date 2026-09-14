@@ -762,8 +762,8 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3)",
     const caps = await advertisedCapabilities(fakeConfig({ codexProbe: { capable: true } }));
     assert.deepStrictEqual(
       caps,
-      ["completion_interlock_v1", "recovery_archive_v1", CODEX_HARNESS_CAPABILITY],
-      "a capable probe appends codex_harness_v1 after the two always-present protocol caps",
+      ["completion_interlock_v1", "recovery_archive_v1", "recovery_archive_v2", CODEX_HARNESS_CAPABILITY],
+      "a capable probe appends codex_harness_v1 after the three always-present protocol caps (v2 added by PRD #1349 M1)",
     );
   });
 
@@ -773,7 +773,7 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3)",
     );
     assert.deepStrictEqual(
       caps,
-      ["completion_interlock_v1", "recovery_archive_v1"],
+      ["completion_interlock_v1", "recovery_archive_v1", "recovery_archive_v2"],
       "a failed probe leaves the always-present protocol caps unchanged (Claude service intact)",
     );
     assert.ok(!caps?.includes(CODEX_HARNESS_CAPABILITY), "codex_harness_v1 is absent on a failed probe");
@@ -785,16 +785,17 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3)",
     const caps = await advertisedCapabilities(fakeConfig());
     assert.deepStrictEqual(
       caps,
-      ["completion_interlock_v1", "recovery_archive_v1"],
-      "an absent probe result advertises only the two always-present protocol caps",
+      ["completion_interlock_v1", "recovery_archive_v1", "recovery_archive_v2"],
+      "an absent probe result advertises only the three always-present protocol caps",
     );
   });
 
-  it("always advertises completion_interlock_v1 and recovery_archive_v1 regardless of the probe", async () => {
+  it("always advertises completion_interlock_v1, recovery_archive_v1 and recovery_archive_v2 regardless of the probe", async () => {
     for (const codexProbe of [{ capable: true }, { capable: false }]) {
       const caps = await advertisedCapabilities(fakeConfig({ codexProbe }));
       assert.ok(caps?.includes("completion_interlock_v1"), "completion_interlock_v1 always present");
       assert.ok(caps?.includes("recovery_archive_v1"), "recovery_archive_v1 always present");
+      assert.ok(caps?.includes("recovery_archive_v2"), "recovery_archive_v2 always present (PRD #1349 M1)");
     }
   });
 });

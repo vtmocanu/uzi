@@ -108,17 +108,24 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 				// the sentence so a 36-char UUID cannot push the actionable tail past the
 				// stderr line's 200-rune cap; --json carries it as a field instead.
 				//
-				// `uzi run export` (D7) is now BACKTICKED: PRD #1296 M5 wired the recovery
-				// command into the cobra tree, so a liftable reference resolves under
-				// assertCommandPathResolves and is registered in instructions_test.go
+				// `uzi run export`, `uzi run recovery` and `uzi run discard` (D7/D9) are all
+				// BACKTICKED: PRD #1296 M5 wired export into the cobra tree, and PRD #1349 M5
+				// wired recovery + discard, so every liftable reference resolves under
+				// assertCommandPathResolves and each is registered in instructions_test.go
 				// (evidenceGoTest → TestWorkerRmCustodyConflict, the test that executes this very
-				// refusal). Before M5 it was deliberately unbackticked prose, because a liftable
-				// reference to a command that did not exist yet would have tripped that drift test.
+				// refusal). The refusal NEVER bundles a force-discard into `worker rm` (D9): it
+				// names the exact `uzi run discard <run-id> --hold <hold-id> --yes` the operator
+				// runs themselves, so destroying a possible only copy is always a separate,
+				// explicit decision.
+				//
+				// TERSE ON PURPOSE: cellText caps the stderr line at 200 runes (compactText),
+				// so naming all three verbs plus the retry leaves no room for prose. The full
+				// structured refusal (hold count) rides the --json channel below.
 				var custody *uzicli.WorkerCustodyConflictError
 				if errors.As(err, &custody) {
 					guidance := fmt.Sprintf(
-						"this worker holds unpublished committed work in %d durable-recovery archive(s); "+
-							"recover it (`uzi run export`) or explicitly discard those archives, then retry the delete",
+						"worker holds %d unpublished-work custody hold(s); list `uzi run recovery <run-id>`, "+
+							"then `uzi run export` or `uzi run discard <run-id> --hold <hold-id> --yes`, and retry",
 						custody.Holds)
 					if p := env.printer(gf); p.Format == uzicli.FormatJSON {
 						_ = p.JSON(map[string]any{

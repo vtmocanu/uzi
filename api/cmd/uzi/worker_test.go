@@ -61,10 +61,16 @@ func TestWorkerRmCustodyConflict(t *testing.T) {
 	if fc.DeleteWorkerCalls != 1 || fc.LastDeletedWorkerID != "w1" {
 		t.Fatalf("DeleteWorker calls=%d id=%q, want exactly one attempt on w1", fc.DeleteWorkerCalls, fc.LastDeletedWorkerID)
 	}
-	// The guidance reaches stderr (Main prints the returned error there). It must name
-	// the recovery command, the discard alternative and the retry — the actionable trio,
-	// not a bare "conflict".
-	for _, want := range []string{"uzi run export", "discard", "retry"} {
+	// The guidance reaches stderr (Main prints the returned error there). It must name the
+	// exact recover/list/discard commands and the retry — the actionable set, not a bare
+	// "conflict" — and it must NAME the exact `uzi run discard <run-id> --hold <hold-id> --yes`
+	// rather than bundling a force-discard into `worker rm` (PRD #1349 M5, D9).
+	for _, want := range []string{
+		"uzi run recovery <run-id>",
+		"uzi run export",
+		"uzi run discard <run-id> --hold <hold-id> --yes",
+		"retry",
+	} {
 		if !strings.Contains(errb, want) {
 			t.Errorf("rm custody refusal missing %q on stderr; got stderr=%q stdout=%q", want, errb, out)
 		}

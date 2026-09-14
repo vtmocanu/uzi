@@ -105,6 +105,8 @@ uzi run inputs <id> [--json]
 uzi run expedite <id> [--clear]
 uzi run rework <id> [-m|--message <text>]
 uzi run export <id> --output <path> [--capture <id>]
+uzi run recovery <id> [--json]
+uzi run discard <id> --hold <hold-id> [--yes]
 uzi schedule create --repo <id> [--repo <id> ...] (--issue <iid> | --sweep [--label <l> ...] [--create-missing-labels] | --prompt <text>)
                     (--at <rfc3339> | --cron <expr>) [--tz <iana>]
                     [--auto-approve[=false]] [--wait-on-limit[=false]]
@@ -726,6 +728,39 @@ uzi run export <run-id> --output ./recovered.bundle
 captures (the archive count, per-state tally, and each available capture's id) so you
 know what `--capture` can fetch. It is metadata only and never claims an archive is
 available when it is not.
+
+### Reviewing and resolving held work: `uzi run recovery` / `uzi run discard`
+
+A run's custody hold reserves owner capacity while its committed-but-unpublished work is
+recovered. Holds are per claim generation and capped per owner, so unresolved holds can
+eventually block new code runs. `uzi run recovery` lists a run's holds and captures so you
+can see exactly what is retained:
+
+```
+uzi run recovery <run-id> [--json]
+```
+
+- Shows each hold's exact id, claim generation, and its attention state — active
+  protection, a capture in flight, an archive ready (which releases automatically), or a
+  capture-less source that needs a decision — plus any retained captures. `--json` prints
+  the raw rows for scripting. Owner-only.
+
+When a capture-less hold is genuinely not worth keeping, discard that one exact held
+source:
+
+```
+uzi run discard <run-id> --hold <hold-id> --yes
+```
+
+- **Names one exact hold.** `--hold` is required; the discard settles only that hold and
+  its non-ready captures. It never touches an *available* archive (delete that separately
+  from the run view) and never a sibling hold or another generation.
+- **Confirmation required, and it may be the only copy.** Without `--yes` it prompts
+  interactively and refuses outright when stdin is not a TTY (so a script cannot discard
+  unprompted); a declined prompt makes no change. Discarding a capture-less hold can
+  destroy the last copy of that work — export anything you might need first.
+- **Terminal and owner-scoped.** A discarded hold cannot be revived, and you can discard
+  only your own runs' holds.
 
 ## uzi handoff: ephemeral branch-scoped task runs
 

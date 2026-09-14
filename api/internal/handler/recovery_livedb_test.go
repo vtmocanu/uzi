@@ -644,11 +644,11 @@ func TestRecoveryReserveIdempotentAndReleaseLiveDB(t *testing.T) {
 	}
 	// A foreign worker releasing settles nothing.
 	foreign := store.Worker{ID: uuid.New(), UserID: e.user}
-	if rel, err := svc.Release(e.ctx, foreign, e.run); err != nil || rel.HoldsReleased != 0 {
+	if rel, err := svc.Release(e.ctx, foreign, e.run, apitypes.RecoveryReleaseRequest{}); err != nil || rel.HoldsReleased != 0 {
 		t.Fatalf("foreign release = (%+v, %v), want 0 holds released", rel, err)
 	}
 	// The rightful worker releases its open hold.
-	rel, err := svc.Release(e.ctx, e.worker, e.run)
+	rel, err := svc.Release(e.ctx, e.worker, e.run, apitypes.RecoveryReleaseRequest{})
 	if err != nil || !rel.Released || rel.HoldsReleased != 1 {
 		t.Fatalf("release = (%+v, %v), want 1 hold released", rel, err)
 	}
@@ -656,7 +656,7 @@ func TestRecoveryReserveIdempotentAndReleaseLiveDB(t *testing.T) {
 		t.Fatalf("hold state = %q, want released", e.holdState())
 	}
 	// Idempotent repeat settles nothing.
-	if rel2, err := svc.Release(e.ctx, e.worker, e.run); err != nil || rel2.HoldsReleased != 0 {
+	if rel2, err := svc.Release(e.ctx, e.worker, e.run, apitypes.RecoveryReleaseRequest{}); err != nil || rel2.HoldsReleased != 0 {
 		t.Fatalf("second release = (%+v, %v), want 0", rel2, err)
 	}
 }

@@ -17,6 +17,7 @@ import { HostedWorkers } from "../components/HostedWorkers";
 import { WorkerRunBadge } from "../components/WorkerRunBadge";
 import { WorkerCordonBadge } from "../components/WorkerCordonBadge";
 import { WorkerCustodyBadge } from "../components/WorkerCustodyBadge";
+import { RecoveryHoldsSurface } from "../components/RecoveryHoldsSurface";
 import { WorkerStatGauges, formatBytes } from "../components/WorkerStats";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import { useAsyncData } from "../lib/useAsyncData";
@@ -535,6 +536,12 @@ export function WorkersSettings() {
                 <Alert tone={notice.tone} message={notice.text} />
               </div>
             )}
+
+            {/* PRD #1349 M6 (D8): the durable custody resolution surface. Self-hides when
+                there is no held work; when present it leads the panel so held work that
+                blocks claims is the first thing the owner sees on the Workers page. It is the
+                deep-link target for the board alert's "Review held work" action. */}
+            <RecoveryHoldsSurface />
 
             <Card className="space-y-3">
               <SectionTitle>Your workers</SectionTitle>

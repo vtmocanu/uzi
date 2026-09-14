@@ -535,6 +535,16 @@ type FakeClient struct {
 	RecoveryDownloadCalls []string
 	RecoveryDownloadErr   error
 
+	// Owner custody-hold list + discard (PRD #1349 M5). RecoveryHoldsResult backs
+	// RecoveryHolds; RecoveryHoldsErr wins over the blanket Err. DiscardHoldCalls records EACH
+	// (run, hold) discard IN ORDER, so a CLI test proves NO mutation was attempted on a
+	// cancelled/declined prompt or a non-TTY refusal (the list stays empty); DiscardHoldErr,
+	// when set, is returned by DiscardRecoveryHold (e.g. a 404 for a foreign/absent hold).
+	RecoveryHoldsResult apitypes.RecoveryCustodyHoldsDTO
+	RecoveryHoldsErr    error
+	DiscardHoldCalls    []DiscardHoldCall
+	DiscardHoldErr      error
+
 	// Err, when non-nil, is returned by every method (before any lookup).
 	Err error
 }

@@ -245,3 +245,43 @@ func TestDeleteWorkerCustodyGuardOwnerScopedLiveDB(t *testing.T) {
 		t.Fatalf("worker %s deleted despite the custody refusal / foreign 404", w)
 	}
 }
+
+// TestSetStateCompletedSameWorkerMultiGenReleasesOnlyCurrentLiveDB is the D1/D2 CORE regression
+// (PRD #1349 M4) — the case the pre-M4 generation-blind completion release got WRONG. ONE worker
+// W holds TWO open holds on a run: an uncaptured generation-1 hold plus a generation-2 hold from
+// an affinity re-claim after a transient loss (BOTH live_worker_id = W). The run completes at
+// claim_generation = 2, reported by W. The generation-EXACT completion release
+// (ReleaseCustodyHoldExact, passing run.claim_generation) settles ONLY generation 2's hold;
+// generation 1's uncaptured hold stays OPEN, preserving its only copy of that committed work.
+//
+// This is the DISCRIMINATING test the sibling different-worker test above does NOT cover: on the
+// pre-fix per-run+worker release (ReleaseCustodyForRunWorker matched EVERY open hold held live by
+// W) BOTH generation-1 AND generation-2 holds would be released, dropping generation 1's only
+// copy — so the gen-1-stays-open assertion FAILS on pre-fix code and PASSES only with the exact
+// release.
+func TestSetStateCompletedSameWorkerMultiGenReleasesOnlyCurrentLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	svc := e.permitService(t)
+
+	w := e.seedWorker(t, nil) // the ONE worker that holds BOTH generations live
+	runID := e.seedLegacyRunningRun(t, w)
+	e.exec(t, `UPDATE runs SET claim_generation = 2 WHERE id = $1`, runID)
+
+	gen1 := mhOpenHold(t, e, runID, 1, w) // uncaptured orphan: protects the ONLY copy of gen-1's work
+	gen2 := mhOpenHold(t, e, runID, 2, w)
+
+	run, applied, err := svc.SetState(e.ctx, store.Worker{ID: w}, runID,
+		StateRequest{State: "completed", Branch: strPtr("agent/issue-samegen"), Head: strPtr("ignored")})
+	if err != nil {
+		t.Fatalf("SetState(completed): %v", err)
+	}
+	if !applied || run.Status != "completed" {
+		t.Fatalf("completion must apply; applied=%v status=%q", applied, run.Status)
+	}
+	if s := mhHoldState(t, e, gen2); s != "released" {
+		t.Fatalf("current-generation (2) hold state = %q after completion, want released", s)
+	}
+	if s := mhHoldState(t, e, gen1); s != "open" {
+		t.Fatalf("uncaptured generation-1 hold state = %q after W's generation-2 completion, want OPEN — a generation-blind run+worker release would drop generation 1's only copy (the D1/D2 core hazard)", s)
+	}
+}

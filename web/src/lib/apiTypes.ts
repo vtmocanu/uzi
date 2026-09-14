@@ -3493,3 +3493,45 @@ export interface RecoveryArchiveSummary {
   counts: RecoveryArchiveStateCounts;
   archives: RecoveryArchive[];
 }
+
+// ── Owner-facing custody holds (PRD #1349 M1) ─────────────────────────────────
+// The owner-visible custody-hold surface the Workers view and `uzi run recovery` render.
+// The Go source is api/internal/apitypes/recovery.go; the api-contract fixtures pin the two
+// in lockstep. Raw provenance (original_worker_identity) never appears here (D7) — only the
+// opaque worker_id and a bounded worker_name.
+
+// RecoveryCustodyHold is one owner-visible custody hold. attention is a SERVER-DERIVED
+// action/attention state DISTINCT from state (its vocabulary: active | capturing |
+// archive_ready | needs_action | source_only | released | discarded); M4/M5 compute it and
+// M1 leaves it "". worker_name/capture_state are absent when empty; released_at is absent
+// while the hold is open. has_available_capture is true when a ready archive covers the hold.
+export interface RecoveryCustodyHold {
+  id: string;
+  run_id: string;
+  generation: number;
+  state: string;
+  attention: string;
+  worker_id: string;
+  worker_name?: string;
+  has_available_capture: boolean;
+  capture_state?: string;
+  created_at: string;
+  updated_at: string;
+  released_at?: string;
+}
+
+// RecoveryCustodyAggregate is the owner-level custody summary the board alert and the
+// one-per-episode Slack DM read. All four counts are always present (0 is meaningful).
+export interface RecoveryCustodyAggregate {
+  open_holds: number;
+  custody_hold_limit: number;
+  decision_needed: number;
+  blocked_runs: number;
+}
+
+// RecoveryCustodyHolds is the owner GET /api/recovery/holds response (M5 populates the
+// endpoint; the shape is frozen in M1). holds is ALWAYS an array on the wire, never null.
+export interface RecoveryCustodyHolds {
+  aggregate: RecoveryCustodyAggregate;
+  holds: RecoveryCustodyHold[];
+}

@@ -193,6 +193,12 @@ export class RunTurnReducerImpl implements RunTurnReducer {
     // mistaken for a positively-empty (zero-turn) result.
     const n = terminal.metrics.wire?.num_turns;
     if (typeof n === "number" && Number.isFinite(n)) this.result.numTurns = n;
+    // PRD #1349 M3: carry THIS turn's FINAL latest-wins rate-limit verdict through to
+    // the result. `limitEvidence.latest` is already the newest rate_limit_event of the
+    // turn (the adapter feeds the latest-wins RateLimitObserver before decode), so no
+    // re-folding is needed here — just thread it. Per-turn state (wholesale-reset each
+    // `beginTurn`), so a prior attempt's verdict cannot leak into a later empty turn.
+    this.result.rateLimit = terminal.limitEvidence?.latest;
     const em = projectResult({
       outcome: terminal.outcome,
       subtype: terminal.subtype,
