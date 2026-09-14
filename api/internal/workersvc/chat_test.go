@@ -245,9 +245,8 @@ func TestAssembleChatClaimRefusesCodexIndicatingRun(t *testing.T) {
 // to open the Anthropic credential and assemble a claim. Wiring a token lets the whole path
 // succeed, which is a strong proof the guard did not fire for the harness reason.
 func TestAssembleChatClaimAllowsClaudeRun(t *testing.T) {
-	const token = "anthropic-claude-chat-allow-abcdef1234567890"
 	box := newBox(t)
-	sealedTok, _ := box.Seal([]byte(token))
+	sealedTok, _ := box.Seal([]byte("anthropic-claude-chat-allow-abcdef1234567890"))
 	fs := &fakeStore{anthropic: sealedTok}
 	svc := New(fs, box, testParams())
 
@@ -262,7 +261,7 @@ func TestAssembleChatClaimAllowsClaudeRun(t *testing.T) {
 	if payload == nil {
 		t.Fatal("a Claude chat run must assemble a payload")
 	}
-	if payload.Secrets.AnthropicOAuthToken != token {
+	if payload.Secrets.AnthropicOAuthToken != "anthropic-claude-chat-allow-abcdef1234567890" {
 		t.Fatalf("payload must carry the decrypted Anthropic token, got %q", payload.Secrets.AnthropicOAuthToken)
 	}
 	// The guard let the claim proceed, so the credential WAS opened (unlike the refusal cases).
