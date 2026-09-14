@@ -514,6 +514,25 @@ workers:
   # own CNPG already runs on standard here, so this is a default worth thinking about,
   # not a blocker.
   storageClass: ""
+  # A cluster-scoped PriorityClass for hosted worker pods (issue #1341). When enabled,
+  # the chart creates the PriorityClass AND the controller stamps its name onto every
+  # worker pod's priorityClassName, so a busy worker outranks lower-priority pods for
+  # kubelet node-pressure eviction and scheduler preemption.
+  #
+  # 🔴 CLUSTER-SCOPED: `name` must be unique cluster-wide across ALL PriorityClasses.
+  # On a SHARED cluster, confirm/tune `value` with the cluster owner before deploying —
+  # a higher value wins eviction/scheduling contests against other tenants' pods. To
+  # gain eviction survival + scheduling priority WITHOUT preempting other tenants'
+  # already-running pods, set `preemptionPolicy: Never`.
+  priorityClass:
+    enabled: true
+    name: uzi-hosted-worker
+    # Modest: above the priority-0 default of a no-class pod, far below the reserved
+    # system range (>= 2000000000). Operator-tunable.
+    value: 1000
+    # Optional. Empty ⇒ the k8s default (PreemptLowerPriority). Set to `Never` on a
+    # shared cluster to avoid preempting other tenants' running pods.
+    # preemptionPolicy: PreemptLowerPriority
   # The per-hosted-worker run-slot cap (→ UZI_WORKER_MAX_CONCURRENT_RUNS → the pod's
   # WORKER_MAX_CONCURRENT_RUNS). Default 1 (safe): a hosted worker takes ONE run at a
   # time regardless of size. Raising it opts into the intra-user concurrency residuals

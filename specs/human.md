@@ -466,6 +466,7 @@ Tracked as GitLab issue vtmocanu/uzi#58 (closed); PRD at `prds/done/58-hosted-k8
   - `/nix` is now a flat **20Gi** — raised for PRD #87's prebaked Chromium closure. [user, PRD #87]
   - `l`'s RAM limit is now **12Gi** (request was 4Gi; now 8Gi, #1341), raised to stop runtime OOMKills from multi-agent runs (parallel subagent waves plus the web-ux browser). [user, #131]
   - Per-size RAM raised: `s` 2–4Gi, `m` 4–8Gi, `l` 8–12Gi — each request lifted above that size's measured per-run peak (all still Burstable). Stops kubelet node-memory-pressure eviction of workers that sat over their request, incl. mid-run. [user, #1341]
+  - Hosted worker pods now carry a default `priorityClassName` (a modest cluster-scoped PriorityClass, `globalDefault: false`), so a busy worker outranks lower-priority pods for node-pressure eviction and scheduler preemption. [user, #1341]
 - Default size is `m`, not `s`. [user 2026-07-16]
 - Three sizes stay, and the picker displays what each size buys. [user 2026-07-17]
 - Deleting a hosted worker requires a confirmation (it destroys the worker's volumes); deleting an external worker stays one click. [user 2026-07-16]

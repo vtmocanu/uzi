@@ -376,6 +376,13 @@ type RenderConfig struct {
 	APIURL string
 	// StorageClass is optional; empty means the cluster default.
 	StorageClass string
+	// PriorityClassName is optional; empty renders no priorityClassName, which is the
+	// pod-default priority 0. Set, it makes a busy worker outrank lower-priority pods
+	// for kubelet node-pressure eviction and scheduler preemption (issue #1341). It is
+	// json:"priorityClassName,omitempty" on the PodSpec, so an empty value marshals
+	// identically to before this field existed — a disabled install does not re-hash or
+	// roll its workers.
+	PriorityClassName string
 	// MaxConcurrentRuns is the per-worker slot cap rendered into the pod's
 	// WORKER_MAX_CONCURRENT_RUNS. Zero (a RenderConfig{} built in a test, or a caller
 	// that never set it) renders "1", so the default stays 1 everywhere; see config.go,
@@ -857,6 +864,7 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 		},
 		Spec: corev1.PodSpec{
 			ServiceAccountName:           cfg.ServiceAccountName,
+			PriorityClassName:            cfg.PriorityClassName,
 			AutomountServiceAccountToken: &automount,
 			// Soft anti-affinity for docker workers ONLY (nil for a plain worker, so its
 			// spec/hash is untouched). Keeps the pod off nodes running the crown-jewel

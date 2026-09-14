@@ -1,0 +1,29 @@
+{{- if and .Values.workers.enabled .Values.workers.priorityClass.enabled }}
+{{- /*
+  The default hosted-worker PriorityClass (issue #1341).
+
+  Cluster-scoped (scheduling.k8s.io/v1 PriorityClass has NO namespace), gated on BOTH
+  workers.enabled AND workers.priorityClass.enabled. When present, the controller stamps
+  its name onto every worker pod's priorityClassName (UZI_WORKER_PRIORITY_CLASS_NAME, wired
+  in controller-deployment.yaml), so a busy worker outranks lower-priority pods for kubelet
+  node-pressure eviction and scheduler preemption.
+
+  Disabled (workers.priorityClass.enabled: false) renders NOTHING here and the controller
+  gets no env, so worker pods carry no priorityClassName — byte-identical to before this
+  existed, and the fleet does not re-hash or roll on upgrade.
+*/ -}}
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: {{ .Values.workers.priorityClass.name }}
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+value: {{ .Values.workers.priorityClass.value }}
+# HARD-CODED false, never configurable: globalDefault: true would repriority every
+# pod cluster-wide that declares no priorityClassName, far outside uzi's blast radius.
+globalDefault: false
+{{- with .Values.workers.priorityClass.preemptionPolicy }}
+preemptionPolicy: {{ . }}
+{{- end }}
+description: {{ .Values.workers.priorityClass.description | default "Priority for uzi hosted worker pods so a busy worker survives node memory pressure and outranks lower-priority pods (issue #1341)." | quote }}
+{{- end }}

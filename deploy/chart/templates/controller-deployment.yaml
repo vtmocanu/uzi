@@ -138,6 +138,16 @@ spec:
             - name: UZI_WORKER_STORAGE_CLASS
               value: {{ . | quote }}
             {{- end }}
+            # The default worker PriorityClass name (issue #1341). Gated on the bool, not
+            # `with`: when enabled the class name always has a chart default, and the
+            # controller renders priorityClassName onto every worker pod so a busy worker
+            # outranks lower-priority pods for node-pressure eviction and preemption. The
+            # controller Deployment is itself gated on workers.enabled (top of this file),
+            # so this env cannot render without the PriorityClass object also rendering.
+            {{- if .Values.workers.priorityClass.enabled }}
+            - name: UZI_WORKER_PRIORITY_CLASS_NAME
+              value: {{ .Values.workers.priorityClass.name | quote }}
+            {{- end }}
             # The per-worker run-slot cap. NOT with-gated: it always has a chart default
             # (workers.maxConcurrentRuns: 1), so the controller always receives it and
             # the default (1) is explicit in the rendered pod rather than implied by the

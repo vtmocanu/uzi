@@ -1,6 +1,7 @@
 package kube
 
 import (
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -296,6 +297,53 @@ func TestRenderedResourcesComeFromThePreset(t *testing.T) {
 	}
 	if c.Resources.Requests.Memory().String() != "8Gi" || c.Resources.Limits.Memory().String() != "12Gi" {
 		t.Errorf("memory = %s/%s, want 8Gi/12Gi", c.Resources.Requests.Memory(), c.Resources.Limits.Memory())
+	}
+}
+
+// TestRenderedPriorityClassName pins the optional worker PriorityClass (issue #1341): a
+// set value stamps priorityClassName onto every worker PodSpec (plain and docker) and
+// rolls the fleet once via the spec hash, while an empty value marshals identically to
+// before the field existed — the omitempty tag drops the key — so a priorityClass-disabled
+// install never re-hashes or rolls its workers on upgrade.
+func TestRenderedPriorityClassName(t *testing.T) {
+	spec := testSpec(t, "base", "m")
+
+	// Set: the value lands on a PLAIN worker's PodSpec.
+	withClass := testConfig()
+	withClass.PriorityClassName = "uzi-hosted-worker"
+	w := desired("abc")
+	if got := RenderDeployment(withClass, w, spec).Spec.Template.Spec.PriorityClassName; got != "uzi-hosted-worker" {
+		t.Errorf("plain priorityClassName = %q, want uzi-hosted-worker", got)
+	}
+
+	// Set: the same for a DOCKER worker.
+	dockerWithClass := dockerTestConfig()
+	dockerWithClass.PriorityClassName = "uzi-hosted-worker"
+	dw := desiredDocker("abc")
+	if got := RenderDeployment(dockerWithClass, dw, spec).Spec.Template.Spec.PriorityClassName; got != "uzi-hosted-worker" {
+		t.Errorf("docker priorityClassName = %q, want uzi-hosted-worker", got)
+	}
+
+	// Empty (the base testConfig()): no priorityClassName rendered.
+	empty := testConfig()
+	if got := RenderDeployment(empty, w, spec).Spec.Template.Spec.PriorityClassName; got != "" {
+		t.Errorf("empty priorityClassName = %q, want empty", got)
+	}
+
+	// Setting the field CHANGES the spec hash, so enabling it rolls the fleet once.
+	if SpecHashOf(withClass, w, spec) == SpecHashOf(empty, w, spec) {
+		t.Error("spec hash unchanged when PriorityClassName is set; enabling it must roll the fleet exactly once")
+	}
+
+	// No spurious roll for a disabled install: the empty-priority PodTemplateSpec must
+	// marshal WITHOUT a priorityClassName key (the omitempty tag), so an empty value
+	// cannot re-hash an existing worker. Mirror SpecHashOf's json.Marshal.
+	raw, err := json.Marshal(RenderDeployment(empty, w, spec).Spec.Template)
+	if err != nil {
+		t.Fatalf("marshal pod template: %v", err)
+	}
+	if strings.Contains(string(raw), "priorityClassName") {
+		t.Errorf("empty PodTemplateSpec JSON contains priorityClassName; omitempty must drop it: %s", raw)
 	}
 }
 
