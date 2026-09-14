@@ -647,6 +647,13 @@ jobs:
           # regex, so a metacharacter in the version can never widen the scope.
           prefix="${TAG}-rc."   # stable tag only here, e.g. v0.83.0 -> v0.83.0-rc.
           deleted=0
+          # A listing FAILURE (network, auth) must not masquerade as "no RC entries": warn
+          # and skip, distinct from a genuine empty result that legitimately prunes nothing.
+          # Still non-fatal -- exit 0 so a listing hiccup never reddens a release that shipped.
+          if ! rc_tags="$(gh release list --limit 1000 --json tagName --jq '.[].tagName')"; then
+            echo "WARN: could not list GitHub Releases -- skipping RC cleanup; re-run the tag to retry." >&2
+            exit 0
+          fi
           while IFS= read -r tag; do
             [ -n "$tag" ] || continue
             rest="${tag#"$prefix"}"                        # strip the literal base prefix
@@ -658,5 +665,5 @@ jobs:
             else
               echo "WARN: could not delete Release $tag -- left in place; re-run the tag to retry."
             fi
-          done < <(gh release list --limit 1000 --json tagName --jq '.[].tagName' || true)
+          done <<< "$rc_tags"
           echo "Pruned $deleted superseded RC Release entries for $TAG."
