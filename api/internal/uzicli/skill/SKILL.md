@@ -168,6 +168,8 @@ uzi run mr-rework <run-id> [--enabled[=false]] [--clear]
 uzi run rework <run-id> [-m|--message <text>]
 uzi run decide <run-id> --continue [--guidance <text>]
 uzi run export <run-id> --output <path> [--capture <id>]
+uzi run recovery <run-id> [--json]
+uzi run discard <run-id> --hold <hold-id> [--yes]
 uzi schedule create --repo <repo-id> [--repo <repo-id>]... (--issue <iid> | --sweep [--label <l>]... [--create-missing-labels] | --prompt <text>) (--at <rfc3339> | --cron <expr>) [--tz <iana>] [--enabled[=false]] [--auto-approve[=false]] [--wait-on-limit] [--mr-rework[=false]] [--output mr|issues]
 uzi schedule list
 uzi schedule get <schedule-id>
@@ -575,6 +577,19 @@ uzi version
   **not** completion-blocked is a 409 (exit 5); a foreign/unknown run is a 404 (exit 4). Prints
   the run's new status (plus the deferred/accepted ids for partial/accept); `--json` emits the
   resumed run object.
+- `uzi run recovery <run-id> [--json]` — list the durable-recovery **custody holds** retained
+  for a run (owner-only): each hold's exact id, claim generation, server-derived **disposition**
+  and latest capture state. A `source_only` or `needs_action` disposition awaits your decision;
+  `archive_ready` self-releases and `active` is healthy protection of a still-running run.
+  Recover an available archive with `uzi run export`, or discard a held source with
+  `uzi run discard`. `--json` emits the run's raw hold DTOs.
+- `uzi run discard <run-id> --hold <hold-id> [--yes]` — discard ONE exact custody hold (a held
+  source of unpublished committed work), so a blocked worker/PVC can be torn down. **Destructive:**
+  the worker-local source may be the only copy and no server archive can restore it after discard.
+  It prompts for confirmation interactively; `--yes` is **required** for a non-interactive run
+  (without a TTY and without `--yes` it refuses and changes nothing). A cancelled prompt mutates
+  nothing. An available archive is never deleted here (export it first). A foreign/absent/already
+  settled hold is a 404 (exit 4).
 
 ### Schedules — time-driven runs
 

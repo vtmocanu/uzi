@@ -451,6 +451,11 @@ func (h *Handler) recoveryLimits() recovery.Limits {
 		MaxConcurrentDownloads: h.cfg.RecoveryMaxConcurrentDownloads,
 		RequestDeadline:        h.cfg.RecoveryRequestDeadline,
 		UploadRetryWindow:      h.cfg.RecoveryUploadRetryWindow,
+		// PRD #1349 M5 (D6/D10): the owner custody-hold aggregate reports the SAME admission
+		// ceiling ClaimRun/health gate on, so the board alert and `uzi run recovery` never
+		// disagree with the claim path. Sourced from workersvc's exported constant rather than
+		// hardcoded here (a constant, so int32() is a compile-time conversion).
+		CustodyHoldLimit: int32(workersvc.CustodyHoldLimit),
 	}
 }
 
@@ -921,6 +926,13 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				r.Get("/{id}/archives", h.ListRecoveryArchives)
 				r.Get("/{id}/archives/{captureID}/download", h.DownloadRecoveryArchive)
 				r.Delete("/{id}/archives/{captureID}", h.DiscardRecoveryArchive)
+				// Exact owner custody-hold DISCARD (PRD #1349 M5, D7). Same RequireUser /runs
+				// group and same strict GetRun owner-or-404 gate as the archive DELETE above, so
+				// both the web dialog and the `uzi run discard` CLI (uzc_/uza_ Bearer) reach it;
+				// admin refused. The mutating ?confirm=discard gate is validated in the handler
+				// BEFORE any SQL. This disposes a HELD SOURCE (custody), distinct from the
+				// archive-artifact DELETE above.
+				r.Delete("/{id}/recovery-holds/{holdID}", h.DiscardRecoveryHold)
 			})
 			r.Group(func(r chi.Router) {
 				r.Use(mw.RequireAuth(h.q, h.cfg))
@@ -951,6 +963,16 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 		r.Group(func(r chi.Router) {
 			r.Use(mw.RequireUser(h.q, h.cfg))
 			r.Get("/ws", h.ServeWS)
+		})
+
+		// Owner recovery custody holds — owner-wide list + aggregate (PRD #1349 M5, D7).
+		// RequireUser (session cookie OR uzc_/uza_ Bearer) so the web board/Workers surface
+		// and the `uzi run recovery` CLI both reach it, mirroring how the owner archive routes
+		// gate ownership. Owner-scoped in SQL by the caller's user id — NO run scope (this is
+		// the owner-wide list; the exact-hold DISCARD is the DELETE under /runs above).
+		r.Group(func(r chi.Router) {
+			r.Use(mw.RequireUser(h.q, h.cfg))
+			r.Get("/recovery/holds", h.ListRecoveryHolds)
 		})
 
 		h.mountChatRoutes(r, chatLimiter, forgeLimiter)

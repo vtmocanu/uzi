@@ -139,3 +139,75 @@ func TestDownloadRecoveryArchiveCredentialSafeBase(t *testing.T) {
 		t.Errorf("expected a plaintext-URL refusal, got %v", err)
 	}
 }
+
+// TestRecoveryHoldsDecodes: the owner-wide holds read hits /api/recovery/holds and decodes
+// the aggregate + hold rows (PRD #1349 M5).
+func TestRecoveryHoldsDecodes(t *testing.T) {
+	var gotPath, gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"aggregate":{"open_holds":2,"custody_hold_limit":8,"decision_needed":1,"blocked_runs":0},` +
+			`"holds":[{"id":"h1","run_id":"r1","generation":1,"state":"open","attention":"source_only",` +
+			`"worker_id":"w1","worker_name":"alpha","has_available_capture":false,` +
+			`"created_at":"2026-09-13T00:00:00Z","updated_at":"2026-09-13T00:00:00Z"}]}`))
+	}))
+	defer srv.Close()
+
+	got, err := newTestClient(srv).RecoveryHolds(context.Background())
+	if err != nil {
+		t.Fatalf("RecoveryHolds: %v", err)
+	}
+	if gotPath != "/api/recovery/holds" {
+		t.Errorf("path = %q, want /api/recovery/holds", gotPath)
+	}
+	if gotAuth != "Bearer uzc_test" {
+		t.Errorf("auth = %q, want Bearer uzc_test", gotAuth)
+	}
+	if got.Aggregate.OpenHolds != 2 || got.Aggregate.CustodyHoldLimit != 8 || got.Aggregate.DecisionNeeded != 1 {
+		t.Errorf("aggregate = %+v, want open 2 / limit 8 / decision 1", got.Aggregate)
+	}
+	if len(got.Holds) != 1 || got.Holds[0].ID != "h1" || got.Holds[0].Attention != "source_only" {
+		t.Errorf("holds = %+v, want the single source_only hold h1", got.Holds)
+	}
+}
+
+// TestDiscardRecoveryHoldSendsConfirm: the discard hits DELETE
+// /api/runs/{run}/recovery-holds/{hold} and ALWAYS carries ?confirm=discard (the server's only
+// mutating form), and a 200 is success (PRD #1349 M5).
+func TestDiscardRecoveryHoldSendsConfirm(t *testing.T) {
+	var gotMethod, gotPath, gotConfirm string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod, gotPath = r.Method, r.URL.Path
+		gotConfirm = r.URL.Query().Get("confirm")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"discarded":true}`))
+	}))
+	defer srv.Close()
+
+	if err := newTestClient(srv).DiscardRecoveryHold(context.Background(), "r1", "h1"); err != nil {
+		t.Fatalf("DiscardRecoveryHold: %v", err)
+	}
+	if gotMethod != http.MethodDelete || gotPath != "/api/runs/r1/recovery-holds/h1" {
+		t.Errorf("request = %s %s, want DELETE /api/runs/r1/recovery-holds/h1", gotMethod, gotPath)
+	}
+	if gotConfirm != "discard" {
+		t.Errorf("confirm query = %q, want discard (the server's only mutating form)", gotConfirm)
+	}
+}
+
+// TestDiscardRecoveryHoldNotFoundMapsExit: a 404 (a foreign/absent/already-settled hold) maps
+// to ExitNotFound, so `uzi run discard` reports "not found" rather than a generic failure.
+func TestDiscardRecoveryHoldNotFoundMapsExit(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":"custody hold not found"}`))
+	}))
+	defer srv.Close()
+
+	err := newTestClient(srv).DiscardRecoveryHold(context.Background(), "r1", "h1")
+	if got := ExitCodeFor(err); got != ExitNotFound {
+		t.Fatalf("exit = %d, want %d (not found) (err: %v)", got, ExitNotFound, err)
+	}
+}

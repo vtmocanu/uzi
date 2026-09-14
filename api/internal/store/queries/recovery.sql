@@ -317,7 +317,15 @@ ORDER BY h.created_at ASC;
 -- '' when the worker row is gone). It NEVER returns original_worker_identity (raw provenance,
 -- D7). The per-hold capture summary (has_available_capture, latest capture_state) lets the
 -- surface classify a hold (active protection / capture in progress / archive available /
--- needs attention) without a second query. Ordered oldest-first for a stable list.
+-- needs attention) without a second query.
+--
+-- run_status is the hold's run's live status (M5, D6/D8), LEFT-JOINed from runs (NULL -> ''
+-- when the run row is gone). It is consumed ONLY by the Go attention derivation in
+-- ListHoldsForOwner to tell `active` (an OPEN hold whose run is still running/claimed —
+-- healthy protection, no owner decision) from `source_only` (an OPEN hold whose run is
+-- terminal and carries no capture — a source needing an owner decision). It is NOT added to
+-- the frozen RecoveryCustodyHoldDTO wire shape; it never reaches the SPA/CLI JSON. Ordered
+-- oldest-first for a stable list.
 SELECT
     h.id,
     h.run_id,
@@ -333,9 +341,11 @@ SELECT
     COALESCE((SELECT c.state FROM recovery_captures c
         WHERE c.hold_id = h.id
         ORDER BY c.created_at DESC, c.id DESC
-        LIMIT 1), '')::text AS capture_state
+        LIMIT 1), '')::text AS capture_state,
+    COALESCE(r.status, '')::text AS run_status
 FROM recovery_custody_holds h
 LEFT JOIN workers w ON w.id = h.original_worker_id AND w.user_id = h.user_id
+LEFT JOIN runs r ON r.id = h.run_id AND r.user_id = h.user_id
 WHERE h.user_id = @user_id
   AND (sqlc.narg('run_id')::uuid IS NULL OR h.run_id = sqlc.narg('run_id')::uuid)
   AND (sqlc.narg('worker_id')::uuid IS NULL OR h.original_worker_id = sqlc.narg('worker_id')::uuid)

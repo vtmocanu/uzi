@@ -302,3 +302,77 @@ func (h *Handler) DiscardRecoveryArchive(w http.ResponseWriter, r *http.Request)
 	}
 	httpx.JSON(w, http.StatusOK, map[string]bool{"discarded": true})
 }
+
+// ListRecoveryHolds returns the caller's owner-wide custody holds + aggregate (PRD #1349 M5,
+// D7). It is owner-scoped in SQL by the caller's user id (no run scope, no GetRun gate) — the
+// board alert and Workers surface read the whole list, and `uzi run recovery` narrows by run
+// client-side. Mounted under RequireUser so a session cookie OR a uzc_/uza_ CLI Bearer reach it.
+func (h *Handler) ListRecoveryHolds(w http.ResponseWriter, r *http.Request) {
+	user, ok := mw.UserFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	holds, err := h.recovery().ListHoldsForOwner(r.Context(), user.ID)
+	if err != nil {
+		slog.Error("recovery holds: list", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	httpx.JSON(w, http.StatusOK, holds)
+}
+
+// DiscardRecoveryHold discards ONE owner-owned open custody hold (PRD #1349 M5, D7/D9). It is
+// the ONE mutating disposition of a held source and the ONLY mutating form of this route:
+//  1. ?confirm=discard is validated BEFORE any SQL — a missing/different value is a fail-fast
+//     400 with NO mutation, so an accidental DELETE can never destroy a possible only copy.
+//  2. run + hold ids are parsed from the path.
+//  3. ownership is strict owner-or-404 via h.wsvc.GetRun (admin refused, GetRun not
+//     GetRunForViewer), exactly like DiscardRecoveryArchive.
+//  4. the service runs the locked discard transaction (SQL re-verifies owner + open state).
+//
+// An available archive is NEVER deleted here (that is the separate DiscardRecoveryArchive
+// choice); a foreign/absent/non-open hold returns {discarded:false} as a 404.
+func (h *Handler) DiscardRecoveryHold(w http.ResponseWriter, r *http.Request) {
+	user, ok := mw.UserFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	// D7/D9: the explicit confirmation gate, BEFORE any SQL — this is the only mutating form,
+	// so a missing or different value fails fast with no mutation.
+	if r.URL.Query().Get("confirm") != "discard" {
+		httpx.Error(w, http.StatusBadRequest, "hold discard requires ?confirm=discard")
+		return
+	}
+	runID, ok := httpx.PathUUID(w, r, "id", "run")
+	if !ok {
+		return
+	}
+	holdID, ok := httpx.PathUUID(w, r, "holdID", "hold")
+	if !ok {
+		return
+	}
+	// Strict owner-or-404, ignoring IsAdmin (mirrors DiscardRecoveryArchive): an admin acting
+	// on a foreign run is refused. GetRun (not GetRunForViewer) is the authorization seam.
+	if _, err := h.wsvc.GetRun(r.Context(), user.ID, runID); err != nil {
+		if errors.Is(err, workersvc.ErrRunNotFound) {
+			httpx.Error(w, http.StatusNotFound, "run not found")
+			return
+		}
+		slog.Error("recovery hold discard: get run", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	discarded, err := h.recovery().DiscardHold(r.Context(), user.ID, runID, holdID)
+	if err != nil {
+		slog.Error("recovery hold discard", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if !discarded {
+		httpx.Error(w, http.StatusNotFound, "custody hold not found")
+		return
+	}
+	httpx.JSON(w, http.StatusOK, map[string]bool{"discarded": true})
+}

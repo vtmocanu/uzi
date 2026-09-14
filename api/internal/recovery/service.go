@@ -627,3 +627,89 @@ func (s *Service) Discard(ctx context.Context, userID, runID, captureID uuid.UUI
 	}
 	return n > 0, nil
 }
+
+// ListHoldsForOwner returns the owner's exact custody holds plus the owner-level aggregate
+// (PRD #1349 M5, D6/D7/D10). It lists ALL the owner's holds (every state), stamps each with a
+// server-derived Attention, and folds the aggregate: OpenHolds and BlockedRuns come from the
+// aggregate query (the SAME predicate ClaimRun/health gate on), CustodyHoldLimit from the
+// configured ceiling, and DecisionNeeded is the count of holds whose derived attention awaits an
+// owner decision (needs_action or source_only) — active protection and self-releasing
+// archive_ready rows are excluded (D10). Owner authorization is by user_id in every query; the
+// handler additionally gates the owner via RequireUser. Holds is always non-nil so it marshals
+// as [] (never null). No run scope — this is the owner-wide list; the CLI narrows by run.
+func (s *Service) ListHoldsForOwner(ctx context.Context, userID uuid.UUID) (apitypes.RecoveryCustodyHoldsDTO, error) {
+	rows, err := s.store.ListCustodyHoldsForOwner(ctx, store.ListCustodyHoldsForOwnerParams{UserID: userID})
+	if err != nil {
+		return apitypes.RecoveryCustodyHoldsDTO{}, err
+	}
+	holds := make([]apitypes.RecoveryCustodyHoldDTO, 0, len(rows))
+	decisionNeeded := 0
+	for _, r := range rows {
+		dto := custodyHoldToDTO(r)
+		if isDecisionAttention(dto.Attention) {
+			decisionNeeded++
+		}
+		holds = append(holds, dto)
+	}
+	agg, err := s.store.GetCustodyAggregateForOwner(ctx, store.GetCustodyAggregateForOwnerParams{
+		UserID:           userID,
+		CustodyHoldLimit: s.limits.CustodyHoldLimit,
+	})
+	if err != nil {
+		return apitypes.RecoveryCustodyHoldsDTO{}, err
+	}
+	return apitypes.RecoveryCustodyHoldsDTO{
+		Aggregate: apitypes.RecoveryCustodyAggregateDTO{
+			OpenHolds:        int(agg.OpenHolds),
+			CustodyHoldLimit: int(s.limits.CustodyHoldLimit),
+			DecisionNeeded:   decisionNeeded,
+			BlockedRuns:      int(agg.BlockedRuns),
+		},
+		Holds: holds,
+	}, nil
+}
+
+// DiscardHold discards ONE owner-owned OPEN custody hold and settles its non-ready captures in
+// ONE locked transaction (PRD #1349 M5, D7). It:
+//   - marks the exact hold 'discarded' and nulls its live worker/run FKs — the mutating SQL
+//     RE-VERIFIES user_id + run + hold + state='open' (belt-and-braces beside the handler's
+//     owner-or-404 gate), so a foreign owner, wrong run/hold id, or an already-released/
+//     discarded hold matches zero rows and the whole call is a no-op returning false;
+//   - marks that hold's preparing/uploading/needs_action captures 'discarded' and frees their
+//     partial byte chunks, NEVER touching an 'available' archive (that survives for export; its
+//     deletion is the separate DiscardRecoveryArchive owner choice);
+//   - locks the hold FIRST, then its captures, matching the worker upload/release/retry order.
+//     Either discard wins (state='open' guard makes it terminal, so a retry cannot revive it)
+//     or a concurrent upload wins and leaves an 'available' archive that survives while the hold
+//     still settles safely.
+//
+// Sibling holds and other generations are left untouched. Returns whether a hold was discarded.
+func (s *Service) DiscardHold(ctx context.Context, userID, runID, holdID uuid.UUID) (bool, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	qtx := store.New(tx)
+	n, err := qtx.DiscardCustodyHoldForOwner(ctx, store.DiscardCustodyHoldForOwnerParams{
+		HoldID: holdID,
+		RunID:  runID,
+		UserID: userID,
+	})
+	if err != nil {
+		return false, err
+	}
+	if n == 0 {
+		// Foreign/absent/non-open: nothing to discard. Leave captures untouched (an available
+		// archive on a released/discarded/foreign hold must survive) and roll back.
+		return false, nil
+	}
+	if _, err := qtx.DiscardNonReadyCapturesForHold(ctx, holdID); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
+	}
+	return true, nil
+}

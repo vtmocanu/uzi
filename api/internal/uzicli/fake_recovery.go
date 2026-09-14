@@ -44,3 +44,35 @@ func (f *FakeClient) DownloadRecoveryArchive(_ context.Context, runID, captureID
 	n, err := w.Write(f.RecoveryBytes[captureID])
 	return int64(n), err
 }
+
+// DiscardHoldCall is one recorded DiscardRecoveryHold attempt (PRD #1349 M5), so a CLI test
+// can assert the exact (run, hold) discarded — or that NONE was attempted after a cancelled
+// prompt or a non-TTY refusal.
+type DiscardHoldCall struct {
+	RunID  string
+	HoldID string
+}
+
+// RecoveryHolds returns the canned owner-wide custody holds + aggregate. RecoveryHoldsErr wins
+// over the blanket Err so a test can model a holds read that fails independently.
+func (f *FakeClient) RecoveryHolds(_ context.Context) (apitypes.RecoveryCustodyHoldsDTO, error) {
+	if f.RecoveryHoldsErr != nil {
+		return apitypes.RecoveryCustodyHoldsDTO{}, f.RecoveryHoldsErr
+	}
+	if f.Err != nil {
+		return apitypes.RecoveryCustodyHoldsDTO{}, f.Err
+	}
+	return f.RecoveryHoldsResult, nil
+}
+
+// DiscardRecoveryHold records the (run, hold) discard IN ORDER — FIRST, so a test can assert a
+// discard was (or was NOT) attempted — then returns DiscardHoldErr (or the blanket Err). The
+// recording is the seam that proves a cancelled/declined prompt or a non-TTY refusal performed
+// NO mutation: the call list stays empty.
+func (f *FakeClient) DiscardRecoveryHold(_ context.Context, runID, holdID string) error {
+	f.DiscardHoldCalls = append(f.DiscardHoldCalls, DiscardHoldCall{RunID: runID, HoldID: holdID})
+	if f.DiscardHoldErr != nil {
+		return f.DiscardHoldErr
+	}
+	return f.Err
+}

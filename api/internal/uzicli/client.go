@@ -584,6 +584,19 @@ type Client interface {
 	// partial file. The Bearer credential rides through the same credentialSafeBase guard
 	// every other request uses, so a plaintext base URL is refused before the token leaves.
 	DownloadRecoveryArchive(ctx context.Context, runID, captureID string, w io.Writer) (int64, error)
+	// RecoveryHolds returns the caller's owner-wide custody holds + aggregate (PRD #1349 M5,
+	// D7): GET /api/recovery/holds. RequireUser and owner-scoped in SQL, so a uzc_/uza_ CLI
+	// token reaches its OWN holds and nobody else's. `uzi run recovery <run-id>` narrows the
+	// returned list to one run client-side. Holds is always a JSON array (never null).
+	RecoveryHolds(ctx context.Context) (apitypes.RecoveryCustodyHoldsDTO, error)
+	// DiscardRecoveryHold discards ONE exact owner-owned open custody hold (PRD #1349 M5,
+	// D7/D9): DELETE /api/runs/{runID}/recovery-holds/{holdID}?confirm=discard. The
+	// ?confirm=discard field is REQUIRED (the server's only mutating form) and this method
+	// always sends it — the CLI's own interactive prompt / --yes gate is the human
+	// confirmation, and this is the wire confirmation the server demands. A 404 (foreign,
+	// absent, or already-settled hold) maps to ExitNotFound; a 200 means the hold was
+	// discarded. Mounted under the same RequireUser /runs group as the archive DELETE.
+	DiscardRecoveryHold(ctx context.Context, runID, holdID string) error
 }
 
 // ProjectSyncStatus mirrors the handler's getGithubProjectSyncStatusResponse JSON
