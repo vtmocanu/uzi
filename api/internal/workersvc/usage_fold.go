@@ -519,10 +519,12 @@ func foldUsageFrames(ctx context.Context, q usageFoldQuerier, run store.Run, fra
 				continue
 			}
 			model = truncateRunes(model, maxUsageModelRunes)
-			// The row's harness and cost status are DERIVED from the persisted run harness
-			// (PRD #1332 M5A / D2), never from a worker-supplied field: Claude stays metered
-			// under THIS model's provider costUSD, Codex is unreported with a zero placeholder.
-			costStatus, costUSD := deriveUsageCost(run.Harness, mu.CostUSD)
+			// The row's harness is DERIVED from the persisted run harness (PRD #1332 M5A / D2),
+			// never from a worker-supplied field. The cost status is then resolved conservatively
+			// (D5): Claude stays metered under THIS model's provider costUSD (marker ignored), while
+			// Codex HONORS the agent's closed per-model costStatus marker — subscription/metered when
+			// the agent asserts it, unreported for any missing/unknown/inconsistent marker.
+			costStatus, costUSD := deriveUsageCost(run.Harness, mu.CostStatus, mu.CostUSD)
 			if err := q.UpsertRunUsage(ctx, store.UpsertRunUsageParams{
 				RunID:               run.ID,
 				SessionID:           sessionID,
@@ -566,23 +568,44 @@ const (
 	harnessClaude = "claude"
 	harnessCodex  = "codex"
 
-	costStatusMetered    = "metered"
-	costStatusUnreported = "unreported"
+	costStatusSubscription = "subscription"
+	costStatusMetered      = "metered"
+	costStatusUnreported   = "unreported"
 )
 
-// deriveUsageCost maps a run's persisted harness to the (cost_status, cost_usd) a folded
-// run_usage row carries in C1 (PRD #1332 M5A / D2, D5). It DERIVES from runs.harness (never a
-// worker-supplied field): a Claude run stays 'metered' under its existing provider-reported
-// costUSD, so Claude accounting is unchanged; a Codex run is 'unreported' with a zero dollar
-// placeholder (C4b adds subscription/metered Codex semantics later). Forcing cost_usd to 0 for
-// a non-metered row is what keeps the insert within 00224's run_usage_nonmetered_zero_check
-// (cost_status='metered' OR cost_usd=0). An unexpected harness (impossible under the runs CHECK)
-// falls to the Claude/metered branch, preserving existing accounting rather than zeroing it.
-func deriveUsageCost(harness string, providerCostUSD float64) (costStatus string, costUSD pgtype.Numeric) {
-	if harness == harnessCodex {
+// deriveUsageCost maps a run's persisted harness and the agent's per-model cost marker to the
+// (cost_status, cost_usd) a folded run_usage row carries (PRD #1332 M5A / D2, D5). The HARNESS is
+// always DERIVED from runs.harness (never a worker-supplied field) — the security-critical binding
+// stays server-authoritative; only the cost STATUS consults the agent's closed marker, and only for
+// Codex. It is a pure function so the full marker matrix is unit-testable without a database.
+//
+//   - Claude (harness != codex): 'metered' under the existing provider-reported costUSD, marker
+//     IGNORED. This is D5's backward-compat rule — "a Claude row with the existing numeric costUSD
+//     and no marker resolves to metered" — so Claude accounting is unchanged. An unexpected harness
+//     (impossible under the runs CHECK) also lands here, preserving accounting rather than zeroing.
+//   - Codex (harness == codex): HONOR the closed marker the agent emits per model (D5).
+//     'subscription' → cost_status='subscription', cost_usd=0 (that credential mode has no
+//     per-token charge, so zero is neutral, not a metered $0). 'metered' → cost_status='metered',
+//     cost_usd = the agent's price-table amount (emittedCostUSD). ANYTHING ELSE — missing, empty,
+//     unknown or inconsistent — → cost_status='unreported', cost_usd=0 ("a Codex row with a
+//     missing, unknown or inconsistent marker resolves to unreported").
+//
+// The marker is worker-controlled, but it never reaches the store verbatim: this closed switch
+// emits only the three fixed literals. Forcing cost_usd to 0 for EVERY non-metered row is what
+// keeps the insert within 00224's run_usage_nonmetered_zero_check (cost_status='metered' OR
+// cost_usd=0) — only 'metered' ever carries a non-zero cost, whatever the harness.
+func deriveUsageCost(harness, marker string, emittedCostUSD float64) (costStatus string, costUSD pgtype.Numeric) {
+	if harness != harnessCodex {
+		return costStatusMetered, numericUSD(emittedCostUSD)
+	}
+	switch marker {
+	case costStatusSubscription:
+		return costStatusSubscription, numericUSD(0)
+	case costStatusMetered:
+		return costStatusMetered, numericUSD(emittedCostUSD)
+	default:
 		return costStatusUnreported, numericUSD(0)
 	}
-	return costStatusMetered, numericUSD(providerCostUSD)
 }
 
 // nonNegTokens clamps a token count to >= 0 at fold time. GREATEST only protects an

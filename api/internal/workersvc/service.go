@@ -2045,6 +2045,13 @@ type resultModelUsage struct {
 	CacheReadInputTokens     int64   `json:"cacheReadInputTokens"`
 	CacheCreationInputTokens int64   `json:"cacheCreationInputTokens"`
 	CostUSD                  float64 `json:"costUSD"`
+	// CostStatus is the agent's CLOSED per-model cost marker (PRD #1332 D5):
+	// "subscription" | "metered" | "unreported", camelCase to match the SDK's
+	// forwarded ModelUsage shape. It is HONORED only for Codex runs and only
+	// through deriveUsageCost's closed switch — a Claude row ignores it, and no
+	// worker-supplied string ever reaches run_usage verbatim. Absent/empty on a
+	// pre-C4b frame or a Claude frame; lenient decode leaves it "".
+	CostStatus string `json:"costStatus"`
 }
 
 // run_usage's PK is (run_id, session_id, model). run_id is a uuid (16 bytes in
