@@ -1215,6 +1215,44 @@ describe("CodexExecutor: child-thread delegation demux (part C)", () => {
   });
 });
 
+describe("CodexExecutor: an api_key run meters the root model end-to-end (executor→harness authMode wiring)", () => {
+  it("(C4b) an api_key binding drives a metered root modelUsage entry with the exact Standard costUSD", async () => {
+    // The seam under test is codex-executor.ts's `authMode: binding.authMode` into new CodexHarness:
+    // the RUN's credential mode selects the terminal cost semantics in the token accountant.
+    // Harness-level cost tests pass authMode DIRECTLY (bypassing this wiring), and the only existing
+    // executor costStatus test drives a SUBSCRIPTION binding — so nothing exercises the api_key
+    // metered path THROUGH the real executor. Hardcoding authMode:"subscription" at that call site
+    // passes every other executor test; this pins it end-to-end: an api_key run's per-model entry
+    // must be `metered` with a real costUSD, never `subscription`.
+    const rig = makeRig();
+    // A single ROOT token-usage note on the configured root model (provider.model = "gpt-6-astra")
+    // with priceable buckets: input 1000 (cached 600, cacheWrite 100 → uncached 300), output 200
+    // (incl. 50 reasoning). last === total (a single-response leg), so it reconciles cleanly.
+    const b = { inputTokens: 1000, cachedInputTokens: 600, cacheWriteInputTokens: 100, outputTokens: 200, reasoningOutputTokens: 50, totalTokens: 1200 };
+    rig.transport
+      .push(threadStarted())
+      .push(tokenUsageUpdated("th-1", "tn-1", b))
+      .push(signalDone())
+      .push(turnCompleted("completed"))
+      .end();
+    const { ctx, emitted } = makeCtx();
+    await withTimeout(makeExecutor(rig, bindingOf(API_KEY)).run(ctx), 3000, "api_key metered run");
+
+    const modelUsage = lastResultModelUsage(emitted);
+    assert.ok(modelUsage, "the terminal carries per-model usage");
+    assert.deepEqual(Object.keys(modelUsage), ["gpt-6-astra"], "the root usage is charged to the configured root model");
+    const astra = rec(modelUsage["gpt-6-astra"]);
+    assert.equal(astra.inputTokens, 300, "uncached input derived from the cumulative delta (1000 - 600 - 100)");
+    assert.equal(astra.outputTokens, 200, "output rode through the accountant");
+    // C4b: the api_key binding threads through `authMode: binding.authMode` so the entry is METERED
+    // with the summed Standard price, NOT subscription. If line ~1413 is hardcoded to
+    // "subscription", this becomes costStatus:'subscription' with no costUSD and both asserts fail.
+    assert.equal(astra.costStatus, "metered", "an api_key run's per-model entry is metered (never subscription)");
+    // 300*10 + 600*1 + 100*12.5 + 200*50 = 14850 µ$. Reasoning (50) is a subset of output, never re-added.
+    assert.equal(Math.round((astra.costUSD as number) * 1e6), 14850, "the exact summed Standard price in microdollars");
+  });
+});
+
 /** The `modelUsage` map of the LAST result status/error message the reducer emitted, or
  *  undefined when none carried one (so a dropped/absent per-model fold is observable). */
 function lastResultModelUsage(emitted: EmittedMessage[]): Record<string, unknown> | undefined {

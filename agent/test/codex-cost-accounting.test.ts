@@ -262,6 +262,39 @@ describe("CodexUsageAccountant cost: conservative dominance across threads on th
   });
 });
 
+describe("CodexUsageAccountant cost: per-response dominance within ONE reconciled thread", () => {
+  it("a single individually-unpriceable response on an otherwise-reconciling thread taints the whole model to unreported, tokens retained", () => {
+    // Distinct from the two-thread dominance block above and from every whole-model-unpriceable
+    // case (unknown model / Sol flip): here ONE thread has TWO adopted responses whose SUMMED
+    // cumulative reconciles the priced buckets, but response 2 is INDIVIDUALLY unpriceable — its own
+    // cache detail buckets exceed its own input (40 + 30 > 50), the impossible split
+    // priceCodexResponse refuses. Per-response conservative dominance must taint the WHOLE model to
+    // `unreported`; it must NOT silently price only response 1 and emit a too-low `metered` figure.
+    const acct = new CodexUsageAccountant();
+    acct.registerThread(ROOT, ASTRA, false);
+    // Response 1: cleanly priceable (uncached-only).
+    acct.record(ROOT, usage({ inputTokens: 100, outputTokens: 60, totalTokens: 160 }, { inputTokens: 100, outputTokens: 60, totalTokens: 160 }));
+    // Response 2: the cumulative grows so the note is ADOPTED (magnitude 250 > 160) and Σ last
+    // reconciles the delta on all four priced buckets (input 150, cached 40, cacheWrite 30, output
+    // 100) — yet last2 ALONE is unpriceable (cached 40 + cacheWrite 30 > input 50).
+    acct.record(
+      ROOT,
+      usage(
+        { inputTokens: 150, cachedInputTokens: 40, cacheWriteInputTokens: 30, outputTokens: 100, totalTokens: 260 },
+        { inputTokens: 50, cachedInputTokens: 40, cacheWriteInputTokens: 30, outputTokens: 40, totalTokens: 120 },
+      ),
+    );
+    const agg = acct.aggregateByModel(API_KEY_EARLY);
+    const astra = get(agg, ASTRA);
+    assert.equal(astra.costStatus, "unreported", "one individually-unpriceable response taints the whole model");
+    assert.ok(!("costUSD" in astra), "no costUSD on an unreported entry — never a too-low metered $ from pricing only response 1");
+    // Tokens RETAINED from the cumulative delta: uncached 150-40-30 = 80, cacheRead 40, cacheCreation 30, output 100.
+    assertTokens(astra, { input: 80, output: 100, cacheRead: 40, cacheCreation: 30, reasoning: 0 });
+    // Run-level rollup: the unreported entry dominates.
+    assert.deepEqual(deriveCodexRunCost(agg, "api_key"), { kind: "unreported" });
+  });
+});
+
 describe("deriveCodexRunCost: api-key rollup edges", () => {
   it("no usage on an api-key run is unreported (never a metered $0)", () => {
     assert.deepEqual(deriveCodexRunCost(undefined, "api_key"), { kind: "unreported" });
