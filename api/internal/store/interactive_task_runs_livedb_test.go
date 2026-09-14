@@ -114,9 +114,10 @@ func TestInteractiveTaskRunConstraintsLiveDB(t *testing.T) {
 		t.Error("runs_status_check ACCEPTED a bogus status: the CHECK is vacuous")
 	}
 
-	// ── (a) runs_stop_kind_check accepts 'stopped' AND every pre-existing value. ──
+	// ── (a) runs_stop_kind_check accepts 'stopped' AND every pre-existing value, plus
+	//    'scope_capped' (PRD #634) and 'scope_reduced' (PRD #1227 M2). ──
 	// stop_kind is display-only, so it can be set independently of status.
-	for _, k := range []string{"cancelled", "plan_rejected", "auto_stopped", "stopped"} {
+	for _, k := range []string{"cancelled", "plan_rejected", "auto_stopped", "stopped", "scope_capped", "scope_reduced"} {
 		if _, err := pool.Exec(ctx, `UPDATE runs SET stop_kind = $1 WHERE id = $2`, k, id); err != nil {
 			t.Errorf("runs_stop_kind_check rejected stop_kind=%q, want accepted: %v", k, err)
 		}

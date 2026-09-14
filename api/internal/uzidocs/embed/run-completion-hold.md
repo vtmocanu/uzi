@@ -69,9 +69,12 @@ can act on your answer immediately, with no restart. If the window elapses
 with no answer, the run parks in the hold instead; it never fails outright
 for this reason.
 
-## Continuing a held run
+## Deciding on a held run
 
-The owner's one decision today is **continue with guidance**:
+The owner has three decisions, all through `uzi run decide <id>` (exactly one
+is required):
+
+**Continue** — resume past the completion check unchanged:
 
 ```
 uzi run decide <id> --continue [--guidance "<text>"]
@@ -85,6 +88,32 @@ uzi run decide <id> --continue [--guidance "<text>"]
 
 Guidance is optional: `uzi run decide <id> --continue` with no `--guidance`
 simply tells the run to carry on past the check.
+
+**Partial** — reduce scope by naming the exact milestone ids to keep, with a
+required reason:
+
+```
+uzi run decide <id> --partial m1,m2 --reason "<why>"
+```
+
+The run delivers only the kept milestones; the rest are deferred. Its closing
+pull/merge request does **not** close the issue and lists the deferred
+milestone ids, so the remaining work stays visible for a later run.
+
+**Accept** — waive the exact unmet criteria by id, with a required reason:
+
+```
+uzi run decide <id> --accept m2.c1,m2.c3 --reason "<why>"
+```
+
+The named criteria are accepted as met and the run continues to finalize. A
+closing pull/merge request then names the accepted criteria in a warning
+block, so a reviewer sees exactly what was waived and why.
+
+Partial and accept each require `--reason` and send the run's current contract
+revision, which the server fences: if someone has already recorded a decision
+(the revision moved), your command is refused with a conflict rather than
+silently overwriting theirs. `--guidance` is valid only with `--continue`.
 
 ## The honest limitation: same-worker-only context
 
@@ -114,11 +143,12 @@ something you asked for; a completion hold is something the run's own
 structural check produced after it couldn't get anywhere on a missing
 milestone. The **live** completion question (before the run has actually
 parked) is not a `paused` run at all, so the ordinary **Resume** control
-doesn't apply to it — only `uzi run decide <id> --continue` answers it.
-Once a run has parked in the hold, plain `uzi run resume` will technically
-move it back to `queued` too, but `uzi run decide <id> --continue` is the
-right tool: it's the one path that can carry guidance to the resumed run and
-that records the decision against the hold it's answering.
+doesn't apply to it — only `uzi run decide <id>` (continue, partial or accept)
+answers it. Once a run has parked in the hold, plain `uzi run resume` will
+technically move it back to `queued` too, but `uzi run decide <id>` is the
+right tool: it's the one path that can carry a decision — guidance on a
+continue, or a scope change on a partial/accept — to the resumed run and that
+records it against the hold it's answering.
 
 Related: [Pausing and resuming a run](run-pause.md) ·
 [Autopilot](autopilot.md) · [CLI](cli.md)

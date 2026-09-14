@@ -427,6 +427,16 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 		dto.HoldContext = &holdCtx
 	}
 	dto.CompletionPhase = completionPhaseRule(dto.CompletionInterlock, r.Status, holdReason, r.CompletionQuestionAt.Valid, dto.CompletionAttempts, len(dto.CompletionUnmet))
+	// PRD #1227 M1: the owner-decision contract projection. completion_revision is the run's current
+	// contract_revision (null when unfrozen). completion_deferred / completion_accepted are decoded
+	// from the frozen completion_contract by the SINGLE shared projector (workersvc.CompletionScopeView),
+	// so the wire shape and the contract shape cannot drift; both are STABLE arrays ([] over null),
+	// like completion_unmet.
+	if r.ContractRevision.Valid {
+		rev := int(r.ContractRevision.Int32)
+		dto.CompletionRevision = &rev
+	}
+	dto.CompletionDeferred, dto.CompletionAccepted = workersvc.CompletionScopeView(r.CompletionContract)
 	// PRD #362 M1, Decision 6 (tolerate-on-read): decode the summary_deltas jsonb into
 	// the typed slice; a malformed or unexpected value renders as NO deltas (nil), logged
 	// and never a panic — the deltas are advisory and a prior write's data, not an

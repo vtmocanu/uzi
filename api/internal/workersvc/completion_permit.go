@@ -159,9 +159,24 @@ func computeUnmetCriteria(run store.Run) (unmet []string, verifiable bool) {
 	for _, id := range completed {
 		done[id] = true
 	}
+	// PRD #1227 M1: an owner decision reduces the in-scope set without the milestone being done.
+	// A criterion is unmet ONLY if it is neither completed, nor owner-DEFERRED (its milestone is in
+	// scope.out), nor owner-ACCEPTED (its exact criterion id is in accepted). On a revision-1
+	// contract (scope nil, accepted nil) both sets are empty, so this loop is byte-identical to the
+	// #1226 behavior — the milestone-done check alone.
+	deferred := make(map[string]bool)
+	if c.Scope != nil {
+		for _, d := range c.Scope.Out {
+			deferred[d.MilestoneID] = true
+		}
+	}
+	acceptedIDs := make(map[string]bool, len(c.Accepted))
+	for _, a := range c.Accepted {
+		acceptedIDs[a.ID] = true
+	}
 	unmet = make([]string, 0, len(c.Criteria))
 	for _, cr := range c.Criteria {
-		if !done[cr.MilestoneID] {
+		if !done[cr.MilestoneID] && !deferred[cr.MilestoneID] && !acceptedIDs[cr.ID] {
 			unmet = append(unmet, cr.MilestoneID)
 		}
 	}

@@ -125,8 +125,19 @@ func TestCreateRunInputStopKindLiveDB(t *testing.T) {
 		t.Fatalf("server-side cancel: want cancelled/cancelled, got %s/%v", run.Status, run.StopKind)
 	}
 
+	// ── PRD #1227 M2 (00224/00225): the widened CHECK accepts 'scope_reduced' — the
+	//    terminal disposition for an owner-`partial` scope-reduced completion — proving the
+	//    two-step migration (add NOT VALID, then VALIDATE) actually applied. ──
+	rScopeReduced := seedRun(6)
+	if _, err := pool.Exec(ctx, `UPDATE runs SET stop_kind = 'scope_reduced' WHERE id = $1`, rScopeReduced); err != nil {
+		t.Fatalf("runs_stop_kind_check must accept 'scope_reduced' after 00224/00225, got: %v", err)
+	}
+	if sk := stopKindOf(rScopeReduced); sk == nil || *sk != "scope_reduced" {
+		t.Fatalf("scope_reduced UPDATE must persist stop_kind='scope_reduced', got %v", sk)
+	}
+
 	// ── the CHECK constraint rejects an out-of-domain stop_kind value. ──
-	rBad := seedRun(6)
+	rBad := seedRun(7)
 	if _, err := pool.Exec(ctx, `UPDATE runs SET stop_kind = 'bogus' WHERE id = $1`, rBad); err == nil {
 		t.Error("an out-of-domain stop_kind must violate the CHECK constraint")
 	}

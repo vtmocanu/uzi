@@ -574,6 +574,43 @@ type ClaimConfig struct {
 	// WORKER-ONLY claim config, deliberately NOT on the web RunDTO, so it touches no api-contract
 	// fixture (same as CompletionContractVersion above).
 	ContractRevision *int `json:"contract_revision,omitempty"`
+	// CompletionScope is the WORKER-ONLY projection of the run's frozen contract's owner decisions
+	// (PRD #1227 M2), the seam the worker consumes to render the partial-delivery PR (deferred
+	// milestone ids+titles+reasons) and the accept warning block (accepted id+text+reason). It is
+	// nil — and omitempty drops the key — whenever the contract has NEITHER a deferred set NOR an
+	// accepted set (a legacy, non-interlocked, or revision-1 run), so a non-reduced run's claim is
+	// byte-identical to today's. Unlike CompletionContractVersion/ContractRevision (scalars read
+	// straight off a column) this is derived from the completion_contract jsonb by
+	// CompletionScopeClaim; it carries milestone TITLES (looked up from the contract's criteria),
+	// which the owner-facing CompletionScopeView DTO does not.
+	CompletionScope *CompletionScopeConfig `json:"completion_scope,omitempty"`
+}
+
+// CompletionScopeConfig is the worker-only projection of a revised completion contract's owner
+// decisions (PRD #1227 M2). Both slices are omitempty: a `partial`-only revision carries just
+// Deferred, an `accept`-only revision just Accepted, and a contract with neither yields a nil
+// *CompletionScopeConfig (see CompletionScopeClaim), so a normal run's claim is byte-identical.
+type CompletionScopeConfig struct {
+	Deferred []CompletionScopeDeferred `json:"deferred,omitempty"`
+	Accepted []CompletionScopeAccepted `json:"accepted,omitempty"`
+}
+
+// CompletionScopeDeferred is one owner-deferred (out-of-scope) milestone for the partial PR body:
+// its id, the milestone TITLE (looked up from the matching contract criterion's text), and the
+// owner's reason.
+type CompletionScopeDeferred struct {
+	MilestoneID string `json:"milestone_id"`
+	Title       string `json:"title"`
+	Reason      string `json:"reason"`
+}
+
+// CompletionScopeAccepted is one owner-accepted unmet criterion for the accept warning block: the
+// exact criterion id, its milestone id, the criterion text, and the owner's reason.
+type CompletionScopeAccepted struct {
+	ID          string `json:"id"`
+	MilestoneID string `json:"milestone_id"`
+	Text        string `json:"text"`
+	Reason      string `json:"reason"`
 }
 
 // agentsFromTemplates maps stored templates to claim-payload agents, decoding

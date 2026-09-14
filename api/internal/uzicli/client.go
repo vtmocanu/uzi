@@ -123,6 +123,24 @@ type Client interface {
 	// → ExitConflict (5); guidance too long is 400 → ExitUsage (2) — via the shared status→exit
 	// mapping.
 	ContinueCompletionDecision(ctx context.Context, id string, guidance string) (apitypes.RunDTO, error)
+	// PartialCompletionDecision records the owner's PARTIAL (scope-reduced) decision on a
+	// completion-blocked run (PRD #1227 M5): POST /api/runs/{id}/completion/decision
+	// {decision:"partial", keep, reason, contract_revision}, RequireUser so a `uzc_` token reaches
+	// it. keep is the milestone-id set to KEEP in scope (the rest are deferred, and the run's PR
+	// then does NOT close the issue); reason is the required owner note; contractRevision is the
+	// run's CURRENT contract revision, which the server fences. Returns the resumed run. A
+	// foreign/unknown run is 404 → ExitNotFound (4); a run NOT completion-blocked or a stale
+	// revision is 409 → ExitConflict (5); a missing reason, a non-positive revision or an unknown
+	// milestone id is 400 → ExitUsage (2) — via the shared status→exit mapping.
+	PartialCompletionDecision(ctx context.Context, id string, keep []string, reason string, contractRevision int) (apitypes.RunDTO, error)
+	// AcceptCompletionDecision records the owner's ACCEPT (criteria-waived) decision on a
+	// completion-blocked run (PRD #1227 M5): POST /api/runs/{id}/completion/decision
+	// {decision:"accept", criteria, reason, contract_revision}, RequireUser so a `uzc_` token
+	// reaches it. criteria is the criterion-id set to ACCEPT as met (a closing PR then names them
+	// in a warning block); reason is the required owner note; contractRevision is the run's CURRENT
+	// contract revision the server fences on. Returns the resumed run. It shares
+	// PartialCompletionDecision's status→exit mapping (404/409/400 → 4/5/2).
+	AcceptCompletionDecision(ctx context.Context, id string, criteria []string, reason string, contractRevision int) (apitypes.RunDTO, error)
 	// SelfRateLimits returns the caller's OWN per-token rate-limit meters, each
 	// carrying the server-computed auto-selection status: GET /api/me/rate-limits.
 	//

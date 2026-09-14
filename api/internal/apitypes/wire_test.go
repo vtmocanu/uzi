@@ -127,6 +127,11 @@ var runDTOKeys = []string{
 	// so they cannot disagree. completion_unmet is a never-null array ([] over null); all six always
 	// on the wire.
 	"completion_interlock", "completion_attempts", "completion_unmet", "hold_reason", "hold_context", "completion_phase",
+	// PRD #1227 M1: the owner-decision contract projection. completion_revision is the run's current
+	// contract_revision (null when unfrozen); completion_deferred / completion_accepted are the
+	// owner-deferred milestones and owner-accepted criteria decoded from the frozen contract, STABLE
+	// arrays ([] over null) like completion_unmet. All three always on the wire.
+	"completion_revision", "completion_deferred", "completion_accepted",
 	"worker_id", "branch",
 	// PRD #400 (uzi handoff): the task/handoff columns, meaningful only on a
 	// kind='task' run. base_branch is null on every non-task run; open_mr is false by

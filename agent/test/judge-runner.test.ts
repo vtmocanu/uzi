@@ -779,6 +779,56 @@ describe("buildJudgePrompt", () => {
       !prompt.includes("Do NOT score the deferred milestones"),
       "no scope guidance for a non-scope stop",
     );
+    // PRD #1227 M3: the OWNER-deferral guidance is likewise gated (on scope_reduced), so a plain
+    // stop draws neither the operator NOR the owner deferral clause.
+    assert.ok(
+      !prompt.includes("DEFERRED BY THE OWNER"),
+      "the owner-deferral guidance is gated on scope_reduced, not any stop",
+    );
+  });
+
+  // PRD #1227 M3: a run whose scope was reduced by an owner completion decision
+  // (runs.stop_kind='scope_reduced') renders the trusted stop-kind header AND owner-deferral
+  // guidance telling the judge the deferred milestones were owner-directed, exactly parallel to the
+  // scope_capped operator case above (distinct wording, its own gate). Read the literals out of
+  // buildJudgePrompt's header: "Stop kind: scope_reduced", the "DEFERRED BY THE OWNER" clause, and
+  // "Do NOT score the owner-deferred milestones ...".
+  const scopeReducedTrace: JudgeTraceResponse = {
+    ...emptyTrace,
+    target: { ...emptyTrace.target, stop_kind: "scope_reduced" },
+  };
+
+  it("renders the scope_reduced stop kind and the owner-deferred guidance in the trusted header (PRD #1227 M3)", () => {
+    const prompt = buildJudgePrompt(scopeReducedTrace, null);
+    assert.match(prompt, /Stop kind: scope_reduced/);
+    assert.ok(
+      prompt.includes("DEFERRED BY THE OWNER"),
+      "the guidance must tell the judge the deferred milestones were owner-directed",
+    );
+    assert.ok(
+      prompt.includes("Do NOT score the owner-deferred milestones as an incomplete or defective implementation"),
+      "the guidance must forbid penalizing the owner-deferred milestones",
+    );
+    // The scope_reduced case must NOT borrow the operator-case wording (they are distinct lines).
+    assert.ok(
+      !prompt.includes("DEFERRED BY THE OPERATOR"),
+      "scope_reduced draws the OWNER clause, not the operator clause",
+    );
+    // Both lines sit in the TRUSTED region — before the untrusted-trace fence opens.
+    const guidanceIdx = prompt.indexOf("DEFERRED BY THE OWNER");
+    const stopIdx = prompt.indexOf("Stop kind: scope_reduced");
+    const fenceIdx = prompt.indexOf("<untrusted_trace_");
+    assert.ok(fenceIdx > 0, "expected an untrusted-trace fence");
+    assert.ok(stopIdx >= 0 && stopIdx < fenceIdx, "the stop-kind line must render before the untrusted fence");
+    assert.ok(guidanceIdx >= 0 && guidanceIdx < fenceIdx, "the owner-deferral guidance must render before the untrusted fence");
+  });
+
+  // The scope_capped and scope_reduced guidances are independent: a scope_capped run draws ONLY the
+  // operator clause (not the owner one), proving the two gates don't leak into each other.
+  it("does NOT draw the owner-deferral guidance on a scope_capped run (gates are independent)", () => {
+    const prompt = buildJudgePrompt(scopeCappedTrace, null);
+    assert.ok(prompt.includes("DEFERRED BY THE OPERATOR"), "scope_capped draws the operator clause");
+    assert.ok(!prompt.includes("DEFERRED BY THE OWNER"), "scope_capped must NOT draw the owner clause");
   });
 });
 
