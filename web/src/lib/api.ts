@@ -73,6 +73,7 @@ import type {
   ProjectSyncOwnerKind,
   ProjectSyncStatus,
   RecoveryArchiveSummary,
+  RecoveryCustodyHolds,
   ReleaseCheckStatus,
   Repo,
   Run,
@@ -1025,6 +1026,32 @@ const realApi = {
   // attachment link, see runArchiveDownloadUrl.
   getRunArchives: (id: string) =>
     request<RecoveryArchiveSummary>("GET", `/runs/${id}/archives`),
+  // Owner custody holds (PRD #1349 M5/M6, D7/D8): the owner-wide hold listing plus the
+  // aggregate safety-slot/decision/blocked counts that drive the board alert and the
+  // Workers resolution surface. RequireUser (session cookie OR owner CLI Bearer), so it is
+  // NOT the per-run getRunArchives strict-owner-404 path — it returns the caller's own
+  // holds across every run. Best-effort at the call sites: a fetch failure hides the alert.
+  getRecoveryHolds: () =>
+    request<RecoveryCustodyHolds>("GET", "/recovery/holds"),
+  // Delete one owner-owned recovery ARCHIVE artifact (PRD #1296 / #1349 M6, D7/D9). This is
+  // artifact cleanup only — it deletes the encrypted archive bytes for one capture and does
+  // NOT disposition the parent custody hold (that is discardHold below). Owner-scoped: a
+  // non-owner (incl. admin) gets 404. Distinct verb, distinct copy: "Delete archive".
+  discardRunArchive: (runId: string, captureId: string) =>
+    request<{ discarded: boolean }>(
+      "DELETE",
+      `/runs/${runId}/archives/${captureId}`,
+    ),
+  // Discard one exact custody HOLD — the possible-only-copy source disposition (PRD #1349
+  // M5/M6, D7/D9). The ?confirm=discard query value is REQUIRED by the server (a missing or
+  // different value is a fail-fast 400 BEFORE any SQL), so it is always sent. RequireUser
+  // (cookie OR owner Bearer); strict owner-or-404. This settles nonready captures and clears
+  // live references but never deletes an available archive. Distinct verb: "Discard held work".
+  discardHold: (runId: string, holdId: string) =>
+    request<{ discarded: boolean }>(
+      "DELETE",
+      `/runs/${runId}/recovery-holds/${holdId}?confirm=discard`,
+    ),
   // A follow_up write returns the created row's id + created_at (PRD #95 S2) so the
   // web's optimistic queue entry adopts the real id and reconciles; other kinds omit
   // them (they are server-side or own their own UI). Both fields optional on the wire.

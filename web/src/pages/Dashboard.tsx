@@ -25,6 +25,7 @@ import { YourUsageCard, FactoryTotalCard, PerUserUsageTable } from "../component
 import { RunHealthBadge } from "../components/RunHealthBadge";
 import { WorkerStatLine, hasStats } from "../components/WorkerStats";
 import { WorkerCordonBadge } from "../components/WorkerCordonBadge";
+import { CustodyBoardAlert } from "../components/CustodyBoardAlert";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import { Badge, Button, Card, cx, PageHeader, SectionTitle, Skeleton, StatTile, StatusPill } from "../components/ui";
 import { CheckIcon, ChevronRightIcon } from "../components/icons";
@@ -216,6 +217,11 @@ export function Dashboard() {
       r.status === "paused",
   );
   const working = active.length - waiting.length;
+  // PRD #1349 M6 (D8/D10): recovery_wait_count, derived CLIENT-SIDE from the runs the
+  // dashboard already polls — the count of the owner's runs currently self-healing in the
+  // recovery_wait park. Surfaced in the custody alert for diagnosis (it explains why holds
+  // may be accumulating); no backend field and no lifetime cap on the count.
+  const recoveryWaitCount = data?.runs.filter((r) => r.status === "recovery_wait").length ?? 0;
   // "8 at work · 1 waiting to resume" only when there is something to disambiguate; a
   // factory with nothing parked keeps exactly the copy it had.
   const activeHint = !active.length
@@ -243,6 +249,12 @@ export function Dashboard() {
         title={`Welcome${user.display_name ? `, ${maskName(user.display_name, demo)}` : ""}`}
         description="The factory floor at a glance."
       />
+
+      {/* PRD #1349 M6 (D8): the conditional custody-pressure alert. Self-hides unless a hold
+          needs a decision, a run is blocked, or the admission limit is reached; it fetches
+          and refreshes its own aggregate, so it can render before the rest of the dashboard
+          settles. */}
+      <CustodyBoardAlert recoveryWaitCount={recoveryWaitCount} />
 
       {!data ? (
         <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">

@@ -22,6 +22,7 @@ vi.mock("../lib/api", async (importOriginal) => {
       listConnections: vi.fn(),
       getUsage: vi.fn(),
       getAdminUsage: vi.fn(),
+      getRecoveryHolds: vi.fn(),
     },
   };
 });
@@ -189,6 +190,12 @@ beforeEach(() => {
   // Default: no usage yet (the run_count===0 "nothing yet" state).
   mockApi.getUsage.mockResolvedValue(emptySelf());
   mockApi.getAdminUsage.mockResolvedValue({ factory: emptySelf(), users: [], earliest_run: null });
+  // Default: no custody holds, so the board alert self-hides and existing assertions are
+  // unaffected. Tests that exercise the alert override this.
+  mockApi.getRecoveryHolds.mockResolvedValue({
+    aggregate: { open_holds: 0, custody_hold_limit: 8, decision_needed: 0, blocked_runs: 0 },
+    holds: [],
+  });
 });
 
 const zeros = () => ({ input_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0, output_tokens: 0, cost_usd: 0 });

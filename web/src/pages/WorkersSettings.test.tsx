@@ -31,6 +31,10 @@ vi.mock("../lib/api", async (importActual) => {
       deleteWorker: vi.fn(),
       hostedConfig: vi.fn(),
       provisionHostedWorker: vi.fn(),
+      // PRD #1349 M6: the custody resolution surface at the top of the workers panel fetches
+      // this. Empty by default so it self-hides and the pre-existing worker-row tests are
+      // unaffected.
+      getRecoveryHolds: vi.fn(),
     },
   };
 });
@@ -50,6 +54,10 @@ beforeEach(() => {
   // One token by default: the picker only renders with more than one, so the
   // pre-#104 tests below see exactly the page they always saw.
   mockApi.listSecrets.mockResolvedValue({ secrets: [aSecret()] });
+  mockApi.getRecoveryHolds.mockResolvedValue({
+    aggregate: { open_holds: 0, custody_hold_limit: 8, decision_needed: 0, blocked_runs: 0 },
+    holds: [],
+  });
 });
 
 afterEach(() => {

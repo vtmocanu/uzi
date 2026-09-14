@@ -1,12 +1,20 @@
 import { describe, it, expect } from "vitest";
 import {
   captureView,
+  custodyAlertView,
+  custodyHoldView,
   formatArchiveSize,
+  groupHoldsByWorker,
   recoverySectionKind,
   shortSha,
   sortedArchives,
 } from "./recovery";
-import type { RecoveryArchive, RecoveryArchiveSummary } from "./apiTypes";
+import type {
+  RecoveryArchive,
+  RecoveryArchiveSummary,
+  RecoveryCustodyAggregate,
+  RecoveryCustodyHold,
+} from "./apiTypes";
 
 // Regression pins for PRD #1296 M5's display logic (D6/D7). recoverySectionKind is the
 // safety-critical one: it decides whether the run page tells the truth with ZERO captures,
@@ -183,5 +191,120 @@ describe("sortedArchives", () => {
     expect(sortedArchives(input).map((a) => a.id)).toEqual(["new", "mid", "old"]);
     // A stable copy: the source order is unchanged.
     expect(input.archives.map((a) => a.id)).toEqual(before);
+  });
+});
+
+// ── PRD #1349 M6: owner custody surface logic ─────────────────────────────────
+
+function agg(over: Partial<RecoveryCustodyAggregate> = {}): RecoveryCustodyAggregate {
+  return { open_holds: 0, custody_hold_limit: 8, decision_needed: 0, blocked_runs: 0, ...over };
+}
+
+function hold(over: Partial<RecoveryCustodyHold> = {}): RecoveryCustodyHold {
+  return {
+    id: "h1",
+    run_id: "r1",
+    generation: 1,
+    state: "open",
+    attention: "active",
+    worker_id: "w1",
+    has_available_capture: false,
+    created_at: "2026-09-14T00:00:00Z",
+    updated_at: "2026-09-14T00:00:00Z",
+    ...over,
+  };
+}
+
+describe("custodyAlertView — self-hide + escalation (D6/D8)", () => {
+  it("self-hides when there are no open holds at all", () => {
+    expect(custodyAlertView(agg({ open_holds: 0, decision_needed: 0, blocked_runs: 0 }), 0)).toBeNull();
+  });
+
+  it("self-hides when holds are only healthy active protection (nothing to act on)", () => {
+    // Open holds exist, but none needs a decision, none blocks a run, and the limit is not
+    // reached — a healthy fleet is not an incident.
+    expect(custodyAlertView(agg({ open_holds: 3, decision_needed: 0, blocked_runs: 0 }), 2)).toBeNull();
+  });
+
+  it("shows a WARNING when a hold needs a decision but claims still flow", () => {
+    const v = custodyAlertView(agg({ open_holds: 4, decision_needed: 2, blocked_runs: 0 }), 0);
+    expect(v?.tone).toBe("warning");
+    expect(v?.atLimit).toBe(false);
+    expect(v?.slotsLabel).toBe("4 / 8 custody slots used");
+    expect(v?.headline).toMatch(/needs your attention/);
+  });
+
+  it("shows a WARNING when runs are blocked below the admission limit", () => {
+    const v = custodyAlertView(agg({ open_holds: 5, decision_needed: 0, blocked_runs: 1 }), 0);
+    expect(v?.tone).toBe("warning");
+  });
+
+  it("ESCALATES to danger the moment open holds reach the admission limit", () => {
+    const v = custodyAlertView(agg({ open_holds: 8, custody_hold_limit: 8, decision_needed: 1 }), 3);
+    expect(v?.tone).toBe("danger");
+    expect(v?.atLimit).toBe(true);
+    expect(v?.headline).toMatch(/blocking new runs/);
+    // recovery_wait_count is threaded through untouched for diagnosis.
+    expect(v?.recoveryWaitCount).toBe(3);
+  });
+
+  it("recovery_wait_count alone never triggers the alert (no open holds)", () => {
+    expect(custodyAlertView(agg({ open_holds: 0 }), 9)).toBeNull();
+  });
+});
+
+describe("custodyHoldView — attention → presentation + actions (D6/D8/D9)", () => {
+  it("active protection needs no decision and offers no action", () => {
+    const v = custodyHoldView(hold({ attention: "active" }));
+    expect(v.needsDecision).toBe(false);
+    expect(v.actions).toEqual([]);
+    expect(v.autoReleasing).toBe(false);
+  });
+
+  it("archive_ready offers Export only, reads releasing-automatically, and is NOT a decision", () => {
+    const v = custodyHoldView(hold({ attention: "archive_ready", has_available_capture: true }));
+    expect(v.actions).toEqual(["export"]);
+    expect(v.actions).not.toContain("discard");
+    expect(v.autoReleasing).toBe(true);
+    expect(v.needsDecision).toBe(false);
+  });
+
+  it("capturing is transient/automatic — not a decision, no action", () => {
+    const v = custodyHoldView(hold({ attention: "capturing", capture_state: "uploading" }));
+    expect(v.needsDecision).toBe(false);
+    expect(v.actions).toEqual([]);
+  });
+
+  it("source_only is a possible-only-copy decision offering discard, never export", () => {
+    const v = custodyHoldView(hold({ attention: "source_only" }));
+    expect(v.needsDecision).toBe(true);
+    expect(v.actions).toEqual(["discard"]);
+  });
+
+  it("needs_action is an actionable decision offering discard", () => {
+    const v = custodyHoldView(hold({ attention: "needs_action" }));
+    expect(v.needsDecision).toBe(true);
+    expect(v.actions).toContain("discard");
+  });
+
+  it("an unknown attention fails toward a decision rather than looking safe", () => {
+    const v = custodyHoldView(hold({ attention: "brand_new_state" }));
+    expect(v.needsDecision).toBe(true);
+    expect(v.actions).toContain("discard");
+  });
+});
+
+describe("groupHoldsByWorker — grouping + ordering (D8)", () => {
+  it("groups holds by worker and orders workers by how much needs resolving", () => {
+    const holds = [
+      hold({ id: "h1", worker_id: "wa", worker_name: "alpha", attention: "active" }),
+      hold({ id: "h2", worker_id: "wb", worker_name: "beta", attention: "source_only", generation: 2 }),
+      hold({ id: "h3", worker_id: "wb", worker_name: "beta", attention: "needs_action", generation: 1 }),
+    ];
+    const groups = groupHoldsByWorker(holds);
+    expect(groups.map((g) => g.workerId)).toEqual(["wb", "wa"]); // wb has 2 decisions, wa 0
+    expect(groups[0].decisionCount).toBe(2);
+    // Within a worker, decision-needing holds lead, then by generation.
+    expect(groups[0].holds.map((h) => h.id)).toEqual(["h3", "h2"]);
   });
 });
