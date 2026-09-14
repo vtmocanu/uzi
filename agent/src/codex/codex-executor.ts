@@ -1408,6 +1408,9 @@ export class CodexExecutor implements Executor {
         log: this.log,
         sessionInspect: () => this.sessionStore.inspect(storeDir),
         appServerAuth,
+        // PRD #1332 C4b / D5: the run's immutable credential mode selects the terminal cost
+        // semantics (subscription vs api-key metered/unreported) in the token accountant.
+        authMode: binding.authMode,
       });
 
       const epochHarness = harness;

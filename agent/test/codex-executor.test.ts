@@ -1206,7 +1206,12 @@ describe("CodexExecutor: child-thread delegation demux (part C)", () => {
     const child = rec(modelUsage["gpt-5.6-sol"]);
     assert.equal(child.inputTokens, 200, "the child's uncached input rode through the accountant");
     assert.equal(child.outputTokens, 100, "the child's output rode through the accountant");
-    assert.equal(child.costStatus, "unreported", "C4a prices nothing");
+    // C4b: this run's binding is SUBSCRIPTION, so the child entry carries costStatus 'subscription'
+    // with no per-token dollar figure (updated from C4a's hard-coded 'unreported' — the marker the
+    // C4b milestone removes). The executor→accountant delegation wiring this test really pins
+    // (recordChildThreadModel) is unchanged; only the cost projection is.
+    assert.equal(child.costStatus, "subscription", "a subscription run's per-model entry is subscription");
+    assert.ok(!("costUSD" in child), "no costUSD on a subscription entry");
   });
 });
 

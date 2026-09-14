@@ -17,11 +17,12 @@ import {
   type CallbackRuntimeId,
 } from "../src/codex/broker.js";
 import { renderCodexRun } from "../src/codex/render.js";
-import type { HarnessEvent, RunTurnRequest } from "../src/harness.js";
+import type { HarnessEvent, HarnessTerminal, RunTurnRequest } from "../src/harness.js";
 import type { CodexNotification, CodexTransport, CodexUsageBreakdown } from "../src/codex/transport.js";
 import type { Logger } from "../src/log.js";
 import {
   createCodexAppServerAuth,
+  type CodexAppServerAuthMode,
   type CodexAppServerAuthSession,
 } from "../src/codex/appserver-auth.js";
 
@@ -309,6 +310,7 @@ function makeHarness(
     sessionInspect?: SessionInspectSeam;
     appServerAuth?: CodexAppServerAuthSession;
     credentialValue?: string;
+    authMode?: CodexAppServerAuthMode;
   } = {},
 ): HarnessBits {
   const transport = opts.transport ?? new FakeTransport();
@@ -326,6 +328,7 @@ function makeHarness(
     sessionInspect: opts.sessionInspect ?? (async () => "unknown"),
     appServerAuth: opts.appServerAuth,
     credentialValue: opts.credentialValue,
+    authMode: opts.authMode,
   });
   return { harness, transport, registry };
 }
@@ -912,6 +915,89 @@ describe("CodexHarness: token accounting → result-frame modelUsage (PRD #1332 
     assert.deepEqual(mu, {
       "gpt-6-astra": { inputTokens: 300, outputTokens: 200, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, reasoningOutputTokens: 0, costStatus: "unreported" },
     });
+  });
+});
+
+describe("CodexHarness: cost projection from the run auth mode (PRD #1332 C4b / D5)", () => {
+  function terminal(events: HarnessEvent[]): HarnessTerminal {
+    const last = events.at(-1)!;
+    assert.equal(last.kind, "turn_finished");
+    if (last.kind !== "turn_finished") throw new Error("no terminal");
+    return last.terminal;
+  }
+
+  interface WireEntry {
+    costStatus: string;
+    costUSD?: number;
+    inputTokens: number;
+    outputTokens: number;
+  }
+
+  /** The named model's `modelUsage` entry off a terminal, extracted safely (no optional-chain
+   *  indexing) so a missing `modelUsage` fails the assertion rather than throwing. */
+  function entryOf(term: HarnessTerminal, model: string): WireEntry {
+    const wire = term.usage?.wire;
+    const modelUsage = wire?.modelUsage as Record<string, WireEntry> | undefined;
+    assert.ok(modelUsage, "the terminal carries per-model usage");
+    const entry = modelUsage[model];
+    assert.ok(entry, `an entry for ${model}`);
+    return entry;
+  }
+
+  it("an api_key run prices the reconciled response as metered (costUSD) and folds the run cost", async () => {
+    const { harness, transport } = makeHarness({ authMode: "api_key" });
+    transport
+      .push(threadStarted())
+      .push(turnStarted())
+      .push(tokenUsage(
+        { inputTokens: 500, cachedInputTokens: 100, cacheWriteInputTokens: 20, outputTokens: 300, reasoningOutputTokens: 40, totalTokens: 800 },
+        { inputTokens: 500, cachedInputTokens: 100, cacheWriteInputTokens: 20, outputTokens: 300, reasoningOutputTokens: 40, totalTokens: 800 },
+      ))
+      .push(turnCompleted("completed"))
+      .end();
+    const term = terminal(await collect(harness.startTurn(makeRequest()).events));
+    const mu = entryOf(term, "gpt-6-astra");
+    assert.equal(mu.costStatus, "metered");
+    assert.ok(mu.costUSD !== undefined, "a metered entry carries costUSD");
+    // uncached 380: 380*10 + 100*1 + 20*12.5 + 300*50 = 19150 µ$.
+    assert.equal(Math.round(mu.costUSD * 1e6), 19150);
+    // The run-level HarnessCost mirrors it: metered, price_table sourced, same dollars.
+    assert.deepEqual(term.metrics.cost, { kind: "metered", usd: mu.costUSD, source: "price_table" });
+  });
+
+  it("a subscription run marks the entry subscription (no costUSD) and the run cost subscription", async () => {
+    const { harness, transport } = makeHarness({ authMode: "subscription" });
+    transport
+      .push(threadStarted())
+      .push(turnStarted())
+      .push(tokenUsage({ inputTokens: 300, outputTokens: 200, totalTokens: 500 }, { inputTokens: 300, outputTokens: 200, totalTokens: 500 }))
+      .push(turnCompleted("completed"))
+      .end();
+    const term = terminal(await collect(harness.startTurn(makeRequest()).events));
+    const mu = entryOf(term, "gpt-6-astra");
+    assert.equal(mu.costStatus, "subscription");
+    assert.ok(!("costUSD" in mu));
+    assert.deepEqual(term.metrics.cost, { kind: "subscription" });
+  });
+
+  it("an api_key run with an unreconciled gap keeps tokens but reports the run cost unreported", async () => {
+    const { harness, transport } = makeHarness({ authMode: "api_key" });
+    transport
+      .push(threadStarted())
+      .push(turnStarted())
+      .push(tokenUsage({ inputTokens: 100, outputTokens: 60, totalTokens: 160 }, { inputTokens: 100, outputTokens: 60, totalTokens: 160 }))
+      // A jump the observed responses cannot account for (a dropped intermediate note).
+      .push(tokenUsage({ inputTokens: 700, outputTokens: 500, totalTokens: 1200 }, { inputTokens: 400, outputTokens: 300, totalTokens: 700 }))
+      .push(turnCompleted("completed"))
+      .end();
+    const term = terminal(await collect(harness.startTurn(makeRequest()).events));
+    const mu = entryOf(term, "gpt-6-astra");
+    assert.equal(mu.costStatus, "unreported");
+    assert.ok(!("costUSD" in mu));
+    // Tokens retained from the cumulative delta.
+    assert.equal(mu.inputTokens, 700);
+    assert.equal(mu.outputTokens, 500);
+    assert.deepEqual(term.metrics.cost, { kind: "unreported" });
   });
 });
 

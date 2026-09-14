@@ -54,7 +54,7 @@ import { renderCodexRun } from "./render.js";
 import { buildCodexDynamicTools } from "./dynamic-tools.js";
 import { CODEX_DELEGATE_TOOLS, CODEX_SIGNAL_TOOLS, canonicalizeCodexToolName } from "./broker.js";
 import { normalizeCodexStatus, normalizeCodexTerminalErrors, normalizeCodexUsage } from "./terminal-normalize.js";
-import { CodexUsageAccountant } from "./token-accounting.js";
+import { CodexUsageAccountant, deriveCodexRunCost } from "./token-accounting.js";
 
 import type { Logger } from "../log.js";
 import type {
@@ -76,7 +76,7 @@ import type {
   TurnSignals,
 } from "../harness.js";
 import type { CallbackResult, CodexCallbackBroker } from "./broker.js";
-import type { CodexAppServerAuthSession } from "./appserver-auth.js";
+import type { CodexAppServerAuthMode, CodexAppServerAuthSession } from "./appserver-auth.js";
 import type { ExecutionRegistry, RegisteredRoot } from "./registry.js";
 import type { CodexNotification, CodexTransport } from "./transport.js";
 import type { RenderedCodexRun } from "./render.js";
@@ -175,6 +175,13 @@ export interface CodexHarnessOptions {
   readonly appServerAuth?: CodexAppServerAuthSession;
   /** Transitional pre-auth integration input. Mutually exclusive with appServerAuth. */
   readonly credentialValue?: string;
+  /** PRD #1332 C4b / D5: the RUN's immutable credential auth mode, from the binding. It selects
+   *  the terminal cost semantics — a subscription run's per-model usage is `subscription` (no
+   *  per-token charge), an api_key run's is `metered` (versioned Standard price table) or
+   *  `unreported`. When ABSENT (a transitional/test construction that supplies no mode) the
+   *  terminal prices NOTHING — every entry stays `unreported` and the run cost `unreported` — the
+   *  conservative choice that retains tokens and never invents a subscription or a dollar figure. */
+  readonly authMode?: CodexAppServerAuthMode;
 }
 
 // --- small pure helpers -------------------------------------------------------
@@ -262,6 +269,9 @@ export class CodexHarness implements RunHarness {
   private readonly appServerAuth?: CodexAppServerAuthSession;
   // Transitional private input; never combined with the pinned app-server auth path.
   private readonly credentialValue?: string;
+  // PRD #1332 C4b / D5: the run's immutable auth mode, used ONLY to project the terminal cost
+  // semantics from the accountant. Undefined leaves the terminal price-free (unreported).
+  private readonly authMode?: CodexAppServerAuthMode;
 
   // Run-level provider root state (launched once, reused across turns; a reused
   // notifications() iterator is single-consumer so it is obtained exactly once).
@@ -322,6 +332,7 @@ export class CodexHarness implements RunHarness {
     }
     this.appServerAuth = opts.appServerAuth;
     this.credentialValue = opts.credentialValue;
+    this.authMode = opts.authMode;
   }
 
   inspectSession(id: string): Promise<SessionPresence> {
@@ -1044,17 +1055,25 @@ export class CodexHarness implements RunHarness {
     // text-free, and usage is a bounded numeric-only subset.
     const { subtype, outcome } = normalizeCodexStatus(rawStatus);
     const errors = normalizeCodexTerminalErrors(subtype, outcome);
-    // PRD #1332 C4a: attach the per-model token accounting as the result-frame `modelUsage`.
-    // The reducer emits `terminal.usage.wire.modelUsage`, so the reconciled deltas ride out
-    // there. When no usage was reconciled, aggregateByModel() is undefined and the terminal
-    // usage is left byte-identical to before C4a.
-    const usage = attachModelUsage(normalizeCodexUsage(turn?.usage, "turn"), this.accountant.aggregateByModel());
+    // PRD #1332 C4a/C4b: attach the per-model token accounting as the result-frame `modelUsage`,
+    // now carrying each model's closed `costStatus` (and `costUSD` when metered) projected from
+    // the run's auth mode against the D5 price table (C4b). The reducer emits
+    // `terminal.usage.wire.modelUsage`, so the reconciled deltas + cost ride out there. When no
+    // usage was reconciled, aggregateByModel() is undefined and the terminal usage is left
+    // byte-identical to before C4a. `now` is the real clock at the terminal point; the price
+    // table keeps the injectable-clock seam (D5) so the Sol boundary is deterministic in tests.
+    const pricing = this.authMode === undefined ? undefined : { authMode: this.authMode, now: new Date() };
+    const modelUsage = this.accountant.aggregateByModel(pricing);
+    const usage = attachModelUsage(normalizeCodexUsage(turn?.usage, "turn"), modelUsage);
+    // The RUN-level cost status: subscription/metered/unreported, folded with D5's unreported
+    // dominance. Undefined auth mode leaves it `unreported` (price-free), matching `modelUsage`.
+    const cost = this.authMode === undefined ? { kind: "unreported" as const } : deriveCodexRunCost(modelUsage, this.authMode);
     return {
       outcome,
       subtype,
       errors,
       usage,
-      metrics: { cost: { kind: "unreported" } },
+      metrics: { cost },
       failure: {
         // Deferred, invoked only at the owner's classification point. Codex M3 carries no
         // limit facts, so this constructs the generic terminal exception; it never invents
