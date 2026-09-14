@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # One-shot backup of in-flight uzi run work from hosted (k8s) worker PVCs.
 #
-# Handles BOTH run kinds: an issue run's working clone is /data/runner/<slug>/issue-N
-# (files named issue-N.*), a task run's (uzi handoff, no issue iid) is
-# /data/runner/<slug>/task-<runid> (files named task-<runid>.*). The per-run "stem"
-# below selects which; a task run's whole point here is that its work is often still
+# Handles every run kind: the per-run "stem" equals the run's canonical runner-clone
+# slug (agent/src/run-kind.ts deriveCloneKey): issue/chat/judge -> issue-N, task ->
+# task-<runid>, self_improve -> uzi-self-improve-<runid>, prompt -> uzi-prompt-<runid>,
+# and mr_rework/ci_fix -> slugify(pipeline_ref). A mr_rework run reuses the issue
+# branch's clone at /data/runner/<slug>/agent-issue-N (files agent-issue-N.*), NOT a
+# mr_rework-<runid> dir; runs.branch is NULL in-flight (claim_assembly.go) so the live
+# branch comes from pipeline_ref. A task or mr_rework run's work is often still
 # UNCOMMITTED, so the uncommitted.patch + untracked capture is what saves it.
 #
 # For each run id it resolves worker_id -> pod FRESH each call (so it survives a
@@ -179,17 +182,37 @@ for RID in "${RUNS[@]}"; do
   kind="$(printf '%s' "$J" | "$JQ" -r '.kind // ""' 2>/dev/null)"
   wid="$(printf '%s' "$J" | "$JQ" -r '.worker_id // ""' 2>/dev/null)"
   mr="$(printf '%s' "$J" | "$JQ" -r '.mr_web_url // ""' 2>/dev/null)"
+  branch="$(printf '%s' "$J" | "$JQ" -r '.branch // ""' 2>/dev/null)"
+  pref="$(printf '%s' "$J" | "$JQ" -r '.pipeline_ref // ""' 2>/dev/null)"
 
-  # The "stem" is BOTH the on-pod working-clone dir name and the output-file prefix.
-  # An issue run keeps its historical issue-N.* naming; a task/chat run (no issue iid)
-  # is task-<runid>.* / <kind>-<runid>.*, matching /data/runner/<slug>/task-<runid>.
-  if [ -n "$iid" ]; then
-    STEM="issue-$iid"; LBL="#$iid"
-  elif [ -n "$kind" ] && [ "$kind" != "issue" ]; then
-    STEM="$kind-$RID"; LBL="$kind ${RID%%-*}"
-  else
-    STEM="run-$RID";  LBL="run ${RID%%-*}"
-  fi
+  # The "stem" is BOTH the on-pod working-clone dir name and the output-file prefix,
+  # so it must equal the run's canonical runner-clone slug (agent/src/run-kind.ts
+  # deriveCloneKey). Derive it from the fields the CLI DTO exposes for an IN-FLIGHT
+  # run, which is the only state backups matter for:
+  #   issue/chat/judge -> issue-<iid>
+  #   task             -> task-<runid>
+  #   self_improve     -> uzi-self-improve-<runid>   (branch is uzi/self-improve/<runid>)
+  #   prompt           -> uzi-prompt-<runid>         (branch is uzi/prompt-<runid>)
+  #   mr_rework/ci_fix  -> slugify(pipeline_ref)      ("/" -> "-")
+  # runs.branch is NULL until completion (claim_assembly.go: a mr_rework/ci_fix run
+  # sources its live branch from pipeline_ref), so keying mr_rework off .branch would
+  # fall back to a mr_rework-<runid> dir that never exists and the capture would
+  # silently produce a status snapshot only. slugify: replace "/" with "-".
+  case "$kind" in
+    issue|chat|judge|"")
+      if [ -n "$iid" ]; then STEM="issue-$iid"; LBL="#$iid"
+      else STEM="run-$RID"; LBL="run ${RID%%-*}"; fi ;;
+    task)         STEM="task-$RID";            LBL="task ${RID%%-*}" ;;
+    self_improve) STEM="uzi-self-improve-$RID"; LBL="self_improve ${RID%%-*}" ;;
+    prompt)       STEM="uzi-prompt-$RID";      LBL="prompt ${RID%%-*}" ;;
+    *)  # mr_rework / ci_fix (and any future branch-scoped kind): use pipeline_ref, the
+        # live branch in-flight; fall back to branch (populated once completed), else a
+        # unique best-effort name. ci_fix's rare default-branch case (ci-fix/pipeline-<id>)
+        # needs pipeline_id, which the DTO does not expose, so it is not reconstructed.
+      src="$pref"; [ -n "$src" ] || src="$branch"
+      if [ -n "$src" ]; then STEM="$(printf '%s' "$src" | tr '/' '-')"; LBL="$kind ${RID%%-*}"
+      else STEM="${kind:-run}-$RID"; LBL="${kind:-run} ${RID%%-*}"; fi ;;
+  esac
 
   # --- status/progress snapshot (ALWAYS, even if parked or terminal: what was
   #     done, what is left, so a backup is self-describing without the code) ---
