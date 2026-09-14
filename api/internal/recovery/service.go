@@ -629,16 +629,30 @@ func (s *Service) Discard(ctx context.Context, userID, runID, captureID uuid.UUI
 }
 
 // ListHoldsForOwner returns the owner's exact custody holds plus the owner-level aggregate
-// (PRD #1349 M5, D6/D7/D10). It lists ALL the owner's holds (every state), stamps each with a
-// server-derived Attention, and folds the aggregate: OpenHolds and BlockedRuns come from the
-// aggregate query (the SAME predicate ClaimRun/health gate on), CustodyHoldLimit from the
-// configured ceiling, and DecisionNeeded is the count of holds whose derived attention awaits an
-// owner decision (needs_action or source_only) — active protection and self-releasing
-// archive_ready rows are excluded (D10). Owner authorization is by user_id in every query; the
-// handler additionally gates the owner via RequireUser. Holds is always non-nil so it marshals
-// as [] (never null). No run scope — this is the owner-wide list; the CLI narrows by run.
-func (s *Service) ListHoldsForOwner(ctx context.Context, userID uuid.UUID) (apitypes.RecoveryCustodyHoldsDTO, error) {
-	rows, err := s.store.ListCustodyHoldsForOwner(ctx, store.ListCustodyHoldsForOwnerParams{UserID: userID})
+// (PRD #1349 M5, D6/D7/D10). By default it lists ALL the owner's holds (every state) — the CLI's
+// all-states contract via `uzi run recovery`; when openOnly is set (the web hot poll, PRD #1371)
+// it lists only live custody (state='open'), dropping resolved released/discarded history. It
+// stamps each hold with a server-derived Attention, and folds the aggregate: OpenHolds and
+// BlockedRuns come from the aggregate query (the SAME predicate ClaimRun/health gate on),
+// CustodyHoldLimit from the configured ceiling, and DecisionNeeded is the count of holds whose
+// derived attention awaits an owner decision (needs_action or source_only) — active protection and
+// self-releasing archive_ready rows are excluded (D10). The aggregate stays owner-wide and
+// independent of openOnly (it is computed by a separate query, never from the returned rows), so a
+// filtered list never skews open_holds/decision_needed/blocked_runs. Owner authorization is by
+// user_id in every query; the handler additionally gates the owner via RequireUser. Holds is
+// always non-nil so it marshals as [] (never null). No run scope — this is the owner-wide list;
+// the CLI narrows by run.
+func (s *Service) ListHoldsForOwner(ctx context.Context, userID uuid.UUID, openOnly bool) (apitypes.RecoveryCustodyHoldsDTO, error) {
+	params := store.ListCustodyHoldsForOwnerParams{UserID: userID}
+	if openOnly {
+		// Bound the list to live custody (PRD #1371): drop resolved (released/discarded)
+		// history from the hot web poll. The hold-state domain is open/released/discarded,
+		// enforced by convention (one INSERT + the release/discard UPDATEs), NOT a DB CHECK;
+		// every decision-bearing hold (needs_action/source_only) is state='open', so this
+		// filter never drops a hold the owner must act on, and DecisionNeeded stays exact.
+		params.State = pgtype.Text{String: "open", Valid: true}
+	}
+	rows, err := s.store.ListCustodyHoldsForOwner(ctx, params)
 	if err != nil {
 		return apitypes.RecoveryCustodyHoldsDTO{}, err
 	}
