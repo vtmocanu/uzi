@@ -133,8 +133,8 @@ describe("WORKER_SIZE_SPECS mirrors the controller's preset table", () => {
 
 describe("the picker's option text", () => {
   it("puts the quantities where the choice is made", () => {
-    expect(sizeOptionLabel("m")).toBe("M — up to 2 CPU / 4Gi RAM / 10Gi disk");
-    expect(sizeSummary("s")).toBe("up to 1 CPU / 2Gi RAM / 5Gi disk");
+    expect(sizeOptionLabel("m")).toBe("M — up to 2 CPU / 8Gi RAM / 10Gi disk");
+    expect(sizeSummary("s")).toBe("up to 1 CPU / 4Gi RAM / 5Gi disk");
   });
 
   it("degrades to the bare label for an unknown size rather than throwing", () => {

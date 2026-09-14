@@ -43,7 +43,7 @@ uzi-db-1         postgres:17   Up 2 weeks      <- the REAL database
 Install the pinned `task`, which every command below needs:
 
 ```sh
-go install github.com/go-task/task/v3/cmd/task@v3.51.1   # pinned, sumdb-verified
+go install github.com/go-task/task/v3/cmd/task@v3.53.1   # pinned, sumdb-verified
 ```
 
 - Version-matched to CI. `brew install go-task` works but is unpinned and drifts from CI.

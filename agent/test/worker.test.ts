@@ -9,6 +9,7 @@ import type { ChatRunner } from "../src/chat-runner.js";
 import type { JudgeRunner } from "../src/judge-runner.js";
 import type { ReviewRunner } from "../src/review-runner.js";
 import type { ClaimResponse, ChatClaimResponse, WorkerStats } from "../src/protocol.js";
+import { CODEX_HARNESS_CAPABILITY } from "../src/codex/codex-runtime-probe.js";
 import { recordingLogger } from "./helpers.js";
 
 // These run-lane / chat-lane tests never claim a judge run, so a no-op JudgeRunner
@@ -705,5 +706,95 @@ describe("Worker — diff-review dispatch (PRD #400 M4b)", () => {
     await done;
 
     assert.deepStrictEqual(routed, ["runner"], "a plain task claim went to the RunRunner");
+  });
+});
+
+// PRD #1332 D3 (M5A / C2) — the worker advertises the `codex_harness_v1` PROTOCOL
+// capability IFF the startup runtime probe (resolved once, carried on config.codexProbe)
+// succeeded. A failed or absent probe leaves the two always-present protocol capabilities
+// unchanged, so a stripped/corrupt/mismatched/old image keeps serving Claude. The server
+// silently filters the string until the later vocabulary-admission unit lands — this test
+// pins the WORKER side: what it puts on the wire, and only that.
+describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3)", () => {
+  // A client whose register() captures the protocol-capabilities argument (5th param) so a
+  // test can assert exactly what the worker advertised, then idles both claim lanes.
+  function capturingClient(): { client: WorkerClient; captured: () => string[] | undefined } {
+    let captured: string[] | undefined;
+    const client = {
+      register: async (
+        _name: string,
+        _template: string,
+        _maxRuns: number,
+        _capabilities?: string[],
+        protocolCapabilities?: string[],
+      ) => {
+        captured = protocolCapabilities;
+        return {};
+      },
+      heartbeat: async () => {},
+      claimRun: async (): Promise<ClaimResponse | null> => null,
+      claimChat: async (): Promise<ChatClaimResponse | null> => null,
+    } as unknown as WorkerClient;
+    return { client, captured: () => captured };
+  }
+
+  async function advertisedCapabilities(config: Config): Promise<string[] | undefined> {
+    const controller = new AbortController();
+    const { client, captured } = capturingClient();
+    const worker = new Worker(
+      config,
+      client,
+      { ...noResumeRecoveries, execute: async () => {} } as unknown as RunRunner,
+      {} as unknown as ChatRunner,
+      noJudge,
+      noReview,
+      recordingLogger().logger,
+      okPreflight,
+    );
+    const done = worker.run(controller.signal);
+    for (let i = 0; i < 300 && captured() === undefined; i++) await tick();
+    controller.abort();
+    await done;
+    return captured();
+  }
+
+  it("appends codex_harness_v1 when the startup probe succeeded", async () => {
+    const caps = await advertisedCapabilities(fakeConfig({ codexProbe: { capable: true } }));
+    assert.deepStrictEqual(
+      caps,
+      ["completion_interlock_v1", "recovery_archive_v1", CODEX_HARNESS_CAPABILITY],
+      "a capable probe appends codex_harness_v1 after the two always-present protocol caps",
+    );
+  });
+
+  it("omits codex_harness_v1 when the probe failed, keeping the other two", async () => {
+    const caps = await advertisedCapabilities(
+      fakeConfig({ codexProbe: { capable: false, reason: "receipt not readable" } }),
+    );
+    assert.deepStrictEqual(
+      caps,
+      ["completion_interlock_v1", "recovery_archive_v1"],
+      "a failed probe leaves the always-present protocol caps unchanged (Claude service intact)",
+    );
+    assert.ok(!caps?.includes(CODEX_HARNESS_CAPABILITY), "codex_harness_v1 is absent on a failed probe");
+  });
+
+  it("omits codex_harness_v1 when the probe result is absent (defensive optional chaining)", async () => {
+    // fakeConfig() sets no codexProbe, so config.codexProbe is undefined — the `?.` guard
+    // must degrade to "not capable" rather than throw inside the registration loop.
+    const caps = await advertisedCapabilities(fakeConfig());
+    assert.deepStrictEqual(
+      caps,
+      ["completion_interlock_v1", "recovery_archive_v1"],
+      "an absent probe result advertises only the two always-present protocol caps",
+    );
+  });
+
+  it("always advertises completion_interlock_v1 and recovery_archive_v1 regardless of the probe", async () => {
+    for (const codexProbe of [{ capable: true }, { capable: false }]) {
+      const caps = await advertisedCapabilities(fakeConfig({ codexProbe }));
+      assert.ok(caps?.includes("completion_interlock_v1"), "completion_interlock_v1 always present");
+      assert.ok(caps?.includes("recovery_archive_v1"), "recovery_archive_v1 always present");
+    }
   });
 });

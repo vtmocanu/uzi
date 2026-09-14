@@ -2,6 +2,7 @@ import os from "node:os";
 import fs from "node:fs";
 import type { LogLevel } from "./log.js";
 import type { DockerWiring } from "./docker-wiring.js";
+import type { CodexRuntimeProbeResult } from "./codex/codex-runtime-probe.js";
 import { errMessage } from "./util.js";
 
 // Worker configuration, parsed from env (PRD #4 §Configuration).
@@ -112,6 +113,17 @@ export interface Config {
    * daemon, so this stays `{}` in practice.
    */
   dockerWiring: DockerWiring;
+  /**
+   * The worker's resolved Codex runtime-probe outcome (PRD #1332 D3 / M5A C2). Like
+   * {@link dockerWiring}, `loadConfig` leaves it `{ capable: false }` — resolution reads
+   * the root-owned Codex receipt and recomputes member digests (async), so it cannot
+   * happen in the sync env parse; main.ts calls `probeCodexRuntime` ONCE at startup and
+   * populates this before the worker registers. `capable === true` ⇒ the pinned Codex
+   * package is present and intact, so the worker advertises the `codex_harness_v1`
+   * PROTOCOL capability; otherwise the capability is omitted and the worker keeps serving
+   * Claude. A stripped/hand-built/corrupt/mismatched/old image resolves to not-capable.
+   */
+  codexProbe: CodexRuntimeProbeResult;
   /**
    * Readiness-wait knobs for the docker-wiring probe (PRD #83 M2 follow-up,
    * UZI_DOCKER_READY_INTERVAL / UZI_DOCKER_READY_TIMEOUT). When a sidecar is EXPECTED
@@ -292,6 +304,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     // Populated by main.ts after an async liveness probe (see the field doc); the sync
     // parse cannot probe, so the default is "no daemon wired".
     dockerWiring: {},
+    // Populated by main.ts after the async Codex runtime probe (see the field doc); the
+    // sync parse cannot read/hash the receipt, so the default is "not capable" — a worker
+    // never advertises codex_harness_v1 until the probe positively confirms the layout.
+    codexProbe: { capable: false },
     // Readiness wait for an EXPECTED docker sidecar (M2 follow-up). ~1s poll, ~30s budget.
     dockerReadyIntervalMs: duration(env, "UZI_DOCKER_READY_INTERVAL", "1s"),
     dockerReadyTimeoutMs: duration(env, "UZI_DOCKER_READY_TIMEOUT", "30s"),

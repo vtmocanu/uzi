@@ -50,8 +50,8 @@ export type WorkerSizeSpec = {
  * a stale name, though: a stale label misinforms, a stale name strands a worker.
  */
 export const WORKER_SIZE_SPECS: Record<WorkerSize, WorkerSizeSpec> = {
-  s: { cpuLimit: "1", memoryLimit: "2Gi", data: "5Gi" },
-  m: { cpuLimit: "2", memoryLimit: "4Gi", data: "10Gi" },
+  s: { cpuLimit: "1", memoryLimit: "4Gi", data: "5Gi" },
+  m: { cpuLimit: "2", memoryLimit: "8Gi", data: "10Gi" },
   l: { cpuLimit: "4", memoryLimit: "12Gi", data: "20Gi" },
 };
 

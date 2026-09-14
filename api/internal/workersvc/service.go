@@ -752,6 +752,13 @@ type Store interface {
 	// CountOnlineWorkersSatisfyingCaps above, and off the hot path for the same reason — it runs
 	// only for an interlocked queued run already past its health threshold.
 	CountOnlineWorkersSatisfyingProtocol(ctx context.Context, userID uuid.UUID) (int64, error)
+	// CountOnlineWorkersSatisfyingCodexHarness backs PRD #1332 M5A's (D3) queued-reason rung: a
+	// CODEX-INDICATING queued run whose owner has NO online worker advertising the 'codex_harness_v1'
+	// protocol capability gets reasonNoCodexCapableWorker — the run's non-bypassable Codex claim
+	// clause can never be satisfied. A per-run lookup like CountOnlineWorkersSatisfyingProtocol
+	// above, and off the hot path for the same reason — it runs only for a Codex-indicating queued
+	// run already past its health threshold.
+	CountOnlineWorkersSatisfyingCodexHarness(ctx context.Context, userID uuid.UUID) (int64, error)
 	// CountOnlineEligibleWorkersForRepo backs PRD #361's queued Docker-allowlist reason:
 	// how many of the caller's online workers fn_worker_can_claim accepts for this repo/kind,
 	// ignoring availability (free slots AND draining). Since issue #512 M2 it is capability-
@@ -2033,11 +2040,30 @@ type resultUsagePayload struct {
 }
 
 type resultModelUsage struct {
-	InputTokens              int64   `json:"inputTokens"`
-	OutputTokens             int64   `json:"outputTokens"`
-	CacheReadInputTokens     int64   `json:"cacheReadInputTokens"`
-	CacheCreationInputTokens int64   `json:"cacheCreationInputTokens"`
-	CostUSD                  float64 `json:"costUSD"`
+	InputTokens              int64 `json:"inputTokens"`
+	OutputTokens             int64 `json:"outputTokens"`
+	CacheReadInputTokens     int64 `json:"cacheReadInputTokens"`
+	CacheCreationInputTokens int64 `json:"cacheCreationInputTokens"`
+	// CostUSD is the agent's per-model provider dollar cost, decoded as RAW JSON (PRD
+	// #1332 M5A / m4) rather than float64: a non-numeric token (e.g. "lots", {}) on ONE
+	// sibling model must not reject the whole frame and lose every other model's usage.
+	// resolveCostUSD collapses it to an (amount, present) pair — absent/empty or a
+	// non-numeric/non-finite token is present=false, a finite JSON number is (value, true).
+	CostUSD json.RawMessage `json:"costUSD"`
+	// CostStatus is the agent's CLOSED per-model cost marker (PRD #1332 D5), decoded as
+	// RAW JSON (m4) — again so a non-string token on one sibling never rejects the frame.
+	// resolveCostStatusMarker collapses the raw token to the absent / invalid / valid
+	// trichotomy:
+	//   - ABSENT  — the key was omitted (nil/empty RawMessage: a pre-C4b or Claude frame), OR a
+	//     JSON `null` literal — a `null` is treated as ABSENT for BOTH costStatus and costUSD → "";
+	//   - INVALID — present but NOT a JSON string (false, {}, an array, a number): → the
+	//     costMarkerInvalid sentinel, which deriveUsageCost routes to 'unreported' for Codex;
+	//   - VALID   — a JSON string: the marker verbatim ("subscription" | "metered" | anything
+	//     else), validated by deriveUsageCost's closed switch, HONORED only for Codex.
+	// It is HONORED only for Codex runs and only through that closed switch — a Claude row
+	// ignores it, and no worker-supplied string ever reaches run_usage verbatim (the switch
+	// emits only its three fixed literals).
+	CostStatus json.RawMessage `json:"costStatus"`
 }
 
 // run_usage's PK is (run_id, session_id, model). run_id is a uuid (16 bytes in

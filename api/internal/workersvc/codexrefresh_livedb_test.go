@@ -1175,8 +1175,11 @@ func TestReleaseCodexCredentialMisboundKindNonDisclosureLiveDB(t *testing.T) {
 
 	// FORCE the mis-bind directly (FreezeCodexBinding would now refuse it): api_key mode
 	// bound to a codex_auth alias, material_revision matching the staging state so the old
-	// per-alias check would have passed straight through to the open.
-	env.exec(`UPDATE runs SET codex_secret_id=$1, codex_auth_mode='api_key', codex_secret_label='forced', codex_material_revision=0 WHERE id=$2`, aliasID, runID)
+	// per-alias check would have passed straight through to the open. harness='codex' keeps
+	// the forced row coherent under runs_codex_harness_coherence_check (PRD #1332 M5A): the
+	// row IS codex-indicating (codex_secret_id/codex_material_revision set), and harness is
+	// orthogonal to the kind↔auth-mode mismatch this test exercises.
+	env.exec(`UPDATE runs SET codex_secret_id=$1, codex_auth_mode='api_key', codex_secret_label='forced', codex_material_revision=0, harness='codex' WHERE id=$2`, aliasID, runID)
 
 	svc := &Service{q: env.q, box: env.box}
 	wkr := store.Worker{ID: workerID, UserID: userID}

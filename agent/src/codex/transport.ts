@@ -83,6 +83,45 @@ function fail(category: HarnessErrorCategory, message: string): CodexTransportEr
  * protocol-framing safety demands it. Raw `params` are retained for the adapter above
  * (never logged).
  */
+/**
+ * One usage breakdown from a `thread/tokenUsage/updated` notification (PRD #1332 C4a / D5).
+ * The pinned 0.153.2 app-server v2 protocol projects camelCase token counts (source commit
+ * `657a993cbee87acf52d14b758ce49dbd46d1b8eb`, `codex-rs/app-server-protocol/src/protocol/v2/
+ * thread.rs`). Each field is a finite `>= 0` number; a missing/invalid field decodes to `0`
+ * (a present-but-partial breakdown is still usable). `inputTokens` is the TOTAL input for the
+ * response(s) — uncached input is `max(inputTokens - cachedInputTokens - cacheWriteInputTokens,
+ * 0)` (D5). `outputTokens` already INCLUDES `reasoningOutputTokens` (a subset, never re-added). */
+export interface CodexUsageBreakdown {
+  readonly inputTokens: number;
+  readonly cachedInputTokens: number;
+  readonly cacheWriteInputTokens: number;
+  readonly outputTokens: number;
+  readonly reasoningOutputTokens: number;
+  readonly totalTokens: number;
+}
+
+/** The token-usage payload of a `thread/tokenUsage/updated` notification: `total` is the
+ *  thread's CUMULATIVE usage (the replay/dedup/recovery key), `last` is the single most-recent
+ *  upstream response's usage (the per-response pricing basis, D5). `modelContextWindow` is the
+ *  model's context size when reported (unused by C4a token accounting).
+ *
+ *  `pricingEvidenceComplete` (PRD #1332 m3, CodeRabbit 4004800884) is the FAIL-CLOSED pricing gate:
+ *  false when a PRICING-REQUIRED bucket (`inputTokens`, `cachedInputTokens`, `cacheWriteInputTokens`,
+ *  `outputTokens`) of EITHER breakdown is absent or malformed (non-numeric, negative, NaN, or
+ *  Infinite). The pinned protocol requires all four; treating a missing bucket as affirmative zero
+ *  would understate a metered cost. Token totals are retained through zero placeholders, and this
+ *  flag ONLY gates cost: the api-key branch of {@link
+ *  CodexUsageAccountant.aggregateByModel} degrades the model to `unreported` on `false`. Optional so
+ *  a pre-decoded test construction (which omits it) reads as complete; the real decoder always sets
+ *  it. The two non-priced buckets (`totalTokens`, `reasoningOutputTokens`) never enter the price and
+ *  are not consulted. */
+export interface CodexThreadTokenUsage {
+  readonly total: CodexUsageBreakdown;
+  readonly last: CodexUsageBreakdown;
+  readonly modelContextWindow?: number;
+  readonly pricingEvidenceComplete?: boolean;
+}
+
 export type CodexNotification =
   | { readonly kind: "thread_started"; readonly method: string; readonly threadId: string; readonly params: unknown }
   | {
@@ -98,6 +137,18 @@ export type CodexNotification =
       readonly threadId: string;
       readonly turnId: string;
       readonly status?: string;
+      readonly params: unknown;
+    }
+  | {
+      // PRD #1332 C4a / D5: a TYPED per-thread token-usage update, decoded off the pinned
+      // `thread/tokenUsage/updated` method rather than treated as generic activity. A frame
+      // whose threadId/turnId/total/last cannot be parsed falls to `activity` (fail-safe
+      // liveness), never a mis-shaped token_usage.
+      readonly kind: "token_usage_updated";
+      readonly method: string;
+      readonly threadId: string;
+      readonly turnId: string;
+      readonly usage: CodexThreadTokenUsage;
       readonly params: unknown;
     }
   | {
@@ -181,6 +232,74 @@ function readStringProp(obj: unknown, key: string): string | undefined {
   if (typeof obj === "object" && obj !== null) {
     const v = (obj as Record<string, unknown>)[key];
     if (typeof v === "string") return v;
+  }
+  return undefined;
+}
+
+function readObjectProp(obj: unknown, key: string): Record<string, unknown> | undefined {
+  if (typeof obj === "object" && obj !== null) {
+    const v = (obj as Record<string, unknown>)[key];
+    if (typeof v === "object" && v !== null && !Array.isArray(v)) return v as Record<string, unknown>;
+  }
+  return undefined;
+}
+
+/** A finite `>= 0` number off `obj[key]`, else 0. Missing/negative/NaN/Infinity collapse to 0
+ *  so a partial or attacker-shaped breakdown retains bounded, non-negative token placeholders.
+ *  Pricing fails closed separately in {@link breakdownPricingEvidenceComplete}; this coercion is
+ *  never evidence that a required pricing bucket was actually present. */
+function readNonNegNumber(obj: Record<string, unknown>, key: string): number {
+  const v = obj[key];
+  return typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : 0;
+}
+
+/** The four PRICING-REQUIRED buckets (`token-accounting.ts` responsesReconcileDelta / the price
+ *  table): a malformed one understates a metered cost, so it is the only corruption {@link
+ *  breakdownPricingEvidenceComplete} fails closed on. `totalTokens` and `reasoningOutputTokens`
+ *  never price and are intentionally excluded. */
+const PRICED_BUCKET_KEYS = ["inputTokens", "cachedInputTokens", "cacheWriteInputTokens", "outputTokens"] as const;
+
+/** Pricing-evidence completeness for ONE breakdown (PRD #1332 m3, CodeRabbit 4004800884).
+ *  Every priced bucket is required by the pinned protocol and must be a finite non-negative number.
+ *  Missing and malformed values both fail cost closed; parseUsageBreakdown still retains their
+ *  zero-valued token placeholders independently. */
+function breakdownPricingEvidenceComplete(raw: Record<string, unknown> | undefined): boolean {
+  if (raw === undefined) return false;
+  for (const key of PRICED_BUCKET_KEYS) {
+    const v = raw[key];
+    if (!(typeof v === "number" && Number.isFinite(v) && v >= 0)) return false;
+  }
+  return true;
+}
+
+function parseUsageBreakdown(raw: Record<string, unknown> | undefined): CodexUsageBreakdown | undefined {
+  if (raw === undefined) return undefined;
+  return {
+    inputTokens: readNonNegNumber(raw, "inputTokens"),
+    cachedInputTokens: readNonNegNumber(raw, "cachedInputTokens"),
+    cacheWriteInputTokens: readNonNegNumber(raw, "cacheWriteInputTokens"),
+    outputTokens: readNonNegNumber(raw, "outputTokens"),
+    reasoningOutputTokens: readNonNegNumber(raw, "reasoningOutputTokens"),
+    totalTokens: readNonNegNumber(raw, "totalTokens"),
+  };
+}
+
+/** Resolve the object carrying the `total`/`last` breakdowns of a `thread/tokenUsage/updated`
+ *  frame. VERIFIED against the pinned 0.153.2 v2 protocol (commit
+ *  `657a993cbee87acf52d14b758ce49dbd46d1b8eb`, `codex-rs/app-server-protocol/src/protocol/v2/
+ *  thread.rs`): the notification payload is `ThreadTokenUsageUpdatedNotification { thread_id,
+ *  turn_id, token_usage: ThreadTokenUsage { total, last, model_context_window } }` under
+ *  `#[serde(rename_all = "camelCase")]` and the adjacently-tagged `ServerNotification`
+ *  (`#[serde(tag = "method", content = "params")]`, `common.rs`), so over the wire the
+ *  breakdowns live under `params.tokenUsage` — the SAME camelCase convention `thread/started`,
+ *  `turn/started` and `turn/completed` params already use in this file. A frame whose
+ *  `tokenUsage` object is absent or lacks either breakdown ⇒ undefined (the caller falls to
+ *  `activity`, fail-safe liveness). */
+function tokenUsageContainer(params: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  if (params === undefined) return undefined;
+  const container = readObjectProp(params, "tokenUsage");
+  if (container !== undefined && readObjectProp(container, "total") !== undefined && readObjectProp(container, "last") !== undefined) {
+    return container;
   }
   return undefined;
 }
@@ -491,6 +610,32 @@ class CodexTransportImpl implements CodexTransport {
           return status === undefined
             ? { kind: "turn_completed", method, threadId, turnId, params }
             : { kind: "turn_completed", method, threadId, turnId, status, params };
+        }
+      } else if (method === "thread/tokenUsage/updated") {
+        // PRD #1332 C4a / D5: decode as a TYPED usage notification. It requires threadId,
+        // turnId AND both `total`/`last` breakdowns; any missing/mis-shaped part falls through
+        // to `activity` (fail-safe liveness) so a malformed frame never mis-accounts.
+        const p = params as Record<string, unknown> | undefined;
+        const threadId = readStringProp(params, "threadId");
+        const turnId = readStringProp(params, "turnId");
+        const container = tokenUsageContainer(p);
+        const rawTotal = readObjectProp(container, "total");
+        const rawLast = readObjectProp(container, "last");
+        const total = parseUsageBreakdown(rawTotal);
+        const last = parseUsageBreakdown(rawLast);
+        if (threadId !== undefined && turnId !== undefined && total !== undefined && last !== undefined) {
+          const rawWindow = container?.modelContextWindow;
+          // PRD #1332 m3 (CodeRabbit 4004800884): fail-closed pricing gate. Token totals were still
+          // coerced+retained above; this flags whether a PRICING-REQUIRED bucket of EITHER breakdown
+          // was present-but-malformed, so the accountant can degrade the model to `unreported`
+          // instead of emitting an understated metered cost off a silently-zeroed field.
+          const pricingEvidenceComplete =
+            breakdownPricingEvidenceComplete(rawTotal) && breakdownPricingEvidenceComplete(rawLast);
+          const usage: CodexThreadTokenUsage =
+            typeof rawWindow === "number" && Number.isFinite(rawWindow) && rawWindow >= 0
+              ? { total, last, modelContextWindow: rawWindow, pricingEvidenceComplete }
+              : { total, last, pricingEvidenceComplete };
+          return { kind: "token_usage_updated", method, threadId, turnId, usage, params };
         }
       }
     }

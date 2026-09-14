@@ -92,6 +92,7 @@ import {
   type StartChildTurnSpec,
 } from "./delegation.js";
 import { buildCodexRunPlan } from "./run-builder.js";
+import { CodexUsageAccountant } from "./token-accounting.js";
 import { CodexSessionStore } from "./session-state.js";
 import { wireFileopHelper, type FileopHelperHandle } from "./fileop-client.js";
 import {
@@ -853,10 +854,10 @@ export interface CodexExecutorOptions {
   readonly provider: CodexProviderConfig;
 }
 
-// ─── The per-epoch provider bundle + the shared per-run context (m4) ────────────
+// ─── The per-epoch provider bundle + shared executor-claim context (m4) ─────────
 /**
- * PRD #1171 m4: the SHARED per-run state every provider epoch is built from. Closed over ONCE in
- * `run()` and passed to every {@link CodexExecutor.startProviderEpoch} so a recreated epoch reuses
+ * PRD #1171 m4: state shared by every provider epoch inside ONE executor claim leg. Closed over
+ * once in `run()` and passed to every {@link CodexExecutor.startProviderEpoch} so a recreated epoch reuses
  * (never rebuilds) the released-token set, the committed-generation cell, the tool-handler map, the
  * reconcile + eviction closures, provisioning-derived command env, the effect launcher and the
  * boundary seams. Only the per-epoch registry/safety/harness/effect-roots + a fresh credential +
@@ -880,6 +881,11 @@ interface EpochSharedContext {
   readonly boundaryProcessSpawner: SpawnBoundaryProcessSeam;
   readonly reconcile: ReconcileBeforeBoundary;
   readonly evictTokens: () => void;
+  /** PRD #1332 C4a / CodeRabbit 4004800880: one accountant for this executor claim leg, shared
+   *  across provider-epoch recreation. A later worker claim constructs a new executor/accountant and
+   *  emits a new init lineage, so its resumed-thread delta is summed rather than GREATEST-folded into
+   *  this leg. */
+  readonly accountant: CodexUsageAccountant;
 }
 
 /**
@@ -1082,6 +1088,9 @@ export class CodexExecutor implements Executor {
         boundaryProcessSpawner,
         reconcile,
         evictTokens,
+        // One accountant for this executor claim leg. Internal provider epochs share its cumulative;
+        // a later worker claim gets a new accountant and a new explicit init lineage.
+        accountant: new CodexUsageAccountant(),
       };
 
       // Build the FIRST provider epoch (epoch 0): eager fresh credential release (fail-closed),
@@ -1249,7 +1258,7 @@ export class CodexExecutor implements Executor {
     const {
       provider, binding, worktreePath, storeDir, homeRoot, boundaryDeadlineMs, childTurnDeadlineMs,
       commandEnv, screenPolicy, toolHandlers, registerToken, committedGeneration, launchEffectRoot,
-      spawnBoundaryRoot, boundaryProcessSpawner, reconcile, evictTokens,
+      spawnBoundaryRoot, boundaryProcessSpawner, reconcile, evictTokens, accountant,
     } = shared;
 
     // The real launcher needs a worker-owned shared run HOME and codex-data parent: the
@@ -1408,6 +1417,14 @@ export class CodexExecutor implements Executor {
         log: this.log,
         sessionInspect: () => this.sessionStore.inspect(storeDir),
         appServerAuth,
+        // PRD #1332 C4b / D5: the run's immutable credential mode selects the terminal cost
+        // semantics (subscription vs api-key metered/unreported) in the token accountant.
+        authMode: binding.authMode,
+        // Share usage across internal provider epochs, but emit the server lineage marker only for
+        // epoch 0. Every new CodexExecutor.run invocation starts again at epoch 0, so a re-claim gets
+        // a fresh lineage even when thread/resume emits no thread/started notification.
+        accountant,
+        emitClaimInit: epochIndex === 0,
       });
 
       const epochHarness = harness;
@@ -1658,6 +1675,11 @@ export class CodexExecutor implements Executor {
       if (typeof childThreadId !== "string" || childThreadId.length === 0) {
         throw new Error("codex child thread/start returned no thread id");
       }
+      // PRD #1332 C4a: capture the CHILD thread->model mapping the moment the child thread id
+      // is known, with the SAME model selected for its thread/start (`spec.model ?? provider.
+      // model`). Without this the child's token-usage notes would be an unknown thread and its
+      // usage would be dropped rather than charged to its actual model.
+      harness.recordChildThreadModel(childThreadId, spec.model ?? provider.model);
       // Register the sink BEFORE turn/start so no child turn frame is missed by the demux.
       const sink = new ChildFrameQueue();
       harness.registerChildSink(childThreadId, sink);

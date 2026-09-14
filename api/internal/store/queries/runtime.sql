@@ -427,8 +427,12 @@ WHERE status = 'online'
 -- so stamping only at approval would make the D2 hard claim clause vacuous for the
 -- plan-phase worker. The contract CONTENT (completion_contract/contract_revision) is still
 -- absent here — it is frozen with milestones_frozen at approval / the first running report.
-INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve, wait_on_limit, mr_rework_enabled, plan_md, plan_source, agent_source, agent_exclusions, planned_base_commit, require_base_match, model, override_subagent_model, issue_comments, review_comments, required_capabilities, trigger_source, completion_contract_version)
-VALUES (@user_id, @repo_id::uuid, @issue_iid, @issue_title, @issue_description, sqlc.narg('origin_column'), now(), @auto_approve, @wait_on_limit, sqlc.narg('mr_rework_enabled'), sqlc.narg('plan_md'), @plan_source, sqlc.narg('agent_source'), sqlc.narg('agent_exclusions')::jsonb, sqlc.narg('planned_base_commit'), @require_base_match, sqlc.narg('model'), @override_subagent_model, sqlc.narg('issue_comments')::jsonb, sqlc.narg('review_comments')::jsonb, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), @trigger_source, sqlc.narg('completion_contract_version'))
+-- 🔴 harness (PRD #1332 M5A / D2) is the SQL literal 'claude', NOT a param: every current
+-- production origin is Claude, and writing the literal (rather than relying on the column
+-- DEFAULT) means a future omitted column-list update fails loudly instead of the default
+-- silently masking it. M5A is dark, so no origin resolves Codex here; M5B adds that seam.
+INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve, wait_on_limit, mr_rework_enabled, plan_md, plan_source, agent_source, agent_exclusions, planned_base_commit, require_base_match, model, override_subagent_model, issue_comments, review_comments, required_capabilities, trigger_source, completion_contract_version, harness)
+VALUES (@user_id, @repo_id::uuid, @issue_iid, @issue_title, @issue_description, sqlc.narg('origin_column'), now(), @auto_approve, @wait_on_limit, sqlc.narg('mr_rework_enabled'), sqlc.narg('plan_md'), @plan_source, sqlc.narg('agent_source'), sqlc.narg('agent_exclusions')::jsonb, sqlc.narg('planned_base_commit'), @require_base_match, sqlc.narg('model'), @override_subagent_model, sqlc.narg('issue_comments')::jsonb, sqlc.narg('review_comments')::jsonb, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), @trigger_source, sqlc.narg('completion_contract_version'), 'claude')
 RETURNING *;
 
 -- name: GetRunByIDForUser :one
@@ -729,6 +733,23 @@ WITH target AS (
       -- stored workers.protocol_capabilities column, passed by the Go caller.
       AND (r.completion_contract_version IS NULL
            OR 'completion_interlock_v1' = ANY(@worker_protocol_caps::text[]))
+      -- PRD #1332 M5A (D3): the NON-BYPASSABLE Codex-harness claim clause, MIRRORING the
+      -- completion-protocol clause directly above. A CODEX-INDICATING run may be claimed ONLY by a
+      -- worker whose SELF-REPORTED protocol_capabilities contain 'codex_harness_v1' (advertised only
+      -- after a successful runtime-receipt probe); a NON-Codex run is unaffected. "Codex-indicating"
+      -- checks ALL THREE binding facts — harness='codex' OR codex_material_revision IS NOT NULL OR
+      -- codex_secret_id IS NOT NULL — so the gate FAILS CLOSED on inconsistent or legacy data: even
+      -- if C1's coherence CHECK normally implies harness='codex', a row whose harness were somehow
+      -- unset while a binding sentinel survives (e.g. the alias FK nulls codex_secret_id but leaves
+      -- codex_material_revision) is still gated, never silently shipping its Codex credential block to
+      -- an old worker that ignores the unknown JSON and runs Claude. Like the completion clause this is
+      -- a DEDICATED, standalone predicate INTENTIONALLY OUTSIDE fn_worker_can_claim,
+      -- required_capabilities, ClearRunRequiredCapabilities and the @capability_aware kill-switch:
+      -- none of those may authorize a worker that cannot run Codex. Reuses the SAME
+      -- @worker_protocol_caps param the completion clause reads (the claimant's stored
+      -- workers.protocol_capabilities, passed by the Go caller).
+      AND (NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
+           OR 'codex_harness_v1' = ANY(@worker_protocol_caps::text[]))
       -- PRD #529 Decision 4: an ephemeral worker exists to serve exactly one run and
       -- must never take foreign work — otherwise it could hold a non-owning run when
       -- its bound run terminates, blocking the busy-guarded teardown (M4). So an
@@ -788,6 +809,14 @@ WITH target AS (
                 -- the claimant's @worker_protocol_caps above).
                 AND (r.completion_contract_version IS NULL
                      OR 'completion_interlock_v1' = ANY(p.protocol_capabilities))
+                -- PRD #1332 M5A (D3): MIRROR the non-bypassable Codex-harness clause for the peer, or
+                -- fleet-spread could DEFER a CODEX-INDICATING run to an INCAPABLE peer that could never
+                -- claim it (its OWN Codex claim clause above blocks it) — making the run permanently
+                -- unclaimable by being preferred. Same all-three "Codex-indicating" test on r, reading
+                -- the peer's OWN workers.protocol_capabilities column directly (no Go param, unlike the
+                -- claimant's @worker_protocol_caps).
+                AND (NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
+                     OR 'codex_harness_v1' = ANY(p.protocol_capabilities))
                 AND pa.active < p.max_concurrent_runs
                 AND pa.active * (SELECT w.max_concurrent_runs FROM workers w WHERE w.id = @worker_id)
                     < (SELECT count(*) FROM runs mr
@@ -2944,19 +2973,43 @@ LIMIT @lim;
 -- idempotent monotonic merge = correct totals with no crash window. The run_usage_totals
 -- view (00177) MAXes within (run_id, model, lineage_epoch) then SUMs across, which is
 -- exactly the per-leg rule once every leg has its own epoch.
+--
+-- PRD #1332 M5A (D2/D5): harness and cost_status ride the fold. harness is the run's
+-- immutable, run-derived harness (foldUsageFrames sources it from runs.harness, never a
+-- worker field), so on conflict the two sides are always equal and the existing value is
+-- kept. cost_status resolves conservatively: EQUAL statuses retain; ANY disagreement (which
+-- necessarily includes any existing/incoming 'unreported' paired with a different status,
+-- and two-of-{metered,subscription,unreported}) resolves to 'unreported'. cost_usd is
+-- GREATEST only when the RESOLVED status is 'metered' (which requires both sides already
+-- 'metered'), else 0 — so a redelivery can never combine an unreported/subscription status
+-- with a positive dollar amount, and the result always satisfies 00226's
+-- run_usage_nonmetered_zero_check (cost_status='metered' OR cost_usd=0).
 INSERT INTO run_usage (
     run_id, session_id, model, lineage_epoch,
-    input_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, cost_usd, updated_at
+    input_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, cost_usd, harness, cost_status, updated_at
 ) VALUES (
     @run_id, @session_id, @model, @lineage_epoch,
-    @input_tokens, @cache_read_tokens, @cache_creation_tokens, @output_tokens, @cost_usd, now()
+    @input_tokens, @cache_read_tokens, @cache_creation_tokens, @output_tokens, @cost_usd, @harness, @cost_status, now()
 )
 ON CONFLICT (run_id, session_id, model, lineage_epoch) DO UPDATE SET
     input_tokens          = GREATEST(run_usage.input_tokens,          EXCLUDED.input_tokens),
     cache_read_tokens     = GREATEST(run_usage.cache_read_tokens,     EXCLUDED.cache_read_tokens),
     cache_creation_tokens = GREATEST(run_usage.cache_creation_tokens, EXCLUDED.cache_creation_tokens),
     output_tokens         = GREATEST(run_usage.output_tokens,         EXCLUDED.output_tokens),
-    cost_usd              = GREATEST(run_usage.cost_usd,              EXCLUDED.cost_usd),
+    -- The run's harness is immutable, so existing == EXCLUDED on conflict; keep existing.
+    harness               = run_usage.harness,
+    cost_status           = CASE
+                                WHEN run_usage.cost_status = EXCLUDED.cost_status THEN run_usage.cost_status
+                                ELSE 'unreported'
+                            END,
+    -- GREATEST only when the resolved status is 'metered' (recomputed inline — the SET-list
+    -- expressions all read the OLD row's run_usage.* and EXCLUDED.*, so order is irrelevant),
+    -- else 0 to keep a non-metered row at the numeric placeholder.
+    cost_usd              = CASE
+                                WHEN (CASE WHEN run_usage.cost_status = EXCLUDED.cost_status THEN run_usage.cost_status ELSE 'unreported' END) = 'metered'
+                                    THEN GREATEST(run_usage.cost_usd, EXCLUDED.cost_usd)
+                                ELSE 0
+                            END,
     updated_at            = now();
 
 -- name: CountRunInitFramesBefore :one
@@ -2978,7 +3031,11 @@ WHERE run_id = @run_id AND kind = 'status'
 -- ROW for a run with no usage — the handler maps pgx.ErrNoRows to "no usage" (absent,
 -- never a fake 0), so it does not gate detail visibility on ownership here (the
 -- caller has already authorized the viewer).
-SELECT input_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, cost_usd
+--
+-- PRD #1332 M5A (D2): the per-run folded cost_status rides along so a reader can tell a real
+-- metered dollar total from a subscription/unreported one that cost_usd cannot represent.
+-- M5A adds no public DTO field for it (the response shape stays unchanged); M5B consumes it.
+SELECT input_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, cost_usd, cost_status
 FROM run_usage_totals
 WHERE run_id = @run_id;
 
@@ -2988,8 +3045,12 @@ WHERE run_id = @run_id;
 -- run's created_at (laptop scale ≈ when it spent). COALESCE(...,0) so a user with no
 -- usage gets zeros + run_count 0 (the client reads run_count==0 as "nothing yet").
 -- Chat runs are excluded (belt-and-suspenders: the fold never writes chat rows).
+-- PRD #1332 M5A (D2): each dollar sum now travels with subscription/unreported RUN COUNTS
+-- for the SAME window, so no partial dollar total can read as complete — a run is counted by
+-- its folded per-run cost_status from the view. M5A adds no public DTO field for these
+-- counts (the /api/usage response shape stays unchanged); M5B consumes them.
 WITH scoped AS (
-    SELECT r.created_at,
+    SELECT r.created_at, t.cost_status,
            t.input_tokens, t.cache_read_tokens, t.cache_creation_tokens, t.output_tokens, t.cost_usd
     FROM run_usage_totals t
     JOIN runs r ON r.id = t.run_id
@@ -3001,11 +3062,15 @@ SELECT
     COALESCE(SUM(cache_creation_tokens), 0)::bigint  AS lifetime_cache_creation_tokens,
     COALESCE(SUM(output_tokens), 0)::bigint          AS lifetime_output_tokens,
     COALESCE(SUM(cost_usd), 0)::numeric              AS lifetime_cost_usd,
+    count(*) FILTER (WHERE cost_status = 'subscription')::bigint AS lifetime_subscription_run_count,
+    count(*) FILTER (WHERE cost_status = 'unreported')::bigint   AS lifetime_unreported_run_count,
     COALESCE(SUM(input_tokens)          FILTER (WHERE created_at >= now() - interval '7 days'), 0)::bigint  AS last7_input_tokens,
     COALESCE(SUM(cache_read_tokens)      FILTER (WHERE created_at >= now() - interval '7 days'), 0)::bigint  AS last7_cache_read_tokens,
     COALESCE(SUM(cache_creation_tokens)  FILTER (WHERE created_at >= now() - interval '7 days'), 0)::bigint  AS last7_cache_creation_tokens,
     COALESCE(SUM(output_tokens)          FILTER (WHERE created_at >= now() - interval '7 days'), 0)::bigint  AS last7_output_tokens,
     COALESCE(SUM(cost_usd)               FILTER (WHERE created_at >= now() - interval '7 days'), 0)::numeric AS last7_cost_usd,
+    count(*) FILTER (WHERE cost_status = 'subscription' AND created_at >= now() - interval '7 days')::bigint AS last7_subscription_run_count,
+    count(*) FILTER (WHERE cost_status = 'unreported'   AND created_at >= now() - interval '7 days')::bigint AS last7_unreported_run_count,
     count(*)::bigint AS run_count
 FROM scoped;
 
@@ -3014,8 +3079,11 @@ FROM scoped;
 -- Same shape as SelfUsage without the user filter; by construction this equals the
 -- SUM of the AdminUsagePerUser rows (both read run_usage_totals joined to non-chat
 -- runs), which the handler test asserts.
+-- PRD #1332 M5A (D2): the factory-wide dollar sums carry subscription/unreported RUN COUNTS
+-- for both windows, mirroring SelfUsage, so a partial dollar total can never read as
+-- complete. M5A adds no public DTO field for the counts; M5B consumes them.
 WITH scoped AS (
-    SELECT r.created_at,
+    SELECT r.created_at, t.cost_status,
            t.input_tokens, t.cache_read_tokens, t.cache_creation_tokens, t.output_tokens, t.cost_usd
     FROM run_usage_totals t
     JOIN runs r ON r.id = t.run_id
@@ -3027,11 +3095,15 @@ SELECT
     COALESCE(SUM(cache_creation_tokens), 0)::bigint  AS lifetime_cache_creation_tokens,
     COALESCE(SUM(output_tokens), 0)::bigint          AS lifetime_output_tokens,
     COALESCE(SUM(cost_usd), 0)::numeric              AS lifetime_cost_usd,
+    count(*) FILTER (WHERE cost_status = 'subscription')::bigint AS lifetime_subscription_run_count,
+    count(*) FILTER (WHERE cost_status = 'unreported')::bigint   AS lifetime_unreported_run_count,
     COALESCE(SUM(input_tokens)          FILTER (WHERE created_at >= now() - interval '7 days'), 0)::bigint  AS last7_input_tokens,
     COALESCE(SUM(cache_read_tokens)      FILTER (WHERE created_at >= now() - interval '7 days'), 0)::bigint  AS last7_cache_read_tokens,
     COALESCE(SUM(cache_creation_tokens)  FILTER (WHERE created_at >= now() - interval '7 days'), 0)::bigint  AS last7_cache_creation_tokens,
     COALESCE(SUM(output_tokens)          FILTER (WHERE created_at >= now() - interval '7 days'), 0)::bigint  AS last7_output_tokens,
     COALESCE(SUM(cost_usd)               FILTER (WHERE created_at >= now() - interval '7 days'), 0)::numeric AS last7_cost_usd,
+    count(*) FILTER (WHERE cost_status = 'subscription' AND created_at >= now() - interval '7 days')::bigint AS last7_subscription_run_count,
+    count(*) FILTER (WHERE cost_status = 'unreported'   AND created_at >= now() - interval '7 days')::bigint AS last7_unreported_run_count,
     count(*)::bigint AS run_count,
     -- The earliest usage-bearing run's creation time, for the factory card's "since
     -- <date>" (PRD #40 M6). NULL when the factory has no usage yet.
@@ -3043,12 +3115,18 @@ FROM scoped;
 -- per user WITH usage; the client computes each user's share against the factory
 -- total. Ordered heaviest-cost first (output tokens tiebreak). Sums the same
 -- run_usage_totals as AdminUsageTotals, so the rows sum to the factory lifetime total.
+-- PRD #1332 M5A (D2): each user's lifetime dollar sum carries subscription/unreported RUN
+-- COUNTS so a partial dollar total cannot read as complete. Lifetime-only here (this row is
+-- the admin per-user lifetime breakdown; the windowed counts live in AdminUsageTotals). M5A
+-- adds no public DTO field for the counts; M5B consumes them.
 SELECT u.id AS user_id, u.email,
     COALESCE(SUM(t.input_tokens), 0)::bigint          AS input_tokens,
     COALESCE(SUM(t.cache_read_tokens), 0)::bigint      AS cache_read_tokens,
     COALESCE(SUM(t.cache_creation_tokens), 0)::bigint  AS cache_creation_tokens,
     COALESCE(SUM(t.output_tokens), 0)::bigint          AS output_tokens,
     COALESCE(SUM(t.cost_usd), 0)::numeric              AS cost_usd,
+    count(*) FILTER (WHERE t.cost_status = 'subscription')::bigint AS subscription_run_count,
+    count(*) FILTER (WHERE t.cost_status = 'unreported')::bigint   AS unreported_run_count,
     count(t.run_id)::bigint AS run_count
 FROM run_usage_totals t
 JOIN runs r ON r.id = t.run_id
@@ -3741,11 +3819,16 @@ UPDATE runs SET checkpoint_tip = @checkpoint_tip, checkpoint_tip_at = now() WHER
 -- PRD #1226 M1: completion_contract_version rides this read so the queued arm can surface a
 -- completion-capability reason for an INTERLOCKED run (version non-null) that no online worker
 -- implements the completion protocol — the non-bypassable claim clause can never be satisfied.
+-- PRD #1332 M5A (D3): harness, codex_material_revision and codex_secret_id ride this read so the
+-- queued arm can surface a Codex-capability reason for a CODEX-INDICATING run (any of the three set)
+-- that no online worker advertises 'codex_harness_v1' — the non-bypassable Codex claim clause can
+-- never be satisfied. The resolver checks all three, mirroring the claim gate's fail-closed test.
 SELECT id, user_id, status, auto_approve,
        started_at, last_activity_at, updated_at, status_since,
        health, health_reason, health_since, health_notified_at,
        budget_wall_seconds, budget_paused_seconds, budget_extension_seconds, interactive,
-       repo_id, kind, required_capabilities, completion_contract_version
+       repo_id, kind, required_capabilities, completion_contract_version,
+       harness, codex_material_revision, codex_secret_id
 FROM runs
 WHERE status IN ('queued', 'running', 'awaiting_approval')
   AND kind <> 'chat';
@@ -3937,6 +4020,31 @@ WHERE w.user_id = @user_id
   AND w.draining_since IS NULL
   AND NOT w.ephemeral
   AND 'completion_interlock_v1' = ANY(w.protocol_capabilities);
+
+-- name: CountOnlineWorkersSatisfyingCodexHarness :one
+-- PRD #1332 M5A (D3): how many of a user's ONLINE, non-draining, non-ephemeral workers self-report
+-- the 'codex_harness_v1' PROTOCOL capability (workers.protocol_capabilities). This is the
+-- Codex-harness analogue of CountOnlineWorkersSatisfyingProtocol: it answers "does the fleet have
+-- ANY worker that can execute a Codex run?", NOT "can THIS run be claimed right now?". It drives the
+-- queued-reason resolver's Codex-capability rung (reasonNoCodexCapableWorker): a 0 here for a
+-- CODEX-INDICATING queued run means every online worker predates the probe/receipt, so the run's
+-- NON-BYPASSABLE claim clause (ClaimRun's `'codex_harness_v1' = ANY(@worker_protocol_caps)`) can
+-- never be satisfied — a persistent block distinct from the generic wait, an ordinary capability
+-- gap, the completion-interlock block, or the docker-allowlist fence.
+--
+-- It reads workers.protocol_capabilities DIRECTLY (the server-authoritative FilterProtocol'd
+-- column), NOT the effective-caps fold: the Codex harness is a self-reported protocol capability,
+-- deliberately OUTSIDE required_capabilities / the docker union / the capability-aware kill-switch
+-- (see ClaimRun's dedicated clause). draining_since IS NULL and NOT w.ephemeral mirror
+-- CountOnlineWorkersSatisfyingProtocol for the same reasons (a draining worker claims nothing; an
+-- ephemeral worker is bound to one run and can never satisfy a different one). Only called for a
+-- Codex-indicating queued run already past its health threshold, so it is off the hot path.
+SELECT count(*) FROM workers w
+WHERE w.user_id = @user_id
+  AND w.status = 'online'
+  AND w.draining_since IS NULL
+  AND NOT w.ephemeral
+  AND 'codex_harness_v1' = ANY(w.protocol_capabilities);
 
 -- name: ListUnplaceableQueuedRunsForEphemeral :many
 -- The trigger query for the ephemeral auto-provisioner (PRD #529 M2). It returns the

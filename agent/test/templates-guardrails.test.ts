@@ -262,6 +262,11 @@ describe("worker template Dockerfiles keep guardrail layers", () => {
   // every template (the ONE packaging path), so read the guard script once and assert
   // its substance below — the Dockerfiles only wire it in.
   const codexGuardScript = fs.readFileSync(path.resolve(templatesDir, "../codex/assert-codex.sh"), "utf8");
+  // The shared install helper (PRD #1332 D3 / M5A C2) also leaves the root-owned runtime
+  // receipt both worker images depend on. Read it once and assert its substance below —
+  // both templates get it identically because they RUN the SAME script (asserted per
+  // template), so the receipt cannot drift between images.
+  const codexInstallScript = fs.readFileSync(path.resolve(templatesDir, "../codex/install-codex.sh"), "utf8");
 
   it("finds at least the base template", () => {
     assert.ok(
@@ -581,6 +586,40 @@ describe("worker template Dockerfiles keep guardrail layers", () => {
         text,
         /^\s*ENV\s+PATH=[^\n]*\/opt\/uzi-codex/m,
         `${name}/Dockerfile must NOT put /opt/uzi-codex on PATH (resolve Codex by absolute path only)`,
+      );
+
+      // (e) The SHARED installer leaves the root-owned, world-readable runtime receipt the
+      // startup capability probe (PRD #1332 D3) re-verifies. Both templates get it identically
+      // because they RUN the same script (asserted in (b)); assert its substance on the script.
+      assert.match(
+        codexInstallScript,
+        /RECEIPT="\$\{PREFIX\}\/\$\{CODEX_VERSION\}\.receipt\.json"/,
+        "install-codex.sh must write the content-addressed receipt BESIDE the version root",
+      );
+      assert.match(
+        codexInstallScript,
+        /chown 0:0 "\$RECEIPT"/,
+        "install-codex.sh must make the receipt root-owned when running as root",
+      );
+      assert.match(
+        codexInstallScript,
+        /chmod 0644 "\$RECEIPT"/,
+        "install-codex.sh must make the receipt world-readable (the worker uid reads it at startup)",
+      );
+      assert.match(
+        codexInstallScript,
+        /sha256sum "\$abs"/,
+        "install-codex.sh must record each installed member's SHA-256 in the receipt",
+      );
+      assert.match(
+        codexInstallScript,
+        /stat -c '%a' "\$abs"/,
+        "install-codex.sh must record each installed member's file mode in the receipt",
+      );
+      assert.match(
+        codexInstallScript,
+        /"lockDigest": "%s"/,
+        "install-codex.sh must bind the pinned lock digest in the receipt",
       );
     });
 

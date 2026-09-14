@@ -59,6 +59,20 @@ const RecoveryArchiveV1 = "recovery_archive_v1"
 // capability picker.
 const RecoveryArchiveV2 = "recovery_archive_v2"
 
+// CodexHarnessV1 is the PROTOCOL capability a worker self-reports (PRD #1332 M5A, D3) after a
+// successful startup probe of the pinned, out-of-PATH Codex runtime receipt — it declares the
+// worker can execute a Codex-harness run. Like CompletionInterlockV1 / RecoveryArchiveV1 it is a
+// worker/server protocol fact, NOT a scheduler capability or a user-chosen repo requirement, so it
+// lives in the protocol vocabulary below, NEVER in `vocabulary`, `required_capabilities` or the web
+// capability picker. It is the fail-closed old-worker discriminator: ClaimRun's dedicated Codex
+// clause (D3, mirroring the completion-interlock clause) admits a CODEX-INDICATING run only for a
+// worker whose workers.protocol_capabilities contains it, OUTSIDE fn_worker_can_claim,
+// required_capabilities, ClearRunRequiredCapabilities and the capability_aware kill-switch — so a
+// stripped/old/failed-probe worker that omits it can never be sent a Codex credential block and
+// silently run Claude. FilterProtocol drops it on registration if removed from protocolVocabulary,
+// which is a calibrated failure case: the capable-worker claim test then fails.
+const CodexHarnessV1 = "codex_harness_v1"
+
 // protocolVocabulary is the closed set of legal PROTOCOL capability names — kept
 // entirely separate from `vocabulary` so a protocol string is never offered to users
 // through Vocabulary()/the web mirror. FilterProtocol drops anything not in here.
@@ -66,11 +80,12 @@ var protocolVocabulary = map[string]struct{}{
 	CompletionInterlockV1: {},
 	RecoveryArchiveV1:     {},
 	RecoveryArchiveV2:     {},
+	CodexHarnessV1:        {},
 }
 
 // protocolOrder fixes FilterProtocol's stable output order (protocolVocabulary is a map,
 // so its own iteration order is not stable). Keep in lockstep with protocolVocabulary.
-var protocolOrder = []string{CompletionInterlockV1, RecoveryArchiveV1, RecoveryArchiveV2}
+var protocolOrder = []string{CompletionInterlockV1, RecoveryArchiveV1, RecoveryArchiveV2, CodexHarnessV1}
 
 // FilterProtocol returns the members of in that are in the PROTOCOL vocabulary, DROPPING
 // unknowns silently (never an error), deduped, in stable order. It mirrors Filter but

@@ -288,6 +288,33 @@ function signalDone(threadId = "th-1", turnId = "tn-1", requestId = 700, callId 
   return toolCall(requestId, "signal_done", {}, threadId, turnId, callId);
 }
 
+/** A pre-decoded per-thread token-usage note (PRD #1332 C4a) as the transport would surface it.
+ *  `last` defaults to `total` (a single-response leg). Used to drive the executor→accountant
+ *  wiring end-to-end; the raw-wire DECODE of this method is guarded in codex-transport.test.ts. */
+function tokenUsageUpdated(
+  threadId: string,
+  turnId: string,
+  total: Partial<Record<"inputTokens" | "cachedInputTokens" | "cacheWriteInputTokens" | "outputTokens" | "reasoningOutputTokens" | "totalTokens", number>>,
+  last: typeof total = total,
+): CodexNotification {
+  const bd = (o: typeof total): {
+    inputTokens: number; cachedInputTokens: number; cacheWriteInputTokens: number;
+    outputTokens: number; reasoningOutputTokens: number; totalTokens: number;
+  } => ({
+    inputTokens: 0, cachedInputTokens: 0, cacheWriteInputTokens: 0,
+    outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0, ...o,
+  });
+  const usage = { total: bd(total), last: bd(last) };
+  return {
+    kind: "token_usage_updated",
+    method: "thread/tokenUsage/updated",
+    threadId,
+    turnId,
+    usage,
+    params: { threadId, turnId, tokenUsage: usage },
+  };
+}
+
 // --- binding + client + context builders ---------------------------------------
 function bindingOf(codex: Record<string, unknown>): CodexBinding {
   const selection = selectCodexBinding({ codex });
@@ -591,6 +618,27 @@ function epochResponder(
     if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: threadId } };
     if (c.method === "turn/start") {
       c.transport.push(threadStarted(threadId));
+      pushFrames(c.transport, threadId, turnId);
+      return { turn: { id: turnId } };
+    }
+    return {};
+  };
+}
+
+// A RESUMED-epoch responder aligned with the pinned resume protocol (PRD #1332, CodeRabbit
+// 4004800880): a recreated epoch RESUMES the SAME thread id (thread/resume returns it) and, unlike
+// {@link epochResponder}, pushes NO thread/started on turn/start — the pinned `thread/resume` path
+// replays token usage but never a `thread/started` lineage row. Kept as a separate builder (not a
+// flag on epochResponder) so tests can model the pinned no-notification path independently from
+// defense-in-depth cases where a recreated provider unexpectedly reports thread/started.
+function resumedEpochResponder(
+  threadId: string,
+  turnId: string,
+  pushFrames: (t: FakeTransport, threadId: string, turnId: string) => void,
+): Responder {
+  return (c) => {
+    if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: threadId } };
+    if (c.method === "turn/start") {
       pushFrames(c.transport, threadId, turnId);
       return { turn: { id: turnId } };
     }
@@ -1138,7 +1186,212 @@ describe("CodexExecutor: child-thread delegation demux (part C)", () => {
     assert.equal(rig.transport.turnStartCount, 2, "the child turn ran on the same transport");
     assert.equal(replyOf1(rig).success, true, "the parent spawn_agent callback succeeded after the child settled");
   });
+
+  it("(C4a) a child's token_usage_updated flows through the REAL delegation flow and is charged to the CHILD's configured model, not the root's", async () => {
+    // The executor→accountant wiring seam: startChildTurn calls harness.recordChildThreadModel
+    // (codex-executor.ts) so a child thread is REGISTERED with the model it was spawned on. If
+    // that call is deleted, the child thread stays unregistered, record() drops its usage note as
+    // an unknown thread, and the child entry vanishes from terminal.usage.wire.modelUsage — a
+    // regression the 133 existing executor/harness/delegation tests all miss. This pins it.
+    const responder: Responder = (c) => {
+      if (c.method === "thread/start") return { thread: { id: c.threadStartCount === 1 ? "th-1" : "th-child" } };
+      if (c.method === "turn/start") {
+        if (c.turnStartCount === 1) return { turn: { id: "tn-1" } };
+        // The CHILD turn: a per-thread token-usage note (charged to th-child) then the terminal.
+        c.transport
+          .push(tokenUsageUpdated("th-child", "tn-child", { inputTokens: 200, outputTokens: 100, totalTokens: 300 }))
+          .push(turnCompleted("completed", "th-child", "tn-child"));
+        return { turn: { id: "tn-child" } };
+      }
+      if (c.method === "turn/interrupt") return {};
+      return {};
+    };
+    const rig = makeRig({ responder });
+    rig.transport.push(threadStarted()).push(toolCall(1, "spawn_agent", { role: "coder", prompt: "help" }, "th-1", "tn-1", "c-root"));
+
+    // The coder subagent is configured with a DISTINCT valid contract model from the root
+    // (root = provider.model = "gpt-6-astra"); its usage must be charged to "gpt-5.6-sol".
+    const childModelAgents: AgentTemplate[] = [
+      { name: "lead", description: "the lead", prompt_body: "lead body", tools: null, skills: [] },
+      { name: "coder", description: "a coder", prompt_body: "coder body", model: "gpt-5.6-sol", tools: null, skills: [] },
+    ];
+    const { ctx, emitted } = makeCtx({ agents: childModelAgents });
+    const runP = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    await waitFor(() => rig.transport.responses.some((r) => r.requestId === 1), "parent spawn_agent reply");
+    rig.transport.push(signalDone("th-1", "tn-1")).push(turnCompleted("completed", "th-1", "tn-1")).end();
+    await withTimeout(runP, 3000, "child-usage delegation run");
+
+    const modelUsage = lastResultModelUsage(emitted);
+    assert.ok(modelUsage, "the terminal carries per-model usage");
+    assert.deepEqual(Object.keys(modelUsage), ["gpt-5.6-sol"], "the child usage is charged to its own model, never the root's or dropped");
+    const child = rec(modelUsage["gpt-5.6-sol"]);
+    assert.equal(child.inputTokens, 200, "the child's uncached input rode through the accountant");
+    assert.equal(child.outputTokens, 100, "the child's output rode through the accountant");
+    // C4b: this run's binding is SUBSCRIPTION, so the child entry carries costStatus 'subscription'
+    // with no per-token dollar figure (updated from C4a's hard-coded 'unreported' — the marker the
+    // C4b milestone removes). The executor→accountant delegation wiring this test really pins
+    // (recordChildThreadModel) is unchanged; only the cost projection is.
+    assert.equal(child.costStatus, "subscription", "a subscription run's per-model entry is subscription");
+    assert.ok(!("costUSD" in child), "no costUSD on a subscription entry");
+  });
 });
+
+describe("CodexExecutor: an api_key run meters the root model end-to-end (executor→harness authMode wiring)", () => {
+  it("(C4b) an api_key binding drives a metered root modelUsage entry with the exact Standard costUSD", async () => {
+    // The seam under test is codex-executor.ts's `authMode: binding.authMode` into new CodexHarness:
+    // the RUN's credential mode selects the terminal cost semantics in the token accountant.
+    // Harness-level cost tests pass authMode DIRECTLY (bypassing this wiring), and the only existing
+    // executor costStatus test drives a SUBSCRIPTION binding — so nothing exercises the api_key
+    // metered path THROUGH the real executor. Hardcoding authMode:"subscription" at that call site
+    // passes every other executor test; this pins it end-to-end: an api_key run's per-model entry
+    // must be `metered` with a real costUSD, never `subscription`.
+    const rig = makeRig();
+    // A single ROOT token-usage note on the configured root model (provider.model = "gpt-6-astra")
+    // with priceable buckets: input 1000 (cached 600, cacheWrite 100 → uncached 300), output 200
+    // (incl. 50 reasoning). last === total (a single-response leg), so it reconciles cleanly.
+    const b = { inputTokens: 1000, cachedInputTokens: 600, cacheWriteInputTokens: 100, outputTokens: 200, reasoningOutputTokens: 50, totalTokens: 1200 };
+    rig.transport
+      .push(threadStarted())
+      .push(tokenUsageUpdated("th-1", "tn-1", b))
+      .push(signalDone())
+      .push(turnCompleted("completed"))
+      .end();
+    const { ctx, emitted } = makeCtx();
+    await withTimeout(makeExecutor(rig, bindingOf(API_KEY)).run(ctx), 3000, "api_key metered run");
+
+    const modelUsage = lastResultModelUsage(emitted);
+    assert.ok(modelUsage, "the terminal carries per-model usage");
+    assert.deepEqual(Object.keys(modelUsage), ["gpt-6-astra"], "the root usage is charged to the configured root model");
+    const astra = rec(modelUsage["gpt-6-astra"]);
+    assert.equal(astra.inputTokens, 300, "uncached input derived from the cumulative delta (1000 - 600 - 100)");
+    assert.equal(astra.outputTokens, 200, "output rode through the accountant");
+    // C4b: the api_key binding threads through `authMode: binding.authMode` so the entry is METERED
+    // with the summed Standard price, NOT subscription. If line ~1413 is hardcoded to
+    // "subscription", this becomes costStatus:'subscription' with no costUSD and both asserts fail.
+    assert.equal(astra.costStatus, "metered", "an api_key run's per-model entry is metered (never subscription)");
+    // 300*10 + 600*1 + 100*12.5 + 200*50 = 14850 µ$. Reasoning (50) is a subset of output, never re-added.
+    assert.equal(Math.round((astra.costUSD as number) * 1e6), 14850, "the exact summed Standard price in microdollars");
+  });
+});
+
+describe("CodexExecutor: one claim-leg accountant survives provider-epoch recreation (CodeRabbit 4004800880)", () => {
+  it("reports cumulative-since-claim-start across a checkpoint recreation, not just the resumed epoch's own delta", async () => {
+    // The seam under test is the shared EpochSharedContext.accountant threaded into every epoch's
+    // CodexHarness. Epoch 0 (a FRESH th-1) charges a cumulative of 100; a cooperative checkpoint
+    // reap recreates the provider epoch, which RESUMES th-1 (SAME thread id, and — per the pinned
+    // resume protocol — NO thread/started). The resumed epoch first replays the prior cumulative
+    // (total=100, whose `last` is the prior leg's final response) and then advances to total=150.
+    //
+    // FIXED (one accountant for this executor claim leg): th-1 persists with baseline 0 and maxTotal
+    // 100, so the replay note (magnitude 100) is a no-op stale note and the total=150 note charges
+    // the FULL cumulative delta 150 - 0 = 150 at the FINAL terminal.
+    //
+    // PRE-FIX (a per-HARNESS accountant): the recreated epoch's harness constructs a FRESH
+    // accountant; registerThread marks th-1 `resumed`, so the replayed total=100 becomes its
+    // baseline and the total=150 note charges only 150 - 100 = 50. That is the run-cumulative loss
+    // this test pins — it FAILS (astra.inputTokens === 50) on the pre-fix per-harness accountant.
+    const rig = makeMultiEpochRig([
+      epochResponder("th-1", "tn-1", (t, th, tn) => {
+        t.push(tokenUsageUpdated(th, tn, { inputTokens: 100, totalTokens: 100 }))
+          .push(toolCall(1, "checkpoint", {}, th, tn, "c-ckpt"))
+          .push(turnCompleted("completed", th, tn));
+      }),
+      resumedEpochResponder("th-1", "tn-2", (t, th, tn) => {
+        // Resume replay: the restored cumulative (total=100); `last` is the prior leg's final
+        // response (a subset already counted upstream). Then a genuinely-newer note (total=150).
+        t.push(tokenUsageUpdated(th, tn, { inputTokens: 100, totalTokens: 100 }, { inputTokens: 100, totalTokens: 100 }))
+          .push(tokenUsageUpdated(th, tn, { inputTokens: 150, totalTokens: 150 }, { inputTokens: 50, totalTokens: 50 }))
+          .push(toolCall(2, "signal_done", {}, th, tn, "c-done"))
+          .push(turnCompleted("completed", th, tn));
+      }),
+    ]);
+    // Pre-approved by default (makeCtx) → straight to the implement loop; the checkpoint sink just
+    // records nothing so the cooperative reap:true recreates the epoch.
+    const { ctx, emitted } = makeCtx({ checkpoint: async () => undefined });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "shared-accountant run");
+
+    assert.equal(result.branch, "agent/issue-42");
+    assert.equal(rig.providerLaunches(), 2, "the cooperative checkpoint recreated a fresh provider epoch");
+    assert.equal(rig.epochs[1]!.transport.turnStartCount, 1, "the resumed implement turn ran on the NEW epoch");
+    const modelUsage = lastResultModelUsage(emitted);
+    assert.ok(modelUsage, "the FINAL terminal carries per-model usage");
+    assert.deepEqual(Object.keys(modelUsage), ["gpt-6-astra"], "usage is charged to the configured root model");
+    const astra = rec(modelUsage["gpt-6-astra"]);
+    assert.equal(
+      astra.inputTokens,
+      150,
+      "the claim-leg accountant reports the claim cumulative (150), NOT the resumed epoch's own delta (50)",
+    );
+    assert.equal(astra.costStatus, "subscription", "a subscription run's per-model entry is subscription");
+  });
+
+  it("emits one init for the executor claim even if an internal resumed epoch reports thread/started", async () => {
+    const rig = makeMultiEpochRig([
+      epochResponder("th-1", "tn-1", (t, th, tn) => {
+        t.push(toolCall(1, "checkpoint", {}, th, tn, "c-ckpt"))
+          .push(turnCompleted("completed", th, tn));
+      }),
+      epochResponder("th-1", "tn-2", (t, th, tn) => {
+        t.push(toolCall(2, "signal_done", {}, th, tn, "c-done"))
+          .push(turnCompleted("completed", th, tn));
+      }),
+    ]);
+    const { ctx, emitted } = makeCtx({ checkpoint: async () => undefined });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "single-init internal recreation");
+
+    assert.equal(rig.providerLaunches(), 2, "the cooperative checkpoint recreated the provider epoch");
+    assert.equal(initMessageCount(emitted), 1, "one executor claim emits exactly one persisted init lineage marker");
+  });
+
+  it("emits a fresh init on a new resumed executor claim so its delta gets a new lineage", async () => {
+    const firstRig = makeMultiEpochRig([
+      epochResponder("th-1", "tn-1", (t, th, tn) => {
+        t.push(tokenUsageUpdated(th, tn, { inputTokens: 100, totalTokens: 100 }))
+          .push(toolCall(1, "signal_done", {}, th, tn, "c-done-1"))
+          .push(turnCompleted("completed", th, tn));
+      }),
+    ]);
+    const first = makeCtx();
+    await withTimeout(makeExecutor(firstRig, bindingOf(SUBSCRIPTION)).run(first.ctx), 5000, "first executor claim");
+
+    const resumedRig = makeMultiEpochRig([
+      resumedEpochResponder("th-1", "tn-2", (t, th, tn) => {
+        t.push(tokenUsageUpdated(th, tn, { inputTokens: 100, totalTokens: 100 }, { inputTokens: 100, totalTokens: 100 }))
+          .push(tokenUsageUpdated(th, tn, { inputTokens: 150, totalTokens: 150 }, { inputTokens: 50, totalTokens: 50 }))
+          .push(toolCall(2, "signal_done", {}, th, tn, "c-done-2"))
+          .push(turnCompleted("completed", th, tn));
+      }),
+    ]);
+    const resumed = makeCtx({ sessionId: "th-1" });
+    await withTimeout(makeExecutor(resumedRig, bindingOf(SUBSCRIPTION)).run(resumed.ctx), 5000, "resumed executor claim");
+
+    assert.equal(initMessageCount(first.emitted), 1, "the first executor claim emits one init");
+    assert.equal(initMessageCount(resumed.emitted), 1, "a new resumed executor claim emits its own init despite no thread/started replay");
+    const firstUsage = rec(lastResultModelUsage(first.emitted)?.["gpt-6-astra"]);
+    const resumedUsage = rec(lastResultModelUsage(resumed.emitted)?.["gpt-6-astra"]);
+    assert.equal(firstUsage.inputTokens, 100, "the first lineage carries its 100-token cumulative");
+    assert.equal(resumedUsage.inputTokens, 50, "the resumed lineage carries only its new 50-token delta");
+    assert.equal(
+      (firstUsage.inputTokens as number) + (resumedUsage.inputTokens as number),
+      150,
+      "SUM across the two init-delimited lineage rows preserves the full 150-token run total",
+    );
+  });
+});
+
+function initMessageCount(emitted: EmittedMessage[]): number {
+  return emitted.filter((m) => m.kind === "status" && rec(m.payload).event === "init").length;
+}
+
+/** The `modelUsage` map of the LAST result status/error message the reducer emitted, or
+ *  undefined when none carried one (so a dropped/absent per-model fold is observable). */
+function lastResultModelUsage(emitted: EmittedMessage[]): Record<string, unknown> | undefined {
+  const results = emitted.filter((m) => rec(m.payload).event === "result");
+  const last = results[results.length - 1];
+  if (last === undefined) return undefined;
+  const modelUsage = rec(last.payload).modelUsage;
+  return modelUsage === undefined ? undefined : (modelUsage as Record<string, unknown>);
+}
 
 /** The success flag of the reply the transport was told to send for requestId 1. */
 function replyOf1(rig: Rig): { success?: boolean } {

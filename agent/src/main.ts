@@ -19,6 +19,7 @@ import { reclaimStrandedRunHomes } from "./home-reclaim.js";
 import { errMessage } from "./util.js";
 import { uidSplitActive } from "./runner-uid.js";
 import { resolveDockerWiring, dockerSidecarExpected } from "./docker-wiring.js";
+import { probeCodexRuntime } from "./codex/codex-runtime-probe.js";
 
 // Set once the logger exists so the last-resort fatal handler can scrub through
 // the SecretRegistry instead of writing a raw (unredacted) line.
@@ -60,6 +61,28 @@ async function main(): Promise<void> {
     );
   }
 
+  // Codex runtime-probe keystone (PRD #1332 D3 / M5A C2): resolve ONCE at startup,
+  // mirroring the docker-wiring resolve-once above. It reads the root-owned Codex receipt
+  // and recomputes member digests WITHOUT executing Codex, searching PATH, starting
+  // app-server or using the network; the single boolean result feeds the register
+  // protocol-capability report (worker.ts appends codex_harness_v1 only when capable). A
+  // stripped/hand-built/corrupt/mismatched/old image resolves to not-capable and keeps
+  // serving Claude. The probe never throws, but a defensive catch degrades to not-capable
+  // so a probe fault can never break startup.
+  config.codexProbe = await probeCodexRuntime().catch((err) => {
+    log.warn("codex runtime probe threw unexpectedly; advertising no codex capability", {
+      error: errMessage(err),
+    });
+    return { capable: false as const };
+  });
+  if (config.codexProbe.capable) {
+    log.info("codex runtime probe OK — advertising codex_harness_v1");
+  } else {
+    log.info("codex runtime probe: codex_harness_v1 NOT advertised (serving Claude)", {
+      reason: config.codexProbe.reason ?? "not capable",
+    });
+  }
+
   log.info("uzi-agent starting", {
     version: config.version,
     api_url: config.apiUrl,
@@ -68,6 +91,7 @@ async function main(): Promise<void> {
     executor: config.executor,
     max_concurrent_runs: config.maxConcurrentRuns,
     docker_wired: config.dockerWiring.dockerHost !== undefined,
+    codex_capable: config.codexProbe.capable,
   });
   // Soft-ceiling warn (PRD #42 Decision 3): the cap is honored as configured, but a
   // value above the documented ceiling is almost certainly a fat-finger — each slot

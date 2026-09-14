@@ -514,6 +514,33 @@ workers:
   # own CNPG already runs on standard here, so this is a default worth thinking about,
   # not a blocker.
   storageClass: ""
+  # A cluster-scoped PriorityClass for hosted worker pods (issue #1341). When enabled,
+  # the chart creates the PriorityClass AND the controller stamps its name onto every
+  # worker pod's priorityClassName, so a busy worker outranks lower-priority pods for
+  # kubelet node-pressure eviction and for scheduling (it can preempt lower-priority
+  # pods to get scheduled; see preemptionPolicy below).
+  #
+  # 🔴 CLUSTER-SCOPED: `name` must be unique cluster-wide across ALL PriorityClasses.
+  # On a SHARED cluster, confirm/tune `value` with the cluster owner before deploying —
+  # a higher value wins eviction/scheduling contests against other tenants' pods. To
+  # gain eviction survival + scheduling priority WITHOUT preempting other tenants'
+  # already-running pods, set `preemptionPolicy: Never`.
+  priorityClass:
+    enabled: true
+    # Cluster-scoped, so the name must be unique across ALL PriorityClasses in the
+    # cluster. Empty ⇒ the chart derives `<release>-hosted-worker`, which is
+    # release-unique, so two uzi releases in one cluster do not collide over this
+    # object. Set an explicit name to adopt an operator-managed shared class.
+    name: ""
+    # Modest: above the priority-0 default of a no-class pod, far below the reserved
+    # system range (>= 2000000000). Operator-tunable.
+    value: 1000
+    # PreemptLowerPriority (the k8s default, set explicitly): when a worker cannot be
+    # scheduled for lack of room, the scheduler evicts lower-priority pods (incl. other
+    # tenants') to place it. This is the owner's choice for this deployment. Set `Never`
+    # to keep eviction survival + scheduling priority WITHOUT preempting other tenants'
+    # already-running pods (the polite shared-cluster option).
+    preemptionPolicy: PreemptLowerPriority
   # The per-hosted-worker run-slot cap (→ UZI_WORKER_MAX_CONCURRENT_RUNS → the pod's
   # WORKER_MAX_CONCURRENT_RUNS). Default 1 (safe): a hosted worker takes ONE run at a
   # time regardless of size. Raising it opts into the intra-user concurrency residuals
@@ -558,10 +585,14 @@ workers:
   # Namespace ResourceQuota (Decision 8). Defense in depth under the api's per-user
   # quota: an app-level bug must not noisy-neighbour a shared cluster.
   #
-  # Sized for the 20 workers `deployments` below advertises, at the WORST-CASE size:
-  # 10 CPU / 40Gi requested, and 20 x (20Gi data + 20Gi nix) = 800Gi of PVC. STORAGE
-  # is the binding constraint, not CPU or memory. dev-cluster's real budget is M6's
-  # rollout conversation.
+  # CPU and memory track the DEFAULT `m` size (issue #1341 raised m's request to 4Gi),
+  # not the worst case: 20 workers x 500m = 10 CPU and 20 x 4Gi = 80Gi requested. STORAGE
+  # instead tracks the WORST-CASE `l` size — 20 x (20Gi data + 20Gi nix) = 800Gi of PVC —
+  # and is the binding constraint, not CPU or memory. Raising m's memory request WITHOUT
+  # raising this key caps the admissible fleet below `deployments`: the next worker is
+  # QUOTA-refused at admission ("provisions and never appears"), a failure no repo test
+  # catches (issue #1341). So keep requestsMemory = deployments x the m request.
+  # dev-cluster's real budget is M6's rollout conversation.
   #
   # WORST CASE MEANS `l`, NOT `m`, AND THAT IS THE WHOLE POINT OF THE NUMBER. Nothing
   # scopes a size to a tier — preset.SizeNames() is global and render.go feeds
@@ -595,7 +626,7 @@ workers:
   quota:
     enabled: true
     requestsCPU: "10"
-    requestsMemory: 40Gi
+    requestsMemory: 80Gi
     requestsStorage: 800Gi
     persistentVolumeClaims: "40"
     # READ BY A CONTROLLER TEST, not merely documented here. This is the restricted
@@ -732,17 +763,21 @@ workers:
     # since issue #224 M-a is its OWN PVC (dindDataSize below), not an emptyDir on node
     # ephemeral storage.
     #
-    # Sized for the 10 workers `deployments` advertises, at THREE PVCs each:
-    # 10 x (20Gi data + 20Gi nix + 20Gi dind) = 600Gi, and 10 x 3 = 30 claims. The data
-    # term is `l`'s, the worst case. STORAGE is the binding constraint here too — and it
-    # already was before M-a: at 140Gi / 20 claims this tier held 3 `l` workers against
-    # the 10 it advertises, so the triple was never self-consistent. Raising a quota
-    # PROVISIONS NOTHING (a ceiling on claims, not a reservation), so this costs zero
-    # storage until the workers exist.
+    # Sized for the 10 workers `deployments` advertises. MEMORY tracks the DEFAULT `m`
+    # size plus the DinD sidecar (issue #1341 raised m's request to 4Gi): 10 x (4Gi worker
+    # + ~256Mi sidecar request) ~= 42.5Gi, rounded up to 48Gi for headroom. STORAGE tracks
+    # THREE PVCs each: 10 x (20Gi data + 20Gi nix + 20Gi dind) = 600Gi, and 10 x 3 = 30
+    # claims. The data term is `l`'s, the worst case. STORAGE is the binding constraint
+    # here too — and it already was before M-a: at 140Gi / 20 claims this tier held 3 `l`
+    # workers against the 10 it advertises, so the triple was never self-consistent. As on
+    # the plain tier, raising m's memory request WITHOUT raising requestsMemory would
+    # QUOTA-refuse workers below `deployments`, a failure no repo test catches (issue
+    # #1341). Raising a quota PROVISIONS NOTHING (a ceiling on claims, not a reservation),
+    # so this costs zero storage until the workers exist.
     quota:
       enabled: true
       requestsCPU: "8"
-      requestsMemory: 32Gi
+      requestsMemory: 48Gi
       requestsStorage: 600Gi
       # BOTH CLAUSES OF WHAT THIS COMMENT USED TO SAY WERE FALSE, and issue #224 M-a
       # falsified the first of them a second time over. It read: "emptyDir dind data

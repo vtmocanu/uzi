@@ -498,7 +498,6 @@ func (m tuiModel) pullsKey(k string) (tea.Model, tea.Cmd) {
 // the branch column (then the run-link cell), right-to-left before the title, like the board.
 const (
 	pullIIDWidth       = 7  // #<iid>
-	pullChecksWidth    = 4  // neutral `·  —` placeholder (the list route carries no checks — see pullRow)
 	pullReviewWidth    = 10 // `✎ changes` / `✓ approved`
 	pullAgeWidth       = 4  // relAge(UpdatedAt)
 	pullBranchWidth    = 20 // source branch
@@ -508,9 +507,9 @@ const (
 )
 
 func pullRowPrefixWidth(branch bool) int {
-	// cursor(1)+spine(1)+glyph(1)+space(1), then two-space gaps around the iid/checks/review/age
+	// cursor(1)+spine(1)+glyph(1)+space(1), then two-space gaps around the iid/review/age
 	// cells, plus the branch cell when shown.
-	w := 4 + pullIIDWidth + 2 + pullChecksWidth + 2 + pullReviewWidth + 2 + pullAgeWidth + 2
+	w := 4 + pullIIDWidth + 2 + pullReviewWidth + 2 + pullAgeWidth + 2
 	if branch {
 		w += pullBranchWidth + 2
 	}
@@ -642,8 +641,9 @@ func (m tuiModel) pullEyebrow(it boardItem) string {
 }
 
 // pullRow renders one pull: the ▌ andon spine + state glyph, the #<iid> (an OSC-8 link to the
-// PR's web URL, https only — D7/D9), a neutral checks placeholder, the review cell, the age,
-// the source branch, the title, and a `↳ <run>` link when a uzi run opened it.
+// PR's web URL, https only — D7/D9), the review cell, the age, the source branch, the title,
+// and a `↳ <run>` link when a uzi run opened it. The list carries no checks cell by design (D4:
+// the cold list must not fan out a per-PR checks call — checks live only in the PR drill-in).
 func (m tuiModel) pullRow(pr apitypes.PullDTO, sel bool, runLinkW int) string {
 	band := pullBand(pr)
 	glyph, glyphC := m.pullGlyph(pr)
@@ -669,11 +669,6 @@ func (m tuiModel) pullRow(pr apitypes.PullDTO, sel bool, runLinkW int) string {
 		paintSeg(glyphC, bg, false, glyph) +
 		paintSeg(nil, bg, false, " ") +
 		m.pullLink(pr, styledIID) + gap
-
-	// Checks cell: the `pulls` LIST route carries NO per-check array — that is the PR drill-in's
-	// job (D4, M5) — so this is a NEUTRAL placeholder, never a fabricated passed/total count. It
-	// mirrors the CLI's renderPullList, which likewise shows no checks column for a list row.
-	row += paintSeg(m.pal.faintC, bg, false, padCell("·  —", pullChecksWidth)) + gap
 
 	rg, rw, rc := pullReviewCell(m.pal, pr)
 	row += paintSeg(rc, bg, false, padCell(rg+" "+rw, pullReviewWidth)) + gap

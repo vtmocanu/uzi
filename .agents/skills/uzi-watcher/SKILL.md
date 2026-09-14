@@ -1,6 +1,6 @@
 ---
 name: uzi-watcher
-description: "Drives one or more uzi PRD issues end to end in Auto mode for this GitHub-hosted repo. Sends each issue to uzi, reviews and steers the plan at the approval gate, watches to MR, reviews and admin-merges past branch protection, then watches and fixes post-merge CI. Handles uzi's workflow-scope guardrail (the worker PAT cannot push .github/workflows changes) by making those edits locally with a workflow-scoped token, and diagnoses a red main that blocks every open PR. Use when the user says send or ship an issue to uzi, watch a uzi run, steer or drive a PRD to a merged green PR, or run several uzi runs in parallel. Triggers include send it to uzi, send an issue to uzi, watch the uzi runs, drive it to merge, uzi auto mode, uzi watcher."
+description: "Drives one or more uzi PRD issues end to end in Auto mode for this GitHub-hosted repo. Sends each issue to uzi, reviews and steers the plan at the approval gate, watches to MR, reviews and admin-merges past branch protection, then watches and fixes post-merge CI. Handles uzi's workflow-scope guardrail (the worker PAT cannot push .github/workflows changes) by making those edits locally with a workflow-scoped token, and diagnoses a red main that blocks every open PR. It also owns proactive backups and recovery of in-flight run work from the hosted worker PVCs (bundled scripts/backup-runs.sh and scripts/backup-loop.sh): snapshot running runs on a timer so a fallback always exists, and recover a lost or workflow-scope-rejected run's commits plus uncommitted work. Use when the user says send or ship an issue to uzi, watch a uzi run, steer or drive a PRD to a merged green PR, run several uzi runs in parallel, back up or snapshot the current runs, or recover a lost run's work. Triggers include send it to uzi, send an issue to uzi, watch the uzi runs, drive it to merge, uzi auto mode, uzi watcher, back up the runs, back up a uzi run, snapshot in-flight work, back up runs every N minutes, recover a lost run, recover a run's work from the worker PVC."
 ---
 
 # uzi watcher — drive PRD issues to merged, green PRs
@@ -341,6 +341,9 @@ caught too, not just the checkpointed tracking ref):
   never hard-coded. **Always pass `UZI_CTX` explicitly**: unset, it falls back to the
   kubeconfig's current context, which is shared across sessions and can be switched under
   a running loop; the symptom is `WARN … no pod for worker` on a worker whose pod exists.
+  A run that has committed nothing beyond public `main` yet (its work still uncommitted)
+  logs **`PART`** and its `.tgz` carries the `uncommitted.patch`/`untracked` but no
+  `.bundle` — expected for an early run, not a failure; the bundle appears once it commits.
 - **`scripts/backup-loop.sh <RUN_ID>...`** — runs `backup-runs.sh` every
   `UZI_BACKUP_INTERVAL` (default 900s), **detached** so it outlives the session (`setsid`
   on Linux, a `( nohup … & )` subshell on macOS). It self-terminates when every run is

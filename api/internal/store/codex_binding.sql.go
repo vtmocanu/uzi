@@ -129,6 +129,14 @@ SET codex_secret_id         = $1::uuid,
     codex_auth_mode         = $2::text,
     codex_secret_label      = $3::text,
     codex_material_revision = $4::bigint,
+    -- PRD #1332 M5A (D2): the guarded freeze atomically marks the row Codex, so
+    -- FreezeCodexBinding makes the run Codex in the SAME statement that pins the binding —
+    -- and the binding-coherence CHECK (00226) is satisfied the instant codex_secret_id /
+    -- codex_material_revision become non-null. 'codex' is a SET-only literal: it is
+    -- DELIBERATELY absent from the exact-unchanged retry comparison in the WHERE below, so
+    -- an idempotent replay still matches the original M1 snapshot (which predates harness)
+    -- while this same guarded UPDATE reasserts Codex.
+    harness                 = 'codex',
     -- A late/duplicate freeze replay must NOT clobber an already-frozen account
     -- identity back to NULL: COALESCE keeps the prior non-null value when this call
     -- passes NULL (e.g. a subscription run whose account was frozen by a later
