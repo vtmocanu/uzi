@@ -712,12 +712,16 @@ describe("retireRunnerClone EXDEV fallback (#1354)", () => {
     // A FIFO and a bound UNIX socket inside the clone — fs.cp throws on these, so the fact
     // the discard path frees the clone anyway proves it never copies (pure atomic rename,
     // which is exactly what tolerates the git fsmonitor socket on a real docker-lane clone).
+    // Bind at a short path first, then move the live socket node into the clone: macOS caps UNIX
+    // socket addresses at 104 bytes, while this fixture's intentionally nested clone path is longer.
     execFileSync("mkfifo", [path.join(clonePath, "worktree.fifo")]);
     const server = net.createServer();
+    const shortSocket = path.join(fx.dataDir, "t1354-a.sock");
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject);
-      server.listen(path.join(clonePath, ".sock"), () => resolve());
+      server.listen(shortSocket, () => resolve());
     });
+    fs.renameSync(shortSocket, path.join(clonePath, ".sock"));
 
     const restore = stubDockerLaneRename();
     try {

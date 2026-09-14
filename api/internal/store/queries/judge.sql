@@ -13,8 +13,10 @@
 -- as the target (never cross-user). issue_title/description are synthesized — a judge
 -- has no issue. The one-active-judge-per-target partial unique index (00057) makes a
 -- duplicate raise 23505, which the caller treats as "already being judged" (a no-op).
-INSERT INTO runs (user_id, kind, target_run_id, issue_title, issue_description, status, trigger_source)
-VALUES (@user_id, 'judge', @target_run_id, @issue_title, @issue_description, 'queued', @trigger_source)
+-- harness (PRD #1332 M5A / D2): SQL literal 'claude', not a param — a judge run is a Claude
+-- production origin, and the literal defeats the DEFAULT-masks-omission trap.
+INSERT INTO runs (user_id, kind, target_run_id, issue_title, issue_description, status, trigger_source, harness)
+VALUES (@user_id, 'judge', @target_run_id, @issue_title, @issue_description, 'queued', @trigger_source, 'claude')
 RETURNING *;
 
 -- name: LastJudgeEnqueuedAt :one

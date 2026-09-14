@@ -778,8 +778,10 @@ func (s *Service) codexFreezeZeroRows(ctx context.Context, runID, userID uuid.UU
 // merged login, or the static api_key — and returns both. It NEVER extracts or ships
 // the refresh/login blob.
 //
-// Called only for a Codex-bound run (run.CodexSecretID.Valid); an ordinary Claude run
-// skips this entirely and its claim JSON stays byte-identical.
+// Called for a Codex run (runs.harness='codex', PRD #1332 M5A D3 — harness-authoritative, so a
+// run whose codex_secret_id was nulled by alias deletion still routes here and fails closed rather
+// than assembling a Claude claim); an ordinary Claude run skips this entirely and its claim JSON
+// stays byte-identical.
 func (s *Service) codexClaimSecrets(ctx context.Context, wkr store.Worker, run store.Run) (*ClaimCodexSecrets, error) {
 	q, ok := s.codexStore()
 	if !ok {

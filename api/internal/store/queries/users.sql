@@ -136,6 +136,17 @@ RETURNING *;
 -- credential a retrospective spends.
 SELECT judge_anthropic_bind_mode, judge_anthropic_secret_id FROM users WHERE id = @id;
 
+-- name: GetUserDefaultHarness :one
+-- The current user's per-user default harness (PRD #1332 M5A / D4); NULL = no preference.
+-- This is the ONE store read C1 ADDS for the pure D11 harness resolver (built in C3): the
+-- resolver's other inputs — Anthropic-token presence, Codex named-default/credential
+-- availability and the M1 binding/auth-mode reads — are served by EXISTING queries the
+-- resolver reuses (UserHasAnthropicToken, GetDefaultUserSecretMeta/ID, GetUserSecretIDByLabel,
+-- CountCodexSecrets, GetCodexCredentialState, GetUserSecretMetaByID, GetRunCodexAuthContext).
+-- Narrow single-column read keyed on the user, mirroring GetUserDefaultModel/GetUserDefaultEffort.
+-- M5A has NO public writer for default_harness; the column is set only in direct test setup.
+SELECT default_harness FROM users WHERE id = $1;
+
 -- name: GetUserDefaultModel :one
 -- The current user's per-user default worker model (PRD #17); NULL = inherit.
 SELECT default_model FROM users WHERE id = $1;

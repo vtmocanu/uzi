@@ -17,11 +17,12 @@ import {
   type CallbackRuntimeId,
 } from "../src/codex/broker.js";
 import { renderCodexRun } from "../src/codex/render.js";
-import type { HarnessEvent, RunTurnRequest } from "../src/harness.js";
-import type { CodexNotification, CodexTransport } from "../src/codex/transport.js";
+import type { HarnessEvent, HarnessTerminal, RunTurnRequest } from "../src/harness.js";
+import type { CodexNotification, CodexTransport, CodexUsageBreakdown } from "../src/codex/transport.js";
 import type { Logger } from "../src/log.js";
 import {
   createCodexAppServerAuth,
+  type CodexAppServerAuthMode,
   type CodexAppServerAuthSession,
 } from "../src/codex/appserver-auth.js";
 
@@ -214,6 +215,37 @@ function delta(): CodexNotification {
   return { kind: "activity", method: "item/agent_message_delta", params: { delta: "h" } };
 }
 
+function bd(overrides: Partial<CodexUsageBreakdown> = {}): CodexUsageBreakdown {
+  return {
+    inputTokens: 0,
+    cachedInputTokens: 0,
+    cacheWriteInputTokens: 0,
+    outputTokens: 0,
+    reasoningOutputTokens: 0,
+    totalTokens: 0,
+    ...overrides,
+  };
+}
+
+/** A decoded `thread/tokenUsage/updated` notification (PRD #1332 C4a), as the transport would
+ *  hand it to the harness. The FakeTransport pushes decoded notes directly, so this builds the
+ *  typed shape rather than a raw wire frame. */
+function tokenUsage(
+  total: Partial<CodexUsageBreakdown>,
+  last: Partial<CodexUsageBreakdown>,
+  threadId = "th-1",
+  turnId = "tn-1",
+): CodexNotification {
+  return {
+    kind: "token_usage_updated",
+    method: "thread/tokenUsage/updated",
+    threadId,
+    turnId,
+    usage: { total: bd(total), last: bd(last) },
+    params: { threadId, turnId },
+  };
+}
+
 function toolCall(
   requestId: number,
   tool: string,
@@ -278,6 +310,7 @@ function makeHarness(
     sessionInspect?: SessionInspectSeam;
     appServerAuth?: CodexAppServerAuthSession;
     credentialValue?: string;
+    authMode?: CodexAppServerAuthMode;
   } = {},
 ): HarnessBits {
   const transport = opts.transport ?? new FakeTransport();
@@ -295,6 +328,7 @@ function makeHarness(
     sessionInspect: opts.sessionInspect ?? (async () => "unknown"),
     appServerAuth: opts.appServerAuth,
     credentialValue: opts.credentialValue,
+    authMode: opts.authMode,
   });
   return { harness, transport, registry };
 }
@@ -786,6 +820,184 @@ describe("CodexHarness: frame → neutral event decode", () => {
     const events = await collect(harness.startTurn(makeRequest()).events);
     assert.equal(events.at(-1)!.kind, "turn_finished");
     assert.equal(events.filter((e) => e.kind === "frame").length, 0);
+  });
+});
+
+describe("CodexHarness: token accounting → result-frame modelUsage (PRD #1332 C4a)", () => {
+  function terminalModelUsage(events: HarnessEvent[]): Record<string, unknown> | undefined {
+    const last = events.at(-1)!;
+    assert.equal(last.kind, "turn_finished");
+    if (last.kind !== "turn_finished") return undefined;
+    return last.terminal.usage?.wire?.modelUsage as Record<string, unknown> | undefined;
+  }
+
+  it("aggregates root token-usage into modelUsage keyed by the configured model, unreported", async () => {
+    const { harness, transport } = makeHarness();
+    transport
+      .push(threadStarted())
+      .push(turnStarted())
+      .push(tokenUsage(
+        { inputTokens: 500, cachedInputTokens: 100, cacheWriteInputTokens: 20, outputTokens: 300, reasoningOutputTokens: 40, totalTokens: 800 },
+        { inputTokens: 500, cachedInputTokens: 100, cacheWriteInputTokens: 20, outputTokens: 300, reasoningOutputTokens: 40, totalTokens: 800 },
+      ))
+      .push(turnCompleted("completed"))
+      .end();
+
+    const mu = terminalModelUsage(await collect(harness.startTurn(makeRequest()).events));
+    // uncached input = 500 - 100 - 20 = 380. Every entry is unreported with NO costUSD.
+    assert.deepEqual(mu, {
+      "gpt-6-astra": {
+        inputTokens: 380,
+        outputTokens: 300,
+        cacheReadInputTokens: 100,
+        cacheCreationInputTokens: 20,
+        reasoningOutputTokens: 40,
+        costStatus: "unreported",
+      },
+    });
+  });
+
+  it("a turn with NO token-usage notes leaves the terminal usage byte-identical (no modelUsage)", async () => {
+    const { harness, transport } = makeHarness();
+    transport.push(threadStarted()).push(turnCompleted("completed", { total_tokens: 10 })).end();
+    const events = await collect(harness.startTurn(makeRequest()).events);
+    const last = events.at(-1)!;
+    assert.equal(last.kind, "turn_finished");
+    if (last.kind === "turn_finished") {
+      // Exactly the pre-C4a shape: bounded turn.usage, and NO modelUsage key on the wire.
+      assert.deepEqual(last.terminal.usage, { basis: "turn", tokens: {}, wire: { usage: { total_tokens: 10 } } });
+    }
+  });
+
+  it("a duplicate root token-usage note does not inflate the emitted modelUsage", async () => {
+    const { harness, transport } = makeHarness();
+    const note = tokenUsage({ inputTokens: 200, outputTokens: 120, totalTokens: 320 }, { inputTokens: 200, outputTokens: 120, totalTokens: 320 });
+    transport.push(threadStarted()).push(turnStarted()).push(note).push(note).push(turnCompleted("completed")).end();
+    const mu = terminalModelUsage(await collect(harness.startTurn(makeRequest()).events));
+    assert.deepEqual(mu, {
+      "gpt-6-astra": { inputTokens: 200, outputTokens: 120, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, reasoningOutputTokens: 0, costStatus: "unreported" },
+    });
+  });
+
+  it("a mixed-model child's usage aggregates under its OWN model, not the root's", async () => {
+    const { harness, transport } = makeHarness();
+    // Mirror exactly what the executor's child-turn seam does: record the child model and
+    // register its sink before the child's frames arrive.
+    harness.recordChildThreadModel("th-child", "gpt-5.6-sol");
+    harness.registerChildSink("th-child", { push: () => {} });
+    transport
+      .push(threadStarted())
+      .push(turnStarted())
+      .push(tokenUsage({ inputTokens: 300, outputTokens: 200, totalTokens: 500 }, { inputTokens: 300, outputTokens: 200, totalTokens: 500 })) // root (th-1)
+      .push(tokenUsage({ inputTokens: 80, outputTokens: 40, totalTokens: 120 }, { inputTokens: 80, outputTokens: 40, totalTokens: 120 }, "th-child", "ctn-1")) // child
+      .push(turnCompleted("completed"))
+      .end();
+
+    const mu = terminalModelUsage(await collect(harness.startTurn(makeRequest()).events));
+    assert.deepEqual(mu, {
+      "gpt-6-astra": { inputTokens: 300, outputTokens: 200, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, reasoningOutputTokens: 0, costStatus: "unreported" },
+      "gpt-5.6-sol": { inputTokens: 80, outputTokens: 40, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, reasoningOutputTokens: 0, costStatus: "unreported" },
+    });
+  });
+
+  it("an unknown child thread's usage is NOT attributed to the root model", async () => {
+    const { harness, transport } = makeHarness();
+    transport
+      .push(threadStarted())
+      .push(turnStarted())
+      .push(tokenUsage({ inputTokens: 300, outputTokens: 200, totalTokens: 500 }, { inputTokens: 300, outputTokens: 200, totalTokens: 500 })) // root (th-1)
+      // A usage note for a thread never registered as root or child (no sink either): dropped.
+      .push(tokenUsage({ inputTokens: 9999, outputTokens: 9999, totalTokens: 19998 }, { inputTokens: 9999, outputTokens: 9999, totalTokens: 19998 }, "th-stray", "stn-1"))
+      .push(turnCompleted("completed"))
+      .end();
+
+    const mu = terminalModelUsage(await collect(harness.startTurn(makeRequest()).events));
+    assert.deepEqual(mu, {
+      "gpt-6-astra": { inputTokens: 300, outputTokens: 200, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, reasoningOutputTokens: 0, costStatus: "unreported" },
+    });
+  });
+});
+
+describe("CodexHarness: cost projection from the run auth mode (PRD #1332 C4b / D5)", () => {
+  function terminal(events: HarnessEvent[]): HarnessTerminal {
+    const last = events.at(-1)!;
+    assert.equal(last.kind, "turn_finished");
+    if (last.kind !== "turn_finished") throw new Error("no terminal");
+    return last.terminal;
+  }
+
+  interface WireEntry {
+    costStatus: string;
+    costUSD?: number;
+    inputTokens: number;
+    outputTokens: number;
+  }
+
+  /** The named model's `modelUsage` entry off a terminal, extracted safely (no optional-chain
+   *  indexing) so a missing `modelUsage` fails the assertion rather than throwing. */
+  function entryOf(term: HarnessTerminal, model: string): WireEntry {
+    const wire = term.usage?.wire;
+    const modelUsage = wire?.modelUsage as Record<string, WireEntry> | undefined;
+    assert.ok(modelUsage, "the terminal carries per-model usage");
+    const entry = modelUsage[model];
+    assert.ok(entry, `an entry for ${model}`);
+    return entry;
+  }
+
+  it("an api_key run prices the reconciled response as metered (costUSD) and folds the run cost", async () => {
+    const { harness, transport } = makeHarness({ authMode: "api_key" });
+    transport
+      .push(threadStarted())
+      .push(turnStarted())
+      .push(tokenUsage(
+        { inputTokens: 500, cachedInputTokens: 100, cacheWriteInputTokens: 20, outputTokens: 300, reasoningOutputTokens: 40, totalTokens: 800 },
+        { inputTokens: 500, cachedInputTokens: 100, cacheWriteInputTokens: 20, outputTokens: 300, reasoningOutputTokens: 40, totalTokens: 800 },
+      ))
+      .push(turnCompleted("completed"))
+      .end();
+    const term = terminal(await collect(harness.startTurn(makeRequest()).events));
+    const mu = entryOf(term, "gpt-6-astra");
+    assert.equal(mu.costStatus, "metered");
+    assert.ok(mu.costUSD !== undefined, "a metered entry carries costUSD");
+    // uncached 380: 380*10 + 100*1 + 20*12.5 + 300*50 = 19150 µ$.
+    assert.equal(Math.round(mu.costUSD * 1e6), 19150);
+    // The run-level HarnessCost mirrors it: metered, price_table sourced, same dollars.
+    assert.deepEqual(term.metrics.cost, { kind: "metered", usd: mu.costUSD, source: "price_table" });
+  });
+
+  it("a subscription run marks the entry subscription (no costUSD) and the run cost subscription", async () => {
+    const { harness, transport } = makeHarness({ authMode: "subscription" });
+    transport
+      .push(threadStarted())
+      .push(turnStarted())
+      .push(tokenUsage({ inputTokens: 300, outputTokens: 200, totalTokens: 500 }, { inputTokens: 300, outputTokens: 200, totalTokens: 500 }))
+      .push(turnCompleted("completed"))
+      .end();
+    const term = terminal(await collect(harness.startTurn(makeRequest()).events));
+    const mu = entryOf(term, "gpt-6-astra");
+    assert.equal(mu.costStatus, "subscription");
+    assert.ok(!("costUSD" in mu));
+    assert.deepEqual(term.metrics.cost, { kind: "subscription" });
+  });
+
+  it("an api_key run with an unreconciled gap keeps tokens but reports the run cost unreported", async () => {
+    const { harness, transport } = makeHarness({ authMode: "api_key" });
+    transport
+      .push(threadStarted())
+      .push(turnStarted())
+      .push(tokenUsage({ inputTokens: 100, outputTokens: 60, totalTokens: 160 }, { inputTokens: 100, outputTokens: 60, totalTokens: 160 }))
+      // A jump the observed responses cannot account for (a dropped intermediate note).
+      .push(tokenUsage({ inputTokens: 700, outputTokens: 500, totalTokens: 1200 }, { inputTokens: 400, outputTokens: 300, totalTokens: 700 }))
+      .push(turnCompleted("completed"))
+      .end();
+    const term = terminal(await collect(harness.startTurn(makeRequest()).events));
+    const mu = entryOf(term, "gpt-6-astra");
+    assert.equal(mu.costStatus, "unreported");
+    assert.ok(!("costUSD" in mu));
+    // Tokens retained from the cumulative delta.
+    assert.equal(mu.inputTokens, 700);
+    assert.equal(mu.outputTokens, 500);
+    assert.deepEqual(term.metrics.cost, { kind: "unreported" });
   });
 });
 
