@@ -288,6 +288,33 @@ function signalDone(threadId = "th-1", turnId = "tn-1", requestId = 700, callId 
   return toolCall(requestId, "signal_done", {}, threadId, turnId, callId);
 }
 
+/** A pre-decoded per-thread token-usage note (PRD #1332 C4a) as the transport would surface it.
+ *  `last` defaults to `total` (a single-response leg). Used to drive the executor→accountant
+ *  wiring end-to-end; the raw-wire DECODE of this method is guarded in codex-transport.test.ts. */
+function tokenUsageUpdated(
+  threadId: string,
+  turnId: string,
+  total: Partial<Record<"inputTokens" | "cachedInputTokens" | "cacheWriteInputTokens" | "outputTokens" | "reasoningOutputTokens" | "totalTokens", number>>,
+  last: typeof total = total,
+): CodexNotification {
+  const bd = (o: typeof total): {
+    inputTokens: number; cachedInputTokens: number; cacheWriteInputTokens: number;
+    outputTokens: number; reasoningOutputTokens: number; totalTokens: number;
+  } => ({
+    inputTokens: 0, cachedInputTokens: 0, cacheWriteInputTokens: 0,
+    outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0, ...o,
+  });
+  const usage = { total: bd(total), last: bd(last) };
+  return {
+    kind: "token_usage_updated",
+    method: "thread/tokenUsage/updated",
+    threadId,
+    turnId,
+    usage,
+    params: { threadId, turnId, tokenUsage: usage },
+  };
+}
+
 // --- binding + client + context builders ---------------------------------------
 function bindingOf(codex: Record<string, unknown>): CodexBinding {
   const selection = selectCodexBinding({ codex });
@@ -1138,7 +1165,60 @@ describe("CodexExecutor: child-thread delegation demux (part C)", () => {
     assert.equal(rig.transport.turnStartCount, 2, "the child turn ran on the same transport");
     assert.equal(replyOf1(rig).success, true, "the parent spawn_agent callback succeeded after the child settled");
   });
+
+  it("(C4a) a child's token_usage_updated flows through the REAL delegation flow and is charged to the CHILD's configured model, not the root's", async () => {
+    // The executor→accountant wiring seam: startChildTurn calls harness.recordChildThreadModel
+    // (codex-executor.ts) so a child thread is REGISTERED with the model it was spawned on. If
+    // that call is deleted, the child thread stays unregistered, record() drops its usage note as
+    // an unknown thread, and the child entry vanishes from terminal.usage.wire.modelUsage — a
+    // regression the 133 existing executor/harness/delegation tests all miss. This pins it.
+    const responder: Responder = (c) => {
+      if (c.method === "thread/start") return { thread: { id: c.threadStartCount === 1 ? "th-1" : "th-child" } };
+      if (c.method === "turn/start") {
+        if (c.turnStartCount === 1) return { turn: { id: "tn-1" } };
+        // The CHILD turn: a per-thread token-usage note (charged to th-child) then the terminal.
+        c.transport
+          .push(tokenUsageUpdated("th-child", "tn-child", { inputTokens: 200, outputTokens: 100, totalTokens: 300 }))
+          .push(turnCompleted("completed", "th-child", "tn-child"));
+        return { turn: { id: "tn-child" } };
+      }
+      if (c.method === "turn/interrupt") return {};
+      return {};
+    };
+    const rig = makeRig({ responder });
+    rig.transport.push(threadStarted()).push(toolCall(1, "spawn_agent", { role: "coder", prompt: "help" }, "th-1", "tn-1", "c-root"));
+
+    // The coder subagent is configured with a DISTINCT valid contract model from the root
+    // (root = provider.model = "gpt-6-astra"); its usage must be charged to "gpt-5.6-sol".
+    const childModelAgents: AgentTemplate[] = [
+      { name: "lead", description: "the lead", prompt_body: "lead body", tools: null, skills: [] },
+      { name: "coder", description: "a coder", prompt_body: "coder body", model: "gpt-5.6-sol", tools: null, skills: [] },
+    ];
+    const { ctx, emitted } = makeCtx({ agents: childModelAgents });
+    const runP = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    await waitFor(() => rig.transport.responses.some((r) => r.requestId === 1), "parent spawn_agent reply");
+    rig.transport.push(signalDone("th-1", "tn-1")).push(turnCompleted("completed", "th-1", "tn-1")).end();
+    await withTimeout(runP, 3000, "child-usage delegation run");
+
+    const modelUsage = lastResultModelUsage(emitted);
+    assert.ok(modelUsage, "the terminal carries per-model usage");
+    assert.deepEqual(Object.keys(modelUsage), ["gpt-5.6-sol"], "the child usage is charged to its own model, never the root's or dropped");
+    const child = rec(modelUsage["gpt-5.6-sol"]);
+    assert.equal(child.inputTokens, 200, "the child's uncached input rode through the accountant");
+    assert.equal(child.outputTokens, 100, "the child's output rode through the accountant");
+    assert.equal(child.costStatus, "unreported", "C4a prices nothing");
+  });
 });
+
+/** The `modelUsage` map of the LAST result status/error message the reducer emitted, or
+ *  undefined when none carried one (so a dropped/absent per-model fold is observable). */
+function lastResultModelUsage(emitted: EmittedMessage[]): Record<string, unknown> | undefined {
+  const results = emitted.filter((m) => rec(m.payload).event === "result");
+  const last = results[results.length - 1];
+  if (last === undefined) return undefined;
+  const modelUsage = rec(last.payload).modelUsage;
+  return modelUsage === undefined ? undefined : (modelUsage as Record<string, unknown>);
+}
 
 /** The success flag of the reply the transport was told to send for requestId 1. */
 function replyOf1(rig: Rig): { success?: boolean } {

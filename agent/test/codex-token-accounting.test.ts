@@ -112,6 +112,21 @@ describe("CodexUsageAccountant: duplicate / out-of-order / missed-update", () =>
     assertEntry(agg[MODEL_ROOT], { input: 500, output: 100, cacheRead: 0, cacheCreation: 0, reasoning: 0 });
   });
 
+  it("an EQUAL-magnitude note with a DIFFERENT bucket composition is REJECTED (strictly exceeds, not >=)", () => {
+    const acct = new CodexUsageAccountant();
+    acct.registerThread(ROOT, MODEL_ROOT, false);
+    // First note: magnitude = max(500, 300+200) = 500.
+    acct.record(ROOT, usage({ inputTokens: 300, outputTokens: 200, totalTokens: 500 }, { inputTokens: 300, outputTokens: 200, totalTokens: 500 }));
+    // Second note: SAME magnitude (max(500, 100+400) = 500) but buckets reallocated (input↓,
+    // output↑). Adoption is gated on `m > maxMagnitude`, so an EQUAL magnitude must NOT replace
+    // the breakdown; the first note's values are retained. A `>=` gate would wrongly adopt this,
+    // reporting 100/400. This pins the strictly-exceeds boundary no duplicate/redelivery test can.
+    acct.record(ROOT, usage({ inputTokens: 100, outputTokens: 400, totalTokens: 500 }, { inputTokens: 100, outputTokens: 400, totalTokens: 500 }));
+    const agg = acct.aggregateByModel();
+    assert.ok(agg);
+    assertEntry(agg[MODEL_ROOT], { input: 300, output: 200, cacheRead: 0, cacheCreation: 0, reasoning: 0 });
+  });
+
   it("a missed intermediate update is recovered from the later cumulative", () => {
     const acct = new CodexUsageAccountant();
     acct.registerThread(ROOT, MODEL_ROOT, false);
@@ -125,37 +140,42 @@ describe("CodexUsageAccountant: duplicate / out-of-order / missed-update", () =>
   });
 });
 
-describe("CodexUsageAccountant: resumed threads baseline at the pre-resume cumulative", () => {
-  it("charges only post-resume deltas (first note recovers the baseline via total - last)", () => {
+describe("CodexUsageAccountant: resumed threads baseline at the full restored cumulative", () => {
+  it("baselines at the FULL restored `total` so the prior leg's final response is NOT double-counted (real resume shape: initial replay carries a non-zero `last`)", () => {
     const acct = new CodexUsageAccountant();
     acct.registerThread(ROOT, MODEL_ROOT, true); // resumed
-    // First post-resume response: total already carries the prior leg's 400 input / 250 output;
-    // last is this response only. baseline = total - last = { in:400, out:250 }.
+    // REAL resume behavior (pinned app-server token_usage_replay.rs): the FIRST note on resume is
+    // the replayed snapshot of the restored TokenUsageInfo — total = the prior cumulative AND
+    // `last` = the prior leg's FINAL response (NON-ZERO, a subset already in `total`). The baseline
+    // must be the full `total` ({in:500, out:300}); a `total - last` baseline ({in:400, out:250})
+    // would sit below the prior cumulative and re-charge the prior leg's last response.
     acct.record(ROOT, usage({ inputTokens: 500, outputTokens: 300, totalTokens: 800 }, { inputTokens: 100, outputTokens: 50, totalTokens: 150 }));
-    // Second post-resume response.
-    acct.record(ROOT, usage({ inputTokens: 650, outputTokens: 400, totalTokens: 1050 }, { inputTokens: 150, outputTokens: 100, totalTokens: 250 }));
+    // The first genuinely-new response after resume adds {in:200, out:100}.
+    acct.record(ROOT, usage({ inputTokens: 700, outputTokens: 400, totalTokens: 1100 }, { inputTokens: 200, outputTokens: 100, totalTokens: 300 }));
     const agg = acct.aggregateByModel();
     assert.ok(agg);
-    // Only this leg's work: 650-400 input, 400-250 output. The prior 400/250 is NOT re-charged.
-    assertEntry(agg[MODEL_ROOT], { input: 250, output: 150, cacheRead: 0, cacheCreation: 0, reasoning: 0 });
+    // Only this leg's genuinely-new work: 700-500 input, 400-300 output. The old `total - last`
+    // rule would report 300/150 here — double-counting the prior leg's 100/50 last response.
+    assertEntry(agg[MODEL_ROOT], { input: 200, output: 100, cacheRead: 0, cacheCreation: 0, reasoning: 0 });
   });
 
   it("a stale resume replay after the baseline cannot increase usage", () => {
     const acct = new CodexUsageAccountant();
     acct.registerThread(ROOT, MODEL_ROOT, true);
     acct.record(ROOT, usage({ inputTokens: 500, outputTokens: 300, totalTokens: 800 }, { inputTokens: 100, outputTokens: 50, totalTokens: 150 }));
-    acct.record(ROOT, usage({ inputTokens: 650, outputTokens: 400, totalTokens: 1050 }, { inputTokens: 150, outputTokens: 100, totalTokens: 250 }));
+    acct.record(ROOT, usage({ inputTokens: 700, outputTokens: 400, totalTokens: 1100 }, { inputTokens: 200, outputTokens: 100, totalTokens: 300 }));
     // A resume replay redelivers an EARLIER cumulative snapshot — must not increase usage.
     acct.record(ROOT, usage({ inputTokens: 500, outputTokens: 300, totalTokens: 800 }, { inputTokens: 100, outputTokens: 50, totalTokens: 150 }));
     const agg = acct.aggregateByModel();
     assert.ok(agg);
-    assertEntry(agg[MODEL_ROOT], { input: 250, output: 150, cacheRead: 0, cacheCreation: 0, reasoning: 0 });
+    assertEntry(agg[MODEL_ROOT], { input: 200, output: 100, cacheRead: 0, cacheCreation: 0, reasoning: 0 });
   });
 
-  it("a resume that emits an initial snapshot (last = 0) baselines at the current cumulative", () => {
+  it("baselines at `total` irrespective of `last` (a hypothetical last=0 snapshot charges the same)", () => {
     const acct = new CodexUsageAccountant();
     acct.registerThread(ROOT, MODEL_ROOT, true);
-    // Initial resume snapshot: total = prior cumulative, last = 0 → baseline = total.
+    // The resume baseline is the full `total` regardless of `last`, so a last=0 first note (were
+    // one ever emitted) baselines at total = {in:400, out:250} — the same rule as the non-zero case.
     acct.record(ROOT, usage({ inputTokens: 400, outputTokens: 250, totalTokens: 650 }, {}));
     // First new response after resume.
     acct.record(ROOT, usage({ inputTokens: 500, outputTokens: 300, totalTokens: 800 }, { inputTokens: 100, outputTokens: 50, totalTokens: 150 }));

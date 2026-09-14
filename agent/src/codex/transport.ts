@@ -252,15 +252,21 @@ function parseUsageBreakdown(raw: Record<string, unknown> | undefined): CodexUsa
 }
 
 /** Resolve the object carrying the `total`/`last` breakdowns of a `thread/tokenUsage/updated`
- *  frame. The pinned protocol shape is not fixed offline, so this accepts the breakdowns either
- *  directly on `params` OR nested under a `usage` object, and returns whichever holds both
- *  breakdowns. Neither present ⇒ undefined (the caller falls to `activity`, fail-safe). */
+ *  frame. VERIFIED against the pinned 0.153.2 v2 protocol (commit
+ *  `657a993cbee87acf52d14b758ce49dbd46d1b8eb`, `codex-rs/app-server-protocol/src/protocol/v2/
+ *  thread.rs`): the notification payload is `ThreadTokenUsageUpdatedNotification { thread_id,
+ *  turn_id, token_usage: ThreadTokenUsage { total, last, model_context_window } }` under
+ *  `#[serde(rename_all = "camelCase")]` and the adjacently-tagged `ServerNotification`
+ *  (`#[serde(tag = "method", content = "params")]`, `common.rs`), so over the wire the
+ *  breakdowns live under `params.tokenUsage` — the SAME camelCase convention `thread/started`,
+ *  `turn/started` and `turn/completed` params already use in this file. A frame whose
+ *  `tokenUsage` object is absent or lacks either breakdown ⇒ undefined (the caller falls to
+ *  `activity`, fail-safe liveness). */
 function tokenUsageContainer(params: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
   if (params === undefined) return undefined;
-  if (readObjectProp(params, "total") !== undefined && readObjectProp(params, "last") !== undefined) return params;
-  const nested = readObjectProp(params, "usage");
-  if (nested !== undefined && readObjectProp(nested, "total") !== undefined && readObjectProp(nested, "last") !== undefined) {
-    return nested;
+  const container = readObjectProp(params, "tokenUsage");
+  if (container !== undefined && readObjectProp(container, "total") !== undefined && readObjectProp(container, "last") !== undefined) {
+    return container;
   }
   return undefined;
 }

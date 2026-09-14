@@ -12,11 +12,15 @@
 //     Token totals are derived from `total` (dedup/recovery-safe), NEVER by summing `last`.
 //   - Each thread has a STARTING SNAPSHOT (baseline). A FRESH thread (thread/start) starts at
 //     zero, so its whole cumulative is this leg's work and a MISSED intermediate update is
-//     recovered by the later cumulative. A RESUMED thread (thread/resume) baselines at the
-//     pre-resume cumulative, recovered from the first observed note as `total - last` (correct
-//     whether or not resume emits an initial snapshot: initial ⇒ last=0 ⇒ baseline=total;
-//     first-new-response ⇒ baseline=total-last=prior cumulative). Only post-baseline deltas
-//     are charged, so a resumed leg never re-reports the prior leg's usage.
+//     recovered by the later cumulative. A RESUMED thread (thread/resume) baselines at the FULL
+//     restored cumulative (`total`) observed on its FIRST note — NOT `total - last`. The pinned
+//     app-server replays an initial `thread/tokenUsage/updated` on resume whose `last` is the
+//     PRIOR leg's final response (non-zero, a subset already in `total`; verified at commit
+//     657a993… — token_usage_replay.rs + protocol.rs append_last_usage), so a `total - last`
+//     baseline would fall below the prior cumulative and DOUBLE-COUNT that final response on the
+//     next note. Baselining at the full `total` charges only genuinely-new post-resume deltas and
+//     can never inflate (D5). Only post-baseline deltas are charged, so a resumed leg never
+//     re-reports the prior leg's usage.
 //   - A DUPLICATE, STALE or OUT-OF-ORDER note cannot increase usage: a note is adopted only
 //     when its cumulative MAGNITUDE strictly exceeds the running max, and it then replaces the
 //     whole breakdown (so a stale note cannot inflate a single bucket).
@@ -149,15 +153,26 @@ export class CodexUsageAccountant {
   /**
    * Reconcile one `thread/tokenUsage/updated` notification. An UNKNOWN thread is dropped (never
    * attributed to the root). The first note establishes the baseline (zero for a fresh thread,
-   * `total - last` for a resumed one); later notes advance the cumulative max ONLY when strictly
-   * newer, so duplicates/stale/out-of-order notes cannot increase usage.
+   * the full restored cumulative `total` for a resumed one — see the module header on why NOT
+   * `total - last`); later notes advance the cumulative max ONLY when strictly newer, so
+   * duplicates/stale/out-of-order notes cannot increase usage.
    */
   record(threadId: string, usage: CodexThreadTokenUsage): void {
     const acct = this.threads.get(threadId);
     if (acct === undefined) return; // unknown / unregistered thread — never attributed
     const total = toCumulative(usage.total);
     if (acct.maxTotal === undefined) {
-      acct.baseline = acct.resumed ? diffClamp(total, toCumulative(usage.last)) : zeroCumulative();
+      // A RESUMED thread baselines at the FULL restored cumulative (`total`) of its first
+      // observed note — NOT `total - last`. VERIFIED against the pinned app-server (commit
+      // 657a993…): on resume `thread_lifecycle.rs` replays an initial `thread/tokenUsage/updated`
+      // carrying the restored `TokenUsageInfo` (`token_usage_replay.rs`
+      // send_thread_token_usage_update_to_connection), whose `last` is the PRIOR leg's final
+      // response (non-zero — `protocol.rs` append_last_usage sets `last_token_usage = last`), a
+      // subset already counted in `total`. So a `total - last` baseline falls BELOW the prior
+      // cumulative and DOUBLE-COUNTS that final response on the next note. Baselining at the full
+      // `total` charges only genuinely-new post-resume deltas and can never inflate (D5). A fresh
+      // thread starts at zero (its whole cumulative is this leg's work).
+      acct.baseline = acct.resumed ? toCumulative(usage.total) : zeroCumulative();
       acct.maxTotal = total;
       acct.maxMagnitude = magnitude(usage.total);
       return;

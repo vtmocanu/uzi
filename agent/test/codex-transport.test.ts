@@ -153,7 +153,12 @@ describe("codex transport: notification decoding", () => {
     await transport.close();
   });
 
-  it("decodes thread/tokenUsage/updated as a TYPED token_usage_updated notification (PRD #1332 C4a)", async () => {
+  it("decodes a REAL-WIRE thread/tokenUsage/updated frame (breakdowns under params.tokenUsage) as a TYPED token_usage_updated notification (PRD #1332 C4a)", async () => {
+    // This feeds the EXACT pinned wire shape THROUGH the real transport decode path (writeFrame
+    // → decodeNotification), not a pre-decoded note: params = { threadId, turnId, tokenUsage: {
+    // total, last, modelContextWindow } } (commit 657a993…, ThreadTokenUsageUpdatedNotification).
+    // It fails on the pre-fix decoder, which only matched params.total/last or params.usage and
+    // so let the real frame fall through to `activity` — emitting NO modelUsage in production.
     const { inbound, transport } = makePair();
     const notes = transport.notifications();
     writeFrame(inbound, {
@@ -161,9 +166,11 @@ describe("codex transport: notification decoding", () => {
       params: {
         threadId: "th-9",
         turnId: "tn-9",
-        total: { inputTokens: 500, cachedInputTokens: 100, cacheWriteInputTokens: 20, outputTokens: 300, reasoningOutputTokens: 40, totalTokens: 800 },
-        last: { inputTokens: 120, cachedInputTokens: 30, cacheWriteInputTokens: 0, outputTokens: 80, reasoningOutputTokens: 10, totalTokens: 200 },
-        modelContextWindow: 272000,
+        tokenUsage: {
+          total: { inputTokens: 500, cachedInputTokens: 100, cacheWriteInputTokens: 20, outputTokens: 300, reasoningOutputTokens: 40, totalTokens: 800 },
+          last: { inputTokens: 120, cachedInputTokens: 30, cacheWriteInputTokens: 0, outputTokens: 80, reasoningOutputTokens: 10, totalTokens: 200 },
+          modelContextWindow: 272000,
+        },
       },
     });
     const v = (await notes.next()).value as CodexNotification;
@@ -190,9 +197,11 @@ describe("codex transport: notification decoding", () => {
       params: {
         threadId: "th-9",
         turnId: "tn-9",
-        // outputTokens missing; inputTokens hostile (a string); cacheWriteInputTokens negative.
-        total: { inputTokens: "lots", cachedInputTokens: 50, cacheWriteInputTokens: -5, reasoningOutputTokens: 7, totalTokens: 90 },
-        last: { totalTokens: 10 },
+        tokenUsage: {
+          // outputTokens missing; inputTokens hostile (a string); cacheWriteInputTokens negative.
+          total: { inputTokens: "lots", cachedInputTokens: 50, cacheWriteInputTokens: -5, reasoningOutputTokens: 7, totalTokens: 90 },
+          last: { totalTokens: 10 },
+        },
       },
     });
     const v = (await notes.next()).value as CodexNotification;
@@ -209,7 +218,11 @@ describe("codex transport: notification decoding", () => {
     await transport.close();
   });
 
-  it("falls back to a nested `usage` container when total/last are not on params top-level", async () => {
+  it("a frame carrying total/last OUTSIDE params.tokenUsage (a shape the pinned protocol never emits) falls to activity", async () => {
+    // Guards the fix's direction: the pinned protocol nests the breakdowns ONLY under
+    // params.tokenUsage. The old decoder also matched params.total/last (top-level) and a
+    // params.usage object — shapes Codex never emits — so it could mis-decode a foreign frame
+    // as token usage. Both such shapes must now be liveness-only, never a token_usage_updated.
     const { inbound, transport } = makePair();
     const notes = transport.notifications();
     writeFrame(inbound, {
@@ -217,6 +230,9 @@ describe("codex transport: notification decoding", () => {
       params: {
         threadId: "th-9",
         turnId: "tn-9",
+        // Breakdowns on params directly AND under a `usage` object — neither is `tokenUsage`.
+        total: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+        last: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
         usage: {
           total: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
           last: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
@@ -224,11 +240,8 @@ describe("codex transport: notification decoding", () => {
       },
     });
     const v = (await notes.next()).value as CodexNotification;
-    assert.equal(v.kind, "token_usage_updated");
-    if (v.kind === "token_usage_updated") {
-      assert.equal(v.usage.total.inputTokens, 10);
-      assert.equal(v.usage.last.outputTokens, 5);
-    }
+    assert.equal(v.kind, "activity");
+    assert.equal(v.kind === "activity" ? v.method : undefined, "thread/tokenUsage/updated");
     await transport.close();
   });
 
