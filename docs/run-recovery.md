@@ -144,8 +144,9 @@ When that happens, the dashboard shows a full-width alert beneath the page
 heading with your safety-slot use, how many held sources need a decision, how
 many runs are blocked, and a **Review held work** button; if you connected
 Slack, you also get one coalesced direct message per blocked episode (not one
-per run) carrying the same counts and the exact discard command. The
-per-worker **retaining work** pills stay as row context.
+per run) carrying your open-hold and blocked-run counts, a link to the surface,
+and the exact discard command. The per-worker **retaining work** pills stay as
+row context.
 
 The **Workers** settings page is where you resolve them: every retained hold
 is grouped by worker with the run it came from, its claim generation, and a

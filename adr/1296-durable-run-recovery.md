@@ -307,9 +307,11 @@ amendment ships it. Owners can:
 
 CLI: `uzi run recovery <run-id>` (list) and `uzi run discard <run-id> --hold <hold-id> --yes`
 (discard). Both endpoints sit under `RequireUser` (session cookie or `uzc_`/`uza_` Bearer),
-preserving the owner-only-never-viewer authorization above; a foreign owner or read-only admin
-gets a 404. Archive deletion (`DELETE /api/runs/{id}/archives/{captureID}`) stays artifact
-cleanup: with the parent hold still open it does not pretend to resolve custody.
+preserving the owner-only-never-viewer authorization above; the owner-wide list returns only
+the caller's own holds, and the run-scoped discard resolves ownership through `GetRun`, so a
+foreign owner or a read-only admin acting on someone else's run gets a 404. Archive deletion
+(`DELETE /api/runs/{id}/archives/{captureID}`) stays artifact cleanup: with the parent hold
+still open it does not pretend to resolve custody.
 
 **Invariant**: a discard and a racing worker upload lock the hold and its captures in the same
 order, so either discard wins and retry cannot revive it, or upload wins and its available
@@ -318,8 +320,9 @@ archive survives while the exact hold settles safely.
 ### One coalesced owner-level Slack episode (D10)
 
 The redundant per-run custody Slack nudge is suppressed; the admission crossing is coalesced by
-owner into at most one blocked-custody episode DM (facts only — open holds, holds needing a
-decision, blocked runs, a web deep link, and the exact
-`uzi run discard <run-id> --hold <hold-id> --yes` command), respecting the existing
-health-notification enablement and cooldown. The per-run web/CLI custody pill stays as row
+owner into at most one blocked-custody episode DM (facts only — open holds, blocked runs, a web
+deep link, and the exact `uzi run discard <run-id> --hold <hold-id> --yes` command), respecting
+the existing health-notification enablement and cooldown. The decision-needed breakdown is
+surfaced in the web board alert rather than recomputed in the notifier loop, so the DM stays a
+light aggregate read (see the Decision Log). The per-run web/CLI custody pill stays as row
 context. Clearing below the limit closes the episode; a later crossing can notify again.
