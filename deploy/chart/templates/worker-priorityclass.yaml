@@ -6,7 +6,9 @@
   workers.enabled AND workers.priorityClass.enabled. When present, the controller stamps
   its name onto every worker pod's priorityClassName (UZI_WORKER_PRIORITY_CLASS_NAME, wired
   in controller-deployment.yaml), so a busy worker outranks lower-priority pods for kubelet
-  node-pressure eviction and scheduler preemption.
+  node-pressure eviction and for scheduling. preemptionPolicy is PreemptLowerPriority by
+  default (values.yaml), so an unschedulable worker preempts lower-priority pods to get
+  placed; set it to Never to keep eviction survival without scheduling-time preemption.
 
   Disabled (workers.priorityClass.enabled: false) renders NOTHING here and the controller
   gets no env, so worker pods carry no priorityClassName — byte-identical to before this
