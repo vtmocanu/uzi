@@ -50,6 +50,9 @@ export function CustodyBoardAlert({ recoveryWaitCount }: { recoveryWaitCount: nu
   // copy — only make sense when a decision is actually pending. When the alert is visible
   // from admission pressure alone (at the limit or blocked runs with decision_needed == 0),
   // there is nothing to review there, so we render no CTA and non-actionable wait copy.
+  // That wait copy ("all custody slots are in use") is truthful because a non-actionable alert
+  // only shows under admission pressure: custodyAlertView requires blocked_runs > 0 or at-limit
+  // when decision_needed == 0, so it never renders in a below-capacity state.
   const actionable = view.decisionNeeded > 0;
 
   return (

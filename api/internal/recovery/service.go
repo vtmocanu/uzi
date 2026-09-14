@@ -636,9 +636,12 @@ func (s *Service) Discard(ctx context.Context, userID, runID, captureID uuid.UUI
 // BlockedRuns come from the aggregate query (the SAME predicate ClaimRun/health gate on),
 // CustodyHoldLimit from the configured ceiling, and DecisionNeeded is the count of holds whose
 // derived attention awaits an owner decision (needs_action or source_only) — active protection and
-// self-releasing archive_ready rows are excluded (D10). The aggregate stays owner-wide and
-// independent of openOnly (it is computed by a separate query, never from the returned rows), so a
-// filtered list never skews open_holds/decision_needed/blocked_runs. Owner authorization is by
+// self-releasing archive_ready rows are excluded (D10). OpenHolds/BlockedRuns come from the
+// separate owner-wide aggregate query, so they are structurally independent of openOnly.
+// DecisionNeeded is counted over the RETURNED rows, so it can in principle see the filter — but it
+// stays exact under openOnly because every decision-bearing hold (needs_action/source_only) is
+// state='open' (the invariant in the inline comment below), so dropping resolved rows never removes
+// one. Owner authorization is by
 // user_id in every query; the handler additionally gates the owner via RequireUser. Holds is
 // always non-nil so it marshals as [] (never null). No run scope — this is the owner-wide list;
 // the CLI narrows by run.
