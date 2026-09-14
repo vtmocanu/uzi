@@ -95,6 +95,7 @@ func main() {
 		ServiceAccountName:  cfg.WorkerServiceAccount,
 		APIURL:              cfg.WorkerAPIURL,
 		StorageClass:        cfg.WorkerStorageClass,
+		PriorityClassName:   cfg.WorkerPriorityClassName,
 		MaxConcurrentRuns:   cfg.WorkerMaxConcurrentRuns,
 		APICAPEM:            cfg.APICAPEM,
 	}
