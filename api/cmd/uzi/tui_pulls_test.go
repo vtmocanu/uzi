@@ -120,6 +120,45 @@ func TestTUIPullsBandsAndGlyphs(t *testing.T) {
 	}
 }
 
+// (b0) Bug #1337 (Option A): the pulls LIST row drops the structurally-always-empty checks
+// placeholder (`·  —`), which read as broken data next to the review cell. The review cell must
+// stay — it carries real data (approved / changes / draft / the `—` no-decision state). Pinned
+// to this bug: on the pre-fix row the checks placeholder rendered once per row, so asserting
+// zero fails on the old double-placeholder row and passes only after the removal.
+func TestTUIPullsListDropsChecksPlaceholder(t *testing.T) {
+	now := time.Now()
+	pulls := samplePulls(now)
+	// A renovate-style PR with no review decision (not a draft): its review cell is the real
+	// `· —` "no decision yet" state — the second cell in the issue's `· — · —` example, which
+	// must survive when the first (checks) cell goes.
+	pulls = append(pulls, apitypes.PullDTO{
+		IID: 1276, Title: "Update dependency renovate", Author: "renovate",
+		SourceBranch: "renovate/renovate", TargetBranch: "main", ReviewDecision: "",
+		Conflicts: bp(false), WebURL: "https://github.com/vtmocanu/uzi/pull/1276",
+		UpdatedAt: now.Add(-25 * time.Hour)})
+	fake := &uzicli.FakeClient{Repos: []apitypes.RepoDTO{oneRepo()}, PullsResult: pulls}
+	m := loadedPulls(t, fake, pulls)
+
+	frame := stripANSI(m.View().Content)
+
+	// The always-empty checks placeholder (`·` + two spaces + `—`) must be gone from every list
+	// row. It rendered once per row pre-fix; zero is the post-fix invariant.
+	if n := strings.Count(frame, "·  —"); n != 0 {
+		t.Errorf("pulls list still renders the checks placeholder %q %d time(s) — Option A drops the column\n%s", "·  —", n, frame)
+	}
+
+	// The review cell stays: concrete decisions still render...
+	for _, want := range []string{"changes", "approved", "draft"} {
+		if !strings.Contains(frame, want) {
+			t.Errorf("pulls list dropped the review-cell word %q (only the checks column should go)\n%s", want, frame)
+		}
+	}
+	// ...and so does the no-review `· —` decision cell (the surviving half of the `· — · —` pair).
+	if !strings.Contains(frame, "· —") {
+		t.Errorf("pulls list dropped the no-review `· —` review cell\n%s", frame)
+	}
+}
+
 // (c) Under the Ascii profile the glyph + word for each state are still present (not merely
 // "no SGR escapes"): colour is never the only carrier (D8).
 func TestTUIPullsAsciiProfileCarriesGlyphAndWord(t *testing.T) {
