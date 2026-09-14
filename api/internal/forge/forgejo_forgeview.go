@@ -514,6 +514,32 @@ func (f *forgejo) ListWorkflowRuns(ctx context.Context, projectID int64, opts Li
 	return out, nil
 }
 
+// GetWorkflowRun returns one Actions run's header (the neutral WorkflowRun) by its
+// Forgejo run id, for the `ci` drill-in. Mirrors ListWorkflowRuns' client/slug
+// prelude and its 404→ErrForgeVersionUnsupported degrade, and reuses
+// toForgejoWorkflowRun so the mapping stays identical to the list rows.
+func (f *forgejo) GetWorkflowRun(ctx context.Context, projectID, runID int64) (WorkflowRun, error) {
+	c, err := f.newClient(ctx)
+	if err != nil {
+		return WorkflowRun{}, err
+	}
+	slug, err := f.repoSlugFor(c, projectID)
+	if err != nil {
+		return WorkflowRun{}, err
+	}
+	run, resp, err := c.GetRepoActionRun(slug.owner, slug.repo, runID)
+	if err != nil {
+		if resp != nil && resp.StatusCode == http.StatusNotFound {
+			return WorkflowRun{}, fmt.Errorf("forgejo: get workflow run: actions API not available on this server version: %w", ErrForgeVersionUnsupported)
+		}
+		return WorkflowRun{}, f.wrapErr("get workflow run", err)
+	}
+	if run == nil {
+		return WorkflowRun{}, nil
+	}
+	return toForgejoWorkflowRun(run), nil
+}
+
 // toForgejoWorkflowRun maps a gitea Actions run to the neutral WorkflowRun. Forgejo
 // has no separate workflow-name field, so Name is the workflow file Path; Title is
 // the run's display title. The run's Status carries the terminal state (never

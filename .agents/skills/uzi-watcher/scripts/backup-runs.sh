@@ -137,9 +137,14 @@ rm -rf "$OUT"
 '
 
 resolve_pod(){   # $1=worker_id ; prints "ns pod" if found
+  # Only a Running pod is exec-able. A worker roll (release fleet upgrade, node
+  # eviction) leaves the old ReplicaSet's dead pod behind, and it sorts BEFORE the
+  # live one, so a plain `grep -m1` grabs the corpse and every exec fails with
+  # "cannot exec into a container in a completed pod". Filter to Running server-side.
   local wid="$1" ns pod
   for ns in $NAMESPACES; do
-    pod="$("$KUBECTL" --context "$CTX" -n "$ns" get pods -o name 2>/dev/null \
+    pod="$("$KUBECTL" --context "$CTX" -n "$ns" get pods \
+             --field-selector=status.phase=Running -o name 2>/dev/null \
            | grep -m1 "uzi-hw-$wid" | sed 's#pod/##')"
     [ -n "$pod" ] && { printf '%s %s\n' "$ns" "$pod"; return 0; }
   done

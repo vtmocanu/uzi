@@ -20,18 +20,21 @@ import (
 // authorized, enabled-repo read reaches a 200 without a live forge. Only the forge-view
 // reads are overridden; everything else keeps BaseFake's loud default.
 //
-// The three fields make the two forge-view reads controllable per iid without disturbing
-// the default: all are nil in the zero fake, so ListMergeRequestRefs returns the single
-// canned ref and GetMergeRequestSummary returns an OPENED summary with no error — the
-// exact behavior the router-auth subtests below rely on. A non-nil field overrides only
-// that axis: refs the ref list; summaryErr[iid] an error GetMergeRequestSummary returns
-// for that iid (e.g. forge.ErrMergeRequestNotFound); summaryState[iid] the State it
-// reports (default forge.MRStateOpened).
+// The fields make the forge-view reads controllable without disturbing the default: all
+// are nil in the zero fake, so ListMergeRequestRefs returns the single canned ref,
+// GetMergeRequestSummary returns an OPENED summary with no error, and GetWorkflowRun
+// returns a canned OK run — the exact behavior the router-auth subtests below rely on. A
+// non-nil field overrides only that axis: refs the ref list; summaryErr[iid] an error
+// GetMergeRequestSummary returns for that iid (e.g. forge.ErrMergeRequestNotFound);
+// summaryState[iid] the State it reports (default forge.MRStateOpened); a non-nil
+// workflowRunErr overrides GetWorkflowRun with that error, e.g.
+// forge.ErrForgeVersionUnsupported.
 type fakeForgeView struct {
 	forgetest.BaseFake
-	refs         []forge.MergeRequestRef
-	summaryErr   map[int64]error
-	summaryState map[int64]string
+	refs           []forge.MergeRequestRef
+	summaryErr     map[int64]error
+	summaryState   map[int64]string
+	workflowRunErr error
 }
 
 func (f *fakeForgeView) ListMergeRequestRefs(context.Context, int64, forge.ListMergeRequestsOptions) ([]forge.MergeRequestRef, error) {
@@ -66,6 +69,13 @@ func (*fakeForgeView) ListWorkflowRuns(context.Context, int64, forge.ListWorkflo
 
 func (*fakeForgeView) ListPipelineJobs(context.Context, int64, int64) ([]forge.Job, error) {
 	return []forge.Job{{ID: 1, Name: "build", Status: "success"}}, nil
+}
+
+func (f *fakeForgeView) GetWorkflowRun(_ context.Context, _ int64, runID int64) (forge.WorkflowRun, error) {
+	if f.workflowRunErr != nil {
+		return forge.WorkflowRun{}, f.workflowRunErr
+	}
+	return forge.WorkflowRun{ID: runID, Name: "CI", Number: 100, Event: "push", Branch: "main", SHA: "deadbeef", Title: "PRD continuation", Actor: "uzi-bot", Status: "completed", Conclusion: "success"}, nil
 }
 
 // TestForgeViewRoutesAuthLiveDB is the router-level auth + enabled-gate proof for the
@@ -240,6 +250,88 @@ func TestForgeViewRoutesAuthLiveDB(t *testing.T) {
 		rec := bearerReq(router, http.MethodGet, fmt.Sprintf("/api/repos/%s/pulls", repo), uzc)
 		if rec.Code != http.StatusBadGateway {
 			t.Fatalf("Bearer GET pulls with a non-sentinel error = %d, want 502 (only ErrMergeRequestNotFound is skipped)\nbody: %s", rec.Code, rec.Body.String())
+		}
+	})
+}
+
+// TestGetCIRunHeaderLiveDB is the regression proof that the CI-run drill-in route
+// (GET /api/repos/{id}/ci/runs/{run_id}) fills the run HEADER via GetWorkflowRun (PRD
+// #1335), not just id + jobs. Pre-M4 the header scalars were all zero (the TUI rendered
+// `#0 · · ·`); this decodes the body and asserts the fake's non-zero scalars survive to
+// the wire, and that the version-unsupported degrade still answers 200 with the
+// "unsupported" sentence. Each case uses its OWN handler (fresh memo) and fake instance,
+// so the OK case's memoized run never masks the degrade case.
+//
+// Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres.
+func TestGetCIRunHeaderLiveDB(t *testing.T) {
+	t.Run("ok_fills_header", func(t *testing.T) {
+		h, router, pool := cliLiveDB(t)
+		h.forgeFactory = func(string, string, []byte) (forge.Forge, error) { return &fakeForgeView{}, nil }
+
+		owner := cliSeedUser(t, pool, false)
+		uzc := cliMintToken(t, pool, owner, clitoken.ScopeUser)
+		connID := rmSeedConn(t, pool, owner)
+		enabled := rmSeedRepo(t, pool, connID, 1335001, true)
+
+		rec := bearerReq(router, http.MethodGet, fmt.Sprintf("/api/repos/%s/ci/runs/100", enabled), uzc)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("Bearer GET ci run detail = %d, want 200\nbody: %s", rec.Code, rec.Body.String())
+		}
+		var got apitypes.CIRunDetailDTO
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+			t.Fatalf("decode ci run detail body: %v\nbody: %s", err, rec.Body.String())
+		}
+		// The header scalars must be the fake's values (pre-M4 they were all zero).
+		if got.ID != 100 {
+			t.Errorf("ID = %d, want 100 (path runID)", got.ID)
+		}
+		if got.Number != 100 {
+			t.Errorf("Number = %d, want 100", got.Number)
+		}
+		if got.Event != "push" {
+			t.Errorf("Event = %q, want %q", got.Event, "push")
+		}
+		if got.Branch != "main" {
+			t.Errorf("Branch = %q, want %q", got.Branch, "main")
+		}
+		if got.SHA != "deadbeef" {
+			t.Errorf("SHA = %q, want %q", got.SHA, "deadbeef")
+		}
+		if got.Title != "PRD continuation" {
+			t.Errorf("Title = %q, want %q", got.Title, "PRD continuation")
+		}
+		if got.Actor != "uzi-bot" {
+			t.Errorf("Actor = %q, want %q", got.Actor, "uzi-bot")
+		}
+		if got.Unsupported != "" {
+			t.Errorf("Unsupported = %q, want empty on the OK path", got.Unsupported)
+		}
+	})
+
+	// A forge version without the Actions/pipelines API degrades to 200 with the
+	// "unsupported" sentence. A fresh handler + fake (its own memo) so the OK case's
+	// memoized run cannot mask this.
+	t.Run("version_unsupported_degrades_200", func(t *testing.T) {
+		h, router, pool := cliLiveDB(t)
+		h.forgeFactory = func(string, string, []byte) (forge.Forge, error) {
+			return &fakeForgeView{workflowRunErr: forge.ErrForgeVersionUnsupported}, nil
+		}
+
+		owner := cliSeedUser(t, pool, false)
+		uzc := cliMintToken(t, pool, owner, clitoken.ScopeUser)
+		connID := rmSeedConn(t, pool, owner)
+		enabled := rmSeedRepo(t, pool, connID, 1335002, true)
+
+		rec := bearerReq(router, http.MethodGet, fmt.Sprintf("/api/repos/%s/ci/runs/100", enabled), uzc)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("Bearer GET ci run detail (unsupported) = %d, want 200 (honest degrade)\nbody: %s", rec.Code, rec.Body.String())
+		}
+		var got apitypes.CIRunDetailDTO
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+			t.Fatalf("decode ci run detail body: %v\nbody: %s", err, rec.Body.String())
+		}
+		if got.Unsupported == "" {
+			t.Errorf("Unsupported must be non-empty on the version-unsupported degrade path")
 		}
 	})
 }

@@ -1027,10 +1027,10 @@ when only one is enabled), defaulting to the repo of your newest run — and
 A rate-limited forge read draws `~ rate-limited · retry in Ns` in the
 header in place of an error and keeps polling once the wait is over — the
 same per-connection budget `FORGE_INTERACTIVE_RATE_MAX` documents in
-[Configuration](./configuration.md). `esc` backs a drill-in out to the list
-it opened from; `esc` on a list returns to the floor. The run detail view
-above gains its own cross-link into this: `m` opens the PR view for that
-run's merge request, when it has one.
+[Configuration](./configuration.md). `esc` (or `←`) backs a drill-in out
+to the list it opened from; `esc` on a list returns to the floor. The run
+detail view above gains its own cross-link into this: `m` opens the PR view
+for that run's merge request, when it has one.
 
 ### Keybindings
 
@@ -1088,6 +1088,7 @@ tab          switch screens: floor → pulls → ci → floor (pulls, ci)
 1 / 2 / 3    jump straight to floor / pulls / ci
 R            cycle the scoped repo (pulls, ci; hidden with one enabled repo)
 enter / →    open the selected row (pulls → PR view · ci → CI run view)
+←            back out of a drill-in (PR view, CI run view) to its list — the symmetric partner of →
 ↑ / ↓        move the cursor (PR view: over CHECKS · CI run view: over JOBS)
 u            open the PR's linked uzi run (pulls row, PR view; shown only when linked)
 w            rework the linked run (pulls row, PR view; shown only when linked)

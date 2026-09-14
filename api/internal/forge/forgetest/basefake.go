@@ -199,6 +199,11 @@ func (*BaseFake) ListWorkflowRuns(context.Context, int64, forge.ListWorkflowRuns
 	return nil, notStubbed("ListWorkflowRuns")
 }
 
+// GetWorkflowRun implements forge.Forge.
+func (*BaseFake) GetWorkflowRun(context.Context, int64, int64) (forge.WorkflowRun, error) {
+	return forge.WorkflowRun{}, notStubbed("GetWorkflowRun")
+}
+
 // ListMergeRequestReviews implements forge.Forge.
 func (*BaseFake) ListMergeRequestReviews(context.Context, int64, int64) ([]forge.Review, error) {
 	return nil, notStubbed("ListMergeRequestReviews")
