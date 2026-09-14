@@ -89,11 +89,15 @@ func TestFoldHonorsCodexMarkerThroughFakeStore(t *testing.T) {
 	}}
 	svc := New(fs, newBox(t), testParams())
 
-	// Two of these models carry a malformed cost field: codex-badstatus has a non-string
-	// costStatus (`false`) and codex-badcost a non-numeric costUSD (`"lots"`) under a metered
-	// marker. Before m4 decoded costStatus/costUSD as json.RawMessage, EITHER of these would
-	// fail the frame's json.Unmarshal and drop EVERY model's usage; the assertions below prove
-	// the valid siblings STILL persist and each malformed model resolves to unreported/0.
+	// Three of these models carry a malformed/absent cost field: codex-badstatus has a
+	// non-string costStatus (`false`), codex-badcost a non-numeric costUSD (`"lots"`) under a
+	// metered marker, and codex-nullcost a JSON `null` costUSD (the 4-byte literal, NOT an
+	// omitted key) under a metered marker. Before m4 decoded costStatus/costUSD as
+	// json.RawMessage, badstatus/badcost would fail the frame's json.Unmarshal and drop EVERY
+	// model's usage; the null-costUSD case additionally exercises resolveCostUSD's null path —
+	// json.Unmarshal([]byte("null"), &float64) is a no-op leaving 0, so before Fix 1 it resolved
+	// to (0, present=true) and fabricated a metered $0 row. The assertions below prove the valid
+	// siblings STILL persist and each malformed/absent model resolves to unreported/0.
 	msgs := []IncomingMessage{{Seq: 1, Kind: "status", Agent: "lead", Payload: json.RawMessage(`{
 		"event":"result",
 		"modelUsage":{
@@ -101,7 +105,8 @@ func TestFoldHonorsCodexMarkerThroughFakeStore(t *testing.T) {
 			"gpt-5.6-sol":{"inputTokens":1000,"outputTokens":400,"costUSD":0,"costStatus":"subscription"},
 			"codex-missing":{"inputTokens":10,"outputTokens":5,"costUSD":3.33},
 			"codex-badstatus":{"inputTokens":20,"outputTokens":8,"costUSD":1.11,"costStatus":false},
-			"codex-badcost":{"inputTokens":30,"outputTokens":12,"costUSD":"lots","costStatus":"metered"}
+			"codex-badcost":{"inputTokens":30,"outputTokens":12,"costUSD":"lots","costStatus":"metered"},
+			"codex-nullcost":{"inputTokens":40,"outputTokens":16,"costUSD":null,"costStatus":"metered"}
 		}}`)}}
 	if err := svc.AppendMessages(context.Background(), w, fs.runOwned.ID, msgs); err != nil {
 		t.Fatalf("AppendMessages: %v", err)
@@ -132,4 +137,44 @@ func TestFoldHonorsCodexMarkerThroughFakeStore(t *testing.T) {
 	check("codex-missing", costStatusUnreported, 0)   // no marker → unreported, cost zeroed
 	check("codex-badstatus", costStatusUnreported, 0) // non-string costStatus → invalid marker → unreported
 	check("codex-badcost", costStatusUnreported, 0)   // metered marker + non-numeric costUSD → unreported (m5)
+	check("codex-nullcost", costStatusUnreported, 0)  // metered marker + JSON null costUSD → absent → unreported (Fix 1)
+}
+
+// TestResolveCostUSD pins the raw-JSON cost decode, including the JSON `null` path Fix 1
+// closed: a `null` literal is the 4-byte RawMessage `null` (len 4, non-nil), and
+// json.Unmarshal([]byte("null"), &float64) is a no-op that returns nil and leaves the value
+// at 0 — so before Fix 1 it resolved to (0, present=true) and fed deriveUsageCost a fabricated
+// metered $0. It must resolve to (0, present=false) — ABSENT — exactly like an omitted key.
+func TestResolveCostUSD(t *testing.T) {
+	cases := []struct {
+		name        string
+		raw         string // "" means a nil/empty RawMessage
+		wantValue   float64
+		wantPresent bool
+	}{
+		{"empty is absent", "", 0, false},
+		{"json null is absent", "null", 0, false},
+		{"json null with whitespace is absent", " null ", 0, false},
+		{"finite number is present", "5.55", 5.55, true},
+		{"zero is present", "0", 0, true},
+		{"negative finite stays present", "-5.5", -5.5, true}, // deriveUsageCost's <0 guard rejects it
+		{"non-numeric string is absent", `"lots"`, 0, false},
+		{"bool is absent", "false", 0, false},
+		{"object is absent", "{}", 0, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var raw json.RawMessage
+			if c.raw != "" {
+				raw = json.RawMessage(c.raw)
+			}
+			gotValue, gotPresent := resolveCostUSD(raw)
+			if gotPresent != c.wantPresent {
+				t.Fatalf("resolveCostUSD(%q) present = %v, want %v", c.raw, gotPresent, c.wantPresent)
+			}
+			if math.Abs(gotValue-c.wantValue) > 5e-7 {
+				t.Fatalf("resolveCostUSD(%q) value = %v, want %v", c.raw, gotValue, c.wantValue)
+			}
+		})
+	}
 }

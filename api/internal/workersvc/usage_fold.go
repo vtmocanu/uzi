@@ -1,6 +1,7 @@
 package workersvc
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -583,7 +584,8 @@ const (
 )
 
 // costMarkerInvalid is the sentinel resolveCostStatusMarker returns for a costStatus that is
-// PRESENT but not a JSON string (e.g. `false`, `{}`, a number, `null`). It is deliberately NOT
+// PRESENT but not a JSON string (e.g. `false`, `{}`, an array, a number). A JSON `null` is NOT
+// invalid: it is treated as ABSENT (→ "", the same as an omitted key). It is deliberately NOT
 // one of the closed cost-status literals, so deriveUsageCost's switch routes it through the
 // default arm to 'unreported' for Codex — exactly as a missing or unknown marker is — while
 // staying DISTINCT from "" (absent) for a reader or test that wants to tell the two apart. It
@@ -594,9 +596,10 @@ const costMarkerInvalid = "invalid-cost-status-type"
 // (PRD #1332 M5A / m4). Decoding it here, off a json.RawMessage, rather than as a typed struct
 // field is what stops a non-string token on ONE sibling model from failing the whole frame's
 // json.Unmarshal and discarding every other model's usage. The trichotomy:
-//   - ABSENT  — nil/empty RawMessage (the key was omitted: a pre-C4b or Claude frame) → "";
+//   - ABSENT  — nil/empty RawMessage (the key was omitted: a pre-C4b or Claude frame), OR a JSON
+//     `null` literal (json.Unmarshal into a string is a no-op that leaves "") → "";
 //   - VALID   — a JSON string → that string verbatim (deriveUsageCost's closed switch validates it);
-//   - INVALID — present but not a JSON string (false, {}, a number, null) → the costMarkerInvalid
+//   - INVALID — present but not a JSON string (false, {}, an array, a number) → the costMarkerInvalid
 //     sentinel, which deriveUsageCost maps to 'unreported' for Codex.
 func resolveCostStatusMarker(raw json.RawMessage) string {
 	if len(raw) == 0 {
@@ -611,15 +614,22 @@ func resolveCostStatusMarker(raw json.RawMessage) string {
 
 // resolveCostUSD decodes the agent's per-model costUSD from its raw JSON (PRD #1332 M5A / m4),
 // tolerating a non-numeric or non-finite value instead of rejecting the whole frame:
-//   - ABSENT  — nil/empty RawMessage → present=false (amount 0);
+//   - ABSENT  — nil/empty RawMessage, OR a JSON `null` literal → present=false (amount 0);
 //   - VALID   — a finite JSON number → (that value, true);
 //   - INVALID — a non-numeric token (string, bool, object) or a non-finite/out-of-range number
 //     → present=false.
+//
 // deriveUsageCost then treats an absent or invalid amount under a Codex 'metered' marker as
 // 'unreported' (m5), so a metered row never carries a bogus or clamped dollar figure. Claude
 // ignores present and folds numericUSD(amount) as before (an absent amount is 0, unchanged).
 func resolveCostUSD(raw json.RawMessage) (value float64, present bool) {
-	if len(raw) == 0 {
+	// A JSON `null` is the 4-byte literal `null` (len 4, non-nil), and it is ABSENT — not a
+	// metered $0. It MUST short-circuit BEFORE the Unmarshal: json.Unmarshal([]byte("null"),
+	// &float64) is a no-op that returns a nil error and leaves v at 0, so without this it would
+	// resolve to (0, present=true) and let deriveUsageCost fabricate a metered $0 Codex row
+	// (violating D5's "an absent costUSD is unreported, never metered zero"). Mirrors how
+	// resolveCostStatusMarker yields the absent result for a `null` costStatus.
+	if len(raw) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
 		return 0, false
 	}
 	var v float64

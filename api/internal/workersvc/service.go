@@ -2054,8 +2054,9 @@ type resultModelUsage struct {
 	// RAW JSON (m4) — again so a non-string token on one sibling never rejects the frame.
 	// resolveCostStatusMarker collapses the raw token to the absent / invalid / valid
 	// trichotomy:
-	//   - ABSENT  — the key was omitted (nil/empty RawMessage): a pre-C4b or Claude frame → "";
-	//   - INVALID — present but NOT a JSON string (false, {}, a number, null): → the
+	//   - ABSENT  — the key was omitted (nil/empty RawMessage: a pre-C4b or Claude frame), OR a
+	//     JSON `null` literal — a `null` is treated as ABSENT for BOTH costStatus and costUSD → "";
+	//   - INVALID — present but NOT a JSON string (false, {}, an array, a number): → the
 	//     costMarkerInvalid sentinel, which deriveUsageCost routes to 'unreported' for Codex;
 	//   - VALID   — a JSON string: the marker verbatim ("subscription" | "metered" | anything
 	//     else), validated by deriveUsageCost's closed switch, HONORED only for Codex.
