@@ -2032,6 +2032,95 @@ func TestTUIInitStartsStripTicker(t *testing.T) {
 	}
 }
 
+// TestTUIThemeTickRequeriesBackground is the issue #1348 regression guard: the slow theme tick
+// re-issues tea.RequestBackgroundColor (so a LIVE dark↔light switch is detected) AND re-arms
+// itself (so it keeps firing), and its batch makes NO server/API call — the re-query is a
+// terminal OSC-11 probe only.
+func TestTUIThemeTickRequeriesBackground(t *testing.T) {
+	// Shrink the theme cadence so the re-arm (tea.Tick) fires promptly instead of in 4s.
+	orig := themePollInterval
+	themePollInterval = time.Millisecond
+	t.Cleanup(func() { themePollInterval = orig })
+
+	m := tuiTestModel(t, &uzicli.FakeClient{}, "")
+
+	_, cmd := m.Update(themeTickMsg{})
+	if cmd == nil {
+		t.Fatal("themeTickMsg returned no command; a live theme switch would never be detected")
+	}
+	msg := cmd()
+	batch, ok := msg.(tea.BatchMsg)
+	if !ok {
+		t.Fatalf("themeTickMsg command yielded %T, want a tea.BatchMsg", msg)
+	}
+
+	wantBG := reflect.ValueOf(tea.RequestBackgroundColor).Pointer()
+	var sawRequest, sawRearm bool
+	for _, inner := range batch {
+		if inner == nil {
+			continue
+		}
+		// tea.RequestBackgroundColor is a bare Cmd value, matched by pointer — never execute it.
+		if reflect.ValueOf(inner).Pointer() == wantBG {
+			sawRequest = true
+			continue
+		}
+		switch inner().(type) {
+		case themeTickMsg:
+			sawRearm = true
+		case rateLimitsMsg, settingsMsg, boardRunsMsg, secretsMsg:
+			// AC: the theme re-request must not fire any server/API call; it is a terminal query
+			// only. The theme tick's batch is the background re-query + the re-armed tick, nothing
+			// more.
+			t.Errorf("themeTickMsg batch fired a server/API fetch (%T); it must be a terminal query only", inner())
+		}
+	}
+	if !sawRequest {
+		t.Error("the themeTickMsg batch did not re-query the terminal background; a live theme change would go undetected")
+	}
+	if !sawRearm {
+		t.Error("the themeTickMsg batch did not re-arm the theme ticker; it would fire only once")
+	}
+}
+
+// TestTUIInitStartsThemeTicker pins that Init arms the slow theme ticker at startup, so a live
+// dark↔light switch is picked up without a restart (issue #1348).
+func TestTUIInitStartsThemeTicker(t *testing.T) {
+	orig := themePollInterval
+	themePollInterval = time.Millisecond
+	t.Cleanup(func() { themePollInterval = orig })
+	// Walking the Init batch executes every inner Cmd, including stripTickCmd()'s tea.Tick, which
+	// otherwise blocks up to the 60s rateLimitPollInterval; shrink it too so this test matches the
+	// strip ticker test's cadence instead of stalling on the strip's minute boundary.
+	origStrip := rateLimitPollInterval
+	rateLimitPollInterval = time.Millisecond
+	t.Cleanup(func() { rateLimitPollInterval = origStrip })
+
+	m := tuiTestModel(t, &uzicli.FakeClient{}, "")
+	cmd := m.Init()
+	if cmd == nil {
+		t.Fatal("Init returned no command")
+	}
+	msg := cmd()
+	batch, ok := msg.(tea.BatchMsg)
+	if !ok {
+		t.Fatalf("Init command yielded %T, want a tea.BatchMsg", msg)
+	}
+
+	var sawRearm bool
+	for _, inner := range batch {
+		if inner == nil {
+			continue
+		}
+		if _, ok := inner().(themeTickMsg); ok {
+			sawRearm = true
+		}
+	}
+	if !sawRearm {
+		t.Error("Init did not start the theme ticker; a live theme switch would only be seen after a restart")
+	}
+}
+
 // spendUsage is the shared PRD #650 M3 usage fixture: a real-shaped run at $9.55 with a
 // heavily-cached token profile (in 2.4M / out 88.4k / cache 14.2M).
 func spendUsage() *apitypes.UsageDTO {
