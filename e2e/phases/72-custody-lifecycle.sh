@@ -148,12 +148,20 @@ pass "server confirms the block: aggregate.blocked_runs=$BLOCKED (queued code ru
 # to the (real, owned) wedge run — a fixture detail that makes the seeded prior-work hold
 # reachable through the shipped owner API against a real owned run id. Sibling seeds and
 # the owner's baseline holds are untouched.
-HOLD_ID="$(db_psql "UPDATE recovery_custody_holds SET run_id = '$WEDGE_RUN'
-                    WHERE id = (SELECT id FROM recovery_custody_holds
-                                  WHERE user_id = '$ADMIN_ID' AND original_worker_identity = '$SEED_IDENT' AND state = 'open'
-                                  LIMIT 1)
-                    RETURNING id")"
-[ -n "$HOLD_ID" ] || fail "could not attach a seeded hold to the wedge run for discard"
+#
+# NOT `RETURNING id`: db_psql is `psql -tAc … | tr -d '\r\n'`, so psql's command TAG is
+# welded onto the returned row and yields `<uuid>UPDATE 1` — non-empty, passes a bare -n
+# guard, and only breaks the later `uzi run recovery` id match. Same trap the phase-37/39
+# fixtures document. Attach the row without RETURNING, then read the id back with a SELECT
+# (the wedge run_id + seed identity uniquely name the just-attached hold) and assert its SHAPE.
+db_psql "UPDATE recovery_custody_holds SET run_id = '$WEDGE_RUN'
+         WHERE id = (SELECT id FROM recovery_custody_holds
+                       WHERE user_id = '$ADMIN_ID' AND original_worker_identity = '$SEED_IDENT' AND state = 'open'
+                       LIMIT 1)" >/dev/null
+HOLD_ID="$(db_psql "SELECT id FROM recovery_custody_holds
+                      WHERE run_id = '$WEDGE_RUN' AND original_worker_identity = '$SEED_IDENT' AND state = 'open'")"
+printf '%s' "$HOLD_ID" | grep -qE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' \
+  || fail "could not attach a seeded hold to the wedge run for discard (got: '$HOLD_ID')"
 
 # The owner CLI list surface (M5): `uzi run recovery <run-id> --json` narrows the
 # owner-wide holds to this run and must show the exact hold, open, before disposition.
