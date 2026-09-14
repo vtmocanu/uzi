@@ -10,6 +10,7 @@ import type { WorkerStats } from "./protocol.js";
 import { StatsCollector } from "./stats.js";
 import { errMessage, sleep } from "./util.js";
 import { toolchainPreflight, type PreflightResult } from "./toolchain-preflight.js";
+import { CODEX_HARNESS_CAPABILITY } from "./codex/codex-runtime-probe.js";
 
 /**
  * Outbound-only worker loop (a daemon model): register once, heartbeat on
@@ -92,6 +93,19 @@ export class Worker {
         // OUTSIDE required_capabilities and the capability_aware kill-switch, so an old
         // image that omits it can never claim an interlocked run or open a custody hold.
         const protocolCapabilities = ["completion_interlock_v1", "recovery_archive_v1"];
+        // PRD #1332 D3 (M5A / C2): advertise the Codex harness PROTOCOL capability ONLY
+        // after a successful startup runtime probe of the pinned, image-baked Codex
+        // package. main.ts resolved that probe ONCE (like dockerWiring) and stored the
+        // boolean on config; a positive result APPENDS codex_harness_v1, a failed/absent
+        // one leaves the array unchanged so a stripped/corrupt/mismatched/old image keeps
+        // serving Claude. The `?.` degrades safe to "not capable" if the field is somehow
+        // unset — registration must never throw on a config quirk. The server-side
+        // vocabulary admission + placement gate land in a LATER unit; until then the
+        // server silently filters this string (FilterProtocol), which is the intended,
+        // harmless dark state.
+        if (this.config.codexProbe?.capable) {
+          protocolCapabilities.push(CODEX_HARNESS_CAPABILITY);
+        }
         const res = await this.client.register(
           this.config.workerName,
           this.config.workerTemplate,
