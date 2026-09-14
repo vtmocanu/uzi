@@ -459,3 +459,49 @@ func TestEveryPresetRequestsMoreMemoryThanTheMeasuredAgentPeak(t *testing.T) {
 		}
 	}
 }
+
+// The requests-above-peak invariant, RESTORED by issue #1341 and pinned to this bug's
+// seam. Under node memory pressure the kubelet evicts pods whose usage exceeds their
+// REQUEST first, so a request sitting below its size's realistic per-run peak makes hosted
+// workers the first thing evicted — the exact node-memory-pressure eviction issue #1341
+// captured. Measured on the hosted cluster (issue #1341): an `l` worker's writable set
+// peaked at ~7451Mi (≈7.1 GiB) against its old 4Gi request — the captured eviction — with
+// a web-ux median of ~4.5 GiB, while a non-web-ux `m` run peaks ~2.7 GiB. Issue #1341
+// recalibrated every request above its size's measured peak (`l` 8Gi, `m` 4Gi, `s` 2Gi),
+// restoring the invariant.
+//
+// The thresholds are PER SIZE on purpose: a single global 7.1Gi floor would wrongly fail
+// `s` and `m`, which never carry an `l`'s multi-agent web-ux load. Each size is asserted
+// BOTH ways — its owner-approved request value exactly AND that the request clears that
+// size's measured peak — so this fails on the pre-#1341 values (old `l` = 4Gi fails both
+// the ==8Gi and the >7451Mi checks).
+func TestEveryPresetRequestSitsAboveItsSizesMeasuredPeak(t *testing.T) {
+	// size -> {owner-approved request, that size's measured per-run peak from issue #1341}.
+	expected := map[string]struct{ request, peak string }{
+		"s": {request: "2Gi", peak: "676Mi"},  // the measured single-agent SDK peak
+		"m": {request: "4Gi", peak: "2764Mi"}, // ~2.7 GiB, a non-web-ux run's peak
+		"l": {request: "8Gi", peak: "7451Mi"}, // ≈7.1 GiB, the captured eviction figure
+	}
+	if len(sizes) == 0 {
+		t.Fatal("the preset size table is empty; the request assertions below would pass vacuously")
+	}
+	for name, s := range sizes {
+		exp, ok := expected[name]
+		if !ok {
+			t.Errorf("preset %q has no expected request/peak in this test: add its owner-approved "+
+				"request and issue #1341 measured peak here so the invariant stays gated", name)
+			continue
+		}
+		wantRequest := resource.MustParse(exp.request)
+		if s.MemoryRequest.Cmp(wantRequest) != 0 {
+			t.Errorf("preset %q: MemoryRequest = %s, want the owner-approved %s (issue #1341)",
+				name, s.MemoryRequest.String(), wantRequest.String())
+		}
+		peak := resource.MustParse(exp.peak)
+		if s.MemoryRequest.Cmp(peak) <= 0 {
+			t.Errorf("preset %q: MemoryRequest = %s is not above this size's measured per-run peak %s "+
+				"(issue #1341): kubelet evicts pods exceeding their request first, so the worker would be "+
+				"the first evicted under node memory pressure", name, s.MemoryRequest.String(), peak.String())
+		}
+	}
+}
