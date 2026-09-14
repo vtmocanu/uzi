@@ -752,6 +752,13 @@ type Store interface {
 	// CountOnlineWorkersSatisfyingCaps above, and off the hot path for the same reason — it runs
 	// only for an interlocked queued run already past its health threshold.
 	CountOnlineWorkersSatisfyingProtocol(ctx context.Context, userID uuid.UUID) (int64, error)
+	// CountOnlineWorkersSatisfyingCodexHarness backs PRD #1332 M5A's (D3) queued-reason rung: a
+	// CODEX-INDICATING queued run whose owner has NO online worker advertising the 'codex_harness_v1'
+	// protocol capability gets reasonNoCodexCapableWorker — the run's non-bypassable Codex claim
+	// clause can never be satisfied. A per-run lookup like CountOnlineWorkersSatisfyingProtocol
+	// above, and off the hot path for the same reason — it runs only for a Codex-indicating queued
+	// run already past its health threshold.
+	CountOnlineWorkersSatisfyingCodexHarness(ctx context.Context, userID uuid.UUID) (int64, error)
 	// CountOnlineEligibleWorkersForRepo backs PRD #361's queued Docker-allowlist reason:
 	// how many of the caller's online workers fn_worker_can_claim accepts for this repo/kind,
 	// ignoring availability (free slots AND draining). Since issue #512 M2 it is capability-

@@ -370,6 +370,23 @@ WITH target AS (
       -- stored workers.protocol_capabilities column, passed by the Go caller.
       AND (r.completion_contract_version IS NULL
            OR 'completion_interlock_v1' = ANY($11::text[]))
+      -- PRD #1332 M5A (D3): the NON-BYPASSABLE Codex-harness claim clause, MIRRORING the
+      -- completion-protocol clause directly above. A CODEX-INDICATING run may be claimed ONLY by a
+      -- worker whose SELF-REPORTED protocol_capabilities contain 'codex_harness_v1' (advertised only
+      -- after a successful runtime-receipt probe); a NON-Codex run is unaffected. "Codex-indicating"
+      -- checks ALL THREE binding facts — harness='codex' OR codex_material_revision IS NOT NULL OR
+      -- codex_secret_id IS NOT NULL — so the gate FAILS CLOSED on inconsistent or legacy data: even
+      -- if C1's coherence CHECK normally implies harness='codex', a row whose harness were somehow
+      -- unset while a binding sentinel survives (e.g. the alias FK nulls codex_secret_id but leaves
+      -- codex_material_revision) is still gated, never silently shipping its Codex credential block to
+      -- an old worker that ignores the unknown JSON and runs Claude. Like the completion clause this is
+      -- a DEDICATED, standalone predicate INTENTIONALLY OUTSIDE fn_worker_can_claim,
+      -- required_capabilities, ClearRunRequiredCapabilities and the @capability_aware kill-switch:
+      -- none of those may authorize a worker that cannot run Codex. Reuses the SAME
+      -- @worker_protocol_caps param the completion clause reads (the claimant's stored
+      -- workers.protocol_capabilities, passed by the Go caller).
+      AND (NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
+           OR 'codex_harness_v1' = ANY($11::text[]))
       -- PRD #529 Decision 4: an ephemeral worker exists to serve exactly one run and
       -- must never take foreign work — otherwise it could hold a non-owning run when
       -- its bound run terminates, blocking the busy-guarded teardown (M4). So an
@@ -429,6 +446,14 @@ WITH target AS (
                 -- the claimant's @worker_protocol_caps above).
                 AND (r.completion_contract_version IS NULL
                      OR 'completion_interlock_v1' = ANY(p.protocol_capabilities))
+                -- PRD #1332 M5A (D3): MIRROR the non-bypassable Codex-harness clause for the peer, or
+                -- fleet-spread could DEFER a CODEX-INDICATING run to an INCAPABLE peer that could never
+                -- claim it (its OWN Codex claim clause above blocks it) — making the run permanently
+                -- unclaimable by being preferred. Same all-three "Codex-indicating" test on r, reading
+                -- the peer's OWN workers.protocol_capabilities column directly (no Go param, unlike the
+                -- claimant's @worker_protocol_caps).
+                AND (NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
+                     OR 'codex_harness_v1' = ANY(p.protocol_capabilities))
                 AND pa.active < p.max_concurrent_runs
                 AND pa.active * (SELECT w.max_concurrent_runs FROM workers w WHERE w.id = $1)
                     < (SELECT count(*) FROM runs mr
@@ -1068,6 +1093,39 @@ type CountOnlineWorkersSatisfyingCapsParams struct {
 // is only ever "who could run THIS if it were free", and a bound worker never could.
 func (q *Queries) CountOnlineWorkersSatisfyingCaps(ctx context.Context, arg CountOnlineWorkersSatisfyingCapsParams) (int64, error) {
 	row := q.db.QueryRow(ctx, countOnlineWorkersSatisfyingCaps, arg.UserID, arg.RequiredCapabilities)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
+const countOnlineWorkersSatisfyingCodexHarness = `-- name: CountOnlineWorkersSatisfyingCodexHarness :one
+SELECT count(*) FROM workers w
+WHERE w.user_id = $1
+  AND w.status = 'online'
+  AND w.draining_since IS NULL
+  AND NOT w.ephemeral
+  AND 'codex_harness_v1' = ANY(w.protocol_capabilities)
+`
+
+// PRD #1332 M5A (D3): how many of a user's ONLINE, non-draining, non-ephemeral workers self-report
+// the 'codex_harness_v1' PROTOCOL capability (workers.protocol_capabilities). This is the
+// Codex-harness analogue of CountOnlineWorkersSatisfyingProtocol: it answers "does the fleet have
+// ANY worker that can execute a Codex run?", NOT "can THIS run be claimed right now?". It drives the
+// queued-reason resolver's Codex-capability rung (reasonNoCodexCapableWorker): a 0 here for a
+// CODEX-INDICATING queued run means every online worker predates the probe/receipt, so the run's
+// NON-BYPASSABLE claim clause (ClaimRun's `'codex_harness_v1' = ANY(@worker_protocol_caps)`) can
+// never be satisfied — a persistent block distinct from the generic wait, an ordinary capability
+// gap, the completion-interlock block, or the docker-allowlist fence.
+//
+// It reads workers.protocol_capabilities DIRECTLY (the server-authoritative FilterProtocol'd
+// column), NOT the effective-caps fold: the Codex harness is a self-reported protocol capability,
+// deliberately OUTSIDE required_capabilities / the docker union / the capability-aware kill-switch
+// (see ClaimRun's dedicated clause). draining_since IS NULL and NOT w.ephemeral mirror
+// CountOnlineWorkersSatisfyingProtocol for the same reasons (a draining worker claims nothing; an
+// ephemeral worker is bound to one run and can never satisfy a different one). Only called for a
+// Codex-indicating queued run already past its health threshold, so it is off the hot path.
+func (q *Queries) CountOnlineWorkersSatisfyingCodexHarness(ctx context.Context, userID uuid.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, countOnlineWorkersSatisfyingCodexHarness, userID)
 	var count int64
 	err := row.Scan(&count)
 	return count, err
@@ -4152,7 +4210,8 @@ SELECT id, user_id, status, auto_approve,
        started_at, last_activity_at, updated_at, status_since,
        health, health_reason, health_since, health_notified_at,
        budget_wall_seconds, budget_paused_seconds, budget_extension_seconds, interactive,
-       repo_id, kind, required_capabilities, completion_contract_version
+       repo_id, kind, required_capabilities, completion_contract_version,
+       harness, codex_material_revision, codex_secret_id
 FROM runs
 WHERE status IN ('queued', 'running', 'awaiting_approval')
   AND kind <> 'chat'
@@ -4179,6 +4238,9 @@ type ListActiveRunsForHealthRow struct {
 	Kind                      string             `json:"kind"`
 	RequiredCapabilities      []string           `json:"required_capabilities"`
 	CompletionContractVersion pgtype.Int4        `json:"completion_contract_version"`
+	Harness                   string             `json:"harness"`
+	CodexMaterialRevision     pgtype.Int8        `json:"codex_material_revision"`
+	CodexSecretID             pgtype.UUID        `json:"codex_secret_id"`
 }
 
 // Run health detector (PRD #47) ----------------------------------------------
@@ -4208,6 +4270,10 @@ type ListActiveRunsForHealthRow struct {
 // PRD #1226 M1: completion_contract_version rides this read so the queued arm can surface a
 // completion-capability reason for an INTERLOCKED run (version non-null) that no online worker
 // implements the completion protocol — the non-bypassable claim clause can never be satisfied.
+// PRD #1332 M5A (D3): harness, codex_material_revision and codex_secret_id ride this read so the
+// queued arm can surface a Codex-capability reason for a CODEX-INDICATING run (any of the three set)
+// that no online worker advertises 'codex_harness_v1' — the non-bypassable Codex claim clause can
+// never be satisfied. The resolver checks all three, mirroring the claim gate's fail-closed test.
 func (q *Queries) ListActiveRunsForHealth(ctx context.Context) ([]ListActiveRunsForHealthRow, error) {
 	rows, err := q.db.Query(ctx, listActiveRunsForHealth)
 	if err != nil {
@@ -4238,6 +4304,9 @@ func (q *Queries) ListActiveRunsForHealth(ctx context.Context) ([]ListActiveRuns
 			&i.Kind,
 			&i.RequiredCapabilities,
 			&i.CompletionContractVersion,
+			&i.Harness,
+			&i.CodexMaterialRevision,
+			&i.CodexSecretID,
 		); err != nil {
 			return nil, err
 		}

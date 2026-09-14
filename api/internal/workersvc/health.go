@@ -131,6 +131,17 @@ const (
 	// regardless of the flag, so the reason reflects the run's actual state (rollout-OFF, no run
 	// is interlocked, so this stays inert).
 	reasonNoCompletionCapableWorker = "no online worker implements the completion interlock (completion_interlock_v1); provision a capable worker"
+	// reasonNoCodexCapableWorker (PRD #1332 M5A, D3) is emitted for a CODEX-INDICATING queued run
+	// (harness='codex', or a surviving M1 binding sentinel) whose owner has NO online worker
+	// advertising the 'codex_harness_v1' protocol capability. Like reasonNoCompletionCapableWorker
+	// it names a NON-BYPASSABLE block: ClaimRun's dedicated Codex clause sits outside
+	// fn_worker_can_claim, required_capabilities, ClearRunRequiredCapabilities and the
+	// capability-aware kill-switch, so a Codex-indicating run in an all-incapable fleet is genuinely
+	// unclaimable until a worker that passed the Codex runtime probe comes online. The prose is the
+	// D3-fixed user-visible text. In M5A only internal test-only Codex rows exist, so this rung is
+	// reachable only for them (no public origin can create a Codex run yet). Maps to the SAME
+	// healthWaitingWorker enum (no migration — runs.health_reason is free text).
+	reasonNoCodexCapableWorker = "no Codex-capable worker is online"
 	// reasonRepoNotDockerAllowed (PRD #361) is the queued reason for a repo-bearing run
 	// that no online worker is eligible to claim because every online worker is a Docker
 	// worker and the repo is not on the Docker-worker allowlist (fn_worker_can_claim,
@@ -605,6 +616,25 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 			slog.Error("health: count online workers satisfying completion protocol", "run_id", r.ID, "error", perr)
 		} else if p == 0 {
 			return reasonNoCompletionCapableWorker
+		}
+	}
+	// PRD #1332 M5A (D3): a CODEX-INDICATING run whose owner has NO online worker advertising the
+	// codex_harness_v1 protocol capability is genuinely UNPLACEABLE — the run's non-bypassable Codex
+	// claim clause (ClaimRun's 'codex_harness_v1' = ANY(worker_protocol_caps)) can never be
+	// satisfied. Placed right after the completion-capability rung and AHEAD of the priority-class
+	// re-label, for the same reason: an actionable "provision a capable worker" block must not be
+	// hidden behind a yield/restored message. The Codex-indicating test mirrors the claim gate's
+	// fail-closed all-three check (harness OR either M1 sentinel), so the pill and the claim can
+	// never disagree. In M5A only internal Codex rows exist, so this fires for them alone. The
+	// per-run Count sits behind the queued-threshold guard in healthTargetFor, so it runs for ~0
+	// runs/tick; a read error falls through to the generic reasons below rather than inventing a
+	// reason on a failed lookup (the conservative degrade the sibling per-run lookups use).
+	if r.Harness == harnessCodex || r.CodexMaterialRevision.Valid || r.CodexSecretID.Valid {
+		c, cerr := s.q.CountOnlineWorkersSatisfyingCodexHarness(ctx, r.UserID)
+		if cerr != nil {
+			slog.Error("health: count online workers satisfying codex harness", "run_id", r.ID, "error", cerr)
+		} else if c == 0 {
+			return reasonNoCodexCapableWorker
 		}
 	}
 	// A queued run the kind-derived priority DEMOTED (PRD #320 D9) is not stuck — it is

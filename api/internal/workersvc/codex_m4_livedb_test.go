@@ -546,10 +546,10 @@ func TestCoordinatedCodexRefreshCancelledMidExchangeRecoverableLiveDB(t *testing
 }
 
 // TestCodexDarkNoCodexOnNormalClaimPathLiveDB (m4 F) proves the dark guarantee: a run created
-// through the ORDINARY (Claude) path carries no Codex binding — codex_secret_id and
-// codex_auth_mode are NULL — so the claim-assembly Codex branch (guarded on
-// run.CodexSecretID.Valid) is skipped, codexClaimSecrets refuses it as not-bound, and the
-// emitted ClaimSecrets JSON carries NO `codex` key (byte-identical to today's wire).
+// through the ORDINARY (Claude) path carries harness='claude' and no Codex binding — codex_secret_id
+// and codex_auth_mode are NULL — so the claim-assembly Codex branch (harness-authoritative since PRD
+// #1332 M5A D3: entered iff run.Harness=='codex') is skipped, codexClaimSecrets refuses it as
+// not-bound, and the emitted ClaimSecrets JSON carries NO `codex` key (byte-identical to today's wire).
 func TestCodexDarkNoCodexOnNormalClaimPathLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	userID, workerID, repoID := env.seedCodexInfra(t)
@@ -573,8 +573,12 @@ func TestCodexDarkNoCodexOnNormalClaimPathLiveDB(t *testing.T) {
 	svc := New(env.q, env.box, testParams())
 	wkr := store.Worker{ID: workerID, UserID: userID}
 
-	// The normal run has NO codex binding frozen.
+	// The normal run has NO codex binding frozen and stays harness='claude' (the assembly branch
+	// is harness-authoritative since PRD #1332 M5A D3, so harness is what keeps it on the Claude path).
 	run := mustRun(t, env, runID)
+	if run.Harness != harnessClaude {
+		t.Fatalf("ordinary run must have harness='claude', got %q", run.Harness)
+	}
 	if run.CodexSecretID.Valid {
 		t.Fatalf("ordinary run must have codex_secret_id NULL, got %v", run.CodexSecretID)
 	}
@@ -588,10 +592,9 @@ func TestCodexDarkNoCodexOnNormalClaimPathLiveDB(t *testing.T) {
 		t.Fatalf("codexClaimSecrets on an unbound run: err = %v, want ErrCodexRunNotBound", err)
 	}
 
-	// Build the REAL claim payload via the production assembly path, exercising the
-	// `run.CodexSecretID.Valid == false` branch (not a hand-built ClaimSecrets), then marshal
-	// its Secrets: an ordinary run leaves ClaimSecrets.Codex nil and omitempty drops the key,
-	// so no `codex` rides the wire.
+	// Build the REAL claim payload via the production assembly path, exercising the ordinary
+	// harness='claude' branch (not a hand-built ClaimSecrets), then marshal its Secrets: an ordinary
+	// run leaves ClaimSecrets.Codex nil and omitempty drops the key, so no `codex` rides the wire.
 	payload, err := svc.assembleClaim(env.ctx, wkr, run)
 	if err != nil {
 		t.Fatalf("assembleClaim: %v", err)

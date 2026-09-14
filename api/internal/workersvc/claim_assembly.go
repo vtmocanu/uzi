@@ -495,13 +495,22 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		},
 	}
 
-	// PRD #1147 M2 (B7), ships DARK: a Codex-bound run (codex_secret_id non-null) also
-	// carries its Codex credential. This branch runs ONLY when the run is Codex-bound;
-	// for an ordinary Claude run (codex_secret_id NULL) it is skipped and the emitted
-	// JSON is byte-identical to today's (ClaimSecrets.Codex stays nil ⇒ no `codex` key).
-	// It mints the per-claim capability (worker-scoped) and opens the usable credential
-	// (subscription access_token or static api_key) — never the refresh/login blob.
-	if run.CodexSecretID.Valid {
+	// PRD #1147 M2 (B7), ships DARK: a Codex run also carries its Codex credential. It mints
+	// the per-claim capability (worker-scoped) and opens the usable credential (subscription
+	// access_token or static api_key) — never the refresh/login blob.
+	//
+	// PRD #1332 M5A (D3): the branch is HARNESS-AUTHORITATIVE — it runs whenever runs.harness is
+	// 'codex', NOT when codex_secret_id happens to be non-null. This is the fail-closed fix for the
+	// deleted-alias case: the alias FK nulls codex_secret_id while leaving harness='codex' (and the
+	// deletion-proof codex_material_revision sentinel), so the OLD `run.CodexSecretID.Valid` guard
+	// would skip the Codex path and assemble a CLAUDE claim carrying an Anthropic token for what is
+	// still a Codex run. Now such a run enters this branch; codexClaimSecrets finds the binding
+	// unavailable/incomplete and returns errCredentialUnavailable (a TERMINAL fail-closed), and the
+	// run NEVER emits a Claude claim or falls back to an Anthropic token. A coherence violation
+	// indicated by either M1 sentinel fails closed the same way. An ordinary Claude run
+	// (harness='claude', no codex fields) skips this entirely and its claim JSON stays
+	// byte-identical to today's (ClaimSecrets.Codex stays nil ⇒ no `codex` key).
+	if run.Harness == harnessCodex {
 		codex, err := s.codexClaimSecrets(ctx, wkr, run)
 		if err != nil {
 			// recoverClaimAssembly handles errVaultLocked (transient requeue) and
