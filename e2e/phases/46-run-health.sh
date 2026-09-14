@@ -56,6 +56,25 @@ done
 [ "$H47_CAP" = 3 ] || fail "worker did not advertise max_concurrent_runs=3 after recreate (got ${H47_CAP:-none})"
 pass "worker back online advertising cap 3 (room for three concurrent health legs)"
 
+# The restart/recreate phases before this one (15/16/27/28/34/35/39/45, plus the agent
+# recreate just above) leave the admin owner holding open recovery custody holds. ClaimRun's
+# custody-admission gate (workersvc/budget.go: custodyHoldLimit=8) refuses a claim once the
+# owner's open holds reach 8, which would wedge the THIRD health run in 'queued' and time out
+# hrun's `wait_status awaiting_approval` — a timeout SWALLOWED by hrun's command substitution,
+# surfacing only as an unattributed non-zero exit. run-health exercises health detection, not
+# recovery, so clear the owner's accumulated cross-phase holds so the gate does not wedge its
+# own claims. The underlying cross-phase accumulation is tracked with the custody-recovery work.
+H47_ADMIN_ID="$(db_psql "SELECT id FROM users WHERE email = '$ADMIN_EMAIL'")"
+[ -n "$H47_ADMIN_ID" ] || fail "run-health: could not resolve the admin owner id for '$ADMIN_EMAIL'"
+# CTE so the TOP-LEVEL statement is a SELECT: a DELETE's command tag would weld onto the count
+# under db_psql's `psql -tA | tr -d '\r\n'` (the phase-37/39/72 trap); a top-level SELECT emits
+# only the tuple.
+H47_CLEARED="$(db_psql "WITH del AS (DELETE FROM recovery_custody_holds
+                                       WHERE user_id = '$H47_ADMIN_ID' AND state = 'open'
+                                       RETURNING 1)
+                        SELECT count(*) FROM del")"
+pass "cleared ${H47_CLEARED:-0} accumulated cross-phase custody hold(s) so the admission gate does not wedge the health claims"
+
 # hrun SENTINEL — create a PRD issue carrying the sentinel, start a run, approve the
 # plan gate, and echo the run id (stdout is only the id: the helpers it calls are
 # silent on success).
