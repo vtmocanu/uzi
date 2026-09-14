@@ -781,6 +781,12 @@ Tracked as GitHub issue vtmocanu/uzi#1265; PRD at `prds/1265-rc-release-train.md
 
 - Releases are cut as release candidates by default; a stable release is promoted from the candidate's own commit; surfaces meant for stable users (the Homebrew formula, the GitHub Release marked latest, the in-app update check) never surface a candidate. [user, #1265]
 
+## Feature #1349 — Recovery custody hardening
+
+Tracked as GitHub issue vtmocanu/uzi#1349; PRD at `prds/1349-recovery-custody-hardening.md`.
+
+- An owner can see retained unpublished committed work, recover an available archive, and explicitly discard one exact held source only after a warning distinguishes recoverable work from a possible only copy. [AI-synced 2026-09-14, #1349]
+
 ## Startup admin seed
 
 - Seed an admin user from env at startup (`UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME`) so the user survives DB wipes.

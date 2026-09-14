@@ -675,9 +675,17 @@ chain in the diagram above, with no intervening `running`.
   transient-recovery park primitive: any
   transient cause can report `recovery_wait` and reuse the same
   preserve→park→promote→reclaim lifecycle, so issue #1088's provider-error
-  classifier can adopt it without a competing mechanism. See
-  [adr/1197-transient-recovery-park.md](adr/1197-transient-recovery-park.md)
-  and [docs/run-recovery-wait.md](docs/run-recovery-wait.md).
+  classifier can adopt it without a competing mechanism. PRD #1349 narrows the
+  routing at the boundary: a positively empty turn whose **final latest-wins
+  rate-limit verdict is `rejected`** (that same attempt hit a hard usage limit
+  and produced no model work) routes to `limit_wait` instead — respecting
+  `wait_on_limit`, so it fails fast rather than cycling here when limit-waiting
+  is off. An earlier `rejected` later followed by `allowed`, or any empty turn
+  from another cause, still parks here. See
+  [adr/1197-transient-recovery-park.md](adr/1197-transient-recovery-park.md),
+  [adr/1296-durable-run-recovery.md](adr/1296-durable-run-recovery.md) (the
+  2026-09-14 PRD #1349 amendment) and
+  [docs/run-recovery-wait.md](docs/run-recovery-wait.md).
 
 - **running ⇄ awaiting_followup** (PRD #517, `uzi handoff --interactive`) — a
   clean `signal_done` on an interactive task parks the run awaiting the
@@ -926,9 +934,25 @@ chain in the diagram above, with no intervening `running`.
   `recovery_wait` transient park above: that mechanism resumes a live,
   still-running turn from a local checkpoint, while this one preserves a
   run's original commits across a `failed` finalization and the worker's
-  eventual teardown. See [docs/run-recovery.md](docs/run-recovery.md),
-  [PRD #1296](prds/1296-durable-run-recovery.md) and
-  [adr/1296-durable-run-recovery.md](adr/1296-durable-run-recovery.md).
+  eventual teardown. A **claim-scoped custody hold** (`recovery_custody_holds`,
+  H-free, opened in the same `ClaimRun` transaction) reserves owner-scoped
+  admission capacity and blocks the worker's teardown while the work is
+  unpublished; the **archive capture** (`recovery_captures`) is the later,
+  immutable, encrypted artifact bound to that hold. PRD #1349 hardens the
+  lifecycle: reserve/release now key on the **exact `runs.claim_generation`**
+  (a v2 worker advertises `recovery_archive_v2`; an ambiguous/older case
+  retains rather than guessing), the agent dispositions custody by exact
+  generation on graceful-park and early-terminal paths (provably-empty →
+  release, committed → generation-bound capture, unverifiable → retain), and
+  owners can list retained holds and discard one exact held source
+  (`GET /api/recovery/holds` + aggregate; `uzi run recovery` /
+  `uzi run discard`; a Dashboard board alert and Workers resolution surface),
+  with the per-run custody Slack nudge coalesced into one owner-level
+  blocked-custody episode DM. See [docs/run-recovery.md](docs/run-recovery.md),
+  [PRD #1296](prds/1296-durable-run-recovery.md),
+  [PRD #1349](prds/1349-recovery-custody-hardening.md) and
+  [adr/1296-durable-run-recovery.md](adr/1296-durable-run-recovery.md) (with
+  its 2026-09-14 PRD #1349 amendment).
 - **Milestone tracker reconciliation** (PRD #122/#265/#390) — a milestone-structured
   `issue` run shows a *reported-complete* tracker (`runs.milestones_completed`,
   monotone union, never "verified"), fed by mid-run `report_progress` and the lead's

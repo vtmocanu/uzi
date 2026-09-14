@@ -184,3 +184,142 @@ not an implicit consequence of either existing one.
   table, silently reopens the exact data-loss class this ADR's decisions close.** Treat
   either change as a regression requiring the same generation-aware, RESTRICT-by-default
   review this PRD went through, not a routine schema edit.
+
+---
+
+## Amendment 2026-09-14 — PRD #1349: generation-exact custody, park/early-terminal capture, causal limit routing, and owner disposition
+
+**Status**: Implemented (PRD #1349 M1-M6 committed on this branch); M7 (integration
+proof and this documentation update) is in progress; M8 (hosted-k8s acceptance and
+release) is maintainer-owned and **not shipped** in this work.
+**Issue**: [vtmocanu/uzi#1349](https://github.com/vtmocanu/uzi/issues/1349)
+**PRD**: [prds/1349-recovery-custody-hardening.md](../prds/1349-recovery-custody-hardening.md) —
+carries the full Decision Log (D1-D12), the milestone breakdown and the verified code anchors.
+
+The decisions above stand unchanged — the two-record model, the two-lifetime FK model, the
+RESTRICT-by-default cascade rules, the AAD binding, and the owner-only-never-viewer
+authorization all carry forward. PRD #1296 made a custody *release* generation-aware in the
+reconciler but left the worker-facing reserve/release paths keyed on `(run_id, worker_id)`,
+released a verified-empty hold only inside finalization capture, and gave an owner no way to
+discharge a capless orphan hold (flagged above as [#1318](https://github.com/vtmocanu/uzi/issues/1318)).
+Hosted acceptance on `v0.83.0-rc.1` exposed those gaps; this amendment records the decisions
+that close them.
+
+### Custody identity is the exact claim generation, end to end (D1)
+
+Reserve, release, no-output disposition, park capture, and retry now key on
+`(run_id, claim_generation)` — the identity this schema chose but did not thread through the
+wire. The server already serialized `claim_generation`; the agent now echoes it in
+`ClaimResponse` and stamps it on every recovery record and custody operation, and every
+run-plus-worker release sweep is replaced by an exact evidence-bound operation.
+
+**Invariant**: a newer same-worker generation can never drop an older generation's only copy.
+The reconciler already had this property (see "Generation-aware, per-hold custody release"
+above); this extends it to the worker's own reserve/release paths, where a completed
+generation-2 claim could previously match and release a still-uncaptured generation-1 hold on
+the same run and worker.
+
+### Mixed fleets advertise v2 and retain on ambiguity (D11)
+
+A recovery-capable worker advertises the additive `recovery_archive_v2` capability alongside
+`recovery_archive_v1` (`api/internal/capability/capability.go`) and names its generation on
+reserve/release. A new server accepting an older (v1) or ambiguous worker resolves custody
+only where exactly one unambiguous current hold exists; anything ambiguous **retains** the
+hold and returns `needs_action` rather than guessing which copy to drop. A v2 worker never
+invokes v2 operations against an older server.
+
+**Invariant**: a missing or ambiguous generation never widens back into run-plus-worker
+matching. Retention — a visible, actionable cost (see PRD #1296's Consequences) — is always
+preferred over a guess that could drop the last copy.
+
+### Release only from per-hold durable evidence, ancestry-checked at disposition time (D2)
+
+One exact hold may leave `open` only after one of: (1) that generation's full head was
+published, (2) an available archive is bound to that hold, (3) the hold's own source-holding
+worker proves no unpublished committed output against freshly fetched forge history, or (4) the
+owner explicitly discards that exact held source. A current generation may settle an *earlier*
+generation only when a settlement-time ancestry check proves the earlier source is contained in
+the durable published/archived head. Tracking/checkpoint adoption supplies a candidate source,
+never lasting proof — a later rebase or amend can break ancestry before publication — so the
+ancestry check runs against the *final* durable head at disposition time. Same-worker identity,
+the same branch, a newer MR, a later generation, or capture absence are never proof of
+continuity, and a default-branch reseed can never supply the earlier source.
+
+### Graceful park and early-terminal disposition (D4)
+
+PRD #1296 released a verified-empty hold only inside finalization capture. A graceful park
+(`recovery_wait`, `limit_wait`, owner pause, shutdown/drain) and an early live-worker
+`failed`/`cancelled` exit both bypassed that boundary, so a provably-empty hold could stay open
+forever. The agent now dispositions custody by exact generation on those paths:
+
+- **provably empty** (a verified fresh-forge comparison shows no unpublished committed output
+  for this generation) → release the exact hold before requeue;
+- **committed work** → pin the exact restore-point head in the authenticated journal, produce a
+  generation-bound bundle, upload through the encrypted archive service, and release only after
+  the ready acknowledgement;
+- **upload or unverifiable** → RETAIN the hold and local source, record `needs_action`, and
+  keep retrying model-free — never fabricate a capture or release to make parking succeed.
+
+The unconditional local pin is credential-free; the credentialed git work (the fresh forge
+fetch, the bundle produce) runs inside the reap-before-credentialed-git boundary, after the
+agent tree is reaped, so a shutdown/pause stays a fast pin-and-retain and the credentialed
+settle never blocks the control transition.
+
+**Invariant**: a hard termination with no usable grace window (hard node-pressure eviction,
+OOM, node loss, force delete) remains outside the guarantee — such custody is retained for
+owner action, never released on a guess. The archive covers only committed Git history
+represented by the verified checkpoint; it is an owner recovery artifact, **not** an automatic
+cross-worker resume source (cross-worker resume still adopts the best-effort
+tracking/checkpoint ref, and may redo work when that ref was unavailable).
+
+### Causal empty-turn → limit routing (D5)
+
+ADR-1197 (referenced above) parks every positively empty SDK turn as `recovery_wait`. That is
+now narrowed: a turn that is *simultaneously* positively empty (`num_turns == 0`, no model
+activity, plan, question, or completion) **and** carries that attempt's final latest-wins
+rate-limit verdict `status == rejected` routes to the existing usage-limit path (`limit_wait`)
+instead. The already-normalized final verdict is threaded from `HarnessTerminal` into
+`TurnResult`; the server stays the authority for reset/type validation, fallback scheduling,
+token selection, and `wait_on_limit` (so with `wait_on_limit=false` the newly recognized limit
+fails fast rather than cycling as recovery).
+
+**Invariant**: cause is never inferred from a token label, headroom, or timing correlation. An
+earlier `rejected` followed by a later `allowed`/`allowed_warning`, a nonempty success, or any
+empty turn without a final same-attempt `rejected` stays on `recovery_wait`. This adds no
+lifetime cap to `recovery_wait` cycles (issue #1197's retry policy is unchanged); it only
+routes the causally-corroborated case.
+
+### Owner disposition surface (D6-D10)
+
+PRD #1296 left a capless orphan hold with no owner self-serve discharge (#1318). This
+amendment ships it. Owners can:
+
+- **list** retained holds: `GET /api/recovery/holds` returns owner-scoped rows plus an
+  aggregate (`open_holds`, `custody_hold_limit`, `decision_needed`, `blocked_runs`); each row
+  carries a server-derived `attention` state, deliberately distinct from its capture state, so
+  a healthy active hold is not presented as an incident (D6);
+- **discard** one exact held source:
+  `DELETE /api/runs/{id}/recovery-holds/{holdID}?confirm=discard` — the confirmation is
+  validated **before any SQL**, ownership is enforced in the mutating SQL as well as the
+  handler's owner-or-404 gate, and the operation marks the hold `discarded`, nulls its live
+  worker/run references, discards its non-ready (preparing/uploading/needs-action) captures,
+  and never touches an available archive or a sibling hold.
+
+CLI: `uzi run recovery <run-id>` (list) and `uzi run discard <run-id> --hold <hold-id> --yes`
+(discard). Both endpoints sit under `RequireUser` (session cookie or `uzc_`/`uza_` Bearer),
+preserving the owner-only-never-viewer authorization above; a foreign owner or read-only admin
+gets a 404. Archive deletion (`DELETE /api/runs/{id}/archives/{captureID}`) stays artifact
+cleanup: with the parent hold still open it does not pretend to resolve custody.
+
+**Invariant**: a discard and a racing worker upload lock the hold and its captures in the same
+order, so either discard wins and retry cannot revive it, or upload wins and its available
+archive survives while the exact hold settles safely.
+
+### One coalesced owner-level Slack episode (D10)
+
+The redundant per-run custody Slack nudge is suppressed; the admission crossing is coalesced by
+owner into at most one blocked-custody episode DM (facts only — open holds, holds needing a
+decision, blocked runs, a web deep link, and the exact
+`uzi run discard <run-id> --hold <hold-id> --yes` command), respecting the existing
+health-notification enablement and cooldown. The per-run web/CLI custody pill stays as row
+context. Clearing below the limit closes the episode; a later crossing can notify again.
