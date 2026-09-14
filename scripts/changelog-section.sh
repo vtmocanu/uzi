@@ -165,9 +165,9 @@ emit_delta() {
     }
     # pass 1: previous RC section -> record every bullet block in seen[]
     FNR == NR {
-      if ($0 ~ /^- /)            { kk = block_key(); if (kk != "") seen[kk] = 1; n = 1; b[1] = $0 }
-      else if ($0 ~ /^#{2,3} /)  { kk = block_key(); if (kk != "") seen[kk] = 1; n = 0 }
-      else if ($0 ~ /^[[:space:]]*$/) { kk = block_key(); if (kk != "") seen[kk] = 1; n = 0 }
+      if ($0 ~ /^- /)                       { kk = block_key(); if (kk != "") seen[kk] = 1; n = 1; b[1] = $0 }
+      else if ($0 ~ /^### / || $0 ~ /^## /) { kk = block_key(); if (kk != "") seen[kk] = 1; n = 0 }
+      else if ($0 ~ /^[[:space:]]*$/)       { kk = block_key(); if (kk != "") seen[kk] = 1; n = 0 }
       else if (n > 0)            { b[++n] = $0 }
       next
     }
@@ -178,7 +178,10 @@ emit_delta() {
       if (n == 0) return
       kk = block_key()
       if (!(kk in seen)) {
-        if (pending != "") { if (emitted) print ""; print pending; pending = ""; emitted = 1 }
+        # Blank before the header when it is not the first output, and a blank
+        # AFTER it, so an emitted subsection reads as the authored loose list
+        # (`### X` / blank / bullets), matching the full-section body exactly.
+        if (pending != "") { if (emitted) print ""; print pending; print ""; pending = ""; emitted = 1 }
         for (i = 1; i <= n; i++) { print b[i]; emitted = 1 }
       }
       n = 0

@@ -229,6 +229,9 @@ EOF
 ## [0.4.0] - 2026-09-20
 ### Added
 - **Feature X** (#401)
+  Adds the X subsystem.
+- **Feature Z** (#403)
+  A stable helper.
 
 ## [0.2.0] - 2026-09-05
 ### Added
@@ -253,7 +256,11 @@ EOF
 ## [0.4.0] - 2026-09-20
 ### Added
 - **Feature X** (#401)
+  Adds the X subsystem, now with caching.
+- **Feature Z** (#403)
+  A stable helper.
 - **Feature Y** (#402)
+  Adds the Y subsystem.
 
 ## [0.2.0] - 2026-09-05
 ### Added
@@ -312,19 +319,32 @@ body="$( cd "$REPO" && bash "$SECTION" body 0.2.0-rc.1 2>&1 )"
 assert_contains "section body reads [0.2.0]" "Feature A" "$body"
 
 echo "=== M1: changelog-section.sh body RC delta (PRD 1265, stable-only accumulation) ==="
-# stable & rc.1 = full section; rc.N>=2 = only its additions since the previous RC;
-# a re-spin with no new bullets says so. Both directions (includes-new/excludes-old)
-# so an always-full-section regression is caught.
+# Two-physical-line bullets (title + indented description), matching the real
+# CHANGELOG shape. rc.1 = full section; rc.2 = only its delta since rc.1: the NEW
+# bullet (Y) and the AMENDED bullet (X, whose description gained a clause), while
+# the UNCHANGED bullet (Z) is dropped. stable = the full accumulated section; a
+# re-spin with no new bullets says so. Both directions, so an always-full-section
+# regression, a dropped continuation line, or a missed amend all fail.
 b_rc1="$( cd "$REPO" && bash "$SECTION" body 0.4.0-rc.1 2>&1 )"
 assert_contains "rc.1 body is the full section (X present)" "Feature X" "$b_rc1"
+assert_contains "rc.1 body is the full section (Z present)" "Feature Z" "$b_rc1"
 b_rc2="$( cd "$REPO" && bash "$SECTION" body 0.4.0-rc.2 2>&1 )"
-assert_contains "rc.2 body includes its own addition (Y)" "Feature Y" "$b_rc2"
+assert_contains "rc.2 body includes its new bullet (Y)" "Feature Y" "$b_rc2"
+assert_contains "rc.2 body surfaces an AMENDED bullet (X's new clause)" "now with caching" "$b_rc2"
 case "$b_rc2" in
-  *"Feature X"*) fail "rc.2 body excludes the unchanged rc.1 bullet (X)" ;;
-  *)             pass "rc.2 body excludes the unchanged rc.1 bullet (X)" ;;
+  *"Feature Z"*) fail "rc.2 body drops the unchanged bullet (Z)" ;;
+  *)             pass "rc.2 body drops the unchanged bullet (Z)" ;;
 esac
+# Structure fidelity: an emitted subsection keeps the blank line after its `### `
+# header (the authored loose list), matching the full-section body.
+if printf '%s\n' "$b_rc2" | awk 'prev == "### Added" && $0 == "" { ok = 1 } { prev = $0 } END { exit ok ? 0 : 1 }'; then
+  pass "rc.2 delta keeps the blank line after a subsection header"
+else
+  fail "rc.2 delta keeps the blank line after a subsection header"
+fi
 b_stable="$( cd "$REPO" && bash "$SECTION" body 0.4.0 2>&1 )"
 assert_contains "stable body accumulates rc.1 (X)" "Feature X" "$b_stable"
+assert_contains "stable body accumulates the unchanged bullet (Z)" "Feature Z" "$b_stable"
 assert_contains "stable body accumulates rc.2 (Y)" "Feature Y" "$b_stable"
 b_rc3="$( cd "$REPO" && bash "$SECTION" body 0.4.0-rc.3 2>&1 )"
 assert_contains "re-spin rc.3 with no new bullets says so" "No changelog changes since v0.4.0-rc.2" "$b_rc3"
