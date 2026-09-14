@@ -81,7 +81,7 @@ import {
   buildSignalMcpServer,
   SIGNAL_SERVER_NAME,
 } from "./signals.js";
-import { classifyLimitEvidence } from "./limit.js";
+import { classifyLimitEvidence, LimitReachedError } from "./limit.js";
 import { PauseNowSignal } from "./steering.js";
 import { buildMemoryServer, MEMORY_SERVER_NAME } from "./memory-tools.js";
 import { buildForgeToolsServer, FORGE_SERVER_NAME } from "./forge-tools.js";
@@ -95,6 +95,7 @@ import { defaultQueryFn } from "./sdk-messages.js";
 import { ClaudeHarness, type ClaudeTurnConfig } from "./claude-harness.js";
 import { RunTurnReducerImpl } from "./harness-reducer.js";
 import type {
+  HarnessRateLimit,
   HarnessTerminal,
   RunTurnReducer,
   RunTurnRequest,
@@ -370,6 +371,13 @@ interface TurnResult {
    *  so callers can distinguish a positively-empty turn (numTurns===0 && !sawModelActivity)
    *  from a genuine "ran but no plan" turn. */
   sawModelActivity?: boolean;
+  /** PRD #1349 M3: THIS turn's FINAL latest-wins rate-limit observation, mirrored from
+   *  ReducedTurnResult (the terminal's `HarnessLimitEvidence.latest`). Per-turn, so it is
+   *  the verdict of the attempt that produced this result, never a stale prior one. Read by
+   *  {@link SdkExecutor.driveTurnWithEmptyRecovery}: a positively-empty turn whose final
+   *  verdict is `rejected` routes to the usage-limit wait path (LimitReachedError) instead
+   *  of the generic recovery_wait park. */
+  rateLimit?: HarnessRateLimit;
 }
 
 /** PRD #88 feed notices for a question that could NOT be put to a human. Both are
@@ -3164,7 +3172,24 @@ export class SdkExecutor implements Executor {
       );
       if (!isPositivelyEmpty(turn)) return turn;
     }
-    // Bounded retries exhausted, still positively empty → escalate to the recovery park.
+    // PRD #1349 M3: bounded retries exhausted, still positively empty. Branch on THIS
+    // (final) attempt's rate-limit verdict:
+    //   - status === "rejected" ⇒ the turn was empty BECAUSE the account is rate-limited.
+    //     Throw the TYPED LimitReachedError so runner.ts routes it to the usage-limit wait
+    //     path (handleLimitReached, which respects `wait_on_limit`), NOT to the endless
+    //     local recovery_wait retry. The reset/type ride verbatim; the SERVER owns
+    //     rate_limit_type validation, reset validation, fallback scheduling and wait_on_limit.
+    //   - anything else (no verdict, allowed/allowed_warning, utilization-only, or a
+    //     rejected-then-allowed latest-wins → allowed) stays the generic recovery park.
+    // This routing keys ONLY on `rejected` and DELIBERATELY does NOT reuse
+    // classifyLimitEvidence's future-reset corroboration (limit.ts): a missing or past
+    // reset must STILL take the limit path here — that gate governs a different decision.
+    if (turn.rateLimit?.status === "rejected") {
+      throw new LimitReachedError({
+        resetsAtMs: turn.rateLimit.resetsAtMs,
+        rateLimitType: turn.rateLimit.window,
+      });
+    }
     throw new TransientRecoveryError();
   }
 

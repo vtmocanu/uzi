@@ -5,6 +5,7 @@ import type {
   HarnessContext,
   HarnessContextHook,
   HarnessEvent,
+  HarnessRateLimit,
 } from "../src/harness.js";
 
 // issue #1197 (D-RC2a): the positively-observed empty-turn evidence the reducer folds
@@ -45,6 +46,24 @@ function terminalNoWire(): HarnessEvent {
       subtype: "success",
       errors: [],
       metrics: { cost: { kind: "unreported" } },
+    },
+  };
+}
+
+/** PRD #1349 M3: a zero-turn success terminal carrying a `limitEvidence.latest` verdict
+ *  (the adapter's final latest-wins RateLimitObserver observation). */
+function terminalWithLimit(latest: HarnessRateLimit | undefined): HarnessEvent {
+  return {
+    kind: "turn_finished",
+    terminal: {
+      outcome: "success",
+      subtype: "success",
+      errors: [],
+      metrics: {
+        cost: { kind: "unreported" },
+        wire: { num_turns: 0, duration_ms: 1, total_cost_usd: 0 },
+      },
+      limitEvidence: { explicitExhaustion: false, latest },
     },
   };
 }
@@ -128,5 +147,41 @@ describe("RunTurnReducer — empty-turn evidence (issue #1197 D-RC2a)", () => {
     const second = r.finish({ kind: "exhausted" }).result;
     assert.strictEqual(second.numTurns, 0);
     assert.ok(!second.sawModelActivity, "sawModelActivity is per-turn, not latched across turns");
+  });
+});
+
+describe("RunTurnReducer — rate-limit verdict carry-through (PRD #1349 M3)", () => {
+  it("carries the terminal's FINAL latest-wins verdict onto result.rateLimit", async () => {
+    const latest: HarnessRateLimit = {
+      status: "rejected",
+      resetsAtMs: 1_800_000_000_000,
+      window: "five_hour",
+    };
+    const result = await reduce([{ kind: "initialized", model: "m" }, terminalWithLimit(latest)]);
+    assert.deepStrictEqual(result.rateLimit, latest, "the verdict flows verbatim from limitEvidence.latest");
+  });
+
+  it("leaves result.rateLimit undefined when the terminal carries no rate-limit evidence", async () => {
+    const result = await reduce([{ kind: "initialized", model: "m" }, terminal(0)]);
+    assert.strictEqual(result.rateLimit, undefined, "no limitEvidence ⇒ no verdict");
+  });
+
+  it("leaves result.rateLimit undefined when limitEvidence carries no `latest` observation", async () => {
+    const result = await reduce([{ kind: "initialized", model: "m" }, terminalWithLimit(undefined)]);
+    assert.strictEqual(result.rateLimit, undefined);
+  });
+
+  it("does not leak a prior turn's `rejected` verdict into a later turn with no verdict", async () => {
+    const r = new RunTurnReducerImpl(noContext);
+    // Turn 1: a rejected verdict on an empty turn.
+    r.beginTurn();
+    await r.accept(terminalWithLimit({ status: "rejected", resetsAtMs: 1_800_000_000_000, window: "five_hour" }));
+    const first = r.finish({ kind: "exhausted" }).result;
+    assert.strictEqual(first.rateLimit?.status, "rejected");
+    // Turn 2: an empty turn with NO rate-limit evidence. The prior verdict must NOT carry.
+    r.beginTurn();
+    await r.accept(terminal(0));
+    const second = r.finish({ kind: "exhausted" }).result;
+    assert.strictEqual(second.rateLimit, undefined, "rateLimit is per-turn, not latched across turns");
   });
 });

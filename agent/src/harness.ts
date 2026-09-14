@@ -409,6 +409,15 @@ export interface ReducedTurnResult extends TurnSignals {
    *  undefined only when the turn streamed no model output at all. Paired with
    *  `numTurns === 0` it is the evidence a turn was positively empty. */
   sawModelActivity?: boolean;
+  /** PRD #1349 M3: THIS turn's FINAL latest-wins rate-limit observation, carried
+   *  through from the terminal's `HarnessLimitEvidence.latest` (built off the
+   *  latest-wins `RateLimitObserver`, so the newest `rate_limit_event` of the turn).
+   *  Undefined when the turn saw no rate-limit frame. Per-turn (cleared each
+   *  `beginTurn`), so a prior turn's verdict never leaks into a later empty turn's
+   *  routing. The empty-turn recovery arm reads `status === "rejected"` to route a
+   *  positively-empty, rate-limited turn to the usage-limit wait path (LimitReachedError)
+   *  rather than the generic recovery_wait park. */
+  rateLimit?: HarnessRateLimit;
 }
 
 export interface TurnReduction {
