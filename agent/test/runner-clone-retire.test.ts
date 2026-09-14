@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
+import net from "node:net";
 import { execFileSync } from "node:child_process";
 import { ForeignCaptureBlockedError, CapturePathMismatchError } from "../src/git.js";
 import { type ExecutorFactory } from "../src/runner.js";
@@ -660,5 +661,334 @@ describe("atomic runner-clone release (#1315) + owner-derived reclaim (#1319)", 
     );
     // The journal is untouched by all three fail-closed classifications.
     assert.deepEqual(readJournal(bare, branch), { runId: ownerRunId, clonePath });
+  });
+});
+
+// issue #1354 — retireRunnerClone's EXDEV fallback. On a docker-lane (dind) worker
+// `/data/runner` (runnerRoot) is a separate emptyDir while `/data/runner-quarantine`
+// (the retire destination) is on the `/data` PVC — DIFFERENT devices — so the step-4
+// `fs.rename(clonePath, holdingDest)` returns EXDEV and the old catch (ENOENT-only)
+// rethrew it, wedging the run in a re-park loop. The fix frees the canonical with an
+// intra-device atomic rename into a scratch parent under runnerRoot (same device, never
+// EXDEV, survives a daemon file-hold), preserving the #1315 invariant that the journaled
+// canonical is freed ONLY by an atomic rename — never a direct recursive rm of residue.
+//
+// These tests faithfully model docker-lane by monkeypatching `fsp.rename` PATH-SELECTIVELY:
+// a rename whose destination is under holdingRoot() (the PVC) throws EXDEV, while the
+// intra-device scratch rename (destination under runnerRoot()) delegates to the real
+// rename. `fsp.cp`/`fsp.rm` stay real unless a specific test needs otherwise. The existing
+// #1315 tests (T4/T5/T6/T7a/T7b/T8) never patch rename, so their same-filesystem renames
+// still succeed and never enter the EXDEV branch.
+describe("retireRunnerClone EXDEV fallback (#1354)", () => {
+  /** Model docker-lane: a rename whose DEST is under the PVC quarantine throws EXDEV, so the
+   *  intra-device scratch rename (dest under runnerRoot) is the only one that can succeed.
+   *  `onScratch`, when given, overrides the scratch rename (dest under `runnerRoot/.retire-`)
+   *  so a test can make ONLY that rename fail. Returns a restore fn to call in a finally. */
+  function stubDockerLaneRename(
+    onScratch?: (from: fs.PathLike, to: fs.PathLike) => Promise<never>,
+  ): () => void {
+    const orig = fsp.rename.bind(fsp);
+    (fsp as { rename: typeof fsp.rename }).rename = (async (from: fs.PathLike, to: fs.PathLike) => {
+      const dest = String(to);
+      if (dest.startsWith(holdingRoot())) {
+        throw Object.assign(new Error("EXDEV: cross-device link not permitted"), { code: "EXDEV" });
+      }
+      if (onScratch && dest.startsWith(path.join(runnerRoot(), ".retire-"))) {
+        return onScratch(from, to);
+      }
+      return orig(from, to);
+    }) as typeof fsp.rename;
+    return () => {
+      (fsp as { rename: typeof fsp.rename }).rename = orig;
+    };
+  }
+
+  const scratchDirs = (): string[] => fs.readdirSync(runnerRoot()).filter((d) => d.startsWith(".retire-"));
+
+  it("T1354-a (discard EXDEV): the atomic rename frees the canonical past a FIFO + socket; no quarantine retained", async () => {
+    const iid = 1470;
+    const ownerRunId = "d1354001-0000-4000-8000-000000000001";
+    const { bare, branch, clonePath } = await seedResidue(iid, ownerRunId, "DISCARD.txt");
+    // A FIFO and a bound UNIX socket inside the clone — fs.cp throws on these, so the fact
+    // the discard path frees the clone anyway proves it never copies (pure atomic rename,
+    // which is exactly what tolerates the git fsmonitor socket on a real docker-lane clone).
+    execFileSync("mkfifo", [path.join(clonePath, "worktree.fifo")]);
+    const server = net.createServer();
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(path.join(clonePath, ".sock"), () => resolve());
+    });
+
+    const restore = stubDockerLaneRename();
+    try {
+      await git.retireRunnerClone(bare, clonePath, branch, ownerRunId, { discard: true });
+    } finally {
+      restore();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+
+    assert.equal(fs.existsSync(clonePath), false, "the canonical is freed by the intra-device atomic rename");
+    assert.equal(readJournal(bare, branch), undefined, "the journal is cleared once the rename frees the canonical");
+    const q = fs.existsSync(holdingRoot()) ? fs.readdirSync(holdingRoot()) : [];
+    assert.equal(q.length, 0, "the discard path retains NO quarantine subtree");
+    assert.equal(scratchDirs().length, 0, "the intra-device scratch parent is disposed out of the lock");
+  });
+
+  it("T1354-b (!discard EXDEV): copy-before-free keeps a symlink-faithful quarantine and skips the FIFO", async () => {
+    const iid = 1471;
+    const ownerRunId = "d1354002-0000-4000-8000-000000000002";
+    const { bare, branch, clonePath } = await seedResidue(iid, ownerRunId, "KEEP.txt");
+    // A symlink pointing OUTSIDE the clone tree, and a FIFO (fs.cp throws on a FIFO, so the
+    // filter must skip it).
+    const outsideTarget = path.join(fx.dataDir, "outside-target.txt");
+    fs.writeFileSync(outsideTarget, "outside\n");
+    fs.symlinkSync(outsideTarget, path.join(clonePath, "outlink"));
+    execFileSync("mkfifo", [path.join(clonePath, "worktree.fifo")]);
+
+    const restore = stubDockerLaneRename();
+    try {
+      await git.retireRunnerClone(bare, clonePath, branch, ownerRunId, { discard: false });
+    } finally {
+      restore();
+    }
+
+    assert.equal(fs.existsSync(clonePath), false, "the canonical is freed after the copy completes");
+    assert.equal(readJournal(bare, branch), undefined, "the journal is cleared");
+    const q = fs.readdirSync(holdingRoot());
+    assert.equal(q.length, 1, "the quarantine subtree is RETAINED (discard:false)");
+    const held = path.join(holdingRoot(), q[0]!);
+    assert.equal(fs.readFileSync(path.join(held, "KEEP.txt"), "utf8"), "owner-only bytes\n", "the tree was copied");
+    const copiedLink = path.join(held, "outlink");
+    assert.equal(fs.lstatSync(copiedLink).isSymbolicLink(), true, "the symlink is copied AS a link, not dereferenced");
+    assert.equal(fs.readlinkSync(copiedLink), outsideTarget, "the symlink target is preserved verbatim");
+    assert.equal(fs.existsSync(path.join(held, "worktree.fifo")), false, "the FIFO is skipped by the filter");
+    assert.equal(scratchDirs().length, 0, "the intra-device scratch parent is disposed out of the lock");
+  });
+
+  // T1354-c — the discriminating partial-rm-then-throw test. The scratch-disposal recursive
+  // rm deletes an inner entry then THROWS, constructed so the top-level scratch dir stays
+  // present. The forbidden mutant (a direct recursive rm of the journaled canonical BEFORE
+  // the journal clear) would, under the same partial failure, leave the canonical
+  // partial/present with a live journal → a permanent capture-guard wedge. Here we assert
+  // that at the moment the rm throws the canonical is ALREADY gone (via the rename) and the
+  // journal ALREADY cleared, that the fault targeted the SCRATCH (never clonePath), and that
+  // a subsequent claim reseeds without any capture-guard error. Each claimant runs on its
+  // OWN seeded fixture: a same-runId claim (Case C, would-be PendingRecoveryCaptureError) and
+  // a different-runId claim (would-be ForeignCaptureBlockedError), for both discard values.
+  async function partialDisposalNoWedge(o: {
+    iid: number;
+    ownerRunId: string;
+    discard: boolean;
+    claimantRunId: string;
+  }): Promise<void> {
+    const { bare, branch, clonePath } = await seedResidue(o.iid, o.ownerRunId, "MARK.txt");
+    let rmFaultTarget: string | undefined;
+    let cloneGoneAtFault: boolean | undefined;
+    let journalClearedAtFault: boolean | undefined;
+
+    const restoreRename = stubDockerLaneRename();
+    const origRm = fsp.rm.bind(fsp);
+    let injected = false;
+    // Intercept the FIRST recursive rm of EITHER the scratch parent OR the canonical: the
+    // correct code only ever recursively rm's the SCRATCH (the canonical was atomically
+    // renamed away), whereas the forbidden mutant (a direct recursive rm of the journaled
+    // canonical before the journal clear) would recursively rm clonePath here. Whatever the
+    // target, delete ONE inner entry then THROW, leaving the top-level dir PRESENT — so the
+    // mutant would leave the canonical partial/present with a live journal.
+    (fsp as { rm: typeof fsp.rm }).rm = (async (p: fs.PathLike, opts?: Parameters<typeof origRm>[1]) => {
+      const target = String(p);
+      const matched = !injected && (target === clonePath || target.startsWith(path.join(runnerRoot(), ".retire-")));
+      if (matched) {
+        injected = true;
+        rmFaultTarget = target;
+        cloneGoneAtFault = !fs.existsSync(clonePath);
+        journalClearedAtFault = readJournal(bare, branch) === undefined;
+        const inner = fs.existsSync(target) ? fs.readdirSync(target) : [];
+        if (inner.length > 0) await origRm(path.join(target, inner[0]!), { recursive: true, force: true });
+        throw Object.assign(new Error("injected recursive-rm partial failure"), { code: "EIO" });
+      }
+      return origRm(p, opts);
+    }) as typeof fsp.rm;
+
+    try {
+      // Disposal is out-of-lock and best-effort (.catch), so retire itself RESOLVES.
+      await git.retireRunnerClone(bare, clonePath, branch, o.ownerRunId, { discard: o.discard });
+    } finally {
+      restoreRename();
+      (fsp as { rm: typeof fsp.rm }).rm = origRm;
+    }
+
+    assert.ok(rmFaultTarget, "the scratch disposal rm was attempted");
+    assert.ok(
+      rmFaultTarget!.startsWith(path.join(runnerRoot(), ".retire-")),
+      "the disposal fault target is the SCRATCH parent",
+    );
+    assert.notEqual(rmFaultTarget, clonePath, "the disposal NEVER recursively rm's the journaled canonical directly");
+    assert.equal(cloneGoneAtFault, true, "at the moment the rm throws, the canonical is ALREADY freed (via the rename)");
+    assert.equal(journalClearedAtFault, true, "at the moment the rm throws, the journal is ALREADY cleared");
+
+    assert.equal(scratchDirs().length, 1, "the partial disposal left the top-level scratch dir present (harmless)");
+    assert.equal(fs.existsSync(clonePath), false, "the canonical remains free after the failed disposal");
+    assert.equal(readJournal(bare, branch), undefined, "the journal remains cleared after the failed disposal");
+    if (!o.discard) {
+      const q = fs.readdirSync(holdingRoot());
+      assert.equal(q.length, 1, "!discard retains the COMPLETE quarantine copy despite the disposal failure");
+      assert.equal(fs.readFileSync(path.join(holdingRoot(), q[0]!, "MARK.txt"), "utf8"), "owner-only bytes\n");
+    }
+
+    // The negative, broadened: the subsequent claim throws NONE of the capture-guard errors.
+    const reseeded = await git
+      .createOrAttachRunnerClone(bare, o.iid, o.claimantRunId)
+      .catch((err: unknown) => assert.fail(`the subsequent claim wedged: ${(err as Error).name}: ${(err as Error).message}`));
+    assert.equal(reseeded.path, clonePath, "the reseed lands cleanly at the now-free canonical");
+    assert.equal(fs.existsSync(clonePath), true, "the reseed recreated the canonical clone");
+  }
+
+  let caseN = 0;
+  for (const discard of [true, false]) {
+    for (const claimant of ["same-run", "different-run"] as const) {
+      caseN++;
+      const n = caseN;
+      it(`T1354-c (discard=${discard}, ${claimant}): a partial scratch-disposal is survivable — no capture-guard wedge`, async () => {
+        const iid = 1471 + n; // 1472..1475
+        const ownerRunId = `d1354c${n}0-0000-4000-8000-000000000003`;
+        const claimantRunId = claimant === "same-run" ? ownerRunId : `d1354c${n}1-0000-4000-8000-000000000004`;
+        await partialDisposalNoWedge({ iid, ownerRunId, discard, claimantRunId });
+      });
+    }
+  }
+
+  for (const discard of [true, false]) {
+    it(`T1354-d (discard=${discard}): a journal-clear failure AFTER the rename leaves no capture-guard wedge`, async () => {
+      const iid = discard ? 1476 : 1477;
+      const ownerRunId = `d1354d${discard ? "1" : "0"}0-0000-4000-8000-000000000006`;
+      const { bare, branch, clonePath } = await seedResidue(iid, ownerRunId, "MARK.txt");
+
+      const restoreRename = stubDockerLaneRename();
+      type RunGit = (cwd: string | undefined, args: string[], pat?: string, scope?: string, username?: string) => Promise<string>;
+      const gitAny = git as unknown as { runGit: RunGit };
+      const origRunGit = gitAny.runGit.bind(git);
+      gitAny.runGit = (async (cwd, args, pat, scope, username) => {
+        // The journal CLEAR is the only config write with an empty value; the --list reads
+        // and markRecoveryCapture (a JSON value) pass through untouched.
+        if (args[0] === "config" && args[3] === "") throw new Error("injected journal-clear failure");
+        return origRunGit(cwd, args, pat, scope, username);
+      }) as RunGit;
+
+      try {
+        await assert.rejects(
+          git.retireRunnerClone(bare, clonePath, branch, ownerRunId, { discard }),
+          /injected journal-clear failure/,
+          "the clear failure surfaces (the rename already freed the canonical)",
+        );
+      } finally {
+        restoreRename();
+        gitAny.runGit = origRunGit;
+      }
+
+      assert.equal(fs.existsSync(clonePath), false, "the canonical is gone: the rename freed it BEFORE the clear failed");
+      assert.deepEqual(
+        readJournal(bare, branch),
+        { runId: ownerRunId, clonePath },
+        "the journal is left STALE by the failed clear, still naming the now-gone canonical",
+      );
+      if (!discard) {
+        const q = fs.readdirSync(holdingRoot());
+        assert.equal(q.length, 1, "the already-complete PVC copy survives the clear failure (copied before the rename)");
+        assert.equal(fs.readFileSync(path.join(holdingRoot(), q[0]!, "MARK.txt"), "utf8"), "owner-only bytes\n");
+      }
+      // The stale journal does NOT wedge the next claim: the guard's lstat→ENOENT (canonical
+      // gone via the rename) lets it reseed despite the uncleared journal.
+      const reseeded = await git.createOrAttachRunnerClone(bare, iid, ownerRunId);
+      assert.equal(reseeded.path, clonePath);
+      assert.equal(fs.existsSync(clonePath), true);
+    });
+  }
+
+  it("T1354-e (!discard EXDEV): a copy failure removes the incomplete quarantine; canonical + journal intact", async () => {
+    const iid = 1478;
+    const ownerRunId = "d1354005-0000-4000-8000-000000000005";
+    const { bare, branch, clonePath } = await seedResidue(iid, ownerRunId, "KEEP.txt");
+    const restoreRename = stubDockerLaneRename();
+    const origCp = fsp.cp.bind(fsp);
+    (fsp as { cp: typeof fsp.cp }).cp = (async () => {
+      throw Object.assign(new Error("injected copy failure"), { code: "EIO" });
+    }) as typeof fsp.cp;
+    try {
+      await assert.rejects(
+        git.retireRunnerClone(bare, clonePath, branch, ownerRunId, { discard: false }),
+        /injected copy failure/,
+      );
+    } finally {
+      restoreRename();
+      (fsp as { cp: typeof fsp.cp }).cp = origCp;
+    }
+    assert.equal(fs.existsSync(clonePath), true, "the canonical is intact (copy-before-free never freed it)");
+    assert.equal(fs.readFileSync(path.join(clonePath, "KEEP.txt"), "utf8"), "owner-only bytes\n");
+    assert.deepEqual(readJournal(bare, branch), { runId: ownerRunId, clonePath }, "the journal is intact");
+    const q = fs.existsSync(holdingRoot()) ? fs.readdirSync(holdingRoot()) : [];
+    assert.equal(q.length, 0, "the incomplete quarantine copy was removed on failure");
+    assert.equal(scratchDirs().length, 0, "no scratch parent is created when the copy fails first");
+  });
+
+  it("T1354-f (!discard EXDEV): a post-copy scratch-rename failure RETAINS the completed quarantine; canonical + journal intact", async () => {
+    const iid = 1479;
+    const ownerRunId = "d1354006-0000-4000-8000-000000000006";
+    const { bare, branch, clonePath } = await seedResidue(iid, ownerRunId, "KEEP.txt");
+    // ONLY the intra-device scratch rename throws a real (non-ENOENT, source-present) error;
+    // the copy into holdingDest completes first via the real fs.cp.
+    const restoreRename = stubDockerLaneRename(async () => {
+      throw Object.assign(new Error("injected scratch rename failure"), { code: "EACCES" });
+    });
+    try {
+      await assert.rejects(
+        git.retireRunnerClone(bare, clonePath, branch, ownerRunId, { discard: false }),
+        /injected scratch rename failure/,
+      );
+    } finally {
+      restoreRename();
+    }
+    assert.equal(fs.existsSync(clonePath), true, "the canonical is intact (the scratch rename failed before freeing it)");
+    assert.equal(fs.readFileSync(path.join(clonePath, "KEEP.txt"), "utf8"), "owner-only bytes\n");
+    assert.deepEqual(readJournal(bare, branch), { runId: ownerRunId, clonePath }, "the journal is intact");
+    const q = fs.readdirSync(holdingRoot());
+    assert.equal(q.length, 1, "the completed PVC copy is RETAINED, never deleted on a rename failure");
+    assert.equal(fs.readFileSync(path.join(holdingRoot(), q[0]!, "KEEP.txt"), "utf8"), "owner-only bytes\n");
+  });
+
+  it("T1354-g: the scratch parent is created EXCLUSIVELY (non-recursive, mode 0700); a pre-planted path fails closed", async () => {
+    const iid = 1480;
+    const ownerRunId = "d1354007-0000-4000-8000-000000000007";
+    const { bare, branch, clonePath } = await seedResidue(iid, ownerRunId, "KEEP.txt");
+    const restoreRename = stubDockerLaneRename();
+    const origMkdir = fsp.mkdir.bind(fsp);
+    let scratchMode: number | undefined;
+    let scratchRecursive: boolean | undefined;
+    (fsp as { mkdir: typeof fsp.mkdir }).mkdir = (async (p: fs.PathLike, opts?: Parameters<typeof origMkdir>[1]) => {
+      if (String(p).startsWith(path.join(runnerRoot(), ".retire-"))) {
+        const o = (typeof opts === "object" && opts !== null ? opts : {}) as { mode?: number; recursive?: boolean };
+        scratchMode = o.mode;
+        scratchRecursive = o.recursive;
+        // Model a pre-planted path / type-surprise: an exclusive (non-recursive) mkdir
+        // throws EEXIST, so the retire fails closed rather than reusing a runner-planted dir.
+        throw Object.assign(new Error("EEXIST: scratch parent already exists"), { code: "EEXIST" });
+      }
+      return origMkdir(p, opts);
+    }) as typeof fsp.mkdir;
+    try {
+      await assert.rejects(
+        git.retireRunnerClone(bare, clonePath, branch, ownerRunId, { discard: true }),
+        /EEXIST/,
+        "a pre-planted scratch parent makes the retire fail closed",
+      );
+    } finally {
+      restoreRename();
+      (fsp as { mkdir: typeof fsp.mkdir }).mkdir = origMkdir;
+    }
+    assert.equal(scratchMode, 0o700, "the scratch parent is created with mode 0700");
+    assert.notEqual(scratchRecursive, true, "the scratch mkdir is NON-recursive (exclusive create — fails closed on EEXIST)");
+    assert.equal(fs.existsSync(clonePath), true, "the canonical is intact after the fail-closed scratch mkdir");
+    assert.equal(fs.readFileSync(path.join(clonePath, "KEEP.txt"), "utf8"), "owner-only bytes\n");
+    assert.deepEqual(readJournal(bare, branch), { runId: ownerRunId, clonePath }, "the journal is intact");
   });
 });
