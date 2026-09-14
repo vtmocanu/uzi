@@ -83,7 +83,9 @@ CAPTURE='
 set -u
 STEM="$1"
 REALMAIN="${2:-}"
-CLONE="/data/runner/'"$REPO_SLUG"'/$STEM"
+# Runner working-clone root. Defaults to the on-pod path; UZI_RUNNER_BASE overrides
+# it (a non-standard runner mount, or a local fake clone under test).
+CLONE="${UZI_RUNNER_BASE:-/data/runner/'"$REPO_SLUG"'}/$STEM"
 [ -d "$CLONE/.git" ] || { echo "NO_CLONE $CLONE" >&2; exit 3; }
 cd "$CLONE" || exit 3
 OUT="$(mktemp -d)"
@@ -101,8 +103,16 @@ elif git rev-parse --verify -q origin/main >/dev/null 2>&1; then
   BASE="origin/main"
 fi
 if [ -n "$BASE" ]; then
-  git bundle create "$OUT/$STEM.bundle" "$BR" --not "$BASE" >/dev/null 2>&1 \
-    || git bundle create "$OUT/$STEM.bundle" "$BR" >/dev/null 2>&1 || :
+  # Only bundle when the branch carries commits the public base does not. With
+  # none (the run has committed nothing beyond main yet — its work is still in the
+  # uncommitted.patch), git refuses an empty bundle and a naive `|| git bundle
+  # create "$BR"` fallback would instead dump the FULL history: tens of MB, every
+  # byte already on the forge and useless for recovery. Skip it — the
+  # uncommitted.patch + untracked capture hold the work and the host logs PART.
+  if [ -n "$(git rev-list "$BASE..$BR" 2>/dev/null | head -n1)" ]; then
+    git bundle create "$OUT/$STEM.bundle" "$BR" --not "$BASE" >/dev/null 2>&1 \
+      || git bundle create "$OUT/$STEM.bundle" "$BR" >/dev/null 2>&1 || :
+  fi
 else
   git bundle create "$OUT/$STEM.bundle" "$BR" >/dev/null 2>&1 || :
 fi
@@ -132,7 +142,11 @@ rm -f "$OUT/.untracked"
   echo "--- git diff --stat HEAD:"
   git diff --stat HEAD 2>/dev/null
 } > "$OUT/$STEM.meta.txt" 2>&1
-tar czf - -C "$OUT" . 2>/dev/null
+# Pipe through gzip -c rather than `tar czf -`: BusyBox/bsdtar pad the gzip stream
+# to a block boundary with trailing NULs, which the host `gzip -t` integrity check
+# rejects as "trailing garbage" and mis-reports as a truncated transfer. gzip -c
+# emits one clean member on every worker tar implementation.
+tar cf - -C "$OUT" . 2>/dev/null | gzip -c
 rm -rf "$OUT"
 '
 
