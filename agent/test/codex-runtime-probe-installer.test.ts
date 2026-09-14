@@ -52,12 +52,20 @@ function lockVal(lockText: string, key: string): string {
   return m[1]!.trim();
 }
 
-/** True only when the POSIX tooling the real installer shells out to is present; else the
- *  suite skips rather than forcing a fragile path (per the task's fallback guidance). */
+/** True only when the tooling the real installer shells out to is present AND behaves with GNU
+ *  semantics; else the suite skips rather than forcing a fragile path (per the task's fallback
+ *  guidance). Beyond mere PRESENCE of bash/tar/sha256sum/stat, this also invokes `stat -c '%a'`:
+ *  install-codex.sh targets Linux and uses GNU `stat -c` (agent/codex/install-codex.sh:214), which
+ *  BSD `stat` (macOS) does NOT accept — a presence-only check passes there and then the real
+ *  installer dies under `set -euo pipefail`, failing every integration assertion. Probing `-c`
+ *  semantics against a portable path (`.`) keeps this true on Linux and makes it false on macOS, so
+ *  the suite skips cleanly instead of erroring. */
 function haveInstallerTooling(): boolean {
-  const r = spawnSync("sh", ["-c", "command -v bash && command -v tar && command -v sha256sum && command -v stat"], {
-    encoding: "utf8",
-  });
+  const r = spawnSync(
+    "sh",
+    ["-c", "command -v bash && command -v tar && command -v sha256sum && command -v stat && stat -c '%a' ."],
+    { encoding: "utf8" },
+  );
   return r.status === 0;
 }
 

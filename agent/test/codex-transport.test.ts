@@ -185,11 +185,19 @@ describe("codex transport: notification decoding", () => {
         inputTokens: 120, cachedInputTokens: 30, cacheWriteInputTokens: 0, outputTokens: 80, reasoningOutputTokens: 10, totalTokens: 200,
       });
       assert.equal(v.usage.modelContextWindow, 272000);
+      // m3 (CodeRabbit 4004800884): every priced bucket is a valid finite number ⇒ complete.
+      assert.equal(v.usage.pricingEvidenceComplete, true, "a fully well-formed frame is pricing-complete");
     }
     await transport.close();
   });
 
-  it("coerces a partial/absent breakdown field to 0 and drops a non-numeric one", async () => {
+  it("RETAINS token totals for a present-but-malformed priced bucket but flags the frame pricing-incomplete (m3, CodeRabbit 4004800884)", async () => {
+    // Pre-m3 this test pinned pure coerce-and-accept. Post-m3 the token totals are STILL coerced and
+    // retained (token retention must never regress), but a PRESENT-but-malformed pricing-required
+    // bucket in `total` (inputTokens hostile string, cacheWriteInputTokens negative) marks the frame
+    // pricingEvidenceComplete=false so the accountant can fail cost closed. `last` here carries only
+    // totalTokens (no priced bucket PRESENT), so `last` alone is lenient — the `total` malformation
+    // is what drives the flag.
     const { inbound, transport } = makePair();
     const notes = transport.notifications();
     writeFrame(inbound, {
@@ -198,7 +206,8 @@ describe("codex transport: notification decoding", () => {
         threadId: "th-9",
         turnId: "tn-9",
         tokenUsage: {
-          // outputTokens missing; inputTokens hostile (a string); cacheWriteInputTokens negative.
+          // outputTokens ABSENT (lenient); inputTokens hostile (a string, malformed);
+          // cacheWriteInputTokens negative (malformed).
           total: { inputTokens: "lots", cachedInputTokens: 50, cacheWriteInputTokens: -5, reasoningOutputTokens: 7, totalTokens: 90 },
           last: { totalTokens: 10 },
         },
@@ -207,6 +216,7 @@ describe("codex transport: notification decoding", () => {
     const v = (await notes.next()).value as CodexNotification;
     assert.equal(v.kind, "token_usage_updated");
     if (v.kind === "token_usage_updated") {
+      // Token retention is UNCHANGED — the malformed/absent fields still coerce to 0.
       assert.deepEqual(v.usage.total, {
         inputTokens: 0, cachedInputTokens: 50, cacheWriteInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 7, totalTokens: 90,
       });
@@ -214,6 +224,65 @@ describe("codex transport: notification decoding", () => {
         inputTokens: 0, cachedInputTokens: 0, cacheWriteInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 10,
       });
       assert.equal(v.usage.modelContextWindow, undefined);
+      // The NEW fail-closed pricing signal: a present-but-malformed priced bucket ⇒ incomplete.
+      assert.equal(v.usage.pricingEvidenceComplete, false, "a present-but-malformed priced bucket flags the frame pricing-incomplete");
+    }
+    await transport.close();
+  });
+
+  it("flags pricing-incomplete when the malformation is in `last` while `total` is clean (m3)", async () => {
+    // The other half of the CodeRabbit-4004800884 bug: `total` is well-formed (the charged delta is
+    // fine) but `last` — the per-response pricing basis — carries a present-but-malformed priced
+    // bucket. The frame must decode and retain tokens, but be flagged pricing-incomplete.
+    const { inbound, transport } = makePair();
+    const notes = transport.notifications();
+    writeFrame(inbound, {
+      method: "thread/tokenUsage/updated",
+      params: {
+        threadId: "th-9",
+        turnId: "tn-9",
+        tokenUsage: {
+          total: { inputTokens: 500, cachedInputTokens: 100, cacheWriteInputTokens: 20, outputTokens: 300, reasoningOutputTokens: 40, totalTokens: 800 },
+          // outputTokens present-but-malformed (NaN over the wire arrives as a hostile value).
+          last: { inputTokens: 120, cachedInputTokens: 30, cacheWriteInputTokens: 0, outputTokens: "eighty", reasoningOutputTokens: 10, totalTokens: 200 },
+        },
+      },
+    });
+    const v = (await notes.next()).value as CodexNotification;
+    assert.equal(v.kind, "token_usage_updated");
+    if (v.kind === "token_usage_updated") {
+      // `total` is intact; `last.outputTokens` coerced to 0 but the frame is flagged incomplete.
+      assert.deepEqual(v.usage.total, {
+        inputTokens: 500, cachedInputTokens: 100, cacheWriteInputTokens: 20, outputTokens: 300, reasoningOutputTokens: 40, totalTokens: 800,
+      });
+      assert.equal(v.usage.last.outputTokens, 0, "the malformed last.outputTokens still coerces to 0 (tokens retained)");
+      assert.equal(v.usage.pricingEvidenceComplete, false, "a malformed priced bucket in `last` flags the frame pricing-incomplete");
+    }
+    await transport.close();
+  });
+
+  it("stays pricing-COMPLETE when a priced bucket is legitimately ABSENT (present-but-partial is usable, m3)", async () => {
+    // The deliberate leniency the m3 fix preserves: a MISSING priced key is not corruption. Here
+    // outputTokens/cacheWriteInputTokens are simply absent (never sent), and every PRESENT priced
+    // bucket is a valid number — so the frame stays pricingEvidenceComplete=true and prices normally.
+    const { inbound, transport } = makePair();
+    const notes = transport.notifications();
+    writeFrame(inbound, {
+      method: "thread/tokenUsage/updated",
+      params: {
+        threadId: "th-9",
+        turnId: "tn-9",
+        tokenUsage: {
+          total: { inputTokens: 400, cachedInputTokens: 100, totalTokens: 400 },
+          last: { inputTokens: 400, cachedInputTokens: 100, totalTokens: 400 },
+        },
+      },
+    });
+    const v = (await notes.next()).value as CodexNotification;
+    assert.equal(v.kind, "token_usage_updated");
+    if (v.kind === "token_usage_updated") {
+      assert.equal(v.usage.total.outputTokens, 0, "an absent priced bucket coerces to 0");
+      assert.equal(v.usage.pricingEvidenceComplete, true, "a legitimately-absent priced bucket stays lenient (complete)");
     }
     await transport.close();
   });

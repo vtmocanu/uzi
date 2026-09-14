@@ -625,6 +625,28 @@ function epochResponder(
   };
 }
 
+// A RESUMED-epoch responder aligned with the pinned resume protocol (PRD #1332, CodeRabbit
+// 4004800880): a recreated epoch RESUMES the SAME thread id (thread/resume returns it) and, unlike
+// {@link epochResponder}, pushes NO thread/started on turn/start — the pinned `thread/resume` path
+// replays token usage but never a `thread/started` lineage row. Kept as a separate builder (not a
+// flag on epochResponder) so the existing multi-epoch tests that depend on epochResponder's
+// unconditional threadStarted stay untouched. It is what proves the run-lifetime accountant fix
+// holds even when the resumed epoch gets no new init/lineage row.
+function resumedEpochResponder(
+  threadId: string,
+  turnId: string,
+  pushFrames: (t: FakeTransport, threadId: string, turnId: string) => void,
+): Responder {
+  return (c) => {
+    if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: threadId } };
+    if (c.method === "turn/start") {
+      pushFrames(c.transport, threadId, turnId);
+      return { turn: { id: turnId } };
+    }
+    return {};
+  };
+}
+
 async function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -1250,6 +1272,58 @@ describe("CodexExecutor: an api_key run meters the root model end-to-end (execut
     assert.equal(astra.costStatus, "metered", "an api_key run's per-model entry is metered (never subscription)");
     // 300*10 + 600*1 + 100*12.5 + 200*50 = 14850 µ$. Reasoning (50) is a subset of output, never re-added.
     assert.equal(Math.round((astra.costUSD as number) * 1e6), 14850, "the exact summed Standard price in microdollars");
+  });
+});
+
+describe("CodexExecutor: ONE run-lifetime accountant survives provider-epoch recreation (CodeRabbit 4004800880)", () => {
+  it("reports cumulative-since-run-start across a checkpoint recreation, not just the resumed epoch's own delta", async () => {
+    // The seam under test is the shared EpochSharedContext.accountant threaded into every epoch's
+    // CodexHarness. Epoch 0 (a FRESH th-1) charges a cumulative of 100; a cooperative checkpoint
+    // reap recreates the provider epoch, which RESUMES th-1 (SAME thread id, and — per the pinned
+    // resume protocol — NO thread/started). The resumed epoch first replays the prior cumulative
+    // (total=100, whose `last` is the prior leg's final response) and then advances to total=150.
+    //
+    // FIXED (ONE run-lifetime accountant): th-1's account persists with baseline 0 and maxTotal
+    // 100, so the replay note (magnitude 100) is a no-op stale note and the total=150 note charges
+    // the FULL cumulative delta 150 - 0 = 150 at the FINAL terminal.
+    //
+    // PRE-FIX (a per-HARNESS accountant): the recreated epoch's harness constructs a FRESH
+    // accountant; registerThread marks th-1 `resumed`, so the replayed total=100 becomes its
+    // baseline and the total=150 note charges only 150 - 100 = 50. That is the run-cumulative loss
+    // this test pins — it FAILS (astra.inputTokens === 50) on the pre-fix per-harness accountant.
+    const rig = makeMultiEpochRig([
+      epochResponder("th-1", "tn-1", (t, th, tn) => {
+        t.push(tokenUsageUpdated(th, tn, { inputTokens: 100, totalTokens: 100 }))
+          .push(toolCall(1, "checkpoint", {}, th, tn, "c-ckpt"))
+          .push(turnCompleted("completed", th, tn));
+      }),
+      resumedEpochResponder("th-1", "tn-2", (t, th, tn) => {
+        // Resume replay: the restored cumulative (total=100); `last` is the prior leg's final
+        // response (a subset already counted upstream). Then a genuinely-newer note (total=150).
+        t.push(tokenUsageUpdated(th, tn, { inputTokens: 100, totalTokens: 100 }, { inputTokens: 100, totalTokens: 100 }))
+          .push(tokenUsageUpdated(th, tn, { inputTokens: 150, totalTokens: 150 }, { inputTokens: 50, totalTokens: 50 }))
+          .push(toolCall(2, "signal_done", {}, th, tn, "c-done"))
+          .push(turnCompleted("completed", th, tn));
+      }),
+    ]);
+    // Pre-approved by default (makeCtx) → straight to the implement loop; the checkpoint sink just
+    // records nothing so the cooperative reap:true recreates the epoch.
+    const { ctx, emitted } = makeCtx({ checkpoint: async () => undefined });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "shared-accountant run");
+
+    assert.equal(result.branch, "agent/issue-42");
+    assert.equal(rig.providerLaunches(), 2, "the cooperative checkpoint recreated a fresh provider epoch");
+    assert.equal(rig.epochs[1]!.transport.turnStartCount, 1, "the resumed implement turn ran on the NEW epoch");
+    const modelUsage = lastResultModelUsage(emitted);
+    assert.ok(modelUsage, "the FINAL terminal carries per-model usage");
+    assert.deepEqual(Object.keys(modelUsage), ["gpt-6-astra"], "usage is charged to the configured root model");
+    const astra = rec(modelUsage["gpt-6-astra"]);
+    assert.equal(
+      astra.inputTokens,
+      150,
+      "the run-lifetime accountant reports the run cumulative-since-start (150), NOT the resumed epoch's own delta (50)",
+    );
+    assert.equal(astra.costStatus, "subscription", "a subscription run's per-model entry is subscription");
   });
 });
 

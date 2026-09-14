@@ -99,10 +99,12 @@ export class Worker {
         // boolean on config; a positive result APPENDS codex_harness_v1, a failed/absent
         // one leaves the array unchanged so a stripped/corrupt/mismatched/old image keeps
         // serving Claude. The `?.` degrades safe to "not capable" if the field is somehow
-        // unset — registration must never throw on a config quirk. The server-side
-        // vocabulary admission + placement gate land in a LATER unit; until then the
-        // server silently filters this string (FilterProtocol), which is the intended,
-        // harmless dark state.
+        // unset — registration must never throw on a config quirk. The server now ADMITS
+        // codex_harness_v1 into its protocol vocabulary (FilterProtocol keeps it) and gates
+        // run placement/claim on it (the ClaimRun dedicated Codex clause admits a
+        // Codex-indicating run only for a worker that self-reported it). M5A stays dark
+        // regardless: no public DTO/CLI/web selector exposes Codex, so advertising this
+        // protocol fact is invisible to users until a later milestone lights it up.
         if (this.config.codexProbe?.capable) {
           protocolCapabilities.push(CODEX_HARNESS_CAPABILITY);
         }

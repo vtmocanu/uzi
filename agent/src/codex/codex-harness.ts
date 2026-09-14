@@ -182,6 +182,14 @@ export interface CodexHarnessOptions {
    *  terminal prices NOTHING — every entry stays `unreported` and the run cost `unreported` — the
    *  conservative choice that retains tokens and never invents a subscription or a dollar figure. */
   readonly authMode?: CodexAppServerAuthMode;
+  /** PRD #1332 C4a / CodeRabbit 4004800880: the RUN-lifetime token accountant, INJECTED so it
+   *  survives provider-epoch recreation (plan approval, cooperative-checkpoint reaps). Each epoch
+   *  builds a FRESH {@link CodexHarness}, but the accountant holds the run's cumulative-since-start
+   *  per-thread reconciliation — a per-harness accountant would report only the resumed epoch's own
+   *  delta and lose the run cumulative under the downstream GREATEST fold. The {@link
+   *  EpochSharedContext} constructs ONE and passes it into every epoch's harness. When ABSENT (a
+   *  single-epoch or test construction) it defaults to a fresh accountant, preserving back-compat. */
+  readonly accountant?: CodexUsageAccountant;
 }
 
 // --- small pure helpers -------------------------------------------------------
@@ -287,11 +295,13 @@ export class CodexHarness implements RunHarness {
 
   // PRD #1332 C4a: the per-run token accountant. It holds the IMMUTABLE thread->model map
   // (root captured on thread establishment, children via {@link recordChildThreadModel}) and
-  // reconciles every `thread/tokenUsage/updated` note into per-model deltas. Constructed ONCE
-  // and never reset — the root thread's cumulative spans turns and earlier-turn children stay
-  // aggregated — so each turn terminal emits the run's cumulative-since-baseline modelUsage,
-  // which C1's per-leg GREATEST fold deduplicates.
-  private readonly accountant = new CodexUsageAccountant();
+  // reconciles every `thread/tokenUsage/updated` note into per-model deltas. INJECTED by the
+  // executor's EpochSharedContext so it survives provider-epoch recreation (plan approval,
+  // checkpoint reaps) — the root thread's cumulative spans turns AND epochs, and earlier-epoch
+  // children stay aggregated, so each turn terminal emits the run's cumulative-since-baseline
+  // modelUsage which C1's per-leg GREATEST fold deduplicates. Defaults to a fresh accountant for a
+  // caller that injects none (single-epoch / test construction).
+  private readonly accountant: CodexUsageAccountant;
 
   // Child-thread demux (part C): a registered sink receives every frame carrying its
   // child thread id off the SAME transport, so a delegation's child turn can consume its
@@ -333,6 +343,7 @@ export class CodexHarness implements RunHarness {
     this.appServerAuth = opts.appServerAuth;
     this.credentialValue = opts.credentialValue;
     this.authMode = opts.authMode;
+    this.accountant = opts.accountant ?? new CodexUsageAccountant();
   }
 
   inspectSession(id: string): Promise<SessionPresence> {

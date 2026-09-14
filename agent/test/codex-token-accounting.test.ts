@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
-import { CodexUsageAccountant, type CodexModelUsageEntry } from "../src/codex/token-accounting.js";
+import { CodexUsageAccountant, deriveCodexRunCost, type CodexModelUsageEntry } from "../src/codex/token-accounting.js";
 import type { CodexThreadTokenUsage, CodexUsageBreakdown } from "../src/codex/transport.js";
 
 // PRD #1332 (M5A, C4a) — the per-thread/per-model token accountant, exercised directly (no
@@ -29,6 +29,16 @@ function bd(overrides: Partial<CodexUsageBreakdown> = {}): CodexUsageBreakdown {
 
 function usage(total: Partial<CodexUsageBreakdown>, last: Partial<CodexUsageBreakdown>): CodexThreadTokenUsage {
   return { total: bd(total), last: bd(last) };
+}
+
+/** Like {@link usage} but carries the m3 (CodeRabbit 4004800884) pricing-evidence flag. `usage`
+ *  itself omits it (undefined = lenient/complete, the "present-but-partial is usable" default). */
+function usageEvidence(
+  total: Partial<CodexUsageBreakdown>,
+  last: Partial<CodexUsageBreakdown>,
+  pricingEvidenceComplete: boolean,
+): CodexThreadTokenUsage {
+  return { total: bd(total), last: bd(last), pricingEvidenceComplete };
 }
 
 /** Assert an emitted entry equals the given token buckets and is an unreported, price-free
@@ -266,5 +276,91 @@ describe("CodexUsageAccountant: redelivery and empties", () => {
     const agg = acct.aggregateByModel();
     assert.ok(agg);
     assert.deepEqual(Object.keys(agg), [MODEL_ROOT]);
+  });
+});
+
+describe("CodexUsageAccountant: m3 fail-closed pricing on malformed required evidence (CodeRabbit 4004800884)", () => {
+  // MODEL_ROOT = "gpt-6-astra" is a Standard-priced model, so a well-shaped note meters. These
+  // pin the m3 gate: a note flagged pricingEvidenceComplete:false degrades cost to `unreported`
+  // even when the numeric reconciliation matches, while token totals still survive; and a flag
+  // that is absent (undefined) or true keeps the existing lenient/metered behavior.
+  const API_KEY = { authMode: "api_key" as const, now: new Date("2026-01-01T00:00:00Z") };
+  // input 300 / output 200 on gpt-6-astra: 300*10 + 200*50 = 13000 µ$ when metered.
+  const B = { inputTokens: 300, outputTokens: 200, totalTokens: 500 };
+
+  it("BASELINE: the same well-shaped, reconciling note meters when evidence is COMPLETE", () => {
+    const acct = new CodexUsageAccountant();
+    acct.registerThread(ROOT, MODEL_ROOT, false);
+    acct.record(ROOT, usageEvidence(B, B, true));
+    const agg = acct.aggregateByModel(API_KEY);
+    assert.ok(agg);
+    const astra = agg[MODEL_ROOT]!;
+    assert.equal(astra.costStatus, "metered", "a complete, reconciling api-key note meters");
+    assert.equal(Math.round(astra.costUSD! * 1e6), 13000, "300*10 + 200*50 µ$");
+  });
+
+  it("malformed required evidence → costStatus 'unreported' EVEN THOUGH the numeric reconciliation matches; tokens survive", () => {
+    const acct = new CodexUsageAccountant();
+    acct.registerThread(ROOT, MODEL_ROOT, false);
+    // Identical buckets to the baseline (so sum(last) === charged delta — reconciliation PASSES),
+    // but a pricing-required bucket was present-but-malformed on the wire (flag false). The gate
+    // must fail cost closed anyway — the CodeRabbit-4004800884 understated-metered bug.
+    acct.record(ROOT, usageEvidence(B, B, false));
+    const agg = acct.aggregateByModel(API_KEY);
+    assert.ok(agg);
+    const astra = agg[MODEL_ROOT]!;
+    // Cost fails closed.
+    assert.equal(astra.costStatus, "unreported", "malformed evidence degrades cost to unreported despite a matching reconciliation");
+    assert.ok(!("costUSD" in astra), "no dollar figure on an unreported entry");
+    // Token totals are RETAINED (no token-accounting regression).
+    assert.equal(astra.inputTokens, 300, "uncached input retained");
+    assert.equal(astra.outputTokens, 200, "output retained");
+    // Run-level rollup: an unreported entry makes the api-key run unreported.
+    assert.deepEqual(deriveCodexRunCost(agg, "api_key"), { kind: "unreported" });
+  });
+
+  it("a subscription run is unaffected by the evidence flag (still subscription, tokens retained)", () => {
+    const acct = new CodexUsageAccountant();
+    acct.registerThread(ROOT, MODEL_ROOT, false);
+    acct.record(ROOT, usageEvidence(B, B, false));
+    const astra = acct.aggregateByModel({ authMode: "subscription", now: API_KEY.now })![MODEL_ROOT]!;
+    assert.equal(astra.costStatus, "subscription", "the evidence gate only applies to the api-key pricing branch");
+    assert.equal(astra.inputTokens, 300);
+  });
+
+  it("a LEGITIMATELY-ABSENT field keeps the lenient/metered behavior (flag absent ⇒ complete)", () => {
+    const acct = new CodexUsageAccountant();
+    acct.registerThread(ROOT, MODEL_ROOT, false);
+    // `usage` omits the flag (undefined). A transport frame with a priced bucket legitimately
+    // absent stays pricingEvidenceComplete=true, so the accountant defaults to lenient and meters.
+    acct.record(ROOT, usage(B, B));
+    const astra = acct.aggregateByModel(API_KEY)![MODEL_ROOT]!;
+    assert.equal(astra.costStatus, "metered", "an absent flag defaults to complete → metered");
+    assert.equal(Math.round(astra.costUSD! * 1e6), 13000);
+  });
+
+  it("dominance: one tainted thread degrades its whole model; a clean thread on ANOTHER model still meters", () => {
+    const acct = new CodexUsageAccountant();
+    acct.registerThread(ROOT, MODEL_ROOT, false);
+    acct.registerThread("th-clean", MODEL_CHILD, false);
+    acct.record(ROOT, usageEvidence(B, B, false)); // tainted astra
+    acct.record("th-clean", usageEvidence({ inputTokens: 100, outputTokens: 100, totalTokens: 200 }, { inputTokens: 100, outputTokens: 100, totalTokens: 200 }, true));
+    const agg = acct.aggregateByModel(API_KEY);
+    assert.ok(agg);
+    assert.equal(agg[MODEL_ROOT]!.costStatus, "unreported", "the tainted model is unreported");
+    assert.equal(agg[MODEL_CHILD]!.costStatus, "metered", "an independent clean model still meters");
+    assert.equal(agg[MODEL_ROOT]!.inputTokens, 300, "tainted model still retains its tokens");
+  });
+
+  it("a tainting note that is NOT adopted (stale/out-of-order) does not degrade a clean thread", () => {
+    const acct = new CodexUsageAccountant();
+    acct.registerThread(ROOT, MODEL_ROOT, false);
+    // Adopt a clean, higher-magnitude note first.
+    acct.record(ROOT, usageEvidence(B, B, true));
+    // A stale, LOWER-magnitude malformed note: not adopted, so it must not taint pricing.
+    acct.record(ROOT, usageEvidence({ inputTokens: 10, outputTokens: 5, totalTokens: 15 }, { inputTokens: 10, outputTokens: 5, totalTokens: 15 }, false));
+    const astra = acct.aggregateByModel(API_KEY)![MODEL_ROOT]!;
+    assert.equal(astra.costStatus, "metered", "a stale (unadopted) malformed note cannot taint the thread");
+    assert.equal(Math.round(astra.costUSD! * 1e6), 13000);
   });
 });

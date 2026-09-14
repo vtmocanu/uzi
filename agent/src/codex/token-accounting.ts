@@ -187,6 +187,12 @@ interface ThreadAccount {
    *  RESUMED thread's FIRST note is the prior leg's replayed snapshot (its `last` is a prior
    *  response already counted), so it establishes the baseline WITHOUT being recorded here. */
   readonly responses: CodexUsageBreakdown[];
+  /** PRD #1332 m3 (CodeRabbit 4004800884): FALSE once any CONSUMED (adopted) note carried a
+   *  present-but-malformed pricing-required bucket (`transport.ts` pricingEvidenceComplete). It
+   *  fails pricing closed for this thread's model in {@link aggregateByModel}'s api-key branch even
+   *  when the coerced-to-0 buckets reconcile numerically — token totals are still retained; only
+   *  cost/costStatus is gated. A stale/out-of-order note (not adopted) never taints it. */
+  pricingEvidenceComplete: boolean;
 }
 
 /**
@@ -204,7 +210,7 @@ export class CodexUsageAccountant {
    *  cumulative) from a fresh root/child (baselines at zero). */
   registerThread(threadId: string, model: string, resumed: boolean): void {
     if (threadId.length === 0 || this.threads.has(threadId)) return;
-    this.threads.set(threadId, { model, resumed, maxMagnitude: 0, responses: [] });
+    this.threads.set(threadId, { model, resumed, maxMagnitude: 0, responses: [], pricingEvidenceComplete: true });
   }
 
   /**
@@ -218,6 +224,10 @@ export class CodexUsageAccountant {
     const acct = this.threads.get(threadId);
     if (acct === undefined) return; // unknown / unregistered thread — never attributed
     const total = toCumulative(usage.total);
+    // PRD #1332 m3 (CodeRabbit 4004800884): a note carrying a present-but-malformed pricing-required
+    // bucket taints THIS thread's pricing evidence. Applied ONLY when the note is adopted (below),
+    // so a duplicate/stale/out-of-order note — which is neither charged nor priced — cannot taint.
+    const evidenceIncomplete = usage.pricingEvidenceComplete === false;
     if (acct.maxTotal === undefined) {
       // A RESUMED thread baselines at the FULL restored cumulative (`total`) of its first
       // observed note — NOT `total - last`. VERIFIED against the pinned app-server (commit
@@ -237,6 +247,7 @@ export class CodexUsageAccountant {
       // final response into `last`; it is already counted upstream and sits below the baseline, so
       // recording it would over-count cost and break reconciliation — it is deliberately skipped.
       if (!acct.resumed) acct.responses.push(usage.last);
+      if (evidenceIncomplete) acct.pricingEvidenceComplete = false;
       return;
     }
     const m = magnitude(usage.total);
@@ -247,6 +258,7 @@ export class CodexUsageAccountant {
       // priced response. Mirrors the magnitude gate so a duplicate/stale/out-of-order note (which
       // does NOT advance the max) is never priced twice.
       acct.responses.push(usage.last);
+      if (evidenceIncomplete) acct.pricingEvidenceComplete = false;
     }
     // else: a duplicate, stale resume replay or out-of-order note — cannot increase usage or cost.
   }
@@ -263,11 +275,13 @@ export class CodexUsageAccountant {
    *                                    charge exists; even an unknown model is subscription).
    *   - `authMode: 'api_key'`        → per model, CONSERVATIVE DOMINANCE: the entry is `metered`
    *                                    with the SUMMED per-response price ONLY when EVERY observed
-   *                                    response of EVERY thread on that model both reconciles to
-   *                                    its cumulative delta AND prices; if ANY response is
-   *                                    unpriceable (unknown model, Sol boundary, bad cache split)
-   *                                    or ANY thread's responses do not reconcile (a missed
-   *                                    update), the WHOLE model entry is `unreported` with its
+   *                                    response of EVERY thread on that model has COMPLETE pricing
+   *                                    evidence (m3: no present-but-malformed priced bucket),
+   *                                    reconciles to its cumulative delta AND prices; if ANY thread
+   *                                    saw malformed pricing evidence (m3, CodeRabbit 4004800884),
+   *                                    ANY response is unpriceable (unknown model, Sol boundary, bad
+   *                                    cache split) or ANY thread's responses do not reconcile (a
+   *                                    missed update), the WHOLE model entry is `unreported` with its
    *                                    tokens RETAINED and no `costUSD`.
    */
   aggregateByModel(pricing?: CodexPricingContext): Record<string, CodexModelUsageEntry> | undefined {
@@ -287,12 +301,20 @@ export class CodexUsageAccountant {
       const agg = byModel.get(acct.model) ?? { tokens: zeroCumulative(), priceable: true, costUSD: 0 };
       addInto(agg.tokens, charged);
       if (priceApiKey && agg.priceable) {
-        // Reconcile THIS thread's observed responses to ITS OWN cumulative delta before pricing:
-        // a dropped note (missed response) leaves sum(last) below the delta, so the model degrades
-        // to `unreported` while its tokens are retained (never fabricate a price for an unobserved
-        // response). A reconciled thread prices every response independently (the >272K tier is
-        // per response); any single unpriceable response taints the whole model (dominance).
-        if (!responsesReconcileDelta(sumResponses(acct.responses), charged)) {
+        // PRD #1332 m3 (CodeRabbit 4004800884): fail closed on pricing-evidence completeness FIRST.
+        // If any consumed note on this thread carried a present-but-malformed pricing-required
+        // bucket, the coerced-to-0 values can make sum(last) and the delta BOTH zero and reconcile
+        // spuriously — so the numeric reconciliation is NOT sufficient. Degrade the model to
+        // `unreported` (tokens still retained via the coerced totals) rather than emit an
+        // understated metered cost. Dominance: one tainted thread taints the whole model.
+        if (!acct.pricingEvidenceComplete) {
+          agg.priceable = false;
+        } else if (!responsesReconcileDelta(sumResponses(acct.responses), charged)) {
+          // Reconcile THIS thread's observed responses to ITS OWN cumulative delta before pricing:
+          // a dropped note (missed response) leaves sum(last) below the delta, so the model degrades
+          // to `unreported` while its tokens are retained (never fabricate a price for an unobserved
+          // response). A reconciled thread prices every response independently (the >272K tier is
+          // per response); any single unpriceable response taints the whole model (dominance).
           agg.priceable = false;
         } else {
           for (const r of acct.responses) {

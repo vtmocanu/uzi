@@ -92,6 +92,7 @@ import {
   type StartChildTurnSpec,
 } from "./delegation.js";
 import { buildCodexRunPlan } from "./run-builder.js";
+import { CodexUsageAccountant } from "./token-accounting.js";
 import { CodexSessionStore } from "./session-state.js";
 import { wireFileopHelper, type FileopHelperHandle } from "./fileop-client.js";
 import {
@@ -880,6 +881,13 @@ interface EpochSharedContext {
   readonly boundaryProcessSpawner: SpawnBoundaryProcessSeam;
   readonly reconcile: ReconcileBeforeBoundary;
   readonly evictTokens: () => void;
+  /** PRD #1332 C4a / CodeRabbit 4004800880: the ONE run-lifetime token accountant, shared across
+   *  every provider epoch. `startProviderEpoch` builds a fresh {@link CodexHarness} on every epoch
+   *  recreation (plan approval, cooperative-checkpoint reaps), but the accountant must survive that
+   *  so a resumed epoch reports the run's cumulative-since-start usage — not just its own delta —
+   *  which the downstream GREATEST fold requires to stay correct. Constructed ONCE below and passed
+   *  into every epoch's harness. */
+  readonly accountant: CodexUsageAccountant;
 }
 
 /**
@@ -1082,6 +1090,11 @@ export class CodexExecutor implements Executor {
         boundaryProcessSpawner,
         reconcile,
         evictTokens,
+        // PRD #1332 C4a / CodeRabbit 4004800880: ONE accountant for the whole run, so its
+        // cumulative-since-start per-thread reconciliation survives every provider-epoch
+        // recreation (plan approval, checkpoint reaps) rather than resetting to a resumed epoch's
+        // own delta and losing the run cumulative under the downstream GREATEST fold.
+        accountant: new CodexUsageAccountant(),
       };
 
       // Build the FIRST provider epoch (epoch 0): eager fresh credential release (fail-closed),
@@ -1249,7 +1262,7 @@ export class CodexExecutor implements Executor {
     const {
       provider, binding, worktreePath, storeDir, homeRoot, boundaryDeadlineMs, childTurnDeadlineMs,
       commandEnv, screenPolicy, toolHandlers, registerToken, committedGeneration, launchEffectRoot,
-      spawnBoundaryRoot, boundaryProcessSpawner, reconcile, evictTokens,
+      spawnBoundaryRoot, boundaryProcessSpawner, reconcile, evictTokens, accountant,
     } = shared;
 
     // The real launcher needs a worker-owned shared run HOME and codex-data parent: the
@@ -1411,6 +1424,9 @@ export class CodexExecutor implements Executor {
         // PRD #1332 C4b / D5: the run's immutable credential mode selects the terminal cost
         // semantics (subscription vs api-key metered/unreported) in the token accountant.
         authMode: binding.authMode,
+        // PRD #1332 C4a / CodeRabbit 4004800880: the ONE run-lifetime accountant, so a recreated
+        // epoch continues the run's cumulative reconciliation instead of starting fresh.
+        accountant,
       });
 
       const epochHarness = harness;
