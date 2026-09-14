@@ -146,7 +146,7 @@ spec:
             # so this env cannot render without the PriorityClass object also rendering.
             {{- if .Values.workers.priorityClass.enabled }}
             - name: UZI_WORKER_PRIORITY_CLASS_NAME
-              value: {{ .Values.workers.priorityClass.name | quote }}
+              value: {{ .Values.workers.priorityClass.name | default (printf "%s-hosted-worker" .Release.Name) | quote }}
             {{- end }}
             # The per-worker run-slot cap. NOT with-gated: it always has a chart default
             # (workers.maxConcurrentRuns: 1), so the controller always receives it and

@@ -527,7 +527,11 @@ workers:
   # already-running pods, set `preemptionPolicy: Never`.
   priorityClass:
     enabled: true
-    name: uzi-hosted-worker
+    # Cluster-scoped, so the name must be unique across ALL PriorityClasses in the
+    # cluster. Empty ⇒ the chart derives `<release>-hosted-worker`, which is
+    # release-unique, so two uzi releases in one cluster do not collide over this
+    # object. Set an explicit name to adopt an operator-managed shared class.
+    name: ""
     # Modest: above the priority-0 default of a no-class pod, far below the reserved
     # system range (>= 2000000000). Operator-tunable.
     value: 1000
