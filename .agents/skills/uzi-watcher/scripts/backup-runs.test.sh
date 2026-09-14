@@ -20,8 +20,10 @@ SCRIPT="$HERE/backup-runs.sh"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
+# fail <msg>: print and abort the test run non-zero.
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
+# git_q <dir> <git-args...>: run git in <dir>, silencing all output.
 git_q() { git -C "$1" "${@:2}" >/dev/null 2>&1; }
 
 # --- "the forge": a base repo whose HEAD is public main -------------------------
@@ -37,7 +39,9 @@ MAIN="$(git -C "$FORGE" rev-parse HEAD)"
 
 # --- stubs ----------------------------------------------------------------------
 # kubectl stub: answers the three calls backup-runs.sh makes. The capture exec is
-# run locally with UZI_RUNNER_BASE pointing at the fake clone root.
+# run verbatim, so the RUNNER_BASE the host forwarded as its last arg is what
+# points CLONE at the fake clone — this exercises the real host->exec argument
+# path, not a stub-injected env var (which would not cross a real `kubectl exec`).
 KSTUB="$WORK/kubectl"
 cat > "$KSTUB" <<STUB
 #!/usr/bin/env bash
@@ -60,14 +64,16 @@ if [ "\${cmd[0]:-}" = git ]; then
   echo "$MAIN"; exit 0
 fi
 if [ "\${cmd[0]:-}" = sh ]; then
-  # cmd = (sh -c <CAPTURE> _ <STEM> <REALMAIN>); run it against the fake clone.
-  UZI_RUNNER_BASE="$WORK/runner" exec "\${cmd[@]}"
+  # cmd = (sh -c <CAPTURE> _ <STEM> <REALMAIN> <RUNNER_BASE>); the host already
+  # forwarded RUNNER_BASE as the last arg, so run it verbatim.
+  exec "\${cmd[@]}"
 fi
 exit 0
 STUB
 chmod +x "$KSTUB"
 
-make_uzi_stub() {  # $1 = kind/iid marker file dir already implied; emits run json
+# make_uzi_stub: write a fake `uzi` that answers `run get --json` for the test run.
+make_uzi_stub() {
   cat > "$WORK/uzi" <<STUB
 #!/usr/bin/env bash
 set -u
@@ -81,10 +87,13 @@ STUB
   chmod +x "$WORK/uzi"
 }
 
-run_backup() {  # populates a fresh backup dir; echoes it
+# run_backup <tag>: run the real script once into a fresh dir; echo its `latest`.
+# UZI_RUNNER_BASE is set on the HOST invocation (not the stub): the script must
+# forward it into the remote capture, which is the production behavior under test.
+run_backup() {
   local dest="$WORK/out.$1"
   rm -rf "$dest"
-  UZI_CTX=test-ctx UZI_WORKER_NS=ns UZI_REPO_SLUG=testrepo \
+  UZI_CTX=test-ctx UZI_WORKER_NS=ns UZI_REPO_SLUG=testrepo UZI_RUNNER_BASE="$WORK/runner" \
     UZI_BACKUP_DIR="$dest" UZI_KUBECTL="$KSTUB" UZI_BIN="$WORK/uzi" \
     bash "$SCRIPT" run-4242 >/dev/null 2>&1
   echo "$dest/latest"

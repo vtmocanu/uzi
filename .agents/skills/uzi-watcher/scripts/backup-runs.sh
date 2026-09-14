@@ -83,9 +83,12 @@ CAPTURE='
 set -u
 STEM="$1"
 REALMAIN="${2:-}"
-# Runner working-clone root. Defaults to the on-pod path; UZI_RUNNER_BASE overrides
-# it (a non-standard runner mount, or a local fake clone under test).
-CLONE="${UZI_RUNNER_BASE:-/data/runner/'"$REPO_SLUG"'}/$STEM"
+# Runner working-clone root, forwarded by the host as $3 (env does not cross
+# `kubectl exec`, so a host UZI_RUNNER_BASE must be passed as an argument). Empty
+# selects the default on-pod path; a value overrides it (a local fake clone under
+# test, or a non-standard runner mount).
+RUNNER_BASE="${3:-/data/runner/'"$REPO_SLUG"'}"
+CLONE="$RUNNER_BASE/$STEM"
 [ -d "$CLONE/.git" ] || { echo "NO_CLONE $CLONE" >&2; exit 3; }
 cd "$CLONE" || exit 3
 OUT="$(mktemp -d)"
@@ -243,7 +246,7 @@ for RID in "${RUNS[@]}"; do
     # earlier attempt already produced — a truncated archive is still the best
     # forensic artifact we have. Promote to $f only when the attempt produced bytes.
     rm -f "$tmp"
-    "$KUBECTL" --context "$CTX" -n "$ns" exec "$pod" -c worker -- sh -c "$CAPTURE" _ "$STEM" "$REALMAIN" > "$tmp" 2>>"$LOG"
+    "$KUBECTL" --context "$CTX" -n "$ns" exec "$pod" -c worker -- sh -c "$CAPTURE" _ "$STEM" "$REALMAIN" "${UZI_RUNNER_BASE:-}" > "$tmp" 2>>"$LOG"
     kc_rc=$?
     if [ "$kc_rc" -ne 0 ]; then
       log "WARN $RID ($LBL): exec/capture attempt $cap_try exit=$kc_rc; see $LOG"
