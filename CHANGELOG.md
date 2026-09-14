@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Changed
+
+- **Promoting a stable release now prunes that version's superseded RC Release entries, so the Releases page keeps one entry per version ([#1340](https://github.com/vtmocanu/uzi/issues/1340)).**
+  Publishing a stable `vX.Y.Z` deletes the GitHub Release entries for that base's release candidates (`vX.Y.Z-rc.N`) as its last publish step, so a multi-candidate train no longer leaves a pre-release badge per RC on the public Releases page. Only the redundant Release entry is removed: the immutable git tag and the RC's GHCR images, chart, and cosign signatures stay, so nothing pinned to a candidate breaks (ArgoCD tracks the GHCR OCI tag, not the Release entry). It runs on stable tags only, so an abandoned candidate train (`release-cut --skip-promote`) keeps its RC Releases as genuine history.
+
 ## [0.83.0] - 2026-09-13
 
 ### Added
