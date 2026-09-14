@@ -153,6 +153,96 @@ describe("codex transport: notification decoding", () => {
     await transport.close();
   });
 
+  it("decodes thread/tokenUsage/updated as a TYPED token_usage_updated notification (PRD #1332 C4a)", async () => {
+    const { inbound, transport } = makePair();
+    const notes = transport.notifications();
+    writeFrame(inbound, {
+      method: "thread/tokenUsage/updated",
+      params: {
+        threadId: "th-9",
+        turnId: "tn-9",
+        total: { inputTokens: 500, cachedInputTokens: 100, cacheWriteInputTokens: 20, outputTokens: 300, reasoningOutputTokens: 40, totalTokens: 800 },
+        last: { inputTokens: 120, cachedInputTokens: 30, cacheWriteInputTokens: 0, outputTokens: 80, reasoningOutputTokens: 10, totalTokens: 200 },
+        modelContextWindow: 272000,
+      },
+    });
+    const v = (await notes.next()).value as CodexNotification;
+    assert.equal(v.kind, "token_usage_updated");
+    if (v.kind === "token_usage_updated") {
+      assert.equal(v.threadId, "th-9");
+      assert.equal(v.turnId, "tn-9");
+      assert.deepEqual(v.usage.total, {
+        inputTokens: 500, cachedInputTokens: 100, cacheWriteInputTokens: 20, outputTokens: 300, reasoningOutputTokens: 40, totalTokens: 800,
+      });
+      assert.deepEqual(v.usage.last, {
+        inputTokens: 120, cachedInputTokens: 30, cacheWriteInputTokens: 0, outputTokens: 80, reasoningOutputTokens: 10, totalTokens: 200,
+      });
+      assert.equal(v.usage.modelContextWindow, 272000);
+    }
+    await transport.close();
+  });
+
+  it("coerces a partial/absent breakdown field to 0 and drops a non-numeric one", async () => {
+    const { inbound, transport } = makePair();
+    const notes = transport.notifications();
+    writeFrame(inbound, {
+      method: "thread/tokenUsage/updated",
+      params: {
+        threadId: "th-9",
+        turnId: "tn-9",
+        // outputTokens missing; inputTokens hostile (a string); cacheWriteInputTokens negative.
+        total: { inputTokens: "lots", cachedInputTokens: 50, cacheWriteInputTokens: -5, reasoningOutputTokens: 7, totalTokens: 90 },
+        last: { totalTokens: 10 },
+      },
+    });
+    const v = (await notes.next()).value as CodexNotification;
+    assert.equal(v.kind, "token_usage_updated");
+    if (v.kind === "token_usage_updated") {
+      assert.deepEqual(v.usage.total, {
+        inputTokens: 0, cachedInputTokens: 50, cacheWriteInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 7, totalTokens: 90,
+      });
+      assert.deepEqual(v.usage.last, {
+        inputTokens: 0, cachedInputTokens: 0, cacheWriteInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 10,
+      });
+      assert.equal(v.usage.modelContextWindow, undefined);
+    }
+    await transport.close();
+  });
+
+  it("falls back to a nested `usage` container when total/last are not on params top-level", async () => {
+    const { inbound, transport } = makePair();
+    const notes = transport.notifications();
+    writeFrame(inbound, {
+      method: "thread/tokenUsage/updated",
+      params: {
+        threadId: "th-9",
+        turnId: "tn-9",
+        usage: {
+          total: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+          last: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+        },
+      },
+    });
+    const v = (await notes.next()).value as CodexNotification;
+    assert.equal(v.kind, "token_usage_updated");
+    if (v.kind === "token_usage_updated") {
+      assert.equal(v.usage.total.inputTokens, 10);
+      assert.equal(v.usage.last.outputTokens, 5);
+    }
+    await transport.close();
+  });
+
+  it("a token-usage frame missing turnId or a breakdown falls to activity (fail-safe liveness)", async () => {
+    const { inbound, transport } = makePair();
+    const notes = transport.notifications();
+    // No turnId, and no total/last at all — must never decode as a token_usage_updated.
+    writeFrame(inbound, { method: "thread/tokenUsage/updated", params: { threadId: "th-9" } });
+    const v = (await notes.next()).value as CodexNotification;
+    assert.equal(v.kind, "activity");
+    assert.equal(v.kind === "activity" ? v.method : undefined, "thread/tokenUsage/updated");
+    await transport.close();
+  });
+
   it("surfaces a server-initiated request (method + id) as activity carrying its requestId", async () => {
     const { inbound, transport } = makePair();
     const notes = transport.notifications();

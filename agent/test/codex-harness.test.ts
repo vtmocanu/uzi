@@ -18,7 +18,7 @@ import {
 } from "../src/codex/broker.js";
 import { renderCodexRun } from "../src/codex/render.js";
 import type { HarnessEvent, RunTurnRequest } from "../src/harness.js";
-import type { CodexNotification, CodexTransport } from "../src/codex/transport.js";
+import type { CodexNotification, CodexTransport, CodexUsageBreakdown } from "../src/codex/transport.js";
 import type { Logger } from "../src/log.js";
 import {
   createCodexAppServerAuth,
@@ -212,6 +212,37 @@ function agentMessage(text: string, usage?: unknown, threadId = "th-1"): CodexNo
 
 function delta(): CodexNotification {
   return { kind: "activity", method: "item/agent_message_delta", params: { delta: "h" } };
+}
+
+function bd(overrides: Partial<CodexUsageBreakdown> = {}): CodexUsageBreakdown {
+  return {
+    inputTokens: 0,
+    cachedInputTokens: 0,
+    cacheWriteInputTokens: 0,
+    outputTokens: 0,
+    reasoningOutputTokens: 0,
+    totalTokens: 0,
+    ...overrides,
+  };
+}
+
+/** A decoded `thread/tokenUsage/updated` notification (PRD #1332 C4a), as the transport would
+ *  hand it to the harness. The FakeTransport pushes decoded notes directly, so this builds the
+ *  typed shape rather than a raw wire frame. */
+function tokenUsage(
+  total: Partial<CodexUsageBreakdown>,
+  last: Partial<CodexUsageBreakdown>,
+  threadId = "th-1",
+  turnId = "tn-1",
+): CodexNotification {
+  return {
+    kind: "token_usage_updated",
+    method: "thread/tokenUsage/updated",
+    threadId,
+    turnId,
+    usage: { total: bd(total), last: bd(last) },
+    params: { threadId, turnId },
+  };
 }
 
 function toolCall(
@@ -786,6 +817,101 @@ describe("CodexHarness: frame → neutral event decode", () => {
     const events = await collect(harness.startTurn(makeRequest()).events);
     assert.equal(events.at(-1)!.kind, "turn_finished");
     assert.equal(events.filter((e) => e.kind === "frame").length, 0);
+  });
+});
+
+describe("CodexHarness: token accounting → result-frame modelUsage (PRD #1332 C4a)", () => {
+  function terminalModelUsage(events: HarnessEvent[]): Record<string, unknown> | undefined {
+    const last = events.at(-1)!;
+    assert.equal(last.kind, "turn_finished");
+    if (last.kind !== "turn_finished") return undefined;
+    return last.terminal.usage?.wire?.modelUsage as Record<string, unknown> | undefined;
+  }
+
+  it("aggregates root token-usage into modelUsage keyed by the configured model, unreported", async () => {
+    const { harness, transport } = makeHarness();
+    transport
+      .push(threadStarted())
+      .push(turnStarted())
+      .push(tokenUsage(
+        { inputTokens: 500, cachedInputTokens: 100, cacheWriteInputTokens: 20, outputTokens: 300, reasoningOutputTokens: 40, totalTokens: 800 },
+        { inputTokens: 500, cachedInputTokens: 100, cacheWriteInputTokens: 20, outputTokens: 300, reasoningOutputTokens: 40, totalTokens: 800 },
+      ))
+      .push(turnCompleted("completed"))
+      .end();
+
+    const mu = terminalModelUsage(await collect(harness.startTurn(makeRequest()).events));
+    // uncached input = 500 - 100 - 20 = 380. Every entry is unreported with NO costUSD.
+    assert.deepEqual(mu, {
+      "gpt-6-astra": {
+        inputTokens: 380,
+        outputTokens: 300,
+        cacheReadInputTokens: 100,
+        cacheCreationInputTokens: 20,
+        reasoningOutputTokens: 40,
+        costStatus: "unreported",
+      },
+    });
+  });
+
+  it("a turn with NO token-usage notes leaves the terminal usage byte-identical (no modelUsage)", async () => {
+    const { harness, transport } = makeHarness();
+    transport.push(threadStarted()).push(turnCompleted("completed", { total_tokens: 10 })).end();
+    const events = await collect(harness.startTurn(makeRequest()).events);
+    const last = events.at(-1)!;
+    assert.equal(last.kind, "turn_finished");
+    if (last.kind === "turn_finished") {
+      // Exactly the pre-C4a shape: bounded turn.usage, and NO modelUsage key on the wire.
+      assert.deepEqual(last.terminal.usage, { basis: "turn", tokens: {}, wire: { usage: { total_tokens: 10 } } });
+    }
+  });
+
+  it("a duplicate root token-usage note does not inflate the emitted modelUsage", async () => {
+    const { harness, transport } = makeHarness();
+    const note = tokenUsage({ inputTokens: 200, outputTokens: 120, totalTokens: 320 }, { inputTokens: 200, outputTokens: 120, totalTokens: 320 });
+    transport.push(threadStarted()).push(turnStarted()).push(note).push(note).push(turnCompleted("completed")).end();
+    const mu = terminalModelUsage(await collect(harness.startTurn(makeRequest()).events));
+    assert.deepEqual(mu, {
+      "gpt-6-astra": { inputTokens: 200, outputTokens: 120, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, reasoningOutputTokens: 0, costStatus: "unreported" },
+    });
+  });
+
+  it("a mixed-model child's usage aggregates under its OWN model, not the root's", async () => {
+    const { harness, transport } = makeHarness();
+    // Mirror exactly what the executor's child-turn seam does: record the child model and
+    // register its sink before the child's frames arrive.
+    harness.recordChildThreadModel("th-child", "gpt-5.6-sol");
+    harness.registerChildSink("th-child", { push: () => {} });
+    transport
+      .push(threadStarted())
+      .push(turnStarted())
+      .push(tokenUsage({ inputTokens: 300, outputTokens: 200, totalTokens: 500 }, { inputTokens: 300, outputTokens: 200, totalTokens: 500 })) // root (th-1)
+      .push(tokenUsage({ inputTokens: 80, outputTokens: 40, totalTokens: 120 }, { inputTokens: 80, outputTokens: 40, totalTokens: 120 }, "th-child", "ctn-1")) // child
+      .push(turnCompleted("completed"))
+      .end();
+
+    const mu = terminalModelUsage(await collect(harness.startTurn(makeRequest()).events));
+    assert.deepEqual(mu, {
+      "gpt-6-astra": { inputTokens: 300, outputTokens: 200, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, reasoningOutputTokens: 0, costStatus: "unreported" },
+      "gpt-5.6-sol": { inputTokens: 80, outputTokens: 40, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, reasoningOutputTokens: 0, costStatus: "unreported" },
+    });
+  });
+
+  it("an unknown child thread's usage is NOT attributed to the root model", async () => {
+    const { harness, transport } = makeHarness();
+    transport
+      .push(threadStarted())
+      .push(turnStarted())
+      .push(tokenUsage({ inputTokens: 300, outputTokens: 200, totalTokens: 500 }, { inputTokens: 300, outputTokens: 200, totalTokens: 500 })) // root (th-1)
+      // A usage note for a thread never registered as root or child (no sink either): dropped.
+      .push(tokenUsage({ inputTokens: 9999, outputTokens: 9999, totalTokens: 19998 }, { inputTokens: 9999, outputTokens: 9999, totalTokens: 19998 }, "th-stray", "stn-1"))
+      .push(turnCompleted("completed"))
+      .end();
+
+    const mu = terminalModelUsage(await collect(harness.startTurn(makeRequest()).events));
+    assert.deepEqual(mu, {
+      "gpt-6-astra": { inputTokens: 300, outputTokens: 200, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, reasoningOutputTokens: 0, costStatus: "unreported" },
+    });
   });
 });
 

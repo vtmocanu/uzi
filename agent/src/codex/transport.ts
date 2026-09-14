@@ -83,6 +83,33 @@ function fail(category: HarnessErrorCategory, message: string): CodexTransportEr
  * protocol-framing safety demands it. Raw `params` are retained for the adapter above
  * (never logged).
  */
+/**
+ * One usage breakdown from a `thread/tokenUsage/updated` notification (PRD #1332 C4a / D5).
+ * The pinned 0.153.2 app-server v2 protocol projects camelCase token counts (source commit
+ * `657a993cbee87acf52d14b758ce49dbd46d1b8eb`, `codex-rs/app-server-protocol/src/protocol/v2/
+ * thread.rs`). Each field is a finite `>= 0` number; a missing/invalid field decodes to `0`
+ * (a present-but-partial breakdown is still usable). `inputTokens` is the TOTAL input for the
+ * response(s) — uncached input is `max(inputTokens - cachedInputTokens - cacheWriteInputTokens,
+ * 0)` (D5). `outputTokens` already INCLUDES `reasoningOutputTokens` (a subset, never re-added). */
+export interface CodexUsageBreakdown {
+  readonly inputTokens: number;
+  readonly cachedInputTokens: number;
+  readonly cacheWriteInputTokens: number;
+  readonly outputTokens: number;
+  readonly reasoningOutputTokens: number;
+  readonly totalTokens: number;
+}
+
+/** The token-usage payload of a `thread/tokenUsage/updated` notification: `total` is the
+ *  thread's CUMULATIVE usage (the replay/dedup/recovery key), `last` is the single most-recent
+ *  upstream response's usage (the per-response pricing basis, D5). `modelContextWindow` is the
+ *  model's context size when reported (unused by C4a token accounting). */
+export interface CodexThreadTokenUsage {
+  readonly total: CodexUsageBreakdown;
+  readonly last: CodexUsageBreakdown;
+  readonly modelContextWindow?: number;
+}
+
 export type CodexNotification =
   | { readonly kind: "thread_started"; readonly method: string; readonly threadId: string; readonly params: unknown }
   | {
@@ -98,6 +125,18 @@ export type CodexNotification =
       readonly threadId: string;
       readonly turnId: string;
       readonly status?: string;
+      readonly params: unknown;
+    }
+  | {
+      // PRD #1332 C4a / D5: a TYPED per-thread token-usage update, decoded off the pinned
+      // `thread/tokenUsage/updated` method rather than treated as generic activity. A frame
+      // whose threadId/turnId/total/last cannot be parsed falls to `activity` (fail-safe
+      // liveness), never a mis-shaped token_usage.
+      readonly kind: "token_usage_updated";
+      readonly method: string;
+      readonly threadId: string;
+      readonly turnId: string;
+      readonly usage: CodexThreadTokenUsage;
       readonly params: unknown;
     }
   | {
@@ -181,6 +220,47 @@ function readStringProp(obj: unknown, key: string): string | undefined {
   if (typeof obj === "object" && obj !== null) {
     const v = (obj as Record<string, unknown>)[key];
     if (typeof v === "string") return v;
+  }
+  return undefined;
+}
+
+function readObjectProp(obj: unknown, key: string): Record<string, unknown> | undefined {
+  if (typeof obj === "object" && obj !== null) {
+    const v = (obj as Record<string, unknown>)[key];
+    if (typeof v === "object" && v !== null && !Array.isArray(v)) return v as Record<string, unknown>;
+  }
+  return undefined;
+}
+
+/** A finite `>= 0` number off `obj[key]`, else 0. Missing/negative/NaN/Infinity collapse to 0
+ *  so a partial or attacker-shaped breakdown yields a bounded, non-negative count. */
+function readNonNegNumber(obj: Record<string, unknown>, key: string): number {
+  const v = obj[key];
+  return typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : 0;
+}
+
+function parseUsageBreakdown(raw: Record<string, unknown> | undefined): CodexUsageBreakdown | undefined {
+  if (raw === undefined) return undefined;
+  return {
+    inputTokens: readNonNegNumber(raw, "inputTokens"),
+    cachedInputTokens: readNonNegNumber(raw, "cachedInputTokens"),
+    cacheWriteInputTokens: readNonNegNumber(raw, "cacheWriteInputTokens"),
+    outputTokens: readNonNegNumber(raw, "outputTokens"),
+    reasoningOutputTokens: readNonNegNumber(raw, "reasoningOutputTokens"),
+    totalTokens: readNonNegNumber(raw, "totalTokens"),
+  };
+}
+
+/** Resolve the object carrying the `total`/`last` breakdowns of a `thread/tokenUsage/updated`
+ *  frame. The pinned protocol shape is not fixed offline, so this accepts the breakdowns either
+ *  directly on `params` OR nested under a `usage` object, and returns whichever holds both
+ *  breakdowns. Neither present ⇒ undefined (the caller falls to `activity`, fail-safe). */
+function tokenUsageContainer(params: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  if (params === undefined) return undefined;
+  if (readObjectProp(params, "total") !== undefined && readObjectProp(params, "last") !== undefined) return params;
+  const nested = readObjectProp(params, "usage");
+  if (nested !== undefined && readObjectProp(nested, "total") !== undefined && readObjectProp(nested, "last") !== undefined) {
+    return nested;
   }
   return undefined;
 }
@@ -491,6 +571,24 @@ class CodexTransportImpl implements CodexTransport {
           return status === undefined
             ? { kind: "turn_completed", method, threadId, turnId, params }
             : { kind: "turn_completed", method, threadId, turnId, status, params };
+        }
+      } else if (method === "thread/tokenUsage/updated") {
+        // PRD #1332 C4a / D5: decode as a TYPED usage notification. It requires threadId,
+        // turnId AND both `total`/`last` breakdowns; any missing/mis-shaped part falls through
+        // to `activity` (fail-safe liveness) so a malformed frame never mis-accounts.
+        const p = params as Record<string, unknown> | undefined;
+        const threadId = readStringProp(params, "threadId");
+        const turnId = readStringProp(params, "turnId");
+        const container = tokenUsageContainer(p);
+        const total = parseUsageBreakdown(readObjectProp(container, "total"));
+        const last = parseUsageBreakdown(readObjectProp(container, "last"));
+        if (threadId !== undefined && turnId !== undefined && total !== undefined && last !== undefined) {
+          const rawWindow = container?.modelContextWindow;
+          const usage: CodexThreadTokenUsage =
+            typeof rawWindow === "number" && Number.isFinite(rawWindow) && rawWindow >= 0
+              ? { total, last, modelContextWindow: rawWindow }
+              : { total, last };
+          return { kind: "token_usage_updated", method, threadId, turnId, usage, params };
         }
       }
     }

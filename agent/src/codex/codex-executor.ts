@@ -1658,6 +1658,11 @@ export class CodexExecutor implements Executor {
       if (typeof childThreadId !== "string" || childThreadId.length === 0) {
         throw new Error("codex child thread/start returned no thread id");
       }
+      // PRD #1332 C4a: capture the CHILD thread->model mapping the moment the child thread id
+      // is known, with the SAME model selected for its thread/start (`spec.model ?? provider.
+      // model`). Without this the child's token-usage notes would be an unknown thread and its
+      // usage would be dropped rather than charged to its actual model.
+      harness.recordChildThreadModel(childThreadId, spec.model ?? provider.model);
       // Register the sink BEFORE turn/start so no child turn frame is missed by the demux.
       const sink = new ChildFrameQueue();
       harness.registerChildSink(childThreadId, sink);

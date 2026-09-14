@@ -54,6 +54,7 @@ import { renderCodexRun } from "./render.js";
 import { buildCodexDynamicTools } from "./dynamic-tools.js";
 import { CODEX_DELEGATE_TOOLS, CODEX_SIGNAL_TOOLS, canonicalizeCodexToolName } from "./broker.js";
 import { normalizeCodexStatus, normalizeCodexTerminalErrors, normalizeCodexUsage } from "./terminal-normalize.js";
+import { CodexUsageAccountant } from "./token-accounting.js";
 
 import type { Logger } from "../log.js";
 import type {
@@ -66,6 +67,7 @@ import type {
   HarnessTerminal,
   HarnessThrownFailure,
   HarnessTurn,
+  HarnessUsage,
   ProcessReap,
   RunHarness,
   RunTurnRequest,
@@ -211,6 +213,20 @@ function extractText(item: Record<string, unknown>): string[] {
   return out;
 }
 
+/** PRD #1332 C4a: fold the reconciled per-model `modelUsage` into a terminal {@link
+ *  HarnessUsage}. When `modelUsage` is undefined (no usage reconciled) the base usage passes
+ *  through UNCHANGED, so a Codex terminal with no token-usage notes is byte-identical to before
+ *  C4a. When usage is reconciled but the turn carried no `turn.usage` (base is undefined), a
+ *  minimal `turn`-basis usage is created to carry `modelUsage` — its `wire.usage` stays
+ *  undefined so `payload.usage` remains absent exactly as before. */
+function attachModelUsage(base: HarnessUsage | undefined, modelUsage: unknown): HarnessUsage | undefined {
+  if (modelUsage === undefined) return base;
+  if (base === undefined) {
+    return { basis: "turn", tokens: {}, wire: { usage: undefined, modelUsage } };
+  }
+  return { ...base, wire: { usage: base.wire?.usage, modelUsage } };
+}
+
 /** A small best-effort deadline (ms) for tearing down a just-launched root that FAILED
  *  registry admission. The launch is already being failed; this only bounds the cleanup
  *  of the unadmitted root so it cannot hang the setup throw. */
@@ -258,6 +274,14 @@ export class CodexHarness implements RunHarness {
   private threadId?: string;
   private currentModel?: string;
   private closed = false;
+
+  // PRD #1332 C4a: the per-run token accountant. It holds the IMMUTABLE thread->model map
+  // (root captured on thread establishment, children via {@link recordChildThreadModel}) and
+  // reconciles every `thread/tokenUsage/updated` note into per-model deltas. Constructed ONCE
+  // and never reset — the root thread's cumulative spans turns and earlier-turn children stay
+  // aggregated — so each turn terminal emits the run's cumulative-since-baseline modelUsage,
+  // which C1's per-leg GREATEST fold deduplicates.
+  private readonly accountant = new CodexUsageAccountant();
 
   // Child-thread demux (part C): a registered sink receives every frame carrying its
   // child thread id off the SAME transport, so a delegation's child turn can consume its
@@ -331,6 +355,15 @@ export class CodexHarness implements RunHarness {
   /** Route frames carrying `threadId` into `sink` instead of the root loop. */
   registerChildSink(threadId: string, sink: CodexChildSink): void {
     this.childSinks.set(threadId, sink);
+  }
+
+  /** PRD #1332 C4a: capture the IMMUTABLE CHILD `threadId -> configured model` mapping. The
+   *  executor's child-turn seam calls this the moment a delegated child thread id is known,
+   *  with the model it selected (`spec.model ?? provider.model`), so the accountant can charge
+   *  the child's token-usage notes to its ACTUAL model rather than the root's. A child thread
+   *  is always fresh (ephemeral, never resumed), so it baselines at zero. */
+  recordChildThreadModel(threadId: string, model: string): void {
+    this.accountant.registerThread(threadId, model, false);
   }
 
   /** Stop routing frames for `threadId` to a child sink (the child turn is done). */
@@ -502,10 +535,14 @@ export class CodexHarness implements RunHarness {
       // 2. Start (or resume) the thread with the explicit untrusted / doc-max config —
       //    and NEVER a hook-trust bypass. Reused across turns once established.
       if (this.threadId === undefined) {
-        this.threadId =
-          request.resumeSessionId !== undefined
-            ? await this.resumeThread(transport, request, rendered)
-            : await this.startThread(transport, rendered, request.signal);
+        const resumed = request.resumeSessionId !== undefined;
+        this.threadId = resumed
+          ? await this.resumeThread(transport, request, rendered)
+          : await this.startThread(transport, rendered, request.signal);
+        // PRD #1332 C4a: capture the ROOT thread->model mapping the moment the thread id is
+        // known. The model is the immutable configured root model (currentModel); a resumed
+        // thread baselines at its pre-resume cumulative rather than zero.
+        this.accountant.registerThread(this.threadId, this.currentModel ?? this.provider.model, resumed);
       }
 
       // 3. Start the turn with the rendered prompt / model / effort.
@@ -544,6 +581,14 @@ export class CodexHarness implements RunHarness {
             category: "protocol",
             message: "codex app-server stream ended before turn completion",
           });
+        }
+        // PRD #1332 C4a: reconcile every typed token-usage note into the per-model accountant
+        // BEFORE the demux, so BOTH root and demuxed-child usage is captured off this single
+        // consumer. An unknown/unregistered thread id is dropped inside record() (never
+        // attributed to root). The note still flows on to its normal handling below (a child's
+        // routes to its sink; a root's maps to `activity`), so decode behavior is unchanged.
+        if (step.value.kind === "token_usage_updated") {
+          this.accountant.record(step.value.threadId, step.value.usage);
         }
         // CHILD-THREAD DEMUX (part C). A frame carrying a REGISTERED child thread id is a
         // delegated child's frame: route its CONTENT to the child controller's sink and
@@ -761,6 +806,11 @@ export class CodexHarness implements RunHarness {
         }
         return { kind: "initialized", model: this.currentModel, sessionId: note.threadId };
       case "turn_started":
+        return { kind: "activity", sessionId: note.threadId };
+      case "token_usage_updated":
+        // PRD #1332 C4a: the token accounting already happened in the run loop before the
+        // demux; on the event stream this is pure liveness (no frame, no items). A child's
+        // token-usage note never reaches here (the demux routes it to the child sink first).
         return { kind: "activity", sessionId: note.threadId };
       case "turn_completed": {
         // The harness serves ONLY the ACTIVE root turn. A terminal for a stale turn id or
@@ -994,7 +1044,11 @@ export class CodexHarness implements RunHarness {
     // text-free, and usage is a bounded numeric-only subset.
     const { subtype, outcome } = normalizeCodexStatus(rawStatus);
     const errors = normalizeCodexTerminalErrors(subtype, outcome);
-    const usage = normalizeCodexUsage(turn?.usage, "turn");
+    // PRD #1332 C4a: attach the per-model token accounting as the result-frame `modelUsage`.
+    // The reducer emits `terminal.usage.wire.modelUsage`, so the reconciled deltas ride out
+    // there. When no usage was reconciled, aggregateByModel() is undefined and the terminal
+    // usage is left byte-identical to before C4a.
+    const usage = attachModelUsage(normalizeCodexUsage(turn?.usage, "turn"), this.accountant.aggregateByModel());
     return {
       outcome,
       subtype,
