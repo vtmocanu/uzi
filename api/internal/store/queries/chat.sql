@@ -87,6 +87,13 @@ WHERE id = (
       -- PRD #529 Decision 4: an ephemeral worker is run-bound and its bound run is
       -- never a chat, so it never claims a chat (no-foreign-work).
       AND NOT @is_ephemeral::boolean
+      -- PRD #1332 M5A (D3): fail closed on ANY Codex indicator. UNLIKE ClaimRun's D3 clause
+      -- there is NO capability escape valve — chat does NOT implement Codex until M5B, so a
+      -- Codex-indicating chat run must NEVER be claimed by ANY worker, however capable. Checks
+      -- all THREE binding facts (harness='codex' OR codex_material_revision IS NOT NULL OR
+      -- codex_secret_id IS NOT NULL) so it stays closed on inconsistent/legacy data, exactly as
+      -- the run lane does. No new bind param, so ClaimChatRunParams is unchanged.
+      AND NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
       AND (r.worker_id IS NULL
            OR r.worker_id = @worker_id
            OR r.updated_at < @affinity_cutoff)

@@ -27,30 +27,37 @@ func TestDeriveUsageCostMarkerMatrix(t *testing.T) {
 		harness        string
 		marker         string
 		emittedCostUSD float64
+		costPresent    bool
 		wantStatus     string
 		wantCost       float64
 	}{
 		// Claude: metered under the provider costUSD, marker IGNORED whatever it says (D5 backward compat).
-		{"claude no marker", harnessClaude, "", 0.0123, costStatusMetered, 0.0123},
-		{"claude subscription marker ignored", harnessClaude, costStatusSubscription, 0.0123, costStatusMetered, 0.0123},
-		{"claude metered marker", harnessClaude, costStatusMetered, 0.0123, costStatusMetered, 0.0123},
-		{"claude unreported marker ignored", harnessClaude, costStatusUnreported, 0.0123, costStatusMetered, 0.0123},
-		{"claude unknown marker ignored", harnessClaude, "flex-tier", 0.0123, costStatusMetered, 0.0123},
+		{"claude no marker", harnessClaude, "", 0.0123, true, costStatusMetered, 0.0123},
+		{"claude subscription marker ignored", harnessClaude, costStatusSubscription, 0.0123, true, costStatusMetered, 0.0123},
+		{"claude metered marker", harnessClaude, costStatusMetered, 0.0123, true, costStatusMetered, 0.0123},
+		{"claude unreported marker ignored", harnessClaude, costStatusUnreported, 0.0123, true, costStatusMetered, 0.0123},
+		{"claude unknown marker ignored", harnessClaude, "flex-tier", 0.0123, true, costStatusMetered, 0.0123},
 		// An unexpected harness (impossible under the runs CHECK) falls to the Claude/metered branch.
-		{"empty harness falls to metered", "", costStatusUnreported, 0.0123, costStatusMetered, 0.0123},
-		{"unknown harness falls to metered", "gemini", "", 0.0123, costStatusMetered, 0.0123},
+		{"empty harness falls to metered", "", costStatusUnreported, 0.0123, true, costStatusMetered, 0.0123},
+		{"unknown harness falls to metered", "gemini", "", 0.0123, true, costStatusMetered, 0.0123},
 		// Codex: HONOR the closed marker.
-		{"codex subscription", harnessCodex, costStatusSubscription, 0, costStatusSubscription, 0},
-		{"codex subscription zeroes an emitted cost", harnessCodex, costStatusSubscription, 9.99, costStatusSubscription, 0},
-		{"codex metered carries the price-table amount", harnessCodex, costStatusMetered, 5.55, costStatusMetered, 5.55},
-		{"codex metered zero cost stays metered", harnessCodex, costStatusMetered, 0, costStatusMetered, 0},
-		{"codex explicit unreported", harnessCodex, costStatusUnreported, 3.33, costStatusUnreported, 0},
-		{"codex missing marker is unreported", harnessCodex, "", 3.33, costStatusUnreported, 0},
-		{"codex unknown marker is unreported", harnessCodex, "flex-tier", 3.33, costStatusUnreported, 0},
+		{"codex subscription", harnessCodex, costStatusSubscription, 0, true, costStatusSubscription, 0},
+		{"codex subscription zeroes an emitted cost", harnessCodex, costStatusSubscription, 9.99, true, costStatusSubscription, 0},
+		{"codex metered carries the price-table amount", harnessCodex, costStatusMetered, 5.55, true, costStatusMetered, 5.55},
+		{"codex metered zero cost stays metered", harnessCodex, costStatusMetered, 0, true, costStatusMetered, 0},
+		{"codex explicit unreported", harnessCodex, costStatusUnreported, 3.33, true, costStatusUnreported, 0},
+		{"codex missing marker is unreported", harnessCodex, "", 3.33, true, costStatusUnreported, 0},
+		{"codex unknown marker is unreported", harnessCodex, "flex-tier", 3.33, true, costStatusUnreported, 0},
+		// m5: a Codex 'metered' marker with an ABSENT or INVALID amount fails safe to unreported/0
+		// rather than let numericUSD clamp a bogus figure into a metered row.
+		{"codex metered but amount absent is unreported", harnessCodex, costStatusMetered, 0, false, costStatusUnreported, 0},
+		{"codex metered negative amount is unreported", harnessCodex, costStatusMetered, -5.5, true, costStatusUnreported, 0},
+		{"codex metered NaN amount is unreported", harnessCodex, costStatusMetered, math.NaN(), true, costStatusUnreported, 0},
+		{"codex metered +Inf amount is unreported", harnessCodex, costStatusMetered, math.Inf(1), true, costStatusUnreported, 0},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			gotStatus, gotCost := deriveUsageCost(c.harness, c.marker, c.emittedCostUSD)
+			gotStatus, gotCost := deriveUsageCost(c.harness, c.marker, c.emittedCostUSD, c.costPresent)
 			if gotStatus != c.wantStatus {
 				t.Fatalf("cost_status = %q, want %q", gotStatus, c.wantStatus)
 			}
@@ -82,12 +89,19 @@ func TestFoldHonorsCodexMarkerThroughFakeStore(t *testing.T) {
 	}}
 	svc := New(fs, newBox(t), testParams())
 
+	// Two of these models carry a malformed cost field: codex-badstatus has a non-string
+	// costStatus (`false`) and codex-badcost a non-numeric costUSD (`"lots"`) under a metered
+	// marker. Before m4 decoded costStatus/costUSD as json.RawMessage, EITHER of these would
+	// fail the frame's json.Unmarshal and drop EVERY model's usage; the assertions below prove
+	// the valid siblings STILL persist and each malformed model resolves to unreported/0.
 	msgs := []IncomingMessage{{Seq: 1, Kind: "status", Agent: "lead", Payload: json.RawMessage(`{
 		"event":"result",
 		"modelUsage":{
 			"gpt-6-astra":{"inputTokens":2000,"outputTokens":800,"costUSD":5.55,"costStatus":"metered"},
 			"gpt-5.6-sol":{"inputTokens":1000,"outputTokens":400,"costUSD":0,"costStatus":"subscription"},
-			"codex-missing":{"inputTokens":10,"outputTokens":5,"costUSD":3.33}
+			"codex-missing":{"inputTokens":10,"outputTokens":5,"costUSD":3.33},
+			"codex-badstatus":{"inputTokens":20,"outputTokens":8,"costUSD":1.11,"costStatus":false},
+			"codex-badcost":{"inputTokens":30,"outputTokens":12,"costUSD":"lots","costStatus":"metered"}
 		}}`)}}
 	if err := svc.AppendMessages(context.Background(), w, fs.runOwned.ID, msgs); err != nil {
 		t.Fatalf("AppendMessages: %v", err)
@@ -115,5 +129,7 @@ func TestFoldHonorsCodexMarkerThroughFakeStore(t *testing.T) {
 	}
 	check("gpt-6-astra", costStatusMetered, 5.55) // metered marker → agent price-table amount
 	check("gpt-5.6-sol", costStatusSubscription, 0)
-	check("codex-missing", costStatusUnreported, 0) // no marker → unreported, cost zeroed
+	check("codex-missing", costStatusUnreported, 0)   // no marker → unreported, cost zeroed
+	check("codex-badstatus", costStatusUnreported, 0) // non-string costStatus → invalid marker → unreported
+	check("codex-badcost", costStatusUnreported, 0)   // metered marker + non-numeric costUSD → unreported (m5)
 }

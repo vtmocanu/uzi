@@ -107,11 +107,20 @@ func TestUsageFoldHonorsCodexCostMarkerLiveDB(t *testing.T) {
 		{"codex-explicit-unrep", "unreported", 3.33, "unreported", "0.000000"},  // explicit unreported
 		{"codex-missing", "", 3.33, "unreported", "0.000000"},                   // MISSING marker → unreported
 		{"codex-unknown", "flex-tier", 3.33, "unreported", "0.000000"},          // UNKNOWN marker → unreported
+		{"codex-metered-neg", "metered", -5.5, "unreported", "0.000000"},        // m5: metered + NEGATIVE cost → unreported
 	}
 	modelUsage := map[string]any{}
 	for _, c := range codexCases {
 		modelUsage[c.model] = markedModelUsage(c.marker, c.costUSD)
 	}
+	// Two malformed-field models that markedModelUsage's typed (string marker, float64 cost)
+	// shape cannot express, folded in the SAME frame as the valid rows above so they double as
+	// the sibling-survival proof — before m4 decoded costStatus/costUSD as json.RawMessage,
+	// either malformed field would fail the frame's json.Unmarshal and drop EVERY row:
+	//   - codex-absent-cost: a 'metered' marker with NO costUSD key → m5 → unreported/0;
+	//   - codex-badstatus:   a non-string costStatus (bool) → invalid marker → unreported/0.
+	modelUsage["codex-absent-cost"] = map[string]any{"inputTokens": 2000, "outputTokens": 800, "costStatus": "metered"}
+	modelUsage["codex-badstatus"] = map[string]any{"inputTokens": 2000, "outputTokens": 800, "costUSD": 1.11, "costStatus": false}
 	codexPayload, err := json.Marshal(map[string]any{"event": "result", "modelUsage": modelUsage})
 	if err != nil {
 		t.Fatalf("marshal codex frame: %v", err)
@@ -123,6 +132,13 @@ func TestUsageFoldHonorsCodexCostMarkerLiveDB(t *testing.T) {
 		if h, cs, cost := readUsage(codexRunID, c.model); h != "codex" || cs != c.wantStatus || cost != c.wantCost {
 			t.Fatalf("codex model %q row = harness %q / cost_status %q / cost_usd %q, want codex/%s/%s",
 				c.model, h, cs, cost, c.wantStatus, c.wantCost)
+		}
+	}
+	// The malformed-field siblings: each persists (frame not dropped) and resolves to unreported/0.
+	for _, model := range []string{"codex-absent-cost", "codex-badstatus"} {
+		if h, cs, cost := readUsage(codexRunID, model); h != "codex" || cs != "unreported" || cost != "0.000000" {
+			t.Fatalf("codex malformed model %q row = harness %q / cost_status %q / cost_usd %q, want codex/unreported/0.000000",
+				model, h, cs, cost)
 		}
 	}
 	// Tokens survive an unreported cost — a zero dollar placeholder is not lost token data.

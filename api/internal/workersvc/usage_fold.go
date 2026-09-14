@@ -524,7 +524,16 @@ func foldUsageFrames(ctx context.Context, q usageFoldQuerier, run store.Run, fra
 			// (D5): Claude stays metered under THIS model's provider costUSD (marker ignored), while
 			// Codex HONORS the agent's closed per-model costStatus marker — subscription/metered when
 			// the agent asserts it, unreported for any missing/unknown/inconsistent marker.
-			costStatus, costUSD := deriveUsageCost(run.Harness, mu.CostStatus, mu.CostUSD)
+			//
+			// The marker and amount are decoded INDEPENDENTLY of the frame's json.Unmarshal (m4):
+			// resolveCostStatusMarker / resolveCostUSD tolerate a non-string / non-numeric token on
+			// one sibling model, so a single malformed field no longer discards every other model's
+			// usage in the same frame. deriveUsageCost then applies m5's rule: a Codex 'metered'
+			// marker whose amount is absent or invalid (costPresent=false, NaN, ±Inf, <0) resolves
+			// to 'unreported' with cost 0 rather than a clamped, bogus metered dollar figure.
+			marker := resolveCostStatusMarker(mu.CostStatus)
+			emittedCostUSD, costPresent := resolveCostUSD(mu.CostUSD)
+			costStatus, costUSD := deriveUsageCost(run.Harness, marker, emittedCostUSD, costPresent)
 			if err := q.UpsertRunUsage(ctx, store.UpsertRunUsageParams{
 				RunID:               run.ID,
 				SessionID:           sessionID,
@@ -561,7 +570,7 @@ func numericUSD(usd float64) pgtype.Numeric {
 }
 
 // Harness and cost-status literals, matching the run_usage.harness / run_usage.cost_status
-// CHECK vocabularies (migration 00224) and runs.harness. Kept here (not a shared package)
+// CHECK vocabularies (migration 00226) and runs.harness. Kept here (not a shared package)
 // because C1 is the only writer of these into run_usage; the pure D11 resolver (C3) and the
 // C4b cost projection add their own use of the same tokens.
 const (
@@ -572,6 +581,56 @@ const (
 	costStatusMetered      = "metered"
 	costStatusUnreported   = "unreported"
 )
+
+// costMarkerInvalid is the sentinel resolveCostStatusMarker returns for a costStatus that is
+// PRESENT but not a JSON string (e.g. `false`, `{}`, a number, `null`). It is deliberately NOT
+// one of the closed cost-status literals, so deriveUsageCost's switch routes it through the
+// default arm to 'unreported' for Codex — exactly as a missing or unknown marker is — while
+// staying DISTINCT from "" (absent) for a reader or test that wants to tell the two apart. It
+// never reaches the store: deriveUsageCost emits only its three fixed literals.
+const costMarkerInvalid = "invalid-cost-status-type"
+
+// resolveCostStatusMarker decodes the agent's per-model costStatus marker from its raw JSON
+// (PRD #1332 M5A / m4). Decoding it here, off a json.RawMessage, rather than as a typed struct
+// field is what stops a non-string token on ONE sibling model from failing the whole frame's
+// json.Unmarshal and discarding every other model's usage. The trichotomy:
+//   - ABSENT  — nil/empty RawMessage (the key was omitted: a pre-C4b or Claude frame) → "";
+//   - VALID   — a JSON string → that string verbatim (deriveUsageCost's closed switch validates it);
+//   - INVALID — present but not a JSON string (false, {}, a number, null) → the costMarkerInvalid
+//     sentinel, which deriveUsageCost maps to 'unreported' for Codex.
+func resolveCostStatusMarker(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return costMarkerInvalid
+	}
+	return s
+}
+
+// resolveCostUSD decodes the agent's per-model costUSD from its raw JSON (PRD #1332 M5A / m4),
+// tolerating a non-numeric or non-finite value instead of rejecting the whole frame:
+//   - ABSENT  — nil/empty RawMessage → present=false (amount 0);
+//   - VALID   — a finite JSON number → (that value, true);
+//   - INVALID — a non-numeric token (string, bool, object) or a non-finite/out-of-range number
+//     → present=false.
+// deriveUsageCost then treats an absent or invalid amount under a Codex 'metered' marker as
+// 'unreported' (m5), so a metered row never carries a bogus or clamped dollar figure. Claude
+// ignores present and folds numericUSD(amount) as before (an absent amount is 0, unchanged).
+func resolveCostUSD(raw json.RawMessage) (value float64, present bool) {
+	if len(raw) == 0 {
+		return 0, false
+	}
+	var v float64
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return 0, false
+	}
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return 0, false
+	}
+	return v, true
+}
 
 // deriveUsageCost maps a run's persisted harness and the agent's per-model cost marker to the
 // (cost_status, cost_usd) a folded run_usage row carries (PRD #1332 M5A / D2, D5). The HARNESS is
@@ -586,15 +645,23 @@ const (
 //   - Codex (harness == codex): HONOR the closed marker the agent emits per model (D5).
 //     'subscription' → cost_status='subscription', cost_usd=0 (that credential mode has no
 //     per-token charge, so zero is neutral, not a metered $0). 'metered' → cost_status='metered',
-//     cost_usd = the agent's price-table amount (emittedCostUSD). ANYTHING ELSE — missing, empty,
-//     unknown or inconsistent — → cost_status='unreported', cost_usd=0 ("a Codex row with a
-//     missing, unknown or inconsistent marker resolves to unreported").
+//     cost_usd = the agent's price-table amount (emittedCostUSD) — but ONLY when that amount is
+//     genuinely present and usable (costPresent && finite && >= 0); an ABSENT or INVALID metered
+//     amount (costPresent=false, NaN, ±Inf, or < 0) resolves to cost_status='unreported',
+//     cost_usd=0 (m5), because numericUSD would otherwise silently clamp the bogus value into a
+//     metered row that reads as a real dollar total. ANYTHING ELSE — missing, empty, unknown or
+//     inconsistent marker — → cost_status='unreported', cost_usd=0 ("a Codex row with a missing,
+//     unknown or inconsistent marker resolves to unreported").
+//
+// costPresent is resolveCostUSD's present flag (m4): false when the agent omitted costUSD or
+// emitted a non-numeric/non-finite token for it. It gates ONLY the Codex 'metered' arm; Claude
+// ignores it and folds numericUSD(emittedCostUSD) exactly as before (an absent amount is 0).
 //
 // The marker is worker-controlled, but it never reaches the store verbatim: this closed switch
 // emits only the three fixed literals. Forcing cost_usd to 0 for EVERY non-metered row is what
-// keeps the insert within 00224's run_usage_nonmetered_zero_check (cost_status='metered' OR
+// keeps the insert within 00226's run_usage_nonmetered_zero_check (cost_status='metered' OR
 // cost_usd=0) — only 'metered' ever carries a non-zero cost, whatever the harness.
-func deriveUsageCost(harness, marker string, emittedCostUSD float64) (costStatus string, costUSD pgtype.Numeric) {
+func deriveUsageCost(harness, marker string, emittedCostUSD float64, costPresent bool) (costStatus string, costUSD pgtype.Numeric) {
 	if harness != harnessCodex {
 		return costStatusMetered, numericUSD(emittedCostUSD)
 	}
@@ -602,6 +669,13 @@ func deriveUsageCost(harness, marker string, emittedCostUSD float64) (costStatus
 	case costStatusSubscription:
 		return costStatusSubscription, numericUSD(0)
 	case costStatusMetered:
+		// A metered marker is honored only with a present, finite, non-negative amount; an
+		// absent or invalid amount cannot be a real metered dollar figure, so fail safe to
+		// 'unreported' rather than let numericUSD clamp it (NaN/-Inf/<0 → 0, +Inf → the ceiling)
+		// into a metered row (m5).
+		if !costPresent || math.IsNaN(emittedCostUSD) || math.IsInf(emittedCostUSD, 0) || emittedCostUSD < 0 {
+			return costStatusUnreported, numericUSD(0)
+		}
 		return costStatusMetered, numericUSD(emittedCostUSD)
 	default:
 		return costStatusUnreported, numericUSD(0)

@@ -2040,18 +2040,29 @@ type resultUsagePayload struct {
 }
 
 type resultModelUsage struct {
-	InputTokens              int64   `json:"inputTokens"`
-	OutputTokens             int64   `json:"outputTokens"`
-	CacheReadInputTokens     int64   `json:"cacheReadInputTokens"`
-	CacheCreationInputTokens int64   `json:"cacheCreationInputTokens"`
-	CostUSD                  float64 `json:"costUSD"`
-	// CostStatus is the agent's CLOSED per-model cost marker (PRD #1332 D5):
-	// "subscription" | "metered" | "unreported", camelCase to match the SDK's
-	// forwarded ModelUsage shape. It is HONORED only for Codex runs and only
-	// through deriveUsageCost's closed switch — a Claude row ignores it, and no
-	// worker-supplied string ever reaches run_usage verbatim. Absent/empty on a
-	// pre-C4b frame or a Claude frame; lenient decode leaves it "".
-	CostStatus string `json:"costStatus"`
+	InputTokens              int64 `json:"inputTokens"`
+	OutputTokens             int64 `json:"outputTokens"`
+	CacheReadInputTokens     int64 `json:"cacheReadInputTokens"`
+	CacheCreationInputTokens int64 `json:"cacheCreationInputTokens"`
+	// CostUSD is the agent's per-model provider dollar cost, decoded as RAW JSON (PRD
+	// #1332 M5A / m4) rather than float64: a non-numeric token (e.g. "lots", {}) on ONE
+	// sibling model must not reject the whole frame and lose every other model's usage.
+	// resolveCostUSD collapses it to an (amount, present) pair — absent/empty or a
+	// non-numeric/non-finite token is present=false, a finite JSON number is (value, true).
+	CostUSD json.RawMessage `json:"costUSD"`
+	// CostStatus is the agent's CLOSED per-model cost marker (PRD #1332 D5), decoded as
+	// RAW JSON (m4) — again so a non-string token on one sibling never rejects the frame.
+	// resolveCostStatusMarker collapses the raw token to the absent / invalid / valid
+	// trichotomy:
+	//   - ABSENT  — the key was omitted (nil/empty RawMessage): a pre-C4b or Claude frame → "";
+	//   - INVALID — present but NOT a JSON string (false, {}, a number, null): → the
+	//     costMarkerInvalid sentinel, which deriveUsageCost routes to 'unreported' for Codex;
+	//   - VALID   — a JSON string: the marker verbatim ("subscription" | "metered" | anything
+	//     else), validated by deriveUsageCost's closed switch, HONORED only for Codex.
+	// It is HONORED only for Codex runs and only through that closed switch — a Claude row
+	// ignores it, and no worker-supplied string ever reaches run_usage verbatim (the switch
+	// emits only its three fixed literals).
+	CostStatus json.RawMessage `json:"costStatus"`
 }
 
 // run_usage's PK is (run_id, session_id, model). run_id is a uuid (16 bytes in

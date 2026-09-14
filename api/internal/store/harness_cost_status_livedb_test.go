@@ -536,7 +536,7 @@ func TestCrossRunCostStatusCountsLiveDB(t *testing.T) {
 // The two rows share the run's harness ('claude'): the view folds on cost_status, not harness,
 // and run_usage carries no harness↔cost_status coherence CHECK (only runs does), so a
 // 'claude' row with cost_status 'subscription'/'unreported' is legal as long as it carries
-// cost_usd=0 (00224's run_usage_nonmetered_zero_check) — which every non-metered row here does.
+// cost_usd=0 (00226's run_usage_nonmetered_zero_check) — which every non-metered row here does.
 //
 // Mutation sensitivity, so a cross-model regression cannot ride in green:
 //   - reverting the mixed-dominance AND to OR misfolds the all-subscription run (run3) and the

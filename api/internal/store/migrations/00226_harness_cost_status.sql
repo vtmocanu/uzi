@@ -3,7 +3,7 @@
 -- PRD #1332 (parent #1106 M5A / C1): the additive "dark Codex routing foundation"
 -- schema. Five new columns plus the CHECKs that close their vocabularies, added in the
 -- lock-cheap two-step (ADD COLUMN + ADD CONSTRAINT ... NOT VALID here, VALIDATE
--- CONSTRAINT in the sibling 00225) that 00219/00220 and 00216/00217 established for a
+-- CONSTRAINT in the sibling 00227) that 00219/00220 and 00216/00217 established for a
 -- CHECK on a populated table: an inline validated CHECK would have PostgreSQL scan every
 -- row under the ACCESS EXCLUSIVE lock the ALTER already holds, whereas VALIDATE CONSTRAINT
 -- later takes only a write-compatible SHARE UPDATE EXCLUSIVE scan.
@@ -44,7 +44,7 @@ ALTER TABLE run_schedules ADD COLUMN harness text;
 UPDATE runs SET harness = 'codex' WHERE codex_material_revision IS NOT NULL;
 
 -- Every new CHECK is added NOT VALID (enforced for new/updated rows immediately; the
--- backlog scan is deferred to 00225's VALIDATE CONSTRAINT).
+-- backlog scan is deferred to 00227's VALIDATE CONSTRAINT).
 ALTER TABLE runs ADD CONSTRAINT runs_harness_check
     CHECK (harness IN ('claude', 'codex')) NOT VALID;
 ALTER TABLE run_usage ADD CONSTRAINT run_usage_harness_check

@@ -2982,7 +2982,7 @@ LIMIT @lim;
 -- and two-of-{metered,subscription,unreported}) resolves to 'unreported'. cost_usd is
 -- GREATEST only when the RESOLVED status is 'metered' (which requires both sides already
 -- 'metered'), else 0 — so a redelivery can never combine an unreported/subscription status
--- with a positive dollar amount, and the result always satisfies 00224's
+-- with a positive dollar amount, and the result always satisfies 00226's
 -- run_usage_nonmetered_zero_check (cost_status='metered' OR cost_usd=0).
 INSERT INTO run_usage (
     run_id, session_id, model, lineage_epoch,

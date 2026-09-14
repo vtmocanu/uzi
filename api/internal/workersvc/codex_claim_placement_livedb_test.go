@@ -24,7 +24,7 @@ import (
 // `ok` with PASS=0 is INVALID, not green.
 
 // seedCodexQueuedRun inserts a queued issue run with harness='codex' — the primary Codex-indicating
-// shape (the binding-coherence CHECK, migration 00224, allows harness='codex' with NULL sentinels).
+// shape (the binding-coherence CHECK, migration 00226, allows harness='codex' with NULL sentinels).
 // worker_id NULL so affinity never pins it; required_capabilities '{}' so fn_worker_can_claim is
 // trivially satisfiable and the D3 Codex clause is the ONLY thing that can block.
 func (e interlockLiveDB) seedCodexQueuedRun(t *testing.T) uuid.UUID {
@@ -214,8 +214,8 @@ func TestQueuedReasonNoCodexCapableWorkerLiveDB(t *testing.T) {
 		e.seedWorker(t, []string{capability.CodexHarnessV1}) // an ONLINE codex-capable worker
 		runID := e.seedCodexQueuedRun(t)
 		got := svc.queuedReason(e.ctx, time.Now(), e.codexIndicatingQueuedRow(runID))
-		if got == reasonNoCodexCapableWorker {
-			t.Fatalf("queuedReason = %q, but a codex-capable worker is online — the Codex rung must not fire", got)
+		if got != reasonWaitingWorker {
+			t.Fatalf("queuedReason = %q, want %q", got, reasonWaitingWorker)
 		}
 	})
 
@@ -224,8 +224,8 @@ func TestQueuedReasonNoCodexCapableWorkerLiveDB(t *testing.T) {
 		runID := e.seedQueuedRun(t, nil, nil)
 		row := e.codexIndicatingQueuedRow(runID)
 		row.Harness = harnessClaude // an ordinary Claude run is not codex-indicating
-		if got := svc.queuedReason(e.ctx, time.Now(), row); got == reasonNoCodexCapableWorker {
-			t.Fatalf("queuedReason = %q, but a Claude run is not codex-indicating — the Codex rung must not fire for it", got)
+		if got := svc.queuedReason(e.ctx, time.Now(), row); got != reasonWaitingWorker {
+			t.Fatalf("queuedReason = %q, want %q", got, reasonWaitingWorker)
 		}
 	})
 }

@@ -7,7 +7,7 @@
 -- every dependent read query (GetRunUsageTotal, ListRunsForUser's ru.* join,
 -- GetJudgeRunUsageForTarget) still compiles unchanged, and APPENDS cost_status at the end.
 --
--- cost_usd stays SUM(cost_usd): non-metered rows carry cost_usd=0 (00224's
+-- cost_usd stays SUM(cost_usd): non-metered rows carry cost_usd=0 (00226's
 -- run_usage_nonmetered_zero_check), so the sum already equals the metered-only dollar total.
 --
 -- The conservative fold (D2): unreported dominates; a run mixing metered and subscription

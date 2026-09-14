@@ -70,7 +70,7 @@ func TestUpsertRunUsageMergeLiveDB(t *testing.T) {
 			RunID: runID, SessionID: session, Model: model, LineageEpoch: epoch,
 			InputTokens: in, CacheReadTokens: cacheR, CacheCreationTokens: cacheC, OutputTokens: out,
 			// PRD #1332 M5A: these Claude rows are metered; harness/cost_status are now
-			// NOT NULL and CHECK-closed (migration 00224), so the fold must supply them.
+			// NOT NULL and CHECK-closed (migration 00226), so the fold must supply them.
 			CostUsd: numericFromMicros(cost), Harness: "claude", CostStatus: "metered",
 		}); err != nil {
 			t.Fatalf("UpsertRunUsage(%s): %v", session, err)
