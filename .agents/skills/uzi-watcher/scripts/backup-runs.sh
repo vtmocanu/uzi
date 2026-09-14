@@ -2,12 +2,13 @@
 # One-shot backup of in-flight uzi run work from hosted (k8s) worker PVCs.
 #
 # Handles every run kind: the per-run "stem" equals the run's canonical runner-clone
-# slug (agent/src/run-kind.ts deriveCloneKey) -- issue/chat/judge -> issue-N, task ->
-# task-<runid>, and mr_rework/ci_fix/self_improve/prompt -> slugify(branch). So an
-# mr_rework run reuses the issue branch's clone: agent/issue-N -> issue-N.* files at
-# /data/runner/<slug>/agent-issue-N, NOT a mr_rework-<runid> dir. A task or mr_rework
-# run's work is often still UNCOMMITTED, so the uncommitted.patch + untracked capture
-# is what saves it.
+# slug (agent/src/run-kind.ts deriveCloneKey): issue/chat/judge -> issue-N, task ->
+# task-<runid>, self_improve -> uzi-self-improve-<runid>, prompt -> uzi-prompt-<runid>,
+# and mr_rework/ci_fix -> slugify(pipeline_ref). A mr_rework run reuses the issue
+# branch's clone at /data/runner/<slug>/agent-issue-N (files agent-issue-N.*), NOT a
+# mr_rework-<runid> dir; runs.branch is NULL in-flight (claim_assembly.go) so the live
+# branch comes from pipeline_ref. A task or mr_rework run's work is often still
+# UNCOMMITTED, so the uncommitted.patch + untracked capture is what saves it.
 #
 # For each run id it resolves worker_id -> pod FRESH each call (so it survives a
 # worker roll or a cross-worker migration), execs into the worker container, and
@@ -182,25 +183,35 @@ for RID in "${RUNS[@]}"; do
   wid="$(printf '%s' "$J" | "$JQ" -r '.worker_id // ""' 2>/dev/null)"
   mr="$(printf '%s' "$J" | "$JQ" -r '.mr_web_url // ""' 2>/dev/null)"
   branch="$(printf '%s' "$J" | "$JQ" -r '.branch // ""' 2>/dev/null)"
+  pref="$(printf '%s' "$J" | "$JQ" -r '.pipeline_ref // ""' 2>/dev/null)"
 
   # The "stem" is BOTH the on-pod working-clone dir name and the output-file prefix,
-  # so it must equal the run's canonical runner-clone slug. Mirror
-  # agent/src/run-kind.ts deriveCloneKey exactly:
+  # so it must equal the run's canonical runner-clone slug (agent/src/run-kind.ts
+  # deriveCloneKey). Derive it from the fields the CLI DTO exposes for an IN-FLIGHT
+  # run, which is the only state backups matter for:
   #   issue/chat/judge -> issue-<iid>
   #   task             -> task-<runid>
-  #   mr_rework/ci_fix/self_improve/prompt -> slugify(branch)  (branch's "/" -> "-")
-  # A mr_rework (or ci_fix) run REUSES the branch's clone: agent/issue-N lives at
-  # /data/runner/<slug>/agent-issue-N, NOT mr_rework-<runid>, so deriving from kind
-  # alone points at a dir that does not exist and the capture silently fails.
+  #   self_improve     -> uzi-self-improve-<runid>   (branch is uzi/self-improve/<runid>)
+  #   prompt           -> uzi-prompt-<runid>         (branch is uzi/prompt-<runid>)
+  #   mr_rework/ci_fix  -> slugify(pipeline_ref)      ("/" -> "-")
+  # runs.branch is NULL until completion (claim_assembly.go: a mr_rework/ci_fix run
+  # sources its live branch from pipeline_ref), so keying mr_rework off .branch would
+  # fall back to a mr_rework-<runid> dir that never exists and the capture would
+  # silently produce a status snapshot only. slugify: replace "/" with "-".
   case "$kind" in
     issue|chat|judge|"")
       if [ -n "$iid" ]; then STEM="issue-$iid"; LBL="#$iid"
       else STEM="run-$RID"; LBL="run ${RID%%-*}"; fi ;;
-    task)
-      STEM="task-$RID"; LBL="task ${RID%%-*}" ;;
-    *)
-      if [ -n "$branch" ]; then STEM="$(printf '%s' "$branch" | tr '/' '-')"; LBL="$kind ${RID%%-*}"
-      else STEM="$kind-$RID"; LBL="$kind ${RID%%-*}"; fi ;;  # branch unknown: best-effort
+    task)         STEM="task-$RID";            LBL="task ${RID%%-*}" ;;
+    self_improve) STEM="uzi-self-improve-$RID"; LBL="self_improve ${RID%%-*}" ;;
+    prompt)       STEM="uzi-prompt-$RID";      LBL="prompt ${RID%%-*}" ;;
+    *)  # mr_rework / ci_fix (and any future branch-scoped kind): use pipeline_ref, the
+        # live branch in-flight; fall back to branch (populated once completed), else a
+        # unique best-effort name. ci_fix's rare default-branch case (ci-fix/pipeline-<id>)
+        # needs pipeline_id, which the DTO does not expose, so it is not reconstructed.
+      src="$pref"; [ -n "$src" ] || src="$branch"
+      if [ -n "$src" ]; then STEM="$(printf '%s' "$src" | tr '/' '-')"; LBL="$kind ${RID%%-*}"
+      else STEM="${kind:-run}-$RID"; LBL="${kind:-run} ${RID%%-*}"; fi ;;
   esac
 
   # --- status/progress snapshot (ALWAYS, even if parked or terminal: what was

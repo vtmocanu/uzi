@@ -73,16 +73,17 @@ STUB
 chmod +x "$KSTUB"
 
 # make_uzi_stub: write a fake `uzi` that answers `run get --json`. A run id containing
-# "mrr" reports a mr_rework run (iid null, branch set) so the slug must come from the
-# branch (agent/issue-9999 -> agent-issue-9999); anything else is the issue-4242 run.
+# "mrr" reports a mr_rework run EXACTLY as the real API does IN-FLIGHT: branch is null
+# and the live branch is in pipeline_ref (agent/issue-9999), so the slug must come from
+# pipeline_ref (-> agent-issue-9999); anything else is the issue-4242 run.
 make_uzi_stub() {
   cat > "$WORK/uzi" <<STUB
 #!/usr/bin/env bash
 set -u
 if [ "\${1:-}" = run ] && [ "\${2:-}" = get ]; then
   case "\${3:-}" in
-    *mrr*) printf '%s' '{"status":"running","issue_iid":null,"kind":"mr_rework","branch":"agent/issue-9999","worker_id":"${WID:-w0rker}","mr_iid":7777,"mr_web_url":null,"health_reason":"ok","anthropic_secret_label":"tok","anthropic_bind_mode":"default","milestones":[],"milestones_completed":[]}' ;;
-    *)     printf '%s' '{"status":"running","issue_iid":4242,"kind":"issue","branch":null,"worker_id":"${WID:-w0rker}","mr_web_url":null,"health_reason":"ok","anthropic_secret_label":"tok","anthropic_bind_mode":"default","milestones":[],"milestones_completed":[]}' ;;
+    *mrr*) printf '%s' '{"status":"running","issue_iid":null,"kind":"mr_rework","branch":null,"pipeline_ref":"agent/issue-9999","worker_id":"${WID:-w0rker}","mr_iid":7777,"mr_web_url":null,"health_reason":"ok","anthropic_secret_label":"tok","anthropic_bind_mode":"default","milestones":[],"milestones_completed":[]}' ;;
+    *)     printf '%s' '{"status":"running","issue_iid":4242,"kind":"issue","branch":null,"pipeline_ref":null,"worker_id":"${WID:-w0rker}","mr_web_url":null,"health_reason":"ok","anthropic_secret_label":"tok","anthropic_bind_mode":"default","milestones":[],"milestones_completed":[]}' ;;
   esac
   exit 0
 fi
@@ -145,8 +146,9 @@ fi
 echo "PASS case2: one commit -> base-excluded bundle, OK"
 
 # --- case 3: mr_rework REUSES the branch clone (agent/issue-9999 -> agent-issue-9999) --
-# The run has no issue_iid; its slug must come from `branch`, not `mr_rework-<runid>`.
-# The old kind-only derivation looked for a mr_rework-<runid> dir that never exists.
+# The run has no issue_iid and (in-flight) a NULL branch; its slug must come from
+# pipeline_ref, not `mr_rework-<runid>`. Both the old kind-only derivation AND a naive
+# .branch read look for a dir that never exists (branch is null until completion).
 RUNNER3="$WORK/runner/agent-issue-9999"
 git clone -q "$FORGE" "$RUNNER3"
 git -C "$RUNNER3" config user.email t@example.com
