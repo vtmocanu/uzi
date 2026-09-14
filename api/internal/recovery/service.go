@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -23,13 +25,25 @@ import (
 // bundle imports against a small verified public closure, never an unbounded list.
 const maxPrerequisiteShas = 64
 
+// ErrAmbiguous: a v1/no-generation worker holds MORE THAN ONE open custody hold on the run, so
+// the server cannot pick which generation a capture-reserve belongs to (PRD #1349 M4, D1/D2). It
+// refuses rather than guess a newest hold — the hold stays open and the worker must name its
+// generation (v2) or the owner disposes explicitly. Defined here beside the Reserve/Release
+// exact-generation logic that raises it (the shared sentinels live in recovery.go); the handler
+// maps it (a 409 Conflict is ideal, but mapRecoveryError's default 500 is acceptable).
+var ErrAmbiguous = errors.New("recovery: ambiguous open custody generation")
+
 // ── Worker-facing operations (D2/D6/D7). Each enforces the ORIGINAL worker identity and
 // an OPEN hold; none mutates run state or retargets another owner/repo/run. ──────────────
 
-// Reserve creates (or idempotently re-reserves) a capture under the run's open custody
-// hold owned by wkr. A lost ACK re-reserves the SAME capture id (idempotency key), never
-// a duplicate. Capture-admission bounds (per-claim, per-owner) gate a genuinely new
-// capture; a retry of an existing key is exempt. Reserve never touches the runs table.
+// Reserve creates (or idempotently re-reserves) a capture under the EXACT custody hold this
+// capture belongs to (PRD #1349 M4, D1/D2). A v2 worker that names req.Generation binds to the
+// hold it took at that claim generation, fail-closed (ErrNotAuthorized) if no such open hold
+// exists; a v1/no-generation worker binds only when it holds a SINGLE open hold — more than one
+// is ErrAmbiguous (the hold stays open, nothing is guessed). A lost ACK re-reserves the SAME
+// capture id (idempotency key), never a duplicate. Capture-admission bounds (per-claim,
+// per-owner) gate a genuinely new capture; a retry of an existing key is exempt. Reserve never
+// touches the runs table.
 func (s *Service) Reserve(ctx context.Context, wkr store.Worker, runID uuid.UUID, req apitypes.RecoveryReserveRequest) (apitypes.RecoveryReserveResponse, error) {
 	sourceSha, err := validateSha(req.SourceSha, false)
 	if err != nil {
@@ -50,19 +64,34 @@ func (s *Service) Reserve(ctx context.Context, wkr store.Worker, runID uuid.UUID
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	// Resolve and row-lock the caller's OPEN hold for this run. FOR UPDATE serializes
-	// concurrent reserves under one hold so the per-claim cap is exact. No open hold owned
-	// by this worker → not authorized (fail closed).
-	var holdID uuid.UUID
-	err = tx.QueryRow(ctx, `SELECT id FROM recovery_custody_holds
-		WHERE run_id = $1 AND user_id = $2 AND original_worker_id = $3 AND state = 'open'
-		ORDER BY created_at DESC LIMIT 1 FOR UPDATE`,
-		runID, wkr.UserID, wkr.ID).Scan(&holdID)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return apitypes.RecoveryReserveResponse{}, ErrNotAuthorized
+	// Resolve and row-lock the EXACT custody hold this capture belongs to (PRD #1349 M4,
+	// D1/D2). FOR UPDATE serializes concurrent reserves under the one hold so the per-claim cap
+	// is exact. A v2 worker names its claim generation, so the capture binds to the ONE hold it
+	// took at that generation — never an arbitrary newest same-worker hold; no such open hold
+	// → not authorized (fail closed). A v1/no-generation worker's hold is resolved only when it
+	// is UNAMBIGUOUS: exactly one open hold binds; MORE than one is ErrAmbiguous (refuse rather
+	// than guess, so the hold stays open); zero is ErrNotAuthorized.
+	var (
+		holdID     uuid.UUID
+		generation int64
+	)
+	if slices.Contains(wkr.ProtocolCapabilities, capability.RecoveryArchiveV2) && req.Generation != nil {
+		generation = *req.Generation
+		err = tx.QueryRow(ctx, `SELECT id FROM recovery_custody_holds
+			WHERE run_id = $1 AND user_id = $2 AND original_worker_id = $3 AND generation = $4 AND state = 'open'
+			ORDER BY created_at DESC LIMIT 1 FOR UPDATE`,
+			runID, wkr.UserID, wkr.ID, generation).Scan(&holdID)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return apitypes.RecoveryReserveResponse{}, ErrNotAuthorized
+			}
+			return apitypes.RecoveryReserveResponse{}, err
 		}
-		return apitypes.RecoveryReserveResponse{}, err
+	} else {
+		holdID, generation, err = s.resolveSoleOpenHold(ctx, tx, runID, wkr.ID)
+		if err != nil {
+			return apitypes.RecoveryReserveResponse{}, err
+		}
 	}
 
 	// Is this an idempotent retry of an existing capture identity? If so it is already
@@ -97,7 +126,7 @@ func (s *Service) Reserve(ctx context.Context, wkr store.Worker, runID uuid.UUID
 		}
 	}
 
-	cap, err := store.New(tx).ReserveCapture(ctx, store.ReserveCaptureParams{
+	cap, err := store.New(tx).ReserveCaptureExact(ctx, store.ReserveCaptureExactParams{
 		RunID:                  runID,
 		UserID:                 wkr.UserID,
 		OriginalWorkerID:       pgconv.UUID(wkr.ID),
@@ -105,6 +134,7 @@ func (s *Service) Reserve(ctx context.Context, wkr store.Worker, runID uuid.UUID
 		SourceSha:              sourceSha,
 		AttemptedHeadSha:       pgconv.TextOrNull(attempted),
 		IdempotencyKey:         key,
+		Generation:             generation,
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -443,20 +473,116 @@ func (s *Service) ListHoldsForWorkerRun(ctx context.Context, wkr store.Worker, r
 	return apitypes.RecoveryHoldsResponse{RunID: runID.String(), Holds: holds}, nil
 }
 
-// Release settles every OPEN custody hold this worker holds on the run (D3): it nulls the
-// live FKs (dropping the ON DELETE RESTRICT that blocks teardown), flips state to
-// 'released' and stamps released_at. Scoped to the caller's own holds — a foreign worker
-// releases nothing. Idempotent: a repeat once none remain open settles zero.
-func (s *Service) Release(ctx context.Context, wkr store.Worker, runID uuid.UUID) (apitypes.RecoveryReleaseResponse, error) {
-	tag, err := s.pool.Exec(ctx, `UPDATE recovery_custody_holds
-		SET live_worker_id = NULL, live_run_id = NULL, state = 'released',
-		    released_at = now(), updated_at = now()
-		WHERE run_id = $1 AND original_worker_id = $2 AND state = 'open'`, runID, wkr.ID)
+// Release settles the caller worker's custody hold for the EXACT generation it completed
+// (PRD #1349 M4, D1/D2/D3): it nulls the live FKs (dropping the ON DELETE RESTRICT that blocks
+// teardown), flips state to 'released' and stamps released_at, for that one hold. A v2 worker
+// names req.Generation and the server settles EXACTLY that generation — so a newer same-worker
+// generation can never release an older generation whose source it did not inherit (the D2
+// hazard). A v1/no-generation worker settles its hold only when it holds a SINGLE open hold;
+// when it holds MORE THAN ONE it RETAINS (releases nothing, Retained=true) so an owner disposes
+// explicitly rather than the server dropping an uncaptured sibling generation. Scoped to the
+// caller's own holds — a foreign worker releases nothing. Idempotent: a repeat once none remain
+// open settles zero (Released=false). It NEVER falls back to a generation-blind run+worker bulk
+// release.
+func (s *Service) Release(ctx context.Context, wkr store.Worker, runID uuid.UUID, req apitypes.RecoveryReleaseRequest) (apitypes.RecoveryReleaseResponse, error) {
+	// v2 + explicit generation: settle EXACTLY that generation (fail-safe by rowcount).
+	if slices.Contains(wkr.ProtocolCapabilities, capability.RecoveryArchiveV2) && req.Generation != nil {
+		n, err := store.New(s.pool).ReleaseCustodyHoldExact(ctx, store.ReleaseCustodyHoldExactParams{
+			RunID:      runID,
+			Generation: *req.Generation,
+			WorkerID:   wkr.ID,
+		})
+		if err != nil {
+			return apitypes.RecoveryReleaseResponse{}, err
+		}
+		return apitypes.RecoveryReleaseResponse{RunID: runID.String(), Released: n > 0, HoldsReleased: int(n)}, nil
+	}
+
+	// v1 or no generation: resolve the caller's OPEN holds. Release the SINGLE one; RETAIN on
+	// ambiguity; idempotent no-op when none remain open. FOR UPDATE row-locks the resolution.
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return apitypes.RecoveryReleaseResponse{}, err
 	}
-	n := tag.RowsAffected()
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	_, generation, err := s.resolveSoleOpenHold(ctx, tx, runID, wkr.ID)
+	switch {
+	case errors.Is(err, ErrNotAuthorized):
+		// No open hold owned by this worker: an idempotent no-op (nothing to release).
+		return apitypes.RecoveryReleaseResponse{RunID: runID.String(), Released: false, HoldsReleased: 0}, nil
+	case errors.Is(err, ErrAmbiguous):
+		// RETAIN: more than one open generation for this worker; an explicit disposition is
+		// required so an uncaptured sibling generation is never dropped.
+		return apitypes.RecoveryReleaseResponse{
+			RunID:         runID.String(),
+			Released:      false,
+			HoldsReleased: 0,
+			Retained:      true,
+			Reason:        "ambiguous: multiple open generations for this worker; explicit disposition required",
+		}, nil
+	case err != nil:
+		return apitypes.RecoveryReleaseResponse{}, err
+	}
+
+	n, err := store.New(tx).ReleaseCustodyHoldExact(ctx, store.ReleaseCustodyHoldExactParams{
+		RunID:      runID,
+		Generation: generation,
+		WorkerID:   wkr.ID,
+	})
+	if err != nil {
+		return apitypes.RecoveryReleaseResponse{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return apitypes.RecoveryReleaseResponse{}, err
+	}
 	return apitypes.RecoveryReleaseResponse{RunID: runID.String(), Released: n > 0, HoldsReleased: int(n)}, nil
+}
+
+// resolveSoleOpenHold row-locks the caller worker's OPEN custody holds on the run and returns
+// the SINGLE one's (id, generation) when exactly one is open (PRD #1349 M4, D1/D2). It refuses
+// to guess: zero open holds → ErrNotAuthorized (fail closed), more than one → ErrAmbiguous.
+// Scoped to holds this worker ORIGINALLY took (original_worker_id); a hold is opened with
+// original_worker_id == live_worker_id and that never changes while open, so the resolved
+// generation is exactly reservable/releasable by this worker. Must run inside tx: the FOR UPDATE
+// holds the row lock(s) for the caller's transaction.
+func (s *Service) resolveSoleOpenHold(ctx context.Context, tx pgx.Tx, runID, workerID uuid.UUID) (uuid.UUID, int64, error) {
+	rows, err := tx.Query(ctx, `SELECT id, generation FROM recovery_custody_holds
+		WHERE run_id = $1 AND original_worker_id = $2 AND state = 'open'
+		ORDER BY created_at DESC FOR UPDATE`, runID, workerID)
+	if err != nil {
+		return uuid.Nil, 0, err
+	}
+	defer rows.Close()
+	var (
+		holdID uuid.UUID
+		gen    int64
+		count  int
+	)
+	for rows.Next() {
+		var (
+			id uuid.UUID
+			g  int64
+		)
+		if err := rows.Scan(&id, &g); err != nil {
+			return uuid.Nil, 0, err
+		}
+		if count == 0 {
+			holdID, gen = id, g
+		}
+		count++
+	}
+	if err := rows.Err(); err != nil {
+		return uuid.Nil, 0, err
+	}
+	switch count {
+	case 0:
+		return uuid.Nil, 0, ErrNotAuthorized
+	case 1:
+		return holdID, gen, nil
+	default:
+		return uuid.Nil, 0, ErrAmbiguous
+	}
 }
 
 // ── Owner-facing operations (D6/D7). Owner authorization (GetRun owner-or-404) is done by

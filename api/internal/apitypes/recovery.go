@@ -78,8 +78,9 @@ type RecoveryReserveRequest struct {
 	AttemptedHeadSha string `json:"attempted_head_sha,omitempty"`
 	// Generation is the exact claim generation this capture belongs to (PRD #1349 M1). A v2
 	// worker sends it so the reserve binds to the ONE hold it took at that generation; a v1
-	// worker omits it (the server falls back to the newest-hold ReserveCapture). The call
-	// sites that populate it are M2's — M1 only threads the field onto the wire.
+	// worker omits it, and the server binds under the caller's SOLE open hold — refusing
+	// (ErrAmbiguous) rather than guessing when more than one open hold exists (M4). The call
+	// sites that populate it are M2's.
 	Generation *int64 `json:"generation,omitempty"`
 }
 

@@ -505,16 +505,18 @@ type fakeStore struct {
 	// tests are unaffected. countCustodyWorkerParams captures the last DeleteWorker guard
 	// call so a test can prove it was owner-scoped. releasableHolds seeds the reconciler
 	// candidate list; releaseCustodyRows is what the release queries report.
-	// releasedCustodyRuns records every (run, worker) ReleaseCustodyForRunWorker was called
-	// with (SetState terminal completion), and releasedCustodyHolds records every hold id
-	// ReleaseCustodyHold was called with (the reconciler).
-	openCustodyHolds         int64
-	countCustodyWorkerParams *store.CountOpenCustodyHoldsForWorkerParams
-	releasableHolds          []store.RecoveryCustodyHold
-	releaseCustodyRows       int64
-	releasedCustodyRuns      []uuid.UUID
-	releasedCustodyWorkers   []uuid.UUID
-	releasedCustodyHolds     []uuid.UUID
+	// releasedCustodyRuns / releasedCustodyWorkers / releasedCustodyGenerations record every
+	// (run, worker, generation) ReleaseCustodyHoldExact was called with (SetState terminal
+	// completion, PRD #1349 M4), and releasedCustodyHolds records every hold id ReleaseCustodyHold
+	// was called with (the reconciler).
+	openCustodyHolds           int64
+	countCustodyWorkerParams   *store.CountOpenCustodyHoldsForWorkerParams
+	releasableHolds            []store.RecoveryCustodyHold
+	releaseCustodyRows         int64
+	releasedCustodyRuns        []uuid.UUID
+	releasedCustodyWorkers     []uuid.UUID
+	releasedCustodyGenerations []int64
+	releasedCustodyHolds       []uuid.UUID
 	// PRD #1296 D3/D4 upload-retry-window sweep. stalledUploadsRows is what
 	// ExpireStalledUploads reports; expireStalledWindows records every retry_window it was
 	// called with, so a test can prove the sweep passes the configured window AND (by an empty
@@ -1404,9 +1406,10 @@ func (f *fakeStore) ReleaseCustodyHold(_ context.Context, id uuid.UUID) (int64, 
 	f.releasedCustodyHolds = append(f.releasedCustodyHolds, id)
 	return f.releaseCustodyRows, nil
 }
-func (f *fakeStore) ReleaseCustodyForRunWorker(_ context.Context, arg store.ReleaseCustodyForRunWorkerParams) (int64, error) {
+func (f *fakeStore) ReleaseCustodyHoldExact(_ context.Context, arg store.ReleaseCustodyHoldExactParams) (int64, error) {
 	f.releasedCustodyRuns = append(f.releasedCustodyRuns, arg.RunID)
 	f.releasedCustodyWorkers = append(f.releasedCustodyWorkers, arg.WorkerID)
+	f.releasedCustodyGenerations = append(f.releasedCustodyGenerations, arg.Generation)
 	return f.releaseCustodyRows, nil
 }
 func (f *fakeStore) ExpireStalledUploads(_ context.Context, retryWindow pgtype.Interval) (int64, error) {
@@ -2865,12 +2868,13 @@ func TestSetStateAppliedOnLiveRun(t *testing.T) {
 	}
 }
 
-// TestSetStateCompletedReleasesCustody proves the PRD #1296 M4 (D3) terminal SUCCESS
-// custody release: an APPLIED `completed` transition releases ONLY THE REPORTING WORKER'S
-// custody hold on the run (a completed code-publishing run published its head, so its
-// unpublished-work custody is moot). It is scoped to the reporting worker (wkr.ID) via
-// ReleaseCustodyForRunWorker, NOT the whole run: a sibling older-generation orphan hold held
-// by a different worker must survive. Uses checkpointDeleteSvc so the whole terminal-automation
+// TestSetStateCompletedReleasesCustody proves the PRD #1349 M4 (D1/D2/D3) terminal SUCCESS
+// custody release: an APPLIED `completed` transition releases EXACTLY the completing generation's
+// custody hold for the reporting worker (a completed code-publishing run published its head, so
+// its unpublished-work custody is moot). It is generation-exact via ReleaseCustodyHoldExact —
+// scoped to the reporting worker (wkr.ID) AND the server run row's claim_generation, NOT a
+// generation-blind run+worker bulk release: a sibling older-generation orphan hold (same worker
+// or different worker) must survive. Uses checkpointDeleteSvc so the whole terminal-automation
 // block runs.
 func TestSetStateCompletedReleasesCustody(t *testing.T) {
 	runID := uuid.New()
@@ -2879,6 +2883,7 @@ func TestSetStateCompletedReleasesCustody(t *testing.T) {
 		runOwned: store.Run{
 			ID: runID, Kind: runkind.Issue,
 			IssueIid: pgtype.Int8{Int64: 5, Valid: true}, Status: "completed",
+			ClaimGeneration: 2,
 		},
 		setCompletedRows:   1,
 		releaseCustodyRows: 1,
@@ -2892,12 +2897,17 @@ func TestSetStateCompletedReleasesCustody(t *testing.T) {
 		t.Fatal("applied = false, want true")
 	}
 	if len(fs.releasedCustodyRuns) != 1 || fs.releasedCustodyRuns[0] != runID {
-		t.Fatalf("ReleaseCustodyForRunWorker run calls = %v, want exactly [%s]", fs.releasedCustodyRuns, runID)
+		t.Fatalf("ReleaseCustodyHoldExact run calls = %v, want exactly [%s]", fs.releasedCustodyRuns, runID)
 	}
 	// The release is scoped to the REPORTING worker, not the whole run — the multi-hold guard
-	// that preserves a sibling older-generation orphan hold.
+	// that preserves a sibling orphan hold.
 	if len(fs.releasedCustodyWorkers) != 1 || fs.releasedCustodyWorkers[0] != wkr.ID {
-		t.Fatalf("ReleaseCustodyForRunWorker worker calls = %v, want exactly [%s] (release must be worker-scoped)", fs.releasedCustodyWorkers, wkr.ID)
+		t.Fatalf("ReleaseCustodyHoldExact worker calls = %v, want exactly [%s] (release must be worker-scoped)", fs.releasedCustodyWorkers, wkr.ID)
+	}
+	// The release names the SERVER run row's claim_generation exactly — so completing generation
+	// 2 can never release a still-open generation-1 sibling orphan (the D1/D2 core fix).
+	if len(fs.releasedCustodyGenerations) != 1 || fs.releasedCustodyGenerations[0] != 2 {
+		t.Fatalf("ReleaseCustodyHoldExact generation calls = %v, want exactly [2] (the completing generation)", fs.releasedCustodyGenerations)
 	}
 }
 
@@ -2922,7 +2932,7 @@ func TestSetStateFailedRetainsCustody(t *testing.T) {
 		t.Fatal("applied = false, want true")
 	}
 	if len(fs.releasedCustodyRuns) != 0 {
-		t.Fatalf("ReleaseCustodyForRunWorker was called on a failed run (%v); failed runs must RETAIN custody", fs.releasedCustodyRuns)
+		t.Fatalf("ReleaseCustodyHoldExact was called on a failed run (%v); failed runs must RETAIN custody", fs.releasedCustodyRuns)
 	}
 	if fs.setFailed == nil {
 		t.Fatal("SetRunFailed was not called; the failed transition must be recorded")

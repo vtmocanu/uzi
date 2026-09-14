@@ -3,6 +3,7 @@ package handler
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 
@@ -33,6 +34,11 @@ func mapRecoveryError(w http.ResponseWriter, err error) {
 		httpx.Error(w, http.StatusBadRequest, "invalid recovery request")
 	case errors.Is(err, recovery.ErrNotAuthorized):
 		httpx.Error(w, http.StatusForbidden, "not authorized for this capture")
+	case errors.Is(err, recovery.ErrAmbiguous):
+		// PRD #1349 M4: a v1/no-generation worker holds more than one open hold, so the
+		// server refuses to guess which generation the capture/release covers. The worker
+		// (or owner) must name the exact generation; the holds stay open (fail closed).
+		httpx.Error(w, http.StatusConflict, "ambiguous open custody generation; name the generation")
 	case errors.Is(err, recovery.ErrCaptureNotFound):
 		httpx.Error(w, http.StatusNotFound, "capture not found")
 	case errors.Is(err, recovery.ErrNotAvailable):
@@ -174,7 +180,16 @@ func (h *Handler) WorkerRecoveryRelease(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
-	res, err := h.recovery().Release(r.Context(), wkr, runID)
+	// PRD #1349 M4: a v2 worker names its exact claim generation in the body so only that
+	// generation's hold settles; a v1 worker sends no body (empty → io.EOF → Generation nil
+	// → the server resolves a single open hold or, on ambiguity, retains). An empty body is
+	// the backward-compatible v1 path, so io.EOF is not an error here.
+	var req apitypes.RecoveryReleaseRequest
+	if err := httpx.DecodeJSONStrict(r, &req); err != nil && !errors.Is(err, io.EOF) {
+		httpx.Error(w, http.StatusBadRequest, "invalid release request")
+		return
+	}
+	res, err := h.recovery().Release(r.Context(), wkr, runID, req)
 	if err != nil {
 		mapRecoveryError(w, err)
 		return

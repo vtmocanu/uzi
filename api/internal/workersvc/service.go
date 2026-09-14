@@ -454,7 +454,6 @@ type Store interface {
 	// is opened atomically inside ClaimRun's CTE (D2); everything below operates on the
 	// already-open hold and its immutable captures.
 	CountUnresolvedCustodyHoldsForOwner(ctx context.Context, userID uuid.UUID) (int64, error)
-	ReserveCapture(ctx context.Context, arg store.ReserveCaptureParams) (store.RecoveryCapture, error)
 	BindCaptureManifest(ctx context.Context, arg store.BindCaptureManifestParams) (store.RecoveryCapture, error)
 	InsertCaptureChunk(ctx context.Context, arg store.InsertCaptureChunkParams) error
 	MarkCaptureReady(ctx context.Context, arg store.MarkCaptureReadyParams) (store.RecoveryCapture, error)
@@ -463,13 +462,14 @@ type Store interface {
 	ListCapturesForRunOwner(ctx context.Context, arg store.ListCapturesForRunOwnerParams) ([]store.RecoveryCapture, error)
 	ListCaptureChunks(ctx context.Context, captureID uuid.UUID) ([]store.RecoveryCaptureChunk, error)
 	GetRecoverySummaryForRun(ctx context.Context, arg store.GetRecoverySummaryForRunParams) (store.GetRecoverySummaryForRunRow, error)
-	// PRD #1296 M4 (D3) custody RELEASE, per-hold and per-worker (never per-run, which
-	// would strand a sibling older-generation orphan hold): ReleaseCustodyHold releases the
-	// ONE selected hold (the reconciler's release, agreeing with ListReleasableCustodyHolds);
-	// ReleaseCustodyForRunWorker releases only the completing worker's own hold on the run
-	// (the terminal-completion release in SetState).
+	// Custody RELEASE, always per-hold and generation-exact (never per-run, which would strand
+	// a sibling older-generation orphan hold): ReleaseCustodyHold releases the ONE selected hold
+	// by id (the reconciler's release, agreeing with ListReleasableCustodyHolds, PRD #1296 M4);
+	// ReleaseCustodyHoldExact releases the open hold on a run at an EXACT generation held live by
+	// the worker — the terminal-completion release in SetState, which passes run.claim_generation
+	// so completing a newer generation never releases an older same-worker orphan (PRD #1349 M4).
 	ReleaseCustodyHold(ctx context.Context, id uuid.UUID) (int64, error)
-	ReleaseCustodyForRunWorker(ctx context.Context, arg store.ReleaseCustodyForRunWorkerParams) (int64, error)
+	ReleaseCustodyHoldExact(ctx context.Context, arg store.ReleaseCustodyHoldExactParams) (int64, error)
 	DiscardCaptureForOwner(ctx context.Context, arg store.DiscardCaptureForOwnerParams) (int64, error)
 	// ExpireReadyCaptures is the periodic ready-artifact retention sweep (PRD #1296 D4): it
 	// flips every 'available' capture past its expires_at to 'expired' AND deletes that
@@ -2748,27 +2748,29 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// maybeEnqueueTaskReview's review_target_run_id-null gate makes the two mutually
 		// exclusive. Best-effort — never fails the report.
 		s.maybeEnqueueThenFix(ctx, run)
-		// PRD #1296 M4 (D3): on a terminal SUCCESS (status='completed'), release the
-		// COMPLETING WORKER'S OWN custody hold idempotently — a completed code-publishing run
-		// published its head, so its unpublished-work custody is moot. Scoped to wkr.ID (via
-		// ReleaseCustodyForRunWorker), NOT the whole run: a run can carry a sibling
-		// older-generation orphan hold (a cross-worker re-claim after a transient worker loss),
-		// and a release-by-run would null that orphan's live FKs and let its worker be reaped,
-		// dropping its uncaptured committed work. Releasing only this worker's
-		// (current-generation) hold preserves the orphan, which is retained until
-		// capture/discard (D3). Placed BEFORE the ephemeral teardown so the release nulls this
-		// hold's ON DELETE RESTRICT live FKs and the teardown DELETE's custody-skip predicate
-		// can reap the worker in the same report. BEST-EFFORT: a release failure must NOT fail
-		// or block the completion report (D3) — the M4 custody-release reconciler is the
-		// backstop that settles a recorded successful publication later, after which reap
-		// proceeds. Deliberately NOT called on failed/cancelled: those retain custody for
-		// capture or explicit discard.
+		// PRD #1349 M4 (D1/D2/D3): on a terminal SUCCESS (status='completed'), release the
+		// COMPLETING GENERATION'S custody hold idempotently — a completed code-publishing run
+		// published its head, so its unpublished-work custody is moot. GENERATION-EXACT via
+		// ReleaseCustodyHoldExact using the server's own run row (run.ClaimGeneration) and this
+		// worker's id, NOT a generation-blind run+worker bulk release: one worker can hold TWO
+		// open holds on a run — an uncaptured generation-1 hold plus a generation-2 hold from an
+		// affinity re-claim after a transient loss — and a blind run+worker release would null
+		// BOTH orphans' live FKs and let the worker be reaped, dropping generation 1's only copy.
+		// Releasing exactly the completing generation preserves any older-generation sibling
+		// orphan (same worker OR a different worker), which is retained until capture/discard
+		// (D3). Placed BEFORE the ephemeral teardown so the release nulls this hold's ON DELETE
+		// RESTRICT live FKs and the teardown DELETE's custody-skip predicate can reap the worker
+		// in the same report. BEST-EFFORT: a release failure must NOT fail or block the
+		// completion report (D3) — the M4 custody-release reconciler is the backstop that settles
+		// a recorded successful publication later, after which reap proceeds. Deliberately NOT
+		// called on failed/cancelled: those retain custody for capture or explicit discard.
 		if run.Status == "completed" {
-			if _, relErr := s.q.ReleaseCustodyForRunWorker(ctx, store.ReleaseCustodyForRunWorkerParams{
-				RunID:    runID,
-				WorkerID: wkr.ID,
+			if _, relErr := s.q.ReleaseCustodyHoldExact(ctx, store.ReleaseCustodyHoldExactParams{
+				RunID:      runID,
+				Generation: run.ClaimGeneration,
+				WorkerID:   wkr.ID,
 			}); relErr != nil {
-				slog.Warn("release custody on completion", "run", runID, "worker", wkr.ID, "error", relErr)
+				slog.Warn("release custody on completion", "run", runID, "worker", wkr.ID, "generation", run.ClaimGeneration, "error", relErr)
 			}
 		}
 		// PRD #529 M4: an ephemeral worker exists only to serve its bound run, so a

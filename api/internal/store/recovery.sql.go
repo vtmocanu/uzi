@@ -13,6 +13,7 @@ import (
 )
 
 const bindCaptureManifest = `-- name: BindCaptureManifest :one
+
 UPDATE recovery_captures
 SET manifest_bound = true,
     byte_size = $1,
@@ -33,6 +34,11 @@ type BindCaptureManifestParams struct {
 	ID               uuid.UUID   `json:"id"`
 }
 
+// PRD #1296 M1 (D2/D4/D5): the durable-recovery store contract. These queries are the
+// COMPLETE store-query layer M2 (upload/owner API), M3 (worker capture/retry) and M5
+// (owner UX) consume, frozen here so those parallel milestones never edit this file.
+// Custody holds are opened atomically with the claim (runtime.sql ClaimRun); everything
+// below operates on the already-open hold and its captures.
 // D2/D4: compare-and-set the byte manifest ONCE. The first bind (manifest_bound=false)
 // always wins; a retry with the SAME byte_size+checksum is idempotent (the second
 // disjunct matches and re-stamps updated_at); a DIFFERENT manifest under the same
@@ -877,35 +883,6 @@ func (q *Queries) MarkCaptureState(ctx context.Context, arg MarkCaptureStatePara
 	return i, err
 }
 
-const releaseCustodyForRunWorker = `-- name: ReleaseCustodyForRunWorker :execrows
-UPDATE recovery_custody_holds
-SET live_worker_id = NULL, live_run_id = NULL, state = 'released',
-    released_at = now(), updated_at = now()
-WHERE run_id = $1 AND live_worker_id = $2::uuid AND state = 'open'
-`
-
-type ReleaseCustodyForRunWorkerParams struct {
-	RunID    uuid.UUID `json:"run_id"`
-	WorkerID uuid.UUID `json:"worker_id"`
-}
-
-// D3: the terminal-completion RELEASE mechanism, scoped to ONE worker's hold on the run.
-// Nulls both live FKs, flips state to 'released' and stamps released_at, for the open hold on
-// @run_id held by @worker_id (the completing/reporting worker). Idempotent: a second call
-// moves zero rows. Scoping to the reporting worker's own (current-generation) hold is the
-// multi-hold guard on the completion path: a completed run reported by generation 2's worker
-// releases only generation 2's hold and PRESERVES a still-open generation-1 orphan hold, whose
-// uncaptured committed work is retained until capture/discard (surfaced as retaining-
-// unpublished-work), rather than being stranded by a release-by-run that nulls every open
-// hold's FKs. Captures survive; the immutable provenance columns are untouched.
-func (q *Queries) ReleaseCustodyForRunWorker(ctx context.Context, arg ReleaseCustodyForRunWorkerParams) (int64, error) {
-	result, err := q.db.Exec(ctx, releaseCustodyForRunWorker, arg.RunID, arg.WorkerID)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
-}
-
 const releaseCustodyHold = `-- name: ReleaseCustodyHold :execrows
 UPDATE recovery_custody_holds
 SET live_worker_id = NULL, live_run_id = NULL, state = 'released',
@@ -962,83 +939,6 @@ func (q *Queries) ReleaseCustodyHoldExact(ctx context.Context, arg ReleaseCustod
 	return result.RowsAffected(), nil
 }
 
-const reserveCapture = `-- name: ReserveCapture :one
-
-INSERT INTO recovery_captures
-    (hold_id, run_id, user_id, original_worker_id, original_worker_identity,
-     source_sha, attempted_head_sha, idempotency_key, state)
-SELECT h.id, $1, $2, $3, $4::text,
-       $5, $6, $7, 'preparing'
-FROM recovery_custody_holds h
-WHERE h.run_id = $1
-  AND h.user_id = $2
-  AND h.original_worker_id = $3
-  AND h.state = 'open'
-ORDER BY h.created_at DESC
-LIMIT 1
-ON CONFLICT (hold_id, idempotency_key) DO UPDATE SET updated_at = now()
-RETURNING id, hold_id, run_id, user_id, original_worker_id, original_worker_identity, source_sha, attempted_head_sha, idempotency_key, state, manifest_bound, byte_size, checksum, chunk_count, prerequisite_shas, reason, context, expires_at, created_at, updated_at
-`
-
-type ReserveCaptureParams struct {
-	RunID                  uuid.UUID   `json:"run_id"`
-	UserID                 uuid.UUID   `json:"user_id"`
-	OriginalWorkerID       pgtype.UUID `json:"original_worker_id"`
-	OriginalWorkerIdentity string      `json:"original_worker_identity"`
-	SourceSha              string      `json:"source_sha"`
-	AttemptedHeadSha       pgtype.Text `json:"attempted_head_sha"`
-	IdempotencyKey         string      `json:"idempotency_key"`
-}
-
-// PRD #1296 M1 (D2/D4/D5): the durable-recovery store contract. These queries are the
-// COMPLETE store-query layer M2 (upload/owner API), M3 (worker capture/retry) and M5
-// (owner UX) consume, frozen here so those parallel milestones never edit this file.
-// Custody holds are opened atomically with the claim (runtime.sql ClaimRun); everything
-// below operates on the already-open hold and its captures.
-// D2: reserve an immutable capture in state 'preparing', bound to the run's OPEN custody
-// hold taken by THIS worker. The hold is resolved in-SQL (fail-closed: no open hold owned
-// by @original_worker_id -> zero rows -> pgx.ErrNoRows -> not authorized), which enforces
-// the D2 invariant "a capture requires the original worker's open hold" at the store, not
-// only at the handler. Retrying the SAME capture identity (hold_id, idempotency_key) is
-// idempotent: ON CONFLICT bumps updated_at and returns the existing record, so a lost ACK
-// re-reserves the same capture_id. A changed source_sha under the same key does NOT
-// overwrite the frozen source (the conflict keeps the original row's columns).
-func (q *Queries) ReserveCapture(ctx context.Context, arg ReserveCaptureParams) (RecoveryCapture, error) {
-	row := q.db.QueryRow(ctx, reserveCapture,
-		arg.RunID,
-		arg.UserID,
-		arg.OriginalWorkerID,
-		arg.OriginalWorkerIdentity,
-		arg.SourceSha,
-		arg.AttemptedHeadSha,
-		arg.IdempotencyKey,
-	)
-	var i RecoveryCapture
-	err := row.Scan(
-		&i.ID,
-		&i.HoldID,
-		&i.RunID,
-		&i.UserID,
-		&i.OriginalWorkerID,
-		&i.OriginalWorkerIdentity,
-		&i.SourceSha,
-		&i.AttemptedHeadSha,
-		&i.IdempotencyKey,
-		&i.State,
-		&i.ManifestBound,
-		&i.ByteSize,
-		&i.Checksum,
-		&i.ChunkCount,
-		&i.PrerequisiteShas,
-		&i.Reason,
-		&i.Context,
-		&i.ExpiresAt,
-		&i.CreatedAt,
-		&i.UpdatedAt,
-	)
-	return i, err
-}
-
 const reserveCaptureExact = `-- name: ReserveCaptureExact :one
 
 INSERT INTO recovery_captures
@@ -1073,10 +973,11 @@ type ReserveCaptureExactParams struct {
 // PRD #1349 M1: the ADDITIVE exact-generation and owner-disposition store contract. These
 // queries are the COMPLETE store-query layer M2 (park capture/post-clone evidence), M4
 // (server generation-safe lifecycle), M5 (owner hold API/CLI disposition) and M6 (web
-// surface + owner Slack episode alert) consume. They are strictly ADDITIVE: every existing
-// query above (ReserveCapture / ReleaseCustodyForRunWorker / ReleaseCustodyHold / …) is
-// UNTOUCHED, so M1 compiles standalone and a later milestone flips its own call sites onto
-// these exact-generation names without editing this seam again.
+// surface + owner Slack episode alert) consume. They were introduced strictly ADDITIVELY by
+// M1 (existing queries UNTOUCHED, so M1 compiled standalone). M4 has since flipped every
+// capture-reserve/custody-release call site onto these exact-generation names and DELETED the
+// superseded generation-blind ReserveCapture / ReleaseCustodyForRunWorker queries, so those no
+// longer exist above (ReleaseCustodyHold, the reconciler's per-hold release, remains).
 // ════════════════════════════════════════════════════════════════════════════════════════
 // PRD #1349 M1 (D1/D2): the GENERATION-EXACT reserve. Identical to ReserveCapture except the
 // hold-selection WHERE ALSO matches @generation, so a capture is bound to the ONE hold this
