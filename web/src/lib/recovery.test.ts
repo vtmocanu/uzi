@@ -134,6 +134,14 @@ describe("captureView", () => {
     // An empty state string gets the literal "Unknown" label rather than a blank pill.
     expect(captureView("")).toMatchObject({ label: "Unknown", downloadable: false });
   });
+
+  it("sanitizes control/format chars in the fallback label (defense in depth, PRD #1349)", () => {
+    // An unexpected server state carrying a bidi override + zero-width space is stripped
+    // before it reaches the Badge — the same scrub capture_state gets at the render site.
+    const ZWSP = String.fromCharCode(0x200b);
+    const RLO = String.fromCharCode(0x202e);
+    expect(captureView(`qu${ZWSP}aran${RLO}tined`).label).toBe("quarantined");
+  });
 });
 
 describe("formatArchiveSize", () => {
@@ -291,6 +299,16 @@ describe("custodyHoldView — attention → presentation + actions (D6/D8/D9)", 
     const v = custodyHoldView(hold({ attention: "brand_new_state" }));
     expect(v.needsDecision).toBe(true);
     expect(v.actions).toContain("discard");
+  });
+
+  it("sanitizes control/format chars in an unknown attention's fallback stateLabel (PRD #1349)", () => {
+    // The unknown-attention fallback renders straight into a Badge, so it is scrubbed like
+    // capture_state at the render site (defense in depth).
+    const ZWSP = String.fromCharCode(0x200b);
+    const RLO = String.fromCharCode(0x202e);
+    const v = custodyHoldView(hold({ attention: `we${ZWSP}ir${RLO}d` }));
+    expect(v.stateLabel).toBe("weird");
+    expect(v.needsDecision).toBe(true);
   });
 });
 

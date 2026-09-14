@@ -185,14 +185,20 @@ function CaptureRow({
         </div>
         <div className="flex flex-wrap items-center gap-1.5">
           {view.downloadable ? (
-            // An authenticated same-origin attachment link (D6): the browser sends the
-            // session cookie, the server sets Content-Disposition/no-store, and no
-            // presigned/public URL is minted. `download` asks for a save rather than a
-            // navigation; the server-generated filename wins over this hint.
-            <a href={runArchiveDownloadUrl(runId, capture.id)} download>
-              <Button variant="primary" size="sm">
-                Export archive
-              </Button>
+            // An authenticated same-origin attachment link (D6) STYLED as a button — never
+            // an <a> wrapping a <Button>, which is two tab stops + a doubled screen-reader
+            // announcement and invalid HTML. The browser sends the session cookie, the
+            // server sets Content-Disposition/no-store, and no presigned/public URL is
+            // minted. `download` asks for a save rather than a navigation; the
+            // server-generated filename wins over this hint. The className mirrors the
+            // primary Button (size sm); the global a:focus-visible rule (index.css) gives
+            // it the same keyboard ring.
+            <a
+              href={runArchiveDownloadUrl(runId, capture.id)}
+              download
+              className="inline-flex h-7 shrink-0 select-none items-center justify-center gap-1 rounded-lg bg-brand px-2.5 text-xs font-medium text-on-brand transition-colors hover:bg-brand-hover"
+            >
+              Export archive
             </a>
           ) : (
             <Button variant="secondary" size="sm" disabled>

@@ -69,6 +69,23 @@ describe("CustodyBoardAlert", () => {
     expect(screen.getByText(/Held work is blocking new runs/)).toBeTruthy();
     const link = screen.getByRole("link", { name: /Review held work/ });
     expect(link.getAttribute("href")).toContain("/workers");
+    // a11y: the action is a SINGLE anchor styled as a button — never a <Link> wrapping a
+    // <Button>, which is two tab stops and a doubled screen-reader announcement. One
+    // focusable element, no nested button.
+    expect(link.tagName).toBe("A");
+    expect(link.querySelector("button")).toBeNull();
+    expect(screen.queryByRole("button", { name: /Review held work/ })).toBeNull();
+  });
+
+  it("gates zero-valued counts: no '0 holds need a decision' / '0 runs blocked' line", async () => {
+    // At the admission limit with no decisions and no blocked runs, the danger alert still
+    // shows (atLimit), but neither count line renders — matching how recoveryWaitCount is
+    // already gated > 0.
+    await renderAlert(holds({ open_holds: 8, custody_hold_limit: 8, decision_needed: 0, blocked_runs: 0 }));
+    expect(screen.getByRole("alert")).toBeTruthy();
+    expect(screen.getByText(/Held work is blocking new runs/)).toBeTruthy();
+    expect(screen.queryByText(/needs? a decision/)).toBeNull();
+    expect(screen.queryByText(/runs? blocked/)).toBeNull();
   });
 
   it("updates live: a poll that crosses the limit turns a hidden alert into a danger alert", async () => {

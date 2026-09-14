@@ -15,6 +15,7 @@ import type {
   RecoveryCustodyHold,
 } from "./apiTypes";
 import { isTerminalRun } from "./runStatus";
+import { stripUnsafeChars } from "./safeText";
 import type { BadgeTone } from "../components/ui";
 
 // RecoverySectionKind is the top-level shape the section renders, derived from the
@@ -114,7 +115,10 @@ export function captureView(state: string): CaptureView {
       };
     default:
       return {
-        label: state || "Unknown",
+        // The fallback renders a server enum straight into a Badge, so it is sanitized like
+        // capture_state beside it (defense in depth against an unexpected value carrying
+        // control/format chars). An empty/all-unsafe value falls back to "Unknown".
+        label: stripUnsafeChars(state) || "Unknown",
         tone: "neutral",
         description: "This archive is not available for download.",
         downloadable: false,
@@ -335,7 +339,9 @@ export function custodyHoldView(hold: RecoveryCustodyHold): CustodyHoldView {
       return {
         group: "attention",
         tone: "warning",
-        stateLabel: hold.attention || "Unknown",
+        // Sanitized like capture_state at the render site (defense in depth): an unexpected
+        // server attention is rendered straight into a Badge. Empty/all-unsafe → "Unknown".
+        stateLabel: stripUnsafeChars(hold.attention) || "Unknown",
         summary:
           "This hold is retaining unpublished work. Review it before deciding what to do.",
         autoReleasing: false,

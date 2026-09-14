@@ -4,7 +4,7 @@ import { Link } from "react-router-dom";
 import { api, type RecoveryCustodyHolds } from "../lib/api";
 import { custodyAlertView } from "../lib/recovery";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
-import { Button, cx } from "./ui";
+import { cx } from "./ui";
 import { ShieldIcon, ChevronRightIcon } from "./icons";
 
 // CustodyBoardAlert is the board's conditional custody-pressure alert (PRD #1349 M6, D8).
@@ -73,8 +73,15 @@ export function CustodyBoardAlert({ recoveryWaitCount }: { recoveryWaitCount: nu
                 : "Some runs are retaining unpublished committed work that only you can resolve."}
             </p>
             <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted">
-              <Count value={view.decisionNeeded} singular="hold needs a decision" plural="holds need a decision" />
-              <Count value={view.blockedRuns} singular="run blocked" plural="runs blocked" />
+              {/* Each count line renders only when its value > 0 (matching recoveryWaitCount),
+                  so the alert never shows "0 holds need a decision" or "0 runs blocked". The
+                  self-hide/escalation decision still lives in custodyAlertView. */}
+              {view.decisionNeeded > 0 && (
+                <Count value={view.decisionNeeded} singular="hold needs a decision" plural="holds need a decision" />
+              )}
+              {view.blockedRuns > 0 && (
+                <Count value={view.blockedRuns} singular="run blocked" plural="runs blocked" />
+              )}
               {view.recoveryWaitCount > 0 && (
                 <Count
                   value={view.recoveryWaitCount}
@@ -87,11 +94,20 @@ export function CustodyBoardAlert({ recoveryWaitCount }: { recoveryWaitCount: nu
           </div>
         </div>
         <div className="shrink-0">
-          {/* One primary action (D8): the Workers resolution surface. */}
-          <Link to="/workers?tab=workers#recovery-holds">
-            <Button variant={danger ? "primary" : "secondary"} size="sm">
-              Review held work <ChevronRightIcon />
-            </Button>
+          {/* One primary action (D8): the Workers resolution surface. A <Link> STYLED as a
+              button (never a <Link> wrapping a <Button>): a nested anchor+button is two tab
+              stops and a doubled screen-reader announcement, and invalid HTML. The global
+              a:focus-visible rule (index.css) gives it the same keyboard ring. */}
+          <Link
+            to="/workers?tab=workers#recovery-holds"
+            className={cx(
+              "inline-flex h-7 shrink-0 select-none items-center justify-center gap-1 rounded-lg px-2.5 text-xs font-medium transition-colors",
+              danger
+                ? "bg-brand text-on-brand hover:bg-brand-hover"
+                : "border border-edge bg-raised text-fg hover:border-edge-strong hover:bg-raised/70",
+            )}
+          >
+            Review held work <ChevronRightIcon />
           </Link>
         </div>
       </div>

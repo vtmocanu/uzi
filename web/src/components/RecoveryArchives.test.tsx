@@ -109,27 +109,26 @@ describe("RecoveryArchivesPanel — download gating (D7)", () => {
       }),
     );
 
-    // Exactly ONE download link exists — the available capture's — proving the other state
-    // did not render a usable download. If the gate were removed both rows would link.
-    const links = screen.getAllByRole("link");
+    // Exactly ONE download control is a link — the available capture's — proving the other
+    // state did not render a usable download. If the gate were removed both rows would link.
+    const links = screen.getAllByRole("link", { name: "Export archive" });
     expect(links).toHaveLength(1);
     expect(links[0].getAttribute("href")).toBe("/api/runs/r1/archives/cap-ok/download");
+    // a11y: the enabled control is a SINGLE <a> styled as a button (its download attribute
+    // kept), never an <a> wrapping a <Button> — one tab stop, one screen-reader announcement.
+    expect(links[0].tagName).toBe("A");
+    expect(links[0].querySelector("button")).toBeNull();
+    expect(links[0].hasAttribute("download")).toBe(true);
     // The link's own row is the available one.
     expect(within(links[0].closest("li") as HTMLElement).getByText("Available")).toBeTruthy();
 
-    // Both rows still render an "Export archive" control; the needs_action one is a disabled
-    // button not wrapped in a link.
+    // The non-downloadable row renders a DISABLED button (not a link), so there is exactly
+    // one "Export archive" button and it is disabled and not inside a link.
     const buttons = screen.getAllByRole("button", { name: "Export archive" });
-    expect(buttons).toHaveLength(2);
-    const disabled = buttons.filter((b) => (b as HTMLButtonElement).disabled);
-    const enabled = buttons.filter((b) => !(b as HTMLButtonElement).disabled);
-    expect(disabled).toHaveLength(1);
-    expect(enabled).toHaveLength(1);
-    // The disabled control belongs to the needs_action row and is NOT inside a link.
-    expect(disabled[0].closest("a")).toBeNull();
-    expect(within(disabled[0].closest("li") as HTMLElement).getByText("Needs action")).toBeTruthy();
-    // The enabled control IS the one inside the sole link.
-    expect(enabled[0].closest("a")).toBe(links[0]);
+    expect(buttons).toHaveLength(1);
+    expect((buttons[0] as HTMLButtonElement).disabled).toBe(true);
+    expect(buttons[0].closest("a")).toBeNull();
+    expect(within(buttons[0].closest("li") as HTMLElement).getByText("Needs action")).toBeTruthy();
   });
 
   it("shows the secret-review warning on the download surface whenever captures render", async () => {

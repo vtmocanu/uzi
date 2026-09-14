@@ -102,7 +102,15 @@ export function RecoveryHoldsSurface() {
 // hold id (D9). Archive-bearing holds link out to the run's Recovery archives section for
 // export (keeping the D7 warning on the one download surface); active/capturing holds are
 // information only.
-function HoldRow({ hold, onChanged }: { hold: RecoveryCustodyHold; onChanged: () => void }) {
+function HoldRow({
+  hold,
+  onChanged,
+}: {
+  hold: RecoveryCustodyHold;
+  // Returns the parent's reload promise so the discard handler can await it and clear `busy`
+  // only once the listing has settled (see discard's finally).
+  onChanged: () => void | Promise<void>;
+}) {
   const view = custodyHoldView(hold);
   const [confirming, setConfirming] = useState(false);
   const [typed, setTyped] = useState("");
@@ -143,10 +151,16 @@ function HoldRow({ hold, onChanged }: { hold: RecoveryCustodyHold; onChanged: ()
     try {
       await api.discardHold(hold.run_id, hold.id);
       // The row disappears on the next listing; reload rather than optimistically mutate so
-      // the aggregate counts stay server-truthful.
-      onChanged();
+      // the aggregate counts stay server-truthful. Await it so `busy` stays set (controls
+      // disabled, "Discarding…") until the reload settles.
+      await onChanged();
     } catch (e) {
       setError(errorMessage(e, "Could not discard the held work."));
+    } finally {
+      // Clear busy on every path — including a successful discard followed by a failed
+      // reload, where `load` keeps the last-good listing so THIS row stays mounted. Without
+      // the finally the row would wedge on "Discarding…" with its controls disabled until
+      // the next poll. On a successful reload the row unmounts and this is a harmless no-op.
       setBusy(false);
     }
   };

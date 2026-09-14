@@ -174,4 +174,42 @@ describe("RecoveryHoldsSurface", () => {
     expect(screen.queryByRole("button", { name: /Discard held work/ })).toBeNull();
     expect(screen.queryByRole("link", { name: /Export archive/ })).toBeNull();
   });
+
+  it("clears busy after a successful discard whose reload fails, so the row does not wedge", async () => {
+    // Discard succeeds, but the follow-up reload rejects. `load` swallows that and keeps the
+    // last-good listing, so THIS row stays mounted — the busy flag must still clear (finally),
+    // or the row wedges on "Discarding…" with its controls disabled until the next poll.
+    const src = hold({ id: "h-src", run_id: "run-xyz", worker_id: "wb", worker_name: "jvm-worker", generation: 4, attention: "source_only" });
+    mockApi.getRecoveryHolds
+      .mockResolvedValueOnce(listing([src]))
+      .mockRejectedValue(new Error("reload failed"));
+    mockApi.discardHold.mockResolvedValue({ discarded: true });
+
+    render(
+      <MemoryRouter>
+        <RecoveryHoldsSurface />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(mockApi.getRecoveryHolds).toHaveBeenCalled());
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /Discard held work/ }));
+    const group = screen.getByRole("group", { name: /Discard held work/ });
+    fireEvent.change(within(group).getByRole("textbox"), { target: { value: "discard" } });
+    fireEvent.click(within(group).getByRole("button", { name: /Discard held work/ }));
+
+    await waitFor(() => expect(mockApi.discardHold).toHaveBeenCalledWith("run-xyz", "h-src"));
+    // The reload failed, so the row is still here — but the confirm button is enabled again
+    // (busy cleared) and no longer reads "Discarding…". Its name reverting to "Discard held
+    // work" (not "Discarding…") is itself the proof busy cleared.
+    await waitFor(() => {
+      const btn = within(
+        screen.getByRole("group", { name: /Discard held work/ }),
+      ).getByRole("button", { name: /Discard held work/ }) as HTMLButtonElement;
+      expect(btn.disabled).toBe(false);
+      expect(btn.textContent).not.toContain("Discarding");
+    });
+  });
 });
