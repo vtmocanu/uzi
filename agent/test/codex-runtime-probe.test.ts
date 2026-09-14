@@ -169,6 +169,24 @@ describe("probeCodexRuntime — fails closed (never throws)", () => {
     assert.match(result.reason ?? "", /member missing on disk/);
   });
 
+  it("a member replaced by a DIRECTORY (not a regular file) → not capable", async () => {
+    // Fail-closed branch coverage for the probe's `if (!st.isFile())` gate. Lay out a
+    // fully valid install + receipt, then swap ONE member's regular file for a DIRECTORY
+    // at the same absolute path. stat() still SUCCEEDS (the path exists), so the probe
+    // gets past the member-missing catch and reaches st.isFile() — the ONLY check that
+    // rejects a non-regular member before its mode and digest are examined. This closes
+    // the untested branch: folding the gate out makes the probe instead try to mode-check
+    // and hash a directory, which changes the failure reason away from /not a regular
+    // file/, so this exact reason is a precise sentinel for that mutation.
+    const { prefix, versionRoot } = await buildFixture();
+    const member = path.join(versionRoot, "codex-resources/bwrap");
+    await rm(member);
+    await mkdir(member, { recursive: true });
+    const result = await probe(prefix);
+    assert.strictEqual(result.capable, false);
+    assert.match(result.reason ?? "", /not a regular file/);
+  });
+
   it("a member digest mismatch → not capable", async () => {
     const { prefix } = await buildFixture({
       mutateReceipt: (r) => {
