@@ -196,10 +196,13 @@ interface ThreadAccount {
 }
 
 /**
- * Per-run Codex usage accountant (one per {@link CodexHarness} instance; it persists across
- * turns and is NEVER reset, because the root thread's cumulative spans turns and children from
- * earlier turns must stay aggregated). NOT thread-safe in the concurrency sense — the harness
- * feeds it from its single-consumer notification loop.
+ * Per-run Codex usage accountant. ONE instance is created per run (owned by the executor's
+ * EpochSharedContext) and SHARED across every provider-epoch {@link CodexHarness} — the harness
+ * is recreated at plan approval and each checkpoint reap, but the accountant is injected so it
+ * survives that recreation. It persists across turns AND provider epochs and is NEVER reset,
+ * because the root thread's cumulative spans turns/epochs and children from earlier turns must
+ * stay aggregated. NOT thread-safe in the concurrency sense — the harness feeds it from its
+ * single-consumer notification loop.
  */
 export class CodexUsageAccountant {
   private readonly threads = new Map<string, ThreadAccount>();
