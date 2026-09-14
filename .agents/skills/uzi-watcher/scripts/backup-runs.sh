@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # One-shot backup of in-flight uzi run work from hosted (k8s) worker PVCs.
 #
-# Handles BOTH run kinds: an issue run's working clone is /data/runner/<slug>/issue-N
-# (files named issue-N.*), a task run's (uzi handoff, no issue iid) is
-# /data/runner/<slug>/task-<runid> (files named task-<runid>.*). The per-run "stem"
-# below selects which; a task run's whole point here is that its work is often still
-# UNCOMMITTED, so the uncommitted.patch + untracked capture is what saves it.
+# Handles every run kind: the per-run "stem" equals the run's canonical runner-clone
+# slug (agent/src/run-kind.ts deriveCloneKey) -- issue/chat/judge -> issue-N, task ->
+# task-<runid>, and mr_rework/ci_fix/self_improve/prompt -> slugify(branch). So an
+# mr_rework run reuses the issue branch's clone: agent/issue-N -> issue-N.* files at
+# /data/runner/<slug>/agent-issue-N, NOT a mr_rework-<runid> dir. A task or mr_rework
+# run's work is often still UNCOMMITTED, so the uncommitted.patch + untracked capture
+# is what saves it.
 #
 # For each run id it resolves worker_id -> pod FRESH each call (so it survives a
 # worker roll or a cross-worker migration), execs into the worker container, and
@@ -179,17 +181,27 @@ for RID in "${RUNS[@]}"; do
   kind="$(printf '%s' "$J" | "$JQ" -r '.kind // ""' 2>/dev/null)"
   wid="$(printf '%s' "$J" | "$JQ" -r '.worker_id // ""' 2>/dev/null)"
   mr="$(printf '%s' "$J" | "$JQ" -r '.mr_web_url // ""' 2>/dev/null)"
+  branch="$(printf '%s' "$J" | "$JQ" -r '.branch // ""' 2>/dev/null)"
 
-  # The "stem" is BOTH the on-pod working-clone dir name and the output-file prefix.
-  # An issue run keeps its historical issue-N.* naming; a task/chat run (no issue iid)
-  # is task-<runid>.* / <kind>-<runid>.*, matching /data/runner/<slug>/task-<runid>.
-  if [ -n "$iid" ]; then
-    STEM="issue-$iid"; LBL="#$iid"
-  elif [ -n "$kind" ] && [ "$kind" != "issue" ]; then
-    STEM="$kind-$RID"; LBL="$kind ${RID%%-*}"
-  else
-    STEM="run-$RID";  LBL="run ${RID%%-*}"
-  fi
+  # The "stem" is BOTH the on-pod working-clone dir name and the output-file prefix,
+  # so it must equal the run's canonical runner-clone slug. Mirror
+  # agent/src/run-kind.ts deriveCloneKey exactly:
+  #   issue/chat/judge -> issue-<iid>
+  #   task             -> task-<runid>
+  #   mr_rework/ci_fix/self_improve/prompt -> slugify(branch)  (branch's "/" -> "-")
+  # A mr_rework (or ci_fix) run REUSES the branch's clone: agent/issue-N lives at
+  # /data/runner/<slug>/agent-issue-N, NOT mr_rework-<runid>, so deriving from kind
+  # alone points at a dir that does not exist and the capture silently fails.
+  case "$kind" in
+    issue|chat|judge|"")
+      if [ -n "$iid" ]; then STEM="issue-$iid"; LBL="#$iid"
+      else STEM="run-$RID"; LBL="run ${RID%%-*}"; fi ;;
+    task)
+      STEM="task-$RID"; LBL="task ${RID%%-*}" ;;
+    *)
+      if [ -n "$branch" ]; then STEM="$(printf '%s' "$branch" | tr '/' '-')"; LBL="$kind ${RID%%-*}"
+      else STEM="$kind-$RID"; LBL="$kind ${RID%%-*}"; fi ;;  # branch unknown: best-effort
+  esac
 
   # --- status/progress snapshot (ALWAYS, even if parked or terminal: what was
   #     done, what is left, so a backup is self-describing without the code) ---
