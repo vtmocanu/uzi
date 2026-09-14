@@ -54,6 +54,14 @@ var rateLimitPollInterval = 60 * time.Second
 // test can shrink it.
 var skewPollInterval = 5 * time.Minute
 
+// themePollInterval is the slow cadence at which the TUI re-queries the terminal's background
+// colour so a LIVE dark↔light theme switch is picked up without a restart (issue #1348).
+// bubbletea v2.0.9 emits no unsolicited theme-change report and drops the DSR-997 events, so the
+// only portable detector is to re-issue tea.RequestBackgroundColor on a timer; ~4s is fast enough
+// for "within a few seconds" at negligible cost (a terminal OSC-11 query, NOT a server call). A var
+// (not const) so a test can shrink it.
+var themePollInterval = 4 * time.Second
+
 // tuiView is which screen has focus.
 type tuiView int
 
@@ -92,6 +100,10 @@ type boardTickMsg struct{ gen uint64 }
 // stripTickMsg fires on the 60s rateLimitPollInterval to refresh the rate-limit strip's
 // meters + settings, independently of the 2s boardTickMsg runs cadence.
 type stripTickMsg struct{}
+
+// themeTickMsg fires on the slow themePollInterval to re-query the terminal background so a live
+// theme change reaches the model (issue #1348), independently of the board/strip/skew ticks.
+type themeTickMsg struct{}
 
 // skewTickMsg fires on the skewPollInterval to re-probe the server's build version so the
 // footer skew banner lights within one interval of a server rolling forward, independently
@@ -408,6 +420,7 @@ func newTUIModel(ctx context.Context, c uzicli.Client, startRun string) tuiModel
 func (m tuiModel) initCmds() []tea.Cmd {
 	cmds := []tea.Cmd{m.fetchRunsCmd(m.board.admin, m.board.waitID), m.fetchSecretsCmd(),
 		m.fetchRateLimitsCmd(), m.fetchSettingsCmd(), tickAfter(boardPollInterval, m.board.tickGen), stripTickCmd(),
+		themeTickCmd(),
 		// The forge views' repo scope (PRD #1255 D2) and the `pulls` list's own 10s tick chain.
 		// The tick is armed now but polls the forge only while the pulls screen is in focus
 		// (pullsTickMsg), so an idle board pays no forge cost for it.
@@ -470,6 +483,10 @@ func boardTickInterval(streak int) time.Duration {
 
 func stripTickCmd() tea.Cmd {
 	return tea.Tick(rateLimitPollInterval, func(time.Time) tea.Msg { return stripTickMsg{} })
+}
+
+func themeTickCmd() tea.Cmd {
+	return tea.Tick(themePollInterval, func(time.Time) tea.Msg { return themeTickMsg{} })
 }
 
 func skewTickCmd() tea.Cmd {
@@ -717,12 +734,15 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.BackgroundColorMsg:
-		// The theme comes from what the terminal reports, not from a package-level
-		// probe at import time (which is what lipgloss v2's compat AdaptiveColor does,
-		// and it fires even without a TTY).
-		m.dark = msg.IsDark()
-		m.pal = newPalette(m.dark)
-		m.renderer, _ = newTUIRenderer(m.transcriptWidth(), m.dark)
+		// The theme comes from what the terminal reports, not from a package-level probe at import
+		// time (which is what lipgloss v2's compat AdaptiveColor does, and it fires even without a
+		// TTY). Guarded so the periodic theme poll (themeTickMsg) does not rebuild the palette and
+		// renderer on every identical report — rebuild only when IsDark() actually flips (issue #1348).
+		if dark := msg.IsDark(); dark != m.dark {
+			m.dark = dark
+			m.pal = newPalette(m.dark)
+			m.renderer, _ = newTUIRenderer(m.transcriptWidth(), m.dark)
+		}
 		return m, nil
 
 	case tea.ColorProfileMsg:
@@ -774,6 +794,12 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, stripTickCmd()
 		}
 		return m, tea.Batch(m.fetchRateLimitsCmd(), m.fetchSettingsCmd(), stripTickCmd())
+
+	case themeTickMsg:
+		// Re-query the terminal background so a LIVE theme switch reaches the model (issue #1348).
+		// tea.RequestBackgroundColor is a terminal OSC-11 query only — no server/API call — so it is
+		// safe to fire even during the quit modal; always re-arm, mirroring stripTickMsg's re-arm idiom.
+		return m, tea.Batch(tea.RequestBackgroundColor, themeTickCmd())
 
 	case skewTickMsg:
 		if m.quitting {
