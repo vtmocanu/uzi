@@ -732,6 +732,13 @@ export class RunRunner {
     try {
       await this.phaseClone(claim, flight);
       const sessionId = await this.phaseResume(claim, flight);
+      // PRD #1349 M2 (D1/D3): after clone/reseed and BEFORE model work, record this run's exact
+      // claim generation into the durable journal (the restore point it starts from) and
+      // inventory any prior open holds by exact id + generation. The early generation-evidence
+      // pin lets a later empty-turn park or early terminal exit disposition the EXACT hold
+      // without inferring `current - 1`; the inventory is observational only (settlement is
+      // deferred to the final durable head). Credential-free and best-effort.
+      await this.recordRecoveryGenerationEvidence(claim, flight);
       await this.phasePreflightHandoff(claim, flight, sessionId);
       // PRD #1171 m4: the finalize sink. phasePreflightHandoff already ran the
       // security-boundary reap (its killAgentTree?.() — no-op for Codex); this wrapper adds the
@@ -865,6 +872,12 @@ export class RunRunner {
           // checkpoint-publish outcome above could reach the feed). Closed exactly once here
           // for every parked run, including the edge where the paths above were absent.
           await batcher.close().catch(() => undefined);
+          // PRD #1349 M2 (D4): settle this generation's hold before the limit-park requeue. The
+          // reapForSink above already reaped the agent tree, so the credentialed fresh-forge
+          // comparison is safe: a verified-empty limit park releases its exact hold, work-bearing
+          // committed history is promoted into the generation-bound archive, and a failed
+          // comparison or upload retains. Best-effort; runs after the park report landed.
+          await this.settleRecoveryGeneration(claim, flight, runLog);
         }
       } else if (err instanceof TransientRecoveryError) {
         // Retry capture without abandoning the live claim. Only verified local
@@ -984,6 +997,23 @@ export class RunRunner {
                   : "shutdown checkpoint NOT published — a resume on another worker will restart from the default branch",
             },
           });
+          // PRD #1349 M2 (D4.6): record this generation's restore point in the durable journal
+          // so an interrupted run's exact hold can be dispositioned later. A shutdown is bounded
+          // by the k8s termination grace (the durability publish above is already raced against
+          // shutdownPublishTimeoutMs), so we do NOT run a credentialed fresh-forge capture here —
+          // that could exceed the grace and be SIGKILLed. Pin only (local, credential-free,
+          // sub-millisecond); settlement is left to the requeued run's reaped terminal or the
+          // server reconciler, and an abrupt interruption legitimately retains custody (D3).
+          await this.pinRecoveryGeneration(
+            claim,
+            flight,
+            await this.currentRestorePointHead(flight),
+          ).catch((e) =>
+            runLog.warn("recovery: shutdown generation-evidence pin failed (custody retained)", {
+              run_id: runId,
+              error: errMessage(e),
+            }),
+          );
         }
         // PRD #556 M1: a shutdown interrupt now preserves the same two filesystem dirs a
         // park does (the sibling skills plugin dir and the per-run HOME holding the
@@ -1004,7 +1034,7 @@ export class RunRunner {
         // park does. If the checkpoint could not be published (handlePausePark reported
         // pause_failed and left the run running), preserve the session and leave it for the
         // sweeper to requeue rather than failing a run the owner asked to pause.
-        flight.parked = await this.handlePausePark(flight, { completedCount: 0 });
+        flight.parked = await this.handlePausePark(claim, flight, { completedCount: 0 });
         if (!flight.parked) {
           flight.preserveSession = true;
           runLog.info(
@@ -1052,6 +1082,16 @@ export class RunRunner {
             error: errMessage(e),
           }),
         );
+        // PRD #1349 M2 (D4.5): before this live worker cleans its clone, disposition its exact
+        // generation hold. A steering-cancel and an early agent failure both land here (a cancel
+        // aborts the controller with the same error, then reports failed), and neither reaches
+        // the finalization pin — so without this the empty hold leaks. The agent tree was already
+        // reaped by the executor's run() finally before this catch, so the credentialed
+        // fresh-forge comparison is safe: a provably empty run RELEASES its exact hold, a run
+        // that committed work then failed CAPTURES it, and a failed/unverifiable comparison
+        // RETAINS — never a wrong release. A pre-clone failure has no restore-point head and
+        // no-ops. Best-effort.
+        await this.settleRecoveryGeneration(claim, flight, runLog);
       }
     } finally {
       // PRD #1171 m4 (F1): the FINAL Codex registry disposal, after EVERY durability sink has
@@ -1238,33 +1278,48 @@ export class RunRunner {
     const driveRecoveryTerminal = async (
       body: Parameters<RunFlight["reportState"]>[0],
     ): Promise<void> => {
-      if (!recoveryRecord) return;
       const status = (body as { status?: string }).status;
       try {
         if (status === "completed") {
-          await this.recovery.release(claim.run_id);
-        } else if (status === "failed") {
+          // A completed FULL publication releases this generation's exact hold. Only the
+          // finalization pin (recoveryRecord) proves a code-publishing run reached this
+          // boundary; a no-code `completed` (report_only / not_code / scope-capped-empty)
+          // never pinned, and the server reconciler releases its completed-generation hold.
+          if (!recoveryRecord) return;
+          await this.recovery.release(claim.run_id, claim.claim_generation);
+        } else if (status === "failed" || status === "cancelled") {
           const capBarePath = flight.barePath;
           if (!capBarePath) return;
-          const capDefaultBranch =
-            claim.repo.default_branch?.trim() ||
-            (await this.git.defaultBranchName(capBarePath)) ||
-            "main";
-          const outcome = await this.recovery.captureAndUpload({
-            record: recoveryRecord,
-            barePath: capBarePath,
-            defaultBranch: capDefaultBranch,
-            forgePat: claim.secrets.forge_pat,
-            cloneUrl: claim.repo.clone_url,
-            forgeUsername: claim.secrets.forge_username,
-            signal: boundarySignal,
-          });
-          runLog.info("recovery: finalization-failure capture outcome", {
-            run_id: claim.run_id,
-            capture_id: outcome.captureId,
-            state: outcome.state,
-            reason: outcome.reason,
-          });
+          if (recoveryRecord) {
+            // Finalization-failure capture: the ORIGINAL committed head H is already pinned.
+            const capDefaultBranch =
+              claim.repo.default_branch?.trim() ||
+              (await this.git.defaultBranchName(capBarePath)) ||
+              "main";
+            const outcome = await this.recovery.captureAndUpload({
+              record: recoveryRecord,
+              barePath: capBarePath,
+              defaultBranch: capDefaultBranch,
+              forgePat: claim.secrets.forge_pat,
+              cloneUrl: claim.repo.clone_url,
+              forgeUsername: claim.secrets.forge_username,
+              signal: boundarySignal,
+            });
+            runLog.info("recovery: finalization-failure capture outcome", {
+              run_id: claim.run_id,
+              capture_id: outcome.captureId,
+              state: outcome.state,
+              reason: outcome.reason,
+            });
+          } else {
+            // PRD #1349 M2 (D4.5): an EARLY failed/cancelled exit that never reached the
+            // finalization pin (report_only after a published checkpoint, an undeclared
+            // empty-diff fail, ...). Run the SAME exact-generation disposition against the
+            // restore-point head BEFORE the early terminal cleanup: a provably empty hold
+            // releases, committed work is archived, and a failed/unverifiable forge comparison
+            // retains — instead of returning and leaking the hold.
+            await this.settleRecoveryGeneration(claim, flight, runLog, boundarySignal);
+          }
         }
       } catch (err) {
         runLog.warn("recovery: terminal drive failed (execution reporting is unaffected)", {
@@ -1457,6 +1512,12 @@ export class RunRunner {
           sourceSha: originalH,
           kind: resolveRunKind(claim.kind),
           branch: result.branch,
+          // PRD #1349 M2 (D1): thread the EXACT claim generation so a finalization-failure
+          // capture and a completion release target the ONE hold this generation owns. The
+          // early generation-evidence pin (recordRecoveryGenerationEvidence) already created
+          // this generation's record after clone; matching by generation UPDATES it to the
+          // committed head H here rather than minting a duplicate.
+          generation: claim.claim_generation,
         });
       } else {
         runLog.warn("recovery: could not resolve the original committed head to pin", {
@@ -3851,7 +3912,7 @@ export class RunRunner {
       // which publishes a checkpoint FIRST and reports `paused` only if it lands (Decision 8),
       // returning whether the run parked. Called from the implement loop's pause boundary and
       // its `now`-pause turn catch.
-      parkForPause: (pausedAt) => this.handlePausePark(flight, pausedAt),
+      parkForPause: (pausedAt) => this.handlePausePark(claim, flight, pausedAt),
       // PRD #1226 M3 (D1/D2): this run is INTERLOCKED when the claim's WORKER-ONLY
       // completion_contract_version is non-null. The executor then runs the structural completion
       // protocol on signal_done instead of finalizing directly. false/absent (legacy run, rollout
@@ -4328,6 +4389,143 @@ export class RunRunner {
   }
 
   /**
+   * PRD #1349 M2 — the run's current restore-point head: the committed tip of the runner
+   * clone this generation holds. NULL when there is no clone/branch yet (a pre-clone early
+   * failure) or the tip is unreadable, so the caller skips disposition rather than guessing.
+   */
+  private async currentRestorePointHead(flight: RunFlight): Promise<string | null> {
+    const clonePath = flight.runnerClone?.path;
+    const branch = flight.runnerClone?.branch ?? flight.branch;
+    if (!clonePath || !branch) return null;
+    return this.git.branchTip(clonePath, branch).catch(() => null);
+  }
+
+  /**
+   * PRD #1349 M2 (D1/D3) — after clone/reseed and BEFORE model work, record this run's exact
+   * claim generation into the durable journal (keyed to the restore point the run starts from)
+   * and inventory any prior open custody holds. The generation-evidence pin lets a later
+   * empty-turn park or early terminal exit disposition the EXACT hold without inferring
+   * `current - 1`; the inventory logs prior holds by exact id + generation but NEVER acts on
+   * them (ancestry settlement is deferred to the final durable head at disposition time).
+   *
+   * Credential-free (a local journal write + a join-token GET, never a forge PAT) and
+   * best-effort: the source stays protected by the server hold regardless, so it never
+   * disturbs the run's start.
+   */
+  private async recordRecoveryGenerationEvidence(
+    claim: ClaimResponse,
+    flight: RunFlight,
+  ): Promise<void> {
+    if (!this.recovery.enabled) return; // token-less harness: no journal, no inventory call
+    if (!isCodePublishingKind(resolveRunKind(claim.kind))) return;
+    try {
+      const startTip = await this.currentRestorePointHead(flight);
+      await this.pinRecoveryGeneration(claim, flight, startTip);
+      const holds = await this.recovery.inventoryHolds(claim.run_id);
+      if (holds.length > 0) {
+        flight.runLog.info("recovery: prior open custody holds inventoried after clone", {
+          run_id: claim.run_id,
+          claim_generation: claim.claim_generation,
+          holds: holds.map((h) => ({
+            hold_id: h.hold_id,
+            generation: h.generation,
+            has_available_capture: h.has_available_capture,
+            capture_state: h.capture_state,
+          })),
+        });
+      }
+    } catch (err) {
+      flight.runLog.warn(
+        "recovery: generation-evidence pin/inventory failed (source stays protected by the server hold)",
+        { run_id: claim.run_id, error: errMessage(err) },
+      );
+    }
+  }
+
+  /**
+   * PRD #1349 M2 (D1) — pin `head` as this run's exact-generation restore point in the
+   * authenticated journal. Credential-free and local (no network, no PAT), so it is safe on a
+   * path where the agent tree may still be alive (an owner pause). Returns the record, or
+   * undefined when recovery is disabled, there is no head to pin, or the pin failed — the
+   * caller treats undefined as "nothing to drive", never as a release authority.
+   */
+  private async pinRecoveryGeneration(
+    claim: ClaimResponse,
+    flight: RunFlight,
+    head: string | null,
+  ): Promise<RecoveryRecord | undefined> {
+    if (!isCodePublishingKind(resolveRunKind(claim.kind))) return undefined;
+    const branch = flight.runnerClone?.branch ?? flight.branch;
+    if (!head || !branch) return undefined;
+    return this.recovery.pin({
+      runId: claim.run_id,
+      sourceSha: head,
+      kind: resolveRunKind(claim.kind),
+      branch,
+      generation: claim.claim_generation,
+    });
+  }
+
+  /**
+   * PRD #1349 M2 (D4) — settle THIS run's exact-generation custody hold at a park / early
+   * terminal exit that never reached the finalization pin. Pins the verified restore-point
+   * head under the exact claim generation, then runs the SAME fresh-forge disposition the
+   * finalization-failure drive uses:
+   *
+   *   - provably no unpublished committed output (H already reachable from the freshly fetched
+   *     forge tip) → RELEASE that exact hold before requeue/cleanup;
+   *   - committed work → a generation-bound bundle uploaded through the encrypted archive
+   *     service (the reconciler releases the hold once the archive is available);
+   *   - a failed/unverifiable forge comparison, an oversize bundle, or an upload failure →
+   *     RETAIN the source and the open hold (needs_action), never a fabricated release.
+   *
+   * The credentialed forge fetch requires the agent tree to be REAPED first (the
+   * reap-before-credentialed-git invariant); every caller runs on a reaped path. Best-effort:
+   * it MUST NOT disturb the run's honest terminal/park reporting.
+   */
+  private async settleRecoveryGeneration(
+    claim: ClaimResponse,
+    flight: RunFlight,
+    runLog: Logger,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    if (!this.recovery.enabled) return; // token-less harness: nothing to settle
+    if (!isCodePublishingKind(resolveRunKind(claim.kind))) return;
+    const barePath = flight.barePath;
+    if (!barePath) return;
+    try {
+      const head = await this.currentRestorePointHead(flight);
+      const record = await this.pinRecoveryGeneration(claim, flight, head);
+      if (!record) return; // recovery disabled, no head, or pin failed — the hold stays protected
+      const defaultBranch =
+        claim.repo.default_branch?.trim() ||
+        (await this.git.defaultBranchName(barePath)) ||
+        "main";
+      const outcome = await this.recovery.captureAndUpload({
+        record,
+        barePath,
+        defaultBranch,
+        forgePat: claim.secrets.forge_pat,
+        cloneUrl: claim.repo.clone_url,
+        forgeUsername: claim.secrets.forge_username,
+        signal,
+      });
+      runLog.info("recovery: park/early-terminal disposition outcome", {
+        run_id: claim.run_id,
+        claim_generation: claim.claim_generation,
+        capture_id: outcome.captureId,
+        state: outcome.state,
+        reason: outcome.reason,
+      });
+    } catch (err) {
+      runLog.warn("recovery: park/early-terminal disposition failed (reporting is unaffected)", {
+        run_id: claim.run_id,
+        error: errMessage(err),
+      });
+    }
+  }
+
+  /**
    * #1197, verified 2026-09-08: keep the execution and steering poller active
    * while retrying local capture, and report a promotable recovery_wait ONLY
    * after current HEAD is verified in the worker-owned tracking ref. A failed
@@ -4384,6 +4582,11 @@ export class RunRunner {
             if (ack.status && terminal.has(ack.status)) {
               flight.preserveRecoveryClone = false;
               flight.preserveSession = false;
+              // PRD #1349 M2 (D4.5): a cancel that terminates the recovery loop cleans the clone
+              // like any other terminal exit, so disposition this generation's hold first. The
+              // agent tree was reaped at the top of this handler, so the fresh-forge comparison is
+              // safe: verified-empty releases, committed work captures, a failed comparison retains.
+              await this.settleRecoveryGeneration(claim, flight, runLog);
               return false;
             }
             if (ack.status && ack.status !== "running") return false;
@@ -4440,6 +4643,14 @@ export class RunRunner {
                   : "paused to recover from an empty model result; the recovery checkpoint is saved on this worker and it resumes automatically",
               },
             });
+            // PRD #1349 M2 (D3/D4): settle THIS generation's hold before the requeue. The agent
+            // tree was reaped at the top of this handler, so the credentialed fresh-forge
+            // comparison is safe: a verified-empty restore point releases the exact hold (so a
+            // repeated verified-empty recovery_wait cycle grows no unresolved custody), committed
+            // work is promoted into the generation-bound archive, and a failed/unverifiable
+            // comparison retains. Runs AFTER the park ack lands, mirroring the finalization
+            // terminal drive; best-effort so it never disturbs the reported park.
+            await this.settleRecoveryGeneration(claim, flight, runLog);
             return true;
           }
           if (ack.status && ack.status !== "running") {
@@ -4509,6 +4720,7 @@ export class RunRunner {
    * it never touches the reapForSink/withCodexBoundaryOnly helpers.
    */
   private async handlePausePark(
+    claim: ClaimResponse,
     flight: RunFlight,
     pausedAt: { completedCount: number; total?: number },
   ): Promise<boolean> {
@@ -4653,6 +4865,23 @@ export class RunRunner {
     runLog.info("run paused at the owner's request; preserving its HOME for resume", {
       run_id: flight.runId,
     });
+    // PRD #1349 M2 (D4): record this generation's checkpointed restore point in the durable
+    // journal. This sink deliberately does NOT reap the agent tree (the run may CONTINUE — the
+    // reap:false / no-overlay class), so it MUST stay credential-free: a PAT fresh-forge
+    // comparison would violate the reap-before-credentialed-git invariant while the agent is
+    // alive. Pin only (a local journal write over the credential-free join-token seam, the same
+    // safety class as the checkpoint publish above); a resume mints a new generation hold, and
+    // the paused generation's hold settles on its reaped resume-terminal or the reconciler.
+    await this.pinRecoveryGeneration(
+      claim,
+      flight,
+      await this.currentRestorePointHead(flight),
+    ).catch((e) =>
+      runLog.warn("recovery: pause generation-evidence pin failed (custody retained)", {
+        run_id: flight.runId,
+        error: errMessage(e),
+      }),
+    );
     return true;
   }
 

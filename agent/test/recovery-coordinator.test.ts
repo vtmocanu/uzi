@@ -19,6 +19,8 @@ import {
 } from "../src/recovery.js";
 import type {
   RecoveryCaptureStatusResponse,
+  RecoveryHold,
+  RecoveryHoldsResponse,
   RecoveryReleaseResponse,
   RecoveryReserveRequest,
   RecoveryReserveResponse,
@@ -35,6 +37,7 @@ import type {
 const TOKEN = "worker-join-token-abcdef0123456789";
 const H = "1111111111111111111111111111111111111111";
 const H_PRIME = "2222222222222222222222222222222222222222";
+const BASE = "4444444444444444444444444444444444444444";
 
 // ── fakes ───────────────────────────────────────────────────────────────────────
 
@@ -53,8 +56,15 @@ class FakeClient implements RecoveryArchiveClient {
   reserveCalls: ReserveCall[] = [];
   uploadCalls: UploadCall[] = [];
   releaseCalls: string[] = [];
+  /** PRD #1349 M2: the EXACT generation each release named (parallel to releaseCalls). */
+  releaseGenerations: Array<number | undefined> = [];
+  listCalls: string[] = [];
+  /** PRD #1349 M2: the holds listRecoveryHolds returns (the post-clone inventory). */
+  holds: RecoveryHold[] = [];
   serverCaptureId = "server-capture-uuid-1";
   uploadShouldThrow = false;
+  /** PRD #1349 M2: when set, the server RETAINED the hold instead of releasing it. */
+  releaseRetained = false;
 
   async reserveRecoveryCapture(runId: string, req: RecoveryReserveRequest): Promise<RecoveryReserveResponse> {
     this.reserveCalls.push({ runId, req });
@@ -75,9 +85,17 @@ class FakeClient implements RecoveryArchiveClient {
     if (this.uploadShouldThrow) throw new Error("upload rejected");
     return { capture_id: captureId, state: "available", manifest_bound: true };
   }
-  async releaseRecoveryCustody(runId: string): Promise<RecoveryReleaseResponse> {
+  async releaseRecoveryCustody(runId: string, generation?: number): Promise<RecoveryReleaseResponse> {
     this.releaseCalls.push(runId);
+    this.releaseGenerations.push(generation);
+    if (this.releaseRetained) {
+      return { run_id: runId, released: false, holds_released: 0, retained: true, reason: "ambiguous" };
+    }
     return { run_id: runId, released: true, holds_released: 1 };
+  }
+  async listRecoveryHolds(runId: string): Promise<RecoveryHoldsResponse> {
+    this.listCalls.push(runId);
+    return { run_id: runId, holds: this.holds };
   }
 }
 
@@ -509,5 +527,145 @@ describe("RecoveryCoordinator — byte-identical restart re-upload with NO forge
     assert.equal(fs.existsSync(bundlePath), false);
 
     fs.rmSync(gitBase, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  });
+});
+
+// PRD #1349 M2 — exact-generation custody: the release/reserve/already-published paths carry
+// the exact claim generation, one journal record per generation (the early evidence pin and the
+// finalization pin collapse), a server-RETAINED release keeps the source, the post-clone
+// inventory only observes, and a cancelled capture retains rather than releasing.
+
+describe("RecoveryCoordinator — exact generation identity end to end (PRD #1349 M2, D1/D2)", () => {
+  it("pin is idempotent by (runId, generation): the finalization pin UPDATES the early pin's source", async () => {
+    const coord = makeCoordinator();
+    // The early generation-evidence pin records the restore point the run starts from (BASE).
+    const early = await coord.pin({ runId: "run-gen", sourceSha: BASE, kind: "issue", branch: "b", generation: 5 });
+    // The finalization pin at the SAME generation advances the source to the committed head H.
+    const fin = await coord.pin({ runId: "run-gen", sourceSha: H, kind: "issue", branch: "b", generation: 5 });
+    assert.ok(early && fin);
+    assert.equal(early.captureId, fin.captureId, "same record — no duplicate for the generation");
+    const recs = await coord.inspect("run-gen");
+    assert.equal(recs.length, 1, "exactly one record per (runId, generation)");
+    assert.equal(recs[0]!.sourceSha, H, "the pinned source advanced base → committed head");
+    assert.equal(recs[0]!.generation, 5);
+  });
+
+  it("a non-pinned record is NOT re-pointed by a later pin (its source is bound to journaled bytes)", async () => {
+    const client = new FakeClient();
+    const git = new FakeGit();
+    // A failed upload leaves a needs_action record whose journaled bundle file is bound to H.
+    client.uploadShouldThrow = true;
+    const coord = makeCoordinator({ client, git });
+    const rec = await coord.pin({ runId: "run-bnd", sourceSha: H, kind: "issue", branch: "b", generation: 3 });
+    await coord.captureAndUpload({ record: rec!, barePath: "/bare", defaultBranch: "main" });
+    assert.equal((await coord.inspect("run-bnd"))[0]!.state, "needs_action");
+    // A later same-generation pin with a DIFFERENT source must not move a record past `pinned`.
+    await coord.pin({ runId: "run-bnd", sourceSha: H_PRIME, kind: "issue", branch: "b", generation: 3 });
+    const recs = await coord.inspect("run-bnd");
+    assert.equal(recs.length, 1);
+    assert.equal(recs[0]!.sourceSha, H, "the record keeps its journaled source, never H'");
+    assert.equal(recs[0]!.state, "needs_action");
+  });
+
+  it("release names the exact generation and drops the journal only on a real release", async () => {
+    const client = new FakeClient();
+    const coord = makeCoordinator({ client });
+    await coord.pin({ runId: "run-rel", sourceSha: H, kind: "issue", branch: "b", generation: 9 });
+    await coord.release("run-rel", 9);
+    assert.deepEqual(client.releaseCalls, ["run-rel"]);
+    assert.deepEqual(client.releaseGenerations, [9], "the EXACT generation is released");
+    assert.deepEqual(await coord.inspect("run-rel"), [], "a real release drops the run journal");
+  });
+
+  it("a server-RETAINED release keeps the local journal (the source stays protected)", async () => {
+    const client = new FakeClient();
+    client.releaseRetained = true;
+    const coord = makeCoordinator({ client });
+    await coord.pin({ runId: "run-ret", sourceSha: H, kind: "issue", branch: "b", generation: 2 });
+    await coord.release("run-ret", 2);
+    assert.deepEqual(client.releaseGenerations, [2]);
+    assert.equal(
+      (await coord.inspect("run-ret")).length,
+      1,
+      "a RETAINED hold keeps the local journal for owner attention rather than deleting it",
+    );
+  });
+
+  it("already-published releases the record's EXACT generation and archives nothing", async () => {
+    const client = new FakeClient();
+    const git = new FakeGit();
+    git.alreadyPublished = true;
+    const coord = makeCoordinator({ client, git });
+    const rec = await coord.pin({ runId: "run-ap", sourceSha: H, kind: "issue", branch: "b", generation: 4 });
+    const outcome = await coord.captureAndUpload({ record: rec!, barePath: "/bare", defaultBranch: "main" });
+    assert.equal(outcome.reason, "already_published");
+    assert.deepEqual(client.releaseGenerations, [4], "released the record's exact generation");
+    assert.equal(client.uploadCalls.length, 0);
+  });
+
+  it("the reserve carries the exact generation so it binds the right hold", async () => {
+    const client = new FakeClient();
+    const git = new FakeGit();
+    const coord = makeCoordinator({ client, git });
+    const rec = await coord.pin({ runId: "run-res", sourceSha: H, kind: "issue", branch: "b", generation: 11 });
+    await coord.captureAndUpload({ record: rec!, barePath: "/bare", defaultBranch: "main" });
+    assert.equal(client.reserveCalls.length, 1);
+    assert.equal(client.reserveCalls[0]!.req.generation, 11, "reserve binds the exact generation");
+  });
+
+  it("inventoryHolds observes the server's holds and NEVER releases; disabled ⇒ []", async () => {
+    const client = new FakeClient();
+    client.holds = [
+      { hold_id: "h1", generation: 3, has_available_capture: false },
+      { hold_id: "h2", generation: 4, has_available_capture: true, capture_state: "available" },
+    ];
+    const coord = makeCoordinator({ client });
+    const holds = await coord.inventoryHolds("run-inv");
+    assert.equal(holds.length, 2);
+    assert.deepEqual(holds.map((h) => h.generation), [3, 4]);
+    assert.deepEqual(client.listCalls, ["run-inv"]);
+    assert.equal(client.releaseCalls.length, 0, "the inventory NEVER releases a hold");
+    // A transport failure is best-effort: [] and no throw.
+    client.listRecoveryHolds = async () => {
+      throw new Error("network down");
+    };
+    assert.deepEqual(await coord.inventoryHolds("run-inv"), []);
+    // A token-less coordinator is a no-op inventory.
+    const disabled = makeCoordinator({ token: undefined });
+    assert.deepEqual(await disabled.inventoryHolds("run-inv"), []);
+  });
+
+  it("cancel-during-capture retains: an aborted upload marks needs_action and NEVER releases", async () => {
+    const client = new FakeClient();
+    const git = new FakeGit();
+    // Model a cancellation arriving during the upload: the client throws when the signal fired.
+    client.uploadRecoveryBundle = (async (
+      _runId: string,
+      captureId: string,
+      manifest: RecoveryUploadManifest,
+      bundle: Readable,
+      signal?: AbortSignal,
+    ) => {
+      for await (const _ of bundle) {
+        /* drain */
+      }
+      void captureId;
+      void manifest;
+      if (signal?.aborted) throw new Error("aborted mid-capture");
+      return { capture_id: captureId, state: "available", manifest_bound: true };
+    }) as typeof client.uploadRecoveryBundle;
+    const coord = makeCoordinator({ client, git });
+    const rec = await coord.pin({ runId: "run-cancel", sourceSha: H, kind: "issue", branch: "b", generation: 6 });
+    const ac = new AbortController();
+    ac.abort();
+    const outcome = await coord.captureAndUpload({
+      record: rec!,
+      barePath: "/bare",
+      defaultBranch: "main",
+      signal: ac.signal,
+    });
+    assert.equal(outcome.state, "needs_action", "a cancelled capture retains (needs_action)");
+    assert.equal(client.releaseCalls.length, 0, "a cancelled capture NEVER releases custody");
+    assert.equal((await coord.inspect("run-cancel"))[0]!.state, "needs_action", "the source is retained");
   });
 });
