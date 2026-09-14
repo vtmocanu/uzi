@@ -116,6 +116,15 @@ func contractCases() []contractCase {
 		// summary fixtures (no standalone row — it is never returned alone).
 		newContractCase[RecoveryArchiveDTO]("recovery_archive"),
 		newContractCase[RecoveryArchiveSummaryDTO]("recovery_archive_summary"),
+		// PRD #1349 M1: the owner-facing custody-hold DTOs. RecoveryCustodyHoldDTO's only
+		// nullable field is released_at (*time.Time omitempty, dropped on the zero value) and
+		// its worker_name/capture_state are omitempty strings, so its zero.json carries NO
+		// null (the finding shape). RecoveryCustodyAggregateDTO is all ints (no null).
+		// RecoveryCustodyHoldsDTO's Holds slice is non-omitempty, so its zero.json carries a
+		// null the mapper normalizes to [] (the recovery_archive_summary shape).
+		newContractCase[RecoveryCustodyHoldDTO]("recovery_custody_hold"),
+		newContractCase[RecoveryCustodyAggregateDTO]("recovery_custody_aggregate"),
+		newContractCase[RecoveryCustodyHoldsDTO]("recovery_custody_holds"),
 	}
 }
 

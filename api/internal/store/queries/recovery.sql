@@ -268,3 +268,201 @@ ORDER BY h.created_at ASC;
 -- through to the 404 (ErrWorkerNotFound) path.
 SELECT count(*) FROM recovery_custody_holds
 WHERE live_worker_id = @worker_id::uuid AND user_id = @user_id AND state = 'open';
+
+-- ════════════════════════════════════════════════════════════════════════════════════════
+-- PRD #1349 M1: the ADDITIVE exact-generation and owner-disposition store contract. These
+-- queries are the COMPLETE store-query layer M2 (park capture/post-clone evidence), M4
+-- (server generation-safe lifecycle), M5 (owner hold API/CLI disposition) and M6 (web
+-- surface + owner Slack episode alert) consume. They are strictly ADDITIVE: every existing
+-- query above (ReserveCapture / ReleaseCustodyForRunWorker / ReleaseCustodyHold / …) is
+-- UNTOUCHED, so M1 compiles standalone and a later milestone flips its own call sites onto
+-- these exact-generation names without editing this seam again.
+-- ════════════════════════════════════════════════════════════════════════════════════════
+
+-- name: ReserveCaptureExact :one
+-- PRD #1349 M1 (D1/D2): the GENERATION-EXACT reserve. Identical to ReserveCapture except the
+-- hold-selection WHERE ALSO matches @generation, so a capture is bound to the ONE hold this
+-- worker took at that exact claim generation (never a newer same-worker hold on the run). No
+-- open hold owned by @original_worker_id AT @generation -> zero rows -> pgx.ErrNoRows -> not
+-- authorized (fail closed), enforcing the D1 exact-identity invariant in-SQL. The ON CONFLICT
+-- idempotency is unchanged: retrying the SAME (hold_id, idempotency_key) re-stamps updated_at
+-- and returns the existing row, so a lost ACK re-reserves the same capture and a changed
+-- source_sha under the same key never overwrites the frozen source. M2/M4 flip capture
+-- reservation onto this in place of the generation-blind newest-hold ReserveCapture.
+INSERT INTO recovery_captures
+    (hold_id, run_id, user_id, original_worker_id, original_worker_identity,
+     source_sha, attempted_head_sha, idempotency_key, state)
+SELECT h.id, @run_id, @user_id, @original_worker_id, @original_worker_identity::text,
+       @source_sha, sqlc.narg('attempted_head_sha'), @idempotency_key, 'preparing'
+FROM recovery_custody_holds h
+WHERE h.run_id = @run_id
+  AND h.user_id = @user_id
+  AND h.original_worker_id = @original_worker_id
+  AND h.generation = @generation
+  AND h.state = 'open'
+ORDER BY h.created_at DESC
+LIMIT 1
+ON CONFLICT (hold_id, idempotency_key) DO UPDATE SET updated_at = now()
+RETURNING *;
+
+-- name: ReleaseCustodyHoldExact :execrows
+-- PRD #1349 M1 (D1/D2/D3): the GENERATION-EXACT worker release. Nulls both live FKs (dropping
+-- the ON DELETE RESTRICT that blocks worker/run teardown), flips state to 'released' and
+-- stamps released_at, for the ONE open hold on @run_id at @generation held live by
+-- @worker_id. Unlike ReleaseCustodyForRunWorker (which matches EVERY open hold on the run for
+-- the worker), this settles EXACTLY the named generation — so a newer same-worker generation
+-- can never release an older generation whose source it did not inherit (the D2 hazard). The
+-- caller must have already established this generation's durable evidence (published head,
+-- available archive, or verified no-output). Idempotent: a second call moves zero rows.
+-- Captures survive; the immutable provenance columns are untouched.
+UPDATE recovery_custody_holds
+SET live_worker_id = NULL, live_run_id = NULL, state = 'released',
+    released_at = now(), updated_at = now()
+WHERE run_id = @run_id
+  AND generation = @generation
+  AND live_worker_id = @worker_id::uuid
+  AND state = 'open';
+
+-- name: ListCustodyHoldsForWorkerRun :many
+-- PRD #1349 M1 (D3): the caller worker's OWN open holds on a run, for the worker-facing
+-- post-clone generation-exact inventory (M2). Scoped to holds this worker ORIGINALLY took
+-- (original_worker_id = @worker_id) so a cross-worker reclaim never sees the crashed worker's
+-- holds. Returns the hold id + generation plus a per-hold capture summary: has_available_capture
+-- (a ready archive already covers this hold's source) and capture_state (the latest capture's
+-- lifecycle state, '' when the hold has no capture yet). The worker uses this to decide, per
+-- generation, whether its source is already durable before it re-attempts capture/release.
+SELECT
+    h.id,
+    h.generation,
+    (EXISTS (SELECT 1 FROM recovery_captures c
+        WHERE c.hold_id = h.id AND c.state = 'available'))::boolean AS has_available_capture,
+    COALESCE((SELECT c.state FROM recovery_captures c
+        WHERE c.hold_id = h.id
+        ORDER BY c.created_at DESC, c.id DESC
+        LIMIT 1), '')::text AS capture_state
+FROM recovery_custody_holds h
+WHERE h.run_id = @run_id
+  AND h.original_worker_id = @worker_id::uuid
+  AND h.state = 'open'
+ORDER BY h.created_at ASC;
+
+-- name: ListCustodyHoldsForOwner :many
+-- PRD #1349 M1 (D7): the owner-scoped, bounded hold list the web Workers surface and the
+-- `uzi run recovery` CLI render (M5/M6). OWNER-scoped by @user_id, with OPTIONAL run/worker/
+-- state narg filters (a NULL narg disables that filter). It returns the exact hold identity
+-- (id, run_id, generation), lifecycle state, timestamps, and the OPAQUE original_worker_id
+-- UUID, plus a BOUNDED owner-safe worker display name LEFT-JOINed from workers.name (NULL ->
+-- '' when the worker row is gone). It NEVER returns original_worker_identity (raw provenance,
+-- D7). The per-hold capture summary (has_available_capture, latest capture_state) lets the
+-- surface classify a hold (active protection / capture in progress / archive available /
+-- needs attention) without a second query. Ordered oldest-first for a stable list.
+SELECT
+    h.id,
+    h.run_id,
+    h.generation,
+    h.state,
+    h.created_at,
+    h.updated_at,
+    h.released_at,
+    h.original_worker_id,
+    COALESCE(w.name, '')::text AS worker_name,
+    (EXISTS (SELECT 1 FROM recovery_captures c
+        WHERE c.hold_id = h.id AND c.state = 'available'))::boolean AS has_available_capture,
+    COALESCE((SELECT c.state FROM recovery_captures c
+        WHERE c.hold_id = h.id
+        ORDER BY c.created_at DESC, c.id DESC
+        LIMIT 1), '')::text AS capture_state
+FROM recovery_custody_holds h
+LEFT JOIN workers w ON w.id = h.original_worker_id AND w.user_id = h.user_id
+WHERE h.user_id = @user_id
+  AND (sqlc.narg('run_id')::uuid IS NULL OR h.run_id = sqlc.narg('run_id')::uuid)
+  AND (sqlc.narg('worker_id')::uuid IS NULL OR h.original_worker_id = sqlc.narg('worker_id')::uuid)
+  AND (sqlc.narg('state')::text IS NULL OR h.state = sqlc.narg('state')::text)
+ORDER BY h.created_at ASC;
+
+-- name: GetCustodyAggregateForOwner :one
+-- PRD #1349 M1 (D6/D10): the owner-level custody aggregate the board alert and one-per-episode
+-- Slack DM read (M6). open_holds is the owner's UNRESOLVED (state='open') hold count — the SAME
+-- admission signal ClaimRun blocks on. blocked_runs is the count of the owner's QUEUED
+-- code-publishing runs currently blocked by the custody-admission predicate: it mirrors the
+-- reasonCustodyLimit predicate in workersvc/health.go — a run stays queued for custody ONLY when
+-- the owner is AT/OVER the limit — so it is 0 unless open_holds >= @custody_hold_limit (and a
+-- non-positive @custody_hold_limit DISABLES the gate exactly like the claim path, yielding 0).
+-- The code-publishing kinds match ClaimRun's custody-hold CTE (issue/ci_fix/self_improve/prompt/
+-- task/mr_rework). Both columns are cast ::bigint so sqlc types them as int64, never interface{}.
+-- Every column is table-qualified and @user_id carries an explicit ::uuid cast: this is a
+-- top-level SELECT with no FROM, so sqlc's param-type inference cannot pick a single relation
+-- for an untyped @user_id when both recovery_custody_holds and runs expose a user_id column
+-- (it reports "column reference user_id is ambiguous"). The cast types the param directly.
+SELECT
+    (SELECT count(*) FROM recovery_custody_holds h
+        WHERE h.user_id = @user_id::uuid AND h.state = 'open')::bigint AS open_holds,
+    (CASE
+        WHEN @custody_hold_limit::int > 0
+             AND (SELECT count(*) FROM recovery_custody_holds h2
+                    WHERE h2.user_id = @user_id::uuid AND h2.state = 'open') >= @custody_hold_limit::int
+        THEN (SELECT count(*) FROM runs r
+                WHERE r.user_id = @user_id::uuid
+                  AND r.status = 'queued'
+                  AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework'))
+        ELSE 0
+     END)::bigint AS blocked_runs;
+
+-- name: DiscardCustodyHoldForOwner :execrows
+-- PRD #1349 M1 (D7): owner-initiated EXACT hold discard. Marks the ONE named open hold
+-- 'discarded' and nulls its live worker/run FKs (dropping the ON DELETE RESTRICT so ordinary
+-- teardown can proceed), leaving the immutable provenance columns intact for audit. OWNER
+-- SCOPE IS VERIFIED IN THE SQL (user_id = @user_id) in ADDITION to the handler's owner-or-404
+-- gate, and the run/hold identity (run_id + id) is matched, so a foreign owner or a wrong
+-- run/hold id settles zero rows. state='open' makes discard terminal + idempotent: a second
+-- call, or a hold already released/discarded, moves zero rows and can never revive it.
+-- Captures are settled separately (DiscardNonReadyCapturesForHold); an available archive is
+-- NEVER touched here (archive deletion is a distinct owner choice, D7). Sibling holds and
+-- generations are left untouched.
+UPDATE recovery_custody_holds
+SET state = 'discarded', live_worker_id = NULL, live_run_id = NULL, updated_at = now()
+WHERE id = @hold_id AND run_id = @run_id AND user_id = @user_id AND state = 'open';
+
+-- name: DiscardNonReadyCapturesForHold :execrows
+-- PRD #1349 M1 (D7): the capture-settlement half of an owner hold discard. For ONE hold, marks
+-- its preparing/uploading/needs_action captures 'discarded' and deletes their partial byte
+-- chunks, NEVER touching an 'available' (ready) capture — a ready archive survives a hold
+-- discard so the owner can still export it (D7/D9). Ordered exactly like DiscardCaptureForOwner
+-- so the whole thing is ONE atomic statement: `targets` SELECTs the non-ready capture ids under
+-- one snapshot, `del` deletes their chunks, and the final UPDATE flips exactly those ids to
+-- 'discarded'. Because every CTE reads that same snapshot, a partially-settled capture can never
+-- leave orphan chunks or a chunk-less non-terminal row, and :execrows reports the capture
+-- UPDATE's row count (not the chunk deletes'). The caller runs this in the SAME transaction as
+-- DiscardCustodyHoldForOwner, locking hold then captures in upload order (D7).
+WITH targets AS (
+    SELECT rc.id AS capture_id FROM recovery_captures rc
+    WHERE rc.hold_id = @hold_id
+      AND rc.state IN ('preparing', 'uploading', 'needs_action')
+),
+del AS (
+    DELETE FROM recovery_capture_chunks
+    WHERE capture_id IN (SELECT targets.capture_id FROM targets)
+)
+UPDATE recovery_captures c
+SET state = 'discarded', updated_at = now()
+WHERE c.id IN (SELECT targets.capture_id FROM targets);
+
+-- name: ClaimCustodyEpisodeNotice :one
+-- PRD #1349 M1 (D10): atomically claim the one-per-episode owner Slack DM slot, mirroring
+-- ClaimVaultLockNotice. Backed by the additive custody_episode_notices table (migration 00226):
+-- the FIRST caller to observe a blocked-custody episode for a user INSERTs the row and gets it
+-- back; a concurrent second caller conflicts on the user_id PK, DO NOTHING returns no row
+-- (pgx.ErrNoRows), so N api pods send EXACTLY ONE DM per episode (at-most-once dedup, the mark
+-- is set before Notify runs). ClearCustodyEpisodeNotice re-arms it when the owner drops below
+-- the limit, so a later crossing can notify afresh.
+INSERT INTO custody_episode_notices (user_id, notified_at)
+VALUES (@user_id, now())
+ON CONFLICT (user_id) DO NOTHING
+RETURNING user_id;
+
+-- name: ClearCustodyEpisodeNotice :exec
+-- PRD #1349 M1 (D10): re-arm the owner custody-episode notice by dropping the mark, mirroring
+-- ClearVaultLockNotice. Called when the owner falls back below the custody-admission limit
+-- (the episode closes), so a later re-crossing sends a fresh DM. Idempotent: a delete of a
+-- missing row is a no-op.
+DELETE FROM custody_episode_notices WHERE user_id = @user_id;

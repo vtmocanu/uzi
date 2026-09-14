@@ -418,6 +418,31 @@ func (s *Service) Status(ctx context.Context, wkr store.Worker, runID, captureID
 	return captureToStatus(cap), nil
 }
 
+// ListHoldsForWorkerRun returns the caller worker's OWN open custody holds on the run — the
+// worker-facing post-clone generation-exact inventory (PRD #1349 M1, D3). Scoped to holds
+// this worker ORIGINALLY took (original_worker_id = wkr.ID), so a cross-worker reclaim never
+// sees a crashed worker's holds. The slice is initialized non-nil so it marshals as [] (never
+// null) when the worker holds nothing on the run.
+func (s *Service) ListHoldsForWorkerRun(ctx context.Context, wkr store.Worker, runID uuid.UUID) (apitypes.RecoveryHoldsResponse, error) {
+	rows, err := s.store.ListCustodyHoldsForWorkerRun(ctx, store.ListCustodyHoldsForWorkerRunParams{
+		RunID:    runID,
+		WorkerID: wkr.ID,
+	})
+	if err != nil {
+		return apitypes.RecoveryHoldsResponse{}, err
+	}
+	holds := make([]apitypes.RecoveryHoldDTO, 0, len(rows))
+	for _, r := range rows {
+		holds = append(holds, apitypes.RecoveryHoldDTO{
+			HoldID:              r.ID.String(),
+			Generation:          r.Generation,
+			HasAvailableCapture: r.HasAvailableCapture,
+			CaptureState:        r.CaptureState,
+		})
+	}
+	return apitypes.RecoveryHoldsResponse{RunID: runID.String(), Holds: holds}, nil
+}
+
 // Release settles every OPEN custody hold this worker holds on the run (D3): it nulls the
 // live FKs (dropping the ON DELETE RESTRICT that blocks teardown), flips state to
 // 'released' and stamps released_at. Scoped to the caller's own holds — a foreign worker

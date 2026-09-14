@@ -63,6 +63,8 @@ type Store interface {
 	GetRecoverySummaryForRun(ctx context.Context, arg store.GetRecoverySummaryForRunParams) (store.GetRecoverySummaryForRunRow, error)
 	MarkCaptureState(ctx context.Context, arg store.MarkCaptureStateParams) (store.RecoveryCapture, error)
 	DiscardCaptureForOwner(ctx context.Context, arg store.DiscardCaptureForOwnerParams) (int64, error)
+	// PRD #1349 M1 (D3): the worker-facing post-clone hold inventory read.
+	ListCustodyHoldsForWorkerRun(ctx context.Context, arg store.ListCustodyHoldsForWorkerRunParams) ([]store.ListCustodyHoldsForWorkerRunRow, error)
 }
 
 // DB is the pgx pool surface the service needs for the streaming download cursor and the

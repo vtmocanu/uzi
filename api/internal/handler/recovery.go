@@ -143,6 +143,26 @@ func (h *Handler) WorkerRecoveryStatus(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, res)
 }
 
+// WorkerListRecoveryHolds returns the caller worker's own open custody holds on the run — the
+// post-clone generation-exact inventory (PRD #1349 M1, D3).
+func (h *Handler) WorkerListRecoveryHolds(w http.ResponseWriter, r *http.Request) {
+	wkr, ok := mw.WorkerFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "worker authentication required")
+		return
+	}
+	runID, ok := httpx.PathUUID(w, r, "id", "run")
+	if !ok {
+		return
+	}
+	res, err := h.recovery().ListHoldsForWorkerRun(r.Context(), wkr, runID)
+	if err != nil {
+		mapRecoveryError(w, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, res)
+}
+
 // WorkerRecoveryRelease releases the caller worker's open custody holds on the run.
 func (h *Handler) WorkerRecoveryRelease(w http.ResponseWriter, r *http.Request) {
 	wkr, ok := mw.WorkerFromContext(r.Context())

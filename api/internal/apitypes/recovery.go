@@ -76,6 +76,11 @@ type RecoveryReserveRequest struct {
 	IdempotencyKey   string `json:"idempotency_key"`
 	SourceSha        string `json:"source_sha"`
 	AttemptedHeadSha string `json:"attempted_head_sha,omitempty"`
+	// Generation is the exact claim generation this capture belongs to (PRD #1349 M1). A v2
+	// worker sends it so the reserve binds to the ONE hold it took at that generation; a v1
+	// worker omits it (the server falls back to the newest-hold ReserveCapture). The call
+	// sites that populate it are M2's — M1 only threads the field onto the wire.
+	Generation *int64 `json:"generation,omitempty"`
 }
 
 // RecoveryReserveResponse is the reserve ACK: the server-minted capture id and its current
@@ -121,4 +126,89 @@ type RecoveryReleaseResponse struct {
 	RunID         string `json:"run_id"`
 	Released      bool   `json:"released"`
 	HoldsReleased int    `json:"holds_released"`
+	// Retained is true when the server LEFT a hold open pending owner attention rather than
+	// releasing it (PRD #1349 M1) — the v1/ambiguous case where the worker could not prove
+	// its generation's work is durable. Reason is a bounded server reason when retained.
+	// Both omitempty, so a clean release marshals neither.
+	Retained bool   `json:"retained,omitempty"`
+	Reason   string `json:"reason,omitempty"`
+}
+
+// RecoveryReleaseRequest is the worker's request to settle custody for the EXACT generation
+// it names (PRD #1349 M1, D1/D2). A v2 worker sends Generation so the server releases only
+// the hold it took at that claim generation, never a newer same-worker generation whose
+// source it did not inherit; a v1 worker omits it (the server settles by run+worker). The
+// call sites that populate it are M2's — M1 only freezes the shape.
+type RecoveryReleaseRequest struct {
+	Generation *int64 `json:"generation,omitempty"`
+}
+
+// RecoveryHoldDTO is one open custody hold this worker holds on a run, in the worker-facing
+// post-clone inventory (PRD #1349 M1, D3). HoldID + Generation are the exact hold identity;
+// HasAvailableCapture is true when a ready archive already covers this hold's source, and
+// CaptureState is the latest capture's lifecycle state (empty when the hold has no capture yet).
+// The worker uses this to decide, per generation, whether its source is already durable
+// before it re-attempts capture/release.
+type RecoveryHoldDTO struct {
+	HoldID              string `json:"hold_id"`
+	Generation          int64  `json:"generation"`
+	HasAvailableCapture bool   `json:"has_available_capture"`
+	CaptureState        string `json:"capture_state,omitempty"`
+}
+
+// RecoveryHoldsResponse is the worker's post-clone hold inventory for one run (PRD #1349 M1,
+// D3). Holds is ALWAYS a JSON array, never null — the service initializes it to
+// []RecoveryHoldDTO{} so the worker iterates it unconditionally.
+type RecoveryHoldsResponse struct {
+	RunID string            `json:"run_id"`
+	Holds []RecoveryHoldDTO `json:"holds"`
+}
+
+// ── Owner-facing custody-hold DTOs (PRD #1349 M1 D7; SPA/CLI read side, api-contract
+// fixture-pinned like the archive DTOs above, mirrored in web/src/lib/apiTypes.ts) ─────────
+
+// RecoveryCustodyHoldDTO is one owner-visible custody hold. It NEVER carries
+// original_worker_identity (raw provenance is owner-hidden, D7) — only the OPAQUE worker id
+// and a bounded owner-safe display name. Attention is a SERVER-DERIVED action/attention state
+// DISTINCT from any capture State: its intended vocabulary is
+//
+//	active | capturing | archive_ready | needs_action | source_only | released | discarded
+//
+// M4/M5 compute it; in M1 it is a documented placeholder that stays "" (the zero fixture
+// carries ""). HasAvailableCapture is true when a ready archive already covers this hold's
+// source; CaptureState is the latest capture's lifecycle state (empty when the hold has none).
+// ReleasedAt is null while the hold is open.
+type RecoveryCustodyHoldDTO struct {
+	ID                  string     `json:"id"`
+	RunID               string     `json:"run_id"`
+	Generation          int64      `json:"generation"`
+	State               string     `json:"state"`
+	Attention           string     `json:"attention"`
+	WorkerID            string     `json:"worker_id"`
+	WorkerName          string     `json:"worker_name,omitempty"`
+	HasAvailableCapture bool       `json:"has_available_capture"`
+	CaptureState        string     `json:"capture_state,omitempty"`
+	CreatedAt           time.Time  `json:"created_at"`
+	UpdatedAt           time.Time  `json:"updated_at"`
+	ReleasedAt          *time.Time `json:"released_at,omitempty"`
+}
+
+// RecoveryCustodyAggregateDTO is the owner-level custody summary the board alert and the
+// one-per-episode Slack DM read (PRD #1349 M1 D6/D10). OpenHolds is the owner's unresolved
+// (state='open') hold count; CustodyHoldLimit is the configured per-owner admission ceiling;
+// DecisionNeeded is how many holds await an owner decision; BlockedRuns is the count of the
+// owner's queued code-publishing runs blocked by the custody-admission gate. All four are
+// plain ints (0 is meaningful), always on the wire.
+type RecoveryCustodyAggregateDTO struct {
+	OpenHolds        int `json:"open_holds"`
+	CustodyHoldLimit int `json:"custody_hold_limit"`
+	DecisionNeeded   int `json:"decision_needed"`
+	BlockedRuns      int `json:"blocked_runs"`
+}
+
+// RecoveryCustodyHoldsDTO is the owner GET /api/recovery/holds response (PRD #1349 M1 D7). M5
+// populates the endpoint; the shape is frozen here. Holds is ALWAYS a JSON array, never null.
+type RecoveryCustodyHoldsDTO struct {
+	Aggregate RecoveryCustodyAggregateDTO `json:"aggregate"`
+	Holds     []RecoveryCustodyHoldDTO    `json:"holds"`
 }

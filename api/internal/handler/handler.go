@@ -1140,6 +1140,8 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		r.Post("/runs/{id}/archives/release", h.WorkerRecoveryRelease)
 		r.Post("/runs/{id}/archives/{captureID}/upload", h.WorkerRecoveryUpload)
 		r.Get("/runs/{id}/archives/{captureID}", h.WorkerRecoveryStatus)
+		// PRD #1349 M1: the post-clone generation-exact hold inventory for this worker's run.
+		r.Get("/runs/{id}/recovery-holds", h.WorkerListRecoveryHolds)
 	})
 }
 

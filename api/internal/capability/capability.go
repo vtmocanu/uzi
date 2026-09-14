@@ -48,17 +48,29 @@ const CompletionInterlockV1 = "completion_interlock_v1"
 // promised recovery.
 const RecoveryArchiveV1 = "recovery_archive_v1"
 
+// RecoveryArchiveV2 is the PROTOCOL capability a worker self-reports (PRD #1349 M1) to
+// declare it implements the GENERATION-EXACT durable-recovery path — it names the exact
+// claim generation on reserve/release and consults the post-clone hold inventory before
+// re-attempting capture. It is a strict superset of RecoveryArchiveV1's guarantees; a v2
+// worker advertises BOTH during rollout (agent/src/worker.ts), so the RecoveryCapable gate
+// (workersvc) stays keyed on V1 until a later milestone flips it. Like V1 it is a
+// worker/server protocol fact, NOT a scheduler capability or a user-chosen repo requirement,
+// so it lives in the protocol vocabulary below, never in `vocabulary` and never in the web
+// capability picker.
+const RecoveryArchiveV2 = "recovery_archive_v2"
+
 // protocolVocabulary is the closed set of legal PROTOCOL capability names — kept
 // entirely separate from `vocabulary` so a protocol string is never offered to users
 // through Vocabulary()/the web mirror. FilterProtocol drops anything not in here.
 var protocolVocabulary = map[string]struct{}{
 	CompletionInterlockV1: {},
 	RecoveryArchiveV1:     {},
+	RecoveryArchiveV2:     {},
 }
 
 // protocolOrder fixes FilterProtocol's stable output order (protocolVocabulary is a map,
 // so its own iteration order is not stable). Keep in lockstep with protocolVocabulary.
-var protocolOrder = []string{CompletionInterlockV1, RecoveryArchiveV1}
+var protocolOrder = []string{CompletionInterlockV1, RecoveryArchiveV1, RecoveryArchiveV2}
 
 // FilterProtocol returns the members of in that are in the PROTOCOL vocabulary, DROPPING
 // unknowns silently (never an error), deduped, in stable order. It mirrors Filter but

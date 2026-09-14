@@ -1,0 +1,14 @@
+{
+  "id": "x",
+  "run_id": "x",
+  "generation": 1,
+  "state": "x",
+  "attention": "x",
+  "worker_id": "x",
+  "worker_name": "x",
+  "has_available_capture": true,
+  "capture_state": "x",
+  "created_at": "2020-01-02T03:04:05Z",
+  "updated_at": "2020-01-02T03:04:05Z",
+  "released_at": "2020-01-02T03:04:05Z"
+}
