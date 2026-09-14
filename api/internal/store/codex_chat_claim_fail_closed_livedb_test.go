@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -128,5 +129,20 @@ func TestCodexChatClaimFailsClosedLiveDB(t *testing.T) {
 		if s := statusOf(runID); s != "queued" {
 			t.Fatalf("Codex-indicating chat (%s) status = %q after the Claude claim, want 'queued'", name, s)
 		}
+	}
+}
+
+// TestClaimChatRunCodexGuardNamesAllIndicators closes the discrimination gap the live schema
+// necessarily has: runs_codex_harness_coherence_check forces either binding sentinel to coexist
+// with harness='codex', so a LiveDB fixture cannot isolate those two SQL arms. Pin the source query's
+// complete defense-in-depth clause; sqlc's generated-code no-drift gate carries it to execution.
+func TestClaimChatRunCodexGuardNamesAllIndicators(t *testing.T) {
+	src, err := os.ReadFile("queries/chat.sql")
+	if err != nil {
+		t.Fatalf("read chat query source: %v", err)
+	}
+	const want = "AND NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)"
+	if !strings.Contains(string(src), want) {
+		t.Fatalf("ClaimChatRun must gate all three Codex indicators with the exact fail-closed clause %q", want)
 	}
 }

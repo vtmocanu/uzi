@@ -854,10 +854,10 @@ export interface CodexExecutorOptions {
   readonly provider: CodexProviderConfig;
 }
 
-// ─── The per-epoch provider bundle + the shared per-run context (m4) ────────────
+// ─── The per-epoch provider bundle + shared executor-claim context (m4) ─────────
 /**
- * PRD #1171 m4: the SHARED per-run state every provider epoch is built from. Closed over ONCE in
- * `run()` and passed to every {@link CodexExecutor.startProviderEpoch} so a recreated epoch reuses
+ * PRD #1171 m4: state shared by every provider epoch inside ONE executor claim leg. Closed over
+ * once in `run()` and passed to every {@link CodexExecutor.startProviderEpoch} so a recreated epoch reuses
  * (never rebuilds) the released-token set, the committed-generation cell, the tool-handler map, the
  * reconcile + eviction closures, provisioning-derived command env, the effect launcher and the
  * boundary seams. Only the per-epoch registry/safety/harness/effect-roots + a fresh credential +
@@ -881,12 +881,10 @@ interface EpochSharedContext {
   readonly boundaryProcessSpawner: SpawnBoundaryProcessSeam;
   readonly reconcile: ReconcileBeforeBoundary;
   readonly evictTokens: () => void;
-  /** PRD #1332 C4a / CodeRabbit 4004800880: the ONE run-lifetime token accountant, shared across
-   *  every provider epoch. `startProviderEpoch` builds a fresh {@link CodexHarness} on every epoch
-   *  recreation (plan approval, cooperative-checkpoint reaps), but the accountant must survive that
-   *  so a resumed epoch reports the run's cumulative-since-start usage — not just its own delta —
-   *  which the downstream GREATEST fold requires to stay correct. Constructed ONCE below and passed
-   *  into every epoch's harness. */
+  /** PRD #1332 C4a / CodeRabbit 4004800880: one accountant for this executor claim leg, shared
+   *  across provider-epoch recreation. A later worker claim constructs a new executor/accountant and
+   *  emits a new init lineage, so its resumed-thread delta is summed rather than GREATEST-folded into
+   *  this leg. */
   readonly accountant: CodexUsageAccountant;
 }
 
@@ -1090,10 +1088,8 @@ export class CodexExecutor implements Executor {
         boundaryProcessSpawner,
         reconcile,
         evictTokens,
-        // PRD #1332 C4a / CodeRabbit 4004800880: ONE accountant for the whole run, so its
-        // cumulative-since-start per-thread reconciliation survives every provider-epoch
-        // recreation (plan approval, checkpoint reaps) rather than resetting to a resumed epoch's
-        // own delta and losing the run cumulative under the downstream GREATEST fold.
+        // One accountant for this executor claim leg. Internal provider epochs share its cumulative;
+        // a later worker claim gets a new accountant and a new explicit init lineage.
         accountant: new CodexUsageAccountant(),
       };
 
@@ -1424,9 +1420,11 @@ export class CodexExecutor implements Executor {
         // PRD #1332 C4b / D5: the run's immutable credential mode selects the terminal cost
         // semantics (subscription vs api-key metered/unreported) in the token accountant.
         authMode: binding.authMode,
-        // PRD #1332 C4a / CodeRabbit 4004800880: the ONE run-lifetime accountant, so a recreated
-        // epoch continues the run's cumulative reconciliation instead of starting fresh.
+        // Share usage across internal provider epochs, but emit the server lineage marker only for
+        // epoch 0. Every new CodexExecutor.run invocation starts again at epoch 0, so a re-claim gets
+        // a fresh lineage even when thread/resume emits no thread/started notification.
         accountant,
+        emitClaimInit: epochIndex === 0,
       });
 
       const epochHarness = harness;

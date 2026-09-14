@@ -54,6 +54,7 @@ func TestDeriveUsageCostMarkerMatrix(t *testing.T) {
 		{"codex metered negative amount is unreported", harnessCodex, costStatusMetered, -5.5, true, costStatusUnreported, 0},
 		{"codex metered NaN amount is unreported", harnessCodex, costStatusMetered, math.NaN(), true, costStatusUnreported, 0},
 		{"codex metered +Inf amount is unreported", harnessCodex, costStatusMetered, math.Inf(1), true, costStatusUnreported, 0},
+		{"codex metered above storage domain is unreported", harnessCodex, costStatusMetered, maxCostUSD + 1, true, costStatusUnreported, 0},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

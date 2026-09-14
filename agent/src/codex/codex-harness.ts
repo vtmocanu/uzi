@@ -182,14 +182,17 @@ export interface CodexHarnessOptions {
    *  terminal prices NOTHING — every entry stays `unreported` and the run cost `unreported` — the
    *  conservative choice that retains tokens and never invents a subscription or a dollar figure. */
   readonly authMode?: CodexAppServerAuthMode;
-  /** PRD #1332 C4a / CodeRabbit 4004800880: the RUN-lifetime token accountant, INJECTED so it
+  /** PRD #1332 C4a / CodeRabbit 4004800880: the executor-claim-leg token accountant, INJECTED so it
    *  survives provider-epoch recreation (plan approval, cooperative-checkpoint reaps). Each epoch
-   *  builds a FRESH {@link CodexHarness}, but the accountant holds the run's cumulative-since-start
-   *  per-thread reconciliation — a per-harness accountant would report only the resumed epoch's own
-   *  delta and lose the run cumulative under the downstream GREATEST fold. The {@link
-   *  EpochSharedContext} constructs ONE and passes it into every epoch's harness. When ABSENT (a
-   *  single-epoch or test construction) it defaults to a fresh accountant, preserving back-compat. */
+   *  builds a FRESH {@link CodexHarness}, but the accountant keeps the claim leg's cumulative
+   *  per-thread reconciliation. A later worker claim constructs a new executor and accountant, and
+   *  its explicit init marker gives that resumed delta a new server lineage. When ABSENT (a
+   *  single-epoch or test construction) this defaults to a fresh accountant. */
   readonly accountant?: CodexUsageAccountant;
+  /** Emit this executor claim leg's one explicit `initialized` event. The first provider epoch sets
+   *  this true; recreated internal epochs set it false, so each worker claim creates exactly one
+   *  persisted usage-lineage marker regardless of app-server `thread/started` behavior. */
+  readonly emitClaimInit?: boolean;
 }
 
 // --- small pure helpers -------------------------------------------------------
@@ -293,15 +296,13 @@ export class CodexHarness implements RunHarness {
   private currentModel?: string;
   private closed = false;
 
-  // PRD #1332 C4a: the per-run token accountant. It holds the IMMUTABLE thread->model map
-  // (root captured on thread establishment, children via {@link recordChildThreadModel}) and
-  // reconciles every `thread/tokenUsage/updated` note into per-model deltas. INJECTED by the
-  // executor's EpochSharedContext so it survives provider-epoch recreation (plan approval,
-  // checkpoint reaps) — the root thread's cumulative spans turns AND epochs, and earlier-epoch
-  // children stay aggregated, so each turn terminal emits the run's cumulative-since-baseline
-  // modelUsage which C1's per-leg GREATEST fold deduplicates. Defaults to a fresh accountant for a
-  // caller that injects none (single-epoch / test construction).
+  // PRD #1332 C4a: the executor-claim-leg token accountant. It holds the IMMUTABLE thread->model
+  // map and survives provider-epoch recreation inside this executor invocation. Each terminal emits
+  // the claim leg's cumulative-since-baseline modelUsage, which one server lineage row de-duplicates
+  // with GREATEST. A later worker claim gets a new accountant and a new explicit init lineage.
   private readonly accountant: CodexUsageAccountant;
+  private readonly emitClaimInit: boolean;
+  private claimInitEmitted = false;
 
   // Child-thread demux (part C): a registered sink receives every frame carrying its
   // child thread id off the SAME transport, so a delegation's child turn can consume its
@@ -344,6 +345,7 @@ export class CodexHarness implements RunHarness {
     this.credentialValue = opts.credentialValue;
     this.authMode = opts.authMode;
     this.accountant = opts.accountant ?? new CodexUsageAccountant();
+    this.emitClaimInit = opts.emitClaimInit ?? true;
   }
 
   inspectSession(id: string): Promise<SessionPresence> {
@@ -576,6 +578,15 @@ export class CodexHarness implements RunHarness {
         return;
       }
 
+      // Usage lineage is one row per executor claim leg, not per provider epoch. Emit the marker
+      // explicitly after thread start/resume + turn/start so a resumed claim gets one even though
+      // the pinned app-server emits no thread/started on thread/resume. Internal epoch recreations
+      // pass emitClaimInit=false, and this latch prevents another marker on later turns in epoch 0.
+      if (this.emitClaimInit && !this.claimInitEmitted) {
+        this.claimInitEmitted = true;
+        yield { kind: "initialized", model: this.currentModel, sessionId: this.threadId };
+      }
+
       // 4. Consume the notification stream, mapping each raw frame to ONE neutral event.
       for (;;) {
         if (this.turnClosed) return;
@@ -603,6 +614,11 @@ export class CodexHarness implements RunHarness {
             category: "protocol",
             message: "codex app-server stream ended before turn completion",
           });
+        }
+        // The explicit claim init above replaces the root thread/started event without adding a
+        // second neutral activity. Child/foreign thread starts still flow through demux/mapNote.
+        if (step.value.kind === "thread_started" && step.value.threadId === this.threadId) {
+          continue;
         }
         // PRD #1332 C4a: reconcile every typed token-usage note into the per-model accountant
         // BEFORE the demux, so BOTH root and demuxed-child usage is captured off this single
@@ -817,16 +833,9 @@ export class CodexHarness implements RunHarness {
   ): Promise<HarnessEvent> {
     switch (note.kind) {
       case "thread_started":
-        // The model-bearing init: carries the model the harness configured, distinct
-        // from the bare turn-start below. Bind it to the ACTIVE ROOT thread: a child
-        // `thread/started` (a delegated subagent's) must never latch the root session id
-        // or emit a root `initialized`. The demux already routes a registered child's
-        // frames away, so this is defense-in-depth for the pre-registration window and any
-        // stray/foreign thread id — such a frame is liveness only.
-        if (note.threadId !== this.threadId) {
-          return { kind: "activity", sessionId: note.threadId };
-        }
-        return { kind: "initialized", model: this.currentModel, sessionId: note.threadId };
+        // The active root's notification is consumed in runTurn because its explicit claim init
+        // already carried the same session. Only a child/foreign start reaches here as liveness.
+        return { kind: "activity", sessionId: note.threadId };
       case "turn_started":
         return { kind: "activity", sessionId: note.threadId };
       case "token_usage_updated":

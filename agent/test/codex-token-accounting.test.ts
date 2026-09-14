@@ -328,11 +328,11 @@ describe("CodexUsageAccountant: m3 fail-closed pricing on malformed required evi
     assert.equal(astra.inputTokens, 300);
   });
 
-  it("a LEGITIMATELY-ABSENT field keeps the lenient/metered behavior (flag absent ⇒ complete)", () => {
+  it("a trusted pre-decoded usage object without the optional evidence flag stays backward-compatible", () => {
     const acct = new CodexUsageAccountant();
     acct.registerThread(ROOT, MODEL_ROOT, false);
-    // `usage` omits the flag (undefined). A transport frame with a priced bucket legitimately
-    // absent stays pricingEvidenceComplete=true, so the accountant defaults to lenient and meters.
+    // The direct helper fills every numeric bucket and omits only the optional decoder flag. Real
+    // transport frames always set that flag, including false when any required bucket is absent.
     acct.record(ROOT, usage(B, B));
     const astra = acct.aggregateByModel(API_KEY)![MODEL_ROOT]!;
     assert.equal(astra.costStatus, "metered", "an absent flag defaults to complete → metered");

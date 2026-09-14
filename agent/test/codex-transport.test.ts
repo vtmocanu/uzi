@@ -196,8 +196,7 @@ describe("codex transport: notification decoding", () => {
     // retained (token retention must never regress), but a PRESENT-but-malformed pricing-required
     // bucket in `total` (inputTokens hostile string, cacheWriteInputTokens negative) marks the frame
     // pricingEvidenceComplete=false so the accountant can fail cost closed. `last` here carries only
-    // totalTokens (no priced bucket PRESENT), so `last` alone is lenient — the `total` malformation
-    // is what drives the flag.
+    // totalTokens, so it is also incomplete because all four pricing-required buckets are absent.
     const { inbound, transport } = makePair();
     const notes = transport.notifications();
     writeFrame(inbound, {
@@ -261,10 +260,10 @@ describe("codex transport: notification decoding", () => {
     await transport.close();
   });
 
-  it("stays pricing-COMPLETE when a priced bucket is legitimately ABSENT (present-but-partial is usable, m3)", async () => {
-    // The deliberate leniency the m3 fix preserves: a MISSING priced key is not corruption. Here
-    // outputTokens/cacheWriteInputTokens are simply absent (never sent), and every PRESENT priced
-    // bucket is a valid number — so the frame stays pricingEvidenceComplete=true and prices normally.
+  it("flags pricing-incomplete when any pricing-required bucket is absent (m3)", async () => {
+    // The pinned protocol requires all four priced buckets. Missing outputTokens and
+    // cacheWriteInputTokens retain zero-valued token placeholders, but cannot be treated as
+    // affirmative pricing evidence or an understated cost could be reported as metered.
     const { inbound, transport } = makePair();
     const notes = transport.notifications();
     writeFrame(inbound, {
@@ -281,8 +280,8 @@ describe("codex transport: notification decoding", () => {
     const v = (await notes.next()).value as CodexNotification;
     assert.equal(v.kind, "token_usage_updated");
     if (v.kind === "token_usage_updated") {
-      assert.equal(v.usage.total.outputTokens, 0, "an absent priced bucket coerces to 0");
-      assert.equal(v.usage.pricingEvidenceComplete, true, "a legitimately-absent priced bucket stays lenient (complete)");
+      assert.equal(v.usage.total.outputTokens, 0, "an absent priced bucket retains a zero token placeholder");
+      assert.equal(v.usage.pricingEvidenceComplete, false, "an absent required bucket fails pricing closed");
     }
     await transport.close();
   });

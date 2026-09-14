@@ -107,11 +107,10 @@ export interface CodexUsageBreakdown {
  *
  *  `pricingEvidenceComplete` (PRD #1332 m3, CodeRabbit 4004800884) is the FAIL-CLOSED pricing gate:
  *  false when a PRICING-REQUIRED bucket (`inputTokens`, `cachedInputTokens`, `cacheWriteInputTokens`,
- *  `outputTokens`) of EITHER breakdown was PRESENT on the wire but malformed (non-numeric / negative
- *  / NaN / Infinite) — the corruption signal a bare `readNonNegNumber` coercion to 0 would hide,
- *  understating a metered cost. It stays true (lenient) for a LEGITIMATELY ABSENT bucket, preserving
- *  the module's "present-but-partial is usable" contract; token totals are ALWAYS retained (the
- *  coerced values still flow), and this flag ONLY gates cost — the api-key branch of {@link
+ *  `outputTokens`) of EITHER breakdown is absent or malformed (non-numeric, negative, NaN, or
+ *  Infinite). The pinned protocol requires all four; treating a missing bucket as affirmative zero
+ *  would understate a metered cost. Token totals are retained through zero placeholders, and this
+ *  flag ONLY gates cost: the api-key branch of {@link
  *  CodexUsageAccountant.aggregateByModel} degrades the model to `unreported` on `false`. Optional so
  *  a pre-decoded test construction (which omits it) reads as complete; the real decoder always sets
  *  it. The two non-priced buckets (`totalTokens`, `reasoningOutputTokens`) never enter the price and
@@ -246,10 +245,9 @@ function readObjectProp(obj: unknown, key: string): Record<string, unknown> | un
 }
 
 /** A finite `>= 0` number off `obj[key]`, else 0. Missing/negative/NaN/Infinity collapse to 0
- *  so a partial or attacker-shaped breakdown yields a bounded, non-negative count. This coercion is
- *  deliberately lenient so TOKEN TOTALS are always retained; the PRICING fail-closed lives
- *  separately in {@link breakdownPricingEvidenceComplete}, which distinguishes a coerced-because-
- *  MALFORMED bucket from a coerced-because-ABSENT one (PRD #1332 m3, CodeRabbit 4004800884). */
+ *  so a partial or attacker-shaped breakdown retains bounded, non-negative token placeholders.
+ *  Pricing fails closed separately in {@link breakdownPricingEvidenceComplete}; this coercion is
+ *  never evidence that a required pricing bucket was actually present. */
 function readNonNegNumber(obj: Record<string, unknown>, key: string): number {
   const v = obj[key];
   return typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : 0;
@@ -261,17 +259,15 @@ function readNonNegNumber(obj: Record<string, unknown>, key: string): number {
  *  never price and are intentionally excluded. */
 const PRICED_BUCKET_KEYS = ["inputTokens", "cachedInputTokens", "cacheWriteInputTokens", "outputTokens"] as const;
 
-/** Pricing-evidence completeness for ONE breakdown (PRD #1332 m3, CodeRabbit 4004800884): true
- *  unless a PRICED bucket is PRESENT-but-malformed (a key whose value is not a finite `>= 0`
- *  number — the exact case `readNonNegNumber` silently coerces to 0). A LEGITIMATELY ABSENT key is
- *  lenient (never marks incomplete), preserving the module's "present-but-partial is usable"
- *  contract; only a present-but-corrupt priced field is the fail-closed signal. */
+/** Pricing-evidence completeness for ONE breakdown (PRD #1332 m3, CodeRabbit 4004800884).
+ *  Every priced bucket is required by the pinned protocol and must be a finite non-negative number.
+ *  Missing and malformed values both fail cost closed; parseUsageBreakdown still retains their
+ *  zero-valued token placeholders independently. */
 function breakdownPricingEvidenceComplete(raw: Record<string, unknown> | undefined): boolean {
-  if (raw === undefined) return true;
+  if (raw === undefined) return false;
   for (const key of PRICED_BUCKET_KEYS) {
-    if (!(key in raw)) continue; // absent — lenient, not a corruption signal
     const v = raw[key];
-    if (!(typeof v === "number" && Number.isFinite(v) && v >= 0)) return false; // present but malformed
+    if (!(typeof v === "number" && Number.isFinite(v) && v >= 0)) return false;
   }
   return true;
 }

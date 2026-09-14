@@ -616,8 +616,9 @@ func resolveCostStatusMarker(raw json.RawMessage) string {
 // tolerating a non-numeric or non-finite value instead of rejecting the whole frame:
 //   - ABSENT  — nil/empty RawMessage, OR a JSON `null` literal → present=false (amount 0);
 //   - VALID   — a finite JSON number → (that value, true);
-//   - INVALID — a non-numeric token (string, bool, object) or a non-finite/out-of-range number
-//     → present=false.
+//   - INVALID — a non-numeric token (string, bool, object) or a non-finite JSON number
+//     → present=false. A finite value above the storage domain remains present here so Claude keeps
+//     its historical clamp; deriveUsageCost rejects it for Codex.
 //
 // deriveUsageCost then treats an absent or invalid amount under a Codex 'metered' marker as
 // 'unreported' (m5), so a metered row never carries a bogus or clamped dollar figure. Claude
@@ -656,8 +657,8 @@ func resolveCostUSD(raw json.RawMessage) (value float64, present bool) {
 //     'subscription' → cost_status='subscription', cost_usd=0 (that credential mode has no
 //     per-token charge, so zero is neutral, not a metered $0). 'metered' → cost_status='metered',
 //     cost_usd = the agent's price-table amount (emittedCostUSD) — but ONLY when that amount is
-//     genuinely present and usable (costPresent && finite && >= 0); an ABSENT or INVALID metered
-//     amount (costPresent=false, NaN, ±Inf, or < 0) resolves to cost_status='unreported',
+//     genuinely present and usable (costPresent, finite, >= 0, and within numeric(12,6)); an ABSENT
+//     or INVALID metered amount resolves to cost_status='unreported',
 //     cost_usd=0 (m5), because numericUSD would otherwise silently clamp the bogus value into a
 //     metered row that reads as a real dollar total. ANYTHING ELSE — missing, empty, unknown or
 //     inconsistent marker — → cost_status='unreported', cost_usd=0 ("a Codex row with a missing,
@@ -680,10 +681,9 @@ func deriveUsageCost(harness, marker string, emittedCostUSD float64, costPresent
 		return costStatusSubscription, numericUSD(0)
 	case costStatusMetered:
 		// A metered marker is honored only with a present, finite, non-negative amount; an
-		// absent or invalid amount cannot be a real metered dollar figure, so fail safe to
-		// 'unreported' rather than let numericUSD clamp it (NaN/-Inf/<0 → 0, +Inf → the ceiling)
-		// into a metered row (m5).
-		if !costPresent || math.IsNaN(emittedCostUSD) || math.IsInf(emittedCostUSD, 0) || emittedCostUSD < 0 {
+		// absent, invalid, or above-domain amount cannot be a real metered dollar figure, so
+		// fail safe to 'unreported' rather than let numericUSD clamp it into a metered row (m5).
+		if !costPresent || math.IsNaN(emittedCostUSD) || math.IsInf(emittedCostUSD, 0) || emittedCostUSD < 0 || emittedCostUSD > maxCostUSD {
 			return costStatusUnreported, numericUSD(0)
 		}
 		return costStatusMetered, numericUSD(emittedCostUSD)

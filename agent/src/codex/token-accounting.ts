@@ -187,8 +187,8 @@ interface ThreadAccount {
    *  RESUMED thread's FIRST note is the prior leg's replayed snapshot (its `last` is a prior
    *  response already counted), so it establishes the baseline WITHOUT being recorded here. */
   readonly responses: CodexUsageBreakdown[];
-  /** PRD #1332 m3 (CodeRabbit 4004800884): FALSE once any CONSUMED (adopted) note carried a
-   *  present-but-malformed pricing-required bucket (`transport.ts` pricingEvidenceComplete). It
+  /** PRD #1332 m3 (CodeRabbit 4004800884): FALSE once any CONSUMED (adopted) note carried an
+   *  absent or malformed pricing-required bucket (`transport.ts` pricingEvidenceComplete). It
    *  fails pricing closed for this thread's model in {@link aggregateByModel}'s api-key branch even
    *  when the coerced-to-0 buckets reconcile numerically — token totals are still retained; only
    *  cost/costStatus is gated. A stale/out-of-order note (not adopted) never taints it. */
@@ -196,13 +196,11 @@ interface ThreadAccount {
 }
 
 /**
- * Per-run Codex usage accountant. ONE instance is created per run (owned by the executor's
- * EpochSharedContext) and SHARED across every provider-epoch {@link CodexHarness} — the harness
- * is recreated at plan approval and each checkpoint reap, but the accountant is injected so it
- * survives that recreation. It persists across turns AND provider epochs and is NEVER reset,
- * because the root thread's cumulative spans turns/epochs and children from earlier turns must
- * stay aggregated. NOT thread-safe in the concurrency sense — the harness feeds it from its
- * single-consumer notification loop.
+ * Codex usage accountant for one executor claim leg. ONE instance is owned by that invocation's
+ * EpochSharedContext and shared across every provider-epoch {@link CodexHarness}. It survives plan
+ * approval and checkpoint recreation, but a later worker claim deliberately creates a new instance
+ * and an explicit init lineage so the resumed delta is additive in the server fold. NOT thread-safe
+ * in the concurrency sense: the harness feeds it from its single-consumer notification loop.
  */
 export class CodexUsageAccountant {
   private readonly threads = new Map<string, ThreadAccount>();

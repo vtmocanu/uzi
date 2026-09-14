@@ -629,9 +629,8 @@ function epochResponder(
 // 4004800880): a recreated epoch RESUMES the SAME thread id (thread/resume returns it) and, unlike
 // {@link epochResponder}, pushes NO thread/started on turn/start — the pinned `thread/resume` path
 // replays token usage but never a `thread/started` lineage row. Kept as a separate builder (not a
-// flag on epochResponder) so the existing multi-epoch tests that depend on epochResponder's
-// unconditional threadStarted stay untouched. It is what proves the run-lifetime accountant fix
-// holds even when the resumed epoch gets no new init/lineage row.
+// flag on epochResponder) so tests can model the pinned no-notification path independently from
+// defense-in-depth cases where a recreated provider unexpectedly reports thread/started.
 function resumedEpochResponder(
   threadId: string,
   turnId: string,
@@ -1275,15 +1274,15 @@ describe("CodexExecutor: an api_key run meters the root model end-to-end (execut
   });
 });
 
-describe("CodexExecutor: ONE run-lifetime accountant survives provider-epoch recreation (CodeRabbit 4004800880)", () => {
-  it("reports cumulative-since-run-start across a checkpoint recreation, not just the resumed epoch's own delta", async () => {
+describe("CodexExecutor: one claim-leg accountant survives provider-epoch recreation (CodeRabbit 4004800880)", () => {
+  it("reports cumulative-since-claim-start across a checkpoint recreation, not just the resumed epoch's own delta", async () => {
     // The seam under test is the shared EpochSharedContext.accountant threaded into every epoch's
     // CodexHarness. Epoch 0 (a FRESH th-1) charges a cumulative of 100; a cooperative checkpoint
     // reap recreates the provider epoch, which RESUMES th-1 (SAME thread id, and — per the pinned
     // resume protocol — NO thread/started). The resumed epoch first replays the prior cumulative
     // (total=100, whose `last` is the prior leg's final response) and then advances to total=150.
     //
-    // FIXED (ONE run-lifetime accountant): th-1's account persists with baseline 0 and maxTotal
+    // FIXED (one accountant for this executor claim leg): th-1 persists with baseline 0 and maxTotal
     // 100, so the replay note (magnitude 100) is a no-op stale note and the total=150 note charges
     // the FULL cumulative delta 150 - 0 = 150 at the FINAL terminal.
     //
@@ -1321,11 +1320,68 @@ describe("CodexExecutor: ONE run-lifetime accountant survives provider-epoch rec
     assert.equal(
       astra.inputTokens,
       150,
-      "the run-lifetime accountant reports the run cumulative-since-start (150), NOT the resumed epoch's own delta (50)",
+      "the claim-leg accountant reports the claim cumulative (150), NOT the resumed epoch's own delta (50)",
     );
     assert.equal(astra.costStatus, "subscription", "a subscription run's per-model entry is subscription");
   });
+
+  it("emits one init for the executor claim even if an internal resumed epoch reports thread/started", async () => {
+    const rig = makeMultiEpochRig([
+      epochResponder("th-1", "tn-1", (t, th, tn) => {
+        t.push(toolCall(1, "checkpoint", {}, th, tn, "c-ckpt"))
+          .push(turnCompleted("completed", th, tn));
+      }),
+      epochResponder("th-1", "tn-2", (t, th, tn) => {
+        t.push(toolCall(2, "signal_done", {}, th, tn, "c-done"))
+          .push(turnCompleted("completed", th, tn));
+      }),
+    ]);
+    const { ctx, emitted } = makeCtx({ checkpoint: async () => undefined });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "single-init internal recreation");
+
+    assert.equal(rig.providerLaunches(), 2, "the cooperative checkpoint recreated the provider epoch");
+    assert.equal(initMessageCount(emitted), 1, "one executor claim emits exactly one persisted init lineage marker");
+  });
+
+  it("emits a fresh init on a new resumed executor claim so its delta gets a new lineage", async () => {
+    const firstRig = makeMultiEpochRig([
+      epochResponder("th-1", "tn-1", (t, th, tn) => {
+        t.push(tokenUsageUpdated(th, tn, { inputTokens: 100, totalTokens: 100 }))
+          .push(toolCall(1, "signal_done", {}, th, tn, "c-done-1"))
+          .push(turnCompleted("completed", th, tn));
+      }),
+    ]);
+    const first = makeCtx();
+    await withTimeout(makeExecutor(firstRig, bindingOf(SUBSCRIPTION)).run(first.ctx), 5000, "first executor claim");
+
+    const resumedRig = makeMultiEpochRig([
+      resumedEpochResponder("th-1", "tn-2", (t, th, tn) => {
+        t.push(tokenUsageUpdated(th, tn, { inputTokens: 100, totalTokens: 100 }, { inputTokens: 100, totalTokens: 100 }))
+          .push(tokenUsageUpdated(th, tn, { inputTokens: 150, totalTokens: 150 }, { inputTokens: 50, totalTokens: 50 }))
+          .push(toolCall(2, "signal_done", {}, th, tn, "c-done-2"))
+          .push(turnCompleted("completed", th, tn));
+      }),
+    ]);
+    const resumed = makeCtx({ sessionId: "th-1" });
+    await withTimeout(makeExecutor(resumedRig, bindingOf(SUBSCRIPTION)).run(resumed.ctx), 5000, "resumed executor claim");
+
+    assert.equal(initMessageCount(first.emitted), 1, "the first executor claim emits one init");
+    assert.equal(initMessageCount(resumed.emitted), 1, "a new resumed executor claim emits its own init despite no thread/started replay");
+    const firstUsage = rec(lastResultModelUsage(first.emitted)?.["gpt-6-astra"]);
+    const resumedUsage = rec(lastResultModelUsage(resumed.emitted)?.["gpt-6-astra"]);
+    assert.equal(firstUsage.inputTokens, 100, "the first lineage carries its 100-token cumulative");
+    assert.equal(resumedUsage.inputTokens, 50, "the resumed lineage carries only its new 50-token delta");
+    assert.equal(
+      (firstUsage.inputTokens as number) + (resumedUsage.inputTokens as number),
+      150,
+      "SUM across the two init-delimited lineage rows preserves the full 150-token run total",
+    );
+  });
 });
+
+function initMessageCount(emitted: EmittedMessage[]): number {
+  return emitted.filter((m) => m.kind === "status" && rec(m.payload).event === "init").length;
+}
 
 /** The `modelUsage` map of the LAST result status/error message the reducer emitted, or
  *  undefined when none carried one (so a dropped/absent per-model fold is observable). */
