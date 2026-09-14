@@ -234,6 +234,18 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		// it here — in the same SetRunHealth write — exactly when it emits a nudge.
 		nudge := target != healthOK && r.Health == healthOK &&
 			(cooldown == 0 || !r.HealthNotifiedAt.Valid || now.Sub(r.HealthNotifiedAt.Time) >= cooldown)
+		// PRD #1349 M6 (D10): SUPPRESS the per-run Slack nudge for the custody-limit reason. The
+		// owner-level custody-episode reconciler (slacksvc) coalesces this crossing into ONE owner
+		// DM; a per-run nudge here would ALSO DM the owner once per queued run (the exact spam the
+		// episode alert exists to prevent). Only the redundant per-run Slack NUDGE is turned off —
+		// the STATE (target + reason) is still written and broadcast below, so the web/CLI custody
+		// pill is unchanged. Keyed off the reason (not the enum): the healthWaitingWorker enum
+		// carries many reasons and only reasonCustodyLimit defers to the episode reconciler. Because
+		// no nudge is emitted, health_notified_at is not stamped for this reason (notifiedAt stays
+		// NULL below), so the per-run cooldown is never burned by a deferred custody crossing.
+		if reason == reasonCustodyLimit {
+			nudge = false
+		}
 		notifiedAt := pgtype.Timestamptz{}
 		if nudge {
 			notifiedAt = pgconv.Time(now)

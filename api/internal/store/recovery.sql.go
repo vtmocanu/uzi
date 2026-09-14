@@ -730,6 +730,84 @@ func (q *Queries) ListCustodyHoldsForWorkerRun(ctx context.Context, arg ListCust
 	return items, nil
 }
 
+const listOwnersOverCustodyLimit = `-- name: ListOwnersOverCustodyLimit :many
+
+SELECT h.user_id
+FROM recovery_custody_holds h
+WHERE h.state = 'open'
+GROUP BY h.user_id
+HAVING count(*) >= $1::int
+`
+
+// ════════════════════════════════════════════════════════════════════════════════════════
+// PRD #1349 M6: the owner custody-episode reconciler's find-owners reads. The one-per-episode
+// owner Slack DM (slacksvc.CustodyEpisodeReconciler, D10) coalesces the blocked-custody crossing
+// by owner, so it needs (a) the owners currently AT/OVER the admission limit to notify and
+// (b) the already-notified owners who have dropped BELOW it, to re-arm (clear) their episode
+// notice for a later crossing. Both key off the SAME open-hold admission signal ClaimRun and
+// GetCustodyAggregateForOwner gate on. Added strictly ADDITIVELY (M1/M4/M5 queries UNTOUCHED).
+// ════════════════════════════════════════════════════════════════════════════════════════
+// PRD #1349 M6 (D10): the owners whose OPEN (unresolved) custody-hold count is AT/OVER the
+// admission limit — the crossing set the episode reconciler considers for a one-per-episode DM.
+// Grouped over the partial idx_recovery_custody_holds_owner_open index; HAVING count(*) >=
+// @custody_hold_limit is the SAME predicate ClaimRun's custody-admission clause blocks on, so a
+// notified owner is exactly one whose runs are (or can be) blocked. The reconciler then claims
+// at-most-once and reads GetCustodyAggregateForOwner for the exact DM facts, so this returns only
+// the user_id. The caller guards a non-positive @custody_hold_limit (the admission gate is then
+// disabled), so this is never called with one — a non-positive limit here would match every owner.
+func (q *Queries) ListOwnersOverCustodyLimit(ctx context.Context, custodyHoldLimit int32) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, listOwnersOverCustodyLimit, custodyHoldLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var user_id uuid.UUID
+		if err := rows.Scan(&user_id); err != nil {
+			return nil, err
+		}
+		items = append(items, user_id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listOwnersWithClearedCustodyEpisode = `-- name: ListOwnersWithClearedCustodyEpisode :many
+SELECT n.user_id
+FROM custody_episode_notices n
+WHERE (SELECT count(*) FROM recovery_custody_holds h
+       WHERE h.user_id = n.user_id AND h.state = 'open') < $1::int
+`
+
+// PRD #1349 M6 (D10): the already-notified owners whose OPEN custody-hold count has dropped
+// BELOW the admission limit — the episode has closed, so the reconciler clears their notice
+// (ClearCustodyEpisodeNotice) to re-arm a later re-crossing. A row in custody_episode_notices
+// means "already DM'd for this episode"; the correlated open-hold count mirrors the same
+// admission signal, so this returns exactly the owners whose episode should re-arm. Returns only
+// the user_id; the reconciler clears each.
+func (q *Queries) ListOwnersWithClearedCustodyEpisode(ctx context.Context, custodyHoldLimit int32) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, listOwnersWithClearedCustodyEpisode, custodyHoldLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var user_id uuid.UUID
+		if err := rows.Scan(&user_id); err != nil {
+			return nil, err
+		}
+		items = append(items, user_id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listReleasableCustodyHolds = `-- name: ListReleasableCustodyHolds :many
 SELECT h.id, h.user_id, h.repo_id, h.run_id, h.generation, h.state, h.original_worker_id, h.original_worker_identity, h.live_worker_id, h.live_run_id, h.created_at, h.updated_at, h.released_at FROM recovery_custody_holds h
 WHERE h.state = 'open'
