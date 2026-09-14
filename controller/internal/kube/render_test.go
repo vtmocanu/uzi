@@ -294,8 +294,8 @@ func TestRenderedResourcesComeFromThePreset(t *testing.T) {
 	if c.Resources.Requests.Cpu().String() != "1" || c.Resources.Limits.Cpu().String() != "4" {
 		t.Errorf("cpu = %s/%s, want 1/4", c.Resources.Requests.Cpu(), c.Resources.Limits.Cpu())
 	}
-	if c.Resources.Requests.Memory().String() != "4Gi" || c.Resources.Limits.Memory().String() != "12Gi" {
-		t.Errorf("memory = %s/%s, want 4Gi/12Gi", c.Resources.Requests.Memory(), c.Resources.Limits.Memory())
+	if c.Resources.Requests.Memory().String() != "8Gi" || c.Resources.Limits.Memory().String() != "12Gi" {
+		t.Errorf("memory = %s/%s, want 8Gi/12Gi", c.Resources.Requests.Memory(), c.Resources.Limits.Memory())
 	}
 }
 
@@ -637,7 +637,7 @@ func TestDinDDataDefaultFitsTheChartsLimitRangeMax(t *testing.T) {
 func chartDockerMaxPVCStorage(t *testing.T) resource.Quantity {
 	t.Helper()
 	path := filepath.Join("..", "..", "..", "deploy", "chart", "values.yaml")
-	raw, err := os.ReadFile(path)
+	raw, err := os.ReadFile(path) //nolint:gosec // G304: reads a test-controlled fixture/chart path (not user input)
 	if err != nil {
 		t.Fatalf("read %s: %v (the PVC ceiling is read from the chart; it must not fall back to a hardcoded constant)", path, err)
 	}
@@ -681,7 +681,7 @@ func chartDeploymentQuotas(t *testing.T) (docker, plain int) {
 	t.Helper()
 	// controller/internal/kube -> repo root.
 	path := filepath.Join("..", "..", "..", "deploy", "chart", "values.yaml")
-	raw, err := os.ReadFile(path)
+	raw, err := os.ReadFile(path) //nolint:gosec // G304: reads a test-controlled fixture/chart path (not user input)
 	if err != nil {
 		t.Fatalf("read %s: %v (the fleet-fit assertion is made against the chart's own quotas; it must not fall back to a hardcoded fleet size)", path, err)
 	}
@@ -1615,7 +1615,7 @@ func runSeed(t *testing.T, src, dst, markerFile, dataDir string) (string, error)
 	// host where /bin/sh is dash (Linux CI runners) the script aborts with "Illegal
 	// option -o pipefail"; it only ran before where /bin/sh happened to be bash
 	// (macOS). bash is the portable pipefail-capable shell present on every host we run.
-	cmd := exec.Command("/bin/bash", "-c", nixSeedScript(src, dst, markerFile, dataDir))
+	cmd := exec.Command("/bin/bash", "-c", nixSeedScript(src, dst, markerFile, dataDir)) //nolint:gosec // G204: runs a test-constructed nix-seed script; all inputs are test-controlled, not user input
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }
@@ -1625,7 +1625,7 @@ func runSeed(t *testing.T, src, dst, markerFile, dataDir string) (string, error)
 func markerFileWith(t *testing.T, value string) string {
 	t.Helper()
 	p := filepath.Join(t.TempDir(), "uzi-toolchain-profile")
-	if err := os.WriteFile(p, []byte(value), 0o644); err != nil {
+	if err := os.WriteFile(p, []byte(value), 0o644); err != nil { //nolint:gosec // G306: throwaway test fixture written under t.TempDir(); perms are not a production concern
 		t.Fatal(err)
 	}
 	return p
@@ -1634,7 +1634,7 @@ func markerFileWith(t *testing.T, value string) string {
 // recordedMarker reads the toolchain identity the seed recorded in the PVC.
 func recordedMarker(t *testing.T, dst string) string {
 	t.Helper()
-	b, err := os.ReadFile(filepath.Join(dst, nixToolchainMarker))
+	b, err := os.ReadFile(filepath.Join(dst, nixToolchainMarker)) //nolint:gosec // G304: reads a test-controlled fixture/chart path (not user input)
 	if err != nil {
 		return ""
 	}
@@ -1644,10 +1644,10 @@ func recordedMarker(t *testing.T, dst string) string {
 func seedSource(t *testing.T) string {
 	t.Helper()
 	src := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(src, "store", "abc-pkg"), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(src, "store", "abc-pkg"), 0o755); err != nil { //nolint:gosec // G301: throwaway test fixture directory under t.TempDir(); perms are not a production concern
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(src, "store", "abc-pkg", "bin"), []byte("payload"), 0o555); err != nil {
+	if err := os.WriteFile(filepath.Join(src, "store", "abc-pkg", "bin"), []byte("payload"), 0o555); err != nil { //nolint:gosec // G306: throwaway test fixture written under t.TempDir(); perms are not a production concern
 		t.Fatal(err)
 	}
 	return src
@@ -1703,10 +1703,10 @@ func TestSeedScriptStillSeedsAVolumeThatCameWithLostAndFound(t *testing.T) {
 // marker — that is the store the running image expects, so it is never overwritten.
 func TestSeedScriptSkipsWhenTheRecordedMarkerMatches(t *testing.T) {
 	dst := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dst, nixSentinel), nil, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dst, nixSentinel), nil, 0o644); err != nil { //nolint:gosec // G306: throwaway test fixture written under t.TempDir(); perms are not a production concern
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dst, nixToolchainMarker), []byte("store-hash-A"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dst, nixToolchainMarker), []byte("store-hash-A"), 0o644); err != nil { //nolint:gosec // G306: throwaway test fixture written under t.TempDir(); perms are not a production concern
 		t.Fatal(err)
 	}
 	out, err := runSeed(t, seedSource(t), dst, markerFileWith(t, "store-hash-A"), "")
@@ -1726,14 +1726,14 @@ func TestSeedScriptSkipsWhenTheRecordedMarkerMatches(t *testing.T) {
 // recorded marker is advanced to the new value so the next boot skips.
 func TestSeedScriptReseedsWhenTheMarkerMismatches(t *testing.T) {
 	dst := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dst, nixSentinel), nil, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dst, nixSentinel), nil, 0o644); err != nil { //nolint:gosec // G306: throwaway test fixture written under t.TempDir(); perms are not a production concern
 		t.Fatal(err)
 	}
 	// A stale store path from the OLD image, plus the OLD recorded marker.
-	if err := os.MkdirAll(filepath.Join(dst, "store", "stale-pkg"), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(dst, "store", "stale-pkg"), 0o755); err != nil { //nolint:gosec // G301: throwaway test fixture directory under t.TempDir(); perms are not a production concern
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dst, nixToolchainMarker), []byte("store-hash-OLD"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dst, nixToolchainMarker), []byte("store-hash-OLD"), 0o644); err != nil { //nolint:gosec // G306: throwaway test fixture written under t.TempDir(); perms are not a production concern
 		t.Fatal(err)
 	}
 	out, err := runSeed(t, seedSource(t), dst, markerFileWith(t, "store-hash-NEW"), "")
@@ -1756,10 +1756,10 @@ func TestSeedScriptReseedsWhenTheMarkerMismatches(t *testing.T) {
 // "absent marker = skip" reading would leave it stranded with a dead PATH forever.
 func TestSeedScriptReseedsALegacySentinelWithoutAMarker(t *testing.T) {
 	dst := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dst, nixSentinel), nil, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dst, nixSentinel), nil, 0o644); err != nil { //nolint:gosec // G306: throwaway test fixture written under t.TempDir(); perms are not a production concern
 		t.Fatal(err)
 	}
-	if err := os.MkdirAll(filepath.Join(dst, "store", "stale-pkg"), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(dst, "store", "stale-pkg"), 0o755); err != nil { //nolint:gosec // G301: throwaway test fixture directory under t.TempDir(); perms are not a production concern
 		t.Fatal(err)
 	}
 	out, err := runSeed(t, seedSource(t), dst, markerFileWith(t, "store-hash-NEW"), "")
@@ -1789,7 +1789,7 @@ func TestSeedScriptClearsDanglingDataStateOnReseedOnly(t *testing.T) {
 	}
 	seedDangling := func(dataDir string) {
 		for _, d := range danglers {
-			if err := os.MkdirAll(filepath.Join(dataDir, d, "child"), 0o755); err != nil {
+			if err := os.MkdirAll(filepath.Join(dataDir, d, "child"), 0o755); err != nil { //nolint:gosec // G301: throwaway test fixture directory under t.TempDir(); perms are not a production concern
 				t.Fatal(err)
 			}
 		}
@@ -1799,12 +1799,12 @@ func TestSeedScriptClearsDanglingDataStateOnReseedOnly(t *testing.T) {
 	t.Run("reseed clears", func(t *testing.T) {
 		dst := t.TempDir()
 		dataDir := t.TempDir()
-		if err := os.WriteFile(filepath.Join(dst, nixSentinel), nil, 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(dst, nixSentinel), nil, 0o644); err != nil { //nolint:gosec // G306: throwaway test fixture written under t.TempDir(); perms are not a production concern
 			t.Fatal(err)
 		}
 		seedDangling(dataDir)
 		// A sibling under agent-home that is NOT provisioning state must SURVIVE.
-		if err := os.MkdirAll(filepath.Join(dataDir, "agent-home", "some-run-id"), 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Join(dataDir, "agent-home", "some-run-id"), 0o755); err != nil { //nolint:gosec // G301: throwaway test fixture directory under t.TempDir(); perms are not a production concern
 			t.Fatal(err)
 		}
 		out, err := runSeed(t, seedSource(t), dst, markerFileWith(t, "store-hash-NEW"), dataDir)
@@ -1825,10 +1825,10 @@ func TestSeedScriptClearsDanglingDataStateOnReseedOnly(t *testing.T) {
 	t.Run("skip leaves data untouched", func(t *testing.T) {
 		dst := t.TempDir()
 		dataDir := t.TempDir()
-		if err := os.WriteFile(filepath.Join(dst, nixSentinel), nil, 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(dst, nixSentinel), nil, 0o644); err != nil { //nolint:gosec // G306: throwaway test fixture written under t.TempDir(); perms are not a production concern
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(filepath.Join(dst, nixToolchainMarker), []byte("store-hash-A"), 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(dst, nixToolchainMarker), []byte("store-hash-A"), 0o644); err != nil { //nolint:gosec // G306: throwaway test fixture written under t.TempDir(); perms are not a production concern
 			t.Fatal(err)
 		}
 		seedDangling(dataDir)
@@ -1856,16 +1856,16 @@ func TestSeedScriptReRunsInFullOverAnInterruptedCopysReadOnlyDirs(t *testing.T) 
 	dst := t.TempDir()
 	// A previous attempt that got as far as sealing a store path read-only.
 	sealed := filepath.Join(dst, "store", "abc-pkg")
-	if err := os.MkdirAll(sealed, 0o755); err != nil {
+	if err := os.MkdirAll(sealed, 0o755); err != nil { //nolint:gosec // G301: throwaway test fixture directory under t.TempDir(); perms are not a production concern
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(sealed, "bin"), []byte("stale"), 0o444); err != nil {
+	if err := os.WriteFile(filepath.Join(sealed, "bin"), []byte("stale"), 0o444); err != nil { //nolint:gosec // G306: throwaway test fixture written under t.TempDir(); perms are not a production concern
 		t.Fatal(err)
 	}
-	if err := os.Chmod(sealed, 0o555); err != nil {
+	if err := os.Chmod(sealed, 0o555); err != nil { //nolint:gosec // G302: test deliberately sets this mode to exercise seal/copy behavior on a throwaway t.TempDir fixture
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(sealed, 0o755) }) // so t.TempDir can clean up
+	t.Cleanup(func() { _ = os.Chmod(sealed, 0o755) }) //nolint:gosec // G302: test cleanup restores perms so t.TempDir can remove the fixture
 
 	out, err := runSeed(t, seedSource(t), dst, markerFileWith(t, "store-hash-A"), "")
 	if err != nil {
@@ -1876,7 +1876,7 @@ func TestSeedScriptReRunsInFullOverAnInterruptedCopysReadOnlyDirs(t *testing.T) 
 	}
 	// The stale content must be REPLACED, not merged around: a half-written store
 	// path is corrupt, and the store is content-addressed.
-	got, err := os.ReadFile(filepath.Join(dst, "store", "abc-pkg", "bin"))
+	got, err := os.ReadFile(filepath.Join(dst, "store", "abc-pkg", "bin")) //nolint:gosec // G304: reads a test-controlled fixture/chart path (not user input)
 	if err != nil {
 		t.Fatal(err)
 	}

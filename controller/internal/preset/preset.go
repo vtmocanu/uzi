@@ -41,12 +41,20 @@ import (
 // Agent SDK run peaks at 676 MiB while compose grants 4 GiB. Guaranteed would also
 // strand 4Gi per IDLE worker (measured idle: 148 MiB) on a shared cluster.
 //
-// The requests were sized ABOVE the measured peak so hosted workers would not be the
-// first thing evicted under node pressure (kubelet evicts pods whose usage exceeds
-// their REQUESTS first). That invariant NO LONGER HOLDS for multi-agent runs: measured
-// per-run peaks are now well above these requests (web-ux median ~4.5 GiB, non-web-ux
-// median ~2.7 GiB vs the l request of 4Gi), so l workers routinely exceed their request.
-// Recalibration is tracked in issue #131.
+// The requests are sized ABOVE each size's measured per-run peak so hosted workers are
+// not the first thing evicted under node pressure (kubelet evicts pods whose usage
+// exceeds their REQUESTS first). That invariant had lapsed for multi-agent runs and is
+// now RESTORED by issue #1341, which recalibrated the requests above each size's measured
+// peak. Measured on the hosted cluster: an `l` worker's writable set peaked at ~7451Mi
+// (≈7.1 GiB) against its old 4Gi request — the captured eviction — with a web-ux median
+// of ~4.5 GiB; a non-web-ux `m` run peaks ~2.7 GiB, above the old 2Gi request. So `l` now
+// requests 8Gi, `m` 4Gi, and `s` 2Gi, each above its size's realistic peak, while every
+// size stays Burstable.
+//
+// Owner decision (settled 2026-09-14) keeps all three Burstable. Guaranteed
+// (request==limit) was considered and dropped: it would strand a full memory limit per
+// IDLE worker (~150Mi idle), and a Guaranteed `l` at 12Gi cannot fit beside the system
+// pods on a ~13.58Gi node.
 type Size struct {
 	CPURequest    resource.Quantity
 	CPULimit      resource.Quantity
@@ -94,8 +102,9 @@ func IsUnknown(err error) bool {
 // sizes is the preset table (USER DECISION, 2026-07-17; measured basis in PRD #58's
 // M6 bullet — a real SDK run peaks at 676 MiB, idle 148 MiB, and compose grants
 // 2 CPU / 4 GiB for 1 run slot + 1 chat session). That 676 MiB is the SINGLE-AGENT
-// era; multi-agent runs (parallel subagent waves, web-ux browser) now peak far higher
-// (see issue #131 for measured figures and the pending L recalibration).
+// era; multi-agent runs (parallel subagent waves, web-ux browser) peak far higher (see
+// issue #1341 for the measured figures), and the requests below were recalibrated in
+// issue #1341 above those measured multi-agent peaks.
 //
 // `m` is compose parity at the limit and is the default. The default cap is 1
 // (WORKER_MAX_CONCURRENT_RUNS), so a size still buys headroom for ONE run. That cap
@@ -110,21 +119,21 @@ var sizes = map[string]Size{
 	"s": {
 		CPURequest:    resource.MustParse("250m"),
 		CPULimit:      resource.MustParse("1"),
-		MemoryRequest: resource.MustParse("1Gi"),
-		MemoryLimit:   resource.MustParse("2Gi"),
+		MemoryRequest: resource.MustParse("2Gi"),
+		MemoryLimit:   resource.MustParse("4Gi"),
 		DataSize:      resource.MustParse("5Gi"),
 	},
 	"m": {
 		CPURequest:    resource.MustParse("500m"),
 		CPULimit:      resource.MustParse("2"),
-		MemoryRequest: resource.MustParse("2Gi"),
-		MemoryLimit:   resource.MustParse("4Gi"),
+		MemoryRequest: resource.MustParse("4Gi"),
+		MemoryLimit:   resource.MustParse("8Gi"),
 		DataSize:      resource.MustParse("10Gi"),
 	},
 	"l": {
 		CPURequest:    resource.MustParse("1"),
 		CPULimit:      resource.MustParse("4"),
-		MemoryRequest: resource.MustParse("4Gi"),
+		MemoryRequest: resource.MustParse("8Gi"),
 		MemoryLimit:   resource.MustParse("12Gi"),
 		DataSize:      resource.MustParse("20Gi"),
 	},
