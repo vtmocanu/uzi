@@ -69,7 +69,7 @@ jobs:
       # go-run form COMPILES sqlc from source every run (~57-61s measured): all api
       # jobs share one setup-go cache key (api/go.sum), so only one job's GOCACHE
       # persists and it is never the one that compiled sqlc -> perpetual recompile.
-      # A downloaded release binary skips the compile. Same VERSION (1.30.0) => byte-
+      # A downloaded release binary skips the compile. Same VERSION (1.31.1) => byte-
       # identical codegen, so the drift check is unchanged; the version pin is the
       # arg; the sha256 is the whole control on this fetch, and Renovate keeps it in
       # lockstep with the version via the github-release-attachments datasource (the
