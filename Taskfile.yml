@@ -123,10 +123,8 @@
 # `go run …golangci-lint@v2.12.2`, which COMPILED that tool from source on a cold
 # cache - 51.6s, the pipeline's cold long pole. So there is still a FETCH but no
 # compile (~1-2s to download+verify, not 51.6s), and it still writes nothing to
-# either go.mod - the pin-and-no-go.mod-write property validate:api's
-# `sqlc@v1.30.0` also has (sqlc is STILL a `go run`). "Installs nothing" remains
-# false as stated: it fetches a binary. Everything else still holds:
-# no `npm ci`, no `go mod download`.
+# either go.mod. "Installs nothing" remains false as stated: it fetches a binary.
+# Everything else still holds: no `npm ci`, no `go mod download`.
 # CI does that in .github/workflows/ci.yml's setup steps (`npm ci`); locally your `node_modules`
 # is expected to exist. `cd agent && npm ci` in particular has a documented
 # host-wide side effect (it rewrites `/opt/homebrew/bin/agent-browser`), so this
@@ -1204,8 +1202,8 @@ tasks:
       # and skips the compile; warm runs were ~1s either way, so this is a
       # cold-start win. Read scripts/golangci-lint.sh before editing this line.
       #   - The version is still an ARGUMENT (`v2.12.2`), so the header's echo
-      #     property is preserved — a pin going missing is still VISIBLE here. Same
-      #     shape as the sqlc@v1.30.0 pin in validate:api and deadcode-gate.sh's.
+      #     property is preserved — a pin going missing is still VISIBLE here. This
+      #     matches deadcode-gate.sh's visible version-argument shape.
       #   - IDENTICAL findings local and in CI (PRD #103 SC-1): both acquire the
       #     SAME pinned artifact. PROVEN BY DIFF, not asserted — the unfiltered
       #     backlog of the release binary matched `go run`'s byte-for-byte on BOTH
@@ -1393,9 +1391,9 @@ tasks:
       # spends one deliberate exception on it (the ratchet lives in
       # `.golangci.yml`, invisible here). One is enough.
       #
-      # PINNED `go run`, same version-pin shape as `sqlc@v1.30.0` in validate:api
-      # and the `golangci-lint.sh v2.12.2` binary pin above (that one is a
-      # downloaded release binary since PRD #230 M5, not a `go run`, but shares the
+      # PINNED `go run`, with the same visible version-argument property as the
+      # `golangci-lint.sh v2.12.2` binary pin above (that one is a downloaded
+      # release binary since PRD #230 M5, not a `go run`, but shares the
       # identical-version-local-and-CI and writes-nothing-to-go.mod properties):
       # identical version local and in CI, and it writes nothing to api/go.mod.
       # v0.48.0 is the current release; v0.38.0 was

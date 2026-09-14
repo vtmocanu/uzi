@@ -466,10 +466,13 @@ export class GitCache {
    *  boundary: `runner/` is runner-writable, `repos/` stays worker-only. */
   private readonly runnerRoot: string;
   /** issue #1315 — worker-only 0700 holding subtree for atomically-released clones.
-   *  A SIBLING of runnerRoot under the SAME dataDir (so a rename cannot hit EXDEV),
-   *  but OUTSIDE the runner-writable `runner/<repo>` tree: a retired clone lands here
-   *  where the untrusted runner uid cannot reach it. Terminal trash is disposed from
-   *  here; a foreign quarantine is retained here for forensics. */
+   *  A SIBLING of runnerRoot under the SAME dataDir PATH, but OUTSIDE the runner-writable
+   *  `runner/<repo>` tree: a retired clone lands here where the untrusted runner uid
+   *  cannot reach it. NOTE (issue #1354): sharing the dataDir path does NOT imply the same
+   *  device — on a docker-lane (dind) worker `runner/` is a separate emptyDir while this
+   *  quarantine sits on the `/data` PVC, so a rename from runnerRoot into here CAN hit
+   *  EXDEV; retireRunnerClone carries an intra-device fallback for exactly that. Terminal
+   *  trash is disposed from here; a foreign quarantine is retained here for forensics. */
   private readonly runnerHoldingRoot: string;
   /** PRD #1296 M3 — the durable durable-recovery journal + verified-bundle store, a
    *  DISTINCT /data subtree from `repos/` (worker bare) and `runner/` (torn-down clones),
@@ -1754,7 +1757,7 @@ export class GitCache {
     ownerRunId: string,
     opts: { discard: boolean },
   ): Promise<void> {
-    const holding = await this.withLock(barePath, async () => {
+    const result = await this.withLock(barePath, async (): Promise<{ holding?: string; scratch?: string }> => {
       // 1. Pre-rename pair validation. Require the EXACT (ownerRunId, clonePath) pair
       //    to STILL be journaled before moving anything. A missing/malformed journal, or
       //    a lock-gap rewrite to a different runId/path, moves NOTHING and fails closed.
@@ -1772,35 +1775,100 @@ export class GitCache {
         throw new CapturePathMismatchError(clonePath, this.runnerRoot, branch, ownerRunId);
       }
       // 3. Worker-only 0700 holding destination: a SIBLING of runnerRoot under the same
-      //    dataDir (same filesystem — no EXDEV), NOT under the runner-writable tree.
-      //    Sanitized, generated components. Create-or-assert the parent 0700 BEFORE the
-      //    rename, so a rename ENOENT below unambiguously means the SOURCE is missing.
+      //    dataDir PATH — but NOT necessarily the same device: on a docker-lane worker
+      //    runnerRoot is an emptyDir and this quarantine is on the /data PVC, so the step-4
+      //    rename CAN hit EXDEV (issue #1354); the EXDEV branch below is that fallback. NOT
+      //    under the runner-writable tree. Sanitized, generated components. Create-or-assert
+      //    the parent 0700 BEFORE the rename, so a rename ENOENT below unambiguously means
+      //    the SOURCE is missing.
       const holdingDest = path.join(
         this.runnerHoldingRoot,
         `${ownerRunId.replace(/[^A-Za-z0-9_-]/g, "_")}-${randomUUID()}`,
       );
       await fs.mkdir(path.dirname(holdingDest), { recursive: true, mode: 0o700 });
-      // 4. Atomic move + ENOENT disambiguation.
+      // 4. Atomic move + ENOENT disambiguation, with an EXDEV fallback (issue #1354).
       let renamed = true;
+      let holding: string | undefined;
+      let scratch: string | undefined;
+      let exdev = false;
       try {
         await fs.rename(clonePath, holdingDest);
       } catch (err) {
         const e = err as NodeJS.ErrnoException;
-        if (e.code !== "ENOENT") throw err;
-        // The destination parent was asserted in step 3, so a rename ENOENT is about the
-        // SOURCE. Confirm: if the source is gone, the canonical is already free — proceed
-        // to clear the journal. If the source STILL exists, the ENOENT is a real,
-        // unexpected failure (e.g. a destination parent that vanished under us) and must
-        // surface with the journal left intact.
-        const sourceGone = await fs.lstat(clonePath).then(
-          () => false,
-          (le: NodeJS.ErrnoException) => {
-            if (le.code === "ENOENT") return true;
-            throw le;
-          },
-        );
-        if (!sourceGone) throw err;
-        renamed = false;
+        if (e.code === "EXDEV") {
+          // issue #1354 — runnerRoot and the quarantine share a dataDir PATH but are on
+          // DIFFERENT devices on a docker-lane worker (emptyDir vs PVC), so the rename to
+          // holdingDest is a cross-device move that cannot happen. Free the canonical with
+          // an intra-device atomic rename into a scratch parent under runnerRoot (SAME
+          // device — never EXDEV, and it survives a daemon file-hold where a recursive rm
+          // races). The #1315 invariant is preserved: the journaled canonical is freed ONLY
+          // by an atomic rename, never a direct recursive rm of partial residue.
+          exdev = true;
+          if (opts.discard) {
+            // Hot path (G1 rename-first): the owner's own terminal trash. Free the
+            // canonical and copy NOTHING — an fs.cp here would throw on a git fsmonitor
+            // socket / FIFO the clone may carry. No holdingDest is used on this path.
+            const scratchParent = await this.createRetireScratchParent();
+            renamed = await this.renameCanonicalOrConfirmFree(clonePath, path.join(scratchParent, "clone"));
+            scratch = scratchParent;
+          } else {
+            // Rare foreign-orphan reclaim: the quarantine is RETAINED FOREVER, so
+            // cross-crash retention is a hard requirement → copy-before-free. COMPLETE the
+            // symlink-safe copy into holdingDest FIRST, while the canonical AND the journal
+            // still protect a retry.
+            try {
+              await fs.cp(clonePath, holdingDest, {
+                recursive: true,
+                dereference: false,
+                verbatimSymlinks: true,
+                // dereference:false + verbatimSymlinks:true copy symlinks AS links. The
+                // filter skips sockets/FIFOs: fs.cp throws ERR_FS_CP_SOCKET /
+                // ERR_FS_CP_FIFO_PIPE on them, and the git fsmonitor daemon plants a UNIX
+                // socket in .git/.
+                filter: async (src) => {
+                  const s = await fs.lstat(src);
+                  return !s.isSocket() && !s.isFIFO();
+                },
+              });
+            } catch (copyErr) {
+              // Remove ONLY the incomplete copy; the canonical + journal stay intact so a
+              // retry can re-copy. No scratch parent exists yet (created below), so this
+              // cleanup is scoped strictly to the copy.
+              await fs.rm(holdingDest, { recursive: true, force: true }).catch(() => undefined);
+              throw copyErr;
+            }
+            // The completed off-tree copy is recorded. NOW free the canonical with the
+            // intra-device atomic rename. A REAL rename failure here must RETAIN the
+            // completed holdingDest AND leave the canonical + journal intact — so this
+            // rename is deliberately OUTSIDE the copy's cleanup catch above.
+            const scratchParent = await this.createRetireScratchParent();
+            renamed = await this.renameCanonicalOrConfirmFree(clonePath, path.join(scratchParent, "clone"));
+            holding = holdingDest; // retained; step 6 no-ops since discard === false
+            scratch = scratchParent;
+          }
+        } else if (e.code === "ENOENT") {
+          // The destination parent was asserted in step 3, so a rename ENOENT is about the
+          // SOURCE. Confirm: if the source is gone, the canonical is already free — proceed
+          // to clear the journal. If the source STILL exists, the ENOENT is a real,
+          // unexpected failure (e.g. a destination parent that vanished under us) and must
+          // surface with the journal left intact.
+          const sourceGone = await fs.lstat(clonePath).then(
+            () => false,
+            (le: NodeJS.ErrnoException) => {
+              if (le.code === "ENOENT") return true;
+              throw le;
+            },
+          );
+          if (!sourceGone) throw err;
+          renamed = false;
+        } else {
+          throw err;
+        }
+      }
+      if (!exdev) {
+        // Non-EXDEV path (rename success OR a confirmed source-already-free): unchanged
+        // behavior — holdingDest is the retired residue iff we renamed it, no scratch.
+        holding = renamed ? holdingDest : undefined;
       }
       // 5. Journal clear — ONLY after a confirmed rename or a confirmed source-already-
       //    free. Re-read and clear only if it STILL matches (ownerRunId, clonePath); a
@@ -1809,10 +1877,14 @@ export class GitCache {
       if (still?.runId === ownerRunId && still.clonePath === clonePath) {
         await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
       }
-      return renamed ? holdingDest : undefined;
+      return { holding, scratch };
     });
     // 6. Disposal, OUTSIDE the lock. Terminal trash (discard) — best-effort delete the
     //    holding dir. Foreign quarantine (!discard) — RETAIN it forever (never delete).
+    //    Always best-effort delete the intra-device scratch parent (issue #1354): by here
+    //    the canonical is already free and the journal already cleared, so a partial
+    //    scratch rm is harmless residue.
+    const { holding, scratch } = result;
     if (holding && opts.discard) {
       await fs.rm(holding, { recursive: true, force: true }).catch((e) =>
         this.log.warn("retireRunnerClone: holding dispose failed", {
@@ -1820,6 +1892,49 @@ export class GitCache {
           error: gitErrorMessage(e),
         }),
       );
+    }
+    if (scratch) {
+      await fs.rm(scratch, { recursive: true, force: true }).catch(() => undefined);
+    }
+  }
+
+  /** issue #1354 — create an intra-device scratch parent directly under runnerRoot (the
+   *  SAME device as the canonical clone, so a rename into it is never EXDEV and survives a
+   *  daemon file-hold where a recursive rm races). The mkdir is NON-recursive, so it throws
+   *  EEXIST if a runner pre-planted the path — fail closed, rather than using a recursive
+   *  0700 mkdir under the runner-writable tree as an ownership assertion; the lstat then
+   *  rejects a symlink or other type surprise. Returns the created scratch parent path. */
+  private async createRetireScratchParent(): Promise<string> {
+    const scratchParent = path.join(this.runnerRoot, `.retire-${randomUUID()}`);
+    await fs.mkdir(scratchParent, { mode: 0o700 }); // non-recursive ⇒ throws on EEXIST — fail closed
+    const st = await fs.lstat(scratchParent);
+    if (!st.isDirectory()) throw new Error("retire scratch parent is not a directory");
+    return scratchParent;
+  }
+
+  /** issue #1354 — atomically rename the canonical clone to `dest`, applying the same
+   *  ENOENT disambiguation as the step-4 holding rename: the destination's parent is
+   *  created immediately before the call, so a rename ENOENT is about the SOURCE — an lstat
+   *  that finds it gone means the canonical is already free (returns false), while a source
+   *  that is still present makes the ENOENT a real, unexpected failure that must surface.
+   *  Any non-ENOENT error is rethrown. Returns true when the rename actually moved the
+   *  canonical. */
+  private async renameCanonicalOrConfirmFree(clonePath: string, dest: string): Promise<boolean> {
+    try {
+      await fs.rename(clonePath, dest);
+      return true;
+    } catch (err) {
+      const e = err as NodeJS.ErrnoException;
+      if (e.code !== "ENOENT") throw err;
+      const sourceGone = await fs.lstat(clonePath).then(
+        () => false,
+        (le: NodeJS.ErrnoException) => {
+          if (le.code === "ENOENT") return true;
+          throw le;
+        },
+      );
+      if (!sourceGone) throw err;
+      return false;
     }
   }
 

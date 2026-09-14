@@ -72,13 +72,19 @@ exit 0
 STUB
 chmod +x "$KSTUB"
 
-# make_uzi_stub: write a fake `uzi` that answers `run get --json` for the test run.
+# make_uzi_stub: write a fake `uzi` that answers `run get --json`. A run id containing
+# "mrr" reports a mr_rework run EXACTLY as the real API does IN-FLIGHT: branch is null
+# and the live branch is in pipeline_ref (agent/issue-9999), so the slug must come from
+# pipeline_ref (-> agent-issue-9999); anything else is the issue-4242 run.
 make_uzi_stub() {
   cat > "$WORK/uzi" <<STUB
 #!/usr/bin/env bash
 set -u
 if [ "\${1:-}" = run ] && [ "\${2:-}" = get ]; then
-  printf '%s' '{"status":"running","issue_iid":4242,"kind":"issue","worker_id":"${WID:-w0rker}","mr_web_url":null,"health_reason":"ok","anthropic_secret_label":"tok","anthropic_bind_mode":"default","milestones":[],"milestones_completed":[]}'
+  case "\${3:-}" in
+    *mrr*) printf '%s' '{"status":"running","issue_iid":null,"kind":"mr_rework","branch":null,"pipeline_ref":"agent/issue-9999","worker_id":"${WID:-w0rker}","mr_iid":7777,"mr_web_url":null,"health_reason":"ok","anthropic_secret_label":"tok","anthropic_bind_mode":"default","milestones":[],"milestones_completed":[]}' ;;
+    *)     printf '%s' '{"status":"running","issue_iid":4242,"kind":"issue","branch":null,"pipeline_ref":null,"worker_id":"${WID:-w0rker}","mr_web_url":null,"health_reason":"ok","anthropic_secret_label":"tok","anthropic_bind_mode":"default","milestones":[],"milestones_completed":[]}' ;;
+  esac
   exit 0
 fi
 # run logs / anything else: quiet success
@@ -87,15 +93,15 @@ STUB
   chmod +x "$WORK/uzi"
 }
 
-# run_backup <tag>: run the real script once into a fresh dir; echo its `latest`.
+# run_backup <tag> [runid]: run the real script once into a fresh dir; echo its `latest`.
 # UZI_RUNNER_BASE is set on the HOST invocation (not the stub): the script must
 # forward it into the remote capture, which is the production behavior under test.
 run_backup() {
-  local dest="$WORK/out.$1"
+  local dest="$WORK/out.$1"; local rid="${2:-run-4242}"
   rm -rf "$dest"
   UZI_CTX=test-ctx UZI_WORKER_NS=ns UZI_REPO_SLUG=testrepo UZI_RUNNER_BASE="$WORK/runner" \
     UZI_BACKUP_DIR="$dest" UZI_KUBECTL="$KSTUB" UZI_BIN="$WORK/uzi" \
-    bash "$SCRIPT" run-4242 >/dev/null 2>&1
+    bash "$SCRIPT" "$rid" >/dev/null 2>&1
   echo "$dest/latest"
 }
 
@@ -138,5 +144,25 @@ if git -C "$FORGE" bundle verify "$BUN/issue-4242.bundle" 2>&1 | grep -q 'comple
   fail "case2: bundle records complete history (base was not excluded)"
 fi
 echo "PASS case2: one commit -> base-excluded bundle, OK"
+
+# --- case 3: mr_rework REUSES the branch clone (agent/issue-9999 -> agent-issue-9999) --
+# The run has no issue_iid and (in-flight) a NULL branch; its slug must come from
+# pipeline_ref, not `mr_rework-<runid>`. Both the old kind-only derivation AND a naive
+# .branch read look for a dir that never exists (branch is null until completion).
+RUNNER3="$WORK/runner/agent-issue-9999"
+git clone -q "$FORGE" "$RUNNER3"
+git -C "$RUNNER3" config user.email t@example.com
+git -C "$RUNNER3" config user.name tester
+git_q "$RUNNER3" checkout -b agent/issue-9999
+echo rework >> "$RUNNER3/f.txt"
+git_q "$RUNNER3" commit -am 'mr_rework commit'
+
+L3="$(run_backup 3 mrr-1)"
+[ -f "$L3/agent-issue-9999.tgz" ] \
+  || fail "case3: expected agent-issue-9999.tgz (slug from branch); dir has: $(ls "$L3" 2>/dev/null | tr '\n' ' ')"
+tar tzf "$L3/agent-issue-9999.tgz" 2>/dev/null | grep -q 'agent-issue-9999[.]bundle' \
+  || fail "case3: mr_rework bundle missing (clone dir not resolved from branch)"
+grep -q "^.*OK .*mrr-1" "$L3/backup.log" || fail "case3: expected OK for mr_rework; got: $(cat "$L3/backup.log")"
+echo "PASS case3: mr_rework -> slug from branch (agent-issue-9999), bundle, OK"
 
 echo "ALL PASS"
