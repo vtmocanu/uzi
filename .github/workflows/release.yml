@@ -617,3 +617,46 @@ jobs:
           else
             gh release create "$TAG" "${flags[@]}" --verify-tag
           fi
+      - name: Prune superseded RC Release entries
+        # After a stable vX.Y.Z publishes, delete the GitHub Release ENTRIES for that
+        # base's release candidates (vX.Y.Z-rc.N). Once the RC notes are folded into the
+        # stable ## [X.Y.Z] section the per-RC entries are redundant, and a multi-RC train
+        # would otherwise leave one pre-release badge per candidate on the public Releases
+        # page. Only the Release ENTRY is removed (no --cleanup-tag): the immutable git tag
+        # and the RC's GHCR images + chart + cosign signatures are untouched, so nothing
+        # pinned to a candidate breaks -- ArgoCD tracks the GHCR OCI tag, not the Release
+        # entry, and the changelog is already folded into CHANGELOG.md. Deleting a Release
+        # entry needs only this job's existing contents:write token; it is NOT the
+        # admin-scoped, tag-protected operation that deleting the tag would be.
+        #
+        # STABLE TAGS ONLY: the `if` skips prerelease tags, so an abandoned candidate train
+        # (release-cut --skip-promote, which never ships that base as stable) keeps its RC
+        # Releases as genuine history. This also decouples the prune from --promote: it is a
+        # pure function of the published stable tag, matching that base's own RCs and no
+        # others (never a broad *-rc.* sweep -- a wrong-Release delete is the failure mode).
+        # NON-FATAL: images and chart are already pushed by the time this last job runs, so
+        # a delete hiccup warns and leaves the entry for a tag re-run to retry, never
+        # reddening a release that already shipped. See #1340.
+        if: ${{ !contains(github.ref_name, '-') }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # Match this base's candidates by exact literal prefix + integer suffix, not a
+          # regex, so a metacharacter in the version can never widen the scope.
+          prefix="${TAG}-rc."   # stable tag only here, e.g. v0.83.0 -> v0.83.0-rc.
+          deleted=0
+          while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            rest="${tag#"$prefix"}"                        # strip the literal base prefix
+            [ "$rest" != "$tag" ] || continue             # tag is not this base's -rc.*
+            case "$rest" in ''|*[!0-9]*) continue ;; esac  # remainder must be exactly rc.N
+            echo "Deleting superseded RC Release entry $tag (git tag + GHCR artifacts kept)"
+            if gh release delete "$tag" --yes; then
+              deleted=$((deleted + 1))
+            else
+              echo "WARN: could not delete Release $tag -- left in place; re-run the tag to retry."
+            fi
+          done < <(gh release list --limit 1000 --json tagName --jq '.[].tagName' || true)
+          echo "Pruned $deleted superseded RC Release entries for $TAG."
