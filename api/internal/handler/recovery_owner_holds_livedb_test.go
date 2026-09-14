@@ -50,6 +50,26 @@ func custodySeedRunHold(t *testing.T, pool *pgxpool.Pool, owner, conn, worker uu
 	return run, hold
 }
 
+// custodySeedHoldOnRun opens a SECOND custody hold on an EXISTING run at a different generation,
+// modelling a cross-worker re-claim: a generation-2 hold opens while the crashed worker's
+// generation-1 hold stays open (the sibling-generation case ReconcileCustodyReleases and the M4
+// discard must treat per-hold, not per-run). Reuses the run's repo_id so the two holds sit on the
+// SAME run — the discriminator a different-run sibling cannot exercise.
+func custodySeedHoldOnRun(t *testing.T, pool *pgxpool.Pool, owner, run, worker uuid.UUID, gen int64) uuid.UUID {
+	t.Helper()
+	var repo uuid.UUID
+	if err := pool.QueryRow(context.Background(), `SELECT repo_id FROM runs WHERE id = $1`, run).Scan(&repo); err != nil {
+		t.Fatalf("look up repo_id for run %s: %v", run, err)
+	}
+	hold := uuid.New()
+	cliMustExec(t, pool,
+		`INSERT INTO recovery_custody_holds
+		   (id, user_id, repo_id, run_id, generation, state, original_worker_id, original_worker_identity, live_worker_id, live_run_id)
+		 VALUES ($1, $2, $3, $4, $5, 'open', $6, $7, $6, $4)`,
+		hold, owner, repo, run, gen, worker, "cw-ident")
+	return hold
+}
+
 // custodySeedCapture inserts a capture in the given state under hold, with n byte chunks. An
 // 'available' capture is manifest-bound with a byte size/checksum (so the sibling-safety test
 // can assert it SURVIVES a hold discard); any other state is left unbound.
@@ -247,9 +267,12 @@ func TestRecoveryOwnerHoldDiscardSiblingSafetyLiveDB(t *testing.T) {
 	runA, holdA := custodySeedRunHold(t, pool, owner, conn, worker, 4203, "failed", 1)
 	capAvail := custodySeedCapture(t, pool, owner, runA, worker, holdA, "kA-avail", "available", 2)
 	capPrep := custodySeedCapture(t, pool, owner, runA, worker, holdA, "kA-prep", "preparing", 1)
-	// holdB (gen 2, a different run): its own preparing capture — the sibling.
-	runB, holdB := custodySeedRunHold(t, pool, owner, conn, worker, 4204, "failed", 1)
-	capB := custodySeedCapture(t, pool, owner, runB, worker, holdB, "kB", "preparing", 1)
+	// holdB (gen 2, the SAME run as holdA): a cross-worker re-claim opened a generation-2 hold
+	// while holdA's generation-1 hold stayed open — its own preparing capture is the SIBLING the
+	// discard must not touch. A different-run hold would only prove run-isolation, not that the
+	// discard is generation-exact WITHIN a run.
+	holdB := custodySeedHoldOnRun(t, pool, owner, runA, worker, 2)
+	capB := custodySeedCapture(t, pool, owner, runA, worker, holdB, "kB", "preparing", 1)
 
 	del := fmt.Sprintf("/api/runs/%s/recovery-holds/%s?confirm=discard", runA, holdA)
 	if rec := bearerReq(router, http.MethodDelete, del, uzc); rec.Code != http.StatusOK {

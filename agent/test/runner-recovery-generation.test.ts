@@ -567,6 +567,81 @@ describe("RunRunner — usage-limit opt-out routes through the coordinator (PRD 
   });
 });
 
+// PRD #1349 M2 (F4 regression) — the OPT-OUT is not the only non-parked limit outcome.
+// handleLimitReached returns parked=false on THREE paths: the wait_on_limit=false opt-out (above),
+// a park report that THREW, and a server ACK whose status is not `limit_wait` (the server declined
+// the park and failed the run instead — RUN_LIMIT_MAX_WAITS exhausted, retry_not_before past
+// RUN_LIMIT_MAX_PARK). The last two carry wait_on_limit=true, so a `} else if (!claim.wait_on_limit)`
+// guard skipped them: their committed-since-checkpoint work was torn down with the clone and NO
+// disposition ran. The fix routes ALL non-parked limit outcomes through the same exact-generation
+// disposition. This block drives the server-declined path (ack != limit_wait via overrideStateStatus)
+// with wait_on_limit=TRUE and asserts the disposition fires — it reserves nothing on the unfixed
+// opt-out-only guard.
+describe("RunRunner — a server-declined park still routes through the coordinator (PRD #1349 M2, F4 regression)", () => {
+  function limitFactory(homeRoot: string, commit: boolean): ExecutorFactory {
+    return (runId) => {
+      const runHome = path.join(homeRoot, runId);
+      return {
+        homeDir: runHome,
+        executor: {
+          run: async (ctx: RunContext): Promise<ExecutorResult> => {
+            fs.mkdirSync(runHome, { recursive: true });
+            if (commit) commitInTree(ctx.worktreePath, "WORK.txt", "committed before the limit\n");
+            throw new LimitReachedError({ resetsAtMs: Date.now() + 5 * 3600_000, rateLimitType: "five_hour" });
+          },
+        },
+      };
+    };
+  }
+
+  it("wait_on_limit=true but the server DECLINED the park: committed work CAPTURES before teardown", async () => {
+    const { gitlab } = fakeGitlab();
+    const { coord, client, git, root } = injectedCoordinator();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-m2-declined-commit-"));
+    try {
+      git.alreadyPublished = false; // committed-since-checkpoint work is unpublished
+      const claim = gitlabClaim(4701, { claim_generation: 17, wait_on_limit: true });
+      // 200 + "failed": the park request is acknowledged with a status that is NOT limit_wait, so
+      // handleLimitReached returns parked=false while wait_on_limit stays true — the exact path the
+      // opt-out-only guard dropped.
+      api.overrideStateStatus(claim.run_id, "failed");
+      await runnerWith(limitFactory(homeRoot, true), gitlab, undefined, nullLogger(), {
+        recovery: coord,
+      }).execute(claim);
+      assert.equal(client.releaseCalls.length, 0, "committed work is NEVER released");
+      assert.equal(
+        client.reserveCalls.length,
+        1,
+        "a declined park with committed work is CAPTURED, not silently dropped (0 on the opt-out-only guard)",
+      );
+      assert.equal(client.reserveCalls[0]!.generation, 17, "the capture binds the exact generation");
+      assert.equal(client.uploadCalls.length, 1, "the generation-bound bundle is uploaded");
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("DISCRIMINATING: wait_on_limit=true declined park with NO work RELEASES the exact generation", async () => {
+    const { gitlab } = fakeGitlab();
+    const { coord, client, git, root } = injectedCoordinator();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-m2-declined-empty-"));
+    try {
+      git.alreadyPublished = true; // provably empty → H already on the forge
+      const claim = gitlabClaim(4702, { claim_generation: 18, wait_on_limit: true });
+      api.overrideStateStatus(claim.run_id, "failed");
+      await runnerWith(limitFactory(homeRoot, false), gitlab, undefined, nullLogger(), {
+        recovery: coord,
+      }).execute(claim);
+      assert.deepEqual(client.releasedGenerations(), [18], "a provably-empty declined park releases its exact hold");
+      assert.equal(client.uploadCalls.length, 0, "nothing to archive on an empty declined park");
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
 // PRD #1349 M2 (F2) — a credentialed settleRecoveryGeneration does a PAT-bearing fresh-forge
 // fetch. On a CODEX run the provider root is disposed only in executeClaim's finally (killAgentTree
 // is a no-op), so a bare settle in the generic-failure catch would race a still-alive Codex provider

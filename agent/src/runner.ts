@@ -878,18 +878,21 @@ export class RunRunner {
           // committed history is promoted into the generation-bound archive, and a failed
           // comparison or upload retains. Best-effort; runs after the park report landed.
           await this.settleRecoveryGeneration(claim, flight, runLog);
-        } else if (!claim.wait_on_limit) {
-          // PRD #1349 M2 (F4): the usage-limit OPT-OUT (wait_on_limit=false). handleLimitReached
-          // reported `failed` and returned parked=false, so the park durability block above is
-          // skipped AND the error never reaches the generic catch's disposition — the exact
-          // "early-terminal path bypasses the coordinator" M2 set out to eliminate. Without this a
-          // code-publishing run that hit a limit with opt-out tears down its clone with NO
-          // disposition: committed-since-checkpoint work is dropped and the early pin becomes an
-          // unreproducible needs_action. Route it through the SAME exact-generation disposition the
-          // limit-park uses, reap-first (Codex-aware, F2): committed work CAPTURES into the
-          // generation-bound archive, a provably-empty opt-out RELEASES its exact hold, and a
-          // failed/unverifiable comparison RETAINS — never a silent drop. Best-effort; runs after
-          // the `failed` report landed.
+        } else {
+          // PRD #1349 M2 (F4): EVERY non-parked limit outcome, not just the opt-out.
+          // handleLimitReached returns parked=false on THREE distinct paths: the usage-limit
+          // OPT-OUT (wait_on_limit=false, reported `failed`), a park report that THREW, and a
+          // server ACK whose status is not `limit_wait`. The last two carry wait_on_limit=true,
+          // so a `} else if (!claim.wait_on_limit)` guard skipped them — and with the park
+          // durability block above also skipped and the error never reaching the generic catch's
+          // disposition, a code-publishing run whose park failed to land tore down its clone with
+          // NO disposition: committed-since-checkpoint work dropped, the early pin left an
+          // unreproducible needs_action. That is the exact "early-terminal path bypasses the
+          // coordinator" M2 set out to eliminate, so it must NOT be gated on the opt-out flag.
+          // Route ALL of them through the SAME exact-generation disposition the limit-park uses,
+          // reap-first (Codex-aware, F2): committed work CAPTURES into the generation-bound
+          // archive, a provably-empty outcome RELEASES its exact hold, and a failed/unverifiable
+          // comparison RETAINS — never a silent drop. Best-effort; runs after the report landed.
           await this.reapThenSettleRecoveryGeneration(claim, flight, runLog, "terminal");
         }
       } else if (err instanceof TransientRecoveryError) {
