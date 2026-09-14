@@ -4513,3 +4513,41 @@ FOR UPDATE;
 -- the caller requires exactly 1 row affected before writing `completed`.
 UPDATE run_completion_permits SET consumed_at = now()
 WHERE id = @id AND issued_by_worker_id = @issued_by_worker_id AND consumed_at IS NULL;
+
+-- name: GetRunByIDForUpdate :one
+-- PRD #1227 M1: the owner-decision transaction's row lock. DecideCompletion opens a pgx
+-- transaction and SELECTs the run FOR UPDATE through this so a partial/accept decision
+-- serializes against a racing decision (or a completeRunWithPermit consume) on the same run —
+-- the FOR UPDATE row lock is the mutex, exactly as GetRunOwnedByWorkerForUpdate is for the
+-- completion transaction. DecideCompletion is OWNER-SCOPED: it re-checks ownership against the
+-- LOCKED row (locked.user_id == caller) after the lock, so a foreign caller — including an
+-- admin_ro Bearer, which keeps IsAdmin — is hidden as ErrRunNotFound (never a write), preserving
+-- the read-only ceiling. An absent run returns pgx.ErrNoRows (-> ErrRunNotFound).
+SELECT * FROM runs WHERE id = @id FOR UPDATE;
+
+-- name: BumpContractRevision :one
+-- PRD #1227 M1: create contract revision N+1 for an owner decision (partial/accept). It writes
+-- the NEW revision and the revised jsonb contract ATOMICALLY, guarded so it fires ONLY for an
+-- interlocked, frozen run at the EXPECTED revision — the optimistic fence that makes a decision
+-- idempotent/conflict-safe under the FOR UPDATE lock: contract_revision = @expected_revision is
+-- the compare-and-set, so a concurrent bump that already moved the revision matches 0 rows
+-- (pgx.ErrNoRows -> ErrCompletionRevisionConflict). completion_contract_version IS NOT NULL keeps
+-- a legacy run out; completion_contract IS NOT NULL keeps a split-state (never-frozen) run out.
+UPDATE runs SET
+    contract_revision = @new_revision,
+    completion_contract = @completion_contract::jsonb,
+    updated_at = now()
+WHERE id = @run_id
+  AND completion_contract_version IS NOT NULL
+  AND completion_contract IS NOT NULL
+  AND contract_revision = @expected_revision
+RETURNING contract_revision;
+
+-- name: InvalidatePriorCompletionPermits :execrows
+-- PRD #1227 M1: after a decision bumps the contract revision to @new_revision, every UNCONSUMED
+-- permit issued against an OLDER revision is stale — a completion report could otherwise consume
+-- one and complete against a scope the owner just changed. Stamp consumed_at on each so the
+-- completion transaction's GetUnconsumedCompletionPermit lookup (consumed_at IS NULL) can never
+-- match it; the worker must re-request a permit at the new revision. Returns the count invalidated.
+UPDATE run_completion_permits SET consumed_at = now()
+WHERE run_id = @run_id AND consumed_at IS NULL AND contract_revision < @new_revision;

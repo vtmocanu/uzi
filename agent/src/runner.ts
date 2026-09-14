@@ -2316,6 +2316,13 @@ export class RunRunner {
     // a held, unverified-head MR can never carry a closing line (AC: only a verified full delivery
     // contains `Closes #N`).
     const renderCloses = !interlocked;
+    // PRD #1227 M2: an OWNER PARTIAL run (the frozen contract's owner decisions deferred ≥1 milestone)
+    // is a scope_reduced partial delivery that must NEVER close its issue — not even after PR-head
+    // verification. It is threaded to reconcileMrDescription(!isOwnerPartial) below so the verified-head
+    // reconcile re-renders the NON-closing partial body instead of adding Closes; mrDescription's own
+    // effectiveCloses guard is the belt-and-suspenders. Absent/empty ⇒ false ⇒ the accept-closing and
+    // full-delivery paths add Closes after verify exactly as before.
+    const isOwnerPartial = (claim.config?.completion_scope?.deferred?.length ?? 0) > 0;
     // H, the exact landed head. Set ONLY on the interlocked granted path; it rides the completed
     // report (`head: completionHead`) and is compared against the created PR's head. Undefined for a
     // legacy run, so JSON.stringify drops it and the legacy completed report is byte-for-byte the same
@@ -2437,7 +2444,7 @@ export class RunRunner {
           pat: claim.secrets.forge_pat,
           sourceBranch: result.branch,
           targetBranch,
-          title: mrTitle(claim, result.scopeCapped),
+          title: mrTitle(claim, result.scopeCapped, claim.config?.completion_scope),
           description: mrDescription(
             claim,
             result.branch,
@@ -2448,6 +2455,7 @@ export class RunRunner {
             result.gatesDiscoveryTruncated,
             result.scopeCapped,
             renderCloses,
+            claim.config?.completion_scope,
           ),
         }, boundarySignal),
       { log: runLog, signal: boundarySignal },
@@ -2491,6 +2499,7 @@ export class RunRunner {
           result.gatesDiscoveryTruncated,
           result.scopeCapped,
           withCloses,
+          claim.config?.completion_scope,
         );
         const desc = banner ? `${banner}\n\n${base}` : base;
         await withForgeRetry(
@@ -2559,8 +2568,12 @@ export class RunRunner {
       // ADOPTED MR whose body a prior hold rewrote to the unverified variant). The completion contract
       // requires the merged MR to carry Closes, so if this write FAILS we hold rather than report
       // completion.
-      if (!(await reconcileMrDescription(true))) {
-        await holdOrFailInterlocked("could not assert Closes on the verified head");
+      // PRD #1227 M2: an OWNER PARTIAL (scope_reduced) run must NEVER close its issue even on a verified
+      // head, so it re-renders its NON-closing partial body here (reconcileMrDescription(false)) instead
+      // of adding Closes; the head is still verified (permit binding) — only the Closes-add is
+      // suppressed. An accept-only/full-delivery run has isOwnerPartial=false and adds Closes as before.
+      if (!(await reconcileMrDescription(!isOwnerPartial))) {
+        await holdOrFailInterlocked("could not assert the verified-head completion body");
         return;
       }
       // BIND the Closes add to the verified head (CodeRabbit !1254): re-read the PR head AFTER writing
@@ -5667,14 +5680,22 @@ function completionHoldWindowMs(
   return typeof secs === "number" && secs > 0 ? secs * 1000 : fallbackMs;
 }
 
-/** MR title from the issue snapshot (never empty). */
-function mrTitle(
+/** MR title from the issue snapshot (never empty). Exported for the direct rendering
+ *  unit tests (agent/test/runner-mr-completion-scope.test.ts). */
+export function mrTitle(
   claim: ClaimResponse,
   scopeCapped?: { completedCount: number; total?: number },
+  // PRD #1227 M2: the run's owner completion decisions. A non-empty `deferred` makes this an
+  // owner PARTIAL (scope_reduced) — the MR does NOT complete the issue and gets the `[partial]`
+  // prefix. An accept-ONLY run (deferred empty, accepted non-empty) closes the issue and gets NO
+  // prefix. Absent/empty ⇒ no owner decision, so the title is byte-identical to today.
+  completionScope?: ClaimConfig["completion_scope"],
 ): string {
-  // PRD #634 M3: a partial delivery from an operator scope directive is prefixed so the
-  // reviewer sees at a glance the MR does not complete the issue.
-  const prefix = scopeCapped ? "[partial] " : "";
+  const deferred = completionScope?.deferred ?? [];
+  const isOwnerPartial = deferred.length > 0;
+  // PRD #634 M3 / PRD #1227 M2: a partial delivery — from an operator scope directive OR an owner
+  // scope reduction — is prefixed so the reviewer sees at a glance the MR does not complete the issue.
+  const prefix = isOwnerPartial || scopeCapped ? "[partial] " : "";
   const t = claim.issue_title?.trim();
   if (t) return prefix + t;
   // PRD #983 M4b: the per-kind empty-title fallbacks (ci_fix's pipeline line, prompt/
@@ -5692,7 +5713,7 @@ function mrTitle(
  *  run used the repo's own agents (PRD #37 Decision 3b) — a marker so the human
  *  reviewer knows the internal review loop was performed by repo-authored agents,
  *  not by uzi's built-in reviewer. */
-function mrDescription(
+export function mrDescription(
   claim: ClaimResponse,
   branch: string,
   agentSelection?: { source: AgentSource; agents: string[] },
@@ -5707,6 +5728,13 @@ function mrDescription(
   // "no `Closes` on an unverified head" invariant structural — the function cannot emit a closing body
   // on its own. Defaults true so the sole issue-arm caller keeps today's behavior.
   renderCloses = true,
+  // PRD #1227 M2/M3: the run's owner completion decisions. `deferred` (non-empty ⇒ owner PARTIAL,
+  // scope_reduced) drives a partial-delivery body that lists each deferred milestone + reason and
+  // NEVER closes the issue — it takes precedence over the #634 scopeCapped count body. `accepted`
+  // (non-empty) appends a warning block naming each owner-accepted unmet criterion (id + text +
+  // reason), present in ANY branch — including on a closing accept-only PR. Absent/empty ⇒ no partial,
+  // no accept, so the body is byte-identical to today.
+  completionScope?: ClaimConfig["completion_scope"],
 ): string {
   const footer = `Opened automatically by the uzi agent from branch \`${branch}\`. Please review and merge manually — the agent never merges.`;
   const repoMarker =
@@ -5734,27 +5762,65 @@ function mrDescription(
     promptGuardSection,
   });
   if (kindBody !== undefined) return kindBody;
-  // PRD #634 M3: a partial delivery from an operator scope directive does NOT close the
-  // issue — it delivered only the approved slice of milestones — so the closing line is
-  // replaced with a partial-delivery statement and a scope-note blockquote is inserted.
-  const body = scopeCapped
+  // PRD #1227 M2/M3: the owner completion decisions. `deferred` non-empty ⇒ owner PARTIAL
+  // (scope_reduced): the issue is NOT fully delivered. `accepted` non-empty ⇒ owner-waived unmet
+  // criteria to name in a warning block. Both absent/empty on a normal run.
+  const deferred = completionScope?.deferred ?? [];
+  const accepted = completionScope?.accepted ?? [];
+  const isOwnerPartial = deferred.length > 0;
+  const hasAccepted = accepted.length > 0;
+  // An owner partial NEVER closes the issue, regardless of the caller's renderCloses — this makes
+  // "a partial never closes" structural in the renderer too, not only in the create-then-verify flow.
+  const effectiveCloses = renderCloses && !isOwnerPartial;
+  // Body selection, in precedence order:
+  //   1. PRD #1227 owner partial (deferred) — partial-delivery body listing each deferred milestone +
+  //      reason; NO Closes. Takes precedence over the #634 scopeCapped count body.
+  //   2. PRD #634 operator scope (scopeCapped) — the existing count-only partial body, UNCHANGED.
+  //   3. normal — `Implements issue #N` with the Closes pair gated on effectiveCloses.
+  const body = isOwnerPartial
     ? [
-        `Implements part of #${claim.issue_iid} (partial delivery — see the scope note below; this MR does NOT close the issue).`,
+        `Implements part of #${claim.issue_iid} (partial delivery — owner scope decision; this MR does NOT close the issue).`,
         "",
-        "> ⚠️ **Partial delivery — operator scope directive.** The operator narrowed this run's",
-        `> scope mid-flight. ${scopeCapped.completedCount}${typeof scopeCapped.total === "number" ? ` of ${scopeCapped.total}` : ""} approved milestone(s) were completed and`,
-        "> are included here; any remaining milestones were deferred to a follow-up run. Review this",
-        "> as a partial implementation — it does not complete the issue.",
+        "> ⚠️ **Partial delivery — owner scope decision (PRD #1227).** The owner reduced this run's",
+        "> completion scope. The milestone(s) below were DEFERRED BY THE OWNER and are NOT delivered by",
+        "> this merge request, so it does not close the issue:",
+        ...deferred.map(
+          (d) => `> - \`${d.milestone_id}\` — ${d.title}: ${d.reason}`,
+        ),
         ...repoMarker,
       ]
-    : [
-        `Implements issue #${claim.issue_iid}.`,
-        // PRD #1226 M4 (D5): the closing line is CONDITIONAL. When renderCloses is true (a legacy run
-        // at creation, or an interlocked run's verified-head reconcile — PRD #1225) this spreads to
-        // exactly the prior `"", "Closes #N"` pair, so the legacy body is byte-for-byte unchanged.
-        ...(renderCloses ? ["", `Closes #${claim.issue_iid}`] : []),
-        ...repoMarker,
-      ];
+    : scopeCapped
+      ? // PRD #634 M3: a partial delivery from an operator scope directive does NOT close the
+        // issue — it delivered only the approved slice of milestones — so the closing line is
+        // replaced with a partial-delivery statement and a scope-note blockquote is inserted.
+        [
+          `Implements part of #${claim.issue_iid} (partial delivery — see the scope note below; this MR does NOT close the issue).`,
+          "",
+          "> ⚠️ **Partial delivery — operator scope directive.** The operator narrowed this run's",
+          `> scope mid-flight. ${scopeCapped.completedCount}${typeof scopeCapped.total === "number" ? ` of ${scopeCapped.total}` : ""} approved milestone(s) were completed and`,
+          "> are included here; any remaining milestones were deferred to a follow-up run. Review this",
+          "> as a partial implementation — it does not complete the issue.",
+          ...repoMarker,
+        ]
+      : [
+          `Implements issue #${claim.issue_iid}.`,
+          // PRD #1226 M4 (D5): the closing line is CONDITIONAL. When effectiveCloses is true (a legacy
+          // run at creation, or an interlocked run's verified-head reconcile — PRD #1225) this spreads
+          // to exactly the prior `"", "Closes #N"` pair, so the legacy body is byte-for-byte unchanged.
+          ...(effectiveCloses ? ["", `Closes #${claim.issue_iid}`] : []),
+          ...repoMarker,
+        ];
+  // PRD #1227 M3 (D3): WHENEVER the owner accepted unmet criteria, append a warning block naming each
+  // by id + criterion text + owner reason. Present in ANY branch above — including on a closing
+  // accept-only PR, so a closing PR carries the reason the unmet criteria were waived.
+  if (hasAccepted) {
+    body.push(
+      "",
+      "> ⚠️ **Accepted unmet criteria — owner decision (PRD #1227).** The owner accepted the following",
+      "> unmet criteria as-is with the reason given; they are NOT met by this merge request:",
+      ...accepted.map((a) => `> - \`${a.id}\` — ${a.text}: ${a.reason}`),
+    );
+  }
   const gatesSection = gatesUnverifiedMrSection(gatesUnverified, gatesDiscoveryTruncated);
   if (gatesSection) body.push("", gatesSection);
   body.push("", "---", footer);

@@ -22,6 +22,13 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Changed
+
+- **Promoting a stable release now prunes that version's superseded RC Release entries, so the Releases page keeps one entry per version ([#1340](https://github.com/vtmocanu/uzi/issues/1340)).**
+  Publishing a stable `vX.Y.Z` deletes the GitHub Release entries for that base's release candidates (`vX.Y.Z-rc.N`) as its last publish step, so a multi-candidate train no longer leaves a pre-release badge per RC on the public Releases page. Only the redundant Release entry is removed: the immutable git tag and the RC's GHCR images, chart, and cosign signatures stay, so nothing pinned to a candidate breaks (ArgoCD tracks the GHCR OCI tag, not the Release entry). It runs on stable tags only, so an abandoned candidate train (`release-cut --skip-promote`) keeps its RC Releases as genuine history.
+- **Hosted worker memory presets raised so a busy worker pod is no longer the first thing evicted under node memory pressure ([#1341](https://github.com/vtmocanu/uzi/issues/1341)).**
+  Each hosted size's memory request and limit were recalibrated above its measured per-run peak (request/limit now s 2Gi/4Gi, m 4Gi/8Gi, l 8Gi/12Gi), restoring the requests-above-peak invariant, and the worker namespace ResourceQuota memory ceilings were raised in step so the new default-size fleet still admits, while every size stays Burstable. Hosted worker pods now also carry a default cluster-scoped PriorityClass (value 1000, globalDefault: false, operator-tunable), so under node memory pressure a busy worker outranks lower-priority pods and other pods are evicted before ours. Its preemptionPolicy is PreemptLowerPriority, so a worker that cannot be scheduled for lack of room also preempts lower-priority pods to get placed; an operator can set preemptionPolicy Never to keep the eviction survival without that scheduling-time preemption.
+
 ## [0.83.0] - 2026-09-13
 
 ### Added

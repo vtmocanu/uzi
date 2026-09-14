@@ -307,3 +307,52 @@ func TestForgejoListWorkflowRunsUnsupported(t *testing.T) {
 		t.Fatalf("a 404 on the Actions endpoint must wrap ErrForgeVersionUnsupported, got %v", err)
 	}
 }
+
+// TestForgejoGetWorkflowRun pins the single-run GET mapping (the `ci` drill-in
+// header): GetRepoActionRun hits /actions/runs/{id} and maps through the same
+// toForgejoWorkflowRun as the list, so the identity scalars carry through.
+func TestForgejoGetWorkflowRun(t *testing.T) {
+	m := newMockForgejo(t, map[string]http.HandlerFunc{
+		"/repos/acme/widgets/actions/runs/88": func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": 88, "display_title": "PRD continuation", "event": "push",
+				"head_branch": "main", "head_sha": "cafe", "path": ".forgejo/workflows/ci.yml",
+				"run_number": 88, "status": "running",
+				"html_url": "https://forgejo/acme/widgets/actions/runs/88",
+				"actor":    map[string]any{"login": "uzi-bot"},
+			})
+		},
+	})
+	d := newForgejoDriver(t, m, "forgejo-token-value-123456")
+
+	r, err := d.GetWorkflowRun(context.Background(), 7, 88)
+	if err != nil {
+		t.Fatalf("GetWorkflowRun: %v", err)
+	}
+	if r.ID != 88 || r.Number != 88 || r.Event != "push" || r.Branch != "main" || r.SHA != "cafe" {
+		t.Fatalf("run mapping wrong: %+v", r)
+	}
+	if r.Name != ".forgejo/workflows/ci.yml" || r.Title != "PRD continuation" || r.Actor != "uzi-bot" {
+		t.Fatalf("run name/title/actor mapping wrong: %+v", r)
+	}
+}
+
+// TestForgejoGetWorkflowRunUnsupported pins the honest degrade path for the single
+// GET: a 404 (Actions API absent on this server version) surfaces as
+// ErrForgeVersionUnsupported, exactly as the list does.
+func TestForgejoGetWorkflowRunUnsupported(t *testing.T) {
+	m := newMockForgejo(t, map[string]http.HandlerFunc{
+		"/repos/acme/widgets/actions/runs/88": func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, `{"message":"Not Found"}`, http.StatusNotFound)
+		},
+	})
+	d := newForgejoDriver(t, m, "forgejo-token-value-123456")
+
+	_, err := d.GetWorkflowRun(context.Background(), 7, 88)
+	if err == nil {
+		t.Fatal("expected an error for an absent Actions endpoint")
+	}
+	if !errors.Is(err, ErrForgeVersionUnsupported) {
+		t.Fatalf("a 404 on the Actions run endpoint must wrap ErrForgeVersionUnsupported, got %v", err)
+	}
+}

@@ -394,3 +394,56 @@ func toGitLabWorkflowRun(p *gitlab.PipelineInfo) WorkflowRun {
 	}
 	return wr
 }
+
+// toGitLabWorkflowRunFromPipeline maps the RICHER *gitlab.Pipeline (returned by the
+// single-pipeline GET, not the list's PipelineInfo) to the neutral WorkflowRun,
+// matching toGitLabWorkflowRun's semantics: Name is the pipeline's Name when set,
+// else its ref; Source is the event (a typed PipelineSource here, so string()); and
+// GitLab has no separate conclusion, so Status carries everything. Unlike the list
+// row, the full Pipeline carries a distinct StartedAt and a user, so StartedAt uses
+// p.StartedAt when set (falling back to CreatedAt, as the list mapper does) and Actor
+// is p.User.Username when the user is present (D5 enrichment the list row lacks).
+func toGitLabWorkflowRunFromPipeline(p *gitlab.Pipeline) WorkflowRun {
+	name := p.Name
+	if name == "" {
+		name = p.Ref
+	}
+	wr := WorkflowRun{
+		ID:     p.ID,
+		Name:   name,
+		Number: p.IID,
+		Event:  string(p.Source),
+		Branch: p.Ref,
+		SHA:    p.SHA,
+		Status: p.Status,
+		WebURL: p.WebURL,
+	}
+	if p.CreatedAt != nil {
+		wr.CreatedAt = *p.CreatedAt
+		wr.StartedAt = *p.CreatedAt
+	}
+	if p.StartedAt != nil {
+		wr.StartedAt = *p.StartedAt
+	}
+	if p.UpdatedAt != nil {
+		wr.UpdatedAt = *p.UpdatedAt
+	}
+	if p.User != nil {
+		wr.Actor = p.User.Username
+	}
+	return wr
+}
+
+// GetWorkflowRun returns one pipeline's header (the neutral WorkflowRun) by its
+// GitLab pipeline id, for the `ci` drill-in. The single GET returns the richer
+// *gitlab.Pipeline, so it maps through toGitLabWorkflowRunFromPipeline.
+func (g *gitLab) GetWorkflowRun(ctx context.Context, projectID, runID int64) (WorkflowRun, error) {
+	pipeline, _, err := g.client.Pipelines.GetPipeline(projectID, runID, gitlab.WithContext(ctx))
+	if err != nil {
+		return WorkflowRun{}, g.wrapErr("get workflow run", err)
+	}
+	if pipeline == nil {
+		return WorkflowRun{}, nil
+	}
+	return toGitLabWorkflowRunFromPipeline(pipeline), nil
+}

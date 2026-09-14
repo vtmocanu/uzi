@@ -249,15 +249,24 @@ func (c *HTTPClient) RunRework(ctx context.Context, runID, guidance string) (api
 	return env.Run, nil
 }
 
-// completionDecisionRequest is the POST /api/runs/{id}/completion/decision body (PRD #1226 M5,
-// D7): the owner's decision on a completion-blocked run. This client supports ONLY the
-// "continue" decision — the only value the endpoint accepts today (the server 400s any other) —
-// so Decision is set to the constant "continue" here rather than taken as a parameter. Guidance
-// rides verbatim like RunRework's, with NO omitempty: an empty guidance is a valid continue
-// (resume with no note), so the key is always sent as `"guidance":""` rather than dropped.
+// completionDecisionRequest is the POST /api/runs/{id}/completion/decision body (PRD #1226 M5, D7 +
+// #1227 M5): the owner's decision on a completion-blocked run. Decision is one of "continue"
+// (#1226), "partial" or "accept" (#1227), set per-method rather than taken as a parameter.
+//
+// Guidance rides verbatim like RunRework's, with NO omitempty: an empty guidance is a valid
+// continue (resume with no note), so the key is always sent as `"guidance":""` rather than dropped.
+// The #1227 fields are ALL omitempty so a CONTINUE body stays byte-identical to before this change
+// (only `decision`+`guidance` on the wire): Keep/Criteria are the partial/accept id sets, Reason is
+// the required owner note, and ContractRevision is the run's current contract revision the server
+// fences on. A partial/accept always sends a non-empty Reason and a >0 ContractRevision, so
+// omitempty never drops a field those decisions need.
 type completionDecisionRequest struct {
-	Decision string `json:"decision"`
-	Guidance string `json:"guidance"`
+	Decision         string   `json:"decision"`
+	Guidance         string   `json:"guidance"`
+	Keep             []string `json:"keep,omitempty"`
+	Criteria         []string `json:"criteria,omitempty"`
+	Reason           string   `json:"reason,omitempty"`
+	ContractRevision int      `json:"contract_revision,omitempty"`
 }
 
 // ContinueCompletionDecision records the owner's CONTINUE decision on a completion-blocked run
@@ -269,6 +278,45 @@ type completionDecisionRequest struct {
 // ExitUsage (2).
 func (c *HTTPClient) ContinueCompletionDecision(ctx context.Context, id string, guidance string) (apitypes.RunDTO, error) {
 	body := completionDecisionRequest{Decision: "continue", Guidance: guidance}
+	var env struct {
+		Run apitypes.RunDTO `json:"run"`
+	}
+	if err := c.postJSON(ctx, "/api/runs/"+url.PathEscape(id)+"/completion/decision", body, &env); err != nil {
+		return apitypes.RunDTO{}, err
+	}
+	return env.Run, nil
+}
+
+// PartialCompletionDecision records the owner's PARTIAL (scope-reduced) decision on a
+// completion-blocked run and resumes it to deliver the kept scope (PRD #1227 M5): POST
+// /api/runs/{id}/completion/decision {decision:"partial", keep, reason, contract_revision},
+// unwrapping the {run: RunDTO} envelope. keep is the milestone-id set to KEEP in scope (the rest
+// are deferred); reason is the required owner note; contractRevision is the run's CURRENT contract
+// revision, which the server fences (a stale revision is a 409). The exit-code mapping comes for
+// free through statusError/postJSON: a foreign/unknown run is 404 → ExitNotFound (4); a run that is
+// NOT completion-blocked or a stale revision is 409 → ExitConflict (5); a missing/oversized reason,
+// a non-positive revision or an unknown milestone id is 400 → ExitUsage (2).
+func (c *HTTPClient) PartialCompletionDecision(ctx context.Context, id string, keep []string, reason string, contractRevision int) (apitypes.RunDTO, error) {
+	body := completionDecisionRequest{Decision: "partial", Keep: keep, Reason: reason, ContractRevision: contractRevision}
+	var env struct {
+		Run apitypes.RunDTO `json:"run"`
+	}
+	if err := c.postJSON(ctx, "/api/runs/"+url.PathEscape(id)+"/completion/decision", body, &env); err != nil {
+		return apitypes.RunDTO{}, err
+	}
+	return env.Run, nil
+}
+
+// AcceptCompletionDecision records the owner's ACCEPT (criteria-waived) decision on a
+// completion-blocked run and resumes it to deliver against the accepted criteria (PRD #1227 M5):
+// POST /api/runs/{id}/completion/decision {decision:"accept", criteria, reason, contract_revision},
+// unwrapping the {run: RunDTO} envelope. criteria is the criterion-id set to ACCEPT as met; reason
+// is the required owner note; contractRevision is the run's CURRENT contract revision the server
+// fences on. It shares PartialCompletionDecision's exit-code mapping: 404 (4) for a
+// foreign/unknown run, 409 (5) for a run not completion-blocked or a stale revision, 400 (2) for a
+// missing/oversized reason, a non-positive revision or an unknown criterion id.
+func (c *HTTPClient) AcceptCompletionDecision(ctx context.Context, id string, criteria []string, reason string, contractRevision int) (apitypes.RunDTO, error) {
+	body := completionDecisionRequest{Decision: "accept", Criteria: criteria, Reason: reason, ContractRevision: contractRevision}
 	var env struct {
 		Run apitypes.RunDTO `json:"run"`
 	}

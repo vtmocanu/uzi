@@ -1103,6 +1103,65 @@ const realApi = {
   startRunRework: (id: string, guidance?: string) =>
     request<{ run: Run }>("POST", `/runs/${id}/rework`, { guidance: guidance ?? "" }),
 
+  // ── Owner completion decisions (PRD #1227 M1/M4) ───────────────────────────────
+  // Three owner/admin decisions on a completion-BLOCKED run (completion_phase ===
+  // "blocked"), all POSTing the one endpoint the CLI shares so web + CLI cannot drift.
+  // ALL THREE are OWNER-SCOPED: a foreign or unknown run is 404 (a read-only admin_ro
+  // uza_ Bearer included — it keeps IsAdmin=true but still 404s, so no admin_ro token can
+  // reduce/accept another user's scope), so callers gate the affordance on the owner flag
+  // (canSteer) and never render a button that would 404. The two 409 states are RE-READ
+  // states, not failures to swallow: ErrCompletionNotBlocked (the run is no longer
+  // completion-blocked) and ErrCompletionRevisionConflict (the contract_revision you sent no
+  // longer matches — the contract advanced under you, so re-read and re-decide). A 400 is a
+  // client-showable validation message. Callers render the 4xx inline at the form.
+
+  /**
+   * PRD #1227: CONTINUE a completion-blocked run with optional guidance (#1226's decision,
+   * kept beside its M4 siblings). `guidance` is ALWAYS sent ("" is valid and the default) and
+   * does NOT revise the contract. Owner-scoped (404); 409 when the run is not
+   * completion-blocked; 400 when the guidance exceeds the 8 KiB cap. Returns the updated run.
+   */
+  continueCompletionDecision: (id: string, guidance?: string) =>
+    request<{ run: Run }>("POST", `/runs/${id}/completion/decision`, {
+      decision: "continue",
+      guidance: guidance ?? "",
+    }),
+
+  /**
+   * PRD #1227: PARTIAL decision — reduce the contract to the `keep` milestone-id set,
+   * deferring the rest out of scope with a required `reason`. `contractRevision` fences the
+   * write against a contract that advanced under the owner (send run.completion_revision).
+   * The server creates revision N+1, records the removed ids as owner-deferred and invalidates
+   * every prior permit; the next PR is visibly partial and never closes the issue. Owner-scoped
+   * (404). 409 = the run is not completion-blocked OR the revision no longer matches (re-read
+   * and re-decide). 400 = an unknown/duplicate id, an empty keep set (removes no milestone), or
+   * an empty/too-long reason. Returns the updated run.
+   */
+  partialCompletionDecision: (id: string, keep: string[], reason: string, contractRevision: number) =>
+    request<{ run: Run }>("POST", `/runs/${id}/completion/decision`, {
+      decision: "partial",
+      keep,
+      reason,
+      contract_revision: contractRevision,
+    }),
+
+  /**
+   * PRD #1227: ACCEPT decision — waive the exact `criteria` criterion-id set with a required
+   * `reason`. It marks ONLY the named criteria as owner-accepted, never their siblings; a
+   * closing PR names each accepted id/text/reason in a warning block. `contractRevision` fences
+   * the write (send run.completion_revision). Owner-scoped (404). 409 = the run is not
+   * completion-blocked OR the revision no longer matches (re-read and re-decide). 400 = an
+   * unknown criterion id (the server is fail-closed), one already satisfied/out of scope, or an
+   * empty/too-long reason. Returns the updated run.
+   */
+  acceptCompletionDecision: (id: string, criteria: string[], reason: string, contractRevision: number) =>
+    request<{ run: Run }>("POST", `/runs/${id}/completion/decision`, {
+      decision: "accept",
+      criteria,
+      reason,
+      contract_revision: contractRevision,
+    }),
+
   /**
    * Issue #754: resume an `auto`-lane run parked at `pool_wait` (the owner's
    * Anthropic token pool was empty) right now, without waiting for a token to be

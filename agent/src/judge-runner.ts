@@ -342,6 +342,14 @@ export function buildJudgePrompt(
     t.stop_kind === "scope_capped"
       ? "This run was intentionally truncated by an operator scope directive (stop_kind=scope_capped): milestones beyond the operator's ceiling were DEFERRED BY THE OPERATOR, not left undone by the agent. Do NOT score the deferred milestones as an incomplete or defective implementation."
       : "",
+    // PRD #1227 M3: an owner completion decision reduced this run's scope (stop_kind=scope_reduced):
+    // the owner explicitly deferred a set of milestones as a real contract revision, so — as with
+    // scope_capped above — the judge must not read the run as incomplete for delivering only the
+    // in-scope set. Kept as its own line (distinct disposition, distinct wording) rather than merged
+    // with the operator-ceiling case; a plain stop matches neither and gets no deferral guidance.
+    t.stop_kind === "scope_reduced"
+      ? "This run's scope was intentionally reduced by an owner completion decision (stop_kind=scope_reduced): the milestones the owner deferred were DEFERRED BY THE OWNER as a deliberate contract revision, not left undone by the agent. Do NOT score the owner-deferred milestones as an incomplete or defective implementation."
+      : "",
     `Iterations: ${t.iteration_count}. MR: ${t.mr_iid ?? "none"}.`,
     t.plan_md ? `\nPlan:\n${clip(t.plan_md, 6000)}` : "",
   ]

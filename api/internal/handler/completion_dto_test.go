@@ -111,6 +111,52 @@ func TestRunToDTOCompletionFieldsInert(t *testing.T) {
 	if dto.CompletionPhase != "" {
 		t.Fatalf("CompletionPhase = %q, want empty", dto.CompletionPhase)
 	}
+	// PRD #1227 M1: the owner-decision projection is inert on a non-interlocked run — a null
+	// revision and STABLE empty (never-null) deferred/accepted arrays.
+	if dto.CompletionRevision != nil {
+		t.Fatalf("CompletionRevision = %v, want nil for an unfrozen run", dto.CompletionRevision)
+	}
+	if dto.CompletionDeferred == nil || len(dto.CompletionDeferred) != 0 {
+		t.Fatalf("CompletionDeferred = %v, want a non-nil empty slice", dto.CompletionDeferred)
+	}
+	if dto.CompletionAccepted == nil || len(dto.CompletionAccepted) != 0 {
+		t.Fatalf("CompletionAccepted = %v, want a non-nil empty slice", dto.CompletionAccepted)
+	}
+}
+
+// TestRunToDTOCompletionScopeProjection pins the PRD #1227 M1 owner-decision projection: runToDTO
+// surfaces completion_revision from run.contract_revision, and decodes the frozen contract's
+// scope.out into completion_deferred and accepted into completion_accepted via the single shared
+// projector (workersvc.CompletionScopeView).
+func TestRunToDTOCompletionScopeProjection(t *testing.T) {
+	contract := []byte(`{"profile":"structural","revision":3,` +
+		`"criteria":[{"id":"m1.c1","milestone_id":"m1","text":"First","audit":null,"finding_ids":[]},` +
+		`{"id":"m3.c1","milestone_id":"m3","text":"Third","audit":null,"finding_ids":[]}],` +
+		`"scope":{"in":["m1"],"out":[{"milestone_id":"m2","reason":"deprioritized","revision":2}]},` +
+		`"accepted":[{"id":"m3.c1","milestone_id":"m3","text":"Third","reason":"good enough","revision":3}]}`)
+	dto := runToDTO(store.Run{
+		ID:                        uuid.New(),
+		Status:                    "running",
+		CompletionContractVersion: pgtype.Int4{Int32: 1, Valid: true},
+		ContractRevision:          pgtype.Int4{Int32: 3, Valid: true},
+		CompletionContract:        contract,
+	}, "normal", 0, 0, dtoTestNow)
+
+	if dto.CompletionRevision == nil || *dto.CompletionRevision != 3 {
+		t.Fatalf("CompletionRevision = %v, want 3", dto.CompletionRevision)
+	}
+	if len(dto.CompletionDeferred) != 1 {
+		t.Fatalf("CompletionDeferred len = %d, want 1", len(dto.CompletionDeferred))
+	}
+	if d := dto.CompletionDeferred[0]; d.MilestoneID != "m2" || d.Reason != "deprioritized" || d.Revision != 2 {
+		t.Fatalf("CompletionDeferred[0] = %+v, want {m2 deprioritized 2}", d)
+	}
+	if len(dto.CompletionAccepted) != 1 {
+		t.Fatalf("CompletionAccepted len = %d, want 1", len(dto.CompletionAccepted))
+	}
+	if a := dto.CompletionAccepted[0]; a.ID != "m3.c1" || a.MilestoneID != "m3" || a.Text != "Third" || a.Reason != "good enough" || a.Revision != 3 {
+		t.Fatalf("CompletionAccepted[0] = %+v, want {m3.c1 m3 Third good enough 3}", a)
+	}
 }
 
 // TestRunToDTOCompletionPhaseAwaitingInputMarker pins the wiring from the dedicated

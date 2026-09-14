@@ -1164,6 +1164,75 @@ func TestContinueCompletionDecisionWire(t *testing.T) {
 	}
 }
 
+// TestPartialCompletionDecisionWire asserts `PartialCompletionDecision` POSTs to
+// /api/runs/{id}/completion/decision with decision="partial", the keep id set, the reason and the
+// contract_revision on the wire (PRD #1227 M5), path-escapes the id, and unwraps the {run: <dto>}
+// envelope. Asserted on RAW bytes (not a decoded struct) so a wrong json tag or a dropped-by-decode
+// field is caught — the omitempty #1227 fields ride only through the real client, which the
+// fake-client command tests cannot see.
+func TestPartialCompletionDecisionWire(t *testing.T) {
+	var gotMethod, gotPath, body string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod, gotPath = r.Method, r.URL.Path
+		b := make([]byte, r.ContentLength)
+		_, _ = io.ReadFull(r.Body, b)
+		body = string(b)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"run":{"id":"r1","status":"running"}}`))
+	}))
+	defer srv.Close()
+
+	run, err := newTestClient(srv).PartialCompletionDecision(context.Background(), "r1", []string{"m2", "m3"}, "drop m4", 4)
+	if err != nil {
+		t.Fatalf("PartialCompletionDecision: %v", err)
+	}
+	if gotMethod != http.MethodPost || gotPath != "/api/runs/r1/completion/decision" {
+		t.Errorf("request = %s %s, want POST /api/runs/r1/completion/decision", gotMethod, gotPath)
+	}
+	for _, want := range []string{`"decision":"partial"`, `"keep":["m2","m3"]`, `"reason":"drop m4"`, `"contract_revision":4`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body = %s, want it to contain %s", body, want)
+		}
+	}
+	if run.ID != "r1" || run.Status != "running" {
+		t.Errorf("decoded run = %+v, want the r1 running run from the envelope", run)
+	}
+}
+
+// TestAcceptCompletionDecisionWire asserts `AcceptCompletionDecision` POSTs to
+// /api/runs/{id}/completion/decision with decision="accept", the criteria id set, the reason and the
+// contract_revision on the wire (PRD #1227 M5), path-escapes the id, and unwraps the {run: <dto>}
+// envelope. Asserted on RAW bytes so a wrong json tag (e.g. `criteria` mistagged) or a
+// dropped-by-decode field is caught — the sibling of TestPartialCompletionDecisionWire.
+func TestAcceptCompletionDecisionWire(t *testing.T) {
+	var gotMethod, gotPath, body string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod, gotPath = r.Method, r.URL.Path
+		b := make([]byte, r.ContentLength)
+		_, _ = io.ReadFull(r.Body, b)
+		body = string(b)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"run":{"id":"r1","status":"running"}}`))
+	}))
+	defer srv.Close()
+
+	run, err := newTestClient(srv).AcceptCompletionDecision(context.Background(), "r1", []string{"m2.c1"}, "waived", 2)
+	if err != nil {
+		t.Fatalf("AcceptCompletionDecision: %v", err)
+	}
+	if gotMethod != http.MethodPost || gotPath != "/api/runs/r1/completion/decision" {
+		t.Errorf("request = %s %s, want POST /api/runs/r1/completion/decision", gotMethod, gotPath)
+	}
+	for _, want := range []string{`"decision":"accept"`, `"criteria":["m2.c1"]`, `"reason":"waived"`, `"contract_revision":2`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body = %s, want it to contain %s", body, want)
+		}
+	}
+	if run.ID != "r1" || run.Status != "running" {
+		t.Errorf("decoded run = %+v, want the r1 running run from the envelope", run)
+	}
+}
+
 // TestCreateRunWireBodySeededPlan pins PRD #209's seed → wire mapping at the RAW body,
 // which the command-level (fake-client) tests cannot see. The load-bearing case is the
 // first: a nil seed must send NEITHER plan_md nor agent_selection, so a run created

@@ -34,6 +34,22 @@ function interlockedClaim(iid: number) {
   });
 }
 
+/** PRD #1227 M2: an INTERLOCKED gitlab issue claim whose FROZEN contract carries an owner PARTIAL
+ *  decision (≥1 deferred milestone), exactly as claim_assembly delivers for a scope_reduced run. The
+ *  worker must open + verify the MR as a partial that NEVER closes — Closes is not added even after
+ *  head verification (reconcileMrDescription(!isOwnerPartial) with isOwnerPartial=true). */
+function ownerPartialClaim(iid: number) {
+  return gitlabClaim(iid, {
+    config: {
+      completion_contract_version: 1,
+      contract_revision: 1,
+      completion_scope: {
+        deferred: [{ milestone_id: "m3", title: "Third milestone", reason: "deprioritized" }],
+      },
+    },
+  });
+}
+
 function statuses(runId: string): string[] {
   return api.states.filter((s) => s.runId === runId).map((s) => s.body.status);
 }
@@ -95,6 +111,37 @@ describe("RunRunner — completion permit + PR-head verification (PRD #1226 M4 D
       ["POST", "GET", "PUT", "GET"],
       "forge calls run in the order: create MR (POST) → verify head (GET) → add Closes (PUT) → re-verify head (GET)",
     );
+  });
+
+  it("OWNER PARTIAL (PRD #1227 M2): creates a [partial] MR with NO Closes, verifies head H, and the post-verify PUT STILL has no Closes", async () => {
+    const { gitlab, calls } = fakeGitlab({ head: H });
+    const claim = ownerPartialClaim(1310);
+    api.setCompletionPermitResponse(true);
+    git.trackingTip = (async () => H) as typeof git.trackingTip;
+
+    await runner(new StubExecutor(nullLogger()), gitlab).execute(claim);
+
+    // The permit is requested and the head is verified exactly like a full delivery.
+    assert.strictEqual(api.completionPermitRequests.length, 1, "a partial run still requests the permit");
+    // The MR is created as a [partial] with NO Closes and the deferred milestone listed.
+    const post = mrPostBody(calls);
+    assert.match(String(post.title), /^\[partial\] /, "an owner partial MR title is prefixed [partial]");
+    assert.doesNotMatch(String(post.description), /Closes #/, "an owner partial MR is created WITHOUT Closes");
+    assert.match(String(post.description), /owner scope decision/, "the created body states the partial delivery");
+    assert.match(String(post.description), /m3.*Third milestone.*deprioritized/, "the deferred milestone is named with its owner reason");
+    // The head is verified (permit binding) — the partial does not skip verification.
+    assert.ok(calls.some((c) => c.method === "GET"), "the PR head is still verified for a partial");
+    // CRITICAL (PRD #1227 M2): the post-verify reconcile PUT re-renders the NON-closing partial body —
+    // reconcileMrDescription(!isOwnerPartial) with isOwnerPartial=true → withCloses=false. The verified
+    // head does NOT add Closes for a partial, contrasting the non-partial test above which DOES.
+    const put = mrPutBody(calls);
+    assert.doesNotMatch(String(put.description), /Closes #/, "a partial NEVER adds Closes even after head verification");
+    assert.match(String(put.description), /owner scope decision/, "the reconciled body is still the partial-delivery body");
+    // The run completes (the head verified) and carries head H, like any granted interlocked run.
+    const done = completedBody(claim.run_id);
+    assert.ok(done, "an owner partial run still completes on a verified head");
+    assert.strictEqual(done!.head, H, "the completed report carries the permitted+verified head H");
+    assert.strictEqual(api.completionHoldRequests.length, 0, "a verified owner partial never holds");
   });
 
   it("permit DENIED → never creates the MR, never completes, holds the run", async () => {

@@ -464,7 +464,9 @@ Tracked as GitLab issue vtmocanu/uzi#58 (closed); PRD at `prds/done/58-hosted-k8
 - Trimmed v1 surface: sizes are built-in constants (no preset CRUD), no restart endpoint, heartbeat-only status. [user 2026-07-16]
 - Sizes are Burstable (requests < limits): `s` 250m–1 CPU / 1–2Gi RAM; `m` 500m–2 / 2–4Gi; `l` 1–4 / 4–8Gi; `/data` 5/10/20Gi; `/nix` a flat 4Gi. [user 2026-07-17]
   - `/nix` is now a flat **20Gi** — raised for PRD #87's prebaked Chromium closure. [user, PRD #87]
-  - `l`'s RAM limit is now **12Gi** (request stays 4Gi), raised to stop runtime OOMKills from multi-agent runs (parallel subagent waves plus the web-ux browser). [user, #131]
+  - `l`'s RAM limit is now **12Gi** (request was 4Gi; now 8Gi, #1341), raised to stop runtime OOMKills from multi-agent runs (parallel subagent waves plus the web-ux browser). [user, #131]
+  - Per-size RAM raised: `s` 2–4Gi, `m` 4–8Gi, `l` 8–12Gi — each request lifted above that size's measured per-run peak (all still Burstable). Stops kubelet node-memory-pressure eviction of workers that sat over their request, incl. mid-run. [user, #1341]
+  - Hosted worker pods now carry a default `priorityClassName` (a modest cluster-scoped PriorityClass, value 1000, `globalDefault: false`), so under node memory pressure other lower-priority pods are evicted before ours. `preemptionPolicy: PreemptLowerPriority` (owner's choice): a worker that cannot be scheduled for lack of room also preempts lower-priority pods to get placed. Operators can set `Never` to drop that scheduling-time preemption. [user, #1341]
 - Default size is `m`, not `s`. [user 2026-07-16]
 - Three sizes stay, and the picker displays what each size buys. [user 2026-07-17]
 - Deleting a hosted worker requires a confirmation (it destroys the worker's volumes); deleting an external worker stays one click. [user 2026-07-16]
@@ -773,6 +775,7 @@ Mock at `prds/mockups/1167-lights-on-themes-mock.html`.
 Tracked as GitHub issue vtmocanu/uzi#1226 (parent epic #1225); PRD at `prds/done/1226-structural-completion-interlock.md`.
 
 - An issue run may open a closing PR only after every in-scope approved milestone is declared complete against a frozen contract for the exact final head, or the owner records an explicit later decision. An incomplete attempt returns to the same lead and otherwise holds without discarding its work. [user, #1226]
+- (AI-synced 2026-09-13) That explicit later decision is delivered by #1227 as three bounded, revisioned, owner-only decisions — continue, partial (reduce scope by exact milestone ids → a `scope_reduced` delivery that never closes the issue) and accept (waive exact named criteria with a required reason, named in the closing PR); each creates a new contract revision and invalidates every prior permit, and the lead has no route to the decision authority. PRD at `prds/done/1227-completion-owner-decisions.md`. [AI-synced, #1227]
 
 ## Feature #1265 — RC-first release train
 

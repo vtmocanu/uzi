@@ -350,6 +350,35 @@ func TestGitHubListWorkflowRuns(t *testing.T) {
 	}
 }
 
+// TestGitHubGetWorkflowRun pins the single-run GET mapping (the `ci` drill-in
+// header): GetWorkflowRunByID hits /actions/runs/{id} and maps through the same
+// toGitHubWorkflowRun as the list, so the identity scalars carry through.
+func TestGitHubGetWorkflowRun(t *testing.T) {
+	m := newMockGitHub(t, map[string]http.HandlerFunc{
+		"/repos/acme/widgets/actions/runs/1039": func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": 1039, "name": "CI", "run_number": 1039, "event": "pull_request",
+				"head_branch": "agent/issue-1", "head_sha": "cafe", "status": "in_progress",
+				"display_title": "PRD continuation",
+				"html_url":      "https://github.com/acme/widgets/actions/runs/1039",
+				"actor":         map[string]any{"login": "uzi-bot"},
+			})
+		},
+	})
+	d := newGitHubDriver(t, m, "ghp_classicTokenValue1234567890")
+
+	r, err := d.GetWorkflowRun(context.Background(), 7, 1039)
+	if err != nil {
+		t.Fatalf("GetWorkflowRun: %v", err)
+	}
+	if r.ID != 1039 || r.Number != 1039 || r.Event != "pull_request" || r.Branch != "agent/issue-1" {
+		t.Fatalf("run mapping wrong: %+v", r)
+	}
+	if r.SHA != "cafe" || r.Status != "in_progress" || r.Title != "PRD continuation" || r.Actor != "uzi-bot" {
+		t.Fatalf("run sha/status/title/actor mapping wrong: %+v", r)
+	}
+}
+
 // TestGitHubJobStepsAndTiming pins that ListPipelineJobs fills Job.Steps and the
 // job's StartedAt/FinishedAt from the workflow-job payload (PRD #1255).
 func TestGitHubJobStepsAndTiming(t *testing.T) {

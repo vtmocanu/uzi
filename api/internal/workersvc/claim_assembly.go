@@ -492,6 +492,11 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			// runs.contract_revision. The worker echoes it in its completion permit request; nil
 			// (legacy / non-interlocked / contract not yet frozen) ⇒ omitted, same as above.
 			ContractRevision: intPtr(run.ContractRevision),
+			// PRD #1227 M2: the worker-only projection of the run's frozen contract's owner
+			// decisions (deferred milestone ids+titles+reasons, accepted id+text+reason). nil for a
+			// contract with neither a deferred nor an accepted set (legacy / non-interlocked /
+			// revision-1), so omitempty keeps such a claim byte-identical to today's.
+			CompletionScope: CompletionScopeClaim(run.CompletionContract),
 		},
 	}
 

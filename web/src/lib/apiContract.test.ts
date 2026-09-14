@@ -171,7 +171,11 @@ type ZeroOf<T, NeverNull extends keyof T = never> = {
 // required_tools (:443); capsOrEmpty is handler/forge.go:148. completion_unmet (PRD
 // #1226 M5, D8) is the fourth — decodeLatestUnmet (handler/runs_dto.go) always returns
 // [] (never null), so the TS type is a never-null string[] and the null zero fixture is
-// exempted here like the capsOrEmpty trio.
+// exempted here like the capsOrEmpty trio. completion_deferred / completion_accepted (PRD
+// #1227 M1) are the fifth and sixth — workersvc.CompletionScopeView (handler/runs_dto.go)
+// always returns non-nil slices, so their TS types are never-null arrays and the null zero
+// fixture is exempted the same way. (completion_revision is number|null, so it needs no
+// exemption.)
 {
   // 1. key-set equality, both directions.
   const _runMissing: never = null as unknown as Exclude<keyof Run, keyof typeof runFull>;
@@ -179,7 +183,12 @@ type ZeroOf<T, NeverNull extends keyof T = never> = {
   // 2. nullability with the mapper-normalized exemptions applied.
   const _runZero: ZeroOf<
     Run,
-    "plan_changed_files" | "required_capabilities" | "required_tools" | "completion_unmet"
+    | "plan_changed_files"
+    | "required_capabilities"
+    | "required_tools"
+    | "completion_unmet"
+    | "completion_deferred"
+    | "completion_accepted"
   > = runZero;
   // 3. value kinds, literal unions widened.
   const _runFull: Widen<Run> = runFull;
@@ -192,13 +201,18 @@ type ZeroOf<T, NeverNull extends keyof T = never> = {
 // ── RunListItem ─────────────────────────────────────────────────────────────
 // RunListItem extends Run, so its extra keys inherit the same drift fields; its
 // own fields (repo_path, worker_name, owner_email, judge_verdict, judge_todo_count,
-// is_revising) match. Same four ZeroOf exemptions, inherited from Run.
+// is_revising) match. Same six ZeroOf exemptions, inherited from Run.
 {
   const _runListItemMissing: never = null as unknown as Exclude<keyof RunListItem, keyof typeof runListItemFull>;
   const _runListItemExtra: never = null as unknown as Exclude<keyof typeof runListItemFull, keyof RunListItem>;
   const _runListItemZero: ZeroOf<
     RunListItem,
-    "plan_changed_files" | "required_capabilities" | "required_tools" | "completion_unmet"
+    | "plan_changed_files"
+    | "required_capabilities"
+    | "required_tools"
+    | "completion_unmet"
+    | "completion_deferred"
+    | "completion_accepted"
   > = runListItemZero;
   const _runListItemFull: Widen<RunListItem> = runListItemFull;
   void _runListItemMissing;

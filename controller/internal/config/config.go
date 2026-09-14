@@ -100,6 +100,11 @@ type Config struct {
 	WorkerAPIURL string
 	// WorkerStorageClass is optional; empty means the cluster default.
 	WorkerStorageClass string
+	// WorkerPriorityClassName is optional (UZI_WORKER_PRIORITY_CLASS_NAME); empty means
+	// worker pods carry no priorityClassName. Set by the chart when
+	// workers.priorityClass.enabled, naming the cluster-scoped PriorityClass the chart
+	// creates (issue #1341).
+	WorkerPriorityClassName string
 	// WorkerEphemeralRequest overrides the WORKER container's
 	// requests.ephemeral-storage for a PLAIN worker (issue #224 M-b;
 	// UZI_WORKER_EPHEMERAL_REQUEST). Empty ⇒ the render side's built-in 512Mi.
@@ -339,6 +344,7 @@ func loadWorkerSettings(cfg *Config) error {
 		return fmt.Errorf("UZI_API_CA_FILE is set but UZI_WORKER_API_URL is not https; the workers would carry a CA they never consult and their claim traffic — which carries the user's decrypted forge PAT and Anthropic token — would cross the pod network in the clear")
 	}
 	cfg.WorkerStorageClass = strings.TrimSpace(os.Getenv("UZI_WORKER_STORAGE_CLASS"))
+	cfg.WorkerPriorityClassName = strings.TrimSpace(os.Getenv("UZI_WORKER_PRIORITY_CLASS_NAME"))
 
 	// The per-worker slot cap (UZI_WORKER_MAX_CONCURRENT_RUNS). Default 1 (empty/unset),
 	// operator-configurable in [1, workerMaxConcurrentRunsCeiling]. A non-integer or an

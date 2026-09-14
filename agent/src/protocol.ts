@@ -658,6 +658,20 @@ export interface ClaimConfig {
    *  the server can reject a revision drift. WORKER-ONLY claim config (NOT the web RunDTO).
    *  Absent (a legacy/non-interlocked run, or a contract not yet frozen) ⇒ no permit request. */
   contract_revision?: number;
+  /** PRD #1227 M2/M3: a WORKER-ONLY projection of the run's FROZEN completion contract's
+   *  owner decisions (server M2a — claim.go / claim_assembly.go). `deferred` drives the
+   *  partial-delivery MR (each owner-deferred milestone, PRD #1227 D2): a run with a
+   *  non-empty `deferred` is a `scope_reduced` partial that renders `[partial]`, lists the
+   *  deferred milestones with the owner's reason, and NEVER closes the issue. `accepted`
+   *  drives the accept warning block (owner-waived unmet criteria, PRD #1227 D3): each
+   *  accepted criterion is named by id + text + reason in a warning block, present even on
+   *  a closing PR. Both arrays are omitempty and `completion_scope` is omitted ENTIRELY for
+   *  a non-reduced run, so the worker MUST treat absent/empty as "no partial, no accept"
+   *  (a normal run's rendering is byte-identical to today). */
+  completion_scope?: {
+    deferred?: { milestone_id: string; title: string; reason: string }[];
+    accepted?: { id: string; milestone_id: string; text: string; reason: string }[];
+  };
 }
 
 /**

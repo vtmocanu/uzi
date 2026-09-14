@@ -210,6 +210,20 @@ type FakeClient struct {
 	DecideRun                     apitypes.RunDTO
 	ContinueCompletionDecisionErr error
 
+	// Partial/AcceptCompletionDecision capture (PRD #1227 M5): the keep/criteria id lists, the
+	// trimmed reason and the fenced contract_revision the decision sent, alongside the shared
+	// LastDecideRunID above (set by all three decisions so a test can assert the write was
+	// REACHED). DecideRun is reused as the canned success reply.
+	// PartialCompletionDecisionErr / AcceptCompletionDecisionErr win over the blanket Err so a
+	// test can model a 409/404/400 on the write while the capture still proves it was reached with
+	// the right args.
+	LastDecideKeep               []string
+	LastDecideCriteria           []string
+	LastDecideReason             string
+	LastDecideRevision           int
+	PartialCompletionDecisionErr error
+	AcceptCompletionDecisionErr  error
+
 	// SelfMeters drives SelfRateLimits (PRD #111 D23): the caller's own per-token
 	// meters, each carrying the server-computed auto-selection status.
 	SelfMeters []apitypes.TokenRateLimitDTO

@@ -2546,19 +2546,35 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// a run the operator never narrowed. NULL (the zero pgtype.Text) leaves any existing
 		// stop_kind untouched via the query's COALESCE-narg, so a normal completion is
 		// byte-identical to before.
+		//
+		// PRD #1227 M2 (D2): the disjoint else-branch stamps stop_kind='scope_reduced' on a
+		// completion whose frozen contract carries an owner-deferred set (scope.out non-empty).
+		// This is SERVER-DERIVED from the contract the owner's `partial` decision revised — the
+		// worker sends no wire signal for it, so it cannot mint a disposition the owner never
+		// authorized. The two are effectively disjoint: scope_capped keys on the operator's
+		// scope_ceiling directive, scope_reduced on the contract's deferred set; scope_capped
+		// wins if both somehow apply, and scope_capped's meaning is NOT widened.
 		var scopeStopKind pgtype.Text
 		if req.ScopeCapped != nil && *req.ScopeCapped && owned.ScopeCeiling.Valid {
 			scopeStopKind = pgconv.TextOrNull("scope_capped")
+		} else if contractHasDeferrals(owned.CompletionContract) {
+			scopeStopKind = pgconv.TextOrNull("scope_reduced")
 		}
 		// PRD #634 M4: settle the still-pending scope audit row at completion. 'applied' when
-		// this is a genuine scope-capped completion (scopeStopKind set); 'declined' otherwise —
+		// this is a genuine scope_capped completion (see the #1227 guard below); 'declined' otherwise —
 		// a run that completed normally despite a scope directive (e.g. the lead under-reported
 		// so the gate never fired; the directive did not change behavior). 'declined' is set
 		// ONLY when the run actually carried a scope directive (owned.ScopeCeiling.Valid);
 		// without one settleScopeDisposition stays "" and the post-switch settle block is
 		// skipped, so a normal completion issues no 0-row UPDATE. Applied best-effort after the
 		// transition commits (rows>0), so a no-op onto an already-terminal run does not re-settle.
-		if scopeStopKind.Valid {
+		//
+		// PRD #1227 M2: guard 'applied' on the disposition being exactly "scope_capped" — a
+		// scope_reduced completion must NOT settle the #634 scope-ceiling audit row 'applied'
+		// (the scope_ceiling directive did not drive this finalize). A scope_reduced completion
+		// then falls to the else-if and settles 'declined' ONLY if the run ALSO carried a
+		// scope_ceiling directive; a run with deferrals but no scope_ceiling settles nothing.
+		if scopeStopKind.Valid && scopeStopKind.String == "scope_capped" {
 			settleScopeDisposition = "applied"
 		} else if owned.ScopeCeiling.Valid {
 			settleScopeDisposition = "declined"

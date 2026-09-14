@@ -378,6 +378,7 @@ func TestLoadReadsTheWorkerSettings(t *testing.T) {
 	t.Setenv("UZI_API_URL", "https://uzi.example.com")
 	t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
 	t.Setenv("UZI_WORKER_STORAGE_CLASS", "standard")
+	t.Setenv("UZI_WORKER_PRIORITY_CLASS_NAME", "uzi-hosted-worker")
 
 	cfg, err := Load()
 	if err != nil {
@@ -394,6 +395,9 @@ func TestLoadReadsTheWorkerSettings(t *testing.T) {
 	}
 	if cfg.WorkerStorageClass != "standard" {
 		t.Errorf("WorkerStorageClass = %q", cfg.WorkerStorageClass)
+	}
+	if cfg.WorkerPriorityClassName != "uzi-hosted-worker" {
+		t.Errorf("WorkerPriorityClassName = %q", cfg.WorkerPriorityClassName)
 	}
 }
 
@@ -486,6 +490,23 @@ func TestLoadLeavesTheStorageClassOptional(t *testing.T) {
 	}
 	if cfg.WorkerStorageClass != "" {
 		t.Errorf("WorkerStorageClass = %q, want empty (the cluster default)", cfg.WorkerStorageClass)
+	}
+}
+
+// The priority class is optional too: empty legitimately means "no priorityClassName",
+// which marshals identically to before the field existed so a disabled install does not
+// re-hash its workers.
+func TestLoadLeavesThePriorityClassOptional(t *testing.T) {
+	setWorkerEnv(t)
+	t.Setenv("UZI_API_URL", "https://uzi.example.com")
+	t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.WorkerPriorityClassName != "" {
+		t.Errorf("WorkerPriorityClassName = %q, want empty (no priorityClassName)", cfg.WorkerPriorityClassName)
 	}
 }
 
