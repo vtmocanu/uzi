@@ -9,6 +9,8 @@ import path from "node:path";
 import type { Readable } from "node:stream";
 import { type ExecutorResult, type RunContext } from "../src/executor.js";
 import { type ExecutorFactory } from "../src/runner.js";
+import { LimitReachedError } from "../src/limit.js";
+import type { BoundaryPermit, BoundaryRequest, CodexExecutionSafety } from "../src/harness.js";
 import { RecoveryCoordinator, type RecoveryArchiveClient, type RecoveryBundleProducer } from "../src/recovery.js";
 import { type RecoveryBundleResult } from "../src/git.js";
 import type {
@@ -450,6 +452,204 @@ describe("RunRunner — graceful shutdown retains within the k8s grace (PRD #134
       // The shutdown pin ADVANCED the source past the early-pin base to the committed head,
       // proving the shutdown-branch pin ran (not merely the after-clone evidence pin).
       assert.equal(recs[0]!.sourceSha, sha(), "the shutdown pin recorded the committed restore point");
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+// PRD #1349 M2 (F3) — a no-code `completed` code-publishing run (report_only / not_code /
+// scope-capped-empty) never reaches the finalization pin, so its EARLY generation-evidence pin
+// would leak and the next restart's resumePending would escalate it to a FALSE needs_action. The
+// completed terminal drive must release this generation's hold (and remove the local record) even
+// when the finalization recoveryRecord is absent.
+describe("RunRunner — no-code completion settles the early-evidence hold (PRD #1349 M2, F3)", () => {
+  it("a report-only COMPLETED run releases its exact generation and removes the leaked early-evidence record", async () => {
+    const { gitlab } = fakeGitlab();
+    const { coord, client, root } = injectedCoordinator();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-m2-reportonly-"));
+    try {
+      const claim = gitlabClaim(4401, { claim_generation: 15 });
+      const factory: ExecutorFactory = (runId) => {
+        const runHome = path.join(homeRoot, runId);
+        return {
+          homeDir: runHome,
+          executor: {
+            run: async (ctx: RunContext): Promise<ExecutorResult> => {
+              fs.mkdirSync(runHome, { recursive: true });
+              // No commit, no checkpoint: a genuine no-code deliverable (report_only completes).
+              return { branch: ctx.branch, reportOnly: true, summary: "findings only, nothing to land" };
+            },
+          },
+        };
+      };
+      await runnerWith(factory, gitlab, undefined, nullLogger(), { recovery: coord }).execute(claim);
+      assert.ok(hasStatus(claim.run_id, "completed"), "the run completed report-only");
+      assert.deepEqual(
+        client.releasedGenerations(),
+        [15],
+        "a no-code completion releases the exact generation (the early-evidence hold)",
+      );
+      assert.equal(client.reserveCalls.length, 0, "a no-code completion captures nothing");
+      assert.deepEqual(
+        await coord.inspect(claim.run_id),
+        [],
+        "the early-evidence record is removed — no leaked `pinned` record for the restart sweep to escalate",
+      );
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+// PRD #1349 M2 (F4) — a usage-limit hit with wait_on_limit=false reports `failed` and returns
+// parked=false, so the limit-park settle is skipped and the error never reaches the generic catch.
+// A code-publishing run that hit the limit with opt-out must still be routed through the
+// exact-generation disposition before its clone is torn down, so committed-since-checkpoint work is
+// CAPTURED (never silently dropped) and a provably-empty opt-out RELEASES its exact hold.
+describe("RunRunner — usage-limit opt-out routes through the coordinator (PRD #1349 M2, F4)", () => {
+  function limitOptOutFactory(homeRoot: string, commit: boolean): ExecutorFactory {
+    return (runId) => {
+      const runHome = path.join(homeRoot, runId);
+      return {
+        homeDir: runHome,
+        executor: {
+          run: async (ctx: RunContext): Promise<ExecutorResult> => {
+            fs.mkdirSync(runHome, { recursive: true });
+            if (commit) commitInTree(ctx.worktreePath, "WORK.txt", "committed before the limit\n");
+            throw new LimitReachedError({ resetsAtMs: Date.now() + 5 * 3600_000, rateLimitType: "five_hour" });
+          },
+        },
+      };
+    };
+  }
+
+  it("wait_on_limit=false with committed work CAPTURES (never silently drops) before teardown", async () => {
+    const { gitlab } = fakeGitlab();
+    const { coord, client, git, root } = injectedCoordinator();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-m2-optout-"));
+    try {
+      git.alreadyPublished = false; // committed-since-checkpoint work is unpublished
+      const claim = gitlabClaim(4501, { claim_generation: 13, wait_on_limit: false });
+      await runnerWith(limitOptOutFactory(homeRoot, true), gitlab, undefined, nullLogger(), {
+        recovery: coord,
+      }).execute(claim);
+      assert.ok(hasStatus(claim.run_id, "failed"), "an opt-out usage-limit hit reports failed");
+      assert.equal(client.releaseCalls.length, 0, "committed work is NEVER released");
+      assert.equal(client.reserveCalls.length, 1, "the opt-out committed work is CAPTURED, not dropped");
+      assert.equal(client.reserveCalls[0]!.generation, 13, "the capture binds the exact generation");
+      assert.equal(client.uploadCalls.length, 1, "the generation-bound bundle is uploaded");
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("DISCRIMINATING: wait_on_limit=false with NO work RELEASES the exact generation (provably empty)", async () => {
+    const { gitlab } = fakeGitlab();
+    const { coord, client, git, root } = injectedCoordinator();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-m2-optout-empty-"));
+    try {
+      git.alreadyPublished = true; // provably empty → H already on the forge
+      const claim = gitlabClaim(4502, { claim_generation: 14, wait_on_limit: false });
+      await runnerWith(limitOptOutFactory(homeRoot, false), gitlab, undefined, nullLogger(), {
+        recovery: coord,
+      }).execute(claim);
+      assert.ok(hasStatus(claim.run_id, "failed"));
+      assert.deepEqual(client.releasedGenerations(), [14], "a provably-empty opt-out releases its exact hold");
+      assert.equal(client.uploadCalls.length, 0, "nothing to archive on an empty opt-out");
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+// PRD #1349 M2 (F2) — a credentialed settleRecoveryGeneration does a PAT-bearing fresh-forge
+// fetch. On a CODEX run the provider root is disposed only in executeClaim's finally (killAgentTree
+// is a no-op), so a bare settle in the generic-failure catch would race a still-alive Codex provider
+// (PAT-in-/proc/environ exposure). The fix reaps the provider (Codex-aware, via withBoundary) BEFORE
+// the credentialed fetch. Driven with a Codex-shaped executor (a `.safety` whose withBoundary models
+// the quiesce+reap, NO killAgentTree).
+describe("RunRunner — credentialed settle reaps the Codex provider FIRST (PRD #1349 M2, F2)", () => {
+  /** A FakeRecoveryGit that records, at each credentialed fetchDefaultTip, whether the provider had
+   *  already been reaped (`!providerAlive`). Shares the live-provider flag with the fake safety. */
+  class ReapProbeGit extends FakeRecoveryGit {
+    reapedAtFetch: boolean[] = [];
+    constructor(private readonly state: { providerAlive: boolean }) {
+      super();
+    }
+    override async fetchDefaultTip(): Promise<string> {
+      this.reapedAtFetch.push(!this.state.providerAlive);
+      return super.fetchDefaultTip();
+    }
+  }
+
+  it("a Codex generic failure reaps the provider root BEFORE the credentialed settle fetch", async () => {
+    const { gitlab } = fakeGitlab();
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-m2-codexreap-"));
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-m2-codexreap-home-"));
+    try {
+      const state = { providerAlive: false };
+      const client = new FakeRecoveryClient();
+      const git = new ReapProbeGit(state);
+      git.alreadyPublished = false; // committed work → the credentialed fresh-forge fetch runs
+      const coord = new RecoveryCoordinator({
+        client,
+        git,
+        log: nullLogger(),
+        recoveryRoot: root,
+        workerToken: "m2-worker-join-token-0123456789",
+        now: () => 1_700_000_000_000,
+      });
+      // A minimal Codex-shaped safety: withBoundary models the quiesce+reap of the provider root.
+      const boundaries: string[] = [];
+      const safety: CodexExecutionSafety = {
+        kind: "codex",
+        withBoundary: async <T>(
+          req: BoundaryRequest,
+          action: (permit: BoundaryPermit) => Promise<T>,
+        ): Promise<T> => {
+          boundaries.push(req.boundary);
+          state.providerAlive = false; // withBoundary quiesced + reaped the provider root
+          const ac = new AbortController();
+          return action({ signal: ac.signal } as unknown as BoundaryPermit);
+        },
+        spawnBoundaryProcess: async () => {
+          throw new Error("spawnBoundaryProcess is not used by this test");
+        },
+        dispose: async () => ({ kind: "disposed" }),
+      };
+      const claim = gitlabClaim(4601, { claim_generation: 21 });
+      const factory: ExecutorFactory = (runId) => {
+        const runHome = path.join(homeRoot, runId);
+        return {
+          homeDir: runHome,
+          executor: {
+            safety,
+            run: async (ctx: RunContext): Promise<ExecutorResult> => {
+              fs.mkdirSync(runHome, { recursive: true });
+              state.providerAlive = true; // the Codex provider subprocess is live
+              commitInTree(ctx.worktreePath, "WORK.txt", "committed before the codex failure\n");
+              throw new Error("codex agent failed hard");
+            },
+          },
+        };
+      };
+      await runnerWith(factory, gitlab, undefined, nullLogger(), { recovery: coord }).execute(claim);
+      assert.ok(hasStatus(claim.run_id, "failed"), "the run reported failed");
+      // The credentialed settle DID run — committed work is captured, not dropped.
+      assert.equal(git.fetchCalls, 1, "the credentialed fresh-forge fetch ran");
+      assert.equal(client.reserveCalls.length, 1, "committed work was captured");
+      // ...and it ran under a Codex reap boundary, AFTER the provider root was reaped (F2).
+      assert.ok(boundaries.length >= 1, "the settle ran under a Codex reap boundary");
+      assert.deepEqual(
+        git.reapedAtFetch,
+        [true],
+        "the provider was reaped BEFORE the credentialed fetch (no PAT-in-/proc/environ race)",
+      );
     } finally {
       fs.rmSync(homeRoot, { recursive: true, force: true });
       fs.rmSync(root, { recursive: true, force: true });

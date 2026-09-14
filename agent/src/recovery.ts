@@ -519,6 +519,15 @@ export class RecoveryCoordinator {
    * is removed ONLY when the server actually released the hold — a server that RETAINED it
    * (v1/ambiguous, `retained`) leaves the source protected, so the record stays for owner
    * attention rather than deleting the only local pointer to it.
+   *
+   * PRD #1349 M2 (D1) — the local cleanup is GENERATION-SCOPED. M2 stores ONE record per
+   * generation (each with its own `<captureId>.json` + `<captureId>.bundle`), and on a same-worker
+   * affinity resume a retained sibling generation's record + bundle (possibly the last local copy of
+   * that generation's unpublished committed work) coexists with this generation's record in the
+   * SAME run dir. So a real release that names an exact generation removes ONLY that generation's
+   * record(s) + their bundle files, never the whole run dir — wiping the dir would take a sibling
+   * generation's work with it. Only the v1 fallback (generation omitted, at most one record) removes
+   * the whole run dir.
    */
   async release(runId: string, generation?: number): Promise<void> {
     if (!this.enabled) return;
@@ -531,7 +540,13 @@ export class RecoveryCoordinator {
         holds_released: res.holds_released,
         ...(res.retained ? { retained: res.retained, reason: res.reason } : {}),
       });
-      if (!res.retained) await this.removeRunDir(runId);
+      if (!res.retained) {
+        if (generation !== undefined) {
+          await this.removeGenerationRecords(runId, generation);
+        } else {
+          await this.removeRunDir(runId);
+        }
+      }
     } catch (err) {
       this.log.warn("recovery: custody release failed (a reconciler will retry; completion is unaffected)", {
         run_id: runId,
@@ -716,6 +731,31 @@ export class RecoveryCoordinator {
 
   private async removeRunDir(runId: string): Promise<void> {
     await fs.rm(this.runDir(runId), { recursive: true, force: true }).catch(() => undefined);
+  }
+
+  /**
+   * PRD #1349 M2 (D1) — remove ONLY the released generation's record(s) + their bundle files,
+   * leaving every sibling generation's record (and its possibly-last-local-copy bundle) intact.
+   * When this was the run's only generation the now-empty run dir is dropped, so a clean release of
+   * the sole hold still tidies the journal exactly as the v1 whole-dir removal did.
+   */
+  private async removeGenerationRecords(runId: string, generation: number): Promise<void> {
+    const records = await this.listRecords(runId);
+    let remaining = 0;
+    for (const record of records) {
+      if (record.generation === generation) {
+        await fs.rm(this.recordPath(record), { force: true }).catch(() => undefined);
+        // The bundle lives at the canonical <captureId>.bundle path; remove any distinct
+        // journaled bundlePath too, so a released generation never leaks its bytes.
+        await fs.rm(this.bundlePath(record), { force: true }).catch(() => undefined);
+        if (record.bundlePath && record.bundlePath !== this.bundlePath(record)) {
+          await fs.rm(record.bundlePath, { force: true }).catch(() => undefined);
+        }
+      } else {
+        remaining++;
+      }
+    }
+    if (remaining === 0) await this.removeRunDir(runId);
   }
 }
 

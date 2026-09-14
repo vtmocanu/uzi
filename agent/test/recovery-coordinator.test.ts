@@ -577,6 +577,41 @@ describe("RecoveryCoordinator — exact generation identity end to end (PRD #134
     assert.deepEqual(await coord.inspect("run-rel"), [], "a real release drops the run journal");
   });
 
+  it("release(generation) removes ONLY that generation's record+bundle; a sibling generation SURVIVES (no whole-dir wipe)", async () => {
+    // PRD #1349 M2 (D1) regression: on a same-worker affinity resume, generation N's retained
+    // needs_action record + its on-disk bundle (possibly the last local copy of N's unpublished
+    // committed work) coexist with generation N+1's record in the SAME run dir. A clean release of
+    // N+1 must NOT wipe the whole run dir — that would take N's work with it.
+    const client = new FakeClient();
+    const git = new FakeGit();
+    const coord = makeCoordinator({ client, git });
+    const runId = "run-sibling";
+    // Gen N: drive to a RETAINED needs_action WITH an on-disk bundle (the upload fails, so a
+    // verified bundle file is journaled and the source is retained).
+    client.uploadShouldThrow = true;
+    const genN = await coord.pin({ runId, sourceSha: H, kind: "issue", branch: "b", generation: 10 });
+    await coord.captureAndUpload({ record: genN!, barePath: "/bare", defaultBranch: "main" });
+    const nRec = (await coord.inspect(runId)).find((r) => r.generation === 10)!;
+    assert.equal(nRec.state, "needs_action", "gen N is retained (needs_action)");
+    const nBundle = nRec.bundlePath!;
+    assert.ok(nBundle && fs.existsSync(nBundle), "gen N's verified bundle is on disk");
+    // Gen N+1: a fresh record for the next generation, in the SAME run dir.
+    client.uploadShouldThrow = false;
+    await coord.pin({ runId, sourceSha: H_PRIME, kind: "issue", branch: "b", generation: 11 });
+    assert.equal((await coord.inspect(runId)).length, 2, "gen 10 + gen 11 coexist in one run dir");
+    // A clean release of gen N+1 (server released:true / retained:false).
+    await coord.release(runId, 11);
+    assert.deepEqual(client.releaseGenerations, [11], "released the exact generation N+1");
+    const remaining = await coord.inspect(runId);
+    assert.equal(remaining.length, 1, "ONLY gen 11's record was removed");
+    assert.equal(remaining[0]!.generation, 10, "gen 10's record SURVIVES");
+    assert.equal(remaining[0]!.state, "needs_action");
+    assert.ok(
+      fs.existsSync(nBundle),
+      "gen 10's bundle SURVIVES — releasing a sibling generation never wipes the run dir",
+    );
+  });
+
   it("a server-RETAINED release keeps the local journal (the source stays protected)", async () => {
     const client = new FakeClient();
     client.releaseRetained = true;

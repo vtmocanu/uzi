@@ -878,6 +878,19 @@ export class RunRunner {
           // committed history is promoted into the generation-bound archive, and a failed
           // comparison or upload retains. Best-effort; runs after the park report landed.
           await this.settleRecoveryGeneration(claim, flight, runLog);
+        } else if (!claim.wait_on_limit) {
+          // PRD #1349 M2 (F4): the usage-limit OPT-OUT (wait_on_limit=false). handleLimitReached
+          // reported `failed` and returned parked=false, so the park durability block above is
+          // skipped AND the error never reaches the generic catch's disposition — the exact
+          // "early-terminal path bypasses the coordinator" M2 set out to eliminate. Without this a
+          // code-publishing run that hit a limit with opt-out tears down its clone with NO
+          // disposition: committed-since-checkpoint work is dropped and the early pin becomes an
+          // unreproducible needs_action. Route it through the SAME exact-generation disposition the
+          // limit-park uses, reap-first (Codex-aware, F2): committed work CAPTURES into the
+          // generation-bound archive, a provably-empty opt-out RELEASES its exact hold, and a
+          // failed/unverifiable comparison RETAINS — never a silent drop. Best-effort; runs after
+          // the `failed` report landed.
+          await this.reapThenSettleRecoveryGeneration(claim, flight, runLog, "terminal");
         }
       } else if (err instanceof TransientRecoveryError) {
         // Retry capture without abandoning the live claim. Only verified local
@@ -1085,13 +1098,15 @@ export class RunRunner {
         // PRD #1349 M2 (D4.5): before this live worker cleans its clone, disposition its exact
         // generation hold. A steering-cancel and an early agent failure both land here (a cancel
         // aborts the controller with the same error, then reports failed), and neither reaches
-        // the finalization pin — so without this the empty hold leaks. The agent tree was already
-        // reaped by the executor's run() finally before this catch, so the credentialed
-        // fresh-forge comparison is safe: a provably empty run RELEASES its exact hold, a run
-        // that committed work then failed CAPTURES it, and a failed/unverifiable comparison
-        // RETAINS — never a wrong release. A pre-clone failure has no restore-point head and
-        // no-ops. Best-effort.
-        await this.settleRecoveryGeneration(claim, flight, runLog);
+        // the finalization pin — so without this the empty hold leaks. The credentialed
+        // fresh-forge comparison MUST run reaped, so REAP FIRST (F2): a Claude/SDK run self-reaps
+        // in its run() finally, but a Codex run does NOT (killAgentTree is a no-op and its provider
+        // root is disposed only in this method's `finally`, AFTER this catch), so a bare settle
+        // here would race a still-alive Codex provider — reapThenSettleRecoveryGeneration reaps
+        // Codex-aware first. A provably empty run then RELEASES its exact hold, a run that committed
+        // work then failed CAPTURES it, and a failed/unverifiable comparison RETAINS — never a
+        // wrong release. A pre-clone failure has no clone and no-ops. Best-effort.
+        await this.reapThenSettleRecoveryGeneration(claim, flight, runLog, "terminal");
       }
     } finally {
       // PRD #1171 m4 (F1): the FINAL Codex registry disposal, after EVERY durability sink has
@@ -1281,11 +1296,17 @@ export class RunRunner {
       const status = (body as { status?: string }).status;
       try {
         if (status === "completed") {
-          // A completed FULL publication releases this generation's exact hold. Only the
-          // finalization pin (recoveryRecord) proves a code-publishing run reached this
-          // boundary; a no-code `completed` (report_only / not_code / scope-capped-empty)
-          // never pinned, and the server reconciler releases its completed-generation hold.
-          if (!recoveryRecord) return;
+          // A completed run published its head (a full publication) OR committed nothing (a
+          // no-code completion: report_only / not_code / scope-capped-empty). EITHER way this
+          // generation's custody is settled by RELEASING its exact hold. recoveryRecord is set
+          // only for a code-publishing run that reached the finalization pin; a no-code completion
+          // returns BEFORE that pin, but recordRecoveryGenerationEvidence ALREADY pinned an early
+          // generation-evidence record after clone, so releasing here is what settles it —
+          // otherwise the leaked `pinned` record survives and a restart's resumePending sweep
+          // escalates it to a FALSE needs_action. Guard on the code-publishing kind so a non-code
+          // kind (chat/judge), which never pins, stays a no-op; release is best-effort/idempotent
+          // and a disabled coordinator no-ops it.
+          if (!isCodePublishingKind(resolveRunKind(claim.kind))) return;
           await this.recovery.release(claim.run_id, claim.claim_generation);
         } else if (status === "failed" || status === "cancelled") {
           const capBarePath = flight.barePath;
@@ -4526,6 +4547,51 @@ export class RunRunner {
   }
 
   /**
+   * PRD #1349 M2 (F2) — reap the agent tree (Codex-aware) BEFORE the credentialed
+   * {@link settleRecoveryGeneration}, then settle. Every credentialed settle site that is NOT
+   * already behind a reap MUST go through this. settle does a PAT-bearing fresh-forge fetch, and
+   * for a CODEX run the provider root is torn down only in executeClaim's `finally` (the FINAL
+   * registry disposal, AFTER these catch/handler paths) while `killAgentTree` is a NO-OP — so a
+   * bare settle here would race a still-alive Codex provider subprocess, the exact
+   * PAT-in-/proc/environ exposure the reap exists to prevent. `reapForSink` reaps via
+   * `killAgentTree` for Claude/stub and via `withBoundary` quiesce+reap for Codex (the SAME
+   * mechanism the limit-park sink uses), so the fetch always runs reaped; the settle then runs
+   * AFTER the boundary releases (mirroring the park path), and the provider stays dead because the
+   * agent run has already returned. The finally's FINAL registry disposal is unaffected —
+   * `withBoundary` reaps the roots but does NOT dispose the registry, and disposeTools is
+   * idempotent. Best-effort: on ANY reap failure (incl. a blocked Codex boundary) it RETAINS the
+   * hold and skips the credentialed fetch rather than run it un-reaped, and never disturbs the
+   * run's terminal/park reporting.
+   */
+  private async reapThenSettleRecoveryGeneration(
+    claim: ClaimResponse,
+    flight: RunFlight,
+    runLog: Logger,
+    boundary: BoundaryRequest["boundary"],
+  ): Promise<void> {
+    if (!this.recovery.enabled) return; // token-less harness: no credentialed settle, no reap needed
+    if (!isCodePublishingKind(resolveRunKind(claim.kind))) return;
+    if (!flight.barePath) return; // no clone → nothing to settle, so nothing to protect
+    try {
+      await this.reapForSink(
+        flight.executor,
+        { boundary, deadlineMs: this.codexBoundaryDeadlineMs },
+        async () => {
+          // Empty body: the reap itself is the point. The credentialed settle runs OUTSIDE the
+          // boundary below (mirroring the park path), after the provider root is reaped.
+        },
+      );
+    } catch (err) {
+      runLog.warn("recovery: pre-settle reap failed; retaining the generation hold (reporting unaffected)", {
+        run_id: claim.run_id,
+        error: errMessage(err),
+      });
+      return; // provider not confirmed reaped → do NOT run the credentialed fetch
+    }
+    await this.settleRecoveryGeneration(claim, flight, runLog);
+  }
+
+  /**
    * #1197, verified 2026-09-08: keep the execution and steering poller active
    * while retrying local capture, and report a promotable recovery_wait ONLY
    * after current HEAD is verified in the worker-owned tracking ref. A failed
@@ -4584,9 +4650,13 @@ export class RunRunner {
               flight.preserveSession = false;
               // PRD #1349 M2 (D4.5): a cancel that terminates the recovery loop cleans the clone
               // like any other terminal exit, so disposition this generation's hold first. The
-              // agent tree was reaped at the top of this handler, so the fresh-forge comparison is
-              // safe: verified-empty releases, committed work captures, a failed comparison retains.
-              await this.settleRecoveryGeneration(claim, flight, runLog);
+              // credentialed fresh-forge comparison MUST run reaped: the killAgentTree at the top
+              // of this handler reaps Claude/stub but is a NO-OP for Codex (whose provider root is
+              // disposed only in executeClaim's finally, and captureRecoveryRestorePoint's reap may
+              // not have run yet on a cancel that arrives before the first capture attempt), so REAP
+              // FIRST (F2). Then verified-empty releases, committed work captures, a failed
+              // comparison retains.
+              await this.reapThenSettleRecoveryGeneration(claim, flight, runLog, "terminal");
               return false;
             }
             if (ack.status && ack.status !== "running") return false;
@@ -4643,14 +4713,16 @@ export class RunRunner {
                   : "paused to recover from an empty model result; the recovery checkpoint is saved on this worker and it resumes automatically",
               },
             });
-            // PRD #1349 M2 (D3/D4): settle THIS generation's hold before the requeue. The agent
-            // tree was reaped at the top of this handler, so the credentialed fresh-forge
-            // comparison is safe: a verified-empty restore point releases the exact hold (so a
-            // repeated verified-empty recovery_wait cycle grows no unresolved custody), committed
-            // work is promoted into the generation-bound archive, and a failed/unverifiable
-            // comparison retains. Runs AFTER the park ack lands, mirroring the finalization
-            // terminal drive; best-effort so it never disturbs the reported park.
-            await this.settleRecoveryGeneration(claim, flight, runLog);
+            // PRD #1349 M2 (D3/D4): settle THIS generation's hold before the requeue. The
+            // credentialed fresh-forge comparison MUST run reaped: the killAgentTree at the top of
+            // this handler is a NO-OP for Codex (whose provider root is disposed only in
+            // executeClaim's finally), so REAP FIRST (F2) — Codex-aware, idempotent with the reap
+            // captureRecoveryRestorePoint already did. Then a verified-empty restore point releases
+            // the exact hold (so a repeated verified-empty recovery_wait cycle grows no unresolved
+            // custody), committed work is promoted into the generation-bound archive, and a
+            // failed/unverifiable comparison retains. Runs AFTER the park ack lands, mirroring the
+            // finalization terminal drive; best-effort so it never disturbs the reported park.
+            await this.reapThenSettleRecoveryGeneration(claim, flight, runLog, "shutdown");
             return true;
           }
           if (ack.status && ack.status !== "running") {
