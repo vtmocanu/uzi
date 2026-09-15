@@ -1098,15 +1098,15 @@ export class RunRunner {
         runLog.info("run claim superseded server-side (stale_claim); stopping this flight");
         await batcher.close().catch(() => undefined);
       } else if (err instanceof CredentialSwitchSignal) {
-        // PRD #1247 M5b: a held-state credential switch tripped — from a live turn (the SDK abort /
-        // re-armable interrupt trips driveTurn, which throws CredentialSwitchSignal that propagates
-        // through the implement loop's turn-catch, mirroring PauseNowSignal's plan-turn path at
-        // ~1067) OR from a run idling at the plan gate / a question / a follow-up (steering rejected
-        // the parked waiter with CredentialSwitchSignal). Caught here BEFORE the generic terminal
-        // path so a switch NEVER becomes a `failed` run. Enter the two-phase local release; the
-        // outcome decides nothing more than which log line — enterCredentialSwitch already set the
-        // flight's flags and (on release) reported credential_switch, so NEITHER branch reports a
-        // terminal state.
+        // PRD #1247 M5b (data-integrity fix): a SAFETY NET. The switch is now handled IN PLACE by the
+        // executor via ctx.attemptCredentialSwitch — the implement loop's turn catch and each idle
+        // held-state waiter (plan gate / question / follow-up) call it and, on a give-up, CONTINUE the
+        // run on the old token rather than letting the CredentialSwitchSignal reach here. So this arm
+        // only fires when the signal escaped that in-place handling: a stub/test executor that does
+        // NOT wire attemptCredentialSwitch (it re-throws), or a switch tripping some await not wrapped
+        // at B/C. Caught here BEFORE the generic terminal path so a switch NEVER becomes a `failed`
+        // run. Enter the same two-phase release; enterCredentialSwitch already set the flight's flags
+        // and (on release) reported credential_switch, so NEITHER branch reports a terminal state.
         const outcome = await this.enterCredentialSwitch(claim, flight, runLog);
         if (outcome === "released") {
           // The flight ends: the finally retires the clone and preserves the HOME; the server
@@ -1114,12 +1114,16 @@ export class RunRunner {
           // terminal report — enterCredentialSwitch already reported credential_switch.
           runLog.info("credential switch released this claim; leaving the run for a reclaim on the new token");
         } else {
-          // Gave up (never verified, or the release was not acked queued): leave the run
-          // non-terminal for requeue, exactly like the worker-shutdown-interrupt arm — preserveSession
-          // + preserveRecoveryClone are already set, and NO terminal report is made. The standing
-          // override still applies, so the requeued run's reclaim spends the new token.
+          // GAVE UP and the signal reached HERE (not the in-place continue at B/C), so the executor
+          // has already unwound and cannot continue on the old token. Make it CONTINUE-SAFE the only
+          // way possible from here: NO terminal `failed` report (a switch must never fail a healthy
+          // run), and KEEP both preserve flags (enterCredentialSwitch left them set on give-up) so the
+          // run is left NON-TERMINAL with its clone + HOME retained for a requeue — the same posture as
+          // the worker-shutdown-interrupt arm. The standing override still points at the new token, so
+          // the requeued run's reclaim spends it. (After B/C this arm is a last resort — a running
+          // give-up continues in place and never reaches here.)
           runLog.info(
-            "credential switch did not release the claim; leaving the run non-terminal for requeue on the standing override",
+            "credential switch did not release the claim and reached the outer catch; leaving the run non-terminal for requeue on the standing override",
           );
         }
         await batcher.close().catch(() => undefined); // idempotent (enterCredentialSwitch may have drained)
@@ -1474,6 +1478,23 @@ export class RunRunner {
       runLog.info("run entered the completion hold; skipping finalization", {
         run_id: runId,
         reason: result.completionHeld.reason,
+      });
+      return;
+    }
+    // PRD #1247 M5b (data-integrity fix): a held-state credential switch RELEASED the claim IN PLACE
+    // (ctx.attemptCredentialSwitch → "released"). enterCredentialSwitch already drained the batcher,
+    // reported credential_switch (queued ack), cleared preserveRecoveryClone + set parked, and the
+    // server requeued the run for a reclaim at resume_phase on the newly-chosen token. Like the pause
+    // park and the completion hold above, the run is non-terminal and already handled, so there is
+    // NOTHING to finalize (no push, no MR, no completion report). Reap + close the batcher
+    // (idempotent — the release already drained it) and return; the finally retires the clone
+    // (preserveRecoveryClone cleared) and preserves the HOME (parked) for the same-worker resume.
+    // Keyed on the executor's result so no non-release path can reach this branch.
+    if (result.switchReleased) {
+      executor.killAgentTree?.();
+      await closeBatcher().catch(() => undefined);
+      runLog.info("run released for a credential switch in place; skipping finalization", {
+        run_id: runId,
       });
       return;
     }
@@ -3602,6 +3623,26 @@ export class RunRunner {
       // resume_phase ⇒ undefined (a fresh run, or an older server), which the executor treats as
       // today's behaviour.
       onCredentialSwitch: (cb) => steering.onCredentialSwitch(cb),
+      // PRD #1247 M5b (data-integrity fix): attempt the held-state credential switch IN PLACE from
+      // wherever the executor was when it tripped (a live implement turn, or an idle gate/question/
+      // follow-up waiter), INSTEAD of letting the CredentialSwitchSignal reach the outer catch and
+      // end the flight while the run is still healthy (which no sweep requeues → a RUN_TIMEOUT
+      // orphan for a running give-up, a strand-until-restart for a held one). Delegates to the SAME
+      // two-phase enterCredentialSwitch the outer catch uses. On a GIVE-UP the run CONTINUES on the
+      // old token in place, so CLEAR the preserve flags enterCredentialSwitch set up front (its
+      // step 2) — a later NORMAL completion must clean up the clone + HOME as usual, not preserve
+      // them (D3/D14). On a RELEASE they are already correct (parked=true, preserveRecoveryClone=
+      // false) so the finally retires the clone and keeps the HOME for resume. The clear lives HERE,
+      // not inside enterCredentialSwitch, because the outer-catch safety net cannot continue in
+      // place and must KEEP the flags to leave the run non-terminal for a requeue.
+      attemptCredentialSwitch: async () => {
+        const outcome = await this.enterCredentialSwitch(claim, flight, runLog);
+        if (outcome === "gave_up") {
+          flight.preserveRecoveryClone = false;
+          flight.preserveSession = false;
+        }
+        return outcome;
+      },
       resumePhase: claim.resume_phase,
       // Persist the SDK session id the moment the executor learns it, so a
       // re-queued run can resume it. Best-effort.

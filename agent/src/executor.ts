@@ -416,6 +416,30 @@ export interface RunContext {
    */
   onCredentialSwitch?(cb: () => void): void;
   /**
+   * PRD #1247 M5b (data-integrity fix): attempt the held-state credential switch IN PLACE, driven
+   * from wherever the run was when the switch tripped — the implement loop's turn catch (a live
+   * turn), or one of the idle held-state waiters (the plan gate, an ask_user question, an
+   * interactive follow-up). Called INSTEAD of letting the CredentialSwitchSignal propagate to the
+   * runner's outer catch, so a GIVE-UP keeps the run running rather than ending the flight while it
+   * is still healthy (which no sweep requeues → RUN_TIMEOUT orphan / held-state strand).
+   *
+   * The runner wires it to `enterCredentialSwitch` (the same two-phase state machine the outer catch
+   * uses). Two outcomes:
+   *   - `"released"` — a VERIFIED capture + a `queued` release ack: the switch already drained the
+   *     batcher, reported `credential_switch`, and parked the HOME; the server requeued the run for a
+   *     reclaim at resume_phase on the newly-chosen token. The caller surfaces
+   *     {@link ExecutorResult.switchReleased} and ENDS (no more turns) so the runner skips finalize.
+   *   - `"gave_up"` — the capture never verified (or the release was not acked): the run CONTINUES on
+   *     the OLD token in place (a restarted turn, or a re-presented gate/question/follow-up wait). The
+   *     server already cleared the switch stamp, and the runner cleared the flight's preserve flags so
+   *     a later NORMAL completion cleans up as usual. This is the fall-through the PRD requires
+   *     (D3/D14), exactly like a declined `now` pause continues rather than parks.
+   *
+   * Absent on the stub/test executors ⇒ the loop/waiters re-throw the CredentialSwitchSignal to the
+   * runner's outer catch, byte-identical to the pre-fix behaviour.
+   */
+  attemptCredentialSwitch?(): Promise<"released" | "gave_up">;
+  /**
    * PRD #517 M3: park an INTERACTIVE task run after a clean `signal_done`, waiting for the
    * next follow-up. The runner's implementation (a) reports `awaiting_followup` and verifies
    * the ack (the park must actually take, mirroring askUser's ack check), then (b) blocks on
@@ -575,6 +599,16 @@ export interface ExecutorResult {
    *  (the seam is unwired, so the executor falls back to the legacy throw). StubExecutor never
    *  sets it. */
   completionHeld?: { reason: string };
+  /** PRD #1247 M5b (data-integrity fix): set when a held-state credential switch RELEASED the claim
+   *  IN PLACE — `ctx.attemptCredentialSwitch` returned "released" from the implement loop, the plan
+   *  gate, an ask_user question, or an interactive follow-up wait. The switch already drained the
+   *  batcher, reported `credential_switch`, got the `queued` ack, and parked the HOME; the server
+   *  requeued the run for a reclaim at resume_phase on the newly-chosen token. The runner reads it in
+   *  phasePublish to SKIP finalization (no push, no MR, no completion report) exactly like
+   *  `pausedAt`/`completionHeld` — the run is already non-terminal and requeued, and the finally
+   *  retires the clone while preserving the HOME. Absent on every normal completion and on a give-up
+   *  (which CONTINUES the run). StubExecutor never sets it. */
+  switchReleased?: boolean;
 }
 
 /**

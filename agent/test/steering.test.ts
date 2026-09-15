@@ -330,6 +330,25 @@ describe("SteeringChannel — credential switch (PRD #1247 M5b)", () => {
     await assert.rejects(parked, (e) => e instanceof CredentialSwitchSignal);
     await ch.stop();
   });
+
+  it("rejects a parked interactive follow-up waiter (a task run idling between turns) with a CredentialSwitchSignal", async () => {
+    // The audit flagged the follow-up waiter as untested for the switch: an interactive task run
+    // parked at awaitFollowUp has no live SDK turn to abort, so — like the gate and answer waiters —
+    // the parked promise itself must reject with a CredentialSwitchSignal so the executor's
+    // follow-up-wait switch handling (runThroughSwitch) can release or re-park it.
+    const ch = new SteeringChannel(
+      switchClient([{ credentialSwitch: { generation: 7 } }]),
+      "run-1",
+      1,
+      nullLogger(),
+      new AbortController(),
+      { claimGeneration: 7 },
+    );
+    const parked = ch.awaitFollowUp(60_000);
+    ch.start();
+    await assert.rejects(parked, (e) => e instanceof CredentialSwitchSignal);
+    await ch.stop();
+  });
 });
 
 // issue #559 M2: the channel tracks the highest follow_up input id it has already DELIVERED
