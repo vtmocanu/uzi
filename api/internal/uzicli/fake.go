@@ -105,12 +105,16 @@ type FakeClient struct {
 	// LastCreateSeed captures PRD #209's optional seeded plan (nil when the run was
 	// created without --plan-file), so a test can assert the plan body and the roster
 	// the CLI forwarded — the assertion M3's flag parsing is proven against.
-	LastCreateSeed     *CreateRunSeed
-	InputResp          apitypes.RunInputResponse
-	LastInputRunID     string
-	LastInputKind      string
-	LastInputBody      string
-	LastInputSelection *apitypes.AgentSelection
+	LastCreateSeed *CreateRunSeed
+	// LastCreateCredOverride captures PRD #1247 M2's create-time credential choice (nil when
+	// --token was omitted), so a test can assert the CLI resolved a label to {pinned,
+	// secret_id} client-side and sent auto/default/inherit as a bare mode.
+	LastCreateCredOverride *CreateRunCredentialOverride
+	InputResp              apitypes.RunInputResponse
+	LastInputRunID         string
+	LastInputKind          string
+	LastInputBody          string
+	LastInputSelection     *apitypes.AgentSelection
 
 	// CreateTaskRun / DispatchTaskRun capture (PRD #400 M3). CreatedTaskRun is the
 	// canned create reply (its Branch is what the handoff command pushes to);

@@ -78,6 +78,18 @@ var (
 	ErrCredentialOverrideInvalidMode        = errors.New("invalid credential override mode")
 )
 
+// ResolveCredentialOverride is the EXPORTED entry point every override write outside this
+// package runs through (PRD #1247 M2): the handler (a different package) has no access to
+// the unexported validateCredentialOverride, so this thin wrapper is its door. It performs
+// no work of its own beyond delegating — the validation, the D9/D10 refusals and the
+// column resolution all live in the one validator — and returns the same resolved
+// *CredentialOverride (nil = inherit) or one of the exported typed refusals the handler
+// maps to HTTP statuses (404/409/422/400). Wired by CreateRun in M2 and by run set-token /
+// schedule create-edit in M4/M6.
+func (s *Service) ResolveCredentialOverride(ctx context.Context, userID uuid.UUID, kind, harness, mode string, secretID *uuid.UUID) (*CredentialOverride, error) {
+	return s.validateCredentialOverride(ctx, userID, kind, harness, mode, secretID)
+}
+
 // validateCredentialOverride is the ONE validator every override write runs through
 // (PRD #1247 M1) — at run create, run approve --token, run set-token, and schedule
 // create/edit (the handlers wire it in M2/M4/M6; M1 provides the function and its

@@ -85,6 +85,18 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 		// force" — and it never affects the active-run gate. The CLI `uzi run create --force`
 		// sets it (m2); the web board start button omits it.
 		Force bool `json:"force"`
+		// PRD #1247 M2: the create-time per-run Anthropic credential choice. A POINTER so
+		// its ABSENCE (the web board start button, the Slack/web chat start card, and any
+		// pre-#1247 client) stays distinct from a present choice: nil ⇒ send no override ⇒
+		// the run inherits the worker binding, byte-identical to today. When present, Mode
+		// is one of pinned/auto/default/inherit and SecretID (a *string, so it is optional
+		// and set only for a pinned choice) names the caller's own anthropic_token. The
+		// choice is validated + resolved below through the one validator (D5/D9/D10); the
+		// web start-dialog picker is M7 and schedule --token is M6.
+		CredentialOverride *struct {
+			Mode     string  `json:"mode"`
+			SecretID *string `json:"secret_id"`
+		} `json:"credential_override"`
 	}
 	if err := httpx.DecodeJSON(r, &req); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
@@ -132,15 +144,93 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// PRD #1247 M2: resolve the create-time credential override (D5/D9/D10) BEFORE the
+	// forge round-trip and the insert, so an invalid choice never creates a run. Absent ⇒
+	// nil ⇒ inherit the worker binding (the web board / chat start card path, unchanged).
+	var credOverride *workersvc.CredentialOverride
+	if req.CredentialOverride != nil {
+		var secretID *uuid.UUID
+		if req.CredentialOverride.SecretID != nil {
+			id, perr := uuid.Parse(strings.TrimSpace(*req.CredentialOverride.SecretID))
+			if perr != nil {
+				httpx.Error(w, http.StatusBadRequest, "credential_override.secret_id must be a valid uuid")
+				return
+			}
+			secretID = &id
+		}
+		// The effective harness of a NEW issue run is the user's default_harness (else
+		// claude): there is no runs.harness row yet (D9's "runs.harness, else
+		// users.default_harness"). Only a codex effective harness is refused (422), so any
+		// other value resolves to claude.
+		harness, herr := h.createRunEffectiveHarness(r.Context(), user.ID)
+		if herr != nil {
+			slog.Error("resolve create-time harness", "error", herr)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		resolved, verr := h.wsvc.ResolveCredentialOverride(r.Context(), user.ID, runkind.Issue, harness, req.CredentialOverride.Mode, secretID)
+		if verr != nil {
+			h.writeCredentialOverrideError(w, verr)
+			return
+		}
+		credOverride = resolved
+	}
+
 	// The forge GetIssue snapshot, the uzi-label eligibility gate and the description
 	// cap all live inside StartRunForUser (PRD #191 M1), shared with the Slack/web chat
 	// start-run card.
-	run, err := h.wsvc.StartRunForUser(r.Context(), user.ID, repo.ID, req.IssueIID, req.WaitOnLimit, req.MrReworkEnabled, req.Force, seed)
+	run, err := h.wsvc.StartRunForUser(r.Context(), user.ID, repo.ID, req.IssueIID, req.WaitOnLimit, req.MrReworkEnabled, req.Force, seed, credOverride)
 	if err != nil {
 		h.writeStartRunError(w, r, err)
 		return
 	}
 	httpx.JSON(w, http.StatusCreated, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock())})
+}
+
+// createRunEffectiveHarness resolves the effective harness of a NEW issue run for the
+// credential-override validator (PRD #1247 M2, D9). A run being created has no runs.harness
+// row yet, so the effective harness is the user's persisted default_harness, else claude —
+// the same "runs.harness, run_schedules.harness, else users.default_harness" fallback the
+// one validator's contract names, applied to the create case where the first two do not yet
+// exist. Only a codex effective harness is refused (422); every other value (including the
+// common NULL default) resolves to claude, so the fallback is the safe direction.
+func (h *Handler) createRunEffectiveHarness(ctx context.Context, userID uuid.UUID) (string, error) {
+	raw, err := h.q.GetUserDefaultHarness(ctx, userID)
+	if err != nil {
+		return "", err
+	}
+	if raw.Valid && raw.String == string(workersvc.HarnessCodex) {
+		return string(workersvc.HarnessCodex), nil
+	}
+	return string(workersvc.HarnessClaude), nil
+}
+
+// writeCredentialOverrideError maps the one validator's typed refusals to HTTP statuses
+// (PRD #1247, D6/D9/D10). Shared by the create path (M2) and reused by run set-token (M4)
+// and schedule create/edit (M6): the mapping lives in one place so the four override write
+// surfaces cannot drift in how they classify the same refusal.
+//
+//   - ErrCredentialOverrideSecretNotFound     → 404 (foreign / deleted / wrong-kind id)
+//   - ErrCredentialOverrideLaneNotSwitchable  → 409 (chat/judge/self_improve lane, D10)
+//   - ErrCredentialOverrideHarnessUnsupported → 422 (codex effective harness, D9)
+//   - ErrCredentialOverridePinnedNeedsSecret  → 400 (pinned with no id)
+//   - ErrCredentialOverrideInvalidMode        → 400 (mode outside the closed set)
+func (h *Handler) writeCredentialOverrideError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, workersvc.ErrCredentialOverrideSecretNotFound):
+		httpx.Error(w, http.StatusNotFound, "credential override token not found")
+	case errors.Is(err, workersvc.ErrCredentialOverrideLaneNotSwitchable):
+		httpx.Error(w, http.StatusConflict, "this run's lane does not support a credential override")
+	case errors.Is(err, workersvc.ErrCredentialOverrideHarnessUnsupported):
+		httpx.Error(w, http.StatusUnprocessableEntity, "a credential override is not supported on the codex harness")
+	case errors.Is(err, workersvc.ErrCredentialOverridePinnedNeedsSecret):
+		httpx.Error(w, http.StatusBadRequest, "a pinned credential override requires a token")
+	case errors.Is(err, workersvc.ErrCredentialOverrideInvalidMode):
+		httpx.Error(w, http.StatusBadRequest, "credential override mode must be one of pinned, auto, default or inherit")
+	default:
+		slog.Error("resolve credential override", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+	}
 }
 
 // CreateTaskRunRequest is the POST /repos/{id}/task-runs body (PRD #400): the inline

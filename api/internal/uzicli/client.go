@@ -240,7 +240,12 @@ type Client interface {
 	// before), and a non-nil seed always carries a plan (the server rejects a
 	// selection with no plan). The plan's size cap and empty-plan rejection are the
 	// SERVER's (422) — the client forwards the bytes so those rules live in one place.
-	CreateRun(ctx context.Context, repoID string, issueIID int64, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *CreateRunSeed) (apitypes.RunDTO, error)
+	//
+	// credOverride is PRD #1247 M2's create-time per-run credential choice (`--token`): nil
+	// OMITS the credential_override key (inherit the worker binding); a present override
+	// carries {mode, secret_id?}. The label→id resolution for a pinned choice happens
+	// CLIENT-SIDE before this call, so the server receives an id, not a label.
+	CreateRun(ctx context.Context, repoID string, issueIID int64, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *CreateRunSeed, credOverride *CreateRunCredentialOverride) (apitypes.RunDTO, error)
 	// CreateTaskRun queues an issue-less handoff/task run on a repo (PRD #400 M3):
 	// POST /api/repos/{id}/task-runs {context, base_branch?, open_mr}. The server
 	// names the branch (uzi/task/<run-id>) and the created-run response carries it in
