@@ -204,6 +204,15 @@ export function decodeResult(msg: Record<string, unknown>): {
   outcome: "success" | "failed";
   subtype: string;
   errors: readonly string[];
+  // issue #1088: raw provider-error signal for a transient-outage classification.
+  // A 529 (and its 429/5xx siblings) arrives as a `subtype:"success"` frame with
+  // `is_error:true`, `api_error_status` set, `terminal_reason:"api_error"`, and the
+  // human text in `result` (its `errors` array is EMPTY). These three are OPTIONAL
+  // additions so the reducer's hand-built `projectResult({outcome,subtype,errors,wire})`
+  // argument still type-checks unchanged.
+  apiErrorStatus?: number | null;
+  resultText?: string;
+  terminalReason?: string;
   wire: {
     usage: unknown;
     modelUsage: unknown;
@@ -219,10 +228,24 @@ export function decodeResult(msg: Record<string, unknown>): {
     outcome === "failed" && Array.isArray(msg["errors"])
       ? (msg["errors"] as unknown[]).map(String)
       : [];
+  // `api_error_status` is `number | null` on the SDK frame: a number is a real HTTP
+  // status, null is a status-less api error (transport/network), absent → undefined.
+  const rawApiErrorStatus = msg["api_error_status"];
+  const apiErrorStatus =
+    typeof rawApiErrorStatus === "number"
+      ? rawApiErrorStatus
+      : rawApiErrorStatus === null
+        ? null
+        : undefined;
   return {
     outcome,
     subtype,
     errors,
+    apiErrorStatus,
+    // `result` is only meaningful on the failed path — on a success frame it is the
+    // final assistant text, not an error — mirroring the existing `errors` guard.
+    resultText: outcome === "failed" ? asString(msg["result"]) : undefined,
+    terminalReason: asString(msg["terminal_reason"]),
     wire: {
       usage: msg["usage"],
       modelUsage: msg["modelUsage"],
@@ -231,6 +254,31 @@ export function decodeResult(msg: Record<string, unknown>): {
       total_cost_usd: msg["total_cost_usd"],
     },
   };
+}
+
+/**
+ * issue #1088: compose a readable, provider-transient failure message from the raw
+ * api-error signal. Shared by claude-harness.ts's `materialize` (the NO-LIMIT branch)
+ * and sdk-executor.ts's `ProviderTransientError` default message so both read
+ * identically. Always begins `provider error:` (so it can NEVER equal or be just
+ * "success"), includes the numeric status when present, and appends the human text
+ * derived from the result frame's `result` (first non-empty line, `API Error:`
+ * wrapper stripped so the status is not duplicated, capped at 200 chars).
+ * e.g. `provider error: 529 Overloaded. This is a server-side issue…`,
+ * `provider error: 401 Unauthorized`, or `provider error: 503` when no text is given.
+ */
+export function providerErrorMessage(
+  status: number | null | undefined,
+  resultText: string | undefined,
+): string {
+  const firstLine =
+    resultText?.split("\n").map((l) => l.trim()).find((l) => l.length > 0) ?? "";
+  const text = firstLine.replace(/^api error:\s*/i, "").slice(0, 200).trim();
+  const statusStr = status != null ? String(status) : "";
+  // Do not repeat the status if the human text already leads with it.
+  const needStatus = statusStr !== "" && !text.startsWith(statusStr);
+  const body = [needStatus ? statusStr : "", text].filter((s) => s.length > 0).join(" ");
+  return body.length > 0 ? `provider error: ${body}` : "provider error";
 }
 
 /** Map an assistant frame's content blocks (text / thinking / tool_use). */

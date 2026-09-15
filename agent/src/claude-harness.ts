@@ -40,6 +40,7 @@ import {
   decodeUserItems,
   orphanInstanceKind,
   promptStream,
+  providerErrorMessage,
   sessionIdOf,
 } from "./sdk-messages.js";
 import { isSignalToolName, isSubagentFrame, scanSignals } from "./signals.js";
@@ -420,10 +421,12 @@ function markSignals(items: HarnessItem[]): void {
  * Build the neutral terminal record for a result frame. The DISPLAY subtype and
  * the wire capsule come from the shared decode; the RAW `subtype ?? "unknown"`
  * value is retained ONLY inside the materialize closure (never the display-
- * stringified one), which reconstructs today's exact typed exception at the
- * owner's classification point — the limit exception with facts, else the generic
- * `agent run failed: ${subtype}`. materialize may throw during malformed-value
- * conversion, at that call site, never here during decode.
+ * stringified one), which reconstructs the typed exception at the owner's
+ * classification point — the limit exception with facts, else (issue #1088) an
+ * accurate message that is a readable `provider error: <status> <text>` for an
+ * api-error terminal, `agent run failed: ${subtype}` for a genuine error subtype,
+ * and NEVER the self-contradictory `agent run failed: success`. materialize may
+ * throw during malformed-value conversion, at that call site, never here during decode.
  */
 function buildTerminal(
   msg: Record<string, unknown>,
@@ -434,6 +437,11 @@ function buildTerminal(
   // compile-time only, `??` catches null/undefined, so a non-string truthy subtype
   // (e.g. `false`) is retained verbatim for the presence/truthiness decision.
   const rawSubtype: string = (msg["subtype"] as string) ?? "unknown";
+  // issue #1088 (defect 2): the NO-LIMIT materialize below must NEVER produce the
+  // self-contradictory `agent run failed: success` — a 529 arrives as a
+  // `subtype:"success"` api-error frame, so `rawSubtype` is literally "success". Capture
+  // the raw provider signal (and the error array) so the message is composed accurately.
+  const { resultText, apiErrorStatus, terminalReason, errors } = decoded;
 
   const limitEvidence: HarnessLimitEvidence = {
     explicitExhaustion: isExplicitLimitReason(msg["terminal_reason"]),
@@ -451,6 +459,11 @@ function buildTerminal(
     outcome: decoded.outcome,
     subtype: decoded.subtype,
     errors: decoded.errors,
+    // issue #1088: carry the raw provider-error signal so the executor can classify a
+    // transient provider outage and route it to the recovery_wait park.
+    apiErrorStatus: decoded.apiErrorStatus,
+    resultText: decoded.resultText,
+    terminalReason: decoded.terminalReason,
     usage: {
       basis: "session",
       tokens: {},
@@ -478,7 +491,22 @@ function buildTerminal(
             original,
           };
         }
-        const original = new Error(`agent run failed: ${rawSubtype}`);
+        // issue #1088 (defect 2): compose an accurate message that can never be (or be
+        // just) "success". Ordering:
+        //  1. an api error → a readable `provider error: <status> <text>` (the 529 path);
+        //  2. else a genuine, informative subtype → keep `agent run failed: ${rawSubtype}`
+        //     (preserves the existing `error_max_turns` behavior);
+        //  3. else the first String-mapped provider error, if any;
+        //  4. else a non-empty fallback (never bare "unknown", never "success").
+        const isApiError = terminalReason === "api_error" || apiErrorStatus != null;
+        const message = isApiError
+          ? providerErrorMessage(apiErrorStatus, resultText)
+          : rawSubtype && rawSubtype !== "success" && rawSubtype !== "unknown"
+            ? `agent run failed: ${rawSubtype}`
+            : errors.length > 0
+              ? `agent run failed: ${errors[0]}`
+              : "agent run failed: unknown error";
+        const original = new Error(message);
         return {
           failure: { category: "unknown", message: original.message },
           original,

@@ -91,7 +91,7 @@ import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-
 import { qualifiedSkillName, type SkillDrop } from "./skills-plugin.js";
 import { prepareSkillPlugin, resolveSkillCaps } from "./skills-run.js";
 import { killProcessGroup, spawnDetached } from "./sdk-spawn.js";
-import { defaultQueryFn } from "./sdk-messages.js";
+import { defaultQueryFn, providerErrorMessage } from "./sdk-messages.js";
 import { ClaudeHarness, type ClaudeTurnConfig } from "./claude-harness.js";
 import { RunTurnReducerImpl } from "./harness-reducer.js";
 import type {
@@ -210,6 +210,57 @@ export class TransientRecoveryError extends Error {
     super(message);
     this.name = "TransientRecoveryError";
   }
+}
+
+/**
+ * issue #1088: a single Anthropic SDK turn ended in a TRANSIENT provider error
+ * (429/500/502/503/529/overloaded, or a status-less transport api error). Thrown on
+ * driveTurn's failed-terminal throw-path (in place of materializing the generic
+ * `Error(provider error: …)`), caught by {@link SdkExecutor.driveTurnWithEmptyRecovery}
+ * which retries it with the existing bounded in-process backoff and, on a sustained
+ * outage, escalates to {@link TransientRecoveryError} → the `recovery_wait` park —
+ * NEVER a work-destroying terminal `failed`. `status` and `sessionId` ride so the park
+ * preserves the session lineage on the throw path (the clean path carries it via
+ * `turn.sessionId`). The default message is composed like the materialize provider
+ * message (readable, contains the status, never "success").
+ */
+export class ProviderTransientError extends Error {
+  public readonly status?: number | null;
+  public readonly sessionId?: string;
+  constructor(
+    message = providerErrorMessage(undefined, undefined),
+    status?: number | null,
+    sessionId?: string,
+  ) {
+    super(message);
+    this.name = "ProviderTransientError";
+    this.status = status;
+    this.sessionId = sessionId;
+  }
+}
+
+/**
+ * issue #1088: whether a FAILED terminal is a TRANSIENT provider error that should be
+ * retried and, on a sustained outage, PARKED (recovery_wait) rather than terminal-failed.
+ *
+ * A guarded AND, deliberately NOT an OR: it requires `terminal_reason === "api_error"`
+ * AND a retryable status. Permanent api errors (401/403/400) are `api_error` too, so an
+ * OR — or dropping the status guard — would park them forever in the uncapped recovery
+ * park. Mirrors client.ts's `isTransient` (transport/network, 408, 429, ≥500 incl. 529);
+ * a status-less api_error is a transport/network failure and is retryable.
+ *
+ * Module-private (used only by driveTurn); the 529/401 behavior is proven end-to-end
+ * through `run()` in the tests rather than by a direct predicate call.
+ */
+function isProviderTransient(t: HarnessTerminal): boolean {
+  return (
+    t.outcome === "failed" &&
+    t.terminalReason === "api_error" &&
+    (t.apiErrorStatus == null ||
+      t.apiErrorStatus === 408 ||
+      t.apiErrorStatus === 429 ||
+      t.apiErrorStatus >= 500)
+  );
 }
 
 // PRD #517 M3/M5: the FALLBACK idle bound for an INTERACTIVE task's follow-up park — how
@@ -2991,6 +3042,11 @@ export class SdkExecutor implements Executor {
     reducer.beginTurn();
     let sawTerminal = false;
     let terminal: HarnessTerminal | undefined;
+    // issue #1088: the session id observed THIS turn (from the reducer's once-per-run
+    // first-session latch). On the clean path the reducer carries it via turn.sessionId;
+    // this is the throw-path analog, passed to a ProviderTransientError so the recovery
+    // park resumes the same session lineage.
+    let observedSessionId: string | undefined;
 
     this.armWall(state);
     // Budget already spent by earlier turns → fail now rather than run unbounded.
@@ -3023,6 +3079,8 @@ export class SdkExecutor implements Executor {
         // First-truthy session id once per run: the run callback, catch-and-warn
         // exactly as before (a handler throw must not fail the turn).
         if (reduction.firstSessionId !== undefined) {
+          // issue #1088: remember it for the ProviderTransientError throw-path resume.
+          observedSessionId = reduction.firstSessionId;
           try {
             ctx.onSessionId?.(reduction.firstSessionId);
           } catch (err) {
@@ -3063,13 +3121,29 @@ export class SdkExecutor implements Executor {
       if (sawTerminal && terminal && terminal.outcome === "failed") {
         // PRD #35: classify at the completion point with Date.now() (not earlier in
         // the stream). A usage-limit death materializes as the TYPED LimitReachedError
-        // carrying the normalized reset; everything else materializes as the generic
-        // `agent run failed: ${subtype}` collapse. The materializer retains the RAW
-        // subtype; malformed-value conversion throws HERE, at this call site.
+        // carrying the normalized reset; a genuine (non-transient) failure materializes
+        // via the closure into an accurate message (issue #1088: a readable
+        // `provider error: <status> <text>` for an api error, else
+        // `agent run failed: ${subtype}`, and NEVER `agent run failed: success`). The
+        // materializer retains the RAW subtype; malformed-value conversion throws HERE,
+        // at this call site.
         const limitFacts = classifyLimitEvidence(
           terminal.limitEvidence ?? { explicitExhaustion: false },
           Date.now(),
         );
+        // issue #1088: a usage-limit death (limitFacts) still wins and materializes the
+        // TYPED LimitReachedError. Otherwise, a TRANSIENT provider error (429/5xx/529 or
+        // a status-less transport api_error) is thrown as a ProviderTransientError so the
+        // recovery wrapper retries it and, on a sustained outage, PARKS via recovery_wait
+        // instead of terminal-failing. Permanent api errors (401/403/400) fail through
+        // materialize as before (isProviderTransient's status guard excludes them).
+        if (!limitFacts && isProviderTransient(terminal)) {
+          throw new ProviderTransientError(
+            providerErrorMessage(terminal.apiErrorStatus, terminal.resultText),
+            terminal.apiErrorStatus,
+            observedSessionId,
+          );
+        }
         const thrown = terminal.failure
           ? terminal.failure.materialize(limitFacts)
           : { original: new Error("agent run failed: unknown") };
@@ -3093,24 +3167,36 @@ export class SdkExecutor implements Executor {
   }
 
   /**
-   * issue #1197 (D-RC2b): drive one turn, then bounded/budget-safe/cancel-safe
-   * in-process retries when — and ONLY when — that turn returned POSITIVELY empty
-   * (0 turns, no model activity, no plan/questions/done). Every other return, including
-   * a turn that ran but did not submit a plan (which stays REASON_NO_PLAN in the caller)
-   * and a turn with MISSING metrics (numTurns undefined), returns unchanged.
+   * issue #1197 (D-RC2b) + issue #1088: drive one turn, then bounded/budget-safe/
+   * cancel-safe in-process retries when — and ONLY when — that turn either returned
+   * POSITIVELY empty (0 turns, no model activity, no plan/questions/done) OR threw a
+   * {@link ProviderTransientError} (a 429/5xx/529 or status-less transport api error).
+   * Every OTHER return or throw is unchanged: a turn that ran but did not submit a plan
+   * stays REASON_NO_PLAN in the caller, a turn with MISSING metrics returns unchanged,
+   * and a genuine (non-transient) failure re-throws to fail the run.
+   *
+   * BOTH driveTurn calls are inside the try/catch (issue #1088): the FIRST turn's
+   * transient throw must be caught here too — otherwise a first-turn ProviderTransientError
+   * would escape to runner.ts, which catches only TransientRecoveryError, and the run would
+   * FAIL instead of park.
    *
    * Invariants (the reason this is a wrapper, not inlined in driveTurn):
-   *  - A genuine cancel/idle/wall trip WINS: `state.tripReason` is thrown FIRST each
-   *    attempt and polled during the backoff, so a real trip keeps its existing
-   *    terminal/cancelled outcome and is NEVER reclassified as recovery.
+   *  - A genuine cancel/idle/wall trip WINS: `state.tripReason` is thrown FIRST — in the
+   *    catch of every drive AND before each backoff/re-drive — so a real trip keeps its
+   *    existing terminal/cancelled outcome and is NEVER reclassified as recovery.
+   *  - A LimitReachedError (usage-limit death) and any non-transient failure re-throw
+   *    unchanged — only a positively-empty turn or a ProviderTransientError is retried.
    *  - Budget exhaustion is NEVER a recovery trigger: the backoff is skipped once the
    *    wall is spent, and the next driveTurn's `armWall` trips REASON_WALL naturally —
    *    the genuine wall outcome, not a park. The between-turns wait is debited from the
    *    wall (disarmed between turns) so the next turn sees the true remaining budget.
-   *  - The re-drive resumes the last session observed, including a fresh empty
-   *    planning turn's session. The persisted first-session ID stays authoritative.
-   * Only after the bounded retries are exhausted on a still-positively-empty result
-   * does this throw {@link TransientRecoveryError} → the recovery_wait park (D-RC2c).
+   *  - The re-drive resumes the last session observed — a fresh empty planning turn's
+   *    `turn.sessionId`, or a transient throw's `err.sessionId`. The persisted
+   *    first-session ID stays authoritative.
+   * Only after the bounded retries are exhausted (still positively-empty, or still
+   * throwing transient) does this throw {@link TransientRecoveryError} → the
+   * recovery_wait park (D-RC2c), with a provider-aware message when the cause was a
+   * ProviderTransientError.
    */
   private async driveTurnWithEmptyRecovery(
     ctx: RunContext,
@@ -3122,20 +3208,45 @@ export class SdkExecutor implements Executor {
     idleMs: number,
     onProgress?: (progress: MilestoneProgress) => void,
   ): Promise<TurnResult> {
-    let turn = await this.driveTurn(
-      ctx,
-      turnConfig,
-      phase,
-      resumeId,
-      prompt,
-      state,
-      idleMs,
-      onProgress,
-    );
-    // The common path: a non-empty turn returns unchanged. Recovery is entered ONLY on
-    // a positively-empty return (isPositivelyEmpty excludes missing metrics, plan,
-    // questions, done and any model activity).
-    if (!isPositivelyEmpty(turn)) return turn;
+    // issue #1088: a driveTurn either RETURNS a result (possibly positively-empty) or
+    // THROWS. A ProviderTransientError throw is captured (retry it, like an empty turn);
+    // a trip / LimitReachedError / any other throw re-throws unchanged. `turn` is left
+    // undefined on a captured transient throw, `lastProviderErr` records the latest one.
+    let turn: TurnResult | undefined;
+    let lastProviderErr: ProviderTransientError | undefined;
+    const runOnce = async (): Promise<void> => {
+      try {
+        turn = await this.driveTurn(
+          ctx,
+          turnConfig,
+          phase,
+          resumeId,
+          prompt,
+          state,
+          idleMs,
+          onProgress,
+        );
+        lastProviderErr = undefined;
+      } catch (err) {
+        // A real cancel/idle/wall trip WINS and keeps its existing outcome.
+        if (state.tripReason) throw this.tripError(state);
+        // A usage-limit death routes to the usage-limit wait path, unchanged.
+        if (err instanceof LimitReachedError) throw err;
+        // Any genuine (non-transient) failure fails the run, exactly as before.
+        if (!(err instanceof ProviderTransientError)) throw err;
+        // A transient provider error: retry it like an empty turn, and preserve the
+        // session lineage on this throw path (the clean path uses turn.sessionId).
+        lastProviderErr = err;
+        turn = undefined;
+        resumeId = err.sessionId ?? resumeId;
+      }
+    };
+
+    await runOnce();
+    // The common path: a non-empty turn returns unchanged. Recovery is entered ONLY on a
+    // positively-empty return (isPositivelyEmpty excludes missing metrics, plan, questions,
+    // done and any model activity) or a captured ProviderTransientError (turn undefined).
+    if (turn && !isPositivelyEmpty(turn)) return turn;
 
     for (let attempt = 1; attempt <= this.emptyTurnMaxRetries; attempt++) {
       // A real cancel/idle/wall trip WINS and keeps its existing outcome — throw it
@@ -3148,29 +3259,24 @@ export class SdkExecutor implements Executor {
       if (state.wallRemainingMs > 0) {
         await this.emptyTurnBackoff(state, this.emptyTurnBackoffBaseMs * attempt);
       }
-      // A truthful feed notice each attempt, right before the re-drive.
+      // A truthful feed notice each attempt, right before the re-drive: provider-aware
+      // when the last drive threw transient, else the empty-turn notice.
       ctx.emit({
         kind: "status",
         agent: "worker",
         payload: {
-          text: "the model returned an empty result (0 turns, no activity); retrying…",
+          text: lastProviderErr
+            ? `the provider returned a transient error (${lastProviderErr.status ?? "API error"}); retrying…`
+            : "the model returned an empty result (0 turns, no activity); retrying…",
         },
       });
       // An empty fresh turn can still initialize a session. Resume it on retry:
       // the reducer already persisted that ID through its once-per-run callback.
-      // Starting a second session would leave recovery pointing at the first.
-      resumeId = turn.sessionId ?? resumeId;
-      turn = await this.driveTurn(
-        ctx,
-        turnConfig,
-        phase,
-        resumeId,
-        prompt,
-        state,
-        idleMs,
-        onProgress,
-      );
-      if (!isPositivelyEmpty(turn)) return turn;
+      // Starting a second session would leave recovery pointing at the first. (On the
+      // transient-throw path resumeId was already advanced inside runOnce.)
+      if (turn) resumeId = turn.sessionId ?? resumeId;
+      await runOnce();
+      if (turn && !isPositivelyEmpty(turn)) return turn;
     }
     // PRD #1349 M3: bounded retries exhausted, still positively empty. Branch on THIS
     // (final) attempt's rate-limit verdict:
@@ -3184,13 +3290,19 @@ export class SdkExecutor implements Executor {
     // This routing keys ONLY on `rejected` and DELIBERATELY does NOT reuse
     // classifyLimitEvidence's future-reset corroboration (limit.ts): a missing or past
     // reset must STILL take the limit path here — that gate governs a different decision.
-    if (turn.rateLimit?.status === "rejected") {
+    if (turn?.rateLimit?.status === "rejected") {
       throw new LimitReachedError({
         resetsAtMs: turn.rateLimit.resetsAtMs,
         rateLimitType: turn.rateLimit.window,
       });
     }
-    throw new TransientRecoveryError();
+    // issue #1088: a sustained provider outage carries its provider-aware message into the
+    // recovery_wait park; a positively-empty exhaustion uses the default message.
+    throw new TransientRecoveryError(
+      lastProviderErr
+        ? `provider transient error persisted after bounded in-process retries: ${lastProviderErr.message}`
+        : undefined,
+    );
   }
 
   /**
