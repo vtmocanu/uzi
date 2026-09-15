@@ -171,6 +171,14 @@ export interface HarnessTerminal {
   // Exact uzi display subtype and String-mapped provider error array.
   subtype: string;
   errors: readonly string[];
+  // issue #1088: the raw provider-error signal threaded from decodeResult so the
+  // executor can classify a transient provider outage (429/500/502/503/529) and PARK
+  // via recovery_wait rather than terminal-fail. A 529 arrives as an api-error frame
+  // whose `errors` array is EMPTY (the text is in `resultText`), so these are the only
+  // signal available. All optional: absent on any non-provider-error terminal.
+  apiErrorStatus?: number | null;
+  resultText?: string;
+  terminalReason?: string;
   // Deferred compatibility construction, independent of display subtype.
   // Invoke only at the lane's existing terminal-classification point.
   failure?: HarnessTerminalFailure;
