@@ -1476,7 +1476,7 @@ export function RecoveryWaitPanel({ run }: { run: Run }) {
         ) : (
           <>
             <p className="mt-0.5 text-xs text-muted">
-              This run paused to recover from a transient empty model result. It resumes on
+              This run paused to recover from a transient interruption. It resumes on
               its own on a capped backoff — no action is needed. If it never recovers it holds
               here so you can cancel it.
             </p>
@@ -1649,7 +1649,7 @@ export function RunView() {
         : parkKey === "pool_wait"
           ? "The run is waiting for a pooled Anthropic token. Add a token to the pool and it resumes automatically."
           : parkKey === "recovery_wait"
-            ? "This run paused to recover from a transient empty result and will resume automatically."
+            ? "This run paused to recover from a transient interruption and will resume automatically."
             : parkKey === "paused"
               ? "The run is paused. Resume it from this page or with the uzi run resume command."
             : "The agent is asking you a question. The run is parked until you answer.",

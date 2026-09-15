@@ -200,14 +200,15 @@ func newRunLogsCmd(env Env, gf *globalFlags) *cobra.Command {
 						case statusRecoveryWait:
 							// PRD #1392 M5: a forge-unreachable park names the forge and
 							// prints the retry time + park count against its cap; every other
-							// cause keeps the transient-empty-turn wording (issue #1197).
+							// cause keeps the transient-interruption wording (issue #1197,
+							// widened to a transient provider outage by issue #1088).
 							if isForgePark(run) {
 								_, _ = fmt.Fprintf(env.Stderr,
 									"run %s %s — still following; it resumes on its own\n",
 									args[0], forgeParkLine(run))
 							} else {
 								_, _ = fmt.Fprintf(env.Stderr,
-									"run %s recovering — a transient empty turn parked it; still following, it resumes on its own\n",
+									"run %s recovering — a transient interruption parked it; still following, it resumes on its own\n",
 									args[0])
 							}
 						default: // statusLimitWait
