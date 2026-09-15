@@ -89,6 +89,46 @@ describe("register / heartbeat / claim", () => {
     }
   });
 
+  // PRD #1392 M2 (D7): register() captures the api's advertised protocol_features onto
+  // client.protocolFeatures so the runner can pick a capability-aware forge-park degradation.
+  // The parse is Array.isArray(res.protocol_features) ? .filter(string) : [] — an older api
+  // (no field) and any malformed value both default to the safe [] ("no features").
+  it("captures the advertised protocol_features onto client.protocolFeatures (D7)", async () => {
+    api.setRegisterProtocolFeatures(["recovery_park_cause", "recovery_release_exact_echo"]);
+    const client = newClient();
+    await client.register("vlad-laptop");
+    assert.deepStrictEqual(client.protocolFeatures, [
+      "recovery_park_cause",
+      "recovery_release_exact_echo",
+    ]);
+  });
+
+  it("defaults protocolFeatures to [] when an older api returns only {worker_id} (D7)", async () => {
+    // The fake omits the field entirely unless configured, exactly like a pre-#1392 api.
+    const client = newClient();
+    const res = await client.register("vlad-laptop");
+    assert.ok(res.worker_id);
+    assert.deepStrictEqual(client.protocolFeatures, [], "no field ⇒ the safe empty negotiation");
+  });
+
+  it("guards a non-array protocol_features to [] (D7)", async () => {
+    api.setRegisterProtocolFeatures("recovery_park_cause"); // a string, not an array
+    const client = newClient();
+    await client.register("vlad-laptop");
+    assert.deepStrictEqual(client.protocolFeatures, [], "a non-array value is never trusted");
+  });
+
+  it("filters out non-string entries from protocol_features (D7)", async () => {
+    api.setRegisterProtocolFeatures(["recovery_park_cause", 42, null, "recovery_release_exact_echo"]);
+    const client = newClient();
+    await client.register("vlad-laptop");
+    assert.deepStrictEqual(
+      client.protocolFeatures,
+      ["recovery_park_cause", "recovery_release_exact_echo"],
+      "only the string tokens survive the filter",
+    );
+  });
+
   it("rejects a wrong token with 401", async () => {
     const bad = new WorkerClient(baseUrl, "nope", "0.1.0-test", nullLogger());
     await assert.rejects(bad.heartbeat(), RequestError);

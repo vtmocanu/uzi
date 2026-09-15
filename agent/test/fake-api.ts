@@ -135,6 +135,11 @@ export class FakeApi {
   private completionPermitGranted = true;
   private completionPermitDenyReason: string | undefined;
   private completionPermitHttpStatus = 200;
+  // PRD #1392 M2 (D7): the RAW `protocol_features` the register endpoint returns beside
+  // worker_id. Left `undefined` ⇒ the response OMITS the field entirely (an older api that
+  // returns only {worker_id}). Set to an arbitrary value (an array, a non-array, or an array
+  // with non-string entries) so a test can drive register()'s Array.isArray + string-filter guard.
+  private registerProtocolFeatures: unknown = undefined;
 
   constructor(private readonly token: string) {
     this.server = http.createServer((req, res) => {
@@ -292,6 +297,13 @@ export class FakeApi {
     else this.pauseRequestedRuns.delete(runId);
   }
 
+  /** PRD #1392 M2 (D7): set the raw `protocol_features` the register endpoint returns beside
+   *  worker_id. Never called ⇒ the field is omitted (an older api). Accepts an arbitrary value
+   *  (a non-array / non-string entries) so a test can exercise register()'s parsing guard. */
+  setRegisterProtocolFeatures(features: unknown): void {
+    this.registerProtocolFeatures = features;
+  }
+
   /** PRD #1226 M4 (D6): set the {run:{status}} the completion-hold endpoint answers, and the HTTP
    *  status it answers with (default 200; 409 models a refusal the client must NOT throw on). */
   setCompletionHoldResponse(status: string, httpStatus = 200): void {
@@ -374,7 +386,12 @@ export class FakeApi {
       if (json.protocol_capabilities !== undefined)
         rec.protocol_capabilities = (json.protocol_capabilities as unknown[]).map(String);
       this.registers.push(rec);
-      return send(res, 200, { worker_id: randomUUID() });
+      // PRD #1392 M2 (D7): the api advertises its protocol features here. Omit the field unless a
+      // test configured one, so an unconfigured register wire stays byte-identical to an older api.
+      const registerBody: Record<string, unknown> = { worker_id: randomUUID() };
+      if (this.registerProtocolFeatures !== undefined)
+        registerBody.protocol_features = this.registerProtocolFeatures;
+      return send(res, 200, registerBody);
     }
     if (req.method === "POST" && p === "/api/worker/heartbeat") {
       this.heartbeats++;

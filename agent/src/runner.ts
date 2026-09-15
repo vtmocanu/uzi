@@ -1535,6 +1535,30 @@ export class RunRunner {
   }
 
   /**
+   * PRD #1392 M2 (D4) — set `preserveSession` for a same-worker resume ONLY when a resume
+   * transcript is resolvable on THIS worker (a resume leg whose session id we can actually
+   * resume). A fresh claim (no session id) and a resume leg without a local transcript preserve
+   * nothing. Shared by finishForgePark (a CONFIRMED park) and reconcileForgeParkByProbe's
+   * worker-shutdown arm (which leaves the run non-terminal for the server to requeue), so both
+   * honor the D4 rule identically — HOME + the SDK session are kept when resolvable, else cleaned.
+   */
+  private async preserveForgeParkSessionIfResolvable(
+    claim: ClaimResponse,
+    flight: RunFlight,
+    runLog: Logger,
+    runHome: string | undefined,
+  ): Promise<void> {
+    const sessionId = claim.session_id;
+    if (
+      runHome &&
+      sessionId &&
+      (await sessionTranscriptResolvable(runHome, sessionId, runLog))
+    ) {
+      flight.preserveSession = true;
+    }
+  }
+
+  /**
    * PRD #1392 M2 (D4/D10) — a CONFIRMED forge park. Emit and flush exactly ONE feed event quoting
    * the acknowledged retry stamp (or "after backoff" when absent), close the batcher, then
    * preserve HOME + the SDK session ONLY when a resume transcript is resolvable on THIS worker
@@ -1558,14 +1582,7 @@ export class RunRunner {
     });
     await batcher.flush().catch(() => undefined);
     await batcher.close().catch(() => undefined);
-    const sessionId = claim.session_id;
-    if (
-      runHome &&
-      sessionId &&
-      (await sessionTranscriptResolvable(runHome, sessionId, runLog))
-    ) {
-      flight.preserveSession = true;
-    }
+    await this.preserveForgeParkSessionIfResolvable(claim, flight, runLog, runHome);
     flight.parked = true;
     flight.preClonePark = true;
     runLog.info("run parked: forge unreachable at clone", {
@@ -1596,10 +1613,15 @@ export class RunRunner {
     for (;;) {
       if (this.shuttingDownGlobal) {
         // Worker draining: leave the (non-terminal) run for the server to requeue; do NOT clean a
-        // possibly-parked session. The batcher must still close so this execution can drain.
+        // possibly-parked session. Preserve HOME + the SDK session by the SAME D4 rule
+        // finishForgePark uses (resolvable transcript ⇒ keep, else clean) so a same-worker
+        // re-claim can resume — without this the finally computes preserveResumeArtifacts=false and
+        // removes runHome on this UNKNOWN outcome. The batcher must still close so this execution
+        // can drain.
         runLog.info("forge park reconcile interrupted by worker shutdown; leaving the run for requeue", {
           run_id: flight.runId,
         });
+        await this.preserveForgeParkSessionIfResolvable(claim, flight, runLog, runHome);
         await batcher.close().catch(() => undefined);
         return "stop";
       }
@@ -1619,7 +1641,10 @@ export class RunRunner {
           run_id: flight.runId,
           error: errMessage(probeErr),
         });
-        await this.waitRecoveryRetry(flight);
+        // Do not busy-loop on a sticky cancel (mirrors the recovery loop): waitRecoveryRetry with
+        // its default cancelStopsWait=true returns IMMEDIATELY on a stuck cancel, degenerating a
+        // simultaneous cancel + api-unreachable into a backoff-free probe storm. Honor the backoff.
+        await this.waitRecoveryRetry(flight, false);
         continue;
       }
       const status = probe.status;
@@ -1651,12 +1676,14 @@ export class RunRunner {
             run_id: flight.runId,
             error: errMessage(reportErr),
           });
-          await this.waitRecoveryRetry(flight);
+          // Honor the backoff even under a sticky cancel (see the probe-retry site above).
+          await this.waitRecoveryRetry(flight, false);
           continue;
         }
       }
       // Any other status (queued, awaiting_*, …): the outcome is not yet known, retain and retry.
-      await this.waitRecoveryRetry(flight);
+      // cancelStopsWait=false so a sticky cancel cannot turn this into a backoff-free retry storm.
+      await this.waitRecoveryRetry(flight, false);
     }
   }
 

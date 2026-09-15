@@ -7,7 +7,7 @@ import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { Readable } from "node:stream";
-import { type ExecutorResult, type RunContext } from "../src/executor.js";
+import { StubExecutor, type ExecutorResult, type RunContext } from "../src/executor.js";
 import { type ExecutorFactory } from "../src/runner.js";
 import { LimitReachedError } from "../src/limit.js";
 import type { BoundaryPermit, BoundaryRequest, CodexExecutionSafety } from "../src/harness.js";
@@ -72,7 +72,10 @@ function commitInTree(treePath: string, file: string, content: string): string {
 class FakeRecoveryClient implements RecoveryArchiveClient {
   reserveCalls: RecoveryReserveRequest[] = [];
   uploadCalls: Array<{ captureId: string; manifest: RecoveryUploadManifest }> = [];
-  releaseCalls: Array<{ runId: string; generation?: number }> = [];
+  // PRD #1392 M1/M2 (fact 9): record the `releaseEvidence` class each release stamped, so the
+  // completion path's publication/NULL mapping is observable ("publication" for a pushed branch,
+  // undefined for a no-code completion).
+  releaseCalls: Array<{ runId: string; generation?: number; evidence?: string }> = [];
   listCalls: string[] = [];
   holds: RecoveryHold[] = [];
   uploadShouldThrow = false;
@@ -97,8 +100,12 @@ class FakeRecoveryClient implements RecoveryArchiveClient {
     if (this.uploadShouldThrow) throw new Error("upload rejected");
     return { capture_id: captureId, state: "available", manifest_bound: true };
   }
-  async releaseRecoveryCustody(runId: string, generation?: number): Promise<RecoveryReleaseResponse> {
-    this.releaseCalls.push({ runId, generation });
+  async releaseRecoveryCustody(
+    runId: string,
+    generation?: number,
+    releaseEvidence?: string,
+  ): Promise<RecoveryReleaseResponse> {
+    this.releaseCalls.push({ runId, generation, evidence: releaseEvidence });
     return { run_id: runId, released: true, holds_released: 1 };
   }
   async listRecoveryHolds(runId: string): Promise<RecoveryHoldsResponse> {
@@ -108,6 +115,10 @@ class FakeRecoveryClient implements RecoveryArchiveClient {
   /** The exact generations that were released, in call order. */
   releasedGenerations(): Array<number | undefined> {
     return this.releaseCalls.map((c) => c.generation);
+  }
+  /** The evidence class each release stamped, in call order (PRD #1392 M1/M2, fact 9). */
+  releasedEvidence(): Array<string | undefined> {
+    return this.releaseCalls.map((c) => c.evidence);
   }
 }
 
@@ -491,6 +502,13 @@ describe("RunRunner — no-code completion settles the early-evidence hold (PRD 
         [15],
         "a no-code completion releases the exact generation (the early-evidence hold)",
       );
+      // PRD #1392 M1/M2 (fact 9): a no-code completion carries NO branch, so it is NOT a
+      // publication — the release stamps NO evidence class (the api stores NULL), never mis-stamps.
+      assert.deepEqual(
+        client.releasedEvidence(),
+        [undefined],
+        "a report-only completion stamps NO release_evidence (NULL)",
+      );
       assert.equal(client.reserveCalls.length, 0, "a no-code completion captures nothing");
       assert.deepEqual(
         await coord.inspect(claim.run_id),
@@ -499,6 +517,40 @@ describe("RunRunner — no-code completion settles the early-evidence hold (PRD 
       );
     } finally {
       fs.rmSync(homeRoot, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+// PRD #1392 M1/M2 (fact 9) — the completion release stamps its evidence CLASS from the reported
+// body: a full publication (a completed report carrying a pushed `branch`) → "publication"; a
+// no-code completion (report_only / not_code / scope-capped-empty, no branch) → NO evidence (the
+// api stores NULL). The report-only case above pins the NULL half; this block pins the publication
+// half through the REAL push+MR completion path (StubExecutor commits a real file and returns its
+// branch, so the runner pushes it and reports { status:"completed", branch }).
+describe("RunRunner — completion release_evidence publication mapping (PRD #1392 M1/M2, fact 9)", () => {
+  it("a full publication (pushed branch + MR) stamps release_evidence: \"publication\"", async () => {
+    const { gitlab } = fakeGitlab();
+    const { coord, client, root } = injectedCoordinator();
+    try {
+      const claim = gitlabClaim(4801, { claim_generation: 22 });
+      await runnerWith(
+        () => ({ executor: new StubExecutor(nullLogger()) }),
+        gitlab,
+        undefined,
+        nullLogger(),
+        { recovery: coord },
+      ).execute(claim);
+      assert.ok(hasStatus(claim.run_id, "completed"), "the run completed with a pushed branch + MR");
+      // The completion released the exact generation, stamped "publication" (a pushed branch was
+      // reported) — never the fresh-forge "forge_no_output" and never NULL.
+      assert.deepEqual(client.releasedGenerations(), [22], "the exact generation was released");
+      assert.deepEqual(
+        client.releasedEvidence(),
+        ["publication"],
+        "a pushed-branch completion stamps release_evidence: publication",
+      );
+    } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
