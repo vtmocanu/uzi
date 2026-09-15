@@ -2,7 +2,7 @@
 
 **Issue**: [#1387](https://github.com/vtmocanu/uzi/issues/1387)
 **Priority**: Low
-**Status**: Ready for implementation
+**Status**: Complete
 
 ## Purpose
 
@@ -70,19 +70,19 @@ Exact wording is not load-bearing; the section headings and structure are.
 
 ## Milestones
 
-- [ ] **M1: Create `DEMO.md` with a title and one-paragraph description.**
+- [x] **M1: Create `DEMO.md` with a title and one-paragraph description.**
   Create `DEMO.md` at the repo root containing a top-level `# uzi demo` heading and a
   single paragraph explaining that the file was produced by a uzi run as an end-to-end
   smoke test and is safe to delete.
   *Validation*: `DEMO.md` exists at the repo root, starts with `# uzi demo`, and the
   repo gates stay green.
 
-- [ ] **M2: Add a "What this demonstrates" bulleted list.**
+- [x] **M2: Add a "What this demonstrates" bulleted list.**
   Append a `## What this demonstrates` section to `DEMO.md` with three short bullet
   points (plan-to-MR loop, milestone-by-milestone completion, gates stay green).
   *Validation*: the section and its three bullets are present below the M1 content.
 
-- [ ] **M3: Add a footer note.**
+- [x] **M3: Add a footer note.**
   Append a horizontal rule and a one-line footer to `DEMO.md` stating it was generated
   by uzi for issue #1387 and is safe to revert once the demo is confirmed.
   *Validation*: the footer line is the last content in the file; the file reads
