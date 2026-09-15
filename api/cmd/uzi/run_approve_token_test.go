@@ -157,3 +157,46 @@ func TestRunApproveTokenComposesWithSelection(t *testing.T) {
 		t.Errorf("approve did not carry the --agent-source selection: %+v", fc.LastInputSelection)
 	}
 }
+
+// TestRunApproveTokenBadSelectionAbortsBeforeSwitch: a client-side-detectable selection error
+// (--exclude-agents without --agent-source) must fail BEFORE the server credential switch — the
+// selection is validated ahead of the --token block, so a malformed invocation never stamps a
+// switch it then abandons. Neither SetRunCredential nor the approve runs.
+func TestRunApproveTokenBadSelectionAbortsBeforeSwitch(t *testing.T) {
+	fc := &uzicli.FakeClient{
+		SetTokenRun: apitypes.RunDTO{ID: "run-9", Status: "awaiting_approval", Kind: "issue"},
+		Secrets:     []apitypes.SecretDTO{{ID: "sec-b", Kind: "anthropic_token", Label: "prod-key"}},
+	}
+	_, _, code := runCLI(t, fakeEnv(fc), "run", "approve", "run-9", "--token", "prod-key", "--exclude-agents", "foo")
+	if code != uzicli.ExitUsage {
+		t.Fatalf("exit = %d, want %d (usage: --exclude-agents needs --agent-source)", code, uzicli.ExitUsage)
+	}
+	if fc.LastSetTokenRunID != "" || fc.LastSetTokenOverride != nil {
+		t.Errorf("a client-side selection error must NOT stamp a credential switch, but SetRunCredential ran (run=%q override=%+v)",
+			fc.LastSetTokenRunID, fc.LastSetTokenOverride)
+	}
+	if fc.LastInputKind != "" {
+		t.Errorf("a client-side selection error must NOT approve (kind=%q)", fc.LastInputKind)
+	}
+}
+
+// TestRunApproveTokenWarningPrintedToStderr: the best-effort D6 warning SetRunCredential returns
+// (e.g. pinning a token whose gauge reads low/stale) is surfaced to stderr, mirroring run
+// set-token, and the approve still proceeds.
+func TestRunApproveTokenWarningPrintedToStderr(t *testing.T) {
+	fc := &uzicli.FakeClient{
+		SetTokenRun:     apitypes.RunDTO{ID: "run-9", Status: "awaiting_approval", Kind: "issue"},
+		SetTokenWarning: "this token's usage gauge reads low or stale",
+		Secrets:         []apitypes.SecretDTO{{ID: "sec-b", Kind: "anthropic_token", Label: "prod-key"}},
+	}
+	_, errb, code := runCLI(t, fakeEnv(fc), "run", "approve", "run-9", "--token", "prod-key")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !containsAll(errb, "warning", "usage gauge reads low") {
+		t.Errorf("the D6 warning should be printed to stderr; got: %q", errb)
+	}
+	if fc.LastInputKind != kindApprovePlan {
+		t.Errorf("approve should still proceed after a warning (kind=%q)", fc.LastInputKind)
+	}
+}

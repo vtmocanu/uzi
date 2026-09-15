@@ -167,10 +167,23 @@ func newRunApproveCmd(env Env, gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			// --token FIRST: the override/switch must land before the approval, so on any
-			// error we return WITHOUT approving — the composition failed. An empty/omitted
-			// --token skips the round-trip entirely, keeping approve byte-identical to today.
-			if token, _ := cmd.Flags().GetString("token"); token != "" {
+			// Validate the client-side selection flags FIRST, before any server call — a
+			// malformed invocation (e.g. --exclude-agents without --agent-source) is detectable
+			// with zero round-trips, so it must NOT stamp a credential switch it then abandons.
+			// This mirrors `run set-token`, which resolves/validates before its server call.
+			source, _ := cmd.Flags().GetString("agent-source")
+			exclude, _ := cmd.Flags().GetStringSlice("exclude-agents")
+			sel, err := approveSelection(source, exclude)
+			if err != nil {
+				return err
+			}
+			// --token FIRST among the SERVER steps: the override/switch must land before the
+			// approval, so on any error we return WITHOUT approving — the composition failed.
+			// Gated on Changed (like `run create --token`), so an explicit --token "" is a
+			// client-side refusal, not a silent no-op; omitting --token skips the round-trip
+			// entirely, keeping approve byte-identical to today.
+			if cmd.Flags().Changed("token") {
+				token, _ := cmd.Flags().GetString("token")
 				override, err := resolveTokenFlagValue(cmd, c, token)
 				if err != nil {
 					return err
@@ -184,12 +197,6 @@ func newRunApproveCmd(env Env, gf *globalFlags) *cobra.Command {
 				if warning != "" {
 					_, _ = fmt.Fprintf(env.Stderr, "warning: %s\n", sanitizeTTY(warning))
 				}
-			}
-			source, _ := cmd.Flags().GetString("agent-source")
-			exclude, _ := cmd.Flags().GetStringSlice("exclude-agents")
-			sel, err := approveSelection(source, exclude)
-			if err != nil {
-				return err
 			}
 			return submitInput(env, gf, c, cmd, args[0], kindApprovePlan, "", sel)
 		},
