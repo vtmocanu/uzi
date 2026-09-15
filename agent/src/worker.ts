@@ -1,12 +1,14 @@
 import type { WorkerClient } from "./client.js";
 import { RequestError } from "./client.js";
+import { replaySegment } from "./batcher.js";
+import type { Outbox } from "./outbox.js";
 import type { RunRunner } from "./runner.js";
 import type { ChatRunner } from "./chat-runner.js";
 import type { JudgeRunner } from "./judge-runner.js";
 import type { ReviewRunner } from "./review-runner.js";
 import type { Logger } from "./log.js";
 import type { Config } from "./config.js";
-import type { WorkerStats } from "./protocol.js";
+import type { OutboxHeartbeatEntry, WorkerStats } from "./protocol.js";
 import { StatsCollector } from "./stats.js";
 import { errMessage, sleep } from "./util.js";
 import { toolchainPreflight, type PreflightResult } from "./toolchain-preflight.js";
@@ -38,7 +40,23 @@ export class Worker {
     // unit tests (which run on a non-image host with no `/opt/uzi-toolchain`) can pass a
     // stub; production uses the real check against the runner PATH.
     private readonly preflight: () => PreflightResult = () => toolchainPreflight(process.env),
+    // PRD #1391 M2: the worker-owned message outbox (main.ts builds + inits it before
+    // constructing the worker). The per-worker drainer replays every run's spilled
+    // segments over the messages route on each successful heartbeat and once on boot,
+    // and re-arms each run's live batcher (via `rearm`) once its segments retire.
+    // Undefined only in the concurrency/semaphore unit tests that never spill.
+    private readonly outbox?: Outbox,
+    // PRD #1391 M2: the shared re-arm registry — runId → the live batcher's `rearm()`.
+    // A RunRunner/ChatRunner registers its batcher here while it holds pending
+    // segments; the drainer calls the hook once the run's segments retire so the live
+    // batcher returns its flush target to the network.
+    private readonly rearm?: Map<string, () => void>,
   ) {}
+
+  /** PRD #1391 M2: single-flight guard — never two outbox drains at once (a heartbeat
+   *  tick must not start a drain while the boot drain, or a prior tick's drain, is
+   *  still running). */
+  private draining = false;
 
   async run(signal: AbortSignal): Promise<void> {
     // PRD #92 M3 — fail-loud boot toolchain preflight, BEFORE the register retry loop.
@@ -68,6 +86,24 @@ export class Worker {
     void this.runner.resumePendingRecoveries(signal).catch((err) => {
       this.log.warn("recovery: restart resume sweep failed", { error: errMessage(err) });
     });
+    // PRD #1391 M2: admit any spill tail a crash may have lost, then drain the outbox
+    // once in the background. On boot, for each run whose `spilled_unclean` flag was set
+    // at init, log ONCE that an unflushed tail MAY have been lost — naming NO span and
+    // NO count, because nothing durable can size it (the crash-before-range-flush
+    // admitted-loss log). Then a boot drain replays any pending segments without waiting
+    // for the first heartbeat. Fire-and-forget and fully swallowed — a drain must never
+    // block the claim loops.
+    if (this.outbox) {
+      for (const runId of this.outbox.uncleanRuns()) {
+        this.log.warn(
+          "outbox: a run was spilling when the worker last stopped; an unflushed tail may have been lost",
+          { run_id: runId },
+        );
+      }
+      void this.drainOutbox(signal).catch((err) => {
+        this.log.warn("outbox boot drain failed", { error: errMessage(err) });
+      });
+    }
     // Heartbeat, the run lane, and the chat lane run concurrently until abort.
     await Promise.all([this.heartbeatLoop(signal), this.claimLoop(signal), this.chatClaimLoop(signal)]);
   }
@@ -160,12 +196,84 @@ export class Worker {
     // (PRD #837 M1); /nix stays the fixed default inside the collector.
     const stats = new StatsCollector({ dataDir: this.config.dataDir });
     while (!signal.aborted) {
+      let ok = false;
       try {
-        await this.client.heartbeat(this.collectStats(stats));
+        // PRD #1391 M5: report per-run outbox depth alongside the resource sample. The
+        // client sends the array only when the server negotiated `heartbeat_outbox`,
+        // so an older api sees a byte-identical heartbeat. Assembled BEFORE the send so
+        // the first recovered heartbeat carries the depth ahead of that tick's drain.
+        await this.client.heartbeat(this.collectStats(stats), this.outboxEntries());
+        ok = true;
       } catch (err) {
         this.log.warn("heartbeat failed", { error: errMessage(err) });
       }
+      // PRD #1391 M2: the re-arm trigger — on EACH successful heartbeat, drain the
+      // outbox (single-flight). Guarded so a drain error never escapes the heartbeat
+      // loop (mirrors the heartbeat try/catch above).
+      if (ok) {
+        await this.drainOutbox(signal).catch((err) => {
+          this.log.warn("outbox drain failed", { error: errMessage(err) });
+        });
+      }
       await sleep(this.config.heartbeatIntervalMs, signal);
+    }
+  }
+
+  /** PRD #1391 M5: assemble the per-run outbox depth for the heartbeat, mapping every
+   *  run with pending outbox depth to the wire {@link OutboxHeartbeatEntry} shape
+   *  (`pending_terminal` is always 0 in Run A). Undefined when there is no outbox or
+   *  nothing pending, so the heartbeat wire stays byte-identical. */
+  private outboxEntries(): OutboxHeartbeatEntry[] | undefined {
+    if (!this.outbox) return undefined;
+    const entries: OutboxHeartbeatEntry[] = [];
+    for (const runId of this.outbox.runsWithPending()) {
+      const d = this.outbox.depthFor(runId);
+      if (!d) continue;
+      entries.push({
+        run_id: d.runId,
+        pending_messages: d.pendingMessages,
+        pending_terminal: d.pendingTerminal,
+        stale_retired: d.staleRetired,
+        since: d.since,
+        ...(d.blockedReason ? { blocked_reason: d.blockedReason } : {}),
+      });
+    }
+    return entries.length > 0 ? entries : undefined;
+  }
+
+  /**
+   * PRD #1391 M2: the per-worker, single-flight outbox drainer. For each run with
+   * pending segments, replay them in seq order over the messages route (poison inside
+   * a segment is tombstoned and the rest lands — {@link replaySegment}); on a fully
+   * retired run, re-arm its live batcher (if any) so it returns to the network. One
+   * run at a time, awaiting each and yielding between them, so two drains never run
+   * concurrently. A non-2xx that {@link replaySegment} re-throws (transient/fatal)
+   * stops that ONE run and leaves the rest pending for the next heartbeat.
+   */
+  private async drainOutbox(signal?: AbortSignal): Promise<void> {
+    const outbox = this.outbox;
+    if (!outbox) return;
+    if (this.draining) return; // single-flight
+    this.draining = true;
+    try {
+      for (const runId of outbox.runsWithPending()) {
+        if (signal?.aborted) break;
+        try {
+          const res = await outbox.drainRun(runId, (msgs, gen) =>
+            replaySegment(this.client, runId, msgs, gen, this.log),
+          );
+          if (res.retired) this.rearm?.get(runId)?.();
+        } catch (err) {
+          this.log.warn("outbox drain failed for a run; will retry next heartbeat", {
+            run_id: runId,
+            error: errMessage(err),
+          });
+        }
+        // Yield between runs so a long backlog never starves the event loop.
+        await Promise.resolve();
+      }
+    } finally {
+      this.draining = false;
     }
   }
 

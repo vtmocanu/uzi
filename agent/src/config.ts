@@ -4,6 +4,7 @@ import path from "node:path";
 import type { LogLevel } from "./log.js";
 import type { DockerWiring } from "./docker-wiring.js";
 import type { CodexRuntimeProbeResult } from "./codex/codex-runtime-probe.js";
+import { TRANSIENT_TRIP_MS } from "./batcher.js";
 import { errMessage } from "./util.js";
 
 // Worker configuration, parsed from env (PRD #4 §Configuration).
@@ -164,6 +165,20 @@ export interface Config {
    * segments is never removed by retention (PRD #1391 M1).
    */
   outboxRetentionMs: number;
+  /**
+   * PRD #1391 M2: how long an unbroken run of TRANSIENT message-flush failures may
+   * last before the batcher stops flushing to the network and starts spilling to the
+   * outbox (WORKER_TRANSIENT_TRIP_MS, default = batcher's TRANSIENT_TRIP_MS, 10 min).
+   * Overridable so the e2e outage phase can lower it and not wait ten real minutes.
+   */
+  transientTripMs: number;
+  /**
+   * PRD #1391 M2: the hard cap on the batcher's in-memory buffer while it is spilled
+   * to the outbox (WORKER_OUTBOX_SPILL_BUFFER_BYTES, default 2 MiB). A message that
+   * would exceed it is dropped and folded into a pending range record the next spill
+   * flush writes durably, so a spilled batcher can never grow memory without bound.
+   */
+  outboxSpillBufferBytes: number;
   logLevel: LogLevel;
 }
 
@@ -353,6 +368,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     outboxRunMaxBytes: positiveInt(env, "WORKER_OUTBOX_RUN_MAX_BYTES", 64 * 1024 * 1024),
     outboxMaxBytes: positiveInt(env, "WORKER_OUTBOX_MAX_BYTES", 512 * 1024 * 1024),
     outboxRetentionMs: duration(env, "WORKER_OUTBOX_RETENTION", "7d"),
+    // PRD #1391 M2. The trip window is a duration (bare number = ms), defaulting to
+    // the batcher's baked TRANSIENT_TRIP_MS so the two never drift; the spill buffer
+    // cap is a plain positive byte count.
+    transientTripMs: duration(env, "WORKER_TRANSIENT_TRIP_MS", String(TRANSIENT_TRIP_MS)),
+    outboxSpillBufferBytes: positiveInt(env, "WORKER_OUTBOX_SPILL_BUFFER_BYTES", 2 * 1024 * 1024),
     logLevel: isLogLevel(rawLevel) ? rawLevel : "info",
   };
 }
