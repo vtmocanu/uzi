@@ -725,6 +725,13 @@ type Store interface {
 	// + _generation) for `uzi run set-token` on a run a worker holds (PRD #1247 M5, D4). It
 	// does NOT change status; owner-scoped so a foreign run is a 0-row no-op.
 	StampCredentialSwitch(ctx context.Context, arg store.StampCredentialSwitchParams) (int64, error)
+	// ClearCredentialSwitchByWorker clears a pending switch stamp WITHOUT changing status for the
+	// worker's `credential_switch_failed` report — the bounded capture-failure give-up (PRD #1247
+	// M5, D3/D14): the run keeps running on its current token. Fenced to the CURRENT claim
+	// (worker_id + exact generation + unreleased + a stamp actually pending), so a
+	// stale/superseded/foreign or already-cleared report affects 0 rows. failCredentialSwitch reads
+	// a 0-row result as a benign no-op (applied=false).
+	ClearCredentialSwitchByWorker(ctx context.Context, arg store.ClearCredentialSwitchByWorkerParams) (int64, error)
 	// ClearCompletionBudgetExhausted clears the served budget_exhausted steer
 	// (completion_budget_exhausted_at) on the owner's CONTINUE decision (PRD #1226 M5, D3): a
 	// new owner decision is the third of D3's clears (alongside the worker acting on it /
@@ -2526,6 +2533,16 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	// generic stale check would wrongly reject an already-released redelivery).
 	if req.State == "credential_switch" {
 		return s.releaseCredentialSwitch(ctx, owned, wkr, req)
+	}
+	// PRD #1247 M5 (D3 step 3 / D14): the bounded capture-failure GIVE-UP. After a bounded number
+	// of failed verified-restore-point captures the worker abandons the switch and reports
+	// {status:"credential_switch_failed", claim_generation}; the server CLEARS the pending switch
+	// stamp WITHOUT changing status — the run keeps running on its current token. Like pause_failed
+	// it withdraws a pending request (a SWITCH, not a PAUSE) rather than transitioning, so it is
+	// handled by its own fenced+idempotent helper BEFORE the generation fence below (whose generic
+	// stale check would wrongly reject an already-cleared redelivery).
+	if req.State == "credential_switch_failed" {
+		return s.failCredentialSwitch(ctx, owned, wkr, req)
 	}
 	// PRD #1247 M5a-1 rework (auditor fail-open finding): FAIL CLOSED for a CAPABILITY worker. The
 	// fence below engages only when the report STAMPS a generation, so a worker advertising

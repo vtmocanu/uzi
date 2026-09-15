@@ -711,3 +711,104 @@ func TestConsumeInputsConsumeNothingWhilePendingLiveDB(t *testing.T) {
 		t.Fatalf("unconsumed rows = %d, want 0 after the reclaim drain", unconsumed())
 	}
 }
+
+// TestFailCredentialSwitchLiveDB is the bounded capture-failure GIVE-UP (PRD #1247 M5, D3 step 3 /
+// D14): a credential_switch_failed report from the HOLDING worker at the CURRENT generation, with a
+// stamp pending, CLEARS the stamp (credential_switch_requested_at/_generation → NULL) WITHOUT
+// changing status — the run keeps running on its current token (applied=true). A stale generation,
+// a run with no pending stamp, and an idempotent redelivery after a successful clear all clear
+// NOTHING (0-row, applied=false, no error). A report missing claim_generation is ErrInvalidState.
+// Dropping the credential_switch_requested_at IS NOT NULL conjunct from ClearCredentialSwitchByWorker
+// reddens the idempotent-redelivery assertion (the second clear would report applied on 0 change).
+func TestFailCredentialSwitchLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	svc := fenceSvc(env)
+	o := seedReevalOwner(t, env, BindModeAuto, false)
+	wkr := store.Worker{ID: o.workerID, UserID: o.userID}
+
+	t.Run("holding worker at current generation clears the stamp, status unchanged", func(t *testing.T) {
+		g := int64(3)
+		id := seedHeldRun(t, env, o, 6100, "running", g, true, false)
+		run, applied, err := svc.SetState(env.ctx, wkr, id, StateRequest{State: "credential_switch_failed", ClaimGeneration: &g})
+		if err != nil || !applied {
+			t.Fatalf("give-up: applied=%v err=%v, want applied", applied, err)
+		}
+		// Status is UNCHANGED — the run keeps running on its current token.
+		if run.Status != "running" {
+			t.Fatalf("status = %q, want it UNCHANGED at running (the run continues on its old token)", run.Status)
+		}
+		// The stamp is CLEARED so the "switch requested" chip drops and the run is no longer
+		// "switch requested forever".
+		if run.CredentialSwitchRequestedAt.Valid || run.CredentialSwitchGeneration.Valid {
+			t.Fatalf("switch stamp = (%v, %v), want both CLEARED to NULL", run.CredentialSwitchRequestedAt, run.CredentialSwitchGeneration)
+		}
+	})
+
+	t.Run("stale generation clears nothing", func(t *testing.T) {
+		g := int64(4)
+		id := seedHeldRun(t, env, o, 6101, "running", g, true, false)
+		stale := g - 1
+		run, applied, err := svc.SetState(env.ctx, wkr, id, StateRequest{State: "credential_switch_failed", ClaimGeneration: &stale})
+		if err != nil {
+			t.Fatalf("stale-generation give-up: err = %v, want nil (0-row no-op ack)", err)
+		}
+		if applied {
+			t.Fatal("a stale-generation give-up must NOT apply")
+		}
+		// The stamp is UNTOUCHED — a stale/superseded report clears nothing.
+		if !run.CredentialSwitchRequestedAt.Valid || !run.CredentialSwitchGeneration.Valid || run.CredentialSwitchGeneration.Int64 != g {
+			t.Fatalf("switch stamp = (%v, %v), want it KEPT at generation %d (a stale report clears nothing)", run.CredentialSwitchRequestedAt, run.CredentialSwitchGeneration, g)
+		}
+	})
+
+	t.Run("no pending stamp clears nothing", func(t *testing.T) {
+		g := int64(5)
+		id := seedHeldRun(t, env, o, 6102, "running", g, false, false) // withStamp=false
+		_, applied, err := svc.SetState(env.ctx, wkr, id, StateRequest{State: "credential_switch_failed", ClaimGeneration: &g})
+		if err != nil {
+			t.Fatalf("give-up with no pending stamp: err = %v, want nil (0-row no-op ack)", err)
+		}
+		if applied {
+			t.Fatal("a give-up with no pending stamp must NOT apply (nothing to clear)")
+		}
+		if got := statusOf(t, env, id); got != "running" {
+			t.Fatalf("status = %q, want running UNCHANGED", got)
+		}
+	})
+
+	t.Run("idempotent redelivery after a successful clear", func(t *testing.T) {
+		g := int64(6)
+		id := seedHeldRun(t, env, o, 6103, "running", g, true, false)
+		if _, applied, err := svc.SetState(env.ctx, wkr, id, StateRequest{State: "credential_switch_failed", ClaimGeneration: &g}); err != nil || !applied {
+			t.Fatalf("first give-up: applied=%v err=%v, want applied", applied, err)
+		}
+		// Redeliver the SAME report: the stamp is already cleared, so it converges to a benign
+		// no-op (applied=false, no error) instead of erroring or re-clearing.
+		run, applied, err := svc.SetState(env.ctx, wkr, id, StateRequest{State: "credential_switch_failed", ClaimGeneration: &g})
+		if err != nil {
+			t.Fatalf("redelivery: err = %v, want nil (benign no-op)", err)
+		}
+		if applied {
+			t.Fatal("an idempotent redelivery after the clear must NOT apply")
+		}
+		if run.Status != "running" {
+			t.Fatalf("status = %q, want running UNCHANGED on redelivery", run.Status)
+		}
+	})
+
+	t.Run("missing claim_generation is ErrInvalidState", func(t *testing.T) {
+		g := int64(7)
+		id := seedHeldRun(t, env, o, 6104, "running", g, true, false)
+		_, applied, err := svc.SetState(env.ctx, wkr, id, StateRequest{State: "credential_switch_failed", ClaimGeneration: nil})
+		if !errors.Is(err, ErrInvalidState) {
+			t.Fatalf("give-up without claim_generation: err = %v, want ErrInvalidState", err)
+		}
+		if applied {
+			t.Fatal("an invalid give-up must not be applied")
+		}
+		// Nothing was cleared — the stamp survives the invalid report.
+		if got := mustRun(t, env, id); !got.CredentialSwitchRequestedAt.Valid {
+			t.Fatal("an invalid give-up (no generation) must clear nothing; the stamp was dropped")
+		}
+	})
+}

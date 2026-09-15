@@ -798,6 +798,37 @@ func (q *Queries) ClearCompletionBudgetExhausted(ctx context.Context, id uuid.UU
 	return result.RowsAffected(), nil
 }
 
+const clearCredentialSwitchByWorker = `-- name: ClearCredentialSwitchByWorker :execrows
+UPDATE runs
+SET credential_switch_requested_at = NULL,
+    credential_switch_generation = NULL,
+    updated_at = now()
+WHERE id = $1
+  AND worker_id = $2
+  AND claim_generation = $3
+  AND claim_released_at IS NULL
+  AND credential_switch_requested_at IS NOT NULL
+`
+
+type ClearCredentialSwitchByWorkerParams struct {
+	ID         uuid.UUID   `json:"id"`
+	WorkerID   pgtype.UUID `json:"worker_id"`
+	Generation int64       `json:"generation"`
+}
+
+// PRD #1247 M5 (D3/D14): a bounded capture-failure give-up (a credential_switch_failed worker
+// report) clears the pending switch stamp WITHOUT changing status — the run keeps running on its
+// current token. Fenced to the CURRENT claim: only the worker holding the exact generation, with
+// the claim NOT released and a stamp actually pending, may clear it, so a stale/superseded/foreign
+// report clears nothing. Idempotent: a second delivery affects 0 rows (already cleared).
+func (q *Queries) ClearCredentialSwitchByWorker(ctx context.Context, arg ClearCredentialSwitchByWorkerParams) (int64, error) {
+	result, err := q.db.Exec(ctx, clearCredentialSwitchByWorker, arg.ID, arg.WorkerID, arg.Generation)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const clearIssueRunsMovePending = `-- name: ClearIssueRunsMovePending :execrows
 UPDATE runs SET move_pending_since = NULL, updated_at = now()
 WHERE repo_id = $1::uuid AND issue_iid = $2 AND move_pending_since IS NOT NULL
