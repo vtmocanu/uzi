@@ -68,6 +68,10 @@ export class FakeApi {
       matchesState: (body: StateRequest) => boolean;
       httpStatus: number;
       runStatus?: string;
+      // PRD #1247 M5b: when set, a 409 refusal carries this TOP-LEVEL disposition (e.g.
+      // "stale_claim"), the shape the server produces when a held-state switch released this
+      // claim or a reclaim superseded it. readRunAck reads it into StateAck.staleClaim.
+      disposition?: string;
       fired: boolean;
     }
   >();
@@ -93,6 +97,11 @@ export class FakeApi {
   stateAttempts = 0;
   readonly states: Array<{ runId: string; body: StateRequest }> = [];
   private readonly stateHooks = new Map<string, (body: StateRequest) => void>();
+  // PRD #1247 M5b: the per-batch MessagesRequest wrapper as it landed (the runMatch handler
+  // otherwise keeps only the flattened `messages[]`, discarding the top-level claim_generation
+  // a capability worker stamps). Additive record; lets a runner test assert the batcher was
+  // wired from the claim.
+  readonly messageBatches: Array<{ runId: string; claim_generation?: number; count: number }> = [];
   private readonly messagesByRun = new Map<string, OutgoingMessage[]>();
   private readonly seenSeqByRun = new Map<string, Set<number>>();
 
@@ -238,12 +247,13 @@ export class FakeApi {
   failStateWhen(
     runId: string,
     matchesState: (body: StateRequest) => boolean,
-    opts: { httpStatus?: number; runStatus?: string } = {},
+    opts: { httpStatus?: number; runStatus?: string; disposition?: string } = {},
   ): void {
     this.stateFailWhen.set(runId, {
       matchesState,
       httpStatus: opts.httpStatus ?? 409,
       runStatus: opts.runStatus,
+      disposition: opts.disposition,
       fired: false,
     });
   }
@@ -547,6 +557,16 @@ export class FakeApi {
       return send(res, this.msgFailStatus, { error: "injected failure" });
     }
     const incoming = (json.messages ?? []) as OutgoingMessage[];
+    // PRD #1247 M5b: record the wrapper as it arrived, so a test can assert claim_generation was
+    // stamped (or omitted). Only when the batch has messages — an empty post is a client no-op.
+    if (incoming.length > 0) {
+      this.messageBatches.push({
+        runId,
+        claim_generation:
+          typeof json.claim_generation === "number" ? json.claim_generation : undefined,
+        count: incoming.length,
+      });
+    }
     const list = this.messagesByRun.get(runId) ?? [];
     const seen = this.seenSeqByRun.get(runId) ?? new Set<number>();
     for (const m of incoming) {
@@ -594,6 +614,8 @@ export class FakeApi {
         return send(res, 409, {
           error: "run already moved on",
           run: { id: runId, status: when.runStatus ?? "cancelled" },
+          // PRD #1247 M5b: a stale_claim (or other) disposition rides TOP-LEVEL when armed.
+          ...(when.disposition ? { disposition: when.disposition } : {}),
         });
       }
       return send(res, when.httpStatus, { error: "injected state failure" });
