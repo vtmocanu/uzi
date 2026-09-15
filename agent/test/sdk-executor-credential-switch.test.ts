@@ -176,3 +176,170 @@ describe("SdkExecutor — credential switch mid-turn (PRD #1247 M5b)", () => {
     );
   });
 });
+
+// PRD #1247 M5b (data-integrity fix) — the executor now handles the switch IN PLACE via
+// ctx.attemptCredentialSwitch instead of always propagating it. A "released" outcome ends the run
+// with switchReleased surfaced (the runner skips finalize); a "gave_up" outcome CONTINUES the run on
+// the OLD token (a restarted turn, or a re-presented gate/question/follow-up wait). Driven directly
+// with a fake attemptCredentialSwitch so the dispatch is provable with no runner and no steering.
+
+/** An implement/done turn: a text frame plus signal_done, then a success result. */
+function doneTurn(sessionId = "sess-1"): SDKMessage[] {
+  return [
+    {
+      type: "assistant",
+      session_id: sessionId,
+      message: {
+        content: [
+          { type: "text", text: "done implementing" },
+          { type: "tool_use", id: "d", name: "mcp__uzi__signal_done", input: {} },
+        ],
+      },
+    } as unknown as SDKMessage,
+    resultSuccess(sessionId),
+  ];
+}
+
+describe("SdkExecutor — credential switch handled IN PLACE (PRD #1247 M5b data-integrity fix)", () => {
+  it("RUNNING switch → attemptCredentialSwitch 'released' → run() ENDS with switchReleased, no throw", async () => {
+    // Plan turn, then the implement turn is tripped at iteration 1 by aborting the shared controller
+    // with a CredentialSwitchSignal reason. The turn catch calls attemptCredentialSwitch → "released"
+    // and BREAKS the loop, so run() RESOLVES (never rejects) with switchReleased latched.
+    const { queryFn } = fakeTurns([[submitPlan("# Plan"), resultSuccess()]]);
+    const cancel = new AbortController();
+    let attempts = 0;
+    const { ctx } = makeCtx({
+      signal: cancel.signal,
+      attemptCredentialSwitch: async () => {
+        attempts++;
+        return "released";
+      },
+      reportIteration: async (n) => {
+        if (n === 1) cancel.abort(new CredentialSwitchSignal());
+        return undefined;
+      },
+    });
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    assert.strictEqual(result.switchReleased, true, "the release is surfaced so the runner skips finalize");
+    assert.strictEqual(attempts, 1, "the switch was handled in place exactly once");
+  });
+
+  it("RUNNING switch → attemptCredentialSwitch 'gave_up' → the loop CONTINUES on the old token and completes normally", async () => {
+    // The iteration-1 implement turn is tripped by the switch; attemptCredentialSwitch returns
+    // "gave_up", so the turn catch clears the trip and CONTINUES. The next iteration drives the done
+    // turn and the run completes NORMALLY — no throw, and switchReleased is NOT surfaced (the run kept
+    // executing rather than being released).
+    const { queryFn } = fakeTurns([[submitPlan("# Plan"), resultSuccess()], doneTurn()]);
+    const cancel = new AbortController();
+    let attempts = 0;
+    const { ctx } = makeCtx({
+      signal: cancel.signal,
+      attemptCredentialSwitch: async () => {
+        attempts++;
+        return "gave_up";
+      },
+      reportIteration: async (n) => {
+        if (n === 1) cancel.abort(new CredentialSwitchSignal());
+        return undefined;
+      },
+    });
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    assert.strictEqual(result.switchReleased, undefined, "a give-up does NOT surface switchReleased — the run continued");
+    assert.strictEqual(attempts, 1, "the switch was attempted once, in place");
+  });
+
+  it("HELD plan gate switch → 'gave_up' → RE-PRESENTS the gate on the old token, then a real approve completes the run", async () => {
+    // The gate waiter rejects with a CredentialSwitchSignal (a run idling at the plan gate). The gate
+    // wait's switch handling attempts the switch → "gave_up" → runThroughSwitch re-runs ctx.gatePlan
+    // (re-present the gate). The SECOND gatePlan returns approve, so the run proceeds to implement and
+    // completes — proving the gate stayed live on the old token after the give-up.
+    const { queryFn } = fakeTurns([[submitPlan("# Plan"), resultSuccess()], doneTurn()]);
+    let gateCalls = 0;
+    let attempts = 0;
+    const { ctx } = makeCtx({
+      gatePlan: async () => {
+        gateCalls++;
+        if (gateCalls === 1) throw new CredentialSwitchSignal();
+        return { kind: "approve", selection: { status: "absent" } };
+      },
+      attemptCredentialSwitch: async () => {
+        attempts++;
+        return "gave_up";
+      },
+    });
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    assert.strictEqual(result.switchReleased, undefined, "a gate give-up does NOT release — it re-waits");
+    assert.strictEqual(gateCalls, 2, "the gate was RE-PRESENTED after the give-up");
+    assert.strictEqual(attempts, 1, "the switch was attempted once at the gate");
+  });
+
+  it("HELD plan gate switch → 'released' → run() ENDS with switchReleased and NO implement turn runs", async () => {
+    // A switch at the gate that RELEASES: phasePlanGate returns early with switchReleased, so run()
+    // resolves without ever entering the implement loop (the reclaim re-presents this plan on the new
+    // token). The done turn is scripted but must never be consumed.
+    const { queryFn, turnCount } = fakeTurns([[submitPlan("# Plan"), resultSuccess()], doneTurn()]);
+    let attempts = 0;
+    const { ctx } = makeCtx({
+      gatePlan: async () => {
+        throw new CredentialSwitchSignal();
+      },
+      attemptCredentialSwitch: async () => {
+        attempts++;
+        return "released";
+      },
+    });
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    assert.strictEqual(result.switchReleased, true, "a gate release is surfaced so the runner skips finalize");
+    assert.strictEqual(attempts, 1, "the switch was attempted once at the gate");
+    assert.strictEqual(turnCount(), 1, "only the plan turn ran — the release ended the run before implementing");
+  });
+
+  it("interactive follow-up wait switch → 'released' → run() ENDS with switchReleased", async () => {
+    // An interactive task run parks at awaitFollowUp on a clean signal_done. The follow-up waiter
+    // rejects with a CredentialSwitchSignal; the wait's switch handling attempts the switch →
+    // "released" → the loop breaks with switchReleased surfaced.
+    const { queryFn } = fakeTurns([[submitPlan("# Plan"), resultSuccess()], doneTurn()]);
+    let attempts = 0;
+    let followUpCalls = 0;
+    const { ctx } = makeCtx({
+      interactive: true,
+      awaitFollowUp: async () => {
+        followUpCalls++;
+        throw new CredentialSwitchSignal();
+      },
+      attemptCredentialSwitch: async () => {
+        attempts++;
+        return "released";
+      },
+    });
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    assert.strictEqual(result.switchReleased, true, "the follow-up-wait release is surfaced");
+    assert.strictEqual(attempts, 1, "the switch was attempted once at the follow-up wait");
+    assert.strictEqual(followUpCalls, 1, "the follow-up wait was entered once before the release");
+  });
+
+  it("interactive follow-up wait switch → 'gave_up' → RE-PARKS the wait on the old token, then a normal idle end completes", async () => {
+    // The follow-up waiter rejects with a switch; attemptCredentialSwitch → "gave_up" → runThroughSwitch
+    // re-parks the wait. The SECOND awaitFollowUp resolves with a normal idle end, so the run finalizes
+    // normally (no release, no throw) — the audit flagged this waiter as previously untested.
+    const { queryFn } = fakeTurns([[submitPlan("# Plan"), resultSuccess()], doneTurn()]);
+    let attempts = 0;
+    let followUpCalls = 0;
+    const { ctx } = makeCtx({
+      interactive: true,
+      awaitFollowUp: async () => {
+        followUpCalls++;
+        if (followUpCalls === 1) throw new CredentialSwitchSignal();
+        return { kind: "ended", reason: "idle" };
+      },
+      attemptCredentialSwitch: async () => {
+        attempts++;
+        return "gave_up";
+      },
+    });
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    assert.strictEqual(result.switchReleased, undefined, "a follow-up give-up does NOT release — it re-parks");
+    assert.strictEqual(attempts, 1, "the switch was attempted once at the follow-up wait");
+    assert.strictEqual(followUpCalls, 2, "the follow-up wait was RE-PARKED on the old token after the give-up");
+  });
+});

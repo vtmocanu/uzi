@@ -88,6 +88,44 @@ function makeSwitchExecutor(
   return { executor, captureAttempts };
 }
 
+// makeInPlaceSwitchExecutor models the DATA-INTEGRITY fix (PRD #1247 M5b): the executor handles the
+// switch IN PLACE by CALLING ctx.attemptCredentialSwitch (which the runner wires to
+// enterCredentialSwitch) instead of throwing to the outer catch. The stub stubs the same capture git
+// as makeSwitchExecutor, then acts on the outcome exactly as the real loop does: "released" → return
+// switchReleased so phasePublish skips finalize; "gave_up" → the run CONTINUES on the old token, here
+// modelled as a later NORMAL (report-only) completion that then cleans up as usual.
+function makeInPlaceSwitchExecutor(verdict: CaptureVerdict): SwitchProbe {
+  const captureAttempts = { count: 0 };
+  const executor: Executor = {
+    run: async (ctx: RunContext) => {
+      const dirty = verdict === "dirty_fail";
+      git.worktreeStatus = (async () => (dirty ? ["M src/impl.ts"] : [])) as typeof git.worktreeStatus;
+      git.commitWipMarker = (async () => !dirty) as typeof git.commitWipMarker;
+      git.fetchAgentBranch = (async () =>
+        `refs/uzi-runner/${ctx.branch}`) as typeof git.fetchAgentBranch;
+      git.verifyRunnerTrackingCovers = (async () => {
+        captureAttempts.count++;
+        return !dirty;
+      }) as typeof git.verifyRunnerTrackingCovers;
+      git.trackingTip = (async () => "cafef00dcafef00dcafef00dcafef00dcafef00d") as typeof git.trackingTip;
+      git.checkpointPack = (async () => null) as typeof git.checkpointPack;
+      const outcome = await ctx.attemptCredentialSwitch!();
+      if (outcome === "released") {
+        // The loop broke with switchReleased latched; the runner skips finalize.
+        return { branch: ctx.branch, switchReleased: true };
+      }
+      // "gave_up" — the run CONTINUES on the old token. Model a later NORMAL completion (report-only,
+      // so the test needs no push/MR plumbing) that must then clean up the clone + HOME as usual.
+      return {
+        branch: ctx.branch,
+        reportOnly: true,
+        summary: "continued on the old token after the credential-switch give-up",
+      };
+    },
+  };
+  return { executor, captureAttempts };
+}
+
 function statuses(runId: string): string[] {
   return api.states.filter((s) => s.runId === runId).map((s) => s.body.status);
 }
@@ -194,6 +232,60 @@ describe("RunRunner — held-state credential switch (PRD #1247 M5b)", () => {
       assert.ok(msgAt >= 0, "the pending message batch was delivered");
       assert.ok(releaseAt >= 0, "the credential_switch release was reported");
       assert.ok(msgAt < releaseAt, "the message batch DRAINED before the credential_switch release report");
+    } finally {
+      fs.rmSync(home.root, { recursive: true, force: true });
+    }
+  });
+
+  // --- PRD #1247 M5b data-integrity fix: the IN-PLACE ctx.attemptCredentialSwitch path -----------
+  // The executor now handles the switch via ctx.attemptCredentialSwitch (wired to enterCredentialSwitch)
+  // instead of throwing to the outer catch. These pin the RUNNER side of that wiring: the flag-clear on
+  // give-up (so the continuing run cleans up normally) and the phasePublish switchReleased short-circuit.
+
+  it("give-up via ctx.attemptCredentialSwitch CONTINUES: reports credential_switch_failed, CLEARS the preserve flags, and a later normal completion cleans up the clone + HOME", async () => {
+    const { gitlab, calls } = fakeGitlab();
+    const { executor, captureAttempts } = makeInPlaceSwitchExecutor("dirty_fail");
+    const home = seedHome();
+    const claim = gitlabClaim(1264);
+    try {
+      await runnerWith(() => ({ executor, homeDir: home.homeDir }), gitlab, undefined, undefined, {
+        recoveryRetryMs: 1,
+      }).execute(claim);
+
+      const s = statuses(claim.run_id);
+      assert.ok(s.includes("credential_switch_failed"), "give-up reports credential_switch_failed (server clears the stamp, keeps the run)");
+      assert.ok(!s.includes("credential_switch"), "the release is NEVER reported on a give-up");
+      assert.ok(!s.includes("failed"), "a running give-up never fails the run");
+      assert.ok(s.includes("completed"), "the run CONTINUED on the old token and reached a NORMAL completion");
+      assert.strictEqual(calls.length, 0, "the report-only completion opens no MR");
+      assert.strictEqual(captureAttempts.count, 0, "the dirty WIP commit fails before the positive-verify step");
+      // The give-up CLEARED the preserve flags (the run continued normally), so the NORMAL completion
+      // cleans up as usual — the clone AND the HOME are removed, NOT preserved.
+      assert.strictEqual(fs.existsSync(worktreeDirFor(1264)), false, "the clone is cleaned up on the normal completion (flags cleared)");
+      assert.strictEqual(fs.existsSync(home.sentinel), false, "the HOME is cleaned up on the normal completion (flags cleared)");
+    } finally {
+      fs.rmSync(home.root, { recursive: true, force: true });
+    }
+  });
+
+  it("release via ctx.attemptCredentialSwitch ENDS: switchReleased skips finalize (no completed/MR), clone retired, HOME preserved", async () => {
+    const { gitlab, calls } = fakeGitlab();
+    const { executor } = makeInPlaceSwitchExecutor("verified");
+    const home = seedHome();
+    const claim = gitlabClaim(1265);
+    try {
+      api.overrideStateStatus(claim.run_id, "queued"); // the release requeues the run
+      await runnerWith(() => ({ executor, homeDir: home.homeDir }), gitlab, undefined, undefined, {
+        recoveryRetryMs: 1,
+      }).execute(claim);
+
+      const s = statuses(claim.run_id);
+      assert.ok(s.includes("credential_switch"), "the release reported credential_switch");
+      assert.ok(!s.includes("completed"), "phasePublish SKIPS finalize on switchReleased — no completed report");
+      assert.ok(!s.includes("failed"), "a released run is not failed");
+      assert.strictEqual(calls.length, 0, "a released run opens no MR");
+      assert.strictEqual(fs.existsSync(worktreeDirFor(1265)), false, "the clone is retired on release");
+      assert.strictEqual(fs.existsSync(home.sentinel), true, "the HOME is preserved for the reclaim");
     } finally {
       fs.rmSync(home.root, { recursive: true, force: true });
     }
