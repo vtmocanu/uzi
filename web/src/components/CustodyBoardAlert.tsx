@@ -45,6 +45,15 @@ export function CustodyBoardAlert({ recoveryWaitCount }: { recoveryWaitCount: nu
 
   const danger = view.tone === "danger";
   const accent = danger ? "text-danger" : "text-warn";
+  // The Workers "Held work" panel is now decision-only (PRD #1371): it self-hides unless a
+  // hold needs an owner decision. So the "Review held work" CTA — and the "resolve" body
+  // copy — only make sense when a decision is actually pending. When the alert is visible
+  // from admission pressure alone (at the limit or blocked runs with decision_needed == 0),
+  // there is nothing to review there, so we render no CTA and non-actionable wait copy.
+  // That wait copy ("all custody slots are in use") is truthful because a non-actionable alert
+  // only shows under admission pressure: custodyAlertView requires blocked_runs > 0 or at-limit
+  // when decision_needed == 0, so it never renders in a below-capacity state.
+  const actionable = view.decisionNeeded > 0;
 
   return (
     <section
@@ -68,9 +77,11 @@ export function CustodyBoardAlert({ recoveryWaitCount }: { recoveryWaitCount: nu
               <span className="text-xs tabular-nums text-muted">{view.slotsLabel}</span>
             </div>
             <p className="text-sm text-muted">
-              {danger
-                ? "Every custody slot is in use, so new code runs cannot claim a worker until you resolve held work."
-                : "Some runs are retaining unpublished committed work that only you can resolve."}
+              {actionable
+                ? danger
+                  ? "Every custody slot is in use, so new code runs cannot claim a worker until you resolve held work."
+                  : "Some runs are retaining unpublished committed work that only you can resolve."
+                : "All custody slots are in use by active work. New code runs must wait for a hold to release."}
             </p>
             <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted">
               {/* Each count line renders only when its value > 0 (matching recoveryWaitCount),
@@ -93,23 +104,28 @@ export function CustodyBoardAlert({ recoveryWaitCount }: { recoveryWaitCount: nu
             </div>
           </div>
         </div>
-        <div className="shrink-0">
-          {/* One primary action (D8): the Workers resolution surface. A <Link> STYLED as a
-              button (never a <Link> wrapping a <Button>): a nested anchor+button is two tab
-              stops and a doubled screen-reader announcement, and invalid HTML. The global
-              a:focus-visible rule (index.css) gives it the same keyboard ring. */}
-          <Link
-            to="/workers?tab=workers#recovery-holds"
-            className={cx(
-              "inline-flex h-7 shrink-0 select-none items-center justify-center gap-1 rounded-lg px-2.5 text-xs font-medium transition-colors",
-              danger
-                ? "bg-brand text-on-brand hover:bg-brand-hover"
-                : "border border-edge bg-raised text-fg hover:border-edge-strong hover:bg-raised/70",
-            )}
-          >
-            Review held work <ChevronRightIcon />
-          </Link>
-        </div>
+        {/* The CTA points at the Workers "Held work" panel, which now self-hides unless a
+            hold needs a decision (PRD #1371). Render it ONLY when a decision is pending; when
+            the alert is up from admission pressure alone there is nothing to review there. */}
+        {actionable && (
+          <div className="shrink-0">
+            {/* One primary action (D8): the Workers resolution surface. A <Link> STYLED as a
+                button (never a <Link> wrapping a <Button>): a nested anchor+button is two tab
+                stops and a doubled screen-reader announcement, and invalid HTML. The global
+                a:focus-visible rule (index.css) gives it the same keyboard ring. */}
+            <Link
+              to="/workers?tab=workers#recovery-holds"
+              className={cx(
+                "inline-flex h-7 shrink-0 select-none items-center justify-center gap-1 rounded-lg px-2.5 text-xs font-medium transition-colors",
+                danger
+                  ? "bg-brand text-on-brand hover:bg-brand-hover"
+                  : "border border-edge bg-raised text-fg hover:border-edge-strong hover:bg-raised/70",
+              )}
+            >
+              Review held work <ChevronRightIcon />
+            </Link>
+          </div>
+        )}
       </div>
     </section>
   );

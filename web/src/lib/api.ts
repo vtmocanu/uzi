@@ -1026,13 +1026,16 @@ const realApi = {
   // attachment link, see runArchiveDownloadUrl.
   getRunArchives: (id: string) =>
     request<RecoveryArchiveSummary>("GET", `/runs/${id}/archives`),
-  // Owner custody holds (PRD #1349 M5/M6, D7/D8): the owner-wide hold listing plus the
+  // Owner custody holds (PRD #1349 M5/M6, D7/D8; #1371): the owner-wide hold listing plus the
   // aggregate safety-slot/decision/blocked counts that drive the board alert and the
   // Workers resolution surface. RequireUser (session cookie OR owner CLI Bearer), so it is
   // NOT the per-run getRunArchives strict-owner-404 path — it returns the caller's own
   // holds across every run. Best-effort at the call sites: a fetch failure hides the alert.
+  // ?state=open bounds the returned rows to still-open holds (the server validates state as
+  // absent|open); released/discarded rows are excluded so the surface reads only live holds.
+  // The aggregate stays owner-wide regardless of the filter.
   getRecoveryHolds: () =>
-    request<RecoveryCustodyHolds>("GET", "/recovery/holds"),
+    request<RecoveryCustodyHolds>("GET", "/recovery/holds?state=open"),
   // Delete one owner-owned recovery ARCHIVE artifact (PRD #1296 / #1349 M6, D7/D9). This is
   // artifact cleanup only — it deletes the encrypted archive bytes for one capture and does
   // NOT disposition the parent custody hold (that is discardHold below). Owner-scoped: a

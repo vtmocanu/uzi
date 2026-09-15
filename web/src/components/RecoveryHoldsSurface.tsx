@@ -38,8 +38,13 @@ export function RecoveryHoldsSurface() {
   }, [load]);
   usePollWhileVisible(load, 10000);
 
-  if (!holds || holds.holds.length === 0) return null;
-  const groups = groupHoldsByWorker(holds.holds);
+  if (!holds) return null;
+  // Decision-only surface (PRD #1371): render only holds that need an owner decision
+  // (needs_action / source_only). Healthy active/capturing/archive_ready and terminal
+  // released/discarded show nothing; the card self-hides when nothing needs a decision.
+  const decisionHolds = holds.holds.filter((h) => custodyHoldView(h).needsDecision);
+  if (decisionHolds.length === 0) return null;
+  const groups = groupHoldsByWorker(decisionHolds);
   const { open_holds, custody_hold_limit, decision_needed } = holds.aggregate;
 
   return (
@@ -65,8 +70,7 @@ export function RecoveryHoldsSurface() {
 
       <p className="text-sm text-muted">
         Each hold retains one run's unpublished committed work so it survives a failed
-        finalization. Active protection clears itself; holds that need a decision are the ones
-        only you can resolve.
+        finalization. These are the holds only you can resolve.
       </p>
 
       <div className="space-y-4">

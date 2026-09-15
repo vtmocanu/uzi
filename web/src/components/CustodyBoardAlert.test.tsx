@@ -60,6 +60,10 @@ describe("CustodyBoardAlert", () => {
     expect(screen.getByText(/run blocked/)).toBeTruthy();
     // recovery_wait_count is surfaced for diagnosis.
     expect(screen.getByText(/runs waiting to recover/)).toBeTruthy();
+    // Actionable (a decision is pending): the CTA to the resolution surface renders and the
+    // body uses the "only you can resolve" copy (PRD #1371).
+    expect(screen.getByRole("link", { name: /Review held work/ })).toBeTruthy();
+    expect(screen.getByText(/only you can resolve/)).toBeTruthy();
   });
 
   it("escalates to an assertive alert at the admission limit and links to the resolution surface", async () => {
@@ -77,15 +81,36 @@ describe("CustodyBoardAlert", () => {
     expect(screen.queryByRole("button", { name: /Review held work/ })).toBeNull();
   });
 
-  it("gates zero-valued counts: no '0 holds need a decision' / '0 runs blocked' line", async () => {
+  it("gates zero-valued counts and omits the CTA when no decision is pending (PRD #1371)", async () => {
     // At the admission limit with no decisions and no blocked runs, the danger alert still
     // shows (atLimit), but neither count line renders — matching how recoveryWaitCount is
-    // already gated > 0.
+    // already gated > 0. And since the Workers panel is now decision-only, the "Review held
+    // work" CTA is omitted and the body shows non-actionable wait copy, not "resolve" copy.
     await renderAlert(holds({ open_holds: 8, custody_hold_limit: 8, decision_needed: 0, blocked_runs: 0 }));
     expect(screen.getByRole("alert")).toBeTruthy();
     expect(screen.getByText(/Held work is blocking new runs/)).toBeTruthy();
     expect(screen.queryByText(/needs? a decision/)).toBeNull();
     expect(screen.queryByText(/runs? blocked/)).toBeNull();
+    // Non-actionable: no CTA to the (now hidden) resolution panel, and wait copy not resolve copy.
+    expect(screen.queryByRole("link", { name: /Review held work/ })).toBeNull();
+    expect(screen.getByText(/New code runs must wait for a hold to release/)).toBeTruthy();
+    expect(screen.queryByText(/until you resolve held work/)).toBeNull();
+  });
+
+  it("stays truthful when the alert is up from admission pressure alone: wait copy, no CTA (PRD #1371, AC #6)", async () => {
+    // At the limit with blocked runs but NO hold needing a decision. The Workers "Held work"
+    // panel now self-hides in this state, so the CTA that points at it must not render, and
+    // the body must not promise a resolution the owner cannot reach.
+    await renderAlert(holds({ open_holds: 8, custody_hold_limit: 8, decision_needed: 0, blocked_runs: 2 }));
+    expect(screen.getByRole("alert")).toBeTruthy();
+    expect(screen.getByText(/Held work is blocking new runs/)).toBeTruthy();
+    // The blocked-runs count still renders (it gates on > 0); the decision line does not.
+    expect(screen.getByText(/runs blocked/)).toBeTruthy();
+    expect(screen.queryByText(/needs? a decision/)).toBeNull();
+    // No CTA / anchor to the hidden panel, and non-actionable wait copy (not the resolve copy).
+    expect(screen.queryByRole("link", { name: /Review held work/ })).toBeNull();
+    expect(screen.getByText(/New code runs must wait for a hold to release/)).toBeTruthy();
+    expect(screen.queryByText(/until you resolve held work/)).toBeNull();
   });
 
   it("updates live: a poll that crosses the limit turns a hidden alert into a danger alert", async () => {

@@ -307,13 +307,29 @@ func (h *Handler) DiscardRecoveryArchive(w http.ResponseWriter, r *http.Request)
 // D7). It is owner-scoped in SQL by the caller's user id (no run scope, no GetRun gate) — the
 // board alert and Workers surface read the whole list, and `uzi run recovery` narrows by run
 // client-side. Mounted under RequireUser so a session cookie OR a uzc_/uza_ CLI Bearer reach it.
+// An optional ?state=open filter (PRD #1371) bounds the list to live custody for the web hot
+// poll; absent state returns all rows (the CLI's all-states contract). The aggregate is always
+// owner-wide, independent of the filter.
 func (h *Handler) ListRecoveryHolds(w http.ResponseWriter, r *http.Request) {
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	holds, err := h.recovery().ListHoldsForOwner(r.Context(), user.ID)
+	// Bound per consumer (PRD #1371): the web sends ?state=open to drop resolved history from
+	// the hot poll; absent state returns all rows (the CLI's all-states contract via
+	// `uzi run recovery`). Strict allowlist — anything but absent/open is a 400, so arbitrary
+	// state filtering is never exposed.
+	openOnly := false
+	switch r.URL.Query().Get("state") {
+	case "":
+	case "open":
+		openOnly = true
+	default:
+		httpx.Error(w, http.StatusBadRequest, "invalid state filter; only 'open' is supported")
+		return
+	}
+	holds, err := h.recovery().ListHoldsForOwner(r.Context(), user.ID, openOnly)
 	if err != nil {
 		slog.Error("recovery holds: list", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")

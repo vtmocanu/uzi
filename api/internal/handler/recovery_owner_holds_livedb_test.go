@@ -363,3 +363,150 @@ func TestRecoveryOwnerHoldsAggregateAndAttentionLiveDB(t *testing.T) {
 		t.Errorf("decision_needed = %d, want 2 (source_only + needs_action)", got.Aggregate.DecisionNeeded)
 	}
 }
+
+// custodySeedTerminalHold seeds a hold (via custodySeedRunHold) then transitions it to the given
+// TERMINAL state (released or discarded), modelling resolved custody history the way the
+// release/discard UPDATEs do: it nulls the live worker/run FKs and stamps released_at. Returns the
+// run and hold ids. Used to prove ?state=open drops resolved rows while the unfiltered list keeps
+// them (PRD #1371).
+func custodySeedTerminalHold(t *testing.T, pool *pgxpool.Pool, owner, conn, worker uuid.UUID, projectID int64, state string, gen int64) (uuid.UUID, uuid.UUID) {
+	t.Helper()
+	run, hold := custodySeedRunHold(t, pool, owner, conn, worker, projectID, "failed", gen)
+	cliMustExec(t, pool,
+		`UPDATE recovery_custody_holds
+		    SET state = $2, live_worker_id = NULL, live_run_id = NULL, released_at = now()
+		  WHERE id = $1`,
+		hold, state)
+	return run, hold
+}
+
+// TestRecoveryOwnerHoldsUnfilteredIncludesTerminalLiveDB (PRD #1371 AC #1) proves the DEFAULT
+// (no ?state) GET /api/recovery/holds still returns terminal (released/discarded) rows — the CLI's
+// all-states contract via `uzi run recovery` is unchanged.
+func TestRecoveryOwnerHoldsUnfilteredIncludesTerminalLiveDB(t *testing.T) {
+	_, router, pool := cliLiveDB(t)
+	owner := cliSeedUser(t, pool, false)
+	uzc := cliMintToken(t, pool, owner, clitoken.ScopeUser)
+	conn := rmSeedConn(t, pool, owner)
+	worker := custodySeedWorker(t, pool, owner)
+
+	// One live (open) hold plus a released and a discarded hold (resolved history).
+	_, hOpen := custodySeedRunHold(t, pool, owner, conn, worker, 4210, "running", 1)
+	_, hReleased := custodySeedTerminalHold(t, pool, owner, conn, worker, 4211, "released", 1)
+	_, hDiscarded := custodySeedTerminalHold(t, pool, owner, conn, worker, 4212, "discarded", 1)
+
+	rec := bearerReq(router, http.MethodGet, "/api/recovery/holds", uzc)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unfiltered GET holds = %d, want 200\nbody: %s", rec.Code, rec.Body.String())
+	}
+	var got apitypes.RecoveryCustodyHoldsDTO
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	states := map[string]string{}
+	for _, h := range got.Holds {
+		states[h.ID] = h.State
+	}
+	if states[hReleased.String()] != "released" {
+		t.Errorf("released hold state in unfiltered list = %q, want released (all-states contract)", states[hReleased.String()])
+	}
+	if states[hDiscarded.String()] != "discarded" {
+		t.Errorf("discarded hold state in unfiltered list = %q, want discarded (all-states contract)", states[hDiscarded.String()])
+	}
+	if states[hOpen.String()] != "open" {
+		t.Errorf("open hold state in unfiltered list = %q, want open", states[hOpen.String()])
+	}
+	if len(got.Holds) != 3 {
+		t.Errorf("unfiltered holds count = %d, want 3 (open + released + discarded)", len(got.Holds))
+	}
+}
+
+// TestRecoveryOwnerHoldsOpenFilterDropsTerminalLiveDB (PRD #1371 AC #2) proves ?state=open omits
+// released/discarded rows while the aggregate stays owner-wide and EXACT: it is computed by the
+// separate GetCustodyAggregateForOwner query (not from the returned rows), so open_holds and
+// decision_needed are identical to the unfiltered call even though the terminal rows are gone.
+func TestRecoveryOwnerHoldsOpenFilterDropsTerminalLiveDB(t *testing.T) {
+	_, router, pool := cliLiveDB(t)
+	owner := cliSeedUser(t, pool, false)
+	uzc := cliMintToken(t, pool, owner, clitoken.ScopeUser)
+	conn := rmSeedConn(t, pool, owner)
+	worker := custodySeedWorker(t, pool, owner)
+
+	// A decision-bearing OPEN hold (source_only: terminal run, no capture) plus resolved history.
+	_, hSource := custodySeedRunHold(t, pool, owner, conn, worker, 4220, "failed", 1)
+	_, hReleased := custodySeedTerminalHold(t, pool, owner, conn, worker, 4221, "released", 1)
+	_, hDiscarded := custodySeedTerminalHold(t, pool, owner, conn, worker, 4222, "discarded", 1)
+
+	// Unfiltered: all three rows, aggregate owner-wide.
+	rec := bearerReq(router, http.MethodGet, "/api/recovery/holds", uzc)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unfiltered GET = %d, want 200\nbody: %s", rec.Code, rec.Body.String())
+	}
+	var all apitypes.RecoveryCustodyHoldsDTO
+	if err := json.Unmarshal(rec.Body.Bytes(), &all); err != nil {
+		t.Fatalf("decode unfiltered: %v", err)
+	}
+	if len(all.Holds) != 3 {
+		t.Fatalf("unfiltered holds = %d, want 3", len(all.Holds))
+	}
+
+	// ?state=open: only the open hold, terminal rows dropped.
+	rec = bearerReq(router, http.MethodGet, "/api/recovery/holds?state=open", uzc)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("open-filtered GET = %d, want 200\nbody: %s", rec.Code, rec.Body.String())
+	}
+	var open apitypes.RecoveryCustodyHoldsDTO
+	if err := json.Unmarshal(rec.Body.Bytes(), &open); err != nil {
+		t.Fatalf("decode open-filtered: %v", err)
+	}
+	if len(open.Holds) != 1 || open.Holds[0].ID != hSource.String() {
+		t.Fatalf("open-filtered holds = %+v, want only the open source_only hold %s", open.Holds, hSource)
+	}
+	for _, h := range open.Holds {
+		if h.State != "open" {
+			t.Errorf("open-filtered hold %s state = %q, want open", h.ID, h.State)
+		}
+		if h.ID == hReleased.String() || h.ID == hDiscarded.String() {
+			t.Errorf("open-filtered list leaked terminal hold %s", h.ID)
+		}
+	}
+
+	// The aggregate is owner-wide and IDENTICAL across both calls (independent of the row filter).
+	if open.Aggregate.OpenHolds != all.Aggregate.OpenHolds {
+		t.Errorf("open_holds changed under filter: open=%d unfiltered=%d", open.Aggregate.OpenHolds, all.Aggregate.OpenHolds)
+	}
+	if open.Aggregate.DecisionNeeded != all.Aggregate.DecisionNeeded {
+		t.Errorf("decision_needed changed under filter: open=%d unfiltered=%d", open.Aggregate.DecisionNeeded, all.Aggregate.DecisionNeeded)
+	}
+	if open.Aggregate.CustodyHoldLimit != all.Aggregate.CustodyHoldLimit {
+		t.Errorf("custody_hold_limit changed under filter: open=%d unfiltered=%d", open.Aggregate.CustodyHoldLimit, all.Aggregate.CustodyHoldLimit)
+	}
+	if open.Aggregate.BlockedRuns != all.Aggregate.BlockedRuns {
+		t.Errorf("blocked_runs changed under filter: open=%d unfiltered=%d", open.Aggregate.BlockedRuns, all.Aggregate.BlockedRuns)
+	}
+	// And the aggregate reflects the owner-wide truth: exactly one open, decision-bearing hold.
+	if open.Aggregate.OpenHolds != 1 {
+		t.Errorf("open_holds = %d, want 1 (only the source_only hold is open)", open.Aggregate.OpenHolds)
+	}
+	if open.Aggregate.DecisionNeeded != 1 {
+		t.Errorf("decision_needed = %d, want 1 (the source_only hold)", open.Aggregate.DecisionNeeded)
+	}
+}
+
+// TestRecoveryOwnerHoldsInvalidStateFilterLiveDB (PRD #1371 AC #3) proves an unknown ?state value
+// is a strict-allowlist 400 (only absent/open are accepted). It lives in this shared auth-mounted
+// harness even though the 400 returns before any DB work.
+func TestRecoveryOwnerHoldsInvalidStateFilterLiveDB(t *testing.T) {
+	_, router, pool := cliLiveDB(t)
+	owner := cliSeedUser(t, pool, false)
+	uzc := cliMintToken(t, pool, owner, clitoken.ScopeUser)
+
+	// ?state=bogus → 400, rejected BEFORE any service/DB call.
+	if rec := bearerReq(router, http.MethodGet, "/api/recovery/holds?state=bogus", uzc); rec.Code != http.StatusBadRequest {
+		t.Fatalf("GET ?state=bogus = %d, want 400\nbody: %s", rec.Code, rec.Body.String())
+	}
+	// A real-but-unexposed state (released) is equally rejected — the allowlist is exactly {open}.
+	if rec := bearerReq(router, http.MethodGet, "/api/recovery/holds?state=released", uzc); rec.Code != http.StatusBadRequest {
+		t.Fatalf("GET ?state=released = %d, want 400", rec.Code)
+	}
+}

@@ -78,33 +78,56 @@ describe("RecoveryHoldsSurface", () => {
     expect(container.innerHTML).toBe("");
   });
 
-  it("groups holds by worker and shows each attention's state label", async () => {
+  it("shows only decision-needed holds, grouped by worker, filtering out healthy protection (PRD #1371)", async () => {
+    // A mix across two workers: healthy active + archive_ready on base (M) (filtered out), a
+    // needs_action on base (M) and a source_only on jvm-worker (both shown). The surface is
+    // decision-only, so the healthy rows never appear.
     await renderSurface(
       listing([
         hold({ id: "h-active", worker_id: "wa", worker_name: "base (M)", attention: "active" }),
         hold({ id: "h-ready", worker_id: "wa", worker_name: "base (M)", attention: "archive_ready", generation: 2, has_available_capture: true, capture_state: "available" }),
+        hold({ id: "h-need", worker_id: "wa", worker_name: "base (M)", attention: "needs_action", generation: 3 }),
         hold({ id: "h-src", worker_id: "wb", worker_name: "jvm-worker", attention: "source_only" }),
       ]),
     );
-    expect(screen.getByText("Active protection")).toBeTruthy();
-    expect(screen.getByText("Archive ready")).toBeTruthy();
+    // Only the decision holds render, each with its state label.
+    expect(screen.getByText("Needs attention")).toBeTruthy();
     expect(screen.getByText("Decision required")).toBeTruthy();
-    // Both worker groups are present.
+    // Healthy protection is filtered out entirely.
+    expect(screen.queryByText("Active protection")).toBeNull();
+    expect(screen.queryByText("Archive ready")).toBeNull();
+    // Both worker groups (each carrying a decision hold) are present.
     expect(screen.getByText("jvm-worker")).toBeTruthy();
     expect(screen.getAllByText("base (M)").length).toBeGreaterThan(0);
   });
 
-  it("renders an archive_ready hold as Export-only + releasing-automatically, never as a discard", async () => {
-    await renderSurface(
-      listing([hold({ id: "h-ready", attention: "archive_ready", has_available_capture: true, capture_state: "available" })]),
+  it("hides when every open hold is healthy (active/capturing/archive_ready) (PRD #1371)", async () => {
+    // None of these need an owner decision, so the decision-only surface renders nothing —
+    // even the archive_ready export lives on the run view now.
+    const { container } = await renderSurface(
+      listing([
+        hold({ id: "h-active", attention: "active" }),
+        hold({ id: "h-capturing", attention: "capturing", generation: 2 }),
+        hold({ id: "h-ready", attention: "archive_ready", generation: 3, has_available_capture: true, capture_state: "available" }),
+      ]),
     );
-    expect(screen.getByText(/Releasing automatically/)).toBeTruthy();
-    expect(screen.getByRole("link", { name: /Export archive/ })).toBeTruthy();
-    expect(screen.queryByRole("button", { name: /Discard held work/ })).toBeNull();
+    expect(container.innerHTML).toBe("");
+  });
+
+  it("hides when every hold is terminal (released/discarded) (PRD #1371)", async () => {
+    // Released/discarded holds are not decisions and are excluded server-side by ?state=open;
+    // even if one arrives, the decision-only surface renders nothing.
+    const { container } = await renderSurface(
+      listing([
+        hold({ id: "h-rel", state: "released", attention: "released" }),
+        hold({ id: "h-disc", state: "discarded", attention: "discarded", generation: 2 }),
+      ]),
+    );
+    expect(container.innerHTML).toBe("");
   });
 
   it("sanitizes an untrusted worker name (no <script>, no invisible chars)", async () => {
-    const { container } = await renderSurface(listing([hold({ worker_id: "wx", worker_name: HOSTILE, attention: "active" })]));
+    const { container } = await renderSurface(listing([hold({ worker_id: "wx", worker_name: HOSTILE, attention: "source_only" })]));
     // React escaping: no real <script> element was created.
     expect(container.querySelector("script")).toBeNull();
     // stripUnsafeChars: the rendered worker-name text has neither the ZWSP nor the RLO.
@@ -114,8 +137,9 @@ describe("RecoveryHoldsSurface", () => {
   });
 
   it("discards a possible-only-copy hold behind a typed confirmation naming run/worker/generation/hold", async () => {
-    // First listing has the source-only hold + one active hold (so the surface survives the
-    // discard); the reload drops the discarded one.
+    // First listing has the source-only hold + one active hold. The decision-only surface
+    // (PRD #1371) filters the active hold out, so only the source-only hold renders a discard
+    // control; the reload drops the discarded one, leaving nothing to decide (surface hides).
     const src = hold({ id: "h-src", run_id: "run-xyz", worker_id: "wb", worker_name: "jvm-worker", generation: 4, attention: "source_only" });
     const keep = hold({ id: "h-keep", run_id: "run-keep", worker_id: "wb", worker_name: "jvm-worker", attention: "active" });
     mockApi.getRecoveryHolds
@@ -169,8 +193,9 @@ describe("RecoveryHoldsSurface", () => {
     expect(mockApi.discardHold).not.toHaveBeenCalled();
   });
 
-  it("active protection offers no destructive action", async () => {
-    await renderSurface(listing([hold({ attention: "active" })]));
+  it("hides a lone healthy active hold — no card, no destructive action (PRD #1371)", async () => {
+    const { container } = await renderSurface(listing([hold({ attention: "active" })]));
+    expect(container.innerHTML).toBe("");
     expect(screen.queryByRole("button", { name: /Discard held work/ })).toBeNull();
     expect(screen.queryByRole("link", { name: /Export archive/ })).toBeNull();
   });
