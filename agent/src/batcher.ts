@@ -1007,6 +1007,17 @@ export class MessageBatcher {
     const outbox = this.outbox;
     if (!outbox) return;
     try {
+      // Re-mark unclean BEFORE any close-time write, mirroring doSpillFlush's own
+      // defensive re-mark at its top. A prior clean periodic doSpillFlush may have
+      // already CLEARED the flag, so relying on it "still being set from enterSpill"
+      // is unsound: without this, a failed appendRangeRecord/appendSegment below is
+      // swallowed by the catch, the flag stays CLEAR, and restart's uncleanRuns()
+      // omits the run — a SILENT tail loss the PRD forbids ("admitted and logged,
+      // never inferred or fabricated"). Set the flag first; the clearSpillUnclean at
+      // the end runs only on a fully-successful close.
+      if (this.buffer.length > 0 || this.pendingRangeFirst !== undefined) {
+        await outbox.markSpillUnclean(this.runId).catch(() => undefined);
+      }
       if (this.pendingRangeFirst !== undefined && this.pendingRangeLast !== undefined) {
         await outbox.appendRangeRecord(this.runId, this.generation, this.pendingRangeFirst, this.pendingRangeLast);
         this.pendingRangeFirst = undefined;

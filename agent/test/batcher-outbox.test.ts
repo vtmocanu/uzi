@@ -63,6 +63,47 @@ async function mkDisabledOutbox(): Promise<Outbox> {
   return o;
 }
 
+/** A real tmpdir Outbox whose write seam a test flips at will (via `failOn`): while a
+ *  record kind is armed, every raw write of that kind throws, exercising a write
+ *  failure without corrupting the store. `fresh()` opens a SEPARATE Outbox over the
+ *  SAME root, so a test can read the on-disk spill-unclean flag exactly as a restart
+ *  would (its `uncleanRuns()` reflects the manifest at that instant). */
+async function mkOutboxWithSeam(): Promise<{
+  outbox: Outbox;
+  failOn: (kind: "segment" | "range" | "manifest" | null) => void;
+  fresh: () => Promise<Outbox>;
+}> {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "batcher-outbox-seam-"));
+  tmpRoots.push(dir);
+  const base = {
+    root: path.join(dir, "outbox"),
+    log: nullLogger(),
+    runMaxBytes: 64 * 1024 * 1024,
+    maxBytes: 512 * 1024 * 1024,
+    retentionMs: 7 * 86_400_000,
+  };
+  let failKind: "segment" | "range" | "manifest" | null = null;
+  const outbox = new Outbox({
+    ...base,
+    rawWrite: async (write, ctx) => {
+      if (failKind !== null && ctx.kind === failKind) throw new Error(`injected ${ctx.kind} write failure`);
+      await write();
+    },
+  });
+  await outbox.init();
+  return {
+    outbox,
+    failOn: (kind) => {
+      failKind = kind;
+    },
+    fresh: async () => {
+      const o = new Outbox({ ...base });
+      await o.init();
+      return o;
+    },
+  };
+}
+
 /** A client whose postMessages behaviour a test flips at will: "fail" throws the
  *  given transient/fatal status, "ok" records the landed batch and resolves. Extra
  *  batcher args (generation, signal) are ignored, matching the real call shape. */
@@ -115,6 +156,16 @@ async function until(pred: () => boolean, ms: number, label: string): Promise<vo
   const deadline = Date.now() + ms;
   while (Date.now() < deadline) {
     if (pred()) return;
+    await sleep(20);
+  }
+  assert.fail(`timed out waiting for: ${label}`);
+}
+
+/** `until` for an async predicate (e.g. re-opening a fresh Outbox each poll). */
+async function untilAsync(pred: () => Promise<boolean>, ms: number, label: string): Promise<void> {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    if (await pred()) return;
     await sleep(20);
   }
   assert.fail(`timed out waiting for: ${label}`);
@@ -333,6 +384,51 @@ describe("MessageBatcher spill/drain (PRD #1391 M2)", () => {
     assert.deepStrictEqual(drained.seqs, [1, 2, 3, 4, 5, 6], "the tail was spilled on close, not dropped");
   });
 
+  it("finalSpillOnClose re-marks spilled_unclean BEFORE the close-time write, so a FAILED write leaves the loss ADMITTED (never silent)", async () => {
+    // The silent-loss sequence the PRD forbids: (1) a clean periodic doSpillFlush empties
+    // the buffer and CLEARS spilled_unclean; (2) more messages emit while still spilled;
+    // (3) close()'s finalSpillOnClose write FAILS. finalSpillOnClose must NOT rely on the
+    // flag "still being set from enterSpill" — a prior clean flush cleared it — so it must
+    // re-mark unclean at its TOP (like doSpillFlush). Without that, restart's uncleanRuns()
+    // omits the run and the tail loss is silent. FAILS on the unfixed code: the flag stays
+    // clear across the failed close-time write, so the fresh Outbox does NOT list the run.
+    const { outbox, failOn, fresh } = await mkOutboxWithSeam();
+    const api = flippableClient("fail", 503);
+    const batcher = new MessageBatcher(api.client, RUN, 0, 5, nullLogger(), undefined, undefined, {
+      outbox,
+      transientTripMs: 40,
+    });
+
+    // (1) Spill a body cleanly: the periodic doSpillFlush drains it and CLEARS the flag.
+    fill(batcher, 3, "body");
+    await until(() => batcher.isSpilled(), 4000, "batcher enters spill");
+    await until(() => outbox.depthFor(RUN)?.pendingMessages === 3, 4000, "the body spilled to the outbox");
+    // Poll a fresh Outbox over the same root until it observes the flag CLEARED (proof the
+    // clean flush ran clearSpillUnclean — the precondition that makes the bug reachable).
+    await untilAsync(
+      async () => !(await fresh()).uncleanRuns().includes(RUN),
+      4000,
+      "the clean periodic doSpillFlush cleared spilled_unclean",
+    );
+
+    // (2) Emit a tail while still spilled, (3) arm the next SEGMENT write to fail, then
+    // close SYNCHRONOUSLY (no await between emit and close, so close clears the flush timer
+    // before it can fire and the tail spills only via finalSpillOnClose). The manifest write
+    // that markSpillUnclean makes is NOT armed to fail, so the flag is set before the doomed
+    // segment write; the segment write then throws and the catch swallows it.
+    failOn("segment");
+    batcher.emit({ kind: "text", agent: "lead", payload: { text: "tail-1" } });
+    batcher.emit({ kind: "text", agent: "lead", payload: { text: "tail-2" } });
+    await batcher.close();
+
+    // (4) A fresh Outbox now lists the run: the possible tail loss is ADMITTED at restart.
+    const afterClose = await fresh();
+    assert.ok(
+      afterClose.uncleanRuns().includes(RUN),
+      "a failed close-time write must leave spilled_unclean SET so restart admits the loss",
+    );
+  });
+
   it("a PERIODIC (timer-driven, non-close) spill flush writes the pending dropped-range as a range record BEFORE any close", async () => {
     // Every spill-cap test above exits via close(), whose finalSpillOnClose has its OWN
     // range-record write — so a mutation that removed doSpillFlush's appendRangeRecord
@@ -377,38 +473,47 @@ describe("MessageBatcher spill/drain (PRD #1391 M2)", () => {
     await batcher.close();
   });
 
-  it("a chat run's batcher (generation 0) spills to the outbox and drains correctly", async () => {
-    // The chat lane wires the SAME MessageBatcher with generation 0 (chat has no claim
-    // generation, D6/D10). Pin that this wiring actually spills and round-trips: the
-    // segments replay under generation 0.
+  it("the batcher's claim generation flows through into the spilled segments (the mechanism carries whatever it is given)", async () => {
+    // The chat lane wires the SAME MessageBatcher, and chat's REAL claim generation is
+    // 0 (chat has no claim generation, D6/D10). But 0 is ALSO the batcher's default
+    // (`opts.generation ?? 0`), so asserting `generation === 0` cannot discriminate "the
+    // option flowed into the segment" from "nothing set it". Use a NON-ZERO generation
+    // and assert the persisted segments replay under exactly that value: this pins that
+    // the mechanism carries whatever generation the lane passes it (0 for chat elsewhere,
+    // a live claim generation here). Fails if the batcher hardcodes/zeroes the generation.
+    const GEN = 7;
     const outbox = await mkOutbox();
     const api = flippableClient("fail", 503);
     const batcher = new MessageBatcher(api.client, RUN, 0, 5, nullLogger(), undefined, undefined, {
       outbox,
-      generation: 0, // the chat lane's value
+      generation: GEN,
       transientTripMs: 40,
     });
 
     fill(batcher, 4, "chat");
-    await until(() => batcher.isSpilled(), 4000, "the chat batcher enters spill");
-    await until(() => outbox.depthFor(RUN)?.pendingMessages === 4, 4000, "all 4 chat messages spilled");
+    await until(() => batcher.isSpilled(), 4000, "the batcher enters spill");
+    await until(() => outbox.depthFor(RUN)?.pendingMessages === 4, 4000, "all 4 messages spilled");
     assert.strictEqual(batcher.isTripped(), false, "a transient outage spills; it never trips");
     await batcher.close();
 
-    // Drain, capturing the generation each segment replays under (chat = 0).
+    // Drain, capturing the generation each segment replays under.
     const gens: number[] = [];
     const msgs: OutgoingMessage[] = [];
     const res = await outbox.drainRun(RUN, async (batch, gen) => {
       gens.push(gen);
       msgs.push(...batch);
     });
-    assert.strictEqual(res.retired, true, "the chat run fully retires after the drain");
+    assert.strictEqual(res.retired, true, "the run fully retires after the drain");
     assert.deepStrictEqual(
       msgs.map((m) => m.seq),
       [1, 2, 3, 4],
-      "every chat message once, ascending, contiguous",
+      "every message once, ascending, contiguous",
     );
-    assert.ok(gens.length > 0 && gens.every((g) => g === 0), "chat segments replay under generation 0");
+    assert.ok(gens.length > 0, "at least one segment drained");
+    assert.ok(
+      gens.every((g) => g === GEN),
+      `every spilled segment must replay under the generation it was produced (${GEN}), not the default 0`,
+    );
   });
 });
 
