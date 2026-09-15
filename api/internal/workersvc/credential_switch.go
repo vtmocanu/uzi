@@ -3,6 +3,7 @@ package workersvc
 import (
 	"context"
 	"fmt"
+	"log/slog"
 
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -45,6 +46,10 @@ import (
 //     (releaseCredentialSwitch), which itself requires a stamped generation and must NOT go
 //     through the generic stale check — a redelivered same-generation release after the release
 //     applied is idempotent success, not stale.
+//   - credential_switch_failed: handled before the fence by its own fenced+idempotent
+//     ClearCredentialSwitchByWorker statement (failCredentialSwitch) — the bounded capture-failure
+//     give-up (D14) CLEARS a pending switch stamp WITHOUT changing status, so it is not a transition
+//     and must not go through the generic stale check (like credential_switch / pause_failed).
 //   - pause_failed: handled before the fence (it withdraws a pending pause, not a transition).
 func stateUsesGenerationFence(state string, owned store.Run) bool {
 	switch state {
@@ -62,8 +67,9 @@ func stateUsesGenerationFence(state string, owned store.Run) bool {
 // generation-fence transaction. It is the subset of stateUsesGenerationFence that fences through
 // that OUTER lock — everything EXCEPT limit_wait / recovery_wait, whose multi-step park helpers
 // fence PER-QUERY (see stateUsesGenerationFence) and would self-deadlock under the lock. The
-// interlocked-completed and credential_switch arms already return false from
-// stateUsesGenerationFence, so they need no exclusion here.
+// interlocked-completed, credential_switch and credential_switch_failed arms already return false
+// from stateUsesGenerationFence (each is dispatched by its own fenced statement before the generic
+// fence), so they need no exclusion here.
 func stateUsesForUpdateFence(state string, owned store.Run) bool {
 	switch state {
 	case "limit_wait", "recovery_wait":
@@ -140,5 +146,65 @@ func (s *Service) releaseCredentialSwitch(ctx context.Context, owned store.Run, 
 		s.bcast.PublishState(owned.ID, run.Status)
 	}
 	s.notify(owned.ID, run.Status)
+	return run, true, nil
+}
+
+// failCredentialSwitch applies the bounded capture-failure GIVE-UP (PRD #1247 M5, D3 step 3 / D14):
+// after a bounded number of failed verified-restore-point captures the worker abandons the switch,
+// reports {status:"credential_switch_failed", claim_generation}, and the server CLEARS the pending
+// switch stamp WITHOUT changing status — the run keeps running on its CURRENT token. It is the
+// exact analog of pause_failed for a pending SWITCH (a withdrawal, not a transition), so SetState
+// dispatches it BEFORE the generic generation fence.
+//
+// The clear is ONE fenced statement (ClearCredentialSwitchByWorker): it requires the run be at the
+// reported generation, UNRELEASED, owned by this worker, and carry a stamp actually pending. A
+// stale/superseded/foreign report, a report after release/reclaim, or an idempotent redelivery
+// after the clear already applied all match 0 rows.
+//
+//   - 0 rows → re-read the run owned-by-worker and return (cur, false, nil): a benign no-op that
+//     the handler renders as the ordinary 409 (nothing was pending for this claim).
+//   - non-zero → re-read, emit a best-effort observability note (the note NEVER fails the report;
+//     the stamp CLEAR is the load-bearing behavior), and return (run, true, nil).
+func (s *Service) failCredentialSwitch(ctx context.Context, owned store.Run, wkr store.Worker, req StateRequest) (store.Run, bool, error) {
+	if req.ClaimGeneration == nil {
+		// A capability worker ALWAYS stamps the generation (the verb targets a specific claim);
+		// without it the clear cannot fence to an exact claim, so this is an invalid report (→ 400),
+		// not a silent no-op.
+		return store.Run{}, false, fmt.Errorf("%w: credential_switch_failed requires claim_generation", ErrInvalidState)
+	}
+	gen := *req.ClaimGeneration
+	rows, err := s.q.ClearCredentialSwitchByWorker(ctx, store.ClearCredentialSwitchByWorkerParams{
+		ID:         owned.ID,
+		WorkerID:   pgconv.UUID(wkr.ID),
+		Generation: gen,
+	})
+	if err != nil {
+		return store.Run{}, false, err
+	}
+	if rows == 0 {
+		// Nothing was pending to clear for this claim — a benign no-op (an idempotent redelivery
+		// after the clear already applied, a stale/superseded generation, or a report after the
+		// claim was released/reclaimed). Re-read worker-scoped so the worker learns the run's real
+		// state; applied=false → the handler's ordinary 409.
+		cur, rerr := s.runOwnedByWorker(ctx, owned.ID, wkr)
+		if rerr != nil {
+			return store.Run{}, false, rerr
+		}
+		return cur, false, nil
+	}
+	run, err := s.runOwnedByWorker(ctx, owned.ID, wkr)
+	if err != nil {
+		return store.Run{}, false, err
+	}
+	// Best-effort note that the switch was abandoned. This is NOT a status transition — the run
+	// stays running on its old token — so it posts no Slack line (like pause_failed); it only logs
+	// for observability and re-broadcasts the (unchanged) status so the web drops the "switch
+	// requested" chip now that the stamp is cleared. The worker's own credential_switch_failed feed
+	// message (D14) carries the human-readable reason to the run's activity feed.
+	slog.Info("credential switch abandoned: bounded capture-failure give-up cleared the pending switch stamp; run continues on its current token",
+		"run", owned.ID, "worker", wkr.ID, "generation", gen)
+	if s.bcast != nil {
+		s.bcast.PublishState(owned.ID, run.Status)
+	}
 	return run, true, nil
 }

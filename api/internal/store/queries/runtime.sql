@@ -2245,6 +2245,22 @@ UPDATE runs SET
     updated_at = now()
 WHERE id = @id AND user_id = @user_id;
 
+-- name: ClearCredentialSwitchByWorker :execrows
+-- PRD #1247 M5 (D3/D14): a bounded capture-failure give-up (a credential_switch_failed worker
+-- report) clears the pending switch stamp WITHOUT changing status — the run keeps running on its
+-- current token. Fenced to the CURRENT claim: only the worker holding the exact generation, with
+-- the claim NOT released and a stamp actually pending, may clear it, so a stale/superseded/foreign
+-- report clears nothing. Idempotent: a second delivery affects 0 rows (already cleared).
+UPDATE runs
+SET credential_switch_requested_at = NULL,
+    credential_switch_generation = NULL,
+    updated_at = now()
+WHERE id = @id
+  AND worker_id = @worker_id
+  AND claim_generation = @generation
+  AND claim_released_at IS NULL
+  AND credential_switch_requested_at IS NOT NULL;
+
 -- name: ClearPauseRequest :execrows
 -- Clear a pending pause request WITHOUT parking (PRD #1190 M1), for the worker's
 -- `pause_failed` report: the worker could not publish the checkpoint, so the run STAYS running
