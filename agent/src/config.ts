@@ -1,5 +1,6 @@
 import os from "node:os";
 import fs from "node:fs";
+import path from "node:path";
 import type { LogLevel } from "./log.js";
 import type { DockerWiring } from "./docker-wiring.js";
 import type { CodexRuntimeProbeResult } from "./codex/codex-runtime-probe.js";
@@ -134,6 +135,35 @@ export interface Config {
    */
   dockerReadyIntervalMs: number;
   dockerReadyTimeoutMs: number;
+  /**
+   * PRD #1391 M1: the worker-owned authenticated message outbox tree, rooted at
+   * `<dataDir>/outbox`. When the api is unreachable the batcher spills run
+   * messages here as fsync'd immutable segments and a per-worker drainer replays
+   * them in `seq` order once the api returns. Distinct from the run HOME (deleted
+   * at terminal cleanup) and from the recovery journal; a sibling of both under
+   * `/data`.
+   */
+  outboxDataDir: string;
+  /**
+   * Per-run byte quota for the outbox (WORKER_OUTBOX_RUN_MAX_BYTES, default
+   * 64 MiB). Before a segment is written, if adding it would exceed this the
+   * oldest segment of the run is replaced by one compact range record, so the
+   * run's on-disk footprint stays bounded (PRD #1391 D2).
+   */
+  outboxRunMaxBytes: number;
+  /**
+   * Worker-total byte quota across every run's outbox (WORKER_OUTBOX_MAX_BYTES,
+   * default 512 MiB). When it binds, the globally-oldest segment across all runs
+   * is evicted to a range record (PRD #1391 D2).
+   */
+  outboxMaxBytes: number;
+  /**
+   * How long a fully-retired (empty) run's outbox subtree is kept before the
+   * retention sweep age-deletes it (WORKER_OUTBOX_RETENTION, default 7d). Only
+   * runs whose records are all retired are eligible; a run with undrained
+   * segments is never removed by retention (PRD #1391 M1).
+   */
+  outboxRetentionMs: number;
   logLevel: LogLevel;
 }
 
@@ -143,14 +173,17 @@ export interface Config {
  *  container. Advisory only, never enforced. */
 export const MAX_CONCURRENT_RUNS_SOFT_CEILING = 8;
 
-const DURATION_RE = /^(\d+)\s*(ms|s|m|h)?$/;
+const DURATION_RE = /^(\d+)\s*(ms|s|m|h|d)?$/;
 
-/** Parse "15s" / "500ms" / "2h" / "15000" into milliseconds. */
+/** Parse "15s" / "500ms" / "2h" / "7d" / "15000" into milliseconds. The `d`
+ *  (days) unit is carried for retention knobs that are naturally expressed in
+ *  days (WORKER_OUTBOX_RETENTION); the rest match the server-side duration set. */
 function parseDuration(value: string): number {
   const m = DURATION_RE.exec(value.trim());
   if (!m) throw new Error(`invalid duration: ${JSON.stringify(value)}`);
   const n = Number(m[1]);
   switch (m[2]) {
+    case "d": return n * 86_400_000;
     case "h": return n * 3_600_000;
     case "m": return n * 60_000;
     case "s": return n * 1_000;
@@ -249,10 +282,11 @@ function resolveWorkerToken(env: NodeJS.ProcessEnv): string {
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const apiUrl = required(env, "UZI_API_URL").replace(/\/+$/, "");
   const rawLevel = env.UZI_LOG_LEVEL?.trim().toLowerCase() ?? "info";
+  const dataDir = env.UZI_DATA_DIR?.trim() || "/data";
   return {
     apiUrl,
     workerToken: resolveWorkerToken(env),
-    dataDir: env.UZI_DATA_DIR?.trim() || "/data",
+    dataDir,
     workerName: env.UZI_WORKER_NAME?.trim() || os.hostname(),
     workerTemplate: env.UZI_WORKER_TEMPLATE?.trim() || "base",
     // Build-stamped by CI (`publish:agent` passes the release tag as the
@@ -311,6 +345,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     // Readiness wait for an EXPECTED docker sidecar (M2 follow-up). ~1s poll, ~30s budget.
     dockerReadyIntervalMs: duration(env, "UZI_DOCKER_READY_INTERVAL", "1s"),
     dockerReadyTimeoutMs: duration(env, "UZI_DOCKER_READY_TIMEOUT", "30s"),
+    // Worker outbox (PRD #1391 M1). The tree is a fixed sibling of the recovery
+    // journal under /data; the two byte quotas and the retention window are the
+    // operator-tunable bounds. positiveInt keeps the byte knobs plain positive
+    // integers; the retention window is a duration string (the `d` unit above).
+    outboxDataDir: path.join(dataDir, "outbox"),
+    outboxRunMaxBytes: positiveInt(env, "WORKER_OUTBOX_RUN_MAX_BYTES", 64 * 1024 * 1024),
+    outboxMaxBytes: positiveInt(env, "WORKER_OUTBOX_MAX_BYTES", 512 * 1024 * 1024),
+    outboxRetentionMs: duration(env, "WORKER_OUTBOX_RETENTION", "7d"),
     logLevel: isLogLevel(rawLevel) ? rawLevel : "info",
   };
 }
