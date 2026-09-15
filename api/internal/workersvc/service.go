@@ -642,6 +642,14 @@ type Store interface {
 	// second park.
 	SetRunLimitWait(ctx context.Context, arg store.SetRunLimitWaitParams) (int64, error)
 	PromoteLimitWaitRuns(ctx context.Context, now pgtype.Timestamptz) ([]store.PromoteLimitWaitRunsRow, error)
+	// The duration-time auto-failover re-evaluation pass (PRD #1247 M3, D8):
+	// ListLimitWaitReeval is the still-parked worklist (retry_not_before still in the
+	// future, a dead credential recorded) that reEvaluateParkedLimitWaitRuns walks, and
+	// LowerLimitWaitRetryNow lowers ONE due run's retry_not_before to now() so the same
+	// tick's PromoteLimitWaitRuns performs the actual resume. Placed BEFORE the promote
+	// call in Sweep so a lowered stamp is eligible for that tick's promotion pass.
+	ListLimitWaitReeval(ctx context.Context, now pgtype.Timestamptz) ([]store.ListLimitWaitReevalRow, error)
+	LowerLimitWaitRetryNow(ctx context.Context, arg store.LowerLimitWaitRetryNowParams) (int64, error)
 	// SetRunRecoveryWait parks a run in the transient-recovery hold (issue #1197);
 	// PromoteRecoveryWaitRuns is the sweeper pass that auto-promotes it once its capped
 	// backoff elapses. Like the limit-wait park its source guard is POSITIVE
@@ -4657,6 +4665,16 @@ type SweepResult struct {
 	// ONE per distinct held-run owner per tick (the anti-stampede stagger), so on a
 	// busy resume it climbs one owner at a time across ticks. Normally 0.
 	PoolResumed int64
+	// LimitReevaluated is the number of still-parked limit_wait runs this pass LOWERED to
+	// retry_not_before = now() because their `auto` next claim now has a pooled
+	// alternative that is spendable sooner than their park (PRD #1247 M3, D8 — Decision
+	// 6e extended from park-time to park-duration). At most ONE per distinct owner per
+	// tick (the same anti-stampede stagger PoolResumed applies, since this pass bypasses
+	// the park-time jitter). A lowered run is transitioned to queued by the following
+	// PromoteLimitWaitRuns pass — the same tick once that pass's clock has reached the
+	// lowered stamp, else the next — so a non-zero LimitReevaluated is normally mirrored
+	// by LimitPromoted within a tick. Normally 0.
+	LimitReevaluated int64
 	// RecoveryPromoted is the number of runs this pass auto-promoted from recovery_wait to
 	// queued because their recovery_retry_not_before elapsed (issue #1197). Normally 0: the
 	// partial index this reads covers only parked runs, a set that is empty on a healthy

@@ -1786,6 +1786,61 @@ UPDATE runs SET
 WHERE status = 'limit_wait' AND retry_not_before <= @now
 RETURNING id, user_id, status;
 
+-- name: ListLimitWaitReeval :many
+-- The duration-time auto-failover worklist (PRD #1247 M3, D8): every run STILL parked
+-- in limit_wait whose window has NOT yet reopened (retry_not_before > @now) and that
+-- recorded a dead credential (limit_dead_secret_id IS NOT NULL), OLDEST park first
+-- (status_since ASC). It is the read half of the second limit-wait promoter that sits
+-- beside PromoteLimitWaitRuns: Decision 6e extended from park-time to park-duration, so
+-- a token that pools or a gauge that turns eligible AFTER the park is re-asked every
+-- tick instead of the run sleeping to retry_not_before regardless.
+--
+-- It projects exactly what the two pure policies in Go need and no more:
+-- effectiveNextClaimMode reads kind / credential_override_mode /
+-- credential_override_secret_id / worker_id plus the recorded worker's bind mode, and
+-- claimExclude reads limit_dead_secret_id / retry_not_before. The recorded worker's
+-- anthropic_bind_mode rides a LEFT JOIN (projected as worker_bind_mode) so the Go side
+-- needs no per-run worker fetch; a NULL/absent worker leaves it NULL, which
+-- effectiveNextClaimMode maps to `unknown` (and unknown is skipped, the safe direction).
+--
+-- No promotion happens here: a due run is LOWERED to now() by LowerLimitWaitRetryNow and
+-- the existing PromoteLimitWaitRuns performs the actual status transition. Backed by the
+-- same idx_runs_limit_wait_retry partial index PromoteLimitWaitRuns reads, so the set is
+-- empty on a healthy instance. @now is the sweep's own clock.
+SELECT
+    r.id,
+    r.user_id,
+    r.kind,
+    r.credential_override_mode,
+    r.credential_override_secret_id,
+    r.worker_id,
+    r.limit_dead_secret_id,
+    r.retry_not_before,
+    w.anthropic_bind_mode AS worker_bind_mode
+FROM runs r
+LEFT JOIN workers w ON w.id = r.worker_id
+WHERE r.status = 'limit_wait'
+  AND r.retry_not_before > @now
+  AND r.limit_dead_secret_id IS NOT NULL
+ORDER BY r.status_since ASC;
+
+-- name: LowerLimitWaitRetryNow :execrows
+-- The write half of the D8 duration-time re-evaluation pass (PRD #1247 M3): lower ONE
+-- still-parked limit_wait run's retry_not_before to now() so the immediately-following
+-- PromoteLimitWaitRuns pass (which the re-eval pass runs BEFORE in Sweep) brings it back
+-- to queued — the same tick once that pass's clock has reached the lowered stamp, else the
+-- next tick. It does NOT transition the status itself — the mutation set of the resume
+-- (fresh wall, health reset, codex-cap revoke) lives in PromoteLimitWaitRuns and must not
+-- be duplicated here.
+--
+-- Owner-scoped (user_id) and status-guarded (status = 'limit_wait') so a run that moved
+-- out of limit_wait between the list and this write is a 0-row no-op, and a lowering can
+-- never touch a foreign run. It writes ONLY retry_not_before + updated_at, leaving every
+-- limit field, limit_dead_secret_id and both retry counters in place, so claimExclude
+-- keeps its answer and the resumed claim re-picks correctly.
+UPDATE runs SET retry_not_before = now(), updated_at = now()
+WHERE id = @id AND user_id = @user_id AND status = 'limit_wait';
+
 -- name: SetRunRecoveryWait :execrows
 -- Park a run in the TRANSIENT-RECOVERY hold (issue #1197). running -> recovery_wait,
 -- non-terminal: the run keeps its issue, its session, its worker affinity, its message
@@ -2656,7 +2711,14 @@ WHERE id = @id AND worker_id = @worker_id
 -- oldest-first ORDER BY is index-ordered. The held set is expected to be tiny (a run
 -- holds only while an auto owner's whole pool is genuinely empty, a transient state M5
 -- resumes out of); the index mirrors limit_wait's idx_runs_limit_wait_retry.
-SELECT id, user_id, status_since FROM runs
+--
+-- limit_dead_secret_id and retry_not_before are projected so the reactive pass can ask
+-- the SAME question the re-claim asks — autoselect.Floor(cands, claimExclude(run)) —
+-- rather than the exclude-blind PoolNonEmpty it once used (PRD #1247 M3, the pool-
+-- promoter fix). Early promotion (the set-token verb and D8) can leave a pool_wait run
+-- carrying a FUTURE retry_not_before whose sole pooled token is its own dead credential;
+-- without these two columns the pass would resume it every tick only for it to re-hold.
+SELECT id, user_id, status_since, limit_dead_secret_id, retry_not_before FROM runs
 WHERE status = 'pool_wait'
 ORDER BY status_since ASC;
 

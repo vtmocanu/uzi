@@ -35,6 +35,11 @@ func strPtr(s string) *string { return &s }
 // parkIn is a park that WILL happen: opted in, budget untouched, a plausible reset
 // two hours out, and no pool information at all. Each case below breaks exactly one
 // thing, so a failure names what it broke.
+//
+// NextClaimMode defaults to BindModeAuto so Decision 6e is ACTIVE in the base fixture —
+// the case the pool leg exists for (PRD #1247 gap 3 gates 6e on the next claim being
+// auto). The pinned/default/unknown regression tests below override it to prove those
+// modes keep their reset instead of lowering to a pooled alternative they would not spend.
 func parkIn() limitParkInput {
 	return limitParkInput{
 		WaitOnLimit:     true,
@@ -42,6 +47,7 @@ func parkIn() limitParkInput {
 		DeadSecretID:    uuid.New(),
 		ReportedResetMs: ms(2 * time.Hour),
 		ReportedType:    strPtr("five_hour"),
+		NextClaimMode:   BindModeAuto,
 		Policy:          autoselect.Policy{MinHeadroom: 15, HeadroomTiePct: 5, MaxStaleness: 15 * time.Minute},
 		MaxWaits:        5,
 		MaxPark:         8 * 24 * time.Hour,
@@ -255,6 +261,52 @@ func TestDecideLimitParkPromotesEarlyForAPooledAlternative(t *testing.T) {
 		t.Fatalf("retry_not_before = %v, want %v. A second credential with headroom means "+
 			"the run can resume on the next tick, so the pool leg must LOWER the stamp "+
 			"below the dead credential's 2h reset", d.RetryNotBefore, want)
+	}
+}
+
+// 🔴 TestDecideLimitParkPoolLegGatedOnAutoNextClaim is the 2026-09-15 gap-3 pin (PRD
+// #1247 Part 1). Decision 6e may lower the park to a pooled alternative ONLY when the
+// resumed run's next claim will actually spend from the pool — i.e. its
+// effectiveNextClaimMode is `auto`. A pinned, default or unknown next claim would ignore
+// the alternative and re-park on the SAME dead credential, so lowering the base for it
+// just guarantees an immediate re-park and burns RUN_LIMIT_MAX_WAITS. Same eligible
+// pooled alternative as the auto case above; only NextClaimMode differs.
+//
+// MUTATION THIS CATCHES: dropping the `in.NextClaimMode == BindModeAuto` guard in
+// decideLimitPark (so 6e lowers for every mode). Each non-auto case below then lowers to
+// the pooled alternative's `now` and reddens.
+func TestDecideLimitParkPoolLegGatedOnAutoNextClaim(t *testing.T) {
+	dead, alt := uuid.New(), uuid.New()
+	// The dead credential's own reset is 2h out; the alternative is eligible NOW. Under
+	// `auto` the base lowers to now+jitter (proven above); under every other mode it must
+	// stay at the reported 2h reset + jitter.
+	wantLowered := parkNow.Add(90 * time.Second)
+	wantKept := parkNow.Add(2*time.Hour + 90*time.Second)
+
+	for _, tc := range []struct {
+		mode string
+		want time.Time
+		why  string
+	}{
+		{BindModeAuto, wantLowered, "an auto next claim spends the pooled alternative, so 6e lowers"},
+		{BindModePinned, wantKept, "a pinned next claim re-parks on the dead credential; lowering only re-parks"},
+		{BindModeDefault, wantKept, "a default next claim ignores the pool; lowering only re-parks"},
+		{effectiveClaimModeUnknown, wantKept, "an unknown next claim must not be promoted early (the safe direction)"},
+	} {
+		in := parkIn()
+		in.DeadSecretID = dead
+		in.NextClaimMode = tc.mode
+		in.Candidates = []autoselect.Candidate{
+			autoselectrowCandidate(dead, 90, parkNow.Add(-time.Minute)),
+			autoselectrowCandidate(alt, 90, parkNow.Add(-time.Minute)), // eligible ⇒ now
+		}
+		d := decideLimitPark(in)
+		if !d.Park {
+			t.Fatalf("%s: did not park: %q", tc.mode, d.Reason)
+		}
+		if !d.RetryNotBefore.Equal(tc.want) {
+			t.Fatalf("%s: retry_not_before = %v, want %v — %s", tc.mode, d.RetryNotBefore, tc.want, tc.why)
+		}
 	}
 }
 

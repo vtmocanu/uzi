@@ -148,6 +148,72 @@ func TestSweepPoolResumeSkipsCandidateReadFailure(t *testing.T) {
 	}
 }
 
+// 🔴 TestSweepPoolResumeSkipsSoleDeadTokenFutureStamp is the pool-promoter fix (PRD
+// #1247 M3, Part 3). Early promotion (the set-token verb and D8) can leave a pool_wait
+// run carrying a FUTURE retry_not_before whose only AutoEligible token is its own dead
+// credential — a state the pre-M3 exclude-blind PoolNonEmpty loop would "resume" every
+// tick, only for the run to re-hold, churning forever while SetRunPoolWait never counts
+// against RUN_LIMIT_MAX_WAITS. The fix asks autoselect.Floor(cands, claimExclude(run)):
+// with the sole token excluded (its window still closed), Floor.ok is false, so the run
+// stays held and is NOT churned across ticks.
+//
+// MUTATION THIS CATCHES: reverting resumePoolWaitRuns to the exclude-blind PoolNonEmpty
+// loop (which counts the dead token as AutoEligible and resumes it). Then
+// PromotePoolWaitRun fires on both ticks and the no-churn assertion reddens.
+func TestSweepPoolResumeSkipsSoleDeadTokenFutureStamp(t *testing.T) {
+	owner := uuid.New()
+	dead := uuid.New()
+	held := store.ListPoolWaitRunsRow{
+		ID:                uuid.New(),
+		UserID:            owner,
+		StatusSince:       pgtype.Timestamptz{Time: parkNow, Valid: true},
+		LimitDeadSecretID: pgtype.UUID{Bytes: dead, Valid: true},
+		// Still closed: retry_not_before in the FUTURE, so claimExclude keeps excluding the
+		// dead token. This is the state early promotion can produce (M4's verb / D8).
+		RetryNotBefore: pgtype.Timestamptz{Time: parkNow.Add(time.Hour), Valid: true},
+	}
+	fs := &fakeStore{
+		poolWaitRuns: []store.ListPoolWaitRunsRow{held},
+		autoCandidatesByUser: map[uuid.UUID][]store.ListAutoSelectCandidatesRow{
+			// The SOLE pooled token IS the dead credential.
+			owner: {{UserSecretID: dead, AutoEligible: true}},
+		},
+	}
+	svc := New(fs, newBox(t), testParams())
+	svc.now = func() time.Time { return parkNow }
+	svc.SetBroadcaster(&parkBroadcaster{})
+
+	// Two ticks: neither resumes, and PromotePoolWaitRun is never called (no churn).
+	for tick := 1; tick <= 2; tick++ {
+		res, err := svc.Sweep(context.Background())
+		if err != nil {
+			t.Fatalf("Sweep %d: %v", tick, err)
+		}
+		if res.PoolResumed != 0 {
+			t.Fatalf("Sweep %d PoolResumed = %d, want 0 — the sole pooled token is the still-excluded "+
+				"dead credential, so Floor.ok is false after the exclude", tick, res.PoolResumed)
+		}
+	}
+	if len(fs.promotedPoolWait) != 0 {
+		t.Fatalf("PromotePoolWaitRun ran %d times, want 0 — a sole-dead-token pool_wait run with a "+
+			"future stamp must be held, not churned every tick", len(fs.promotedPoolWait))
+	}
+
+	// Positive control: once the window reopens (retry_not_before in the past) claimExclude
+	// relaxes to Nil and the SAME dead token becomes spendable again, so the run resumes.
+	// Without this, a mutation that NEVER resumes would pass the no-churn assertion.
+	held.RetryNotBefore = pgtype.Timestamptz{Time: parkNow.Add(-time.Hour), Valid: true}
+	fs.poolWaitRuns = []store.ListPoolWaitRunsRow{held}
+	res, err := svc.Sweep(context.Background())
+	if err != nil {
+		t.Fatalf("Sweep (reopened): %v", err)
+	}
+	if res.PoolResumed != 1 {
+		t.Fatalf("PoolResumed = %d after the window reopened, want 1 — with retry_not_before in the "+
+			"past claimExclude relaxes and Floor may spend the token again", res.PoolResumed)
+	}
+}
+
 // TestSweepPoolResumeListErrorFailsSweep: a ListPoolWaitRuns error, unlike a per-user
 // candidate read, fails the whole pass — it mirrors the limit-promote's own read.
 func TestSweepPoolResumeListErrorFailsSweep(t *testing.T) {
