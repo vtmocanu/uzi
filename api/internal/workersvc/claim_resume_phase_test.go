@@ -84,6 +84,14 @@ func TestResumePhaseFor(t *testing.T) {
 			want:         "implementing",
 		},
 		{
+			// A present-but-whitespace session_id is not a resumable session, so an unapproved
+			// plan cannot resume the gate (the same TrimSpace guard the plan/open-question arms use).
+			name:         "whitespace-only session is not a resumable gate",
+			run:          store.Run{PlanMd: text("# plan"), SessionID: text("  ")},
+			planApproved: false,
+			want:         "",
+		},
+		{
 			name:         "empty run falls through",
 			run:          store.Run{},
 			planApproved: false,

@@ -638,8 +638,9 @@ func TestReleaseCredentialSwitchReleasedConjunctLiveDB(t *testing.T) {
 // (PRD #1247 M5, step 2): while a credential switch is pending for the run's CURRENT claim,
 // ConsumeInputs returns the worker-facing switch signal and DRAINS NOTHING — ConsumeRunInputs marks
 // rows consumed on read, so a buffered follow_up that would otherwise race the release stays
-// UNCONSUMED for the reclaim. Once the claim is released for this generation the signal clears and
-// the same input drains normally.
+// UNCONSUMED for the reclaim. Once the claim is released the signal clears but the drain stays
+// FENCED until the reclaim bumps the generation; only then does the buffered input drain (exactly
+// once). The three branches below walk pending -> released -> reclaimed.
 func TestConsumeInputsConsumeNothingWhilePendingLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	svc := New(env.q, env.box, testParams())
