@@ -666,7 +666,7 @@ export class SteeringChannel {
   private async pollLoop(): Promise<void> {
     while (!this.stopped) {
       try {
-        const inputs = await this.client.getInputs(this.runId);
+        const { inputs } = await this.client.getInputs(this.runId);
         for (const inp of inputs)
           this.route(inp.kind, inp.body ?? undefined, inp.id);
       } catch (err) {
@@ -845,7 +845,7 @@ export class ChatSteering implements ChatInputSource {
   private async pollLoop(): Promise<void> {
     while (!this.stopped) {
       try {
-        const inputs = await this.client.getInputs(this.runId);
+        const { inputs } = await this.client.getInputs(this.runId);
         for (const inp of inputs) this.route(inp.kind, inp.body ?? undefined);
       } catch (err) {
         this.log.warn("chat steering: input poll failed", {

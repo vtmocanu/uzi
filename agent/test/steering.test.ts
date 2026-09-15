@@ -10,7 +10,8 @@ import { nullLogger } from "./helpers.js";
 
 function fakeClient(batches: UserInput[][]): WorkerClient {
   let i = 0;
-  return { getInputs: async () => batches[i++] ?? [] } as unknown as WorkerClient;
+  // PRD #1247 M5: getInputs now returns { inputs, credentialSwitch? }; the poller reads `.inputs`.
+  return { getInputs: async () => ({ inputs: batches[i++] ?? [] }) } as unknown as WorkerClient;
 }
 
 const inp = (kind: UserInput["kind"], body?: string): UserInput => ({ id: 1, kind, body: body ?? null });
@@ -76,7 +77,7 @@ describe("SteeringChannel", () => {
       getInputs: async () => {
         calls++;
         if (calls === 1) throw new Error("transient");
-        return calls === 2 ? [inp("approve_plan")] : [];
+        return { inputs: calls === 2 ? [inp("approve_plan")] : [] };
       },
     } as unknown as WorkerClient;
     const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController());
@@ -341,9 +342,9 @@ describe("SteeringChannel — plan revision (PRD #41)", () => {
         const b = queue.shift();
         if (b && b.length) {
           dispensedPending = true;
-          return b;
+          return { inputs: b };
         }
-        return [];
+        return { inputs: [] };
       },
     } as unknown as WorkerClient;
     return {
@@ -519,9 +520,9 @@ describe("ChatSteering", () => {
         calls++;
         if (calls >= 3) {
           clock = 10_000; // idle window (50) long elapsed...
-          return [inp("follow_up", "raced-in")]; // ...but a follow_up arrives THIS poll
+          return { inputs: [inp("follow_up", "raced-in")] }; // ...but a follow_up arrives THIS poll
         }
-        return [];
+        return { inputs: [] };
       },
     } as unknown as WorkerClient;
     const ch = new ChatSteering(client, "chat-1", 1, nullLogger(), new AbortController(), { now: () => clock });

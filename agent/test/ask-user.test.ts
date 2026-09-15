@@ -14,7 +14,8 @@ const ASK_USER_QUALIFIED = `mcp__${SIGNAL_SERVER_NAME}__${ASK_USER_TOOL}`;
 
 function fakeClient(batches: UserInput[][]): WorkerClient {
   let i = 0;
-  return { getInputs: async () => batches[i++] ?? [] } as unknown as WorkerClient;
+  // PRD #1247 M5: getInputs now returns { inputs, credentialSwitch? }; the poller reads `.inputs`.
+  return { getInputs: async () => ({ inputs: batches[i++] ?? [] }) } as unknown as WorkerClient;
 }
 
 const inp = (kind: UserInput["kind"], body?: string): UserInput => ({ id: 1, kind, body: body ?? null });
