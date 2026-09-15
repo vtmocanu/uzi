@@ -213,6 +213,43 @@ func (c *HTTPClient) ResumeRunNow(ctx context.Context, id string) (apitypes.RunD
 	return env.Run, nil
 }
 
+// SetRunCredentialOverride is the wire shape of PRD #1247 M4's `uzi run set-token` body:
+// {mode, secret_id?}. Mode is one of "pinned"/"auto"/"default"/"inherit"; SecretID is set
+// ONLY for a pinned choice (the label is resolved to an anthropic_token id CLIENT-SIDE,
+// mirroring `uzi run create --token`) and empty for the other three modes. It mirrors the
+// server's inline request struct and the create path's CreateRunCredentialOverride.
+type SetRunCredentialOverride struct {
+	Mode     string
+	SecretID string
+}
+
+// setRunCredentialBody is the JSON wire body. secret_id is a `*string` with `omitempty` so
+// it rides only for a pinned choice; the keyword modes send `mode` alone.
+type setRunCredentialBody struct {
+	Mode     string  `json:"mode"`
+	SecretID *string `json:"secret_id,omitempty"`
+}
+
+// SetRunCredential POSTs the set-token override to /api/runs/{id}/credential and unwraps
+// the {run: RunDTO, warning?: string} envelope, returning the run and the (possibly empty)
+// D6 warning (PRD #1247 M4). The exit-code mapping (404→ExitNotFound, 409→ExitConflict,
+// 422/400→ExitUsage) comes for free through statusError/postJSON.
+func (c *HTTPClient) SetRunCredential(ctx context.Context, id string, override SetRunCredentialOverride) (apitypes.RunDTO, string, error) {
+	body := setRunCredentialBody{Mode: override.Mode}
+	if override.SecretID != "" {
+		sid := override.SecretID
+		body.SecretID = &sid
+	}
+	var env struct {
+		Run     apitypes.RunDTO `json:"run"`
+		Warning string          `json:"warning"`
+	}
+	if err := c.postJSON(ctx, "/api/runs/"+url.PathEscape(id)+"/credential", body, &env); err != nil {
+		return apitypes.RunDTO{}, "", err
+	}
+	return env.Run, env.Warning, nil
+}
+
 func (c *HTTPClient) SetRunMrRework(ctx context.Context, id string, enabled *bool) (apitypes.RunDTO, error) {
 	// `enabled` is a *bool with NO omitempty, deliberately: this endpoint's null is
 	// meaningful — a nil pointer marshals `"enabled": null`, which the server reads as

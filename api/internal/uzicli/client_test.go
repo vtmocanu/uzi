@@ -1040,6 +1040,63 @@ func TestCreateRunWireBodyCredentialOverride(t *testing.T) {
 	}
 }
 
+// TestSetRunCredentialWire asserts `SetRunCredential` POSTs to /api/runs/{id}/credential
+// with {mode, secret_id?} — a pinned choice carries secret_id, the keyword modes carry mode
+// alone (secret_id omitempty) — and that it unwraps the {run, warning} envelope, returning
+// the D6 warning (PRD #1247 M4). Asserted on raw bytes so the omitted secret_id is caught.
+func TestSetRunCredentialWire(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		in       SetRunCredentialOverride
+		wantJSON []string
+		wantNot  []string
+	}{
+		{"pinned carries mode + secret_id", SetRunCredentialOverride{Mode: "pinned", SecretID: "sec-b"},
+			[]string{`"mode":"pinned"`, `"secret_id":"sec-b"`}, nil},
+		{"auto carries mode alone", SetRunCredentialOverride{Mode: "auto"},
+			[]string{`"mode":"auto"`}, []string{"secret_id"}},
+		{"inherit carries mode alone", SetRunCredentialOverride{Mode: "inherit"},
+			[]string{`"mode":"inherit"`}, []string{"secret_id"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var body, path string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				path = r.URL.Path
+				b := make([]byte, r.ContentLength)
+				_, _ = io.ReadFull(r.Body, b)
+				body = string(b)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"run":{"id":"r1","status":"queued"},"warning":"heads up"}`))
+			}))
+			defer srv.Close()
+
+			run, warning, err := newTestClient(srv).SetRunCredential(context.Background(), "r1", tc.in)
+			if err != nil {
+				t.Fatalf("SetRunCredential: %v", err)
+			}
+			if path != "/api/runs/r1/credential" {
+				t.Errorf("path = %q, want /api/runs/r1/credential", path)
+			}
+			if run.ID != "r1" {
+				t.Errorf("run.ID = %q, want r1", run.ID)
+			}
+			if warning != "heads up" {
+				t.Errorf("warning = %q, want the unwrapped 'heads up'", warning)
+			}
+			for _, want := range tc.wantJSON {
+				if !strings.Contains(body, want) {
+					t.Errorf("body = %s, want it to contain %s", body, want)
+				}
+			}
+			for _, notWant := range tc.wantNot {
+				if strings.Contains(body, notWant) {
+					t.Errorf("body = %s, want it to NOT contain %s (a keyword mode carries no secret)", body, notWant)
+				}
+			}
+		})
+	}
+}
+
 // TestCreateRunWireBodyForce asserts the --force flag's wire mapping (issue #856). Unlike
 // wait_on_limit/mr_rework_enabled, force is NOT tri-state: it is a plain bool with omitempty,
 // so a false force (the default, and every non-forced create) must send NO `force` key —
