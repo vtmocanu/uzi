@@ -184,6 +184,18 @@ type FakeClient struct {
 	ResumedRun      apitypes.RunDTO
 	ResumeRunNowErr error
 
+	// SetRunCredential capture (PRD #1247 M4). LastSetTokenRunID is the run id `uzi run
+	// set-token` targeted; LastSetTokenOverride is the resolved override it sent (a label
+	// resolved CLIENT-SIDE to {pinned, secret_id}; auto/default/inherit as a bare mode), so
+	// a test can assert the exact wire mapping. SetTokenRun / SetTokenWarning are the canned
+	// success reply and its D6 warning; SetRunCredentialErr wins over the blanket Err so a
+	// test can model a 409/404/422 on the write while the capture still proves it was reached.
+	LastSetTokenRunID    string
+	LastSetTokenOverride *SetRunCredentialOverride
+	SetTokenRun          apitypes.RunDTO
+	SetTokenWarning      string
+	SetRunCredentialErr  error
+
 	// SetRunMrRework capture (PRD #841 M3). LastMrReworkRunID is the run id `uzi run
 	// mr-rework` targeted; LastMrReworkEnabled keeps the POINTER so a test can tell the
 	// three wire states apart — &true, &false, and nil (--clear → clear to inherit).

@@ -597,6 +597,11 @@ var wantRouteMounts = []routeMount{
 	// UPDATE of runs (status → queued), no token spend, no forge write → noLimiter,
 	// mirroring the priority verb's posture.
 	{"POST", "/api/runs/{id}/resume-now", noLimiter},
+	// Per-run credential switch (PRD #1247 M4): one owner-scoped override write plus, for a
+	// parked run, an early-promote UPDATE of runs (→ queued) — no token spend, no forge
+	// write → noLimiter, mirroring resume-now's posture. (D6 warnings read the owner's own
+	// candidate gauge, still no forge call.)
+	{"POST", "/api/runs/{id}/credential", noLimiter},
 	// Owner completion decision (PRD #1226 M5, D7): one owner-scoped resume of a
 	// completion-blocked run (paused → queued via ResumePausedRun, or delivering the decision
 	// to the live worker) plus an audit/guidance input row — no token spend, no forge write →
