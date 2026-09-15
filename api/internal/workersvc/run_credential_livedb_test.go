@@ -238,6 +238,110 @@ func TestSetRunCredentialRefusedStatesLiveDB(t *testing.T) {
 	})
 }
 
+// TestSetRunCredentialLaneAndSecretRefusalsLiveDB drives the validator's 409 lane refusal
+// and 404 foreign/wrong-kind-secret refusal THROUGH the full SetRunCredential verb path (the
+// M1 validator's own unit tests prove them in isolation; this proves the wiring — that
+// run.Kind and the secret id are actually threaded into the validator). Every case asserts
+// NO override was written and the status is unchanged: validation runs BEFORE the status
+// dispatch, so a refused switch must never touch the override columns.
+func TestSetRunCredentialLaneAndSecretRefusalsLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	svc := New(env.q, env.box, testParams())
+	now := time.Now().UTC()
+	// altEligible so altTok is an unambiguously VALID pin (the caller's own anthropic_token
+	// with a fresh gauge) — the lane cases must still refuse a valid pin.
+	o := seedReevalOwner(t, env, BindModeAuto, true)
+
+	// assertNoOverride re-reads the run and asserts the refusal wrote nothing and left the
+	// status where it was.
+	assertNoOverride := func(t *testing.T, runID uuid.UUID, wantStatus string) {
+		t.Helper()
+		run := mustRun(t, env, runID)
+		if run.CredentialOverrideMode.Valid {
+			t.Errorf("credential_override_mode = %q, want NULL (a refused switch writes nothing)", run.CredentialOverrideMode.String)
+		}
+		if run.CredentialOverrideSecretID.Valid {
+			t.Errorf("credential_override_secret_id = %+v, want NULL (a refused switch writes nothing)", run.CredentialOverrideSecretID)
+		}
+		if run.Status != wantStatus {
+			t.Errorf("status = %q, want it UNCHANGED (%q)", run.Status, wantStatus)
+		}
+	}
+
+	// (409) The three non-switchable lanes (D10): chat / judge / self_improve. A VALID pinned
+	// override (the caller's own eligible altTok) must STILL be refused with the lane error,
+	// proving run.Kind is threaded into the validator — hardcoding the kind to 'issue' would
+	// let the queued switch through and redden this (both the error and the NO-override check).
+	t.Run("lane not switchable", func(t *testing.T) {
+		// judge requires a target_run_id (runs_kind_shape); seed the caller's own issue run
+		// as the target.
+		judgeTarget := seedRunInStatus(t, env, o, 4720, "queued", now)
+
+		chatID := uuid.New()
+		env.exec(`INSERT INTO runs (id, user_id, kind, issue_title, issue_description, status, status_since)
+		          VALUES ($1, $2, 'chat', 't', 'd', 'queued', now())`, chatID, o.userID)
+
+		judgeID := uuid.New()
+		env.exec(`INSERT INTO runs (id, user_id, kind, issue_title, issue_description, status, status_since, target_run_id)
+		          VALUES ($1, $2, 'judge', 't', 'd', 'queued', now(), $3)`, judgeID, o.userID, judgeTarget)
+
+		// self_improve is issue-shaped (repo_id + issue_iid). The per-repo one-active guard
+		// (uq_runs_one_active_self_improve, migration 00158) is scoped to o's FRESH repo, so a
+		// queued self_improve here cannot collide with a sibling package's fixture.
+		selfID := uuid.New()
+		env.exec(`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, status, status_since, worker_id)
+		          VALUES ($1, $2, $3, 'self_improve', 4721, 't', 'd', 'queued', now(), $4)`, selfID, o.userID, o.repoID, o.workerID)
+
+		for _, tc := range []struct {
+			kind  string
+			runID uuid.UUID
+		}{
+			{"chat", chatID},
+			{"judge", judgeID},
+			{"self_improve", selfID},
+		} {
+			t.Run(tc.kind, func(t *testing.T) {
+				_, err := svc.SetRunCredential(env.ctx, o.userID, tc.runID, CredentialOverrideModePinned, &o.altTok)
+				if !errors.Is(err, ErrCredentialOverrideLaneNotSwitchable) {
+					t.Fatalf("SetRunCredential(%s) err = %v, want ErrCredentialOverrideLaneNotSwitchable (409)", tc.kind, err)
+				}
+				assertNoOverride(t, tc.runID, "queued")
+			})
+		}
+	})
+
+	// (404) The pinned secret must be the CALLER's OWN anthropic_token. Both a foreign secret
+	// and an own-but-wrong-kind secret resolve as not-found through the owner+kind-scoped
+	// lookup — proving the secret id is threaded to that lookup. A switchable (queued) issue
+	// run owned by the caller isolates the refusal to the secret, not the lane or the state.
+	t.Run("pinned secret not found", func(t *testing.T) {
+		// (a) a secret owned by a DIFFERENT user.
+		other := seedReevalOwner(t, env, BindModeAuto, false)
+		t.Run("foreign-owner secret", func(t *testing.T) {
+			runID := seedRunInStatus(t, env, o, 4730, "queued", now)
+			_, err := svc.SetRunCredential(env.ctx, o.userID, runID, CredentialOverrideModePinned, &other.altTok)
+			if !errors.Is(err, ErrCredentialOverrideSecretNotFound) {
+				t.Fatalf("pinning another user's secret: err = %v, want ErrCredentialOverrideSecretNotFound (404)", err)
+			}
+			assertNoOverride(t, runID, "queued")
+		})
+
+		// (b) the caller's OWN secret, but of a NON-anthropic_token kind.
+		t.Run("own wrong-kind secret", func(t *testing.T) {
+			wrongKindID := uuid.New()
+			env.exec(`INSERT INTO user_secrets (id, user_id, kind, label, ciphertext, sealed_with)
+			          VALUES ($1, $2, 'openai_api_key', $3, $4, 'master')`,
+				wrongKindID, o.userID, "wrongkind-"+uuid.NewString(), []byte("x"))
+			runID := seedRunInStatus(t, env, o, 4731, "queued", now)
+			_, err := svc.SetRunCredential(env.ctx, o.userID, runID, CredentialOverrideModePinned, &wrongKindID)
+			if !errors.Is(err, ErrCredentialOverrideSecretNotFound) {
+				t.Fatalf("pinning an own wrong-kind (openai_api_key) secret: err = %v, want ErrCredentialOverrideSecretNotFound (404)", err)
+			}
+			assertNoOverride(t, runID, "queued")
+		})
+	})
+}
+
 // TestSetRunCredentialWarningsLiveDB covers the D6 warnings: pinning the run's own dead
 // token, pinning a token whose gauge reads stale/exhausted, and auto with an empty
 // pool-minus-dead all return 200 + a warning; a healthy pin returns none. A warning NEVER
