@@ -11,8 +11,8 @@ Uzi retries in place and, if the trouble persists, parks the run in
 
 - A **positively empty SDK turn** — a turn that finishes with a reported
   turn count of zero and no model activity, plan, question, or completion.
-- A **transient provider error** — the Anthropic API returning 429, 500,
-  502, 503, or 529 (or a status-less transport error).
+- A **transient provider error** — the Anthropic API returning 408, 429, or
+  any 5xx (500/502/503/504/529), or a status-less transport error.
 
 Uzi retries the interruption a few times in place. If it does not clear,
 uzi saves a verified local recovery checkpoint before parking the run in
