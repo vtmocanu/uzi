@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
@@ -143,9 +145,11 @@ func TestRunSetTokenMutuallyExclusive(t *testing.T) {
 	}
 }
 
-// TestRunSetTokenPrintsWarning: a D6 warning on the 200 is printed to the user (above the
-// run detail) without the command failing.
-func TestRunSetTokenPrintsWarning(t *testing.T) {
+// TestRunSetTokenPrintsWarningToStderr: a D6 warning on the 200 is printed to STDERR (never
+// stdout) on the human path so the advisory is not lost, without the command failing, and
+// stdout carries only the run detail. Routing to stderr is what lets a --json consumer see it
+// too (TestRunSetTokenJSONWarningToStderr) while stdout stays a bare RunDTO.
+func TestRunSetTokenPrintsWarningToStderr(t *testing.T) {
 	// Assigned via a local so gosec G101 does not read a string literal on a Token-named
 	// field as a hardcoded credential (it is a D6 warning message, not a secret).
 	warn := "auto has no pooled token with headroom right now; the run will hold in pool_wait until one is available"
@@ -153,11 +157,53 @@ func TestRunSetTokenPrintsWarning(t *testing.T) {
 		SetTokenRun:     apitypes.RunDTO{ID: "run-9", Status: "queued", Kind: "issue"},
 		SetTokenWarning: warn,
 	}
-	outb, _, code := runCLI(t, fakeEnv(fc), "run", "set-token", "run-9", "--auto")
+	outb, errb, code := runCLI(t, fakeEnv(fc), "run", "set-token", "run-9", "--auto")
 	if code != uzicli.ExitOK {
 		t.Fatalf("exit = %d, want 0", code)
 	}
-	if !containsAll(outb, "warning", "pool_wait") {
-		t.Errorf("a D6 warning should be printed; got stdout: %q", outb)
+	if !containsAll(errb, "warning", "pool_wait") {
+		t.Errorf("a D6 warning should be printed to STDERR; got stderr: %q", errb)
+	}
+	if strings.Contains(outb, "warning") {
+		t.Errorf("the D6 warning must NOT be on stdout (the human path renders only the detail); got stdout: %q", outb)
+	}
+}
+
+// TestRunSetTokenJSONWarningToStderr: with --json, stdout stays a BARE RunDTO (valid JSON,
+// decodes to the run, NO warning key — the shape the other run verbs emit), while the D6
+// warning is not dropped: it is routed to stderr so a scripted/agent caller still sees it.
+func TestRunSetTokenJSONWarningToStderr(t *testing.T) {
+	warn := "auto has no pooled token with headroom right now; the run will hold in pool_wait until one is available"
+	fc := &uzicli.FakeClient{
+		SetTokenRun:     apitypes.RunDTO{ID: "run-9", Status: "queued", Kind: "issue"},
+		SetTokenWarning: warn,
+	}
+	outb, errb, code := runCLI(t, fakeEnv(fc), "run", "set-token", "run-9", "--auto", "--json")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	// stdout is a bare RunDTO: valid JSON, an object with NO warning key, decoding to the run.
+	if !json.Valid([]byte(outb)) {
+		t.Fatalf("--json stdout is not valid JSON: %q", outb)
+	}
+	var asMap map[string]any
+	if err := json.Unmarshal([]byte(outb), &asMap); err != nil {
+		t.Fatalf("--json stdout did not decode to a JSON object: %v (%q)", err, outb)
+	}
+	for _, k := range []string{"warning", "Warning"} {
+		if _, ok := asMap[k]; ok {
+			t.Errorf("--json stdout must stay a bare RunDTO with no %q key; got: %q", k, outb)
+		}
+	}
+	var run apitypes.RunDTO
+	if err := json.Unmarshal([]byte(outb), &run); err != nil {
+		t.Fatalf("--json stdout did not decode to a RunDTO: %v", err)
+	}
+	if run.ID != "run-9" {
+		t.Errorf("--json stdout RunDTO id = %q, want run-9", run.ID)
+	}
+	// The advisory is not lost — it is on stderr, so a --json consumer still sees it.
+	if !containsAll(errb, "warning", "pool_wait") {
+		t.Errorf("--json must still surface the D6 warning on stderr; got stderr: %q", errb)
 	}
 }
