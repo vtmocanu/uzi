@@ -506,6 +506,13 @@ func (h *Handler) WorkerRunMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	var req struct {
 		Messages []workersvc.IncomingMessage `json:"messages"`
+		// ClaimGeneration is the runs.claim_generation the reporting worker believes it holds
+		// (PRD #1247 M5, D3). A CAPABILITY worker stamps it on every batch; the fenced append
+		// then persists ONLY while the run is still at that generation with an unreleased claim,
+		// so a released/reclaimed old flight's batch lands nothing. Nullable + OPTIONAL: a legacy
+		// worker omits it and the append is unfenced. The field must exist here because
+		// DecodeJSONLimited rejects unknown fields.
+		ClaimGeneration *int64 `json:"claim_generation"`
 	}
 	// DecodeJSONLimited, not DecodeJSON: this is the one route whose client is a
 	// machine that must decide whether to retry (PRD #108 M2). DecodeJSON's
@@ -543,10 +550,17 @@ func (h *Handler) WorkerRunMessages(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if err := h.wsvc.AppendMessages(r.Context(), wkr, runID, req.Messages); err != nil {
+	if err := h.wsvc.AppendMessagesForClaim(r.Context(), wkr, runID, req.Messages, req.ClaimGeneration); err != nil {
 		switch {
 		case errors.Is(err, workersvc.ErrRunNotOwned):
 			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
+		case errors.Is(err, workersvc.ErrMissingClaimGeneration):
+			// PRD #1247 M5a-1 rework (auditor fail-open finding): a CAPABILITY worker
+			// (advertising credential_switch_v1) omitted claim_generation on a message batch, so
+			// the per-query fence could not engage. Refuse rather than persist unfenced. 409 is
+			// the refuse ack — a protocol violation the worker fixes by stamping the generation,
+			// distinct from the 404 (not owned) and 400 (bad/unstorable batch) causes.
+			httpx.Error(w, http.StatusConflict, "this worker must stamp claim_generation on every message batch")
 		case errors.Is(err, workersvc.ErrInvalidMessage):
 			httpx.Error(w, http.StatusBadRequest, "each message needs a positive seq, a kind, and a JSON payload")
 		case errors.Is(err, workersvc.ErrUnstorableMessage):
@@ -614,10 +628,23 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 	run, applied, err := h.wsvc.SetState(r.Context(), wkr, runID, req)
 	if err != nil {
 		switch {
+		case errors.Is(err, workersvc.ErrStaleClaim), errors.Is(err, workersvc.ErrMissingClaimGeneration):
+			// PRD #1247 M5 (D3): the generation fence rejected this report — a held-state switch
+			// RELEASED this claim, or a reclaim SUPERSEDED it. M5a-1 rework: it ALSO covers a
+			// CAPABILITY worker that OMITTED claim_generation on a mutating report
+			// (ErrMissingClaimGeneration, fail-closed). Answer 409 with the run PLUS a
+			// disposition:"stale_claim" field the new worker reads to STOP the old flight without
+			// further reports. The 409 status is shared with an ordinary not-applied ack (an old
+			// worker that ignores the extra field still treats it as "changed nothing"); the
+			// disposition is what distinguishes a stale claim from a benign no-op.
+			httpx.JSON(w, http.StatusConflict, map[string]any{
+				"run":         runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.clock()),
+				"disposition": "stale_claim",
+			})
 		case errors.Is(err, workersvc.ErrRunNotOwned):
 			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
 		case errors.Is(err, workersvc.ErrInvalidState):
-			httpx.Error(w, http.StatusBadRequest, "state must be one of running, awaiting_approval, awaiting_input, awaiting_followup, limit_wait, recovery_wait, paused, pause_failed, completed, failed")
+			httpx.Error(w, http.StatusBadRequest, "state must be one of running, awaiting_approval, awaiting_input, awaiting_followup, limit_wait, recovery_wait, paused, pause_failed, credential_switch, completed, failed")
 		default:
 			slog.Error("worker run state", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
