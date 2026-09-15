@@ -165,6 +165,14 @@ func (s *Service) releaseCredentialSwitch(ctx context.Context, owned store.Run, 
 //     the handler renders as the ordinary 409 (nothing was pending for this claim).
 //   - non-zero → re-read, emit a best-effort observability note (the note NEVER fails the report;
 //     the stamp CLEAR is the load-bearing behavior), and return (run, true, nil).
+//
+// ACCEPTED TRADEOFF (matches pause_failed): the clear carries no per-request discriminator, so a
+// lost-ack REDELIVERY of a give-up at the same still-held claim generation can clear a switch the
+// owner RE-REQUESTED in the window between the first give-up and the redelivery — the re-request is
+// silently withdrawn and the owner re-issues it. This mirrors ClearPauseRequest / pause_failed
+// (which fences on worker_id alone), is liveness-only (no auth/tenant/secret impact), and closing
+// it would need a stamp nonce (a schema column) out of proportion to the edge. Deliberate, not an
+// oversight.
 func (s *Service) failCredentialSwitch(ctx context.Context, owned store.Run, wkr store.Worker, req StateRequest) (store.Run, bool, error) {
 	if req.ClaimGeneration == nil {
 		// A capability worker ALWAYS stamps the generation (the verb targets a specific claim);
