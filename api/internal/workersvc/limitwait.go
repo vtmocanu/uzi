@@ -660,6 +660,10 @@ func (s *Service) setLimitWait(ctx context.Context, run store.Run, wkr store.Wor
 		LimitResetsAt:  pgconv.TimePtr(d.LimitResetsAt),
 		RateLimitType:  pgconv.TextPtr(d.RateLimitType),
 		RetryNotBefore: pgconv.Time(d.RetryNotBefore),
+		// PRD #1247 M5a-1 rework (reviewer NB1): thread the reported generation to the per-query
+		// fence. A capability worker stamps it; a stale/reclaimed old flight's park matches 0 rows
+		// and cannot clobber the reclaiming run. nil (legacy) parks unfenced.
+		ClaimGeneration: pgconv.Int8Ptr(req.ClaimGeneration),
 		// PRD #217 M2: record the credential this run was spending so its NEXT claim
 		// excludes it (runs.limit_dead_secret_id). Passed straight through from the run
 		// row — an invalid/NULL AnthropicSecretID writes NULL, i.e. no exclusion, which

@@ -7449,8 +7449,15 @@ type ReleaseCredentialSwitchParams struct {
 // by the reporting worker (worker_id), and in one of the HELD states. A stale redelivery (the
 // claim was released, or a reclaim bumped the generation) matches 0 rows; the caller
 // distinguishes an already-applied/already-reclaimed redelivery (idempotent success) from an
-// unexpected state by re-reading the run (releaseCredentialSwitch). Dropping the
-// claim_released_at IS NULL conjunct is the mutation TestReleaseCredentialSwitch*LiveDB pins.
+// unexpected state by re-reading the run (releaseCredentialSwitch).
+//
+// The claim_released_at IS NULL conjunct is DEFENSE IN DEPTH, not the pin of the idempotent
+// redelivery test: both redelivery cases are already excluded INDEPENDENTLY — an already-released
+// run is 'queued' (excluded by the status IN (...) clause below), and a reclaimed run is at a
+// higher generation (excluded by claim_generation = @generation). What the conjunct alone catches
+// is the ARTIFICIAL state a released claim still in a held status (which the normal flow never
+// produces), pinned by TestReleaseCredentialSwitchReleasedConjunctLiveDB, which forces that state
+// directly and asserts a same-generation release is refused.
 //
 // THE BUDGET RULE IS THE GATE-PARK/PAUSE ONE (Open Question 3, D14): started_at is KEPT and the
 // held gap is BANKED into budget_paused_seconds, exactly like ResumePausedRun — a mid-run switch
@@ -8930,6 +8937,15 @@ UPDATE runs SET
 WHERE id = $6 AND worker_id = $7
   AND status = 'running'
   AND kind <> 'judge'
+  -- PRD #1247 M5a-1 rework (reviewer NB1): the per-query generation fence, the SAME nil-guarded
+  -- shape as InsertRunMessage. A CAPABILITY worker stamps claim_generation on the park report;
+  -- a stale report from an OLD flight — reclaimed to a NEW generation under same-worker affinity
+  -- (status 'running' and worker_id both still match, so the status guard alone does NOT exclude
+  -- it), or against a released claim — matches 0 rows here, so a fenced-out park cannot clobber
+  -- the reclaiming flight's run. A legacy worker (NULL generation) parks unconditionally,
+  -- unchanged. sqlc.narg, never @name (this file's multibyte comment blocks break the @name parser).
+  AND ($8::bigint IS NULL
+       OR (claim_generation = $8::bigint AND claim_released_at IS NULL))
 `
 
 type SetRunLimitWaitParams struct {
@@ -8940,6 +8956,7 @@ type SetRunLimitWaitParams struct {
 	SessionID         pgtype.Text        `json:"session_id"`
 	ID                uuid.UUID          `json:"id"`
 	WorkerID          pgtype.UUID        `json:"worker_id"`
+	ClaimGeneration   pgtype.Int8        `json:"claim_generation"`
 }
 
 // Park a run until the owner's exhausted Anthropic usage window reopens (PRD #35
@@ -9014,6 +9031,7 @@ func (q *Queries) SetRunLimitWait(ctx context.Context, arg SetRunLimitWaitParams
 		arg.SessionID,
 		arg.ID,
 		arg.WorkerID,
+		arg.ClaimGeneration,
 	)
 	if err != nil {
 		return 0, err
@@ -9287,13 +9305,22 @@ UPDATE runs SET
 WHERE id = $3 AND worker_id = $4
   AND status = 'running'
   AND kind <> 'judge'
+  -- PRD #1247 M5a-1 rework (reviewer NB1): the per-query generation fence, identical to
+  -- SetRunLimitWait's and the SAME nil-guarded shape as InsertRunMessage. A stale report from an
+  -- OLD flight — reclaimed to a NEW generation under same-worker affinity, or against a released
+  -- claim — matches 0 rows, so a fenced-out park cannot clobber the reclaiming flight's run. A
+  -- legacy worker (NULL generation) parks unconditionally, unchanged. sqlc.narg, never @name (the
+  -- multibyte comment blocks break the @name parser).
+  AND ($5::bigint IS NULL
+       OR (claim_generation = $5::bigint AND claim_released_at IS NULL))
 `
 
 type SetRunRecoveryWaitParams struct {
-	RetryNotBefore pgtype.Timestamptz `json:"retry_not_before"`
-	SessionID      pgtype.Text        `json:"session_id"`
-	ID             uuid.UUID          `json:"id"`
-	WorkerID       pgtype.UUID        `json:"worker_id"`
+	RetryNotBefore  pgtype.Timestamptz `json:"retry_not_before"`
+	SessionID       pgtype.Text        `json:"session_id"`
+	ID              uuid.UUID          `json:"id"`
+	WorkerID        pgtype.UUID        `json:"worker_id"`
+	ClaimGeneration pgtype.Int8        `json:"claim_generation"`
 }
 
 // Park a run in the TRANSIENT-RECOVERY hold (issue #1197). running -> recovery_wait,
@@ -9342,6 +9369,7 @@ func (q *Queries) SetRunRecoveryWait(ctx context.Context, arg SetRunRecoveryWait
 		arg.SessionID,
 		arg.ID,
 		arg.WorkerID,
+		arg.ClaimGeneration,
 	)
 	if err != nil {
 		return 0, err
