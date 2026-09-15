@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
-# Local Homebrew test for the uzi-cli formula, no published tag / no remote needed.
+# Local Homebrew test for a uzi CLI formula, no published tag / no remote needed.
+#
+# Works for either channel via an optional first arg (default uzi-cli): `uzi-cli` renders
+# and installs the stable Formula/uzi-cli.rb; `uzi-cli-rc` does the same for the RC lane
+# (Formula/uzi-cli-rc.rb via `task brew-rc:formula`, with a -rc.N version so Homebrew
+# auto-detects a prerelease and `uzi version` prints v<rc-version>).
 #
 # The real formula installs by downloading vtmocanu/uzi's tag source tarball (the
 # auto-archive) and building from source. Here we mimic that offline: build a throwaway
-# tarball holding the CURRENT source (the api/ module), then render Formula/uzi-cli.rb's
-# url/sha256 placeholders against it with the SAME reusable `task brew:formula` CI uses
+# tarball holding the CURRENT source (the api/ module), then render the chosen formula's
+# url/sha256 placeholders against it with the SAME reusable `task <ns>:formula` CI uses
 # (TARBALL_URL points at the local file://), drop the rendered formula into a throwaway
 # local tap, then install / run / assert / test / uninstall. Cleaned up on exit. Unlike
 # a stub harness this COMPILES the CLI, so it is what settles whether a from-source Go
@@ -15,19 +20,28 @@ export HOMEBREW_NO_AUTO_UPDATE=1
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$here/.." && pwd)"
 
+# Optional channel arg selects the formula/binary name and its render task namespace.
+# Default uzi-cli keeps the no-arg invocation byte-for-byte identical to before.
+channel="${1:-uzi-cli}"
+case "$channel" in
+  uzi-cli)    task_ns="brew";    version="0.0.0" ;;
+  uzi-cli-rc) task_ns="brew-rc"; version="0.0.0-rc.1" ;;
+  *) echo "usage: scripts/brew-local-test.sh [uzi-cli|uzi-cli-rc]" >&2; exit 2 ;;
+esac
+
 # Arbitrary local version: this test validates that the CURRENT source builds, installs
 # and runs, not a version number. The CLI reports v<version> (the formula stamps
-# -X main.version=v#{version}), and Homebrew derives <version> from the tarball filename.
-version="0.0.0"
+# -X main.version=v#{version}), and Homebrew derives <version> from the tarball filename;
+# in the rc channel that filename carries -rc.1, so `uzi version` prints v0.0.0-rc.1.
 work="$(mktemp -d)"
 
 # Throwaway tap name on purpose (NOT the real vtmocanu/homebrew-tap).
 tap_user="uzi-local"; tap_repo="tap"
 tap_dir="$(brew --repository)/Library/Taps/$tap_user/homebrew-$tap_repo"
-ref="$tap_user/$tap_repo/uzi-cli"
+ref="$tap_user/$tap_repo/$channel"
 
 cleanup() {
-  brew uninstall --force uzi-cli >/dev/null 2>&1 || true
+  brew uninstall --force "$channel" >/dev/null 2>&1 || true
   rm -rf "$tap_dir" "$work"
   # Also drop the now-empty tap namespace dir Homebrew leaves behind.
   rmdir "$(dirname "$tap_dir")" 2>/dev/null || true
@@ -57,14 +71,16 @@ tar -czf "$tarball" -C "$work" "uzi-$version"
 #    pointing url at the local tarball. This exercises the real render path -- the
 #    @@URL@@/@@SHA256@@ substitution and the sha256 guard -- with no network or tag.
 mkdir -p "$tap_dir/Formula"
-( cd "$repo_root" && task brew:formula VERSION="v$version" \
-    TARBALL_URL="file://$tarball" FORMULA_OUT="$tap_dir/Formula/uzi-cli.rb" )
-chmod 644 "$tap_dir/Formula/uzi-cli.rb"
+( cd "$repo_root" && task "${task_ns}:formula" VERSION="v$version" \
+    TARBALL_URL="file://$tarball" FORMULA_OUT="$tap_dir/Formula/$channel.rb" )
+chmod 644 "$tap_dir/Formula/$channel.rb"
 
 # 3. install, run, assert, brew-test, uninstall (uninstall via cleanup trap).
-brew uninstall --force uzi-cli >/dev/null 2>&1 || true
+brew uninstall --force "$channel" >/dev/null 2>&1 || true
 # Clear any prior download so this run builds the current source, not a stale cache.
-rm -rf "$(brew --cache)"/*uzi-cli* "$(brew --cache)"/downloads/*uzi-cli* 2>/dev/null || true
+# `${cache:?}` guards the glob from ever expanding to /* if brew --cache is empty.
+cache="$(brew --cache)"
+rm -rf "${cache:?}"/*"$channel"* "${cache:?}"/downloads/*"$channel"* 2>/dev/null || true
 brew install --build-from-source "$ref"
 
 echo "--- $(brew --prefix)/bin/uzi version ---"
