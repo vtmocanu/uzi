@@ -1819,13 +1819,19 @@ export type RunStatus =
 // directive truncated. PRD #1227 M2: "scope_reduced" is stamped on a completed run whose
 // owner `partial` decision deferred part of its frozen scope. Both land
 // status="completed" (green success), so — like "stopped" — neither is a HUMAN_STOP_KIND.
+// Issue #1117: "branch_moved" is stamped on an mr_rework run whose finalize push was
+// rejected non-fast-forward because a concurrent same-branch writer advanced the MR branch
+// under it (a benign, expected race, not an agent failure). It lands status="cancelled", so
+// isStoppedRun already renders it calm regardless of stop_kind — it is NOT a HUMAN_STOP_KIND
+// (those govern the status="failed" case only).
 export type StopKind =
   | "cancelled"
   | "plan_rejected"
   | "auto_stopped"
   | "stopped"
   | "scope_capped"
-  | "scope_reduced";
+  | "scope_reduced"
+  | "branch_moved";
 
 // RunHealth is the server-side run-health flag (PRD #47): a non-terminal,
 // self-clearing signal that a run looks stuck, looping, or close to its timeout. "ok"

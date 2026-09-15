@@ -1136,6 +1136,19 @@ describe("stop_kind='stopped' (PRD #517 M4, deliberate HUMAN_STOP_KINDS exclusio
   });
 });
 
+describe("stop_kind='branch_moved' (issue #1117, cancelled-status disposition)", () => {
+  it("type-checks as a StopKind and renders calm because it lands status='cancelled'", () => {
+    // 'branch_moved' is a valid StopKind (compile-time: this assignment fails to build if
+    // the union omits it).
+    const kind: StopKind = "branch_moved";
+    // The disposition lands status='cancelled'; isStoppedRun treats every cancelled run as a
+    // calm "stopped" regardless of stop_kind, so a concurrent-writer supersession never reads
+    // as breakage.
+    expect(isStoppedRun("cancelled", kind)).toBe(true);
+    expect(runStatusTone("cancelled", kind)).toBe("neutral");
+  });
+});
+
 describe("awaiting_input presentation (PRD #88)", () => {
   it("gets the SAME warn tone as the plan gate", () => {
     expect(runStatusTone("awaiting_input", null)).toBe("warning");
