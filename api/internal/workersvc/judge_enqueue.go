@@ -18,20 +18,39 @@ import (
 )
 
 // preStartInfraFailOrigins is the fail_origin set that means a run failed BEFORE the
-// agent did anything reviewable (PRD #69 M7a Pass B, Decision 12; PRD #1392 M1): a
+// agent did anything reviewable (PRD #69 M7a Pass B, Decision 12): a
 // provisioning/credential/guardrail block that is permanent until the config or policy
-// is fixed, OR a forge that stayed unreachable at clone past the park cap. Gate 4b skips the
-// judge for such a run at iteration_count == 0 — there is no agent behavior to retrospect.
-// Deliberately EXACTLY these four: not rate_limited/worker_lost/run_timeout (transient) and
-// not agent_failure (judgeable). forge_unreachable joins them because a forge park fails
-// pre-clone (fact 4: no clone, no ActiveRun, iteration_count == 0), so like the three infra
-// origins it has no agent behaviour to review. The members are a strict subset of
-// failorigin.go's vocabulary. TestPreStartInfraFailOriginsExact pins the exact set.
+// is fixed. Gate 4b skips the judge for such a run ONLY at iteration_count == 0 — there is
+// no agent behavior to retrospect, and the iteration conjunct is the PRD's defensive guard
+// so a run that DID get far enough to have behaviour worth reviewing is still judged.
+// Deliberately EXACTLY these three: not rate_limited/worker_lost/run_timeout (transient) and
+// not agent_failure (judgeable). The members are a strict subset of failorigin.go's
+// vocabulary. TestPreStartInfraFailOriginsExact pins the exact set.
+//
+// forge_unreachable is DELIBERATELY NOT a member: a forge cap-fail is NOT an
+// iteration_count == 0 condition. iteration_count is only ever advanced (SetRunRunning uses
+// GREATEST) and never reset across park/promote/claim/fail, so a RESUMED run that did work
+// (iteration_count = N > 0), then hit a forge outage and forge-parked to the cap, cap-fails
+// with iteration_count > 0 — the iteration conjunct would let it through. It therefore lives
+// in neverJudgeFailOrigins, which skips the judge regardless of iteration_count (SC3).
 var preStartInfraFailOrigins = map[string]bool{
 	"provisioning_failed":    true,
 	"credential_unavailable": true,
 	"guardrail_blocked":      true,
-	"forge_unreachable":      true,
+}
+
+// neverJudgeFailOrigins is the fail_origin set that skips the judge REGARDLESS of
+// iteration_count (PRD #1392 M1, SC3). Its members are SERVER-DERIVED origins that are never
+// a real agent defect, so there is nothing to retrospect however far the run got. Today it is
+// EXACTLY forge_unreachable: it is stamped ONLY inside SetState's forge-park transaction (a
+// forge that stayed unreachable at clone past the park cap), never by a worker report
+// (workerReportableFailOrigins excludes it, and CoerceFailOrigin drops a worker forging it),
+// so an untrusted report can never steer this skip. Unlike preStartInfraFailOrigins it is NOT
+// gated on iteration_count == 0, because a resumed run's forge cap-fail carries
+// iteration_count > 0 (see preStartInfraFailOrigins). A strict subset of failorigin.go's
+// vocabulary. TestNeverJudgeFailOriginsExact pins the exact set.
+var neverJudgeFailOrigins = map[string]bool{
+	"forge_unreachable": true,
 }
 
 // maybeEnqueueJudgeByID reloads a run by id and runs the judge gate. Used by the
@@ -107,33 +126,38 @@ func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 		}
 		return // no token ⇒ nothing to spend ⇒ no judge run
 	}
-	// Gate 4b (PRD #69 M7a Pass B, Decision 12): skip the judge for a PRE-START INFRA
-	// failure — a run that failed BEFORE the agent did anything worth retrospecting.
-	// The set is EXACTLY the three policy/config-denied origins, AND only at
-	// iteration_count == 0. An agent that started and crashed at iteration 0 carries
-	// 'agent_failure' (the worker-reported default), stays out of this set, and is still
-	// judged (SC3); the iteration conjunct is the PRD's defensive guard for that. NOT
-	// rate_limited/worker_lost/run_timeout (transient) and NOT agent_failure (judgeable).
-	// This is the ACCURACY+SPEND fix: a pre-start infra failure has no agent behavior to
-	// review, and skipping avoids the most expensive per-run call (opus) on a run that
-	// did nothing.
+	// Gate 4b (PRD #69 M7a Pass B, Decision 12; PRD #1392 M1): skip the judge for a failure
+	// with no agent behavior to retrospect. Two disjoint sets, differing ONLY in whether the
+	// skip is gated on iteration_count:
+	//   - neverJudgeFailOrigins (forge_unreachable): server-derived, never a real agent defect,
+	//     so it skips REGARDLESS of iteration_count. A forge cap-fail on a RESUMED run carries
+	//     iteration_count > 0 (iteration_count is only ever advanced, never reset), so gating it
+	//     on == 0 would wrongly judge it — SC3 requires "no judge run" unconditionally.
+	//   - preStartInfraFailOrigins (provisioning/credential/guardrail): a pre-start policy/config
+	//     block, skipped ONLY at iteration_count == 0. An agent that started and crashed at
+	//     iteration 0 carries 'agent_failure' (the worker-reported default), stays out of BOTH
+	//     sets, and is still judged (SC3); the iteration conjunct is the PRD's defensive guard.
+	// Neither is rate_limited/worker_lost/run_timeout (transient) nor agent_failure (judgeable).
+	// This is the ACCURACY+SPEND fix: such a failure has no agent behavior to review, and
+	// skipping avoids the most expensive per-run call (opus) on a run that did nothing.
 	//
 	// DETERMINISTIC INFRA NOTIFICATION — delivered here by the EXISTING RunFailureNotifier,
-	// NOT injected. The judge is a REPLACEMENT for these runs, not an addition, so they
-	// still owe a failure notification. Every path that can reach this gate carrying one
-	// of these three origins is the worker-reported SetState terminal transition, which
-	// fires s.bcast.PublishState(runID,"failed") BEFORE calling maybeEnqueueJudge; the
-	// RunFailureNotifier subscribes to that PublishState and notifies every
-	// non-cancelled/non-plan_rejected failure (infra included), so the notification has
-	// already been delivered on the SAME transition and this gate need only skip the
-	// judge. (The server-side claim-assembly failer that also stamps these three origins
-	// via MarkRunFailedByID never calls maybeEnqueueJudge at all, so it is not
-	// gate-reachable; it notifies through its own s.notify.) No notifysvc injection is
-	// possible anyway — notifysvc imports workersvc (RunFailureNotifier is a
-	// workersvc.Broadcaster), so injecting it would create an import cycle.
-	if run.Status == "failed" && run.IterationCount == 0 &&
-		run.FailOrigin.Valid && preStartInfraFailOrigins[run.FailOrigin.String] {
-		slog.Debug("judge enqueue: pre-start infra failure, skipping judge (deterministic notification delivered by RunFailureNotifier on the same transition)",
+	// NOT injected. The judge is a REPLACEMENT for these runs, not an addition, so they still
+	// owe a failure notification. Every path that reaches this gate — the worker-reported
+	// SetState terminal transition for the three infra origins, AND SetState's own forge-park
+	// transaction for forge_unreachable — fires s.bcast.PublishState(runID,"failed") BEFORE
+	// calling maybeEnqueueJudge; the RunFailureNotifier subscribes to that PublishState and
+	// notifies every non-cancelled/non-plan_rejected failure (infra included), so the
+	// notification has already been delivered on the SAME transition and this gate need only
+	// skip the judge. (The server-side claim-assembly failer that also stamps the three infra
+	// origins via MarkRunFailedByID never calls maybeEnqueueJudge at all, so it is not
+	// gate-reachable; it notifies through its own s.notify.) No notifysvc injection is possible
+	// anyway — notifysvc imports workersvc (RunFailureNotifier is a workersvc.Broadcaster), so
+	// injecting it would create an import cycle.
+	if run.Status == "failed" && run.FailOrigin.Valid &&
+		(neverJudgeFailOrigins[run.FailOrigin.String] ||
+			(run.IterationCount == 0 && preStartInfraFailOrigins[run.FailOrigin.String])) {
+		slog.Debug("judge enqueue: server-derived / pre-start infra failure, skipping judge (deterministic notification delivered by RunFailureNotifier on the same transition)",
 			"run", run.ID, "fail_origin", run.FailOrigin.String)
 		return
 	}

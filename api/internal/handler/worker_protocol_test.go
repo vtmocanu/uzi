@@ -3,6 +3,8 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -801,6 +803,40 @@ func TestWorkerStateAlreadyTerminalReturns409(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "cancelled") {
 		t.Fatalf("409 body should echo the run's real status, got %q", rec.Body.String())
+	}
+}
+
+// TestForgeParkRefusalReason pins the pure error→reason mapping WorkerRunState's 409
+// {run, reason} body carries (PRD #1392 M1). It is the smallest testable seam for the two new
+// reason bodies — the errors themselves are only raised inside SetState's live-DB forge-park
+// transaction (a fake service is impossible: h.wsvc is a concrete *workersvc.Service) — and it
+// PROVES a stale_claim↔custody_unsettled mixup is caught: each sentinel demands its OWN exact
+// token. It also proves errors.Is-unwrapping (a wrapped sentinel still maps, the shape SetState
+// may return) and that every NON-forge-park error falls through (ok=false) so WorkerRunState
+// keeps routing it to ErrRunNotOwned/ErrInvalidState/the 500 arm instead of a 409 {reason}.
+func TestForgeParkRefusalReason(t *testing.T) {
+	if reason, ok := forgeParkRefusalReason(workersvc.ErrForgeParkStaleClaim); !ok || reason != "stale_claim" {
+		t.Errorf("stale-claim: got (%q,%v), want (stale_claim,true)", reason, ok)
+	}
+	if reason, ok := forgeParkRefusalReason(workersvc.ErrForgeParkCustodyUnsettled); !ok || reason != "custody_unsettled" {
+		t.Errorf("custody-unsettled: got (%q,%v), want (custody_unsettled,true)", reason, ok)
+	}
+	// errors.Is-unwrapping: a wrapped sentinel still maps to its token.
+	wrapped := fmt.Errorf("set state: %w", workersvc.ErrForgeParkCustodyUnsettled)
+	if reason, ok := forgeParkRefusalReason(wrapped); !ok || reason != "custody_unsettled" {
+		t.Errorf("wrapped custody-unsettled: got (%q,%v), want (custody_unsettled,true)", reason, ok)
+	}
+	// Every OTHER error falls through (ok=false, "") — never a 409 {reason} body. A nil error is
+	// never passed here in practice, but returns ("",false) too.
+	for _, err := range []error{
+		workersvc.ErrRunNotOwned,
+		workersvc.ErrInvalidState,
+		errors.New("boom"),
+		nil,
+	} {
+		if reason, ok := forgeParkRefusalReason(err); ok || reason != "" {
+			t.Errorf("forgeParkRefusalReason(%v) = (%q,%v), want (\"\",false)", err, reason, ok)
+		}
 	}
 }
 

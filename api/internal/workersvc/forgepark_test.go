@@ -49,13 +49,20 @@ func TestSetStateForgeParkNoTxBeginnerFailsSafe(t *testing.T) {
 	}
 }
 
-// TestForgeUnreachableIsPreStartInfra pins the judge exclusion mechanism: forge_unreachable is
-// a member of preStartInfraFailOrigins, so a run failed past the forge cap (iteration_count==0,
-// pre-clone) is not judged. Cheap, gate-visible, and the direct mutation guard for the
-// "enqueues no judge" behaviour.
-func TestForgeUnreachableIsPreStartInfra(t *testing.T) {
-	if !preStartInfraFailOrigins["forge_unreachable"] {
-		t.Fatal("forge_unreachable is not in preStartInfraFailOrigins; a forge-cap failure would be judged")
+// TestForgeUnreachableSkipsJudgeRegardlessOfIteration pins the judge exclusion mechanism:
+// forge_unreachable is a member of neverJudgeFailOrigins (the skip that does NOT depend on
+// iteration_count), so a run failed past the forge cap is not judged even when it resumed and
+// did work (iteration_count > 0). It must ALSO be absent from preStartInfraFailOrigins — the
+// iteration_count==0-gated set — else the regardless-of-iteration guarantee would be masked by
+// the conjunct. Cheap, gate-visible, and the direct mutation guard for the "enqueues no judge"
+// behaviour (SC3).
+func TestForgeUnreachableSkipsJudgeRegardlessOfIteration(t *testing.T) {
+	if !neverJudgeFailOrigins["forge_unreachable"] {
+		t.Fatal("forge_unreachable is not in neverJudgeFailOrigins; a forge-cap failure would be judged")
+	}
+	if preStartInfraFailOrigins["forge_unreachable"] {
+		t.Fatal("forge_unreachable is in preStartInfraFailOrigins; that would gate the skip on " +
+			"iteration_count==0, judging a resumed run's forge cap-fail (iteration_count>0)")
 	}
 	// It must also be a real stored member (else the exclusion references a phantom origin).
 	if !failOriginSet["forge_unreachable"] {
