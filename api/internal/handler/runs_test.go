@@ -359,6 +359,56 @@ func TestRunToDTORequirementSet(t *testing.T) {
 	}
 }
 
+// TestRunToDTOForgeParkFields pins that PRD #1392 M1's four forge-park fields reach the RunDTO
+// runToDTO builds (served on GET /api/runs/{id} and the worker 409 bodies). Nothing tested this
+// mapping — folding ForgeParkCount to 0 left the suite green — so this is the mutation-confirmed
+// gap. Both directions, with DISTINCT count vs. max so a swap is caught: a forge-parked run
+// carries the typed cause, the retry stamp, the lifetime count, and forge_park_max = the
+// configured cap (passed to runToDTO, NOT a run column); an unparked/legacy run maps to
+// null/null/0 while forge_park_max still reflects the cap (it is instance config on every run).
+func TestRunToDTOForgeParkFields(t *testing.T) {
+	retry := time.Date(2026, 9, 15, 8, 30, 0, 0, time.UTC)
+	const cap = 6
+
+	parked := runToDTO(store.Run{
+		Status:                 "recovery_wait",
+		RecoveryWaitCause:      pgtype.Text{String: "forge_unreachable", Valid: true},
+		RecoveryRetryNotBefore: pgtype.Timestamptz{Time: retry, Valid: true},
+		ForgeParkCount:         3,
+	}, "normal", 0, 0, cap, dtoTestNow)
+	if parked.RecoveryWaitCause == nil || *parked.RecoveryWaitCause != "forge_unreachable" {
+		t.Errorf("recovery_wait_cause = %v, want forge_unreachable", parked.RecoveryWaitCause)
+	}
+	if parked.RecoveryRetryNotBefore == nil || !parked.RecoveryRetryNotBefore.Equal(retry) {
+		t.Errorf("recovery_retry_not_before = %v, want %v", parked.RecoveryRetryNotBefore, retry)
+	}
+	if parked.ForgeParkCount != 3 {
+		t.Errorf("forge_park_count = %d, want 3", parked.ForgeParkCount)
+	}
+	// forge_park_max is the caller-supplied cap (6), NOT the run's count (3) — swapping the two
+	// (a plausible mapper bug) reddens because 6 != 3, and dropping the ForgeParkMax line reddens
+	// because the zero value 0 != 6.
+	if parked.ForgeParkMax != cap {
+		t.Errorf("forge_park_max = %d, want %d (the configured cap)", parked.ForgeParkMax, cap)
+	}
+
+	// An unparked/legacy run: NULL cause + NULL retry + zero count → null/null/0.
+	legacy := runToDTO(store.Run{Status: "completed"}, "normal", 0, 0, cap, dtoTestNow)
+	if legacy.RecoveryWaitCause != nil {
+		t.Errorf("legacy recovery_wait_cause = %q, want nil", *legacy.RecoveryWaitCause)
+	}
+	if legacy.RecoveryRetryNotBefore != nil {
+		t.Errorf("legacy recovery_retry_not_before = %v, want nil", *legacy.RecoveryRetryNotBefore)
+	}
+	if legacy.ForgeParkCount != 0 {
+		t.Errorf("legacy forge_park_count = %d, want 0", legacy.ForgeParkCount)
+	}
+	// forge_park_max is present on EVERY run (instance config), independent of park state.
+	if legacy.ForgeParkMax != cap {
+		t.Errorf("legacy forge_park_max = %d, want %d (the cap rides every run)", legacy.ForgeParkMax, cap)
+	}
+}
+
 func TestGetRunOwnerNonOwnerAdmin(t *testing.T) {
 	owner := store.User{ID: uuid.New()}
 	runID := uuid.New()

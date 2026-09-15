@@ -60,8 +60,9 @@ var failOrigins = []string{
 	// RUN_FORGE_UNREACHABLE_MAX_PARKS parks. SERVER-DERIVED, NOT worker-reportable (it is
 	// stamped directly inside SetState's forge-park transaction, so it is deliberately absent
 	// from workerReportableFailOrigins) — a worker reporting it is a forgery CoerceFailOrigin
-	// drops. Excluded from the judge (preStartInfraFailOrigins, judge_enqueue.go): a forge park
-	// fails pre-clone at iteration_count==0, with no agent behaviour to retrospect.
+	// drops. Excluded from the judge (neverJudgeFailOrigins, judge_enqueue.go) REGARDLESS of
+	// iteration_count: a forge cap-fail is server-derived, never a real agent defect, and on a
+	// resumed run it carries iteration_count > 0, so the skip cannot be gated on == 0 (SC3).
 	"forge_unreachable",
 }
 

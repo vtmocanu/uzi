@@ -614,6 +614,30 @@ func (h *Handler) WorkerRunMessages(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// forgeParkRefusalReason maps a forge-park precedence refusal (PRD #1392 M1) to the token the
+// WorkerRunState 409 {run, reason} body carries, which the worker dispatches on:
+//   - "stale_claim": a newer claim superseded this worker's, nothing was mutated — the worker
+//     stops silently.
+//   - "custody_unsettled": the generation's custody hold could not be settled — the worker falls
+//     to today's failed path.
+//
+// It returns ("", false) for EVERY other error so WorkerRunState keeps routing
+// ErrRunNotOwned / ErrInvalidState and the generic 500 through its own switch. Kept as a pure
+// function for two reasons: the exact error→reason mapping is unit-tested (a
+// stale_claim↔custody_unsettled swap reddens) WITHOUT the live-DB forge-park transaction that
+// raises these errors; and, being the single source of the reason token, it makes the two 409
+// bodies structurally incapable of the copy-paste mixup two hand-written case arms invited.
+func forgeParkRefusalReason(err error) (string, bool) {
+	switch {
+	case errors.Is(err, workersvc.ErrForgeParkStaleClaim):
+		return "stale_claim", true
+	case errors.Is(err, workersvc.ErrForgeParkCustodyUnsettled):
+		return "custody_unsettled", true
+	default:
+		return "", false
+	}
+}
+
 // WorkerRunState applies a state transition and echoes the run's resulting
 // status, so the worker learns if the run was cancelled out from under it.
 func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
@@ -633,23 +657,22 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 	}
 	run, applied, err := h.wsvc.SetState(r.Context(), wkr, runID, req)
 	if err != nil {
-		switch {
-		case errors.Is(err, workersvc.ErrRunNotOwned):
-			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
 		// PRD #1392 M1: the two forge-park precedence refusals are 409 with a {run, reason}
 		// body — the worker dispatches on `reason` (stale_claim stops silently; custody_unsettled
 		// falls to today's failed path). recovery_retry_not_before rides on the run (RunDTO), not
 		// the top-level body. Both carry the run row (SetState returns it alongside the error).
-		case errors.Is(err, workersvc.ErrForgeParkStaleClaim):
+		// The reason token comes from the single pure forgeParkRefusalReason mapping, so the two
+		// bodies cannot drift or swap; a non-forge-park error returns ok=false and falls through.
+		if reason, ok := forgeParkRefusalReason(err); ok {
 			httpx.JSON(w, http.StatusConflict, map[string]any{
 				"run":    runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock()),
-				"reason": "stale_claim",
+				"reason": reason,
 			})
-		case errors.Is(err, workersvc.ErrForgeParkCustodyUnsettled):
-			httpx.JSON(w, http.StatusConflict, map[string]any{
-				"run":    runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock()),
-				"reason": "custody_unsettled",
-			})
+			return
+		}
+		switch {
+		case errors.Is(err, workersvc.ErrRunNotOwned):
+			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
 		case errors.Is(err, workersvc.ErrInvalidState):
 			httpx.Error(w, http.StatusBadRequest, "state must be one of running, awaiting_approval, awaiting_input, awaiting_followup, limit_wait, recovery_wait, paused, pause_failed, completed, failed")
 		default:
