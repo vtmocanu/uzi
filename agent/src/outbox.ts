@@ -692,14 +692,35 @@ export class Outbox {
       if (rs.manifest.records.length === 0 && now - rs.manifest.updatedAt > this.retentionMs) toRemove.push(runId);
     }
     for (const runId of toRemove) {
-      await this.withRunLock(runId, () => this.removeRun(runId));
-      this.log.info("outbox: retention removed fully-retired run", { run_id: runId });
+      const removed = await this.withRunLock(runId, () => this.removeRunIfStillReclaimable(runId, now));
+      if (removed) this.log.info("outbox: retention removed fully-retired run", { run_id: runId });
     }
   }
 
   /** Remove a run's whole subtree (the api reported the run terminal/404). */
   async retireRun(runId: string): Promise<void> {
     await this.withRunLock(runId, () => this.removeRun(runId));
+  }
+
+  /** Delete a run ONLY if it is STILL reclaimable, re-checked under the run's lock
+   *  against the CURRENT in-memory state — the retention-sweep TOCTOU guard.
+   *  {@link sweepRetention} decides a run is removable (records empty, past
+   *  retentionMs) OUTSIDE the lock; by the time this runs under the lock a legitimate
+   *  {@link appendSegment} may have won the lock chain between that decision and here
+   *  and committed a fresh, undrained record. {@link removeRun} deletes the subtree
+   *  UNCONDITIONALLY, so calling it here would silently delete that just-committed
+   *  record. Re-reading `rs` and re-testing emptiness + age against the SAME `now`
+   *  skips a run that is no longer tracked, no longer empty, or no longer past
+   *  retentionMs. Returns whether the run was actually removed. {@link retireRun}
+   *  (api-said-terminal / api-said-404) keeps calling the unconditional
+   *  {@link removeRun}: it must delete regardless of records. */
+  private async removeRunIfStillReclaimable(runId: string, now: number): Promise<boolean> {
+    const rs = this.runs.get(runId);
+    if (!rs) return false; // no longer tracked (already removed / retired)
+    if (rs.manifest.records.length !== 0) return false; // a record was appended after the decision
+    if (now - rs.manifest.updatedAt <= this.retentionMs) return false; // no longer past retention
+    await this.removeRun(runId);
+    return true;
   }
 
   private async removeRun(runId: string): Promise<void> {

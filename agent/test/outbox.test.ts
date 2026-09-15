@@ -770,4 +770,111 @@ describe("Outbox M1 (PRD #1391 Run A)", () => {
     assert.equal(cb.flat()[0]?.kind, "text", "B's record survived as the real message (no lost generation)");
     assert.equal((cb.flat()[0]?.payload as { text: string } | undefined)?.text, big);
   });
+
+  it("H4. retention re-checks under the lock: a record appended during the sweep is NOT deleted", async () => {
+    // The retention-sweep TOCTOU the M1 fix closes. sweepRetention decides a run is
+    // removable (records empty, past retentionMs) OUTSIDE the per-run lock, collecting
+    // a toRemove list, then deletes each UNDER the lock. Because the per-run mutex now
+    // orders things deterministically, a legitimate appendSegment for that run that
+    // wins the lock chain between the decision and the removal commits FIRST; the fix
+    // re-checks emptiness + age under the lock and skips the run, so removeRun never
+    // deletes the freshly-committed record.
+    //
+    // DISCRIMINATOR: while a paused appendSegment holds r1's lock (its manifest write
+    // suspended, so r1's in-memory records are still empty), sweepRetention collects r1
+    // and queues the removal BEHIND that lock. Releasing the paused write commits the
+    // new record and frees the lock; the queued removal then runs. Under the UNFIXED
+    // code removeRun deletes r1's whole subtree unconditionally, so the record is lost
+    // (depthFor undefined, a fresh Outbox replays nothing) and this test fails. Under
+    // the fix the re-check sees r1 tracked with one record and skips it, so it survives.
+    const root = await mkRoot();
+    const clock = 1_000_000;
+
+    // Seam: once armed, pause r1's NEXT manifest write (the paused append that holds
+    // r1's lock across the sweep). The seg-1 append and the drain-to-empty run BEFORE
+    // the gate is armed, so their manifest writes proceed untouched.
+    let armGate = false;
+    let paused = false;
+    let reachedAppendWrite!: () => void;
+    const appendAtWrite = new Promise<void>((r) => {
+      reachedAppendWrite = r;
+    });
+    let releaseAppend!: () => void;
+    const appendGate = new Promise<void>((r) => {
+      releaseAppend = r;
+    });
+    const rawWrite: RawWriteSeam = async (write, ctx) => {
+      if (armGate && !paused && ctx.kind === "manifest") {
+        paused = true;
+        reachedAppendWrite();
+        await appendGate; // hold r1's per-run lock until the test releases it
+      }
+      await write();
+    };
+
+    const o = makeOutbox(root, { retentionMs: 1000, now: () => clock, rawWrite });
+    await o.init();
+
+    // r1 gets one record, then is drained empty and (via the sweep's `now`) aged past
+    // retentionMs relative to its last write.
+    await o.appendSegment("r1", 1, [textMsg(1, "first")]);
+    const c0 = collector();
+    const drained = await o.drainRun("r1", c0.send);
+    assert.equal(drained.retired, true);
+    assert.equal(o.depthFor("r1")?.pendingMessages, 0, "r1 is empty before the sweep");
+
+    const sweepNow = clock + 5000; // well past retentionMs relative to r1's last write
+
+    // Start (do not await) a legitimate appendSegment for a NEW record. It pauses at
+    // its manifest write, holding r1's lock, so its record is not yet committed.
+    armGate = true;
+    const appendP = o.appendSegment("r1", 1, [textMsg(2, "second")]);
+    await appendAtWrite;
+
+    // sweepRetention collects r1 as empty (the paused append has not committed) — the
+    // collection loop is synchronous, so it reads the still-empty in-memory manifest
+    // before the append commits — then queues the removal behind r1's held lock.
+    const sweepP = o.sweepRetention(sweepNow);
+
+    // Release the paused append: it commits the new record and frees r1's lock; the
+    // queued removal then runs and must re-check + SKIP, not delete.
+    releaseAppend();
+    await appendP;
+    await sweepP;
+
+    // The appended record SURVIVES: r1 is still tracked with one pending record.
+    assert.equal(o.depthFor("r1")?.pendingMessages, 1, "the record appended during the sweep survives");
+
+    // And a fresh Outbox over the same root replays it (r1's directory was NOT deleted).
+    const b = makeOutbox(root, { retentionMs: 1000, now: () => clock });
+    await b.init();
+    const c = collector();
+    const res = await b.drainRun("r1", c.send);
+    assert.equal(res.retired, true);
+    assert.deepEqual(
+      c.flat().map((m) => m.seq),
+      [2],
+      "the just-appended record replays; r1 was not silently deleted",
+    );
+    assert.equal((c.flat()[0]?.payload as { text: string } | undefined)?.text, "second");
+    assert.equal(c.flat()[0]?.kind, "text", "the survivor is the real message, not a tombstone");
+  });
+
+  it("H4b. ordinary reclaim still deletes an empty, aged run with no concurrent append", async () => {
+    // The fix does not weaken the ordinary reclaim path: with no concurrent append the
+    // under-lock re-check still finds the run empty and aged, so it IS removed.
+    const root = await mkRoot();
+    const clock = 1_000_000;
+    const o = makeOutbox(root, { retentionMs: 1000, now: () => clock });
+    await o.init();
+    await o.appendSegment("r1", 1, [textMsg(1, "x")]);
+    const c = collector();
+    const res = await o.drainRun("r1", c.send);
+    assert.equal(res.retired, true);
+    assert.equal(o.depthFor("r1")?.pendingMessages, 0);
+
+    await o.sweepRetention(clock + 5000);
+    assert.equal(o.depthFor("r1"), undefined, "an empty, aged run with no concurrent append is reclaimed");
+    assert.ok(!existsSync(path.join(root, "r1")), "its directory was deleted");
+  });
 });
