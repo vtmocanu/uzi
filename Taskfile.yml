@@ -852,11 +852,11 @@ tasks:
       # marker exemption is exact (a matching marker -> 0, a mismatched one -> 1, an embedded
       # one -> 1) and that string-literal content is never read as SQL -- a marker inside a
       # $$ ... $$ body cannot exempt a real drop (-> 1), a DROP-shaped fragment inside a body is
-      # not a statement (-> 0), a $$/$tag$ token inside a single-quoted string and a
-      # backslash-escaped quote inside an E-string open no literal so a real drop after them is
-      # still caught (-> 1), and a $tag$ after identifier chars (foo$tag$) is identifier text,
-      # not a dollar-quote opener, so a real drop after it is still caught (-> 1) (issue #1128).
-      # Any deviation
+      # not a statement (-> 0), a $$/$tag$ token inside a single-quoted string, a
+      # backslash-escaped quote inside an E-string, and an identifier ending in $E before a
+      # string (foo$E'a\') open no literal so a real drop after them is still caught (-> 1), and
+      # a $tag$ after identifier chars (foo$tag$) is identifier text, not a dollar-quote opener,
+      # so a real drop after it is still caught (-> 1) (issue #1128). Any deviation
       # exits 2 (instrument broken). The canary arg is explicit so this echo shows exactly what
       # is scanned; the sibling fixtures are found beside it. See the script header.
       - ./scripts/check-migration-additive.sh scripts/migration-additive-canary.sql api/internal/store/migrations

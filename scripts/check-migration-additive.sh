@@ -71,8 +71,9 @@
 # (a standalone marker line INSIDE a $$ ... $$ body, next to a real worker-table drop that
 # FOLLOWS the body) MUST yield 1; migration-additive-dollarquote-drop-canary.sql (a DROP
 # COLUMN-shaped fragment INSIDE a $$ ... $$ body) MUST yield 0;
-# migration-additive-sqstring-canary.sql (a $$/$tag$ token INSIDE a single-quoted string AND a
-# backslash-escaped quote inside an E-string, then a real worker-table drop) MUST yield 1; and
+# migration-additive-sqstring-canary.sql (a $$/$tag$ token INSIDE a single-quoted string, a
+# backslash-escaped quote inside an E-string, AND an identifier ending in $E before a string
+# -- foo$E'a\' -- then a real worker-table drop) MUST yield 1; and
 # migration-additive-dollarquote-ident-canary.sql (a $tag$ token after identifier chars,
 # foo$tag$, then a real worker-table drop) MUST yield 1. Together they prove the exemption is
 # exact in every direction and that string content is never read as SQL: a broken marker match
@@ -332,10 +333,11 @@ scan() {
 #                       $$ body, drop AFTER it)                     cannot exempt a real drop)
 #   dollarquote drop   (DROP-shaped text INSIDE a   -> MUST be 0  (string content is not a
 #                       $$ body)                                    statement)
-#   sqstring           ($$/$tag$ INSIDE a '...' and -> MUST be 1  (a token in a single-quoted
-#                       an escaped quote in E'..\'', string opens no literal, and an escaped
-#                       real drop AFTER them)                       quote in an E-string does not
-#                                                                   reopen it over the real drop)
+#   sqstring           ($$/$tag$ INSIDE a '...', an -> MUST be 1  (a token in a single-quoted
+#                       escaped quote in E'..\'', and             string opens no literal, an escaped
+#                       foo$E'a\' before a real drop)             quote in an E-string does not reopen
+#                                                                 it, and $E is identifier text not an
+#                                                                 E-string prefix -- none hide the drop)
 #   dollarquote ident  (foo$tag$ then a real drop)  -> MUST be 1  ($tag$ after identifier chars
 #                                                                   is identifier text, not an opener)
 # The marker/mismatch/embedded trio is the both-directions mutation guard on the exemption
@@ -344,8 +346,9 @@ scan() {
 # anchor and the embedded canary falls to 0. The four string-literal canaries guard #1128:
 # lose dollar-quote state and the dollarquote-marker canary falls to 0 (an in-body marker
 # wrongly exempts) or the dollarquote-drop canary rises to 1 (in-body text wrongly flagged);
-# lose single-quote or E-string-escape state and the sqstring canary falls to 0 (a $$ in a
-# string, or a following drop after an early-closed E-string, is hidden); lose the
+# lose single-quote or E-string-escape state, or let the E-string boundary class drift from
+# the dollar-quote opener's, and the sqstring canary falls to 0 (a $$ in a string, a drop after
+# an early-closed E-string, or a drop after a foo$E-misread-as-E-string, is hidden); lose the
 # identifier-boundary check and the dollarquote-ident canary falls to 0 (foo$tag$ opens a
 # spurious literal that hides the real drop). Either way this self-check exits 2.
 CANARY_DIR="$(dirname "$CANARY")"
@@ -400,9 +403,11 @@ if [ "$canary_count" -ne 1 ] || [ "$marker_count" -ne 0 ] || [ "$mismatch_count"
   echo "check-migration-additive:            a DROP COLUMN-shaped fragment INSIDE a \$\$ ... \$\$ body; want 0 (string" >&2
   echo "check-migration-additive:            content is not a statement, issue #1128)." >&2
   echo "check-migration-additive:   sqstring ($SQSTRING_CANARY): a \$\$/\$tag\$ token INSIDE a" >&2
-  echo "check-migration-additive:            single-quoted string, plus a backslash-escaped quote inside an E-string, then a" >&2
-  echo "check-migration-additive:            real worker-table DROP after them; want 1 (a token in a '...' string must not" >&2
-  echo "check-migration-additive:            open a literal, and an escaped quote in an E-string must not reopen it, #1128)." >&2
+  echo "check-migration-additive:            single-quoted string, a backslash-escaped quote inside an E-string, and an" >&2
+  echo "check-migration-additive:            identifier ending in \$E before a string (foo\$E'a\\'), then a real worker-table" >&2
+  echo "check-migration-additive:            DROP after them; want 1 (a token in a '...' string must not open a literal, an" >&2
+  echo "check-migration-additive:            escaped quote in an E-string must not reopen it, and \$E is identifier text not" >&2
+  echo "check-migration-additive:            an E-string prefix, so none may swallow the real drop, #1128)." >&2
   echo "check-migration-additive:   dollar-ident ($DOLLAR_IDENT_CANARY):" >&2
   echo "check-migration-additive:            a \$tag\$ token after identifier chars (foo\$tag\$), then a real worker-table DROP;" >&2
   echo "check-migration-additive:            want 1 (a \$tag\$ at no identifier boundary is identifier text, not a dollar-quote" >&2
