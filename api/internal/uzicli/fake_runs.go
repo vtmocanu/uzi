@@ -264,13 +264,14 @@ func (f *FakeClient) AcceptCompletionDecision(_ context.Context, id string, crit
 	return f.DecideRun, nil
 }
 
-func (f *FakeClient) CreateRun(_ context.Context, repoID string, issueIID int64, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *CreateRunSeed) (apitypes.RunDTO, error) {
+func (f *FakeClient) CreateRun(_ context.Context, repoID string, issueIID int64, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *CreateRunSeed, credOverride *CreateRunCredentialOverride) (apitypes.RunDTO, error) {
 	f.LastCreateRepoID = repoID
 	f.LastCreateIssueIID = issueIID
 	f.LastCreateWaitOnLimit = waitOnLimit
 	f.LastCreateMrRework = mrReworkEnabled
 	f.LastCreateForce = force
 	f.LastCreateSeed = seed
+	f.LastCreateCredOverride = credOverride
 	if f.Err != nil {
 		return apitypes.RunDTO{}, f.Err
 	}
