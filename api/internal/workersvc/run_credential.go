@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/autoselect"
 	"github.com/vtmocanu/uzi/api/internal/autoselectrow"
+	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -24,22 +26,39 @@ import (
 
 // The typed refusals SetRunCredential returns for a run whose CURRENT state cannot take a
 // parked-state switch. The handler maps each to 409 with a state-specific message; they
-// are distinct sentinels so the handler (and M5) can tell them apart:
+// are distinct sentinels so the handler can tell them apart:
 //
-//   - ErrCredentialSwitchHeldStateUnsupported → a worker holds the session
-//     (awaiting_approval/awaiting_input/awaiting_followup/running). M4 refuses and does
-//     NOT write the override; M5 replaces this branch with the held-state switch protocol.
+//   - ErrCredentialSwitchNoLiveWorker → a HELD run (awaiting_*/running) whose holding worker is
+//     gone (WorkerID NULL or the worker row deleted). A switch needs a live worker to release,
+//     so this is refused rather than stamped (D4-step-9).
 //   - ErrCredentialSwitchClaimAssembling → the run is `claimed`; the claim payload is being
 //     assembled, so retry in a moment.
 //   - ErrCredentialSwitchRunTerminal → the run is completed/failed/cancelled.
 //   - ErrCredentialSwitchRaced → the run moved out of the parked state between the read and
 //     the early-promote write (a concurrent claim/cancel), so the promote found 0 rows.
+//
+// A HELD run whose worker LACKS the credential_switch capability is refused with
+// CredentialSwitchWorkerUnsupportedError (a struct error, so the 409 can name the worker).
 var (
-	ErrCredentialSwitchHeldStateUnsupported = errors.New("credential switch not supported in a held state")
-	ErrCredentialSwitchClaimAssembling      = errors.New("credential switch: claim being assembled")
-	ErrCredentialSwitchRunTerminal          = errors.New("credential switch: run has finished")
-	ErrCredentialSwitchRaced                = errors.New("credential switch: run state changed, retry")
+	ErrCredentialSwitchNoLiveWorker    = errors.New("credential switch: run has no live worker")
+	ErrCredentialSwitchClaimAssembling = errors.New("credential switch: claim being assembled")
+	ErrCredentialSwitchRunTerminal     = errors.New("credential switch: run has finished")
+	ErrCredentialSwitchRaced           = errors.New("credential switch: run state changed, retry")
 )
+
+// CredentialSwitchWorkerUnsupportedError refuses a held-state switch whose holding worker does
+// NOT advertise the credential_switch capability (PRD #1247 M5, D4-step-9): an old worker cannot
+// honour the switch signal, so the verb 409s and writes NOTHING rather than stamping a switch the
+// worker would ignore. It is a struct error (not a sentinel) so the handler can name the specific
+// worker the operator must upgrade.
+type CredentialSwitchWorkerUnsupportedError struct {
+	WorkerID   uuid.UUID
+	WorkerName string
+}
+
+func (e *CredentialSwitchWorkerUnsupportedError) Error() string {
+	return fmt.Sprintf("credential switch: worker %q (%s) does not support credential_switch; it must be upgraded to a version that advertises the capability", e.WorkerName, e.WorkerID)
+}
 
 // SetRunCredentialResult is what SetRunCredential returns on success: the re-read run (so
 // the caller renders the resumed status + the written override) and a best-effort D6
@@ -60,8 +79,10 @@ type SetRunCredentialResult struct {
 //     run; nothing more for queued). A 0-row promote (a raced claim/cancel) is
 //     ErrCredentialSwitchRaced → 409.
 //   - awaiting_approval / awaiting_input / awaiting_followup / running: a worker holds the
-//     session → ErrCredentialSwitchHeldStateUnsupported, and NO override is written (M5's
-//     switch protocol owns that write).
+//     session, so this is the HELD-STATE switch (PRD #1247 M5, D4/D14). If the holding worker
+//     advertises the credential_switch capability, the override columns AND the switch stamp are
+//     written (visible as "requested", 200); an old worker without the capability, or a run whose
+//     worker is gone, is refused 409 and NOTHING is written. See stampHeldStateSwitch.
 //   - claimed: ErrCredentialSwitchClaimAssembling → 409.
 //   - completed / failed / cancelled: ErrCredentialSwitchRunTerminal → 409.
 //
@@ -111,9 +132,12 @@ func (s *Service) SetRunCredential(ctx context.Context, userID, runID uuid.UUID,
 			return SetRunCredentialResult{}, terr
 		}
 	case "awaiting_approval", "awaiting_input", "awaiting_followup", "running":
-		// M5 replaces this branch with the held-state switch protocol; M4 refuses and
-		// writes nothing.
-		return SetRunCredentialResult{}, ErrCredentialSwitchHeldStateUnsupported
+		// PRD #1247 M5 (D4/D14): the held-state switch. Stamp the switch (override + request)
+		// iff the holding worker advertises the capability; otherwise refuse 409 with nothing
+		// written. Falls through to the D6 warning + re-read tail (the warnings still apply).
+		if serr := s.stampHeldStateSwitch(ctx, run, userID, runID, resolved); serr != nil {
+			return SetRunCredentialResult{}, serr
+		}
 	case "claimed":
 		return SetRunCredentialResult{}, ErrCredentialSwitchClaimAssembling
 	default:
@@ -132,6 +156,55 @@ func (s *Service) SetRunCredential(ctx context.Context, userID, runID uuid.UUID,
 		return SetRunCredentialResult{}, fmt.Errorf("set run credential: re-read run: %w", err)
 	}
 	return SetRunCredentialResult{Run: updated, Warning: warning}, nil
+}
+
+// stampHeldStateSwitch is the held-state (awaiting_*/running) arm of `uzi run set-token` (PRD
+// #1247 M5, D4/D14). A worker holds the session, so the switch cannot take effect until the
+// worker RELEASES its claim (the two-phase local release, M5b) — this only REQUESTS it. But a
+// switch is only requestable if the holding worker advertises the credential_switch capability:
+//
+//   - The run must have a live holding worker (WorkerID set, worker row present) → else
+//     ErrCredentialSwitchNoLiveWorker (409). A held run should always have one; a missing worker
+//     means it was reaped mid-flight.
+//   - That worker must advertise credential_switch_v1 in workers.protocol_capabilities → else a
+//     CredentialSwitchWorkerUnsupportedError naming it (409, D4-step-9). An old worker cannot
+//     read or act on the switch signal, so stamping one would strand the request forever.
+//
+// Only when both hold does it write — the override columns FIRST (SetRunCredentialOverride,
+// idempotent), then the switch stamp (credential_switch_requested_at + _generation targeting the
+// run's CURRENT claim generation, which ReleaseCredentialSwitch's fence matches). It does NOT
+// change status; the run stays held until the worker releases. A refusal writes NOTHING (neither
+// the override nor the stamp), because the capability check runs BEFORE either write.
+func (s *Service) stampHeldStateSwitch(ctx context.Context, run store.Run, userID, runID uuid.UUID, resolved *CredentialOverride) error {
+	if !run.WorkerID.Valid {
+		return ErrCredentialSwitchNoLiveWorker
+	}
+	wkr, err := s.q.GetWorkerByID(ctx, uuid.UUID(run.WorkerID.Bytes))
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrCredentialSwitchNoLiveWorker
+		}
+		return fmt.Errorf("set run credential: load holding worker: %w", err)
+	}
+	if !slices.Contains(wkr.ProtocolCapabilities, capability.CredentialSwitchV1) {
+		return &CredentialSwitchWorkerUnsupportedError{WorkerID: wkr.ID, WorkerName: wkr.Name}
+	}
+	if _, err := s.q.SetRunCredentialOverride(ctx, store.SetRunCredentialOverrideParams{
+		Mode:     pgOverrideMode(resolved),
+		SecretID: pgOverrideSecretID(resolved),
+		ID:       runID,
+		UserID:   userID,
+	}); err != nil {
+		return fmt.Errorf("set run credential override (held): %w", err)
+	}
+	if _, err := s.q.StampCredentialSwitch(ctx, store.StampCredentialSwitchParams{
+		Generation: pgtype.Int8{Int64: run.ClaimGeneration, Valid: true},
+		ID:         runID,
+		UserID:     userID,
+	}); err != nil {
+		return fmt.Errorf("stamp credential switch: %w", err)
+	}
+	return nil
 }
 
 // applyCredentialTransition performs the state-specific transition after the override
