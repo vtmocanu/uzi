@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # release-watch.sh — watch a tag's publish workflows to green, JOB level,
 # AUTO-RERUNNING a transient publish failure a bounded number of
-# times. A stable tag runs release.yml + brew.yml; an RC tag (vX.Y.Z-rc.N) runs
-# release.yml only, since brew.yml does not trigger for a prerelease (PRD 1265 M3/M4).
+# times. Every v* tag runs release.yml + brew.yml -- a stable tag publishes the uzi-cli
+# formula, an RC tag (vX.Y.Z-rc.N) the opt-in uzi-cli-rc formula (PRD #1378).
 # times. This is the release analog of watch-run-ci.sh: publish jobs push an image
 # tag and sign it (idempotent, network-flavored), so a lone flaked job — a cosign
 # installer download, a registry hiccup — should be re-run, not surfaced to a human.
@@ -28,7 +28,7 @@
 #
 # Exit codes:
 #   0  every watched workflow all-green (after any auto-reruns): release.yml + brew.yml
-#      for a stable tag, release.yml only for an RC
+#      for every v* tag (stable and RC alike)
 #   1  a non-transient failure, or reruns exhausted (failing jobs printed)
 #   2  timed out (still pending after --max-ticks)
 #   3  usage / gh error
@@ -54,16 +54,15 @@ if [ -z "$VERSION" ]; then
 fi
 VERSION="${VERSION#v}"; TAG="v$VERSION"
 
-# Which publish workflows to wait for depends on the release channel (PRD 1265 M3).
-# brew.yml has NO run on an RC tag (its trigger negates v*-* after M4), so waiting for it
-# on an RC would loop until --max-ticks and exit 2 on every candidate. A stable tag runs
-# both. The channel comes from the shared release-mode helper, so watch and verify never
-# disagree about whether a tag is an RC.
+# Both channels publish a formula now (PRD #1378): brew.yml triggers on every v* tag
+# (stable -> uzi-cli, RC -> uzi-cli-rc), so every tag waits for release.yml AND brew.yml.
+# MODE is still read from the shared release-mode helper, but only to label the release in
+# the line below; the workflow set no longer depends on it.
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || { echo "release-watch: not in a git checkout" >&2; exit 3; }
 # shellcheck source=scripts/lib/release-mode.sh
 . "$ROOT/scripts/lib/release-mode.sh"
 MODE="$(release_mode "$VERSION")"
-if [ "$MODE" = rc ]; then WORKFLOWS="release.yml"; else WORKFLOWS="release.yml brew.yml"; fi
+WORKFLOWS="release.yml brew.yml"
 echo "release-watch: $TAG is a $MODE release; watching: $WORKFLOWS"
 
 # Resolve the run id for one workflow on the tag ref (empty until it appears).

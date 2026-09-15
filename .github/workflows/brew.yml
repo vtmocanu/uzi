@@ -1,22 +1,21 @@
-# Regenerate Formula/uzi-cli.rb for a v* tag and push it to vtmocanu/homebrew-tap.
+# Regenerate a uzi CLI Homebrew formula for a v* tag and push it to vtmocanu/homebrew-tap.
 #
-# Mirrors the sibling formulae (cc-statusline, fj-queue): `task brew:formula` computes
-# the tag tarball's sha256 and renders Formula/uzi-cli.rb (its url/sha256 placeholders),
-# then `task brew:publish` pushes the rendered copy into the tap. The mechanics live in
-# the reusable homebrew-tap.yml from github.com/vtmocanu/task, included by uzi's
-# Taskfile.yml under `brew:` (the one sanctioned remote include, SHA-pinned; see that
-# file's rule 3).
+# Two channels, routed by the tag (PRD #1378): a STABLE tag (vX.Y.Z) renders the `uzi-cli`
+# formula via `task brew:formula`; an RC tag (vX.Y.Z-rc.N) renders the separate, opt-in
+# `uzi-cli-rc` formula via `task brew-rc:formula`. Both compute the tag tarball's sha256,
+# substitute the url/sha256 placeholders in the matching Formula/*.rb template, and push
+# the rendered copy into the tap with `task <channel>:publish`. The mechanics live in the
+# vendored homebrew-tap.yml, included by uzi's Taskfile.yml under `brew:` and `brew-rc:`
+# (the two sanctioned includes, local vendored copies; see that file's rule 3).
 #
 # TRIGGERS: a `v*` tag push (auto-publish the formula on release, matching release.yml)
 # AND workflow_dispatch (re-publish for any existing tag by hand). Both feed the same job
 # through INPUT_TAG below. brew:formula fetches the ANONYMOUS auto-archive
-# (https://github.com/vtmocanu/uzi/archive/refs/tags/<tag>.tar.gz), which 404s while the
-# repo is private -- so the tag trigger was intentionally withheld until the public flip
-# (the reusable task guards the empty-input digest and refuses to render on a 404). The
-# repo is public now and the tag trigger is live: a release tags vX.Y.Z, release.yml
-# publishes the images + chart, and this publishes the matching formula. brew stays a
-# SEPARATE workflow from release.yml because it needs that public archive, and a failed
-# tap push must not redden the image+chart release.
+# (https://github.com/vtmocanu/uzi/archive/refs/tags/<tag>.tar.gz); the reusable task
+# guards the empty-input digest and refuses to render on a 404. A release tags vX.Y.Z (or
+# vX.Y.Z-rc.N), release.yml publishes the images + chart, and this publishes the matching
+# formula. brew stays a SEPARATE workflow from release.yml because it needs that public
+# archive, and a failed tap push must not redden the image+chart release.
 #
 # The default GITHUB_TOKEN cannot write to a second repo, so the cross-repo push uses
 # HOMEBREW_TAP_TOKEN (a fine-grained PAT scoped to vtmocanu/homebrew-tap, contents:write),
@@ -33,24 +32,30 @@ name: Brew
 # Quoted so yamllint's `truthy` rule does not read the key as the boolean `on`.
 "on":
   push:
-    # Stable tags only. The negative pattern excludes any prerelease (vX.Y.Z-rc.N) so an
-    # RC tag creates NO brew run at all (PRD 1265 M4): Homebrew must never point at a
-    # candidate, and release-watch.sh would otherwise wait forever for a run that never
-    # starts. A negative pattern after a positive one excludes the ref, and at least one
-    # positive pattern (v*) remains, per GitHub's workflow-syntax. The Validate step's
-    # strict regex stays as the second line of defense for workflow_dispatch.
-    tags: ["v*", "!v*-*"]
+    # Every v* tag, both channels (PRD #1378). A STABLE tag (vX.Y.Z) publishes the
+    # `uzi-cli` formula; an RC tag (vX.Y.Z-rc.N) publishes the separate, opt-in
+    # `uzi-cli-rc` formula, so stable users on `uzi-cli` never see a candidate while a
+    # dogfooder can `brew install vtmocanu/tap/uzi-cli-rc`. (Before #1378 the negative
+    # `!v*-*` pattern excluded RC tags entirely; now the Detect channel step routes them.)
+    # The Validate step's regex is the SemVer gate for both channels, esp. workflow_dispatch.
+    tags: ["v*"]
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to publish the uzi-cli formula for (e.g. v0.42.1)"
+        description: "Tag to publish the uzi-cli / uzi-cli-rc formula for (e.g. v0.42.1 or v0.42.1-rc.1)"
         required: true
 
 permissions:
   contents: read
 
 concurrency:
-  group: brew-${{ github.ref }}
+  # Ref-INDEPENDENT (not per-tag): a promote ceremony pushes the stable tag and the next
+  # RC tag within minutes, firing two runs that BOTH `git push origin main` into the tap
+  # from a fresh clone with no rebase/retry. A per-ref group would let them run
+  # concurrently and collide on a non-fast-forward push, reddening one (PRD #1378 R5). One
+  # shared group serializes every tap publish; cancel-in-progress:false so the queued run
+  # still runs (the two channels render different formula files, so ordering is enough).
+  group: brew-tap-publish
   cancel-in-progress: false
 
 jobs:
@@ -66,38 +71,56 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
 
-      # Only strict SemVer tags may proceed. $INPUT_TAG flows into a URL + Task template
-      # substitution where quoting cannot be relied on; the guard is injection-safe
-      # because $INPUT_TAG is shell-expanded from env, never a GH expression.
+      # Only strict SemVer tags may proceed -- a stable vMAJOR.MINOR.PATCH or an RC
+      # vMAJOR.MINOR.PATCH-rc.N (integer N, no leading zero). $INPUT_TAG flows into a URL +
+      # Task template substitution where quoting cannot be relied on; the guard is
+      # injection-safe because $INPUT_TAG is shell-expanded from env, never a GH expression.
       - name: Validate tag format
         id: tag
         run: |
           set -euo pipefail
-          if ! printf '%s' "$INPUT_TAG" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'; then
-            echo "refusing to publish: tag '$INPUT_TAG' is not vMAJOR.MINOR.PATCH" >&2
+          if ! printf '%s' "$INPUT_TAG" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-rc\.[1-9][0-9]*)?$'; then
+            echo "refusing to publish: tag '$INPUT_TAG' is not vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-rc.N" >&2
             exit 1
           fi
           echo "tag=$INPUT_TAG" >> "$GITHUB_OUTPUT"
+
+      # Route the tag to a channel: a prerelease suffix (vX.Y.Z-rc.N) publishes the opt-in
+      # `uzi-cli-rc` formula via the `brew-rc:` task include; a stable tag publishes
+      # `uzi-cli` via `brew:`. The output is a fixed literal from this case (`brew` or
+      # `brew-rc`), never the raw tag, so it is safe to splice into the task target below.
+      - name: Detect channel
+        id: channel
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          case "$TAG" in
+            *-*) ns=brew-rc ;;
+            *)   ns=brew ;;
+          esac
+          echo "ns=$ns" >> "$GITHUB_OUTPUT"
 
       - uses: arduino/setup-task@c0bc642852239c2689f73f4ea6459c29405f3c52  # v3.0.0
         with:
           version: 3.x
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      # Renders dist/uzi-cli.rb (auto-archive url + computed sha256). Fails loudly on the
-      # empty-input digest, i.e. while the repo is still private. VERSION flows via
-      # env: (never string-interpolated into the run body), matching this repo's
-      # zizmor template-injection convention -- release.yml uses env: the same way.
-      # The value is already regex-gated to strict SemVer by the Validate step, so
-      # this is consistency/future-proofing, not a live injection fix.
+      # Renders dist/<channel>.rb (auto-archive url + computed sha256) for the routed
+      # channel. Fails loudly on the empty-input digest (a bad tag / network failure).
+      # VERSION and CHANNEL_NS flow via env: (never string-interpolated into the run body),
+      # matching this repo's zizmor template-injection convention -- release.yml uses env:
+      # the same way. CHANNEL_NS is the fixed `brew`/`brew-rc` literal from Detect channel.
       - name: Render formula
         env:
           VERSION: ${{ steps.tag.outputs.tag }}
-        run: task --yes brew:formula VERSION="$VERSION"
+          CHANNEL_NS: ${{ steps.channel.outputs.ns }}
+        run: task --yes "${CHANNEL_NS}:formula" VERSION="$VERSION"
 
       # Clones the tap with HOMEBREW_TAP_TOKEN, copies the rendered formula, commits + pushes.
       - name: Publish to tap
         env:
           VERSION: ${{ steps.tag.outputs.tag }}
+          CHANNEL_NS: ${{ steps.channel.outputs.ns }}
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-        run: task --yes brew:publish VERSION="$VERSION" HOMEBREW_TAP_TOKEN="$HOMEBREW_TAP_TOKEN"
+        run: task --yes "${CHANNEL_NS}:publish" VERSION="$VERSION" HOMEBREW_TAP_TOKEN="$HOMEBREW_TAP_TOKEN"
