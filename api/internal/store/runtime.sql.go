@@ -545,6 +545,14 @@ UPDATE runs SET
     -- PRD #1296 M1 (D2): the general claim-lane counter, incremented once per successful
     -- claim. Returned in the claim payload; the hold above binds the identical value.
     claim_generation = claim_generation + 1,
+    -- PRD #1247 M5 (D3): CLOSE the released-claim fence window. A held-state credential
+    -- switch requeues the run with claim_released_at set (ReleaseCredentialSwitch), which
+    -- makes the generation fence reject every report from the OLD flight. Reclaiming the
+    -- run opens a fresh generation, so the fence must be cleared in the SAME atomic UPDATE
+    -- that bumps claim_generation — otherwise a reclaim would immediately reject the NEW
+    -- flight's own first report. A run that was never released has claim_released_at NULL
+    -- already, so this is a harmless no-op on the ordinary claim path.
+    claim_released_at = NULL,
     -- Exit contract (PRD #47 Decision 3): leaving 'queued' clears any health flag
     -- the detector raised (e.g. "no worker online"). health_notified_at is NOT reset.
     health = 'ok', health_reason = NULL, health_since = NULL
@@ -4167,23 +4175,37 @@ func (q *Queries) HeartbeatWorker(ctx context.Context, arg HeartbeatWorkerParams
 const insertRunMessage = `-- name: InsertRunMessage :execrows
 
 INSERT INTO run_messages (run_id, seq, kind, agent, agent_instance, agent_label, payload)
-VALUES ($1, $2, $3, $4, $5, $6, $7)
+SELECT $1, $2, $3, $4, $5, $6, $7
+WHERE $8::bigint IS NULL
+   OR EXISTS (SELECT 1 FROM runs r
+              WHERE r.id = $1
+                AND r.claim_generation = $8::bigint
+                AND r.claim_released_at IS NULL)
 ON CONFLICT (run_id, seq) DO NOTHING
 `
 
 type InsertRunMessageParams struct {
-	RunID         uuid.UUID   `json:"run_id"`
-	Seq           int32       `json:"seq"`
-	Kind          string      `json:"kind"`
-	Agent         pgtype.Text `json:"agent"`
-	AgentInstance pgtype.Text `json:"agent_instance"`
-	AgentLabel    pgtype.Text `json:"agent_label"`
-	Payload       []byte      `json:"payload"`
+	RunID           uuid.UUID   `json:"run_id"`
+	Seq             int32       `json:"seq"`
+	Kind            string      `json:"kind"`
+	Agent           pgtype.Text `json:"agent"`
+	AgentInstance   pgtype.Text `json:"agent_instance"`
+	AgentLabel      pgtype.Text `json:"agent_label"`
+	Payload         []byte      `json:"payload"`
+	ClaimGeneration pgtype.Int8 `json:"claim_generation"`
 }
 
 // Messages -----------------------------------------------------------------
 // Idempotent seq-numbered append: a re-delivered batch (worker retry) is a
 // no-op on the duplicate (run_id, seq).
+//
+// PRD #1247 M5 (D3): when the caller carries a claim generation (@claim_generation NOT NULL —
+// a capability worker stamps it on every message batch), the append is FENCED atomically. It
+// lands ONLY while the run is still at that generation with an UNRELEASED claim, so a message
+// batch from a released or reclaimed OLD flight persists nothing (the row-guard is checked in
+// the same statement as the insert, no TOCTOU). A legacy caller (NULL generation) inserts
+// unconditionally, byte-identical to before the fence. Preferring this per-query guard over a
+// FOR UPDATE tx per message keeps the hot append path a single round-trip.
 func (q *Queries) InsertRunMessage(ctx context.Context, arg InsertRunMessageParams) (int64, error) {
 	result, err := q.db.Exec(ctx, insertRunMessage,
 		arg.RunID,
@@ -4193,6 +4215,7 @@ func (q *Queries) InsertRunMessage(ctx context.Context, arg InsertRunMessagePara
 		arg.AgentInstance,
 		arg.AgentLabel,
 		arg.Payload,
+		arg.ClaimGeneration,
 	)
 	if err != nil {
 		return 0, err
@@ -7394,6 +7417,59 @@ func (q *Queries) RejectRunServerSide(ctx context.Context, arg RejectRunServerSi
 	return result.RowsAffected(), nil
 }
 
+const releaseCredentialSwitch = `-- name: ReleaseCredentialSwitch :execrows
+UPDATE runs SET
+    status                = 'queued',
+    status_since          = now(),
+    claim_released_at     = now(),
+    budget_paused_seconds = budget_paused_seconds
+        + GREATEST(0, EXTRACT(EPOCH FROM (now() - status_since))::int),
+    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at            = now()
+WHERE id = $1 AND worker_id = $2
+  AND claim_generation = $3
+  AND claim_released_at IS NULL
+  AND status IN ('running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+`
+
+type ReleaseCredentialSwitchParams struct {
+	ID         uuid.UUID   `json:"id"`
+	WorkerID   pgtype.UUID `json:"worker_id"`
+	Generation int64       `json:"generation"`
+}
+
+// PRD #1247 M5 (D3/D4/D14): the held-state credential-switch RELEASE transition. After the
+// worker's local two-phase release (quiesce -> verified capture -> teardown) it reports
+// {status:"credential_switch", claim_generation}; in ONE fenced statement this requeues the
+// held run so its next claim spends the already-written override.
+//
+// THE WHERE IS THE FENCE. It requires the run still be at the reported generation
+// (claim_generation = @generation), with an UNRELEASED claim (claim_released_at IS NULL), owned
+// by the reporting worker (worker_id), and in one of the HELD states. A stale redelivery (the
+// claim was released, or a reclaim bumped the generation) matches 0 rows; the caller
+// distinguishes an already-applied/already-reclaimed redelivery (idempotent success) from an
+// unexpected state by re-reading the run (releaseCredentialSwitch). Dropping the
+// claim_released_at IS NULL conjunct is the mutation TestReleaseCredentialSwitch*LiveDB pins.
+//
+// THE BUDGET RULE IS THE GATE-PARK/PAUSE ONE (Open Question 3, D14): started_at is KEPT and the
+// held gap is BANKED into budget_paused_seconds, exactly like ResumePausedRun — a mid-run switch
+// is the owner's choice, not an external park, so a fresh wall would let repeated switches extend
+// a run without bound. claim_released_at = now() ARMS the fence so every later report from the
+// old flight is rejected until ClaimRun reclaims and clears it. The switch stamp
+// (credential_switch_requested_at/_generation) is deliberately KEPT — it is visible as "released,
+// awaiting reclaim" (D14) and is cleared only by the next epoch write at reclaim (M9). codex
+// cap/epoch are revoked/bumped like every other park->queued transition; health is reset because
+// 'queued' is on the detector's allowlist. Status_since is NOT NULL (migration 00163), so the
+// banked interval is never NULL.
+func (q *Queries) ReleaseCredentialSwitch(ctx context.Context, arg ReleaseCredentialSwitchParams) (int64, error) {
+	result, err := q.db.Exec(ctx, releaseCredentialSwitch, arg.ID, arg.WorkerID, arg.Generation)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const requeueClaimedRunToQueued = `-- name: RequeueClaimedRunToQueued :execrows
 UPDATE runs SET status = 'queued', status_since = now(),
     -- Exit contract (PRD #47 Decision 3): mirrors SweepClaimedNeverStarted — a
@@ -9888,6 +9964,36 @@ func (q *Queries) StampCompletionBudgetExhausted(ctx context.Context, arg StampC
 	return result.RowsAffected(), nil
 }
 
+const stampCredentialSwitch = `-- name: StampCredentialSwitch :execrows
+UPDATE runs SET
+    credential_switch_requested_at = now(),
+    credential_switch_generation   = $1,
+    updated_at = now()
+WHERE id = $2 AND user_id = $3
+`
+
+type StampCredentialSwitchParams struct {
+	Generation pgtype.Int8 `json:"generation"`
+	ID         uuid.UUID   `json:"id"`
+	UserID     uuid.UUID   `json:"user_id"`
+}
+
+// PRD #1247 M5 (D4): stamp a pending held-state credential switch for the owner's
+// `uzi run set-token` verb on a run a worker currently holds (running/awaiting_*). The switch
+// is REQUESTED (visible as "requested", D14); the holding worker's next inputs poll (M5a-2)
+// reads the signal and drives the local release. @generation is the claim the switch targets
+// (runs.claim_generation at request time), which ReleaseCredentialSwitch's fence matches. This
+// does NOT change status — the run stays in its held state until the worker releases — and it
+// is owner-scoped (user_id), so a foreign run is a 0-row no-op. The verb writes the override
+// columns (SetRunCredentialOverride) FIRST, then this stamp.
+func (q *Queries) StampCredentialSwitch(ctx context.Context, arg StampCredentialSwitchParams) (int64, error) {
+	result, err := q.db.Exec(ctx, stampCredentialSwitch, arg.Generation, arg.ID, arg.UserID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const sweepClaimedNeverStarted = `-- name: SweepClaimedNeverStarted :many
 
 UPDATE runs SET status = 'queued', status_since = now(),
@@ -10066,11 +10172,15 @@ func (q *Queries) SweepRunningTimeout(ctx context.Context, arg SweepRunningTimeo
 const updateRunLastSeq = `-- name: UpdateRunLastSeq :execrows
 UPDATE runs SET last_seq = GREATEST(last_seq, $1), last_activity_at = now()
 WHERE id = $2
+  AND ($3::bigint IS NULL
+       OR (claim_generation = $3::bigint
+           AND claim_released_at IS NULL))
 `
 
 type UpdateRunLastSeqParams struct {
-	Seq int32     `json:"seq"`
-	ID  uuid.UUID `json:"id"`
+	Seq             int32       `json:"seq"`
+	ID              uuid.UUID   `json:"id"`
+	ClaimGeneration pgtype.Int8 `json:"claim_generation"`
 }
 
 // Advance the message high-water mark (never regresses) AND bump last_activity_at
@@ -10080,8 +10190,14 @@ type UpdateRunLastSeqParams struct {
 // activity-bump endpoint. A pure-duplicate re-delivery skips this call (maxSeq not
 // advanced), so last_activity_at reflects real new activity, which is exactly what
 // the stalled signal wants.
+//
+// PRD #1247 M5 (D3): FENCED like InsertRunMessage. When the caller carries a claim generation
+// (@claim_generation NOT NULL) the high-water bump lands ONLY while the run is at that
+// generation with an unreleased claim, so a released/reclaimed old flight cannot advance
+// last_seq (which would strand the reclaiming flight's re-emitted seqs behind a stale mark). A
+// legacy caller (NULL) advances unconditionally, byte-identical to before.
 func (q *Queries) UpdateRunLastSeq(ctx context.Context, arg UpdateRunLastSeqParams) (int64, error) {
-	result, err := q.db.Exec(ctx, updateRunLastSeq, arg.Seq, arg.ID)
+	result, err := q.db.Exec(ctx, updateRunLastSeq, arg.Seq, arg.ID, arg.ClaimGeneration)
 	if err != nil {
 		return 0, err
 	}

@@ -196,25 +196,33 @@ func TestSetRunCredentialRefusedStatesLiveDB(t *testing.T) {
 		return id
 	}
 
+	// The seeded worker (o.workerID) advertises NO protocol_capabilities, so a HELD-state switch
+	// (PRD #1247 M5, D4-step-9) is refused with CredentialSwitchWorkerUnsupportedError and writes
+	// nothing — the same "nothing written, status unchanged" contract the terminal/claimed
+	// refusals keep. The capability-PRESENT held path (200 + stamp) is proven in the M5 tests.
+	isUnsupportedWorker := func(err error) bool {
+		var u *CredentialSwitchWorkerUnsupportedError
+		return errors.As(err, &u)
+	}
 	cases := []struct {
 		status  string
-		wantErr error
+		wantErr func(error) bool
 	}{
-		{"running", ErrCredentialSwitchHeldStateUnsupported},
-		{"awaiting_approval", ErrCredentialSwitchHeldStateUnsupported},
-		{"awaiting_input", ErrCredentialSwitchHeldStateUnsupported},
-		{"awaiting_followup", ErrCredentialSwitchHeldStateUnsupported},
-		{"claimed", ErrCredentialSwitchClaimAssembling},
-		{"completed", ErrCredentialSwitchRunTerminal},
-		{"failed", ErrCredentialSwitchRunTerminal},
-		{"cancelled", ErrCredentialSwitchRunTerminal},
+		{"running", isUnsupportedWorker},
+		{"awaiting_approval", isUnsupportedWorker},
+		{"awaiting_input", isUnsupportedWorker},
+		{"awaiting_followup", isUnsupportedWorker},
+		{"claimed", func(e error) bool { return errors.Is(e, ErrCredentialSwitchClaimAssembling) }},
+		{"completed", func(e error) bool { return errors.Is(e, ErrCredentialSwitchRunTerminal) }},
+		{"failed", func(e error) bool { return errors.Is(e, ErrCredentialSwitchRunTerminal) }},
+		{"cancelled", func(e error) bool { return errors.Is(e, ErrCredentialSwitchRunTerminal) }},
 	}
 	for i, tc := range cases {
 		t.Run(tc.status, func(t *testing.T) {
 			runID := seedInStatus(tc.status, int64(4600+i))
 			_, err := svc.SetRunCredential(env.ctx, o.userID, runID, CredentialOverrideModePinned, &o.altTok)
-			if !errors.Is(err, tc.wantErr) {
-				t.Fatalf("SetRunCredential(%s): err = %v, want %v", tc.status, err, tc.wantErr)
+			if !tc.wantErr(err) {
+				t.Fatalf("SetRunCredential(%s): err = %v, want a state-specific refusal", tc.status, err)
 			}
 			// No override may be written on a refused switch.
 			run := mustRun(t, env, runID)

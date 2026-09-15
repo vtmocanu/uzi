@@ -535,6 +535,19 @@ func (s *Service) completeRunWithPermit(ctx context.Context, wkr store.Worker, o
 		return 0, false, err
 	}
 
+	// PRD #1247 M5 (D3): the generation fence, evaluated INSIDE this permit transaction's FOR
+	// UPDATE lock (an interlocked completion cannot nest under SetState's fence tx without
+	// self-deadlock, so it fences here instead). A capability worker stamps req.ClaimGeneration;
+	// if a held-state switch RELEASED this claim (claim_released_at set) or a reclaim SUPERSEDED
+	// it (claim_generation advanced) since the permit was issued, the completion is stale — a
+	// released run is 'queued', which SetRunCompleted's permissive guard WOULD otherwise complete,
+	// letting an old flight complete the run the new flight is working. Reject atomically under
+	// the lock; SetState's completed arm maps this to the stale_claim disposition. A legacy report
+	// (nil generation) skips the check, byte-identical to before.
+	if req.ClaimGeneration != nil && (run.ClaimGeneration != *req.ClaimGeneration || run.ClaimReleasedAt.Valid) {
+		return 0, false, ErrStaleClaim
+	}
+
 	// The revision that binds the permit identity MUST come from the LOCKED row, not the pre-tx
 	// `owned` snapshot. Revision is immutable post-freeze today, so the two agree; but #1227 will
 	// introduce contract-revision bumps, and a bump racing this completion would let a stale

@@ -33,7 +33,23 @@ import (
 // arm of the switch; the invariant they all serve is persistfail.go's ownership
 // tripwire.
 func (s *Service) AppendMessages(ctx context.Context, wkr store.Worker, runID uuid.UUID, msgs []IncomingMessage) error {
-	obs, err := s.appendMessages(ctx, wkr, runID, msgs)
+	return s.appendAndRecord(ctx, wkr, runID, msgs, nil)
+}
+
+// AppendMessagesForClaim is AppendMessages with the caller's claim generation threaded to the
+// FENCE (PRD #1247 M5, D3). A CAPABILITY worker stamps its claim_generation on every message
+// batch; the fenced InsertRunMessage / UpdateRunLastSeq then persist ONLY while the run is at
+// that generation with an unreleased claim, so a message batch from a RELEASED or RECLAIMED old
+// flight persists nothing and cannot advance last_seq. A nil generation is the LEGACY path
+// (identical to AppendMessages), unfenced — back-compat by construction. The handler
+// (WorkerRunMessages) passes the decoded batch generation here; every test caller keeps using
+// AppendMessages (nil), so the fence adds no test churn.
+func (s *Service) AppendMessagesForClaim(ctx context.Context, wkr store.Worker, runID uuid.UUID, msgs []IncomingMessage, claimGen *int64) error {
+	return s.appendAndRecord(ctx, wkr, runID, msgs, claimGen)
+}
+
+func (s *Service) appendAndRecord(ctx context.Context, wkr store.Worker, runID uuid.UUID, msgs []IncomingMessage, claimGen *int64) error {
+	obs, err := s.appendMessages(ctx, wkr, runID, msgs, claimGen)
 	switch {
 	case !obs.resolved:
 		// Ownership never resolved (ErrRunNotOwned, or the lookup itself failed), so
@@ -230,7 +246,7 @@ func (s *Service) NoteOversizeBatch(ctx context.Context, wkr store.Worker, runID
 // A broader wrap was considered and rejected: with the above holding it catches
 // nothing extra, while reintroducing exactly the misattribution this narrowness
 // exists to prevent.
-func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uuid.UUID, msgs []IncomingMessage) (appendObservation, error) {
+func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uuid.UUID, msgs []IncomingMessage, claimGen *int64) (appendObservation, error) {
 	run, err := s.runOwnedByWorker(ctx, runID, wkr)
 	if err != nil {
 		return appendObservation{}, err
@@ -335,6 +351,10 @@ func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uu
 			AgentInstance: pgconv.TextOrNull(m.AgentInstance),
 			AgentLabel:    pgconv.TextOrNull(m.AgentLabel),
 			Payload:       []byte(m.Payload),
+			// PRD #1247 M5 (D3): the per-query generation fence. nil (legacy worker) inserts
+			// unconditionally; a present generation gates the insert on the run still being at
+			// that generation with an unreleased claim.
+			ClaimGeneration: pgconv.Int8Ptr(claimGen),
 		})
 		if err != nil {
 			// The ONLY classified error on this path. See the tripwire on
@@ -395,7 +415,10 @@ func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uu
 	// after it, which is why it is fixed here rather than left to the transaction
 	// Phase 2 will consider.
 	if maxStored > run.LastSeq {
-		if _, err := s.q.UpdateRunLastSeq(ctx, store.UpdateRunLastSeqParams{ID: runID, Seq: maxStored}); err != nil {
+		// Fenced on the same predicate (PRD #1247 M5, D3): a released/reclaimed old flight must
+		// not advance last_seq, which would strand the reclaiming flight's re-emitted seqs behind
+		// a stale high-water mark. nil generation advances unconditionally (legacy).
+		if _, err := s.q.UpdateRunLastSeq(ctx, store.UpdateRunLastSeqParams{ID: runID, Seq: maxStored, ClaimGeneration: pgconv.Int8Ptr(claimGen)}); err != nil {
 			if insertErr != nil {
 				return obs, insertErr // the insert failure is the more informative of the two
 			}
