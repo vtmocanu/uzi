@@ -9,10 +9,10 @@
 #
 # SELF-CONTAINED ON PURPOSE. The GATE is readable here without resolving anything:
 # no gate target (`gate`, `gate:*`, or any target they call) includes or depends on a
-# remote taskfile. The exceptions are the release-only `brew:` and `brew-rc:` includes
-# below (see rule 3) -- both LOCAL vendored copies of the same reusable brew mechanic
-# (tracking an upstream SHA), reached by no gate target; only the release path invokes
-# them.
+# remote taskfile. The exceptions are the `brew:` and `brew-rc:` includes below (see rule
+# 3) -- both LOCAL vendored copies of the same reusable brew mechanic (tracking an upstream
+# SHA), reached by no gate target (only the release path and the local brew-local-test.sh
+# harness invoke them).
 #
 # 🔴 FOUR TASKFILE FEATURES ARE BANNED IN THIS FILE. One list, so the next reader
 # sees all of them at once. Each is one line to avoid and expensive to retrofit.

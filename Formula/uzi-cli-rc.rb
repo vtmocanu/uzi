@@ -7,15 +7,17 @@
 # install uzi-cli` switches back to stable). Stable users are never moved onto a
 # candidate; a dogfooder opts in with `brew install vtmocanu/tap/uzi-cli-rc`.
 #
-# This file is the SOURCE OF TRUTH and a TEMPLATE. Release CI (.github/workflows/brew.yml)
-# runs `task brew-rc:formula` / `task brew-rc:publish` -- the reusable homebrew-tap.yml from
+# This file is the SOURCE OF TRUTH and a TEMPLATE. `task brew-rc:formula` /
+# `task brew-rc:publish` render it -- the reusable homebrew-tap.yml from
 # github.com/vtmocanu/task, the SAME mechanic uzi-cli.rb and the sibling formulae
 # (cc-statusline, fj-queue) use -- which substitutes the url + sha256 placeholder strings
 # below for the RC tag's tarball + sha256 and pushes the rendered formula into the shared
-# vtmocanu tap (vtmocanu/homebrew-tap). The tap's Formula/uzi-cli-rc.rb is fully GENERATED
-# from this one on every RC release, so edit HERE, never the tap copy (tap edits are
-# overwritten). The placeholder strings are valid Ruby, so `task lint:formula` (ruby -c)
-# still parses this.
+# vtmocanu tap (vtmocanu/homebrew-tap). Release CI (.github/workflows/brew.yml) will run
+# that render/publish on an RC tag once its RC-channel wiring lands (issue #1378 M3); until
+# then the render path is exercised locally (scripts/brew-local-test.sh, `task
+# brew-rc:formula`). The tap's Formula/uzi-cli-rc.rb is fully GENERATED from this one on
+# each RC render, so edit HERE, never the tap copy (tap edits are overwritten). The
+# placeholder strings are valid Ruby, so `task lint:formula` (ruby -c) still parses this.
 #
 # The render is a GLOBAL substitution, so this header must NOT spell the placeholder
 # tokens literally: the url/sha256 lines below are the ONLY places they may appear.
