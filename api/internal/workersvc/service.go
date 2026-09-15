@@ -3242,17 +3242,39 @@ type InputDTO struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+// ConsumeInputsResult is what ConsumeInputs returns: the drained steering inputs and, when a
+// held-state switch is pending for the run's current claim, the worker-facing switch signal (PRD
+// #1247 M5, D3/D4). On the consume-nothing path (a pending switch) Inputs is empty and
+// CredentialSwitch is set; on the normal path CredentialSwitch is nil.
+type ConsumeInputsResult struct {
+	Inputs           []InputDTO
+	CredentialSwitch *CredentialSwitchSignal
+}
+
 // ConsumeInputs returns and marks-consumed every pending steering input for a
 // run the worker owns, FIFO. Delivery marks the input consumed (there is no
 // separate ack), so a worker crash right after the GET drops that input — an
 // accepted MVP trade-off for the steering channel (the user can re-send).
-func (s *Service) ConsumeInputs(ctx context.Context, wkr store.Worker, runID uuid.UUID) ([]InputDTO, error) {
-	if _, err := s.runOwnedByWorker(ctx, runID, wkr); err != nil {
-		return nil, err
+//
+// CONSUME-NOTHING RULE (PRD #1247 M5, step 2): when a credential switch is pending for the
+// run's CURRENT claim, this returns the switch signal and DRAINS NOTHING — it does not call
+// ConsumeRunInputs, which marks rows consumed on read. A racing answer/follow-up therefore stays
+// unconsumed for the reclaim, rather than being drained (and dropped) during the release the
+// worker is about to perform. Once the switch is released or reclaimed the signal clears and the
+// normal drain resumes.
+func (s *Service) ConsumeInputs(ctx context.Context, wkr store.Worker, runID uuid.UUID) (ConsumeInputsResult, error) {
+	run, err := s.runOwnedByWorker(ctx, runID, wkr)
+	if err != nil {
+		return ConsumeInputsResult{}, err
+	}
+	if sig := PendingCredentialSwitchSignal(run); sig != nil {
+		// Consume-nothing: return the signal and drain no rows, so a racing answer/follow-up
+		// survives unconsumed for the reclaim (PRD #1247 M5, step 2).
+		return ConsumeInputsResult{CredentialSwitch: sig}, nil
 	}
 	rows, err := s.q.ConsumeRunInputs(ctx, runID)
 	if err != nil {
-		return nil, err
+		return ConsumeInputsResult{}, err
 	}
 	out := make([]InputDTO, 0, len(rows))
 	consumedFollowUp := false
@@ -3271,7 +3293,7 @@ func (s *Service) ConsumeInputs(ctx context.Context, wkr store.Worker, runID uui
 	if consumedFollowUp && s.bcast != nil {
 		s.bcast.PublishInput(runID)
 	}
-	return out, nil
+	return ConsumeInputsResult{Inputs: out}, nil
 }
 
 // SaveMemory persists one cross-run memory entry for the run's (user, repo), the
