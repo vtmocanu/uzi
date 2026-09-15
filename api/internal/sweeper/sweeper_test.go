@@ -140,6 +140,13 @@ func TestSweeperPassLogsResumeOnlyTicks(t *testing.T) {
 		attr string // "" => expect NO "sweeper pass" record
 	}{
 		{name: "limit_wait promotion alone", res: workersvc.SweepResult{LimitPromoted: 1}, attr: "limit_promoted"},
+		// PRD #1247 M3 (D8): a tick that ONLY re-evaluates a still-parked run (lowering its
+		// retry_not_before to now() because its auto next claim gained a spendable pooled
+		// alternative) must raise the line too — the guard sum AND emit list both include
+		// LimitReevaluated. Its own promotion typically lands a tick later (the D8 pass writes
+		// DB now(), a hair ahead of the sweep's captured now), so a re-eval-only tick with
+		// LimitPromoted=0 would otherwise log nothing and the early promotion is invisible.
+		{name: "limit re-evaluation alone", res: workersvc.SweepResult{LimitReevaluated: 1}, attr: "limit_reevaluated"},
 		{name: "recovery_wait promotion alone", res: workersvc.SweepResult{RecoveryPromoted: 1}, attr: "recovery_promoted"},
 		// PRD #1226 M4 (D3): a tick that ONLY arms the served budget_exhausted steer must raise the
 		// line too — the guard sum AND emit list both include CompletionBudgetExhausted, else a
