@@ -70,12 +70,22 @@ func TestSupersedeRunByWorkerLiveDB(t *testing.T) {
 	// collides on workers_token_hash_key (Migrate does not truncate).
 	exec(`INSERT INTO workers (id, user_id, name, token_hash) VALUES ($1, $2, 'w', $3)`, wkr, userID, wkr[:])
 
+	// runs_kind_shape (migration 00167) requires an mr_rework row to carry a non-null
+	// pipeline_ref (its branch), mr_iid, and target_run_id — the last a FK to the source
+	// issue run the rework folds onto. Insert that completed source run first so the FK and
+	// the shape CHECK are satisfied; issue_iid stays NULL on the mr_rework row.
+	const branch = "agent/issue-42"
+	sourceRunID := uuid.New()
+	exec(`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, branch, mr_iid, mr_state, status)
+	      VALUES ($1, $2, $3, 'issue', 42, 't', 'd', $4, 42, 'opened', 'completed')`,
+		sourceRunID, userID, repoID, branch)
+
 	// A worker-owned, non-terminal mr_rework run — exactly what a live rework worker owns when
 	// its finalize push is rejected non-fast-forward by a concurrent same-branch writer.
 	runID := uuid.New()
-	exec(`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, status, worker_id, mr_iid)
-	      VALUES ($1, $2, $3, 'mr_rework', 7, 'rework x', 'ctx', 'running', $4, 42)`,
-		runID, userID, repoID, wkr)
+	exec(`INSERT INTO runs (id, user_id, repo_id, kind, issue_title, issue_description, pipeline_ref, mr_iid, target_run_id, status, worker_id)
+	      VALUES ($1, $2, $3, 'mr_rework', 'rework x', 'ctx', $4, 42, $5, 'running', $6)`,
+		runID, userID, repoID, branch, sourceRunID, wkr)
 
 	// ── Positive control / non-vacuity: a WRONG worker id must move 0 rows. ──
 	rows, err := q.SupersedeRunByWorker(ctx, store.SupersedeRunByWorkerParams{ID: runID, WorkerID: pgUUID(uuid.New())})
