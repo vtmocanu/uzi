@@ -174,6 +174,23 @@ func (f *FakeClient) ResumeRunNow(_ context.Context, id string) (apitypes.RunDTO
 	return f.ResumedRun, nil
 }
 
+// SetRunCredential records the run id and the resolved override it was called with and
+// returns the canned run + warning. It captures BEFORE the error branch (mirroring
+// ResumeRunNow) so a test asserting a 409/404/422 still proves the write was reached with
+// the right args; SetRunCredentialErr wins over the blanket Err.
+func (f *FakeClient) SetRunCredential(_ context.Context, id string, override SetRunCredentialOverride) (apitypes.RunDTO, string, error) {
+	f.LastSetTokenRunID = id
+	ov := override
+	f.LastSetTokenOverride = &ov
+	if f.SetRunCredentialErr != nil {
+		return apitypes.RunDTO{}, "", f.SetRunCredentialErr
+	}
+	if f.Err != nil {
+		return apitypes.RunDTO{}, "", f.Err
+	}
+	return f.SetTokenRun, f.SetTokenWarning, nil
+}
+
 // SetRunMrRework records the run id and the tri-state pointer it was called with and
 // returns the canned run. It captures BEFORE the error branch (mirroring SetRunPriority)
 // so a test asserting a 404 still proves the write was reached; SetRunMrReworkErr wins

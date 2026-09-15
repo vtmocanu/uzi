@@ -642,6 +642,12 @@ type Store interface {
 	// second park.
 	SetRunLimitWait(ctx context.Context, arg store.SetRunLimitWaitParams) (int64, error)
 	PromoteLimitWaitRuns(ctx context.Context, now pgtype.Timestamptz) ([]store.PromoteLimitWaitRunsRow, error)
+	// PromoteLimitWaitRunNow is the SINGLE-ROW early promote for `uzi run set-token` (PRD
+	// #1247 M4, D4): limit_wait -> queued for ONE owner+run WITHOUT the retry_not_before
+	// guard. Its mutation set is EXACTLY PromoteLimitWaitRuns' (a column-parity test pins
+	// them together) and it preserves the limit fields + retry_not_before so claimExclude
+	// keeps excluding the still-dead token. A 0-row result is a raced no-op (409).
+	PromoteLimitWaitRunNow(ctx context.Context, arg store.PromoteLimitWaitRunNowParams) (int64, error)
 	// The duration-time auto-failover re-evaluation pass (PRD #1247 M3, D8):
 	// ListLimitWaitReeval is the still-parked worklist (retry_not_before still in the
 	// future, a dead credential recorded) that reEvaluateParkedLimitWaitRuns walks, and
@@ -657,6 +663,11 @@ type Store interface {
 	// it has NO per-run cap, so promotion always fires and the run recovers repeatedly.
 	SetRunRecoveryWait(ctx context.Context, arg store.SetRunRecoveryWaitParams) (int64, error)
 	PromoteRecoveryWaitRuns(ctx context.Context, now pgtype.Timestamptz) ([]store.PromoteRecoveryWaitRunsRow, error)
+	// PromoteRecoveryWaitRunNow is the SINGLE-ROW early promote for `uzi run set-token`
+	// (PRD #1247 M4, D4): recovery_wait -> queued for ONE owner+run WITHOUT the
+	// recovery_retry_not_before guard, mirroring PromoteRecoveryWaitRuns' mutation set. A
+	// 0-row result is a raced no-op (409).
+	PromoteRecoveryWaitRunNow(ctx context.Context, arg store.PromoteRecoveryWaitRunNowParams) (int64, error)
 	// PRD #1190 M1 pause/resume. SetRunPaused parks a running run on the owner's request
 	// (positive source guard, like SetRunLimitWait); ResumePausedRun promotes it back
 	// (paused → queued) with gate-park accounting; ClearPauseRequest clears a pending
@@ -913,6 +924,11 @@ type Store interface {
 	// RunCredentialEpochs service method.
 	RecordRunCredentialEpoch(ctx context.Context, arg store.RecordRunCredentialEpochParams) error
 	ListRunCredentialEpochs(ctx context.Context, arg store.ListRunCredentialEpochsParams) ([]store.RunCredentialEpoch, error)
+	// SetRunCredentialOverride writes the per-run override columns for `uzi run set-token`
+	// (PRD #1247 M4, D4): the FIRST write in every writable-state branch of the verb,
+	// before the state-specific transition. Both params are nullable (inherit clears
+	// both). Owner-scoped; idempotent.
+	SetRunCredentialOverride(ctx context.Context, arg store.SetRunCredentialOverrideParams) (int64, error)
 	// Auto-selection (PRD #111 M4): every anthropic_token the user holds, with its
 	// gauge reading and in-flight run count. NOT pre-filtered on auto_eligible — the
 	// eligibility gate lives entirely in autoselect.Classify (D21), and the ranker
