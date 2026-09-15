@@ -118,7 +118,7 @@ func resumePhaseFor(run store.Run, planApproved bool) string {
 		return "awaiting_input"
 	case hasPlan && planApproved:
 		return "implementing"
-	case hasPlan && !planApproved && run.SessionID.Valid:
+	case hasPlan && !planApproved && run.SessionID.Valid && strings.TrimSpace(run.SessionID.String) != "":
 		return "awaiting_approval"
 	default:
 		return ""

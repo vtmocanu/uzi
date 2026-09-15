@@ -675,8 +675,9 @@ func TestConsumeInputsConsumeNothingWhilePendingLiveDB(t *testing.T) {
 		t.Fatalf("unconsumed rows = %d, want the buffered follow_up STILL present (consume-nothing)", unconsumed())
 	}
 
-	// (b) After the claim is released for this generation, the signal clears and the same input
-	// drains normally.
+	// (b) RELEASED but NOT yet reclaimed: the signal clears, but the drain is STILL fenced — the
+	// old worker (worker_id unchanged) must not orphan the row the reclaim is owed. The buffered
+	// follow_up survives.
 	env.exec(`UPDATE runs SET claim_released_at = now() WHERE id = $1`, id)
 	res2, err := svc.ConsumeInputs(env.ctx, wkr, id)
 	if err != nil {
@@ -685,10 +686,27 @@ func TestConsumeInputsConsumeNothingWhilePendingLiveDB(t *testing.T) {
 	if res2.CredentialSwitch != nil {
 		t.Fatalf("credential_switch = %+v, want nil after release", res2.CredentialSwitch)
 	}
-	if len(res2.Inputs) != 1 || res2.Inputs[0].Kind != "follow_up" {
-		t.Fatalf("inputs = %+v, want the buffered follow_up drained", res2.Inputs)
+	if len(res2.Inputs) != 0 {
+		t.Fatalf("inputs = %+v, want NONE drained in the released-but-not-reclaimed window", res2.Inputs)
+	}
+	if unconsumed() != 1 {
+		t.Fatalf("unconsumed rows = %d, want the buffered follow_up STILL present until reclaim", unconsumed())
+	}
+
+	// (c) RECLAIMED (ClaimRun clears claim_released_at and bumps the generation): the normal drain
+	// resumes and the buffered follow_up is delivered exactly once to the reclaim.
+	env.exec(`UPDATE runs SET claim_released_at = NULL, claim_generation = claim_generation + 1 WHERE id = $1`, id)
+	res3, err := svc.ConsumeInputs(env.ctx, wkr, id)
+	if err != nil {
+		t.Fatalf("ConsumeInputs (after reclaim): %v", err)
+	}
+	if res3.CredentialSwitch != nil {
+		t.Fatalf("credential_switch = %+v, want nil after reclaim (stamp generation now stale)", res3.CredentialSwitch)
+	}
+	if len(res3.Inputs) != 1 || res3.Inputs[0].Kind != "follow_up" {
+		t.Fatalf("inputs = %+v, want the buffered follow_up drained on reclaim", res3.Inputs)
 	}
 	if unconsumed() != 0 {
-		t.Fatalf("unconsumed rows = %d, want 0 after the normal drain", unconsumed())
+		t.Fatalf("unconsumed rows = %d, want 0 after the reclaim drain", unconsumed())
 	}
 }
