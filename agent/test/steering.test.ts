@@ -1,6 +1,12 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { SteeringChannel, ChatSteering, PauseNowSignal, type PlanVerdict } from "../src/steering.js";
+import {
+  SteeringChannel,
+  ChatSteering,
+  PauseNowSignal,
+  CredentialSwitchSignal,
+  type PlanVerdict,
+} from "../src/steering.js";
 import type { WorkerClient } from "../src/client.js";
 import type { UserInput } from "../src/protocol.js";
 import { nullLogger } from "./helpers.js";
@@ -217,6 +223,111 @@ describe("SteeringChannel — pause (PRD #1190 M2)", () => {
     ch.start();
     await tick();
     assert.strictEqual(fired, 0, "a milestone pause never drops the in-flight turn");
+    await ch.stop();
+  });
+});
+
+// PRD #1247 M5b — the held-state credential switch. A `credential_switch {generation}` field rides
+// EVERY /inputs response (incl. an empty one). The channel acts on it ONLY when the generation
+// matches THIS claim's (claimGeneration): it records the pending switch, trips the shared controller
+// with a CredentialSwitchSignal reason (DISTINCT from a cancel), invokes the re-armable interrupt,
+// and rejects any parked gate/answer/follow-up waiter (a run idling at the gate/question/follow-up
+// has no live SDK turn to abort). A mismatched generation targets a superseded claim and is ignored.
+describe("SteeringChannel — credential switch (PRD #1247 M5b)", () => {
+  // A client whose getInputs yields scripted { inputs?, credentialSwitch? } batches (min-clamped so
+  // the last batch repeats every subsequent tick, modelling the signal riding EVERY poll).
+  function switchClient(
+    batches: Array<{ inputs?: UserInput[]; credentialSwitch?: { generation: number } }>,
+  ): WorkerClient {
+    let i = 0;
+    return {
+      getInputs: async () => {
+        const b = batches[Math.min(i, batches.length - 1)] ?? {};
+        i++;
+        return { inputs: b.inputs ?? [], credentialSwitch: b.credentialSwitch };
+      },
+    } as unknown as WorkerClient;
+  }
+
+  it("fires on a matching generation: records the pending switch, aborts WITH a CredentialSwitchSignal reason, and interrupts", async () => {
+    const cancel = new AbortController();
+    let interrupts = 0;
+    const ch = new SteeringChannel(
+      switchClient([{ credentialSwitch: { generation: 7 } }]),
+      "run-1",
+      1,
+      nullLogger(),
+      cancel,
+      { claimGeneration: 7 },
+    );
+    ch.onCredentialSwitch(() => {
+      interrupts++;
+    });
+    ch.start();
+    for (let n = 0; n < 300 && ch.pendingCredentialSwitch() === undefined; n++) await tick();
+    assert.strictEqual(ch.pendingCredentialSwitch(), 7, "the pending switch generation is recorded");
+    assert.strictEqual(cancel.signal.aborted, true, "the shared controller is aborted");
+    assert.ok(
+      cancel.signal.reason instanceof CredentialSwitchSignal,
+      "aborted WITH a CredentialSwitchSignal reason (so the executor maps it to a switch, not a cancel)",
+    );
+    // Let several more matching polls run: the fire is idempotent (once per pending switch).
+    await tick(20);
+    assert.strictEqual(interrupts, 1, "the re-armable interrupt fires exactly once, not every tick");
+    await ch.stop();
+  });
+
+  it("does NOT act on a switch whose generation does not match this claim (a superseded claim)", async () => {
+    const cancel = new AbortController();
+    let interrupts = 0;
+    const ch = new SteeringChannel(
+      switchClient([{ credentialSwitch: { generation: 5 } }]),
+      "run-1",
+      1,
+      nullLogger(),
+      cancel,
+      { claimGeneration: 7 },
+    );
+    ch.onCredentialSwitch(() => {
+      interrupts++;
+    });
+    ch.start();
+    await tick(20);
+    assert.strictEqual(ch.pendingCredentialSwitch(), undefined, "a mismatched generation is ignored");
+    assert.strictEqual(cancel.signal.aborted, false, "the controller is NOT aborted for a stale signal");
+    assert.strictEqual(interrupts, 0, "the interrupt never fires for a stale signal");
+    await ch.stop();
+  });
+
+  it("rejects a parked plan-gate waiter with a CredentialSwitchSignal (idle at the gate — no live turn to abort)", async () => {
+    const ch = new SteeringChannel(
+      switchClient([{ credentialSwitch: { generation: 7 } }]),
+      "run-1",
+      1,
+      nullLogger(),
+      new AbortController(),
+      { claimGeneration: 7 },
+    );
+    // Park the gate waiter BEFORE starting the poll loop, so the switch deterministically rejects an
+    // already-parked waiter (the gate-switch case, D13: no SDK turn is running at the gate).
+    const parked = ch.awaitVerdict();
+    ch.start();
+    await assert.rejects(parked, (e) => e instanceof CredentialSwitchSignal);
+    await ch.stop();
+  });
+
+  it("rejects a parked answer waiter (a run idling at an ask_user question) with a CredentialSwitchSignal", async () => {
+    const ch = new SteeringChannel(
+      switchClient([{ credentialSwitch: { generation: 7 } }]),
+      "run-1",
+      1,
+      nullLogger(),
+      new AbortController(),
+      { claimGeneration: 7 },
+    );
+    const parked = ch.awaitAnswer("q-1");
+    ch.start();
+    await assert.rejects(parked, (e) => e instanceof CredentialSwitchSignal);
     await ch.stop();
   });
 });

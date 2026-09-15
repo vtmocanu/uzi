@@ -82,7 +82,7 @@ import {
   SIGNAL_SERVER_NAME,
 } from "./signals.js";
 import { classifyLimitEvidence, LimitReachedError } from "./limit.js";
-import { PauseNowSignal } from "./steering.js";
+import { PauseNowSignal, CredentialSwitchSignal } from "./steering.js";
 import { buildMemoryServer, MEMORY_SERVER_NAME } from "./memory-tools.js";
 import { buildForgeToolsServer, FORGE_SERVER_NAME } from "./forge-tools.js";
 import { buildFindingsToolsServer, FINDINGS_SERVER_NAME } from "./findings-tools.js";
@@ -134,6 +134,12 @@ const REASON_CANCELLED = "run cancelled";
 // implement loop's turn catch takes to the pause-park path, so it never reaches a `failed`
 // report as text. DISTINCT from REASON_CANCELLED so the two aborts do not collide.
 const REASON_PAUSE_NOW = "run paused (now)";
+// PRD #1247 M5b: the internal trip reason for a held-state CREDENTIAL SWITCH abort. Never a
+// failure_reason — tripError converts it to a thrown CredentialSwitchSignal at every driveTurn
+// throw site, which propagates through the implement loop's turn catch to the runner's release
+// state machine (enterCredentialSwitch), so it never reaches a `failed` report as text. DISTINCT
+// from REASON_CANCELLED and REASON_PAUSE_NOW so the three aborts never collide.
+const REASON_CREDENTIAL_SWITCH = "run released for a credential switch";
 // Exported so the runner's failed-report site can map it to a fail_origin
 // (PRD #69 M7a): a missing Anthropic token is a credential_unavailable failure.
 export const REASON_NO_TOKEN = "no Anthropic OAuth token was provided for this run";
@@ -1197,7 +1203,13 @@ export class SdkExecutor implements Executor {
         state,
         ctx.signal?.reason instanceof PauseNowSignal
           ? REASON_PAUSE_NOW
-          : REASON_CANCELLED,
+          : // PRD #1247 M5b: a held-state credential switch aborts the SAME controller as a cancel,
+            // but with a CredentialSwitchSignal reason. Trip with REASON_CREDENTIAL_SWITCH so
+            // driveTurn throws a CredentialSwitchSignal (via tripError) instead of the cancel error —
+            // the runner then RELEASES the claim rather than failing the run.
+            ctx.signal?.reason instanceof CredentialSwitchSignal
+            ? REASON_CREDENTIAL_SWITCH
+            : REASON_CANCELLED,
       );
       depsAbort.abort();
     };
@@ -1214,6 +1226,13 @@ export class SdkExecutor implements Executor {
     // cleared the prior trip still drops the (restarted) turn. `state` is the run-lifetime drive
     // object, so this one registration covers every turn.
     ctx.onPauseNow?.(() => this.trip(state, REASON_PAUSE_NOW));
+
+    // PRD #1247 M5b: register the RE-ARMABLE credential-switch interrupt, the exact analog of the
+    // pause-now interrupt above. The shared cancel controller fires 'abort' once, so a switch that
+    // lands after a declined `now` park (which already aborted it) cannot re-fire it; the steering
+    // channel invokes THIS on the matching switch, and trip() is first-wins-per-turn, so the switch
+    // drops the (restarted) turn as REASON_CREDENTIAL_SWITCH. One registration covers every turn.
+    ctx.onCredentialSwitch?.(() => this.trip(state, REASON_CREDENTIAL_SWITCH));
 
     // The SDK session id evolves across turns; resume each turn from the last.
     let resumeId = ctx.sessionId ?? undefined;
@@ -1311,6 +1330,17 @@ export class SdkExecutor implements Executor {
         (!!ctx.sessionId ||
           ctx.seeded === true ||
           ctx.reviewedPlanResume === true) &&
+        !!ctx.approvedPlan?.trim();
+
+      // PRD #1247 M5b (D13): a run RECLAIMED after a held-state credential switch at the plan gate.
+      // resume_phase == "awaiting_approval" carries the SUBMITTED-but-unapproved plan (persisted
+      // plan_md → ctx.approvedPlan). RE-PRESENT that exact plan at the gate WITHOUT running a
+      // planning turn, then await a fresh verdict. DISTINCT from preApproved (never both — the plan
+      // is not yet approved here); mutually exclusive by the `!preApproved` guard so an approved run
+      // still takes the gate-skip path.
+      const resumeAtGate =
+        !preApproved &&
+        ctx.resumePhase === "awaiting_approval" &&
         !!ctx.approvedPlan?.trim();
 
       // Hoisted above the skip so the post-gate code (the ci_fix not_code check, the
@@ -1534,27 +1564,50 @@ export class SdkExecutor implements Executor {
             autoApprove: ctx.autoApprove,
           });
         }
-        const planningLabel = isCIFix
-          ? "diagnosing CI failure"
-          : isSelfImprove
-            ? "planning self-improvement"
-            : "planning";
-        ctx.emit({
-          kind: "status",
-          agent: "worker",
-          payload: { text: `starting SDK agent (${planningLabel})` },
-        });
+        // PRD #1247 M5b (D13): both paths below set `approvedPlan` + the candidate milestone list,
+        // then share the gate + revision loop. A resume-at-gate run does NOT run a planning turn —
+        // it re-presents the ALREADY-CAPTURED plan (the persisted plan_md → ctx.approvedPlan) at the
+        // gate, so `planPrompt` built above is consumed only on the planning path.
+        let candidateMilestones: Milestone[] | undefined;
+        if (resumeAtGate) {
+          ctx.emit({
+            kind: "status",
+            agent: "worker",
+            payload: {
+              text: "resuming at the plan gate after a credential switch — re-presenting the submitted plan (no re-plan)",
+            },
+          });
+          approvedPlan = ctx.approvedPlan!;
+          // The frozen breakdown rides the claim so the re-presented gate shows the same
+          // milestones; absent ⇒ no milestones on the report, as for a plan turn producing none.
+          candidateMilestones = ctx.frozenMilestones ?? undefined;
+        } else {
+          const planningLabel = isCIFix
+            ? "diagnosing CI failure"
+            : isSelfImprove
+              ? "planning self-improvement"
+              : "planning";
+          ctx.emit({
+            kind: "status",
+            agent: "worker",
+            payload: { text: `starting SDK agent (${planningLabel})` },
+          });
 
-        const plan = await this.drivePlanningTurn(
-          ctx,
-          baseConfig,
-          resumeId,
-          planPrompt,
-          state,
-          idleMs,
-          budget,
-        );
-        resumeId = plan.sessionId ?? resumeId;
+          const plan = await this.drivePlanningTurn(
+            ctx,
+            baseConfig,
+            resumeId,
+            planPrompt,
+            state,
+            idleMs,
+            budget,
+          );
+          resumeId = plan.sessionId ?? resumeId;
+          approvedPlan = plan.plan;
+          // PRD #122 M1: the CANDIDATE milestone list rides every gate call so the human
+          // approves the breakdown. It is REPLACED on each revision round (Decision 2).
+          candidateMilestones = plan.milestones;
+        }
 
         // --- Plan gate (+ revision loop, PRD #41) -----------------------------
         // The gate can be re-entered N times under ONE approval budget: a `revise`
@@ -1565,11 +1618,6 @@ export class SdkExecutor implements Executor {
         // guarantee the only way past this block is an `approve` (see the explicit guard).
         if (!ctx.gatePlan)
           throw new Error("plan gate is not wired for this run");
-        approvedPlan = plan.plan;
-        // PRD #122 M1: the CANDIDATE milestone list rides every gate call so the human
-        // approves the breakdown. It is REPLACED on each revision round (Decision 2),
-        // tracked alongside approvedPlan.
-        let candidateMilestones = plan.milestones;
         // PRD #362 M3c PLAN hook (Decision 2): generate + post the plan summary as the
         // gate's onAwaitingApproval callback, so it fires AFTER the gate persists plan_md
         // (the summary's stale-write guard value) and BEFORE the verdict wait — blocking
@@ -2127,6 +2175,12 @@ export class SdkExecutor implements Executor {
         try {
           turn = await turnPromise;
         } catch (err) {
+          // PRD #1247 M5b: a held-state credential switch must reach executeClaim's outer catch
+          // UNIFORMLY — whether it trips mid-implement-turn (here) or during a plan turn (the outer
+          // catch directly). Re-throw it FIRST, explicitly, so no later branch here (the WALL/IDLE
+          // completion-hold route, say) can ever swallow it. Mirrors how PauseNowSignal is routed on
+          // the plan-turn path; unlike a pause, a switch does NOT park in place, it releases.
+          if (err instanceof CredentialSwitchSignal) throw err;
           if (err instanceof PauseNowSignal) {
             const at = {
               // The server's fresh completed count off THIS iteration's ACK, matching the
@@ -3434,9 +3488,13 @@ export class SdkExecutor implements Executor {
    *  path; every other trip reason throws its static Error(reason) exactly as before. Keeps the
    *  REASON_PAUSE_NOW sentinel from ever surfacing as a `failed` report's text. */
   private tripError(state: RunDrive): Error {
-    return state.tripReason === REASON_PAUSE_NOW
-      ? new PauseNowSignal()
-      : new Error(state.tripReason ?? REASON_CANCELLED);
+    if (state.tripReason === REASON_PAUSE_NOW) return new PauseNowSignal();
+    // PRD #1247 M5b: a credential-switch trip throws a CredentialSwitchSignal, which the implement
+    // loop's turn catch propagates (it is neither a PauseNowSignal nor a WALL/IDLE trip) to the
+    // runner's release state machine — keeping REASON_CREDENTIAL_SWITCH from ever surfacing as a
+    // `failed` report's text.
+    if (state.tripReason === REASON_CREDENTIAL_SWITCH) return new CredentialSwitchSignal();
+    return new Error(state.tripReason ?? REASON_CANCELLED);
   }
 
   /** Record a first-wins watchdog/cancel trip and stop the current turn. */
