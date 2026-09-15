@@ -57,8 +57,9 @@ function reasonsFromMigration(): string[] {
     .filter((line) => !line.trimStart().startsWith("--"))
     .join("\n");
   // Isolate the select-reason IN-list. 00230 both DROPs (no IN-list) and re-ADDs the
-  // constraint; matchAll returns the first re-ADD (the Up NOT VALID one, the widened
-  // vocabulary) before the Down section's copy.
+  // constraint; this non-global .match() returns only the FIRST match in the file, the
+  // Up section's re-ADD (the NOT VALID one, the widened vocabulary), before the Down
+  // section's copy.
   const inList = stmt.match(/anthropic_select_reason IN \(([^)]*)\)/);
   if (!inList) throw new Error("could not find the anthropic_select_reason IN-list in 00230");
   return [...inList[1].matchAll(/'([a-z_]+)'/g)].map((m) => m[1]).sort();

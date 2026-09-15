@@ -116,12 +116,15 @@ func TestCredentialCellCoversEveryReason(t *testing.T) {
 		}
 		seen[got] = r
 	}
-	// The five that carry real prose must not read as their bare wire value. Stated as
+	// The seven that carry real prose must not read as their bare wire value. Stated as
 	// an explicit list rather than "all of them" precisely because the other three
-	// legitimately do.
+	// legitimately do. ReasonRunPinned/ReasonRunDefault (PRD #1247) render "run-pinned"
+	// / "run-default" (hyphenated) — deleting either arm falls through to the bare wire
+	// value ("run_pinned" / "run_default", underscored), which this loop would catch.
 	for _, r := range []autoselect.Reason{
 		autoselect.ReasonJudge, autoselect.ReasonBestOfPool,
 		autoselect.ReasonPoolEmpty, autoselect.ReasonPoolStale, autoselect.ReasonOpenFailed,
+		autoselect.ReasonRunPinned, autoselect.ReasonRunDefault,
 	} {
 		if got := selectReasonText(r, nil); got == string(r) {
 			t.Errorf("%s fell through to the raw wire value %q — the shape of a deleted "+
