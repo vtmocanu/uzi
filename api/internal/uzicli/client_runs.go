@@ -349,7 +349,26 @@ type CreateRunSeed struct {
 	RequireBase bool
 }
 
-func (c *HTTPClient) CreateRun(ctx context.Context, repoID string, issueIID int64, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *CreateRunSeed) (apitypes.RunDTO, error) {
+// createRunCredentialOverride is the wire shape of PRD #1247's credential_override create
+// field, matching the server's inline req struct. SecretID is a `*string` with `omitempty`
+// so it is sent only for a pinned choice; the auto/default/inherit modes carry `mode` alone.
+type createRunCredentialOverride struct {
+	Mode     string  `json:"mode"`
+	SecretID *string `json:"secret_id,omitempty"`
+}
+
+// CreateRunCredentialOverride is PRD #1247 M2's create-time per-run Anthropic credential
+// choice, forwarded by `uzi run create --token`. Nil ⇒ no credential_override key is sent
+// (inherit the worker binding, byte-identical to a pre-#1247 create). Mode is one of
+// "auto"/"default"/"inherit"/"pinned"; SecretID is set ONLY for "pinned" (the label is
+// resolved to an anthropic_token id CLIENT-SIDE, mirroring `uzi token pool`) and empty for
+// the other three modes.
+type CreateRunCredentialOverride struct {
+	Mode     string
+	SecretID string
+}
+
+func (c *HTTPClient) CreateRun(ctx context.Context, repoID string, issueIID int64, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *CreateRunSeed, credOverride *CreateRunCredentialOverride) (apitypes.RunDTO, error) {
 	var env struct {
 		Run apitypes.RunDTO `json:"run"`
 	}
@@ -379,15 +398,22 @@ func (c *HTTPClient) CreateRun(ctx context.Context, repoID string, issueIID int6
 	// a plain create stays byte-identical to before, while `force:true` (only ever set on
 	// --force) asks the server to bypass ONLY the open-MR guard — a run already in progress
 	// is never bypassed. false is the common, correct value, so omitempty is the whole point.
+	// credential_override (PRD #1247 M2) is a `*struct` with `omitempty`, so a nil override
+	// omits the key entirely and a bare create stays byte-identical to before (the server
+	// then inherits the worker binding). A present override always sends `mode`; `secret_id`
+	// is itself `omitempty` on a `*string`, so it rides only for a pinned choice and the
+	// auto/default/inherit modes send `mode` alone. This mirrors the server's inline req
+	// struct `{mode, secret_id?}`.
 	reqBody := struct {
-		IssueIID        int64                    `json:"issue_iid"`
-		WaitOnLimit     *bool                    `json:"wait_on_limit,omitempty"`
-		MrReworkEnabled *bool                    `json:"mr_rework_enabled,omitempty"`
-		Force           bool                     `json:"force,omitempty"`
-		PlanMD          *string                  `json:"plan_md,omitempty"`
-		Selection       *apitypes.AgentSelection `json:"agent_selection,omitempty"`
-		PlannedCommit   *string                  `json:"planned_commit,omitempty"`
-		RequireBase     bool                     `json:"require_base,omitempty"`
+		IssueIID           int64                        `json:"issue_iid"`
+		WaitOnLimit        *bool                        `json:"wait_on_limit,omitempty"`
+		MrReworkEnabled    *bool                        `json:"mr_rework_enabled,omitempty"`
+		Force              bool                         `json:"force,omitempty"`
+		PlanMD             *string                      `json:"plan_md,omitempty"`
+		Selection          *apitypes.AgentSelection     `json:"agent_selection,omitempty"`
+		PlannedCommit      *string                      `json:"planned_commit,omitempty"`
+		RequireBase        bool                         `json:"require_base,omitempty"`
+		CredentialOverride *createRunCredentialOverride `json:"credential_override,omitempty"`
 	}{IssueIID: issueIID, WaitOnLimit: waitOnLimit, MrReworkEnabled: mrReworkEnabled, Force: force}
 	if seed != nil {
 		reqBody.PlanMD = &seed.PlanMD
@@ -396,6 +422,14 @@ func (c *HTTPClient) CreateRun(ctx context.Context, repoID string, issueIID int6
 			reqBody.PlannedCommit = &seed.PlannedCommit
 		}
 		reqBody.RequireBase = seed.RequireBase
+	}
+	if credOverride != nil {
+		ov := &createRunCredentialOverride{Mode: credOverride.Mode}
+		if credOverride.SecretID != "" {
+			sid := credOverride.SecretID
+			ov.SecretID = &sid
+		}
+		reqBody.CredentialOverride = ov
 	}
 	if err := c.postJSON(ctx, "/api/repos/"+url.PathEscape(repoID)+"/runs", reqBody, &env); err != nil {
 		return apitypes.RunDTO{}, err
