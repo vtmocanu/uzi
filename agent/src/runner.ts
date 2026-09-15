@@ -4206,6 +4206,17 @@ export class RunRunner {
         if (outcome === "gave_up") {
           flight.preserveRecoveryClone = false;
           flight.preserveSession = false;
+          // A DIRTY-tree switch committed a `wip(park):` marker in captureRecoveryRestorePoint; a
+          // give-up CONTINUES in place with NO reseed, so the marker must be undone here or it rides
+          // into the eventual MR and the restarted turn builds on a throwaway commit — the SAME orphan
+          // handlePausePark fixes on the pause-continue path (undoWipMarker's docstring). headIsWipMarker
+          // self-guards the blind `reset --mixed HEAD^` so it fires ONLY when HEAD is a marker (a
+          // clean-tree switch committed none). Kept HERE, not in enterCredentialSwitch (shared with the
+          // outer-catch requeue arm, whose reseed reset-softs the marker) and NOT on the release path
+          // (the reclaim's reseed handles it) — the two paths that MUST leave the marker.
+          if (flight.worktreePath && (await this.git.headIsWipMarker(flight.worktreePath))) {
+            await this.git.undoWipMarker(flight.worktreePath).catch(() => undefined);
+          }
         }
         return outcome;
       },

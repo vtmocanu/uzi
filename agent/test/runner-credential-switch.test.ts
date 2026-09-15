@@ -88,27 +88,63 @@ function makeSwitchExecutor(
   return { executor, captureAttempts };
 }
 
+// In-place-switch verdicts (the ctx.attemptCredentialSwitch path) model the WIP-MARKER lifecycle so the
+// data-integrity fix is observable — a give-up that continues in place MUST undo a marker it committed
+// (else the throwaway commit rides into the MR), while a release LEAVES it for the reclaim's reseed:
+//  - "verified":       CLEAN tree, NO marker committed (status.length===0 skips commitWipMarker),
+//                      verified ⇒ RELEASED — the switchReleased finalize short-circuit.
+//  - "marker_giveup":  DIRTY tree, marker committed (commitWipMarker→true, so HEAD IS a marker), never
+//                      verified ⇒ GIVE UP; the marker is at HEAD and MUST be undone in place.
+//  - "marker_release": DIRTY tree, marker committed, verified ⇒ RELEASED; the marker is LEFT at HEAD (the
+//                      reclaim reseeds and reset-softs it) — undoWipMarker must NOT fire.
+type InPlaceVerdict = "verified" | "marker_giveup" | "marker_release";
+
+interface InPlaceSwitchProbe {
+  executor: Executor;
+  captureAttempts: { count: number };
+  // Observable WIP-marker state the git double tracks: whether HEAD is currently a marker, and whether
+  // the runner undid it (undoWipMarker called on the continue-in-place path).
+  marker: { headIsMarker: boolean; undoCalled: boolean };
+}
+
 // makeInPlaceSwitchExecutor models the DATA-INTEGRITY fix (PRD #1247 M5b): the executor handles the
 // switch IN PLACE by CALLING ctx.attemptCredentialSwitch (which the runner wires to
-// enterCredentialSwitch) instead of throwing to the outer catch. The stub stubs the same capture git
-// as makeSwitchExecutor, then acts on the outcome exactly as the real loop does: "released" → return
-// switchReleased so phasePublish skips finalize; "gave_up" → the run CONTINUES on the old token, here
-// modelled as a later NORMAL (report-only) completion that then cleans up as usual.
-function makeInPlaceSwitchExecutor(verdict: CaptureVerdict): SwitchProbe {
+// enterCredentialSwitch) instead of throwing to the outer catch, then acts on the outcome exactly as the
+// real loop does: "released" → return switchReleased so phasePublish skips finalize; "gave_up" → the run
+// CONTINUES on the old token, here modelled as a later NORMAL (report-only) completion that cleans up as
+// usual. Unlike makeSwitchExecutor's "dirty_fail" (where the WIP commit FAILS so no marker exists), the
+// DIRTY verdicts here let the WIP commit SUCCEED — so headIsWipMarker sees a real marker at HEAD and the
+// give-up's undo (and the release's non-undo) can be asserted.
+function makeInPlaceSwitchExecutor(verdict: InPlaceVerdict): InPlaceSwitchProbe {
   const captureAttempts = { count: 0 };
+  const marker = { headIsMarker: false, undoCalled: false };
+  const dirty = verdict === "marker_giveup" || verdict === "marker_release";
+  const verifies = verdict === "verified" || verdict === "marker_release";
   const executor: Executor = {
     run: async (ctx: RunContext) => {
-      const dirty = verdict === "dirty_fail";
       git.worktreeStatus = (async () => (dirty ? ["M src/impl.ts"] : [])) as typeof git.worktreeStatus;
-      git.commitWipMarker = (async () => !dirty) as typeof git.commitWipMarker;
+      // A DIRTY tree's WIP commit SUCCEEDS here — the marker IS committed, so headIsWipMarker sees it at
+      // HEAD. A CLEAN tree skips commitWipMarker entirely (captureRecoveryRestorePoint's status.length===0
+      // branch), so no marker is ever planted.
+      git.commitWipMarker = (async () => {
+        marker.headIsMarker = true;
+        return true;
+      }) as typeof git.commitWipMarker;
       git.fetchAgentBranch = (async () =>
         `refs/uzi-runner/${ctx.branch}`) as typeof git.fetchAgentBranch;
       git.verifyRunnerTrackingCovers = (async () => {
         captureAttempts.count++;
-        return !dirty;
+        return verifies;
       }) as typeof git.verifyRunnerTrackingCovers;
       git.trackingTip = (async () => "cafef00dcafef00dcafef00dcafef00dcafef00d") as typeof git.trackingTip;
       git.checkpointPack = (async () => null) as typeof git.checkpointPack;
+      // The marker helpers the give-up-continue path drives: headIsWipMarker reflects the current HEAD;
+      // undoWipMarker (the blind reset --mixed HEAD^) clears the marker and records that it fired.
+      git.headIsWipMarker = (async () => marker.headIsMarker) as typeof git.headIsWipMarker;
+      git.undoWipMarker = (async () => {
+        marker.undoCalled = true;
+        marker.headIsMarker = false;
+      }) as typeof git.undoWipMarker;
       const outcome = await ctx.attemptCredentialSwitch!();
       if (outcome === "released") {
         // The loop broke with switchReleased latched; the runner skips finalize.
@@ -123,7 +159,7 @@ function makeInPlaceSwitchExecutor(verdict: CaptureVerdict): SwitchProbe {
       };
     },
   };
-  return { executor, captureAttempts };
+  return { executor, captureAttempts, marker };
 }
 
 function statuses(runId: string): string[] {
@@ -242,9 +278,11 @@ describe("RunRunner — held-state credential switch (PRD #1247 M5b)", () => {
   // instead of throwing to the outer catch. These pin the RUNNER side of that wiring: the flag-clear on
   // give-up (so the continuing run cleans up normally) and the phasePublish switchReleased short-circuit.
 
-  it("give-up via ctx.attemptCredentialSwitch CONTINUES: reports credential_switch_failed, CLEARS the preserve flags, and a later normal completion cleans up the clone + HOME", async () => {
+  it("give-up via ctx.attemptCredentialSwitch CONTINUES: reports credential_switch_failed, CLEARS the preserve flags, UNDOES the wip(park) marker, and a later normal completion cleans up the clone + HOME", async () => {
     const { gitlab, calls } = fakeGitlab();
-    const { executor, captureAttempts } = makeInPlaceSwitchExecutor("dirty_fail");
+    // DIRTY tree whose WIP commit SUCCEEDS (a marker IS at HEAD) but never verifies ⇒ give up: the
+    // continue-in-place path must undo that marker or it rides into the MR.
+    const { executor, captureAttempts, marker } = makeInPlaceSwitchExecutor("marker_giveup");
     const home = seedHome();
     const claim = gitlabClaim(1264);
     try {
@@ -258,7 +296,12 @@ describe("RunRunner — held-state credential switch (PRD #1247 M5b)", () => {
       assert.ok(!s.includes("failed"), "a running give-up never fails the run");
       assert.ok(s.includes("completed"), "the run CONTINUED on the old token and reached a NORMAL completion");
       assert.strictEqual(calls.length, 0, "the report-only completion opens no MR");
-      assert.strictEqual(captureAttempts.count, 0, "the dirty WIP commit fails before the positive-verify step");
+      assert.ok(captureAttempts.count > 0, "the marker WAS committed and the capture reached the positive-verify step (which never covered) ⇒ give up");
+      // The DATA-INTEGRITY fix: the give-up-continue UNDID the wip(park) marker it committed, so HEAD is
+      // no longer a throwaway commit that would ride into the MR. Removing the undo in the runner reddens
+      // exactly these two assertions (the marker would stay at HEAD).
+      assert.ok(marker.undoCalled, "the give-up-continue UNDID the wip(park) marker (undoWipMarker fired)");
+      assert.strictEqual(marker.headIsMarker, false, "HEAD is no longer a wip(park) marker after the in-place undo");
       // The give-up CLEARED the preserve flags (the run continued normally), so the NORMAL completion
       // cleans up as usual — the clone AND the HOME are removed, NOT preserved.
       assert.strictEqual(fs.existsSync(worktreeDirFor(1264)), false, "the clone is cleaned up on the normal completion (flags cleared)");
@@ -285,6 +328,36 @@ describe("RunRunner — held-state credential switch (PRD #1247 M5b)", () => {
       assert.ok(!s.includes("failed"), "a released run is not failed");
       assert.strictEqual(calls.length, 0, "a released run opens no MR");
       assert.strictEqual(fs.existsSync(worktreeDirFor(1265)), false, "the clone is retired on release");
+      assert.strictEqual(fs.existsSync(home.sentinel), true, "the HOME is preserved for the reclaim");
+    } finally {
+      fs.rmSync(home.root, { recursive: true, force: true });
+    }
+  });
+
+  it("release via ctx.attemptCredentialSwitch LEAVES a wip(park) marker at HEAD: the reclaim's reseed reset-softs it, so the runner must NOT undo it in place", async () => {
+    const { gitlab, calls } = fakeGitlab();
+    // DIRTY tree whose WIP commit succeeds AND verifies ⇒ RELEASED with a marker at HEAD. On release the
+    // run requeues and a reclaim reseeds (reset-softing the marker), so the give-up-only undo must NOT
+    // fire here — this guards against the undo being wrongly moved out of the "gave_up" branch onto the
+    // release (or into the shared enterCredentialSwitch).
+    const { executor, marker } = makeInPlaceSwitchExecutor("marker_release");
+    const home = seedHome();
+    const claim = gitlabClaim(1266);
+    try {
+      api.overrideStateStatus(claim.run_id, "queued"); // the release requeues the run
+      await runnerWith(() => ({ executor, homeDir: home.homeDir }), gitlab, undefined, undefined, {
+        recoveryRetryMs: 1,
+      }).execute(claim);
+
+      const s = statuses(claim.run_id);
+      assert.ok(s.includes("credential_switch"), "the release reported credential_switch");
+      assert.ok(!s.includes("credential_switch_failed"), "a released run did NOT give up");
+      assert.ok(!s.includes("completed"), "phasePublish SKIPS finalize on switchReleased — no completed report");
+      assert.strictEqual(calls.length, 0, "a released run opens no MR");
+      // The marker is LEFT at HEAD on release — the reclaim reseeds and reset-softs it.
+      assert.ok(!marker.undoCalled, "the marker is NOT undone on release (undoWipMarker never fired)");
+      assert.strictEqual(marker.headIsMarker, true, "the wip(park) marker is LEFT at HEAD for the reclaim's reseed");
+      assert.strictEqual(fs.existsSync(worktreeDirFor(1266)), false, "the clone is retired on release");
       assert.strictEqual(fs.existsSync(home.sentinel), true, "the HOME is preserved for the reclaim");
     } finally {
       fs.rmSync(home.root, { recursive: true, force: true });
