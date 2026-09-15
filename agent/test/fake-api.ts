@@ -96,6 +96,11 @@ export class FakeApi {
   unauthorized = 0;
   stateAttempts = 0;
   readonly states: Array<{ runId: string; body: StateRequest }> = [];
+  // PRD #1247 M5b: a GLOBAL, ordered log of the mutating requests as they land, so a test can pin
+  // RELATIVE ORDER across the two endpoints the single `states`/`messageBatches` arrays cannot show
+  // (e.g. that a message batch DRAINED before the credential_switch state report). Each accepted
+  // /messages batch appends "messages"; each recorded /state report appends `state:<status>`.
+  readonly requestLog: string[] = [];
   private readonly stateHooks = new Map<string, (body: StateRequest) => void>();
   // PRD #1247 M5b: the per-batch MessagesRequest wrapper as it landed (the runMatch handler
   // otherwise keeps only the flattened `messages[]`, discarding the top-level claim_generation
@@ -560,6 +565,7 @@ export class FakeApi {
     // PRD #1247 M5b: record the wrapper as it arrived, so a test can assert claim_generation was
     // stamped (or omitted). Only when the batch has messages — an empty post is a client no-op.
     if (incoming.length > 0) {
+      this.requestLog.push("messages");
       this.messageBatches.push({
         runId,
         claim_generation:
@@ -634,6 +640,7 @@ export class FakeApi {
       });
     }
     this.states.push({ runId, body });
+    this.requestLog.push(`state:${body.status}`);
     this.stateHooks.get(runId)?.(body);
     send(res, 200, {
       run: {

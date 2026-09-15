@@ -227,6 +227,17 @@ export interface RunContext {
    *  3); a park BEFORE approval (only reachable if the planning turn itself died on a
    *  limit) likewise leaves this false and resumes into planning exactly as today. */
   planApproved?: boolean;
+  /** PRD #1247 M5b (D13): the phase a RESUME claim after a held-state credential switch should
+   *  RESTORE, one of "awaiting_approval" / "awaiting_input" / "implementing" (or absent/"" for a
+   *  fresh run). Set by the RUNNER from claim.resume_phase. The executor reads only
+   *  "awaiting_approval": it re-presents the ALREADY-CAPTURED plan (ctx.approvedPlan / the persisted
+   *  plan_md) at the gate WITHOUT running a planning turn — distinct from planApproved, which skips
+   *  the gate entirely for an APPROVED plan; here the plan is not yet approved, so a human still
+   *  approves it, then implementation proceeds on the newly-chosen token. The other phases need no
+   *  new executor code: "implementing" is the existing preApproved skip, "awaiting_input" is driven
+   *  by the existing open_question_id re-park, and "awaiting_followup" collapses to "implementing"
+   *  server-side. Absent/other ⇒ today's behaviour. */
+  resumePhase?: string;
   /** PRD #209 (D4 row 2): this run's plan was supplied EXTERNALLY by the user at create
    *  time (claim plan_source='seeded'), not produced by a Phase-1 planning turn. Set by
    *  the runner. Two effects: it relaxes the pre-approved skip so it fires with NO SDK
@@ -394,6 +405,16 @@ export interface RunContext {
    * no re-arm (the first `now` still drops the turn via ctx.signal).
    */
   onPauseNow?(cb: () => void): void;
+  /**
+   * PRD #1247 M5b: register a RE-ARMABLE interrupt (steering.onCredentialSwitch) the steering
+   * channel invokes when a held-state CREDENTIAL SWITCH is pending for this claim, so a switch drops
+   * the in-flight turn even after the shared abort controller has already fired once — the exact
+   * analog of onPauseNow. The executor passes a callback that trips the current turn with
+   * REASON_CREDENTIAL_SWITCH, so driveTurn throws a CredentialSwitchSignal that propagates to the
+   * runner's release state machine. Absent on the stub/test executors ⇒ no re-arm (the first switch
+   * still drops the turn via ctx.signal's CredentialSwitchSignal abort reason).
+   */
+  onCredentialSwitch?(cb: () => void): void;
   /**
    * PRD #517 M3: park an INTERACTIVE task run after a clean `signal_done`, waiting for the
    * next follow-up. The runner's implementation (a) reports `awaiting_followup` and verifies

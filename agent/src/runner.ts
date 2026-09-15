@@ -45,6 +45,7 @@ import { rmTreeForce } from "./rmtree.js";
 import {
   SteeringChannel,
   PauseNowSignal,
+  CredentialSwitchSignal,
   type AnswerVerdict,
   type PlanVerdict,
 } from "./steering.js";
@@ -85,6 +86,14 @@ const TERMINAL_RUN_STATUSES = new Set(["cancelled", "completed", "failed"]);
  *  A never-verified capture DOES NOT park: enterCompletionHold clears its preserve flags and returns
  *  false, so the run's normal terminal cleanup runs (no park, no leak). */
 const COMPLETION_HOLD_CAPTURE_ATTEMPTS = 3;
+
+/** PRD #1247 M5b (D3): bounded in-call attempts to capture a VERIFIED restore point before a
+ *  held-state credential-switch RELEASE. Mirrors COMPLETION_HOLD_CAPTURE_ATTEMPTS — the same
+ *  retain-and-retry, bounded because it runs synchronously in executeClaim's catch arm. A capture
+ *  that never verifies GIVES UP: enterCredentialSwitch reports `credential_switch_failed`, KEEPS
+ *  the preserve flags (no work loss), and returns "gave_up" so the run is left non-terminal for
+ *  requeue on the still-standing override — the switch is realized at the reclaim boundary. */
+const CREDENTIAL_SWITCH_CAPTURE_ATTEMPTS = 3;
 
 /** PRD #1226 M4 (D5): the STATIC, content-free failure_reason a worker reports when the completion
  *  interlock cannot report completed AND cannot park the run for recovery (the restore point never
@@ -1088,6 +1097,32 @@ export class RunRunner {
         // (normal teardown: the new claim has its own clone). The finally then runs ordinary cleanup.
         runLog.info("run claim superseded server-side (stale_claim); stopping this flight");
         await batcher.close().catch(() => undefined);
+      } else if (err instanceof CredentialSwitchSignal) {
+        // PRD #1247 M5b: a held-state credential switch tripped — from a live turn (the SDK abort /
+        // re-armable interrupt trips driveTurn, which throws CredentialSwitchSignal that propagates
+        // through the implement loop's turn-catch, mirroring PauseNowSignal's plan-turn path at
+        // ~1067) OR from a run idling at the plan gate / a question / a follow-up (steering rejected
+        // the parked waiter with CredentialSwitchSignal). Caught here BEFORE the generic terminal
+        // path so a switch NEVER becomes a `failed` run. Enter the two-phase local release; the
+        // outcome decides nothing more than which log line — enterCredentialSwitch already set the
+        // flight's flags and (on release) reported credential_switch, so NEITHER branch reports a
+        // terminal state.
+        const outcome = await this.enterCredentialSwitch(claim, flight, runLog);
+        if (outcome === "released") {
+          // The flight ends: the finally retires the clone and preserves the HOME; the server
+          // requeued the run; a reclaim resumes at resume_phase on the newly-chosen token. No
+          // terminal report — enterCredentialSwitch already reported credential_switch.
+          runLog.info("credential switch released this claim; leaving the run for a reclaim on the new token");
+        } else {
+          // Gave up (never verified, or the release was not acked queued): leave the run
+          // non-terminal for requeue, exactly like the worker-shutdown-interrupt arm — preserveSession
+          // + preserveRecoveryClone are already set, and NO terminal report is made. The standing
+          // override still applies, so the requeued run's reclaim spends the new token.
+          runLog.info(
+            "credential switch did not release the claim; leaving the run non-terminal for requeue on the standing override",
+          );
+        }
+        await batcher.close().catch(() => undefined); // idempotent (enterCredentialSwitch may have drained)
       } else {
         // failure_reason goes straight to reportState, bypassing the batcher's
         // redactor, and the sdk-executor catch-all re-throws raw SDK errors into this
@@ -2822,6 +2857,9 @@ export class RunRunner {
       {
         notify: (text) =>
           batcher.emit({ kind: "status", agent: "worker", payload: { text } }),
+        // PRD #1247 M5b: the claim's generation, so the poll loop acts on a credential_switch
+        // signal ONLY when it targets THIS claim (a signal for a superseded claim is ignored).
+        claimGeneration,
       },
     );
     // issue #552 M3: a graceful `uzi run stop` (PRD #517 M4) consumed into the worker's
@@ -3559,6 +3597,12 @@ export class RunRunner {
       cancelRequested: () => steering.isCancelled(),
       pauseModeRequested: () => steering.getPauseMode(),
       onPauseNow: (cb) => steering.onPauseNow(cb),
+      // PRD #1247 M5b: re-arm the in-flight turn drop for a held-state credential switch (the
+      // analog of onPauseNow), and restore the gate phase after a switch resume (D13). Absent
+      // resume_phase ⇒ undefined (a fresh run, or an older server), which the executor treats as
+      // today's behaviour.
+      onCredentialSwitch: (cb) => steering.onCredentialSwitch(cb),
+      resumePhase: claim.resume_phase,
       // Persist the SDK session id the moment the executor learns it, so a
       // re-queued run can resume it. Best-effort.
       onSessionId: (sessionId) => {
@@ -5217,6 +5261,126 @@ export class RunRunner {
       head,
     });
     return true;
+  }
+
+  /**
+   * PRD #1247 M5b (D3, D13, D14): enter the held-state CREDENTIAL SWITCH release. Modeled
+   * step-for-step on enterCompletionHold (runner.ts, the reap → set-preserve-flags-up-front →
+   * bounded VERIFIED capture → positive-ack state machine), but its terminal outcome is a REQUEUE,
+   * not a park:
+   *
+   *   1. Reap the agent tree BEFORE any credentialed capture git (REAP-BEFORE-GIT), like
+   *      enterCompletionHold step 1 — idempotent, run()'s finally reaps again.
+   *   2. Set preserveRecoveryClone + preserveSession up front (enterCompletionHold step 2) so a
+   *      failed capture cannot strand the run's only copy of work while the release is uncertain.
+   *   3-5. Capture a VERIFIED local restore point via captureRecoveryRestorePoint (dirty→WIP commit
+   *      required, clean→clean proof, unreadable status→NOT verified; origin publish best-effort),
+   *      bounded retry with waitRecoveryRetry between attempts — enterCompletionHold steps 3-5, but
+   *      using captureRecoveryRestorePoint (the PRD's named capture) rather than captureHoldContext.
+   *   6a. GIVE UP (never verified): report `credential_switch_failed` (best-effort; the server clears
+   *      the switch STAMP but leaves the standing override), KEEP both preserve flags (NO committed
+   *      work is lost), and return "gave_up". The caller leaves the run NON-TERMINAL for requeue,
+   *      exactly like the worker-shutdown-interrupt arm; the standing override still points at the
+   *      new token, so a same-worker reclaim resumes on it.
+   *   6b. VERIFIED capture: DRAIN the batcher FIRST (the server's fenced append only persists while
+   *      claim_released_at IS NULL, so pending messages MUST land before the release moves the run
+   *      to `queued`), THEN report `credential_switch` and REQUIRE ack.status === "queued" — the
+   *      positive-ack contract, exactly as enterCompletionHold requires "paused". A non-"queued" ack
+   *      or a throw (incl. a stale_claim from the reportState closure) is a GIVE-UP: keep the flags,
+   *      return "gave_up" — never assume released.
+   *   7. Only after the queued ack: preserveRecoveryClone=false (the finally RETIRES the clone — a
+   *      cross-worker reclaim re-clones and recovers from the durable tracking ref + best-effort
+   *      origin; work is safe) and parked=true (preserve HOME + plugin dir for a same-worker
+   *      resume); return "released".
+   *
+   * DELIBERATE INTERPRETATION vs the PRD's "continue on the old token in place": the SDK executor
+   * has no primitive to re-drive an aborted turn IN PLACE, so this realizes the switch at the
+   * RECLAIM boundary instead of mid-flight. The verified-capture gate plus the preserved clone/HOME
+   * keep committed work safe on both outcomes, and the standing override makes the reclaim spend the
+   * newly-chosen token — the codebase-idiomatic equivalent of "continue on the old token", with no
+   * committed work lost. Strict continue-in-place would require resuming an aborted SDK session the
+   * executor cannot resume in place.
+   */
+  private async enterCredentialSwitch(
+    claim: ClaimResponse,
+    flight: RunFlight,
+    runLog: Logger,
+  ): Promise<"released" | "gave_up"> {
+    // The generation this switch targets (equals flight.claimGeneration by construction — the
+    // steering channel trips only on a generation match). Logged for provenance; the release
+    // report's claim_generation is stamped by the reportState closure from flight.claimGeneration.
+    const generation = flight.steering.pendingCredentialSwitch();
+    // 1. Reap BEFORE any credentialed capture git (idempotent — run()'s finally reaps again).
+    flight.executor.killAgentTree?.();
+    // 2. Retain EVERYTHING up front so an uncertain capture cannot strand the only copy of work.
+    flight.preserveRecoveryClone = true;
+    flight.preserveSession = true;
+    // 3-5. Capture a VERIFIED local restore point, bounded retry (recovery's retain-and-retry).
+    let verified = false;
+    for (let attempt = 0; attempt < CREDENTIAL_SWITCH_CAPTURE_ATTEMPTS; attempt++) {
+      if (flight.active?.shuttingDown) break;
+      try {
+        const result = await this.captureRecoveryRestorePoint(claim, flight, runLog);
+        if (result.verified) {
+          verified = true;
+          break;
+        }
+      } catch (captureError) {
+        runLog.warn("credential switch capture failed; retaining live work for retry", {
+          error: errMessage(captureError),
+        });
+      }
+      if (attempt < CREDENTIAL_SWITCH_CAPTURE_ATTEMPTS - 1) await this.waitRecoveryRetry(flight);
+    }
+    if (!verified) {
+      // 6a. GIVE UP. Report credential_switch_failed (best-effort) so the server clears the switch
+      // stamp; KEEP both preserve flags (no work loss); leave the run non-terminal for requeue.
+      await flight
+        .reportState({ status: "credential_switch_failed" })
+        .catch((e) =>
+          runLog.warn("credential switch: could not report credential_switch_failed", {
+            run_id: flight.runId,
+            error: errMessage(e),
+          }),
+        );
+      runLog.warn(
+        "credential switch: restore point never verified; not releasing (clone + HOME retained for requeue)",
+        { run_id: flight.runId, generation },
+      );
+      return "gave_up";
+    }
+    // 6b. Verified. DRAIN the batcher FIRST — the fenced append persists only while
+    // claim_released_at IS NULL, so every pending message MUST land BEFORE the release requeues the
+    // run. Idempotent with the caller's own close().
+    await flight.batcher.close().catch(() => undefined);
+    // THEN report the RELEASE and REQUIRE the positive `queued` ack. A throw (incl. a stale_claim
+    // from the reportState closure) or a non-queued status ⇒ give up: keep the flags, stay owned.
+    let released = false;
+    try {
+      const ack = await flight.reportState({ status: "credential_switch" });
+      released = ack.status === "queued";
+      if (!released) {
+        runLog.warn("credential switch: server did not requeue the run on release; not releasing", {
+          run_id: flight.runId,
+          server_status: ack.status ?? "unknown",
+        });
+      }
+    } catch (releaseError) {
+      runLog.warn("credential switch: release report failed; not releasing (retained for requeue)", {
+        run_id: flight.runId,
+        error: errMessage(releaseError),
+      });
+    }
+    if (!released) return "gave_up"; // flags stay SET (retain-everything) — never assume released
+    // 7. Released. The work is durable on the worker tracking ref (+ best-effort origin), so RETIRE
+    // the clone (a cross-worker reclaim re-clones); KEEP the HOME (parked) for a same-worker resume.
+    flight.preserveRecoveryClone = false;
+    flight.parked = true;
+    runLog.info(
+      "run released for a credential switch; retiring the clone, preserving HOME for resume",
+      { run_id: flight.runId, generation },
+    );
+    return "released";
   }
 
   /**

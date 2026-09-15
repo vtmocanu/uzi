@@ -99,6 +99,14 @@ export class Worker {
           "completion_interlock_v1",
           "recovery_archive_v1",
           "recovery_archive_v2",
+          // PRD #1247 M5b (D3/protocol §9): this image implements the held-state credential-switch
+          // protocol — it stamps claim_generation on every mutating report (already landed in W2a),
+          // surfaces the credential_switch signal, and performs the two-phase release. Advertised
+          // UNCONDITIONALLY (like completion_interlock_v1): the server then REQUIRES claim_generation
+          // on every mutating report for this worker's fenced claims, which W2a already stamps, so it
+          // is safe to land now. An image WITHOUT this flag keeps working on legacy claims, and the
+          // held-state `set-token` verb 409s naming the worker.
+          "credential_switch_v1",
         ];
         // PRD #1332 D3 (M5A / C2): advertise the Codex harness PROTOCOL capability ONLY
         // after a successful startup runtime probe of the pinned, image-baked Codex
