@@ -397,6 +397,29 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 			dto.MrReworkAutoCap = &capUsed
 		}
 	}
+	// PRD #1247 M1: attach the run's credential attribution journal (D7) and, for a pinned
+	// override, resolve the token label — both need the store, which runToDTO (pure) does
+	// not have. runToDTO already seeded credential_epochs to [] and set the override mode
+	// from the run row. Best-effort like the enrichments below: a lookup error leaves the
+	// journal empty / the label null rather than failing the read of an otherwise-fine run.
+	if epochs, err := h.wsvc.RunCredentialEpochs(r.Context(), run.ID, run.UserID); err != nil {
+		slog.Error("list run credential epochs", "run_id", run.ID, "error", err)
+	} else {
+		dto.CredentialEpochs = credentialEpochsToDTO(epochs)
+	}
+	if dto.CredentialOverride != nil && run.CredentialOverrideSecretID.Valid {
+		if meta, err := h.q.GetUserSecretMetaByID(r.Context(), store.GetUserSecretMetaByIDParams{
+			ID:     uuid.UUID(run.CredentialOverrideSecretID.Bytes),
+			UserID: run.UserID,
+		}); err != nil {
+			if !errors.Is(err, pgx.ErrNoRows) {
+				slog.Error("resolve credential override label", "run_id", run.ID, "error", err)
+			}
+		} else {
+			label := meta.Label
+			dto.CredentialOverride.Label = &label
+		}
+	}
 	// PRD #37 M4-fix: resolve the owner's OWN-source roster here, on the detail read,
 	// so the plan-gate picker sources its "My agent templates" chips from exactly the
 	// roster the approve validator + worker use (allocation-resolved, lead stripped).

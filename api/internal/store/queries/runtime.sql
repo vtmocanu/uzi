@@ -431,8 +431,16 @@ WHERE status = 'online'
 -- production origin is Claude, and writing the literal (rather than relying on the column
 -- DEFAULT) means a future omitted column-list update fails loudly instead of the default
 -- silently masking it. M5A is dark, so no origin resolves Codex here; M5B adds that seam.
-INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve, wait_on_limit, mr_rework_enabled, plan_md, plan_source, agent_source, agent_exclusions, planned_base_commit, require_base_match, model, override_subagent_model, issue_comments, review_comments, required_capabilities, trigger_source, completion_contract_version, harness)
-VALUES (@user_id, @repo_id::uuid, @issue_iid, @issue_title, @issue_description, sqlc.narg('origin_column'), now(), @auto_approve, @wait_on_limit, sqlc.narg('mr_rework_enabled'), sqlc.narg('plan_md'), @plan_source, sqlc.narg('agent_source'), sqlc.narg('agent_exclusions')::jsonb, sqlc.narg('planned_base_commit'), @require_base_match, sqlc.narg('model'), @override_subagent_model, sqlc.narg('issue_comments')::jsonb, sqlc.narg('review_comments')::jsonb, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), @trigger_source, sqlc.narg('completion_contract_version'), 'claude')
+--
+-- 🔴 credential_override_mode / credential_override_secret_id (PRD #1247 M1) are the
+-- silently-omittable per-run credential override (D1), both sqlc.narg — NULL = inherit
+-- the worker binding, byte-identical to a pre-#1247 run. Every M1 caller passes NULL;
+-- a real user choice is wired in M2 (create) / M6 (schedule). Named explicitly per this
+-- query's own "name every column" convention so an unstamped path is visible in a diff
+-- of THIS file, and guarded by a per-path test rather than the compiler (the narg trap
+-- above applies identically).
+INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve, wait_on_limit, mr_rework_enabled, plan_md, plan_source, agent_source, agent_exclusions, planned_base_commit, require_base_match, model, override_subagent_model, issue_comments, review_comments, required_capabilities, trigger_source, completion_contract_version, harness, credential_override_mode, credential_override_secret_id)
+VALUES (@user_id, @repo_id::uuid, @issue_iid, @issue_title, @issue_description, sqlc.narg('origin_column'), now(), @auto_approve, @wait_on_limit, sqlc.narg('mr_rework_enabled'), sqlc.narg('plan_md'), @plan_source, sqlc.narg('agent_source'), sqlc.narg('agent_exclusions')::jsonb, sqlc.narg('planned_base_commit'), @require_base_match, sqlc.narg('model'), @override_subagent_model, sqlc.narg('issue_comments')::jsonb, sqlc.narg('review_comments')::jsonb, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), @trigger_source, sqlc.narg('completion_contract_version'), 'claude', sqlc.narg('credential_override_mode'), sqlc.narg('credential_override_secret_id'))
 RETURNING *;
 
 -- name: GetRunByIDForUser :one
@@ -1004,6 +1012,34 @@ SET anthropic_secret_id     = @anthropic_secret_id,
     limit_dead_secret_id    = NULL,
     updated_at = now()
 WHERE id = @id AND user_id = @user_id;
+
+-- name: RecordRunCredentialEpoch :exec
+-- Append the attribution-journal row for one claim (PRD #1247 M1, D7/D14): one row per
+-- (run_id, claim_generation), written by recordRunCredential right after SetRunAnthropicSecret
+-- on a successful open. claim_generation is the run's EXISTING generation (00223, PRD #1349) —
+-- this PRD never increments it — so re-recording the same claim (a retry after a crash before
+-- the payload shipped) is idempotent: the composite PK conflicts and DO UPDATE refreshes the
+-- snapshot fields in place rather than duplicating the epoch. secret_id/label/select_reason are
+-- the credential the claim actually spent; applied_at defaults to now() and is refreshed on a
+-- re-record so it names the last apply of that generation.
+INSERT INTO run_credential_epochs (run_id, claim_generation, secret_id, label, select_reason, applied_at)
+VALUES (@run_id, @claim_generation, sqlc.narg('secret_id'), sqlc.narg('label'), sqlc.narg('select_reason'), now())
+ON CONFLICT (run_id, claim_generation) DO UPDATE
+SET secret_id     = EXCLUDED.secret_id,
+    label         = EXCLUDED.label,
+    select_reason = EXCLUDED.select_reason,
+    applied_at    = EXCLUDED.applied_at;
+
+-- name: ListRunCredentialEpochs :many
+-- The applied-switch history for one run (PRD #1247 M1, D7): every claim's credential
+-- epoch, oldest generation first, for the run-detail DTO's credential_epochs and for the
+-- M1 live-DB attribution test. Owner-scoped through the run join so a caller cannot read
+-- another user's journal.
+SELECT e.run_id, e.claim_generation, e.secret_id, e.label, e.select_reason, e.applied_at
+FROM run_credential_epochs e
+JOIN runs r ON r.id = e.run_id
+WHERE e.run_id = @run_id AND r.user_id = @user_id
+ORDER BY e.claim_generation ASC;
 
 -- name: SetRunRunning :execrows
 -- claimed/awaiting_approval → running, AND running → running: the worker reports
@@ -3006,13 +3042,13 @@ ON CONFLICT (run_id, seq) DO NOTHING;
 -- order. The persisted log is authoritative; the WS layer (M5) is only a live
 -- cache on top of this.
 -- Column order matches the run_messages table order (the two PRD #99 columns were
--- appended by 00075), so sqlc keeps returning store.RunMessage rather than
--- minting a separate ...Row type.
+-- appended by 00075, claim_generation by PRD #1247's 00230), so sqlc keeps returning
+-- store.RunMessage rather than minting a separate ...Row type.
 -- TO DO IT RIGHT: new columns must be APPENDED to both this SELECT list and
 -- ListRunMessagesForWorkerPage's, in the same order the ALTER TABLE adds them.
 -- Diverge and sqlc mints per-query Row types for BOTH, breaking workersvc.Store's
 -- []store.RunMessage contract (a compile error at cmd/server/main.go).
-SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label
+SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label, claim_generation
 FROM run_messages
 WHERE run_id = @run_id AND seq > @after_seq
 ORDER BY seq ASC;
@@ -3024,7 +3060,7 @@ ORDER BY seq ASC;
 -- Column order is IDENTICAL to ListRunMessagesAfter so the row stays
 -- store.RunMessage. New columns must be APPENDED here AND in ListRunMessagesAfter,
 -- in the same order the ALTER TABLE adds them — see that query's note.
-SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label
+SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label, claim_generation
 FROM run_messages
 WHERE run_id = @run_id AND seq > @after_seq
 ORDER BY seq ASC
@@ -3039,7 +3075,7 @@ LIMIT @lim;
 -- the row stays store.RunMessage. New columns must be APPENDED to ALL THREE of these
 -- queries in the same order the ALTER TABLE adds them — see ListRunMessagesAfter's
 -- note. Diverge and sqlc mints a per-query Row type, breaking that []store.RunMessage.
-SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label
+SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label, claim_generation
 FROM run_messages
 WHERE run_id = @run_id AND seq < @before_seq
 ORDER BY seq DESC
@@ -3239,7 +3275,7 @@ ORDER BY cost_usd DESC, output_tokens DESC, u.id;
 -- ListRunMessagesAfter so sqlc keeps returning store.RunMessage. status carries both
 -- the `init` markers CountRunInitFramesBefore counts and the success result frames;
 -- error carries a failed turn's result frame. This is a few dozen rows per run.
-SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label
+SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label, claim_generation
 FROM run_messages
 WHERE run_id = @run_id AND kind IN ('status', 'error')
 ORDER BY seq ASC;
@@ -3331,7 +3367,7 @@ WHERE r.id = @id AND r.user_id = @user_id AND r.kind <> 'judge';
 -- Column order matches the table (see ListRunMessagesAfter) so the row stays
 -- store.RunMessage. New columns must be APPENDED here AND in ListRunMessagesAfter,
 -- in the same order the ALTER TABLE adds them — see that query's note.
-SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label
+SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label, claim_generation
 FROM run_messages
 WHERE run_id = @run_id AND seq > @after_seq
 ORDER BY seq ASC

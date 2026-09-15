@@ -909,7 +909,18 @@ type Store interface {
 	// unscoped cross-tenant read, so there is deliberately no such query.
 	GetDefaultUserSecretMeta(ctx context.Context, arg store.GetDefaultUserSecretMetaParams) (store.GetDefaultUserSecretMetaRow, error)
 	GetUserSecretMetaByID(ctx context.Context, arg store.GetUserSecretMetaByIDParams) (store.GetUserSecretMetaByIDRow, error)
+	// GetUserSecretMetaByIDOfKind is the kind-SCOPED by-id meta lookup (PRD #1247 M1):
+	// the per-run credential override resolves a specific credential and must confirm it
+	// is an anthropic_token before opening it, without weakening the worker/judge lanes'
+	// non-kind-scoped GetUserSecretMetaByID (D9).
+	GetUserSecretMetaByIDOfKind(ctx context.Context, arg store.GetUserSecretMetaByIDOfKindParams) (store.GetUserSecretMetaByIDOfKindRow, error)
 	SetRunAnthropicSecret(ctx context.Context, arg store.SetRunAnthropicSecretParams) (int64, error)
+	// RecordRunCredentialEpoch appends the per-claim attribution-journal row (PRD #1247
+	// M1, D7/D14), keyed by the run's existing claim_generation; ListRunCredentialEpochs
+	// reads a run's applied-switch history (owner-scoped) for the GetRun DTO via the
+	// RunCredentialEpochs service method.
+	RecordRunCredentialEpoch(ctx context.Context, arg store.RecordRunCredentialEpochParams) error
+	ListRunCredentialEpochs(ctx context.Context, arg store.ListRunCredentialEpochsParams) ([]store.RunCredentialEpoch, error)
 	// Auto-selection (PRD #111 M4): every anthropic_token the user holds, with its
 	// gauge reading and in-flight run count. NOT pre-filtered on auto_eligible — the
 	// eligibility gate lives entirely in autoselect.Classify (D21), and the ranker
@@ -4063,7 +4074,7 @@ func (s *Service) DeleteWorker(ctx context.Context, userID, workerID uuid.UUID) 
 // run is self-contained even if the issue cache is later evicted. A PRD link is no
 // longer required. The one-non-terminal-run-per-issue index rejects a duplicate
 // active run.
-func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *SeededPlan) (store.Run, error) {
+func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *SeededPlan, credOverride *CredentialOverride) (store.Run, error) {
 	// waitOnLimit nil ⇒ inherit the owner's default. It is a *bool rather than a bool
 	// because "the caller said false" and "the caller said nothing" are different
 	// requests, and collapsing them would make every API client that omits the field
@@ -4081,16 +4092,20 @@ func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issue
 	// so it stays in the default lane where subagent pins win.
 	// force (issue #856): threaded straight through so the interactive/CLI caller can
 	// bypass the open-MR dedup with --force; it never affects the active-run gate.
-	return s.createRun(ctx, userID, repoID, issueIID, "manual", description, false, waitOnLimit, mrReworkEnabled, nil, false, force, seed)
+	// credOverride nil ⇒ inherit the worker binding (PRD #1247 M1); the create-time
+	// user choice is wired in M2. Threaded through the signature now so M2 does not
+	// reopen this seam (the freeze).
+	return s.createRun(ctx, userID, repoID, issueIID, "manual", description, false, waitOnLimit, mrReworkEnabled, nil, false, force, seed, credOverride)
 }
 
 // CreateScheduledRun queues a NON-auto-approve scheduled issue run (PRD #241: a timer
 // or label-sweep schedule firing an issue with the plan gate still requiring a human).
 // It is IDENTICAL to CreateRun — same single uzi_label eligibility gate (PRD #764 M1) —
 // and, like every create path, no longer requires a PRD link.
-func (s *Service) CreateScheduledRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, seed *SeededPlan) (store.Run, error) {
+func (s *Service) CreateScheduledRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, seed *SeededPlan, credOverride *CredentialOverride) (store.Run, error) {
 	// false force (issue #856): a scheduled run never bypasses the open-MR dedup.
-	return s.createRun(ctx, userID, repoID, issueIID, "schedule", description, false, waitOnLimit, mrReworkEnabled, model, overrideSubagentModel, false, seed)
+	// credOverride nil ⇒ inherit (PRD #1247 M1); M6 threads the schedule's stored override.
+	return s.createRun(ctx, userID, repoID, issueIID, "schedule", description, false, waitOnLimit, mrReworkEnabled, model, overrideSubagentModel, false, seed, credOverride)
 }
 
 // CreateAutopilotRun queues a run the poller's autopilot detection started on a
@@ -4114,7 +4129,9 @@ func (s *Service) CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UU
 	// express a per-run override, so the run's column stays NULL → inherit the owner
 	// default live, exactly today's behaviour.
 	// false force (issue #856): label-poller autopilot never bypasses the open-MR dedup.
-	return s.createRun(ctx, userID, repoID, issueIID, "autopilot", description, true, nil, nil, nil, false, false, nil)
+	// nil credOverride (PRD #1247 M1): label-poller autopilot has no per-run credential
+	// choice, so it inherits the worker binding exactly as before.
+	return s.createRun(ctx, userID, repoID, issueIID, "autopilot", description, true, nil, nil, nil, false, false, nil, nil)
 }
 
 // CreateScheduledAutopilotRun queues an auto-approve run for a schedule while honouring
@@ -4126,9 +4143,10 @@ func (s *Service) CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UU
 // seam (its interface, fake, and call site) stays byte-identical, so widening the
 // scheduler seam cannot change label-driven autopilot. seed=nil for the same reason as
 // CreateAutopilotRun: autopilot never seeds its plan.
-func (s *Service) CreateScheduledAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool) (store.Run, error) {
+func (s *Service) CreateScheduledAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, credOverride *CredentialOverride) (store.Run, error) {
 	// false force (issue #856): a scheduled autopilot run never bypasses the open-MR dedup.
-	return s.createRun(ctx, userID, repoID, issueIID, "autopilot", description, true /*autoApprove*/, waitOnLimit, mrReworkEnabled, model, overrideSubagentModel, false /*force*/, nil /*seed*/)
+	// credOverride nil ⇒ inherit (PRD #1247 M1); M6 threads the schedule's stored override.
+	return s.createRun(ctx, userID, repoID, issueIID, "autopilot", description, true /*autoApprove*/, waitOnLimit, mrReworkEnabled, model, overrideSubagentModel, false /*force*/, nil /*seed*/, credOverride)
 }
 
 // SeededPlan carries a create-time externally-authored plan and its optional agent
@@ -4157,7 +4175,7 @@ type SeededPlan struct {
 	RequireBase bool
 }
 
-func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, triggerSource string, description string, autoApprove bool, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, force bool, seed *SeededPlan) (store.Run, error) {
+func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, triggerSource string, description string, autoApprove bool, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, force bool, seed *SeededPlan, credOverride *CredentialOverride) (store.Run, error) {
 	// The description cap is enforced HERE, once, so the manual (handler → 422) and
 	// autopilot (poller → too-large comment) paths cannot drift (PRD #19 M5). Checked
 	// first: it is pure input validation, independent of the repo/issue gates below.
@@ -4410,6 +4428,13 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		// this stamps the run interlocked (version 1) before its first claim. Listed
 		// explicitly per runtime.sql's 🔴 silently-omittable-narg warning.
 		CompletionContractVersion: completionContractVersion,
+		// PRD #1247 M1 (D1): the per-run credential override, NULL/NULL for every M1
+		// caller (credOverride nil ⇒ inherit the worker binding, byte-identical to a
+		// pre-#1247 run). Listed explicitly per the same silently-omittable-narg warning:
+		// an omitted Go struct field would compile green and ship NULL, which is correct
+		// here only because NULL *is* the intended M1 value — M2 passes a real override.
+		CredentialOverrideMode:     pgOverrideMode(credOverride),
+		CredentialOverrideSecretID: pgOverrideSecretID(credOverride),
 	})
 	if err != nil {
 		if isUniqueViolation(err) {
@@ -4646,6 +4671,14 @@ func (s *Service) activeRunsPriorityCutoff() pgtype.Timestamptz {
 // pgx.ErrNoRows for a run with no usage — the caller renders that as "no usage".
 func (s *Service) RunUsageTotal(ctx context.Context, runID uuid.UUID) (store.GetRunUsageTotalRow, error) {
 	return s.q.GetRunUsageTotal(ctx, runID)
+}
+
+// RunCredentialEpochs returns one run's applied-switch attribution journal, oldest
+// generation first (PRD #1247 M1, D7), owner-scoped through the query's run join. Empty
+// for a run that has never been claimed. Consumed by the handler's GetRun for the
+// credential_epochs DTO field.
+func (s *Service) RunCredentialEpochs(ctx context.Context, runID, userID uuid.UUID) ([]store.RunCredentialEpoch, error) {
+	return s.q.ListRunCredentialEpochs(ctx, store.ListRunCredentialEpochsParams{RunID: runID, UserID: userID})
 }
 
 // SelfUsage returns the user's own lifetime + last-7-days usage totals and their

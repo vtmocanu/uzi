@@ -216,7 +216,9 @@ func (s *Service) StartRunForUser(ctx context.Context, userID, repoID uuid.UUID,
 	// PRD #841 M2: the caller's per-run mr_rework override (CLI/API) threads straight
 	// through with no owner-default snapshot — the run inherits the owner default live
 	// when it is nil (D1).
-	return s.CreateRun(ctx, userID, repo.ID, issueIID, issue.Description, waitOnLimit, mrReworkEnabled, force, seed)
+	// nil credOverride (PRD #1247 M1): the create-time token choice is wired in M2; M1
+	// inherits the worker binding, byte-identical to today.
+	return s.CreateRun(ctx, userID, repo.ID, issueIID, issue.Description, waitOnLimit, mrReworkEnabled, force, seed, nil)
 }
 
 // StartRunForUserByPath is StartRunForUser keyed by the human repo PATH the chat

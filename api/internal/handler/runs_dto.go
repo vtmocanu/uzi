@@ -134,6 +134,47 @@ func decodeLatestUnmet(raw []byte) []string {
 	return summary.Unmet
 }
 
+// credentialEpochsToDTO maps a run's credential-epoch journal rows to the DTO slice
+// (PRD #1247 M1, D7), oldest generation first (the query orders them). Always returns a
+// non-nil slice ([] over null) so the wire field is never null once enriched. label and
+// select_reason are null-tolerant so a deleted token's history stays readable.
+func credentialEpochsToDTO(rows []store.RunCredentialEpoch) []apitypes.CredentialEpochDTO {
+	out := make([]apitypes.CredentialEpochDTO, 0, len(rows))
+	for _, e := range rows {
+		dto := apitypes.CredentialEpochDTO{
+			ClaimGeneration: e.ClaimGeneration,
+			AppliedAt:       e.AppliedAt.Time,
+		}
+		if e.Label.Valid {
+			l := e.Label.String
+			dto.Label = &l
+		}
+		if e.SelectReason.Valid {
+			sr := e.SelectReason.String
+			dto.SelectReason = &sr
+		}
+		out = append(out, dto)
+	}
+	return out
+}
+
+// credentialSwitchState derives RunDTO.credential_switch from the run row (PRD #1247
+// M1, D14): null when no held-state switch is pending, "released" once the release
+// transition has stamped claim_released_at at-or-after the request, else "requested".
+// The stamp is cleared on apply (the next epoch write), so a present stamp always means
+// a switch is still in flight. Nothing writes these columns in M1, so this returns null
+// for every run today; M4/M5 make it live.
+func credentialSwitchState(r store.Run) *string {
+	if !r.CredentialSwitchRequestedAt.Valid {
+		return nil
+	}
+	state := "requested"
+	if r.ClaimReleasedAt.Valid && !r.ClaimReleasedAt.Time.Before(r.CredentialSwitchRequestedAt.Time) {
+		state = "released"
+	}
+	return &state
+}
+
 // runToDTO maps a bare run row to its wire DTO. priorityClass is the D8 display class
 // (from fn_run_priority_class via a list column or h.runPriorityClass), passed in
 // explicitly so this mapper stays a PURE function of its inputs — no now()/config
@@ -294,6 +335,18 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 		v := int(r.AnthropicHeadroomPct.Int16)
 		dto.AnthropicHeadroomPct = &v
 	}
+	// PRD #1247 M1: the per-run credential override + switch state, mapped from the run
+	// row. Mapped INDEPENDENTLY (like the anthropic fields above): a run can carry an
+	// override with no pending switch and vice versa. The override Label is resolved by
+	// the GetRun enrichment path (runToDTO is pure and cannot read the token row); here it
+	// is null. CredentialEpochs is initialized to [] and filled by the same enrichment —
+	// [] over null so a client reads it unconditionally, mirroring PlanChangedFiles. Every
+	// value stays null/[] in M1 because nothing writes the override columns yet.
+	if r.CredentialOverrideMode.Valid && r.CredentialOverrideMode.String != "" {
+		dto.CredentialOverride = &apitypes.CredentialOverrideDTO{Mode: r.CredentialOverrideMode.String}
+	}
+	dto.CredentialSwitch = credentialSwitchState(r)
+	dto.CredentialEpochs = []apitypes.CredentialEpochDTO{}
 	// PRD #37. A decode error should be impossible (the API validates every write
 	// and both columns carry a jsonb_typeof CHECK); it is logged and treated as
 	// "not reported" rather than failing the read of an otherwise-fine run.
