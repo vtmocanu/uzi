@@ -2093,6 +2093,36 @@ export class GitCache {
   }
 
   /**
+   * PRD #1247 M5b (data-integrity fix) — true iff the runner clone's HEAD commit is a
+   * `wip(park):` marker (its subject starts with WIP_PARK_COMMIT_PREFIX, the same prefix
+   * `commitWipMarker` plants). Read as the RUNNER uid (`runGitAsRunner`, `log -1
+   * --format=%s`) because the clone is runner-owned — a worker-uid read would hit the B2
+   * dubious-ownership boundary. Reading the subject is a pure object read (no working-tree
+   * touch), so no attacker-chosen filter driver fires.
+   *
+   * This SELF-GUARDS `undoWipMarker` at a CONTINUE-IN-PLACE call site: `undoWipMarker` is a
+   * blind `reset --mixed HEAD^` (it does NOT check what HEAD is), so it must run ONLY when
+   * HEAD actually IS a marker. The credential-switch give-up-continue path
+   * (attemptCredentialSwitch → "gave_up") commits a marker via captureRecoveryRestorePoint
+   * on a DIRTY tree but never reseeds, so the marker would otherwise ride into the MR;
+   * gating the undo on this check retires it without threading a `markerCreated` flag out of
+   * the SHARED captureRecoveryRestorePoint. BEST-EFFORT: any error (unreadable clone, missing
+   * HEAD) answers false, so a bad read never triggers a blind reset.
+   */
+  async headIsWipMarker(clonePath: string): Promise<boolean> {
+    try {
+      const subject = await this.runGitAsRunner(clonePath, ["log", "-1", "--format=%s"]);
+      return subject.startsWith(WIP_PARK_COMMIT_PREFIX);
+    } catch (err) {
+      this.log.warn("WIP park marker HEAD check failed (best-effort → not a marker)", {
+        cwd: clonePath,
+        error: gitErrorMessage(err),
+      });
+      return false;
+    }
+  }
+
+  /**
    * The unified diff of the reviewed `branch` against `base` (three-dot: the changes on
    * `branch` since it diverged from `base`), for a PRD #400 M4b diff-review run. `branch` is
    * resolved as the bare's remote-tracking ref (`refs/remotes/origin/<name>`, which every
