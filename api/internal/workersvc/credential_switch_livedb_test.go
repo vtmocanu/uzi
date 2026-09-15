@@ -633,3 +633,62 @@ func TestReleaseCredentialSwitchReleasedConjunctLiveDB(t *testing.T) {
 		t.Fatalf("budget_paused_seconds re-banked (%d -> %d): the conjunct must prevent a re-release", before.BudgetPausedSeconds, run.BudgetPausedSeconds)
 	}
 }
+
+// TestConsumeInputsConsumeNothingWhilePendingLiveDB is the transport half's consume-nothing rule
+// (PRD #1247 M5, step 2): while a credential switch is pending for the run's CURRENT claim,
+// ConsumeInputs returns the worker-facing switch signal and DRAINS NOTHING — ConsumeRunInputs marks
+// rows consumed on read, so a buffered follow_up that would otherwise race the release stays
+// UNCONSUMED for the reclaim. Once the claim is released for this generation the signal clears and
+// the same input drains normally.
+func TestConsumeInputsConsumeNothingWhilePendingLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	svc := New(env.q, env.box, testParams())
+	o := seedReevalOwner(t, env, BindModeAuto, false)
+	wkr := store.Worker{ID: o.workerID, UserID: o.userID}
+	g := int64(12)
+
+	// A running run held by o's worker with a switch pending for the current claim (stamp at g),
+	// plus a buffered follow_up the pending switch must NOT drain.
+	id := seedHeldRun(t, env, o, 6000, "running", g, true, false)
+	env.exec(`INSERT INTO run_user_inputs (run_id, kind, body) VALUES ($1, 'follow_up', 'an answer that races the switch')`, id)
+
+	unconsumed := func() int {
+		var n int
+		if err := env.pool.QueryRow(env.ctx, `SELECT count(*) FROM run_user_inputs WHERE run_id = $1 AND consumed_at IS NULL`, id).Scan(&n); err != nil {
+			t.Fatalf("count unconsumed: %v", err)
+		}
+		return n
+	}
+
+	// (a) Pending switch → signal returned, nothing drained, the buffered row survives.
+	res, err := svc.ConsumeInputs(env.ctx, wkr, id)
+	if err != nil {
+		t.Fatalf("ConsumeInputs (pending switch): %v", err)
+	}
+	if res.CredentialSwitch == nil || res.CredentialSwitch.Generation != g {
+		t.Fatalf("credential_switch = %+v, want generation %d", res.CredentialSwitch, g)
+	}
+	if len(res.Inputs) != 0 {
+		t.Fatalf("inputs = %v, want none drained while a switch is pending", res.Inputs)
+	}
+	if unconsumed() != 1 {
+		t.Fatalf("unconsumed rows = %d, want the buffered follow_up STILL present (consume-nothing)", unconsumed())
+	}
+
+	// (b) After the claim is released for this generation, the signal clears and the same input
+	// drains normally.
+	env.exec(`UPDATE runs SET claim_released_at = now() WHERE id = $1`, id)
+	res2, err := svc.ConsumeInputs(env.ctx, wkr, id)
+	if err != nil {
+		t.Fatalf("ConsumeInputs (after release): %v", err)
+	}
+	if res2.CredentialSwitch != nil {
+		t.Fatalf("credential_switch = %+v, want nil after release", res2.CredentialSwitch)
+	}
+	if len(res2.Inputs) != 1 || res2.Inputs[0].Kind != "follow_up" {
+		t.Fatalf("inputs = %+v, want the buffered follow_up drained", res2.Inputs)
+	}
+	if unconsumed() != 0 {
+		t.Fatalf("unconsumed rows = %d, want 0 after the normal drain", unconsumed())
+	}
+}

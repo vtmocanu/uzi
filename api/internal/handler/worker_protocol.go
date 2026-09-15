@@ -903,10 +903,23 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 		// run opted out) are server-side FAILURES delivered as 200s with
 		// status: "failed", where applied is TRUE. An applied-keyed branch leaks the
 		// disk on exactly those.
-		httpx.JSON(w, http.StatusConflict, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock())})
+		httpx.JSON(w, http.StatusConflict, h.workerStateAck(r, run))
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock())})
+	httpx.JSON(w, http.StatusOK, h.workerStateAck(r, run))
+}
+
+// workerStateAck builds the state-report ack body: the run DTO plus, when a held-state switch is
+// pending for the run's CURRENT claim, the worker-facing credential_switch signal (PRD #1247 M5,
+// D3/D4). It is shared by the 200 ack and the ORDINARY not-applied 409 ack — both hand back a run
+// the worker may still be holding, so both must carry the switch signal. It is deliberately NOT
+// used for the stale_claim 409 disposition, which already tells the worker to STOP the flight.
+func (h *Handler) workerStateAck(r *http.Request, run store.Run) map[string]any {
+	ack := map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock())}
+	if sig := workersvc.PendingCredentialSwitchSignal(run); sig != nil {
+		ack["credential_switch"] = sig
+	}
+	return ack
 }
 
 // WorkerRunInputs consumes and returns any pending steering inputs, FIFO.
@@ -920,7 +933,7 @@ func (h *Handler) WorkerRunInputs(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	inputs, err := h.wsvc.ConsumeInputs(r.Context(), wkr, runID)
+	res, err := h.wsvc.ConsumeInputs(r.Context(), wkr, runID)
 	if err != nil {
 		if errors.Is(err, workersvc.ErrRunNotOwned) {
 			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
@@ -930,7 +943,20 @@ func (h *Handler) WorkerRunInputs(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"inputs": inputs})
+	// inputs is ALWAYS an array (never nil) — the consume-nothing path returns an empty slice.
+	inputs := res.Inputs
+	if inputs == nil {
+		inputs = []workersvc.InputDTO{}
+	}
+	body := map[string]any{"inputs": inputs}
+	// PRD #1247 M5 (D3/D4, step 2): surface the held-state switch signal on EVERY inputs
+	// response — including an empty-inputs poll (the idle gate/question/follow-up waiters poll
+	// this route continuously) — so the worker holding the current claim learns a switch was
+	// requested and begins its local release. Omitted when no switch is pending for this claim.
+	if res.CredentialSwitch != nil {
+		body["credential_switch"] = res.CredentialSwitch
+	}
+	httpx.JSON(w, http.StatusOK, body)
 }
 
 // WorkerRunOwnership returns the current status of a run this worker owns —
