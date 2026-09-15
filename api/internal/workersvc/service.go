@@ -3387,21 +3387,33 @@ type ConsumeInputsResult struct {
 // separate ack), so a worker crash right after the GET drops that input — an
 // accepted MVP trade-off for the steering channel (the user can re-send).
 //
-// CONSUME-NOTHING RULE (PRD #1247 M5, step 2): when a credential switch is pending for the
-// run's CURRENT claim, this returns the switch signal and DRAINS NOTHING — it does not call
-// ConsumeRunInputs, which marks rows consumed on read. A racing answer/follow-up therefore stays
-// unconsumed for the reclaim, rather than being drained (and dropped) during the release the
-// worker is about to perform. Once the switch is released or reclaimed the signal clears and the
-// normal drain resumes.
+// CONSUME-NOTHING RULE (PRD #1247 M5, step 2): the buffered inputs of a run whose claim is being
+// switched are earmarked for the RECLAIM, and this drains NOTHING until that reclaim happens. Two
+// windows are fenced, both server-side (never on worker discipline):
+//
+//   - a switch is PENDING for the current claim (PendingCredentialSwitchSignal != nil): return the
+//     signal and drain nothing, so a racing answer/follow-up stays unconsumed for the reclaim
+//     rather than being drained (and dropped) during the release the worker is about to perform.
+//   - the claim has been RELEASED and not yet reclaimed (claim_released_at set): the old worker
+//     still passes the worker_id-only ownership check in this window, and the signal has already
+//     cleared, so without this fence a stray poll from the departing worker would drain the very
+//     rows the reclaim must see. Drain nothing here too. The drain resumes only after ClaimRun
+//     reclaims the run (which clears claim_released_at and bumps the generation).
 func (s *Service) ConsumeInputs(ctx context.Context, wkr store.Worker, runID uuid.UUID) (ConsumeInputsResult, error) {
 	run, err := s.runOwnedByWorker(ctx, runID, wkr)
 	if err != nil {
 		return ConsumeInputsResult{}, err
 	}
 	if sig := PendingCredentialSwitchSignal(run); sig != nil {
-		// Consume-nothing: return the signal and drain no rows, so a racing answer/follow-up
-		// survives unconsumed for the reclaim (PRD #1247 M5, step 2).
+		// Pending switch: signal + no drain, so a racing answer/follow-up survives for the reclaim.
 		return ConsumeInputsResult{CredentialSwitch: sig}, nil
+	}
+	if run.ClaimReleasedAt.Valid {
+		// Released-but-not-reclaimed: claim_released_at is set ONLY by ReleaseCredentialSwitch and
+		// cleared ONLY by ClaimRun, so a valid value here means exactly "a credential switch
+		// released this claim and the reclaim has not happened yet." The buffered inputs belong to
+		// that reclaim; fence the drain (no signal — the switch for this claim is already released).
+		return ConsumeInputsResult{}, nil
 	}
 	rows, err := s.q.ConsumeRunInputs(ctx, runID)
 	if err != nil {
