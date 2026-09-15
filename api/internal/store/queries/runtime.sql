@@ -2378,6 +2378,32 @@ UPDATE runs SET
 WHERE id = @id AND worker_id = @worker_id
   AND status NOT IN ('completed', 'failed', 'cancelled');
 
+-- name: SupersedeRunByWorker :execrows
+-- Issue #1117: a LIVE mr_rework worker whose finalize push was rejected non-fast-forward
+-- because a concurrent same-branch writer (a human / uzi-watcher landing review fixes)
+-- advanced the MR branch under it reports `failed` + branch_moved. SetState's failed arm
+-- routes HERE (guarded on kind='mr_rework') instead of SetRunFailed, so a benign, expected
+-- race is NOT mis-classified as 'agent_failure' (and is not judged — status 'cancelled',
+-- Gate 0). Distinct from CancelRunByWorker in that it STAMPS stop_kind='branch_moved' +
+-- a static stop_reason in the same statement (branch_moved has no pre-stamp, unlike a
+-- CreateStopVerdictInput cancel). Terminal cleanup + guard mirror CancelRunByWorker, so a
+-- report onto an already-terminal run is a 0-row no-op.
+UPDATE runs SET
+    status             = 'cancelled',
+    stop_kind          = 'branch_moved',
+    stop_reason        = 'The MR branch was advanced by a concurrent writer, so this rework was superseded and not applied. The branch and the concurrent commits are intact.',
+    status_since       = now(),
+    fail_origin        = NULL,
+    move_pending_since = now(),
+    finished_at        = now(),
+    milestones_in_progress = NULL,
+    milestones_agents = NULL,
+    pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at         = now()
+WHERE id = @id AND worker_id = @worker_id
+  AND status NOT IN ('completed', 'failed', 'cancelled');
+
 -- name: FailRunAutoStop :execrows
 -- Server-side auto-stop (PRD #108 M5) for a run whose message writes are in a
 -- confirmed permanent-failure loop AND which has no live poller to consume a stop
