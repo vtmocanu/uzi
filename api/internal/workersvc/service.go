@@ -692,6 +692,11 @@ type Store interface {
 	// converging with CancelRunServerSide — rather than being mis-classified as
 	// agent_failure. Worker-scoped because SetState holds a worker, not a user.
 	CancelRunByWorker(ctx context.Context, arg store.CancelRunByWorkerParams) (int64, error)
+	// SupersedeRunByWorker (issue #1117) is the live-worker terminal transition for an
+	// mr_rework run whose finalize push lost to a concurrent same-branch writer: status
+	// 'cancelled', stop_kind='branch_moved', fail_origin NULL, a static stop_reason. Like
+	// CancelRunByWorker it is worker-scoped and a 0-row no-op onto an already-terminal run.
+	SupersedeRunByWorker(ctx context.Context, arg store.SupersedeRunByWorkerParams) (int64, error)
 	RejectRunServerSide(ctx context.Context, arg store.RejectRunServerSideParams) (int64, error)
 	// FailRunAutoStop is the server-side half of PRD #108 M5's auto-stop. Unlike
 	// its two neighbours it takes no user_id: it is driven by the sweeper, not by a
@@ -2167,6 +2172,13 @@ type StateRequest struct {
 	// normal completion stay byte-identical on the wire. httpx.DecodeJSON rejects unknown
 	// fields, so this field MUST exist here or a new worker's report 400s.
 	ScopeCapped *bool `json:"scope_capped"`
+	// BranchMoved (issue #1117) is the worker's DECLARATION, on an mr_rework `failed` report,
+	// that the finalize push was rejected non-fast-forward because a concurrent same-branch
+	// writer advanced the MR branch. UNTRUSTED like ScopeCapped: the server honors it ONLY when
+	// the run's own kind is mr_rework (owned.Kind == runkind.MRRework), routing to a
+	// 'cancelled'/'branch_moved' disposition instead of defaulting to 'agent_failure'. Absent/
+	// false on every other report ⇒ byte-identical to before.
+	BranchMoved *bool `json:"branch_moved"`
 	// RepoAgents is the roster the worker parsed from the clone's .claude/agents/
 	// (PRD #37), reported on the first `running` report after checkout. A POINTER to
 	// a slice, because the three states differ: absent (nil) = this report says
@@ -2685,6 +2697,18 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 				FailOrigin:     pgconv.TextOrNull("plan_rejected"),
 				PreservedPatch: clampWirePreservedPatch(req.PreservedPatch),
 				SessionID:      sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
+			})
+		case req.BranchMoved != nil && *req.BranchMoved && owned.Kind == runkind.MRRework:
+			// Issue #1117: an mr_rework finalize push rejected non-fast-forward because a concurrent
+			// same-branch writer advanced the MR branch is a benign, expected race (the "double-fix
+			// collision" the uzi-watcher warns about), NOT an agent failure. Route to a distinct
+			// 'cancelled'/stop_kind='branch_moved' disposition (fail_origin NULL, not judged — Gate 0)
+			// rather than the agent_failure default. GUARDED on the run's own kind (a server-known fact,
+			// like ScopeCapped's scope_ceiling guard) so an untrusted worker cannot mint the benign
+			// disposition on any other kind. Placed after the operator-stop arms so a concurrent operator
+			// cancel/stop (which pre-stamped owned.StopKind) still wins.
+			rows, err = s.q.SupersedeRunByWorker(ctx, store.SupersedeRunByWorkerParams{
+				ID: runID, WorkerID: pgconv.UUID(wkr.ID),
 			})
 		default:
 			// PRD #69 M7a: stamp the TRUSTED failure class. The worker-reported origin is

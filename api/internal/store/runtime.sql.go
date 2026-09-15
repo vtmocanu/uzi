@@ -9454,6 +9454,46 @@ func (q *Queries) StampCompletionBudgetExhausted(ctx context.Context, arg StampC
 	return result.RowsAffected(), nil
 }
 
+const supersedeRunByWorker = `-- name: SupersedeRunByWorker :execrows
+UPDATE runs SET
+    status             = 'cancelled',
+    stop_kind          = 'branch_moved',
+    stop_reason        = 'The MR branch was advanced by a concurrent writer, so this rework was superseded and not applied. The branch and the concurrent commits are intact.',
+    status_since       = now(),
+    fail_origin        = NULL,
+    move_pending_since = now(),
+    finished_at        = now(),
+    milestones_in_progress = NULL,
+    milestones_agents = NULL,
+    pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at         = now()
+WHERE id = $1 AND worker_id = $2
+  AND status NOT IN ('completed', 'failed', 'cancelled')
+`
+
+type SupersedeRunByWorkerParams struct {
+	ID       uuid.UUID   `json:"id"`
+	WorkerID pgtype.UUID `json:"worker_id"`
+}
+
+// Issue #1117: a LIVE mr_rework worker whose finalize push was rejected non-fast-forward
+// because a concurrent same-branch writer (a human / uzi-watcher landing review fixes)
+// advanced the MR branch under it reports `failed` + branch_moved. SetState's failed arm
+// routes HERE (guarded on kind='mr_rework') instead of SetRunFailed, so a benign, expected
+// race is NOT mis-classified as 'agent_failure' (and is not judged — status 'cancelled',
+// Gate 0). Distinct from CancelRunByWorker in that it STAMPS stop_kind='branch_moved' +
+// a static stop_reason in the same statement (branch_moved has no pre-stamp, unlike a
+// CreateStopVerdictInput cancel). Terminal cleanup + guard mirror CancelRunByWorker, so a
+// report onto an already-terminal run is a 0-row no-op.
+func (q *Queries) SupersedeRunByWorker(ctx context.Context, arg SupersedeRunByWorkerParams) (int64, error) {
+	result, err := q.db.Exec(ctx, supersedeRunByWorker, arg.ID, arg.WorkerID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const sweepClaimedNeverStarted = `-- name: SweepClaimedNeverStarted :many
 
 UPDATE runs SET status = 'queued', status_since = now(),
