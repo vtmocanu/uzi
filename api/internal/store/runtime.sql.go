@@ -6625,6 +6625,57 @@ func (q *Queries) NewestRunForMR(ctx context.Context, arg NewestRunForMRParams) 
 	return i, err
 }
 
+const promoteLimitWaitRunNow = `-- name: PromoteLimitWaitRunNow :execrows
+UPDATE runs SET
+    status     = 'queued',
+    status_since = now(),
+    started_at = NULL,
+    budget_paused_seconds = 0,
+    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE id = $1 AND user_id = $2 AND status = 'limit_wait'
+`
+
+type PromoteLimitWaitRunNowParams struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+// The SINGLE-ROW early promote of ONE owner's limit_wait run for `uzi run set-token`
+// (PRD #1247 M4, D4). The owner chose a new credential for THIS run, so it is returned to
+// `queued` at once WITHOUT waiting for retry_not_before — that stamp gates the sweeper's
+// PromoteLimitWaitRuns pass, not this deliberate owner action, so this statement does NOT
+// carry the `retry_not_before <= @now` guard.
+//
+// 🔴 ITS MUTATION SET MUST STAY EXACTLY PromoteLimitWaitRuns' SET CLAUSE, column for
+// column, and a column-parity test (store/promote_limit_wait_now_parity_test.go) pins the
+// two queries together, naming every mutated column. The reasons each column moves are
+// documented on PromoteLimitWaitRuns above and are not repeated here; the short of it:
+// started_at = NULL gives the resumed run a FRESH wall (Decision 6d) so it cannot time out
+// on its first report, budget_paused_seconds = 0 clears the pause banked against the old
+// baseline, the codex cap is revoked + epoch bumped (PRD #1147 F7), and health is reset so
+// the detector re-evaluates from the fresh status_since.
+//
+// 🔴 AND IT MUST PRESERVE worker_id, session_id, last_seq, EVERY limit field,
+// limit_dead_secret_id, retry_not_before and both retry counters — none of them appear in
+// the SET clause, so they are left in place. That is load-bearing: claimExclude
+// (secretchoice.go) keeps EXCLUDING the still-dead token while its window
+// (retry_not_before) is closed, so the early-promoted run's next `auto` claim re-picks the
+// newly-chosen credential rather than the one it just exhausted. limit_wait_count is left
+// as history (this is not a new park), so RUN_LIMIT_MAX_WAITS still bounds thrash.
+//
+// Owner- and status-scoped (user_id + status = 'limit_wait'): a run that moved out of
+// limit_wait between the verb's read and this write is a 0-row no-op the service surfaces
+// as a 409 (raced), and a foreign run can never be promoted.
+func (q *Queries) PromoteLimitWaitRunNow(ctx context.Context, arg PromoteLimitWaitRunNowParams) (int64, error) {
+	result, err := q.db.Exec(ctx, promoteLimitWaitRunNow, arg.ID, arg.UserID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const promoteLimitWaitRuns = `-- name: PromoteLimitWaitRuns :many
 UPDATE runs SET
     status     = 'queued',
@@ -6757,6 +6808,47 @@ type PromotePoolWaitRunParams struct {
 // status predicate also makes a re-delivered or racing promote inert once the run has moved.
 func (q *Queries) PromotePoolWaitRun(ctx context.Context, arg PromotePoolWaitRunParams) (int64, error) {
 	result, err := q.db.Exec(ctx, promotePoolWaitRun, arg.ID, arg.UserID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const promoteRecoveryWaitRunNow = `-- name: PromoteRecoveryWaitRunNow :execrows
+UPDATE runs SET
+    status     = 'queued',
+    status_since = now(),
+    started_at = NULL,
+    budget_paused_seconds = 0,
+    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE id = $1 AND user_id = $2 AND status = 'recovery_wait'
+`
+
+type PromoteRecoveryWaitRunNowParams struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+// The SINGLE-ROW early promote of ONE owner's recovery_wait run for `uzi run set-token`
+// (PRD #1247 M4, D4). Mirrors PromoteRecoveryWaitRuns' mutation set field-for-field, but
+// for one owner+run and WITHOUT the recovery_retry_not_before guard — the owner chose a
+// new credential, so the run is returned to `queued` at once rather than sleeping to the
+// capped recovery cadence.
+//
+// started_at = NULL (fresh wall, so it cannot time out on its first report),
+// budget_paused_seconds = 0, the codex cap revoked + epoch bumped, health reset — all
+// exactly as PromoteRecoveryWaitRuns. session_id, worker_id, recovery_wait_count and
+// recovery_retry_not_before are LEFT IN PLACE as affinity/history (recovery_wait carries no
+// lifetime cap and this is not a new park). recovery_wait is not a usage limit, so there is
+// no limit_dead_secret_id to preserve here.
+//
+// Owner- and status-scoped (user_id + status = 'recovery_wait'): a run that moved out of
+// recovery_wait between the verb's read and this write is a 0-row no-op the service
+// surfaces as a 409 (raced), and a foreign run can never be promoted.
+func (q *Queries) PromoteRecoveryWaitRunNow(ctx context.Context, arg PromoteRecoveryWaitRunNowParams) (int64, error) {
+	result, err := q.db.Exec(ctx, promoteRecoveryWaitRunNow, arg.ID, arg.UserID)
 	if err != nil {
 		return 0, err
 	}
@@ -8565,6 +8657,51 @@ func (q *Queries) SetRunCompletionHold(ctx context.Context, arg SetRunCompletion
 		&i.CredentialSwitchGeneration,
 	)
 	return i, err
+}
+
+const setRunCredentialOverride = `-- name: SetRunCredentialOverride :execrows
+UPDATE runs SET
+    credential_override_mode = $1,
+    credential_override_secret_id = $2,
+    updated_at = now()
+WHERE id = $3 AND user_id = $4
+`
+
+type SetRunCredentialOverrideParams struct {
+	Mode     pgtype.Text `json:"mode"`
+	SecretID pgtype.UUID `json:"secret_id"`
+	ID       uuid.UUID   `json:"id"`
+	UserID   uuid.UUID   `json:"user_id"`
+}
+
+// Write the per-run credential override columns for `uzi run set-token` (PRD #1247 M4,
+// D4). It is the FIRST write in every writable-state branch of the verb (queued /
+// limit_wait / pool_wait / recovery_wait / paused), before the state-specific
+// transition, and is idempotent: re-writing the same override is harmless, and a
+// transition that then finds 0 rows leaves the override written but the status unchanged.
+//
+// @mode and @secret_id are BOTH nullable (inherit clears both to NULL). A pinned override
+// carries a mode + id; auto/default carry the mode with a NULL id; inherit carries NULL /
+// NULL. The caller resolves them through the one validator (validateCredentialOverride)
+// FIRST, so this statement never sees an unvalidated mode. It does NOT touch status /
+// status_since — it only re-points which credential the next claim spends — so it is not
+// one of the status_since-pairing writers.
+//
+// Owner-scoped (user_id): a foreign run is a 0-row no-op, exactly like the other set-token
+// writes, so the verb cannot re-point a run the caller does not own. The handler has
+// already read the run owner-scoped (GetRunByIDForUser) before reaching here, so a 0-row
+// result at this point means a concurrent delete/transfer, not a missing owner check.
+func (q *Queries) SetRunCredentialOverride(ctx context.Context, arg SetRunCredentialOverrideParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setRunCredentialOverride,
+		arg.Mode,
+		arg.SecretID,
+		arg.ID,
+		arg.UserID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const setRunFailed = `-- name: SetRunFailed :execrows
