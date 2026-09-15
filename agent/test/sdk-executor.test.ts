@@ -4896,4 +4896,60 @@ describe("SdkExecutor provider-transient error handling (issue #1088)", () => {
     assert.strictEqual(err.rateLimitType, "five_hour");
     assert.strictEqual(err.resetsAtMs, IN_5H);
   });
+
+  it("parks (TransientRecoveryError) on a transient 429, like a 529, with no in-process retries", async () => {
+    // The apiErrorStatus === 429 branch of isProviderTransient also routes to the park —
+    // not just 529 (the only status the sibling park tests exercise).
+    const { queryFn } = fakeTurns([[resultApiError(429, "API Error: 429 Too Many Requests")]]);
+    await assert.rejects(
+      new SdkExecutor(nullLogger(), homeDir, fast(queryFn, 0)).run(makeCtx().ctx),
+      (err: unknown) => err instanceof TransientRecoveryError,
+    );
+  });
+
+  it("parks (TransientRecoveryError) on a status-less (null) transport api_error", async () => {
+    // The apiErrorStatus == null branch: an api_error with no HTTP status is a
+    // transport/network failure, so it is retryable and parks, mirroring client.ts isTransient.
+    const { queryFn } = fakeTurns([
+      [
+        {
+          type: "result",
+          subtype: "success",
+          is_error: true,
+          api_error_status: null,
+          terminal_reason: "api_error",
+          session_id: "s",
+        } as unknown as SDKMessage,
+      ],
+    ]);
+    await assert.rejects(
+      new SdkExecutor(nullLogger(), homeDir, fast(queryFn, 0)).run(makeCtx().ctx),
+      (err: unknown) => err instanceof TransientRecoveryError,
+    );
+  });
+
+  it("pins limit-over-transient precedence: a limit-bearing transient 529 throws LimitReachedError, never a provider-transient park", async () => {
+    // The `!limitFacts &&` guard in driveTurn is load-bearing HERE: this terminal is
+    // SIMULTANEOUSLY a genuine provider-transient (terminal_reason:"api_error",
+    // api_error_status:529 → isProviderTransient true) AND limit-bearing (a rejected
+    // rate-limit event with a FUTURE reset → classifyLimitEvidence returns limitFacts).
+    // The limit path must WIN. Folding the guard down to `if (isProviderTransient(terminal))`
+    // would instead throw ProviderTransientError → retry → TransientRecoveryError park,
+    // mislabeling a usage-limit death as a transient outage.
+    const IN_5H = Date.now() + 5 * 60 * 60 * 1000;
+    const { queryFn } = fakeTurns([
+      [
+        rateLimitEvent("rejected", { resetsAt: IN_5H, rateLimitType: "five_hour" }),
+        resultApiError(529, OVERLOADED_529),
+      ],
+    ]);
+    const err = await rejection(
+      new SdkExecutor(nullLogger(), homeDir, fast(queryFn, 2)).run(makeCtx().ctx),
+    );
+    assert.ok(err instanceof LimitReachedError, "the limit death wins over the provider-transient throw");
+    assert.ok(!(err instanceof ProviderTransientError), "not classified as a provider-transient error");
+    assert.ok(!(err instanceof TransientRecoveryError), "not parked as a transient outage");
+    assert.strictEqual(err.rateLimitType, "five_hour");
+    assert.strictEqual(err.resetsAtMs, IN_5H);
+  });
 });
