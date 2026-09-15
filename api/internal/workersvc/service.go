@@ -588,6 +588,10 @@ type Store interface {
 	// /runs + board plan-revise flag (issue #750): the plan-ish message rows for a page of
 	// runs, folded into the is_revising set in Go by planRevisingSet — never in SQL.
 	ListPlanRevisionStateForRuns(ctx context.Context, runIds []uuid.UUID) ([]store.ListPlanRevisionStateForRunsRow, error)
+	// PRD #1247 M5 (D13): the seq of the run's latest submitted-plan frame, fetched only on the
+	// awaiting_approval resume so the worker correlates a buffered approve_plan to the right plan
+	// revision. Off the hot path for every other claim.
+	LatestPlanSeqForRun(ctx context.Context, runID uuid.UUID) (int64, error)
 	// /runs + board + run-view current_activity (PRD #1064 M2): the newest tool_use frame
 	// per run for a page, folded into the "now" line in Go by runactivity.FromFrame.
 	LatestToolUseForRuns(ctx context.Context, runIds []uuid.UUID) ([]store.LatestToolUseForRunsRow, error)
