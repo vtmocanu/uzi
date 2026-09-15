@@ -1,19 +1,30 @@
 ---
-title: Recovering from an empty turn
+title: Recovering from a transient interruption
 order: 111
 audience: user
 ---
 
-# Recovering from an empty turn
+# Recovering from a transient interruption
 
-Sometimes an SDK turn finishes with a reported turn count of zero and no
-model activity, plan, question, or completion. Uzi retries this specific
-empty result a few times in place. If it stays empty, uzi saves a verified
-local recovery checkpoint before parking the run in `recovery_wait`.
+Uzi retries in place and, if the trouble persists, parks the run in
+`recovery_wait` on two kinds of transient interruption:
+
+- A **positively empty SDK turn** — a turn that finishes with a reported
+  turn count of zero and no model activity, plan, question, or completion.
+- A **transient provider error** — the Anthropic API returning 429, 500,
+  502, 503, or 529 (or a status-less transport error).
+
+Uzi retries the interruption a few times in place. If it does not clear,
+uzi saves a verified local recovery checkpoint before parking the run in
+`recovery_wait`.
 
 This recovery is automatic and requires no per-run setting. A missing plan
 after a turn that actually did work, missing turn-count metadata, a real
-timeout, and cancellation are not classified as an empty-result recovery.
+timeout, and cancellation are not classified as a transient recovery.
+
+A **permanent** provider error — for example 401, 403, or 400 (bad
+credentials or a bad request) — is not a transient interruption. The run
+fails fast with an accurate reason and does not park here.
 
 One empty result is routed elsewhere on purpose: if the turn came back empty
 **because that attempt hit a hard usage limit** (its final rate-limit verdict
@@ -72,8 +83,9 @@ a genuine timeout or cancellation.
 
 ## Other waiting states
 
-- `recovery_wait`: a positively empty SDK result persisted through bounded
-  retries. The server retries automatically after a backoff.
+- `recovery_wait`: a positively-empty SDK turn OR a transient provider error
+  persisted through bounded retries. The server retries automatically after a
+  backoff.
 - `limit_wait`: a usage-limit window must reset. See
   [Paused on a usage limit](run-limit-wait.md).
 - `pool_wait`: no token is available in the selected pool. It needs an

@@ -1015,9 +1015,9 @@ func steerState(kind string, consumedAt *time.Time, disposition *string, runStat
 	// PRD #754: a pool_wait run is HELD on an empty token pool, not a usage limit, so its
 	// suffix names the actual reason (distinct copy for a distinct hold).
 	const heldSuffix = " (run held on an empty token pool)"
-	// issue #1197: a recovery_wait run is parked recovering from a transient empty turn,
+	// issue #1197: a recovery_wait run is parked recovering from a transient interruption,
 	// neither a usage limit nor an empty pool, so its suffix names the actual reason.
-	const recoveringSuffix = " (run recovering from a transient empty turn)"
+	const recoveringSuffix = " (run recovering from a transient interruption)"
 	if consumedAt == nil {
 		if terminalRunStatuses[runStatus] {
 			return "not delivered (run finished)"

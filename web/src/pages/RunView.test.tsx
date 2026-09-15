@@ -4451,7 +4451,7 @@ describe("RecoveryWaitPanel (issue #1197)", () => {
     // The park is announced (role=status heading) and the copy explains the automatic
     // resume and the owner's cancel option — distinct from a pooled-token / usage-limit park.
     expect(container.querySelector('[role="status"]')).not.toBeNull();
-    expect(container.textContent).toContain("transient empty model result");
+    expect(container.textContent).toContain("transient interruption");
     expect(container.textContent).toContain("resumes on");
     expect(container.textContent).toContain("cancel");
     // COPY ONLY: no "Resume now" control (no resume-now verb for this park) and no countdown.
@@ -4669,7 +4669,7 @@ describe("RunView park announcement — recovery_wait (issue #1197, a11y)", () =
     });
     expect(region.getAttribute("aria-live")).toBe("polite");
     expect(region.textContent).toBe(
-      "This run paused to recover from a transient empty result and will resume automatically.",
+      "This run paused to recover from a transient interruption and will resume automatically.",
     );
     // Mutation guard: it is the recovery copy, NOT the pool_wait or awaiting_input copy.
     expect(region.textContent).not.toContain("pooled Anthropic token");

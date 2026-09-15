@@ -217,7 +217,7 @@ describe("runBadge taxonomy", () => {
       tone: "warning",
       pulse: false,
     });
-    // NOT a usage-limit / pooled-token park: the title speaks of a transient empty result
+    // NOT a usage-limit / pooled-token park: the title speaks of a transient interruption
     // and an automatic resume, never a reset window or a pooled token.
     if (b.kind === "badge") {
       expect(b.title).toMatch(/resumes automatically/i);

@@ -199,7 +199,7 @@ func newRunLogsCmd(env Env, gf *globalFlags) *cobra.Command {
 								args[0])
 						case statusRecoveryWait:
 							_, _ = fmt.Fprintf(env.Stderr,
-								"run %s recovering — a transient empty turn parked it; still following, it resumes on its own\n",
+								"run %s recovering — a transient interruption parked it; still following, it resumes on its own\n",
 								args[0])
 						default: // statusLimitWait
 							_, _ = fmt.Fprintf(env.Stderr, "run %s %s — still following; it resumes on its own\n",
