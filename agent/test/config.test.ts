@@ -1,5 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import path from "node:path";
 import { loadConfig } from "../src/config.js";
 
 // Minimal env that satisfies loadConfig's required fields.
@@ -152,6 +153,43 @@ describe("loadConfig UZI_HOME_RECLAIM (PRD #108 M6)", () => {
   it("stays ON for the affirmative spellings", () => {
     for (const v of ["1", "true", "yes", "TRUE", " On "]) {
       assert.strictEqual(loadConfig(baseEnv({ UZI_HOME_RECLAIM: v })).homeReclaimEnabled, true, `value ${JSON.stringify(v)}`);
+    }
+  });
+});
+
+// PRD #1391 M1: the outbox knobs. These pin the VALUES (not just "parses to a
+// number"), so a wrong multiplier — a retention window that is hours not days, or a
+// MiB that is really 1000*1000 — fails here rather than shipping silently.
+describe("loadConfig outbox knobs (PRD #1391 M1)", () => {
+  it("applies the documented defaults", () => {
+    const c = loadConfig(baseEnv());
+    assert.strictEqual(c.outboxRetentionMs, 7 * 24 * 3600 * 1000, "default retention is 7 days in ms");
+    assert.strictEqual(c.outboxRunMaxBytes, 64 * 1024 * 1024, "default per-run quota is 64 MiB");
+    assert.strictEqual(c.outboxMaxBytes, 512 * 1024 * 1024, "default worker-total quota is 512 MiB");
+    assert.strictEqual(c.outboxDataDir, path.join("/data", "outbox"), "outbox tree is <dataDir>/outbox");
+  });
+
+  it("derives outboxDataDir from UZI_DATA_DIR", () => {
+    assert.strictEqual(loadConfig(baseEnv({ UZI_DATA_DIR: "/srv/uzi" })).outboxDataDir, path.join("/srv/uzi", "outbox"));
+  });
+
+  it("computes the retention window from the d (days) unit", () => {
+    // 5d must be 5*86_400_000, not 5*3_600_000 (hours) or a bare 5.
+    assert.strictEqual(loadConfig(baseEnv({ WORKER_OUTBOX_RETENTION: "5d" })).outboxRetentionMs, 432_000_000);
+    assert.strictEqual(loadConfig(baseEnv({ WORKER_OUTBOX_RETENTION: "12h" })).outboxRetentionMs, 12 * 3_600_000);
+    assert.strictEqual(loadConfig(baseEnv({ WORKER_OUTBOX_RETENTION: "1d" })).outboxRetentionMs, 86_400_000);
+  });
+
+  it("honors the byte-quota env overrides", () => {
+    const c = loadConfig(baseEnv({ WORKER_OUTBOX_RUN_MAX_BYTES: "1048576", WORKER_OUTBOX_MAX_BYTES: "5242880" }));
+    assert.strictEqual(c.outboxRunMaxBytes, 1_048_576);
+    assert.strictEqual(c.outboxMaxBytes, 5_242_880);
+  });
+
+  it("falls back to the byte-quota defaults on a blank, zero, or non-integer value", () => {
+    for (const v of ["  ", "0", "-1", "1.5"]) {
+      assert.strictEqual(loadConfig(baseEnv({ WORKER_OUTBOX_RUN_MAX_BYTES: v })).outboxRunMaxBytes, 64 * 1024 * 1024);
+      assert.strictEqual(loadConfig(baseEnv({ WORKER_OUTBOX_MAX_BYTES: v })).outboxMaxBytes, 512 * 1024 * 1024);
     }
   });
 });
