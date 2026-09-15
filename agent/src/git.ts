@@ -1441,6 +1441,18 @@ export class GitCache {
     return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
   }
 
+  /** issue #1117: the CURRENT origin-tracking tip of `refs/remotes/origin/<branch>`,
+   *  read WITHOUT fetching, or null when unresolvable. Mirrors {@link trackingTip} but for
+   *  the origin mirror rather than the runner tracking ref. Used at the mr_rework finalize
+   *  push to capture O — the origin branch tip as of clone — BEFORE the detection fetch
+   *  (`fetchDefaultTip`) overwrites that same ref with the fresh remote tip, so the
+   *  concurrent-advance discriminator can compare O against the freshly-fetched tip.
+   *  Best-effort (tryGitStdout): a broken/absent ref answers null rather than throwing. */
+  async originBranchTip(barePath: string, branch: string): Promise<string | null> {
+    const sha = (await this.tryGitStdout(barePath, ["rev-parse", "--verify", `refs/remotes/origin/${branch}^{commit}`])).trim();
+    return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
+  }
+
   /** PRD #122 M6: the tip of the runner clone's own `refs/heads/<branch>` (the agent's
    *  committed work), or null when unresolvable. Read as the RUNNER uid — the clone is
    *  runner-owned, so a worker-uid read would hit the B2 dubious-ownership boundary
@@ -2860,6 +2872,15 @@ export class GitCache {
    *  wins the "strictly descends" branch. */
   private async isAncestor(barePath: string, ancestorRef: string, descendantRef: string): Promise<boolean> {
     return (await this.tryGit(barePath, ["merge-base", "--is-ancestor", ancestorRef, descendantRef])) === 0;
+  }
+
+  /** issue #1117: public delegate to {@link isAncestor} — true when `ancestorRef` is an
+   *  ancestor of (or equal to) `descendantRef`, i.e. `descendantRef` descends from it; any
+   *  failure (a missing ref) answers false. Exposed so the mr_rework finalize path can
+   *  confirm that the freshly-fetched remote tip strictly descends from the origin tip at
+   *  clone (a genuine concurrent-writer advance) rather than a rewound/diverged history. */
+  async isAncestorRef(barePath: string, ancestorRef: string, descendantRef: string): Promise<boolean> {
+    return this.isAncestor(barePath, ancestorRef, descendantRef);
   }
 
   /** issue #781 — true when `ref` shares any history with the default branch, i.e.

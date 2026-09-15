@@ -2000,6 +2000,38 @@ export class RunRunner {
       await reportPushSecretBlocked(reason);
     };
 
+    // issue #1117 — the mr_rework concurrent-writer disposition. An mr_rework run pushes its
+    // rework to the pre-existing MR branch `agent/issue-*` via a non-forced finalize push;
+    // when a concurrent same-branch writer (a human, or uzi-watcher landing review fixes)
+    // advanced that branch under the run, the push is rejected non-fast-forward. Report
+    // `failed` + `branch_moved:true` through the plain reportState wrapper (so the terminal
+    // report is dispositioned for custody/recovery, like failPushSecretBlocked /
+    // failBaseAlignConflict) instead of letting the non-ff rethrow into the generic
+    // agent_failure catch; the server routes it to a non-error cancelled/branch_moved
+    // disposition. NO preserved_patch: the branch and its concurrent commits are intact, so
+    // there is nothing to hand back — the rework was simply superseded. The reason is a fixed
+    // static string (no model output), so no slice/scrub is needed.
+    const failBranchMoved = async () => {
+      batcher.emit({
+        kind: "status",
+        agent: "worker",
+        payload: {
+          text: "the MR branch was advanced by a concurrent writer; this rework was superseded and not applied (the branch and its commits are intact)",
+        },
+      });
+      runLog.info(
+        "run superseded: mr_rework finalize push rejected non-fast-forward because the MR branch was concurrently advanced; reporting branch_moved",
+        { run_id: runId },
+      );
+      await closeBatcher();
+      await reportState({
+        status: "failed",
+        failure_reason:
+          "The MR branch was advanced by a concurrent writer, so this rework was superseded and not applied. The branch and the concurrent commits are intact.",
+        branch_moved: true,
+      });
+    };
+
     // PRD #456 M1: a GitHub run can be merely BEHIND the default branch on
     // .github/workflows/** (main advanced those files after this run's clone base) WITHOUT
     // having touched them. The bot's repo-only PAT push is then rejected atomically —
@@ -2360,6 +2392,46 @@ export class RunRunner {
         if (isPushProtectionRejection(e)) {
           await failPushSecretBlocked();
           return;
+        }
+        // issue #1117 — mr_rework moved-tip detection. A non-forced finalize push of an
+        // mr_rework rework rejected non-fast-forward can mean a concurrent same-branch writer
+        // advanced the MR branch under the run; route that distinct case to the branch_moved
+        // disposition instead of letting it rethrow into the generic agent_failure catch.
+        if (claim.kind === "mr_rework" && isNonFastForwardRejection(e)) {
+          // Capture O — the origin branch tip at clone — BEFORE the detection fetch overwrites
+          // refs/remotes/origin/<branch> with the fresh remote tip. The base is the ORIGIN tip
+          // at clone, NOT runnerClone.baseCommit: on a resume the reseed sets baseCommit to the
+          // tracking tip (ahead of origin), which would fail the ancestor check below and
+          // silently regress a resumed run back to agent_failure.
+          const originAtClone = await this.git
+            .originBranchTip(finalizeBarePath, result.branch)
+            .catch(() => null);
+          let remoteTip: string | null = null;
+          try {
+            remoteTip = await this.git.fetchDefaultTip(
+              finalizeBarePath,
+              result.branch,
+              claim.secrets.forge_pat,
+              claim.repo.clone_url,
+              claim.secrets.forge_username,
+            );
+          } catch {
+            // Fetch failed → fall through to the generic throw (fail-safe): never mislabel a
+            // real problem as benign.
+          }
+          // A genuine concurrent-writer advance: the remote tip changed since our clone AND
+          // strictly descends from it (advanced forward, not rewritten/rewound). Anything else
+          // (unchanged tip, fetch failure, divergent/rewound history) falls through to today's
+          // behavior — never a false positive.
+          if (
+            originAtClone &&
+            remoteTip &&
+            remoteTip !== originAtClone &&
+            (await this.git.isAncestorRef(finalizeBarePath, originAtClone, remoteTip))
+          ) {
+            await failBranchMoved();
+            return;
+          }
         }
         throw e;
       }
