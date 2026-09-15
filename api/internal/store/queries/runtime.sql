@@ -561,6 +561,15 @@ WHERE run_id = ANY(@run_ids::uuid[])
   AND kind IN ('plan', 'plan_revising')
 ORDER BY run_id, seq;
 
+-- name: LatestPlanSeqForRun :one
+-- The seq of the run's latest plan-gate frame ({plan, plan_revising}), for the awaiting_approval
+-- resume_phase (PRD #1247 M5, D13). 0 when the run has emitted no plan frame yet. Backed by
+-- run_messages UNIQUE (run_id, seq).
+SELECT COALESCE(MAX(seq), 0)::bigint AS seq
+FROM run_messages
+WHERE run_id = @run_id::uuid
+  AND kind IN ('plan', 'plan_revising');
+
 -- name: LatestToolUseForRuns :many
 -- The newest tool_use frame per run for a page of runs (PRD #1064 D3, current_activity):
 -- DISTINCT ON (run_id) with ORDER BY run_id, seq DESC yields exactly one row per run —

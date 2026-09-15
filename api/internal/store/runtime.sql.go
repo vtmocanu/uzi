@@ -4246,6 +4246,23 @@ func (q *Queries) InvalidatePriorCompletionPermits(ctx context.Context, arg Inva
 	return result.RowsAffected(), nil
 }
 
+const latestPlanSeqForRun = `-- name: LatestPlanSeqForRun :one
+SELECT COALESCE(MAX(seq), 0)::bigint AS seq
+FROM run_messages
+WHERE run_id = $1::uuid
+  AND kind IN ('plan', 'plan_revising')
+`
+
+// The seq of the run's latest plan-gate frame ({plan, plan_revising}), for the awaiting_approval
+// resume_phase (PRD #1247 M5, D13). 0 when the run has emitted no plan frame yet. Backed by
+// run_messages UNIQUE (run_id, seq).
+func (q *Queries) LatestPlanSeqForRun(ctx context.Context, runID uuid.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, latestPlanSeqForRun, runID)
+	var seq int64
+	err := row.Scan(&seq)
+	return seq, err
+}
+
 const latestToolUseForRuns = `-- name: LatestToolUseForRuns :many
 SELECT DISTINCT ON (run_id) run_id, seq, kind, agent, agent_label, payload, created_at
 FROM run_messages
