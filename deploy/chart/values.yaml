@@ -141,6 +141,30 @@ appPriorityClass:
   # shared-cluster option (eviction survival only, no scheduling-time preemption).
   preemptionPolicy: PreemptLowerPriority
 
+# The database-tier PriorityClass for the chart-managed CNPG Cluster (postgres.*). Rendered
+# only when BOTH this and postgres.enabled are true. The CNPG subchart stamps
+# postgres.cluster.priorityClassName onto its instance pods; this block creates the class
+# that name points at. Why the DB needs one at all: ArgoCD gates the whole release's sync
+# on the CNPG Cluster reporting healthy, so a single Pending replica under node memory
+# pressure blocks every api/web/controller update until it schedules.
+#
+# 🔴 CLUSTER-SCOPED, and the name is PAIRED BY HAND with postgres.cluster.priorityClassName
+# (Helm cannot template a subchart's values). The db-priorityclass template FAILS the render
+# when the two differ. On a release not named `uzi`, set `name` here and the same literal
+# under postgres.cluster.priorityClassName. Shared-cluster caveats as for appPriorityClass.
+dbPriorityClass:
+  enabled: true
+  # Empty ⇒ the chart derives `<release>-db` (release-unique). Must equal
+  # postgres.cluster.priorityClassName; the default there assumes the release is `uzi`.
+  name: ""
+  # 998: below appPriorityClass (999) and workers.priorityClass (1000) by design, so the
+  # database never preempts the api or a worker, but above the priority-0 default so a
+  # Postgres instance outranks co-tenant pods for scheduling and eviction.
+  value: 998
+  # PreemptLowerPriority so an unschedulable replica reclaims room on a full cluster; set
+  # `Never` for eviction survival without scheduling-time preemption.
+  preemptionPolicy: PreemptLowerPriority
+
 # --- api: the Go backend (sole holder of secrets/keys, the DB client) -----------
 api:
   enabled: true
@@ -1274,6 +1298,10 @@ postgres:
     # Cluster-specific (a private registry mirror) -> set in deploy/values/<cluster>.yaml.
     imageName: ""
     imagePullSecrets: []
+    # The PriorityClass the subchart stamps onto every instance pod. Must equal the name
+    # dbPriorityClass renders (`<release>-db`; this default assumes release `uzi`), or the
+    # render fails. Leave empty only with dbPriorityClass.enabled=false.
+    priorityClassName: uzi-db
     storage:
       size: 5Gi
       storageClass: ""        # per-cluster (e.g. standard)

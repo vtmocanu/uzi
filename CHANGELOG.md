@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Changed
+
+- **The chart-managed PostgreSQL (CNPG) instances now carry their own PriorityClass so the database schedules ahead of lower-priority pods under node memory pressure.**
+  The chart creates a cluster-scoped database-tier PriorityClass (`dbPriorityClass`, default value 998, below the app tier at 999 and the hosted-worker class at 1000) and wires it into the CNPG subchart through `postgres.cluster.priorityClassName`, so a Postgres replica is no longer left Pending behind priority-0 co-tenant pods. That matters beyond the database itself: ArgoCD gates the whole release's sync on the CNPG Cluster reporting healthy, so one unschedulable replica used to block every api, web and controller update. The two settings must name the same class (Helm cannot template a subchart's values); the render fails loudly when they differ. Enabled by default whenever `postgres.enabled` is true; on a shared cluster tune the value or set `preemptionPolicy: Never` before deploying.
+
 ## [0.83.0] - 2026-09-13
 
 ### Added

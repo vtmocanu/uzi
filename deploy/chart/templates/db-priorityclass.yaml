@@ -1,0 +1,55 @@
+{{- /*
+  The database-tier PriorityClass for the chart-managed CNPG Cluster.
+
+  Cluster-scoped (scheduling.k8s.io/v1 PriorityClass has NO namespace), gated on BOTH
+  dbPriorityClass.enabled AND postgres.enabled: without the CNPG subchart there is no pod
+  to carry it, so nothing renders. The CNPG `cluster` subchart stamps
+  postgres.cluster.priorityClassName onto every instance pod itself; this template only
+  creates the class that name points at.
+
+  🔴 The subchart CANNOT derive this object's name (Helm never templates a subchart's
+  values), so the two settings must agree by hand. Two guards fail the render instead of
+  shipping a Cluster whose pods are unschedulable with "no PriorityClass named ...":
+    - enabled, but postgres.cluster.priorityClassName differs from the name rendered here;
+    - DISABLED, but postgres.cluster.priorityClassName still names the class this chart
+      would have rendered (the chart default), which ArgoCD would prune out from under the
+      Cluster. Pointing it at an operator-managed class with a different name stays legal.
+
+  value defaults to 998: just below appPriorityClass (999) and workers.priorityClass
+  (1000), so the database never preempts the api or a worker, but above the priority-0
+  default so a Postgres instance outranks co-tenant pods for scheduling and kubelet
+  node-pressure eviction. This matters beyond the pods themselves: ArgoCD gates the whole
+  release's sync on the CNPG Cluster reporting healthy, so ONE Pending replica blocks every
+  api/web/controller update until it schedules (measured 2026-09-15 under node memory
+  starvation). Operator-tunable: raise it above the worker class if a worker must never
+  be able to preempt the database (value is immutable on a live PriorityClass, so a change
+  means delete-and-recreate).
+
+  sync-wave -6 so ArgoCD applies this object before the Cluster (wave -5) that references it.
+*/ -}}
+{{- $name := .Values.dbPriorityClass.name | default (printf "%s-db" .Release.Name) }}
+{{- $wired := toString .Values.postgres.cluster.priorityClassName }}
+{{- if and .Values.postgres.enabled (not .Values.dbPriorityClass.enabled) (eq $wired $name) }}
+{{- fail (printf "dbPriorityClass.enabled is false but postgres.cluster.priorityClassName still names %q, the class this chart would render and ArgoCD would prune. Clear postgres.cluster.priorityClassName, point it at an operator-managed class with a different name, or re-enable dbPriorityClass." $name) }}
+{{- end }}
+{{- if and .Values.dbPriorityClass.enabled .Values.postgres.enabled }}
+{{- if ne $wired $name }}
+{{- fail (printf "dbPriorityClass renders PriorityClass %q but postgres.cluster.priorityClassName is %q. The CNPG subchart cannot derive the name, so set postgres.cluster.priorityClassName to %q (or set dbPriorityClass.name to match it), or set dbPriorityClass.enabled=false." $name $wired $name) }}
+{{- end }}
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "-6"
+value: {{ .Values.dbPriorityClass.value }}
+# HARD-CODED false, never configurable: globalDefault: true would repriority every pod
+# cluster-wide that declares no priorityClassName, far outside uzi's blast radius.
+globalDefault: false
+{{- with .Values.dbPriorityClass.preemptionPolicy }}
+preemptionPolicy: {{ . }}
+{{- end }}
+description: {{ .Values.dbPriorityClass.description | default "Priority for the uzi PostgreSQL (CNPG) instances so the database schedules and survives node memory pressure ahead of lower-priority pods." | quote }}
+{{- end }}
