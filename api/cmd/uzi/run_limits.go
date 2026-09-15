@@ -4,6 +4,7 @@ package main
 // (PRD #1009 M4).
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -132,7 +133,9 @@ func newRunResumeCmd(env Env, gf *globalFlags) *cobra.Command {
 //
 // On a queued run the switch takes effect at the next claim; on a parked run it promotes
 // the run back to queued at once. The server may return a D6 WARNING (no headroom, auto
-// will hold in pool_wait) on the 200 without refusing — it is printed above the detail.
+// will hold in pool_wait) on the 200 without refusing — it is printed to STDERR regardless
+// of --format (mirroring renderCreatedRun), so a scripted/--json consumer still sees the
+// advisory while stdout stays a bare RunDTO.
 func newRunSetTokenCmd(env Env, gf *globalFlags) *cobra.Command {
 	setToken := &cobra.Command{
 		Use:   "set-token <run-id> [<label>]",
@@ -163,12 +166,15 @@ func newRunSetTokenCmd(env Env, gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			// Route the D6 warning to STDERR regardless of --format so a --json consumer
+			// still sees it while stdout stays a bare RunDTO, matching renderCreatedRun's
+			// convention (server strings are sanitized before printing).
+			if warning != "" {
+				_, _ = fmt.Fprintf(env.Stderr, "warning: %s\n", sanitizeTTY(warning))
+			}
 			p := env.printer(gf)
 			if p.Format == uzicli.FormatJSON {
 				return p.JSON(run)
-			}
-			if warning != "" && !gf.quiet {
-				p.Printf("warning: %s\n", warning)
 			}
 			return renderRunDetail(p, run)
 		},
