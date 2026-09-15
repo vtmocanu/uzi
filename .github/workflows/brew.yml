@@ -53,8 +53,13 @@ concurrency:
   # RC tag within minutes, firing two runs that BOTH `git push origin main` into the tap
   # from a fresh clone with no rebase/retry. A per-ref group would let them run
   # concurrently and collide on a non-fast-forward push, reddening one (PRD #1378 R5). One
-  # shared group serializes every tap publish; cancel-in-progress:false so the queued run
-  # still runs (the two channels render different formula files, so ordering is enough).
+  # shared group + cancel-in-progress:false serializes the promote's two publishes: one
+  # runs, the other pends, then runs (the channels render different formula files, so
+  # ordering is enough). A 3rd tag pushed inside that ~3-min window would displace the
+  # single pending slot; `queue: max` (a real GH Actions key since 2026-05-07) would hold
+  # all pending runs, but the pinned actionlint rejects the `queue` key, so it is deferred
+  # until that pin catches up -- and three simultaneous release tags is not a cadence the
+  # RC-first flow produces, while a displaced publish simply re-runs on the tag.
   group: brew-tap-publish
   cancel-in-progress: false
 
