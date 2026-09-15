@@ -776,6 +776,16 @@ export class Outbox {
     return [...this.uncleanAtInit];
   }
 
+  /** Whether the store failed closed at {@link init} (symlinked root, unreadable or
+   *  wrong-size `.key`, `.key`-absent-but-records-present, or a mint failure). While
+   *  disabled every write is a SILENT no-op and drain replays nothing, so a caller
+   *  must treat a disabled store as "no durable store" — the batcher trips rather
+   *  than entering spill, which would drop the whole buffer into the void with no
+   *  trip and no report. */
+  isDisabled(): boolean {
+    return this.disabled;
+  }
+
   // ── manifest / record IO ───────────────────────────────────────────────────────
 
   private runDir(runId: string): string {

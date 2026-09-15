@@ -42,6 +42,27 @@ async function mkOutbox(): Promise<Outbox> {
   return o;
 }
 
+/** An Outbox that FAILED CLOSED at init — its root is a symlink, which `init()`
+ *  refuses (following it would escape /data), so `disabled` is set and every write is
+ *  a silent no-op. Used to prove the batcher trips instead of "spilling" into it. */
+async function mkDisabledOutbox(): Promise<Outbox> {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "batcher-outbox-disabled-"));
+  tmpRoots.push(dir);
+  const real = path.join(dir, "real");
+  await fs.mkdir(real, { recursive: true });
+  const root = path.join(dir, "outbox");
+  await fs.symlink(real, root); // a symlinked root → init disables the store
+  const o = new Outbox({
+    root,
+    log: nullLogger(),
+    runMaxBytes: 64 * 1024 * 1024,
+    maxBytes: 512 * 1024 * 1024,
+    retentionMs: 7 * 86_400_000,
+  });
+  await o.init();
+  return o;
+}
+
 /** A client whose postMessages behaviour a test flips at will: "fail" throws the
  *  given transient/fatal status, "ok" records the landed batch and resolves. Extra
  *  batcher args (generation, signal) are ignored, matching the real call shape. */
@@ -200,6 +221,31 @@ describe("MessageBatcher spill/drain (PRD #1391 M2)", () => {
     await batcher.close();
   });
 
+  it("a DISABLED outbox TRIPS (never silently spills into the void) on a sustained transient outage", async () => {
+    // A disabled store's writes are silent no-ops. If the batcher entered spill against
+    // it, doSpillFlush's appendSegment would "succeed" writing NOTHING while takePrefix
+    // has already removed the batch — the whole buffer silently dropped with no trip and
+    // no onPermanentFailure, and the batcher stuck spilled forever. It must instead TRIP
+    // (a disabled store is "no durable store"), exactly as with no outbox at all.
+    const outbox = await mkDisabledOutbox();
+    assert.strictEqual(outbox.isDisabled(), true, "the symlinked-root store failed closed at init");
+    const api = flippableClient("fail", 503); // a genuine transient (5xx) that today would spill
+    let perm: PermanentFailureInfo | undefined;
+    const batcher = new MessageBatcher(api.client, RUN, 0, 5, nullLogger(), undefined, undefined, {
+      outbox,
+      transientTripMs: 40,
+      onPermanentFailure: (info) => {
+        perm = info;
+      },
+    });
+
+    fill(batcher, 4);
+    await until(() => batcher.isTripped(), 4000, "the batcher trips against a disabled outbox");
+    assert.ok(perm, "the failure is SURFACED via onPermanentFailure — not silently dropped");
+    assert.strictEqual(batcher.isSpilled(), false, "a disabled outbox is never a spill target");
+    await batcher.close();
+  });
+
   it("a message emitted AFTER the spill lands AFTER the spilled ones (ordering held on drain)", async () => {
     const outbox = await mkOutbox();
     const api = flippableClient("fail", 503);
@@ -285,6 +331,84 @@ describe("MessageBatcher spill/drain (PRD #1391 M2)", () => {
     const drained = await collect(outbox, RUN);
     assert.strictEqual(drained.retired, true);
     assert.deepStrictEqual(drained.seqs, [1, 2, 3, 4, 5, 6], "the tail was spilled on close, not dropped");
+  });
+
+  it("a PERIODIC (timer-driven, non-close) spill flush writes the pending dropped-range as a range record BEFORE any close", async () => {
+    // Every spill-cap test above exits via close(), whose finalSpillOnClose has its OWN
+    // range-record write — so a mutation that removed doSpillFlush's appendRangeRecord
+    // call went uncaught. This keeps the batcher OPEN and lets a scheduled doSpillFlush
+    // run, then asserts the range record is on disk BEFORE any close: it pins the
+    // PERIODIC path's range write independently. (Fails if doSpillFlush's
+    // appendRangeRecord call is removed — no range-*.json would appear while open.)
+    const outbox = await mkOutbox();
+    const api = flippableClient("fail", 503);
+    const batcher = new MessageBatcher(api.client, RUN, 0, 5, nullLogger(), undefined, undefined, {
+      outbox,
+      transientTripMs: 40,
+      spillBufferBytes: 1, // so the burst below drops into a pending range
+    });
+
+    fill(batcher, 2, "pre");
+    await until(() => batcher.isSpilled(), 4000, "batcher enters spill");
+    await until(() => (outbox.depthFor(RUN)?.pendingMessages ?? 0) >= 2, 4000, "pre-spill messages land");
+    await sleep(40); // settle: buffer empty, batcher idle
+
+    // While spilled AND OPEN, emit a burst: seq 3 fills the empty buffer and is kept;
+    // seqs 4..7 exceed the 1-byte cap and are folded into the pending range. The
+    // scheduled (timer-driven) doSpillFlush must write that range as a range record.
+    fill(batcher, 5, "burst");
+
+    const runDir = await runDirFor(RUN);
+    let rangeFile: string | undefined;
+    const deadline = Date.now() + 4000;
+    while (Date.now() < deadline) {
+      const names = await fs.readdir(runDir).catch(() => [] as string[]);
+      rangeFile = names.find((n) => n.startsWith("range-") && n.endsWith(".json"));
+      if (rangeFile) break;
+      await sleep(20);
+    }
+    assert.ok(
+      rangeFile,
+      "a periodic (non-close) doSpillFlush must write the pending dropped-range as a range-*.json record",
+    );
+
+    // Only now (assertion already made against the OPEN batcher) do we close, purely to
+    // stop the timer for a clean teardown.
+    await batcher.close();
+  });
+
+  it("a chat run's batcher (generation 0) spills to the outbox and drains correctly", async () => {
+    // The chat lane wires the SAME MessageBatcher with generation 0 (chat has no claim
+    // generation, D6/D10). Pin that this wiring actually spills and round-trips: the
+    // segments replay under generation 0.
+    const outbox = await mkOutbox();
+    const api = flippableClient("fail", 503);
+    const batcher = new MessageBatcher(api.client, RUN, 0, 5, nullLogger(), undefined, undefined, {
+      outbox,
+      generation: 0, // the chat lane's value
+      transientTripMs: 40,
+    });
+
+    fill(batcher, 4, "chat");
+    await until(() => batcher.isSpilled(), 4000, "the chat batcher enters spill");
+    await until(() => outbox.depthFor(RUN)?.pendingMessages === 4, 4000, "all 4 chat messages spilled");
+    assert.strictEqual(batcher.isTripped(), false, "a transient outage spills; it never trips");
+    await batcher.close();
+
+    // Drain, capturing the generation each segment replays under (chat = 0).
+    const gens: number[] = [];
+    const msgs: OutgoingMessage[] = [];
+    const res = await outbox.drainRun(RUN, async (batch, gen) => {
+      gens.push(gen);
+      msgs.push(...batch);
+    });
+    assert.strictEqual(res.retired, true, "the chat run fully retires after the drain");
+    assert.deepStrictEqual(
+      msgs.map((m) => m.seq),
+      [1, 2, 3, 4],
+      "every chat message once, ascending, contiguous",
+    );
+    assert.ok(gens.length > 0 && gens.every((g) => g === 0), "chat segments replay under generation 0");
   });
 });
 

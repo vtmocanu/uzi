@@ -208,10 +208,18 @@ export class Worker {
         this.log.warn("heartbeat failed", { error: errMessage(err) });
       }
       // PRD #1391 M2: the re-arm trigger — on EACH successful heartbeat, drain the
-      // outbox (single-flight). Guarded so a drain error never escapes the heartbeat
-      // loop (mirrors the heartbeat try/catch above).
+      // outbox (single-flight). FIRE-AND-FORGET, like the boot drain: `drainOutbox`
+      // replays the ENTIRE per-run backlog with no time budget, so awaiting it here
+      // could push the next heartbeat past the api's 45s stale cutoff (message POSTs
+      // do not refresh liveness) → the sweeper marks the worker offline and re-queues
+      // its still-running runs (duplicate execution) during the very recovery this
+      // feature exists to handle. The heartbeat must keep ticking on its interval; the
+      // single-flight `draining` guard already makes a tick that fires mid-drain a
+      // no-op. The depth was already assembled and SENT above (before this tick's
+      // drain starts), so it is reported regardless. Guarded so a drain error never
+      // escapes the loop (mirrors the heartbeat try/catch above).
       if (ok) {
-        await this.drainOutbox(signal).catch((err) => {
+        void this.drainOutbox(signal).catch((err) => {
           this.log.warn("outbox drain failed", { error: errMessage(err) });
         });
       }

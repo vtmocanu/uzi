@@ -458,9 +458,12 @@ export class MessageBatcher {
    * has retired this run's spilled segments, and resume normal flushing. The single
    * re-arm trigger; the drainer calls it (via the shared re-arm registry) once
    * {@link Outbox.drainRun} reports the run fully retired. Any in-memory dropped range
-   * not yet written to the outbox becomes network tombstones here, so the re-armed
-   * stream stays contiguous — the outbox is fully drained by the time this is called,
-   * so those are the highest seqs and land last. Idempotent and inert after close.
+   * not yet written to the outbox becomes network tombstones here, PREPENDED to the
+   * buffer ({@link drainPendingRangeToBuffer}), so they flush FIRST — ahead of any
+   * message emitted after the drop. The stream still ends up contiguous: the server is
+   * idempotent on (run_id, seq) and the web client gap-buffers out-of-order seqs, so a
+   * tombstone landing before a lower-or-later seq reassembles correctly. Idempotent and
+   * inert after close.
    */
   rearm(): void {
     if (!this.spilled || this.closed) return;
@@ -876,7 +879,12 @@ export class MessageBatcher {
       error: errMessage(err),
     });
     if (this.failingSince !== undefined && now - this.failingSince >= this.transientTripMs) {
-      if (this.outbox) {
+      // Spill ONLY to a usable store. A DISABLED outbox (failed closed at init) is not
+      // a durable store: its writes are silent no-ops, so "spilling" to it would drop
+      // the whole buffer with no trip and no report. Treat a missing OR disabled outbox
+      // as "no durable store" and TRIP (surfacing the failure), exactly as today with
+      // no outbox at all.
+      if (this.outbox && !this.outbox.isDisabled()) {
         await this.enterSpill(lastSeq);
       } else {
         this.trip(
@@ -897,8 +905,10 @@ export class MessageBatcher {
    */
   private async enterSpill(lastSeq: number): Promise<void> {
     if (this.spilled || this.tripped) return;
-    if (!this.outbox) {
-      this.trip("the api has been unreachable and no outbox is available", lastSeq);
+    // No durable store — absent, or failed closed at init (a disabled store's writes
+    // are silent no-ops). Trip rather than pretend to spill into the void.
+    if (!this.outbox || this.outbox.isDisabled()) {
+      this.trip("the api has been unreachable and no usable outbox is available", lastSeq);
       return;
     }
     try {
@@ -954,7 +964,12 @@ export class MessageBatcher {
           return; // keep the pending range; the finally reschedules
         }
       }
-      while (this.buffer.length > 0 && !this.closed) {
+      // `&& this.spilled` so a rearm() that flips the batcher back to the network
+      // mid-flush (during an await above) stops us appending further segments to the
+      // outbox — otherwise a late segment would be delivered out of order AFTER the
+      // network has re-armed. The remaining buffer flushes over the network; the
+      // finally below reschedules a (now network) flush for it.
+      while (this.buffer.length > 0 && !this.closed && this.spilled) {
         const batch = this.takePrefix();
         if (batch.length === 0) break;
         try {

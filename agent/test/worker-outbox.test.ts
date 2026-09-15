@@ -150,6 +150,57 @@ describe("Worker outbox drainer (PRD #1391 M2)", () => {
     assert.ok(rearmed >= 1, "a retired run re-arms its batcher exactly through the shared registry hook");
   });
 
+  it("the heartbeat-triggered drain is FIRE-AND-FORGET: a slow drain never delays the next heartbeat", async () => {
+    // drainOutbox replays the ENTIRE per-run backlog with no time budget. If the
+    // heartbeat loop AWAITED it, a slow drain would push the next heartbeat past the
+    // api's 45s stale cutoff → the sweeper re-queues still-running runs (duplicate
+    // execution). This proves the heartbeat keeps ticking while a drain is in flight.
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let drainStarted = 0;
+    const outbox = {
+      uncleanRuns: () => [],
+      runsWithPending: () => ["r1"],
+      depthFor: (id: string) => depth(id),
+      drainRun: async () => {
+        drainStarted += 1;
+        // The boot drain (call #1) completes fast so the single-flight guard clears;
+        // the first heartbeat-triggered drain (call #2) blocks on the gate. If the loop
+        // awaited it, heartbeats would stall here.
+        if (drainStarted === 1) return { retired: false, staleRetired: 0 };
+        await gate;
+        return { retired: false, staleRetired: 0 };
+      },
+    } as unknown as Outbox;
+
+    let heartbeats = 0;
+    const controller = new AbortController();
+    const worker = new Worker(
+      fakeConfig(),
+      idleClient(async () => {
+        heartbeats += 1; // every heartbeat SUCCEEDS, so each tick triggers a drain
+      }),
+      idleRunner,
+      idleChat,
+      noJudge,
+      noReview,
+      nullLogger(),
+      okPreflight,
+      outbox,
+      new Map(),
+    );
+    const done = worker.run(controller.signal);
+
+    // Heartbeats must keep advancing while a heartbeat-triggered drain is blocked on the
+    // gate. An awaited drain would freeze the loop at ~1 tick.
+    await pollUntil(() => heartbeats >= 3, 2000, "heartbeats keep firing while the drain is blocked");
+    assert.ok(drainStarted >= 2, "a heartbeat-triggered drain started (call #2) and is still blocked on the gate");
+
+    release();
+    controller.abort();
+    await done;
+  });
+
   it("the BOOT drain runs even when heartbeats never succeed", async () => {
     let drainCalls = 0;
     const outbox = {
