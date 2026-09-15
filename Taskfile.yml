@@ -9,9 +9,10 @@
 #
 # SELF-CONTAINED ON PURPOSE. The GATE is readable here without resolving anything:
 # no gate target (`gate`, `gate:*`, or any target they call) includes or depends on a
-# remote taskfile. The ONE exception is the release-only `brew:` include below (see
-# rule 3) -- pinned to a commit SHA, called only by .github/workflows/brew.yml, and
-# reached by no gate target.
+# remote taskfile. The exceptions are the `brew:` and `brew-rc:` includes below (see rule
+# 3) -- both LOCAL vendored copies of the same reusable brew mechanic (tracking an upstream
+# SHA), reached by no gate target (only the release path and the local brew-local-test.sh
+# harness invoke them).
 #
 # 🔴 FOUR TASKFILE FEATURES ARE BANNED IN THIS FILE. One list, so the next reader
 # sees all of them at once. Each is one line to avoid and expensive to retrofit.
@@ -43,15 +44,18 @@
 #    from being invited back. The self-contained rule above is the style reason;
 #    this is the security one.
 #
-#    THE ONE SANCTIONED EXCEPTION is the `brew:` include below (owner-approved
-#    2026-08-17): `./homebrew-tap.yml`, a VENDORED copy of the reusable mechanic the
-#    sibling formulae (cc-statusline, fj-queue) share. It is deliberately NOT the remote
-#    form the siblings use, and the reason is THIS rule: Task resolves an include EAGERLY
-#    on every `task` call, so a `{{if .CI}}` remote include would fetch over the network
-#    on every GATE job in CI (and fail there without TASK_X_REMOTE_TASKFILES). Vendoring
-#    keeps it (a) reached by no gate target -- only .github/workflows/brew.yml calls it;
-#    (b) local, so no network and no remote code touches any run; (c) reviewable in-repo.
-#    To update, diff against the upstream file named in its header and bump that SHA.
+#    THE SANCTIONED EXCEPTIONS are the `brew:` and `brew-rc:` includes below
+#    (owner-approved 2026-08-17): both reuse `./homebrew-tap.yml`, a VENDORED copy of the
+#    reusable mechanic the sibling formulae (cc-statusline, fj-queue) share. It is
+#    deliberately NOT the remote form the siblings use, and the reason is THIS rule: Task
+#    resolves an include EAGERLY on every `task` call, so a `{{if .CI}}` remote include
+#    would fetch over the network on every GATE job in CI (and fail there without
+#    TASK_X_REMOTE_TASKFILES). Vendoring keeps them (a) reached by no gate target -- only
+#    the release path renders them (`brew:` via .github/workflows/brew.yml, `brew-rc:` via
+#    scripts/brew-local-test.sh and `task brew-rc:formula` until its brew.yml wiring lands
+#    separately); (b) local, so no network and no remote code touches any run; (c)
+#    reviewable in-repo. To update, diff against the upstream file named in its header and
+#    bump that SHA.
 #
 # 4. NO DYNAMIC ROOT `vars:` (`vars: {X: {sh: ...}}`). Those execute on every
 #    invocation, including unrelated targets and a bare `task --list`. Not a hole,
@@ -158,14 +162,17 @@ version: '3'
 
 output: prefixed
 
-# THE ONE SANCTIONED INCLUDE (rule 3), and it is LOCAL, not remote. `./homebrew-tap.yml`
-# is a VENDORED copy of vtmocanu/task's reusable brew mechanic (see its header for the
-# upstream SHA). Task resolves includes EAGERLY on every `task` call, so a remote include
-# would fetch over the network on every gate job in CI and break them; a vendored local
-# file resolves identically everywhere with no network and no remote code. It provides
-# Homebrew formula render + tap publish, run ONLY by .github/workflows/brew.yml on a v*
-# tag, and is reached by no gate target. The formula BODY is Formula/uzi-cli.rb (a
-# template with url/sha256 placeholders); the rendered copy lands in the tap.
+# THE TWO SANCTIONED INCLUDES (rule 3), and they are LOCAL, not remote. Both reuse
+# `./homebrew-tap.yml`, a VENDORED copy of vtmocanu/task's reusable brew mechanic (see its
+# header for the upstream SHA). Task resolves includes EAGERLY on every `task` call, so a
+# remote include would fetch over the network on every gate job in CI and break them; a
+# vendored local file resolves identically everywhere with no network and no remote code.
+# It provides Homebrew formula render + tap publish, reached by no gate target: `brew:` is
+# run by .github/workflows/brew.yml on a v* tag, while `brew-rc:` renders the RC formula
+# and is exercised offline by scripts/brew-local-test.sh and `task brew-rc:formula` (its
+# release-time wiring into brew.yml is a separate maintainer change). The formula BODIES
+# are Formula/uzi-cli.rb and Formula/uzi-cli-rc.rb (two templates with url/sha256
+# placeholders); the rendered copy lands in the tap.
 includes:
   brew:
     taskfile: ./homebrew-tap.yml
@@ -174,6 +181,13 @@ includes:
       GH_REPO: vtmocanu/uzi
       TAP_REPO: vtmocanu/homebrew-tap
       FORMULA_TEMPLATE: Formula/uzi-cli.rb
+  brew-rc:
+    taskfile: ./homebrew-tap.yml
+    vars:
+      NAME: uzi-cli-rc
+      GH_REPO: vtmocanu/uzi
+      TAP_REPO: vtmocanu/homebrew-tap
+      FORMULA_TEMPLATE: Formula/uzi-cli-rc.rb
 
 tasks:
   # ---------------------------------------------------------------- composed --
@@ -764,7 +778,7 @@ tasks:
       - ./scripts/lint-actions-embedded.sh warning 0.11.0
 
   lint:formula:
-    desc: ruby -c over the Homebrew formula (syntax only; needs ruby >= 3.1)
+    desc: ruby -c over both Homebrew formulae (syntax only; needs ruby >= 3.1)
     cmds:
       # 🔴 THIS TARGET CAN SKIP, AND A SKIP IS EXIT 0. /usr/bin/ruby on macOS is
       # 2.6.10 and the formula uses the Ruby >= 3.1 shorthand hash value
@@ -797,6 +811,7 @@ tasks:
       # elsewhere, so the distinction is live -- and copies this file VERBATIM
       # into vtmocanu/homebrew-tap on every v* tag.
       - ./scripts/lint-formula.sh Formula/uzi-cli.rb
+      - ./scripts/lint-formula.sh Formula/uzi-cli-rc.rb
 
   test:e2e-reclaim:
     desc: behavioral test of the e2e leaked-project reclaim safety contract (fake docker, hermetic)
