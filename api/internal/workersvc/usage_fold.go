@@ -9,11 +9,13 @@ import (
 	"log/slog"
 	"math"
 	"math/big"
+	"slices"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -51,6 +53,12 @@ func (s *Service) AppendMessagesForClaim(ctx context.Context, wkr store.Worker, 
 func (s *Service) appendAndRecord(ctx context.Context, wkr store.Worker, runID uuid.UUID, msgs []IncomingMessage, claimGen *int64) error {
 	obs, err := s.appendMessages(ctx, wkr, runID, msgs, claimGen)
 	switch {
+	case errors.Is(err, ErrMissingClaimGeneration):
+		// PRD #1247 M5a-1 rework (auditor fail-open finding): a CAPABILITY worker omitted its
+		// claim_generation on a message batch — a PROTOCOL violation refused before any insert,
+		// NOT a persistence failure. Do NOT record a streak against the run for the worker's
+		// missing field (recording here would build a spurious kill streak). Placed FIRST so it
+		// skips the recorder regardless of the run's status.
 	case !obs.resolved:
 		// Ownership never resolved (ErrRunNotOwned, or the lookup itself failed), so
 		// this run is not this worker's to vouch for. Recording here is what would let
@@ -252,6 +260,15 @@ func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uu
 		return appendObservation{}, err
 	}
 	obs := appendObservation{resolved: true, status: run.Status, lastSeq: run.LastSeq}
+	// PRD #1247 M5a-1 rework (auditor fail-open finding): FAIL CLOSED for a CAPABILITY worker. The
+	// per-query InsertRunMessage/UpdateRunLastSeq fence engages only when the batch STAMPS a
+	// generation, so a worker advertising credential_switch_v1 could bypass it by OMITTING it and
+	// persist unfenced. A capability worker MUST stamp its claim_generation, so an omission is
+	// refused; a LEGACY worker (no capability) keeps inserting unfenced (nil generation), unchanged.
+	// Checked AFTER ownership resolves so ErrRunNotOwned (a foreign worker) still takes precedence.
+	if claimGen == nil && slices.Contains(wkr.ProtocolCapabilities, capability.CredentialSwitchV1) {
+		return obs, ErrMissingClaimGeneration
+	}
 	// Validate the whole batch before persisting any of it: a single invalid
 	// message rejects the batch with nothing written, so a [valid, valid, invalid]
 	// batch never leaves the first two half-persisted.

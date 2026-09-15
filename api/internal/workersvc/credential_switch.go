@@ -14,34 +14,62 @@ import (
 // The USER-facing verb (`uzi run set-token`, which writes the override + the switch stamp) lives
 // in run_credential.go; the fence's atomic FOR UPDATE wrapper is in SetState (service.go).
 
-// stateUsesGenerationFence reports whether SetState wraps a given transition in the FOR UPDATE
-// generation fence (PRD #1247 M5, D3). It is TRUE for the single-statement arms whose mutation
-// runs through the tx-bound querier — running, awaiting_approval, awaiting_input,
-// awaiting_followup, paused, failed — and for a LEGACY completion (a single fenced
-// SetRunCompleted UPDATE). It is FALSE for:
+// stateUsesGenerationFence reports whether a worker-driven transition PARTICIPATES in the
+// released-generation fence (PRD #1247 M5, D3) — i.e. whether a CAPABILITY worker must stamp
+// claim_generation on it (fail-closed; SetState rejects an omission with ErrMissingClaimGeneration)
+// and whether a STALE (released/superseded) report is rejected. It is TRUE for every
+// single-statement mutating arm — running, awaiting_approval, awaiting_input, awaiting_followup,
+// paused, failed — for the two multi-step PARK arms — limit_wait, recovery_wait (M5a-1 rework,
+// reviewer NB1: EVERY worker-driven mutating transition is fenced) — and for a LEGACY completion
+// (a single fenced SetRunCompleted UPDATE).
+//
+// The fence MECHANISM differs by arm, which is why stateUsesForUpdateFence exists alongside this:
+//
+//   - running / awaiting_* / paused / failed / legacy-completed: fenced by SetState's FOR UPDATE
+//     wrapper (stateUsesForUpdateFence is TRUE for exactly these — its mutation runs through the
+//     tx-bound querier while the row lock is held from the generation check through the write).
+//   - limit_wait / recovery_wait: fenced PER-QUERY inside SetRunLimitWait / SetRunRecoveryWait —
+//     the reported generation is threaded through setLimitWait / setRecoveryWait and added to the
+//     WHERE with the same nil-guarded shape as InsertRunMessage. They do NOT use the FOR UPDATE
+//     wrapper (stateUsesForUpdateFence is FALSE for them): their candidate-read + pure decision +
+//     write is multi-step, and holding the FOR UPDATE lock across it while the helper writes on
+//     s.q (a different connection) would self-deadlock on the run row.
+//
+// It is FALSE for:
 //
 //   - completed on an INTERLOCKED run: completeRunWithPermit runs its OWN permit transaction,
-//     which must NOT nest under this FOR UPDATE (self-deadlock on the run row); it is
-//     generation-fenced inside that lock instead (service.go's completed arm surfaces its
-//     ErrStaleClaim).
-//   - limit_wait / recovery_wait: multi-query park helpers on s.q whose park query already
-//     requires status='running'. A released run is 'queued', so SetRunLimitWait /
-//     SetRunRecoveryWait match 0 rows; and a reclaim moves ownership while the worker tears down
-//     before releasing, so the switch flight never drives these. Not additionally
-//     generation-fenced in M5a-1 (documented gap; a later belt-and-braces predicate is cheap).
+//     which must NOT nest under a FOR UPDATE (self-deadlock on the run row); it is
+//     generation-fenced INSIDE that lock instead — including the fail-closed capability check —
+//     and service.go's completed arm surfaces its ErrStaleClaim / ErrMissingClaimGeneration.
 //   - credential_switch: handled by its own fenced+idempotent ReleaseCredentialSwitch statement
-//     (releaseCredentialSwitch), which must NOT go through the generic stale check — a
-//     redelivered same-generation release after the release applied is idempotent success, not
-//     stale.
+//     (releaseCredentialSwitch), which itself requires a stamped generation and must NOT go
+//     through the generic stale check — a redelivered same-generation release after the release
+//     applied is idempotent success, not stale.
 //   - pause_failed: handled before the fence (it withdraws a pending pause, not a transition).
 func stateUsesGenerationFence(state string, owned store.Run) bool {
 	switch state {
-	case "running", "awaiting_approval", "awaiting_input", "awaiting_followup", "paused", "failed":
+	case "running", "awaiting_approval", "awaiting_input", "awaiting_followup", "paused", "failed",
+		"limit_wait", "recovery_wait":
 		return true
 	case "completed":
 		return !owned.CompletionContractVersion.Valid
 	default:
 		return false
+	}
+}
+
+// stateUsesForUpdateFence reports whether SetState wraps a transition in the FOR UPDATE
+// generation-fence transaction. It is the subset of stateUsesGenerationFence that fences through
+// that OUTER lock — everything EXCEPT limit_wait / recovery_wait, whose multi-step park helpers
+// fence PER-QUERY (see stateUsesGenerationFence) and would self-deadlock under the lock. The
+// interlocked-completed and credential_switch arms already return false from
+// stateUsesGenerationFence, so they need no exclusion here.
+func stateUsesForUpdateFence(state string, owned store.Run) bool {
+	switch state {
+	case "limit_wait", "recovery_wait":
+		return false
+	default:
+		return stateUsesGenerationFence(state, owned)
 	}
 }
 

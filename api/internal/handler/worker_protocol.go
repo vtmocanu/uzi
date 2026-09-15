@@ -554,6 +554,13 @@ func (h *Handler) WorkerRunMessages(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case errors.Is(err, workersvc.ErrRunNotOwned):
 			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
+		case errors.Is(err, workersvc.ErrMissingClaimGeneration):
+			// PRD #1247 M5a-1 rework (auditor fail-open finding): a CAPABILITY worker
+			// (advertising credential_switch_v1) omitted claim_generation on a message batch, so
+			// the per-query fence could not engage. Refuse rather than persist unfenced. 409 is
+			// the refuse ack — a protocol violation the worker fixes by stamping the generation,
+			// distinct from the 404 (not owned) and 400 (bad/unstorable batch) causes.
+			httpx.Error(w, http.StatusConflict, "this worker must stamp claim_generation on every message batch")
 		case errors.Is(err, workersvc.ErrInvalidMessage):
 			httpx.Error(w, http.StatusBadRequest, "each message needs a positive seq, a kind, and a JSON payload")
 		case errors.Is(err, workersvc.ErrUnstorableMessage):
@@ -621,9 +628,11 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 	run, applied, err := h.wsvc.SetState(r.Context(), wkr, runID, req)
 	if err != nil {
 		switch {
-		case errors.Is(err, workersvc.ErrStaleClaim):
+		case errors.Is(err, workersvc.ErrStaleClaim), errors.Is(err, workersvc.ErrMissingClaimGeneration):
 			// PRD #1247 M5 (D3): the generation fence rejected this report — a held-state switch
-			// RELEASED this claim, or a reclaim SUPERSEDED it. Answer 409 with the run PLUS a
+			// RELEASED this claim, or a reclaim SUPERSEDED it. M5a-1 rework: it ALSO covers a
+			// CAPABILITY worker that OMITTED claim_generation on a mutating report
+			// (ErrMissingClaimGeneration, fail-closed). Answer 409 with the run PLUS a
 			// disposition:"stale_claim" field the new worker reads to STOP the old flight without
 			// further reports. The 409 status is shared with an ordinary not-applied ack (an old
 			// worker that ignores the extra field still treats it as "changed nothing"); the
