@@ -116,7 +116,7 @@ GitLab issue comment: MR link on success; on failure, one comment with a run lin
   `CiAutofixEnabled` does (`api/internal/settings/settings_ci_autofix.go`). This is not
   free: `runlifecycle` has no settings access today
   (`git grep -i -F settings -- api/internal/runlifecycle/` is empty; the `Lifecycle`
-  struct holds only `q Store`, `mover`, `now`, `projector`, `frontendOrigin`,
+  struct holds no settings collaborator — `q Store`, `mover`, `now`, `projector`, `frontendOrigin`, plus sweep-tuning fields —
   `api/internal/runlifecycle/lifecycle.go:90`), so M1 adds a settings collaborator,
   widens the `Store` interface (`api/internal/runlifecycle/lifecycle.go:62`) and the
   `fakeStore` in `api/internal/runlifecycle/lifecycle_test.go:25`, and threads it through
