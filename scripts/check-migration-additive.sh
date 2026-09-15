@@ -42,6 +42,13 @@
 # TABLE are never exempted. Mirrors the check-docs:ignore-path marker-comment convention.
 # The marker/mismatch self-check canaries below prove the match stays exact (both directions).
 #
+# 🔴 DOLLAR-QUOTED LITERALS (issue #1128). PostgreSQL dollar-quoted strings ($$ ... $$, or
+# tagged $tag$ ... $tag$; multi-line, and several blocks per section) are opaque text. scan()
+# tracks quote state and, while inside one, reads NEITHER the allow-drop marker NOR a DROP: a
+# marker on its own line inside a DO/function body is string content, not a comment, and cannot
+# exempt a real drop; and a DROP COLUMN-shaped fragment inside a body is not a statement. The
+# two dollarquote self-check canaries below prove both directions.
+#
 # 🔴 SELF-CHECK (canary), the check-spec-numbering convention. A silent pass is the
 # failure mode: if the awk parse ever matches nothing, every migration reads "clean" and
 # this gate passes vacuously. The canary ($1) carries a deliberately planted worker-facing
@@ -50,14 +57,19 @@
 # means the detector is blind (instrument broken); two means it wrongly scanned the Down
 # section (a false positive the canary is built to expose). Either way: exit 2.
 #
-# Three sibling fixtures beside $1 extend the self-check to the allow-drop marker (#1087):
+# Five sibling fixtures beside $1 extend the self-check. For the allow-drop marker (#1087):
 # migration-additive-marker-canary.sql (a worker-table drop WITH a matching STANDALONE
 # marker) MUST yield 0; migration-additive-mismatch-canary.sql (a drop whose marker names a
 # DIFFERENT column) MUST yield 1; and migration-additive-embedded-canary.sql (a marker
-# trailing a statement or inside a string literal, NOT a standalone comment) MUST yield 1.
-# Together they prove the exemption is exact in every direction: a broken marker match reddens
-# the marker canary, an over-broad one reddens the mismatch canary, and dropping the
-# standalone-comment anchor reddens the embedded canary.
+# trailing a statement or inside a single-line string literal, NOT a standalone comment) MUST
+# yield 1. For dollar-quote awareness (#1128): migration-additive-dollarquote-marker-canary.sql
+# (a standalone marker line INSIDE a $$ ... $$ body, next to a real worker-table drop that
+# FOLLOWS the body) MUST yield 1; and migration-additive-dollarquote-drop-canary.sql (a DROP
+# COLUMN-shaped fragment INSIDE a $$ ... $$ body) MUST yield 0. Together they prove the
+# exemption is exact in every direction and that string content is never read as SQL: a broken
+# marker match reddens the marker canary, an over-broad one reddens the mismatch canary,
+# dropping the standalone-comment anchor reddens the embedded canary, and losing dollar-quote
+# state reddens one of the two dollarquote canaries.
 #
 # EXIT CODES (the lint-yaml.sh / scan-secrets.sh / check-spec-numbering.sh convention):
 #     2 = the instrument is broken (a file/dir missing, or the canary did not detect
@@ -163,6 +175,46 @@ scan() {
       }
       return anycol
     }
+    # 🔴 DOLLAR-QUOTE SANITIZER (issue #1128). PostgreSQL dollar-quoted string literals
+    # ($$ ... $$, tagged $tag$ ... $tag$) are opaque text: a `;`, a `--`, or an ALTER/DROP
+    # fragment INSIDE one is string content, not SQL, and an allow-drop marker inside one is
+    # not a comment. Return the line with every dollar-quoted span removed, keeping ordinary
+    # code and SQL line comments verbatim -- so goose markers, the allow-drop anchor, and the
+    # end-of-line comment strip below all still see what they should. dqtag holds the
+    # currently-open delimiter across lines ("" = outside); it is reset per file and per goose
+    # section, since a literal never spans one. Walk by CHARACTER POSITION (index/substr), not
+    # a per-line toggle: several blocks can open/close on one line and a delimiter can sit
+    # mid-line. Portable awk only -- substr/index/length and 2-arg match with RSTART/RLENGTH;
+    # no gawk-only 3-arg match(s,re,arr), no gensub, no \< / {n,m}.
+    function strip_literals(s,   out, n, i, rest, cpos){
+      out = ""; n = length(s); i = 1
+      while (i <= n){
+        if (dqtag == ""){
+          if (substr(s, i, 2) == "--"){   # rest of line is a SQL line comment: keep verbatim
+            return out substr(s, i)         # (a $$/$1 in a comment must NOT open a literal)
+          }
+          if (substr(s, i, 1) == "$"){
+            rest = substr(s, i)             # try to read a dollar-quote OPENER $tag$ here
+            if (match(rest, /^\$([a-zA-Z_][a-zA-Z0-9_]*)?\$/)){
+              dqtag = substr(rest, 1, RLENGTH)   # exact delimiter, e.g. "$$" or "$body$"
+              i = i + RLENGTH                     # skip the opener; enter literal state
+              continue
+            }
+          }
+          out = out substr(s, i, 1); i++    # an ordinary code character
+        } else {
+          rest = substr(s, i)
+          cpos = index(rest, dqtag)          # exact closing delimiter (literal, case-sensitive)
+          if (cpos > 0){
+            i = i + cpos - 1 + length(dqtag)    # drop the literal up to and incl. the closer
+            dqtag = ""
+          } else {
+            return out                          # literal runs to EOL; drop the rest of it
+          }
+        }
+      }
+      return out
+    }
     function check(raw,   stmt, rest, w, tbl, verb, m, parts, k, tw){
       stmt = norm(raw)
       if (stmt == "") return
@@ -192,26 +244,35 @@ scan() {
       }
     }
     BEGIN { n = split(tables, a, " "); for (i = 1; i <= n; i++) wf[a[i]] = 1 }
-    FNR == 1 { state = "pre"; buf = ""; split("", allow) }
+    FNR == 1 { state = "pre"; buf = ""; split("", allow); dqtag = "" }
     {
       lc = tolower($0)
-      # Detect goose section markers BEFORE stripping comments (the marker IS a comment).
-      # allow[] (the approved-drop set) resets per Up section, so a marker can never leak
-      # across sections or in from a Down. split("", allow) empties it portably.
-      if (lc ~ /\+goose[ \t]+up/)   { state = "up";   buf = ""; split("", allow); next }
-      if (lc ~ /\+goose[ \t]+down/) { state = "down"; buf = ""; next }
+      # Detect goose section markers on the RAW line, BEFORE any dollar-quote sanitizing (the
+      # marker IS a comment; a section marker never sits inside a literal, and reading the raw
+      # line means a stray unclosed literal can never hide one). allow[] (the approved-drop
+      # set) AND dqtag (the open dollar-quote, #1128) both reset per Up section: a marker can
+      # never leak across sections or in from a Down, and a literal never spans a section.
+      if (lc ~ /\+goose[ \t]+up/)   { state = "up";   buf = ""; split("", allow); dqtag = ""; next }
+      if (lc ~ /\+goose[ \t]+down/) { state = "down"; buf = ""; dqtag = ""; next }
       if (state != "up") next
+      # Remove dollar-quoted-literal spans (issue #1128) BEFORE the marker capture and the DROP
+      # scan below, so neither reads string content as SQL. SQL line comments survive in sline,
+      # so the standalone allow-drop anchor and the end-of-line comment strip still see them.
+      sline = strip_literals($0)
+      slc = tolower(sline)
       # Capture an approval marker BEFORE the comment strip below (the marker IS a comment).
       # `-- migration-additive:allow-drop <table>.<column>` exempts exactly that
       # table.column from the DROP COLUMN check (issue #1087), and nothing else.
       # The marker MUST be a STANDALONE comment line (`^\s*-- migration-additive:allow-drop
       # <tbl>.<col>\s*$`): a token trailing a destructive statement, or inside a string
       # literal, must NOT populate allow[] (it would let an embedded token bypass the guard).
-      if (match(lc, /^[ \t]*--[ \t]*migration-additive:allow-drop[ \t]+[a-z0-9_".]+[ \t]*$/)){
-        mk = lc; sub(/^.*allow-drop[ \t]+/, "", mk); sub(/[ \t]+$/, "", mk); gsub(/"/, "", mk)
+      # A marker INSIDE a dollar-quoted literal has been blanked out of sline (#1128), so it
+      # can never populate allow[] either.
+      if (match(slc, /^[ \t]*--[ \t]*migration-additive:allow-drop[ \t]+[a-z0-9_".]+[ \t]*$/)){
+        mk = slc; sub(/^.*allow-drop[ \t]+/, "", mk); sub(/[ \t]+$/, "", mk); gsub(/"/, "", mk)
         allow[mk] = 1
       }
-      line = $0
+      line = sline
       sub(/--.*/, "", line)          # strip an end-of-line SQL comment
       buf = buf " " tolower(line)
       while ((p = index(buf, ";")) > 0){
@@ -222,23 +283,33 @@ scan() {
   ' "$@"
 }
 
-# 🔴 CANARIES FIRST: prove the detector fires (Up only) AND that the allow-drop marker
-# exemption is EXACT -- before trusting any verdict over the real corpus. Four fixtures,
-# all beside $CANARY, each run through the same scan():
-#   canary            (no marker)                  -> MUST be 1  (detector live, Up-only)
-#   marker canary     (matching allow-drop)        -> MUST be 0  (exact marker exempts)
-#   mismatch canary   (allow-drop names OTHER col) -> MUST be 1  (marker cannot over-exempt)
-#   embedded canary   (marker trailing a stmt /    -> MUST be 1  (only a STANDALONE comment
-#                      inside a string literal)                    marker exempts)
+# 🔴 CANARIES FIRST: prove the detector fires (Up only), that the allow-drop marker exemption
+# is EXACT, and that dollar-quoted string content is never read as SQL -- before trusting any
+# verdict over the real corpus. Six fixtures, all beside $CANARY, each run through the same
+# scan():
+#   canary             (no marker)                  -> MUST be 1  (detector live, Up-only)
+#   marker canary      (matching allow-drop)        -> MUST be 0  (exact marker exempts)
+#   mismatch canary    (allow-drop names OTHER col) -> MUST be 1  (marker cannot over-exempt)
+#   embedded canary    (marker trailing a stmt /    -> MUST be 1  (only a STANDALONE comment
+#                       inside a single-line string)                marker exempts)
+#   dollarquote marker (standalone marker INSIDE a  -> MUST be 1  (a marker in string content
+#                       $$ body, drop AFTER it)                     cannot exempt a real drop)
+#   dollarquote drop   (DROP-shaped text INSIDE a   -> MUST be 0  (string content is not a
+#                       $$ body)                                    statement)
 # The marker/mismatch/embedded trio is the both-directions mutation guard on the exemption
 # (#1087): delete the marker logic and the marker canary jumps to 1; loosen it to "any
 # marker exempts any drop" and the mismatch canary falls to 0; drop the standalone-comment
-# anchor and the embedded canary falls to 0. Either way this self-check exits 2.
+# anchor and the embedded canary falls to 0. The two dollarquote canaries guard #1128: lose
+# dollar-quote state and the dollarquote-marker canary falls to 0 (an in-body marker wrongly
+# exempts) or the dollarquote-drop canary rises to 1 (in-body text wrongly flagged). Either
+# way this self-check exits 2.
 CANARY_DIR="$(dirname "$CANARY")"
 MARKER_CANARY="$CANARY_DIR/migration-additive-marker-canary.sql"
 MISMATCH_CANARY="$CANARY_DIR/migration-additive-mismatch-canary.sql"
 EMBEDDED_CANARY="$CANARY_DIR/migration-additive-embedded-canary.sql"
-for f in "$MARKER_CANARY" "$MISMATCH_CANARY" "$EMBEDDED_CANARY"; do
+DOLLAR_MARKER_CANARY="$CANARY_DIR/migration-additive-dollarquote-marker-canary.sql"
+DOLLAR_DROP_CANARY="$CANARY_DIR/migration-additive-dollarquote-drop-canary.sql"
+for f in "$MARKER_CANARY" "$MISMATCH_CANARY" "$EMBEDDED_CANARY" "$DOLLAR_MARKER_CANARY" "$DOLLAR_DROP_CANARY"; do
   if [ ! -f "$f" ]; then
     echo "check-migration-additive: self-check fixture not found: $f" >&2
     echo "  The marker/mismatch canaries prove the allow-drop exemption is exact; without" >&2
@@ -252,11 +323,14 @@ canary_count="$(count_hits "$(scan "$CANARY")")"
 marker_count="$(count_hits "$(scan "$MARKER_CANARY")")"
 mismatch_count="$(count_hits "$(scan "$MISMATCH_CANARY")")"
 embedded_count="$(count_hits "$(scan "$EMBEDDED_CANARY")")"
-if [ "$canary_count" -ne 1 ] || [ "$marker_count" -ne 0 ] || [ "$mismatch_count" -ne 1 ] || [ "$embedded_count" -ne 1 ]; then
+dollar_marker_count="$(count_hits "$(scan "$DOLLAR_MARKER_CANARY")")"
+dollar_drop_count="$(count_hits "$(scan "$DOLLAR_DROP_CANARY")")"
+if [ "$canary_count" -ne 1 ] || [ "$marker_count" -ne 0 ] || [ "$mismatch_count" -ne 1 ] || [ "$embedded_count" -ne 1 ] || [ "$dollar_marker_count" -ne 1 ] || [ "$dollar_drop_count" -ne 0 ]; then
   echo "check-migration-additive: ================================================================" >&2
   echo "check-migration-additive: INSTRUMENT BROKEN -- a self-check fixture did not yield its" >&2
   echo "check-migration-additive: expected count (canary=$canary_count want 1, marker=$marker_count want 0," >&2
-  echo "check-migration-additive: mismatch=$mismatch_count want 1, embedded=$embedded_count want 1)." >&2
+  echo "check-migration-additive: mismatch=$mismatch_count want 1, embedded=$embedded_count want 1," >&2
+  echo "check-migration-additive: dollar-marker=$dollar_marker_count want 1, dollar-drop=$dollar_drop_count want 0)." >&2
   echo "check-migration-additive:" >&2
   echo "check-migration-additive:   canary   ($CANARY): one Up + one Down destructive stmt;" >&2
   echo "check-migration-additive:            want 1 (0 = parse matched nothing; 2 = wrongly read Down)." >&2
@@ -267,7 +341,14 @@ if [ "$canary_count" -ne 1 ] || [ "$marker_count" -ne 0 ] || [ "$mismatch_count"
   echo "check-migration-additive:            want 1 (a marker must never over-exempt)." >&2
   echo "check-migration-additive:   embedded ($EMBEDDED_CANARY): a worker-table DROP with the" >&2
   echo "check-migration-additive:            marker trailing the statement or inside a string literal;" >&2
-  echo "check-migration-additive:            want 1 (only a STANDALONE comment marker exempts). Fix scan() or the fixtures." >&2
+  echo "check-migration-additive:            want 1 (only a STANDALONE comment marker exempts)." >&2
+  echo "check-migration-additive:   dollar-marker ($DOLLAR_MARKER_CANARY):" >&2
+  echo "check-migration-additive:            a standalone allow-drop marker INSIDE a \$\$ ... \$\$ body, next to a real" >&2
+  echo "check-migration-additive:            worker-table DROP that FOLLOWS the body; want 1 (in-body string content" >&2
+  echo "check-migration-additive:            is not a comment and cannot exempt the real drop, issue #1128)." >&2
+  echo "check-migration-additive:   dollar-drop ($DOLLAR_DROP_CANARY):" >&2
+  echo "check-migration-additive:            a DROP COLUMN-shaped fragment INSIDE a \$\$ ... \$\$ body; want 0 (string" >&2
+  echo "check-migration-additive:            content is not a statement, issue #1128). Fix scan() or the fixtures." >&2
   echo "check-migration-additive: ================================================================" >&2
   exit 2
 fi
