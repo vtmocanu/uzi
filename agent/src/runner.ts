@@ -135,6 +135,23 @@ export class ForgeUnreachableAtCloneError extends Error {
   }
 }
 
+/**
+ * PRD #1247 M5b: a /state report came back with the top-level `stale_claim` disposition
+ * (`ack.staleClaim`) — a held-state credential switch RELEASED this claim, or a reclaim
+ * SUPERSEDED it. This flight no longer owns the run, so it MUST STOP without reporting a
+ * terminal state (another claim owns the run now) and without setting a preserve flag
+ * (normal teardown — the new claim has its own clone). Thrown from the flight.reportState
+ * closure the moment any report is answered stale, and caught in executeClaim's catch chain
+ * BEFORE the generic terminal path (mirroring the PauseNowSignal arm). Local, like
+ * TerminalReportError: it is thrown and caught entirely within this file.
+ */
+class StaleClaimError extends Error {
+  constructor() {
+    super("run claim superseded server-side (stale_claim)");
+    this.name = "StaleClaimError";
+  }
+}
+
 /** Map a known failure-reason CONSTANT to the server's fail_origin enum (PRD #69
  *  M7a). Authored WORKER-SIDE from the reason constant the throw site used — it never
  *  parses free text: it matches only the fixed prefixes the two fatal pre-start
@@ -401,6 +418,10 @@ interface RunFlight {
   readonly batcher: MessageBatcher;
   readonly cancel: AbortController;
   readonly steering: SteeringChannel;
+  /** PRD #1247 M5b: the claim-lane generation THIS claim holds (from claim.claim_generation).
+   *  Stamped on every mutating report (the reportState closure) and every message batch (the
+   *  batcher), so the server's per-query fence can engage. Server-side NOT NULL DEFAULT 0. */
+  readonly claimGeneration: number;
   readonly reportState: (
     body: Parameters<WorkerClient["reportState"]>[1],
     signal?: AbortSignal,
@@ -1130,6 +1151,15 @@ export class RunRunner {
         if (outcome === "fail") {
           await this.reportGenericFailure(claim, flight, err);
         }
+      } else if (err instanceof StaleClaimError) {
+        // PRD #1247 M5b: a /state report came back with the stale_claim disposition — a held-state
+        // credential switch RELEASED this claim, or a reclaim SUPERSEDED it. Another claim owns the
+        // run now, so STOP this flight. Caught here BEFORE the generic terminal path (mirroring the
+        // PauseNowSignal arm above, but WITHOUT its park): log, close the batcher, and report NO
+        // terminal state — a `failed` here would fight the owning claim — and set NO preserve flag
+        // (normal teardown: the new claim has its own clone). The finally then runs ordinary cleanup.
+        runLog.info("run claim superseded server-side (stale_claim); stopping this flight");
+        await batcher.close().catch(() => undefined);
       } else {
         await this.reportGenericFailure(claim, flight, err);
       }
@@ -3295,6 +3325,10 @@ export class RunRunner {
     }
     const redact = makeRedactor(secrets);
     const redactText = makeTextRedactor(secrets);
+    // PRD #1247 M5b: the claim-lane generation this claim holds. Server-side NOT NULL DEFAULT 0;
+    // `?? 0` covers a pre-#1296 payload that omits the field. Held on the flight and stamped on
+    // every mutating report + message batch so the server's per-query fence can engage.
+    const claimGeneration = claim.claim_generation ?? 0;
     const batcher = new MessageBatcher(
       this.client,
       runId,
@@ -3372,15 +3406,27 @@ export class RunRunner {
       batcher,
       cancel,
       steering,
+      claimGeneration,
       observedSessionId: undefined,
-      reportState: (body, signal) =>
-        this.client.reportState(
-          runId,
-          flight.observedSessionId
-            ? { ...body, session_id: flight.observedSessionId }
-            : body,
-          signal,
-        ),
+      reportState: async (body, signal) => {
+        // PRD #1247 M5b: stamp the claim-lane generation on EVERY mutating report. This is the
+        // single choke point every one of the ~71 report sites goes through (incl. the terminal
+        // `failed` report), so the server's per-query fence engages uniformly. Additive/optional:
+        // the observedSessionId injection is preserved, and claim_generation rides beside it.
+        const stamped: Parameters<WorkerClient["reportState"]>[1] = {
+          ...body,
+          claim_generation: flight.claimGeneration,
+          ...(flight.observedSessionId ? { session_id: flight.observedSessionId } : {}),
+        };
+        const ack = await this.client.reportState(runId, stamped, signal);
+        // PRD #1247 M5b: a stale_claim disposition means a held-state switch RELEASED this claim
+        // (or a reclaim SUPERSEDED it) — the flight no longer owns the run and MUST STOP. Throw so
+        // executeClaim's catch chain closes the batcher and ends the flight with NO terminal
+        // report (another claim owns the run now). A stale ack on the TERMINAL `failed` report is
+        // a no-op: that reportState is already `.catch(...)`-guarded, so the throw is swallowed.
+        if (ack.staleClaim) throw new StaleClaimError();
+        return ack;
+      },
       barePath: undefined,
       worktreePath: undefined,
       // PRD #267: time-based origin-checkpoint gate state (per run). `lastPublish` starts
