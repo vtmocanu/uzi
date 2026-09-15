@@ -455,6 +455,39 @@ func effectiveNextClaimMode(run store.Run, ownerJudgeMode string, worker store.W
 	return worker.AnthropicBindMode
 }
 
+// ownerJudgeBindMode reads the run owner's judge-lane bind mode for
+// effectiveNextClaimMode's self_improve rung (PRD #1247). It reuses judgeChoice's own
+// GetUserJudgeAnthropicBinding read — the SAME query that resolves the credential at
+// claim time — so the mode 6e and the D8 pass predict a self_improve resume against is
+// exactly the one its next claim will use. Only a self_improve run needs it; every
+// other kind passes "" without a read, since effectiveNextClaimMode ignores
+// ownerJudgeMode for them. A lookup error is propagated (never swallowed into a wrong
+// mode), matching judgeChoice.
+func (s *Service) ownerJudgeBindMode(ctx context.Context, userID uuid.UUID) (string, error) {
+	bound, err := s.q.GetUserJudgeAnthropicBinding(ctx, userID)
+	if err != nil {
+		return "", fmt.Errorf("owner judge binding lookup: %w", err)
+	}
+	return bound.JudgeAnthropicBindMode, nil
+}
+
+// claimExcludeFor is claimExclude's pure core (PRD #1247 M3): the credential a resume
+// must not re-pick, given only the run's dead-credential id and its retry cadence. It
+// exists so a caller holding just those two columns (the D8 re-eval pass, the widened
+// pool-wait resume) can ask the same question the full-row claimExclude asks, without
+// materialising a whole store.Run. uuid.Nil means "exclude nothing".
+func (s *Service) claimExcludeFor(limitDead pgtype.UUID, retryNotBefore pgtype.Timestamptz) uuid.UUID {
+	if !limitDead.Valid {
+		return uuid.Nil
+	}
+	// Window still closed → keep excluding. Relax (Nil) once retry_not_before has
+	// reopened, and also when there is no reset stamp to wait on.
+	if retryNotBefore.Valid && retryNotBefore.Time.After(s.now()) {
+		return uuid.UUID(limitDead.Bytes)
+	}
+	return uuid.Nil
+}
+
 // claimExclude is the credential this claim must NOT resolve onto: the run's
 // just-parked dead credential (PRD #217), but only WHILE it is not yet due to retry.
 // retry_not_before is the run's retry CADENCE, not a proof the token's real Anthropic
@@ -478,15 +511,7 @@ func effectiveNextClaimMode(run store.Run, ownerJudgeMode string, worker store.W
 // ever hand a not-yet-due run to the claim path, and the M2 exclusion tests inject a
 // future stamp to exercise it.
 func (s *Service) claimExclude(run store.Run) uuid.UUID {
-	if !run.LimitDeadSecretID.Valid {
-		return uuid.Nil
-	}
-	// Window still closed → keep excluding. Relax (Nil) once it has reopened, and also
-	// when there is no reset stamp to wait on (nothing says the window is closed).
-	if run.RetryNotBefore.Valid && run.RetryNotBefore.Time.After(s.now()) {
-		return uuid.UUID(run.LimitDeadSecretID.Bytes)
-	}
-	return uuid.Nil
+	return s.claimExcludeFor(run.LimitDeadSecretID, run.RetryNotBefore)
 }
 
 // autoChoice runs the selector for an `auto` worker (PRD #111 M4, #754 M2).

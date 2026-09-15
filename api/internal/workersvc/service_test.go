@@ -618,6 +618,22 @@ type fakeStore struct {
 	promotePoolWaitRows *int64
 	promotePoolWaitErr  error
 
+	// PRD #1247 M3 D8 duration-time re-evaluation. limitWaitReeval is what
+	// ListLimitWaitReeval returns (the still-parked worklist), limitWaitReevalErr fails
+	// that read, and limitWaitReevalAt records every `@now` the pass passed it.
+	// loweredLimitWait records every LowerLimitWaitRetryNow arg in order (so a test can
+	// assert WHICH run was lowered and that it was owner-scoped); lowerLimitWaitRows
+	// overrides the rows-affected (default 1; 0 models a run that moved out of limit_wait
+	// under the pass); lowerLimitWaitErr fails the lower. Like PromotePoolWaitRun, a
+	// successful lower DROPS the run from limitWaitReeval so a second Sweep on the same
+	// fake sees the remaining parked run — proving the one-per-owner-per-tick cap.
+	limitWaitReeval    []store.ListLimitWaitReevalRow
+	limitWaitReevalErr error
+	limitWaitReevalAt  []pgtype.Timestamptz
+	loweredLimitWait   []store.LowerLimitWaitRetryNowParams
+	lowerLimitWaitRows *int64
+	lowerLimitWaitErr  error
+
 	// PRD #217 M1: the park-time gauge write. markedFiveHour / markedSevenDay record
 	// every user_secret_id MarkFiveHourExhausted / MarkSevenDayExhausted was called
 	// with, in order, so a test can assert WHICH window a park marked down (and that
@@ -1066,6 +1082,41 @@ func (f *fakeStore) PromoteRecoveryWaitRuns(_ context.Context, now pgtype.Timest
 
 func (f *fakeStore) ListPoolWaitRuns(_ context.Context) ([]store.ListPoolWaitRunsRow, error) {
 	return f.poolWaitRuns, f.poolWaitRunsErr
+}
+
+func (f *fakeStore) ListLimitWaitReeval(_ context.Context, now pgtype.Timestamptz) ([]store.ListLimitWaitReevalRow, error) {
+	f.limitWaitReevalAt = append(f.limitWaitReevalAt, now)
+	return f.limitWaitReeval, f.limitWaitReevalErr
+}
+
+// LowerLimitWaitRetryNow records the arg and, by default, reports 1 row (a still-parked
+// run lowered). lowerLimitWaitRows overrides the count so a test can model the 0-row
+// no-op (the run moved out of limit_wait under the pass); lowerLimitWaitErr fails it. It
+// also DROPS the lowered run from limitWaitReeval so a SECOND Sweep on the same fake sees
+// the remaining parked run — which is how the one-per-owner-per-tick cap is proven across
+// two calls (mirroring PromotePoolWaitRun).
+func (f *fakeStore) LowerLimitWaitRetryNow(_ context.Context, arg store.LowerLimitWaitRetryNowParams) (int64, error) {
+	f.loweredLimitWait = append(f.loweredLimitWait, arg)
+	if f.lowerLimitWaitErr != nil {
+		return 0, f.lowerLimitWaitErr
+	}
+	rows := int64(1)
+	if f.lowerLimitWaitRows != nil {
+		rows = *f.lowerLimitWaitRows
+	}
+	if rows > 0 {
+		// A FRESH slice, not f.limitWaitReeval[:0]: reEvaluateParkedLimitWaitRuns holds the
+		// slice ListLimitWaitReeval returned and iterates it while calling this, so reusing
+		// the backing array would corrupt that in-flight range.
+		remaining := make([]store.ListLimitWaitReevalRow, 0, len(f.limitWaitReeval))
+		for _, r := range f.limitWaitReeval {
+			if r.ID != arg.ID {
+				remaining = append(remaining, r)
+			}
+		}
+		f.limitWaitReeval = remaining
+	}
+	return rows, nil
 }
 
 // PromotePoolWaitRun records the arg and, by default, reports 1 row (a held run

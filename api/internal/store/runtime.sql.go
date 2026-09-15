@@ -4843,6 +4843,87 @@ func (q *Queries) ListGaveUpColumnMoves(ctx context.Context, arg ListGaveUpColum
 	return items, nil
 }
 
+const listLimitWaitReeval = `-- name: ListLimitWaitReeval :many
+SELECT
+    r.id,
+    r.user_id,
+    r.kind,
+    r.credential_override_mode,
+    r.credential_override_secret_id,
+    r.worker_id,
+    r.limit_dead_secret_id,
+    r.retry_not_before,
+    w.anthropic_bind_mode AS worker_bind_mode
+FROM runs r
+LEFT JOIN workers w ON w.id = r.worker_id
+WHERE r.status = 'limit_wait'
+  AND r.retry_not_before > $1
+  AND r.limit_dead_secret_id IS NOT NULL
+ORDER BY r.status_since ASC
+`
+
+type ListLimitWaitReevalRow struct {
+	ID                         uuid.UUID          `json:"id"`
+	UserID                     uuid.UUID          `json:"user_id"`
+	Kind                       string             `json:"kind"`
+	CredentialOverrideMode     pgtype.Text        `json:"credential_override_mode"`
+	CredentialOverrideSecretID pgtype.UUID        `json:"credential_override_secret_id"`
+	WorkerID                   pgtype.UUID        `json:"worker_id"`
+	LimitDeadSecretID          pgtype.UUID        `json:"limit_dead_secret_id"`
+	RetryNotBefore             pgtype.Timestamptz `json:"retry_not_before"`
+	WorkerBindMode             pgtype.Text        `json:"worker_bind_mode"`
+}
+
+// The duration-time auto-failover worklist (PRD #1247 M3, D8): every run STILL parked
+// in limit_wait whose window has NOT yet reopened (retry_not_before > @now) and that
+// recorded a dead credential (limit_dead_secret_id IS NOT NULL), OLDEST park first
+// (status_since ASC). It is the read half of the second limit-wait promoter that sits
+// beside PromoteLimitWaitRuns: Decision 6e extended from park-time to park-duration, so
+// a token that pools or a gauge that turns eligible AFTER the park is re-asked every
+// tick instead of the run sleeping to retry_not_before regardless.
+//
+// It projects exactly what the two pure policies in Go need and no more:
+// effectiveNextClaimMode reads kind / credential_override_mode /
+// credential_override_secret_id / worker_id plus the recorded worker's bind mode, and
+// claimExclude reads limit_dead_secret_id / retry_not_before. The recorded worker's
+// anthropic_bind_mode rides a LEFT JOIN (projected as worker_bind_mode) so the Go side
+// needs no per-run worker fetch; a NULL/absent worker leaves it NULL, which
+// effectiveNextClaimMode maps to `unknown` (and unknown is skipped, the safe direction).
+//
+// No promotion happens here: a due run is LOWERED to now() by LowerLimitWaitRetryNow and
+// the existing PromoteLimitWaitRuns performs the actual status transition. Backed by the
+// same idx_runs_limit_wait_retry partial index PromoteLimitWaitRuns reads, so the set is
+// empty on a healthy instance. @now is the sweep's own clock.
+func (q *Queries) ListLimitWaitReeval(ctx context.Context, now pgtype.Timestamptz) ([]ListLimitWaitReevalRow, error) {
+	rows, err := q.db.Query(ctx, listLimitWaitReeval, now)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListLimitWaitReevalRow{}
+	for rows.Next() {
+		var i ListLimitWaitReevalRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.UserID,
+			&i.Kind,
+			&i.CredentialOverrideMode,
+			&i.CredentialOverrideSecretID,
+			&i.WorkerID,
+			&i.LimitDeadSecretID,
+			&i.RetryNotBefore,
+			&i.WorkerBindMode,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listPendingColumnMoves = `-- name: ListPendingColumnMoves :many
 SELECT id FROM runs
 WHERE move_pending_since IS NOT NULL
@@ -4922,15 +5003,17 @@ func (q *Queries) ListPlanRevisionStateForRuns(ctx context.Context, runIds []uui
 }
 
 const listPoolWaitRuns = `-- name: ListPoolWaitRuns :many
-SELECT id, user_id, status_since FROM runs
+SELECT id, user_id, status_since, limit_dead_secret_id, retry_not_before FROM runs
 WHERE status = 'pool_wait'
 ORDER BY status_since ASC
 `
 
 type ListPoolWaitRunsRow struct {
-	ID          uuid.UUID          `json:"id"`
-	UserID      uuid.UUID          `json:"user_id"`
-	StatusSince pgtype.Timestamptz `json:"status_since"`
+	ID                uuid.UUID          `json:"id"`
+	UserID            uuid.UUID          `json:"user_id"`
+	StatusSince       pgtype.Timestamptz `json:"status_since"`
+	LimitDeadSecretID pgtype.UUID        `json:"limit_dead_secret_id"`
+	RetryNotBefore    pgtype.Timestamptz `json:"retry_not_before"`
 }
 
 // The reactive-resume worklist (PRD #754 M5): every run currently held in pool_wait,
@@ -4945,6 +5028,13 @@ type ListPoolWaitRunsRow struct {
 // oldest-first ORDER BY is index-ordered. The held set is expected to be tiny (a run
 // holds only while an auto owner's whole pool is genuinely empty, a transient state M5
 // resumes out of); the index mirrors limit_wait's idx_runs_limit_wait_retry.
+//
+// limit_dead_secret_id and retry_not_before are projected so the reactive pass can ask
+// the SAME question the re-claim asks — autoselect.Floor(cands, claimExclude(run)) —
+// rather than the exclude-blind PoolNonEmpty it once used (PRD #1247 M3, the pool-
+// promoter fix). Early promotion (the set-token verb and D8) can leave a pool_wait run
+// carrying a FUTURE retry_not_before whose sole pooled token is its own dead credential;
+// without these two columns the pass would resume it every tick only for it to re-hold.
 func (q *Queries) ListPoolWaitRuns(ctx context.Context) ([]ListPoolWaitRunsRow, error) {
 	rows, err := q.db.Query(ctx, listPoolWaitRuns)
 	if err != nil {
@@ -4954,7 +5044,13 @@ func (q *Queries) ListPoolWaitRuns(ctx context.Context) ([]ListPoolWaitRunsRow, 
 	items := []ListPoolWaitRunsRow{}
 	for rows.Next() {
 		var i ListPoolWaitRunsRow
-		if err := rows.Scan(&i.ID, &i.UserID, &i.StatusSince); err != nil {
+		if err := rows.Scan(
+			&i.ID,
+			&i.UserID,
+			&i.StatusSince,
+			&i.LimitDeadSecretID,
+			&i.RetryNotBefore,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -6263,6 +6359,37 @@ func (q *Queries) ListWorkersByUser(ctx context.Context, userID uuid.UUID) ([]Li
 		return nil, err
 	}
 	return items, nil
+}
+
+const lowerLimitWaitRetryNow = `-- name: LowerLimitWaitRetryNow :execrows
+UPDATE runs SET retry_not_before = now(), updated_at = now()
+WHERE id = $1 AND user_id = $2 AND status = 'limit_wait'
+`
+
+type LowerLimitWaitRetryNowParams struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+// The write half of the D8 duration-time re-evaluation pass (PRD #1247 M3): lower ONE
+// still-parked limit_wait run's retry_not_before to now() so the immediately-following
+// PromoteLimitWaitRuns pass (which the re-eval pass runs BEFORE in Sweep) brings it back
+// to queued — the same tick once that pass's clock has reached the lowered stamp, else the
+// next tick. It does NOT transition the status itself — the mutation set of the resume
+// (fresh wall, health reset, codex-cap revoke) lives in PromoteLimitWaitRuns and must not
+// be duplicated here.
+//
+// Owner-scoped (user_id) and status-guarded (status = 'limit_wait') so a run that moved
+// out of limit_wait between the list and this write is a 0-row no-op, and a lowering can
+// never touch a foreign run. It writes ONLY retry_not_before + updated_at, leaving every
+// limit field, limit_dead_secret_id and both retry counters in place, so claimExclude
+// keeps its answer and the resumed claim re-picks correctly.
+func (q *Queries) LowerLimitWaitRetryNow(ctx context.Context, arg LowerLimitWaitRetryNowParams) (int64, error) {
+	result, err := q.db.Exec(ctx, lowerLimitWaitRetryNow, arg.ID, arg.UserID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const markRunFailedByID = `-- name: MarkRunFailedByID :execrows
