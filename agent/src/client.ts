@@ -323,9 +323,18 @@ export class WorkerClient {
     return (await res.json()) as ChatClaimResponse;
   }
 
-  async postMessages(runId: string, messages: OutgoingMessage[], signal?: AbortSignal): Promise<void> {
+  async postMessages(
+    runId: string,
+    messages: OutgoingMessage[],
+    signal?: AbortSignal,
+    claimGeneration?: number,
+  ): Promise<void> {
     if (messages.length === 0) return;
     const body: MessagesRequest = { messages };
+    // PRD #1247 M5 (INERT seam): a capability worker stamps its claim-lane generation on every batch
+    // so the server's fence can engage. Optional + additive — when unset (today, and for every
+    // legacy worker) the body is byte-identical to `{messages}` and the append is unfenced.
+    if (claimGeneration !== undefined) body.claim_generation = claimGeneration;
     await this.postJSON(
       `${WORKER_API_PREFIX}/runs/${runId}/messages`,
       body,
@@ -403,6 +412,13 @@ export class WorkerClient {
           // completion hold.
           if (fields.budgetExhausted !== undefined)
             ack.budgetExhausted = fields.budgetExhausted;
+          // PRD #1247 M5 (INERT seam): fold the top-level held-state credential-switch signal and
+          // the stale-claim disposition off the SAME single-use body. Control flow is unchanged — a
+          // 409 is still returned as {applied:false,...}; a LATER behavior unit acts on staleClaim.
+          if (fields.credentialSwitch !== undefined)
+            ack.credentialSwitch = fields.credentialSwitch;
+          if (fields.staleClaim !== undefined)
+            ack.staleClaim = fields.staleClaim;
           if (!ack.applied) {
             this.log.info("state report not applied server-side", {
               run_id: runId,
@@ -577,9 +593,12 @@ export class WorkerClient {
     )) as RecoveryHoldsResponse;
   }
 
-  async getInputs(runId: string): Promise<UserInput[]> {
+  async getInputs(runId: string): Promise<{ inputs: UserInput[]; credentialSwitch?: { generation: number } }> {
     const res = (await this.getJSON(`${WORKER_API_PREFIX}/runs/${runId}/inputs`)) as InputsResponse;
-    return res.inputs ?? [];
+    // PRD #1247 M5 (INERT seam): the held-state credential-switch signal rides EVERY inputs response
+    // (including an empty-inputs poll), so surface it beside the inputs for a LATER behavior unit.
+    // Today every caller reads `.inputs` and ignores the signal, so behavior is unchanged.
+    return { inputs: res.inputs ?? [], credentialSwitch: res.credential_switch };
   }
 
   /** issue #559: lightweight read-only ownership/terminality probe for the interactive
@@ -1063,6 +1082,8 @@ export async function readRunAck(res: Response): Promise<{
   completedCount?: number;
   pauseRequested?: boolean;
   budgetExhausted?: boolean;
+  credentialSwitch?: { generation: number };
+  staleClaim?: boolean;
 }> {
   try {
     const text = await res.text();
@@ -1078,6 +1099,10 @@ export async function readRunAck(res: Response): Promise<{
         pause_requested?: unknown;
         completion_budget_exhausted?: unknown;
       };
+      // PRD #1247 M5 (INERT seam): the held-state signal + stale-claim disposition ride TOP-LEVEL,
+      // beside `run`, not inside it.
+      credential_switch?: unknown;
+      disposition?: unknown;
     };
     const run = parsed?.run;
     const out: {
@@ -1089,6 +1114,8 @@ export async function readRunAck(res: Response): Promise<{
       completedCount?: number;
       pauseRequested?: boolean;
       budgetExhausted?: boolean;
+      credentialSwitch?: { generation: number };
+      staleClaim?: boolean;
     } = {};
     if (typeof run?.status === "string") out.status = run.status;
     if (typeof run?.budget_max_iterations === "number")
@@ -1122,6 +1149,15 @@ export async function readRunAck(res: Response): Promise<{
     // reads as "no budget-exhausted steer".
     if (typeof run?.completion_budget_exhausted === "boolean")
       out.budgetExhausted = run.completion_budget_exhausted;
+    // PRD #1247 M5 (INERT seam): the held-state credential-switch signal and the stale-claim
+    // disposition ride the SAME single-use body, TOP-LEVEL beside `run` (present on the 200 ack, the
+    // ordinary 409, and — for stale_claim — the superseded/released 409). Both additive + optional
+    // and total-by-construction like the rest of this parse: a malformed/absent value leaves the
+    // field undefined. A LATER behavior unit acts on them; nothing reads them today.
+    const cs = parsed?.credential_switch;
+    if (typeof cs === "object" && cs !== null && typeof (cs as { generation?: unknown }).generation === "number")
+      out.credentialSwitch = { generation: (cs as { generation: number }).generation };
+    if (parsed?.disposition === "stale_claim") out.staleClaim = true;
     return out;
   } catch {
     return {};

@@ -48,6 +48,16 @@ export type RunState =
    *  `running`, and the worker CONTINUES the run. The human-readable reason rides the worker's
    *  own `pause_failed` feed message, not this report. */
   | "pause_failed"
+  /** PRD #1247 M5 (INERT wire seam, M5b): the worker's held-state credential-switch RELEASE report.
+   *  A capability worker acknowledges a requested switch by releasing its claim — reported as
+   *  `{status: "credential_switch", claim_generation}` — so the server's fence can hand the run to a
+   *  fresh flight. Declared here for a LATER behavior unit; nothing in the worker reports it today. */
+  | "credential_switch"
+  /** PRD #1247 M5: the worker's held-state credential-switch GIVE-UP report (the give-up branch is
+   *  added server-side by the parallel Go unit) — `{status: "credential_switch_failed",
+   *  claim_generation}`, sent when the worker cannot complete the release. INERT here (declared for
+   *  the LATER unit); nothing reports it today. */
+  | "credential_switch_failed"
   | "completed"
   | "failed";
 
@@ -1067,6 +1077,17 @@ export interface ClaimResponse {
    *  silently lose the behaviour the user chose. Absent on an older server ⇒ false,
    *  i.e. a limit death fails the run as it does today. */
   wait_on_limit?: boolean;
+  /** PRD #1247 M5 (D13): which phase a RESUME claim should RESTORE instead of re-entering the
+   *  planning turn — one of "awaiting_input", "awaiting_approval", "implementing", or absent/""
+   *  (a fresh run with no prior phase). Derived server-side from the run row
+   *  (workersvc.ClaimPayload.ResumePhase). Additive + optional; a LATER behavior unit consumes it,
+   *  nothing reads it today. */
+  resume_phase?: string;
+  /** PRD #1247 M5 (D13): the run_messages seq of the submitted plan frame the gate is parked on,
+   *  carried ONLY when `resume_phase == "awaiting_approval"` so a reclaim can correlate a buffered
+   *  approve_plan with the right plan revision (workersvc.ClaimPayload.ResumePlanSeq). 0/absent for
+   *  every other phase. Additive + optional. */
+  resume_plan_seq?: number;
 }
 
 /** One deterministic missing-executable hit (PRD #46 Decision 4). */
@@ -1530,6 +1551,12 @@ export interface OutgoingMessage {
 
 export interface MessagesRequest {
   messages: OutgoingMessage[];
+  /** PRD #1247 M5 (INERT seam): the claim-lane generation the reporting worker holds. A CAPABILITY
+   *  worker stamps it on every message batch so the server's per-query fence can engage — a
+   *  released/reclaimed old flight's batch then persists nothing (the api decodes it as
+   *  `ClaimGeneration *int64`). Optional so a legacy worker omits it and the append stays unfenced.
+   *  A LATER behavior unit stamps it; nothing sets it today. */
+  claim_generation?: number;
 }
 
 /**
@@ -1719,6 +1746,10 @@ export type PublishResult =
 
 export interface StateRequest {
   status: RunState;
+  /** PRD #1247 M5 (INERT seam): the claim-lane generation the worker holds. Stamped by a capability
+   *  worker on every mutating report so the server's fence can engage; optional so a legacy worker
+   *  omits it. A LATER behavior unit stamps it; nothing sets it today. */
+  claim_generation?: number;
   /** awaiting_approval carries the captured plan; an autopilot `running` report also
    *  carries it, persisted durably via SetRunAutopilotPlan (RC1 #1197). */
   plan_md?: string;
@@ -1980,6 +2011,18 @@ export interface StateAck {
    *  boolean; the server owns the rule. Absent/non-boolean (older server, unparseable body) ⇒
    *  treated as false = "no budget-exhausted steer". */
   budgetExhausted?: boolean;
+  /** PRD #1247 M5 (INERT seam): the worker-facing held-state credential-switch signal, read
+   *  TOP-LEVEL off the /state ack body (beside `run`, on both the 200 ack and the ordinary
+   *  not-applied 409). Present when a switch is pending for the claim the worker still holds; the
+   *  `generation` is the one the worker must release at. Absent otherwise. A LATER behavior unit
+   *  acts on it; nothing reads it today. */
+  credentialSwitch?: { generation: number };
+  /** PRD #1247 M5 (INERT seam): true when the /state ack carried the top-level
+   *  `disposition: "stale_claim"` (a 409) — a held-state switch RELEASED this claim, or a reclaim
+   *  SUPERSEDED it, so the old flight must STOP without further reports. Absent otherwise.
+   *  reportState still returns a stale-claim 409 as `{applied:false,...}` — control flow is
+   *  unchanged; a LATER behavior unit acts on this flag. */
+  staleClaim?: boolean;
 }
 
 export interface UserInput {
@@ -1996,6 +2039,12 @@ export interface UserInput {
 
 export interface InputsResponse {
   inputs: UserInput[];
+  /** PRD #1247 M5 (INERT seam): the held-state credential-switch signal, surfaced on EVERY inputs
+   *  response — including an empty-inputs poll (the idle gate/question/follow-up waiters poll this
+   *  route continuously) — so the worker holding the current claim learns a switch was requested.
+   *  Present only when a switch is pending for this claim; omitted otherwise. A LATER behavior unit
+   *  acts on it; nothing reads it today. */
+  credential_switch?: { generation: number };
 }
 
 /** Response of the interactive park-skip ownership probe (issue #559): the current

@@ -233,6 +233,13 @@ export class MessageBatcher {
   /** Cap on the NEXT prefix's message count, set when a 413 says to split. */
   private splitLimit: number | undefined;
   private permanentFailureHandler: ((info: PermanentFailureInfo) => void) | undefined;
+  /**
+   * The claim-lane generation stamped on every message batch this batcher flushes (PRD #1247 M5,
+   * INERT seam). Undefined today (and for every legacy worker) ⇒ postMessages omits
+   * `claim_generation` and the wire body is byte-identical. A LATER behavior unit sets it from the
+   * flight's claim so the server's fence can engage.
+   */
+  private claimGeneration: number | undefined;
   private seq: number;
   private timer: NodeJS.Timeout | undefined;
   private flushing = false;
@@ -264,11 +271,22 @@ export class MessageBatcher {
     redact?: PayloadRedactor,
     redactText?: TextRedactor,
     opts: MessageBatcherOptions = {},
+    claimGeneration?: number,
   ) {
     this.seq = lastSeq;
     this.redact = redact ?? ((p) => p);
     this.redactText = redactText ?? ((s) => s);
     this.permanentFailureHandler = opts.onPermanentFailure;
+    this.claimGeneration = claimGeneration;
+  }
+
+  /**
+   * Set (or clear) the claim-lane generation stamped on every SUBSEQUENT message batch (PRD #1247
+   * M5, INERT seam). Unset (today) ⇒ postMessages omits `claim_generation` and the wire body is
+   * byte-identical. A LATER behavior unit sets it from the flight's claim.
+   */
+  setClaimGeneration(generation: number | undefined): void {
+    this.claimGeneration = generation;
   }
 
   emit(msg: EmittedMessage): void {
@@ -524,6 +542,7 @@ export class MessageBatcher {
           this.runId,
           half.map((b) => b.msg),
           signal,
+          this.claimGeneration,
         );
         lo = mid; // confirmed clean by a 2xx
         progressed = true; // a sub-batch was persisted
@@ -577,7 +596,7 @@ export class MessageBatcher {
       bisect_posts: posts,
     });
     try {
-      await this.client.postMessages(this.runId, [marker.msg], signal);
+      await this.client.postMessages(this.runId, [marker.msg], signal, this.claimGeneration);
       progressed = true; // the poison was isolated and tombstoned
       return { remaining: batch.slice(lo + 1), progressed };
     } catch (err) {
@@ -613,6 +632,7 @@ export class MessageBatcher {
             this.runId,
             batch.map((b) => b.msg),
             signal,
+            this.claimGeneration,
           );
           // Any success clears the backoff, the failure clock and the split limit.
           this.consecutiveFailures = 0;
