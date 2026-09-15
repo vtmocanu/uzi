@@ -191,8 +191,9 @@ func TestSetStateFenceConcurrentInterleaveLiveDB(t *testing.T) {
 // D4/D14): at the right generation it requeues the held run, sets claim_released_at, BANKS the
 // held gap into budget_paused_seconds (the banked-gap column), PRESERVES started_at, and KEEPS the
 // switch stamp (credential_switch_requested_at + credential_switch_generation). A wrong generation
-// is rejected (0-row, not idempotent). Dropping the release query's `claim_released_at IS NULL`
-// conjunct is caught by TestReleaseCredentialSwitchIdempotentRedeliveryLiveDB.
+// is rejected (0-row, not idempotent). The release query's `claim_released_at IS NULL` conjunct
+// is DEFENSE IN DEPTH here (the wrong-generation case is excluded by the generation compare, not
+// the conjunct); it is isolated and pinned by TestReleaseCredentialSwitchReleasedConjunctLiveDB.
 func TestReleaseCredentialSwitchLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	svc := fenceSvc(env)
@@ -245,10 +246,14 @@ func TestReleaseCredentialSwitchLiveDB(t *testing.T) {
 
 // TestReleaseCredentialSwitchIdempotentRedeliveryLiveDB is the retained-retry (PRD #1247 M5, D14):
 // a redelivered same-generation release after the release already applied — and a redelivery after
-// a reclaim — both converge to IDEMPOTENT SUCCESS, NOT a stale write and NOT a double-release. It
-// is the test the `claim_released_at IS NULL` conjunct in ReleaseCredentialSwitch protects:
-// dropping it makes the redelivery MATCH (rows=1), re-banking the gap and re-stamping
-// claim_released_at — which this test's "unchanged" assertions catch.
+// a reclaim — both converge to IDEMPOTENT SUCCESS, NOT a stale write and NOT a double-release.
+//
+// It does NOT pin the release query's `claim_released_at IS NULL` conjunct (a prior comment
+// over-claimed that it did). Both redelivery cases here are excluded INDEPENDENTLY of that
+// conjunct: after a release the run is 'queued' (excluded by the query's status IN (...) clause),
+// and after a reclaim the generation has advanced past g (excluded by claim_generation = @generation).
+// Dropping the conjunct leaves both sub-tests green. The conjunct is isolated and pinned by
+// TestReleaseCredentialSwitchReleasedConjunctLiveDB instead.
 func TestReleaseCredentialSwitchIdempotentRedeliveryLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	svc := fenceSvc(env)
@@ -421,5 +426,210 @@ func TestInsertRunMessageFenceLiveDB(t *testing.T) {
 	}
 	if countMsgs() != 2 {
 		t.Fatalf("message count = %d, want 2 (a legacy append is unfenced)", countMsgs())
+	}
+}
+
+// TestSetStateFailsClosedForCapabilityWorkerLiveDB is the M5a-1 rework fail-closed guard (auditor
+// fail-open finding): a worker that ADVERTISES credential_switch_v1 MUST stamp claim_generation on
+// a mutating report, so omitting it is REFUSED (ErrMissingClaimGeneration) rather than running
+// unfenced — closing the "downgrade by omission" bypass. A LEGACY worker (no capability) that omits
+// the field is still honoured unfenced (back-compat). Dropping the fail-closed check in SetState
+// reddens the first sub-test (the capability worker's omission would apply).
+func TestSetStateFailsClosedForCapabilityWorkerLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	svc := fenceSvc(env)
+	o := seedReevalOwner(t, env, BindModeAuto, false)
+	capWkr := store.Worker{ID: o.workerID, UserID: o.userID, ProtocolCapabilities: []string{capability.CredentialSwitchV1}}
+	legacyWkr := store.Worker{ID: o.workerID, UserID: o.userID}
+	g := int64(7)
+
+	t.Run("capability worker omitting generation is rejected", func(t *testing.T) {
+		id := seedHeldRun(t, env, o, 5700, "running", g, false, false)
+		_, applied, err := svc.SetState(env.ctx, capWkr, id, runningReport(nil))
+		if !errors.Is(err, ErrMissingClaimGeneration) {
+			t.Fatalf("capability worker without generation: err = %v, want ErrMissingClaimGeneration", err)
+		}
+		if applied {
+			t.Fatal("a fail-closed report must not be applied")
+		}
+		if got := statusOf(t, env, id); got != "running" {
+			t.Fatalf("status = %q, want running UNCHANGED (the refused report wrote nothing)", got)
+		}
+	})
+
+	t.Run("legacy worker omitting generation is honoured unfenced", func(t *testing.T) {
+		id := seedHeldRun(t, env, o, 5701, "running", g, false, false)
+		run, applied, err := svc.SetState(env.ctx, legacyWkr, id, runningReport(nil))
+		if err != nil {
+			t.Fatalf("legacy worker without generation: err = %v, want nil (unfenced back-compat)", err)
+		}
+		if !applied || run.Status != "running" {
+			t.Fatalf("legacy report applied=%v status=%q, want applied running", applied, run.Status)
+		}
+	})
+}
+
+// TestAppendMessagesFailsClosedForCapabilityWorkerLiveDB is the message-append half of the same
+// fail-closed guard: a capability worker that omits claim_generation on a batch is refused
+// (ErrMissingClaimGeneration) and persists NOTHING, while a legacy worker's unstamped batch persists
+// unfenced. Dropping the fail-closed check in appendMessages reddens the first assertion (the
+// capability batch would land unfenced).
+func TestAppendMessagesFailsClosedForCapabilityWorkerLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	svc := New(env.q, env.box, testParams())
+	o := seedReevalOwner(t, env, BindModeAuto, false)
+	capWkr := store.Worker{ID: o.workerID, UserID: o.userID, ProtocolCapabilities: []string{capability.CredentialSwitchV1}}
+	legacyWkr := store.Worker{ID: o.workerID, UserID: o.userID}
+	g := int64(5)
+	id := seedHeldRun(t, env, o, 5710, "running", g, false, false)
+
+	msg := func(seq int32) IncomingMessage {
+		return IncomingMessage{Seq: seq, Kind: "text", Payload: []byte(`{"t":"x"}`)}
+	}
+	countMsgs := func() int {
+		var n int
+		if err := env.pool.QueryRow(env.ctx, `SELECT count(*) FROM run_messages WHERE run_id = $1`, id).Scan(&n); err != nil {
+			t.Fatalf("count messages: %v", err)
+		}
+		return n
+	}
+
+	if err := svc.AppendMessagesForClaim(env.ctx, capWkr, id, []IncomingMessage{msg(1)}, nil); !errors.Is(err, ErrMissingClaimGeneration) {
+		t.Fatalf("capability worker append without generation: err = %v, want ErrMissingClaimGeneration", err)
+	}
+	if countMsgs() != 0 {
+		t.Fatalf("a fail-closed append must persist nothing; got %d", countMsgs())
+	}
+	if err := svc.AppendMessages(env.ctx, legacyWkr, id, []IncomingMessage{msg(2)}); err != nil {
+		t.Fatalf("legacy append: %v", err)
+	}
+	if countMsgs() != 1 {
+		t.Fatalf("a legacy append must persist unfenced; got %d", countMsgs())
+	}
+}
+
+// TestSetLimitWaitGenerationFenceLiveDB proves the M5a-1-rework per-query fence on SetRunLimitWait
+// (reviewer NB1): an OLD-generation limit_wait report against a run already RECLAIMED to G+1 under
+// same-worker affinity (status stays 'running', worker unchanged — so the status guard alone does
+// NOT exclude it) is fenced out (0 rows, not applied) and cannot clobber the reclaiming flight's
+// run. A CURRENT-generation report on the same run DOES park, proving the FENCE — not the park
+// decision — rejected the stale one. Dropping the fence conjunct from SetRunLimitWait reddens the
+// old-generation assertion (the stale park would apply and flip the run to limit_wait).
+func TestSetLimitWaitGenerationFenceLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	// A svc whose limit-park budget actually parks (testParams leaves MaxWaits/MaxPark at 0, which
+	// opts every report OUT of the park path), so the report exercises SetRunLimitWait, not the
+	// opt-out SetRunFailed.
+	p := testParams()
+	p.RunLimitMaxWaits = 5
+	p.RunLimitMaxPark = 2 * time.Hour
+	svc := New(env.q, env.box, p)
+	svc.SetTxBeginner(env.pool)
+	o := seedReevalOwner(t, env, BindModeAuto, false)
+	wkr := store.Worker{ID: o.workerID, UserID: o.userID}
+	g := int64(4)
+
+	id := seedHeldRun(t, env, o, 5800, "running", g, false, false)
+	env.exec(`UPDATE runs SET wait_on_limit = true, claim_generation = claim_generation + 1 WHERE id = $1`, id)
+
+	// OLD generation (g) against the run now at g+1: fenced out.
+	_, applied, err := svc.SetState(env.ctx, wkr, id, StateRequest{State: "limit_wait", ClaimGeneration: &g})
+	if err != nil {
+		t.Fatalf("old-generation limit_wait: err = %v, want nil (0-row no-op ack)", err)
+	}
+	if applied {
+		t.Fatal("an old-generation park must NOT apply (fenced out)")
+	}
+	if got := statusOf(t, env, id); got != "running" {
+		t.Fatalf("status = %q, want the reclaimed run UNCHANGED at running (a stale park must not clobber it)", got)
+	}
+
+	// CURRENT generation (g+1) parks — the fence, not the park decision, rejected the old one.
+	cur := g + 1
+	_, applied2, err := svc.SetState(env.ctx, wkr, id, StateRequest{State: "limit_wait", ClaimGeneration: &cur})
+	if err != nil {
+		t.Fatalf("current-generation limit_wait: %v", err)
+	}
+	if !applied2 {
+		t.Fatal("a current-generation park must apply")
+	}
+	if got := statusOf(t, env, id); got != "limit_wait" {
+		t.Fatalf("status = %q, want limit_wait after the current-generation park", got)
+	}
+}
+
+// TestSetRecoveryWaitGenerationFenceLiveDB is the recovery_wait analog of the above (reviewer NB1):
+// an OLD-generation recovery_wait report against a run reclaimed to G+1 is fenced out (0 rows, not
+// applied); a current-generation report parks. recovery_wait always parks (no opt-out), so it needs
+// no special budget. Dropping the fence conjunct from SetRunRecoveryWait reddens the old-generation
+// assertion.
+func TestSetRecoveryWaitGenerationFenceLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	svc := fenceSvc(env)
+	o := seedReevalOwner(t, env, BindModeAuto, false)
+	wkr := store.Worker{ID: o.workerID, UserID: o.userID}
+	g := int64(4)
+
+	id := seedHeldRun(t, env, o, 5810, "running", g, false, false)
+	env.exec(`UPDATE runs SET claim_generation = claim_generation + 1 WHERE id = $1`, id)
+
+	_, applied, err := svc.SetState(env.ctx, wkr, id, StateRequest{State: "recovery_wait", ClaimGeneration: &g})
+	if err != nil {
+		t.Fatalf("old-generation recovery_wait: err = %v, want nil (0-row no-op ack)", err)
+	}
+	if applied {
+		t.Fatal("an old-generation recovery park must NOT apply (fenced out)")
+	}
+	if got := statusOf(t, env, id); got != "running" {
+		t.Fatalf("status = %q, want the reclaimed run UNCHANGED at running", got)
+	}
+
+	cur := g + 1
+	_, applied2, err := svc.SetState(env.ctx, wkr, id, StateRequest{State: "recovery_wait", ClaimGeneration: &cur})
+	if err != nil {
+		t.Fatalf("current-generation recovery_wait: %v", err)
+	}
+	if !applied2 {
+		t.Fatal("a current-generation recovery park must apply")
+	}
+	if got := statusOf(t, env, id); got != "recovery_wait" {
+		t.Fatalf("status = %q, want recovery_wait after the current-generation park", got)
+	}
+}
+
+// TestReleaseCredentialSwitchReleasedConjunctLiveDB isolates the release query's
+// `claim_released_at IS NULL` conjunct (M5a-1 rework, tester finding) so it is genuinely
+// load-bearing rather than only defense-in-depth. It forces the ARTIFICIAL state the normal flow
+// never produces — a claim already RELEASED (claim_released_at set) while the run is STILL in a
+// held status ('running') at the SAME generation — directly via SQL. In that state ONLY the
+// conjunct excludes the release: the status IN (...) clause admits 'running' and the generation
+// compare admits g. So a same-generation release must be REFUSED (0 rows, the run untouched);
+// dropping the conjunct makes it MATCH and requeue the run to 'queued', which the status assertion
+// reddens.
+func TestReleaseCredentialSwitchReleasedConjunctLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	svc := fenceSvc(env)
+	o := seedReevalOwner(t, env, BindModeAuto, false)
+	wkr := store.Worker{ID: o.workerID, UserID: o.userID}
+	g := int64(8)
+
+	id := seedHeldRun(t, env, o, 5900, "running", g, true, true) // withStamp + released, but held
+	before := mustRun(t, env, id)
+	if !before.ClaimReleasedAt.Valid || before.Status != "running" {
+		t.Fatalf("precondition: want a released run still at running; got released=%v status=%q", before.ClaimReleasedAt.Valid, before.Status)
+	}
+
+	run, _, err := svc.SetState(env.ctx, wkr, id, StateRequest{State: "credential_switch", ClaimGeneration: &g})
+	if err != nil {
+		t.Fatalf("release against a released-but-held run: err = %v, want nil (0-row no-op)", err)
+	}
+	if run.Status != "running" {
+		t.Fatalf("status = %q, want the run UNCHANGED at running (dropping `claim_released_at IS NULL` would requeue it to 'queued')", run.Status)
+	}
+	if !run.ClaimReleasedAt.Time.Equal(before.ClaimReleasedAt.Time) {
+		t.Fatalf("claim_released_at moved (%v -> %v): the conjunct must prevent a re-release", before.ClaimReleasedAt.Time, run.ClaimReleasedAt.Time)
+	}
+	if run.BudgetPausedSeconds != before.BudgetPausedSeconds {
+		t.Fatalf("budget_paused_seconds re-banked (%d -> %d): the conjunct must prevent a re-release", before.BudgetPausedSeconds, run.BudgetPausedSeconds)
 	}
 }

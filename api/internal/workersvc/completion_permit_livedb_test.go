@@ -365,6 +365,80 @@ func TestCompletionRevisionBumpUnderLockStaysNonTerminalLiveDB(t *testing.T) {
 	}
 }
 
+// TestCompletionGenerationFenceLiveDB drives completeRunWithPermit's generation fence (PRD #1247
+// M5, D3) end to end through a completed report carrying claim_generation, against an INTERLOCKED
+// run with a granted permit — coverage the interlocked completion arm lacked (tester BLOCKING gap):
+//   - (a) matching generation + not released -> completion proceeds (happy path);
+//   - (b1) generation mismatch (a superseding reclaim bumped it) -> ErrStaleClaim, not completed;
+//   - (b2) claim_released_at set at the matching generation -> ErrStaleClaim, not completed.
+//
+// The permit is issued in every case, so ONLY the generation fence distinguishes them. A mutation
+// flipping the fence boolean (== for !=) reddens (a); dropping the fence reddens (b1) and (b2).
+func TestCompletionGenerationFenceLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	svc := e.permitService(t)
+	wid := e.seedWorker(t, []string{"completion_interlock_v1"})
+	wkr := store.Worker{ID: wid}
+	const (
+		head   = "d0d0feed"
+		branch = "agent/issue-1"
+	)
+	g := int64(3)
+	permit := func(runID uuid.UUID) {
+		t.Helper()
+		if p, err := svc.RequestCompletionPermit(e.ctx, wkr, runID,
+			CompletionPermitRequest{ContractRevision: 1, Branch: branch, Head: head}); err != nil || !p.Granted {
+			t.Fatalf("permit must be granted: %+v err=%v", p, err)
+		}
+	}
+
+	// (a) HAPPY PATH: matching generation, not released -> the permitted completion terminates.
+	happy := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
+	e.exec(t, `UPDATE runs SET claim_generation = $2 WHERE id = $1`, happy, g)
+	permit(happy)
+	run, applied, err := svc.SetState(e.ctx, wkr, happy,
+		StateRequest{State: "completed", Head: strPtr(head), Branch: strPtr(branch), ClaimGeneration: &g})
+	if err != nil {
+		t.Fatalf("matching-generation completion: %v", err)
+	}
+	if !applied || run.Status != "completed" {
+		t.Fatalf("a matching-generation permitted completion must terminate the run; applied=%v status=%q", applied, run.Status)
+	}
+
+	// (b1) GENERATION MISMATCH: a reclaim bumped the run past the reported generation.
+	mismatch := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
+	e.exec(t, `UPDATE runs SET claim_generation = $2 WHERE id = $1`, mismatch, g)
+	permit(mismatch)
+	wrong := g + 1
+	_, applied, err = svc.SetState(e.ctx, wkr, mismatch,
+		StateRequest{State: "completed", Head: strPtr(head), Branch: strPtr(branch), ClaimGeneration: &wrong})
+	if !errors.Is(err, ErrStaleClaim) {
+		t.Fatalf("generation-mismatch completion: err = %v, want ErrStaleClaim", err)
+	}
+	if applied {
+		t.Fatal("a generation-mismatch completion must not apply")
+	}
+	if s := e.runStatus(t, mismatch); s != "running" {
+		t.Fatalf("run must stay non-terminal on a stale completion; status = %q", s)
+	}
+
+	// (b2) RELEASED CLAIM at the matching generation: a held-state switch released this claim.
+	released := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
+	e.exec(t, `UPDATE runs SET claim_generation = $2, claim_released_at = now() WHERE id = $1`, released, g)
+	permit(released)
+	_, applied, err = svc.SetState(e.ctx, wkr, released,
+		StateRequest{State: "completed", Head: strPtr(head), Branch: strPtr(branch), ClaimGeneration: &g})
+	if !errors.Is(err, ErrStaleClaim) {
+		t.Fatalf("released-claim completion: err = %v, want ErrStaleClaim", err)
+	}
+	if applied {
+		t.Fatal("a released-claim completion must not apply")
+	}
+	if s := e.runStatus(t, released); s != "running" {
+		t.Fatalf("run must stay non-terminal on a released-claim completion; status = %q", s)
+	}
+}
+
 // TestLegacyCompletionPassthroughLiveDB: a legacy run (completion_contract_version NULL)
 // completes through the unchanged path, needing no permit.
 func TestLegacyCompletionPassthroughLiveDB(t *testing.T) {

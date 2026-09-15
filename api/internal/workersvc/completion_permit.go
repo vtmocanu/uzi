@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -542,10 +544,21 @@ func (s *Service) completeRunWithPermit(ctx context.Context, wkr store.Worker, o
 	// it (claim_generation advanced) since the permit was issued, the completion is stale — a
 	// released run is 'queued', which SetRunCompleted's permissive guard WOULD otherwise complete,
 	// letting an old flight complete the run the new flight is working. Reject atomically under
-	// the lock; SetState's completed arm maps this to the stale_claim disposition. A legacy report
-	// (nil generation) skips the check, byte-identical to before.
-	if req.ClaimGeneration != nil && (run.ClaimGeneration != *req.ClaimGeneration || run.ClaimReleasedAt.Valid) {
-		return 0, false, ErrStaleClaim
+	// the lock; SetState's completed arm maps this to the stale_claim disposition.
+	//
+	// M5a-1 rework (auditor fail-open finding): FAIL CLOSED for a capability worker. The top of
+	// SetState skips interlocked-completed (stateUsesGenerationFence is false for it), so the
+	// fail-closed check for THIS arm lives here: a worker advertising credential_switch_v1 that
+	// OMITS the generation is refused (ErrMissingClaimGeneration) rather than completing unfenced.
+	// A LEGACY worker (no capability, nil generation) skips the fence entirely, byte-identical to
+	// before.
+	switch {
+	case req.ClaimGeneration != nil:
+		if run.ClaimGeneration != *req.ClaimGeneration || run.ClaimReleasedAt.Valid {
+			return 0, false, ErrStaleClaim
+		}
+	case slices.Contains(wkr.ProtocolCapabilities, capability.CredentialSwitchV1):
+		return 0, false, ErrMissingClaimGeneration
 	}
 
 	// The revision that binds the permit identity MUST come from the LOCKED row, not the pre-tx

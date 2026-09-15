@@ -195,6 +195,15 @@ var (
 	// 409 carrying the run plus disposition:"stale_claim"), which the new worker reads to STOP
 	// the flight without further reports; an ordinary applied=false 409 keeps its meaning.
 	ErrStaleClaim = errors.New("run claim is stale (released or superseded)")
+	// ErrMissingClaimGeneration rejects a worker-driven MUTATING report from a CAPABILITY worker
+	// (one advertising capability.CredentialSwitchV1) that OMITS claim_generation (PRD #1247
+	// M5a-1 rework, auditor fail-open finding). The fence engages only when a report stamps a
+	// generation, so without this a capability worker could bypass it entirely by dropping the
+	// field. Making "legacy" a per-WORKER-capability property (not a per-request field-presence
+	// choice) closes that hole: a capability worker MUST stamp the generation, while a legacy
+	// worker (no capability) is still honoured unfenced when it omits it. The handler maps this to
+	// the SAME stale/refuse ack as ErrStaleClaim (a 409 with disposition:"stale_claim").
+	ErrMissingClaimGeneration = errors.New("capability worker omitted claim_generation on a mutating report")
 	// ErrRunNotAwaitingInput rejects an `answer` for a run that is not parked on a
 	// clarification question (PRD #88 M1) → 409. Its sibling ErrStaleAnswer covers the
 	// run that IS parked but on a DIFFERENT question — the two are separated because
@@ -2426,6 +2435,21 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	if req.State == "credential_switch" {
 		return s.releaseCredentialSwitch(ctx, owned, wkr, req)
 	}
+	// PRD #1247 M5a-1 rework (auditor fail-open finding): FAIL CLOSED for a CAPABILITY worker. The
+	// fence below engages only when the report STAMPS a generation, so a worker advertising
+	// credential_switch_v1 could otherwise bypass it entirely by OMITTING claim_generation on a
+	// mutating report. Make "legacy" a per-WORKER-capability property, not a per-request
+	// field-presence choice: a worker that advertises the capability MUST stamp the generation on
+	// every fenced mutating transition, so an omission is refused (ErrMissingClaimGeneration → the
+	// same 409/stale_claim ack as ErrStaleClaim). A LEGACY worker (no capability) is still honoured
+	// unfenced when it omits the field — back-compat by construction. INTERLOCKED completion is
+	// excluded here (stateUsesGenerationFence is false for it) and enforces the identical check
+	// inside completeRunWithPermit's permit transaction, where the rest of that arm's fence lives.
+	if req.ClaimGeneration == nil &&
+		stateUsesGenerationFence(req.State, owned) &&
+		slices.Contains(wkr.ProtocolCapabilities, capability.CredentialSwitchV1) {
+		return owned, false, ErrMissingClaimGeneration
+	}
 	// PRD #1247 M5 (D3): the released-generation fence. A CAPABILITY worker stamps
 	// req.ClaimGeneration on every mutating report; we then run the state transition under a
 	// FOR UPDATE lock on the run row and REJECT the report (ErrStaleClaim) when the run's
@@ -2445,7 +2469,7 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			_ = fenceTx.Rollback(ctx)
 		}
 	}()
-	if req.ClaimGeneration != nil && stateUsesGenerationFence(req.State, owned) {
+	if req.ClaimGeneration != nil && stateUsesForUpdateFence(req.State, owned) {
 		if s.txBeginner == nil {
 			return store.Run{}, false, fmt.Errorf("state fence unavailable: no tx beginner wired for run %s", runID)
 		}
@@ -2741,10 +2765,13 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			// PRD #1247 M5 (D3): the interlocked completion runs its OWN permit transaction, so
 			// it cannot nest under an outer FOR UPDATE fence (self-deadlock) — it is
 			// generation-fenced INSIDE that lock instead and returns ErrStaleClaim when a
-			// released/reclaimed old flight tries to consume a stale permit. Surface it with the
-			// pre-tx run row so the handler renders the stale_claim disposition.
-			if errors.Is(err, ErrStaleClaim) {
-				return owned, false, ErrStaleClaim
+			// released/reclaimed old flight tries to consume a stale permit. It ALSO enforces the
+			// M5a-1 fail-closed check (a capability worker that omitted claim_generation →
+			// ErrMissingClaimGeneration), since interlocked-completed does not pass through the
+			// top-of-SetState check above. Surface either with the pre-tx run row so the handler
+			// renders the stale_claim disposition.
+			if errors.Is(err, ErrStaleClaim) || errors.Is(err, ErrMissingClaimGeneration) {
+				return owned, false, err
 			}
 			if err == nil && idempotent {
 				run, rerr := s.runOwnedByWorker(ctx, runID, wkr)

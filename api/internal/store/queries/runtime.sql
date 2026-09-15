@@ -1756,7 +1756,16 @@ UPDATE runs SET
     updated_at           = now()
 WHERE id = @id AND worker_id = @worker_id
   AND status = 'running'
-  AND kind <> 'judge';
+  AND kind <> 'judge'
+  -- PRD #1247 M5a-1 rework (reviewer NB1): the per-query generation fence, the SAME nil-guarded
+  -- shape as InsertRunMessage. A CAPABILITY worker stamps claim_generation on the park report;
+  -- a stale report from an OLD flight — reclaimed to a NEW generation under same-worker affinity
+  -- (status 'running' and worker_id both still match, so the status guard alone does NOT exclude
+  -- it), or against a released claim — matches 0 rows here, so a fenced-out park cannot clobber
+  -- the reclaiming flight's run. A legacy worker (NULL generation) parks unconditionally,
+  -- unchanged. sqlc.narg, never @name (this file's multibyte comment blocks break the @name parser).
+  AND (sqlc.narg('claim_generation')::bigint IS NULL
+       OR (claim_generation = sqlc.narg('claim_generation')::bigint AND claim_released_at IS NULL));
 
 -- name: PromoteLimitWaitRuns :many
 -- The sweeper's promotion pass (PRD #35 M2): limit_wait → queued once the clock
@@ -1961,7 +1970,15 @@ UPDATE runs SET
     updated_at                = now()
 WHERE id = @id AND worker_id = @worker_id
   AND status = 'running'
-  AND kind <> 'judge';
+  AND kind <> 'judge'
+  -- PRD #1247 M5a-1 rework (reviewer NB1): the per-query generation fence, identical to
+  -- SetRunLimitWait's and the SAME nil-guarded shape as InsertRunMessage. A stale report from an
+  -- OLD flight — reclaimed to a NEW generation under same-worker affinity, or against a released
+  -- claim — matches 0 rows, so a fenced-out park cannot clobber the reclaiming flight's run. A
+  -- legacy worker (NULL generation) parks unconditionally, unchanged. sqlc.narg, never @name (the
+  -- multibyte comment blocks break the @name parser).
+  AND (sqlc.narg('claim_generation')::bigint IS NULL
+       OR (claim_generation = sqlc.narg('claim_generation')::bigint AND claim_released_at IS NULL));
 
 -- name: PromoteRecoveryWaitRuns :many
 -- The sweeper's transient-recovery promotion pass (issue #1197): recovery_wait -> queued
@@ -2170,8 +2187,15 @@ RETURNING id, user_id, status;
 -- by the reporting worker (worker_id), and in one of the HELD states. A stale redelivery (the
 -- claim was released, or a reclaim bumped the generation) matches 0 rows; the caller
 -- distinguishes an already-applied/already-reclaimed redelivery (idempotent success) from an
--- unexpected state by re-reading the run (releaseCredentialSwitch). Dropping the
--- claim_released_at IS NULL conjunct is the mutation TestReleaseCredentialSwitch*LiveDB pins.
+-- unexpected state by re-reading the run (releaseCredentialSwitch).
+--
+-- The claim_released_at IS NULL conjunct is DEFENSE IN DEPTH, not the pin of the idempotent
+-- redelivery test: both redelivery cases are already excluded INDEPENDENTLY — an already-released
+-- run is 'queued' (excluded by the status IN (...) clause below), and a reclaimed run is at a
+-- higher generation (excluded by claim_generation = @generation). What the conjunct alone catches
+-- is the ARTIFICIAL state a released claim still in a held status (which the normal flow never
+-- produces), pinned by TestReleaseCredentialSwitchReleasedConjunctLiveDB, which forces that state
+-- directly and asserts a same-generation release is refused.
 --
 -- THE BUDGET RULE IS THE GATE-PARK/PAUSE ONE (Open Question 3, D14): started_at is KEPT and the
 -- held gap is BANKED into budget_paused_seconds, exactly like ResumePausedRun — a mid-run switch
