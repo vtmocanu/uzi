@@ -108,6 +108,16 @@ describe("classifyForgeError", () => {
       ),
       want: "transient",
     },
+    // (xi) PRD #1392: the DNS shape of the incident — "Could not resolve host" at clone —
+    // classifies transient, so phaseClone parks rather than fails. Kept here as the unit case
+    // the PRD names.
+    {
+      name: "DNS 'Could not resolve host' at clone (the #1392 incident shape)",
+      err: new Error(
+        "git fetch --prune origin failed: fatal: unable to access 'https://github.com/vtmocanu/uzi.git/': Could not resolve host: github.com",
+      ),
+      want: "transient",
+    },
   ];
 
   const exercised = new Set<string>();
@@ -175,6 +185,59 @@ describe("withForgeRetry", () => {
     );
     assert.strictEqual(attempts, FORGE_RETRY_SCHEDULE.length + 1);
     assert.deepStrictEqual(delays, FORGE_RETRY_SCHEDULE);
+  });
+
+  // PRD #1392: the DNS shape of the incident is a git-TEXT error (not a ForgeError). Six fast
+  // transient failures classify transient (not permanent), so withForgeRetry exhausts the full
+  // schedule (six attempts, five sleeps) then rethrows — the exhaustion phaseClone parks on.
+  it("six fast DNS 'could not resolve host' failures classify transient and exhaust the schedule", async () => {
+    const delays: number[] = [];
+    const sleep = async (ms: number) => {
+      delays.push(ms);
+    };
+    let attempts = 0;
+    const fn = async () => {
+      attempts++;
+      throw new Error(
+        "fatal: unable to access 'https://github.com/x/y.git/': Could not resolve host: github.com",
+      );
+    };
+    await assert.rejects(withForgeRetry(fn, { sleep }), /Could not resolve host/);
+    assert.strictEqual(attempts, FORGE_RETRY_SCHEDULE.length + 1, "six attempts (all classified transient)");
+    assert.deepStrictEqual(delays, FORGE_RETRY_SCHEDULE);
+  });
+});
+
+// PRD #1392 M2: the retry log line names its phase. ensureClone's two sites pass "clone/fetch";
+// the push/MR-create sites pass nothing and keep the historical text.
+describe("withForgeRetry — retry log line names its phase (PRD #1392 M2)", () => {
+  const captureLog = () => {
+    const warns: string[] = [];
+    return { warns, log: { warn: (msg: string) => warns.push(msg) } };
+  };
+
+  it('names "clone/fetch" when the label is passed (ensureClone path)', async () => {
+    const { warns, log } = captureLog();
+    let attempts = 0;
+    const fn = async () => {
+      attempts++;
+      if (attempts < 2) throw new ForgeError(503, "transient");
+      return "ok";
+    };
+    await withForgeRetry(fn, { sleep: async () => {}, log, label: "clone/fetch" });
+    assert.deepStrictEqual(warns, ["transient forge error; retrying clone/fetch"]);
+  });
+
+  it('keeps "push/MR-create" when no label is passed (push/MR-create path)', async () => {
+    const { warns, log } = captureLog();
+    let attempts = 0;
+    const fn = async () => {
+      attempts++;
+      if (attempts < 2) throw new ForgeError(503, "transient");
+      return "ok";
+    };
+    await withForgeRetry(fn, { sleep: async () => {}, log });
+    assert.deepStrictEqual(warns, ["transient forge error; retrying push/MR-create"]);
   });
 });
 

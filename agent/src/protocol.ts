@@ -336,6 +336,13 @@ export interface RegisterResponse {
   // (heartbeat/claim carry no worker id in the path), so this is not strictly
   // needed; M1 returns it and we capture it for logging when present.
   worker_id?: string;
+  /** PRD #1392 M2 (D7): the protocol features THIS api advertises as implemented, so the
+   *  worker can pick a capability-aware degradation on a mixed fleet. A full #1392 api sends
+   *  `["recovery_park_cause","recovery_release_exact_echo"]`; a future api may also advertise
+   *  `claim_generation_fence`. OPTIONAL and OMITTED ENTIRELY by an OLDER api (which returns
+   *  only `worker_id`) — the worker then negotiates neither the typed park report nor the
+   *  exact-echo release fallback, so an absent field must decode as "no features". */
+  protocol_features?: string[];
 }
 
 /**
@@ -1908,6 +1915,20 @@ export interface StateRequest {
    *  non-completed report — an old worker omits it and a non-interlocked completion has no
    *  permit to match. */
   head?: string;
+  /** PRD #1392 M2 (D9/D10): the typed cause of a `recovery_wait` park. Today the worker only
+   *  ever sends "forge_unreachable" (the pre-clone transient-forge park); the api validates it
+   *  against its own enum (forge_unreachable|empty_turn|provider_outage) before any SQL and a
+   *  legacy/untyped park omits it (NULL). Additive + optional and OMITTED ENTIRELY on every
+   *  other report so a pre-#1392 worker's payload and an ordinary (empty-turn) recovery park
+   *  stay byte-identical on the wire; an api that predates the field 400s a report carrying it,
+   *  which the worker's capability-aware fallback avoids by only sending it when the api
+   *  advertised `recovery_park_cause` at register (D7). */
+  recovery_cause?: string;
+  /** PRD #1392 M2 (#1247 generation fence): the exact claim generation THIS report is made
+   *  against, so the api's park transaction settles only the hold that generation opened. Sent
+   *  on the forge-unreachable park report; also kept on the older-api untyped fallback report
+   *  ONLY when the api advertised `claim_generation_fence` (D7). Additive + optional. */
+  claim_generation?: number;
 }
 
 /**
@@ -1980,6 +2001,17 @@ export interface StateAck {
    *  boolean; the server owns the rule. Absent/non-boolean (older server, unparseable body) ⇒
    *  treated as false = "no budget-exhausted steer". */
   budgetExhausted?: boolean;
+  /** PRD #1392 M2 (D10): the TOP-LEVEL disposition reason the api returns on a 409 (and,
+   *  where present, a 200) for a `recovery_wait` park report — one of "stale_claim" (#1247: the
+   *  run moved on under this worker, so stop silently) or "custody_unsettled" (the exact-hold
+   *  cardinality/evidence step could not settle, so take today's failed path). Absent on an
+   *  ordinary ack. Read from the body's TOP LEVEL, NOT off `run`. */
+  reason?: string;
+  /** PRD #1392 M2 (D10): the retry-not-before stamp the api returns on a `recovery_wait` ack —
+   *  a field ON the RunDTO (`run.recovery_retry_not_before`), NOT top-level — so the pre-clone
+   *  forge-park feed event can quote when the run resumes. An RFC3339 string as the api marshals
+   *  it; absent (older server, no stamp, unparseable body) ⇒ the feed event says "after backoff". */
+  recoveryRetryNotBefore?: string;
 }
 
 export interface UserInput {
@@ -2003,6 +2035,12 @@ export interface InputsResponse {
  *  thrown RequestError, not by this shape. */
 export interface RunOwnershipResponse {
   status: string;
+  /** PRD #1392 M2 (D10): the run's `recovery_retry_not_before` stamp, added to the ownership
+   *  probe so a forge park reconciled through the probe (a transport failure lost the report
+   *  ack) can still quote when it resumes. An RFC3339 string when the run is parked with a
+   *  stamp; absent otherwise (an older api, or a non-parked run) ⇒ the feed event falls back
+   *  to "retry after backoff". */
+  recovery_retry_not_before?: string;
 }
 
 /** Response of the issue #1319 orphan-classification read (GET
@@ -2089,6 +2127,13 @@ export interface RecoveryReleaseResponse {
    *  its generation's work is durable; reason is a bounded server reason when retained. */
   retained?: boolean;
   reason?: string;
+  /** PRD #1392 M2 (D7): the generation the release actually settled, echoed back by a full
+   *  #1392 api and present ONLY when a row was released. The pre-#1392-park worker's older-api
+   *  fallback requires this to EQUAL the claim generation it named (alongside released===true
+   *  and holds_released===1) as PROOF of an exact-generation release before it dares park;
+   *  absent (an api that does not echo it) ⇒ proof missing ⇒ never park, take today's failed
+   *  path. */
+  generation?: number;
 }
 
 /** RecoveryReleaseRequest is the worker's request to settle custody for the EXACT generation
@@ -2097,6 +2142,13 @@ export interface RecoveryReleaseResponse {
  *  The call sites that populate it are M2's — M1 only freezes the shape. */
 export interface RecoveryReleaseRequest {
   generation?: number;
+  /** PRD #1392 M1/M2 (fact 9): the worker's own evidence class for THIS release, allowlisted
+   *  server-side to {publication, forge_no_output} (anything else → 400). A completion release
+   *  stamps "publication"; a proven fresh-forge no-output release stamps "forge_no_output". An
+   *  omitted field is allowed (the api stores NULL) for a release whose class is ambiguous, and
+   *  the pre-clone forge-park older-api FALLBACK release deliberately sends none (its proof is
+   *  the exact-generation echo, and an older api need not accept the field). */
+  release_evidence?: string;
 }
 
 /** RecoveryHold is one open custody hold this worker holds on a run, in the worker-facing

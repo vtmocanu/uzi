@@ -248,6 +248,11 @@ export class WorkerClient {
   private readonly terminalRetrySchedule: number[];
   private readonly httpTimeoutMs: number;
   private readonly codexHTTPTimeoutMs: number;
+  /** PRD #1392 M2 (D7): the protocol features the api advertised at `register`, so the runner
+   *  can pick a capability-aware degradation for a pre-clone forge-unreachable park. Empty until
+   *  `register` runs, and stays `[]` when an OLDER api returns no `protocol_features` — so a
+   *  reader treats "no features" as the safe default (negotiate nothing). */
+  protocolFeatures: string[] = [];
 
   constructor(
     private readonly baseUrl: string,
@@ -291,7 +296,14 @@ export class WorkerClient {
     // byte-identical to today. The server stores it in workers.protocol_capabilities,
     // SEPARATE from `capabilities`, and the ClaimRun hard clause reads it there.
     if (protocolCapabilities?.length) body.protocol_capabilities = protocolCapabilities;
-    return (await this.postJSON(`${WORKER_API_PREFIX}/register`, body)) as RegisterResponse;
+    const res = (await this.postJSON(`${WORKER_API_PREFIX}/register`, body)) as RegisterResponse;
+    // PRD #1392 M2 (D7): capture the api's advertised protocol features so the runner can pick a
+    // capability-aware degradation for a forge-unreachable park. An OLDER api omits the field
+    // entirely (returns only worker_id) — default to [] so "no features" is the safe negotiation.
+    this.protocolFeatures = Array.isArray(res.protocol_features)
+      ? res.protocol_features.filter((f): f is string => typeof f === "string")
+      : [];
+    return res;
   }
 
   async heartbeat(stats?: WorkerStats): Promise<void> {
@@ -403,6 +415,12 @@ export class WorkerClient {
           // completion hold.
           if (fields.budgetExhausted !== undefined)
             ack.budgetExhausted = fields.budgetExhausted;
+          // PRD #1392 M2 (D10): the top-level disposition reason and the RunDTO's
+          // recovery_retry_not_before stamp ride the same {run, reason?} ack so the pre-clone
+          // forge-park dispatch can tell stale_claim/custody_unsettled apart and quote the retry.
+          if (fields.reason !== undefined) ack.reason = fields.reason;
+          if (fields.recoveryRetryNotBefore !== undefined)
+            ack.recoveryRetryNotBefore = fields.recoveryRetryNotBefore;
           if (!ack.applied) {
             this.log.info("state report not applied server-side", {
               run_id: runId,
@@ -559,10 +577,14 @@ export class WorkerClient {
   async releaseRecoveryCustody(
     runId: string,
     generation?: number,
+    releaseEvidence?: string,
   ): Promise<RecoveryReleaseResponse> {
     // Backward-compatible: an omitted generation posts an empty body (the v1 settle-by-
     // run+worker path); a v2 caller names the exact generation (PRD #1349 M1, D1/D2).
     const body: RecoveryReleaseRequest = generation !== undefined ? { generation } : {};
+    // PRD #1392 M1/M2 (fact 9): stamp the release's evidence class when the caller knows it
+    // ({publication, forge_no_output}); an omitted class is allowed (the api stores NULL).
+    if (releaseEvidence !== undefined) body.release_evidence = releaseEvidence;
     return (await this.postJSON(
       `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/archives/release`,
       body,
@@ -1063,11 +1085,15 @@ export async function readRunAck(res: Response): Promise<{
   completedCount?: number;
   pauseRequested?: boolean;
   budgetExhausted?: boolean;
+  reason?: string;
+  recoveryRetryNotBefore?: string;
 }> {
   try {
     const text = await res.text();
     if (!text) return {};
     const parsed = JSON.parse(text) as {
+      // PRD #1392 M2 (D10): `reason` is TOP-LEVEL on the {run, reason?} ack body, NOT under run.
+      reason?: unknown;
       run?: {
         status?: unknown;
         budget_max_iterations?: unknown;
@@ -1077,6 +1103,8 @@ export async function readRunAck(res: Response): Promise<{
         milestones_completed?: unknown;
         pause_requested?: unknown;
         completion_budget_exhausted?: unknown;
+        // PRD #1392 M2 (D10): the retry-not-before stamp is a FIELD ON the RunDTO.
+        recovery_retry_not_before?: unknown;
       };
     };
     const run = parsed?.run;
@@ -1089,6 +1117,8 @@ export async function readRunAck(res: Response): Promise<{
       completedCount?: number;
       pauseRequested?: boolean;
       budgetExhausted?: boolean;
+      reason?: string;
+      recoveryRetryNotBefore?: string;
     } = {};
     if (typeof run?.status === "string") out.status = run.status;
     if (typeof run?.budget_max_iterations === "number")
@@ -1122,6 +1152,13 @@ export async function readRunAck(res: Response): Promise<{
     // reads as "no budget-exhausted steer".
     if (typeof run?.completion_budget_exhausted === "boolean")
       out.budgetExhausted = run.completion_budget_exhausted;
+    // PRD #1392 M2 (D10): the TOP-LEVEL disposition reason ("stale_claim"|"custody_unsettled")
+    // and the RunDTO's `recovery_retry_not_before` stamp for a forge-unreachable park ack. Both
+    // string-only; a non-string (older server, unparseable value) leaves them absent, which the
+    // forge-park dispatch reads as "no reason" / "retry after backoff" — the safe defaults.
+    if (typeof parsed?.reason === "string") out.reason = parsed.reason;
+    if (typeof run?.recovery_retry_not_before === "string")
+      out.recoveryRetryNotBefore = run.recovery_retry_not_before;
     return out;
   } catch {
     return {};

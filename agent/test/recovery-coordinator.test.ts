@@ -58,6 +58,8 @@ class FakeClient implements RecoveryArchiveClient {
   releaseCalls: string[] = [];
   /** PRD #1349 M2: the EXACT generation each release named (parallel to releaseCalls). */
   releaseGenerations: Array<number | undefined> = [];
+  /** PRD #1392 M1/M2: the evidence class each release stamped (parallel to releaseCalls). */
+  releaseEvidence: Array<string | undefined> = [];
   listCalls: string[] = [];
   /** PRD #1349 M2: the holds listRecoveryHolds returns (the post-clone inventory). */
   holds: RecoveryHold[] = [];
@@ -85,9 +87,10 @@ class FakeClient implements RecoveryArchiveClient {
     if (this.uploadShouldThrow) throw new Error("upload rejected");
     return { capture_id: captureId, state: "available", manifest_bound: true };
   }
-  async releaseRecoveryCustody(runId: string, generation?: number): Promise<RecoveryReleaseResponse> {
+  async releaseRecoveryCustody(runId: string, generation?: number, releaseEvidence?: string): Promise<RecoveryReleaseResponse> {
     this.releaseCalls.push(runId);
     this.releaseGenerations.push(generation);
+    this.releaseEvidence.push(releaseEvidence);
     if (this.releaseRetained) {
       return { run_id: runId, released: false, holds_released: 0, retained: true, reason: "ambiguous" };
     }
@@ -380,6 +383,8 @@ describe("RecoveryCoordinator — already-published releases custody (D3)", () =
     assert.equal(outcome.state, "uploaded");
     assert.equal(outcome.reason, "already_published");
     assert.deepEqual(client.releaseCalls, ["run-F"]);
+    // PRD #1392 M1/M2 (fact 9): a proven fresh-forge no-output release stamps forge_no_output.
+    assert.deepEqual(client.releaseEvidence, ["forge_no_output"]);
     assert.equal(client.uploadCalls.length, 0);
   });
 });

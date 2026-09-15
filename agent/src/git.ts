@@ -531,6 +531,7 @@ export class GitCache {
           schedule: this.retry?.schedule,
           sleep: this.retry?.sleep,
           log: this.log,
+          label: "clone/fetch",
         });
       } else {
         this.log.info("repo cache: cloning bare", { url: repoUrl, bare: barePath });
@@ -538,6 +539,7 @@ export class GitCache {
           schedule: this.retry?.schedule,
           sleep: this.retry?.sleep,
           log: this.log,
+          label: "clone/fetch",
         });
       }
       return barePath;
