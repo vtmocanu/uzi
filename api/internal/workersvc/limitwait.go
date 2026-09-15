@@ -13,6 +13,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/autoselect"
 	"github.com/vtmocanu/uzi/api/internal/autoselectrow"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -282,9 +283,17 @@ type limitParkInput struct {
 	// the dead credential (which carries the gauge row the Decision 4 cross-check
 	// reads). Empty is legal and means "no pool information".
 	Candidates []autoselect.Candidate
-	Policy     autoselect.Policy
-	MaxWaits   int
-	MaxPark    time.Duration
+	// NextClaimMode is effectiveNextClaimMode for the run whose next claim this park
+	// precedes (PRD #1247 gap 3): the bind mode that will actually resolve the resumed
+	// run's credential — BindModeAuto / BindModePinned / BindModeDefault, or
+	// effectiveClaimModeUnknown. It GATES Decision 6e below: only an `auto` next claim
+	// can SPEND a pooled alternative, so only it may lower the park to one. A
+	// pinned/default/unknown next claim keeps its own reset — lowering it to a token it
+	// will not spend just guarantees an immediate re-park (burning RUN_LIMIT_MAX_WAITS).
+	NextClaimMode string
+	Policy        autoselect.Policy
+	MaxWaits      int
+	MaxPark       time.Duration
 	// Jitter is supplied by the caller so this function has no clock and no
 	// randomness of its own, which is what makes every case below assertable.
 	Jitter time.Duration
@@ -367,12 +376,19 @@ func decideLimitPark(in limitParkInput) limitParkDecision {
 			base, haveBase = gauge, true
 		}
 	}
-	// Decision 6e. Only ever LOWERS the base — a pooled alternative cannot make the
-	// wait longer, and NextAvailable's own contract is a floor on "something is
-	// spendable", not a promise.
-	if alt, ok := autoselect.NextAvailable(in.Candidates, in.DeadSecretID, in.Policy, in.Now); ok {
-		if !haveBase || alt.Before(base) {
-			base, haveBase = alt, true
+	// Decision 6e, gated by the effective next-claim mode (PRD #1247 gap 3). Only ever
+	// LOWERS the base — a pooled alternative cannot make the wait longer, and
+	// NextAvailable's own contract is a floor on "something is spendable", not a
+	// promise. But it fires ONLY when the next claim resolves through the `auto`
+	// selector: a pinned, default or unknown next claim would ignore the pooled
+	// alternative and re-park on the same credential, so lowering the base for it just
+	// guarantees an immediate re-park. Steps 1-2 (or the exponential fallback) stand for
+	// those modes.
+	if in.NextClaimMode == BindModeAuto {
+		if alt, ok := autoselect.NextAvailable(in.Candidates, in.DeadSecretID, in.Policy, in.Now); ok {
+			if !haveBase || alt.Before(base) {
+				base, haveBase = alt, true
+			}
 		}
 	}
 	if !haveBase {
@@ -550,6 +566,21 @@ func (s *Service) setLimitWait(ctx context.Context, run store.Run, wkr store.Wor
 		}
 	}
 
+	// The effective next-claim mode gates Decision 6e (PRD #1247 gap 3): only an `auto`
+	// resume can spend a pooled alternative, so only it may lower the park to one. The
+	// reporting worker `wkr` IS this run's recorded worker (it holds the running claim),
+	// so it is the right row for effectiveNextClaimMode's worker rung. ownerJudgeMode is
+	// consulted only for a self_improve run (which follows the owner's judge binding);
+	// every other kind passes "" without a read.
+	ownerJudgeMode := ""
+	if run.Kind == runkind.SelfImprove {
+		m, err := s.ownerJudgeBindMode(ctx, run.UserID)
+		if err != nil {
+			return 0, err
+		}
+		ownerJudgeMode = m
+	}
+
 	d := decideLimitPark(limitParkInput{
 		WaitOnLimit:     run.WaitOnLimit,
 		LimitWaitCount:  run.LimitWaitCount,
@@ -557,6 +588,7 @@ func (s *Service) setLimitWait(ctx context.Context, run store.Run, wkr store.Wor
 		ReportedResetMs: req.LimitResetsAt,
 		ReportedType:    req.RateLimitType,
 		Candidates:      cands,
+		NextClaimMode:   effectiveNextClaimMode(run, ownerJudgeMode, wkr),
 		Policy:          s.p.Autoselect,
 		MaxWaits:        s.p.RunLimitMaxWaits,
 		MaxPark:         s.p.RunLimitMaxPark,
