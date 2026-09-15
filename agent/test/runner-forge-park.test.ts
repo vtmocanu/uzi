@@ -444,6 +444,169 @@ describe("RunRunner — pre-clone forge-unreachable park (PRD #1392 M2)", () => 
     }
   });
 
+  it("recovery_park_cause api: a TRANSIENT (non-404) probe throw is retried with the backoff honored; the eventual recovery_wait preserves (never cleaned mid-loop)", async () => {
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-forgepark-probe-retry-"));
+    try {
+      const client = new ForgeParkClient(["recovery_park_cause"], {
+        onParkReport: () => {
+          throw new Error("socket hang up"); // transport failure AFTER the send → reconcile
+        },
+        onOwnership: (n) => {
+          if (n <= 2) throw new Error("socket hang up"); // two transient (non-404) probe failures
+          return { status: "recovery_wait", recovery_retry_not_before: "2026-09-15T18:00:00Z" };
+        },
+      });
+      const { factory, runHome } = parkFactory(homeRoot, { sessionId: SESSION_ID });
+      git.ensureClone = async () => {
+        throw A_TRANSIENT();
+      };
+      const claim = gitlabClaim(719, { claim_generation: 2, session_id: SESSION_ID });
+      const runner = makeRunner(client, factory);
+      // FIX A pin: spy on waitRecoveryRetry to capture the cancelStopsWait argument each reconcile
+      // retry passes. Pre-fix the retries called waitRecoveryRetry(flight) (cancelStopsWait defaults
+      // to true), so a simultaneous sticky cancel would make each wait return immediately and the
+      // loop tight-spin; post-fix every reconcile retry passes false, honoring the backoff. Asserting
+      // the argument is the "smallest reliable assertion" the task asks for (no wall-clock timing).
+      const waitArgs: Array<boolean | undefined> = [];
+      const target = runner as unknown as {
+        waitRecoveryRetry: (flight: unknown, cancelStopsWait?: boolean) => Promise<void>;
+      };
+      const origWait = target.waitRecoveryRetry.bind(runner);
+      target.waitRecoveryRetry = (flight: unknown, cancelStopsWait?: boolean) => {
+        waitArgs.push(cancelStopsWait);
+        return origWait(flight, cancelStopsWait);
+      };
+      await runner.execute(claim);
+
+      assert.strictEqual(
+        client.ownershipCalls,
+        3,
+        "the probe was retried (two transient throws, then the resolving probe) — call count >= 2",
+      );
+      const texts = statusTexts(claim.run_id).filter((t) => /forge unreachable at clone; parked/.test(t));
+      assert.strictEqual(texts.length, 1, "the eventual recovery_wait parks");
+      assert.match(texts[0]!, /retry at 2026-09-15T18:00:00Z/, "quotes the resolving probe's retry time");
+      assert.ok(!reportedStatuses(client).includes("failed"), "a transient probe failure is NEVER a failure");
+      assert.strictEqual(
+        fs.existsSync(runHome()),
+        true,
+        "HOME/session preserved (resolvable transcript) — nothing was cleaned mid-loop",
+      );
+      assert.ok(waitArgs.length >= 2, "the loop waited between the two transient probe retries");
+      assert.ok(
+        waitArgs.every((c) => c === false),
+        "every reconcile retry passes cancelStopsWait=false, so a sticky cancel cannot turn it into a tight loop",
+      );
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("recovery_park_cause api: an INTERMEDIATE ownership status (queued) is retained and retried until recovery_wait", async () => {
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-forgepark-probe-queued-"));
+    try {
+      const client = new ForgeParkClient(["recovery_park_cause"], {
+        onParkReport: () => {
+          throw new Error("socket hang up");
+        },
+        onOwnership: (n) => (n === 1 ? { status: "queued" } : { status: "recovery_wait" }),
+      });
+      const { factory, runHome } = parkFactory(homeRoot, { sessionId: SESSION_ID });
+      git.ensureClone = async () => {
+        throw A_TRANSIENT();
+      };
+      const claim = gitlabClaim(720, { claim_generation: 3, session_id: SESSION_ID });
+      await makeRunner(client, factory).execute(claim);
+
+      assert.strictEqual(client.ownershipCalls, 2, "the intermediate `queued` status is retried, not resolved");
+      assert.strictEqual(
+        statusTexts(claim.run_id).filter((t) => /parked/.test(t)).length,
+        1,
+        "the eventual recovery_wait parks",
+      );
+      assert.ok(!reportedStatuses(client).includes("failed"), "an intermediate status is never a failure");
+      assert.strictEqual(
+        fs.existsSync(runHome()),
+        true,
+        "the possibly-parked session is retained across the intermediate status, never cleaned",
+      );
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("worker shutdown DURING reconcile preserves a resolvable session (leaves the run for requeue, never cleans it)", async () => {
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-forgepark-reconcile-shutdown-"));
+    try {
+      let runnerRef: RunRunner | undefined;
+      const client = new ForgeParkClient(["recovery_park_cause"], {
+        onParkReport: () => {
+          throw new Error("socket hang up"); // transport failure → reconcile
+        },
+        onOwnership: () => {
+          // The worker begins draining mid-reconcile. Return a non-terminal status; the loop then
+          // waits (cancelStopsWait=false) and re-checks shuttingDownGlobal at the top, taking the
+          // shutdown arm before probing again.
+          runnerRef!.shutdown();
+          return { status: "queued" };
+        },
+      });
+      const { factory, runHome } = parkFactory(homeRoot, { sessionId: SESSION_ID });
+      git.ensureClone = async () => {
+        throw A_TRANSIENT();
+      };
+      const claim = gitlabClaim(721, { claim_generation: 1, session_id: SESSION_ID });
+      runnerRef = makeRunner(client, factory);
+      await runnerRef.execute(claim);
+
+      assert.strictEqual(client.ownershipCalls, 1, "the shutdown arm stops before the next probe");
+      assert.strictEqual(
+        statusTexts(claim.run_id).filter((t) => /parked/.test(t)).length,
+        0,
+        "a shutdown interrupt emits NO park event",
+      );
+      assert.ok(!reportedStatuses(client).includes("failed"), "a shutdown interrupt is never a failure (left for requeue)");
+      assert.strictEqual(
+        fs.existsSync(runHome()),
+        true,
+        "the possibly-parked, resolvable session is PRESERVED for a same-worker requeue, not cleaned (FIX B)",
+      );
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("worker shutdown DURING reconcile with NO resolvable transcript cleans HOME (preserve is conditional on D4)", async () => {
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-forgepark-reconcile-shutdown-noxscript-"));
+    try {
+      let runnerRef: RunRunner | undefined;
+      const client = new ForgeParkClient(["recovery_park_cause"], {
+        onParkReport: () => {
+          throw new Error("socket hang up");
+        },
+        onOwnership: () => {
+          runnerRef!.shutdown();
+          return { status: "queued" };
+        },
+      });
+      const { factory, runHome } = parkFactory(homeRoot); // session id on the claim, but NO transcript planted
+      git.ensureClone = async () => {
+        throw A_TRANSIENT();
+      };
+      const claim = gitlabClaim(722, { claim_generation: 1, session_id: SESSION_ID });
+      runnerRef = makeRunner(client, factory);
+      await runnerRef.execute(claim);
+
+      assert.strictEqual(
+        fs.existsSync(runHome()),
+        false,
+        "no resolvable transcript ⇒ the shutdown arm cleans HOME (the D4 preserve rule is conditional, not unconditional)",
+      );
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
   // ── D7 fallback: capability-aware degradation on an older api ──────────────────────
 
   it("D7 (recovery_release_exact_echo + claim_generation_fence): parks via an untyped report that KEEPS claim_generation after a proven exact release", async () => {
@@ -577,6 +740,51 @@ describe("RunRunner — pre-clone forge-unreachable park (PRD #1392 M2)", () => 
 
       assert.ok(!parkReport(client), "a thrown release never parks");
       assert.ok(reportedStatuses(client).includes("failed"), "a thrown release takes today's failed path");
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("D7 (proof conjunct): a release with released:false (all else matching) → proof fails → never parks", async () => {
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-forgepark-d7-relfalse-"));
+    try {
+      const client = new ForgeParkClient(["recovery_release_exact_echo"], {
+        // generation echoes the claim, holds_released === 1, NOT retained — only released is false.
+        onRelease: (gen) => ({ run_id: "x", released: false, holds_released: 1, generation: gen }),
+      });
+      const { factory } = parkFactory(homeRoot);
+      git.ensureClone = async () => {
+        throw A_TRANSIENT();
+      };
+      const claim = gitlabClaim(723, { claim_generation: 3 });
+      await makeRunner(client, factory).execute(claim);
+
+      assert.strictEqual(client.releaseCalls.length, 1, "the release was attempted");
+      assert.ok(!parkReport(client), "released:false never parks — the proof requires released===true");
+      assert.ok(reportedStatuses(client).includes("failed"), "proof-failure takes today's failed path");
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("D7 (proof conjunct): a release that RETAINED (retained:true, released:true) → proof fails → never parks", async () => {
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-forgepark-d7-retained-"));
+    try {
+      const client = new ForgeParkClient(["recovery_release_exact_echo"], {
+        // released:true and the generation/holds match, but the server RETAINED the hold — the
+        // exact-generation release was NOT positively confirmed (rel.retained !== true fails).
+        onRelease: (gen) => ({ run_id: "x", released: true, holds_released: 1, generation: gen, retained: true }),
+      });
+      const { factory } = parkFactory(homeRoot);
+      git.ensureClone = async () => {
+        throw A_TRANSIENT();
+      };
+      const claim = gitlabClaim(724, { claim_generation: 3 });
+      await makeRunner(client, factory).execute(claim);
+
+      assert.strictEqual(client.releaseCalls.length, 1, "the release was attempted");
+      assert.ok(!parkReport(client), "a retained release never parks — the proof requires retained!==true");
+      assert.ok(reportedStatuses(client).includes("failed"), "proof-failure takes today's failed path");
     } finally {
       fs.rmSync(homeRoot, { recursive: true, force: true });
     }
