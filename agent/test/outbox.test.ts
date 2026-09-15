@@ -72,6 +72,18 @@ async function segFile(runDir: string): Promise<string> {
   return path.join(runDir, seg);
 }
 
+/** Sum the on-disk bytes of a run's record files (the seg- and range- files).
+ *  recordBytes in the store is set to the serialized length that is written
+ *  verbatim, so this on-disk sum equals the store's byte accounting for the run. */
+async function recordFileBytes(runDir: string): Promise<number> {
+  const names = await fs.readdir(runDir);
+  let total = 0;
+  for (const n of names) {
+    if (n.startsWith("seg-") || n.startsWith("range-")) total += statSync(path.join(runDir, n)).size;
+  }
+  return total;
+}
+
 /** Flip the first hex char of the record's MAC — keeps the JSON valid so the test
  *  exercises the MAC-mismatch path specifically, not the JSON-parse path. */
 async function tamperMac(file: string): Promise<void> {
@@ -88,30 +100,52 @@ async function readManifest(root: string, runId: string): Promise<{ generation: 
 }
 
 describe("Outbox M1 (PRD #1391 Run A)", () => {
-  it("1. atomic write survives a simulated crash between temp and install", async () => {
+  it("1. a write interrupted before its rename never corrupts the prior good state", async () => {
+    // The crash-atomicity guarantee (temp -> fsync -> rename -> dir fsync): a write
+    // that dies before the rename leaves the destination untouched and adopts no
+    // partial file. The `rawWrite` seam INTERRUPTS the SECOND append's manifest
+    // write partway (writes a truncated body to the target path, then throws before
+    // the rename), then a fresh Outbox loads the same root.
+    //
+    // Mutation guard: if writeFileAtomic were folded to write straight to the
+    // destination (no temp -> fsync -> rename), the interrupted write would leave
+    // `manifest.json` itself half-written and unparseable, the run would fail to
+    // load, and the prior good seq-1 record would be lost — so this test would fail.
     const root = await mkRoot();
-    const a = makeOutbox(root);
+    let manifestWrites = 0;
+    const rawWrite: RawWriteSeam = async (write, ctx) => {
+      if (ctx.kind === "manifest") {
+        manifestWrites++;
+        if (manifestWrites === 2) {
+          // Simulate the process dying mid-write: leave a truncated body at the
+          // write's target path, then throw before writeFileAtomic can rename it.
+          await fs.writeFile(ctx.path, '{"version":1,"runId":"r1","gen');
+          throw new Error("simulated crash before rename");
+        }
+      }
+      await write();
+    };
+    const a = makeOutbox(root, { rawWrite });
     await a.init();
-    await a.appendSegment("r1", 1, [textMsg(1, "hello")]);
+    await a.appendSegment("r1", 1, [textMsg(1, "first")]); // fully lands (manifest write #1)
+    // The second append's manifest write is interrupted; the call rejects.
+    await assert.rejects(a.appendSegment("r1", 1, [textMsg(2, "second")]), /simulated crash/);
 
-    // Simulate a crash mid-install: leave stray *.tmp files behind. init must
-    // ignore them and still load the last good manifest + segment.
-    const runDir = path.join(root, "r1");
-    await fs.writeFile(path.join(runDir, "manifest.json.crash.tmp"), "partial");
-    await fs.writeFile(path.join(runDir, "seg-1-1-v9.json.crash.tmp"), "partial");
-
+    // A fresh store over the same root must load the intact gen-1 manifest + seg-1,
+    // never a partial file, and replay exactly the first message.
     const b = makeOutbox(root);
     await b.init();
+    assert.equal(b.depthFor("r1")?.pendingMessages, 1, "only the committed record is pending");
     const c = collector();
     const res = await b.drainRun("r1", c.send);
     assert.equal(res.retired, true);
     assert.deepEqual(
       c.flat().map((m) => m.seq),
       [1],
+      "the prior good segment is intact; the interrupted second write is not adopted",
     );
-    assert.equal((c.flat()[0]?.payload as { text: string } | undefined)?.text, "hello");
-    // The stray tmp files were ignored, not consumed or deleted.
-    assert.ok(existsSync(path.join(runDir, "manifest.json.crash.tmp")));
+    assert.equal((c.flat()[0]?.payload as { text: string } | undefined)?.text, "first");
+    assert.equal(c.flat()[0]?.kind, "text", "the record is the real message, not a partial-file tombstone");
   });
 
   it("2a. a valid manifest referencing a tampered segment yields per-seq gap tombstones", async () => {
@@ -179,12 +213,55 @@ describe("Outbox M1 (PRD #1391 Run A)", () => {
     );
   });
 
-  it("4. quota replaces the oldest segment with one range record → contiguous per-seq tombstones", async () => {
+  it("3b. a symlinked root fails closed (disabled: writes no-op, drain replays nothing)", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "outbox-"));
+    tmpRoots.push(dir);
+    const real = path.join(dir, "outbox-real");
+    await fs.mkdir(real, { recursive: true });
+    const root = path.join(dir, "outbox");
+    await fs.symlink(real, root); // the ROOT itself is a symlink (following it escapes /data)
+
+    const { logger, lines } = recordingLogger();
+    const o = makeOutbox(root, { log: logger });
+    await o.init();
+    await o.appendSegment("r1", 1, [textMsg(1, "x")]);
+    assert.deepEqual(o.runsWithPending(), [], "a symlinked root disables every write");
+    assert.ok(
+      (lines as Array<{ level: string; msg: string }>).some((l) => l.level === "error" && l.msg.includes("root is a symlink")),
+    );
+  });
+
+  it("3c. a symlinked .key fails closed (disabled)", async () => {
+    const root = await mkRoot();
+    await fs.mkdir(root, { recursive: true });
+    // A `.key` symlink is refused before it is ever read (lstat, never followed).
+    await fs.symlink(path.join(root, "key-target-does-not-exist"), path.join(root, ".key"));
+
+    const { logger, lines } = recordingLogger();
+    const o = makeOutbox(root, { log: logger });
+    await o.init();
+    await o.appendSegment("r1", 1, [textMsg(1, "x")]);
+    assert.deepEqual(o.runsWithPending(), [], "a symlinked .key disables the store");
+    assert.ok(
+      (lines as Array<{ level: string; msg: string }>).some((l) => l.level === "error" && l.msg.includes(".key is a symlink")),
+    );
+  });
+
+  it("4. quota replaces the oldest segment with a COMPACT range record → contiguous per-seq tombstones", async () => {
     const root = await mkRoot();
     // runMaxBytes = 1 forces eviction of the prior segment on every append.
     const o = makeOutbox(root, { runMaxBytes: 1 });
     await o.init();
-    await o.appendSegment("r1", 1, [textMsg(1, "one")]);
+    const big = "x".repeat(5000);
+    await o.appendSegment("r1", 1, [textMsg(1, big)]);
+
+    const runDir = path.join(root, "r1");
+    // Capture the evicted segment's size + the run's accounted bytes before eviction.
+    const segPath = await segFile(runDir);
+    const segSize = statSync(segPath).size;
+    assert.ok(segSize > 5000, "the segment embeds the 5000-byte message");
+    const bytesBefore = await recordFileBytes(runDir);
+
     await o.appendSegment("r1", 1, [textMsg(2, "two")]);
 
     // Exactly one range record (evicted seg1) plus the surviving segment.
@@ -192,6 +269,22 @@ describe("Outbox M1 (PRD #1391 Run A)", () => {
     const kinds = (manifest.records as Array<{ kind: string; firstSeq: number; lastSeq: number }>).map((r) => r.kind);
     assert.deepEqual(kinds.sort(), ["range", "segment"]);
     assert.equal(o.depthFor("r1")?.pendingMessages, 2);
+
+    // (a) The range record is COMPACT — it does not embed the evicted messages.
+    // Mutation guard: if evictSegment wrote the original `messages` into the range
+    // body, the range file would be ~segSize, not a few hundred bytes.
+    const names = await fs.readdir(runDir);
+    const rangeName = names.find((n) => n.startsWith("range-1-1-"));
+    assert.ok(rangeName, "seg1 was evicted to a range record covering its exact range");
+    const rangeSize = statSync(path.join(runDir, rangeName as string)).size;
+    assert.ok(rangeSize < 1024, `the range record is well under 1 KiB (was ${rangeSize} bytes)`);
+    assert.ok(rangeSize < segSize / 4, "the range record is far smaller than the evicted segment");
+    assert.ok(!existsSync(segPath), "the evicted segment file was unlinked (D12: after the manifest install)");
+
+    // (b) The run's accounted bytes dropped: the 5000-byte segment gave way to a
+    // compact range + one small surviving segment.
+    const bytesAfter = await recordFileBytes(runDir);
+    assert.ok(bytesAfter < bytesBefore, `accounted bytes dropped after eviction (${bytesBefore} -> ${bytesAfter})`);
 
     const c = collector();
     await o.drainRun("r1", c.send);
@@ -204,6 +297,41 @@ describe("Outbox M1 (PRD #1391 Run A)", () => {
     assert.equal(sent[0]?.kind, "status", "the dropped seq replays as a tombstone");
     assert.equal((sent[0]?.payload as { event: string } | undefined)?.event, "message_dropped");
     assert.equal(sent[1]?.kind, "text", "the surviving segment replays its real message");
+  });
+
+  it("4b. multiple consecutive evictions replay back-to-back range records as one contiguous stream", async () => {
+    const root = await mkRoot();
+    // runMaxBytes = 1 evicts the oldest surviving segment on every append, so after
+    // four appends seqs 1-3 are all range records and only seq4 remains a segment.
+    const o = makeOutbox(root, { runMaxBytes: 1 });
+    await o.init();
+    await o.appendSegment("r1", 1, [textMsg(1, "one")]);
+    await o.appendSegment("r1", 1, [textMsg(2, "two")]);
+    await o.appendSegment("r1", 1, [textMsg(3, "three")]);
+    await o.appendSegment("r1", 1, [textMsg(4, "four")]);
+
+    const manifest = await readManifest(root, "r1");
+    const recs = (manifest.records as Array<{ kind: string; firstSeq: number }>).sort((a, b) => a.firstSeq - b.firstSeq);
+    assert.deepEqual(
+      recs.map((r) => r.kind),
+      ["range", "range", "range", "segment"],
+      "seqs 1-3 evicted to range records; seq4 survives",
+    );
+
+    const c = collector();
+    const res = await o.drainRun("r1", c.send);
+    assert.equal(res.retired, true);
+    const sent = c.flat();
+    assert.deepEqual(
+      sent.map((m) => m.seq),
+      [1, 2, 3, 4],
+      "the back-to-back range records replay as one contiguous per-seq tombstone stream",
+    );
+    assert.deepEqual(
+      sent.map((m) => m.kind),
+      ["status", "status", "status", "text"],
+      "seqs 1-3 are tombstones; seq4 is the surviving real message",
+    );
   });
 
   it("5. retention removes a fully-retired run past retentionMs, never one with undrained records", async () => {
@@ -293,6 +421,28 @@ describe("Outbox M1 (PRD #1391 Run A)", () => {
       (lines as Array<{ level: string; msg: string }>).some(
         (l) => l.level === "error" && l.msg.includes("records present"),
       ),
+    );
+  });
+
+  it("8b. a wrong-length .key fails closed (disabled: replays nothing, append is a no-op)", async () => {
+    const root = await mkRoot();
+    const a = makeOutbox(root);
+    await a.init();
+    await a.appendSegment("r1", 1, [textMsg(1, "a")]);
+    // Replace the 32-byte key with a wrong-length one: fail closed rather than mint
+    // over it and orphan every existing MAC.
+    await fs.writeFile(path.join(root, ".key"), Buffer.alloc(16), { mode: 0o600 });
+
+    const { logger, lines } = recordingLogger();
+    const b = makeOutbox(root, { log: logger });
+    await b.init();
+    const c = collector();
+    await b.drainRun("r1", c.send);
+    assert.equal(c.calls(), 0);
+    await b.appendSegment("r1", 1, [textMsg(2, "b")]);
+    assert.deepEqual(b.runsWithPending(), [], "disabled store tracks and writes nothing");
+    assert.ok(
+      (lines as Array<{ level: string; msg: string }>).some((l) => l.level === "error" && l.msg.includes("unreadable")),
     );
   });
 
@@ -405,5 +555,219 @@ describe("Outbox M1 (PRD #1391 Run A)", () => {
     assert.equal(calls, 2, "the drain stopped at the failing record");
     assert.ok(o.runsWithPending().includes("r1"));
     assert.equal(o.depthFor("r1")?.pendingMessages, 2, "seq 1 retired; seqs 2 and 3 remain pending");
+  });
+
+  it("12. the worker-total quota evicts the GLOBALLY-oldest segment (by since) across runs", async () => {
+    const root = await mkRoot();
+    const msg = "z".repeat(4000); // each segment ~4.2 KiB
+    let clock = 0;
+    // runMaxBytes huge so only the worker-total quota binds; maxBytes admits two
+    // segments but not three, so the third append evicts exactly one — the oldest.
+    const o = makeOutbox(root, { runMaxBytes: 1 << 30, maxBytes: 10_000, now: () => clock });
+    await o.init();
+    // r2 is created FIRST (iterated first, so it is the initial "best") but is the
+    // NEWER run; r1 is created second at an EARLIER `since`. The globally-oldest
+    // pick must flip to r1 via the `since <` comparison, not insertion order.
+    clock = 2000;
+    await o.appendSegment("r2", 1, [textMsg(1, msg)]); // since 2000 (newer)
+    clock = 1000;
+    await o.appendSegment("r1", 1, [textMsg(1, msg)]); // since 1000 (older)
+    clock = 3000;
+    await o.appendSegment("r2", 1, [textMsg(2, msg)]); // trips the worker quota
+
+    const m1 = await readManifest(root, "r1");
+    assert.equal((m1.records[0] as { kind: string }).kind, "range", "the globally-oldest run (r1) was evicted");
+    const m2 = await readManifest(root, "r2");
+    assert.ok(
+      (m2.records as Array<{ kind: string }>).every((r) => r.kind === "segment"),
+      "the newer run's segments survive",
+    );
+  });
+
+  it("12b. the globally-oldest tie-break falls to the smaller firstSeq at equal since", async () => {
+    const root = await mkRoot();
+    const msg = "z".repeat(4000);
+    const clock = 5000; // both runs created at the SAME since → the tie-break is firstSeq
+    const o = makeOutbox(root, { runMaxBytes: 1 << 30, maxBytes: 10_000, now: () => clock });
+    await o.init();
+    // rA (firstSeq 5) is iterated first as the initial "best"; rB (firstSeq 1) must
+    // win the tie via `firstSeq < best.rec.firstSeq`.
+    await o.appendSegment("rA", 1, [textMsg(5, msg)]);
+    await o.appendSegment("rB", 1, [textMsg(1, msg)]);
+    await o.appendSegment("rA", 1, [textMsg(6, msg)]); // trips the worker quota
+
+    const mB = await readManifest(root, "rB");
+    assert.equal((mB.records[0] as { kind: string }).kind, "range", "the smaller-firstSeq segment (rB seq1) was evicted");
+    const mA = await readManifest(root, "rA");
+    assert.ok(
+      (mA.records as Array<{ kind: string }>).every((r) => r.kind === "segment"),
+      "rA's segments survive the tie-break",
+    );
+  });
+
+  it("H1. a non-bare runId cannot escape the root (retireRun/appendSegment refuse it)", async () => {
+    const root = await mkRoot();
+    const { logger, lines } = recordingLogger();
+    const o = makeOutbox(root, { log: logger });
+    await o.init();
+
+    // A sentinel OUTSIDE the root that a `../` escape would reach:
+    // path.join(root, "../victim") resolves to a sibling of the outbox root.
+    const outside = path.join(path.dirname(root), "victim");
+    await fs.mkdir(outside, { recursive: true });
+    await fs.writeFile(path.join(outside, "sentinel.txt"), "keep me");
+
+    // retireRun's recursive delete must refuse the escaping component.
+    await o.retireRun("../victim");
+    assert.ok(existsSync(path.join(outside, "sentinel.txt")), "retireRun must not delete outside the root");
+
+    // appendSegment must not write outside the root either.
+    await o.appendSegment("../escape", 1, [textMsg(1, "nope")]);
+    assert.ok(!existsSync(path.join(path.dirname(root), "escape")), "appendSegment must not write outside the root");
+    assert.deepEqual(o.runsWithPending(), [], "no run is tracked for an escaping id");
+
+    assert.ok(
+      (lines as Array<{ level: string; msg: string }>).some((l) => l.level === "warn" && l.msg.includes("runId")),
+      "an escape attempt is logged",
+    );
+  });
+
+  it("H2. concurrent appendSegment on the SAME run both persist (no lost generation)", async () => {
+    const root = await mkRoot();
+    const o = makeOutbox(root);
+    await o.init();
+
+    // Without the per-run mutex both calls read the same manifest generation (empty
+    // records), each installs `[...[], ownRef]`, and the later rename wins — losing
+    // one record. The mutex serializes them, so both land.
+    await Promise.all([
+      o.appendSegment("r1", 1, [textMsg(1, "a")]),
+      o.appendSegment("r1", 1, [textMsg(2, "b")]),
+    ]);
+
+    const manifest = await readManifest(root, "r1");
+    assert.equal(manifest.records.length, 2, "both segments are listed (neither generation was lost)");
+    assert.ok(manifest.generation >= 2, "each append advanced the generation");
+    assert.equal(o.depthFor("r1")?.pendingMessages, 2);
+
+    // A fresh store over the same root replays both, in seq order.
+    const b = makeOutbox(root);
+    await b.init();
+    const c = collector();
+    const res = await b.drainRun("r1", c.send);
+    assert.equal(res.retired, true);
+    assert.deepEqual(
+      c.flat().map((m) => m.seq).sort((x, y) => x - y),
+      [1, 2],
+      "both records survived and drain in seq order",
+    );
+  });
+
+  it("H3. a cross-run worker-quota eviction never mutates a BUSY victim's manifest (try-lock/defer)", async () => {
+    // The cross-run hazard the M1 fix closes. The worker-total quota (maxBytes)
+    // evicts the globally-oldest segment, which may belong to a DIFFERENT run B than
+    // the appending run A. That eviction is a read-modify-write of B's manifest.json
+    // generation. If B's OWN batcher is mid-append (holding B's per-run lock) the two
+    // writers race on manifest.json and one generation is lost — B drops or reorders a
+    // committed record. The fix takes a cross-run victim's lock NON-BLOCKING: a busy
+    // victim is skipped and the eviction deferred (maxBytes is a SOFT target), so A
+    // never touches B's manifest while B's lock is held.
+    //
+    // DISCRIMINATOR: while B's lock is held, A's append must create NO file in B's
+    // directory. Under the unfixed code A's evictSegment(B) writes a range-*.json into
+    // B's dir (and unlinks the evicted segment / rewrites B's manifest) regardless of
+    // who wins the manifest race, so B's directory listing changes — and this test
+    // fails. Under the fix the listing is untouched.
+    const root = await mkRoot();
+    const big = "x".repeat(5000); // each segment ~5.2 KiB
+    const bDirName = "run-b";
+    const bDir = path.join(root, bDirName);
+
+    // Seam: once armed, pause ONLY run B's next manifest write (op_B, the slow
+    // mutating op that will hold B's lock across A's append). B's initial append runs
+    // BEFORE the gate is armed, and every other write — A's own writes, and on the
+    // unfixed path A's eviction writes into B's dir — proceeds untouched.
+    let armGate = false;
+    let paused = false;
+    let reachedOpBWrite!: () => void;
+    const opBAtWrite = new Promise<void>((r) => {
+      reachedOpBWrite = r;
+    });
+    let releaseOpB!: () => void;
+    const opBGate = new Promise<void>((r) => {
+      releaseOpB = r;
+    });
+    const rawWrite: RawWriteSeam = async (write, ctx) => {
+      const underB = ctx.path.includes(`${path.sep}${bDirName}${path.sep}`);
+      if (armGate && !paused && ctx.kind === "manifest" && underB) {
+        paused = true;
+        reachedOpBWrite();
+        await opBGate; // hold B's per-run lock until the test releases it
+      }
+      await write();
+    };
+
+    // runMaxBytes huge so only the worker-total quota binds; maxBytes admits ONE
+    // segment but not two, so A's append trips the worker quota with B as the victim.
+    const o = makeOutbox(root, { runMaxBytes: 1 << 30, maxBytes: 8000, rawWrite });
+    await o.init();
+
+    // B commits one big segment (fully) — the globally-oldest eviction target.
+    await o.appendSegment(bDirName, 1, [textMsg(1, big)]);
+    const bDirBefore = (await fs.readdir(bDir)).sort();
+    const bGenBefore = (await readManifest(root, bDirName)).generation;
+
+    // Start a slow mutating op on B that pauses at its manifest write, holding B's
+    // per-run lock for the duration of A's append.
+    armGate = true;
+    const opB = o.markSpillUnclean(bDirName);
+    await opBAtWrite;
+
+    // A appends and trips the worker-total quota; B is the globally-oldest segment but
+    // its lock is held, so the eviction must be deferred and B left untouched.
+    await o.appendSegment("run-a", 1, [textMsg(1, big)]);
+
+    // DISCRIMINATOR: A's cross-run eviction attempt wrote nothing into B's directory.
+    const bDirDuring = (await fs.readdir(bDir)).sort();
+    assert.deepEqual(
+      bDirDuring,
+      bDirBefore,
+      "A must not mutate a busy victim's directory (cross-run eviction deferred)",
+    );
+
+    // Release B's slow op and let it finish cleanly.
+    releaseOpB();
+    await opB;
+
+    // A's append succeeded despite the deferred eviction.
+    assert.equal(o.depthFor("run-a")?.pendingMessages, 1, "A's append landed");
+
+    // B lost no committed generation: exactly one mutation (op_B) advanced its
+    // generation, its record set is intact, and its committed record replays as the
+    // real message — never a dropped-range tombstone from a stolen eviction.
+    const bManifestAfter = await readManifest(root, bDirName);
+    assert.equal(bManifestAfter.generation, bGenBefore + 1, "B's generation advanced by exactly its own one mutation");
+    assert.equal(bManifestAfter.records.length, 1, "B keeps its committed segment (no cross-run eviction)");
+    assert.equal((bManifestAfter.records[0] as { kind: string }).kind, "segment", "B's record is still a real segment");
+
+    const ca = collector();
+    const resA = await o.drainRun("run-a", ca.send);
+    assert.equal(resA.retired, true);
+    assert.deepEqual(
+      ca.flat().map((m) => m.seq),
+      [1],
+    );
+    assert.equal(ca.flat()[0]?.kind, "text", "A's record replays as a real message");
+
+    const cb = collector();
+    const resB = await o.drainRun(bDirName, cb.send);
+    assert.equal(resB.retired, true);
+    assert.deepEqual(
+      cb.flat().map((m) => m.seq),
+      [1],
+      "B's committed record replays contiguously",
+    );
+    assert.equal(cb.flat()[0]?.kind, "text", "B's record survived as the real message (no lost generation)");
+    assert.equal((cb.flat()[0]?.payload as { text: string } | undefined)?.text, big);
   });
 });

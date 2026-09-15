@@ -224,6 +224,11 @@ export class Outbox {
 
   private readonly runs = new Map<string, RunState>();
   private readonly uncleanAtInit: string[] = [];
+  /** Per-run promise-chain mutex tails: every mutating op on one run awaits and
+   *  extends its run's tail, so a run's ops run strictly one-at-a-time (different
+   *  runs stay concurrent). Closes the read-modify-write race in installManifest
+   *  where two mutating calls would read the same generation and lose one. */
+  private readonly runLocks = new Map<string, Promise<void>>();
   private key: Buffer | undefined;
   /** Set when the store fails closed (key missing/unreadable with records
    *  present, or the root is a symlink): every write is a no-op and drain
@@ -382,29 +387,31 @@ export class Outbox {
     const first = msgs[0];
     const last = msgs[msgs.length - 1];
     if (!first || !last) return;
-    const rs = await this.ensureRunState(runId);
-    if (!rs) return; // refused (symlink) or disabled
+    await this.withRunLock(runId, async () => {
+      const rs = await this.ensureRunState(runId);
+      if (!rs) return; // refused (symlink / non-bare runId) or disabled
 
-    const body = {
-      version: 1 as const,
-      runId,
-      firstSeq: first.seq,
-      lastSeq: last.seq,
-      generation,
-      messages: msgs,
-    };
-    const serialized = this.seal(MAC_DOMAIN_SEGMENT, body);
-    const bytes = Buffer.byteLength(serialized, "utf8");
+      const body = {
+        version: 1 as const,
+        runId,
+        firstSeq: first.seq,
+        lastSeq: last.seq,
+        generation,
+        messages: msgs,
+      };
+      const serialized = this.seal(MAC_DOMAIN_SEGMENT, body);
+      const bytes = Buffer.byteLength(serialized, "utf8");
 
-    await this.enforceQuota(runId, bytes);
+      await this.enforceQuota(runId, bytes);
 
-    const fileVersion = this.nextFileVersion(rs, first.seq, last.seq);
-    const file = `seg-${first.seq}-${last.seq}-v${fileVersion}.json`;
-    await this.writeFileAtomic(path.join(this.runDir(runId), file), serialized, "segment");
+      const fileVersion = this.nextFileVersion(rs, first.seq, last.seq);
+      const file = `seg-${first.seq}-${last.seq}-v${fileVersion}.json`;
+      await this.writeFileAtomic(path.join(this.runDir(runId), file), serialized, "segment");
 
-    const ref: ManifestRecordRef = { kind: "segment", firstSeq: first.seq, lastSeq: last.seq, fileVersion, file };
-    await this.installManifest(rs, [...rs.manifest.records, ref]);
-    rs.recordBytes.set(file, bytes);
+      const ref: ManifestRecordRef = { kind: "segment", firstSeq: first.seq, lastSeq: last.seq, fileVersion, file };
+      await this.installManifest(rs, [...rs.manifest.records, ref]);
+      rs.recordBytes.set(file, bytes);
+    });
   }
 
   /**
@@ -415,26 +422,28 @@ export class Outbox {
    */
   async appendRangeRecord(runId: string, generation: number, firstSeq: number, lastSeq: number): Promise<void> {
     if (!this.writable()) return;
-    const rs = await this.ensureRunState(runId);
-    if (!rs) return;
-    await this.withReserveOnEnospc(async () => {
-      const body = {
-        version: 1 as const,
-        runId,
-        firstSeq,
-        lastSeq,
-        generation,
-        event: "message_dropped" as const,
-        reason: DROP_REASON,
-      };
-      const serialized = this.seal(MAC_DOMAIN_RANGE, body);
-      const bytes = Buffer.byteLength(serialized, "utf8");
-      const fileVersion = this.nextFileVersion(rs, firstSeq, lastSeq);
-      const file = `range-${firstSeq}-${lastSeq}-v${fileVersion}.json`;
-      await this.writeFileAtomic(path.join(this.runDir(runId), file), serialized, "range");
-      const ref: ManifestRecordRef = { kind: "range", firstSeq, lastSeq, fileVersion, file };
-      await this.installManifest(rs, [...rs.manifest.records, ref]);
-      rs.recordBytes.set(file, bytes);
+    await this.withRunLock(runId, async () => {
+      const rs = await this.ensureRunState(runId);
+      if (!rs) return;
+      await this.withReserveOnEnospc(async () => {
+        const body = {
+          version: 1 as const,
+          runId,
+          firstSeq,
+          lastSeq,
+          generation,
+          event: "message_dropped" as const,
+          reason: DROP_REASON,
+        };
+        const serialized = this.seal(MAC_DOMAIN_RANGE, body);
+        const bytes = Buffer.byteLength(serialized, "utf8");
+        const fileVersion = this.nextFileVersion(rs, firstSeq, lastSeq);
+        const file = `range-${firstSeq}-${lastSeq}-v${fileVersion}.json`;
+        await this.writeFileAtomic(path.join(this.runDir(runId), file), serialized, "range");
+        const ref: ManifestRecordRef = { kind: "range", firstSeq, lastSeq, fileVersion, file };
+        await this.installManifest(rs, [...rs.manifest.records, ref]);
+        rs.recordBytes.set(file, bytes);
+      });
     });
   }
 
@@ -442,18 +451,22 @@ export class Outbox {
    *  none exists yet). Surfaced at the next restart via {@link uncleanRuns}. */
   async markSpillUnclean(runId: string): Promise<void> {
     if (!this.writable()) return;
-    const rs = await this.ensureRunState(runId);
-    if (!rs) return;
-    if (rs.manifest.spilledUnclean && rs.manifest.generation > 0) return;
-    await this.installManifest(rs, rs.manifest.records, { spilledUnclean: true });
+    await this.withRunLock(runId, async () => {
+      const rs = await this.ensureRunState(runId);
+      if (!rs) return;
+      if (rs.manifest.spilledUnclean && rs.manifest.generation > 0) return;
+      await this.installManifest(rs, rs.manifest.records, { spilledUnclean: true });
+    });
   }
 
   /** Clear the spill-unclean flag on a clean flush/close. */
   async clearSpillUnclean(runId: string): Promise<void> {
     if (!this.writable()) return;
-    const rs = this.runs.get(runId);
-    if (!rs || !rs.manifest.spilledUnclean) return;
-    await this.installManifest(rs, rs.manifest.records, { spilledUnclean: false });
+    await this.withRunLock(runId, async () => {
+      const rs = this.runs.get(runId);
+      if (!rs || !rs.manifest.spilledUnclean) return;
+      await this.installManifest(rs, rs.manifest.records, { spilledUnclean: false });
+    });
   }
 
   // ── drain / replay ────────────────────────────────────────────────────────────
@@ -473,33 +486,35 @@ export class Outbox {
     send: (msgs: OutgoingMessage[]) => Promise<void>,
   ): Promise<{ retired: boolean; staleRetired: number }> {
     if (this.disabled) return { retired: false, staleRetired: 0 };
-    const rs = this.runs.get(runId);
-    if (!rs) return { retired: true, staleRetired: 0 }; // unknown/rejected run: nothing to replay
+    return this.withRunLock(runId, async () => {
+      const rs = this.runs.get(runId);
+      if (!rs) return { retired: true, staleRetired: 0 }; // unknown/rejected run: nothing to replay
 
-    const pending = rs.manifest.records
-      .filter((r) => r.lastSeq > rs.manifest.cursor)
-      .sort((a, b) => a.firstSeq - b.firstSeq);
+      const pending = rs.manifest.records
+        .filter((r) => r.lastSeq > rs.manifest.cursor)
+        .sort((a, b) => a.firstSeq - b.firstSeq);
 
-    for (const rec of pending) {
-      const msgs = await this.expandRecord(rs, rec);
-      try {
-        await send(msgs);
-      } catch (err) {
-        if (err instanceof StaleClaimError) {
-          this.log.warn("outbox: record refused as stale claim; retiring locally (frames lost, not rebound)", {
-            run_id: runId,
-            first_seq: rec.firstSeq,
-            last_seq: rec.lastSeq,
-          });
-          await this.retireRecord(rs, rec, true);
-          continue;
+      for (const rec of pending) {
+        const msgs = await this.expandRecord(rs, rec);
+        try {
+          await send(msgs);
+        } catch (err) {
+          if (err instanceof StaleClaimError) {
+            this.log.warn("outbox: record refused as stale claim; retiring locally (frames lost, not rebound)", {
+              run_id: runId,
+              first_seq: rec.firstSeq,
+              last_seq: rec.lastSeq,
+            });
+            await this.retireRecord(rs, rec, true);
+            continue;
+          }
+          // Any other error: stop, leave this and the rest pending for the next drain.
+          return { retired: false, staleRetired: rs.manifest.staleRetired };
         }
-        // Any other error: stop, leave this and the rest pending for the next drain.
-        return { retired: false, staleRetired: rs.manifest.staleRetired };
+        await this.retireRecord(rs, rec, false);
       }
-      await this.retireRecord(rs, rec, false);
-    }
-    return { retired: rs.manifest.records.length === 0, staleRetired: rs.manifest.staleRetired };
+      return { retired: rs.manifest.records.length === 0, staleRetired: rs.manifest.staleRetired };
+    });
   }
 
   /** The messages a record replays as: a segment's own messages, or one tombstone
@@ -534,16 +549,38 @@ export class Outbox {
 
   private async enforceQuota(runId: string, incomingBytes: number): Promise<void> {
     // Run quota: evict this run's oldest segment until the incoming segment fits.
+    // The appending run already holds its own lock, so a same-run eviction stays on
+    // this in-lock path — unchanged.
     while (this.runBytes(runId) + incomingBytes > this.runMaxBytes) {
       const oldest = this.oldestSegmentInRun(runId);
       if (!oldest) break; // nothing evictable (only ranges, or empty) — write over quota
       await this.evictSegment(runId, oldest);
     }
-    // Worker quota: evict the globally-oldest segment across all runs.
+    // Worker quota: evict the globally-oldest segment across all runs. The victim may
+    // belong to a DIFFERENT run whose manifest must be mutated ONLY under its own
+    // per-run lock (else its own concurrent append races the eviction on manifest.json
+    // and a generation is lost). So a cross-run victim's lock is taken NON-BLOCKING:
+    // a victim whose lock is currently held is skipped — never waited on, which would
+    // risk an A-waits-B / B-waits-A deadlock and stall this spill on another run's I/O.
+    // oldestEvictableSegment already excludes busy victims, so it hands back the oldest
+    // segment we can evict without blocking (the appending run's own, or a free run's);
+    // when none is free the eviction is deferred and the append proceeds — maxBytes is
+    // a SOFT target and a transient overage until the next append is acceptable, the
+    // store's existing bounded-degradation model.
     while (this.totalBytes() + incomingBytes > this.maxBytes) {
-      const oldest = this.oldestSegmentGlobally();
-      if (!oldest) break;
-      await this.evictSegment(oldest.runId, oldest.rec);
+      const victim = this.oldestEvictableSegment(runId);
+      if (!victim) break; // nothing evictable whose lock is free — defer (soft quota)
+      if (victim.runId === runId) {
+        await this.evictSegment(victim.runId, victim.rec); // same run: A already holds the lock
+        continue;
+      }
+      const release = this.tryRunLock(victim.runId);
+      if (!release) break; // raced busy between selection and acquire — defer, never block
+      try {
+        await this.evictSegment(victim.runId, victim.rec);
+      } finally {
+        release();
+      }
     }
   }
 
@@ -600,11 +637,19 @@ export class Outbox {
     return oldest;
   }
 
-  /** The globally-oldest segment across all runs, ordered by (run creation time,
-   *  firstSeq) as an age proxy (no per-record timestamp is stored, D12 shape). */
-  private oldestSegmentGlobally(): { runId: string; rec: ManifestRecordRef } | undefined {
+  /** The globally-oldest segment this append may evict WITHOUT blocking, ordered by
+   *  (run creation time, firstSeq) as an age proxy (no per-record timestamp is
+   *  stored, D12 shape). Candidates are the appending run (whose lock is already
+   *  held on this path) plus any OTHER run whose per-run lock is currently free; a
+   *  different run whose lock is HELD is skipped, because its manifest must be
+   *  mutated only under its own lock and blocking on it could deadlock. With no
+   *  contention every run is a candidate, so this is exactly the globally-oldest
+   *  segment — the common-case behavior is unchanged. */
+  private oldestEvictableSegment(appendingRunId: string): { runId: string; rec: ManifestRecordRef } | undefined {
     let best: { runId: string; rec: ManifestRecordRef; since: number } | undefined;
     for (const rs of this.runs.values()) {
+      // Skip a DIFFERENT run whose lock is held — its own op is mutating its manifest.
+      if (rs.runId !== appendingRunId && this.runLocks.has(rs.runId)) continue;
       for (const r of rs.manifest.records) {
         if (r.kind !== "segment") continue;
         if (
@@ -647,17 +692,21 @@ export class Outbox {
       if (rs.manifest.records.length === 0 && now - rs.manifest.updatedAt > this.retentionMs) toRemove.push(runId);
     }
     for (const runId of toRemove) {
-      await this.removeRun(runId);
+      await this.withRunLock(runId, () => this.removeRun(runId));
       this.log.info("outbox: retention removed fully-retired run", { run_id: runId });
     }
   }
 
   /** Remove a run's whole subtree (the api reported the run terminal/404). */
   async retireRun(runId: string): Promise<void> {
-    await this.removeRun(runId);
+    await this.withRunLock(runId, () => this.removeRun(runId));
   }
 
   private async removeRun(runId: string): Promise<void> {
+    // Guard the recursive delete: a non-bare runId (`..`, a nested path, a
+    // separator/NUL) would escape the root, so refuse it here — the last line of
+    // defense before `fs.rm(..., { recursive: true })` (H1).
+    if (!this.validRunId(runId)) return;
     await fs.rm(this.runDir(runId), { recursive: true, force: true }).catch(() => undefined);
     this.runs.delete(runId);
   }
@@ -701,7 +750,83 @@ export class Outbox {
     return path.join(this.root, runId);
   }
 
+  /** True iff `runId` is a bare path component safe to `path.join` under the root.
+   *  A `..`, `.`, empty string, or one carrying a separator or NUL would escape
+   *  the root for a write AND for the recursive delete in removeRun/retireRun/the
+   *  retention sweep. `runId` is a server UUID today, so this is latent — but a
+   *  recursive delete must never be handed an escaping component (H1). Rejection
+   *  logs a warning; the caller fails closed (no write, no delete). */
+  private validRunId(runId: string): boolean {
+    if (
+      runId === "" ||
+      runId === "." ||
+      runId === ".." ||
+      runId.includes("/") ||
+      runId.includes("\\") ||
+      runId.includes("\0") ||
+      path.basename(runId) !== runId
+    ) {
+      this.log.warn("outbox: refusing non-bare runId (path escape guard)", { run_id: runId });
+      return false;
+    }
+    return true;
+  }
+
+  /** Serialize all mutating ops on ONE run through a promise-chain mutex: each op
+   *  awaits the run's current tail, then becomes the new tail, so two mutating
+   *  calls on the same run never interleave (which would let both read the same
+   *  manifest generation and lose one). Different runs never share a tail, so they
+   *  stay concurrent. The stored tail never rejects, so one op's failure does not
+   *  wedge the run's chain (H2). */
+  private withRunLock<T>(runId: string, fn: () => Promise<T>): Promise<T> {
+    const prev = this.runLocks.get(runId) ?? Promise.resolve();
+    const result = prev.then(() => fn());
+    const tail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.runLocks.set(runId, tail);
+    // Drop the entry once this op is the last in the chain (bounded map growth).
+    void tail.then(() => {
+      if (this.runLocks.get(runId) === tail) this.runLocks.delete(runId);
+    });
+    return result;
+  }
+
+  /** Non-blocking acquire of a run's per-run lock, for a CROSS-RUN mutation (a
+   *  worker-quota eviction whose victim is not the appending run). Returns a
+   *  release fn when the run's chain is idle, or null when an op already holds or
+   *  awaits it — in which case the caller MUST skip the victim, never block on it
+   *  (blocking risks an A-waits-B / B-waits-A deadlock and would stall a spill on
+   *  another run's I/O). The check-then-take is synchronous, so no interleaving can
+   *  occur between them. While the lock is held a later {@link withRunLock} on the
+   *  same run chains behind it; calling the returned release fn drains that chain.
+   *  This is what keeps "a victim run's manifest is only mutated under its own
+   *  lock" true even across runs. */
+  private tryRunLock(runId: string): (() => void) | null {
+    if (this.runLocks.has(runId)) return null; // busy — do NOT block
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const tail = held.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.runLocks.set(runId, tail);
+    void tail.then(() => {
+      if (this.runLocks.get(runId) === tail) this.runLocks.delete(runId);
+    });
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      release();
+    };
+  }
+
   private async ensureRunState(runId: string): Promise<RunState | undefined> {
+    if (!this.validRunId(runId)) return undefined; // H1: never build a write path from a non-bare runId
     const existing = this.runs.get(runId);
     if (existing) return existing;
     const dir = this.runDir(runId);
@@ -885,12 +1010,23 @@ export class Outbox {
 
   private async replenishReserve(): Promise<void> {
     // Plain write (not the seam-wrapped atomic writer): the reserve is opaque
-    // padding, needs no MAC, and must stay writable in the ENOSPC retry path.
-    await fs
-      .writeFile(this.reservePath(), Buffer.alloc(OUTBOX_RANGE_RESERVE_BYTES), { mode: 0o600 })
-      .catch((err) => {
-        this.log.warn("outbox: could not replenish reserve", { error: errText(err) });
-      });
+    // padding, needs no MAC, and must stay writable in the ENOSPC retry path. But
+    // it opens O_NOFOLLOW like every other write in the module, so a symlinked
+    // `.reserve` is never followed (consistency with mintKey/writeFileAtomic).
+    try {
+      const fh = await fs.open(
+        this.reservePath(),
+        fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC | fsConstants.O_NOFOLLOW,
+        0o600,
+      );
+      try {
+        await fh.writeFile(Buffer.alloc(OUTBOX_RANGE_RESERVE_BYTES));
+      } finally {
+        await fh.close();
+      }
+    } catch (err) {
+      this.log.warn("outbox: could not replenish reserve", { error: errText(err) });
+    }
   }
 
   /** Run `fn`, and on `ENOSPC` release the reserve to free space, retry once, then
