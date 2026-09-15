@@ -199,6 +199,6 @@ executed on an older worker, or against an older server, is honestly
 reported as **unsupported** rather than silently promised a recovery that
 was never captured. Upgrading your fleet only protects runs going forward.
 
-Related: [Recovering from an empty turn](run-recovery-wait.md) (a different,
+Related: [Recovering from a transient interruption](run-recovery-wait.md) (a different,
 earlier mechanism — a transient in-place retry, not a byte archive) ·
 [Hosted workers](hosted-workers.md) · [CLI](cli.md)

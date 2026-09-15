@@ -618,7 +618,7 @@ export function runBadge(run: LatestRun, nowMs: number): RunBadge {
         tone: "warning",
         pulse: false,
         title:
-          "Paused to recover from a transient empty model result — it resumes automatically.",
+          "Paused to recover from a transient interruption — it resumes automatically.",
       };
     // PRD #1190: a run its owner paused. Info-toned and STATIC (no elapsed on the badge —
     // the per-card duration token carries `paused <elapsed>` via runDurationLabel). The
