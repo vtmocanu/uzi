@@ -2,6 +2,7 @@ package handler
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -75,12 +76,18 @@ func (h *Handler) SetRunCredential(w http.ResponseWriter, r *http.Request) {
 // path (M2) also uses, so the two override write surfaces classify the same refusal the
 // same way.
 func (h *Handler) writeSetRunCredentialError(w http.ResponseWriter, err error) {
+	var workerUnsupported *workersvc.CredentialSwitchWorkerUnsupportedError
 	switch {
 	case errors.Is(err, workersvc.ErrRunNotFound):
 		httpx.Error(w, http.StatusNotFound, "run not found")
-	case errors.Is(err, workersvc.ErrCredentialSwitchHeldStateUnsupported):
-		// M4: held states refuse; M5 replaces this with the real switch protocol.
-		httpx.Error(w, http.StatusConflict, "switching a running or gated run is not yet available")
+	case errors.As(err, &workerUnsupported):
+		// PRD #1247 M5 (D4-step-9): the run's holding worker does not advertise the
+		// credential_switch capability, so a held-state switch cannot be requested. Name the
+		// worker so the operator knows which to upgrade (the worker name is owner-controlled
+		// text but not attacker-supplied on this owner-scoped path).
+		httpx.Error(w, http.StatusConflict, fmt.Sprintf("the worker running this run (%q) must be upgraded to support credential_switch before its token can be switched", workerUnsupported.WorkerName))
+	case errors.Is(err, workersvc.ErrCredentialSwitchNoLiveWorker):
+		httpx.Error(w, http.StatusConflict, "this run has no live worker to switch its token; retry once it is claimed")
 	case errors.Is(err, workersvc.ErrCredentialSwitchClaimAssembling):
 		httpx.Error(w, http.StatusConflict, "the claim is being assembled; retry in a moment")
 	case errors.Is(err, workersvc.ErrCredentialSwitchRunTerminal):
