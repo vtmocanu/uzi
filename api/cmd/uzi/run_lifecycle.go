@@ -34,8 +34,12 @@ func newRunCreateCmd(env Env, gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			credOverride, err := credentialOverrideFlag(cmd, c)
+			if err != nil {
+				return err
+			}
 			force, _ := cmd.Flags().GetBool("force")
-			run, err := c.CreateRun(cmd.Context(), repoID, issue, waitOnLimitFlag(cmd), mrReworkFlag(cmd), force, seed)
+			run, err := c.CreateRun(cmd.Context(), repoID, issue, waitOnLimitFlag(cmd), mrReworkFlag(cmd), force, seed, credOverride)
 			if err != nil {
 				return err
 			}
@@ -72,7 +76,59 @@ func newRunCreateCmd(env Env, gf *globalFlags) *cobra.Command {
 	create.Flags().Bool("require-base", false,
 		"fail the run instead of warning if the clone's base differs from --planned-commit "+
 			"(requires --planned-commit)")
+	// PRD #1247 M2: the per-run Anthropic credential choice. Three-way like --wait-on-limit
+	// and --mr-rework: omitted inherits the worker binding; a keyword forces a mode; any
+	// other value is a token label resolved to a pinned choice.
+	create.Flags().String("token", "",
+		"which Anthropic token this run spends: a token label (pins the run to it), "+
+			"'auto' (auto-select from your pool), 'default' (your default token), or 'inherit' "+
+			"(the worker's binding); omit to inherit")
 	return create
+}
+
+// credentialOverrideFlag resolves `uzi run create --token` into the wire credential override
+// (PRD #1247 M2). It is three-way like waitOnLimitFlag/mrReworkFlag and mirrors `worker
+// set-token` / `token pool`'s CLIENT-SIDE label resolution:
+//
+//   - flag OMITTED                    → nil (send no credential_override; inherit the worker
+//     binding, byte-identical to a pre-#1247 create)
+//   - --token auto|default|inherit    → that mode, carrying no secret
+//   - --token <label>                 → resolve the label to an anthropic_token id via
+//     ListSecrets + findSecretByLabel; a no-match is a clean CLIENT-SIDE refusal naming the
+//     read commands (never a round-trip), and a match sends {pinned, secret_id}
+//
+// ListSecrets is called ONLY for a label (the three keywords need no server round-trip).
+func credentialOverrideFlag(cmd *cobra.Command, c uzicli.Client) (*uzicli.CreateRunCredentialOverride, error) {
+	if !cmd.Flags().Changed("token") {
+		return nil, nil
+	}
+	val, _ := cmd.Flags().GetString("token")
+	switch val {
+	case "auto", "default", "inherit":
+		return &uzicli.CreateRunCredentialOverride{Mode: val}, nil
+	}
+	// Any other value is a token LABEL, resolved client-side to a pinned choice. The
+	// resolution kind-filters to anthropic_token (a credential override re-points Anthropic
+	// spend only), exactly as `uzi token pool` does now that ListSecrets returns codex kinds.
+	secrets, err := c.ListSecrets(cmd.Context())
+	if err != nil {
+		return nil, err
+	}
+	target, ok := findSecretByLabel(secrets, kindAnthropicToken, val)
+	if !ok {
+		// A NON-anthropic secret carrying this label: name its kind so the refusal reads
+		// true (an override applies only to Anthropic tokens) rather than "no such token".
+		if other, found := findSecretByLabel(secrets, "", val); found {
+			return nil, uzicli.Exitf(uzicli.ExitUsage,
+				"--token accepts only Anthropic tokens; %q is a %s credential", val, tokenKindAlias(other.Kind))
+		}
+		// A usage error, not a 404: the label never reached the server, so report what
+		// actually happened — the caller holds no Anthropic token by that name. Names the
+		// read command, exactly like `uzi token pool`'s own unknown-label refusal.
+		return nil, uzicli.Exitf(uzicli.ExitUsage,
+			"no Anthropic token labelled %q; `uzi token list` shows yours", val)
+	}
+	return &uzicli.CreateRunCredentialOverride{Mode: "pinned", SecretID: target.ID}, nil
 }
 
 // newRunApproveCmd builds `uzi run approve`.

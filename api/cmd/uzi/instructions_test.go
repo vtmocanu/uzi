@@ -403,10 +403,12 @@ var knownInstructions = []knownInstruction{
 		// executed against a FAKE client, so this proves the argv shape and the refusal, not
 		// that `uzi token list` succeeds against a booted API. TestTokenList covers the
 		// command itself, also against a fake.
-		note: "RUNTIME: `uzi token pool`'s unknown-label refusal (token.go) names the read " +
-			"that prints the caller's valid labels. EXECUTED through the real parse in " +
-			"TestTokenPoolUnknownLabelIsUsageError, which asserts exit 3 AND that no write " +
-			"was sent. Not executed against a booted API.",
+		note: "RUNTIME: `uzi token pool`'s unknown-label refusal (token.go) AND `uzi run create " +
+			"--token <label>`'s client-side unknown-label refusal (run_lifecycle.go, PRD #1247 M2) " +
+			"both name the read that prints the caller's valid labels. EXECUTED through the real " +
+			"parse in TestTokenPoolUnknownLabelIsUsageError (exit 3 AND no write sent) and " +
+			"TestRunCreateTokenUnknownLabelRefusedClientSide (exit 3 AND CreateRun never called). " +
+			"Not executed against a booted API.",
 	},
 	{
 		command:  "uzi skill install",
