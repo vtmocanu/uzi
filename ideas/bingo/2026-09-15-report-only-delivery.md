@@ -43,12 +43,16 @@ completion with no MR it posts a bare stub:
 (`api/internal/runlifecycle/lifecycle.go:489-490`). `docs/autopilot.md` documents
 exactly two outcomes — the MR-link success (`docs/autopilot.md:66-68`) and the
 failure comment (`docs/autopilot.md:81-84`) — and a report-only completion is neither.
-There is no completed-run notification kind: the notification `Kind` literals are
-`run_failed` (`api/internal/notifysvc/run_failure_notifier.go:149`), `ci_autofix_landed`
+There is no completed-run notification kind: every notification construction site
+(`git grep -n 'notifysvc.Notification{' -- api/`, plus the package's own) carries a
+failure, halt, start or housekeeping kind — among them `run_failed`
+(`api/internal/notifysvc/run_failure_notifier.go:149`), `ci_autofix_landed`
 (`api/internal/forgesvc/pipeline_sync.go:259`), `mr_rework_halted`
 (`api/internal/poller/mr_review_watch.go:311`), `early_limit_reset`
-(`api/internal/notifysvc/service.go:187`), and `incidental_finding`
-(`api/internal/notifysvc/service.go:181`) — none is a run completion.
+(`api/internal/notifysvc/service.go:187`), `incidental_finding`
+(`api/internal/notifysvc/service.go:181`), `ci_autofix_started`/`ci_autofix_halted`,
+`schedule_error`, `judge_review`, `guard_role_excluded`, `selfimprove_started`/
+`selfimprove_skipped`, `vault_locked`, `custody_episode` — and none is a run completion.
 
 **The maintainer already pays for the gap by hand.** The release skill has to sweep
 these out manually: "Also surface report-only runs whose issue could now be closed —
@@ -249,7 +253,7 @@ Commands re-run at `ab1d7431`:
 | Phrase sweep | `git grep -rn -i -F` of "deliver the report" / "post the report" / "report to the issue" / "report comment" / "answer on the issue" over `prds/ ideas/ adr/ docs/ specs/` | Empty |
 | report_md leaves uzi | `git grep -n 'ReportMd\b' -- api/ \| grep -v '_test\|sql.go\|/store/'` | Only DTO/CLI/web consumers + ingest; no forge write |
 | CreateIssueNote callers | `git grep -rn CreateIssueNote -- api/ \| grep -v -i test` | `poller/autopilot.go:280`, `poller/ci_autofix.go:247,293`, `poller/mr_review_watch.go:260`, `runlifecycle/lifecycle.go:470` — none carries report_md |
-| Completion notification kind | enumerate `Kind:` literals in `api/internal/notifysvc/` and callers | `run_failed`, `ci_autofix_landed`, `mr_rework_halted`, `early_limit_reset`, `incidental_finding` — none is a completion |
+| Completion notification kind | `git grep -n 'notifysvc.Notification{' -- api/ \| grep -v _test`, then read each `Kind:` (plus `notifysvc`'s own constructions) | 13+ distinct kinds (`run_failed`, `ci_autofix_*`, `mr_rework_halted`, `schedule_error`, `judge_review`, `guard_role_excluded`, `selfimprove_*`, `vault_locked`, `custody_episode`, `early_limit_reset`, `incidental_finding`) — none is a run completion |
 | report-only user docs | `git grep -rn -i 'report-only\|report only' -- docs/` | Only `docs/agent-templates.md:86`, unrelated wave-instruction sense |
 | Open PRDs on this surface | grep `runlifecycle`/`report_md` in `prds/1253-run-merged-signal.md`, `prds/1202-on-demand-mr-rework.md`, `prds/1233-structured-blockers-mr-rework.md`, `prds/1293-failed-run-rate-dashboard.md` | Zero matches in all four |
 
