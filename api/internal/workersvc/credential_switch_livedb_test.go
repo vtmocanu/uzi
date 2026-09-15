@@ -811,4 +811,26 @@ func TestFailCredentialSwitchLiveDB(t *testing.T) {
 			t.Fatal("an invalid give-up (no generation) must clear nothing; the stamp was dropped")
 		}
 	})
+
+	t.Run("a RELEASED claim clears nothing (pins the claim_released_at IS NULL conjunct)", func(t *testing.T) {
+		// A run whose claim was already RELEASED by a successful credential_switch keeps its stamp
+		// (D14: the stamp stays "released, awaiting reclaim" until the reclaim's epoch write clears
+		// it, M9). A give-up at that same generation must therefore clear NOTHING — the release, not
+		// a capture failure, owns that stamp now. This pins the ClearCredentialSwitchByWorker
+		// `claim_released_at IS NULL` conjunct: dropping it lets the give-up clear a released stamp
+		// (applied=true), reddening this test — the mutation check the sibling
+		// ReleaseCredentialSwitch conjunct already has.
+		g := int64(8)
+		id := seedHeldRun(t, env, o, 6105, "running", g, true, true) // withStamp=true, released=true
+		run, applied, err := svc.SetState(env.ctx, wkr, id, StateRequest{State: "credential_switch_failed", ClaimGeneration: &g})
+		if err != nil {
+			t.Fatalf("give-up on a released claim: err = %v, want nil (0-row no-op ack)", err)
+		}
+		if applied {
+			t.Fatal("a give-up on a RELEASED claim must NOT apply (the release owns the stamp until reclaim)")
+		}
+		if !run.CredentialSwitchRequestedAt.Valid || !run.CredentialSwitchGeneration.Valid {
+			t.Fatalf("switch stamp = (%v, %v), want it KEPT on the released claim", run.CredentialSwitchRequestedAt, run.CredentialSwitchGeneration)
+		}
+	})
 }

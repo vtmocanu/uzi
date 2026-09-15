@@ -237,5 +237,11 @@ func TestWorkerCredentialSwitchFailedAckLiveDB(t *testing.T) {
 		if rec.Code != http.StatusConflict {
 			t.Fatalf("status = %d, want 409 (nothing pending to clear); body=%s", rec.Code, rec.Body.String())
 		}
+		// It is the ORDINARY not-applied 409, NOT a stale_claim disposition: a give-up that clears
+		// nothing is a benign no-op, not a superseded-claim stop signal. Assert the disposition is
+		// absent so the "ordinary vs stale 409" distinction stays pinned.
+		if strings.Contains(rec.Body.String(), "stale_claim") {
+			t.Fatalf("redelivery 409 body must NOT carry a stale_claim disposition; body=%s", rec.Body.String())
+		}
 	})
 }
