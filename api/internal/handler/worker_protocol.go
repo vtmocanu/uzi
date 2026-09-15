@@ -303,10 +303,30 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	// worker_id is echoed for the worker's convenience; identity on every other
 	// call comes from the Bearer token, never a URL path (M2 wire contract).
+	//
+	// PRD #1392 M1: protocol_features advertises the OPTIONAL wire-protocol behaviours THIS api
+	// implements, so a worker can negotiate its report shape (the register-time capability
+	// advertisement PRDs #1390/#1391 also key on — this PRD ships the field first). It is
+	// server-derived and constant, not worker input.
 	httpx.JSON(w, http.StatusOK, map[string]any{
-		"worker_id": updated.ID.String(),
-		"worker":    workerDTOFromWorker(updated, 0, false, "", h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt),
+		"worker_id":         updated.ID.String(),
+		"worker":            workerDTOFromWorker(updated, 0, false, "", h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt),
+		"protocol_features": protocolFeatures(),
 	})
+}
+
+// protocolFeatures is the closed set of optional wire-protocol behaviours this api
+// implements, advertised on the register response (PRD #1392 M1). It is EXACTLY these two:
+//   - "recovery_park_cause": SetState accepts a typed recovery_cause and, for forge_unreachable,
+//     runs the atomic custody-settling park transaction.
+//   - "recovery_release_exact_echo": the v2 worker Release endpoint echoes the released
+//     generation back.
+//
+// It deliberately does NOT advertise "claim_generation_fence" — that token is owned by #1390
+// and is advertised only once that PRD lands. Returns a fresh slice so a caller cannot mutate
+// the advertised set. TestRegisterAdvertisesProtocolFeatures pins the exact two.
+func protocolFeatures() []string {
+	return []string{"recovery_park_cause", "recovery_release_exact_echo"}
 }
 
 // maxWorkerCPUPct clamps a worker's self-reported CPU percentage (PRD #49 Decision
@@ -616,6 +636,20 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case errors.Is(err, workersvc.ErrRunNotOwned):
 			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
+		// PRD #1392 M1: the two forge-park precedence refusals are 409 with a {run, reason}
+		// body — the worker dispatches on `reason` (stale_claim stops silently; custody_unsettled
+		// falls to today's failed path). recovery_retry_not_before rides on the run (RunDTO), not
+		// the top-level body. Both carry the run row (SetState returns it alongside the error).
+		case errors.Is(err, workersvc.ErrForgeParkStaleClaim):
+			httpx.JSON(w, http.StatusConflict, map[string]any{
+				"run":    runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock()),
+				"reason": "stale_claim",
+			})
+		case errors.Is(err, workersvc.ErrForgeParkCustodyUnsettled):
+			httpx.JSON(w, http.StatusConflict, map[string]any{
+				"run":    runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock()),
+				"reason": "custody_unsettled",
+			})
 		case errors.Is(err, workersvc.ErrInvalidState):
 			httpx.Error(w, http.StatusBadRequest, "state must be one of running, awaiting_approval, awaiting_input, awaiting_followup, limit_wait, recovery_wait, paused, pause_failed, completed, failed")
 		default:
@@ -643,10 +677,10 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 		// run opted out) are server-side FAILURES delivered as 200s with
 		// status: "failed", where applied is TRUE. An applied-keyed branch leaks the
 		// disk on exactly those.
-		httpx.JSON(w, http.StatusConflict, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.clock())})
+		httpx.JSON(w, http.StatusConflict, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock())})
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.clock())})
+	httpx.JSON(w, http.StatusOK, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock())})
 }
 
 // WorkerRunInputs consumes and returns any pending steering inputs, FIFO.
@@ -688,7 +722,7 @@ func (h *Handler) WorkerRunOwnership(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	status, err := h.wsvc.RunOwnership(r.Context(), wkr, runID)
+	status, recoveryRetryNotBefore, err := h.wsvc.RunOwnership(r.Context(), wkr, runID)
 	if err != nil {
 		if errors.Is(err, workersvc.ErrRunNotOwned) {
 			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
@@ -698,7 +732,15 @@ func (h *Handler) WorkerRunOwnership(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"status": status})
+	// PRD #1392 M1 (D10): recovery_retry_not_before rides the ownership probe so a worker
+	// reconciling an unknown forge-park outcome (a transport failure after the report was sent)
+	// can still quote the acknowledged retry time on its feed event. Omitted (nil) for a run
+	// that is not recovery-parked.
+	body := map[string]any{"status": status}
+	if recoveryRetryNotBefore != nil {
+		body["recovery_retry_not_before"] = recoveryRetryNotBefore
+	}
+	httpx.JSON(w, http.StatusOK, body)
 }
 
 // WorkerRunOrphanClassification classifies a clone orphan's OWNER run (issue #1319): the
@@ -877,10 +919,10 @@ func (h *Handler) WorkerRunCompletionHold(w http.ResponseWriter, r *http.Request
 		// The hold's guard refused (wrong status, not interlocked, or no recorded completion
 		// attempt): 409 with the run's REAL status, which the worker reads off the body and
 		// retains the run on (it cleans up ONLY on a `paused` ack).
-		httpx.JSON(w, http.StatusConflict, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.clock())})
+		httpx.JSON(w, http.StatusConflict, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock())})
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.clock())})
+	httpx.JSON(w, http.StatusOK, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock())})
 }
 
 // workerMemoryToDTO maps a stored entry to the worker-facing DTO. It carries run_id

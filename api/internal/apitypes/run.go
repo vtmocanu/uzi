@@ -587,6 +587,32 @@ type RunDTO struct {
 	// it: the vocabulary is the SDK's and a newer server can ship a member this
 	// client has not heard of. Same rule as AnthropicSelectReason above.
 	RateLimitType *string `json:"rate_limit_type"`
+	// RecoveryWaitCause is the TYPED cause of a 'recovery_wait' park (PRD #1392 M1). Null is
+	// the LEGACY/untyped park — the empty-turn park writes NULL (D9), so a client must render
+	// null as the generic "waiting to retry" wording, NOT as any particular cause. Today the
+	// only non-null value is "forge_unreachable" (the forge stayed unreachable at clone);
+	// "empty_turn"/"provider_outage" are reserved. Clients render an unrecognised value
+	// honestly (a newer server may ship a cause this client has not heard of), the same rule
+	// as RateLimitType.
+	RecoveryWaitCause *string `json:"recovery_wait_cause"`
+	// RecoveryRetryNotBefore is when the server will promote a 'recovery_wait' run back to
+	// queued — the retry stamp the forge-park surface counts down to ("retry at HH:MM"). It is
+	// the recovery-park analog of RetryNotBefore (the usage-limit park's stamp) and is a
+	// SEPARATE column: a run parks on at most one of the two at a time, but they never share a
+	// field. Null for a run that has never recovery-parked. Surfaced for EVERY recovery cause,
+	// not just the forge one (SC5).
+	RecoveryRetryNotBefore *time.Time `json:"recovery_retry_not_before"`
+	// ForgeParkCount is how many times this run has forge-parked in its lifetime (PRD #1392
+	// M1), the FORGE-ONLY counter the cap decides on — distinct from the backoff-shaping
+	// recovery_wait_count. 0 for a run that has never forge-parked (including every empty-turn
+	// park, which never touches it, SC5). Rendered as the "N" in "N of MAX".
+	ForgeParkCount int `json:"forge_park_count"`
+	// ForgeParkMax is the EFFECTIVE forge-park cap (RUN_FORGE_UNREACHABLE_MAX_PARKS),
+	// server-computed from config and surfaced so the pill can render "N of MAX". 0 means
+	// UNLIMITED (the cap is disabled) — render it as "unlimited", never as a real ceiling of
+	// zero. It is one server constant, but unlike LimitWaitCount's cap it IS on the row because
+	// the forge wording ("N of MAX") needs the denominator inline.
+	ForgeParkMax int `json:"forge_park_max"`
 	// Model is the model frozen onto the run at fire time by the schedule that created it
 	// (PRD #300): nil means the run inherited the owner's per-user Worker default. Surfaced
 	// read-only so a scheduled run's model is confirmable.

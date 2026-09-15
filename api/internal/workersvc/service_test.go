@@ -511,12 +511,15 @@ type fakeStore struct {
 	// was called with (the reconciler).
 	openCustodyHolds           int64
 	countCustodyWorkerParams   *store.CountOpenCustodyHoldsForWorkerParams
-	releasableHolds            []store.RecoveryCustodyHold
+	releasableHolds            []store.ListReleasableCustodyHoldsRow
 	releaseCustodyRows         int64
 	releasedCustodyRuns        []uuid.UUID
 	releasedCustodyWorkers     []uuid.UUID
 	releasedCustodyGenerations []int64
 	releasedCustodyHolds       []uuid.UUID
+	// PRD #1392 M1 (D3): every release_evidence value ReleaseCustodyHold was called with (the
+	// reconciler), so a test can prove the per-hold class it stamps.
+	releasedCustodyEvidence []string
 	// PRD #1296 D3/D4 upload-retry-window sweep. stalledUploadsRows is what
 	// ExpireStalledUploads reports; expireStalledWindows records every retry_window it was
 	// called with, so a test can prove the sweep passes the configured window AND (by an empty
@@ -1399,11 +1402,12 @@ func (f *fakeStore) CountOpenCustodyHoldsForWorker(_ context.Context, arg store.
 func (f *fakeStore) CountUnresolvedCustodyHoldsForOwner(_ context.Context, _ uuid.UUID) (int64, error) {
 	return f.openCustodyHolds, nil
 }
-func (f *fakeStore) ListReleasableCustodyHolds(_ context.Context) ([]store.RecoveryCustodyHold, error) {
+func (f *fakeStore) ListReleasableCustodyHolds(_ context.Context) ([]store.ListReleasableCustodyHoldsRow, error) {
 	return f.releasableHolds, nil
 }
-func (f *fakeStore) ReleaseCustodyHold(_ context.Context, id uuid.UUID) (int64, error) {
-	f.releasedCustodyHolds = append(f.releasedCustodyHolds, id)
+func (f *fakeStore) ReleaseCustodyHold(_ context.Context, arg store.ReleaseCustodyHoldParams) (int64, error) {
+	f.releasedCustodyHolds = append(f.releasedCustodyHolds, arg.ID)
+	f.releasedCustodyEvidence = append(f.releasedCustodyEvidence, arg.ReleaseEvidence.String)
 	return f.releaseCustodyRows, nil
 }
 func (f *fakeStore) ReleaseCustodyHoldExact(_ context.Context, arg store.ReleaseCustodyHoldExactParams) (int64, error) {
@@ -1454,6 +1458,10 @@ func testParams() Params {
 		// testParams() computes a real recovery backoff (1m base doubling to a 30m cap).
 		RunRecoveryParkBase: time.Minute,
 		RunRecoveryMaxPark:  30 * time.Minute,
+		// PRD #1392 M1: the forge pre-clone park cap (default matches production). Forge-park
+		// tests that need a different cap (0 = unlimited, or a low value to exercise the
+		// cap-exceeded branch) build a Service with an overridden Params.
+		RunForgeUnreachableMaxParks: 6,
 	}
 }
 

@@ -421,6 +421,17 @@ type Config struct {
 	RunRecoveryParkBase time.Duration // first recovery park's wait; doubles per prior park
 	RunRecoveryMaxPark  time.Duration // ceiling on one recovery park's backoff
 
+	// Forge-unreachable pre-clone park cap (PRD #1392 M1, D2). A transient forge failure at
+	// clone parks the run in 'recovery_wait' with recovery_wait_cause='forge_unreachable';
+	// forge_park_count is its FORGE-ONLY lifetime counter (distinct from the backoff-shaping
+	// recovery_wait_count), and this is the cap the park-or-fail decision consults inside
+	// SetState. Past the cap the run fails with fail_origin='forge_unreachable'. UNLIKE the
+	// recovery-park cadence knobs above, this CAN fail a run — it is the forge park's lifetime
+	// bound. 0 = unlimited (never fail on the count), the deliberate off switch; the default
+	// (6 parks ≈ an hour at the recovery-park defaults) lives in Load. Counted separately from
+	// recovery_wait_count so the empty-turn park keeps its no-lifetime-cap contract (fact 7).
+	RunForgeUnreachableMaxParks int
+
 	// CI status integration (PRD #6). The pipeline sync rides the existing poller
 	// tick (no new interval). CIWatchRunWindow bounds how long a finished run's
 	// branch stays watched after it completes; CIWatchMaxRefs caps how many run
@@ -957,6 +968,13 @@ func Load() (Config, error) {
 	// auto-promote cadence and have no off switch — there is no "never recover" mode.
 	cfg.RunRecoveryParkBase = parseDuration("RUN_RECOVERY_PARK_BASE", time.Minute)
 	cfg.RunRecoveryMaxPark = parseDuration("RUN_RECOVERY_MAX_PARK", 30*time.Minute)
+
+	// Forge-unreachable pre-clone park cap (PRD #1392 M1, D2). parseNonNegInt, so
+	// RUN_FORGE_UNREACHABLE_MAX_PARKS=0 is legal and means "unlimited" (never fail on the
+	// count) — the deliberate off switch, matching how RUN_LIMIT_MAX_WAITS=0 means "never
+	// park". Default 6 (≈ an hour of parks at the recovery-park defaults; more once earlier
+	// parks raise the backoff).
+	cfg.RunForgeUnreachableMaxParks = parseNonNegInt("RUN_FORGE_UNREACHABLE_MAX_PARKS", 6)
 
 	cfg.SkillMaxBytes = parseInt("SKILL_MAX_BYTES", 65536)
 	cfg.SkillsMaxPerRun = parseInt("SKILLS_MAX_PER_RUN", 32)

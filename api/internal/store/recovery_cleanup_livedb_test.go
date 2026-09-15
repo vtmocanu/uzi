@@ -92,7 +92,7 @@ func TestTeardownDeletesSkipCustodyHeldWorkerLiveDB(t *testing.T) {
 		}
 
 		// Release custody (null the live FK, state released) — the per-hold release primitive.
-		if _, err := fx.q.ReleaseCustodyHold(fx.ctx, holdID); err != nil {
+		if _, err := fx.q.ReleaseCustodyHold(fx.ctx, store.ReleaseCustodyHoldParams{ID: holdID}); err != nil {
 			t.Fatalf("ReleaseCustodyHold: %v", err)
 		}
 		if holdIsOpen(fx, holdID) {
@@ -130,7 +130,7 @@ func TestTeardownDeletesSkipCustodyHeldWorkerLiveDB(t *testing.T) {
 			t.Fatalf("worker %s reaped despite holding an open custody hold", wID)
 		}
 
-		if _, err := fx.q.ReleaseCustodyHold(fx.ctx, holdID); err != nil {
+		if _, err := fx.q.ReleaseCustodyHold(fx.ctx, store.ReleaseCustodyHoldParams{ID: holdID}); err != nil {
 			t.Fatalf("ReleaseCustodyHold: %v", err)
 		}
 		if holdIsOpen(fx, holdID) {
@@ -274,7 +274,7 @@ func TestCountOpenCustodyHoldsForWorkerAndRepoLiveDB(t *testing.T) {
 	}
 
 	// Releasing run1's custody drops both counts by one.
-	if _, err := fx.q.ReleaseCustodyHold(fx.ctx, hold1); err != nil {
+	if _, err := fx.q.ReleaseCustodyHold(fx.ctx, store.ReleaseCustodyHoldParams{ID: hold1}); err != nil {
 		t.Fatalf("ReleaseCustodyHold: %v", err)
 	}
 	if n, err := fx.q.CountOpenCustodyHoldsForWorker(fx.ctx, store.CountOpenCustodyHoldsForWorkerParams{WorkerID: wID, UserID: fx.userID}); err != nil {
@@ -347,7 +347,7 @@ func TestCustodyControllerAndOwnerListSignalsLiveDB(t *testing.T) {
 	}
 
 	// Release custody → both signals clear.
-	if _, err := fx.q.ReleaseCustodyHold(ctx, holdID); err != nil {
+	if _, err := fx.q.ReleaseCustodyHold(ctx, store.ReleaseCustodyHoldParams{ID: holdID}); err != nil {
 		t.Fatalf("ReleaseCustodyHold: %v", err)
 	}
 	if holdIsOpen(fx, holdID) {
