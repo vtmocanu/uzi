@@ -177,6 +177,19 @@
     "at": "2020-01-02T03:04:05Z",
     "seq": 1
   },
+  "credential_override": {
+    "mode": "x",
+    "label": "x"
+  },
+  "credential_switch": "x",
+  "credential_epochs": [
+    {
+      "claim_generation": 1,
+      "label": "x",
+      "select_reason": "x",
+      "applied_at": "2020-01-02T03:04:05Z"
+    }
+  ],
   "repo_path": "x",
   "worker_name": "x",
   "owner_email": "x",

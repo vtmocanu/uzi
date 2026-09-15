@@ -53,6 +53,14 @@ func (h *Handler) scheduleDTO(s store.RunSchedule, repoPath string) apitypes.Sch
 		v := s.CatalogSlug.String
 		dto.CatalogSlug = &v
 	}
+	// PRD #1247 M1 (D5): the schedule's per-run credential override. null = inherit
+	// (the fired run follows the worker binding); else {mode, label}. The mode is read
+	// straight from the row; the pinned-token label is resolved when M6 wires the picker
+	// (this pure mapper has no context to read the token row). Null for every schedule
+	// until M6, so behaviour is byte-identical to today.
+	if s.CredentialOverrideMode.Valid && s.CredentialOverrideMode.String != "" {
+		dto.CredentialOverride = &apitypes.CredentialOverrideDTO{Mode: s.CredentialOverrideMode.String}
+	}
 	// sibling_group_id (PRD #636): a display-only group tag, surfaced as a uuid string only
 	// when the row is grouped (nil for a standalone row).
 	if s.SiblingGroupID.Valid {

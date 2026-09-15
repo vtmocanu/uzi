@@ -80,9 +80,12 @@ type runsStore struct {
 	// pgx.ErrNoRows so a run shows no usage — existing GetRun tests are unaffected.
 	hasRunUsage   bool
 	runUsageTotal store.GetRunUsageTotalRow
-	selfUsage     store.SelfUsageRow
-	adminTotals   store.AdminUsageTotalsRow
-	adminPerUser  []store.AdminUsagePerUserRow
+	// PRD #1247 M1: the credential attribution journal ListRunCredentialEpochs returns
+	// (empty by default, so GetRun reads credential_epochs: []).
+	credentialEpochs []store.RunCredentialEpoch
+	selfUsage        store.SelfUsageRow
+	adminTotals      store.AdminUsageTotalsRow
+	adminPerUser     []store.AdminUsagePerUserRow
 	// PRD #95 steer queue: the follow_up rows ListFollowUpInputsForRun returns, and the
 	// row CreateRunInput echoes (so the richer follow-up write's id/created_at are
 	// assertable).
@@ -196,6 +199,12 @@ func (s *runsStore) GetRunUsageTotal(_ context.Context, _ uuid.UUID) (store.GetR
 		return store.GetRunUsageTotalRow{}, pgx.ErrNoRows
 	}
 	return s.runUsageTotal, nil
+}
+
+// ListRunCredentialEpochs backs GetRun's credential_epochs enrichment (PRD #1247 M1):
+// the staged journal, empty by default so existing GetRun tests read [].
+func (s *runsStore) ListRunCredentialEpochs(_ context.Context, _ store.ListRunCredentialEpochsParams) ([]store.RunCredentialEpoch, error) {
+	return s.credentialEpochs, nil
 }
 func (s *runsStore) SelfUsage(_ context.Context, _ uuid.UUID) (store.SelfUsageRow, error) {
 	return s.selfUsage, nil

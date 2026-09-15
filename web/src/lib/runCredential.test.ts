@@ -43,7 +43,12 @@ function run(over: Partial<Parameters<typeof describeCredential>[0]> = {}) {
 // from the array left this green. See SELECT_REASONS for why deriving it from the
 // exhaustive Record closes that.
 function reasonsFromMigration(): string[] {
-  const path = "../api/internal/store/migrations/00089_run_select_reason_check.sql";
+  // PRD #1247 M1 widened the vocabulary in 00230 (run_pinned, run_default) alongside the
+  // override-MODE CHECKs, so this parses 00230 now. 00230 carries other quoted
+  // vocabularies (the override-mode IN-list 'pinned'/'auto'/'default'), so a whole-file
+  // regex would pull those in; anchor strictly on the runs_anthropic_select_reason_check
+  // IN-list, the same way the Go guard (TestSelectReasonVocabularyMatchesCheck) does.
+  const path = "../api/internal/store/migrations/00230_per_run_credential_override.sql";
   const raw = readFileSync(path, "utf8");
   // Comments first. The prose above the statement names several reasons, and a regex
   // over the whole file would happily collect them and agree with itself.
@@ -51,11 +56,16 @@ function reasonsFromMigration(): string[] {
     .split("\n")
     .filter((line) => !line.trimStart().startsWith("--"))
     .join("\n");
-  return [...stmt.matchAll(/'([a-z_]+)'/g)].map((m) => m[1]).sort();
+  // Isolate the select-reason IN-list. 00230 both DROPs (no IN-list) and re-ADDs the
+  // constraint; matchAll returns the first re-ADD (the Up NOT VALID one, the widened
+  // vocabulary) before the Down section's copy.
+  const inList = stmt.match(/anthropic_select_reason IN \(([^)]*)\)/);
+  if (!inList) throw new Error("could not find the anthropic_select_reason IN-list in 00230");
+  return [...inList[1].matchAll(/'([a-z_]+)'/g)].map((m) => m[1]).sort();
 }
 
 describe("the reason vocabulary is one vocabulary", () => {
-  it("matches migration 00089's CHECK", () => {
+  it("matches migration 00230's CHECK", () => {
     const fromSQL = reasonsFromMigration();
     expect(fromSQL.length).toBeGreaterThan(0);
     expect(fromSQL).toEqual([...SELECT_REASONS].sort());
@@ -92,7 +102,16 @@ describe("describeCredential", () => {
     }
     expect(byTone.warning.sort()).toEqual(["open_failed", "pool_empty", "pool_stale"]);
     expect(byTone.info).toEqual(["best_of_pool"]);
-    expect(byTone.neutral.sort()).toEqual(["auto", "default", "judge", "pinned"]);
+    // run_default/run_pinned (PRD #1247) are neutral: a deliberate per-run override, not
+    // a fallback or a warning.
+    expect(byTone.neutral.sort()).toEqual([
+      "auto",
+      "default",
+      "judge",
+      "pinned",
+      "run_default",
+      "run_pinned",
+    ]);
   });
 
   // ONE rule, asserted as one: link iff the tone is not neutral. Two independent

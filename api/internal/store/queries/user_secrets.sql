@@ -210,6 +210,18 @@ WHERE user_id = $1 AND kind = $2 AND is_default;
 SELECT id, label, kind FROM user_secrets
 WHERE id = $1 AND user_id = $2;
 
+-- name: GetUserSecretMetaByIDOfKind :one
+-- The kind-SCOPED by-id meta lookup (PRD #1247 M1): the per-run credential override
+-- resolves a specific credential and must confirm it is an anthropic_token before
+-- opening it. GetUserSecretMetaByID above is owner-scoped but deliberately NOT
+-- kind-scoped (its comment explains why the worker/judge bind lanes keep it that way),
+-- so a separate query carries the kind predicate rather than weakening those lanes. Used
+-- by the override open path in claimSecretID and by validateCredentialOverride as
+-- defense in depth; a wrong-kind or foreign id returns pgx.ErrNoRows, which the caller
+-- maps to the same "unavailable" credential failure a foreign id already produces (D9).
+SELECT id, label, kind FROM user_secrets
+WHERE id = @id AND user_id = @user_id AND kind = @kind;
+
 -- name: GetUserSecretIDByLabel :one
 -- Resolve a user-facing label to the credential it names, case-insensitively to
 -- match the unique index 00077 put on (user_id, kind, lower(label)) — `Console` and
