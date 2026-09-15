@@ -232,7 +232,7 @@ scan() {
             # escapes inside the literal (issue #1128); a plain string does not.
             estr = ((i >= 2) &&
                     (substr(s, i-1, 1) == "E" || substr(s, i-1, 1) == "e") &&
-                    (i == 2 || substr(s, i-2, 1) !~ /[a-zA-Z0-9_]/))
+                    (i == 2 || substr(s, i-2, 1) !~ /[a-zA-Z0-9_$]/))
             i++; continue
           }
           if (substr(s, i, 1) == "$"){
