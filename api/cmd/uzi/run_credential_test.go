@@ -99,8 +99,8 @@ func TestCredentialCellFallbacksSayWhy(t *testing.T) {
 // together with the fallback test above.
 func TestCredentialCellCoversEveryReason(t *testing.T) {
 	reasons := autoselect.AllReasons()
-	if len(reasons) != 8 {
-		t.Fatalf("AllReasons has %d entries, want 8 — this test enumerates the vocabulary and a "+
+	if len(reasons) != 10 {
+		t.Fatalf("AllReasons has %d entries, want 10 — this test enumerates the vocabulary and a "+
 			"change to it must be deliberate here too", len(reasons))
 	}
 	seen := map[string]autoselect.Reason{}

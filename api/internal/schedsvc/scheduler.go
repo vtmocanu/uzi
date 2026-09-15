@@ -113,18 +113,21 @@ type Store interface {
 // RunCreator is the shared run-creation seam the scheduler fires through — the SAME
 // seam autopilot and the manual board use. *workersvc.Service satisfies it.
 type RunCreator interface {
-	CreateRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *workersvc.SeededPlan) (store.Run, error)
+	// PRD #1247 M1: every scheduled creation seam carries the per-run credential override
+	// (nil = inherit) so the schedule's stored choice reaches the fired run (D5, wired in
+	// M6); M1 passes nil everywhere and behaviour is byte-identical.
+	CreateRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *workersvc.SeededPlan, credOverride *workersvc.CredentialOverride) (store.Run, error)
 	// CreateScheduledRun is the non-auto-approve scheduled path: like CreateRun but the
 	// plan gate still requires a human (see workersvc.CreateScheduledRun). Eligibility is
 	// the single uzi_label gate (PRD #764 M1); a PRD link is no longer required.
-	CreateScheduledRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, seed *workersvc.SeededPlan) (store.Run, error)
+	CreateScheduledRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, seed *workersvc.SeededPlan, credOverride *workersvc.CredentialOverride) (store.Run, error)
 	CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string) (store.Run, error)
 	// CreateScheduledAutopilotRun is the auto-approve scheduled path (PRD #274 Decision
 	// 1a): like CreateAutopilotRun but it HONOURS the schedule's persisted wait_on_limit
 	// instead of the owner default. It is a distinct method so the poller's
 	// CreateAutopilotRun seam stays untouched (see workersvc.CreateScheduledAutopilotRun).
-	CreateScheduledAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool) (store.Run, error)
-	CreatePromptRun(ctx context.Context, userID, repoID, scheduleID uuid.UUID, title, prompt string, autoApprove, waitOnLimit bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool) (store.Run, error)
+	CreateScheduledAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, credOverride *workersvc.CredentialOverride) (store.Run, error)
+	CreatePromptRun(ctx context.Context, userID, repoID, scheduleID uuid.UUID, title, prompt string, autoApprove, waitOnLimit bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, credOverride *workersvc.CredentialOverride) (store.Run, error)
 	// CreateSelfImproveRun is the self-improvement fire path's insert (PRD #590 M1): a
 	// dedicated issue-shaped, auto_approve, kind='self_improve' run against the tracking
 	// issue, threading the schedule's per-schedule model override and (PRD #908 M1) the
@@ -655,7 +658,9 @@ func (e *Scheduler) firePrompt(ctx context.Context, sched store.RunSchedule) (Fi
 	instruction := composeRunDescriptionWithSections(prompt, guidanceOf(sched), sections...)
 	// PRD #841 M2: the schedule's stored mr_rework override stamps onto the run (nil ⇒
 	// inherit the owner default live).
-	run, err := e.runs.CreatePromptRun(ctx, sched.UserID, sched.RepoID, sched.ID, title, instruction, sched.AutoApprove, sched.WaitOnLimit, scheduleMrRework(sched), scheduleModel(sched), scheduleOverrideSubagentModel(sched))
+	// nil credOverride (PRD #1247 M1): M6 threads the schedule's stored credential
+	// override onto the fired prompt run; M1 inherits the worker binding.
+	run, err := e.runs.CreatePromptRun(ctx, sched.UserID, sched.RepoID, sched.ID, title, instruction, sched.AutoApprove, sched.WaitOnLimit, scheduleMrRework(sched), scheduleModel(sched), scheduleOverrideSubagentModel(sched), nil)
 	switch {
 	case err == nil:
 		return FireOutcome{Matched: 1, Started: []Started{{RunID: run.ID, Title: title}}}, nil
@@ -709,7 +714,8 @@ func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule,
 		// guarantee that label-driven autopilot behaviour is unchanged.
 		// PRD #841 M2: the schedule's stored mr_rework override stamps onto the run
 		// (nil ⇒ inherit the owner default live).
-		run, err = e.runs.CreateScheduledAutopilotRun(ctx, sched.UserID, repoID, iid, desc, &waitOnLimit, scheduleMrRework(sched), scheduleModel(sched), scheduleOverrideSubagentModel(sched))
+		// nil credOverride (PRD #1247 M1): M6 threads the schedule's stored override here.
+		run, err = e.runs.CreateScheduledAutopilotRun(ctx, sched.UserID, repoID, iid, desc, &waitOnLimit, scheduleMrRework(sched), scheduleModel(sched), scheduleOverrideSubagentModel(sched), nil)
 	} else {
 		// CreateScheduledRun is the non-auto-approve scheduled seam. Post-PRD #764 M1 it
 		// and the interactive CreateRun apply the SAME single uzi_label eligibility gate —
@@ -719,7 +725,9 @@ func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule,
 		// needs a human here), not eligibility.
 		// PRD #841 M2: the schedule's stored mr_rework override stamps onto the run
 		// (nil ⇒ inherit the owner default live).
-		run, err = e.runs.CreateScheduledRun(ctx, sched.UserID, repoID, iid, desc, &waitOnLimit, scheduleMrRework(sched), scheduleModel(sched), scheduleOverrideSubagentModel(sched), nil)
+		// trailing nil, nil: seed (no seeded plan for a scheduled issue run) and
+		// credOverride (PRD #1247 M1 inherit; M6 threads the schedule's stored override).
+		run, err = e.runs.CreateScheduledRun(ctx, sched.UserID, repoID, iid, desc, &waitOnLimit, scheduleMrRework(sched), scheduleModel(sched), scheduleOverrideSubagentModel(sched), nil, nil)
 	}
 
 	if err == nil {

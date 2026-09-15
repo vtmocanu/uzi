@@ -854,6 +854,16 @@ func selectReasonText(reason autoselect.Reason, headroom *int) string {
 		// The selector's picked token would not decrypt, so the run FLOORED onto
 		// ANOTHER POOLED token — again not the default (#754).
 		return "auto (fell to another pooled token; the chosen one would not open)"
+	case autoselect.ReasonRunPinned:
+		// A per-run credential override (PRD #1247) named this token for THIS run,
+		// outranking the worker's own binding. Distinct wording from `pinned` (the
+		// worker binding) so the run view names the source of the choice (D2/D20).
+		return "run-pinned"
+	case autoselect.ReasonRunDefault:
+		// A per-run credential override of mode 'default' (PRD #1247): the owner
+		// default chosen for THIS run, distinct from an unset binding falling through
+		// to the default (rendered "default").
+		return "run-default"
 	}
 	return string(reason)
 }

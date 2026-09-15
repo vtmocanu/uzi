@@ -8,18 +8,19 @@ import (
 
 // Reason is WHY a claim spent the credential it spent, persisted in
 // runs.anthropic_select_reason and rendered by M5. It is a CLOSED vocabulary of
-// eight, and this is its ONE Go home.
+// ten, and this is its ONE Go home.
 //
 // The three static reasons live here rather than in workersvc, which is where they
 // started. Taxonomically they belong there — `default` and `pinned` have nothing to
 // do with auto-selection — but M5 needs the whole set readable from `cmd/uzi` (which
-// must not import the server) and from a web guard, and two of the eight were locked
+// must not import the server) and from a web guard, and two of them were locked
 // in an unexported workersvc function. One home beats the neater taxonomy: a
 // vocabulary split across packages is a vocabulary that drifts, which is D21's
 // argument applied to itself.
 //
-// Migration 00089's CHECK is the same eight values, and
-// TestSelectReasonVocabularyMatchesCheck parses that CHECK and compares. A value
+// The SQL CHECK is the same ten values — migration 00089's original eight, widened
+// by PRD #1247's 00230 to add run_pinned and run_default — and
+// TestSelectReasonVocabularyMatchesCheck parses the 00230 CHECK and compares. A value
 // added in Go and forgotten in SQL is a constraint violation at claim time, i.e. a
 // FAILED RUN; one removed from Go but left in SQL is a promise nothing keeps.
 type Reason string
@@ -65,10 +66,22 @@ const (
 	// workersvc's because it can only ever arise on the auto lane — no other mode has
 	// a pooled alternative to fall to.
 	ReasonOpenFailed Reason = "open_failed"
+	// ReasonRunPinned: a per-run credential override (PRD #1247) named a specific
+	// token, so THIS run spent it regardless of the worker's own binding. Distinct
+	// from ReasonPinned, which is the WORKER's binding — the two answer "why this
+	// account" with a different source (a per-run choice vs a worker configuration),
+	// which is exactly what D20 makes the run view name.
+	ReasonRunPinned Reason = "run_pinned"
+	// ReasonRunDefault: a per-run credential override (PRD #1247) of mode 'default' —
+	// the owner default chosen for THIS run. Distinct from ReasonDefault, which is an
+	// UNSET binding falling through to the owner default: run_default is a deliberate
+	// per-run choice, so staticChoice(nil, …) cannot express it (it always reports
+	// `default`), and the ladder constructs it explicitly.
+	ReasonRunDefault Reason = "run_default"
 )
 
 // AllReasons is the WHOLE reason vocabulary, in a form a guard can enumerate. Three
-// guards do: workersvc's, which compares it against migration 00089's CHECK; the
+// guards do: workersvc's, which compares it against migration 00230's CHECK; the
 // CLI's, which requires a rendering for each; and the web's, which requires the same
 // of the TypeScript union.
 //
@@ -78,6 +91,7 @@ func AllReasons() []Reason {
 	return []Reason{
 		ReasonDefault, ReasonPinned, ReasonJudge,
 		ReasonAuto, ReasonBestOfPool, ReasonPoolEmpty, ReasonPoolStale, ReasonOpenFailed,
+		ReasonRunPinned, ReasonRunDefault,
 	}
 }
 

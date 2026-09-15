@@ -488,9 +488,11 @@ type RunDTO struct {
 	// are different questions — and PRD #104's compatibility path creates a row
 	// labelled literally `default`, so the label is not even a reliable hint.
 	//
-	// One of eight server-generated values (autoselect.Reason, closed by migration
-	// 00089's CHECK): default, pinned, judge, auto, best_of_pool, pool_empty,
-	// pool_stale, open_failed. Null for a run claimed before M1.
+	// One of ten server-generated values (autoselect.Reason, closed by migration
+	// 00089's CHECK as widened by 00230): default, pinned, judge, auto, best_of_pool,
+	// pool_empty, pool_stale, open_failed, run_pinned, run_default.
+	// run_pinned/run_default are the per-run credential override reasons (PRD #1247).
+	// Null for a run claimed before M1.
 	//
 	// A CLOSED SERVER ENUM, not free text: it describes the OWNER'S OWN configuration
 	// and can carry no cross-tenant content, which is why it rides this DTO under the
@@ -630,6 +632,50 @@ type RunDTO struct {
 	// path and both list builders) from a batched per-page lookup, not in runToDTO
 	// itself, which stays a pure function of its row.
 	CurrentActivity *RunActivity `json:"current_activity"`
+	// Per-run Anthropic credential override + attribution journal (PRD #1247 M1). All
+	// three are back-compat by construction: a run with no override reads
+	// credential_override == null and credential_switch == null, and a run claimed before
+	// M1 (or never claimed) reads credential_epochs == [].
+	//
+	// CredentialOverride is the run's per-run token choice: null = inherit the worker
+	// binding (today's behaviour), else {mode, label}. Mode is one of pinned/auto/default;
+	// Label is the snapshotted token name for a pinned override (null for auto/default,
+	// or when the token was deleted). Populated from the run row + an owner-scoped label
+	// lookup in the DTO builder's enrichment path.
+	CredentialOverride *CredentialOverrideDTO `json:"credential_override"`
+	// CredentialSwitch is the state of a pending held-state switch (PRD #1247, D14):
+	// null (none pending) | "requested" (stamped, not yet released) | "released"
+	// (released, awaiting reclaim). Distinct from CredentialOverride, which is the choice;
+	// this is the in-flight transition. Always null in M1 (nothing stamps it until M4/M5).
+	CredentialSwitch *string `json:"credential_switch"`
+	// CredentialEpochs is the applied-switch history (D7): one entry per claim, oldest
+	// generation first, each naming the token that claim spent and why. Never omitempty —
+	// [] over null — so a client reads it unconditionally. Populated from
+	// run_credential_epochs in the DTO builder's enrichment path.
+	CredentialEpochs []CredentialEpochDTO `json:"credential_epochs"`
+}
+
+// CredentialOverrideDTO is a run's or schedule's per-run credential override (PRD #1247
+// M1): the mode the owner chose and, for a pinned override, the token label. It is the
+// null-when-absent shape on both RunDTO and ScheduleDTO.
+type CredentialOverrideDTO struct {
+	// Mode is one of "pinned" | "auto" | "default" (migration 00230's CHECK). A client
+	// must render an unrecognised value honestly — the API is deployed separately.
+	Mode string `json:"mode"`
+	// Label is the token name for a pinned override, snapshotted for readability after a
+	// rename/delete; null for auto/default or when no label is resolvable.
+	Label *string `json:"label"`
+}
+
+// CredentialEpochDTO is one claim's credential attribution (PRD #1247 M1, D7): the
+// generation, the token it spent (label + select_reason, both null-tolerant so a deleted
+// token's history stays readable), and when it was applied. ClaimGeneration is int64 —
+// every generation on the wire is int64, mirroring runs.claim_generation.
+type CredentialEpochDTO struct {
+	ClaimGeneration int64     `json:"claim_generation"`
+	Label           *string   `json:"label"`
+	SelectReason    *string   `json:"select_reason"`
+	AppliedAt       time.Time `json:"applied_at"`
 }
 
 // RunListItemDTO is a run row for the Runs index and the admin Agents-status

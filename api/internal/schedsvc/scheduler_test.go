@@ -308,7 +308,7 @@ func (f *fakeRuns) effErr(issueIID int64) error {
 	return f.err
 }
 
-func (f *fakeRuns) CreateRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, _ string, waitOnLimit *bool, mrReworkEnabled *bool, force bool, _ *workersvc.SeededPlan) (store.Run, error) {
+func (f *fakeRuns) CreateRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, _ string, waitOnLimit *bool, mrReworkEnabled *bool, force bool, _ *workersvc.SeededPlan, _ *workersvc.CredentialOverride) (store.Run, error) {
 	if f.err != nil {
 		return store.Run{}, f.err
 	}
@@ -318,7 +318,7 @@ func (f *fakeRuns) CreateRun(_ context.Context, userID, repoID uuid.UUID, issueI
 	f.runs = append(f.runs, runCall{userID, repoID, issueIID, waitOnLimit, mrReworkEnabled, false, nil, false, force})
 	return store.Run{ID: uuid.New()}, nil
 }
-func (f *fakeRuns) CreateScheduledRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, _ string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, _ *workersvc.SeededPlan) (store.Run, error) {
+func (f *fakeRuns) CreateScheduledRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, _ string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, _ *workersvc.SeededPlan, _ *workersvc.CredentialOverride) (store.Run, error) {
 	// The non-auto-approve scheduled path: recorded in the same `runs` bucket as
 	// CreateRun so the existing wait-on-limit / path-selection count assertions still
 	// observe it, but tagged scheduled=true so a test can prove the scheduler routed
@@ -340,7 +340,7 @@ func (f *fakeRuns) CreateAutopilotRun(_ context.Context, userID, repoID uuid.UUI
 	f.autopilot = append(f.autopilot, autopilotCall{userID, repoID, issueIID, description, nil, nil, nil, false})
 	return store.Run{ID: uuid.New()}, nil
 }
-func (f *fakeRuns) CreateScheduledAutopilotRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool) (store.Run, error) {
+func (f *fakeRuns) CreateScheduledAutopilotRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, _ *workersvc.CredentialOverride) (store.Run, error) {
 	// The auto-approve scheduled path (PRD #274 Decision 1a): recorded in the same
 	// `autopilot` bucket as CreateAutopilotRun so the existing count assertions still
 	// observe it, but it CAPTURES waitOnLimit (which CreateAutopilotRun drops), the
@@ -352,7 +352,7 @@ func (f *fakeRuns) CreateScheduledAutopilotRun(_ context.Context, userID, repoID
 	f.autopilot = append(f.autopilot, autopilotCall{userID, repoID, issueIID, description, waitOnLimit, mrReworkEnabled, model, overrideSubagentModel})
 	return store.Run{ID: uuid.New()}, nil
 }
-func (f *fakeRuns) CreatePromptRun(_ context.Context, userID, repoID, scheduleID uuid.UUID, title, prompt string, autoApprove, waitOnLimit bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool) (store.Run, error) {
+func (f *fakeRuns) CreatePromptRun(_ context.Context, userID, repoID, scheduleID uuid.UUID, title, prompt string, autoApprove, waitOnLimit bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, _ *workersvc.CredentialOverride) (store.Run, error) {
 	if f.err != nil {
 		return store.Run{}, f.err
 	}

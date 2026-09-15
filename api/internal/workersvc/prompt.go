@@ -37,7 +37,7 @@ var ErrActivePromptExists = errors.New("a prompt run is already active for this 
 // run-create paths. auto_approve and wait_on_limit ride straight from the schedule
 // the owner configured. A second active run for the schedule is rejected by the
 // partial unique index → ErrActivePromptExists.
-func (s *Service) CreatePromptRun(ctx context.Context, userID, repoID, scheduleID uuid.UUID, title, prompt string, autoApprove, waitOnLimit bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool) (store.Run, error) {
+func (s *Service) CreatePromptRun(ctx context.Context, userID, repoID, scheduleID uuid.UUID, title, prompt string, autoApprove, waitOnLimit bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, credOverride *CredentialOverride) (store.Run, error) {
 	row, err := s.q.GetRepoForUser(ctx, store.GetRepoForUserParams{ID: repoID, UserID: userID})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -66,6 +66,11 @@ func (s *Service) CreatePromptRun(ctx context.Context, userID, repoID, scheduleI
 		// PRD #305: the schedule's "apply model also to agents" opt-in, frozen onto this
 		// run at fire time (M1 stores only; delivery M3, worker behaviour M4).
 		OverrideSubagentModel: overrideSubagentModel,
+		// PRD #1247 M1 (D1/D5): the schedule's per-run credential override, NULL/NULL for
+		// every M1 caller (credOverride nil ⇒ inherit). M6 threads the schedule's stored
+		// override onto the fired prompt run through this seam.
+		CredentialOverrideMode:     pgOverrideMode(credOverride),
+		CredentialOverrideSecretID: pgOverrideSecretID(credOverride),
 	})
 	if err != nil {
 		if isUniqueViolation(err) {

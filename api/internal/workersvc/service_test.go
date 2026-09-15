@@ -90,6 +90,15 @@ type fakeStore struct {
 	recordedCreds  []store.SetRunAnthropicSecretParams
 	recordCredErr  error
 	recordCredRows *int64
+	// PRD #1247 M1: recordedEpochs is every RecordRunCredentialEpoch write in order (the
+	// attribution journal), recordEpochErr fails it. metaOfKindLookups records every
+	// kind-scoped by-id meta lookup (the override open + validator path), proving it is
+	// owner-AND-kind-scoped.
+	recordedEpochs    []store.RecordRunCredentialEpochParams
+	recordEpochErr    error
+	metaOfKindLookups []store.GetUserSecretMetaByIDOfKindParams
+	// credentialEpochs is what ListRunCredentialEpochs (the read side) returns.
+	credentialEpochs []store.RunCredentialEpoch
 	// autoCandidates is what M4's ranking query returns (PRD #111 M4) and
 	// autoCandidatesErr fails it. autoCandidateLookups records the user ids asked
 	// for — which is what proves the selector never ranks another tenant's tokens,
@@ -831,6 +840,44 @@ func (f *fakeStore) SetRunAnthropicSecret(_ context.Context, arg store.SetRunAnt
 		return *f.recordCredRows, nil
 	}
 	return 1, nil
+}
+
+// GetUserSecretMetaByIDOfKind mirrors the real kind-SCOPED by-id lookup (PRD #1247 M1):
+// owner-scoped AND kind-scoped, so a foreign id, a missing id, or a wrong-kind id all
+// yield pgx.ErrNoRows (never another tenant's or another kind's row). It reuses the
+// byIDSecrets fixtures a claim test already stages, keyed by id, so a run-override test
+// stages nothing new.
+func (f *fakeStore) GetUserSecretMetaByIDOfKind(_ context.Context, arg store.GetUserSecretMetaByIDOfKindParams) (store.GetUserSecretMetaByIDOfKindRow, error) {
+	f.metaOfKindLookups = append(f.metaOfKindLookups, arg)
+	row, ok := f.byIDSecrets[arg.ID]
+	if !ok {
+		return store.GetUserSecretMetaByIDOfKindRow{}, pgx.ErrNoRows
+	}
+	if row.UserID != uuid.Nil && row.UserID != arg.UserID {
+		return store.GetUserSecretMetaByIDOfKindRow{}, pgx.ErrNoRows
+	}
+	if row.Kind != "" && row.Kind != arg.Kind {
+		return store.GetUserSecretMetaByIDOfKindRow{}, pgx.ErrNoRows
+	}
+	label, ok := f.byIDLabels[arg.ID]
+	if !ok {
+		label = "token-" + arg.ID.String()[:8]
+	}
+	return store.GetUserSecretMetaByIDOfKindRow{ID: arg.ID, Label: label, Kind: arg.Kind}, nil
+}
+
+// RecordRunCredentialEpoch records the per-claim attribution-journal write (PRD #1247
+// M1), so a claim test can assert the epoch was appended (and, via recordEpochErr, that
+// a journal failure fails the claim).
+func (f *fakeStore) RecordRunCredentialEpoch(_ context.Context, arg store.RecordRunCredentialEpochParams) error {
+	f.recordedEpochs = append(f.recordedEpochs, arg)
+	return f.recordEpochErr
+}
+
+// ListRunCredentialEpochs is the read side backing RunCredentialEpochs; returns the
+// staged journal (empty by default).
+func (f *fakeStore) ListRunCredentialEpochs(_ context.Context, _ store.ListRunCredentialEpochsParams) ([]store.RunCredentialEpoch, error) {
+	return f.credentialEpochs, nil
 }
 func (f *fakeStore) SetRunCheckpointTip(_ context.Context, arg store.SetRunCheckpointTipParams) (int64, error) {
 	f.checkpointTips = append(f.checkpointTips, arg)
@@ -4323,7 +4370,7 @@ func TestCreateRunSnapshotsTitleAndRunsWithoutPRDLink(t *testing.T) {
 		createRunResult: store.Run{ID: uuid.New()},
 	}
 	svc := New(fs, newBox(t), testParams())
-	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "the description", nil, nil, false, nil); err != nil {
+	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "the description", nil, nil, false, nil, nil); err != nil {
 		t.Fatalf("CreateRun: %v", err)
 	}
 	if fs.createRunParams == nil {
@@ -4355,7 +4402,7 @@ func TestCreateRunOpenMRGuard(t *testing.T) {
 			createRunResult:   store.Run{ID: uuid.New()},
 		}
 		svc := New(fs, newBox(t), testParams())
-		_, err := svc.CreateRun(context.Background(), user, repo, 4, "the description", nil, nil, false /*force*/, nil)
+		_, err := svc.CreateRun(context.Background(), user, repo, 4, "the description", nil, nil, false /*force*/, nil, nil)
 		if !errors.Is(err, ErrOpenMRExists) {
 			t.Fatalf("CreateRun err = %v, want ErrOpenMRExists", err)
 		}
@@ -4380,7 +4427,7 @@ func TestCreateRunOpenMRGuard(t *testing.T) {
 			createRunResult:   store.Run{ID: uuid.New()},
 		}
 		svc := New(fs, newBox(t), testParams())
-		_, err := svc.CreateRun(context.Background(), user, repo, 4, "the description", nil, nil, true /*force*/, nil)
+		_, err := svc.CreateRun(context.Background(), user, repo, 4, "the description", nil, nil, true /*force*/, nil, nil)
 		if errors.Is(err, ErrOpenMRExists) {
 			t.Fatalf("CreateRun with force=true err = %v, must NOT be ErrOpenMRExists (guard bypassed)", err)
 		}
@@ -4430,7 +4477,7 @@ func TestCreateAutopilotRunSetsAutoApproveAndSharesGates(t *testing.T) {
 		createRunResult: store.Run{ID: uuid.New()},
 	}
 	svc = New(fsManual, newBox(t), testParams())
-	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "d", nil, nil, false, nil); err != nil {
+	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "d", nil, nil, false, nil, nil); err != nil {
 		t.Fatalf("CreateRun: %v", err)
 	}
 	if fsManual.createRunParams.AutoApprove {
@@ -4497,7 +4544,7 @@ func TestCreateRunRejectsOversizeDescription(t *testing.T) {
 
 	// Manual and autopilot both reject at the one shared cap, before any run is made.
 	fs := &fakeStore{issueByID: store.Issue{Title: "T", Labels: uziLabels(), HasPrdLink: true}}
-	if _, err := New(fs, newBox(t), testParams()).CreateRun(context.Background(), user, repo, 4, big, nil, nil, false, nil); err != ErrDescriptionTooLarge {
+	if _, err := New(fs, newBox(t), testParams()).CreateRun(context.Background(), user, repo, 4, big, nil, nil, false, nil, nil); err != ErrDescriptionTooLarge {
 		t.Fatalf("CreateRun err = %v, want ErrDescriptionTooLarge", err)
 	}
 	if fs.createRunParams != nil {
@@ -4512,7 +4559,7 @@ func TestCreateRunRejectsOversizeDescription(t *testing.T) {
 	// Exactly at the cap is accepted (boundary).
 	ok := strings.Repeat("x", MaxIssueDescriptionBytes)
 	fsOK := &fakeStore{issueByID: store.Issue{Title: "T", Labels: uziLabels(), HasPrdLink: true}, createRunResult: store.Run{ID: uuid.New()}}
-	if _, err := New(fsOK, newBox(t), testParams()).CreateRun(context.Background(), user, repo, 4, ok, nil, nil, false, nil); err != nil {
+	if _, err := New(fsOK, newBox(t), testParams()).CreateRun(context.Background(), user, repo, 4, ok, nil, nil, false, nil, nil); err != nil {
 		t.Fatalf("a description exactly at the cap must be accepted, got %v", err)
 	}
 }
@@ -4524,7 +4571,7 @@ func TestCreateRunMapsDuplicateToActiveRunExists(t *testing.T) {
 		createRunErr: &pgconn.PgError{Code: "23505"},
 	}
 	svc := New(fs, newBox(t), testParams())
-	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "d", nil, nil, false, nil); err != ErrActiveRunExists {
+	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "d", nil, nil, false, nil, nil); err != ErrActiveRunExists {
 		t.Fatalf("err = %v, want ErrActiveRunExists", err)
 	}
 }
@@ -4543,7 +4590,7 @@ func TestCreateRunPreCheckBlocksDuplicateOnHeldIssue(t *testing.T) {
 		createRunResult:      store.Run{ID: uuid.New()},
 	}
 	svc := New(fs, newBox(t), testParams())
-	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "d", nil, nil, false, nil); err != ErrActiveRunExists {
+	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "d", nil, nil, false, nil, nil); err != ErrActiveRunExists {
 		t.Fatalf("err = %v, want ErrActiveRunExists — the pre-check must refuse a second run on a held issue", err)
 	}
 }
@@ -4559,7 +4606,7 @@ func TestCreateRunPreCheckErrorPropagates(t *testing.T) {
 		createRunResult:         store.Run{ID: uuid.New()},
 	}
 	svc := New(fs, newBox(t), testParams())
-	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "d", nil, nil, false, nil); !errors.Is(err, sentinel) {
+	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "d", nil, nil, false, nil, nil); !errors.Is(err, sentinel) {
 		t.Fatalf("err = %v, want the pre-check error to propagate", err)
 	}
 }
@@ -4567,7 +4614,7 @@ func TestCreateRunPreCheckErrorPropagates(t *testing.T) {
 func TestCreateRunRepoNotOwned(t *testing.T) {
 	fs := &fakeStore{repoErr: pgx.ErrNoRows}
 	svc := New(fs, newBox(t), testParams())
-	if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "d", nil, nil, false, nil); err != ErrRepoNotFound {
+	if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "d", nil, nil, false, nil, nil); err != ErrRepoNotFound {
 		t.Fatalf("err = %v, want ErrRepoNotFound", err)
 	}
 }
@@ -4893,7 +4940,7 @@ func TestCreateRunNotifiesQueuedWithOriginSnapshot(t *testing.T) {
 	lc := &fakeLifecycle{}
 	svc.SetLifecycle(lc)
 
-	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "desc", nil, nil, false, nil); err != nil {
+	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "desc", nil, nil, false, nil, nil); err != nil {
 		t.Fatalf("CreateRun: %v", err)
 	}
 	// origin_column snapshots the issue's current column ("Later"), always a valid
@@ -4920,7 +4967,7 @@ func TestCreateRunOriginNullWhenColumnsUnavailable(t *testing.T) {
 	}
 	svc := New(fs, newBox(t), testParams())
 
-	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "desc", nil, nil, false, nil); err != nil {
+	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "desc", nil, nil, false, nil, nil); err != nil {
 		t.Fatalf("CreateRun should not be blocked by a column-list error: %v", err)
 	}
 	if fs.createRunParams == nil {
