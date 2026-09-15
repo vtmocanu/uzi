@@ -14,6 +14,7 @@ import type { WorkerClient } from "./client.js";
 import type { Logger } from "./log.js";
 import type { ChatClaimResponse, StateAck, StateRequest } from "./protocol.js";
 import { MessageBatcher } from "./batcher.js";
+import type { Outbox } from "./outbox.js";
 import type { ChatContext, ChatExecutorLike, ChatExecutorResult } from "./chat-executor.js";
 import { ChatSteering, type ChatInputSource } from "./steering.js";
 import { buildUziToolsServer, UZI_TOOLS_SERVER_NAME } from "./uzi-tools.js";
@@ -69,6 +70,19 @@ export interface ChatRunnerOptions {
    * real SDK session, so the e2e's report → resume_of → Continue flow is unaffected.
    */
   sdkHomeDir?: string;
+  /** PRD #1391 M2 — the worker message outbox the chat batcher SPILLS to after a
+   *  sustained transient outage (chat keeps the message outbox even though it has no
+   *  claim generation, D6/D10). Undefined ⇒ today's trip behaviour. */
+  outbox?: Outbox;
+  /** PRD #1391 M2 — the shared re-arm registry (runId → the live batcher's rearm()),
+   *  the same map the run lane + worker share. */
+  rearm?: Map<string, () => void>;
+  /** PRD #1391 M2 — the spill trip window (config.transientTripMs); default is the
+   *  batcher's own TRANSIENT_TRIP_MS. */
+  transientTripMs?: number;
+  /** PRD #1391 M2 — the in-memory spill-buffer cap (config.outboxSpillBufferBytes);
+   *  default is the batcher's own 2 MiB. */
+  outboxSpillBufferBytes?: number;
 }
 
 /**
@@ -79,6 +93,11 @@ export interface ChatRunnerOptions {
 export class ChatRunner {
   private readonly makeSource: (runId: string, cancel: AbortController, log: Logger) => ChatInputSource;
   private readonly sdkHomeDir?: string;
+  /** PRD #1391 M2 — spill collaborators threaded into the chat batcher (see execute). */
+  private readonly outbox: Outbox | undefined;
+  private readonly rearm: Map<string, () => void> | undefined;
+  private readonly transientTripMs: number | undefined;
+  private readonly outboxSpillBufferBytes: number | undefined;
 
   constructor(
     private readonly client: WorkerClient,
@@ -97,6 +116,10 @@ export class ChatRunner {
       opts.makeSource ??
       ((runId, cancel, runLog) => new ChatSteering(this.client, runId, this.defaults.pollMs, runLog, cancel));
     this.sdkHomeDir = opts.sdkHomeDir;
+    this.outbox = opts.outbox;
+    this.rearm = opts.rearm;
+    this.transientTripMs = opts.transientTripMs;
+    this.outboxSpillBufferBytes = opts.outboxSpillBufferBytes;
   }
 
   /**
@@ -125,7 +148,19 @@ export class ChatRunner {
     // batcher carries beside the payload. A chat run never spawns a subagent
     // (NESTED_AGENT_TOOL is disallowed), so those fields stay absent here — the
     // redactor is wired anyway so the two runner paths cannot drift.
-    const batcher = new MessageBatcher(this.client, runId, claim.last_seq, this.batchMs, runLog, redact, redactText);
+    const batcher = new MessageBatcher(this.client, runId, claim.last_seq, this.batchMs, runLog, redact, redactText, {
+      // PRD #1391 M2: chat keeps the message outbox (Run A) — it spills like the run
+      // lane after a sustained transient outage. Generation is always 0: chat has no
+      // claim generation (D6/D10), so nothing is fenced on replay.
+      ...(this.outbox ? { outbox: this.outbox } : {}),
+      generation: 0,
+      ...(this.transientTripMs !== undefined ? { transientTripMs: this.transientTripMs } : {}),
+      ...(this.outboxSpillBufferBytes !== undefined ? { spillBufferBytes: this.outboxSpillBufferBytes } : {}),
+    });
+    // PRD #1391 M2: register this chat's batcher in the shared re-arm registry so the
+    // per-worker drainer can return it to the network once its spilled segments retire.
+    // Dropped in the terminal finally below.
+    this.rearm?.set(runId, () => batcher.rearm());
 
     // A `cancel` (End chat) input, or worker shutdown, aborts the whole conversation.
     // This SAME controller is the steering channel's cancel AND the executor's
@@ -278,6 +313,9 @@ export class ChatRunner {
       );
     } finally {
       if (signal) signal.removeEventListener("abort", onShutdown);
+      // PRD #1391 M2: drop this chat's re-arm registration (the batcher is closed by
+      // now, so a later drainer retire never needs to re-arm it).
+      this.rearm?.delete(runId);
       await source.stop().catch(() => undefined);
       // Evict this chat's token now the run is terminal (Decision 7).
       if (oauthToken) this.log.removeSecret(oauthToken);

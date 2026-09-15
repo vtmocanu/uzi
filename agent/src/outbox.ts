@@ -483,7 +483,7 @@ export class Outbox {
    */
   async drainRun(
     runId: string,
-    send: (msgs: OutgoingMessage[]) => Promise<void>,
+    send: (msgs: OutgoingMessage[], generation: number) => Promise<void>,
   ): Promise<{ retired: boolean; staleRetired: number }> {
     if (this.disabled) return { retired: false, staleRetired: 0 };
     return this.withRunLock(runId, async () => {
@@ -495,9 +495,12 @@ export class Outbox {
         .sort((a, b) => a.firstSeq - b.firstSeq);
 
       for (const rec of pending) {
-        const msgs = await this.expandRecord(rs, rec);
+        const { messages, generation } = await this.expandRecord(rs, rec);
         try {
-          await send(msgs);
+          // Replay each record under the generation it was PRODUCED under (needed for
+          // #1247's fence once the api advertises it, D11), so a re-claim's generation
+          // bump never rebinds an old attempt's frames.
+          await send(messages, generation);
         } catch (err) {
           if (err instanceof StaleClaimError) {
             this.log.warn("outbox: record refused as stale claim; retiring locally (frames lost, not rebound)", {
@@ -517,22 +520,30 @@ export class Outbox {
     });
   }
 
-  /** The messages a record replays as: a segment's own messages, or one tombstone
-   *  per seq for a range record / a segment the valid manifest proves is missing. */
-  private async expandRecord(rs: RunState, rec: ManifestRecordRef): Promise<OutgoingMessage[]> {
+  /** The messages a record replays as (plus the generation it was produced under):
+   *  a segment's own messages, or one tombstone per seq for a range record / a
+   *  segment the valid manifest proves is missing. A missing/tampered segment or a
+   *  MAC-bad range record has no readable generation, so it replays under 0. */
+  private async expandRecord(
+    rs: RunState,
+    rec: ManifestRecordRef,
+  ): Promise<{ messages: OutgoingMessage[]; generation: number }> {
     if (rec.kind === "segment") {
       const seg = await this.readSegmentFile(rs.runId, rec);
-      if (seg) return seg.messages;
+      if (seg) return { messages: seg.messages, generation: seg.generation };
       this.log.warn("outbox: segment missing/tampered; emitting per-seq gap tombstones (manifest proves the range)", {
         run_id: rs.runId,
         first_seq: rec.firstSeq,
         last_seq: rec.lastSeq,
       });
-      return gapTombstones(rec, "outbox segment unrecoverable");
+      return { messages: gapTombstones(rec, "outbox segment unrecoverable"), generation: 0 };
     }
     // A range record IS a dropped range; the manifest ref alone proves it, so we
-    // expand from the ref whether or not the file authenticates.
-    return gapTombstones(rec, DROP_REASON);
+    // expand from the ref whether or not the file authenticates. Read the file only
+    // for its recorded generation (0 when it does not authenticate).
+    const parsed = await this.readAuthed(path.join(this.runDir(rs.runId), rec.file), MAC_DOMAIN_RANGE);
+    const generation = parsed && typeof parsed.generation === "number" ? parsed.generation : 0;
+    return { messages: gapTombstones(rec, DROP_REASON), generation };
   }
 
   private async retireRecord(rs: RunState, rec: ManifestRecordRef, stale: boolean): Promise<void> {
