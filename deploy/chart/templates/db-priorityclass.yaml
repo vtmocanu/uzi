@@ -15,17 +15,19 @@
       would have rendered (the chart default), which ArgoCD would prune out from under the
       Cluster. Pointing it at an operator-managed class with a different name stays legal.
 
-  value defaults to 998: just below appPriorityClass (999) and workers.priorityClass
-  (1000), so the database never preempts the api or a worker, but above the priority-0
-  default so a Postgres instance outranks co-tenant pods for scheduling and kubelet
-  node-pressure eviction. This matters beyond the pods themselves: ArgoCD gates the whole
-  release's sync on the CNPG Cluster reporting healthy, so ONE Pending replica blocks every
-  api/web/controller update until it schedules (measured 2026-09-15 under node memory
-  starvation). Operator-tunable: raise it above the worker class if a worker must never
-  be able to preempt the database (value is immutable on a live PriorityClass, so a change
-  means delete-and-recreate).
+  value defaults to 1002: the HIGHEST uzi class, above appPriorityClass (1001) and
+  workers.priorityClass (1000). An evicted Postgres instance takes the api and every run
+  down with it, so nothing of uzi's may preempt the database, and a Pending replica may
+  reclaim room from a worker or the app tier. This matters beyond the pods themselves:
+  ArgoCD gates the whole release's sync on the CNPG Cluster reporting healthy, so ONE
+  Pending replica blocks every api/web/controller update until it schedules (measured
+  2026-09-15 under node memory starvation). Operator-tunable.
 
   sync-wave -6 so ArgoCD applies this object before the Cluster (wave -5) that references it.
+  Replace=true because `value` and `preemptionPolicy` are IMMUTABLE on a live PriorityClass:
+  a patch of a changed value is rejected and wedges the sync, so ArgoCD deletes and
+  recreates the object instead. Safe: running Postgres pods keep the priority recorded at
+  admission, and the wave ordering recreates the class before the Cluster is reconciled.
 */ -}}
 {{- $name := .Values.dbPriorityClass.name | default (printf "%s-db" .Release.Name) }}
 {{- $wired := toString .Values.postgres.cluster.priorityClassName }}
@@ -44,6 +46,7 @@ metadata:
     {{- include "uzi.labels" . | nindent 4 }}
   annotations:
     argocd.argoproj.io/sync-wave: "-6"
+    argocd.argoproj.io/sync-options: Replace=true
 value: {{ .Values.dbPriorityClass.value }}
 # HARD-CODED false, never configurable: globalDefault: true would repriority every pod
 # cluster-wide that declares no priorityClassName, far outside uzi's blast radius.

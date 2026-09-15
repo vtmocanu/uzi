@@ -8,14 +8,19 @@
   scheduling and kubelet node-pressure eviction instead of being the first thing evicted or
   left unschedulable when the hosted worker fleet reserves most of the node memory.
 
-  value defaults to 999 — just below workers.priorityClass.value (1000), so the app tier
-  does NOT preempt the workers, but above the priority-0 default so it outranks co-tenant
-  pods. preemptionPolicy defaults to PreemptLowerPriority so an unschedulable app pod
-  preempts a lower-priority victim to get placed on a full cluster; set it to Never for the
-  polite shared-cluster option (eviction survival without scheduling-time preemption).
+  value defaults to 1001 — above workers.priorityClass.value (1000), so a hosted worker can
+  never evict or preempt uzi's own control plane, and below dbPriorityClass (1002), the one
+  thing the api depends on. preemptionPolicy defaults to PreemptLowerPriority so an
+  unschedulable app pod preempts a lower-priority victim to get placed on a full cluster;
+  set it to Never for the polite shared-cluster option (eviction survival without
+  scheduling-time preemption).
 
   sync-wave -1 so ArgoCD applies this object before the Deployments that reference it (an
   otherwise-transient "no PriorityClass named ..." pod admission error on first sync).
+  Replace=true because `value` and `preemptionPolicy` are IMMUTABLE on a live PriorityClass:
+  a patch of a changed value is rejected and wedges the sync, so ArgoCD deletes and
+  recreates the object instead. Safe: running pods keep the priority recorded at admission,
+  and the wave ordering recreates the class before any Deployment rollout needs it.
 
   Disabled (appPriorityClass.enabled: false) renders NOTHING here and the deployments carry
   no priorityClassName — byte-identical to before this existed.
@@ -28,6 +33,7 @@ metadata:
     {{- include "uzi.labels" . | nindent 4 }}
   annotations:
     argocd.argoproj.io/sync-wave: "-1"
+    argocd.argoproj.io/sync-options: Replace=true
 value: {{ .Values.appPriorityClass.value }}
 # HARD-CODED false, never configurable: globalDefault: true would repriority every pod
 # cluster-wide that declares no priorityClassName, far outside uzi's blast radius.

@@ -129,12 +129,14 @@ appPriorityClass:
   # Empty ⇒ the chart derives `<release>-app`, release-unique so two uzi releases in one
   # cluster do not collide over this object.
   name: ""
-  # 999: just BELOW workers.priorityClass.value (1000) by design, so the app tier does
-  # NOT preempt the hosted workers, but ABOVE the priority-0 default of a no-class pod so
-  # it outranks co-tenant workloads. Tradeoff: a worker (1000) still outranks the app
-  # tier, but the scheduler preempts priority-0 victims before a 999 app pod. Operator-
-  # tunable; raise above workers only if the control plane must always beat a worker.
-  value: 999
+  # 1001: ABOVE workers.priorityClass.value (1000) by design, so a hosted worker can
+  # never evict or preempt uzi's own control plane on a full node (a worker is
+  # disposable and its run requeues; an evicted api takes every run down with it), and
+  # BELOW dbPriorityClass (1002), the one thing the api itself depends on. Operator-
+  # tunable. 🔴 IMMUTABLE on a live PriorityClass: changing it means the object is
+  # deleted and recreated (the template carries Replace=true so ArgoCD does that itself;
+  # running pods keep their recorded priority through the swap).
+  value: 1001
   # PreemptLowerPriority (the k8s default, set explicitly): when an app-tier pod cannot be
   # scheduled for lack of room, the scheduler evicts lower-priority pods to place it. That
   # is what lets the control plane recover on a full cluster. Set `Never` for the polite
@@ -157,10 +159,13 @@ dbPriorityClass:
   # Empty ⇒ the chart derives `<release>-db` (release-unique). Must equal
   # postgres.cluster.priorityClassName; the default there assumes the release is `uzi`.
   name: ""
-  # 998: below appPriorityClass (999) and workers.priorityClass (1000) by design, so the
-  # database never preempts the api or a worker, but above the priority-0 default so a
-  # Postgres instance outranks co-tenant pods for scheduling and eviction.
-  value: 998
+  # 1002: the HIGHEST uzi class, above appPriorityClass (1001) and workers.priorityClass
+  # (1000) by design: an evicted Postgres instance takes the api and every run down with
+  # it, so nothing of uzi's may preempt it, and a Pending replica may reclaim room from
+  # a worker or the app tier. 🔴 IMMUTABLE on a live PriorityClass: a change means
+  # delete-and-recreate (the template carries Replace=true so ArgoCD does that itself;
+  # running pods keep their recorded priority through the swap).
+  value: 1002
   # PreemptLowerPriority so an unschedulable replica reclaims room on a full cluster; set
   # `Never` for eviction survival without scheduling-time preemption.
   preemptionPolicy: PreemptLowerPriority
