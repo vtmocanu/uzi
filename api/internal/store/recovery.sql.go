@@ -175,14 +175,16 @@ func (q *Queries) DiscardCaptureForOwner(ctx context.Context, arg DiscardCapture
 
 const discardCustodyHoldForOwner = `-- name: DiscardCustodyHoldForOwner :execrows
 UPDATE recovery_custody_holds
-SET state = 'discarded', live_worker_id = NULL, live_run_id = NULL, updated_at = now()
-WHERE id = $1 AND run_id = $2 AND user_id = $3 AND state = 'open'
+SET state = 'discarded', live_worker_id = NULL, live_run_id = NULL,
+    release_evidence = $1, updated_at = now()
+WHERE id = $2 AND run_id = $3 AND user_id = $4 AND state = 'open'
 `
 
 type DiscardCustodyHoldForOwnerParams struct {
-	HoldID uuid.UUID `json:"hold_id"`
-	RunID  uuid.UUID `json:"run_id"`
-	UserID uuid.UUID `json:"user_id"`
+	ReleaseEvidence pgtype.Text `json:"release_evidence"`
+	HoldID          uuid.UUID   `json:"hold_id"`
+	RunID           uuid.UUID   `json:"run_id"`
+	UserID          uuid.UUID   `json:"user_id"`
 }
 
 // PRD #1349 M1 (D7): owner-initiated EXACT hold discard. Marks the ONE named open hold
@@ -195,8 +197,17 @@ type DiscardCustodyHoldForOwnerParams struct {
 // Captures are settled separately (DiscardNonReadyCapturesForHold); an available archive is
 // NEVER touched here (archive deletion is a distinct owner choice, D7). Sibling holds and
 // generations are left untouched.
+//
+// PRD #1392 M1 (D3): release_evidence is stamped 'owner_discard' — the class recording that
+// the owner explicitly discarded this hold's custody. The caller passes it as @release_evidence;
+// CHECK-constrained to the five classes (migration 00233).
 func (q *Queries) DiscardCustodyHoldForOwner(ctx context.Context, arg DiscardCustodyHoldForOwnerParams) (int64, error) {
-	result, err := q.db.Exec(ctx, discardCustodyHoldForOwner, arg.HoldID, arg.RunID, arg.UserID)
+	result, err := q.db.Exec(ctx, discardCustodyHoldForOwner,
+		arg.ReleaseEvidence,
+		arg.HoldID,
+		arg.RunID,
+		arg.UserID,
+	)
 	if err != nil {
 		return 0, err
 	}
@@ -809,7 +820,16 @@ func (q *Queries) ListOwnersWithClearedCustodyEpisode(ctx context.Context, custo
 }
 
 const listReleasableCustodyHolds = `-- name: ListReleasableCustodyHolds :many
-SELECT h.id, h.user_id, h.repo_id, h.run_id, h.generation, h.state, h.original_worker_id, h.original_worker_identity, h.live_worker_id, h.live_run_id, h.created_at, h.updated_at, h.released_at FROM recovery_custody_holds h
+SELECT h.id, h.user_id, h.repo_id, h.run_id, h.generation, h.state, h.original_worker_id, h.original_worker_identity, h.live_worker_id, h.live_run_id, h.created_at, h.updated_at, h.released_at, h.release_evidence,
+    CASE
+        WHEN EXISTS (SELECT 1 FROM runs r
+                       WHERE r.id = h.run_id
+                         AND r.status = 'completed'
+                         AND h.generation = r.claim_generation)
+            THEN 'publication'
+        ELSE 'archive'
+    END::text AS reason
+FROM recovery_custody_holds h
 WHERE h.state = 'open'
   AND (
       EXISTS (SELECT 1 FROM runs r
@@ -821,6 +841,24 @@ WHERE h.state = 'open'
   )
 ORDER BY h.created_at ASC
 `
+
+type ListReleasableCustodyHoldsRow struct {
+	ID                     uuid.UUID          `json:"id"`
+	UserID                 uuid.UUID          `json:"user_id"`
+	RepoID                 pgtype.UUID        `json:"repo_id"`
+	RunID                  uuid.UUID          `json:"run_id"`
+	Generation             int64              `json:"generation"`
+	State                  string             `json:"state"`
+	OriginalWorkerID       uuid.UUID          `json:"original_worker_id"`
+	OriginalWorkerIdentity string             `json:"original_worker_identity"`
+	LiveWorkerID           pgtype.UUID        `json:"live_worker_id"`
+	LiveRunID              pgtype.UUID        `json:"live_run_id"`
+	CreatedAt              pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt              pgtype.Timestamptz `json:"updated_at"`
+	ReleasedAt             pgtype.Timestamptz `json:"released_at"`
+	ReleaseEvidence        pgtype.Text        `json:"release_evidence"`
+	Reason                 string             `json:"reason"`
+}
 
 // PRD #1296 M4 (D3): the custody-release RECONCILER's candidate set — OPEN holds whose
 // release is now WARRANTED but was never applied (e.g. the best-effort terminal release in
@@ -850,15 +888,23 @@ ORDER BY h.created_at ASC
 // run retains custody for capture/discard). Returns oldest-first for stable reconcile order;
 // the reconciler releases the SPECIFIC selected hold by id (ReleaseCustodyHold), so selection
 // and release agree per-hold and a sibling hold is never collaterally released.
-func (q *Queries) ListReleasableCustodyHolds(ctx context.Context) ([]RecoveryCustodyHold, error) {
+//
+// PRD #1392 M1 (D3): `reason` is the per-hold RELEASE-EVIDENCE class the reconciler stamps
+// when it releases this hold, so the stored evidence matches the qualifier that selected it:
+// 'publication' when the completed-run backstop (a) qualifies it (the generation that
+// published its head), else 'archive' (its source is durably captured). The CASE mirrors the
+// WHERE's two disjuncts and prefers publication when both hold; a selected hold always
+// satisfies at least one disjunct, so `reason` is never a spurious 'archive' on a hold that
+// only the completed backstop qualified.
+func (q *Queries) ListReleasableCustodyHolds(ctx context.Context) ([]ListReleasableCustodyHoldsRow, error) {
 	rows, err := q.db.Query(ctx, listReleasableCustodyHolds)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []RecoveryCustodyHold{}
+	items := []ListReleasableCustodyHoldsRow{}
 	for rows.Next() {
-		var i RecoveryCustodyHold
+		var i ListReleasableCustodyHoldsRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.UserID,
@@ -873,6 +919,8 @@ func (q *Queries) ListReleasableCustodyHolds(ctx context.Context) ([]RecoveryCus
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.ReleasedAt,
+			&i.ReleaseEvidence,
+			&i.Reason,
 		); err != nil {
 			return nil, err
 		}
@@ -976,9 +1024,15 @@ func (q *Queries) MarkCaptureState(ctx context.Context, arg MarkCaptureStatePara
 const releaseCustodyHold = `-- name: ReleaseCustodyHold :execrows
 UPDATE recovery_custody_holds
 SET live_worker_id = NULL, live_run_id = NULL, state = 'released',
+    release_evidence = $1,
     released_at = now(), updated_at = now()
-WHERE id = $1 AND state = 'open'
+WHERE id = $2 AND state = 'open'
 `
+
+type ReleaseCustodyHoldParams struct {
+	ReleaseEvidence pgtype.Text `json:"release_evidence"`
+	ID              uuid.UUID   `json:"id"`
+}
 
 // D3: the PER-HOLD RELEASE mechanism. Nulls both live FKs (dropping the ON DELETE RESTRICT
 // that blocks worker/run teardown), flips state to 'released' and stamps released_at, for the
@@ -988,8 +1042,13 @@ WHERE id = $1 AND state = 'open'
 // it releases EXACTLY the hold ListReleasableCustodyHolds qualified, so a sibling
 // older-generation orphan hold on the same run is never collaterally released (the multi-hold
 // hazard documented on ListReleasableCustodyHolds).
-func (q *Queries) ReleaseCustodyHold(ctx context.Context, id uuid.UUID) (int64, error) {
-	result, err := q.db.Exec(ctx, releaseCustodyHold, id)
+//
+// PRD #1392 M1 (D3): release_evidence records WHY this release was warranted — the
+// reconciler passes the per-hold class ListReleasableCustodyHolds now computes ('publication'
+// for a completed-run backstop, 'archive' for a ready capture). CHECK-constrained to the five
+// classes (migration 00233).
+func (q *Queries) ReleaseCustodyHold(ctx context.Context, arg ReleaseCustodyHoldParams) (int64, error) {
+	result, err := q.db.Exec(ctx, releaseCustodyHold, arg.ReleaseEvidence, arg.ID)
 	if err != nil {
 		return 0, err
 	}
@@ -999,17 +1058,19 @@ func (q *Queries) ReleaseCustodyHold(ctx context.Context, id uuid.UUID) (int64, 
 const releaseCustodyHoldExact = `-- name: ReleaseCustodyHoldExact :execrows
 UPDATE recovery_custody_holds
 SET live_worker_id = NULL, live_run_id = NULL, state = 'released',
+    release_evidence = $1,
     released_at = now(), updated_at = now()
-WHERE run_id = $1
-  AND generation = $2
-  AND live_worker_id = $3::uuid
+WHERE run_id = $2
+  AND generation = $3
+  AND live_worker_id = $4::uuid
   AND state = 'open'
 `
 
 type ReleaseCustodyHoldExactParams struct {
-	RunID      uuid.UUID `json:"run_id"`
-	Generation int64     `json:"generation"`
-	WorkerID   uuid.UUID `json:"worker_id"`
+	ReleaseEvidence pgtype.Text `json:"release_evidence"`
+	RunID           uuid.UUID   `json:"run_id"`
+	Generation      int64       `json:"generation"`
+	WorkerID        uuid.UUID   `json:"worker_id"`
 }
 
 // PRD #1349 M1 (D1/D2/D3): the GENERATION-EXACT worker release. Nulls both live FKs (dropping
@@ -1021,8 +1082,20 @@ type ReleaseCustodyHoldExactParams struct {
 // caller must have already established this generation's durable evidence (published head,
 // available archive, or verified no-output). Idempotent: a second call moves zero rows.
 // Captures survive; the immutable provenance columns are untouched.
+//
+// PRD #1392 M1 (D3): release_evidence records WHY this release was warranted. The caller
+// supplies the class: the terminal-completion release passes 'publication'; the worker
+// Release endpoint passes an allowlisted request value ('publication' or 'forge_no_output');
+// the forge pre-clone park passes 'no_adopted_source' (a generation that never adopted a
+// source has nothing to prove against the forge). CHECK-constrained to the five classes
+// (migration 00233).
 func (q *Queries) ReleaseCustodyHoldExact(ctx context.Context, arg ReleaseCustodyHoldExactParams) (int64, error) {
-	result, err := q.db.Exec(ctx, releaseCustodyHoldExact, arg.RunID, arg.Generation, arg.WorkerID)
+	result, err := q.db.Exec(ctx, releaseCustodyHoldExact,
+		arg.ReleaseEvidence,
+		arg.RunID,
+		arg.Generation,
+		arg.WorkerID,
+	)
 	if err != nil {
 		return 0, err
 	}

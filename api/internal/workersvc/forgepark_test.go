@@ -1,0 +1,68 @@
+package workersvc
+
+import (
+	"context"
+	"errors"
+	"testing"
+)
+
+// TestSetStateUnknownRecoveryCauseRejected: an unknown non-nil recovery_cause is validated
+// BEFORE any state SQL and rejected as ErrInvalidState (400), so a garbled cause can never
+// reach the CHECK-constrained column. Uses the fake fixture (no DB): the validation is the
+// first thing SetState does.
+func TestSetStateUnknownRecoveryCauseRejected(t *testing.T) {
+	run := runningRun(false)
+	_, svc, wkr := limitParkFixture(t, run)
+
+	_, applied, err := svc.SetState(context.Background(), wkr, run.ID, StateRequest{
+		State: "recovery_wait", RecoveryCause: strPtr("not-a-real-cause"),
+	})
+	if !errors.Is(err, ErrInvalidState) {
+		t.Fatalf("SetState err = %v, want ErrInvalidState for an unknown recovery_cause", err)
+	}
+	if applied {
+		t.Fatal("applied = true for a rejected unknown cause")
+	}
+}
+
+// TestSetStateForgeParkNoTxBeginnerFailsSafe: when no transaction beginner is wired the atomic
+// release+park cannot run, so a forge_unreachable report MUST NOT blind-park (which would leak
+// the generation's hold) — it takes today's safe FAILED path instead (D3). Uses the fake
+// fixture, which wires no tx beginner.
+func TestSetStateForgeParkNoTxBeginnerFailsSafe(t *testing.T) {
+	run := runningRun(false)
+	fs, svc, wkr := limitParkFixture(t, run)
+	if svc.txBeginner != nil {
+		t.Fatal("fixture unexpectedly wired a tx beginner; this test needs the nil path")
+	}
+
+	if _, _, err := svc.SetState(context.Background(), wkr, run.ID, StateRequest{
+		State: "recovery_wait", RecoveryCause: strPtr("forge_unreachable"), ClaimGeneration: i64Ptr(1),
+	}); err != nil {
+		t.Fatalf("SetState(forge park, no tx beginner): %v", err)
+	}
+	if fs.setFailed == nil {
+		t.Fatal("SetRunFailed was never called — a forge park with no tx beginner must fail safe, not park")
+	}
+	if fs.setRecoveryWait != nil {
+		t.Fatalf("SetRunRecoveryWait was called with no tx beginner — a forge park must never blind-park (leaks the hold)")
+	}
+}
+
+// TestForgeUnreachableIsPreStartInfra pins the judge exclusion mechanism: forge_unreachable is
+// a member of preStartInfraFailOrigins, so a run failed past the forge cap (iteration_count==0,
+// pre-clone) is not judged. Cheap, gate-visible, and the direct mutation guard for the
+// "enqueues no judge" behaviour.
+func TestForgeUnreachableIsPreStartInfra(t *testing.T) {
+	if !preStartInfraFailOrigins["forge_unreachable"] {
+		t.Fatal("forge_unreachable is not in preStartInfraFailOrigins; a forge-cap failure would be judged")
+	}
+	// It must also be a real stored member (else the exclusion references a phantom origin).
+	if !failOriginSet["forge_unreachable"] {
+		t.Fatal("forge_unreachable is not in the fail_origin vocabulary")
+	}
+	// And it must NOT be worker-reportable (it is server-derived).
+	if workerReportableFailOrigins["forge_unreachable"] {
+		t.Fatal("forge_unreachable is worker-reportable; it must be server-derived only")
+	}
+}

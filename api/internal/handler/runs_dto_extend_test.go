@@ -36,7 +36,7 @@ func TestRunToDTOExtendBudgetFields(t *testing.T) {
 		BudgetWallSeconds:      pgtype.Int4{Int32: wallSeconds, Valid: true},
 		BudgetExtensionSeconds: extSeconds,
 		BudgetPausedSeconds:    0,
-	}, "normal", 2*time.Hour, capSeconds, dtoTestNow)
+	}, "normal", 2*time.Hour, capSeconds, 0, dtoTestNow)
 
 	if dto.BudgetExtensionSeconds != extSeconds {
 		t.Errorf("budget_extension_seconds = %d, want %d", dto.BudgetExtensionSeconds, extSeconds)
@@ -67,7 +67,7 @@ func TestRunToDTOExtendBudgetTotalNilForChat(t *testing.T) {
 		Status:            "running",
 		StartedAt:         pgtype.Timestamptz{Time: dtoTestNow.Add(-1 * time.Hour), Valid: true},
 		BudgetWallSeconds: pgtype.Int4{Int32: 8 * 60 * 60, Valid: true},
-	}, "normal", 2*time.Hour, 57600, dtoTestNow)
+	}, "normal", 2*time.Hour, 57600, 0, dtoTestNow)
 
 	if dto.BudgetTotalSeconds != nil {
 		t.Errorf("budget_total_seconds must be nil for a chat run (no wall deadline), got %d", *dto.BudgetTotalSeconds)
@@ -90,7 +90,7 @@ func TestRunToDTOExtendBudgetUsedClampedAtZero(t *testing.T) {
 		StartedAt:           pgtype.Timestamptz{Time: dtoTestNow.Add(-10 * time.Minute), Valid: true},
 		BudgetWallSeconds:   pgtype.Int4{Int32: 8 * 60 * 60, Valid: true},
 		BudgetPausedSeconds: 60 * 60, // 1h banked pause > 10m elapsed → raw used is negative
-	}, "normal", 2*time.Hour, 57600, dtoTestNow)
+	}, "normal", 2*time.Hour, 57600, 0, dtoTestNow)
 
 	if dto.BudgetUsedSeconds == nil {
 		t.Fatal("budget_used_seconds must be non-nil when started_at is set, got nil")
@@ -106,7 +106,7 @@ func TestRunToDTOExtendBudgetUsedNilWhenNotStarted(t *testing.T) {
 	dto := runToDTO(store.Run{
 		Kind:   "issue",
 		Status: "queued", // never started → StartedAt invalid
-	}, "normal", 2*time.Hour, 57600, dtoTestNow)
+	}, "normal", 2*time.Hour, 57600, 0, dtoTestNow)
 
 	if dto.BudgetUsedSeconds != nil {
 		t.Errorf("budget_used_seconds must be nil when started_at is invalid, got %d", *dto.BudgetUsedSeconds)

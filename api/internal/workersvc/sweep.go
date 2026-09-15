@@ -383,7 +383,14 @@ func (s *Service) ReconcileCustodyReleases(ctx context.Context) (int64, error) {
 	}
 	var released int64
 	for _, h := range holds {
-		n, err := s.q.ReleaseCustodyHold(ctx, h.ID)
+		// PRD #1392 M1 (D3): stamp the per-hold release-evidence class the candidate query
+		// computed alongside each hold — 'publication' (a completed run published this
+		// generation's head) or 'archive' (a ready capture covers this hold's source) — so the
+		// stored evidence matches the qualifier that selected the hold for release.
+		n, err := s.q.ReleaseCustodyHold(ctx, store.ReleaseCustodyHoldParams{
+			ID:              h.ID,
+			ReleaseEvidence: pgconv.TextOrNull(h.Reason),
+		})
 		if err != nil {
 			// Best-effort: skip this hold, keep reconciling the rest. The hold stays open and
 			// the next tick retries it.

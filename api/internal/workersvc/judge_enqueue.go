@@ -18,16 +18,20 @@ import (
 )
 
 // preStartInfraFailOrigins is the fail_origin set that means a run failed BEFORE the
-// agent did anything reviewable (PRD #69 M7a Pass B, Decision 12): a
+// agent did anything reviewable (PRD #69 M7a Pass B, Decision 12; PRD #1392 M1): a
 // provisioning/credential/guardrail block that is permanent until the config or policy
-// is fixed. Gate 4b skips the judge for such a run at iteration_count == 0 — there is no
-// agent behavior to retrospect. Deliberately EXACTLY these three: not
-// rate_limited/worker_lost/run_timeout (transient) and not agent_failure (judgeable).
-// The members are a strict subset of failorigin.go's vocabulary.
+// is fixed, OR a forge that stayed unreachable at clone past the park cap. Gate 4b skips the
+// judge for such a run at iteration_count == 0 — there is no agent behavior to retrospect.
+// Deliberately EXACTLY these four: not rate_limited/worker_lost/run_timeout (transient) and
+// not agent_failure (judgeable). forge_unreachable joins them because a forge park fails
+// pre-clone (fact 4: no clone, no ActiveRun, iteration_count == 0), so like the three infra
+// origins it has no agent behaviour to review. The members are a strict subset of
+// failorigin.go's vocabulary. TestPreStartInfraFailOriginsExact pins the exact set.
 var preStartInfraFailOrigins = map[string]bool{
 	"provisioning_failed":    true,
 	"credential_unavailable": true,
 	"guardrail_blocked":      true,
+	"forge_unreachable":      true,
 }
 
 // maybeEnqueueJudgeByID reloads a run by id and runs the judge gate. Used by the

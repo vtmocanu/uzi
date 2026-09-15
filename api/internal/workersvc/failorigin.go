@@ -56,6 +56,13 @@ var failOrigins = []string{
 	// PARSES the remote reject, failing typed with the diff preserved instead of a raw
 	// `remote rejected` (worker-reportable — see workerReportableFailOrigins).
 	"push_secret_blocked",
+	// PRD #1392 M1: a run whose forge stayed unreachable at CLONE past
+	// RUN_FORGE_UNREACHABLE_MAX_PARKS parks. SERVER-DERIVED, NOT worker-reportable (it is
+	// stamped directly inside SetState's forge-park transaction, so it is deliberately absent
+	// from workerReportableFailOrigins) — a worker reporting it is a forgery CoerceFailOrigin
+	// drops. Excluded from the judge (preStartInfraFailOrigins, judge_enqueue.go): a forge park
+	// fails pre-clone at iteration_count==0, with no agent behaviour to retrospect.
+	"forge_unreachable",
 }
 
 // failOriginSet is the lookup form. Built once; failOrigins stays the declaration so
