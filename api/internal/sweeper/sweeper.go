@@ -107,7 +107,7 @@ func (e *Engine) runOnce(ctx context.Context) {
 	}
 	// Only log when the pass actually did something, to keep the log quiet on an
 	// idle system.
-	if res.WorkersOffline+res.ClaimedReset+res.RunningTimeout+res.StaleFailed+res.StaleRequeued+res.ChatIdleCompleted+res.ProposalsRecovered+res.HealthChanged+res.AutoStopped+res.LimitPromoted+res.PoolResumed+res.RecoveryPromoted+res.CompletionBudgetExhausted+res.CustodyReleased+res.RecoveryStalled+res.RecoveryExpired > 0 {
+	if res.WorkersOffline+res.ClaimedReset+res.RunningTimeout+res.StaleFailed+res.StaleRequeued+res.ChatIdleCompleted+res.ProposalsRecovered+res.HealthChanged+res.AutoStopped+res.LimitPromoted+res.PoolResumed+res.LimitReevaluated+res.RecoveryPromoted+res.CompletionBudgetExhausted+res.CustodyReleased+res.RecoveryStalled+res.RecoveryExpired > 0 {
 		slog.Info("sweeper pass",
 			"workers_offline", res.WorkersOffline,
 			"claimed_reset", res.ClaimedReset,
@@ -129,6 +129,12 @@ func (e *Engine) runOnce(ctx context.Context) {
 			// resume-only tick (nothing else changed) still raises this line rather than
 			// resuming a held run invisibly.
 			"pool_resumed", res.PoolResumed,
+			// PRD #1247 M3 (D8): same reasoning — in the sum above as well as emitted here, so a
+			// re-eval-only tick (a still-parked run LOWERED to now() because its auto next claim
+			// gained a spendable pooled alternative) still raises this line. Its own promotion
+			// usually lands a tick later — the D8 pass writes DB now(), a hair ahead of the sweep's
+			// captured now — so without this the early promotion is otherwise invisible.
+			"limit_reevaluated", res.LimitReevaluated,
 			// issue #1197: same reasoning — in the sum above as well as emitted here, so a
 			// tick that only promotes a run out of recovery_wait (recovery_retry_not_before
 			// elapsed) still raises this line rather than resuming a held run invisibly.

@@ -642,6 +642,80 @@ func TestSetStateLimitWaitSkipsTheCandidateQueryWithoutACredential(t *testing.T)
 	}
 }
 
+// 🔴 TestSetStateLimitWaitSelfImproveUsesOwnerJudgeBindMode pins setLimitWait's
+// self_improve → ownerJudgeBindMode wiring (PRD #1247 gap 3). A self_improve run
+// follows the OWNER's judge binding rather than a worker binding, so setLimitWait
+// fetches ownerJudgeMode via ownerJudgeBindMode and passes it to effectiveNextClaimMode;
+// only then does an `auto` judge binding make the resumed run's next claim `auto`, which
+// is the sole condition under which Decision 6e may lower the park to a pooled
+// alternative.
+//
+// The dead credential's own reset is 2h out and a second pooled token is eligible NOW.
+// Under an AUTO judge binding the park must LOWER to now+jitter (the run resumes on the
+// next tick onto the alternative); under a PINNED judge binding 6e must NOT fire, so the
+// park keeps the dead credential's own 2h reset — lowering it would just guarantee an
+// immediate re-park on the dead credential.
+//
+// MUTATION THIS CATCHES: dropping the self_improve → ownerJudgeBindMode branch in
+// setLimitWait (so it always passes ""). effectiveNextClaimMode then returns "" for a
+// self_improve run, the 6e gate `== BindModeAuto` is false, and the AUTO case below is no
+// longer lowered — it keeps the 2h reset and reddens.
+func TestSetStateLimitWaitSelfImproveUsesOwnerJudgeBindMode(t *testing.T) {
+	dead, alt := uuid.New(), uuid.New()
+	for _, tc := range []struct {
+		judgeMode string
+		lowered   bool
+		why       string
+	}{
+		{BindModeAuto, true, "an auto judge binding makes the self_improve next claim auto, so 6e lowers to the pooled alternative"},
+		{BindModePinned, false, "a pinned judge binding keeps the dead credential; lowering would only re-park"},
+	} {
+		run := runningRun(true)
+		run.Kind = runkind.SelfImprove
+		run.AnthropicSecretID = pgtype.UUID{Bytes: dead, Valid: true}
+
+		fs, svc, wkr := limitParkFixture(t, run)
+		fs.setLimitWaitRows = 1
+		fs.judgeBindMode = tc.judgeMode
+		// The dead credential carries no gauge reset, so Decision 4's cross-check does not
+		// push the base out past the reported reset — this isolates the 6e pool leg, which
+		// is the only thing the judge-binding wiring gates (mirrors autoselectrowCandidate's
+		// nil-resets convention in the pure tests above).
+		deadRow := candRow(dead, "dead", true, 90, time.Minute, 0)
+		deadRow.FiveHourResetsAt = pgtype.Timestamptz{}
+		fs.autoCandidates = []store.ListAutoSelectCandidatesRow{
+			deadRow,
+			candRow(alt, "alt", true, 90, time.Minute, 0), // eligible ⇒ spendable now
+		}
+
+		reset := parkNow.Add(2 * time.Hour)
+		rows := reset.UnixMilli()
+		_, applied, err := svc.SetState(context.Background(), wkr, run.ID, StateRequest{
+			State: "limit_wait", LimitResetsAt: &rows, RateLimitType: strPtr("five_hour"),
+		})
+		if err != nil || !applied {
+			t.Fatalf("%s: SetState applied=%v err=%v", tc.judgeMode, applied, err)
+		}
+		if fs.setLimitWait == nil {
+			t.Fatalf("%s: SetRunLimitWait was never called", tc.judgeMode)
+		}
+		got := fs.setLimitWait.RetryNotBefore
+		if !got.Valid {
+			t.Fatalf("%s: retry_not_before was not stamped", tc.judgeMode)
+		}
+
+		// Two disjoint windows: lowered ⇒ now+jitter, kept ⇒ the 2h reset + jitter.
+		lo, hi := parkNow.Add(limitParkJitterMin), parkNow.Add(limitParkJitterMax)
+		if !tc.lowered {
+			lo, hi = reset.Add(limitParkJitterMin), reset.Add(limitParkJitterMax)
+		}
+		if got.Time.Before(lo) || got.Time.After(hi) {
+			t.Fatalf("%s: retry_not_before = %v, want within [%v, %v] — %s",
+				tc.judgeMode, got.Time, lo, hi, tc.why)
+		}
+	}
+}
+
 // TestSetStateFailedComposesTheLimitReasonServerSide is §7.8. The worker's own text
 // is REPLACED when the structured fields ride along, so the enum never lives on the
 // untrusted side of the wire.
