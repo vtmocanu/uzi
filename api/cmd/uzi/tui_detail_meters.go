@@ -146,53 +146,85 @@ func (m tuiModel) railRateMeters(now time.Time, usedRows int) string {
 	return m.pal.faint.Render("ACCOUNTS") + "\n" + strings.Join(fitted, "\n")
 }
 
-// railCredentialLine is the crew rail's per-run token CHOICE + pending-switch line (PRD #1247 M8):
-// one physical line naming the override the owner chose for this run and any held-state switch in
-// flight. It is drawn INDEPENDENTLY of the ACCOUNTS block's isRun branch (railRateMeters), so a
-// QUEUED, unclaimed run — which has no AnthropicSecretID and therefore no ACCOUNTS entry at all —
-// STILL shows its override/switch. "" when the run inherits the worker binding with no pending
-// switch (credential_override null AND credential_switch null), so the common case adds no line.
+// railCredentialLine is the crew rail's per-run token-choice + pending-switch BLOCK (PRD #1247 M8):
+// up to TWO physical lines — a token line naming the override the owner chose for this run, and a
+// SEPARATE switch line for any held-state switch in flight. It is drawn INDEPENDENTLY of the
+// ACCOUNTS block's isRun branch (railRateMeters), so a QUEUED, unclaimed run — which has no
+// AnthropicSecretID and therefore no ACCOUNTS entry at all — STILL shows its override/switch. "" when
+// the run inherits the worker binding with no pending switch (credential_override null AND
+// credential_switch null), so the common case adds no line (and no stray blank row).
 //
-// usedRows budgets it whole-line-or-nothing against the remaining rail height, the same arithmetic
-// renderSpend/railRateMeters use (the -1 is the blank "\n\n" separator the caller prepends), so a
-// height-clamped rail drops the whole line rather than overflow. renderLaneRail draws it LAST, below
-// ACCOUNTS, so this budget never steals a row from a PRD #1257-protected block above it — the line
-// is best-effort like a sibling ACCOUNTS entry, not part of the protected set railAutoFolded counts.
+// Two lines, not one: joinColumns clamps every rail line to laneRailWidth (26), and the packed
+// one-line form ("token: <label> (run-pinned) · switch requested") is always wider than that, so the
+// clamp TRUNCATED the pending-switch marker — the transient, attention-worthy signal the line exists
+// to surface — off the tail. Rendering the switch on its OWN line (mirroring renderMilestones'
+// eyebrow→continuation-line precedent) keeps it inside the rail, fully rendered. Each line is
+// self-capped to laneRailWidth by renderer.Plain (token line) or is a short server enum (switch
+// line), so neither depends on the joinColumns clamp to fit.
+//
+// usedRows budgets each line whole-line-or-nothing against the remaining rail height, the same
+// arithmetic renderSpend/railRateMeters use (the -1 is the blank "\n\n" separator the caller
+// prepends). renderLaneRail draws the block LAST, below ACCOUNTS, so this budget never steals a row
+// from a PRD #1257-protected block above it — the lines are best-effort like a sibling ACCOUNTS
+// entry, not part of the protected set railAutoFolded counts. Priority under pressure: when only ONE
+// row remains and a switch IS pending, the switch line wins (the transient signal is worth surfacing
+// over the steady-state token choice); otherwise the token line shows. When two rows fit, both show,
+// token first.
 func (m tuiModel) railCredentialLine(usedRows int) string {
-	line := m.railCredentialText()
-	if line == "" {
+	token := m.railCredentialTokenLine()
+	sw := m.railCredentialSwitchLine()
+	if token == "" && sw == "" {
 		return ""
 	}
-	if 1 > m.transcriptViewport()-usedRows-1 {
+	budget := m.transcriptViewport() - usedRows - 1
+	if budget < 1 {
 		return ""
 	}
-	return line
+	switch {
+	case token != "" && sw != "":
+		if budget >= 2 {
+			return token + "\n" + sw
+		}
+		// One row left: prioritise the transient switch marker over the steady token choice.
+		return sw
+	case sw != "":
+		return sw
+	default:
+		return token
+	}
 }
 
-// railCredentialText builds the faint token-choice line, or "" when there is no override and no
-// pending switch. The pinned override's label is USER-AUTHORED and drawn through renderer.Plain
-// (D7), never raw; the mode/switch words are server enums rendered honestly (an unrecognised value
-// still rides Plain rather than reaching the frame raw). The override and any switch are joined with
-// " · " onto one line ("token: <label> (run-pinned) · switch requested").
-func (m tuiModel) railCredentialText() string {
-	var parts []string
-	if co := m.detail.run.CredentialOverride; co != nil {
-		parts = append(parts, "token: "+m.railOverrideMode(co))
-	}
-	if sw := m.detail.run.CredentialSwitch; sw != nil && *sw != "" {
-		switch *sw {
-		case "requested":
-			parts = append(parts, "switch requested")
-		case "released":
-			parts = append(parts, "switch released")
-		default:
-			parts = append(parts, "switch "+m.renderer.Plain(*sw, laneRailWidth))
-		}
-	}
-	if len(parts) == 0 {
+// railCredentialTokenLine builds the faint "token: <choice>" rail line, or "" when the run carries no
+// credential override. The WHOLE line rides renderer.Plain at laneRailWidth so the USER-AUTHORED
+// override label (D7) is sanitized and the line is capped to the rail width in one place; a long
+// label may push "(run-pinned)" past the cap and lose it, which is acceptable — the label is the
+// priority on the token line. The mode words are server enums (auto/default) rendered honestly (an
+// unrecognised value still rides Plain rather than reaching the frame raw, via railOverrideMode).
+func (m tuiModel) railCredentialTokenLine() string {
+	co := m.detail.run.CredentialOverride
+	if co == nil {
 		return ""
 	}
-	return m.pal.faint.Render(strings.Join(parts, " · "))
+	return m.pal.faint.Render(m.renderer.Plain("token: "+m.railOverrideMode(co), laneRailWidth))
+}
+
+// railCredentialSwitchLine builds the faint pending-switch rail line ("switch requested" / "switch
+// released") on its OWN line, so the marker fully renders inside laneRailWidth rather than being
+// truncated off the token line. "" when no switch is in flight. The switch word is a server enum
+// rendered honestly; an unrecognised value rides renderer.Plain rather than reaching the frame raw.
+func (m tuiModel) railCredentialSwitchLine() string {
+	sw := m.detail.run.CredentialSwitch
+	if sw == nil || *sw == "" {
+		return ""
+	}
+	switch *sw {
+	case "requested":
+		return m.pal.faint.Render("switch requested")
+	case "released":
+		return m.pal.faint.Render("switch released")
+	default:
+		return m.pal.faint.Render("switch " + m.renderer.Plain(*sw, laneRailWidth))
+	}
 }
 
 // railOverrideMode renders a per-run credential override's mode for the crew rail: a pinned override

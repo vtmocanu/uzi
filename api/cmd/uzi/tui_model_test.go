@@ -800,9 +800,11 @@ func TestTUIViewsStripControlBytesFromUntrustedText(t *testing.T) {
 	// distinct "milesafe" tail, so only railMilestoneAgentLines' render of MilestoneAgent.AgentLabel
 	// can put it in the frame (the title yields "safe", the account label "credsafe").
 	hostileMileLabel := "\x1b[2J\u202E\x07\x01milesafe"
-	// A hostile per-run CredentialOverride.Label (PRD #1247 M8) exercises the crew rail's new
-	// token-choice line (railCredentialLine \u2192 railOverrideMode \u2192 renderer.Plain). Its "ovrsafe"
-	// tail differs from every other marker so only THAT render path can put it in the frame.
+	// A hostile per-run CredentialOverride.Label (PRD #1247 M8) exercises the crew rail's token line
+	// (railCredentialLine \u2192 railCredentialTokenLine \u2192 railOverrideMode \u2192 renderer.Plain). Its "ovrsafe"
+	// tail differs from every other marker so only THAT render path can put it in the frame. The
+	// pending switch below rides its OWN line (railCredentialSwitchLine), so the M8 two-line split
+	// keeps the marker inside the rail rather than truncating it off the token line.
 	hostileOverrideLabel := "\x1b[2J\u202E\x07\x01ovrsafe"
 	// A hostile CredentialEpoch.Label is set as a NON-LEAK guard: the TUI does not render epoch
 	// history (that is a CLI-only surface, proven sanitized by TestRenderRunDetailCredentialOverrideSanitizes),
@@ -864,9 +866,11 @@ func TestTUIViewsStripControlBytesFromUntrustedText(t *testing.T) {
 		t.Fatalf("the detail rail is not drawing AnthropicSecretLabel, so this test is not exercising that render path\n%s", detailOut)
 	}
 	// The hostile CredentialOverride.Label sanitizes to "ovrsafe", reachable ONLY via the crew rail's
-	// new token-choice line (railCredentialLine → railOverrideMode → renderer.Plain, PRD #1247 M8) —
-	// the "ovrsafe" tail is distinct from "safe"/"credsafe"/"milesafe" so its survival proves THIS
-	// render path put it in the frame, and assertNoRawControls above proves it folded the hostile bytes.
+	// token line (railCredentialLine → railCredentialTokenLine → railOverrideMode → renderer.Plain,
+	// PRD #1247 M8) — the "ovrsafe" tail is distinct from "safe"/"credsafe"/"milesafe" so its survival
+	// proves THIS render path put it in the frame, and assertNoRawControls above proves it folded the
+	// hostile bytes. Asserted on the COMPOSED view (detailOut = View().Content): "token: ovrsafe …" is
+	// early on the token line, so the marker survives the 26-col clamp even though "(run-pinned)" does not.
 	if !strings.Contains(detailOut, "ovrsafe") {
 		t.Fatalf("the crew rail is not drawing CredentialOverride.Label, so this test is not exercising the PRD #1247 override render path\n%s", detailOut)
 	}
@@ -2503,30 +2507,51 @@ func TestTUIBackgroundColorMsgFlipsPalette(t *testing.T) {
 // TestRailCredentialLineAccountlessQueuedRun pins PRD #1247 M8's account-less case: a QUEUED,
 // unclaimed run has NO AnthropicSecretID (so railRateMeters draws no ACCOUNTS entry at all), yet
 // the crew rail must STILL show its per-run token override and any pending switch, because
-// railCredentialLine is drawn INDEPENDENTLY of the ACCOUNTS/isRun branch. renderLaneRail is asserted
-// directly (not View()) so the 26-col joinColumns clamp does not cut the token line's tail.
+// railCredentialLine is drawn INDEPENDENTLY of the ACCOUNTS/isRun branch.
+//
+// Asserted on the COMPOSED view (View().Content) — the frame the user actually sees, AFTER the
+// laneRailWidth (26-col) joinColumns clamp — NOT the pre-clamp renderLaneRail() output: the M8
+// truncation bug was precisely that the packed one-line "token: … · switch requested" overflowed the
+// rail and the switch marker was clamped away, so a pre-clamp assertion would falsely confirm a
+// marker the shipped view had cut.
 func TestRailCredentialLineAccountlessQueuedRun(t *testing.T) {
 	queued := func(run apitypes.RunDTO) string {
 		t.Helper()
 		m := tuiTestModel(t, &uzicli.FakeClient{}, run.ID)
 		m = applyDetail(m, run, nil)
-		return stripANSI(m.renderLaneRail())
+		return stripANSI(m.View().Content)
 	}
 
-	// A pinned override on a queued run with no account row: the token line still shows.
-	label := "chosen-key"
+	// A pinned override on a queued run with no account row: the token line still shows within the
+	// 26-col rail. A short label leaves room for the "(run-pinned)" qualifier under the clamp.
+	label := "prod"
 	out := queued(apitypes.RunDTO{ID: "run-q", Kind: "issue", Status: "queued",
 		CredentialOverride: &apitypes.CredentialOverrideDTO{Mode: "pinned", Label: &label}})
 	if strings.Contains(out, "ACCOUNTS") {
 		t.Fatalf("a queued unclaimed run must have no ACCOUNTS block; the fixture is not exercising the account-less path\n%s", out)
 	}
-	for _, want := range []string{"token:", "chosen-key", "run-pinned"} {
+	for _, want := range []string{"token:", "prod", "run-pinned"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("the crew rail dropped the token override %q for an account-less queued run\n%s", want, out)
 		}
 	}
 
-	// A pending switch on an account-less run also surfaces, folded onto the same line as the override.
+	// The M8 regression guard: a PINNED override PLUS a pending switch, with a label long enough that
+	// the packed one-line form would overflow the 26-col rail and lose the marker. The switch now
+	// rides its OWN line, so "switch requested" survives the composed clamp — the deterministic proof
+	// the marker is no longer truncated away.
+	out = queued(apitypes.RunDTO{ID: "run-qp", Kind: "issue", Status: "queued",
+		CredentialOverride: &apitypes.CredentialOverrideDTO{Mode: "pinned", Label: sptr("acme-prod-key")},
+		CredentialSwitch:   sptr("requested")})
+	if !strings.Contains(out, "token:") {
+		t.Fatalf("the crew rail dropped the token line for a pinned override + pending switch\n%s", out)
+	}
+	if !strings.Contains(out, "switch requested") {
+		t.Fatalf("the composed rail truncated the pending-switch marker off the token line (the M8 bug this fix closes)\n%s", out)
+	}
+
+	// A pending switch on an account-less AUTO run also surfaces on its own line, alongside the token
+	// line, in the composed view.
 	out = queued(apitypes.RunDTO{ID: "run-q2", Kind: "issue", Status: "queued",
 		CredentialOverride: &apitypes.CredentialOverrideDTO{Mode: "auto"},
 		CredentialSwitch:   sptr("requested")})
