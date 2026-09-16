@@ -66,10 +66,16 @@ reviews:
     # :semanticCommits, so PRs are titled chore(deps)/fix(deps)/build(deps)).
     ignore_usernames:
       - "renovate[bot]"
+    # On-demand skip: put "[skip-cr]" anywhere in a PR title and CodeRabbit will
+    # not auto-review it. For a PR already open (or to skip one review only), post
+    # the native comment "@coderabbitai ignore" instead. Reach for either only
+    # when review adds no value (a mechanical or generated diff); a normal change
+    # still gets reviewed.
     ignore_title_keywords:
       - "chore(deps)"
       - "fix(deps)"
       - "build(deps)"
+      - "[skip-cr]"
 
   # Path-specific instructions
   path_instructions:
