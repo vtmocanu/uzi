@@ -145,3 +145,73 @@ func (m tuiModel) railRateMeters(now time.Time, usedRows int) string {
 	}
 	return m.pal.faint.Render("ACCOUNTS") + "\n" + strings.Join(fitted, "\n")
 }
+
+// railCredentialLine is the crew rail's per-run token CHOICE + pending-switch line (PRD #1247 M8):
+// one physical line naming the override the owner chose for this run and any held-state switch in
+// flight. It is drawn INDEPENDENTLY of the ACCOUNTS block's isRun branch (railRateMeters), so a
+// QUEUED, unclaimed run — which has no AnthropicSecretID and therefore no ACCOUNTS entry at all —
+// STILL shows its override/switch. "" when the run inherits the worker binding with no pending
+// switch (credential_override null AND credential_switch null), so the common case adds no line.
+//
+// usedRows budgets it whole-line-or-nothing against the remaining rail height, the same arithmetic
+// renderSpend/railRateMeters use (the -1 is the blank "\n\n" separator the caller prepends), so a
+// height-clamped rail drops the whole line rather than overflow. renderLaneRail draws it LAST, below
+// ACCOUNTS, so this budget never steals a row from a PRD #1257-protected block above it — the line
+// is best-effort like a sibling ACCOUNTS entry, not part of the protected set railAutoFolded counts.
+func (m tuiModel) railCredentialLine(usedRows int) string {
+	line := m.railCredentialText()
+	if line == "" {
+		return ""
+	}
+	if 1 > m.transcriptViewport()-usedRows-1 {
+		return ""
+	}
+	return line
+}
+
+// railCredentialText builds the faint token-choice line, or "" when there is no override and no
+// pending switch. The pinned override's label is USER-AUTHORED and drawn through renderer.Plain
+// (D7), never raw; the mode/switch words are server enums rendered honestly (an unrecognised value
+// still rides Plain rather than reaching the frame raw). The override and any switch are joined with
+// " · " onto one line ("token: <label> (run-pinned) · switch requested").
+func (m tuiModel) railCredentialText() string {
+	var parts []string
+	if co := m.detail.run.CredentialOverride; co != nil {
+		parts = append(parts, "token: "+m.railOverrideMode(co))
+	}
+	if sw := m.detail.run.CredentialSwitch; sw != nil && *sw != "" {
+		switch *sw {
+		case "requested":
+			parts = append(parts, "switch requested")
+		case "released":
+			parts = append(parts, "switch released")
+		default:
+			parts = append(parts, "switch "+m.renderer.Plain(*sw, laneRailWidth))
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return m.pal.faint.Render(strings.Join(parts, " · "))
+}
+
+// railOverrideMode renders a per-run credential override's mode for the crew rail: a pinned override
+// names its snapshotted label + the run-pinned reason ("<label> (run-pinned)"), auto/default name the
+// mode. The label rides renderer.Plain (D7 — it is the CredentialOverride.Label the "Label" guard
+// entry covers). A pinned override whose label is gone (deleted token) drops to "run-pinned"; an
+// unrecognised mode rides Plain too rather than reaching the frame raw.
+func (m tuiModel) railOverrideMode(co *apitypes.CredentialOverrideDTO) string {
+	switch co.Mode {
+	case "pinned":
+		if co.Label != nil && *co.Label != "" {
+			return m.renderer.Plain(*co.Label, laneRailWidth) + " (run-pinned)"
+		}
+		return "run-pinned"
+	case "auto":
+		return "auto"
+	case "default":
+		return "default"
+	default:
+		return m.renderer.Plain(co.Mode, laneRailWidth)
+	}
+}

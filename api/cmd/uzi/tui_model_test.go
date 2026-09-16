@@ -800,6 +800,15 @@ func TestTUIViewsStripControlBytesFromUntrustedText(t *testing.T) {
 	// distinct "milesafe" tail, so only railMilestoneAgentLines' render of MilestoneAgent.AgentLabel
 	// can put it in the frame (the title yields "safe", the account label "credsafe").
 	hostileMileLabel := "\x1b[2J\u202E\x07\x01milesafe"
+	// A hostile per-run CredentialOverride.Label (PRD #1247 M8) exercises the crew rail's new
+	// token-choice line (railCredentialLine \u2192 railOverrideMode \u2192 renderer.Plain). Its "ovrsafe"
+	// tail differs from every other marker so only THAT render path can put it in the frame.
+	hostileOverrideLabel := "\x1b[2J\u202E\x07\x01ovrsafe"
+	// A hostile CredentialEpoch.Label is set as a NON-LEAK guard: the TUI does not render epoch
+	// history (that is a CLI-only surface, proven sanitized by TestRenderRunDetailCredentialOverrideSanitizes),
+	// so its "epochsafe" tail must NOT appear in the frame and assertNoRawControls must still pass \u2014
+	// a tripwire for anyone later wiring epochs into the TUI without a sanitizer.
+	hostileEpochLabel := "\x1b[2J\u202E\x07\x01epochsafe"
 	// A hostile milestone title exercises renderMilestones' crew-rail draw (D7): the
 	// in-progress id makes the row render its title through renderer.Plain. The hostile
 	// AnthropicSecretLabel exercises the detail rail ACCOUNTS label (railRateMeters →
@@ -817,7 +826,15 @@ func TestTUIViewsStripControlBytesFromUntrustedText(t *testing.T) {
 		// byte-matches current_activity.agent and becomes the D3 unique-matching lane, exercising the
 		// live-age branch; the AgentLabel marker "milesafe" differs from the title's "safe" and the
 		// account label's "credsafe" so its survival proves THIS render path put it in the frame.
-		MilestonesAgents: []apitypes.MilestoneAgent{{ID: "m1", Agent: nasty, AgentLabel: hostileMileLabel}}},
+		MilestonesAgents: []apitypes.MilestoneAgent{{ID: "m1", Agent: nasty, AgentLabel: hostileMileLabel}},
+		// PRD #1247 M8: a pinned override drives the crew rail's token-choice line (its label folded
+		// through renderer.Plain); the epoch history is a hostile CLI-only fixture the TUI must NOT draw.
+		CredentialOverride: &apitypes.CredentialOverrideDTO{Mode: "pinned", Label: &hostileOverrideLabel},
+		CredentialSwitch:   sptr("requested"),
+		CredentialEpochs: []apitypes.CredentialEpochDTO{
+			{ClaimGeneration: 1, Label: &hostileEpochLabel, SelectReason: sptr("run_pinned"), AppliedAt: now},
+			{ClaimGeneration: 2, Label: sptr("backup"), SelectReason: sptr("run_default"), AppliedAt: now},
+		}},
 		[]apitypes.MessageDTO{
 			msgDTO(1, "text", nasty, "toolu_"+nasty, nasty, nasty, now),
 			// A hostile tool_use frame supplies the live current_activity (renderMilestones →
@@ -845,6 +862,20 @@ func TestTUIViewsStripControlBytesFromUntrustedText(t *testing.T) {
 	// the title's "safe" or this assertion is vacuous (the title alone would satisfy it).
 	if !strings.Contains(detailOut, "credsafe") {
 		t.Fatalf("the detail rail is not drawing AnthropicSecretLabel, so this test is not exercising that render path\n%s", detailOut)
+	}
+	// The hostile CredentialOverride.Label sanitizes to "ovrsafe", reachable ONLY via the crew rail's
+	// new token-choice line (railCredentialLine → railOverrideMode → renderer.Plain, PRD #1247 M8) —
+	// the "ovrsafe" tail is distinct from "safe"/"credsafe"/"milesafe" so its survival proves THIS
+	// render path put it in the frame, and assertNoRawControls above proves it folded the hostile bytes.
+	if !strings.Contains(detailOut, "ovrsafe") {
+		t.Fatalf("the crew rail is not drawing CredentialOverride.Label, so this test is not exercising the PRD #1247 override render path\n%s", detailOut)
+	}
+	// The epoch history is a CLI-only surface: its "epochsafe" tail must NOT reach the TUI frame. This
+	// is a non-leak tripwire — assertNoRawControls above catches raw bytes; this catches a future TUI
+	// epoch render added without a sanitizer. (The positive, does-render-and-folds proof for the epoch
+	// label lives in TestRenderRunDetailCredentialOverrideSanitizes, the CLI render test.)
+	if strings.Contains(detailOut, "epochsafe") {
+		t.Fatalf("the TUI drew CredentialEpoch.Label — epochs are a CLI-only surface; a TUI epoch render must go through a sanitizer\n%s", detailOut)
 	}
 
 	// The ADMIN board is the only view that draws OwnerEmail (PRD #325 M2, B1). A hostile
@@ -2466,6 +2497,47 @@ func TestTUIBackgroundColorMsgFlipsPalette(t *testing.T) {
 	}
 	if fgSGR(m.pal.selBg) != fgSGR(newPalette(true).selBg) {
 		t.Errorf("flipped-back selBg %v does not match newPalette(true).selBg %v", m.pal.selBg, newPalette(true).selBg)
+	}
+}
+
+// TestRailCredentialLineAccountlessQueuedRun pins PRD #1247 M8's account-less case: a QUEUED,
+// unclaimed run has NO AnthropicSecretID (so railRateMeters draws no ACCOUNTS entry at all), yet
+// the crew rail must STILL show its per-run token override and any pending switch, because
+// railCredentialLine is drawn INDEPENDENTLY of the ACCOUNTS/isRun branch. renderLaneRail is asserted
+// directly (not View()) so the 26-col joinColumns clamp does not cut the token line's tail.
+func TestRailCredentialLineAccountlessQueuedRun(t *testing.T) {
+	queued := func(run apitypes.RunDTO) string {
+		t.Helper()
+		m := tuiTestModel(t, &uzicli.FakeClient{}, run.ID)
+		m = applyDetail(m, run, nil)
+		return stripANSI(m.renderLaneRail())
+	}
+
+	// A pinned override on a queued run with no account row: the token line still shows.
+	label := "chosen-key"
+	out := queued(apitypes.RunDTO{ID: "run-q", Kind: "issue", Status: "queued",
+		CredentialOverride: &apitypes.CredentialOverrideDTO{Mode: "pinned", Label: &label}})
+	if strings.Contains(out, "ACCOUNTS") {
+		t.Fatalf("a queued unclaimed run must have no ACCOUNTS block; the fixture is not exercising the account-less path\n%s", out)
+	}
+	for _, want := range []string{"token:", "chosen-key", "run-pinned"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("the crew rail dropped the token override %q for an account-less queued run\n%s", want, out)
+		}
+	}
+
+	// A pending switch on an account-less run also surfaces, folded onto the same line as the override.
+	out = queued(apitypes.RunDTO{ID: "run-q2", Kind: "issue", Status: "queued",
+		CredentialOverride: &apitypes.CredentialOverrideDTO{Mode: "auto"},
+		CredentialSwitch:   sptr("requested")})
+	if !strings.Contains(out, "token: auto") || !strings.Contains(out, "switch requested") {
+		t.Fatalf("the crew rail dropped the auto override or pending switch for an account-less queued run\n%s", out)
+	}
+
+	// The common inherit case — no override, no switch — adds no token line (and no stray blank line).
+	out = queued(apitypes.RunDTO{ID: "run-q3", Kind: "issue", Status: "queued"})
+	if strings.Contains(out, "token:") || strings.Contains(out, "switch ") {
+		t.Fatalf("an inheriting run must add no token line to the crew rail\n%s", out)
 	}
 }
 

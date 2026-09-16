@@ -220,6 +220,12 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 	if r.AnthropicSecretLabel != nil && *r.AnthropicSecretLabel != "" {
 		rows = append(rows, []string{"ANTHROPIC_TOKEN", credentialCell(r)})
 	}
+	// The per-run token CHOICE and any in-flight switch (PRD #1247 M8), DISTINCT from the
+	// ANTHROPIC_TOKEN row above: that names the token the run SPENT, this names what the
+	// owner chose for this run and any held-state transition in flight. Emit-only-when-set,
+	// so a run that inherits the worker binding (credential_override null, credential_switch
+	// null, a single-credential history) adds nothing here.
+	rows = append(rows, credentialOverrideRows(r)...)
 	rows = append(rows, limitWaitRows(r, time.Now())...)
 	// The pause block (PRD #1190 M4): a PAUSED row while parked by an owner pause, or a
 	// PAUSE_REQUESTED row while a pause is pending and the run has not yet parked into
@@ -866,6 +872,139 @@ func selectReasonText(reason autoselect.Reason, headroom *int) string {
 		return "run-default"
 	}
 	return string(reason)
+}
+
+// credentialOverrideRows renders `uzi run get`'s per-run token CHOICE, in-flight switch, and
+// applied-switch history (PRD #1247 M8) — the CLI twin of the run view's override/switch chips
+// and epoch journal. It is DISTINCT from the ANTHROPIC_TOKEN (spent) row above: that says which
+// account paid, this says what the owner CHOSE for the run and what transition is in flight.
+//
+// Every row is emit-only-when-set, so a run that inherits the worker binding (credential_override
+// null, credential_switch null) with at most a single credential in its history renders NOTHING —
+// byte-for-byte what it did before this milestone. The TOKEN row folds the override mode and the
+// pending switch onto one row; when only a switch is pending (no override) the switch stands on the
+// TOKEN row alone.
+func credentialOverrideRows(r apitypes.RunDTO) [][]string {
+	var rows [][]string
+	tokenCell := ""
+	if r.CredentialOverride != nil {
+		tokenCell = credentialOverrideCell(r.CredentialOverride)
+	}
+	switchCell := ""
+	if r.CredentialSwitch != nil && *r.CredentialSwitch != "" {
+		switchCell = credentialSwitchText(*r.CredentialSwitch)
+	}
+	switch {
+	case tokenCell != "" && switchCell != "":
+		rows = append(rows, []string{"TOKEN", tokenCell + " · " + switchCell})
+	case tokenCell != "":
+		rows = append(rows, []string{"TOKEN", tokenCell})
+	case switchCell != "":
+		rows = append(rows, []string{"TOKEN", switchCell})
+	}
+	rows = append(rows, credentialEpochRows(r)...)
+	return rows
+}
+
+// credentialOverrideCell renders the mode of a per-run credential override (PRD #1247): a pinned
+// override names its snapshotted token label and the run-pinned reason ("<label> (run-pinned)"),
+// an auto/default override names the mode. The label is USER-AUTHORED and lands in a table cell,
+// so it goes through cellText — the same newline-fold, tab-fold and length cap the ANTHROPIC_TOKEN
+// row relies on to keep a hostile label from breaking the rail. A pinned override whose label has
+// gone (a deleted token) drops to the bare "run-pinned" reason. An UNRECOGNISED mode prints as
+// itself through sanitizeTTY (the API is deployed separately, so a newer server can ship a mode
+// this binary has not heard of; inventing a rendering or dropping it would be worse).
+func credentialOverrideCell(co *apitypes.CredentialOverrideDTO) string {
+	switch co.Mode {
+	case "pinned":
+		if co.Label != nil && *co.Label != "" {
+			return cellText(*co.Label) + " (run-pinned)"
+		}
+		return "run-pinned"
+	case "auto":
+		return "auto"
+	case "default":
+		return "default"
+	default:
+		return sanitizeTTY(co.Mode)
+	}
+}
+
+// credentialSwitchText renders the state of a pending held-state credential switch (PRD #1247
+// D14): a "requested" switch was stamped but not yet released; a "released" switch handed the
+// token back and is awaiting the worker's reclaim. An UNRECOGNISED value prints as itself through
+// sanitizeTTY, the same pass-through-the-unknown stance the mode cell and selectReasonText take.
+func credentialSwitchText(s string) string {
+	switch s {
+	case "requested":
+		return "switch requested"
+	case "released":
+		return "switch released, awaiting reclaim"
+	default:
+		return "switch " + sanitizeTTY(s)
+	}
+}
+
+// credentialEpochRows renders the applied-switch history of `uzi run get` (PRD #1247 M8, D7): a
+// TOKEN_HISTORY header plus one indented row per claim generation (oldest first), each naming the
+// token that generation spent, why, and when. It is emitted ONLY when the history names MORE THAN
+// ONE distinct credential — i.e. an applied switch actually changed the token, not a plain reclaim
+// of the same token across a resume — so a single-credential run adds nothing (the ANTHROPIC_TOKEN
+// row already names the one token it spent).
+//
+// Each epoch label is snapshotted USER-AUTHORED text and lands in a table cell, so it goes through
+// cellText like the ANTHROPIC_TOKEN row; a generation whose token was deleted (null label) reads
+// "(deleted)". The select_reason reuses selectReasonText (the same mode vocabulary the spent-token
+// row uses), and applied_at renders as a UTC RFC3339 timestamp exactly like LIMIT_RESETS_AT.
+func credentialEpochRows(r apitypes.RunDTO) [][]string {
+	if !credentialHistoryHasSwitch(r.CredentialEpochs) {
+		return nil
+	}
+	rows := make([][]string, 0, len(r.CredentialEpochs)+1)
+	rows = append(rows, []string{"TOKEN_HISTORY", itoa(len(r.CredentialEpochs)) + " claims"})
+	for _, e := range r.CredentialEpochs {
+		rows = append(rows, []string{"  gen " + strconv.FormatInt(e.ClaimGeneration, 10), credentialEpochCell(e)})
+	}
+	return rows
+}
+
+// credentialHistoryHasSwitch reports whether the epoch history names more than one DISTINCT
+// credential — the signal that an applied switch changed the token, as opposed to the same token
+// being reclaimed across a resume (which still mints a fresh claim generation, D7). Distinctness is
+// keyed on the snapshotted label; two generations that both lost their label (deleted tokens) cannot
+// be told apart and so count as one, the honest reading when the data cannot prove a switch.
+func credentialHistoryHasSwitch(epochs []apitypes.CredentialEpochDTO) bool {
+	if len(epochs) < 2 {
+		return false
+	}
+	seen := make(map[string]bool, len(epochs))
+	for _, e := range epochs {
+		key := "\x00nil" // a sentinel distinct from any real label so nil groups together
+		if e.Label != nil {
+			key = *e.Label
+		}
+		seen[key] = true
+		if len(seen) > 1 {
+			return true
+		}
+	}
+	return false
+}
+
+// credentialEpochCell renders one claim generation's credential attribution: "<label> — <reason> ·
+// <applied_at>". The label goes through cellText (USER-AUTHORED, table cell); a null label reads
+// "(deleted)". The reason reuses selectReasonText with no headroom (epochs carry none); a null/empty
+// reason drops the "— <reason>" clause rather than render a bare em dash.
+func credentialEpochCell(e apitypes.CredentialEpochDTO) string {
+	label := "(deleted)"
+	if e.Label != nil && *e.Label != "" {
+		label = cellText(*e.Label)
+	}
+	cell := label
+	if e.SelectReason != nil && *e.SelectReason != "" {
+		cell += " — " + selectReasonText(autoselect.Reason(*e.SelectReason), nil)
+	}
+	return cell + " · " + e.AppliedAt.UTC().Format(time.RFC3339)
 }
 
 // renderMessage prints one run message. In --json mode it emits one compact JSON
