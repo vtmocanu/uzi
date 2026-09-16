@@ -108,6 +108,26 @@ func TestParseWorkerOutboxPerEntryDrops(t *testing.T) {
 	}
 }
 
+func TestParseWorkerOutboxWrongTypedEntryDropsOnlyThatEntry(t *testing.T) {
+	wid := uuid.New()
+	good := uuid.New()
+	// A wrong-typed element must fail only its OWN per-entry decode, not abort the whole
+	// array and discard the valid sibling with it. Here run_id is a JSON number and
+	// blocked_reason is a JSON object — both are type errors against the entry struct.
+	raw := `[
+	  {"run_id":123,"pending_messages":1,"pending_terminal":0,"stale_retired":0,"since":1},
+	  {"run_id":"` + uuid.New().String() + `","pending_messages":1,"pending_terminal":0,"stale_retired":0,"blocked_reason":{},"since":1},
+	  {"run_id":"` + good.String() + `","pending_messages":4,"pending_terminal":0,"stale_retired":0,"since":100}
+	]`
+	out := parseWorkerOutbox(json.RawMessage(raw), wid)
+	if len(out) != 1 {
+		t.Fatalf("len = %d, want 1: a numeric run_id and an object blocked_reason each drop only THAT entry, not the whole report", len(out))
+	}
+	if out[0].RunID != good || out[0].PendingMessages != 4 {
+		t.Fatalf("survivor = %+v, want the one valid entry (%s, pending 4)", out[0], good)
+	}
+}
+
 func TestParseWorkerOutboxSanitizesBlockedReason(t *testing.T) {
 	wid := uuid.New()
 	r := uuid.New()

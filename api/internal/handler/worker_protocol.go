@@ -439,11 +439,12 @@ const (
 //
 // Drop granularity, chosen deliberately (see parseWorkerStats' two precedents — the
 // coarse whole-object drop and the granular per-disk-field drop):
-//   - WHOLE-REPORT drop: the byte cap, the entry-count cap, and a top-level malformed
-//     array — none of these can be trusted to bound anything.
-//   - PER-ENTRY drop: a bad run_id, a negative/absurd count, or an invalid `since`
-//     drops only that one entry (the rest of a valid report still lands), because one
-//     bad entry proves nothing about the others.
+//   - WHOLE-REPORT drop: the byte cap, the entry-count cap, and a top-level non-array
+//     (the outer []json.RawMessage decode fails) — none of these can be trusted to
+//     bound anything.
+//   - PER-ENTRY drop: a wrong-typed entry (its own typed Unmarshal fails), a bad run_id,
+//     a negative/absurd count, or an invalid `since` drops only that one entry (the rest
+//     of a valid report still lands), because one bad entry proves nothing about the others.
 func parseWorkerOutbox(raw json.RawMessage, workerID uuid.UUID) []workersvc.OutboxEntry {
 	if len(raw) == 0 || string(raw) == "null" {
 		return nil // no outbox on this tick (older worker, feature off, or drained → clears)
@@ -456,26 +457,34 @@ func parseWorkerOutbox(raw json.RawMessage, workerID uuid.UUID) []workersvc.Outb
 	if len(raw) > maxOutboxReportBytes {
 		return drop("oversize")
 	}
-	// Counts and `since` decode as *json.Number, NOT typed ints, so a float / overflow
-	// / non-integer value fails HERE per-entry (converted below) instead of aborting the
-	// whole array Unmarshal and discarding every valid entry with it — the same reason
+	// Decode the TOP LEVEL into []json.RawMessage first, then each element into the typed
+	// per-entry struct below. Only a top-level shape error (not a JSON array) is a
+	// whole-report "malformed" drop; a WRONG-TYPED element (e.g. a numeric run_id or an
+	// object-valued blocked_reason) fails only its own per-entry Unmarshal and drops just
+	// that entry — a single typed field must never abort the whole array and discard every
+	// valid entry with it. Counts and `since` likewise decode as *json.Number so a float /
+	// overflow / non-integer value fails per-entry (converted below), the same reason
 	// parseWorkerStats decodes its disk fields as *json.Number.
-	var items []struct {
-		RunID           string       `json:"run_id"`
-		PendingMessages *json.Number `json:"pending_messages"`
-		PendingTerminal *json.Number `json:"pending_terminal"`
-		StaleRetired    *json.Number `json:"stale_retired"`
-		BlockedReason   string       `json:"blocked_reason"`
-		Since           *json.Number `json:"since"`
-	}
-	if err := json.Unmarshal(raw, &items); err != nil {
+	var rawItems []json.RawMessage
+	if err := json.Unmarshal(raw, &rawItems); err != nil {
 		return drop("malformed")
 	}
-	if len(items) > maxOutboxEntries {
+	if len(rawItems) > maxOutboxEntries {
 		return drop("too many entries")
 	}
-	out := make([]workersvc.OutboxEntry, 0, len(items))
-	for _, it := range items {
+	out := make([]workersvc.OutboxEntry, 0, len(rawItems))
+	for _, rawItem := range rawItems {
+		var it struct {
+			RunID           string       `json:"run_id"`
+			PendingMessages *json.Number `json:"pending_messages"`
+			PendingTerminal *json.Number `json:"pending_terminal"`
+			StaleRetired    *json.Number `json:"stale_retired"`
+			BlockedReason   string       `json:"blocked_reason"`
+			Since           *json.Number `json:"since"`
+		}
+		if err := json.Unmarshal(rawItem, &it); err != nil {
+			continue // wrong-typed entry → drop only this entry
+		}
 		id, err := uuid.Parse(it.RunID)
 		if err != nil {
 			continue // bad run_id → drop only this entry
