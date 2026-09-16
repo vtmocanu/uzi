@@ -8,7 +8,8 @@ import type { JudgeRunner } from "./judge-runner.js";
 import type { ReviewRunner } from "./review-runner.js";
 import type { Logger } from "./log.js";
 import type { Config } from "./config.js";
-import type { OutboxHeartbeatEntry, WorkerStats } from "./protocol.js";
+import type { ActiveSnapshot, OutboxHeartbeatEntry, WorkerStats } from "./protocol.js";
+import type { ActiveRunRegistry } from "./active-run-registry.js";
 import { StatsCollector } from "./stats.js";
 import { errMessage, sleep } from "./util.js";
 import { toolchainPreflight, type PreflightResult } from "./toolchain-preflight.js";
@@ -51,6 +52,12 @@ export class Worker {
     // segments; the drainer calls the hook once the run's segments retire so the live
     // batcher returns its flush target to the network.
     private readonly rearm?: Map<string, () => void>,
+    // PRD #1390 M2a: the shared active-run registry the run lane + judge/review runners
+    // write as they start/transition/finish. The worker READS it to build the
+    // ActiveSnapshot that rides every heartbeat and run-lane claim. Undefined in the
+    // concurrency/semaphore unit tests that never negotiate the feature — buildActiveSnapshot
+    // then returns undefined and no snapshot is ever sent.
+    private readonly activeRuns?: ActiveRunRegistry,
   ) {}
 
   /** PRD #1391 M2: single-flight guard — never two outbox drains at once (a heartbeat
@@ -210,7 +217,9 @@ export class Worker {
         // client sends the array only when the server negotiated `heartbeat_outbox`,
         // so an older api sees a byte-identical heartbeat. Assembled BEFORE the send so
         // the first recovered heartbeat carries the depth ahead of that tick's drain.
-        await this.client.heartbeat(this.collectStats(stats), this.outboxEntries());
+        // PRD #1390 M2a: the active-run snapshot rides the same send (built here so its
+        // epoch is drawn from the ONE monotonic counter the claim loop also draws from).
+        await this.client.heartbeat(this.collectStats(stats), this.outboxEntries(), this.buildActiveSnapshot());
         ok = true;
       } catch (err) {
         this.log.warn("heartbeat failed", { error: errMessage(err) });
@@ -255,6 +264,20 @@ export class Worker {
       });
     }
     return entries.length > 0 ? entries : undefined;
+  }
+
+  /**
+   * PRD #1390 M2a: build the active-run snapshot the heartbeat and the run-lane claim
+   * both carry, from the shared {@link ActiveRunRegistry}. Returns undefined — so no
+   * snapshot is sent and no epoch is spent — unless the registry exists AND the server
+   * negotiated `active_run_snapshot`. Both loops call this, so their `snapshot_epoch`
+   * values come from the ONE monotonic counter the registry owns. The client stamps the
+   * register nonce on send.
+   */
+  private buildActiveSnapshot(): ActiveSnapshot | undefined {
+    if (!this.activeRuns) return undefined;
+    if (!this.client.hasFeature("active_run_snapshot")) return undefined;
+    return this.activeRuns.build();
   }
 
   /**
@@ -343,7 +366,10 @@ export class Worker {
       loggedAtCapacity = false;
       let claimed = false;
       try {
-        const claim = await this.client.claimRun();
+        // PRD #1390 M2a: carry the active-run snapshot on the claim (built from the SAME
+        // monotonic epoch counter the heartbeat draws from) so the api's pre-claim dedupe
+        // sees this worker's live runs even before the first post-outage heartbeat lands.
+        const claim = await this.client.claimRun(this.buildActiveSnapshot());
         if (claim) {
           claimed = true;
           // PRD #400 M4b: a DIFF-REVIEW claim is a `task`-kind claim carrying a non-null

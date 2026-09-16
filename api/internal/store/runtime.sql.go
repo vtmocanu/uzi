@@ -2290,6 +2290,32 @@ func (q *Queries) CreateWorker(ctx context.Context, arg CreateWorkerParams) (Wor
 	return i, err
 }
 
+const deleteOrdinaryWorkerActiveRunsNotIn = `-- name: DeleteOrdinaryWorkerActiveRunsNotIn :execrows
+DELETE FROM worker_active_runs
+WHERE worker_id = $1
+  AND terminal_pending = false
+  AND run_id <> ALL($2::uuid[])
+`
+
+type DeleteOrdinaryWorkerActiveRunsNotInParams struct {
+	WorkerID   uuid.UUID   `json:"worker_id"`
+	KeepRunIds []uuid.UUID `json:"keep_run_ids"`
+}
+
+// Register-path delete (PRD #1390 M2a): remove only ORDINARY (terminal_pending = false) rows
+// whose run is not in the register-carried snapshot, PRESERVING every row under a
+// terminal-pending lease (its generation is what protects #1391's boot replay from the orphan
+// pass that follows). @keep_run_ids is the snapshot's run-id set; an empty set deletes every
+// ordinary row (a register with no listed live attempts). The kept rows are re-upserted right
+// after, so this only removes ordinary rows the snapshot no longer names.
+func (q *Queries) DeleteOrdinaryWorkerActiveRunsNotIn(ctx context.Context, arg DeleteOrdinaryWorkerActiveRunsNotInParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteOrdinaryWorkerActiveRunsNotIn, arg.WorkerID, arg.KeepRunIds)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const deleteRunUsage = `-- name: DeleteRunUsage :exec
 DELETE FROM run_usage WHERE run_id = $1
 `
@@ -2300,6 +2326,24 @@ DELETE FROM run_usage WHERE run_id = $1
 func (q *Queries) DeleteRunUsage(ctx context.Context, runID uuid.UUID) error {
 	_, err := q.db.Exec(ctx, deleteRunUsage, runID)
 	return err
+}
+
+const deleteWorkerActiveRuns = `-- name: DeleteWorkerActiveRuns :execrows
+
+DELETE FROM worker_active_runs WHERE worker_id = $1
+`
+
+// Worker active-run snapshot (PRD #1390 M2a) --------------------------------
+// Full-replacement delete for the heartbeat/claim snapshot path (D3): drop every row of the
+// worker before re-inserting the validated set, so an attempt that ended (dropped from the
+// snapshot) leaves no row behind. Register uses DeleteOrdinaryWorkerActiveRunsNotIn instead,
+// because it must PRESERVE leased rows across a restart.
+func (q *Queries) DeleteWorkerActiveRuns(ctx context.Context, workerID uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteWorkerActiveRuns, workerID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const deleteWorkerForUser = `-- name: DeleteWorkerForUser :execrows
@@ -4158,6 +4202,60 @@ SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, create
 // Worker auth: Bearer join token → sha256 → this lookup.
 func (q *Queries) GetWorkerByTokenHash(ctx context.Context, tokenHash []byte) (Worker, error) {
 	row := q.db.QueryRow(ctx, getWorkerByTokenHash, tokenHash)
+	var i Worker
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.Name,
+		&i.TokenHash,
+		&i.Status,
+		&i.LastHeartbeatAt,
+		&i.Version,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.TemplateDeclared,
+		&i.TemplateReported,
+		&i.MaxConcurrentRuns,
+		&i.StatsCpuPct,
+		&i.StatsMemBytes,
+		&i.StatsMemLimitBytes,
+		&i.StatsSource,
+		&i.Kind,
+		&i.HostedSize,
+		&i.HostedGeneration,
+		&i.DockerEnabled,
+		&i.AnthropicSecretID,
+		&i.AnthropicBindMode,
+		&i.OnlineSince,
+		&i.DrainingSince,
+		&i.Capabilities,
+		&i.Ephemeral,
+		&i.EphemeralRunID,
+		&i.StatsDiskNixBytes,
+		&i.StatsDiskNixTotalBytes,
+		&i.StatsDiskDataBytes,
+		&i.StatsDiskDataTotalBytes,
+		&i.StatsDiskPressureStreak,
+		&i.ProtocolCapabilities,
+		&i.SnapshotEpoch,
+		&i.SnapshotRegisterNonce,
+		&i.PendingOverflow,
+		&i.PendingOverflowUntil,
+	)
+	return i, err
+}
+
+const getWorkerForUpdate = `-- name: GetWorkerForUpdate :one
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until FROM workers WHERE id = $1 FOR UPDATE
+`
+
+// PRD #1390 M2a: lock the worker row FOR UPDATE at the top of the Register transaction, in
+// the canonical worker-row lock order shared with the stale-worker passes' `locked` CTE and
+// with HeartbeatWorker's own UPDATE. Holding it across the nonce rotation + snapshot persist +
+// orphan fail/requeue is what serialises Register against a concurrent heartbeat or stale
+// sweep, so a run's D11 lease is read against a settled snapshot rather than a torn one.
+func (q *Queries) GetWorkerForUpdate(ctx context.Context, id uuid.UUID) (Worker, error) {
+	row := q.db.QueryRow(ctx, getWorkerForUpdate, id)
 	var i Worker
 	err := row.Scan(
 		&i.ID,
@@ -7644,6 +7742,14 @@ WITH prev AS (
         -- before the poll re-derives disk_pressure. (Distinct from HeartbeatWorker's
         -- increment/reset CASE: this is reset-on-action, unconditional.)
         stats_disk_pressure_streak = 0,
+        -- PRD #1390 M2a: rotate the register nonce every snapshot must echo and RESET the
+        -- snapshot epoch to 0 under it (D3). A fresh worker process starts its epoch at 1, so
+        -- resetting to 0 here means its very first post-register snapshot (epoch 1) is accepted
+        -- while any delayed high-epoch snapshot from the PREVIOUS process is rejected by the
+        -- now-stale nonce — not by epoch. The nonce must live on the row (not in memory)
+        -- because it is checked exactly when an api restart has forgotten everything else.
+        snapshot_register_nonce = $7,
+        snapshot_epoch      = 0,
         last_heartbeat_at   = now(),
         updated_at          = now()
     WHERE workers.id = $1
@@ -7703,12 +7809,13 @@ SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, create
 `
 
 type RegisterWorkerParams struct {
-	ID                   uuid.UUID   `json:"id"`
-	Version              pgtype.Text `json:"version"`
-	TemplateReported     pgtype.Text `json:"template_reported"`
-	Capabilities         []string    `json:"capabilities"`
-	ProtocolCapabilities []string    `json:"protocol_capabilities"`
-	MaxConcurrentRuns    pgtype.Int4 `json:"max_concurrent_runs"`
+	ID                    uuid.UUID   `json:"id"`
+	Version               pgtype.Text `json:"version"`
+	TemplateReported      pgtype.Text `json:"template_reported"`
+	Capabilities          []string    `json:"capabilities"`
+	ProtocolCapabilities  []string    `json:"protocol_capabilities"`
+	MaxConcurrentRuns     pgtype.Int4 `json:"max_concurrent_runs"`
+	SnapshotRegisterNonce pgtype.Text `json:"snapshot_register_nonce"`
 }
 
 type RegisterWorkerRow struct {
@@ -7806,6 +7913,7 @@ func (q *Queries) RegisterWorker(ctx context.Context, arg RegisterWorkerParams) 
 		arg.Capabilities,
 		arg.ProtocolCapabilities,
 		arg.MaxConcurrentRuns,
+		arg.SnapshotRegisterNonce,
 	)
 	var i RegisterWorkerRow
 	err := row.Scan(
@@ -8062,7 +8170,7 @@ func (q *Queries) RequeueRunsOfStaleWorkers(ctx context.Context, arg RequeueRuns
 	return items, nil
 }
 
-const requeueWorkerRuns = `-- name: RequeueWorkerRuns :execrows
+const requeueWorkerRuns = `-- name: RequeueWorkerRuns :many
 UPDATE runs SET status = 'queued', status_since = now(), requeue_count = requeue_count + 1,
     -- Exit contract (PRD #47 Decision 3): reset on the way back to 'queued'; the
     -- detector re-evaluates the queued signal from this transition's status_since.
@@ -8093,6 +8201,7 @@ WHERE runs.worker_id = $1
                          AND a.claim_generation = runs.claim_generation)
            AND NOT EXISTS (SELECT 1 FROM workers w
                            WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
+RETURNING id
 `
 
 type RequeueWorkerRunsParams struct {
@@ -8102,12 +8211,28 @@ type RequeueWorkerRunsParams struct {
 
 // Within budget → re-queued to this same worker (affinity), which then re-claims
 // and resumes from the persisted session (handles docker compose down && up).
-func (q *Queries) RequeueWorkerRuns(ctx context.Context, arg RequeueWorkerRunsParams) (int64, error) {
-	result, err := q.db.Exec(ctx, requeueWorkerRuns, arg.WorkerID, arg.MaxRequeues)
+//
+// PRD #1390 M2a: RETURNING id so Register can publish each requeue transition post-commit
+// (via publishSwept) exactly as the sweeper's RequeueRunsOfStaleWorkers twin already does —
+// closing the gap where a register-time requeue reached no live channel.
+func (q *Queries) RequeueWorkerRuns(ctx context.Context, arg RequeueWorkerRunsParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, requeueWorkerRuns, arg.WorkerID, arg.MaxRequeues)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	return result.RowsAffected(), nil
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const resumePausedRun = `-- name: ResumePausedRun :one
@@ -10459,6 +10584,42 @@ func (q *Queries) SetWorkerAnthropicSecret(ctx context.Context, arg SetWorkerAnt
 	return i, err
 }
 
+const setWorkerSnapshotState = `-- name: SetWorkerSnapshotState :execrows
+UPDATE workers SET
+    snapshot_epoch         = $1,
+    pending_overflow       = $2,
+    pending_overflow_until = CASE WHEN $2::boolean
+                                  THEN now() + make_interval(secs => $3::int)
+                                  ELSE NULL END,
+    updated_at             = now()
+WHERE id = $4
+`
+
+type SetWorkerSnapshotStateParams struct {
+	SnapshotEpoch   int64     `json:"snapshot_epoch"`
+	PendingOverflow bool      `json:"pending_overflow"`
+	LeaseSeconds    int32     `json:"lease_seconds"`
+	ID              uuid.UUID `json:"id"`
+}
+
+// Apply the snapshot's worker-row effects (PRD #1390 M2a): advance snapshot_epoch to the
+// accepted snapshot's epoch and set the pending_overflow closure. A flagged snapshot stamps
+// pending_overflow_until = now() + the lease (the worker-level stand-in for the row-level
+// leases it could not express, D11); an unflagged one clears both, which is what a valid
+// unflagged snapshot uses to reopen claiming before expiry.
+func (q *Queries) SetWorkerSnapshotState(ctx context.Context, arg SetWorkerSnapshotStateParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setWorkerSnapshotState,
+		arg.SnapshotEpoch,
+		arg.PendingOverflow,
+		arg.LeaseSeconds,
+		arg.ID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const settleScopeInputDisposition = `-- name: SettleScopeInputDisposition :execrows
 UPDATE run_user_inputs SET disposition = $1
 WHERE run_id = $2 AND kind = 'scope' AND disposition IS NULL
@@ -11032,4 +11193,59 @@ func (q *Queries) UpsertRunUsage(ctx context.Context, arg UpsertRunUsageParams) 
 		arg.CostStatus,
 	)
 	return err
+}
+
+const upsertWorkerActiveRun = `-- name: UpsertWorkerActiveRun :execrows
+INSERT INTO worker_active_runs (
+    worker_id, run_id, claim_generation, phase,
+    terminal_pending, terminal_pending_until, snapshot_epoch, reported_at
+)
+SELECT $1, $2, $3, $4,
+       $5,
+       CASE WHEN $5::boolean
+            THEN now() + make_interval(secs => $6::int)
+            ELSE NULL END,
+       $7, now()
+WHERE EXISTS (SELECT 1 FROM runs r WHERE r.id = $2 AND r.worker_id = $1)
+ON CONFLICT (worker_id, run_id) DO UPDATE SET
+    claim_generation       = EXCLUDED.claim_generation,
+    phase                  = EXCLUDED.phase,
+    terminal_pending       = EXCLUDED.terminal_pending,
+    terminal_pending_until = EXCLUDED.terminal_pending_until,
+    snapshot_epoch         = EXCLUDED.snapshot_epoch,
+    reported_at            = EXCLUDED.reported_at
+`
+
+type UpsertWorkerActiveRunParams struct {
+	WorkerID        uuid.UUID `json:"worker_id"`
+	RunID           uuid.UUID `json:"run_id"`
+	ClaimGeneration int64     `json:"claim_generation"`
+	Phase           string    `json:"phase"`
+	TerminalPending bool      `json:"terminal_pending"`
+	LeaseSeconds    int32     `json:"lease_seconds"`
+	SnapshotEpoch   int64     `json:"snapshot_epoch"`
+}
+
+// Insert (or replace) one validated snapshot entry, OWNERSHIP-ENFORCED in SQL (D3): the row is
+// written only when the run is actually `worker_id = @worker_id`, so a buggy or hostile worker
+// can never describe — and thereby suppress a sibling's claim on, or lease — a run it does not
+// own. An entry that fails the EXISTS is silently dropped (0 rows affected); the Go caller logs
+// it. terminal_pending_until is stamped now() + the lease for a pending entry and NULL for a
+// live one; reported_at is this snapshot's capture time (now()), which ClaimRun's freshness
+// test reads. ON CONFLICT keeps the (worker_id, run_id) primary key a full upsert so the
+// register path's preserved-then-re-listed rows refresh cleanly.
+func (q *Queries) UpsertWorkerActiveRun(ctx context.Context, arg UpsertWorkerActiveRunParams) (int64, error) {
+	result, err := q.db.Exec(ctx, upsertWorkerActiveRun,
+		arg.WorkerID,
+		arg.RunID,
+		arg.ClaimGeneration,
+		arg.Phase,
+		arg.TerminalPending,
+		arg.LeaseSeconds,
+		arg.SnapshotEpoch,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }

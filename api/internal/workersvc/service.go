@@ -807,7 +807,9 @@ type Store interface {
 	FailRunsOfStaleWorkersOverCap(ctx context.Context, arg store.FailRunsOfStaleWorkersOverCapParams) ([]store.FailRunsOfStaleWorkersOverCapRow, error)
 	RequeueRunsOfStaleWorkers(ctx context.Context, arg store.RequeueRunsOfStaleWorkersParams) ([]store.RequeueRunsOfStaleWorkersRow, error)
 	FailWorkerRunsOverCap(ctx context.Context, arg store.FailWorkerRunsOverCapParams) ([]uuid.UUID, error)
-	RequeueWorkerRuns(ctx context.Context, arg store.RequeueWorkerRunsParams) (int64, error)
+	// RequeueWorkerRuns returns the re-queued run ids (PRD #1390 M2a) so Register can publish
+	// each transition post-commit, mirroring the sweeper's RequeueRunsOfStaleWorkers twin.
+	RequeueWorkerRuns(ctx context.Context, arg store.RequeueWorkerRunsParams) ([]uuid.UUID, error)
 
 	// Run-health detector (PRD #47): the per-tick active-run scan, the per-running-run
 	// tool window (loop + in-flight), the single health writer, and the queued-run
@@ -1123,6 +1125,22 @@ type Params struct {
 	// as today. 0 (the zero value) means "immediate" — today's behaviour — so a Params literal
 	// that omits it is a safe no-op. Mirrored from config; the default lives in config.go.
 	SweeperBootGrace time.Duration
+	// TerminalPendingLease (PRD #1390 M2a, D11, TERMINAL_PENDING_LEASE) is the lifetime of a
+	// terminal-pending lease and of the pending_overflow closure, mirrored from config.
+	// ReplaceWorkerActiveRuns stamps `terminal_pending_until = now() + TerminalPendingLease` on
+	// every terminal_pending entry (and `pending_overflow_until` likewise). The zero value is a
+	// safe no-op (a lease of 0 is already expired, so nothing is protected — degraded, never
+	// wrong); the positive default lives in config.go.
+	TerminalPendingLease time.Duration
+	// ActiveSnapshotMaxEntries (PRD #1390 M2a, ACTIVE_SNAPSHOT_MAX_ENTRIES) is the absolute
+	// server ceiling on a snapshot's entry count, mirrored from config. A snapshot above it is
+	// rejected as invalid. The zero value would reject every non-empty snapshot; the positive
+	// default lives in config.go.
+	ActiveSnapshotMaxEntries int
+	// WorkerOutboxMaxPending (PRD #1390 M2a / #1391, WORKER_OUTBOX_MAX_PENDING) caps the
+	// terminal_pending=true entries in one snapshot, mirrored from config. A worker beyond it
+	// sets pending_overflow. The default lives in config.go.
+	WorkerOutboxMaxPending int
 	// SkillMaxBytes / SkillsMaxPerRun are the skill caps (PRD #16), mirrored from
 	// config. SkillsMaxPerRun bounds the per-run union at claim assembly; both ride
 	// the claim so the worker enforces the same limits (no server/worker drift).
@@ -1669,29 +1687,21 @@ func New(q Store, box *secretbox.Box, p Params) *Service {
 // awaiting_input forever, pointing at execution that no longer exists, with its
 // worker-held answer deadline gone and no user-visible signal — on the ordinary
 // restart path this comment already names.
-func (s *Service) Register(ctx context.Context, wkr store.Worker, version, template string, maxConcurrentRuns *int, capabilities []string, protocolCapabilities []string) (store.Worker, error) {
-	max := int32(s.p.RunMaxRequeues) //nolint:gosec // G115: RunMaxRequeues is a small bounded config int (env RUN_MAX_REQUEUES), never near int32 range
-	orphanFailed, err := s.q.FailWorkerRunsOverCap(ctx, store.FailWorkerRunsOverCapParams{
-		FailureReason: pgconv.TextOrNull("worker restarted; run orphaned and out of re-queue budget"),
-		WorkerID:      pgconv.UUID(wkr.ID),
-		MaxRequeues:   max,
-	})
+//
+// PRD #1390 M2a runs the whole of Register in ONE transaction (canonical worker-row lock
+// order): mint + persist a fresh register nonce and reset the snapshot epoch, persist any
+// register-carried snapshot (ownership-validated, preserving leased rows) BEFORE the orphan
+// pass so the D11 lease predicate reads a settled snapshot, then run the orphan fail/requeue
+// pass, commit, and only THEN publish each transition and judge the failures. It returns the
+// nonce so the handler can echo it in the register response. When no transaction beginner is
+// wired (unit tests with a fake store), it degrades to the tx-less path: no worker-row lock and
+// no snapshot persist — a fake store never carries a snapshot.
+func (s *Service) Register(ctx context.Context, wkr store.Worker, version, template string, maxConcurrentRuns *int, capabilities []string, protocolCapabilities []string, snapshot *ActiveSnapshot) (store.Worker, string, error) {
+	nonce, err := mintSnapshotNonce()
 	if err != nil {
-		return store.Worker{}, err
+		return store.Worker{}, "", err
 	}
-	// PRD #46 Decision 2: these orphaned-over-cap runs just committed to 'failed'
-	// (worker lost) — the same worker-lost runs the sweeper's identical
-	// FailRunsOfStaleWorkersOverCap funnels into the judge. Funnel them here too.
-	// Best-effort, gated inside; never fails the register.
-	for _, id := range orphanFailed {
-		s.maybeEnqueueJudgeByID(ctx, id)
-	}
-	if _, err := s.q.RequeueWorkerRuns(ctx, store.RequeueWorkerRunsParams{
-		WorkerID:    pgconv.UUID(wkr.ID),
-		MaxRequeues: max,
-	}); err != nil {
-		return store.Worker{}, err
-	}
+	max := int32(s.p.RunMaxRequeues) //nolint:gosec // G115: RunMaxRequeues is a small bounded config int (env RUN_MAX_REQUEUES), never near int32 range
 	// template is the worker's self-reported image template (PRD #18); empty →
 	// NULL (older image sends none). Soft signal only; never rejected here.
 	// maxConcurrentRuns is the worker's advertised concurrency cap (PRD #42); nil →
@@ -1715,20 +1725,105 @@ func (s *Service) Register(ctx context.Context, wkr store.Worker, version, templ
 	// fresh-start signal), so a downgraded image that stops reporting the protocol loses
 	// it here — which correctly makes it unable to claim an interlocked run.
 	protocolCaps := capability.FilterProtocol(protocolCapabilities)
-	row, err := s.q.RegisterWorker(ctx, store.RegisterWorkerParams{
-		Version:              pgconv.TextOrNull(version),
-		TemplateReported:     pgconv.TextOrNull(template),
-		Capabilities:         storedCaps,
-		ProtocolCapabilities: protocolCaps,
-		MaxConcurrentRuns:    pgconv.Int4Ptr(maxConcurrentRuns),
-		ID:                   wkr.ID,
-	})
-	if err != nil {
-		return store.Worker{}, err
+	regParams := store.RegisterWorkerParams{
+		Version:               pgconv.TextOrNull(version),
+		TemplateReported:      pgconv.TextOrNull(template),
+		Capabilities:          storedCaps,
+		ProtocolCapabilities:  protocolCaps,
+		MaxConcurrentRuns:     pgconv.Int4Ptr(maxConcurrentRuns),
+		SnapshotRegisterNonce: pgconv.TextOrNull(nonce),
+		ID:                    wkr.ID,
 	}
-	// Field-identical structs; the conversion keeps Register's signature — and so
-	// every handler and DTO builder above it — unchanged.
-	return store.Worker(row), nil
+	failParams := store.FailWorkerRunsOverCapParams{
+		FailureReason: pgconv.TextOrNull("worker restarted; run orphaned and out of re-queue budget"),
+		WorkerID:      pgconv.UUID(wkr.ID),
+		MaxRequeues:   max,
+	}
+	requeueParams := store.RequeueWorkerRunsParams{
+		WorkerID:    pgconv.UUID(wkr.ID),
+		MaxRequeues: max,
+	}
+
+	// Tx-less degraded path: no pool wired (fake-store unit tests). No worker-row lock and no
+	// snapshot persist; still rotates the nonce and resets the epoch via RegisterWorker.
+	if s.txBeginner == nil {
+		row, err := s.q.RegisterWorker(ctx, regParams)
+		if err != nil {
+			return store.Worker{}, "", err
+		}
+		orphanFailed, err := s.q.FailWorkerRunsOverCap(ctx, failParams)
+		if err != nil {
+			return store.Worker{}, "", err
+		}
+		requeued, err := s.q.RequeueWorkerRuns(ctx, requeueParams)
+		if err != nil {
+			return store.Worker{}, "", err
+		}
+		s.publishRegisterSweeps(ctx, orphanFailed, requeued)
+		return store.Worker(row), nonce, nil
+	}
+
+	tx, err := s.txBeginner.Begin(ctx)
+	if err != nil {
+		return store.Worker{}, "", err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+	qtx := store.New(tx)
+	// (a) Lock the worker row FOR UPDATE — the canonical order that serialises Register against
+	// a concurrent heartbeat and the stale-worker passes (both of which lock the worker row).
+	if _, err := qtx.GetWorkerForUpdate(ctx, wkr.ID); err != nil {
+		return store.Worker{}, "", err
+	}
+	// (b) Rotate the nonce + reset the epoch (folded into RegisterWorker's update).
+	row, err := qtx.RegisterWorker(ctx, regParams)
+	if err != nil {
+		return store.Worker{}, "", err
+	}
+	// (c) Persist a register-carried snapshot BEFORE the orphan pass, so its leased rows protect
+	// #1391's pending outcomes from the D11-predicated fail/requeue that follows. #1390's worker
+	// never sends one; the path exists for #1391. An invalid register snapshot is ignored, never
+	// fatal (register must not wedge on soft input).
+	if snapshot != nil {
+		if _, err := s.ReplaceWorkerActiveRuns(ctx, qtx, store.Worker(row), snapshot, snapshotModeRegister); err != nil {
+			return store.Worker{}, "", err
+		}
+	}
+	// (d) Orphan pass — fail-over-cap then requeue, both D11-lease/overflow-predicated (M1).
+	orphanFailed, err := qtx.FailWorkerRunsOverCap(ctx, failParams)
+	if err != nil {
+		return store.Worker{}, "", err
+	}
+	requeued, err := qtx.RequeueWorkerRuns(ctx, requeueParams)
+	if err != nil {
+		return store.Worker{}, "", err
+	}
+	// (e) Commit, then publish + judge post-commit (never inside the tx).
+	if err := tx.Commit(ctx); err != nil {
+		return store.Worker{}, "", err
+	}
+	committed = true
+	s.publishRegisterSweeps(ctx, orphanFailed, requeued)
+	return store.Worker(row), nonce, nil
+}
+
+// publishRegisterSweeps fans a register-time orphan pass out post-commit (PRD #1390 M2a):
+// publishSwept for both the failed and the requeued transitions (closing the gap where a
+// register-time requeue/fail reached no live channel — before, only the judge saw the fails)
+// and maybeEnqueueJudgeByID for the committed-terminal fails (PRD #46 Decision 2, the same
+// worker-lost runs the sweeper funnels). Both are best-effort and never fail the register.
+func (s *Service) publishRegisterSweeps(ctx context.Context, failed, requeued []uuid.UUID) {
+	for _, id := range failed {
+		s.publishSwept(id, "failed")
+		s.maybeEnqueueJudgeByID(ctx, id)
+	}
+	for _, id := range requeued {
+		s.publishSwept(id, "queued")
+	}
 }
 
 // WorkerStats is a validated, clamped container resource sample (PRD #49). The
@@ -1757,11 +1852,19 @@ type WorkerStats struct {
 }
 
 // Heartbeat refreshes liveness, overwrites the worker's latest resource sample (PRD
-// #49), records the worker's per-run outbox depth (PRD #1391 M5), and returns the
-// updated worker. A nil stats writes NULLs for every stats_ column, so a worker that
-// stops reporting self-clears its gauge; an empty/nil outbox CLEARS the worker's
-// tracked depth (the "clears on the next empty report" contract).
-func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *WorkerStats, outbox []OutboxEntry) (store.Worker, error) {
+// #49), records the worker's per-run outbox depth (PRD #1391 M5), stores the worker's
+// active-run snapshot when one is carried (PRD #1390 M2a), and returns the updated worker.
+// A nil stats writes NULLs for every stats_ column, so a worker that stops reporting
+// self-clears its gauge; an empty/nil outbox CLEARS the worker's tracked depth (the "clears
+// on the next empty report" contract).
+//
+// When a snapshot is carried it runs inside ONE transaction after the liveness write (which
+// locks the worker row): HeartbeatWorker, then ReplaceWorkerActiveRuns in heartbeat mode. An
+// invalid/stale/wrong-nonce snapshot is IGNORED there — a warning, no error, rows and leases
+// left as they were — so an invalid snapshot never turns a heartbeat into a 400 and liveness is
+// still refreshed. When no snapshot is carried (or no tx beginner is wired), it takes the plain
+// single-statement path, exactly as before.
+func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *WorkerStats, outbox []OutboxEntry, snapshot *ActiveSnapshot) (store.Worker, error) {
 	// Record the outbox depth BEFORE the liveness write: it is in-memory and cannot
 	// fail, and doing it unconditionally means an empty report clears the set even on
 	// a tick that carries no stats.
@@ -1782,7 +1885,36 @@ func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *Worker
 		// (the tick carried no evidence of pressure).
 		arg.DiskOverThreshold = diskOverThreshold(stats, s.p.DiskPressureThreshold)
 	}
-	return s.q.HeartbeatWorker(ctx, arg)
+	// No snapshot (an old worker, or the field absent), or no pool wired (tests): the plain
+	// single-statement liveness write, unchanged.
+	if snapshot == nil || s.txBeginner == nil {
+		return s.q.HeartbeatWorker(ctx, arg)
+	}
+	tx, err := s.txBeginner.Begin(ctx)
+	if err != nil {
+		return store.Worker{}, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+	qtx := store.New(tx)
+	updated, err := qtx.HeartbeatWorker(ctx, arg)
+	if err != nil {
+		return store.Worker{}, err
+	}
+	// heartbeat mode: an invalid snapshot returns (false, nil) — ignored, not fatal — so the
+	// heartbeat's liveness refresh still commits. Only a real DB error aborts the tx.
+	if _, err := s.ReplaceWorkerActiveRuns(ctx, qtx, updated, snapshot, snapshotModeHeartbeat); err != nil {
+		return store.Worker{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return store.Worker{}, err
+	}
+	committed = true
+	return updated, nil
 }
 
 // diskOverThreshold: any reported volume at/above threshold. >= pins the comparator

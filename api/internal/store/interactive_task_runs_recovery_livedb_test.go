@@ -156,9 +156,9 @@ func TestAwaitingFollowupRecoveryLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RequeueWorkerRuns: %v", err)
 	}
-	if rows != 1 {
+	if len(rows) != 1 {
 		t.Fatalf("RequeueWorkerRuns requeued %d runs, want exactly 1 — a parked interactive task must be "+
-			"requeued on register (remove awaiting_followup from the IN-list and this is 0, the zombie)", rows)
+			"requeued on register (remove awaiting_followup from the IN-list and this is 0, the zombie)", len(rows))
 	}
 	if got := f.status(ctx, t, parked); got != "queued" {
 		t.Fatalf("parked run status = %q after RequeueWorkerRuns, want queued", got)

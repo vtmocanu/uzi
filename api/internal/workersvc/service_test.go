@@ -255,13 +255,14 @@ type fakeStore struct {
 	settledScopeRows int64
 
 	// Register + heartbeat.
-	failOverCap      *store.FailWorkerRunsOverCapParams
-	orphanFailedRuns []uuid.UUID // ids FailWorkerRunsOverCap returns (PRD #46 register-time judge funnel)
-	requeueWorker    *store.RequeueWorkerRunsParams
-	registerParams   *store.RegisterWorkerParams
-	registerResult   store.Worker
-	heartbeat        store.Worker
-	callOrder        []string
+	failOverCap        *store.FailWorkerRunsOverCapParams
+	orphanFailedRuns   []uuid.UUID // ids FailWorkerRunsOverCap returns (PRD #46 register-time judge funnel)
+	requeuedWorkerRuns []uuid.UUID // ids RequeueWorkerRuns returns (PRD #1390 M2a register-time requeue publish)
+	requeueWorker      *store.RequeueWorkerRunsParams
+	registerParams     *store.RegisterWorkerParams
+	registerResult     store.Worker
+	heartbeat          store.Worker
+	callOrder          []string
 
 	// Sweep.
 	staleCutoff pgtype.Timestamptz
@@ -1155,10 +1156,10 @@ func (f *fakeStore) FailWorkerRunsOverCap(_ context.Context, arg store.FailWorke
 	f.callOrder = append(f.callOrder, "fail_over_cap")
 	return f.orphanFailedRuns, nil
 }
-func (f *fakeStore) RequeueWorkerRuns(_ context.Context, arg store.RequeueWorkerRunsParams) (int64, error) {
+func (f *fakeStore) RequeueWorkerRuns(_ context.Context, arg store.RequeueWorkerRunsParams) ([]uuid.UUID, error) {
 	f.requeueWorker = &arg
 	f.callOrder = append(f.callOrder, "requeue_worker")
-	return 0, nil
+	return f.requeuedWorkerRuns, nil
 }
 func (f *fakeStore) RegisterWorker(_ context.Context, arg store.RegisterWorkerParams) (store.RegisterWorkerRow, error) {
 	f.registerParams = &arg
@@ -1554,17 +1555,23 @@ func testParams() Params {
 		QuestionTimeoutSeconds: 86400, // PRD #88 answer deadline (24h)
 		RunMaxRequeues:         1,
 		WorkerHeartbeatStale:   45 * time.Second,
-		WorkerAffinityGrace:    2 * time.Minute,
-		WorkerAffinityCeiling:  25 * time.Minute, // PRD #628 run-lane ceiling — deliberately != grace (2m) and != default (2h) so a test proves the run lane reads the ceiling
-		WorkerSpreadGrace:      9 * time.Second,
-		WorkerBackgroundGrace:  15 * time.Minute,
-		ClaimGrace:             5 * time.Minute,
-		SkillMaxBytes:          65536,
-		SkillsMaxPerRun:        32,
-		ChatIdleTimeout:        70 * time.Minute,
-		ChatMaxTurns:           50,
-		WorkerChatIdleTimeout:  60 * time.Minute,
-		WorkerChatTurnTimeout:  10 * time.Minute,
+		// PRD #1390 M2a snapshot knobs, at their config defaults so a Service built from
+		// testParams() validates/stamps snapshots exactly as production. Snapshot-cap tests
+		// override these on their own Params.
+		TerminalPendingLease:     time.Hour,
+		ActiveSnapshotMaxEntries: 256,
+		WorkerOutboxMaxPending:   32,
+		WorkerAffinityGrace:      2 * time.Minute,
+		WorkerAffinityCeiling:    25 * time.Minute, // PRD #628 run-lane ceiling — deliberately != grace (2m) and != default (2h) so a test proves the run lane reads the ceiling
+		WorkerSpreadGrace:        9 * time.Second,
+		WorkerBackgroundGrace:    15 * time.Minute,
+		ClaimGrace:               5 * time.Minute,
+		SkillMaxBytes:            65536,
+		SkillsMaxPerRun:          32,
+		ChatIdleTimeout:          70 * time.Minute,
+		ChatMaxTurns:             50,
+		WorkerChatIdleTimeout:    60 * time.Minute,
+		WorkerChatTurnTimeout:    10 * time.Minute,
 		// Issue #1197 transient-recovery park: the config defaults, so a svc built from
 		// testParams() computes a real recovery backoff (1m base doubling to a 30m cap).
 		RunRecoveryParkBase: time.Minute,
@@ -3655,10 +3662,15 @@ func TestRegisterRecoversOrphansThenComesOnline(t *testing.T) {
 	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
 	svc := New(fs, newBox(t), testParams())
 
-	if _, err := svc.Register(context.Background(), w, "1.2.3", "jvm", intp(2), nil, nil); err != nil {
+	if _, _, err := svc.Register(context.Background(), w, "1.2.3", "jvm", intp(2), nil, nil, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	want := []string{"fail_over_cap", "requeue_worker", "register"}
+	// PRD #1390 M2a flips the order: RegisterWorker (which rotates the nonce and resets the
+	// snapshot epoch) runs BEFORE the orphan pass, so a register-carried snapshot can be
+	// persisted between them and protect its leased runs from the D11-predicated orphan fail/
+	// requeue that follows. (This tx-less fake path never carries a snapshot, but keeps the
+	// same statement order as the production transaction.)
+	want := []string{"register", "fail_over_cap", "requeue_worker"}
 	if strings.Join(fs.callOrder, ",") != strings.Join(want, ",") {
 		t.Fatalf("call order = %v, want %v", fs.callOrder, want)
 	}
@@ -3694,7 +3706,7 @@ func TestRegisterUnionsAndFiltersCapabilities(t *testing.T) {
 	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
 	svc := New(fs, newBox(t), testParams())
 
-	if _, err := svc.Register(context.Background(), w, "1.2.3", "jvm", nil, []string{"docker", "gpu", "docker"}, nil); err != nil {
+	if _, _, err := svc.Register(context.Background(), w, "1.2.3", "jvm", nil, []string{"docker", "gpu", "docker"}, nil, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	got := fs.registerParams.Capabilities
@@ -3711,7 +3723,7 @@ func TestRegisterBaseTemplateDropsSelfReportedJVM(t *testing.T) {
 	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
 	svc := New(fs, newBox(t), testParams())
 
-	if _, err := svc.Register(context.Background(), w, "1.2.3", "base", nil, []string{"jvm", "docker"}, nil); err != nil {
+	if _, _, err := svc.Register(context.Background(), w, "1.2.3", "base", nil, []string{"jvm", "docker"}, nil, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	got := fs.registerParams.Capabilities
@@ -3727,7 +3739,7 @@ func TestRegisterBaseTemplateNoSelfReportEmptyCapabilities(t *testing.T) {
 	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
 	svc := New(fs, newBox(t), testParams())
 
-	if _, err := svc.Register(context.Background(), w, "1.2.3", "base", nil, nil, nil); err != nil {
+	if _, _, err := svc.Register(context.Background(), w, "1.2.3", "base", nil, nil, nil, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	if got := fs.registerParams.Capabilities; len(got) != 0 {
@@ -3745,8 +3757,8 @@ func TestRegisterFiltersProtocolCapabilitiesSeparately(t *testing.T) {
 	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
 	svc := New(fs, newBox(t), testParams())
 
-	if _, err := svc.Register(context.Background(), w, "1.2.3", "base", nil,
-		[]string{"docker"}, []string{"completion_interlock_v1", "docker", "gpu", "completion_interlock_v1"}); err != nil {
+	if _, _, err := svc.Register(context.Background(), w, "1.2.3", "base", nil,
+		[]string{"docker"}, []string{"completion_interlock_v1", "docker", "gpu", "completion_interlock_v1"}, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	// Scheduler capabilities: only the self-reported docker (base template implies nothing).
@@ -3768,7 +3780,7 @@ func TestRegisterNilProtocolCapsStoresEmpty(t *testing.T) {
 	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
 	svc := New(fs, newBox(t), testParams())
 
-	if _, err := svc.Register(context.Background(), w, "1.2.3", "base", nil, nil, nil); err != nil {
+	if _, _, err := svc.Register(context.Background(), w, "1.2.3", "base", nil, nil, nil, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	if got := fs.registerParams.ProtocolCapabilities; len(got) != 0 {
@@ -3783,7 +3795,7 @@ func TestRegisterNilCapStoresNull(t *testing.T) {
 	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
 	svc := New(fs, newBox(t), testParams())
 
-	if _, err := svc.Register(context.Background(), w, "1.2.3", "", nil, nil, nil); err != nil {
+	if _, _, err := svc.Register(context.Background(), w, "1.2.3", "", nil, nil, nil, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	if fs.registerParams == nil || fs.registerParams.MaxConcurrentRuns.Valid {
@@ -3798,7 +3810,7 @@ func TestRegisterEmptyTemplateStoresNull(t *testing.T) {
 	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
 	svc := New(fs, newBox(t), testParams())
 
-	if _, err := svc.Register(context.Background(), w, "1.2.3", "", nil, nil, nil); err != nil {
+	if _, _, err := svc.Register(context.Background(), w, "1.2.3", "", nil, nil, nil, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	if fs.registerParams == nil || fs.registerParams.TemplateReported.Valid {

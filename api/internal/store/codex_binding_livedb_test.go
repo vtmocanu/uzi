@@ -420,10 +420,10 @@ func TestSetRunCodexClaimCapabilityLiveDB(t *testing.T) {
 		t.Fatalf("GetRunByID(ctrl): %v", err)
 	}
 
-	if n, err := q.RequeueWorkerRuns(ctx, store.RequeueWorkerRunsParams{
+	if rows, err := q.RequeueWorkerRuns(ctx, store.RequeueWorkerRunsParams{
 		WorkerID: pgUUID(worker), MaxRequeues: 100,
-	}); err != nil || n != 2 {
-		t.Fatalf("RequeueWorkerRuns = (%d,%v), want (2,nil)", n, err)
+	}); err != nil || len(rows) != 2 {
+		t.Fatalf("RequeueWorkerRuns = (%d,%v), want (2,nil)", len(rows), err)
 	}
 	codexAfter, err := q.GetRunByID(ctx, runID)
 	if err != nil {

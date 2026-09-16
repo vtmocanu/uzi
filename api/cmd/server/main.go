@@ -308,7 +308,12 @@ func run() error {
 		WorkerHeartbeatStale:        cfg.WorkerHeartbeatStale,
 		// PRD #1390 M1 (D1): the boot-grace window that suppresses the stale-worker passes
 		// until the worker-facing listener has been ready this long (SetReadyAt, below).
-		SweeperBootGrace:            cfg.SweeperBootGrace,
+		SweeperBootGrace: cfg.SweeperBootGrace,
+		// PRD #1390 M2a: the terminal-pending lease clock + the snapshot entry caps that
+		// ReplaceWorkerActiveRuns validates and stamps against.
+		TerminalPendingLease:        cfg.TerminalPendingLease,
+		ActiveSnapshotMaxEntries:    cfg.ActiveSnapshotMaxEntries,
+		WorkerOutboxMaxPending:      cfg.WorkerOutboxMaxPending,
 		DiskPressureThreshold:       cfg.DiskPressureThreshold,
 		WorkerAffinityGrace:         cfg.WorkerAffinityGrace,
 		WorkerAffinityCeiling:       cfg.WorkerAffinityCeiling,

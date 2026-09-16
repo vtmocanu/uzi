@@ -91,7 +91,7 @@ func (s *Service) appendAndRecord(ctx context.Context, wkr store.Worker, runID u
 		//     reach 20, so which side of the threshold an OOM lands on is close to a
 		//     coin flip; half that population landed here.
 		//   - Every OTHER path that resets status without a hook, including Register's
-		//     RequeueWorkerRuns, which returns no ids and so can never have one.
+		//     requeue path, which wires no eviction hook and so can never have one.
 		//
 		// Sweep's two requeue-site evictions and the evaluator's are now belt and
 		// braces rather than the mechanism, which is the safer arrangement: this arm

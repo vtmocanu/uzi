@@ -389,12 +389,34 @@ type Config struct {
 	// process started — so an api that was unreachable does not declare every worker dead
 	// the instant it comes back, before any worker could reconnect. Default 60s (the 45s
 	// stale window plus one 15s heartbeat interval). 0 means "immediate", today's behaviour.
-	SweeperBootGrace      time.Duration
-	WorkerPollInterval    time.Duration // worker claim-poll cadence
-	WorkerAffinityGrace   time.Duration // a re-queued run waits this long for its prior worker (chat lane; ClaimChatRun)
-	WorkerAffinityCeiling time.Duration // PRD #628 D3a: run-lane affinity ceiling — a promoted run stays pinned to a LIVE, non-draining prior worker (liveness leg) but never longer than this, bounding the live-but-wedged case
-	WorkerSpreadGrace     time.Duration // PRD #216: a queued run older than this is exempt from the fleet-aware spread
-	WorkerBackgroundGrace time.Duration // PRD #320: a demoted (judge/self_improve) run older than this fails open to normal priority so background work never starves
+	SweeperBootGrace time.Duration
+	// TerminalPendingLease (PRD #1390 M2a, D11, TERMINAL_PENDING_LEASE) is how long a
+	// worker_active_runs entry reported terminal_pending (an outcome journaled on the worker
+	// but not yet accepted by the api, #1391) is protected from every terminal writer, and
+	// how long the worker-level pending_overflow closure lasts. Default 1h. The lease and the
+	// overflow closure share this one clock, so a worker that never returns still frees its
+	// runs when it expires.
+	TerminalPendingLease time.Duration
+	// ActiveSnapshotMaxEntries (PRD #1390 M2a, ACTIVE_SNAPSHOT_MAX_ENTRIES) is the absolute
+	// server ceiling on the number of entries in one worker active-run snapshot, above the
+	// per-type caps (max_concurrent_runs + 2 live, WORKER_OUTBOX_MAX_PENDING pending). A
+	// snapshot exceeding it is rejected as invalid. Default 256. Loud-on-misconfig (a
+	// set-but-malformed or non-positive value aborts boot).
+	ActiveSnapshotMaxEntries int
+	// WorkerOutboxMaxPending (PRD #1390 M2a / #1391, WORKER_OUTBOX_MAX_PENDING) is the cap on
+	// terminal_pending=true entries in one snapshot (#1391's pending-outcome quota). A worker
+	// with more sets pending_overflow instead of listing them. Default 32.
+	WorkerOutboxMaxPending int
+	// ActiveSnapshotDisabled (PRD #1390 M2a / D7, UZI_ACTIVE_SNAPSHOT_DISABLED) is the rollback
+	// switch: when set truthy the api omits `active_run_snapshot` from the register
+	// protocol_features and decodes heartbeats strictly as before (an active_snapshot field on
+	// a heartbeat 400s, which is exactly what triggers the worker's strip-and-retry fallback).
+	ActiveSnapshotDisabled bool
+	WorkerPollInterval     time.Duration // worker claim-poll cadence
+	WorkerAffinityGrace    time.Duration // a re-queued run waits this long for its prior worker (chat lane; ClaimChatRun)
+	WorkerAffinityCeiling  time.Duration // PRD #628 D3a: run-lane affinity ceiling — a promoted run stays pinned to a LIVE, non-draining prior worker (liveness leg) but never longer than this, bounding the live-but-wedged case
+	WorkerSpreadGrace      time.Duration // PRD #216: a queued run older than this is exempt from the fleet-aware spread
+	WorkerBackgroundGrace  time.Duration // PRD #320: a demoted (judge/self_improve) run older than this fails open to normal priority so background work never starves
 
 	// Anthropic usage-limit park (PRD #35). Both are server-side bounds on a
 	// WORKER-REPORTED event, which is why they are here and not in the claim payload:
@@ -939,6 +961,25 @@ func Load() (Config, error) {
 	// so 0 is a legitimate value ("immediate", today's behaviour) rather than falling back to the
 	// default. Default 60s = WORKER_HEARTBEAT_STALE (45s) + WORKER_HEARTBEAT_INTERVAL (15s).
 	cfg.SweeperBootGrace = parseNonNegDuration("SWEEPER_BOOT_GRACE", 60*time.Second)
+	// PRD #1390 M2a (D11): the terminal-pending lease + pending_overflow closure clock. Default 1h.
+	cfg.TerminalPendingLease = parseDuration("TERMINAL_PENDING_LEASE", time.Hour)
+	// PRD #1390 M2a: the absolute snapshot-entry ceiling. Loud-on-misconfig (like
+	// UZI_USAGE_REFOLD_BATCH), so a set-but-non-positive value aborts boot rather than
+	// silently taking 256.
+	cfg.ActiveSnapshotMaxEntries, err = parsePositiveInt("ACTIVE_SNAPSHOT_MAX_ENTRIES", 256)
+	if err != nil {
+		return Config{}, err
+	}
+	// PRD #1390 M2a / #1391: the pending-outcome quota (terminal_pending entries per snapshot).
+	// parseNonNegInt so 0 is legal (list no pending entries) and a malformed value falls back.
+	cfg.WorkerOutboxMaxPending = parseNonNegInt("WORKER_OUTBOX_MAX_PENDING", 32)
+	// PRD #1390 M2a / D7: the rollback switch. loud-on-misconfig (a control knob), matching
+	// UZI_USAGE_REFOLD_ENABLED — a set-but-malformed value aborts boot rather than silently
+	// defaulting.
+	cfg.ActiveSnapshotDisabled, err = parseBool("UZI_ACTIVE_SNAPSHOT_DISABLED", false)
+	if err != nil {
+		return Config{}, err
+	}
 	cfg.MRReviewQuietPeriod = parseNonNegDuration("MR_REVIEW_QUIET_PERIOD", 3*time.Minute)
 	cfg.WorkerPollInterval = parseDuration("WORKER_POLL_INTERVAL", 3*time.Second)
 	cfg.WorkerAffinityGrace = parseDuration("WORKER_AFFINITY_GRACE", 2*time.Minute)

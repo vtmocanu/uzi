@@ -2,6 +2,8 @@ import type { Readable } from "node:stream";
 import type { Logger } from "./log.js";
 import {
   WORKER_API_PREFIX,
+  type ActiveSnapshot,
+  type ClaimRequest,
   type PublishResponse,
   type PublishResult,
   type ChatClaimResponse,
@@ -270,6 +272,17 @@ export class WorkerClient {
    */
   private hasCredentialSwitchCapability = false;
 
+  /**
+   * The per-registration nonce the api minted on the last successful register (PRD #1390
+   * M2a), captured beside `serverFeatures`. The client stamps it onto every ActiveSnapshot
+   * it SENDS (heartbeat + claim), so the api can trust the snapshot's epoch across a worker
+   * OR api restart. Undefined until an api that advertises `active_run_snapshot` registers;
+   * an older api omits it. NOT cleared by the strict-decode fallback — clearing the feature
+   * set already stops the snapshot from being sent, and the nonce is re-minted on the next
+   * register (process restart) regardless.
+   */
+  private registerNonce: string | undefined;
+
   /** The advertised features as an array (PRD #1392 D7): the runner reads this to pick a
    *  capability-aware degradation for a pre-clone forge-unreachable park. Backed by
    *  `serverFeatures` so the two views never diverge and a rollback clear empties both. The
@@ -337,6 +350,10 @@ export class WorkerClient {
     // capability, so the send-gate can stamp the claim generation optimistically (its runs
     // are fenced server-side) even when a one-shot register missed the negotiated feature.
     this.hasCredentialSwitchCapability = protocolCapabilities?.includes("credential_switch_v1") ?? false;
+    // PRD #1390 M2a: capture the per-registration nonce the api minted, stamped onto every
+    // ActiveSnapshot the worker sends. A string only (defensive); absent on an older api ⇒
+    // undefined, in which case no snapshot is sent either (the feature gate is off too).
+    this.registerNonce = typeof res.register_nonce === "string" ? res.register_nonce : undefined;
     return res;
   }
 
@@ -353,7 +370,11 @@ export class WorkerClient {
     this.serverFeatures.clear();
   }
 
-  async heartbeat(stats?: WorkerStats, outbox?: OutboxHeartbeatEntry[]): Promise<void> {
+  async heartbeat(
+    stats?: WorkerStats,
+    outbox?: OutboxHeartbeatEntry[],
+    activeSnapshot?: ActiveSnapshot,
+  ): Promise<void> {
     const body: HeartbeatRequest = { version: this.version };
     // Only attach stats when the collector produced a sample (PRD #49): an absent
     // field is the same wire shape as today, so a pre-#49 server ignores the extra
@@ -364,32 +385,52 @@ export class WorkerClient {
     // advertised it sees a byte-identical heartbeat.
     const includeOutbox = this.hasFeature("heartbeat_outbox") && outbox !== undefined && outbox.length > 0;
     if (includeOutbox) body.outbox = outbox;
+    // PRD #1390 M2a: attach the active-run snapshot ONLY when the server negotiated
+    // `active_run_snapshot` AND the worker built one, stamped with the register nonce so the
+    // api can trust its epoch across a restart. Same "byte-identical wire on an old api" shape
+    // as `outbox`.
+    const includeSnapshot = this.hasFeature("active_run_snapshot") && activeSnapshot !== undefined;
+    if (includeSnapshot) body.active_snapshot = { ...activeSnapshot, register_nonce: this.registerNonce };
+    const includeExtension = includeOutbox || includeSnapshot;
     try {
       await this.postJSON(`${WORKER_API_PREFIX}/heartbeat`, body);
     } catch (err) {
-      // Rollback fallback (PRD #1391 M5): a rolled-back api that no longer knows the
-      // negotiated heartbeat extension strict-decodes it as an unknown field and
-      // answers a generic `invalid request body` 400. Retry the SAME heartbeat ONCE
-      // with every negotiated extension stripped (i.e. no `outbox`); if the stripped
-      // retry SUCCEEDS, clear the whole cached feature set so nothing negotiated is
-      // sent again until process restart. A heartbeat must NEVER be lost to a
-      // rolled-back api, so a stripped success is the outcome, not the original 400.
-      if (!includeOutbox || !isStrictDecodeError(err)) throw err;
+      // Rollback fallback (PRD #1391 M5, extended by #1390 M2a): a rolled-back api that no
+      // longer knows a negotiated heartbeat extension strict-decodes it as an unknown field
+      // and answers a generic `invalid request body` 400. Retry the SAME heartbeat ONCE with
+      // EVERY negotiated extension stripped (both `outbox` AND `active_snapshot`); if the
+      // stripped retry SUCCEEDS, clear the WHOLE cached feature set so nothing negotiated is
+      // sent again until process restart. A heartbeat must NEVER be lost to a rolled-back api,
+      // so a stripped success is the outcome, not the original 400. Deliberately WHOLE-SET, not
+      // surgical: the sticky `credential_switch_v1` capability lives separately from
+      // `serverFeatures` and is NOT cleared, so `includeClaimGeneration` keeps stamping
+      // `claim_generation` for a capability worker after this clear.
+      if (!includeExtension || !isStrictDecodeError(err)) throw err;
       const stripped: HeartbeatRequest = { version: this.version };
       if (stats) stripped.stats = stats;
       await this.postJSON(`${WORKER_API_PREFIX}/heartbeat`, stripped);
       this.clearFeatures();
       this.log.warn(
-        "heartbeat outbox field rejected by a rolled-back api; retried stripped and cleared the negotiated feature set",
+        "heartbeat extension rejected by a rolled-back api; retried stripped and cleared the negotiated feature set",
         {},
       );
     }
   }
 
   /** Claim the oldest queued run for this worker's user (the RUN lane — no lane
-   *  param, back-compat with older servers). Returns null on 204. */
-  async claimRun(): Promise<ClaimResponse | null> {
-    const res = await this.fetchRaw("POST", `${WORKER_API_PREFIX}/runs/claim`, {});
+   *  param, back-compat with older servers). Returns null on 204.
+   *
+   *  PRD #1390 M2a: carries the worker's {@link ActiveSnapshot} in the claim body when
+   *  `active_run_snapshot` is negotiated AND the worker built one (nonce-stamped), so the
+   *  api's pre-claim dedupe sees the runs this worker is already executing BEFORE the first
+   *  post-outage heartbeat lands. If not negotiated the claim posts an empty body `{}`, which
+   *  an old api ignores (harmless — the run-lane claim was bodyless before this). */
+  async claimRun(activeSnapshot?: ActiveSnapshot): Promise<ClaimResponse | null> {
+    const body: ClaimRequest = {};
+    if (this.hasFeature("active_run_snapshot") && activeSnapshot !== undefined) {
+      body.active_snapshot = { ...activeSnapshot, register_nonce: this.registerNonce };
+    }
+    const res = await this.fetchRaw("POST", `${WORKER_API_PREFIX}/runs/claim`, body);
     if (res.status === 204) return null;
     if (res.status >= 400) throw await this.toError("POST", `${WORKER_API_PREFIX}/runs/claim`, res);
     return (await res.json()) as ClaimResponse;

@@ -231,6 +231,12 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 		// vocabulary or the web capability picker. An unknown/garbled name here is
 		// dropped, never stored, and the register never 400s over this field.
 		ProtocolCapabilities []string `json:"protocol_capabilities"`
+		// ActiveSnapshot is the worker's active-run snapshot (PRD #1390 M2a). #1390's worker
+		// NEVER sends it on register — the path exists for #1391's restart-replay of pending
+		// outcomes (it is the one snapshot exempt from the nonce check). Captured as an isolated
+		// json.RawMessage, parsed defensively below, so a malformed body can never 400 the
+		// register (a register that fails over soft input wedges the worker's retry loop).
+		ActiveSnapshot json.RawMessage `json:"active_snapshot"`
 	}
 	if err := httpx.DecodeJSON(r, &req); err != nil && !errors.Is(err, io.EOF) {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
@@ -265,7 +271,14 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("worker reported an out-of-range max_concurrent_runs; dropping", "worker_id", wkr.ID.String(), "value", *advertisedCap)
 		advertisedCap = nil
 	}
-	updated, err := h.wsvc.Register(r.Context(), wkr, version, reported, advertisedCap, req.Capabilities, req.ProtocolCapabilities)
+	// A register-carried snapshot is parsed only when the feature is enabled; #1390's worker
+	// never sends one, so this is nil in practice (the path is #1391's). An unparseable body
+	// yields nil (dropped, logged) — never a register failure.
+	var regSnapshot *workersvc.ActiveSnapshot
+	if !h.cfg.ActiveSnapshotDisabled {
+		regSnapshot = parseActiveSnapshot(req.ActiveSnapshot, wkr.ID)
+	}
+	updated, registerNonce, err := h.wsvc.Register(r.Context(), wkr, version, reported, advertisedCap, req.Capabilities, req.ProtocolCapabilities, regSnapshot)
 	if err != nil {
 		slog.Error("worker register", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -312,10 +325,15 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 	// paths.
 	dto := workerDTOFromWorker(updated, 0, false, "", h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt)
 	h.overlayOutbox(&dto, updated.ID)
+	// register_nonce (PRD #1390 M2a): the per-registration nonce every subsequent heartbeat and
+	// claim snapshot must echo. Minted + persisted on the worker row inside Register's tx and
+	// returned here. protocol_features gates whether the worker even sends snapshots, but the
+	// nonce is issued unconditionally (harmless to an old worker, which ignores it).
 	httpx.JSON(w, http.StatusOK, map[string]any{
 		"worker_id":         updated.ID.String(),
 		"worker":            dto,
-		"protocol_features": protocolFeatures(),
+		"protocol_features": protocolFeatures(!h.cfg.ActiveSnapshotDisabled),
+		"register_nonce":    registerNonce,
 	})
 }
 
@@ -341,11 +359,19 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 // belongs to Run B, lands after this, and is added to its own slice then — advertising it now
 // would tell the worker to send a fence this api still rejects. Returns a fresh slice so a
 // caller cannot mutate the advertised set.
-func protocolFeatures() []string {
+//
+// `active_run_snapshot` (PRD #1390 M2a) is appended in its own group, gated on
+// activeSnapshotEnabled (= !cfg.ActiveSnapshotDisabled). When the api is started with
+// UZI_ACTIVE_SNAPSHOT_DISABLED set (the D7 rollback simulation) the token is omitted and the
+// worker never sends the snapshot — the same shape an old worker sees.
+func protocolFeatures(activeSnapshotEnabled bool) []string {
 	groups := [][]string{
 		{"recovery_park_cause", "recovery_release_exact_echo"}, // PRD #1392 M1
 		{"heartbeat_outbox"},       // PRD #1391 M5, Run A
 		{"claim_generation_fence"}, // PRD #1247 M5 (D11): this api fences message/report inserts on claim_generation for a credential_switch_v1 worker
+	}
+	if activeSnapshotEnabled {
+		groups = append(groups, []string{"active_run_snapshot"}) // PRD #1390 M2a
 	}
 	seen := make(map[string]bool)
 	out := make([]string, 0)
@@ -394,6 +420,14 @@ func (h *Handler) WorkerHeartbeat(w http.ResponseWriter, r *http.Request) {
 		// `heartbeat_outbox` AND a run has depth, so an older api never sees it and a
 		// current worker on a rolled-back api strips it on the generic-400 retry (D8).
 		Outbox json.RawMessage `json:"outbox"`
+		// ActiveSnapshot is the worker's active-run snapshot (PRD #1390 M2a), its OWN isolated
+		// json.RawMessage like Stats/Outbox and for the same reason: a malformed body must drop
+		// the snapshot WITHOUT failing the heartbeat's liveness. The worker sends it only when
+		// the register response advertised `active_run_snapshot`. When the api is started with
+		// UZI_ACTIVE_SNAPSHOT_DISABLED (D7's rollback simulation) it is not advertised, and a
+		// heartbeat that still carries it is 400'd below — exactly the generic 400 that triggers
+		// the worker's strip-and-retry fallback.
+		ActiveSnapshot json.RawMessage `json:"active_snapshot"`
 	}
 	if err := httpx.DecodeJSON(r, &req); err != nil && !errors.Is(err, io.EOF) {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
@@ -408,7 +442,21 @@ func (h *Handler) WorkerHeartbeat(w http.ResponseWriter, r *http.Request) {
 	// the worker's tracked depth (the "clears on the next empty report" contract) — and
 	// the 200 stands.
 	outbox := parseWorkerOutbox(req.Outbox, wkr.ID)
-	updated, err := h.wsvc.Heartbeat(r.Context(), wkr, stats, outbox)
+	// Active-run snapshot (PRD #1390 M2a, D7). When the feature is DISABLED, a heartbeat carrying
+	// the field is rejected with a generic 400 — the same rejection a pre-#1390 strict decoder
+	// would give an unknown field, which is what makes the worker strip the field and retry
+	// (never a lost heartbeat once it does). When enabled, parse defensively: a malformed body
+	// drops to nil (snapshot ignored) and the heartbeat still 200s.
+	var snapshot *workersvc.ActiveSnapshot
+	if h.cfg.ActiveSnapshotDisabled {
+		if req.ActiveSnapshot != nil {
+			httpx.Error(w, http.StatusBadRequest, "invalid request body")
+			return
+		}
+	} else {
+		snapshot = parseActiveSnapshot(req.ActiveSnapshot, wkr.ID)
+	}
+	updated, err := h.wsvc.Heartbeat(r.Context(), wkr, stats, outbox, snapshot)
 	if err != nil {
 		slog.Error("worker heartbeat", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -528,6 +576,35 @@ func parseWorkerOutbox(raw json.RawMessage, workerID uuid.UUID) []workersvc.Outb
 		})
 	}
 	return out
+}
+
+// maxActiveSnapshotBytes bounds the heartbeat/claim/register active_snapshot body before
+// Unmarshal touches it (PRD #1390 M2a). Generous for ACTIVE_SNAPSHOT_MAX_ENTRIES entries (each
+// ~150 bytes) while bounding an abusive/garbled worker; the semantic entry caps are enforced
+// server-side in ReplaceWorkerActiveRuns.
+const maxActiveSnapshotBytes = 128 << 10 // 128 KiB
+
+// parseActiveSnapshot is the defensive JSON-shape parse of the untrusted active_snapshot body
+// (PRD #1390 M2a). It NEVER fails the request: an absent/empty/oversize/malformed body returns
+// nil (the snapshot is simply not applied) and, for a heartbeat, the 200 stands. It does only
+// the shape decode; the SEMANTIC validation (nonce, epoch ordering, phase set, caps, ownership)
+// lives in ReplaceWorkerActiveRuns, which needs the worker's stored nonce/epoch from the DB. A
+// lenient Unmarshal (not the strict whole-body decoder) is used on purpose, so a future worker
+// adding an inner field never 400s a heartbeat that carries the snapshot.
+func parseActiveSnapshot(raw json.RawMessage, workerID uuid.UUID) *workersvc.ActiveSnapshot {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil // no snapshot on this tick (older worker, feature off/absent)
+	}
+	if len(raw) > maxActiveSnapshotBytes {
+		slog.Warn("worker reported oversize active snapshot; dropping", "worker_id", workerID.String())
+		return nil
+	}
+	var snap workersvc.ActiveSnapshot
+	if err := json.Unmarshal(raw, &snap); err != nil {
+		slog.Warn("worker reported malformed active snapshot; dropping", "worker_id", workerID.String())
+		return nil
+	}
+	return &snap
 }
 
 // outboxCountOrDrop converts a raw count field to a non-negative int within the sane

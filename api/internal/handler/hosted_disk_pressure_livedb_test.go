@@ -51,7 +51,7 @@ func TestPollDiskPressureDebouncesAtTwoLiveDB(t *testing.T) {
 	}
 
 	// One over-threshold heartbeat: streak=1, still under the >=2 debounce.
-	if _, err := wsvc.Heartbeat(ctx, wkr, diskStats(95), nil); err != nil {
+	if _, err := wsvc.Heartbeat(ctx, wkr, diskStats(95), nil, nil); err != nil {
 		t.Fatalf("heartbeat 1: %v", err)
 	}
 	if diskPressureOf(ctx, t, poll, wkr.ID) {
@@ -59,7 +59,7 @@ func TestPollDiskPressureDebouncesAtTwoLiveDB(t *testing.T) {
 	}
 
 	// Second over-threshold heartbeat: streak=2, now under pressure.
-	if _, err := wsvc.Heartbeat(ctx, wkr, diskStats(95), nil); err != nil {
+	if _, err := wsvc.Heartbeat(ctx, wkr, diskStats(95), nil, nil); err != nil {
 		t.Fatalf("heartbeat 2: %v", err)
 	}
 	if !diskPressureOf(ctx, t, poll, wkr.ID) {
@@ -68,7 +68,7 @@ func TestPollDiskPressureDebouncesAtTwoLiveDB(t *testing.T) {
 
 	// An under-threshold heartbeat resets the streak to 0: any non-pressured sample
 	// breaks the run, so pressure clears immediately.
-	if _, err := wsvc.Heartbeat(ctx, wkr, diskStats(50), nil); err != nil {
+	if _, err := wsvc.Heartbeat(ctx, wkr, diskStats(50), nil, nil); err != nil {
 		t.Fatalf("heartbeat 3 (under): %v", err)
 	}
 	if diskPressureOf(ctx, t, poll, wkr.ID) {
@@ -94,7 +94,7 @@ func TestPollDiskPressureResetOnRegisterLiveDB(t *testing.T) {
 
 	// Get it pressured (streak=2).
 	for i := 0; i < 2; i++ {
-		if _, err := wsvc.Heartbeat(ctx, wkr, diskStats(95), nil); err != nil {
+		if _, err := wsvc.Heartbeat(ctx, wkr, diskStats(95), nil, nil); err != nil {
 			t.Fatalf("heartbeat %d: %v", i, err)
 		}
 	}
@@ -129,7 +129,7 @@ func TestPollDiskPressureFreshnessGateLiveDB(t *testing.T) {
 		t.Fatalf("provision: %v", err)
 	}
 	for i := 0; i < 2; i++ {
-		if _, err := wsvc.Heartbeat(ctx, wkr, diskStats(95), nil); err != nil {
+		if _, err := wsvc.Heartbeat(ctx, wkr, diskStats(95), nil, nil); err != nil {
 			t.Fatalf("heartbeat %d: %v", i, err)
 		}
 	}

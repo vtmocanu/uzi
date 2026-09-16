@@ -59,8 +59,8 @@ func (p *protocolStore) SetRunCompleted(context.Context, store.SetRunCompletedPa
 func (p *protocolStore) FailWorkerRunsOverCap(context.Context, store.FailWorkerRunsOverCapParams) ([]uuid.UUID, error) {
 	return nil, nil
 }
-func (p *protocolStore) RequeueWorkerRuns(context.Context, store.RequeueWorkerRunsParams) (int64, error) {
-	return 0, nil
+func (p *protocolStore) RequeueWorkerRuns(context.Context, store.RequeueWorkerRunsParams) ([]uuid.UUID, error) {
+	return nil, nil
 }
 func (p *protocolStore) RegisterWorker(_ context.Context, arg store.RegisterWorkerParams) (store.RegisterWorkerRow, error) {
 	return store.RegisterWorkerRow{ID: arg.ID, Status: "online", Version: arg.Version, TemplateReported: arg.TemplateReported, MaxConcurrentRuns: arg.MaxConcurrentRuns}, nil

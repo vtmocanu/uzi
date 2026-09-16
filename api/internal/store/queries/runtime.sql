@@ -222,6 +222,14 @@ WITH prev AS (
         -- before the poll re-derives disk_pressure. (Distinct from HeartbeatWorker's
         -- increment/reset CASE: this is reset-on-action, unconditional.)
         stats_disk_pressure_streak = 0,
+        -- PRD #1390 M2a: rotate the register nonce every snapshot must echo and RESET the
+        -- snapshot epoch to 0 under it (D3). A fresh worker process starts its epoch at 1, so
+        -- resetting to 0 here means its very first post-register snapshot (epoch 1) is accepted
+        -- while any delayed high-epoch snapshot from the PREVIOUS process is rejected by the
+        -- now-stale nonce — not by epoch. The nonce must live on the row (not in memory)
+        -- because it is checked exactly when an api restart has forgotten everything else.
+        snapshot_register_nonce = @snapshot_register_nonce,
+        snapshot_epoch      = 0,
         last_heartbeat_at   = now(),
         updated_at          = now()
     WHERE workers.id = @id
@@ -320,6 +328,14 @@ UPDATE workers SET
     updated_at            = now()
 WHERE id = @id
 RETURNING *;
+
+-- name: GetWorkerForUpdate :one
+-- PRD #1390 M2a: lock the worker row FOR UPDATE at the top of the Register transaction, in
+-- the canonical worker-row lock order shared with the stale-worker passes' `locked` CTE and
+-- with HeartbeatWorker's own UPDATE. Holding it across the nonce rotation + snapshot persist +
+-- orphan fail/requeue is what serialises Register against a concurrent heartbeat or stale
+-- sweep, so a run's D11 lease is read against a settled snapshot rather than a torn one.
+SELECT * FROM workers WHERE id = @id FOR UPDATE;
 
 -- name: DeleteWorkerForUser :execrows
 DELETE FROM workers WHERE id = @id AND user_id = @user_id;
@@ -3426,9 +3442,13 @@ WHERE runs.worker_id = @worker_id
                            WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
 RETURNING id;
 
--- name: RequeueWorkerRuns :execrows
+-- name: RequeueWorkerRuns :many
 -- Within budget → re-queued to this same worker (affinity), which then re-claims
 -- and resumes from the persisted session (handles docker compose down && up).
+--
+-- PRD #1390 M2a: RETURNING id so Register can publish each requeue transition post-commit
+-- (via publishSwept) exactly as the sweeper's RequeueRunsOfStaleWorkers twin already does —
+-- closing the gap where a register-time requeue reached no live channel.
 UPDATE runs SET status = 'queued', status_since = now(), requeue_count = requeue_count + 1,
     -- Exit contract (PRD #47 Decision 3): reset on the way back to 'queued'; the
     -- detector re-evaluates the queued signal from this transition's status_since.
@@ -3458,7 +3478,72 @@ WHERE runs.worker_id = @worker_id
                          AND a.terminal_pending_until > now()
                          AND a.claim_generation = runs.claim_generation)
            AND NOT EXISTS (SELECT 1 FROM workers w
-                           WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())));
+                           WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
+RETURNING id;
+
+-- Worker active-run snapshot (PRD #1390 M2a) --------------------------------
+
+-- name: DeleteWorkerActiveRuns :execrows
+-- Full-replacement delete for the heartbeat/claim snapshot path (D3): drop every row of the
+-- worker before re-inserting the validated set, so an attempt that ended (dropped from the
+-- snapshot) leaves no row behind. Register uses DeleteOrdinaryWorkerActiveRunsNotIn instead,
+-- because it must PRESERVE leased rows across a restart.
+DELETE FROM worker_active_runs WHERE worker_id = @worker_id;
+
+-- name: DeleteOrdinaryWorkerActiveRunsNotIn :execrows
+-- Register-path delete (PRD #1390 M2a): remove only ORDINARY (terminal_pending = false) rows
+-- whose run is not in the register-carried snapshot, PRESERVING every row under a
+-- terminal-pending lease (its generation is what protects #1391's boot replay from the orphan
+-- pass that follows). @keep_run_ids is the snapshot's run-id set; an empty set deletes every
+-- ordinary row (a register with no listed live attempts). The kept rows are re-upserted right
+-- after, so this only removes ordinary rows the snapshot no longer names.
+DELETE FROM worker_active_runs
+WHERE worker_id = @worker_id
+  AND terminal_pending = false
+  AND run_id <> ALL(@keep_run_ids::uuid[]);
+
+-- name: UpsertWorkerActiveRun :execrows
+-- Insert (or replace) one validated snapshot entry, OWNERSHIP-ENFORCED in SQL (D3): the row is
+-- written only when the run is actually `worker_id = @worker_id`, so a buggy or hostile worker
+-- can never describe — and thereby suppress a sibling's claim on, or lease — a run it does not
+-- own. An entry that fails the EXISTS is silently dropped (0 rows affected); the Go caller logs
+-- it. terminal_pending_until is stamped now() + the lease for a pending entry and NULL for a
+-- live one; reported_at is this snapshot's capture time (now()), which ClaimRun's freshness
+-- test reads. ON CONFLICT keeps the (worker_id, run_id) primary key a full upsert so the
+-- register path's preserved-then-re-listed rows refresh cleanly.
+INSERT INTO worker_active_runs (
+    worker_id, run_id, claim_generation, phase,
+    terminal_pending, terminal_pending_until, snapshot_epoch, reported_at
+)
+SELECT @worker_id, @run_id, @claim_generation, @phase,
+       @terminal_pending,
+       CASE WHEN @terminal_pending::boolean
+            THEN now() + make_interval(secs => @lease_seconds::int)
+            ELSE NULL END,
+       @snapshot_epoch, now()
+WHERE EXISTS (SELECT 1 FROM runs r WHERE r.id = @run_id AND r.worker_id = @worker_id)
+ON CONFLICT (worker_id, run_id) DO UPDATE SET
+    claim_generation       = EXCLUDED.claim_generation,
+    phase                  = EXCLUDED.phase,
+    terminal_pending       = EXCLUDED.terminal_pending,
+    terminal_pending_until = EXCLUDED.terminal_pending_until,
+    snapshot_epoch         = EXCLUDED.snapshot_epoch,
+    reported_at            = EXCLUDED.reported_at;
+
+-- name: SetWorkerSnapshotState :execrows
+-- Apply the snapshot's worker-row effects (PRD #1390 M2a): advance snapshot_epoch to the
+-- accepted snapshot's epoch and set the pending_overflow closure. A flagged snapshot stamps
+-- pending_overflow_until = now() + the lease (the worker-level stand-in for the row-level
+-- leases it could not express, D11); an unflagged one clears both, which is what a valid
+-- unflagged snapshot uses to reopen claiming before expiry.
+UPDATE workers SET
+    snapshot_epoch         = @snapshot_epoch,
+    pending_overflow       = @pending_overflow,
+    pending_overflow_until = CASE WHEN @pending_overflow::boolean
+                                  THEN now() + make_interval(secs => @lease_seconds::int)
+                                  ELSE NULL END,
+    updated_at             = now()
+WHERE id = @id;
 
 -- Messages -----------------------------------------------------------------
 

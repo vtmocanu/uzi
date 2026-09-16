@@ -12,6 +12,7 @@ import { StubChatExecutor } from "./chat-executor-stub.js";
 import { RunRunner, type ExecutorFactory } from "./runner.js";
 import { ChatRunner } from "./chat-runner.js";
 import { Outbox } from "./outbox.js";
+import { ActiveRunRegistry } from "./active-run-registry.js";
 import { JudgeRunner } from "./judge-runner.js";
 import { ReviewRunner } from "./review-runner.js";
 import { stubJudgeQueryFn } from "./judge-runner-stub.js";
@@ -127,6 +128,11 @@ async function main(): Promise<void> {
   });
   await outbox.init();
   const rearm = new Map<string, () => void>();
+  // PRD #1390 M2a: the shared active-run registry the run lane + judge/review runners write
+  // as they start/transition/finish, and the worker reads to build the ActiveSnapshot that
+  // rides every heartbeat and run-lane claim. ONE instance so the snapshot epoch is a single
+  // process-monotonic counter across the heartbeat and claim loops.
+  const activeRuns = new ActiveRunRegistry();
   // Pin the SDK's HOME (session transcripts under $HOME/.claude/projects) onto
   // the persistent data volume so `docker compose down && up` doesn't wipe
   // sessions and resume still works.
@@ -225,6 +231,8 @@ async function main(): Promise<void> {
     rearm,
     transientTripMs: config.transientTripMs,
     outboxSpillBufferBytes: config.outboxSpillBufferBytes,
+    // PRD #1390 M2a: the shared active-run registry the worker reads to build snapshots.
+    activeRuns,
   });
 
   // The chat lane (PRD #39). Per-session executor factory (PRD #42 Decision 4): each
@@ -284,6 +292,8 @@ async function main(): Promise<void> {
   // token and zero spend.
   const judgeRunner = new JudgeRunner(client, log, {
     homeRoot: sdkHomeRoot,
+    // PRD #1390 M2a: a judge attempt holds a run slot, so it is listed in the snapshot.
+    activeRuns,
     ...(config.executor === "stub" ? { queryFn: stubJudgeQueryFn } : {}),
   });
 
@@ -295,13 +305,15 @@ async function main(): Promise<void> {
   // review), mirroring the judge lane so the e2e can drive it with a dummy token.
   const reviewRunner = new ReviewRunner(client, git, log, {
     homeRoot: sdkHomeRoot,
+    // PRD #1390 M2a: a review attempt holds a run slot, so it is listed in the snapshot.
+    activeRuns,
     ...(config.executor === "stub" ? { queryFn: stubJudgeQueryFn } : {}),
   });
 
   // PRD #1391 M2: the Worker owns the per-worker outbox drainer + the heartbeat outbox
   // report, so it takes the same outbox + re-arm registry the runners spill into. The
   // `undefined` preserves the default boot toolchain preflight (only tests inject one).
-  const worker = new Worker(config, client, runner, chatRunner, judgeRunner, reviewRunner, log, undefined, outbox, rearm);
+  const worker = new Worker(config, client, runner, chatRunner, judgeRunner, reviewRunner, log, undefined, outbox, rearm, activeRuns);
 
   // Signal handlers FIRST, before anything that can take real time. Until these
   // are installed a SIGTERM hits Node's default disposition and terminates the

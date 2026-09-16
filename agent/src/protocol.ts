@@ -350,13 +350,23 @@ export interface RegisterResponse {
    *  capability-aware degradation on a mixed fleet. ONE negotiation wire shared by several
    *  PRDs (#1392 D7, #1391 D8, #1390 M2a): whichever lands first declares the field, the
    *  others their values. A full #1392 api sends `["recovery_park_cause",
-   *  "recovery_release_exact_echo"]`; #1391's api adds `heartbeat_outbox`; a future api may
-   *  also advertise `claim_generation_fence` / `terminal_fence`. OPTIONAL and OMITTED
-   *  ENTIRELY by an OLDER api (which returns only `worker_id`) — an absent field decodes as
-   *  "no features", so the worker negotiates nothing extra — EXCEPT that a
-   *  `credential_switch_v1` CAPABILITY worker still stamps `claim_generation` optimistically,
-   *  regardless of the advertised features (see `MessagesRequest.claim_generation`). */
+   *  "recovery_release_exact_echo"]`; #1391's api adds `heartbeat_outbox`; a #1390 M2a api
+   *  adds `active_run_snapshot` (a LIVE value now — the worker attaches its ActiveSnapshot to
+   *  the heartbeat and the run-lane claim once it is advertised, and pairs it with the
+   *  `register_nonce` below); a future api may also advertise `claim_generation_fence` /
+   *  `terminal_fence`. OPTIONAL and OMITTED ENTIRELY by an OLDER api (which returns only
+   *  `worker_id`) — an absent field decodes as "no features", so the worker negotiates
+   *  nothing extra — EXCEPT that a `credential_switch_v1` CAPABILITY worker still stamps
+   *  `claim_generation` optimistically, regardless of the advertised features (see
+   *  `MessagesRequest.claim_generation`). */
   protocol_features?: string[];
+  /** PRD #1390 M2a: the per-registration nonce the api mints so it can trust the epoch of an
+   *  ActiveSnapshot across a worker OR api restart. The worker captures it at register and
+   *  echoes it verbatim on every snapshot it SENDS (heartbeat + claim); a snapshot whose
+   *  nonce is not the api's current one is discarded server-side. OPTIONAL and OMITTED by an
+   *  api that does not advertise `active_run_snapshot`; the register-carried snapshot (#1391)
+   *  is the one snapshot exempt from the nonce (none exists yet at that point). */
+  register_nonce?: string;
 }
 
 /**
@@ -413,6 +423,44 @@ export interface OutboxHeartbeatEntry {
   since: number;
 }
 
+/** The phase a run-lane (or judge/review) attempt is in from the WORKER's point of
+ *  view (PRD #1390 M2a). A strict subset of {@link RunState}: the four the api restores
+ *  a re-adopted run to. A judge/review attempt is always `running`. */
+export type ActiveSnapshotPhase = "running" | "awaiting_approval" | "awaiting_input" | "awaiting_followup";
+
+/** One entry in an {@link ActiveSnapshot} (PRD #1390 M2a): a run-lane attempt (or a
+ *  judge/review attempt) this worker is currently executing, named by its run id, the
+ *  `claim_generation` it was claimed at, and its current `phase`. For a #1390 worker
+ *  `terminal_pending` is ALWAYS false — terminal-outcome journaling is #1391's, so this
+ *  worker never lists a pending outcome. */
+export interface ActiveSnapshotEntry {
+  run_id: string;
+  claim_generation: number;
+  phase: ActiveSnapshotPhase;
+  terminal_pending: boolean;
+}
+
+/**
+ * The worker's active-run snapshot (PRD #1390 M2a): the run-lane attempts it is
+ * currently executing PLUS any judge/review attempts, each with its current phase. It
+ * rides every heartbeat (`HeartbeatRequest.active_snapshot`) and every run-lane claim
+ * (`ClaimRequest.active_snapshot`) so the api can re-adopt a run after an outage and
+ * never double-claim one this worker is already running.
+ *
+ * `snapshot_epoch` is a worker-process-monotonic counter (starts at 1, ++ on every
+ * build) shared by the heartbeat and claim loops, so the api can order snapshots
+ * captured independently. `register_nonce` is the value the api issued at register,
+ * stamped by the client on send (OMITTED on a register-carried snapshot, #1391 — the one
+ * snapshot exempt from the nonce). For a #1390 worker `pending_overflow` is ALWAYS false
+ * (no terminal-outcome journaling yet — that is #1391).
+ */
+export interface ActiveSnapshot {
+  snapshot_epoch: number;
+  register_nonce?: string;
+  active: ActiveSnapshotEntry[];
+  pending_overflow: boolean;
+}
+
 export interface HeartbeatRequest {
   version: string;
   /** Optional container resource sample (PRD #49), same absent-optional convention
@@ -427,6 +475,25 @@ export interface HeartbeatRequest {
    * field and the heartbeat wire stays byte-identical to today when it is unset.
    */
   outbox?: OutboxHeartbeatEntry[];
+  /**
+   * The worker's active-run snapshot (PRD #1390 M2a). Sent ONLY when the server
+   * advertised `active_run_snapshot` in `RegisterResponse.protocol_features` (client.ts
+   * gates it), so an older api never sees the field and the heartbeat wire stays
+   * byte-identical to today when it is unset. Stripped alongside `outbox` on the
+   * strict-decode rollback retry.
+   */
+  active_snapshot?: ActiveSnapshot;
+}
+
+/**
+ * Body of a run-lane claim POST (PRD #1390 M2a). The claim is a bodyless POST today;
+ * this adds the worker's {@link ActiveSnapshot} so the api's pre-claim dedupe can see
+ * the runs this worker is already executing BEFORE the first post-outage heartbeat
+ * lands. Sent ONLY when `active_run_snapshot` is negotiated; otherwise the claim posts
+ * an empty body, which an old api ignores (harmless).
+ */
+export interface ClaimRequest {
+  active_snapshot?: ActiveSnapshot;
 }
 
 /** Kebab-case agent name. Mirrors the API's template nameRe
