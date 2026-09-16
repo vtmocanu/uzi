@@ -54,11 +54,18 @@ usage() {
   echo "       scripts/migration-renumber.sh --rewrite-comments <mapfile> <sqlfile>" >&2
 }
 
-# map_has_entry <mapfile> -- reject empty and whitespace-only maps. An empty first awk
-# input makes NR==FNR true again for the SQL input, which would consume every SQL line as a
-# map record and replace the migration with an empty file (CodeRabbit review on PR #1410).
-map_has_entry() {
-  awk 'NF { found=1 } END { exit found ? 0 : 1 }' "$1"
+# map_is_valid <mapfile> -- require at least one unique `NNNNN NNNNN` pair and reject
+# every malformed nonblank line. A missing NEW value would otherwise store an empty mapping
+# and silently delete the OLD token from comment lines; an empty first awk input also makes
+# NR==FNR-style map detection consume the SQL input. This tree-writer fails closed on both.
+map_is_valid() {
+  awk '
+    NF == 0 { next }
+    NF != 2 || $1 !~ /^[0-9][0-9][0-9][0-9][0-9]$/ ||
+      $2 !~ /^[0-9][0-9][0-9][0-9][0-9]$/ || seen[$1]++ { bad=1; next }
+    { found=1 }
+    END { exit found && !bad ? 0 : 1 }
+  ' "$1"
 }
 
 # rewrite_comments <mapfile> <sqlfile>
@@ -72,7 +79,7 @@ map_has_entry() {
 rewrite_comments() {
   _map="$1"
   _f="$2"
-  map_has_entry "$_map" || return 1
+  map_is_valid "$_map" || return 1
   _dir="$(dirname "$_f")"
   _tmp="$(mktemp "$_dir/.renum.XXXXXX")" || return 1
   if awk -v mapfile="$_map" 'FILENAME==mapfile { m[$1]=$2; next }
@@ -109,7 +116,7 @@ case "${1:-}" in
     _sub_map="$2"
     _sub_f="$3"
     [ -f "$_sub_map" ] || die "--rewrite-comments: map file not found: $_sub_map"
-    map_has_entry "$_sub_map" || die "--rewrite-comments: map file is empty or whitespace-only: $_sub_map"
+    map_is_valid "$_sub_map" || die "--rewrite-comments: map file is empty, whitespace-only, or malformed (expected unique NNNNN NNNNN pairs): $_sub_map"
     [ -f "$_sub_f" ] || die "--rewrite-comments: sql file not found: $_sub_f"
     if rewrite_comments "$_sub_map" "$_sub_f"; then
       exit 0

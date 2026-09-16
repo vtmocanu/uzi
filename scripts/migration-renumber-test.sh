@@ -255,8 +255,33 @@ SQL
   EMPTY_OUT="$(sh "$HELPER" --rewrite-comments "$EMPTY_MAP" "$EMPTY_FIX" 2>&1)"
   EMPTY_RC=$?
   assert_nonzero "A: $_map_kind map refused" "$EMPTY_RC"
-  assert_contains "A: $_map_kind map names expected reason" "map file is empty or whitespace-only" "$EMPTY_OUT"
+  assert_contains "A: $_map_kind map names expected reason" "map file is empty, whitespace-only, or malformed" "$EMPTY_OUT"
   assert_eq "A: $_map_kind map leaves SQL byte-identical" "$EMPTY_BEFORE" "$(cat "$EMPTY_FIX")"
+done
+
+# A nonempty malformed map must also fail closed. A missing NEW value used to create an
+# empty mapping and silently delete the OLD token; duplicate OLD keys are ambiguous.
+for _bad_kind in missing-value duplicate-old; do
+  BAD_FIX="$CASE_A/${_bad_kind}_map.sql"
+  BAD_MAP="$CASE_A/${_bad_kind}_map.txt"
+  wf "$BAD_FIX" <<'SQL'
+-- +goose Up
+-- Companion migration is 00231_validate_x.
+SELECT 00231;
+-- +goose Down
+SELECT 1;
+SQL
+  if [ "$_bad_kind" = "missing-value" ]; then
+    printf '%s\n' '00231' > "$BAD_MAP"
+  else
+    printf '%s\n' '00231 00232' '00231 00233' > "$BAD_MAP"
+  fi
+  BAD_BEFORE="$(cat "$BAD_FIX")"
+  BAD_OUT="$(sh "$HELPER" --rewrite-comments "$BAD_MAP" "$BAD_FIX" 2>&1)"
+  BAD_RC=$?
+  assert_nonzero "A: $_bad_kind map refused" "$BAD_RC"
+  assert_contains "A: $_bad_kind map names expected reason" "map file is empty, whitespace-only, or malformed" "$BAD_OUT"
+  assert_eq "A: $_bad_kind map leaves SQL byte-identical" "$BAD_BEFORE" "$(cat "$BAD_FIX")"
 done
 
 # =============================================================================
