@@ -870,6 +870,105 @@ describe("MessageBatcher spill/drain (PRD #1391 M2)", () => {
       `every spilled segment must replay under the generation it was produced (${GEN}), not the default 0`,
     );
   });
+
+  it("close() over the NETWORK drains a pending dropped-range with an EMPTY buffer (never a silent seq-hole)", async () => {
+    // Regression for b4c54940: rearm() now drains the in-memory dropped-range LAZILY via
+    // the network flush loop, and flush()/doFlush() treat a pending range as work — but
+    // close() was NOT updated in lockstep. In NETWORK mode (post-rearm) a pending range
+    // can exist with an EMPTY buffer; the pre-fix close() network-drain loop and its
+    // "undelivered" warning gated only on buffer.length > 0, so such a range was silently
+    // discarded on close — no network tombstones, no admission. The PRD forbids a silent
+    // seq-hole ("admitted and logged, never a silent hole"). This proves close() drains it.
+    //
+    // Reach "buffer empty + pending range set + network mode" deterministically via the
+    // outbox write seam: (1) fold a burst into the pending range DURING a spill segment
+    // write (takePrefix has emptied the buffer, so the first injected emit is KEPT and the
+    // rest FOLD over the 1-byte cap), and (2) fail every OUTBOX range-record write so the
+    // periodic doSpillFlush can never persist the range — it stays in memory with an empty
+    // buffer until rearm()+close() are what drain it. Network postMessages are unaffected.
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "batcher-outbox-close-range-"));
+    tmpRoots.push(dir);
+
+    let batcher: MessageBatcher | undefined;
+    let armFold = false;
+    let foldFired = false;
+    const foldedSeqs: number[] = [];
+
+    const outbox = new Outbox({
+      root: path.join(dir, "outbox"),
+      log: nullLogger(),
+      runMaxBytes: 64 * 1024 * 1024,
+      maxBytes: 512 * 1024 * 1024,
+      retentionMs: 7 * 86_400_000,
+      rawWrite: async (write, ctx) => {
+        // PIN the pending dropped-range in memory: every periodic doSpillFlush that tries
+        // to persist it as a range record fails, so the range stays in memory (buffer
+        // empty) until rearm()+close() drain it. Only OUTBOX writes are guarded here.
+        if (ctx.kind === "range") throw new Error("injected range write failure (pin the range in memory)");
+        // On the FIRST segment write only, fold a burst into the pending range. takePrefix
+        // has already emptied the buffer, so the first injected emit is KEPT (empty buffer)
+        // and the rest FOLD (buffer non-empty + over the 1-byte spill cap).
+        if (ctx.kind === "segment" && armFold && !foldFired) {
+          foldFired = true;
+          const base = batcher!.currentSeq(); // the trigger's seq, already assigned
+          for (let i = 0; i < 5; i++) batcher!.emit({ kind: "text", agent: "lead", payload: { text: `fold${i}` } });
+          // base+1 is the KEPT message; base+2..currentSeq folded into the pending range.
+          for (let s = base + 2; s <= batcher!.currentSeq(); s++) foldedSeqs.push(s);
+        }
+        await write();
+      },
+    });
+    await outbox.init();
+
+    const api = flippableClient("fail", 503);
+    batcher = new MessageBatcher(api.client, RUN, 0, 5, nullLogger(), undefined, undefined, {
+      outbox,
+      transientTripMs: 40,
+      spillBufferBytes: 1, // so the injected burst folds into the pending range
+    });
+
+    // Drive a spill with two pre-spill messages; let them settle to the outbox so the
+    // buffer is empty + idle before we arm the fold.
+    fill(batcher, 2, "pre");
+    await until(() => batcher!.isSpilled(), 4000, "batcher enters spill");
+    await until(() => (outbox.depthFor(RUN)?.pendingMessages ?? 0) >= 2, 4000, "pre-spill messages land");
+    await sleep(40);
+
+    // Arm the fold, then emit the trigger: its segment write injects the burst, leaving
+    // the buffer empty + a pending range set + still spilled (the range-write pin keeps
+    // the range in memory across the periodic re-flushes).
+    armFold = true;
+    batcher.emit({ kind: "text", agent: "lead", payload: { text: "trigger" } });
+    await until(
+      () => foldFired && batcher!.bufferedCount() === 0 && batcher!.isSpilled(),
+      4000,
+      "buffer empty + pending range set + still spilled",
+    );
+    assert.strictEqual(batcher.bufferedCount(), 0, "the buffer is empty while a pending range is set");
+    assert.ok(foldedSeqs.length >= 3, `the burst folded seqs into the pending range (${JSON.stringify(foldedSeqs)})`);
+
+    // Flip to the network and close. rearm() schedules a flush; close() clears that timer,
+    // so close()'s OWN drain loop is what must drain the pending range — the exact path the
+    // pre-fix close() skipped on an empty buffer.
+    batcher.rearm();
+    api.setMode("ok");
+    assert.strictEqual(batcher.isSpilled(), false, "rearm returns the batcher to the network");
+    await batcher.close();
+
+    // Every folded seq landed over the network as a message_dropped tombstone, exactly
+    // once, contiguous. On the pre-fix close() none of them land (empty buffer → the drain
+    // loop is skipped → the range is silently dropped).
+    const landedForRange = api.landed.filter((m) => foldedSeqs.includes(m.seq));
+    assert.deepStrictEqual(
+      landedForRange.map((m) => m.seq).sort((a, b) => a - b),
+      foldedSeqs.slice().sort((a, b) => a - b),
+      "every folded seq drained over the network on close, exactly once and contiguous",
+    );
+    assert.strictEqual(landedForRange.length, foldedSeqs.length, "no folded seq landed twice");
+    for (const m of landedForRange) {
+      assert.strictEqual(pl(m).event, "message_dropped", `folded seq ${m.seq} landed as a drop tombstone`);
+    }
+  });
 });
 
 describe("replaySegment poison handling (PRD #1391 M2)", () => {

@@ -518,6 +518,12 @@ export class MessageBatcher {
     }
   }
 
+  /** Seq-count of the in-memory pending dropped-range (0 when none). */
+  private pendingRangeWidth(): number {
+    if (this.pendingRangeFirst === undefined || this.pendingRangeLast === undefined) return 0;
+    return this.pendingRangeLast - this.pendingRangeFirst + 1;
+  }
+
   /**
    * Wire the breaker's out-of-band report. A setter rather than a constructor
    * argument because both runners build their `reportState` closure AFTER the
@@ -1074,7 +1080,10 @@ export class MessageBatcher {
       // the end runs only on a fully-successful close. A marker-write FAILURE must
       // propagate to the outer catch BEFORE takePrefix() mutates the buffer, so the
       // "may be lost" warning reports the full, accurate dropped count and
-      // clearSpillUnclean is skipped (leaving the flag set for restart).
+      // clearSpillUnclean is skipped, so a flag already set stays set for restart;
+      // when the failing write is the marker itself (a prior clean flush having
+      // cleared the flag), an unwritable manifest can record nothing durably and the
+      // loss is admitted by the "may be lost" log alone.
       if (this.buffer.length > 0 || this.pendingRangeFirst !== undefined) {
         await outbox.markSpillUnclean(this.runId);
       }
@@ -1101,7 +1110,7 @@ export class MessageBatcher {
     } catch (err) {
       this.log.warn("message batcher: spilling the tail to the outbox on close failed; it may be lost", {
         run_id: this.runId,
-        dropped: this.buffer.length,
+        dropped: this.buffer.length + this.pendingRangeWidth(),
         error: errMessage(err),
       });
     }
@@ -1147,10 +1156,10 @@ export class MessageBatcher {
     // unconditionally — that guard is what stops close() observing an empty buffer
     // while a doomed flush is still airborne, and a trip does not make it less true.
     if (this.tripped) {
-      if (this.buffer.length > 0) {
+      if (this.buffer.length > 0 || this.pendingRangeFirst !== undefined) {
         this.log.warn("message batcher closed with undelivered messages", {
           run_id: this.runId,
-          dropped: this.buffer.length,
+          dropped: this.buffer.length + this.pendingRangeWidth(),
           trip_reason: this.tripReason,
           last_rejected_seq: this.buffer[0]?.msg.seq,
         });
@@ -1163,25 +1172,27 @@ export class MessageBatcher {
     // were landing fine. Progress — the buffer shrank — is free and does not
     // consume an attempt; only an attempt that moved nothing does.
     let failed = 0;
-    while (failed < CLOSE_MAX_FAILED_ATTEMPTS && this.buffer.length > 0) {
+    while (failed < CLOSE_MAX_FAILED_ATTEMPTS && (this.buffer.length > 0 || this.pendingRangeFirst !== undefined)) {
       if (signal?.aborted) break;
-      const before = this.buffer.length;
+      const before = this.buffer.length + this.pendingRangeWidth();
       await this.flush(signal);
-      if (this.buffer.length === 0) break;
+      const remaining = this.buffer.length + this.pendingRangeWidth();
+      if (remaining === 0) break;
       if (signal?.aborted) break;
-      if (this.buffer.length < before) continue; // a sub-batch landed; keep going
+      if (remaining < before) continue; // progress (buffer and/or range shrank); keep going
       failed += 1;
       await sleepUnlessAborted(200 * failed, signal);
     }
-    if (this.buffer.length > 0)
+    if (this.buffer.length > 0 || this.pendingRangeFirst !== undefined)
       this.warnUndeliveredAtClose(signal?.aborted ? "durability boundary deadline expired" : undefined);
   }
 
   private warnUndeliveredAtClose(reason?: string): void {
-    if (this.buffer.length === 0) return;
+    const dropped = this.buffer.length + this.pendingRangeWidth();
+    if (dropped === 0) return;
     this.log.warn("message batcher closed with undelivered messages", {
       run_id: this.runId,
-      dropped: this.buffer.length,
+      dropped,
       ...(reason ? { reason } : {}),
     });
   }
