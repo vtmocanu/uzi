@@ -43,19 +43,23 @@
 # 🔴 THE PATTERN STRING IS NOT ITSELF A CONTIGUOUS LITERAL, so this script does not
 # self-flag when the main scan reaches it: a `[` or `(` follows each token prefix in
 # PATTERN, so no `glpat-…`/`ghp_…`/etc. run in this file is a complete literal.
-# Verified by self-verify (g): the script stays clean when scanned over itself.
+# The main scan proves it: this script (a tracked, in-scope file) stays clean when the
+# very same detector is run over its own source.
 #
 # 🔴 SELF-TEST (positive/negative/canary controls) BEFORE THE MAIN SCAN, because a
 # silent pass is the failure mode -- a detector that matched nothing reads identical
-# to a clean tree. The positive control BUILDS a complete literal AT RUNTIME (never a
-# contiguous literal in this source) and asserts the detector MATCHES it; the negative
-# control writes the ASSEMBLED form (prefix and body as separate quoted fragments) and
-# asserts the detector does NOT; and each allowlisted canary is asserted to still carry
-# a detectable complete shape. Any control that comes out wrong is exit 2 (instrument
-# broken), not a finding. Scratch files live under a `mktemp -d` temp dir OUTSIDE the
-# repo (trap-cleaned on EXIT), scanned with `git grep --no-index` from inside that dir
-# -- `--no-index` so it reads a file that is not in the index, run from within the dir
-# because `git grep --no-index` refuses a path outside the enclosing repository.
+# to a clean tree. ONE POSITIVE CONTROL PER DETECTOR ALTERNATIVE builds a complete
+# literal for that provider AT RUNTIME (never a contiguous literal in this source) and
+# asserts the detector MATCHES it, so a PCRE/pattern regression that blinds a SINGLE
+# alternative is caught by name rather than hidden behind the four branches that still
+# fire; the negative control writes the ASSEMBLED form (prefix and body as separate
+# quoted fragments) and asserts the detector does NOT; and each allowlisted canary is
+# asserted to still carry a detectable complete shape. Any control that comes out wrong
+# is exit 2 (instrument broken), not a finding. Scratch files live under a `mktemp -d`
+# temp dir OUTSIDE the repo (trap-cleaned on EXIT), scanned with `git grep --no-index`
+# from inside that dir -- `--no-index` so it reads a file that is not in the index, run
+# from within the dir because `git grep --no-index` refuses a path outside the enclosing
+# repository.
 #
 # EXIT CODES (the check-skill-size.sh / check-migration-additive.sh convention):
 #     2 = the instrument is broken (bad args, a canary missing/untracked/lost its
@@ -128,25 +132,51 @@ SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/check-token-literals.XXXXXX")" || {
 }
 trap 'rm -rf "$SCRATCH"' EXIT
 
-# A 20-char body built at runtime (brace expansion, no unquoted command substitution).
-BODY="$(printf 'A%.0s' {1..20})"
+# Token BODIES, each a run of 'A' of the exact minimum length its rule needs, built at
+# runtime (brace expansion, no unquoted command substitution). Building the body -- and
+# joining it to its prefix -- at runtime is why no line in this source is itself a
+# complete token: the prefix lives ONLY inside a printf FORMAT string, where a `%`
+# immediately follows it and breaks the shape.
+b20="$(printf 'A%.0s' {1..20})"    # GitLab   glpat-       body (20 chars)
+b36="$(printf 'A%.0s' {1..36})"    # GitHub classic  ghp_ body (36 chars)
+b82="$(printf 'A%.0s' {1..82})"    # GitHub fine-grained github_pat_ body (82 chars)
+b93="$(printf 'A%.0s' {1..93})"    # Anthropic sk-ant-api03- body (93 chars, then AA)
+s10a="$(printf '1%.0s' {1..10})"   # Slack    xoxb- first  digit run (10 digits)
+s10b="$(printf '2%.0s' {1..10})"   # Slack    xoxb- second digit run (10 digits)
 
-# POSITIVE control: a COMPLETE literal assembled AT RUNTIME (never written contiguous
-# in this source). The detector MUST match it, or it could not flag a real literal.
-printf 'x = "glpat-%s"\n' "$BODY" > "$SCRATCH/positive.txt"
-if ! scan_scratch "$SCRATCH" positive.txt; then
-  echo "check-token-literals: ================================================================" >&2
-  echo "check-token-literals: INSTRUMENT BROKEN -- the detector did NOT match a complete" >&2
-  echo "check-token-literals: provider-token literal built at runtime. The pattern or git's" >&2
-  echo "check-token-literals: PCRE support has regressed; a clean tree would mean nothing." >&2
-  echo "check-token-literals: ================================================================" >&2
-  exit 2
-fi
+# POSITIVE controls, ONE PER DETECTOR ALTERNATIVE. Each provider's COMPLETE literal is
+# assembled AT RUNTIME (never written contiguous in this source), then the detector is
+# asserted to MATCH it -- so a PCRE/pattern regression that silently kills a SINGLE
+# branch is caught and NAMED, instead of hiding behind the branches that still fire.
+# The label/value pairs are kept side by side so the failure message can name the dead
+# branch; the prefix appears only in the printf format strings below (a `%` follows it).
+pos_labels=(glpat- ghp_ github_pat_ sk-ant-api03- xoxb-)
+pos_values=(
+  "$(printf 'glpat-%s' "$b20")"
+  "$(printf 'ghp_%s' "$b36")"
+  "$(printf 'github_pat_%s' "$b82")"
+  "$(printf 'sk-ant-api03-%sAA' "$b93")"
+  "$(printf 'xoxb-%s-%sabcd' "$s10a" "$s10b")"
+)
+for i in "${!pos_labels[@]}"; do
+  printf 'x = "%s"\n' "${pos_values[$i]}" > "$SCRATCH/positive.txt"
+  if ! scan_scratch "$SCRATCH" positive.txt; then
+    echo "check-token-literals: ================================================================" >&2
+    echo "check-token-literals: INSTRUMENT BROKEN -- the detector did NOT match a complete" >&2
+    echo "check-token-literals: provider-token literal built at runtime for the '${pos_labels[$i]}'" >&2
+    echo "check-token-literals: branch. That detector alternative is DEAD: a real leak of this" >&2
+    echo "check-token-literals: shape would ride through green. The pattern or git's PCRE support" >&2
+    echo "check-token-literals: has regressed for this provider; a clean tree would mean nothing." >&2
+    echo "check-token-literals: ================================================================" >&2
+    exit 2
+  fi
+done
 
 # NEGATIVE control: the ASSEMBLED form -- prefix and body as two separate quoted
 # fragments joined at runtime. The detector MUST NOT match it, or the sanctioned
-# runtime-assembly fix would itself be flagged.
-printf 'fake := "glpat-" + "%s"\n' "$BODY" > "$SCRATCH/negative.txt"
+# runtime-assembly fix would itself be flagged. One is sufficient: it proves the
+# sanctioned assembly technique passes, and the technique is provider-agnostic.
+printf 'fake := "glpat-" + "%s"\n' "$b20" > "$SCRATCH/negative.txt"
 if scan_scratch "$SCRATCH" negative.txt; then
   echo "check-token-literals: ================================================================" >&2
   echo "check-token-literals: INSTRUMENT BROKEN -- the detector matched the ASSEMBLED form" >&2
