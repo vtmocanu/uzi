@@ -4222,6 +4222,17 @@ export class RunRunner {
       // resume_phase ⇒ undefined (a fresh run, or an older server), which the executor treats as
       // today's behaviour.
       onCredentialSwitch: (cb) => steering.onCredentialSwitch(cb),
+      // PRD #1247 M5b (MAJOR-6): run `fn` with credential-switch trips DEFERRED (the signal held,
+      // not tripped) — the executor wraps a plan-REVISION planning turn in this so a switch never
+      // releases before gatePlan has persisted the revised plan. Balanced begin/finally-end.
+      deferCredentialSwitch: async (fn) => {
+        steering.beginCredentialSwitchDefer();
+        try {
+          return await fn();
+        } finally {
+          steering.endCredentialSwitchDefer();
+        }
+      },
       // PRD #1247 M5b (data-integrity fix): attempt the held-state credential switch IN PLACE from
       // wherever the executor was when it tripped (a live implement turn, or an idle gate/question/
       // follow-up waiter), INSTEAD of letting the CredentialSwitchSignal reach the outer catch and

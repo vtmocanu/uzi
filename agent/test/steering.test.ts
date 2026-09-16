@@ -308,6 +308,35 @@ describe("SteeringChannel — credential switch (PRD #1247 M5b)", () => {
     await ch.stop();
   });
 
+  it("MAJOR-6: a signal inside a defer window is HELD (not tripped/aborting), then fires once the window closes", async () => {
+    const cancel = new AbortController();
+    let interrupts = 0;
+    const ch = new SteeringChannel(
+      switchClient([{ credentialSwitch: { generation: 7 } }]), // re-offered every poll
+      "run-1",
+      1,
+      nullLogger(),
+      cancel,
+      { claimGeneration: 7 },
+    );
+    ch.onCredentialSwitch(() => {
+      interrupts++;
+    });
+    // Open a defer window BEFORE the poll loop can trip (the executor opens it around a revision turn).
+    ch.beginCredentialSwitchDefer();
+    ch.start();
+    await tick(30); // several polls inside the window
+    assert.strictEqual(ch.pendingCredentialSwitch(), undefined, "inside the defer window the switch is NOT recorded (no pending set)");
+    assert.strictEqual(interrupts, 0, "inside the defer window the re-armable interrupt does NOT fire");
+    assert.strictEqual(cancel.signal.aborted, false, "inside the defer window the current turn is NOT aborted");
+    // Close the window: the same-generation signal, still offered every poll, now trips.
+    ch.endCredentialSwitchDefer();
+    for (let n = 0; n < 300 && ch.pendingCredentialSwitch() === undefined; n++) await tick();
+    assert.strictEqual(ch.pendingCredentialSwitch(), 7, "once the window closes the switch trips at the next matching poll");
+    assert.strictEqual(interrupts, 1, "and the interrupt fires exactly once");
+    await ch.stop();
+  });
+
   it("does NOT act on a switch whose generation does not match this claim (a superseded claim)", async () => {
     const cancel = new AbortController();
     let interrupts = 0;

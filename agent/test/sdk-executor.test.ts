@@ -412,6 +412,45 @@ describe("SdkExecutor plan revision loop (PRD #41)", () => {
     assert.strictEqual(result.branch, "agent/issue-5");
   });
 
+  it("MAJOR-6: a mid-revision switch cannot approve the superseded plan — the revision turn runs DEFERRED and the re-gate persists the revised plan OUTSIDE the window", async () => {
+    const { queryFn } = fakeTurns([
+      [submitPlan("# Plan v1"), resultSuccess()], // planning turn
+      [submitPlan("# Plan v2"), resultSuccess()], // revision turn — MUST run inside the defer window
+      [assistantText("implementing"), signalDone(), resultSuccess()], // loop turn 1
+    ]);
+    // The revised v2 plan is persisted by the gate (probe.persisted / probe.gated). The fix wraps the
+    // revision planning turn in a credential-switch DEFER window so a mid-revision switch is held —
+    // not released mid-turn, which would leave the run row on the superseded v1 and re-present it on a
+    // reclaim. Record when the window opens/closes relative to how many gates have run: it must open
+    // AFTER the v1 gate and close BEFORE the v2 gate, so the switch trips only at the v2 gate wait,
+    // once v2 is persisted. Reverting the revision turn to runThroughSwitch (no defer) never calls the
+    // hook, so `order` stays empty and this reddens.
+    const order: string[] = [];
+    const probe = makeCtx(
+      {
+        agents: [lead, coder, reviewer],
+        deferCredentialSwitch: async (fn) => {
+          order.push(`begin@gated=${probe.gated.length}`);
+          try {
+            return await fn();
+          } finally {
+            order.push(`end@gated=${probe.gated.length}`);
+          }
+        },
+      },
+      [revise("add a rollback step"), approve],
+    );
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+
+    // Exactly one defer window, opened after the v1 gate (gated.length === 1) and closed before the
+    // v2 gate (still 1) — so a switch during the revision turn is deferred, never released mid-turn.
+    assert.deepStrictEqual(order, ["begin@gated=1", "end@gated=1"], "the revision turn is wrapped in one defer window, between the two gates");
+    // The re-gate ran AFTER the window and persisted the REVISED v2 (never the superseded v1), so a
+    // reclaim at resume_phase 'awaiting_approval' re-presents v2, not v1.
+    assert.deepStrictEqual(probe.gated, ["# Plan v1", "# Plan v2"], "the gate saw v1 then the revised v2");
+    assert.strictEqual(probe.persisted.planMd, "# Plan v2", "the persisted plan is the revised v2, so a reclaim resumes on it, never v1");
+  });
+
   it("a revision turn that submits no plan fails with REASON_NO_PLAN", async () => {
     const { queryFn } = fakeTurns([
       [submitPlan("# Plan v1"), resultSuccess()],

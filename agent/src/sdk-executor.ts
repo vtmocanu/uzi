@@ -1684,13 +1684,21 @@ export class SdkExecutor implements Executor {
           // A revision turn is a PLANNING turn (pre-approval), so it runs with the OWN
           // subagents (baseConfig), exactly like the first plan turn — the roster
           // selection only takes effect once a plan is APPROVED (PRD #37 Decision 5).
-          // PRD #1247 M5b (data-integrity fix): the revision planning turn is switch-survivable too
-          // (a live turn, or its own ask_user park) — same handling as the initial planning turn.
-          const revStep = await this.runThroughSwitch(ctx, state, () =>
-            this.drivePlanningTurn(ctx, baseConfig, resumeId, buildRevisePlanPrompt(feedback), state, idleMs, budget),
-          );
-          if ("released" in revStep) return { branch: ctx.branch, switchReleased: true };
-          const turn = revStep.value;
+          // PRD #1247 M5b (MAJOR-6 rework): DEFER the credential switch across the revision planning
+          // turn instead of releasing mid-turn. The turn's new plan is not persisted until the gate
+          // report below, so a mid-turn release would leave the run row on the OLD plan_md and a
+          // reclaim would re-present the SUPERSEDED plan (resume_phase 'awaiting_approval' re-emits
+          // run.plan_md verbatim). Deferring holds the switch — which rides every inputs poll — until
+          // the NEXT trip point, the gate wait just below, AFTER gatePlan has persisted the revised
+          // plan; the reclaim then resumes at the gate on the CORRECT plan. The defer window covers
+          // the turn's own ask_user sub-park and closes before the gate wait. A stub/test executor
+          // that does not wire the hook runs the turn undeferred (the switch signal then reaches the
+          // outer catch, byte-identical to the pre-rework behaviour).
+          const runRevisionTurn = () =>
+            this.drivePlanningTurn(ctx, baseConfig, resumeId, buildRevisePlanPrompt(feedback), state, idleMs, budget);
+          const turn = ctx.deferCredentialSwitch
+            ? await ctx.deferCredentialSwitch(runRevisionTurn)
+            : await runRevisionTurn();
           resumeId = turn.sessionId ?? resumeId;
           approvedPlan = turn.plan;
           // Decision 2: the candidate is REPLACED across a revision round.

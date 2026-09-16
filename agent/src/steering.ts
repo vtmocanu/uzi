@@ -214,6 +214,15 @@ export class SteeringChannel {
    *  generation it is releasing. Never reset within a flight: the flight ends (release or give-up)
    *  the moment it is set. */
   private pendingSwitchGeneration: number | undefined;
+  /** PRD #1247 M5b (MAJOR-6 rework): while > 0, a matching credential_switch signal is DEFERRED —
+   *  maybeTripCredentialSwitch returns WITHOUT setting pendingSwitchGeneration and WITHOUT aborting,
+   *  so the signal (which rides every poll) is honored at the NEXT trip point after the window ends.
+   *  The executor opens this window around a plan-REVISION planning turn, whose new plan is not yet
+   *  persisted: releasing mid-turn would leave the run row on the OLD plan_md, so a reclaim would
+   *  re-present the superseded plan. Deferring lets the switch trip at the following gate wait
+   *  instead, AFTER gatePlan has persisted the revised plan. A COUNTER (not a bool) so nested/
+   *  re-entrant windows compose. */
+  private switchDeferDepth = 0;
   /** PRD #1247 M5b: a RE-ARMABLE interrupt the executor registers (via ctx.onCredentialSwitch),
    *  the exact analog of pauseNowInterrupt — invoked on the matching switch so a switch drops the
    *  in-flight turn even after the shared cancel controller has already fired once (an
@@ -352,6 +361,22 @@ export class SteeringChannel {
    *  retain-and-stop (where the server stamp may still be pending). */
   rearmCredentialSwitch(): void {
     this.pendingSwitchGeneration = undefined;
+  }
+
+  /** PRD #1247 M5b (MAJOR-6): open a defer window — a matching credential_switch signal is held
+   *  (not tripped, not aborting) until the window closes. Used around a plan-REVISION planning turn
+   *  so a switch never releases the claim before gatePlan has persisted the revised plan (which
+   *  would strand the run row on the OLD plan_md and re-present the superseded plan on a reclaim).
+   *  Counted, so a defer window that itself nests one composes; balanced by endCredentialSwitchDefer. */
+  beginCredentialSwitchDefer(): void {
+    this.switchDeferDepth++;
+  }
+
+  /** PRD #1247 M5b (MAJOR-6): close a defer window opened by beginCredentialSwitchDefer. The pending
+   *  signal is NOT re-tripped here — it rides every poll, so the next poll after the window closes
+   *  (the gate wait) trips it, by which point the revised plan is persisted. */
+  endCredentialSwitchDefer(): void {
+    if (this.switchDeferDepth > 0) this.switchDeferDepth--;
   }
 
   /** Start the poll loop (idempotent). Runs until stop(). */
@@ -654,6 +679,10 @@ export class SteeringChannel {
    */
   private maybeTripCredentialSwitch(generation: number): void {
     if (generation !== this.claimGeneration) return; // a stale signal for a superseded claim
+    // PRD #1247 M5b (MAJOR-6): inside a defer window (a plan-revision planning turn), DEFER — do NOT
+    // set pendingSwitchGeneration and do NOT abort. The signal rides every poll, so it trips at the
+    // next poll after the window closes (the gate wait), by which point the revised plan is persisted.
+    if (this.switchDeferDepth > 0) return;
     if (this.pendingSwitchGeneration !== undefined) return; // already tripped once — idempotent
     this.pendingSwitchGeneration = generation;
     // Mid-turn: trip the shared controller (guarded on !aborted so we don't double-abort a

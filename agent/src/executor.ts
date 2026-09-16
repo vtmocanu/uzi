@@ -440,6 +440,16 @@ export interface RunContext {
    */
   attemptCredentialSwitch?(): Promise<"released" | "gave_up">;
   /**
+   * PRD #1247 M5b (MAJOR-6): run `fn` with credential-switch trips DEFERRED — a matching switch
+   * signal is held (not tripped, the turn not aborted) for the duration, then honored at the next
+   * trip point after `fn` returns. The executor wraps a plan-REVISION planning turn (whose new plan
+   * is not yet persisted) in this, so a switch never releases mid-revision — which would leave the
+   * run row on the OLD plan_md and re-present the superseded plan on a reclaim. The switch instead
+   * trips at the following gate wait, after gatePlan has persisted the revised plan. Balanced
+   * (begin/finally end) by the runner. Absent on the stub/test executors ⇒ `fn` runs undeferred.
+   */
+  deferCredentialSwitch?<T>(fn: () => Promise<T>): Promise<T>;
+  /**
    * PRD #517 M3: park an INTERACTIVE task run after a clean `signal_done`, waiting for the
    * next follow-up. The runner's implementation (a) reports `awaiting_followup` and verifies
    * the ack (the park must actually take, mirroring askUser's ack check), then (b) blocks on
