@@ -975,15 +975,40 @@ export class Outbox {
   ): Promise<{ generation: number; messages: OutgoingMessage[] } | null> {
     const parsed = await this.readAuthed(path.join(this.runDir(runId), rec.file), MAC_DOMAIN_SEGMENT);
     if (!parsed) return null;
+    // Bind the segment body to its manifest record's authenticated seq range. Every
+    // record in a run shares one MAC key, so a valid segment from another range in the
+    // same run could be swapped in for rec.file; requiring the body's firstSeq/lastSeq
+    // to equal rec's — and the messages to be non-empty, in-bounds, strictly increasing,
+    // and to open on rec.firstSeq / close on rec.lastSeq — prevents replaying foreign
+    // messages or mis-advancing the cursor. Gaps between kept seqs are allowed (dropped
+    // seqs live in separate range records). A mismatch returns null, routing replayRecord
+    // to sendGapChunks (safe per-seq gap tombstones) — the existing fallback.
     if (
       parsed.version !== 1 ||
       parsed.runId !== runId ||
       typeof parsed.generation !== "number" ||
+      parsed.firstSeq !== rec.firstSeq ||
+      parsed.lastSeq !== rec.lastSeq ||
       !Array.isArray(parsed.messages)
     ) {
       return null;
     }
-    return { generation: parsed.generation, messages: parsed.messages as OutgoingMessage[] };
+    const messages = parsed.messages as OutgoingMessage[];
+    if (
+      messages.length === 0 ||
+      messages[0]!.seq !== rec.firstSeq ||
+      messages[messages.length - 1]!.seq !== rec.lastSeq
+    ) {
+      return null;
+    }
+    let prevSeq = rec.firstSeq - 1;
+    for (const m of messages) {
+      if (typeof m?.seq !== "number" || m.seq < rec.firstSeq || m.seq > rec.lastSeq || m.seq <= prevSeq) {
+        return null;
+      }
+      prevSeq = m.seq;
+    }
+    return { generation: parsed.generation, messages };
   }
 
   /** Serialize a record body + its domain-separated MAC into the on-disk string. */

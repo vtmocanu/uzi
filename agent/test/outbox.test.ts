@@ -1037,6 +1037,63 @@ describe("Outbox M1 (PRD #1391 Run A)", () => {
     assert.ok(gens.every((g) => g === 0), "a foreign-run range file must not lend its generation; replay under 0");
   });
 
+  it("15d. a segment file swapped for ANOTHER RANGE of the SAME run (valid MAC, matching runId) replays gap tombstones, not the foreign-range messages", async () => {
+    // The MAC-key range bind in readSegmentFile: every record in a run shares one MAC
+    // key, so a valid segment from a DIFFERENT range of the SAME run authenticates when
+    // swapped in for another record's file (runId matches, MAC verifies) — the runId
+    // bind of 15b does not catch this. Binding the body's firstSeq/lastSeq (and the
+    // message bounds) to the manifest record's range is what blocks replaying foreign
+    // messages or mis-advancing the cursor: the mismatched record replays as per-seq gap
+    // tombstones over ITS manifest range. FAILS on the unfixed readSegmentFile, which
+    // returns the swapped segment's messages (seqs 3,4) for the [1,2] record — seqs 1,2
+    // vanish and 3,4 replay twice.
+    const root = await mkRoot();
+    const a = makeOutbox(root);
+    await a.init();
+    await a.appendSegment("rS", 1, [textMsg(1, "one"), textMsg(2, "two")]);
+    await a.appendSegment("rS", 1, [textMsg(3, "three"), textMsg(4, "four")]);
+
+    // Swap the [1,2] record's file contents for the [3,4] segment's authenticated bytes.
+    // The MAC stays valid (same run, same key) but the body's firstSeq/lastSeq (3/4) no
+    // longer match the [1,2] manifest record's range.
+    const runDir = path.join(root, "rS");
+    const seg34 = await fs.readFile(path.join(runDir, "seg-3-4-v1.json"));
+    await fs.writeFile(path.join(runDir, "seg-1-2-v1.json"), seg34);
+
+    const b = makeOutbox(root);
+    await b.init();
+    const c = collector();
+    const res = await b.drainRun("rS", c.send);
+    assert.equal(res.retired, true, "the run fully retires");
+
+    const sent = c.flat();
+    const bySeq = new Map(sent.map((m) => [m.seq, m]));
+    assert.deepEqual(
+      [...bySeq.keys()].sort((x, y) => x - y),
+      [1, 2, 3, 4],
+      "the manifest ranges still prove a contiguous 1..4 stream (no vanished/duplicated seqs)",
+    );
+    // The mismatched [1,2] record replays as gap tombstones over ITS range, never the
+    // foreign seqs' payloads.
+    for (const s of [1, 2]) {
+      const m = bySeq.get(s);
+      assert.ok(m, `seq ${s} was replayed`);
+      assert.equal(m.kind, "status", `seq ${s} is a gap tombstone`);
+      const p = m.payload as { event?: string; text?: string };
+      assert.equal(p.event, "message_dropped", `seq ${s} is a drop tombstone`);
+      assert.ok(
+        !String(p.text ?? "").includes("three"),
+        "the foreign-range messages (three/four) must never replay under the [1,2] record",
+      );
+    }
+    // The untouched [3,4] record replays its real messages exactly once.
+    const m3 = bySeq.get(3);
+    const m4 = bySeq.get(4);
+    assert.ok(m3 && m4, "seqs 3 and 4 were replayed");
+    assert.equal((m3.payload as { text?: string }).text, "three", "seq 3 is the real message");
+    assert.equal((m4.payload as { text?: string }).text, "four", "seq 4 is the real message");
+  });
+
   it("16. a root that cannot be created fails closed (init resolves, disabled; no throw at startup)", async () => {
     // init()'s first act is fs.mkdir(this.root). A throwing root creation (EACCES/EROFS/
     // ENOSPC, here forced by pre-creating the root path as a regular FILE so mkdir hits
