@@ -2242,7 +2242,9 @@ type StateRequest struct {
 	// generation). Nullable and OPTIONAL: a LEGACY worker (no capability) omits it, and the
 	// report is honoured UNFENCED exactly as before — back-compat by construction. The field
 	// MUST exist here because httpx.DecodeJSON sets DisallowUnknownFields — a capability
-	// worker that sends it would 400 otherwise.
+	// worker that sends it would 400 otherwise. The SAME field is also the forge-park fence
+	// (PRD #1392 M1): the forge_unreachable park transaction requires it to equal the locked
+	// run's claim_generation and answers 409 stale_claim on a mismatch (#1247's precedence).
 	ClaimGeneration *int64  `json:"claim_generation"`
 	PlanMd          *string `json:"plan_md"`
 	Branch          *string `json:"branch"`
@@ -2462,13 +2464,6 @@ type StateRequest struct {
 	// worker's empty-turn park. httpx.DecodeJSON rejects unknown fields, so this field MUST
 	// exist here or a new worker's report 400s.
 	RecoveryCause *string `json:"recovery_cause"`
-	// ClaimGeneration is the claim generation the worker holds, carried on the forge-park report
-	// (PRD #1392 M1). UNTRUSTED, but it is a FENCE not a value: the forge-park transaction
-	// requires it to equal the locked run's claim_generation and answers 409 stale_claim on a
-	// mismatch, with nothing mutated (#1247's precedence, checked first). Required for a
-	// forge_unreachable park; ignored on every other report. httpx.DecodeJSON rejects unknown
-	// fields, so this field MUST exist here or a new worker's report 400s.
-	ClaimGeneration *int64 `json:"claim_generation"`
 }
 
 // ProposalPayload is the structured idea a scheduled issues-mode prompt run emits on

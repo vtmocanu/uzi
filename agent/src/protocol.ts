@@ -1989,11 +1989,6 @@ export interface StateRequest {
    *  which the worker's capability-aware fallback avoids by only sending it when the api
    *  advertised `recovery_park_cause` at register (D7). */
   recovery_cause?: string;
-  /** PRD #1392 M2 (#1247 generation fence): the exact claim generation THIS report is made
-   *  against, so the api's park transaction settles only the hold that generation opened. Sent
-   *  on the forge-unreachable park report; also kept on the older-api untyped fallback report
-   *  ONLY when the api advertised `claim_generation_fence` (D7). Additive + optional. */
-  claim_generation?: number;
 }
 
 /**

@@ -37,7 +37,7 @@ type claimCred struct {
 //
 // These are ALIASES, not a second definition. The whole ten-value vocabulary lives
 // in autoselect (see Reason there for why it hosts even the non-auto three), and
-// the SQL CHECK is the same ten (00089's eight, widened by 00230); these exist only so the claim path reads
+// the SQL CHECK is the same ten (00089's eight, widened by 00233); these exist only so the claim path reads
 // in its own idiom rather than saying string(autoselect.ReasonPinned) on every line.
 // Aliasing means a rename upstream is a compile error here, which a second set of
 // string literals would not be.
@@ -355,7 +355,7 @@ func (s *Service) claimSecretID(ctx context.Context, wkr store.Worker, run store
 // #1247 M1, D1/D2/D9). ok is false when there is NO override to apply and the caller
 // must fall through to the worker binding: a NULL/empty mode, a `pinned` mode whose id
 // was nulled by a token delete (D1, mirroring #104's worker-binding rule), or an
-// unrecognised mode (impossible through the validator + the 00230 CHECK, resolved as
+// unrecognised mode (impossible through the validator + the 00233 CHECK, resolved as
 // inherit — the safe direction). ok is true when the override decides the credential:
 //
 //   - pinned + a live id → staticChoice(id, run_pinned), but ONLY after confirming the

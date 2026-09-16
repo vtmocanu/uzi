@@ -494,7 +494,7 @@ type RunDTO struct {
 	// labelled literally `default`, so the label is not even a reliable hint.
 	//
 	// One of ten server-generated values (autoselect.Reason, closed by migration
-	// 00089's CHECK as widened by 00230): default, pinned, judge, auto, best_of_pool,
+	// 00089's CHECK as widened by 00233): default, pinned, judge, auto, best_of_pool,
 	// pool_empty, pool_stale, open_failed, run_pinned, run_default.
 	// run_pinned/run_default are the per-run credential override reasons (PRD #1247).
 	// Null for a run claimed before M1.
@@ -690,7 +690,7 @@ type RunDTO struct {
 // M1): the mode the owner chose and, for a pinned override, the token label. It is the
 // null-when-absent shape on both RunDTO and ScheduleDTO.
 type CredentialOverrideDTO struct {
-	// Mode is one of "pinned" | "auto" | "default" (migration 00230's CHECK). A client
+	// Mode is one of "pinned" | "auto" | "default" (migration 00233's CHECK). A client
 	// must render an unrecognised value honestly — the API is deployed separately.
 	Mode string `json:"mode"`
 	// Label is the token name for a pinned override, snapshotted for readability after a

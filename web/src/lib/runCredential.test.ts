@@ -43,12 +43,12 @@ function run(over: Partial<Parameters<typeof describeCredential>[0]> = {}) {
 // from the array left this green. See SELECT_REASONS for why deriving it from the
 // exhaustive Record closes that.
 function reasonsFromMigration(): string[] {
-  // PRD #1247 M1 widened the vocabulary in 00230 (run_pinned, run_default) alongside the
-  // override-MODE CHECKs, so this parses 00230 now. 00230 carries other quoted
+  // PRD #1247 M1 widened the vocabulary in 00233 (run_pinned, run_default) alongside the
+  // override-MODE CHECKs, so this parses 00233 now. 00233 carries other quoted
   // vocabularies (the override-mode IN-list 'pinned'/'auto'/'default'), so a whole-file
   // regex would pull those in; anchor strictly on the runs_anthropic_select_reason_check
   // IN-list, the same way the Go guard (TestSelectReasonVocabularyMatchesCheck) does.
-  const path = "../api/internal/store/migrations/00230_per_run_credential_override.sql";
+  const path = "../api/internal/store/migrations/00233_per_run_credential_override.sql";
   const raw = readFileSync(path, "utf8");
   // Comments first. The prose above the statement names several reasons, and a regex
   // over the whole file would happily collect them and agree with itself.
@@ -56,17 +56,17 @@ function reasonsFromMigration(): string[] {
     .split("\n")
     .filter((line) => !line.trimStart().startsWith("--"))
     .join("\n");
-  // Isolate the select-reason IN-list. 00230 both DROPs (no IN-list) and re-ADDs the
+  // Isolate the select-reason IN-list. 00233 both DROPs (no IN-list) and re-ADDs the
   // constraint; this non-global .match() returns only the FIRST match in the file, the
   // Up section's re-ADD (the NOT VALID one, the widened vocabulary), before the Down
   // section's copy.
   const inList = stmt.match(/anthropic_select_reason IN \(([^)]*)\)/);
-  if (!inList) throw new Error("could not find the anthropic_select_reason IN-list in 00230");
+  if (!inList) throw new Error("could not find the anthropic_select_reason IN-list in 00233");
   return [...inList[1].matchAll(/'([a-z_]+)'/g)].map((m) => m[1]).sort();
 }
 
 describe("the reason vocabulary is one vocabulary", () => {
-  it("matches migration 00230's CHECK", () => {
+  it("matches migration 00233's CHECK", () => {
     const fromSQL = reasonsFromMigration();
     expect(fromSQL.length).toBeGreaterThan(0);
     expect(fromSQL).toEqual([...SELECT_REASONS].sort());

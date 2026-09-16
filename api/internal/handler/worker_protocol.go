@@ -871,7 +871,7 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 			// worker that ignores the extra field still treats it as "changed nothing"); the
 			// disposition is what distinguishes a stale claim from a benign no-op.
 			httpx.JSON(w, http.StatusConflict, map[string]any{
-				"run":         runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.clock()),
+				"run":         runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock()),
 				"disposition": "stale_claim",
 			})
 		case errors.Is(err, workersvc.ErrRunNotOwned):

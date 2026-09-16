@@ -19,8 +19,8 @@ import (
 // argument applied to itself.
 //
 // The SQL CHECK is the same ten values — migration 00089's original eight, widened
-// by PRD #1247's 00230 to add run_pinned and run_default — and
-// TestSelectReasonVocabularyMatchesCheck parses the 00230 CHECK and compares. A value
+// by PRD #1247's 00233 to add run_pinned and run_default — and
+// TestSelectReasonVocabularyMatchesCheck parses the 00233 CHECK and compares. A value
 // added in Go and forgotten in SQL is a constraint violation at claim time, i.e. a
 // FAILED RUN; one removed from Go but left in SQL is a promise nothing keeps.
 type Reason string
@@ -81,7 +81,7 @@ const (
 )
 
 // AllReasons is the WHOLE reason vocabulary, in a form a guard can enumerate. Three
-// guards do: workersvc's, which compares it against migration 00230's CHECK; the
+// guards do: workersvc's, which compares it against migration 00233's CHECK; the
 // CLI's, which requires a rendering for each; and the web's, which requires the same
 // of the TypeScript union.
 //

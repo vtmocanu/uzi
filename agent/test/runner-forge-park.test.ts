@@ -637,7 +637,7 @@ describe("RunRunner — pre-clone forge-unreachable park (PRD #1392 M2)", () => 
     }
   });
 
-  it("D7 (recovery_release_exact_echo only): parks via an untyped report with NEITHER field after a proven exact release", async () => {
+  it("D7 (recovery_release_exact_echo only): parks via an untyped report carrying claim_generation (PRD #1247 universal stamp) but NO cause after a proven exact release", async () => {
     const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-forgepark-d7-echo-"));
     try {
       const client = new ForgeParkClient(["recovery_release_exact_echo"], {
@@ -654,7 +654,13 @@ describe("RunRunner — pre-clone forge-unreachable park (PRD #1392 M2)", () => 
       assert.strictEqual(client.releaseCalls[0]!.generation, 20);
       const park = parkReport(client);
       assert.ok(park, "an untyped recovery_wait report must be sent");
-      assert.strictEqual(park!.claim_generation, undefined, "no generation field without the fence");
+      // PRD #1247 M5b: the reportState closure now stamps claim_generation on EVERY /state report
+      // (the uniform generation fence), which supersedes #1392's forge-park conditional-omit. It is
+      // SAFE: an api advertising recovery_release_exact_echo also accepts the claim_generation field
+      // (both landed in #1392), so it is never rejected — and an api old enough to reject it would
+      // already 400 every other #1247 report, so #1247 does not pair with it. The fence now covers
+      // the forge-park report too (a stale/superseded park is rejected). recovery_cause stays absent.
+      assert.strictEqual(park!.claim_generation, 20, "PRD #1247 stamps claim_generation on every report");
       assert.strictEqual(park!.recovery_cause, undefined, "no cause on the baseline fallback");
       assert.strictEqual(statusTexts(claim.run_id).filter((t) => /parked/.test(t)).length, 1, "one park event");
     } finally {

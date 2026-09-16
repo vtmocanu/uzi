@@ -6,7 +6,7 @@
 -- worker binding" — today's behaviour, back-compat by construction (D1).
 --
 -- Every CHECK on a POPULATED table is added NOT VALID here and VALIDATE-d in the
--- sibling 00231, the lock-cheap two-step 00226/00227 established for a CHECK on a live
+-- sibling 00234, the lock-cheap two-step 00226/00227 established for a CHECK on a live
 -- table: an inline validated CHECK would scan every row under the ACCESS EXCLUSIVE lock
 -- the ALTER already holds, whereas VALIDATE CONSTRAINT later takes only a
 -- write-compatible SHARE UPDATE EXCLUSIVE scan. The new run_credential_epochs table is
@@ -60,7 +60,7 @@ CREATE TABLE run_credential_epochs (
 
 -- Close the override-mode vocabulary to its three legal values on both tables. Added
 -- NOT VALID (enforced for new/updated rows immediately; the backlog scan deferred to
--- 00231). NULL stays legal on both — it is the inherit default every existing row carries.
+-- 00234). NULL stays legal on both — it is the inherit default every existing row carries.
 ALTER TABLE runs ADD CONSTRAINT runs_credential_override_mode_check
     CHECK (credential_override_mode IS NULL OR credential_override_mode IN ('pinned', 'auto', 'default')) NOT VALID;
 ALTER TABLE run_schedules ADD CONSTRAINT run_schedules_credential_override_mode_check
@@ -70,7 +70,7 @@ ALTER TABLE run_schedules ADD CONSTRAINT run_schedules_credential_override_mode_
 -- (run_pinned = a per-run override named a token; run_default = a per-run override of
 -- mode 'default'). The two-step DROP + re-ADD NOT VALID is required because 00089 added
 -- this CHECK validated: re-adding NOT VALID keeps the add lock-cheap and defers the
--- backlog scan to 00231. The IN-list is 00089's eight (see 00089's comment) plus
+-- backlog scan to 00234. The IN-list is 00089's eight (see 00089's comment) plus
 -- run_pinned and run_default; an `auto` override reuses the selector's own reasons, so
 -- no auto-specific value is added.
 ALTER TABLE runs DROP CONSTRAINT runs_anthropic_select_reason_check;

@@ -721,12 +721,12 @@ func TestPinnedOpenFailureStaysTerminal(t *testing.T) {
 // MUTATION THIS CATCHES: adding a constant to either Go half without touching 00089
 // (and the reverse). Measured both directions.
 func TestSelectReasonVocabularyMatchesCheck(t *testing.T) {
-	// PRD #1247 M1 widened the vocabulary in 00230 (run_pinned, run_default) alongside
-	// the two override-MODE CHECKs, so the guard now parses 00230. 00230 carries several
+	// PRD #1247 M1 widened the vocabulary in 00233 (run_pinned, run_default) alongside
+	// the two override-MODE CHECKs, so the guard now parses 00233. 00233 carries several
 	// unrelated quoted vocabularies (the override-mode IN-list 'pinned'/'auto'/'default'
 	// on runs and run_schedules), so a whole-file regex would pull those in and disagree
 	// with AllReasons. Anchor strictly on the runs_anthropic_select_reason_check IN-list.
-	const path = "../store/migrations/00230_per_run_credential_override.sql"
+	const path = "../store/migrations/00233_per_run_credential_override.sql"
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read %s: %v", path, err)
@@ -741,7 +741,7 @@ func TestSelectReasonVocabularyMatchesCheck(t *testing.T) {
 		stmt.WriteString(line)
 		stmt.WriteString("\n")
 	}
-	// Isolate the select-reason IN-list. 00230 both DROPs and re-ADDs the constraint;
+	// Isolate the select-reason IN-list. 00233 both DROPs and re-ADDs the constraint;
 	// the DROP CONSTRAINT statement carries no IN-list, and only the FIRST re-ADD in the
 	// Up section (the NOT VALID one) is the widened vocabulary. Anchor on
 	// "anthropic_select_reason IN (" and collect the quoted values up to the closing ")".

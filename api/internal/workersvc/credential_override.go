@@ -39,7 +39,7 @@ func pgOverrideSecretID(o *CredentialOverride) pgtype.UUID {
 // behaviour is byte-identical until M2/M6 wire real user input.
 //
 // Mode is one of the three stored modes (pinned/auto/default), mirroring migration
-// 00230's runs.credential_override_mode CHECK; SecretID is set ONLY for a pinned
+// 00233's runs.credential_override_mode CHECK; SecretID is set ONLY for a pinned
 // override and is the caller's own anthropic_token id. "inherit" is not a stored mode —
 // it is expressed as a nil *CredentialOverride (both columns NULL).
 type CredentialOverride struct {

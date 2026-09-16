@@ -14,7 +14,7 @@ import (
 // This file closes the DB-truth gap a test-adequacy pass found in PRD #1247 M1
 // (prds/1247-per-run-token-selection.md): TestClaimRecordsCredentialEpochLiveDB in the
 // sibling file only exercises the no-override path and claims once. Nothing before this
-// file exercised the override columns, GetUserSecretMetaByIDOfKind, migration 00230/00231's
+// file exercised the override columns, GetUserSecretMetaByIDOfKind, migration 00233/00234's
 // CHECK constraints, or the epoch ON CONFLICT (run_id, claim_generation) DO UPDATE against
 // a REAL Postgres. Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres.
 
@@ -50,7 +50,7 @@ func (e codexTestEnv) seedAnthropicSecret(t *testing.T, userID uuid.UUID, label 
 
 // seedQueuedRunWithOverride inserts a queued run carrying the given per-run credential
 // override columns DIRECTLY via a store update/insert, never through the M2 create-time
-// wiring (which does not exist in M1) — this is exactly what proves migration 00230/00231's
+// wiring (which does not exist in M1) — this is exactly what proves migration 00233/00234's
 // CHECK constraints accept the write against REAL Postgres rather than a fake store.
 func (e codexTestEnv) seedQueuedRunWithOverride(t *testing.T, userID, repoID uuid.UUID, mode string, secretID *uuid.UUID) uuid.UUID {
 	t.Helper()

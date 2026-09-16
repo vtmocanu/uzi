@@ -62,7 +62,7 @@ func (h *Handler) SetRunCredential(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body := map[string]any{"run": runToDTO(res.Run, h.runPriorityClass(r.Context(), res.Run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.clock())}
+	body := map[string]any{"run": runToDTO(res.Run, h.runPriorityClass(r.Context(), res.Run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock())}
 	if res.Warning != "" {
 		body["warning"] = res.Warning
 	}

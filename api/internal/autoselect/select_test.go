@@ -459,7 +459,7 @@ func TestAllReasonsIsAFreshSlice(t *testing.T) {
 	}
 	// Ten: M5 folded workersvc's three static reasons in here (so the whole vocabulary
 	// has ONE Go home), and PRD #1247 added run_pinned/run_default. The SQL CHECK is the
-	// same ten (00089's eight, widened by 00230) and three separate guards compare against
+	// same ten (00089's eight, widened by 00233) and three separate guards compare against
 	// it — workersvc's, the CLI's, and the web's — so a change to this number is a change
 	// to four artefacts and must be deliberate.
 	if len(AllReasons()) != 10 {

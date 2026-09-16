@@ -3324,7 +3324,7 @@ ON CONFLICT (run_id, seq) DO NOTHING;
 -- order. The persisted log is authoritative; the WS layer (M5) is only a live
 -- cache on top of this.
 -- Column order matches the run_messages table order (the two PRD #99 columns were
--- appended by 00075, claim_generation by PRD #1247's 00230), so sqlc keeps returning
+-- appended by 00075, claim_generation by PRD #1247's 00233), so sqlc keeps returning
 -- store.RunMessage rather than minting a separate ...Row type.
 -- TO DO IT RIGHT: new columns must be APPENDED to both this SELECT list and
 -- ListRunMessagesForWorkerPage's, in the same order the ALTER TABLE adds them.
