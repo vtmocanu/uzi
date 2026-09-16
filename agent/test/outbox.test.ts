@@ -1002,6 +1002,68 @@ describe("Outbox M1 (PRD #1391 Run A)", () => {
     );
   });
 
+  it("15c. a range file swapped for another run's (valid MAC, foreign runId) replays under generation 0, not the foreign generation", async () => {
+    // Defense in depth (the range-record generation bind in replayRecord): a genuine
+    // manifest (runId matches the directory) whose referenced RANGE file was swapped for
+    // another run's (valid MAC, embedded runId "rA", generation 7) must NOT lend that
+    // foreign generation to the replayed tombstones — a range file's runId mismatch falls
+    // back to generation 0. The seq range still comes from the genuine manifest. FAILS on
+    // the unfixed generation read, which trusts the foreign file's generation (7).
+    const root = await mkRoot();
+    const a = makeOutbox(root);
+    await a.init();
+    await a.appendRangeRecord("rA", 7, 1, 3); // rA's range file: embedded runId "rA", generation 7
+    await a.appendRangeRecord("rB", 9, 1, 3); // rB genuine: manifest runId "rB"
+
+    // Swap rB's range file for rA's (same filename, valid MAC, embedded runId "rA");
+    // rB's manifest stays genuine (runId "rB").
+    const rangeName = (await fs.readdir(path.join(root, "rB"))).find(
+      (n) => n.startsWith("range-") && n.endsWith(".json"),
+    );
+    assert.ok(rangeName, "rB has a range file");
+    await fs.copyFile(path.join(root, "rA", rangeName), path.join(root, "rB", rangeName));
+
+    const b = makeOutbox(root);
+    await b.init();
+    const gens: number[] = [];
+    const seqs: number[] = [];
+    const res = await b.drainRun("rB", async (msgs, gen) => {
+      gens.push(gen);
+      for (const m of msgs) seqs.push(m.seq);
+    });
+    assert.equal(res.retired, true);
+    assert.deepEqual(seqs, [1, 2, 3], "the genuine manifest still proves the seq range as gap tombstones");
+    assert.ok(gens.length > 0, "the record replayed");
+    assert.ok(gens.every((g) => g === 0), "a foreign-run range file must not lend its generation; replay under 0");
+  });
+
+  it("16. a root that cannot be created fails closed (init resolves, disabled; no throw at startup)", async () => {
+    // init()'s first act is fs.mkdir(this.root). A throwing root creation (EACCES/EROFS/
+    // ENOSPC, here forced by pre-creating the root path as a regular FILE so mkdir hits
+    // EEXIST/ENOTDIR) must be caught, logged and disable the store — never reject, which
+    // would abort worker startup at `await outbox.init()` in main.ts. FAILS on the unfixed
+    // init(), whose unguarded mkdir rejects the promise.
+    const root = await mkRoot();
+    await fs.writeFile(root, "not a directory"); // now mkdir(root, {recursive:true}) throws
+    const { logger, lines } = recordingLogger();
+    const o = makeOutbox(root, { log: logger });
+    await assert.doesNotReject(o.init(), "init must resolve, never reject, when the root cannot be created");
+    assert.equal(o.isDisabled(), true, "a root that cannot be created fails closed (disabled)");
+    // Disabled → every later call is a safe no-op.
+    await o.appendSegment("r1", 1, [textMsg(1, "x")]);
+    assert.deepEqual(o.runsWithPending(), [], "a disabled store persists nothing");
+    const c = collector();
+    const res = await o.drainRun("r1", c.send);
+    assert.equal(c.calls(), 0, "a disabled store replays nothing");
+    assert.equal(res.retired, false, "drain on a disabled store retires nothing");
+    assert.ok(
+      (lines as Array<{ level: string; msg: string }>).some(
+        (l) => l.level === "error" && l.msg.includes("cannot create root"),
+      ),
+      "the failure is logged",
+    );
+  });
+
   it("H4b. ordinary reclaim still deletes an empty, aged run with no concurrent append", async () => {
     // The fix does not weaken the ordinary reclaim path: with no concurrent append the
     // under-lock re-check still finds the run empty and aged, so it IS removed.
