@@ -957,6 +957,14 @@ export class MessageBatcher {
           this.pendingRangeFirst = undefined;
           this.pendingRangeLast = undefined;
         } catch (err) {
+          // Advance the failure clock so nextDelayMs() backs off on a persistent
+          // spill-write failure instead of retrying at the flat batchMs cadence.
+          // Guarded on `spilled` so a rearm() during the await above (which clears
+          // this state) is not re-dirtied.
+          if (this.spilled) {
+            this.consecutiveFailures += 1;
+            this.failingSince ??= Date.now();
+          }
           this.log.warn("outbox spill range-record write failed; will retry", {
             run_id: this.runId,
             error: errMessage(err),
@@ -980,6 +988,14 @@ export class MessageBatcher {
           );
         } catch (err) {
           this.buffer = batch.concat(this.buffer);
+          // Advance the failure clock so nextDelayMs() backs off on a persistent
+          // spill-write failure instead of retrying at the flat batchMs cadence.
+          // Guarded on `spilled` so a rearm() during the await above (which clears
+          // this state) is not re-dirtied.
+          if (this.spilled) {
+            this.consecutiveFailures += 1;
+            this.failingSince ??= Date.now();
+          }
           this.log.warn("outbox spill segment write failed; will retry", {
             run_id: this.runId,
             error: errMessage(err),

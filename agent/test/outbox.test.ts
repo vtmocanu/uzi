@@ -193,10 +193,10 @@ describe("Outbox M1 (PRD #1391 Run A)", () => {
     const root = await mkRoot();
     const a = makeOutbox(root);
     await a.init();
-    await a.appendSegment("r1", 1, [textMsg(1, "real")]);
-
-    // Replace the run dir with a symlink pointing at a renamed copy of the data.
-    await fs.rename(path.join(root, "r1"), path.join(root, "r1-real"));
+    // The real data lives at "r1-real" (its manifest's embedded runId matches its
+    // directory name, so the runId-binding guard accepts it). "r1" is then a symlink
+    // pointing at it, which init must refuse without following.
+    await a.appendSegment("r1-real", 1, [textMsg(1, "real")]);
     await fs.symlink(path.join(root, "r1-real"), path.join(root, "r1"));
 
     const { logger, lines } = recordingLogger();
@@ -858,6 +858,148 @@ describe("Outbox M1 (PRD #1391 Run A)", () => {
     );
     assert.equal((c.flat()[0]?.payload as { text: string } | undefined)?.text, "second");
     assert.equal(c.flat()[0]?.kind, "text", "the survivor is the real message, not a tombstone");
+  });
+
+  it("13. a wide range record drains as BOUNDED chunks (≤ OUTBOX_DRAIN_CHUNK), contiguous per-seq, retired once", async () => {
+    // A range record whose span far exceeds the drain chunk (a persistent
+    // appendRangeRecord failure can let the pending range grow unboundedly). Replay
+    // must emit BOUNDED, sequence-ordered chunks — never one huge tombstone array in a
+    // single send() call. FAILS on the unfixed expandRecord, which materialises the
+    // whole range and posts it as ONE oversized send.
+    const root = await mkRoot();
+    const o = makeOutbox(root);
+    await o.init();
+    const FIRST = 1;
+    const LAST = 1200; // span > 2 * OUTBOX_DRAIN_CHUNK (500)
+    const SPAN = LAST - FIRST + 1;
+    await o.appendRangeRecord("r1", 1, FIRST, LAST);
+
+    const batches: OutgoingMessage[][] = [];
+    const res = await o.drainRun("r1", async (msgs) => {
+      batches.push(msgs);
+    });
+
+    assert.equal(res.retired, true, "the record retires once every chunk lands");
+    assert.ok(batches.length >= 3, `a wide range must split into multiple chunks (got ${batches.length})`);
+    for (const b of batches) assert.ok(b.length <= 500, `each chunk is ≤ OUTBOX_DRAIN_CHUNK (got ${b.length})`);
+    const flat = batches.flat();
+    assert.equal(flat.length, SPAN, "one tombstone per seq over the whole range");
+    assert.deepEqual(
+      flat.map((m) => m.seq),
+      Array.from({ length: SPAN }, (_, i) => FIRST + i),
+      "the concatenation is contiguous ascending per-seq",
+    );
+    for (const m of flat) {
+      assert.equal(m.kind, "status");
+      assert.equal((m.payload as { event: string }).event, "message_dropped");
+    }
+    assert.deepEqual(o.runsWithPending(), [], "fully retired");
+  });
+
+  it("14. a wide range record whose send throws mid-drain stays PENDING and re-drains from the start", async () => {
+    // A later chunk failing must leave the record pending (retired only after ALL
+    // chunks land) and re-draining must re-send from the first seq — dedup on
+    // (run_id, seq) absorbs the repeat. FAILS on the unfixed single-send expandRecord:
+    // there is only one send call, so it cannot throw on a "later chunk" and the record
+    // retires on the first pass.
+    const root = await mkRoot();
+    const o = makeOutbox(root);
+    await o.init();
+    await o.appendRangeRecord("r1", 1, 1, 1200);
+
+    let calls = 0;
+    const res1 = await o.drainRun("r1", async () => {
+      calls++;
+      if (calls === 2) throw new Error("transient network");
+    });
+    assert.equal(res1.retired, false, "a throw on a later chunk leaves the record pending");
+    assert.equal(calls, 2, "the drain stopped at the failing chunk");
+    assert.ok(o.runsWithPending().includes("r1"), "the record is still pending");
+    assert.equal(o.depthFor("r1")?.pendingMessages, 1200, "no partial retirement — the whole record remains");
+
+    // Re-drain healthy: it re-sends from the START (the whole range replays again).
+    const batches: OutgoingMessage[][] = [];
+    const res2 = await o.drainRun("r1", async (msgs) => {
+      batches.push(msgs);
+    });
+    assert.equal(res2.retired, true);
+    const flat = batches.flat();
+    assert.equal(flat[0]?.seq, 1, "re-drain restarts from the first seq");
+    assert.equal(flat.length, 1200, "the whole range replays again");
+  });
+
+  it("15. a manifest copied into another run's directory (valid MAC, wrong embedded runId) is skipped", async () => {
+    // Under the worker-local key a manifest copied from run A into run B's directory
+    // still authenticates. loadRun must reject the cross-run manifest (the embedded
+    // runId does not match the directory), or the drainer would post A's messages under
+    // B's id. FAILS on the unfixed loadRun, which loads rB's records and replays them.
+    const root = await mkRoot();
+    const a = makeOutbox(root);
+    await a.init();
+    await a.appendSegment("rA", 1, [textMsg(1, "a"), textMsg(2, "b")]);
+
+    // Copy rA's whole directory (manifest + segment, both carrying embedded runId "rA"
+    // and a valid MAC under the shared .key) into a directory named "rB".
+    const src = path.join(root, "rA");
+    const dst = path.join(root, "rB");
+    await fs.mkdir(dst, { recursive: true });
+    for (const name of await fs.readdir(src)) await fs.copyFile(path.join(src, name), path.join(dst, name));
+
+    const { logger, lines } = recordingLogger();
+    const b = makeOutbox(root, { log: logger });
+    await b.init();
+
+    assert.ok(b.runsWithPending().includes("rA"), "the genuine run still loads (its embedded runId matches)");
+    assert.ok(!b.runsWithPending().includes("rB"), "the cross-run copy is skipped");
+    assert.equal(b.depthFor("rB"), undefined, "no records loaded for the cross-run copy");
+    const c = collector();
+    const res = await b.drainRun("rB", c.send);
+    assert.equal(c.calls(), 0, "nothing replays for the cross-run copy");
+    assert.equal(res.retired, true, "an unknown/rejected run has nothing to replay");
+    assert.ok(
+      (lines as Array<{ level: string; msg: string }>).some(
+        (l) => l.level === "warn" && l.msg.includes("cross-run"),
+      ),
+      "the cross-run manifest is logged",
+    );
+  });
+
+  it("15b. a genuine manifest referencing a segment file from ANOTHER run replays gap tombstones, not the foreign messages", async () => {
+    // Defense in depth (readSegmentFile's runId bind): a genuine manifest (runId matches
+    // the directory) whose referenced segment file was swapped for another run's
+    // (valid MAC, embedded runId "rA") must NOT replay the foreign run's real payloads —
+    // the segment is unrecoverable, so the manifest-proven range replays as gap
+    // tombstones. FAILS on the unfixed readSegmentFile, which returns rA's messages.
+    const root = await mkRoot();
+    const a = makeOutbox(root);
+    await a.init();
+    await a.appendSegment("rA", 1, [textMsg(1, "from-A-1"), textMsg(2, "from-A-2")]);
+    await a.appendSegment("rB", 1, [textMsg(1, "from-B-1"), textMsg(2, "from-B-2")]);
+
+    // Swap rB's segment file for rA's (same filename, valid MAC, embedded runId "rA");
+    // rB's manifest stays genuine (runId "rB").
+    const segName = "seg-1-2-v1.json";
+    await fs.copyFile(path.join(root, "rA", segName), path.join(root, "rB", segName));
+
+    const b = makeOutbox(root);
+    await b.init();
+    const c = collector();
+    const res = await b.drainRun("rB", c.send);
+    assert.equal(res.retired, true);
+    const sent = c.flat();
+    assert.deepEqual(
+      sent.map((m) => m.seq),
+      [1, 2],
+      "the genuine manifest still proves the seq range",
+    );
+    for (const m of sent) {
+      assert.equal(m.kind, "status", "a foreign-run segment is unrecoverable → gap tombstones");
+      assert.equal((m.payload as { event: string }).event, "message_dropped");
+    }
+    assert.ok(
+      sent.every((m) => !String((m.payload as { text?: string }).text ?? "").includes("from-A")),
+      "the foreign run's real messages must never be replayed under this run",
+    );
   });
 
   it("H4b. ordinary reclaim still deletes an empty, aged run with no concurrent append", async () => {

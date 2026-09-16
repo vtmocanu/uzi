@@ -104,6 +104,41 @@ async function mkOutboxWithSeam(): Promise<{
   };
 }
 
+/** A real tmpdir Outbox whose write seam TIMESTAMPS every raw write of `failKind` and
+ *  throws it (until `disarm()`), so a test can observe the retry CADENCE of a persistent
+ *  spill-write failure. Every other write proceeds, so the batcher still enters spill
+ *  (network 503 + manifest writes) before the armed kind starts failing. */
+async function mkOutboxTimedSeam(
+  failKind: "segment" | "range",
+): Promise<{ outbox: Outbox; attempts: number[]; disarm: () => void }> {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "batcher-outbox-timed-"));
+  tmpRoots.push(dir);
+  const attempts: number[] = [];
+  let armed = true;
+  const outbox = new Outbox({
+    root: path.join(dir, "outbox"),
+    log: nullLogger(),
+    runMaxBytes: 64 * 1024 * 1024,
+    maxBytes: 512 * 1024 * 1024,
+    retentionMs: 7 * 86_400_000,
+    rawWrite: async (write, ctx) => {
+      if (armed && ctx.kind === failKind) {
+        attempts.push(Date.now());
+        throw new Error(`injected ${ctx.kind} write failure`);
+      }
+      await write();
+    },
+  });
+  await outbox.init();
+  return {
+    outbox,
+    attempts,
+    disarm: () => {
+      armed = false;
+    },
+  };
+}
+
 /** A client whose postMessages behaviour a test flips at will: "fail" throws the
  *  given transient/fatal status, "ok" records the landed batch and resolves. Extra
  *  batcher args (generation, signal) are ignored, matching the real call shape. */
@@ -470,6 +505,69 @@ describe("MessageBatcher spill/drain (PRD #1391 M2)", () => {
 
     // Only now (assertion already made against the OPEN batcher) do we close, purely to
     // stop the timer for a clean teardown.
+    await batcher.close();
+  });
+
+  it("persistent spill SEGMENT-write failures BACK OFF (advance the failure clock), not a flat retry cadence", async () => {
+    // On the unfixed code the spill segment-write catch never advances
+    // consecutiveFailures, so nextDelayMs() reschedules at the flat batchMs cadence on a
+    // persistent disk/quota failure. The fix increments the failure counter so the
+    // retries back off exponentially — the same five attempts then span far longer than
+    // a flat cadence could.
+    const { outbox, attempts, disarm } = await mkOutboxTimedSeam("segment");
+    const api = flippableClient("fail", 503);
+    const batchMs = 20;
+    const batcher = new MessageBatcher(api.client, RUN, 0, batchMs, nullLogger(), undefined, undefined, {
+      outbox,
+      transientTripMs: 40,
+    });
+
+    fill(batcher, 3);
+    await until(() => batcher.isSpilled(), 4000, "batcher enters spill");
+    await until(() => attempts.length >= 5, 4000, "five persistent segment-write attempts observed");
+
+    const span = attempts[4]! - attempts[0]!;
+    const flatCadence = batchMs * 4; // ~4 gaps at the flat batchMs cadence
+    assert.ok(
+      span > 250,
+      `persistent spill-write failures must back off (5 attempts spanned ${span}ms; a flat cadence is ~${flatCadence}ms)`,
+    );
+
+    disarm();
+    await batcher.close();
+  });
+
+  it("persistent spill RANGE-record-write failures BACK OFF (advance the failure clock), not a flat retry cadence", async () => {
+    // The range-record write catch has the SAME defect and the SAME fix. A 1-byte spill
+    // buffer folds the burst below into a pending range whose write fails persistently;
+    // the retries must back off rather than reschedule at the flat batchMs cadence.
+    const { outbox, attempts, disarm } = await mkOutboxTimedSeam("range");
+    const api = flippableClient("fail", 503);
+    const batchMs = 20;
+    const batcher = new MessageBatcher(api.client, RUN, 0, batchMs, nullLogger(), undefined, undefined, {
+      outbox,
+      transientTripMs: 40,
+      spillBufferBytes: 1, // so the burst folds into a pending range record
+    });
+
+    fill(batcher, 2, "pre");
+    await until(() => batcher.isSpilled(), 4000, "batcher enters spill");
+    await until(() => (outbox.depthFor(RUN)?.pendingMessages ?? 0) >= 2, 4000, "pre-spill messages land as a segment");
+    await sleep(40); // settle: buffer empty, idle
+
+    // Burst while spilled: seq 3 fills the empty buffer (kept); seqs 4..7 exceed the
+    // 1-byte cap and fold into the pending range, whose record write then fails.
+    fill(batcher, 5, "burst");
+    await until(() => attempts.length >= 5, 4000, "five persistent range-record-write attempts observed");
+
+    const span = attempts[4]! - attempts[0]!;
+    const flatCadence = batchMs * 4;
+    assert.ok(
+      span > 250,
+      `persistent range-write failures must back off (5 attempts spanned ${span}ms; a flat cadence is ~${flatCadence}ms)`,
+    );
+
+    disarm();
     await batcher.close();
   });
 

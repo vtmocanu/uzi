@@ -61,6 +61,12 @@ const RESERVE_FILE = ".reserve";
  *  one status tombstone per seq carrying this reason (batcher.ts:152-180). */
 const DROP_REASON = "outbox quota";
 
+/** PRD #1391 M2 / D2: replay a record in bounded, sequence-ordered chunks so a very
+ *  wide range record never materialises one huge tombstone array or posts one oversized
+ *  request. A message COUNT well under MAX_BATCH_BYTES (tombstones are ~150 B each, so
+ *  500 ≈ ~75 KiB, comfortably below the 512 KiB batch cap). */
+const OUTBOX_DRAIN_CHUNK = 500;
+
 /** A record's kind in the manifest. A `segment` carries real messages; a `range`
  *  is a compact stand-in for a dropped seq range that replay expands into one
  *  tombstone per seq (D2). */
@@ -254,11 +260,17 @@ export class Outbox {
    * method no-ops.
    */
   async init(): Promise<void> {
-    await fs.mkdir(this.root, { recursive: true, mode: 0o700 });
-    if (await this.isSymlink(this.root)) {
-      this.log.error("outbox: root is a symlink; disabling (following it would escape /data)", {
-        path: this.root,
-      });
+    try {
+      await fs.mkdir(this.root, { recursive: true, mode: 0o700 });
+      if (await this.isSymlink(this.root)) {
+        this.log.error("outbox: root is a symlink; disabling (following it would escape /data)", {
+          path: this.root,
+        });
+        this.disabled = true;
+        return;
+      }
+    } catch (err) {
+      this.log.error("outbox: cannot create root; disabling", { error: errText(err) });
       this.disabled = true;
       return;
     }
@@ -357,8 +369,8 @@ export class Outbox {
     const parsed = await this.readAuthed(manifestPath, MAC_DOMAIN_MANIFEST);
     if (!parsed) return; // absent (nothing to load) or tampered (readAuthed logged)
     const manifest = coerceManifest(parsed);
-    if (!manifest) {
-      this.log.warn("outbox: malformed manifest; skipping run", { run_id: runId });
+    if (!manifest || manifest.runId !== runId) {
+      this.log.warn("outbox: malformed or cross-run manifest; skipping run", { run_id: runId });
       return;
     }
     const recordBytes = new Map<string, number>();
@@ -495,12 +507,12 @@ export class Outbox {
         .sort((a, b) => a.firstSeq - b.firstSeq);
 
       for (const rec of pending) {
-        const { messages, generation } = await this.expandRecord(rs, rec);
         try {
           // Replay each record under the generation it was PRODUCED under (needed for
           // #1247's fence once the api advertises it, D11), so a re-claim's generation
-          // bump never rebinds an old attempt's frames.
-          await send(messages, generation);
+          // bump never rebinds an old attempt's frames. Streamed in bounded chunks so a
+          // wide range never allocates one huge array or posts one oversized request.
+          await this.replayRecord(rs, rec, send);
         } catch (err) {
           if (err instanceof StaleClaimError) {
             this.log.warn("outbox: record refused as stale claim; retiring locally (frames lost, not rebound)", {
@@ -520,30 +532,59 @@ export class Outbox {
     });
   }
 
-  /** The messages a record replays as (plus the generation it was produced under):
-   *  a segment's own messages, or one tombstone per seq for a range record / a
-   *  segment the valid manifest proves is missing. A missing/tampered segment or a
-   *  MAC-bad range record has no readable generation, so it replays under 0. */
-  private async expandRecord(
+  /** Replay one record as bounded, sequence-ordered chunks over `send` (each ≤
+   *  OUTBOX_DRAIN_CHUNK messages). A segment replays its own messages under the
+   *  segment's generation; a range record — or a segment the valid manifest proves
+   *  missing/tampered — replays as per-seq gap tombstones under the record's
+   *  generation (0 when the file does not authenticate). Any send throw propagates so
+   *  drainRun leaves the record pending; the record is retired by the caller only
+   *  after every chunk lands. A crash/partial send re-drains the whole record on the
+   *  next pass — dedup on (run_id, seq) absorbs the repeat. */
+  private async replayRecord(
     rs: RunState,
     rec: ManifestRecordRef,
-  ): Promise<{ messages: OutgoingMessage[]; generation: number }> {
+    send: (msgs: OutgoingMessage[], generation: number) => Promise<void>,
+  ): Promise<void> {
     if (rec.kind === "segment") {
       const seg = await this.readSegmentFile(rs.runId, rec);
-      if (seg) return { messages: seg.messages, generation: seg.generation };
+      if (seg) {
+        for (let i = 0; i < seg.messages.length; i += OUTBOX_DRAIN_CHUNK) {
+          await send(seg.messages.slice(i, i + OUTBOX_DRAIN_CHUNK), seg.generation);
+        }
+        return;
+      }
       this.log.warn("outbox: segment missing/tampered; emitting per-seq gap tombstones (manifest proves the range)", {
         run_id: rs.runId,
         first_seq: rec.firstSeq,
         last_seq: rec.lastSeq,
       });
-      return { messages: gapTombstones(rec, "outbox segment unrecoverable"), generation: 0 };
+      await this.sendGapChunks(rec, "outbox segment unrecoverable", 0, send);
+      return;
     }
-    // A range record IS a dropped range; the manifest ref alone proves it, so we
-    // expand from the ref whether or not the file authenticates. Read the file only
-    // for its recorded generation (0 when it does not authenticate).
+    // A range record IS a dropped range; the manifest ref alone proves it. Read the file
+    // only for its recorded generation (0 when it does not authenticate OR its
+    // authenticated runId does not match this directory — see the runId-binding fix).
     const parsed = await this.readAuthed(path.join(this.runDir(rs.runId), rec.file), MAC_DOMAIN_RANGE);
-    const generation = parsed && typeof parsed.generation === "number" ? parsed.generation : 0;
-    return { messages: gapTombstones(rec, DROP_REASON), generation };
+    const generation =
+      parsed && parsed.runId === rs.runId && typeof parsed.generation === "number" ? parsed.generation : 0;
+    await this.sendGapChunks(rec, DROP_REASON, generation, send);
+  }
+
+  /** Emit one status tombstone per seq in `rec`'s range, chunked to OUTBOX_DRAIN_CHUNK
+   *  and sent in ascending order — building only one chunk at a time (never the whole
+   *  range) so an arbitrarily wide range never allocates a huge array. */
+  private async sendGapChunks(
+    rec: Pick<ManifestRecordRef, "firstSeq" | "lastSeq">,
+    reason: string,
+    generation: number,
+    send: (msgs: OutgoingMessage[], generation: number) => Promise<void>,
+  ): Promise<void> {
+    for (let start = rec.firstSeq; start <= rec.lastSeq; start += OUTBOX_DRAIN_CHUNK) {
+      const end = Math.min(start + OUTBOX_DRAIN_CHUNK - 1, rec.lastSeq);
+      const chunk: OutgoingMessage[] = [];
+      for (let seq = start; seq <= end; seq++) chunk.push(gapTombstone(seq, reason));
+      await send(chunk, generation);
+    }
   }
 
   private async retireRecord(rs: RunState, rec: ManifestRecordRef, stale: boolean): Promise<void> {
@@ -934,7 +975,12 @@ export class Outbox {
   ): Promise<{ generation: number; messages: OutgoingMessage[] } | null> {
     const parsed = await this.readAuthed(path.join(this.runDir(runId), rec.file), MAC_DOMAIN_SEGMENT);
     if (!parsed) return null;
-    if (parsed.version !== 1 || typeof parsed.generation !== "number" || !Array.isArray(parsed.messages)) {
+    if (
+      parsed.version !== 1 ||
+      parsed.runId !== runId ||
+      typeof parsed.generation !== "number" ||
+      !Array.isArray(parsed.messages)
+    ) {
       return null;
     }
     return { generation: parsed.generation, messages: parsed.messages as OutgoingMessage[] };
@@ -1192,16 +1238,13 @@ function coerceManifest(obj: Record<string, unknown>): ManifestData | null {
   };
 }
 
-/** One status tombstone per seq in a record's range — the shape the browser
- *  renders (batcher.ts:152-180) and that keeps the stream contiguous (D2). */
-function gapTombstones(rec: Pick<ManifestRecordRef, "firstSeq" | "lastSeq">, reason: string): OutgoingMessage[] {
-  const out: OutgoingMessage[] = [];
-  for (let seq = rec.firstSeq; seq <= rec.lastSeq; seq++) {
-    out.push({
-      seq,
-      kind: "status",
-      payload: { text: `message dropped: ${reason} (seq ${seq})`, event: "message_dropped", reason },
-    });
-  }
-  return out;
+/** One status tombstone for a single seq — the shape the browser renders
+ *  (batcher.ts:152-180) and that keeps the stream contiguous (D2). Built one at a
+ *  time by {@link Outbox.sendGapChunks} so a wide range never allocates a huge array. */
+function gapTombstone(seq: number, reason: string): OutgoingMessage {
+  return {
+    seq,
+    kind: "status",
+    payload: { text: `message dropped: ${reason} (seq ${seq})`, event: "message_dropped", reason },
+  };
 }
