@@ -381,7 +381,10 @@ func TestAwaitingFollowupOverCapFailedLiveDB(t *testing.T) {
 	atCap(staleTerminal)
 
 	staleFailed, err := f.q.FailRunsOfStaleWorkersOverCap(ctx, store.FailRunsOfStaleWorkersOverCapParams{
-		MaxRequeues: 3, Cutoff: pgtype.Timestamptz{Time: time.Now(), Valid: true},
+		// PRD #1390 M1 (D9): the field is now FailCutoff (the two-window cutoff the sweeper
+		// computes as now-2*stale). This worker's heartbeat is an hour stale, so now() as the
+		// cutoff still selects it — the rename keeps this over-cap-park assertion intact.
+		MaxRequeues: 3, FailCutoff: pgtype.Timestamptz{Time: time.Now(), Valid: true},
 		FailureReason: pgT("stale worker over cap"),
 	})
 	if err != nil {

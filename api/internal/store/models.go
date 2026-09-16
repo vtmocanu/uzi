@@ -592,6 +592,7 @@ type Run struct {
 	ClaimReleasedAt             pgtype.Timestamptz `json:"claim_released_at"`
 	CredentialSwitchRequestedAt pgtype.Timestamptz `json:"credential_switch_requested_at"`
 	CredentialSwitchGeneration  pgtype.Int8        `json:"credential_switch_generation"`
+	StaleRequeueGeneration      pgtype.Int8        `json:"stale_requeue_generation"`
 }
 
 type RunCompletionAttempt struct {
@@ -883,6 +884,21 @@ type Worker struct {
 	StatsDiskDataTotalBytes pgtype.Int8        `json:"stats_disk_data_total_bytes"`
 	StatsDiskPressureStreak int32              `json:"stats_disk_pressure_streak"`
 	ProtocolCapabilities    []string           `json:"protocol_capabilities"`
+	SnapshotEpoch           int64              `json:"snapshot_epoch"`
+	SnapshotRegisterNonce   pgtype.Text        `json:"snapshot_register_nonce"`
+	PendingOverflow         bool               `json:"pending_overflow"`
+	PendingOverflowUntil    pgtype.Timestamptz `json:"pending_overflow_until"`
+}
+
+type WorkerActiveRun struct {
+	WorkerID             uuid.UUID          `json:"worker_id"`
+	RunID                uuid.UUID          `json:"run_id"`
+	ClaimGeneration      int64              `json:"claim_generation"`
+	Phase                string             `json:"phase"`
+	TerminalPending      bool               `json:"terminal_pending"`
+	TerminalPendingUntil pgtype.Timestamptz `json:"terminal_pending_until"`
+	SnapshotEpoch        int64              `json:"snapshot_epoch"`
+	ReportedAt           pgtype.Timestamptz `json:"reported_at"`
 }
 
 type WorkerUpgradeMute struct {

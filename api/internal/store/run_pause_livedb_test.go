@@ -289,7 +289,9 @@ func TestRunPauseQueriesLiveDB(t *testing.T) {
 		pausedOver := insertRun(t, "paused", "issue", false, true, true, 9, "", 0)
 		controlOver := insertRun(t, "running", "issue", false, true, true, 9, "", 0)
 		if _, err := q.FailRunsOfStaleWorkersOverCap(ctx, store.FailRunsOfStaleWorkersOverCapParams{
-			FailureReason: pgconvText("worker lost"), MaxRequeues: 5, Cutoff: staleCut}); err != nil {
+			// PRD #1390 M1 (D9): renamed Cutoff → FailCutoff (the two-window cutoff); staleCut still
+			// selects this stale worker, so the paused-run carve-out assertion is unchanged.
+			FailureReason: pgconvText("worker lost"), MaxRequeues: 5, FailCutoff: staleCut}); err != nil {
 			t.Fatalf("FailRunsOfStaleWorkersOverCap: %v", err)
 		}
 		if status(t, pausedOver) != "paused" {
@@ -546,7 +548,9 @@ func TestRunPauseQueriesLiveDB(t *testing.T) {
 		t.Run("FailRunsOfStaleWorkersOverCap", func(t *testing.T) {
 			id := armedRunning(t, 9 /*over cap*/, false)
 			if _, err := q.FailRunsOfStaleWorkersOverCap(ctx, store.FailRunsOfStaleWorkersOverCapParams{
-				FailureReason: pgconvText("worker lost"), MaxRequeues: 5, Cutoff: pgtype.Timestamptz{Time: nowUTC(), Valid: true}}); err != nil {
+				// PRD #1390 M1 (D9): renamed Cutoff → FailCutoff (two-window cutoff); nowUTC() still
+				// selects this stale worker so the health-clear assertion is unchanged.
+				FailureReason: pgconvText("worker lost"), MaxRequeues: 5, FailCutoff: pgtype.Timestamptz{Time: nowUTC(), Valid: true}}); err != nil {
 				t.Fatalf("FailRunsOfStaleWorkersOverCap: %v", err)
 			}
 			assertCleared(t, id, "failed")

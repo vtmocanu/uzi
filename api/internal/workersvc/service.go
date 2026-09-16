@@ -20,6 +20,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -1114,6 +1115,14 @@ type Params struct {
 	// ClaimGrace is the claimed-but-never-started reclaim window. It is not a
 	// PRD env var (the PRD fixes it at 5m in prose); defaulted in New.
 	ClaimGrace time.Duration
+	// SweeperBootGrace (PRD #1390 M1, D1, SWEEPER_BOOT_GRACE) is the boot-grace window
+	// that suppresses the three stale-worker passes (MarkStaleWorkersOffline,
+	// FailRunsOfStaleWorkersOverCap, RequeueRunsOfStaleWorkers) until it has elapsed
+	// since the LISTENER became ready (Service.SetReadyAt), so an api that was unreachable
+	// does not declare every worker dead the instant it returns. Every other sweep pass runs
+	// as today. 0 (the zero value) means "immediate" — today's behaviour — so a Params literal
+	// that omits it is a safe no-op. Mirrored from config; the default lives in config.go.
+	SweeperBootGrace time.Duration
 	// SkillMaxBytes / SkillsMaxPerRun are the skill caps (PRD #16), mirrored from
 	// config. SkillsMaxPerRun bounds the per-run union at claim assembly; both ride
 	// the claim so the worker enforces the same limits (no server/worker drift).
@@ -1474,6 +1483,15 @@ type Service struct {
 	// non-atomically, so a deployment that never wired it can never complete an interlocked
 	// run without the permit transaction. A LEGACY completion never touches it.
 	txBeginner TxBeginner
+	// readyAt is the moment the worker-facing listener(s) became ready (PRD #1390 M1, D1),
+	// stored as Unix nanoseconds (0 = not yet ready). main.go writes it via SetReadyAt after
+	// binding every enabled listener; the sweeper goroutine reads it each tick to anchor the
+	// boot grace. An atomic.Int64 rather than a time.Time so the cross-goroutine read/write is
+	// data-race-free under -race.
+	readyAt atomic.Int64
+	// bootGraceFirstRunLogged flips true the first time a post-grace sweep runs the gated
+	// stale-worker passes, so that transition is logged exactly once (PRD #1390 M1).
+	bootGraceFirstRunLogged atomic.Bool
 }
 
 // SetSettings wires the instance settings reader (PRD #46). Call once at startup,
@@ -1570,6 +1588,42 @@ func (s *Service) SetDeleteCheckpointFn(fn func(ctx context.Context, o pushbroke
 // Production leaves the `go fn()` default New installs; tests set a synchronous
 // runner so the async checkpoint delete is observed deterministically.
 func (s *Service) SetBackground(fn func(func())) { s.background = fn }
+
+// SetReadyAt records the moment the worker-facing listener(s) became ready (PRD #1390 M1,
+// D1). main.go calls it exactly once, AFTER every enabled listener has bound, so the boot
+// grace is anchored on when workers could actually reconnect — not on process start, which
+// ages while the api is still unreachable. Race-safe: stores Unix nanoseconds atomically for
+// the sweeper goroutine to read. A zero t clears it back to "not ready".
+func (s *Service) SetReadyAt(t time.Time) {
+	if t.IsZero() {
+		s.readyAt.Store(0)
+		return
+	}
+	s.readyAt.Store(t.UnixNano())
+}
+
+// readyAtTime reads the listener-ready timestamp set by SetReadyAt, returning the zero
+// time.Time when the listener is not yet ready (the sweeper treats that as grace-active).
+func (s *Service) readyAtTime() time.Time {
+	ns := s.readyAt.Load()
+	if ns == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ns)
+}
+
+// bootGraceActive decides whether the three stale-worker passes are suppressed this tick
+// (PRD #1390 M1, D1). A pure function of the config knob, the listener-ready timestamp and
+// the current time, so it is table-testable without a DB:
+//   - bootGrace <= 0 ⇒ never active (SWEEPER_BOOT_GRACE=0 reproduces today's behaviour).
+//   - readyAt zero (the listener has not bound yet) ⇒ active (a worker cannot have reconnected).
+//   - now before readyAt+bootGrace ⇒ active; at or after ⇒ the grace has elapsed.
+func bootGraceActive(bootGrace time.Duration, readyAt, now time.Time) bool {
+	if bootGrace <= 0 {
+		return false
+	}
+	return readyAt.IsZero() || now.Before(readyAt.Add(bootGrace))
+}
 
 // notify fires the lifecycle hook if one is wired. It is a no-op otherwise, so
 // every call site stays unconditional.

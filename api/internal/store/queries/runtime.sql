@@ -2857,7 +2857,7 @@ UPDATE runs SET status = 'failed', status_since = now(),
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
-WHERE id = @id
+WHERE runs.id = @id
   AND status NOT IN ('completed', 'failed', 'cancelled')
   -- limit_wait excluded EXPLICITLY (PRD #35) — the third statement in this file to
   -- need it, for the same reason as SetRunRunning and SetRunAwaitingApproval above:
@@ -2907,7 +2907,19 @@ WHERE id = @id
   -- slot), not looped, so auto-stopping one would be wrong on the merits. It is excluded today
   -- only by autostop.go's single `if run.Status != "running"` line, unmentioned in that line's
   -- comment, and exposed the day someone relaxes it — so this is its SQL backstop.
-  AND status <> 'paused';
+  AND status <> 'paused'
+  -- PRD #1390 D11: the persist-failure auto-stop honours the terminal-pending lease +
+  -- pending_overflow closure like every other terminal writer — a run whose outcome is
+  -- journaled on the worker (#1391) must not be auto-stopped out from under the pending
+  -- replay while its lease holds. Chat is exempt from the PROTECTION (D10):
+  -- `kind = 'chat' OR NOT EXISTS(...)`.
+  AND (runs.kind = 'chat'
+       OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                       WHERE a.run_id = runs.id AND a.terminal_pending
+                         AND a.terminal_pending_until > now()
+                         AND a.claim_generation = runs.claim_generation)
+           AND NOT EXISTS (SELECT 1 FROM workers w
+                           WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())));
 
 -- name: RejectRunServerSide :execrows
 -- Server-side plan rejection → failed → origin restore → stamp. stop_kind is
@@ -2969,6 +2981,17 @@ UPDATE runs SET status = 'queued', status_since = now(),
     codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
     updated_at = now()
 WHERE status = 'claimed' AND claimed_at < @cutoff
+  -- PRD #1390 D11: a `claimed` run whose initial `running` report never landed while its worker
+  -- journaled a terminal outcome and leased it (or whose owner is pending_overflow) must not be
+  -- reset to `queued` — that would invite a re-claim that overtakes the pending replay. Chat is
+  -- exempt from the PROTECTION (D10): `kind = 'chat' OR NOT EXISTS(...)`.
+  AND (runs.kind = 'chat'
+       OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                       WHERE a.run_id = runs.id AND a.terminal_pending
+                         AND a.terminal_pending_until > now()
+                         AND a.claim_generation = runs.claim_generation)
+           AND NOT EXISTS (SELECT 1 FROM workers w
+                           WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
 RETURNING id, user_id, status;
 
 -- name: RequeueClaimedRunToQueued :execrows
@@ -3198,6 +3221,19 @@ WHERE status = 'running'
             AND w.last_heartbeat_at >= sqlc.arg('worker_stale_cutoff')::timestamptz
       )
   )
+  -- PRD #1390 D11: a run under an unexpired terminal-pending lease for its current generation
+  -- (an outcome journaled on the worker, #1391), or owned by a pending_overflow worker, is not
+  -- timed out — a journaled outcome must not be overwritten by a wall-clock fail while its lease
+  -- holds; the lease/overflow expiry is the backstop. Chat is exempt from the PROTECTION (D10),
+  -- so the guard is `kind = 'chat' OR NOT EXISTS(...)`; SweepRunningTimeout already excludes chat
+  -- by kind above, so the chat arm is inert here but kept identical for one predicate shape.
+  AND (runs.kind = 'chat'
+       OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                       WHERE a.run_id = runs.id AND a.terminal_pending
+                         AND a.terminal_pending_until > now()
+                         AND a.claim_generation = runs.claim_generation)
+           AND NOT EXISTS (SELECT 1 FROM workers w
+                           WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
 RETURNING id, user_id, status;
 
 -- name: StampCompletionBudgetExhausted :execrows
@@ -3257,6 +3293,28 @@ UPDATE runs SET completion_budget_exhausted_at = NULL, updated_at = now() WHERE 
 -- failed instead of re-queued. Stamps move_pending_since (reconcile restores the
 -- origin column; the sweep itself never touches the forge — worker-loss recovery
 -- must not wait on a down forge).
+--
+-- PRD #1390 M1 (D9): the FAIL path requires TWO consecutive stale windows —
+-- @fail_cutoff = now() - 2*WORKER_HEARTBEAT_STALE (the Go caller computes it) — so a run
+-- that was requeued once and then hits a partition just over one window is not terminated
+-- before a heartbeat can re-adopt it; terminal cannot be undone. The stale workers are
+-- locked FIRST in a `locked` CTE that takes each worker row FOR UPDATE ordered by id (the
+-- canonical lock order), so this statement serialises with HeartbeatWorker and re-checks
+-- staleness after a concurrent heartbeat commits — the race where a heartbeat lands between
+-- the staleness read and the terminal write is closed.
+--
+-- PRD #1390 M1 (D11): a run under an unexpired terminal-pending lease for its CURRENT
+-- generation is NOT failed (an outcome is journaled on the worker, #1391), and neither is
+-- any run owned by a worker flagged pending_overflow (the worker-level closure for outcomes
+-- it could not list). Chat is exempt from the lease/overflow PROTECTION (D10) — it is still
+-- failed as before — so the guard is `kind = 'chat' OR NOT EXISTS(...)`, never a top-level
+-- kind <> 'chat'. The lease/overflow expiries (one clock) are the dead-worker backstop.
+WITH locked AS (
+    SELECT workers.id FROM workers
+    WHERE workers.last_heartbeat_at IS NULL OR workers.last_heartbeat_at < @fail_cutoff
+    ORDER BY workers.id
+    FOR UPDATE
+)
 UPDATE runs SET status = 'failed', status_since = now(), failure_reason = @failure_reason,
     -- PRD #69 M7a: the trusted failure class for an orphaned run whose worker is gone.
     fail_origin = 'worker_lost',
@@ -3272,18 +3330,39 @@ UPDATE runs SET status = 'failed', status_since = now(), failure_reason = @failu
     updated_at = now()
 WHERE status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
   AND requeue_count >= @max_requeues
-  AND worker_id IN (
-      SELECT id FROM workers WHERE last_heartbeat_at IS NULL OR last_heartbeat_at < @cutoff
-  )
+  AND worker_id IN (SELECT id FROM locked)
+  -- PRD #1390 D11: terminal-pending lease + pending_overflow closure, chat-exempt (D10).
+  AND (runs.kind = 'chat'
+       OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                       WHERE a.run_id = runs.id AND a.terminal_pending
+                         AND a.terminal_pending_until > now()
+                         AND a.claim_generation = runs.claim_generation)
+           AND NOT EXISTS (SELECT 1 FROM workers w
+                           WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
 RETURNING id, user_id, status;
 
 -- name: RequeueRunsOfStaleWorkers :many
 -- A stale worker's non-terminal run within its re-queue budget → back to queued
 -- (worker_id kept for affinity, requeue_count incremented).
+--
+-- PRD #1390 M1 (D9): the stale workers are locked FIRST in a `locked` CTE that takes each
+-- worker row FOR UPDATE ordered by id (the canonical lock order shared with the over-cap
+-- fail above), so this statement serialises with HeartbeatWorker. The REQUEUE keeps the
+-- single stale window (@cutoff); only the over-cap FAIL waits for the second one (D9).
+WITH locked AS (
+    SELECT workers.id FROM workers
+    WHERE workers.last_heartbeat_at IS NULL OR workers.last_heartbeat_at < @cutoff
+    ORDER BY workers.id
+    FOR UPDATE
+)
 UPDATE runs SET status = 'queued', status_since = now(), requeue_count = requeue_count + 1,
     -- Exit contract (PRD #47 Decision 3): reset on the way back to 'queued'; the
     -- detector re-evaluates the queued signal from this transition's status_since.
     health = 'ok', health_reason = NULL, health_since = NULL,
+    -- PRD #1390 M2b (D2): record the generation this stale-worker requeue charged, so the
+    -- heartbeat re-adoption can refund the requeue only when the same generation is restored
+    -- (a legitimate earlier loss is never refunded). The restore and every ClaimRun clear it.
+    stale_requeue_generation = claim_generation,
     -- Issue #783: bank park time before a worker-death requeue -> queued, since started_at
     -- survives the requeue and the later claimed->running resume would not see the park.
     -- awaiting_followup is intentionally excluded: interactive runs are exempt from
@@ -3299,9 +3378,15 @@ UPDATE runs SET status = 'queued', status_since = now(), requeue_count = requeue
     updated_at = now()
 WHERE status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
   AND requeue_count < @max_requeues
-  AND worker_id IN (
-      SELECT id FROM workers WHERE last_heartbeat_at IS NULL OR last_heartbeat_at < @cutoff
-  )
+  AND worker_id IN (SELECT id FROM locked)
+  -- PRD #1390 D11: terminal-pending lease + pending_overflow closure, chat-exempt (D10).
+  AND (runs.kind = 'chat'
+       OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                       WHERE a.run_id = runs.id AND a.terminal_pending
+                         AND a.terminal_pending_until > now()
+                         AND a.claim_generation = runs.claim_generation)
+           AND NOT EXISTS (SELECT 1 FROM workers w
+                           WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
 RETURNING id, user_id, status;
 
 -- Register-time orphan recovery (worker-scoped) ------------------------------
@@ -3326,9 +3411,19 @@ UPDATE runs SET status = 'failed', status_since = now(), failure_reason = @failu
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
-WHERE worker_id = @worker_id
+WHERE runs.worker_id = @worker_id
   AND status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
   AND requeue_count >= @max_requeues
+  -- PRD #1390 D11: register's orphan fail honours the terminal-pending lease + pending_overflow
+  -- closure exactly as the stale-worker passes do (chat-exempt, D10) — a fresh worker process
+  -- must not fail its own run whose outcome is journaled and about to be replayed (#1391).
+  AND (runs.kind = 'chat'
+       OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                       WHERE a.run_id = runs.id AND a.terminal_pending
+                         AND a.terminal_pending_until > now()
+                         AND a.claim_generation = runs.claim_generation)
+           AND NOT EXISTS (SELECT 1 FROM workers w
+                           WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
 RETURNING id;
 
 -- name: RequeueWorkerRuns :execrows
@@ -3351,9 +3446,19 @@ UPDATE runs SET status = 'queued', status_since = now(), requeue_count = requeue
     -- epoch. A harmless no-op for a non-codex run, whose codex_cap_hash is already NULL.
     codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
     updated_at = now()
-WHERE worker_id = @worker_id
+WHERE runs.worker_id = @worker_id
   AND status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
-  AND requeue_count < @max_requeues;
+  AND requeue_count < @max_requeues
+  -- PRD #1390 D11: register's orphan requeue honours the terminal-pending lease + pending_overflow
+  -- closure exactly as the stale-worker passes do (chat-exempt, D10) — a fresh worker process
+  -- must not requeue its own run whose outcome is journaled and about to be replayed (#1391).
+  AND (runs.kind = 'chat'
+       OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                       WHERE a.run_id = runs.id AND a.terminal_pending
+                         AND a.terminal_pending_until > now()
+                         AND a.claim_generation = runs.claim_generation)
+           AND NOT EXISTS (SELECT 1 FROM workers w
+                           WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())));
 
 -- Messages -----------------------------------------------------------------
 

@@ -383,11 +383,18 @@ type Config struct {
 	WorkerHeartbeatStale        time.Duration // no heartbeat past this ⇒ worker offline + runs re-queued
 	DiskPressureThreshold       float64       // PRD #837 M4: used/total fraction in (0,1] at/above which a worker's self-reported volume counts as under disk pressure (display/lifecycle-only)
 	SweepInterval               time.Duration // run-liveness sweep cadence; 0 ⇒ sweeper's built-in 15s default
-	WorkerPollInterval          time.Duration // worker claim-poll cadence
-	WorkerAffinityGrace         time.Duration // a re-queued run waits this long for its prior worker (chat lane; ClaimChatRun)
-	WorkerAffinityCeiling       time.Duration // PRD #628 D3a: run-lane affinity ceiling — a promoted run stays pinned to a LIVE, non-draining prior worker (liveness leg) but never longer than this, bounding the live-but-wedged case
-	WorkerSpreadGrace           time.Duration // PRD #216: a queued run older than this is exempt from the fleet-aware spread
-	WorkerBackgroundGrace       time.Duration // PRD #320: a demoted (judge/self_improve) run older than this fails open to normal priority so background work never starves
+	// SweeperBootGrace (PRD #1390 M1, D1): the three stale-worker passes
+	// (MarkStaleWorkersOffline, FailRunsOfStaleWorkersOverCap, RequeueRunsOfStaleWorkers)
+	// are skipped until this has elapsed since the LISTENER became ready — not since the
+	// process started — so an api that was unreachable does not declare every worker dead
+	// the instant it comes back, before any worker could reconnect. Default 60s (the 45s
+	// stale window plus one 15s heartbeat interval). 0 means "immediate", today's behaviour.
+	SweeperBootGrace      time.Duration
+	WorkerPollInterval    time.Duration // worker claim-poll cadence
+	WorkerAffinityGrace   time.Duration // a re-queued run waits this long for its prior worker (chat lane; ClaimChatRun)
+	WorkerAffinityCeiling time.Duration // PRD #628 D3a: run-lane affinity ceiling — a promoted run stays pinned to a LIVE, non-draining prior worker (liveness leg) but never longer than this, bounding the live-but-wedged case
+	WorkerSpreadGrace     time.Duration // PRD #216: a queued run older than this is exempt from the fleet-aware spread
+	WorkerBackgroundGrace time.Duration // PRD #320: a demoted (judge/self_improve) run older than this fails open to normal priority so background work never starves
 
 	// Anthropic usage-limit park (PRD #35). Both are server-side bounds on a
 	// WORKER-REPORTED event, which is why they are here and not in the claim payload:
@@ -928,6 +935,10 @@ func Load() (Config, error) {
 	// 0 (or unset) delegates to the sweeper's own built-in 15s default, so current
 	// behaviour is preserved unless SWEEP_INTERVAL is explicitly set.
 	cfg.SweepInterval = parseNonNegDuration("SWEEP_INTERVAL", 0)
+	// PRD #1390 M1 (D1): the boot-grace window that anchors on listener-ready. parseNonNegDuration
+	// so 0 is a legitimate value ("immediate", today's behaviour) rather than falling back to the
+	// default. Default 60s = WORKER_HEARTBEAT_STALE (45s) + WORKER_HEARTBEAT_INTERVAL (15s).
+	cfg.SweeperBootGrace = parseNonNegDuration("SWEEPER_BOOT_GRACE", 60*time.Second)
 	cfg.MRReviewQuietPeriod = parseNonNegDuration("MR_REVIEW_QUIET_PERIOD", 3*time.Minute)
 	cfg.WorkerPollInterval = parseDuration("WORKER_POLL_INTERVAL", 3*time.Second)
 	cfg.WorkerAffinityGrace = parseDuration("WORKER_AFFINITY_GRACE", 2*time.Minute)
