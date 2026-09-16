@@ -178,6 +178,7 @@ headers, not the rows.
 | 70 | handoff | gitlab | no | PRD #966 M5: task/handoff run kind via `uzi handoff` (+ host-gitconfig transport) |
 | 71 | mr-rework | gitlab | no | PRD #966 M6: mr_rework run kind (review-landed rework on a settled MR) |
 | 72 | custody-lifecycle | gitlab | no | PRD #1349 M7: recovery custody-limit wedge repro + owner-disposition unblock |
+| 73 | forge-unreachable-park | gitlab | no | PRD #1392: pre-clone forge park — recovery_wait(forge_unreachable), promote+complete, cap-fail no judge, cancel |
 
 <!-- registry:end -->
 
