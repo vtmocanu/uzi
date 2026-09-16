@@ -114,3 +114,64 @@ func TestAppendMessagesChatExemptFromGenerationFenceLiveDB(t *testing.T) {
 		t.Fatalf("message count = %d, want 1 (a capability worker's chat batch persists unfenced)", countMsgs())
 	}
 }
+
+// TestAppendMessagesChatMismatchedGenerationTreatedAsLegacyLiveDB is the DISCRIMINATOR the
+// omission-only test above cannot catch: a capability worker's chat message batch carrying a
+// MISMATCHED NONZERO claim_generation (the run is at generation 0) is still treated as LEGACY —
+// accepted, persisted, and last_seq advanced — because appendMessages normalizes effectiveClaimGen
+// to nil for a chat run BEFORE the InsertRunMessage / generation_live / UpdateRunLastSeq fence. The
+// server must never fence chat regardless of what generation a buggy or old worker supplies.
+//
+// MUTATION CHECK: reverting the effectiveClaimGen normalization (passing the raw claimGen to
+// InsertRunMessage) reddens this test — the insert fences out against the run's generation 0
+// (generation_live == false) and appendMessages returns ErrStaleClaim, persisting nothing. The
+// omission-only chat test above stays GREEN on that partial code, which is exactly why this
+// nonzero-mismatch case is required.
+func TestAppendMessagesChatMismatchedGenerationTreatedAsLegacyLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	svc := New(env.q, env.box, testParams())
+	o := seedReevalOwner(t, env, BindModeAuto, false)
+	capWkr := store.Worker{ID: o.workerID, UserID: o.userID, ProtocolCapabilities: []string{capability.CredentialSwitchV1}}
+	id := seedChatRun(t, env, o, "running") // run is at claim_generation 0
+
+	countMsgs := func() int {
+		var n int
+		if err := env.pool.QueryRow(env.ctx, `SELECT count(*) FROM run_messages WHERE run_id = $1`, id).Scan(&n); err != nil {
+			t.Fatalf("count messages: %v", err)
+		}
+		return n
+	}
+	lastSeq := func() int64 {
+		var n int64
+		if err := env.pool.QueryRow(env.ctx, `SELECT last_seq FROM runs WHERE id = $1`, id).Scan(&n); err != nil {
+			t.Fatalf("read last_seq: %v", err)
+		}
+		return n
+	}
+
+	mismatched := int64(99) // NOT the run's generation (0); a supplied value chat must ignore
+	msg := IncomingMessage{Seq: 1, Kind: "text", Payload: []byte(`{"t":"x"}`)}
+	if err := svc.AppendMessagesForClaim(env.ctx, capWkr, id, []IncomingMessage{msg}, &mismatched); err != nil {
+		if errors.Is(err, ErrStaleClaim) {
+			t.Fatalf("chat batch with mismatched generation: err = %v, want nil (chat is legacy regardless of the supplied generation)", err)
+		}
+		t.Fatalf("chat batch append: %v", err)
+	}
+	if countMsgs() != 1 {
+		t.Fatalf("message count = %d, want 1 (a chat batch persists unfenced even with a mismatched generation)", countMsgs())
+	}
+	if lastSeq() != 1 {
+		t.Fatalf("last_seq = %d, want 1 (a chat batch advances last_seq unfenced with a mismatched generation)", lastSeq())
+	}
+
+	// The state-report half is already covered by stateUsesGenerationFence's chat guard; assert it
+	// here too so the whole chat property is pinned in one place: a chat state report carrying a
+	// mismatched nonzero generation is still accepted.
+	run, applied, err := svc.SetState(env.ctx, capWkr, id, StateRequest{State: "completed", ClaimGeneration: &mismatched})
+	if err != nil {
+		t.Fatalf("chat completed report with mismatched generation: err = %v, want nil", err)
+	}
+	if !applied || run.Status != "completed" {
+		t.Fatalf("applied=%v status=%q, want applied completed", applied, run.Status)
+	}
+}

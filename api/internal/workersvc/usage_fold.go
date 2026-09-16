@@ -266,19 +266,25 @@ func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uu
 		return appendObservation{}, err
 	}
 	obs := appendObservation{resolved: true, status: run.Status, lastSeq: run.LastSeq}
+	// PRD #1247 M5 rework (chat fence completeness): a CHAT run has no claim-generation contract,
+	// so NORMALIZE the generation to nil for chat and use effectiveClaimGen for EVERY fenced query
+	// below (the omission check, InsertRunMessage, the generation_live stale check, and
+	// UpdateRunLastSeq). This makes a chat batch legacy even if a worker SUPPLIES a (mismatched)
+	// generation: the server must never fence chat regardless of what any client version sends. The
+	// client also guards generation > 0 on chat, but the server holds the property independently (a
+	// guardrail layer is not weakened on the theory another layer covers it).
+	effectiveClaimGen := claimGen
+	if run.Kind == runkind.Chat {
+		effectiveClaimGen = nil
+	}
 	// PRD #1247 M5a-1 rework (auditor fail-open finding): FAIL CLOSED for a CAPABILITY worker. The
 	// per-query InsertRunMessage/UpdateRunLastSeq fence engages only when the batch STAMPS a
 	// generation, so a worker advertising credential_switch_v1 could bypass it by OMITTING it and
 	// persist unfenced. A capability worker MUST stamp its claim_generation, so an omission is
 	// refused; a LEGACY worker (no capability) keeps inserting unfenced (nil generation), unchanged.
 	// Checked AFTER ownership resolves so ErrRunNotOwned (a foreign worker) still takes precedence.
-	//
-	// A CHAT run is EXEMPT (PRD #1247 M5 rework): chat has no claim-generation contract, so a
-	// capability worker's chat batch legitimately omits it and MUST NOT be fenced. This stays
-	// server-side even though the client now guards generation > 0 on chat: an OLD worker binary may
-	// still send 0 / omit the field, and the server must not 409 a chat batch regardless of what any
-	// client version sends.
-	if claimGen == nil && run.Kind != runkind.Chat && slices.Contains(wkr.ProtocolCapabilities, capability.CredentialSwitchV1) {
+	// A CHAT run is exempt via effectiveClaimGen (nil) plus the explicit run.Kind guard.
+	if effectiveClaimGen == nil && run.Kind != runkind.Chat && slices.Contains(wkr.ProtocolCapabilities, capability.CredentialSwitchV1) {
 		return obs, ErrMissingClaimGeneration
 	}
 	// Validate the whole batch before persisting any of it: a single invalid
@@ -383,7 +389,7 @@ func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uu
 			// PRD #1247 M5 (D3): the per-query generation fence. nil (legacy worker) inserts
 			// unconditionally; a present generation gates the insert on the run still being at
 			// that generation with an unreleased claim.
-			ClaimGeneration: pgconv.Int8Ptr(claimGen),
+			ClaimGeneration: pgconv.Int8Ptr(effectiveClaimGen),
 		})
 		if err != nil {
 			// The ONLY classified error on this path. See the tripwire on
@@ -412,7 +418,7 @@ func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uu
 		// run_usage with an OLD generation's frames after release/reclaim. Both the fence rejection
 		// and a benign duplicate used to look like rows == 0; only the former is stale. A legacy
 		// (nil generation) caller always sees generation_live == true, so this never fires for it.
-		if claimGen != nil && !res.GenerationLive.Bool {
+		if effectiveClaimGen != nil && !res.GenerationLive.Bool {
 			return obs, ErrStaleClaim
 		}
 		if m.Seq > maxStored {
@@ -458,7 +464,7 @@ func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uu
 		// Fenced on the same predicate (PRD #1247 M5, D3): a released/reclaimed old flight must
 		// not advance last_seq, which would strand the reclaiming flight's re-emitted seqs behind
 		// a stale high-water mark. nil generation advances unconditionally (legacy).
-		if _, err := s.q.UpdateRunLastSeq(ctx, store.UpdateRunLastSeqParams{ID: runID, Seq: maxStored, ClaimGeneration: pgconv.Int8Ptr(claimGen)}); err != nil {
+		if _, err := s.q.UpdateRunLastSeq(ctx, store.UpdateRunLastSeqParams{ID: runID, Seq: maxStored, ClaimGeneration: pgconv.Int8Ptr(effectiveClaimGen)}); err != nil {
 			if insertErr != nil {
 				return obs, insertErr // the insert failure is the more informative of the two
 			}
