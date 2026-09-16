@@ -272,7 +272,13 @@ func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uu
 	// persist unfenced. A capability worker MUST stamp its claim_generation, so an omission is
 	// refused; a LEGACY worker (no capability) keeps inserting unfenced (nil generation), unchanged.
 	// Checked AFTER ownership resolves so ErrRunNotOwned (a foreign worker) still takes precedence.
-	if claimGen == nil && slices.Contains(wkr.ProtocolCapabilities, capability.CredentialSwitchV1) {
+	//
+	// A CHAT run is EXEMPT (PRD #1247 M5 rework): chat has no claim-generation contract, so a
+	// capability worker's chat batch legitimately omits it and MUST NOT be fenced. This stays
+	// server-side even though the client now guards generation > 0 on chat: an OLD worker binary may
+	// still send 0 / omit the field, and the server must not 409 a chat batch regardless of what any
+	// client version sends.
+	if claimGen == nil && run.Kind != runkind.Chat && slices.Contains(wkr.ProtocolCapabilities, capability.CredentialSwitchV1) {
 		return obs, ErrMissingClaimGeneration
 	}
 	// Validate the whole batch before persisting any of it: a single invalid

@@ -6,6 +6,7 @@ import (
 	"log/slog"
 
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -51,7 +52,15 @@ import (
 //     give-up (D14) CLEARS a pending switch stamp WITHOUT changing status, so it is not a transition
 //     and must not go through the generic stale check (like credential_switch / pause_failed).
 //   - pause_failed: handled before the fence (it withdraws a pending pause, not a transition).
+//
+// A CHAT run is EXEMPT regardless of state (PRD #1247 M5 rework): chat has no claim-generation
+// contract (its batcher sends generation 0 and the run may omit it entirely), so fencing a
+// capability worker's chat report would 409 it. The chat guard below returns false for every
+// state so no chat transition is ever fenced.
 func stateUsesGenerationFence(state string, owned store.Run) bool {
+	if owned.Kind == runkind.Chat {
+		return false
+	}
 	switch state {
 	case "running", "awaiting_approval", "awaiting_input", "awaiting_followup", "paused", "failed",
 		"limit_wait", "recovery_wait":
