@@ -24,6 +24,7 @@ import {
   PRD_LIFECYCLE_APPEND,
   NOT_CODE_MARKER,
   REPO_SUBAGENT_UNTRUSTED_APPEND,
+  SECRET_FIXTURE_HYGIENE_APPEND,
 } from "../src/prompt.js";
 import { reportIncidentalIssueToolName } from "../src/findings-tools.js";
 import type {
@@ -1039,12 +1040,28 @@ describe("buildLeadSystemPrompt", () => {
     // issue-only PRD-lifecycle clause.
     assert.strictEqual(
       buildLeadSystemPrompt(undefined, { kind: "issue" }).append,
-      [LEAD_GUARDRAIL_APPEND, FINDINGS_NUDGE_APPEND, PRD_LIFECYCLE_APPEND].join("\n\n"),
+      [
+        LEAD_GUARDRAIL_APPEND,
+        FINDINGS_NUDGE_APPEND,
+        SECRET_FIXTURE_HYGIENE_APPEND,
+        PRD_LIFECYCLE_APPEND,
+      ].join("\n\n"),
     );
     assert.strictEqual(
       buildLeadSystemPrompt(undefined, { kind: "ci_fix" }).append,
-      [LEAD_GUARDRAIL_APPEND, FINDINGS_NUDGE_APPEND].join("\n\n"),
+      [LEAD_GUARDRAIL_APPEND, FINDINGS_NUDGE_APPEND, SECRET_FIXTURE_HYGIENE_APPEND].join("\n\n"),
     );
+  });
+
+  it("PRD #1120: the secret-fixture hygiene rule is unconditional across run kinds", () => {
+    // Mirrors the findings-nudge unconditional test: the rule reaches the lead append
+    // on the issue path AND a non-issue path, proving the push is not kind-gated.
+    for (const kind of ["issue", "ci_fix"] as const) {
+      assert.ok(
+        buildLeadSystemPrompt(undefined, { kind }).append.includes(SECRET_FIXTURE_HYGIENE_APPEND),
+        `${kind}: secret-fixture hygiene rule present`,
+      );
+    }
   });
 
   it("PRD #457: the findings nudge is unconditional across run kinds", () => {
@@ -1073,7 +1090,7 @@ describe("buildLeadSystemPrompt", () => {
     assert.strictEqual(buildLeadSystemPrompt("   ").append, buildLeadSystemPrompt(undefined).append);
     assert.strictEqual(
       buildLeadSystemPrompt("   ", { kind: "ci_fix" }).append,
-      [LEAD_GUARDRAIL_APPEND, FINDINGS_NUDGE_APPEND].join("\n\n"),
+      [LEAD_GUARDRAIL_APPEND, FINDINGS_NUDGE_APPEND, SECRET_FIXTURE_HYGIENE_APPEND].join("\n\n"),
     );
   });
 

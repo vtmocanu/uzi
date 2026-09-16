@@ -187,6 +187,27 @@ export const FINDINGS_NUDGE_APPEND = [
 ].join("\n");
 
 /**
+ * PRD #1120: the safe-authoring rule for secret-shaped test fixtures, hoisted from
+ * `.claude/rules/prds.md` into the TRUSTED worker prompt because `.claude/rules/**` is
+ * never loaded by a worker run (claude-harness.ts sets `settingSources: []` and only the
+ * clone's root CLAUDE.md is threaded in — repo-instructions.ts). Shared VERBATIM by the
+ * lead system prompt (buildLeadSystemPrompt) and every subagent prompt (toDefinition in
+ * agents.ts, renderSubagentPrompt in codex/render.ts), so there is one source of wording.
+ * NB: this text must not itself contain a contiguous complete token shape — the `glpat-`
+ * example is written split/assembled so no scanner flags the guidance constant itself.
+ */
+export const SECRET_FIXTURE_HYGIENE_APPEND = [
+  "When a test needs a secret-shaped fixture, NEVER write a complete provider-token-shaped",
+  "literal into tracked source (e.g. a `glpat-` prefix immediately followed by 20 token",
+  "characters, or a full-length GitHub/Anthropic/Slack token). Instead assemble the value",
+  'from source fragments joined at runtime — e.g. `"glpat-" + "<the 20-char body>"` — so',
+  "the scrubber/redactor still sees the whole joined value at runtime, but no scanner (uzi's",
+  "finalize gitleaks scan, or GitHub Push Protection) ever sees a complete token-shaped",
+  "SOURCE literal. Keep the exact runtime value and the behaviour under test unchanged; this",
+  "is enforced by a source-hygiene gate.",
+].join("\n");
+
+/**
  * PRD #702 M5: the subagent-channel mirror of the lead's deps-provisioning notes
  * (depsProvisionPlanNote / depsProvisionImplementNote). Appended to EVERY subagent
  * prompt in `toDefinition` (agents.ts), exactly like FINDINGS_NUDGE_APPEND, so
@@ -262,6 +283,11 @@ export function buildLeadSystemPrompt(
   // production worker run always sets `this.client`, so threading a client flag into
   // prompt-building would add coupling for a case that cannot occur.
   parts.push(FINDINGS_NUDGE_APPEND);
+  // PRD #1120: the secret-fixture source-hygiene rule is unconditional across run kinds
+  // (any code-producing run can add a test that needs a secret-shaped fixture). Pushed
+  // right after the findings nudge and before every conditional append, so it never sits
+  // inside the untrusted-repo fence (repoInstructions is pushed last).
+  parts.push(SECRET_FIXTURE_HYGIENE_APPEND);
   if (resolveRunKind(opts.kind) === "issue") parts.push(PRD_LIFECYCLE_APPEND);
   // PRD #700 M4: the mr_rework run-lifecycle note. Gated on the kind so an issue/
   // ci_fix/self_improve run's prompt is byte-identical to before.
