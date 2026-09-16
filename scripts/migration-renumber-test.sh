@@ -107,12 +107,16 @@ body_lines() {
   awk '{ p = $0; sub(/^[[:space:]]+/, "", p); if (substr(p, 1, 2) != "--") print }' "$1"
 }
 
-# tree_state <repo> -- a stable snapshot of what a refusal must leave UNCHANGED: the
-# porcelain status (staged renames / dirty edits show here) plus the tracked migration set.
+# tree_state <repo> -- a stable snapshot of what a refusal must leave UNCHANGED: status,
+# tracked migration paths, and their full binary diff against HEAD. The diff is load-bearing
+# for B1, whose tree starts dirty: porcelain alone would stay ` M file` if a broken helper
+# changed that already-dirty file again and would falsely report byte-identical state.
 tree_state() {
   git -C "$1" status --porcelain
   echo "--migrations--"
   git -C "$1" ls-files -- "$MIGDIR"
+  echo "--migration-diff--"
+  git -C "$1" diff --no-ext-diff --binary HEAD -- "$MIGDIR"
 }
 
 # build_base <casedir> -- create <casedir>/origin.git (bare) + <casedir>/repo, commit a
@@ -170,17 +174,20 @@ SQL
   git -C "$_r" commit -q -m "branch: colliding forge pair (draft 00230/00231)"
 }
 
-# run_refusal <label> <repo> -- snapshot the tree, run the helper (cwd in the repo),
-# assert it exits non-zero AND left the tree byte-identical.
+# run_refusal <label> <repo> <expected-message-fragment> -- snapshot the tree, run the
+# helper (cwd in the repo), and assert it exits non-zero for the EXPECTED reason and leaves
+# the tree byte-identical. Checking only the status would let an earlier unrelated refusal
+# make a later case read green (CodeRabbit review on PR #1410).
 run_refusal() {
   _label="$1"
   _repo="$2"
+  _needle="$3"
   _before="$(tree_state "$_repo")"
   _out="$( ( cd "$_repo" && sh "$HELPER" ) 2>&1 )"
   _rc=$?
   _after="$(tree_state "$_repo")"
-  : "$_out"
   assert_nonzero "$_label" "$_rc"
+  assert_contains "$_label: refused for expected reason" "$_needle" "$_out"
   assert_eq "$_label: tree UNCHANGED (nothing renamed/edited)" "$_before" "$_after"
 }
 
@@ -224,6 +231,32 @@ assert_eq       "A: NO SQL body line changed"               "$BODY_BEFORE"      
 assert_contains "A: body 5-digit map-key literal preserved" "VALUES (1, 00231);"              "$BODY_AFTER"
 assert_contains "A: body 6-digit literal preserved"         "VALUES (2, 100232);"             "$BODY_AFTER"
 
+# An empty or whitespace-only map must fail without truncating the SQL file. With the old
+# NR==FNR map detection, an empty first input made every SQL line look like a map record and
+# the helper replaced the migration with an empty file (CodeRabbit review on PR #1410).
+for _map_kind in empty whitespace; do
+  EMPTY_FIX="$CASE_A/${_map_kind}_map.sql"
+  EMPTY_MAP="$CASE_A/${_map_kind}_map.txt"
+  wf "$EMPTY_FIX" <<'SQL'
+-- +goose Up
+-- Migration comment 00231 must survive a rejected rewrite.
+SELECT 00231;
+-- +goose Down
+SELECT 1;
+SQL
+  if [ "$_map_kind" = "empty" ]; then
+    : > "$EMPTY_MAP"
+  else
+    printf '   \n\t\n' > "$EMPTY_MAP"
+  fi
+  EMPTY_BEFORE="$(cat "$EMPTY_FIX")"
+  EMPTY_OUT="$(sh "$HELPER" --rewrite-comments "$EMPTY_MAP" "$EMPTY_FIX" 2>&1)"
+  EMPTY_RC=$?
+  assert_nonzero "A: $_map_kind map refused" "$EMPTY_RC"
+  assert_contains "A: $_map_kind map names expected reason" "map file is empty or whitespace-only" "$EMPTY_OUT"
+  assert_eq "A: $_map_kind map leaves SQL byte-identical" "$EMPTY_BEFORE" "$(cat "$EMPTY_FIX")"
+done
+
 # =============================================================================
 echo "=== B. precondition/preflight refusals (each exits non-zero, changes nothing) ==="
 # =============================================================================
@@ -232,13 +265,13 @@ echo "=== B. precondition/preflight refusals (each exits non-zero, changes nothi
 CB1="$ROOT/caseB1"; build_base "$CB1"; RB1="$CB1/repo"
 add_forge_pair "$RB1"
 printf '%s\n' '-- uncommitted edit' >> "$RB1/$MIGDIR/00100_base.sql"
-run_refusal "B1 dirty tree" "$RB1"
+run_refusal "B1 dirty tree" "$RB1" "working tree is not clean"
 
 # B2. unresolvable base: no usable origin, so `git fetch origin main` fails.
 CB2="$ROOT/caseB2"; build_base "$CB2"; RB2="$CB2/repo"
 add_forge_pair "$RB2"
 git -C "$RB2" remote remove origin
-run_refusal "B2 unresolvable base (no origin remote)" "$RB2"
+run_refusal "B2 unresolvable base (no origin remote)" "$RB2" "git fetch origin main failed"
 
 # B3. not rebased: origin/main advances to a commit that is NOT an ancestor of HEAD.
 CB3="$ROOT/caseB3"; build_base "$CB3"; RB3="$CB3/repo"
@@ -249,7 +282,7 @@ git -C "$RB3" add -A
 git -C "$RB3" commit -q -m "main advances after branch cut"
 git -C "$RB3" push -q origin main
 git -C "$RB3" checkout -q feature
-run_refusal "B3 branch not rebased onto origin/main" "$RB3"
+run_refusal "B3 branch not rebased onto origin/main" "$RB3" "HEAD is not rebased onto current origin/main"
 
 # B4. empty branch-new set: a clean rebased branch that adds NO migration.
 CB4="$ROOT/caseB4"; build_base "$CB4"; RB4="$CB4/repo"
@@ -259,7 +292,7 @@ This branch adds no migration at all.
 MD
 git -C "$RB4" add -A
 git -C "$RB4" commit -q -m "branch: docs only, no migration"
-run_refusal "B4 empty branch-new set" "$RB4"
+run_refusal "B4 empty branch-new set" "$RB4" "no migrations added by HEAD"
 
 # B5. malformed name: a branch-new migration whose basename is not NNNNN_slug.sql.
 CB5="$ROOT/caseB5"; build_base "$CB5"; RB5="$CB5/repo"
@@ -271,7 +304,7 @@ SELECT 1;
 SQL
 git -C "$RB5" add -A
 git -C "$RB5" commit -q -m "branch: malformed migration name (4-digit prefix)"
-run_refusal "B5 malformed migration name" "$RB5"
+run_refusal "B5 malformed migration name" "$RB5" "malformed migration name"
 
 # B6. duplicate old number: two branch-new migrations sharing one 5-digit prefix.
 CB6="$ROOT/caseB6"; build_base "$CB6"; RB6="$CB6/repo"
@@ -279,7 +312,30 @@ mk_goose "$RB6/$MIGDIR/00240_a.sql" "duplicate prefix a"
 mk_goose "$RB6/$MIGDIR/00240_b.sql" "duplicate prefix b"
 git -C "$RB6" add -A
 git -C "$RB6" commit -q -m "branch: two migrations share prefix 00240"
-run_refusal "B6 duplicate old number" "$RB6"
+run_refusal "B6 duplicate old number" "$RB6" "two branch-new migrations share the same 5-digit prefix"
+
+# B7. vacuous main head: the branch adds a valid migration, but origin/main has no numbered
+# migrations. The helper must not silently treat that as head 0 and renumber from 00001.
+CB7="$ROOT/caseB7"; BARE7="$CB7/origin.git"; RB7="$CB7/repo"
+mkdir -p "$CB7"
+git init -q --bare -b main "$BARE7"
+git init -q -b main "$RB7"
+git -C "$RB7" config user.email test@example.com
+git -C "$RB7" config user.name "renumber-test"
+git -C "$RB7" config commit.gpgsign false
+git -C "$RB7" remote add origin "$BARE7"
+wf "$RB7/docs/base.md" <<'MD'
+# Base without migrations
+MD
+git -C "$RB7" add -A
+git -C "$RB7" commit -q -m "main: no migrations"
+git -C "$RB7" push -q origin main
+git -C "$RB7" checkout -q -b feature
+mkdir -p "$RB7/$MIGDIR"
+mk_goose "$RB7/$MIGDIR/00240_new.sql" "branch migration over a vacuous main head"
+git -C "$RB7" add -A
+git -C "$RB7" commit -q -m "branch: first migration"
+run_refusal "B7 vacuous main migration head" "$RB7" "origin/main has no numbered migrations"
 
 # =============================================================================
 echo "=== C. integration -- the happy path ==="

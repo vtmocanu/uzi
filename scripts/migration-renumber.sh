@@ -54,6 +54,13 @@ usage() {
   echo "       scripts/migration-renumber.sh --rewrite-comments <mapfile> <sqlfile>" >&2
 }
 
+# map_has_entry <mapfile> -- reject empty and whitespace-only maps. An empty first awk
+# input makes NR==FNR true again for the SQL input, which would consume every SQL line as a
+# map record and replace the migration with an empty file (CodeRabbit review on PR #1410).
+map_has_entry() {
+  awk 'NF { found=1 } END { exit found ? 0 : 1 }' "$1"
+}
+
 # rewrite_comments <mapfile> <sqlfile>
 # Rewrite <sqlfile> IN PLACE, applying the map (whitespace-separated `OLD NEW` per line)
 # to its COMMENT LINES ONLY. Simultaneous, token-exact: matches a MAXIMAL run of digits
@@ -65,9 +72,10 @@ usage() {
 rewrite_comments() {
   _map="$1"
   _f="$2"
+  map_has_entry "$_map" || return 1
   _dir="$(dirname "$_f")"
   _tmp="$(mktemp "$_dir/.renum.XXXXXX")" || return 1
-  if awk 'NR==FNR { m[$1]=$2; next }
+  if awk -v mapfile="$_map" 'FILENAME==mapfile { m[$1]=$2; next }
     {
       probe=$0
       sub(/^[[:space:]]+/, "", probe)
@@ -101,6 +109,7 @@ case "${1:-}" in
     _sub_map="$2"
     _sub_f="$3"
     [ -f "$_sub_map" ] || die "--rewrite-comments: map file not found: $_sub_map"
+    map_has_entry "$_sub_map" || die "--rewrite-comments: map file is empty or whitespace-only: $_sub_map"
     [ -f "$_sub_f" ] || die "--rewrite-comments: sql file not found: $_sub_f"
     if rewrite_comments "$_sub_map" "$_sub_f"; then
       exit 0
@@ -151,16 +160,22 @@ fi
 # counts the branch's own draft, so it is the wrong base to number above.
 git ls-tree -r --name-only origin/main -- "$MIGRATIONS_DIR" > "$WORKDIR/main_migs" ||
   die "git ls-tree origin/main failed for $MIGRATIONS_DIR"
-HEAD_NUM="$(awk '
+MAIN_STATS="$(awk '
   {
     base = $0
     sub(/.*\//, "", base)
     if (match(base, /^[0-9]+/)) {
+      count++
       v = substr(base, RSTART, RLENGTH) + 0
       if (v > max) max = v
     }
   }
-  END { print max + 0 }' "$WORKDIR/main_migs")"
+  END { print count + 0, max + 0 }' "$WORKDIR/main_migs")"
+MAIN_COUNT="${MAIN_STATS% *}"
+HEAD_NUM="${MAIN_STATS#* }"
+if [ "$MAIN_COUNT" -eq 0 ]; then
+  die "origin/main has no numbered migrations under $MIGRATIONS_DIR; refusing to number from a vacuous head"
+fi
 
 # ---- branch-new set BY FILE PATH -----------------------------------------------------
 git diff --no-renames --name-only --diff-filter=A origin/main HEAD -- "$MIGRATIONS_DIR" \
@@ -309,14 +324,12 @@ if [ "$selfok" != "1" ]; then
   die "self-check FAILED: new numbers are not contiguous head+1..head+$N above $HEAD_NUM"
 fi
 
-# Numbering check: reuse the committed uniqueness gate if it is present.
-if [ -x scripts/check-migration-numbering.sh ]; then
-  if ! ./scripts/check-migration-numbering.sh "$CANARY_DIR" "$MIGRATIONS_DIR"; then
-    die "self-check FAILED: check-migration-numbering.sh reported a problem after renumber"
-  fi
-else
-  echo "migration-renumber: NOTE -- scripts/check-migration-numbering.sh not found or not"
-  echo "  executable; skipping the numbering self-check (this is not a failure)."
+# Numbering check: the committed uniqueness gate is load-bearing. Missing or non-executable
+# means the helper cannot prove its result, so fail closed rather than silently skipping it.
+[ -x scripts/check-migration-numbering.sh ] ||
+  die "self-check FAILED: scripts/check-migration-numbering.sh is missing or not executable"
+if ! ./scripts/check-migration-numbering.sh "$CANARY_DIR" "$MIGRATIONS_DIR"; then
+  die "self-check FAILED: check-migration-numbering.sh reported a problem after renumber"
 fi
 
 # NOTE: the renamed migrations are deliberately NOT grepped for residual OLD numbers as a
