@@ -139,6 +139,60 @@ async function mkOutboxTimedSeam(
   };
 }
 
+/** A real tmpdir Outbox whose write seam a test arms to fail a chosen record kind AND
+ *  records observability the FIX 2 tests need: the timestamps of every FAILED manifest
+ *  write (the mark-unclean re-mark), and every segment/range write ATTEMPTED while a
+ *  kind is armed (proof a fail-closed path did NOT proceed to a record write). `fresh()`
+ *  opens a separate Outbox over the same root to read the on-disk unclean flag as a
+ *  restart would. */
+async function mkCountingSeam(): Promise<{
+  outbox: Outbox;
+  failOn: (kind: "segment" | "range" | "manifest" | null) => void;
+  fresh: () => Promise<Outbox>;
+  failedManifestWrites: number[];
+  recordWritesWhileArmed: string[];
+}> {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "batcher-outbox-count-"));
+  tmpRoots.push(dir);
+  const base = {
+    root: path.join(dir, "outbox"),
+    log: nullLogger(),
+    runMaxBytes: 64 * 1024 * 1024,
+    maxBytes: 512 * 1024 * 1024,
+    retentionMs: 7 * 86_400_000,
+  };
+  let failKind: "segment" | "range" | "manifest" | null = null;
+  const failedManifestWrites: number[] = [];
+  const recordWritesWhileArmed: string[] = [];
+  const outbox = new Outbox({
+    ...base,
+    rawWrite: async (write, ctx) => {
+      if (failKind !== null && ctx.kind === failKind) {
+        if (ctx.kind === "manifest") failedManifestWrites.push(Date.now());
+        throw new Error(`injected ${ctx.kind} write failure`);
+      }
+      if (failKind !== null && (ctx.kind === "segment" || ctx.kind === "range")) {
+        recordWritesWhileArmed.push(ctx.kind);
+      }
+      await write();
+    },
+  });
+  await outbox.init();
+  return {
+    outbox,
+    failOn: (kind) => {
+      failKind = kind;
+    },
+    fresh: async () => {
+      const o = new Outbox({ ...base });
+      await o.init();
+      return o;
+    },
+    failedManifestWrites,
+    recordWritesWhileArmed,
+  };
+}
+
 /** A client whose postMessages behaviour a test flips at will: "fail" throws the
  *  given transient/fatal status, "ok" records the landed batch and resolves. Extra
  *  batcher args (generation, signal) are ignored, matching the real call shape. */
@@ -569,6 +623,209 @@ describe("MessageBatcher spill/drain (PRD #1391 M2)", () => {
 
     disarm();
     await batcher.close();
+  });
+
+  it("a PERIODIC spill flush whose mark-unclean re-mark FAILS fails closed: backs off, writes NO range/segment, preserves the data", async () => {
+    // FIX 2a: doSpillFlush's re-mark of spilled_unclean must FAIL CLOSED. A marker-write
+    // failure must NOT proceed to write range/segments — a crash after that would read as
+    // clean at restart (silent tail loss). The fix advances the failure clock (backs off,
+    // like the write-failure backoff tests) and returns, preserving the buffer + pending
+    // range for the rescheduled retry. The re-mark only ATTEMPTS a manifest write once the
+    // flag has been CLEARED by a prior clean flush, so we clear it first.
+    const { outbox, failOn, fresh, failedManifestWrites, recordWritesWhileArmed } = await mkCountingSeam();
+    const api = flippableClient("fail", 503);
+    const batchMs = 20;
+    const batcher = new MessageBatcher(api.client, RUN, 0, batchMs, nullLogger(), undefined, undefined, {
+      outbox,
+      transientTripMs: 40,
+    });
+
+    // (1) Spill a body cleanly so the periodic doSpillFlush clears spilled_unclean.
+    fill(batcher, 2, "pre");
+    await until(() => batcher.isSpilled(), 4000, "batcher enters spill");
+    await until(() => outbox.depthFor(RUN)?.pendingMessages === 2, 4000, "the body spilled to the outbox");
+    await untilAsync(
+      async () => !(await fresh()).uncleanRuns().includes(RUN),
+      4000,
+      "the clean periodic doSpillFlush cleared spilled_unclean",
+    );
+
+    // (2) Arm the manifest write to fail (so markSpillUnclean throws), then emit a tail so
+    // the next PERIODIC doSpillFlush has pending data and tries to re-mark unclean.
+    failOn("manifest");
+    fill(batcher, 3, "tail");
+
+    // The re-mark keeps failing; the failure clock must advance so the retries BACK OFF.
+    await until(() => failedManifestWrites.length >= 5, 4000, "five failed mark-unclean re-mark attempts observed");
+    const span = failedManifestWrites[4]! - failedManifestWrites[0]!;
+    assert.ok(
+      span > 250,
+      `persistent mark-unclean failures must back off (5 attempts spanned ${span}ms; a flat cadence is ~${batchMs * 4}ms)`,
+    );
+
+    // Fail closed: NO range/segment write was attempted while the marker kept failing, and
+    // the tail is preserved in memory (nothing lost, nothing written durably yet).
+    assert.deepStrictEqual(
+      recordWritesWhileArmed,
+      [],
+      "a failed mark-unclean must NOT proceed to any range/segment write (fail closed)",
+    );
+    assert.strictEqual(batcher.bufferedCount(), 3, "the tail is preserved for the rescheduled retry");
+    assert.strictEqual(
+      outbox.depthFor(RUN)?.pendingMessages,
+      2,
+      "only the pre-spill body is durable; the tail was never written",
+    );
+
+    failOn(null);
+    await batcher.close();
+  });
+
+  it("close() while SPILLED fails closed on a mark-unclean OR segment-write failure: no partial silent loss, accurate 'may be lost' count", async () => {
+    // FIX 2b: if finalSpillOnClose's mark-unclean re-mark FAILS, it must abort BEFORE
+    //   takePrefix drains the buffer — no partial write, and the "may be lost" warning
+    //   reports the FULL dropped count.
+    // FIX 2c: if a close-time appendSegment FAILS, the drained batch is re-buffered so the
+    //   "may be lost" warning still reports the FULL dropped count (not an under-count).
+
+    // Scenario A (2b) — the MARK fails.
+    {
+      const { outbox, failOn, fresh, recordWritesWhileArmed } = await mkCountingSeam();
+      const api = flippableClient("fail", 503);
+      const { logger, lines } = recordingLogger();
+      const batcher = new MessageBatcher(api.client, "run-A", 0, 5, logger, undefined, undefined, {
+        outbox,
+        transientTripMs: 40,
+      });
+
+      // Spill a body cleanly so a later re-mark actually ATTEMPTS a manifest write.
+      fill(batcher, 2, "body");
+      await until(() => batcher.isSpilled(), 4000, "A: batcher enters spill");
+      await until(() => outbox.depthFor("run-A")?.pendingMessages === 2, 4000, "A: body spilled");
+      await untilAsync(
+        async () => !(await fresh()).uncleanRuns().includes("run-A"),
+        4000,
+        "A: the clean flush cleared spilled_unclean",
+      );
+
+      // Arm the manifest write to fail, stage a tail, then close SYNCHRONOUSLY (close clears
+      // the flush timer before it fires, so the tail spills only via finalSpillOnClose).
+      failOn("manifest");
+      batcher.emit({ kind: "text", agent: "lead", payload: { text: "tail-A1" } });
+      batcher.emit({ kind: "text", agent: "lead", payload: { text: "tail-A2" } });
+      await batcher.close();
+
+      const warn = (lines as Array<{ level: string; msg: string; dropped?: number }>).find(
+        (l) => l.msg === "message batcher: spilling the tail to the outbox on close failed; it may be lost",
+      );
+      assert.ok(warn, "A: a failed mark-unclean must ADMIT the loss via the 'may be lost' warning");
+      assert.strictEqual(warn.dropped, 2, "A: the warning reports the FULL undrained count (aborted before takePrefix)");
+      assert.deepStrictEqual(
+        recordWritesWhileArmed,
+        [],
+        "A: the close aborts before any range/segment write (no partial silent loss)",
+      );
+    }
+
+    // Scenario B (2c) — the MARK succeeds but the close-time SEGMENT write fails.
+    {
+      const { outbox, failOn, fresh } = await mkCountingSeam();
+      const api = flippableClient("fail", 503);
+      const { logger, lines } = recordingLogger();
+      const batcher = new MessageBatcher(api.client, "run-B", 0, 5, logger, undefined, undefined, {
+        outbox,
+        transientTripMs: 40,
+      });
+
+      fill(batcher, 2, "body");
+      await until(() => batcher.isSpilled(), 4000, "B: batcher enters spill");
+      await until(() => outbox.depthFor("run-B")?.pendingMessages === 2, 4000, "B: body spilled");
+      await untilAsync(
+        async () => !(await fresh()).uncleanRuns().includes("run-B"),
+        4000,
+        "B: the clean flush cleared spilled_unclean",
+      );
+
+      // Arm the SEGMENT write to fail (the mark still succeeds), stage a tail, close.
+      failOn("segment");
+      batcher.emit({ kind: "text", agent: "lead", payload: { text: "tail-B1" } });
+      batcher.emit({ kind: "text", agent: "lead", payload: { text: "tail-B2" } });
+      await batcher.close();
+
+      const warn = (lines as Array<{ level: string; msg: string; dropped?: number }>).find(
+        (l) => l.msg === "message batcher: spilling the tail to the outbox on close failed; it may be lost",
+      );
+      assert.ok(warn, "B: a failed close-time write must ADMIT the loss via the 'may be lost' warning");
+      assert.strictEqual(
+        warn.dropped,
+        2,
+        "B: the failed batch is re-buffered so the warning reports the FULL dropped count, not an under-count",
+      );
+      // The mark succeeded, so restart admits the loss via the unclean flag too.
+      assert.ok(
+        (await fresh()).uncleanRuns().includes("run-B"),
+        "B: spilled_unclean stays SET so restart admits the loss",
+      );
+    }
+  });
+
+  it("rearm() drains a WIDE in-memory dropped-range in BOUNDED chunks (memory-safe), landing every seq once, ascending", async () => {
+    // FIX 3: rearm must NOT synchronously materialise the whole in-memory dropped-range
+    // into the buffer (a long outage can make it arbitrarily wide → one huge allocation).
+    // It flips to the network and schedules a flush; the network flush loop materialises
+    // the range one bounded chunk at a time. Drive a spill with a 1-byte cap, fold a range
+    // far wider than REARM_TOMBSTONE_CHUNK (500), then rearm with the client STILL failing
+    // and assert the buffer never holds more than ~one chunk. Then flip the client OK and
+    // assert every tombstone lands once, ascending (contiguity preserved).
+    const CHUNK = 500; // mirrors the module-private REARM_TOMBSTONE_CHUNK
+    const outbox = await mkOutbox();
+    const api = flippableClient("fail", 503);
+    const batcher = new MessageBatcher(api.client, RUN, 0, 5, nullLogger(), undefined, undefined, {
+      outbox,
+      transientTripMs: 40,
+      spillBufferBytes: 1, // every burst message after the first folds into the pending range
+    });
+
+    fill(batcher, 2, "pre");
+    await until(() => batcher.isSpilled(), 4000, "batcher enters spill");
+    await until(() => (outbox.depthFor(RUN)?.pendingMessages ?? 0) >= 2, 4000, "pre-spill messages land");
+    await sleep(40); // settle: buffer empty, idle
+
+    // Synchronously (no await, so no flush timer interleaves): the first burst message fills
+    // the empty buffer (kept); the next RANGE_WIDTH fold into the pending range. Keep the
+    // client failing so nothing drains, then rearm.
+    const RANGE_WIDTH = 1600; // > 3x CHUNK
+    fill(batcher, RANGE_WIDTH + 1, "burst");
+    batcher.rearm();
+
+    // MEMORY SAFETY: rearm must not have materialised the whole range. On the pre-fix code
+    // the buffer would already hold the kept message + the entire RANGE_WIDTH tombstones.
+    assert.ok(
+      batcher.bufferedCount() <= CHUNK + 1,
+      `rearm must not materialise the whole range at once (buffered ${batcher.bufferedCount()}, range width ${RANGE_WIDTH})`,
+    );
+    assert.strictEqual(batcher.isSpilled(), false, "rearm returns the batcher to the network");
+
+    // Now let it drain over a healthy network; every seq in the range must land once, ascending.
+    api.setMode("ok");
+    const keptSeq = 3; // seqs 1,2 = pre (spilled to the outbox); seq 3 = the kept burst
+    const lastSeq = 2 + RANGE_WIDTH + 1; // last folded seq
+    await until(() => api.landed.some((m) => m.seq === lastSeq), 8000, "the whole range drains to the network");
+    await batcher.close();
+
+    const landedSeqs = api.landed.map((m) => m.seq);
+    for (let i = 1; i < landedSeqs.length; i++) {
+      assert.ok(landedSeqs[i]! > landedSeqs[i - 1]!, `network seqs land strictly ascending (index ${i})`);
+    }
+    const set = new Set(landedSeqs);
+    assert.strictEqual(landedSeqs.length, set.size, "no seq landed twice");
+    assert.ok(set.has(keptSeq), "the kept burst message landed over the network");
+    for (let s = keptSeq + 1; s <= lastSeq; s++) {
+      assert.ok(set.has(s), `dropped seq ${s} materialised as a network tombstone`);
+    }
+    // A folded seq lands as a drop tombstone, not a real payload.
+    const mid = api.landed.find((m) => m.seq === Math.floor((keptSeq + 1 + lastSeq) / 2));
+    assert.strictEqual(pl(mid).event, "message_dropped", "a folded seq is a drop tombstone");
   });
 
   it("the batcher's claim generation flows through into the spilled segments (the mechanism carries whatever it is given)", async () => {
