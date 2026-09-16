@@ -258,6 +258,18 @@ export class WorkerClient {
    */
   private serverFeatures = new Set<string>();
 
+  /**
+   * Whether this image advertised the `credential_switch_v1` protocol capability at
+   * register (PRD #1247 fix round). A capability worker's runs are fenced server-side,
+   * so it stamps `claim_generation` OPTIMISTICALLY — independent of the negotiated
+   * `claim_generation_fence` feature, which a one-shot register may have missed under
+   * rollout skew. Captured from `register()`'s `protocolCapabilities` argument; false
+   * until (and unless) a register advertises it, so a non-capability worker keeps the
+   * feature gate. Never cleared by the strict-decode fallback (a capability worker stays
+   * optimistic so the next request self-recovers once the api rolls forward).
+   */
+  private hasCredentialSwitchCapability = false;
+
   /** The advertised features as an array (PRD #1392 D7): the runner reads this to pick a
    *  capability-aware degradation for a pre-clone forge-unreachable park. Backed by
    *  `serverFeatures` so the two views never diverge and a rollback clear empties both. The
@@ -321,6 +333,10 @@ export class WorkerClient {
         ? res.protocol_features.filter((f): f is string => typeof f === "string")
         : [],
     );
+    // PRD #1247 fix round: remember whether THIS image advertised the credential_switch_v1
+    // capability, so the send-gate can stamp the claim generation optimistically (its runs
+    // are fenced server-side) even when a one-shot register missed the negotiated feature.
+    this.hasCredentialSwitchCapability = protocolCapabilities?.includes("credential_switch_v1") ?? false;
     return res;
   }
 
@@ -390,6 +406,47 @@ export class WorkerClient {
     return (await res.json()) as ChatClaimResponse;
   }
 
+  /**
+   * The send-gate for `claim_generation` (PRD #1247 fix round). `0` is chat's legacy
+   * sentinel and is NEVER sent (the batcher passes `this.generation`, default 0, and
+   * ChatRunner sets `generation: 0`; any CLAIMED work run is generation >= 1). A
+   * `credential_switch_v1` capability worker stamps OPTIMISTICALLY — its runs are fenced
+   * server-side, and a one-shot register may have missed the negotiated feature under
+   * rollout skew — while a non-capability (#1391-era) worker keeps the feature gate.
+   */
+  private includeClaimGeneration(generation?: number): boolean {
+    return (
+      generation !== undefined &&
+      generation > 0 &&
+      (this.hasCredentialSwitchCapability || this.hasFeature("claim_generation_fence"))
+    );
+  }
+
+  /**
+   * Run `send(includeField)` with the shared skew-safe fallback (PRD #1247 fix round).
+   * REUSABLE: a later milestone drives the completion RPCs through it too. When `included`
+   * is true and the api answers the EXACT strict-decode 400 (a rolled-back api that
+   * strict-decodes `claim_generation` as an unknown field, `isStrictDecodeError`), retry
+   * ONCE with the field stripped and classify only that second response; a capability
+   * worker stays OPTIMISTIC (features NOT cleared) so the next request self-recovers once
+   * the api rolls forward, while a non-capability worker calls clearFeatures() (today's
+   * sticky behavior). A genuine (non-strict-decode) 400 — e.g. an unstorable/invalid
+   * message — propagates unchanged, so it is never mistaken for a rollback and the field
+   * is never stripped off a genuine-poison request.
+   */
+  private async withGenerationFallback<T>(
+    included: boolean,
+    send: (includeField: boolean) => Promise<T>,
+  ): Promise<T> {
+    try {
+      return await send(included);
+    } catch (err) {
+      if (!included || !isStrictDecodeError(err)) throw err;
+      if (!this.hasCredentialSwitchCapability) this.clearFeatures();
+      return await send(false);
+    }
+  }
+
   async postMessages(
     runId: string,
     messages: OutgoingMessage[],
@@ -398,29 +455,25 @@ export class WorkerClient {
   ): Promise<void> {
     if (messages.length === 0) return;
     const path = `${WORKER_API_PREFIX}/runs/${runId}/messages`;
-    // PRD #1391 M2: ride the claim generation ONLY when the server negotiated
-    // `claim_generation_fence` AND the caller supplied one, so today's strict-decode
-    // api (which would 400 an unknown field) never sees it. Run A's api never
-    // advertises the feature, so this path is inert there.
-    const includeGeneration = this.hasFeature("claim_generation_fence") && generation !== undefined;
-    const body: MessagesRequest = { messages };
-    if (includeGeneration) body.claim_generation = generation;
-    try {
-      await this.postJSON(path, body, this.httpTimeoutMs, signal);
-    } catch (err) {
-      // Request-local strict-decode fallback (PRD #1391 M5): a rolled-back api that no
-      // longer knows `claim_generation` strict-decodes it as an unknown field and
-      // answers a generic `invalid request body` 400. Clear the cached feature set and
-      // retry the IDENTICAL batch ONCE without the field; the batcher classifies ONLY
-      // this second response, so it sees exactly one outcome. The dedicated
-      // unstorable-message 400 has a DIFFERENT body and is NOT a trigger — it
-      // propagates unchanged so the batcher's bisection still runs and the generation
-      // is never stripped off a genuine-poison batch.
-      if (!includeGeneration || !isStrictDecodeError(err)) throw err;
-      this.clearFeatures();
-      const stripped: MessagesRequest = { messages };
-      await this.postJSON(path, stripped, this.httpTimeoutMs, signal);
-    }
+    // PRD #1247 fix round: stamp the claim generation through the shared send-gate. A
+    // credential_switch_v1 capability worker stamps OPTIMISTICALLY (its runs are fenced
+    // server-side, so a register that missed the negotiated `claim_generation_fence`
+    // feature under rollout skew must not silently drop the fence); a non-capability
+    // (#1391-era) worker keeps the feature gate. `0` is chat's legacy sentinel and is
+    // never sent. On the EXACT strict-decode 400 from a rolled-back api the field is
+    // stripped and the identical batch retried ONCE — the batcher classifies only that
+    // second response, so it sees exactly one outcome. A capability worker does NOT clear
+    // its features on the fallback (it stays optimistic, so the next batch self-recovers
+    // once the api rolls forward); a non-capability worker clears them (sticky, as today).
+    // A genuine unstorable/invalid-message 400 has a DIFFERENT body and propagates
+    // unchanged, so the batcher's bisection still runs and the generation is never
+    // stripped off a genuine-poison batch.
+    const included = this.includeClaimGeneration(generation);
+    await this.withGenerationFallback(included, (includeField) => {
+      const body: MessagesRequest = { messages };
+      if (includeField) body.claim_generation = generation;
+      return this.postJSON(path, body, this.httpTimeoutMs, signal);
+    });
   }
 
   /**
