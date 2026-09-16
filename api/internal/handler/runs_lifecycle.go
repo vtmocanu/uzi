@@ -496,6 +496,28 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 		slog.Error("list run credential epochs", "run_id", run.ID, "error", err)
 	} else {
 		dto.CredentialEpochs = credentialEpochsToDTO(epochs)
+		// PRD #1247 Step A (D14, deferred clear #1422): credentialSwitchState derives
+		// credential_switch purely from the run row, but the DB clear of the switch stamp
+		// on a successful application is deferred to #1422 — so after a release+reclaim the
+		// row still carries credential_switch_requested_at/credential_switch_generation and
+		// the derived field reads a KNOWN-STALE "requested"/"released" for a switch that has
+		// already been applied. Suppress the stale DERIVED field here, where the epochs are
+		// in reach; the DB stays untouched and credentialSwitchState is unchanged.
+		//
+		// The stamp targets the CURRENT claim generation G, and recordRunCredential already
+		// wrote a run_credential_epochs row at that SAME generation G when the current claim
+		// opened — so an epoch AT G does NOT prove the switch was applied. Only an applied
+		// epoch at a LATER generation (STRICTLY > G), written after the release+reclaim,
+		// does. Use strict > (never >=): an epoch at == credential_switch_generation is the
+		// pre-request epoch of the current claim and must NOT suppress.
+		if dto.CredentialSwitch != nil && run.CredentialSwitchGeneration.Valid {
+			for _, e := range epochs {
+				if e.AppliedAt.Valid && e.ClaimGeneration > run.CredentialSwitchGeneration.Int64 {
+					dto.CredentialSwitch = nil
+					break
+				}
+			}
+		}
 	}
 	if dto.CredentialOverride != nil && run.CredentialOverrideSecretID.Valid {
 		if meta, err := h.q.GetUserSecretMetaByID(r.Context(), store.GetUserSecretMetaByIDParams{
