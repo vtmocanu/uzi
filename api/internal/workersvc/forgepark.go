@@ -14,7 +14,7 @@ import (
 )
 
 // recoveryWaitCauses is the server enum for StateRequest.RecoveryCause (PRD #1392 M1, D9),
-// matching migration 00233's runs_recovery_wait_cause_check. SetState validates a non-nil
+// matching migration 00232's runs_recovery_wait_cause_check. SetState validates a non-nil
 // cause against this set BEFORE any state SQL, so an unknown value is a 400 rather than a
 // constraint violation at the park write. NULL (an absent cause) is the LEGACY/untyped park
 // and is not a member here — the empty-turn park writes NULL. Only 'forge_unreachable' drives

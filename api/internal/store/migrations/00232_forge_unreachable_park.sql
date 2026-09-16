@@ -36,11 +36,10 @@
 -- plus 'forge_unreachable'. Immediate DROP+ADD (no NOT VALID), the 00186 template: the CHECK
 -- validates against the existing rows on ADD, which is cheap for this small domain column.
 --
--- NUMBER ASSIGNED AT LANDING. Drafted as 00233 against a live head of
--- 00229_recovery_custody_episode.sql (with #1247 drafting 00230/00231 and #1390 drafting
--- 00232); renumber above the live head on the landing rebase if another migration merged
--- first (strict goose refuses to boot on a version below an already-applied head —
--- store/migrate.go), per the CLAUDE.md goose convention (no allow-missing).
+-- Drafted as 00233; landed as 00232, the next free number above the live head
+-- 00231_validate_run_branch_moved_stop_kind.sql at the landing rebase (#1386 landed
+-- 00230/00231 first). Renumbered per the CLAUDE.md goose convention (no allow-missing;
+-- strict goose refuses to boot on a version below an already-applied head — store/migrate.go).
 ALTER TABLE runs ADD COLUMN recovery_wait_cause text;
 ALTER TABLE runs ADD CONSTRAINT runs_recovery_wait_cause_check
     CHECK (recovery_wait_cause IS NULL OR recovery_wait_cause IN (

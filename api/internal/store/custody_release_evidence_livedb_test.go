@@ -15,7 +15,7 @@ import (
 // TestCustodyReleaseEvidenceLiveDB is the PRD #1392 M1 (D3) STORAGE proof: the release/discard
 // store methods stamp the correct release_evidence class into recovery_custody_holds, and
 // ListReleasableCustodyHolds returns the correct per-hold `reason` (publication vs archive)
-// against a REAL Postgres — the CHECK-constrained column (migration 00233) and the reason CASE
+// against a REAL Postgres — the CHECK-constrained column (migration 00232) and the reason CASE
 // that a fake store cannot exhibit. It statically references the release/discard query methods so
 // their evidence-stamping behaviour is proven, not just their reachability.
 //

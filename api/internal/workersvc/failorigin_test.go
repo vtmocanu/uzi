@@ -68,9 +68,9 @@ func TestCoerceFailOrigin(t *testing.T) {
 // is exactly the drift it prevents.
 func TestFailOriginVocabularyMatchesCheck(t *testing.T) {
 	// The CURRENT fail_origin CHECK is declared by the LATEST migration that widened it, not
-	// 00186 (which added push_secret_blocked): PRD #1392 M1's 00233 re-declares it with the
+	// 00186 (which added push_secret_blocked): PRD #1392 M1's 00232 re-declares it with the
 	// thirteenth value forge_unreachable, so this parses THAT migration's Up-section CHECK.
-	const path = "../store/migrations/00233_forge_unreachable_park.sql"
+	const path = "../store/migrations/00232_forge_unreachable_park.sql"
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read %s: %v", path, err)

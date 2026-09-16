@@ -109,7 +109,7 @@ WHERE c.run_id = @run_id AND c.user_id = @user_id;
 -- PRD #1392 M1 (D3): release_evidence records WHY this release was warranted — the
 -- reconciler passes the per-hold class ListReleasableCustodyHolds now computes ('publication'
 -- for a completed-run backstop, 'archive' for a ready capture). CHECK-constrained to the five
--- classes (migration 00233).
+-- classes (migration 00232).
 UPDATE recovery_custody_holds
 SET live_worker_id = NULL, live_run_id = NULL, state = 'released',
     release_evidence = @release_evidence,
@@ -306,7 +306,7 @@ RETURNING *;
 -- Release endpoint passes an allowlisted request value ('publication' or 'forge_no_output');
 -- the forge pre-clone park passes 'no_adopted_source' (a generation that never adopted a
 -- source has nothing to prove against the forge). CHECK-constrained to the five classes
--- (migration 00233).
+-- (migration 00232).
 UPDATE recovery_custody_holds
 SET live_worker_id = NULL, live_run_id = NULL, state = 'released',
     release_evidence = @release_evidence,
@@ -425,7 +425,7 @@ SELECT
 --
 -- PRD #1392 M1 (D3): release_evidence is stamped 'owner_discard' — the class recording that
 -- the owner explicitly discarded this hold's custody. The caller passes it as @release_evidence;
--- CHECK-constrained to the five classes (migration 00233).
+-- CHECK-constrained to the five classes (migration 00232).
 UPDATE recovery_custody_holds
 SET state = 'discarded', live_worker_id = NULL, live_run_id = NULL,
     release_evidence = @release_evidence, updated_at = now()
