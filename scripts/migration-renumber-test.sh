@@ -174,16 +174,18 @@ SQL
   git -C "$_r" commit -q -m "branch: colliding forge pair (draft 00230/00231)"
 }
 
-# run_refusal <label> <repo> <expected-message-fragment> -- snapshot the tree, run the
-# helper (cwd in the repo), and assert it exits non-zero for the EXPECTED reason and leaves
-# the tree byte-identical. Checking only the status would let an earlier unrelated refusal
-# make a later case read green (CodeRabbit review on PR #1410).
+# run_refusal <label> <repo> <expected-message-fragment> [path] -- snapshot the tree, run
+# the helper (cwd in the repo), and assert it exits non-zero for the EXPECTED reason and
+# leaves the tree byte-identical. Checking only the status would let an earlier unrelated
+# refusal make a later case read green (CodeRabbit review on PR #1410). The optional PATH
+# lets one case inject a git wrapper that fails only `git status --porcelain`.
 run_refusal() {
   _label="$1"
   _repo="$2"
   _needle="$3"
+  _path="${4:-$PATH}"
   _before="$(tree_state "$_repo")"
-  _out="$( ( cd "$_repo" && sh "$HELPER" ) 2>&1 )"
+  _out="$( ( cd "$_repo" && PATH="$_path" sh "$HELPER" ) 2>&1 )"
   _rc=$?
   _after="$(tree_state "$_repo")"
   assert_nonzero "$_label" "$_rc"
@@ -266,6 +268,23 @@ CB1="$ROOT/caseB1"; build_base "$CB1"; RB1="$CB1/repo"
 add_forge_pair "$RB1"
 printf '%s\n' '-- uncommitted edit' >> "$RB1/$MIGDIR/00100_base.sql"
 run_refusal "B1 dirty tree" "$RB1" "working tree is not clean"
+
+# B1b. git status itself fails: an unknown tree state must be a refusal, never misread as
+# clean. A PATH-local wrapper fails only that command and delegates every other git call.
+CB1B="$ROOT/caseB1b"; build_base "$CB1B"; RB1B="$CB1B/repo"
+add_forge_pair "$RB1B"
+FAKEBIN1B="$CB1B/bin"
+REAL_GIT1B="$(command -v git)"
+mkdir -p "$FAKEBIN1B"
+wf "$FAKEBIN1B/git" <<EOF
+#!/bin/sh
+if [ "\${1:-}" = "status" ] && [ "\${2:-}" = "--porcelain" ]; then
+  exit 73
+fi
+exec "$REAL_GIT1B" "\$@"
+EOF
+chmod +x "$FAKEBIN1B/git"
+run_refusal "B1b git status failure" "$RB1B" "git status --porcelain failed" "$FAKEBIN1B:$PATH"
 
 # B2. unresolvable base: no usable origin, so `git fetch origin main` fails.
 CB2="$ROOT/caseB2"; build_base "$CB2"; RB2="$CB2/repo"

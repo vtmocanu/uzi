@@ -141,7 +141,11 @@ trap 'rm -rf "$WORKDIR"' EXIT
 # ---- preconditions: fail closed, change nothing, check in order ----------------------
 
 # 1. Clean tree: the helper git mv's files, so the branch's migrations must be committed.
-if [ -n "$(git status --porcelain)" ]; then
+# Capture status separately: a substitution inside `[ ... ]` would hide a failing git status
+# behind the test command's own exit code and misread an unknown tree as clean.
+porcelain="$(git status --porcelain)" ||
+  die "git status --porcelain failed; cannot establish a clean tree"
+if [ -n "$porcelain" ]; then
   die "working tree is not clean. Commit (or stash) the branch's migrations first -- this
   helper git mv's them and rewrites comments, so it refuses to touch a dirty tree."
 fi
