@@ -2990,9 +2990,11 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 				FailOrigin:     pgconv.TextOrNull("plan_rejected"),
 				PreservedPatch: clampWirePreservedPatch(req.PreservedPatch),
 				SessionID:      sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
-				// PRD #1247 M5a-1 rework (m6): this arm runs under the outer FOR UPDATE fence on the
-				// loaded run (the capability report is already generation-checked upstream), so the
-				// per-query fence is redundant here — pass explicit nil (behavior preserved).
+				// PRD #1247 M5a-1 rework (m6): explicit nil. A fenced (non-chat, generation-bearing)
+				// capability report was already generation-checked under the outer FOR UPDATE fence
+				// upstream, so the per-query fence is redundant here; a legacy or chat report carries no
+				// generation (chat is deliberately fence-exempt), so nil is correct there too. Behavior
+				// preserved.
 				ClaimGeneration: pgtype.Int8{},
 			})
 		case req.BranchMoved != nil && *req.BranchMoved && owned.Kind == runkind.MRRework:
@@ -3004,7 +3006,13 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			// like ScopeCapped's scope_ceiling guard) so an untrusted worker cannot mint the benign
 			// disposition on any other kind. Placed after the operator-stop arms so a concurrent operator
 			// cancel/stop (which pre-stamped owned.StopKind) still wins.
-			rows, err = s.q.SupersedeRunByWorker(ctx, store.SupersedeRunByWorkerParams{
+			//
+			// PRD #1247 fix round: use the TX-bound q (not s.q). This arm runs under the outer
+			// FOR UPDATE fence (q rebound to qtx), which holds a row lock on runID; issuing the
+			// supersede on the POOL (s.q) would wait on the transaction's own uncommitted lock until
+			// the context deadline, hanging every capability-worker mr_rework branch_moved report.
+			// Every sibling arm uses q for exactly this reason.
+			rows, err = q.SupersedeRunByWorker(ctx, store.SupersedeRunByWorkerParams{
 				ID: runID, WorkerID: pgconv.UUID(wkr.ID),
 			})
 		default:
@@ -3031,9 +3039,11 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 				FailOrigin:     pgconv.TextOrNull(failOrigin),
 				PreservedPatch: clampWirePreservedPatch(req.PreservedPatch),
 				SessionID:      sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
-				// PRD #1247 M5a-1 rework (m6): this arm runs under the outer FOR UPDATE fence on the
-				// loaded run (a legacy nil report skips the lock but carries no generation), so the
-				// per-query fence is redundant here — pass explicit nil (behavior preserved).
+				// PRD #1247 M5a-1 rework (m6): explicit nil. A fenced (non-chat, generation-bearing)
+				// capability report was already generation-checked under the outer FOR UPDATE fence
+				// upstream, so the per-query fence is redundant here; a legacy or chat report skips the
+				// lock and carries no generation (chat is deliberately fence-exempt), so nil is correct
+				// there too. Behavior preserved.
 				ClaimGeneration: pgtype.Int8{},
 			})
 		}

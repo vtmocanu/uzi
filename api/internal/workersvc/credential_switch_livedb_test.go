@@ -1,6 +1,7 @@
 package workersvc
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"testing"
@@ -982,5 +983,65 @@ func TestTerminalTransitionSettlesCredentialSwitchSignalLiveDB(t *testing.T) {
 				t.Fatalf("terminal transition must clear the switch columns: at=%v gen=%v", after.CredentialSwitchRequestedAt, after.CredentialSwitchGeneration)
 			}
 		})
+	}
+}
+
+// TestSetStateBranchMovedSupersedeUnderFenceLiveDB (PRD #1247 fix round) pins the branch_moved
+// supersede against the FOR UPDATE generation fence. SetState's failed/branch_moved arm runs INSIDE
+// the fence transaction (a credential_switch_v1 worker's generation-bearing report opens it, holding
+// a row lock on the run). The supersede must therefore run on the TX-bound querier: issuing it on
+// the POOL (the s.q -> q bug) waits on the transaction's own uncommitted lock until the context
+// deadline, hanging every capability-worker mr_rework branch_moved report.
+//
+// Asserts on the RETURNED (got, applied, err), NOT just the DB row: on the broken code the blocked
+// pool UPDATE may commit AFTER the fence tx is cancelled while SetState returns a deadline error and
+// SKIPS the terminal automation — so a status-only check could false-green. Reverting q -> s.q makes
+// SetState return a context-deadline error (err != nil / applied false), reddening this.
+func TestSetStateBranchMovedSupersedeUnderFenceLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	svc := fenceSvc(env) // wires txBeginner: a generation-bearing report opens the FOR UPDATE fence tx
+	o := seedReevalOwner(t, env, BindModeAuto, false)
+	// A capability worker so the report engages the fence transaction.
+	env.exec(`UPDATE workers SET protocol_capabilities = $2 WHERE id = $1`, o.workerID, []string{capability.CredentialSwitchV1})
+	wkr := store.Worker{ID: o.workerID, UserID: o.userID}
+	g := int64(5)
+
+	// The reworked target, then the mr_rework run (runs_kind_shape: repo_id/pipeline_ref/mr_iid/
+	// target_run_id NOT NULL, issue_iid NULL), running at generation G under the capability worker.
+	targetID := uuid.New()
+	env.exec(`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, status, status_since)
+	          VALUES ($1, $2, $3, 'issue', 990, 't', 'd', 'completed', now())`, targetID, o.userID, o.repoID)
+	runID := uuid.New()
+	env.exec(`INSERT INTO runs (id, user_id, repo_id, kind, issue_title, issue_description, status, status_since,
+	             worker_id, started_at, claim_generation, pipeline_ref, mr_iid, target_run_id)
+	          VALUES ($1, $2, $3, 'mr_rework', 't', 'd', 'running', now(), $4, now(), $5, 'agent/issue-990', 77, $6)`,
+		runID, o.userID, o.repoID, o.workerID, g, targetID)
+
+	// A bounded deadline: with the fix (tx querier) the supersede completes in a few ms; with the bug
+	// (pool querier) it blocks on the fence tx's own lock until this deadline.
+	ctx, cancel := context.WithTimeout(env.ctx, 5*time.Second)
+	defer cancel()
+	moved := true
+	reason := "the MR branch moved under the rework"
+	start := time.Now()
+	got, applied, err := svc.SetState(ctx, wkr, runID, StateRequest{
+		State: "failed", FailureReason: &reason, BranchMoved: &moved, ClaimGeneration: &g,
+	})
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("SetState(branch_moved under fence) err = %v (want nil); elapsed=%s — the supersede must run on the tx querier, not deadlock on the pool", err, elapsed)
+	}
+	if !applied {
+		t.Fatal("applied=false: the branch_moved supersede did not apply")
+	}
+	if got.Status != "cancelled" {
+		t.Fatalf("returned status = %q, want cancelled", got.Status)
+	}
+	if got.StopKind.String != "branch_moved" {
+		t.Fatalf("returned stop_kind = %q, want branch_moved", got.StopKind.String)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("SetState took %s — a healthy supersede completes in ms; this indicates the pool/tx deadlock", elapsed)
 	}
 }
