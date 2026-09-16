@@ -151,7 +151,7 @@ func newRunSetTokenCmd(env Env, gf *globalFlags) *cobra.Command {
 			"pool_wait, recovery_wait, paused) it promotes the run back to `queued` at once so the " +
 			"next claim spends the chosen token. On a RUNNING or gated run held by a capable worker " +
 			"the switch is REQUESTED and takes effect when the worker releases its claim; it is refused " +
-			"(409, exit 5) only when no live worker holds the run or the holding worker predates the " +
+			"(409, exit 5) when no live worker holds the run or the holding worker predates the " +
 			"credential_switch capability. A foreign or unknown run — or an unknown token label — is " +
 			"refused (404 / usage); a codex run is 422.\n\n" +
 			"It may print a warning (the token has no headroom, or auto will hold in pool_wait) " +

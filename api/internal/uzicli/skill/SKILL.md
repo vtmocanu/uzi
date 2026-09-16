@@ -550,7 +550,7 @@ uzi version
   a **parked** run (`limit_wait`, `pool_wait`, `recovery_wait`, `paused`) it promotes the
   run back to **queued** at once so the next claim spends the chosen token. On a **running**
   or gated run held by a capable worker the switch is **requested** and takes effect when the
-  worker releases its claim; it is refused (409, exit 5) only when no live worker holds the run
+  worker releases its claim; it is refused (409, exit 5) when no live worker holds the run
   or the holding worker predates the `credential_switch` capability. A foreign/unknown run or an
   unknown token label is refused (404 / usage); a codex run is 422. It may print a warning (the
   token has no headroom, or `auto` will hold in `pool_wait`) **without** refusing — the
