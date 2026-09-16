@@ -70,10 +70,34 @@ can **cancel** the run at any time. Normal watchdogs still apply while it
 is running, including while it retries capture; recovery does not override
 a genuine timeout or cancellation.
 
+## Forge unreachable at clone
+
+A `recovery_wait` park can also come from a different cause: the forge
+(GitHub, GitLab, Forgejo) was unreachable when the worker tried to clone or
+fetch your repo — a DNS blip, a dropped connection, or a transient 5xx.
+Unlike the empty-turn case above, nothing has been cloned yet, so there is
+no checkpoint to capture; the run just parks and retries.
+
+The run's badge and feed say **waiting for the forge, retry at HH:MM (N of
+MAX)**, naming the next retry time and how many of this run's lifetime
+forge parks it has used. It auto-resumes on the same capped backoff as an
+empty-turn park (`RUN_RECOVERY_PARK_BASE` up to `RUN_RECOVERY_MAX_PARK`) —
+no action needed while `N` stays under `MAX`.
+
+Unlike an empty-turn park, this one **does** have a lifetime cap:
+`RUN_FORGE_UNREACHABLE_MAX_PARKS` (default 6). If the forge is still
+unreachable past that many parks, the run fails instead of parking again,
+so a genuinely dead forge does not hold the run open forever. A permanent
+forge error (401/403/404 — bad credentials or a deleted repo) fails the run
+immediately instead of parking, since retrying would not help. Cancelling
+the run at any point during these retries ends it `cancelled`, as usual.
+
 ## Other waiting states
 
 - `recovery_wait`: a positively empty SDK result persisted through bounded
-  retries. The server retries automatically after a backoff.
+  retries, or the forge was unreachable at clone/fetch (see
+  [Forge unreachable at clone](#forge-unreachable-at-clone) above). The
+  server retries automatically after a backoff.
 - `limit_wait`: a usage-limit window must reset. See
   [Paused on a usage limit](run-limit-wait.md).
 - `pool_wait`: no token is available in the selected pool. It needs an

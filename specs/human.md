@@ -637,6 +637,12 @@ Tracked as GitLab issue vtmocanu/uzi#218; PRD at `prds/done/218-park-resume-work
 - When prior work genuinely cannot be recovered, the run says so in the feed rather
   than silently re-treading it. [user 2026-08-04]
 
+## Feature #1392 — Park a run on a transient forge failure at clone or fetch
+
+Tracked as GitHub issue vtmocanu/uzi#1392; PRD at `prds/1392-forge-unreachable-preclone-park.md`.
+
+- A transient forge failure (DNS/connect/5xx) at clone or fetch parks the run and auto-resumes it, rather than failing it; it fails only after a bounded number of forge parks (`RUN_FORGE_UNREACHABLE_MAX_PARKS`). A permanent forge error (401/403/404) still fails at once. [user 2026-09-15, PRD #1392]
+
 ## Feature #88 — Ask-user clarification: the agent can ask the human a question
 
 Tracked as GitLab issue vtmocanu/uzi#88; PRD at `prds/done/88-ask-user-clarification.md`.
