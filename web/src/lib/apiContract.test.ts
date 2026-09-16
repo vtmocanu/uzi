@@ -322,10 +322,18 @@ type ZeroOf<T, NeverNull extends keyof T = never> = {
 // handler/workers.go:201). DISCOVERED in M2 as a drift against the then-`docker?: boolean`
 // TS type; RECONCILED in M4 — TS is now `docker?: boolean | null`, so the null is accepted
 // and no directive or exemption is needed. Every other pointer field is typed X|null in TS.
+//
+// reported_runs (PRD #1390 M2c): a handler-overlaid field, so the TS type is OPTIONAL
+// (WorkerReportedRun[]?, matching the outbox_* / retaining_unpublished_work overlay siblings) —
+// the list/patch overlay and the DTO builders normalize the nil slice to [] on the real wire
+// (handler/workers.go reportedRunsByWorker/builders), never null. The exemption is still needed:
+// json.Marshal(WorkerDTO{}) emits null for the nil slice, so worker.zero.json carries an explicit
+// `null`, which an optional `X[] | undefined` field rejects — the exemption tolerates it exactly
+// like capabilities.
 {
   const _workerMissing: never = null as unknown as Exclude<keyof Worker, keyof typeof workerFull>;
   const _workerExtra: never = null as unknown as Exclude<keyof typeof workerFull, keyof Worker>;
-  const _workerZero: ZeroOf<Worker, "capabilities"> = workerZero;
+  const _workerZero: ZeroOf<Worker, "capabilities" | "reported_runs"> = workerZero;
   const _workerFull: Widen<Worker> = workerFull;
   void _workerMissing;
   void _workerExtra;
@@ -335,12 +343,13 @@ type ZeroOf<T, NeverNull extends keyof T = never> = {
 
 // ── AdminWorker (M2) ────────────────────────────────────────────────────────
 // AdminWorker extends Worker + owner_email; the embedded WorkerDTO fields marshal inline,
-// so full.json carries the Worker keys AND owner_email. Same capabilities exemption and the
-// same inherited worker.docker null, now reconciled in M4 (docker?: boolean | null) — no directive.
+// so full.json carries the Worker keys AND owner_email. Same capabilities exemption, the same
+// reported_runs exemption (PRD #1390 M2c, inherited from Worker), and the same inherited
+// worker.docker null, now reconciled in M4 (docker?: boolean | null) — no directive.
 {
   const _adminWorkerMissing: never = null as unknown as Exclude<keyof AdminWorker, keyof typeof adminWorkerFull>;
   const _adminWorkerExtra: never = null as unknown as Exclude<keyof typeof adminWorkerFull, keyof AdminWorker>;
-  const _adminWorkerZero: ZeroOf<AdminWorker, "capabilities"> = adminWorkerZero;
+  const _adminWorkerZero: ZeroOf<AdminWorker, "capabilities" | "reported_runs"> = adminWorkerZero;
   const _adminWorkerFull: Widen<AdminWorker> = adminWorkerFull;
   void _adminWorkerMissing;
   void _adminWorkerExtra;

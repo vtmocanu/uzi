@@ -44,6 +44,17 @@ type WorkerDTO struct {
 	// (PRD #42).
 	ActiveRuns        int  `json:"active_runs"`
 	MaxConcurrentRuns *int `json:"max_concurrent_runs"`
+	// ReportedRuns is what this worker SAYS it is executing, from its latest active-run
+	// snapshot (PRD #1390 M2c): one entry per run in the worker_active_runs table, each with
+	// the run id, the phase the worker sees it in, and the generation it was claimed at. It is
+	// the operator's window onto a split between the api's picture of a run and the worker's —
+	// visible on `uzi worker list` / `uzi admin workers` instead of inferred from pod logs.
+	//
+	// Distinct from ActiveRuns (a bare count derived from run rows): this is the worker's own
+	// report, so it can differ (e.g. during an api outage the worker rode out). ALWAYS a JSON
+	// array, never null — the list/patch handlers overlay it from the DB and the DTO builders
+	// seed it to [] — so a worker the snapshot table has no row for encodes as [], not null.
+	ReportedRuns []WorkerReportedRunDTO `json:"reported_runs"`
 	// RetainingUnpublishedWork marks a worker holding an OPEN durable-recovery custody
 	// hold (PRD #1296 M4, D4): it committed work a run could not publish and is keeping
 	// the last local source until the archive is captured or the owner discards it.
@@ -181,8 +192,21 @@ type WorkerDTO struct {
 }
 
 // AdminWorkerDTO is a worker plus its owner email for the admin Agents-status
-// page.
+// page. It embeds WorkerDTO, so it inherits ReportedRuns (PRD #1390 M2c) and every
+// other worker field on the wire.
 type AdminWorkerDTO struct {
 	WorkerDTO
 	OwnerEmail string `json:"owner_email"`
+}
+
+// WorkerReportedRunDTO is one entry of a worker's reported active-run snapshot (PRD #1390
+// M2c) — a run the worker says it is executing, with the phase it sees it in and the exact
+// generation it was claimed at. It is a display-only projection of a worker_active_runs row:
+// the phase is a closed server-validated enum (running | awaiting_approval | awaiting_input |
+// awaiting_followup), never worker free-text, so renderers read it without a scrub. Nested in
+// WorkerDTO.ReportedRuns, following the RecoveryCustodyHoldDTO nested-DTO precedent.
+type WorkerReportedRunDTO struct {
+	RunID           string `json:"run_id"`
+	Phase           string `json:"phase"`
+	ClaimGeneration int64  `json:"claim_generation"`
 }

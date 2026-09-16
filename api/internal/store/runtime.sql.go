@@ -4970,6 +4970,49 @@ func (q *Queries) ListActiveRunsForHealth(ctx context.Context) ([]ListActiveRuns
 	return items, nil
 }
 
+const listActiveRunsForWorkers = `-- name: ListActiveRunsForWorkers :many
+SELECT worker_id, run_id, phase, claim_generation
+FROM worker_active_runs
+WHERE worker_id = ANY($1::uuid[])
+ORDER BY worker_id, run_id
+`
+
+type ListActiveRunsForWorkersRow struct {
+	WorkerID        uuid.UUID `json:"worker_id"`
+	RunID           uuid.UUID `json:"run_id"`
+	Phase           string    `json:"phase"`
+	ClaimGeneration int64     `json:"claim_generation"`
+}
+
+// PRD #1390 M2c: the reported active runs (run_id, phase, generation) for a set of workers, for
+// the worker-list DTO overlay. Batched over a worker-id set so the two list endpoints read every
+// worker's rows in one round-trip (no N+1). Ordered by (worker_id, run_id) so the overlay can
+// group by worker in one pass and each worker's entries render in a stable order.
+func (q *Queries) ListActiveRunsForWorkers(ctx context.Context, workerIds []uuid.UUID) ([]ListActiveRunsForWorkersRow, error) {
+	rows, err := q.db.Query(ctx, listActiveRunsForWorkers, workerIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListActiveRunsForWorkersRow{}
+	for rows.Next() {
+		var i ListActiveRunsForWorkersRow
+		if err := rows.Scan(
+			&i.WorkerID,
+			&i.RunID,
+			&i.Phase,
+			&i.ClaimGeneration,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listAllWorkers = `-- name: ListAllWorkers :many
 SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source, w.kind, w.hosted_size, w.hosted_generation, w.docker_enabled, w.anthropic_secret_id, w.anthropic_bind_mode, w.online_since, w.draining_since, w.capabilities, w.ephemeral, w.ephemeral_run_id, w.stats_disk_nix_bytes, w.stats_disk_nix_total_bytes, w.stats_disk_data_bytes, w.stats_disk_data_total_bytes, w.stats_disk_pressure_streak, w.protocol_capabilities, w.snapshot_epoch, w.snapshot_register_nonce, w.pending_overflow, w.pending_overflow_until,
        EXISTS (

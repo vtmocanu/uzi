@@ -3545,6 +3545,16 @@ UPDATE workers SET
     updated_at             = now()
 WHERE id = @id;
 
+-- name: ListActiveRunsForWorkers :many
+-- PRD #1390 M2c: the reported active runs (run_id, phase, generation) for a set of workers, for
+-- the worker-list DTO overlay. Batched over a worker-id set so the two list endpoints read every
+-- worker's rows in one round-trip (no N+1). Ordered by (worker_id, run_id) so the overlay can
+-- group by worker in one pass and each worker's entries render in a stable order.
+SELECT worker_id, run_id, phase, claim_generation
+FROM worker_active_runs
+WHERE worker_id = ANY(@worker_ids::uuid[])
+ORDER BY worker_id, run_id;
+
 -- Heartbeat reconciliation (PRD #1390 M2b) ----------------------------------
 
 -- name: LockOwnedRunsByIDs :many

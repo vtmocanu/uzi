@@ -12,6 +12,13 @@
   "busy": true,
   "active_runs": 1,
   "max_concurrent_runs": 1,
+  "reported_runs": [
+    {
+      "run_id": "x",
+      "phase": "x",
+      "claim_generation": 1
+    }
+  ],
   "retaining_unpublished_work": true,
   "template_declared": "x",
   "template_reported": "x",
