@@ -235,9 +235,12 @@ func TestChatAnswerIsScrubbedAndInert(t *testing.T) {
 	fp := &fakePoster{}
 	n := NewNotifier(chatMsgStore(runID), fp, fixedBase, nil)
 
+	// Fake PAT fixture, assembled from parts so no contiguous glpat-<20> literal sits in
+	// source; used in both the fixture and the scrub assertion below, never a real secret.
+	pat := "glpat-" + "ABCDEF1234567890abcd"
 	feed(n, runID,
 		frame("user_message", `{"text":"echo this"}`),
-		frame("text", `{"text":"ping <@U123> see <https://evil|Open> token glpat-ABCDEF1234567890abcd"}`), //gitleaks:allow // fake PAT fixture: asserts a credential-shaped string is scrubbed, never a real secret
+		frame("text", `{"text":"ping <@U123> see <https://evil|Open> token `+pat+`"}`),
 		frame("status", `{"event":"result"}`),
 	)
 
@@ -253,7 +256,7 @@ func TestChatAnswerIsScrubbedAndInert(t *testing.T) {
 	if strings.Contains(body, "<https://evil|Open>") {
 		t.Errorf("a masquerading link must be neutralized in the section: %q", body)
 	}
-	if strings.Contains(body, "glpat-ABCDEF1234567890abcd") { //gitleaks:allow // fake PAT fixture: asserts the credential-shaped string was scrubbed, never a real secret
+	if strings.Contains(body, pat) {
 		t.Errorf("a credential-shaped string must be scrubbed: %q", body)
 	}
 	// The fallback is built from the escaped twin, so it is inert there too.

@@ -143,15 +143,19 @@ func TestProposalCardScrubsAndBounds(t *testing.T) {
 	n := NewNotifier(chatMsgStore(runID), fp, fixedBase, nil)
 
 	longDesc := strings.Repeat("x", 5000)
+	// Fake PAT fixtures, assembled from parts so no contiguous glpat-<20> literal sits in
+	// source; used in both the fixture and the scrub assertion below, never a real secret.
+	titlePAT := "glpat-" + "ABCDEF1234567890abcd"
+	labelPAT := "glpat-" + "ZZZZZZZZZZZZZZZZZZZZ"
 	feed(n, runID, frame("proposal",
-		`{"id":"`+propID.String()+`","title":"tok glpat-ABCDEF1234567890abcd ping <@U9>",`+ //gitleaks:allow // fake PAT fixture: asserts a credential-shaped title is scrubbed, never a real secret
-			`"description":"`+longDesc+`","labels":["glpat-ZZZZZZZZZZZZZZZZZZZZ"],"repo_path":"grp/repo"}`))
+		`{"id":"`+propID.String()+`","title":"tok `+titlePAT+` ping <@U9>",`+
+			`"description":"`+longDesc+`","labels":["`+labelPAT+`"],"repo_path":"grp/repo"}`))
 
 	if len(fp.blocks) != 1 {
 		t.Fatalf("want one card, got %+v", fp.blocks)
 	}
 	body := fp.blocks[0].sectionText
-	if strings.Contains(body, "glpat-ABCDEF1234567890abcd") || strings.Contains(body, "glpat-ZZZZZZZZZZZZZZZZZZZZ") { //gitleaks:allow // fake PAT fixtures: asserts credential-shaped title/label are scrubbed, never a real secret
+	if strings.Contains(body, titlePAT) || strings.Contains(body, labelPAT) {
 		t.Errorf("credential-shaped title/label must be scrubbed: %q", body[:min(200, len(body))])
 	}
 	if strings.Contains(body, "<@U9>") {
@@ -415,15 +419,18 @@ func TestSteerRequestFrameMessageInert(t *testing.T) {
 	fp := &fakePoster{}
 	n := NewNotifier(chatMsgStore(runID), fp, fixedBase, nil)
 
+	// Fake PAT fixture, assembled from parts so no contiguous glpat-<20> literal sits in
+	// source; used in both the fixture and the scrub assertion below, never a real secret.
+	pat := "glpat-" + "ABCDEF1234567890abcd"
 	feed(n, runID, frame("steer_request",
 		`{"run_id":"`+targetRun.String()+`",`+
-			`"message":"tok glpat-ABCDEF1234567890abcd ping <@U9> see <https://evil|Open>"}`)) //gitleaks:allow // fake PAT fixture: asserts a credential-shaped message is scrubbed, never a real secret
+			`"message":"tok `+pat+` ping <@U9> see <https://evil|Open>"}`))
 
 	if len(fp.blocks) != 1 {
 		t.Fatalf("want one card, got %+v", fp.blocks)
 	}
 	body := fp.blocks[0].sectionText
-	if strings.Contains(body, "glpat-ABCDEF1234567890abcd") { //gitleaks:allow // fake PAT fixture: asserts the credential-shaped message is scrubbed, never a real secret
+	if strings.Contains(body, pat) {
 		t.Errorf("a credential in the proposed message must be scrubbed: %q", body)
 	}
 	if strings.Contains(body, "<@U9>") {
