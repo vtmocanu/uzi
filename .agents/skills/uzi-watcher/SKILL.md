@@ -389,6 +389,14 @@ and **CodeRabbit reviews every PR automatically** the moment it opens. So the de
 auto-run `/code-review`; that is a redundant fourth pass over code two waves already read,
 and the standing preference here is not to spin up review agents by default (2026-08-24).
 
+- **CodeRabbit is the sole AUTO reviewer; Greptile is configured on-demand only.**
+  `greptile.json` sets `autoReview: []`, so Greptile never fires unasked — summon it with a
+  `@greptile review` comment (or the full handle `@greptileai`; GitHub won't autocomplete the
+  bot but it still triggers) when you want a second bot opinion: CodeRabbit absent or
+  rate-limited, or a high-risk diff worth two passes. Re-comment `@greptile review` after a fix
+  push to re-review. It bills a credit per review, so reserve it for when it adds value; it is
+  also a valid CR-absent fallback alongside `/code-review` below.
+
 - **Default — wait for CodeRabbit, then assess.** CodeRabbit posts **asynchronously** (a few
   minutes after the PR opens), so you must wait for its review to **land** before assessing.
   Detect landing:
