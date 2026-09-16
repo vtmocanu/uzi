@@ -1800,10 +1800,13 @@ export interface StateRequest {
   status: RunState;
   /** PRD #1392 M2 (#1247 generation fence): the exact claim generation THIS report is made
    *  against, so the api's park transaction settles only the hold that generation opened. Sent on
-   *  the forge-unreachable park report; the #1247 reportState closure (M5b) stamps it
-   *  UNCONDITIONALLY on every in-flight mutating report — including the older-api untyped forge-park
-   *  fallback — so the server's per-query fence engages. It is NOT gated on the
-   *  `claim_generation_fence` feature here. Additive + optional. */
+   *  the forge-unreachable park report; the #1247 reportState closure (M5b) THREADS it onto every
+   *  in-flight mutating report (including the older-api untyped forge-park fallback), and the fix
+   *  round (E) send-gates it in client.reportState: a `credential_switch_v1` capability worker
+   *  stamps OPTIMISTICALLY regardless of the negotiated `claim_generation_fence` feature, a
+   *  non-capability (#1391-era) worker feature-gates, 0 (chat's legacy sentinel) is omitted, and on
+   *  the exact strict-decode 400 from a rolled-back api the field is stripped and the report retried
+   *  ONCE. Additive + optional. */
   claim_generation?: number;
   /** awaiting_approval carries the captured plan; an autopilot `running` report also
    *  carries it, persisted durably via SetRunAutopilotPlan (RC1 #1197). */

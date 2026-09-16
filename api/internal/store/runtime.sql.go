@@ -7830,8 +7830,11 @@ type ReleaseCredentialSwitchParams struct {
 // is the owner's choice, not an external park, so a fresh wall would let repeated switches extend
 // a run without bound. claim_released_at = now() ARMS the fence so every later report from the
 // old flight is rejected until ClaimRun reclaims and clears it. The switch stamp
-// (credential_switch_requested_at/_generation) is deliberately KEPT — it is visible as "released,
-// awaiting reclaim" (D14) and is cleared only by the next epoch write at reclaim (M9). codex
+// (credential_switch_requested_at/_generation) is deliberately KEPT on this release transition — it
+// is visible as "released, awaiting reclaim" (D14). It is cleared by any TERMINAL transition now
+// (PRD #1247 D11 fix round, beside the pause-clears). The successful-APPLICATION clear at the next
+// epoch write on reclaim (D14) is NOT yet implemented — deferred to issue #1422 (M9); until it
+// lands the stamp lingers past a same-run reclaim (a stale DTO state only, no signal leak). codex
 // cap/epoch are revoked/bumped like every other park->queued transition; health is reset because
 // 'queued' is on the detector's allowlist. Status_since is NOT NULL (migration 00163), so the
 // banked interval is never NULL.

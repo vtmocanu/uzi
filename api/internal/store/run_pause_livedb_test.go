@@ -422,7 +422,7 @@ func TestRunPauseQueriesLiveDB(t *testing.T) {
 	// PRD #1224 M2 (Decision 7): this same table now ALSO pins the milestones_agents clear.
 	// armedRunning additionally sets milestones_in_progress + milestones_agents to non-empty
 	// values and asserts milestones_agents is SET, and assertCleared additionally asserts it
-	// is NULL after the transition — so all ten terminal writers are proven to clear the
+	// is NULL after the transition — so all eleven terminal writers are proven to clear the
 	// per-milestone agent attribution beside milestones_in_progress.
 	t.Run("every terminal transition clears a pending pause", func(t *testing.T) {
 		// milestonesAgents reads the run's milestones_agents column as its ::text form, so a
@@ -435,7 +435,6 @@ func TestRunPauseQueriesLiveDB(t *testing.T) {
 			}
 			return raw
 		}
-		// armedRunning inserts a running issue run under this worker carrying a pending
 		// PRD #1247 D11 fix round: arm + assert the held-state credential-switch clear beside the
 		// pause + milestones_agents clears, so every terminal writer settles a pending switch.
 		switchStamp := func(t *testing.T, id uuid.UUID) (pgtype.Timestamptz, pgtype.Int8) {
@@ -447,6 +446,7 @@ func TestRunPauseQueriesLiveDB(t *testing.T) {
 			}
 			return at, gen
 		}
+		// armedRunning inserts a running issue run under this worker carrying a pending
 		// milestone pause (after-count 2), arms a non-empty milestones_in_progress +
 		// milestones_agents beside it (PRD #1224 M2), and asserts both the pause columns and
 		// milestones_agents actually landed SET — the control half that keeps the

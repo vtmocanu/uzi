@@ -183,11 +183,16 @@ describe("RunRunner — pre-clone forge-unreachable park (PRD #1392 M2)", () => 
       const claim = gitlabClaim(702, { claim_generation: 9 });
       await makeRunner(client, factory).execute(claim);
 
-      // The TYPED report is sent first, carrying the cause + generation.
+      // The TYPED report is sent first, carrying the cause + generation. NOTE: ForgeParkClient
+      // OVERRIDES reportState and records the body the CLOSURE built, BEFORE client.reportState's
+      // send-gate (fix round E) runs — so this asserts the reportState closure STAMPS the generation
+      // into the report, not that it rides the wire. The actual wire behavior (capability-optimistic
+      // stamp, gen-0 omit, strict-decode strip-and-retry) is pinned in client-state-send-gate.test.ts
+      // and the runner integration in runner-stale-claim.test.ts.
       const park = parkReport(client);
       assert.ok(park, "the typed recovery_wait report must be sent");
       assert.strictEqual(park!.recovery_cause, "forge_unreachable");
-      assert.strictEqual(park!.claim_generation, 9);
+      assert.strictEqual(park!.claim_generation, 9, "the reportState closure stamps the claim generation into the report");
       // No terminal report, no release endpoint call (the api settles custody in the transaction).
       assert.ok(!reportedStatuses(client).includes("failed"), "a parked run reports no failure");
       assert.deepStrictEqual(client.releaseCalls, [], "recovery_park_cause api parks with NO release call");
