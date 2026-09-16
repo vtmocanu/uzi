@@ -2333,7 +2333,11 @@ export class RunRunner {
     // real secret. GitHub-only: GitLab/Forgejo have no equivalent push-side secret rejection.
     if (claim.repo.forge_type === "github") {
       const scanBarePath = barePath;
-      const scan = await this.git.secretScanRange(scanBarePath, trackingRef);
+      const scan = await this.git.secretScanRange(scanBarePath, trackingRef, result.branch, {
+        pat: claim.secrets.forge_pat,
+        cloneUrl: claim.repo.clone_url,
+        username: claim.secrets.forge_username,
+      });
       if (scan.trusted && scan.findings.length > 0) {
         const reason = composePushSecretBlockedReason(scan.findings);
         // Do NOT preserve the diff on a secret block. redactText only scrubs the run's OWN

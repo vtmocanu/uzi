@@ -2181,14 +2181,111 @@ export class GitCache {
   }
 
   /**
+   * issue #1398 — resolve the FLOOR the finalize secret scan should treat as
+   * already-published, so `floor..trackingRef` is the REAL push delta and no
+   * already-pushed history is re-scanned. Returns a 40-hex SHA or a ref string, or
+   * `null` to mean "fail open" (no trustworthy floor).
+   *
+   * FIRST push (no `refs/remotes/origin/<branch>` in the worker bare): the whole branch
+   * is new, so the floor is the default branch — exactly what a push carries.
+   *
+   * RESUMED / continued branch (the ref exists): the floor is the CURRENT remote branch
+   * tip, and it must be FRESH. The last origin contact was at claim time, so the bare's
+   * `refs/remotes/origin/<branch>` mirror can be stale; flooring on the stale mirror (or
+   * on the default branch) re-scans already-pushed commits and can rediscover an old
+   * inline-allowed synthetic fixture, falsely failing the run as `push_secret_blocked`.
+   *
+   * NON-CLOBBER (load-bearing; issue #1117 dependency): the mr_rework branch-moved
+   * detection reads the CLAIM-TIME `refs/remotes/origin/<branch>` (via originBranchTip)
+   * BEFORE its own fetchDefaultTip, so this fresh fetch must NOT touch that ref. A plain
+   * `git fetch origin <branch>` would update it via the configured refspec. Even an explicit
+   * command-line refspec into a scratch ref is NOT enough on its own: git still performs an
+   * OPPORTUNISTIC update of `refs/remotes/origin/<branch>` because the fetched `refs/heads/
+   * <branch>` matches the bare's configured `+refs/heads/*:refs/remotes/origin/*` refspec
+   * (measured on git 2.54: the mirror moved to the fresh tip). We suppress that with
+   * `--refmap=` (empty), which makes git ignore the configured refspecs entirely and rely
+   * only on the command-line one, so ONLY the scratch ref `refs/uzi-secret-scan-floor/
+   * <branch>` is written and `refs/remotes/origin/<branch>` is left untouched. The scratch
+   * ref is deleted on EVERY exit path; its objects survive in the object store (no gc
+   * mid-process), so the returned SHA stays usable as the caller's range base after the ref
+   * is gone.
+   *
+   * ANCESTRY / FAIL-OPEN: the fresh tip is used only when it is an ancestor of trackingRef
+   * (the push is a fast-forward over it). A diverged/rewound remote, an unresolved tip, or
+   * any thrown error (an unreadable bare, a failed fetch) returns `null` — the caller then
+   * fails open and relies on the GH013 remote backstop rather than blocking or scanning a
+   * wrong range.
+   */
+  async resolvePublicationFloor(
+    barePath: string,
+    trackingRef: string,
+    branch: string,
+    creds?: { pat?: string; cloneUrl?: string; username?: string },
+  ): Promise<string | null> {
+    const originRef = `refs/remotes/origin/${branch}`;
+    if (!(await this.refExists(barePath, originRef))) {
+      // FIRST push: the whole branch is new, so the default branch is the floor.
+      try {
+        return await this.defaultBranchRef(barePath);
+      } catch {
+        return null;
+      }
+    }
+    // RESUMED branch: floor on a FRESH, verified remote tip fetched into a scratch ref that
+    // does NOT clobber refs/remotes/origin/<branch> (see NON-CLOBBER above).
+    const scratchRef = `refs/uzi-secret-scan-floor/${branch}`;
+    const scope = creds?.cloneUrl ? httpScopeForUrl(creds.cloneUrl) : undefined;
+    try {
+      return await this.withLock(barePath, async () => {
+        try {
+          await this.runGit(
+            barePath,
+            // `--refmap=` (empty) suppresses the bare's configured
+            // `+refs/heads/*:refs/remotes/origin/*` refspec, so this fetch does NOT
+            // opportunistically clobber refs/remotes/origin/<branch> (the NON-CLOBBER
+            // invariant above) — only the explicit scratch ref is written.
+            ["fetch", "--refmap=", "origin", `+refs/heads/${branch}:${scratchRef}`],
+            creds?.pat,
+            scope,
+            creds?.username,
+          );
+          const tip = (
+            await this.runGit(barePath, [
+              "rev-parse",
+              "--verify",
+              `${scratchRef}^{commit}`,
+            ]).catch(() => "")
+          ).trim();
+          if (!/^[0-9a-f]{40}$/.test(tip)) return null;
+          // Only floor on the fresh tip when the push is a fast-forward over it; a
+          // diverged/rewound remote fails open (the delta is not simply floor..tip).
+          if (!(await this.isAncestorRef(barePath, tip, trackingRef))) return null;
+          return tip;
+        } finally {
+          // Delete the scratch ref on EVERY exit path (success, fail-open, thrown error). Its
+          // objects remain in the object store, so a returned SHA stays usable as the range base.
+          await this.runGit(barePath, ["update-ref", "-d", scratchRef]).catch(() => undefined);
+        }
+      });
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * PRD #974 M2 (load-bearing security) — scan the commit range the finalize push would carry
    * for secrets with the repo's pinned gitleaks, GitLeaks' three silencers DISABLED, and
    * return whether the scan is TRUSTWORTHY plus any findings.
    *
-   * Range: `base..head` (TWO-dot — the commits ON the branch and NOT on the default branch,
-   * exactly what a push carries), base = defaultBranchRef, head = trackingRef. An empty range
-   * (0 commits) is the nothing-to-scan case and returns trusted with no findings so the normal
-   * push proceeds.
+   * Range: `base..head` (TWO-dot — the commits ON the branch and NOT below the publication
+   * floor), base = the publication floor (git.resolvePublicationFloor), head = trackingRef.
+   * `base..head` equals what a push carries ONLY for a FIRST push of a NEW remote branch
+   * (floor = the default branch); on a RESUMED/continued branch the floor is the CURRENT,
+   * FRESHLY-FETCHED remote branch tip, so already-pushed commits are EXCLUDED (issue #1398 —
+   * flooring on the default branch there re-scanned pushed history and could falsely block on
+   * an old inline-allowed fixture). An empty range (0 commits) is the nothing-to-scan case and
+   * returns trusted with no findings so the normal push proceeds; a null floor
+   * (unreadable/unresolved/diverged) fails OPEN to the GH013 backstop.
    *
    * WHY the BARE, and why the silencers are disabled: GitHub Push Protection (GH013) ignores
    * `.gitleaks.toml`, `.gitleaksignore` and inline `//gitleaks:allow`, so a scan that honored
@@ -2213,19 +2310,22 @@ export class GitCache {
   async secretScanRange(
     barePath: string,
     trackingRef: string,
+    branch: string,
+    creds?: { pat?: string; cloneUrl?: string; username?: string },
   ): Promise<{ trusted: boolean; findings: SecretFinding[] }> {
-    // Resolve the range base INSIDE the fail-open envelope: defaultBranchRef throws when no
-    // default ref resolves, and an uncaught throw here would escape to the generic catch and
-    // report `failed` with NO preserved_patch — the exact work-loss this feature prevents. So
-    // it fails open like every other setup step below (the sibling changedFiles guards the
-    // identical call the same way).
-    let base: string;
-    try {
-      base = await this.defaultBranchRef(barePath);
-    } catch {
-      this.log.warn("finalize secret scan: could not resolve the default branch; failing open", {
-        barePath,
-      });
+    // Resolve the range base INSIDE the fail-open envelope: resolvePublicationFloor never
+    // throws (it returns null on any unreadable/unresolved/diverged case), because an uncaught
+    // throw here would escape to the generic catch and report `failed` with NO preserved_patch —
+    // the exact work-loss this feature prevents. A null floor fails open like every other setup
+    // step below. The floor is the current FRESH remote branch tip on a resumed branch and the
+    // default branch on a first push (issue #1398), so the trust gate below covers the real
+    // push delta rather than re-scanning already-pushed history.
+    const base = await this.resolvePublicationFloor(barePath, trackingRef, branch, creds);
+    if (base === null) {
+      this.log.warn(
+        "finalize secret scan: could not resolve a trustworthy publication floor; failing open",
+        { barePath },
+      );
       return { trusted: false, findings: [] };
     }
     const logRange = `${base}..${trackingRef}`;
