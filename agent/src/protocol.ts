@@ -2094,6 +2094,12 @@ export interface StateAck {
    *  reportState still returns a stale-claim 409 as `{applied:false,...}` — control flow is
    *  unchanged; a LATER behavior unit acts on this flag. */
   staleClaim?: boolean;
+  /** PRD #1247 M5b (BLOCKING-2 rework): true when the /state ack carried `disposition: "released"`
+   *  on a 200 — the held-state credential-switch RELEASE applied. The server sets it for BOTH a
+   *  fresh requeue (status 'queued') and an idempotent release after a reclaim (status 'running'),
+   *  so enterCredentialSwitch treats the release as done off this flag, not off status === 'queued'
+   *  (which missed the idempotent-after-reclaim success and gave up on a server-confirmed release). */
+  credentialSwitchReleased?: boolean;
 }
 
 export interface UserInput {

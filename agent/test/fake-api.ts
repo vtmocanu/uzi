@@ -667,6 +667,11 @@ export class FakeApi {
         // present when a test armed it; otherwise absent (the worker reads it as "no pause").
         ...(this.pauseRequestedRuns.has(runId) ? { pause_requested: true } : {}),
       },
+      // PRD #1247 M5b (BLOCKING-2): mirror the real server — an APPLIED credential_switch RELEASE
+      // (a 200) carries disposition:"released", which the worker reads to accept the release
+      // regardless of the run's returned status (a fresh 'queued' OR an idempotent-after-reclaim
+      // 'running' set via overrideStateStatus). enterCredentialSwitch keys off this, not status.
+      ...(body.status === "credential_switch" ? { disposition: "released" } : {}),
     });
   }
 }

@@ -343,6 +343,17 @@ export class SteeringChannel {
     return this.pendingSwitchGeneration;
   }
 
+  /** PRD #1247 M5b (BLOCKING-3 rework): re-arm the credential-switch trip after a give-up whose
+   *  stamp-clear the server POSITIVELY confirmed. Clears pendingSwitchGeneration so a LATER
+   *  same-generation switch signal — a re-request the owner makes on the STILL-OPEN claim, whose
+   *  generation is pinned to claim_generation for the claim's lifetime — can trip again. Without
+   *  it the once-only guard in maybeTripCredentialSwitch permanently drops every subsequent signal
+   *  for that claim. Call it ONLY after a CONFIRMED clear on a give-up-continue, never on a
+   *  retain-and-stop (where the server stamp may still be pending). */
+  rearmCredentialSwitch(): void {
+    this.pendingSwitchGeneration = undefined;
+  }
+
   /** Start the poll loop (idempotent). Runs until stop(). */
   start(): void {
     if (this.loop) return;

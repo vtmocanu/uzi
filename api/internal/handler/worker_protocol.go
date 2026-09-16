@@ -914,7 +914,17 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 		httpx.JSON(w, http.StatusConflict, h.workerStateAck(r, run))
 		return
 	}
-	httpx.JSON(w, http.StatusOK, h.workerStateAck(r, run))
+	ack := h.workerStateAck(r, run)
+	if req.State == "credential_switch" {
+		// PRD #1247 M5b (BLOCKING-2 rework): the held-state credential-switch RELEASE applied — a
+		// FRESH requeue (status 'queued') OR an idempotent release after a reclaim (applied, status
+		// 'running'). Tell the worker EXPLICITLY the release took, so enterCredentialSwitch accepts
+		// it regardless of the run's status. It previously required status == 'queued' and so gave
+		// up on the idempotent-after-reclaim success (applied=true, status 'running'), leaving the
+		// old flight to continue on a claim the reclaim already owns.
+		ack["disposition"] = "released"
+	}
+	httpx.JSON(w, http.StatusOK, ack)
 }
 
 // workerStateAck builds the state-report ack body: the run DTO plus, when a held-state switch is

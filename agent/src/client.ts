@@ -505,6 +505,8 @@ export class WorkerClient {
             ack.credentialSwitch = fields.credentialSwitch;
           if (fields.staleClaim !== undefined)
             ack.staleClaim = fields.staleClaim;
+          if (fields.credentialSwitchReleased !== undefined)
+            ack.credentialSwitchReleased = fields.credentialSwitchReleased;
           if (!ack.applied) {
             this.log.info("state report not applied server-side", {
               run_id: runId,
@@ -1197,6 +1199,7 @@ export async function readRunAck(res: Response): Promise<{
   recoveryRetryNotBefore?: string;
   credentialSwitch?: { generation: number };
   staleClaim?: boolean;
+  credentialSwitchReleased?: boolean;
 }> {
   try {
     const text = await res.text();
@@ -1235,6 +1238,7 @@ export async function readRunAck(res: Response): Promise<{
       recoveryRetryNotBefore?: string;
       credentialSwitch?: { generation: number };
       staleClaim?: boolean;
+      credentialSwitchReleased?: boolean;
     } = {};
     if (typeof run?.status === "string") out.status = run.status;
     if (typeof run?.budget_max_iterations === "number")
@@ -1284,6 +1288,11 @@ export async function readRunAck(res: Response): Promise<{
     if (typeof cs === "object" && cs !== null && typeof (cs as { generation?: unknown }).generation === "number")
       out.credentialSwitch = { generation: (cs as { generation: number }).generation };
     if (parsed?.disposition === "stale_claim") out.staleClaim = true;
+    // PRD #1247 M5b (BLOCKING-2 rework): the held-state credential-switch RELEASE applied. The
+    // server sets it on the 200 ack for BOTH a fresh requeue (status 'queued') and an idempotent
+    // release after a reclaim (status 'running'), so enterCredentialSwitch accepts the release off
+    // this flag rather than off status === 'queued' (which missed the idempotent case).
+    if (parsed?.disposition === "released") out.credentialSwitchReleased = true;
     return out;
   } catch {
     return {};

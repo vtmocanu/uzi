@@ -311,6 +311,69 @@ describe("RunRunner — held-state credential switch (PRD #1247 M5b)", () => {
     }
   });
 
+  it("BLOCKING-2: an idempotent release AFTER a reclaim (applied, status 'running', disposition 'released') is accepted as RELEASED, not a give-up", async () => {
+    const { gitlab, calls } = fakeGitlab();
+    const { executor } = makeInPlaceSwitchExecutor("verified");
+    const home = seedHome();
+    const claim = gitlabClaim(1270);
+    try {
+      // The release is a REDELIVERY the server already applied via a reclaim: it answers 200 with the
+      // reclaimed run's status 'running' (NOT 'queued') plus disposition:'released'. The pre-fix worker
+      // keyed release off status === 'queued' and so GAVE UP on this server-confirmed success, leaving
+      // the old flight to keep working a claim the reclaim already owns; the fix keys off the released
+      // disposition, so `status: 'running'` is still accepted as released.
+      api.overrideStateStatus(claim.run_id, "running");
+      await runnerWith(() => ({ executor, homeDir: home.homeDir }), gitlab, undefined, undefined, {
+        recoveryRetryMs: 1,
+      }).execute(claim);
+
+      const s = statuses(claim.run_id);
+      assert.ok(s.includes("credential_switch"), "the release reported credential_switch");
+      assert.ok(!s.includes("credential_switch_failed"), "an idempotent-after-reclaim release is RELEASED, not a give-up");
+      assert.ok(!s.includes("completed"), "a released run skips finalize");
+      assert.ok(!s.includes("failed"), "a released run is not failed");
+      assert.strictEqual(calls.length, 0, "a released run opens no MR");
+      assert.strictEqual(fs.existsSync(worktreeDirFor(1270)), false, "the clone is retired on the accepted release");
+      assert.strictEqual(fs.existsSync(home.sentinel), true, "the HOME is preserved for the reclaim");
+    } finally {
+      fs.rmSync(home.root, { recursive: true, force: true });
+    }
+  });
+
+  it("BLOCKING-3: a give-up whose credential_switch_failed clear is NOT confirmed RETAINS work and STOPS (no continue, no terminal report, marker kept)", async () => {
+    const { gitlab, calls } = fakeGitlab();
+    // DIRTY tree, marker committed, never verifies ⇒ GIVE UP. The clear report is REFUSED (409, not
+    // applied), so the switch stamp may still be pending — continuing in place would let the server's
+    // consume-nothing rule strand every buffered answer/follow-up for this claim. So the run RETAINS
+    // everything and STOPS for requeue instead of continuing.
+    const { executor, marker } = makeInPlaceSwitchExecutor("marker_giveup");
+    const home = seedHome();
+    const claim = gitlabClaim(1271);
+    try {
+      api.failStateWhen(claim.run_id, (b) => b.status === "credential_switch_failed", { httpStatus: 409 });
+      await runnerWith(() => ({ executor, homeDir: home.homeDir }), gitlab, undefined, undefined, {
+        recoveryRetryMs: 1,
+      }).execute(claim);
+
+      const s = statuses(claim.run_id);
+      // The credential_switch_failed clear WAS attempted but the fake refused it (409) before
+      // recording, matching the real server — so it does not appear in `statuses`; its refusal is
+      // exactly what makes the clear "not confirmed" and drives the retain-and-stop below.
+      assert.ok(!s.includes("credential_switch"), "the release is never reported on a give-up");
+      // Clear NOT confirmed ⇒ retain-and-stop. On the pre-fix code the run CONTINUED regardless (a
+      // normal completion was reported and the marker was undone); the fix STOPS: no completion, no
+      // terminal report, the wip marker KEPT, and the clone + HOME retained for the reclaim.
+      assert.ok(!s.includes("completed"), "an unconfirmed give-up STOPS — it does NOT continue to a completion");
+      assert.ok(!s.includes("failed"), "a switch never fails the run");
+      assert.strictEqual(calls.length, 0, "no MR is opened");
+      assert.strictEqual(marker.undoCalled, false, "retain-and-stop KEEPS the wip(park) marker (no in-place undo)");
+      assert.strictEqual(fs.existsSync(worktreeDirFor(1271)), true, "the clone is RETAINED for the reclaim");
+      assert.strictEqual(fs.existsSync(home.sentinel), true, "the HOME is RETAINED for the reclaim");
+    } finally {
+      fs.rmSync(home.root, { recursive: true, force: true });
+    }
+  });
+
   it("release via ctx.attemptCredentialSwitch ENDS: switchReleased skips finalize (no completed/MR), clone retired, HOME preserved", async () => {
     const { gitlab, calls } = fakeGitlab();
     const { executor } = makeInPlaceSwitchExecutor("verified");

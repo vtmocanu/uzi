@@ -277,6 +277,37 @@ describe("SteeringChannel — credential switch (PRD #1247 M5b)", () => {
     await ch.stop();
   });
 
+  it("BLOCKING-3: rearmCredentialSwitch re-opens the trip so a LATER same-generation signal fires again", async () => {
+    const cancel = new AbortController();
+    let interrupts = 0;
+    const ch = new SteeringChannel(
+      switchClient([{ credentialSwitch: { generation: 7 } }]), // re-offered on EVERY poll
+      "run-1",
+      1,
+      nullLogger(),
+      cancel,
+      { claimGeneration: 7 },
+    );
+    ch.onCredentialSwitch(() => {
+      interrupts++;
+    });
+    ch.start();
+    for (let n = 0; n < 300 && ch.pendingCredentialSwitch() === undefined; n++) await tick();
+    assert.strictEqual(interrupts, 1, "the switch tripped once");
+    await tick(20);
+    assert.strictEqual(interrupts, 1, "and stays tripped-once while pending (the once-only guard drops repeats)");
+    // A give-up whose clear the server POSITIVELY confirmed re-arms the channel. The SAME-generation
+    // signal — a re-request the owner makes on the STILL-OPEN claim, whose generation is pinned to
+    // claim_generation for the claim's lifetime — is still offered on every poll and must trip AGAIN.
+    // Without the re-arm the once-only guard would drop every subsequent signal for the claim forever.
+    ch.rearmCredentialSwitch();
+    assert.strictEqual(ch.pendingCredentialSwitch(), undefined, "rearm clears the pending switch");
+    for (let n = 0; n < 300 && interrupts < 2; n++) await tick();
+    assert.strictEqual(interrupts, 2, "the re-armed channel fires the switch again on the next matching poll");
+    assert.strictEqual(ch.pendingCredentialSwitch(), 7, "and re-records the pending generation");
+    await ch.stop();
+  });
+
   it("does NOT act on a switch whose generation does not match this claim (a superseded claim)", async () => {
     const cancel = new AbortController();
     let interrupts = 0;

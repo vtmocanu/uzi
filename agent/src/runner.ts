@@ -161,6 +161,24 @@ class StaleClaimError extends Error {
   }
 }
 
+/**
+ * PRD #1247 M5b (BLOCKING-2/3 rework): a held-state credential switch could not be CONFIRMED, so
+ * the flight must STOP without continuing in place — but, unlike StaleClaimError, it must RETAIN
+ * all work (enterCredentialSwitch left the preserve flags SET). Thrown by ctx.attemptCredentialSwitch
+ * when enterCredentialSwitch returns "retained_stop" — an unverified give-up whose stamp-clear the
+ * server never confirmed, or a release whose outcome is unknown. Continuing in place would risk
+ * working a claim the reclaim already owns (release) or stranding every buffered input behind a
+ * still-pending switch stamp (give-up); so executeClaim's catch chain ends the flight NON-TERMINAL
+ * (no failed report), keeping the clone + HOME so the sweeper's requeue lets a reclaim resume the
+ * retained work. Local, like TerminalReportError / StaleClaimError.
+ */
+class CredentialSwitchRetainedStop extends Error {
+  constructor() {
+    super("credential switch unconfirmed; retaining work and stopping the flight");
+    this.name = "CredentialSwitchRetainedStop";
+  }
+}
+
 /** Map a known failure-reason CONSTANT to the server's fail_origin enum (PRD #69
  *  M7a). Authored WORKER-SIDE from the reason constant the throw site used — it never
  *  parses free text: it matches only the fixed prefixes the two fatal pre-start
@@ -1168,6 +1186,18 @@ export class RunRunner {
         // terminal state — a `failed` here would fight the owning claim — and set NO preserve flag
         // (normal teardown: the new claim has its own clone). The finally then runs ordinary cleanup.
         runLog.info("run claim superseded server-side (stale_claim); stopping this flight");
+        await batcher.close().catch(() => undefined);
+      } else if (err instanceof CredentialSwitchRetainedStop) {
+        // PRD #1247 M5b (BLOCKING-2/3 rework): the in-place ctx.attemptCredentialSwitch could not
+        // CONFIRM the switch (an unverified give-up whose stamp-clear the server never confirmed, or
+        // a release whose outcome is unknown), so it retained all work and threw to stop rather than
+        // continue on a possibly-released claim. Unlike StaleClaimError, KEEP the preserve flags
+        // (enterCredentialSwitch left them SET) so the clone + HOME survive: report NO terminal state
+        // (a `failed` would fight a claim that may already have moved on) and leave the run
+        // NON-TERMINAL so the sweeper requeues it and a reclaim resumes the retained work.
+        runLog.info("credential switch unconfirmed; retaining work and leaving the run non-terminal for requeue", {
+          run_id: flight.runId,
+        });
         await batcher.close().catch(() => undefined);
       } else if (err instanceof CredentialSwitchSignal) {
         // PRD #1247 M5b (data-integrity fix): a SAFETY NET. The switch is now handled IN PLACE by the
@@ -4206,6 +4236,14 @@ export class RunRunner {
       // place and must KEEP the flags to leave the run non-terminal for a requeue.
       attemptCredentialSwitch: async () => {
         const outcome = await this.enterCredentialSwitch(claim, flight, runLog);
+        if (outcome === "retained_stop") {
+          // The switch could not be confirmed (BLOCKING-2/3 rework). enterCredentialSwitch RETAINED
+          // all work (the preserve flags stay set); STOP the flight NON-TERMINAL by throwing to
+          // executeClaim's catch chain, rather than continuing in place on a claim the reclaim may
+          // already own (release) or whose switch stamp may still be pending (give-up). Do NOT clear
+          // the preserve flags or undo the wip marker — the retained work must survive for the reclaim.
+          throw new CredentialSwitchRetainedStop();
+        }
         if (outcome === "gave_up") {
           flight.preserveRecoveryClone = false;
           flight.preserveSession = false;
@@ -5934,7 +5972,7 @@ export class RunRunner {
     claim: ClaimResponse,
     flight: RunFlight,
     runLog: Logger,
-  ): Promise<"released" | "gave_up"> {
+  ): Promise<"released" | "gave_up" | "retained_stop"> {
     // The generation this switch targets (equals flight.claimGeneration by construction — the
     // steering channel trips only on a generation match). Logged for provenance; the release
     // report's claim_generation is stamped by the reportState closure from flight.claimGeneration.
@@ -5962,45 +6000,71 @@ export class RunRunner {
       if (attempt < CREDENTIAL_SWITCH_CAPTURE_ATTEMPTS - 1) await this.waitRecoveryRetry(flight);
     }
     if (!verified) {
-      // 6a. GIVE UP. Report credential_switch_failed (best-effort) so the server clears the switch
-      // stamp; KEEP both preserve flags (no work loss); leave the run non-terminal for requeue.
-      await flight
-        .reportState({ status: "credential_switch_failed" })
-        .catch((e) =>
-          runLog.warn("credential switch: could not report credential_switch_failed", {
+      // 6a. GIVE UP — but only CONTINUE in place on a POSITIVE clear confirmation (BLOCKING-3
+      // rework). Report credential_switch_failed and READ the ack: the server clears the stamp
+      // only on a 200 (applied). If the clear is NOT confirmed — a not-applied 409, a network
+      // error, or a stale_claim throw (the claim was superseded) — the switch stamp may still be
+      // pending, and continuing would let the server's consume-nothing rule strand every
+      // answer/follow-up for this claim forever. So RETAIN everything and STOP for requeue instead.
+      // KEEP both preserve flags either way (no work loss).
+      let cleared = false;
+      try {
+        const ack = await flight.reportState({ status: "credential_switch_failed" });
+        cleared = ack.applied === true;
+        if (!cleared) {
+          runLog.warn("credential switch give-up: server did not confirm the stamp cleared; retaining and stopping", {
             run_id: flight.runId,
-            error: errMessage(e),
-          }),
-        );
+            server_status: ack.status ?? "unknown",
+          });
+        }
+      } catch (e) {
+        runLog.warn("credential switch give-up: could not confirm credential_switch_failed cleared the stamp; retaining and stopping", {
+          run_id: flight.runId,
+          error: errMessage(e),
+        });
+      }
+      if (!cleared) {
+        return "retained_stop";
+      }
+      // Positive clear confirmed: RE-ARM the steering channel so a LATER same-generation switch
+      // request (the owner re-clicking "switch token" on the still-open claim) can trip again —
+      // the once-only guard would otherwise drop it — then continue in place on the old token.
+      flight.steering.rearmCredentialSwitch();
       runLog.warn(
-        "credential switch: restore point never verified; not releasing (clone + HOME retained for requeue)",
+        "credential switch: restore point never verified; the switch stamp is cleared, continuing on the old token (clone + HOME retained)",
         { run_id: flight.runId, generation },
       );
       return "gave_up";
     }
     // 6b. Verified. DRAIN the batcher FIRST — the fenced append persists only while
     // claim_released_at IS NULL, so every pending message MUST land BEFORE the release requeues the
-    // run. Idempotent with the caller's own close().
+    // run. close() is safe here (not a "reversible drain"): BOTH release outcomes below END this
+    // flight — a confirmed release leaves the run for the reclaim, and an UNCONFIRMED release now
+    // RETAINS-and-STOPS (it no longer continues in place on a claim the reclaim may already own) —
+    // so a closed batcher is never continued past. Idempotent with the caller's own close().
     await flight.batcher.close().catch(() => undefined);
-    // THEN report the RELEASE and REQUIRE the positive `queued` ack. A throw (incl. a stale_claim
-    // from the reportState closure) or a non-queued status ⇒ give up: keep the flags, stay owned.
+    // THEN report the RELEASE. Accept it off the server's RELEASED disposition — set on BOTH a
+    // fresh requeue (status 'queued') AND an idempotent release after a reclaim (applied, status
+    // 'running') — not off status === 'queued', which missed the idempotent-after-reclaim success
+    // and gave up on a server-confirmed release, leaving the old flight to continue on a claim the
+    // reclaim already owned. A throw or an unconfirmed release ⇒ retain-and-stop.
     let released = false;
     try {
       const ack = await flight.reportState({ status: "credential_switch" });
-      released = ack.status === "queued";
+      released = ack.credentialSwitchReleased === true;
       if (!released) {
-        runLog.warn("credential switch: server did not requeue the run on release; not releasing", {
+        runLog.warn("credential switch: server did not confirm the release; retaining and stopping", {
           run_id: flight.runId,
           server_status: ack.status ?? "unknown",
         });
       }
     } catch (releaseError) {
-      runLog.warn("credential switch: release report failed; not releasing (retained for requeue)", {
+      runLog.warn("credential switch: release report failed; retaining and stopping", {
         run_id: flight.runId,
         error: errMessage(releaseError),
       });
     }
-    if (!released) return "gave_up"; // flags stay SET (retain-everything) — never assume released
+    if (!released) return "retained_stop"; // flags stay SET; STOP — never continue on a possibly-released claim
     // 7. Released. The work is durable on the worker tracking ref (+ best-effort origin), so RETIRE
     // the clone (a cross-worker reclaim re-clones); KEEP the HOME (parked) for a same-worker resume.
     flight.preserveRecoveryClone = false;
