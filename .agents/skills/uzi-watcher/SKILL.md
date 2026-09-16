@@ -309,7 +309,7 @@ matching GitHub's free-text message. At finalize the worker scans the push range
 (`base..HEAD`) with the pinned gitleaks, its three silencers (`.gitleaks.toml`,
 `.gitleaksignore`, inline `//gitleaks:allow`) forced OFF — GitHub Push Protection honours
 none of them, so a scan that did would clear a range GitHub still rejects. A finding fails
-the run early, typed `fail_origin = "push_secret_blocked"`, with the diff preserved; a GH013
+the run early, typed `fail_origin = "push_secret_blocked"`, with no preserved diff (it may carry the detected secret; recover the committed work from the run branch/PVC, or `uzi run export` when a durable-recovery archive exists); a GH013
 remote rejection that slips past the pre-push scan is parsed to the SAME typed origin. So
 `uzi run get RUN --json | jq -r .fail_origin` returns `push_secret_blocked` for this whole
 class — no more matching free-text `failure_reason`. **The pre-push scan does not catch

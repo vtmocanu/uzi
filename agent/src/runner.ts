@@ -194,11 +194,12 @@ export function composeWorkflowScopeReason(paths: string[]): string {
  * PRD #974 M2 — compose the actionable, capped `failure_reason` for a GitHub run whose branch
  * carries a secret GitHub Push Protection (GH013) would reject at push. It NAMES the offending
  * commit + path(s) (the first finding, plus an "and N more" tail like composeWorkflowScopeReason)
- * so a human knows exactly what to scrub, says the branch could not be pushed, and points out
- * that the diff is preserved for a human to scrub-and-land.
+ * so a human knows exactly what to scrub, says the branch could not be pushed, and — because the
+ * diff may carry the detected secret — states that the diff is withheld, pointing the owner at a
+ * durable-recovery archive (`uzi run export`) when one exists.
  *
  * The variable part (the finding list) is truncated to fit MAX_FAILURE_REASON_LEN against the
- * budget left after the fixed prefix + suffix — the "diff is preserved" pointer in the suffix is
+ * budget left after the fixed prefix + suffix — the withheld-diff / recovery pointer in the suffix is
  * NEVER cut. The truncation math is done BEFORE assembly (mirroring composeWorkflowScopeReason),
  * not by slicing the whole string at the end. Exported for a direct cap unit test; the caller
  * still applies `.slice(0, MAX_FAILURE_REASON_LEN)` as a belt-and-braces net.
@@ -208,8 +209,9 @@ export function composePushSecretBlockedReason(findings: SecretFinding[]): strin
     "This run's branch could not be pushed: it carries a secret GitHub Push Protection blocks " +
     "(GH013). Offending: ";
   const suffix =
-    ". The change is otherwise valid; a human can scrub the secret from the commit(s) and land " +
-    "it. Your diff is preserved below.";
+    ". The change is otherwise valid; a human can scrub the secret from the commit(s) and " +
+    "land it. The diff is withheld because it may carry the detected secret; if a " +
+    "durable-recovery archive of this run is available, export it with `uzi run export`.";
   const budget = MAX_FAILURE_REASON_LEN - prefix.length - suffix.length;
   // One human-readable label per finding: `<short-commit> <path> (<rule>)`. The file path (and
   // rule id) come from gitleaks' report of ATTACKER-authored repo content, so a committed
@@ -239,7 +241,7 @@ export function composePushSecretBlockedReason(findings: SecretFinding[]): strin
     }
     if (shown === 0) {
       // Pathological: even one label overflows the budget. Keep a hard-truncated first label so
-      // the fixed suffix (and its "diff is preserved" pointer) still fits.
+      // the fixed suffix (and its withheld-diff / recovery pointer) still fits.
       list = (labels[0] ?? "").slice(0, Math.max(0, budget - 1)) + "…";
     }
   }
@@ -2324,8 +2326,9 @@ export class RunRunner {
     // with the pinned gitleaks (default ruleset, all three silencers GitHub Push Protection
     // ignores DISABLED — see git.secretScanRange) BEFORE the doomed push, mirroring the #377
     // workflow-scope guard above. On a TRUSTWORTHY scan with a real finding, fail the run early
-    // and typed with the diff preserved — instead of face-planting into GitHub's opaque GH013
-    // rejection and discarding the committed work. An UNTRUSTWORTHY scan (broken/empty) fails
+    // and typed WITHOUT a preserved_patch (the diff may carry the detected secret; the committed
+    // work stays recoverable from the run branch/PVC) instead of face-planting into GitHub's opaque
+    // GH013 rejection and discarding the committed work. An UNTRUSTWORTHY scan (broken/empty) fails
     // OPEN: it does NOT block the run, and the GH013 remote backstop at the push below covers a
     // real secret. GitHub-only: GitLab/Forgejo have no equivalent push-side secret rejection.
     if (claim.repo.forge_type === "github") {
@@ -2344,11 +2347,11 @@ export class RunRunner {
           kind: "status",
           agent: "worker",
           payload: {
-            text: "branch carries a secret GitHub Push Protection would reject; failing early and preserving the diff",
+            text: "branch carries a secret GitHub Push Protection would reject; failing early — the diff is withheld because it may carry the secret",
           },
         });
         runLog.info(
-          "run failed: branch carries a secret GitHub Push Protection would reject (GH013); preserving diff",
+          "run failed: branch carries a secret GitHub Push Protection would reject (GH013); withholding diff (it may carry the secret)",
           {
             run_id: runId,
             findings: scan.findings.map((f) => ({
@@ -2598,11 +2601,11 @@ export class RunRunner {
             } catch (e) {
               // PRD #974 M2: an aligned push rejected by GitHub Push Protection (GH013) is a
               // secret the pre-push gitleaks scan missed — route it to the typed
-              // push_secret_blocked preserve-and-fail (diffing the pre-align agent tip) rather
-              // than the base-align-conflict path or the generic catch.
+              // push_secret_blocked fail (NO preserved diff: it may carry the detected secret)
+              // rather than the base-align-conflict path or the generic catch.
               if (isPushProtectionRejection(e)) {
                 runLog.info(
-                  "finalize base-align: aligned push rejected by GitHub Push Protection (GH013); preserving diff and failing typed",
+                  "finalize base-align: aligned push rejected by GitHub Push Protection (GH013); failing typed, no preserved diff (it may carry the secret)",
                   { run_id: runId },
                 );
                 await failPushSecretBlocked();
@@ -2689,11 +2692,12 @@ export class RunRunner {
                 overlayHandled = true;
               } catch (e) {
                 // PRD #974 M2: an overlay push rejected by GitHub Push Protection (GH013) is a
-                // secret gitleaks missed — typed preserve-and-fail, not a fall-back to
-                // merge/rebase (which cannot clear a secret) nor the generic catch.
+                // secret gitleaks missed — typed push_secret_blocked fail (NO preserved diff:
+                // it may carry the secret), not a fall-back to merge/rebase (which cannot clear
+                // a secret) nor the generic catch.
                 if (isPushProtectionRejection(e)) {
                   runLog.info(
-                    "finalize base-align: workflow-subtree overlay push rejected by GitHub Push Protection (GH013); preserving diff and failing typed",
+                    "finalize base-align: workflow-subtree overlay push rejected by GitHub Push Protection (GH013); failing typed, no preserved diff (it may carry the secret)",
                     { run_id: runId },
                   );
                   await failPushSecretBlocked();
@@ -2719,11 +2723,12 @@ export class RunRunner {
                 await fetchAndPush();
               } catch (e) {
                 // PRD #974 M2: a merge push rejected by GitHub Push Protection (GH013) is a secret
-                // gitleaks missed — typed preserve-and-fail, not the rebase fallback (which cannot
-                // clear a secret) nor the generic catch.
+                // gitleaks missed — typed push_secret_blocked fail (NO preserved diff: it may
+                // carry the secret), not the rebase fallback (which cannot clear a secret) nor
+                // the generic catch.
                 if (isPushProtectionRejection(e)) {
                   runLog.info(
-                    "finalize base-align: merge push rejected by GitHub Push Protection (GH013); preserving diff and failing typed",
+                    "finalize base-align: merge push rejected by GitHub Push Protection (GH013); failing typed, no preserved diff (it may carry the secret)",
                     { run_id: runId },
                   );
                   await failPushSecretBlocked();
@@ -2808,8 +2813,9 @@ export class RunRunner {
         await pushToOrigin();
       } catch (e) {
         // PRD #974 M2 backstop: a GitHub Push Protection (GH013) rejection here means a secret
-        // the pre-push gitleaks scan missed — route it to the typed preserve-and-fail rather than
-        // the generic catch. Any OTHER push error rethrows (unchanged behavior).
+        // the pre-push gitleaks scan missed — route it to the typed push_secret_blocked fail
+        // (NO preserved diff: it may carry the secret) rather than the generic catch. Any OTHER
+        // push error rethrows (unchanged behavior).
         if (isPushProtectionRejection(e)) {
           await failPushSecretBlocked();
           return;
