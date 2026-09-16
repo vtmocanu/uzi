@@ -3,8 +3,10 @@ package workersvc
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -67,10 +69,12 @@ func TestCoerceFailOrigin(t *testing.T) {
 // parses the migration rather than restating the list, because a second hand-typed copy
 // is exactly the drift it prevents.
 func TestFailOriginVocabularyMatchesCheck(t *testing.T) {
-	// The CURRENT fail_origin CHECK is declared by the LATEST migration that widened it, not
-	// 00186 (which added push_secret_blocked): PRD #1392 M1's 00232 re-declares it with the
-	// thirteenth value forge_unreachable, so this parses THAT migration's Up-section CHECK.
-	const path = "../store/migrations/00232_forge_unreachable_park.sql"
+	// The CURRENT fail_origin CHECK is declared by the LATEST migration that widened it, so
+	// this DISCOVERS that migration at runtime instead of pinning a number that goes stale at
+	// every landing-time renumber: the highest-numbered migration under ../store/migrations
+	// whose Up section declares a fail_origin CHECK. A future re-widening migration is picked
+	// up with no test edit; parse THAT migration's Up-section CHECK below.
+	path := latestFailOriginCheckMigration(t, "../store/migrations")
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read %s: %v", path, err)
@@ -121,6 +125,79 @@ func TestFailOriginVocabularyMatchesCheck(t *testing.T) {
 			"failed run's write; add or remove a member on either side and the other must "+
 			"move in the same commit.", fromGo, fromSQL)
 	}
+}
+
+// latestFailOriginCheckMigration discovers the migration that declares the CURRENT
+// fail_origin CHECK: the highest-numbered migration under dir whose Up section contains a
+// fail_origin CHECK. Discovering it (rather than naming a file by number) keeps the guard
+// number-agnostic across the goose renumbers that happen at landing time.
+func latestFailOriginCheckMigration(t *testing.T, dir string) string {
+	t.Helper()
+	files, err := filepath.Glob(filepath.Join(dir, "*.sql"))
+	if err != nil {
+		t.Fatalf("glob %s: %v", dir, err)
+	}
+	best, bestNum := "", -1
+	for _, file := range files {
+		num, ok := migrationNumber(filepath.Base(file))
+		if !ok {
+			continue
+		}
+		raw, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatalf("read %s: %v", file, err)
+		}
+		if num > bestNum && upSectionDeclaresFailOriginCheck(string(raw)) {
+			best, bestNum = file, num
+		}
+	}
+	if best == "" {
+		t.Fatalf("no migration under %s declares a fail_origin IN (...) CHECK in its Up "+
+			"section; the scan is reading the wrong directory or the CHECK vanished. A broken "+
+			"scan that finds nothing must fail here, not pass vacuously", dir)
+	}
+	return best
+}
+
+// migrationNumber parses the leading run of digits of a goose migration basename (its
+// version). A basename that does not start with a digit is not a migration.
+func migrationNumber(base string) (int, bool) {
+	end := 0
+	for end < len(base) && base[end] >= '0' && base[end] <= '9' {
+		end++
+	}
+	if end == 0 {
+		return 0, false
+	}
+	n, err := strconv.Atoi(base[:end])
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+// upSectionDeclaresFailOriginCheck reports whether the migration's Up section (the text
+// between the "-- +goose Up" and "-- +goose Down" markers) declares a fail_origin CHECK.
+// Comment lines are stripped first so prose that merely names the phrase does not count, and
+// the Down section is excluded so a migration's narrower re-declared CHECK never matches.
+func upSectionDeclaresFailOriginCheck(raw string) bool {
+	up := strings.Index(raw, "-- +goose Up")
+	if up < 0 {
+		return false
+	}
+	section := raw[up:]
+	if down := strings.Index(section, "-- +goose Down"); down >= 0 {
+		section = section[:down]
+	}
+	var stripped strings.Builder
+	for _, line := range strings.Split(section, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "--") {
+			continue
+		}
+		stripped.WriteString(line)
+		stripped.WriteString("\n")
+	}
+	return strings.Contains(stripped.String(), "fail_origin IN (")
 }
 
 // TestAllFailOriginsIsNotAliasable pins the fresh-slice contract, mirroring
