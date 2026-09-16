@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -72,6 +73,7 @@ func (r *fakeSecretRows) FieldDescriptions() []pgconn.FieldDescription { return 
 func (r *fakeSecretRows) Values() ([]any, error)                       { return nil, nil }
 func (r *fakeSecretRows) RawValues() [][]byte                          { return nil }
 func (r *fakeSecretRows) Conn() *pgx.Conn                              { return nil }
+func (r *fakeSecretRows) TypeMap() *pgtype.Map                         { return pgtype.NewMap() }
 
 func secretRow(id uuid.UUID, label string, isDefault bool) store.ListUserSecretsForKindRow {
 	return store.ListUserSecretsForKindRow{ID: id, Kind: "anthropic_token", Label: label, IsDefault: isDefault}

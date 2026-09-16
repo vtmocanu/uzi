@@ -510,6 +510,7 @@ func (*emptyViewerRows) FieldDescriptions() []pgconn.FieldDescription {
 func (*emptyViewerRows) Values() ([]any, error) { return nil, nil }
 func (*emptyViewerRows) RawValues() [][]byte    { return nil }
 func (*emptyViewerRows) Conn() *pgx.Conn        { return nil }
+func (*emptyViewerRows) TypeMap() *pgtype.Map   { return pgtype.NewMap() }
 
 // fakeViewerListDB is a store.DBTX for the list-endpoint *ForViewer queries. Like
 // fakeSkillDB it CAPTURES the raw positional args of the Query call — a fake that
