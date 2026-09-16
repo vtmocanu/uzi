@@ -504,6 +504,27 @@ export class WorkerClient {
    */
   async reportState(runId: string, body: StateRequest, signal?: AbortSignal): Promise<StateAck> {
     const path = `${WORKER_API_PREFIX}/runs/${runId}/state`;
+    // PRD #1247 fix round (E): /state carries claim_generation on EVERY mutating report (M5b's
+    // reportState closure stamps it), but /state DisallowUnknownFields-decodes, so a rolled-back api
+    // that predates the field 400s the report and — force-roll off — a busy newer worker wedges every
+    // run. Route the report through the SAME send-gate + skew-safe fallback as postMessages and the
+    // completion RPCs: stamp the field ONLY for a generation>0 capability/feature worker, and on the
+    // EXACT strict-decode 400 strip it and retry the identical report ONCE (capability non-sticky so
+    // it self-recovers on roll-forward; non-capability sticky, as today). This also makes a <=v0.82
+    // claim (generation ?? 0) OMIT the key rather than send 0. The transient-retry loop, AbortSignal,
+    // 200/409 single-body ACK parse, already-terminal handling and logging are preserved per variant
+    // in reportStateOnce, so the fallback only toggles whether claim_generation is on the wire.
+    const included = this.includeClaimGeneration(body.claim_generation);
+    return this.withGenerationFallback(included, (includeField) =>
+      this.reportStateOnce(runId, path, includeField ? body : { ...body, claim_generation: undefined }, signal),
+    );
+  }
+
+  /** One /state POST WITH the given body, including the transient-retry loop, AbortSignal
+   *  handling, 200/409 single-body ACK parse, already-terminal handling and logging. Split out of
+   *  reportState (PRD #1247 fix round E) so the claim_generation send-gate + strict-decode
+   *  strip-and-retry can drive it through withGenerationFallback, exactly as postMessages. */
+  private async reportStateOnce(runId: string, path: string, body: StateRequest, signal?: AbortSignal): Promise<StateAck> {
     for (let attempt = 0; ; attempt++) {
       signal?.throwIfAborted();
       try {

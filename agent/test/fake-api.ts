@@ -41,6 +41,9 @@ export class FakeApi {
   private readonly inputsByRun = new Map<string, UserInput[]>();
   private stateFailRemaining = 0;
   private stateFailStatus = 503;
+  // PRD #1247 fix round E: model an rc.5-shaped api that strict-decodes the unknown
+  // claim_generation field on /state with the EXACT "invalid request body" 400.
+  private strictDecodeStateRemaining = 0;
   private msgFailRemaining = 0;
   private msgFailStatus = 503;
   private readonly alreadyTerminal = new Set<string>();
@@ -207,6 +210,15 @@ export class FakeApi {
   failStateNext(times: number, status = 503): void {
     this.stateFailRemaining = times;
     this.stateFailStatus = status;
+  }
+
+  /** PRD #1247 fix round E: make the next `times` /state calls answer the EXACT strict-decode 400
+   *  ("invalid request body") a rolled-back api produces for the unknown claim_generation field,
+   *  then succeed — so a runner test can prove reportState's strip-and-retry survives an rc.5-shaped
+   *  decoder. Distinct from failStateNext (whose {error:"injected failure"} body is NOT strict-decode
+   *  shaped, so isStrictDecodeError is false and the client would not strip). */
+  failStateStrictDecodeNext(times: number): void {
+    this.strictDecodeStateRemaining = times;
   }
 
   /** Make the next `times` /messages calls fail with `status` before succeeding. */
@@ -620,6 +632,11 @@ export class FakeApi {
     json: Record<string, unknown>,
   ): void {
     this.stateAttempts++;
+    if (this.strictDecodeStateRemaining > 0) {
+      this.strictDecodeStateRemaining--;
+      // The exact 400 shape httpx.DecodeJSON (DisallowUnknownFields) produces for an unknown field.
+      return send(res, 400, { error: "invalid request body" });
+    }
     if (this.stateFailRemaining > 0) {
       this.stateFailRemaining--;
       return send(res, this.stateFailStatus, { error: "injected failure" });

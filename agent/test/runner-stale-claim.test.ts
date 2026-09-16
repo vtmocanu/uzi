@@ -1,16 +1,18 @@
-// PRD #1247 M5b — the transport-behavior half of the held-state credential switch (worker side).
+// PRD #1247 M5b — the transport-behavior half of the held-state credential switch (worker side),
+// as send-gated by the fix round (E).
 //
-// This unit makes the worker (1) STAMP its claim-lane generation on every mutating /state report,
-// and (2) STOP a flight the moment a report is answered with the
-// stale_claim disposition (a held-state switch RELEASED the claim, or a reclaim SUPERSEDED it) —
-// without a terminal report and without a preserve flag. It advertises NO capability and does NOT
-// implement the release itself, so it is transparent in normal operation: stamping a generation
-// the server's fence already matches changes no outcome (the back-compat test below).
+// This unit makes the worker (1) STAMP its claim-lane generation on every mutating /state report
+// THROUGH the claim_generation send-gate (fix round E): the field rides the wire only for a
+// generation>0 capability/feature worker, and on the exact strict-decode 400 from a rolled-back api
+// it is stripped and the report retried ONCE so the run never wedges; and (2) STOP a flight the
+// moment a report is answered with the stale_claim disposition (a held-state switch RELEASED the
+// claim, or a reclaim SUPERSEDED it) — without a terminal report and without a preserve flag.
 //
 // The generation stamping is driven end-to-end through the runner (buildFlight wires the batcher
-// from claim.claim_generation and the reportState closure stamps it), so these are RUNNER tests.
-// Message-batch generation stamping is the shared #1391 wire, feature-gated on
-// `claim_generation_fence`; its omit-vs-stamp byte shape is pinned in client-negotiation.test.ts.
+// from claim.claim_generation and the reportState closure stamps it, and client.reportState applies
+// the send-gate), so these are RUNNER tests. The gate's omit-vs-stamp + strip-and-retry byte shape
+// is pinned at the client level in client-state-send-gate.test.ts (state) and
+// client-send-gate.test.ts (messages).
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
@@ -22,6 +24,7 @@ import { type ExecutorFactory } from "../src/runner.js";
 import { nullLogger, recordingLogger } from "./helpers.js";
 import {
   api,
+  client,
   fakeGitlab,
   gitlabClaim,
   homeDir,
@@ -35,12 +38,17 @@ import {
 
 installHarness();
 
-describe("RunRunner — PRD #1247 M5b claim_generation stamping", () => {
-  it("stamps the claim's generation on every /state report, and completes normally", async () => {
+describe("RunRunner — PRD #1247 M5b claim_generation stamping (send-gated, fix round E)", () => {
+  it("a CAPABILITY worker stamps the claim's generation on every /state report, and completes normally", async () => {
     const { gitlab } = fakeGitlab();
     // The fake SDK query commits nothing; model committed work so the zero-diff guard does not
     // fail this happy path (issue #279).
     simulateCommittedWork();
+    // PRD #1247 fix round E: /state now rides the claim_generation send-gate, so the field is
+    // stamped only for a generation>0 capability/feature worker (a production worker always
+    // advertises credential_switch_v1). Register the harness client as a capability worker so the
+    // reportState closure's stamp actually reaches the wire.
+    await client.register("w-1247", undefined, 1, undefined, ["credential_switch_v1"]);
     const GEN = 7;
     const claim = gitlabClaim(1247, { claim_generation: GEN });
     api.setInputs(claim.run_id, [input("approve_plan")]);
@@ -56,7 +64,7 @@ describe("RunRunner — PRD #1247 M5b claim_generation stamping", () => {
       assert.strictEqual(
         s.claim_generation,
         GEN,
-        `every /state report carries claim_generation (${s.status})`,
+        `every /state report carries claim_generation for a capability worker (${s.status})`,
       );
     }
     // The specific reports the spec calls out: a `running` report and the terminal report.
@@ -68,16 +76,13 @@ describe("RunRunner — PRD #1247 M5b claim_generation stamping", () => {
       states.some((s) => s.status === "completed"),
       "the flight completed normally (a matching generation is a no-op)",
     );
-    // Message-batch generation stamping is the shared #1391 wire (feature-gated on
-    // `claim_generation_fence`), pinned by byte shape in client-negotiation.test.ts; the batcher is
-    // wired from claim.claim_generation at construction. This runner test owns the #1247-specific
-    // half: the /state reportState closure stamps every report unconditionally.
   });
 
-  it("stamps a generation of 0 when the claim omits it (server-side NOT NULL DEFAULT 0)", async () => {
+  it("OMITS claim_generation on /state for a gen-0 claim, even for a capability worker (E: 0 is chat's legacy sentinel)", async () => {
     const { gitlab } = fakeGitlab();
     simulateCommittedWork();
-    const claim = gitlabClaim(1248); // no claim_generation on the claim
+    await client.register("w-1248", undefined, 1, undefined, ["credential_switch_v1"]);
+    const claim = gitlabClaim(1248); // no claim_generation on the claim ⇒ 0
     api.setInputs(claim.run_id, [input("approve_plan")]);
     await runner(
       new SdkExecutor(nullLogger(), homeDir, { queryFn: planThenDoneQuery() }),
@@ -89,7 +94,55 @@ describe("RunRunner — PRD #1247 M5b claim_generation stamping", () => {
       .map((s) => s.body)
       .find((s) => s.status === "running");
     assert.ok(running, "a running report was made");
-    assert.strictEqual(running!.claim_generation, 0, "the missing generation defaults to 0");
+    // E's send-gate never sends 0 (unlike the old M5b unconditional stamp, which sent 0). This is
+    // the same fix that makes a <=v0.82 claim (generation ?? 0) omit the key instead of sending 0.
+    assert.strictEqual(running!.claim_generation, undefined, "0 is never sent; the key is omitted");
+  });
+
+  it("OMITS claim_generation on /state for a NON-capability worker without the feature (E send-gate)", async () => {
+    const { gitlab } = fakeGitlab();
+    simulateCommittedWork();
+    await client.register("w-bare"); // no capability advertised, FakeApi advertises no feature
+    const claim = gitlabClaim(1249, { claim_generation: 5 });
+    api.setInputs(claim.run_id, [input("approve_plan")]);
+    await runner(
+      new SdkExecutor(nullLogger(), homeDir, { queryFn: planThenDoneQuery() }),
+      gitlab,
+    ).execute(claim);
+
+    const states = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body);
+    assert.ok(states.length > 0, "the run made at least one /state report");
+    for (const s of states) {
+      assert.strictEqual(
+        s.claim_generation,
+        undefined,
+        `a bare worker omits claim_generation on /state (${s.status})`,
+      );
+    }
+  });
+
+  it("survives an rc.5-shaped strict decoder: the first running report strips+retries and the run still completes", async () => {
+    // PRD #1247 fix round E, the runner integration: a capability worker's /state stamp meets a
+    // rolled-back api that strict-decodes the unknown field with a 400. reportState strips the field
+    // and retries ONCE, so the first `running` report and the terminal report both land — the run is
+    // NOT wedged. Reverting E (unconditional stamp, no fallback) throws the 400 out of the first
+    // report and the run fails instead.
+    const { gitlab } = fakeGitlab();
+    simulateCommittedWork();
+    await client.register("w-skew", undefined, 1, undefined, ["credential_switch_v1"]);
+    api.failStateStrictDecodeNext(1); // ONLY the first /state POST strict-decodes
+    const claim = gitlabClaim(1250, { claim_generation: 3 });
+    api.setInputs(claim.run_id, [input("approve_plan")]);
+    await runner(
+      new SdkExecutor(nullLogger(), homeDir, { queryFn: planThenDoneQuery() }),
+      gitlab,
+    ).execute(claim);
+
+    const states = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body);
+    // The first running report survived (via the stripped retry), and the run reached a terminal
+    // report — proof the strict decoder did not wedge it.
+    assert.ok(states.some((s) => s.status === "running"), "the running report landed after strip+retry");
+    assert.ok(states.some((s) => s.status === "completed"), "the run reached its terminal report");
   });
 });
 
