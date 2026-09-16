@@ -91,6 +91,35 @@ describe("GitCache.ancestry (PRD #1416 M2)", () => {
     );
   });
 
+  it("returns 'unknown' when git never produced a real exit status (spawn/signal), never 'divergent'", async () => {
+    // issue #1416 — the non-DATA failure class. A spawn failure carries a STRING code ("ENOENT")
+    // and a timeout/SIGTERM/signal kill carries a NULL code — neither is a genuine numeric exit
+    // status, so merge-base never actually reported not-an-ancestor. tryGit coerces both to 1;
+    // ancestry must go through tryGitExit and answer "unknown", NOT "divergent" (M3's bridge keys
+    // off this same result, so a false "divergent" here would synthesize a spurious bridge merge).
+    const bare = await git.ensureClone(fx.originPath);
+    const mainTip = gitIn(bare, ["rev-parse", "refs/remotes/origin/main"]);
+    const other = "0123456789abcdef0123456789abcdef01234567"; // valid OID shape
+
+    // Inject at the exec seam: force the underlying git subprocess to reject WITHOUT a numeric
+    // exit code. (Set AFTER ensureClone/gitIn, which used the real exec.)
+    const rejectWithCode = (code: unknown) => (): Promise<never> => {
+      const err = new Error("git did not run") as Error & { code?: unknown };
+      err.code = code;
+      return Promise.reject(err);
+    };
+    const inject = git as unknown as { execScoped: () => Promise<never> };
+
+    inject.execScoped = rejectWithCode("ENOENT"); // spawn failure — string code
+    assert.equal(await git.ancestry(bare, mainTip, other), "unknown");
+
+    inject.execScoped = rejectWithCode(null); // timeout / SIGTERM / signal kill — null code
+    assert.equal(await git.ancestry(bare, mainTip, other), "unknown");
+
+    inject.execScoped = rejectWithCode(undefined); // code-less error — no .code at all
+    assert.equal(await git.ancestry(bare, mainTip, other), "unknown");
+  });
+
   it("returns 'unknown' for a malformed floor/tip without running git", async () => {
     const bare = await git.ensureClone(fx.originPath);
     const mainTip = gitIn(bare, ["rev-parse", "refs/remotes/origin/main"]);

@@ -3027,13 +3027,20 @@ export class GitCache {
    *  - "divergent" — exit 1: both OIDs resolve but `floor` is NOT an ancestor of `tip` (the
    *                  history at/below the floor was rewritten, or the histories are disjoint), so
    *                  the branch can no longer be landed with a plain fast-forward push.
-   *  - "unknown"   — ANY git error, a missing/unresolvable ref, or a malformed floor/tip. NEVER
-   *                  coerced to "divergent"; the caller treats unknown as "not divergent".
+   *  - "unknown"   — ANY git error, a missing/unresolvable ref, a malformed floor/tip, OR a
+   *                  non-completion of the git process (a spawn failure such as ENOENT, a
+   *                  timeout/SIGTERM kill, or any signal death). NEVER coerced to "divergent";
+   *                  the caller treats unknown as "not divergent".
    *
    * git's contract makes the discrimination reliable (verified): 0 = ancestor, 1 = both commits
-   * present but not-an-ancestor, 128 = a missing/invalid commit or a broken repo. Both inputs
-   * must be full 40-hex OIDs (P and C come from originBranchTip/trackingTip; the tip is a fetched
-   * tracking tip); a value that is not answers "unknown" without running git.
+   * present but not-an-ancestor, 128 = a missing/invalid commit or a broken repo. Only a GENUINE
+   * numeric exit 1 (the process ran to completion and merge-base reported not-an-ancestor) maps to
+   * "divergent". A process that never produced a real exit status carries a non-numeric code (a
+   * string like "ENOENT" on a spawn failure, or `null` on a signal/timeout kill), which
+   * {@link tryGitExit} surfaces as `null` → "unknown" — so a broken read is never mistaken for a
+   * data answer. Both inputs must be full 40-hex OIDs (P and C come from originBranchTip/
+   * trackingTip; the tip is a fetched tracking tip); a value that is not answers "unknown"
+   * without running git.
    */
   async ancestry(
     barePath: string,
@@ -3042,10 +3049,13 @@ export class GitCache {
   ): Promise<"ancestor" | "divergent" | "unknown"> {
     const OID = /^[0-9a-f]{40}$/;
     if (!OID.test(floor) || !OID.test(tip)) return "unknown";
-    const code = await this.tryGit(barePath, ["merge-base", "--is-ancestor", floor, tip]);
+    // tryGitExit (NOT tryGit) so a non-completion — a spawn failure, timeout, or signal kill —
+    // surfaces as null rather than tryGit's coerce-to-1, which would misreport it as "divergent".
+    const code = await this.tryGitExit(barePath, ["merge-base", "--is-ancestor", floor, tip]);
     if (code === 0) return "ancestor";
     if (code === 1) return "divergent";
-    // 128 / any other exit = a git error or a missing/unresolvable ref → unknown, never divergent.
+    // 128 / any other exit = a git error or a missing/unresolvable ref, and null = a spawn error,
+    // timeout, or signal death → unknown, never divergent.
     return "unknown";
   }
 
@@ -3311,6 +3321,22 @@ export class GitCache {
     } catch (err) {
       const code = (err as { code?: unknown }).code;
       return typeof code === "number" ? code : 1;
+    }
+  }
+
+  /** issue #1416 — like {@link tryGit} but discriminates a GENUINE numeric git exit status from a
+   *  non-completion: returns the numeric exit code (0 on success) when the process ran to
+   *  completion, or `null` when it never produced a real exit status — a spawn failure (code is a
+   *  string, e.g. "ENOENT"), a timeout/SIGTERM kill, or any signal death (code is `null`). tryGit
+   *  keeps its historical coerce-to-1 for callers that only care whether the op succeeded; this
+   *  sibling exists for callers (ancestry) that MUST NOT treat a broken read as a data answer. */
+  private async tryGitExit(cwd: string | undefined, args: string[], pat?: string): Promise<number | null> {
+    try {
+      await this.execScoped("git", withDir(cwd, args), { env: gitEnv(pat), timeout: GIT_TIMEOUT_MS });
+      return 0;
+    } catch (err) {
+      const code = (err as { code?: unknown }).code;
+      return typeof code === "number" ? code : null;
     }
   }
 
