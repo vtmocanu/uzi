@@ -330,9 +330,13 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 //
 // `claim_generation_fence` is a SERVER-SUPPORT advertisement, not an issue-ownership token:
 // this api now implements the per-query claim-generation fence — a `credential_switch_v1`
-// worker fails closed (ErrMissingClaimGeneration) if a mutating batch omits the generation —
-// so it advertises support here and its capability workers stamp the field only because the
-// server said it accepts it. #1390 lands after #1247 and its own slice must preserve/dedupe
+// worker fails closed (ErrMissingClaimGeneration) if a mutating batch omits the generation.
+// The advertisement is what lets a NON-capability (#1391-era) worker know it may stamp the
+// field; a `credential_switch_v1` CAPABILITY worker stamps OPTIMISTICALLY regardless of this
+// advertisement (its runs are fenced server-side, and a one-shot register may have missed the
+// feature under rollout skew), and rides the strict-decode strip-and-retry fallback (PRD #1247
+// fix round) on the message, /state and completion wires if it meets an api that predates the
+// field. #1390 lands after #1247 and its own slice must preserve/dedupe
 // this token, not activate it for the first time. Do NOT advertise `terminal_fence` yet: it
 // belongs to Run B, lands after this, and is added to its own slice then — advertising it now
 // would tell the worker to send a fence this api still rejects. Returns a fresh slice so a

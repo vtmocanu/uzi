@@ -161,9 +161,18 @@ func credentialEpochsToDTO(rows []store.RunCredentialEpoch) []apitypes.Credentia
 // credentialSwitchState derives RunDTO.credential_switch from the run row (PRD #1247
 // M1, D14): null when no held-state switch is pending, "released" once the release
 // transition has stamped claim_released_at at-or-after the request, else "requested".
-// The stamp is cleared on apply (the next epoch write), so a present stamp always means
-// a switch is still in flight. Nothing writes these columns in M1, so this returns null
-// for every run today; M4/M5 make it live.
+//
+// M4/M5 make this LIVE: SetRunCredential stamps the columns on a held-state switch, and
+// (PRD #1247 D11 fix round) every terminal transition CLEARS them, so a completed/failed/
+// cancelled run never carries a stale switch state.
+//
+// NOT YET IMPLEMENTED (deferred, issue #1422): clearing the stamp on successful APPLICATION
+// at the next epoch write (D14). Until then, after a release+reclaim (the run's
+// claim_generation has advanced PAST credential_switch_generation) this reads the stale
+// pre-reclaim state ("requested"/"released") rather than null. It is NOT a worker-signal leak
+// — PendingCredentialSwitchSignal's generation guard already returns nil there — only this
+// DTO field, and no UI renders it yet (PRD m7/m8), so it is a JSON-contract wart, not a
+// user-visible one.
 func credentialSwitchState(r store.Run) *string {
 	if !r.CredentialSwitchRequestedAt.Valid {
 		return nil

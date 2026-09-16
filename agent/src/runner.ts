@@ -446,8 +446,11 @@ interface RunFlight {
   readonly cancel: AbortController;
   readonly steering: SteeringChannel;
   /** PRD #1247 M5b: the claim-lane generation THIS claim holds (from claim.claim_generation).
-   *  Stamped on every mutating report (the reportState closure) and every message batch (the
-   *  batcher), so the server's per-query fence can engage. Server-side NOT NULL DEFAULT 0. */
+   *  Threaded onto every mutating report (the reportState closure) and every message batch (the
+   *  batcher), so the server's per-query fence can engage. The client's send-gate (fix round E)
+   *  decides whether it actually rides the wire — a generation>0 capability/feature worker sends it,
+   *  0 (chat's legacy sentinel) is never sent, and a rolled-back api's strict-decode 400 strips it
+   *  and retries ONCE. Server-side NOT NULL DEFAULT 0. */
   readonly claimGeneration: number;
   readonly reportState: (
     body: Parameters<WorkerClient["reportState"]>[1],
@@ -1498,8 +1501,8 @@ export class RunRunner {
    *   - `recovery_release_exact_echo` (but NOT recovery_park_cause) → the older-api fallback: an
    *      older api's park touches no custody (fact 13), so first prove an EXACT-generation release
    *      (released && generation===gen && holds_released===1), then send the UNTYPED report, which
-   *      still carries claim_generation — the reportState closure (M5b) stamps it UNCONDITIONALLY,
-   *      NOT gated on `claim_generation_fence`. Missing proof (or a
+   *      still carries claim_generation — the reportState closure (M5b) threads it, and for a capability worker the E send-gate stamps it
+   *      regardless of the negotiated `claim_generation_fence` feature (strict-decode strip-and-retry if this older api also predates the /state field). Missing proof (or a
    *      release throw) → today's failed path, never a leaked hold.
    *   - neither token → negotiate nothing, take today's failed path.
    *
