@@ -305,11 +305,16 @@ is the authoring-side rule in `.claude/rules/prds.md` (*A PRD whose tests need
 secret-SHAPED strings*); it is not repeated here.
 
 **Issue #974 has landed**, so the diagnosis now keys on a stable typed field instead of
-matching GitHub's free-text message. At finalize the worker scans the push range
-(`base..HEAD`) with the pinned gitleaks, its three silencers (`.gitleaks.toml`,
-`.gitleaksignore`, inline `//gitleaks:allow`) forced OFF — GitHub Push Protection honours
-none of them, so a scan that did would clear a range GitHub still rejects. A finding fails
-the run early, typed `fail_origin = "push_secret_blocked"`, with the diff preserved; a GH013
+matching GitHub's free-text message. At finalize the worker scans the range the push will
+actually add: `base..HEAD` from the default branch on a first push of a new branch, or
+`origin/<branch>..HEAD` from the current remote branch tip on a push to an existing remote
+branch (a resumed/continued run), which excludes already-pushed commits. The pinned
+gitleaks runs with its three silencers (`.gitleaks.toml`, `.gitleaksignore`, inline
+`//gitleaks:allow`) forced OFF. GitHub Push Protection honours none of them, so a scan
+that did would clear a range GitHub still rejects. A finding fails the run early, typed
+`fail_origin = "push_secret_blocked"`, with no preserved diff (it may carry the detected
+secret; recover the committed work from the run branch/PVC, or `uzi run export` when a
+durable-recovery archive exists); a GH013
 remote rejection that slips past the pre-push scan is parsed to the SAME typed origin. So
 `uzi run get RUN --json | jq -r .fail_origin` returns `push_secret_blocked` for this whole
 class — no more matching free-text `failure_reason`. **The pre-push scan does not catch

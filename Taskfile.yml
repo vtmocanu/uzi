@@ -324,6 +324,12 @@ tasks:
       # looks committed but never loads. Sub-second, offline, tree-fact -- runs before
       # `scan:secrets` too. Belongs in gate:repo, not a component gate.
       - task: check:skill-size
+      # Provider-token source-hygiene guard (PRD #1120 M3): an ADDITIONAL, independent
+      # check (never a replacement for scan:secrets) that flags a NEWLY-ADDED complete
+      # provider-token literal in tracked source EVEN when an inline //gitleaks:allow is
+      # present -- GitHub Push Protection honours no such directive and refuses the push.
+      # Sub-second, offline, index-only tree fact, so it runs before `scan:secrets` too.
+      - task: check:token-literals
       # Offline fixture test of scripts/migration-renumber.sh (issue 1400). The ONE
       # non-sub-second gate:repo member: it builds temp git repos with a local bare
       # origin, so it does not fit gate:repo's offline sub-second band. It is kept here
@@ -958,6 +964,24 @@ tasks:
       # register as over a tiny threshold, or it exits 2 (instrument broken); the explicit
       # canary arg makes this echo show what is scanned. See the script header.
       - ./scripts/check-skill-size.sh scripts/skill-size-canary.txt .agents/skills
+
+  check:token-literals:
+    desc: no NEW complete provider-token-shaped literal in tracked source (even with an inline //gitleaks:allow), with canaries proving the detector fired
+    cmds:
+      # An ADDITIONAL, independent source-hygiene gate (PRD #1120 M3) -- it does NOT
+      # invoke, weaken, or replace `scan:secrets`/gitleaks. A run can be gate-green through
+      # every milestone yet unpushable at finalize: GitHub Push Protection scans every
+      # commit for provider tokens and refuses the whole push (GH013), honouring NONE of
+      # gitleaks' silencers (.gitleaks.toml, .gitleaksignore, inline //gitleaks:allow). This
+      # flags any complete provider-token literal (GitLab glpat- with NO entropy floor,
+      # GitHub ghp_/github_pat_, Anthropic sk-ant-, Slack xoxb-) wherever it lands, IGNORING
+      # every in-file allow directive, so the failure reddens CI offline instead of at the
+      # doomed push. The fix is runtime assembly ("glpat-" + "<20 chars>"), which passes both
+      # this check and Push Protection (see .claude/rules/prds.md). The two gitleaks canaries
+      # are passed as an explicit, NARROW allowlist so this echo shows exactly what is exempt;
+      # they double as the detector's positive controls (a canary that lost its token shape,
+      # or was deleted/untracked, exits 2 instrument-broken). See the script header.
+      - ./scripts/check-token-literals.sh scripts/gitleaks-canary.txt api/internal/config/gitleaks_canary_test.go
 
   render:worker-tag-check:
     desc: assert the hosted-worker image tag is pinned independently of Chart.AppVersion (PRD 422 M1)
@@ -2484,8 +2508,8 @@ tasks:
   # one. NOT a gate target and NOT under gate: it WRITES the tree (git mv's the branch's
   # new migrations to consecutive numbers above the live main head, rewrites their own
   # cross-reference comments, and REPORTS every other reference for a human to fix by
-  # hand). The gate is its test target, added in a later milestone (the docs:sync
-  # writer/drift-test relationship). Fail-closed before any mutation; leaves the tree
+  # hand). The gate is test:migration-renumber above (the docs:sync writer/drift-test
+  # relationship). Fail-closed before any mutation; leaves the tree
   # dirty on success for the maintainer to review and commit.
   migration:renumber:
     desc: renumber the branch's new migrations above the live main head; rewrite their comments; report other refs

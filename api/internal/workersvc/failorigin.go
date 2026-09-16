@@ -53,8 +53,9 @@ var failOrigins = []string{
 	"finalize_base_align_conflict",
 	// issue #974: a GitHub run whose push carries a secret is rejected by GitHub Push
 	// Protection / GH013. The worker PREDICTS it with a pre-push gitleaks scan and also
-	// PARSES the remote reject, failing typed with the diff preserved instead of a raw
-	// `remote rejected` (worker-reportable — see workerReportableFailOrigins).
+	// PARSES the remote reject, failing typed WITHOUT a preserved diff (it may carry the
+	// detected secret; the committed work stays recoverable from the run branch/PVC) instead
+	// of a raw `remote rejected` (worker-reportable — see workerReportableFailOrigins).
 	"push_secret_blocked",
 	// PRD #1392 M1: a run whose forge stayed unreachable at CLONE past
 	// RUN_FORGE_UNREACHABLE_MAX_PARKS parks. SERVER-DERIVED, NOT worker-reportable (it is
@@ -100,8 +101,8 @@ func AllFailOrigins() []string {
 // (PRD #456: the finalize base-align merge AND rebase both conflict, so the worker
 // aborts and preserves the diff), and push_secret_blocked (issue #974: the finalize
 // pre-push gitleaks range scan finds a secret, or the push is rejected by GitHub Push
-// Protection / GH013, so the worker fails typed and preserves the diff); agent_failure
-// is included because it is the judgeable
+// Protection / GH013, so the worker fails typed WITHOUT a preserved diff — it may carry
+// the detected secret); agent_failure is included because it is the judgeable
 // default the `failed` arm applies anyway, so an explicit worker agent_failure is
 // harmless and semantically correct. The partition (worker-reportable + server-only ==
 // vocabulary) is pinned by TestCoerceFailOrigin.

@@ -690,6 +690,24 @@ func TestMRReworkBotWalkthroughSummaryNoFire(t *testing.T) {
 	}
 }
 
+func TestMRReworkHumanCodeRabbitControlCommentNoFire(t *testing.T) {
+	// Issue #1407: a maintainer's standalone CodeRabbit command controls that bot; it is
+	// not review feedback for uzi and must neither start a run nor consume a ledger attempt.
+	for _, body := range []string{"@coderabbitai rate limit", "@coderabbitai review"} {
+		t.Run(body, func(t *testing.T) {
+			st := &mrwStore{candidates: []store.ListMRReworkCandidatesRow{mrwCand("success")}}
+			runs := &mrwRuns{}
+			f := landedForge(mrwSummaryComment(420, landed(), "maintainer", body))
+
+			newMRW(st, runs, nil, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f)
+
+			if len(runs.calls) != 0 || len(st.upserts) != 0 {
+				t.Fatalf("a CodeRabbit control command must not fire or advance the ledger: runs=%d upserts=%d", len(runs.calls), len(st.upserts))
+			}
+		})
+	}
+}
+
 func TestMRReworkInlineBotFindingFires(t *testing.T) {
 	// A third-party review bot's INLINE finding is exactly what mr_rework exists for —
 	// the "[bot]" login must NOT suppress it (only top-level/summary bot notes filter).
