@@ -12,7 +12,7 @@ import type { AgentTemplate, ClaimSkill, Milestone, MilestoneAgent, MilestonePro
 import type { JsDepsResult } from "../src/js-deps.js";
 import { skillsPluginDir } from "../src/skills-plugin.js";
 import { FINDINGS_SERVER_NAME, reportIncidentalIssueToolName } from "../src/findings-tools.js";
-import { FINDINGS_NUDGE_APPEND, WORKER_RUNTIME_APPEND } from "../src/prompt.js";
+import { FINDINGS_NUDGE_APPEND, SECRET_FIXTURE_HYGIENE_APPEND, WORKER_RUNTIME_APPEND } from "../src/prompt.js";
 import type { WorkerClient } from "../src/client.js";
 import type {
   SummaryRunner,
@@ -53,7 +53,8 @@ const FAKE_JOIN_TOKEN = "dummy-join-token-do-not-scan-2222";
 // PRD #457: toDefinition grants the findings tool to a non-empty allowlist and appends
 // the discovery nudge to every subagent prompt. Reference the helper, not a literal.
 const FINDINGS_TOOL = reportIncidentalIssueToolName();
-const withNudge = (body: string) => `${body}\n\n${FINDINGS_NUDGE_APPEND}\n\n${WORKER_RUNTIME_APPEND}`;
+const withNudge = (body: string) =>
+  `${body}\n\n${FINDINGS_NUDGE_APPEND}\n\n${WORKER_RUNTIME_APPEND}\n\n${SECRET_FIXTURE_HYGIENE_APPEND}`;
 
 const coder: AgentTemplate = { name: "coder", description: "writes code", prompt_body: "You implement.", tools: ["Read", "Edit", "Write", "Bash"] };
 const reviewer: AgentTemplate = { name: "reviewer", description: "reviews", prompt_body: "You review.", tools: ["Read", "Grep"] };
