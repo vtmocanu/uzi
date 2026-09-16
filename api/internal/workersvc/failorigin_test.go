@@ -75,7 +75,7 @@ func TestFailOriginVocabularyMatchesCheck(t *testing.T) {
 	// whose Up section declares a fail_origin CHECK. A future re-widening migration is picked
 	// up with no test edit; parse THAT migration's Up-section CHECK below.
 	path := latestFailOriginCheckMigration(t, "../store/migrations")
-	raw, err := os.ReadFile(path)
+	raw, err := os.ReadFile(path) //nolint:gosec // G304: test reads a migration discovered under the fixed repo-relative ../store/migrations dir, never user input
 	if err != nil {
 		t.Fatalf("read %s: %v", path, err)
 	}
@@ -143,7 +143,7 @@ func latestFailOriginCheckMigration(t *testing.T, dir string) string {
 		if !ok {
 			continue
 		}
-		raw, err := os.ReadFile(file)
+		raw, err := os.ReadFile(file) //nolint:gosec // G304: test reads migration files from the fixed repo-relative ../store/migrations dir, never user input
 		if err != nil {
 			t.Fatalf("read %s: %v", file, err)
 		}
