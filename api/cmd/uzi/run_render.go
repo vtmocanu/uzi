@@ -1075,7 +1075,7 @@ func steerState(kind string, consumedAt *time.Time, disposition *string, runStat
 
 // forgeUnreachableCause is the RecoveryWaitCause a pre-clone forge-unreachable park writes
 // (PRD #1392 M1). It is the one recovery_wait cause that earns forge-specific surface
-// wording; a null/other cause keeps the generic transient-empty-turn wording (issue #1197).
+// wording; a null/other cause keeps the generic transient-interruption wording (issue #1197/#1088).
 const forgeUnreachableCause = "forge_unreachable"
 
 // isForgePark reports whether a recovery_wait run is parked because the forge was

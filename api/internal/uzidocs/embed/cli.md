@@ -1626,7 +1626,7 @@ A run's `status` (on `run get` and `run list`) is one of exactly **thirteen** va
   genuinely empty, resumed once a token is pooled — see [Letting uzi pick the
   token](anthropic-token.md#letting-uzi-pick-the-token-auto-selection);
 - `recovery_wait` — parked to recover from a resumed turn that came back empty
-  or hit a transient provider error (no model activity); the sweep auto-resumes
+  (no model activity) or hit a transient provider error; the sweep auto-resumes
   it on a capped backoff until it recovers or you cancel it — see [Recovering
   from a transient interruption](run-recovery-wait.md).
 - `paused`: an owner-requested hold (`uzi run pause`), resumed on demand from

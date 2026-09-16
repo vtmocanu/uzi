@@ -1356,18 +1356,18 @@ func TestSteerStateOnAParkedRun(t *testing.T) {
 		t.Errorf("steerState(consumed, recovery_wait) = %q, want a delivered row naming the transient-recovery park", got)
 	}
 
-	// PRD #1392 M5: a forge-unreachable recovery park names the FORGE, not the transient
-	// empty turn — the queue state is still unchanged. The empty/other cause keeps the
-	// #1197 wording above (the variadic tail defaults to it).
+	// PRD #1392 M5: a forge-unreachable recovery park names the FORGE, not the generic
+	// transient interruption — the queue state is still unchanged. The empty/other cause
+	// keeps the #1197 wording above (the variadic tail defaults to it).
 	if got := steerState(kindFollowUp, nil, nil, statusRecoveryWait, "forge_unreachable"); !strings.HasPrefix(got, "queued") || !strings.Contains(got, "waiting for the forge") {
 		t.Errorf("steerState(unconsumed, recovery_wait, forge) = %q, want a queued row naming the forge park", got)
 	}
 	if got := steerState(kindFollowUp, &consumed, nil, statusRecoveryWait, "forge_unreachable"); !strings.HasPrefix(got, "delivered") || !strings.Contains(got, "waiting for the forge") {
 		t.Errorf("steerState(consumed, recovery_wait, forge) = %q, want a delivered row naming the forge park", got)
 	}
-	// A forge park must NOT keep the transient-empty-turn wording.
-	if got := steerState(kindFollowUp, nil, nil, statusRecoveryWait, "forge_unreachable"); strings.Contains(got, "transient empty turn") {
-		t.Errorf("steerState forge park = %q, still names the transient empty turn", got)
+	// A forge park must NOT keep the generic transient-interruption wording.
+	if got := steerState(kindFollowUp, nil, nil, statusRecoveryWait, "forge_unreachable"); strings.Contains(got, "transient interruption") {
+		t.Errorf("steerState forge park = %q, still names the generic transient interruption", got)
 	}
 
 	// Every other status is untouched.

@@ -1426,8 +1426,9 @@ export function PoolWaitPanel({
  * PRD #1392 M5: when the typed cause is `forge_unreachable` (the forge stayed unreachable
  * at clone) the panel swaps in forge-specific copy — "Waiting for the forge", the retry
  * time from `recovery_retry_not_before`, and the park count against its cap ("N of MAX",
- * or "N of unlimited" when `forge_park_max` is 0). A null/other cause keeps the #1197
- * empty-turn copy. The wording is kept consistent with the TUI and `uzi run get`.
+ * or "N of unlimited" when `forge_park_max` is 0). A null/other cause keeps the generic
+ * transient-interruption copy (issue #1197, widened by issue #1088). The wording is kept
+ * consistent with the TUI and `uzi run get`.
  *
  * Exported like the sibling panels so its copy is reachable without mounting the page.
  */
@@ -1438,7 +1439,7 @@ export function RecoveryWaitPanel({ run }: { run: Run }) {
   if (run.status !== "recovery_wait") return null;
 
   // PRD #1392 M5: a forge-unreachable park gets forge-specific copy. Every other cause
-  // (including the null/untyped empty-turn park, issue #1197) keeps the copy below.
+  // (including the null/untyped transient-interruption park, issue #1197/#1088) keeps the copy below.
   const forgePark = run.recovery_wait_cause === "forge_unreachable";
   const retryMs = run.recovery_retry_not_before ? Date.parse(run.recovery_retry_not_before) : NaN;
   // Same wall-clock HH:MM idiom as the paused/limit surfaces on this page.
