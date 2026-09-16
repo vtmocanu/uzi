@@ -858,11 +858,14 @@ UPDATE runs SET
     pause_after_count  = NULL,
     updated_at         = now()
 WHERE id = $1 AND worker_id = $2
+  AND ($3::bigint IS NULL
+       OR (claim_generation = $3::bigint AND claim_released_at IS NULL))
 `
 
 type ClearPauseRequestParams struct {
-	ID       uuid.UUID   `json:"id"`
-	WorkerID pgtype.UUID `json:"worker_id"`
+	ID              uuid.UUID   `json:"id"`
+	WorkerID        pgtype.UUID `json:"worker_id"`
+	ClaimGeneration pgtype.Int8 `json:"claim_generation"`
 }
 
 // Clear a pending pause request WITHOUT parking (PRD #1190 M1), for the worker's
@@ -871,8 +874,16 @@ type ClearPauseRequestParams struct {
 // worker_id so only the worker holding the run can clear it; it does not touch status. One of
 // the four sites that clear the pending-pause columns (with SetRunPaused, CancelPauseInput and
 // the terminal transitions).
+//
+// PRD #1247 M5: the per-query generation fence, the SAME nil-guarded shape as InsertRunMessage /
+// SetRunLimitWait. A CAPABILITY worker stamps claim_generation on its `pause_failed` report; a
+// STALE report from an OLD flight — its claim RELEASED by a held-state switch (claim_released_at
+// set) or SUPERSEDED by a reclaim (claim_generation advanced) — matches 0 rows here, so it can
+// NOT clear the NEW flight's pending pause request. A legacy worker (NULL generation) clears
+// unconditionally, byte-identical to before. sqlc.narg, never @name (this file's multibyte
+// comment blocks break the @name parser).
 func (q *Queries) ClearPauseRequest(ctx context.Context, arg ClearPauseRequestParams) (int64, error) {
-	result, err := q.db.Exec(ctx, clearPauseRequest, arg.ID, arg.WorkerID)
+	result, err := q.db.Exec(ctx, clearPauseRequest, arg.ID, arg.WorkerID, arg.ClaimGeneration)
 	if err != nil {
 		return 0, err
 	}
@@ -7322,9 +7333,16 @@ func (q *Queries) ReconcileRunMR(ctx context.Context, arg ReconcileRunMRParams) 
 const recordCompletionAttempt = `-- name: RecordCompletionAttempt :one
 WITH ins AS (
     INSERT INTO run_completion_attempts (run_id, contract_revision, unmet, head, worktree_fingerprint)
-    SELECT r.id, $7, $2::jsonb, $3, $4
+    SELECT r.id, $8, $2::jsonb, $3, $4
     FROM runs r
     WHERE r.id = $5 AND r.worker_id = $6 AND r.completion_contract_version IS NOT NULL
+      -- PRD #1247 M5: the per-query generation fence, the SAME nil-guarded shape as InsertRunMessage.
+      -- A CAPABILITY worker stamps claim_generation; a STALE attempt from an OLD flight (its claim
+      -- RELEASED by a held-state switch, or SUPERSEDED by a reclaim) inserts NOTHING here, so with the
+      -- UPDATE's EXISTS(ins) gate below it records no attempt (0 rows -> pgx.ErrNoRows -> the caller's
+      -- ErrCompletionStaleClaim). A legacy worker (NULL generation) records unconditionally, unchanged.
+      AND ($7::bigint IS NULL
+           OR (r.claim_generation = $7::bigint AND r.claim_released_at IS NULL))
     RETURNING run_completion_attempts.id
 ),
 pruned AS (
@@ -7356,6 +7374,12 @@ UPDATE runs SET
     updated_at = now()
 WHERE runs.id = $5 AND runs.worker_id = $6 AND runs.completion_contract_version IS NOT NULL
   AND EXISTS (SELECT 1 FROM ins)
+  -- PRD #1247 M5: mirror the ins CTE's generation fence on the counter/summary UPDATE too, so a
+  -- fenced-out attempt updates NOTHING as well as inserting nothing (0 rows -> pgx.ErrNoRows ->
+  -- ErrCompletionStaleClaim). Belt-and-suspenders beside EXISTS(ins): the ins fence already stops
+  -- the insert, but pinning the same predicate here keeps the whole statement stale-safe.
+  AND ($7::bigint IS NULL
+       OR (runs.claim_generation = $7::bigint AND runs.claim_released_at IS NULL))
 RETURNING runs.completion_attempts
 `
 
@@ -7366,6 +7390,7 @@ type RecordCompletionAttemptParams struct {
 	WorktreeFingerprint pgtype.Text `json:"worktree_fingerprint"`
 	RunID               uuid.UUID   `json:"run_id"`
 	WorkerID            pgtype.UUID `json:"worker_id"`
+	ClaimGeneration     pgtype.Int8 `json:"claim_generation"`
 	ContractRevision    pgtype.Int4 `json:"contract_revision"`
 }
 
@@ -7408,6 +7433,7 @@ func (q *Queries) RecordCompletionAttempt(ctx context.Context, arg RecordComplet
 		arg.WorktreeFingerprint,
 		arg.RunID,
 		arg.WorkerID,
+		arg.ClaimGeneration,
 		arg.ContractRevision,
 	)
 	var completion_attempts int32
@@ -8888,6 +8914,15 @@ WHERE id = $3 AND worker_id = $4
   AND status IN ('running', 'awaiting_input')
   AND completion_contract_version IS NOT NULL
   AND completion_attempts > 0
+  -- PRD #1247 M5: the per-query generation fence, the SAME nil-guarded shape as InsertRunMessage.
+  -- A CAPABILITY worker stamps claim_generation on its park order; a STALE report from an OLD
+  -- flight (its claim RELEASED by a held-state switch, or SUPERSEDED by a reclaim — status
+  -- 'running'/'awaiting_input' and worker_id can both still match, so the guards above do not
+  -- exclude it) matches 0 rows here, which the service maps to the existing applied=false path
+  -- (the worker retains the reclaimed flight's run live). A legacy worker (NULL generation) holds
+  -- unconditionally, unchanged. sqlc.narg, never @name (this file's multibyte comments break @name).
+  AND ($5::bigint IS NULL
+       OR (claim_generation = $5::bigint AND claim_released_at IS NULL))
 RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash, pause_requested_at, pause_mode, pause_after_count, checkpoint_tip_at, recovery_wait_count, recovery_retry_not_before, completion_contract_version, contract_revision, completion_contract, completion_attempts, latest_completion_attempt, milestones_agents, hold_reason, hold_captured_head, completion_budget_exhausted_at, completion_question_at, budget_extension_seconds, claim_generation, harness, recovery_wait_cause, forge_park_count, credential_override_mode, credential_override_secret_id, claim_released_at, credential_switch_requested_at, credential_switch_generation
 `
 
@@ -8896,6 +8931,7 @@ type SetRunCompletionHoldParams struct {
 	HoldCapturedHead pgtype.Text `json:"hold_captured_head"`
 	ID               uuid.UUID   `json:"id"`
 	WorkerID         pgtype.UUID `json:"worker_id"`
+	ClaimGeneration  pgtype.Int8 `json:"claim_generation"`
 }
 
 // Park an OWNED, INTERLOCKED run on the completion interlock's dedicated HOLD transition
@@ -8940,6 +8976,7 @@ func (q *Queries) SetRunCompletionHold(ctx context.Context, arg SetRunCompletion
 		arg.HoldCapturedHead,
 		arg.ID,
 		arg.WorkerID,
+		arg.ClaimGeneration,
 	)
 	var i Run
 	err := row.Scan(

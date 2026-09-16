@@ -1351,6 +1351,11 @@ export interface CompletionAttemptRequest {
   milestones_completed: string[];
   head: string | null;
   worktree_fingerprint: string | null;
+  /** PRD #1247 M5 (D3): the claim-lane generation the reporting worker holds. A CAPABILITY worker
+   *  stamps it so the server's RecordCompletionAttempt fence can engage — a released/superseded
+   *  stale flight's attempt then records nothing (the api decodes it as `ClaimGeneration *int64`).
+   *  Optional so a legacy worker omits it and the attempt is unfenced. */
+  claim_generation?: number;
 }
 
 /** Response body for POST /api/worker/runs/:id/completion/attempt (PRD #1226 M3): the
@@ -1370,6 +1375,11 @@ export interface CompletionPermitRequest {
   contract_revision: number;
   branch: string;
   head: string;
+  /** PRD #1247 M5 (D3): the claim-lane generation the reporting worker holds. A CAPABILITY worker
+   *  stamps it so the server refuses to issue a permit for a released/superseded stale flight (the
+   *  api decodes it as `ClaimGeneration *int64`). Optional so a legacy worker omits it and the
+   *  issue is unfenced. */
+  claim_generation?: number;
 }
 
 /** Response body for POST /api/worker/runs/:id/completion/permit (PRD #1226 M4, D5), the

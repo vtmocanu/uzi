@@ -2211,6 +2211,15 @@ WHERE id = @id AND worker_id = @worker_id
   AND status IN ('running', 'awaiting_input')
   AND completion_contract_version IS NOT NULL
   AND completion_attempts > 0
+  -- PRD #1247 M5: the per-query generation fence, the SAME nil-guarded shape as InsertRunMessage.
+  -- A CAPABILITY worker stamps claim_generation on its park order; a STALE report from an OLD
+  -- flight (its claim RELEASED by a held-state switch, or SUPERSEDED by a reclaim — status
+  -- 'running'/'awaiting_input' and worker_id can both still match, so the guards above do not
+  -- exclude it) matches 0 rows here, which the service maps to the existing applied=false path
+  -- (the worker retains the reclaimed flight's run live). A legacy worker (NULL generation) holds
+  -- unconditionally, unchanged. sqlc.narg, never @name (this file's multibyte comments break @name).
+  AND (sqlc.narg('claim_generation')::bigint IS NULL
+       OR (claim_generation = sqlc.narg('claim_generation')::bigint AND claim_released_at IS NULL))
 RETURNING *;
 
 -- name: ResumePausedRun :one
@@ -2349,12 +2358,22 @@ WHERE id = @id
 -- worker_id so only the worker holding the run can clear it; it does not touch status. One of
 -- the four sites that clear the pending-pause columns (with SetRunPaused, CancelPauseInput and
 -- the terminal transitions).
+--
+-- PRD #1247 M5: the per-query generation fence, the SAME nil-guarded shape as InsertRunMessage /
+-- SetRunLimitWait. A CAPABILITY worker stamps claim_generation on its `pause_failed` report; a
+-- STALE report from an OLD flight — its claim RELEASED by a held-state switch (claim_released_at
+-- set) or SUPERSEDED by a reclaim (claim_generation advanced) — matches 0 rows here, so it can
+-- NOT clear the NEW flight's pending pause request. A legacy worker (NULL generation) clears
+-- unconditionally, byte-identical to before. sqlc.narg, never @name (this file's multibyte
+-- comment blocks break the @name parser).
 UPDATE runs SET
     pause_requested_at = NULL,
     pause_mode         = NULL,
     pause_after_count  = NULL,
     updated_at         = now()
-WHERE id = @id AND worker_id = @worker_id;
+WHERE id = @id AND worker_id = @worker_id
+  AND (sqlc.narg('claim_generation')::bigint IS NULL
+       OR (claim_generation = sqlc.narg('claim_generation')::bigint AND claim_released_at IS NULL));
 
 -- name: SetRunAwaitingInput :execrows
 -- PRD #88 M1: the clarification park. Sibling of SetRunAwaitingApproval, and it
@@ -4849,6 +4868,13 @@ WITH ins AS (
     SELECT r.id, sqlc.narg('contract_revision'), @unmet::jsonb, sqlc.narg('head'), sqlc.narg('worktree_fingerprint')
     FROM runs r
     WHERE r.id = @run_id AND r.worker_id = @worker_id AND r.completion_contract_version IS NOT NULL
+      -- PRD #1247 M5: the per-query generation fence, the SAME nil-guarded shape as InsertRunMessage.
+      -- A CAPABILITY worker stamps claim_generation; a STALE attempt from an OLD flight (its claim
+      -- RELEASED by a held-state switch, or SUPERSEDED by a reclaim) inserts NOTHING here, so with the
+      -- UPDATE's EXISTS(ins) gate below it records no attempt (0 rows -> pgx.ErrNoRows -> the caller's
+      -- ErrCompletionStaleClaim). A legacy worker (NULL generation) records unconditionally, unchanged.
+      AND (sqlc.narg('claim_generation')::bigint IS NULL
+           OR (r.claim_generation = sqlc.narg('claim_generation')::bigint AND r.claim_released_at IS NULL))
     RETURNING run_completion_attempts.id
 ),
 pruned AS (
@@ -4880,6 +4906,12 @@ UPDATE runs SET
     updated_at = now()
 WHERE runs.id = @run_id AND runs.worker_id = @worker_id AND runs.completion_contract_version IS NOT NULL
   AND EXISTS (SELECT 1 FROM ins)
+  -- PRD #1247 M5: mirror the ins CTE's generation fence on the counter/summary UPDATE too, so a
+  -- fenced-out attempt updates NOTHING as well as inserting nothing (0 rows -> pgx.ErrNoRows ->
+  -- ErrCompletionStaleClaim). Belt-and-suspenders beside EXISTS(ins): the ins fence already stops
+  -- the insert, but pinning the same predicate here keeps the whole statement stale-safe.
+  AND (sqlc.narg('claim_generation')::bigint IS NULL
+       OR (runs.claim_generation = sqlc.narg('claim_generation')::bigint AND runs.claim_released_at IS NULL))
 RETURNING runs.completion_attempts;
 
 -- name: UpsertCompletionPermit :one

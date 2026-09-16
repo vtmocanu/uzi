@@ -797,13 +797,23 @@ export class WorkerClient {
    *  RequestError on non-2xx (409 stale claim, 400 not interlocked) — the caller decides. */
   async recordCompletionAttempt(
     runId: string,
-    args: { milestonesCompleted: string[]; head: string | null; worktreeFingerprint: string | null },
+    args: {
+      milestonesCompleted: string[];
+      head: string | null;
+      worktreeFingerprint: string | null;
+      claimGeneration?: number;
+    },
   ): Promise<{ unmet: string[]; attemptCount: number }> {
     const body: CompletionAttemptRequest = {
       milestones_completed: args.milestonesCompleted,
       head: args.head,
       worktree_fingerprint: args.worktreeFingerprint,
     };
+    // PRD #1247 M5: a capability worker stamps its claim-lane generation so the server's fence can
+    // engage — a released/superseded stale flight's attempt then records nothing. Optional +
+    // additive: unset (legacy) leaves the body unchanged and the attempt is unfenced (mirrors
+    // postMessages).
+    if (args.claimGeneration !== undefined) body.claim_generation = args.claimGeneration;
     const res = (await this.postJSON(
       `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/completion/attempt`,
       body,
@@ -820,13 +830,16 @@ export class WorkerClient {
    *  transport/HTTP error (the denial is a 200 body, not a 4xx). */
   async requestCompletionPermit(
     runId: string,
-    args: { contractRevision: number; branch: string; head: string },
+    args: { contractRevision: number; branch: string; head: string; claimGeneration?: number },
   ): Promise<CompletionPermitResult> {
     const body: CompletionPermitRequest = {
       contract_revision: args.contractRevision,
       branch: args.branch,
       head: args.head,
     };
+    // PRD #1247 M5: stamp the claim-lane generation so the server refuses to issue a permit for a
+    // released/superseded stale flight. Optional + additive (unset = legacy, unfenced).
+    if (args.claimGeneration !== undefined) body.claim_generation = args.claimGeneration;
     const res = (await this.postJSON(
       `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/completion/permit`,
       body,
@@ -856,9 +869,17 @@ export class WorkerClient {
    *  body (paused on a landed hold, the real status on a refusal); an unmodelled 2xx or an
    *  unreadable body yields "" (never "paused" ⇒ retain, the safe default). A genuine transport
    *  error or a non-200/409 4xx/5xx still throws RequestError. */
-  async requestCompletionHold(runId: string, args: { head: string }): Promise<{ status: string }> {
+  async requestCompletionHold(
+    runId: string,
+    args: { head: string; claimGeneration?: number },
+  ): Promise<{ status: string }> {
     const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/completion/hold`;
-    const res = await this.fetchRaw("POST", path, { head: args.head });
+    // PRD #1247 M5: stamp the claim-lane generation so the server refuses to park a
+    // released/superseded stale flight's reclaimed run. Optional + additive (unset = legacy,
+    // unfenced) — the body is byte-identical to `{head}` when it is omitted.
+    const body: { head: string; claim_generation?: number } = { head: args.head };
+    if (args.claimGeneration !== undefined) body.claim_generation = args.claimGeneration;
+    const res = await this.fetchRaw("POST", path, body);
     if (res.status === 200 || res.status === 409) {
       const fields = await readRunAck(res);
       return { status: fields.status ?? "" };

@@ -723,7 +723,7 @@ func TestSetRunCompletionHoldLiveDB(t *testing.T) {
 	// is recorded and a resolved open_question_id is cleared.
 	running := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
 	e.exec(t, `UPDATE runs SET completion_attempts = 1, open_question_id = 'q-should-clear' WHERE id = $1`, running)
-	run, applied, err := svc.SetRunCompletionHold(e.ctx, wkr, running, "capturedhead1")
+	run, applied, err := svc.SetRunCompletionHold(e.ctx, wkr, running, "capturedhead1", nil)
 	if err != nil {
 		t.Fatalf("SetRunCompletionHold (running): %v", err)
 	}
@@ -746,7 +746,7 @@ func TestSetRunCompletionHoldLiveDB(t *testing.T) {
 	// Case 2: owned interlocked AWAITING_INPUT run with an attempt also holds.
 	awaiting := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
 	e.exec(t, `UPDATE runs SET status = 'awaiting_input', completion_attempts = 2 WHERE id = $1`, awaiting)
-	run2, applied2, err := svc.SetRunCompletionHold(e.ctx, wkr, awaiting, "")
+	run2, applied2, err := svc.SetRunCompletionHold(e.ctx, wkr, awaiting, "", nil)
 	if err != nil {
 		t.Fatalf("SetRunCompletionHold (awaiting_input): %v", err)
 	}
@@ -761,7 +761,7 @@ func TestSetRunCompletionHoldLiveDB(t *testing.T) {
 	// Case 3: completion_attempts==0 is REFUSED (the guard fails); status is unchanged. THIS is
 	// the assertion the completion_attempts>0 mutation check reddens.
 	noAttempts := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false) // attempts defaults to 0
-	run3, applied3, err := svc.SetRunCompletionHold(e.ctx, wkr, noAttempts, "h")
+	run3, applied3, err := svc.SetRunCompletionHold(e.ctx, wkr, noAttempts, "h", nil)
 	if err != nil {
 		t.Fatalf("SetRunCompletionHold (attempts=0): %v", err)
 	}
@@ -778,7 +778,7 @@ func TestSetRunCompletionHoldLiveDB(t *testing.T) {
 	// Case 4: a non-running/awaiting_input status (queued) is REFUSED even with an attempt.
 	queued := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
 	e.exec(t, `UPDATE runs SET status = 'queued', completion_attempts = 3 WHERE id = $1`, queued)
-	run4, applied4, err := svc.SetRunCompletionHold(e.ctx, wkr, queued, "h")
+	run4, applied4, err := svc.SetRunCompletionHold(e.ctx, wkr, queued, "h", nil)
 	if err != nil {
 		t.Fatalf("SetRunCompletionHold (queued): %v", err)
 	}
@@ -810,7 +810,7 @@ func TestSetRunCompletionHoldLiveDB(t *testing.T) {
 	// drop `completion_contract_version IS NOT NULL` from SetRunCompletionHold and this reddens.
 	legacy := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
 	e.exec(t, `UPDATE runs SET completion_contract_version = NULL, completion_attempts = 4 WHERE id = $1`, legacy)
-	run6, applied6, err := svc.SetRunCompletionHold(e.ctx, wkr, legacy, "h")
+	run6, applied6, err := svc.SetRunCompletionHold(e.ctx, wkr, legacy, "h", nil)
 	if err != nil {
 		t.Fatalf("SetRunCompletionHold (legacy): %v", err)
 	}
@@ -835,7 +835,7 @@ func TestSetRunCompletionHoldLiveDB(t *testing.T) {
 	other := store.Worker{ID: otherWid}
 	foreign := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
 	e.exec(t, `UPDATE runs SET completion_attempts = 1 WHERE id = $1`, foreign)
-	run7, applied7, err := svc.SetRunCompletionHold(e.ctx, other, foreign, "foreignhead")
+	run7, applied7, err := svc.SetRunCompletionHold(e.ctx, other, foreign, "foreignhead", nil)
 	if !errors.Is(err, ErrRunNotOwned) {
 		t.Fatalf("a foreign worker must be refused ErrRunNotOwned; got run=%+v applied=%v err=%v", run7, applied7, err)
 	}

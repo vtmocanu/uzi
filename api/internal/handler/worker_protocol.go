@@ -1059,6 +1059,11 @@ func (h *Handler) WorkerRunCompletionPermit(w http.ResponseWriter, r *http.Reque
 		ContractRevision int    `json:"contract_revision"`
 		Branch           string `json:"branch"`
 		Head             string `json:"head"`
+		// PRD #1247 M5 (D3): the claim generation the worker holds. A CAPABILITY worker stamps it so
+		// RequestCompletionPermit's fence refuses to issue a permit for a released/superseded stale
+		// flight. Nullable + OPTIONAL (a legacy worker omits it, unfenced), but the field must exist
+		// here because httpx.DecodeJSON rejects unknown fields.
+		ClaimGeneration *int64 `json:"claim_generation"`
 	}
 	if err := httpx.DecodeJSON(r, &body); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
@@ -1071,15 +1076,24 @@ func (h *Handler) WorkerRunCompletionPermit(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	res, err := h.wsvc.RequestCompletionPermit(r.Context(), wkr, runID, workersvc.CompletionPermitRequest{
-		ContractRevision: body.ContractRevision, Branch: branch, Head: head,
+		ContractRevision: body.ContractRevision, Branch: branch, Head: head, ClaimGeneration: body.ClaimGeneration,
 	})
 	if err != nil {
-		if errors.Is(err, workersvc.ErrRunNotOwned) {
+		switch {
+		case errors.Is(err, workersvc.ErrRunNotOwned):
 			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
-			return
+		case errors.Is(err, workersvc.ErrCompletionStaleClaim):
+			// PRD #1247 M5: the generation fence refused — a held-state switch RELEASED this claim or
+			// a reclaim SUPERSEDED it, so no permit is issued for the stale flight. 409, non-terminal.
+			httpx.Error(w, http.StatusConflict, "run is not in a live claimed state for this worker")
+		case errors.Is(err, workersvc.ErrMissingClaimGeneration):
+			// PRD #1247 M5: a CAPABILITY worker omitted claim_generation, so the fence could not
+			// engage. Refuse (409) rather than issue an unfenced permit, mirroring WorkerRunState.
+			httpx.Error(w, http.StatusConflict, "this worker must stamp claim_generation on the completion permit request")
+		default:
+			slog.Error("worker run completion permit", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
 		}
-		slog.Error("worker run completion permit", "error", err)
-		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 	httpx.JSON(w, http.StatusOK, res)
@@ -1105,6 +1119,10 @@ func (h *Handler) WorkerRunCompletionAttempt(w http.ResponseWriter, r *http.Requ
 		MilestonesCompleted []string `json:"milestones_completed"`
 		Head                string   `json:"head"`
 		WorktreeFingerprint string   `json:"worktree_fingerprint"`
+		// PRD #1247 M5 (D3): the claim generation the worker holds. A CAPABILITY worker stamps it so
+		// the RecordCompletionAttempt fence refuses a released/superseded stale flight's attempt.
+		// Nullable + OPTIONAL, but the field must exist because httpx.DecodeJSON rejects unknown fields.
+		ClaimGeneration *int64 `json:"claim_generation"`
 	}
 	if err := httpx.DecodeJSON(r, &body); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
@@ -1114,6 +1132,7 @@ func (h *Handler) WorkerRunCompletionAttempt(w http.ResponseWriter, r *http.Requ
 		MilestonesCompleted: body.MilestonesCompleted,
 		Head:                strings.TrimSpace(body.Head),
 		WorktreeFingerprint: strings.TrimSpace(body.WorktreeFingerprint),
+		ClaimGeneration:     body.ClaimGeneration,
 	})
 	if err != nil {
 		switch {
@@ -1121,6 +1140,10 @@ func (h *Handler) WorkerRunCompletionAttempt(w http.ResponseWriter, r *http.Requ
 			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
 		case errors.Is(err, workersvc.ErrCompletionStaleClaim):
 			httpx.Error(w, http.StatusConflict, "run is not in a live claimed state for this worker")
+		case errors.Is(err, workersvc.ErrMissingClaimGeneration):
+			// PRD #1247 M5: a CAPABILITY worker omitted claim_generation, so the fence could not
+			// engage. Refuse (409) rather than record an unfenced attempt, mirroring WorkerRunState.
+			httpx.Error(w, http.StatusConflict, "this worker must stamp claim_generation on the completion attempt")
 		case errors.Is(err, workersvc.ErrCompletionNotInterlocked):
 			httpx.Error(w, http.StatusBadRequest, "run is not interlocked")
 		default:
@@ -1160,15 +1183,25 @@ func (h *Handler) WorkerRunCompletionHold(w http.ResponseWriter, r *http.Request
 		// The exact head the worker captured at hold time. Empty is allowed (the column is
 		// nullable); the service NUL-strips + TrimSpaces it, matching the permit path.
 		Head string `json:"head"`
+		// PRD #1247 M5 (D3): the claim generation the worker holds. A CAPABILITY worker stamps it so
+		// the hold's fence refuses to park a released/superseded stale flight's reclaimed run.
+		// Nullable + OPTIONAL, but the field must exist because httpx.DecodeJSON rejects unknown fields.
+		ClaimGeneration *int64 `json:"claim_generation"`
 	}
 	if err := httpx.DecodeJSON(r, &body); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	run, applied, err := h.wsvc.SetRunCompletionHold(r.Context(), wkr, runID, body.Head)
+	run, applied, err := h.wsvc.SetRunCompletionHold(r.Context(), wkr, runID, body.Head, body.ClaimGeneration)
 	if err != nil {
 		if errors.Is(err, workersvc.ErrRunNotOwned) {
 			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
+			return
+		}
+		if errors.Is(err, workersvc.ErrMissingClaimGeneration) {
+			// PRD #1247 M5: a CAPABILITY worker omitted claim_generation, so the hold's fence could
+			// not engage. Refuse (409) rather than park unfenced, mirroring WorkerRunState.
+			httpx.Error(w, http.StatusConflict, "this worker must stamp claim_generation on the completion hold")
 			return
 		}
 		slog.Error("worker run completion hold", "error", err)

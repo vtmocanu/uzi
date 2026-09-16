@@ -2515,7 +2515,19 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	// transitions and pause_failed is not one; the in-app feed message carries the reason. A
 	// Slack DM would need a reason-carrying handler→slacksvc seam (deferred).
 	if req.State == "pause_failed" {
-		if _, cerr := s.q.ClearPauseRequest(ctx, store.ClearPauseRequestParams{ID: runID, WorkerID: pgconv.UUID(wkr.ID)}); cerr != nil {
+		// PRD #1247 M5: FAIL CLOSED for a CAPABILITY worker. pause_failed is handled BEFORE the
+		// generic fail-closed check below, so its own check lives here: a worker advertising
+		// credential_switch_v1 that OMITS claim_generation is refused (ErrMissingClaimGeneration →
+		// the same 409 the handler maps it to) rather than clearing the pause unfenced. A LEGACY
+		// worker (no capability, nil generation) skips the fence, byte-identical to before.
+		if req.ClaimGeneration == nil && slices.Contains(wkr.ProtocolCapabilities, capability.CredentialSwitchV1) {
+			return owned, false, ErrMissingClaimGeneration
+		}
+		// The nullable claim_generation fences the clear: a stale flight (its claim released by a
+		// held-state switch, or superseded by a reclaim) matches 0 rows, so it clears nothing and
+		// cannot withdraw the NEW flight's pending pause. The run stays running either way (the
+		// rowcount is intentionally not read — the fence is the protection, not a re-read).
+		if _, cerr := s.q.ClearPauseRequest(ctx, store.ClearPauseRequestParams{ID: runID, WorkerID: pgconv.UUID(wkr.ID), ClaimGeneration: pgconv.Int8Ptr(req.ClaimGeneration)}); cerr != nil {
 			return store.Run{}, false, cerr
 		}
 		run, err = s.runOwnedByWorker(ctx, runID, wkr)

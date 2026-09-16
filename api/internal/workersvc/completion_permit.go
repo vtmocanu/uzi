@@ -86,6 +86,11 @@ type CompletionPermitRequest struct {
 	ContractRevision int
 	Branch           string
 	Head             string
+	// ClaimGeneration is the runs.claim_generation the reporting worker believes it holds (PRD
+	// #1247 M5, D3). A CAPABILITY worker stamps it; RequestCompletionPermit fences the issue on it
+	// (a released/superseded claim is refused ErrCompletionStaleClaim), so a permit is never issued
+	// for a stale flight. Nullable + OPTIONAL: a legacy worker omits it and the issue is unfenced.
+	ClaimGeneration *int64
 }
 
 // CompletionAttemptRequest is the same-lead nudge (M3) request (PRD #1226 M2/M3, D4): the worker
@@ -104,6 +109,11 @@ type CompletionAttemptRequest struct {
 	MilestonesCompleted []string
 	Head                string
 	WorktreeFingerprint string
+	// ClaimGeneration is the runs.claim_generation the reporting worker believes it holds (PRD
+	// #1247 M5, D3). A CAPABILITY worker stamps it; the RecordCompletionAttempt statement fences on
+	// it, so a released/superseded stale flight records NOTHING (0 rows -> ErrCompletionStaleClaim).
+	// Nullable + OPTIONAL: a legacy worker omits it and the attempt is unfenced.
+	ClaimGeneration *int64
 }
 
 // CompletionPermitDTO is the wire shape of an issued permit. It carries no secret and no forge
@@ -231,6 +241,21 @@ func (s *Service) RequestCompletionPermit(ctx context.Context, wkr store.Worker,
 	if deny != "" {
 		return CompletionPermitResult{Granted: false, DenyReason: deny}, nil
 	}
+	// PRD #1247 M5 (D3): the released-generation fence, applied Go-side. A CAPABILITY worker stamps
+	// req.ClaimGeneration; if a held-state switch RELEASED this claim (claim_released_at set) or a
+	// reclaim SUPERSEDED it (claim_generation advanced), issuing a permit for the stale flight is
+	// wrong even though a stale permit is otherwise harmless (completeRunWithPermit re-fences at
+	// consume). The Go check suffices here because the permit issue is not a single mutating
+	// statement. FAIL CLOSED for a capability worker that OMITS the generation, mirroring the
+	// completeRunWithPermit / SetState fence.
+	switch {
+	case req.ClaimGeneration != nil:
+		if run.ClaimGeneration != *req.ClaimGeneration || run.ClaimReleasedAt.Valid {
+			return CompletionPermitResult{}, ErrCompletionStaleClaim
+		}
+	case slices.Contains(wkr.ProtocolCapabilities, capability.CredentialSwitchV1):
+		return CompletionPermitResult{}, ErrMissingClaimGeneration
+	}
 	// Revision drift: the permit fences on the run's FROZEN revision, not the worker's claim.
 	// An unfrozen revision (NULL) also lands here, which is correct — there is no revision to
 	// bind a permit to yet.
@@ -246,7 +271,7 @@ func (s *Service) RequestCompletionPermit(ctx context.Context, wkr store.Worker,
 		// A gated attempt with missing milestones: record it (bounded) and deny non-terminally.
 		// A recompute race that reclaimed the run (ErrNoRows from the write) leaves the denial
 		// intact — the recompute was valid at load; only an infra error propagates.
-		if _, aerr := s.persistCompletionAttempt(ctx, wkr, run, unmet, req.Head, "", nil); aerr != nil && !errors.Is(aerr, pgx.ErrNoRows) {
+		if _, aerr := s.persistCompletionAttempt(ctx, wkr, run, unmet, req.Head, "", nil, req.ClaimGeneration); aerr != nil && !errors.Is(aerr, pgx.ErrNoRows) {
 			return CompletionPermitResult{}, aerr
 		}
 		return CompletionPermitResult{Granted: false, DenyReason: CompletionDenyMissingMilestones, Unmet: unmet}, nil
@@ -315,6 +340,14 @@ func (s *Service) RecordCompletionAttempt(ctx context.Context, wkr store.Worker,
 	case CompletionDenyNotInterlocked:
 		return CompletionAttemptResult{}, ErrCompletionNotInterlocked
 	}
+	// PRD #1247 M5 (D3): FAIL CLOSED for a CAPABILITY worker. A worker advertising
+	// credential_switch_v1 MUST stamp claim_generation on the attempt so the RecordCompletionAttempt
+	// fence can engage; omitting it is refused (ErrMissingClaimGeneration → 409) rather than
+	// recording an unfenced attempt. A LEGACY worker (no capability, nil generation) records
+	// unfenced, byte-identical to before.
+	if req.ClaimGeneration == nil && slices.Contains(wkr.ProtocolCapabilities, capability.CredentialSwitchV1) {
+		return CompletionAttemptResult{}, ErrMissingClaimGeneration
+	}
 	// PRD #1226 M3: subset-validate the lead's declaration against the frozen list — the SAME
 	// kind/membership gate SetRunRunning/SetRunCompleted apply (progressParams). declaredJSON is
 	// the jsonb the RecordCompletionAttempt statement UNIONs into milestones_completed; nil when
@@ -330,7 +363,7 @@ func (s *Service) RecordCompletionAttempt(ctx context.Context, wkr store.Worker,
 	merged := run
 	merged.MilestonesCompleted = unionMilestoneIDs(run.MilestonesCompleted, declaredJSON)
 	unmet, _ := computeUnmetCriteria(merged)
-	count, err := s.persistCompletionAttempt(ctx, wkr, run, unmet, req.Head, req.WorktreeFingerprint, declaredJSON)
+	count, err := s.persistCompletionAttempt(ctx, wkr, run, unmet, req.Head, req.WorktreeFingerprint, declaredJSON, req.ClaimGeneration)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			// The run was reclaimed between the load and the write — the fence no longer holds.
@@ -365,7 +398,14 @@ func (s *Service) RecordCompletionAttempt(ctx context.Context, wkr store.Worker,
 // 409 (already held). The re-read predates no snapshot: the hold's guard and the re-read both key on
 // (id, worker_id), so a run that failed the guard while still owned re-reads cleanly, while a
 // genuinely reclaimed run surfaces as ErrRunNotOwned (-> 404). Only an infra error propagates.
-func (s *Service) SetRunCompletionHold(ctx context.Context, wkr store.Worker, runID uuid.UUID, capturedHead string) (store.Run, bool, error) {
+func (s *Service) SetRunCompletionHold(ctx context.Context, wkr store.Worker, runID uuid.UUID, capturedHead string, claimGen *int64) (store.Run, bool, error) {
+	// PRD #1247 M5 (D3): FAIL CLOSED for a CAPABILITY worker. A worker advertising
+	// credential_switch_v1 MUST stamp claim_generation on its park order so the hold's fence can
+	// engage; omitting it is refused (ErrMissingClaimGeneration → 409) rather than parking unfenced.
+	// A LEGACY worker (no capability, nil generation) holds unfenced, byte-identical to before.
+	if claimGen == nil && slices.Contains(wkr.ProtocolCapabilities, capability.CredentialSwitchV1) {
+		return store.Run{}, false, ErrMissingClaimGeneration
+	}
 	// NUL-strip BEFORE the trim (a NUL is not whitespace, so a "\x00 h \x00" would survive a
 	// trim) — the same order RequestCompletionPermit / persistCompletionAttempt use for every
 	// worker-authored text field, and required because hold_captured_head accepts arbitrary
@@ -375,6 +415,10 @@ func (s *Service) SetRunCompletionHold(ctx context.Context, wkr store.Worker, ru
 		ID:               runID,
 		WorkerID:         pgconv.UUID(wkr.ID),
 		HoldCapturedHead: pgconv.TextOrNull(strings.TrimSpace(clean)),
+		// PRD #1247 M5: the nullable generation fence. A stale flight (its claim released by a
+		// held-state switch, or superseded by a reclaim) matches 0 rows -> the existing
+		// applied=false path (the worker retains the reclaimed flight's run live). nil is unfenced.
+		ClaimGeneration: pgconv.Int8Ptr(claimGen),
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -400,7 +444,7 @@ func (s *Service) SetRunCompletionHold(ctx context.Context, wkr store.Worker, ru
 // (milestonesCompletedJSON) to union-merge, while the permit path passes nil (it carries no
 // declaration, so the union CASE leaves milestones_completed untouched). pgx.ErrNoRows means the
 // guard (owned + interlocked) failed at write time — a raced reclaim — which each caller interprets.
-func (s *Service) persistCompletionAttempt(ctx context.Context, wkr store.Worker, run store.Run, unmet []string, head, worktreeFingerprint string, milestonesCompletedJSON []byte) (int32, error) {
+func (s *Service) persistCompletionAttempt(ctx context.Context, wkr store.Worker, run store.Run, unmet []string, head, worktreeFingerprint string, milestonesCompletedJSON []byte, claimGen *int64) (int32, error) {
 	unmetJSON, err := encodeJSONArray(unmet)
 	if err != nil {
 		return 0, err
@@ -424,6 +468,9 @@ func (s *Service) persistCompletionAttempt(ctx context.Context, wkr store.Worker
 		RunID:               run.ID,
 		WorkerID:            pgconv.UUID(wkr.ID),
 		ContractRevision:    run.ContractRevision,
+		// PRD #1247 M5: the nullable generation fence. nil (legacy) => unfenced; a present
+		// generation records ONLY while the run is still at it with an unreleased claim.
+		ClaimGeneration: pgconv.Int8Ptr(claimGen),
 	})
 }
 

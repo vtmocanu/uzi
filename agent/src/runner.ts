@@ -3102,6 +3102,9 @@ export class RunRunner {
         contractRevision,
         branch: result.branch,
         head,
+        // PRD #1247 M5: stamp the claim-lane generation (the SAME value the reportState closure
+        // stamps) so the server refuses to issue a permit for a released/superseded stale flight.
+        claimGeneration: flight.claimGeneration,
       });
       // 3. NOT granted: do NOT create the MR, do NOT render Closes, do NOT report completed — hold.
       if (!permit.granted) {
@@ -4663,6 +4666,9 @@ export class RunRunner {
           milestonesCompleted: declared,
           head,
           worktreeFingerprint,
+          // PRD #1247 M5: stamp the claim-lane generation (the SAME value the reportState closure
+          // stamps) so a released/superseded stale flight's attempt records nothing server-side.
+          claimGeneration: flight.claimGeneration,
         }),
       // PRD #1226 M4 (D3/D6): the recoverable completion-hold seam is now WIRED. On a repeated
       // no-progress completion attempt, a post-attempt budget/stall/wall/idle exhaustion, or the
@@ -5849,7 +5855,12 @@ export class RunRunner {
     const head = captured.head;
     let status: string;
     try {
-      ({ status } = await this.client.requestCompletionHold(flight.runId, { head }));
+      ({ status } = await this.client.requestCompletionHold(flight.runId, {
+        head,
+        // PRD #1247 M5: stamp the claim-lane generation (the SAME value the reportState closure
+        // stamps) so the server refuses to park a released/superseded stale flight's reclaimed run.
+        claimGeneration: flight.claimGeneration,
+      }));
     } catch (holdError) {
       flight.preserveRecoveryClone = false;
       flight.preserveSession = false;
