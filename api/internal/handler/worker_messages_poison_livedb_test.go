@@ -122,11 +122,11 @@ func newPoisonFixture(t *testing.T) poisonFixture {
 	      VALUES ($1, $2, 'gitlab', 'https://forge.e2e', 'bot', 1, $3)`, connID, userID, []byte{0x1})
 	exec(`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
 	      VALUES ($1, $2, $3, $4, 'https://forge.e2e/g/r', 'main', true)`,
-		repoID, connID, rand.Int63n(1<<40), fmt.Sprintf("g/r-%s", repoID))
+		repoID, connID, rand.Int63n(1<<40), fmt.Sprintf("g/r-%s", repoID)) //nolint:gosec // G404: a non-security test-fixture forge_project_id (uniqueness only, never a secret)
 	exec(`INSERT INTO workers (id, user_id, name, token_hash) VALUES ($1, $2, 'poison', $3)`,
 		workerID, userID, append([]byte("poison-"), workerID[:]...))
 	exec(`INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, status, worker_id)
-	      VALUES ($1, $2, $3, $4, 't', 'd', 'running', $5)`, runID, userID, repoID, rand.Int63n(1<<40), workerID)
+	      VALUES ($1, $2, $3, $4, 't', 'd', 'running', $5)`, runID, userID, repoID, rand.Int63n(1<<40), workerID) //nolint:gosec // G404: a non-security test-fixture issue_iid (uniqueness only, never a secret)
 
 	return poisonFixture{
 		h:     h,
