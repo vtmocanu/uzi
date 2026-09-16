@@ -1202,8 +1202,15 @@ func (s *Service) assembleJudgeClaim(ctx context.Context, run store.Run) (*Claim
 	}
 
 	return &ClaimPayload{
-		RunID:                  run.ID.String(),
-		Kind:                   run.Kind,
+		RunID: run.ID.String(),
+		Kind:  run.Kind,
+		// PRD #1247 M2 fix round: the judge lane forks here BEFORE assembleClaim's ordinary
+		// `ClaimGeneration: run.ClaimGeneration` (claim_assembly.go), so this literal must carry
+		// the field itself. ClaimRun has already incremented the judge run's row to >= 1, and the
+		// judge runner threads this onto its running/completed reports + usage batch — omitting it
+		// (a non-pointer int64, so 0) makes the server fence every capability worker's judge as
+		// stale (ErrMissingClaimGeneration / staleClaim), silently breaking the whole judge lane.
+		ClaimGeneration:        run.ClaimGeneration,
 		IssueTitle:             run.IssueTitle,
 		IssueDescription:       run.IssueDescription,
 		Status:                 run.Status,
