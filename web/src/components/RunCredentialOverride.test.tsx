@@ -220,3 +220,68 @@ describe("SwitchTokenAction — switching + D6 warning", () => {
     expect(onSwitched).toHaveBeenCalledWith(updated);
   });
 });
+
+describe("SwitchTokenAction — seeds an EXISTING pinned override via the self-fetch path", () => {
+  // These deliberately DO NOT inject `tokens` — exactly how RunView mounts it — so they
+  // exercise the real self-fetch + re-seed. The prior tests masked the bug by injecting a
+  // list, which resolved the pin at mount; RunView passes none, so the initial seed hit []
+  // and an existing pinned token rendered as "(unavailable)" with a disabled confirm.
+  it("opens with the pinned token SELECTED and the confirm ENABLED, no re-pick needed", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [token({ id: "sec-1", label: "console-key" })] });
+    const updated = run({ credential_override: { mode: "pinned", label: "console-key" } });
+    mockApi.setRunCredential.mockResolvedValue({ run: updated });
+    const onSwitched = vi.fn();
+    render(
+      <SwitchTokenAction
+        run={run({ kind: "issue", status: "running", credential_override: { mode: "pinned", label: "console-key" } })}
+        canSteer
+        onSwitched={onSwitched}
+      />,
+    );
+    // The self-fetch fires on mount (no injected list).
+    await waitFor(() => expect(mockApi.listSecrets).toHaveBeenCalled());
+
+    fireEvent.click(screen.getByRole("button", { name: "Switch token" }));
+    const select = screen.getByLabelText("Switch this run's Anthropic token") as HTMLSelectElement;
+
+    // The pin resolved label→id: the token option is present and the select is set to it,
+    // never the "(unavailable)" placeholder.
+    const opt = (await within(select).findByRole("option", { name: "console-key" })) as HTMLOptionElement;
+    await waitFor(() => expect(select.value).toBe("sec-1"));
+    expect(opt.value).toBe("sec-1");
+    expect(within(select).queryByRole("option", { name: /unavailable/ })).toBeNull();
+
+    // The confirm is ENABLED without touching the picker again.
+    const confirm = screen.getByRole("button", { name: "Switch to this token" }) as HTMLButtonElement;
+    expect(confirm.disabled).toBe(false);
+
+    // Confirming as-is sends the resolved pin.
+    fireEvent.click(confirm);
+    await waitFor(() =>
+      expect(mockApi.setRunCredential).toHaveBeenCalledWith("r1", { mode: "pinned", secret_id: "sec-1" }),
+    );
+    expect(onSwitched).toHaveBeenCalledWith(updated);
+  });
+
+  it("keeps PINNED_UNAVAILABLE + a disabled confirm for a genuinely DELETED token", async () => {
+    // The pinned label resolves to NO token in the fetched list (deleted/unresolvable), so
+    // the re-seed cannot fill an id: the picker shows "(unavailable)" and the confirm stays
+    // disabled until the user re-picks — the one case that must still block.
+    mockApi.listSecrets.mockResolvedValue({ secrets: [token({ id: "sec-other", label: "other-key" })] });
+    render(
+      <SwitchTokenAction
+        run={run({ kind: "issue", status: "running", credential_override: { mode: "pinned", label: "deleted-key" } })}
+        canSteer
+      />,
+    );
+    await waitFor(() => expect(mockApi.listSecrets).toHaveBeenCalled());
+
+    fireEvent.click(screen.getByRole("button", { name: "Switch token" }));
+    const select = screen.getByLabelText("Switch this run's Anthropic token") as HTMLSelectElement;
+
+    const unavailable = (await within(select).findByRole("option", { name: /deleted-key.*unavailable/i })) as HTMLOptionElement;
+    expect(select.value).toBe(unavailable.value);
+    const confirm = screen.getByRole("button", { name: "Switch to this token" }) as HTMLButtonElement;
+    expect(confirm.disabled).toBe(true);
+  });
+});

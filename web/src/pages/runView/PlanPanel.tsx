@@ -7,11 +7,8 @@ import {
   type Worker,
 } from "../../lib/api";
 import { errorMessage } from "../../lib/apiError";
-import {
-  INHERIT_SELECTION,
-  runCredentialBody,
-  type CredentialSelection,
-} from "../../lib/credentialOverride";
+import { runCredentialBody } from "../../lib/credentialOverride";
+import { useSeededCredential } from "../../lib/useSeededCredential";
 import { stripUnsafeChars } from "../../lib/safeText";
 import { effectiveWorkerCaps } from "../../lib/workerCaps";
 import { AgentPicker, selectionLabel, type OwnTemplate } from "../../components/AgentPicker";
@@ -194,18 +191,29 @@ export function PlanPanel({
   });
   const onSelectionChange = useCallback((s: AgentSelectionInput) => setSelection(s), []);
 
-  // PRD #1247 M7: the token the IMPLEMENTATION phase runs on, chosen at the gate.
-  // Default inherit (shown explicitly) — the run keeps the worker binding. On approve,
-  // a non-inherit choice is set via api.setRunCredential BEFORE the approve submits, so
-  // the run implements on the chosen token; inherit does nothing extra. The credential
-  // call stays HERE (not folded into onApprove's args) so the existing onApprove
-  // contract — and its tests — are untouched.
-  const [credential, setCredential] = useState<CredentialSelection>(INHERIT_SELECTION);
+  // PRD #1247 M7: the token the IMPLEMENTATION phase runs on, chosen at the gate. Seeded
+  // from the run's stored override (a pinned label→id resolved once the token list loads,
+  // touched-ref guarded) so the picker shows the run's CURRENT choice, not a misleading
+  // "inherit". On approve, a CHANGED non-inherit choice is set via api.setRunCredential
+  // BEFORE the approve submits; an UNTOUCHED picker sends nothing (a no-op that PRESERVES
+  // the create-time override), and a genuine inherit pick still omits (runCredentialBody,
+  // the create-time body rule). The credential call stays HERE (not folded into
+  // onApprove's args) so the existing onApprove contract — and its tests — are untouched.
+  const {
+    selection: credential,
+    onSelectionChange: onCredentialChange,
+    tokens: credentialTokens,
+    touched: credentialTouched,
+  } = useSeededCredential(run.credential_override, { enabled: canSteer });
   const [credentialError, setCredentialError] = useState("");
   const doApprove = useCallback(
     async (withOverride: boolean) => {
       setCredentialError("");
-      const body = runCredentialBody(credential);
+      // Only (re)set the token when the user CHANGED the gate picker: leaving the seeded
+      // choice untouched keeps the run's create-time override (sending nothing is a no-op
+      // that preserves it), whereas re-sending the same value would be redundant. A
+      // genuine inherit pick still omits (runCredentialBody), the create-time rule.
+      const body = credentialTouched ? runCredentialBody(credential) : undefined;
       if (body) {
         try {
           await api.setRunCredential(run.id, body);
@@ -222,7 +230,7 @@ export function PlanPanel({
       if (withOverride) onApprove(selection, true);
       else onApprove(selection);
     },
-    [credential, run.id, onApprove, selection],
+    [credential, credentialTouched, run.id, onApprove, selection],
   );
 
   const activeRoster = selection.source === "repo" ? repoAgents.map((a) => a.name) : ownTemplates.map((t) => t.name);
@@ -349,8 +357,10 @@ export function PlanPanel({
         )}
 
         {/* PRD #1247 M7: the gate token picker — the natural sibling of the agent picker.
-            Choose the Anthropic token the implementation phase runs on; inherit (default,
-            shown explicitly) keeps the worker binding. Owner-gated like the AgentPicker. */}
+            Choose the Anthropic token the implementation phase runs on. Seeded from the
+            run's stored override so it shows the CURRENT choice (a pinned label→id resolved
+            once the list loads); a run with no override seeds to inherit. Owner-gated like
+            the AgentPicker. */}
         {canSteer && (
           <Field label="Anthropic token" htmlFor="plan-gate-token">
             <TokenPicker
@@ -358,11 +368,14 @@ export function PlanPanel({
               label="Anthropic token for the implementation phase"
               className="h-9 max-w-xs text-sm"
               value={credential}
-              onChange={setCredential}
+              onChange={onCredentialChange}
+              tokens={credentialTokens}
               disabled={busy}
             />
             <p className="mt-1 text-[11px] text-faint">
-              The implementation phase runs on this token. Inherit keeps the worker&rsquo;s current binding.
+              {run.credential_override
+                ? "The implementation phase runs on this token. Leaving the current choice keeps this run’s override."
+                : "The implementation phase runs on this token. Inherit keeps the worker’s current binding."}
             </p>
           </Field>
         )}

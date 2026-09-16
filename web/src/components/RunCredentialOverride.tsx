@@ -14,12 +14,11 @@ import { api, type CredentialEpoch, type CredentialOverride, type Run, type Secr
 import { errorMessage } from "../lib/apiError";
 import {
   isCredentialSwitchRefusedLane,
-  selectionFromOverride,
   setTokenBody,
-  type CredentialSelection,
 } from "../lib/credentialOverride";
 import { isTerminalRun } from "../lib/runStatus";
 import { sanitizeLabel } from "../lib/sanitizeLabel";
+import { useSeededCredential } from "../lib/useSeededCredential";
 import { TokenPicker } from "./TokenPicker";
 import { Alert, Badge, Button } from "./ui";
 
@@ -144,9 +143,18 @@ export function SwitchTokenAction({
   onSwitched?: (run: Run) => void;
 }) {
   const [open, setOpen] = useState(false);
-  const [selection, setSelection] = useState<CredentialSelection>(
-    selectionFromOverride(run.credential_override, tokens ?? []),
-  );
+  // Seed the picker from the run's stored override, and re-resolve a pinned label→id once
+  // the token list loads (self-fetched when none is injected), so a run pinned to an
+  // EXISTING token opens with that token SELECTED and the confirm ENABLED — never as a
+  // spurious "(unavailable)". A touched ref freezes the async re-seed behind a live edit,
+  // mirroring the ScheduleModal pattern. The picker (hence the fetch) only shows for a
+  // steering owner on a non-refused, non-terminal run, so gate `enabled` on that.
+  const pickerVisible = canSteer && !isCredentialSwitchRefusedLane(run) && !isTerminalRun(run.status);
+  const {
+    tokens: pickerTokens,
+    selection,
+    onSelectionChange,
+  } = useSeededCredential(run.credential_override, { tokens, enabled: pickerVisible });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [warning, setWarning] = useState("");
@@ -195,8 +203,8 @@ export function SwitchTokenAction({
             label="Switch this run's Anthropic token"
             className="h-8 w-full text-xs"
             value={selection}
-            onChange={setSelection}
-            tokens={tokens}
+            onChange={onSelectionChange}
+            tokens={pickerTokens}
             disabled={busy}
           />
           {willInterrupt && (
