@@ -350,6 +350,19 @@ func TestOnlyEnabled(t *testing.T) {
 	if onlyEnabled(apitypes.ScheduleRequest{Enabled: &yes, RepoID: "some-id"}) {
 		t.Fatalf("enabled + repo_id is NOT onlyEnabled (else the repoint is dropped)")
 	}
+	// enabled + a PRESENT credential_override is a config PATCH, not enabled-only: it must
+	// NOT short-circuit, or the override would be silently dropped (PRD #1247 M6, the same
+	// bug class as model/override_subagent_model/repo_id above). A PRESENT wrapper — even one
+	// carrying an explicit inherit/null — trips the presence conjunct.
+	if onlyEnabled(apitypes.ScheduleRequest{Enabled: &yes, CredentialOverride: apitypes.OptionalCredentialOverride{Present: true, Value: &apitypes.CredentialOverrideRequest{Mode: "auto"}}}) {
+		t.Fatalf("enabled + credential_override is NOT onlyEnabled (else the override is dropped)")
+	}
+	// enabled + an OMITTED credential_override (Present:false, the zero-value wrapper) is
+	// STILL enabled-only: the presence conjunct must not over-trip on the zero value, or a
+	// bare pause/resume would be forced down the full config path (PRD #1247 M6).
+	if !onlyEnabled(apitypes.ScheduleRequest{Enabled: &yes, CredentialOverride: apitypes.OptionalCredentialOverride{Present: false}}) {
+		t.Fatalf("enabled + an omitted credential_override should still be onlyEnabled")
+	}
 	if onlyEnabled(apitypes.ScheduleRequest{}) {
 		t.Fatalf("a patch with no enabled is not onlyEnabled")
 	}
