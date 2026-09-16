@@ -13,7 +13,6 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 import { WorkerClient, readRunAck } from "../src/client.js";
-import { MessageBatcher } from "../src/batcher.js";
 import { nullLogger } from "./helpers.js";
 
 const TOKEN = "worker-join-token-0123456789";
@@ -149,42 +148,3 @@ describe("getInputs — PRD #1247 M5 credential_switch signal", () => {
   });
 });
 
-// The byte-shape guarantee: with no claim generation set, the /messages body is byte-identical to
-// today's `{messages}` (no claim_generation key); with one set — by the constructor arg or the
-// setter — every batch carries it. These prove the INERT default and the LATER unit's mechanism.
-describe("MessageBatcher — PRD #1247 M5 claim_generation stamping", () => {
-  function messagePosts(requests: CapturedRequest[]): CapturedRequest[] {
-    return requests.filter((r) => r.method === "POST" && r.path.endsWith("/messages"));
-  }
-
-  it("omits claim_generation entirely when the batcher has none set (byte-identical)", async () => {
-    const { url, requests } = await start(() => ({ status: 200, body: { accepted: 1 } }));
-    const batcher = new MessageBatcher(newClient(url), "run-1", 0, 0, nullLogger());
-    batcher.emit({ kind: "text", payload: { i: 1 } });
-    await batcher.close();
-    const posts = messagePosts(requests);
-    assert.strictEqual(posts.length, 1);
-    assert.ok(Array.isArray(posts[0]!.body.messages), "the batch still carries messages[]");
-    assert.strictEqual("claim_generation" in posts[0]!.body, false, "no claim_generation key on the wire");
-  });
-
-  it("stamps claim_generation on the batch when passed to the constructor", async () => {
-    const { url, requests } = await start(() => ({ status: 200, body: { accepted: 1 } }));
-    const batcher = new MessageBatcher(newClient(url), "run-1", 0, 0, nullLogger(), undefined, undefined, {}, 42);
-    batcher.emit({ kind: "text", payload: { i: 1 } });
-    await batcher.close();
-    const posts = messagePosts(requests);
-    assert.strictEqual(posts.length, 1);
-    assert.strictEqual(posts[0]!.body.claim_generation, 42);
-  });
-
-  it("stamps a claim_generation set after construction via setClaimGeneration", async () => {
-    const { url, requests } = await start(() => ({ status: 200, body: { accepted: 1 } }));
-    const batcher = new MessageBatcher(newClient(url), "run-1", 0, 0, nullLogger());
-    batcher.setClaimGeneration(99);
-    batcher.emit({ kind: "text", payload: { i: 1 } });
-    await batcher.close();
-    const posts = messagePosts(requests);
-    assert.strictEqual(posts[0]!.body.claim_generation, 99);
-  });
-});

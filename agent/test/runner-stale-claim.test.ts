@@ -1,15 +1,16 @@
 // PRD #1247 M5b — the transport-behavior half of the held-state credential switch (worker side).
 //
-// This unit makes the worker (1) STAMP its claim-lane generation on every mutating /state report
-// and every message batch, and (2) STOP a flight the moment a report is answered with the
+// This unit makes the worker (1) STAMP its claim-lane generation on every mutating /state report,
+// and (2) STOP a flight the moment a report is answered with the
 // stale_claim disposition (a held-state switch RELEASED the claim, or a reclaim SUPERSEDED it) —
 // without a terminal report and without a preserve flag. It advertises NO capability and does NOT
 // implement the release itself, so it is transparent in normal operation: stamping a generation
 // the server's fence already matches changes no outcome (the back-compat test below).
 //
 // The generation stamping is driven end-to-end through the runner (buildFlight wires the batcher
-// from claim.claim_generation and the reportState closure stamps it), so these are RUNNER tests:
-// the batcher/client-level omit-vs-stamp byte shape is pinned separately in credential-switch.test.ts.
+// from claim.claim_generation and the reportState closure stamps it), so these are RUNNER tests.
+// Message-batch generation stamping is the shared #1391 wire, feature-gated on
+// `claim_generation_fence`; its omit-vs-stamp byte shape is pinned in client-negotiation.test.ts.
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
@@ -35,7 +36,7 @@ import {
 installHarness();
 
 describe("RunRunner — PRD #1247 M5b claim_generation stamping", () => {
-  it("stamps the claim's generation on every /state report and message batch, and completes normally", async () => {
+  it("stamps the claim's generation on every /state report, and completes normally", async () => {
     const { gitlab } = fakeGitlab();
     // The fake SDK query commits nothing; model committed work so the zero-diff guard does not
     // fail this happy path (issue #279).
@@ -67,18 +68,10 @@ describe("RunRunner — PRD #1247 M5b claim_generation stamping", () => {
       states.some((s) => s.status === "completed"),
       "the flight completed normally (a matching generation is a no-op)",
     );
-
-    // Every message batch the batcher flushed carries the same generation (the batcher was
-    // wired from the claim), never omitted.
-    const batches = api.messageBatches.filter((b) => b.runId === claim.run_id);
-    assert.ok(batches.length > 0, "the run flushed at least one message batch");
-    for (const b of batches) {
-      assert.strictEqual(
-        b.claim_generation,
-        GEN,
-        "every message batch carries the claim's generation",
-      );
-    }
+    // Message-batch generation stamping is the shared #1391 wire (feature-gated on
+    // `claim_generation_fence`), pinned by byte shape in client-negotiation.test.ts; the batcher is
+    // wired from claim.claim_generation at construction. This runner test owns the #1247-specific
+    // half: the /state reportState closure stamps every report unconditionally.
   });
 
   it("stamps a generation of 0 when the claim omits it (server-side NOT NULL DEFAULT 0)", async () => {
