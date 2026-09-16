@@ -183,7 +183,7 @@ export class JudgeRunner {
       // fallback + `completed` report, not throw out of execute() and leave the judge run
       // non-terminal — execute()'s never-throws contract (above). started_at simply stays
       // NULL on that rare path, so the panel shows no duration rather than losing the run.
-      await this.client.reportState(judgeRunId, {
+      const runningAck = await this.client.reportState(judgeRunId, {
         status: "running",
         // PRD #1247 M2 fix round: this runner reports state DIRECTLY (not through the RunRunner
         // stamping closure), so it threads the claim's run-lane generation onto the report itself
@@ -191,6 +191,20 @@ export class JudgeRunner {
         // worker's judge run is fenced, not refused with a 409.
         claim_generation: claim.claim_generation,
       });
+      // PRD #1247 fix round (Greptile P1): a judge claim SUPERSEDED by an ordinary stale-worker
+      // requeue + reclaim (which bumps the run-lane generation) gets staleClaim on this first
+      // report. postReview does NOT fence on generation, so a superseded flight would overwrite
+      // the current verdict. Abandon cleanly BEFORE any trace/model/advice/completed/failed work.
+      // A normal RETURN, not a throw: throwing here would fall through to the catch's
+      // deterministic-fallback `completed` report, which would ALSO overwrite. This closes only
+      // the INITIAL-stale window; the atomic fence for post-ack supersession + the ungenerationed
+      // postReview write is a follow-up (issue #1423).
+      if (runningAck?.staleClaim) {
+        this.log.warn("judge claim superseded (stale) at running report; abandoning without posting", {
+          run_id: judgeRunId,
+        });
+        return;
+      }
       const trace = await this.fetchTrace(targetId);
       const token = claim.secrets?.anthropic_oauth_token?.trim();
       if (!token) {
@@ -222,6 +236,24 @@ export class JudgeRunner {
           [{ seq: 1, kind: usageMessage.kind, agent: JUDGE_AGENT, payload: usageMessage.payload }],
           claim.claim_generation,
         );
+      }
+      // PRD #1247 fix round (Greptile P1, pre-post probe): the initial running ack closes only the
+      // pre-model window. A judge model call can run minutes while a stale-worker requeue (~45s)
+      // plus a same-worker reclaim (concurrency 2) advances the run to G+1 mid-flight; postReview
+      // authorizes on worker+nonterminal ONLY (no generation fence), so a stale G flight could
+      // overwrite G+1's verdict. Re-probe with an idempotent running report (SetRunRunning
+      // preserves status_since) IMMEDIATELY before the advice write; a stale ack abandons before
+      // postReview. A residual sub-RPC TOCTOU and the ungenerationed advice write itself remain for
+      // the atomic-fence follow-up (issue #1423).
+      const prePostAck = await this.client.reportState(judgeRunId, {
+        status: "running",
+        claim_generation: claim.claim_generation,
+      });
+      if (prePostAck?.staleClaim) {
+        this.log.warn("judge claim superseded (stale) before posting review; abandoning without posting", {
+          run_id: judgeRunId,
+        });
+        return;
       }
       await this.client.postReview(targetId, review);
       await this.client.reportState(judgeRunId, {

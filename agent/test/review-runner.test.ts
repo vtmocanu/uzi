@@ -54,6 +54,33 @@ function fencedFakeClient() {
   return { client, calls };
 }
 
+// A fake api that returns staleClaim on the INITIAL `running` report — models a review claim
+// SUPERSEDED by an ordinary stale-worker requeue + reclaim. PRD #1247 fix round (Greptile P1):
+// the runner must abandon cleanly BEFORE any clone/diff/model/advice/completed/failed work, so a
+// superseded flight cannot overwrite the current review.
+function staleRunningFakeClient(staleOnRunningIndex = 1) {
+  let runningCount = 0;
+  const calls: {
+    review?: { id: string; review: TaskReviewRequest };
+    states: { id: string; body: StateRequest }[];
+  } = { states: [] };
+  const client = {
+    reportState: async (id: string, body: StateRequest) => {
+      calls.states.push({ id, body });
+      if (body.status === "running") {
+        runningCount++;
+        if (runningCount === staleOnRunningIndex) return { applied: false, staleClaim: true } as never;
+        return { applied: true, status: "running" } as never;
+      }
+      return { applied: true, status: body.status } as never;
+    },
+    postTaskReview: async (id: string, review: TaskReviewRequest) => {
+      calls.review = { id, review };
+    },
+  } as unknown as WorkerClient;
+  return { client, calls };
+}
+
 // A fake git layer: records the clone + diff calls, and carries SPY counters on the
 // push/fetch-back functions a run lane would use — a review must never touch them, so
 // the assertions below on these counters are the non-vacuous no-push/no-MR proof.
@@ -189,9 +216,11 @@ describe("ReviewRunner", () => {
     await runner.execute(reviewClaim({ claim_generation: 9 }));
 
     const mutating = calls.states.filter((s) => s.body.status === "running" || s.body.status === "completed");
+    // PRD #1247 fix round adds a SECOND idempotent `running` probe immediately before the advice
+    // write, so the happy path is running (initial) → running (pre-post probe) → completed.
     assert.deepEqual(
       mutating.map((s) => s.body.status),
-      ["running", "completed"],
+      ["running", "running", "completed"],
     );
     for (const s of mutating) {
       assert.equal(s.body.claim_generation, 9, `the ${s.body.status} report carries the claim generation`);
@@ -220,13 +249,53 @@ describe("ReviewRunner", () => {
     assert.deepEqual(calls.refused, [], "the fence refuses no mutating report — all carry the generation");
     assert.deepEqual(
       calls.accepted.map((s) => s.body.status),
-      ["running", "completed"],
-      "both mutating reports are accepted by the fence",
+      ["running", "running", "completed"],
+      "all mutating reports (initial running, pre-post running probe, completed) are accepted by the fence",
     );
     for (const s of calls.accepted) {
       assert.equal(s.body.claim_generation, 7, `the accepted ${s.body.status} report carries the claim generation`);
     }
     assert.equal(calls.review?.review.status, "complete", "the review still posts on the accepted lane");
+  });
+
+  // PRD #1247 fix round (Greptile P1): a review claim superseded before its first report gets
+  // staleClaim on `running`; the runner must ABANDON cleanly — no clone, no diff, no model, no
+  // advice POST, no completed/failed report — so a stale flight cannot overwrite the current review.
+  it("abandons a stale-claimed review run at the running report with zero clone/diff/advice work (PRD #1247 fix round)", async () => {
+    const { client, calls } = staleRunningFakeClient(1);
+    const { git, calls: gitCalls } = fakeGit("diff --git a/x b/x\n+one\n");
+    const runner = new ReviewRunner(client, git, nullLogger(), { queryFn: forbiddenQueryFn() });
+    await runner.execute(reviewClaim({ claim_generation: 5 }));
+
+    assert.deepEqual(
+      calls.states.map((s) => s.body.status),
+      ["running"],
+      "only the running report is sent; no completed/failed after staleClaim",
+    );
+    assert.equal(gitCalls.ensureClone, 0, "no clone after a stale running ack");
+    assert.deepEqual(gitCalls.reviewDiff, [], "no diff after a stale running ack");
+    assert.equal(calls.review, undefined, "no task review is posted after a stale running ack");
+  });
+
+  // PRD #1247 fix round (Greptile P1, pre-post probe): the most reachable window — the model runs
+  // (minutes) while a stale requeue + same-worker reclaim advances the run to G+1. The initial ack
+  // was fresh, so the clone/diff/model run; the PRE-POST probe catches the supersession and abandons
+  // BEFORE the advice write, so the stale flight posts NO review and NO completed. Reverting the
+  // pre-post probe reddens this (the runner would postTaskReview + completed on the superseded flight).
+  it("abandons a stale-claimed review run at the pre-post probe with zero advice/completed posts (PRD #1247 fix round)", async () => {
+    const { client, calls } = staleRunningFakeClient(2);
+    const { git, calls: gitCalls } = fakeGit("diff --git a/poller.ts b/poller.ts\n@@ -1 +1 @@\n-old\n+new\n");
+    const runner = new ReviewRunner(client, git, nullLogger(), { queryFn: replyingQueryFn(goodModelJson) });
+    await runner.execute(reviewClaim({ claim_generation: 5 }));
+
+    assert.deepEqual(
+      calls.states.map((s) => s.body.status),
+      ["running", "running"],
+      "the initial running is fresh; the pre-post probe is stale, so no completed/failed follows",
+    );
+    assert.equal(gitCalls.ensureClone, 1, "the clone/diff/model DID run before the pre-post probe");
+    assert.equal(gitCalls.reviewDiff.length, 1, "the diff was computed before the pre-post probe");
+    assert.equal(calls.review, undefined, "no task review is posted when the pre-post probe is stale");
   });
 
   it("posts zero findings WITHOUT calling the model on an empty diff", async () => {

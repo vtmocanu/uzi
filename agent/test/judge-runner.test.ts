@@ -81,6 +81,43 @@ function fencedFakeClient(trace: JudgeTraceResponse) {
   return { client, calls };
 }
 
+// A fake api that returns staleClaim on the Nth `running` report — models a judge claim
+// SUPERSEDED by an ordinary stale-worker requeue + reclaim. PRD #1247 fix round (Greptile P1):
+// the runner must abandon cleanly on staleClaim, whether it fires on the INITIAL ack (index 1,
+// before any trace/model/advice) or on the PRE-POST probe (index 2, after the model but before the
+// advice write). `traceFetched` proves whether the model path ran.
+function staleRunningFakeClient(trace: JudgeTraceResponse, staleOnRunningIndex = 1) {
+  let runningCount = 0;
+  const calls: {
+    review?: { id: string; review: ReviewRequest };
+    states: { id: string; body: StateRequest }[];
+    messages: { id: string; messages: OutgoingMessage[]; generation?: number }[];
+    traceFetched: boolean;
+  } = { states: [], messages: [], traceFetched: false };
+  const client = {
+    getTrace: async () => {
+      calls.traceFetched = true;
+      return trace;
+    },
+    postReview: async (id: string, review: ReviewRequest) => {
+      calls.review = { id, review };
+    },
+    reportState: async (id: string, body: StateRequest) => {
+      calls.states.push({ id, body });
+      if (body.status === "running") {
+        runningCount++;
+        if (runningCount === staleOnRunningIndex) return { applied: false, staleClaim: true } as never;
+        return { applied: true, status: "running" } as never;
+      }
+      return { applied: true, status: body.status } as never;
+    },
+    postMessages: async (id: string, messages: OutgoingMessage[], generation?: number) => {
+      calls.messages.push({ id, messages, generation });
+    },
+  } as unknown as WorkerClient;
+  return { client, calls };
+}
+
 const emptyTrace: JudgeTraceResponse = {
   target: {
     id: "target-1",
@@ -171,11 +208,13 @@ describe("JudgeRunner", () => {
     await runner.execute(judgeClaim());
 
     // A `running` report precedes the terminal `completed` one — this is what stamps the
-    // judge run's started_at, giving the reviewed run's panel a duration to show.
+    // judge run's started_at, giving the reviewed run's panel a duration to show. PRD #1247 fix
+    // round adds a SECOND idempotent `running` probe immediately before the advice write, so the
+    // happy path is running (initial) → running (pre-post probe) → completed.
     assert.deepEqual(
       calls.states.map((s) => s.body.status),
-      ["running", "completed"],
-      "the judge must report running before completed",
+      ["running", "running", "completed"],
+      "the judge reports running, re-probes running before posting, then completed",
     );
     // Exactly one usage frame posted, on the judge run, carrying a result event and the
     // non-empty per-model usage the API folds into run_usage.
@@ -204,7 +243,7 @@ describe("JudgeRunner", () => {
 
     assert.deepEqual(
       calls.states.map((s) => s.body.status),
-      ["running", "completed"],
+      ["running", "running", "completed"],
     );
     for (const s of calls.states) {
       assert.equal(s.body.claim_generation, 9, `the ${s.body.status} report carries the claim generation`);
@@ -234,14 +273,59 @@ describe("JudgeRunner", () => {
     assert.deepEqual(calls.refused, [], "the fence refuses no mutating report — all carry the generation");
     assert.deepEqual(
       calls.accepted.map((s) => s.body.status),
-      ["running", "completed"],
-      "both mutating reports are accepted by the fence",
+      ["running", "running", "completed"],
+      "all mutating reports (initial running, pre-post running probe, completed) are accepted by the fence",
     );
     for (const s of calls.accepted) {
       assert.equal(s.body.claim_generation, 7, `the accepted ${s.body.status} report carries the claim generation`);
     }
     assert.equal(calls.messages[0]?.generation, 7, "the usage batch rides the send-gate with the generation");
     assert.equal(calls.review?.review.verdict, "ok", "the review still posts on the accepted lane");
+  });
+
+  // PRD #1247 fix round (Greptile P1): a judge claim superseded before its first report gets
+  // staleClaim on `running`; the runner must ABANDON cleanly — no trace, no model, no advice
+  // POST, no completed/failed report — so a stale flight cannot overwrite the current verdict.
+  // Reverting the early return reddens this (the runner would fetch the trace and post a review).
+  it("abandons a stale-claimed judge run at the running report with zero downstream posts (PRD #1247 fix round)", async () => {
+    let modelCalled = false;
+    const { client, calls } = staleRunningFakeClient(emptyTrace);
+    const queryFn = async function* () {
+      modelCalled = true;
+      yield { type: "result", subtype: "success", is_error: false };
+    } as unknown as SdkQueryFn;
+    const runner = new JudgeRunner(client, nullLogger(), { queryFn });
+    await runner.execute(judgeClaim({ claim_generation: 5 }));
+
+    assert.deepEqual(
+      calls.states.map((s) => s.body.status),
+      ["running"],
+      "only the running report is sent; no completed/failed after staleClaim",
+    );
+    assert.equal(calls.traceFetched, false, "no trace is fetched after a stale running ack");
+    assert.equal(modelCalled, false, "no model call after a stale running ack");
+    assert.equal(calls.review, undefined, "no review is posted after a stale running ack");
+    assert.equal(calls.messages.length, 0, "no usage frame is posted after a stale running ack");
+  });
+
+  // PRD #1247 fix round (Greptile P1, pre-post probe): the most reachable window — the model runs
+  // (minutes) while a stale requeue + same-worker reclaim advances the run to G+1. The initial ack
+  // was fresh, so the model runs; the PRE-POST probe catches the supersession and abandons BEFORE
+  // the advice write, so the stale flight posts NO review and NO completed. Reverting the pre-post
+  // probe reddens this (the runner would postReview + completed on the superseded flight).
+  it("abandons a stale-claimed judge run at the pre-post probe with zero advice/completed posts (PRD #1247 fix round)", async () => {
+    const { client, calls } = staleRunningFakeClient(emptyTrace, 2);
+    const modelJson = JSON.stringify({ verdict: "ok", summary: "s", recommendations: [] });
+    const runner = new JudgeRunner(client, nullLogger(), { queryFn: replyingQueryFn(modelJson) });
+    await runner.execute(judgeClaim({ claim_generation: 5 }));
+
+    assert.deepEqual(
+      calls.states.map((s) => s.body.status),
+      ["running", "running"],
+      "the initial running is fresh; the pre-post probe is stale, so no completed/failed follows",
+    );
+    assert.equal(calls.traceFetched, true, "the model path DID run before the pre-post probe");
+    assert.equal(calls.review, undefined, "no review is posted when the pre-post probe is stale");
   });
 
   it("posts NO usage frame on the model-error path (PRD #69 M6)", async () => {
@@ -251,10 +335,11 @@ describe("JudgeRunner", () => {
 
     // The deterministic-fallback path records no real spend, so no usage frame is posted.
     assert.equal(calls.messages.length, 0, "an error result must not post a usage frame");
-    // The run still reports running then completes with the fallback review.
+    // The run still reports running, re-probes running before posting, then completes with the
+    // fallback review.
     assert.deepEqual(
       calls.states.map((s) => s.body.status),
-      ["running", "completed"],
+      ["running", "running", "completed"],
     );
   });
 
