@@ -860,20 +860,29 @@ export class WorkerClient {
       claimGeneration?: number;
     },
   ): Promise<{ unmet: string[]; attemptCount: number }> {
-    const body: CompletionAttemptRequest = {
-      milestones_completed: args.milestonesCompleted,
-      head: args.head,
-      worktree_fingerprint: args.worktreeFingerprint,
-    };
-    // PRD #1247 M5: a capability worker stamps its claim-lane generation so the server's fence can
-    // engage — a released/superseded stale flight's attempt then records nothing. Optional +
-    // additive: unset (legacy) leaves the body unchanged and the attempt is unfenced (mirrors
-    // postMessages).
-    if (args.claimGeneration !== undefined) body.claim_generation = args.claimGeneration;
-    const res = (await this.postJSON(
-      `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/completion/attempt`,
-      body,
-    )) as CompletionAttemptResponse;
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/completion/attempt`;
+    // PRD #1247 fix round: stamp the claim-lane generation through the shared send-gate so a
+    // completion attempt racing a rollback recovers instead of hard-400ing. A
+    // credential_switch_v1 capability worker stamps OPTIMISTICALLY (its runs are fenced
+    // server-side, so a register that missed the negotiated `claim_generation_fence` feature
+    // under rollout skew must not silently drop the fence); a non-capability (#1391-era) worker
+    // keeps the feature gate; `0`/unset omits the field. On the EXACT strict-decode 400 from a
+    // rolled-back api the field is stripped and the identical attempt retried ONCE — the
+    // recompute+attempt is server-authoritative in ONE call, so the first (rejected) request
+    // records nothing and the stripped retry applies exactly once. A capability worker stays
+    // optimistic (features NOT cleared, self-recovers once the api rolls forward); a
+    // non-capability worker clears them (sticky, as today). A genuine business 400 (e.g. "not
+    // interlocked") is NOT a strict-decode 400 and propagates unchanged — no strip, no retry.
+    const included = this.includeClaimGeneration(args.claimGeneration);
+    const res = (await this.withGenerationFallback(included, (includeField) => {
+      const body: CompletionAttemptRequest = {
+        milestones_completed: args.milestonesCompleted,
+        head: args.head,
+        worktree_fingerprint: args.worktreeFingerprint,
+      };
+      if (includeField) body.claim_generation = args.claimGeneration;
+      return this.postJSON(path, body);
+    })) as CompletionAttemptResponse;
     return { unmet: res.unmet ?? [], attemptCount: res.attempt_count ?? 0 };
   }
 
@@ -888,18 +897,29 @@ export class WorkerClient {
     runId: string,
     args: { contractRevision: number; branch: string; head: string; claimGeneration?: number },
   ): Promise<CompletionPermitResult> {
-    const body: CompletionPermitRequest = {
-      contract_revision: args.contractRevision,
-      branch: args.branch,
-      head: args.head,
-    };
-    // PRD #1247 M5: stamp the claim-lane generation so the server refuses to issue a permit for a
-    // released/superseded stale flight. Optional + additive (unset = legacy, unfenced).
-    if (args.claimGeneration !== undefined) body.claim_generation = args.claimGeneration;
-    const res = (await this.postJSON(
-      `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/completion/permit`,
-      body,
-    )) as CompletionPermitResponse;
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/completion/permit`;
+    // PRD #1247 fix round: stamp the claim-lane generation through the shared send-gate so a
+    // permit request racing a rollback recovers instead of hard-400ing. A credential_switch_v1
+    // capability worker stamps OPTIMISTICALLY (its runs are fenced server-side, so a register
+    // that missed the negotiated `claim_generation_fence` feature under rollout skew must not
+    // silently drop the fence); a non-capability (#1391-era) worker keeps the feature gate;
+    // `0`/unset omits the field. On the EXACT strict-decode 400 from a rolled-back api the field
+    // is stripped and the identical request retried ONCE — permit ISSUANCE is idempotent
+    // server-side, and the first (rejected) request issues nothing, so the stripped retry issues
+    // exactly once. A capability worker stays optimistic (features NOT cleared, self-recovers
+    // once the api rolls forward); a non-capability worker clears them (sticky, as today). A
+    // granted:false denial is a 200 body, not an error, so it never reaches the fallback; a
+    // genuine transport/HTTP 400 that is NOT a strict-decode 400 propagates unchanged.
+    const included = this.includeClaimGeneration(args.claimGeneration);
+    const res = (await this.withGenerationFallback(included, (includeField) => {
+      const body: CompletionPermitRequest = {
+        contract_revision: args.contractRevision,
+        branch: args.branch,
+        head: args.head,
+      };
+      if (includeField) body.claim_generation = args.claimGeneration;
+      return this.postJSON(path, body);
+    })) as CompletionPermitResponse;
     const result: CompletionPermitResult = { granted: res.granted ?? false };
     if (res.deny_reason !== undefined) result.denyReason = res.deny_reason;
     if (res.unmet !== undefined) result.unmet = res.unmet;
@@ -930,20 +950,34 @@ export class WorkerClient {
     args: { head: string; claimGeneration?: number },
   ): Promise<{ status: string }> {
     const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/completion/hold`;
-    // PRD #1247 M5: stamp the claim-lane generation so the server refuses to park a
-    // released/superseded stale flight's reclaimed run. Optional + additive (unset = legacy,
-    // unfenced) — the body is byte-identical to `{head}` when it is omitted.
-    const body: { head: string; claim_generation?: number } = { head: args.head };
-    if (args.claimGeneration !== undefined) body.claim_generation = args.claimGeneration;
-    const res = await this.fetchRaw("POST", path, body);
-    if (res.status === 200 || res.status === 409) {
-      const fields = await readRunAck(res);
-      return { status: fields.status ?? "" };
-    }
-    if (res.status >= 400) throw await this.toError("POST", path, res);
-    // A 2xx we do not model (e.g. 204 from an older server): no status came back, which is
-    // not "paused" and so retains the run.
-    return { status: "" };
+    // PRD #1247 fix round: stamp the claim-lane generation through the shared send-gate so a
+    // hold request racing a rollback recovers instead of hard-400ing. A credential_switch_v1
+    // capability worker stamps OPTIMISTICALLY (its runs are fenced server-side, so a register
+    // that missed the negotiated `claim_generation_fence` feature under rollout skew must not
+    // silently drop the fence); a non-capability (#1391-era) worker keeps the feature gate;
+    // `0`/unset omits the field. The whole fetchRaw + 200/409 readRunAck read runs INSIDE the
+    // closure, so a stripped retry re-runs the identical request and preserves the 200/409
+    // semantics (a 409 is a refusal that RETAINS the run, NOT an error — it returns the run's
+    // real status). Only a genuine non-200/409 throw reaches the fallback; a rolled-back api
+    // answers the completion fence field with a strict-decode 400 (NOT a 409), which the fallback
+    // catches and retries stripped ONCE — the first (rejected) request parks nothing, so the
+    // retry applies exactly once. A capability worker stays optimistic (features NOT cleared,
+    // self-recovers once the api rolls forward); a non-capability worker clears them (sticky, as
+    // today). A genuine non-200/409 4xx/5xx that is NOT a strict-decode 400 propagates unchanged.
+    const included = this.includeClaimGeneration(args.claimGeneration);
+    return this.withGenerationFallback(included, async (includeField) => {
+      const body: { head: string; claim_generation?: number } = { head: args.head };
+      if (includeField) body.claim_generation = args.claimGeneration;
+      const res = await this.fetchRaw("POST", path, body);
+      if (res.status === 200 || res.status === 409) {
+        const fields = await readRunAck(res);
+        return { status: fields.status ?? "" };
+      }
+      if (res.status >= 400) throw await this.toError("POST", path, res);
+      // A 2xx we do not model (e.g. 204 from an older server): no status came back, which is
+      // not "paused" and so retains the run.
+      return { status: "" };
+    });
   }
 
   // ── Inline run summaries (PRD #362 M3c) ────────────────────────────────────
