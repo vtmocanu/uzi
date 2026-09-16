@@ -5222,8 +5222,8 @@ export class RunRunner {
               agent: "worker",
               payload: {
                 text: capture.published
-                  ? "paused to recover from an empty model result; the recovery checkpoint is published and it resumes automatically"
-                  : "paused to recover from an empty model result; the recovery checkpoint is saved on this worker and it resumes automatically",
+                  ? "paused to recover from a transient interruption; the recovery checkpoint is published and it resumes automatically"
+                  : "paused to recover from a transient interruption; the recovery checkpoint is saved on this worker and it resumes automatically",
               },
             });
             // PRD #1349 M2 (D3/D4): settle THIS generation's hold before the requeue. The

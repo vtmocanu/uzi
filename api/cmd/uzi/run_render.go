@@ -1020,12 +1020,13 @@ func steerState(kind string, consumedAt *time.Time, disposition *string, runStat
 	// PRD #754: a pool_wait run is HELD on an empty token pool, not a usage limit, so its
 	// suffix names the actual reason (distinct copy for a distinct hold).
 	const heldSuffix = " (run held on an empty token pool)"
-	// issue #1197: a recovery_wait run is parked recovering from a transient empty turn,
+	// issue #1197: a recovery_wait run is parked recovering from a transient interruption,
 	// neither a usage limit nor an empty pool, so its suffix names the actual reason.
 	// PRD #1392 M5: a forge-unreachable park names the forge instead — the compact core of
 	// the shared "waiting for the forge …" wording (the retry/cap detail is width-shed here,
-	// it lives on the fuller run-get notice and the web panel).
-	recoveringSuffix := " (run recovering from a transient empty turn)"
+	// it lives on the fuller run-get notice and the web panel). issue #1088 widened the
+	// non-forge cause to any transient interruption (a transient empty turn or provider outage).
+	recoveringSuffix := " (run recovering from a transient interruption)"
 	if len(recoveryCause) > 0 && recoveryCause[0] == forgeUnreachableCause {
 		recoveringSuffix = " (run waiting for the forge)"
 	}
@@ -1074,7 +1075,7 @@ func steerState(kind string, consumedAt *time.Time, disposition *string, runStat
 
 // forgeUnreachableCause is the RecoveryWaitCause a pre-clone forge-unreachable park writes
 // (PRD #1392 M1). It is the one recovery_wait cause that earns forge-specific surface
-// wording; a null/other cause keeps the generic transient-empty-turn wording (issue #1197).
+// wording; a null/other cause keeps the generic transient-interruption wording (issue #1197/#1088).
 const forgeUnreachableCause = "forge_unreachable"
 
 // isForgePark reports whether a recovery_wait run is parked because the forge was
