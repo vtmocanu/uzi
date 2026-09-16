@@ -90,6 +90,15 @@ type fakeStore struct {
 	recordedCreds  []store.SetRunAnthropicSecretParams
 	recordCredErr  error
 	recordCredRows *int64
+	// PRD #1247 M1: recordedEpochs is every RecordRunCredentialEpoch write in order (the
+	// attribution journal), recordEpochErr fails it. metaOfKindLookups records every
+	// kind-scoped by-id meta lookup (the override open + validator path), proving it is
+	// owner-AND-kind-scoped.
+	recordedEpochs    []store.RecordRunCredentialEpochParams
+	recordEpochErr    error
+	metaOfKindLookups []store.GetUserSecretMetaByIDOfKindParams
+	// credentialEpochs is what ListRunCredentialEpochs (the read side) returns.
+	credentialEpochs []store.RunCredentialEpoch
 	// autoCandidates is what M4's ranking query returns (PRD #111 M4) and
 	// autoCandidatesErr fails it. autoCandidateLookups records the user ids asked
 	// for — which is what proves the selector never ranks another tenant's tokens,
@@ -609,6 +618,22 @@ type fakeStore struct {
 	promotePoolWaitRows *int64
 	promotePoolWaitErr  error
 
+	// PRD #1247 M3 D8 duration-time re-evaluation. limitWaitReeval is what
+	// ListLimitWaitReeval returns (the still-parked worklist), limitWaitReevalErr fails
+	// that read, and limitWaitReevalAt records every `@now` the pass passed it.
+	// loweredLimitWait records every LowerLimitWaitRetryNow arg in order (so a test can
+	// assert WHICH run was lowered and that it was owner-scoped); lowerLimitWaitRows
+	// overrides the rows-affected (default 1; 0 models a run that moved out of limit_wait
+	// under the pass); lowerLimitWaitErr fails the lower. Like PromotePoolWaitRun, a
+	// successful lower DROPS the run from limitWaitReeval so a second Sweep on the same
+	// fake sees the remaining parked run — proving the one-per-owner-per-tick cap.
+	limitWaitReeval    []store.ListLimitWaitReevalRow
+	limitWaitReevalErr error
+	limitWaitReevalAt  []pgtype.Timestamptz
+	loweredLimitWait   []store.LowerLimitWaitRetryNowParams
+	lowerLimitWaitRows *int64
+	lowerLimitWaitErr  error
+
 	// PRD #217 M1: the park-time gauge write. markedFiveHour / markedSevenDay record
 	// every user_secret_id MarkFiveHourExhausted / MarkSevenDayExhausted was called
 	// with, in order, so a test can assert WHICH window a park marked down (and that
@@ -839,6 +864,44 @@ func (f *fakeStore) SetRunAnthropicSecret(_ context.Context, arg store.SetRunAnt
 	}
 	return 1, nil
 }
+
+// GetUserSecretMetaByIDOfKind mirrors the real kind-SCOPED by-id lookup (PRD #1247 M1):
+// owner-scoped AND kind-scoped, so a foreign id, a missing id, or a wrong-kind id all
+// yield pgx.ErrNoRows (never another tenant's or another kind's row). It reuses the
+// byIDSecrets fixtures a claim test already stages, keyed by id, so a run-override test
+// stages nothing new.
+func (f *fakeStore) GetUserSecretMetaByIDOfKind(_ context.Context, arg store.GetUserSecretMetaByIDOfKindParams) (store.GetUserSecretMetaByIDOfKindRow, error) {
+	f.metaOfKindLookups = append(f.metaOfKindLookups, arg)
+	row, ok := f.byIDSecrets[arg.ID]
+	if !ok {
+		return store.GetUserSecretMetaByIDOfKindRow{}, pgx.ErrNoRows
+	}
+	if row.UserID != uuid.Nil && row.UserID != arg.UserID {
+		return store.GetUserSecretMetaByIDOfKindRow{}, pgx.ErrNoRows
+	}
+	if row.Kind != "" && row.Kind != arg.Kind {
+		return store.GetUserSecretMetaByIDOfKindRow{}, pgx.ErrNoRows
+	}
+	label, ok := f.byIDLabels[arg.ID]
+	if !ok {
+		label = "token-" + arg.ID.String()[:8]
+	}
+	return store.GetUserSecretMetaByIDOfKindRow{ID: arg.ID, Label: label, Kind: arg.Kind}, nil
+}
+
+// RecordRunCredentialEpoch records the per-claim attribution-journal write (PRD #1247
+// M1), so a claim test can assert the epoch was appended (and, via recordEpochErr, that
+// a journal failure fails the claim).
+func (f *fakeStore) RecordRunCredentialEpoch(_ context.Context, arg store.RecordRunCredentialEpochParams) error {
+	f.recordedEpochs = append(f.recordedEpochs, arg)
+	return f.recordEpochErr
+}
+
+// ListRunCredentialEpochs is the read side backing RunCredentialEpochs; returns the
+// staged journal (empty by default).
+func (f *fakeStore) ListRunCredentialEpochs(_ context.Context, _ store.ListRunCredentialEpochsParams) ([]store.RunCredentialEpoch, error) {
+	return f.credentialEpochs, nil
+}
 func (f *fakeStore) SetRunCheckpointTip(_ context.Context, arg store.SetRunCheckpointTipParams) (int64, error) {
 	f.checkpointTips = append(f.checkpointTips, arg)
 	if f.checkpointTipErr != nil {
@@ -892,16 +955,18 @@ func (f *fakeStore) InsertAgentMemory(_ context.Context, arg store.InsertAgentMe
 func (f *fakeStore) EvictAgentMemoryOverCap(context.Context, store.EvictAgentMemoryOverCapParams) error {
 	return nil
 }
-func (f *fakeStore) InsertRunMessage(_ context.Context, arg store.InsertRunMessageParams) (int64, error) {
+func (f *fakeStore) InsertRunMessage(_ context.Context, arg store.InsertRunMessageParams) (store.InsertRunMessageRow, error) {
 	f.insertedMessages = append(f.insertedMessages, arg)
 	if f.insertedSeqs == nil {
 		f.insertedSeqs = map[int32]bool{}
 	}
+	live := store.InsertRunMessageRow{GenerationLive: pgtype.Bool{Bool: true, Valid: true}}
 	if f.insertedSeqs[arg.Seq] {
-		return 0, nil // ON CONFLICT DO NOTHING
+		return live, nil // ON CONFLICT DO NOTHING — a benign duplicate at the live generation
 	}
 	f.insertedSeqs[arg.Seq] = true
-	return 1, nil
+	live.Inserted = true
+	return live, nil
 }
 func (f *fakeStore) UpdateRunLastSeq(_ context.Context, arg store.UpdateRunLastSeqParams) (int64, error) {
 	v := arg.Seq
@@ -1019,6 +1084,41 @@ func (f *fakeStore) PromoteRecoveryWaitRuns(_ context.Context, now pgtype.Timest
 
 func (f *fakeStore) ListPoolWaitRuns(_ context.Context) ([]store.ListPoolWaitRunsRow, error) {
 	return f.poolWaitRuns, f.poolWaitRunsErr
+}
+
+func (f *fakeStore) ListLimitWaitReeval(_ context.Context, now pgtype.Timestamptz) ([]store.ListLimitWaitReevalRow, error) {
+	f.limitWaitReevalAt = append(f.limitWaitReevalAt, now)
+	return f.limitWaitReeval, f.limitWaitReevalErr
+}
+
+// LowerLimitWaitRetryNow records the arg and, by default, reports 1 row (a still-parked
+// run lowered). lowerLimitWaitRows overrides the count so a test can model the 0-row
+// no-op (the run moved out of limit_wait under the pass); lowerLimitWaitErr fails it. It
+// also DROPS the lowered run from limitWaitReeval so a SECOND Sweep on the same fake sees
+// the remaining parked run — which is how the one-per-owner-per-tick cap is proven across
+// two calls (mirroring PromotePoolWaitRun).
+func (f *fakeStore) LowerLimitWaitRetryNow(_ context.Context, arg store.LowerLimitWaitRetryNowParams) (int64, error) {
+	f.loweredLimitWait = append(f.loweredLimitWait, arg)
+	if f.lowerLimitWaitErr != nil {
+		return 0, f.lowerLimitWaitErr
+	}
+	rows := int64(1)
+	if f.lowerLimitWaitRows != nil {
+		rows = *f.lowerLimitWaitRows
+	}
+	if rows > 0 {
+		// A FRESH slice, not f.limitWaitReeval[:0]: reEvaluateParkedLimitWaitRuns holds the
+		// slice ListLimitWaitReeval returned and iterates it while calling this, so reusing
+		// the backing array would corrupt that in-flight range.
+		remaining := make([]store.ListLimitWaitReevalRow, 0, len(f.limitWaitReeval))
+		for _, r := range f.limitWaitReeval {
+			if r.ID != arg.ID {
+				remaining = append(remaining, r)
+			}
+		}
+		f.limitWaitReeval = remaining
+	}
+	return rows, nil
 }
 
 // PromotePoolWaitRun records the arg and, by default, reports 1 row (a held run
@@ -4342,7 +4442,7 @@ func TestCreateRunSnapshotsTitleAndRunsWithoutPRDLink(t *testing.T) {
 		createRunResult: store.Run{ID: uuid.New()},
 	}
 	svc := New(fs, newBox(t), testParams())
-	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "the description", nil, nil, false, nil); err != nil {
+	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "the description", nil, nil, false, nil, nil); err != nil {
 		t.Fatalf("CreateRun: %v", err)
 	}
 	if fs.createRunParams == nil {
@@ -4374,7 +4474,7 @@ func TestCreateRunOpenMRGuard(t *testing.T) {
 			createRunResult:   store.Run{ID: uuid.New()},
 		}
 		svc := New(fs, newBox(t), testParams())
-		_, err := svc.CreateRun(context.Background(), user, repo, 4, "the description", nil, nil, false /*force*/, nil)
+		_, err := svc.CreateRun(context.Background(), user, repo, 4, "the description", nil, nil, false /*force*/, nil, nil)
 		if !errors.Is(err, ErrOpenMRExists) {
 			t.Fatalf("CreateRun err = %v, want ErrOpenMRExists", err)
 		}
@@ -4399,7 +4499,7 @@ func TestCreateRunOpenMRGuard(t *testing.T) {
 			createRunResult:   store.Run{ID: uuid.New()},
 		}
 		svc := New(fs, newBox(t), testParams())
-		_, err := svc.CreateRun(context.Background(), user, repo, 4, "the description", nil, nil, true /*force*/, nil)
+		_, err := svc.CreateRun(context.Background(), user, repo, 4, "the description", nil, nil, true /*force*/, nil, nil)
 		if errors.Is(err, ErrOpenMRExists) {
 			t.Fatalf("CreateRun with force=true err = %v, must NOT be ErrOpenMRExists (guard bypassed)", err)
 		}
@@ -4449,7 +4549,7 @@ func TestCreateAutopilotRunSetsAutoApproveAndSharesGates(t *testing.T) {
 		createRunResult: store.Run{ID: uuid.New()},
 	}
 	svc = New(fsManual, newBox(t), testParams())
-	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "d", nil, nil, false, nil); err != nil {
+	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "d", nil, nil, false, nil, nil); err != nil {
 		t.Fatalf("CreateRun: %v", err)
 	}
 	if fsManual.createRunParams.AutoApprove {
@@ -4516,7 +4616,7 @@ func TestCreateRunRejectsOversizeDescription(t *testing.T) {
 
 	// Manual and autopilot both reject at the one shared cap, before any run is made.
 	fs := &fakeStore{issueByID: store.Issue{Title: "T", Labels: uziLabels(), HasPrdLink: true}}
-	if _, err := New(fs, newBox(t), testParams()).CreateRun(context.Background(), user, repo, 4, big, nil, nil, false, nil); err != ErrDescriptionTooLarge {
+	if _, err := New(fs, newBox(t), testParams()).CreateRun(context.Background(), user, repo, 4, big, nil, nil, false, nil, nil); err != ErrDescriptionTooLarge {
 		t.Fatalf("CreateRun err = %v, want ErrDescriptionTooLarge", err)
 	}
 	if fs.createRunParams != nil {
@@ -4531,7 +4631,7 @@ func TestCreateRunRejectsOversizeDescription(t *testing.T) {
 	// Exactly at the cap is accepted (boundary).
 	ok := strings.Repeat("x", MaxIssueDescriptionBytes)
 	fsOK := &fakeStore{issueByID: store.Issue{Title: "T", Labels: uziLabels(), HasPrdLink: true}, createRunResult: store.Run{ID: uuid.New()}}
-	if _, err := New(fsOK, newBox(t), testParams()).CreateRun(context.Background(), user, repo, 4, ok, nil, nil, false, nil); err != nil {
+	if _, err := New(fsOK, newBox(t), testParams()).CreateRun(context.Background(), user, repo, 4, ok, nil, nil, false, nil, nil); err != nil {
 		t.Fatalf("a description exactly at the cap must be accepted, got %v", err)
 	}
 }
@@ -4543,7 +4643,7 @@ func TestCreateRunMapsDuplicateToActiveRunExists(t *testing.T) {
 		createRunErr: &pgconn.PgError{Code: "23505"},
 	}
 	svc := New(fs, newBox(t), testParams())
-	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "d", nil, nil, false, nil); err != ErrActiveRunExists {
+	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "d", nil, nil, false, nil, nil); err != ErrActiveRunExists {
 		t.Fatalf("err = %v, want ErrActiveRunExists", err)
 	}
 }
@@ -4562,7 +4662,7 @@ func TestCreateRunPreCheckBlocksDuplicateOnHeldIssue(t *testing.T) {
 		createRunResult:      store.Run{ID: uuid.New()},
 	}
 	svc := New(fs, newBox(t), testParams())
-	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "d", nil, nil, false, nil); err != ErrActiveRunExists {
+	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "d", nil, nil, false, nil, nil); err != ErrActiveRunExists {
 		t.Fatalf("err = %v, want ErrActiveRunExists — the pre-check must refuse a second run on a held issue", err)
 	}
 }
@@ -4578,7 +4678,7 @@ func TestCreateRunPreCheckErrorPropagates(t *testing.T) {
 		createRunResult:         store.Run{ID: uuid.New()},
 	}
 	svc := New(fs, newBox(t), testParams())
-	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "d", nil, nil, false, nil); !errors.Is(err, sentinel) {
+	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "d", nil, nil, false, nil, nil); !errors.Is(err, sentinel) {
 		t.Fatalf("err = %v, want the pre-check error to propagate", err)
 	}
 }
@@ -4586,7 +4686,7 @@ func TestCreateRunPreCheckErrorPropagates(t *testing.T) {
 func TestCreateRunRepoNotOwned(t *testing.T) {
 	fs := &fakeStore{repoErr: pgx.ErrNoRows}
 	svc := New(fs, newBox(t), testParams())
-	if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "d", nil, nil, false, nil); err != ErrRepoNotFound {
+	if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "d", nil, nil, false, nil, nil); err != ErrRepoNotFound {
 		t.Fatalf("err = %v, want ErrRepoNotFound", err)
 	}
 }
@@ -4912,7 +5012,7 @@ func TestCreateRunNotifiesQueuedWithOriginSnapshot(t *testing.T) {
 	lc := &fakeLifecycle{}
 	svc.SetLifecycle(lc)
 
-	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "desc", nil, nil, false, nil); err != nil {
+	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "desc", nil, nil, false, nil, nil); err != nil {
 		t.Fatalf("CreateRun: %v", err)
 	}
 	// origin_column snapshots the issue's current column ("Later"), always a valid
@@ -4939,7 +5039,7 @@ func TestCreateRunOriginNullWhenColumnsUnavailable(t *testing.T) {
 	}
 	svc := New(fs, newBox(t), testParams())
 
-	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "desc", nil, nil, false, nil); err != nil {
+	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "desc", nil, nil, false, nil, nil); err != nil {
 		t.Fatalf("CreateRun should not be blocked by a column-list error: %v", err)
 	}
 	if fs.createRunParams == nil {

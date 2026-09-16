@@ -164,6 +164,7 @@ uzi run inputs <run-id>
 uzi run expedite <run-id> [--clear]
 uzi run resume-now <run-id>
 uzi run resume <run-id>
+uzi run set-token <run-id> (<label> | --auto | --default | --inherit)
 uzi run mr-rework <run-id> [--enabled[=false]] [--clear]
 uzi run rework <run-id> [-m|--message <text>]
 uzi run decide <run-id> --continue [--guidance <text>]
@@ -540,6 +541,20 @@ uzi version
   is a 409 (exit 5), and a foreign/unknown run is a 404 (exit 4). No token is spent
   and nothing is written to the forge. Prints the updated run; `--json` emits the run
   object.
+- `uzi run set-token <run-id> <label>|--auto|--default|--inherit` — re-point which
+  Anthropic token this run spends (PRD #1247). A positional token **label** pins the run
+  to that token; `--auto` auto-selects from your pool, `--default` uses your default
+  token, and `--inherit` clears the override back to the worker's binding. Exactly one of
+  {label, `--auto`, `--default`, `--inherit`} is required and they are mutually exclusive
+  (usage error, exit 2). On a **queued** run the switch takes effect at the next claim; on
+  a **parked** run (`limit_wait`, `pool_wait`, `recovery_wait`, `paused`) it promotes the
+  run back to **queued** at once so the next claim spends the chosen token. On a **running**
+  or gated run held by a capable worker the switch is **requested** and takes effect when the
+  worker releases its claim; it is refused (409, exit 5) when no live worker holds the run
+  or the holding worker predates the `credential_switch` capability. A foreign/unknown run or an
+  unknown token label is refused (404 / usage); a codex run is 422. It may print a warning (the
+  token has no headroom, or `auto` will hold in `pool_wait`) **without** refusing — the
+  switch still applies. Prints the updated run; `--json` emits the run object.
 - `uzi run mr-rework <run-id>` — set the per-run override for the MR review-rework
   watcher (PRD #841): whether new review comments on this run's open MR are
   auto-reworked. Tri-state and editable on a **completed** run for as long as its MR is

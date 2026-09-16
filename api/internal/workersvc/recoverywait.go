@@ -100,15 +100,19 @@ func recoveryParkJitter() time.Duration {
 // SetState maps to applied=false / 409 (idempotent, like the limit park). It returns the
 // row count SetState maps to `applied`.
 //
-// The StateRequest parameter is unused today — recovery_wait carries no dedicated DTO
-// fields (the pool_wait precedent) — but is kept for symmetry with the park family so a
-// later transient-recovery field lands here without changing the call shape.
-func (s *Service) setRecoveryWait(ctx context.Context, run store.Run, wkr store.Worker, _ StateRequest, sessionID pgtype.Text) (int64, error) {
+// The StateRequest parameter carries ONLY the reported claim_generation today (threaded to the
+// per-query fence, PRD #1247 M5a-1 rework); recovery_wait has no other dedicated DTO fields (the
+// pool_wait precedent), and the param is kept for symmetry with the park family so a later
+// transient-recovery field lands here without changing the call shape.
+func (s *Service) setRecoveryWait(ctx context.Context, run store.Run, wkr store.Worker, req StateRequest, sessionID pgtype.Text) (int64, error) {
 	retryNotBefore := s.now().Add(s.recoveryParkFallbackFor(run.RecoveryWaitCount) + recoveryParkJitter())
 	return s.q.SetRunRecoveryWait(ctx, store.SetRunRecoveryWaitParams{
 		RetryNotBefore: pgconv.Time(retryNotBefore),
 		SessionID:      sessionID,
 		ID:             run.ID,
 		WorkerID:       pgconv.UUID(wkr.ID),
+		// PRD #1247 M5a-1 rework (reviewer NB1): the reported generation, threaded to the fence in
+		// SetRunRecoveryWait. A stale/reclaimed old flight's park matches 0 rows; nil parks unfenced.
+		ClaimGeneration: pgconv.Int8Ptr(req.ClaimGeneration),
 	})
 }

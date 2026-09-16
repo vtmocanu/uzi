@@ -771,7 +771,7 @@ func TestHTTPClientOnlyReturnsExitError(t *testing.T) {
 		{"start-cli-auth", func(c *HTTPClient) error { _, e := c.StartCLIAuth(context.Background(), "ch", "desc"); return e }},
 		{"poll-cli-auth", func(c *HTTPClient) error { _, e := c.PollCLIAuth(context.Background(), "req", "ver"); return e }},
 		{"create-run", func(c *HTTPClient) error {
-			_, e := c.CreateRun(context.Background(), "p1", 7, nil, nil, false, nil)
+			_, e := c.CreateRun(context.Background(), "p1", 7, nil, nil, false, nil, nil)
 			return e
 		}},
 		{"submit-run-input", func(c *HTTPClient) error {
@@ -924,7 +924,7 @@ func TestCreateRunWireBodyOmitsAbsentWaitOnLimit(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			if _, err := newTestClient(srv).CreateRun(context.Background(), "p1", 42, tc.in, nil, false, nil); err != nil {
+			if _, err := newTestClient(srv).CreateRun(context.Background(), "p1", 42, tc.in, nil, false, nil, nil); err != nil {
 				t.Fatalf("CreateRun: %v", err)
 			}
 			if !strings.Contains(body, `"issue_iid":42`) {
@@ -972,7 +972,7 @@ func TestCreateRunWireBodyMrRework(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			if _, err := newTestClient(srv).CreateRun(context.Background(), "p1", 42, nil, tc.in, false, nil); err != nil {
+			if _, err := newTestClient(srv).CreateRun(context.Background(), "p1", 42, nil, tc.in, false, nil, nil); err != nil {
 				t.Fatalf("CreateRun: %v", err)
 			}
 			if got := strings.Contains(body, "mr_rework_enabled"); got != tc.wantPresent {
@@ -983,6 +983,115 @@ func TestCreateRunWireBodyMrRework(t *testing.T) {
 			}
 			if tc.wantJSON != "" && !strings.Contains(body, tc.wantJSON) {
 				t.Errorf("body = %s, want it to contain %s", body, tc.wantJSON)
+			}
+		})
+	}
+}
+
+// TestCreateRunWireBodyCredentialOverride asserts the PRD #1247 M2 credential_override wire
+// mapping: an absent override omits the key entirely (a bare create stays byte-identical), a
+// pinned choice carries {mode, secret_id}, and a keyword mode carries `mode` ALONE with no
+// secret_id key. Asserted on raw bytes so a stray `"secret_id":""` a decode-into-struct would
+// erase is caught.
+func TestCreateRunWireBodyCredentialOverride(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		in         *CreateRunCredentialOverride
+		wantAbsent bool
+		wantJSON   []string
+		wantNot    []string
+	}{
+		{"absent omits the key", nil, true, nil, nil},
+		{"pinned carries mode + secret_id", &CreateRunCredentialOverride{Mode: "pinned", SecretID: "sec-b"}, false,
+			[]string{`"credential_override":`, `"mode":"pinned"`, `"secret_id":"sec-b"`}, nil},
+		{"auto carries mode alone", &CreateRunCredentialOverride{Mode: "auto"}, false,
+			[]string{`"mode":"auto"`}, []string{"secret_id"}},
+		{"inherit carries mode alone", &CreateRunCredentialOverride{Mode: "inherit"}, false,
+			[]string{`"mode":"inherit"`}, []string{"secret_id"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var body string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				b := make([]byte, r.ContentLength)
+				_, _ = io.ReadFull(r.Body, b)
+				body = string(b)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"run":{"id":"r1","status":"queued"}}`))
+			}))
+			defer srv.Close()
+
+			if _, err := newTestClient(srv).CreateRun(context.Background(), "p1", 42, nil, nil, false, nil, tc.in); err != nil {
+				t.Fatalf("CreateRun: %v", err)
+			}
+			if got := strings.Contains(body, "credential_override"); got == tc.wantAbsent {
+				t.Errorf("credential_override present = %v, want absent = %v; body = %s", got, tc.wantAbsent, body)
+			}
+			for _, want := range tc.wantJSON {
+				if !strings.Contains(body, want) {
+					t.Errorf("body = %s, want it to contain %s", body, want)
+				}
+			}
+			for _, notWant := range tc.wantNot {
+				if strings.Contains(body, notWant) {
+					t.Errorf("body = %s, want it to NOT contain %s (a keyword mode carries no secret)", body, notWant)
+				}
+			}
+		})
+	}
+}
+
+// TestSetRunCredentialWire asserts `SetRunCredential` POSTs to /api/runs/{id}/credential
+// with {mode, secret_id?} — a pinned choice carries secret_id, the keyword modes carry mode
+// alone (secret_id omitempty) — and that it unwraps the {run, warning} envelope, returning
+// the D6 warning (PRD #1247 M4). Asserted on raw bytes so the omitted secret_id is caught.
+func TestSetRunCredentialWire(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		in       SetRunCredentialOverride
+		wantJSON []string
+		wantNot  []string
+	}{
+		{"pinned carries mode + secret_id", SetRunCredentialOverride{Mode: "pinned", SecretID: "sec-b"},
+			[]string{`"mode":"pinned"`, `"secret_id":"sec-b"`}, nil},
+		{"auto carries mode alone", SetRunCredentialOverride{Mode: "auto"},
+			[]string{`"mode":"auto"`}, []string{"secret_id"}},
+		{"inherit carries mode alone", SetRunCredentialOverride{Mode: "inherit"},
+			[]string{`"mode":"inherit"`}, []string{"secret_id"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var body, path string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				path = r.URL.Path
+				b := make([]byte, r.ContentLength)
+				_, _ = io.ReadFull(r.Body, b)
+				body = string(b)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"run":{"id":"r1","status":"queued"},"warning":"heads up"}`))
+			}))
+			defer srv.Close()
+
+			run, warning, err := newTestClient(srv).SetRunCredential(context.Background(), "r1", tc.in)
+			if err != nil {
+				t.Fatalf("SetRunCredential: %v", err)
+			}
+			if path != "/api/runs/r1/credential" {
+				t.Errorf("path = %q, want /api/runs/r1/credential", path)
+			}
+			if run.ID != "r1" {
+				t.Errorf("run.ID = %q, want r1", run.ID)
+			}
+			if warning != "heads up" {
+				t.Errorf("warning = %q, want the unwrapped 'heads up'", warning)
+			}
+			for _, want := range tc.wantJSON {
+				if !strings.Contains(body, want) {
+					t.Errorf("body = %s, want it to contain %s", body, want)
+				}
+			}
+			for _, notWant := range tc.wantNot {
+				if strings.Contains(body, notWant) {
+					t.Errorf("body = %s, want it to NOT contain %s (a keyword mode carries no secret)", body, notWant)
+				}
 			}
 		})
 	}
@@ -1015,7 +1124,7 @@ func TestCreateRunWireBodyForce(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			if _, err := newTestClient(srv).CreateRun(context.Background(), "p1", 42, nil, nil, tc.in, nil); err != nil {
+			if _, err := newTestClient(srv).CreateRun(context.Background(), "p1", 42, nil, nil, tc.in, nil, nil); err != nil {
 				t.Fatalf("CreateRun: %v", err)
 			}
 			if got := strings.Contains(body, "force"); got != tc.wantPresent {
@@ -1299,7 +1408,7 @@ func TestCreateRunWireBodySeededPlan(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			if _, err := newTestClient(srv).CreateRun(context.Background(), "p1", 42, nil, nil, false, tc.seed); err != nil {
+			if _, err := newTestClient(srv).CreateRun(context.Background(), "p1", 42, nil, nil, false, tc.seed, nil); err != nil {
 				t.Fatalf("CreateRun: %v", err)
 			}
 			for _, want := range tc.wantContains {

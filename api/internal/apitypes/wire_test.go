@@ -235,6 +235,9 @@ var runDTOKeys = []string{
 	// PRD #1064 M2: the server-derived "now" line (RunActivity object or null). On both
 	// list and detail via the RunListItemDTO embed.
 	"current_activity",
+	// PRD #1247 M1: the per-run credential override, the pending held-state switch state,
+	// and the applied-switch attribution journal. All three non-omitempty.
+	"credential_override", "credential_switch", "credential_epochs",
 }
 
 func TestRunDTOTags(t *testing.T) {

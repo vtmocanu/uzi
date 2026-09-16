@@ -46,6 +46,7 @@ import { rmTreeForce } from "./rmtree.js";
 import {
   SteeringChannel,
   PauseNowSignal,
+  CredentialSwitchSignal,
   type AnswerVerdict,
   type PlanVerdict,
 } from "./steering.js";
@@ -86,6 +87,14 @@ const TERMINAL_RUN_STATUSES = new Set(["cancelled", "completed", "failed"]);
  *  A never-verified capture DOES NOT park: enterCompletionHold clears its preserve flags and returns
  *  false, so the run's normal terminal cleanup runs (no park, no leak). */
 const COMPLETION_HOLD_CAPTURE_ATTEMPTS = 3;
+
+/** PRD #1247 M5b (D3): bounded in-call attempts to capture a VERIFIED restore point before a
+ *  held-state credential-switch RELEASE. Mirrors COMPLETION_HOLD_CAPTURE_ATTEMPTS — the same
+ *  retain-and-retry, bounded because it runs synchronously in executeClaim's catch arm. A capture
+ *  that never verifies GIVES UP: enterCredentialSwitch reports `credential_switch_failed`, KEEPS
+ *  the preserve flags (no work loss), and returns "gave_up" so the run is left non-terminal for
+ *  requeue on the still-standing override — the switch is realized at the reclaim boundary. */
+const CREDENTIAL_SWITCH_CAPTURE_ATTEMPTS = 3;
 
 /** PRD #1226 M4 (D5): the STATIC, content-free failure_reason a worker reports when the completion
  *  interlock cannot report completed AND cannot park the run for recovery (the restore point never
@@ -132,6 +141,41 @@ export class ForgeUnreachableAtCloneError extends Error {
   constructor(message: string, cause?: unknown) {
     super(message, { cause });
     this.name = "ForgeUnreachableAtCloneError";
+  }
+}
+
+/**
+ * PRD #1247 M5b: a /state report came back with the top-level `stale_claim` disposition
+ * (`ack.staleClaim`) — a held-state credential switch RELEASED this claim, or a reclaim
+ * SUPERSEDED it. This flight no longer owns the run, so it MUST STOP without reporting a
+ * terminal state (another claim owns the run now) and without setting a preserve flag
+ * (normal teardown — the new claim has its own clone). Thrown from the flight.reportState
+ * closure the moment any report is answered stale, and caught in executeClaim's catch chain
+ * BEFORE the generic terminal path (mirroring the PauseNowSignal arm). Local, like
+ * TerminalReportError: it is thrown and caught entirely within this file.
+ */
+class StaleClaimError extends Error {
+  constructor() {
+    super("run claim superseded server-side (stale_claim)");
+    this.name = "StaleClaimError";
+  }
+}
+
+/**
+ * PRD #1247 M5b (BLOCKING-2/3 rework): a held-state credential switch could not be CONFIRMED, so
+ * the flight must STOP without continuing in place — but, unlike StaleClaimError, it must RETAIN
+ * all work (enterCredentialSwitch left the preserve flags SET). Thrown by ctx.attemptCredentialSwitch
+ * when enterCredentialSwitch returns "retained_stop" — an unverified give-up whose stamp-clear the
+ * server never confirmed, or a release whose outcome is unknown. Continuing in place would risk
+ * working a claim the reclaim already owns (release) or stranding every buffered input behind a
+ * still-pending switch stamp (give-up); so executeClaim's catch chain ends the flight NON-TERMINAL
+ * (no failed report), keeping the clone + HOME so the sweeper's requeue lets a reclaim resume the
+ * retained work. Local, like TerminalReportError / StaleClaimError.
+ */
+class CredentialSwitchRetainedStop extends Error {
+  constructor() {
+    super("credential switch unconfirmed; retaining work and stopping the flight");
+    this.name = "CredentialSwitchRetainedStop";
   }
 }
 
@@ -401,6 +445,13 @@ interface RunFlight {
   readonly batcher: MessageBatcher;
   readonly cancel: AbortController;
   readonly steering: SteeringChannel;
+  /** PRD #1247 M5b: the claim-lane generation THIS claim holds (from claim.claim_generation).
+   *  Threaded onto every mutating report (the reportState closure) and every message batch (the
+   *  batcher), so the server's per-query fence can engage. The client's send-gate (fix round E)
+   *  decides whether it actually rides the wire — a generation>0 capability/feature worker sends it,
+   *  0 (chat's legacy sentinel) is never sent, and a rolled-back api's strict-decode 400 strips it
+   *  and retries ONCE. Server-side NOT NULL DEFAULT 0. */
+  readonly claimGeneration: number;
   readonly reportState: (
     body: Parameters<WorkerClient["reportState"]>[1],
     signal?: AbortSignal,
@@ -1130,6 +1181,57 @@ export class RunRunner {
         if (outcome === "fail") {
           await this.reportGenericFailure(claim, flight, err);
         }
+      } else if (err instanceof StaleClaimError) {
+        // PRD #1247 M5b: a /state report came back with the stale_claim disposition — a held-state
+        // credential switch RELEASED this claim, or a reclaim SUPERSEDED it. Another claim owns the
+        // run now, so STOP this flight. Caught here BEFORE the generic terminal path (mirroring the
+        // PauseNowSignal arm above, but WITHOUT its park): log, close the batcher, and report NO
+        // terminal state — a `failed` here would fight the owning claim — and set NO preserve flag
+        // (normal teardown: the new claim has its own clone). The finally then runs ordinary cleanup.
+        runLog.info("run claim superseded server-side (stale_claim); stopping this flight");
+        await batcher.close().catch(() => undefined);
+      } else if (err instanceof CredentialSwitchRetainedStop) {
+        // PRD #1247 M5b (BLOCKING-2/3 rework): the in-place ctx.attemptCredentialSwitch could not
+        // CONFIRM the switch (an unverified give-up whose stamp-clear the server never confirmed, or
+        // a release whose outcome is unknown), so it retained all work and threw to stop rather than
+        // continue on a possibly-released claim. Unlike StaleClaimError, KEEP the preserve flags
+        // (enterCredentialSwitch left them SET) so the clone + HOME survive: report NO terminal state
+        // (a `failed` would fight a claim that may already have moved on) and leave the run
+        // NON-TERMINAL so the sweeper requeues it and a reclaim resumes the retained work.
+        runLog.info("credential switch unconfirmed; retaining work and leaving the run non-terminal for requeue", {
+          run_id: flight.runId,
+        });
+        await batcher.close().catch(() => undefined);
+      } else if (err instanceof CredentialSwitchSignal) {
+        // PRD #1247 M5b (data-integrity fix): a SAFETY NET. The switch is now handled IN PLACE by the
+        // executor via ctx.attemptCredentialSwitch — the implement loop's turn catch and each idle
+        // held-state waiter (plan gate / question / follow-up) call it and, on a give-up, CONTINUE the
+        // run on the old token rather than letting the CredentialSwitchSignal reach here. So this arm
+        // only fires when the signal escaped that in-place handling: a stub/test executor that does
+        // NOT wire attemptCredentialSwitch (it re-throws), or a switch tripping some await not wrapped
+        // at B/C. Caught here BEFORE the generic terminal path so a switch NEVER becomes a `failed`
+        // run. Enter the same two-phase release; enterCredentialSwitch already set the flight's flags
+        // and (on release) reported credential_switch, so NEITHER branch reports a terminal state.
+        const outcome = await this.enterCredentialSwitch(claim, flight, runLog);
+        if (outcome === "released") {
+          // The flight ends: the finally retires the clone and preserves the HOME; the server
+          // requeued the run; a reclaim resumes at resume_phase on the newly-chosen token. No
+          // terminal report — enterCredentialSwitch already reported credential_switch.
+          runLog.info("credential switch released this claim; leaving the run for a reclaim on the new token");
+        } else {
+          // GAVE UP and the signal reached HERE (not the in-place continue at B/C), so the executor
+          // has already unwound and cannot continue on the old token. Make it CONTINUE-SAFE the only
+          // way possible from here: NO terminal `failed` report (a switch must never fail a healthy
+          // run), and KEEP both preserve flags (enterCredentialSwitch left them set on give-up) so the
+          // run is left NON-TERMINAL with its clone + HOME retained for a requeue — the same posture as
+          // the worker-shutdown-interrupt arm. The standing override still points at the new token, so
+          // the requeued run's reclaim spends it. (After B/C this arm is a last resort — a running
+          // give-up continues in place and never reaches here.)
+          runLog.info(
+            "credential switch did not release the claim and reached the outer catch; leaving the run non-terminal for requeue on the standing override",
+          );
+        }
+        await batcher.close().catch(() => undefined); // idempotent (enterCredentialSwitch may have drained)
       } else {
         await this.reportGenericFailure(claim, flight, err);
       }
@@ -1398,8 +1500,9 @@ export class RunRunner {
    *      transaction — the worker calls no release endpoint).
    *   - `recovery_release_exact_echo` (but NOT recovery_park_cause) → the older-api fallback: an
    *      older api's park touches no custody (fact 13), so first prove an EXACT-generation release
-   *      (released && generation===gen && holds_released===1), then send the UNTYPED report,
-   *      keeping claim_generation IFF `claim_generation_fence` is advertised. Missing proof (or a
+   *      (released && generation===gen && holds_released===1), then send the UNTYPED report, which
+   *      still carries claim_generation — the reportState closure (M5b) threads it, and for a capability worker the E send-gate stamps it
+   *      regardless of the negotiated `claim_generation_fence` feature (strict-decode strip-and-retry if this older api also predates the /state field). Missing proof (or a
    *      release throw) → today's failed path, never a leaked hold.
    *   - neither token → negotiate nothing, take today's failed path.
    *
@@ -1465,13 +1568,9 @@ export class RunRunner {
         });
         return "fail";
       }
-      // With proof, send the UNTYPED report. Keep claim_generation IFF the api advertised the
-      // #1247 state fence (D7); the `6603f793` baseline has no generation field on the state
-      // report, so it carries neither field.
+      // With proof, send the UNTYPED recovery_wait report; the flight reportState closure it routes
+      // through (reportForgeParkAndDispatch) stamps claim_generation unconditionally (PRD #1247 M5b).
       const body: StateRequest = { status: "recovery_wait" };
-      if (features.includes("claim_generation_fence") && gen !== undefined) {
-        body.claim_generation = gen;
-      }
       return await this.reportForgeParkAndDispatch(body, claim, flight, reportState, runLog, runHome);
     }
 
@@ -1865,6 +1964,23 @@ export class RunRunner {
       runLog.info("run entered the completion hold; skipping finalization", {
         run_id: runId,
         reason: result.completionHeld.reason,
+      });
+      return;
+    }
+    // PRD #1247 M5b (data-integrity fix): a held-state credential switch RELEASED the claim IN PLACE
+    // (ctx.attemptCredentialSwitch → "released"). enterCredentialSwitch already drained the batcher,
+    // reported credential_switch (queued ack), cleared preserveRecoveryClone + set parked, and the
+    // server requeued the run for a reclaim at resume_phase on the newly-chosen token. Like the pause
+    // park and the completion hold above, the run is non-terminal and already handled, so there is
+    // NOTHING to finalize (no push, no MR, no completion report). Reap + close the batcher
+    // (idempotent — the release already drained it) and return; the finally retires the clone
+    // (preserveRecoveryClone cleared) and preserves the HOME (parked) for the same-worker resume.
+    // Keyed on the executor's result so no non-release path can reach this branch.
+    if (result.switchReleased) {
+      executor.killAgentTree?.();
+      await closeBatcher().catch(() => undefined);
+      runLog.info("run released for a credential switch in place; skipping finalization", {
+        run_id: runId,
       });
       return;
     }
@@ -3016,6 +3132,9 @@ export class RunRunner {
         contractRevision,
         branch: result.branch,
         head,
+        // PRD #1247 M5: stamp the claim-lane generation (the SAME value the reportState closure
+        // stamps) so the server refuses to issue a permit for a released/superseded stale flight.
+        claimGeneration: flight.claimGeneration,
       });
       // 3. NOT granted: do NOT create the MR, do NOT render Closes, do NOT report completed — hold.
       if (!permit.granted) {
@@ -3295,6 +3414,10 @@ export class RunRunner {
     }
     const redact = makeRedactor(secrets);
     const redactText = makeTextRedactor(secrets);
+    // PRD #1247 M5b: the claim-lane generation this claim holds. Server-side NOT NULL DEFAULT 0;
+    // `?? 0` covers a pre-#1296 payload that omits the field. Held on the flight and stamped on
+    // every mutating report + message batch so the server's per-query fence can engage.
+    const claimGeneration = claim.claim_generation ?? 0;
     const batcher = new MessageBatcher(
       this.client,
       runId,
@@ -3337,6 +3460,9 @@ export class RunRunner {
       {
         notify: (text) =>
           batcher.emit({ kind: "status", agent: "worker", payload: { text } }),
+        // PRD #1247 M5b: the claim's generation, so the poll loop acts on a credential_switch
+        // signal ONLY when it targets THIS claim (a signal for a superseded claim is ignored).
+        claimGeneration,
       },
     );
     // issue #552 M3: a graceful `uzi run stop` (PRD #517 M4) consumed into the worker's
@@ -3372,15 +3498,35 @@ export class RunRunner {
       batcher,
       cancel,
       steering,
+      claimGeneration,
       observedSessionId: undefined,
-      reportState: (body, signal) =>
-        this.client.reportState(
-          runId,
-          flight.observedSessionId
-            ? { ...body, session_id: flight.observedSessionId }
-            : body,
-          signal,
-        ),
+      reportState: async (body, signal) => {
+        // PRD #1247 M5b: stamp the claim-lane generation on EVERY mutating report. This is the
+        // single choke point every one of the ~71 report sites goes through (incl. the terminal
+        // `failed` report), so the server's per-query fence engages uniformly. Additive/optional:
+        // the observedSessionId injection is preserved, and claim_generation rides beside it.
+        const stamped: Parameters<WorkerClient["reportState"]>[1] = {
+          ...body,
+          claim_generation: flight.claimGeneration,
+          ...(flight.observedSessionId ? { session_id: flight.observedSessionId } : {}),
+        };
+        const ack = await this.client.reportState(runId, stamped, signal);
+        // PRD #1247 M5b (MINOR-7): the held-state switch signal rides the state ACK too — the
+        // advertised SECONDARY transport beside /inputs. Feed it into the SAME generation-checked,
+        // idempotent, defer-aware trigger the inputs poll uses (tripCredentialSwitch), so a failing
+        // /inputs poll can no longer disable the switch: a report is made far more often than an
+        // inputs poll, and the two transports compose (a switch trips at most once). Fed BEFORE the
+        // stale_claim check below; the two never co-occur (workerStateAck omits the switch signal
+        // from the stale_claim disposition), so ordering is immaterial to correctness.
+        if (ack.credentialSwitch) flight.steering.tripCredentialSwitch(ack.credentialSwitch.generation);
+        // PRD #1247 M5b: a stale_claim disposition means a held-state switch RELEASED this claim
+        // (or a reclaim SUPERSEDED it) — the flight no longer owns the run and MUST STOP. Throw so
+        // executeClaim's catch chain closes the batcher and ends the flight with NO terminal
+        // report (another claim owns the run now). A stale ack on the TERMINAL `failed` report is
+        // a no-op: that reportState is already `.catch(...)`-guarded, so the throw is swallowed.
+        if (ack.staleClaim) throw new StaleClaimError();
+        return ack;
+      },
       barePath: undefined,
       worktreePath: undefined,
       // PRD #267: time-based origin-checkpoint gate state (per run). `lastPublish` starts
@@ -4079,6 +4225,62 @@ export class RunRunner {
       cancelRequested: () => steering.isCancelled(),
       pauseModeRequested: () => steering.getPauseMode(),
       onPauseNow: (cb) => steering.onPauseNow(cb),
+      // PRD #1247 M5b: re-arm the in-flight turn drop for a held-state credential switch (the
+      // analog of onPauseNow), and restore the gate phase after a switch resume (D13). Absent
+      // resume_phase ⇒ undefined (a fresh run, or an older server), which the executor treats as
+      // today's behaviour.
+      onCredentialSwitch: (cb) => steering.onCredentialSwitch(cb),
+      // PRD #1247 M5b (MAJOR-6): run `fn` with credential-switch trips DEFERRED (the signal held,
+      // not tripped) — the executor wraps a plan-REVISION planning turn in this so a switch never
+      // releases before gatePlan has persisted the revised plan. Balanced begin/finally-end.
+      deferCredentialSwitch: async (fn) => {
+        steering.beginCredentialSwitchDefer();
+        try {
+          return await fn();
+        } finally {
+          steering.endCredentialSwitchDefer();
+        }
+      },
+      // PRD #1247 M5b (data-integrity fix): attempt the held-state credential switch IN PLACE from
+      // wherever the executor was when it tripped (a live implement turn, or an idle gate/question/
+      // follow-up waiter), INSTEAD of letting the CredentialSwitchSignal reach the outer catch and
+      // end the flight while the run is still healthy (which no sweep requeues → a RUN_TIMEOUT
+      // orphan for a running give-up, a strand-until-restart for a held one). Delegates to the SAME
+      // two-phase enterCredentialSwitch the outer catch uses. On a GIVE-UP the run CONTINUES on the
+      // old token in place, so CLEAR the preserve flags enterCredentialSwitch set up front (its
+      // step 2) — a later NORMAL completion must clean up the clone + HOME as usual, not preserve
+      // them (D3/D14). On a RELEASE they are already correct (parked=true, preserveRecoveryClone=
+      // false) so the finally retires the clone and keeps the HOME for resume. The clear lives HERE,
+      // not inside enterCredentialSwitch, because the outer-catch safety net cannot continue in
+      // place and must KEEP the flags to leave the run non-terminal for a requeue.
+      attemptCredentialSwitch: async () => {
+        const outcome = await this.enterCredentialSwitch(claim, flight, runLog);
+        if (outcome === "retained_stop") {
+          // The switch could not be confirmed (BLOCKING-2/3 rework). enterCredentialSwitch RETAINED
+          // all work (the preserve flags stay set); STOP the flight NON-TERMINAL by throwing to
+          // executeClaim's catch chain, rather than continuing in place on a claim the reclaim may
+          // already own (release) or whose switch stamp may still be pending (give-up). Do NOT clear
+          // the preserve flags or undo the wip marker — the retained work must survive for the reclaim.
+          throw new CredentialSwitchRetainedStop();
+        }
+        if (outcome === "gave_up") {
+          flight.preserveRecoveryClone = false;
+          flight.preserveSession = false;
+          // A DIRTY-tree switch committed a `wip(park):` marker in captureRecoveryRestorePoint; a
+          // give-up CONTINUES in place with NO reseed, so the marker must be undone here or it rides
+          // into the eventual MR and the restarted turn builds on a throwaway commit — the SAME orphan
+          // handlePausePark fixes on the pause-continue path (undoWipMarker's docstring). headIsWipMarker
+          // self-guards the blind `reset --mixed HEAD^` so it fires ONLY when HEAD is a marker (a
+          // clean-tree switch committed none). Kept HERE, not in enterCredentialSwitch (shared with the
+          // outer-catch requeue arm, whose reseed reset-softs the marker) and NOT on the release path
+          // (the reclaim's reseed handles it) — the two paths that MUST leave the marker.
+          if (flight.worktreePath && (await this.git.headIsWipMarker(flight.worktreePath))) {
+            await this.git.undoWipMarker(flight.worktreePath).catch(() => undefined);
+          }
+        }
+        return outcome;
+      },
+      resumePhase: claim.resume_phase,
       // Persist the SDK session id the moment the executor learns it, so a
       // re-queued run can resume it. Best-effort.
       onSessionId: (sessionId) => {
@@ -4521,6 +4723,9 @@ export class RunRunner {
           milestonesCompleted: declared,
           head,
           worktreeFingerprint,
+          // PRD #1247 M5: stamp the claim-lane generation (the SAME value the reportState closure
+          // stamps) so a released/superseded stale flight's attempt records nothing server-side.
+          claimGeneration: flight.claimGeneration,
         }),
       // PRD #1226 M4 (D3/D6): the recoverable completion-hold seam is now WIRED. On a repeated
       // no-progress completion attempt, a post-attempt budget/stall/wall/idle exhaustion, or the
@@ -5707,7 +5912,12 @@ export class RunRunner {
     const head = captured.head;
     let status: string;
     try {
-      ({ status } = await this.client.requestCompletionHold(flight.runId, { head }));
+      ({ status } = await this.client.requestCompletionHold(flight.runId, {
+        head,
+        // PRD #1247 M5: stamp the claim-lane generation (the SAME value the reportState closure
+        // stamps) so the server refuses to park a released/superseded stale flight's reclaimed run.
+        claimGeneration: flight.claimGeneration,
+      }));
     } catch (holdError) {
       flight.preserveRecoveryClone = false;
       flight.preserveSession = false;
@@ -5737,6 +5947,152 @@ export class RunRunner {
       head,
     });
     return true;
+  }
+
+  /**
+   * PRD #1247 M5b (D3, D13, D14): enter the held-state CREDENTIAL SWITCH release. Modeled
+   * step-for-step on enterCompletionHold (runner.ts, the reap → set-preserve-flags-up-front →
+   * bounded VERIFIED capture → positive-ack state machine), but its terminal outcome is a REQUEUE,
+   * not a park:
+   *
+   *   1. Reap the agent tree BEFORE any credentialed capture git (REAP-BEFORE-GIT), like
+   *      enterCompletionHold step 1 — idempotent, run()'s finally reaps again.
+   *   2. Set preserveRecoveryClone + preserveSession up front (enterCompletionHold step 2) so a
+   *      failed capture cannot strand the run's only copy of work while the release is uncertain.
+   *   3-5. Capture a VERIFIED local restore point via captureRecoveryRestorePoint (dirty→WIP commit
+   *      required, clean→clean proof, unreadable status→NOT verified; origin publish best-effort),
+   *      bounded retry with waitRecoveryRetry between attempts — enterCompletionHold steps 3-5, but
+   *      using captureRecoveryRestorePoint (the PRD's named capture) rather than captureHoldContext.
+   *   6a. GIVE UP (never verified): report `credential_switch_failed` (best-effort; the server clears
+   *      the switch STAMP but leaves the standing override), KEEP both preserve flags (NO committed
+   *      work is lost), and return "gave_up". The caller leaves the run NON-TERMINAL for requeue,
+   *      exactly like the worker-shutdown-interrupt arm; the standing override still points at the
+   *      new token, so a same-worker reclaim resumes on it.
+   *   6b. VERIFIED capture: DRAIN the batcher FIRST (the server's fenced append only persists while
+   *      claim_released_at IS NULL, so pending messages MUST land before the release moves the run
+   *      to `queued`), THEN report `credential_switch` and REQUIRE ack.status === "queued" — the
+   *      positive-ack contract, exactly as enterCompletionHold requires "paused". A non-"queued" ack
+   *      or a throw (incl. a stale_claim from the reportState closure) is a GIVE-UP: keep the flags,
+   *      return "gave_up" — never assume released.
+   *   7. Only after the queued ack: preserveRecoveryClone=false (the finally RETIRES the clone — a
+   *      cross-worker reclaim re-clones and recovers from the durable tracking ref + best-effort
+   *      origin; work is safe) and parked=true (preserve HOME + plugin dir for a same-worker
+   *      resume); return "released".
+   *
+   * DELIBERATE INTERPRETATION vs the PRD's "continue on the old token in place": the SDK executor
+   * has no primitive to re-drive an aborted turn IN PLACE, so this realizes the switch at the
+   * RECLAIM boundary instead of mid-flight. The verified-capture gate plus the preserved clone/HOME
+   * keep committed work safe on both outcomes, and the standing override makes the reclaim spend the
+   * newly-chosen token — the codebase-idiomatic equivalent of "continue on the old token", with no
+   * committed work lost. Strict continue-in-place would require resuming an aborted SDK session the
+   * executor cannot resume in place.
+   */
+  private async enterCredentialSwitch(
+    claim: ClaimResponse,
+    flight: RunFlight,
+    runLog: Logger,
+  ): Promise<"released" | "gave_up" | "retained_stop"> {
+    // The generation this switch targets (equals flight.claimGeneration by construction — the
+    // steering channel trips only on a generation match). Logged for provenance; the release
+    // report's claim_generation is stamped by the reportState closure from flight.claimGeneration.
+    const generation = flight.steering.pendingCredentialSwitch();
+    // 1. Reap BEFORE any credentialed capture git (idempotent — run()'s finally reaps again).
+    flight.executor.killAgentTree?.();
+    // 2. Retain EVERYTHING up front so an uncertain capture cannot strand the only copy of work.
+    flight.preserveRecoveryClone = true;
+    flight.preserveSession = true;
+    // 3-5. Capture a VERIFIED local restore point, bounded retry (recovery's retain-and-retry).
+    let verified = false;
+    for (let attempt = 0; attempt < CREDENTIAL_SWITCH_CAPTURE_ATTEMPTS; attempt++) {
+      if (flight.active?.shuttingDown) break;
+      try {
+        const result = await this.captureRecoveryRestorePoint(claim, flight, runLog);
+        if (result.verified) {
+          verified = true;
+          break;
+        }
+      } catch (captureError) {
+        runLog.warn("credential switch capture failed; retaining live work for retry", {
+          error: errMessage(captureError),
+        });
+      }
+      if (attempt < CREDENTIAL_SWITCH_CAPTURE_ATTEMPTS - 1) await this.waitRecoveryRetry(flight);
+    }
+    if (!verified) {
+      // 6a. GIVE UP — but only CONTINUE in place on a POSITIVE clear confirmation (BLOCKING-3
+      // rework). Report credential_switch_failed and READ the ack: the server clears the stamp
+      // only on a 200 (applied). If the clear is NOT confirmed — a not-applied 409, a network
+      // error, or a stale_claim throw (the claim was superseded) — the switch stamp may still be
+      // pending, and continuing would let the server's consume-nothing rule strand every
+      // answer/follow-up for this claim forever. So RETAIN everything and STOP for requeue instead.
+      // KEEP both preserve flags either way (no work loss).
+      let cleared = false;
+      try {
+        const ack = await flight.reportState({ status: "credential_switch_failed" });
+        cleared = ack.applied === true;
+        if (!cleared) {
+          runLog.warn("credential switch give-up: server did not confirm the stamp cleared; retaining and stopping", {
+            run_id: flight.runId,
+            server_status: ack.status ?? "unknown",
+          });
+        }
+      } catch (e) {
+        runLog.warn("credential switch give-up: could not confirm credential_switch_failed cleared the stamp; retaining and stopping", {
+          run_id: flight.runId,
+          error: errMessage(e),
+        });
+      }
+      if (!cleared) {
+        return "retained_stop";
+      }
+      // Positive clear confirmed: RE-ARM the steering channel so a LATER same-generation switch
+      // request (the owner re-clicking "switch token" on the still-open claim) can trip again —
+      // the once-only guard would otherwise drop it — then continue in place on the old token.
+      flight.steering.rearmCredentialSwitch();
+      runLog.warn(
+        "credential switch: restore point never verified; the switch stamp is cleared, continuing on the old token (clone + HOME retained)",
+        { run_id: flight.runId, generation },
+      );
+      return "gave_up";
+    }
+    // 6b. Verified. DRAIN the batcher FIRST — the fenced append persists only while
+    // claim_released_at IS NULL, so every pending message MUST land BEFORE the release requeues the
+    // run. close() is safe here (not a "reversible drain"): BOTH release outcomes below END this
+    // flight — a confirmed release leaves the run for the reclaim, and an UNCONFIRMED release now
+    // RETAINS-and-STOPS (it no longer continues in place on a claim the reclaim may already own) —
+    // so a closed batcher is never continued past. Idempotent with the caller's own close().
+    await flight.batcher.close().catch(() => undefined);
+    // THEN report the RELEASE. Accept it off the server's RELEASED disposition — set on BOTH a
+    // fresh requeue (status 'queued') AND an idempotent release after a reclaim (applied, status
+    // 'running') — not off status === 'queued', which missed the idempotent-after-reclaim success
+    // and gave up on a server-confirmed release, leaving the old flight to continue on a claim the
+    // reclaim already owned. A throw or an unconfirmed release ⇒ retain-and-stop.
+    let released = false;
+    try {
+      const ack = await flight.reportState({ status: "credential_switch" });
+      released = ack.credentialSwitchReleased === true;
+      if (!released) {
+        runLog.warn("credential switch: server did not confirm the release; retaining and stopping", {
+          run_id: flight.runId,
+          server_status: ack.status ?? "unknown",
+        });
+      }
+    } catch (releaseError) {
+      runLog.warn("credential switch: release report failed; retaining and stopping", {
+        run_id: flight.runId,
+        error: errMessage(releaseError),
+      });
+    }
+    if (!released) return "retained_stop"; // flags stay SET; STOP — never continue on a possibly-released claim
+    // 7. Released. The work is durable on the worker tracking ref (+ best-effort origin), so RETIRE
+    // the clone (a cross-worker reclaim re-clones); KEEP the HOME (parked) for a same-worker resume.
+    flight.preserveRecoveryClone = false;
+    flight.parked = true;
+    runLog.info(
+      "run released for a credential switch; retiring the clone, preserving HOME for resume",
+      { run_id: flight.runId, generation },
+    );
+    return "released";
   }
 
   /**

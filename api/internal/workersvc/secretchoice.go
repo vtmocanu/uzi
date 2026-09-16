@@ -35,9 +35,9 @@ type claimCred struct {
 // a default fallback can name the same token, and PRD #104's compatibility path
 // creates a row labelled literally "default", so the label alone answers nothing).
 //
-// These are ALIASES, not a second definition. The whole eight-value vocabulary lives
+// These are ALIASES, not a second definition. The whole ten-value vocabulary lives
 // in autoselect (see Reason there for why it hosts even the non-auto three), and
-// migration 00089's CHECK is the same eight; these exist only so the claim path reads
+// the SQL CHECK is the same ten (00089's eight, widened by 00233); these exist only so the claim path reads
 // in its own idiom rather than saying string(autoselect.ReasonPinned) on every line.
 // Aliasing means a rename upstream is a compile error here, which a second set of
 // string literals would not be.
@@ -45,7 +45,18 @@ const (
 	selectReasonDefault = string(autoselect.ReasonDefault)
 	selectReasonPinned  = string(autoselect.ReasonPinned)
 	selectReasonJudge   = string(autoselect.ReasonJudge)
+	// PRD #1247 M1: the two per-run credential override reasons, same alias idiom as
+	// the three above (a rename upstream is a compile error here). run_pinned = a per-run
+	// override named a token; run_default = a per-run override of mode 'default'.
+	selectReasonRunPinned  = string(autoselect.ReasonRunPinned)
+	selectReasonRunDefault = string(autoselect.ReasonRunDefault)
 )
+
+// effectiveClaimModeUnknown is effectiveNextClaimMode's answer when the next claim's
+// mode cannot be predicted — no recorded worker, or a worker the caller could not load
+// (PRD #1247). It is deliberately NOT one of the three bind modes: 6e and the switch
+// verb must treat it as "do not promote early", the safe direction.
+const effectiveClaimModeUnknown = "unknown"
 
 // secretChoice is WHICH credential a claim should spend and WHY: the override
 // openAnthropic takes (nil ⇒ the owner's default), the reason to record, and the
@@ -278,6 +289,21 @@ func (s *Service) recordRunCredential(ctx context.Context, run store.Run, cred c
 	if n == 0 {
 		return errRunVanished
 	}
+	// PRD #1247 M1 (D7/D14): append the attribution-journal epoch for THIS claim, keyed
+	// by the run's existing claim_generation (00223, PRD #1349 — this PRD never
+	// increments it). Written AFTER SetRunAnthropicSecret confirmed a live run (n>0), so
+	// the FK to runs cannot fail on a vanished run and the epoch can never disagree with
+	// runs.anthropic_secret_id about which token this claim spent. Idempotent on the
+	// composite PK, so a claim retried after a crash re-records rather than duplicating.
+	if err := s.q.RecordRunCredentialEpoch(ctx, store.RecordRunCredentialEpochParams{
+		RunID:           run.ID,
+		ClaimGeneration: run.ClaimGeneration,
+		SecretID:        pgconv.UUID(cred.ID),
+		Label:           pgconv.TextOrNull(cred.Label),
+		SelectReason:    pgconv.TextOrNull(choice.reason),
+	}); err != nil {
+		return fmt.Errorf("record run credential epoch: %w", err)
+	}
 	return nil
 }
 
@@ -302,13 +328,164 @@ func (s *Service) claimSecretID(ctx context.Context, wkr store.Worker, run store
 		// Full judge resolution, including the `auto` pool ranker and D4's empty-pool
 		// fallback (PRD #1140 M2): self_improve is uzi reviewing itself and follows the
 		// judge's credential, not a worker's. The run-lane open-failed retry still wraps
-		// this because self_improve rides assembleClaim (via openWithAutoRetry).
+		// this because self_improve rides assembleClaim (via openWithAutoRetry). Checked
+		// FIRST, so the run override below can never apply to self_improve (D10: that lane
+		// is not switchable — the verb refuses it rather than writing an override its
+		// ladder would ignore).
 		return s.judgeChoice(ctx, run)
+	}
+	// PRD #1247 M1 (D2): a per-run credential override outranks the worker binding for
+	// THIS run — the user chose it for this run specifically. It sits BETWEEN the
+	// self_improve/judge branch above and the worker bind-mode branch below. NULL mode
+	// (every pre-feature run and every run created without a choice) and a `pinned` mode
+	// whose id was nulled by a token delete both fall through to the worker binding
+	// (inherit, D1), so behaviour is byte-identical to today when no override is set.
+	if choice, ok, err := s.runOverrideChoice(ctx, run); err != nil {
+		return secretChoice{}, err
+	} else if ok {
+		return choice, nil
 	}
 	if wkr.AnthropicBindMode == BindModeAuto {
 		return s.autoChoice(ctx, run)
 	}
 	return staticChoice(workerSecretID(wkr), selectReasonPinned), nil
+}
+
+// runOverrideChoice resolves the per-run credential override rung of the ladder (PRD
+// #1247 M1, D1/D2/D9). ok is false when there is NO override to apply and the caller
+// must fall through to the worker binding: a NULL/empty mode, a `pinned` mode whose id
+// was nulled by a token delete (D1, mirroring #104's worker-binding rule), or an
+// unrecognised mode (impossible through the validator + the 00233 CHECK, resolved as
+// inherit — the safe direction). ok is true when the override decides the credential:
+//
+//   - pinned + a live id → staticChoice(id, run_pinned), but ONLY after confirming the
+//     id is the caller's own anthropic_token via the kind-scoped lookup. A foreign or
+//     wrong-kind id resolves to errCredentialUnavailable (D9) rather than falling through
+//     to inherit — inheriting would silently spend the worker's binding and misattribute.
+//     openAnthropic then opens by id with its own owner-scoped read; the existing
+//     worker/judge lanes keep their non-kind-scoped lookup unchanged.
+//   - auto → the SAME autoChoice ranker the auto worker uses. errAutoPoolEmpty propagates
+//     exactly as it does for an auto worker (the caller holds the run in pool_wait).
+//   - default → an EXPLICITLY constructed choice with reason run_default. It cannot use
+//     staticChoice(nil, …), which always reports `default`: run_default is a deliberate
+//     per-run choice of the owner default, distinct from an unset binding, and D20 makes
+//     the run view name that difference.
+func (s *Service) runOverrideChoice(ctx context.Context, run store.Run) (secretChoice, bool, error) {
+	if !run.CredentialOverrideMode.Valid || run.CredentialOverrideMode.String == "" {
+		return secretChoice{}, false, nil
+	}
+	switch run.CredentialOverrideMode.String {
+	case BindModePinned:
+		if !run.CredentialOverrideSecretID.Valid {
+			// The FK nulled the id when the token was deleted; the mode stays. Resolve
+			// as inherit (D1), exactly the worker-pin rule for a deleted binding.
+			return secretChoice{}, false, nil
+		}
+		id := uuid.UUID(run.CredentialOverrideSecretID.Bytes)
+		// Kind-scoped resolution (D9): the override id must name the caller's OWN
+		// anthropic_token. A foreign id, a deleted-but-not-nulled id, or a wrong-kind
+		// id all return pgx.ErrNoRows here → errCredentialUnavailable, never another
+		// lane's credential and never a silent inherit.
+		if _, err := s.q.GetUserSecretMetaByIDOfKind(ctx, store.GetUserSecretMetaByIDOfKindParams{
+			ID:     id,
+			UserID: run.UserID,
+			Kind:   store.KindAnthropicToken,
+		}); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return secretChoice{}, true, fmt.Errorf("%w: run credential override is not an available Anthropic token", errCredentialUnavailable)
+			}
+			return secretChoice{}, true, fmt.Errorf("run credential override lookup: %w", err)
+		}
+		return staticChoice(&id, selectReasonRunPinned), true, nil
+	case BindModeAuto:
+		choice, err := s.autoChoice(ctx, run)
+		if err != nil {
+			return secretChoice{}, true, err
+		}
+		return choice, true, nil
+	case BindModeDefault:
+		// The owner default, chosen for THIS run. Built directly so the reason is
+		// run_default rather than staticChoice's `default`.
+		return secretChoice{reason: selectReasonRunDefault}, true, nil
+	default:
+		// Unrecognised mode (the CHECK and validator forbid it): inherit, the safe
+		// direction — spending the worker binding is what a run did before overrides.
+		return secretChoice{}, false, nil
+	}
+}
+
+// effectiveNextClaimMode is the shared PURE policy for "which mode will resolve the
+// run's NEXT claim" (PRD #1247, the one seam consulted by Decision 6e at park time, the
+// duration-time pass, and the verb's D6 warnings). It is derived from the run + owner +
+// worker rows, NEVER from anthropic_select_reason (which describes the PREVIOUS claim and
+// goes stale the moment a binding changes while parked).
+//
+//   - self_improve → the owner's judge bind mode, resolved by the caller and passed in
+//     (self_improve follows the judge binding, D10). The override never applies here.
+//   - else the run override: pinned/auto/default, EXCEPT a `pinned` whose id was nulled
+//     (inherit), which falls through to the worker.
+//   - else the recorded worker_id's bind mode.
+//   - a missing recorded worker, or a deleted worker (a zero-value worker row), → unknown.
+//
+// It has no production caller in M1 — M3 wires it into decideLimitPark — and is kept
+// alive by the workersvc unit tests that exercise every rung.
+func effectiveNextClaimMode(run store.Run, ownerJudgeMode string, worker store.Worker) string {
+	if run.Kind == runkind.SelfImprove {
+		return ownerJudgeMode
+	}
+	if run.CredentialOverrideMode.Valid && run.CredentialOverrideMode.String != "" {
+		switch run.CredentialOverrideMode.String {
+		case BindModePinned:
+			if run.CredentialOverrideSecretID.Valid {
+				return BindModePinned
+			}
+			// nulled pin → inherit; fall through to the worker binding below.
+		case BindModeAuto:
+			return BindModeAuto
+		case BindModeDefault:
+			return BindModeDefault
+		}
+	}
+	// Inherit the recorded worker's bind mode. No recorded worker, or a worker the
+	// caller could not load (zero-value row), is unknown — the next claim's mode cannot
+	// be predicted, so 6e and the verb must not promote it early.
+	if !run.WorkerID.Valid || worker.ID == uuid.Nil {
+		return effectiveClaimModeUnknown
+	}
+	return worker.AnthropicBindMode
+}
+
+// ownerJudgeBindMode reads the run owner's judge-lane bind mode for
+// effectiveNextClaimMode's self_improve rung (PRD #1247). It reuses judgeChoice's own
+// GetUserJudgeAnthropicBinding read — the SAME query that resolves the credential at
+// claim time — so the mode 6e and the D8 pass predict a self_improve resume against is
+// exactly the one its next claim will use. Only a self_improve run needs it; every
+// other kind passes "" without a read, since effectiveNextClaimMode ignores
+// ownerJudgeMode for them. A lookup error is propagated (never swallowed into a wrong
+// mode), matching judgeChoice.
+func (s *Service) ownerJudgeBindMode(ctx context.Context, userID uuid.UUID) (string, error) {
+	bound, err := s.q.GetUserJudgeAnthropicBinding(ctx, userID)
+	if err != nil {
+		return "", fmt.Errorf("owner judge binding lookup: %w", err)
+	}
+	return bound.JudgeAnthropicBindMode, nil
+}
+
+// claimExcludeFor is claimExclude's pure core (PRD #1247 M3): the credential a resume
+// must not re-pick, given only the run's dead-credential id and its retry cadence. It
+// exists so a caller holding just those two columns (the D8 re-eval pass, the widened
+// pool-wait resume) can ask the same question the full-row claimExclude asks, without
+// materialising a whole store.Run. uuid.Nil means "exclude nothing".
+func (s *Service) claimExcludeFor(limitDead pgtype.UUID, retryNotBefore pgtype.Timestamptz) uuid.UUID {
+	if !limitDead.Valid {
+		return uuid.Nil
+	}
+	// Window still closed → keep excluding. Relax (Nil) once retry_not_before has
+	// reopened, and also when there is no reset stamp to wait on.
+	if retryNotBefore.Valid && retryNotBefore.Time.After(s.now()) {
+		return uuid.UUID(limitDead.Bytes)
+	}
+	return uuid.Nil
 }
 
 // claimExclude is the credential this claim must NOT resolve onto: the run's
@@ -334,15 +511,7 @@ func (s *Service) claimSecretID(ctx context.Context, wkr store.Worker, run store
 // ever hand a not-yet-due run to the claim path, and the M2 exclusion tests inject a
 // future stamp to exercise it.
 func (s *Service) claimExclude(run store.Run) uuid.UUID {
-	if !run.LimitDeadSecretID.Valid {
-		return uuid.Nil
-	}
-	// Window still closed → keep excluding. Relax (Nil) once it has reopened, and also
-	// when there is no reset stamp to wait on (nothing says the window is closed).
-	if run.RetryNotBefore.Valid && run.RetryNotBefore.Time.After(s.now()) {
-		return uuid.UUID(run.LimitDeadSecretID.Bytes)
-	}
-	return uuid.Nil
+	return s.claimExcludeFor(run.LimitDeadSecretID, run.RetryNotBefore)
 }
 
 // autoChoice runs the selector for an `auto` worker (PRD #111 M4, #754 M2).

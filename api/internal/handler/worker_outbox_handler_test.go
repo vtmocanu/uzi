@@ -45,11 +45,12 @@ func TestWorkerRegisterAdvertisesHeartbeatOutboxFeature(t *testing.T) {
 	if !has("heartbeat_outbox") {
 		t.Fatalf("protocol_features = %v, must contain heartbeat_outbox (the M2 agent gates its heartbeat outbox field on it)", resp.ProtocolFeatures)
 	}
-	// No fences in Run A: these belong to #1247/#1390 and Run B, land later, and
-	// advertising one now would tell the worker to send a fence a current api rejects.
-	for _, forbidden := range []string{"claim_generation_fence", "terminal_fence"} {
+	// `claim_generation_fence` is now advertised (#1247 landed the fence). `terminal_fence`
+	// stays out until Run B lands — advertising it now would tell the worker to send a fence
+	// a current api rejects.
+	for _, forbidden := range []string{"terminal_fence"} {
 		if has(forbidden) {
-			t.Fatalf("protocol_features = %v, must NOT contain %q in Run A", resp.ProtocolFeatures, forbidden)
+			t.Fatalf("protocol_features = %v, must NOT contain %q until Run B lands", resp.ProtocolFeatures, forbidden)
 		}
 	}
 }

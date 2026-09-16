@@ -198,6 +198,23 @@ var (
 	// handler's ordinary 409 {run} path (status recovery_wait, no reason) covers it.
 	ErrForgeParkStaleClaim       = errors.New("forge park: claim generation mismatch")
 	ErrForgeParkCustodyUnsettled = errors.New("forge park: custody could not be settled")
+	// ErrStaleClaim rejects a worker-driven MUTATING report whose claim_generation is stale
+	// (PRD #1247 M5, D3): a held-state credential switch RELEASED the claim (claim_released_at
+	// set) or a reclaim SUPERSEDED it (claim_generation advanced). The generation fence in
+	// SetState returns it atomically under a FOR UPDATE lock so no ClaimRun/release can
+	// interleave. The handler surfaces it as a `stale_claim` disposition on the state ack (a
+	// 409 carrying the run plus disposition:"stale_claim"), which the new worker reads to STOP
+	// the flight without further reports; an ordinary applied=false 409 keeps its meaning.
+	ErrStaleClaim = errors.New("run claim is stale (released or superseded)")
+	// ErrMissingClaimGeneration rejects a worker-driven MUTATING report from a CAPABILITY worker
+	// (one advertising capability.CredentialSwitchV1) that OMITS claim_generation (PRD #1247
+	// M5a-1 rework, auditor fail-open finding). The fence engages only when a report stamps a
+	// generation, so without this a capability worker could bypass it entirely by dropping the
+	// field. Making "legacy" a per-WORKER-capability property (not a per-request field-presence
+	// choice) closes that hole: a capability worker MUST stamp the generation, while a legacy
+	// worker (no capability) is still honoured unfenced when it omits it. The handler maps this to
+	// the SAME stale/refuse ack as ErrStaleClaim (a 409 with disposition:"stale_claim").
+	ErrMissingClaimGeneration = errors.New("capability worker omitted claim_generation on a mutating report")
 	// ErrRunNotAwaitingInput rejects an `answer` for a run that is not parked on a
 	// clarification question (PRD #88 M1) → 409. Its sibling ErrStaleAnswer covers the
 	// run that IS parked but on a DIFFERENT question — the two are separated because
@@ -571,6 +588,10 @@ type Store interface {
 	// /runs + board plan-revise flag (issue #750): the plan-ish message rows for a page of
 	// runs, folded into the is_revising set in Go by planRevisingSet — never in SQL.
 	ListPlanRevisionStateForRuns(ctx context.Context, runIds []uuid.UUID) ([]store.ListPlanRevisionStateForRunsRow, error)
+	// PRD #1247 M5 (D13): the seq of the run's latest submitted-plan frame, fetched only on the
+	// awaiting_approval resume so the worker correlates a buffered approve_plan to the right plan
+	// revision. Off the hot path for every other claim.
+	LatestPlanSeqForRun(ctx context.Context, runID uuid.UUID) (int64, error)
 	// /runs + board + run-view current_activity (PRD #1064 M2): the newest tool_use frame
 	// per run for a page, folded into the "now" line in Go by runactivity.FromFrame.
 	LatestToolUseForRuns(ctx context.Context, runIds []uuid.UUID) ([]store.LatestToolUseForRunsRow, error)
@@ -653,6 +674,20 @@ type Store interface {
 	// second park.
 	SetRunLimitWait(ctx context.Context, arg store.SetRunLimitWaitParams) (int64, error)
 	PromoteLimitWaitRuns(ctx context.Context, now pgtype.Timestamptz) ([]store.PromoteLimitWaitRunsRow, error)
+	// PromoteLimitWaitRunNow is the SINGLE-ROW early promote for `uzi run set-token` (PRD
+	// #1247 M4, D4): limit_wait -> queued for ONE owner+run WITHOUT the retry_not_before
+	// guard. Its mutation set is EXACTLY PromoteLimitWaitRuns' (a column-parity test pins
+	// them together) and it preserves the limit fields + retry_not_before so claimExclude
+	// keeps excluding the still-dead token. A 0-row result is a raced no-op (409).
+	PromoteLimitWaitRunNow(ctx context.Context, arg store.PromoteLimitWaitRunNowParams) (int64, error)
+	// The duration-time auto-failover re-evaluation pass (PRD #1247 M3, D8):
+	// ListLimitWaitReeval is the still-parked worklist (retry_not_before still in the
+	// future, a dead credential recorded) that reEvaluateParkedLimitWaitRuns walks, and
+	// LowerLimitWaitRetryNow lowers ONE due run's retry_not_before to now() so the same
+	// tick's PromoteLimitWaitRuns performs the actual resume. Placed BEFORE the promote
+	// call in Sweep so a lowered stamp is eligible for that tick's promotion pass.
+	ListLimitWaitReeval(ctx context.Context, now pgtype.Timestamptz) ([]store.ListLimitWaitReevalRow, error)
+	LowerLimitWaitRetryNow(ctx context.Context, arg store.LowerLimitWaitRetryNowParams) (int64, error)
 	// SetRunRecoveryWait parks a run in the transient-recovery hold (issue #1197);
 	// PromoteRecoveryWaitRuns is the sweeper pass that auto-promotes it once its capped
 	// backoff elapses. Like the limit-wait park its source guard is POSITIVE
@@ -660,6 +695,11 @@ type Store interface {
 	// it has NO per-run cap, so promotion always fires and the run recovers repeatedly.
 	SetRunRecoveryWait(ctx context.Context, arg store.SetRunRecoveryWaitParams) (int64, error)
 	PromoteRecoveryWaitRuns(ctx context.Context, now pgtype.Timestamptz) ([]store.PromoteRecoveryWaitRunsRow, error)
+	// PromoteRecoveryWaitRunNow is the SINGLE-ROW early promote for `uzi run set-token`
+	// (PRD #1247 M4, D4): recovery_wait -> queued for ONE owner+run WITHOUT the
+	// recovery_retry_not_before guard, mirroring PromoteRecoveryWaitRuns' mutation set. A
+	// 0-row result is a raced no-op (409).
+	PromoteRecoveryWaitRunNow(ctx context.Context, arg store.PromoteRecoveryWaitRunNowParams) (int64, error)
 	// PRD #1190 M1 pause/resume. SetRunPaused parks a running run on the owner's request
 	// (positive source guard, like SetRunLimitWait); ResumePausedRun promotes it back
 	// (paused → queued) with gate-park accounting; ClearPauseRequest clears a pending
@@ -674,6 +714,27 @@ type Store interface {
 	// rows (guard fail) is the non-paused ack the worker's park order must retain the run on.
 	SetRunCompletionHold(ctx context.Context, arg store.SetRunCompletionHoldParams) (store.Run, error)
 	ResumePausedRun(ctx context.Context, arg store.ResumePausedRunParams) (store.ResumePausedRunRow, error)
+	// ReleaseCredentialSwitch is the held-state credential-switch RELEASE transition (PRD
+	// #1247 M5, D3/D4/D14): a worker's {status:"credential_switch", claim_generation} report
+	// requeues the held run in ONE fenced statement — generation- and release-gated, banking
+	// the held gap like ResumePausedRun and keeping the switch stamp. releaseCredentialSwitch
+	// distinguishes a stale redelivery (0 rows) from an idempotent already-released/already-
+	// reclaimed one by a re-read.
+	ReleaseCredentialSwitch(ctx context.Context, arg store.ReleaseCredentialSwitchParams) (int64, error)
+	// StampHeldCredentialSwitch atomically writes the override columns AND the switch stamp
+	// (credential_switch_requested_at + _generation) for `uzi run set-token` on a run a worker
+	// holds (PRD #1247 M5, D4, BLOCKING-1 rework). One fenced UPDATE, owner-scoped and fenced on
+	// the exact live claim (worker_id + claim_generation + claim_released_at IS NULL + held
+	// status); it does NOT change status. Requires exactly one affected row — a 0-row result is a
+	// raced release/reclaim the caller maps to ErrCredentialSwitchRaced, with nothing written.
+	StampHeldCredentialSwitch(ctx context.Context, arg store.StampHeldCredentialSwitchParams) (int64, error)
+	// ClearCredentialSwitchByWorker clears a pending switch stamp WITHOUT changing status for the
+	// worker's `credential_switch_failed` report — the bounded capture-failure give-up (PRD #1247
+	// M5, D3/D14): the run keeps running on its current token. Fenced to the CURRENT claim
+	// (worker_id + exact generation + unreleased + a stamp actually pending), so a
+	// stale/superseded/foreign or already-cleared report affects 0 rows. failCredentialSwitch reads
+	// a 0-row result as a benign no-op (applied=false).
+	ClearCredentialSwitchByWorker(ctx context.Context, arg store.ClearCredentialSwitchByWorkerParams) (int64, error)
 	// ClearCompletionBudgetExhausted clears the served budget_exhausted steer
 	// (completion_budget_exhausted_at) on the owner's CONTINUE decision (PRD #1226 M5, D3): a
 	// new owner decision is the third of D3's clears (alongside the worker acting on it /
@@ -797,7 +858,10 @@ type Store interface {
 	RunPriorityClassForRun(ctx context.Context, arg store.RunPriorityClassForRunParams) (string, error)
 
 	// Messages + inputs.
-	InsertRunMessage(ctx context.Context, arg store.InsertRunMessageParams) (int64, error)
+	// InsertRunMessage returns whether the row was inserted (vs a benign duplicate) AND whether
+	// the generation fence held (generation_live) — so a fenced-out stale-generation batch is
+	// distinguishable from a duplicate (BLOCKING-4 rework).
+	InsertRunMessage(ctx context.Context, arg store.InsertRunMessageParams) (store.InsertRunMessageRow, error)
 	ListRunMessagesAfter(ctx context.Context, arg store.ListRunMessagesAfterParams) ([]store.RunMessage, error)
 	ListRunMessagesAfterPage(ctx context.Context, arg store.ListRunMessagesAfterPageParams) ([]store.RunMessage, error)
 	ListRunMessagesBeforePage(ctx context.Context, arg store.ListRunMessagesBeforePageParams) ([]store.RunMessage, error)
@@ -909,7 +973,23 @@ type Store interface {
 	// unscoped cross-tenant read, so there is deliberately no such query.
 	GetDefaultUserSecretMeta(ctx context.Context, arg store.GetDefaultUserSecretMetaParams) (store.GetDefaultUserSecretMetaRow, error)
 	GetUserSecretMetaByID(ctx context.Context, arg store.GetUserSecretMetaByIDParams) (store.GetUserSecretMetaByIDRow, error)
+	// GetUserSecretMetaByIDOfKind is the kind-SCOPED by-id meta lookup (PRD #1247 M1):
+	// the per-run credential override resolves a specific credential and must confirm it
+	// is an anthropic_token before opening it, without weakening the worker/judge lanes'
+	// non-kind-scoped GetUserSecretMetaByID (D9).
+	GetUserSecretMetaByIDOfKind(ctx context.Context, arg store.GetUserSecretMetaByIDOfKindParams) (store.GetUserSecretMetaByIDOfKindRow, error)
 	SetRunAnthropicSecret(ctx context.Context, arg store.SetRunAnthropicSecretParams) (int64, error)
+	// RecordRunCredentialEpoch appends the per-claim attribution-journal row (PRD #1247
+	// M1, D7/D14), keyed by the run's existing claim_generation; ListRunCredentialEpochs
+	// reads a run's applied-switch history (owner-scoped) for the GetRun DTO via the
+	// RunCredentialEpochs service method.
+	RecordRunCredentialEpoch(ctx context.Context, arg store.RecordRunCredentialEpochParams) error
+	ListRunCredentialEpochs(ctx context.Context, arg store.ListRunCredentialEpochsParams) ([]store.RunCredentialEpoch, error)
+	// SetRunCredentialOverride writes the per-run override columns for `uzi run set-token`
+	// (PRD #1247 M4, D4): the FIRST write in every writable-state branch of the verb,
+	// before the state-specific transition. Both params are nullable (inherit clears
+	// both). Owner-scoped; idempotent.
+	SetRunCredentialOverride(ctx context.Context, arg store.SetRunCredentialOverrideParams) (int64, error)
 	// Auto-selection (PRD #111 M4): every anthropic_token the user holds, with its
 	// gauge reading and in-flight run count. NOT pre-filtered on auto_eligible — the
 	// eligibility gate lives entirely in autoselect.Classify (D21), and the ranker
@@ -2157,10 +2237,24 @@ const maxCostUSD = 999999.999999
 // column and the M2 worker client); the Go field stays
 // `State` to avoid churn in the switch below.
 type StateRequest struct {
-	State  string  `json:"status"` // running|awaiting_approval|awaiting_input|completed|failed
-	PlanMd *string `json:"plan_md"`
-	Branch *string `json:"branch"`
-	MrIID  *int64  `json:"mr_iid"`
+	State string `json:"status"` // running|awaiting_approval|awaiting_input|awaiting_followup|limit_wait|recovery_wait|paused|pause_failed|credential_switch|completed|failed
+	// ClaimGeneration is the runs.claim_generation the worker believes it holds (PRD #1247
+	// M5, D3). A CAPABILITY worker (credential_switch_v1) stamps it on EVERY mutating report;
+	// SetState then fences the transition atomically on `claim_generation = @gen AND
+	// claim_released_at IS NULL`, so a report from a flight whose claim was RELEASED (a
+	// held-state switch requeued the run) or SUPERSEDED (a reclaim bumped the generation) is
+	// rejected with a typed stale_claim disposition instead of mutating the run. It is ALSO
+	// REQUIRED on a `credential_switch` release report (the release targets an exact
+	// generation). Nullable and OPTIONAL: a LEGACY worker (no capability) omits it, and the
+	// report is honoured UNFENCED exactly as before — back-compat by construction. The field
+	// MUST exist here because httpx.DecodeJSON sets DisallowUnknownFields — a capability
+	// worker that sends it would 400 otherwise. The SAME field is also the forge-park fence
+	// (PRD #1392 M1): the forge_unreachable park transaction requires it to equal the locked
+	// run's claim_generation and answers 409 stale_claim on a mismatch (#1247's precedence).
+	ClaimGeneration *int64  `json:"claim_generation"`
+	PlanMd          *string `json:"plan_md"`
+	Branch          *string `json:"branch"`
+	MrIID           *int64  `json:"mr_iid"`
 	// Head is the EXACT source-branch tip H a `completed` report is being made against
 	// (PRD #1226 M2, D5). It is REQUIRED for an INTERLOCKED run's completion: SetState routes
 	// such a completion through completeRunWithPermit, which consumes the permit issued for
@@ -2376,13 +2470,6 @@ type StateRequest struct {
 	// worker's empty-turn park. httpx.DecodeJSON rejects unknown fields, so this field MUST
 	// exist here or a new worker's report 400s.
 	RecoveryCause *string `json:"recovery_cause"`
-	// ClaimGeneration is the claim generation the worker holds, carried on the forge-park report
-	// (PRD #1392 M1). UNTRUSTED, but it is a FENCE not a value: the forge-park transaction
-	// requires it to equal the locked run's claim_generation and answers 409 stale_claim on a
-	// mismatch, with nothing mutated (#1247's precedence, checked first). Required for a
-	// forge_unreachable park; ignored on every other report. httpx.DecodeJSON rejects unknown
-	// fields, so this field MUST exist here or a new worker's report 400s.
-	ClaimGeneration *int64 `json:"claim_generation"`
 }
 
 // ProposalPayload is the structured idea a scheduled issues-mode prompt run emits on
@@ -2428,7 +2515,19 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	// transitions and pause_failed is not one; the in-app feed message carries the reason. A
 	// Slack DM would need a reason-carrying handler→slacksvc seam (deferred).
 	if req.State == "pause_failed" {
-		if _, cerr := s.q.ClearPauseRequest(ctx, store.ClearPauseRequestParams{ID: runID, WorkerID: pgconv.UUID(wkr.ID)}); cerr != nil {
+		// PRD #1247 M5: FAIL CLOSED for a CAPABILITY worker. pause_failed is handled BEFORE the
+		// generic fail-closed check below, so its own check lives here: a worker advertising
+		// credential_switch_v1 that OMITS claim_generation is refused (ErrMissingClaimGeneration →
+		// the same 409 the handler maps it to) rather than clearing the pause unfenced. A LEGACY
+		// worker (no capability, nil generation) skips the fence, byte-identical to before.
+		if req.ClaimGeneration == nil && slices.Contains(wkr.ProtocolCapabilities, capability.CredentialSwitchV1) {
+			return owned, false, ErrMissingClaimGeneration
+		}
+		// The nullable claim_generation fences the clear: a stale flight (its claim released by a
+		// held-state switch, or superseded by a reclaim) matches 0 rows, so it clears nothing and
+		// cannot withdraw the NEW flight's pending pause. The run stays running either way (the
+		// rowcount is intentionally not read — the fence is the protection, not a re-read).
+		if _, cerr := s.q.ClearPauseRequest(ctx, store.ClearPauseRequestParams{ID: runID, WorkerID: pgconv.UUID(wkr.ID), ClaimGeneration: pgconv.Int8Ptr(req.ClaimGeneration)}); cerr != nil {
 			return store.Run{}, false, cerr
 		}
 		run, err = s.runOwnedByWorker(ctx, runID, wkr)
@@ -2439,6 +2538,89 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			s.bcast.PublishState(runID, run.Status)
 		}
 		return run, true, nil
+	}
+	// PRD #1247 M5 (D3/D4/D14): the held-state credential-switch RELEASE report. It is NOT a
+	// generic mutation — a redelivered same-generation release after the release already
+	// applied (a lost ack) must converge to idempotent success, not a stale rejection — so it
+	// is handled by its own fenced+idempotent helper BEFORE the generation fence below (whose
+	// generic stale check would wrongly reject an already-released redelivery).
+	if req.State == "credential_switch" {
+		return s.releaseCredentialSwitch(ctx, owned, wkr, req)
+	}
+	// PRD #1247 M5 (D3 step 3 / D14): the bounded capture-failure GIVE-UP. After a bounded number
+	// of failed verified-restore-point captures the worker abandons the switch and reports
+	// {status:"credential_switch_failed", claim_generation}; the server CLEARS the pending switch
+	// stamp WITHOUT changing status — the run keeps running on its current token. Like pause_failed
+	// it withdraws a pending request (a SWITCH, not a PAUSE) rather than transitioning, so it is
+	// handled by its own fenced+idempotent helper BEFORE the generation fence below (whose generic
+	// stale check would wrongly reject an already-cleared redelivery).
+	if req.State == "credential_switch_failed" {
+		return s.failCredentialSwitch(ctx, owned, wkr, req)
+	}
+	// PRD #1247 M5a-1 rework (auditor fail-open finding): FAIL CLOSED for a CAPABILITY worker. The
+	// fence below engages only when the report STAMPS a generation, so a worker advertising
+	// credential_switch_v1 could otherwise bypass it entirely by OMITTING claim_generation on a
+	// mutating report. Make "legacy" a per-WORKER-capability property, not a per-request
+	// field-presence choice: a worker that advertises the capability MUST stamp the generation on
+	// every fenced mutating transition, so an omission is refused (ErrMissingClaimGeneration → the
+	// same 409/stale_claim ack as ErrStaleClaim). A LEGACY worker (no capability) is still honoured
+	// unfenced when it omits the field — back-compat by construction. INTERLOCKED completion is
+	// excluded here (stateUsesGenerationFence is false for it) and enforces the identical check
+	// inside completeRunWithPermit's permit transaction, where the rest of that arm's fence lives.
+	if req.ClaimGeneration == nil &&
+		stateUsesGenerationFence(req.State, owned) &&
+		slices.Contains(wkr.ProtocolCapabilities, capability.CredentialSwitchV1) {
+		return owned, false, ErrMissingClaimGeneration
+	}
+	// PRD #1247 M5 (D3): the released-generation fence. A CAPABILITY worker stamps
+	// req.ClaimGeneration on every mutating report; we then run the state transition under a
+	// FOR UPDATE lock on the run row and REJECT the report (ErrStaleClaim) when the run's
+	// generation has moved past the reported one (a reclaim) or its claim has been RELEASED (a
+	// held-state switch requeued it). Holding the row lock from the check THROUGH the mutation
+	// is what makes it atomic and serialized against ClaimRun / ReleaseCredentialSwitch — a
+	// Go-side check on a stale read then an unfenced UPDATE would be a TOCTOU (D3). A LEGACY
+	// report (nil generation, no capability) skips the tx entirely and runs UNFENCED exactly as
+	// before — back-compat by construction. The single-statement arms run their mutation
+	// through the tx-bound `q`; the multi-query park helpers (limit_wait/recovery_wait) and the
+	// interlocked-completion permit transaction do NOT nest under this lock — see
+	// stateUsesGenerationFence for why each is covered by its own guard.
+	q := Store(s.q)
+	var fenceTx pgx.Tx
+	defer func() {
+		if fenceTx != nil {
+			_ = fenceTx.Rollback(ctx)
+		}
+	}()
+	if req.ClaimGeneration != nil && stateUsesForUpdateFence(req.State, owned) {
+		if s.txBeginner == nil {
+			return store.Run{}, false, fmt.Errorf("state fence unavailable: no tx beginner wired for run %s", runID)
+		}
+		tx, berr := s.txBeginner.Begin(ctx)
+		if berr != nil {
+			return store.Run{}, false, berr
+		}
+		fenceTx = tx
+		qtx := store.New(tx)
+		locked, lerr := qtx.GetRunOwnedByWorkerForUpdate(ctx, store.GetRunOwnedByWorkerForUpdateParams{ID: runID, WorkerID: pgconv.UUID(wkr.ID)})
+		if lerr != nil {
+			if errors.Is(lerr, pgx.ErrNoRows) {
+				// The run left this worker (a reclaim by a DIFFERENT worker between the
+				// unlocked ownership read and this FOR UPDATE) → not this worker's to mutate.
+				return store.Run{}, false, ErrRunNotOwned
+			}
+			return store.Run{}, false, lerr
+		}
+		if locked.ClaimGeneration != *req.ClaimGeneration || locked.ClaimReleasedAt.Valid {
+			// Stale: a reclaim bumped the generation past the reported one, or a switch
+			// released this claim. Return the LOCKED row so the handler can render it beside
+			// the stale_claim disposition. The deferred Rollback releases the lock.
+			return locked, false, ErrStaleClaim
+		}
+		// Locked and current: the arms below mutate through the tx, and the lock is held
+		// until the post-mutation commit, so no ClaimRun/release can interleave. Use the
+		// freshly-locked snapshot for the arm's own reads of the run row.
+		owned = locked
+		q = qtx
 	}
 	var rows int64
 	// PRD #634 M4: the disposition to settle the pending scope audit row(s) with, decided in
@@ -2465,7 +2647,7 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 				return store.Run{}, false, fmt.Errorf("%w: running report carries a blank plan_md", ErrInvalidState)
 			}
 			var planRows int64
-			planRows, err = s.q.SetRunAutopilotPlan(ctx, store.SetRunAutopilotPlanParams{
+			planRows, err = q.SetRunAutopilotPlan(ctx, store.SetRunAutopilotPlanParams{
 				PlanMd:   planBody,
 				ID:       runID,
 				WorkerID: pgconv.UUID(wkr.ID),
@@ -2537,14 +2719,14 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// SQL is ownership+status guarded (id + worker_id, non-terminal), so a superseded worker
 		// cannot wipe the live owner's progress; a 0-row refusal is benign and not surfaced.
 		if req.SeededFromDefault != nil && *req.SeededFromDefault {
-			if _, cerr := s.q.ClearRunMilestonesCompleted(ctx, store.ClearRunMilestonesCompletedParams{
+			if _, cerr := q.ClearRunMilestonesCompleted(ctx, store.ClearRunMilestonesCompletedParams{
 				ID:       runID,
 				WorkerID: pgconv.UUID(wkr.ID),
 			}); cerr != nil {
 				return store.Run{}, false, cerr
 			}
 		}
-		rows, err = s.q.SetRunRunning(ctx, runningParams)
+		rows, err = q.SetRunRunning(ctx, runningParams)
 	case "awaiting_approval":
 		// PRD #122 M1: the CANDIDATE milestone list rides the pre-approval report.
 		// milestonesParam validates + kind-gates it (Decision 12/13) and returns NULL
@@ -2560,7 +2742,7 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// as an absent-safe pgtype.Text, so an off-vocabulary or absent value is an invalid
 		// (SQL NULL) param the query's COALESCE keeps out of the column.
 		inferredCaps, inferredTools, sizeClass := inferredRequirementParams(req)
-		rows, err = s.q.SetRunAwaitingApproval(ctx, store.SetRunAwaitingApprovalParams{
+		rows, err = q.SetRunAwaitingApproval(ctx, store.SetRunAwaitingApprovalParams{
 			PlanMd: stripNULParam(req.PlanMd), SessionID: sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
 			MilestonesCandidate:  milestonesParam(owned.Kind, req.Milestones),
 			InferredCapabilities: inferredCaps,
@@ -2593,7 +2775,7 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			now := time.Now().UTC()
 			completionQuestionAt = &now
 		}
-		rows, err = s.q.SetRunAwaitingInput(ctx, store.SetRunAwaitingInputParams{
+		rows, err = q.SetRunAwaitingInput(ctx, store.SetRunAwaitingInputParams{
 			OpenQuestionID:       pgconv.TextOrNull(qid),
 			CompletionQuestionAt: pgconv.TimePtr(completionQuestionAt),
 			SessionID:            sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
@@ -2617,7 +2799,7 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		if owned.Kind != runkind.Task || !owned.Interactive {
 			return store.Run{}, false, fmt.Errorf("%w: awaiting_followup requires an interactive task run", ErrInvalidState)
 		}
-		rows, err = s.q.SetRunAwaitingFollowup(ctx, store.SetRunAwaitingFollowupParams{
+		rows, err = q.SetRunAwaitingFollowup(ctx, store.SetRunAwaitingFollowupParams{
 			// int8Param maps nil → pgtype.Int8{} (Valid:false → SQL NULL), so an old
 			// worker that omits open_followup_id lands NULL and the query's COALESCE
 			// fallback recomputes the server-derived max-consumed watermark. A present
@@ -2702,12 +2884,23 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		if owned.CompletionContractVersion.Valid {
 			var idempotent bool
 			rows, idempotent, err = s.completeRunWithPermit(ctx, wkr, owned, req, completedParams)
+			// PRD #1247 M5 (D3): the interlocked completion runs its OWN permit transaction, so
+			// it cannot nest under an outer FOR UPDATE fence (self-deadlock) — it is
+			// generation-fenced INSIDE that lock instead and returns ErrStaleClaim when a
+			// released/reclaimed old flight tries to consume a stale permit. It ALSO enforces the
+			// M5a-1 fail-closed check (a capability worker that omitted claim_generation →
+			// ErrMissingClaimGeneration), since interlocked-completed does not pass through the
+			// top-of-SetState check above. Surface either with the pre-tx run row so the handler
+			// renders the stale_claim disposition.
+			if errors.Is(err, ErrStaleClaim) || errors.Is(err, ErrMissingClaimGeneration) {
+				return owned, false, err
+			}
 			if err == nil && idempotent {
 				run, rerr := s.runOwnedByWorker(ctx, runID, wkr)
 				return run, true, rerr
 			}
 		} else {
-			rows, err = s.q.SetRunCompleted(ctx, completedParams)
+			rows, err = q.SetRunCompleted(ctx, completedParams)
 		}
 	case "limit_wait":
 		rows, err = s.setLimitWait(ctx, owned, wkr, req, sessionID)
@@ -2747,7 +2940,7 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// ack contract as limit_wait — the worker keys off the RETURNED status being literally
 		// "paused", never off applied — so a refused park (0 rows) surfaces as 409 and the worker
 		// cleans up. It clears the pending-pause columns (the request is now consumed).
-		rows, err = s.q.SetRunPaused(ctx, store.SetRunPausedParams{
+		rows, err = q.SetRunPaused(ctx, store.SetRunPausedParams{
 			SessionID: sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
 		})
 	case "failed":
@@ -2772,7 +2965,7 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			// converging with the server-side CancelRunServerSide path. SetRunFailed is NOT
 			// called. rows drives the same applied/not-applied logic below (execrows, like
 			// SetRunFailed).
-			rows, err = s.q.CancelRunByWorker(ctx, store.CancelRunByWorkerParams{
+			rows, err = q.CancelRunByWorker(ctx, store.CancelRunByWorkerParams{
 				ID: runID, WorkerID: pgconv.UUID(wkr.ID),
 			})
 		case owned.StopKind.Valid && owned.StopKind.String == "stopped":
@@ -2785,18 +2978,24 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			// fail_origin='agent_failure' and must NOT be judged. Route to CancelRunByWorker
 			// exactly like the 'cancelled' arm: status 'cancelled', fail_origin NULL (CHECK-safe,
 			// no new vocabulary value), which Gate 0 of maybeEnqueueJudge excludes from judging.
-			rows, err = s.q.CancelRunByWorker(ctx, store.CancelRunByWorkerParams{
+			rows, err = q.CancelRunByWorker(ctx, store.CancelRunByWorkerParams{
 				ID: runID, WorkerID: pgconv.UUID(wkr.ID),
 			})
 		case owned.StopKind.Valid && owned.StopKind.String == "plan_rejected":
 			// A live plan-reject: stamp fail_origin='plan_rejected' (overriding the untrusted
 			// req.FailOrigin, which the worker cannot forge), matching the server-side
 			// RejectRunServerSide path rather than defaulting to agent_failure.
-			rows, err = s.q.SetRunFailed(ctx, store.SetRunFailedParams{
+			rows, err = q.SetRunFailed(ctx, store.SetRunFailedParams{
 				FailureReason:  limitAwareFailureReason(req),
 				FailOrigin:     pgconv.TextOrNull("plan_rejected"),
 				PreservedPatch: clampWirePreservedPatch(req.PreservedPatch),
 				SessionID:      sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
+				// PRD #1247 M5a-1 rework (m6): explicit nil. A fenced (non-chat, generation-bearing)
+				// capability report was already generation-checked under the outer FOR UPDATE fence
+				// upstream, so the per-query fence is redundant here; a legacy or chat report carries no
+				// generation (chat is deliberately fence-exempt), so nil is correct there too. Behavior
+				// preserved.
+				ClaimGeneration: pgtype.Int8{},
 			})
 		case req.BranchMoved != nil && *req.BranchMoved && owned.Kind == runkind.MRRework:
 			// Issue #1117: an mr_rework finalize push rejected non-fast-forward because a concurrent
@@ -2807,7 +3006,13 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			// like ScopeCapped's scope_ceiling guard) so an untrusted worker cannot mint the benign
 			// disposition on any other kind. Placed after the operator-stop arms so a concurrent operator
 			// cancel/stop (which pre-stamped owned.StopKind) still wins.
-			rows, err = s.q.SupersedeRunByWorker(ctx, store.SupersedeRunByWorkerParams{
+			//
+			// PRD #1247 fix round: use the TX-bound q (not s.q). This arm runs under the outer
+			// FOR UPDATE fence (q rebound to qtx), which holds a row lock on runID; issuing the
+			// supersede on the POOL (s.q) would wait on the transaction's own uncommitted lock until
+			// the context deadline, hanging every capability-worker mr_rework branch_moved report.
+			// Every sibling arm uses q for exactly this reason.
+			rows, err = q.SupersedeRunByWorker(ctx, store.SupersedeRunByWorkerParams{
 				ID: runID, WorkerID: pgconv.UUID(wkr.ID),
 			})
 		default:
@@ -2821,7 +3026,7 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			if o := CoerceFailOrigin(req.FailOrigin); o != nil {
 				failOrigin = *o
 			}
-			rows, err = s.q.SetRunFailed(ctx, store.SetRunFailedParams{
+			rows, err = q.SetRunFailed(ctx, store.SetRunFailedParams{
 				// PRD #35 §7.8: when a `failed` report carries the structured limit fields,
 				// the SERVER composes the sentence from its own allowlisted enum and replaces
 				// whatever text the worker sent. That is the opt-out path (a run with
@@ -2834,6 +3039,12 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 				FailOrigin:     pgconv.TextOrNull(failOrigin),
 				PreservedPatch: clampWirePreservedPatch(req.PreservedPatch),
 				SessionID:      sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
+				// PRD #1247 M5a-1 rework (m6): explicit nil. A fenced (non-chat, generation-bearing)
+				// capability report was already generation-checked under the outer FOR UPDATE fence
+				// upstream, so the per-query fence is redundant here; a legacy or chat report skips the
+				// lock and carries no generation (chat is deliberately fence-exempt), so nil is correct
+				// there too. Behavior preserved.
+				ClaimGeneration: pgtype.Int8{},
 			})
 		}
 	default:
@@ -2841,6 +3052,18 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	}
 	if err != nil {
 		return store.Run{}, false, err
+	}
+	// PRD #1247 M5 (D3): the fenced transition applied — COMMIT it, releasing the FOR UPDATE
+	// lock, BEFORE the post-transition automation below. That automation runs on s.q (a
+	// separate pool connection) and re-reads the run, so it must not run while this tx holds
+	// the row lock (the re-read would see the pre-commit row, and any run-row write would
+	// self-deadlock against the lock). A commit failure fails the report; the deferred Rollback
+	// is a no-op once fenceTx is cleared. A legacy report left fenceTx nil, so this is skipped.
+	if fenceTx != nil {
+		if cerr := fenceTx.Commit(ctx); cerr != nil {
+			return store.Run{}, false, cerr
+		}
+		fenceTx = nil
 	}
 	// issue #329: record the MR the worker opened INDEPENDENT of the terminal status
 	// the switch above wrote. If SetRunCompleted applied, ReconcileRunMR is a COALESCE
@@ -3198,17 +3421,51 @@ type InputDTO struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+// ConsumeInputsResult is what ConsumeInputs returns: the drained steering inputs and, when a
+// held-state switch is pending for the run's current claim, the worker-facing switch signal (PRD
+// #1247 M5, D3/D4). On the consume-nothing path (a pending switch) Inputs is empty and
+// CredentialSwitch is set; on the normal path CredentialSwitch is nil.
+type ConsumeInputsResult struct {
+	Inputs           []InputDTO
+	CredentialSwitch *CredentialSwitchSignal
+}
+
 // ConsumeInputs returns and marks-consumed every pending steering input for a
 // run the worker owns, FIFO. Delivery marks the input consumed (there is no
 // separate ack), so a worker crash right after the GET drops that input — an
 // accepted MVP trade-off for the steering channel (the user can re-send).
-func (s *Service) ConsumeInputs(ctx context.Context, wkr store.Worker, runID uuid.UUID) ([]InputDTO, error) {
-	if _, err := s.runOwnedByWorker(ctx, runID, wkr); err != nil {
-		return nil, err
+//
+// CONSUME-NOTHING RULE (PRD #1247 M5, step 2): the buffered inputs of a run whose claim is being
+// switched are earmarked for the RECLAIM, and this drains NOTHING until that reclaim happens. Two
+// windows are fenced, both server-side (never on worker discipline):
+//
+//   - a switch is PENDING for the current claim (PendingCredentialSwitchSignal != nil): return the
+//     signal and drain nothing, so a racing answer/follow-up stays unconsumed for the reclaim
+//     rather than being drained (and dropped) during the release the worker is about to perform.
+//   - the claim has been RELEASED and not yet reclaimed (claim_released_at set): the old worker
+//     still passes the worker_id-only ownership check in this window, and the signal has already
+//     cleared, so without this fence a stray poll from the departing worker would drain the very
+//     rows the reclaim must see. Drain nothing here too. The drain resumes only after ClaimRun
+//     reclaims the run (which clears claim_released_at and bumps the generation).
+func (s *Service) ConsumeInputs(ctx context.Context, wkr store.Worker, runID uuid.UUID) (ConsumeInputsResult, error) {
+	run, err := s.runOwnedByWorker(ctx, runID, wkr)
+	if err != nil {
+		return ConsumeInputsResult{}, err
+	}
+	if sig := PendingCredentialSwitchSignal(run); sig != nil {
+		// Pending switch: signal + no drain, so a racing answer/follow-up survives for the reclaim.
+		return ConsumeInputsResult{CredentialSwitch: sig}, nil
+	}
+	if run.ClaimReleasedAt.Valid {
+		// Released-but-not-reclaimed: claim_released_at is set ONLY by ReleaseCredentialSwitch and
+		// cleared ONLY by ClaimRun, so a valid value here means exactly "a credential switch
+		// released this claim and the reclaim has not happened yet." The buffered inputs belong to
+		// that reclaim; fence the drain (no signal — the switch for this claim is already released).
+		return ConsumeInputsResult{}, nil
 	}
 	rows, err := s.q.ConsumeRunInputs(ctx, runID)
 	if err != nil {
-		return nil, err
+		return ConsumeInputsResult{}, err
 	}
 	out := make([]InputDTO, 0, len(rows))
 	consumedFollowUp := false
@@ -3227,7 +3484,7 @@ func (s *Service) ConsumeInputs(ctx context.Context, wkr store.Worker, runID uui
 	if consumedFollowUp && s.bcast != nil {
 		s.bcast.PublishInput(runID)
 	}
-	return out, nil
+	return ConsumeInputsResult{Inputs: out}, nil
 }
 
 // SaveMemory persists one cross-run memory entry for the run's (user, repo), the
@@ -4063,7 +4320,7 @@ func (s *Service) DeleteWorker(ctx context.Context, userID, workerID uuid.UUID) 
 // run is self-contained even if the issue cache is later evicted. A PRD link is no
 // longer required. The one-non-terminal-run-per-issue index rejects a duplicate
 // active run.
-func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *SeededPlan) (store.Run, error) {
+func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *SeededPlan, credOverride *CredentialOverride) (store.Run, error) {
 	// waitOnLimit nil ⇒ inherit the owner's default. It is a *bool rather than a bool
 	// because "the caller said false" and "the caller said nothing" are different
 	// requests, and collapsing them would make every API client that omits the field
@@ -4081,16 +4338,20 @@ func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issue
 	// so it stays in the default lane where subagent pins win.
 	// force (issue #856): threaded straight through so the interactive/CLI caller can
 	// bypass the open-MR dedup with --force; it never affects the active-run gate.
-	return s.createRun(ctx, userID, repoID, issueIID, "manual", description, false, waitOnLimit, mrReworkEnabled, nil, false, force, seed)
+	// credOverride nil ⇒ inherit the worker binding (PRD #1247 M1); the create-time
+	// user choice is wired in M2. Threaded through the signature now so M2 does not
+	// reopen this seam (the freeze).
+	return s.createRun(ctx, userID, repoID, issueIID, "manual", description, false, waitOnLimit, mrReworkEnabled, nil, false, force, seed, credOverride)
 }
 
 // CreateScheduledRun queues a NON-auto-approve scheduled issue run (PRD #241: a timer
 // or label-sweep schedule firing an issue with the plan gate still requiring a human).
 // It is IDENTICAL to CreateRun — same single uzi_label eligibility gate (PRD #764 M1) —
 // and, like every create path, no longer requires a PRD link.
-func (s *Service) CreateScheduledRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, seed *SeededPlan) (store.Run, error) {
+func (s *Service) CreateScheduledRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, seed *SeededPlan, credOverride *CredentialOverride) (store.Run, error) {
 	// false force (issue #856): a scheduled run never bypasses the open-MR dedup.
-	return s.createRun(ctx, userID, repoID, issueIID, "schedule", description, false, waitOnLimit, mrReworkEnabled, model, overrideSubagentModel, false, seed)
+	// credOverride nil ⇒ inherit (PRD #1247 M1); M6 threads the schedule's stored override.
+	return s.createRun(ctx, userID, repoID, issueIID, "schedule", description, false, waitOnLimit, mrReworkEnabled, model, overrideSubagentModel, false, seed, credOverride)
 }
 
 // CreateAutopilotRun queues a run the poller's autopilot detection started on a
@@ -4114,7 +4375,9 @@ func (s *Service) CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UU
 	// express a per-run override, so the run's column stays NULL → inherit the owner
 	// default live, exactly today's behaviour.
 	// false force (issue #856): label-poller autopilot never bypasses the open-MR dedup.
-	return s.createRun(ctx, userID, repoID, issueIID, "autopilot", description, true, nil, nil, nil, false, false, nil)
+	// nil credOverride (PRD #1247 M1): label-poller autopilot has no per-run credential
+	// choice, so it inherits the worker binding exactly as before.
+	return s.createRun(ctx, userID, repoID, issueIID, "autopilot", description, true, nil, nil, nil, false, false, nil, nil)
 }
 
 // CreateScheduledAutopilotRun queues an auto-approve run for a schedule while honouring
@@ -4126,9 +4389,10 @@ func (s *Service) CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UU
 // seam (its interface, fake, and call site) stays byte-identical, so widening the
 // scheduler seam cannot change label-driven autopilot. seed=nil for the same reason as
 // CreateAutopilotRun: autopilot never seeds its plan.
-func (s *Service) CreateScheduledAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool) (store.Run, error) {
+func (s *Service) CreateScheduledAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, credOverride *CredentialOverride) (store.Run, error) {
 	// false force (issue #856): a scheduled autopilot run never bypasses the open-MR dedup.
-	return s.createRun(ctx, userID, repoID, issueIID, "autopilot", description, true /*autoApprove*/, waitOnLimit, mrReworkEnabled, model, overrideSubagentModel, false /*force*/, nil /*seed*/)
+	// credOverride nil ⇒ inherit (PRD #1247 M1); M6 threads the schedule's stored override.
+	return s.createRun(ctx, userID, repoID, issueIID, "autopilot", description, true /*autoApprove*/, waitOnLimit, mrReworkEnabled, model, overrideSubagentModel, false /*force*/, nil /*seed*/, credOverride)
 }
 
 // SeededPlan carries a create-time externally-authored plan and its optional agent
@@ -4157,7 +4421,7 @@ type SeededPlan struct {
 	RequireBase bool
 }
 
-func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, triggerSource string, description string, autoApprove bool, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, force bool, seed *SeededPlan) (store.Run, error) {
+func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, triggerSource string, description string, autoApprove bool, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, force bool, seed *SeededPlan, credOverride *CredentialOverride) (store.Run, error) {
 	// The description cap is enforced HERE, once, so the manual (handler → 422) and
 	// autopilot (poller → too-large comment) paths cannot drift (PRD #19 M5). Checked
 	// first: it is pure input validation, independent of the repo/issue gates below.
@@ -4410,6 +4674,13 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		// this stamps the run interlocked (version 1) before its first claim. Listed
 		// explicitly per runtime.sql's 🔴 silently-omittable-narg warning.
 		CompletionContractVersion: completionContractVersion,
+		// PRD #1247 M1 (D1): the per-run credential override, NULL/NULL for every M1
+		// caller (credOverride nil ⇒ inherit the worker binding, byte-identical to a
+		// pre-#1247 run). Listed explicitly per the same silently-omittable-narg warning:
+		// an omitted Go struct field would compile green and ship NULL, which is correct
+		// here only because NULL *is* the intended M1 value — M2 passes a real override.
+		CredentialOverrideMode:     pgOverrideMode(credOverride),
+		CredentialOverrideSecretID: pgOverrideSecretID(credOverride),
 	})
 	if err != nil {
 		if isUniqueViolation(err) {
@@ -4648,6 +4919,14 @@ func (s *Service) RunUsageTotal(ctx context.Context, runID uuid.UUID) (store.Get
 	return s.q.GetRunUsageTotal(ctx, runID)
 }
 
+// RunCredentialEpochs returns one run's applied-switch attribution journal, oldest
+// generation first (PRD #1247 M1, D7), owner-scoped through the query's run join. Empty
+// for a run that has never been claimed. Consumed by the handler's GetRun for the
+// credential_epochs DTO field.
+func (s *Service) RunCredentialEpochs(ctx context.Context, runID, userID uuid.UUID) ([]store.RunCredentialEpoch, error) {
+	return s.q.ListRunCredentialEpochs(ctx, store.ListRunCredentialEpochsParams{RunID: runID, UserID: userID})
+}
+
 // SelfUsage returns the user's own lifetime + last-7-days usage totals and their
 // usage-bearing run count (PRD #40 M3, GET /api/usage).
 func (s *Service) SelfUsage(ctx context.Context, userID uuid.UUID) (store.SelfUsageRow, error) {
@@ -4763,6 +5042,16 @@ type SweepResult struct {
 	// ONE per distinct held-run owner per tick (the anti-stampede stagger), so on a
 	// busy resume it climbs one owner at a time across ticks. Normally 0.
 	PoolResumed int64
+	// LimitReevaluated is the number of still-parked limit_wait runs this pass LOWERED to
+	// retry_not_before = now() because their `auto` next claim now has a pooled
+	// alternative that is spendable sooner than their park (PRD #1247 M3, D8 — Decision
+	// 6e extended from park-time to park-duration). At most ONE per distinct owner per
+	// tick (the same anti-stampede stagger PoolResumed applies, since this pass bypasses
+	// the park-time jitter). A lowered run is transitioned to queued by the following
+	// PromoteLimitWaitRuns pass — the same tick once that pass's clock has reached the
+	// lowered stamp, else the next — so a non-zero LimitReevaluated is normally mirrored
+	// by LimitPromoted within a tick. Normally 0.
+	LimitReevaluated int64
 	// RecoveryPromoted is the number of runs this pass auto-promoted from recovery_wait to
 	// queued because their recovery_retry_not_before elapsed (issue #1197). Normally 0: the
 	// partial index this reads covers only parked runs, a set that is empty on a healthy

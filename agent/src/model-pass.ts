@@ -190,7 +190,15 @@ const ADVICE_FAILURE_REASON_LEN = 500;
  *  `cause` lets the judge map a LimitReachedError to the server's structured limit facts
  *  (PRD #35 Decision 8): failure_reason is OMITTED in that case so the server composes the
  *  sentence from its own allowlisted enum rather than the worker smuggling an unvalidated
- *  rateLimitType in as free text. */
+ *  rateLimitType in as free text.
+ *
+ *  `claimGeneration` (PRD #1247 M2 fix round) is the run-lane claim generation this failed
+ *  report is made against. The judge/review runners call this from OUTSIDE the RunRunner
+ *  reportState stamping closure, so they thread the claim's generation through here to stamp
+ *  it — UNCONDITIONALLY, mirroring that closure — on BOTH failed body shapes, so a
+ *  credential_switch_v1 capability worker's failed advice report engages the server's
+ *  per-query generation fence instead of being refused with a 409. Undefined on a pre-#1296
+ *  claim, which leaves the field off the wire. */
 export async function safeReportFailed(
   client: Pick<WorkerClient, "reportState">,
   log: Logger,
@@ -198,12 +206,22 @@ export async function safeReportFailed(
   runId: string,
   reason: string,
   cause?: unknown,
+  claimGeneration?: number,
 ): Promise<void> {
   try {
     const body =
       cause instanceof LimitReachedError
-        ? { status: "failed" as const, rate_limit_type: cause.rateLimitType, limit_resets_at: cause.resetsAtMs }
-        : { status: "failed" as const, failure_reason: reason.slice(0, ADVICE_FAILURE_REASON_LEN) };
+        ? {
+            status: "failed" as const,
+            rate_limit_type: cause.rateLimitType,
+            limit_resets_at: cause.resetsAtMs,
+            claim_generation: claimGeneration,
+          }
+        : {
+            status: "failed" as const,
+            failure_reason: reason.slice(0, ADVICE_FAILURE_REASON_LEN),
+            claim_generation: claimGeneration,
+          };
     await client.reportState(runId, body);
   } catch (err) {
     log.warn(`${label} failed-state report failed`, { run_id: runId, error: errMessage(err) });

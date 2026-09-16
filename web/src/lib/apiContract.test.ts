@@ -198,6 +198,10 @@ type ZeroOf<T, NeverNull extends keyof T = never> = {
     | "completion_unmet"
     | "completion_deferred"
     | "completion_accepted"
+    // PRD #1247 M1: credential_epochs is normalized to [] by runToDTO
+    // (handler/runs_dto.go) but its zero fixture is a null nil-slice, so it is
+    // never-null on the wire and the null zero value is exempted here.
+    | "credential_epochs"
   > = runZero;
   // 3. value kinds, literal unions widened.
   const _runFull: Widen<Run> = runFull;
@@ -222,6 +226,7 @@ type ZeroOf<T, NeverNull extends keyof T = never> = {
     | "completion_unmet"
     | "completion_deferred"
     | "completion_accepted"
+    | "credential_epochs"
   > = runListItemZero;
   const _runListItemFull: Widen<RunListItem> = runListItemFull;
   void _runListItemMissing;

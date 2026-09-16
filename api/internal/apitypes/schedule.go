@@ -162,6 +162,11 @@ type ScheduleDTO struct {
 	// advance path persists, that a parked-or-transient fire left the prior summary (or
 	// none) in place rather than overwriting it.
 	LastFire *LastFire `json:"last_fire"`
+	// CredentialOverride is the schedule's per-run credential override (PRD #1247 M1,
+	// D5): null = inherit (the fired run follows the worker binding), else {mode, label}.
+	// The twin of RunDTO.CredentialOverride — a fired run inherits this choice (M6). Null
+	// for every schedule until M6 wires the picker.
+	CredentialOverride *CredentialOverrideDTO `json:"credential_override"`
 }
 
 // LastFireStarted is one run a persisted fire actually created (PRD #308 M3). Its json

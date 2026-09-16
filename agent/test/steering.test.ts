@@ -1,6 +1,12 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { SteeringChannel, ChatSteering, PauseNowSignal, type PlanVerdict } from "../src/steering.js";
+import {
+  SteeringChannel,
+  ChatSteering,
+  PauseNowSignal,
+  CredentialSwitchSignal,
+  type PlanVerdict,
+} from "../src/steering.js";
 import type { WorkerClient } from "../src/client.js";
 import type { UserInput } from "../src/protocol.js";
 import { nullLogger } from "./helpers.js";
@@ -10,7 +16,8 @@ import { nullLogger } from "./helpers.js";
 
 function fakeClient(batches: UserInput[][]): WorkerClient {
   let i = 0;
-  return { getInputs: async () => batches[i++] ?? [] } as unknown as WorkerClient;
+  // PRD #1247 M5: getInputs now returns { inputs, credentialSwitch? }; the poller reads `.inputs`.
+  return { getInputs: async () => ({ inputs: batches[i++] ?? [] }) } as unknown as WorkerClient;
 }
 
 const inp = (kind: UserInput["kind"], body?: string): UserInput => ({ id: 1, kind, body: body ?? null });
@@ -76,7 +83,7 @@ describe("SteeringChannel", () => {
       getInputs: async () => {
         calls++;
         if (calls === 1) throw new Error("transient");
-        return calls === 2 ? [inp("approve_plan")] : [];
+        return { inputs: calls === 2 ? [inp("approve_plan")] : [] };
       },
     } as unknown as WorkerClient;
     const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController());
@@ -220,6 +227,190 @@ describe("SteeringChannel — pause (PRD #1190 M2)", () => {
   });
 });
 
+// PRD #1247 M5b — the held-state credential switch. A `credential_switch {generation}` field rides
+// EVERY /inputs response (incl. an empty one). The channel acts on it ONLY when the generation
+// matches THIS claim's (claimGeneration): it records the pending switch, trips the shared controller
+// with a CredentialSwitchSignal reason (DISTINCT from a cancel), invokes the re-armable interrupt,
+// and rejects any parked gate/answer/follow-up waiter (a run idling at the gate/question/follow-up
+// has no live SDK turn to abort). A mismatched generation targets a superseded claim and is ignored.
+describe("SteeringChannel — credential switch (PRD #1247 M5b)", () => {
+  // A client whose getInputs yields scripted { inputs?, credentialSwitch? } batches (min-clamped so
+  // the last batch repeats every subsequent tick, modelling the signal riding EVERY poll).
+  function switchClient(
+    batches: Array<{ inputs?: UserInput[]; credentialSwitch?: { generation: number } }>,
+  ): WorkerClient {
+    let i = 0;
+    return {
+      getInputs: async () => {
+        const b = batches[Math.min(i, batches.length - 1)] ?? {};
+        i++;
+        return { inputs: b.inputs ?? [], credentialSwitch: b.credentialSwitch };
+      },
+    } as unknown as WorkerClient;
+  }
+
+  it("fires on a matching generation: records the pending switch, aborts WITH a CredentialSwitchSignal reason, and interrupts", async () => {
+    const cancel = new AbortController();
+    let interrupts = 0;
+    const ch = new SteeringChannel(
+      switchClient([{ credentialSwitch: { generation: 7 } }]),
+      "run-1",
+      1,
+      nullLogger(),
+      cancel,
+      { claimGeneration: 7 },
+    );
+    ch.onCredentialSwitch(() => {
+      interrupts++;
+    });
+    ch.start();
+    for (let n = 0; n < 300 && ch.pendingCredentialSwitch() === undefined; n++) await tick();
+    assert.strictEqual(ch.pendingCredentialSwitch(), 7, "the pending switch generation is recorded");
+    assert.strictEqual(cancel.signal.aborted, true, "the shared controller is aborted");
+    assert.ok(
+      cancel.signal.reason instanceof CredentialSwitchSignal,
+      "aborted WITH a CredentialSwitchSignal reason (so the executor maps it to a switch, not a cancel)",
+    );
+    // Let several more matching polls run: the fire is idempotent (once per pending switch).
+    await tick(20);
+    assert.strictEqual(interrupts, 1, "the re-armable interrupt fires exactly once, not every tick");
+    await ch.stop();
+  });
+
+  it("BLOCKING-3: rearmCredentialSwitch re-opens the trip so a LATER same-generation signal fires again", async () => {
+    const cancel = new AbortController();
+    let interrupts = 0;
+    const ch = new SteeringChannel(
+      switchClient([{ credentialSwitch: { generation: 7 } }]), // re-offered on EVERY poll
+      "run-1",
+      1,
+      nullLogger(),
+      cancel,
+      { claimGeneration: 7 },
+    );
+    ch.onCredentialSwitch(() => {
+      interrupts++;
+    });
+    ch.start();
+    for (let n = 0; n < 300 && ch.pendingCredentialSwitch() === undefined; n++) await tick();
+    assert.strictEqual(interrupts, 1, "the switch tripped once");
+    await tick(20);
+    assert.strictEqual(interrupts, 1, "and stays tripped-once while pending (the once-only guard drops repeats)");
+    // A give-up whose clear the server POSITIVELY confirmed re-arms the channel. The SAME-generation
+    // signal — a re-request the owner makes on the STILL-OPEN claim, whose generation is pinned to
+    // claim_generation for the claim's lifetime — is still offered on every poll and must trip AGAIN.
+    // Without the re-arm the once-only guard would drop every subsequent signal for the claim forever.
+    ch.rearmCredentialSwitch();
+    assert.strictEqual(ch.pendingCredentialSwitch(), undefined, "rearm clears the pending switch");
+    for (let n = 0; n < 300 && interrupts < 2; n++) await tick();
+    assert.strictEqual(interrupts, 2, "the re-armed channel fires the switch again on the next matching poll");
+    assert.strictEqual(ch.pendingCredentialSwitch(), 7, "and re-records the pending generation");
+    await ch.stop();
+  });
+
+  it("MAJOR-6: a signal inside a defer window is HELD (not tripped/aborting), then fires once the window closes", async () => {
+    const cancel = new AbortController();
+    let interrupts = 0;
+    const ch = new SteeringChannel(
+      switchClient([{ credentialSwitch: { generation: 7 } }]), // re-offered every poll
+      "run-1",
+      1,
+      nullLogger(),
+      cancel,
+      { claimGeneration: 7 },
+    );
+    ch.onCredentialSwitch(() => {
+      interrupts++;
+    });
+    // Open a defer window BEFORE the poll loop can trip (the executor opens it around a revision turn).
+    ch.beginCredentialSwitchDefer();
+    ch.start();
+    await tick(30); // several polls inside the window
+    assert.strictEqual(ch.pendingCredentialSwitch(), undefined, "inside the defer window the switch is NOT recorded (no pending set)");
+    assert.strictEqual(interrupts, 0, "inside the defer window the re-armable interrupt does NOT fire");
+    assert.strictEqual(cancel.signal.aborted, false, "inside the defer window the current turn is NOT aborted");
+    // Close the window: the same-generation signal, still offered every poll, now trips.
+    ch.endCredentialSwitchDefer();
+    for (let n = 0; n < 300 && ch.pendingCredentialSwitch() === undefined; n++) await tick();
+    assert.strictEqual(ch.pendingCredentialSwitch(), 7, "once the window closes the switch trips at the next matching poll");
+    assert.strictEqual(interrupts, 1, "and the interrupt fires exactly once");
+    await ch.stop();
+  });
+
+  it("does NOT act on a switch whose generation does not match this claim (a superseded claim)", async () => {
+    const cancel = new AbortController();
+    let interrupts = 0;
+    const ch = new SteeringChannel(
+      switchClient([{ credentialSwitch: { generation: 5 } }]),
+      "run-1",
+      1,
+      nullLogger(),
+      cancel,
+      { claimGeneration: 7 },
+    );
+    ch.onCredentialSwitch(() => {
+      interrupts++;
+    });
+    ch.start();
+    await tick(20);
+    assert.strictEqual(ch.pendingCredentialSwitch(), undefined, "a mismatched generation is ignored");
+    assert.strictEqual(cancel.signal.aborted, false, "the controller is NOT aborted for a stale signal");
+    assert.strictEqual(interrupts, 0, "the interrupt never fires for a stale signal");
+    await ch.stop();
+  });
+
+  it("rejects a parked plan-gate waiter with a CredentialSwitchSignal (idle at the gate — no live turn to abort)", async () => {
+    const ch = new SteeringChannel(
+      switchClient([{ credentialSwitch: { generation: 7 } }]),
+      "run-1",
+      1,
+      nullLogger(),
+      new AbortController(),
+      { claimGeneration: 7 },
+    );
+    // Park the gate waiter BEFORE starting the poll loop, so the switch deterministically rejects an
+    // already-parked waiter (the gate-switch case, D13: no SDK turn is running at the gate).
+    const parked = ch.awaitVerdict();
+    ch.start();
+    await assert.rejects(parked, (e) => e instanceof CredentialSwitchSignal);
+    await ch.stop();
+  });
+
+  it("rejects a parked answer waiter (a run idling at an ask_user question) with a CredentialSwitchSignal", async () => {
+    const ch = new SteeringChannel(
+      switchClient([{ credentialSwitch: { generation: 7 } }]),
+      "run-1",
+      1,
+      nullLogger(),
+      new AbortController(),
+      { claimGeneration: 7 },
+    );
+    const parked = ch.awaitAnswer("q-1");
+    ch.start();
+    await assert.rejects(parked, (e) => e instanceof CredentialSwitchSignal);
+    await ch.stop();
+  });
+
+  it("rejects a parked interactive follow-up waiter (a task run idling between turns) with a CredentialSwitchSignal", async () => {
+    // The audit flagged the follow-up waiter as untested for the switch: an interactive task run
+    // parked at awaitFollowUp has no live SDK turn to abort, so — like the gate and answer waiters —
+    // the parked promise itself must reject with a CredentialSwitchSignal so the executor's
+    // follow-up-wait switch handling (runThroughSwitch) can release or re-park it.
+    const ch = new SteeringChannel(
+      switchClient([{ credentialSwitch: { generation: 7 } }]),
+      "run-1",
+      1,
+      nullLogger(),
+      new AbortController(),
+      { claimGeneration: 7 },
+    );
+    const parked = ch.awaitFollowUp(60_000);
+    ch.start();
+    await assert.rejects(parked, (e) => e instanceof CredentialSwitchSignal);
+    await ch.stop();
+  });
+});
+
 // issue #559 M2: the channel tracks the highest follow_up input id it has already DELIVERED
 // to the executor (getLastDeliveredFollowUpId) — the wake-guard watermark the runner reports
 // as open_followup_id at the interactive park. Buffering a follow-up does NOT advance it; only
@@ -341,9 +532,9 @@ describe("SteeringChannel — plan revision (PRD #41)", () => {
         const b = queue.shift();
         if (b && b.length) {
           dispensedPending = true;
-          return b;
+          return { inputs: b };
         }
-        return [];
+        return { inputs: [] };
       },
     } as unknown as WorkerClient;
     return {
@@ -519,9 +710,9 @@ describe("ChatSteering", () => {
         calls++;
         if (calls >= 3) {
           clock = 10_000; // idle window (50) long elapsed...
-          return [inp("follow_up", "raced-in")]; // ...but a follow_up arrives THIS poll
+          return { inputs: [inp("follow_up", "raced-in")] }; // ...but a follow_up arrives THIS poll
         }
-        return [];
+        return { inputs: [] };
       },
     } as unknown as WorkerClient;
     const ch = new ChatSteering(client, "chat-1", 1, nullLogger(), new AbortController(), { now: () => clock });

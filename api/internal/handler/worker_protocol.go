@@ -326,16 +326,26 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 //
 // 🔴 THE RULE, VERBATIM: each PRD adds its own slice at its landing rebase (union, never
 // replace). PRD #1392 M1 adds `recovery_park_cause` and `recovery_release_exact_echo`;
-// PRD #1391 Run A adds `heartbeat_outbox`.
+// PRD #1391 Run A adds `heartbeat_outbox`; PRD #1247 adds `claim_generation_fence`.
 //
-// Do NOT advertise `claim_generation_fence` or `terminal_fence` here: those belong to
-// #1247/#1390 and Run B respectively, land after this, and are added to their own slice at
-// that time — advertising one now would tell the worker to send a fence a current api still
-// rejects. Returns a fresh slice so a caller cannot mutate the advertised set.
+// `claim_generation_fence` is a SERVER-SUPPORT advertisement, not an issue-ownership token:
+// this api now implements the per-query claim-generation fence — a `credential_switch_v1`
+// worker fails closed (ErrMissingClaimGeneration) if a mutating batch omits the generation.
+// The advertisement is what lets a NON-capability (#1391-era) worker know it may stamp the
+// field; a `credential_switch_v1` CAPABILITY worker stamps OPTIMISTICALLY regardless of this
+// advertisement (its runs are fenced server-side, and a one-shot register may have missed the
+// feature under rollout skew), and rides the strict-decode strip-and-retry fallback (PRD #1247
+// fix round) on the message, /state and completion wires if it meets an api that predates the
+// field. #1390 lands after #1247 and its own slice must preserve/dedupe
+// this token, not activate it for the first time. Do NOT advertise `terminal_fence` yet: it
+// belongs to Run B, lands after this, and is added to its own slice then — advertising it now
+// would tell the worker to send a fence this api still rejects. Returns a fresh slice so a
+// caller cannot mutate the advertised set.
 func protocolFeatures() []string {
 	groups := [][]string{
 		{"recovery_park_cause", "recovery_release_exact_echo"}, // PRD #1392 M1
-		{"heartbeat_outbox"}, // PRD #1391 M5, Run A
+		{"heartbeat_outbox"},       // PRD #1391 M5, Run A
+		{"claim_generation_fence"}, // PRD #1247 M5 (D11): this api fences message/report inserts on claim_generation for a credential_switch_v1 worker
 	}
 	seen := make(map[string]bool)
 	out := make([]string, 0)
@@ -702,6 +712,13 @@ func (h *Handler) WorkerRunMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	var req struct {
 		Messages []workersvc.IncomingMessage `json:"messages"`
+		// ClaimGeneration is the runs.claim_generation the reporting worker believes it holds
+		// (PRD #1247 M5, D3). A CAPABILITY worker stamps it on every batch; the fenced append
+		// then persists ONLY while the run is still at that generation with an unreleased claim,
+		// so a released/reclaimed old flight's batch lands nothing. Nullable + OPTIONAL: a legacy
+		// worker omits it and the append is unfenced. The field must exist here because
+		// DecodeJSONLimited rejects unknown fields.
+		ClaimGeneration *int64 `json:"claim_generation"`
 	}
 	// DecodeJSONLimited, not DecodeJSON: this is the one route whose client is a
 	// machine that must decide whether to retry (PRD #108 M2). DecodeJSON's
@@ -739,10 +756,25 @@ func (h *Handler) WorkerRunMessages(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if err := h.wsvc.AppendMessages(r.Context(), wkr, runID, req.Messages); err != nil {
+	if err := h.wsvc.AppendMessagesForClaim(r.Context(), wkr, runID, req.Messages, req.ClaimGeneration); err != nil {
 		switch {
 		case errors.Is(err, workersvc.ErrRunNotOwned):
 			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
+		case errors.Is(err, workersvc.ErrMissingClaimGeneration):
+			// PRD #1247 M5a-1 rework (auditor fail-open finding): a CAPABILITY worker
+			// (advertising credential_switch_v1) omitted claim_generation on a message batch, so
+			// the per-query fence could not engage. Refuse rather than persist unfenced. 409 is
+			// the refuse ack — a protocol violation the worker fixes by stamping the generation,
+			// distinct from the 404 (not owned) and 400 (bad/unstorable batch) causes.
+			httpx.Error(w, http.StatusConflict, "this worker must stamp claim_generation on every message batch")
+		case errors.Is(err, workersvc.ErrStaleClaim):
+			// PRD #1247 M5 (BLOCKING-4 rework): the message batch fenced out — a held-state switch
+			// RELEASED this claim or a reclaim SUPERSEDED it, so it persisted NOTHING and no usage
+			// was folded. Answer the same stale_claim 409 disposition WorkerRunState uses, which
+			// the worker reads to STOP the old flight rather than treat a 409 as a permanent
+			// per-message reject and bisect the batch. The old flight no longer owns the run, so no
+			// run DTO is carried — the disposition is the whole signal.
+			httpx.JSON(w, http.StatusConflict, map[string]any{"disposition": "stale_claim"})
 		case errors.Is(err, workersvc.ErrInvalidMessage):
 			httpx.Error(w, http.StatusBadRequest, "each message needs a positive seq, a kind, and a JSON payload")
 		case errors.Is(err, workersvc.ErrUnstorableMessage):
@@ -847,10 +879,23 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		switch {
+		case errors.Is(err, workersvc.ErrStaleClaim), errors.Is(err, workersvc.ErrMissingClaimGeneration):
+			// PRD #1247 M5 (D3): the generation fence rejected this report — a held-state switch
+			// RELEASED this claim, or a reclaim SUPERSEDED it. M5a-1 rework: it ALSO covers a
+			// CAPABILITY worker that OMITTED claim_generation on a mutating report
+			// (ErrMissingClaimGeneration, fail-closed). Answer 409 with the run PLUS a
+			// disposition:"stale_claim" field the new worker reads to STOP the old flight without
+			// further reports. The 409 status is shared with an ordinary not-applied ack (an old
+			// worker that ignores the extra field still treats it as "changed nothing"); the
+			// disposition is what distinguishes a stale claim from a benign no-op.
+			httpx.JSON(w, http.StatusConflict, map[string]any{
+				"run":         runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock()),
+				"disposition": "stale_claim",
+			})
 		case errors.Is(err, workersvc.ErrRunNotOwned):
 			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
 		case errors.Is(err, workersvc.ErrInvalidState):
-			httpx.Error(w, http.StatusBadRequest, "state must be one of running, awaiting_approval, awaiting_input, awaiting_followup, limit_wait, recovery_wait, paused, pause_failed, completed, failed")
+			httpx.Error(w, http.StatusBadRequest, "state must be one of running, awaiting_approval, awaiting_input, awaiting_followup, limit_wait, recovery_wait, paused, pause_failed, credential_switch, credential_switch_failed, completed, failed")
 		default:
 			slog.Error("worker run state", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -876,10 +921,33 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 		// run opted out) are server-side FAILURES delivered as 200s with
 		// status: "failed", where applied is TRUE. An applied-keyed branch leaks the
 		// disk on exactly those.
-		httpx.JSON(w, http.StatusConflict, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock())})
+		httpx.JSON(w, http.StatusConflict, h.workerStateAck(r, run))
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock())})
+	ack := h.workerStateAck(r, run)
+	if req.State == "credential_switch" {
+		// PRD #1247 M5b (BLOCKING-2 rework): the held-state credential-switch RELEASE applied — a
+		// FRESH requeue (status 'queued') OR an idempotent release after a reclaim (applied, status
+		// 'running'). Tell the worker EXPLICITLY the release took, so enterCredentialSwitch accepts
+		// it regardless of the run's status. It previously required status == 'queued' and so gave
+		// up on the idempotent-after-reclaim success (applied=true, status 'running'), leaving the
+		// old flight to continue on a claim the reclaim already owns.
+		ack["disposition"] = "released"
+	}
+	httpx.JSON(w, http.StatusOK, ack)
+}
+
+// workerStateAck builds the state-report ack body: the run DTO plus, when a held-state switch is
+// pending for the run's CURRENT claim, the worker-facing credential_switch signal (PRD #1247 M5,
+// D3/D4). It is shared by the 200 ack and the ORDINARY not-applied 409 ack — both hand back a run
+// the worker may still be holding, so both must carry the switch signal. It is deliberately NOT
+// used for the stale_claim 409 disposition, which already tells the worker to STOP the flight.
+func (h *Handler) workerStateAck(r *http.Request, run store.Run) map[string]any {
+	ack := map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock())}
+	if sig := workersvc.PendingCredentialSwitchSignal(run); sig != nil {
+		ack["credential_switch"] = sig
+	}
+	return ack
 }
 
 // WorkerRunInputs consumes and returns any pending steering inputs, FIFO.
@@ -893,7 +961,7 @@ func (h *Handler) WorkerRunInputs(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	inputs, err := h.wsvc.ConsumeInputs(r.Context(), wkr, runID)
+	res, err := h.wsvc.ConsumeInputs(r.Context(), wkr, runID)
 	if err != nil {
 		if errors.Is(err, workersvc.ErrRunNotOwned) {
 			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
@@ -903,7 +971,20 @@ func (h *Handler) WorkerRunInputs(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"inputs": inputs})
+	// inputs is ALWAYS an array (never nil) — the consume-nothing path returns an empty slice.
+	inputs := res.Inputs
+	if inputs == nil {
+		inputs = []workersvc.InputDTO{}
+	}
+	body := map[string]any{"inputs": inputs}
+	// PRD #1247 M5 (D3/D4, step 2): surface the held-state switch signal on EVERY inputs
+	// response — including an empty-inputs poll (the idle gate/question/follow-up waiters poll
+	// this route continuously) — so the worker holding the current claim learns a switch was
+	// requested and begins its local release. Omitted when no switch is pending for this claim.
+	if res.CredentialSwitch != nil {
+		body["credential_switch"] = res.CredentialSwitch
+	}
+	httpx.JSON(w, http.StatusOK, body)
 }
 
 // WorkerRunOwnership returns the current status of a run this worker owns —
@@ -998,6 +1079,11 @@ func (h *Handler) WorkerRunCompletionPermit(w http.ResponseWriter, r *http.Reque
 		ContractRevision int    `json:"contract_revision"`
 		Branch           string `json:"branch"`
 		Head             string `json:"head"`
+		// PRD #1247 M5 (D3): the claim generation the worker holds. A CAPABILITY worker stamps it so
+		// RequestCompletionPermit's fence refuses to issue a permit for a released/superseded stale
+		// flight. Nullable + OPTIONAL (a legacy worker omits it, unfenced), but the field must exist
+		// here because httpx.DecodeJSON rejects unknown fields.
+		ClaimGeneration *int64 `json:"claim_generation"`
 	}
 	if err := httpx.DecodeJSON(r, &body); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
@@ -1010,15 +1096,24 @@ func (h *Handler) WorkerRunCompletionPermit(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	res, err := h.wsvc.RequestCompletionPermit(r.Context(), wkr, runID, workersvc.CompletionPermitRequest{
-		ContractRevision: body.ContractRevision, Branch: branch, Head: head,
+		ContractRevision: body.ContractRevision, Branch: branch, Head: head, ClaimGeneration: body.ClaimGeneration,
 	})
 	if err != nil {
-		if errors.Is(err, workersvc.ErrRunNotOwned) {
+		switch {
+		case errors.Is(err, workersvc.ErrRunNotOwned):
 			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
-			return
+		case errors.Is(err, workersvc.ErrCompletionStaleClaim):
+			// PRD #1247 M5: the generation fence refused — a held-state switch RELEASED this claim or
+			// a reclaim SUPERSEDED it, so no permit is issued for the stale flight. 409, non-terminal.
+			httpx.Error(w, http.StatusConflict, "run is not in a live claimed state for this worker")
+		case errors.Is(err, workersvc.ErrMissingClaimGeneration):
+			// PRD #1247 M5: a CAPABILITY worker omitted claim_generation, so the fence could not
+			// engage. Refuse (409) rather than issue an unfenced permit, mirroring WorkerRunState.
+			httpx.Error(w, http.StatusConflict, "this worker must stamp claim_generation on the completion permit request")
+		default:
+			slog.Error("worker run completion permit", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
 		}
-		slog.Error("worker run completion permit", "error", err)
-		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 	httpx.JSON(w, http.StatusOK, res)
@@ -1044,6 +1139,10 @@ func (h *Handler) WorkerRunCompletionAttempt(w http.ResponseWriter, r *http.Requ
 		MilestonesCompleted []string `json:"milestones_completed"`
 		Head                string   `json:"head"`
 		WorktreeFingerprint string   `json:"worktree_fingerprint"`
+		// PRD #1247 M5 (D3): the claim generation the worker holds. A CAPABILITY worker stamps it so
+		// the RecordCompletionAttempt fence refuses a released/superseded stale flight's attempt.
+		// Nullable + OPTIONAL, but the field must exist because httpx.DecodeJSON rejects unknown fields.
+		ClaimGeneration *int64 `json:"claim_generation"`
 	}
 	if err := httpx.DecodeJSON(r, &body); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
@@ -1053,6 +1152,7 @@ func (h *Handler) WorkerRunCompletionAttempt(w http.ResponseWriter, r *http.Requ
 		MilestonesCompleted: body.MilestonesCompleted,
 		Head:                strings.TrimSpace(body.Head),
 		WorktreeFingerprint: strings.TrimSpace(body.WorktreeFingerprint),
+		ClaimGeneration:     body.ClaimGeneration,
 	})
 	if err != nil {
 		switch {
@@ -1060,6 +1160,10 @@ func (h *Handler) WorkerRunCompletionAttempt(w http.ResponseWriter, r *http.Requ
 			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
 		case errors.Is(err, workersvc.ErrCompletionStaleClaim):
 			httpx.Error(w, http.StatusConflict, "run is not in a live claimed state for this worker")
+		case errors.Is(err, workersvc.ErrMissingClaimGeneration):
+			// PRD #1247 M5: a CAPABILITY worker omitted claim_generation, so the fence could not
+			// engage. Refuse (409) rather than record an unfenced attempt, mirroring WorkerRunState.
+			httpx.Error(w, http.StatusConflict, "this worker must stamp claim_generation on the completion attempt")
 		case errors.Is(err, workersvc.ErrCompletionNotInterlocked):
 			httpx.Error(w, http.StatusBadRequest, "run is not interlocked")
 		default:
@@ -1099,15 +1203,25 @@ func (h *Handler) WorkerRunCompletionHold(w http.ResponseWriter, r *http.Request
 		// The exact head the worker captured at hold time. Empty is allowed (the column is
 		// nullable); the service NUL-strips + TrimSpaces it, matching the permit path.
 		Head string `json:"head"`
+		// PRD #1247 M5 (D3): the claim generation the worker holds. A CAPABILITY worker stamps it so
+		// the hold's fence refuses to park a released/superseded stale flight's reclaimed run.
+		// Nullable + OPTIONAL, but the field must exist because httpx.DecodeJSON rejects unknown fields.
+		ClaimGeneration *int64 `json:"claim_generation"`
 	}
 	if err := httpx.DecodeJSON(r, &body); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	run, applied, err := h.wsvc.SetRunCompletionHold(r.Context(), wkr, runID, body.Head)
+	run, applied, err := h.wsvc.SetRunCompletionHold(r.Context(), wkr, runID, body.Head, body.ClaimGeneration)
 	if err != nil {
 		if errors.Is(err, workersvc.ErrRunNotOwned) {
 			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
+			return
+		}
+		if errors.Is(err, workersvc.ErrMissingClaimGeneration) {
+			// PRD #1247 M5: a CAPABILITY worker omitted claim_generation, so the hold's fence could
+			// not engage. Refuse (409) rather than park unfenced, mirroring WorkerRunState.
+			httpx.Error(w, http.StatusConflict, "this worker must stamp claim_generation on the completion hold")
 			return
 		}
 		slog.Error("worker run completion hold", "error", err)

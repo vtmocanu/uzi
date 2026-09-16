@@ -598,7 +598,8 @@ describe("SdkExecutor interactive task park (PRD #517 M3)", () => {
 describe("SteeringChannel.awaitFollowUp (PRD #517 M3)", () => {
   function fakeClient(batches: UserInput[][]): WorkerClient {
     let i = 0;
-    return { getInputs: async () => batches[i++] ?? [] } as unknown as WorkerClient;
+    // PRD #1247 M5: getInputs now returns { inputs, credentialSwitch? }; the poller reads `.inputs`.
+    return { getInputs: async () => ({ inputs: batches[i++] ?? [] }) } as unknown as WorkerClient;
   }
   const inp = (kind: UserInput["kind"], body?: string): UserInput => ({
     id: 1,

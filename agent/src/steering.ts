@@ -62,6 +62,12 @@ export interface SteeringOptions {
   /** PRD #517 M3: injectable clock so the interactive follow-up park's idle window is
    *  provable without real time (mirrors ChatSteeringOptions.now). Default Date.now. */
   now?: () => number;
+  /** PRD #1247 M5b: the claim-lane generation THIS claim holds. A `credential_switch {generation}`
+   *  signal on an /inputs poll is acted on ONLY when its generation === this value — a signal for a
+   *  superseded (already-reclaimed) claim is ignored. Absent ⇒ 0, which no real fenced claim uses,
+   *  so a channel constructed without it never trips a switch (the behaviour of every test and
+   *  chat path that omits it). Threaded from the flight by the runner. */
+  claimGeneration?: number;
 }
 
 /** Feed notices for events discarded because they were written against a plan version
@@ -128,6 +134,29 @@ export class PauseNowSignal extends Error {
   }
 }
 
+/**
+ * PRD #1247 M5b: the abort/interrupt a held-state CREDENTIAL SWITCH uses to release the claim.
+ * A pending switch for THIS claim's generation is delivered on an /inputs poll
+ * (`credential_switch {generation}`); the poll loop trips the shared controller with this as the
+ * abort reason (so the executor's cancel listener maps it to REASON_CREDENTIAL_SWITCH → a fresh
+ * CredentialSwitchSignal from tripError, DISTINCT from both the cancel path and the pause path),
+ * invokes the re-armable onCredentialSwitch interrupt, AND rejects any parked gate/answer/
+ * follow-up waiter with this error so a run idling at the plan gate / a question / a follow-up
+ * (no live SDK turn to abort) is released too. It reaches executeClaim's catch chain, which enters
+ * the two-phase local release (enterCredentialSwitch) instead of failing the run — the claim is
+ * handed back to the server for a reclaim on the newly-chosen token.
+ *
+ * Modeled on PauseNowSignal (exported; constructed here, `instanceof`-tested and thrown in
+ * sdk-executor.ts, and `instanceof`-tested in runner.ts) so it crosses files and knip sees a live
+ * consumer of the export.
+ */
+export class CredentialSwitchSignal extends Error {
+  constructor() {
+    super("run released for a credential switch");
+    this.name = "CredentialSwitchSignal";
+  }
+}
+
 export class SteeringChannel {
   private stopped = false;
   private loop: Promise<void> | undefined;
@@ -178,11 +207,35 @@ export class SteeringChannel {
    *  prior trip re-arms the drop. The shared-controller abort is KEPT alongside it as the
    *  pre-registration safety net for the very first `now` (before the executor registers this). */
   private pauseNowInterrupt: (() => void) | undefined;
+  /** PRD #1247 M5b: the generation of a held-state credential switch pending for THIS claim, or
+   *  undefined when none is pending. Set ONCE by maybeTripCredentialSwitch on the first matching
+   *  `credential_switch` poll (idempotent — every later tick with the same pending switch is a
+   *  no-op), read by the runner (pendingCredentialSwitch) so enterCredentialSwitch knows which
+   *  generation it is releasing. Never reset within a flight: the flight ends (release or give-up)
+   *  the moment it is set. */
+  private pendingSwitchGeneration: number | undefined;
+  /** PRD #1247 M5b (MAJOR-6 rework): while > 0, a matching credential_switch signal is DEFERRED —
+   *  maybeTripCredentialSwitch returns WITHOUT setting pendingSwitchGeneration and WITHOUT aborting,
+   *  so the signal (which rides every poll) is honored at the NEXT trip point after the window ends.
+   *  The executor opens this window around a plan-REVISION planning turn, whose new plan is not yet
+   *  persisted: releasing mid-turn would leave the run row on the OLD plan_md, so a reclaim would
+   *  re-present the superseded plan. Deferring lets the switch trip at the following gate wait
+   *  instead, AFTER gatePlan has persisted the revised plan. A COUNTER (not a bool) so nested/
+   *  re-entrant windows compose. */
+  private switchDeferDepth = 0;
+  /** PRD #1247 M5b: a RE-ARMABLE interrupt the executor registers (via ctx.onCredentialSwitch),
+   *  the exact analog of pauseNowInterrupt — invoked on the matching switch so a switch drops the
+   *  in-flight turn even after the shared cancel controller has already fired once (an
+   *  AbortController fires 'abort' only once). The executor's callback trips the current turn with
+   *  REASON_CREDENTIAL_SWITCH. */
+  private credentialSwitchInterrupt: (() => void) | undefined;
   /** FIFO queue of revision feedback (PRD #41), each stamped with its arrival epoch. */
   private readonly reviseQueue: { feedback: string; epoch: number }[] = [];
-  /** The gate waiter parked on awaitGateEvent, with the epoch it is waiting for. */
+  /** The gate waiter parked on awaitGateEvent, with the epoch it is waiting for. `reject` releases
+   *  it with a CredentialSwitchSignal when a held-state switch trips (PRD #1247 M5b): a run idling
+   *  at the plan gate has no live SDK turn to abort, so the waiter itself must reject. */
   private gateWaiter:
-    { epoch: number; resolve: (v: PlanVerdict) => void } | undefined;
+    { epoch: number; resolve: (v: PlanVerdict) => void; reject: (err: Error) => void } | undefined;
   /** An answer that arrived before the executor asked for one (no lost wakeup),
    *  stamped with the QUESTION ID it named. Latest-wins if several land before a read.
    *
@@ -196,21 +249,24 @@ export class SteeringChannel {
    *  still said "first gate", and a verdict already queued when the gate opened would
    *  go stale. */
   private answerBuffer: { answers: string[]; questionId: string } | undefined;
-  /** The answer waiter parked on awaitAnswer, with the question id it is waiting for. */
+  /** The answer waiter parked on awaitAnswer, with the question id it is waiting for. `reject`
+   *  releases it with a CredentialSwitchSignal when a held-state switch trips (PRD #1247 M5b). */
   private answerWaiter:
-    { questionId: string; resolve: (v: AnswerVerdict) => void } | undefined;
+    { questionId: string; resolve: (v: AnswerVerdict) => void; reject: (err: Error) => void } | undefined;
   /** PRD #517 M3: the interactive-task follow-up park waiter (single outstanding), with
    *  the idle bound and the clock reading it armed at. A DISTINCT slot from gateWaiter /
    *  answerWaiter for the same reason those are distinct (one shared slot would have two
    *  owners): an interactive task parks HERE between turns, never at the plan gate or an
    *  ask_user question, so the three are mutually exclusive and each owns its own slot. */
   private followUpWaiter:
-    | { resolve: (o: FollowUpOutcome) => void; idleMs: number; parkedAt: number }
+    | { resolve: (o: FollowUpOutcome) => void; reject: (err: Error) => void; idleMs: number; parkedAt: number }
     | undefined;
   private readonly sleepFn: (ms: number, signal?: AbortSignal) => Promise<void>;
   private readonly notify: ((text: string) => void) | undefined;
   /** PRD #517 M3: clock the follow-up park's idle window measures against. */
   private readonly now: () => number;
+  /** PRD #1247 M5b: the claim-lane generation this channel guards a credential switch against. */
+  private readonly claimGeneration: number;
 
   constructor(
     private readonly client: WorkerClient,
@@ -224,6 +280,7 @@ export class SteeringChannel {
     this.sleepFn = opts.sleep ?? sleep;
     this.notify = opts.notify;
     this.now = opts.now ?? Date.now;
+    this.claimGeneration = opts.claimGeneration ?? 0;
   }
 
   /** Seed the sticky `stop` state at construction time (issue #552 M3), before the poll
@@ -280,6 +337,58 @@ export class SteeringChannel {
     this.pauseNowInterrupt = cb;
   }
 
+  /** Register the re-armable credential-switch interrupt (see credentialSwitchInterrupt, PRD #1247
+   *  M5b). Last-wins; the runner wires it to the executor's per-run trip so a held-state switch
+   *  drops the current turn even after the shared abort controller has been spent. */
+  onCredentialSwitch(cb: () => void): void {
+    this.credentialSwitchInterrupt = cb;
+  }
+
+  /** PRD #1247 M5b: the generation of a held-state credential switch pending for THIS claim, or
+   *  undefined when none is pending. Read by the runner's CredentialSwitchSignal catch arm so
+   *  enterCredentialSwitch knows which generation it is releasing (it equals this claim's
+   *  generation by construction — maybeTripCredentialSwitch fires only on a generation match). */
+  pendingCredentialSwitch(): number | undefined {
+    return this.pendingSwitchGeneration;
+  }
+
+  /** PRD #1247 M5b (BLOCKING-3 rework): re-arm the credential-switch trip after a give-up whose
+   *  stamp-clear the server POSITIVELY confirmed. Clears pendingSwitchGeneration so a LATER
+   *  same-generation switch signal — a re-request the owner makes on the STILL-OPEN claim, whose
+   *  generation is pinned to claim_generation for the claim's lifetime — can trip again. Without
+   *  it the once-only guard in maybeTripCredentialSwitch permanently drops every subsequent signal
+   *  for that claim. Call it ONLY after a CONFIRMED clear on a give-up-continue, never on a
+   *  retain-and-stop (where the server stamp may still be pending). */
+  rearmCredentialSwitch(): void {
+    this.pendingSwitchGeneration = undefined;
+  }
+
+  /** PRD #1247 M5b (MINOR-7): the PUBLIC entry the runner's reportState closure calls to feed the
+   *  state-ack's credential_switch signal into the SAME trigger the /inputs poll uses. It reuses
+   *  maybeTripCredentialSwitch's guards verbatim — the generation match, the once-only idempotency,
+   *  and the defer window — so the two transports compose (a switch trips at most once, whichever the
+   *  ack or a poll observes first) and a failing /inputs poll can no longer disable the advertised
+   *  secondary transport. */
+  tripCredentialSwitch(generation: number): void {
+    this.maybeTripCredentialSwitch(generation);
+  }
+
+  /** PRD #1247 M5b (MAJOR-6): open a defer window — a matching credential_switch signal is held
+   *  (not tripped, not aborting) until the window closes. Used around a plan-REVISION planning turn
+   *  so a switch never releases the claim before gatePlan has persisted the revised plan (which
+   *  would strand the run row on the OLD plan_md and re-present the superseded plan on a reclaim).
+   *  Counted, so a defer window that itself nests one composes; balanced by endCredentialSwitchDefer. */
+  beginCredentialSwitchDefer(): void {
+    this.switchDeferDepth++;
+  }
+
+  /** PRD #1247 M5b (MAJOR-6): close a defer window opened by beginCredentialSwitchDefer. The pending
+   *  signal is NOT re-tripped here — it rides every poll, so the next poll after the window closes
+   *  (the gate wait) trips it, by which point the revised plan is persisted. */
+  endCredentialSwitchDefer(): void {
+    if (this.switchDeferDepth > 0) this.switchDeferDepth--;
+  }
+
   /** Start the poll loop (idempotent). Runs until stop(). */
   start(): void {
     if (this.loop) return;
@@ -334,8 +443,8 @@ export class SteeringChannel {
   awaitGateEvent(epoch: number): Promise<PlanVerdict> {
     const v = this.takeGateEvent(epoch);
     if (v) return Promise.resolve(v);
-    return new Promise<PlanVerdict>((resolve) => {
-      this.gateWaiter = { epoch, resolve };
+    return new Promise<PlanVerdict>((resolve, reject) => {
+      this.gateWaiter = { epoch, resolve, reject };
     });
   }
 
@@ -362,8 +471,8 @@ export class SteeringChannel {
   awaitAnswer(questionId: string): Promise<AnswerVerdict> {
     const v = this.takeAnswerEvent(questionId);
     if (v) return Promise.resolve(v);
-    return new Promise<AnswerVerdict>((resolve) => {
-      this.answerWaiter = { questionId, resolve };
+    return new Promise<AnswerVerdict>((resolve, reject) => {
+      this.answerWaiter = { questionId, resolve, reject };
     });
   }
 
@@ -481,8 +590,8 @@ export class SteeringChannel {
         body: f.body,
       });
     }
-    return new Promise<FollowUpOutcome>((resolve) => {
-      this.followUpWaiter = { resolve, idleMs, parkedAt: this.now() };
+    return new Promise<FollowUpOutcome>((resolve, reject) => {
+      this.followUpWaiter = { resolve, reject, idleMs, parkedAt: this.now() };
     });
   }
 
@@ -557,6 +666,58 @@ export class SteeringChannel {
     const w = this.gateWaiter;
     this.gateWaiter = undefined;
     w.resolve(v);
+  }
+
+  /**
+   * PRD #1247 M5b: act on a `credential_switch {generation}` signal surfaced by an /inputs poll.
+   *
+   * ONLY when the generation matches THIS claim's (`this.claimGeneration`): a signal carrying a
+   * DIFFERENT generation targets a superseded claim (the run was already reclaimed under a newer
+   * generation) and MUST be ignored — acting on it would release a claim that is not this flight's.
+   * IDEMPOTENT: fires exactly once per pending switch (the `pendingSwitchGeneration` guard), so the
+   * continuous idle poll does not re-abort every tick.
+   *
+   * On a match it does three things, covering every shape a held-state run can be in when the
+   * switch lands:
+   *   1. records the pending switch (read later by the runner's release state machine);
+   *   2. trips the shared cancel controller with a CredentialSwitchSignal reason (the mid-turn
+   *      case — the executor's cancel listener maps the reason to REASON_CREDENTIAL_SWITCH) and
+   *      invokes the re-armable interrupt (a turn that outlived a spent controller);
+   *   3. rejects any parked gate/answer/follow-up waiter with a CredentialSwitchSignal (the idle
+   *      case — a run at the plan gate / a question / a follow-up park has NO live SDK turn to
+   *      abort, so the awaited promise itself must reject to release the flight).
+   */
+  private maybeTripCredentialSwitch(generation: number): void {
+    if (generation !== this.claimGeneration) return; // a stale signal for a superseded claim
+    // PRD #1247 M5b (MAJOR-6): inside a defer window (a plan-revision planning turn), DEFER — do NOT
+    // set pendingSwitchGeneration and do NOT abort. The signal rides every poll, so it trips at the
+    // next poll after the window closes (the gate wait), by which point the revised plan is persisted.
+    if (this.switchDeferDepth > 0) return;
+    if (this.pendingSwitchGeneration !== undefined) return; // already tripped once — idempotent
+    this.pendingSwitchGeneration = generation;
+    // Mid-turn: trip the shared controller (guarded on !aborted so we don't double-abort a
+    // controller a cancel/pause already spent) and the re-armable interrupt, exactly like a `now`
+    // pause. The abort reason is a CredentialSwitchSignal so the executor's cancel listener routes
+    // it to REASON_CREDENTIAL_SWITCH, not REASON_CANCELLED.
+    if (!this.cancel.signal.aborted) this.cancel.abort(new CredentialSwitchSignal());
+    this.credentialSwitchInterrupt?.();
+    // Idle at a waiter: reject it so a gate/question/follow-up park (no live turn) is released.
+    const err = new CredentialSwitchSignal();
+    if (this.gateWaiter) {
+      const w = this.gateWaiter;
+      this.gateWaiter = undefined;
+      w.reject(err);
+    }
+    if (this.answerWaiter) {
+      const w = this.answerWaiter;
+      this.answerWaiter = undefined;
+      w.reject(err);
+    }
+    if (this.followUpWaiter) {
+      const w = this.followUpWaiter;
+      this.followUpWaiter = undefined;
+      w.reject(err);
+    }
   }
 
   private route(kind: string, body: string | null | undefined, id: number): void {
@@ -666,9 +827,13 @@ export class SteeringChannel {
   private async pollLoop(): Promise<void> {
     while (!this.stopped) {
       try {
-        const inputs = await this.client.getInputs(this.runId);
+        const { inputs, credentialSwitch } = await this.client.getInputs(this.runId);
         for (const inp of inputs)
           this.route(inp.kind, inp.body ?? undefined, inp.id);
+        // PRD #1247 M5b: the credential-switch signal rides EVERY inputs response (incl. an empty
+        // one), so read it each tick after routing. It is not an input row — it is the server's
+        // "a switch is pending for the current claim" fact — and acting on it releases the claim.
+        if (credentialSwitch) this.maybeTripCredentialSwitch(credentialSwitch.generation);
       } catch (err) {
         // The loop continues on a getInputs failure (HTTP >=400 / timeout) — but only the
         // FETCH is skipped, not the service step below. PRD #517 M5: serviceFollowUp()
@@ -845,7 +1010,7 @@ export class ChatSteering implements ChatInputSource {
   private async pollLoop(): Promise<void> {
     while (!this.stopped) {
       try {
-        const inputs = await this.client.getInputs(this.runId);
+        const { inputs } = await this.client.getInputs(this.runId);
         for (const inp of inputs) this.route(inp.kind, inp.body ?? undefined);
       } catch (err) {
         this.log.warn("chat steering: input poll failed", {

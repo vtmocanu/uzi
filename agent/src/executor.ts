@@ -227,6 +227,17 @@ export interface RunContext {
    *  3); a park BEFORE approval (only reachable if the planning turn itself died on a
    *  limit) likewise leaves this false and resumes into planning exactly as today. */
   planApproved?: boolean;
+  /** PRD #1247 M5b (D13): the phase a RESUME claim after a held-state credential switch should
+   *  RESTORE, one of "awaiting_approval" / "awaiting_input" / "implementing" (or absent/"" for a
+   *  fresh run). Set by the RUNNER from claim.resume_phase. The executor reads only
+   *  "awaiting_approval": it re-presents the ALREADY-CAPTURED plan (ctx.approvedPlan / the persisted
+   *  plan_md) at the gate WITHOUT running a planning turn — distinct from planApproved, which skips
+   *  the gate entirely for an APPROVED plan; here the plan is not yet approved, so a human still
+   *  approves it, then implementation proceeds on the newly-chosen token. The other phases need no
+   *  new executor code: "implementing" is the existing preApproved skip, "awaiting_input" is driven
+   *  by the existing open_question_id re-park, and "awaiting_followup" collapses to "implementing"
+   *  server-side. Absent/other ⇒ today's behaviour. */
+  resumePhase?: string;
   /** PRD #209 (D4 row 2): this run's plan was supplied EXTERNALLY by the user at create
    *  time (claim plan_source='seeded'), not produced by a Phase-1 planning turn. Set by
    *  the runner. Two effects: it relaxes the pre-approved skip so it fires with NO SDK
@@ -395,6 +406,50 @@ export interface RunContext {
    */
   onPauseNow?(cb: () => void): void;
   /**
+   * PRD #1247 M5b: register a RE-ARMABLE interrupt (steering.onCredentialSwitch) the steering
+   * channel invokes when a held-state CREDENTIAL SWITCH is pending for this claim, so a switch drops
+   * the in-flight turn even after the shared abort controller has already fired once — the exact
+   * analog of onPauseNow. The executor passes a callback that trips the current turn with
+   * REASON_CREDENTIAL_SWITCH, so driveTurn throws a CredentialSwitchSignal that propagates to the
+   * runner's release state machine. Absent on the stub/test executors ⇒ no re-arm (the first switch
+   * still drops the turn via ctx.signal's CredentialSwitchSignal abort reason).
+   */
+  onCredentialSwitch?(cb: () => void): void;
+  /**
+   * PRD #1247 M5b (data-integrity fix): attempt the held-state credential switch IN PLACE, driven
+   * from wherever the run was when the switch tripped — the implement loop's turn catch (a live
+   * turn), or one of the idle held-state waiters (the plan gate, an ask_user question, an
+   * interactive follow-up). Called INSTEAD of letting the CredentialSwitchSignal propagate to the
+   * runner's outer catch, so a GIVE-UP keeps the run running rather than ending the flight while it
+   * is still healthy (which no sweep requeues → RUN_TIMEOUT orphan / held-state strand).
+   *
+   * The runner wires it to `enterCredentialSwitch` (the same two-phase state machine the outer catch
+   * uses). Two outcomes:
+   *   - `"released"` — a VERIFIED capture + a `queued` release ack: the switch already drained the
+   *     batcher, reported `credential_switch`, and parked the HOME; the server requeued the run for a
+   *     reclaim at resume_phase on the newly-chosen token. The caller surfaces
+   *     {@link ExecutorResult.switchReleased} and ENDS (no more turns) so the runner skips finalize.
+   *   - `"gave_up"` — the capture never verified (or the release was not acked): the run CONTINUES on
+   *     the OLD token in place (a restarted turn, or a re-presented gate/question/follow-up wait). The
+   *     server already cleared the switch stamp, and the runner cleared the flight's preserve flags so
+   *     a later NORMAL completion cleans up as usual. This is the fall-through the PRD requires
+   *     (D3/D14), exactly like a declined `now` pause continues rather than parks.
+   *
+   * Absent on the stub/test executors ⇒ the loop/waiters re-throw the CredentialSwitchSignal to the
+   * runner's outer catch, byte-identical to the pre-fix behaviour.
+   */
+  attemptCredentialSwitch?(): Promise<"released" | "gave_up">;
+  /**
+   * PRD #1247 M5b (MAJOR-6): run `fn` with credential-switch trips DEFERRED — a matching switch
+   * signal is held (not tripped, the turn not aborted) for the duration, then honored at the next
+   * trip point after `fn` returns. The executor wraps a plan-REVISION planning turn (whose new plan
+   * is not yet persisted) in this, so a switch never releases mid-revision — which would leave the
+   * run row on the OLD plan_md and re-present the superseded plan on a reclaim. The switch instead
+   * trips at the following gate wait, after gatePlan has persisted the revised plan. Balanced
+   * (begin/finally end) by the runner. Absent on the stub/test executors ⇒ `fn` runs undeferred.
+   */
+  deferCredentialSwitch?<T>(fn: () => Promise<T>): Promise<T>;
+  /**
    * PRD #517 M3: park an INTERACTIVE task run after a clean `signal_done`, waiting for the
    * next follow-up. The runner's implementation (a) reports `awaiting_followup` and verifies
    * the ack (the park must actually take, mirroring askUser's ack check), then (b) blocks on
@@ -554,6 +609,16 @@ export interface ExecutorResult {
    *  (the seam is unwired, so the executor falls back to the legacy throw). StubExecutor never
    *  sets it. */
   completionHeld?: { reason: string };
+  /** PRD #1247 M5b (data-integrity fix): set when a held-state credential switch RELEASED the claim
+   *  IN PLACE — `ctx.attemptCredentialSwitch` returned "released" from the implement loop, the plan
+   *  gate, an ask_user question, or an interactive follow-up wait. The switch already drained the
+   *  batcher, reported `credential_switch`, got the `queued` ack, and parked the HOME; the server
+   *  requeued the run for a reclaim at resume_phase on the newly-chosen token. The runner reads it in
+   *  phasePublish to SKIP finalization (no push, no MR, no completion report) exactly like
+   *  `pausedAt`/`completionHeld` — the run is already non-terminal and requeued, and the finally
+   *  retires the clone while preserving the HOME. Absent on every normal completion and on a give-up
+   *  (which CONTINUES the run). StubExecutor never sets it. */
+  switchReleased?: boolean;
 }
 
 /**

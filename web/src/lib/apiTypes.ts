@@ -1398,6 +1398,11 @@ export interface Schedule {
   // fired (or a parked/transient fire left the prior summary — or none — in place, since
   // only the success/benign advance path persists).
   last_fire: LastFire | null;
+  /** PRD #1247 M1 (D5): the schedule's per-run credential override. null = inherit (the
+   *  fired run follows the worker binding), else the {mode, label} a fired run stamps onto
+   *  itself. Twin of Run.credential_override; null for every schedule until M6 wires it.
+   *  OPTIONAL for the same api/web rollout skew as Run.credential_override. */
+  credential_override?: CredentialOverride | null;
   auto_approve: boolean;
   wait_on_limit: boolean;
   /** PRD #841: per-schedule MR-review-rework override, tri-state. null = inherit (the
@@ -2424,6 +2429,39 @@ export interface Run {
    *  never <Markdown> or a URL sink. OPTIONAL here for the SAME api/web rollout skew as
    *  plan_source (a mid-deploy api pod predating the field omits the key). */
   current_activity?: RunActivity | null;
+  /** PRD #1247 M1: the per-run Anthropic credential override + attribution journal.
+   *  credential_override is null = inherit the worker binding (today's behaviour), else the
+   *  {mode, label} the owner chose. credential_switch is the pending held-state switch:
+   *  null | "requested" | "released". credential_epochs is the applied-switch history, one
+   *  entry per claim, oldest first — [] over null via the DTO builder (mapper-normalized, so
+   *  its null zero fixture is exempted in the contract test). All three read null/[] for a run
+   *  with no override and for a pre-feature run. OPTIONAL for the same api/web rollout
+   *  skew as current_activity/plan_changed_files: a mid-deploy api pod predating #1247
+   *  omits the keys. credential_epochs is normalized to [] by runToDTO (mapper never-null),
+   *  so its zero fixture null is exempted in the contract test like plan_changed_files. */
+  credential_override?: CredentialOverride | null;
+  credential_switch?: string | null;
+  credential_epochs?: CredentialEpoch[];
+}
+
+/** CredentialOverride is a run's or schedule's per-run credential choice (PRD #1247 M1):
+ *  mode is "pinned" | "auto" | "default", label is the pinned token's snapshotted name
+ *  (null for auto/default or a deleted token). Rendered null-when-absent on Run and
+ *  Schedule. */
+export interface CredentialOverride {
+  mode: string;
+  label: string | null;
+}
+
+/** CredentialEpoch is one claim's credential attribution (PRD #1247 M1, D7): the
+ *  generation, the token it spent (label + select_reason, null-tolerant for a deleted
+ *  token's history), and when it was applied. claim_generation is a plain JSON number
+ *  (int64 on the wire). */
+export interface CredentialEpoch {
+  claim_generation: number;
+  label: string | null;
+  select_reason: string | null;
+  applied_at: string;
 }
 
 // RunActivity is the server-derived "now" line for a run (PRD #1064 D3): who is acting,
@@ -2606,7 +2644,9 @@ export type SelectReason =
   | "best_of_pool"
   | "pool_empty"
   | "pool_stale"
-  | "open_failed";
+  | "open_failed"
+  | "run_pinned"
+  | "run_default";
 
 export type AutoStatus =
   | "eligible"

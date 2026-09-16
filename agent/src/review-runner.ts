@@ -93,13 +93,29 @@ export class ReviewRunner {
     const targetId = claim.review_target_run_id;
     if (!targetId) {
       this.log.warn("review claim missing review_target_run_id; failing", { run_id: reviewRunId });
-      await safeReportFailed(this.client, this.log, "review", reviewRunId, "review claim carried no target run");
+      await safeReportFailed(
+        this.client,
+        this.log,
+        "review",
+        reviewRunId,
+        "review claim carried no target run",
+        undefined,
+        claim.claim_generation,
+      );
       return;
     }
     const branch = claim.branch?.trim();
     if (!branch) {
       this.log.warn("review claim missing branch; failing", { run_id: reviewRunId, target: targetId });
-      await safeReportFailed(this.client, this.log, "review", reviewRunId, "review claim carried no branch to review");
+      await safeReportFailed(
+        this.client,
+        this.log,
+        "review",
+        reviewRunId,
+        "review claim carried no branch to review",
+        undefined,
+        claim.claim_generation,
+      );
       return;
     }
 
@@ -107,7 +123,28 @@ export class ReviewRunner {
     // the reviewed run still receives a (report-only) result rather than nothing.
     let review: TaskReviewRequest;
     try {
-      await this.client.reportState(reviewRunId, { status: "running" });
+      const runningAck = await this.client.reportState(reviewRunId, {
+        status: "running",
+        // PRD #1247 M2 fix round: this runner reports state DIRECTLY (not through the RunRunner
+        // stamping closure), so it threads the claim's run-lane generation onto the report itself
+        // — unconditionally, mirroring that closure — so a credential_switch_v1 capability
+        // worker's review run is fenced, not refused with a 409.
+        claim_generation: claim.claim_generation,
+      });
+      // PRD #1247 fix round (Greptile P1): a review claim SUPERSEDED by an ordinary stale-worker
+      // requeue + reclaim (which bumps the run-lane generation) gets staleClaim on this first
+      // report. postTaskReview does NOT fence on generation, so a superseded flight would
+      // overwrite the current review. Abandon cleanly BEFORE clone/diff/model/advice/completed/
+      // failed work. A normal RETURN, not a throw: throwing here falls through to the catch's
+      // `failed` review post, which would ALSO overwrite. This closes only the INITIAL-stale
+      // window; the atomic fence for post-ack supersession + the ungenerationed postTaskReview
+      // write is a follow-up (issue #1423).
+      if (runningAck?.staleClaim) {
+        this.log.warn("review claim superseded (stale) at running report; abandoning without posting", {
+          run_id: reviewRunId,
+        });
+        return;
+      }
       // ensureClone mirrors every origin head into refs/remotes/origin/* (a bare
       // clone-or-fetch), so both the reviewed branch and its base resolve locally for the
       // diff below — no working-tree checkout is needed (reviewDiff reads the bare's
@@ -144,8 +181,40 @@ export class ReviewRunner {
     }
 
     try {
+      // PRD #1247 fix round (Greptile P1, pre-post probe): the initial running ack closes only the
+      // pre-model window. A review model call can run minutes while a stale-worker requeue (~45s)
+      // plus a same-worker reclaim (concurrency 2) advances the run to G+1 mid-flight; postTaskReview
+      // authorizes on worker+nonterminal ONLY (no generation fence), so a stale G flight could
+      // overwrite G+1's review. Re-probe with an idempotent running report (SetRunRunning preserves
+      // status_since) IMMEDIATELY before the advice write; a stale ack abandons before postTaskReview.
+      // A residual sub-RPC TOCTOU and the ungenerationed advice write itself remain for the
+      // atomic-fence follow-up (issue #1423).
+      // The pre-post probe is a SUPERSESSION FENCE, and it is FAIL-CLOSED (Greptile P1 disposition —
+      // NOT best-effort). A staleClaim ack abandons cleanly (below). A transport/transient failure
+      // leaves ownership UNKNOWN — the run may have been reclaimed at G+1 during the outage — and
+      // postTaskReview is generation-blind until #1423, so PROCEEDING could overwrite the reclaiming
+      // flight's review with this stale one. So a probe throw PROPAGATES to the advice-phase catch
+      // (safeReportFailed, itself generation-fenced), posting NO review: the review is lost
+      // (recoverable) rather than risking a stale overwrite. In the api-unreachable case postTaskReview
+      // would fail anyway, so this only changes the narrow reclaim-during-blip case, in the safe
+      // direction.
+      const prePostAck = await this.client.reportState(reviewRunId, {
+        status: "running",
+        claim_generation: claim.claim_generation,
+      });
+      if (prePostAck?.staleClaim) {
+        this.log.warn("review claim superseded (stale) before posting review; abandoning without posting", {
+          run_id: reviewRunId,
+        });
+        return;
+      }
       await this.client.postTaskReview(targetId, review);
-      await this.client.reportState(reviewRunId, { status: "completed" });
+      await this.client.reportState(reviewRunId, {
+        status: "completed",
+        // PRD #1247 M2 fix round: stamp the claim's run-lane generation on the terminal report too
+        // (direct report, not the RunRunner stamping closure), so the completion is fenced not 409'd.
+        claim_generation: claim.claim_generation,
+      });
       this.log.info("review run completed", {
         run_id: reviewRunId,
         target: targetId,
@@ -154,7 +223,7 @@ export class ReviewRunner {
       });
     } catch (err) {
       this.log.warn("review post/complete failed", { run_id: reviewRunId, error: errMessage(err) });
-      await safeReportFailed(this.client, this.log, "review", reviewRunId, errMessage(err));
+      await safeReportFailed(this.client, this.log, "review", reviewRunId, errMessage(err), undefined, claim.claim_generation);
     }
   }
 

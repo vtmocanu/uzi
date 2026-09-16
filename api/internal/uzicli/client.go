@@ -99,6 +99,14 @@ type Client interface {
 	// /api/runs/{id}/resume-now, RequireUser so a CLI token can reach it. A non-held run
 	// is a 409 → ExitConflict (5); a foreign/absent run is 404 → 4. No request body.
 	ResumeRunNow(ctx context.Context, id string) (apitypes.RunDTO, error)
+	// SetRunCredential is the `uzi run set-token` verb (PRD #1247 M4, D4/D12): POST
+	// /api/runs/{id}/credential {mode, secret_id?}, RequireUser so a uzc_ CLI Bearer reaches
+	// it. It re-points which Anthropic token a queued or parked run spends (promoting a
+	// parked run to queued at once) and returns the updated run plus an optional D6 warning
+	// string. A held/claimed/terminal run is 409 → ExitConflict (5); a foreign/unknown run
+	// or token is 404 → ExitNotFound (4); a codex-harness run is 422; a bad mode is 400 →
+	// ExitUsage (2) — all via the shared status→exit mapping.
+	SetRunCredential(ctx context.Context, id string, override SetRunCredentialOverride) (apitypes.RunDTO, string, error)
 	// SetRunMrRework sets the per-run MR review-rework override (PRD #841 M3): PUT
 	// /api/runs/{id}/mr-rework {enabled: bool|null}, RequireUser so a CLI `uzc_` token can
 	// reach it. enabled is tri-state — &true opts the run's MR into auto-rework, &false out,
@@ -240,7 +248,12 @@ type Client interface {
 	// before), and a non-nil seed always carries a plan (the server rejects a
 	// selection with no plan). The plan's size cap and empty-plan rejection are the
 	// SERVER's (422) — the client forwards the bytes so those rules live in one place.
-	CreateRun(ctx context.Context, repoID string, issueIID int64, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *CreateRunSeed) (apitypes.RunDTO, error)
+	//
+	// credOverride is PRD #1247 M2's create-time per-run credential choice (`--token`): nil
+	// OMITS the credential_override key (inherit the worker binding); a present override
+	// carries {mode, secret_id?}. The label→id resolution for a pinned choice happens
+	// CLIENT-SIDE before this call, so the server receives an id, not a label.
+	CreateRun(ctx context.Context, repoID string, issueIID int64, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *CreateRunSeed, credOverride *CreateRunCredentialOverride) (apitypes.RunDTO, error)
 	// CreateTaskRun queues an issue-less handoff/task run on a repo (PRD #400 M3):
 	// POST /api/repos/{id}/task-runs {context, base_branch?, open_mr}. The server
 	// names the branch (uzi/task/<run-id>) and the created-run response carries it in
