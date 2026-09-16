@@ -324,6 +324,14 @@ tasks:
       # looks committed but never loads. Sub-second, offline, tree-fact -- runs before
       # `scan:secrets` too. Belongs in gate:repo, not a component gate.
       - task: check:skill-size
+      # Offline fixture test of scripts/migration-renumber.sh (issue 1400). The ONE
+      # non-sub-second gate:repo member: it builds temp git repos with a local bare
+      # origin, so it does not fit gate:repo's offline sub-second band. It is kept here
+      # DELIBERATELY -- CI runs `task gate:repo` as a job and separately hardcodes only
+      # `test:release-scripts`, so wiring it into gate:repo is what makes it CI-gated
+      # WITHOUT editing .github/workflows/** (which this branch must not touch). Ordered
+      # before `scan:secrets`, which is deliberately last because it dominates.
+      - task: test:migration-renumber
       - task: scan:secrets
       # Whole-tree Go+TS SAST scan (semgrep), BYO fail-open like lint:yaml. Ordered
       # LAST because a whole-tree scan dominates, same as scan:secrets above (PRD #862 M2).
@@ -844,6 +852,16 @@ tasks:
       # exits nonzero on any failure. Watch it fail on the unmodified scripts. See the
       # script header.
       - ./scripts/release-scripts-test.sh
+
+  test:migration-renumber:
+    desc: offline fixture test of scripts/migration-renumber.sh (builds temp git repos; issue 1400)
+    cmds:
+      # A gate:repo member (see gate:repo), deliberately NOT in its sub-second band: it
+      # builds temp git repos with a local bare origin and drives the real
+      # migration-renumber.sh through its --rewrite-comments unit, its precondition/preflight
+      # refusals, and the happy-path renumber. Prints `N passed, N failed` and exits nonzero
+      # on any failure. See the script header.
+      - ./scripts/migration-renumber-test.sh
 
   check:spec-numbering:
     desc: specs/ai.md is frozen at section 637 (issue 1317), unique numbers, none above the head, count 637, with a canary proving both detectors fired
