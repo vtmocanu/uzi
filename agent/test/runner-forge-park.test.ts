@@ -642,7 +642,7 @@ describe("RunRunner — pre-clone forge-unreachable park (PRD #1392 M2)", () => 
     }
   });
 
-  it("D7 (recovery_release_exact_echo only): parks via an untyped report carrying claim_generation (PRD #1247 universal stamp) but NO cause after a proven exact release", async () => {
+  it("D7 (recovery_release_exact_echo only): parks via an untyped report whose reportState closure supplies claim_generation (PRD #1247 universal stamp, pre-client-gate) but NO cause after a proven exact release", async () => {
     const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-forgepark-d7-echo-"));
     try {
       const client = new ForgeParkClient(["recovery_release_exact_echo"], {
@@ -659,18 +659,17 @@ describe("RunRunner — pre-clone forge-unreachable park (PRD #1392 M2)", () => 
       assert.strictEqual(client.releaseCalls[0]!.generation, 20);
       const park = parkReport(client);
       assert.ok(park, "an untyped recovery_wait report must be sent");
-      // PRD #1247 M5b: the reportState closure now stamps claim_generation on EVERY /state report
-      // (the uniform generation fence), which supersedes #1392's forge-park conditional-omit. It is
-      // SAFE: an api advertising recovery_release_exact_echo also accepts the claim_generation field
-      // (both landed in #1392), so it is never rejected — and an api old enough to reject it would
-      // already 400 every other #1247 report, so #1247 does not pair with it. The fence now covers
-      // the forge-park report too (a stale/superseded park is rejected). recovery_cause stays absent.
+      // PRD #1247 M5b: the reportState closure stamps claim_generation on the forge-park report (as on
+      // every mutating /state report), superseding #1392's forge-park conditional-omit. recovery_cause
+      // stays absent.
       // PRD #1247 M5 rework: the recovery_release_exact_echo branch no longer stamps claim_generation
-      // locally (the `claim_generation_fence`-gated local set was dead — the reportState closure spreads
-      // `...body` then overrides claim_generation unconditionally). Here the fence is NOT advertised, so
-      // the retired conditional could never have fired; claim_generation being present therefore proves
-      // the stamp comes SOLELY from the reportState closure — removing the local conditional changed
-      // nothing on the wire.
+      // LOCALLY (the `claim_generation_fence`-gated local set was dead — the reportState closure spreads
+      // `...body` then sets claim_generation). Here the fence is NOT advertised, so the retired local
+      // conditional could never have fired; claim_generation being present therefore proves the stamp
+      // comes SOLELY from the reportState closure, AT THE CLOSURE BOUNDARY — removing the local
+      // conditional changed nothing there. NOTE: this asserts the CLOSURE, not the wire. ForgeParkClient
+      // OVERRIDES reportState and records the body BEFORE the fix round E send-gate, so on the real wire
+      // this no-capability/no-feature config OMITS the field (pinned in client-state-send-gate.test.ts).
       assert.strictEqual(
         park!.claim_generation,
         claim.claim_generation,
