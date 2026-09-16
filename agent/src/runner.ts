@@ -425,6 +425,62 @@ function composeSafetySteer(publishedTip: string, currentTip: string): string {
 }
 
 /**
+ * PRD #1416 M5 (D5): does a submitted `plan_md` propose an operation that would rewrite history?
+ * A WARN-ONLY, case-insensitive regex scan over the plan prose (case-insensitive to catch prose
+ * casing). False POSITIVES are explicitly accepted — a plan that says "do NOT `git rebase`" still
+ * matches, and that is fine: a plan is prose, one spurious status line costs nothing, and a false
+ * NEGATIVE is caught downstream by the M2 mid-run steer and the M3 finalize bridge. Matches the
+ * D5 pattern set: `git rebase`, `--amend`, `filter-repo`/`filter-branch`, `reset --hard`, or a
+ * forced push (`push` followed on the same line by `--force`/`-f`/`--force-with-lease`).
+ *
+ * Not exported: consumed only by {@link RunRunner.gatePlan} in this file; its behaviour is
+ * asserted end-to-end via the emitted status nudge (and the armed steer) in the M5 plan-gate tests.
+ */
+function planProposesRewrite(planMd: string): boolean {
+  const patterns: RegExp[] = [
+    /\bgit\s+rebase\b/i,
+    /--amend\b/i,
+    /\bfilter-repo\b/i,
+    /\bfilter-branch\b/i,
+    /\breset\s+--hard\b/i,
+    // A forced push: `push` followed on the SAME LINE by a force flag (PRD: push
+    // (--force|-f|--force-with-lease)). `--force-with-lease`/`--force` are listed ahead of `-f`
+    // so the longest flag wins; `-f\b` will not match inside `--force` (the trailing `\b` fails
+    // before the `o`). Bounded to one line ([^\n]*?) so an unrelated later `--force` never pairs
+    // with a much earlier `push`.
+    /\bpush\b[^\n]*?(?:--force-with-lease|--force|-f)\b/i,
+  ];
+  return patterns.some((re) => re.test(planMd));
+}
+
+/**
+ * PRD #1416 M5: the body of the worker-authoritative safety steer armed at the PLAN GATE when the
+ * submitted plan proposes rewriting history (planProposesRewrite) on a branch with a published
+ * floor P, under AUTO-APPROVE. Distinct from {@link composeSafetySteer}, the M2 DETECTED-rewrite
+ * recipe: at plan time there is no rewritten tip H yet, so this is PREVENTIVE — it names P, states
+ * that uzi lands work with a fast-forward push and NEVER force-pushes (so the worker cannot land a
+ * rewritten branch without bridging), tells the agent not to rebase/amend/squash/reset any commit
+ * at or below P, and to integrate the default branch with `git merge`, not `git rebase`. Armed
+ * only on the auto-approved branch (a human on the gated branch sees the plan + the status nudge
+ * and can revise/reject). uzi's own guidance, NOT untrusted user text, so both executors render it
+ * outside the `<follow_up>` fence. P is a worker-verified OID; no repo-controlled text is rendered.
+ *
+ * Not exported: consumed only by {@link RunRunner.gatePlan} in this file; its content is asserted
+ * end-to-end via the armed steer in the M5 plan-gate tests.
+ */
+function composePlanGateNudge(publishedTip: string): string {
+  return [
+    `Your plan proposes rewriting history on a branch that is ALREADY PUBLISHED at ${publishedTip}.`,
+    `uzi lands work with a fast-forward push and NEVER force-pushes, so the worker cannot land a`,
+    `branch that was rewritten at or below ${publishedTip} without bridging. Before you start:`,
+    ``,
+    `1. Do NOT rebase, amend, squash, or reset any commit at or below ${publishedTip}.`,
+    `2. Add new commits on top instead.`,
+    `3. To integrate the default branch, use \`git merge\`, never \`git rebase\`.`,
+  ].join("\n");
+}
+
+/**
  * Thrown when a SEEDED run's clone was cut from a commit that diverges from the one the
  * user planned against AND the run was created with --require-base (PRD #209 M4, Open
  * Question 3). The runner catches it on the generic failure path and reports `failed`
@@ -4593,6 +4649,8 @@ export class RunRunner {
           // Use runnerClone.path (const, string), NOT the `worktreePath` local
           // (string | undefined — does not narrow in this closure).
           runnerClone.path,
+          // PRD #1416 M5: the published floor P for the warn-only plan-gate nudge.
+          flight.publishedTip,
           onAwaitingApproval,
         );
         // Human-in-the-loop iff the plan reached an approve verdict via the PARK path
@@ -6882,6 +6940,11 @@ export class RunRunner {
     // PRD #212: the runner clone path (= runnerClone.path), so the gate can run a
     // runner-uid `git status --porcelain` there to surface plan-turn worktree writes.
     worktreePath: string,
+    // PRD #1416 M5: the branch's published floor P (flight.publishedTip), or undefined for a
+    // fresh, never-published branch. When set AND the submitted plan proposes rewriting history,
+    // the gate emits a warn-only status nudge (both modes) and, under auto-approve, arms the M2
+    // safety steer for the first implement turn. The verdict flow is untouched (never rejects).
+    publishedTip: string | undefined,
     // PRD #362 M3c: advisory hook fired AFTER the awaiting_approval report persists
     // plan_md, BEFORE the verdict wait (see the RunContext.gatePlan doc). Never invoked
     // on the autopilot branch: that branch DOES persist plan_md durably (RC1 #1197, via
@@ -6893,6 +6956,23 @@ export class RunRunner {
     // Get the plan message onto the stream regardless of mode — it is the audit
     // record of what the agent intended, autopilot or not.
     await batcher.flush().catch(() => undefined);
+
+    // PRD #1416 M5 (D5): a WARN-ONLY plan-gate nudge. When the branch has a published floor P and
+    // the submitted plan proposes rewriting history (a case-insensitive regex scan over plan_md),
+    // emit ONE visible `status` run message right after the plan — in BOTH modes, so a human sees
+    // it next to the plan and an auto-approved run still records it. The verdict flow is untouched:
+    // this never rejects and never blocks the plan (false positives are accepted, D5). The steer is
+    // armed under auto-approve only, below.
+    const proposesRewrite = !!publishedTip && planProposesRewrite(planMd);
+    if (proposesRewrite) {
+      batcher.emit({
+        kind: "status",
+        agent: "worker",
+        payload: {
+          text: `the plan proposes rewriting history on a branch published at ${publishedTip!.slice(0, 12)}; the worker lands fast-forward only and cannot land a rewritten branch — prefer \`git merge\``,
+        },
+      });
+    }
 
     if (autoApprove) {
       // Auto-approve is a VERDICT SOURCE at the existing gate, not a bypass around
@@ -6959,6 +7039,15 @@ export class RunRunner {
         run_id: runId,
         agent_source: selection.source,
       });
+      // PRD #1416 M5: on an AUTO-APPROVED run the human never sees the status nudge emitted above,
+      // so ALSO arm the M2 worker-authoritative safety steer with a plan-time PREVENTIVE body
+      // (composePlanGateNudge — distinct from composeSafetySteer, which references an already-
+      // rewritten tip H that does not exist yet at plan time). Both executors drain pullSafetySteer
+      // at their loop top, ahead of any follow-up and BEFORE the FIRST buildImplementPrompt, so the
+      // first implement turn is reminded not to rewrite at/below P. NOT armed on the human-gated
+      // branch below (a human sees the plan + the nudge and can revise/reject). The verdict is
+      // UNCHANGED — this arms guidance beside the approve, it does not alter it.
+      if (proposesRewrite) steering.pushSafetySteer(composePlanGateNudge(publishedTip!));
       return { kind: "approve", selection: { status: "ok", selection } };
     }
 
