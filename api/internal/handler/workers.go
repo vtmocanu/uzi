@@ -238,6 +238,27 @@ func rollSignalFromRow(w store.ListWorkersByUserRow) *workersvc.RollSignal {
 	return sig
 }
 
+// overlayOutbox folds a worker's in-process outbox depth (PRD #1391 M5) onto its
+// DTO. The depth lives in workersvc's restart-losing tracker, not in a store.Worker
+// row, so workerDTOFromWorker/workerDTOFromRow (which read only the row) cannot carry
+// it and this overlay runs at each response site that should show it. Left NIL (the
+// four fields marshal null) when the worker has no tracked depth, so a worker with no
+// outbox shows nulls; set together the moment any component is non-zero. A nil wsvc
+// (defensive; the handler always wires one) is a no-op.
+func (h *Handler) overlayOutbox(dto *apitypes.WorkerDTO, workerID uuid.UUID) {
+	if h.wsvc == nil {
+		return
+	}
+	pm, pt, sr, blocked := h.wsvc.OutboxAggregate(workerID)
+	if pm == 0 && pt == 0 && sr == 0 && blocked == nil {
+		return // no tracked depth → leave the four fields null
+	}
+	dto.OutboxPendingMessages = &pm
+	dto.OutboxPendingTerminal = &pt
+	dto.OutboxStaleRetired = &sr
+	dto.OutboxBlocked = blocked
+}
+
 // -------------------------------------------------------------------------
 // Worker management (session-authenticated)
 // -------------------------------------------------------------------------
@@ -323,7 +344,9 @@ func (h *Handler) ListWorkers(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]apitypes.WorkerDTO, 0, len(rows))
 	for _, row := range rows {
-		out = append(out, workerDTOFromRow(row, h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt))
+		dto := workerDTOFromRow(row, h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt)
+		h.overlayOutbox(&dto, row.ID)
+		out = append(out, dto)
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"workers": out})
 }
@@ -339,8 +362,10 @@ func (h *Handler) AdminListWorkers(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]apitypes.AdminWorkerDTO, 0, len(rows))
 	for _, row := range rows {
+		dto := workerDTOFromWorker(row.Worker, int(row.ActiveRuns), row.Busy, "", h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt)
+		h.overlayOutbox(&dto, row.Worker.ID)
 		out = append(out, apitypes.AdminWorkerDTO{
-			WorkerDTO:  workerDTOFromWorker(row.Worker, int(row.ActiveRuns), row.Busy, "", h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt),
+			WorkerDTO:  dto,
 			OwnerEmail: row.OwnerEmail,
 		})
 	}

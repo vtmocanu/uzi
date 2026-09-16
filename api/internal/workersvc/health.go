@@ -161,6 +161,18 @@ const (
 	// pool_wait/recovery_wait park reasons (D4): this is an owner-admission block, not a
 	// credential-pool or transient-recovery hold, and its fix is archive retry/discard.
 	reasonCustodyLimit = "you have too much unpublished work awaiting recovery; resolve or discard some recovery archives to start new runs"
+	// reasonOutboxQueued (PRD #1391 M5) replaces the misleading `stalled` reason for a
+	// running run whose worker is holding its updates in the durable outbox during an
+	// api outage: the agent is working and sending, the frames are simply queued on the
+	// worker and will replay once it can reach the api. Without this, the health
+	// detector reads the outage silence as `stalled` — the exact wrong signal the
+	// outbox exists to prevent. It maps to the SAME healthStalled enum (no migration —
+	// runs.health_reason is free text, only runs.health is CHECK-constrained;
+	// migration 00057), and applies ONLY while the tracked pending-message depth is
+	// non-zero: on the next empty report (the backlog drained) or once the worker's set
+	// clears, normal stalled detection resumes. Same fixed-string contract as its
+	// siblings — no tool name, no repo content, no live duration.
+	reasonOutboxQueued = "the agent's updates are queued on its worker and will replay when it can reach the api"
 )
 
 // Persistence-failure FLAG thresholds (PRD #108 M4), code constants for the same
@@ -387,6 +399,15 @@ func (s *Service) runningTarget(ctx context.Context, now time.Time, r store.List
 	// pathological single call.
 	if th.stall > 0 && !stats.inFlight {
 		if base := stallBaseline(r); !base.IsZero() && now.Sub(base) >= th.stall {
+			// The silence may be an api outage, not a stall: if the worker reported a
+			// non-zero outbox depth for this run (PRD #1391 M5), the agent IS working and
+			// sending — its updates are queued on the worker and will replay. Same
+			// healthStalled enum, truthful reason. Only while depth is non-zero; when the
+			// tracker reports nothing (backlog drained / cleared) normal stalled detection
+			// resumes.
+			if d, ok := s.OutboxRunDepth(r.ID); ok && d.PendingMessages > 0 {
+				return healthStalled, reasonOutboxQueued
+			}
 			return healthStalled, reasonStalled
 		}
 	}
