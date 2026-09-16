@@ -2461,6 +2461,19 @@ tasks:
     cmds:
       - ./scripts/check-e2e-registry-doc.sh --write
 
+  # migration:renumber is a landing-time helper for the maintainer who rebased a branch
+  # onto main and finds a new migration's draft number now collides with a just-landed
+  # one. NOT a gate target and NOT under gate: it WRITES the tree (git mv's the branch's
+  # new migrations to consecutive numbers above the live main head, rewrites their own
+  # cross-reference comments, and REPORTS every other reference for a human to fix by
+  # hand). The gate is its test target, added in a later milestone (the docs:sync
+  # writer/drift-test relationship). Fail-closed before any mutation; leaves the tree
+  # dirty on success for the maintainer to review and commit.
+  migration:renumber:
+    desc: renumber the branch's new migrations above the live main head; rewrite their comments; report other refs
+    cmds:
+      - ./scripts/migration-renumber.sh
+
   # -------------------------------------------------------------------- nudge --
   # A NUDGE is not a gate. This target is DELIBERATELY absent from `gate` and from
   # every `gate:*`, and the tool it runs is structurally incapable of failing a
