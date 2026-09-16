@@ -351,7 +351,7 @@ describe("isPushProtectionRejection", () => {
 });
 
 describe("composePushSecretBlockedReason", () => {
-  const SUFFIX_TAIL = "Your diff is preserved below.";
+  const SUFFIX_TAIL = "export it with `uzi run export`.";
   const MAX = 512;
 
   it("names the short commit + path + rule for a single finding, ≤512, suffix intact", () => {
@@ -365,6 +365,9 @@ describe("composePushSecretBlockedReason", () => {
     assert.match(reason, /config\/app\.env:12/, "path:line must appear");
     assert.match(reason, /\(generic-api-key\)/, "rule id must appear");
     assert.ok(reason.endsWith(SUFFIX_TAIL), "the preserved-diff pointer must end the reason");
+    assert.ok(!reason.includes("preserved below"), "must not claim the diff is preserved");
+    assert.ok(!reason.includes("diff is preserved"), "must not claim the diff is preserved");
+    assert.match(reason, /withheld/, "must state the diff is withheld, not preserved");
     // A single short finding fits well under the cap — proves the ≤512 assertion is not
     // trivially satisfied because everything is short (non-vacuity for the cap cases below).
     assert.ok(reason.length < MAX, "a single short finding should not need truncation");
@@ -381,6 +384,9 @@ describe("composePushSecretBlockedReason", () => {
     assert.ok(reason.length <= MAX, `must be ≤${MAX} (got ${reason.length})`);
     assert.match(reason, /and \d+ more/, "a truncated list must show the omitted count");
     assert.ok(reason.endsWith(SUFFIX_TAIL), "the preserved-diff pointer must survive truncation");
+    assert.ok(!reason.includes("preserved below"), "must not claim the diff is preserved");
+    assert.ok(!reason.includes("diff is preserved"), "must not claim the diff is preserved");
+    assert.match(reason, /withheld/, "must state the diff is withheld, not preserved");
     assert.match(reason, /GH013/, "the fixed prefix must survive truncation");
     // Non-vacuity: the UNtruncated join would blow past the cap, so truncation actually fired.
     const untruncated = findings
@@ -402,6 +408,9 @@ describe("composePushSecretBlockedReason", () => {
     ]);
     assert.ok(reason.length <= MAX, `must be ≤${MAX} (got ${reason.length})`);
     assert.ok(reason.endsWith(SUFFIX_TAIL), "the preserved-diff pointer must survive hard truncation");
+    assert.ok(!reason.includes("preserved below"), "must not claim the diff is preserved");
+    assert.ok(!reason.includes("diff is preserved"), "must not claim the diff is preserved");
+    assert.match(reason, /withheld/, "must state the diff is withheld, not preserved");
     assert.match(reason, /GH013/, "the fixed prefix must survive hard truncation");
     assert.match(reason, /…/, "a hard-truncated single label must show the ellipsis");
   });

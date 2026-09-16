@@ -3452,9 +3452,9 @@ export function isWorkflowScopeRejection(err: unknown): boolean {
  * This is the remote BACKSTOP for the case the pre-push gitleaks scan (default ruleset) misses
  * a secret GitHub's own scanner catches — GitHub's pattern set is broader than gitleaks' and
  * the two are not identical, so a clean pre-push scan does not guarantee GitHub accepts the
- * push. Routing this rejection to the same typed `push_secret_blocked` fail_origin preserves
- * the diff and gives an actionable failure instead of GitHub's opaque remote reject discarding
- * the committed work.
+ * push. Routing this rejection to the same typed `push_secret_blocked` fail_origin gives an
+ * actionable, typed failure (the committed work stays recoverable from the run branch/PVC) instead
+ * of GitHub's opaque remote reject discarding it.
  */
 export function isPushProtectionRejection(err: unknown): boolean {
   const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
