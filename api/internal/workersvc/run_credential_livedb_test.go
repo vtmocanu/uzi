@@ -365,6 +365,34 @@ func TestSetRunCredentialLaneAndSecretRefusalsLiveDB(t *testing.T) {
 		}
 	})
 
+	// (NOT refused: a QUEUED review run keeps its next-claim override) The review-lane refusal is
+	// scoped to HELD states only. A queued/parked review run has no in-flight held switch, so its
+	// override is legitimately WRITTEN and honored on the next claim (claimSecretID ->
+	// runOverrideChoice; the ReviewRunner consumes the resolved token). This proves the fix round
+	// did NOT regress the queued next-claim override, and pins the held-only scope of the C guard.
+	t.Run("queued review run keeps its next-claim override", func(t *testing.T) {
+		reviewTarget := seedRunInStatus(t, env, o, 4742, "queued", now)
+		reviewID := uuid.New()
+		env.exec(`INSERT INTO runs (id, user_id, repo_id, kind, issue_title, issue_description,
+		             status, status_since, review_target_run_id, branch)
+		          VALUES ($1, $2, $3, 'task', 't', 'd', 'queued', now(), $4, 'uzi/task/review')`,
+			reviewID, o.userID, o.repoID, reviewTarget)
+		res, err := svc.SetRunCredential(env.ctx, o.userID, reviewID, CredentialOverrideModePinned, &o.altTok)
+		if err != nil {
+			t.Fatalf("SetRunCredential(queued review) err = %v, want success (override applies on next claim)", err)
+		}
+		if res.Run.CredentialOverrideMode.String != CredentialOverrideModePinned ||
+			!res.Run.CredentialOverrideSecretID.Valid || uuid.UUID(res.Run.CredentialOverrideSecretID.Bytes) != o.altTok {
+			t.Fatalf("override not written for a queued review: mode=%q id=%+v", res.Run.CredentialOverrideMode.String, res.Run.CredentialOverrideSecretID)
+		}
+		if res.Run.Status != "queued" {
+			t.Errorf("status = %q, want queued (a queued override is not a transition)", res.Run.Status)
+		}
+		if res.Run.CredentialSwitchRequestedAt.Valid {
+			t.Errorf("credential_switch_requested_at set on a queued override, want NULL (no held switch stamped)")
+		}
+	})
+
 	// (404) The pinned secret must be the CALLER's OWN anthropic_token. Both a foreign secret
 	// and an own-but-wrong-kind secret resolve as not-found through the owner+kind-scoped
 	// lookup — proving the secret id is threaded to that lookup. A switchable (queued) issue
