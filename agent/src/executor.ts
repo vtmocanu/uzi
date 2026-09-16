@@ -322,6 +322,12 @@ export interface RunContext {
   askUser?(questions: AskUserQuestion[]): Promise<AnswerVerdict>;
   /** M4: dequeue the next queued follow-up to inject into the next loop turn. */
   pullFollowUp?(): string | undefined;
+  /** PRD #1416 M2: drain the WORKER-AUTHORITATIVE safety steer armed in-process by the runner's
+   *  divergence detection, if any. Consumed with PRIORITY at each executor loop top — ahead of
+   *  pullFollowUp — and rendered as worker guidance, NOT as untrusted <follow_up> user input (D3).
+   *  Distinct from pullFollowUp: it carries no server input id and never touches the follow-up
+   *  wake-guard watermark. Optional; absent (a stub/older wiring) ⇒ no steer. */
+  pullSafetySteer?(): string | undefined;
   /**
    * M4: report a running/iteration heartbeat (server persists via GREATEST).
    *

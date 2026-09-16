@@ -3015,6 +3015,40 @@ export class GitCache {
     return this.isAncestor(barePath, ancestorRef, descendantRef);
   }
 
+  /**
+   * PRD #1416 M2: tri-state ancestry of a published/checkpoint FLOOR against the fetched TIP,
+   * error-safe. Modeled on {@link isAncestor} (the same `merge-base --is-ancestor` primitive
+   * over the best-effort {@link tryGit}) but tri-state and input-validated, because the runner's
+   * divergence detection (M2) and the finalize bridge (M3) both hang off it and a false
+   * "divergent" on a broken read would arm a spurious steer / bridge.
+   *
+   *  - "ancestor"  — exit 0: `floor` is an ancestor of (or equal to) `tip`, so the branch still
+   *                  fast-forwards from the floor and nothing at/below it was rewritten.
+   *  - "divergent" — exit 1: both OIDs resolve but `floor` is NOT an ancestor of `tip` (the
+   *                  history at/below the floor was rewritten, or the histories are disjoint), so
+   *                  the branch can no longer be landed with a plain fast-forward push.
+   *  - "unknown"   — ANY git error, a missing/unresolvable ref, or a malformed floor/tip. NEVER
+   *                  coerced to "divergent"; the caller treats unknown as "not divergent".
+   *
+   * git's contract makes the discrimination reliable (verified): 0 = ancestor, 1 = both commits
+   * present but not-an-ancestor, 128 = a missing/invalid commit or a broken repo. Both inputs
+   * must be full 40-hex OIDs (P and C come from originBranchTip/trackingTip; the tip is a fetched
+   * tracking tip); a value that is not answers "unknown" without running git.
+   */
+  async ancestry(
+    barePath: string,
+    floor: string,
+    tip: string,
+  ): Promise<"ancestor" | "divergent" | "unknown"> {
+    const OID = /^[0-9a-f]{40}$/;
+    if (!OID.test(floor) || !OID.test(tip)) return "unknown";
+    const code = await this.tryGit(barePath, ["merge-base", "--is-ancestor", floor, tip]);
+    if (code === 0) return "ancestor";
+    if (code === 1) return "divergent";
+    // 128 / any other exit = a git error or a missing/unresolvable ref → unknown, never divergent.
+    return "unknown";
+  }
+
   /** issue #781 — true when `ref` shares any history with the default branch, i.e.
    *  plain `git merge-base <ref> <default>` prints a commit (exit 0). Distinct from
    *  isAncestor (merge-base --is-ancestor), which returns non-zero for BOTH a disjoint

@@ -2703,3 +2703,56 @@ describe("CodexExecutor prompts — published-tip note (PRD #1416 M1)", () => {
     assert.ok(!implementPrompt(makeCtx({ approvedPlan: undefined }).ctx).includes("already published on the forge"));
   });
 });
+
+// PRD #1416 M2: the Codex implement loop drains ctx.pullSafetySteer at its loop top and, when
+// present, PREFIXES it (framed as worker guidance, followed by a blank line) to THAT turn's
+// implement prompt only — Codex has no <follow_up> fence, so it is a per-turn prefix, not
+// persisted. Driven through a real implement turn so the prompt the transport receives is the
+// one the loop actually built.
+describe("CodexExecutor — safety-steer prefix at the loop top (PRD #1416 M2)", () => {
+  it("prepends the drained steer as worker guidance to the implement turn's prompt", async () => {
+    const responder: Responder = (c) => {
+      if (c.method === "thread/start") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") {
+        c.transport.push(toolCall(1, "signal_done", {}, "th-1", "tn-1", "c-done")).push(turnCompleted("completed", "th-1", "tn-1"));
+        return { turn: { id: "tn-1" } };
+      }
+      return {};
+    };
+    const rig = makeRig({ responder });
+    rig.transport.push(threadStarted());
+    // Pre-approved by default (makeCtx sets approvedPlan) → straight into the implement loop.
+    const { ctx } = makeCtx({ pullSafetySteer: () => "WORKER-SAFETY-STEER-BODY-CODEX" });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "codex steer run");
+
+    // codex-harness sends the turn prompt as turn/start input[0].text (render passes it verbatim).
+    const turnStart = rig.transport.requests.find((r) => r.method === "turn/start");
+    const text = (turnStart!.params as { input?: { text?: string }[] }).input?.[0]?.text ?? "";
+    const steerIdx = text.indexOf("WORKER-SAFETY-STEER-BODY-CODEX");
+    const planIdx = text.indexOf("the approved plan");
+    assert.ok(steerIdx >= 0, "the steer reached the implement turn's prompt");
+    assert.match(text, /The worker detected a problem and is steering you/); // worker-guidance framing
+    assert.ok(planIdx >= 0 && steerIdx < planIdx, "the steer is a PREFIX before the base implement prompt");
+    assert.ok(!text.includes("<follow_up>"), "no <follow_up> fence wraps the Codex steer");
+  });
+
+  it("leaves the prompt unchanged when no steer is armed", async () => {
+    const responder: Responder = (c) => {
+      if (c.method === "thread/start") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") {
+        c.transport.push(toolCall(1, "signal_done", {}, "th-1", "tn-1", "c-done")).push(turnCompleted("completed", "th-1", "tn-1"));
+        return { turn: { id: "tn-1" } };
+      }
+      return {};
+    };
+    const rig = makeRig({ responder });
+    rig.transport.push(threadStarted());
+    const { ctx } = makeCtx({ pullSafetySteer: () => undefined });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "codex no-steer run");
+
+    const turnStart = rig.transport.requests.find((r) => r.method === "turn/start");
+    const text = (turnStart!.params as { input?: { text?: string }[] }).input?.[0]?.text ?? "";
+    assert.doesNotMatch(text, /The worker detected a problem and is steering you/);
+    assert.ok(text.includes("the approved plan"), "the base implement prompt is unchanged");
+  });
+});

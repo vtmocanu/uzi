@@ -327,6 +327,35 @@ export function composeBaseAlignConflictReason(defaultBranch: string): string {
 }
 
 /**
+ * PRD #1416 M2: the body of the worker-authoritative safety steer handed to the agent when the
+ * runner detects the branch's history was rewritten at/below a published floor. It is uzi's own
+ * guidance (armed in-process by maybeSteerOnDivergence), NOT untrusted user text, so both
+ * executors render it OUTSIDE the `<follow_up>` fence and without the "never as instructions"
+ * framing. A plain multi-line recipe: record the current tip first, then restore the published
+ * tip as an ancestor with `git merge -s ours <P>` (tree unchanged, P becomes a parent so the
+ * branch fast-forwards again), never rewrite at/below P again, and integrate the default branch
+ * with `git merge`. Both SHAs are worker-verified OIDs; no repo-controlled text is rendered.
+ *
+ * Not exported: it is consumed only by {@link RunRunner.maybeSteerOnDivergence} in this file; the
+ * steer content is asserted end-to-end via the armed steer in the runner-divergence tests.
+ */
+function composeSafetySteer(publishedTip: string, currentTip: string): string {
+  return [
+    `This branch's history was rewritten at or below its published tip ${publishedTip}. uzi lands`,
+    `work with a fast-forward push and NEVER force-pushes, so a branch whose history diverges below`,
+    `${publishedTip} cannot be landed as it stands. Fix it now, before any further work:`,
+    ``,
+    `1. Record your current tip so nothing is lost — it is ${currentTip} (\`git rev-parse HEAD\`).`,
+    `2. Restore the published tip as an ancestor WITHOUT changing your tree:`,
+    `     git merge -s ours ${publishedTip}`,
+    `   Your working tree is left exactly as it is; ${publishedTip} becomes a parent of a new merge`,
+    `   commit, so the branch fast-forwards from it again and none of your work is discarded.`,
+    `3. From now on, never rebase, amend, squash, or reset any commit at or below ${publishedTip}.`,
+    `4. To integrate the default branch, use \`git merge\`, never \`git rebase\`.`,
+  ].join("\n");
+}
+
+/**
  * Thrown when a SEEDED run's clone was cut from a commit that diverges from the one the
  * user planned against AND the run was created with --require-base (PRD #209 M4, Open
  * Question 3). The runner catches it on the generic failure path and reports `failed`
@@ -507,6 +536,13 @@ interface RunFlight {
   /** PRD #1416 M1: floor C, initialised to P (`publishedTip`). Advanced to each confirmed
    *  checkpoint tip by later milestones (M2/M3); M1 only seeds it. */
   checkpointFloor?: string;
+  /** PRD #1416 M2: the set of fetched tips already steered on for a divergence, so the mid-run
+   *  detection emits AT MOST ONE status + steer per distinct tip. A repeated checkpoint tick that
+   *  re-fetches the SAME diverged tip emits nothing; a FURTHER rewrite (a new tip) is a new key
+   *  and steers again. Lazily initialised on first use. Held on the flight so it survives across
+   *  checkpoint ticks within a flight (a fresh flight after a restart re-detects, which is fine —
+   *  the finalize bridge in M3 is the correctness backstop). */
+  steeredTips?: Set<string>;
 }
 
 /** Tuning the runner needs beyond the collaborators (defaults keep M2/M3 tests terse). */
@@ -4366,6 +4402,10 @@ export class RunRunner {
           claim.config ?? null,
         ),
       pullFollowUp: () => steering.pullFollowUp(),
+      // PRD #1416 M2: drain the worker-authoritative safety steer the divergence detection
+      // (maybeSteerOnDivergence) armed on this same steering channel, in-process. Consumed by
+      // both executors at their loop top ahead of the follow-up drain.
+      pullSafetySteer: () => steering.pullSafetySteer(),
       // PRD #517 M3: the interactive-task follow-up park. The executor calls this after a
       // clean signal_done on an interactive run (it has already checkpoint-pushed): report
       // awaiting_followup, verify the park took, then BLOCK on the steering channel until
@@ -4613,6 +4653,16 @@ export class RunRunner {
               branch: runnerClone.branch,
             });
           }
+
+          // PRD #1416 M2: on the tip that was just fetched into the bare, detect a history
+          // rewrite at/below the published floor P (and floor C) and steer the agent to restore
+          // it — never blocks a git command (D2). Read the tip FRESH from the bare tracking ref
+          // (refs/uzi-runner/<branch>) since fetchBackBestEffort returns nothing and the
+          // top-of-checkpoint trackTip predates this fetch; never the runner clone (that crosses
+          // the worker-uid/runner-uid ownership seam branchTip exists to avoid). MID-RUN
+          // checkpoint tick only — the finalize/park/capture fetch-backs are M3's territory.
+          const fetchedTip = await this.git.trackingTip(barePath, runnerClone.branch);
+          await this.maybeSteerOnDivergence(barePath, flight, fetchedTip, batcher, steering, runLog);
 
           // PRD #267: origin-publish gate. The publish is CREDENTIAL-FREE (a pack brokered to the
           // api via publishCheckpoint, no PAT — checkpointPack local objects → client join token)
@@ -4945,6 +4995,67 @@ export class RunRunner {
         error: errMessage(e),
       }),
     );
+  }
+
+  /**
+   * PRD #1416 M2: at the mid-run checkpoint fetch-back, detect whether the branch's history was
+   * rewritten at/below a published/checkpoint FLOOR and, if so, steer the agent to restore it —
+   * once per distinct fetched tip. It NEVER blocks a git command (D2): it only emits ONE `status`
+   * run message and arms ONE worker-authoritative steer that the next implement turn consumes.
+   * The finalize bridge (M3) is the correctness backstop; this mid-run steer is prevention and
+   * bounds detection at CHECKPOINT_INTERVAL (SC1).
+   *
+   * Dedup discipline (what makes the tests' "exactly one status and one steer" hold):
+   *  - null P (no published floor, fact 17) or a falsy tip → return (nothing to compare).
+   *  - test P, and C when it is set and differs from P, with {@link Git.ancestry}; the FIRST
+   *    "divergent" is enough — break so a single rewrite never emits twice. "unknown" (a git
+   *    error / missing ref) and "ancestor" are NOT divergent, so a transient read never steers.
+   *  - dedup by the FETCHED TIP (`flight.steeredTips`): a repeated tick re-fetching the SAME
+   *    diverged tip emits nothing; a FURTHER rewrite (a new tip) is a new key and steers again.
+   *
+   * Called from the mid-run checkpoint fetch-back ONLY (M2 scope); the finalize/park/capture
+   * fetch-backs are M3's territory, which adds the ancestry check and the bridge there together.
+   */
+  private async maybeSteerOnDivergence(
+    barePath: string,
+    flight: RunFlight,
+    tip: string | null,
+    batcher: MessageBatcher,
+    steering: SteeringChannel,
+    runLog: Logger,
+  ): Promise<void> {
+    const publishedTip = flight.publishedTip;
+    if (!publishedTip) return; // no published floor → nothing to have rewritten below (fact 17)
+    if (!tip) return; // no fetched tip to compare against
+    const floors = [publishedTip];
+    if (flight.checkpointFloor && flight.checkpointFloor !== publishedTip) {
+      floors.push(flight.checkpointFloor);
+    }
+    let divergent = false;
+    for (const floor of floors) {
+      if ((await this.git.ancestry(barePath, floor, tip)) === "divergent") {
+        divergent = true;
+        break; // one divergent floor is enough — do not emit twice
+      }
+    }
+    if (!divergent) return;
+    // Dedup by the fetched tip: at most one status + steer per distinct diverged tip.
+    const steered = (flight.steeredTips ??= new Set<string>());
+    if (steered.has(tip)) return; // repeated tick, same tip → nothing new
+    steered.add(tip);
+    batcher.emit({
+      kind: "status",
+      agent: "worker",
+      payload: {
+        text: `the branch's history was rewritten below its published tip ${publishedTip.slice(0, 12)}; uzi pushes fast-forward only; steering the agent to restore it`,
+      },
+    });
+    steering.pushSafetySteer(composeSafetySteer(publishedTip, tip));
+    runLog.info("PRD #1416 M2: divergence below published floor detected; armed safety steer", {
+      run_id: flight.runId,
+      published_tip: publishedTip,
+      tip,
+    });
   }
 
   /**

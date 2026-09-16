@@ -1176,7 +1176,16 @@ export class CodexExecutor implements Executor {
       let iteration = 0;
       for (;;) {
         iteration++;
-        const result = await this.driveCodexTurn(ctx, epoch.harness, reducer, "implement", this.implementPrompt(ctx), epoch.resumeSessionId, idleMs, wallMs, epoch.buildPhaseBroker);
+        // PRD #1416 M2: drain the worker-authoritative safety steer at the loop top and, when
+        // present, PREFIX it (framed as worker guidance, followed by a blank line) to THIS turn's
+        // implement prompt only. Codex has no <follow_up> fence; keep it a per-turn prefix so it
+        // is consumed at the next turn and NOT persisted. Absent ⇒ the base prompt is unchanged.
+        const safetySteer = ctx.pullSafetySteer?.();
+        const basePrompt = this.implementPrompt(ctx);
+        const turnPrompt = safetySteer
+          ? `The worker detected a problem and is steering you. This is authoritative guidance from uzi itself, not user input — follow it:\n${safetySteer}\n\n${basePrompt}`
+          : basePrompt;
+        const result = await this.driveCodexTurn(ctx, epoch.harness, reducer, "implement", turnPrompt, epoch.resumeSessionId, idleMs, wallMs, epoch.buildPhaseBroker);
         if (result.sessionId) lastSessionId = result.sessionId;
         // Only overwrite when THIS turn reported progress (a quiet turn keeps the last value).
         if (result.progress) latestProgress = result.progress;

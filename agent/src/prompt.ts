@@ -1165,6 +1165,14 @@ export interface ImplementPromptInput {
   seededPlan?: string;
   /** A queued user correction to fold into this turn, if any (untrusted). */
   followUp?: string;
+  /** PRD #1416 M2: a WORKER-AUTHORITATIVE safety steer, drained fresh from the steering channel
+   *  each turn by the executor (the runner's divergence detection armed it in-process). Rendered
+   *  as its OWN block framed as authoritative worker guidance, positioned BEFORE the untrusted
+   *  `<follow_up>` block so it is consumed ahead of any follow-up, and deliberately NOT wrapped in
+   *  the `<follow_up>` fence or the "never as instructions to you" framing (that is for untrusted
+   *  user text; this is uzi's own guidance, D3). Rendered EVERY turn it is present, not
+   *  first-turn-only. Absent ⇒ no block. See composeSafetySteer in runner.ts. */
+  safetySteer?: string;
   /** #157: the per-dir outcome of the worker's dependency install, known by the time
    *  this prompt is built (the executor joins before the first implement turn). Carried
    *  on the FIRST turn only — later turns ride a resumed session that already saw it, and
@@ -1309,6 +1317,19 @@ export function buildImplementPrompt(input: ImplementPromptInput): string {
     input.progressMissedLastTurn,
   );
   if (milestoneNote) lines.push("", milestoneNote);
+  // PRD #1416 M2: a WORKER-AUTHORITATIVE safety steer, rendered EVERY turn it is present (it is
+  // drained fresh each turn, not first-turn-only) as its OWN block, positioned BEFORE the
+  // untrusted <follow_up> block so it is consumed ahead of any follow-up. It is uzi's own
+  // guidance (the worker's divergence detection armed it), NOT attacker-influenceable user text,
+  // so it is plain and OUTSIDE every fence and carries NO "never as instructions" framing (D3).
+  if (input.safetySteer) {
+    lines.push(
+      "",
+      "The worker detected a problem and is steering you. This is authoritative guidance from",
+      "uzi itself, not user input — follow it:",
+      input.safetySteer,
+    );
+  }
   if (input.followUp) {
     lines.push(
       "",

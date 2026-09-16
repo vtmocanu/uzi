@@ -169,6 +169,16 @@ export class SteeringChannel {
    *  stable while the report is in flight because the follow-up waiter is armed only AFTER
    *  the report returns. Monotone (Math.max). */
   private lastDeliveredFollowUpIdValue = 0;
+  /** PRD #1416 M2: a WORKER-AUTHORITATIVE safety steer, entirely separate from the follow-up
+   *  machinery. It originates IN-PROCESS (the runner's divergence detection arms it via
+   *  pushSafetySteer), NOT from a server input — so it is deliberately NOT wired into route(),
+   *  does NOT carry a server input id, does NOT advance the follow-up wake-guard watermark
+   *  (lastDeliveredFollowUpIdValue), and is NOT consulted by hasPendingFollowUpOutcome() or
+   *  awaitFollowUp() (D3). Both executors drain it with priority at their loop top and render it
+   *  as worker guidance (NOT untrusted <follow_up> user text). Single slot, latest-wins: a later
+   *  arm overwrites an unconsumed one (the body is regenerated from the current tip, so the newest
+   *  is the truthful one). undefined ⇒ nothing armed. */
+  private safetySteer: string | undefined;
   /** The current gate epoch (PRD #41): bumped at each awaiting_approval (re-)report.
    *  Every buffered verdict / queued revise is stamped with the epoch it arrived at, so
    *  a verdict written against a superseded plan version is detectable. Starts at 0 so a
@@ -524,6 +534,24 @@ export class SteeringChannel {
   /** Dequeue the oldest un-consumed follow-up, or undefined if none. */
   pullFollowUp(): string | undefined {
     return this.takeFollowUp()?.body;
+  }
+
+  /** PRD #1416 M2: arm (set/replace) the worker-authoritative safety steer. Called IN-PROCESS by
+   *  the runner's divergence detection, never from route(). Latest-wins: a later arm overwrites an
+   *  unconsumed one — the body is regenerated from the current tip, so the newest is the truthful
+   *  one. Deliberately touches NONE of the follow-up machinery (no watermark advance, no wake
+   *  guard), so it can never be mistaken for a server follow-up (D3). */
+  pushSafetySteer(text: string): void {
+    this.safetySteer = text;
+  }
+
+  /** PRD #1416 M2: consume the worker-authoritative safety steer — return it and clear the slot,
+   *  so it is delivered exactly once per arm. Both executors call this at their loop top ahead of
+   *  pullFollowUp, so the steer is rendered before any follow-up. undefined ⇒ none armed. */
+  pullSafetySteer(): string | undefined {
+    const steer = this.safetySteer;
+    this.safetySteer = undefined;
+    return steer;
   }
 
   /**

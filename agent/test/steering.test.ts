@@ -486,6 +486,44 @@ describe("SteeringChannel — last-delivered follow-up watermark (issue #559)", 
   });
 });
 
+// PRD #1416 M2: the worker-authoritative safety-steer slot. It originates IN-PROCESS (the
+// runner's divergence detection), never from a server input, so it is entirely separate from the
+// follow-up machinery — not routed, no input id, no wake-guard watermark, and invisible to the
+// follow-up-outcome peek (D3). These drive the slot directly; no poll loop is needed.
+describe("SteeringChannel — worker-authoritative safety steer (PRD #1416 M2)", () => {
+  it("push then pull returns the steer and clears the slot", () => {
+    const { ch } = makeChannel([]);
+    ch.pushSafetySteer("restore the published tip as an ancestor");
+    assert.strictEqual(ch.pullSafetySteer(), "restore the published tip as an ancestor");
+    assert.strictEqual(ch.pullSafetySteer(), undefined, "the slot is cleared after one pull");
+  });
+
+  it("pushing twice keeps the latest (a later arm overwrites an unconsumed one)", () => {
+    const { ch } = makeChannel([]);
+    ch.pushSafetySteer("first");
+    ch.pushSafetySteer("second");
+    assert.strictEqual(ch.pullSafetySteer(), "second");
+    assert.strictEqual(ch.pullSafetySteer(), undefined);
+  });
+
+  it("pulling an empty slot returns undefined", () => {
+    const { ch } = makeChannel([]);
+    assert.strictEqual(ch.pullSafetySteer(), undefined);
+  });
+
+  it("does NOT advance the follow-up watermark and does NOT make hasPendingFollowUpOutcome true (D3)", () => {
+    // The whole point of D3: the worker steer must not corrupt the follow-up wake-guard. Mutation:
+    // routing the steer through the follow-up queue (push → this.followUps) would advance the
+    // watermark and flip hasPendingFollowUpOutcome, reddening both asserts.
+    const { ch } = makeChannel([]);
+    ch.pushSafetySteer("worker guidance");
+    assert.strictEqual(ch.getLastDeliveredFollowUpId(), 0, "the steer never touches the follow-up watermark");
+    assert.strictEqual(ch.hasPendingFollowUpOutcome(), false, "the steer is not a follow-up outcome");
+    // And it is still deliverable via its own slot, unaffected by the follow-up machinery.
+    assert.strictEqual(ch.pullSafetySteer(), "worker guidance");
+  });
+});
+
 // PRD #41: plan revision at the gate. The channel epoch-stamps every verdict/revise so
 // one written against a stale plan version is discardable, and a revise both enqueues
 // (FIFO) and wakes the gate.
