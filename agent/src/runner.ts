@@ -1564,13 +1564,9 @@ export class RunRunner {
         });
         return "fail";
       }
-      // With proof, send the UNTYPED report. Keep claim_generation IFF the api advertised the
-      // #1247 state fence (D7); the `6603f793` baseline has no generation field on the state
-      // report, so it carries neither field.
+      // With proof, send the UNTYPED recovery_wait report; the flight reportState closure it routes
+      // through (reportForgeParkAndDispatch) stamps claim_generation unconditionally (PRD #1247 M2).
       const body: StateRequest = { status: "recovery_wait" };
-      if (features.includes("claim_generation_fence") && gen !== undefined) {
-        body.claim_generation = gen;
-      }
       return await this.reportForgeParkAndDispatch(body, claim, flight, reportState, runLog, runHome);
     }
 

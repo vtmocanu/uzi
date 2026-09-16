@@ -660,7 +660,17 @@ describe("RunRunner — pre-clone forge-unreachable park (PRD #1392 M2)", () => 
       // (both landed in #1392), so it is never rejected — and an api old enough to reject it would
       // already 400 every other #1247 report, so #1247 does not pair with it. The fence now covers
       // the forge-park report too (a stale/superseded park is rejected). recovery_cause stays absent.
-      assert.strictEqual(park!.claim_generation, 20, "PRD #1247 stamps claim_generation on every report");
+      // PRD #1247 M5 rework: the recovery_release_exact_echo branch no longer stamps claim_generation
+      // locally (the `claim_generation_fence`-gated local set was dead — the reportState closure spreads
+      // `...body` then overrides claim_generation unconditionally). Here the fence is NOT advertised, so
+      // the retired conditional could never have fired; claim_generation being present therefore proves
+      // the stamp comes SOLELY from the reportState closure — removing the local conditional changed
+      // nothing on the wire.
+      assert.strictEqual(
+        park!.claim_generation,
+        claim.claim_generation,
+        "the reportState closure stamps the claim's generation (20) on the untyped forge-park report",
+      );
       assert.strictEqual(park!.recovery_cause, undefined, "no cause on the baseline fallback");
       assert.strictEqual(statusTexts(claim.run_id).filter((t) => /parked/.test(t)).length, 1, "one park event");
     } finally {
