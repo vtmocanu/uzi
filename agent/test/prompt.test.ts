@@ -1712,6 +1712,37 @@ describe("plan/implement prompts — published-tip note (PRD #1416 M1)", () => {
     assert.ok(withP.indexOf("already published on the forge") < withP.indexOf("<issue_description>"));
   });
 
+  // SC4: a ci_fix run's PLAN turn must name P too — ci_fix branches are routinely published
+  // (PRD fact 17). Mirrors the buildPlanPrompt include/omit test above; the note sits OUTSIDE
+  // the untrusted job-log fence.
+  it("buildCIFixPlanPrompt includes the paragraph when P is set and omits it when absent", () => {
+    const ciBase = {
+      ref: "main", branch: "uzi/issue-1", pipelineWebURL: "u",
+      failedJobs: [{ name: "j", stage: "s", logTail: "l" }], subagentNames: [],
+    };
+    const withP = buildCIFixPlanPrompt({ ...ciBase, publishedTip: P, defaultBranchCommit: DFLT });
+    assert.ok(withP.includes("already published on the forge"));
+    assert.ok(withP.includes(P));
+    const without = buildCIFixPlanPrompt({ ...ciBase });
+    assert.ok(!without.includes("already published on the forge"));
+    // Outside the untrusted job-log fence (uzi's own worker-verified fact).
+    assert.ok(withP.indexOf("already published on the forge") < withP.indexOf("<job_log_"));
+  });
+
+  // SC4: a self_improve run's PLAN turn must name P too — the fixed self_improve branch is
+  // routinely published (PRD fact 17). Mirrors the buildPlanPrompt include/omit test above; the
+  // note sits OUTSIDE the untrusted recommendations fence.
+  it("buildSelfImprovePlanPrompt includes the paragraph when P is set and omits it when absent", () => {
+    const siBase = { branch: "uzi/self-improve", recommendations: "untrusted body", subagentNames: [] };
+    const withP = buildSelfImprovePlanPrompt({ ...siBase, publishedTip: P, defaultBranchCommit: DFLT });
+    assert.ok(withP.includes("already published on the forge"));
+    assert.ok(withP.includes(P));
+    const without = buildSelfImprovePlanPrompt({ ...siBase });
+    assert.ok(!without.includes("already published on the forge"));
+    // Outside the untrusted recommendations fence (uzi's own worker-verified fact).
+    assert.ok(withP.indexOf("already published on the forge") < withP.indexOf("<untrusted_recommendations_"));
+  });
+
   it("buildImplementPrompt renders it on the FIRST turn only", () => {
     const first = buildImplementPrompt({
       branch: "uzi/task/abc", subagentNames: [], first: true, iteration: 1, publishedTip: P, defaultBranchCommit: DFLT,

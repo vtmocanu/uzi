@@ -1539,6 +1539,10 @@ export interface SelfImprovePlanPromptInput {
   baseCommit?: string;
   /** The default branch's tip. See baseCommitNote. */
   defaultBranchCommit?: string;
+  /** PRD #1416 M1: the branch's published forge tip P at claim (runner.ts `RunFlight.publishedTip`).
+   *  The self_improve branch is fixed and long-lived and is routinely published (PRD fact 17),
+   *  so P is routinely set. Drives publishedTipNote. See publishedTipNote. */
+  publishedTip?: string;
   /** Issue #297: coordinate lines for work already in flight on this repo, rendered as
    *  their OWN untrusted nonce-fenced block. Absent/empty ⇒ no block. */
   inflightTargets?: string[];
@@ -1579,6 +1583,9 @@ export function buildSelfImprovePlanPrompt(
   const memoryBlock = buildMemoryContext(input.memory ?? []);
   const priorNote = priorWorkNote(input.priorWork);
   const baseNote = baseCommitNote(input.baseCommit, input.defaultBranchCommit);
+  // PRD #1416 M1: name the published floor P beside the base-commit/branch facts, OUTSIDE
+  // every untrusted fence (exactly where baseNote sits). Empty ⇒ nothing added.
+  const publishedNote = publishedTipNote(input.publishedTip, input.defaultBranchCommit);
   // Issue #297: the in-flight avoid-set gets its OWN nonce-fenced block, minted from a
   // fresh nonce so it never shares a delimiter with the recommendations fence above. An
   // empty avoid-set injects nothing — no dangling fence, no preface.
@@ -1654,6 +1661,7 @@ export function buildSelfImprovePlanPrompt(
     `You are on this cycle's branch \`${input.branch}\`; open a new merge request for your change.`,
     ...(priorNote ? ["", priorNote] : []),
     ...(baseNote ? ["", baseNote] : []),
+    ...(publishedNote ? ["", publishedNote] : []),
     "",
     "Pick exactly ONE top improvement to make this cycle — a single bug fix, feature, or",
     "refactor that you can complete and verify in one merge request. Do NOT attempt a list.",
@@ -1758,6 +1766,10 @@ export interface CIFixPlanPromptInput {
   baseCommit?: string;
   /** The default branch's tip. See baseCommitNote. */
   defaultBranchCommit?: string;
+  /** PRD #1416 M1: the branch's published forge tip P at claim (runner.ts `RunFlight.publishedTip`).
+   *  A ci_fix run's branch is routinely published (PRD fact 17), so P is routinely set. Drives
+   *  publishedTipNote. See publishedTipNote. */
+  publishedTip?: string;
   /** PRD #501 REC B: autopilot run (claim.auto_approve). When true, the plan prompt
    *  tells the lead there is no human and to decide open questions on best judgment.
    *  Absent/false ⇒ byte-identical to before. */
@@ -1795,11 +1807,15 @@ export function buildCIFixPlanPrompt(input: CIFixPlanPromptInput): string {
   const closeTag = `</job_log_${nonce}>`;
   const priorNote = priorWorkNote(input.priorWork);
   const baseNote = baseCommitNote(input.baseCommit, input.defaultBranchCommit);
+  // PRD #1416 M1: name the published floor P beside the base-commit/branch facts, OUTSIDE
+  // the job-log fence (exactly where baseNote sits). Empty ⇒ nothing added.
+  const publishedNote = publishedTipNote(input.publishedTip, input.defaultBranchCommit);
   const lines: string[] = [
     `A CI pipeline failed on ref \`${input.ref}\`. You are on branch \`${input.branch}\`.`,
     `Failing pipeline: ${input.pipelineWebURL}`,
     ...(priorNote ? ["", priorNote] : []),
     ...(baseNote ? ["", baseNote] : []),
+    ...(publishedNote ? ["", publishedNote] : []),
     "",
     ciLogFrame(openTag, closeTag),
     "",
