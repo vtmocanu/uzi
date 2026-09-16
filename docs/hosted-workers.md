@@ -126,7 +126,11 @@ wanted.
 A hosted worker gets the same [message outbox](./worker-setup.md#message-outbox) as
 any worker: an api outage of any length no longer costs a run its message feed,
 since the worker spills to a durable on-disk outbox after a sustained outage and
-replays it in order once the api is back. One caveat is worth restating here rather
+replays it in order once the api is back — as long as the retained data stays
+within the outbox's configured quotas (`WORKER_OUTBOX_RUN_MAX_BYTES`,
+`WORKER_OUTBOX_MAX_BYTES`, `WORKER_OUTBOX_SPILL_BUFFER_BYTES`); beyond them, some
+message frames are dropped and replayed as contiguous per-seq gap markers rather
+than the original messages. One caveat is worth restating here rather
 than at length: a hosted worker runs the `#58` single-uid posture, so the model
 process shares its uid and could read, forge, truncate, or delete its own outbox —
 the outbox protects against the outage, not against a hostile model, on this
