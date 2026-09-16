@@ -139,6 +139,7 @@ func (r *fakeNotifRows) Scan(dest ...any) error                       { return r
 func (r *fakeNotifRows) Values() ([]any, error)                       { return nil, nil }
 func (r *fakeNotifRows) RawValues() [][]byte                          { return nil }
 func (r *fakeNotifRows) Conn() *pgx.Conn                              { return nil }
+func (r *fakeNotifRows) TypeMap() *pgtype.Map                         { return pgtype.NewMap() }
 
 // notifUser attaches a session user (own-user / admin scope) to a request.
 func notifUser(req *http.Request, id uuid.UUID, admin bool) *http.Request {
