@@ -210,12 +210,22 @@ workflow-file pieces locally, because your own token has `workflow` scope (confi
 
 ## Recovering a failed run's work from the worker PVC
 
-**A push-rejected run's work is usually NOT lost.** On hosted (k8s) workers the branch
-survives in the worker's persistent volume at `refs/uzi-runner/agent/issue-N` (the
-worker-side tracking ref); only the worker *container* is torn down, its data volume
-persists. Recovered #422's full 12 commits this way, 2026-08-20. Needs kube access to your
-deployment's worker namespace — **read the context and namespace from your own kubeconfig;
-they are deployment-specific, do not hard-code them** (and this is a public file).
+**A push-rejected run's work is usually NOT lost.** Check the durable sources first; they need
+no kube access:
+
+- `uzi run export RUN --output FILE`: the #1296 recovery capture. Only an `available` capture
+  exports; with several, pass `--capture ID`, reading the ids from `GET /api/runs/RUN/archives`
+  until #1417 lands (the CLI listing truncates them).
+- `uzi run get RUN --json | jq -r .preserved_patch`: the diff a typed push failure preserves.
+
+Fall back to the worker PVC only for a **persistent** hosted worker: the branch survives at
+`refs/uzi-runner/agent/issue-N` (the worker-side tracking ref) because a roll replaces the
+container, not the data volume. An **ephemeral** (run-bound) worker is removed automatically,
+PVC included, once its run is terminal and recovery custody has released, so skip PVC recovery
+when the live worker reads `(ephemeral)` in `uzi worker list` or the finished run's `worker_id`
+is already null. Needs kube access to your deployment's worker namespace — **read the context
+and namespace from your own kubeconfig; they are deployment-specific, do not hard-code them**
+(and this is a public file).
 
 1. **Find the worker — but do NOT trust the run's *current* `worker_id` after a
    resume.** `uzi run get RUN --json | jq -r .worker_id` names the worker the run is
