@@ -11,6 +11,7 @@ import { ChatExecutor, type ChatExecutorLike } from "./chat-executor.js";
 import { StubChatExecutor } from "./chat-executor-stub.js";
 import { RunRunner, type ExecutorFactory } from "./runner.js";
 import { ChatRunner } from "./chat-runner.js";
+import { Outbox } from "./outbox.js";
 import { JudgeRunner } from "./judge-runner.js";
 import { ReviewRunner } from "./review-runner.js";
 import { stubJudgeQueryFn } from "./judge-runner-stub.js";
@@ -109,6 +110,23 @@ async function main(): Promise<void> {
     httpTimeoutMs: config.httpTimeoutMs,
   });
   const git = new GitCache(config.dataDir, log);
+
+  // PRD #1391 M2: the worker-owned message outbox and the shared re-arm registry,
+  // built + initialised BEFORE the runners/worker so a boot backlog is already
+  // loadable and every batcher can spill into the same store. `init()` mints/loads the
+  // worker-local HMAC key, scans the run tree and captures the spill-unclean flags;
+  // it fails closed (disables the store) rather than throwing, so a broken /data never
+  // blocks startup. The registry maps a live run's id to its batcher's rearm() so the
+  // drainer can return a still-running run to the network once its segments retire.
+  const outbox = new Outbox({
+    root: config.outboxDataDir,
+    log,
+    runMaxBytes: config.outboxRunMaxBytes,
+    maxBytes: config.outboxMaxBytes,
+    retentionMs: config.outboxRetentionMs,
+  });
+  await outbox.init();
+  const rearm = new Map<string, () => void>();
   // Pin the SDK's HOME (session transcripts under $HOME/.claude/projects) onto
   // the persistent data volume so `docker compose down && up` doesn't wipe
   // sessions and resume still works.
@@ -202,6 +220,11 @@ async function main(): Promise<void> {
     pollMs: config.pollIntervalMs,
     planApprovalTimeoutMs: config.planApprovalTimeoutMs,
     checkpointIntervalMs: config.checkpointIntervalMs,
+    // PRD #1391 M2: spill collaborators for every run's batcher.
+    outbox,
+    rearm,
+    transientTripMs: config.transientTripMs,
+    outboxSpillBufferBytes: config.outboxSpillBufferBytes,
   });
 
   // The chat lane (PRD #39). Per-session executor factory (PRD #42 Decision 4): each
@@ -239,13 +262,18 @@ async function main(): Promise<void> {
     // session) — the same discriminator the run lane gets for free from the stub's
     // absent per-run HOME above.
     //
-    // The conditional-spread idiom is the point (PRD #103 M3, oxlint
-    // unicorn/no-useless-spread): it OMITS the key rather than setting it to
-    // undefined, which is what lets the stub be told apart from a worker whose
-    // sdkHomeDir happens to be unset. Rewriting it to satisfy the rule would either
-    // reintroduce the undefined key or need a mutable builder for one field.
-    // eslint-disable-next-line unicorn/no-useless-spread
+    // The conditional-spread idiom is the point (PRD #103 M3): it OMITS the key
+    // rather than setting it to undefined, which is what lets the stub be told apart
+    // from a worker whose sdkHomeDir happens to be unset. (No oxlint
+    // unicorn/no-useless-spread disable is needed here: the PRD #1391 M2 fields below
+    // give the object sibling keys, so the rule no longer reads the spread as useless.)
     ...(config.executor === "stub" ? {} : { sdkHomeDir: sdkHomeRoot }),
+    // PRD #1391 M2: chat keeps the message outbox (Run A), spilling into the same store
+    // and re-arm registry as the run lane.
+    outbox,
+    rearm,
+    transientTripMs: config.transientTripMs,
+    outboxSpillBufferBytes: config.outboxSpillBufferBytes,
   });
 
   // The judge lane (PRD #46): a slim runner for `judge` claims. It reuses the SDK
@@ -270,7 +298,10 @@ async function main(): Promise<void> {
     ...(config.executor === "stub" ? { queryFn: stubJudgeQueryFn } : {}),
   });
 
-  const worker = new Worker(config, client, runner, chatRunner, judgeRunner, reviewRunner, log);
+  // PRD #1391 M2: the Worker owns the per-worker outbox drainer + the heartbeat outbox
+  // report, so it takes the same outbox + re-arm registry the runners spill into. The
+  // `undefined` preserves the default boot toolchain preflight (only tests inject one).
+  const worker = new Worker(config, client, runner, chatRunner, judgeRunner, reviewRunner, log, undefined, outbox, rearm);
 
   // Signal handlers FIRST, before anything that can take real time. Until these
   // are installed a SIGTERM hits Node's default disposition and terminates the

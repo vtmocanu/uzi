@@ -3913,12 +3913,17 @@ UPDATE runs SET checkpoint_tip = @checkpoint_tip, checkpoint_tip_at = now() WHER
 -- queued arm can surface a Codex-capability reason for a CODEX-INDICATING run (any of the three set)
 -- that no online worker advertises 'codex_harness_v1' — the non-bypassable Codex claim clause can
 -- never be satisfied. The resolver checks all three, mirroring the claim gate's fail-closed test.
+-- PRD #1391 M5 (owner-gated outbox reason): worker_id rides this read so the running-run stalled arm
+-- applies reasonOutboxQueued ONLY when the run's CURRENT owning worker is the same worker that
+-- reported the outbox depth. Without it a cross-tenant worker (or a stale runIndex entry left by a
+-- reclaim-during-outage) could flip a genuinely-stalled run to the reassuring "queued" reason.
+-- worker_id is NULL for an unclaimed run (ON DELETE SET NULL), so the arm requires it be non-null.
 SELECT id, user_id, status, auto_approve,
        started_at, last_activity_at, updated_at, status_since,
        health, health_reason, health_since, health_notified_at,
        budget_wall_seconds, budget_paused_seconds, budget_extension_seconds, interactive,
        repo_id, kind, required_capabilities, completion_contract_version,
-       harness, codex_material_revision, codex_secret_id
+       harness, codex_material_revision, codex_secret_id, worker_id
 FROM runs
 WHERE status IN ('queued', 'running', 'awaiting_approval')
   AND kind <> 'chat';

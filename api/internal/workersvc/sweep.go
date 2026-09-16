@@ -254,6 +254,12 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 	// detector so a flag is never raised off an entry this tick was going to expire.
 	s.persistFail.prune(now)
 
+	// Bound the in-process outbox-depth tracker (PRD #1391 M5), the same memory bound
+	// persistFail.prune above is: a worker that vanished (or went offline and stopped
+	// heartbeating) without a graceful delete has its stale depth age out here, which
+	// is also how the "queued on the worker" health reason clears for an offline worker.
+	s.outbox.prune(now)
+
 	// Run-health detector (PRD #47): flag/clear slow, stalled, looping, stuck-queued,
 	// and approval-idle runs from telemetry already in Postgres. Best-effort and
 	// non-terminal — it never kills a run and never fails the sweep (it logs and

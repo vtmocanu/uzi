@@ -160,6 +160,24 @@ type WorkerDTO struct {
 	// default: the mode it resolves under is the only one that describes what its
 	// next claim will spend. Do not "fix" this by exposing the stored value.
 	AnthropicBindMode string `json:"anthropic_bind_mode"`
+	// Outbox depth this worker last reported on its heartbeat (PRD #1391 M5), summed
+	// across the runs it holds. All null until the worker reports a non-empty outbox
+	// (and re-nulled on the next empty report, when the backlog has drained), matching
+	// the Stats* fields' "null until reported, last-known otherwise" contract: the api
+	// overlays them from an in-process, restart-losing tracker, never from the DB.
+	//
+	// OutboxPendingMessages is the count of message frames buffered on the worker
+	// waiting to replay to the api (the visible symptom of an api outage the worker
+	// rode out). OutboxPendingTerminal is the count of write-ahead terminal outcomes
+	// still to send (always 0 in Run A — terminal journaling is Run B). OutboxStaleRetired
+	// counts frames a re-claim forced the worker to retire locally (D11). OutboxBlocked
+	// is the oldest permanent-refusal reason across the worker's runs (never set in Run
+	// A; forward-compat for Run B's blocked terminal journals), or null when nothing is
+	// blocked.
+	OutboxPendingMessages *int    `json:"outbox_pending_messages"`
+	OutboxPendingTerminal *int    `json:"outbox_pending_terminal"`
+	OutboxStaleRetired    *int    `json:"outbox_stale_retired"`
+	OutboxBlocked         *string `json:"outbox_blocked"`
 }
 
 // AdminWorkerDTO is a worker plus its owner email for the admin Agents-status

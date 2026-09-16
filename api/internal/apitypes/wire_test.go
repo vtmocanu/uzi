@@ -770,6 +770,11 @@ var workerDTOKeys = []string{
 	// PRD #111 M3: HOW this worker chooses — default | pinned | auto. The server
 	// reports the EFFECTIVE mode, so "pinned" always has an id beside it.
 	"anthropic_bind_mode",
+	// PRD #1391 M5: the worker's last-reported outbox depth, summed across its runs.
+	// Null until it reports a non-empty outbox (re-nulled once drained). Overlaid from
+	// an in-process, restart-losing tracker, never stored — this tag set is the only
+	// wire contract these four fields have.
+	"outbox_pending_messages", "outbox_pending_terminal", "outbox_stale_retired", "outbox_blocked",
 }
 
 func TestWorkerDTOTags(t *testing.T) {

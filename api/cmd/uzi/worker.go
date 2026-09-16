@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -72,7 +73,7 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 					version = "-"
 				}
 				rows = append(rows, []string{
-					w.ID, cellText(w.Name), statusCell(w), uptimeCell(w), version, upgradeCell(w), bindModeCell(w),
+					w.ID, cellText(w.Name), statusCell(w), uptimeCell(w), version, upgradeCell(w), bindModeCell(w), outboxCell(w),
 				})
 			}
 			// VERSION is here because docs/run-auto-stopped.md's first remedy for an
@@ -86,7 +87,12 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 			// gained a WRITE (`worker set-token --auto`) with no human-readable READ, so
 			// the only way to confirm what a worker was set to was `--json`. A three-way
 			// user choice you can set and cannot see is worse than one you cannot set.
-			return p.Table([]string{"ID", "NAME", "STATUS", "UPTIME", "VERSION", "UPGRADE", "TOKEN"}, rows)
+			// OUTBOX is PRD #1391 M5: the count of a worker's message frames buffered
+			// locally waiting to replay to the api (the visible symptom of an api outage the
+			// worker rode out). "-" in the steady state where nothing is queued, so a healthy
+			// fleet reads a clean column; a number means the api was unreachable and the
+			// worker held the run's updates rather than losing them.
+			return p.Table([]string{"ID", "NAME", "STATUS", "UPTIME", "VERSION", "UPGRADE", "TOKEN", "OUTBOX"}, rows)
 		},
 	}
 
@@ -341,6 +347,40 @@ func upgradeCell(w apitypes.WorkerDTO) string {
 		// not as "-" hiding a state this build has no opinion about.
 		return strings.ReplaceAll(w.UpgradeStatus, "_", " ")
 	}
+}
+
+// outboxCell renders a worker's outbox depth for `uzi worker list`'s and
+// `uzi admin workers`'s OUTBOX column (PRD #1391 M5) — "how many of this worker's
+// updates are buffered locally waiting to replay to the api".
+//
+// "-" is the steady state (null or zero pending): the api is reachable and nothing is
+// queued, so a healthy fleet shows a clean column and a non-"-" cell is a real signal.
+// A number is the count of buffered message frames; when a run's outcome is
+// permanently blocked on the worker (Run B) the reason rides `outbox_blocked` and this
+// annotates "(blocked)" so the operator knows a decision is owed rather than a drain
+// that will clear itself. A worker showing "blocked" with zero pending still reads
+// "blocked" rather than "-", because a held outcome is not nothing.
+//
+// The fields are api-derived (server-side aggregate of the worker's own report), so
+// the raw counts also ride `--json` untouched for scripting. blocked_reason is
+// server-sanitized (control/format chars stripped, bounded) before it reaches here.
+func outboxCell(w apitypes.WorkerDTO) string {
+	blocked := w.OutboxBlocked != nil && *w.OutboxBlocked != ""
+	pending := 0
+	if w.OutboxPendingMessages != nil {
+		pending = *w.OutboxPendingMessages
+	}
+	if pending == 0 {
+		if blocked {
+			return "blocked"
+		}
+		return "-"
+	}
+	s := strconv.Itoa(pending)
+	if blocked {
+		s += " (blocked)"
+	}
+	return s
 }
 
 // bindModeCell renders HOW a worker chooses its Anthropic credential, for

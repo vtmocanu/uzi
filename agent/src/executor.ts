@@ -675,6 +675,17 @@ export const STUB_LOOP_SENTINEL = "UZI_STUB_LOOP";
 export const STUB_INFLIGHT_SENTINEL = "UZI_STUB_INFLIGHT";
 
 /**
+ * PRD #1391 M5 (Run A): drives the stub to emit a STEADY STREAM of status messages
+ * over a bounded window instead of a one-shot pause. The e2e outbox-outage phase
+ * stops the api mid-run so the batcher spills the frames produced DURING the outage
+ * to the durable outbox and replays them in order once the api returns; that needs a
+ * run that stays ALIVE and PRODUCING across the whole stop→wait→start window, which
+ * is exactly what this sentinel gives (the STALL sentinel goes quiet — the opposite).
+ * Off unless present; a normal run never streams.
+ */
+export const STUB_OUTBOX_SENTINEL = "UZI_STUB_OUTBOX";
+
+/**
  * Pause lengths for the health sentinels, in ms. STALL/INFLIGHT sit comfortably
  * above the 60s minimum health_stall_seconds the E2E sets, so the detector flags
  * (or, for in-flight, provably does NOT flag) the run before the stub moves on.
@@ -689,6 +700,16 @@ export const STUB_INFLIGHT_SENTINEL = "UZI_STUB_INFLIGHT";
 const STUB_HEALTH_STALL_MS = 95_000;
 const STUB_HEALTH_RESUME_MS = 20_000;
 const STUB_HEALTH_LOOP_HOLD_MS = 35_000;
+
+// PRD #1391 M5: the outbox-sentinel stream shape. The stub emits STUB_OUTBOX_TICKS
+// status frames spaced STUB_OUTBOX_TICK_MS apart, so the run stays alive and producing
+// for ~STUB_OUTBOX_TICKS × STUB_OUTBOX_TICK_MS (90s at the defaults) — long enough that
+// the e2e's whole stop-api → sleep → start-api → observe-depth window falls inside it
+// and a steady share of frames is produced (and spilled) mid-outage. The e2e leaves
+// these at their defaults; a unit test shrinks them via StubExecutorOptions so the
+// stream runs instantly (mirroring healthPauseMs for the health sentinels).
+const STUB_OUTBOX_TICK_MS = 1_000;
+const STUB_OUTBOX_TICKS = 90;
 
 // PRD #99 M2: the same six frames now also carry the per-instance attribution a
 // real parallel-subagent run would — `instance` = the SDK's `parent_tool_use_id`
@@ -796,6 +817,14 @@ export interface StubExecutorOptions {
    * server's stall threshold).
    */
   healthPauseMs?: number;
+  /**
+   * E2E/test-only (PRD #1391 M5): override the outbox-sentinel stream shape — the tick
+   * interval in ms (`outboxTickMs`) and the number of ticks (`outboxTicks`). A unit test
+   * sets tiny values so the stream runs instantly; the real e2e leaves them undefined to
+   * use the STUB_OUTBOX_* defaults (a ~90s window the outage falls inside).
+   */
+  outboxTickMs?: number;
+  outboxTicks?: number;
 }
 
 /**
@@ -1269,6 +1298,26 @@ export class StubExecutor implements Executor {
         payload: { text: "stub: resuming after the pause" },
       });
       await sleep(resumeMs);
+      return;
+    }
+
+    if (has(STUB_OUTBOX_SENTINEL)) {
+      // PRD #1391 M5: emit a STEADY STREAM of status frames over a bounded window so the
+      // e2e can stop the api mid-run. The batcher spills the frames produced during the
+      // outage to the durable outbox and replays them in order once the api returns; the
+      // run stays alive and producing across the whole outage window (unlike the one-shot
+      // health pauses above). Tick interval + count are tunable so a unit test shrinks the
+      // stream to run instantly; the e2e leaves the STUB_OUTBOX_* defaults.
+      const outboxTickMs = this.opts.outboxTickMs ?? STUB_OUTBOX_TICK_MS;
+      const outboxTicks = this.opts.outboxTicks ?? STUB_OUTBOX_TICKS;
+      for (let i = 1; i <= outboxTicks; i++) {
+        ctx.emit({
+          kind: "status",
+          agent: "worker",
+          payload: { text: `stub: outbox tick ${i}` },
+        });
+        await sleep(outboxTickMs);
+      }
       return;
     }
 
