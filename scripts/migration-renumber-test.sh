@@ -11,6 +11,9 @@
 #      main head, rewrites the renamed migrations' own cross-references, REPORTS (never
 #      edits) stale references in other branch-changed files, and passes its own numbering
 #      self-check.
+#   D. an OVERLAPPING-range renumber (a same-slug pair straddling the head) is renamed
+#      correctly, and by IDENTITY, by the two-phase git mv -- where a single-phase mv
+#      would collide with a still-present sibling and fail.
 #
 # 🔴 100% OFFLINE AND HERMETIC. Every git repo is built under `mktemp -d`; the "remote" is
 # a LOCAL bare repo (`git init --bare`), so the helper's `git fetch origin main` is a local
@@ -335,6 +338,48 @@ assert_absent "C: unrelated file NOT in the postflight report"   "unrelated.md" 
 ( cd "$REPOC" && ./scripts/check-migration-numbering.sh scripts/migration-numbering-canary "$MIGDIR" ) >/dev/null 2>&1
 C_NUMRC=$?
 assert_eq "C: check-migration-numbering.sh green after renumber" "0" "$C_NUMRC"
+
+# =============================================================================
+echo "=== D. integration -- two-phase rename over an OVERLAPPING range ==="
+# =============================================================================
+# The whole reason migration-renumber.sh renames in TWO phases (old -> temp -> new) is to
+# survive a rename whose NEW path equals another branch file's still-present OLD path. That
+# happens when a SAME-SLUG pair straddles the head: draft 00231_dup / 00232_dup with live
+# head 00231 -> new 00232_dup / 00233_dup, so a direct `git mv 00231_dup -> 00232_dup` would
+# collide with the still-present 00232_dup. A single-phase helper FAILS this (git mv refuses
+# to overwrite); the two-phase rename renames it correctly. Distinguishing body markers prove
+# IDENTITY is preserved (no clobber/swap), not merely that the new numbers now exist. Case C
+# (distinct slugs, no path overlap) does NOT exercise this: single-phase would pass it.
+CASE_D="$ROOT/caseD"; build_base "$CASE_D"; REPOD="$CASE_D/repo"
+MD_D="$REPOD/$MIGDIR"
+printf '%s\n' '-- +goose Up' '-- MARK_A: this file was drafted as 00231_dup' 'SELECT 1;' '-- +goose Down' 'SELECT 1;' > "$MD_D/00231_dup.sql"
+printf '%s\n' '-- +goose Up' '-- MARK_B: this file was drafted as 00232_dup' 'SELECT 1;' '-- +goose Down' 'SELECT 1;' > "$MD_D/00232_dup.sql"
+git -C "$REPOD" add -A
+git -C "$REPOD" commit -q -m "branch: same-slug pair 00231_dup/00232_dup straddling head 00231"
+
+D_OUT="$( ( cd "$REPOD" && sh "$HELPER" ) 2>&1 )"
+D_RC=$?
+: "$D_OUT"
+assert_eq "D: overlapping-range renumber exits 0 (single-phase git mv would collide)" "0" "$D_RC"
+if [ -f "$MD_D/00232_dup.sql" ]; then pass "D: 00232_dup.sql created"; else fail "D: 00232_dup.sql created"; fi
+if [ -f "$MD_D/00233_dup.sql" ]; then pass "D: 00233_dup.sql created"; else fail "D: 00233_dup.sql created"; fi
+if [ -f "$MD_D/00231_dup.sql" ]; then fail "D: old 00231_dup.sql removed"; else pass "D: old 00231_dup.sql removed"; fi
+# Identity preserved by the two-phase rename: the file drafted 00231_dup is now 00232_dup
+# (MARK_A), the file drafted 00232_dup is now 00233_dup (MARK_B) -- not clobbered or swapped.
+# (MARK_A/MARK_B are number-free, so the comment number-remap cannot perturb them.)
+assert_contains "D: 00232_dup carries MARK_A (was 00231_dup)" "MARK_A" "$(cat "$MD_D/00232_dup.sql" 2>/dev/null)"
+assert_contains "D: 00233_dup carries MARK_B (was 00232_dup)" "MARK_B" "$(cat "$MD_D/00233_dup.sql" 2>/dev/null)"
+# No stray two-phase temp file left behind (POSIX glob: an explicit leading dot matches
+# dotfiles; a no-match glob stays literal, so the -e test is false and leftover stays empty).
+_leftover=""
+for _t in "$MD_D"/.renumber-tmp-*; do
+  [ -e "$_t" ] && _leftover="$_leftover $_t"
+done
+assert_eq "D: no leftover .renumber-tmp-* file after success" "" "$_leftover"
+# Numbering check green after the overlapping renumber.
+( cd "$REPOD" && ./scripts/check-migration-numbering.sh scripts/migration-numbering-canary "$MIGDIR" ) >/dev/null 2>&1
+D_NUMRC=$?
+assert_eq "D: check-migration-numbering.sh green after overlapping renumber" "0" "$D_NUMRC"
 
 # --- tally -------------------------------------------------------------------
 TOTAL=$((PASSES + FAILS))
