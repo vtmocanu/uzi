@@ -1423,6 +1423,12 @@ export function PoolWaitPanel({
  * recovers or the owner cancels it (cancel is the separate Stop control, not offered
  * here — same rule as LimitWaitPanel's parked state).
  *
+ * PRD #1392 M5: when the typed cause is `forge_unreachable` (the forge stayed unreachable
+ * at clone) the panel swaps in forge-specific copy — "Waiting for the forge", the retry
+ * time from `recovery_retry_not_before`, and the park count against its cap ("N of MAX",
+ * or "N of unlimited" when `forge_park_max` is 0). A null/other cause keeps the #1197
+ * empty-turn copy. The wording is kept consistent with the TUI and `uzi run get`.
+ *
  * Exported like the sibling panels so its copy is reachable without mounting the page.
  */
 export function RecoveryWaitPanel({ run }: { run: Run }) {
@@ -1430,6 +1436,17 @@ export function RecoveryWaitPanel({ run }: { run: Run }) {
   // sibling parks) renders nothing — PoolWaitPanel owns pool_wait, LimitWaitPanel owns
   // limit_wait, and this self-hides on both so mounting all three side by side is safe.
   if (run.status !== "recovery_wait") return null;
+
+  // PRD #1392 M5: a forge-unreachable park gets forge-specific copy. Every other cause
+  // (including the null/untyped empty-turn park, issue #1197) keeps the copy below.
+  const forgePark = run.recovery_wait_cause === "forge_unreachable";
+  const retryMs = run.recovery_retry_not_before ? Date.parse(run.recovery_retry_not_before) : NaN;
+  // Same wall-clock HH:MM idiom as the paused/limit surfaces on this page.
+  const retryAt = Number.isFinite(retryMs)
+    ? new Date(retryMs).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })
+    : null;
+  // 0 means the cap is disabled — render "unlimited", never a real ceiling of zero.
+  const parkLabel = `${run.forge_park_count} of ${run.forge_park_max === 0 ? "unlimited" : run.forge_park_max}`;
 
   return (
     <div className="rounded-xl border border-warn/40 bg-warn/10 p-4">
@@ -1443,16 +1460,31 @@ export function RecoveryWaitPanel({ run }: { run: Run }) {
             what reliably announces the hold. */}
         <p role="status" className="text-sm font-semibold text-warn">
           <span aria-hidden="true">⏸ </span>
-          Recovering and resuming automatically
+          {forgePark ? "Waiting for the forge" : "Recovering and resuming automatically"}
         </p>
-        <p className="mt-0.5 text-xs text-muted">
-          This run paused to recover from a transient empty model result. It resumes on
-          its own on a capped backoff — no action is needed. If it never recovers it holds
-          here so you can cancel it.
-        </p>
-        {/* No countdown, deliberately: the retry instant is a server-owned backoff with
-            no DTO field to count down to (distinct from limit_wait, which carries a reset
-            window, and from pool_wait, which resumes on a pooled-token event). */}
+        {forgePark ? (
+          <>
+            <p className="mt-0.5 text-xs text-muted">
+              This run paused because the forge was unreachable when it went to clone. It
+              retries on its own on a capped backoff — no action is needed. If it never
+              recovers it holds here so you can cancel it.
+            </p>
+            <p className="mt-1.5 text-xs text-muted">
+              {retryAt ? `Retry at ${retryAt} (${parkLabel}).` : `Attempt ${parkLabel}.`}
+            </p>
+          </>
+        ) : (
+          <>
+            <p className="mt-0.5 text-xs text-muted">
+              This run paused to recover from a transient empty model result. It resumes on
+              its own on a capped backoff — no action is needed. If it never recovers it holds
+              here so you can cancel it.
+            </p>
+            {/* No countdown, deliberately: the retry instant is a server-owned backoff with
+                no DTO field to count down to (distinct from limit_wait, which carries a reset
+                window, and from pool_wait, which resumes on a pooled-token event). */}
+          </>
+        )}
         <p className="mt-1.5 text-xs text-muted">
           Nothing is lost — the run keeps its branch and its history and picks up where it left off.
         </p>

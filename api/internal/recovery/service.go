@@ -485,17 +485,33 @@ func (s *Service) ListHoldsForWorkerRun(ctx context.Context, wkr store.Worker, r
 // open settles zero (Released=false). It NEVER falls back to a generation-blind run+worker bulk
 // release.
 func (s *Service) Release(ctx context.Context, wkr store.Worker, runID uuid.UUID, req apitypes.RecoveryReleaseRequest) (apitypes.RecoveryReleaseResponse, error) {
+	// PRD #1392 M1 (D3): the worker's release-evidence declaration is UNTRUSTED and allowlisted
+	// to the two dispositions a worker's release endpoint may legitimately assert; an unknown
+	// non-nil value is a bad request (never a silently-stamped bogus class). Absent → no
+	// explicit evidence stamped.
+	evidence, err := allowlistedReleaseEvidence(req.ReleaseEvidence)
+	if err != nil {
+		return apitypes.RecoveryReleaseResponse{}, err
+	}
 	// v2 + explicit generation: settle EXACTLY that generation (fail-safe by rowcount).
 	if slices.Contains(wkr.ProtocolCapabilities, capability.RecoveryArchiveV2) && req.Generation != nil {
 		n, err := store.New(s.pool).ReleaseCustodyHoldExact(ctx, store.ReleaseCustodyHoldExactParams{
-			RunID:      runID,
-			Generation: *req.Generation,
-			WorkerID:   wkr.ID,
+			RunID:           runID,
+			Generation:      *req.Generation,
+			WorkerID:        wkr.ID,
+			ReleaseEvidence: evidence,
 		})
 		if err != nil {
 			return apitypes.RecoveryReleaseResponse{}, err
 		}
-		return apitypes.RecoveryReleaseResponse{RunID: runID.String(), Released: n > 0, HoldsReleased: int(n)}, nil
+		resp := apitypes.RecoveryReleaseResponse{RunID: runID.String(), Released: n > 0, HoldsReleased: int(n)}
+		// PRD #1392 M1: echo the released generation on the exact path when a hold was actually
+		// released, so the worker can confirm the server settled the generation it named.
+		if n > 0 {
+			g := *req.Generation
+			resp.Generation = &g
+		}
+		return resp, nil
 	}
 
 	// v1 or no generation: resolve the caller's OPEN holds. Release the SINGLE one; RETAIN on
@@ -526,9 +542,10 @@ func (s *Service) Release(ctx context.Context, wkr store.Worker, runID uuid.UUID
 	}
 
 	n, err := store.New(tx).ReleaseCustodyHoldExact(ctx, store.ReleaseCustodyHoldExactParams{
-		RunID:      runID,
-		Generation: generation,
-		WorkerID:   wkr.ID,
+		RunID:           runID,
+		Generation:      generation,
+		WorkerID:        wkr.ID,
+		ReleaseEvidence: evidence,
 	})
 	if err != nil {
 		return apitypes.RecoveryReleaseResponse{}, err
@@ -537,6 +554,24 @@ func (s *Service) Release(ctx context.Context, wkr store.Worker, runID uuid.UUID
 		return apitypes.RecoveryReleaseResponse{}, err
 	}
 	return apitypes.RecoveryReleaseResponse{RunID: runID.String(), Released: n > 0, HoldsReleased: int(n)}, nil
+}
+
+// allowlistedReleaseEvidence validates the worker's UNTRUSTED release-evidence declaration
+// (PRD #1392 M1, D3). A worker's release endpoint may only assert one of two dispositions —
+// "publication" (its work is published) or "forge_no_output" (a fresh-forge no-output proof);
+// the other three classes are server-derived and never worker-supplied. Absent (nil) is fine
+// and stamps no explicit evidence; an unknown non-nil value is ErrBadRequest so a garbled
+// report can never smuggle a bogus class into the constrained column.
+func allowlistedReleaseEvidence(reported *string) (pgtype.Text, error) {
+	if reported == nil {
+		return pgtype.Text{}, nil
+	}
+	switch *reported {
+	case "publication", "forge_no_output":
+		return pgconv.TextOrNull(*reported), nil
+	default:
+		return pgtype.Text{}, ErrBadRequest
+	}
 }
 
 // resolveSoleOpenHold row-locks the caller worker's OPEN custody holds on the run and returns
@@ -713,6 +748,8 @@ func (s *Service) DiscardHold(ctx context.Context, userID, runID, holdID uuid.UU
 		HoldID: holdID,
 		RunID:  runID,
 		UserID: userID,
+		// PRD #1392 M1 (D3): an explicit owner discard is warranted by the owner's decision.
+		ReleaseEvidence: pgconv.TextOrNull("owner_discard"),
 	})
 	if err != nil {
 		return false, err

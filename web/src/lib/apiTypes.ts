@@ -2241,6 +2241,31 @@ export interface Run {
    *  vocabulary is the SDK's and a newer server can ship a member this build has not
    *  heard of. Null for a run that has never parked. */
   rate_limit_type: string | null;
+  /** PRD #1392 M1: the TYPED cause of a `recovery_wait` park. Null is the LEGACY/untyped
+   *  park — the empty-turn park (#1197) writes null, so render null as the generic
+   *  "waiting to recover" wording, NOT as any particular cause. Today the only non-null
+   *  value is "forge_unreachable" (the forge stayed unreachable at clone);
+   *  "empty_turn"/"provider_outage" are reserved. Render an unrecognised value honestly (a
+   *  newer server may ship a cause this build has not heard of), the same rule as
+   *  rate_limit_type. */
+  recovery_wait_cause: string | null;
+  /** PRD #1392 M1: when the server will promote a `recovery_wait` run back to queued — the
+   *  retry stamp the forge-park surface counts down to ("retry at HH:MM"). The
+   *  recovery-park analog of retry_not_before (the usage-limit park's stamp) and a SEPARATE
+   *  field: a run parks on at most one of the two at a time. Null for a run that has never
+   *  recovery-parked. ISO-8601 string, like every other timestamp on this type. */
+  recovery_retry_not_before: string | null;
+  /** PRD #1392 M1: how many times this run has forge-parked in its lifetime — the
+   *  FORGE-ONLY counter the cap decides on. 0 for a run that has never forge-parked
+   *  (including every empty-turn park, which never touches it). Rendered as the "N" in
+   *  "N of MAX". */
+  forge_park_count: number;
+  /** PRD #1392 M1: the EFFECTIVE forge-park cap (RUN_FORGE_UNREACHABLE_MAX_PARKS),
+   *  server-computed and surfaced so the pill can render "N of MAX". 0 means UNLIMITED (the
+   *  cap is disabled) — render it as "unlimited", never as a real ceiling of zero. Unlike
+   *  limit_wait_count's cap it IS on the row because the forge wording ("N of MAX") needs
+   *  the denominator inline. */
+  forge_park_max: number;
   /** PRD #84 M4: the run's inferred/hinted scheduling requirements, surfaced RAW so the
    *  web derives the plan-gate readiness display from them plus the assigned worker's
    *  capabilities (there is no server-computed "capability_block" field — the 409 the

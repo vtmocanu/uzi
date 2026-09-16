@@ -95,6 +95,52 @@ describe("readRunAck", () => {
     assert.equal(bool.budgetTotalSeconds, undefined, "a boolean is ignored");
   });
 
+  // PRD #1392 M2 (D10) — the forge-unreachable park ack rides a {run, reason?} body: the
+  // disposition `reason` is TOP-LEVEL (stale_claim / custody_unsettled on a 409), while the
+  // retry-not-before stamp is a FIELD ON the RunDTO (run.recovery_retry_not_before). Both
+  // string-only; a missing / wrong-typed value leaves them ABSENT so the dispatch reads its safe
+  // defaults ("no reason" / "retry after backoff").
+  it("reads the disposition reason off the TOP LEVEL, not from run", async () => {
+    const out = await readRunAck(
+      jsonResponse({ reason: "stale_claim", run: { status: "queued" } }),
+    );
+    assert.equal(out.reason, "stale_claim", "reason is parsed from the top-level body");
+  });
+
+  it("does NOT read reason from inside run (it is top-level only)", async () => {
+    const out = await readRunAck(jsonResponse({ run: { status: "queued", reason: "stale_claim" } }));
+    assert.equal(out.reason, undefined, "a reason nested under run is ignored — it is a top-level field");
+  });
+
+  it("reads recovery_retry_not_before off the RUN body", async () => {
+    const out = await readRunAck(
+      jsonResponse({ run: { status: "recovery_wait", recovery_retry_not_before: "2026-09-15T16:00:00Z" } }),
+    );
+    assert.equal(
+      out.recoveryRetryNotBefore,
+      "2026-09-15T16:00:00Z",
+      "the retry stamp is parsed from the RunDTO",
+    );
+  });
+
+  it("does NOT read recovery_retry_not_before from the top level (it is a run field)", async () => {
+    const out = await readRunAck(
+      jsonResponse({ recovery_retry_not_before: "2026-09-15T16:00:00Z", run: { status: "recovery_wait" } }),
+    );
+    assert.equal(out.recoveryRetryNotBefore, undefined, "a top-level stamp is ignored — it lives on run");
+  });
+
+  it("leaves reason and recovery_retry_not_before absent when missing or wrong-typed", async () => {
+    const missing = await readRunAck(jsonResponse({ run: { status: "recovery_wait" } }));
+    assert.equal(missing.reason, undefined, "absent top-level reason ⇒ absent");
+    assert.equal(missing.recoveryRetryNotBefore, undefined, "absent run stamp ⇒ absent");
+    const wrongType = await readRunAck(
+      jsonResponse({ reason: 7, run: { status: "recovery_wait", recovery_retry_not_before: 123 } }),
+    );
+    assert.equal(wrongType.reason, undefined, "a non-string reason is ignored, never coerced");
+    assert.equal(wrongType.recoveryRetryNotBefore, undefined, "a non-string stamp is ignored, never coerced");
+  });
+
   it("returns {} on an empty body (existing catch/total behavior)", async () => {
     const out = await readRunAck(new Response(""));
     assert.deepEqual(out, {}, "an empty body yields the fields absent");

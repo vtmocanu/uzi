@@ -56,7 +56,7 @@ func TestRunToDTOPauseFieldsOwner(t *testing.T) {
 		CheckpointTipAt:     pgtype.Timestamptz{Time: cp, Valid: true},
 		MilestonesFrozen:    []byte(`[{"id":"m1","title":"a"},{"id":"m2","title":"b"},{"id":"m3","title":"c"},{"id":"m4","title":"d"}]`),
 		MilestonesCompleted: []byte(`["m1","m2","m3","m4"]`),
-	}, "normal", 0, 0, dtoTestNow)
+	}, "normal", 0, 0, 0, dtoTestNow)
 
 	if dto.PauseRequestedAt == nil || !dto.PauseRequestedAt.Equal(at) {
 		t.Fatalf("PauseRequestedAt = %v, want %v", dto.PauseRequestedAt, at)
@@ -80,7 +80,7 @@ func TestRunToDTOPauseFieldsOwner(t *testing.T) {
 // TestRunToDTOPauseFieldsAbsent pins the null case: a run with no pending pause exposes nil
 // intent fields and a false boundary.
 func TestRunToDTOPauseFieldsAbsent(t *testing.T) {
-	dto := runToDTO(store.Run{ID: uuid.New(), Status: "running"}, "normal", 0, 0, dtoTestNow)
+	dto := runToDTO(store.Run{ID: uuid.New(), Status: "running"}, "normal", 0, 0, 0, dtoTestNow)
 	if dto.PauseRequestedAt != nil || dto.PauseMode != nil || dto.PauseAfterCount != nil {
 		t.Fatalf("expected nil pause intent fields, got at=%v mode=%v after=%v",
 			dto.PauseRequestedAt, dto.PauseMode, dto.PauseAfterCount)

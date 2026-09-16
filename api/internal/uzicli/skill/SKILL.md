@@ -322,8 +322,9 @@ uzi version
   `limit_wait` (parked while an Anthropic usage limit resets; the sweep
   promotes it back to `queued` once past its `retry_not_before`),
   `pool_wait` (an `auto` run held because its token pool is empty — add a token
-  to the pool and it resumes), `recovery_wait` (parked after an empty model turn;
-  the sweep retries it on a capped backoff), and `paused` (an owner-requested hold, `uzi
+  to the pool and it resumes), `recovery_wait` (parked after an empty model turn, or
+  because the forge was unreachable at clone — cause `forge_unreachable`, capped by
+  `RUN_FORGE_UNREACHABLE_MAX_PARKS`; the sweep retries it on a capped backoff), and `paused` (an owner-requested hold, `uzi
   run pause`, resumed on demand from the run page or `uzi run resume <id>`;
   it does not auto-resume). So to
   wait for a plan gate or a clarification park, use **`uzi run wait <id>`** (see

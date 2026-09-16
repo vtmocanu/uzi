@@ -1791,10 +1791,20 @@ RETURNING id, user_id, status;
 -- plan_md and worker_id are PRESERVED (worker_id is in the WHERE, never the SET). This is a
 -- NON-TERMINAL transition, so the run's checkpoint is NOT deleted (that fires only on
 -- terminal transitions).
+--
+-- PRD #1392 M1 (D9): this is the UNTYPED park (empty turn, and #1088's provider park once
+-- it adopts recovery_wait). It CLEARS recovery_wait_cause to NULL — a later untyped park on
+-- a run that forge-parked earlier must REPLACE the typed cause, not coalesce it, so its
+-- surface reads the generic wording and its forge cap counter is not consulted. It does NOT
+-- touch forge_park_count: that lifetime counter belongs to the forge park alone (fact 7 /
+-- D2), so an empty-turn park neither increments nor resets it (a run keeps its forge-park
+-- lifetime count through a later empty-turn park). The forge park has its own writer,
+-- ParkRunForgeUnreachable, which sets the cause and bumps forge_park_count.
 UPDATE runs SET
     status                    = 'recovery_wait',
     status_since              = now(),
     recovery_wait_count       = recovery_wait_count + 1,
+    recovery_wait_cause       = NULL,
     recovery_retry_not_before = @retry_not_before,
     session_id                = COALESCE(sqlc.narg('session_id'), session_id),
     health = 'ok', health_reason = NULL, health_since = NULL,
@@ -1802,6 +1812,60 @@ UPDATE runs SET
 WHERE id = @id AND worker_id = @worker_id
   AND status = 'running'
   AND kind <> 'judge';
+
+-- name: ParkRunForgeUnreachable :one
+-- PRD #1392 M1 (D2/D3): the FORGE pre-clone park writer. It is the typed sibling of
+-- SetRunRecoveryWait — same 'recovery_wait' transition, same backoff-shaping
+-- recovery_wait_count bump, same health-trio reset and session_id COALESCE, same positive
+-- source guard (status = 'running') — with two additions that are the whole point:
+--
+--   - recovery_wait_cause = 'forge_unreachable' — the TYPED cause the surface renders the
+--     forge wording and the cap counter off of. Distinct from the empty-turn park, which
+--     writes NULL (D9).
+--   - forge_park_count = forge_park_count + 1 — the FORGE-ONLY lifetime counter the cap
+--     (RUN_FORGE_UNREACHABLE_MAX_PARKS) decides on. Bumped HERE, in the same statement as
+--     the transition, so a run cannot park without its cap counter advancing. Separate from
+--     recovery_wait_count (the backoff shaper) so the empty-turn park keeps its no-lifetime-cap
+--     contract (fact 7 / D2).
+--
+-- RETURNING * so the service (SetState's forge-park transaction) reads back the incremented
+-- forge_park_count and the stamped recovery_retry_not_before for the ack. Run INSIDE the
+-- park transaction after the run row is FOR UPDATE locked and its status/generation verified
+-- in Go, so the positive guard here is the belt-and-braces backstop rather than the race
+-- barrier (the row lock is). recovery_retry_not_before is computed in Go (now + capped
+-- exponential backoff + jitter; recoverywait.go recoveryParkFallbackFor/recoveryParkJitter),
+-- exactly as setRecoveryWait does.
+UPDATE runs SET
+    status                    = 'recovery_wait',
+    status_since              = now(),
+    recovery_wait_count       = recovery_wait_count + 1,
+    recovery_wait_cause       = 'forge_unreachable',
+    forge_park_count          = forge_park_count + 1,
+    recovery_retry_not_before = @retry_not_before,
+    session_id                = COALESCE(sqlc.narg('session_id'), session_id),
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at                = now()
+WHERE id = @id AND worker_id = @worker_id
+  AND status = 'running'
+  AND kind <> 'judge'
+RETURNING *;
+
+-- name: LockOpenCustodyHoldsForRunWorkerGeneration :many
+-- PRD #1392 M1 (D3): the forge park's EXACT-hold cardinality lock. Returns the ids of every
+-- OPEN custody hold on @run_id at @generation held live by @worker_id, FOR UPDATE, so the
+-- park transaction can (a) count them — it requires EXACTLY ONE eligible hold, because the
+-- exact release (ReleaseCustodyHoldExact) trusts the supplied generation and zero/several is
+-- an unsettleable custody state that must refuse the park (409 custody_unsettled) — and (b)
+-- hold the row lock across the release, so a concurrent reconciler release cannot slip in
+-- between the count and the release and turn a verified single hold into zero. Scoped to the
+-- LIVE holder (live_worker_id), matching ReleaseCustodyHoldExact's own predicate so the
+-- count and the release agree on the same rows.
+SELECT id FROM recovery_custody_holds
+WHERE run_id = @run_id
+  AND generation = @generation
+  AND live_worker_id = @worker_id::uuid
+  AND state = 'open'
+FOR UPDATE;
 
 -- name: PromoteRecoveryWaitRuns :many
 -- The sweeper's transient-recovery promotion pass (issue #1197): recovery_wait -> queued

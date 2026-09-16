@@ -187,6 +187,17 @@ var (
 	// the lifetime number of revisions requested, not the pending backlog. → 409.
 	ErrReviseCapReached = errors.New("plan revision limit reached")
 	ErrInvalidState     = errors.New("invalid run state")
+	// The two forge-park precedence sentinels (PRD #1392 M1). Both are returned by SetState's
+	// forge-park transaction alongside the run row (nothing else returns them), and the handler
+	// maps each to a 409 whose body carries {run, reason}: ErrForgeParkStaleClaim → reason
+	// "stale_claim" (the report's claim_generation did not match the locked run's — nothing was
+	// mutated, #1247's rule, checked FIRST); ErrForgeParkCustodyUnsettled → reason
+	// "custody_unsettled" (a current, unreleased generation whose exact-hold cardinality or
+	// release step could not settle — the transaction rolled back). The idempotent
+	// already-parked case is NOT an error: it returns the parked run with applied=false, so the
+	// handler's ordinary 409 {run} path (status recovery_wait, no reason) covers it.
+	ErrForgeParkStaleClaim       = errors.New("forge park: claim generation mismatch")
+	ErrForgeParkCustodyUnsettled = errors.New("forge park: custody could not be settled")
 	// ErrRunNotAwaitingInput rejects an `answer` for a run that is not parked on a
 	// clarification question (PRD #88 M1) → 409. Its sibling ErrStaleAnswer covers the
 	// run that IS parked but on a DIFFERENT question — the two are separated because
@@ -468,7 +479,7 @@ type Store interface {
 	// ReleaseCustodyHoldExact releases the open hold on a run at an EXACT generation held live by
 	// the worker — the terminal-completion release in SetState, which passes run.claim_generation
 	// so completing a newer generation never releases an older same-worker orphan (PRD #1349 M4).
-	ReleaseCustodyHold(ctx context.Context, id uuid.UUID) (int64, error)
+	ReleaseCustodyHold(ctx context.Context, arg store.ReleaseCustodyHoldParams) (int64, error)
 	ReleaseCustodyHoldExact(ctx context.Context, arg store.ReleaseCustodyHoldExactParams) (int64, error)
 	DiscardCaptureForOwner(ctx context.Context, arg store.DiscardCaptureForOwnerParams) (int64, error)
 	// ExpireReadyCaptures is the periodic ready-artifact retention sweep (PRD #1296 D4): it
@@ -485,7 +496,7 @@ type Store interface {
 	// M4 (D3) cleanup-safety reads: ListReleasableCustodyHolds is the custody-release
 	// reconciler's candidate set (OPEN holds whose release is now warranted but unapplied);
 	// CountOpenCustodyHoldsForWorker backs the DeleteWorker custody guard.
-	ListReleasableCustodyHolds(ctx context.Context) ([]store.RecoveryCustodyHold, error)
+	ListReleasableCustodyHolds(ctx context.Context) ([]store.ListReleasableCustodyHoldsRow, error)
 	CountOpenCustodyHoldsForWorker(ctx context.Context, arg store.CountOpenCustodyHoldsForWorkerParams) (int64, error)
 	// Run judge (PRD #46 M3): terminal-funnel enqueue, judge-run-scoped trace/review
 	// authz, the command-not-found scan input, and the review upsert.
@@ -1095,6 +1106,15 @@ type Params struct {
 	// cancels). recovery_wait_count shapes the curve only. The defaults live in config.go.
 	RunRecoveryParkBase time.Duration
 	RunRecoveryMaxPark  time.Duration
+
+	// RunForgeUnreachableMaxParks (PRD #1392 M1, D2), mirrored from config. The FORGE-park
+	// lifetime cap: past it, SetState's forge-park transaction fails the run with
+	// fail_origin='forge_unreachable' instead of parking. UNLIKE the recovery-park cadence
+	// knobs above, this CAN fail a run. The ZERO VALUE is "unlimited" (never fail on the
+	// count) — the safe off direction and NOT a hole (a Params literal that omits it never
+	// caps the forge park), matching RUN_LIMIT_MAX_WAITS==0's "never park" shape. The positive
+	// default lives in config.go where the env is read.
+	RunForgeUnreachableMaxParks int
 
 	// RecoveryUploadRetryWindow (PRD #1296 D3/D4, UZI_RECOVERY_UPLOAD_RETRY_WINDOW) is the
 	// durable-archive upload-retry window: a capture reserved but still non-terminal
@@ -2316,6 +2336,23 @@ type StateRequest struct {
 	RequiredCapabilities *[]string `json:"required_capabilities"`
 	RequiredTools        *[]string `json:"required_tools"`
 	SizeClass            *string   `json:"size_class"`
+	// RecoveryCause is the worker's TYPED cause for a 'recovery_wait' park (PRD #1392 M1).
+	// UNTRUSTED free text on arrival: SetState validates it against the server enum
+	// {forge_unreachable, empty_turn, provider_outage} BEFORE any state SQL and rejects an
+	// unknown non-nil value as ErrInvalidState (400), so a garbled cause can never reach the
+	// constrained column. Only recovery_cause == "forge_unreachable" triggers the dedicated
+	// custody-settling park transaction; the other causes take the ordinary untyped park (which
+	// writes cause NULL, D9). Absent (nil) on every non-recovery_wait report and on a legacy
+	// worker's empty-turn park. httpx.DecodeJSON rejects unknown fields, so this field MUST
+	// exist here or a new worker's report 400s.
+	RecoveryCause *string `json:"recovery_cause"`
+	// ClaimGeneration is the claim generation the worker holds, carried on the forge-park report
+	// (PRD #1392 M1). UNTRUSTED, but it is a FENCE not a value: the forge-park transaction
+	// requires it to equal the locked run's claim_generation and answers 409 stale_claim on a
+	// mismatch, with nothing mutated (#1247's precedence, checked first). Required for a
+	// forge_unreachable park; ignored on every other report. httpx.DecodeJSON rejects unknown
+	// fields, so this field MUST exist here or a new worker's report 400s.
+	ClaimGeneration *int64 `json:"claim_generation"`
 }
 
 // ProposalPayload is the structured idea a scheduled issues-mode prompt run emits on
@@ -2335,6 +2372,15 @@ type ProposalPayload struct {
 // "already terminal" as success and learns it was cancelled), per the M2 wire
 // contract.
 func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUID, req StateRequest) (run store.Run, applied bool, err error) {
+	// PRD #1392 M1: validate the TYPED recovery cause against the server enum BEFORE any state
+	// SQL, so an unknown non-nil value is a loud 400 (ErrInvalidState) rather than a
+	// constraint violation at the park write. Absent (nil) is fine (an ordinary report or a
+	// legacy untyped park). Only forge_unreachable triggers the dedicated park transaction
+	// below; empty_turn/provider_outage are accepted here (reserved, D9) but take the ordinary
+	// untyped park, which writes cause NULL.
+	if req.RecoveryCause != nil && !recoveryWaitCauses[*req.RecoveryCause] {
+		return store.Run{}, false, fmt.Errorf("%w: unknown recovery_cause %q", ErrInvalidState, *req.RecoveryCause)
+	}
 	owned, err := s.runOwnedByWorker(ctx, runID, wkr)
 	if err != nil {
 		return store.Run{}, false, err
@@ -2636,6 +2682,30 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	case "limit_wait":
 		rows, err = s.setLimitWait(ctx, owned, wkr, req, sessionID)
 	case "recovery_wait":
+		// PRD #1392 M1: the FORGE pre-clone park is a DEDICATED transaction — validate the claim
+		// generation, lock the run, settle the exact-generation custody hold, and park (or
+		// cancel, or fail past the cap) atomically. It COMMITS its own transaction and returns
+		// the committed run + a rows count, then falls through to the shared post-switch fan-out
+		// (re-read, broadcast, judge — which the pre-clone origin skips, teardown), so the whole
+		// terminal automation is reused rather than duplicated. Its two typed precedence errors
+		// (stale_claim / custody_unsettled) return EARLY carrying the run for the handler's
+		// {run, reason} 409 body. A nil txBeginner cannot run the atomic settle, so it MUST NOT
+		// fall through to the blind untyped park (that would park while leaking the generation's
+		// hold); it takes today's safe FAILED path instead (D3: never release an unproven hold).
+		if req.RecoveryCause != nil && *req.RecoveryCause == "forge_unreachable" {
+			if s.txBeginner == nil {
+				rows, err = s.failForgeUnsettleable(ctx, wkr, runID, req, sessionID)
+				break
+			}
+			var frun store.Run
+			frun, rows, err = s.parkForgeUnreachable(ctx, wkr, owned, req, sessionID)
+			if err != nil {
+				// stale_claim / custody_unsettled: carry the run so the handler can render the
+				// 409 {run, reason} body; nothing was committed.
+				return frun, false, err
+			}
+			break
+		}
 		// Transient-recovery park (issue #1197): a positively-empty SDK turn survived the
 		// worker's bounded in-process retries, so the run parks on a server-owned capped
 		// backoff and the sweeper auto-promotes it. This is the reusable transient-recovery
@@ -2819,6 +2889,9 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 				RunID:      runID,
 				Generation: run.ClaimGeneration,
 				WorkerID:   wkr.ID,
+				// PRD #1392 M1 (D3): a completed run published its head, so its release is
+				// warranted by publication.
+				ReleaseEvidence: pgconv.TextOrNull("publication"),
 			}); relErr != nil {
 				slog.Warn("release custody on completion", "run", runID, "worker", wkr.ID, "generation", run.ClaimGeneration, "error", relErr)
 			}
@@ -3276,16 +3349,24 @@ func (s *Service) ListMemoryForRun(ctx context.Context, wkr store.Worker, runID 
 	})
 }
 
-// RunOwnership returns the current status of a run this worker owns, or
-// ErrRunNotOwned when it is not (reclaimed / never owned). Read-only; the
-// interactive park-skip path (#559) uses it to detect a mid-turn reclaim or
-// terminal transition early, restoring the ACK the skipped park report gave.
-func (s *Service) RunOwnership(ctx context.Context, wkr store.Worker, runID uuid.UUID) (string, error) {
+// RunOwnership returns the current status of a run this worker owns plus, when the run is
+// parked in recovery_wait, its recovery_retry_not_before stamp — or ErrRunNotOwned when the
+// worker does not own it (reclaimed / never owned). Read-only; the interactive park-skip path
+// (#559) uses the status to detect a mid-turn reclaim or terminal transition early, and the
+// forge pre-clone park (PRD #1392 M1, D10) uses the retry stamp to reconcile an unknown park
+// outcome after a transport failure — so a reconciled park can still quote its retry time. The
+// stamp is nil for a run that is not recovery-parked.
+func (s *Service) RunOwnership(ctx context.Context, wkr store.Worker, runID uuid.UUID) (status string, recoveryRetryNotBefore *time.Time, err error) {
 	run, err := s.runOwnedByWorker(ctx, runID, wkr)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
-	return run.Status, nil
+	var retry *time.Time
+	if run.RecoveryRetryNotBefore.Valid {
+		t := run.RecoveryRetryNotBefore.Time
+		retry = &t
+	}
+	return run.Status, retry, nil
 }
 
 func (s *Service) runOwnedByWorker(ctx context.Context, runID uuid.UUID, wkr store.Worker) (store.Run, error) {

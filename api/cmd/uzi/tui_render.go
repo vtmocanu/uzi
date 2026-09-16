@@ -226,7 +226,13 @@ func displayHealth(health string) string {
 // is FOR. ok/empty health shows the status token. The word is the DISPLAY word from
 // displayHealth, so the `slow` enum PRD #1170 kept (D1) reads as "near timeout" here while
 // every logic path still keys off the raw enum.
-func stateGlyphWord(status, health string, isPlanning, isRevising bool) (glyph, word string) {
+//
+// PRD #1392 M5: cause is the optional RecoveryWaitCause of a recovery_wait run — a variadic
+// tail so the many existing call sites without it stay valid. When it is "forge_unreachable"
+// the wait word reads "forge wait" instead of "recovery wait" (glyph and colour unchanged —
+// it is still a wait-family hold). The retry/cap detail does not fit this fixed-width token;
+// it lives on the run-get notice and the web panel.
+func stateGlyphWord(status, health string, isPlanning, isRevising bool, cause ...string) (glyph, word string) {
 	// Recovery does no work while parked; stale health must not hide its wait state.
 	if status != statusRecoveryWait && stalledHealth[health] {
 		return "▲", displayHealth(health)
@@ -262,7 +268,11 @@ func stateGlyphWord(status, health string, isPlanning, isRevising bool) (glyph, 
 	case statusRecoveryWait:
 		// issue #1197: a transient-recovery park that auto-resumes on a capped backoff.
 		// Same wait-family glyph as limit_wait/pool_wait (all non-terminal holds), distinct
-		// word so a user can tell them apart at a glance.
+		// word so a user can tell them apart at a glance. PRD #1392 M5: a forge-unreachable
+		// park reads "forge wait" so it is distinguishable from the empty-turn recovery.
+		if len(cause) > 0 && cause[0] == forgeUnreachableCause {
+			return "~", "forge wait"
+		}
 		return "~", "recovery wait"
 	case statusPaused:
 		// PRD #1190: an owner pause. The ‖ glyph (a pause bar) is its own vocabulary entry
@@ -320,8 +330,8 @@ type runToken struct {
 // stateToken is the ONE shared helper the design mandates: (glyph, colour, word) from a
 // run's status/health/planning, used on the board row, the board strip and the detail
 // header so they cannot render one run three ways.
-func (p palette) stateToken(status, health string, isPlanning, isRevising bool) runToken {
-	g, w := stateGlyphWord(status, health, isPlanning, isRevising)
+func (p palette) stateToken(status, health string, isPlanning, isRevising bool, cause ...string) runToken {
+	g, w := stateGlyphWord(status, health, isPlanning, isRevising, cause...)
 	return runToken{glyph: g, word: w, color: p.stateColor(status, health, isPlanning, isRevising)}
 }
 

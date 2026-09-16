@@ -37,6 +37,37 @@ func TestStateGlyphWordRecoveryWait(t *testing.T) {
 	}
 }
 
+// TestStateGlyphWordForgePark pins the PRD #1392 M5 forge branch: a recovery_wait run whose
+// cause is "forge_unreachable" reads the DISTINCT word "forge wait", while the empty-turn /
+// null cause keeps "recovery wait". The glyph and wait-family colour stay the same for both —
+// only the word distinguishes them. Reddening mutation: drop the cause branch in
+// stateGlyphWord → the forge park falls back to "recovery wait" and the first assertion fails.
+func TestStateGlyphWordForgePark(t *testing.T) {
+	glyph, word := stateGlyphWord(statusRecoveryWait, "", false, false, "forge_unreachable")
+	if glyph != "~" {
+		t.Errorf("forge park glyph = %q, want %q (still a wait-family hold)", glyph, "~")
+	}
+	if word != "forge wait" {
+		t.Errorf("forge park word = %q, want %q", word, "forge wait")
+	}
+	// The empty-turn / null cause keeps the issue #1197 wording.
+	if _, w := stateGlyphWord(statusRecoveryWait, "", false, false, ""); w != "recovery wait" {
+		t.Errorf("empty-cause recovery park word = %q, want %q", w, "recovery wait")
+	}
+	if _, w := stateGlyphWord(statusRecoveryWait, "", false, false); w != "recovery wait" {
+		t.Errorf("cause-less recovery park word = %q, want %q (the pre-M5 call shape)", w, "recovery wait")
+	}
+	// An unrecognised cause is not the forge one, so it keeps the generic wording.
+	if _, w := stateGlyphWord(statusRecoveryWait, "", false, false, "provider_outage"); w != "recovery wait" {
+		t.Errorf("other-cause recovery park word = %q, want %q", w, "recovery wait")
+	}
+	// The forge park still shares the wait ink with its sibling holds (colour unchanged).
+	p := newPalette(true)
+	if bgFillSGR(p.stateColor(statusRecoveryWait, "", false, false)) != bgFillSGR(p.wait) {
+		t.Error("forge park colour is not the wait ink; it must stay in the wait family")
+	}
+}
+
 // TestStateColorRecoveryWait pins the colour to the shared wait ink. Reddening mutation:
 // remove statusRecoveryWait from stateColor's wait case → it falls to the faintC default,
 // so it stops matching p.wait (and its sibling holds) and matches faintC.

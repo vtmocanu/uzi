@@ -133,6 +133,11 @@ type RecoveryReleaseResponse struct {
 	// Both omitempty, so a clean release marshals neither.
 	Retained bool   `json:"retained,omitempty"`
 	Reason   string `json:"reason,omitempty"`
+	// Generation is the released generation the server ECHOES back on the v2 exact release path
+	// (PRD #1392 M1), set only when a hold was actually released (n>0) so the worker can confirm
+	// the server settled the exact generation it asked to release. Omitempty and a pointer, so a
+	// v1/idempotent-no-op release marshals nothing.
+	Generation *int64 `json:"generation,omitempty"`
 }
 
 // RecoveryReleaseRequest is the worker's request to settle custody for the EXACT generation
@@ -142,6 +147,15 @@ type RecoveryReleaseResponse struct {
 // call sites that populate it are M2's — M1 only freezes the shape.
 type RecoveryReleaseRequest struct {
 	Generation *int64 `json:"generation,omitempty"`
+	// ReleaseEvidence is the worker's DECLARATION of WHY this release is warranted (PRD #1392
+	// M1, D3). UNTRUSTED: the server allowlists it to {"publication","forge_no_output"} — the
+	// two dispositions a worker's release endpoint may legitimately assert — and treats
+	// anything else as absent (the release is refused with a 400 in the handler, so a garbled
+	// value can never stamp a bogus class). Absent (nil) on a v1 worker; the server then stamps
+	// no explicit evidence. The other three classes are server-derived, never worker-supplied:
+	// "publication" also on the completed-run release, "archive" on the reconciler,
+	// "owner_discard" on the owner discard, and "no_adopted_source" on the pre-clone park.
+	ReleaseEvidence *string `json:"release_evidence,omitempty"`
 }
 
 // RecoveryHoldDTO is one open custody hold this worker holds on a run, in the worker-facing

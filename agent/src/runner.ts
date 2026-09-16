@@ -49,7 +49,7 @@ import {
   type PlanVerdict,
 } from "./steering.js";
 import { GitLabClient, ForgejoClient, GitHubClient, type ForgeClient } from "./forge.js";
-import { withForgeRetry } from "./forge-retry.js";
+import { classifyForgeError, withForgeRetry } from "./forge-retry.js";
 import { makeRedactor, makeTextRedactor } from "./redact.js";
 import { sessionTranscriptResolvable } from "./sdk-session.js";
 import { errMessage, RUN_ID_RE, sleep } from "./util.js";
@@ -116,6 +116,21 @@ class TerminalReportError extends Error {
   ) {
     super("terminal state report failed", { cause });
     this.name = "TerminalReportError";
+  }
+}
+
+/**
+ * PRD #1392 M2 — `ensureClone` exhausted `withForgeRetry` with a TRANSIENT verdict: the forge
+ * was unreachable at clone/fetch (a DNS blip, a connection reset, a 5xx), not a permanent
+ * rejection (401/403/404). `phaseClone` wraps the `ensureClone` throw in this so `executeClaim`'s
+ * catch can PARK the run (`recovery_wait`, cause `forge_unreachable`) instead of failing it — the
+ * pre-clone transient park. A PERMANENT verdict is NOT wrapped and still fails immediately. The
+ * message carries only the (redacted-at-report) git/forge error text, never a secret.
+ */
+export class ForgeUnreachableAtCloneError extends Error {
+  constructor(message: string, cause?: unknown) {
+    super(message, { cause });
+    this.name = "ForgeUnreachableAtCloneError";
   }
 }
 
@@ -394,6 +409,12 @@ interface RunFlight {
   active: ActiveRun | undefined;
   parked: boolean;
   preserveSession: boolean;
+  /** PRD #1392 M2: this run parked on a PRE-CLONE forge-unreachable transient error, so it
+   *  captured no clone and no model session. Unlike a limit_wait/recovery park, it preserves its
+   *  HOME + plugin dir ONLY when a resume transcript is resolvable on this worker
+   *  (`preserveSession`), never on `parked` alone (D4). The finally reads it to gate exactly the
+   *  two resume-artifact removals; false is the safe default for every other path. */
+  preClonePark: boolean;
   /** Retain the only copy of unverified recovery work; never guard non-filesystem cleanup. */
   preserveRecoveryClone: boolean;
   lastPublish: number;
@@ -728,7 +749,7 @@ export class RunRunner {
       gitBasic,
       runScopedSecrets,
     );
-    const { runLog, batcher, reportState, redactText, steering } = flight;
+    const { runLog, batcher, reportState, steering } = flight;
     try {
       await this.phaseClone(claim, flight);
       const sessionId = await this.phaseResume(claim, flight);
@@ -1058,58 +1079,28 @@ export class RunRunner {
           );
         }
         await batcher.close().catch(() => undefined);
-      } else {
-        // failure_reason goes straight to reportState, bypassing the batcher's
-        // redactor, and the sdk-executor catch-all re-throws raw SDK errors into this
-        // path — so scrub it here with the run's own secret set. A plan rejection
-        // carries the user's verbatim reason; scrubbing it too is harmless for plain
-        // text and a safety net if the user pasted a secret.
-        const rawReason =
-          err instanceof PlanRejectedError
-            ? err.reason
-            : err instanceof TerminalReportError
-              ? err.reason
-              : errMessage(err);
-        const reason = redactText(rawReason);
-        // PRD #69 M7a: derive the TRUSTED failure class from the RAW reason (before
-        // redaction) so a fatal pre-start failure (provisioning / no token) carries a
-        // structured origin the judge can key on; an ordinary agent failure maps to
-        // undefined and the server defaults it to 'agent_failure'. PRD #1077: a
-        // TerminalReportError carries its own typed origin (push_secret_blocked) whose
-        // terminal report threw after exhausting retries — honor it verbatim.
-        const failOrigin =
-          err instanceof TerminalReportError
-            ? err.failOrigin
-            : failOriginForReason(rawReason);
-        runLog.error("run failed", { error: reason });
-        batcher.emit({
-          kind: "error",
-          agent: "worker",
-          payload: { text: reason },
-        });
-        await batcher.close().catch(() => undefined);
-        // Cap what lands in the run row (matches the GitLab error-body cap).
-        await reportState({
-          status: "failed",
-          failure_reason: reason.slice(0, MAX_FAILURE_REASON_LEN),
-          fail_origin: failOrigin,
-        }).catch((e) =>
-          runLog.error("could not report failed state", {
-            error: errMessage(e),
-          }),
+      } else if (err instanceof ForgeUnreachableAtCloneError) {
+        // PRD #1392 M2: the forge was unreachable at clone/fetch on a TRANSIENT error. Caught
+        // BEFORE the generic terminal path (the LimitReachedError/PauseNowSignal precedent) so a
+        // transient forge blip NEVER becomes a `failed` run. The handler attempts NO recovery
+        // capture (there is nothing to capture pre-clone) and reports the park first, then
+        // dispatches on the ack (D10): a confirmed `recovery_wait` park closes the batcher and
+        // preserves HOME/session only when a resume transcript is resolvable, `stop` leaves a
+        // server-terminal/stale run cleaned up with no re-report, and `fail` falls through to
+        // today's failed path (batcher deliberately still open on that arm).
+        const outcome = await this.handleForgeUnreachableAtClone(
+          err,
+          claim,
+          flight,
+          reportState,
+          runLog,
+          runHome,
         );
-        // PRD #1349 M2 (D4.5): before this live worker cleans its clone, disposition its exact
-        // generation hold. A steering-cancel and an early agent failure both land here (a cancel
-        // aborts the controller with the same error, then reports failed), and neither reaches
-        // the finalization pin — so without this the empty hold leaks. The credentialed
-        // fresh-forge comparison MUST run reaped, so REAP FIRST (F2): a Claude/SDK run self-reaps
-        // in its run() finally, but a Codex run does NOT (killAgentTree is a no-op and its provider
-        // root is disposed only in this method's `finally`, AFTER this catch), so a bare settle
-        // here would race a still-alive Codex provider — reapThenSettleRecoveryGeneration reaps
-        // Codex-aware first. A provably empty run then RELEASES its exact hold, a run that committed
-        // work then failed CAPTURES it, and a failed/unverifiable comparison RETAINS — never a
-        // wrong release. A pre-clone failure has no clone and no-ops. Best-effort.
-        await this.reapThenSettleRecoveryGeneration(claim, flight, runLog, "terminal");
+        if (outcome === "fail") {
+          await this.reportGenericFailure(claim, flight, err);
+        }
+      } else {
+        await this.reportGenericFailure(claim, flight, err);
       }
     } finally {
       // PRD #1171 m4 (F1): the FINAL Codex registry disposal, after EVERY durability sink has
@@ -1224,10 +1215,19 @@ export class RunRunner {
           runLog.warn("runner clone cleanup failed", { error: errMessage(e) });
         }
       }
+      // PRD #1392 M2: whether to KEEP the two resume artifacts (the sibling skills plugin dir
+      // and the per-run HOME). Every park/shutdown that has on-disk state to resume keeps them on
+      // `parked` OR `preserveSession` as before — EXCEPT a pre-clone forge-unreachable park, which
+      // captured no clone and no model session: it keeps them ONLY when a resume transcript is
+      // resolvable on this worker (`preserveSession`), never on `parked` alone (D4). So a fresh
+      // forge-parked claim and a resume leg without a local transcript still clean up fully.
+      const preserveResumeArtifacts = flight.preClonePark
+        ? flight.preserveSession
+        : flight.parked || flight.preserveSession;
       // Tear down the sibling skills plugin dir the executor synthesized (PRD #16
       // M4). It is OUTSIDE the runner clone, so removeRunnerClone does not reach it;
       // leave it and each run leaks a dir. Best-effort, like the clone cleanup.
-      if (flight.worktreePath && !flight.parked && !flight.preserveSession) {
+      if (flight.worktreePath && !preserveResumeArtifacts) {
         await fs
           .rm(skillsPluginDir(flight.worktreePath), { recursive: true, force: true })
           .catch((e) =>
@@ -1247,12 +1247,24 @@ export class RunRunner {
       // measured for one run). Still best-effort and still swallowing its own
       // error: this is a `finally`, and a cleanup that threw would convert a
       // completed run into a failed one, which is strictly worse than a leak.
-      if (runHome && !flight.parked && !flight.preserveSession) {
+      if (runHome && !preserveResumeArtifacts) {
         await rmTreeForce(runHome).catch((e) =>
           runLog.warn("run HOME cleanup failed", { error: errMessage(e) }),
         );
       }
-      if (flight.parked) {
+      if (flight.preClonePark) {
+        // PRD #1392 M2: a pre-clone forge-unreachable park. It preserves HOME/session only when a
+        // resume transcript is resolvable (D4); say which, so an operator reading disk pressure
+        // (or the absence of it) can connect it to the park rather than to a leak.
+        runLog.info(
+          flight.preserveSession
+            ? "run parked (forge unreachable at clone); preserving its plugin dir and HOME for a same-worker resume"
+            : "run parked (forge unreachable at clone); no clone or session to preserve",
+          {
+            run_home: runHome,
+          },
+        );
+      } else if (flight.parked) {
         // ~170 MB of Go module cache was measured under a single run HOME, so say
         // what is being held and why — an operator reading disk pressure needs to
         // connect it to a parked run rather than to a leak.
@@ -1274,6 +1286,404 @@ export class RunRunner {
           },
         );
       }
+    }
+  }
+
+  /**
+   * Today's generic terminal FAILED path (extracted verbatim so the pre-clone
+   * forge-unreachable park's `fail` arm can reuse it). failure_reason goes straight to
+   * reportState, bypassing the batcher's redactor, and the sdk-executor catch-all re-throws raw
+   * SDK errors into this path — so scrub it here with the run's own secret set. A plan rejection
+   * carries the user's verbatim reason; scrubbing it too is harmless for plain text and a safety
+   * net if the user pasted a secret. The caller MUST leave the batcher OPEN — this emits the
+   * error line and closes it.
+   */
+  private async reportGenericFailure(
+    claim: ClaimResponse,
+    flight: RunFlight,
+    err: unknown,
+  ): Promise<void> {
+    const { batcher, reportState, redactText, runLog } = flight;
+    const rawReason =
+      err instanceof PlanRejectedError
+        ? err.reason
+        : err instanceof TerminalReportError
+          ? err.reason
+          : errMessage(err);
+    const reason = redactText(rawReason);
+    // PRD #69 M7a: derive the TRUSTED failure class from the RAW reason (before
+    // redaction) so a fatal pre-start failure (provisioning / no token) carries a
+    // structured origin the judge can key on; an ordinary agent failure maps to
+    // undefined and the server defaults it to 'agent_failure'. PRD #1077: a
+    // TerminalReportError carries its own typed origin (push_secret_blocked) whose
+    // terminal report threw after exhausting retries — honor it verbatim.
+    const failOrigin =
+      err instanceof TerminalReportError
+        ? err.failOrigin
+        : failOriginForReason(rawReason);
+    runLog.error("run failed", { error: reason });
+    batcher.emit({
+      kind: "error",
+      agent: "worker",
+      payload: { text: reason },
+    });
+    await batcher.close().catch(() => undefined);
+    // Cap what lands in the run row (matches the GitLab error-body cap).
+    await reportState({
+      status: "failed",
+      failure_reason: reason.slice(0, MAX_FAILURE_REASON_LEN),
+      fail_origin: failOrigin,
+    }).catch((e) =>
+      runLog.error("could not report failed state", {
+        error: errMessage(e),
+      }),
+    );
+    // PRD #1349 M2 (D4.5): before this live worker cleans its clone, disposition its exact
+    // generation hold. A steering-cancel and an early agent failure both land here (a cancel
+    // aborts the controller with the same error, then reports failed), and neither reaches
+    // the finalization pin — so without this the empty hold leaks. The credentialed
+    // fresh-forge comparison MUST run reaped, so REAP FIRST (F2): a Claude/SDK run self-reaps
+    // in its run() finally, but a Codex run does NOT (killAgentTree is a no-op and its provider
+    // root is disposed only in this method's `finally`, AFTER this catch), so a bare settle
+    // here would race a still-alive Codex provider — reapThenSettleRecoveryGeneration reaps
+    // Codex-aware first. A provably empty run then RELEASES its exact hold, a run that committed
+    // work then failed CAPTURES it, and a failed/unverifiable comparison RETAINS — never a
+    // wrong release. A pre-clone failure has no clone and no-ops. Best-effort.
+    await this.reapThenSettleRecoveryGeneration(claim, flight, runLog, "terminal");
+  }
+
+  /**
+   * PRD #1392 M2 — the pre-clone forge-unreachable park handler (D7/D10). `ensureClone` exhausted
+   * its transient-retry budget with a transient verdict, so there is NOTHING to capture: the
+   * worker attempts no recovery capture and REPORTS FIRST, its report shape chosen from what the
+   * api advertised at `register`:
+   *
+   *   - `recovery_park_cause`  → the TYPED report {recovery_wait, recovery_cause:forge_unreachable,
+   *      claim_generation}, then dispatch on the ack (the api settles custody + park in one locked
+   *      transaction — the worker calls no release endpoint).
+   *   - `recovery_release_exact_echo` (but NOT recovery_park_cause) → the older-api fallback: an
+   *      older api's park touches no custody (fact 13), so first prove an EXACT-generation release
+   *      (released && generation===gen && holds_released===1), then send the UNTYPED report,
+   *      keeping claim_generation IFF `claim_generation_fence` is advertised. Missing proof (or a
+   *      release throw) → today's failed path, never a leaked hold.
+   *   - neither token → negotiate nothing, take today's failed path.
+   *
+   * Returns "parked" (handler closed the batcher, set the flight flags), "stop" (a server-terminal
+   * or stale run: batcher closed, no re-report), or "fail" (the caller runs today's failed path
+   * with the batcher STILL OPEN).
+   */
+  private async handleForgeUnreachableAtClone(
+    err: ForgeUnreachableAtCloneError,
+    claim: ClaimResponse,
+    flight: RunFlight,
+    reportState: RunFlight["reportState"],
+    runLog: Logger,
+    runHome: string | undefined,
+  ): Promise<"parked" | "stop" | "fail"> {
+    const features = this.client.protocolFeatures;
+    const gen = claim.claim_generation;
+    runLog.warn("forge unreachable at clone; attempting a pre-clone recovery park", {
+      run_id: flight.runId,
+      detail: err.message,
+      protocol_features: features,
+    });
+
+    if (features.includes("recovery_park_cause")) {
+      // Full #1392 api: the TYPED report. The api's park transaction settles this generation's
+      // hold and parks (or fails at the cap) in one shot, so the worker calls NO release endpoint.
+      const body: StateRequest = {
+        status: "recovery_wait",
+        recovery_cause: "forge_unreachable",
+        ...(gen !== undefined ? { claim_generation: gen } : {}),
+      };
+      return await this.reportForgeParkAndDispatch(body, claim, flight, reportState, runLog, runHome);
+    }
+
+    if (features.includes("recovery_release_exact_echo")) {
+      // Older-api fallback (D7): an older api's park touches NO custody (fact 13), so the worker
+      // must first release its own exact-generation hold and require POSITIVE proof of an
+      // exact-generation release before it dares park. NO release_evidence — the proof is the
+      // echo, and an older api need not accept the field.
+      let rel;
+      try {
+        rel = await this.client.releaseRecoveryCustody(flight.runId, gen);
+      } catch (relErr) {
+        runLog.warn("forge park fallback: exact release call failed; taking the failed path (no park)", {
+          run_id: flight.runId,
+          error: errMessage(relErr),
+        });
+        return "fail";
+      }
+      const proven =
+        gen !== undefined &&
+        rel.released === true &&
+        rel.generation === gen &&
+        rel.holds_released === 1 &&
+        rel.retained !== true;
+      if (!proven) {
+        runLog.warn("forge park fallback: exact release not positively confirmed; taking the failed path (no park)", {
+          run_id: flight.runId,
+          released: rel.released,
+          echoed_generation: rel.generation,
+          holds_released: rel.holds_released,
+          retained: rel.retained,
+        });
+        return "fail";
+      }
+      // With proof, send the UNTYPED report. Keep claim_generation IFF the api advertised the
+      // #1247 state fence (D7); the `6603f793` baseline has no generation field on the state
+      // report, so it carries neither field.
+      const body: StateRequest = { status: "recovery_wait" };
+      if (features.includes("claim_generation_fence") && gen !== undefined) {
+        body.claim_generation = gen;
+      }
+      return await this.reportForgeParkAndDispatch(body, claim, flight, reportState, runLog, runHome);
+    }
+
+    // Neither token → send NOTHING negotiated; take today's failed path (never park).
+    runLog.info("forge park: api advertised no recovery-park feature; taking today's failed path", {
+      run_id: flight.runId,
+    });
+    return "fail";
+  }
+
+  /**
+   * PRD #1392 M2 — send the forge park report ONCE and dispatch on the ack (D10). A generic 400
+   * (an api that rejects the fields) → today's failed path, never park. A transport failure AFTER
+   * the send is an UNKNOWN outcome, never a failure: reconcile via the ownership probe.
+   */
+  private async reportForgeParkAndDispatch(
+    body: StateRequest,
+    claim: ClaimResponse,
+    flight: RunFlight,
+    reportState: RunFlight["reportState"],
+    runLog: Logger,
+    runHome: string | undefined,
+  ): Promise<"parked" | "stop" | "fail"> {
+    let ack: StateAck;
+    try {
+      ack = await reportState(body);
+    } catch (reportErr) {
+      if (reportErr instanceof RequestError && reportErr.status === 400) {
+        // The api rejected the negotiated fields (predates them) → today's failed path.
+        runLog.warn("forge park report rejected 400; taking the failed path (no park)", {
+          run_id: flight.runId,
+        });
+        return "fail";
+      }
+      // Transport failure / exhausted-transient throw: the server MAY have committed release +
+      // park and lost the ack, so reconcile via the read-only ownership probe until it is known.
+      // NEVER clean a possibly-parked session on an unknown outcome (D10).
+      runLog.warn("forge park report failed transport; reconciling by ownership probe", {
+        run_id: flight.runId,
+        error: errMessage(reportErr),
+      });
+      return await this.reconcileForgeParkByProbe(body, claim, flight, reportState, runLog, runHome);
+    }
+    return await this.dispatchForgeParkAck(ack, claim, flight, runLog, runHome);
+  }
+
+  /**
+   * PRD #1392 M2 (D10) — act on the forge park report's ack. reportState reads BOTH a 200 and a
+   * 409 for their body, so the ack carries the run's authoritative status plus the top-level
+   * `reason`. Precedence: a `stale_claim`/`custody_unsettled` reason (409) is checked before the
+   * status, then a `recovery_wait` status (a fresh 200 park OR an idempotent 409 duplicate-park),
+   * then any authoritative terminal status, then any other 409 → today's failed path.
+   */
+  private async dispatchForgeParkAck(
+    ack: StateAck,
+    claim: ClaimResponse,
+    flight: RunFlight,
+    runLog: Logger,
+    runHome: string | undefined,
+  ): Promise<"parked" | "stop" | "fail"> {
+    const { batcher } = flight;
+    if (ack.reason === "stale_claim") {
+      // #1247: the run moved on under this worker. Stop silently, no further report.
+      runLog.info("forge park: ack stale_claim; stopping silently", { run_id: flight.runId });
+      await batcher.close().catch(() => undefined);
+      return "stop";
+    }
+    if (ack.reason === "custody_unsettled") {
+      // Fail-safe: leave the batcher OPEN and take today's failed path.
+      runLog.info("forge park: ack custody_unsettled; taking today's failed path", { run_id: flight.runId });
+      return "fail";
+    }
+    if (ack.status === "recovery_wait") {
+      await this.finishForgePark(ack.recoveryRetryNotBefore, claim, flight, runLog, runHome);
+      return "parked";
+    }
+    if (ack.status && TERMINAL_RUN_STATUSES.has(ack.status)) {
+      // cancelled, or failed when the cap branch committed the terminal state, or any other
+      // authoritative terminal status: close the still-open batcher, no park event, no second
+      // report. The finally does the (empty, pre-clone) cleanup.
+      runLog.info("forge park: ack was authoritative terminal; cleaning up without a park", {
+        run_id: flight.runId,
+        status: ack.status,
+      });
+      await batcher.close().catch(() => undefined);
+      return "stop";
+    }
+    // Any other 409 (or an unmodelled non-park, non-terminal status): today's failed path,
+    // batcher left OPEN.
+    runLog.info("forge park: unrecognised ack; taking today's failed path", {
+      run_id: flight.runId,
+      status: ack.status,
+      reason: ack.reason,
+    });
+    return "fail";
+  }
+
+  /**
+   * PRD #1392 M2 (D4) — set `preserveSession` for a same-worker resume ONLY when a resume
+   * transcript is resolvable on THIS worker (a resume leg whose session id we can actually
+   * resume). A fresh claim (no session id) and a resume leg without a local transcript preserve
+   * nothing. Shared by finishForgePark (a CONFIRMED park) and reconcileForgeParkByProbe's
+   * worker-shutdown arm (which leaves the run non-terminal for the server to requeue), so both
+   * honor the D4 rule identically — HOME + the SDK session are kept when resolvable, else cleaned.
+   */
+  private async preserveForgeParkSessionIfResolvable(
+    claim: ClaimResponse,
+    flight: RunFlight,
+    runLog: Logger,
+    runHome: string | undefined,
+  ): Promise<void> {
+    const sessionId = claim.session_id;
+    if (
+      runHome &&
+      sessionId &&
+      (await sessionTranscriptResolvable(runHome, sessionId, runLog))
+    ) {
+      flight.preserveSession = true;
+    }
+  }
+
+  /**
+   * PRD #1392 M2 (D4/D10) — a CONFIRMED forge park. Emit and flush exactly ONE feed event quoting
+   * the acknowledged retry stamp (or "after backoff" when absent), close the batcher, then
+   * preserve HOME + the SDK session ONLY when a resume transcript is resolvable on THIS worker
+   * (a resume leg whose session id we can actually resume) — a fresh claim and a resume leg
+   * without a local transcript preserve nothing. `parked` + `preClonePark` mark the run so the
+   * finally treats it as a park (no terminal report) whose resume artifacts follow preserveSession.
+   */
+  private async finishForgePark(
+    retryAt: string | undefined,
+    claim: ClaimResponse,
+    flight: RunFlight,
+    runLog: Logger,
+    runHome: string | undefined,
+  ): Promise<void> {
+    const { batcher } = flight;
+    const when = retryAt ? `retry at ${retryAt}` : "retry after backoff";
+    batcher.emit({
+      kind: "status",
+      agent: "worker",
+      payload: { text: `forge unreachable at clone; parked, ${when}` },
+    });
+    await batcher.flush().catch(() => undefined);
+    await batcher.close().catch(() => undefined);
+    await this.preserveForgeParkSessionIfResolvable(claim, flight, runLog, runHome);
+    flight.parked = true;
+    flight.preClonePark = true;
+    runLog.info("run parked: forge unreachable at clone", {
+      run_id: flight.runId,
+      preserve_session: flight.preserveSession,
+      retry_not_before: retryAt ?? null,
+    });
+  }
+
+  /**
+   * PRD #1392 M2 (D10) — reconcile a forge park whose report threw AFTER the send (an unknown
+   * outcome). The read-only ownership probe is authoritative: `recovery_wait` → the park landed,
+   * preserve + emit (quoting the probe's recovery_retry_not_before, or "after backoff"); `running`
+   * → the transaction did not land, resend the SAME (idempotent) report and dispatch its ack; an
+   * authoritative terminal → today's cleanup (no park); a 404 (stale_claim / not owned / reclaimed)
+   * → stop. A transport failure ON the probe is itself unknown, so retain the (possibly parked)
+   * session and retry — NEVER clean it — until the outcome is known.
+   */
+  private async reconcileForgeParkByProbe(
+    body: StateRequest,
+    claim: ClaimResponse,
+    flight: RunFlight,
+    reportState: RunFlight["reportState"],
+    runLog: Logger,
+    runHome: string | undefined,
+  ): Promise<"parked" | "stop" | "fail"> {
+    const { batcher } = flight;
+    for (;;) {
+      if (this.shuttingDownGlobal) {
+        // Worker draining: leave the (non-terminal) run for the server to requeue; do NOT clean a
+        // possibly-parked session. Preserve HOME + the SDK session by the SAME D4 rule
+        // finishForgePark uses (resolvable transcript ⇒ keep, else clean) so a same-worker
+        // re-claim can resume — without this the finally computes preserveResumeArtifacts=false and
+        // removes runHome on this UNKNOWN outcome. The batcher must still close so this execution
+        // can drain.
+        runLog.info("forge park reconcile interrupted by worker shutdown; leaving the run for requeue", {
+          run_id: flight.runId,
+        });
+        await this.preserveForgeParkSessionIfResolvable(claim, flight, runLog, runHome);
+        await batcher.close().catch(() => undefined);
+        return "stop";
+      }
+      let probe;
+      try {
+        probe = await this.client.getRunOwnership(flight.runId);
+      } catch (probeErr) {
+        if (probeErr instanceof RequestError && probeErr.status === 404) {
+          // Not owned / reclaimed = stale_claim. Stop; do NOT clean a possibly-parked session.
+          runLog.info("forge park reconcile: ownership 404 (stale_claim); stopping silently", {
+            run_id: flight.runId,
+          });
+          await batcher.close().catch(() => undefined);
+          return "stop";
+        }
+        runLog.warn("forge park reconcile: ownership probe failed transport; retrying", {
+          run_id: flight.runId,
+          error: errMessage(probeErr),
+        });
+        // Do not busy-loop on a sticky cancel (mirrors the recovery loop): waitRecoveryRetry with
+        // its default cancelStopsWait=true returns IMMEDIATELY on a stuck cancel, degenerating a
+        // simultaneous cancel + api-unreachable into a backoff-free probe storm. Honor the backoff.
+        await this.waitRecoveryRetry(flight, false);
+        continue;
+      }
+      const status = probe.status;
+      if (status === "recovery_wait") {
+        await this.finishForgePark(probe.recovery_retry_not_before, claim, flight, runLog, runHome);
+        return "parked";
+      }
+      if (TERMINAL_RUN_STATUSES.has(status)) {
+        runLog.info("forge park reconcile: run is terminal; cleaning up without a park", {
+          run_id: flight.runId,
+          status,
+        });
+        await batcher.close().catch(() => undefined);
+        return "stop";
+      }
+      if (status === "running") {
+        // The transaction did not land; resend the SAME report (idempotent) and dispatch its ack.
+        try {
+          const ack = await reportState(body);
+          return await this.dispatchForgeParkAck(ack, claim, flight, runLog, runHome);
+        } catch (reportErr) {
+          if (reportErr instanceof RequestError && reportErr.status === 400) {
+            runLog.warn("forge park reconcile: resend rejected 400; taking the failed path (no park)", {
+              run_id: flight.runId,
+            });
+            return "fail";
+          }
+          runLog.warn("forge park reconcile: resend failed transport; re-probing", {
+            run_id: flight.runId,
+            error: errMessage(reportErr),
+          });
+          // Honor the backoff even under a sticky cancel (see the probe-retry site above).
+          await this.waitRecoveryRetry(flight, false);
+          continue;
+        }
+      }
+      // Any other status (queued, awaiting_*, …): the outcome is not yet known, retain and retry.
+      // cancelStopsWait=false so a sticky cancel cannot turn this into a backoff-free retry storm.
+      await this.waitRecoveryRetry(flight, false);
     }
   }
 
@@ -1310,7 +1720,18 @@ export class RunRunner {
           // kind (chat/judge), which never pins, stays a no-op; release is best-effort/idempotent
           // and a disabled coordinator no-ops it.
           if (!isCodePublishingKind(resolveRunKind(claim.kind))) return;
-          await this.recovery.release(claim.run_id, claim.claim_generation);
+          // PRD #1392 M1/M2 (fact 9): stamp the release's evidence class. A full publication
+          // (a pushed branch + / or MR) → "publication". A NO-code completion on this SAME
+          // branch (report_only / not_code / scope-capped-empty) carries no `branch` and is NOT a
+          // publication — its release class is genuinely ambiguous (neither publication nor the
+          // fresh-forge no-output proof), so OMIT the evidence (the api stores NULL, which is
+          // allowed) rather than mis-stamp it.
+          const completedBody = body as StateRequest;
+          const releaseEvidence =
+            typeof completedBody.branch === "string" && completedBody.branch !== ""
+              ? "publication"
+              : undefined;
+          await this.recovery.release(claim.run_id, claim.claim_generation, releaseEvidence);
         } else if (status === "failed" || status === "cancelled") {
           const capBarePath = flight.barePath;
           if (!capBarePath) return;
@@ -2935,6 +3356,9 @@ export class RunRunner {
       // a distinct flag from `parked` on purpose: `parked` also drives park-only report
       // semantics, resume seeding, and the park log, none of which apply to a shutdown.
       preserveSession: false,
+      // PRD #1392 M2: set true ONLY by the pre-clone forge-unreachable park. false everywhere
+      // else, so no other path's HOME preservation semantics change.
+      preClonePark: false,
       preserveRecoveryClone: false,
       ciFixHumanApproved: false,
       runnerClone: undefined,
@@ -3025,11 +3449,25 @@ export class RunRunner {
     await reportState({ status: "running" });
     steering.start();
 
-    const barePath = (flight.barePath = await this.git.ensureClone(
-      claim.repo.clone_url,
-      claim.secrets.forge_pat,
-      claim.secrets.forge_username,
-    ));
+    // PRD #1392 M2: only `ensureClone` is wrapped in `withForgeRetry` (fact 4). When it exhausts
+    // the schedule and rethrows the last raw git/forge error, a TRANSIENT verdict (a DNS blip, a
+    // connection reset, a 5xx) becomes a ForgeUnreachableAtCloneError so executeClaim's catch can
+    // PARK the run instead of failing it; a PERMANENT verdict (401/403/404) is rethrown unchanged
+    // and still fails immediately. `flight.barePath` is assigned ONLY on success, so a park leaves
+    // it undefined (no clone, no worktree, no plugin dir exist pre-clone).
+    let barePath: string;
+    try {
+      barePath = flight.barePath = await this.git.ensureClone(
+        claim.repo.clone_url,
+        claim.secrets.forge_pat,
+        claim.secrets.forge_username,
+      );
+    } catch (err) {
+      if (classifyForgeError(err) === "transient") {
+        throw new ForgeUnreachableAtCloneError(errMessage(err), err);
+      }
+      throw err;
+    }
     let retained = false;
     try {
       const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim));
