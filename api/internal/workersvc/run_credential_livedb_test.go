@@ -318,6 +318,53 @@ func TestSetRunCredentialLaneAndSecretRefusalsLiveDB(t *testing.T) {
 		}
 	})
 
+	// (409, PRD #1247 fix round) A task run carrying review_target_run_id is an auto-created
+	// diff-review ADVICE lane. The ReviewRunner never honors a held switch, so accepting one is
+	// "200 accepted but never honored". SetRunCredential must refuse it with the same lane 409 as
+	// chat/judge/self_improve BEFORE any write. Seeded RUNNING and owned by a CAPABILITY worker so
+	// the mutation is real: remove the review guard and the held-state switch stamps the override +
+	// switch columns instead — this subtest's zero-write assertions then redden.
+	t.Run("review lane not switchable", func(t *testing.T) {
+		// A capability worker (advertises credential_switch_v1) so, absent the guard, the running
+		// switch path would actually stamp — the point of the mutation.
+		capWorker := uuid.New()
+		env.exec(`INSERT INTO workers (id, user_id, name, token_hash, status, protocol_capabilities)
+		          VALUES ($1, $2, $3, $4, 'online', ARRAY['credential_switch_v1'])`,
+			capWorker, o.userID, "cap-"+capWorker.String(), capWorker[:])
+
+		// The reviewed target, then the review run: kind='task', review_target_run_id set, RUNNING,
+		// owned by the capability worker (the held-switch state).
+		reviewTarget := seedRunInStatus(t, env, o, 4740, "queued", now)
+		reviewID := uuid.New()
+		// runs_kind_shape (00167): a task row requires issue_iid NULL and branch NOT NULL — a review
+		// run IS a task carrying review_target_run_id (review-runner.ts).
+		env.exec(`INSERT INTO runs (id, user_id, repo_id, kind, issue_title, issue_description,
+		             status, status_since, worker_id, review_target_run_id, branch, started_at)
+		          VALUES ($1, $2, $3, 'task', 't', 'd', 'running', now(), $4, $5, 'uzi/task/review', now())`,
+			reviewID, o.userID, o.repoID, capWorker, reviewTarget)
+
+		_, err := svc.SetRunCredential(env.ctx, o.userID, reviewID, CredentialOverrideModePinned, &o.altTok)
+		if !errors.Is(err, ErrCredentialOverrideLaneNotSwitchable) {
+			t.Fatalf("SetRunCredential(review) err = %v, want ErrCredentialOverrideLaneNotSwitchable (409)", err)
+		}
+		run := mustRun(t, env, reviewID)
+		if run.CredentialOverrideMode.Valid {
+			t.Errorf("credential_override_mode = %q, want NULL (a refused review switch writes nothing)", run.CredentialOverrideMode.String)
+		}
+		if run.CredentialOverrideSecretID.Valid {
+			t.Errorf("credential_override_secret_id = %+v, want NULL (a refused review switch writes nothing)", run.CredentialOverrideSecretID)
+		}
+		if run.CredentialSwitchRequestedAt.Valid {
+			t.Errorf("credential_switch_requested_at set, want NULL — a refused review switch stamps nothing")
+		}
+		if run.CredentialSwitchGeneration.Valid {
+			t.Errorf("credential_switch_generation set, want NULL — a refused review switch stamps nothing")
+		}
+		if run.Status != "running" {
+			t.Errorf("status = %q, want running (UNCHANGED by a refused switch)", run.Status)
+		}
+	})
+
 	// (404) The pinned secret must be the CALLER's OWN anthropic_token. Both a foreign secret
 	// and an own-but-wrong-kind secret resolve as not-found through the owner+kind-scoped
 	// lookup — proving the secret id is threaded to that lookup. A switchable (queued) issue

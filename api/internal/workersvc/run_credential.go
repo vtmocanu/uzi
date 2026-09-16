@@ -99,6 +99,18 @@ func (s *Service) SetRunCredential(ctx context.Context, userID, runID uuid.UUID,
 		return SetRunCredentialResult{}, fmt.Errorf("set run credential: read run: %w", err)
 	}
 
+	// PRD #1247 fix round (review-lane refusal, D10): a task run carrying review_target_run_id is
+	// an auto-created diff-review ADVICE lane, not a code lane. The ReviewRunner never inspects the
+	// held-switch ACK, so a switch stamped here is "200 accepted but never honored": the review
+	// completes on the OLD token and, because SetRunCompleted does not clear the switch columns, its
+	// completed DTO stays permanently `credential_switch: requested`. Refuse the whole lane with the
+	// same non-switchable 409 as chat/judge/self_improve, BEFORE any override/stamp write. The
+	// validator below cannot catch this — it receives only run.Kind ('task') — so the guard lives
+	// here, where the run row's review_target_run_id is visible.
+	if run.ReviewTargetRunID.Valid {
+		return SetRunCredentialResult{}, fmt.Errorf("%w: review (review_target_run_id set)", ErrCredentialOverrideLaneNotSwitchable)
+	}
+
 	// The effective harness of THIS run: runs.harness is NOT NULL DEFAULT 'claude'
 	// (migration 00226), so a persisted run always carries its authoritative harness and no
 	// users.default_harness fallback is needed here (that fallback is the create case, where
