@@ -2180,11 +2180,11 @@ export class RunRunner {
             } catch (e) {
               // PRD #974 M2: an aligned push rejected by GitHub Push Protection (GH013) is a
               // secret the pre-push gitleaks scan missed — route it to the typed
-              // push_secret_blocked preserve-and-fail (diffing the pre-align agent tip) rather
-              // than the base-align-conflict path or the generic catch.
+              // push_secret_blocked fail (NO preserved diff: it may carry the detected secret)
+              // rather than the base-align-conflict path or the generic catch.
               if (isPushProtectionRejection(e)) {
                 runLog.info(
-                  "finalize base-align: aligned push rejected by GitHub Push Protection (GH013); preserving diff and failing typed",
+                  "finalize base-align: aligned push rejected by GitHub Push Protection (GH013); failing typed, no preserved diff (it may carry the secret)",
                   { run_id: runId },
                 );
                 await failPushSecretBlocked();
@@ -2271,11 +2271,12 @@ export class RunRunner {
                 overlayHandled = true;
               } catch (e) {
                 // PRD #974 M2: an overlay push rejected by GitHub Push Protection (GH013) is a
-                // secret gitleaks missed — typed preserve-and-fail, not a fall-back to
-                // merge/rebase (which cannot clear a secret) nor the generic catch.
+                // secret gitleaks missed — typed push_secret_blocked fail (NO preserved diff:
+                // it may carry the secret), not a fall-back to merge/rebase (which cannot clear
+                // a secret) nor the generic catch.
                 if (isPushProtectionRejection(e)) {
                   runLog.info(
-                    "finalize base-align: workflow-subtree overlay push rejected by GitHub Push Protection (GH013); preserving diff and failing typed",
+                    "finalize base-align: workflow-subtree overlay push rejected by GitHub Push Protection (GH013); failing typed, no preserved diff (it may carry the secret)",
                     { run_id: runId },
                   );
                   await failPushSecretBlocked();
@@ -2301,11 +2302,12 @@ export class RunRunner {
                 await fetchAndPush();
               } catch (e) {
                 // PRD #974 M2: a merge push rejected by GitHub Push Protection (GH013) is a secret
-                // gitleaks missed — typed preserve-and-fail, not the rebase fallback (which cannot
-                // clear a secret) nor the generic catch.
+                // gitleaks missed — typed push_secret_blocked fail (NO preserved diff: it may
+                // carry the secret), not the rebase fallback (which cannot clear a secret) nor
+                // the generic catch.
                 if (isPushProtectionRejection(e)) {
                   runLog.info(
-                    "finalize base-align: merge push rejected by GitHub Push Protection (GH013); preserving diff and failing typed",
+                    "finalize base-align: merge push rejected by GitHub Push Protection (GH013); failing typed, no preserved diff (it may carry the secret)",
                     { run_id: runId },
                   );
                   await failPushSecretBlocked();
@@ -2390,8 +2392,9 @@ export class RunRunner {
         await pushToOrigin();
       } catch (e) {
         // PRD #974 M2 backstop: a GitHub Push Protection (GH013) rejection here means a secret
-        // the pre-push gitleaks scan missed — route it to the typed preserve-and-fail rather than
-        // the generic catch. Any OTHER push error rethrows (unchanged behavior).
+        // the pre-push gitleaks scan missed — route it to the typed push_secret_blocked fail
+        // (NO preserved diff: it may carry the secret) rather than the generic catch. Any OTHER
+        // push error rethrows (unchanged behavior).
         if (isPushProtectionRejection(e)) {
           await failPushSecretBlocked();
           return;

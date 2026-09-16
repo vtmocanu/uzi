@@ -112,7 +112,10 @@ describe("RunRunner — push_secret_blocked typed terminal (PRD #974 M2 / #1077)
       .messages(claim.run_id)
       .filter((m) => m.kind === "status")
       .map((m) => JSON.stringify(m.payload));
-    assert.ok(statusTexts.length > 0, "the trusted-scan block must emit a worker status");
+    assert.ok(
+      statusTexts.some((t) => /Push Protection would reject/.test(t)),
+      "the trusted-scan block must emit its own secret-block worker status",
+    );
     for (const t of statusTexts) {
       assert.ok(!/preserv/i.test(t), `worker status must not claim preservation: ${t}`);
     }

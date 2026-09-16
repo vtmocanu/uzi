@@ -93,8 +93,8 @@ func AllFailOrigins() []string {
 // (PRD #456: the finalize base-align merge AND rebase both conflict, so the worker
 // aborts and preserves the diff), and push_secret_blocked (issue #974: the finalize
 // pre-push gitleaks range scan finds a secret, or the push is rejected by GitHub Push
-// Protection / GH013, so the worker fails typed WITHOUT a preserved diff — it may carry the detected secret); agent_failure
-// is included because it is the judgeable
+// Protection / GH013, so the worker fails typed WITHOUT a preserved diff — it may carry
+// the detected secret); agent_failure is included because it is the judgeable
 // default the `failed` arm applies anyway, so an explicit worker agent_failure is
 // harmless and semantically correct. The partition (worker-reportable + server-only ==
 // vocabulary) is pinned by TestCoerceFailOrigin.
