@@ -3511,6 +3511,14 @@ export class RunRunner {
           ...(flight.observedSessionId ? { session_id: flight.observedSessionId } : {}),
         };
         const ack = await this.client.reportState(runId, stamped, signal);
+        // PRD #1247 M5b (MINOR-7): the held-state switch signal rides the state ACK too — the
+        // advertised SECONDARY transport beside /inputs. Feed it into the SAME generation-checked,
+        // idempotent, defer-aware trigger the inputs poll uses (tripCredentialSwitch), so a failing
+        // /inputs poll can no longer disable the switch: a report is made far more often than an
+        // inputs poll, and the two transports compose (a switch trips at most once). Fed BEFORE the
+        // stale_claim check below; the two never co-occur (workerStateAck omits the switch signal
+        // from the stale_claim disposition), so ordering is immaterial to correctness.
+        if (ack.credentialSwitch) flight.steering.tripCredentialSwitch(ack.credentialSwitch.generation);
         // PRD #1247 M5b: a stale_claim disposition means a held-state switch RELEASED this claim
         // (or a reclaim SUPERSEDED it) — the flight no longer owns the run and MUST STOP. Throw so
         // executeClaim's catch chain closes the batcher and ends the flight with NO terminal

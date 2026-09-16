@@ -174,4 +174,33 @@ describe("RunRunner — PRD #1247 M5b stop-on-stale_claim", () => {
       fs.rmSync(homeRoot, { recursive: true, force: true });
     }
   });
+
+  it("MINOR-7: a credential_switch signal on a /state ACK triggers the switch (the secondary transport, not just /inputs)", async () => {
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-1247-ack-switch-"));
+    try {
+      const claim = gitlabClaim(1280, { claim_generation: 5 });
+      // Arm the switch signal ONLY on the /state ACK — /inputs (setInputs) is never called — so a
+      // trip PROVES the state-ack transport works on its own. Before MINOR-7 the ack's credential_switch
+      // was parsed but never forwarded, so ONLY a /inputs poll could trigger a switch; here the run
+      // would just complete normally.
+      api.armStateAckCredentialSwitch(claim.run_id, 5);
+      const factory: ExecutorFactory = (runId) => ({
+        homeDir: path.join(homeRoot, runId),
+        executor: new SdkExecutor(nullLogger(), path.join(homeRoot, runId), { queryFn: planThenDoneQuery() }),
+      });
+      await runnerWith(factory, gitlab, undefined, nullLogger()).execute(claim);
+
+      const s = api.states.filter((x) => x.runId === claim.run_id).map((x) => x.body.status);
+      // The state-ack signal tripped the switch: the flight entered enterCredentialSwitch and
+      // reported the release (credential_switch) or the give-up (credential_switch_failed) — NOT a
+      // plain `completed`, which is what a run whose switch signal was ignored would report.
+      assert.ok(
+        s.includes("credential_switch") || s.includes("credential_switch_failed"),
+        `the state-ack credential_switch tripped the switch; reports were: ${s.join(", ")}`,
+      );
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
 });

@@ -50,6 +50,11 @@ export class FakeApi {
   // worker reads it off the same body (readRunAck). A resumed run whose pause columns survived a
   // requeue answers true here WITHOUT any pause input being delivered.
   private readonly pauseRequestedRuns = new Set<string>();
+  // PRD #1247 M5b (MINOR-7): runs whose /state ACK carries a TOP-LEVEL credential_switch signal
+  // (the SECONDARY transport beside /inputs). The real server (workerStateAck) sets it when a
+  // held-state switch is pending for the run's current claim; a test arms it to prove the state-ack
+  // transport triggers the switch through the reportState closure, independent of /inputs.
+  private readonly stateAckCredentialSwitch = new Map<string, number>();
   private readonly stateRawOverride = new Map<
     string,
     { status: number; body: string }
@@ -270,6 +275,13 @@ export class FakeApi {
 
   setInputs(runId: string, inputs: UserInput[]): void {
     this.inputsByRun.set(runId, inputs);
+  }
+
+  /** PRD #1247 M5b (MINOR-7): arm a TOP-LEVEL credential_switch signal on every /state ACK for a
+   *  run, WITHOUT delivering it through /inputs — so a test can prove the state-ack transport trips
+   *  the switch on its own. */
+  armStateAckCredentialSwitch(runId: string, generation: number): void {
+    this.stateAckCredentialSwitch.set(runId, generation);
   }
 
   /** issue #559 M3: answer the ownership probe for this run with 200 {status}. Use a
@@ -672,6 +684,12 @@ export class FakeApi {
       // regardless of the run's returned status (a fresh 'queued' OR an idempotent-after-reclaim
       // 'running' set via overrideStateStatus). enterCredentialSwitch keys off this, not status.
       ...(body.status === "credential_switch" ? { disposition: "released" } : {}),
+      // PRD #1247 M5b (MINOR-7): the TOP-LEVEL credential_switch signal the reportState closure feeds
+      // to the steering channel (armStateAckCredentialSwitch). Present on the ordinary report acks,
+      // not the credential_switch release report itself (which already carries disposition:released).
+      ...(this.stateAckCredentialSwitch.has(runId) && body.status !== "credential_switch"
+        ? { credential_switch: { generation: this.stateAckCredentialSwitch.get(runId)! } }
+        : {}),
     });
   }
 }

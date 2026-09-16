@@ -363,6 +363,16 @@ export class SteeringChannel {
     this.pendingSwitchGeneration = undefined;
   }
 
+  /** PRD #1247 M5b (MINOR-7): the PUBLIC entry the runner's reportState closure calls to feed the
+   *  state-ack's credential_switch signal into the SAME trigger the /inputs poll uses. It reuses
+   *  maybeTripCredentialSwitch's guards verbatim — the generation match, the once-only idempotency,
+   *  and the defer window — so the two transports compose (a switch trips at most once, whichever the
+   *  ack or a poll observes first) and a failing /inputs poll can no longer disable the advertised
+   *  secondary transport. */
+  tripCredentialSwitch(generation: number): void {
+    this.maybeTripCredentialSwitch(generation);
+  }
+
   /** PRD #1247 M5b (MAJOR-6): open a defer window — a matching credential_switch signal is held
    *  (not tripped, not aborting) until the window closes. Used around a plan-REVISION planning turn
    *  so a switch never releases the claim before gatePlan has persisted the revised plan (which
