@@ -10315,30 +10315,57 @@ func (q *Queries) StampCompletionBudgetExhausted(ctx context.Context, arg StampC
 	return result.RowsAffected(), nil
 }
 
-const stampCredentialSwitch = `-- name: StampCredentialSwitch :execrows
+const stampHeldCredentialSwitch = `-- name: StampHeldCredentialSwitch :execrows
 UPDATE runs SET
+    credential_override_mode       = $1,
+    credential_override_secret_id  = $2,
     credential_switch_requested_at = now(),
-    credential_switch_generation   = $1,
-    updated_at = now()
-WHERE id = $2 AND user_id = $3
+    credential_switch_generation   = $3,
+    updated_at                     = now()
+WHERE id = $4
+  AND user_id = $5
+  AND worker_id = $6
+  AND claim_generation = $3
+  AND claim_released_at IS NULL
+  AND status IN ('running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
 `
 
-type StampCredentialSwitchParams struct {
+type StampHeldCredentialSwitchParams struct {
+	Mode       pgtype.Text `json:"mode"`
+	SecretID   pgtype.UUID `json:"secret_id"`
 	Generation pgtype.Int8 `json:"generation"`
 	ID         uuid.UUID   `json:"id"`
 	UserID     uuid.UUID   `json:"user_id"`
+	WorkerID   pgtype.UUID `json:"worker_id"`
 }
 
-// PRD #1247 M5 (D4): stamp a pending held-state credential switch for the owner's
-// `uzi run set-token` verb on a run a worker currently holds (running/awaiting_*). The switch
-// is REQUESTED (visible as "requested", D14); the holding worker's next inputs poll (M5a-2)
-// reads the signal and drives the local release. @generation is the claim the switch targets
-// (runs.claim_generation at request time), which ReleaseCredentialSwitch's fence matches. This
-// does NOT change status — the run stays in its held state until the worker releases — and it
-// is owner-scoped (user_id), so a foreign run is a 0-row no-op. The verb writes the override
-// columns (SetRunCredentialOverride) FIRST, then this stamp.
-func (q *Queries) StampCredentialSwitch(ctx context.Context, arg StampCredentialSwitchParams) (int64, error) {
-	result, err := q.db.Exec(ctx, stampCredentialSwitch, arg.Generation, arg.ID, arg.UserID)
+// PRD #1247 M5 (D4, BLOCKING-1 rework): the held-state credential switch for the owner's
+// `uzi run set-token` verb on a run a worker currently holds (running/awaiting_*), written in ONE
+// atomic, fenced UPDATE — the override columns AND the switch stamp together. This REPLACES the
+// prior two-write path (SetRunCredentialOverride then a `id + user_id`-only stamp), which could
+// interleave with a concurrent release/reclaim/cancel/second-switch and leave the override written
+// but the stamp fenced out (or vice versa) while the verb still returned 200. The switch is
+// REQUESTED (visible as "requested", D14); the holding worker's next inputs poll (M5a-2) reads the
+// signal and drives the local release. It does NOT change status — the run stays in its held state
+// until the worker releases.
+//
+// THE WHERE IS THE FENCE. Owner-scoped (user_id, so a foreign run is a 0-row no-op) AND fenced on
+// the EXACT live claim — worker_id, claim_generation = @generation, claim_released_at IS NULL, in
+// one of the held states — mirroring ReleaseCredentialSwitch / ClearCredentialSwitchByWorker.
+// @generation is the run's current claim_generation, so the switch stamp targets the CURRENT
+// claim and ReleaseCredentialSwitch's fence matches it. EXACTLY ONE row is expected; a 0-row
+// result means the run left the held state, the generation advanced, or the claim was released
+// between the caller's read and this write (a raced release/reclaim) → the caller returns
+// ErrCredentialSwitchRaced and NOTHING is written (this UPDATE matched no row).
+func (q *Queries) StampHeldCredentialSwitch(ctx context.Context, arg StampHeldCredentialSwitchParams) (int64, error) {
+	result, err := q.db.Exec(ctx, stampHeldCredentialSwitch,
+		arg.Mode,
+		arg.SecretID,
+		arg.Generation,
+		arg.ID,
+		arg.UserID,
+		arg.WorkerID,
+	)
 	if err != nil {
 		return 0, err
 	}

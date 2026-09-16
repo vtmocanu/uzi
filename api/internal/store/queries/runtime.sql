@@ -2294,20 +2294,37 @@ WHERE id = @id AND worker_id = @worker_id
   AND claim_released_at IS NULL
   AND status IN ('running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup');
 
--- name: StampCredentialSwitch :execrows
--- PRD #1247 M5 (D4): stamp a pending held-state credential switch for the owner's
--- `uzi run set-token` verb on a run a worker currently holds (running/awaiting_*). The switch
--- is REQUESTED (visible as "requested", D14); the holding worker's next inputs poll (M5a-2)
--- reads the signal and drives the local release. @generation is the claim the switch targets
--- (runs.claim_generation at request time), which ReleaseCredentialSwitch's fence matches. This
--- does NOT change status — the run stays in its held state until the worker releases — and it
--- is owner-scoped (user_id), so a foreign run is a 0-row no-op. The verb writes the override
--- columns (SetRunCredentialOverride) FIRST, then this stamp.
+-- name: StampHeldCredentialSwitch :execrows
+-- PRD #1247 M5 (D4, BLOCKING-1 rework): the held-state credential switch for the owner's
+-- `uzi run set-token` verb on a run a worker currently holds (running/awaiting_*), written in ONE
+-- atomic, fenced UPDATE — the override columns AND the switch stamp together. This REPLACES the
+-- prior two-write path (SetRunCredentialOverride then a `id + user_id`-only stamp), which could
+-- interleave with a concurrent release/reclaim/cancel/second-switch and leave the override written
+-- but the stamp fenced out (or vice versa) while the verb still returned 200. The switch is
+-- REQUESTED (visible as "requested", D14); the holding worker's next inputs poll (M5a-2) reads the
+-- signal and drives the local release. It does NOT change status — the run stays in its held state
+-- until the worker releases.
+--
+-- THE WHERE IS THE FENCE. Owner-scoped (user_id, so a foreign run is a 0-row no-op) AND fenced on
+-- the EXACT live claim — worker_id, claim_generation = @generation, claim_released_at IS NULL, in
+-- one of the held states — mirroring ReleaseCredentialSwitch / ClearCredentialSwitchByWorker.
+-- @generation is the run's current claim_generation, so the switch stamp targets the CURRENT
+-- claim and ReleaseCredentialSwitch's fence matches it. EXACTLY ONE row is expected; a 0-row
+-- result means the run left the held state, the generation advanced, or the claim was released
+-- between the caller's read and this write (a raced release/reclaim) → the caller returns
+-- ErrCredentialSwitchRaced and NOTHING is written (this UPDATE matched no row).
 UPDATE runs SET
+    credential_override_mode       = @mode,
+    credential_override_secret_id  = @secret_id,
     credential_switch_requested_at = now(),
     credential_switch_generation   = @generation,
-    updated_at = now()
-WHERE id = @id AND user_id = @user_id;
+    updated_at                     = now()
+WHERE id = @id
+  AND user_id = @user_id
+  AND worker_id = @worker_id
+  AND claim_generation = @generation
+  AND claim_released_at IS NULL
+  AND status IN ('running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup');
 
 -- name: ClearCredentialSwitchByWorker :execrows
 -- PRD #1247 M5 (D3/D14): a bounded capture-failure give-up (a credential_switch_failed worker

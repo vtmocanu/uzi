@@ -721,10 +721,13 @@ type Store interface {
 	// distinguishes a stale redelivery (0 rows) from an idempotent already-released/already-
 	// reclaimed one by a re-read.
 	ReleaseCredentialSwitch(ctx context.Context, arg store.ReleaseCredentialSwitchParams) (int64, error)
-	// StampCredentialSwitch stamps a pending held-state switch (credential_switch_requested_at
-	// + _generation) for `uzi run set-token` on a run a worker holds (PRD #1247 M5, D4). It
-	// does NOT change status; owner-scoped so a foreign run is a 0-row no-op.
-	StampCredentialSwitch(ctx context.Context, arg store.StampCredentialSwitchParams) (int64, error)
+	// StampHeldCredentialSwitch atomically writes the override columns AND the switch stamp
+	// (credential_switch_requested_at + _generation) for `uzi run set-token` on a run a worker
+	// holds (PRD #1247 M5, D4, BLOCKING-1 rework). One fenced UPDATE, owner-scoped and fenced on
+	// the exact live claim (worker_id + claim_generation + claim_released_at IS NULL + held
+	// status); it does NOT change status. Requires exactly one affected row — a 0-row result is a
+	// raced release/reclaim the caller maps to ErrCredentialSwitchRaced, with nothing written.
+	StampHeldCredentialSwitch(ctx context.Context, arg store.StampHeldCredentialSwitchParams) (int64, error)
 	// ClearCredentialSwitchByWorker clears a pending switch stamp WITHOUT changing status for the
 	// worker's `credential_switch_failed` report — the bounded capture-failure give-up (PRD #1247
 	// M5, D3/D14): the run keeps running on its current token. Fenced to the CURRENT claim

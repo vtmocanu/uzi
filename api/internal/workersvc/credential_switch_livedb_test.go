@@ -15,7 +15,7 @@ import (
 // This file is the live-DB half of PRD #1247 M5a-1 (the protocol core): it EXECUTES the
 // generation fence (service.go's FOR UPDATE wrapper + the fenced InsertRunMessage), the
 // credential_switch RELEASE transition (ReleaseCredentialSwitch), the held-state stamp
-// (StampCredentialSwitch), and ClaimRun's fence-clear against a REAL Postgres — sqlc's type
+// (StampHeldCredentialSwitch), and ClaimRun's fence-clear against a REAL Postgres — sqlc's type
 // deduction is not Postgres's, so these guarded statements can pass `sqlc generate` yet fail at
 // prepare/execute. Skipped unless UZI_TEST_DATABASE_URL is set (setupCodexLiveDB skips).
 
@@ -379,6 +379,37 @@ func TestSetRunCredentialHeldStateStampLiveDB(t *testing.T) {
 			t.Fatalf("a refused held switch wrote something: override=%v stamp=%v", run.CredentialOverrideMode, run.CredentialSwitchRequestedAt)
 		}
 	})
+}
+
+// TestSetRunCredentialHeldStateStampRacedReleaseLiveDB is the BLOCKING-1 regression: the held-state
+// switch is ONE atomic fenced write, so a claim RELEASED (or reclaimed) between the verb's read and
+// its write is a raced conflict — the fence (worker_id + claim_generation + claim_released_at IS
+// NULL + held status) matches 0 rows → ErrCredentialSwitchRaced with NOTHING written. The prior
+// two-write path (SetRunCredentialOverride then a user_id-only StampCredentialSwitch) had no
+// released/generation fence, so it wrote the override AND the stamp onto an already-released claim
+// while still returning 200 — the exact inconsistency this rework closes. Reverting run_credential
+// to the two-write path reddens this test (err would be nil and the columns would be set).
+func TestSetRunCredentialHeldStateStampRacedReleaseLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	svc := New(env.q, env.box, testParams())
+	o := seedReevalOwner(t, env, BindModeAuto, false)
+	env.exec(`UPDATE workers SET protocol_capabilities = $2 WHERE id = $1`, o.workerID, []string{capability.CredentialSwitchV1})
+	g := int64(7)
+	// A held 'running' run whose claim was RELEASED (claim_released_at set) but still reads as
+	// 'running' — the raced window a real release→requeue passes through before ClaimRun clears it.
+	id := seedHeldRun(t, env, o, 5502, "running", g, false, true)
+
+	_, err := svc.SetRunCredential(env.ctx, o.userID, id, CredentialOverrideModePinned, &o.altTok)
+	if !errors.Is(err, ErrCredentialSwitchRaced) {
+		t.Fatalf("raced held switch: err = %v, want ErrCredentialSwitchRaced", err)
+	}
+	run := mustRun(t, env, id)
+	if run.CredentialOverrideMode.Valid || run.CredentialOverrideSecretID.Valid ||
+		run.CredentialSwitchRequestedAt.Valid || run.CredentialSwitchGeneration.Valid {
+		t.Fatalf("a raced held switch wrote something: override=(%v,%v) stamp=(%v,%v)",
+			run.CredentialOverrideMode, run.CredentialOverrideSecretID,
+			run.CredentialSwitchRequestedAt, run.CredentialSwitchGeneration)
+	}
 }
 
 // TestInsertRunMessageFenceLiveDB proves the message-append fence (PRD #1247 M5, D3): a batch

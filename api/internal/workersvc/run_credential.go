@@ -170,11 +170,13 @@ func (s *Service) SetRunCredential(ctx context.Context, userID, runID uuid.UUID,
 //     CredentialSwitchWorkerUnsupportedError naming it (409, D4-step-9). An old worker cannot
 //     read or act on the switch signal, so stamping one would strand the request forever.
 //
-// Only when both hold does it write — the override columns FIRST (SetRunCredentialOverride,
-// idempotent), then the switch stamp (credential_switch_requested_at + _generation targeting the
-// run's CURRENT claim generation, which ReleaseCredentialSwitch's fence matches). It does NOT
-// change status; the run stays held until the worker releases. A refusal writes NOTHING (neither
-// the override nor the stamp), because the capability check runs BEFORE either write.
+// Only when both hold does it write — the override columns AND the switch stamp
+// (credential_switch_requested_at + _generation) together in ONE atomic fenced UPDATE
+// (StampHeldCredentialSwitch, BLOCKING-1 rework), targeting the run's CURRENT claim generation,
+// which ReleaseCredentialSwitch's fence matches. It does NOT change status; the run stays held
+// until the worker releases. A refusal writes NOTHING: the capability check refuses before the
+// write, and a raced release/reclaim between the read and the write yields 0 rows, which the
+// single-query fence turns into ErrCredentialSwitchRaced (409) with nothing written.
 func (s *Service) stampHeldStateSwitch(ctx context.Context, run store.Run, userID, runID uuid.UUID, resolved *CredentialOverride) error {
 	if !run.WorkerID.Valid {
 		return ErrCredentialSwitchNoLiveWorker
@@ -189,20 +191,26 @@ func (s *Service) stampHeldStateSwitch(ctx context.Context, run store.Run, userI
 	if !slices.Contains(wkr.ProtocolCapabilities, capability.CredentialSwitchV1) {
 		return &CredentialSwitchWorkerUnsupportedError{WorkerID: wkr.ID, WorkerName: wkr.Name}
 	}
-	if _, err := s.q.SetRunCredentialOverride(ctx, store.SetRunCredentialOverrideParams{
-		Mode:     pgOverrideMode(resolved),
-		SecretID: pgOverrideSecretID(resolved),
-		ID:       runID,
-		UserID:   userID,
-	}); err != nil {
-		return fmt.Errorf("set run credential override (held): %w", err)
-	}
-	if _, err := s.q.StampCredentialSwitch(ctx, store.StampCredentialSwitchParams{
+	// One atomic, fenced write (BLOCKING-1 rework): the override columns AND the switch stamp
+	// together, guarded by the held status + worker_id + claim_generation + claim_released_at IS
+	// NULL fence. Replaces the prior two writes (SetRunCredentialOverride then a user_id-only
+	// stamp), which a concurrent release/reclaim/cancel/second-switch could interleave and leave
+	// inconsistent while the verb returned 200. Exactly one row is required; a 0-row result is a
+	// raced release/reclaim between the read above and this write → ErrCredentialSwitchRaced with
+	// nothing written (the UPDATE matched no row).
+	rows, err := s.q.StampHeldCredentialSwitch(ctx, store.StampHeldCredentialSwitchParams{
+		Mode:       pgOverrideMode(resolved),
+		SecretID:   pgOverrideSecretID(resolved),
 		Generation: pgtype.Int8{Int64: run.ClaimGeneration, Valid: true},
 		ID:         runID,
 		UserID:     userID,
-	}); err != nil {
-		return fmt.Errorf("stamp credential switch: %w", err)
+		WorkerID:   pgtype.UUID{Bytes: wkr.ID, Valid: true},
+	})
+	if err != nil {
+		return fmt.Errorf("stamp held credential switch: %w", err)
+	}
+	if rows != 1 {
+		return ErrCredentialSwitchRaced
 	}
 	return nil
 }
