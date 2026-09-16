@@ -681,10 +681,16 @@ chain in the diagram above, with no intervening `running`.
   and produced no model work) routes to `limit_wait` instead — respecting
   `wait_on_limit`, so it fails fast rather than cycling here when limit-waiting
   is off. An earlier `rejected` later followed by `allowed`, or any empty turn
-  from another cause, still parks here. See
+  from another cause, still parks here. `recovery_wait` also covers a
+  **pre-clone forge-unreachable park** (issue #1392): a transient forge
+  failure at clone or fetch parks here too, cause `forge_unreachable`, capped
+  by `RUN_FORGE_UNREACHABLE_MAX_PARKS` (unlike the empty-turn cause, which has
+  no lifetime cap). See
   [adr/1197-transient-recovery-park.md](adr/1197-transient-recovery-park.md),
   [adr/1296-durable-run-recovery.md](adr/1296-durable-run-recovery.md) (the
-  2026-09-14 PRD #1349 amendment) and
+  2026-09-14 PRD #1349 amendment),
+  [adr/1392-forge-unreachable-preclone-park.md](adr/1392-forge-unreachable-preclone-park.md)
+  and
   [docs/run-recovery-wait.md](docs/run-recovery-wait.md).
 
 - **running ⇄ awaiting_followup** (PRD #517, `uzi handoff --interactive`) — a

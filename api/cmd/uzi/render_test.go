@@ -909,6 +909,57 @@ func TestLimitWaitLine(t *testing.T) {
 	}
 }
 
+// TestForgeParkLine pins the PRD #1392 M5 shared forge wording: "waiting for the forge,
+// retry at HH:MM (N of MAX)", with MAX → "unlimited" when the cap is disabled and the retry
+// clause dropped when the server sent no stamp.
+func TestForgeParkLine(t *testing.T) {
+	retry := time.Date(2026, 8, 1, 9, 30, 0, 0, time.UTC)
+	forgeCause := "forge_unreachable"
+	base := apitypes.RunDTO{
+		Status:                 statusRecoveryWait,
+		RecoveryWaitCause:      &forgeCause,
+		RecoveryRetryNotBefore: &retry,
+		ForgeParkCount:         2,
+		ForgeParkMax:           5,
+	}
+	// The retry time is the viewer's local wall clock, so compute the expected HH:MM the
+	// same way rather than hard-coding a tz-dependent string.
+	wantAt := retry.Local().Format("15:04")
+	if got := forgeParkLine(base); got != "waiting for the forge, retry at "+wantAt+" (2 of 5)" {
+		t.Errorf("forgeParkLine(count=2, max=5) = %q, want the retry+count wording", got)
+	}
+
+	// Cap disabled (0) renders "unlimited", never a real ceiling of zero.
+	unlimited := base
+	unlimited.ForgeParkMax = 0
+	unlimited.ForgeParkCount = 3
+	if got := forgeParkLine(unlimited); !strings.Contains(got, "3 of unlimited") {
+		t.Errorf("forgeParkLine(max=0) = %q, want it to render the cap as \"unlimited\"", got)
+	}
+
+	// No retry stamp ⇒ the retry clause is dropped, the count stays.
+	noStamp := base
+	noStamp.RecoveryRetryNotBefore = nil
+	if got := forgeParkLine(noStamp); got != "waiting for the forge (2 of 5)" || strings.Contains(got, "retry at") {
+		t.Errorf("forgeParkLine(no stamp) = %q, want no retry clause", got)
+	}
+
+	// isForgePark keys off BOTH the status and the cause: a forge cause on a non-recovery
+	// status is not a forge park, and a null/other cause on a recovery_wait run is not one.
+	if !isForgePark(base) {
+		t.Error("isForgePark(recovery_wait + forge_unreachable) = false, want true")
+	}
+	notRecovering := base
+	notRecovering.Status = "running"
+	if isForgePark(notRecovering) {
+		t.Error("isForgePark(running + forge_unreachable) = true — a forge park is a recovery_wait run")
+	}
+	emptyTurn := apitypes.RunDTO{Status: statusRecoveryWait}
+	if isForgePark(emptyTurn) {
+		t.Error("isForgePark(recovery_wait + null cause) = true — the empty-turn park is not a forge park")
+	}
+}
+
 // TestLimitWaitLineSanitizesTheRateLimitType is the Risk 13 half.
 //
 // rate_limit_type is server-allowlisted today, which is exactly why this test states
@@ -1303,6 +1354,20 @@ func TestSteerStateOnAParkedRun(t *testing.T) {
 	}
 	if got := steerState(kindFollowUp, &consumed, nil, statusRecoveryWait); !strings.HasPrefix(got, "delivered") || !strings.Contains(got, "recovering") {
 		t.Errorf("steerState(consumed, recovery_wait) = %q, want a delivered row naming the transient-recovery park", got)
+	}
+
+	// PRD #1392 M5: a forge-unreachable recovery park names the FORGE, not the transient
+	// empty turn — the queue state is still unchanged. The empty/other cause keeps the
+	// #1197 wording above (the variadic tail defaults to it).
+	if got := steerState(kindFollowUp, nil, nil, statusRecoveryWait, "forge_unreachable"); !strings.HasPrefix(got, "queued") || !strings.Contains(got, "waiting for the forge") {
+		t.Errorf("steerState(unconsumed, recovery_wait, forge) = %q, want a queued row naming the forge park", got)
+	}
+	if got := steerState(kindFollowUp, &consumed, nil, statusRecoveryWait, "forge_unreachable"); !strings.HasPrefix(got, "delivered") || !strings.Contains(got, "waiting for the forge") {
+		t.Errorf("steerState(consumed, recovery_wait, forge) = %q, want a delivered row naming the forge park", got)
+	}
+	// A forge park must NOT keep the transient-empty-turn wording.
+	if got := steerState(kindFollowUp, nil, nil, statusRecoveryWait, "forge_unreachable"); strings.Contains(got, "transient empty turn") {
+		t.Errorf("steerState forge park = %q, still names the transient empty turn", got)
 	}
 
 	// Every other status is untouched.

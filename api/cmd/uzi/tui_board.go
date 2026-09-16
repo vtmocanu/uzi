@@ -132,7 +132,7 @@ func (b *boardState) visible() []apitypes.RunListItemDTO {
 			// #321 hides) plus the human word, so a user can filter by either "awaiting_approval"
 			// or "plan gate". The truly-raw r.Status is deliberately NOT included: it would let
 			// "running" match a planning run again, the exact thing #321 fixed.
-			_, word := stateGlyphWord(r.Status, r.Health, r.IsPlanning, r.IsRevising)
+			_, word := stateGlyphWord(r.Status, r.Health, r.IsPlanning, r.IsRevising, strOr(r.RecoveryWaitCause, ""))
 			hay := strings.ToLower(strings.Join([]string{
 				r.ID, r.Kind, effectiveRunStatus(r.Status, r.IsPlanning, r.IsRevising),
 				word, r.Health, cellText(runTitle(r.RunDTO)),

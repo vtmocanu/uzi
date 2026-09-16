@@ -103,3 +103,40 @@ only current work copy could be deleted. The decision above requires
 verified capture or retained-source retry instead. Additional red/green
 regressions cover cancellation reporting, restart recovery, duplicate-claim
 cleanup serialization and message-cursor refresh.
+
+## Amendment 2026-09-16 — PRD #1392: a pre-clone park is the exception to "verified capture first"
+
+**Status**: Accepted (PRD #1392 M1-M4 committed on this branch).
+**Issue**: [vtmocanu/uzi#1392](https://github.com/vtmocanu/uzi/issues/1392)
+**PRD**: [prds/1392-forge-unreachable-preclone-park.md](../prds/1392-forge-unreachable-preclone-park.md)
+
+"Verified capture before a promotable park" above assumes a clone already
+exists to inspect, WIP-commit and fetch. That assumption does not hold for
+a transient forge failure (DNS, connect, or a 5xx) hit *while cloning* — a
+run resumed from any park re-clones on every resume, so the same exposure
+recurs on every such resume, not only on first dispatch.
+
+When `ensureClone` exhausts its retry schedule with a transient verdict,
+there is no runner clone, no worktree, no branch and no recovery journal
+yet (`phaseClone` reports `running` and starts steering before any of those
+exist). There is therefore **nothing to capture, verify, or retain a source
+for**: the worker reports `recovery_wait` with cause `forge_unreachable`
+directly, with no capture attempt and no retry-while-owned loop, because
+there is no local work a retry could lose. This is the one park path in
+this ADR's scope that enters `recovery_wait` without a verified capture,
+and it does so precisely because "verified" and "unverified" both presume
+a capture target that does not exist here.
+
+Everything else stands: a permanent forge error still fails immediately
+(no retry can fix bad credentials or a missing repo), an owner cancel
+during the retries still ends `cancelled`, and the promotion cadence is
+the same `recovery_wait` sweeper this ADR already describes. What differs
+is only the *entry* condition and a forge-only lifetime cap this cause
+adds on top (`RUN_FORGE_UNREACHABLE_MAX_PARKS`) — the empty-turn park
+above keeps its uncapped lifetime, unchanged. See
+[adr/1296-durable-run-recovery.md](1296-durable-run-recovery.md) (the
+2026-09-16 PRD #1392 amendment) for the matching custody-side exception —
+a generation that never adopted a source releases its hold without the
+forge proof this ADR's sibling amendments otherwise require — and
+[adr/1392-forge-unreachable-preclone-park.md](1392-forge-unreachable-preclone-park.md)
+for the full decision record.
