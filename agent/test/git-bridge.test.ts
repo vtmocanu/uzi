@@ -151,6 +151,62 @@ describe("GitCache.bridgeToFloors (PRD #1416 M3)", () => {
     assert.strictEqual(await git.bridgeToFloors(repo, H, []), null);
     assert.strictEqual(await git.bridgeToFloors(repo, H, ["nope"]), null);
   });
+
+  it("is IDEMPOTENT on an idle re-bridge: a prior bridge B1 passed as an additional floor is SKIPPED (no nesting)", async () => {
+    // FIX 1 (#1416) — the nested-bridge accumulation guard. B1 bridges the divergent H over [P].
+    const { P, H } = rootPublishedAndDivergent();
+    const B1 = await git.bridgeToFloors(repo, H, [P]);
+    assert.ok(B1 && OID.test(B1));
+    // A later idle checkpoint tick re-bridges the SAME unchanged H, now with C === B1 as an
+    // additional floor. B1's tree === H's tree, so it contributes no unique content and is skipped —
+    // the result is byte-identical to B1, NOT a new nested commit.
+    const B2 = await git.bridgeToFloors(repo, H, [P, B1!]);
+    assert.strictEqual(B2, B1, "an idle re-bridge of an unchanged H yields the identical B (no growth)");
+    // B2 has EXACTLY the two parents H and P — B1 was NOT appended as a third parent.
+    assert.strictEqual(gitIn(repo, ["rev-parse", `${B2}^1`]), H, "first parent is H");
+    assert.strictEqual(gitIn(repo, ["rev-parse", `${B2}^2`]), P, "second parent is P");
+    assert.throws(() => gitIn(repo, ["rev-parse", `${B2}^3`]), "no third parent (B1 skipped as tree-equal)");
+  });
+
+  it("NEVER skips the published floor floors[0] on the tree-equal basis (P stays an ancestor of B)", async () => {
+    // A published floor P whose tree coincides with H's tree must STILL be appended: build P as a
+    // tree-preserving sibling of the root so P^{tree} === H^{tree}, then bridge H over [P].
+    const R = commit("base.txt", "base\n", "root");
+    const rootTree = gitIn(repo, ["rev-parse", `${R}^{tree}`]);
+    // P: an empty commit on R (tree unchanged = rootTree), a sibling-less advance so it is a real tip.
+    gitIn(repo, [...IDENT, "commit", "--allow-empty", "-m", "published (tree unchanged)"]);
+    const P = gitIn(repo, ["rev-parse", "HEAD"]);
+    // H: a DIVERGENT sibling of P on R that ALSO leaves the tree unchanged (empty commit) → H^{tree}
+    // === rootTree === P^{tree}, yet P is not an ancestor of H.
+    gitIn(repo, ["checkout", "-b", "h", R]);
+    gitIn(repo, [...IDENT, "commit", "--allow-empty", "-m", "divergent (tree unchanged)"]);
+    const H = gitIn(repo, ["rev-parse", "HEAD"]);
+    assert.strictEqual(gitIn(repo, ["rev-parse", `${H}^{tree}`]), rootTree, "H's tree === root tree");
+    assert.strictEqual(gitIn(repo, ["rev-parse", `${P}^{tree}`]), rootTree, "P's tree === root tree");
+    const B = await git.bridgeToFloors(repo, H, [P]);
+    assert.ok(B && OID.test(B), "a bridge is built even though P's tree coincides with H's");
+    assert.strictEqual(gitIn(repo, ["rev-parse", `${B}^2`]), P, "P (floors[0]) is still an extra parent");
+    assert.ok(isAncestor(P, B!), "P remains an ancestor of B");
+    assert.ok(isAncestor(H, B!), "H remains an ancestor of B");
+  });
+
+  it("still appends an ADDITIONAL floor whose tree DIFFERS from the tip's tree", async () => {
+    // The complement of the idempotency guard: a floor with genuinely different tree content must
+    // NOT be skipped — this is the legitimate one-per-rewrite chaining the plan permits.
+    const R = commit("base.txt", "base\n", "root");
+    const P = commit("p.txt", "p\n", "published");
+    const C = commit("c.txt", "c\n", "checkpoint above P"); // C's tree adds c.txt → differs from H's
+    gitIn(repo, ["checkout", "-b", "h", R]);
+    const H = commit("impl.ts", "1\n", "diverges below P");
+    const B = await git.bridgeToFloors(repo, H, [P, C]);
+    assert.ok(B && OID.test(B));
+    assert.strictEqual(gitIn(repo, ["rev-parse", `${B}^2`]), P, "P appended");
+    assert.strictEqual(
+      gitIn(repo, ["rev-parse", `${B}^3`]),
+      C,
+      "the tree-differing additional floor C is still appended",
+    );
+  });
 });
 
 describe("GitCache.rangeContainsBridge (PRD #1416 M3 — the structure-validated detector)", () => {
@@ -275,5 +331,57 @@ describe("GitCache.rangeContainsBridge (PRD #1416 M3 — the structure-validated
     })();
     const H = commit("impl.ts", "1\n", "clean fast-forward work"); // descends from P, no bridge
     assert.strictEqual(await git.rangeContainsBridge(repo, P, H), false);
+  });
+
+  it("is NOT fooled by a 0x1e byte embedded in a commit body (NUL-separated parse — FIX 5, #1416)", async () => {
+    // git round-trips 0x1e (the old record separator) AND 0x1f (the old field separator) in a commit
+    // MESSAGE, so a crafted body could inject a phantom record under the OLD 0x1e/0x1f-split parse.
+    // The NUL-based parse cannot be split by any byte a body can contain, so the phantom is inert.
+    // Built from \u escapes at RUNTIME — never a raw control byte in THIS source.
+    const RS = "\u001e";
+    const US = "\u001f";
+    const R = commit("base.txt", "base\n", "root");
+    const P = commit("p.txt", "p\n", "published");
+    // D: a divergent sibling of P whose tree the phantom masquerades as a bridge over.
+    gitIn(repo, ["checkout", "-b", "d", R]);
+    const D = commit("d.ts", "1\n", "divergent sibling D");
+    const dTree = gitIn(repo, ["rev-parse", `${D}^{tree}`]);
+    // M: the carrier — a divergent sibling of P (so P..M = {M}) whose BODY embeds a phantom bridge
+    // record. Under the OLD parse the injected 0x1e would start a fake record that parses as a valid
+    // worker bridge (tree === D's; extra parent P descends from P; P not an ancestor of D) → true,
+    // fooled. Under the NUL parse it all stays inside M's single body field, and M itself is not a
+    // bridge (its own tree differs from its parent's) → false.
+    gitIn(repo, ["checkout", "-b", "m", R]);
+    fs.writeFileSync(path.join(repo, "m.ts"), "1\n");
+    gitIn(repo, ["add", "."]);
+    const phantomBody =
+      `real work${RS}junkH${US}${dTree}${US}${D} ${P}${US}` +
+      `bridge: restore published tip ${P} as an ancestor of ${D} (tree unchanged)`;
+    gitIn(repo, [...IDENT, "commit", "-m", phantomBody]);
+    const M = gitIn(repo, ["rev-parse", "HEAD"]);
+    // Sanity: git preserved the 0x1e byte in the stored body (the exact case the fix hardens).
+    assert.ok(
+      gitIn(repo, ["log", "-1", "--format=%B", M]).includes(RS),
+      "the 0x1e byte round-tripped into the stored body",
+    );
+    assert.strictEqual(
+      await git.rangeContainsBridge(repo, P, M),
+      false,
+      "the phantom record injected via 0x1e does not fool the NUL-separated parse",
+    );
+  });
+
+  it("ACCEPTS a genuine agent bridge whose body CONTAINS a 0x1e byte (parse not corrupted — FIX 5)", async () => {
+    const RS = "\u001e"; // runtime byte from a printable escape
+    const { P } = rootPublishedAndDivergent(); // working tree on `h` at H
+    // A genuine agent `-s ours` bridge, but with a 0x1e byte in its message: the NUL parse keeps the
+    // whole body in one field, so the bridge is still detected by its structure (tree + extra parent).
+    gitIn(repo, [...IDENT, "merge", "-s", "ours", P, "-m", `restore${RS}published tip`]);
+    const B = gitIn(repo, ["rev-parse", "HEAD"]);
+    assert.ok(
+      gitIn(repo, ["log", "-1", "--format=%B", B]).includes(RS),
+      "the 0x1e byte round-tripped into the stored body",
+    );
+    assert.strictEqual(await git.rangeContainsBridge(repo, P, B), true);
   });
 });

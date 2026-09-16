@@ -204,6 +204,13 @@ export class RecoveryBundleTooLargeError extends Error {
 // backstop) rather than read into memory. 16 MiB holds far more findings than any honest push.
 const SECRET_SCAN_REPORT_MAX_BYTES = 16 * 1024 * 1024;
 
+// PRD #1416 M3 — cap on the EXTRA parents (beyond the first) a worker-bridge marker candidate may
+// carry in rangeContainsBridge before it is rejected outright. A legitimate bridge has at most 2
+// (the published floor P and the checkpoint floor C); the per-parent validation spawns ~2
+// `isAncestor` git subprocesses per extra parent, so an attacker-crafted commit with many distinct
+// descendant-of-P parents would stall the run's own finalize. 8 is a safe headroom over 2.
+const BRIDGE_MAX_EXTRA_PARENTS = 8;
+
 // PRD #51 M3 — (b) separate-runner-clone: the worker-side tracking-ref namespace the
 // worker's fetch-back writes the agent branch into. Deliberately NOT refs/heads/* (B2
 // invariant 2: the runner's branch is admitted only into a demarcated worker-side
@@ -3103,21 +3110,37 @@ export class GitCache {
     const OID = /^[0-9a-f]{40}$/;
     if (!OID.test(tip) || floors.length === 0 || !OID.test(floors[0]!)) return null;
     try {
+      // B's tree === H's tree, byte-identical: a tree OID is content-addressed, so committing onto
+      // `tip^{tree}` reproduces H's tree exactly (no read-tree/write-tree round-trip needed). Read it
+      // up front because the nested-bridge guard below also compares each additional floor's tree to
+      // it.
+      const tipTree = (await this.runGit(barePath, ["rev-parse", `${tip}^{tree}`])).trim();
+      if (!OID.test(tipTree)) return null;
       // Only floors NOT already reachable from H become extra parents (a floor already an ancestor
       // needs no bridge parent). "divergent" is the only positive signal — "unknown" (a transient
       // read) and "ancestor" both mean "do not append", so a broken read never synthesises a
       // spurious parent.
+      //
+      // #1416 M3 — nested-bridge accumulation guard. An ADDITIONAL floor (index > 0, e.g. the
+      // checkpoint floor C, which after a prior divergent tick IS the prior bridge B_prev) whose
+      // tree equals H's tree contributes NO unique tree content: appending it only NESTS one commit
+      // per divergent tick — INCLUDING idle ticks where H is unchanged — bloating the pushed history.
+      // Skip any such tree-equal additional floor. NEVER skip the published floor floors[0] (P) on
+      // this basis: P must remain an ancestor of B even when its tree coincides with H's. Skipping the
+      // tree-equal prior bridge keeps the identity deterministic — re-bridging the SAME divergent H
+      // yields the SAME sha (idempotent), so an idle re-bridge produces no growth, while a genuinely
+      // different H (a different tree) still chains once (the plan's "acceptable" one-per-rewrite).
       const missing: string[] = [];
-      for (const floor of floors) {
-        if (OID.test(floor) && (await this.ancestry(barePath, floor, tip)) === "divergent") {
-          missing.push(floor);
+      for (let i = 0; i < floors.length; i++) {
+        const floor = floors[i]!;
+        if (!OID.test(floor) || (await this.ancestry(barePath, floor, tip)) !== "divergent") continue;
+        if (i > 0) {
+          const floorTree = (await this.tryGitStdout(barePath, ["rev-parse", `${floor}^{tree}`])).trim();
+          if (OID.test(floorTree) && floorTree === tipTree) continue; // tree-equal prior bridge — no unique content
         }
+        missing.push(floor);
       }
       if (missing.length === 0) return null; // nothing was actually missing — nothing to bridge
-      // B's tree === H's tree, byte-identical: a tree OID is content-addressed, so committing onto
-      // `tip^{tree}` reproduces H's tree exactly (no read-tree/write-tree round-trip needed).
-      const tipTree = (await this.runGit(barePath, ["rev-parse", `${tip}^{tree}`])).trim();
-      if (!OID.test(tipTree)) return null;
       // Deterministic committer/author date = H's own committer date (buildWorkflowOverlay's rule),
       // so a re-bridge of the same H over the same floors yields the same OID.
       const committerDate = (await this.runGit(barePath, ["show", "-s", "--format=%cI", tip])).trim();
@@ -3166,8 +3189,10 @@ export class GitCache {
    *
    *  1. WORKER bridge (carries the deterministic {@link bridgeToFloors} marker). Parse X and Y
    *     (40-hex) from the marker and require ALL of: `X === publishedTip` (this run's P); `Y ===`
-   *     the commit's FIRST parent; the commit's tree === its first-parent's tree; ≥1 EXTRA parent
-   *     (beyond the first); EVERY extra parent descends from `publishedTip`; and ≥1 extra parent is
+   *     the commit's FIRST parent; the commit's tree === its first-parent's tree; between 1 and
+   *     {@link BRIDGE_MAX_EXTRA_PARENTS} EXTRA parents (beyond the first — a legitimate bridge has at
+   *     most P and C, and a candidate over the bound is rejected WITHOUT scanning its parents, #1416);
+   *     EVERY extra parent descends from `publishedTip`; and ≥1 extra parent is
    *     NOT already an ancestor of Y. A marker present but any check failing is REJECTED (never
    *     re-checked as the markerless form).
    *  2. AGENT safety bridge (no marker — the M2 steer had the agent run `git merge -s ours <P>`).
@@ -3188,18 +3213,22 @@ export class GitCache {
   ): Promise<boolean> {
     const OID = /^[0-9a-f]{40}$/;
     if (!OID.test(publishedTip) || !OID.test(pushedTip)) return false;
-    // Field/record separators: git emits the bytes 0x1f/0x1e via its own `%x1f`/`%x1e` format
-    // specifiers (plain ASCII in THIS source); we split the OUTPUT on the same bytes, written as
-    // printable \u escapes (never raw control bytes in source). A commit message never contains
-    // either byte, so %B (last field) is unambiguous.
-    const US = "\u001f";
-    const RS = "\u001e";
+    // Field AND record separators: NUL (`%x00`) — the ONE byte git FORBIDS in a commit message.
+    // 0x1f/0x1e are NOT forbidden (git round-trips both), so a crafted %B carrying either byte could
+    // inject a fake field/record separator and mis-split the parse — that was the prior bug. NUL can
+    // never appear in %B, so the body (always the LAST field of a record) cannot corrupt the parse.
+    // `-z` NUL-terminates each commit entry too, so there is no inter-commit newline to strip: the
+    // whole output is a flat NUL-delimited token stream, and every record is exactly four fields
+    // (%H,%T,%P,%B) — grouped in fours unambiguously. NUL is written as a printable \u escape here
+    // (never a raw control byte in source).
+    const NUL = "\u0000";
     let raw: string;
     try {
       raw = await this.runGit(barePath, [
         "log",
         "--first-parent",
-        "--format=%H%x1f%T%x1f%P%x1f%B%x1e",
+        "-z",
+        "--format=%H%x00%T%x00%P%x00%B",
         `${publishedTip}..${pushedTip}`,
       ]);
     } catch {
@@ -3207,14 +3236,13 @@ export class GitCache {
     }
     const markerRe =
       /bridge: restore published tip ([0-9a-f]{40}) as an ancestor of ([0-9a-f]{40}) \(tree unchanged\)/;
-    for (const record of raw.split(RS)) {
-      const rec = record.replace(/^\s+/, "");
-      if (rec.length === 0) continue;
-      const fields = rec.split(US);
-      if (fields.length < 4) continue;
-      const tree = fields[1]!.trim();
-      const parents = fields[2]!.trim().split(/\s+/).filter((p) => OID.test(p));
-      const body = fields[3]!;
+    // Each record is exactly four fields (%H,%T,%P,%B); the trailing NUL from `-z` yields one empty
+    // trailing token, which the `i + 3 < tokens.length` bound skips.
+    const tokens = raw.split(NUL);
+    for (let i = 0; i + 3 < tokens.length; i += 4) {
+      const tree = tokens[i + 1]!.trim();
+      const parents = tokens[i + 2]!.trim().split(/\s+/).filter((p) => OID.test(p));
+      const body = tokens[i + 3]!;
       const firstParent = parents[0];
       if (!firstParent || !OID.test(tree)) continue;
       const extras = parents.slice(1);
@@ -3229,7 +3257,17 @@ export class GitCache {
         // is rejected outright (never re-checked as the markerless agent form).
         const X = m[1]!;
         const Y = m[2]!;
-        if (X !== publishedTip || Y !== firstParent || !treeEqualsFirstParent || extras.length < 1) {
+        // #1416 M3 — reject a marker candidate with MORE than a small bound of extra parents OUTRIGHT
+        // (do not scan all parents): a legitimate bridge has at most 2 (P and C), and the per-parent
+        // scan below spawns ~2 isAncestor git subprocesses per extra parent, so a crafted commit with
+        // many descendant-of-P parents would otherwise stall the run's finalize.
+        if (
+          X !== publishedTip ||
+          Y !== firstParent ||
+          !treeEqualsFirstParent ||
+          extras.length < 1 ||
+          extras.length > BRIDGE_MAX_EXTRA_PARENTS
+        ) {
           continue;
         }
         let allDescend = true;

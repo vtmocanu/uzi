@@ -5239,22 +5239,47 @@ export class RunRunner {
       return { kind: "failed" };
     }
     // VALIDATE B before adopting it: tree byte-equal to H's, and P and H both ancestors of B.
+    // #1416 M3 — distinguish a TRANSIENT/UNKNOWN read from a DEFINITIVE validation failure. A
+    // revParse that returns null (a broken/transient read) or an `ancestry` that returns "unknown"
+    // is NOT proof that B is malformed; at the finalize sinks a "failed" throws HistoryRewrittenError
+    // and fails the whole run, so a transient read must NOT hard-fail it. Only a DEFINITIVELY
+    // malformed B fails: its tree RESOLVES and differs from H's, OR `ancestry` DEFINITIVELY reports
+    // "divergent" (P or H provably NOT an ancestor of B). A transient/unknown read → "unknown"
+    // (best-effort: do not adopt B, do not throw at finalize).
     const bridgeTree = await this.git.revParse(barePath, `${bridge}^{tree}`);
     const hTree = await this.git.revParse(barePath, `${H}^{tree}`);
-    const treeOk = bridgeTree !== null && hTree !== null && bridgeTree === hTree;
-    const pOk = (await this.git.ancestry(barePath, publishedTip, bridge)) === "ancestor";
-    const hOk = (await this.git.ancestry(barePath, H, bridge)) === "ancestor";
-    if (!treeOk || !pOk || !hOk) {
-      runLog.warn("PRD #1416 M3: bridge failed validation; NOT adopting it", {
+    const pRel = await this.git.ancestry(barePath, publishedTip, bridge);
+    const hRel = await this.git.ancestry(barePath, H, bridge);
+    // A tree read that could not resolve is transient; a resolved-but-different tree is definitive.
+    const treeUnknown = bridgeTree === null || hTree === null;
+    const treeMismatch = !treeUnknown && bridgeTree !== hTree;
+    const definitiveFail = treeMismatch || pRel === "divergent" || hRel === "divergent";
+    const transientUnknown = treeUnknown || pRel === "unknown" || hRel === "unknown";
+    if (definitiveFail) {
+      runLog.warn("PRD #1416 M3: bridge is definitively malformed; NOT adopting it", {
         run_id: flight.runId,
         published_tip: publishedTip,
         tip: H,
         bridge,
-        tree_ok: treeOk,
-        p_ancestor: pOk,
-        h_ancestor: hOk,
+        tree_mismatch: treeMismatch,
+        p_ancestry: pRel,
+        h_ancestry: hRel,
       });
       return { kind: "failed" };
+    }
+    if (transientUnknown) {
+      // A broken/transient read during validation: do NOT adopt B, but do NOT fail the run either
+      // (the finalize sinks would throw). Best-effort — the caller leaves the tracking ref at H.
+      runLog.warn("PRD #1416 M3: bridge validation read was transient/unknown; NOT adopting it (best-effort)", {
+        run_id: flight.runId,
+        published_tip: publishedTip,
+        tip: H,
+        bridge,
+        tree_unknown: treeUnknown,
+        p_ancestry: pRel,
+        h_ancestry: hRel,
+      });
+      return { kind: "unknown" };
     }
     // Adopt B: advance the bare tracking ref (worker-uid) and the checkpoint floor C.
     try {
@@ -7382,11 +7407,15 @@ export function mrDescription(
   bridged = false,
 ): string {
   const footer = `Opened automatically by the uzi agent from branch \`${branch}\`. Please review and merge manually — the agent never merges.`;
-  // One generic sentence, appended to whichever body arm runs below (a per-kind body or the issue
-  // body) so the note is path- AND kind-independent. Empty when not bridged (body unchanged).
-  const bridgeNote = bridged
-    ? "\n\nThis branch contains a history bridge: a published commit was restored as an ancestor so the branch fast-forwards without a force-push, and `git log --first-parent` still reads as the intended history."
+  // One generic sentence, rendered into whichever body arm runs below (a per-kind body or the issue
+  // body) so the note is path- AND kind-independent. Empty when not bridged (body unchanged). #1416
+  // FIX 6: the issue arm renders it WITHIN the body (before the `---` footer); the bridgeNote form
+  // (with its leading blank line) is kept for the per-kind arm, which appends it to a body that
+  // already carries its own footer.
+  const bridgeSentence = bridged
+    ? "This branch contains a history bridge: a published commit was restored as an ancestor so the branch fast-forwards without a force-push, and `git log --first-parent` still reads as the intended history."
     : "";
+  const bridgeNote = bridgeSentence ? `\n\n${bridgeSentence}` : "";
   const repoMarker =
     agentSelection?.source === "repo"
       ? [
@@ -7473,8 +7502,10 @@ export function mrDescription(
   }
   const gatesSection = gatesUnverifiedMrSection(gatesUnverified, gatesDiscoveryTruncated);
   if (gatesSection) body.push("", gatesSection);
+  // #1416 FIX 6: render the bridge sentence WITHIN the body, before the `---` footer.
+  if (bridgeSentence) body.push("", bridgeSentence);
   body.push("", "---", footer);
-  return body.join("\n") + bridgeNote;
+  return body.join("\n");
 }
 
 /** Issue #293 M2: an "unverified gates" note for the MR body, or "" when every

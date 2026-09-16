@@ -429,4 +429,63 @@ describe("RunRunner.bridgeBareTrackingRefIfDivergent (PRD #1416 M3 — the share
       (git as unknown as { ancestry: unknown }).ancestry = origAncestry;
     }
   });
+
+  it("returns 'failed' when the built bridge is DEFINITIVELY malformed (tree resolves but differs from H's) — FIX 3", async () => {
+    const { gitlab } = fakeGitlab();
+    const branch = "feature/helper-validate-fail";
+    const P = publishBranch(branch);
+    const bare = await git.ensureClone(fx.originPath);
+    const rc = await git.runnerCloneForBranch(bare, branch, "feature-hvf", "R1");
+    fs.writeFileSync(path.join(rc.path, "REWRITE.md"), "rewrite\n");
+    gitIn(rc.path, ["add", "."]);
+    gitIn(rc.path, [...IDENT, "commit", "--amend", "--no-edit"]);
+    const H = gitIn(rc.path, ["rev-parse", "HEAD"]);
+    await git.fetchAgentBranch(bare, rc.path, branch, "R1"); // tracking ref = divergent H
+    const tipBefore = await git.trackingTip(bare, branch);
+
+    // A malformed "bridge": parents H and P (so BOTH are definitively ancestors) but P's tree, NOT
+    // H's → the tree-equality check must fail DEFINITIVELY (both trees resolve and differ). Stub
+    // bridgeToFloors to return it so only the tree-mismatch decides the verdict.
+    const pTree = gitIn(bare, ["rev-parse", `${P}^{tree}`]);
+    const malformed = gitIn(bare, [...IDENT, "commit-tree", pTree, "-p", H, "-p", P, "-m", "wrong-tree bridge"]);
+    const origBridge = git.bridgeToFloors.bind(git);
+    (git as unknown as { bridgeToFloors: unknown }).bridgeToFloors = async () => malformed;
+    try {
+      const flight = { runId: "R1", publishedTip: P, checkpointFloor: P };
+      const r = runner({ run: async (c) => ({ branch: c.branch }) }, gitlab);
+      const outcome = await callBridge(r, bare, branch, flight);
+      assert.strictEqual(outcome.kind, "failed", "a tree-mismatched bridge is a definitive failure");
+      assert.strictEqual(await git.trackingTip(bare, branch), tipBefore, "a failed validation never advances the ref");
+    } finally {
+      (git as unknown as { bridgeToFloors: unknown }).bridgeToFloors = origBridge;
+    }
+  });
+
+  it("returns 'unknown' (never 'failed') when a validation READ is transient (revParse null) — FIX 3", async () => {
+    const { gitlab } = fakeGitlab();
+    const branch = "feature/helper-validate-unknown";
+    const P = publishBranch(branch);
+    const bare = await git.ensureClone(fx.originPath);
+    const rc = await git.runnerCloneForBranch(bare, branch, "feature-hvu", "R1");
+    fs.writeFileSync(path.join(rc.path, "REWRITE.md"), "rewrite\n");
+    gitIn(rc.path, ["add", "."]);
+    gitIn(rc.path, [...IDENT, "commit", "--amend", "--no-edit"]);
+    await git.fetchAgentBranch(bare, rc.path, branch, "R1"); // tracking ref = divergent H
+    const tipBefore = await git.trackingTip(bare, branch);
+
+    // The divergence detection + the REAL bridge build both run; only the post-build validation's
+    // tree read is stubbed transient (revParse → null). That must map to 'unknown', NOT 'failed' —
+    // a finalize sink turns 'failed' into a thrown HistoryRewrittenError that would fail the run.
+    const origRevParse = git.revParse.bind(git);
+    (git as unknown as { revParse: unknown }).revParse = async () => null;
+    try {
+      const flight = { runId: "R1", publishedTip: P, checkpointFloor: P };
+      const r = runner({ run: async (c) => ({ branch: c.branch }) }, gitlab);
+      const outcome = await callBridge(r, bare, branch, flight);
+      assert.strictEqual(outcome.kind, "unknown", "a transient validation read maps to unknown, not failed");
+      assert.strictEqual(await git.trackingTip(bare, branch), tipBefore, "a transient read never advances the ref");
+    } finally {
+      (git as unknown as { revParse: unknown }).revParse = origRevParse;
+    }
+  });
 });
