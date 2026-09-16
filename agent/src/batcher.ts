@@ -217,8 +217,10 @@ export interface MessageBatcherOptions {
   /**
    * The claim generation these messages were produced under (PRD #1391 D11). Stamped
    * on every spilled segment/range so replay can ride it under #1247's fence, and
-   * passed to `postMessages` for the network flush/bisection paths (sent on the wire
-   * only once the api advertises `claim_generation_fence`). Default 0.
+   * passed to `postMessages` for the network flush/bisection paths (which send it on the
+   * wire when a credential_switch_v1 capability worker stamps optimistically, or a
+   * non-capability worker once the api advertises `claim_generation_fence`; see client.ts
+   * `includeClaimGeneration`). Default 0.
    */
   generation?: number;
   /**
@@ -1222,8 +1224,9 @@ function tombstoneMessage(msg: OutgoingMessage, event: TombstoneEvent, reason: s
  * message: the poison is tombstoned and the rest still lands ("today's bisection
  * semantics against a segment"), and this resolves so the outbox retires the record.
  *
- * `generation` rides `postMessages`, which sends it on the wire only once the api
- * advertises `claim_generation_fence` (inert under Run A's own api). A crash
+ * `generation` rides `postMessages`, which sends it on the wire when a
+ * credential_switch_v1 capability worker stamps optimistically, or a non-capability
+ * worker once the api advertises `claim_generation_fence`. A crash
  * mid-split leaves the record un-retired (the cursor is unchanged), so restart
  * re-drains the whole record — already-delivered seqs dedupe on (run_id, seq).
  */

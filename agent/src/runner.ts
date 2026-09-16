@@ -1497,8 +1497,9 @@ export class RunRunner {
    *      transaction — the worker calls no release endpoint).
    *   - `recovery_release_exact_echo` (but NOT recovery_park_cause) → the older-api fallback: an
    *      older api's park touches no custody (fact 13), so first prove an EXACT-generation release
-   *      (released && generation===gen && holds_released===1), then send the UNTYPED report,
-   *      keeping claim_generation IFF `claim_generation_fence` is advertised. Missing proof (or a
+   *      (released && generation===gen && holds_released===1), then send the UNTYPED report, which
+   *      still carries claim_generation — the reportState closure (M5b) stamps it UNCONDITIONALLY,
+   *      NOT gated on `claim_generation_fence`. Missing proof (or a
    *      release throw) → today's failed path, never a leaked hold.
    *   - neither token → negotiate nothing, take today's failed path.
    *
@@ -1565,7 +1566,7 @@ export class RunRunner {
         return "fail";
       }
       // With proof, send the UNTYPED recovery_wait report; the flight reportState closure it routes
-      // through (reportForgeParkAndDispatch) stamps claim_generation unconditionally (PRD #1247 M2).
+      // through (reportForgeParkAndDispatch) stamps claim_generation unconditionally (PRD #1247 M5b).
       const body: StateRequest = { status: "recovery_wait" };
       return await this.reportForgeParkAndDispatch(body, claim, flight, reportState, runLog, runHome);
     }

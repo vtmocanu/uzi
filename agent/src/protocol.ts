@@ -353,7 +353,9 @@ export interface RegisterResponse {
    *  "recovery_release_exact_echo"]`; #1391's api adds `heartbeat_outbox`; a future api may
    *  also advertise `claim_generation_fence` / `terminal_fence`. OPTIONAL and OMITTED
    *  ENTIRELY by an OLDER api (which returns only `worker_id`) — an absent field decodes as
-   *  "no features", so the worker negotiates nothing and sends today's byte-identical wire. */
+   *  "no features", so the worker negotiates nothing extra — EXCEPT that a
+   *  `credential_switch_v1` CAPABILITY worker still stamps `claim_generation` optimistically,
+   *  regardless of the advertised features (see `MessagesRequest.claim_generation`). */
   protocol_features?: string[];
 }
 
@@ -1595,12 +1597,16 @@ export interface MessagesRequest {
   messages: OutgoingMessage[];
   /**
    * The claim generation these messages were produced under (PRD #1391 M2 / #1247
-   * fence, D11). Sent ONLY once the server advertises `claim_generation_fence` in
-   * `RegisterResponse.protocol_features` AND the caller supplies a generation
-   * (client.ts gates both), so today's api — which strict-decodes and would 400 an
-   * unknown field — never sees it and the messages wire stays byte-identical. Run A's
-   * api never advertises the feature, so this rides only under a fenced api / the
-   * negotiation tests.
+   * fence, D11). Sent when the caller supplies a generation > 0 AND either this image
+   * advertised the `credential_switch_v1` capability OR the server advertised the
+   * `claim_generation_fence` feature (client.ts `includeClaimGeneration`): a
+   * `credential_switch_v1` capability worker stamps OPTIMISTICALLY — regardless of the
+   * negotiated feature, since its runs are fenced server-side and a one-shot register
+   * may have missed the feature under rollout skew — while a non-capability (#1391-era)
+   * worker keeps the feature gate. `0` is chat's legacy sentinel and is NEVER sent. On
+   * the EXACT strict-decode 400 from a rolled-back api the field is stripped and the
+   * batch retried ONCE — non-sticky for a capability worker (it stays optimistic, so the
+   * next batch self-recovers), sticky/clearFeatures for a non-capability worker.
    */
   claim_generation?: number;
 }
@@ -1794,10 +1800,10 @@ export interface StateRequest {
   status: RunState;
   /** PRD #1392 M2 (#1247 generation fence): the exact claim generation THIS report is made
    *  against, so the api's park transaction settles only the hold that generation opened. Sent on
-   *  the forge-unreachable park report; the #1247 reportState closure also stamps it on every
-   *  in-flight mutating report so the server's per-query fence engages; also kept on the older-api
-   *  untyped fallback report ONLY when the api advertised `claim_generation_fence` (D7). Additive +
-   *  optional. */
+   *  the forge-unreachable park report; the #1247 reportState closure (M5b) stamps it
+   *  UNCONDITIONALLY on every in-flight mutating report — including the older-api untyped forge-park
+   *  fallback — so the server's per-query fence engages. It is NOT gated on the
+   *  `claim_generation_fence` feature here. Additive + optional. */
   claim_generation?: number;
   /** awaiting_approval carries the captured plan; an autopilot `running` report also
    *  carries it, persisted durably via SetRunAutopilotPlan (RC1 #1197). */
