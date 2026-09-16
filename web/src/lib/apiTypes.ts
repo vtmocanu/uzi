@@ -1576,6 +1576,12 @@ export interface ScheduleInput {
   // list omits it), mirroring RepoID's create-vs-PATCH asymmetry. `interface Schedule`
   // carries the read-side `sibling_group_id` (M3) separately; this is the write-side input.
   sibling_group_id?: string;
+  // PRD #1247 M6/M7: the schedule's per-run Anthropic credential override (D5). The
+  // write shape is {mode, secret_id?}, distinct from the read-side `Schedule.credential_override`
+  // ({mode,label}). Request-presence semantics: OMIT the field to leave the stored override
+  // unchanged (seed-and-keep on PATCH); send {mode:"inherit"} to clear it; a pinned mode
+  // carries secret_id. The server 409s any explicit override on a self_improve lane.
+  credential_override?: { mode: string; secret_id?: string } | null;
 }
 
 // SchedulePreviewInput asks for a live "next fires" preview from a timing spec

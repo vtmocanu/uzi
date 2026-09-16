@@ -84,6 +84,7 @@ func renderScheduleDetail(p *uzicli.Printer, s apitypes.ScheduleDTO) error {
 		[]string{"AUTO_APPROVE", boolStr(s.AutoApprove)},
 		[]string{"WAIT_ON_LIMIT", boolStr(s.WaitOnLimit)},
 		[]string{"MR_REWORK", triStateStr(s.MrReworkEnabled)},
+		[]string{"TOKEN", scheduleTokenCell(s)},
 		[]string{"ENABLED", boolStr(s.Enabled)},
 		[]string{"STATUS", s.Status},
 	)
@@ -101,6 +102,21 @@ func renderScheduleDetail(p *uzicli.Printer, s apitypes.ScheduleDTO) error {
 	}
 	renderLastFire(p, s.LastFire)
 	return nil
+}
+
+// scheduleTokenCell renders the TOKEN detail row (PRD #1247 M6): the pinned token's LABEL for
+// a pinned override (falling back to the bare "pinned" mode when the label could not be
+// resolved — a renamed/deleted token), the bare mode for auto/default, and "inherit" when the
+// schedule carries no override (the fired run follows the worker binding).
+func scheduleTokenCell(s apitypes.ScheduleDTO) string {
+	co := s.CredentialOverride
+	if co == nil {
+		return "inherit"
+	}
+	if co.Mode == "pinned" && co.Label != nil && *co.Label != "" {
+		return *co.Label
+	}
+	return co.Mode
 }
 
 // skipReasonLabels maps a schedsvc.SkipReason wire string to a short human label for CLI

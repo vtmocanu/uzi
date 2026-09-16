@@ -1,6 +1,72 @@
 package apitypes
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
+
+// CredentialOverrideRequest is the inner write shape of a schedule's per-run credential
+// override (PRD #1247 M6). It MIRRORS the create-run request's inline credential_override
+// type ({mode, secret_id?}), NOT the response DTO CredentialOverrideDTO{mode,label}: a
+// request names the mode and (for a pinned mode) the token by id, while the response snaps
+// the token's label for display. Mode is one of pinned/auto/default/inherit; SecretID is
+// set only for a pinned mode (a malformed uuid is a 400 in the handler). "inherit" clears
+// the override; an omitted secret_id on a pinned mode is a 400.
+type CredentialOverrideRequest struct {
+	Mode     string  `json:"mode"`
+	SecretID *string `json:"secret_id,omitempty"`
+}
+
+// OptionalCredentialOverride is a request-presence / tri-state wrapper for the schedule
+// PATCH/create credential_override field (PRD #1247 M6, blocker 2). A plain *T pointer
+// collapses an OMITTED field with an explicit null (Go sets a pointer field to nil for a
+// JSON null WITHOUT calling UnmarshalJSON), which is WRONG here: an omitted override must
+// SEED-AND-KEEP the stored columns, while an explicit null/inherit must be VALIDATED and
+// written. This value-typed wrapper records presence in UnmarshalJSON so the three cases
+// stay distinct on decode:
+//
+//   - key absent            → Present=false            (omitted: seed-and-keep)
+//   - "credential_override": null → Present=true, Value=nil (explicit clear-to-inherit)
+//   - "credential_override": {…}  → Present=true, Value=&{…} (explicit mode)
+//
+// On ENCODE it carries `omitzero` (Go 1.24+) + IsZero so a Present=false value is OMITTED
+// from the marshaled body — which is what lets the CLI leave credential_override out of a
+// PATCH unless --token was passed, so an unrelated edit never restates (and so never
+// re-validates or clears) the stored override.
+type OptionalCredentialOverride struct {
+	Present bool
+	Value   *CredentialOverrideRequest
+}
+
+// UnmarshalJSON records that the key was present (even for an explicit null) and, for a
+// non-null value, decodes the inner request. See the type doc for the tri-state contract.
+func (o *OptionalCredentialOverride) UnmarshalJSON(b []byte) error {
+	o.Present = true
+	if string(b) == "null" {
+		o.Value = nil
+		return nil
+	}
+	var v CredentialOverrideRequest
+	if err := json.Unmarshal(b, &v); err != nil {
+		return err
+	}
+	o.Value = &v
+	return nil
+}
+
+// MarshalJSON emits the inner value (or JSON null when Present with no value). A
+// Present=false wrapper is never reached because IsZero + the `omitzero` tag omit the
+// whole key; it still marshals to null defensively if a caller forces it.
+func (o OptionalCredentialOverride) MarshalJSON() ([]byte, error) {
+	if o.Value == nil {
+		return []byte("null"), nil
+	}
+	return json.Marshal(o.Value)
+}
+
+// IsZero drives the `omitzero` tag: an omitted (Present=false) wrapper is treated as the
+// zero value and dropped from the marshaled body.
+func (o OptionalCredentialOverride) IsZero() bool { return !o.Present }
 
 // ScheduleRequest is the create/patch input for a run schedule (PRD #241 M4).
 //
@@ -73,6 +139,14 @@ type ScheduleRequest struct {
 	// omits it, so a PATCH can neither set nor clobber it (create-only, Decision 4). A
 	// nil/absent value stores NULL (a standalone single-repo row, the common case).
 	SiblingGroupID *string `json:"sibling_group_id"`
+	// CredentialOverride is the schedule's per-run Anthropic credential override (PRD #1247
+	// M6, D5): every fired run inherits it. It is request-presence / tri-state (see
+	// OptionalCredentialOverride) so an OMITTED field seeds-and-keeps the stored columns
+	// (an unrelated retime/model edit must neither re-validate nor clear the override),
+	// while an EXPLICIT value (incl. {"mode":"inherit"} or null) is validated through the
+	// one credential-override validator and written. `omitzero` drops it from the marshaled
+	// body when absent, so the CLI only sends it when --token was passed.
+	CredentialOverride OptionalCredentialOverride `json:"credential_override,omitzero"`
 }
 
 // ScheduleDTO is the response view of a run schedule (PRD #241 M4). All fields are

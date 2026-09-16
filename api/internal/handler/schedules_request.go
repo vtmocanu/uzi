@@ -228,7 +228,11 @@ func onlyEnabled(req apitypes.ScheduleRequest) bool {
 		req.IssueIID == nil && req.Labels == nil && req.Prompt == "" &&
 		req.CronExpr == "" && req.RunAt == nil && req.Timezone == "" &&
 		req.AutoApprove == nil && req.WaitOnLimit == nil && req.MrReworkEnabled == nil && req.MaxIssues == nil &&
-		req.Guidance == nil && req.Model == nil && req.OutputMode == nil && req.OverrideSubagentModel == nil
+		req.Guidance == nil && req.Model == nil && req.OutputMode == nil && req.OverrideSubagentModel == nil &&
+		// PRD #1247 M6: a PRESENT credential_override (even an explicit inherit/null) makes
+		// this NOT an enabled-only PATCH, so it routes through the config path that validates
+		// and persists the override; `{enabled}` alone (override omitted) still short-circuits.
+		!req.CredentialOverride.Present
 }
 
 // mergeSchedule overlays the provided PATCH fields onto the current stored schedule,

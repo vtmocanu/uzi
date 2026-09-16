@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -14,6 +15,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/schedsvc"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
@@ -77,36 +79,47 @@ func (h *Handler) CreateSchedule(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "could not compute the next fire time")
 		return
 	}
+	// PRD #1247 M6: the create-time credential override (D5). OMITTED ⇒ NULL/inherit with no
+	// validation; PRESENT ⇒ validate through the one validator against the new schedule's lane
+	// and effective harness (a NEW schedule has no run_schedules.harness row, so the harness is
+	// the user's default_harness else claude), then persist the resolved columns. A self_improve
+	// schedule with an explicit override 409s here (scheduleLaneKind → SelfImprove).
+	credCols, ok := h.resolveScheduleCredentialOverride(w, r.Context(), user.ID, store.RunSchedule{UserID: user.ID}, m.Target, req)
+	if !ok {
+		return
+	}
 	issueIID, labels, prompt, cronExpr, runAt := scheduleColumns(m)
 	s, err := h.q.CreateRunSchedule(r.Context(), store.CreateRunScheduleParams{
-		UserID:                user.ID,
-		RepoID:                repo.ID,
-		Target:                m.Target,
-		IssueIid:              issueIID,
-		Labels:                labels,
-		Prompt:                prompt,
-		Timing:                m.Timing,
-		CronExpr:              cronExpr,
-		RunAt:                 runAt,
-		Timezone:              m.Timezone,
-		NextFireAt:            nextFire,
-		AutoApprove:           *m.AutoApprove,
-		WaitOnLimit:           *m.WaitOnLimit,
-		MrReworkEnabled:       optBoolToPgtype(m.MrReworkEnabled),
-		Enabled:               *m.Enabled,
-		MaxIssues:             maxIssuesColumn(m),
-		Guidance:              guidanceColumn(m),
-		Model:                 modelColumn(m),
-		OutputMode:            outputModeColumn(m),
-		OverrideSubagentModel: overrideSubagentModelColumn(m),
-		SiblingGroupID:        siblingGroup,
+		UserID:                     user.ID,
+		RepoID:                     repo.ID,
+		Target:                     m.Target,
+		IssueIid:                   issueIID,
+		Labels:                     labels,
+		Prompt:                     prompt,
+		Timing:                     m.Timing,
+		CronExpr:                   cronExpr,
+		RunAt:                      runAt,
+		Timezone:                   m.Timezone,
+		NextFireAt:                 nextFire,
+		AutoApprove:                *m.AutoApprove,
+		WaitOnLimit:                *m.WaitOnLimit,
+		MrReworkEnabled:            optBoolToPgtype(m.MrReworkEnabled),
+		Enabled:                    *m.Enabled,
+		MaxIssues:                  maxIssuesColumn(m),
+		Guidance:                   guidanceColumn(m),
+		Model:                      modelColumn(m),
+		OutputMode:                 outputModeColumn(m),
+		OverrideSubagentModel:      overrideSubagentModelColumn(m),
+		SiblingGroupID:             siblingGroup,
+		CredentialOverrideMode:     credCols.mode,
+		CredentialOverrideSecretID: credCols.secretID,
 	})
 	if err != nil {
 		slog.Error("create run schedule", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	httpx.JSON(w, http.StatusCreated, h.scheduleDTO(s, repo.PathWithNamespace))
+	httpx.JSON(w, http.StatusCreated, h.scheduleDTOWithLabel(r.Context(), s, repo.PathWithNamespace))
 }
 
 // ListMySchedules lists the caller's schedules, newest first
@@ -126,7 +139,7 @@ func (h *Handler) ListMySchedules(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]apitypes.ScheduleDTO, 0, len(rows))
 	for _, s := range rows {
-		out = append(out, h.scheduleDTO(s, h.repoPathFor(r.Context(), s)))
+		out = append(out, h.scheduleDTOWithLabel(r.Context(), s, h.repoPathFor(r.Context(), s)))
 	}
 	httpx.JSON(w, http.StatusOK, out)
 }
@@ -143,7 +156,7 @@ func (h *Handler) GetSchedule(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusNotFound, "schedule not found")
 		return
 	}
-	httpx.JSON(w, http.StatusOK, h.scheduleDTO(s, h.repoPathFor(r.Context(), s)))
+	httpx.JSON(w, http.StatusOK, h.scheduleDTOWithLabel(r.Context(), s, h.repoPathFor(r.Context(), s)))
 }
 
 // PatchSchedule merges the provided fields over the current schedule (pointer/empty =
@@ -206,26 +219,43 @@ func (h *Handler) PatchSchedule(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusBadRequest, "could not compute the next fire time")
 			return
 		}
+		// PRD #1247 M6: presence-aware credential override on a config PATCH. OMITTED ⇒
+		// seed-and-keep the row's current columns (an unrelated retime/model edit must neither
+		// re-validate nor clear the stored override — like RepoID's keep-on-empty, NOT the
+		// blind-replace the OutputMode-style fields take); PRESENT ⇒ validate against the
+		// merged target's lane + the row's effective harness and write the resolved columns.
+		credMode := cur.CredentialOverrideMode
+		credSecret := cur.CredentialOverrideSecretID
+		credCols, ok := h.resolveScheduleCredentialOverride(w, r.Context(), user.ID, cur, m.Target, req)
+		if !ok {
+			return
+		}
+		if !credCols.keep {
+			credMode = credCols.mode
+			credSecret = credCols.secretID
+		}
 		issueIID, labels, prompt, cronExpr, runAt := scheduleColumns(m)
 		final, err = h.q.UpdateRunSchedule(r.Context(), store.UpdateRunScheduleParams{
-			Target:                m.Target,
-			RepoID:                repoID,
-			IssueIid:              issueIID,
-			Labels:                labels,
-			Prompt:                prompt,
-			Timing:                m.Timing,
-			CronExpr:              cronExpr,
-			RunAt:                 runAt,
-			Timezone:              m.Timezone,
-			NextFireAt:            nextFire,
-			AutoApprove:           *m.AutoApprove,
-			WaitOnLimit:           *m.WaitOnLimit,
-			MrReworkEnabled:       optBoolToPgtype(m.MrReworkEnabled),
-			MaxIssues:             maxIssuesColumn(m),
-			Guidance:              guidanceColumn(m),
-			Model:                 modelColumn(m),
-			OutputMode:            outputModeColumn(m),
-			OverrideSubagentModel: overrideSubagentModelColumn(m),
+			Target:                     m.Target,
+			RepoID:                     repoID,
+			IssueIid:                   issueIID,
+			Labels:                     labels,
+			Prompt:                     prompt,
+			Timing:                     m.Timing,
+			CronExpr:                   cronExpr,
+			RunAt:                      runAt,
+			Timezone:                   m.Timezone,
+			NextFireAt:                 nextFire,
+			AutoApprove:                *m.AutoApprove,
+			WaitOnLimit:                *m.WaitOnLimit,
+			MrReworkEnabled:            optBoolToPgtype(m.MrReworkEnabled),
+			MaxIssues:                  maxIssuesColumn(m),
+			Guidance:                   guidanceColumn(m),
+			Model:                      modelColumn(m),
+			OutputMode:                 outputModeColumn(m),
+			OverrideSubagentModel:      overrideSubagentModelColumn(m),
+			CredentialOverrideMode:     credMode,
+			CredentialOverrideSecretID: credSecret,
 			// A user-origin row is never customized (that flag is default-only); preserve
 			// the stored value (always false here) so this write never sets it.
 			Customized: cur.Customized,
@@ -284,7 +314,7 @@ func (h *Handler) PatchSchedule(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	httpx.JSON(w, http.StatusOK, h.scheduleDTO(final, h.repoPathFor(r.Context(), final)))
+	httpx.JSON(w, http.StatusOK, h.scheduleDTOWithLabel(r.Context(), final, h.repoPathFor(r.Context(), final)))
 }
 
 // DeleteSchedule removes an owner-scoped schedule (DELETE /api/schedules/{id}); 0 rows
@@ -472,4 +502,101 @@ func marshalLabels(labels []string) []byte {
 	}
 	b, _ := json.Marshal(labels)
 	return b
+}
+
+// ── credential override (PRD #1247 M6) ─────────────────────────────────────────
+
+// scheduleLaneKind maps a schedule target to the run LANE kind the one credential-override
+// validator checks for switchability (D10). issue and sweep both fire issue runs, so both
+// map to runkind.Issue; prompt → runkind.Prompt; self_improve → runkind.SelfImprove (the
+// validator refuses it 409 — a self_improve run follows its own ladder). An unknown target
+// falls back to the switchable runkind.Issue, but validateScheduleConfig has already rejected
+// any target outside the closed set before this runs.
+func scheduleLaneKind(target string) string {
+	switch target {
+	case "prompt":
+		return runkind.Prompt
+	case "self_improve":
+		return runkind.SelfImprove
+	default: // issue, sweep
+		return runkind.Issue
+	}
+}
+
+// scheduleEffectiveHarness resolves a schedule's effective harness for the credential-override
+// validator (PRD #1247 M6, D9), mirroring createRunEffectiveHarness (runs_lifecycle.go): read
+// run_schedules.harness (a pgtype.Text on the model; defensive — a schedule row usually leaves
+// it unset) else the user's persisted default_harness, mapping codex→codex else claude. Only a
+// codex effective harness is refused (422); every other value (incl. the common NULL default)
+// resolves to claude, the safe direction.
+func (h *Handler) scheduleEffectiveHarness(ctx context.Context, sched store.RunSchedule) (string, error) {
+	if sched.Harness.Valid && sched.Harness.String == string(workersvc.HarnessCodex) {
+		return string(workersvc.HarnessCodex), nil
+	}
+	raw, err := h.q.GetUserDefaultHarness(ctx, sched.UserID)
+	if err != nil {
+		return "", err
+	}
+	if raw.Valid && raw.String == string(workersvc.HarnessCodex) {
+		return string(workersvc.HarnessCodex), nil
+	}
+	return string(workersvc.HarnessClaude), nil
+}
+
+// scheduleCredentialColumns is the resolved write for a schedule's credential override
+// (PRD #1247 M6). keep=true means the request OMITTED credential_override, so the caller MUST
+// leave the stored columns untouched (seed-and-keep, like RepoID's keep-on-empty — NOT an
+// OutputMode-style blind replace). Otherwise mode/secretID are the validated columns to write
+// (both zero-value NULL for a switchable-lane inherit clear).
+type scheduleCredentialColumns struct {
+	keep     bool
+	mode     pgtype.Text
+	secretID pgtype.UUID
+}
+
+// resolveScheduleCredentialOverride applies the presence-aware credential override (PRD #1247
+// M6, blocker 2). When credential_override was OMITTED (!Present) it returns keep=true and does
+// NO validation — the caller keeps the row's current columns (or NULL on create). When PRESENT
+// (any value, incl. an explicit {"mode":"inherit"} or null) it resolves the mode/secret_id,
+// validates them through the one validator against the schedule's LANE (scheduleLaneKind) and
+// effective harness — so even an explicit inherit on a self_improve lane 409s BEFORE the mode
+// switch (D10) — and returns the resolved columns (both NULL for a switchable-lane inherit
+// clear). It writes the HTTP error itself (400 malformed uuid, 404/409/422/400 via
+// writeCredentialOverrideError) and returns ok=false on any refusal.
+func (h *Handler) resolveScheduleCredentialOverride(w http.ResponseWriter, ctx context.Context, userID uuid.UUID, sched store.RunSchedule, target string, req apitypes.ScheduleRequest) (scheduleCredentialColumns, bool) {
+	if !req.CredentialOverride.Present {
+		return scheduleCredentialColumns{keep: true}, true
+	}
+	mode := workersvc.CredentialOverrideModeInherit
+	var secretID *uuid.UUID
+	if v := req.CredentialOverride.Value; v != nil {
+		mode = v.Mode
+		if v.SecretID != nil {
+			id, perr := uuid.Parse(strings.TrimSpace(*v.SecretID))
+			if perr != nil {
+				httpx.Error(w, http.StatusBadRequest, "credential_override.secret_id must be a valid uuid")
+				return scheduleCredentialColumns{}, false
+			}
+			secretID = &id
+		}
+	}
+	harness, herr := h.scheduleEffectiveHarness(ctx, sched)
+	if herr != nil {
+		slog.Error("resolve schedule harness", "error", herr)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return scheduleCredentialColumns{}, false
+	}
+	resolved, verr := h.wsvc.ResolveCredentialOverride(ctx, userID, scheduleLaneKind(target), harness, mode, secretID)
+	if verr != nil {
+		h.writeCredentialOverrideError(w, verr)
+		return scheduleCredentialColumns{}, false
+	}
+	cols := scheduleCredentialColumns{}
+	if resolved != nil {
+		cols.mode = pgtype.Text{String: resolved.Mode, Valid: resolved.Mode != ""}
+		if resolved.SecretID != nil {
+			cols.secretID = pgtype.UUID{Bytes: *resolved.SecretID, Valid: true}
+		}
+	}
+	return cols, true
 }

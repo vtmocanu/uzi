@@ -558,38 +558,40 @@ INSERT INTO run_schedules (
     user_id, repo_id, target, issue_iid, labels, prompt,
     timing, cron_expr, run_at, timezone, next_fire_at,
     auto_approve, wait_on_limit, mr_rework_enabled, enabled, max_issues, guidance, model, output_mode, override_subagent_model,
-    sibling_group_id
+    sibling_group_id, credential_override_mode, credential_override_secret_id
 ) VALUES (
     $1, $2, $3, $4, $5, $6,
     $7, $8, $9, $10, $11,
     $12, $13, $14, $15, $16, $17, $18, $19, $20,
-    $21
+    $21, $22, $23
 )
 RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id, mr_rework_enabled, output_mode, harness, credential_override_mode, credential_override_secret_id
 `
 
 type CreateRunScheduleParams struct {
-	UserID                uuid.UUID          `json:"user_id"`
-	RepoID                uuid.UUID          `json:"repo_id"`
-	Target                string             `json:"target"`
-	IssueIid              pgtype.Int8        `json:"issue_iid"`
-	Labels                []byte             `json:"labels"`
-	Prompt                pgtype.Text        `json:"prompt"`
-	Timing                string             `json:"timing"`
-	CronExpr              pgtype.Text        `json:"cron_expr"`
-	RunAt                 pgtype.Timestamptz `json:"run_at"`
-	Timezone              string             `json:"timezone"`
-	NextFireAt            pgtype.Timestamptz `json:"next_fire_at"`
-	AutoApprove           bool               `json:"auto_approve"`
-	WaitOnLimit           bool               `json:"wait_on_limit"`
-	MrReworkEnabled       pgtype.Bool        `json:"mr_rework_enabled"`
-	Enabled               bool               `json:"enabled"`
-	MaxIssues             pgtype.Int4        `json:"max_issues"`
-	Guidance              pgtype.Text        `json:"guidance"`
-	Model                 pgtype.Text        `json:"model"`
-	OutputMode            pgtype.Text        `json:"output_mode"`
-	OverrideSubagentModel bool               `json:"override_subagent_model"`
-	SiblingGroupID        pgtype.UUID        `json:"sibling_group_id"`
+	UserID                     uuid.UUID          `json:"user_id"`
+	RepoID                     uuid.UUID          `json:"repo_id"`
+	Target                     string             `json:"target"`
+	IssueIid                   pgtype.Int8        `json:"issue_iid"`
+	Labels                     []byte             `json:"labels"`
+	Prompt                     pgtype.Text        `json:"prompt"`
+	Timing                     string             `json:"timing"`
+	CronExpr                   pgtype.Text        `json:"cron_expr"`
+	RunAt                      pgtype.Timestamptz `json:"run_at"`
+	Timezone                   string             `json:"timezone"`
+	NextFireAt                 pgtype.Timestamptz `json:"next_fire_at"`
+	AutoApprove                bool               `json:"auto_approve"`
+	WaitOnLimit                bool               `json:"wait_on_limit"`
+	MrReworkEnabled            pgtype.Bool        `json:"mr_rework_enabled"`
+	Enabled                    bool               `json:"enabled"`
+	MaxIssues                  pgtype.Int4        `json:"max_issues"`
+	Guidance                   pgtype.Text        `json:"guidance"`
+	Model                      pgtype.Text        `json:"model"`
+	OutputMode                 pgtype.Text        `json:"output_mode"`
+	OverrideSubagentModel      bool               `json:"override_subagent_model"`
+	SiblingGroupID             pgtype.UUID        `json:"sibling_group_id"`
+	CredentialOverrideMode     pgtype.Text        `json:"credential_override_mode"`
+	CredentialOverrideSecretID pgtype.UUID        `json:"credential_override_secret_id"`
 }
 
 // Scheduled runs (PRD #241). run_schedules is the durable, time-driven origin of a
@@ -598,6 +600,11 @@ type CreateRunScheduleParams struct {
 // firing code needs (sweep candidate issues, active-run guard).
 // Insert an owner-supplied schedule. Nullable columns ride sqlc.narg; server-managed
 // columns (id, status, last_fired_at, created_at, updated_at) take their defaults.
+// credential_override_mode / credential_override_secret_id (PRD #1247 M6) are the
+// schedule's per-run credential override (D5), both sqlc.narg — NULL/NULL = inherit,
+// byte-identical to a pre-#1247 schedule. The handler validates + resolves the pair
+// through the one validator before insert; clone/add-repo copy the source row's columns
+// so a derived row never drops the override.
 func (q *Queries) CreateRunSchedule(ctx context.Context, arg CreateRunScheduleParams) (RunSchedule, error) {
 	row := q.db.QueryRow(ctx, createRunSchedule,
 		arg.UserID,
@@ -621,6 +628,8 @@ func (q *Queries) CreateRunSchedule(ctx context.Context, arg CreateRunSchedulePa
 		arg.OutputMode,
 		arg.OverrideSubagentModel,
 		arg.SiblingGroupID,
+		arg.CredentialOverrideMode,
+		arg.CredentialOverrideSecretID,
 	)
 	var i RunSchedule
 	err := row.Scan(
@@ -1036,6 +1045,8 @@ SET cron_expr     = $1,
     guidance      = NULL,
     output_mode   = $8,
     override_subagent_model = false,
+    credential_override_mode = NULL,
+    credential_override_secret_id = NULL,
     next_fire_at  = $9,
     customized    = false,
     status        = 'active',
@@ -1070,6 +1081,10 @@ type ResetDefaultScheduleParams struct {
 // output_mode is likewise reset to the catalog baseline (PRD #929 M1): a prompt default can
 // carry an owner-editable output mode, so the resolved catalog value is passed in and written
 // here (nil for a non-prompt default, which stores NULL = inherit).
+// credential_override_mode / credential_override_secret_id (PRD #1247 M6) are cleared to NULL
+// (inherit): a default now carries an owner-editable per-run credential override, so a Reset
+// must drop it back to the catalog baseline (inherit), same as guidance/override_subagent_model.
+// Written as SQL literals (no param) because the catalog baseline is always inherit.
 // next_fire_at is recomputed in Go from the catalog cron+timezone and passed in.
 func (q *Queries) ResetDefaultSchedule(ctx context.Context, arg ResetDefaultScheduleParams) (RunSchedule, error) {
 	row := q.db.QueryRow(ctx, resetDefaultSchedule,
@@ -1319,35 +1334,39 @@ SET target        = $1,
     model         = $16,
     output_mode   = $17,
     override_subagent_model = $18,
-    customized    = $19,
+    credential_override_mode = $19,
+    credential_override_secret_id = $20,
+    customized    = $21,
     status        = 'active',
     updated_at    = now()
-WHERE id = $20 AND user_id = $21
+WHERE id = $22 AND user_id = $23
 RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id, mr_rework_enabled, output_mode, harness, credential_override_mode, credential_override_secret_id
 `
 
 type UpdateRunScheduleParams struct {
-	Target                string             `json:"target"`
-	RepoID                uuid.UUID          `json:"repo_id"`
-	IssueIid              pgtype.Int8        `json:"issue_iid"`
-	Labels                []byte             `json:"labels"`
-	Prompt                pgtype.Text        `json:"prompt"`
-	Timing                string             `json:"timing"`
-	CronExpr              pgtype.Text        `json:"cron_expr"`
-	RunAt                 pgtype.Timestamptz `json:"run_at"`
-	Timezone              string             `json:"timezone"`
-	NextFireAt            pgtype.Timestamptz `json:"next_fire_at"`
-	AutoApprove           bool               `json:"auto_approve"`
-	WaitOnLimit           bool               `json:"wait_on_limit"`
-	MrReworkEnabled       pgtype.Bool        `json:"mr_rework_enabled"`
-	MaxIssues             pgtype.Int4        `json:"max_issues"`
-	Guidance              pgtype.Text        `json:"guidance"`
-	Model                 pgtype.Text        `json:"model"`
-	OutputMode            pgtype.Text        `json:"output_mode"`
-	OverrideSubagentModel bool               `json:"override_subagent_model"`
-	Customized            bool               `json:"customized"`
-	ID                    uuid.UUID          `json:"id"`
-	UserID                uuid.UUID          `json:"user_id"`
+	Target                     string             `json:"target"`
+	RepoID                     uuid.UUID          `json:"repo_id"`
+	IssueIid                   pgtype.Int8        `json:"issue_iid"`
+	Labels                     []byte             `json:"labels"`
+	Prompt                     pgtype.Text        `json:"prompt"`
+	Timing                     string             `json:"timing"`
+	CronExpr                   pgtype.Text        `json:"cron_expr"`
+	RunAt                      pgtype.Timestamptz `json:"run_at"`
+	Timezone                   string             `json:"timezone"`
+	NextFireAt                 pgtype.Timestamptz `json:"next_fire_at"`
+	AutoApprove                bool               `json:"auto_approve"`
+	WaitOnLimit                bool               `json:"wait_on_limit"`
+	MrReworkEnabled            pgtype.Bool        `json:"mr_rework_enabled"`
+	MaxIssues                  pgtype.Int4        `json:"max_issues"`
+	Guidance                   pgtype.Text        `json:"guidance"`
+	Model                      pgtype.Text        `json:"model"`
+	OutputMode                 pgtype.Text        `json:"output_mode"`
+	OverrideSubagentModel      bool               `json:"override_subagent_model"`
+	CredentialOverrideMode     pgtype.Text        `json:"credential_override_mode"`
+	CredentialOverrideSecretID pgtype.UUID        `json:"credential_override_secret_id"`
+	Customized                 bool               `json:"customized"`
+	ID                         uuid.UUID          `json:"id"`
+	UserID                     uuid.UUID          `json:"user_id"`
 }
 
 // Owner-scoped edit of the mutable fields. A foreign id matches no row and returns
@@ -1380,6 +1399,8 @@ func (q *Queries) UpdateRunSchedule(ctx context.Context, arg UpdateRunSchedulePa
 		arg.Model,
 		arg.OutputMode,
 		arg.OverrideSubagentModel,
+		arg.CredentialOverrideMode,
+		arg.CredentialOverrideSecretID,
 		arg.Customized,
 		arg.ID,
 		arg.UserID,

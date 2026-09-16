@@ -19,5 +19,9 @@
   "model": "x",
   "output_mode": "x",
   "override_subagent_model": true,
-  "sibling_group_id": "x"
+  "sibling_group_id": "x",
+  "credential_override": {
+    "mode": "x",
+    "secret_id": "x"
+  }
 }
