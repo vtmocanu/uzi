@@ -46,7 +46,7 @@ import { MEMORY_SERVER_NAME, memoryToolNames } from "../memory-tools.js";
 import { reportIncidentalIssueToolName } from "../findings-tools.js";
 import { forgeToolNames } from "../forge-tools.js";
 import { SKILL_NAME_RE } from "../skills-plugin.js";
-import { FINDINGS_NUDGE_APPEND, WORKER_RUNTIME_APPEND } from "../prompt.js";
+import { FINDINGS_NUDGE_APPEND, SECRET_FIXTURE_HYGIENE_APPEND, WORKER_RUNTIME_APPEND } from "../prompt.js";
 
 // --- canonical Codex tool vocabulary (mirrors broker.ts) ----------------------
 
@@ -298,10 +298,11 @@ function resolveRoleModel(
 }
 
 /** Render a subagent prompt exactly as agents.ts `toDefinition` composes it: the
- *  role body followed by the two shared appends, so a Codex subagent carries the
- *  same findings nudge and worker-runtime guidance a Claude subagent does. */
+ *  role body followed by the three shared appends, so a Codex subagent carries the
+ *  same findings nudge, worker-runtime guidance, and secret-fixture hygiene rule a
+ *  Claude subagent does (PRD #1120). */
 function renderSubagentPrompt(agent: HarnessAgent): string {
-  return `${agent.prompt}\n\n${FINDINGS_NUDGE_APPEND}\n\n${WORKER_RUNTIME_APPEND}`;
+  return `${agent.prompt}\n\n${FINDINGS_NUDGE_APPEND}\n\n${WORKER_RUNTIME_APPEND}\n\n${SECRET_FIXTURE_HYGIENE_APPEND}`;
 }
 
 /** The character ceiling on a sanitized diagnostic `name`, mirroring broker.ts's

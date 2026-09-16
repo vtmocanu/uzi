@@ -103,7 +103,7 @@ func newSkewFixture(ctx context.Context, t *testing.T) skewFixture {
 	// A unique forge project id per fixture so parallel LiveDB rows on the shared
 	// database never collide on forge_connections' project/bot uniqueness.
 	projectID := int64(uuid.New().ID())
-	sealedPAT, err := box.Seal([]byte("glpat-dummy-skew-token-000000")) //gitleaks:allow synthetic PAT fixture, sealed, never a real credential
+	sealedPAT, err := box.Seal([]byte("glpat-" + "dummy-skew-token-000000")) // synthetic PAT fixture, assembled from parts so no contiguous glpat-<20> literal sits in source; sealed, never a real credential
 	if err != nil {
 		t.Fatalf("seal PAT: %v", err)
 	}

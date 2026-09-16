@@ -228,7 +228,10 @@ There are also four repo-wide checks with no component, as of PRD #103 M5:
 verbatim into the shared Homebrew tap on every tag) and `task scan:secrets`
 (gitleaks, a secret scan over tracked files). `task gate:repo` runs these —
 among the further repo-wide checks it has gained since (`lint:actions`, the
-`check:migration-*` and `check:spec-numbering` guards, `sast:semgrep`) — and it
+`check:migration-*` and `check:spec-numbering` guards, `check:token-literals`
+— a NEW complete provider-token literal in tracked source, flagged even under an
+inline `//gitleaks:allow`, as an independent check beside `scan:secrets` rather
+than a replacement for it — `sast:semgrep`) — and it
 runs **first** inside `task gate`, cheap-first, ahead of any Go module's `-race`
 compile or npm step — none of the three lint checks needs a build or a warm
 toolchain. Like the other repo-wide slots, their scope comes from the git
