@@ -342,6 +342,11 @@ type RunDTO struct {
 	// `uzi run stop` of an interactive task run, null for every other run. It — not the
 	// failure_reason text — is what clients read.
 	//
+	// Later values widen this set: "scope_capped" (PRD #634) and "scope_reduced" (PRD #1227)
+	// are completed-status scope dispositions, and "branch_moved" (issue #1117) is a
+	// cancelled-status disposition for an mr_rework rework whose finalize push was superseded
+	// by a concurrent same-branch writer (a non-fast-forward push rejection).
+	//
 	// A "stopped" run's happy path lands `completed` (the worker finalizes — push + MR iff
 	// open_mr — and reports completed); on the edge where that finalize throws (or a
 	// cancel-then-stop let the cancel win) the worker reports `failed` and the server routes

@@ -390,7 +390,11 @@ type fakeStore struct {
 	// applied, like the SetRunFailed fake).
 	cancelledByWorker     *store.CancelRunByWorkerParams
 	cancelledByWorkerRows int64
-	rejected              *store.RejectRunServerSideParams
+	// supersededByWorker captures the issue #1117 live-worker branch_moved supersession;
+	// SetState's failed arm calls it (instead of SetRunFailed) when an mr_rework run reports
+	// branch_moved. Mirrors cancelledByWorker.
+	supersededByWorker *store.SupersedeRunByWorkerParams
+	rejected           *store.RejectRunServerSideParams
 	// clearedCaps captures the PRD #84 M4 4c override clear (ClearRunRequiredCapabilities);
 	// clearCapsRows is the RowsAffected the fake returns. When cleared, the fake also empties
 	// runByID.RequiredCapabilities so a subsequent SubmitInput reload sees the override effect.
@@ -1283,6 +1287,13 @@ func (f *fakeStore) CancelRunByWorker(_ context.Context, arg store.CancelRunByWo
 	if f.cancelledByWorkerRows != 0 {
 		return f.cancelledByWorkerRows, nil
 	}
+	return 1, nil
+}
+
+// SupersedeRunByWorker (issue #1117) records the live-worker branch_moved supersession of an
+// mr_rework run. Returns 1 (applied) like the CancelRunByWorker fake.
+func (f *fakeStore) SupersedeRunByWorker(_ context.Context, arg store.SupersedeRunByWorkerParams) (int64, error) {
+	f.supersededByWorker = &arg
 	return 1, nil
 }
 func (f *fakeStore) RejectRunServerSide(_ context.Context, arg store.RejectRunServerSideParams) (int64, error) {

@@ -1776,6 +1776,15 @@ export interface StateRequest {
    *  a normal completion so an old worker's payload and a normal completion stay identical on
    *  the wire. Issue runs only; the server re-gates on the run having scope_ceiling set. */
   scope_capped?: boolean;
+  /** issue #1117: the worker's declaration, on an mr_rework `failed` report, that the
+   *  finalize push was rejected non-fast-forward because a concurrent same-branch writer
+   *  (a human, or uzi-watcher landing review fixes) advanced the MR branch `agent/issue-*`
+   *  under the run. The server honors it ONLY for an mr_rework run and routes such a
+   *  `failed` report to a non-error `cancelled`/stop_kind='branch_moved' disposition instead
+   *  of the generic agent_failure. Additive + optional and OMITTED ENTIRELY (never `false`)
+   *  on every other report, so an old worker's payload and every non-mr_rework report stay
+   *  identical on the wire. */
+  branch_moved?: boolean;
   /** failed carries a human-readable reason. */
   failure_reason?: string;
   /** implement⇄review loop counter, reported on running reports (M4). The
