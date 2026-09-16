@@ -134,8 +134,13 @@ export interface RecoveryArchiveClient {
   ): Promise<RecoveryCaptureStatusResponse>;
   /** Release the run's custody. A v2 caller names the EXACT generation so the server settles
    *  only the hold taken at that claim generation (PRD #1349 M1/M2, D1/D2); an omitted
-   *  generation is the v1 settle-by-run+worker fallback. */
-  releaseRecoveryCustody(runId: string, generation?: number): Promise<RecoveryReleaseResponse>;
+   *  generation is the v1 settle-by-run+worker fallback. `releaseEvidence` stamps the release's
+   *  evidence class (PRD #1392 M1/M2, fact 9), allowlisted server-side; omitted stores NULL. */
+  releaseRecoveryCustody(
+    runId: string,
+    generation?: number,
+    releaseEvidence?: string,
+  ): Promise<RecoveryReleaseResponse>;
   /** The worker's own open custody holds on a run — the post-clone generation-exact inventory
    *  (PRD #1349 M1/M2, D3). */
   listRecoveryHolds(runId: string): Promise<RecoveryHoldsResponse>;
@@ -340,7 +345,8 @@ export class RecoveryCoordinator {
         if (produced.kind === "already_published") {
           // H is already on the fresh forge tip — verified no-unpublished-output (D2/D3).
           // Release THIS generation's exact hold and drop the local journal; nothing to archive.
-          await this.release(record.runId, record.generation);
+          // PRD #1392 M1/M2 (fact 9): a proven fresh-forge no-output release stamps forge_no_output.
+          await this.release(record.runId, record.generation, "forge_no_output");
           return { state: "uploaded", captureId: record.captureId, reason: "already_published" };
         }
         if (produced.kind !== "bundled") {
@@ -529,13 +535,14 @@ export class RecoveryCoordinator {
    * generation's work with it. Only the v1 fallback (generation omitted, at most one record) removes
    * the whole run dir.
    */
-  async release(runId: string, generation?: number): Promise<void> {
+  async release(runId: string, generation?: number, releaseEvidence?: string): Promise<void> {
     if (!this.enabled) return;
     try {
-      const res = await this.client.releaseRecoveryCustody(runId, generation);
+      const res = await this.client.releaseRecoveryCustody(runId, generation, releaseEvidence);
       this.log.info("recovery: released custody after verified no-unpublished-output", {
         run_id: runId,
         generation,
+        release_evidence: releaseEvidence,
         released: res.released,
         holds_released: res.holds_released,
         ...(res.retained ? { retained: res.retained, reason: res.reason } : {}),

@@ -219,6 +219,10 @@ export interface WithForgeRetryOptions {
   sleep?: (ms: number) => Promise<void>;
   /** Optional logger; a warn is emitted before each retry sleep. */
   log?: { warn: (msg: string, meta?: Record<string, unknown>) => void };
+  /** PRD #1392 M2: the forge PHASE this retry wraps, folded into the retry log line so it names
+   *  where the transient error happened. `ensureClone`'s two sites pass "clone/fetch"; the
+   *  push/MR-create sites pass nothing and KEEP the historical "push/MR-create" text. */
+  label?: string;
   /** Cancels attempts and backoff at the owning durability boundary deadline. */
   signal?: AbortSignal;
 }
@@ -338,7 +342,9 @@ export async function withForgeRetry<T>(
     schedule: opts.schedule ?? FORGE_RETRY_SCHEDULE,
     sleep: opts.sleep,
     log: opts.log,
-    logMessage: "transient forge error; retrying push/MR-create",
+    // PRD #1392 M2: name the phase in the retry log line. Default preserves the historical
+    // "push/MR-create" text so the untouched push/MR-create callers are byte-identical.
+    logMessage: `transient forge error; retrying ${opts.label ?? "push/MR-create"}`,
     signal: opts.signal,
   });
 }

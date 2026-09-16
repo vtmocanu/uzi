@@ -326,3 +326,41 @@ the existing health-notification enablement and cooldown. The decision-needed br
 surfaced in the web board alert rather than recomputed in the notifier loop, so the DM stays a
 light aggregate read (see the Decision Log). The per-run web/CLI custody pill stays as row
 context. Clearing below the limit closes the episode; a later crossing can notify again.
+
+---
+
+## Amendment 2026-09-16 — PRD #1392: a fifth release-evidence class for a generation that never adopted a source
+
+**Status**: Accepted (PRD #1392 M1-M4 committed on this branch).
+**Issue**: [vtmocanu/uzi#1392](https://github.com/vtmocanu/uzi/issues/1392)
+**PRD**: [prds/1392-forge-unreachable-preclone-park.md](../prds/1392-forge-unreachable-preclone-park.md)
+
+D2 above (as amended by PRD #1349) permits a hold to leave `open` only on one of four kinds of
+durable evidence: publication, an available archive, a fresh-forge no-output proof, or an owner
+discard. All four presume the claim reached a source to publish, archive, prove empty against,
+or discard — a bare, worktree, or committed head that exists, even if empty.
+
+That presumption does not hold for a **pre-clone** forge park (ADR-1197's 2026-09-16 amendment):
+when `ensureClone` itself exhausts its retries with a transient forge error, the claim's
+generation never adopted any source at all — no bare, no worktree, no committed head, nothing to
+fetch against and nothing to prove empty. Evidence (3), the fresh-forge no-output proof, cannot
+be produced here: there is no local source to compare against fetched forge history, and running
+that comparison would need the very clone the forge is currently refusing.
+
+This amendment adds a **fifth** release-evidence class, `no_adopted_source`, for exactly this
+case: a generation whose claim opened a custody hold (fact 6 in the PRD, every recovery-capable
+claim on a code-publishing profile does) but never adopted a source releases that hold on
+`no_adopted_source` — no forge proof required or possible, because there is no source to prove
+anything against. The release happens inside the same locked transaction that parks the run
+(`SetState`, cause `forge_unreachable`), settling custody and parking atomically rather than as
+a best-effort follow-up call — closing the same "park after releasing cannot promise zero holds"
+gap D3 in the PRD's own Decision Log names.
+
+**Invariant, matching the existing four:** `no_adopted_source` never substitutes for
+`forge_no_output` on a generation that *did* adopt a source (even an empty one) — that generation
+still needs the real fresh-forge comparison. And it settles only the exact (run, worker,
+generation) hold the transaction validated; anything already on disk belongs to an earlier
+generation and is inventoried separately after the next successful clone, exactly as D2 already
+requires for every other evidence class. See
+[adr/1392-forge-unreachable-preclone-park.md](1392-forge-unreachable-preclone-park.md) for the
+full decision record.

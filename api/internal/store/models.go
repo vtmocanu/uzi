@@ -410,6 +410,7 @@ type RecoveryCustodyHold struct {
 	CreatedAt              pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt              pgtype.Timestamptz `json:"updated_at"`
 	ReleasedAt             pgtype.Timestamptz `json:"released_at"`
+	ReleaseEvidence        pgtype.Text        `json:"release_evidence"`
 }
 
 type Repo struct {
@@ -584,6 +585,8 @@ type Run struct {
 	BudgetExtensionSeconds      int32              `json:"budget_extension_seconds"`
 	ClaimGeneration             int64              `json:"claim_generation"`
 	Harness                     string             `json:"harness"`
+	RecoveryWaitCause           pgtype.Text        `json:"recovery_wait_cause"`
+	ForgeParkCount              int32              `json:"forge_park_count"`
 }
 
 type RunCompletionAttempt struct {

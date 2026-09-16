@@ -200,6 +200,11 @@ var runDTOKeys = []string{
 	// clamped and pool-aware and is routinely EARLIER than the reported reset.
 	"wait_on_limit", "limit_resets_at", "retry_not_before", "limit_wait_count",
 	"rate_limit_type",
+	// PRD #1392 M1: the forge pre-clone park surface. recovery_wait_cause is the typed park
+	// cause (null = untyped/legacy park); recovery_retry_not_before is the recovery-park
+	// promotion stamp (a distinct column from retry_not_before, the limit park's); forge_park_count
+	// is the forge-only lifetime counter; forge_park_max is the effective cap (0 = unlimited).
+	"recovery_wait_cause", "recovery_retry_not_before", "forge_park_count", "forge_park_max",
 	// PRD #841 M1: the per-run MR-rework override, tri-state *bool (null = inherit the
 	// owner default, resolved live). NOT omitempty — always on the wire, so the web can
 	// tell "no per-run opinion" (null) from an explicit true/false and render the

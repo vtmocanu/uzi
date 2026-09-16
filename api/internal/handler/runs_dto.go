@@ -142,7 +142,11 @@ func decodeLatestUnmet(raw []byte) []string {
 // (PRD #1170). extensionCapSeconds is the effective admin extension cap (PRD #1189,
 // RunExtensionCapSeconds; 0 = extending disabled) and now is the wall-clock instant used
 // for budget_used_seconds — both passed in so this mapper stays pure.
-func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, extensionCapSeconds int, now time.Time) apitypes.RunDTO {
+// forgeParkMax is the effective forge-unreachable park cap (PRD #1392 M1,
+// RUN_FORGE_UNREACHABLE_MAX_PARKS; 0 = unlimited), passed in the same way as
+// extensionCapSeconds so this mapper stays pure — no config reaches into it. It surfaces on
+// the DTO as ForgeParkMax so the forge-park pill can render "N of MAX".
+func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, extensionCapSeconds int, forgeParkMax int, now time.Time) apitypes.RunDTO {
 	dto := apitypes.RunDTO{
 		ID:               r.ID.String(),
 		Kind:             r.Kind,
@@ -219,6 +223,15 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 		RetryNotBefore:  timePtr(r.RetryNotBefore.Valid, r.RetryNotBefore.Time),
 		LimitWaitCount:  r.LimitWaitCount,
 		RateLimitType:   textPtrValue(r.RateLimitType.Valid, r.RateLimitType.String),
+		// PRD #1392 M1: the forge pre-clone park surface. RecoveryWaitCause is the typed cause
+		// (null = untyped/legacy park); RecoveryRetryNotBefore is the recovery-park promotion
+		// stamp (the recovery-park analog of RetryNotBefore, a distinct column); ForgeParkCount
+		// is the forge-only lifetime counter; ForgeParkMax is the effective cap passed in
+		// (0 = unlimited). All four surface for every run (SC5), independent of each other.
+		RecoveryWaitCause:      textPtrValue(r.RecoveryWaitCause.Valid, r.RecoveryWaitCause.String),
+		RecoveryRetryNotBefore: timePtr(r.RecoveryRetryNotBefore.Valid, r.RecoveryRetryNotBefore.Time),
+		ForgeParkCount:         int(r.ForgeParkCount),
+		ForgeParkMax:           forgeParkMax,
 		// PRD #300: the per-schedule model a schedule froze onto this run at fire time.
 		// nil (NULL column) for every run that inherited the owner's per-user default.
 		Model: textPtrValue(r.Model.Valid, r.Model.String),

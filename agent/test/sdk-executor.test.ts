@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { Options as SdkOptions, SDKMessage, HookInput } from "@anthropic-ai/claude-agent-sdk";
-import { SdkExecutor, resolveLeadModel, embedSeededPlan, TransientRecoveryError, type SdkQueryFn, type SdkExecutorOptions, type ContextUsageReading } from "../src/sdk-executor.js";
+import { SdkExecutor, resolveLeadModel, embedSeededPlan, TransientRecoveryError, ProviderTransientError, type SdkQueryFn, type SdkExecutorOptions, type ContextUsageReading } from "../src/sdk-executor.js";
 import { LimitReachedError } from "../src/limit.js";
 import { PlanRejectedError, type EmittedMessage, type RunContext } from "../src/executor.js";
 import type { PlanVerdict } from "../src/steering.js";
@@ -110,6 +110,21 @@ function resultEmpty(sessionId = "sess-1"): SDKMessage {
 // activity — it flows to the existing REASON_NO_PLAN control, never into recovery.
 function resultNoTurns(sessionId = "sess-1"): SDKMessage {
   return { type: "result", subtype: "success", is_error: false, session_id: sessionId } as unknown as SDKMessage;
+}
+// issue #1088: a TRANSIENT provider error surfaces as a `SDKResultSuccess` frame —
+// `subtype:"success"` with `is_error:true`, an `api_error_status` (e.g. 529), the human
+// text in `result`, and `terminal_reason:"api_error"`. Its `errors` array is EMPTY (the
+// text is in `result`). This is the shape a 529/500/…/401 arrives in.
+function resultApiError(status: number, result: string, sessionId = "s"): SDKMessage {
+  return {
+    type: "result",
+    subtype: "success",
+    is_error: true,
+    api_error_status: status,
+    result,
+    terminal_reason: "api_error",
+    session_id: sessionId,
+  } as unknown as SDKMessage;
 }
 // Issue #281: a subagent frame — `subagent_type` makes mapSdkMessage attribute it to
 // that agent (em.agent = "coder"), which the no-progress detector reads as activity.
@@ -4785,5 +4800,156 @@ describe("SdkExecutor empty-turn limit routing (PRD #1349 M3)", () => {
       "a rejected verdict on a NON-empty (planning) turn is normal work, never a limit park",
     );
     assert.strictEqual(turns.length, 2, "no retry, no escalation — the turn was not positively empty");
+  });
+});
+
+// issue #1088: a TRANSIENT provider error (429/500/502/503/529/overloaded) ends a turn as a
+// `subtype:"success"` api-error frame. It must (a) retry with the existing bounded in-process
+// backoff and, on a sustained outage, PARK via TransientRecoveryError (recovery_wait) instead
+// of terminal-failing, and (b) never report the self-contradictory "agent run failed: success".
+// A PERMANENT api error (401/403/400) is NOT retried/parked — it fails, labelled with its status.
+describe("SdkExecutor provider-transient error handling (issue #1088)", () => {
+  const OVERLOADED_529 = "API Error: 529 Overloaded. This is a server-side issue…";
+  const fast = (queryFn: SdkQueryFn, maxRetries: number): SdkExecutorOptions => ({
+    queryFn,
+    emptyTurnBackoffBaseMs: 1, // no real multi-second sleeps in tests
+    emptyTurnMaxRetries: maxRetries,
+  });
+  // Run to a rejection and hand back the thrown value for direct assertion.
+  const rejection = async (p: Promise<unknown>): Promise<unknown> =>
+    p.then(
+      () => {
+        throw new Error("expected the run to reject");
+      },
+      (e: unknown) => e,
+    );
+
+  it("parks (TransientRecoveryError), never fails, on a 529 with no in-process retries", async () => {
+    // Before the fix this rejected with /agent run failed: success/ (a terminal failure).
+    const { queryFn } = fakeTurns([[resultApiError(529, OVERLOADED_529)]]);
+    await assert.rejects(
+      new SdkExecutor(nullLogger(), homeDir, fast(queryFn, 0)).run(makeCtx().ctx),
+      (err: unknown) => err instanceof TransientRecoveryError,
+    );
+  });
+
+  it("retries a 529 provider error and recovers on the next successful turn (no throw)", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [resultApiError(529, OVERLOADED_529)], // planning turn 0: transient 529
+      [submitPlan("# The Plan"), resultSuccess()], // retry: a real plan
+      [assistantText("impl"), signalDone(), resultSuccess()], // implement done
+    ]);
+    const probe = makeCtx({ agents: [lead, coder, reviewer] });
+    const result = await new SdkExecutor(nullLogger(), homeDir, fast(queryFn, 1)).run(probe.ctx);
+    assert.strictEqual(result.branch, "agent/issue-5");
+    assert.deepStrictEqual(probe.gated, ["# The Plan"], "the retried plan reaches the gate");
+    assert.strictEqual(turns.length, 3, "529 turn + retried plan + implement");
+    assert.ok(
+      probe.emits.some(
+        (m) =>
+          m.kind === "status" &&
+          /provider returned a transient error \(529\)/.test(String(m.payload["text"])),
+      ),
+      "a provider-aware transient retry notice is emitted",
+    );
+  });
+
+  it("labels the 529 park message with the status and 'provider', never 'success'", async () => {
+    const { queryFn } = fakeTurns([[resultApiError(529, OVERLOADED_529)]]);
+    const err = await rejection(
+      new SdkExecutor(nullLogger(), homeDir, fast(queryFn, 0)).run(makeCtx().ctx),
+    );
+    assert.ok(err instanceof TransientRecoveryError, "the 529 outage parks");
+    assert.match(err.message, /529/, "the label pins the numeric status");
+    assert.match(err.message, /provider/i, "the label names the provider");
+    assert.doesNotMatch(err.message, /success/, "never the self-contradictory 'success'");
+  });
+
+  it("does NOT over-park a permanent 401 — it fails, labelled with 401 and never 'success'", async () => {
+    const { queryFn, turns } = fakeTurns([[resultApiError(401, "API Error: 401 Unauthorized")]]);
+    const err = await rejection(
+      new SdkExecutor(nullLogger(), homeDir, fast(queryFn, 2)).run(makeCtx().ctx),
+    );
+    assert.ok(err instanceof Error, "a 401 is a genuine failure");
+    assert.ok(!(err instanceof TransientRecoveryError), "a permanent 401 is NEVER parked");
+    assert.ok(!(err instanceof ProviderTransientError), "a permanent 401 is not classified transient");
+    assert.match(err.message, /401/, "the failure names the status");
+    assert.doesNotMatch(err.message, /success/, "never the self-contradictory 'success'");
+    assert.strictEqual(turns.length, 1, "a permanent api error fails immediately, no retries");
+  });
+
+  it("a usage-limit death on a FAILED terminal still throws LimitReachedError, not ProviderTransientError", async () => {
+    // classifyLimitEvidence wins over the provider-transient throw: a rejected rate-limit
+    // event with a FUTURE reset on a failed terminal materializes the TYPED LimitReachedError.
+    const IN_5H = Date.now() + 5 * 60 * 60 * 1000;
+    const { queryFn } = fakeTurns([
+      [
+        rateLimitEvent("rejected", { resetsAt: IN_5H, rateLimitType: "five_hour" }),
+        { type: "result", subtype: "error_during_execution", is_error: true, session_id: "s" } as unknown as SDKMessage,
+      ],
+    ]);
+    const err = await rejection(
+      new SdkExecutor(nullLogger(), homeDir, fast(queryFn, 2)).run(makeCtx().ctx),
+    );
+    assert.ok(err instanceof LimitReachedError, "a usage-limit death takes the limit path");
+    assert.ok(!(err instanceof ProviderTransientError), "the limit guard precedes the provider-transient throw");
+    assert.strictEqual(err.rateLimitType, "five_hour");
+    assert.strictEqual(err.resetsAtMs, IN_5H);
+  });
+
+  it("parks (TransientRecoveryError) on a transient 429, like a 529, with no in-process retries", async () => {
+    // The apiErrorStatus === 429 branch of isProviderTransient also routes to the park —
+    // not just 529 (the only status the sibling park tests exercise).
+    const { queryFn } = fakeTurns([[resultApiError(429, "API Error: 429 Too Many Requests")]]);
+    await assert.rejects(
+      new SdkExecutor(nullLogger(), homeDir, fast(queryFn, 0)).run(makeCtx().ctx),
+      (err: unknown) => err instanceof TransientRecoveryError,
+    );
+  });
+
+  it("parks (TransientRecoveryError) on a status-less (null) transport api_error", async () => {
+    // The apiErrorStatus == null branch: an api_error with no HTTP status is a
+    // transport/network failure, so it is retryable and parks, mirroring client.ts isTransient.
+    const { queryFn } = fakeTurns([
+      [
+        {
+          type: "result",
+          subtype: "success",
+          is_error: true,
+          api_error_status: null,
+          terminal_reason: "api_error",
+          session_id: "s",
+        } as unknown as SDKMessage,
+      ],
+    ]);
+    await assert.rejects(
+      new SdkExecutor(nullLogger(), homeDir, fast(queryFn, 0)).run(makeCtx().ctx),
+      (err: unknown) => err instanceof TransientRecoveryError,
+    );
+  });
+
+  it("pins limit-over-transient precedence: a limit-bearing transient 529 throws LimitReachedError, never a provider-transient park", async () => {
+    // The `!limitFacts &&` guard in driveTurn is load-bearing HERE: this terminal is
+    // SIMULTANEOUSLY a genuine provider-transient (terminal_reason:"api_error",
+    // api_error_status:529 → isProviderTransient true) AND limit-bearing (a rejected
+    // rate-limit event with a FUTURE reset → classifyLimitEvidence returns limitFacts).
+    // The limit path must WIN. Folding the guard down to `if (isProviderTransient(terminal))`
+    // would instead throw ProviderTransientError → retry → TransientRecoveryError park,
+    // mislabeling a usage-limit death as a transient outage.
+    const IN_5H = Date.now() + 5 * 60 * 60 * 1000;
+    const { queryFn } = fakeTurns([
+      [
+        rateLimitEvent("rejected", { resetsAt: IN_5H, rateLimitType: "five_hour" }),
+        resultApiError(529, OVERLOADED_529),
+      ],
+    ]);
+    const err = await rejection(
+      new SdkExecutor(nullLogger(), homeDir, fast(queryFn, 2)).run(makeCtx().ctx),
+    );
+    assert.ok(err instanceof LimitReachedError, "the limit death wins over the provider-transient throw");
+    assert.ok(!(err instanceof ProviderTransientError), "not classified as a provider-transient error");
+    assert.ok(!(err instanceof TransientRecoveryError), "not parked as a transient outage");
+    assert.strictEqual(err.rateLimitType, "five_hour");
+    assert.strictEqual(err.resetsAtMs, IN_5H);
   });
 });

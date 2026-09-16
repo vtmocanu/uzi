@@ -105,8 +105,14 @@ WHERE c.run_id = @run_id AND c.user_id = @user_id;
 -- it releases EXACTLY the hold ListReleasableCustodyHolds qualified, so a sibling
 -- older-generation orphan hold on the same run is never collaterally released (the multi-hold
 -- hazard documented on ListReleasableCustodyHolds).
+--
+-- PRD #1392 M1 (D3): release_evidence records WHY this release was warranted — the
+-- reconciler passes the per-hold class ListReleasableCustodyHolds now computes ('publication'
+-- for a completed-run backstop, 'archive' for a ready capture). CHECK-constrained to the five
+-- classes (migration 00232).
 UPDATE recovery_custody_holds
 SET live_worker_id = NULL, live_run_id = NULL, state = 'released',
+    release_evidence = @release_evidence,
     released_at = now(), updated_at = now()
 WHERE id = @id AND state = 'open';
 
@@ -203,7 +209,24 @@ WHERE state IN ('preparing', 'uploading')
 -- run retains custody for capture/discard). Returns oldest-first for stable reconcile order;
 -- the reconciler releases the SPECIFIC selected hold by id (ReleaseCustodyHold), so selection
 -- and release agree per-hold and a sibling hold is never collaterally released.
-SELECT h.* FROM recovery_custody_holds h
+--
+-- PRD #1392 M1 (D3): `reason` is the per-hold RELEASE-EVIDENCE class the reconciler stamps
+-- when it releases this hold, so the stored evidence matches the qualifier that selected it:
+-- 'publication' when the completed-run backstop (a) qualifies it (the generation that
+-- published its head), else 'archive' (its source is durably captured). The CASE mirrors the
+-- WHERE's two disjuncts and prefers publication when both hold; a selected hold always
+-- satisfies at least one disjunct, so `reason` is never a spurious 'archive' on a hold that
+-- only the completed backstop qualified.
+SELECT h.*,
+    CASE
+        WHEN EXISTS (SELECT 1 FROM runs r
+                       WHERE r.id = h.run_id
+                         AND r.status = 'completed'
+                         AND h.generation = r.claim_generation)
+            THEN 'publication'
+        ELSE 'archive'
+    END::text AS reason
+FROM recovery_custody_holds h
 WHERE h.state = 'open'
   AND (
       EXISTS (SELECT 1 FROM runs r
@@ -277,8 +300,16 @@ RETURNING *;
 -- caller must have already established this generation's durable evidence (published head,
 -- available archive, or verified no-output). Idempotent: a second call moves zero rows.
 -- Captures survive; the immutable provenance columns are untouched.
+--
+-- PRD #1392 M1 (D3): release_evidence records WHY this release was warranted. The caller
+-- supplies the class: the terminal-completion release passes 'publication'; the worker
+-- Release endpoint passes an allowlisted request value ('publication' or 'forge_no_output');
+-- the forge pre-clone park passes 'no_adopted_source' (a generation that never adopted a
+-- source has nothing to prove against the forge). CHECK-constrained to the five classes
+-- (migration 00232).
 UPDATE recovery_custody_holds
 SET live_worker_id = NULL, live_run_id = NULL, state = 'released',
+    release_evidence = @release_evidence,
     released_at = now(), updated_at = now()
 WHERE run_id = @run_id
   AND generation = @generation
@@ -391,8 +422,13 @@ SELECT
 -- Captures are settled separately (DiscardNonReadyCapturesForHold); an available archive is
 -- NEVER touched here (archive deletion is a distinct owner choice, D7). Sibling holds and
 -- generations are left untouched.
+--
+-- PRD #1392 M1 (D3): release_evidence is stamped 'owner_discard' — the class recording that
+-- the owner explicitly discarded this hold's custody. The caller passes it as @release_evidence;
+-- CHECK-constrained to the five classes (migration 00232).
 UPDATE recovery_custody_holds
-SET state = 'discarded', live_worker_id = NULL, live_run_id = NULL, updated_at = now()
+SET state = 'discarded', live_worker_id = NULL, live_run_id = NULL,
+    release_evidence = @release_evidence, updated_at = now()
 WHERE id = @hold_id AND run_id = @run_id AND user_id = @user_id AND state = 'open';
 
 -- name: DiscardNonReadyCapturesForHold :execrows

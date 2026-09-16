@@ -82,6 +82,45 @@ describe("RunRunner — push_secret_blocked typed terminal (PRD #974 M2 / #1077)
     assert.strictEqual(pushed, 0, "a trusted secret finding must block the push entirely");
   });
 
+  it("trusted-scan block emits NO preservation claim and never attaches a preserved_patch", async () => {
+    git.secretScanRange = (async () => ({
+      trusted: true,
+      findings: [
+        {
+          file: "src/leak.ts",
+          startLine: 1,
+          commit: "deadbeefcafe",
+          ruleId: "generic-api-key",
+        },
+      ],
+    })) as typeof git.secretScanRange;
+    git.pushBranch = (async () => {}) as typeof git.pushBranch;
+
+    const claim = githubClaim(1005);
+    await githubRunner().execute(claim);
+
+    const failed = failedBody(claim.run_id);
+    // The invariant this bug protects: no diff is attached on the secret path.
+    assert.strictEqual(failed.preserved_patch, undefined);
+    // The terminal reason makes no preservation claim.
+    const reason = failed.failure_reason ?? "";
+    assert.ok(!reason.includes("preserved below"));
+    assert.ok(!reason.includes("diff is preserved"));
+    assert.match(reason, /withheld/);
+    // The emitted worker STATUS makes no preservation claim either.
+    const statusTexts = api
+      .messages(claim.run_id)
+      .filter((m) => m.kind === "status")
+      .map((m) => JSON.stringify(m.payload));
+    assert.ok(
+      statusTexts.some((t) => /Push Protection would reject/.test(t)),
+      "the trusted-scan block must emit its own secret-block worker status",
+    );
+    for (const t of statusTexts) {
+      assert.ok(!/preserv/i.test(t), `worker status must not claim preservation: ${t}`);
+    }
+  });
+
   it("GH013 backstop fails typed as push_secret_blocked and omits preserved_patch", async () => {
     // Fail-open scan (untrustworthy/empty): the pre-push block does not fire, so the run
     // reaches the finalize push and relies on GitHub's GH013 rejection backstop.

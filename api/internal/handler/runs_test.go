@@ -253,7 +253,7 @@ func TestRunToDTOStopKind(t *testing.T) {
 	stamped := runToDTO(store.Run{
 		Status:   "failed",
 		StopKind: pgtype.Text{String: "plan_rejected", Valid: true},
-	}, "normal", 0, 0, dtoTestNow)
+	}, "normal", 0, 0, 0, dtoTestNow)
 	if stamped.StopKind == nil {
 		t.Fatal("a stamped stop_kind must reach the RunDTO, got nil")
 	}
@@ -262,7 +262,7 @@ func TestRunToDTOStopKind(t *testing.T) {
 	}
 
 	// NULL column ⇒ nil pointer (omitted from JSON), never "".
-	unstamped := runToDTO(store.Run{Status: "completed"}, "normal", 0, 0, dtoTestNow)
+	unstamped := runToDTO(store.Run{Status: "completed"}, "normal", 0, 0, 0, dtoTestNow)
 	if unstamped.StopKind != nil {
 		t.Errorf("an unstamped stop_kind must map to nil, got %q", *unstamped.StopKind)
 	}
@@ -275,7 +275,7 @@ func TestRunToDTOStopReason(t *testing.T) {
 	stamped := runToDTO(store.Run{
 		Status:     "cancelled",
 		StopReason: pgtype.Text{String: "wrong approach, restarting", Valid: true},
-	}, "normal", 0, 0, dtoTestNow)
+	}, "normal", 0, 0, 0, dtoTestNow)
 	if stamped.StopReason == nil {
 		t.Fatal("a stamped stop_reason must reach the RunDTO, got nil")
 	}
@@ -284,7 +284,7 @@ func TestRunToDTOStopReason(t *testing.T) {
 	}
 
 	// NULL column ⇒ nil pointer (omitted from JSON), never "".
-	unstamped := runToDTO(store.Run{Status: "completed"}, "normal", 0, 0, dtoTestNow)
+	unstamped := runToDTO(store.Run{Status: "completed"}, "normal", 0, 0, 0, dtoTestNow)
 	if unstamped.StopReason != nil {
 		t.Errorf("an unstamped stop_reason must map to nil, got %q", *unstamped.StopReason)
 	}
@@ -304,7 +304,7 @@ func TestRunToDTODeadlineAt(t *testing.T) {
 		Status:            "running",
 		StartedAt:         pgtype.Timestamptz{Time: start, Valid: true},
 		BudgetWallSeconds: pgtype.Int4{Int32: 8 * 60 * 60, Valid: true},
-	}, "normal", globalTimeout, 0, dtoTestNow)
+	}, "normal", globalTimeout, 0, 0, dtoTestNow)
 	if issue.DeadlineAt == nil {
 		t.Fatal("a running issue run must carry a deadline_at, got nil")
 	}
@@ -318,7 +318,7 @@ func TestRunToDTODeadlineAt(t *testing.T) {
 		Kind:      "chat",
 		Status:    "running",
 		StartedAt: pgtype.Timestamptz{Time: start, Valid: true},
-	}, "normal", globalTimeout, 0, dtoTestNow)
+	}, "normal", globalTimeout, 0, 0, dtoTestNow)
 	if chat.DeadlineAt != nil {
 		t.Errorf("a running chat run must carry deadline_at null, got %v", *chat.DeadlineAt)
 	}
@@ -335,7 +335,7 @@ func TestRunToDTORequirementSet(t *testing.T) {
 		RequiredCapabilities: []string{"docker"},
 		RequiredTools:        []string{"go", "node"},
 		SizeClass:            "m",
-	}, "normal", 0, 0, dtoTestNow)
+	}, "normal", 0, 0, 0, dtoTestNow)
 	if len(populated.RequiredCapabilities) != 1 || populated.RequiredCapabilities[0] != "docker" {
 		t.Errorf("required_capabilities = %v, want [docker]", populated.RequiredCapabilities)
 	}
@@ -347,7 +347,7 @@ func TestRunToDTORequirementSet(t *testing.T) {
 	}
 
 	// Empty columns ⇒ non-nil empty slices ([] over null) and "" for size_class.
-	empty := runToDTO(store.Run{Status: "queued"}, "normal", 0, 0, dtoTestNow)
+	empty := runToDTO(store.Run{Status: "queued"}, "normal", 0, 0, 0, dtoTestNow)
 	if empty.RequiredCapabilities == nil || len(empty.RequiredCapabilities) != 0 {
 		t.Errorf("required_capabilities = %v, want non-nil empty", empty.RequiredCapabilities)
 	}
@@ -356,6 +356,56 @@ func TestRunToDTORequirementSet(t *testing.T) {
 	}
 	if empty.SizeClass != "" {
 		t.Errorf("size_class = %q, want empty", empty.SizeClass)
+	}
+}
+
+// TestRunToDTOForgeParkFields pins that PRD #1392 M1's four forge-park fields reach the RunDTO
+// runToDTO builds (served on GET /api/runs/{id} and the worker 409 bodies). Nothing tested this
+// mapping — folding ForgeParkCount to 0 left the suite green — so this is the mutation-confirmed
+// gap. Both directions, with DISTINCT count vs. max so a swap is caught: a forge-parked run
+// carries the typed cause, the retry stamp, the lifetime count, and forge_park_max = the
+// configured cap (passed to runToDTO, NOT a run column); an unparked/legacy run maps to
+// null/null/0 while forge_park_max still reflects the cap (it is instance config on every run).
+func TestRunToDTOForgeParkFields(t *testing.T) {
+	retry := time.Date(2026, 9, 15, 8, 30, 0, 0, time.UTC)
+	const cap = 6
+
+	parked := runToDTO(store.Run{
+		Status:                 "recovery_wait",
+		RecoveryWaitCause:      pgtype.Text{String: "forge_unreachable", Valid: true},
+		RecoveryRetryNotBefore: pgtype.Timestamptz{Time: retry, Valid: true},
+		ForgeParkCount:         3,
+	}, "normal", 0, 0, cap, dtoTestNow)
+	if parked.RecoveryWaitCause == nil || *parked.RecoveryWaitCause != "forge_unreachable" {
+		t.Errorf("recovery_wait_cause = %v, want forge_unreachable", parked.RecoveryWaitCause)
+	}
+	if parked.RecoveryRetryNotBefore == nil || !parked.RecoveryRetryNotBefore.Equal(retry) {
+		t.Errorf("recovery_retry_not_before = %v, want %v", parked.RecoveryRetryNotBefore, retry)
+	}
+	if parked.ForgeParkCount != 3 {
+		t.Errorf("forge_park_count = %d, want 3", parked.ForgeParkCount)
+	}
+	// forge_park_max is the caller-supplied cap (6), NOT the run's count (3) — swapping the two
+	// (a plausible mapper bug) reddens because 6 != 3, and dropping the ForgeParkMax line reddens
+	// because the zero value 0 != 6.
+	if parked.ForgeParkMax != cap {
+		t.Errorf("forge_park_max = %d, want %d (the configured cap)", parked.ForgeParkMax, cap)
+	}
+
+	// An unparked/legacy run: NULL cause + NULL retry + zero count → null/null/0.
+	legacy := runToDTO(store.Run{Status: "completed"}, "normal", 0, 0, cap, dtoTestNow)
+	if legacy.RecoveryWaitCause != nil {
+		t.Errorf("legacy recovery_wait_cause = %q, want nil", *legacy.RecoveryWaitCause)
+	}
+	if legacy.RecoveryRetryNotBefore != nil {
+		t.Errorf("legacy recovery_retry_not_before = %v, want nil", *legacy.RecoveryRetryNotBefore)
+	}
+	if legacy.ForgeParkCount != 0 {
+		t.Errorf("legacy forge_park_count = %d, want 0", legacy.ForgeParkCount)
+	}
+	// forge_park_max is present on EVERY run (instance config), independent of park state.
+	if legacy.ForgeParkMax != cap {
+		t.Errorf("legacy forge_park_max = %d, want %d (the cap rides every run)", legacy.ForgeParkMax, cap)
 	}
 }
 

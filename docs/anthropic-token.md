@@ -198,7 +198,7 @@ can skip the wait with `uzi run resume-now <run-id>` or the run view's
 nothing pooled to spend at all, not that a pooled token hit its rate limit.
 It is also different from [a transient-recovery
 park](run-recovery-wait.md): `pool_wait` means there was nothing pooled to
-spend, not that a resumed turn came back empty.
+spend, not that a resumed turn hit a transient interruption.
 
 ### Reading it back
 

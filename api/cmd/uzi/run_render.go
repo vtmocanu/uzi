@@ -938,7 +938,7 @@ func compactPayload(raw json.RawMessage) string {
 // user's own text, sanitized like any free text bound for a TTY. State is derived per
 // kind — from (consumed_at, runStatus) for a follow_up, from disposition for a scope
 // directive; age is relative to created_at.
-func renderRunInputs(p *uzicli.Printer, inputs []apitypes.SteerInputDTO, runStatus string) error {
+func renderRunInputs(p *uzicli.Printer, inputs []apitypes.SteerInputDTO, runStatus string, recoveryCause ...string) error {
 	rows := make([][]string, 0, len(inputs))
 	for _, in := range inputs {
 		body := "-"
@@ -948,7 +948,7 @@ func renderRunInputs(p *uzicli.Printer, inputs []apitypes.SteerInputDTO, runStat
 		rows = append(rows, []string{
 			steerKindLabel(in.Kind),
 			body,
-			steerState(in.Kind, in.ConsumedAt, in.Disposition, runStatus),
+			steerState(in.Kind, in.ConsumedAt, in.Disposition, runStatus, recoveryCause...),
 			relAge(in.CreatedAt),
 		})
 	}
@@ -989,7 +989,12 @@ func steerKindLabel(kind string) string {
 // anything is currently acting on it. Rewriting "queued" to something else on a parked
 // run would be the same lie as dropping the park entirely, one level down: the queue
 // state is still queued.
-func steerState(kind string, consumedAt *time.Time, disposition *string, runStatus string) string {
+//
+// PRD #1392 M5: recoveryCause is the optional RecoveryWaitCause of a recovery_wait run — a
+// variadic tail so the ~two dozen existing call sites that do not have it stay valid. When
+// it is "forge_unreachable" the recovery suffix names the forge instead of the transient
+// empty turn.
+func steerState(kind string, consumedAt *time.Time, disposition *string, runStatus string, recoveryCause ...string) string {
 	// PRD #634: a scope directive's state IS its disposition — it is never consumed, so
 	// consumed_at/runStatus carry no delivery signal for it. A nil disposition means the
 	// ceiling is still pending (only reachable on a live run).
@@ -1015,9 +1020,16 @@ func steerState(kind string, consumedAt *time.Time, disposition *string, runStat
 	// PRD #754: a pool_wait run is HELD on an empty token pool, not a usage limit, so its
 	// suffix names the actual reason (distinct copy for a distinct hold).
 	const heldSuffix = " (run held on an empty token pool)"
-	// issue #1197: a recovery_wait run is parked recovering from a transient empty turn,
+	// issue #1197: a recovery_wait run is parked recovering from a transient interruption,
 	// neither a usage limit nor an empty pool, so its suffix names the actual reason.
-	const recoveringSuffix = " (run recovering from a transient empty turn)"
+	// PRD #1392 M5: a forge-unreachable park names the forge instead — the compact core of
+	// the shared "waiting for the forge …" wording (the retry/cap detail is width-shed here,
+	// it lives on the fuller run-get notice and the web panel). issue #1088 widened the
+	// non-forge cause to any transient interruption (a transient empty turn or provider outage).
+	recoveringSuffix := " (run recovering from a transient interruption)"
+	if len(recoveryCause) > 0 && recoveryCause[0] == forgeUnreachableCause {
+		recoveringSuffix = " (run waiting for the forge)"
+	}
 	if consumedAt == nil {
 		if terminalRunStatuses[runStatus] {
 			return "not delivered (run finished)"
@@ -1059,6 +1071,34 @@ func steerState(kind string, consumedAt *time.Time, disposition *string, runStat
 		return "delivered" + recoveringSuffix
 	}
 	return "delivered"
+}
+
+// forgeUnreachableCause is the RecoveryWaitCause a pre-clone forge-unreachable park writes
+// (PRD #1392 M1). It is the one recovery_wait cause that earns forge-specific surface
+// wording; a null/other cause keeps the generic transient-interruption wording (issue #1197/#1088).
+const forgeUnreachableCause = "forge_unreachable"
+
+// isForgePark reports whether a recovery_wait run is parked because the forge was
+// unreachable (PRD #1392 M5) — the one cause that swaps in forge-specific surface wording.
+func isForgePark(r apitypes.RunDTO) bool {
+	return r.Status == statusRecoveryWait && strOr(r.RecoveryWaitCause, "") == forgeUnreachableCause
+}
+
+// forgeParkLine is the shared "waiting for the forge, retry at HH:MM (N of MAX)" wording
+// (PRD #1392 M5) the CLI and web keep consistent for a forge-unreachable recovery park. MAX
+// renders "unlimited" when the cap is disabled (ForgeParkMax == 0); the retry clause is
+// dropped when the server sent no retry stamp. HH:MM is the viewer's local wall clock, the
+// same idiom as the near-timeout / times-out rows above.
+func forgeParkLine(r apitypes.RunDTO) string {
+	capLabel := "unlimited"
+	if r.ForgeParkMax != 0 {
+		capLabel = itoa(r.ForgeParkMax)
+	}
+	count := itoa(r.ForgeParkCount) + " of " + capLabel
+	if r.RecoveryRetryNotBefore != nil {
+		return "waiting for the forge, retry at " + r.RecoveryRetryNotBefore.Local().Format("15:04") + " (" + count + ")"
+	}
+	return "waiting for the forge (" + count + ")"
 }
 
 // limitWaitLine is the ONE sentence every CLI surface renders for a parked run

@@ -30,9 +30,11 @@ func TestCoerceFailOrigin(t *testing.T) {
 	// Server-authoritative classes are NOT worker-reportable: a worker naming one is a
 	// forgery and must coerce to nil (→ the failed arm defaults to agent_failure), so a
 	// worker cannot inject worker_lost/run_timeout/plan_rejected/auto_stopped/
-	// guardrail_blocked into the trusted classification, nor steer Gate 4b via a forged
-	// guardrail_blocked. Each must still be a real stored member (else the split is stale).
-	serverOnly := []string{"worker_lost", "run_timeout", "plan_rejected", "auto_stopped", "guardrail_blocked"}
+	// guardrail_blocked/forge_unreachable into the trusted classification, nor steer Gate 4b
+	// via a forged guardrail_blocked/forge_unreachable. Each must still be a real stored member
+	// (else the split is stale). forge_unreachable (PRD #1392 M1) is server-derived: SetState's
+	// forge-park transaction stamps it directly, never the worker.
+	serverOnly := []string{"worker_lost", "run_timeout", "plan_rejected", "auto_stopped", "guardrail_blocked", "forge_unreachable"}
 	for _, s := range serverOnly {
 		if !failOriginSet[s] {
 			t.Fatalf("%q is in the server-only list but not in the stored vocabulary", s)
@@ -65,7 +67,10 @@ func TestCoerceFailOrigin(t *testing.T) {
 // parses the migration rather than restating the list, because a second hand-typed copy
 // is exactly the drift it prevents.
 func TestFailOriginVocabularyMatchesCheck(t *testing.T) {
-	const path = "../store/migrations/00186_run_push_secret_blocked.sql"
+	// The CURRENT fail_origin CHECK is declared by the LATEST migration that widened it, not
+	// 00186 (which added push_secret_blocked): PRD #1392 M1's 00232 re-declares it with the
+	// thirteenth value forge_unreachable, so this parses THAT migration's Up-section CHECK.
+	const path = "../store/migrations/00232_forge_unreachable_park.sql"
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read %s: %v", path, err)
