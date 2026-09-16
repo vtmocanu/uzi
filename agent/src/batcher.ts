@@ -104,6 +104,13 @@ function classify(err: unknown): Verdict {
   if (err instanceof RequestError) {
     if (err.status === 413) return "oversize";
     if (err.status === 401 || err.status === 403 || err.status === 404) return "fatal";
+    // PRD #1247 M5 (BLOCKING-4): a 409 carrying the stale_claim disposition means a held-state
+    // switch RELEASED this claim or a reclaim SUPERSEDED it — EVERY message in the batch fences
+    // out server-side (and so would every tombstone), so bisecting only burns budget. Treat it
+    // like a fatal reject and stop delivering: the /state path already stops the superseded
+    // flight, and this old flight's own terminal report is itself generation-fenced, so the trip
+    // never actually fails the run (which the new flight now owns).
+    if (err.status === 409 && err.body.includes('"stale_claim"')) return "fatal";
     if (isTransient(err)) return "transient";
     return "permanent";
   }

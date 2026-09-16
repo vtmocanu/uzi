@@ -21,6 +21,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
@@ -492,8 +493,8 @@ func (u *unstorableStore) GetRunOwnedByWorker(context.Context, store.GetRunOwned
 	return store.Run{}, nil
 }
 
-func (u *unstorableStore) InsertRunMessage(context.Context, store.InsertRunMessageParams) (int64, error) {
-	return 0, u.insertErr
+func (u *unstorableStore) InsertRunMessage(context.Context, store.InsertRunMessageParams) (store.InsertRunMessageRow, error) {
+	return store.InsertRunMessageRow{}, u.insertErr
 }
 
 func postToFakeStore(t *testing.T, insertErr error) *httptest.ResponseRecorder {
@@ -728,8 +729,8 @@ func (s *foldingStore) GetRunOwnedByWorker(context.Context, store.GetRunOwnedByW
 	return store.Run{}, nil
 }
 
-func (s *foldingStore) InsertRunMessage(context.Context, store.InsertRunMessageParams) (int64, error) {
-	return 1, nil
+func (s *foldingStore) InsertRunMessage(context.Context, store.InsertRunMessageParams) (store.InsertRunMessageRow, error) {
+	return store.InsertRunMessageRow{Inserted: true, GenerationLive: pgtype.Bool{Bool: true, Valid: true}}, nil
 }
 
 func (s *foldingStore) UpdateRunLastSeq(context.Context, store.UpdateRunLastSeqParams) (int64, error) {

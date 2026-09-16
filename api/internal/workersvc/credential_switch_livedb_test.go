@@ -1,6 +1,7 @@
 package workersvc
 
 import (
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -442,10 +443,13 @@ func TestInsertRunMessageFenceLiveDB(t *testing.T) {
 		t.Fatalf("message count = %d, want 1 (the current-generation append lands)", countMsgs())
 	}
 
-	// (2) Release the claim, then a same-generation batch must land NOTHING (fenced).
+	// (2) Release the claim, then a same-generation batch must land NOTHING (fenced) AND report the
+	// stale generation to its caller (BLOCKING-4): a fenced-out capability batch now returns
+	// ErrStaleClaim instead of the old silent nil, so the worker STOPS rather than folding stale
+	// usage and treating the no-op as success.
 	env.exec(`UPDATE runs SET claim_released_at = now() WHERE id = $1`, id)
-	if err := svc.AppendMessagesForClaim(env.ctx, wkr, id, []IncomingMessage{msg(2)}, &g); err != nil {
-		t.Fatalf("append on released claim: %v", err)
+	if err := svc.AppendMessagesForClaim(env.ctx, wkr, id, []IncomingMessage{msg(2)}, &g); !errors.Is(err, ErrStaleClaim) {
+		t.Fatalf("append on released claim: err = %v, want ErrStaleClaim", err)
 	}
 	if countMsgs() != 1 {
 		t.Fatalf("message count = %d, want 1 (a released-claim append is fenced out)", countMsgs())
@@ -457,6 +461,66 @@ func TestInsertRunMessageFenceLiveDB(t *testing.T) {
 	}
 	if countMsgs() != 2 {
 		t.Fatalf("message count = %d, want 2 (a legacy append is unfenced)", countMsgs())
+	}
+}
+
+// TestAppendUsageFoldFencedOnStaleGenerationLiveDB is the BLOCKING-4 regression: a DELAYED
+// result-frame batch from an OLD flight must NOT fold usage after the claim is released/reclaimed.
+// Before the fix a fenced-out insert looked like a benign duplicate (rows == 0), so appendMessages
+// advanced its high-water and folded usage over the STALE frames — an OLD generation mutating
+// run_usage after reclaim. Now a fenced-out capability batch returns ErrStaleClaim BEFORE any
+// high-water or fold. It covers a frame arriving BEFORE a reclaim (live generation → folds) and the
+// SAME-generation frame arriving AFTER a reclaim (stale → refused, nothing folded). Reverting
+// appendMessages to treat generation_live == false as a duplicate reddens the stale assertions.
+func TestAppendUsageFoldFencedOnStaleGenerationLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	svc := New(env.q, env.box, testParams())
+	o := seedReevalOwner(t, env, BindModeAuto, false)
+	wkr := store.Worker{ID: o.workerID, UserID: o.userID}
+	g := int64(4)
+	id := seedHeldRun(t, env, o, 5620, "running", g, false, false)
+
+	resultFrame := func(seq int32, model string, inTok int) IncomingMessage {
+		payload, err := json.Marshal(map[string]any{
+			"event": "result",
+			"modelUsage": map[string]any{
+				model: map[string]any{"inputTokens": inTok, "outputTokens": 0, "costUSD": 0.0, "costStatus": "subscription"},
+			},
+		})
+		if err != nil {
+			t.Fatalf("marshal result frame: %v", err)
+		}
+		return IncomingMessage{Seq: seq, Kind: "status", Agent: "lead", Payload: payload}
+	}
+	usageInputFor := func(model string) int64 {
+		var in int64
+		if err := env.pool.QueryRow(env.ctx,
+			`SELECT COALESCE(sum(input_tokens), 0) FROM run_usage WHERE run_id = $1 AND model = $2`,
+			id, model).Scan(&in); err != nil {
+			t.Fatalf("read run_usage (%s): %v", model, err)
+		}
+		return in
+	}
+
+	// (A) BEFORE a reclaim: at the current generation the frame lands and usage folds.
+	if err := svc.AppendMessagesForClaim(env.ctx, wkr, id, []IncomingMessage{resultFrame(1, "m-live", 100)}, &g); err != nil {
+		t.Fatalf("append at current generation: %v", err)
+	}
+	if got := usageInputFor("m-live"); got != 100 {
+		t.Fatalf("a live-generation result frame did not fold: input_tokens = %d, want 100", got)
+	}
+
+	// (B) Reclaim: a fresh claim bumps claim_generation and clears claim_released_at. A DELAYED
+	// batch from the OLD flight (old generation g) must FENCE OUT → ErrStaleClaim, folding NOTHING.
+	env.exec(`UPDATE runs SET claim_generation = claim_generation + 1, claim_released_at = NULL WHERE id = $1`, id)
+	if err := svc.AppendMessagesForClaim(env.ctx, wkr, id, []IncomingMessage{resultFrame(2, "m-stale", 999)}, &g); !errors.Is(err, ErrStaleClaim) {
+		t.Fatalf("delayed old-generation batch: err = %v, want ErrStaleClaim", err)
+	}
+	if got := usageInputFor("m-stale"); got != 0 {
+		t.Fatalf("a stale-generation result frame folded usage: input_tokens = %d, want 0", got)
+	}
+	if got := usageInputFor("m-live"); got != 100 {
+		t.Fatalf("the stale batch disturbed the live row: input_tokens = %d, want 100", got)
 	}
 }
 

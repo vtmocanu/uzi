@@ -955,16 +955,18 @@ func (f *fakeStore) InsertAgentMemory(_ context.Context, arg store.InsertAgentMe
 func (f *fakeStore) EvictAgentMemoryOverCap(context.Context, store.EvictAgentMemoryOverCapParams) error {
 	return nil
 }
-func (f *fakeStore) InsertRunMessage(_ context.Context, arg store.InsertRunMessageParams) (int64, error) {
+func (f *fakeStore) InsertRunMessage(_ context.Context, arg store.InsertRunMessageParams) (store.InsertRunMessageRow, error) {
 	f.insertedMessages = append(f.insertedMessages, arg)
 	if f.insertedSeqs == nil {
 		f.insertedSeqs = map[int32]bool{}
 	}
+	live := store.InsertRunMessageRow{GenerationLive: pgtype.Bool{Bool: true, Valid: true}}
 	if f.insertedSeqs[arg.Seq] {
-		return 0, nil // ON CONFLICT DO NOTHING
+		return live, nil // ON CONFLICT DO NOTHING — a benign duplicate at the live generation
 	}
 	f.insertedSeqs[arg.Seq] = true
-	return 1, nil
+	live.Inserted = true
+	return live, nil
 }
 func (f *fakeStore) UpdateRunLastSeq(_ context.Context, arg store.UpdateRunLastSeqParams) (int64, error) {
 	v := arg.Seq

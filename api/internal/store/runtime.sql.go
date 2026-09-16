@@ -4219,19 +4219,30 @@ func (q *Queries) HeartbeatWorker(ctx context.Context, arg HeartbeatWorkerParams
 	return i, err
 }
 
-const insertRunMessage = `-- name: InsertRunMessage :execrows
+const insertRunMessage = `-- name: InsertRunMessage :one
 
-INSERT INTO run_messages (run_id, seq, kind, agent, agent_instance, agent_label, payload)
-SELECT $1, $2, $3, $4, $5, $6, $7
-WHERE $8::bigint IS NULL
-   OR EXISTS (SELECT 1 FROM runs r
-              WHERE r.id = $1
-                AND r.claim_generation = $8::bigint
-                AND r.claim_released_at IS NULL)
-ON CONFLICT (run_id, seq) DO NOTHING
+WITH ins AS (
+    INSERT INTO run_messages (run_id, seq, kind, agent, agent_instance, agent_label, payload)
+    SELECT $2, $3, $4, $5, $6, $7, $8
+    WHERE $1::bigint IS NULL
+       OR EXISTS (SELECT 1 FROM runs r
+                  WHERE r.id = $2
+                    AND r.claim_generation = $1::bigint
+                    AND r.claim_released_at IS NULL)
+    ON CONFLICT (run_id, seq) DO NOTHING
+    RETURNING 1 AS one
+)
+SELECT
+    EXISTS (SELECT 1 FROM ins) AS inserted,
+    ($1::bigint IS NULL
+     OR EXISTS (SELECT 1 FROM runs r
+                WHERE r.id = $2
+                  AND r.claim_generation = $1::bigint
+                  AND r.claim_released_at IS NULL)) AS generation_live
 `
 
 type InsertRunMessageParams struct {
+	ClaimGeneration pgtype.Int8 `json:"claim_generation"`
 	RunID           uuid.UUID   `json:"run_id"`
 	Seq             int32       `json:"seq"`
 	Kind            string      `json:"kind"`
@@ -4239,7 +4250,11 @@ type InsertRunMessageParams struct {
 	AgentInstance   pgtype.Text `json:"agent_instance"`
 	AgentLabel      pgtype.Text `json:"agent_label"`
 	Payload         []byte      `json:"payload"`
-	ClaimGeneration pgtype.Int8 `json:"claim_generation"`
+}
+
+type InsertRunMessageRow struct {
+	Inserted       bool        `json:"inserted"`
+	GenerationLive pgtype.Bool `json:"generation_live"`
 }
 
 // Messages -----------------------------------------------------------------
@@ -4253,8 +4268,17 @@ type InsertRunMessageParams struct {
 // the same statement as the insert, no TOCTOU). A legacy caller (NULL generation) inserts
 // unconditionally, byte-identical to before the fence. Preferring this per-query guard over a
 // FOR UPDATE tx per message keeps the hot append path a single round-trip.
-func (q *Queries) InsertRunMessage(ctx context.Context, arg InsertRunMessageParams) (int64, error) {
-	result, err := q.db.Exec(ctx, insertRunMessage,
+//
+// BLOCKING-4 rework: return BOTH `inserted` (did this call add a row) AND `generation_live` (did
+// the fence predicate hold), computed in the SAME statement snapshot as the insert's WHERE, so
+// the caller can tell a benign duplicate (generation_live, not inserted — the row is already
+// persisted at the live generation) from a FENCE REJECTION (NOT generation_live — the batch is
+// from a released/reclaimed OLD flight and persisted nothing). Both used to surface as :execrows
+// == 0, so the caller advanced its high-water mark and folded usage over STALE frames. A legacy
+// (NULL generation) caller always sees generation_live = TRUE, byte-identical to before.
+func (q *Queries) InsertRunMessage(ctx context.Context, arg InsertRunMessageParams) (InsertRunMessageRow, error) {
+	row := q.db.QueryRow(ctx, insertRunMessage,
+		arg.ClaimGeneration,
 		arg.RunID,
 		arg.Seq,
 		arg.Kind,
@@ -4262,12 +4286,10 @@ func (q *Queries) InsertRunMessage(ctx context.Context, arg InsertRunMessagePara
 		arg.AgentInstance,
 		arg.AgentLabel,
 		arg.Payload,
-		arg.ClaimGeneration,
 	)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
+	var i InsertRunMessageRow
+	err := row.Scan(&i.Inserted, &i.GenerationLive)
+	return i, err
 }
 
 const invalidatePriorCompletionPermits = `-- name: InvalidatePriorCompletionPermits :execrows

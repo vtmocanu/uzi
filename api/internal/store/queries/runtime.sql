@@ -3316,7 +3316,7 @@ WHERE worker_id = @worker_id
 
 -- Messages -----------------------------------------------------------------
 
--- name: InsertRunMessage :execrows
+-- name: InsertRunMessage :one
 -- Idempotent seq-numbered append: a re-delivered batch (worker retry) is a
 -- no-op on the duplicate (run_id, seq).
 --
@@ -3327,14 +3327,32 @@ WHERE worker_id = @worker_id
 -- the same statement as the insert, no TOCTOU). A legacy caller (NULL generation) inserts
 -- unconditionally, byte-identical to before the fence. Preferring this per-query guard over a
 -- FOR UPDATE tx per message keeps the hot append path a single round-trip.
-INSERT INTO run_messages (run_id, seq, kind, agent, agent_instance, agent_label, payload)
-SELECT @run_id, @seq, @kind, @agent, @agent_instance, @agent_label, @payload
-WHERE sqlc.narg('claim_generation')::bigint IS NULL
-   OR EXISTS (SELECT 1 FROM runs r
-              WHERE r.id = @run_id
-                AND r.claim_generation = sqlc.narg('claim_generation')::bigint
-                AND r.claim_released_at IS NULL)
-ON CONFLICT (run_id, seq) DO NOTHING;
+--
+-- BLOCKING-4 rework: return BOTH `inserted` (did this call add a row) AND `generation_live` (did
+-- the fence predicate hold), computed in the SAME statement snapshot as the insert's WHERE, so
+-- the caller can tell a benign duplicate (generation_live, not inserted — the row is already
+-- persisted at the live generation) from a FENCE REJECTION (NOT generation_live — the batch is
+-- from a released/reclaimed OLD flight and persisted nothing). Both used to surface as :execrows
+-- == 0, so the caller advanced its high-water mark and folded usage over STALE frames. A legacy
+-- (NULL generation) caller always sees generation_live = TRUE, byte-identical to before.
+WITH ins AS (
+    INSERT INTO run_messages (run_id, seq, kind, agent, agent_instance, agent_label, payload)
+    SELECT @run_id, @seq, @kind, @agent, @agent_instance, @agent_label, @payload
+    WHERE sqlc.narg('claim_generation')::bigint IS NULL
+       OR EXISTS (SELECT 1 FROM runs r
+                  WHERE r.id = @run_id
+                    AND r.claim_generation = sqlc.narg('claim_generation')::bigint
+                    AND r.claim_released_at IS NULL)
+    ON CONFLICT (run_id, seq) DO NOTHING
+    RETURNING 1 AS one
+)
+SELECT
+    EXISTS (SELECT 1 FROM ins) AS inserted,
+    (sqlc.narg('claim_generation')::bigint IS NULL
+     OR EXISTS (SELECT 1 FROM runs r
+                WHERE r.id = @run_id
+                  AND r.claim_generation = sqlc.narg('claim_generation')::bigint
+                  AND r.claim_released_at IS NULL)) AS generation_live;
 
 -- name: ListRunMessagesAfter :many
 -- Replay for a (re)connecting browser: everything after its last-seen seq, in

@@ -858,7 +858,10 @@ type Store interface {
 	RunPriorityClassForRun(ctx context.Context, arg store.RunPriorityClassForRunParams) (string, error)
 
 	// Messages + inputs.
-	InsertRunMessage(ctx context.Context, arg store.InsertRunMessageParams) (int64, error)
+	// InsertRunMessage returns whether the row was inserted (vs a benign duplicate) AND whether
+	// the generation fence held (generation_live) — so a fenced-out stale-generation batch is
+	// distinguishable from a duplicate (BLOCKING-4 rework).
+	InsertRunMessage(ctx context.Context, arg store.InsertRunMessageParams) (store.InsertRunMessageRow, error)
 	ListRunMessagesAfter(ctx context.Context, arg store.ListRunMessagesAfterParams) ([]store.RunMessage, error)
 	ListRunMessagesAfterPage(ctx context.Context, arg store.ListRunMessagesAfterPageParams) ([]store.RunMessage, error)
 	ListRunMessagesBeforePage(ctx context.Context, arg store.ListRunMessagesBeforePageParams) ([]store.RunMessage, error)

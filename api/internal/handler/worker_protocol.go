@@ -757,6 +757,14 @@ func (h *Handler) WorkerRunMessages(w http.ResponseWriter, r *http.Request) {
 			// the refuse ack — a protocol violation the worker fixes by stamping the generation,
 			// distinct from the 404 (not owned) and 400 (bad/unstorable batch) causes.
 			httpx.Error(w, http.StatusConflict, "this worker must stamp claim_generation on every message batch")
+		case errors.Is(err, workersvc.ErrStaleClaim):
+			// PRD #1247 M5 (BLOCKING-4 rework): the message batch fenced out — a held-state switch
+			// RELEASED this claim or a reclaim SUPERSEDED it, so it persisted NOTHING and no usage
+			// was folded. Answer the same stale_claim 409 disposition WorkerRunState uses, which
+			// the worker reads to STOP the old flight rather than treat a 409 as a permanent
+			// per-message reject and bisect the batch. The old flight no longer owns the run, so no
+			// run DTO is carried — the disposition is the whole signal.
+			httpx.JSON(w, http.StatusConflict, map[string]any{"disposition": "stale_claim"})
 		case errors.Is(err, workersvc.ErrInvalidMessage):
 			httpx.Error(w, http.StatusBadRequest, "each message needs a positive seq, a kind, and a JSON payload")
 		case errors.Is(err, workersvc.ErrUnstorableMessage):

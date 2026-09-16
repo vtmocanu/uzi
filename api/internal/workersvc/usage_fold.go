@@ -59,6 +59,12 @@ func (s *Service) appendAndRecord(ctx context.Context, wkr store.Worker, runID u
 		// NOT a persistence failure. Do NOT record a streak against the run for the worker's
 		// missing field (recording here would build a spurious kill streak). Placed FIRST so it
 		// skips the recorder regardless of the run's status.
+	case errors.Is(err, ErrStaleClaim):
+		// PRD #1247 M5 (BLOCKING-4 rework): the batch fenced out — the run was released or
+		// reclaimed under this OLD flight, so it persisted nothing. Like the missing-generation
+		// case this is NOT a persistence failure of the run; recording a streak here would punish
+		// a run for a superseded flight's late delivery. Skip the recorder; the handler answers
+		// the worker a stale_claim 409 so the old flight STOPS.
 	case !obs.resolved:
 		// Ownership never resolved (ErrRunNotOwned, or the lookup itself failed), so
 		// this run is not this worker's to vouch for. Recording here is what would let
@@ -360,7 +366,7 @@ func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uu
 	var insertErr error
 	inserted := make([]IncomingMessage, 0, len(msgs))
 	for _, m := range msgs {
-		rows, err := s.q.InsertRunMessage(ctx, store.InsertRunMessageParams{
+		res, err := s.q.InsertRunMessage(ctx, store.InsertRunMessageParams{
 			RunID:         runID,
 			Seq:           m.Seq,
 			Kind:          m.Kind,
@@ -393,12 +399,23 @@ func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uu
 			}
 			break
 		}
+		// BLOCKING-4 rework: distinguish a benign duplicate from a GENERATION-FENCE REJECTION. A
+		// capability worker's batch that fenced out (generation_live == false) persisted NOTHING —
+		// the run was released or reclaimed under this old flight — so return "stale" BEFORE
+		// advancing the high-water mark and BEFORE foldRunUsage, which would otherwise mutate
+		// run_usage with an OLD generation's frames after release/reclaim. Both the fence rejection
+		// and a benign duplicate used to look like rows == 0; only the former is stale. A legacy
+		// (nil generation) caller always sees generation_live == true, so this never fires for it.
+		if claimGen != nil && !res.GenerationLive.Bool {
+			return obs, ErrStaleClaim
+		}
 		if m.Seq > maxStored {
 			maxStored = m.Seq
 		}
-		// rows == 0 means a duplicate (run_id, seq) — a worker re-delivery. Only
-		// broadcast genuinely new messages so a retry never double-emits over WS.
-		if rows > 0 {
+		// A live-generation insert that added no row is a duplicate (run_id, seq) — a worker
+		// re-delivery, already stored. Only broadcast genuinely new messages so a retry never
+		// double-emits over WS.
+		if res.Inserted {
 			inserted = append(inserted, m)
 		}
 	}
