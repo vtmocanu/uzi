@@ -261,7 +261,7 @@ func TestSubmitAnswerScrubsSecretsInEveryAnswer(t *testing.T) {
 	svc := New(fs, newBox(t), testParams())
 
 	secrets := []string{
-		"glpat-AAAAAAAAAAAAAAAAAAAA",
+		"glpat-" + "AAAAAAAAAAAAAAAAAAAA", // assembled from parts so no contiguous glpat-<20> literal sits in source
 		"sk-ant-api03-BBBBBBBBBBBBBBBBBBBB",
 		"xoxb-111111111111-CCCCCCCCCCCC",
 		"uzc_DDDDDDDDDDDDDDDDDDDD",

@@ -16,7 +16,7 @@ import { reportIncidentalIssueToolName, FINDINGS_SERVER_NAME } from "../src/find
 import { FORGE_SERVER_NAME } from "../src/forge-tools.js";
 import { MEMORY_SERVER_NAME } from "../src/memory-tools.js";
 import { SIGNAL_SERVER_NAME } from "../src/signals.js";
-import { FINDINGS_NUDGE_APPEND, WORKER_RUNTIME_APPEND } from "../src/prompt.js";
+import { FINDINGS_NUDGE_APPEND, SECRET_FIXTURE_HYGIENE_APPEND, WORKER_RUNTIME_APPEND } from "../src/prompt.js";
 import type { AgentTemplate } from "../src/protocol.js";
 
 // PRD #457: toDefinition now grants the incidental-findings tool to every non-empty
@@ -25,8 +25,9 @@ import type { AgentTemplate } from "../src/protocol.js";
 const FINDINGS_TOOL = reportIncidentalIssueToolName();
 // PRD #702 M5: toDefinition also appends the worker-runtime deps note (WORKER_RUNTIME_APPEND)
 // after the findings nudge, in that order — mirror the composition here.
+// PRD #1120: and the secret-fixture hygiene rule (SECRET_FIXTURE_HYGIENE_APPEND) last.
 const withNudge = (body: string) =>
-  `${body}\n\n${FINDINGS_NUDGE_APPEND}\n\n${WORKER_RUNTIME_APPEND}`;
+  `${body}\n\n${FINDINGS_NUDGE_APPEND}\n\n${WORKER_RUNTIME_APPEND}\n\n${SECRET_FIXTURE_HYGIENE_APPEND}`;
 
 const coder: AgentTemplate = {
   name: "coder",
