@@ -37,5 +37,9 @@
   "anthropic_secret_id": "x",
   "anthropic_secret_label": "x",
   "anthropic_bind_mode": "x",
+  "outbox_pending_messages": 1,
+  "outbox_pending_terminal": 1,
+  "outbox_stale_retired": 1,
+  "outbox_blocked": "x",
   "owner_email": "x"
 }

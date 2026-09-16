@@ -14,6 +14,7 @@ import {
   type ReportFindingRequest,
   type HeartbeatRequest,
   type MessagesRequest,
+  type OutboxHeartbeatEntry,
   type OutgoingMessage,
   type RegisterRequest,
   type RegisterResponse,
@@ -248,11 +249,25 @@ export class WorkerClient {
   private readonly terminalRetrySchedule: number[];
   private readonly httpTimeoutMs: number;
   private readonly codexHTTPTimeoutMs: number;
-  /** PRD #1392 M2 (D7): the protocol features the api advertised at `register`, so the runner
-   *  can pick a capability-aware degradation for a pre-clone forge-unreachable park. Empty until
-   *  `register` runs, and stays `[]` when an OLDER api returns no `protocol_features` — so a
-   *  reader treats "no features" as the safe default (negotiate nothing). */
-  protocolFeatures: string[] = [];
+  /**
+   * The PROTOCOL FEATURES the server advertised on the last successful register. ONE
+   * shared negotiation wire (PRD #1392 D7 / #1391 D8): `register()` REPLACES the set from
+   * `RegisterResponse.protocol_features`, and a strict-decode rollback fallback CLEARS it
+   * (so nothing negotiated is sent again until process restart). Empty until the first
+   * register, so a client that has not registered sends today's byte-identical wire.
+   */
+  private serverFeatures = new Set<string>();
+
+  /** The advertised features as an array (PRD #1392 D7): the runner reads this to pick a
+   *  capability-aware degradation for a pre-clone forge-unreachable park. Backed by
+   *  `serverFeatures` so the two views never diverge and a rollback clear empties both. The
+   *  setter routes through the same set (a test that skips register can seed it directly). */
+  get protocolFeatures(): string[] {
+    return [...this.serverFeatures];
+  }
+  set protocolFeatures(v: string[]) {
+    this.serverFeatures = new Set(v);
+  }
 
   constructor(
     private readonly baseUrl: string,
@@ -297,22 +312,62 @@ export class WorkerClient {
     // SEPARATE from `capabilities`, and the ClaimRun hard clause reads it there.
     if (protocolCapabilities?.length) body.protocol_capabilities = protocolCapabilities;
     const res = (await this.postJSON(`${WORKER_API_PREFIX}/register`, body)) as RegisterResponse;
-    // PRD #1392 M2 (D7): capture the api's advertised protocol features so the runner can pick a
-    // capability-aware degradation for a forge-unreachable park. An OLDER api omits the field
-    // entirely (returns only worker_id) — default to [] so "no features" is the safe negotiation.
-    this.protocolFeatures = Array.isArray(res.protocol_features)
-      ? res.protocol_features.filter((f): f is string => typeof f === "string")
-      : [];
+    // Capture the negotiated protocol features (PRD #1392 D7 / #1391 D8): REPLACE the set
+    // from this register's advertisement so a re-register after a rollout reflects the
+    // server's current features. Filter to strings (defensive), and treat an absent field
+    // as an empty set (older server) ⇒ no wire extension is ever sent.
+    this.serverFeatures = new Set(
+      Array.isArray(res.protocol_features)
+        ? res.protocol_features.filter((f): f is string => typeof f === "string")
+        : [],
+    );
     return res;
   }
 
-  async heartbeat(stats?: WorkerStats): Promise<void> {
+  /** Whether the server advertised protocol feature `f` on the last register (PRD
+   *  #1391 D8). The gate on every optional wire extension. */
+  hasFeature(f: string): boolean {
+    return this.serverFeatures.has(f);
+  }
+
+  /** Drop the whole negotiated feature set (PRD #1391 M5): after a strict-decode
+   *  rollback fallback succeeds, nothing negotiated is sent again until the process
+   *  restarts (a re-register would re-populate it). */
+  clearFeatures(): void {
+    this.serverFeatures.clear();
+  }
+
+  async heartbeat(stats?: WorkerStats, outbox?: OutboxHeartbeatEntry[]): Promise<void> {
     const body: HeartbeatRequest = { version: this.version };
     // Only attach stats when the collector produced a sample (PRD #49): an absent
     // field is the same wire shape as today, so a pre-#49 server ignores the extra
     // bytes and a collector-less tick is indistinguishable from an old worker.
     if (stats) body.stats = stats;
-    await this.postJSON(`${WORKER_API_PREFIX}/heartbeat`, body);
+    // PRD #1391 M5: attach the outbox depth ONLY when the server negotiated
+    // `heartbeat_outbox` AND there is something to report, so an api that never
+    // advertised it sees a byte-identical heartbeat.
+    const includeOutbox = this.hasFeature("heartbeat_outbox") && outbox !== undefined && outbox.length > 0;
+    if (includeOutbox) body.outbox = outbox;
+    try {
+      await this.postJSON(`${WORKER_API_PREFIX}/heartbeat`, body);
+    } catch (err) {
+      // Rollback fallback (PRD #1391 M5): a rolled-back api that no longer knows the
+      // negotiated heartbeat extension strict-decodes it as an unknown field and
+      // answers a generic `invalid request body` 400. Retry the SAME heartbeat ONCE
+      // with every negotiated extension stripped (i.e. no `outbox`); if the stripped
+      // retry SUCCEEDS, clear the whole cached feature set so nothing negotiated is
+      // sent again until process restart. A heartbeat must NEVER be lost to a
+      // rolled-back api, so a stripped success is the outcome, not the original 400.
+      if (!includeOutbox || !isStrictDecodeError(err)) throw err;
+      const stripped: HeartbeatRequest = { version: this.version };
+      if (stats) stripped.stats = stats;
+      await this.postJSON(`${WORKER_API_PREFIX}/heartbeat`, stripped);
+      this.clearFeatures();
+      this.log.warn(
+        "heartbeat outbox field rejected by a rolled-back api; retried stripped and cleared the negotiated feature set",
+        {},
+      );
+    }
   }
 
   /** Claim the oldest queued run for this worker's user (the RUN lane — no lane
@@ -335,15 +390,37 @@ export class WorkerClient {
     return (await res.json()) as ChatClaimResponse;
   }
 
-  async postMessages(runId: string, messages: OutgoingMessage[], signal?: AbortSignal): Promise<void> {
+  async postMessages(
+    runId: string,
+    messages: OutgoingMessage[],
+    generation?: number,
+    signal?: AbortSignal,
+  ): Promise<void> {
     if (messages.length === 0) return;
+    const path = `${WORKER_API_PREFIX}/runs/${runId}/messages`;
+    // PRD #1391 M2: ride the claim generation ONLY when the server negotiated
+    // `claim_generation_fence` AND the caller supplied one, so today's strict-decode
+    // api (which would 400 an unknown field) never sees it. Run A's api never
+    // advertises the feature, so this path is inert there.
+    const includeGeneration = this.hasFeature("claim_generation_fence") && generation !== undefined;
     const body: MessagesRequest = { messages };
-    await this.postJSON(
-      `${WORKER_API_PREFIX}/runs/${runId}/messages`,
-      body,
-      this.httpTimeoutMs,
-      signal,
-    );
+    if (includeGeneration) body.claim_generation = generation;
+    try {
+      await this.postJSON(path, body, this.httpTimeoutMs, signal);
+    } catch (err) {
+      // Request-local strict-decode fallback (PRD #1391 M5): a rolled-back api that no
+      // longer knows `claim_generation` strict-decodes it as an unknown field and
+      // answers a generic `invalid request body` 400. Clear the cached feature set and
+      // retry the IDENTICAL batch ONCE without the field; the batcher classifies ONLY
+      // this second response, so it sees exactly one outcome. The dedicated
+      // unstorable-message 400 has a DIFFERENT body and is NOT a trigger — it
+      // propagates unchanged so the batcher's bisection still runs and the generation
+      // is never stripped off a genuine-poison batch.
+      if (!includeGeneration || !isStrictDecodeError(err)) throw err;
+      this.clearFeatures();
+      const stripped: MessagesRequest = { messages };
+      await this.postJSON(path, stripped, this.httpTimeoutMs, signal);
+    }
   }
 
   /**
@@ -1163,6 +1240,19 @@ export async function readRunAck(res: Response): Promise<{
   } catch {
     return {};
   }
+}
+
+/**
+ * The generic strict-decode signal (PRD #1391 D9): a 400 whose body is the api's
+ * generic `invalid request body` answer — what a rolled-back api returns when it
+ * strict-decodes an unknown field (a negotiated wire extension it no longer knows).
+ * Keyed ONLY on that body, so the dedicated unstorable-message 400 (a DIFFERENT
+ * body/reason from the messages route) and the invalid-message 400 never match — they
+ * must propagate so the batcher's bisection still runs. A typed code is preferred if
+ * the api gains one; until then the body string is the discriminator the PRD names.
+ */
+export function isStrictDecodeError(err: unknown): boolean {
+  return err instanceof RequestError && err.status === 400 && /invalid request body/i.test(err.body);
 }
 
 /** Retryable: transport failures, 5xx, and 408/429; permanent otherwise. */

@@ -41,6 +41,7 @@ import {
   type DetectedRepoAgents,
 } from "./repoagents.js";
 import { MessageBatcher } from "./batcher.js";
+import type { Outbox } from "./outbox.js";
 import { rmTreeForce } from "./rmtree.js";
 import {
   SteeringChannel,
@@ -493,6 +494,22 @@ export interface RunnerOptions {
   /** PRD #1296 M3 — inject a pre-built recovery coordinator (a fake client/git) for tests;
    *  production builds one from the run lane's own client + git cache + join token. */
   recovery?: RecoveryCoordinator;
+  /** PRD #1391 M2 — the worker-owned message outbox the batcher SPILLS to after a
+   *  sustained transient outage (instead of tripping). main.ts builds + inits it once
+   *  and injects it here + into the Worker + ChatRunner. Undefined ⇒ the batcher keeps
+   *  today's trip behaviour (tests that do not exercise spill). */
+  outbox?: Outbox;
+  /** PRD #1391 M2 — the shared re-arm registry (runId → the live batcher's rearm()).
+   *  The runner registers this run's batcher at construction and drops it in the
+   *  terminal finally; the worker's drainer calls the hook once the run's segments
+   *  retire, returning a still-live batcher to the network. */
+  rearm?: Map<string, () => void>;
+  /** PRD #1391 M2 — the spill trip window (config.transientTripMs); default is the
+   *  batcher's own TRANSIENT_TRIP_MS. Threaded to every run's batcher. */
+  transientTripMs?: number;
+  /** PRD #1391 M2 — the in-memory spill-buffer cap (config.outboxSpillBufferBytes);
+   *  default is the batcher's own 2 MiB. Threaded to every run's batcher. */
+  outboxSpillBufferBytes?: number;
 }
 
 /**
@@ -523,6 +540,13 @@ export class RunRunner {
   /** PRD #1296 M3 — durable-recovery capture/journal/upload coordinator (D1/D3/D5).
    *  Disabled when the worker has no join token (a token-less test harness). */
   private readonly recovery: RecoveryCoordinator;
+  /** PRD #1391 M2 — the worker message outbox the batcher spills to, the shared re-arm
+   *  registry, the spill trip window and the spill-buffer cap. All threaded into every
+   *  run's MessageBatcher; `outbox`/`rearm` undefined ⇒ today's trip behaviour. */
+  private readonly outbox: Outbox | undefined;
+  private readonly rearm: Map<string, () => void> | undefined;
+  private readonly transientTripMs: number | undefined;
+  private readonly outboxSpillBufferBytes: number | undefined;
   private readonly detect: (
     worktreePath: string,
   ) => Promise<DetectedRepoAgents>;
@@ -625,6 +649,11 @@ export class RunRunner {
       });
     this.detect = opts.detectRepoAgents ?? detectRepoAgents;
     this.checkRunner = opts.checkRunner;
+    // PRD #1391 M2: spill collaborators, threaded into each run's batcher (buildFlight).
+    this.outbox = opts.outbox;
+    this.rearm = opts.rearm;
+    this.transientTripMs = opts.transientTripMs;
+    this.outboxSpillBufferBytes = opts.outboxSpillBufferBytes;
     this.checkpointIntervalMs = opts.checkpointIntervalMs ?? 20 * 60_000;
     this.shutdownPublishTimeoutMs = opts.shutdownPublishTimeoutMs ?? 15_000;
     this.recoveryRetryMs = Math.max(1, Math.min(opts.recoveryRetryMs ?? 1_000, 30_000));
@@ -1122,6 +1151,10 @@ export class RunRunner {
       // must not stay abortable — shutdown() iterating a stale entry would abort a
       // controller nobody is watching, and the map would leak an entry per run.
       this.activeRuns.delete(runId);
+      // PRD #1391 M2: drop this run's re-arm registration. The batcher is closed by the
+      // time we reach here, so a later drainer retire never needs to re-arm it; any
+      // still-pending segments are drained and simply not re-armed (a no-op).
+      this.rearm?.delete(runId);
       await steering.stop().catch(() => undefined);
       // PRD #41: drop this run's plan-approval deadline + gate-tracking (normally cleared
       // when the gate resolves terminally, but a run that ends by any other path must not
@@ -3270,7 +3303,24 @@ export class RunRunner {
       runLog,
       redact,
       redactText,
+      {
+        // PRD #1391 M2: spill to the outbox after a sustained transient outage instead
+        // of tripping. Segments carry the claim generation (default 0 when absent) so
+        // replay can ride it under #1247's fence (D11). transientTripMs/spillBufferBytes
+        // fall back to the batcher's own defaults when unset.
+        ...(this.outbox ? { outbox: this.outbox } : {}),
+        generation: claim.claim_generation ?? 0,
+        ...(this.transientTripMs !== undefined ? { transientTripMs: this.transientTripMs } : {}),
+        ...(this.outboxSpillBufferBytes !== undefined
+          ? { spillBufferBytes: this.outboxSpillBufferBytes }
+          : {}),
+      },
     );
+    // PRD #1391 M2: register this run's batcher in the shared re-arm registry so the
+    // per-worker drainer can return it to the network once its spilled segments retire
+    // — reachable while the run is still live and holds pending segments. Dropped in
+    // executeClaim's terminal finally.
+    this.rearm?.set(runId, () => batcher.rearm());
 
     // Cancel/shutdown spans the whole run; a `cancel` input aborts it via the
     // steering channel, which the executor's ctx.signal watches.

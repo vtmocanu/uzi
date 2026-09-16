@@ -1342,6 +1342,13 @@ type Service struct {
 	// /messages and read by the sweeper, so it carries its own mutex — see
 	// persistfail.go.
 	persistFail *persistFailTracker
+	// outbox tracks each worker's last reported outbox depth (PRD #1391 M5), the
+	// signal the health detector turns into a truthful "queued on the worker" reason
+	// (instead of the misleading `stalled`) and the list/register/heartbeat DTOs
+	// overlay onto WorkerDTO. Always non-nil (New constructs it). Like persistFail it
+	// is IN-PROCESS, mutex-guarded, capped and TTL-pruned, and restart-losing by
+	// design — see outbox_tracker.go.
+	outbox *outboxTracker
 	// forgeBaseURLAllowed is the SSRF gate for the M8 checkpoint-publish path (PRD
 	// #122): it reports whether a run's forge base URL is on the configured
 	// allowlist before the api will fetch/push against it. Set via
@@ -1501,7 +1508,7 @@ func New(q Store, box *secretbox.Box, p Params) *Service {
 		p.ClaimGrace = defaultClaimGrace
 	}
 	return &Service{
-		q: q, box: box, p: p, now: time.Now, persistFail: newPersistFailTracker(),
+		q: q, box: box, p: p, now: time.Now, persistFail: newPersistFailTracker(), outbox: newOutboxTracker(),
 		publishFn:          pushbroker.Publish,
 		deleteCheckpointFn: pushbroker.Delete,
 		background:         func(fn func()) { go fn() },
@@ -1616,9 +1623,15 @@ type WorkerStats struct {
 }
 
 // Heartbeat refreshes liveness, overwrites the worker's latest resource sample (PRD
-// #49), and returns the updated worker. A nil stats writes NULLs for every stats_
-// column, so a worker that stops reporting self-clears its gauge.
-func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *WorkerStats) (store.Worker, error) {
+// #49), records the worker's per-run outbox depth (PRD #1391 M5), and returns the
+// updated worker. A nil stats writes NULLs for every stats_ column, so a worker that
+// stops reporting self-clears its gauge; an empty/nil outbox CLEARS the worker's
+// tracked depth (the "clears on the next empty report" contract).
+func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *WorkerStats, outbox []OutboxEntry) (store.Worker, error) {
+	// Record the outbox depth BEFORE the liveness write: it is in-memory and cannot
+	// fail, and doing it unconditionally means an empty report clears the set even on
+	// a tick that carries no stats.
+	s.outbox.record(wkr.ID, outbox, s.now())
 	arg := store.HeartbeatWorkerParams{ID: wkr.ID}
 	if stats != nil {
 		arg.StatsCpuPct = pgconv.Float4Ptr(stats.CPUPct)
@@ -1648,6 +1661,23 @@ func diskOverThreshold(stats *WorkerStats, threshold float64) bool {
 		return float64(*used)/float64(*total) >= threshold
 	}
 	return over(stats.DiskNixBytes, stats.DiskNixTotalBytes) || over(stats.DiskDataBytes, stats.DiskDataTotalBytes)
+}
+
+// OutboxAggregate returns a worker's summed outbox depth (PRD #1391 M5) for the
+// WorkerDTO overlay: pending messages, pending terminals, stale-retired frames, and
+// the oldest blocked reason (nil when nothing is blocked). All zero and nil when the
+// worker has no tracked depth, so a worker with no outbox shows nulls.
+func (s *Service) OutboxAggregate(workerID uuid.UUID) (pendingMessages, pendingTerminal, staleRetired int, blocked *string) {
+	return s.outbox.workerAggregate(workerID)
+}
+
+// OutboxRunDepth returns the outbox entry reported for a run AND the id of the worker
+// that reported it, across whichever worker reported it last (PRD #1391 M5). The health
+// detector uses it to turn a non-zero pending depth into the truthful "queued on the
+// worker" reason instead of `stalled` — but ONLY when the reporting worker is the run's
+// current owner, so it passes the reporting worker id back for the caller to owner-gate.
+func (s *Service) OutboxRunDepth(runID uuid.UUID) (OutboxEntry, uuid.UUID, bool) {
+	return s.outbox.runDepth(runID)
 }
 
 // Claim atomically claims the oldest claimable run for the worker's user and
@@ -4020,6 +4050,10 @@ func (s *Service) DeleteWorker(ctx context.Context, userID, workerID uuid.UUID) 
 	if n == 0 {
 		return ErrWorkerNotFound
 	}
+	// The worker is gone; drop its last-known outbox depth (PRD #1391 M5) so a
+	// removed worker's stale depth does not linger on the fleet view. In-memory and
+	// best-effort — the TTL prune is the backstop for any path that skips this.
+	s.outbox.evict(workerID)
 	return nil
 }
 

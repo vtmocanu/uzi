@@ -1727,6 +1727,29 @@ export interface Worker {
    *  default. The API applies that rule before answering, so "pinned" here always
    *  has an id beside it and no client needs to re-derive it. */
   anthropic_bind_mode: BindMode;
+  // Outbox depth this worker last reported on its heartbeat (PRD #1391 M5), summed
+  // across the runs it holds. All null until the worker reports a non-empty outbox
+  // (and re-nulled on the next empty report, when the backlog has drained) — the api
+  // overlays them from an in-process, restart-losing tracker, never from the DB, the
+  // same "null until reported, last-known otherwise" contract as the stats_ fields.
+  //
+  // outbox_pending_messages is the count of message frames buffered on the worker
+  // waiting to replay to the api (the visible symptom of an api outage the worker rode
+  // out). outbox_pending_terminal is the count of write-ahead terminal outcomes still
+  // to send (always 0 in Run A — terminal journaling is Run B). outbox_stale_retired
+  // counts frames a re-claim forced the worker to retire locally (D11). outbox_blocked
+  // is the oldest permanent-refusal reason across the worker's runs (never set in Run
+  // A; forward-compat for Run B), or null when nothing is blocked.
+  //
+  // Optional in TS (`?`), exactly like retaining_unpublished_work above and for the
+  // same reason: the api ALWAYS sends these keys (overlaid to null when the worker has
+  // no tracked depth), but they are overlay fields a mock or an older payload may omit,
+  // so `?` lets those literals compile while the wire contract stays `X | null`. The
+  // api-contract parity check pins the null/value shape against the recorded fixtures.
+  outbox_pending_messages?: number | null;
+  outbox_pending_terminal?: number | null;
+  outbox_stale_retired?: number | null;
+  outbox_blocked?: string | null;
 }
 
 /** The closed set of worker bind modes (PRD #111 M3), mirroring the server's CHECK. */

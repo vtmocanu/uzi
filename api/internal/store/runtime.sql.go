@@ -4440,7 +4440,7 @@ SELECT id, user_id, status, auto_approve,
        health, health_reason, health_since, health_notified_at,
        budget_wall_seconds, budget_paused_seconds, budget_extension_seconds, interactive,
        repo_id, kind, required_capabilities, completion_contract_version,
-       harness, codex_material_revision, codex_secret_id
+       harness, codex_material_revision, codex_secret_id, worker_id
 FROM runs
 WHERE status IN ('queued', 'running', 'awaiting_approval')
   AND kind <> 'chat'
@@ -4470,6 +4470,7 @@ type ListActiveRunsForHealthRow struct {
 	Harness                   string             `json:"harness"`
 	CodexMaterialRevision     pgtype.Int8        `json:"codex_material_revision"`
 	CodexSecretID             pgtype.UUID        `json:"codex_secret_id"`
+	WorkerID                  pgtype.UUID        `json:"worker_id"`
 }
 
 // Run health detector (PRD #47) ----------------------------------------------
@@ -4503,6 +4504,11 @@ type ListActiveRunsForHealthRow struct {
 // queued arm can surface a Codex-capability reason for a CODEX-INDICATING run (any of the three set)
 // that no online worker advertises 'codex_harness_v1' — the non-bypassable Codex claim clause can
 // never be satisfied. The resolver checks all three, mirroring the claim gate's fail-closed test.
+// PRD #1391 M5 (owner-gated outbox reason): worker_id rides this read so the running-run stalled arm
+// applies reasonOutboxQueued ONLY when the run's CURRENT owning worker is the same worker that
+// reported the outbox depth. Without it a cross-tenant worker (or a stale runIndex entry left by a
+// reclaim-during-outage) could flip a genuinely-stalled run to the reassuring "queued" reason.
+// worker_id is NULL for an unclaimed run (ON DELETE SET NULL), so the arm requires it be non-null.
 func (q *Queries) ListActiveRunsForHealth(ctx context.Context) ([]ListActiveRunsForHealthRow, error) {
 	rows, err := q.db.Query(ctx, listActiveRunsForHealth)
 	if err != nil {
@@ -4536,6 +4542,7 @@ func (q *Queries) ListActiveRunsForHealth(ctx context.Context) ([]ListActiveRuns
 			&i.Harness,
 			&i.CodexMaterialRevision,
 			&i.CodexSecretID,
+			&i.WorkerID,
 		); err != nil {
 			return nil, err
 		}

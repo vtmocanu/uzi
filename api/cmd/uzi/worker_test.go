@@ -9,6 +9,61 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
+// TestWorkerListShowsOutboxColumn pins the OUTBOX column (PRD #1391 M5): "-" in the
+// steady state (no outbox), the pending-message count when the worker buffered
+// updates during an api outage, and a "(blocked)"/"blocked" annotation when an
+// outcome is held.
+func TestWorkerListShowsOutboxColumn(t *testing.T) {
+	four := 4
+	zero := 0
+	blocked := "reserve_exhausted"
+	fc := &uzicli.FakeClient{Workers: []apitypes.WorkerDTO{
+		{ID: "w1", Name: "idle", Status: "online"},
+		{ID: "w2", Name: "backlog", Status: "online", OutboxPendingMessages: &four},
+		{ID: "w3", Name: "held", Status: "online", OutboxPendingMessages: &zero, OutboxBlocked: &blocked},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "worker", "list")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(out, "OUTBOX") {
+		t.Fatalf("worker list is missing the OUTBOX column:\n%s", out)
+	}
+	header := strings.Fields(strings.Split(out, "\n")[0])
+	col := -1
+	for i, h := range header {
+		if h == "OUTBOX" {
+			col = i
+			break
+		}
+	}
+	// None of these rows has an empty cell before OUTBOX (it is the last column), so
+	// reading the last field is the OUTBOX cell; the header lookup asserts that too.
+	cellOf := func(name string) string {
+		t.Helper()
+		for _, line := range strings.Split(out, "\n") {
+			if strings.Contains(line, name) {
+				f := strings.Fields(line)
+				return f[len(f)-1]
+			}
+		}
+		t.Fatalf("no row for %s in %q", name, out)
+		return ""
+	}
+	if col != len(header)-1 {
+		t.Fatalf("OUTBOX is not the last column (header=%v)", header)
+	}
+	if got := cellOf("idle"); got != "-" {
+		t.Errorf("idle worker OUTBOX = %q, want - (no buffered updates)", got)
+	}
+	if got := cellOf("backlog"); got != "4" {
+		t.Errorf("backlog worker OUTBOX = %q, want 4 (buffered depth)", got)
+	}
+	if got := cellOf("held"); got != "blocked" {
+		t.Errorf("held worker OUTBOX = %q, want blocked (a held outcome with zero pending)", got)
+	}
+}
+
 func TestWorkerRm(t *testing.T) {
 	fc := &uzicli.FakeClient{}
 	out, _, code := runCLI(t, fakeEnv(fc), "worker", "rm", "w1")
@@ -245,12 +300,27 @@ func TestWorkerListShowsBindMode(t *testing.T) {
 	if !strings.Contains(out, "TOKEN") {
 		t.Fatalf("worker list is missing the TOKEN column: %q", out)
 	}
+	// Read the TOKEN column by its HEADER index rather than the last field: PRD #1391
+	// M5 appended an OUTBOX column after TOKEN, so the last field is now OUTBOX. None of
+	// these fixture rows has an empty cell before TOKEN, so header-index and field-index
+	// line up.
+	header := strings.Fields(strings.Split(out, "\n")[0])
+	tokenCol := -1
+	for i, h := range header {
+		if h == "TOKEN" {
+			tokenCol = i
+			break
+		}
+	}
+	if tokenCol < 0 {
+		t.Fatalf("worker list is missing the TOKEN column: %q", out)
+	}
 	cellOf := func(name string) string {
 		t.Helper()
 		for _, line := range strings.Split(out, "\n") {
 			if strings.Contains(line, name) {
 				f := strings.Fields(line)
-				return f[len(f)-1]
+				return f[tokenCol]
 			}
 		}
 		t.Fatalf("no row for %s in %q", name, out)

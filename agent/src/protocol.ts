@@ -336,12 +336,14 @@ export interface RegisterResponse {
   // (heartbeat/claim carry no worker id in the path), so this is not strictly
   // needed; M1 returns it and we capture it for logging when present.
   worker_id?: string;
-  /** PRD #1392 M2 (D7): the protocol features THIS api advertises as implemented, so the
-   *  worker can pick a capability-aware degradation on a mixed fleet. A full #1392 api sends
-   *  `["recovery_park_cause","recovery_release_exact_echo"]`; a future api may also advertise
-   *  `claim_generation_fence`. OPTIONAL and OMITTED ENTIRELY by an OLDER api (which returns
-   *  only `worker_id`) — the worker then negotiates neither the typed park report nor the
-   *  exact-echo release fallback, so an absent field must decode as "no features". */
+  /** The PROTOCOL FEATURES this api advertises as implemented, so the worker can pick a
+   *  capability-aware degradation on a mixed fleet. ONE negotiation wire shared by several
+   *  PRDs (#1392 D7, #1391 D8, #1390 M2a): whichever lands first declares the field, the
+   *  others their values. A full #1392 api sends `["recovery_park_cause",
+   *  "recovery_release_exact_echo"]`; #1391's api adds `heartbeat_outbox`; a future api may
+   *  also advertise `claim_generation_fence` / `terminal_fence`. OPTIONAL and OMITTED
+   *  ENTIRELY by an OLDER api (which returns only `worker_id`) — an absent field decodes as
+   *  "no features", so the worker negotiates nothing and sends today's byte-identical wire. */
   protocol_features?: string[];
 }
 
@@ -383,6 +385,22 @@ export interface WorkerStats {
   disk_data_total_bytes?: number;
 }
 
+/**
+ * One run's outbox depth on the heartbeat (PRD #1391 M5). Its own isolated field
+ * (like `stats`, fact 8), so a malformed or oversized report drops without costing
+ * the heartbeat. `pending_terminal` is ALWAYS 0 in Run A (terminal journaling is Run
+ * B); `blocked_reason` is likewise never set here. `since` is epoch ms. Every field
+ * is model-independent worker telemetry — no secret, no repo content.
+ */
+export interface OutboxHeartbeatEntry {
+  run_id: string;
+  pending_messages: number;
+  pending_terminal: number;
+  stale_retired: number;
+  blocked_reason?: string;
+  since: number;
+}
+
 export interface HeartbeatRequest {
   version: string;
   /** Optional container resource sample (PRD #49), same absent-optional convention
@@ -390,6 +408,13 @@ export interface HeartbeatRequest {
    *  nothing, and the server both tolerates its absence and (Decision 3) decodes it
    *  defensively so a malformed sample drops the stats without failing the heartbeat. */
   stats?: WorkerStats;
+  /**
+   * Per-run outbox depth (PRD #1391 M5). Sent ONLY when the server advertised
+   * `heartbeat_outbox` in `RegisterResponse.protocol_features` AND at least one run
+   * has pending outbox depth (client.ts gates both), so an older api never sees the
+   * field and the heartbeat wire stays byte-identical to today when it is unset.
+   */
+  outbox?: OutboxHeartbeatEntry[];
 }
 
 /** Kebab-case agent name. Mirrors the API's template nameRe
@@ -1537,6 +1562,16 @@ export interface OutgoingMessage {
 
 export interface MessagesRequest {
   messages: OutgoingMessage[];
+  /**
+   * The claim generation these messages were produced under (PRD #1391 M2 / #1247
+   * fence, D11). Sent ONLY once the server advertises `claim_generation_fence` in
+   * `RegisterResponse.protocol_features` AND the caller supplies a generation
+   * (client.ts gates both), so today's api — which strict-decodes and would 400 an
+   * unknown field — never sees it and the messages wire stays byte-identical. Run A's
+   * api never advertises the feature, so this rides only under a fenced api / the
+   * negotiation tests.
+   */
+  claim_generation?: number;
 }
 
 /**

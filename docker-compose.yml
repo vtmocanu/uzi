@@ -352,6 +352,17 @@ services:
       # capability). See docs/worker-docker.md (M4). The agent always mounts the socket
       # volume; this only controls the readiness WAIT + capability self-report.
       UZI_DIND_SOCKET: ${UZI_DIND_SOCKET:-}
+      # PRD #1391 (worker outbox): tunable knobs for the durable message outbox. Each
+      # passes through EMPTY by default, and the worker's config.ts treats a blank value
+      # as unset (so it uses the built-in default) — an operator never has to set these.
+      # The e2e outbox-outage phase (52-api-outage-outbox) exports them to lower the spill
+      # trip window and shrink the per-run quota so an outage forces a spill / a quota
+      # eviction without ten-minute waits or gigabyte volumes.
+      WORKER_TRANSIENT_TRIP_MS: ${WORKER_TRANSIENT_TRIP_MS:-}
+      WORKER_OUTBOX_RUN_MAX_BYTES: ${WORKER_OUTBOX_RUN_MAX_BYTES:-}
+      WORKER_OUTBOX_MAX_BYTES: ${WORKER_OUTBOX_MAX_BYTES:-}
+      WORKER_OUTBOX_SPILL_BUFFER_BYTES: ${WORKER_OUTBOX_SPILL_BUFFER_BYTES:-}
+      WORKER_OUTBOX_RETENTION: ${WORKER_OUTBOX_RETENTION:-}
       UZI_LOG_LEVEL: ${UZI_LOG_LEVEL:-info}
     volumes:
       - agentdata:/data

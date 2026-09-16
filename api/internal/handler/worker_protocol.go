@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/google/uuid"
@@ -304,29 +305,49 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 	// worker_id is echoed for the worker's convenience; identity on every other
 	// call comes from the Bearer token, never a URL path (M2 wire contract).
 	//
-	// PRD #1392 M1: protocol_features advertises the OPTIONAL wire-protocol behaviours THIS api
-	// implements, so a worker can negotiate its report shape (the register-time capability
-	// advertisement PRDs #1390/#1391 also key on — this PRD ships the field first). It is
-	// server-derived and constant, not worker input.
+	// protocol_features is the shared negotiation wire (PRD #1392 M1 / #1391 D8 / #1390 M2a):
+	// the worker sends a gated wire extension only when its feature string appears here. A
+	// just-registered worker holds nothing, so overlayOutbox is a no-op, but the register
+	// response is one of the WorkerDTO surfaces and stays uniform with the list/heartbeat
+	// paths.
+	dto := workerDTOFromWorker(updated, 0, false, "", h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt)
+	h.overlayOutbox(&dto, updated.ID)
 	httpx.JSON(w, http.StatusOK, map[string]any{
 		"worker_id":         updated.ID.String(),
-		"worker":            workerDTOFromWorker(updated, 0, false, "", h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt),
+		"worker":            dto,
 		"protocol_features": protocolFeatures(),
 	})
 }
 
-// protocolFeatures is the closed set of optional wire-protocol behaviours this api
-// implements, advertised on the register response (PRD #1392 M1). It is EXACTLY these two:
-//   - "recovery_park_cause": SetState accepts a typed recovery_cause and, for forge_unreachable,
-//     runs the atomic custody-settling park transaction.
-//   - "recovery_release_exact_echo": the v2 worker Release endpoint echoes the released
-//     generation back.
+// protocolFeatures is the set of optional wire-protocol behaviours this api implements,
+// advertised on the register response — the shared negotiation wire the worker reads to
+// decide which gated heartbeat/message extensions to send. Composed as a UNION of per-PRD
+// slices, deduped — NEVER a single literal a sibling PRD would overwrite.
 //
-// It deliberately does NOT advertise "claim_generation_fence" — that token is owned by #1390
-// and is advertised only once that PRD lands. Returns a fresh slice so a caller cannot mutate
-// the advertised set. TestRegisterAdvertisesProtocolFeatures pins the exact two.
+// 🔴 THE RULE, VERBATIM: each PRD adds its own slice at its landing rebase (union, never
+// replace). PRD #1392 M1 adds `recovery_park_cause` and `recovery_release_exact_echo`;
+// PRD #1391 Run A adds `heartbeat_outbox`.
+//
+// Do NOT advertise `claim_generation_fence` or `terminal_fence` here: those belong to
+// #1247/#1390 and Run B respectively, land after this, and are added to their own slice at
+// that time — advertising one now would tell the worker to send a fence a current api still
+// rejects. Returns a fresh slice so a caller cannot mutate the advertised set.
 func protocolFeatures() []string {
-	return []string{"recovery_park_cause", "recovery_release_exact_echo"}
+	groups := [][]string{
+		{"recovery_park_cause", "recovery_release_exact_echo"}, // PRD #1392 M1
+		{"heartbeat_outbox"}, // PRD #1391 M5, Run A
+	}
+	seen := make(map[string]bool)
+	out := make([]string, 0)
+	for _, g := range groups {
+		for _, f := range g {
+			if !seen[f] {
+				seen[f] = true
+				out = append(out, f)
+			}
+		}
+	}
+	return out
 }
 
 // maxWorkerCPUPct clamps a worker's self-reported CPU percentage (PRD #49 Decision
@@ -356,6 +377,13 @@ func (h *Handler) WorkerHeartbeat(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Version string          `json:"version"`
 		Stats   json.RawMessage `json:"stats"`
+		// Outbox is the per-run outbox depth (PRD #1391 M5), its OWN isolated
+		// json.RawMessage exactly like Stats and for the same reason: a malformed or
+		// oversized report must drop the depth WITHOUT failing the heartbeat's liveness.
+		// The worker sends it only when the register response advertised
+		// `heartbeat_outbox` AND a run has depth, so an older api never sees it and a
+		// current worker on a rolled-back api strips it on the generic-400 retry (D8).
+		Outbox json.RawMessage `json:"outbox"`
 	}
 	if err := httpx.DecodeJSON(r, &req); err != nil && !errors.Is(err, io.EOF) {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
@@ -364,13 +392,161 @@ func (h *Handler) WorkerHeartbeat(w http.ResponseWriter, r *http.Request) {
 	// Second step: validate + clamp the isolated stats (Decision 5). A malformed or
 	// invalid sample drops to nil (columns written NULL) and the heartbeat still 200s.
 	stats := parseWorkerStats(req.Stats, wkr.ID)
-	updated, err := h.wsvc.Heartbeat(r.Context(), wkr, stats)
+	// Same defensive second step for the isolated outbox (PRD #1391 M5): validate
+	// drop-not-fail and hand the parsed entries to the service, which records them in
+	// its in-process tracker. An absent/empty/malformed body yields nil — which CLEARS
+	// the worker's tracked depth (the "clears on the next empty report" contract) — and
+	// the 200 stands.
+	outbox := parseWorkerOutbox(req.Outbox, wkr.ID)
+	updated, err := h.wsvc.Heartbeat(r.Context(), wkr, stats, outbox)
 	if err != nil {
 		slog.Error("worker heartbeat", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"worker": workerDTOFromWorker(updated, 0, false, "", h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt)})
+	dto := workerDTOFromWorker(updated, 0, false, "", h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt)
+	h.overlayOutbox(&dto, updated.ID)
+	httpx.JSON(w, http.StatusOK, map[string]any{"worker": dto})
+}
+
+// Outbox heartbeat validation bounds (PRD #1391 M5). The report is untrusted
+// worker self-report bound for an in-process map and the fleet UI.
+const (
+	// maxOutboxReportBytes is the WHOLE-REPORT byte cap: past it the entire report is
+	// dropped (like parseWorkerStats drops the whole stats object), so a hostile worker
+	// cannot make the api parse an unbounded array. A worker holds at most a handful of
+	// runs, each entry a few hundred bytes, so this is generous headroom.
+	maxOutboxReportBytes = 128 << 10 // 128 KiB
+	// maxOutboxEntries is the ENTRY-COUNT cap: past it the whole report is dropped. Far
+	// above any real worker's concurrent-run count (documented soft ceiling 8).
+	maxOutboxEntries = 256
+	// maxOutboxCount is the sane per-count ceiling. A count outside [0, maxOutboxCount]
+	// drops only THAT entry (the granular precedent is parseWorkerStats' per-disk-field
+	// drop). ~1e9 is orders of magnitude above any real backlog the quota permits.
+	maxOutboxCount = 1 << 30
+	// maxOutboxBlockedBytes bounds the blocked_reason string. It is sanitized (control
+	// + format chars stripped) and truncated, never rejected — same posture as
+	// sanitizeSelfReported.
+	maxOutboxBlockedBytes = 200
+)
+
+// parseWorkerOutbox is the heartbeat's defensive second-step parse of the untrusted,
+// isolated `outbox` field (PRD #1391 M5), mirroring parseWorkerStats. It NEVER fails
+// the heartbeat: an absent, empty, null, oversized, or malformed body returns nil (a
+// nil clears the worker's tracked depth) and the 200 stands. On a drop it logs
+// worker_id + a STATIC reason only — never the raw values, which are attacker-
+// controlled until validation passes (mirrors sanitizeSelfReported's no-echo posture).
+//
+// Drop granularity, chosen deliberately (see parseWorkerStats' two precedents — the
+// coarse whole-object drop and the granular per-disk-field drop):
+//   - WHOLE-REPORT drop: the byte cap, the entry-count cap, and a top-level non-array
+//     (the outer []json.RawMessage decode fails) — none of these can be trusted to
+//     bound anything.
+//   - PER-ENTRY drop: a wrong-typed entry (its own typed Unmarshal fails), a bad run_id,
+//     a negative/absurd count, or an invalid `since` drops only that one entry (the rest
+//     of a valid report still lands), because one bad entry proves nothing about the others.
+func parseWorkerOutbox(raw json.RawMessage, workerID uuid.UUID) []workersvc.OutboxEntry {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil // no outbox on this tick (older worker, feature off, or drained → clears)
+	}
+	drop := func(reason string) []workersvc.OutboxEntry {
+		slog.Warn("worker reported invalid outbox; dropping", "worker_id", workerID.String(), "reason", reason)
+		return nil
+	}
+	// Whole-report byte cap FIRST, before Unmarshal touches it.
+	if len(raw) > maxOutboxReportBytes {
+		return drop("oversize")
+	}
+	// Decode the TOP LEVEL into []json.RawMessage first, then each element into the typed
+	// per-entry struct below. Only a top-level shape error (not a JSON array) is a
+	// whole-report "malformed" drop; a WRONG-TYPED element (e.g. a numeric run_id or an
+	// object-valued blocked_reason) fails only its own per-entry Unmarshal and drops just
+	// that entry — a single typed field must never abort the whole array and discard every
+	// valid entry with it. Counts and `since` likewise decode as *json.Number so a float /
+	// overflow / non-integer value fails per-entry (converted below), the same reason
+	// parseWorkerStats decodes its disk fields as *json.Number.
+	var rawItems []json.RawMessage
+	if err := json.Unmarshal(raw, &rawItems); err != nil {
+		return drop("malformed")
+	}
+	if len(rawItems) > maxOutboxEntries {
+		return drop("too many entries")
+	}
+	out := make([]workersvc.OutboxEntry, 0, len(rawItems))
+	for _, rawItem := range rawItems {
+		var it struct {
+			RunID           string       `json:"run_id"`
+			PendingMessages *json.Number `json:"pending_messages"`
+			PendingTerminal *json.Number `json:"pending_terminal"`
+			StaleRetired    *json.Number `json:"stale_retired"`
+			BlockedReason   string       `json:"blocked_reason"`
+			Since           *json.Number `json:"since"`
+		}
+		if err := json.Unmarshal(rawItem, &it); err != nil {
+			continue // wrong-typed entry → drop only this entry
+		}
+		id, err := uuid.Parse(it.RunID)
+		if err != nil {
+			continue // bad run_id → drop only this entry
+		}
+		pm, ok := outboxCountOrDrop(it.PendingMessages)
+		if !ok {
+			continue
+		}
+		pt, ok := outboxCountOrDrop(it.PendingTerminal)
+		if !ok {
+			continue
+		}
+		sr, ok := outboxCountOrDrop(it.StaleRetired)
+		if !ok {
+			continue
+		}
+		since, ok := outboxSinceOrDrop(it.Since)
+		if !ok {
+			continue
+		}
+		out = append(out, workersvc.OutboxEntry{
+			RunID:           id,
+			PendingMessages: pm,
+			PendingTerminal: pt,
+			StaleRetired:    sr,
+			// Sanitize (strip control + format chars, bound) rather than reject: the
+			// reason reaches a CLI column and the web, and a register/heartbeat must never
+			// fail over cosmetic input. Same posture as sanitizeSelfReported.
+			BlockedReason: sanitizeSelfReported(it.BlockedReason, maxOutboxBlockedBytes),
+			Since:         since,
+		})
+	}
+	return out
+}
+
+// outboxCountOrDrop converts a raw count field to a non-negative int within the sane
+// ceiling, reporting ok=false (drop the entry) on absent / parse error / overflow /
+// negative / absurd. The counts are REQUIRED on the wire, so a nil is a malformed
+// entry, not a zero.
+func outboxCountOrDrop(n *json.Number) (int, bool) {
+	if n == nil {
+		return 0, false
+	}
+	v, err := n.Int64()
+	if err != nil || v < 0 || v > maxOutboxCount {
+		return 0, false
+	}
+	return int(v), true
+}
+
+// outboxSinceOrDrop converts the epoch-millisecond `since` (a NUMBER on the wire, not
+// an RFC3339 string) to a time, reporting ok=false (drop the entry) on absent / parse
+// error / overflow / negative. Only the ordering of blocked reasons depends on it.
+func outboxSinceOrDrop(n *json.Number) (time.Time, bool) {
+	if n == nil {
+		return time.Time{}, false
+	}
+	ms, err := n.Int64()
+	if err != nil || ms < 0 {
+		return time.Time{}, false
+	}
+	return time.UnixMilli(ms), true
 }
 
 // parseWorkerStats is Decision 3's second-step defensive parse plus Decision 5's
