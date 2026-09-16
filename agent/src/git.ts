@@ -1443,6 +1443,24 @@ export class GitCache {
     return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
   }
 
+  /** PRD #1416 M3 — resolve `rev` to a 40-hex OID in the worker bare (e.g. `<sha>^{tree}` for a
+   *  tree OID, `<sha>^{commit}` for a commit), or null when it does not resolve. Best-effort
+   *  (tryGitStdout): a broken/absent rev answers null rather than throwing. Used by the finalize
+   *  bridge to byte-compare a synthesised bridge's tree against H's tree before adopting it. */
+  async revParse(barePath: string, rev: string): Promise<string | null> {
+    const sha = (await this.tryGitStdout(barePath, ["rev-parse", "--verify", rev])).trim();
+    return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
+  }
+
+  /** PRD #1416 M3 — point the worker-side tracking ref `refs/uzi-runner/<branch>` at `sha`
+   *  (worker-uid `update-ref`). The finalize/park/capture bridge advances this ref to the
+   *  synthesised bridge B, so everything a reseed, capture, align or push then reads off the
+   *  tracking ref carries B. Throws on failure (unlike the best-effort reads) so the caller can
+   *  fall back to a "failed" outcome rather than silently pushing the un-bridged H. */
+  async updateTrackingRef(barePath: string, branch: string, sha: string): Promise<void> {
+    await this.runGit(barePath, ["update-ref", runnerTrackingRef(branch), sha]);
+  }
+
   /** issue #1117: the CURRENT origin-tracking tip of `refs/remotes/origin/<branch>`,
    *  read WITHOUT fetching, or null when unresolvable. Mirrors {@link trackingTip} but for
    *  the origin mirror rather than the runner tracking ref. Used at the mr_rework finalize
@@ -3057,6 +3075,179 @@ export class GitCache {
     // 128 / any other exit = a git error or a missing/unresolvable ref, and null = a spawn error,
     // timeout, or signal death → unknown, never divergent.
     return "unknown";
+  }
+
+  /**
+   * PRD #1416 M3 — build the ancestry BRIDGE commit B that non-destructively restores every
+   * missing published/checkpoint FLOOR as an ancestor of a divergent tip H, so a rewritten branch
+   * FAST-FORWARDS from its published floor WITHOUT a force-push (D4). Reuses the checkpoint
+   * overlay's synthesis technique ({@link buildWorkflowOverlay}, fact 12) — a deterministic,
+   * worker-uid, PAT-free `commit-tree` with no working tree — but with H's tree UNCHANGED, so no
+   * temp-index edit is needed: B is committed directly onto H's own tree OID.
+   *
+   * B's parents: `-p tip` FIRST (H is the first parent, so `git log --first-parent` still reads as
+   * the agent's history), then `-p <floor>` for EACH floor in `floors` that is NOT already an
+   * ancestor of `tip` (`ancestry(bare, floor, tip) === "divergent"`), in the given order. A floor
+   * already reachable from H needs no bridge parent and is skipped.
+   *
+   * Message EXACTLY: `bridge: restore published tip <P> as an ancestor of <H> (tree unchanged)`,
+   * where <P> is `floors[0]` (the published floor) and <H> is `tip`, both full 40-hex OIDs — the
+   * deterministic marker {@link rangeContainsBridge} parses.
+   *
+   * INVARIANT (validated by the caller before adopting B): B's tree === H's tree byte-for-byte, and
+   * every appended floor AND H are ancestors of B. Returns the new commit sha, or `null` when no
+   * floor was actually missing (nothing to bridge) OR any git step failed (best-effort — a bridge
+   * that cannot be built never throws here; the caller decides how to fail).
+   */
+  async bridgeToFloors(barePath: string, tip: string, floors: string[]): Promise<string | null> {
+    const OID = /^[0-9a-f]{40}$/;
+    if (!OID.test(tip) || floors.length === 0 || !OID.test(floors[0]!)) return null;
+    try {
+      // Only floors NOT already reachable from H become extra parents (a floor already an ancestor
+      // needs no bridge parent). "divergent" is the only positive signal — "unknown" (a transient
+      // read) and "ancestor" both mean "do not append", so a broken read never synthesises a
+      // spurious parent.
+      const missing: string[] = [];
+      for (const floor of floors) {
+        if (OID.test(floor) && (await this.ancestry(barePath, floor, tip)) === "divergent") {
+          missing.push(floor);
+        }
+      }
+      if (missing.length === 0) return null; // nothing was actually missing — nothing to bridge
+      // B's tree === H's tree, byte-identical: a tree OID is content-addressed, so committing onto
+      // `tip^{tree}` reproduces H's tree exactly (no read-tree/write-tree round-trip needed).
+      const tipTree = (await this.runGit(barePath, ["rev-parse", `${tip}^{tree}`])).trim();
+      if (!OID.test(tipTree)) return null;
+      // Deterministic committer/author date = H's own committer date (buildWorkflowOverlay's rule),
+      // so a re-bridge of the same H over the same floors yields the same OID.
+      const committerDate = (await this.runGit(barePath, ["show", "-s", "--format=%cI", tip])).trim();
+      if (committerDate.length === 0) return null;
+      const args = ["-c", "commit.gpgsign=false", "commit-tree", tipTree, "-p", tip];
+      for (const floor of missing) args.push("-p", floor);
+      args.push(
+        "-m",
+        `bridge: restore published tip ${floors[0]} as an ancestor of ${tip} (tree unchanged)`,
+      );
+      const sha = (
+        await this.runGitWithEnv(barePath, args, {
+          GIT_AUTHOR_NAME: AGENT_GIT_IDENTITY.name,
+          GIT_AUTHOR_EMAIL: AGENT_GIT_IDENTITY.email,
+          GIT_COMMITTER_NAME: AGENT_GIT_IDENTITY.name,
+          GIT_COMMITTER_EMAIL: AGENT_GIT_IDENTITY.email,
+          GIT_AUTHOR_DATE: committerDate,
+          GIT_COMMITTER_DATE: committerDate,
+        })
+      ).trim();
+      if (!OID.test(sha)) return null;
+      this.log.info("PRD #1416 M3: ancestry bridge built", {
+        tip,
+        published_floor: floors[0],
+        bridge_parents: missing.length + 1,
+        bridge_sha: sha,
+      });
+      return sha;
+    } catch (e) {
+      this.log.warn("PRD #1416 M3: ancestry bridge synthesis failed", {
+        tip,
+        error: gitErrorMessage(e),
+      });
+      return null;
+    }
+  }
+
+  /**
+   * PRD #1416 M3 — the structure-validated bridge DETECTOR (spoof/inflation-hardened). Scans
+   * `<publishedTip>..<pushedTip>` with `git log --first-parent` so a merged default-branch SIDE
+   * history (a second parent) can neither SPOOF (masquerade as a bridge) nor INFLATE (be walked at
+   * all) the detection. Returns true iff some commit in the range is a bridge in one of exactly two
+   * FULLY-validated forms; everything else is rejected. History-derived on purpose: a bridge built
+   * before a park is invisible to a reclaimed run's flight-local state, but it is right here in the
+   * pushed history, so a reclaim's finalize (which builds no new bridge) still reports it.
+   *
+   *  1. WORKER bridge (carries the deterministic {@link bridgeToFloors} marker). Parse X and Y
+   *     (40-hex) from the marker and require ALL of: `X === publishedTip` (this run's P); `Y ===`
+   *     the commit's FIRST parent; the commit's tree === its first-parent's tree; ≥1 EXTRA parent
+   *     (beyond the first); EVERY extra parent descends from `publishedTip`; and ≥1 extra parent is
+   *     NOT already an ancestor of Y. A marker present but any check failing is REJECTED (never
+   *     re-checked as the markerless form).
+   *  2. AGENT safety bridge (no marker — the M2 steer had the agent run `git merge -s ours <P>`).
+   *     Accepted with NO marker ONLY when the commit's tree === its first-parent's tree AND an
+   *     extra parent is EXACTLY `publishedTip`.
+   *
+   * Why `--first-parent` + full structure validation and NOT a raw marker-or-shape OR: a plain
+   * `git merge <default>` into the branch produces a merge whose tree DIFFERS from its first parent
+   * and whose side history could carry any text; without `--first-parent` its side commits would be
+   * walked, and without the tree/parent checks a spoofed message or an unrelated `-s ours` merge
+   * would be miscounted. Returns false (never throws) on any git error or when publishedTip/
+   * pushedTip is missing/malformed.
+   */
+  async rangeContainsBridge(
+    barePath: string,
+    publishedTip: string,
+    pushedTip: string,
+  ): Promise<boolean> {
+    const OID = /^[0-9a-f]{40}$/;
+    if (!OID.test(publishedTip) || !OID.test(pushedTip)) return false;
+    // Field/record separators: git emits the bytes 0x1f/0x1e via its own `%x1f`/`%x1e` format
+    // specifiers (plain ASCII in THIS source); we split the OUTPUT on the same bytes, written as
+    // printable \u escapes (never raw control bytes in source). A commit message never contains
+    // either byte, so %B (last field) is unambiguous.
+    const US = "\u001f";
+    const RS = "\u001e";
+    let raw: string;
+    try {
+      raw = await this.runGit(barePath, [
+        "log",
+        "--first-parent",
+        "--format=%H%x1f%T%x1f%P%x1f%B%x1e",
+        `${publishedTip}..${pushedTip}`,
+      ]);
+    } catch {
+      return false; // an invalid range / missing ref / broken repo → not detectable, never throw
+    }
+    const markerRe =
+      /bridge: restore published tip ([0-9a-f]{40}) as an ancestor of ([0-9a-f]{40}) \(tree unchanged\)/;
+    for (const record of raw.split(RS)) {
+      const rec = record.replace(/^\s+/, "");
+      if (rec.length === 0) continue;
+      const fields = rec.split(US);
+      if (fields.length < 4) continue;
+      const tree = fields[1]!.trim();
+      const parents = fields[2]!.trim().split(/\s+/).filter((p) => OID.test(p));
+      const body = fields[3]!;
+      const firstParent = parents[0];
+      if (!firstParent || !OID.test(tree)) continue;
+      const extras = parents.slice(1);
+      // tree === first-parent's tree — the load-bearing "H unchanged" property of a real bridge.
+      const fpTree = (
+        await this.tryGitStdout(barePath, ["rev-parse", `${firstParent}^{tree}`])
+      ).trim();
+      const treeEqualsFirstParent = OID.test(fpTree) && tree === fpTree;
+      const m = body.match(markerRe);
+      if (m) {
+        // WORKER bridge — the marker MEANS it must satisfy form 1 in full; a failing marker commit
+        // is rejected outright (never re-checked as the markerless agent form).
+        const X = m[1]!;
+        const Y = m[2]!;
+        if (X !== publishedTip || Y !== firstParent || !treeEqualsFirstParent || extras.length < 1) {
+          continue;
+        }
+        let allDescend = true;
+        let someNotAncestorOfY = false;
+        for (const ep of extras) {
+          if (!(await this.isAncestor(barePath, publishedTip, ep))) {
+            allDescend = false;
+            break;
+          }
+          if (!(await this.isAncestor(barePath, ep, firstParent))) someNotAncestorOfY = true;
+        }
+        if (allDescend && someNotAncestorOfY) return true;
+        continue;
+      }
+      // AGENT safety bridge (no marker): tree unchanged AND publishedTip is EXACTLY an extra parent.
+      if (treeEqualsFirstParent && extras.includes(publishedTip)) return true;
+    }
+    return false;
   }
 
   /** issue #781 — true when `ref` shares any history with the default branch, i.e.

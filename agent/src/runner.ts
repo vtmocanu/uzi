@@ -130,6 +130,38 @@ class TerminalReportError extends Error {
 }
 
 /**
+ * PRD #1416 M3/M4 SEAM — thrown at the FINALIZE bridge sites (the plain push and the align
+ * `fetchAndPush`) when the branch's history was rewritten at/below the published floor P AND the
+ * ancestry bridge B could not be built or validated, so the run cannot be landed with a
+ * fast-forward push. M3 only DEFINES and THROWS it (from `bridgeBareTrackingRefIfDivergent`
+ * returning `{kind:"failed"}`); it is deliberately NOT caught in M3 — it falls through to the
+ * existing generic failure path (which is today's behaviour for such a run anyway). M4 adds the
+ * catch that types it `history_rewritten` with a preserved_patch. Carries P (the published floor)
+ * so M4's typed reason can name it. Local, like TerminalReportError / StaleClaimError. The MID-RUN
+ * and PARK/CAPTURE bridge sinks must NEVER throw it (best-effort — a park that loses a bridge is
+ * worse than one that fails, D4). */
+class HistoryRewrittenError extends Error {
+  constructor(readonly publishedTip: string) {
+    super(
+      `history rewritten at or below the published tip ${publishedTip}; a fast-forward bridge could not be built or validated`,
+    );
+    this.name = "HistoryRewrittenError";
+  }
+}
+
+/** PRD #1416 M3 — the outcome of {@link RunRunner.bridgeBareTrackingRefIfDivergent} at a
+ *  publication boundary. "clean": P (and C) already ancestors of the tracking tip, nothing to do.
+ *  "unknown": ancestry could not be read, so do NOT bridge and do NOT fail. "bridged": B was built
+ *  + validated, the tracking ref advanced to B, and C advanced to B. "failed": divergent, but B
+ *  could not be built or validated (the finalize sinks turn this into a HistoryRewrittenError; the
+ *  mid-run/park/capture sinks log it and continue — best-effort, D4). */
+type BridgeOutcome =
+  | { kind: "clean" }
+  | { kind: "unknown" }
+  | { kind: "bridged"; bridge: string }
+  | { kind: "failed" };
+
+/**
  * PRD #1392 M2 — `ensureClone` exhausted `withForgeRetry` with a TRANSIENT verdict: the forge
  * was unreachable at clone/fetch (a DNS blip, a connection reset, a 5xx), not a permanent
  * rejection (401/403/404). `phaseClone` wraps the `ensureClone` throw in this so `executeClaim`'s
@@ -974,6 +1006,11 @@ export class RunRunner {
                 // braces so nothing here can undo the park (D4).
                 await this.git.commitWipMarker(worktreePath).catch(() => false);
                 await this.fetchBackBestEffort(barePath, worktreePath, branch, runId, runLog);
+                // PRD #1416 M3 (C5): bridge a divergent tracking tip BEFORE the park publish so a
+                // reseed on resume adopts B (the rewritten work), not the published tip. Best-effort:
+                // a park that fails is worse than a park that loses work (D4), so it NEVER throws —
+                // "failed"/"unknown" only log and the park continues.
+                await this.bridgeParkSinkBestEffort(barePath, branch, flight, runLog, "limit-park");
                 // PRD #628 M2: publish a ONE-SHOT checkpoint to origin so a DIFFERENT worker
                 // re-claiming this limit_wait run recovers the committed tree from
                 // refs/uzi-checkpoints/<branch> instead of cold-starting from default. Runs
@@ -1119,6 +1156,10 @@ export class RunRunner {
                 async (permit) => {
                   await this.git.commitWipMarker(worktreePath).catch(() => false);
                   await this.fetchBackBestEffort(barePath, worktreePath, branch, runId, runLog);
+                  // PRD #1416 M3 (C6): bridge a divergent tracking tip BEFORE the shutdown publish so
+                  // a resume adopts B, not the published tip. Best-effort — a shutdown checkpoint must
+                  // never throw (it is inside the k8s termination grace race, D4).
+                  await this.bridgeParkSinkBestEffort(barePath, branch, flight, runLog, "shutdown");
                   // PRD #1062 M2 (#1036): the path is reaped above, so the overlay's PAT
                   // default-fetch is permitted — a behind-on-workflows branch checkpoints durably.
                   const shutdownOverlay = await this.buildCheckpointOverlay(claim, flight, barePath);
@@ -2781,6 +2822,20 @@ export class RunRunner {
               result.branch,
               runId,
             );
+            // PRD #1416 M3 (C4): the align chain re-fetched the CLONE's aligned tip into the
+            // tracking ref — and a rebase-fallback align rewrites P (fact 14), so the aligned tip
+            // can itself be divergent below P. Bridge it here, AFTER the re-fetch and BEFORE the
+            // push, so pushToOrigin pushes B (P is an ancestor of B → fast-forward). One placement
+            // covers all three arms (overlay, merge, rebase). A "failed" bridge throws
+            // HistoryRewrittenError, which the arm's push catch rethrows (it catches only push-
+            // protection / workflow-scope / non-ff), falling to the generic catch; M4 will type it.
+            const o = await this.bridgeBareTrackingRefIfDivergent(
+              alignBarePath,
+              result.branch,
+              flight,
+              runLog,
+            );
+            if (o.kind === "failed") throw new HistoryRewrittenError(flight.publishedTip!);
             await pushToOrigin();
             alignPushed = true;
           };
@@ -3010,6 +3065,20 @@ export class RunRunner {
     // aligned branch — the run pushes through EXACTLY ONE code path (`pushToOrigin`), so a
     // successful align-push and the normal push converge here without ever double-pushing.
     if (!alignPushed) {
+      // PRD #1416 M3 (C3): non-destructively bridge a divergent tracking tip so the plain push
+      // fast-forwards. On "bridged" the tracking ref now points at B (P is an ancestor of B), so
+      // pushToOrigin pushes B. "clean"/"unknown" proceed unchanged; "failed" throws
+      // HistoryRewrittenError (NOT caught in M3 — it falls to the generic catch, today's behaviour
+      // for such a run; M4 types it history_rewritten). The top-of-finalize secret scan ran earlier
+      // on the divergent H (its floor was unresolvable, so it failed open); a secret on B is caught
+      // by the GH013 remote backstop in the push catch below, exactly as today for a divergent tip.
+      const o = await this.bridgeBareTrackingRefIfDivergent(
+        finalizeBarePath,
+        result.branch,
+        flight,
+        runLog,
+      );
+      if (o.kind === "failed") throw new HistoryRewrittenError(flight.publishedTip!);
       try {
         await pushToOrigin();
       } catch (e) {
@@ -3063,6 +3132,35 @@ export class RunRunner {
         }
         throw e;
       }
+    }
+
+    // PRD #1416 M3 (Part D): the MR bridge-note, derived from the PUSHED HISTORY — not a
+    // flight-local flag. A bridge built before a park is invisible to a reclaimed run's finalize
+    // (which builds no new bridge), but it is right here in P..pushedTip, so a reclaim still
+    // reports it. Computed ONCE after whichever push landed (plain or align), so it is path-
+    // independent. Only meaningful when there is a published floor P. Best-effort: rangeContainsBridge
+    // never throws (a git error → false), so this can never fail a finalize whose push already landed.
+    let bridged = false;
+    if (flight.publishedTip) {
+      const pushedTip = await this.git.trackingTip(finalizeBarePath, result.branch);
+      if (pushedTip) {
+        bridged = await this.git.rangeContainsBridge(
+          finalizeBarePath,
+          flight.publishedTip,
+          pushedTip,
+        );
+      }
+    }
+    if (bridged) {
+      // Worded GENERICALLY: the branch may have been bridged by THIS worker OR by the agent (the M2
+      // steer's `git merge -s ours <P>`), so it never says "the worker bridged it".
+      batcher.emit({
+        kind: "status",
+        agent: "worker",
+        payload: {
+          text: "the branch contains a history bridge (a published commit was restored as an ancestor so the branch fast-forwards); `git log --first-parent` reads as the intended history",
+        },
+      });
     }
 
     // PRD #400 M2: a no-MR task completes HERE — the branch is pushed, there is
@@ -3244,6 +3342,7 @@ export class RunRunner {
             result.scopeCapped,
             renderCloses,
             claim.config?.completion_scope,
+            bridged,
           ),
         }, boundarySignal),
       { log: runLog, signal: boundarySignal },
@@ -3288,6 +3387,7 @@ export class RunRunner {
           result.scopeCapped,
           withCloses,
           claim.config?.completion_scope,
+          bridged,
         );
         const desc = banner ? `${banner}\n\n${base}` : base;
         await withForgeRetry(
@@ -4664,6 +4764,24 @@ export class RunRunner {
           const fetchedTip = await this.git.trackingTip(barePath, runnerClone.branch);
           await this.maybeSteerOnDivergence(barePath, flight, fetchedTip, batcher, steering, runLog);
 
+          // PRD #1416 M3 (C1): AFTER the steer (which must see the agent's rewritten H) and BEFORE
+          // the publish, non-destructively bridge a divergent tracking tip so the checkpoint pack —
+          // and therefore a reseed on resume — carries B instead of the rewritten H. Best-effort:
+          // a checkpoint must never crash the run (D4), so "failed"/"unknown" only log and continue.
+          const bridgeOutcome = await this.bridgeBareTrackingRefIfDivergent(
+            barePath,
+            runnerClone.branch,
+            flight,
+            runLog,
+          );
+          if (bridgeOutcome.kind === "failed" || bridgeOutcome.kind === "unknown") {
+            runLog.info("PRD #1416 M3: mid-run checkpoint bridge did not advance the tracking ref", {
+              run_id: runId,
+              branch: runnerClone.branch,
+              outcome: bridgeOutcome.kind,
+            });
+          }
+
           // PRD #267: origin-publish gate. The publish is CREDENTIAL-FREE (a pack brokered to the
           // api via publishCheckpoint, no PAT — checkpointPack local objects → client join token)
           // EXCEPT the reap:true `overlay`'s default-tip fetch.
@@ -4690,6 +4808,15 @@ export class RunRunner {
             // retries the SAME tip at the next interval boundary (bounded loss).
             if (published) {
               flight.lastPublishedTip = cloneTip ?? flight.lastPublishedTip;
+              // PRD #1416 M3 (C2): advance the checkpoint floor C to the DURABLE published floor on
+              // EVERY confirmed publish (PRD line 62). When this tick BRIDGED, C is already B (the
+              // helper set it) and cloneTip is the un-bridged H — so DO NOT regress C back to H;
+              // otherwise C is the confirmed checkpoint tip cloneTip. lastPublishedTip stays cloneTip
+              // (H) above: it drives hasNewWork, a separate concern from the floor.
+              flight.checkpointFloor =
+                bridgeOutcome.kind === "bridged"
+                  ? bridgeOutcome.bridge
+                  : (cloneTip ?? flight.checkpointFloor);
               // PRD #267 M3: make the time-based publish observable, only for the time path so
               // we do not double-log the milestone case.
               if (!opts.reap) {
@@ -5056,6 +5183,134 @@ export class RunRunner {
       published_tip: publishedTip,
       tip,
     });
+  }
+
+  /**
+   * PRD #1416 M3 — at a PUBLICATION BOUNDARY (finalize push, park, release, capture), non-
+   * destructively repair a divergent bare tracking tip H by wrapping it in a synthesised bridge
+   * commit B so a rewritten branch FAST-FORWARDS from its published floor P (and checkpoint floor
+   * C) WITHOUT a force-push (D4). Reads H from the WORKER BARE tracking ref (worker-uid, via
+   * {@link Git.trackingTip}) — NEVER the runner clone (that crosses the ownership seam branchTip
+   * avoids). Advances the tracking ref to B and C to B on success, so everything a caller then
+   * captures / releases / aligns / pushes off the tracking ref carries B.
+   *
+   * Outcomes (never thrown for control flow — a git failure inside maps to "failed"/"unknown"):
+   *  - "clean"   — no floor to bridge (P null, or P and C are already ancestors of H). Nothing done.
+   *  - "unknown" — ancestry could not be determined (a broken read); do NOT bridge, do NOT fail.
+   *  - "bridged" — B built AND validated (tree === H's tree, P and H both ancestors of B); the bare
+   *                tracking ref was advanced to B and C set to B.
+   *  - "failed"  — H is divergent but B could not be built or validated; the ref is left at H.
+   */
+  private async bridgeBareTrackingRefIfDivergent(
+    barePath: string,
+    branch: string,
+    flight: RunFlight,
+    runLog: Logger,
+  ): Promise<BridgeOutcome> {
+    const publishedTip = flight.publishedTip;
+    if (!publishedTip) return { kind: "clean" }; // no published floor (fact 17) — nothing to bridge
+    // Read H from the WORKER-owned bare tracking ref; null ⇒ nothing published yet on this seam.
+    const H = await this.git.trackingTip(barePath, branch);
+    if (!H) return { kind: "clean" };
+    // Ancestry of P and of C (when C is set and differs from P) against H, tri-state.
+    const floors = [publishedTip];
+    if (flight.checkpointFloor && flight.checkpointFloor !== publishedTip) {
+      floors.push(flight.checkpointFloor);
+    }
+    let anyDivergent = false;
+    let anyUnknown = false;
+    for (const floor of floors) {
+      const rel = await this.git.ancestry(barePath, floor, H);
+      if (rel === "divergent") anyDivergent = true;
+      else if (rel === "unknown") anyUnknown = true;
+    }
+    if (!anyDivergent) {
+      // All ancestor, OR a mix of ancestor+unknown (no divergent): a broken read must NEVER bridge.
+      return anyUnknown ? { kind: "unknown" } : { kind: "clean" };
+    }
+    // Build B over the floors (bridgeToFloors appends only the ones actually missing).
+    const bridge = await this.git.bridgeToFloors(barePath, H, floors);
+    if (!bridge) {
+      runLog.warn("PRD #1416 M3: divergence below published floor but the bridge could not be built", {
+        run_id: flight.runId,
+        published_tip: publishedTip,
+        tip: H,
+      });
+      return { kind: "failed" };
+    }
+    // VALIDATE B before adopting it: tree byte-equal to H's, and P and H both ancestors of B.
+    const bridgeTree = await this.git.revParse(barePath, `${bridge}^{tree}`);
+    const hTree = await this.git.revParse(barePath, `${H}^{tree}`);
+    const treeOk = bridgeTree !== null && hTree !== null && bridgeTree === hTree;
+    const pOk = (await this.git.ancestry(barePath, publishedTip, bridge)) === "ancestor";
+    const hOk = (await this.git.ancestry(barePath, H, bridge)) === "ancestor";
+    if (!treeOk || !pOk || !hOk) {
+      runLog.warn("PRD #1416 M3: bridge failed validation; NOT adopting it", {
+        run_id: flight.runId,
+        published_tip: publishedTip,
+        tip: H,
+        bridge,
+        tree_ok: treeOk,
+        p_ancestor: pOk,
+        h_ancestor: hOk,
+      });
+      return { kind: "failed" };
+    }
+    // Adopt B: advance the bare tracking ref (worker-uid) and the checkpoint floor C.
+    try {
+      await this.git.updateTrackingRef(barePath, branch, bridge);
+    } catch (e) {
+      runLog.warn("PRD #1416 M3: could not advance the tracking ref to the bridge", {
+        run_id: flight.runId,
+        bridge,
+        error: errMessage(e),
+      });
+      return { kind: "failed" };
+    }
+    flight.checkpointFloor = bridge;
+    runLog.info("PRD #1416 M3: history rewritten below the published floor; bridged and advanced the tracking ref", {
+      run_id: flight.runId,
+      published_tip: publishedTip,
+      tip: H,
+      bridge,
+    });
+    return { kind: "bridged", bridge };
+  }
+
+  /**
+   * PRD #1416 M3 — the BEST-EFFORT bridge wrapper for the park / shutdown / capture sinks (C5-C8).
+   * Unlike the finalize sinks (C3/C4), which throw {@link HistoryRewrittenError} on a "failed"
+   * bridge, these boundaries must NEVER throw: a park/shutdown/capture that fails is worse than one
+   * that loses a bridge (D4). It runs the bridge, logs a "failed"/"unknown" outcome, and returns —
+   * the caller then captures/publishes whatever the tracking ref points at (B on success, the
+   * un-bridged H otherwise). Swallows any thrown error too, so nothing here can undo a park.
+   */
+  private async bridgeParkSinkBestEffort(
+    barePath: string,
+    branch: string,
+    flight: RunFlight,
+    runLog: Logger,
+    sink: string,
+  ): Promise<void> {
+    try {
+      const o = await this.bridgeBareTrackingRefIfDivergent(barePath, branch, flight, runLog);
+      if (o.kind === "failed" || o.kind === "unknown") {
+        runLog.info("PRD #1416 M3: park/capture bridge did not advance the tracking ref", {
+          run_id: flight.runId,
+          branch,
+          sink,
+          outcome: o.kind,
+        });
+      }
+    } catch (e) {
+      // Never let a bridge failure undo a park/shutdown/capture (D4).
+      runLog.warn("PRD #1416 M3: park/capture bridge threw; continuing best-effort", {
+        run_id: flight.runId,
+        branch,
+        sink,
+        error: errMessage(e),
+      });
+    }
   }
 
   /**
@@ -5767,6 +6022,12 @@ export class RunRunner {
           runLog,
         );
       }
+      // PRD #1416 M3 (C7): bridge a divergent tracking tip BEFORE the pause-park publish so a resume
+      // adopts B (the rewritten work), not the published tip. handlePausePark is checkpoint-first and
+      // does NOT route through the doCheckpointPublish/reapForSink machinery C1/C5/C6 cover, so it is
+      // wired here directly; the PauseNowSignal catch and the parkForPause callback both reach it, so
+      // this one placement covers both. Best-effort — a park must never throw (D4).
+      await this.bridgeParkSinkBestEffort(barePath, branch, flight, runLog, "pause-park");
     }
 
     // Checkpoint FIRST (Decision 8). An already-durable tip (a prior mid-run publish
@@ -5929,6 +6190,12 @@ export class RunRunner {
       branch,
     );
     if (!verified) return { verified: false, published: false };
+    // PRD #1416 M3 (C8): bridge a divergent tracking tip AFTER the fetch-back + verify (so the verify
+    // still confirms the tracking ref covered the run's HEAD H) and BEFORE the capture publish, so
+    // the recovery restore point + its published checkpoint hold B — a reseed on resume adopts B
+    // (which descends from P) instead of the rewritten H being set aside. Best-effort — a recovery
+    // capture must never throw.
+    await this.bridgeParkSinkBestEffort(barePath, branch, flight, runLog, "recovery-capture");
     // Remote publish is SEPARATE and best-effort. The agent tree was already reaped by the
     // caller (handleRecoveryExhausted's killAgentTree, untouched), so the overlay's PAT
     // default-fetch is permitted. publishCheckpointBestEffort surfaces the HTTP/skip outcome
@@ -6293,6 +6560,11 @@ export class RunRunner {
     // current HEAD (incl. any WIP marker), so a same-worker reseed recovers exactly this tip.
     const verified = await this.git.verifyRunnerTrackingCovers(barePath, worktreePath, branch);
     if (!verified) return NONE;
+    // PRD #1416 M3 (C8): bridge a divergent tracking tip AFTER the fetch-back + verify (so the verify
+    // still confirms the tracking ref covered H) and BEFORE the head is read + published, so a
+    // credential-switch release captures B, not the rewritten H — the completion-hold head and the
+    // published checkpoint both carry B, and a same-worker reclaim's reseed adopts it. Best-effort.
+    await this.bridgeParkSinkBestEffort(barePath, branch, flight, runLog, "hold-capture");
     // The captured head is the verified tracking tip. A verified ref whose tip is unresolvable is
     // treated as unverified (retain) — the hold contract requires a real head H for the permit.
     const head = await this.git.trackingTip(barePath, branch);
@@ -7103,8 +7375,18 @@ export function mrDescription(
   // reason), present in ANY branch — including on a closing accept-only PR. Absent/empty ⇒ no partial,
   // no accept, so the body is byte-identical to today.
   completionScope?: ClaimConfig["completion_scope"],
+  // PRD #1416 M3 (Part D): the pushed history contains an ancestry bridge (derived from history via
+  // rangeContainsBridge, NOT a flight-local flag). When true, ONE GENERIC sentence is appended to the
+  // body of EVERY kind's MR — never "the worker bridged it", because the agent's own `git merge -s
+  // ours <P>` bridge is equally possible. Defaults false so a non-bridged MR is byte-identical to today.
+  bridged = false,
 ): string {
   const footer = `Opened automatically by the uzi agent from branch \`${branch}\`. Please review and merge manually — the agent never merges.`;
+  // One generic sentence, appended to whichever body arm runs below (a per-kind body or the issue
+  // body) so the note is path- AND kind-independent. Empty when not bridged (body unchanged).
+  const bridgeNote = bridged
+    ? "\n\nThis branch contains a history bridge: a published commit was restored as an ancestor so the branch fast-forwards without a force-push, and `git log --first-parent` still reads as the intended history."
+    : "";
   const repoMarker =
     agentSelection?.source === "repo"
       ? [
@@ -7129,7 +7411,7 @@ export function mrDescription(
     selfImproveSection,
     promptGuardSection,
   });
-  if (kindBody !== undefined) return kindBody;
+  if (kindBody !== undefined) return kindBody + bridgeNote;
   // PRD #1227 M2/M3: the owner completion decisions. `deferred` non-empty ⇒ owner PARTIAL
   // (scope_reduced): the issue is NOT fully delivered. `accepted` non-empty ⇒ owner-waived unmet
   // criteria to name in a warning block. Both absent/empty on a normal run.
@@ -7192,7 +7474,7 @@ export function mrDescription(
   const gatesSection = gatesUnverifiedMrSection(gatesUnverified, gatesDiscoveryTruncated);
   if (gatesSection) body.push("", gatesSection);
   body.push("", "---", footer);
-  return body.join("\n");
+  return body.join("\n") + bridgeNote;
 }
 
 /** Issue #293 M2: an "unverified gates" note for the MR body, or "" when every

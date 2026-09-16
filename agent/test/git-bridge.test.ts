@@ -1,0 +1,279 @@
+import { afterEach, beforeEach, describe, it } from "node:test";
+import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { GitCache } from "../src/git.js";
+import { nullLogger } from "./helpers.js";
+
+// PRD #1416 M3 — the ancestry BRIDGE (git.ts bridgeToFloors) and the structure-validated bridge
+// DETECTOR (git.ts rangeContainsBridge), exercised over REAL on-disk repos so the commit graph
+// (divergent siblings, worker bridges, agent `-s ours` merges, spoofed markers) is genuine. A
+// GitCache git op runs in any git dir, so a plain working repo doubles as the "bare" here.
+
+const ENV = {
+  ...process.env,
+  GIT_CONFIG_GLOBAL: "/dev/null",
+  GIT_CONFIG_SYSTEM: "/dev/null",
+  GIT_TERMINAL_PROMPT: "0",
+};
+const IDENT = ["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false"];
+const OID = /^[0-9a-f]{40}$/;
+
+let base: string;
+let repo: string;
+let git: GitCache;
+
+function gitIn(dir: string, args: string[]): string {
+  return execFileSync("git", ["-C", dir, ...args], { encoding: "utf8", env: ENV }).trim();
+}
+
+/** Write `file`=`content`, stage it and commit on the CURRENT branch; return the new HEAD sha. */
+function commit(file: string, content: string, msg: string): string {
+  fs.writeFileSync(path.join(repo, file), content);
+  gitIn(repo, ["add", "."]);
+  gitIn(repo, [...IDENT, "commit", "-m", msg]);
+  return gitIn(repo, ["rev-parse", "HEAD"]);
+}
+
+/** True when `ancestor` is an ancestor of (or equal to) `descendant`. */
+function isAncestor(ancestor: string, descendant: string): boolean {
+  try {
+    execFileSync("git", ["-C", repo, "merge-base", "--is-ancestor", ancestor, descendant], {
+      env: ENV,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+beforeEach(() => {
+  base = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-bridge-test-"));
+  repo = path.join(base, "repo");
+  const dataDir = path.join(base, "data");
+  fs.mkdirSync(dataDir);
+  execFileSync("git", ["init", "-b", "main", repo], { env: ENV });
+  gitIn(repo, ["config", "user.email", "t@t"]);
+  gitIn(repo, ["config", "user.name", "t"]);
+  gitIn(repo, ["config", "commit.gpgsign", "false"]);
+  gitIn(repo, ["config", "maintenance.auto", "false"]);
+  gitIn(repo, ["config", "gc.auto", "0"]);
+  gitIn(repo, ["config", "core.fsmonitor", "false"]);
+  git = new GitCache(dataDir, nullLogger());
+});
+
+afterEach(() => fs.rmSync(base, { recursive: true, force: true }));
+
+/**
+ * Build the canonical rewrite graph: a root R, a published tip P on top of R, and a DIVERGENT
+ * tip H that is a sibling of P (also on R). P is NOT an ancestor of H, so H is "rewritten below P".
+ * Leaves the working tree checked out on the `h` branch at H.
+ */
+function rootPublishedAndDivergent(): { R: string; P: string; H: string } {
+  const R = commit("base.txt", "base\n", "root");
+  const P = commit("published.txt", "published\n", "published work");
+  gitIn(repo, ["checkout", "-b", "h", R]);
+  const H = commit("impl.ts", "export const x = 1;\n", "rewritten work");
+  return { R, P, H };
+}
+
+describe("GitCache.bridgeToFloors (PRD #1416 M3)", () => {
+  it("wraps a divergent H in B whose tree === H's tree byte-for-byte, with P and H both ancestors", async () => {
+    const { P, H } = rootPublishedAndDivergent();
+    const B = await git.bridgeToFloors(repo, H, [P]);
+    assert.ok(B && OID.test(B), "a bridge sha was returned");
+    // B's tree is byte-identical to H's tree.
+    assert.strictEqual(
+      gitIn(repo, ["rev-parse", `${B}^{tree}`]),
+      gitIn(repo, ["rev-parse", `${H}^{tree}`]),
+      "B's tree === H's tree",
+    );
+    // Both the published floor P and H are ancestors of B → a plain fast-forward push lands over P.
+    assert.ok(isAncestor(P!, B!), "P is an ancestor of B");
+    assert.ok(isAncestor(H, B!), "H is an ancestor of B");
+    // H is the FIRST parent (so `git log --first-parent` reads as the agent's history).
+    assert.strictEqual(gitIn(repo, ["rev-parse", `${B}^1`]), H, "H is B's first parent");
+    assert.strictEqual(gitIn(repo, ["rev-parse", `${B}^2`]), P, "P is B's second parent");
+  });
+
+  it("uses the EXACT marker message naming P (floors[0]) and H", async () => {
+    const { P, H } = rootPublishedAndDivergent();
+    const B = await git.bridgeToFloors(repo, H, [P]);
+    const msg = gitIn(repo, ["log", "-1", "--format=%B", B!]);
+    assert.strictEqual(
+      msg,
+      `bridge: restore published tip ${P} as an ancestor of ${H} (tree unchanged)`,
+    );
+  });
+
+  it("is DETERMINISTIC: the same inputs yield the same sha", async () => {
+    const { P, H } = rootPublishedAndDivergent();
+    const B1 = await git.bridgeToFloors(repo, H, [P]);
+    const B2 = await git.bridgeToFloors(repo, H, [P]);
+    assert.ok(B1 && B2);
+    assert.strictEqual(B1, B2, "a re-bridge of the same H over the same floors is byte-identical");
+  });
+
+  it("returns null when no floor is missing (P already an ancestor of the tip)", async () => {
+    const R = commit("base.txt", "base\n", "root");
+    const P = commit("published.txt", "p\n", "published");
+    const onTop = commit("more.ts", "1\n", "work on top of P"); // descends from P
+    assert.ok(isAncestor(P, onTop));
+    assert.strictEqual(await git.bridgeToFloors(repo, onTop, [P]), null, "nothing to bridge");
+    void R;
+  });
+
+  it("appends only the floors actually missing (C-only: P an ancestor, C divergent)", async () => {
+    const R = commit("base.txt", "base\n", "root");
+    const P = commit("p.txt", "p\n", "published");
+    const C = commit("c.txt", "c\n", "checkpoint above P"); // C descends from P
+    gitIn(repo, ["checkout", "-b", "h", P]);
+    const H = commit("impl.ts", "1\n", "work on P but diverging from C"); // descends from P, not C
+    const B = await git.bridgeToFloors(repo, H, [P, C]);
+    assert.ok(B && OID.test(B));
+    // P is already an ancestor of H → NOT a bridge parent; only the missing C is appended.
+    assert.strictEqual(gitIn(repo, ["rev-parse", `${B}^1`]), H, "first parent is H");
+    assert.strictEqual(gitIn(repo, ["rev-parse", `${B}^2`]), C, "the only extra parent is C");
+    assert.throws(() => gitIn(repo, ["rev-parse", `${B}^3`]), "no third parent (P was not missing)");
+    // The marker still names P (floors[0]).
+    assert.match(
+      gitIn(repo, ["log", "-1", "--format=%B", B]),
+      new RegExp(`restore published tip ${P} `),
+    );
+    void R;
+  });
+
+  it("returns null on a malformed tip or empty floors (never throws)", async () => {
+    const { H } = rootPublishedAndDivergent();
+    assert.strictEqual(await git.bridgeToFloors(repo, "not-an-oid", ["a".repeat(40)]), null);
+    assert.strictEqual(await git.bridgeToFloors(repo, H, []), null);
+    assert.strictEqual(await git.bridgeToFloors(repo, H, ["nope"]), null);
+  });
+});
+
+describe("GitCache.rangeContainsBridge (PRD #1416 M3 — the structure-validated detector)", () => {
+  it("ACCEPTS a P-only worker bridge", async () => {
+    const { P, H } = rootPublishedAndDivergent();
+    const B = await git.bridgeToFloors(repo, H, [P]);
+    assert.strictEqual(await git.rangeContainsBridge(repo, P, B!), true);
+  });
+
+  it("ACCEPTS a C-only worker bridge", async () => {
+    const P = (() => {
+      commit("base.txt", "base\n", "root");
+      return commit("p.txt", "p\n", "published");
+    })();
+    const C = commit("c.txt", "c\n", "checkpoint above P");
+    gitIn(repo, ["checkout", "-b", "h", P]);
+    const H = commit("impl.ts", "1\n", "on P, diverging from C");
+    const B = await git.bridgeToFloors(repo, H, [P, C]);
+    assert.strictEqual(await git.rangeContainsBridge(repo, P, B!), true);
+  });
+
+  it("ACCEPTS a P+C worker bridge", async () => {
+    const R = commit("base.txt", "base\n", "root");
+    const P = commit("p.txt", "p\n", "published");
+    const C = commit("c.txt", "c\n", "checkpoint above P");
+    gitIn(repo, ["checkout", "-b", "h", R]);
+    const H = commit("impl.ts", "1\n", "diverges below P");
+    const B = await git.bridgeToFloors(repo, H, [P, C]);
+    assert.strictEqual(gitIn(repo, ["rev-parse", `${B}^3`]), C, "both P and C are extra parents");
+    assert.strictEqual(await git.rangeContainsBridge(repo, P, B!), true);
+  });
+
+  it("ACCEPTS an agent `git merge -s ours P` bridge (no marker)", async () => {
+    const { P } = rootPublishedAndDivergent(); // working tree on `h` at H
+    gitIn(repo, [...IDENT, "merge", "-s", "ours", P, "-m", "restore published tip"]);
+    const B = gitIn(repo, ["rev-parse", "HEAD"]);
+    assert.strictEqual(gitIn(repo, ["log", "-1", "--format=%B", B]).includes("bridge: restore"), false);
+    assert.strictEqual(await git.rangeContainsBridge(repo, P, B), true);
+  });
+
+  it("REJECTS an unrelated `-s ours` merge (extra parent ≠ P)", async () => {
+    const R = commit("base.txt", "base\n", "root");
+    const P = commit("p.txt", "p\n", "published");
+    gitIn(repo, ["checkout", "-b", "q", R]);
+    const Q = commit("q.txt", "q\n", "unrelated sibling");
+    gitIn(repo, ["checkout", "-b", "h", R]);
+    commit("impl.ts", "1\n", "diverges below P");
+    gitIn(repo, [...IDENT, "merge", "-s", "ours", Q, "-m", "merge unrelated"]);
+    const B = gitIn(repo, ["rev-parse", "HEAD"]);
+    assert.strictEqual(await git.rangeContainsBridge(repo, P, B), false, "extra parent is Q, not P");
+  });
+
+  it("REJECTS a merged default-history merge commit (tree ≠ first-parent tree; no spoof/inflation under --first-parent)", async () => {
+    commit("base.txt", "base\n", "root");
+    const P = commit("p.txt", "p\n", "published");
+    // D is a default-branch sibling that adds its own file (so a merge tree differs from H's).
+    gitIn(repo, ["checkout", "-b", "d", P]);
+    const D = commit("default.txt", "from default\n", "default history advances");
+    gitIn(repo, ["checkout", "-b", "h", P]);
+    commit("impl.ts", "1\n", "agent work on P");
+    gitIn(repo, [...IDENT, "merge", "--no-edit", D]); // ordinary merge → tree combines H and D
+    const M = gitIn(repo, ["rev-parse", "HEAD"]);
+    assert.notStrictEqual(
+      gitIn(repo, ["rev-parse", `${M}^{tree}`]),
+      gitIn(repo, ["rev-parse", `${M}^1^{tree}`]),
+      "the merge tree differs from its first parent's tree",
+    );
+    assert.strictEqual(await git.rangeContainsBridge(repo, P, M), false);
+  });
+
+  it("REJECTS a commit carrying the marker TEXT but a WRONG X (published tip mismatch)", async () => {
+    const { R, P, H } = rootPublishedAndDivergent();
+    // Structurally a valid bridge (tree = H's, extra parent = P) but the marker names R, not P.
+    const tree = gitIn(repo, ["rev-parse", `${H}^{tree}`]);
+    const spoof = gitIn(repo, [
+      ...IDENT,
+      "commit-tree",
+      tree,
+      "-p",
+      H,
+      "-p",
+      P,
+      "-m",
+      `bridge: restore published tip ${R} as an ancestor of ${H} (tree unchanged)`,
+    ]);
+    assert.strictEqual(
+      await git.rangeContainsBridge(repo, P, spoof),
+      false,
+      "a marker naming the wrong published tip is rejected, never re-checked as the markerless form",
+    );
+  });
+
+  it("REJECTS a commit carrying the marker TEXT but tree ≠ first-parent tree", async () => {
+    const { P, H } = rootPublishedAndDivergent();
+    // Marker names P correctly, extra parent is P, but the tree is P's (not H's) → invalid.
+    const wrongTree = gitIn(repo, ["rev-parse", `${P}^{tree}`]);
+    const spoof = gitIn(repo, [
+      ...IDENT,
+      "commit-tree",
+      wrongTree,
+      "-p",
+      H,
+      "-p",
+      P,
+      "-m",
+      `bridge: restore published tip ${P} as an ancestor of ${H} (tree unchanged)`,
+    ]);
+    assert.strictEqual(await git.rangeContainsBridge(repo, P, spoof), false);
+  });
+
+  it("returns false (never throws) on a malformed publishedTip/pushedTip", async () => {
+    const { P, H } = rootPublishedAndDivergent();
+    assert.strictEqual(await git.rangeContainsBridge(repo, "nope", H), false);
+    assert.strictEqual(await git.rangeContainsBridge(repo, P, "nope"), false);
+    assert.strictEqual(await git.rangeContainsBridge(repo, P, "f".repeat(40)), false);
+  });
+
+  it("returns false on an empty range (nothing was bridged)", async () => {
+    const P = (() => {
+      commit("base.txt", "base\n", "root");
+      return commit("p.txt", "p\n", "published");
+    })();
+    const H = commit("impl.ts", "1\n", "clean fast-forward work"); // descends from P, no bridge
+    assert.strictEqual(await git.rangeContainsBridge(repo, P, H), false);
+  });
+});
