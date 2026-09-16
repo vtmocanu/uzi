@@ -326,16 +326,22 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 //
 // 🔴 THE RULE, VERBATIM: each PRD adds its own slice at its landing rebase (union, never
 // replace). PRD #1392 M1 adds `recovery_park_cause` and `recovery_release_exact_echo`;
-// PRD #1391 Run A adds `heartbeat_outbox`.
+// PRD #1391 Run A adds `heartbeat_outbox`; PRD #1247 adds `claim_generation_fence`.
 //
-// Do NOT advertise `claim_generation_fence` or `terminal_fence` here: those belong to
-// #1247/#1390 and Run B respectively, land after this, and are added to their own slice at
-// that time — advertising one now would tell the worker to send a fence a current api still
-// rejects. Returns a fresh slice so a caller cannot mutate the advertised set.
+// `claim_generation_fence` is a SERVER-SUPPORT advertisement, not an issue-ownership token:
+// this api now implements the per-query claim-generation fence — a `credential_switch_v1`
+// worker fails closed (ErrMissingClaimGeneration) if a mutating batch omits the generation —
+// so it advertises support here and its capability workers stamp the field only because the
+// server said it accepts it. #1390 lands after #1247 and its own slice must preserve/dedupe
+// this token, not activate it for the first time. Do NOT advertise `terminal_fence` yet: it
+// belongs to Run B, lands after this, and is added to its own slice then — advertising it now
+// would tell the worker to send a fence this api still rejects. Returns a fresh slice so a
+// caller cannot mutate the advertised set.
 func protocolFeatures() []string {
 	groups := [][]string{
 		{"recovery_park_cause", "recovery_release_exact_echo"}, // PRD #1392 M1
-		{"heartbeat_outbox"}, // PRD #1391 M5, Run A
+		{"heartbeat_outbox"},       // PRD #1391 M5, Run A
+		{"claim_generation_fence"}, // PRD #1247 M5 (D11): this api fences message/report inserts on claim_generation for a credential_switch_v1 worker
 	}
 	seen := make(map[string]bool)
 	out := make([]string, 0)
