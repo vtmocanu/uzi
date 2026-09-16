@@ -1023,14 +1023,16 @@ func TestSetStateBranchMovedSupersedeUnderFenceLiveDB(t *testing.T) {
 	defer cancel()
 	moved := true
 	reason := "the MR branch moved under the rework"
-	start := time.Now()
+	// The bounded 5s context is the discriminator: on the broken s.q path the supersede blocks on the
+	// fence tx's own lock until this deadline, so SetState returns a context-deadline err (caught by
+	// the first assertion below). A wall-clock threshold is deliberately NOT asserted — it adds no
+	// discriminating power over err != nil and would only false-red correct code under CI/DB load.
 	got, applied, err := svc.SetState(ctx, wkr, runID, StateRequest{
 		State: "failed", FailureReason: &reason, BranchMoved: &moved, ClaimGeneration: &g,
 	})
-	elapsed := time.Since(start)
 
 	if err != nil {
-		t.Fatalf("SetState(branch_moved under fence) err = %v (want nil); elapsed=%s — the supersede must run on the tx querier, not deadlock on the pool", err, elapsed)
+		t.Fatalf("SetState(branch_moved under fence) err = %v (want nil) — the supersede must run on the tx querier, not deadlock on the pool", err)
 	}
 	if !applied {
 		t.Fatal("applied=false: the branch_moved supersede did not apply")
@@ -1040,8 +1042,5 @@ func TestSetStateBranchMovedSupersedeUnderFenceLiveDB(t *testing.T) {
 	}
 	if got.StopKind.String != "branch_moved" {
 		t.Fatalf("returned stop_kind = %q, want branch_moved", got.StopKind.String)
-	}
-	if elapsed > 2*time.Second {
-		t.Fatalf("SetState took %s — a healthy supersede completes in ms; this indicates the pool/tx deadlock", elapsed)
 	}
 }
