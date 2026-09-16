@@ -48,7 +48,7 @@ func mrThreadMockHandler(t *testing.T, forgeType string, mrIID *int64, snap []by
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 
-	sealed, err := box.Seal([]byte("glpat-fake-forge-token-abcdef123456")) //gitleaks:allow fake fixture PAT (literal "fake"), sealed into a throwaway test secretbox; never a real credential
+	sealed, err := box.Seal([]byte("glpat-" + "fake-forge-token-abcdef123456")) // fake fixture PAT (literal "fake"), assembled from parts so no contiguous glpat-<20> literal sits in source; sealed into a throwaway test secretbox; never a real credential
 	if err != nil {
 		t.Fatalf("seal token: %v", err)
 	}

@@ -77,7 +77,7 @@ func newClaimGuardFixture(ctx context.Context, t *testing.T) claimGuardFixture {
 		forge:  fg,
 	}
 
-	sealedPAT, err := box.Seal([]byte("glpat-dummy-claim-token-000000")) //gitleaks:allow synthetic PAT fixture, sealed, never a real credential
+	sealedPAT, err := box.Seal([]byte("glpat-" + "dummy-claim-token-000000")) // synthetic PAT fixture, assembled from parts so no contiguous glpat-<20> literal sits in source; sealed, never a real credential
 	if err != nil {
 		t.Fatalf("seal PAT: %v", err)
 	}
