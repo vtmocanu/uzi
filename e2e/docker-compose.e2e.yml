@@ -123,6 +123,15 @@ services:
       # (config.go RUN_RECOVERY_PARK_BASE / RUN_RECOVERY_MAX_PARK) are untouched.
       RUN_RECOVERY_PARK_BASE: 1s
       RUN_RECOVERY_MAX_PARK: 5s
+      # Forge pre-clone park lifetime cap (PRD #1392 M1): how many times a run may
+      # forge-park before SetState fails it with fail_origin=forge_unreachable (0 =
+      # unlimited). The shipped default is 6; interpolated so phase 73
+      # (forge-unreachable-park) can lower it to 2 for its cap-exhaustion case by
+      # writing E2E_FORGE_UNREACHABLE_MAX_PARKS into the env-file and recreating the
+      # api. Unset ⇒ the api's built-in 6 default, exercised by every other run.
+      # Mirrors the FORGE_POLL_INTERVAL interpolation pattern below. Overlay-only;
+      # production (config.go RUN_FORGE_UNREACHABLE_MAX_PARKS) is untouched.
+      RUN_FORGE_UNREACHABLE_MAX_PARKS: ${E2E_FORGE_UNREACHABLE_MAX_PARKS:-6}
       # MR review-watcher debounce (PRD #966 M6 / D6): the review-landed quiet period
       # the mr_rework detector waits after the newest review comment before queuing a
       # rework. Shrunk from the shipped 3m default so phase 71 can inject a note and
