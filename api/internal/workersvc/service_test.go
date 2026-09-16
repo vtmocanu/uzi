@@ -1555,6 +1555,9 @@ func testParams() Params {
 		QuestionTimeoutSeconds: 86400, // PRD #88 answer deadline (24h)
 		RunMaxRequeues:         1,
 		WorkerHeartbeatStale:   45 * time.Second,
+		// PRD #1390 M2b (D4): the missing-run fence is WorkerHeartbeatStale + WorkerHeartbeatInterval
+		// (45s + 15s = 60s), so a Service from testParams() computes the same fence as production.
+		WorkerHeartbeatInterval: 15 * time.Second,
 		// PRD #1390 M2a snapshot knobs, at their config defaults so a Service built from
 		// testParams() validates/stamps snapshots exactly as production. Snapshot-cap tests
 		// override these on their own Params.

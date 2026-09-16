@@ -1093,6 +1093,12 @@ type Params struct {
 	CompletionHoldWindowSeconds int
 	RunMaxRequeues              int
 	WorkerHeartbeatStale        time.Duration
+	// WorkerHeartbeatInterval (WORKER_HEARTBEAT_INTERVAL) is the worker's heartbeat cadence.
+	// PRD #1390 M2b (D4): the missing-run fence is WorkerHeartbeatStale + WorkerHeartbeatInterval
+	// (the stale window plus one heartbeat interval), so a `running` run absent from a snapshot is
+	// requeued only once it has been silent past the whole window with margin. Mirrored from config;
+	// the zero value narrows the fence to just the stale window (degraded, never wrong).
+	WorkerHeartbeatInterval time.Duration
 	// DiskPressureThreshold (PRD #837 M4, UZI_DISK_PRESSURE_THRESHOLD) is the used/total
 	// fraction in (0,1] at/above which a self-reported disk volume counts as "over
 	// threshold" for one heartbeat. Heartbeat feeds it to diskOverThreshold, which drives
@@ -1858,12 +1864,18 @@ type WorkerStats struct {
 // self-clears its gauge; an empty/nil outbox CLEARS the worker's tracked depth (the "clears
 // on the next empty report" contract).
 //
-// When a snapshot is carried it runs inside ONE transaction after the liveness write (which
-// locks the worker row): HeartbeatWorker, then ReplaceWorkerActiveRuns in heartbeat mode. An
-// invalid/stale/wrong-nonce snapshot is IGNORED there — a warning, no error, rows and leases
-// left as they were — so an invalid snapshot never turns a heartbeat into a 400 and liveness is
-// still refreshed. When no snapshot is carried (or no tx beginner is wired), it takes the plain
-// single-statement path, exactly as before.
+// When a snapshot is carried it runs inside ONE transaction in the canonical order (PRD #1390
+// M2b): HeartbeatWorker (locks the worker row), then LockOwnedRunsByIDs (pre-locks the runs the
+// snapshot lists so a sibling's concurrent FOR UPDATE SKIP LOCKED claim skips them), then
+// ReplaceWorkerActiveRuns in heartbeat mode. ONLY when the snapshot was applied does it then
+// reconcile: ReadoptRunsFromSnapshot (restore a queued run the worker still lists), then
+// FailRunsMissingFromSnapshot then RequeueRunsMissingFromSnapshot (fail before requeue) for a
+// running run this worker owns but no longer lists, past the missing fence. Each reconciled
+// transition is published post-commit (never inside the tx), mirroring publishRegisterSweeps.
+// An invalid/stale/wrong-nonce snapshot is IGNORED (applied=false) — a warning, no error, rows
+// and leases left as they were, and the reconciliation is skipped — so an invalid snapshot never
+// turns a heartbeat into a 400 and liveness is still refreshed. When no snapshot is carried (or
+// no tx beginner is wired), it takes the plain single-statement path, exactly as before.
 func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *WorkerStats, outbox []OutboxEntry, snapshot *ActiveSnapshot) (store.Worker, error) {
 	// Record the outbox depth BEFORE the liveness write: it is in-memory and cannot
 	// fail, and doing it unconditionally means an empty report clears the set even on
@@ -1905,16 +1917,93 @@ func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *Worker
 	if err != nil {
 		return store.Worker{}, err
 	}
-	// heartbeat mode: an invalid snapshot returns (false, nil) — ignored, not fatal — so the
-	// heartbeat's liveness refresh still commits. Only a real DB error aborts the tx.
-	if _, err := s.ReplaceWorkerActiveRuns(ctx, qtx, updated, snapshot, snapshotModeHeartbeat); err != nil {
+	// (b) Pre-lock the runs the snapshot lists, in canonical id order, BEFORE the replace and the
+	// reconciliation writes — so a sibling's concurrent claim (FOR UPDATE SKIP LOCKED) skips them
+	// until this tx commits. Unparseable ids are skipped (they cannot name a real run); an id for a
+	// run this worker does not own is a no-op (the WHERE excludes it), never locked.
+	if ids := snapshotRunIDs(snapshot); len(ids) > 0 {
+		if _, err := qtx.LockOwnedRunsByIDs(ctx, store.LockOwnedRunsByIDsParams{
+			RunIds:   ids,
+			WorkerID: pgconv.UUID(updated.ID),
+		}); err != nil {
+			return store.Worker{}, err
+		}
+	}
+	// (c) heartbeat mode: an invalid snapshot returns (false, nil) — ignored, not fatal — so the
+	// heartbeat's liveness refresh still commits. Only a real DB error aborts the tx. CAPTURE
+	// applied: the reconciliation runs ONLY when the snapshot was actually applied (an invalid,
+	// stale-epoch or wrong-nonce snapshot must not drive readopt/requeue off rows it did not write).
+	applied, err := s.ReplaceWorkerActiveRuns(ctx, qtx, updated, snapshot, snapshotModeHeartbeat)
+	if err != nil {
 		return store.Worker{}, err
+	}
+	var (
+		readopted       []store.ReadoptRunsFromSnapshotRow
+		missingFailed   []store.FailRunsMissingFromSnapshotRow
+		missingRequeued []store.RequeueRunsMissingFromSnapshotRow
+	)
+	if applied {
+		// (d) Reconcile, fail before requeue (over-cap fail-first ordering). The missing fence is the
+		// stale window plus one heartbeat interval (D4). max_requeues is RUN_MAX_REQUEUES.
+		missingCutoff := pgconv.Time(s.now().Add(-(s.p.WorkerHeartbeatStale + s.p.WorkerHeartbeatInterval)))
+		maxRequeues := int32(s.p.RunMaxRequeues) //nolint:gosec // G115: RunMaxRequeues is a small bounded config int (env RUN_MAX_REQUEUES), never near int32 range
+		readopted, err = qtx.ReadoptRunsFromSnapshot(ctx, updated.ID)
+		if err != nil {
+			return store.Worker{}, err
+		}
+		missingFailed, err = qtx.FailRunsMissingFromSnapshot(ctx, store.FailRunsMissingFromSnapshotParams{
+			FailureReason: pgconv.TextOrNull("worker lost the execution; exceeded re-queue budget"),
+			WorkerID:      pgconv.UUID(updated.ID),
+			MissingCutoff: missingCutoff,
+			MaxRequeues:   maxRequeues,
+		})
+		if err != nil {
+			return store.Worker{}, err
+		}
+		missingRequeued, err = qtx.RequeueRunsMissingFromSnapshot(ctx, store.RequeueRunsMissingFromSnapshotParams{
+			WorkerID:      pgconv.UUID(updated.ID),
+			MissingCutoff: missingCutoff,
+			MaxRequeues:   maxRequeues,
+		})
+		if err != nil {
+			return store.Worker{}, err
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return store.Worker{}, err
 	}
 	committed = true
+	// (e) Publish + judge POST-COMMIT (never inside the tx), mirroring publishRegisterSweeps: a
+	// readopt and a missing-requeue publish their live status; a missing-fail publishes 'failed'
+	// AND funnels into the judge (PRD #46 Decision 2, the same worker-lost runs the sweeper funnels).
+	for _, r := range readopted {
+		s.publishSwept(r.ID, r.Status)
+	}
+	for _, r := range missingFailed {
+		s.publishSwept(r.ID, r.Status)
+		s.maybeEnqueueJudgeByID(ctx, r.ID)
+	}
+	for _, r := range missingRequeued {
+		s.publishSwept(r.ID, r.Status)
+	}
 	return updated, nil
+}
+
+// snapshotRunIDs parses the run ids an ActiveSnapshot lists into uuids for the canonical pre-lock
+// (PRD #1390 M2b). Unparseable ids are skipped (ReplaceWorkerActiveRuns rejects the whole snapshot
+// on a bad uuid anyway; the pre-lock only needs the parseable ones for its FOR UPDATE). Returns nil
+// for a nil/empty snapshot so the caller can skip the lock statement.
+func snapshotRunIDs(snap *ActiveSnapshot) []uuid.UUID {
+	if snap == nil || len(snap.Active) == 0 {
+		return nil
+	}
+	ids := make([]uuid.UUID, 0, len(snap.Active))
+	for _, e := range snap.Active {
+		if id, err := uuid.Parse(e.RunID); err == nil {
+			ids = append(ids, id)
+		}
+	}
+	return ids
 }
 
 // diskOverThreshold: any reported volume at/above threshold. >= pins the comparator

@@ -306,6 +306,8 @@ func run() error {
 		CompletionHoldWindowSeconds: cfg.CompletionHoldWindowSeconds,
 		RunMaxRequeues:              cfg.RunMaxRequeues,
 		WorkerHeartbeatStale:        cfg.WorkerHeartbeatStale,
+		// PRD #1390 M2b (D4): the missing-run fence is WorkerHeartbeatStale + WorkerHeartbeatInterval.
+		WorkerHeartbeatInterval: cfg.WorkerHeartbeatInterval,
 		// PRD #1390 M1 (D1): the boot-grace window that suppresses the stale-worker passes
 		// until the worker-facing listener has been ready this long (SetReadyAt, below).
 		SweeperBootGrace: cfg.SweeperBootGrace,

@@ -2488,6 +2488,79 @@ func (q *Queries) FailRunAutoStop(ctx context.Context, arg FailRunAutoStopParams
 	return result.RowsAffected(), nil
 }
 
+const failRunsMissingFromSnapshot = `-- name: FailRunsMissingFromSnapshot :many
+UPDATE runs SET status = 'failed', status_since = now(), failure_reason = $1,
+    fail_origin = 'worker_lost',
+    move_pending_since = now(), finished_at = now(),
+    milestones_in_progress = NULL,
+    milestones_agents = NULL,
+    pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
+    credential_switch_requested_at = NULL, credential_switch_generation = NULL,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE runs.worker_id = $2
+  AND runs.kind <> 'chat'                                   -- D10 (run-lane only; chat has its own sweeps)
+  AND runs.status = 'running'
+  AND runs.claim_released_at IS NULL                        -- #1247 fence
+  AND runs.status_since < $3                   -- fence: stale window + one heartbeat interval, D4
+  AND runs.requeue_count >= $4
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a        -- ABSENT (or a different generation) from the snapshot
+                  WHERE a.worker_id = $2 AND a.run_id = runs.id
+                    AND a.claim_generation = runs.claim_generation)
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a        -- D11 terminal-pending lease (worker-scoped, defense-in-depth)
+                  WHERE a.worker_id = runs.worker_id AND a.run_id = runs.id
+                    AND a.terminal_pending AND a.terminal_pending_until > now()
+                    AND a.claim_generation = runs.claim_generation)
+  AND NOT EXISTS (SELECT 1 FROM workers w                   -- D11 pending_overflow closure (worker-level, ESSENTIAL)
+                  WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())
+RETURNING id, user_id, status
+`
+
+type FailRunsMissingFromSnapshotParams struct {
+	FailureReason pgtype.Text        `json:"failure_reason"`
+	WorkerID      pgtype.UUID        `json:"worker_id"`
+	MissingCutoff pgtype.Timestamptz `json:"missing_cutoff"`
+	MaxRequeues   int32              `json:"max_requeues"`
+}
+
+type FailRunsMissingFromSnapshotRow struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+	Status string    `json:"status"`
+}
+
+// PRD #1390 M2b (SC2, over cap): a run-lane `running` run this worker OWNS but no longer lists (its
+// execution is lost) — past the fence, and out of re-queue budget — is FAILED (fail-first with the
+// requeue twin below). Its SET list mirrors FailRunsOfStaleWorkersOverCap (fail_origin='worker_lost',
+// the pause/switch/milestone clears, health reset, move_pending_since for the reconcile origin
+// restore). Held states are never targeted (status = 'running' only). Chat is a target restriction
+// (kind <> 'chat', D10) — these writers only ever touch run-lane runs. @missing_cutoff is the stale
+// window plus one heartbeat interval (D4); @max_requeues is RUN_MAX_REQUEUES.
+func (q *Queries) FailRunsMissingFromSnapshot(ctx context.Context, arg FailRunsMissingFromSnapshotParams) ([]FailRunsMissingFromSnapshotRow, error) {
+	rows, err := q.db.Query(ctx, failRunsMissingFromSnapshot,
+		arg.FailureReason,
+		arg.WorkerID,
+		arg.MissingCutoff,
+		arg.MaxRequeues,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []FailRunsMissingFromSnapshotRow{}
+	for rows.Next() {
+		var i FailRunsMissingFromSnapshotRow
+		if err := rows.Scan(&i.ID, &i.UserID, &i.Status); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const failRunsOfStaleWorkersOverCap = `-- name: FailRunsOfStaleWorkersOverCap :many
 WITH locked AS (
     SELECT workers.id FROM workers
@@ -6727,6 +6800,40 @@ func (q *Queries) LockOpenCustodyHoldsForRunWorkerGeneration(ctx context.Context
 	return items, nil
 }
 
+const lockOwnedRunsByIDs = `-- name: LockOwnedRunsByIDs :many
+
+SELECT id FROM runs WHERE id = ANY($1::uuid[]) AND worker_id = $2 ORDER BY id FOR UPDATE
+`
+
+type LockOwnedRunsByIDsParams struct {
+	RunIds   []uuid.UUID `json:"run_ids"`
+	WorkerID pgtype.UUID `json:"worker_id"`
+}
+
+// Heartbeat reconciliation (PRD #1390 M2b) ----------------------------------
+// PRD #1390 M2b (blocker 1, canonical lock order step b): lock the runs the heartbeat's snapshot
+// lists, owned by this worker, in deterministic id order, BEFORE the snapshot replace and the
+// reconciliation writes. Rows returned are ignored; the statement exists for its FOR UPDATE.
+func (q *Queries) LockOwnedRunsByIDs(ctx context.Context, arg LockOwnedRunsByIDsParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, lockOwnedRunsByIDs, arg.RunIds, arg.WorkerID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const lowerLimitWaitRetryNow = `-- name: LowerLimitWaitRetryNow :execrows
 UPDATE runs SET retry_not_before = now(), updated_at = now()
 WHERE id = $1 AND user_id = $2 AND status = 'limit_wait'
@@ -7490,6 +7597,65 @@ func (q *Queries) PromoteRecoveryWaitRuns(ctx context.Context, now pgtype.Timest
 	return items, nil
 }
 
+const readoptRunsFromSnapshot = `-- name: ReadoptRunsFromSnapshot :many
+UPDATE runs r SET
+    status = a.phase,
+    status_since = now(),
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    budget_paused_seconds = r.budget_paused_seconds
+        + CASE WHEN a.phase IN ('awaiting_approval','awaiting_input')
+               THEN GREATEST(0, EXTRACT(EPOCH FROM (now() - r.status_since))::int)
+               ELSE 0 END,
+    requeue_count = CASE WHEN r.stale_requeue_generation = r.claim_generation
+                         THEN GREATEST(r.requeue_count - 1, 0) ELSE r.requeue_count END,
+    stale_requeue_generation = NULL,
+    updated_at = now()
+FROM worker_active_runs a
+WHERE a.worker_id = $1 AND a.run_id = r.id AND a.terminal_pending = false
+  AND r.worker_id = $1
+  AND r.status = 'queued'
+  AND r.kind <> 'chat'
+  AND r.claim_generation = a.claim_generation
+  AND r.claim_released_at IS NULL
+RETURNING r.id, r.user_id, r.status
+`
+
+type ReadoptRunsFromSnapshotRow struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+	Status string    `json:"status"`
+}
+
+// PRD #1390 M2b (D5, D2): restore a `queued` run-lane run the worker still lists as a LIVE entry
+// (terminal_pending = false) at the SAME generation to its listed phase. This is a DIRECT status
+// write (not SetRunRunning), correct because the held-state content columns (open_question_id,
+// plan candidates, completion/follow-up identity) survived the stale requeue untouched (fact 4),
+// so the gate is restored by status alone. The queued interval is banked into budget_paused_seconds
+// only for the two approval/input phases (as the stale requeue did for the park). The requeue
+// refund (requeue_count - 1, floored at 0) fires ONLY when stale_requeue_generation = claim_generation
+// (D2: the stale requeue charged THIS exact generation); a NULL/mismatched provenance never refunds.
+// stale_requeue_generation is cleared after. claim_released_at IS NULL is #1247's fence (a run the
+// credential switch released must not be revived). Held-state content columns are UNTOUCHED here.
+func (q *Queries) ReadoptRunsFromSnapshot(ctx context.Context, workerID uuid.UUID) ([]ReadoptRunsFromSnapshotRow, error) {
+	rows, err := q.db.Query(ctx, readoptRunsFromSnapshot, workerID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ReadoptRunsFromSnapshotRow{}
+	for rows.Next() {
+		var i ReadoptRunsFromSnapshotRow
+		if err := rows.Scan(&i.ID, &i.UserID, &i.Status); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const reconcileRunMR = `-- name: ReconcileRunMR :execrows
 UPDATE runs SET
     mr_iid     = COALESCE(mr_iid, $1),
@@ -8088,6 +8254,71 @@ func (q *Queries) RequeueClaimedRunToQueued(ctx context.Context, id uuid.UUID) (
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const requeueRunsMissingFromSnapshot = `-- name: RequeueRunsMissingFromSnapshot :many
+UPDATE runs SET status = 'queued', status_since = now(), requeue_count = requeue_count + 1,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    budget_paused_seconds = budget_paused_seconds
+        + CASE WHEN status IN ('awaiting_approval', 'awaiting_input')
+               THEN GREATEST(0, EXTRACT(EPOCH FROM (now() - status_since))::int)
+               ELSE 0 END,
+    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
+    updated_at = now()
+WHERE runs.worker_id = $1
+  AND runs.kind <> 'chat'                                   -- D10 (run-lane only; chat has its own sweeps)
+  AND runs.status = 'running'
+  AND runs.claim_released_at IS NULL                        -- #1247 fence
+  AND runs.status_since < $2                   -- fence: stale window + one heartbeat interval, D4
+  AND runs.requeue_count < $3
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a        -- ABSENT (or a different generation) from the snapshot
+                  WHERE a.worker_id = $1 AND a.run_id = runs.id
+                    AND a.claim_generation = runs.claim_generation)
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a        -- D11 terminal-pending lease (worker-scoped, defense-in-depth)
+                  WHERE a.worker_id = runs.worker_id AND a.run_id = runs.id
+                    AND a.terminal_pending AND a.terminal_pending_until > now()
+                    AND a.claim_generation = runs.claim_generation)
+  AND NOT EXISTS (SELECT 1 FROM workers w                   -- D11 pending_overflow closure (worker-level, ESSENTIAL)
+                  WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())
+RETURNING id, user_id, status
+`
+
+type RequeueRunsMissingFromSnapshotParams struct {
+	WorkerID      pgtype.UUID        `json:"worker_id"`
+	MissingCutoff pgtype.Timestamptz `json:"missing_cutoff"`
+	MaxRequeues   int32              `json:"max_requeues"`
+}
+
+type RequeueRunsMissingFromSnapshotRow struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+	Status string    `json:"status"`
+}
+
+// PRD #1390 M2b (SC2, under cap): the requeue twin of FailRunsMissingFromSnapshot — a `running`
+// run-lane run this worker OWNS but no longer lists, past the fence and within budget, is REQUEUED
+// through the existing requeue path. Its SET list mirrors RequeueRunsOfStaleWorkers (health reset,
+// park-time bank for approval/input — a no-op here since only status='running' is targeted, codex
+// cap revocation, requeue_count++). It does NOT set stale_requeue_generation: a genuine loss is
+// never refunded (D2). Chat is a target restriction (kind <> 'chat', D10).
+func (q *Queries) RequeueRunsMissingFromSnapshot(ctx context.Context, arg RequeueRunsMissingFromSnapshotParams) ([]RequeueRunsMissingFromSnapshotRow, error) {
+	rows, err := q.db.Query(ctx, requeueRunsMissingFromSnapshot, arg.WorkerID, arg.MissingCutoff, arg.MaxRequeues)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []RequeueRunsMissingFromSnapshotRow{}
+	for rows.Next() {
+		var i RequeueRunsMissingFromSnapshotRow
+		if err := rows.Scan(&i.ID, &i.UserID, &i.Status); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const requeueRunsOfStaleWorkers = `-- name: RequeueRunsOfStaleWorkers :many
