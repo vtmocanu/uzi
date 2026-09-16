@@ -328,6 +328,39 @@ describe("JudgeRunner", () => {
     assert.equal(calls.review, undefined, "no review is posted when the pre-post probe is stale");
   });
 
+  // PRD #1247 fix round (Greptile P1 disposition): the pre-post probe is a SUPERSESSION FENCE and is
+  // FAIL-CLOSED. A TRANSIENT failure (a throw, NOT a staleClaim ack) leaves ownership UNKNOWN, and
+  // postReview is generation-blind until #1423, so proceeding could overwrite a reclaiming flight's
+  // advice. The throw therefore propagates to the advice-phase catch (safeReportFailed) and posts
+  // NO advice. Removing the fence (or making it best-effort) reddens this (a review would be posted).
+  it("fails closed when the pre-post probe throws transiently: NO advice post, the run reports failed", async () => {
+    let running = 0;
+    const calls: { review?: unknown; states: string[] } = { states: [] };
+    const client = {
+      getTrace: async () => emptyTrace,
+      postReview: async (id: string, review: ReviewRequest) => {
+        calls.review = { id, review };
+      },
+      reportState: async (_id: string, body: StateRequest) => {
+        calls.states.push(body.status);
+        if (body.status === "running") {
+          running++;
+          if (running === 2) throw new Error("transient probe failure"); // the pre-post probe
+          return { applied: true, status: "running" } as never;
+        }
+        return { applied: true, status: body.status } as never;
+      },
+      postMessages: async () => {},
+    } as unknown as WorkerClient;
+    const modelJson = JSON.stringify({ verdict: "ok", summary: "s", recommendations: [] });
+    const runner = new JudgeRunner(client, nullLogger(), { queryFn: replyingQueryFn(modelJson) });
+    await runner.execute(judgeClaim({ claim_generation: 5 }));
+
+    assert.equal(calls.review, undefined, "a probe throw posts NO advice (fail-closed: ownership unknown)");
+    assert.ok(calls.states.includes("failed"), "the run reports failed via the advice-phase catch");
+    assert.ok(!calls.states.includes("completed"), "no completed report when the pre-post fence fails closed");
+  });
+
   it("posts NO usage frame on the model-error path (PRD #69 M6)", async () => {
     const { client, calls } = fakeClient(emptyTrace);
     const runner = new JudgeRunner(client, nullLogger(), { queryFn: replyingQueryFn("garbage", true) });

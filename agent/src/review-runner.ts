@@ -189,6 +189,15 @@ export class ReviewRunner {
       // status_since) IMMEDIATELY before the advice write; a stale ack abandons before postTaskReview.
       // A residual sub-RPC TOCTOU and the ungenerationed advice write itself remain for the
       // atomic-fence follow-up (issue #1423).
+      // The pre-post probe is a SUPERSESSION FENCE, and it is FAIL-CLOSED (Greptile P1 disposition —
+      // NOT best-effort). A staleClaim ack abandons cleanly (below). A transport/transient failure
+      // leaves ownership UNKNOWN — the run may have been reclaimed at G+1 during the outage — and
+      // postTaskReview is generation-blind until #1423, so PROCEEDING could overwrite the reclaiming
+      // flight's review with this stale one. So a probe throw PROPAGATES to the advice-phase catch
+      // (safeReportFailed, itself generation-fenced), posting NO review: the review is lost
+      // (recoverable) rather than risking a stale overwrite. In the api-unreachable case postTaskReview
+      // would fail anyway, so this only changes the narrow reclaim-during-blip case, in the safe
+      // direction.
       const prePostAck = await this.client.reportState(reviewRunId, {
         status: "running",
         claim_generation: claim.claim_generation,

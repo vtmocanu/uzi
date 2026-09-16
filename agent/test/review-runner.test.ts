@@ -298,6 +298,37 @@ describe("ReviewRunner", () => {
     assert.equal(calls.review, undefined, "no task review is posted when the pre-post probe is stale");
   });
 
+  // PRD #1247 fix round (Greptile P1 disposition): the pre-post probe is a SUPERSESSION FENCE and is
+  // FAIL-CLOSED. A TRANSIENT failure (a throw, NOT a staleClaim ack) leaves ownership UNKNOWN, and
+  // postTaskReview is generation-blind until #1423, so proceeding could overwrite a reclaiming
+  // flight's review. The throw propagates to the advice-phase catch (safeReportFailed) and posts NO
+  // review. Removing the fence (or making it best-effort) reddens this (a review would be posted).
+  it("fails closed when the pre-post probe throws transiently: NO review post, the run reports failed", async () => {
+    let running = 0;
+    const calls: { review?: unknown; states: string[] } = { states: [] };
+    const client = {
+      reportState: async (_id: string, body: StateRequest) => {
+        calls.states.push(body.status);
+        if (body.status === "running") {
+          running++;
+          if (running === 2) throw new Error("transient probe failure"); // the pre-post probe
+          return { applied: true, status: "running" } as never;
+        }
+        return { applied: true, status: body.status } as never;
+      },
+      postTaskReview: async (id: string, review: TaskReviewRequest) => {
+        calls.review = { id, review };
+      },
+    } as unknown as WorkerClient;
+    const { git } = fakeGit("diff --git a/poller.ts b/poller.ts\n@@ -1 +1 @@\n-old\n+new\n");
+    const runner = new ReviewRunner(client, git, nullLogger(), { queryFn: replyingQueryFn(goodModelJson) });
+    await runner.execute(reviewClaim({ claim_generation: 5 }));
+
+    assert.equal(calls.review, undefined, "a probe throw posts NO review (fail-closed: ownership unknown)");
+    assert.ok(calls.states.includes("failed"), "the run reports failed via the advice-phase catch");
+    assert.ok(!calls.states.includes("completed"), "no completed report when the pre-post fence fails closed");
+  });
+
   it("posts zero findings WITHOUT calling the model on an empty diff", async () => {
     const { client, calls } = fakeClient();
     const { git, calls: gitCalls } = fakeGit("   \n  "); // whitespace-only ⇒ nothing to review
