@@ -17,12 +17,13 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// run_credential.go is the service side of `uzi run set-token` for the NON-HELD run
-// states (PRD #1247 M4, D4/D6/D12): it writes the per-run credential override and, for a
-// parked run, performs the state-specific early promote so the next claim spends the
-// chosen token. The HELD-state switch protocol (awaiting_*/running) is M5 — this file
-// refuses those with a typed 409 and writes NOTHING; M5 replaces that branch with the
-// real quiesce → release → reclaim protocol and the credential_switch capability check.
+// run_credential.go is the service side of `uzi run set-token` (PRD #1247 M4/M5, D4/D6/D12): it
+// writes the per-run credential override and, for a parked run, performs the state-specific early
+// promote so the next claim spends the chosen token. For a HELD run (awaiting_*/running) it is the
+// M5 held-state switch: iff the holding worker advertises the credential_switch capability it stamps
+// the override + the switch REQUEST (stampHeldStateSwitch), which takes effect when the worker
+// releases its claim (the two-phase local release, M5b); an old worker or a run with no live worker
+// is refused with a typed 409 and NOTHING is written.
 
 // The typed refusals SetRunCredential returns for a run whose CURRENT state cannot take a
 // parked-state switch. The handler maps each to 409 with a state-specific message; they

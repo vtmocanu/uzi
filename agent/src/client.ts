@@ -498,9 +498,10 @@ export class WorkerClient {
           if (fields.reason !== undefined) ack.reason = fields.reason;
           if (fields.recoveryRetryNotBefore !== undefined)
             ack.recoveryRetryNotBefore = fields.recoveryRetryNotBefore;
-          // PRD #1247 M5 (INERT seam): fold the top-level held-state credential-switch signal and
-          // the stale-claim disposition off the SAME single-use body. Control flow is unchanged — a
-          // 409 is still returned as {applied:false,...}; a LATER behavior unit acts on staleClaim.
+          // PRD #1247 M5b: fold the top-level held-state credential-switch signal and the
+          // stale-claim disposition off the SAME single-use body. A stale-claim 409 is still
+          // returned as {applied:false, staleClaim:true}; the runner's reportState closure throws
+          // StaleClaimError on that flag to stop the superseded flight.
           if (fields.credentialSwitch !== undefined)
             ack.credentialSwitch = fields.credentialSwitch;
           if (fields.staleClaim !== undefined)
@@ -687,9 +688,9 @@ export class WorkerClient {
 
   async getInputs(runId: string): Promise<{ inputs: UserInput[]; credentialSwitch?: { generation: number } }> {
     const res = (await this.getJSON(`${WORKER_API_PREFIX}/runs/${runId}/inputs`)) as InputsResponse;
-    // PRD #1247 M5 (INERT seam): the held-state credential-switch signal rides EVERY inputs response
-    // (including an empty-inputs poll), so surface it beside the inputs for a LATER behavior unit.
-    // Today every caller reads `.inputs` and ignores the signal, so behavior is unchanged.
+    // PRD #1247 M5b: the held-state credential-switch signal rides EVERY inputs response (including
+    // an empty-inputs poll), surfaced beside the inputs. The runner's poll trips the switch off it
+    // (steering.maybeTripCredentialSwitch); a legacy caller that reads only `.inputs` is unaffected.
     return { inputs: res.inputs ?? [], credentialSwitch: res.credential_switch };
   }
 
@@ -1219,7 +1220,7 @@ export async function readRunAck(res: Response): Promise<{
         // PRD #1392 M2 (D10): the retry-not-before stamp is a FIELD ON the RunDTO.
         recovery_retry_not_before?: unknown;
       };
-      // PRD #1247 M5 (INERT seam): the held-state signal + stale-claim disposition ride TOP-LEVEL,
+      // PRD #1247 M5b: the held-state signal + stale-claim disposition ride TOP-LEVEL,
       // beside `run`, not inside it.
       credential_switch?: unknown;
       disposition?: unknown;
@@ -1279,11 +1280,12 @@ export async function readRunAck(res: Response): Promise<{
     if (typeof parsed?.reason === "string") out.reason = parsed.reason;
     if (typeof run?.recovery_retry_not_before === "string")
       out.recoveryRetryNotBefore = run.recovery_retry_not_before;
-    // PRD #1247 M5 (INERT seam): the held-state credential-switch signal and the stale-claim
-    // disposition ride the SAME single-use body, TOP-LEVEL beside `run` (present on the 200 ack, the
-    // ordinary 409, and — for stale_claim — the superseded/released 409). Both additive + optional
-    // and total-by-construction like the rest of this parse: a malformed/absent value leaves the
-    // field undefined. A LATER behavior unit acts on them; nothing reads them today.
+    // PRD #1247 M5b: the held-state credential-switch signal and the stale-claim disposition ride
+    // the SAME single-use body, TOP-LEVEL beside `run` (present on the 200 ack, the ordinary 409,
+    // and — for stale_claim — the superseded/released 409). Both additive + optional and
+    // total-by-construction like the rest of this parse: a malformed/absent value leaves the field
+    // undefined. M5b acts on them — MINOR-7 trips the switch off credentialSwitch, and the
+    // reportState closure throws StaleClaimError off staleClaim.
     const cs = parsed?.credential_switch;
     if (typeof cs === "object" && cs !== null && typeof (cs as { generation?: unknown }).generation === "number")
       out.credentialSwitch = { generation: (cs as { generation: number }).generation };

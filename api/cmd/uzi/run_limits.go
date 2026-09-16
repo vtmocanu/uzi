@@ -132,14 +132,16 @@ func newRunResumeCmd(env Env, gf *globalFlags) *cobra.Command {
 // wrong-kind label is refused before any request; the keywords need no round-trip.
 //
 // On a queued run the switch takes effect at the next claim; on a parked run it promotes
-// the run back to queued at once. The server may return a D6 WARNING (no headroom, auto
-// will hold in pool_wait) on the 200 without refusing — it is printed to STDERR regardless
-// of --format (mirroring renderCreatedRun), so a scripted/--json consumer still sees the
-// advisory while stdout stays a bare RunDTO.
+// the run back to queued at once; on a RUNNING or gated run held by a capability worker it
+// REQUESTS the switch, which takes effect when the worker releases its claim (PRD #1247 M5).
+// The server may return a D6 WARNING (no headroom, auto will hold in pool_wait) on the 200
+// without refusing — it is printed to STDERR regardless of --format (mirroring
+// renderCreatedRun), so a scripted/--json consumer still sees the advisory while stdout
+// stays a bare RunDTO.
 func newRunSetTokenCmd(env Env, gf *globalFlags) *cobra.Command {
 	setToken := &cobra.Command{
 		Use:   "set-token <run-id> [<label>]",
-		Short: "Switch which Anthropic token a queued or parked run spends",
+		Short: "Switch which Anthropic token a run spends",
 		Long: "Re-point which Anthropic token ONE run spends (PRD #1247). A positional token " +
 			"LABEL pins the run to that token; `--auto` auto-selects from your pool, `--default` " +
 			"uses your default token, and `--inherit` clears the override back to the worker's " +
@@ -147,9 +149,11 @@ func newRunSetTokenCmd(env Env, gf *globalFlags) *cobra.Command {
 			"are mutually exclusive.\n\n" +
 			"On a QUEUED run it takes effect at the next claim; on a PARKED run (limit_wait, " +
 			"pool_wait, recovery_wait, paused) it promotes the run back to `queued` at once so the " +
-			"next claim spends the chosen token. A RUNNING or gated run is not yet switchable " +
-			"(409, exit 5). A foreign or unknown run — or an unknown token label — is refused " +
-			"(404 / usage); a codex run is 422.\n\n" +
+			"next claim spends the chosen token. On a RUNNING or gated run held by a capable worker " +
+			"the switch is REQUESTED and takes effect when the worker releases its claim; it is refused " +
+			"(409, exit 5) only when no live worker holds the run or the holding worker predates the " +
+			"credential_switch capability. A foreign or unknown run — or an unknown token label — is " +
+			"refused (404 / usage); a codex run is 422.\n\n" +
 			"It may print a warning (the token has no headroom, or auto will hold in pool_wait) " +
 			"WITHOUT refusing — the switch still applies.",
 		Args: cobra.RangeArgs(1, 2),
