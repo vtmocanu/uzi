@@ -187,12 +187,18 @@ M1="$(apiget "/api/runs/$RUN1/messages")"
 # No drops: default quotas + the small status frames stay under the spill-buffer cap.
 printf '%s' "$M1" | jq -e '[.messages[] | select(.kind=="status" and (.payload.event? == "message_dropped"))] | length == 0' >/dev/null \
   || fail "case 1: unexpected message_dropped tombstone(s) — a clean spill+drain must carry none"
-# No transient `failed` report: the batcher never tripped (SC1). wait_status already
-# fails on a `failed`/`cancelled` transition; this also proves no permanent-failure
-# report frame was ever emitted onto the stream.
-printf '%s' "$M1" | jq -e '[.messages[] | select((.payload.text? // "") | test("persistence failed permanently"))] | length == 0' >/dev/null \
-  || fail "case 1: the batcher tripped a permanent-failure report during the outage — spill did not hold"
-# The spilled stream carried real frames that replayed (not just pre/post-outage traffic).
+# No transient `failed` report (SC1): a permanent-failure trip reaches the run's DTO
+# `failure_reason` via reportState (batcher.ts trip() -> onPermanentFailureReport ->
+# runner reportState{status:"failed"}), NOT the message stream — so assert on the run
+# DTO, not the frames. wait_status already fails on a `failed` transition; this pins
+# that the completed run carries no residual transient failure_reason either.
+RUN1_FR="$(apiget "/api/runs/$RUN1" | jq -r '.run.failure_reason // ""')"
+[ -z "$RUN1_FR" ] \
+  || fail "case 1: run carried a failure_reason after a transient outage — spill did not hold: $RUN1_FR"
+# All the run's tick frames arrived (>=5); combined with the depth barrier seen during
+# the outage and the gapless 1..N contiguity above, this shows the spilled frames were
+# replayed (NT1 counts every tick frame — pre-, during-, and post-outage — so it is the
+# barrier+contiguity, not NT1 alone, that isolates the replayed ones).
 NT1="$(printf '%s' "$M1" | jq '[.messages[] | select((.payload.text? // "") | startswith("stub: outbox tick"))] | length')"
 { [ -n "$NT1" ] && [ "$NT1" -ge 5 ] 2>/dev/null; } \
   || fail "case 1: fewer than 5 outbox tick frames replayed (got ${NT1:-none})"
