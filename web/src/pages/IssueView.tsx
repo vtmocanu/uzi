@@ -1,10 +1,13 @@
 import { useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { api, ApiError, isHttpsUrl, isOpenMRConflict, openMRConflictMRIID, preferForgeUrl, type IssueDetail, type RunListItem } from "../lib/api";
+import { api, isHttpsUrl, preferForgeUrl, type IssueDetail, type RunListItem, type SecretMeta } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
 import { useAsyncData } from "../lib/useAsyncData";
 import { hasAnthropicToken } from "../lib/hasToken";
 import { startRunGate } from "../lib/runStream";
+import { startRunWithCredential } from "../lib/startRun";
+import { INHERIT_SELECTION, type CredentialSelection } from "../lib/credentialOverride";
+import { TokenPicker } from "../components/TokenPicker";
 import { activeRunInHistory, effectiveRunStatus, isStoppedRun, mrChipState, runStatusTone } from "../lib/runBadge";
 import { mergeRequestUrl, projectWebUrlFromIssue } from "../lib/forgeUrls";
 import { chipLabels } from "../lib/labelChips";
@@ -13,7 +16,7 @@ import { Markdown } from "../components/Markdown";
 import { MrChip } from "../components/MrChip";
 import { forgePlatform } from "../lib/forgeNoun";
 import { formatDuration } from "../components/RunEvent";
-import { Alert, Badge, Button, Card } from "../components/ui";
+import { Alert, Badge, Button, Card, Field } from "../components/ui";
 import { ClockIcon } from "../components/icons";
 import { ScheduleModal } from "../components/ScheduleModal";
 import { useAuth } from "../auth/AuthContext";
@@ -56,6 +59,9 @@ export function IssueView() {
   const [promoting, setPromoting] = useState(false);
   // PRD #241: the "Schedule…" entry point, pre-pinned to this issue.
   const [scheduling, setScheduling] = useState(false);
+  // PRD #1247 M7: the token the run will spend, chosen before Start run. Default
+  // inherit (shown explicitly) so an untouched start follows the worker binding.
+  const [credential, setCredential] = useState<CredentialSelection>(INHERIT_SELECTION);
 
   const { data, loading, error: loadError, reload } = useAsyncData(
     async ({ isCurrent }) => {
@@ -70,6 +76,8 @@ export function IssueView() {
         runs,
         hasWorker: workers.length > 0,
         hasToken: hasAnthropicToken(secrets),
+        // Pass the already-loaded tokens to the picker so it need not re-fetch.
+        tokens: secrets.filter((s: SecretMeta) => s.kind === "anthropic_token"),
       };
     },
     [repoId, iidNum],
@@ -78,59 +86,26 @@ export function IssueView() {
   const runs = data?.runs ?? [];
   const hasWorker = data?.hasWorker ?? false;
   const hasToken = data?.hasToken ?? false;
+  const tokens = data?.tokens ?? [];
 
   const startRun = async () => {
     if (!issue) return;
     setError("");
     setStarting(true);
-    // createAndOpen runs the create then navigates; the force path reuses it so
-    // the retry does not duplicate the navigate.
-    const createAndOpen = async (force?: boolean) => {
-      const { run } = await api.createRun(repoId, issue.iid, force);
+    // The shared helper carries the chosen credential override and preserves it across
+    // the open-MR force retry (issue #856). onSettled keeps IssueView's pre-#1247
+    // behaviour: clear the starting flag, clear the error, and reload.
+    await startRunWithCredential(repoId, issue.iid, credential, {
       // encodeURIComponent the id: per-call-site open-redirect hardening (see
       // safeNextPath in Login.tsx). A no-op for today's UUID ids.
-      navigate(`/runs/${encodeURIComponent(run.id)}`);
-    };
-    try {
-      await createAndOpen();
-    } catch (err) {
-      // issue_has_open_mr (issue #856): a completed prior run still owns an open
-      // MR. Compose a web-specific confirm naming the MR (no --force jargon);
-      // confirm, then retry with force.
-      if (isOpenMRConflict(err) && err instanceof ApiError) {
-        const mr = openMRConflictMRIID(err);
-        const detail =
-          mr != null ? `an open merge request (!${mr})` : "an open merge request";
-        const proceed = window.confirm(
-          `This issue already has ${detail} from a completed run. Starting a new run will plan and review it again from scratch. Start a new run anyway?`,
-        );
-        if (proceed) {
-          try {
-            await createAndOpen(true);
-            return;
-          } catch (retryErr) {
-            setError(errorMessage(retryErr, "Could not start run"));
-          }
-        }
-        // Declined (or forced retry failed): clear starting, no toast on decline.
-        // The original load() began with setError(""), so a forced-retry failure
-        // toast never persisted (issue #856, spec: keep as-is). reload() now clears
-        // it too via onFetchStart (m2), so this explicit setError("") is redundant
-        // belt-and-suspenders — kept to make the intent local.
+      onCreated: (runId) => navigate(`/runs/${encodeURIComponent(runId)}`),
+      onError: (msg) => setError(msg),
+      onSettled: () => {
         setStarting(false);
         setError("");
         reload();
-        return;
-      }
-      setError(errorMessage(err, "Could not start run"));
-      setStarting(false);
-      // As above: the old load() wiped this just-set message on entry so the toast
-      // never persisted. reload() now clears it too via onFetchStart (m2), so this
-      // explicit setError("") is redundant belt-and-suspenders — kept for local intent
-      // (issue #856).
-      setError("");
-      reload();
-    }
+      },
+    });
   };
 
   // PRD #764, #767 M5. The detail page drives its Start/Promote affordance off the
@@ -342,16 +317,31 @@ export function IssueView() {
               be noise. Keyed on eligibility (PRD #196 M4), so a runnable `bug` issue
               DOES show Start run. */}
           {!issue.closed && isEligible && gate && (
-            <div>
-              <Button
-                variant={gate.enabled ? "primary" : "ghost"}
-                disabled={!gate.enabled || starting}
-                title={gate.enabled ? "Queue an agent run for this issue" : gate.reason}
-                onClick={startRun}
-              >
-                {starting ? "Starting…" : "Start run"}
-              </Button>
-              {!gate.enabled && <p className="mt-1 text-xs text-faint">{gate.reason}</p>}
+            <div className="flex flex-wrap items-end gap-3">
+              {/* PRD #1247 M7: choose the token the run spends before starting it. Inherit
+                  (the default, shown explicitly) follows the worker's binding. */}
+              <Field label="Anthropic token" htmlFor="start-run-token">
+                <TokenPicker
+                  id="start-run-token"
+                  label="Anthropic token for this run"
+                  className="h-9 w-56 text-sm"
+                  value={credential}
+                  onChange={setCredential}
+                  tokens={tokens}
+                  disabled={!gate.enabled || starting}
+                />
+              </Field>
+              <div>
+                <Button
+                  variant={gate.enabled ? "primary" : "ghost"}
+                  disabled={!gate.enabled || starting}
+                  title={gate.enabled ? "Queue an agent run for this issue" : gate.reason}
+                  onClick={startRun}
+                >
+                  {starting ? "Starting…" : "Start run"}
+                </Button>
+                {!gate.enabled && <p className="mt-1 text-xs text-faint">{gate.reason}</p>}
+              </div>
             </div>
           )}
 

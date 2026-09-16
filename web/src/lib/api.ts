@@ -968,10 +968,20 @@ const realApi = {
       docker,
     }),
 
-  createRun: (repoId: string, issueIid: number, force?: boolean) =>
+  createRun: (
+    repoId: string,
+    issueIid: number,
+    force?: boolean,
+    // PRD #1247 M7: the per-run Anthropic credential override. Sent ONLY when the user
+    // picked a non-inherit value (the caller passes undefined for inherit), so an inherit
+    // run's body is byte-identical to a pre-#1247 create and the run follows the worker
+    // binding. The write shape mirrors the Go create handler ({mode, secret_id?}).
+    credentialOverride?: { mode: string; secret_id?: string },
+  ) =>
     request<{ run: Run }>("POST", `/repos/${repoId}/runs`, {
       issue_iid: issueIid,
       ...(force ? { force: true } : {}),
+      ...(credentialOverride ? { credential_override: credentialOverride } : {}),
     }),
   /** Queue a CI-fix run for a failed pipeline on a watched ref (PRD #6). */
   createCIFixRun: (repoId: string, ref: string) =>
@@ -1102,6 +1112,23 @@ const realApi = {
    */
   setRunWaitOnLimit: (id: string, enabled: boolean) =>
     request<{ run: Run }>("PUT", `/runs/${id}/wait-on-limit`, { enabled }),
+
+  /**
+   * PRD #1247 M7: SWITCH (or set) this run's Anthropic credential — POST
+   * /api/runs/{id}/credential with {mode, secret_id?}, mirroring the Go handler's
+   * request shape (secret_id rides a pinned mode only). Owner-scoped and RequireUser
+   * (cookie OR uzc_ Bearer), like setRunMrRework. For a queued/parked run it writes the
+   * override and transitions; for a held/running run it requests the held-state switch,
+   * losing at most the in-flight step.
+   *
+   * On success it returns the updated run DTO plus an OPTIONAL D6 `warning` string — a
+   * benign caveat (e.g. an auto choice whose pool has no currently-eligible token) that
+   * rides the 200, never a refusal. Refusals are non-2xx the caller surfaces inline; the
+   * refused lanes (task_review / chat / judge / self_improve) 409, so callers HIDE the
+   * control for them (isCredentialSwitchRefusedLane) rather than render a 409-ing button.
+   */
+  setRunCredential: (id: string, body: { mode: string; secret_id?: string }) =>
+    request<{ run: Run; warning?: string }>("POST", `/runs/${id}/credential`, body),
 
   /**
    * PRD #841: set (or clear) THIS run's per-run MR-review-rework override. `true`/`false`

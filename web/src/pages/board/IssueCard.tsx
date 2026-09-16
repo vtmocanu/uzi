@@ -1,6 +1,8 @@
 import { Link } from "react-router-dom";
-import { isHttpsUrl, preferForgeUrl, type Card as CardData } from "../../lib/api";
+import { isHttpsUrl, preferForgeUrl, type Card as CardData, type SecretMeta } from "../../lib/api";
 import type { StartRunGate } from "../../lib/runStream";
+import { INHERIT_SELECTION, type CredentialSelection } from "../../lib/credentialOverride";
+import { TokenPicker } from "../../components/TokenPicker";
 import {
   canOpenRunView,
   effectiveRunStatus,
@@ -74,6 +76,9 @@ export function IssueCard({
   gate,
   starting,
   onStart,
+  tokens,
+  credential = INHERIT_SELECTION,
+  onCredentialChange,
   fixCiBusy,
   onFixCi,
   uziLabel,
@@ -130,6 +135,12 @@ export function IssueCard({
   gate: StartRunGate;
   starting: boolean;
   onStart: () => void;
+  // PRD #1247 M7: the per-card Anthropic token choice, shown beside Start run. All three
+  // are optional so the direct-render tests need not supply them — the picker is only
+  // rendered when onCredentialChange is wired (the board passes it), defaulting to inherit.
+  tokens?: SecretMeta[];
+  credential?: CredentialSelection;
+  onCredentialChange?: (next: CredentialSelection) => void;
   fixCiBusy: boolean;
   onFixCi: () => void;
   // PRD #764. isEligible drives the treatment and the affordances: a card carrying the
@@ -497,7 +508,20 @@ export function IssueCard({
       ) : (
         !card.closed &&
         isEligible && (
-          <div className="mt-2.5">
+          <div className="mt-2.5 space-y-1.5">
+            {/* PRD #1247 M7: choose the token the run spends before starting it. Inherit
+                (the default, shown explicitly) follows the worker's binding. Rendered only
+                when the board wires the change handler. */}
+            {onCredentialChange && (
+              <TokenPicker
+                label={`Anthropic token for #${card.iid}`}
+                className="h-8 w-full text-xs"
+                value={credential}
+                onChange={onCredentialChange}
+                tokens={tokens}
+                disabled={!gate.enabled || starting}
+              />
+            )}
             <Button
               variant={gate.enabled ? "primary" : "secondary"}
               size="sm"
