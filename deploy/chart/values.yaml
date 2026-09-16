@@ -134,8 +134,8 @@ appPriorityClass:
   # disposable and its run requeues; an evicted api takes every run down with it), and
   # BELOW dbPriorityClass (1002), the one thing the api itself depends on. Operator-
   # tunable. 🔴 IMMUTABLE on a live PriorityClass: changing it means the object is
-  # deleted and recreated (the template carries Replace=true so ArgoCD does that itself;
-  # running pods keep their recorded priority through the swap).
+  # deleted and recreated (the template carries Force=true,Replace=true so ArgoCD does that
+  # itself; running pods keep their recorded priority through the swap).
   value: 1001
   # PreemptLowerPriority (the k8s default, set explicitly): when an app-tier pod cannot be
   # scheduled for lack of room, the scheduler evicts lower-priority pods to place it. That
@@ -163,8 +163,8 @@ dbPriorityClass:
   # (1000) by design: an evicted Postgres instance takes the api and every run down with
   # it, so nothing of uzi's may preempt it, and a Pending replica may reclaim room from
   # a worker or the app tier. 🔴 IMMUTABLE on a live PriorityClass: a change means
-  # delete-and-recreate (the template carries Replace=true so ArgoCD does that itself;
-  # running pods keep their recorded priority through the swap).
+  # delete-and-recreate (the template carries Force=true,Replace=true so ArgoCD does that
+  # itself; running pods keep their recorded priority through the swap).
   value: 1002
   # PreemptLowerPriority so an unschedulable replica reclaims room on a full cluster; set
   # `Never` for eviction survival without scheduling-time preemption.
