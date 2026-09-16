@@ -19,7 +19,7 @@ import type {
   RunTurnRequest,
 } from "../src/harness.js";
 import { reportIncidentalIssueToolName } from "../src/findings-tools.js";
-import { FINDINGS_NUDGE_APPEND, WORKER_RUNTIME_APPEND } from "../src/prompt.js";
+import { FINDINGS_NUDGE_APPEND, SECRET_FIXTURE_HYGIENE_APPEND, WORKER_RUNTIME_APPEND } from "../src/prompt.js";
 
 // PRD #1171 (M2) — the deterministic Codex prompt/tool/role renderer. Pure input →
 // output, no I/O, no process, no clock. These tests pin the tool/skill/effort/model
@@ -329,9 +329,12 @@ describe("renderCodexRun — prompts", () => {
     assert.deepEqual(lead, { systemPrompt: "SYS", prompt: "USR" });
   });
 
-  it("renders a subagent prompt as body + the two shared appends (agents.ts parity)", () => {
+  it("renders a subagent prompt as body + the three shared appends (agents.ts parity)", () => {
     const run = renderCodexRun(runRequest({ agents: { a: agent({ prompt: "BODY" }) } }));
-    assert.equal(run.perRolePrompts.get("a"), `BODY\n\n${FINDINGS_NUDGE_APPEND}\n\n${WORKER_RUNTIME_APPEND}`);
+    assert.equal(
+      run.perRolePrompts.get("a"),
+      `BODY\n\n${FINDINGS_NUDGE_APPEND}\n\n${WORKER_RUNTIME_APPEND}\n\n${SECRET_FIXTURE_HYGIENE_APPEND}`,
+    );
   });
 });
 

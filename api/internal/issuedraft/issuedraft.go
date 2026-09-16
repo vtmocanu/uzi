@@ -273,7 +273,7 @@ func normalizeNewlines(s string) string {
 // non-slash literal "[redacted]" (:488), so a scrubbed span still leaves a token at the
 // line start and firstNonSpaceIsSlash answers false. Measured on the shipped package:
 //
-//	"glpat-AAAAAAAAAAAAAAAAAAAA/label ~backdoor\nplain text"
+//	"glpat-EXAMPLE/label ~backdoor\nplain text"
 //	  repl "[redacted]"  ->  "[redacted]/label ~backdoor\n…"   inert
 //	  repl ""            ->  "/label ~backdoor\n…"             LIVE
 //
