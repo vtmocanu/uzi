@@ -121,6 +121,18 @@ Both are cluster-driven, like cordoning; there's no button for either. An
 admin can turn the self-heal off entirely via chart config if it's ever not
 wanted.
 
+## Message outbox
+
+A hosted worker gets the same [message outbox](./worker-setup.md#message-outbox) as
+any worker: an api outage of any length no longer costs a run its message feed,
+since the worker spills to a durable on-disk outbox after a sustained outage and
+replays it in order once the api is back. One caveat is worth restating here rather
+than at length: a hosted worker runs the `#58` single-uid posture, so the model
+process shares its uid and could read, forge, truncate, or delete its own outbox —
+the outbox protects against the outage, not against a hostile model, on this
+runtime. See [worker-setup.md](./worker-setup.md#message-outbox) for the full
+caveat and the tunable quotas.
+
 ## How this differs from running your own worker
 
 A worker you run yourself is a container on hardware you control: you copy a
