@@ -2990,6 +2990,10 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 				FailOrigin:     pgconv.TextOrNull("plan_rejected"),
 				PreservedPatch: clampWirePreservedPatch(req.PreservedPatch),
 				SessionID:      sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
+				// PRD #1247 M5a-1 rework (m6): this arm runs under the outer FOR UPDATE fence on the
+				// loaded run (the capability report is already generation-checked upstream), so the
+				// per-query fence is redundant here — pass explicit nil (behavior preserved).
+				ClaimGeneration: pgtype.Int8{},
 			})
 		case req.BranchMoved != nil && *req.BranchMoved && owned.Kind == runkind.MRRework:
 			// Issue #1117: an mr_rework finalize push rejected non-fast-forward because a concurrent
@@ -3027,6 +3031,10 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 				FailOrigin:     pgconv.TextOrNull(failOrigin),
 				PreservedPatch: clampWirePreservedPatch(req.PreservedPatch),
 				SessionID:      sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
+				// PRD #1247 M5a-1 rework (m6): this arm runs under the outer FOR UPDATE fence on the
+				// loaded run (a legacy nil report skips the lock but carries no generation), so the
+				// per-query fence is redundant here — pass explicit nil (behavior preserved).
+				ClaimGeneration: pgtype.Int8{},
 			})
 		}
 	default:

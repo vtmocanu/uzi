@@ -2663,7 +2663,15 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
 WHERE id = @id AND worker_id = @worker_id
-  AND status NOT IN ('completed', 'failed', 'cancelled');
+  AND status NOT IN ('completed', 'failed', 'cancelled')
+  -- PRD #1247 M5a-1 rework (m6): the per-query generation fence, the SAME nil-guarded shape as
+  -- UpdateRunLastSeq/InsertRunMessage. limit_wait (non-park + forge-park DEGRADED) callers skip
+  -- the outer FOR UPDATE fence, so when a generation is supplied the fail applies ONLY to the
+  -- still-held run at that exact generation: a late gen-G report matches 0 rows against a run
+  -- released after G (claim_released_at set) or reclaimed to G+1 (generation moved on), so it
+  -- cannot clobber the reclaiming flight. nil = legacy/outer-lock-fenced callers, unchanged.
+  AND (sqlc.narg('claim_generation')::bigint IS NULL
+       OR (claim_generation = sqlc.narg('claim_generation')::bigint AND claim_released_at IS NULL));
 
 -- name: MarkRunFailedByID :execrows
 -- Service-internal fail (e.g. a claim whose secrets are missing/undecryptable):

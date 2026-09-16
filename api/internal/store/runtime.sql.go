@@ -9193,15 +9193,24 @@ UPDATE runs SET
     updated_at         = now()
 WHERE id = $5 AND worker_id = $6
   AND status NOT IN ('completed', 'failed', 'cancelled')
+  -- PRD #1247 M5a-1 rework (m6): the per-query generation fence, the SAME nil-guarded shape as
+  -- UpdateRunLastSeq/InsertRunMessage. limit_wait (non-park + forge-park DEGRADED) callers skip
+  -- the outer FOR UPDATE fence, so when a generation is supplied the fail applies ONLY to the
+  -- still-held run at that exact generation: a late gen-G report matches 0 rows against a run
+  -- released after G (claim_released_at set) or reclaimed to G+1 (generation moved on), so it
+  -- cannot clobber the reclaiming flight. nil = legacy/outer-lock-fenced callers, unchanged.
+  AND ($7::bigint IS NULL
+       OR (claim_generation = $7::bigint AND claim_released_at IS NULL))
 `
 
 type SetRunFailedParams struct {
-	FailureReason  pgtype.Text `json:"failure_reason"`
-	FailOrigin     pgtype.Text `json:"fail_origin"`
-	PreservedPatch pgtype.Text `json:"preserved_patch"`
-	SessionID      pgtype.Text `json:"session_id"`
-	ID             uuid.UUID   `json:"id"`
-	WorkerID       pgtype.UUID `json:"worker_id"`
+	FailureReason   pgtype.Text `json:"failure_reason"`
+	FailOrigin      pgtype.Text `json:"fail_origin"`
+	PreservedPatch  pgtype.Text `json:"preserved_patch"`
+	SessionID       pgtype.Text `json:"session_id"`
+	ID              uuid.UUID   `json:"id"`
+	WorkerID        pgtype.UUID `json:"worker_id"`
+	ClaimGeneration pgtype.Int8 `json:"claim_generation"`
 }
 
 // failed restores the origin column → move_pending_since stamped in the same
@@ -9214,6 +9223,7 @@ func (q *Queries) SetRunFailed(ctx context.Context, arg SetRunFailedParams) (int
 		arg.SessionID,
 		arg.ID,
 		arg.WorkerID,
+		arg.ClaimGeneration,
 	)
 	if err != nil {
 		return 0, err

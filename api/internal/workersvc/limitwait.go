@@ -607,6 +607,11 @@ func (s *Service) setLimitWait(ctx context.Context, run store.Run, wkr store.Wor
 			SessionID:  sessionID,
 			ID:         run.ID,
 			WorkerID:   pgconv.UUID(wkr.ID),
+			// PRD #1247 M5a-1 rework (m6): limit_wait skips the outer FOR UPDATE fence, so fence
+			// this fail per-query on the reported generation (nil-guarded internally by Int8Ptr).
+			// A late gen-G opt-out cannot fail a run already released (claim_released_at set) or
+			// reclaimed to G+1 by the same worker; matches the SetRunLimitWait fence below.
+			ClaimGeneration: pgconv.Int8Ptr(req.ClaimGeneration),
 		})
 		if err != nil {
 			return rows, err

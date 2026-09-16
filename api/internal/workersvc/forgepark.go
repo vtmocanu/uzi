@@ -161,6 +161,11 @@ func (s *Service) parkForgeUnreachable(ctx context.Context, wkr store.Worker, ow
 			SessionID:  sessionID,
 			ID:         run.ID,
 			WorkerID:   workerID,
+			// PRD #1247 M5a-1 rework (m6): this path is ALREADY fenced by the FOR UPDATE lock on the
+			// row (parkForgeUnreachable) plus the explicit run.ClaimGeneration == *req.ClaimGeneration
+			// check above, so the per-query fence is redundant here — pass explicit nil (behavior
+			// preserved: an unfenced fail on the already-locked, already-generation-checked row).
+			ClaimGeneration: pgtype.Int8{},
 		})
 		if ferr != nil {
 			return store.Run{}, 0, ferr
@@ -217,5 +222,10 @@ func (s *Service) failForgeUnsettleable(ctx context.Context, wkr store.Worker, r
 		SessionID:      sessionID,
 		ID:             runID,
 		WorkerID:       pgconv.UUID(wkr.ID),
+		// PRD #1247 M5a-1 rework (m6): the DEGRADED (txBeginner == nil) path skips the outer FOR
+		// UPDATE fence, so fence this fail per-query on the reported generation (nil-guarded by
+		// Int8Ptr). A late gen-G forge-park report cannot fail a run already released or reclaimed
+		// to G+1; a legacy nil-generation report still fails unconditionally.
+		ClaimGeneration: pgconv.Int8Ptr(req.ClaimGeneration),
 	})
 }
