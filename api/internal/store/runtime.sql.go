@@ -2440,7 +2440,7 @@ WHERE runs.id = $2
   -- ` + "`" + `kind = 'chat' OR NOT EXISTS(...)` + "`" + `.
   AND (runs.kind = 'chat'
        OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
-                       WHERE a.run_id = runs.id AND a.terminal_pending
+                       WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
                          AND a.terminal_pending_until > now()
                          AND a.claim_generation = runs.claim_generation)
            AND NOT EXISTS (SELECT 1 FROM workers w
@@ -2514,7 +2514,7 @@ WHERE status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'a
   -- PRD #1390 D11: terminal-pending lease + pending_overflow closure, chat-exempt (D10).
   AND (runs.kind = 'chat'
        OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
-                       WHERE a.run_id = runs.id AND a.terminal_pending
+                       WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
                          AND a.terminal_pending_until > now()
                          AND a.claim_generation = runs.claim_generation)
            AND NOT EXISTS (SELECT 1 FROM workers w
@@ -2597,7 +2597,7 @@ WHERE runs.worker_id = $2
   -- must not fail its own run whose outcome is journaled and about to be replayed (#1391).
   AND (runs.kind = 'chat'
        OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
-                       WHERE a.run_id = runs.id AND a.terminal_pending
+                       WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
                          AND a.terminal_pending_until > now()
                          AND a.claim_generation = runs.claim_generation)
            AND NOT EXISTS (SELECT 1 FROM workers w
@@ -8124,7 +8124,7 @@ WHERE status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'a
   -- PRD #1390 D11: terminal-pending lease + pending_overflow closure, chat-exempt (D10).
   AND (runs.kind = 'chat'
        OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
-                       WHERE a.run_id = runs.id AND a.terminal_pending
+                       WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
                          AND a.terminal_pending_until > now()
                          AND a.claim_generation = runs.claim_generation)
            AND NOT EXISTS (SELECT 1 FROM workers w
@@ -8196,7 +8196,7 @@ WHERE runs.worker_id = $1
   -- must not requeue its own run whose outcome is journaled and about to be replayed (#1391).
   AND (runs.kind = 'chat'
        OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
-                       WHERE a.run_id = runs.id AND a.terminal_pending
+                       WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
                          AND a.terminal_pending_until > now()
                          AND a.claim_generation = runs.claim_generation)
            AND NOT EXISTS (SELECT 1 FROM workers w
@@ -10814,7 +10814,7 @@ WHERE status = 'claimed' AND claimed_at < $1
   -- exempt from the PROTECTION (D10): ` + "`" + `kind = 'chat' OR NOT EXISTS(...)` + "`" + `.
   AND (runs.kind = 'chat'
        OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
-                       WHERE a.run_id = runs.id AND a.terminal_pending
+                       WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
                          AND a.terminal_pending_until > now()
                          AND a.claim_generation = runs.claim_generation)
            AND NOT EXISTS (SELECT 1 FROM workers w
@@ -10906,7 +10906,7 @@ WHERE status = 'running'
   -- by kind above, so the chat arm is inert here but kept identical for one predicate shape.
   AND (runs.kind = 'chat'
        OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
-                       WHERE a.run_id = runs.id AND a.terminal_pending
+                       WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
                          AND a.terminal_pending_until > now()
                          AND a.claim_generation = runs.claim_generation)
            AND NOT EXISTS (SELECT 1 FROM workers w

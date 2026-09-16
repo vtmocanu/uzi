@@ -391,3 +391,73 @@ func TestStaleFailTwoWindowLiveDB(t *testing.T) {
 		t.Fatalf("over-budget run status = %q, want failed once the second window elapsed", got)
 	}
 }
+
+// TestD11ForeignWorkerLeaseDoesNotProtectSiblingReclaimLiveDB (PRD #1390 M2a, D11 worker-scoping
+// fix): the terminal-pending-lease NOT EXISTS sub-clause keys on the run's CURRENT owner
+// (a.worker_id = runs.worker_id), so a FOREIGN worker's stale lease — planted at a forged future
+// generation for a run it once owned — cannot survive a sibling worker's reclaim and block that
+// sibling's worker-loss recovery. This is the cross-worker CONSUMPTION path the existing D11
+// tests do not cover: they exercise the same-worker lease and the write-side ownership drop, not
+// a foreign row consumed by a sibling's recovery pass. The same-worker lease (honest
+// re-adoption / #1391 boot-replay) still protects the run, proven as the positive contrast.
+//
+// Without the a.worker_id predicate the first subtest FAILS: worker A's forged lease at
+// generation g+1 matches runs.claim_generation (also g+1 after B's reclaim) purely by run_id, so
+// the NOT EXISTS is false and R stays running under a foreign worker's lease.
+func TestD11ForeignWorkerLeaseDoesNotProtectSiblingReclaimLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	userID, _, repoID := env.seedCodexInfra(t)
+
+	const g int64 = 5
+
+	fireStaleRequeue := func(t *testing.T) {
+		t.Helper()
+		if _, err := env.q.RequeueRunsOfStaleWorkers(env.ctx, store.RequeueRunsOfStaleWorkersParams{
+			MaxRequeues: 1,
+			Cutoff:      pgconv.Time(time.Now().Add(-45 * time.Second)),
+		}); err != nil {
+			t.Fatalf("RequeueRunsOfStaleWorkers: %v", err)
+		}
+	}
+
+	t.Run("foreign lease does not protect the sibling reclaim", func(t *testing.T) {
+		// Worker A is alive; worker B is stale past the requeue window. R starts owned by A at
+		// generation g, then A journals a terminal-pending lease at a FORGED future generation
+		// g+1 (ReplaceWorkerActiveRuns validates an entry's claim_generation only as >= 0, never
+		// against the run's real generation).
+		workerA := seedOutageWorker(t, env, userID, 0)
+		workerB := seedOutageWorker(t, env, userID, 120*time.Second)
+		runR := seedOutageRun(t, env, userID, repoID, workerA, "running", "issue", g, 0)
+		insertActiveLease(t, env, workerA, runR, g+1, true, "1 hour")
+
+		// A relinquishes R and the SIBLING B reclaims it: generation advances to g+1 (ClaimRun
+		// increments by exactly 1), so A's forged lease now equals runs.claim_generation. A's
+		// (worker A, run R) row is not cleaned up when B reclaims — it is a foreign lease.
+		env.exec(`UPDATE runs SET worker_id = $2, claim_generation = $3, status = 'running',
+		                          status_since = now() - interval '3 hours',
+		                          started_at = now() - interval '3 hours',
+		                          claimed_at = now() - interval '3 hours'
+		          WHERE id = $1`, runR, workerB, g+1)
+
+		// B is stale → its worker-loss recovery must requeue R. A's foreign lease must NOT
+		// protect it, because A is no longer the run's owner.
+		fireStaleRequeue(t)
+		if got := statusOf(t, env, runR); got != "queued" {
+			t.Fatalf("run status = %q, want queued: a FOREIGN worker's stale lease must not block a sibling's worker-loss recovery", got)
+		}
+	})
+
+	t.Run("same-worker lease still protects the run", func(t *testing.T) {
+		// The honest re-adoption case is unbroken: B owns R at generation g+1 and holds its OWN
+		// terminal-pending lease at that generation, so the run is legitimately protected from
+		// the sweep (its outcome is journaled on the owning worker, #1391).
+		workerB := seedOutageWorker(t, env, userID, 120*time.Second)
+		runR := seedOutageRun(t, env, userID, repoID, workerB, "running", "issue", g+1, 0)
+		insertActiveLease(t, env, workerB, runR, g+1, true, "1 hour")
+
+		fireStaleRequeue(t)
+		if got := statusOf(t, env, runR); got != "running" {
+			t.Fatalf("run status = %q, want unchanged running: the run's OWN worker lease must still protect it (honest re-adoption)", got)
+		}
+	})
+}
