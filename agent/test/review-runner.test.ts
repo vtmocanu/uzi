@@ -25,6 +25,35 @@ function fakeClient() {
   return { client, calls };
 }
 
+// A generation-FENCING fake api (PRD #1247 M2), the review-lane twin of the judge test's. It
+// models a credential_switch_v1 capability worker whose mutating state reports the server fences
+// on the claim generation: a running/completed/failed report with no numeric claim_generation is
+// REFUSED with the 409 shape ({applied:false}). The real client swallows that 409 (never throws),
+// so acceptance is observed via `accepted`/`refused`. Threading in place ⇒ nothing refused;
+// reverting it reddens the lane test.
+function fencedFakeClient() {
+  const MUTATING = new Set(["running", "completed", "failed"]);
+  const calls: {
+    review?: { id: string; review: TaskReviewRequest };
+    accepted: { id: string; body: StateRequest }[];
+    refused: { id: string; body: StateRequest }[];
+  } = { accepted: [], refused: [] };
+  const client = {
+    reportState: async (id: string, body: StateRequest) => {
+      if (MUTATING.has(body.status) && typeof body.claim_generation !== "number") {
+        calls.refused.push({ id, body });
+        return { applied: false, status: "running" } as never;
+      }
+      calls.accepted.push({ id, body });
+      return { applied: true, status: body.status } as never;
+    },
+    postTaskReview: async (id: string, review: TaskReviewRequest) => {
+      calls.review = { id, review };
+    },
+  } as unknown as WorkerClient;
+  return { client, calls };
+}
+
 // A fake git layer: records the clone + diff calls, and carries SPY counters on the
 // push/fetch-back functions a run lane would use — a review must never touch them, so
 // the assertions below on these counters are the non-vacuous no-push/no-MR proof.
@@ -148,6 +177,56 @@ describe("ReviewRunner", () => {
     assert.equal(gitCalls.pushBranch, 0, "a review pushes nothing");
     assert.equal(gitCalls.fetchAgentBranch, 0, "a review fetches nothing back");
     assert.equal(gitCalls.removeRunnerClone, 0, "a review makes no working-tree clone");
+  });
+
+  // PRD #1247 M2 fix round: the review reports state DIRECTLY (not through the RunRunner stamping
+  // closure), so it threads the claim's run-lane generation onto both the running and completed
+  // reports.
+  it("stamps the claim generation on the running and completed reports (PRD #1247 M2)", async () => {
+    const { client, calls } = fakeClient();
+    const { git } = fakeGit("diff --git a/poller.ts b/poller.ts\n@@ -1 +1 @@\n-old\n+new\n");
+    const runner = new ReviewRunner(client, git, nullLogger(), { queryFn: replyingQueryFn(goodModelJson) });
+    await runner.execute(reviewClaim({ claim_generation: 9 }));
+
+    const mutating = calls.states.filter((s) => s.body.status === "running" || s.body.status === "completed");
+    assert.deepEqual(
+      mutating.map((s) => s.body.status),
+      ["running", "completed"],
+    );
+    for (const s of mutating) {
+      assert.equal(s.body.claim_generation, 9, `the ${s.body.status} report carries the claim generation`);
+    }
+  });
+
+  // The failed report (here, the no-target early-exit through safeReportFailed) also carries the
+  // generation, so a capability worker's review FAILURE is fenced, not 409'd.
+  it("stamps the claim generation on the failed report (PRD #1247 M2)", async () => {
+    const { client, calls } = fakeClient();
+    const { git } = fakeGit("diff\n");
+    const runner = new ReviewRunner(client, git, nullLogger(), { queryFn: forbiddenQueryFn() });
+    await runner.execute(reviewClaim({ review_target_run_id: null, claim_generation: 4 }));
+    assert.equal(calls.states.at(-1)?.body.status, "failed");
+    assert.equal(calls.states.at(-1)?.body.claim_generation, 4, "the failed report carries the claim generation");
+  });
+
+  // Lane-acceptance: a capability worker's review run is ACCEPTED by a generation-fencing api.
+  // Reverting the threading routes the mutating reports to `refused` (409) and reddens this.
+  it("a capability worker's review run is ACCEPTED (not 409) by a generation-fencing api (PRD #1247 M2)", async () => {
+    const { client, calls } = fencedFakeClient();
+    const { git } = fakeGit("diff --git a/poller.ts b/poller.ts\n@@ -1 +1 @@\n-old\n+new\n");
+    const runner = new ReviewRunner(client, git, nullLogger(), { queryFn: replyingQueryFn(goodModelJson) });
+    await runner.execute(reviewClaim({ claim_generation: 7 }));
+
+    assert.deepEqual(calls.refused, [], "the fence refuses no mutating report — all carry the generation");
+    assert.deepEqual(
+      calls.accepted.map((s) => s.body.status),
+      ["running", "completed"],
+      "both mutating reports are accepted by the fence",
+    );
+    for (const s of calls.accepted) {
+      assert.equal(s.body.claim_generation, 7, `the accepted ${s.body.status} report carries the claim generation`);
+    }
+    assert.equal(calls.review?.review.status, "complete", "the review still posts on the accepted lane");
   });
 
   it("posts zero findings WITHOUT calling the model on an empty diff", async () => {

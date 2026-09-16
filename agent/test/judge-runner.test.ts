@@ -25,7 +25,9 @@ function fakeClient(trace: JudgeTraceResponse) {
     review?: { id: string; review: ReviewRequest };
     state?: { id: string; body: StateRequest };
     states: { id: string; body: StateRequest }[];
-    messages: { id: string; messages: OutgoingMessage[] }[];
+    // `generation` records the arg the judge threads to postMessages (PRD #1247 M2): the m3
+    // send-gate reads it to decide whether to stamp claim_generation on the usage batch.
+    messages: { id: string; messages: OutgoingMessage[]; generation?: number }[];
   } = { states: [], messages: [] };
   const client = {
     getTrace: async () => trace,
@@ -36,8 +38,44 @@ function fakeClient(trace: JudgeTraceResponse) {
       calls.states.push({ id, body });
       calls.state = { id, body };
     },
-    postMessages: async (id: string, messages: OutgoingMessage[]) => {
-      calls.messages.push({ id, messages });
+    postMessages: async (id: string, messages: OutgoingMessage[], generation?: number) => {
+      calls.messages.push({ id, messages, generation });
+    },
+  } as unknown as WorkerClient;
+  return { client, calls };
+}
+
+// A generation-FENCING fake api (PRD #1247 M2): it models a credential_switch_v1 capability
+// worker whose mutating state reports the server fences on the claim generation. A
+// running/completed/failed report carrying no numeric claim_generation is REFUSED with the
+// server's 409 shape ({applied:false}); the real client swallows that 409 (it does not throw),
+// so acceptance is observed via `accepted`/`refused`, not a throw. With the threading in place
+// nothing is refused; reverting it reddens every assertion below.
+function fencedFakeClient(trace: JudgeTraceResponse) {
+  const MUTATING = new Set(["running", "completed", "failed"]);
+  const calls: {
+    review?: { id: string; review: ReviewRequest };
+    accepted: { id: string; body: StateRequest }[];
+    refused: { id: string; body: StateRequest }[];
+    messages: { id: string; messages: OutgoingMessage[]; generation?: number }[];
+  } = { accepted: [], refused: [], messages: [] };
+  const client = {
+    getTrace: async () => trace,
+    postReview: async (id: string, review: ReviewRequest) => {
+      calls.review = { id, review };
+    },
+    reportState: async (id: string, body: StateRequest) => {
+      if (MUTATING.has(body.status) && typeof body.claim_generation !== "number") {
+        // The fence: a capability worker's mutating report MUST carry the generation. The 409
+        // shape the real client reads as {applied:false, status} — the run is NOT applied.
+        calls.refused.push({ id, body });
+        return { applied: false, status: "running" } as never;
+      }
+      calls.accepted.push({ id, body });
+      return { applied: true, status: body.status } as never;
+    },
+    postMessages: async (id: string, messages: OutgoingMessage[], generation?: number) => {
+      calls.messages.push({ id, messages, generation });
     },
   } as unknown as WorkerClient;
   return { client, calls };
@@ -153,6 +191,57 @@ describe("JudgeRunner", () => {
       payload.modelUsage && Object.keys(payload.modelUsage).length > 0,
       "the frame carries non-empty per-model usage (usage reaches the API)",
     );
+  });
+
+  // PRD #1247 M2 fix round: the judge reports state DIRECTLY (not through the RunRunner stamping
+  // closure), so it must thread the claim's run-lane generation onto the running + completed
+  // reports AND onto the usage postMessages (which rides the m3 send-gate).
+  it("stamps the claim generation on the running, completed, and usage reports (PRD #1247 M2)", async () => {
+    const { client, calls } = fakeClient(emptyTrace);
+    const modelJson = JSON.stringify({ verdict: "ok", summary: "s", recommendations: [] });
+    const runner = new JudgeRunner(client, nullLogger(), { queryFn: replyingQueryFnWithUsage(modelJson) });
+    await runner.execute(judgeClaim({ claim_generation: 9 }));
+
+    assert.deepEqual(
+      calls.states.map((s) => s.body.status),
+      ["running", "completed"],
+    );
+    for (const s of calls.states) {
+      assert.equal(s.body.claim_generation, 9, `the ${s.body.status} report carries the claim generation`);
+    }
+    assert.equal(calls.messages.length, 1, "one usage frame is posted on the success path");
+    assert.equal(calls.messages[0]?.generation, 9, "the usage batch is sent with the claim generation for the send-gate");
+  });
+
+  // The failed report (here, the no-target early-exit through safeReportFailed) also carries the
+  // generation, so a capability worker's judge FAILURE is fenced, not 409'd.
+  it("stamps the claim generation on the failed report (PRD #1247 M2)", async () => {
+    const { client, calls } = fakeClient(emptyTrace);
+    const runner = new JudgeRunner(client, nullLogger(), { queryFn: replyingQueryFn("{}") });
+    await runner.execute(judgeClaim({ target_run_id: null, claim_generation: 4 }));
+    assert.equal(calls.state?.body.status, "failed");
+    assert.equal(calls.state?.body.claim_generation, 4, "the failed report carries the claim generation");
+  });
+
+  // Lane-acceptance: a capability worker's judge run is ACCEPTED by a generation-fencing api.
+  // Reverting the threading routes the mutating reports to `refused` (409) and reddens this.
+  it("a capability worker's judge run is ACCEPTED (not 409) by a generation-fencing api (PRD #1247 M2)", async () => {
+    const { client, calls } = fencedFakeClient(emptyTrace);
+    const modelJson = JSON.stringify({ verdict: "ok", summary: "s", recommendations: [] });
+    const runner = new JudgeRunner(client, nullLogger(), { queryFn: replyingQueryFnWithUsage(modelJson) });
+    await runner.execute(judgeClaim({ claim_generation: 7 }));
+
+    assert.deepEqual(calls.refused, [], "the fence refuses no mutating report — all carry the generation");
+    assert.deepEqual(
+      calls.accepted.map((s) => s.body.status),
+      ["running", "completed"],
+      "both mutating reports are accepted by the fence",
+    );
+    for (const s of calls.accepted) {
+      assert.equal(s.body.claim_generation, 7, `the accepted ${s.body.status} report carries the claim generation`);
+    }
+    assert.equal(calls.messages[0]?.generation, 7, "the usage batch rides the send-gate with the generation");
+    assert.equal(calls.review?.review.verdict, "ok", "the review still posts on the accepted lane");
   });
 
   it("posts NO usage frame on the model-error path (PRD #69 M6)", async () => {

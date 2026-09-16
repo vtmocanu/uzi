@@ -155,7 +155,15 @@ export class JudgeRunner {
     const targetId = claim.target_run_id;
     if (!targetId) {
       this.log.warn("judge claim missing target_run_id; failing", { run_id: judgeRunId });
-      await safeReportFailed(this.client, this.log, "judge", judgeRunId, "judge claim carried no target run");
+      await safeReportFailed(
+        this.client,
+        this.log,
+        "judge",
+        judgeRunId,
+        "judge claim carried no target run",
+        undefined,
+        claim.claim_generation,
+      );
       return;
     }
     // Build the review. Any failure BEFORE the post still lands the deterministic
@@ -175,7 +183,14 @@ export class JudgeRunner {
       // fallback + `completed` report, not throw out of execute() and leave the judge run
       // non-terminal — execute()'s never-throws contract (above). started_at simply stays
       // NULL on that rare path, so the panel shows no duration rather than losing the run.
-      await this.client.reportState(judgeRunId, { status: "running" });
+      await this.client.reportState(judgeRunId, {
+        status: "running",
+        // PRD #1247 M2 fix round: this runner reports state DIRECTLY (not through the RunRunner
+        // stamping closure), so it threads the claim's run-lane generation onto the report itself
+        // — unconditionally, mirroring that closure — so a credential_switch_v1 capability
+        // worker's judge run is fenced, not refused with a 409.
+        claim_generation: claim.claim_generation,
+      });
       const trace = await this.fetchTrace(targetId);
       const token = claim.secrets?.anthropic_oauth_token?.trim();
       if (!token) {
@@ -199,16 +214,26 @@ export class JudgeRunner {
       // row exists (PRD #69 M6). A single-turn judge has no batcher/gapless-seq machinery
       // in this lane, so seq:1 is safe.
       if (usageMessage) {
-        await this.client.postMessages(judgeRunId, [
-          { seq: 1, kind: usageMessage.kind, agent: JUDGE_AGENT, payload: usageMessage.payload },
-        ]);
+        // PRD #1247 M2 fix round: pass the claim's generation so the usage batch rides the m3
+        // send-gate (postMessages applies includeClaimGeneration internally, gating on
+        // generation > 0 && capability/feature) rather than being refused for a capability worker.
+        await this.client.postMessages(
+          judgeRunId,
+          [{ seq: 1, kind: usageMessage.kind, agent: JUDGE_AGENT, payload: usageMessage.payload }],
+          claim.claim_generation,
+        );
       }
       await this.client.postReview(targetId, review);
-      await this.client.reportState(judgeRunId, { status: "completed" });
+      await this.client.reportState(judgeRunId, {
+        status: "completed",
+        // PRD #1247 M2 fix round: stamp the claim's run-lane generation on the terminal report too
+        // (direct report, not the RunRunner stamping closure), so the completion is fenced not 409'd.
+        claim_generation: claim.claim_generation,
+      });
       this.log.info("judge run completed", { run_id: judgeRunId, target: targetId, verdict: review.verdict });
     } catch (err) {
       this.log.warn("judge post/complete failed", { run_id: judgeRunId, error: errMessage(err) });
-      await safeReportFailed(this.client, this.log, "judge", judgeRunId, errMessage(err), err);
+      await safeReportFailed(this.client, this.log, "judge", judgeRunId, errMessage(err), err, claim.claim_generation);
     }
   }
 

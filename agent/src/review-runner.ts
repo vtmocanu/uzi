@@ -93,13 +93,29 @@ export class ReviewRunner {
     const targetId = claim.review_target_run_id;
     if (!targetId) {
       this.log.warn("review claim missing review_target_run_id; failing", { run_id: reviewRunId });
-      await safeReportFailed(this.client, this.log, "review", reviewRunId, "review claim carried no target run");
+      await safeReportFailed(
+        this.client,
+        this.log,
+        "review",
+        reviewRunId,
+        "review claim carried no target run",
+        undefined,
+        claim.claim_generation,
+      );
       return;
     }
     const branch = claim.branch?.trim();
     if (!branch) {
       this.log.warn("review claim missing branch; failing", { run_id: reviewRunId, target: targetId });
-      await safeReportFailed(this.client, this.log, "review", reviewRunId, "review claim carried no branch to review");
+      await safeReportFailed(
+        this.client,
+        this.log,
+        "review",
+        reviewRunId,
+        "review claim carried no branch to review",
+        undefined,
+        claim.claim_generation,
+      );
       return;
     }
 
@@ -107,7 +123,14 @@ export class ReviewRunner {
     // the reviewed run still receives a (report-only) result rather than nothing.
     let review: TaskReviewRequest;
     try {
-      await this.client.reportState(reviewRunId, { status: "running" });
+      await this.client.reportState(reviewRunId, {
+        status: "running",
+        // PRD #1247 M2 fix round: this runner reports state DIRECTLY (not through the RunRunner
+        // stamping closure), so it threads the claim's run-lane generation onto the report itself
+        // — unconditionally, mirroring that closure — so a credential_switch_v1 capability
+        // worker's review run is fenced, not refused with a 409.
+        claim_generation: claim.claim_generation,
+      });
       // ensureClone mirrors every origin head into refs/remotes/origin/* (a bare
       // clone-or-fetch), so both the reviewed branch and its base resolve locally for the
       // diff below — no working-tree checkout is needed (reviewDiff reads the bare's
@@ -145,7 +168,12 @@ export class ReviewRunner {
 
     try {
       await this.client.postTaskReview(targetId, review);
-      await this.client.reportState(reviewRunId, { status: "completed" });
+      await this.client.reportState(reviewRunId, {
+        status: "completed",
+        // PRD #1247 M2 fix round: stamp the claim's run-lane generation on the terminal report too
+        // (direct report, not the RunRunner stamping closure), so the completion is fenced not 409'd.
+        claim_generation: claim.claim_generation,
+      });
       this.log.info("review run completed", {
         run_id: reviewRunId,
         target: targetId,
@@ -154,7 +182,7 @@ export class ReviewRunner {
       });
     } catch (err) {
       this.log.warn("review post/complete failed", { run_id: reviewRunId, error: errMessage(err) });
-      await safeReportFailed(this.client, this.log, "review", reviewRunId, errMessage(err));
+      await safeReportFailed(this.client, this.log, "review", reviewRunId, errMessage(err), undefined, claim.claim_generation);
     }
   }
 
