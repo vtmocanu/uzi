@@ -181,22 +181,32 @@ func (t *outboxTracker) forgetWorkerRunsLocked(workerID uuid.UUID) {
 	}
 }
 
-// runDepth returns the outbox entry for a run, across whichever worker reported it.
-// O(1) via the reverse index — the health detector calls it for every running run
-// each sweep tick.
-func (t *outboxTracker) runDepth(runID uuid.UUID) (OutboxEntry, bool) {
+// runDepth returns the outbox entry for a run AND the id of the worker that reported
+// it, across whichever worker reported it last. O(1) via the reverse index — the
+// health detector calls it for every running run each sweep tick.
+//
+// The reporting worker id is returned so the caller can OWNER-GATE the outbox reason
+// (PRD #1391 M5): runIndex is "last reporter wins" with no ownership check, so any
+// worker that knows a run's UUID could report depth for it, and a reclaim-during-
+// outage leaves runIndex pointing at the prior worker until the TTL. The health
+// detector applies reasonOutboxQueued only when this id EQUALS the run's current
+// owning worker — trusting the run's owner, never merely the last reporter.
+func (t *outboxTracker) runDepth(runID uuid.UUID) (entry OutboxEntry, workerID uuid.UUID, ok bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	workerID, ok := t.runIndex[runID]
+	workerID, ok = t.runIndex[runID]
 	if !ok {
-		return OutboxEntry{}, false
+		return OutboxEntry{}, uuid.UUID{}, false
 	}
 	st, ok := t.workers[workerID]
 	if !ok {
-		return OutboxEntry{}, false
+		return OutboxEntry{}, uuid.UUID{}, false
 	}
 	e, ok := st.runs[runID]
-	return e, ok
+	if !ok {
+		return OutboxEntry{}, uuid.UUID{}, false
+	}
+	return e, workerID, true
 }
 
 // workerAggregate sums a worker's outbox depth across its runs, for the DTO overlay.

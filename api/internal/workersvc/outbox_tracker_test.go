@@ -58,13 +58,18 @@ func TestOutboxTrackerRunDepth(t *testing.T) {
 	w := uuid.New()
 	r := uuid.New()
 	now := time.Unix(1000, 0)
-	if _, ok := tr.runDepth(r); ok {
+	if _, _, ok := tr.runDepth(r); ok {
 		t.Fatal("runDepth present before any record")
 	}
 	tr.record(w, []OutboxEntry{{RunID: r, PendingMessages: 7, Since: now}}, now)
-	e, ok := tr.runDepth(r)
+	e, reporter, ok := tr.runDepth(r)
 	if !ok || e.PendingMessages != 7 || e.RunID != r {
 		t.Fatalf("runDepth = (%+v,%v), want pending 7 for %s", e, ok, r)
+	}
+	// The reporting worker id is returned so the health detector can owner-gate the
+	// outbox reason (PRD #1391 M5): it must be the worker that recorded the entry.
+	if reporter != w {
+		t.Fatalf("runDepth reporter = %s, want the recording worker %s", reporter, w)
 	}
 }
 
@@ -76,7 +81,7 @@ func TestOutboxTrackerClearsOnEmptyReport(t *testing.T) {
 	tr.record(w, []OutboxEntry{{RunID: r, PendingMessages: 4, Since: now}}, now)
 	// The drainer emptied the outbox; the next heartbeat carries no entries and clears.
 	tr.record(w, nil, now.Add(time.Second))
-	if _, ok := tr.runDepth(r); ok {
+	if _, _, ok := tr.runDepth(r); ok {
 		t.Fatal("runDepth present after an empty report; the set must clear on the next empty report")
 	}
 	if pm, _, _, blocked := tr.workerAggregate(w); pm != 0 || blocked != nil {
@@ -95,10 +100,10 @@ func TestOutboxTrackerRecordReplacesWholeSet(t *testing.T) {
 	}, now)
 	// A later report lists only r2: r1 must drop out entirely (index included).
 	tr.record(w, []OutboxEntry{{RunID: r2, PendingMessages: 9, Since: now}}, now.Add(time.Second))
-	if _, ok := tr.runDepth(r1); ok {
+	if _, _, ok := tr.runDepth(r1); ok {
 		t.Fatal("r1 present after a report that omitted it; a report REPLACES the whole set")
 	}
-	if e, ok := tr.runDepth(r2); !ok || e.PendingMessages != 9 {
+	if e, _, ok := tr.runDepth(r2); !ok || e.PendingMessages != 9 {
 		t.Fatalf("r2 = (%+v,%v), want pending 9", e, ok)
 	}
 	if pm, _, _, _ := tr.workerAggregate(w); pm != 9 {
@@ -113,7 +118,7 @@ func TestOutboxTrackerEvict(t *testing.T) {
 	now := time.Unix(1000, 0)
 	tr.record(w, []OutboxEntry{{RunID: r, PendingMessages: 1, Since: now}}, now)
 	tr.evict(w)
-	if _, ok := tr.runDepth(r); ok {
+	if _, _, ok := tr.runDepth(r); ok {
 		t.Fatal("runDepth present after evict")
 	}
 	if pm, _, _, _ := tr.workerAggregate(w); pm != 0 {
@@ -129,12 +134,12 @@ func TestOutboxTrackerPruneEvictsStale(t *testing.T) {
 	tr.record(w, []OutboxEntry{{RunID: r, PendingMessages: 1, Since: base}}, base)
 	// Within the TTL: survives.
 	tr.prune(base.Add(outboxTrackerTTL - time.Second))
-	if _, ok := tr.runDepth(r); !ok {
+	if _, _, ok := tr.runDepth(r); !ok {
 		t.Fatal("pruned within TTL; a fresh set must survive")
 	}
 	// Past the TTL: gone (from the reverse index too — runDepth proves it).
 	tr.prune(base.Add(outboxTrackerTTL + time.Second))
-	if _, ok := tr.runDepth(r); ok {
+	if _, _, ok := tr.runDepth(r); ok {
 		t.Fatal("not pruned past TTL; a vanished/offline worker's set must age out")
 	}
 }
@@ -149,7 +154,7 @@ func TestOutboxTrackerCapRefusesNewWorker(t *testing.T) {
 	// direction, whereas evicting to make room would drop a live worker's real depth.
 	newW, newR := uuid.New(), uuid.New()
 	tr.record(newW, []OutboxEntry{{RunID: newR, PendingMessages: 1, Since: now}}, now)
-	if _, ok := tr.runDepth(newR); ok {
+	if _, _, ok := tr.runDepth(newR); ok {
 		t.Fatal("a new worker's report was tracked past the cap; the cap must refuse to start a new entry")
 	}
 }

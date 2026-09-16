@@ -1671,10 +1671,12 @@ func (s *Service) OutboxAggregate(workerID uuid.UUID) (pendingMessages, pendingT
 	return s.outbox.workerAggregate(workerID)
 }
 
-// OutboxRunDepth returns the outbox entry reported for a run, across whichever worker
-// reported it (PRD #1391 M5). The health detector uses it to turn a non-zero pending
-// depth into the truthful "queued on the worker" reason instead of `stalled`.
-func (s *Service) OutboxRunDepth(runID uuid.UUID) (OutboxEntry, bool) {
+// OutboxRunDepth returns the outbox entry reported for a run AND the id of the worker
+// that reported it, across whichever worker reported it last (PRD #1391 M5). The health
+// detector uses it to turn a non-zero pending depth into the truthful "queued on the
+// worker" reason instead of `stalled` — but ONLY when the reporting worker is the run's
+// current owner, so it passes the reporting worker id back for the caller to owner-gate.
+func (s *Service) OutboxRunDepth(runID uuid.UUID) (OutboxEntry, uuid.UUID, bool) {
 	return s.outbox.runDepth(runID)
 }
 

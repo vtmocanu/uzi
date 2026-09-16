@@ -532,5 +532,10 @@ func (h *Handler) PatchWorker(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"worker": workerDTOFromWorker(wkr, 0, false, token.label, h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt)})
+	// Overlay the in-process outbox depth (PRD #1391 M5) for consistency with the
+	// register/heartbeat/list surfaces: this worker may be active with a live backlog,
+	// and without the overlay its outbox_* fields would read null on this response.
+	dto := workerDTOFromWorker(wkr, 0, false, token.label, h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt)
+	h.overlayOutbox(&dto, wkr.ID)
+	httpx.JSON(w, http.StatusOK, map[string]any{"worker": dto})
 }

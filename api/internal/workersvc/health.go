@@ -399,13 +399,23 @@ func (s *Service) runningTarget(ctx context.Context, now time.Time, r store.List
 	// pathological single call.
 	if th.stall > 0 && !stats.inFlight {
 		if base := stallBaseline(r); !base.IsZero() && now.Sub(base) >= th.stall {
-			// The silence may be an api outage, not a stall: if the worker reported a
-			// non-zero outbox depth for this run (PRD #1391 M5), the agent IS working and
-			// sending — its updates are queued on the worker and will replay. Same
+			// The silence may be an api outage, not a stall: if the run's OWNING worker
+			// reported a non-zero outbox depth for it (PRD #1391 M5), the agent IS working
+			// and sending — its updates are queued on the worker and will replay. Same
 			// healthStalled enum, truthful reason. Only while depth is non-zero; when the
 			// tracker reports nothing (backlog drained / cleared) normal stalled detection
 			// resumes.
-			if d, ok := s.OutboxRunDepth(r.ID); ok && d.PendingMessages > 0 {
+			//
+			// OWNER-GATE (trust boundary): the tracker's runIndex is "last reporter wins"
+			// with no ownership check, so the reporting worker id must EQUAL the run's
+			// current owning worker before we trust the depth. Two cases this closes: a
+			// cross-tenant worker that knows the run's UUID cannot flip a victim's stalled
+			// reason to the reassuring "queued", and after a reclaim-during-outage (run
+			// moved to worker B while runIndex still points at the offline worker A until
+			// the TTL) a genuinely-stalled B is not mislabeled "queued". An unclaimed run
+			// (worker_id NULL) never qualifies, so it falls through to the honest stall.
+			if d, reporter, ok := s.OutboxRunDepth(r.ID); ok && d.PendingMessages > 0 &&
+				r.WorkerID.Valid && uuid.UUID(r.WorkerID.Bytes) == reporter {
 				return healthStalled, reasonOutboxQueued
 			}
 			return healthStalled, reasonStalled
