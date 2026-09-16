@@ -929,3 +929,58 @@ func TestFailCredentialSwitchLiveDB(t *testing.T) {
 		}
 	})
 }
+
+// TestTerminalTransitionSettlesCredentialSwitchSignalLiveDB (PRD #1247 D11 fix round) is the
+// signal-level behavior gate beside the store-level column-clear enumeration
+// (run_pause_livedb_test.go): a run holding a pending SAME-GENERATION, unreleased switch
+// (PendingCredentialSwitchSignal fires) must, once it reaches a terminal status, stop signaling —
+// because the terminal writer now clears the switch columns. Proven on the worker-completed seam
+// (SetRunCompleted) and a server-side seam (CancelRunServerSide). Reverting the terminal-writer
+// clear reddens this (the signal would survive onto the dead run).
+//
+// SCOPE (PRD m9): this is TERMINAL settlement only. The post-reclaim applied-settlement case
+// (credential_switch_generation=G while claim_generation=G+1) already yields a nil signal via
+// PendingCredentialSwitchSignal's generation-mismatch guard; clearing its lingering DTO
+// "requested" is PRD m9 (D14 epoch-write attribution), NOT this fix round.
+func TestTerminalTransitionSettlesCredentialSwitchSignalLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	o := seedReevalOwner(t, env, BindModeAuto, false)
+	g := int64(9)
+
+	cases := []struct {
+		name       string
+		wantStatus string
+		fire       func(t *testing.T, id uuid.UUID)
+	}{
+		{"SetRunCompleted (worker seam)", "completed", func(t *testing.T, id uuid.UUID) {
+			if rows, err := env.q.SetRunCompleted(env.ctx, store.SetRunCompletedParams{ID: id, WorkerID: pgtype.UUID{Bytes: o.workerID, Valid: true}, Branch: pgtype.Text{String: "b", Valid: true}}); err != nil || rows != 1 {
+				t.Fatalf("SetRunCompleted = (%d,%v), want (1,nil)", rows, err)
+			}
+		}},
+		{"CancelRunServerSide (server seam)", "cancelled", func(t *testing.T, id uuid.UUID) {
+			if rows, err := env.q.CancelRunServerSide(env.ctx, store.CancelRunServerSideParams{ID: id, UserID: o.userID, StopReason: pgtype.Text{String: "op", Valid: true}}); err != nil || rows != 1 {
+				t.Fatalf("CancelRunServerSide = (%d,%v), want (1,nil)", rows, err)
+			}
+		}},
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			id := seedHeldRun(t, env, o, int64(5600+i), "running", g, true /*withStamp*/, false /*released*/)
+			// Control: a running run with a same-generation, unreleased switch DOES signal.
+			if before := mustRun(t, env, id); PendingCredentialSwitchSignal(before) == nil {
+				t.Fatal("precondition: a running same-generation unreleased switch must signal")
+			}
+			tc.fire(t, id)
+			after := mustRun(t, env, id)
+			if after.Status != tc.wantStatus {
+				t.Fatalf("status = %q, want %q", after.Status, tc.wantStatus)
+			}
+			if PendingCredentialSwitchSignal(after) != nil {
+				t.Fatal("a terminal run must NOT signal a pending switch — the terminal writer clears the columns")
+			}
+			if after.CredentialSwitchRequestedAt.Valid || after.CredentialSwitchGeneration.Valid {
+				t.Fatalf("terminal transition must clear the switch columns: at=%v gen=%v", after.CredentialSwitchRequestedAt, after.CredentialSwitchGeneration)
+			}
+		})
+	}
+}
