@@ -495,6 +495,18 @@ interface RunFlight {
   runnerClone: RunnerClone | undefined;
   ciFixHumanApproved: boolean;
   result: ExecutorResult | undefined;
+  /** PRD #1416 M1: the branch's published forge tip P at claim (fact 2) — the floor at/below
+   *  which the branch must never be rewritten, since uzi lands work with a plain fast-forward
+   *  push and never force-pushes. Recorded ONCE at claim from `originBranchTip(bare, branch)`
+   *  (no fetch). Null/absent when the branch did not exist on the forge at clone (a fresh
+   *  issue run). Held here, on the flight, so it survives an executor/session restart —
+   *  deliberately NOT on `RunnerClone.baseCommit`, which can point at unpublished recovered
+   *  work. Named in every prompt of a run with a published floor; later milestones read it for
+   *  the ancestry check and the finalize bridge. */
+  publishedTip?: string;
+  /** PRD #1416 M1: floor C, initialised to P (`publishedTip`). Advanced to each confirmed
+   *  checkpoint tip by later milestones (M2/M3); M1 only seeds it. */
+  checkpointFloor?: string;
 }
 
 /** Tuning the runner needs beyond the collaborators (defaults keep M2/M3 tests terse). */
@@ -3719,6 +3731,17 @@ export class RunRunner {
     }
     if (retained) throw new TransientRecoveryError("recovering retained work before reseeding");
 
+    // PRD #1416 M1: record the published floor P ONCE at claim — the branch's forge tip as of
+    // this clone (fact 2), read from the worker bare WITHOUT a fetch. Placed after the whole
+    // clone try/catch so it covers the primary AND the reclaim paths (both assign runnerClone);
+    // the retained-recovery path threw above and re-claims later, recording P on that pass.
+    // Null when the branch did not exist on the forge at clone (a fresh issue run). This is
+    // runner-level flight state that survives an executor restart — never RunnerClone.baseCommit,
+    // which can point at unpublished recovered work. checkpointFloor C initialises to P; later
+    // milestones advance it to each confirmed checkpoint tip.
+    flight.publishedTip = (await this.git.originBranchTip(barePath, flight.branch!)) ?? undefined;
+    flight.checkpointFloor = flight.publishedTip;
+
     // Journal ownership before any model can write. The worker-owned bare config
     // survives failed captures, process restarts, and runner-owned clone tampering.
     await this.git.markRecoveryCapture(barePath, flight.worktreePath!, flight.branch!, runId);
@@ -4149,6 +4172,10 @@ export class RunRunner {
       // guessing the branch's parent (judge rec, run 51757591).
       baseCommit: runnerClone.baseCommit,
       defaultBranchCommit: runnerClone.defaultBranchCommit,
+      // PRD #1416 M1: the published floor P recorded at claim (flight, restart-surviving),
+      // threaded to prompt-build time so both builders name it on a run with a published
+      // floor. Absent (fresh branch) ⇒ no note.
+      publishedTip: flight.publishedTip,
       emit: (m) => batcher.emit(m),
       oauthToken: claim.secrets.anthropic_oauth_token,
       // PRD #362 M3c: the run-summary model resolved server-side (user-value-wins),

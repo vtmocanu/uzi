@@ -56,7 +56,7 @@ import type {
   TurnStreamEnd,
 } from "../harness.js";
 import { RunTurnReducerImpl } from "../harness-reducer.js";
-import { buildLeadSystemPrompt, buildRevisePlanPrompt } from "../prompt.js";
+import { buildLeadSystemPrompt, buildRevisePlanPrompt, publishedTipNote } from "../prompt.js";
 import { RUNNER_UID, WORKER_UID, uidSplitActive } from "../runner-uid.js";
 import { errMessage } from "../util.js";
 import type { AgentTemplate, ClaimSkill } from "../protocol.js";
@@ -1763,14 +1763,21 @@ export class CodexExecutor implements Executor {
 
   private planPrompt(ctx: RunContext): string {
     const head = ctx.issueIid != null ? `Issue #${ctx.issueIid}: ${ctx.issueTitle}` : ctx.issueTitle;
-    return `${head}\n\n${ctx.issueDescription}\n\nProduce a plan for this work and submit it for approval.`;
+    const body = `${head}\n\n${ctx.issueDescription}\n\nProduce a plan for this work and submit it for approval.`;
+    // PRD #1416 M1: these Codex builders bypass the shared buildPlanPrompt/buildImplementPrompt,
+    // so prepend the published-floor paragraph here. Empty ⇒ unchanged (a fresh branch).
+    const note = publishedTipNote(ctx.publishedTip, ctx.defaultBranchCommit);
+    return note ? `${note}\n\n${body}` : body;
   }
 
   private implementPrompt(ctx: RunContext): string {
     const approved = ctx.approvedPlan?.trim();
-    if (approved) return approved;
     const head = ctx.issueIid != null ? `Issue #${ctx.issueIid}: ${ctx.issueTitle}` : ctx.issueTitle;
-    return `${head}\n\n${ctx.issueDescription}`;
+    const body = approved ? approved : `${head}\n\n${ctx.issueDescription}`;
+    // PRD #1416 M1: prepend the published-floor paragraph whether or not a plan is approved.
+    // Empty ⇒ unchanged (a fresh branch).
+    const note = publishedTipNote(ctx.publishedTip, ctx.defaultBranchCommit);
+    return note ? `${note}\n\n${body}` : body;
   }
 
 }

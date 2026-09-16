@@ -1560,6 +1560,8 @@ export class SdkExecutor implements Executor {
             // See above.
             baseCommit: ctx.baseCommit,
             defaultBranchCommit: ctx.defaultBranchCommit,
+            // PRD #1416 M1: name the published floor P on a run with one. Absent ⇒ no note.
+            publishedTip: ctx.publishedTip,
             // PRD #501 REC B: thread the autopilot flag so the plan note renders.
             autoApprove: ctx.autoApprove,
           });
@@ -2174,6 +2176,9 @@ export class SdkExecutor implements Executor {
             // lead hands a subagent a diff command, which is where the wrong one was seen.
             baseCommit: ctx.baseCommit,
             defaultBranchCommit: ctx.defaultBranchCommit,
+            // PRD #1416 M1: name the published floor P, first turn only (gated inside
+            // buildImplementPrompt). Absent ⇒ no note.
+            publishedTip: ctx.publishedTip,
             // PRD #209 (D7): a requeued seeded run whose transcript was dropped re-enters
             // implement COLD — no plan turn carried the prior-work note. Threaded on the
             // pre-approved path ONLY, so an ordinary gated run's implement prompt is

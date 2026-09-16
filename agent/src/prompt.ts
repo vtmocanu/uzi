@@ -778,6 +778,42 @@ export function baseCommitNote(
   ].join("\n");
 }
 
+/**
+ * PRD #1416 M1: the paragraph that names the branch's PUBLISHED FLOOR P — the forge tip the
+ * branch already carries at claim (git.ts `originBranchTip`, fact 2). uzi lands work with a
+ * plain fast-forward push and never force-pushes, so a rewrite at or below P is unlandable and
+ * only discovered at finalize; naming P up front lets the lead integrate the default branch
+ * with `git merge` instead of a rebase. Plain and OUTSIDE every untrusted fence, exactly like
+ * baseCommitNote: it is uzi's own worker-verified statement of fact, not repo- or user-supplied
+ * text, and only OIDs are ever threaded here.
+ *
+ * Absent/malformed P ⇒ nothing is injected (a fresh branch has no published floor). The
+ * default-branch tip, when provided, is named ONLY as an OID and only when it validates; its
+ * NAME is repo-controlled text that must never sit outside a fence (D7, `BASE_COMMIT_RE` and
+ * the doctrine at :718-728), so the wording refers to "the default branch" and its SHA only.
+ */
+export function publishedTipNote(
+  publishedTip: string | undefined,
+  defaultBranchCommit?: string,
+): string {
+  if (!publishedTip || !BASE_COMMIT_RE.test(publishedTip)) return "";
+  const dflt =
+    defaultBranchCommit && BASE_COMMIT_RE.test(defaultBranchCommit)
+      ? defaultBranchCommit
+      : undefined;
+  // The default-branch OID rides the merge clause only when it validates; its NAME never does.
+  const mergeLine = dflt
+    ? `Add new commits, and integrate the default branch (at ${dflt}) with \`git merge\`, not \`git rebase\`.`
+    : `Add new commits, and integrate the default branch with \`git merge\`, not \`git rebase\`.`;
+  return [
+    `This branch is already published on the forge at commit ${publishedTip}. The worker lands`,
+    `your work with a fast-forward push and never force-pushes, so a rewritten branch cannot be`,
+    `landed. Never rebase, amend, squash, or reset any commit at or below ${publishedTip}.`,
+    mergeLine,
+    `If a rewrite is genuinely unavoidable, stop and call \`ask_user\`.`,
+  ].join("\n");
+}
+
 // ─── Dependency provisioning notes (#157) ────────────────────────────────────
 // PRD #121 made the worker install the clone's JS dependencies before the agent's
 // first implement turn. Nothing TOLD the agent, so on run 51757591 it planned
@@ -979,6 +1015,10 @@ export interface PlanPromptInput {
    *  `baseCommit` on a fresh branch; on a resume it is the branch's true fork point and
    *  the note names both. Absent ⇒ the note makes the narrower claim. */
   defaultBranchCommit?: string;
+  /** PRD #1416 M1: the branch's published forge tip P at claim (runner.ts `RunFlight.publishedTip`).
+   *  Set on a run whose branch already existed on the forge at clone; absent on a fresh issue
+   *  branch. Drives publishedTipNote. See publishedTipNote. */
+  publishedTip?: string;
   /** PRD #501 REC B: autopilot run (claim.auto_approve). When true, the plan prompt
    *  tells the lead there is no human and to decide open questions on best judgment.
    *  Absent/false ⇒ byte-identical to before. */
@@ -1002,10 +1042,14 @@ export function buildPlanPrompt(input: PlanPromptInput): string {
   const reviewBlock = buildReviewCommentsContext(input.reviewComments);
   const priorNote = priorWorkNote(input.priorWork);
   const baseNote = baseCommitNote(input.baseCommit, input.defaultBranchCommit);
+  // PRD #1416 M1: name the published floor P beside the base-commit/branch facts. Empty ⇒
+  // nothing added (a fresh branch has no published floor).
+  const publishedNote = publishedTipNote(input.publishedTip, input.defaultBranchCommit);
   return [
     `Plan the work described by this forge issue. You are on branch \`${input.branch}\`.`,
     ...(priorNote ? ["", priorNote] : []),
     ...(baseNote ? ["", baseNote] : []),
+    ...(publishedNote ? ["", publishedNote] : []),
     "",
     UNTRUSTED_FRAME,
     "",
@@ -1137,6 +1181,10 @@ export interface ImplementPromptInput {
   baseCommit?: string;
   /** The default branch's tip. See baseCommitNote. */
   defaultBranchCommit?: string;
+  /** PRD #1416 M1: the branch's published forge tip P at claim. FIRST TURN ONLY, like
+   *  baseCommit — later turns resume a session that already read it. Drives publishedTipNote.
+   *  Absent (fresh issue branch) ⇒ no note. See publishedTipNote. */
+  publishedTip?: string;
   /** PRD #209 (D7): prior pushed work on this branch, for a SEEDED cold-start implement.
    *  A requeued seeded run whose transcript was dropped never saw a plan turn, so the
    *  amnesiac note an ordinary run got in its plan prompt must ride the implement prompt
@@ -1246,6 +1294,12 @@ export function buildImplementPrompt(input: ImplementPromptInput): string {
     ? baseCommitNote(input.baseCommit, input.defaultBranchCommit)
     : "";
   if (baseNote) lines.push("", baseNote);
+  // PRD #1416 M1: name the published floor P, first turn only — like baseNote, later turns
+  // resume a session that already read it. Empty on a fresh branch ⇒ nothing added.
+  const publishedNote = input.first
+    ? publishedTipNote(input.publishedTip, input.defaultBranchCommit)
+    : "";
+  if (publishedNote) lines.push("", publishedNote);
   // PRD #122 M6: name the approved milestones and their live status EVERY turn (not
   // first-turn-only like the facts above — progress is dynamic), so the lead can see the
   // milestone boundaries and checkpoint at each one. Empty ⇒ nothing added.

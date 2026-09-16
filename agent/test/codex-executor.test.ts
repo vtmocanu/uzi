@@ -2657,3 +2657,49 @@ describe("CodexExecutor: production tool-handler map (item 5)", () => {
     assert.deepEqual(forgeCalls, [7], "the shared forge handler ran with the child-supplied iid");
   });
 });
+
+// PRD #1416 M1: the Codex executor's planPrompt/implementPrompt are trivial string builders that
+// bypass the shared buildPlanPrompt/buildImplementPrompt, so the published-floor paragraph is
+// prepended directly (from publishedTipNote). These assert it rides both prompts when
+// ctx.publishedTip is set (with AND without an approved plan) and is absent otherwise.
+describe("CodexExecutor prompts — published-tip note (PRD #1416 M1)", () => {
+  const P = "0123456789abcdef0123456789abcdef01234567";
+  const DFLT = "fedcba9876543210fedcba9876543210fedcba98";
+  const exec = makeExecutor(makeRig(), bindingOf(SUBSCRIPTION));
+  const planPrompt = (ctx: RunContext): string =>
+    (exec as unknown as { planPrompt(c: RunContext): string }).planPrompt(ctx);
+  const implementPrompt = (ctx: RunContext): string =>
+    (exec as unknown as { implementPrompt(c: RunContext): string }).implementPrompt(ctx);
+
+  it("planPrompt prepends the paragraph when publishedTip is set, omits it when absent", () => {
+    const withP = planPrompt(makeCtx({ publishedTip: P, defaultBranchCommit: DFLT }).ctx);
+    assert.ok(withP.includes("already published on the forge"));
+    assert.ok(withP.includes(P));
+    // Prepended: it comes before the plan instruction.
+    assert.ok(withP.indexOf("already published on the forge") < withP.indexOf("Produce a plan"));
+    const without = planPrompt(makeCtx().ctx);
+    assert.ok(!without.includes("already published on the forge"));
+  });
+
+  it("implementPrompt prepends the paragraph WITH an approved plan present", () => {
+    const withP = implementPrompt(
+      makeCtx({ approvedPlan: "the approved plan", publishedTip: P, defaultBranchCommit: DFLT }).ctx,
+    );
+    assert.ok(withP.includes("already published on the forge"));
+    assert.ok(withP.includes(P));
+    assert.ok(withP.includes("the approved plan"), "the approved plan body is preserved");
+    assert.ok(withP.indexOf("already published on the forge") < withP.indexOf("the approved plan"));
+  });
+
+  it("implementPrompt prepends the paragraph WITHOUT an approved plan", () => {
+    const withP = implementPrompt(makeCtx({ approvedPlan: undefined, publishedTip: P }).ctx);
+    assert.ok(withP.includes("already published on the forge"));
+    assert.ok(withP.includes(P));
+    assert.ok(withP.includes("the description"), "the issue fallback body is preserved");
+  });
+
+  it("implementPrompt omits it when publishedTip is absent (with and without a plan)", () => {
+    assert.ok(!implementPrompt(makeCtx({ approvedPlan: "p" }).ctx).includes("already published on the forge"));
+    assert.ok(!implementPrompt(makeCtx({ approvedPlan: undefined }).ctx).includes("already published on the forge"));
+  });
+});
