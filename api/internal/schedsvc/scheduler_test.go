@@ -245,6 +245,10 @@ type autopilotCall struct {
 	// a test can prove the auto-approve scheduled path threads scheduleCredentialOverride(sched)
 	// onto the created run. nil for the poller-shaped CreateAutopilotRun (no per-run override).
 	credOverride *workersvc.CredentialOverride
+	// explicit is the schedule's pinned run_schedules.harness (PRD #1429 M2, D5), captured so a
+	// test can prove the auto-approve scheduled path threads scheduleHarness(sched). nil for the
+	// poller-shaped CreateAutopilotRun (no per-schedule harness pin) and for a NULL-harness schedule.
+	explicit *workersvc.Harness
 }
 
 type runCall struct {
@@ -274,6 +278,10 @@ type runCall struct {
 	// prove the non-auto scheduled path threads scheduleCredentialOverride(sched). nil for the
 	// interactive CreateRun (the handler's per-run field feeds that seam, not a schedule).
 	credOverride *workersvc.CredentialOverride
+	// explicit is the schedule's pinned run_schedules.harness (PRD #1429 M2, D5), captured to
+	// prove the non-auto scheduled path threads scheduleHarness(sched). nil for the interactive
+	// CreateRun and for a NULL-harness schedule.
+	explicit *workersvc.Harness
 }
 
 type promptCall struct {
@@ -292,6 +300,10 @@ type promptCall struct {
 	// credOverride is the schedule's per-run credential override (PRD #1247 M6), captured to
 	// prove the prompt path threads scheduleCredentialOverride(sched) onto the prompt run.
 	credOverride *workersvc.CredentialOverride
+	// explicit is the schedule's pinned run_schedules.harness (PRD #1429 M2, D5), captured to
+	// prove the prompt path threads scheduleHarness(sched) onto the prompt run. nil for a
+	// NULL-harness schedule.
+	explicit *workersvc.Harness
 }
 
 type fakeRuns struct {
@@ -306,6 +318,24 @@ type fakeRuns struct {
 	// and the iid is present, the scheduled create seams return that error (so one candidate
 	// can be a not_eligible skip while its neighbours start); else they fall back to err.
 	errByIssue map[int64]error
+	// resolvedHarness/resolveErr back ResolveHarnessForUser (PRD #1429 M2, D5): the scheduler's
+	// fire-time codex+override conflict gate reads this to learn what D11 would resolve for the
+	// schedule owner. Defaults to HarnessClaude (no conflict) when unset.
+	resolvedHarness workersvc.Harness
+	resolveErr      error
+}
+
+// ResolveHarnessForUser fakes the D11 read the scheduler's fire-time codex+override conflict
+// gate (codexOverrideConflict) uses (PRD #1429 M2, D5). Tests that need it to resolve Codex set
+// f.resolvedHarness = workersvc.HarnessCodex before firing.
+func (f *fakeRuns) ResolveHarnessForUser(_ context.Context, _ uuid.UUID, _ *workersvc.Harness) (workersvc.Harness, error) {
+	if f.resolveErr != nil {
+		return "", f.resolveErr
+	}
+	if f.resolvedHarness == "" {
+		return workersvc.HarnessClaude, nil
+	}
+	return f.resolvedHarness, nil
 }
 
 // effErr resolves the create-seam error for one candidate iid: a per-issue override if
@@ -328,10 +358,10 @@ func (f *fakeRuns) CreateRun(_ context.Context, userID, repoID uuid.UUID, issueI
 	// force is captured so a test can prove the scheduler never sets it (issue #856).
 	// credOverride captured (PRD #1247 M6): the scheduler never routes a fire through CreateRun,
 	// so this stays nil, but capturing it keeps the fake symmetric with the scheduled seams.
-	f.runs = append(f.runs, runCall{userID, repoID, issueIID, waitOnLimit, mrReworkEnabled, false, nil, false, force, credOverride})
+	f.runs = append(f.runs, runCall{userID, repoID, issueIID, waitOnLimit, mrReworkEnabled, false, nil, false, force, credOverride, nil})
 	return store.Run{ID: uuid.New()}, nil
 }
-func (f *fakeRuns) CreateScheduledRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, _ string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, _ *workersvc.SeededPlan, credOverride *workersvc.CredentialOverride) (store.Run, error) {
+func (f *fakeRuns) CreateScheduledRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, _ string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, _ *workersvc.SeededPlan, credOverride *workersvc.CredentialOverride, explicit *workersvc.Harness) (store.Run, error) {
 	// The non-auto-approve scheduled path: recorded in the same `runs` bucket as
 	// CreateRun so the existing wait-on-limit / path-selection count assertions still
 	// observe it, but tagged scheduled=true so a test can prove the scheduler routed
@@ -341,8 +371,9 @@ func (f *fakeRuns) CreateScheduledRun(_ context.Context, userID, repoID uuid.UUI
 	}
 	// false force: the scheduled seam never forces a run creation (issue #856).
 	// credOverride captured (PRD #1247 M6): proves the non-auto path threads the schedule's
-	// stored override onto the run.
-	f.runs = append(f.runs, runCall{userID, repoID, issueIID, waitOnLimit, mrReworkEnabled, true, model, overrideSubagentModel, false, credOverride})
+	// stored override onto the run. explicit captured (PRD #1429 M2, D5): proves it threads
+	// scheduleHarness(sched).
+	f.runs = append(f.runs, runCall{userID, repoID, issueIID, waitOnLimit, mrReworkEnabled, true, model, overrideSubagentModel, false, credOverride, explicit})
 	return store.Run{ID: uuid.New()}, nil
 }
 func (f *fakeRuns) CreateAutopilotRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, description string) (store.Run, error) {
@@ -352,26 +383,28 @@ func (f *fakeRuns) CreateAutopilotRun(_ context.Context, userID, repoID uuid.UUI
 	// nil waitOnLimit: the poller seam has no per-run choice (owner default). nil model:
 	// the poller seam has no per-run model (PRD #300). Kept so the interface stays
 	// satisfied even though the scheduler no longer calls it. nil credOverride (PRD #1247).
-	f.autopilot = append(f.autopilot, autopilotCall{userID, repoID, issueIID, description, nil, nil, nil, false, nil})
+	// nil explicit (PRD #1429 M2): the poller seam has no per-schedule harness pin either.
+	f.autopilot = append(f.autopilot, autopilotCall{userID, repoID, issueIID, description, nil, nil, nil, false, nil, nil})
 	return store.Run{ID: uuid.New()}, nil
 }
-func (f *fakeRuns) CreateScheduledAutopilotRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, credOverride *workersvc.CredentialOverride) (store.Run, error) {
+func (f *fakeRuns) CreateScheduledAutopilotRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, credOverride *workersvc.CredentialOverride, explicit *workersvc.Harness) (store.Run, error) {
 	// The auto-approve scheduled path (PRD #274 Decision 1a): recorded in the same
 	// `autopilot` bucket as CreateAutopilotRun so the existing count assertions still
 	// observe it, but it CAPTURES waitOnLimit (which CreateAutopilotRun drops), the
-	// schedule's mr_rework override (PRD #841 M2), the schedule's model (PRD #300) and the
-	// schedule's credential override (PRD #1247 M6) so a test can prove all are threaded through.
+	// schedule's mr_rework override (PRD #841 M2), the schedule's model (PRD #300), the
+	// schedule's credential override (PRD #1247 M6) and its pinned harness (PRD #1429 M2, D5)
+	// so a test can prove all are threaded through.
 	if err := f.effErr(issueIID); err != nil {
 		return store.Run{}, err
 	}
-	f.autopilot = append(f.autopilot, autopilotCall{userID, repoID, issueIID, description, waitOnLimit, mrReworkEnabled, model, overrideSubagentModel, credOverride})
+	f.autopilot = append(f.autopilot, autopilotCall{userID, repoID, issueIID, description, waitOnLimit, mrReworkEnabled, model, overrideSubagentModel, credOverride, explicit})
 	return store.Run{ID: uuid.New()}, nil
 }
-func (f *fakeRuns) CreatePromptRun(_ context.Context, userID, repoID, scheduleID uuid.UUID, title, prompt string, autoApprove, waitOnLimit bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, credOverride *workersvc.CredentialOverride) (store.Run, error) {
+func (f *fakeRuns) CreatePromptRun(_ context.Context, userID, repoID, scheduleID uuid.UUID, title, prompt string, autoApprove, waitOnLimit bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, credOverride *workersvc.CredentialOverride, explicit *workersvc.Harness) (store.Run, error) {
 	if f.err != nil {
 		return store.Run{}, f.err
 	}
-	f.prompts = append(f.prompts, promptCall{userID, repoID, scheduleID, title, prompt, autoApprove, waitOnLimit, mrReworkEnabled, model, overrideSubagentModel, credOverride})
+	f.prompts = append(f.prompts, promptCall{userID, repoID, scheduleID, title, prompt, autoApprove, waitOnLimit, mrReworkEnabled, model, overrideSubagentModel, credOverride, explicit})
 	return store.Run{ID: uuid.New()}, nil
 }
 
@@ -1251,9 +1284,10 @@ func TestSkipReasonForErr(t *testing.T) {
 	}
 	// AllSkipReasons enumerates the full closed set (PRD #590 M1 added vault_locked;
 	// PRD #686 D10 added self_improve_mr_cap_reached; PRD #764 retired not_eligible;
-	// issue #856 added open_mr_exists; PRD #1093 M1 added schedules_paused).
-	if len(AllSkipReasons) != 8 {
-		t.Fatalf("AllSkipReasons has %d reasons, want 8", len(AllSkipReasons))
+	// issue #856 added open_mr_exists; PRD #1093 M1 added schedules_paused; PRD #1429 M2 added
+	// codex_override_conflict).
+	if len(AllSkipReasons) != 9 {
+		t.Fatalf("AllSkipReasons has %d reasons, want 9", len(AllSkipReasons))
 	}
 }
 

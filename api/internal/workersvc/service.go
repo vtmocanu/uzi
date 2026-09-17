@@ -5017,7 +5017,10 @@ func (s *Service) DeleteWorker(ctx context.Context, userID, workerID uuid.UUID) 
 // run is self-contained even if the issue cache is later evicted. A PRD link is no
 // longer required. The one-non-terminal-run-per-issue index rejects a duplicate
 // active run.
-func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *SeededPlan, credOverride *CredentialOverride) (store.Run, error) {
+// PRD #1429 M2: explicit is the manual request's optional harness (D2), nil ⇒ implicit D11;
+// rawOverride is the raw #1247 credential override validated against the resolved harness inside
+// the create transaction (D5). The old pre-transaction createRunEffectiveHarness guesser is gone.
+func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *SeededPlan, explicit *Harness, rawOverride *RawCredentialOverride) (store.Run, error) {
 	// waitOnLimit nil ⇒ inherit the owner's default. It is a *bool rather than a bool
 	// because "the caller said false" and "the caller said nothing" are different
 	// requests, and collapsing them would make every API client that omits the field
@@ -5038,17 +5041,18 @@ func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issue
 	// credOverride nil ⇒ inherit the worker binding (PRD #1247 M1); the create-time
 	// user choice is wired in M2. Threaded through the signature now so M2 does not
 	// reopen this seam (the freeze).
-	return s.createRun(ctx, userID, repoID, issueIID, "manual", description, false, waitOnLimit, mrReworkEnabled, nil, false, force, seed, credOverride)
+	return s.createRun(ctx, userID, repoID, issueIID, "manual", description, false, waitOnLimit, mrReworkEnabled, nil, false, force, seed, nil /*credOverride: manual uses rawOverride*/, explicit, rawOverride)
 }
 
 // CreateScheduledRun queues a NON-auto-approve scheduled issue run (PRD #241: a timer
 // or label-sweep schedule firing an issue with the plan gate still requiring a human).
 // It is IDENTICAL to CreateRun — same single uzi_label eligibility gate (PRD #764 M1) —
 // and, like every create path, no longer requires a PRD link.
-func (s *Service) CreateScheduledRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, seed *SeededPlan, credOverride *CredentialOverride) (store.Run, error) {
+func (s *Service) CreateScheduledRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, seed *SeededPlan, credOverride *CredentialOverride, explicit *Harness) (store.Run, error) {
 	// false force (issue #856): a scheduled run never bypasses the open-MR dedup.
-	// credOverride nil ⇒ inherit (PRD #1247 M1); M6 threads the schedule's stored override.
-	return s.createRun(ctx, userID, repoID, issueIID, "schedule", description, false, waitOnLimit, mrReworkEnabled, model, overrideSubagentModel, false, seed, credOverride)
+	// credOverride: the schedule's stored (pre-validated) override, written as-is. explicit: the
+	// schedule's pinned run_schedules.harness (nil ⇒ implicit D11 at fire time), PRD #1429 M2.
+	return s.createRun(ctx, userID, repoID, issueIID, "schedule", description, false, waitOnLimit, mrReworkEnabled, model, overrideSubagentModel, false, seed, credOverride, explicit, nil /*rawOverride*/)
 }
 
 // CreateAutopilotRun queues a run the poller's autopilot detection started on a
@@ -5074,7 +5078,9 @@ func (s *Service) CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UU
 	// false force (issue #856): label-poller autopilot never bypasses the open-MR dedup.
 	// nil credOverride (PRD #1247 M1): label-poller autopilot has no per-run credential
 	// choice, so it inherits the worker binding exactly as before.
-	return s.createRun(ctx, userID, repoID, issueIID, "autopilot", description, true, nil, nil, nil, false, false, nil, nil)
+	// nil explicit + nil rawOverride (PRD #1429 M2): label-poller autopilot has no per-run harness
+	// choice, so it uses implicit D11 resolution at create.
+	return s.createRun(ctx, userID, repoID, issueIID, "autopilot", description, true, nil, nil, nil, false, false, nil, nil /*credOverride*/, nil /*explicit*/, nil /*rawOverride*/)
 }
 
 // CreateScheduledAutopilotRun queues an auto-approve run for a schedule while honouring
@@ -5086,10 +5092,11 @@ func (s *Service) CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UU
 // seam (its interface, fake, and call site) stays byte-identical, so widening the
 // scheduler seam cannot change label-driven autopilot. seed=nil for the same reason as
 // CreateAutopilotRun: autopilot never seeds its plan.
-func (s *Service) CreateScheduledAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, credOverride *CredentialOverride) (store.Run, error) {
+func (s *Service) CreateScheduledAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, credOverride *CredentialOverride, explicit *Harness) (store.Run, error) {
 	// false force (issue #856): a scheduled autopilot run never bypasses the open-MR dedup.
-	// credOverride nil ⇒ inherit (PRD #1247 M1); M6 threads the schedule's stored override.
-	return s.createRun(ctx, userID, repoID, issueIID, "autopilot", description, true /*autoApprove*/, waitOnLimit, mrReworkEnabled, model, overrideSubagentModel, false /*force*/, nil /*seed*/, credOverride)
+	// credOverride: the schedule's stored override; explicit: the schedule's pinned harness
+	// (nil ⇒ implicit D11 at fire time), PRD #1429 M2.
+	return s.createRun(ctx, userID, repoID, issueIID, "autopilot", description, true /*autoApprove*/, waitOnLimit, mrReworkEnabled, model, overrideSubagentModel, false /*force*/, nil /*seed*/, credOverride, explicit, nil /*rawOverride*/)
 }
 
 // SeededPlan carries a create-time externally-authored plan and its optional agent
@@ -5118,7 +5125,13 @@ type SeededPlan struct {
 	RequireBase bool
 }
 
-func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, triggerSource string, description string, autoApprove bool, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, force bool, seed *SeededPlan, credOverride *CredentialOverride) (store.Run, error) {
+// explicit is the caller's outright D11 harness selection (PRD #1429 M2): the manual request's
+// harness / chat start_run's harness, or a schedule's pinned run_schedules.harness; nil ⇒ implicit
+// D11 resolution. credOverride is a PRE-RESOLVED credential override (the schedule producers'
+// stored choice), written to the columns as-is; rawOverride is an UNVALIDATED request override
+// (manual/chat-start) validated against the D11-resolved harness INSIDE the create transaction
+// (D5). At most one of credOverride/rawOverride is non-nil.
+func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, triggerSource string, description string, autoApprove bool, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, force bool, seed *SeededPlan, credOverride *CredentialOverride, explicit *Harness, rawOverride *RawCredentialOverride) (store.Run, error) {
 	// The description cap is enforced HERE, once, so the manual (handler → 422) and
 	// autopilot (poller → too-large comment) paths cannot drift (PRD #19 M5). Checked
 	// first: it is pure input validation, independent of the repo/issue gates below.
@@ -5316,74 +5329,86 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 	if s.completionInterlockOn(ctx) {
 		completionContractVersion = pgtype.Int4{Int32: 1, Valid: true}
 	}
-	run, err := s.q.CreateRun(ctx, store.CreateRunParams{
-		UserID:           userID,
-		RepoID:           repoID,
-		IssueIid:         pgtype.Int8{Int64: issueIID, Valid: true},
-		IssueTitle:       issue.Title,
-		IssueDescription: description,
-		OriginColumn:     s.originColumn(ctx, repoID, issue),
-		AutoApprove:      autoApprove,
-		// PRD #35 Decision 7. Stamped at creation from the owner's default (or the
-		// caller's explicit choice), never read from users at park time: a run must
-		// keep the behaviour it was created with, so flipping the default later cannot
-		// retroactively change a run already in flight.
-		WaitOnLimit: s.resolveWaitOnLimit(ctx, userID, waitOnLimit),
-		// PRD #841 M1 Decision D1: mr_rework is LIVE-INHERIT, the deliberate opposite of
-		// wait_on_limit's snapshot. The pointer is stamped THROUGH with no resolver — nil
-		// ⇒ NULL ⇒ the run inherits the owner default live at read time (the candidate
-		// query COALESCEs run over owner), and an explicit true/false is a per-run override.
-		// Every M1 caller passes nil except a future request/schedule override (M2/M3), so
-		// behaviour is byte-identical to today.
-		MrReworkEnabled: pgconv.BoolPtr(mrReworkEnabled),
-		// PRD #209 seeded-plan columns, listed explicitly (runtime.sql's 🔴 warning):
-		// all zero-valued to the not-seeded state above unless seed != nil. The M4
-		// staleness-guard pair (planned_base_commit, require_base_match) is here for the
-		// same reason — require_base_match is NOT NULL DEFAULT false, so omitting it would
-		// silently opt every seeded run out of the fail-on-divergence behaviour.
-		PlanMd:            planMD,
-		PlanSource:        planSource,
-		AgentSource:       agentSource,
-		AgentExclusions:   agentExclusions,
-		PlannedBaseCommit: plannedBaseCommit,
-		RequireBaseMatch:  requireBaseMatch,
-		// PRD #300: the per-schedule model override, frozen onto the run at fire time.
-		// nil for every non-scheduled caller (interactive, label-poller autopilot) →
-		// NULL → the run inherits the owner's per-user Worker default at claim assembly.
-		Model: pgconv.TextPtr(model),
-		// PRD #305: the schedule's "apply model also to agents" opt-in, frozen onto the
-		// run at fire time. false for every non-scheduled caller (interactive,
-		// label-poller autopilot) → the default lane where subagent pins win. M1 stores
-		// it only; claim delivery (M3) and worker behaviour (M4) are separate milestones.
-		OverrideSubagentModel: overrideSubagentModel,
-		// PRD #381: the structured human-comments snapshot, fetched best-effort above.
-		// nil (→ NULL) for a non-issue kind, a comment-less issue, an unknown bot id
-		// (D9), or when no forge builder is wired (tests).
-		IssueComments: issueCommentsJSON,
-		// PRD #700 M2: issue runs never carry MR review comments — always NULL here.
-		// The mr_rework create path (M3's CreateAutoMRReworkRun) fetches the MR review
-		// snapshot via fetchReviewCommentsSnapshot and populates this itself.
-		ReviewComments: nil,
-		// issue #857 M2: the provenance stamp threaded from each public entrypoint
-		// ("manual"/"schedule"/"autopilot"), so a run records why it fired.
-		TriggerSource: triggerSource,
-		// PRD #1226 M1 (D1): NULL (legacy) unless the rollout switch is on, in which case
-		// this stamps the run interlocked (version 1) before its first claim. Listed
-		// explicitly per runtime.sql's 🔴 silently-omittable-narg warning.
-		CompletionContractVersion: completionContractVersion,
-		// PRD #1429 M1: harness is now a required parameter (the SQL literal 'claude' became
-		// @harness). This is the MECHANICAL STOPGAP — every current origin stamps Claude so
-		// behaviour is byte-identical to today; M2 replaces this with the D11-resolved harness
-		// from the atomic create seam (createRunAtomic). An OMITTED field would ship harness=''
-		// and 23514 on runs_harness_check, the exact silently-omittable trap runtime.sql warns of.
-		Harness: string(HarnessClaude),
-		// PRD #1247 M1 (D1): the per-run credential override, NULL/NULL for every M1
-		// caller (credOverride nil ⇒ inherit the worker binding, byte-identical to a
-		// pre-#1247 run). Listed explicitly per the same silently-omittable-narg warning:
-		// an omitted Go struct field would compile green and ship NULL, which is correct
-		// here only because NULL *is* the intended M1 value — M2 passes a real override.
-		CredentialOverrideMode:     pgOverrideMode(credOverride),
-		CredentialOverrideSecretID: pgOverrideSecretID(credOverride),
+	run, err := s.createRunResolved(ctx, userID, explicit, func(q Store, resolved resolvedHarness) (store.Run, error) {
+		// PRD #1429 M2 (D5), #1247 override resolved INSIDE the create transaction against the
+		// D11-resolved harness (not a pre-tx guess): a rawOverride (manual/chat-start request) is
+		// validated here — an effective-Codex harness + Anthropic override fails
+		// ErrCredentialOverrideHarnessUnsupported and rolls the whole create back (no run row, no
+		// forge write after the invalid fact is known); a pre-resolved credOverride (a schedule's
+		// stored choice) is written as-is. nil override ⇒ inherit, byte-identical to a pre-#1247 run.
+		effOverride := credOverride
+		if rawOverride != nil {
+			ov, verr := s.ResolveCredentialOverride(ctx, userID, runkind.Issue, string(resolved.Harness), rawOverride.Mode, rawOverride.SecretID)
+			if verr != nil {
+				return store.Run{}, verr
+			}
+			effOverride = ov
+		}
+		return q.CreateRun(ctx, store.CreateRunParams{
+			UserID:           userID,
+			RepoID:           repoID,
+			IssueIid:         pgtype.Int8{Int64: issueIID, Valid: true},
+			IssueTitle:       issue.Title,
+			IssueDescription: description,
+			OriginColumn:     s.originColumn(ctx, repoID, issue),
+			AutoApprove:      autoApprove,
+			// PRD #35 Decision 7. Stamped at creation from the owner's default (or the
+			// caller's explicit choice), never read from users at park time: a run must
+			// keep the behaviour it was created with, so flipping the default later cannot
+			// retroactively change a run already in flight.
+			WaitOnLimit: s.resolveWaitOnLimit(ctx, userID, waitOnLimit),
+			// PRD #841 M1 Decision D1: mr_rework is LIVE-INHERIT, the deliberate opposite of
+			// wait_on_limit's snapshot. The pointer is stamped THROUGH with no resolver — nil
+			// ⇒ NULL ⇒ the run inherits the owner default live at read time (the candidate
+			// query COALESCEs run over owner), and an explicit true/false is a per-run override.
+			// Every M1 caller passes nil except a future request/schedule override (M2/M3), so
+			// behaviour is byte-identical to today.
+			MrReworkEnabled: pgconv.BoolPtr(mrReworkEnabled),
+			// PRD #209 seeded-plan columns, listed explicitly (runtime.sql's 🔴 warning):
+			// all zero-valued to the not-seeded state above unless seed != nil. The M4
+			// staleness-guard pair (planned_base_commit, require_base_match) is here for the
+			// same reason — require_base_match is NOT NULL DEFAULT false, so omitting it would
+			// silently opt every seeded run out of the fail-on-divergence behaviour.
+			PlanMd:            planMD,
+			PlanSource:        planSource,
+			AgentSource:       agentSource,
+			AgentExclusions:   agentExclusions,
+			PlannedBaseCommit: plannedBaseCommit,
+			RequireBaseMatch:  requireBaseMatch,
+			// PRD #300: the per-schedule model override, frozen onto the run at fire time.
+			// nil for every non-scheduled caller (interactive, label-poller autopilot) →
+			// NULL → the run inherits the owner's per-user Worker default at claim assembly.
+			Model: pgconv.TextPtr(model),
+			// PRD #305: the schedule's "apply model also to agents" opt-in, frozen onto the
+			// run at fire time. false for every non-scheduled caller (interactive,
+			// label-poller autopilot) → the default lane where subagent pins win. M1 stores
+			// it only; claim delivery (M3) and worker behaviour (M4) are separate milestones.
+			OverrideSubagentModel: overrideSubagentModel,
+			// PRD #381: the structured human-comments snapshot, fetched best-effort above.
+			// nil (→ NULL) for a non-issue kind, a comment-less issue, an unknown bot id
+			// (D9), or when no forge builder is wired (tests).
+			IssueComments: issueCommentsJSON,
+			// PRD #700 M2: issue runs never carry MR review comments — always NULL here.
+			// The mr_rework create path (M3's CreateAutoMRReworkRun) fetches the MR review
+			// snapshot via fetchReviewCommentsSnapshot and populates this itself.
+			ReviewComments: nil,
+			// issue #857 M2: the provenance stamp threaded from each public entrypoint
+			// ("manual"/"schedule"/"autopilot"), so a run records why it fired.
+			TriggerSource: triggerSource,
+			// PRD #1226 M1 (D1): NULL (legacy) unless the rollout switch is on, in which case
+			// this stamps the run interlocked (version 1) before its first claim. Listed
+			// explicitly per runtime.sql's 🔴 silently-omittable-narg warning.
+			CompletionContractVersion: completionContractVersion,
+			// PRD #1429 M2 (D1): the AUDITOR INVARIANT — runs.harness is stamped from the D11 result
+			// createRunAtomic resolved and froze inside THIS transaction, never a hardcoded literal, so
+			// the frozen row's harness equals the harness the freeze decision used.
+			Harness: string(resolved.Harness),
+			// PRD #1247 / #1429 M2: the per-run credential override columns, from the effective override
+			// resolved above (rawOverride validated against resolved.Harness, or a schedule's stored
+			// credOverride written as-is). nil ⇒ NULL/NULL ⇒ inherit the worker binding.
+			CredentialOverrideMode:     pgOverrideMode(effOverride),
+			CredentialOverrideSecretID: pgOverrideSecretID(effOverride),
+		})
 	})
 	if err != nil {
 		if isUniqueViolation(err) {

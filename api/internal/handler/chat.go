@@ -183,6 +183,10 @@ func (h *Handler) ContinueChat(w http.ResponseWriter, r *http.Request) {
 type startChatRunRequest struct {
 	RepoPath string `json:"repo_path"`
 	IssueIID int64  `json:"issue_iid"`
+	// PRD #1429 M2 (D2): the optional harness selection for the ordinary issue run this card
+	// starts, values claude|codex; absent ⇒ implicit D11. An invalid enum is a 400. This is the
+	// Chat surface's start_run action — the Chat CONVERSATION lane stays literal Claude (a later PRD).
+	Harness string `json:"harness"`
 }
 
 // StartChatRun starts an agent run from a chat's start-run card. Owner-scoped through
@@ -206,7 +210,14 @@ func (h *Handler) StartChatRun(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "issue_iid must be a positive integer")
 		return
 	}
-	run, err := h.wsvc.StartRunForUserByPath(r.Context(), user.ID, req.RepoPath, req.IssueIID, nil, nil)
+	// PRD #1429 M2 (D2): the optional harness enum threads through to the ordinary issue run this
+	// card starts. Absent ⇒ implicit D11; an invalid enum is a 400.
+	explicit, harnessOK := parseHarnessParam(req.Harness)
+	if !harnessOK {
+		httpx.Error(w, http.StatusBadRequest, "harness must be one of claude, codex")
+		return
+	}
+	run, err := h.wsvc.StartRunForUserByPath(r.Context(), user.ID, req.RepoPath, req.IssueIID, nil, nil, explicit)
 	if err != nil {
 		h.writeStartRunError(w, r, err)
 		return

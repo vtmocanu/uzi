@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
@@ -183,37 +184,49 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		return nil, fmt.Errorf("%w: bot PAT could not be decrypted", errCredentialUnavailable)
 	}
 
-	// Which credential this claim spends: the claiming worker's binding for ordinary
-	// runs, the owner's judge binding for self_improve, the owner's default when
-	// neither names one (PRD #104 D1). Resolution is per-claim, which is what makes a
-	// rebind take effect on the worker's next claim with no restart and no re-minted
-	// join token — the token has never ridden the worker, only each claim response.
-	choice, err := s.claimSecretID(ctx, wkr, run)
-	if err != nil {
-		return nil, err
+	// PRD #1429 M2 (D4): claim assembly is HARNESS-AUTHORITATIVE — the Codex/Claude split is
+	// decided HERE, BEFORE the Anthropic credential ladder, not after the payload is built. A
+	// Codex run NEVER traverses the ladder: claimSecretID / openWithAutoRetry / recordRunCredential
+	// are skipped, so it opens no Anthropic credential, writes no run_credential_epochs Anthropic
+	// row, and carries no anthropic_oauth_token (anthropic stays nil → AnthropicOAuthToken == "").
+	// Its Codex secrets are attached just below, in the harnessCodex block after the payload
+	// literal. A Claude run keeps the exact existing ladder — byte-identical.
+	var anthropic []byte
+	recordedLastSeq := run.LastSeq
+	if run.Harness != harnessCodex {
+		// Which credential this claim spends: the claiming worker's binding for ordinary
+		// runs, the owner's judge binding for self_improve, the owner's default when
+		// neither names one (PRD #104 D1). Resolution is per-claim, which is what makes a
+		// rebind take effect on the worker's next claim with no restart and no re-minted
+		// join token — the token has never ridden the worker, only each claim response.
+		choice, err := s.claimSecretID(ctx, wkr, run)
+		if err != nil {
+			return nil, err
+		}
+		// Open with the shared auto-lane open-failed retry (D14), which returns the
+		// post-retry choice so the record below names the credential actually spent.
+		cred, choice, err := s.openWithAutoRetry(ctx, run, choice)
+		if err != nil {
+			return nil, err
+		}
+		// Record it before anything else can fail (PRD #111 M1): the credential HAS been
+		// opened at this point, so from the run's perspective it is already the account
+		// this claim commits to, whether or not the rest of assembly succeeds.
+		//
+		// PRD #1247 M9 (task c): the RUN LANE passes emitSwitchMessage=true, so recordRunCredential
+		// emits a 'credential_switch' feed message on an APPLIED token switch (an epoch delta onto a
+		// different token) atomically with the credential write, and RETURNS the (possibly bumped)
+		// last_seq — the seq of the server-inserted message, or the run's current high-water mark when
+		// no message was emitted. ClaimPayload.LastSeq MUST be this returned value, not the stale
+		// run.LastSeq snapshot: the worker resumes seq numbering from it, so a stale snapshot would let
+		// it re-use the message's seq and collide.
+		rls, err := s.recordRunCredential(ctx, run, cred, choice, true)
+		if err != nil {
+			return nil, err
+		}
+		recordedLastSeq = rls
+		anthropic = cred.Token
 	}
-	// Open with the shared auto-lane open-failed retry (D14), which returns the
-	// post-retry choice so the record below names the credential actually spent.
-	cred, choice, err := s.openWithAutoRetry(ctx, run, choice)
-	if err != nil {
-		return nil, err
-	}
-	// Record it before anything else can fail (PRD #111 M1): the credential HAS been
-	// opened at this point, so from the run's perspective it is already the account
-	// this claim commits to, whether or not the rest of assembly succeeds.
-	//
-	// PRD #1247 M9 (task c): the RUN LANE passes emitSwitchMessage=true, so recordRunCredential
-	// emits a 'credential_switch' feed message on an APPLIED token switch (an epoch delta onto a
-	// different token) atomically with the credential write, and RETURNS the (possibly bumped)
-	// last_seq — the seq of the server-inserted message, or the run's current high-water mark when
-	// no message was emitted. ClaimPayload.LastSeq MUST be this returned value, not the stale
-	// run.LastSeq snapshot: the worker resumes seq numbering from it, so a stale snapshot would let
-	// it re-use the message's seq and collide.
-	recordedLastSeq, err := s.recordRunCredential(ctx, run, cred, choice, true)
-	if err != nil {
-		return nil, err
-	}
-	anthropic := cred.Token
 
 	// Only the templates allocated to this run's owner ride the claim (PRD #18
 	// M7): builtin/global defaults ± the owner's overlay + the owner's own
@@ -241,6 +254,17 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	// non-scheduled run and every schedule without a model).
 	if run.Model.Valid {
 		defaultModel = run.Model
+	}
+
+	// PRD #1429 D6: the model vocabulary is harness-owned. If the resolved model belongs to the
+	// OTHER harness (a Claude alias on a Codex run, or a Codex-only model on a Claude run), drop it
+	// so the worker uses its own harness default, and record a VISIBLE nonsecret status note — a
+	// Claude alias must NEVER reach a Codex claim, nor a Codex model a Claude claim. Empty/inherit
+	// and same-harness models pass through unchanged, so every existing claim stays byte-identical.
+	if defaultModel.Valid && !harnessModelCompatible(Harness(run.Harness), defaultModel.String) {
+		dropped := defaultModel.String
+		defaultModel = pgtype.Text{} // omit → the worker falls back to its own harness default
+		recordedLastSeq = s.recordHarnessModelFallbackNote(ctx, run, recordedLastSeq, Harness(run.Harness), dropped)
 	}
 
 	// The run owner's per-user default reasoning effort (PRD #617). NULL now

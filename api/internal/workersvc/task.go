@@ -112,28 +112,31 @@ func (s *Service) CreateTaskRun(ctx context.Context, userID, repoID uuid.UUID, i
 	// decoupled from the global RUN_TIMEOUT / RUN_MAX_ITERATIONS (see handoffBudget).
 	budgetWall, budgetIters := s.handoffBudget(interactive)
 
-	run, err := s.q.CreateTaskRun(ctx, store.CreateTaskRunParams{
-		RunID:               id,
-		UserID:              userID,
-		RepoID:              repoID,
-		Branch:              pgconv.TextOrNull(branch),
-		BaseBranch:          pgTextTrimNarg(baseBranch),
-		OpenMr:              openMR,
-		Interactive:         interactive,
-		ReviewRequested:     reviewRequested,
-		ThenFixRequested:    thenFixRequested,
-		IssueTitle:          deriveTaskTitle(inlineContext),
-		IssueDescription:    inlineContext,
-		BudgetWallSeconds:   budgetWall,
-		BudgetMaxIterations: budgetIters,
-		// PRD #1429 M1 stopgap: harness is now the @harness param (was the SQL literal
-		// 'claude'). Stamp Claude explicitly so behaviour is byte-identical; M3 replaces it
-		// with the D11-resolved harness. An omitted field would ship harness='' → 23514.
-		Harness: string(HarnessClaude),
-		// PRD #35: the OWNER's default. A handoff has no per-request wait_on_limit
-		// override today, so nil resolves to the user's users.wait_on_limit — the same
-		// defaulting every other creation path applies (ci_fix/mr_rework/CreateRun).
-		WaitOnLimit: s.resolveWaitOnLimit(ctx, userID, nil),
+	// PRD #1429 M2: the initial task handoff has no source run, so it uses IMPLICIT D11 (nil
+	// explicit). This path previously BYPASSED createRun, so the M1 stopgap is replaced here by the
+	// atomic resolve/freeze — the pre-minted run id (RunID: id) is what the in-tx Codex freeze binds.
+	run, err := s.createRunResolved(ctx, userID, nil /*explicit: implicit D11*/, func(q Store, resolved resolvedHarness) (store.Run, error) {
+		return q.CreateTaskRun(ctx, store.CreateTaskRunParams{
+			RunID:               id,
+			UserID:              userID,
+			RepoID:              repoID,
+			Branch:              pgconv.TextOrNull(branch),
+			BaseBranch:          pgTextTrimNarg(baseBranch),
+			OpenMr:              openMR,
+			Interactive:         interactive,
+			ReviewRequested:     reviewRequested,
+			ThenFixRequested:    thenFixRequested,
+			IssueTitle:          deriveTaskTitle(inlineContext),
+			IssueDescription:    inlineContext,
+			BudgetWallSeconds:   budgetWall,
+			BudgetMaxIterations: budgetIters,
+			// PRD #1429 M2 (D1 auditor invariant): the D11-resolved harness frozen in-tx.
+			Harness: string(resolved.Harness),
+			// PRD #35: the OWNER's default. A handoff has no per-request wait_on_limit
+			// override today, so nil resolves to the user's users.wait_on_limit — the same
+			// defaulting every other creation path applies (ci_fix/mr_rework/CreateRun).
+			WaitOnLimit: s.resolveWaitOnLimit(ctx, userID, nil),
+		})
 	})
 	if err != nil {
 		return store.Run{}, err

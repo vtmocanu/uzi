@@ -178,6 +178,14 @@ func (h *Handler) StartRunRework(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusConflict, "a CI fix is working this branch")
 		case errors.Is(err, workersvc.ErrActiveMRReworkExists):
 			httpx.Error(w, http.StatusConflict, "a rework is already running for this merge request")
+		case errors.Is(err, workersvc.ErrNoCredentialForHarness):
+			// PRD #1429 M2 (D4): the derived rework INHERITS the source run's harness explicitly; if
+			// that harness is no longer usable, creation refuses with no fallback. Surface the typed
+			// reason (422, stable no_credential_for_harness classification) rather than a 500.
+			httpx.JSON(w, http.StatusUnprocessableEntity, map[string]any{
+				"error": "the source run's harness has no usable credential",
+				"code":  "no_credential_for_harness",
+			})
 		default:
 			slog.Error("start run rework", "run_id", runID, "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")

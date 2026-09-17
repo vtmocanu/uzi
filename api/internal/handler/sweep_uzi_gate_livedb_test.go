@@ -96,6 +96,13 @@ func TestSweepFiresOnlyUziLabelledCandidateLiveDB(t *testing.T) {
 	t.Cleanup(func() { mustExecT(ctx, t, pool, `DELETE FROM users WHERE id = $1`, owner) })
 	mustExecT(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
 		owner, fmt.Sprintf("m3sweep-%s@e2e", uuid.NewString()[:8]))
+	// PRD #1429 M2: the sweep fire path now resolves a real D11 harness at create time; give
+	// the owner a usable Anthropic token (Claude, byte-identical) — orthogonal to the
+	// uzi-label selector/eligibility behaviour under test.
+	mustExecT(ctx, t, pool,
+		`INSERT INTO user_secrets (id, user_id, kind, label, is_default, ciphertext, sealed_with)
+		 VALUES ($1, $2, 'anthropic_token', 'anthropic-default', true, $3, 'master')`,
+		uuid.New(), owner, []byte("ct"))
 	mustExecT(ctx, t, pool,
 		`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
 		 VALUES ($1, $2, 'gitlab', 'https://forge.example', 'uzi-bot', $3, $4)`,

@@ -27,13 +27,20 @@ func reworkableSourceRun(runID, user, repo uuid.UUID) store.Run {
 		Branch:  pgconv.Text("agent/issue-7"),
 		MrIid:   pgtype.Int8{Int64: 55, Valid: true},
 		MrState: pgconv.Text("opened"),
+		// PRD #1429 M2 (D4): createMRReworkRun now loads the source run and inherits its harness
+		// as an EXPLICIT createRunResolved selection. The fakeStore in-memory branch resolves only
+		// Claude, so every source run here must carry the harness the rework inherits.
+		Harness: harnessClaude,
 	}
 }
 
 func TestStartMRReworkForRunHappyPathStampsManual(t *testing.T) {
 	user, repo, runID, newRun := uuid.New(), uuid.New(), uuid.New(), uuid.New()
 	fs := &fakeStore{
-		runByID:           reworkableSourceRun(runID, user, repo),
+		runByID: reworkableSourceRun(runID, user, repo),
+		// PRD #1429 M2 (D4): createMRReworkRun's source-harness load goes through the PLAIN
+		// GetRunByID (runByIDPlain), distinct from the door check's GetRunByIDForUser (runByID).
+		runByIDPlain:      reworkableSourceRun(runID, user, repo),
 		hasAnthropicToken: true,
 		mrReworkLedger:    store.MrReworkLedger{Ref: "agent/issue-7", AttemptCount: 5, HighWater: 100},
 		repoRow:           aValidRepoRow(),
@@ -89,6 +96,7 @@ func TestStartMRReworkForRunGuidanceOnlyStillAdvances(t *testing.T) {
 	user, repo, runID := uuid.New(), uuid.New(), uuid.New()
 	fs := &fakeStore{
 		runByID:           reworkableSourceRun(runID, user, repo),
+		runByIDPlain:      reworkableSourceRun(runID, user, repo),
 		hasAnthropicToken: true,
 		// high_water already above the snapshot's max actionable id (120): nothing new.
 		mrReworkLedger:    store.MrReworkLedger{Ref: "agent/issue-7", AttemptCount: 5, HighWater: 500},
@@ -210,6 +218,7 @@ func TestStartMRReworkForRunMapsCreateErrors(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			fs := &fakeStore{
 				runByID:           reworkableSourceRun(runID, user, repo),
+				runByIDPlain:      reworkableSourceRun(runID, user, repo),
 				hasAnthropicToken: true,
 				mrReworkLedger:    store.MrReworkLedger{Ref: "agent/issue-7", HighWater: 100},
 				repoRow:           aValidRepoRow(),

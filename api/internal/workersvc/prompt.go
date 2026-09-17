@@ -37,7 +37,7 @@ var ErrActivePromptExists = errors.New("a prompt run is already active for this 
 // run-create paths. auto_approve and wait_on_limit ride straight from the schedule
 // the owner configured. A second active run for the schedule is rejected by the
 // partial unique index → ErrActivePromptExists.
-func (s *Service) CreatePromptRun(ctx context.Context, userID, repoID, scheduleID uuid.UUID, title, prompt string, autoApprove, waitOnLimit bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, credOverride *CredentialOverride) (store.Run, error) {
+func (s *Service) CreatePromptRun(ctx context.Context, userID, repoID, scheduleID uuid.UUID, title, prompt string, autoApprove, waitOnLimit bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, credOverride *CredentialOverride, explicit *Harness) (store.Run, error) {
 	row, err := s.q.GetRepoForUser(ctx, store.GetRepoForUserParams{ID: repoID, UserID: userID})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -48,33 +48,33 @@ func (s *Service) CreatePromptRun(ctx context.Context, userID, repoID, scheduleI
 	if err := s.guardDefaultBranch(ctx, row); err != nil {
 		return store.Run{}, err
 	}
-	run, err := s.q.CreatePromptRun(ctx, store.CreatePromptRunParams{
-		UserID:           userID,
-		RepoID:           repoID,
-		ScheduleID:       scheduleID,
-		IssueTitle:       title,
-		IssueDescription: prompt,
-		AutoApprove:      autoApprove,
-		WaitOnLimit:      waitOnLimit,
-		// PRD #841 M1: the schedule's mr_rework override, stamped THROUGH live-inherit
-		// (D1) — nil ⇒ NULL ⇒ the run follows the owner default at read time. Threaded
-		// as *bool (not the schedule column yet) so M2 can pass sched.MrReworkEnabled.
-		MrReworkEnabled: pgconv.BoolPtr(mrReworkEnabled),
-		// PRD #300: the schedule's per-schedule model override, frozen onto this run.
-		// nil → NULL → the run inherits the owner's per-user Worker default.
-		Model: pgconv.TextPtr(model),
-		// PRD #305: the schedule's "apply model also to agents" opt-in, frozen onto this
-		// run at fire time (M1 stores only; delivery M3, worker behaviour M4).
-		OverrideSubagentModel: overrideSubagentModel,
-		// PRD #1247 M1 (D1/D5): the schedule's per-run credential override, NULL/NULL for
-		// every M1 caller (credOverride nil ⇒ inherit). M6 threads the schedule's stored
-		// override onto the fired prompt run through this seam.
-		CredentialOverrideMode:     pgOverrideMode(credOverride),
-		CredentialOverrideSecretID: pgOverrideSecretID(credOverride),
-		// PRD #1429 M1 stopgap: harness is now the @harness param. Stamp Claude explicitly
-		// (byte-identical to today); M2 threads the schedule pin / resolved D11 harness.
-		// Omitting it would ship harness='' → 23514.
-		Harness: string(HarnessClaude),
+	// PRD #1429 M2: resolve + freeze the harness in the same transaction as the INSERT. explicit is
+	// the schedule's pinned run_schedules.harness (nil ⇒ implicit D11); the fire-time codex+override
+	// conflict is gated by the scheduler's firePrompt (D5).
+	run, err := s.createRunResolved(ctx, userID, explicit, func(q Store, resolved resolvedHarness) (store.Run, error) {
+		return q.CreatePromptRun(ctx, store.CreatePromptRunParams{
+			UserID:           userID,
+			RepoID:           repoID,
+			ScheduleID:       scheduleID,
+			IssueTitle:       title,
+			IssueDescription: prompt,
+			AutoApprove:      autoApprove,
+			WaitOnLimit:      waitOnLimit,
+			// PRD #841 M1: the schedule's mr_rework override, stamped THROUGH live-inherit
+			// (D1) — nil ⇒ NULL ⇒ the run follows the owner default at read time.
+			MrReworkEnabled: pgconv.BoolPtr(mrReworkEnabled),
+			// PRD #300: the schedule's per-schedule model override, frozen onto this run.
+			// nil → NULL → the run inherits the owner's per-user Worker default.
+			Model: pgconv.TextPtr(model),
+			// PRD #305: the schedule's "apply model also to agents" opt-in, frozen onto this
+			// run at fire time (M1 stores only; delivery M3, worker behaviour M4).
+			OverrideSubagentModel: overrideSubagentModel,
+			// PRD #1247 M6: the schedule's stored credential override (nil ⇒ inherit).
+			CredentialOverrideMode:     pgOverrideMode(credOverride),
+			CredentialOverrideSecretID: pgOverrideSecretID(credOverride),
+			// PRD #1429 M2 (D1 auditor invariant): the D11-resolved harness frozen in-tx.
+			Harness: string(resolved.Harness),
+		})
 	})
 	if err != nil {
 		if isUniqueViolation(err) {

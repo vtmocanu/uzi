@@ -524,27 +524,29 @@ func scheduleLaneKind(target string) string {
 }
 
 // scheduleEffectiveHarness resolves a schedule's effective harness for the credential-override
-// validator (PRD #1247 M6, D9), mirroring createRunEffectiveHarness (runs_lifecycle.go): read
-// run_schedules.harness (a pgtype.Text on the model), mapping codex→codex else claude; the
-// user's persisted default_harness is consulted ONLY when run_schedules.harness is NULL (a
-// schedule row usually leaves it unset). Only a codex effective harness is refused (422); every
-// other value (incl. the common NULL default) resolves to claude, the safe direction.
+// validator (PRD #1429 M2, D5 — replacing the #1247 raw guesser). A PINNED run_schedules.harness
+// is the effective harness directly (an explicit D11 selection; only 'codex' matters to the
+// override validator, and a pinned-but-unusable harness is a fire-time concern, not here). A NULL
+// harness resolves through a proper implicit D11 resolution against current availability — not the
+// raw default_harness the retired guesser read — so a stale default that has no usable credential
+// no longer wrongly refuses an Anthropic override. Neither harness usable ⇒ treat as claude, the
+// safe direction: the override is allowed and the AUTHORITATIVE fire-time gate re-checks and fails
+// closed if the schedule later resolves to codex.
 func (h *Handler) scheduleEffectiveHarness(ctx context.Context, sched store.RunSchedule) (string, error) {
-	if sched.Harness.Valid {
+	if sched.Harness.Valid && sched.Harness.String != "" {
 		if sched.Harness.String == string(workersvc.HarnessCodex) {
 			return string(workersvc.HarnessCodex), nil
 		}
 		return string(workersvc.HarnessClaude), nil
 	}
-	// NULL: consult the user's persisted default_harness.
-	raw, err := h.q.GetUserDefaultHarness(ctx, sched.UserID)
+	harness, err := h.wsvc.ResolveHarnessForUser(ctx, sched.UserID, nil)
 	if err != nil {
+		if errors.Is(err, workersvc.ErrNoUsableCredential) {
+			return string(workersvc.HarnessClaude), nil
+		}
 		return "", err
 	}
-	if raw.Valid && raw.String == string(workersvc.HarnessCodex) {
-		return string(workersvc.HarnessCodex), nil
-	}
-	return string(workersvc.HarnessClaude), nil
+	return string(harness), nil
 }
 
 // scheduleCredentialColumns is the resolved write for a schedule's credential override

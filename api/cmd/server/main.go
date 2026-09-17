@@ -1517,7 +1517,9 @@ func (g gateSubmitter) DismissProposalForUser(ctx context.Context, userID, runID
 // button's intent) and logs the raw cause, so slacksvc surfaces a helpful line without
 // importing workersvc.
 func (g gateSubmitter) StartRunFromCard(ctx context.Context, userID uuid.UUID, repoPath string, issueIID int64) (uuid.UUID, error) {
-	run, err := g.svc.StartRunForUserByPath(ctx, userID, repoPath, issueIID, nil, nil)
+	// nil explicit (PRD #1429 M2): the Slack start-run card has no harness picker, so it uses
+	// implicit D11 resolution.
+	run, err := g.svc.StartRunForUserByPath(ctx, userID, repoPath, issueIID, nil, nil, nil)
 	if err == nil {
 		return run.ID, nil
 	}

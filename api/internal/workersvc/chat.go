@@ -184,15 +184,18 @@ func (s *Service) assembleChatClaim(ctx context.Context, run store.Run) (*ChatCl
 	}
 
 	// PRD #1332 M5A (D3): belt-and-suspenders Codex refusal, mirroring assembleClaim's
-	// harness-authoritative fail-closed branch but UNCONDITIONAL — chat does NOT implement
-	// Codex until M5B, and there is no worker capability that authorizes it. ClaimChatRun's
-	// WHERE already excludes every Codex-indicating chat row, so a run reaching here should
-	// never be Codex; if one somehow does (a claim raced a binding write, or inconsistent
-	// legacy data), refuse rather than assemble a Claude chat claim for a Codex-indicating
-	// run. Checks all THREE binding facts so it stays closed on the deleted-alias / coherence
-	// edge the run lane guards. errCredentialUnavailable is TERMINAL, so the run fails cleanly.
+	// harness-authoritative fail-closed branch but UNCONDITIONAL — the Chat CONVERSATION lane
+	// deliberately has NO Codex executor (a later PRD, not this one — #1429 activates Codex for
+	// the ordinary run lanes only), and there is no worker capability that authorizes it.
+	// ClaimChatRun's WHERE already excludes every Codex-indicating chat row, so a run reaching
+	// here should never be Codex; if one somehow does (a claim raced a binding write, or
+	// inconsistent legacy data), refuse rather than assemble a Claude chat claim for a
+	// Codex-indicating run. Checks all THREE binding facts so it stays closed on the
+	// deleted-alias / coherence edge the run lane guards. errCredentialUnavailable is TERMINAL,
+	// so the run fails cleanly. (The guard logic is unchanged; only the wording was updated to
+	// point at a later PRD rather than the retired "M5B" label.)
 	if run.Harness == harnessCodex || run.CodexMaterialRevision.Valid || run.CodexSecretID.Valid {
-		return nil, fmt.Errorf("%w: chat run is Codex-indicating; Codex chat is not implemented until M5B", errCredentialUnavailable)
+		return nil, fmt.Errorf("%w: chat run is Codex-indicating; Codex chat is deferred to a later PRD", errCredentialUnavailable)
 	}
 
 	// nil, and it stays nil: chat is deliberately NOT bindable (PRD #104 D1), so a

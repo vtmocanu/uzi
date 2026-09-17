@@ -113,21 +113,23 @@ type Store interface {
 // RunCreator is the shared run-creation seam the scheduler fires through — the SAME
 // seam autopilot and the manual board use. *workersvc.Service satisfies it.
 type RunCreator interface {
-	// PRD #1247 M1: every scheduled creation seam carries the per-run credential override
-	// (nil = inherit) so the schedule's stored choice reaches the fired run (D5, wired in
-	// M6); M1 passes nil everywhere and behaviour is byte-identical.
-	CreateRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *workersvc.SeededPlan, credOverride *workersvc.CredentialOverride) (store.Run, error)
-	// CreateScheduledRun is the non-auto-approve scheduled path: like CreateRun but the
+	// PRD #1429 M2: every scheduled creation seam carries the schedule's pinned harness as an
+	// explicit D11 selection (nil ⇒ implicit resolution at fire time) alongside the per-run
+	// credential override (nil = inherit); the resolve/INSERT/freeze happen atomically in workersvc.
+	// CreateScheduledRun is the non-auto-approve scheduled path: like the manual create but the
 	// plan gate still requires a human (see workersvc.CreateScheduledRun). Eligibility is
 	// the single uzi_label gate (PRD #764 M1); a PRD link is no longer required.
-	CreateScheduledRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, seed *workersvc.SeededPlan, credOverride *workersvc.CredentialOverride) (store.Run, error)
+	CreateScheduledRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, seed *workersvc.SeededPlan, credOverride *workersvc.CredentialOverride, explicit *workersvc.Harness) (store.Run, error)
 	CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string) (store.Run, error)
 	// CreateScheduledAutopilotRun is the auto-approve scheduled path (PRD #274 Decision
 	// 1a): like CreateAutopilotRun but it HONOURS the schedule's persisted wait_on_limit
 	// instead of the owner default. It is a distinct method so the poller's
 	// CreateAutopilotRun seam stays untouched (see workersvc.CreateScheduledAutopilotRun).
-	CreateScheduledAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, credOverride *workersvc.CredentialOverride) (store.Run, error)
-	CreatePromptRun(ctx context.Context, userID, repoID, scheduleID uuid.UUID, title, prompt string, autoApprove, waitOnLimit bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, credOverride *workersvc.CredentialOverride) (store.Run, error)
+	CreateScheduledAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, credOverride *workersvc.CredentialOverride, explicit *workersvc.Harness) (store.Run, error)
+	CreatePromptRun(ctx context.Context, userID, repoID, scheduleID uuid.UUID, title, prompt string, autoApprove, waitOnLimit bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, credOverride *workersvc.CredentialOverride, explicit *workersvc.Harness) (store.Run, error)
+	// ResolveHarnessForUser resolves the harness a user's next run WOULD get under D11 (PRD #1429
+	// M2), reads-only. The scheduler uses it for the fire-time codex+override conflict gate (D5).
+	ResolveHarnessForUser(ctx context.Context, userID uuid.UUID, explicit *workersvc.Harness) (workersvc.Harness, error)
 	// CreateSelfImproveRun is the self-improvement fire path's insert (PRD #590 M1): a
 	// dedicated issue-shaped, auto_approve, kind='self_improve' run against the tracking
 	// issue, threading the schedule's per-schedule model override and (PRD #908 M1) the
@@ -656,11 +658,20 @@ func (e *Scheduler) firePrompt(ctx context.Context, sched store.RunSchedule) (Fi
 		}
 	}
 	instruction := composeRunDescriptionWithSections(prompt, guidanceOf(sched), sections...)
+	// PRD #1429 M2 (D5): a null-harness schedule with a stored Anthropic override that now resolves
+	// to Codex fails closed with a legible Skip — no run, override untouched, no fallback.
+	if conflict, cerr := e.codexOverrideConflict(ctx, sched); cerr != nil {
+		return FireOutcome{}, cerr // transient (D11 read error)
+	} else if conflict {
+		e.logger.Info("scheduler: prompt fire codex+override conflict, skipping", "schedule", sched.ID.String())
+		return FireOutcome{Matched: 1, Skips: []Skip{{Title: title, Reason: SkipCodexOverrideConflict}}}, nil
+	}
 	// PRD #841 M2: the schedule's stored mr_rework override stamps onto the run (nil ⇒
 	// inherit the owner default live).
 	// PRD #1247 M6: the schedule's stored credential override is threaded onto the fired
 	// prompt run (nil ⇒ inherit the worker binding, a pre-#1247 fire).
-	run, err := e.runs.CreatePromptRun(ctx, sched.UserID, sched.RepoID, sched.ID, title, instruction, sched.AutoApprove, sched.WaitOnLimit, scheduleMrRework(sched), scheduleModel(sched), scheduleOverrideSubagentModel(sched), scheduleCredentialOverride(sched))
+	// PRD #1429 M2: the schedule's pinned harness is threaded as explicit (nil ⇒ implicit D11).
+	run, err := e.runs.CreatePromptRun(ctx, sched.UserID, sched.RepoID, sched.ID, title, instruction, sched.AutoApprove, sched.WaitOnLimit, scheduleMrRework(sched), scheduleModel(sched), scheduleOverrideSubagentModel(sched), scheduleCredentialOverride(sched), scheduleHarness(sched))
 	switch {
 	case err == nil:
 		return FireOutcome{Matched: 1, Started: []Started{{RunID: run.ID, Title: title}}}, nil
@@ -704,6 +715,15 @@ func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule,
 
 	desc := composeRunDescription(description, guidanceOf(sched))
 
+	// PRD #1429 M2 (D5): a null-harness schedule with a stored Anthropic override that now resolves
+	// to Codex fails closed with a legible Skip — no run, override untouched, no fallback.
+	if conflict, cerr := e.codexOverrideConflict(ctx, sched); cerr != nil {
+		return FireOutcome{}, cerr // transient (D11 read error)
+	} else if conflict {
+		e.logger.Info("scheduler: issue fire codex+override conflict, skipping", "schedule", sched.ID.String(), "issue", iid)
+		return FireOutcome{Matched: 1, Skips: []Skip{{IssueIID: &iidCopy, Title: title, Reason: SkipCodexOverrideConflict, WebURL: webURL}}}, nil
+	}
+
 	waitOnLimit := sched.WaitOnLimit
 	var run store.Run
 	var err error
@@ -716,7 +736,7 @@ func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule,
 		// (nil ⇒ inherit the owner default live).
 		// PRD #1247 M6: the schedule's stored credential override is threaded here
 		// (nil ⇒ inherit the worker binding).
-		run, err = e.runs.CreateScheduledAutopilotRun(ctx, sched.UserID, repoID, iid, desc, &waitOnLimit, scheduleMrRework(sched), scheduleModel(sched), scheduleOverrideSubagentModel(sched), scheduleCredentialOverride(sched))
+		run, err = e.runs.CreateScheduledAutopilotRun(ctx, sched.UserID, repoID, iid, desc, &waitOnLimit, scheduleMrRework(sched), scheduleModel(sched), scheduleOverrideSubagentModel(sched), scheduleCredentialOverride(sched), scheduleHarness(sched))
 	} else {
 		// CreateScheduledRun is the non-auto-approve scheduled seam. Post-PRD #764 M1 it
 		// and the interactive CreateRun apply the SAME single uzi_label eligibility gate —
@@ -728,7 +748,7 @@ func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule,
 		// (nil ⇒ inherit the owner default live).
 		// trailing seed=nil (no seeded plan for a scheduled issue run); PRD #1247 M6 threads
 		// the schedule's stored credential override (nil ⇒ inherit the worker binding).
-		run, err = e.runs.CreateScheduledRun(ctx, sched.UserID, repoID, iid, desc, &waitOnLimit, scheduleMrRework(sched), scheduleModel(sched), scheduleOverrideSubagentModel(sched), nil, scheduleCredentialOverride(sched))
+		run, err = e.runs.CreateScheduledRun(ctx, sched.UserID, repoID, iid, desc, &waitOnLimit, scheduleMrRework(sched), scheduleModel(sched), scheduleOverrideSubagentModel(sched), nil, scheduleCredentialOverride(sched), scheduleHarness(sched))
 	}
 
 	if err == nil {
@@ -1112,6 +1132,43 @@ func scheduleCredentialOverride(s store.RunSchedule) *workersvc.CredentialOverri
 		o.SecretID = &id
 	}
 	return o
+}
+
+// scheduleHarness maps a schedule's pinned run_schedules.harness to the explicit *workersvc.Harness
+// the fire seams thread (PRD #1429 M2): a non-null pin is an EXPLICIT D11 selection; a NULL harness
+// (the common case — schedule create/edit has no harness picker yet) is nil ⇒ implicit resolution
+// at fire time.
+func scheduleHarness(s store.RunSchedule) *workersvc.Harness {
+	if !s.Harness.Valid || s.Harness.String == "" {
+		return nil
+	}
+	h := workersvc.Harness(s.Harness.String)
+	return &h
+}
+
+// codexOverrideConflict is the FIRE-TIME fail-closed gate for a null-harness schedule that carries
+// a stored Anthropic credential override (PRD #1429 M2, D5). The Anthropic override cannot ride a
+// Codex run and there is no cross-harness fallback, so: when the schedule is NOT pinned and DOES
+// carry an override, it resolves D11 for the schedule owner; if that now resolves to Codex, the
+// fire fails closed (returns conflict=true) — the caller records a legible codex_override_conflict
+// Skip, creates no run and leaves the stored override untouched. A pinned schedule is exempt (its
+// explicit harness is threaded and a pinned-Codex schedule can never store an Anthropic override —
+// the create/edit validator refuses it), as is a schedule with no override. A D11 read error is
+// returned as-is (transient), not silently treated as no-conflict.
+func (e *Scheduler) codexOverrideConflict(ctx context.Context, sched store.RunSchedule) (bool, error) {
+	if scheduleHarness(sched) != nil || scheduleCredentialOverride(sched) == nil {
+		return false, nil
+	}
+	h, err := e.runs.ResolveHarnessForUser(ctx, sched.UserID, nil)
+	if err != nil {
+		// Neither harness usable / read error: the fire would fail anyway, but that is not this
+		// gate's concern. Only a resolved Codex is a conflict; surface other errors as transient.
+		if errors.Is(err, workersvc.ErrNoUsableCredential) {
+			return false, nil
+		}
+		return false, err
+	}
+	return h == workersvc.HarnessCodex, nil
 }
 
 // truncateUTF8 returns the longest prefix of s that is at most n bytes AND does not split

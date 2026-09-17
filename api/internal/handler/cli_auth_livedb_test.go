@@ -141,7 +141,7 @@ func cookieReq(t *testing.T, router http.Handler, method, path, jwt, body string
 		r = strings.NewReader(body)
 	}
 	req := httptest.NewRequest(method, path, r)
-	req.AddCookie(&http.Cookie{Name: auth.AuthCookieName, Value: jwt})
+	req.AddCookie(&http.Cookie{Name: auth.AuthCookieName, Value: jwt}) //nolint:gosec // G124: test-only client cookie on an httptest request; Secure/HttpOnly/SameSite are response-side attributes irrelevant to a cookie a unit test sends.
 	req.Header.Set(auth.CSRFHeaderName, cliCSRFHeader(t, jwt))
 	if body != "" {
 		req.Header.Set("Content-Type", "application/json")
@@ -558,7 +558,7 @@ func TestCLICSRFBypassShapeLiveDB(t *testing.T) {
 
 	// Baseline: a valid cookie alone reaches the RequireUser handler (GET, no CSRF).
 	req := httptest.NewRequest(http.MethodGet, "/api/auth/me", nil)
-	req.AddCookie(&http.Cookie{Name: auth.AuthCookieName, Value: jwt})
+	req.AddCookie(&http.Cookie{Name: auth.AuthCookieName, Value: jwt}) //nolint:gosec // G124: test-only client cookie on an httptest request; Secure/HttpOnly/SameSite are response-side attributes irrelevant to a cookie a unit test sends.
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
@@ -569,7 +569,7 @@ func TestCLICSRFBypassShapeLiveDB(t *testing.T) {
 	// dispatch takes the bearer path (bogus token → 401) and must NOT fall back to the
 	// cookie path — which would be the CSRF bypass.
 	req = httptest.NewRequest(http.MethodGet, "/api/auth/me", nil)
-	req.AddCookie(&http.Cookie{Name: auth.AuthCookieName, Value: jwt})
+	req.AddCookie(&http.Cookie{Name: auth.AuthCookieName, Value: jwt}) //nolint:gosec // G124: test-only client cookie on an httptest request; Secure/HttpOnly/SameSite are response-side attributes irrelevant to a cookie a unit test sends.
 	req.Header.Set("Authorization", "Bearer uzc_not-a-real-token")
 	rec = httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
@@ -580,7 +580,7 @@ func TestCLICSRFBypassShapeLiveDB(t *testing.T) {
 	// The cookie path still enforces CSRF on writes through RequireUser: a valid cookie
 	// POST without the CSRF header is 403 (the unchanged RequireAuth pin).
 	req = httptest.NewRequest(http.MethodPost, "/api/runs/"+uuid.New().String()+"/inputs", nil)
-	req.AddCookie(&http.Cookie{Name: auth.AuthCookieName, Value: jwt})
+	req.AddCookie(&http.Cookie{Name: auth.AuthCookieName, Value: jwt}) //nolint:gosec // G124: test-only client cookie on an httptest request; Secure/HttpOnly/SameSite are response-side attributes irrelevant to a cookie a unit test sends.
 	rec = httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 	if rec.Code != http.StatusForbidden {
@@ -740,7 +740,7 @@ func TestCLIRevokeAllLiveDB(t *testing.T) {
 	jwt := cliMintJWT(t, pool, caller)
 	revokeAll := func() int {
 		req := httptest.NewRequest(http.MethodPost, "/api/me/cli-tokens/revoke-all", nil)
-		req.AddCookie(&http.Cookie{Name: auth.AuthCookieName, Value: jwt})
+		req.AddCookie(&http.Cookie{Name: auth.AuthCookieName, Value: jwt}) //nolint:gosec // G124: test-only client cookie on an httptest request; Secure/HttpOnly/SameSite are response-side attributes irrelevant to a cookie a unit test sends.
 		req.Header.Set(auth.CSRFHeaderName, cliCSRFHeader(t, jwt))
 		rec := httptest.NewRecorder()
 		router.ServeHTTP(rec, req)
@@ -881,6 +881,12 @@ func TestCLICRUDBearerRejectAndOwnerScopeLiveDB(t *testing.T) {
 func TestCLITaskRunsBearerReachableLiveDB(t *testing.T) {
 	_, router, pool := cliLiveDB(t)
 	user := cliSeedUser(t, pool, false)
+	// PRD #1429 M2: CreateTaskRun now resolves a real D11 harness at create time; give the
+	// user a usable Anthropic token (Claude, byte-identical) — orthogonal to the Bearer/cookie
+	// reachability under test.
+	cliMustExec(t, pool, `INSERT INTO user_secrets (id, user_id, kind, label, is_default, ciphertext, sealed_with)
+	          VALUES ($1, $2, 'anthropic_token', 'anthropic-default', true, $3, 'master')`,
+		uuid.New(), user, []byte("ct"))
 	uzc := cliMintToken(t, pool, user, clitoken.ScopeUser)
 	repoID := cliSeedOwnedRepo(t, pool, user)
 
@@ -910,7 +916,7 @@ func TestCLITaskRunsBearerReachableLiveDB(t *testing.T) {
 	// back to the cookie path — mirrors TestCLICSRFBypassShapeLiveDB's bogus-Bearer
 	// assertion, now for a write route.
 	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
-	req.AddCookie(&http.Cookie{Name: auth.AuthCookieName, Value: cliMintJWT(t, pool, user)})
+	req.AddCookie(&http.Cookie{Name: auth.AuthCookieName, Value: cliMintJWT(t, pool, user)}) //nolint:gosec // G124: test-only client cookie on an httptest request; Secure/HttpOnly/SameSite are response-side attributes irrelevant to a cookie a unit test sends.
 	req.Header.Set("Authorization", "Bearer uzc_not-a-real-token")
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -1022,7 +1028,7 @@ func TestCLIFilingRoutesStillEnforceCSRFLiveDB(t *testing.T) {
 		// A valid auth cookie, NO CSRF header: the cookie path must reject the write at
 		// the CSRF check (403), proving RequireUser preserves CSRF for the moved routes.
 		req := httptest.NewRequest(http.MethodPost, tc.path, nil)
-		req.AddCookie(&http.Cookie{Name: auth.AuthCookieName, Value: jwt})
+		req.AddCookie(&http.Cookie{Name: auth.AuthCookieName, Value: jwt}) //nolint:gosec // G124: test-only client cookie on an httptest request; Secure/HttpOnly/SameSite are response-side attributes irrelevant to a cookie a unit test sends.
 		rec := httptest.NewRecorder()
 		router.ServeHTTP(rec, req)
 		if rec.Code != http.StatusForbidden {

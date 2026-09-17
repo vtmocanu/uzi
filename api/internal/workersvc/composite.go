@@ -193,7 +193,7 @@ func (s *Service) DismissProposalForUser(ctx context.Context, userID, runID, pro
 // composite no longer computes any PRD-link bypass. It returns the CreateRun
 // sentinels unchanged (ErrNotPRDIssue, ErrActiveRunExists, …) plus the forge
 // sentinels above.
-func (s *Service) StartRunForUser(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, waitOnLimit, mrReworkEnabled *bool, force bool, seed *SeededPlan, credOverride *CredentialOverride) (store.Run, error) {
+func (s *Service) StartRunForUser(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, waitOnLimit, mrReworkEnabled *bool, force bool, seed *SeededPlan, explicit *Harness, rawOverride *RawCredentialOverride) (store.Run, error) {
 	if s.forges == nil {
 		return store.Run{}, ErrForgesUnavailable
 	}
@@ -216,13 +216,11 @@ func (s *Service) StartRunForUser(ctx context.Context, userID, repoID uuid.UUID,
 	// PRD #841 M2: the caller's per-run mr_rework override (CLI/API) threads straight
 	// through with no owner-default snapshot — the run inherits the owner default live
 	// when it is nil (D1).
-	// PRD #1247 M2: the caller's create-time credential override threads straight through.
-	// The web board start button and the Slack/web chat start card (StartRunForUserByPath)
-	// pass nil — no per-run token choice, so the run inherits the worker binding,
-	// byte-identical to a pre-#1247 create. The CreateRun handler resolves the override
-	// (validator + effective harness) BEFORE calling this, so an invalid choice never
-	// reaches the forge round-trip or the insert.
-	return s.CreateRun(ctx, userID, repo.ID, issueIID, issue.Description, waitOnLimit, mrReworkEnabled, force, seed, credOverride)
+	// PRD #1429 M2: explicit is the request's optional harness (D2), rawOverride the raw #1247
+	// credential override (D5). Both are threaded straight into CreateRun, which resolves D11 and
+	// validates the override INSIDE the create transaction against the resolved harness — the old
+	// pre-transaction effective-harness guess is gone. The web board / chat start card pass nil/nil.
+	return s.CreateRun(ctx, userID, repo.ID, issueIID, issue.Description, waitOnLimit, mrReworkEnabled, force, seed, explicit, rawOverride)
 }
 
 // StartRunForUserByPath is StartRunForUser keyed by the human repo PATH the chat
@@ -230,7 +228,7 @@ func (s *Service) StartRunForUser(ctx context.Context, userID, repoID uuid.UUID,
 // shows), not the internal repo id. It resolves the path to the user's own repo id
 // (ErrRepoNotFound for an unknown/foreign path) and delegates. Same gate, same
 // sentinels as the web start button.
-func (s *Service) StartRunForUserByPath(ctx context.Context, userID uuid.UUID, repoPath string, issueIID int64, waitOnLimit *bool, seed *SeededPlan) (store.Run, error) {
+func (s *Service) StartRunForUserByPath(ctx context.Context, userID uuid.UUID, repoPath string, issueIID int64, waitOnLimit *bool, seed *SeededPlan, explicit *Harness) (store.Run, error) {
 	repoID, err := s.q.GetRepoIDByPathForUser(ctx, store.GetRepoIDByPathForUserParams{Path: repoPath, UserID: userID})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -242,7 +240,7 @@ func (s *Service) StartRunForUserByPath(ctx context.Context, userID uuid.UUID, r
 	// per-run mr_rework override, so the run inherits the owner default live.
 	// false force (issue #856): chat/Slack has no --force, so it never bypasses the
 	// open-MR dedup.
-	// nil credOverride (PRD #1247 M2): the chat/Slack start-run card carries no per-run
-	// token choice, so the run inherits the worker binding.
-	return s.StartRunForUser(ctx, userID, repoID, issueIID, waitOnLimit, nil, false, seed, nil)
+	// explicit is the chat start_run card's optional harness (PRD #1429 M2 / D2); nil rawOverride:
+	// the start card carries no per-run token choice, so the run inherits the worker binding.
+	return s.StartRunForUser(ctx, userID, repoID, issueIID, waitOnLimit, nil, false, seed, explicit, nil /*rawOverride*/)
 }

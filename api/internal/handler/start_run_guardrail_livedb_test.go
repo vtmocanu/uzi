@@ -134,6 +134,11 @@ func newStartRunGuardFixture(ctx context.Context, t *testing.T) startRunGuardFix
 	wsvc := workersvc.New(q, box, workersvc.Params{})
 	wsvc.SetForges(svc)
 	wsvc.SetRepoGuard(pcheck)
+	// PRD #1429 M1/M2: a Codex resolution's binding freeze requires the atomic transaction
+	// seam; without it createRunAtomic fails closed (errCodexCreateRequiresTx). Wire the same
+	// live pool production uses (cmd/server/main.go's SetTxBeginner) so a genuine Codex
+	// resolution in a test (e.g. the credential-override harness-unsupported case) commits.
+	wsvc.SetTxBeginner(pool)
 
 	f := startRunGuardFixture{
 		pool:   pool,
@@ -152,6 +157,15 @@ func newStartRunGuardFixture(ctx context.Context, t *testing.T) startRunGuardFix
 		`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
 		 VALUES ($1, $2, 'gitlab', $3, 'uzi-bot', $4, $5)`,
 		f.connID, f.owner.ID, fg.server.URL, guardBotUserID, sealed)
+	// PRD #1429 M2: createRun now resolves a real D11 harness at create time (before the
+	// guardrail even runs, the guard blocks earlier regardless — this only affects the
+	// ALLOWED-path assertions). Give the owner a usable Anthropic token (Claude,
+	// byte-identical) so an allowed create actually reaches 201 rather than 422
+	// no_usable_credential, orthogonal to the guard/override behaviour under test.
+	mustExecT(ctx, t, pool,
+		`INSERT INTO user_secrets (id, user_id, kind, label, is_default, ciphertext, sealed_with)
+		 VALUES ($1, $2, 'anthropic_token', 'anthropic-default', true, $3, 'master')`,
+		uuid.New(), f.owner.ID, []byte("ct"))
 	return f
 }
 
