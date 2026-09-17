@@ -238,6 +238,10 @@ var runDTOKeys = []string{
 	// PRD #1247 M1: the per-run credential override, the pending held-state switch state,
 	// and the applied-switch attribution journal. All three non-omitempty.
 	"credential_override", "credential_switch", "credential_epochs",
+	// PRD #1391 M3 (D13): a finished outcome the run's worker is holding because the api
+	// permanently refused the terminal report ({reason} object or null). Non-omitempty,
+	// overlaid on the single-run detail read only.
+	"outcome_pending",
 }
 
 func TestRunDTOTags(t *testing.T) {

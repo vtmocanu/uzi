@@ -194,5 +194,8 @@
       "select_reason": "x",
       "applied_at": "2020-01-02T03:04:05Z"
     }
-  ]
+  ],
+  "outcome_pending": {
+    "reason": "x"
+  }
 }

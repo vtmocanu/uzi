@@ -532,6 +532,20 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 			dto.CredentialOverride.Label = &label
 		}
 	}
+	// PRD #1391 M3 (D13): surface a finished outcome the run's OWNING worker is holding
+	// because its api permanently refused the terminal report (a completion-permit
+	// mismatch, an unrecoverable message gap, or an exhausted terminal reserve), so the
+	// owner can see it and resolve it with a discarding cancel. Non-pure telemetry from
+	// the outbox tracker (not the run row), so it is overlaid here rather than in the pure
+	// runToDTO builder, and ONLY on this single-run detail path — the list/board never
+	// carries it. RunBlockedOutcome already dropped any unrecognised (untrusted) reason;
+	// OWNER-GATE on the reporting worker (the outbox runIndex is "last reporter wins" with
+	// no ownership check, so trust the depth only when the reporter IS the run's current
+	// owning worker, exactly as the health detector does).
+	if reason, reporter, ok := h.wsvc.RunBlockedOutcome(run.ID); ok &&
+		run.WorkerID.Valid && uuid.UUID(run.WorkerID.Bytes) == reporter {
+		dto.OutcomePending = &apitypes.OutcomePendingDTO{Reason: reason}
+	}
 	// PRD #37 M4-fix: resolve the owner's OWN-source roster here, on the detail read,
 	// so the plan-gate picker sources its "My agent templates" chips from exactly the
 	// roster the approve validator + worker use (allocation-resolved, lead stripped).

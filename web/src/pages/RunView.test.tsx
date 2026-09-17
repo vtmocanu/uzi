@@ -5344,3 +5344,120 @@ describe("PlanPanel proposed milestones (candidate list, PRD #122)", () => {
     expect(screen.queryByText("Proposed milestones")).toBeNull();
   });
 });
+
+// PRD #1391 Run B M3d (D13): the held-outcome banner + the discard-confirmation modal that
+// gates the cancel. Rendered whole-page (useRunStream mocked) so the CENTRAL cancel path is
+// exercised where it lives, covering every cancel entry point at once.
+describe("RunView — held-outcome banner + discard confirmation (PRD #1391 M3d)", () => {
+  function renderPage(over: Partial<Run>, submit: ReturnType<typeof vi.fn>, canSteer = true) {
+    mockUseRunStream.mockReturnValue({
+      run: run(over),
+      messages: [],
+      connected: true,
+      error: "",
+      submit,
+      refreshRun: vi.fn(),
+      inputs: [],
+      canSteer,
+    } as unknown as ReturnType<typeof useRunStream>);
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
+    return render(
+      <MemoryRouter initialEntries={["/runs/r1"]}>
+        <RunView />
+      </MemoryRouter>,
+    );
+  }
+
+  const HELD: Partial<Run> = {
+    status: "running",
+    started_at: "2026-01-01T00:00:00Z",
+    outcome_pending: { reason: "gap_unrecoverable" },
+  };
+
+  it("renders the banner naming the held outcome's reason in plain terms", async () => {
+    renderPage(HELD, vi.fn());
+    await screen.findByText("Add rate limiting");
+    expect(
+      screen.getByText(/Outcome held on the worker: some of the run's updates can't be recovered/i),
+    ).toBeTruthy();
+  });
+
+  it("does NOT render the banner when outcome_pending is null", async () => {
+    renderPage({ status: "running", started_at: "2026-01-01T00:00:00Z", outcome_pending: null }, vi.fn());
+    await screen.findByText("Add rate limiting");
+    expect(screen.queryByText(/Outcome held on the worker:/i)).toBeNull();
+  });
+
+  it("a cancel that returns the typed 409 opens the modal; confirming retries with the discard bit", async () => {
+    // The server refuses the first cancel with the typed 409 (no discard bit) and accepts the
+    // confirmed retry (discard bit set). submit is the ONLY cancel path, so this proves the
+    // whole central flow.
+    const submit = vi.fn(
+      async (
+        _kind: string,
+        _body?: string,
+        _selection?: unknown,
+        _override?: boolean,
+        discardPendingOutcome?: boolean,
+      ) => {
+        if (!discardPendingOutcome) {
+          throw new ApiError(409, "cancel refused", {
+            reason: "outcome_pending_confirmation_required",
+          });
+        }
+        return undefined;
+      },
+    );
+    renderPage(HELD, submit);
+    await screen.findByText("Add rate limiting");
+
+    // Trigger the cancel from the banner's own resolution button.
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /discard held outcome/i }));
+    });
+
+    // The typed 409 pops the modal that names what is lost, NOT a raw error banner.
+    await screen.findByText(
+      /This run has a finished outcome held on its worker that has not yet landed\. Cancelling will discard it\./i,
+    );
+
+    // Confirm → the cancel is retried WITH the discard bit.
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /discard and cancel/i }));
+    });
+    await waitFor(() => {
+      const last = submit.mock.calls[submit.mock.calls.length - 1];
+      expect(last[0]).toBe("cancel");
+      expect(last[4]).toBe(true);
+    });
+    // The modal closes on success.
+    await waitFor(() =>
+      expect(
+        screen.queryByText(/Cancelling will discard it\./i),
+      ).toBeNull(),
+    );
+    // The first (unconfirmed) cancel carried no discard bit.
+    expect(submit.mock.calls[0][4]).toBeFalsy();
+  });
+
+  it("'Keep waiting' closes the modal without cancelling", async () => {
+    const submit = vi.fn(async () => {
+      throw new ApiError(409, "cancel refused", {
+        reason: "outcome_pending_confirmation_required",
+      });
+    });
+    renderPage(HELD, submit);
+    await screen.findByText("Add rate limiting");
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /discard held outcome/i }));
+    });
+    await screen.findByText(/Cancelling will discard it\./i);
+    const callsBefore = submit.mock.calls.length;
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /keep waiting/i }));
+    });
+    await waitFor(() => expect(screen.queryByText(/Cancelling will discard it\./i)).toBeNull());
+    // No further cancel was issued by closing the modal.
+    expect(submit.mock.calls.length).toBe(callsBefore);
+  });
+});

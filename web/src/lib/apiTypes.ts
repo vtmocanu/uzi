@@ -2469,6 +2469,15 @@ export interface Run {
   credential_override?: CredentialOverride | null;
   credential_switch?: string | null;
   credential_epochs?: CredentialEpoch[];
+  /** PRD #1391 M3 (D13): a finished outcome the run's OWNING worker is holding because the
+   *  api permanently refused the terminal report — so the owner can see it and resolve it
+   *  with a discarding cancel. null (today's contract) for every run with no held outcome.
+   *  reason is one of a CLOSED, server-filtered set (completion_permit_mismatch |
+   *  gap_unrecoverable | reserve_exhausted); the api drops any other value, so the web maps
+   *  the known set to friendly text and renders an unrecognised value honestly. OPTIONAL for
+   *  the same api/web rollout skew as credential_override: a mid-deploy api pod predating
+   *  #1391 M3 omits the key. Overlaid on the single-run detail read only (never the list). */
+  outcome_pending?: { reason: string } | null;
 }
 
 /** CredentialOverride is a run's or schedule's per-run credential choice (PRD #1247 M1):

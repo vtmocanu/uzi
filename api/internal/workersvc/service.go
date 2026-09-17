@@ -2086,6 +2086,45 @@ func (s *Service) OutboxRunDepth(runID uuid.UUID) (OutboxEntry, uuid.UUID, bool)
 	return s.outbox.runDepth(runID)
 }
 
+// blockedOutcomeReasons is the CLOSED set of blocked-terminal reasons the api will
+// surface on a run (PRD #1391 M3, D13). The worker's heartbeat carries a free-text
+// blocked_reason, but the worker is untrusted (fact 8: a worker cannot forge health,
+// and the same posture applies to what it can put on the owner's run page), so only a
+// recognised member of this set is ever passed through — every other value is dropped.
+// The three members are the run-B permanent-refusal reasons: a completion-permit
+// mismatch, a message hole too large to fill (gap_unrecoverable), and an exhausted
+// terminal-journal reserve.
+var blockedOutcomeReasons = map[string]struct{}{
+	"completion_permit_mismatch": {},
+	"gap_unrecoverable":          {},
+	"reserve_exhausted":          {},
+}
+
+// RunBlockedOutcome reports the reason a run's OWNING worker is holding a finished
+// terminal outcome it could not land (PRD #1391 M3, D13), for the GetRun DTO overlay.
+// It reads the outbox tracker's per-run entry and returns its BlockedReason ONLY when
+// it is a recognised member of blockedOutcomeReasons — arbitrary worker text is
+// dropped (ok == false), so a hostile worker cannot inject a reason string onto the
+// owner's run page.
+//
+// It also returns the reporting worker id so the caller OWNER-GATES the overlay,
+// exactly as the health detector owner-gates OutboxRunDepth: runIndex is
+// "last reporter wins" with no ownership check (see outbox_tracker.go), so a
+// cross-tenant worker that knows a run's UUID could otherwise report a blocked reason
+// for it, and a reclaim-during-outage leaves runIndex pointing at the prior worker
+// until the TTL. The caller trusts the depth only when this id EQUALS the run's
+// current owning worker.
+func (s *Service) RunBlockedOutcome(runID uuid.UUID) (reason string, workerID uuid.UUID, ok bool) {
+	entry, reporter, found := s.outbox.runDepth(runID)
+	if !found {
+		return "", uuid.UUID{}, false
+	}
+	if _, recognised := blockedOutcomeReasons[entry.BlockedReason]; !recognised {
+		return "", uuid.UUID{}, false
+	}
+	return entry.BlockedReason, reporter, true
+}
+
 // Claim atomically claims the oldest claimable run for the worker's user and
 // assembles the full run payload (issue snapshot, repo + clone URL, decrypted
 // credentials, structured agent templates, config caps, and resume fields). A

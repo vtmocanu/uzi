@@ -684,6 +684,28 @@ type RunDTO struct {
 	// [] over null — so a client reads it unconditionally. Populated from
 	// run_credential_epochs in the DTO builder's enrichment path.
 	CredentialEpochs []CredentialEpochDTO `json:"credential_epochs"`
+	// OutcomePending is set (PRD #1391 M3, D13) when the run's OWNING worker holds a
+	// finished terminal outcome its api could not land — a terminal journal the api
+	// permanently refused — so the owner can see the held outcome and resolve it with a
+	// discarding cancel. null (today's contract) for every run with no held outcome, which
+	// is every run until a worker reports a blocked terminal journal. It is NON-PURE
+	// telemetry (the outbox tracker, not the run row), so it is overlaid in the GetRun
+	// enrichment path, never in the pure runToDTO builder, and only for the single-run
+	// detail read — the list/board never carries it. Reason is one of a CLOSED enum
+	// (completion_permit_mismatch | gap_unrecoverable | reserve_exhausted), filtered
+	// server-side so untrusted worker text can never reach the client.
+	OutcomePending *OutcomePendingDTO `json:"outcome_pending"`
+}
+
+// OutcomePendingDTO names a finished outcome held on the run's worker (PRD #1391 M3,
+// D13). Reason is one of the closed set the worker may report — completion_permit_mismatch
+// (the run's completion permit no longer matches), gap_unrecoverable (a message hole the
+// worker cannot fill bounds the terminal fence), reserve_exhausted (the terminal-journal
+// reserve is full) — mapped to friendly text by the web owner-resolution UI. The api drops
+// any other value (the worker is untrusted), so a client may render an unrecognised value
+// honestly but will never see one from this api.
+type OutcomePendingDTO struct {
+	Reason string `json:"reason"`
 }
 
 // CredentialOverrideDTO is a run's or schedule's per-run credential override (PRD #1247
