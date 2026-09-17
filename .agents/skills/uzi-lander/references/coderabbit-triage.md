@@ -1,26 +1,35 @@
 # Triaging CodeRabbit findings (assess ALL first, then execute unattended)
 
-This is the full runbook split out of `SKILL.md` (which carries a short pointer stub under
-the same heading). Paths like `scripts/...` and `resume-recipe.md` are relative to this
-skill directory (`.agents/skills/uzi-watcher/`), unchanged by the split.
+The full runbook behind the *findings* step of `SKILL.md`. Paths like `scripts/...` are
+relative to this skill directory (`.agents/skills/uzi-lander/`); `resume-recipe.md` lives in
+`.agents/skills/uzi-watcher/`. Greptile findings enter the same flow (gathered by
+`scripts/pr-findings.sh`, verified the same way).
 
-When findings exist across one or more in-flight PRs, do NOT fix them piecemeal and do NOT
-decide them yourself. **Gather every finding across every PR, verify each, present them as
-one batch, collect the user's decision on each, THEN do all the work unattended.** One
-decision gate, then hands-off — that is the whole point of batching, and it is the flow the
-user asked for here (2026-08-24): "first we assess all, gather all answers, then work".
+When findings exist across one or more in-flight PRs, do NOT fix them piecemeal. **Gather
+every finding across every PR, verify each, decide each, report the batch in ONE message,
+THEN do all the work unattended.** One report, then hands-off. Since 2026-09-17 the
+decisions are the lander's (full autonomy is the default); the user reads the report and
+overrides only if they care. The one finding class still put to the user is a fix that
+would change behaviour the plan or PRD specifies.
 
-Present each finding with: PR, file:line, CodeRabbit's severity, your **real / inherited /
-deliberate / mock-only** label, and a one-line recommendation. For each, the user picks one:
+Report each finding with: PR, file:line, the bot's severity, your **real / inherited /
+deliberate / mock-only** label, and your choice from these:
 
 - **Fix locally** — amend the PR's own `agent/issue-*` branch with your own credentials (an
   isolated worktree; `git add` only your files), re-run CI, then merge. Keeps it in the one
   PR / review / CI cycle. The right default for small, localized findings — **but first
-  confirm uzi's own `mr_rework` is not already fixing this MR** (see the *uzi may fix the
-  CodeRabbit findings ITSELF* runbook in `mr-rework.md`, this skill dir); on a default-enabled
-  instance it usually is, and a
-  local amend then collides with its push. Defer to it, review its fix, and reserve the
-  local amend for the cases it cannot handle.
+  confirm uzi's own `mr_rework` is not already fixing this MR** (see `mr-rework.md`, this
+  dir); on a default-enabled instance it usually is, and a local amend then collides with
+  its push. Defer to it, review its fix, and reserve the local amend for the cases it
+  cannot handle. Batch every fix for one PR into ONE push (each push is one CodeRabbit
+  review); `scripts/land-prep.sh` does the lease-guarded push.
+- **Rework on demand** — `uzi run rework RUN -m 'GUIDANCE'` (PRD #1202) starts ONE
+  `mr_rework` cycle on the SAME PR branch, skipping the per-MR cap, the quiet period, and
+  the one-active-rework guard. The right call for a **big** finding set (design-level,
+  many files, needs the plan's context) that is still this PR's to fix. Capture
+  `SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)` first, then `scripts/wait-mrrework.sh OWNER/REPO
+  PR 45 60 "$SINCE"`, then review its commit like any other diff (`mr-rework.md` step 3).
+  A 409 (exit 5) means disabled / not reworkable / already running / nothing new.
 - **Skip** — record the reason (deliberate behavior, a false positive, a base-realignment
   artifact, not worth it). A skip is a legitimate outcome, not a failure. **But a
   pre-existing / inherited finding that is a REAL bug is NOT a free skip:** fix it (in the PR
@@ -36,13 +45,13 @@ deliberate / mock-only** label, and a one-line recommendation. For each, the use
   divergences moved verbatim from the old file — filed as follow-up #1013 rather than skipped,
   keeping the split pure — while the HIGH CodeQL "clear-text storage" alert beside them was a
   true false positive (non-secret demo settings in `localStorage`), dismissed not fixed.
-- **Send back to uzi** — as a follow-up **issue** (a full gated run → a *separate* PR to
-  review/merge/CI-watch; right for a substantial change) or a **handoff task**
-  (`uzi handoff`). Know the tradeoffs before recommending it: a handoff pushes to a throwaway
-  `uzi/task/<id>` branch and so **cannot amend the PR under review**; an issue is a whole
-  extra PR cycle; and a `.github/workflows` finding **cannot go to uzi at all** (worker lacks
-  `workflow` scope). For tiny, well-localized findings a uzi round-trip is usually
-  disproportionate — say so.
+- **Send back to uzi as new work** — a follow-up **issue** (a full gated run → a *separate*
+  PR to review/merge/CI-watch; right for a change that is out of this PR's scope) or a
+  **handoff task** (`uzi handoff`). Know the tradeoffs: a handoff pushes to a throwaway
+  `uzi/task/<id>` branch and so **cannot amend the PR under review** (that is what `uzi run
+  rework` above is for); an issue is a whole extra PR cycle; and a `.github/workflows`
+  finding **cannot go to uzi at all** (worker lacks `workflow` scope). For tiny,
+  well-localized findings a uzi round-trip is disproportionate — say so.
 
   **A filed issue meant for UNATTENDED pickup must be sweepable AND self-contained**, or the
   nightly sweep silently never fires it (the sweep table is in `CLAUDE.local.md`; the failure
@@ -68,15 +77,16 @@ A finding on a **workflow file inherited from `main`** (base-realignment artifac
 PR's to fix at all — if it is worth doing, it is a separate CI-only PR (your token carries
 `workflow` scope), correctly attributed to the change that introduced it.
 
-**After you push a fix commit, CodeRabbit RE-REVIEWS the branch — wait for that re-review
-before merging.** Every push to an `agent/issue-*` branch retriggers CodeRabbit's `auto_review`,
-which posts an *incremental* review of just the new commits (async, a few minutes; the
-`CodeRabbit` PR check flips to pending then back to "Review completed"). So the merge sequence
-per fixed PR is: push fix → **wait for the incremental review of THAT commit to land** → confirm
-it is clean or only acknowledgements → then merge. Do not merge a PR whose CodeRabbit re-review is
-still pending after a fix push — the re-review can surface a defect in the fix itself, and merging
-first defeats the point of fixing. A re-review that raises something new re-enters this same triage
-flow (assess → decide → fix/skip), not an automatic merge.
+**After you push a fix commit, CodeRabbit RE-REVIEWS the branch.** Every push to an
+`agent/issue-*` branch retriggers CodeRabbit's `auto_review`, which posts an *incremental*
+review of just the new commits (async, a few minutes; the `CodeRabbit` PR check flips to
+pending then back to "Review completed"). Greptile does NOT re-review on its own: re-comment
+`@greptileai review` if you want its second pass. **Whether to wait for the re-review is
+the lander's call** (owner decision, 2026-09-17): wait when the fix changed logic or touched
+a trust boundary (the re-review can surface a defect in the fix itself); merge on green CI
+alone when it did not (docs, comments, renames, test names); ask when unsure and the user is
+present; and say which you did in the merge note. A re-review that raises something new
+re-enters this same triage flow (assess → decide → fix/skip), not an automatic merge.
 
 **Do NOT treat the `CodeRabbit` PR check flipping back to "Review completed" (`gh pr checks PR`
 showing CodeRabbit `pass`) as proof the re-review landed.** Measured 2026-08-28 on PR#756: the

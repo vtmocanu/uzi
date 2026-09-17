@@ -17,8 +17,9 @@ elsewhere:
   `docs/admin-settings.md#run-eligibility`. **Read those for how a label makes an issue
   fire**; do not hardcode the mechanics here (they are machine/instance-specific and
   drift). Live source of truth for the schedules is `uzi schedule list`.
-- **Sending an issue to uzi and driving it to a merged PR** is the **uzi-watcher**
-  skill. This skill stops at "queued for the sweep" or "hand to uzi-watcher".
+- **Sending an issue to uzi and steering its plan** is the **uzi-watcher** skill;
+  **landing the resulting PR** is **uzi-lander**. This skill stops at "queued for the
+  sweep" or "hand to uzi-watcher".
 
 ## Step 1 — Pick the issue
 

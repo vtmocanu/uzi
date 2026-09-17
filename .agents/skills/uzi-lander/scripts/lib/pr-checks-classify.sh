@@ -1,7 +1,7 @@
 # shellcheck shell=bash
-# pr-checks-classify.sh — the ONE `gh pr checks` classifier, sourced by both
-# watch-pr-ci.sh and watch-prs-ci.sh so a state-policy edit (what counts as a
-# failure vs pending vs terminal) cannot land in one watcher and not the other.
+# pr-checks-classify.sh — the ONE `gh pr checks` classifier, sourced by watch-prs-ci.sh
+# (and any future checks-based watcher) so a state-policy edit (what counts as a
+# failure vs pending vs terminal) has exactly one home.
 #
 # Source it, then call `classify <wait_cr>` with a `gh pr checks` dump on stdin.
 # wait_cr (default 0) is passed explicitly rather than read from a caller's env var,

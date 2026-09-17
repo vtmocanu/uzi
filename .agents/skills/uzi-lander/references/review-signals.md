@@ -1,0 +1,47 @@
+# Review-bot signals: what is pollable, per bot, per head
+
+Everything here is measured on this repo (PRs #1421, #1426, #1428, 2026-09-16/17, plus
+the earlier CodeRabbit measurements cited in `coderabbit-triage.md`). `scripts/watch-pr.sh`,
+`scripts/pr-findings.sh`, `scripts/takeover.sh` and `scripts/cr-rate-limit.sh` implement
+these; read this when you must hand-roll a check or extend a script.
+
+## CodeRabbit (auto on every PR against `main`; `.coderabbit.yaml`)
+
+| Surface | Endpoint | What it tells you |
+|---|---|---|
+| Commit status, context `CodeRabbit` | `repos/O/R/commits/<head>/status` → `.statuses[]` | The **only place CR says why it did not review**: `Review in progress`, `Review completed`, `Review rate limited`, `Review skipped: reviews are disabled for this base branch` / `147 files exceed the limit of 100` / `ignored keyword in the PR title`. `state` is `success` even when rate-limited: read the description. Absent = CR never touched this head. |
+| Review objects | `repos/O/R/pulls/N/reviews` | Signal (a): a `coderabbitai[bot]` review with `commit_id == head` proves a review of this head. The tally `Actionable comments posted: N` lives in the review body (a clean pass is an APPROVED review with an empty body; a COMMENTED tally-less review is *unconfirmed*, read its body). |
+| Walkthrough comment | `repos/O/R/issues/N/comments`, exactly one `coderabbitai[bot]` comment containing `<!-- walkthrough_start -->` | Signal (c): the `final_review_risk` block's ``up to `<short-sha>` `` names the last reviewed head; a zero-finding incremental posts no review object, so this is the signal that always fires. Parse only inside the block, fail closed on 0 or >1 comments. The same comment carries the **rate-limit block** (`rate limited by coderabbit.ai` … `Next included review available in N minutes`), relative to the comment's `updated_at`. |
+| Inline comments | `repos/O/R/pulls/N/comments` | Live finding = `line != null` and body without `Addressed in commit`. `line == null` = outdated. |
+| Equivalent head | two `compare` calls | Signal (d): a logic-free merge-in of the base plus regenerated artifacts needs no fresh review (#819); `watch-pr.sh` computes it fail-closed. |
+| Check-run `CodeRabbit` in `gh pr checks` | | Do not key on it: it reads `pass` for an earlier commit while the new head is unreviewed (PR #756). |
+
+**Rate limit, the three places the reset appears:** the walkthrough block above (free);
+the reply to the exact two-word `@coderabbitai rate limit` (`More reviews will be available
+in N minutes`, relative to the reply's `created_at`); nowhere on a bare `@coderabbitai
+review` while limited (it replies `Review rate limited`, no time). `@coderabbitai ratelimits`
+and plain English get "I cannot view the quota". Refill is adaptive to the org's 7-day volume.
+Renovate-authored PRs and `*(deps)` / `[skip-cr]` titles are not auto-reviewed and consume
+nothing; every push to any other open PR is one review, including uzi's `mr_rework` pushes.
+
+## Greptile (on demand only; `greptile.json` has `autoReview: []`)
+
+Trigger: a `@greptileai review` comment (also `@greptile review`), or the `Retrigger` link
+Greptile puts in the PR body. One credit per review. The check-run appears ~12 s later.
+
+| Surface | Endpoint | What it tells you |
+|---|---|---|
+| Check-run `Greptile Review`, app `greptile-apps` | `repos/O/R/commits/<head>/check-runs` | **The per-head signal.** `in_progress` while reviewing; `completed` with `output.summary` = `Greptile has reviewed the Pull Request.\n\nN files reviewed, M comments added`. Conclusion is `success` even with a P1 finding: read M. Absent = not triggered on this head. Durations seen: 35 files 2.5 min, 107 files 6 min. |
+| Review object | `pulls/N/reviews` | Only when M > 0: a `greptile-apps[bot]` COMMENTED review, empty body, `commit_id` = reviewed head. **Zero findings posts no review at all**, so the reviews endpoint reads clean-as-absent. |
+| Inline comments | `pulls/N/comments` | Findings carry a `<img alt="P1">` / `P2` badge; live = `line != null`. |
+| PR body | `pulls/N` `.body` | Greptile may rewrite the description between `<!-- greptile_comment -->` markers: `Confidence Score: N/5`, a summary, a mermaid diagram, and `<sub>Reviews (K) · Last reviewed commit: [...](…/commit/<full-sha>)</sub>`. Seen on 2 of 3 PRs, so a **secondary** confirmation only. The edit bumps the PR `updated_at`. |
+| Issue comments | | None from Greptile. |
+
+## Poll recipe (what the scripts do)
+
+1. Head SHA from `gh pr view --json headRefOid`; every signal is tested against it.
+2. CR: status description → pending / limited / skipped / absent; reviewed = (a) or (c) or (d).
+3. Greptile: check-run on head → absent / in_progress / completed(+M).
+4. Live findings = CR live + Greptile live, regardless of which bot the gate requires.
+5. Ready only when required CI is settled green, the required reviewer(s) reviewed this exact
+   head, live = 0, no `mr_rework` active, and the head re-reads unchanged (TOCTOU).
