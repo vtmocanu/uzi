@@ -149,6 +149,18 @@ class HistoryRewrittenError extends Error {
   }
 }
 
+/** PRD #1416 (MR-rework, finding 1) — a data-free unwind sentinel: the post-bridge secret scan
+ *  found a trusted secret in the now-pushable `P..B` range and has ALREADY terminally reported
+ *  push_secret_blocked (via reportPushSecretBlocked). Thrown from the ALIGN chain's fetchAndPush so
+ *  the enclosing align try/catch (which types HistoryRewrittenError) unwinds without pushing, and
+ *  caught in the outer finalize catch to STOP rather than re-report. Local, like HistoryRewrittenError. */
+class PushSecretBlockedSignal extends Error {
+  constructor() {
+    super("push_secret_blocked already reported by the post-bridge secret scan");
+    this.name = "PushSecretBlockedSignal";
+  }
+}
+
 /** PRD #1416 M3 — the outcome of {@link RunRunner.bridgeBareTrackingRefIfDivergent} at a
  *  publication boundary. "clean": P (and C) already ancestors of the tracking tip, nothing to do.
  *  "unknown": ancestry could not be read, so do NOT bridge and do NOT fail. "bridged": B was built
@@ -281,10 +293,20 @@ export function composeWorkflowScopeReason(paths: string[]): string {
  * not by slicing the whole string at the end. Exported for a direct cap unit test; the caller
  * still applies `.slice(0, MAX_FAILURE_REASON_LEN)` as a belt-and-braces net.
  */
-export function composePushSecretBlockedReason(findings: SecretFinding[]): string {
-  const prefix =
-    "This run's branch could not be pushed: it carries a secret GitHub Push Protection blocks " +
-    "(GH013). Offending: ";
+export function composePushSecretBlockedReason(
+  findings: SecretFinding[],
+  forgeType?: string,
+): string {
+  // PRD #1416 (MR-rework, finding 1): the post-bridge scan runs on EVERY forge, so a non-GitHub
+  // block must NOT cite "GitHub Push Protection"/"GH013" (there is no such backstop on
+  // GitLab/Forgejo). GitHub (or an omitted forge — the top-of-finalize GH013 caller) keeps the
+  // original wording so its existing callers + unit tests stay stable.
+  const isGitHub = forgeType === undefined || forgeType === "github";
+  const prefix = isGitHub
+    ? "This run's branch could not be pushed: it carries a secret GitHub Push Protection blocks " +
+      "(GH013). Offending: "
+    : "This run's branch could not be pushed: the pre-push secret scan detected a secret (a " +
+      "rewritten branch was bridged so it could publish). Offending: ";
   const suffix =
     ". The change is otherwise valid; a human can scrub the secret from the commit(s) and " +
     "land it. The diff is withheld because it may carry the detected secret; if a " +
@@ -2740,6 +2762,48 @@ export class RunRunner {
         { log: runLog, signal: boundarySignal },
       );
 
+    // PRD #1416 (MR-rework, finding 1): a bridge NEWLY makes a rewritten branch pushable (a plain
+    // rewritten push is non-fast-forward-rejected on every forge). The top-of-finalize scan ran on
+    // the divergent H with an unresolvable floor and failed OPEN; now that the tracking ref is B and
+    // P is an ancestor of B, P..B is the real, trustworthy push delta. Re-scan it on EVERY forge
+    // before pushing B — GitLab/Forgejo have no GH013 backstop, so this worker-side scan is their
+    // only gate. On a TRUSTED finding: report push_secret_blocked (no preserved_patch), no push.
+    // On untrusted/clean: fail open (unchanged; GH013 still backstops GitHub at the push catch).
+    const scanBridgedRangeAndBlock = async (scanBare: string): Promise<"blocked" | "ok"> => {
+      const scan = await this.git.secretScanRange(scanBare, trackingRef, result.branch, {
+        pat: claim.secrets.forge_pat,
+        cloneUrl: claim.repo.clone_url,
+        username: claim.secrets.forge_username,
+      });
+      if (scan.trusted && scan.findings.length > 0) {
+        const reason = composePushSecretBlockedReason(scan.findings, claim.repo.forge_type);
+        batcher.emit({
+          kind: "status",
+          agent: "worker",
+          payload: {
+            text: "the bridged branch carries a secret the pre-push scan detected; failing without pushing — the diff is withheld because it may carry the secret",
+          },
+        });
+        runLog.info(
+          "run failed: post-bridge secret scan found a secret in the P..B push delta; withholding diff",
+          {
+            run_id: runId,
+            findings: scan.findings.map((f) => ({ commit: f.commit, file: f.file, rule: f.ruleId })),
+          },
+        );
+        await closeBatcher();
+        await reportPushSecretBlocked(reason);
+        return "blocked";
+      }
+      if (!scan.trusted) {
+        runLog.warn(
+          "post-bridge secret scan: not trustworthy (broken/empty); pushing and relying on the GH013 remote backstop where it exists",
+          { run_id: runId },
+        );
+      }
+      return "ok";
+    };
+
     // PRD #974 M2 — the GH013 remote backstop. When a finalize push (the normal path OR an
     // align-path push) is rejected by GitHub Push Protection for a secret the pre-push gitleaks
     // scan missed (GitHub's pattern set is broader than gitleaks', and the two are not
@@ -2989,6 +3053,14 @@ export class RunRunner {
                 runLog,
               );
               if (o.kind === "failed") throw new HistoryRewrittenError(flight.publishedTip!);
+              // PRD #1416 (MR-rework, finding 1): re-scan the now-trusted P..B delta before pushing
+              // the bridged, aligned tip. On a trusted finding scanBridgedRangeAndBlock has already
+              // terminally reported push_secret_blocked, so throw the data-free unwind sentinel — the
+              // enclosing align try/catch and the outer finalize catch propagate it without pushing or
+              // re-reporting (mirroring how HistoryRewrittenError unwinds this same nested closure).
+              if (o.kind === "bridged" && (await scanBridgedRangeAndBlock(alignBarePath)) === "blocked") {
+                throw new PushSecretBlockedSignal();
+              }
               await pushToOrigin();
               alignPushed = true;
             };
@@ -3203,6 +3275,12 @@ export class RunRunner {
         await failHistoryRewritten(e.publishedTip);
         return;
       }
+      if (e instanceof PushSecretBlockedSignal) {
+        // PRD #1416 (MR-rework, finding 1): the align-path post-bridge scan already terminally
+        // reported push_secret_blocked inside fetchAndPush; unwind and stop (never re-report, never
+        // fall through to the plain-path push below).
+        return;
+      }
       throw e;
     }
 
@@ -3246,6 +3324,13 @@ export class RunRunner {
       );
       if (o.kind === "failed") {
         await failHistoryRewritten(flight.publishedTip!);
+        return;
+      }
+      // PRD #1416 (MR-rework, finding 1): a bridge just made this rewritten branch pushable, so
+      // re-scan the now-trusted P..B delta on EVERY forge before pushing. A trusted finding reports
+      // push_secret_blocked and STOPS (a direct return unwinds the whole finalize, like the
+      // failHistoryRewritten site above).
+      if (o.kind === "bridged" && (await scanBridgedRangeAndBlock(finalizeBarePath)) === "blocked") {
         return;
       }
       try {

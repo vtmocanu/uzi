@@ -286,6 +286,115 @@ describe("RunRunner — history_rewritten typed terminal (PRD #1416 M4)", () => 
   });
 });
 
+describe("RunRunner — post-bridge secret scan (PRD #1416 MR-rework)", () => {
+  // FIX finding 1 (P1 SECURITY): a bridge NEWLY makes a rewritten branch pushable, so the run
+  // re-scans the now-trusted P..B delta on EVERY forge before pushing B. A trusted finding blocks
+  // (push_secret_blocked, no preserved_patch, no push); on a gitlab/forgejo claim this worker-side
+  // scan is the ONLY gate (no GH013 backstop). bridgeToFloors is NEVER stubbed here — the
+  // rewritingExecutor produces a real divergent H that is bridged to a real B.
+  const leakFinding = () => ({
+    trusted: true as const,
+    findings: [{ commit: "deadbeef", file: "leaked.env", startLine: 1, ruleId: "generic-api-key" }],
+  });
+  /** A gitlab task claim with forge_type set (so composePushSecretBlockedReason picks the
+   *  forge-neutral wording, not the GitHub GH013 wording). */
+  const gitlabClaimTyped = (branch: string) =>
+    taskClaim(branch, {
+      open_mr: false,
+      repo: {
+        id: "r1",
+        url: "https://gitlab.example.test/org/repo",
+        clone_url: fx.originPath,
+        forge_type: "gitlab",
+      },
+    });
+  /** A stub that fails the FIRST call open (the github top-of-finalize scan) then returns a trusted
+   *  finding on every later call (the post-bridge scan). Returns a counter to assert both ran. */
+  const countingLeakStub = (): { calls: () => number } => {
+    let n = 0;
+    git.secretScanRange = (async () => {
+      n++;
+      return n === 1 ? { trusted: false, findings: [] } : leakFinding();
+    }) as typeof git.secretScanRange;
+    return { calls: () => n };
+  };
+
+  it("(GitLab, plain path) a trusted post-bridge finding fails push_secret_blocked, no push, forge-neutral reason", async () => {
+    const { gitlab } = fakeGitlab();
+    const branch = "feature/pb-gitlab-plain";
+    const P = publishBranch(branch);
+    // A gitlab claim never runs the github top scan, so this CONSTANT stub is hit ONLY by the
+    // post-bridge scan.
+    git.secretScanRange = (async () => leakFinding()) as typeof git.secretScanRange;
+    const claim = gitlabClaimTyped(branch);
+    await runner(rewritingExecutor({}), gitlab).execute(claim);
+
+    const statuses = statusesFor(claim.run_id);
+    assert.ok(!statuses.includes("completed"), "the run did not complete (blocked before the push)");
+    assert.strictEqual(gitIn(fx.originPath, ["rev-parse", branch]), P, "nothing was pushed (origin tip still P)");
+    const failed = failedBody(claim.run_id);
+    assert.strictEqual(failed.fail_origin, "push_secret_blocked");
+    assert.strictEqual(failed.preserved_patch, undefined, "no preserved_patch on a secret block");
+    const reason = failed.failure_reason ?? "";
+    assert.doesNotMatch(reason, /GH013/, "the gitlab reason is forge-neutral: no GH013");
+    assert.doesNotMatch(reason, /GitHub Push Protection/i, "the gitlab reason is forge-neutral: no GitHub Push Protection");
+    assert.match(reason, /pre-push secret scan detected a secret/i, "the reason cites the pre-push scan");
+  });
+
+  it("(GitHub, plain path) the post-bridge re-scan blocks a secret the top scan failed open on", async () => {
+    const { github } = fakeGitHub();
+    const branch = "feature/pb-github-plain";
+    const P = publishBranch(branch);
+    const counter = countingLeakStub(); // 1st call (top scan) fails open; 2nd (post-bridge) finds a secret
+    const claim = githubTaskClaim(branch, { open_mr: false });
+    await githubRunner(github, rewritingExecutor({})).execute(claim);
+
+    assert.ok(counter.calls() >= 2, "the post-bridge scan ran after the top scan failed open");
+    const failed = failedBody(claim.run_id);
+    assert.strictEqual(failed.fail_origin, "push_secret_blocked");
+    assert.strictEqual(failed.preserved_patch, undefined, "no preserved_patch on a secret block");
+    assert.ok(!statusesFor(claim.run_id).includes("completed"), "the run did not complete");
+    assert.strictEqual(gitIn(fx.originPath, ["rev-parse", branch]), P, "nothing was pushed");
+  });
+
+  it("(GitHub, align path) a trusted post-bridge finding blocks via the align path", async () => {
+    // main advances a workflow file → behind-on-workflows → the align chain engages; inside it
+    // fetchAndPush bridges, re-scans P..B, and on a trusted finding reports push_secret_blocked and
+    // throws the unwind sentinel (which the M4 wrap + outer catch stop without pushing).
+    commitToOriginMain({ ".github/workflows/ci.yml": CI_V1 }, "seed workflows");
+    const branch = "feature/pb-github-align";
+    const P = publishBranch(branch);
+    const { github } = fakeGitHub();
+    const counter = countingLeakStub();
+    const claim = githubTaskClaim(branch, { open_mr: false });
+    await githubRunner(github, rewritingExecutor({}, { ".github/workflows/ci.yml": CI_V2 })).execute(claim);
+
+    assert.ok(counter.calls() >= 2, "the post-bridge scan ran on the align path");
+    const failed = failedBody(claim.run_id);
+    assert.strictEqual(failed.fail_origin, "push_secret_blocked", "typed push_secret_blocked via the align path");
+    assert.notStrictEqual(failed.fail_origin, "finalize_base_align_conflict");
+    assert.strictEqual(failed.preserved_patch, undefined, "no preserved_patch on a secret block");
+    assert.ok(!statusesFor(claim.run_id).includes("completed"), "the run did not complete");
+    assert.strictEqual(gitIn(fx.originPath, ["rev-parse", branch]), P, "nothing was pushed");
+  });
+
+  it("(clean scan) a trusted post-bridge scan with no findings pushes B and completes", async () => {
+    const { gitlab } = fakeGitlab();
+    const branch = "feature/pb-clean";
+    const P = publishBranch(branch);
+    git.secretScanRange = (async () => ({ trusted: true, findings: [] })) as typeof git.secretScanRange;
+    const claim = gitlabClaimTyped(branch);
+    await runner(rewritingExecutor({}), gitlab).execute(claim);
+
+    assert.ok(statusesFor(claim.run_id).includes("completed"), "a clean post-bridge scan completes the run");
+    assert.notStrictEqual(
+      gitIn(fx.originPath, ["rev-parse", branch]),
+      P,
+      "the bridge B was pushed over P (the branch advanced)",
+    );
+  });
+});
+
 describe("composeHistoryRewrittenReason (PRD #1416 M4)", () => {
   it("names the published tip, points at the doc, and fits MAX_FAILURE_REASON_LEN", () => {
     const P = "0123456789abcdef0123456789abcdef01234567";
