@@ -10,13 +10,13 @@ import (
 // TestSkipReasonEnumIsHonest pins the Go side of the SkipReason contract internally
 // consistent (PRD #308 M3; PRD #590 M1 added vault_locked; PRD #764 retired the link-less skip;
 // issue #856 added open_mr_exists; PRD #1093 M1 added schedules_paused; PRD #1429 M2 added
-// codex_override_conflict): the closed set has exactly the nine expected members with no
-// duplicates, every benign seam sentinel maps into that set, an unrelated error maps to no
-// reason, and the reasons the seam does not map (fetch_failed is recorded at the sweep site,
-// already_running also at the prompt site, vault_locked at the self_improve site) are still
-// enumerated. The cross-language guard that the TS reason union has not drifted lives in
-// web/src/lib/scheduleSkipReasons.test.ts; this keeps the Go enum honest so that guard
-// has a trustworthy source to compare against.
+// codex_override_conflict; a PRD #1429 review fix added no_usable_credential): the closed set has
+// exactly the ten expected members with no duplicates, every benign seam sentinel maps into that
+// set, an unrelated error maps to no reason, and the reasons the seam does not map (fetch_failed
+// is recorded at the sweep site, already_running also at the prompt site, vault_locked at the
+// self_improve site) are still enumerated. The cross-language guard that the TS reason union has
+// not drifted lives in web/src/lib/scheduleSkipReasons.test.ts; this keeps the Go enum honest so
+// that guard has a trustworthy source to compare against.
 func TestSkipReasonEnumIsHonest(t *testing.T) {
 	want := map[SkipReason]bool{
 		SkipNotEligible:             true,
@@ -28,6 +28,7 @@ func TestSkipReasonEnumIsHonest(t *testing.T) {
 		SkipOpenMRExists:            true,
 		SkipCodexOverrideConflict:   true,
 		SkipSchedulesPaused:         true,
+		SkipNoUsableCredential:      true,
 	}
 
 	if len(AllSkipReasons) != len(want) {
@@ -71,6 +72,7 @@ func TestSkipReasonEnumIsHonest(t *testing.T) {
 		{"ErrDescriptionTooLarge", workersvc.ErrDescriptionTooLarge},
 		{"ErrOpenMRExists", workersvc.ErrOpenMRExists},
 		{"ErrCredentialOverrideHarnessUnsupported", workersvc.ErrCredentialOverrideHarnessUnsupported},
+		{"ErrNoUsableCredential", workersvc.ErrNoUsableCredential},
 	}
 	for _, c := range mapped {
 		got, ok := skipReasonForErr(c.err)

@@ -683,6 +683,14 @@ func (e *Scheduler) firePrompt(ctx context.Context, sched store.RunSchedule) (Fi
 	case errors.Is(err, workersvc.ErrRepoNotFound):
 		return FireOutcome{}, workersvc.ErrRepoNotFound // permanent
 	default:
+		// Review fix (PRD #1429): route through the shared classifier so a benign seam
+		// sentinel (e.g. ErrNoUsableCredential — D11 found neither harness usable) advances
+		// the schedule as a legible Skip instead of falling through as transient, which would
+		// tick-storm (re-fire, re-hit the forge, never advance next_fire_at).
+		if reason, ok := skipReasonForErr(err); ok {
+			e.logger.Info("scheduler: prompt fire skipped", "schedule", sched.ID.String(), "reason", err)
+			return FireOutcome{Matched: 1, Skips: []Skip{{Title: title, Reason: reason}}}, nil
+		}
 		return FireOutcome{}, err // transient
 	}
 }
@@ -757,8 +765,10 @@ func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule,
 	// Benign per-fire seam sentinel → a typed Skip; the schedule still advances (no
 	// tick-storm). skipReasonForErr maps the benign sentinels a scheduled fire can still
 	// return (ErrActiveRunExists → already_running, ErrNotPRDIssue → not_eligible,
-	// ErrDescriptionTooLarge → description_too_large). The old link-less skip reason was
-	// retired with the PRD-link gate (PRD #764).
+	// ErrDescriptionTooLarge → description_too_large, ErrNoUsableCredential →
+	// no_usable_credential — review fix, PRD #1429: neither harness usable for the owner is
+	// benign, not transient). The old link-less skip reason was retired with the PRD-link
+	// gate (PRD #764).
 	if reason, ok := skipReasonForErr(err); ok {
 		e.logger.Info("scheduler: issue fire skipped", "schedule", sched.ID.String(), "issue", iid, "reason", err)
 		return FireOutcome{Matched: 1, Skips: []Skip{{IssueIID: &iidCopy, Title: title, Reason: reason, WebURL: webURL}}}, nil

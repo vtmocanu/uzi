@@ -1272,6 +1272,7 @@ func TestSkipReasonForErr(t *testing.T) {
 		{workersvc.ErrActiveRunExists, SkipAlreadyRunning, true},
 		{workersvc.ErrDescriptionTooLarge, SkipDescriptionTooLarge, true},
 		{workersvc.ErrOpenMRExists, SkipOpenMRExists, true},
+		{workersvc.ErrNoUsableCredential, SkipNoUsableCredential, true},
 		{workersvc.ErrActivePromptExists, "", false},
 		{workersvc.ErrRepoNotFound, "", false},
 		{context.DeadlineExceeded, "", false},
@@ -1285,9 +1286,9 @@ func TestSkipReasonForErr(t *testing.T) {
 	// AllSkipReasons enumerates the full closed set (PRD #590 M1 added vault_locked;
 	// PRD #686 D10 added self_improve_mr_cap_reached; PRD #764 retired not_eligible;
 	// issue #856 added open_mr_exists; PRD #1093 M1 added schedules_paused; PRD #1429 M2 added
-	// codex_override_conflict).
-	if len(AllSkipReasons) != 9 {
-		t.Fatalf("AllSkipReasons has %d reasons, want 9", len(AllSkipReasons))
+	// codex_override_conflict; a PRD #1429 review fix added no_usable_credential).
+	if len(AllSkipReasons) != 10 {
+		t.Fatalf("AllSkipReasons has %d reasons, want 10", len(AllSkipReasons))
 	}
 }
 

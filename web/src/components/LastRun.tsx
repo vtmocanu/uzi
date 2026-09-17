@@ -33,10 +33,17 @@ const SKIP_REASON_TONES: Record<ScheduleSkipReason, BadgeTone> = {
   // issue #856: a prior completed run's MR is still open, so a fresh run is refused. Benign
   // and self-resolving like already_running — the cadence re-fires once the MR merges/closes.
   open_mr_exists: "neutral",
+  // PRD #1429 (D5): a null-harness schedule resolved to Codex at fire time while carrying a
+  // stored Anthropic credential override, which Codex cannot use. Actionable — the owner clears
+  // the override or the Codex default — so it reads amber like the other owner-fixable skips.
+  codex_override_conflict: "warning",
   // PRD #1093: the owner's user-level "pause all schedules" switch was on when this fire
   // came due. Benign and self-resolving — the cadence advanced as normal and re-fires on
   // resume, nothing replays (the explanatory detail-row copy is added in M4).
   schedules_paused: "neutral",
+  // PRD #1429 (D5): the owner has no usable credential for either harness at fire time, so
+  // D11 cannot resolve one. Actionable — the owner adds/repairs a credential — so it reads amber.
+  no_usable_credential: "warning",
 };
 
 // LastRunOutcome is the enriched "Last run" cell for a schedule that has a
