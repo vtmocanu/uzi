@@ -349,6 +349,14 @@ export class Worker {
     const active = new Set<Promise<void>>();
     let loggedAtCapacity = false;
     while (!signal.aborted) {
+      // PRD #1390 M4 (e2e ONLY): the env-gated drop-execution seam pauses claiming (via the
+      // shared registry latch) so a silently-dropped run can be observed sitting `queued`
+      // before any reclaim. isClaimPausedForE2E() is a constant `false` in production (nothing
+      // latches it), so this is a no-op there; the e2e clears it by recreating the agent.
+      if (this.activeRuns?.isClaimPausedForE2E()) {
+        await sleep(this.config.pollIntervalMs, signal);
+        continue;
+      }
       if (active.size >= cap) {
         // At capacity: defer the claim (never claim without a free slot) and wake
         // when a slot frees or after a poll. Log once per saturation episode so a

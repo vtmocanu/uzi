@@ -763,6 +763,22 @@ export const STUB_INFLIGHT_SENTINEL = "UZI_STUB_INFLIGHT";
 export const STUB_OUTBOX_SENTINEL = "UZI_STUB_OUTBOX";
 
 /**
+ * PRD #1390 M4: keeps a run parked in `running` (with `stalled` SUPPRESSED, via one held-open
+ * tool call) until the run is cancelled/shut down (`ctx.signal`) or a long ceiling elapses. The
+ * api-outage-readoption e2e needs a run that stays genuinely `running` across a stop-api /
+ * network-disconnect window and the reconciliation that follows (longer than STUB_INFLIGHT's
+ * one-shot 95s pause and, unlike it, abort-aware so a cancel frees the slot promptly). Off unless
+ * present; a normal run never holds. The ceiling is tunable via `healthPauseMs` so a unit test
+ * runs it instantly.
+ */
+const STUB_HOLD_SENTINEL = "UZI_STUB_HOLD";
+
+/** The STUB_HOLD ceiling: a generous upper bound (10 min) so the e2e's whole outage +
+ *  readoption window fits inside it; the hold normally ends earlier when `ctx.signal` aborts
+ *  (a cancel or a worker shutdown). Overridable via `healthPauseMs` for an instant unit test. */
+const STUB_HEALTH_HOLD_MS = 600_000;
+
+/**
  * Pause lengths for the health sentinels, in ms. STALL/INFLIGHT sit comfortably
  * above the 60s minimum health_stall_seconds the E2E sets, so the detector flags
  * (or, for in-flight, provably does NOT flag) the run before the stub moves on.
@@ -1420,6 +1436,40 @@ export class StubExecutor implements Executor {
         });
       }
       await sleep(loopHoldMs);
+      return;
+    }
+
+    if (has(STUB_HOLD_SENTINEL)) {
+      // PRD #1390 M4: hold the run OPEN in `running` for the whole outage/readoption window.
+      // One unmatched tool_use keeps the newest message an in-flight call, so `stalled` stays
+      // SUPPRESSED (working, not stuck) exactly like the INFLIGHT sentinel — but the wait is
+      // long AND abort-aware: it resolves the moment ctx.signal aborts (a cancel or worker
+      // shutdown), so a case's cleanup `cancel` frees the worker slot promptly instead of
+      // pinning it for the full ceiling. Close the tool out on exit so a non-aborted end (the
+      // ceiling elapsed) still lets the run complete cleanly.
+      const holdMs = override ?? STUB_HEALTH_HOLD_MS;
+      const id = "stub-hold-0";
+      ctx.emit({
+        kind: "tool_use",
+        agent: "worker",
+        payload: { id, name: "Bash", input: { command: "sleep infinity" } },
+      });
+      await new Promise<void>((resolve) => {
+        const sig = ctx.signal;
+        const timer = setTimeout(finish, holdMs);
+        function finish(): void {
+          clearTimeout(timer);
+          sig?.removeEventListener("abort", finish);
+          resolve();
+        }
+        if (sig?.aborted) return finish();
+        sig?.addEventListener("abort", finish, { once: true });
+      });
+      ctx.emit({
+        kind: "tool_result",
+        agent: "worker",
+        payload: { tool_use_id: id, content: "hold released", is_error: false },
+      });
       return;
     }
 

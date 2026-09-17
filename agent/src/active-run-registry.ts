@@ -28,6 +28,15 @@ export class ActiveRunRegistry {
    *  the first build returns 1). */
   private epoch = 0;
 
+  /** PRD #1390 M4 — e2e-ONLY claim-loop pause latch. Set by the runner's env-gated
+   *  drop-execution seam (runner.ts, reachable only when UZI_E2E_DROP_ON_SENTINEL is set),
+   *  read by the worker's claim loop so a silently-dropped run can be observed sitting
+   *  `queued` before any reclaim. Never touched in production (the seam that sets it is
+   *  off by default), so `isClaimPaused()` is a constant `false` there. Cleared only by a
+   *  fresh worker process (a new registry instance), which the e2e resume does by
+   *  recreating the agent. */
+  private claimPaused = false;
+
   /** Register a run as executing at `running`, at the generation it was claimed at.
    *  Idempotent per run id (re-registering, e.g. a promoted re-claim serialised behind an
    *  old park, overwrites the prior entry). */
@@ -51,6 +60,19 @@ export class ActiveRunRegistry {
   /** Number of live executions currently tracked (test/observability helper). */
   get size(): number {
     return this.runs.size;
+  }
+
+  /** PRD #1390 M4 (e2e ONLY): latch the claim-loop pause. Called by the runner's drop
+   *  seam, which only fires under UZI_E2E_DROP_ON_SENTINEL, so this is unreachable in
+   *  production. */
+  pauseClaimForE2E(): void {
+    this.claimPaused = true;
+  }
+
+  /** PRD #1390 M4 (e2e ONLY): whether the claim loop is paused by the drop seam. A
+   *  constant `false` in production (nothing ever calls {@link pauseClaimForE2E}). */
+  isClaimPausedForE2E(): boolean {
+    return this.claimPaused;
   }
 
   /** Whether this worker is CURRENTLY executing `runId` (PRD #1390 M3, blocker 7). Read

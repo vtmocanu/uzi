@@ -208,6 +208,27 @@ class StaleClaimError extends Error {
 }
 
 /**
+ * PRD #1390 M4 — the env-gated e2e DROP-EXECUTION seam signal. OFF unless the worker is
+ * started with `UZI_E2E_DROP_ON_SENTINEL=1` (inert in production); when on, a claim whose
+ * issue text carries {@link E2E_DROP_SENTINEL} is dropped right after its first `running`
+ * report, BEFORE the clone (no worktree, no recovery journal), to model a live worker that
+ * silently loses one execution: the flight ends with NO terminal report, so the run stays
+ * `running` for the api's heartbeat missing-run requeue (M2b) to reclaim after the fence, the
+ * snapshot entry is removed by the ordinary finally, and the claim loop is paused (via the
+ * shared registry) so the e2e can observe the requeued run before a reclaim. Local, thrown
+ * and caught entirely within this file, exactly like StaleClaimError. */
+class E2EDropExecutionError extends Error {
+  constructor() {
+    super("e2e drop-execution seam: ending flight with no terminal report");
+    this.name = "E2EDropExecutionError";
+  }
+}
+
+/** PRD #1390 M4: the issue-text sentinel the e2e drop-execution seam keys on (only when
+ *  UZI_E2E_DROP_ON_SENTINEL is set). Named like the stub sentinels; inert in production. */
+const E2E_DROP_SENTINEL = "UZI_STUB_DROP";
+
+/**
  * PRD #1247 M5b (BLOCKING-2/3 rework): a held-state credential switch could not be CONFIRMED, so
  * the flight must STOP without continuing in place — but, unlike StaleClaimError, it must RETAIN
  * all work (enterCredentialSwitch left the preserve flags SET). Thrown by ctx.attemptCredentialSwitch
@@ -1474,6 +1495,16 @@ export class RunRunner {
           );
         }
         await batcher.close().catch(() => undefined); // idempotent (enterCredentialSwitch may have drained)
+      } else if (err instanceof E2EDropExecutionError) {
+        // PRD #1390 M4 (e2e drop seam): end the flight with NO terminal report, mirroring the
+        // StaleClaimError arm. The run is left `running` (non-terminal) so the api's heartbeat
+        // missing-run requeue (M2b) reclaims it after the fence; the finally drops the snapshot
+        // entry and (with no clone) retires nothing. pauseClaimForE2E was already latched at the
+        // throw site. Reachable only under UZI_E2E_DROP_ON_SENTINEL.
+        runLog.info(
+          "e2e drop-execution seam: ending flight with no terminal report (run left running for the missing-run requeue)",
+        );
+        await batcher.close().catch(() => undefined);
       } else {
         await this.reportGenericFailure(claim, flight, err);
       }
@@ -4117,6 +4148,24 @@ export class RunRunner {
     });
     await reportState({ status: "running" });
     steering.start();
+
+    // PRD #1390 M4 — env-gated e2e DROP-EXECUTION seam. OFF unless UZI_E2E_DROP_ON_SENTINEL
+    // is set (so this whole block is inert in production). The run has just reported `running`
+    // (its status_since is now), and it is still listed at `running` in the active-run
+    // registry (executeClaim registered it before phaseClone). Ending the flight HERE — before
+    // ensureClone, so there is no worktree and no recovery journal to retire — models a live
+    // worker that silently loses one execution: no terminal report is sent (the run stays
+    // `running` for the api's heartbeat missing-run requeue to reclaim after the fence), the
+    // ordinary finally drops the snapshot entry, and the claim loop is paused so the e2e can
+    // observe the requeued run sitting `queued` before a reclaim. See E2EDropExecutionError.
+    if (
+      process.env.UZI_E2E_DROP_ON_SENTINEL === "1" &&
+      (claim.issue_description?.includes(E2E_DROP_SENTINEL) ||
+        claim.issue_title?.includes(E2E_DROP_SENTINEL))
+    ) {
+      this.snapshotRegistry?.pauseClaimForE2E();
+      throw new E2EDropExecutionError();
+    }
 
     // PRD #1392 M2: only `ensureClone` is wrapped in `withForgeRetry` (fact 4). When it exhausts
     // the schedule and rethrows the last raw git/forge error, a TRANSIENT verdict (a DNS blip, a
