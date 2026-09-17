@@ -1165,6 +1165,18 @@ describe("RunView header — the frozen per-schedule model badge (PRD #300)", ()
     await screen.findByText("Add rate limiting");
     expect(screen.queryByTitle(OVERRIDE_BADGE_TITLE)).toBeNull();
   });
+
+  // PRD #1429 M4a: the run's actual harness, in the same header cluster.
+  it("shows the Codex badge for a codex-harness run", async () => {
+    renderPage({ status: "completed", harness: "codex" });
+    expect(await screen.findByText("Codex")).toBeTruthy();
+  });
+
+  it("shows no harness badge for a claude-harness run (unmarked)", async () => {
+    renderPage({ status: "completed", harness: "claude" });
+    await screen.findByText("Add rate limiting");
+    expect(screen.queryByText("Codex")).toBeNull();
+  });
 });
 
 // PRD #320 M6: the queue-priority pill + the owner's Expedite/undo action in the run

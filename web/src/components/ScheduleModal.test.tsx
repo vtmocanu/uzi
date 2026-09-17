@@ -1329,3 +1329,133 @@ describe("the per-schedule credential picker (PRD #1247 M6/M7)", () => {
     expect(mockApi.updateSchedule.mock.calls[0]?.[1]?.credential_override).toBeUndefined();
   });
 });
+
+function codexKey(over: Partial<SecretMeta> = {}): SecretMeta {
+  return {
+    id: "sec-codex",
+    kind: "openai_api_key",
+    label: "codex-key",
+    is_default: true,
+    auto_eligible: false,
+    created_at: "2026-01-01T00:00:00Z",
+    updated_at: "2026-01-01T00:00:00Z",
+    ...over,
+  };
+}
+
+// PRD #1429 M4a: the per-schedule harness pin.
+describe("the per-schedule harness picker (PRD #1429 M4a)", () => {
+  it("hides the picker for a Claude-only user (today's flow, unchanged)", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken()] });
+    render(
+      <MemoryRouter>
+        <ScheduleModal editing={schedFixture()} onClose={vi.fn()} onSaved={vi.fn()} />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(mockApi.listSecrets).toHaveBeenCalled());
+    expect(screen.queryByLabelText("Harness for this schedule")).toBeNull();
+    // The Anthropic picker is unaffected.
+    expect(screen.getByLabelText("Anthropic token for this schedule")).toBeTruthy();
+  });
+
+  it("shows the picker once both harnesses are usable, seeded from the stored pin", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken(), codexKey()] });
+    render(
+      <MemoryRouter>
+        <ScheduleModal editing={schedFixture({ harness: "codex" })} onClose={vi.fn()} onSaved={vi.fn()} />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(mockApi.listSecrets).toHaveBeenCalled());
+    const picker = (await screen.findByLabelText("Harness for this schedule")) as HTMLSelectElement;
+    expect(picker.value).toBe("codex");
+  });
+
+  it("OMITS harness on an unrelated edit (seed-and-keep)", async () => {
+    mockApi.updateSchedule.mockResolvedValue(schedFixture());
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken(), codexKey()] });
+    render(
+      <MemoryRouter>
+        <ScheduleModal editing={schedFixture({ harness: "codex" })} onClose={vi.fn()} onSaved={vi.fn()} />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(mockApi.listSecrets).toHaveBeenCalled());
+
+    // Touch ONLY the model — the harness picker is left untouched.
+    fireEvent.change(screen.getByLabelText("Model (optional)"), { target: { value: "gpt-6-astra" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenCalled());
+
+    const input = mockApi.updateSchedule.mock.calls[0]?.[1];
+    expect(input?.model).toBe("gpt-6-astra");
+    expect(input?.harness).toBeUndefined();
+  });
+
+  it("sends null when the user explicitly clears a stored pin", async () => {
+    mockApi.updateSchedule.mockResolvedValue(schedFixture());
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken(), codexKey()] });
+    render(
+      <MemoryRouter>
+        <ScheduleModal editing={schedFixture({ harness: "codex" })} onClose={vi.fn()} onSaved={vi.fn()} />
+      </MemoryRouter>,
+    );
+    const picker = (await screen.findByLabelText("Harness for this schedule")) as HTMLSelectElement;
+    fireEvent.change(picker, { target: { value: "inherit" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenCalled());
+    expect(mockApi.updateSchedule.mock.calls[0]?.[1]?.harness).toBeNull();
+  });
+
+  it("sends the bare harness string when the user pins one", async () => {
+    mockApi.updateSchedule.mockResolvedValue(schedFixture());
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken(), codexKey()] });
+    render(
+      <MemoryRouter>
+        <ScheduleModal editing={schedFixture()} onClose={vi.fn()} onSaved={vi.fn()} />
+      </MemoryRouter>,
+    );
+    const picker = (await screen.findByLabelText("Harness for this schedule")) as HTMLSelectElement;
+    fireEvent.change(picker, { target: { value: "codex" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenCalled());
+    expect(mockApi.updateSchedule.mock.calls[0]?.[1]?.harness).toBe("codex");
+  });
+
+  it("is allowed (not hidden, not blocked) on a self_improve schedule, unlike credential_override", async () => {
+    mockApi.updateSchedule.mockResolvedValue(schedFixture({ target: "self_improve" }));
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken(), codexKey()] });
+    render(
+      <MemoryRouter>
+        <ScheduleModal
+          editing={schedFixture({ origin: "default", target: "self_improve", catalog_slug: "self-improve" })}
+          onClose={vi.fn()}
+          onSaved={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(mockApi.listSecrets).toHaveBeenCalled());
+    const picker = (await screen.findByLabelText("Harness for this schedule")) as HTMLSelectElement;
+    fireEvent.change(picker, { target: { value: "codex" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenCalled());
+    // Unlike credential_override (always undefined for self_improve), harness DOES ride.
+    expect(mockApi.updateSchedule.mock.calls[0]?.[1]?.harness).toBe("codex");
+    expect(mockApi.updateSchedule.mock.calls[0]?.[1]?.credential_override).toBeUndefined();
+  });
+
+  it("hides the Anthropic token picker and offers the Codex model vocabulary once harness=codex is picked", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken(), codexKey()] });
+    render(
+      <MemoryRouter>
+        <ScheduleModal editing={schedFixture()} onClose={vi.fn()} onSaved={vi.fn()} />
+      </MemoryRouter>,
+    );
+    const picker = (await screen.findByLabelText("Harness for this schedule")) as HTMLSelectElement;
+    fireEvent.change(picker, { target: { value: "codex" } });
+
+    expect(screen.queryByLabelText("Anthropic token for this schedule")).toBeNull();
+    expect(screen.getByText(/spends a Codex credential/)).toBeTruthy();
+    const modelSelect = screen.getByLabelText("Model (optional)") as HTMLSelectElement;
+    expect(within(modelSelect).getByRole("option", { name: "gpt-6-astra" })).toBeTruthy();
+    expect(within(modelSelect).queryByRole("option", { name: "opus" })).toBeNull();
+  });
+});

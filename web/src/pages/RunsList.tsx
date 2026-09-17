@@ -47,6 +47,7 @@ import { WorkerCustodyBadge } from "../components/WorkerCustodyBadge";
 import { RunHealthBadge } from "../components/RunHealthBadge";
 import { JudgeRunBadge } from "../components/JudgeRunBadge";
 import { RunCredential } from "../components/RunCredential";
+import { HarnessBadge } from "../components/HarnessBadge";
 import { stripUnsafeChars } from "../lib/safeText";
 import { formatUptimeSince } from "../lib/formatUptimeSince";
 import { anthropicTokenCount } from "../lib/hasToken";
@@ -428,6 +429,10 @@ export function RunRow({
             </Badge>
           ) : (
             <>
+              {/* PRD #1429 M4a: the run's actual harness. Claude stays unmarked (renders
+                  nothing); Codex is explicit — self-hiding, so a Claude-only fleet's list
+                  renders byte-identical to before this milestone. */}
+              <HarnessBadge harness={run.harness} />
               {/* PRD #122: compact milestone progress; a non-milestone run adds nothing.
                   PRD #265 M2: "not reported" (M–/N) reads distinct from a genuine 0/N. */}
               {msBadge && (

@@ -232,7 +232,10 @@ func onlyEnabled(req apitypes.ScheduleRequest) bool {
 		// PRD #1247 M6: a PRESENT credential_override (even an explicit inherit/null) makes
 		// this NOT an enabled-only PATCH, so it routes through the config path that validates
 		// and persists the override; `{enabled}` alone (override omitted) still short-circuits.
-		!req.CredentialOverride.Present
+		!req.CredentialOverride.Present &&
+		// PRD #1429 M4a: a PRESENT harness (even an explicit clear/null) likewise makes this
+		// NOT an enabled-only PATCH, mirroring credential_override above.
+		!req.Harness.Present
 }
 
 // mergeSchedule overlays the provided PATCH fields onto the current stored schedule,

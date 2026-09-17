@@ -341,14 +341,28 @@ func (h *Handler) patchDefaultScheduleConfig(w http.ResponseWriter, r *http.Requ
 		return store.RunSchedule{}, false
 	}
 
+	// PRD #1429 M4a: presence-aware harness pin on a DEFAULT-origin config PATCH, the SAME
+	// seed-and-keep/enum-validate as the user path. It is an owner-editable run option (not
+	// catalog-owned), so it is absent from the catalog-owned reject block above. Resolved
+	// BEFORE the credential override below so an explicit harness in the SAME request is what
+	// the override's effective-harness read sees.
+	harness := cur.Harness
+	harnessCols, harnessOK := h.resolveScheduleHarness(w, req)
+	if !harnessOK {
+		return store.RunSchedule{}, false
+	}
+	if !harnessCols.keep {
+		harness = harnessCols.value
+	}
 	// PRD #1247 M6: presence-aware credential override on a DEFAULT-origin config PATCH, the
 	// SAME validate/persist as the user path — OMITTED seeds-and-keeps the row's columns (an
 	// unrelated retime/model edit must not clear the override), PRESENT validates against the
-	// row's lane + effective harness and writes the resolved columns. It is an owner-editable
-	// run option (not catalog-owned), so it is absent from the catalog-owned reject block above.
+	// row's lane + effective harness (post this edit's pin, if any) and writes the resolved
+	// columns. It is an owner-editable run option (not catalog-owned), so it is absent from
+	// the catalog-owned reject block above.
 	credMode := cur.CredentialOverrideMode
 	credSecret := cur.CredentialOverrideSecretID
-	credCols, credOK := h.resolveScheduleCredentialOverride(w, r.Context(), user.ID, cur, cur.Target, req)
+	credCols, credOK := h.resolveScheduleCredentialOverride(w, r.Context(), user.ID, scheduleWithHarness(cur, harnessCols), cur.Target, req)
 	if !credOK {
 		return store.RunSchedule{}, false
 	}
@@ -405,6 +419,10 @@ func (h *Handler) patchDefaultScheduleConfig(w http.ResponseWriter, r *http.Requ
 	// customized. A cleared/inherit override (mode NULL) does not, so an exact-restore
 	// un-customizes. Mirrors the override_subagent_model / guidance precedents above.
 	customized = customized || credMode.Valid
+	// harness (PRD #1429 M4a) is likewise a run option, not a catalog field: its catalog
+	// baseline is no pin (NULL), so any stored pin diverges = customized. A cleared pin does
+	// not, so an exact-restore un-customizes. Mirrors credential_override's precedent above.
+	customized = customized || harness.Valid
 
 	final, err := h.q.UpdateRunSchedule(r.Context(), store.UpdateRunScheduleParams{
 		Target:                     cur.Target,
@@ -425,6 +443,7 @@ func (h *Handler) patchDefaultScheduleConfig(w http.ResponseWriter, r *http.Requ
 		Model:                      model,
 		OutputMode:                 outputMode,
 		OverrideSubagentModel:      ov,
+		Harness:                    harness,
 		CredentialOverrideMode:     credMode,
 		CredentialOverrideSecretID: credSecret,
 		Customized:                 customized,

@@ -79,12 +79,21 @@ func (h *Handler) CreateSchedule(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "could not compute the next fire time")
 		return
 	}
+	// PRD #1429 M4a: the create-time harness pin (D2). OMITTED ⇒ NULL/implicit with no
+	// validation; PRESENT ⇒ enum-validated and persisted. Resolved BEFORE the credential
+	// override below so an explicit harness in the SAME request is what the override's
+	// effective-harness read sees, not a stale/absent one.
+	harnessCols, ok := h.resolveScheduleHarness(w, req)
+	if !ok {
+		return
+	}
 	// PRD #1247 M6: the create-time credential override (D5). OMITTED ⇒ NULL/inherit with no
 	// validation; PRESENT ⇒ validate through the one validator against the new schedule's lane
 	// and effective harness (a NEW schedule has no run_schedules.harness row, so the harness is
-	// the user's default_harness else claude), then persist the resolved columns. A self_improve
-	// schedule with an explicit override 409s here (scheduleLaneKind → SelfImprove).
-	credCols, ok := h.resolveScheduleCredentialOverride(w, r.Context(), user.ID, store.RunSchedule{UserID: user.ID}, m.Target, req)
+	// this request's pin if one was just resolved, else the user's default_harness else claude),
+	// then persist the resolved columns. A self_improve schedule with an explicit override 409s
+	// here (scheduleLaneKind → SelfImprove).
+	credCols, ok := h.resolveScheduleCredentialOverride(w, r.Context(), user.ID, scheduleWithHarness(store.RunSchedule{UserID: user.ID}, harnessCols), m.Target, req)
 	if !ok {
 		return
 	}
@@ -111,6 +120,7 @@ func (h *Handler) CreateSchedule(w http.ResponseWriter, r *http.Request) {
 		OutputMode:                 outputModeColumn(m),
 		OverrideSubagentModel:      overrideSubagentModelColumn(m),
 		SiblingGroupID:             siblingGroup,
+		Harness:                    harnessCols.value,
 		CredentialOverrideMode:     credCols.mode,
 		CredentialOverrideSecretID: credCols.secretID,
 	})
@@ -219,14 +229,27 @@ func (h *Handler) PatchSchedule(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusBadRequest, "could not compute the next fire time")
 			return
 		}
+		// PRD #1429 M4a: presence-aware harness pin on a config PATCH. OMITTED ⇒ seed-and-keep
+		// the row's current pin; PRESENT ⇒ enum-validated and written. Resolved BEFORE the
+		// credential override below so an explicit harness in the SAME request is what the
+		// override's effective-harness read sees, not the stale pre-edit pin.
+		harness := cur.Harness
+		harnessCols, ok := h.resolveScheduleHarness(w, req)
+		if !ok {
+			return
+		}
+		if !harnessCols.keep {
+			harness = harnessCols.value
+		}
 		// PRD #1247 M6: presence-aware credential override on a config PATCH. OMITTED ⇒
 		// seed-and-keep the row's current columns (an unrelated retime/model edit must neither
 		// re-validate nor clear the stored override — like RepoID's keep-on-empty, NOT the
 		// blind-replace the OutputMode-style fields take); PRESENT ⇒ validate against the
-		// merged target's lane + the row's effective harness and write the resolved columns.
+		// merged target's lane + the row's effective harness (post this edit's pin, if any) and
+		// write the resolved columns.
 		credMode := cur.CredentialOverrideMode
 		credSecret := cur.CredentialOverrideSecretID
-		credCols, ok := h.resolveScheduleCredentialOverride(w, r.Context(), user.ID, cur, m.Target, req)
+		credCols, ok := h.resolveScheduleCredentialOverride(w, r.Context(), user.ID, scheduleWithHarness(cur, harnessCols), m.Target, req)
 		if !ok {
 			return
 		}
@@ -254,6 +277,7 @@ func (h *Handler) PatchSchedule(w http.ResponseWriter, r *http.Request) {
 			Model:                      modelColumn(m),
 			OutputMode:                 outputModeColumn(m),
 			OverrideSubagentModel:      overrideSubagentModelColumn(m),
+			Harness:                    harness,
 			CredentialOverrideMode:     credMode,
 			CredentialOverrideSecretID: credSecret,
 			// A user-origin row is never customized (that flag is default-only); preserve
@@ -605,4 +629,56 @@ func (h *Handler) resolveScheduleCredentialOverride(w http.ResponseWriter, ctx c
 		}
 	}
 	return cols, true
+}
+
+// ── harness pin (PRD #1429 M4a, Part A) ─────────────────────────────────────────
+
+// scheduleHarnessColumns is the resolved write for a schedule's harness pin, mirroring
+// scheduleCredentialColumns exactly. keep=true means the request OMITTED harness, so the
+// caller MUST leave the stored column untouched (seed-and-keep). Otherwise value is the
+// validated nullable column to write (zero-value NULL for an explicit clear-to-implicit).
+type scheduleHarnessColumns struct {
+	keep  bool
+	value pgtype.Text
+}
+
+// resolveScheduleHarness applies the presence-aware harness pin (PRD #1429 M4a, D2). When
+// harness was OMITTED (!Present) it returns keep=true and does NO validation — the caller
+// keeps the row's current column (or NULL on create). When PRESENT (any value, incl. an
+// explicit null) a non-null value is validated against the closed claude|codex enum (400
+// otherwise) and the resolved column is returned (NULL for an explicit clear). Unlike
+// resolveScheduleCredentialOverride, a harness pin is a SELECTION rather than a per-run
+// credential override, so it is allowed on every lane including self_improve — self-improve
+// creation resolves through the same D11 seam (M2), and D2/D3 describe a pin as orthogonal
+// to lane switchability; the one real conflict (a pinned-Codex schedule storing an Anthropic
+// override) is enforced by ordering this resolution BEFORE resolveScheduleCredentialOverride
+// and feeding it the post-edit harness (see CreateSchedule/PatchSchedule).
+func (h *Handler) resolveScheduleHarness(w http.ResponseWriter, req apitypes.ScheduleRequest) (scheduleHarnessColumns, bool) {
+	if !req.Harness.Present {
+		return scheduleHarnessColumns{keep: true}, true
+	}
+	if req.Harness.Value == nil {
+		return scheduleHarnessColumns{}, true // explicit clear: NULL = implicit D11
+	}
+	v := strings.TrimSpace(*req.Harness.Value)
+	switch workersvc.Harness(v) {
+	case workersvc.HarnessClaude, workersvc.HarnessCodex:
+	default:
+		httpx.Error(w, http.StatusBadRequest, "harness must be one of: claude, codex")
+		return scheduleHarnessColumns{}, false
+	}
+	return scheduleHarnessColumns{value: pgtype.Text{String: v, Valid: true}}, true
+}
+
+// scheduleWithHarness returns a copy of sched with Harness set to the POST-EDIT value
+// described by cols (keep leaves it as-is). Passing this — rather than the pre-edit row —
+// into resolveScheduleCredentialOverride's scheduleEffectiveHarness read is what makes an
+// explicit `{"harness":"codex","credential_override":{...}}` in the SAME request 422 rather
+// than silently validating the override against the stale pre-edit harness.
+func scheduleWithHarness(sched store.RunSchedule, cols scheduleHarnessColumns) store.RunSchedule {
+	if cols.keep {
+		return sched
+	}
+	sched.Harness = cols.value
+	return sched
 }

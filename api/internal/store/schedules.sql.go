@@ -563,12 +563,12 @@ INSERT INTO run_schedules (
     user_id, repo_id, target, issue_iid, labels, prompt,
     timing, cron_expr, run_at, timezone, next_fire_at,
     auto_approve, wait_on_limit, mr_rework_enabled, enabled, max_issues, guidance, model, output_mode, override_subagent_model,
-    sibling_group_id, credential_override_mode, credential_override_secret_id
+    sibling_group_id, harness, credential_override_mode, credential_override_secret_id
 ) VALUES (
     $1, $2, $3, $4, $5, $6,
     $7, $8, $9, $10, $11,
     $12, $13, $14, $15, $16, $17, $18, $19, $20,
-    $21, $22, $23
+    $21, $22, $23, $24
 )
 RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id, mr_rework_enabled, output_mode, harness, credential_override_mode, credential_override_secret_id
 `
@@ -595,6 +595,7 @@ type CreateRunScheduleParams struct {
 	OutputMode                 pgtype.Text        `json:"output_mode"`
 	OverrideSubagentModel      bool               `json:"override_subagent_model"`
 	SiblingGroupID             pgtype.UUID        `json:"sibling_group_id"`
+	Harness                    pgtype.Text        `json:"harness"`
 	CredentialOverrideMode     pgtype.Text        `json:"credential_override_mode"`
 	CredentialOverrideSecretID pgtype.UUID        `json:"credential_override_secret_id"`
 }
@@ -605,6 +606,11 @@ type CreateRunScheduleParams struct {
 // firing code needs (sweep candidate issues, active-run guard).
 // Insert an owner-supplied schedule. Nullable columns ride sqlc.narg; server-managed
 // columns (id, status, last_fired_at, created_at, updated_at) take their defaults.
+// harness (PRD #1429 M4a, D2) is the schedule's per-run harness pin, sqlc.narg — NULL =
+// implicit (D11 resolves at fire time), 'claude'/'codex' = an explicit selection frozen onto
+// every fired run (M2 already honors a stored pin; this is the write path). The handler
+// validates the enum before insert; clone/add-repo copy the source row's column so a
+// derived row never drops the pin, mirroring credential_override below exactly.
 // credential_override_mode / credential_override_secret_id (PRD #1247 M6) are the
 // schedule's per-run credential override (D5), both sqlc.narg — NULL/NULL = inherit,
 // byte-identical to a pre-#1247 schedule. The handler validates + resolves the pair
@@ -633,6 +639,7 @@ func (q *Queries) CreateRunSchedule(ctx context.Context, arg CreateRunSchedulePa
 		arg.OutputMode,
 		arg.OverrideSubagentModel,
 		arg.SiblingGroupID,
+		arg.Harness,
 		arg.CredentialOverrideMode,
 		arg.CredentialOverrideSecretID,
 	)
@@ -1050,6 +1057,7 @@ SET cron_expr     = $1,
     guidance      = NULL,
     output_mode   = $8,
     override_subagent_model = false,
+    harness       = NULL,
     credential_override_mode = NULL,
     credential_override_secret_id = NULL,
     next_fire_at  = $9,
@@ -1089,6 +1097,9 @@ type ResetDefaultScheduleParams struct {
 // credential_override_mode / credential_override_secret_id (PRD #1247 M6) are cleared to NULL
 // (inherit): a default now carries an owner-editable per-run credential override, so a Reset
 // must drop it back to the catalog baseline (inherit), same as guidance/override_subagent_model.
+// harness (PRD #1429 M4a) is likewise cleared to NULL (implicit D11 at fire time): a default
+// now carries an owner-editable harness pin, so a Reset drops it back to the catalog baseline
+// (no pin), same as credential_override_mode/secret_id above.
 // Written as SQL literals (no param) because the catalog baseline is always inherit.
 // next_fire_at is recomputed in Go from the catalog cron+timezone and passed in.
 func (q *Queries) ResetDefaultSchedule(ctx context.Context, arg ResetDefaultScheduleParams) (RunSchedule, error) {
@@ -1339,12 +1350,13 @@ SET target        = $1,
     model         = $16,
     output_mode   = $17,
     override_subagent_model = $18,
-    credential_override_mode = $19,
-    credential_override_secret_id = $20,
-    customized    = $21,
+    harness       = $19,
+    credential_override_mode = $20,
+    credential_override_secret_id = $21,
+    customized    = $22,
     status        = 'active',
     updated_at    = now()
-WHERE id = $22 AND user_id = $23
+WHERE id = $23 AND user_id = $24
 RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id, mr_rework_enabled, output_mode, harness, credential_override_mode, credential_override_secret_id
 `
 
@@ -1367,6 +1379,7 @@ type UpdateRunScheduleParams struct {
 	Model                      pgtype.Text        `json:"model"`
 	OutputMode                 pgtype.Text        `json:"output_mode"`
 	OverrideSubagentModel      bool               `json:"override_subagent_model"`
+	Harness                    pgtype.Text        `json:"harness"`
 	CredentialOverrideMode     pgtype.Text        `json:"credential_override_mode"`
 	CredentialOverrideSecretID pgtype.UUID        `json:"credential_override_secret_id"`
 	Customized                 bool               `json:"customized"`
@@ -1404,6 +1417,7 @@ func (q *Queries) UpdateRunSchedule(ctx context.Context, arg UpdateRunSchedulePa
 		arg.Model,
 		arg.OutputMode,
 		arg.OverrideSubagentModel,
+		arg.Harness,
 		arg.CredentialOverrideMode,
 		arg.CredentialOverrideSecretID,
 		arg.Customized,

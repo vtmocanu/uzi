@@ -3,11 +3,13 @@ import { Link, useNavigate, useParams } from "react-router-dom";
 import { api, isHttpsUrl, preferForgeUrl, type IssueDetail, type RunListItem, type SecretMeta } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
 import { useAsyncData } from "../lib/useAsyncData";
-import { hasAnthropicToken } from "../lib/hasToken";
+import { hasAnthropicToken, hasAnyCodexCredential, isCodexUsable } from "../lib/hasToken";
 import { startRunGate } from "../lib/runStream";
 import { startRunWithCredential } from "../lib/startRun";
 import { INHERIT_SELECTION, type CredentialSelection } from "../lib/credentialOverride";
+import { bothHarnessesUsable, INHERIT_HARNESS, type HarnessSelection } from "../lib/harnessSelection";
 import { TokenPicker } from "../components/TokenPicker";
+import { HarnessPicker } from "../components/HarnessPicker";
 import { activeRunInHistory, effectiveRunStatus, isStoppedRun, mrChipState, runStatusTone } from "../lib/runBadge";
 import { mergeRequestUrl, projectWebUrlFromIssue } from "../lib/forgeUrls";
 import { chipLabels } from "../lib/labelChips";
@@ -62,11 +64,16 @@ export function IssueView() {
   // PRD #1247 M7: the token the run will spend, chosen before Start run. Default
   // inherit (shown explicitly) so an untouched start follows the worker binding.
   const [credential, setCredential] = useState<CredentialSelection>(INHERIT_SELECTION);
+  // PRD #1429 M4a: the harness the run will start on, chosen before Start run. Default
+  // inherit (the picker is shown only when both harnesses are usable — D2), so an
+  // untouched start follows the server's D11 resolver exactly as before this milestone.
+  const [harness, setHarness] = useState<HarnessSelection>(INHERIT_HARNESS);
   // PRD #1247: this component is reused across route-param changes without remounting (the
   // data effect below keys on [repoId, iidNum] and refetches), so reset the picked
   // credential to inherit when the route identity changes (no-op at mount).
   useEffect(() => {
     setCredential(INHERIT_SELECTION);
+    setHarness(INHERIT_HARNESS);
   }, [repoId, iidNum]);
 
   const { data, loading, error: loadError, reload } = useAsyncData(
@@ -81,7 +88,11 @@ export function IssueView() {
       return {
         runs,
         hasWorker: workers.length > 0,
+        // PRD #1429 M4a, D3: harness-aware credential facts. claudeUsable/hasToken stay
+        // the pre-M4a Anthropic-only check; codexUsable/hasCodexCredential are new.
         hasToken: hasAnthropicToken(secrets),
+        codexUsable: isCodexUsable(secrets),
+        hasCodexCredential: hasAnyCodexCredential(secrets),
         // Pass the already-loaded tokens to the picker so it need not re-fetch.
         tokens: secrets.filter((s: SecretMeta) => s.kind === "anthropic_token"),
       };
@@ -92,15 +103,21 @@ export function IssueView() {
   const runs = data?.runs ?? [];
   const hasWorker = data?.hasWorker ?? false;
   const hasToken = data?.hasToken ?? false;
+  const codexUsable = data?.codexUsable ?? false;
+  const hasCodexCredential = data?.hasCodexCredential ?? false;
   const tokens = data?.tokens ?? [];
+  // D2: the harness control appears only when BOTH harnesses are usable — a
+  // single-harness user (Claude-only or Codex-only) sees no picker at all.
+  const showHarnessPicker = bothHarnessesUsable(hasToken, codexUsable);
 
   const startRun = async () => {
     if (!issue) return;
     setError("");
     setStarting(true);
-    // The shared helper carries the chosen credential override and preserves it across
-    // the open-MR force retry (issue #856). onSettled keeps IssueView's pre-#1247
-    // behaviour: clear the starting flag, clear the error, and reload.
+    // The shared helper carries the chosen credential override AND harness, and
+    // preserves both across the open-MR force retry (issue #856). onSettled keeps
+    // IssueView's pre-#1247 behaviour: clear the starting flag, clear the error, and
+    // reload.
     await startRunWithCredential(repoId, issue.iid, credential, {
       // encodeURIComponent the id: per-call-site open-redirect hardening (see
       // safeNextPath in Login.tsx). A no-op for today's UUID ids.
@@ -111,7 +128,7 @@ export function IssueView() {
         setError("");
         reload();
       },
-    });
+    }, harness);
   };
 
   // PRD #764, #767 M5. The detail page drives its Start/Promote affordance off the
@@ -142,7 +159,10 @@ export function IssueView() {
     ? startRunGate({
         closed: issue.closed,
         hasWorker,
-        hasToken,
+        claudeUsable: hasToken,
+        codexUsable,
+        hasCodexCredential,
+        harness,
         activeRunExists: activeRunInHistory(runs),
       })
     : null;
@@ -324,19 +344,38 @@ export function IssueView() {
               DOES show Start run. */}
           {!issue.closed && isEligible && gate && (
             <div className="flex flex-wrap items-end gap-3">
+              {/* PRD #1429 M4a: choose the harness the run starts on, shown ONLY when
+                  both harnesses are usable (D2) — a single-harness user never sees this
+                  redundant picker. */}
+              {showHarnessPicker && (
+                <Field label="Harness" htmlFor="start-run-harness">
+                  <HarnessPicker
+                    id="start-run-harness"
+                    label="Harness for this run"
+                    className="h-9 w-40 text-sm"
+                    value={harness}
+                    onChange={setHarness}
+                    disabled={starting}
+                  />
+                </Field>
+              )}
               {/* PRD #1247 M7: choose the token the run spends before starting it. Inherit
-                  (the default, shown explicitly) follows the worker's binding. */}
-              <Field label="Anthropic token" htmlFor="start-run-token">
-                <TokenPicker
-                  id="start-run-token"
-                  label="Anthropic token for this run"
-                  className="h-9 w-56 text-sm"
-                  value={credential}
-                  onChange={setCredential}
-                  tokens={tokens}
-                  disabled={!gate.enabled || starting}
-                />
-              </Field>
+                  (the default, shown explicitly) follows the worker's binding. Hidden when
+                  the run is explicitly starting on Codex — a Codex run spends a Codex
+                  credential, never an Anthropic one, so the picker would be noise. */}
+              {harness !== "codex" && (
+                <Field label="Anthropic token" htmlFor="start-run-token">
+                  <TokenPicker
+                    id="start-run-token"
+                    label="Anthropic token for this run"
+                    className="h-9 w-56 text-sm"
+                    value={credential}
+                    onChange={setCredential}
+                    tokens={tokens}
+                    disabled={!gate.enabled || starting}
+                  />
+                </Field>
+              )}
               <div>
                 <Button
                   variant={gate.enabled ? "primary" : "ghost"}

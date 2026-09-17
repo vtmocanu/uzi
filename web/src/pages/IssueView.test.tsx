@@ -361,6 +361,58 @@ describe("IssueView Start gate (PRD #764)", () => {
     await waitFor(() => expect(startBtn().disabled).toBe(false));
   });
 
+  // PRD #1429 M4a, D2: the harness picker appears ONLY when the user has a usable
+  // credential for BOTH harnesses — a single-harness (Claude-only) user's flow stays
+  // byte-identical to today, with no redundant picker.
+  it("hides the harness picker for a Claude-only user (today's flow, unchanged)", async () => {
+    setAuth();
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
+    mockApi.listSecrets.mockResolvedValue({ secrets: [aToken()] });
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["uzi"], has_prd_link: false }) });
+    renderIssueView();
+
+    await screen.findByText("A small typo fix");
+    await screen.findByRole("button", { name: /start run/i });
+    expect(screen.queryByLabelText("Harness for this run")).toBeNull();
+    // The Anthropic picker is still there — unaffected by the harness feature.
+    expect(screen.getByLabelText("Anthropic token for this run")).toBeTruthy();
+  });
+
+  it("shows the harness picker once BOTH harnesses are usable, defaulting to inherit", async () => {
+    setAuth();
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
+    mockApi.listSecrets.mockResolvedValue({
+      secrets: [aToken(), { ...aToken(), id: "sec-codex", kind: "openai_api_key" }],
+    });
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["uzi"], has_prd_link: false }) });
+    renderIssueView();
+
+    await screen.findByText("A small typo fix");
+    const picker = (await screen.findByLabelText("Harness for this run")) as HTMLSelectElement;
+    expect(picker.value).toBe("inherit");
+  });
+
+  it("sends the picked harness on Start and hides the Anthropic picker once Codex is chosen", async () => {
+    setAuth();
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
+    mockApi.listSecrets.mockResolvedValue({
+      secrets: [aToken(), { ...aToken(), id: "sec-codex", kind: "openai_api_key" }],
+    });
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["uzi"], has_prd_link: false }) });
+    mockApi.createRun.mockResolvedValue({ run: { id: "run-codex-1" } as unknown as Run });
+    renderIssueView();
+
+    await screen.findByText("A small typo fix");
+    const picker = (await screen.findByLabelText("Harness for this run")) as HTMLSelectElement;
+    fireEvent.change(picker, { target: { value: "codex" } });
+    // Once harness=codex is chosen, the Anthropic picker (irrelevant to a Codex run) hides.
+    expect(screen.queryByLabelText("Anthropic token for this run")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: /start run/i }));
+    await waitFor(() => expect(mockApi.createRun).toHaveBeenCalled());
+    expect(mockApi.createRun).toHaveBeenCalledWith("repo-1", 7, undefined, undefined, "codex");
+  });
+
   // Issue #856 M3: a completed prior run that still owns an open MR makes the
   // server refuse a fresh run with a coded 409 (issue_has_open_mr). Start catches
   // it, confirms (the message names the MR), and retries with force on confirm.

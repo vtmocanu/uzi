@@ -57,6 +57,7 @@ import { CIFixRunHeader } from "../components/CIFixRunHeader";
 import { RecoveryArchivesPanel } from "../components/RecoveryArchives";
 import { RunIssueRef } from "../components/RunIssueRef";
 import { RunCredential } from "../components/RunCredential";
+import { HarnessBadge } from "../components/HarnessBadge";
 import {
   CredentialEpochList,
   RunCredentialOverride,
@@ -1953,6 +1954,10 @@ export function RunView() {
                   null for a run with no frozen list, so a pre-#122 run shows only the
                   iteration badge — unchanged. */}
               <MilestoneBadge run={run} />
+              {/* PRD #1429 M4a: the run's actual harness. Claude stays unmarked (renders
+                  nothing); Codex is explicit. Placed ahead of the model badge — which
+                  harness executed the run is more fundamental than which model within it. */}
+              <HarnessBadge harness={run.harness} />
               {/* Which Anthropic credential this run spent (PRD #111 M1). Here in
                   the header rather than beside the usage panel because it must show
                   for every claimed run, and the usage panel only appears once a run

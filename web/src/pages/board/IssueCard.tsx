@@ -2,7 +2,9 @@ import { Link } from "react-router-dom";
 import { isHttpsUrl, preferForgeUrl, type Card as CardData, type SecretMeta } from "../../lib/api";
 import type { StartRunGate } from "../../lib/runStream";
 import { INHERIT_SELECTION, type CredentialSelection } from "../../lib/credentialOverride";
+import { INHERIT_HARNESS, type HarnessSelection } from "../../lib/harnessSelection";
 import { TokenPicker } from "../../components/TokenPicker";
+import { HarnessPicker } from "../../components/HarnessPicker";
 import {
   canOpenRunView,
   effectiveRunStatus,
@@ -79,6 +81,9 @@ export function IssueCard({
   tokens,
   credential = INHERIT_SELECTION,
   onCredentialChange,
+  showHarnessPicker = false,
+  harness = INHERIT_HARNESS,
+  onHarnessChange,
   fixCiBusy,
   onFixCi,
   uziLabel,
@@ -141,6 +146,13 @@ export function IssueCard({
   tokens?: SecretMeta[];
   credential?: CredentialSelection;
   onCredentialChange?: (next: CredentialSelection) => void;
+  // PRD #1429 M4a: the per-card harness choice, shown beside Start run ONLY when the
+  // board says both harnesses are usable (D2) — a single-harness user never sees a
+  // redundant picker. Defaults false/inherit so the direct-render tests need not supply
+  // them and a card outside the feature renders exactly as before.
+  showHarnessPicker?: boolean;
+  harness?: HarnessSelection;
+  onHarnessChange?: (next: HarnessSelection) => void;
   fixCiBusy: boolean;
   onFixCi: () => void;
   // PRD #764. isEligible drives the treatment and the affordances: a card carrying the
@@ -509,10 +521,25 @@ export function IssueCard({
         !card.closed &&
         isEligible && (
           <div className="mt-2.5 space-y-1.5">
+            {/* PRD #1429 M4a: choose the harness this card's run starts on, shown ONLY
+                when the board says both harnesses are usable (D2) AND it wires the
+                change handler — a single-harness user never sees this redundant
+                picker. */}
+            {showHarnessPicker && onHarnessChange && (
+              <HarnessPicker
+                label={`Harness for #${card.iid}`}
+                className="h-8 w-full text-xs"
+                value={harness}
+                onChange={onHarnessChange}
+                disabled={!gate.enabled || starting}
+              />
+            )}
             {/* PRD #1247 M7: choose the token the run spends before starting it. Inherit
                 (the default, shown explicitly) follows the worker's binding. Rendered only
-                when the board wires the change handler. */}
-            {onCredentialChange && (
+                when the board wires the change handler, and hidden once this card is
+                explicitly starting on Codex — a Codex run never spends an Anthropic
+                credential, so the picker would be noise. */}
+            {onCredentialChange && harness !== "codex" && (
               <TokenPicker
                 label={`Anthropic token for #${card.iid}`}
                 className="h-8 w-full text-xs"
