@@ -1594,8 +1594,20 @@ export function RunView() {
   // of surfacing the raw error, and the modal's confirm retries with discardPendingOutcome
   // true. Any other error surfaces on the page banner exactly as today.
   const [confirmDiscardOutcome, setConfirmDiscardOutcome] = useState(false);
+  // A MODAL-LOCAL error for the discard-confirmation modal. A failure of the confirmed
+  // discard retry must be shown INSIDE the modal: the page-level actionErr <Alert> renders
+  // behind the modal's `fixed inset-0 z-50` overlay, so surfacing it there on a high-stakes
+  // destructive flow leaves the owner looking at an open modal with no feedback. Cleared on a
+  // fresh confirm attempt (below) and when the modal closes (closeDiscardModal).
+  const [discardOutcomeErr, setDiscardOutcomeErr] = useState("");
+  const closeDiscardModal = () => {
+    setConfirmDiscardOutcome(false);
+    setDiscardOutcomeErr("");
+  };
   const cancelRun = async (discardPendingOutcome = false): Promise<boolean> => {
     setActionErr("");
+    // A fresh attempt clears the modal-local error so a stale reason never lingers under a retry.
+    setDiscardOutcomeErr("");
     setBusy(true);
     try {
       await submit("cancel", "", undefined, undefined, discardPendingOutcome);
@@ -1608,7 +1620,14 @@ export function RunView() {
         setConfirmDiscardOutcome(true);
         return false;
       }
-      setActionErr(errorMessage(e, "Action failed"));
+      // A non-409 failure of the CONFIRMED discard retry (modal open) is shown inside the
+      // modal — the page-level <Alert> is hidden behind the overlay — and the modal stays open
+      // so the owner can retry or back out. Any other cancel entry point surfaces on the page.
+      if (discardPendingOutcome) {
+        setDiscardOutcomeErr(errorMessage(e, "Action failed"));
+      } else {
+        setActionErr(errorMessage(e, "Action failed"));
+      }
       return false;
     } finally {
       setBusy(false);
@@ -2061,9 +2080,13 @@ export function RunView() {
           </p>
           <p className="mt-1 text-xs text-muted">
             The run finished on its worker, but that outcome has not reached uzi yet.
-            {canSteer
-              ? " Stopping the run discards the held outcome — you will be asked to confirm."
-              : " The run's owner can discard it by stopping the run."}
+            {/* A terminal run's outcome is already resolved, so the stop-to-discard action no
+                longer applies — drop the now-meaningless sentence rather than dangle it with no
+                button (the resolve button below is gated out for a terminal run too). */}
+            {!isTerminalRun(run.status) &&
+              (canSteer
+                ? " Stopping the run discards the held outcome — you will be asked to confirm."
+                : " The run's owner can discard it by stopping the run.")}
           </p>
           {canSteer && !isTerminalRun(run.status) && (
             <div className="mt-2">
@@ -2489,7 +2512,7 @@ export function RunView() {
       {confirmDiscardOutcome && (
         <Modal
           label="Discard the held outcome?"
-          onClose={() => setConfirmDiscardOutcome(false)}
+          onClose={closeDiscardModal}
           closeOnBackdrop={!busy}
         >
           <div className="my-8 w-full max-w-md overflow-hidden rounded-2xl border border-edge-strong bg-surface shadow-2xl">
@@ -2498,26 +2521,24 @@ export function RunView() {
             </div>
             <div className="space-y-3 px-5 py-5 text-sm text-muted">
               <p>
-                This run has a finished outcome held on its worker that has not yet landed.
-                Cancelling will discard it.
+                This run finished on its worker, but its result never reached uzi. Discarding it
+                cancels the run and throws that finished result away — this can&rsquo;t be undone.
               </p>
               {run.outcome_pending && (
                 <p className="text-xs">
                   Held because {outcomePendingReasonLabel(run.outcome_pending.reason)}.
                 </p>
               )}
+              {/* The confirmed retry's failure surfaces HERE, not on the page banner behind the
+                  overlay. The modal stays open so the owner sees why and can retry or back out. */}
+              {discardOutcomeErr && <p className="text-xs text-danger">{discardOutcomeErr}</p>}
             </div>
             <div className="flex items-center justify-end gap-2 border-t border-edge bg-ink/40 inset-panel px-5 py-3.5">
-              <Button
-                variant="ghost"
-                size="sm"
-                disabled={busy}
-                onClick={() => setConfirmDiscardOutcome(false)}
-              >
+              <Button variant="ghost" size="sm" disabled={busy} onClick={closeDiscardModal}>
                 Keep waiting
               </Button>
               <Button
-                variant="danger"
+                variant="dangerSolid"
                 size="sm"
                 disabled={busy}
                 onClick={() => cancelRun(true)}

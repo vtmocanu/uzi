@@ -5374,6 +5374,10 @@ describe("RunView — held-outcome banner + discard confirmation (PRD #1391 M3d)
     outcome_pending: { reason: "gap_unrecoverable" },
   };
 
+  // A stable substring of the modal body copy that names the concrete loss (avoids the
+  // apostrophe/em-dash so the regex stays plain). Presence == the modal is open.
+  const MODAL_BODY = /Discarding it cancels the run and throws that finished result away/i;
+
   it("renders the banner naming the held outcome's reason in plain terms", async () => {
     renderPage(HELD, vi.fn());
     await screen.findByText("Add rate limiting");
@@ -5417,9 +5421,7 @@ describe("RunView — held-outcome banner + discard confirmation (PRD #1391 M3d)
     });
 
     // The typed 409 pops the modal that names what is lost, NOT a raw error banner.
-    await screen.findByText(
-      /This run has a finished outcome held on its worker that has not yet landed\. Cancelling will discard it\./i,
-    );
+    await screen.findByText(MODAL_BODY);
 
     // Confirm → the cancel is retried WITH the discard bit.
     await act(async () => {
@@ -5431,11 +5433,7 @@ describe("RunView — held-outcome banner + discard confirmation (PRD #1391 M3d)
       expect(last[4]).toBe(true);
     });
     // The modal closes on success.
-    await waitFor(() =>
-      expect(
-        screen.queryByText(/Cancelling will discard it\./i),
-      ).toBeNull(),
-    );
+    await waitFor(() => expect(screen.queryByText(MODAL_BODY)).toBeNull());
     // The first (unconfirmed) cancel carried no discard bit.
     expect(submit.mock.calls[0][4]).toBeFalsy();
   });
@@ -5451,13 +5449,82 @@ describe("RunView — held-outcome banner + discard confirmation (PRD #1391 M3d)
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: /discard held outcome/i }));
     });
-    await screen.findByText(/Cancelling will discard it\./i);
+    await screen.findByText(MODAL_BODY);
     const callsBefore = submit.mock.calls.length;
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: /keep waiting/i }));
     });
-    await waitFor(() => expect(screen.queryByText(/Cancelling will discard it\./i)).toBeNull());
+    await waitFor(() => expect(screen.queryByText(MODAL_BODY)).toBeNull());
     // No further cancel was issued by closing the modal.
     expect(submit.mock.calls.length).toBe(callsBefore);
+  });
+
+  it("the destructive confirm uses the solid danger variant, not the soft one", async () => {
+    const submit = vi.fn(async () => {
+      throw new ApiError(409, "cancel refused", {
+        reason: "outcome_pending_confirmation_required",
+      });
+    });
+    renderPage(HELD, submit);
+    await screen.findByText("Add rate limiting");
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /discard held outcome/i }));
+    });
+    await screen.findByText(MODAL_BODY);
+    // dangerSolid (bg-danger) is the "confirmed-destructive" style; the soft `danger`
+    // variant (bg-danger/10) is reserved for routine deletes and must not be used here.
+    const confirm = screen.getByRole("button", { name: /discard and cancel/i });
+    expect(confirm.className).toContain("bg-danger");
+    expect(confirm.className).not.toContain("bg-danger/10");
+  });
+
+  it("a non-409 discard-retry failure renders INSIDE the modal and keeps it open", async () => {
+    // The first (unconfirmed) cancel is refused with the typed 409 → modal opens. The
+    // confirmed retry then fails with a plain 500, which must surface in the modal body — the
+    // page-level <Alert> renders behind the `fixed inset-0 z-50` overlay and would be invisible.
+    const submit = vi.fn(
+      async (
+        _kind: string,
+        _body?: string,
+        _selection?: unknown,
+        _override?: boolean,
+        discardPendingOutcome?: boolean,
+      ): Promise<undefined> => {
+        if (!discardPendingOutcome) {
+          throw new ApiError(409, "cancel refused", {
+            reason: "outcome_pending_confirmation_required",
+          });
+        }
+        throw new ApiError(500, "worker unreachable");
+      },
+    );
+    renderPage(HELD, submit);
+    await screen.findByText("Add rate limiting");
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /discard held outcome/i }));
+    });
+    await screen.findByText(MODAL_BODY);
+
+    // Confirm → the retry throws a non-409 error.
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /discard and cancel/i }));
+    });
+
+    // The reason is shown IN the modal (which stays open), not on the page banner.
+    await screen.findByText("worker unreachable");
+    expect(screen.getByText(MODAL_BODY)).toBeTruthy();
+    // The page-level actionErr banner is NOT used for this failure — the modal owns it.
+    // (Only the modal-local copy of the message exists.)
+    expect(screen.getAllByText("worker unreachable")).toHaveLength(1);
+
+    // A fresh confirm clears the stale modal-local error. Point submit at success this time.
+    submit.mockImplementation(async () => undefined);
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /discard and cancel/i }));
+    });
+    await waitFor(() => expect(screen.queryByText("worker unreachable")).toBeNull());
+    // …and the modal closes on the now-successful retry.
+    await waitFor(() => expect(screen.queryByText(MODAL_BODY)).toBeNull());
   });
 });
