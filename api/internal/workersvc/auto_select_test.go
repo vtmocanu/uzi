@@ -117,7 +117,7 @@ func newAutoFixture(t *testing.T) autoFixture {
 
 func (f autoFixture) claim(t *testing.T) *ClaimPayload {
 	t.Helper()
-	payload, err := f.svc.Claim(context.Background(), f.worker)
+	payload, err := f.svc.Claim(context.Background(), f.worker, nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -485,7 +485,7 @@ func TestAutoCandidateQueryErrorFailsTheClaim(t *testing.T) {
 	f := newAutoFixture(t)
 	f.fs.autoCandidatesErr = errors.New("connection reset")
 
-	_, err := f.svc.Claim(context.Background(), f.worker)
+	_, err := f.svc.Claim(context.Background(), f.worker, nil)
 	if err == nil {
 		t.Fatal("a failed candidate query produced no error; it must not look like an empty pool")
 	}
@@ -651,7 +651,7 @@ func TestAutoDoesNotRetryOnALockedVault(t *testing.T) {
 
 	payload, err := svc.Claim(context.Background(), store.Worker{
 		ID: uuid.New(), UserID: owner, AnthropicBindMode: BindModeAuto,
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}

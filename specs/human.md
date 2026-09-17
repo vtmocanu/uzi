@@ -795,6 +795,14 @@ Tracked as GitHub issue vtmocanu/uzi#1349; PRD at `prds/1349-recovery-custody-ha
 
 - An owner can see retained unpublished committed work, recover an available archive, and explicitly discard one exact held source only after a warning distinguishes recoverable work from a possible only copy. [AI-synced 2026-09-14, #1349]
 
+## Feature #1390 — Api outage does not disturb a run on a still-live worker
+
+Tracked as GitHub issue vtmocanu/uzi#1390; PRD at `prds/1390-outage-requeue-readoption.md`.
+
+- An api outage does not disturb a run executing on a still-live worker: within one worker heartbeat of the api's return each such run is restored to the exact status it held (running, or waiting at its plan/question gate), without spending its re-queue budget or opening a new custody hold. [user, #1390]
+- A worker that has genuinely died still has its runs re-queued after the stale window, and failed only after a second window. [user, #1390]
+- Each worker reports which runs it is executing and in which phase, visible in `uzi worker list` / `uzi admin workers`. [user, #1390]
+
 ## Startup admin seed
 
 - Seed an admin user from env at startup (`UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME`) so the user survives DB wipes.

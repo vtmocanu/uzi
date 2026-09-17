@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -73,7 +74,7 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 					version = "-"
 				}
 				rows = append(rows, []string{
-					w.ID, cellText(w.Name), statusCell(w), uptimeCell(w), version, upgradeCell(w), bindModeCell(w), outboxCell(w),
+					w.ID, cellText(w.Name), statusCell(w), uptimeCell(w), version, upgradeCell(w), bindModeCell(w), reportedRunsCell(w), outboxCell(w),
 				})
 			}
 			// VERSION is here because docs/run-auto-stopped.md's first remedy for an
@@ -92,7 +93,11 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 			// worker rode out). "-" in the steady state where nothing is queued, so a healthy
 			// fleet reads a clean column; a number means the api was unreachable and the
 			// worker held the run's updates rather than losing them.
-			return p.Table([]string{"ID", "NAME", "STATUS", "UPTIME", "VERSION", "UPGRADE", "TOKEN", "OUTBOX"}, rows)
+			// RUNS is PRD #1390 M2c: what the worker SAYS it is executing (its reported active-run
+			// snapshot), summarized per phase — so a split between the api's picture and the
+			// worker's is visible here instead of inferred from pod logs. "-" when it reports none.
+			// It sits before OUTBOX (kept last, its own test pins that) so neither shifts the other.
+			return p.Table([]string{"ID", "NAME", "STATUS", "UPTIME", "VERSION", "UPGRADE", "TOKEN", "RUNS", "OUTBOX"}, rows)
 		},
 	}
 
@@ -381,6 +386,50 @@ func outboxCell(w apitypes.WorkerDTO) string {
 		s += " (blocked)"
 	}
 	return s
+}
+
+// reportedRunsCell summarizes the runs a worker SAYS it is executing, for `uzi worker list`'s
+// and `uzi admin workers`'s RUNS column (PRD #1390 M2c) — the operator's window onto a split
+// between the api's picture of a run and the worker's, visible here rather than inferred from
+// pod logs.
+//
+// "-" is the empty state (the worker reports no active runs). Otherwise a compact,
+// phase-grouped tally like "2 running, 1 awaiting_approval", rendered in a FIXED phase order so
+// the cell is stable across calls (a map's iteration order is not). Each phase is a closed,
+// server-validated enum (the worker_active_runs CHECK), never worker free-text, so the cell
+// needs no scrub — but an unrecognized phase a newer api adds is still appended (sorted, for
+// stability) rather than dropped, the same pass-through discipline upgradeCell uses, because
+// the CLI is versioned separately from the api.
+//
+// The raw reported_runs array also rides `--json` untouched (run_id/phase/claim_generation per
+// entry) for scripting, so an agent keys off the structured fields rather than parsing this cell.
+func reportedRunsCell(w apitypes.WorkerDTO) string {
+	if len(w.ReportedRuns) == 0 {
+		return "-"
+	}
+	counts := make(map[string]int, len(w.ReportedRuns))
+	for _, rr := range w.ReportedRuns {
+		counts[rr.Phase]++
+	}
+	parts := make([]string, 0, len(counts))
+	seen := make(map[string]bool, len(counts))
+	for _, ph := range []string{"running", "awaiting_approval", "awaiting_input", "awaiting_followup"} {
+		if n := counts[ph]; n > 0 {
+			parts = append(parts, fmt.Sprintf("%d %s", n, ph))
+			seen[ph] = true
+		}
+	}
+	extra := make([]string, 0, len(counts))
+	for ph := range counts {
+		if !seen[ph] {
+			extra = append(extra, ph)
+		}
+	}
+	sort.Strings(extra)
+	for _, ph := range extra {
+		parts = append(parts, fmt.Sprintf("%d %s", counts[ph], ph))
+	}
+	return strings.Join(parts, ", ")
 }
 
 // bindModeCell renders HOW a worker chooses its Anthropic credential, for

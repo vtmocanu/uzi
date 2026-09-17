@@ -48,7 +48,7 @@ func TestJudgeClaimCarriesClaimGenerationLiveDB(t *testing.T) {
 	svc.SetSettings(fakeSettings{enabled: true, model: "haiku"})
 	wkr := store.Worker{ID: workerID, UserID: userID, Name: "worker-judge", Status: "online"}
 
-	payload, err := svc.Claim(env.ctx, wkr)
+	payload, err := svc.Claim(env.ctx, wkr, nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}

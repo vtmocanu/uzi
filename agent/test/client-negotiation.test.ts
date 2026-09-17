@@ -4,7 +4,7 @@ import http from "node:http";
 import type { AddressInfo } from "node:net";
 
 import { WorkerClient, RequestError, isStrictDecodeError } from "../src/client.js";
-import type { OutboxHeartbeatEntry, OutgoingMessage } from "../src/protocol.js";
+import type { ActiveSnapshot, OutboxHeartbeatEntry, OutgoingMessage } from "../src/protocol.js";
 import { nullLogger } from "./helpers.js";
 
 // PRD #1391 M2/M5 — the client's feature negotiation and the strict-decode rollback
@@ -15,7 +15,7 @@ import { nullLogger } from "./helpers.js";
 const TOKEN = "worker-join-token-0123456789";
 
 interface Recorded {
-  kind: "register" | "heartbeat" | "messages" | "other";
+  kind: "register" | "heartbeat" | "messages" | "claim" | "other";
   body: Record<string, unknown> | undefined;
 }
 interface Reply {
@@ -29,8 +29,12 @@ interface ProgServer {
   requests: Recorded[];
   cfg: {
     features: string[];
+    /** PRD #1390 M2a: the per-registration nonce the api mints; echoed by the client on
+     *  every snapshot it sends. undefined ⇒ the register response omits the field. */
+    registerNonce: string | undefined;
     heartbeat: (callIndex: number) => Reply;
     messages: (callIndex: number) => Reply;
+    claim: (callIndex: number) => Reply;
   };
   countOf: (kind: Recorded["kind"]) => number;
 }
@@ -42,8 +46,10 @@ async function startServer(): Promise<ProgServer> {
   const requests: Recorded[] = [];
   const cfg: ProgServer["cfg"] = {
     features: [],
+    registerNonce: undefined,
     heartbeat: () => OK,
     messages: () => OK,
+    claim: () => OK,
   };
   const countOf = (kind: Recorded["kind"]): number => requests.filter((r) => r.kind === kind).length;
 
@@ -62,13 +68,18 @@ async function startServer(): Promise<ProgServer> {
       let reply: Reply;
       if (url.endsWith("/register")) {
         requests.push({ kind: "register", body });
-        reply = { status: 200, body: JSON.stringify({ worker_id: "w1", protocol_features: cfg.features }) };
+        const registerBody: Record<string, unknown> = { worker_id: "w1", protocol_features: cfg.features };
+        if (cfg.registerNonce !== undefined) registerBody.register_nonce = cfg.registerNonce;
+        reply = { status: 200, body: JSON.stringify(registerBody) };
       } else if (url.endsWith("/heartbeat")) {
         reply = cfg.heartbeat(countOf("heartbeat"));
         requests.push({ kind: "heartbeat", body });
       } else if (url.endsWith("/messages")) {
         reply = cfg.messages(countOf("messages"));
         requests.push({ kind: "messages", body });
+      } else if (url.endsWith("/runs/claim")) {
+        reply = cfg.claim(countOf("claim"));
+        requests.push({ kind: "claim", body });
       } else {
         requests.push({ kind: "other", body });
         reply = { status: 404 };
@@ -113,11 +124,31 @@ const entry: OutboxHeartbeatEntry = {
 };
 const msg: OutgoingMessage = { seq: 1, kind: "text", payload: { text: "hi" } };
 
+/** A #1390 worker snapshot: one run at `running`, terminal_pending false, no overflow.
+ *  `register_nonce` is OMITTED here on purpose — the client stamps it on send. */
+function snapshot(epoch: number): ActiveSnapshot {
+  return {
+    snapshot_epoch: epoch,
+    active: [
+      {
+        run_id: "22222222-2222-2222-2222-222222222222",
+        claim_generation: 4,
+        phase: "running",
+        terminal_pending: false,
+      },
+    ],
+    pending_overflow: false,
+  };
+}
+
 function heartbeats(): Recorded[] {
   return srv.requests.filter((r) => r.kind === "heartbeat");
 }
 function messages(): Recorded[] {
   return srv.requests.filter((r) => r.kind === "messages");
+}
+function claims(): Recorded[] {
+  return srv.requests.filter((r) => r.kind === "claim");
 }
 
 describe("heartbeat outbox negotiation (PRD #1391 M5)", () => {
@@ -229,6 +260,135 @@ describe("messages claim_generation negotiation (PRD #1391 M2/M5)", () => {
     assert.strictEqual(m.length, 1, "no stripped retry on a genuine-poison 400");
     assert.strictEqual(m[0]!.body?.claim_generation, 5, "the generation is NOT stripped off a poison batch");
     assert.strictEqual(c.hasFeature("claim_generation_fence"), true, "the feature set is left intact");
+  });
+});
+
+describe("active-run snapshot negotiation (PRD #1390 M2a)", () => {
+  it("does NOT attach `active_snapshot` when the server never advertised active_run_snapshot", async () => {
+    srv.cfg.features = []; // an older api
+    const c = newClient();
+    await c.register("w");
+    await c.heartbeat(undefined, undefined, snapshot(1));
+
+    const hb = heartbeats();
+    assert.strictEqual(hb.length, 1);
+    assert.ok(
+      hb[0]!.body && !("active_snapshot" in hb[0]!.body),
+      "send-only-when-advertised: the snapshot field must be absent",
+    );
+  });
+
+  it("attaches `active_snapshot` with the ECHOED register nonce and epoch when negotiated", async () => {
+    srv.cfg.features = ["active_run_snapshot"];
+    srv.cfg.registerNonce = "nonce-abc";
+    const c = newClient();
+    await c.register("w");
+    await c.heartbeat(undefined, undefined, snapshot(1));
+
+    const hb = heartbeats();
+    assert.strictEqual(hb.length, 1);
+    const snap = hb[0]!.body?.active_snapshot as Record<string, unknown> | undefined;
+    assert.ok(snap, "the negotiated snapshot rides the heartbeat");
+    assert.strictEqual(snap.register_nonce, "nonce-abc", "the client stamps the echoed nonce");
+    assert.strictEqual(snap.snapshot_epoch, 1, "the caller's epoch rides through");
+    assert.strictEqual(snap.pending_overflow, false, "a #1390 worker never overflows");
+    assert.deepStrictEqual(
+      snap.active,
+      [
+        {
+          run_id: "22222222-2222-2222-2222-222222222222",
+          claim_generation: 4,
+          phase: "running",
+          terminal_pending: false,
+        },
+      ],
+      "the live-run entry rides verbatim, terminal_pending false",
+    );
+  });
+
+  it("epoch is monotonic across successive heartbeats (a later heartbeat carries a higher epoch)", async () => {
+    srv.cfg.features = ["active_run_snapshot"];
+    srv.cfg.registerNonce = "n1";
+    const c = newClient();
+    await c.register("w");
+    await c.heartbeat(undefined, undefined, snapshot(1));
+    await c.heartbeat(undefined, undefined, snapshot(2));
+
+    const hb = heartbeats();
+    assert.strictEqual(hb.length, 2);
+    const s0 = hb[0]!.body?.active_snapshot as Record<string, unknown> | undefined;
+    const s1 = hb[1]!.body?.active_snapshot as Record<string, unknown> | undefined;
+    assert.ok(s0 && s1, "both heartbeats carried a snapshot");
+    assert.ok((s1.snapshot_epoch as number) > (s0.snapshot_epoch as number), "the second heartbeat's epoch is strictly greater");
+  });
+
+  it("the run-lane claim carries `active_snapshot` (nonce-stamped) when negotiated", async () => {
+    srv.cfg.features = ["active_run_snapshot"];
+    srv.cfg.registerNonce = "nonce-xyz";
+    const c = newClient();
+    await c.register("w");
+    const res = await c.claimRun(snapshot(1));
+    assert.strictEqual(res, null, "204 = queue idle");
+
+    const cl = claims();
+    assert.strictEqual(cl.length, 1);
+    const snap = cl[0]!.body?.active_snapshot as Record<string, unknown> | undefined;
+    assert.ok(snap, "the claim body carries the snapshot");
+    assert.strictEqual(snap.register_nonce, "nonce-xyz", "the claim snapshot echoes the nonce");
+    assert.strictEqual(snap.snapshot_epoch, 1);
+  });
+
+  it("the run-lane claim posts an EMPTY body (no snapshot) when NOT negotiated", async () => {
+    srv.cfg.features = []; // an older api
+    const c = newClient();
+    await c.register("w");
+    await c.claimRun(snapshot(1));
+
+    const cl = claims();
+    assert.strictEqual(cl.length, 1);
+    assert.ok(
+      !cl[0]!.body || !("active_snapshot" in cl[0]!.body),
+      "an un-negotiated claim posts {} — an old api ignores the unread body",
+    );
+  });
+
+  it("whole-set fallback: a strict-decode 400 on a snapshot-carrying heartbeat retries STRIPPED, clears the feature set, and a credential_switch_v1 worker STILL stamps claim_generation afterward", async () => {
+    srv.cfg.features = ["active_run_snapshot"];
+    srv.cfg.registerNonce = "n1";
+    // The first heartbeat 400s (a rolled-back api strict-decoding the snapshot field);
+    // every later heartbeat is fine.
+    srv.cfg.heartbeat = (i) => (i === 0 ? INVALID_BODY : OK);
+    const c = newClient();
+    // Register as a credential_switch_v1 CAPABILITY worker (protocolCapabilities arg).
+    await c.register("w", undefined, undefined, undefined, ["credential_switch_v1"]);
+
+    // Must NOT throw — a heartbeat is never lost to a rolled-back api.
+    await c.heartbeat(undefined, undefined, snapshot(1));
+
+    const hb = heartbeats();
+    assert.strictEqual(hb.length, 2, "the 400 triggered exactly one stripped retry");
+    assert.ok(hb[0]!.body?.active_snapshot, "the first attempt carried the snapshot");
+    assert.ok(
+      hb[1]!.body && !("active_snapshot" in hb[1]!.body),
+      "the stripped retry carried NO active_snapshot",
+    );
+    assert.strictEqual(
+      c.hasFeature("active_run_snapshot"),
+      false,
+      "a stripped success clears the WHOLE negotiated feature set",
+    );
+
+    // The load-bearing regression: the sticky credential_switch_v1 capability is stored
+    // SEPARATELY from the feature set and is NOT cleared, so a subsequent messages call
+    // still stamps claim_generation optimistically.
+    await c.postMessages("run-x", [msg], 7);
+    const m = messages();
+    assert.strictEqual(m.length, 1);
+    assert.strictEqual(
+      m[0]!.body?.claim_generation,
+      7,
+      "the credential capability survives the whole-set clear and keeps stamping the generation",
+    );
   });
 });
 

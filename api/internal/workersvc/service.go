@@ -20,6 +20,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -806,7 +807,9 @@ type Store interface {
 	FailRunsOfStaleWorkersOverCap(ctx context.Context, arg store.FailRunsOfStaleWorkersOverCapParams) ([]store.FailRunsOfStaleWorkersOverCapRow, error)
 	RequeueRunsOfStaleWorkers(ctx context.Context, arg store.RequeueRunsOfStaleWorkersParams) ([]store.RequeueRunsOfStaleWorkersRow, error)
 	FailWorkerRunsOverCap(ctx context.Context, arg store.FailWorkerRunsOverCapParams) ([]uuid.UUID, error)
-	RequeueWorkerRuns(ctx context.Context, arg store.RequeueWorkerRunsParams) (int64, error)
+	// RequeueWorkerRuns returns the re-queued run ids (PRD #1390 M2a) so Register can publish
+	// each transition post-commit, mirroring the sweeper's RequeueRunsOfStaleWorkers twin.
+	RequeueWorkerRuns(ctx context.Context, arg store.RequeueWorkerRunsParams) ([]uuid.UUID, error)
 
 	// Run-health detector (PRD #47): the per-tick active-run scan, the per-running-run
 	// tool window (loop + in-flight), the single health writer, and the queued-run
@@ -1090,6 +1093,12 @@ type Params struct {
 	CompletionHoldWindowSeconds int
 	RunMaxRequeues              int
 	WorkerHeartbeatStale        time.Duration
+	// WorkerHeartbeatInterval (WORKER_HEARTBEAT_INTERVAL) is the worker's heartbeat cadence.
+	// PRD #1390 M2b (D4): the missing-run fence is WorkerHeartbeatStale + WorkerHeartbeatInterval
+	// (the stale window plus one heartbeat interval), so a `running` run absent from a snapshot is
+	// requeued only once it has been silent past the whole window with margin. Mirrored from config;
+	// the zero value narrows the fence to just the stale window (degraded, never wrong).
+	WorkerHeartbeatInterval time.Duration
 	// DiskPressureThreshold (PRD #837 M4, UZI_DISK_PRESSURE_THRESHOLD) is the used/total
 	// fraction in (0,1] at/above which a self-reported disk volume counts as "over
 	// threshold" for one heartbeat. Heartbeat feeds it to diskOverThreshold, which drives
@@ -1114,6 +1123,30 @@ type Params struct {
 	// ClaimGrace is the claimed-but-never-started reclaim window. It is not a
 	// PRD env var (the PRD fixes it at 5m in prose); defaulted in New.
 	ClaimGrace time.Duration
+	// SweeperBootGrace (PRD #1390 M1, D1, SWEEPER_BOOT_GRACE) is the boot-grace window
+	// that suppresses the three stale-worker passes (MarkStaleWorkersOffline,
+	// FailRunsOfStaleWorkersOverCap, RequeueRunsOfStaleWorkers) until it has elapsed
+	// since the LISTENER became ready (Service.SetReadyAt), so an api that was unreachable
+	// does not declare every worker dead the instant it returns. Every other sweep pass runs
+	// as today. 0 (the zero value) means "immediate" — today's behaviour — so a Params literal
+	// that omits it is a safe no-op. Mirrored from config; the default lives in config.go.
+	SweeperBootGrace time.Duration
+	// TerminalPendingLease (PRD #1390 M2a, D11, TERMINAL_PENDING_LEASE) is the lifetime of a
+	// terminal-pending lease and of the pending_overflow closure, mirrored from config.
+	// ReplaceWorkerActiveRuns stamps `terminal_pending_until = now() + TerminalPendingLease` on
+	// every terminal_pending entry (and `pending_overflow_until` likewise). The zero value is a
+	// safe no-op (a lease of 0 is already expired, so nothing is protected — degraded, never
+	// wrong); the positive default lives in config.go.
+	TerminalPendingLease time.Duration
+	// ActiveSnapshotMaxEntries (PRD #1390 M2a, ACTIVE_SNAPSHOT_MAX_ENTRIES) is the absolute
+	// server ceiling on a snapshot's entry count, mirrored from config. A snapshot above it is
+	// rejected as invalid. The zero value would reject every non-empty snapshot; the positive
+	// default lives in config.go.
+	ActiveSnapshotMaxEntries int
+	// WorkerOutboxMaxPending (PRD #1390 M2a / #1391, WORKER_OUTBOX_MAX_PENDING) caps the
+	// terminal_pending=true entries in one snapshot, mirrored from config. A worker beyond it
+	// sets pending_overflow. The default lives in config.go.
+	WorkerOutboxMaxPending int
 	// SkillMaxBytes / SkillsMaxPerRun are the skill caps (PRD #16), mirrored from
 	// config. SkillsMaxPerRun bounds the per-run union at claim assembly; both ride
 	// the claim so the worker enforces the same limits (no server/worker drift).
@@ -1474,6 +1507,15 @@ type Service struct {
 	// non-atomically, so a deployment that never wired it can never complete an interlocked
 	// run without the permit transaction. A LEGACY completion never touches it.
 	txBeginner TxBeginner
+	// readyAt is the moment the worker-facing listener(s) became ready (PRD #1390 M1, D1),
+	// stored as Unix nanoseconds (0 = not yet ready). main.go writes it via SetReadyAt after
+	// binding every enabled listener; the sweeper goroutine reads it each tick to anchor the
+	// boot grace. An atomic.Int64 rather than a time.Time so the cross-goroutine read/write is
+	// data-race-free under -race.
+	readyAt atomic.Int64
+	// bootGraceFirstRunLogged flips true the first time a post-grace sweep runs the gated
+	// stale-worker passes, so that transition is logged exactly once (PRD #1390 M1).
+	bootGraceFirstRunLogged atomic.Bool
 }
 
 // SetSettings wires the instance settings reader (PRD #46). Call once at startup,
@@ -1571,6 +1613,42 @@ func (s *Service) SetDeleteCheckpointFn(fn func(ctx context.Context, o pushbroke
 // runner so the async checkpoint delete is observed deterministically.
 func (s *Service) SetBackground(fn func(func())) { s.background = fn }
 
+// SetReadyAt records the moment the worker-facing listener(s) became ready (PRD #1390 M1,
+// D1). main.go calls it exactly once, AFTER every enabled listener has bound, so the boot
+// grace is anchored on when workers could actually reconnect — not on process start, which
+// ages while the api is still unreachable. Race-safe: stores Unix nanoseconds atomically for
+// the sweeper goroutine to read. A zero t clears it back to "not ready".
+func (s *Service) SetReadyAt(t time.Time) {
+	if t.IsZero() {
+		s.readyAt.Store(0)
+		return
+	}
+	s.readyAt.Store(t.UnixNano())
+}
+
+// readyAtTime reads the listener-ready timestamp set by SetReadyAt, returning the zero
+// time.Time when the listener is not yet ready (the sweeper treats that as grace-active).
+func (s *Service) readyAtTime() time.Time {
+	ns := s.readyAt.Load()
+	if ns == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ns)
+}
+
+// bootGraceActive decides whether the three stale-worker passes are suppressed this tick
+// (PRD #1390 M1, D1). A pure function of the config knob, the listener-ready timestamp and
+// the current time, so it is table-testable without a DB:
+//   - bootGrace <= 0 ⇒ never active (SWEEPER_BOOT_GRACE=0 reproduces today's behaviour).
+//   - readyAt zero (the listener has not bound yet) ⇒ active (a worker cannot have reconnected).
+//   - now before readyAt+bootGrace ⇒ active; at or after ⇒ the grace has elapsed.
+func bootGraceActive(bootGrace time.Duration, readyAt, now time.Time) bool {
+	if bootGrace <= 0 {
+		return false
+	}
+	return readyAt.IsZero() || now.Before(readyAt.Add(bootGrace))
+}
+
 // notify fires the lifecycle hook if one is wired. It is a no-op otherwise, so
 // every call site stays unconditional.
 func (s *Service) notify(runID uuid.UUID, status string) {
@@ -1615,29 +1693,21 @@ func New(q Store, box *secretbox.Box, p Params) *Service {
 // awaiting_input forever, pointing at execution that no longer exists, with its
 // worker-held answer deadline gone and no user-visible signal — on the ordinary
 // restart path this comment already names.
-func (s *Service) Register(ctx context.Context, wkr store.Worker, version, template string, maxConcurrentRuns *int, capabilities []string, protocolCapabilities []string) (store.Worker, error) {
-	max := int32(s.p.RunMaxRequeues) //nolint:gosec // G115: RunMaxRequeues is a small bounded config int (env RUN_MAX_REQUEUES), never near int32 range
-	orphanFailed, err := s.q.FailWorkerRunsOverCap(ctx, store.FailWorkerRunsOverCapParams{
-		FailureReason: pgconv.TextOrNull("worker restarted; run orphaned and out of re-queue budget"),
-		WorkerID:      pgconv.UUID(wkr.ID),
-		MaxRequeues:   max,
-	})
+//
+// PRD #1390 M2a runs the whole of Register in ONE transaction (canonical worker-row lock
+// order): mint + persist a fresh register nonce and reset the snapshot epoch, persist any
+// register-carried snapshot (ownership-validated, preserving leased rows) BEFORE the orphan
+// pass so the D11 lease predicate reads a settled snapshot, then run the orphan fail/requeue
+// pass, commit, and only THEN publish each transition and judge the failures. It returns the
+// nonce so the handler can echo it in the register response. When no transaction beginner is
+// wired (unit tests with a fake store), it degrades to the tx-less path: no worker-row lock and
+// no snapshot persist — a fake store never carries a snapshot.
+func (s *Service) Register(ctx context.Context, wkr store.Worker, version, template string, maxConcurrentRuns *int, capabilities []string, protocolCapabilities []string, snapshot *ActiveSnapshot) (store.Worker, string, error) {
+	nonce, err := mintSnapshotNonce()
 	if err != nil {
-		return store.Worker{}, err
+		return store.Worker{}, "", err
 	}
-	// PRD #46 Decision 2: these orphaned-over-cap runs just committed to 'failed'
-	// (worker lost) — the same worker-lost runs the sweeper's identical
-	// FailRunsOfStaleWorkersOverCap funnels into the judge. Funnel them here too.
-	// Best-effort, gated inside; never fails the register.
-	for _, id := range orphanFailed {
-		s.maybeEnqueueJudgeByID(ctx, id)
-	}
-	if _, err := s.q.RequeueWorkerRuns(ctx, store.RequeueWorkerRunsParams{
-		WorkerID:    pgconv.UUID(wkr.ID),
-		MaxRequeues: max,
-	}); err != nil {
-		return store.Worker{}, err
-	}
+	max := int32(s.p.RunMaxRequeues) //nolint:gosec // G115: RunMaxRequeues is a small bounded config int (env RUN_MAX_REQUEUES), never near int32 range
 	// template is the worker's self-reported image template (PRD #18); empty →
 	// NULL (older image sends none). Soft signal only; never rejected here.
 	// maxConcurrentRuns is the worker's advertised concurrency cap (PRD #42); nil →
@@ -1661,20 +1731,105 @@ func (s *Service) Register(ctx context.Context, wkr store.Worker, version, templ
 	// fresh-start signal), so a downgraded image that stops reporting the protocol loses
 	// it here — which correctly makes it unable to claim an interlocked run.
 	protocolCaps := capability.FilterProtocol(protocolCapabilities)
-	row, err := s.q.RegisterWorker(ctx, store.RegisterWorkerParams{
-		Version:              pgconv.TextOrNull(version),
-		TemplateReported:     pgconv.TextOrNull(template),
-		Capabilities:         storedCaps,
-		ProtocolCapabilities: protocolCaps,
-		MaxConcurrentRuns:    pgconv.Int4Ptr(maxConcurrentRuns),
-		ID:                   wkr.ID,
-	})
-	if err != nil {
-		return store.Worker{}, err
+	regParams := store.RegisterWorkerParams{
+		Version:               pgconv.TextOrNull(version),
+		TemplateReported:      pgconv.TextOrNull(template),
+		Capabilities:          storedCaps,
+		ProtocolCapabilities:  protocolCaps,
+		MaxConcurrentRuns:     pgconv.Int4Ptr(maxConcurrentRuns),
+		SnapshotRegisterNonce: pgconv.TextOrNull(nonce),
+		ID:                    wkr.ID,
 	}
-	// Field-identical structs; the conversion keeps Register's signature — and so
-	// every handler and DTO builder above it — unchanged.
-	return store.Worker(row), nil
+	failParams := store.FailWorkerRunsOverCapParams{
+		FailureReason: pgconv.TextOrNull("worker restarted; run orphaned and out of re-queue budget"),
+		WorkerID:      pgconv.UUID(wkr.ID),
+		MaxRequeues:   max,
+	}
+	requeueParams := store.RequeueWorkerRunsParams{
+		WorkerID:    pgconv.UUID(wkr.ID),
+		MaxRequeues: max,
+	}
+
+	// Tx-less degraded path: no pool wired (fake-store unit tests). No worker-row lock and no
+	// snapshot persist; still rotates the nonce and resets the epoch via RegisterWorker.
+	if s.txBeginner == nil {
+		row, err := s.q.RegisterWorker(ctx, regParams)
+		if err != nil {
+			return store.Worker{}, "", err
+		}
+		orphanFailed, err := s.q.FailWorkerRunsOverCap(ctx, failParams)
+		if err != nil {
+			return store.Worker{}, "", err
+		}
+		requeued, err := s.q.RequeueWorkerRuns(ctx, requeueParams)
+		if err != nil {
+			return store.Worker{}, "", err
+		}
+		s.publishRegisterSweeps(ctx, orphanFailed, requeued)
+		return store.Worker(row), nonce, nil
+	}
+
+	tx, err := s.txBeginner.Begin(ctx)
+	if err != nil {
+		return store.Worker{}, "", err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+	qtx := store.New(tx)
+	// (a) Lock the worker row FOR UPDATE — the canonical order that serialises Register against
+	// a concurrent heartbeat and the stale-worker passes (both of which lock the worker row).
+	if _, err := qtx.GetWorkerForUpdate(ctx, wkr.ID); err != nil {
+		return store.Worker{}, "", err
+	}
+	// (b) Rotate the nonce + reset the epoch (folded into RegisterWorker's update).
+	row, err := qtx.RegisterWorker(ctx, regParams)
+	if err != nil {
+		return store.Worker{}, "", err
+	}
+	// (c) Persist a register-carried snapshot BEFORE the orphan pass, so its leased rows protect
+	// #1391's pending outcomes from the D11-predicated fail/requeue that follows. #1390's worker
+	// never sends one; the path exists for #1391. An invalid register snapshot is ignored, never
+	// fatal (register must not wedge on soft input).
+	if snapshot != nil {
+		if _, err := s.ReplaceWorkerActiveRuns(ctx, qtx, store.Worker(row), snapshot, snapshotModeRegister); err != nil {
+			return store.Worker{}, "", err
+		}
+	}
+	// (d) Orphan pass — fail-over-cap then requeue, both D11-lease/overflow-predicated (M1).
+	orphanFailed, err := qtx.FailWorkerRunsOverCap(ctx, failParams)
+	if err != nil {
+		return store.Worker{}, "", err
+	}
+	requeued, err := qtx.RequeueWorkerRuns(ctx, requeueParams)
+	if err != nil {
+		return store.Worker{}, "", err
+	}
+	// (e) Commit, then publish + judge post-commit (never inside the tx).
+	if err := tx.Commit(ctx); err != nil {
+		return store.Worker{}, "", err
+	}
+	committed = true
+	s.publishRegisterSweeps(ctx, orphanFailed, requeued)
+	return store.Worker(row), nonce, nil
+}
+
+// publishRegisterSweeps fans a register-time orphan pass out post-commit (PRD #1390 M2a):
+// publishSwept for both the failed and the requeued transitions (closing the gap where a
+// register-time requeue/fail reached no live channel — before, only the judge saw the fails)
+// and maybeEnqueueJudgeByID for the committed-terminal fails (PRD #46 Decision 2, the same
+// worker-lost runs the sweeper funnels). Both are best-effort and never fail the register.
+func (s *Service) publishRegisterSweeps(ctx context.Context, failed, requeued []uuid.UUID) {
+	for _, id := range failed {
+		s.publishSwept(id, "failed")
+		s.maybeEnqueueJudgeByID(ctx, id)
+	}
+	for _, id := range requeued {
+		s.publishSwept(id, "queued")
+	}
 }
 
 // WorkerStats is a validated, clamped container resource sample (PRD #49). The
@@ -1703,11 +1858,25 @@ type WorkerStats struct {
 }
 
 // Heartbeat refreshes liveness, overwrites the worker's latest resource sample (PRD
-// #49), records the worker's per-run outbox depth (PRD #1391 M5), and returns the
-// updated worker. A nil stats writes NULLs for every stats_ column, so a worker that
-// stops reporting self-clears its gauge; an empty/nil outbox CLEARS the worker's
-// tracked depth (the "clears on the next empty report" contract).
-func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *WorkerStats, outbox []OutboxEntry) (store.Worker, error) {
+// #49), records the worker's per-run outbox depth (PRD #1391 M5), stores the worker's
+// active-run snapshot when one is carried (PRD #1390 M2a), and returns the updated worker.
+// A nil stats writes NULLs for every stats_ column, so a worker that stops reporting
+// self-clears its gauge; an empty/nil outbox CLEARS the worker's tracked depth (the "clears
+// on the next empty report" contract).
+//
+// When a snapshot is carried it runs inside ONE transaction in the canonical order (PRD #1390
+// M2b): HeartbeatWorker (locks the worker row), then LockOwnedRunsByIDs (pre-locks the runs the
+// snapshot lists so a sibling's concurrent FOR UPDATE SKIP LOCKED claim skips them), then
+// ReplaceWorkerActiveRuns in heartbeat mode. ONLY when the snapshot was applied does it then
+// reconcile: ReadoptRunsFromSnapshot (restore a queued run the worker still lists), then
+// FailRunsMissingFromSnapshot then RequeueRunsMissingFromSnapshot (fail before requeue) for a
+// running run this worker owns but no longer lists, past the missing fence. Each reconciled
+// transition is published post-commit (never inside the tx), mirroring publishRegisterSweeps.
+// An invalid/stale/wrong-nonce snapshot is IGNORED (applied=false) — a warning, no error, rows
+// and leases left as they were, and the reconciliation is skipped — so an invalid snapshot never
+// turns a heartbeat into a 400 and liveness is still refreshed. When no snapshot is carried (or
+// no tx beginner is wired), it takes the plain single-statement path, exactly as before.
+func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *WorkerStats, outbox []OutboxEntry, snapshot *ActiveSnapshot) (store.Worker, error) {
 	// Record the outbox depth BEFORE the liveness write: it is in-memory and cannot
 	// fail, and doing it unconditionally means an empty report clears the set even on
 	// a tick that carries no stats.
@@ -1728,7 +1897,113 @@ func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *Worker
 		// (the tick carried no evidence of pressure).
 		arg.DiskOverThreshold = diskOverThreshold(stats, s.p.DiskPressureThreshold)
 	}
-	return s.q.HeartbeatWorker(ctx, arg)
+	// No snapshot (an old worker, or the field absent), or no pool wired (tests): the plain
+	// single-statement liveness write, unchanged.
+	if snapshot == nil || s.txBeginner == nil {
+		return s.q.HeartbeatWorker(ctx, arg)
+	}
+	tx, err := s.txBeginner.Begin(ctx)
+	if err != nil {
+		return store.Worker{}, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+	qtx := store.New(tx)
+	updated, err := qtx.HeartbeatWorker(ctx, arg)
+	if err != nil {
+		return store.Worker{}, err
+	}
+	// (b) Pre-lock the runs the snapshot lists, in canonical id order, BEFORE the replace and the
+	// reconciliation writes — so a sibling's concurrent claim (FOR UPDATE SKIP LOCKED) skips them
+	// until this tx commits. Unparseable ids are skipped (they cannot name a real run); an id for a
+	// run this worker does not own is a no-op (the WHERE excludes it), never locked.
+	if ids := snapshotRunIDs(snapshot); len(ids) > 0 {
+		if _, err := qtx.LockOwnedRunsByIDs(ctx, store.LockOwnedRunsByIDsParams{
+			RunIds:   ids,
+			WorkerID: pgconv.UUID(updated.ID),
+		}); err != nil {
+			return store.Worker{}, err
+		}
+	}
+	// (c) heartbeat mode: an invalid snapshot returns (false, nil) — ignored, not fatal — so the
+	// heartbeat's liveness refresh still commits. Only a real DB error aborts the tx. CAPTURE
+	// applied: the reconciliation runs ONLY when the snapshot was actually applied (an invalid,
+	// stale-epoch or wrong-nonce snapshot must not drive readopt/requeue off rows it did not write).
+	applied, err := s.ReplaceWorkerActiveRuns(ctx, qtx, updated, snapshot, snapshotModeHeartbeat)
+	if err != nil {
+		return store.Worker{}, err
+	}
+	var (
+		readopted       []store.ReadoptRunsFromSnapshotRow
+		missingFailed   []store.FailRunsMissingFromSnapshotRow
+		missingRequeued []store.RequeueRunsMissingFromSnapshotRow
+	)
+	if applied {
+		// (d) Reconcile, fail before requeue (over-cap fail-first ordering). The missing fence is the
+		// stale window plus one heartbeat interval (D4). max_requeues is RUN_MAX_REQUEUES.
+		missingCutoff := pgconv.Time(s.now().Add(-(s.p.WorkerHeartbeatStale + s.p.WorkerHeartbeatInterval)))
+		maxRequeues := int32(s.p.RunMaxRequeues) //nolint:gosec // G115: RunMaxRequeues is a small bounded config int (env RUN_MAX_REQUEUES), never near int32 range
+		readopted, err = qtx.ReadoptRunsFromSnapshot(ctx, updated.ID)
+		if err != nil {
+			return store.Worker{}, err
+		}
+		missingFailed, err = qtx.FailRunsMissingFromSnapshot(ctx, store.FailRunsMissingFromSnapshotParams{
+			FailureReason: pgconv.TextOrNull("worker lost the execution; exceeded re-queue budget"),
+			WorkerID:      pgconv.UUID(updated.ID),
+			MissingCutoff: missingCutoff,
+			MaxRequeues:   maxRequeues,
+		})
+		if err != nil {
+			return store.Worker{}, err
+		}
+		missingRequeued, err = qtx.RequeueRunsMissingFromSnapshot(ctx, store.RequeueRunsMissingFromSnapshotParams{
+			WorkerID:      pgconv.UUID(updated.ID),
+			MissingCutoff: missingCutoff,
+			MaxRequeues:   maxRequeues,
+		})
+		if err != nil {
+			return store.Worker{}, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return store.Worker{}, err
+	}
+	committed = true
+	// (e) Publish + judge POST-COMMIT (never inside the tx), mirroring publishRegisterSweeps: a
+	// readopt and a missing-requeue publish their live status; a missing-fail publishes 'failed'
+	// AND funnels into the judge (PRD #46 Decision 2, the same worker-lost runs the sweeper funnels).
+	for _, r := range readopted {
+		s.publishSwept(r.ID, r.Status)
+	}
+	for _, r := range missingFailed {
+		s.publishSwept(r.ID, r.Status)
+		s.maybeEnqueueJudgeByID(ctx, r.ID)
+	}
+	for _, r := range missingRequeued {
+		s.publishSwept(r.ID, r.Status)
+	}
+	return updated, nil
+}
+
+// snapshotRunIDs parses the run ids an ActiveSnapshot lists into uuids for the canonical pre-lock
+// (PRD #1390 M2b). Unparseable ids are skipped (ReplaceWorkerActiveRuns rejects the whole snapshot
+// on a bad uuid anyway; the pre-lock only needs the parseable ones for its FOR UPDATE). Returns nil
+// for a nil/empty snapshot so the caller can skip the lock statement.
+func snapshotRunIDs(snap *ActiveSnapshot) []uuid.UUID {
+	if snap == nil || len(snap.Active) == 0 {
+		return nil
+	}
+	ids := make([]uuid.UUID, 0, len(snap.Active))
+	for _, e := range snap.Active {
+		if id, err := uuid.Parse(e.RunID); err == nil {
+			ids = append(ids, id)
+		}
+	}
+	return ids
 }
 
 // diskOverThreshold: any reported volume at/above threshold. >= pins the comparator
@@ -1773,7 +2048,18 @@ func (s *Service) OutboxRunDepth(runID uuid.UUID) (OutboxEntry, uuid.UUID, bool)
 // it, so runs spread across a fleet instead of piling on whichever worker polls
 // first. The deferral is a no-op at the caller level — the run simply isn't
 // returned (nil payload / 204), so the worker just re-polls and a peer claims it.
-func (s *Service) Claim(ctx context.Context, wkr store.Worker) (*ClaimPayload, error) {
+//
+// snapshot is the worker's active-run snapshot riding the claim request (PRD #1390 M3, D3/D8),
+// nil for an old bodyless worker. When it is carried AND a tx beginner is wired, the claim runs in
+// ONE transaction in the canonical lock order — lock the worker row, pre-lock the request
+// snapshot's own runs, replace the snapshot, then (claimant guard) refuse the claim if the worker
+// is under an unexpired pending_overflow closure, else select and claim — so a run any fresh
+// snapshot lists (its own request's included) is never double-claimed and no sibling can steal a
+// pre-locked run until this tx commits. An invalid/stale/wrong-nonce claim snapshot fails the claim
+// CLOSED (ErrActiveSnapshotInvalid → the handler's 400). Without a snapshot (or without a tx
+// beginner: fake-store unit tests) it keeps the single auto-commit ClaimRun, which still applies
+// the persisted-snapshot exclusions and the overflow closure. Assembly always runs OUTSIDE the tx.
+func (s *Service) Claim(ctx context.Context, wkr store.Worker, snapshot *ActiveSnapshot) (*ClaimPayload, error) {
 	// Vault gate (PRD #32 M3): while the run owner's vault is locked (after a pod
 	// restart, or a manual lock), do not claim any of their runs — report idle so
 	// they stay queued as "waiting for vault unlock" instead of failing. This is a
@@ -1847,7 +2133,17 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker) (*ClaimPayload, e
 	// flag routes rather than silently degrading to a mid-run crash.
 	capabilityAware := s.capabilityAwareOn(ctx)
 
-	run, err := s.q.ClaimRun(ctx, store.ClaimRunParams{
+	// PRD #1390 M3: the request snapshot's index-aligned (run_id, generation) pairs, feeding
+	// ClaimRun's request-array exclusion so the claimant never re-claims a run its OWN request
+	// snapshot lists at the current generation, before the first heartbeat persists those rows
+	// (fact 7). Empty (nil-safe) when no snapshot rides the claim — an empty exclusion set.
+	reqIDs, reqGens := requestActivePairs(snapshot)
+
+	// ClaimRun params are built IDENTICALLY for both the no-snapshot auto-commit path and the
+	// transactional path (only the request arrays differ, and they are empty in the no-snapshot
+	// path). @snapshot_fresh_cutoff is the stale window plus one heartbeat interval (D3): a
+	// worker_active_runs row reported within it fences the run out of every claim.
+	params := store.ClaimRunParams{
 		WorkerID:            pgconv.UUID(wkr.ID),
 		UserID:              wkr.UserID,
 		AffinityCutoff:      pgconv.Time(s.now().Add(-s.p.WorkerAffinityCeiling)),
@@ -1884,19 +2180,134 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker) (*ClaimPayload, e
 		CustodyHoldLimit: custodyHoldLimit,
 		RecoveryCapable:  slices.Contains(wkr.ProtocolCapabilities, capability.RecoveryArchiveV1),
 		WorkerIdentity:   workerIdentity(wkr),
-	})
+		// PRD #1390 M3: the three snapshot-dedupe params. @snapshot_fresh_cutoff bounds the
+		// persisted-snapshot freshness test; the request arrays are the claimant's own listed runs
+		// (empty in the no-snapshot path). All three are always passed so an old worker still gets
+		// the persisted-snapshot exclusions + the overflow closure.
+		SnapshotFreshCutoff: pgconv.Time(s.now().Add(-(s.p.WorkerHeartbeatStale + s.p.WorkerHeartbeatInterval))),
+		RequestActiveIds:    reqIDs,
+		RequestActiveGens:   reqGens,
+	}
+
+	// No request snapshot (an old worker) or no tx beginner wired (fake-store unit tests): keep
+	// TODAY'S path — a single auto-commit ClaimRun, then assembleClaim. The predicate params above
+	// still apply, so an old worker gets the persisted-snapshot exclusions and the overflow closure;
+	// only the claimant guard (the flagged-worker-itself refusal) and the request pre-lock are
+	// snapshot-only, and an old worker is never flagged and lists nothing.
+	if snapshot == nil || s.txBeginner == nil {
+		run, err := s.q.ClaimRun(ctx, params)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil, nil // idle
+			}
+			return nil, err
+		}
+		payload, err := s.assembleClaim(ctx, wkr, run)
+		if err != nil {
+			return nil, s.recoverClaimAssembly(ctx, run, err)
+		}
+		return payload, nil
+	}
+
+	// Snapshot carried + tx beginner: ONE transaction in the canonical lock order (D8), so a
+	// sibling's concurrent FOR UPDATE SKIP LOCKED claim cannot see this claimant's pre-locked runs
+	// or replaced snapshot until it commits.
+	tx, err := s.txBeginner.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+	qtx := store.New(tx)
+	// (a) Lock the worker row FIRST — the canonical order shared with Register, Heartbeat and the
+	// stale-worker passes.
+	locked, err := qtx.GetWorkerForUpdate(ctx, wkr.ID)
+	if err != nil {
+		return nil, err
+	}
+	// (b) Pre-lock the request snapshot's own runs in deterministic id order (skip when empty), so a
+	// sibling's concurrent FOR UPDATE SKIP LOCKED claim skips them until this tx commits its
+	// replacement. An id for a run this worker does not own is a no-op (the WHERE excludes it).
+	if ids := snapshotRunIDs(snapshot); len(ids) > 0 {
+		if _, err := qtx.LockOwnedRunsByIDs(ctx, store.LockOwnedRunsByIDsParams{
+			RunIds:   ids,
+			WorkerID: pgconv.UUID(wkr.ID),
+		}); err != nil {
+			return nil, err
+		}
+	}
+	// (c) Replace the snapshot in CLAIM mode: an invalid/stale-epoch/wrong-nonce snapshot returns
+	// ErrActiveSnapshotInvalid — ROLLBACK (via the defer) and return it so the handler fails the
+	// claim CLOSED (400, no claim, no side effect). A real DB error propagates the same way.
+	if _, err := s.ReplaceWorkerActiveRuns(ctx, qtx, locked, snapshot, snapshotModeClaim); err != nil {
+		return nil, err
+	}
+	// (d) Claimant guard (snapshot-replace BEFORE overflow, blocker 2). The replace just set/cleared
+	// pending_overflow_until from the snapshot's pending_overflow flag; re-read the row to see the
+	// CURRENT value. If the worker is under an unexpired overflow closure it is refused every claim,
+	// unassigned runs included — but the replace is valid info that must persist, so COMMIT and
+	// report idle. An UNFLAGGED valid snapshot cleared the closure here, so the claim proceeds in
+	// this SAME tx below.
+	reread, err := qtx.GetWorkerByID(ctx, wkr.ID)
+	if err != nil {
+		return nil, err
+	}
+	if reread.PendingOverflowUntil.Valid && reread.PendingOverflowUntil.Time.After(s.now()) {
+		if err := tx.Commit(ctx); err != nil {
+			return nil, err
+		}
+		committed = true
+		return nil, nil // idle: the worker is overflowed, no claim
+	}
+	// (e) Claim inside the tx. On no candidate, COMMIT (the snapshot replace must persist) and report
+	// idle; on success, COMMIT and then assemble OUTSIDE the tx (assembly opens credentials + builds
+	// snapshots and must not hold the DB tx), exactly as the no-snapshot path does.
+	run, err := qtx.ClaimRun(ctx, params)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
+			if cerr := tx.Commit(ctx); cerr != nil {
+				return nil, cerr
+			}
+			committed = true
 			return nil, nil // idle
 		}
 		return nil, err
 	}
-
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	committed = true
 	payload, err := s.assembleClaim(ctx, wkr, run)
 	if err != nil {
 		return nil, s.recoverClaimAssembly(ctx, run, err)
 	}
 	return payload, nil
+}
+
+// requestActivePairs extracts the index-aligned (run_id, claim_generation) pairs a claim's request
+// snapshot lists (PRD #1390 M3), for ClaimRun's request-array exclusion. Only entries whose run_id
+// parses as a uuid are kept, and the two slices stay index-aligned (a dropped entry drops from
+// both). A nil/empty snapshot yields empty (non-nil) slices, which ClaimRun's WITH ORDINALITY zip
+// reads as an empty exclusion set.
+func requestActivePairs(snap *ActiveSnapshot) ([]uuid.UUID, []int64) {
+	ids := []uuid.UUID{}
+	gens := []int64{}
+	if snap == nil {
+		return ids, gens
+	}
+	for _, e := range snap.Active {
+		id, err := uuid.Parse(e.RunID)
+		if err != nil {
+			continue
+		}
+		ids = append(ids, id)
+		gens = append(gens, e.ClaimGeneration)
+	}
+	return ids, gens
 }
 
 // recoverClaimAssembly turns a failed claim assembly (run OR chat lane) into the

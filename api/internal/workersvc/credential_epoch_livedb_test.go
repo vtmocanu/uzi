@@ -45,7 +45,7 @@ func TestClaimRecordsCredentialEpochLiveDB(t *testing.T) {
 
 	svc := New(env.q, env.box, testParams())
 	wkr := store.Worker{ID: workerID, UserID: userID, Name: "worker-alpha", Status: "online"}
-	payload, err := svc.Claim(env.ctx, wkr)
+	payload, err := svc.Claim(env.ctx, wkr, nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}

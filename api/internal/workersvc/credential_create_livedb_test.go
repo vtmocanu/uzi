@@ -63,7 +63,7 @@ func TestCreateRunOverrideFirstClaimSpendsPinnedTokenLiveDB(t *testing.T) {
 		AnthropicBindMode: BindModePinned,
 		AnthropicSecretID: pgconv.UUID(tokenA),
 	}
-	payload, err := svc.Claim(env.ctx, wkr)
+	payload, err := svc.Claim(env.ctx, wkr, nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}

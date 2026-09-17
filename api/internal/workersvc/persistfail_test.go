@@ -149,8 +149,8 @@ func TestAppendMessagesDropsASubThresholdStreakWhenTheRunLeavesRunning(t *testin
 	// which side of the threshold a worker OOM lands on is close to a coin flip;
 	// half that population landed here.
 	//
-	// Register's RequeueWorkerRuns returns no ids, so it can never have a Sweep-style
-	// hook. Closing it at the RECORDER retires the class instead of adding a fourth
+	// Register's requeue path wires no eviction hook, so it can never have one.
+	// Closing it at the RECORDER retires the class instead of adding a fourth
 	// path-specific patch — and costs nothing, since appendMessages already read the
 	// run row.
 	w := worker()

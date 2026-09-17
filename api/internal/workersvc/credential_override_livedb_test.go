@@ -88,7 +88,7 @@ func TestRunOverrideBeatsWorkerBindLiveDB(t *testing.T) {
 			AnthropicBindMode: BindModePinned,
 			AnthropicSecretID: pgconv.UUID(tokenA),
 		}
-		payload, err := svc.Claim(env.ctx, wkr)
+		payload, err := svc.Claim(env.ctx, wkr, nil)
 		if err != nil {
 			t.Fatalf("Claim: %v", err)
 		}
@@ -122,7 +122,7 @@ func TestRunOverrideBeatsWorkerBindLiveDB(t *testing.T) {
 			AnthropicBindMode: BindModePinned,
 			AnthropicSecretID: pgconv.UUID(tokenB),
 		}
-		payload, err := svc.Claim(env.ctx, wkr)
+		payload, err := svc.Claim(env.ctx, wkr, nil)
 		if err != nil {
 			t.Fatalf("Claim: %v", err)
 		}
@@ -162,7 +162,7 @@ func TestRecordRunCredentialEpochIdempotentAtGenerationLiveDB(t *testing.T) {
 	          VALUES ($1, $2, $3, 'issue', 202, 't', 'd', 'queued')`, runID, userID, repoID)
 
 	wkr := store.Worker{ID: workerID, UserID: userID, Name: "worker-epoch", Status: "online"}
-	payload, err := svc.Claim(env.ctx, wkr)
+	payload, err := svc.Claim(env.ctx, wkr, nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}

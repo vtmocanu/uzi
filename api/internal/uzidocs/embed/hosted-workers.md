@@ -137,6 +137,21 @@ the outbox protects against the outage, not against a hostile model, on this
 runtime. See [worker-setup.md](./worker-setup.md#message-outbox) for the full
 caveat and the tunable quotas.
 
+## Surviving an api restart mid-run
+
+The message outbox above is about the run's message feed surviving an
+outage; this is about the run's own status. A hosted worker reports, on
+every heartbeat, which run-lane attempts it's actually executing and in
+which phase — running, or waiting at a plan-approval or a clarifying-question
+gate. Once the api is back up (after a boot grace during which it holds off
+declaring workers stale, so a worker that only lost the api and not its own
+health isn't wrongly re-queued), it uses that report to restore a run the
+outage flipped to `queued` back to its exact phase within one heartbeat,
+without spending the run's re-queue budget or opening a new custody hold. A
+run genuinely re-queued during the outage has that charge refunded once it's
+back. See [configuration.md](./configuration.md#server-api) for
+`SWEEPER_BOOT_GRACE` and the related knobs.
+
 ## How this differs from running your own worker
 
 A worker you run yourself is a container on hardware you control: you copy a

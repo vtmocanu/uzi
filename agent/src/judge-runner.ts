@@ -13,6 +13,7 @@ import os from "node:os";
 import type { EffortLevel } from "@anthropic-ai/claude-agent-sdk";
 
 import type { WorkerClient } from "./client.js";
+import type { ActiveRunRegistry } from "./active-run-registry.js";
 import type { Logger } from "./log.js";
 import { fenceNonce } from "./prompt.js";
 import { defaultQueryFn, mapSdkMessage } from "./sdk-messages.js";
@@ -131,12 +132,17 @@ export interface JudgeRunnerOptions {
   /** Wall-clock cap on the model turn; default JUDGE_MODEL_TIMEOUT_MS. Injectable so
    *  a test can drive the timeout path deterministically. */
   modelTimeoutMs?: number;
+  /** PRD #1390 M2a: the shared active-run registry. A judge attempt holds a run slot, so
+   *  it is listed in the worker's ActiveSnapshot at phase `running` for its whole life
+   *  (a judge never parks). Undefined ⇒ no tracking. */
+  activeRuns?: ActiveRunRegistry;
 }
 
 export class JudgeRunner {
   private readonly queryFn: SdkQueryFn;
   private readonly homeRoot: string;
   private readonly modelTimeoutMs: number;
+  private readonly activeRuns: ActiveRunRegistry | undefined;
 
   constructor(
     private readonly client: WorkerClient,
@@ -146,6 +152,7 @@ export class JudgeRunner {
     this.queryFn = opts.queryFn ?? defaultQueryFn;
     this.homeRoot = opts.homeRoot ?? os.tmpdir();
     this.modelTimeoutMs = opts.modelTimeoutMs ?? JUDGE_MODEL_TIMEOUT_MS;
+    this.activeRuns = opts.activeRuns;
   }
 
   /** Run one judge claim end to end. Never throws — a failure reports the judge run
@@ -166,6 +173,10 @@ export class JudgeRunner {
       );
       return;
     }
+    // PRD #1390 M2a: a judge attempt holds a run slot, so list it in the worker's
+    // ActiveSnapshot at `running` for its whole life (a judge never parks). Removed in the
+    // finally below, on every exit path.
+    this.activeRuns?.add(judgeRunId, claim.claim_generation ?? 0);
     // Build the review. Any failure BEFORE the post still lands the deterministic
     // command-not-found findings the claim carries (Decision 4): a trace-fetch throw
     // must not lose them, so it falls back rather than failing the run with no review.
@@ -275,6 +286,9 @@ export class JudgeRunner {
     } catch (err) {
       this.log.warn("judge post/complete failed", { run_id: judgeRunId, error: errMessage(err) });
       await safeReportFailed(this.client, this.log, "judge", judgeRunId, errMessage(err), err, claim.claim_generation);
+    } finally {
+      // PRD #1390 M2a: the judge is terminal here on every path — stop listing it.
+      this.activeRuns?.remove(judgeRunId);
     }
   }
 

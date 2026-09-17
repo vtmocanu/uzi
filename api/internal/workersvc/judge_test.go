@@ -46,7 +46,7 @@ func TestClaimJudgeSkipsRepoJoinAndPAT(t *testing.T) {
 	}
 	svc := New(fs, box, testParams())
 
-	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid})
+	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid}, nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -93,7 +93,7 @@ func TestClaimJudgeCarriesKnownImproveUziTargets(t *testing.T) {
 	}
 	svc := New(fs, box, testParams())
 
-	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid})
+	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid}, nil)
 	if err != nil || payload == nil {
 		t.Fatalf("Claim: payload=%v err=%v", payload, err)
 	}
@@ -123,7 +123,7 @@ func TestClaimJudgeCarriesKnownImproveUziTargets(t *testing.T) {
 	// ── empty menu is omitted from the wire ──
 	fsEmpty := &fakeStore{claimRun: judgeRun(uid, uuid.New()), anthropic: sealedTok}
 	svcEmpty := New(fsEmpty, box, testParams())
-	empty, err := svcEmpty.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid})
+	empty, err := svcEmpty.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid}, nil)
 	if err != nil || empty == nil {
 		t.Fatalf("Claim (empty): payload=%v err=%v", empty, err)
 	}
@@ -150,7 +150,7 @@ func TestClaimJudgeSurvivesKnownTargetsLookupError(t *testing.T) {
 	}
 	svc := New(fs, box, testParams())
 
-	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid})
+	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid}, nil)
 	if err != nil {
 		t.Fatalf("a known-targets lookup error must NOT fail the claim: %v", err)
 	}
@@ -173,7 +173,7 @@ func TestClaimJudgeWireCarriesNoPATValue(t *testing.T) {
 	fs := &fakeStore{claimRun: judgeRun(uid, uuid.New()), anthropic: sealedTok}
 	svc := New(fs, box, testParams())
 
-	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid})
+	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid}, nil)
 	if err != nil || payload == nil {
 		t.Fatalf("Claim: payload=%v err=%v", payload, err)
 	}

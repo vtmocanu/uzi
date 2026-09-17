@@ -165,7 +165,7 @@ func TestSetRunCredentialLimitWaitAutoClaimExcludesDeadTokenLiveDB(t *testing.T)
 	// The ensuing auto claim must spend the ALT token — the dead one is excluded while its
 	// window (retry_not_before, still future) is closed.
 	wkr := store.Worker{ID: o.workerID, UserID: o.userID, Name: "w-claim", Status: "online", AnthropicBindMode: BindModeAuto}
-	payload, err := svc.Claim(env.ctx, wkr)
+	payload, err := svc.Claim(env.ctx, wkr, nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}

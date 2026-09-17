@@ -162,6 +162,7 @@ headers, not the rows.
 | 39 | review-row-cap | gitlab | no | PRD #98 M8b/B4': the server's row cap, and the truncation remedy executed against it |
 | 40 | chat-agent | gitlab | no | PRD #39: in-app chat agent (stub) — create -> read(red-team) -> propose -> confirm -> dismiss -> idle -> continue |
 | 41 | interleave-stream | gitlab | no | PRD #43 M5: interleaved multi-agent stream persists + replays (gapless seq, per-agent attribution) |
+| 42 | api-outage-readoption | gitlab | no | PRD #1390: api outage recovery — boot grace, heartbeat re-adoption, claim dedupe |
 | 43 | plan-revision-loop | gitlab | no | PRD #41: plan-revision loop (revise_plan -> re-plan -> re-park -> approve -> MR) |
 | 44 | ask-user-clarification | gitlab | no | PRD #88: ask-user clarification (park -> answer -> resume -> approve -> MR) |
 | 45 | bounded-concurrency | gitlab | no | PRD #42 bounded-concurrency scenario (stub-only) |

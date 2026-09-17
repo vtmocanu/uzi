@@ -118,12 +118,14 @@ func newAdminCmd(env Env, gf *globalFlags) *cobra.Command {
 				// validator at all (handler/workers.go checks length only, and workers.name
 				// carries no CHECK), so ESC remains STORABLE in one. That is a behaviour
 				// change to a shipped endpoint and belongs in its own MR.
-				rows = append(rows, []string{w.ID, w.OwnerEmail, cellText(w.Name), w.Status, outboxCell(w.WorkerDTO)})
+				rows = append(rows, []string{w.ID, w.OwnerEmail, cellText(w.Name), w.Status, reportedRunsCell(w.WorkerDTO), outboxCell(w.WorkerDTO)})
 			}
-			// OUTBOX (PRD #1391 M5): the depth of a worker's locally-buffered updates
-			// waiting to replay to the api — "-" in the steady state, a count while the api
-			// was unreachable. Shared renderer with `uzi worker list` (worker.go).
-			return p.Table([]string{"ID", "OWNER", "NAME", "STATUS", "OUTBOX"}, rows)
+			// RUNS (PRD #1390 M2c): what each worker SAYS it is executing (its reported active-run
+			// snapshot), summarized per phase. OUTBOX (PRD #1391 M5): the depth of a worker's
+			// locally-buffered updates waiting to replay to the api — "-" in the steady state, a
+			// count while the api was unreachable. Both share their renderer with `uzi worker
+			// list` (worker.go), read off the embedded WorkerDTO.
+			return p.Table([]string{"ID", "OWNER", "NAME", "STATUS", "RUNS", "OUTBOX"}, rows)
 		},
 	}
 

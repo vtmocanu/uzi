@@ -986,9 +986,18 @@ chain in the diagram above, with no intervening `running`.
   5 minutes is re-queued; a running run older than `RUN_TIMEOUT` (default 2h)
   is failed; a worker whose heartbeat is stale past `WORKER_HEARTBEAT_STALE`
   (default 45s) is marked offline and its non-terminal runs re-queued,
-  incrementing `requeue_count` — past `RUN_MAX_REQUEUES` (default 1) a run is
-  failed instead of re-queued again. An orphan sweep also runs once at API
-  boot, so a run left dangling by a server restart is not stuck forever.
+  incrementing `requeue_count` — only after a *second* consecutive stale
+  window is the run failed instead of re-queued again, giving a worker that
+  briefly lost the api time to return (issue #1390). An orphan sweep also
+  runs once at API boot, but its three stale-worker passes (offline-marking,
+  over-cap fail, re-queue) are held off for `SWEEPER_BOOT_GRACE` (default 60s)
+  after the api's listeners are ready — every other boot pass runs as usual —
+  so a worker that only lost the api — not its own health — is not wrongly
+  declared dead; on its next
+  heartbeat, a worker's reported active-run snapshot re-adopts any run the
+  outage flipped to `queued` back to its exact phase, with no re-queue
+  budget spent and no new custody hold (issue #1390). `uzi worker list` and
+  `uzi admin workers` show each worker's reported runs and their phase.
 - **Cancel/reject with no live poller** (a `queued` run, or one whose worker
   has gone stale) is transitioned straight to `cancelled`/`failed`
   server-side rather than waiting on a `GET /api/worker/runs/:id/inputs` poll

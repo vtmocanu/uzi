@@ -161,6 +161,21 @@ An api outage — of any length — no longer costs a run its message feed. The 
 
 **Same-uid caveat on the hosted runtime.** A [hosted worker](./hosted-workers.md) runs the `#58` single-uid posture (see [proc-hardening.md](proc-hardening.md)): the model process shares the worker's own uid, so it can read the outbox's signing key and forge, truncate, or delete any run's outbox files. There, the outbox protects against an api outage, not against a hostile model — integrity and durability against the model itself are a documented residual, closed by a later container-split follow-up (the model running in its own container behind an IPC boundary). On a self-run worker's [uid-split](proc-hardening.md#the-mechanism-as-built-mechanism-a1) start, the outbox tree is unwritable by the `runner` uid the model runs as.
 
+## Surviving an api restart mid-run
+
+The message outbox above keeps a run's message feed intact across an api
+outage; this is about the run's own status. On every heartbeat and claim, a
+worker reports which run-lane attempts it's actually executing and in which
+phase (running, or parked at a plan-approval or clarifying-question gate).
+Once the api is back (after a short boot grace where it holds off declaring
+workers stale, so a worker that only lost the api and not its own health
+isn't wrongly re-queued), it uses that report to restore a run the outage
+flipped to `queued` back to its exact phase within one heartbeat — no
+re-queue budget spent, no new custody hold. A run that was genuinely
+re-queued during the outage gets that charge refunded once it's back. See
+[configuration.md](./configuration.md#server-api) for `SWEEPER_BOOT_GRACE`
+and the related knobs.
+
 ## Concurrent runs
 
 By default a worker executes one run at a time. Set `WORKER_MAX_CONCURRENT_RUNS`

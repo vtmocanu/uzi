@@ -458,9 +458,9 @@ func TestRegisterSweepsMoveAwaitingInputLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RequeueWorkerRuns: %v", err)
 	}
-	if rows != 1 {
+	if len(rows) != 1 {
 		t.Fatalf("RequeueWorkerRuns left the parked run alone (%d rows) — an ordinary worker "+
-			"restart strands it in awaiting_input forever, pointing at dead execution", rows)
+			"restart strands it in awaiting_input forever, pointing at dead execution", len(rows))
 	}
 	run, err := f.q.GetRunByID(ctx, f.runID)
 	if err != nil {

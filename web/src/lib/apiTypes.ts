@@ -1591,6 +1591,16 @@ export interface SchedulePreviewInput {
 
 // ── Agent runtime (PRD #4) ────────────────────────────────────────────────
 
+/** One entry of a worker's reported active-run snapshot (PRD #1390 M2c): a run the worker
+ *  says it is executing, with the phase it sees it in and the exact generation it was
+ *  claimed at. phase is a closed server enum (running | awaiting_approval | awaiting_input |
+ *  awaiting_followup). Nested in Worker.reported_runs. */
+export interface WorkerReportedRun {
+  run_id: string;
+  phase: string;
+  claim_generation: number;
+}
+
 export interface Worker {
   id: string;
   name: string;
@@ -1626,6 +1636,17 @@ export interface Worker {
   // "N/M runs" saturation badge (workerRunBadge in lib/workerRuns.ts).
   active_runs: number;
   max_concurrent_runs: number | null;
+  // reported_runs (PRD #1390 M2c): what this worker SAYS it is executing, from its latest
+  // active-run snapshot — one entry per run, each with the phase the worker sees it in and the
+  // generation it was claimed at. The api ALWAYS sends the key: the list/patch handlers overlay
+  // it from the DB and the DTO builders seed it to [], so a worker the snapshot table has no row
+  // for arrives as []. Distinct from active_runs (a bare count off run rows) — this is the
+  // worker's own report, so the two can differ (e.g. during an api outage it rode out). Optional
+  // in TS (`?`), exactly like the outbox_* overlay fields below and retaining_unpublished_work
+  // above: it is a handler-overlaid field a mock or older payload may omit, so `?` lets those
+  // literals compile while the wire contract stays a never-null array (pinned by the api-contract
+  // parity check against the recorded fixtures).
+  reported_runs?: WorkerReportedRun[];
   // retaining_unpublished_work (PRD #1296 M4): true when the worker holds an OPEN
   // durable-recovery custody hold (unpublished committed work not yet archived), so
   // teardown is deferred. Distinct from busy/active_runs — it consumes no run slot.

@@ -8,7 +8,8 @@ import type { JudgeRunner } from "./judge-runner.js";
 import type { ReviewRunner } from "./review-runner.js";
 import type { Logger } from "./log.js";
 import type { Config } from "./config.js";
-import type { OutboxHeartbeatEntry, WorkerStats } from "./protocol.js";
+import type { ActiveSnapshot, OutboxHeartbeatEntry, WorkerStats } from "./protocol.js";
+import type { ActiveRunRegistry } from "./active-run-registry.js";
 import { StatsCollector } from "./stats.js";
 import { errMessage, sleep } from "./util.js";
 import { toolchainPreflight, type PreflightResult } from "./toolchain-preflight.js";
@@ -51,6 +52,12 @@ export class Worker {
     // segments; the drainer calls the hook once the run's segments retire so the live
     // batcher returns its flush target to the network.
     private readonly rearm?: Map<string, () => void>,
+    // PRD #1390 M2a: the shared active-run registry the run lane + judge/review runners
+    // write as they start/transition/finish. The worker READS it to build the
+    // ActiveSnapshot that rides every heartbeat and run-lane claim. Undefined in the
+    // concurrency/semaphore unit tests that never negotiate the feature — buildActiveSnapshot
+    // then returns undefined and no snapshot is ever sent.
+    private readonly activeRuns?: ActiveRunRegistry,
   ) {}
 
   /** PRD #1391 M2: single-flight guard — never two outbox drains at once (a heartbeat
@@ -210,7 +217,9 @@ export class Worker {
         // client sends the array only when the server negotiated `heartbeat_outbox`,
         // so an older api sees a byte-identical heartbeat. Assembled BEFORE the send so
         // the first recovered heartbeat carries the depth ahead of that tick's drain.
-        await this.client.heartbeat(this.collectStats(stats), this.outboxEntries());
+        // PRD #1390 M2a: the active-run snapshot rides the same send (built here so its
+        // epoch is drawn from the ONE monotonic counter the claim loop also draws from).
+        await this.client.heartbeat(this.collectStats(stats), this.outboxEntries(), this.buildActiveSnapshot());
         ok = true;
       } catch (err) {
         this.log.warn("heartbeat failed", { error: errMessage(err) });
@@ -255,6 +264,20 @@ export class Worker {
       });
     }
     return entries.length > 0 ? entries : undefined;
+  }
+
+  /**
+   * PRD #1390 M2a: build the active-run snapshot the heartbeat and the run-lane claim
+   * both carry, from the shared {@link ActiveRunRegistry}. Returns undefined — so no
+   * snapshot is sent and no epoch is spent — unless the registry exists AND the server
+   * negotiated `active_run_snapshot`. Both loops call this, so their `snapshot_epoch`
+   * values come from the ONE monotonic counter the registry owns. The client stamps the
+   * register nonce on send.
+   */
+  private buildActiveSnapshot(): ActiveSnapshot | undefined {
+    if (!this.activeRuns) return undefined;
+    if (!this.client.hasFeature("active_run_snapshot")) return undefined;
+    return this.activeRuns.build();
   }
 
   /**
@@ -326,6 +349,14 @@ export class Worker {
     const active = new Set<Promise<void>>();
     let loggedAtCapacity = false;
     while (!signal.aborted) {
+      // PRD #1390 M4 (e2e ONLY): the env-gated drop-execution seam pauses claiming (via the
+      // shared registry latch) so a silently-dropped run can be observed sitting `queued`
+      // before any reclaim. isClaimPausedForE2E() is a constant `false` in production (nothing
+      // latches it), so this is a no-op there; the e2e clears it by recreating the agent.
+      if (this.activeRuns?.isClaimPausedForE2E()) {
+        await sleep(this.config.pollIntervalMs, signal);
+        continue;
+      }
       if (active.size >= cap) {
         // At capacity: defer the claim (never claim without a free slot) and wake
         // when a slot frees or after a poll. Log once per saturation episode so a
@@ -343,8 +374,27 @@ export class Worker {
       loggedAtCapacity = false;
       let claimed = false;
       try {
-        const claim = await this.client.claimRun();
-        if (claim) {
+        // PRD #1390 M2a: carry the active-run snapshot on the claim (built from the SAME
+        // monotonic epoch counter the heartbeat draws from) so the api's pre-claim dedupe
+        // sees this worker's live runs even before the first post-outage heartbeat lands.
+        const claim = await this.client.claimRun(this.buildActiveSnapshot());
+        if (claim && this.activeRuns?.has(claim.run_id)) {
+          // PRD #1390 M3 (blocker 7) — belt-and-braces duplicate-claim assertion. The
+          // server-side pre-claim dedupe (M3 api) is the real guard; this is the loud last
+          // line of defence. The claim loop tracks in-flight PROMISES, not run ids, so a
+          // server that ever hands back a run this worker is ALREADY executing (the exact
+          // #1390 root cause: a same-worker re-claim of its own live run) would have
+          // `runner.execute` serialise a second attempt behind the first through
+          // `executionTails`, parking a slot AND opening a gen+1 custody hold. Refuse it:
+          // log LOUD (error, greppable, with run_id) and do NOT execute — no slot taken, no
+          // hold, no double-execution. `claimed` stays false so the loop backs off one poll
+          // rather than tight-looping on a persistently-buggy server. This is ADDITIVE — the
+          // Set<Promise> semaphore and the shutdown drain below are untouched.
+          this.log.error(
+            "claim returned a run this worker is already executing; refusing to double-execute",
+            { run_id: claim.run_id },
+          );
+        } else if (claim) {
           claimed = true;
           // PRD #400 M4b: a DIFF-REVIEW claim is a `task`-kind claim carrying a non-null
           // review_target_run_id — routed to the slim ReviewRunner (clone + diff + reviewer

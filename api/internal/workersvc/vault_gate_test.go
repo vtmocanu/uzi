@@ -76,7 +76,7 @@ func TestClaimGateSkipsLockedOwner(t *testing.T) {
 	svc := New(fs, box, testParams())
 	svc.SetVault(v)
 
-	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid})
+	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid}, nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -118,7 +118,7 @@ func TestClaimUnlockedOwnerOpensDEKToken(t *testing.T) {
 	svc := New(fs, box, testParams())
 	svc.SetVault(v)
 
-	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid})
+	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid}, nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -159,7 +159,7 @@ func TestClaimLockRaceRequeuesNeverFails(t *testing.T) {
 	svc := New(fs, box, testParams())
 	svc.SetVault(v)
 
-	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid})
+	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid}, nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}

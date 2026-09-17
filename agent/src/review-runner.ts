@@ -14,6 +14,7 @@
 import os from "node:os";
 
 import type { WorkerClient } from "./client.js";
+import type { ActiveRunRegistry } from "./active-run-registry.js";
 import type { GitCache } from "./git.js";
 import type { Logger } from "./log.js";
 import { fenceNonce } from "./prompt.js";
@@ -67,12 +68,17 @@ export interface ReviewRunnerOptions {
   /** Wall-clock cap on the model turn; default REVIEW_MODEL_TIMEOUT_MS. Injectable so a
    *  test can drive the timeout path deterministically. */
   modelTimeoutMs?: number;
+  /** PRD #1390 M2a: the shared active-run registry. A review attempt holds a run slot, so
+   *  it is listed in the worker's ActiveSnapshot at phase `running` for its whole life
+   *  (a review never parks). Undefined ⇒ no tracking. */
+  activeRuns?: ActiveRunRegistry;
 }
 
 export class ReviewRunner {
   private readonly queryFn: SdkQueryFn;
   private readonly homeRoot: string;
   private readonly modelTimeoutMs: number;
+  private readonly activeRuns: ActiveRunRegistry | undefined;
 
   constructor(
     private readonly client: WorkerClient,
@@ -83,6 +89,7 @@ export class ReviewRunner {
     this.queryFn = opts.queryFn ?? defaultQueryFn;
     this.homeRoot = opts.homeRoot ?? os.tmpdir();
     this.modelTimeoutMs = opts.modelTimeoutMs ?? REVIEW_MODEL_TIMEOUT_MS;
+    this.activeRuns = opts.activeRuns;
   }
 
   /** Run one diff-review claim end to end. Never throws — a failure reports the review
@@ -119,6 +126,10 @@ export class ReviewRunner {
       return;
     }
 
+    // PRD #1390 M2a: a review attempt holds a run slot, so list it in the worker's
+    // ActiveSnapshot at `running` for its whole life (a review never parks). Removed in the
+    // finally below, on every exit path.
+    this.activeRuns?.add(reviewRunId, claim.claim_generation ?? 0);
     // Compute the review. Any failure BEFORE the post falls back to a `failed` review so
     // the reviewed run still receives a (report-only) result rather than nothing.
     let review: TaskReviewRequest;
@@ -224,6 +235,9 @@ export class ReviewRunner {
     } catch (err) {
       this.log.warn("review post/complete failed", { run_id: reviewRunId, error: errMessage(err) });
       await safeReportFailed(this.client, this.log, "review", reviewRunId, errMessage(err), undefined, claim.claim_generation);
+    } finally {
+      // PRD #1390 M2a: the review is terminal here on every path — stop listing it.
+      this.activeRuns?.remove(reviewRunId);
     }
   }
 

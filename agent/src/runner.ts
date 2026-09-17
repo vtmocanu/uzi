@@ -18,6 +18,7 @@ import { skillsPluginDir } from "./skills-plugin.js";
 import { describeLimit, LimitReachedError } from "./limit.js";
 import type { Logger } from "./log.js";
 import type {
+  ActiveSnapshotPhase,
   AgentSelection,
   AgentSource,
   AgentTemplate,
@@ -32,6 +33,7 @@ import type {
   StateRequest,
 } from "./protocol.js";
 import { resolveAgentSelection } from "./protocol.js";
+import type { ActiveRunRegistry } from "./active-run-registry.js";
 import { deriveCloneKey, resolveRunKind, RUN_KIND_PROFILES } from "./run-kind.js";
 import { RecoveryCoordinator, isCodePublishingKind, type RecoveryRecord } from "./recovery.js";
 import {
@@ -204,6 +206,27 @@ class StaleClaimError extends Error {
     this.name = "StaleClaimError";
   }
 }
+
+/**
+ * PRD #1390 M4 — the env-gated e2e DROP-EXECUTION seam signal. OFF unless the worker is
+ * started with `UZI_E2E_DROP_ON_SENTINEL=1` (inert in production); when on, a claim whose
+ * issue text carries {@link E2E_DROP_SENTINEL} is dropped right after its first `running`
+ * report, BEFORE the clone (no worktree, no recovery journal), to model a live worker that
+ * silently loses one execution: the flight ends with NO terminal report, so the run stays
+ * `running` for the api's heartbeat missing-run requeue (M2b) to reclaim after the fence, the
+ * snapshot entry is removed by the ordinary finally, and the claim loop is paused (via the
+ * shared registry) so the e2e can observe the requeued run before a reclaim. Local, thrown
+ * and caught entirely within this file, exactly like StaleClaimError. */
+class E2EDropExecutionError extends Error {
+  constructor() {
+    super("e2e drop-execution seam: ending flight with no terminal report");
+    this.name = "E2EDropExecutionError";
+  }
+}
+
+/** PRD #1390 M4: the issue-text sentinel the e2e drop-execution seam keys on (only when
+ *  UZI_E2E_DROP_ON_SENTINEL is set). Named like the stub sentinels; inert in production. */
+const E2E_DROP_SENTINEL = "UZI_STUB_DROP";
 
 /**
  * PRD #1247 M5b (BLOCKING-2/3 rework): a held-state credential switch could not be CONFIRMED, so
@@ -692,6 +715,23 @@ interface RunFlight {
   steeredTips?: Set<string>;
 }
 
+/** PRD #1390 M2a: the four run states a worker's ActiveSnapshot may report as a `phase`
+ *  (a strict subset of RunState — the ones the api re-adopts a run to). A `running` report
+ *  and each of the three held-state parks map through here into the active-run registry so
+ *  the next snapshot lists this run's real phase; every other status (terminal, limit_wait,
+ *  paused, recovery_wait, credential_switch, ...) is not a snapshot phase and leaves the
+ *  registry entry unchanged (the run is removed on terminal / requeue). */
+const SNAPSHOT_PHASES = new Set<ActiveSnapshotPhase>([
+  "running",
+  "awaiting_approval",
+  "awaiting_input",
+  "awaiting_followup",
+]);
+
+function snapshotPhaseOf(status: StateRequest["status"]): ActiveSnapshotPhase | undefined {
+  return SNAPSHOT_PHASES.has(status as ActiveSnapshotPhase) ? (status as ActiveSnapshotPhase) : undefined;
+}
+
 /** Tuning the runner needs beyond the collaborators (defaults keep M2/M3 tests terse). */
 export interface RunnerOptions {
   /** How often the steering channel polls /inputs (default 3s). */
@@ -756,6 +796,12 @@ export interface RunnerOptions {
   /** PRD #1391 M2 — the in-memory spill-buffer cap (config.outboxSpillBufferBytes);
    *  default is the batcher's own 2 MiB. Threaded to every run's batcher. */
   outboxSpillBufferBytes?: number;
+  /** PRD #1390 M2a — the shared active-run registry. Each run this runner executes is
+   *  registered at `running` (with its claim generation) as it starts, has its phase
+   *  updated as it transitions/parks (through the reportState choke point), and is removed
+   *  on terminal / requeue. The worker reads the registry to build the ActiveSnapshot.
+   *  Undefined ⇒ no tracking (tests that never negotiate the feature). */
+  activeRuns?: ActiveRunRegistry;
 }
 
 /**
@@ -793,6 +839,11 @@ export class RunRunner {
   private readonly rearm: Map<string, () => void> | undefined;
   private readonly transientTripMs: number | undefined;
   private readonly outboxSpillBufferBytes: number | undefined;
+  /** PRD #1390 M2a — the shared active-run registry (runId → phase + claim generation);
+   *  undefined ⇒ no snapshot tracking. The worker reads it to build the ActiveSnapshot.
+   *  Named distinctly from the `activeRuns` shutdown Map below — that tracks abortable
+   *  controllers, this tracks the snapshot phase. */
+  private readonly snapshotRegistry: ActiveRunRegistry | undefined;
   private readonly detect: (
     worktreePath: string,
   ) => Promise<DetectedRepoAgents>;
@@ -900,6 +951,8 @@ export class RunRunner {
     this.rearm = opts.rearm;
     this.transientTripMs = opts.transientTripMs;
     this.outboxSpillBufferBytes = opts.outboxSpillBufferBytes;
+    // PRD #1390 M2a: the shared active-run registry the worker reads to build snapshots.
+    this.snapshotRegistry = opts.activeRuns;
     this.checkpointIntervalMs = opts.checkpointIntervalMs ?? 20 * 60_000;
     this.shutdownPublishTimeoutMs = opts.shutdownPublishTimeoutMs ?? 15_000;
     this.recoveryRetryMs = Math.max(1, Math.min(opts.recoveryRetryMs ?? 1_000, 30_000));
@@ -1027,6 +1080,12 @@ export class RunRunner {
       runScopedSecrets,
     );
     const { runLog, batcher, reportState, steering } = flight;
+    // PRD #1390 M2a: register this run in the active-run snapshot registry at `running`,
+    // at the generation it was claimed at, so the worker's next ActiveSnapshot lists it.
+    // The reportState choke point advances its phase as it parks/resumes; the terminal
+    // finally removes it (a park that RETURNS from executeClaim — limit_wait/recovery/
+    // pre-clone — is a requeue, so it stops being listed there too). Idempotent per run id.
+    this.snapshotRegistry?.add(runId, claim.claim_generation ?? 0);
     try {
       await this.phaseClone(claim, flight);
       const sessionId = await this.phaseResume(claim, flight);
@@ -1436,6 +1495,16 @@ export class RunRunner {
           );
         }
         await batcher.close().catch(() => undefined); // idempotent (enterCredentialSwitch may have drained)
+      } else if (err instanceof E2EDropExecutionError) {
+        // PRD #1390 M4 (e2e drop seam): end the flight with NO terminal report, mirroring the
+        // StaleClaimError arm. The run is left `running` (non-terminal) so the api's heartbeat
+        // missing-run requeue (M2b) reclaims it after the fence; the finally drops the snapshot
+        // entry and (with no clone) retires nothing. pauseClaimForE2E was already latched at the
+        // throw site. Reachable only under UZI_E2E_DROP_ON_SENTINEL.
+        runLog.info(
+          "e2e drop-execution seam: ending flight with no terminal report (run left running for the missing-run requeue)",
+        );
+        await batcher.close().catch(() => undefined);
       } else {
         await this.reportGenericFailure(claim, flight, err);
       }
@@ -1457,6 +1526,12 @@ export class RunRunner {
       // must not stay abortable — shutdown() iterating a stale entry would abort a
       // controller nobody is watching, and the map would leak an entry per run.
       this.activeRuns.delete(runId);
+      // PRD #1390 M2a: drop the active-run snapshot entry. Reaching this finally means the
+      // run reached a terminal report OR parked-and-returned for a requeue — either way it is
+      // no longer executing on this worker, so it must stop being listed in the snapshot. A
+      // run parked at a gate (awaiting_approval/awaiting_input/awaiting_followup) never reaches
+      // here (its execute promise stays live), so it stays listed in its held phase.
+      this.snapshotRegistry?.remove(runId);
       // PRD #1391 M2: drop this run's re-arm registration. The batcher is closed by the
       // time we reach here, so a later drainer retire never needs to re-arm it; any
       // still-pending segments are drained and simply not re-armed (a no-op).
@@ -3913,6 +3988,13 @@ export class RunRunner {
       claimGeneration,
       observedSessionId: undefined,
       reportState: async (body, signal) => {
+        // PRD #1390 M2a: this same choke point is where the run announces every phase
+        // transition, so reflect the four snapshot phases (running / awaiting_approval /
+        // awaiting_input / awaiting_followup) into the active-run registry BEFORE the report
+        // is sent, so a concurrent snapshot build sees the run in its true phase. Every other
+        // status leaves the entry unchanged (removed by the terminal finally / requeue).
+        const phase = snapshotPhaseOf(body.status);
+        if (phase) this.snapshotRegistry?.setPhase(runId, phase);
         // PRD #1247 M5b: stamp the claim-lane generation on EVERY mutating report. This is the
         // single choke point every one of the ~71 report sites goes through (incl. the terminal
         // `failed` report), so the server's per-query fence engages uniformly. Additive/optional:
@@ -4066,6 +4148,24 @@ export class RunRunner {
     });
     await reportState({ status: "running" });
     steering.start();
+
+    // PRD #1390 M4 — env-gated e2e DROP-EXECUTION seam. OFF unless UZI_E2E_DROP_ON_SENTINEL
+    // is set (so this whole block is inert in production). The run has just reported `running`
+    // (its status_since is now), and it is still listed at `running` in the active-run
+    // registry (executeClaim registered it before phaseClone). Ending the flight HERE — before
+    // ensureClone, so there is no worktree and no recovery journal to retire — models a live
+    // worker that silently loses one execution: no terminal report is sent (the run stays
+    // `running` for the api's heartbeat missing-run requeue to reclaim after the fence), the
+    // ordinary finally drops the snapshot entry, and the claim loop is paused so the e2e can
+    // observe the requeued run sitting `queued` before a reclaim. See E2EDropExecutionError.
+    if (
+      process.env.UZI_E2E_DROP_ON_SENTINEL === "1" &&
+      (claim.issue_description?.includes(E2E_DROP_SENTINEL) ||
+        claim.issue_title?.includes(E2E_DROP_SENTINEL))
+    ) {
+      this.snapshotRegistry?.pauseClaimForE2E();
+      throw new E2EDropExecutionError();
+    }
 
     // PRD #1392 M2: only `ensureClone` is wrapped in `withForgeRetry` (fact 4). When it exhausts
     // the schedule and rethrows the last raw git/forge error, a TRANSIENT verdict (a DNS blip, a

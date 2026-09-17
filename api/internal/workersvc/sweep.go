@@ -23,14 +23,35 @@ import (
 func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 	now := s.now()
 	staleCutoff := pgconv.Time(now.Add(-s.p.WorkerHeartbeatStale))
+	// PRD #1390 M1 (D9): the over-cap FAIL waits for TWO consecutive stale windows, so a run
+	// requeued once then hit by a partition just over one window is not terminated before a
+	// heartbeat can re-adopt it. The REQUEUE keeps the single window (staleCutoff).
+	failCutoff := pgconv.Time(now.Add(-2 * s.p.WorkerHeartbeatStale))
 	claimCutoff := pgconv.Time(now.Add(-s.p.ClaimGrace))
 	max := int32(s.p.RunMaxRequeues) //nolint:gosec // G115: RunMaxRequeues is a small bounded config int (env RUN_MAX_REQUEUES), never near int32 range
+
+	// PRD #1390 M1 (D1): the boot grace. While active, the three stale-worker passes
+	// (MarkStaleWorkersOffline, FailRunsOfStaleWorkersOverCap, RequeueRunsOfStaleWorkers) are
+	// skipped — an api that was unreachable must not declare every worker dead the instant it
+	// returns, before any worker could reconnect. Every other pass below runs as today. The
+	// grace is anchored on listener-ready (SetReadyAt), not process start; readyAt still zero
+	// (before bind) is treated as active. SWEEPER_BOOT_GRACE=0 makes this always false.
+	graceActive := bootGraceActive(s.p.SweeperBootGrace, s.readyAtTime(), now)
+	if graceActive {
+		slog.Info("sweeper: boot grace active, skipping stale-worker passes",
+			"boot_grace", s.p.SweeperBootGrace, "ready_at", s.readyAtTime())
+	} else if s.p.SweeperBootGrace > 0 && s.bootGraceFirstRunLogged.CompareAndSwap(false, true) {
+		slog.Info("sweeper: boot grace elapsed, running stale-worker passes",
+			"boot_grace", s.p.SweeperBootGrace, "ready_at", s.readyAtTime())
+	}
 
 	var res SweepResult
 	var err error
 
-	if res.WorkersOffline, err = s.q.MarkStaleWorkersOffline(ctx, staleCutoff); err != nil {
-		return res, fmt.Errorf("mark stale workers offline: %w", err)
+	if !graceActive {
+		if res.WorkersOffline, err = s.q.MarkStaleWorkersOffline(ctx, staleCutoff); err != nil {
+			return res, fmt.Errorf("mark stale workers offline: %w", err)
+		}
 	}
 
 	claimed, err := s.q.SweepClaimedNeverStarted(ctx, claimCutoff)
@@ -84,52 +105,57 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 	}
 
 	// Fail-over-cap before re-queue: the two are disjoint on requeue_count, but
-	// failing first keeps a run that just hit the cap from being re-queued.
-	failed, err := s.q.FailRunsOfStaleWorkersOverCap(ctx, store.FailRunsOfStaleWorkersOverCapParams{
-		FailureReason: pgconv.TextOrNull("worker lost; exceeded re-queue budget"),
-		MaxRequeues:   max,
-		Cutoff:        staleCutoff,
-	})
-	if err != nil {
-		return res, fmt.Errorf("fail stale-worker runs over cap: %w", err)
-	}
-	res.StaleFailed = int64(len(failed))
-	for _, r := range failed {
-		s.publishSwept(r.ID, r.Status)
-		// PRD #46 Decision 2: a swept-to-failed run (worker lost, over re-queue budget)
-		// is committed-terminal and worth judging. Best-effort, gated inside.
-		s.maybeEnqueueJudgeByID(ctx, r.ID)
-	}
+	// failing first keeps a run that just hit the cap from being re-queued. Both are
+	// stale-worker passes, so both are suppressed inside the boot grace (PRD #1390 M1).
+	if !graceActive {
+		failed, err := s.q.FailRunsOfStaleWorkersOverCap(ctx, store.FailRunsOfStaleWorkersOverCapParams{
+			FailureReason: pgconv.TextOrNull("worker lost; exceeded re-queue budget"),
+			MaxRequeues:   max,
+			// PRD #1390 M1 (D9): the two-window cutoff — the over-cap fail requires the worker
+			// to have been stale for 2*WORKER_HEARTBEAT_STALE, unlike the single-window requeue.
+			FailCutoff: failCutoff,
+		})
+		if err != nil {
+			return res, fmt.Errorf("fail stale-worker runs over cap: %w", err)
+		}
+		res.StaleFailed = int64(len(failed))
+		for _, r := range failed {
+			s.publishSwept(r.ID, r.Status)
+			// PRD #46 Decision 2: a swept-to-failed run (worker lost, over re-queue budget)
+			// is committed-terminal and worth judging. Best-effort, gated inside.
+			s.maybeEnqueueJudgeByID(ctx, r.ID)
+		}
 
-	requeued, err := s.q.RequeueRunsOfStaleWorkers(ctx, store.RequeueRunsOfStaleWorkersParams{
-		MaxRequeues: max,
-		Cutoff:      staleCutoff,
-	})
-	if err != nil {
-		return res, fmt.Errorf("re-queue stale-worker runs: %w", err)
-	}
-	res.StaleRequeued = int64(len(requeued))
-	for _, r := range requeued {
-		s.publishSwept(r.ID, r.Status)
-		// 🔴 A REQUEUE GRANTS A FRESH ATTEMPT, SO IT MUST CLEAR THE DEAD ATTEMPT'S
-		// EVIDENCE (PRD #108 M5). This query writes status='queued' but KEEPS
-		// worker_id for affinity, so without this the run returns to `running` under a
-		// new attempt still carrying the old one's 20-failure streak and is
-		// auto-stopped before the new worker persists a byte — uzi killing a run one
-		// tick after deciding it deserved another try and spending re-queue budget to
-		// say so. Likely rather than theoretical for the population M5 exists to
-		// protect: a pre-0.10.1 worker's retry batch GROWS, so a worker wedged at 2 Hz
-		// is a prime OOM candidate, and OOM is exactly what puts it here.
-		//
-		// The window is wide, and uzi's own configuration is the calibration:
-		// defaultClaimGrace budgets FIVE MINUTES for claimed→started, while the sweeper
-		// gives this 15 seconds. The whole of the new attempt's checkout sits inside it
-		// — ensureClone branches on isBareRepo, so a fresh container from a NEW image
-		// has an empty cache and takes the cold cloneBare path, and that clone runs
-		// between the worker's reportState({status:"running"}) and its first flush
-		// (runner.ts; batcher.emit only buffers and then waits for a tick). The claim
-		// is about that ORDERING, not a stopwatched duration.
-		s.persistFail.evict(r.ID)
+		requeued, err := s.q.RequeueRunsOfStaleWorkers(ctx, store.RequeueRunsOfStaleWorkersParams{
+			MaxRequeues: max,
+			Cutoff:      staleCutoff,
+		})
+		if err != nil {
+			return res, fmt.Errorf("re-queue stale-worker runs: %w", err)
+		}
+		res.StaleRequeued = int64(len(requeued))
+		for _, r := range requeued {
+			s.publishSwept(r.ID, r.Status)
+			// 🔴 A REQUEUE GRANTS A FRESH ATTEMPT, SO IT MUST CLEAR THE DEAD ATTEMPT'S
+			// EVIDENCE (PRD #108 M5). This query writes status='queued' but KEEPS
+			// worker_id for affinity, so without this the run returns to `running` under a
+			// new attempt still carrying the old one's 20-failure streak and is
+			// auto-stopped before the new worker persists a byte — uzi killing a run one
+			// tick after deciding it deserved another try and spending re-queue budget to
+			// say so. Likely rather than theoretical for the population M5 exists to
+			// protect: a pre-0.10.1 worker's retry batch GROWS, so a worker wedged at 2 Hz
+			// is a prime OOM candidate, and OOM is exactly what puts it here.
+			//
+			// The window is wide, and uzi's own configuration is the calibration:
+			// defaultClaimGrace budgets FIVE MINUTES for claimed→started, while the sweeper
+			// gives this 15 seconds. The whole of the new attempt's checkout sits inside it
+			// — ensureClone branches on isBareRepo, so a fresh container from a NEW image
+			// has an empty cache and takes the cold cloneBare path, and that clone runs
+			// between the worker's reportState({status:"running"}) and its first flush
+			// (runner.ts; batcher.emit only buffers and then waits for a tick). The claim
+			// is about that ORDERING, not a stopwatched duration.
+			s.persistFail.evict(r.ID)
+		}
 	}
 
 	// Chat idle backstop (PRD #39 Decision 3): a chat run whose last message is

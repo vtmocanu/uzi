@@ -255,13 +255,14 @@ type fakeStore struct {
 	settledScopeRows int64
 
 	// Register + heartbeat.
-	failOverCap      *store.FailWorkerRunsOverCapParams
-	orphanFailedRuns []uuid.UUID // ids FailWorkerRunsOverCap returns (PRD #46 register-time judge funnel)
-	requeueWorker    *store.RequeueWorkerRunsParams
-	registerParams   *store.RegisterWorkerParams
-	registerResult   store.Worker
-	heartbeat        store.Worker
-	callOrder        []string
+	failOverCap        *store.FailWorkerRunsOverCapParams
+	orphanFailedRuns   []uuid.UUID // ids FailWorkerRunsOverCap returns (PRD #46 register-time judge funnel)
+	requeuedWorkerRuns []uuid.UUID // ids RequeueWorkerRuns returns (PRD #1390 M2a register-time requeue publish)
+	requeueWorker      *store.RequeueWorkerRunsParams
+	registerParams     *store.RegisterWorkerParams
+	registerResult     store.Worker
+	heartbeat          store.Worker
+	callOrder          []string
 
 	// Sweep.
 	staleCutoff pgtype.Timestamptz
@@ -1155,10 +1156,10 @@ func (f *fakeStore) FailWorkerRunsOverCap(_ context.Context, arg store.FailWorke
 	f.callOrder = append(f.callOrder, "fail_over_cap")
 	return f.orphanFailedRuns, nil
 }
-func (f *fakeStore) RequeueWorkerRuns(_ context.Context, arg store.RequeueWorkerRunsParams) (int64, error) {
+func (f *fakeStore) RequeueWorkerRuns(_ context.Context, arg store.RequeueWorkerRunsParams) ([]uuid.UUID, error) {
 	f.requeueWorker = &arg
 	f.callOrder = append(f.callOrder, "requeue_worker")
-	return 0, nil
+	return f.requeuedWorkerRuns, nil
 }
 func (f *fakeStore) RegisterWorker(_ context.Context, arg store.RegisterWorkerParams) (store.RegisterWorkerRow, error) {
 	f.registerParams = &arg
@@ -1554,17 +1555,26 @@ func testParams() Params {
 		QuestionTimeoutSeconds: 86400, // PRD #88 answer deadline (24h)
 		RunMaxRequeues:         1,
 		WorkerHeartbeatStale:   45 * time.Second,
-		WorkerAffinityGrace:    2 * time.Minute,
-		WorkerAffinityCeiling:  25 * time.Minute, // PRD #628 run-lane ceiling — deliberately != grace (2m) and != default (2h) so a test proves the run lane reads the ceiling
-		WorkerSpreadGrace:      9 * time.Second,
-		WorkerBackgroundGrace:  15 * time.Minute,
-		ClaimGrace:             5 * time.Minute,
-		SkillMaxBytes:          65536,
-		SkillsMaxPerRun:        32,
-		ChatIdleTimeout:        70 * time.Minute,
-		ChatMaxTurns:           50,
-		WorkerChatIdleTimeout:  60 * time.Minute,
-		WorkerChatTurnTimeout:  10 * time.Minute,
+		// PRD #1390 M2b (D4): the missing-run fence is WorkerHeartbeatStale + WorkerHeartbeatInterval
+		// (45s + 15s = 60s), so a Service from testParams() computes the same fence as production.
+		WorkerHeartbeatInterval: 15 * time.Second,
+		// PRD #1390 M2a snapshot knobs, at their config defaults so a Service built from
+		// testParams() validates/stamps snapshots exactly as production. Snapshot-cap tests
+		// override these on their own Params.
+		TerminalPendingLease:     time.Hour,
+		ActiveSnapshotMaxEntries: 256,
+		WorkerOutboxMaxPending:   32,
+		WorkerAffinityGrace:      2 * time.Minute,
+		WorkerAffinityCeiling:    25 * time.Minute, // PRD #628 run-lane ceiling — deliberately != grace (2m) and != default (2h) so a test proves the run lane reads the ceiling
+		WorkerSpreadGrace:        9 * time.Second,
+		WorkerBackgroundGrace:    15 * time.Minute,
+		ClaimGrace:               5 * time.Minute,
+		SkillMaxBytes:            65536,
+		SkillsMaxPerRun:          32,
+		ChatIdleTimeout:          70 * time.Minute,
+		ChatMaxTurns:             50,
+		WorkerChatIdleTimeout:    60 * time.Minute,
+		WorkerChatTurnTimeout:    10 * time.Minute,
 		// Issue #1197 transient-recovery park: the config defaults, so a svc built from
 		// testParams() computes a real recovery backoff (1m base doubling to a 30m cap).
 		RunRecoveryParkBase: time.Minute,
@@ -1634,7 +1644,7 @@ func TestClaimAssemblesPayloadWithDecryptedSecrets(t *testing.T) {
 	defer slog.SetDefault(prev)
 
 	svc := New(fs, box, testParams())
-	payload, err := svc.Claim(context.Background(), worker())
+	payload, err := svc.Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -1720,7 +1730,7 @@ func TestClaimCarriesTaskOpenMrAndBaseBranch(t *testing.T) {
 	}
 
 	svc := New(fs, box, testParams())
-	payload, err := svc.Claim(context.Background(), worker())
+	payload, err := svc.Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -1768,7 +1778,7 @@ func TestClaimCarriesTaskIdleTimeoutForInteractiveRun(t *testing.T) {
 	}
 
 	svc := New(fs, box, testParams())
-	payload, err := svc.Claim(context.Background(), worker())
+	payload, err := svc.Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -1806,7 +1816,7 @@ func TestClaimOmitsTaskIdleTimeoutForNonInteractiveRun(t *testing.T) {
 	}
 
 	svc := New(fs, box, testParams())
-	payload, err := svc.Claim(context.Background(), worker())
+	payload, err := svc.Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -1873,7 +1883,7 @@ func TestClaimDerivesStopPending(t *testing.T) {
 			}
 
 			svc := New(fs, box, testParams())
-			payload, err := svc.Claim(context.Background(), worker())
+			payload, err := svc.Claim(context.Background(), worker(), nil)
 			if err != nil {
 				t.Fatalf("Claim: %v", err)
 			}
@@ -1904,7 +1914,7 @@ func TestClaimOmitsDefaultModelWhenOwnerHasNone(t *testing.T) {
 		// defaultModel left zero ⇒ NULL ⇒ the owner has no per-user default.
 	}
 
-	payload, err := New(fs, box, testParams()).Claim(context.Background(), worker())
+	payload, err := New(fs, box, testParams()).Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -1964,7 +1974,7 @@ func TestClaimScheduleModelOverridesUserDefault(t *testing.T) {
 		{Name: "reviewer", Description: "reviews", PromptBody: "you review", Model: pgconv.TextOrNull("claude-opus-4-8")},
 	}
 
-	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker())
+	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -1986,7 +1996,7 @@ func TestClaimDeliversOverrideSubagentModelWhenFrozenOn(t *testing.T) {
 	fs := scheduleModelStore(t, pgconv.TextOrNull("fable"), pgtype.Text{})
 	fs.claimRun.OverrideSubagentModel = true
 
-	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker())
+	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -2003,7 +2013,7 @@ func TestClaimOmitsOverrideSubagentModelWhenFrozenOff(t *testing.T) {
 	fs := scheduleModelStore(t, pgconv.TextOrNull("fable"), pgtype.Text{})
 	// claimRun.OverrideSubagentModel left zero ⇒ the run did not opt in.
 
-	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker())
+	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -2027,7 +2037,7 @@ func TestClaimDeliversAttributionEnabledWhenOwnerOn(t *testing.T) {
 	fs := scheduleModelStore(t, pgconv.TextOrNull("fable"), pgtype.Text{})
 	fs.attributionEnabled = true
 
-	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker())
+	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -2054,7 +2064,7 @@ func TestClaimDeliversAttributionDisabledWhenOwnerOff(t *testing.T) {
 	fs := scheduleModelStore(t, pgconv.TextOrNull("fable"), pgtype.Text{})
 	fs.attributionEnabled = false
 
-	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker())
+	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -2082,7 +2092,7 @@ func TestClaimReReadsAttributionLivePerClaim(t *testing.T) {
 
 	svc := New(fs, newBox(t), testParams())
 
-	first, err := svc.Claim(context.Background(), worker())
+	first, err := svc.Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("first Claim: %v", err)
 	}
@@ -2093,7 +2103,7 @@ func TestClaimReReadsAttributionLivePerClaim(t *testing.T) {
 	// Flip the owner's stored value (as SetUserAttributionEnabled would) and re-assemble.
 	fs.attributionEnabled = false
 
-	second, err := svc.Claim(context.Background(), worker())
+	second, err := svc.Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("second Claim: %v", err)
 	}
@@ -2107,7 +2117,7 @@ func TestClaimReReadsAttributionLivePerClaim(t *testing.T) {
 func TestClaimScheduleModelOverridesEvenWithNoUserDefault(t *testing.T) {
 	fs := scheduleModelStore(t, pgconv.TextOrNull("fable"), pgtype.Text{})
 
-	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker())
+	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -2122,7 +2132,7 @@ func TestClaimScheduleModelOverridesEvenWithNoUserDefault(t *testing.T) {
 func TestClaimNoScheduleModelUsesUserDefault(t *testing.T) {
 	fs := scheduleModelStore(t, pgtype.Text{}, pgconv.TextOrNull("sonnet"))
 
-	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker())
+	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -2149,7 +2159,7 @@ func TestClaimCarriesSummaryModelFromInstanceDefault(t *testing.T) {
 	svc := New(fs, newBox(t), testParams())
 	svc.SetSettings(fakeSettings{summaryModel: "haiku"})
 
-	payload, err := svc.Claim(context.Background(), worker())
+	payload, err := svc.Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -2166,7 +2176,7 @@ func TestClaimSummaryModelUserOverrideWins(t *testing.T) {
 	svc := New(fs, newBox(t), testParams())
 	svc.SetSettings(fakeSettings{summaryModel: "haiku"})
 
-	payload, err := svc.Claim(context.Background(), worker())
+	payload, err := svc.Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -2180,7 +2190,7 @@ func TestClaimSummaryModelUserOverrideWins(t *testing.T) {
 func TestClaimOmitsSummaryModelWhenNoSettings(t *testing.T) {
 	fs := scheduleModelStore(t, pgtype.Text{}, pgtype.Text{})
 	// New(...) leaves s.settings nil unless SetSettings is called.
-	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker())
+	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -2211,7 +2221,7 @@ func TestClaimFailsOnDefaultModelLookupError(t *testing.T) {
 		defaultModelErr: errors.New("db down"),
 	}
 
-	_, err := New(fs, box, testParams()).Claim(context.Background(), worker())
+	_, err := New(fs, box, testParams()).Claim(context.Background(), worker(), nil)
 	if err == nil {
 		t.Fatal("expected Claim to fail when the default-model lookup errors")
 	}
@@ -2245,7 +2255,7 @@ func TestClaimDefaultsEffortToXhighWhenOwnerHasNone(t *testing.T) {
 		// defaultEffort left zero ⇒ NULL ⇒ the owner has no per-user default.
 	}
 
-	payload, err := New(fs, box, testParams()).Claim(context.Background(), worker())
+	payload, err := New(fs, box, testParams()).Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -2280,7 +2290,7 @@ func TestClaimCarriesDefaultEffort(t *testing.T) {
 		defaultEffort: pgconv.TextOrNull("low"),
 	}
 
-	payload, err := New(fs, box, testParams()).Claim(context.Background(), worker())
+	payload, err := New(fs, box, testParams()).Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -2307,7 +2317,7 @@ func TestClaimFailsOnDefaultEffortLookupError(t *testing.T) {
 		defaultEffortErr: errors.New("db down"),
 	}
 
-	_, err := New(fs, box, testParams()).Claim(context.Background(), worker())
+	_, err := New(fs, box, testParams()).Claim(context.Background(), worker(), nil)
 	if err == nil {
 		t.Fatal("expected Claim to fail when the default-effort lookup errors")
 	}
@@ -2337,7 +2347,7 @@ func TestClaimFailsOnAttributionLookupError(t *testing.T) {
 		attributionEnabledErr: errors.New("db down"),
 	}
 
-	_, err := New(fs, box, testParams()).Claim(context.Background(), worker())
+	_, err := New(fs, box, testParams()).Claim(context.Background(), worker(), nil)
 	if err == nil {
 		t.Fatal("expected Claim to fail when the attribution lookup errors")
 	}
@@ -2352,7 +2362,7 @@ func TestClaimFailsOnAttributionLookupError(t *testing.T) {
 func TestClaimIdleReturnsNilPayload(t *testing.T) {
 	fs := &fakeStore{claimErr: pgx.ErrNoRows}
 	svc := New(fs, newBox(t), testParams())
-	payload, err := svc.Claim(context.Background(), worker())
+	payload, err := svc.Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -2370,7 +2380,7 @@ func TestClaimFailsRunWhenAnthropicTokenMissing(t *testing.T) {
 		anthropicErr: pgx.ErrNoRows,
 	}
 	svc := New(fs, box, testParams())
-	payload, err := svc.Claim(context.Background(), worker())
+	payload, err := svc.Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -2469,7 +2479,7 @@ func TestClaimFailsRunWhenToolPackagesRejected(t *testing.T) {
 		toolAllowlist: []store.ToolAllowlist{}, // shrank to nothing
 	}
 	svc := New(fs, box, testParams())
-	payload, err := svc.Claim(context.Background(), worker())
+	payload, err := svc.Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -2491,7 +2501,7 @@ func TestClaimFailsRunWhenPATUndecryptable(t *testing.T) {
 		claimCtx: store.GetRunClaimContextRow{TokenCiphertext: []byte("not-a-valid-ciphertext"), RepoWebUrl: "https://x/y"},
 	}
 	svc := New(fs, box, testParams())
-	payload, err := svc.Claim(context.Background(), worker())
+	payload, err := svc.Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -2513,7 +2523,7 @@ func TestClaimPassesAffinityCeiling(t *testing.T) {
 	fixed := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return fixed }
 
-	if _, err := svc.Claim(context.Background(), worker()); err != nil {
+	if _, err := svc.Claim(context.Background(), worker(), nil); err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
 	if fs.claimParams == nil {
@@ -3655,10 +3665,15 @@ func TestRegisterRecoversOrphansThenComesOnline(t *testing.T) {
 	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
 	svc := New(fs, newBox(t), testParams())
 
-	if _, err := svc.Register(context.Background(), w, "1.2.3", "jvm", intp(2), nil, nil); err != nil {
+	if _, _, err := svc.Register(context.Background(), w, "1.2.3", "jvm", intp(2), nil, nil, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	want := []string{"fail_over_cap", "requeue_worker", "register"}
+	// PRD #1390 M2a flips the order: RegisterWorker (which rotates the nonce and resets the
+	// snapshot epoch) runs BEFORE the orphan pass, so a register-carried snapshot can be
+	// persisted between them and protect its leased runs from the D11-predicated orphan fail/
+	// requeue that follows. (This tx-less fake path never carries a snapshot, but keeps the
+	// same statement order as the production transaction.)
+	want := []string{"register", "fail_over_cap", "requeue_worker"}
 	if strings.Join(fs.callOrder, ",") != strings.Join(want, ",") {
 		t.Fatalf("call order = %v, want %v", fs.callOrder, want)
 	}
@@ -3694,7 +3709,7 @@ func TestRegisterUnionsAndFiltersCapabilities(t *testing.T) {
 	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
 	svc := New(fs, newBox(t), testParams())
 
-	if _, err := svc.Register(context.Background(), w, "1.2.3", "jvm", nil, []string{"docker", "gpu", "docker"}, nil); err != nil {
+	if _, _, err := svc.Register(context.Background(), w, "1.2.3", "jvm", nil, []string{"docker", "gpu", "docker"}, nil, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	got := fs.registerParams.Capabilities
@@ -3711,7 +3726,7 @@ func TestRegisterBaseTemplateDropsSelfReportedJVM(t *testing.T) {
 	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
 	svc := New(fs, newBox(t), testParams())
 
-	if _, err := svc.Register(context.Background(), w, "1.2.3", "base", nil, []string{"jvm", "docker"}, nil); err != nil {
+	if _, _, err := svc.Register(context.Background(), w, "1.2.3", "base", nil, []string{"jvm", "docker"}, nil, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	got := fs.registerParams.Capabilities
@@ -3727,7 +3742,7 @@ func TestRegisterBaseTemplateNoSelfReportEmptyCapabilities(t *testing.T) {
 	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
 	svc := New(fs, newBox(t), testParams())
 
-	if _, err := svc.Register(context.Background(), w, "1.2.3", "base", nil, nil, nil); err != nil {
+	if _, _, err := svc.Register(context.Background(), w, "1.2.3", "base", nil, nil, nil, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	if got := fs.registerParams.Capabilities; len(got) != 0 {
@@ -3745,8 +3760,8 @@ func TestRegisterFiltersProtocolCapabilitiesSeparately(t *testing.T) {
 	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
 	svc := New(fs, newBox(t), testParams())
 
-	if _, err := svc.Register(context.Background(), w, "1.2.3", "base", nil,
-		[]string{"docker"}, []string{"completion_interlock_v1", "docker", "gpu", "completion_interlock_v1"}); err != nil {
+	if _, _, err := svc.Register(context.Background(), w, "1.2.3", "base", nil,
+		[]string{"docker"}, []string{"completion_interlock_v1", "docker", "gpu", "completion_interlock_v1"}, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	// Scheduler capabilities: only the self-reported docker (base template implies nothing).
@@ -3768,7 +3783,7 @@ func TestRegisterNilProtocolCapsStoresEmpty(t *testing.T) {
 	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
 	svc := New(fs, newBox(t), testParams())
 
-	if _, err := svc.Register(context.Background(), w, "1.2.3", "base", nil, nil, nil); err != nil {
+	if _, _, err := svc.Register(context.Background(), w, "1.2.3", "base", nil, nil, nil, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	if got := fs.registerParams.ProtocolCapabilities; len(got) != 0 {
@@ -3783,7 +3798,7 @@ func TestRegisterNilCapStoresNull(t *testing.T) {
 	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
 	svc := New(fs, newBox(t), testParams())
 
-	if _, err := svc.Register(context.Background(), w, "1.2.3", "", nil, nil, nil); err != nil {
+	if _, _, err := svc.Register(context.Background(), w, "1.2.3", "", nil, nil, nil, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	if fs.registerParams == nil || fs.registerParams.MaxConcurrentRuns.Valid {
@@ -3798,7 +3813,7 @@ func TestRegisterEmptyTemplateStoresNull(t *testing.T) {
 	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
 	svc := New(fs, newBox(t), testParams())
 
-	if _, err := svc.Register(context.Background(), w, "1.2.3", "", nil, nil, nil); err != nil {
+	if _, _, err := svc.Register(context.Background(), w, "1.2.3", "", nil, nil, nil, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	if fs.registerParams == nil || fs.registerParams.TemplateReported.Valid {
@@ -4576,7 +4591,7 @@ func TestClaimDeliversAutoApproveTopLevelFreshAndResume(t *testing.T) {
 
 	// Fresh autopilot run: no branch/session yet, auto_approve set on the row.
 	fresh := newFS(store.Run{ID: uuid.New(), IssueIid: pgtype.Int8{Int64: 4, Valid: true}, Status: "claimed", AutoApprove: true})
-	p, err := New(fresh, box, testParams()).Claim(context.Background(), worker())
+	p, err := New(fresh, box, testParams()).Claim(context.Background(), worker(), nil)
 	if err != nil || p == nil {
 		t.Fatalf("fresh Claim: payload=%v err=%v", p, err)
 	}
@@ -4591,7 +4606,7 @@ func TestClaimDeliversAutoApproveTopLevelFreshAndResume(t *testing.T) {
 		ID: uuid.New(), IssueIid: pgtype.Int8{Int64: 4, Valid: true}, Status: "claimed", AutoApprove: true,
 		Branch: pgconv.TextOrNull("agent/issue-4"), SessionID: pgconv.TextOrNull("sess-xyz"), RequeueCount: 1,
 	})
-	p, err = New(resume, box, testParams()).Claim(context.Background(), worker())
+	p, err = New(resume, box, testParams()).Claim(context.Background(), worker(), nil)
 	if err != nil || p == nil {
 		t.Fatalf("resume Claim: payload=%v err=%v", p, err)
 	}
@@ -4601,7 +4616,7 @@ func TestClaimDeliversAutoApproveTopLevelFreshAndResume(t *testing.T) {
 
 	// A manual run never carries it.
 	manual := newFS(store.Run{ID: uuid.New(), IssueIid: pgtype.Int8{Int64: 4, Valid: true}, Status: "claimed"})
-	p, err = New(manual, box, testParams()).Claim(context.Background(), worker())
+	p, err = New(manual, box, testParams()).Claim(context.Background(), worker(), nil)
 	if err != nil || p == nil {
 		t.Fatalf("manual Claim: payload=%v err=%v", p, err)
 	}
@@ -5080,7 +5095,7 @@ func TestClaimCredentialFailureNotifiesFailed(t *testing.T) {
 	lc := &fakeLifecycle{}
 	svc.SetLifecycle(lc)
 
-	if _, err := svc.Claim(context.Background(), worker()); err != nil {
+	if _, err := svc.Claim(context.Background(), worker(), nil); err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
 	if len(lc.notes) != 1 || lc.notes[0].status != "failed" || lc.notes[0].runID != runID {
@@ -5142,7 +5157,7 @@ func TestClaimRebindChangesCredentialWithoutRestart(t *testing.T) {
 
 	claimToken := func(t *testing.T, w store.Worker) string {
 		t.Helper()
-		payload, err := svc.Claim(context.Background(), w)
+		payload, err := svc.Claim(context.Background(), w, nil)
 		if err != nil {
 			t.Fatalf("Claim: %v", err)
 		}
@@ -5242,7 +5257,7 @@ func TestClaimBoundToVanishedSecretFailsClosed(t *testing.T) {
 	wkr.AnthropicBindMode = BindModePinned
 	wkr.AnthropicSecretID = pgtype.UUID{Bytes: uuid.New(), Valid: true}
 
-	payload, err := svc.Claim(context.Background(), wkr)
+	payload, err := svc.Claim(context.Background(), wkr, nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -5284,7 +5299,7 @@ func TestJudgeClaimIgnoresWorkerBinding(t *testing.T) {
 		AnthropicBindMode: BindModePinned,
 		AnthropicSecretID: pgtype.UUID{Bytes: consoleID, Valid: true},
 	}
-	payload, err := svc.Claim(context.Background(), wkr)
+	payload, err := svc.Claim(context.Background(), wkr, nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -5363,7 +5378,7 @@ func TestJudgeClaimUsesJudgeBinding(t *testing.T) {
 		AnthropicBindMode: BindModePinned,
 		AnthropicSecretID: pgtype.UUID{Bytes: workerBoundID, Valid: true},
 	}
-	payload, err := svc.Claim(context.Background(), wkr)
+	payload, err := svc.Claim(context.Background(), wkr, nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -5405,7 +5420,7 @@ func TestJudgeClaimUnboundUsesDefault(t *testing.T) {
 	}
 	svc := New(fs, box, testParams())
 
-	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: owner})
+	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: owner}, nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -5446,7 +5461,7 @@ func TestJudgeBindingLookupErrorFailsClaim(t *testing.T) {
 	}
 	svc := New(fs, box, testParams())
 
-	_, err := svc.Claim(context.Background(), worker())
+	_, err := svc.Claim(context.Background(), worker(), nil)
 	if err == nil {
 		t.Fatal("a failed judge-binding lookup must fail the claim, never silently fall back to the default")
 	}
@@ -5473,7 +5488,7 @@ func TestJudgeBoundToVanishedSecretFailsClosed(t *testing.T) {
 	}
 	svc := New(fs, box, testParams())
 
-	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: owner})
+	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: owner}, nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -5525,7 +5540,7 @@ func TestSelfImproveClaimFollowsJudgeBinding(t *testing.T) {
 		AnthropicBindMode: BindModePinned,
 		AnthropicSecretID: pgtype.UUID{Bytes: workerID, Valid: true},
 	}
-	payload, err := svc.Claim(context.Background(), wkr)
+	payload, err := svc.Claim(context.Background(), wkr, nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
