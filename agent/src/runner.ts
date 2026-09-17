@@ -1093,6 +1093,11 @@ export class RunRunner {
    * Returns whether to PROCEED to execute:
    *   1. Synchronously resolve this run's pending terminal journal (if any) — send/retire/stale-retire
    *      per M3 — so a completion the previous attempt journaled lands (and its lease clears) first.
+   *   1b. SC4 guard: if the drain LEFT a pending terminal for this run at the claim's generation (a
+   *      `messages_pending` keep on an undrained run, a `blocked`/`gap_unrecoverable` journal, or a send
+   *      that could not land), END the attempt WITHOUT executing — the outcome is still pending, so a
+   *      second execution here would run over a pending outcome (an SC4 violation), even though the
+   *      server can still read running@same-generation and the probe below would otherwise PROCEED.
    *   2. Probe `GET /worker/runs/{id}/ownership` (status + additive claim_generation) and decide:
    *      - `claimed`/`running` AT this claim's generation → PROCEED (a `running` row is the case where
    *        #1390 re-adopted this exact claim);
@@ -1110,6 +1115,22 @@ export class RunRunner {
     await this.resolveRunPendingTerminals(runId);
 
     const claimGen = claim.claim_generation;
+    // 1b. SC4 guard (fact 6): the drain does NOT always clear the journal — a `blocked`/`gap_unrecoverable`
+    //     record is left for the owner (D13), a `messages_pending` keep waits on an undrained run, and a
+    //     send that could not land stays installed for a later resolve. In all of those the outcome is
+    //     STILL pending, yet the server can read running@same-generation, so the ownership probe below
+    //     would PROCEED and RE-EXECUTE the run OVER a pending outcome — the SC4 violation. End the attempt
+    //     here instead (no report, no executeClaim): the run keeps its authoritative status, leased/listed
+    //     for a later resolve or owner action. Only fall through to the probe once the drain actually
+    //     cleared the pending terminal.
+    if (claimGen !== undefined && this.outbox && this.outbox.hasPendingTerminal(runId, claimGen)) {
+      this.log.info(QUEUED_DUPLICATE_END_LOG, {
+        run_id: runId,
+        reason: "a pending terminal outcome remains after the drain",
+        claim_generation: claimGen,
+      });
+      return false;
+    }
     const deadline = this.now() + this.queuedDuplicateProbeBudgetMs;
     for (;;) {
       if (this.shuttingDownGlobal) {

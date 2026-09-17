@@ -1,8 +1,12 @@
-import { describe, it } from "node:test";
+import { afterEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import fsp from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 
 import { type ExecutorFactory } from "../src/runner.js";
+import { Outbox } from "../src/outbox.js";
 import { nullLogger } from "./helpers.js";
 import { api, client, deferred, fakeGitlab, gitlabClaim, homeDir, installHarness, runnerWith } from "./runner-harness.js";
 
@@ -15,18 +19,40 @@ import { api, client, deferred, fakeGitlab, gitlabClaim, homeDir, installHarness
 
 installHarness();
 
+const tmpRoots: string[] = [];
+afterEach(async () => {
+  for (const r of tmpRoots.splice(0)) await fsp.rm(r, { recursive: true, force: true }).catch(() => undefined);
+});
+
+/** A real on-disk Outbox for the pending-terminal drain path (mirrors runner-terminal-journal.test.ts). */
+async function mkOutbox(): Promise<Outbox> {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "runner-claim-router-"));
+  tmpRoots.push(dir);
+  const outbox = new Outbox({
+    root: path.join(dir, "outbox"),
+    log: nullLogger(),
+    runMaxBytes: 64 * 1024 * 1024,
+    maxBytes: 512 * 1024 * 1024,
+    retentionMs: 7 * 86_400_000,
+  });
+  await outbox.init();
+  return outbox;
+}
+
 /**
  * Drive a queued-duplicate scenario: a first execution blocks in its executor until released (holding
  * its run's execution tail), a second execution of the same run is started (so its `previous` is the
- * first's pending tail and the M4 router runs), the ownership probe is configured, then the first is
- * released so the second's router runs. Returns whether the SECOND execution actually reached the
- * executor (proceeded) and how many ownership probes fired.
+ * first's pending tail and the M4 router runs), the ownership probe (and, when wired, the run's pending
+ * terminal journal) is configured, then the first is released so the second's router runs. Returns the
+ * run id, whether the SECOND execution actually reached the executor (proceeded), and how many
+ * ownership probes fired.
  */
 async function driveQueuedDuplicate(opts: {
   claimGen?: number;
   budgetMs?: number;
-  configureProbe: (runId: string) => void;
-}): Promise<{ secondExecuted: boolean; probes: number }> {
+  outbox?: Outbox;
+  configureProbe: (runId: string) => void | Promise<void>;
+}): Promise<{ runId: string; secondExecuted: boolean; probes: number }> {
   const { gitlab } = fakeGitlab();
   const claim = gitlabClaim(2000, opts.claimGen !== undefined ? { claim_generation: opts.claimGen } : {});
   const runId = claim.run_id;
@@ -60,6 +86,7 @@ async function driveQueuedDuplicate(opts: {
   const runner = runnerWith(factory, gitlab, undefined, nullLogger(), {
     recoveryRetryMs: 5,
     queuedDuplicateProbeBudgetMs: opts.budgetMs ?? 20_000,
+    ...(opts.outbox ? { outbox: opts.outbox, outboxTerminalMaxBytes: 1 << 20, gapFillMax: 100 } : {}),
   });
   const p1 = runner.execute(claim);
   let p2: Promise<void> = Promise.resolve();
@@ -72,10 +99,10 @@ async function driveQueuedDuplicate(opts: {
     ]);
     // The duplicate: its `previous` is the first's still-pending tail, so execute() runs the router.
     p2 = runner.execute({ ...claim });
-    opts.configureProbe(runId);
+    await opts.configureProbe(runId);
     firstGate.resolve();
     await Promise.allSettled([p1, p2]);
-    return { secondExecuted, probes };
+    return { runId, secondExecuted, probes };
   } finally {
     firstGate.resolve();
     runner.shutdown();
@@ -127,6 +154,41 @@ describe("RunRunner queued-duplicate claim router (PRD #1391 Run B M4)", () => {
     });
     assert.equal(secondExecuted, false, "a persistently-failing probe ends the attempt without executing");
     assert.ok(probes >= 2, "the transient failure was retried before giving up");
+  });
+
+  it("a pending terminal that REMAINS after the drain ends the attempt without executing (SC4)", async () => {
+    const outbox = await mkOutbox();
+    const gen = 5;
+    const { runId, secondExecuted } = await driveQueuedDuplicate({
+      claimGen: gen,
+      budgetMs: 30,
+      outbox,
+      configureProbe: async (rid) => {
+        // The server still reads running@same-generation, so the ownership probe ALONE would PROCEED —
+        // this is the SC4 trap. But a BLOCKED journal (D13) is the drain-leaves-it-pending case: the
+        // drain no-ops on a blocked record, so the outcome stays pending and re-executing would run
+        // OVER it. The gate must re-check hasPendingTerminal after the drain and END here.
+        api.setOwnershipStatus(rid, "running", gen);
+        await outbox.journalTerminal(rid, gen, "running", 0, { status: "completed" });
+        await outbox.markTerminalBlocked(rid, gen, "gap_unrecoverable");
+      },
+    });
+    assert.equal(
+      secondExecuted,
+      false,
+      "a pending terminal surviving the drain ends the attempt without executing (unfixed code PROCEEDS and executes)",
+    );
+    assert.equal(
+      outbox.hasPendingTerminal(runId, gen),
+      true,
+      "the blocked journal is left leased/listed for a later resolve or owner action",
+    );
+    const terminal = new Set(["completed", "failed", "cancelled"]);
+    assert.equal(
+      api.states.some((s) => s.runId === runId && terminal.has(s.body.status)),
+      false,
+      "ending the attempt sends NO terminal report — the run keeps its authoritative status",
+    );
   });
 });
 
