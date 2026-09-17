@@ -1464,6 +1464,11 @@ export interface Schedule {
    *  itself. Twin of Run.credential_override; null for every schedule until M6 wires it.
    *  OPTIONAL for the same api/web rollout skew as Run.credential_override. */
   credential_override?: CredentialOverride | null;
+  /** PRD #1429 M4a (D2): the schedule's stored harness pin. null = implicit — the fired
+   *  run resolves through D11 at fire time (the schedule fire path already honors this) —
+   *  a value ("claude"|"codex") is an explicit pin frozen onto every fired run, never
+   *  falling back to the other harness. The schedule-side twin of Run.harness. */
+  harness?: Harness | null;
   auto_approve: boolean;
   wait_on_limit: boolean;
   /** PRD #841: per-schedule MR-review-rework override, tri-state. null = inherit (the
@@ -1643,6 +1648,12 @@ export interface ScheduleInput {
   // unchanged (seed-and-keep on PATCH); send {mode:"inherit"} to clear it; a pinned mode
   // carries secret_id. The server 409s any explicit override on a self_improve lane.
   credential_override?: { mode: string; secret_id?: string } | null;
+  // PRD #1429 M4a (D2): the schedule's per-run harness pin. Presence semantics mirror
+  // credential_override above: OMIT to leave the stored pin unchanged (seed-and-keep on
+  // PATCH); send null to clear it back to implicit D11 resolution at fire time; a value
+  // ("claude"|"codex") pins it. Use lib/harnessSelection.ts's scheduleHarnessPatch to
+  // shape this from a HarnessSelection + a touched flag.
+  harness?: Harness | null;
 }
 
 // SchedulePreviewInput asks for a live "next fires" preview from a timing spec

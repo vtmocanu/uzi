@@ -3,6 +3,7 @@ import {
   type AgentSelectionInput,
   type CredentialEpoch,
   type CredentialOverride,
+  type Harness,
   type RecoveryCustodyHold,
   type RecoveryCustodyHolds,
   type Run,
@@ -188,6 +189,15 @@ function credentialOverlay(run: Run): Run {
   }
 }
 
+// harnessOverlay (PRD #1429 M4a): the "codex-only" mock scenario flips every run's
+// harness to codex, so the harness badge (RunsList/RunView) and the run's usage/cost
+// context show Codex as this account's active harness end to end, offline. A no-op
+// for every other scenario — every run keeps its seeded "claude" harness.
+function harnessOverlay<T extends { harness: Harness }>(run: T): T {
+  if (mockScenario() !== "codex-only") return run;
+  return { ...run, harness: "codex" };
+}
+
 // overrideToRead maps the set-token WRITE body ({mode, secret_id?}) to the READ-side
 // {mode, label} the run DTO carries; inherit clears it to null. A pinned token's label
 // is resolved from the seeded secrets (null when the id is unknown, mirroring a deleted
@@ -208,6 +218,12 @@ export const runsApi = {
     // PRD #1247 M7: mirror the real client's optional override arg. The mock stamps the
     // read-side {mode,label} onto the created run so a demo start-with-token is visible.
     credentialOverride?: { mode: string; secret_id?: string },
+    // PRD #1429 M4a: mirror the real client's optional harness arg. An explicit pick is
+    // stamped verbatim (never overridden by the scenario — D2's "explicit never falls
+    // back" holds even in the mock); omitted falls through to the scenario's implicit
+    // resolution, mirroring D11 (the "codex-only" scenario has no usable Claude, so it
+    // implicitly resolves codex, same as the real server would).
+    harness?: Harness,
   ) => {
     const b = state.boards.get(repoId);
     const card = b?.cards.find((c) => c.iid === issueIid);
@@ -247,7 +263,7 @@ export const runsApi = {
       issue_iid: issueIid,
       issue_title: card.title,
       issue_description: "See the linked PRD.",
-      harness: "claude", // PRD #1429 M1: runs.harness is now on RunDTO (NOT NULL, default claude).
+      harness: harness ?? (mockScenario() === "codex-only" ? "codex" : "claude"),
       title: null,
       resume_of_run_id: null,
       status: "queued",
@@ -402,7 +418,7 @@ export const runsApi = {
         .filter((r) => !(r.id in mockOtherRunOwners))
         .filter((r) => (params?.repoId ? r.repo_id === params.repoId : true))
         .filter((r) => (params?.issueIid != null ? r.issue_iid === params.issueIid : true))
-        .map((r) => runListItem(r)),
+        .map((r) => runListItem(harnessOverlay(r))),
     }),
   // PRD #40: token/cost usage. Static demo figures — enough to populate the
   // dashboard's "Your usage" and (admin) factory cards + per-user table.
@@ -487,7 +503,9 @@ export const runsApi = {
       .map((t) => ({ name: t.name, description: t.description }));
     // PRD #1247 M7: overlay the active credential-override demo scenario onto the run
     // (a no-op for the default/unknown scenario, and for a run switched this session).
-    return delay({ run: { ...credentialOverlay(run), own_agents } }, 60);
+    // PRD #1429 M4a: layered with the harness overlay, so a "codex-only" run also
+    // reads harness=codex on the detail page.
+    return delay({ run: { ...harnessOverlay(credentialOverlay(run)), own_agents } }, 60);
   },
   // PRD #35: flip this run's usage-limit opt-in. Mirrors the server's guard — the
   // same NEGATIVE predicate the cancel path uses — so a terminal run is refused and

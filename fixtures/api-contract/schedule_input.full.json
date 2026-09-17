@@ -23,5 +23,6 @@
   "credential_override": {
     "mode": "x",
     "secret_id": "x"
-  }
+  },
+  "harness": "x"
 }

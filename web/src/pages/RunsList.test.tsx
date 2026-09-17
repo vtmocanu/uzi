@@ -396,6 +396,24 @@ describe("RunsList — autopilot badge", () => {
   });
 });
 
+describe("RunsList — harness badge (PRD #1429 M4a)", () => {
+  it("shows a Codex badge only for a codex-harness run, Claude stays unmarked", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        aRun({ id: "codex-run", issue_title: "Codex run", harness: "codex" }),
+        aRun({ id: "claude-run", issue_title: "Claude run", harness: "claude" }),
+      ],
+    });
+
+    renderRuns();
+
+    await waitFor(() => expect(screen.getByText("Codex run")).toBeTruthy());
+    expect(screen.getByText("Claude run")).toBeTruthy();
+    // Exactly one badge — the Claude run must not carry it.
+    expect(screen.getAllByText("Codex")).toHaveLength(1);
+  });
+});
+
 describe("RunsList — usage meta line (PRD #40)", () => {
   it("adds tokens + cost to a run with usage (running → 'so far'), nothing to a run without", async () => {
     mockApi.listRuns.mockResolvedValue({

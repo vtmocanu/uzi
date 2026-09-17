@@ -18,10 +18,11 @@ import {
   type SecretMeta,
 } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
-import { hasAnthropicToken } from "../lib/hasToken";
+import { hasAnthropicToken, hasAnyCodexCredential, isCodexUsable } from "../lib/hasToken";
 import { startRunGate } from "../lib/runStream";
 import { startRunWithCredential } from "../lib/startRun";
 import { INHERIT_SELECTION, type CredentialSelection } from "../lib/credentialOverride";
+import { bothHarnessesUsable, INHERIT_HARNESS, type HarnessSelection } from "../lib/harnessSelection";
 import {
   effectiveRunStatus,
   hasActiveRun,
@@ -392,16 +393,23 @@ export function Board() {
   // comes from the card's own latest_run (no separate listRuns fan-in).
   const [hasWorker, setHasWorker] = useState(false);
   const [hasToken, setHasToken] = useState(false);
+  // PRD #1429 M4a, D3: harness-aware credential facts alongside hasToken.
+  const [codexUsable, setCodexUsable] = useState(false);
+  const [hasCodexCredential, setHasCodexCredential] = useState(false);
   // PRD #1247 M7: the viewer's Anthropic tokens (for the per-card token picker) and the
   // per-card credential choice (keyed by issue iid). A card the user has not touched
   // defaults to inherit — the run follows the worker binding.
   const [tokens, setTokens] = useState<SecretMeta[]>([]);
   const [cardCredential, setCardCredential] = useState<Record<number, CredentialSelection>>({});
+  // PRD #1429 M4a: the per-card harness choice (keyed by issue iid), mirroring
+  // cardCredential above. A card the user has not touched defaults to inherit.
+  const [cardHarness, setCardHarness] = useState<Record<number, HarnessSelection>>({});
   // PRD #1247: cardCredential is keyed only by issue iid, and the route swaps :id without
   // remounting the component, so a per-card pin from repo A would otherwise reapply to a
   // same-iid card in repo B. Clear it on a repo change (no-op at mount).
   useEffect(() => {
     setCardCredential({});
+    setCardHarness({});
   }, [repoId]);
   // The viewer's runs on this repo blocked on their approval — drives the
   // attention strip above the columns.
@@ -531,6 +539,9 @@ export function Board() {
       ]);
       setHasWorker(workers.length > 0);
       setHasToken(hasAnthropicToken(secrets));
+      // PRD #1429 M4a, D3: harness-aware credential facts alongside hasToken.
+      setCodexUsable(isCodexUsable(secrets));
+      setHasCodexCredential(hasAnyCodexCredential(secrets));
       // PRD #1247 M7: keep the Anthropic tokens for the per-card token picker.
       setTokens(secrets.filter((s) => s.kind === "anthropic_token"));
       // issue #750: classify from the EFFECTIVE status, not the raw one. A run
@@ -613,9 +624,10 @@ export function Board() {
   const startRun = async (card: CardData) => {
     setError("");
     setStarting(card.iid);
-    // The shared helper carries this card's chosen credential override (default inherit)
-    // and preserves it across the open-MR force retry (issue #856). onSettled keeps
-    // Board's pre-#1247 behaviour: clear the starting flag and re-read preconditions.
+    // The shared helper carries this card's chosen credential override AND harness
+    // (both default inherit) and preserves them across the open-MR force retry (issue
+    // #856). onSettled keeps Board's pre-#1247 behaviour: clear the starting flag and
+    // re-read preconditions.
     await startRunWithCredential(repoId, card.iid, cardCredential[card.iid] ?? INHERIT_SELECTION, {
       // encodeURIComponent the id: per-call-site open-redirect hardening (see
       // safeNextPath in Login.tsx). A no-op for today's UUID ids.
@@ -625,7 +637,7 @@ export function Board() {
         setStarting(null);
         loadPreconditions();
       },
-    });
+    }, cardHarness[card.iid] ?? INHERIT_HARNESS);
   };
 
   // Fix CI (PRD #6): queue a plan-gated ci_fix run for a failed pipeline's ref.
@@ -1492,7 +1504,10 @@ export function Board() {
                     gate={startRunGate({
                       closed: card.closed,
                       hasWorker,
-                      hasToken,
+                      claudeUsable: hasToken,
+                      codexUsable,
+                      hasCodexCredential,
+                      harness: cardHarness[card.iid] ?? INHERIT_HARNESS,
                       activeRunExists: hasActiveRun(card.latest_run),
                     })}
                     starting={starting === card.iid}
@@ -1501,6 +1516,11 @@ export function Board() {
                     credential={cardCredential[card.iid] ?? INHERIT_SELECTION}
                     onCredentialChange={(sel) =>
                       setCardCredential((prev) => ({ ...prev, [card.iid]: sel }))
+                    }
+                    showHarnessPicker={bothHarnessesUsable(hasToken, codexUsable)}
+                    harness={cardHarness[card.iid] ?? INHERIT_HARNESS}
+                    onHarnessChange={(h) =>
+                      setCardHarness((prev) => ({ ...prev, [card.iid]: h }))
                     }
                     fixCiBusy={card.pipeline != null && fixingRef === card.pipeline.ref}
                     onFixCi={() => card.pipeline && fixCi(card.pipeline.ref)}
