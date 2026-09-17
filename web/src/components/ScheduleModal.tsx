@@ -10,6 +10,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   api,
+  type Harness,
   type Repo,
   type Schedule,
   type ScheduleInput,
@@ -263,6 +264,11 @@ export function ScheduleModal({
   // PRD #1429 M4a: the full secret list (all kinds), so the harness picker's D2
   // show/hide gate can compute Codex usability alongside `tokens`' Anthropic-only slice.
   const [allSecrets, setAllSecrets] = useState<SecretMeta[]>([]);
+  // PRD #1429 M4a review Fix 1: the owner's own default_harness — a schedule with no
+  // pin resolves at FIRE time from the then-current default (D11 rule 2), so this is
+  // only an edit-time hint for the effective-Codex gate below, mirroring IssueView's
+  // start dialog and Board's per-card gate.
+  const [ownerDefaultHarness, setOwnerDefaultHarness] = useState<Harness | null>(null);
   const [credentialSel, setCredentialSel] = useState<CredentialSelection>(
     selectionFromOverride(editing?.credential_override, []),
   );
@@ -272,9 +278,10 @@ export function ScheduleModal({
     let cancelled = false;
     void (async () => {
       try {
-        const { secrets } = await api.listSecrets();
+        const [{ secrets }, { settings }] = await Promise.all([api.listSecrets(), api.getMySettings()]);
         if (cancelled) return;
         setAllSecrets(secrets);
+        setOwnerDefaultHarness(settings.default_harness);
         const anthropic = secrets.filter((s) => s.kind === "anthropic_token");
         setTokens(anthropic);
         // Re-seed to resolve a pinned label→id now that the list is known — unless the
@@ -325,11 +332,15 @@ export function ScheduleModal({
   // Fix 2 (M4a review): gate the Anthropic TokenPicker on the EFFECTIVE harness, not the
   // raw `harnessSel` — a Codex-only owner never sees the harness picker above
   // (showHarnessPicker is false), so `harnessSel` stays "inherit" even though every run
-  // this schedule fires WILL resolve to Codex implicitly.
+  // this schedule fires WILL resolve to Codex implicitly. Fix 1 (M4a review follow-up):
+  // also thread the owner's CURRENT default_harness (an edit-time hint only — the real
+  // resolution happens at fire time), so a both-usable owner with a usable Codex/Claude
+  // default (D11 rule 2) sees the same hide/show IssueView's start dialog would.
   const scheduleStartsOnCodex = effectiveHarnessIsCodex(
     harnessSel,
     claudeUsableForHarness,
     codexUsableForHarness,
+    ownerDefaultHarness,
   );
   // PRD #929 M1: per-schedule output mode for prompt-target schedules. "" = inherit the
   // catalog/job default; "mr" opens a merge request from an idea file, "issues" files issues.

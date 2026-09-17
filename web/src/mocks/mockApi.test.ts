@@ -437,6 +437,40 @@ describe("mockApi default_harness setting (PRD #1429 M1/D3, M4a review fix)", ()
   });
 });
 
+// PRD #1429 M4a review Fix 3: the M4a rework added a `run.harness === "codex"` guard to
+// setRunCredential (a Codex run cannot carry an Anthropic-only override — D5/D9), but no
+// test exercised the REAL mock (every consumer test stubs setRunCredential directly).
+// Drives the real mock exactly like the default_harness round-trip test above: reload,
+// seed a codex-harness run via the real createRun, then call the real setRunCredential.
+describe("mockApi setRunCredential harness gate (PRD #1429 M4a review Fix 3)", () => {
+  it("422s an Anthropic credential override on a codex-harness run", async () => {
+    installStorage();
+    const api = await reload();
+
+    // repo-uzi issue #31 is seeded with no active run and no open MR (data/boards.ts),
+    // so an explicit harness:"codex" create lands a fresh codex-harness run.
+    const { run } = await api.createRun("repo-uzi", 31, undefined, undefined, "codex");
+    expect(run.harness).toBe("codex");
+
+    await expect(api.setRunCredential(run.id, { mode: "inherit" })).rejects.toMatchObject({
+      status: 422,
+    });
+  });
+
+  // Positive control: the identical call on a claude-harness run succeeds — the fix
+  // must not have blocked credential overrides universally.
+  it("still allows an Anthropic credential override on a claude-harness run", async () => {
+    installStorage();
+    const api = await reload();
+
+    const { run } = await api.createRun("repo-uzi", 31, undefined, undefined, "claude");
+    expect(run.harness).toBe("claude");
+
+    const { run: updated } = await api.setRunCredential(run.id, { mode: "inherit" });
+    expect(updated.id).toBe(run.id);
+  });
+});
+
 describe("mockApi run judge review (PRD #46 M4)", () => {
   it("returns the seeded review for a judged run, null for an unjudged one, 404 for unknown", async () => {
     installStorage();

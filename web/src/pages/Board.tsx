@@ -14,6 +14,7 @@ import {
   api,
   type Board as BoardData,
   type Card as CardData,
+  type Harness,
   type RunListItem,
   type SecretMeta,
 } from "../lib/api";
@@ -396,6 +397,10 @@ export function Board() {
   // PRD #1429 M4a, D3: harness-aware credential facts alongside hasToken.
   const [codexUsable, setCodexUsable] = useState(false);
   const [hasCodexCredential, setHasCodexCredential] = useState(false);
+  // PRD #1429 M4a review Fix 1: the viewer's own default_harness, so each card's
+  // effective-Codex gate can mirror D11 rule 2 (a usable default wins on an untouched
+  // "inherit" pick) exactly as IssueView's start dialog does.
+  const [defaultHarness, setDefaultHarness] = useState<Harness | null>(null);
   // PRD #1247 M7: the viewer's Anthropic tokens (for the per-card token picker) and the
   // per-card credential choice (keyed by issue iid). A card the user has not touched
   // defaults to inherit — the run follows the worker binding.
@@ -532,16 +537,20 @@ export function Board() {
 
   const loadPreconditions = useCallback(async () => {
     try {
-      const [{ workers }, { secrets }, { runs }] = await Promise.all([
+      const [{ workers }, { secrets }, { runs }, { settings }] = await Promise.all([
         api.listWorkers(),
         api.listSecrets(),
         api.listRuns({ repoId }),
+        // PRD #1429 M4a review Fix 1: the viewer's own default_harness, mirroring
+        // IssueView's start dialog so a card's effective-Codex gate agrees with it.
+        api.getMySettings(),
       ]);
       setHasWorker(workers.length > 0);
       setHasToken(hasAnthropicToken(secrets));
       // PRD #1429 M4a, D3: harness-aware credential facts alongside hasToken.
       setCodexUsable(isCodexUsable(secrets));
       setHasCodexCredential(hasAnyCodexCredential(secrets));
+      setDefaultHarness(settings.default_harness);
       // PRD #1247 M7: keep the Anthropic tokens for the per-card token picker.
       setTokens(secrets.filter((s) => s.kind === "anthropic_token"));
       // issue #750: classify from the EFFECTIVE status, not the raw one. A run
@@ -1524,6 +1533,7 @@ export function Board() {
                     }
                     claudeUsable={hasToken}
                     codexUsable={codexUsable}
+                    defaultHarness={defaultHarness}
                     fixCiBusy={card.pipeline != null && fixingRef === card.pipeline.ref}
                     onFixCi={() => card.pipeline && fixCi(card.pipeline.ref)}
                     uziLabel={uziLabel}

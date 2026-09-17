@@ -83,11 +83,16 @@ export function IssueView() {
 
   const { data, loading, error: loadError, reload } = useAsyncData(
     async ({ isCurrent }) => {
-      const [{ issue }, { runs }, { workers }, { secrets }] = await Promise.all([
+      const [{ issue }, { runs }, { workers }, { secrets }, { settings }] = await Promise.all([
         api.getIssue(repoId, iidNum),
         api.listRuns({ repoId, issueIid: iidNum }),
         api.listWorkers(),
         api.listSecrets(),
+        // PRD #1429 M4a review Fix 1: the viewer's own default_harness, so the
+        // not-yet-created start dialog's effective-Codex gate can mirror D11 rule 2
+        // (a usable default wins on an untouched "inherit" pick) — RunDefaults is the
+        // only other page that already fetches this, and it does so separately too.
+        api.getMySettings(),
       ]);
       if (isCurrent()) setIssue(issue);
       return {
@@ -100,6 +105,7 @@ export function IssueView() {
         hasCodexCredential: hasAnyCodexCredential(secrets),
         // Pass the already-loaded tokens to the picker so it need not re-fetch.
         tokens: secrets.filter((s: SecretMeta) => s.kind === "anthropic_token"),
+        defaultHarness: settings.default_harness,
       };
     },
     [repoId, iidNum],
@@ -111,13 +117,17 @@ export function IssueView() {
   const codexUsable = data?.codexUsable ?? false;
   const hasCodexCredential = data?.hasCodexCredential ?? false;
   const tokens = data?.tokens ?? [];
+  const defaultHarness = data?.defaultHarness ?? null;
   // D2: the harness control appears only when BOTH harnesses are usable — a
   // single-harness user (Claude-only or Codex-only) sees no picker at all.
   const showHarnessPicker = bothHarnessesUsable(hasToken, codexUsable);
   // Fix 2 (M4a review): gate the Anthropic TokenPicker on the EFFECTIVE harness, not the
   // raw picker selection — a Codex-only user never sees the harness picker (showHarnessPicker
-  // is false), so `harness` stays "inherit" even though the run WILL resolve to Codex.
-  const startingOnCodex = effectiveHarnessIsCodex(harness, hasToken, codexUsable);
+  // is false), so `harness` stays "inherit" even though the run WILL resolve to Codex. Fix 1
+  // (M4a review follow-up): also thread the viewer's default_harness, so a BOTH-usable user
+  // who set a Codex default (Run Defaults) and leaves the picker on "inherit" gets the same
+  // hide — touching the Anthropic picker in that case 422s (D11 rule 2 resolves them to Codex).
+  const startingOnCodex = effectiveHarnessIsCodex(harness, hasToken, codexUsable, defaultHarness);
 
   const startRun = async () => {
     if (!issue) return;
