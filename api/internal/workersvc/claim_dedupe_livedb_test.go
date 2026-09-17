@@ -263,6 +263,76 @@ func TestClaimRequestArrayExclusionLiveDB(t *testing.T) {
 	})
 }
 
+// TestClaimRequestArrayZipAlignmentLiveDB pins the id↔generation PAIRING of exclusion (2)'s
+// two-array zip (the `ON req_gen.ord = req_id.ord` join). Every other request-array test drives
+// this predicate with a SINGLE-element (or empty) request array, where a broken pairing
+// (`ON true` → cross join, every id paired with every gen) is INDISTINGUISHABLE from the correct
+// index-aligned zip at cardinality ≤ 1. A worker executing 2+ runs sends a multi-element request
+// array, so the ordinal join is load-bearing: this test seeds TWO runs at DIFFERENT generations
+// and asserts an arrangement where the aligned zip and a cross join give DIFFERENT answers — it
+// passes on the current (aligned) code and would fail if the join became `ON true`.
+func TestClaimRequestArrayZipAlignmentLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+
+	// Each sub-test gets its OWN user + repo. Exclusion (2) is REQUEST-scoped (the arrays live only
+	// on the ClaimRun call, never persisted), so a run it excludes stays queued and un-excluded; a
+	// shared user would let one sub-test's leftover runs pollute the other's candidate pool.
+
+	t.Run("each run listed at its OWN generation is excluded", func(t *testing.T) {
+		userID, _, repoID := env.seedCodexInfra(t)
+		wk := seedSnapshotWorker(t, env, userID, "nonce-A")
+		runA := seedClaimableRun(t, env, userID, repoID, wk, 7)
+		runB := seedClaimableRun(t, env, userID, repoID, wk, 5)
+
+		// Aligned pairs A↔7 and B↔5 — each id with ITS OWN current generation — so both are
+		// excluded and the worker claims nothing. (A cross join would exclude both here too, so
+		// this case is the positive baseline, not the discriminator.)
+		p := claimRunParams(wkrRow(t, env, wk))
+		p.RequestActiveIds = []uuid.UUID{runA, runB}
+		p.RequestActiveGens = []int64{7, 5}
+		if _, err := env.q.ClaimRun(env.ctx, p); !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatalf("ClaimRun err = %v, want pgx.ErrNoRows (both listed at their own generation → both excluded)", err)
+		}
+		if g := claimGenOf(t, env, runA); g != 7 {
+			t.Fatalf("runA claim_generation = %d, want unchanged 7 (no claim)", g)
+		}
+		if g := claimGenOf(t, env, runB); g != 5 {
+			t.Fatalf("runB claim_generation = %d, want unchanged 5 (no claim)", g)
+		}
+	})
+
+	t.Run("misaligned generations exclude NEITHER run — the zip pairing is load-bearing", func(t *testing.T) {
+		userID, _, repoID := env.seedCodexInfra(t)
+		wk := seedSnapshotWorker(t, env, userID, "nonce-A")
+		runA := seedClaimableRun(t, env, userID, repoID, wk, 7)
+		runB := seedClaimableRun(t, env, userID, repoID, wk, 5)
+
+		// The SAME two ids, but the generations are SWAPPED against them: A is paired with 5
+		// (A's current gen is 7) and B with 7 (B's current gen is 5). The correct index-aligned
+		// zip matches NEITHER run at its own generation, so both stay claimable. A broken
+		// `ON true` cross join would pair every id with every gen — the {5,7} gens array contains
+		// both 7 (A's current gen) and 5 (B's current gen) — and would wrongly exclude BOTH, so the
+		// first ClaimRun would return pgx.ErrNoRows (this user owns no other queued run).
+		p := claimRunParams(wkrRow(t, env, wk))
+		p.RequestActiveIds = []uuid.UUID{runA, runB}
+		p.RequestActiveGens = []int64{5, 7}
+
+		first, err := env.q.ClaimRun(env.ctx, p)
+		if err != nil {
+			t.Fatalf("first ClaimRun err = %v, want a run claimed (misaligned generations exclude neither)", err)
+		}
+		second, err := env.q.ClaimRun(env.ctx, p)
+		if err != nil {
+			t.Fatalf("second ClaimRun err = %v, want the other run claimed (both are claimable)", err)
+		}
+		got := map[uuid.UUID]bool{first.ID: true, second.ID: true}
+		if !got[runA] || !got[runB] {
+			t.Fatalf("claimed runs = {%s, %s}, want both runA=%s and runB=%s (the zip must pair each id with ITS OWN generation)",
+				first.ID, second.ID, runA, runB)
+		}
+	})
+}
+
 // ---- (3) overflow closure — sibling half ----------------------------------
 
 // TestClaimOverflowClosureSiblingLiveDB (D11): while a worker's pending_overflow closure is
