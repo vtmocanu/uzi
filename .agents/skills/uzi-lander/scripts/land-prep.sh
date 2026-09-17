@@ -92,6 +92,13 @@ mrw_check || exit 4
 
 # ---- worktree -----------------------------------------------------------------------------
 git -C "$ROOT" fetch origin "$BRANCH" "$BASE" --quiet || { echo "git fetch failed" >&2; exit 3; }
+# A branch can be checked out in only one worktree: if one already holds it (this session
+# or an earlier one made it), reuse that path instead of failing on `worktree add`.
+existing=$(git -C "$ROOT" worktree list --porcelain | awk -v b="refs/heads/$BRANCH" '$1=="worktree"{p=$2} $1=="branch" && $2==b {print p}' | head -1)
+if [ -n "$existing" ] && [ "$existing" != "$WT" ]; then
+  log "branch $BRANCH is already checked out at $existing; using it"
+  WT="$existing"
+fi
 if [ -d "$WT" ]; then
   cur=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
   [ "$cur" = "$BRANCH" ] || { echo "$WT exists but is on '$cur', not '$BRANCH'; pass --worktree" >&2; exit 3; }

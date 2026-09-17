@@ -2,15 +2,18 @@
 # takeover.sh — one-shot snapshot of a uzi run and/or its PR, so a session taking over
 # mid-flight starts from facts instead of a hand-rolled survey. Read-only.
 #
-# Usage: takeover.sh (<run-id> | <PR-number>) [--repo OWNER/REPO]
+# Usage: takeover.sh (<run-id> | <PR-number>) [--repo OWNER/REPO] [--no-claim]
 #   A bare number is a PR; anything else is a uzi run id (prefix ok). Each resolves the
 #   other when it can: a run's mr_iid -> PR; a PR -> the newest non-rework uzi run that
 #   opened it. --repo defaults to the checkout's origin (gh repo view).
+#   Unless --no-claim, an open PR is CLAIMED for this session (claims.sh) so other landers
+#   see it; a PR another live session holds stops here with NEXT=claimed_by_other.
 #
 # Prints KEY=VALUE lines (empty when unknown), then NEXT=<state> — the branch point the
 # uzi-lander SKILL.md decision tree keys on:
 #   run_active:<status>   run not terminal (running, or a park: awaiting_*, limit_wait, …)
 #   run_failed:<origin>   run failed/cancelled and no PR — hand to uzi-watcher recovery
+#   claimed_by_other      another live session is landing this PR (CLAIM_HELD_BY printed)
 #   merged | closed       nothing to land
 #   conflict              mergeStateStatus DIRTY — resolve in a worktree
 #   migration_collision   PR adds a migration whose number already exists on main — rebase + renumber
@@ -25,11 +28,13 @@
 # Exit 0 on a snapshot, 3 on usage / could not resolve the target.
 set -uo pipefail
 
-TARGET=""; REPO=""
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TARGET=""; REPO=""; CLAIM=1
 while [ $# -gt 0 ]; do
   case "$1" in
     --repo) REPO="${2:?}"; shift 2;;
-    -h|--help) sed -n '2,26p' "$0"; exit 3;;
+    --no-claim) CLAIM=0; shift;;
+    -h|--help) sed -n '2,29p' "$0"; exit 3;;
     -*) echo "unknown flag: $1" >&2; exit 3;;
     *) if [ -z "$TARGET" ]; then TARGET="$1"; else echo "unexpected arg: $1" >&2; exit 3; fi; shift;;
   esac
@@ -166,6 +171,20 @@ if [ -n "$added_mig" ]; then
   done <<< "$added_mig"
 fi
 [ -n "$collision" ] && echo "MIGRATION_COLLISION=$collision (renumber above $main_head: task migration:renumber)"
+n_files=$(printf '%s' "$files" | jq 'length' 2>/dev/null || echo 0)
+n_lines=$(printf '%s' "$files" | jq '[.[]|.additions+.deletions]|add // 0' 2>/dev/null || echo 0)
+echo "SIZE_FILES=$n_files"; echo "SIZE_LINES=$n_lines"
+
+# ---- claim ------------------------------------------------------------------------------
+# Record that THIS session is landing the PR (priority defaults to the file count: spend
+# CodeRabbit reviews on the large PRs first). Another live session's claim stops us here.
+if [ "$CLAIM" -eq 1 ]; then
+  if ! cl_out=$("$HERE/claims.sh" claim "#$PR" --repo "$REPO" --pr "$PR" --size "$n_files" --lines "$n_lines" 2>&1); then
+    printf '%s\n' "$cl_out"
+    echo "NEXT=claimed_by_other"; exit 4
+  fi
+  printf '%s\n' "$cl_out"
+fi
 
 # ---- NEXT -------------------------------------------------------------------------------
 reviewed=$cr_reviewed

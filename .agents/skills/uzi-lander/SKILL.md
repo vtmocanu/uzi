@@ -1,6 +1,6 @@
 ---
 name: uzi-lander
-description: "Lands a uzi run's pull request on this GitHub-hosted repo, taking over at any point after dispatch: polls a running run blind to its terminal state, then drives the PR through the review bots (CodeRabbit auto, Greptile on demand), CodeRabbit rate limits, uzi's own mr_rework, local fixes, rebase and migration renumbering, the admin merge and post-merge CI, reporting one status line per state change. The deterministic steps are bundled scripts (takeover, watch-pr, cr-rate-limit, review-quota, land-prep, merge, watch-run-ci, trail). Use when the user says take over run X, land PR N, babysit the PR, drive it home, watch the PR to merge, wait for CodeRabbit, or fix the review findings. Triggers include take over the run, land the PR, babysit, drive it home, uzi lander, CR rate limited, greptile review, merge it when green."
+description: "Lands a uzi run's pull request on this GitHub-hosted repo, taking over at any point after dispatch: polls a running run blind to its terminal state, then drives the PR through the review bots (CodeRabbit auto, Greptile on demand), CodeRabbit rate limits, uzi's own mr_rework, local fixes, rebase and migration renumbering, the admin merge and post-merge CI, reporting one status line per state change. Claims each PR in a shared per-repo board so several landing sessions (Claude or Codex) coordinate priority and quota. The deterministic steps are bundled scripts (takeover, claims, watch-pr, cr-rate-limit, review-quota, land-prep, merge, watch-run-ci, trail). Use when the user says take over run X, land PR N, babysit the PR, drive it home, watch the PR to merge, wait for CodeRabbit, or fix the review findings. Triggers include take over the run, land the PR, babysit, drive it home, uzi lander, CR rate limited, greptile review, merge it when green."
 ---
 
 # uzi lander — take over a run and land its PR
@@ -31,6 +31,10 @@ Below, `RUN` is a run id, `PR` a PR number, `S` this skill's `scripts/` director
   decision itself. When a step turns out to be mechanical, put it in a script.
 - **Absent user = time is cheap.** Ask in plain text with the default stated (never a
   blocking prompt), start the patient path in the same turn, and let a reply override it.
+- **Claim what you land.** `takeover.sh` records this session as the PR's lander in the
+  repo's shared state (`claims.sh`), so other landers, Claude or Codex, see who holds what
+  and message you instead of double-driving it. A PR another live session holds stops you
+  at `NEXT=claimed_by_other`: talk to them (SendMessage), do not take it.
 - **Never in the `main` worktree.** Every local edit happens in a sibling worktree
   (`land-prep.sh` makes one); auto-clean worktrees you created once the PR merges.
 
@@ -48,6 +52,7 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
 | `run_failed:*`, `run_completed_no_pr` | hand to `uzi-watcher` (*When a run fails*, recovery) |
 | `migration_collision`, `conflict` | step 5 |
 | `ci_red` | read the failing job; fix locally (step 4) or classify flake |
+| `claimed_by_other` | another live lander holds it: message the owner, take the patient path |
 | `mr_rework_active` | `S/wait-mrrework.sh` (references/mr-rework.md), then re-snapshot |
 | `ci_pending`, `review_pending` | step 2 |
 | `cr_rate_limited`, `no_review` | step 3 |
@@ -137,14 +142,40 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    ```
 
    It refuses on a moved head, an active rework, red or pending required checks, or a
-   git conflict, and confirms `MERGED` before printing `MERGE_SHA`. A classifier block
-   prints the exact command for the user's `!` line. Trail `admin-merged <sha8>`.
+   git conflict, takes the repo-wide merge lock (exit 7 = another lander is merging; wait
+   for its `main` run to appear), confirms `MERGED`, prints `MERGE_SHA`, writes the trail
+   line and releases the claim. A classifier block prints the exact command for the
+   user's `!` line.
 7. **Post-merge CI.** `S/watch-run-ci.sh --sha MERGE_SHA --interval 60` in the background.
    Exit 0 green (a partial dispatch counts; confirm a gate fix another way), 1 red (fix on a
    branch, never code to `main`; flake → rerun + file), 3 no run appeared, 4 superseded →
    re-watch the current `main` head (references/merge-mechanics.md). Trail `main ci green`.
 8. **Finish.** Remove the worktrees and branches you created (`git worktree remove`,
-   `git branch -D`), print the final trail line, and hand any still-open item on.
+   `git branch -D`), print the final trail line, `S/claims.sh reap --repo OWNER/REPO`
+   (drops claims whose PR merged or closed and orphans of dead sessions), and hand any
+   still-open item on.
+
+## Several landers on one repo
+
+The shared state (`lib/state.sh`: the main checkout's `.git/uzi-lander/`, seen by every
+worktree, never tracked) holds one claim per PR: owner name, durable session uuid, kind,
+size, priority, `depends_on`, and the last trail state. Identity and liveness come from the
+session-peers registry, so a Codex thread with a shim is a peer like any Claude session.
+
+- **Read the board before you spend a review.** `S/claims.sh list` next to
+  `S/review-quota.sh`: every push to an eligible PR and every `@coderabbitai review` is one
+  review from the shared quota.
+- **Order: big PRs get CodeRabbit first.** Priority defaults to the PR's file count. A large
+  or trust-boundary PR is worth the bot; a small PR is cheap to review with `/code-review`
+  or a peer, so it yields when the quota is tight. The sessions decide among themselves
+  (SendMessage, one line: what you hold, what you are about to consume, what you propose);
+  the user overrides with `--priority`.
+- **Dependencies.** `S/claims.sh claim '#B' --depends-on '#A'` when B must land after A;
+  `list` shows it, and B's lander waits on A's owner (trail `waiting #A`).
+- **Contested PR.** Never `--force` a live session's claim; message the owner. A dead or
+  stale owner (registry says gone, or no heartbeat for 6 h) is taken over silently.
+- **Cleanup is automatic.** `merge.sh` releases the claim and trail on `MERGED`; `reap`
+  removes the rest. Nothing here is a lock on the PR itself, only on the merge step.
 
 ## Waiting, uniformly
 
@@ -164,7 +195,9 @@ a user reply that arrives first wins.
 
 ## Files
 
-- `scripts/takeover.sh` snapshot + `NEXT`; `scripts/trail.sh` the status line.
+- `scripts/takeover.sh` snapshot + claim + `NEXT`; `scripts/trail.sh` the status line;
+  `scripts/claims.sh` who lands what (claim / release / list / reap / whoami);
+  `scripts/lib/state.sh` the shared state dir and session identity.
 - `scripts/watch-pr.sh` readiness (CI + CR/Greptile on head + rework + rate-limit/skip exits);
   `scripts/pr-findings.sh` findings from both bots; `scripts/cr-rate-limit.sh` reset +
   wait; `scripts/review-quota.sh` who else consumes reviews; `scripts/wait-mrrework.sh`

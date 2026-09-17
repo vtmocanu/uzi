@@ -19,7 +19,12 @@
 # not fatal.
 set -uo pipefail
 
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/state.sh
+. "$HERE/lib/state.sh"
+
 REPO=${1:?usage: review-quota.sh OWNER/REPO}
+SD=$(state_dir) || SD=""
 
 prs=$(gh pr list --repo "$REPO" --state open --limit 50 \
   --json number,title,author,isDraft,headRefOid,updatedAt 2>/dev/null) || { echo "gh pr list failed" >&2; exit 3; }
@@ -42,7 +47,11 @@ while IFS=$'\t' read -r num author draft head title; do
     *"rate limited"*) limited=$((limited+1));;
   esac
   case "$elig" in yes) eligible=$((eligible+1));; esac
-  printf '  #%-5s cr=%-45s eligible=%-22s %s\n' "$num" "'${desc:-absent}'" "$elig" "${title:0:60}"
+  owner="-"
+  if [ -n "$SD" ] && [ -f "$SD/claims/#$num.json" ]; then
+    owner=$(jq -r '"\(.owner) (\(.state|if .=="" then "?" else . end))"' "$SD/claims/#$num.json" 2>/dev/null || echo "?")
+  fi
+  printf '  #%-5s cr=%-45s eligible=%-22s lander=%-28s %s\n' "$num" "'${desc:-absent}'" "$elig" "$owner" "${title:0:60}"
 done < <(printf '%s' "$prs" | jq -r '.[]|[.number, .author.login, (.isDraft|tostring), .headRefOid, .title]|@tsv')
 
 echo
