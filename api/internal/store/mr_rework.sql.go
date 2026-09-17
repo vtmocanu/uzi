@@ -82,8 +82,8 @@ type CreateAutoMRReworkRunParams struct {
 // harness (PRD #1429 M1, was #1332 M5A / D2): now the @harness PARAMETER supplied by the M5B
 // create seam (workersvc.createRunAtomic) in the SELECT list, not the SQL literal 'claude'. A
 // derived mr_rework inherits its source run's harness as an explicit selection (D4); M2 wires
-// that real value. Every current caller passes string(HarnessClaude) as a mechanical stopgap.
-// Keep in sync with CreateManualMRReworkRunAndAdvance's body below.
+// that real value — the caller passes the D11-resolved, source-run-inherited harness, not a
+// stopgap. Keep in sync with CreateManualMRReworkRunAndAdvance's body below.
 func (q *Queries) CreateAutoMRReworkRun(ctx context.Context, arg CreateAutoMRReworkRunParams) (Run, error) {
 	row := q.db.QueryRow(ctx, createAutoMRReworkRun,
 		arg.UserID,
@@ -266,7 +266,7 @@ SELECT
     $1, $2::uuid, 'mr_rework', $3, $4,
     $5, $6, $7, $8::jsonb, true, $9,
     -- harness (PRD #1429 M1, was #1332 M5A / D2): the @harness PARAMETER, mirroring
-    -- CreateAutoMRReworkRun. Every current caller passes string(HarnessClaude) as a stopgap.
+    -- CreateAutoMRReworkRun. The caller passes the D11-resolved, source-run-inherited harness.
     COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = $2::uuid), '{}'), 'manual', $10
 WHERE NOT EXISTS (
     SELECT 1 FROM runs
