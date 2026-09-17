@@ -1506,6 +1506,9 @@ export class SdkExecutor implements Executor {
             // does not infer the parent from the clone's freshly-fetched default branch.
             baseCommit: ctx.baseCommit,
             defaultBranchCommit: ctx.defaultBranchCommit,
+            // PRD #1416 M1: name the published floor P — ci_fix branches are routinely
+            // published (PRD fact 17). Absent ⇒ no note.
+            publishedTip: ctx.publishedTip,
             // PRD #501 REC B: thread the autopilot flag so the plan note renders.
             autoApprove: ctx.autoApprove,
           });
@@ -1534,6 +1537,9 @@ export class SdkExecutor implements Executor {
             // cycle's tip, so its base is the least guessable of the three kinds.
             baseCommit: ctx.baseCommit,
             defaultBranchCommit: ctx.defaultBranchCommit,
+            // PRD #1416 M1: name the published floor P — the self_improve branch is
+            // routinely published (PRD fact 17). Absent ⇒ no note.
+            publishedTip: ctx.publishedTip,
             // PRD #501 REC B: thread the autopilot flag so the plan note renders.
             autoApprove: ctx.autoApprove,
           });
@@ -1560,6 +1566,8 @@ export class SdkExecutor implements Executor {
             // See above.
             baseCommit: ctx.baseCommit,
             defaultBranchCommit: ctx.defaultBranchCommit,
+            // PRD #1416 M1: name the published floor P on a run with one. Absent ⇒ no note.
+            publishedTip: ctx.publishedTip,
             // PRD #501 REC B: thread the autopilot flag so the plan note renders.
             autoApprove: ctx.autoApprove,
           });
@@ -2112,6 +2120,12 @@ export class SdkExecutor implements Executor {
           agent: "worker",
           payload: { text: `implement/review iteration ${iteration}` },
         });
+        // PRD #1416 M2: drain the worker-authoritative safety steer BEFORE building the implement
+        // prompt, so an M2-armed steer reaches the next turn and an M5-armed steer reaches
+        // iteration 1. Every iteration (including the first), and AHEAD of the end-of-iteration
+        // follow-up drain at ~2672 — it survives the paths that `continue` before that drain, and
+        // is rendered as worker guidance OUTSIDE the <follow_up> fence (see buildImplementPrompt).
+        const safetySteer = ctx.pullSafetySteer?.();
         // PRD #1064 M1 (Decisions 1/2): a per-turn progress observer. It owns the diff base
         // (seeded from the loop-scope latestProgress, the previous turn's final snapshot, so
         // a transition already seen does not re-emit) and the frozen titles, emits the
@@ -2174,6 +2188,17 @@ export class SdkExecutor implements Executor {
             // lead hands a subagent a diff command, which is where the wrong one was seen.
             baseCommit: ctx.baseCommit,
             defaultBranchCommit: ctx.defaultBranchCommit,
+            // PRD #1416 M1: name the published floor P, first turn only (gated inside
+            // buildImplementPrompt). Absent ⇒ no note.
+            publishedTip: ctx.publishedTip,
+            // #1416 (MR-rework): under auto-approve the published-tip note's rewrite guidance
+            // must not tell the agent to call `ask_user` (no human answers it), matching the
+            // plan builders above.
+            autoApprove: ctx.autoApprove,
+            // PRD #1416 M2: the worker-authoritative safety steer drained above, EVERY turn it is
+            // present (drained fresh each turn, not first-turn-only). Rendered as worker guidance
+            // ahead of any <follow_up> block. Absent ⇒ no block.
+            safetySteer,
             // PRD #209 (D7): a requeued seeded run whose transcript was dropped re-enters
             // implement COLD — no plan turn carried the prior-work note. Threaded on the
             // pre-approved path ONLY, so an ordinary gated run's implement prompt is

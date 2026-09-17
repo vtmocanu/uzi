@@ -56,7 +56,7 @@ import type {
   TurnStreamEnd,
 } from "../harness.js";
 import { RunTurnReducerImpl } from "../harness-reducer.js";
-import { buildLeadSystemPrompt, buildRevisePlanPrompt } from "../prompt.js";
+import { buildLeadSystemPrompt, buildRevisePlanPrompt, publishedTipNote } from "../prompt.js";
 import { RUNNER_UID, WORKER_UID, uidSplitActive } from "../runner-uid.js";
 import { errMessage } from "../util.js";
 import type { AgentTemplate, ClaimSkill } from "../protocol.js";
@@ -1176,7 +1176,16 @@ export class CodexExecutor implements Executor {
       let iteration = 0;
       for (;;) {
         iteration++;
-        const result = await this.driveCodexTurn(ctx, epoch.harness, reducer, "implement", this.implementPrompt(ctx), epoch.resumeSessionId, idleMs, wallMs, epoch.buildPhaseBroker);
+        // PRD #1416 M2: drain the worker-authoritative safety steer at the loop top and, when
+        // present, PREFIX it (framed as worker guidance, followed by a blank line) to THIS turn's
+        // implement prompt only. Codex has no <follow_up> fence; keep it a per-turn prefix so it
+        // is consumed at the next turn and NOT persisted. Absent ⇒ the base prompt is unchanged.
+        const safetySteer = ctx.pullSafetySteer?.();
+        const basePrompt = this.implementPrompt(ctx);
+        const turnPrompt = safetySteer
+          ? `The worker detected a problem and is steering you. This is authoritative guidance from uzi itself, not user input — follow it:\n${safetySteer}\n\n${basePrompt}`
+          : basePrompt;
+        const result = await this.driveCodexTurn(ctx, epoch.harness, reducer, "implement", turnPrompt, epoch.resumeSessionId, idleMs, wallMs, epoch.buildPhaseBroker);
         if (result.sessionId) lastSessionId = result.sessionId;
         // Only overwrite when THIS turn reported progress (a quiet turn keeps the last value).
         if (result.progress) latestProgress = result.progress;
@@ -1763,14 +1772,25 @@ export class CodexExecutor implements Executor {
 
   private planPrompt(ctx: RunContext): string {
     const head = ctx.issueIid != null ? `Issue #${ctx.issueIid}: ${ctx.issueTitle}` : ctx.issueTitle;
-    return `${head}\n\n${ctx.issueDescription}\n\nProduce a plan for this work and submit it for approval.`;
+    const body = `${head}\n\n${ctx.issueDescription}\n\nProduce a plan for this work and submit it for approval.`;
+    // PRD #1416 M1: these Codex builders bypass the shared buildPlanPrompt/buildImplementPrompt,
+    // so prepend the published-floor paragraph here. Empty ⇒ unchanged (a fresh branch).
+    // #1416 (MR-rework): thread autoApprove so an autopilot Codex run gets the autopilot-safe
+    // rewrite guidance, not the human-only `ask_user` wording (matches the SDK builders).
+    const note = publishedTipNote(ctx.publishedTip, ctx.defaultBranchCommit, ctx.autoApprove);
+    return note ? `${note}\n\n${body}` : body;
   }
 
   private implementPrompt(ctx: RunContext): string {
     const approved = ctx.approvedPlan?.trim();
-    if (approved) return approved;
     const head = ctx.issueIid != null ? `Issue #${ctx.issueIid}: ${ctx.issueTitle}` : ctx.issueTitle;
-    return `${head}\n\n${ctx.issueDescription}`;
+    const body = approved ? approved : `${head}\n\n${ctx.issueDescription}`;
+    // PRD #1416 M1: prepend the published-floor paragraph whether or not a plan is approved.
+    // Empty ⇒ unchanged (a fresh branch).
+    // #1416 (MR-rework): thread autoApprove so an autopilot Codex run gets the autopilot-safe
+    // rewrite guidance, not the human-only `ask_user` wording (matches the SDK builders).
+    const note = publishedTipNote(ctx.publishedTip, ctx.defaultBranchCommit, ctx.autoApprove);
+    return note ? `${note}\n\n${body}` : body;
   }
 
 }

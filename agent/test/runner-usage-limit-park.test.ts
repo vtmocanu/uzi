@@ -1705,3 +1705,102 @@ describe("RunRunner — worker-shutdown fetch-back (PRD #218 M1)", () => {
     }
   });
 });
+
+// PRD #1416 M3 (FIX 2) — the ancestry bridge driven through the REAL limit-park sink
+// (bridgeParkSinkBestEffort "limit-park"). A rewrite below the published floor P leaves a divergent
+// tracking tip H; the park sink must bridge it to B (with P and H as ancestors) BEFORE the park
+// publish, so the published checkpoint carries B (descends from P) and a reseed on resume adopts it.
+describe("RunRunner — limit-park ancestry bridge (PRD #1416 M3, FIX 2)", () => {
+  /** Publish `agent/issue-{iid}` on the fixture origin so its tip P is a real forge tip the reseed
+   *  records as the published floor. Restores origin to main. Returns P. */
+  function publishAgentBranch(iid: number): string {
+    const branch = `agent/issue-${iid}`;
+    execFileSync("git", ["-C", fx.originPath, "checkout", "-b", branch], { env: GIT_ENV, stdio: "pipe" });
+    fs.writeFileSync(path.join(fx.originPath, "PUBLISHED.md"), `# published ${branch}\n`);
+    execFileSync("git", ["-C", fx.originPath, "add", "."], { env: GIT_ENV, stdio: "pipe" });
+    execFileSync("git", ["-C", fx.originPath, ...IDENT, "commit", "-m", `published ${branch}`], {
+      env: GIT_ENV,
+      stdio: "pipe",
+    });
+    const sha = execFileSync("git", ["-C", fx.originPath, "rev-parse", "HEAD"], {
+      env: GIT_ENV,
+      encoding: "utf8",
+    }).trim();
+    execFileSync("git", ["-C", fx.originPath, "checkout", "main"], { env: GIT_ENV, stdio: "pipe" });
+    return sha;
+  }
+
+  /** True when `ancestor` is an ancestor of (or equal to) `descendant` in the bare. */
+  function bareAncestor(bare: string, ancestor: string, descendant: string): boolean {
+    try {
+      execFileSync("git", ["-C", bare, "merge-base", "--is-ancestor", ancestor, descendant], {
+        env: GIT_ENV,
+        stdio: "pipe",
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  it("a rewrite below P is bridged at the limit park: the tracking tip becomes B (descends from P and H), and a reseed adopts it", async () => {
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-1416-limit-"));
+    try {
+      const iid = 1417;
+      const runId = "20000000-0000-4000-8000-000000001417";
+      const P = publishAgentBranch(iid);
+      // The clone seeds from origin at P; the executor AMENDS it → a divergent sibling H (P is not an
+      // ancestor of H), then parks on a usage limit → the limit-park sink bridges the divergent tip.
+      let H = "";
+      const factory: ExecutorFactory = (rid) => ({
+        homeDir: path.join(homeRoot, rid),
+        executor: {
+          run: async (ctx: RunContext): Promise<ExecutorResult> => {
+            fs.writeFileSync(path.join(ctx.worktreePath, "REWRITE.md"), "rewrite below P\n");
+            execFileSync("git", ["-C", ctx.worktreePath, "add", "."], { env: GIT_ENV, stdio: "pipe" });
+            execFileSync("git", ["-C", ctx.worktreePath, ...IDENT, "commit", "--amend", "--no-edit"], {
+              env: GIT_ENV,
+              stdio: "pipe",
+            });
+            H = execFileSync("git", ["-C", ctx.worktreePath, "rev-parse", "HEAD"], {
+              env: GIT_ENV,
+              encoding: "utf8",
+            }).trim();
+            fs.mkdirSync(path.join(homeRoot, rid), { recursive: true });
+            throw new LimitReachedError({
+              resetsAtMs: Date.now() + 5 * 3600_000,
+              rateLimitType: "five_hour",
+            });
+          },
+        },
+      });
+      await runnerWith(factory, gitlab).execute(
+        gitlabClaim(iid, { run_id: runId, wait_on_limit: true }),
+      );
+
+      assert.ok(api.states.some((s) => s.body.status === "limit_wait"), "the run parked limit_wait");
+      const bare = git.barePathFor(fx.originPath);
+      const B = shaInBare(bare, trackingRef(iid));
+      assert.ok(B, "the tracking ref exists after the limit park");
+      // The REAL limit-park sink bridged the divergent H: the captured tip is neither the raw H nor
+      // P, and BOTH P and H are ancestors of it.
+      assert.notStrictEqual(B, H, "the tracking tip is the bridge B, not the raw rewritten H");
+      assert.notStrictEqual(B, P, "the tracking tip is the bridge B, not the published floor P");
+      assert.ok(bareAncestor(bare, P, B!), "P is an ancestor of the bridged tracking tip B");
+      assert.ok(H && bareAncestor(bare, H, B!), "H is an ancestor of the bridged tracking tip B");
+
+      // A same-run reseed adopts B off the tracking ref (ownedHere leg: B strictly descends P), so
+      // the resume continues on the rewritten work rather than setting it aside for origin.
+      const reseed = await git.runnerCloneForBranch(bare, `agent/issue-${iid}`, `issue-${iid}`, runId, true);
+      assert.strictEqual(reseed.seededFrom, "tracking", "the bridged tip descends from P → adopted");
+      assert.strictEqual(
+        execFileSync("git", ["-C", reseed.path, "rev-parse", "HEAD"], { env: GIT_ENV, encoding: "utf8" }).trim(),
+        B,
+        "the reseeded clone HEAD is the bridge B",
+      );
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+});

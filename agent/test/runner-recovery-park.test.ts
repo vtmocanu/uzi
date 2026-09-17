@@ -271,3 +271,82 @@ describe("RunRunner — recovery_wait park (issue #1197 D-RC2c)", () => {
     }
   });
 });
+
+// PRD #1416 M3 (FIX 2) — the ancestry bridge driven through the REAL recovery-capture sink
+// (captureRecoveryRestorePoint → bridgeParkSinkBestEffort "recovery-capture"). A rewrite below the
+// published floor P leaves a divergent tracking tip H; the sink must bridge it to B (with P and H as
+// ancestors) so the verified restore point + its published checkpoint hold B, and a reseed on resume
+// adopts B instead of setting the rewritten work aside.
+describe("RunRunner — recovery-capture ancestry bridge (PRD #1416 M3, FIX 2)", () => {
+  /** Publish `agent/issue-{iid}` on the fixture origin so its tip P is a real forge tip the reseed
+   *  records as the published floor. Restores origin to main. Returns P. */
+  function publishAgentBranch(iid: number): string {
+    const branch = `agent/issue-${iid}`;
+    execFileSync("git", ["-C", fx.originPath, "checkout", "-b", branch], { env: GIT_ENV, stdio: "pipe" });
+    fs.writeFileSync(path.join(fx.originPath, "PUBLISHED.md"), `# published ${branch}\n`);
+    execFileSync("git", ["-C", fx.originPath, "add", "."], { env: GIT_ENV, stdio: "pipe" });
+    execFileSync("git", ["-C", fx.originPath, ...IDENT, "commit", "-m", `published ${branch}`], {
+      env: GIT_ENV,
+      stdio: "pipe",
+    });
+    const sha = execFileSync("git", ["-C", fx.originPath, "rev-parse", "HEAD"], {
+      env: GIT_ENV,
+      encoding: "utf8",
+    }).trim();
+    execFileSync("git", ["-C", fx.originPath, "checkout", "main"], { env: GIT_ENV, stdio: "pipe" });
+    return sha;
+  }
+
+  /** True when `ancestor` is an ancestor of (or equal to) `descendant` in the bare. */
+  function bareAncestor(bare: string, ancestor: string, descendant: string): boolean {
+    try {
+      execFileSync("git", ["-C", bare, "merge-base", "--is-ancestor", ancestor, descendant], {
+        env: GIT_ENV,
+        stdio: "pipe",
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  it("a rewrite below P is bridged at the recovery capture: the tracking tip becomes B (descends from P and H)", async () => {
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-1416-rec-"));
+    try {
+      const iid = 1418;
+      const P = publishAgentBranch(iid);
+      // The clone seeds from origin at P; the executor AMENDS it → a divergent sibling H (P is not an
+      // ancestor of H), then throws TransientRecoveryError → captureRecoveryRestorePoint.
+      let H = "";
+      const { factory } = recoveryFactory(homeRoot, iid, (wt) => {
+        fs.writeFileSync(path.join(wt, "REWRITE.md"), "rewrite below P\n");
+        execFileSync("git", ["-C", wt, "add", "."], { env: GIT_ENV, stdio: "pipe" });
+        execFileSync("git", ["-C", wt, ...IDENT, "commit", "--amend", "--no-edit"], {
+          env: GIT_ENV,
+          stdio: "pipe",
+        });
+        H = execFileSync("git", ["-C", wt, "rev-parse", "HEAD"], { env: GIT_ENV, encoding: "utf8" }).trim();
+      });
+      await runnerWith(factory, gitlab).execute(
+        gitlabClaim(iid, { run_id: "20000000-0000-4000-8000-000000001418" }),
+      );
+
+      assert.ok(
+        api.states.some((s) => s.body.status === "recovery_wait"),
+        "the run parked recovery_wait after the verified capture",
+      );
+      const bare = git.barePathFor(fx.originPath);
+      const B = shaInBare(bare, trackingRef(iid));
+      assert.ok(B, "the tracking ref exists after the recovery capture");
+      // The REAL sink bridged the divergent H: the captured tip is neither the raw H nor P, and BOTH
+      // P and H are ancestors of it — a reseed fast-forwards from P and still carries the rewritten work.
+      assert.notStrictEqual(B, H, "the captured tip is the bridge B, not the raw rewritten H");
+      assert.notStrictEqual(B, P, "the captured tip is the bridge B, not the published floor P");
+      assert.ok(bareAncestor(bare, P, B!), "P is an ancestor of the captured tip B");
+      assert.ok(H && bareAncestor(bare, H, B!), "H is an ancestor of the captured tip B");
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+});

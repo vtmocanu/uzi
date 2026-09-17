@@ -118,6 +118,12 @@ export interface RunContext {
    *  alongside `baseCommit` because on a RESUME the two differ and name different diffs;
    *  the prompt is wrong on exactly the prior-work runs if it only ever sees one. */
   defaultBranchCommit?: string;
+  /** PRD #1416 M1: the branch's published forge tip P at claim (runner.ts `RunFlight.publishedTip`,
+   *  fact 2). Set only on a run whose branch already existed on the forge at clone (task,
+   *  mr_rework, self_improve, ci_fix on an existing branch, every resume of a pushed branch).
+   *  Threaded to the plan/implement builders so they name P with the fast-forward-only rule.
+   *  Optional; absent (a fresh issue branch) ⇒ no note. See prompt.ts `publishedTipNote`. */
+  publishedTip?: string;
   /** PRD #501 REC B: this run is auto-approved (autopilot, claim.auto_approve) — no
    *  human in the loop. Threaded to the plan builders so the lead is told up front to
    *  resolve open decisions on best judgment rather than calling `ask_user`. Optional;
@@ -316,6 +322,12 @@ export interface RunContext {
   askUser?(questions: AskUserQuestion[]): Promise<AnswerVerdict>;
   /** M4: dequeue the next queued follow-up to inject into the next loop turn. */
   pullFollowUp?(): string | undefined;
+  /** PRD #1416 M2: drain the WORKER-AUTHORITATIVE safety steer armed in-process by the runner's
+   *  divergence detection, if any. Consumed with PRIORITY at each executor loop top — ahead of
+   *  pullFollowUp — and rendered as worker guidance, NOT as untrusted <follow_up> user input (D3).
+   *  Distinct from pullFollowUp: it carries no server input id and never touches the follow-up
+   *  wake-guard watermark. Optional; absent (a stub/older wiring) ⇒ no steer. */
+  pullSafetySteer?(): string | undefined;
   /**
    * M4: report a running/iteration heartbeat (server persists via GREATEST).
    *

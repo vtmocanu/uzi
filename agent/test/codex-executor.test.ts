@@ -2657,3 +2657,118 @@ describe("CodexExecutor: production tool-handler map (item 5)", () => {
     assert.deepEqual(forgeCalls, [7], "the shared forge handler ran with the child-supplied iid");
   });
 });
+
+// PRD #1416 M1: the Codex executor's planPrompt/implementPrompt are trivial string builders that
+// bypass the shared buildPlanPrompt/buildImplementPrompt, so the published-floor paragraph is
+// prepended directly (from publishedTipNote). These assert it rides both prompts when
+// ctx.publishedTip is set (with AND without an approved plan) and is absent otherwise.
+describe("CodexExecutor prompts — published-tip note (PRD #1416 M1)", () => {
+  const P = "0123456789abcdef0123456789abcdef01234567";
+  const DFLT = "fedcba9876543210fedcba9876543210fedcba98";
+  const exec = makeExecutor(makeRig(), bindingOf(SUBSCRIPTION));
+  const planPrompt = (ctx: RunContext): string =>
+    (exec as unknown as { planPrompt(c: RunContext): string }).planPrompt(ctx);
+  const implementPrompt = (ctx: RunContext): string =>
+    (exec as unknown as { implementPrompt(c: RunContext): string }).implementPrompt(ctx);
+
+  it("planPrompt prepends the paragraph when publishedTip is set, omits it when absent", () => {
+    const withP = planPrompt(makeCtx({ publishedTip: P, defaultBranchCommit: DFLT }).ctx);
+    assert.ok(withP.includes("already published on the forge"));
+    assert.ok(withP.includes(P));
+    // Prepended: it comes before the plan instruction.
+    assert.ok(withP.indexOf("already published on the forge") < withP.indexOf("Produce a plan"));
+    const without = planPrompt(makeCtx().ctx);
+    assert.ok(!without.includes("already published on the forge"));
+  });
+
+  it("implementPrompt prepends the paragraph WITH an approved plan present", () => {
+    const withP = implementPrompt(
+      makeCtx({ approvedPlan: "the approved plan", publishedTip: P, defaultBranchCommit: DFLT }).ctx,
+    );
+    assert.ok(withP.includes("already published on the forge"));
+    assert.ok(withP.includes(P));
+    assert.ok(withP.includes("the approved plan"), "the approved plan body is preserved");
+    assert.ok(withP.indexOf("already published on the forge") < withP.indexOf("the approved plan"));
+  });
+
+  it("implementPrompt prepends the paragraph WITHOUT an approved plan", () => {
+    const withP = implementPrompt(makeCtx({ approvedPlan: undefined, publishedTip: P }).ctx);
+    assert.ok(withP.includes("already published on the forge"));
+    assert.ok(withP.includes(P));
+    assert.ok(withP.includes("the description"), "the issue fallback body is preserved");
+  });
+
+  it("implementPrompt omits it when publishedTip is absent (with and without a plan)", () => {
+    assert.ok(!implementPrompt(makeCtx({ approvedPlan: "p" }).ctx).includes("already published on the forge"));
+    assert.ok(!implementPrompt(makeCtx({ approvedPlan: undefined }).ctx).includes("already published on the forge"));
+  });
+
+  it("threads autoApprove: an autopilot Codex prompt gets plan-only rewrite guidance, not `ask_user`", () => {
+    // #1416 (MR-rework): under auto-approve the Codex plan/implement prompts must carry the
+    // autopilot-safe rewrite guidance, not the human-only `ask_user` wording (matches the SDK path).
+    const autoPlan = planPrompt(makeCtx({ publishedTip: P, autoApprove: true }).ctx);
+    assert.ok(autoPlan.includes("state the constraint plainly in the plan"), "autopilot plan gives plan-only guidance");
+    assert.ok(!autoPlan.includes("stop and call `ask_user`"), "autopilot plan does not call ask_user");
+    // The default (non-autopilot) form keeps the `ask_user` rewrite guidance.
+    const manualPlan = planPrompt(makeCtx({ publishedTip: P, autoApprove: false }).ctx);
+    assert.ok(manualPlan.includes("stop and call `ask_user`"), "the default Codex plan keeps the ask_user guidance");
+    const autoImpl = implementPrompt(
+      makeCtx({ approvedPlan: "the approved plan", publishedTip: P, autoApprove: true }).ctx,
+    );
+    assert.ok(autoImpl.includes("state the constraint plainly in the plan"), "autopilot implement gives plan-only guidance");
+    assert.ok(!autoImpl.includes("stop and call `ask_user`"), "autopilot implement does not call ask_user");
+  });
+});
+
+// PRD #1416 M2: the Codex implement loop drains ctx.pullSafetySteer at its loop top and, when
+// present, PREFIXES it (framed as worker guidance, followed by a blank line) to THAT turn's
+// implement prompt only — Codex has no <follow_up> fence, so it is a per-turn prefix, not
+// persisted. Driven through a real implement turn so the prompt the transport receives is the
+// one the loop actually built.
+describe("CodexExecutor — safety-steer prefix at the loop top (PRD #1416 M2)", () => {
+  it("prepends the drained steer as worker guidance to the implement turn's prompt", async () => {
+    const responder: Responder = (c) => {
+      if (c.method === "thread/start") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") {
+        c.transport.push(toolCall(1, "signal_done", {}, "th-1", "tn-1", "c-done")).push(turnCompleted("completed", "th-1", "tn-1"));
+        return { turn: { id: "tn-1" } };
+      }
+      return {};
+    };
+    const rig = makeRig({ responder });
+    rig.transport.push(threadStarted());
+    // Pre-approved by default (makeCtx sets approvedPlan) → straight into the implement loop.
+    const { ctx } = makeCtx({ pullSafetySteer: () => "WORKER-SAFETY-STEER-BODY-CODEX" });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "codex steer run");
+
+    // codex-harness sends the turn prompt as turn/start input[0].text (render passes it verbatim).
+    const turnStart = rig.transport.requests.find((r) => r.method === "turn/start");
+    const text = (turnStart!.params as { input?: { text?: string }[] }).input?.[0]?.text ?? "";
+    const steerIdx = text.indexOf("WORKER-SAFETY-STEER-BODY-CODEX");
+    const planIdx = text.indexOf("the approved plan");
+    assert.ok(steerIdx >= 0, "the steer reached the implement turn's prompt");
+    assert.match(text, /The worker detected a problem and is steering you/); // worker-guidance framing
+    assert.ok(planIdx >= 0 && steerIdx < planIdx, "the steer is a PREFIX before the base implement prompt");
+    assert.ok(!text.includes("<follow_up>"), "no <follow_up> fence wraps the Codex steer");
+  });
+
+  it("leaves the prompt unchanged when no steer is armed", async () => {
+    const responder: Responder = (c) => {
+      if (c.method === "thread/start") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") {
+        c.transport.push(toolCall(1, "signal_done", {}, "th-1", "tn-1", "c-done")).push(turnCompleted("completed", "th-1", "tn-1"));
+        return { turn: { id: "tn-1" } };
+      }
+      return {};
+    };
+    const rig = makeRig({ responder });
+    rig.transport.push(threadStarted());
+    const { ctx } = makeCtx({ pullSafetySteer: () => undefined });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "codex no-steer run");
+
+    const turnStart = rig.transport.requests.find((r) => r.method === "turn/start");
+    const text = (turnStart!.params as { input?: { text?: string }[] }).input?.[0]?.text ?? "";
+    assert.doesNotMatch(text, /The worker detected a problem and is steering you/);
+    assert.ok(text.includes("the approved plan"), "the base implement prompt is unchanged");
+  });
+});

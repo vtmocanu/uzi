@@ -1347,7 +1347,9 @@ choices.
   with **your own** git credentials, then (3) dispatches the run so a worker may claim
   it; the worker commits onto the same branch, which you pull. The three steps are
   ordered on purpose — a failed push stops before dispatch, so the run never becomes
-  claimable with no seed content. Context comes from `--message`, or `--file <path>`
+  claimable with no seed content. The seeded branch is already published, so phrase
+  the task as "merge main," never "rebase onto main" — uzi never force-pushes a
+  rewrite of a branch it already published. Context comes from `--message`, or `--file <path>`
   (`-` for stdin), or piped stdin. The repo is auto-detected from your `origin` remote;
   `--repo <repo-id>` overrides it. `--base <ref>` branches from a named ref instead of
   local HEAD. `--mr` has the worker open a merge request (and exempts the branch from

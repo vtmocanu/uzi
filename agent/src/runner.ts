@@ -130,6 +130,50 @@ class TerminalReportError extends Error {
 }
 
 /**
+ * PRD #1416 M3/M4 SEAM — thrown at the FINALIZE bridge sites (the align `fetchAndPush`; the plain
+ * push handles the same outcome by a direct call+return) when the branch's history was rewritten
+ * at/below the published floor P AND the ancestry bridge B could not be built or validated, so the
+ * run cannot be landed with a fast-forward push. Defined and thrown from where
+ * `bridgeBareTrackingRefIfDivergent` returns `{kind:"failed"}`. M4 CATCHES it — the align chain is
+ * wrapped in a try/catch that routes it to `failHistoryRewritten` — so it is TYPED
+ * `history_rewritten` with a scan-gated preserved_patch and NEVER reaches the generic failure path
+ * (SC3). Carries P (the published floor) so the typed reason can name it. Local, like
+ * TerminalReportError / StaleClaimError. The MID-RUN and PARK/CAPTURE bridge sinks must NEVER throw
+ * it (best-effort — a park that loses a bridge is worse than one that fails, D4). */
+class HistoryRewrittenError extends Error {
+  constructor(readonly publishedTip: string) {
+    super(
+      `history rewritten at or below the published tip ${publishedTip}; a fast-forward bridge could not be built or validated`,
+    );
+    this.name = "HistoryRewrittenError";
+  }
+}
+
+/** PRD #1416 (MR-rework, finding 1) — a data-free unwind sentinel: the post-bridge secret scan
+ *  found a trusted secret in the now-pushable `P..B` range and has ALREADY terminally reported
+ *  push_secret_blocked (via reportPushSecretBlocked). Thrown from the ALIGN chain's fetchAndPush so
+ *  the enclosing align try/catch (which types HistoryRewrittenError) unwinds without pushing, and
+ *  caught in the outer finalize catch to STOP rather than re-report. Local, like HistoryRewrittenError. */
+class PushSecretBlockedSignal extends Error {
+  constructor() {
+    super("push_secret_blocked already reported by the post-bridge secret scan");
+    this.name = "PushSecretBlockedSignal";
+  }
+}
+
+/** PRD #1416 M3 — the outcome of {@link RunRunner.bridgeBareTrackingRefIfDivergent} at a
+ *  publication boundary. "clean": P (and C) already ancestors of the tracking tip, nothing to do.
+ *  "unknown": ancestry could not be read, so do NOT bridge and do NOT fail. "bridged": B was built
+ *  + validated, the tracking ref advanced to B, and C advanced to B. "failed": divergent, but B
+ *  could not be built or validated (the finalize sinks turn this into a HistoryRewrittenError; the
+ *  mid-run/park/capture sinks log it and continue — best-effort, D4). */
+type BridgeOutcome =
+  | { kind: "clean" }
+  | { kind: "unknown" }
+  | { kind: "bridged"; bridge: string }
+  | { kind: "failed" };
+
+/**
  * PRD #1392 M2 — `ensureClone` exhausted `withForgeRetry` with a TRANSIENT verdict: the forge
  * was unreachable at clone/fetch (a DNS blip, a connection reset, a 5xx), not a permanent
  * rejection (401/403/404). `phaseClone` wraps the `ensureClone` throw in this so `executeClaim`'s
@@ -249,10 +293,20 @@ export function composeWorkflowScopeReason(paths: string[]): string {
  * not by slicing the whole string at the end. Exported for a direct cap unit test; the caller
  * still applies `.slice(0, MAX_FAILURE_REASON_LEN)` as a belt-and-braces net.
  */
-export function composePushSecretBlockedReason(findings: SecretFinding[]): string {
-  const prefix =
-    "This run's branch could not be pushed: it carries a secret GitHub Push Protection blocks " +
-    "(GH013). Offending: ";
+export function composePushSecretBlockedReason(
+  findings: SecretFinding[],
+  forgeType?: string,
+): string {
+  // PRD #1416 (MR-rework, finding 1): the post-bridge scan runs on EVERY forge, so a non-GitHub
+  // block must NOT cite "GitHub Push Protection"/"GH013" (there is no such backstop on
+  // GitLab/Forgejo). GitHub (or an omitted forge — the top-of-finalize GH013 caller) keeps the
+  // original wording so its existing callers + unit tests stay stable.
+  const isGitHub = forgeType === undefined || forgeType === "github";
+  const prefix = isGitHub
+    ? "This run's branch could not be pushed: it carries a secret GitHub Push Protection blocks " +
+      "(GH013). Offending: "
+    : "This run's branch could not be pushed: the pre-push secret scan detected a secret (a " +
+      "rewritten branch was bridged so it could publish). Offending: ";
   const suffix =
     ". The change is otherwise valid; a human can scrub the secret from the commit(s) and " +
     "land it. The diff is withheld because it may carry the detected secret; if a " +
@@ -324,6 +378,128 @@ export function composeBaseAlignConflictReason(defaultBranch: string): string {
   const branch = db.length > budget ? db.slice(0, Math.max(0, budget - 1)) + "…" : db;
   // Belt-and-braces final net, mirroring composeWorkflowScopeReason's caller.
   return (prefix + branch + suffix).slice(0, MAX_FAILURE_REASON_LEN);
+}
+
+/**
+ * PRD #1416 M4 — the actionable `failure_reason` for a run whose branch was rewritten at or below
+ * its published tip P AND could not be bridged to a fast-forward (the bridge B could not be built
+ * or validated), so uzi cannot land it. It NAMES P, states that uzi lands work with a fast-forward
+ * push and NEVER force-pushes (so a branch rewritten at or below P cannot be landed as it stands),
+ * points at docs/github-bot-setup.md, and tells the human where the work is (the run branch / a
+ * durable-recovery archive).
+ *
+ * Unlike composeWorkflowScopeReason / composeBaseAlignConflictReason, it is worded to be ACCURATE
+ * whether or not a `preserved_patch` is attached: M4 attaches the diff ONLY from a scan-trusted
+ * range (fact 15), and the divergent branch that reaches this path fails the scan floor open, so a
+ * patch is usually OMITTED. It therefore NEVER hard-promises "Your diff is preserved below."; it
+ * says the committed work is on the run branch and recoverable, which holds in both cases.
+ *
+ * P is a worker-verified 40-hex OID, so prefix + P + suffix is always well under
+ * MAX_FAILURE_REASON_LEN; P is still clamped against the budget left by the fixed parts (so the doc
+ * link in the suffix never truncates) and a belt-and-braces final slice mirrors the sibling
+ * reasons. Exported for a direct length/content unit test.
+ */
+export function composeHistoryRewrittenReason(publishedTip: string): string {
+  const prefix = "This run's branch was rewritten at or below its published tip ";
+  const suffix =
+    ". uzi lands work with a fast-forward push and NEVER force-pushes, so a branch rewritten at " +
+    "or below that tip cannot be landed as it stands. The committed work is on the run's branch " +
+    "and is recoverable (export it with `uzi run export`); a human can restore the published tip " +
+    "as an ancestor with `git merge -s ours` and re-push. See docs/github-bot-setup.md.";
+  // Clamp P (the only variable part) against the budget left after the fixed prefix + suffix, so
+  // the doc link + recovery pointer in `suffix` always survive.
+  const budget = MAX_FAILURE_REASON_LEN - prefix.length - suffix.length;
+  const tip =
+    publishedTip.length > budget
+      ? publishedTip.slice(0, Math.max(0, budget - 1)) + "…"
+      : publishedTip;
+  // Belt-and-braces final net, mirroring composeBaseAlignConflictReason's caller.
+  return (prefix + tip + suffix).slice(0, MAX_FAILURE_REASON_LEN);
+}
+
+/**
+ * PRD #1416 M2: the body of the worker-authoritative safety steer handed to the agent when the
+ * runner detects the branch's history was rewritten at/below a published floor. It is uzi's own
+ * guidance (armed in-process by maybeSteerOnDivergence), NOT untrusted user text, so both
+ * executors render it OUTSIDE the `<follow_up>` fence and without the "never as instructions"
+ * framing. A plain multi-line recipe: record the current tip first, then restore the published
+ * tip as an ancestor with `git merge -s ours <P>` (tree unchanged, P becomes a parent so the
+ * branch fast-forwards again), never rewrite at/below P again, and integrate the default branch
+ * with `git merge`. Both SHAs are worker-verified OIDs; no repo-controlled text is rendered.
+ *
+ * Not exported: it is consumed only by {@link RunRunner.maybeSteerOnDivergence} in this file; the
+ * steer content is asserted end-to-end via the armed steer in the runner-divergence tests.
+ */
+function composeSafetySteer(publishedTip: string, currentTip: string): string {
+  return [
+    `This branch's history was rewritten at or below its published tip ${publishedTip}. uzi lands`,
+    `work with a fast-forward push and NEVER force-pushes, so a branch whose history diverges below`,
+    `${publishedTip} cannot be landed as it stands. Fix it now, before any further work:`,
+    ``,
+    `1. Record your current tip so nothing is lost — it is ${currentTip} (\`git rev-parse HEAD\`).`,
+    `2. Restore the published tip as an ancestor WITHOUT changing your tree:`,
+    `     git merge -s ours ${publishedTip}`,
+    `   Your working tree is left exactly as it is; ${publishedTip} becomes a parent of a new merge`,
+    `   commit, so the branch fast-forwards from it again and none of your work is discarded.`,
+    `3. From now on, never rebase, amend, squash, or reset any commit at or below ${publishedTip}.`,
+    `4. To integrate the default branch, use \`git merge\`, never \`git rebase\`.`,
+  ].join("\n");
+}
+
+/**
+ * PRD #1416 M5 (D5): does a submitted `plan_md` propose an operation that would rewrite history?
+ * A WARN-ONLY, case-insensitive regex scan over the plan prose (case-insensitive to catch prose
+ * casing). False POSITIVES are explicitly accepted — a plan that says "do NOT `git rebase`" still
+ * matches, and that is fine: a plan is prose, one spurious status line costs nothing, and a false
+ * NEGATIVE is caught downstream by the M2 mid-run steer and the M3 finalize bridge. Matches the
+ * D5 pattern set: `git rebase`, `--amend`, `filter-repo`/`filter-branch`, `reset --hard`, or a
+ * forced push (`push` followed on the same line by `--force`/`-f`/`--force-with-lease`).
+ *
+ * Not exported: consumed only by {@link RunRunner.gatePlan} in this file; its behaviour is
+ * asserted end-to-end via the emitted status nudge (and the armed steer) in the M5 plan-gate tests.
+ */
+function planProposesRewrite(planMd: string): boolean {
+  const patterns: RegExp[] = [
+    /\bgit\s+rebase\b/i,
+    /--amend\b/i,
+    /\bfilter-repo\b/i,
+    /\bfilter-branch\b/i,
+    /\breset\s+--hard\b/i,
+    // A forced push: `push` followed on the SAME LINE by a force flag (PRD: push
+    // (--force|-f|--force-with-lease)). `--force-with-lease`/`--force` are listed ahead of `-f`
+    // so the longest flag wins; `-f\b` will not match inside `--force` (the trailing `\b` fails
+    // before the `o`). Bounded to one line ([^\n]*?) so an unrelated later `--force` never pairs
+    // with a much earlier `push`.
+    /\bpush\b[^\n]*?(?:--force-with-lease|--force|-f)\b/i,
+  ];
+  return patterns.some((re) => re.test(planMd));
+}
+
+/**
+ * PRD #1416 M5: the body of the worker-authoritative safety steer armed at the PLAN GATE when the
+ * submitted plan proposes rewriting history (planProposesRewrite) on a branch with a published
+ * floor P, under AUTO-APPROVE. Distinct from {@link composeSafetySteer}, the M2 DETECTED-rewrite
+ * recipe: at plan time there is no rewritten tip H yet, so this is PREVENTIVE — it names P, states
+ * that uzi lands work with a fast-forward push and NEVER force-pushes (so the worker cannot land a
+ * rewritten branch without bridging), tells the agent not to rebase/amend/squash/reset any commit
+ * at or below P, and to integrate the default branch with `git merge`, not `git rebase`. Armed
+ * only on the auto-approved branch (a human on the gated branch sees the plan + the status nudge
+ * and can revise/reject). uzi's own guidance, NOT untrusted user text, so both executors render it
+ * outside the `<follow_up>` fence. P is a worker-verified OID; no repo-controlled text is rendered.
+ *
+ * Not exported: consumed only by {@link RunRunner.gatePlan} in this file; its content is asserted
+ * end-to-end via the armed steer in the M5 plan-gate tests.
+ */
+function composePlanGateNudge(publishedTip: string): string {
+  return [
+    `Your plan proposes rewriting history on a branch that is ALREADY PUBLISHED at ${publishedTip}.`,
+    `uzi lands work with a fast-forward push and NEVER force-pushes, so the worker cannot land a`,
+    `branch that was rewritten at or below ${publishedTip} without bridging. Before you start:`,
+    ``,
+    `1. Do NOT rebase, amend, squash, or reset any commit at or below ${publishedTip}.`,
+    `2. Add new commits on top instead.`,
+    `3. To integrate the default branch, use \`git merge\`, never \`git rebase\`.`,
+  ].join("\n");
 }
 
 /**
@@ -495,6 +671,25 @@ interface RunFlight {
   runnerClone: RunnerClone | undefined;
   ciFixHumanApproved: boolean;
   result: ExecutorResult | undefined;
+  /** PRD #1416 M1: the branch's published forge tip P at claim (fact 2) — the floor at/below
+   *  which the branch must never be rewritten, since uzi lands work with a plain fast-forward
+   *  push and never force-pushes. Recorded ONCE at claim from `originBranchTip(bare, branch)`
+   *  (no fetch). Null/absent when the branch did not exist on the forge at clone (a fresh
+   *  issue run). Held here, on the flight, so it survives an executor/session restart —
+   *  deliberately NOT on `RunnerClone.baseCommit`, which can point at unpublished recovered
+   *  work. Named in every prompt of a run with a published floor; later milestones read it for
+   *  the ancestry check and the finalize bridge. */
+  publishedTip?: string;
+  /** PRD #1416 M1: floor C, initialised to P (`publishedTip`). Advanced to each confirmed
+   *  checkpoint tip by later milestones (M2/M3); M1 only seeds it. */
+  checkpointFloor?: string;
+  /** PRD #1416 M2: the set of fetched tips already steered on for a divergence, so the mid-run
+   *  detection emits AT MOST ONE status + steer per distinct tip. A repeated checkpoint tick that
+   *  re-fetches the SAME diverged tip emits nothing; a FURTHER rewrite (a new tip) is a new key
+   *  and steers again. Lazily initialised on first use. Held on the flight so it survives across
+   *  checkpoint ticks within a flight (a fresh flight after a restart re-detects, which is fine —
+   *  the finalize bridge in M3 is the correctness backstop). */
+  steeredTips?: Set<string>;
 }
 
 /** Tuning the runner needs beyond the collaborators (defaults keep M2/M3 tests terse). */
@@ -926,6 +1121,11 @@ export class RunRunner {
                 // braces so nothing here can undo the park (D4).
                 await this.git.commitWipMarker(worktreePath).catch(() => false);
                 await this.fetchBackBestEffort(barePath, worktreePath, branch, runId, runLog);
+                // PRD #1416 M3 (C5): bridge a divergent tracking tip BEFORE the park publish so a
+                // reseed on resume adopts B (the rewritten work), not the published tip. Best-effort:
+                // a park that fails is worse than a park that loses work (D4), so it NEVER throws —
+                // "failed"/"unknown" only log and the park continues.
+                await this.bridgeParkSinkBestEffort(barePath, branch, flight, runLog, "limit-park");
                 // PRD #628 M2: publish a ONE-SHOT checkpoint to origin so a DIFFERENT worker
                 // re-claiming this limit_wait run recovers the committed tree from
                 // refs/uzi-checkpoints/<branch> instead of cold-starting from default. Runs
@@ -1071,6 +1271,10 @@ export class RunRunner {
                 async (permit) => {
                   await this.git.commitWipMarker(worktreePath).catch(() => false);
                   await this.fetchBackBestEffort(barePath, worktreePath, branch, runId, runLog);
+                  // PRD #1416 M3 (C6): bridge a divergent tracking tip BEFORE the shutdown publish so
+                  // a resume adopts B, not the published tip. Best-effort — a shutdown checkpoint must
+                  // never throw (it is inside the k8s termination grace race, D4).
+                  await this.bridgeParkSinkBestEffort(barePath, branch, flight, runLog, "shutdown");
                   // PRD #1062 M2 (#1036): the path is reaped above, so the overlay's PAT
                   // default-fetch is permitted — a behind-on-workflows branch checkpoints durably.
                   const shutdownOverlay = await this.buildCheckpointOverlay(claim, flight, barePath);
@@ -2471,6 +2675,14 @@ export class RunRunner {
       }
     };
 
+    // PRD #1416 M4 (fact 15): whether the top-of-finalize secret scan below walked a TRUSTWORTHY
+    // range. A divergent H (the branch that reaches history_rewritten) fails the scan floor OPEN
+    // (secretScanRange returns trusted:false), so the pushable range is NOT secret-scanned. This
+    // flag gates whether failHistoryRewritten may attach a preserved_patch: only a scan-trusted
+    // range may be preserved, else an UNSCANNED secret could be written into a stored/displayed
+    // diff. Defaults false, so a non-github forge (no scan at all) also omits the patch — the
+    // conservative, safe default. Set only inside the github scan block below.
+    let scanRangeTrusted = false;
     // PRD #974 M2 (load-bearing security): a GitHub run's committed range is scanned for secrets
     // with the pinned gitleaks (default ruleset, all three silencers GitHub Push Protection
     // ignores DISABLED — see git.secretScanRange) BEFORE the doomed push, mirroring the #377
@@ -2487,6 +2699,7 @@ export class RunRunner {
         cloneUrl: claim.repo.clone_url,
         username: claim.secrets.forge_username,
       });
+      scanRangeTrusted = scan.trusted;
       if (scan.trusted && scan.findings.length > 0) {
         const reason = composePushSecretBlockedReason(scan.findings);
         // Do NOT preserve the diff on a secret block. redactText only scrubs the run's OWN
@@ -2549,6 +2762,58 @@ export class RunRunner {
         { log: runLog, signal: boundarySignal },
       );
 
+    // PRD #1416 (MR-rework, finding 1): a bridge NEWLY makes a rewritten branch pushable (a plain
+    // rewritten push is non-fast-forward-rejected on every forge). The top-of-finalize scan ran on
+    // the divergent H with an unresolvable floor and failed OPEN; now that the tracking ref is B and
+    // P is an ancestor of B, P..B is the real, trustworthy push delta. Re-scan it on EVERY forge
+    // before pushing B — GitLab/Forgejo have no GH013 backstop, so this worker-side scan is their
+    // only gate. On a TRUSTED finding: report push_secret_blocked (no preserved_patch), no push.
+    // On untrusted/clean: fail open (unchanged; GH013 still backstops GitHub at the push catch).
+    const scanBridgedRangeAndBlock = async (scanBare: string): Promise<"blocked" | "ok"> => {
+      const scan = await this.git.secretScanRange(scanBare, trackingRef, result.branch, {
+        pat: claim.secrets.forge_pat,
+        cloneUrl: claim.repo.clone_url,
+        username: claim.secrets.forge_username,
+      });
+      if (scan.trusted && scan.findings.length > 0) {
+        // #1416 (MR-rework, finding 8) — forge_type is optional (an omitted value means GitLab, R8),
+        // but composePushSecretBlockedReason defaults undefined → github (relied on by the
+        // GitHub-gated top-of-finalize caller). Normalize HERE so an omitted-forge_type GitLab run
+        // gets forge-neutral wording, not GH013/"GitHub Push Protection".
+        const forgeType =
+          claim.repo.forge_type === "forgejo"
+            ? "forgejo"
+            : claim.repo.forge_type === "github"
+              ? "github"
+              : "gitlab"; // R8: an omitted forge_type is GitLab, which has no GH013 backstop
+        const reason = composePushSecretBlockedReason(scan.findings, forgeType);
+        batcher.emit({
+          kind: "status",
+          agent: "worker",
+          payload: {
+            text: "the bridged branch carries a secret the pre-push scan detected; failing without pushing — the diff is withheld because it may carry the secret",
+          },
+        });
+        runLog.info(
+          "run failed: post-bridge secret scan found a secret in the P..B push delta; withholding diff",
+          {
+            run_id: runId,
+            findings: scan.findings.map((f) => ({ commit: f.commit, file: f.file, rule: f.ruleId })),
+          },
+        );
+        await closeBatcher();
+        await reportPushSecretBlocked(reason);
+        return "blocked";
+      }
+      if (!scan.trusted) {
+        runLog.warn(
+          "post-bridge secret scan: not trustworthy (broken/empty); pushing and relying on the GH013 remote backstop where it exists",
+          { run_id: runId },
+        );
+      }
+      return "ok";
+    };
+
     // PRD #974 M2 — the GH013 remote backstop. When a finalize push (the normal path OR an
     // align-path push) is rejected by GitHub Push Protection for a secret the pre-push gitleaks
     // scan missed (GitHub's pattern set is broader than gitleaks', and the two are not
@@ -2609,6 +2874,50 @@ export class RunRunner {
       });
     };
 
+    // PRD #1416 M4: the typed terminal for a run whose branch was rewritten at/below the published
+    // floor P AND could not be bridged to a fast-forward (bridgeBareTrackingRefIfDivergent returned
+    // {kind:"failed"}, which the finalize sinks throw as HistoryRewrittenError). Mirrors
+    // failBaseAlignConflict / failPushSecretBlocked / failBranchMoved: a worker status line, close
+    // the batcher, and report `failed` through the reportState WRAPPER (so driveRecoveryTerminal
+    // captures + uploads the verified bundle — the #1296 durable-recovery path, per the PRD).
+    // fail_origin=history_rewritten, NEVER the generic catch (agent_failure) and NEVER
+    // finalize_base_align_conflict. push_secret_blocked keeps precedence: a bridge FAILURE throws
+    // BEFORE any push, so a GH013 rejection (which happens only AFTER a successful bridge+push) can
+    // never collide with this path.
+    //
+    // preserved_patch is SECURITY-GATED (fact 15). The divergent H that reaches here failed the
+    // top-of-finalize secret scan floor OPEN (scanRangeTrusted=false), so the pushable range was NOT
+    // secret-scanned; attaching its diff could persist an UNSCANNED secret into runs.preserved_patch
+    // / RunView. So the (redacted) diff is included ONLY when a trustworthy scanned range was
+    // available, and OMITTED otherwise — which is the divergent case in practice. The committed work
+    // is durably recoverable via the #1296 capture regardless; the preserved_patch is a convenience.
+    const failHistoryRewritten = async (publishedTip: string) => {
+      let patch: string | undefined;
+      if (scanRangeTrusted) {
+        // Reuse the same diff helper failBaseAlignConflict uses, redacting the run's own secrets.
+        const rawPatch = await this.git.workflowScopeDiff(finalizeBarePath, trackingRef);
+        patch = rawPatch === null ? undefined : redactText(rawPatch);
+      }
+      batcher.emit({
+        kind: "status",
+        agent: "worker",
+        payload: {
+          text: "the branch's history was rewritten below its published tip and could not be bridged to a fast-forward; failing (uzi never force-pushes) — the committed work is on the run branch and recoverable",
+        },
+      });
+      runLog.info(
+        "run failed: history rewritten at or below the published tip; a fast-forward bridge could not be built or validated",
+        { run_id: runId, published_tip: publishedTip, preserved_patch: patch !== undefined },
+      );
+      await closeBatcher();
+      await reportState({
+        status: "failed",
+        failure_reason: composeHistoryRewrittenReason(publishedTip).slice(0, MAX_FAILURE_REASON_LEN),
+        fail_origin: "history_rewritten",
+        preserved_patch: patch,
+      });
+    };
+
     // PRD #456 M1: a GitHub run can be merely BEHIND the default branch on
     // .github/workflows/** (main advanced those files after this run's clone base) WITHOUT
     // having touched them. The bot's repo-only PAT push is then rejected atomically —
@@ -2620,298 +2929,341 @@ export class RunRunner {
     // rather than face-plant into GitHub's opaque rejection and discard the committed work.
     // GitHub-only: GitLab/Forgejo impose no workflow-scope rule.
     let alignPushed = false;
-    if (claim.repo.forge_type === "github") {
-      const alignBarePath = barePath;
-      const alignDefaultBranch =
-        claim.repo.default_branch?.trim() ||
-        (await this.git.defaultBranchName(alignBarePath)) ||
-        "main";
-      // Detection is best-effort (N2/D6 posture): a fetch/diff failure must NOT block a push
-      // that may well succeed (the branch may not actually be behind) — fall through to the
-      // normal push, never fail a run on an inability to compute the align target.
-      let defaultTip: string | undefined;
-      let differs = false;
-      try {
-        defaultTip = await this.git.fetchDefaultTip(
-          alignBarePath,
-          alignDefaultBranch,
-          claim.secrets.forge_pat,
-          claim.repo.clone_url,
-          claim.secrets.forge_username,
-        );
-        differs = await this.git.workflowTreeDiffers(
-          alignBarePath,
-          trackingRef,
-          defaultTip,
-        );
-      } catch (e) {
-        runLog.warn(
-          "finalize base-align: could not compute the align target; pushing without aligning",
-          { run_id: runId, error: errMessage(e) },
-        );
-      }
-      if (defaultTip && differs) {
-        // The pre-align committed agent tip — the base every align strategy starts from, so
-        // a rebase FALLBACK after a clean merge replays the ORIGINAL commits, not the merge.
-        const originalAgentTip = await this.git.branchTip(
-          runnerClone.path,
-          result.branch,
-        );
-        if (!originalAgentTip) {
-          runLog.warn(
-            "finalize base-align: could not resolve the branch tip; pushing without aligning",
-            { run_id: runId },
+    // PRD #1416 M4 (SC3): wrap the whole align chain so a HistoryRewrittenError thrown at its
+    // bridge site (git.ts bridgeToFloors → {kind:"failed"} → thrown inside fetchAndPush and
+    // rethrown by the arms' push catches, which classify only push-protection/workflow-scope/
+    // non-ff) is TYPED history_rewritten here rather than escaping to the generic catch. Declared
+    // OUTSIDE this try so the plain-push block below still sees `alignPushed`.
+    try {
+      if (claim.repo.forge_type === "github") {
+        const alignBarePath = barePath;
+        const alignDefaultBranch =
+          claim.repo.default_branch?.trim() ||
+          (await this.git.defaultBranchName(alignBarePath)) ||
+          "main";
+        // Detection is best-effort (N2/D6 posture): a fetch/diff failure must NOT block a push
+        // that may well succeed (the branch may not actually be behind) — fall through to the
+        // normal push, never fail a run on an inability to compute the align target.
+        let defaultTip: string | undefined;
+        let differs = false;
+        try {
+          defaultTip = await this.git.fetchDefaultTip(
+            alignBarePath,
+            alignDefaultBranch,
+            claim.secrets.forge_pat,
+            claim.repo.clone_url,
+            claim.secrets.forge_username,
           );
-        } else {
-          // The conflict-failure path (M2). The abort already ran inside
-          // alignBranchWithDefault; here we preserve the diff via #377's preserved_patch and
-          // fail typed. We diff the pre-align agent tip (`originalAgentTip`, declared at :1848,
-          // non-null under the :1852 guard) — NOT `trackingRef` — so the preserved patch is
-          // exactly the agent's human-landable work. Issue #631: when a strategy ALIGNED and
-          // then had its push rejected (the overlay's arm (c), or a merge/rebase whose push was
-          // rejected) `fetchAndPush` re-fetched the ALIGNED tip into `trackingRef`, so diffing
-          // `trackingRef` yielded a SUPERSET (agent work PLUS the aligning strategy's own
-          // workflow-subtree/merge changes) if a LATER strategy then conflicted and landed here.
-          // Diffing `originalAgentTip` eliminates that superset: its objects were fetched into
-          // the worker bare by the finalize `fetchAgentBranch` before any align, so
-          // workflowScopeDiff resolves it. In the non-push conflict paths originalAgentTip ==
-          // trackingRef, so those are unchanged; in the clobber-safety path (a branch that
-          // edited a workflow) originalAgentTip carries that edit, so it is still preserved.
-          const defTip = defaultTip;
-          const failBaseAlignConflict = async () => {
-            const rawPatch = await this.git.workflowScopeDiff(alignBarePath, originalAgentTip);
-            const patch = rawPatch === null ? undefined : redactText(rawPatch);
+          differs = await this.git.workflowTreeDiffers(
+            alignBarePath,
+            trackingRef,
+            defaultTip,
+          );
+        } catch (e) {
+          runLog.warn(
+            "finalize base-align: could not compute the align target; pushing without aligning",
+            { run_id: runId, error: errMessage(e) },
+          );
+        }
+        if (defaultTip && differs) {
+          // The pre-align committed agent tip — the base every align strategy starts from, so
+          // a rebase FALLBACK after a clean merge replays the ORIGINAL commits, not the merge.
+          const originalAgentTip = await this.git.branchTip(
+            runnerClone.path,
+            result.branch,
+          );
+          if (!originalAgentTip) {
+            runLog.warn(
+              "finalize base-align: could not resolve the branch tip; pushing without aligning",
+              { run_id: runId },
+            );
+          } else {
+            // The conflict-failure path (M2). The abort already ran inside
+            // alignBranchWithDefault; here we preserve the diff via #377's preserved_patch and
+            // fail typed. We diff the pre-align agent tip (`originalAgentTip`, declared at :1848,
+            // non-null under the :1852 guard) — NOT `trackingRef` — so the preserved patch is
+            // exactly the agent's human-landable work. Issue #631: when a strategy ALIGNED and
+            // then had its push rejected (the overlay's arm (c), or a merge/rebase whose push was
+            // rejected) `fetchAndPush` re-fetched the ALIGNED tip into `trackingRef`, so diffing
+            // `trackingRef` yielded a SUPERSET (agent work PLUS the aligning strategy's own
+            // workflow-subtree/merge changes) if a LATER strategy then conflicted and landed here.
+            // Diffing `originalAgentTip` eliminates that superset: its objects were fetched into
+            // the worker bare by the finalize `fetchAgentBranch` before any align, so
+            // workflowScopeDiff resolves it. In the non-push conflict paths originalAgentTip ==
+            // trackingRef, so those are unchanged; in the clobber-safety path (a branch that
+            // edited a workflow) originalAgentTip carries that edit, so it is still preserved.
+            const defTip = defaultTip;
+            const failBaseAlignConflict = async () => {
+              const rawPatch = await this.git.workflowScopeDiff(alignBarePath, originalAgentTip);
+              const patch = rawPatch === null ? undefined : redactText(rawPatch);
+              batcher.emit({
+                kind: "status",
+                agent: "worker",
+                payload: {
+                  text: "could not realign the branch with the updated default branch and safely push it (merge and rebase conflicted, or the aligned branch could not be fast-forwarded); failing and preserving the diff for a human to land",
+                },
+              });
+              runLog.info("run failed: finalize base-align conflict; preserving diff", {
+                run_id: runId,
+              });
+              await closeBatcher();
+              await reportState({
+                status: "failed",
+                failure_reason: composeBaseAlignConflictReason(alignDefaultBranch),
+                fail_origin: "finalize_base_align_conflict",
+                preserved_patch: patch,
+              });
+            };
+
+            // Run one align STRATEGY, treating an UNEXPECTED throw (the S3 count-mismatch
+            // guard, or any git error) exactly like a `"conflict"` return. This is the whole
+            // point of the feature: the agent's work must be PRESERVED on failure, so an
+            // unexpected align error must route to failBaseAlignConflict (typed fail + diff),
+            // NOT escape to the generic catch below (raw message, no preserved_patch, defaulted
+            // fail_origin). Scoped to the align OPERATION only — the push keeps its own
+            // handling (workflow-scope → rebase fallback; any other push error rethrows).
+            const alignOp = async (strategy: "merge" | "rebase"): Promise<"aligned" | "conflict"> => {
+              try {
+                return await this.git.alignBranchWithDefault(
+                  runnerClone.path,
+                  result.branch,
+                  originalAgentTip,
+                  defTip,
+                  strategy,
+                );
+              } catch (e) {
+                runLog.warn(
+                  "finalize base-align: unexpected error during align; preserving diff and failing typed",
+                  { run_id: runId, strategy, error: errMessage(e) },
+                );
+                return "conflict";
+              }
+            };
+
+            // Re-fetch the aligned tip into the worker bare's tracking ref, then push once.
+            const fetchAndPush = async () => {
+              await this.git.fetchAgentBranch(
+                alignBarePath,
+                runnerClone.path,
+                result.branch,
+                runId,
+              );
+              // PRD #1416 M3 (C4): the align chain re-fetched the CLONE's aligned tip into the
+              // tracking ref — and a rebase-fallback align rewrites P (fact 14), so the aligned tip
+              // can itself be divergent below P. Bridge it here, AFTER the re-fetch and BEFORE the
+              // push, so pushToOrigin pushes B (P is an ancestor of B → fast-forward). One placement
+              // covers all three arms (overlay, merge, rebase). A "failed" bridge throws
+              // HistoryRewrittenError, which the arm's push catch rethrows (it catches only push-
+              // protection / workflow-scope / non-ff); PRD #1416 M4's try/catch wrapping the whole
+              // align chain then types it history_rewritten (never the generic catch, SC3).
+              const o = await this.bridgeBareTrackingRefIfDivergent(
+                alignBarePath,
+                result.branch,
+                flight,
+                runLog,
+              );
+              if (o.kind === "failed") throw new HistoryRewrittenError(flight.publishedTip!);
+              // PRD #1416 (MR-rework, finding 1): re-scan the now-trusted P..B delta before pushing
+              // the bridged, aligned tip. On a trusted finding scanBridgedRangeAndBlock has already
+              // terminally reported push_secret_blocked, so throw the data-free unwind sentinel — the
+              // enclosing align try/catch and the outer finalize catch propagate it without pushing or
+              // re-reporting (mirroring how HistoryRewrittenError unwinds this same nested closure).
+              if (o.kind === "bridged" && (await scanBridgedRangeAndBlock(alignBarePath)) === "blocked") {
+                throw new PushSecretBlockedSignal();
+              }
+              await pushToOrigin();
+              alignPushed = true;
+            };
+
+            // Push the aligned branch. Two rejections here are the base-align-conflict path,
+            // not a mislabel: a REPEAT workflow-scope rejection means the default's workflow
+            // files moved again DURING our align (double-TOCTOU); a NON-FAST-FORWARD rejection
+            // means the rebase fallback rewrote the history of an already-published branch (a
+            // resume, or the self_improve fixed branch) so this non-forced push cannot
+            // fast-forward, and force-push is denied by the guardrails by design. Both preserve
+            // the diff and fail typed rather than lose it to the generic catch. Any OTHER push
+            // error still rethrows unchanged (a genuine auth/transient/protected-branch failure
+            // must not be mislabelled as a base-align conflict). Returns true if it
+            // preserved-and-failed (the caller must then `return`), false on a successful push.
+            const pushAlignedOrPreserve = async (): Promise<boolean> => {
+              try {
+                await fetchAndPush();
+                return false;
+              } catch (e) {
+                // PRD #974 M2: an aligned push rejected by GitHub Push Protection (GH013) is a
+                // secret the pre-push gitleaks scan missed — route it to the typed
+                // push_secret_blocked fail (NO preserved diff: it may carry the detected secret)
+                // rather than the base-align-conflict path or the generic catch.
+                if (isPushProtectionRejection(e)) {
+                  runLog.info(
+                    "finalize base-align: aligned push rejected by GitHub Push Protection (GH013); failing typed, no preserved diff (it may carry the secret)",
+                    { run_id: runId },
+                  );
+                  await failPushSecretBlocked();
+                  return true;
+                }
+                const nonFf = isNonFastForwardRejection(e);
+                if (!isWorkflowScopeRejection(e) && !nonFf) throw e;
+                // Record WHICH cause fired so an operator reading logs can tell the two apart:
+                // a repeat workflow-scope rejection (the default's workflow files moved again
+                // DURING our align) versus a non-fast-forward (the rebase rewrote an
+                // already-published branch's history, a resume or the self_improve fixed
+                // branch, that the bot cannot force-push).
+                runLog.info(
+                  nonFf
+                    ? "finalize base-align: aligned push rejected non-fast-forward (rebase rewrote an already-published branch's history the bot cannot force-push); preserving diff and failing typed"
+                    : "finalize base-align: aligned push STILL workflow-scope-rejected (default moved again during align); preserving diff and failing typed",
+                  { run_id: runId },
+                );
+                await failBaseAlignConflict();
+                return true;
+              }
+            };
+
+            // Issue #627 — the overlay gate (correctness pin). FRESHLY recompute the branch's
+            // workflow-change signal here: the #377 guard earlier FAILS OPEN on a null diff, so
+            // a branch that modified a workflow file can still reach this block. Overlaying the
+            // default's workflow subtree would then CLOBBER that agent edit, so the overlay is
+            // allowed ONLY when the diff succeeded AND the branch provably modified NO workflow
+            // file. Any other case (null diff, or a real workflow edit) falls straight into the
+            // EXISTING merge → rebase → preserve chain, unchanged.
+            // Issue #631: reuse the #377 guard's changedFiles result (identical barePath+trackingRef);
+            // recompute only when #377 failed open (null diff), so a transient diff failure gets a retry.
+            const alignChanged =
+              changedForWf === null
+                ? await this.git.changedFiles(alignBarePath, trackingRef)
+                : changedForWf;
+            const alignWfHits =
+              alignChanged === null
+                ? null
+                : flagCIConfigPaths(alignChanged, [".github/workflows/**"]);
+            const canOverlay =
+              alignChanged !== null && alignWfHits !== null && alignWfHits.length === 0;
+
+            // Emit once here so the status fires on BOTH the overlay and the fallback paths.
             batcher.emit({
               kind: "status",
               agent: "worker",
               payload: {
-                text: "could not realign the branch with the updated default branch and safely push it (merge and rebase conflicted, or the aligned branch could not be fast-forwarded); failing and preserving the diff for a human to land",
+                text: "branch is behind the default branch on .github/workflows; aligning before pushing",
               },
             });
-            runLog.info("run failed: finalize base-align conflict; preserving diff", {
-              run_id: runId,
-            });
-            await closeBatcher();
-            await reportState({
-              status: "failed",
-              failure_reason: composeBaseAlignConflictReason(alignDefaultBranch),
-              fail_origin: "finalize_base_align_conflict",
-              preserved_patch: patch,
-            });
-          };
 
-          // Run one align STRATEGY, treating an UNEXPECTED throw (the S3 count-mismatch
-          // guard, or any git error) exactly like a `"conflict"` return. This is the whole
-          // point of the feature: the agent's work must be PRESERVED on failure, so an
-          // unexpected align error must route to failBaseAlignConflict (typed fail + diff),
-          // NOT escape to the generic catch below (raw message, no preserved_patch, defaulted
-          // fail_origin). Scoped to the align OPERATION only — the push keeps its own
-          // handling (workflow-scope → rebase fallback; any other push error rethrows).
-          const alignOp = async (strategy: "merge" | "rebase"): Promise<"aligned" | "conflict"> => {
-            try {
-              return await this.git.alignBranchWithDefault(
-                runnerClone.path,
-                result.branch,
-                originalAgentTip,
-                defTip,
-                strategy,
-              );
-            } catch (e) {
-              runLog.warn(
-                "finalize base-align: unexpected error during align; preserving diff and failing typed",
-                { run_id: runId, strategy, error: errMessage(e) },
-              );
-              return "conflict";
-            }
-          };
-
-          // Re-fetch the aligned tip into the worker bare's tracking ref, then push once.
-          const fetchAndPush = async () => {
-            await this.git.fetchAgentBranch(
-              alignBarePath,
-              runnerClone.path,
-              result.branch,
-              runId,
-            );
-            await pushToOrigin();
-            alignPushed = true;
-          };
-
-          // Push the aligned branch. Two rejections here are the base-align-conflict path,
-          // not a mislabel: a REPEAT workflow-scope rejection means the default's workflow
-          // files moved again DURING our align (double-TOCTOU); a NON-FAST-FORWARD rejection
-          // means the rebase fallback rewrote the history of an already-published branch (a
-          // resume, or the self_improve fixed branch) so this non-forced push cannot
-          // fast-forward, and force-push is denied by the guardrails by design. Both preserve
-          // the diff and fail typed rather than lose it to the generic catch. Any OTHER push
-          // error still rethrows unchanged (a genuine auth/transient/protected-branch failure
-          // must not be mislabelled as a base-align conflict). Returns true if it
-          // preserved-and-failed (the caller must then `return`), false on a successful push.
-          const pushAlignedOrPreserve = async (): Promise<boolean> => {
-            try {
-              await fetchAndPush();
-              return false;
-            } catch (e) {
-              // PRD #974 M2: an aligned push rejected by GitHub Push Protection (GH013) is a
-              // secret the pre-push gitleaks scan missed — route it to the typed
-              // push_secret_blocked fail (NO preserved diff: it may carry the detected secret)
-              // rather than the base-align-conflict path or the generic catch.
-              if (isPushProtectionRejection(e)) {
-                runLog.info(
-                  "finalize base-align: aligned push rejected by GitHub Push Protection (GH013); failing typed, no preserved diff (it may carry the secret)",
-                  { run_id: runId },
-                );
-                await failPushSecretBlocked();
-                return true;
-              }
-              const nonFf = isNonFastForwardRejection(e);
-              if (!isWorkflowScopeRejection(e) && !nonFf) throw e;
-              // Record WHICH cause fired so an operator reading logs can tell the two apart:
-              // a repeat workflow-scope rejection (the default's workflow files moved again
-              // DURING our align) versus a non-fast-forward (the rebase rewrote an
-              // already-published branch's history, a resume or the self_improve fixed
-              // branch, that the bot cannot force-push).
-              runLog.info(
-                nonFf
-                  ? "finalize base-align: aligned push rejected non-fast-forward (rebase rewrote an already-published branch's history the bot cannot force-push); preserving diff and failing typed"
-                  : "finalize base-align: aligned push STILL workflow-scope-rejected (default moved again during align); preserving diff and failing typed",
-                { run_id: runId },
-              );
-              await failBaseAlignConflict();
-              return true;
-            }
-          };
-
-          // Issue #627 — the overlay gate (correctness pin). FRESHLY recompute the branch's
-          // workflow-change signal here: the #377 guard earlier FAILS OPEN on a null diff, so
-          // a branch that modified a workflow file can still reach this block. Overlaying the
-          // default's workflow subtree would then CLOBBER that agent edit, so the overlay is
-          // allowed ONLY when the diff succeeded AND the branch provably modified NO workflow
-          // file. Any other case (null diff, or a real workflow edit) falls straight into the
-          // EXISTING merge → rebase → preserve chain, unchanged.
-          // Issue #631: reuse the #377 guard's changedFiles result (identical barePath+trackingRef);
-          // recompute only when #377 failed open (null diff), so a transient diff failure gets a retry.
-          const alignChanged =
-            changedForWf === null
-              ? await this.git.changedFiles(alignBarePath, trackingRef)
-              : changedForWf;
-          const alignWfHits =
-            alignChanged === null
-              ? null
-              : flagCIConfigPaths(alignChanged, [".github/workflows/**"]);
-          const canOverlay =
-            alignChanged !== null && alignWfHits !== null && alignWfHits.length === 0;
-
-          // Emit once here so the status fires on BOTH the overlay and the fallback paths.
-          batcher.emit({
-            kind: "status",
-            agent: "worker",
-            payload: {
-              text: "branch is behind the default branch on .github/workflows; aligning before pushing",
-            },
-          });
-
-          // PRIMARY (issue #627): overlay ONLY the default tip's .github/workflows/ subtree
-          // onto the agent tip. It cannot conflict and is a fast-forward (original agent SHAs
-          // preserved, nothing rebased), and it makes the tip's workflow tree equal main's —
-          // all GitHub's tip-vs-default check requires — WITHOUT dragging in main's unrelated
-          // changes the way a whole-tree merge/rebase does. Invoked OUTSIDE alignOp on
-          // purpose: alignOp maps any throw to "conflict" (→ preserve-and-fail), which is
-          // WRONG for the overlay — an overlay error must fall back to merge/rebase, not
-          // preserve-and-fail. So the overlay gets its own try/catch here.
-          let overlayHandled = false;
-          if (canOverlay) {
-            let overlayAligned = false;
-            try {
-              const res = await this.git.alignBranchWithDefault(
-                runnerClone.path,
-                result.branch,
-                originalAgentTip,
-                defTip,
-                "workflow-subtree",
-              );
-              overlayAligned = res === "aligned"; // the overlay never returns "conflict"
-            } catch (e) {
-              // (b) the overlay git op threw (a GENUINE unexpected git error) → fall back to
-              // merge/rebase, NOT preserve-and-fail. Distinct message from (c) below.
-              runLog.warn(
-                "finalize base-align: workflow-subtree overlay errored; falling back to merge/rebase",
-                { run_id: runId, error: errMessage(e) },
-              );
-            }
-            if (overlayAligned) {
+            // PRIMARY (issue #627): overlay ONLY the default tip's .github/workflows/ subtree
+            // onto the agent tip. It cannot conflict and is a fast-forward (original agent SHAs
+            // preserved, nothing rebased), and it makes the tip's workflow tree equal main's —
+            // all GitHub's tip-vs-default check requires — WITHOUT dragging in main's unrelated
+            // changes the way a whole-tree merge/rebase does. Invoked OUTSIDE alignOp on
+            // purpose: alignOp maps any throw to "conflict" (→ preserve-and-fail), which is
+            // WRONG for the overlay — an overlay error must fall back to merge/rebase, not
+            // preserve-and-fail. So the overlay gets its own try/catch here.
+            let overlayHandled = false;
+            if (canOverlay) {
+              let overlayAligned = false;
               try {
-                await fetchAndPush(); // sets alignPushed = true on success
-                overlayHandled = true;
+                const res = await this.git.alignBranchWithDefault(
+                  runnerClone.path,
+                  result.branch,
+                  originalAgentTip,
+                  defTip,
+                  "workflow-subtree",
+                );
+                overlayAligned = res === "aligned"; // the overlay never returns "conflict"
               } catch (e) {
-                // PRD #974 M2: an overlay push rejected by GitHub Push Protection (GH013) is a
-                // secret gitleaks missed — typed push_secret_blocked fail (NO preserved diff:
-                // it may carry the secret), not a fall-back to merge/rebase (which cannot clear
-                // a secret) nor the generic catch.
-                if (isPushProtectionRejection(e)) {
-                  runLog.info(
-                    "finalize base-align: workflow-subtree overlay push rejected by GitHub Push Protection (GH013); failing typed, no preserved diff (it may carry the secret)",
-                    { run_id: runId },
-                  );
-                  await failPushSecretBlocked();
-                  return;
-                }
-                if (!isWorkflowScopeRejection(e) && !isNonFastForwardRejection(e)) throw e;
-                // (c) the overlay pushed but was STILL rejected (workflow-scope: the default
-                // moved again during our align; or non-fast-forward: a resumed/rewritten
-                // branch) → fall back to merge/rebase. Distinct message from (b) above so an
-                // operator can tell the two failure modes apart.
-                runLog.info(
-                  "finalize base-align: workflow-subtree overlay push still rejected; falling back to merge/rebase",
-                  { run_id: runId },
+                // (b) the overlay git op threw (a GENUINE unexpected git error) → fall back to
+                // merge/rebase, NOT preserve-and-fail. Distinct message from (c) below.
+                runLog.warn(
+                  "finalize base-align: workflow-subtree overlay errored; falling back to merge/rebase",
+                  { run_id: runId, error: errMessage(e) },
                 );
               }
+              if (overlayAligned) {
+                try {
+                  await fetchAndPush(); // sets alignPushed = true on success
+                  overlayHandled = true;
+                } catch (e) {
+                  // PRD #974 M2: an overlay push rejected by GitHub Push Protection (GH013) is a
+                  // secret gitleaks missed — typed push_secret_blocked fail (NO preserved diff:
+                  // it may carry the secret), not a fall-back to merge/rebase (which cannot clear
+                  // a secret) nor the generic catch.
+                  if (isPushProtectionRejection(e)) {
+                    runLog.info(
+                      "finalize base-align: workflow-subtree overlay push rejected by GitHub Push Protection (GH013); failing typed, no preserved diff (it may carry the secret)",
+                      { run_id: runId },
+                    );
+                    await failPushSecretBlocked();
+                    return;
+                  }
+                  if (!isWorkflowScopeRejection(e) && !isNonFastForwardRejection(e)) throw e;
+                  // (c) the overlay pushed but was STILL rejected (workflow-scope: the default
+                  // moved again during our align; or non-fast-forward: a resumed/rewritten
+                  // branch) → fall back to merge/rebase. Distinct message from (b) above so an
+                  // operator can tell the two failure modes apart.
+                  runLog.info(
+                    "finalize base-align: workflow-subtree overlay push still rejected; falling back to merge/rebase",
+                    { run_id: runId },
+                  );
+                }
+              }
             }
-          }
 
-          if (!overlayHandled) {
-            const mergeRes = await alignOp("merge");
-            if (mergeRes === "aligned") {
-              try {
-                await fetchAndPush();
-              } catch (e) {
-                // PRD #974 M2: a merge push rejected by GitHub Push Protection (GH013) is a secret
-                // gitleaks missed — typed push_secret_blocked fail (NO preserved diff: it may
-                // carry the secret), not the rebase fallback (which cannot clear a secret) nor
-                // the generic catch.
-                if (isPushProtectionRejection(e)) {
+            if (!overlayHandled) {
+              const mergeRes = await alignOp("merge");
+              if (mergeRes === "aligned") {
+                try {
+                  await fetchAndPush();
+                } catch (e) {
+                  // PRD #974 M2: a merge push rejected by GitHub Push Protection (GH013) is a secret
+                  // gitleaks missed — typed push_secret_blocked fail (NO preserved diff: it may
+                  // carry the secret), not the rebase fallback (which cannot clear a secret) nor
+                  // the generic catch.
+                  if (isPushProtectionRejection(e)) {
+                    runLog.info(
+                      "finalize base-align: merge push rejected by GitHub Push Protection (GH013); failing typed, no preserved diff (it may carry the secret)",
+                      { run_id: runId },
+                    );
+                    await failPushSecretBlocked();
+                    return;
+                  }
+                  if (isNonFastForwardRejection(e)) {
+                    // Issue #631: a non-fast-forward rejection (an already-published branch — a resume, or
+                    // the self_improve fixed branch — whose merge push cannot fast-forward) can't be cleared
+                    // by the rebase fallback (it also can't force-push), so preserve the diff and fail typed
+                    // rather than escape to the generic catch (raw message, no preserved_patch). This
+                    // matches pushAlignedOrPreserve (:1945-1946), which likewise fails typed on non-ff.
+                    // (The overlay push catch at :2020 handles non-ff differently — it can still fall
+                    // back to merge/rebase — so this arm deliberately does NOT mirror it: once at the
+                    // merge, a rebase cannot clear a non-ff on an already-published branch.)
+                    runLog.info(
+                      "finalize base-align: merge push rejected non-fast-forward; preserving diff and failing typed",
+                      { run_id: runId },
+                    );
+                    await failBaseAlignConflict();
+                    return;
+                  }
+                  if (!isWorkflowScopeRejection(e)) throw e;
+                  // The merge did NOT clear GitHub's workflow-scope rejection → the proven
+                  // rebase fallback (#422). alignBranchWithDefault rewinds to originalAgentTip
+                  // first, so the rebase replays the ORIGINAL agent commits onto the fresh
+                  // default rather than the merge commit.
                   runLog.info(
-                    "finalize base-align: merge push rejected by GitHub Push Protection (GH013); failing typed, no preserved diff (it may carry the secret)",
+                    "finalize base-align: merge push still workflow-scope-rejected; trying rebase fallback",
                     { run_id: runId },
                   );
-                  await failPushSecretBlocked();
-                  return;
+                  const rebaseRes = await alignOp("rebase");
+                  if (rebaseRes === "aligned") {
+                    if (await pushAlignedOrPreserve()) return;
+                  } else {
+                    await failBaseAlignConflict();
+                    return;
+                  }
                 }
-                if (isNonFastForwardRejection(e)) {
-                  // Issue #631: a non-fast-forward rejection (an already-published branch — a resume, or
-                  // the self_improve fixed branch — whose merge push cannot fast-forward) can't be cleared
-                  // by the rebase fallback (it also can't force-push), so preserve the diff and fail typed
-                  // rather than escape to the generic catch (raw message, no preserved_patch). This
-                  // matches pushAlignedOrPreserve (:1945-1946), which likewise fails typed on non-ff.
-                  // (The overlay push catch at :2020 handles non-ff differently — it can still fall
-                  // back to merge/rebase — so this arm deliberately does NOT mirror it: once at the
-                  // merge, a rebase cannot clear a non-ff on an already-published branch.)
-                  runLog.info(
-                    "finalize base-align: merge push rejected non-fast-forward; preserving diff and failing typed",
-                    { run_id: runId },
-                  );
-                  await failBaseAlignConflict();
-                  return;
-                }
-                if (!isWorkflowScopeRejection(e)) throw e;
-                // The merge did NOT clear GitHub's workflow-scope rejection → the proven
-                // rebase fallback (#422). alignBranchWithDefault rewinds to originalAgentTip
-                // first, so the rebase replays the ORIGINAL agent commits onto the fresh
-                // default rather than the merge commit.
-                runLog.info(
-                  "finalize base-align: merge push still workflow-scope-rejected; trying rebase fallback",
-                  { run_id: runId },
-                );
+              } else {
+                // The merge conflicted (or errored) — a rebase may still replay cleanly where a
+                // single merge did not, so try it before giving up.
+                runLog.info("finalize base-align: merge conflicted; trying rebase", {
+                  run_id: runId,
+                });
                 const rebaseRes = await alignOp("rebase");
                 if (rebaseRes === "aligned") {
                   if (await pushAlignedOrPreserve()) return;
@@ -2920,23 +3272,26 @@ export class RunRunner {
                   return;
                 }
               }
-            } else {
-              // The merge conflicted (or errored) — a rebase may still replay cleanly where a
-              // single merge did not, so try it before giving up.
-              runLog.info("finalize base-align: merge conflicted; trying rebase", {
-                run_id: runId,
-              });
-              const rebaseRes = await alignOp("rebase");
-              if (rebaseRes === "aligned") {
-                if (await pushAlignedOrPreserve()) return;
-              } else {
-                await failBaseAlignConflict();
-                return;
-              }
             }
           }
         }
       }
+    } catch (e) {
+      // PRD #1416 M4 (SC3): a bridge that could not be built/validated at a finalize push site was
+      // thrown as HistoryRewrittenError; type it history_rewritten — never the generic catch
+      // (agent_failure), never finalize_base_align_conflict (the align arms call failBaseAlignConflict
+      // only for push-classified errors, never for this). Any other error rethrows unchanged.
+      if (e instanceof HistoryRewrittenError) {
+        await failHistoryRewritten(e.publishedTip);
+        return;
+      }
+      if (e instanceof PushSecretBlockedSignal) {
+        // PRD #1416 (MR-rework, finding 1): the align-path post-bridge scan already terminally
+        // reported push_secret_blocked inside fetchAndPush; unwind and stop (never re-report, never
+        // fall through to the plain-path push below).
+        return;
+      }
+      throw e;
     }
 
     // PRD #400 M2: a TASK run always pushes its branch back (the deliverable is the
@@ -2962,6 +3317,32 @@ export class RunRunner {
     // aligned branch — the run pushes through EXACTLY ONE code path (`pushToOrigin`), so a
     // successful align-push and the normal push converge here without ever double-pushing.
     if (!alignPushed) {
+      // PRD #1416 M3 (C3): non-destructively bridge a divergent tracking tip so the plain push
+      // fast-forwards. On "bridged" the tracking ref now points at B (P is an ancestor of B), so
+      // pushToOrigin pushes B. "clean"/"unknown" proceed unchanged. PRD #1416 M4: on "failed" the
+      // divergent tip cannot be bridged, so type it history_rewritten and STOP here (no push) —
+      // never the generic catch (SC3). A direct call+return is used because this site is at
+      // phasePublish top level, so `return` unwinds the whole finalize (unlike the align site,
+      // which throws to unwind its nested fetchAndPush and is caught by the wrap above). The
+      // top-of-finalize secret scan ran earlier on the divergent H (its floor was unresolvable, so
+      // it failed open); a secret on B is caught by the GH013 remote backstop in the push catch below.
+      const o = await this.bridgeBareTrackingRefIfDivergent(
+        finalizeBarePath,
+        result.branch,
+        flight,
+        runLog,
+      );
+      if (o.kind === "failed") {
+        await failHistoryRewritten(flight.publishedTip!);
+        return;
+      }
+      // PRD #1416 (MR-rework, finding 1): a bridge just made this rewritten branch pushable, so
+      // re-scan the now-trusted P..B delta on EVERY forge before pushing. A trusted finding reports
+      // push_secret_blocked and STOPS (a direct return unwinds the whole finalize, like the
+      // failHistoryRewritten site above).
+      if (o.kind === "bridged" && (await scanBridgedRangeAndBlock(finalizeBarePath)) === "blocked") {
+        return;
+      }
       try {
         await pushToOrigin();
       } catch (e) {
@@ -3015,6 +3396,35 @@ export class RunRunner {
         }
         throw e;
       }
+    }
+
+    // PRD #1416 M3 (Part D): the MR bridge-note, derived from the PUSHED HISTORY — not a
+    // flight-local flag. A bridge built before a park is invisible to a reclaimed run's finalize
+    // (which builds no new bridge), but it is right here in P..pushedTip, so a reclaim still
+    // reports it. Computed ONCE after whichever push landed (plain or align), so it is path-
+    // independent. Only meaningful when there is a published floor P. Best-effort: rangeContainsBridge
+    // never throws (a git error → false), so this can never fail a finalize whose push already landed.
+    let bridged = false;
+    if (flight.publishedTip) {
+      const pushedTip = await this.git.trackingTip(finalizeBarePath, result.branch);
+      if (pushedTip) {
+        bridged = await this.git.rangeContainsBridge(
+          finalizeBarePath,
+          flight.publishedTip,
+          pushedTip,
+        );
+      }
+    }
+    if (bridged) {
+      // Worded GENERICALLY: the branch may have been bridged by THIS worker OR by the agent (the M2
+      // steer's `git merge -s ours <P>`), so it never says "the worker bridged it".
+      batcher.emit({
+        kind: "status",
+        agent: "worker",
+        payload: {
+          text: "the branch contains a history bridge (a published commit was restored as an ancestor so the branch fast-forwards); `git log --first-parent` reads as the intended history",
+        },
+      });
     }
 
     // PRD #400 M2: a no-MR task completes HERE — the branch is pushed, there is
@@ -3196,6 +3606,7 @@ export class RunRunner {
             result.scopeCapped,
             renderCloses,
             claim.config?.completion_scope,
+            bridged,
           ),
         }, boundarySignal),
       { log: runLog, signal: boundarySignal },
@@ -3240,6 +3651,7 @@ export class RunRunner {
           result.scopeCapped,
           withCloses,
           claim.config?.completion_scope,
+          bridged,
         );
         const desc = banner ? `${banner}\n\n${base}` : base;
         await withForgeRetry(
@@ -3719,6 +4131,17 @@ export class RunRunner {
     }
     if (retained) throw new TransientRecoveryError("recovering retained work before reseeding");
 
+    // PRD #1416 M1: record the published floor P ONCE at claim — the branch's forge tip as of
+    // this clone (fact 2), read from the worker bare WITHOUT a fetch. Placed after the whole
+    // clone try/catch so it covers the primary AND the reclaim paths (both assign runnerClone);
+    // the retained-recovery path threw above and re-claims later, recording P on that pass.
+    // Null when the branch did not exist on the forge at clone (a fresh issue run). This is
+    // runner-level flight state that survives an executor restart — never RunnerClone.baseCommit,
+    // which can point at unpublished recovered work. checkpointFloor C initialises to P; later
+    // milestones advance it to each confirmed checkpoint tip.
+    flight.publishedTip = (await this.git.originBranchTip(barePath, flight.branch!)) ?? undefined;
+    flight.checkpointFloor = flight.publishedTip;
+
     // Journal ownership before any model can write. The worker-owned bare config
     // survives failed captures, process restarts, and runner-owned clone tampering.
     await this.git.markRecoveryCapture(barePath, flight.worktreePath!, flight.branch!, runId);
@@ -4149,6 +4572,10 @@ export class RunRunner {
       // guessing the branch's parent (judge rec, run 51757591).
       baseCommit: runnerClone.baseCommit,
       defaultBranchCommit: runnerClone.defaultBranchCommit,
+      // PRD #1416 M1: the published floor P recorded at claim (flight, restart-surviving),
+      // threaded to prompt-build time so both builders name it on a run with a published
+      // floor. Absent (fresh branch) ⇒ no note.
+      publishedTip: flight.publishedTip,
       emit: (m) => batcher.emit(m),
       oauthToken: claim.secrets.anthropic_oauth_token,
       // PRD #362 M3c: the run-summary model resolved server-side (user-value-wins),
@@ -4317,6 +4744,8 @@ export class RunRunner {
           // Use runnerClone.path (const, string), NOT the `worktreePath` local
           // (string | undefined — does not narrow in this closure).
           runnerClone.path,
+          // PRD #1416 M5: the published floor P for the warn-only plan-gate nudge.
+          flight.publishedTip,
           onAwaitingApproval,
         );
         // Human-in-the-loop iff the plan reached an approve verdict via the PARK path
@@ -4339,6 +4768,10 @@ export class RunRunner {
           claim.config ?? null,
         ),
       pullFollowUp: () => steering.pullFollowUp(),
+      // PRD #1416 M2: drain the worker-authoritative safety steer the divergence detection
+      // (maybeSteerOnDivergence) armed on this same steering channel, in-process. Consumed by
+      // both executors at their loop top ahead of the follow-up drain.
+      pullSafetySteer: () => steering.pullSafetySteer(),
       // PRD #517 M3: the interactive-task follow-up park. The executor calls this after a
       // clean signal_done on an interactive run (it has already checkpoint-pushed): report
       // awaiting_followup, verify the park took, then BLOCK on the steering channel until
@@ -4587,6 +5020,34 @@ export class RunRunner {
             });
           }
 
+          // PRD #1416 M2: on the tip that was just fetched into the bare, detect a history
+          // rewrite at/below the published floor P (and floor C) and steer the agent to restore
+          // it — never blocks a git command (D2). Read the tip FRESH from the bare tracking ref
+          // (refs/uzi-runner/<branch>) since fetchBackBestEffort returns nothing and the
+          // top-of-checkpoint trackTip predates this fetch; never the runner clone (that crosses
+          // the worker-uid/runner-uid ownership seam branchTip exists to avoid). MID-RUN
+          // checkpoint tick only — the finalize/park/capture fetch-backs are M3's territory.
+          const fetchedTip = await this.git.trackingTip(barePath, runnerClone.branch);
+          await this.maybeSteerOnDivergence(barePath, flight, fetchedTip, batcher, steering, runLog);
+
+          // PRD #1416 M3 (C1): AFTER the steer (which must see the agent's rewritten H) and BEFORE
+          // the publish, non-destructively bridge a divergent tracking tip so the checkpoint pack —
+          // and therefore a reseed on resume — carries B instead of the rewritten H. Best-effort:
+          // a checkpoint must never crash the run (D4), so "failed"/"unknown" only log and continue.
+          const bridgeOutcome = await this.bridgeBareTrackingRefIfDivergent(
+            barePath,
+            runnerClone.branch,
+            flight,
+            runLog,
+          );
+          if (bridgeOutcome.kind === "failed" || bridgeOutcome.kind === "unknown") {
+            runLog.info("PRD #1416 M3: mid-run checkpoint bridge did not advance the tracking ref", {
+              run_id: runId,
+              branch: runnerClone.branch,
+              outcome: bridgeOutcome.kind,
+            });
+          }
+
           // PRD #267: origin-publish gate. The publish is CREDENTIAL-FREE (a pack brokered to the
           // api via publishCheckpoint, no PAT — checkpointPack local objects → client join token)
           // EXCEPT the reap:true `overlay`'s default-tip fetch.
@@ -4613,6 +5074,15 @@ export class RunRunner {
             // retries the SAME tip at the next interval boundary (bounded loss).
             if (published) {
               flight.lastPublishedTip = cloneTip ?? flight.lastPublishedTip;
+              // PRD #1416 M3 (C2): advance the checkpoint floor C to the DURABLE published floor on
+              // EVERY confirmed publish (PRD line 62). When this tick BRIDGED, C is already B (the
+              // helper set it) and cloneTip is the un-bridged H — so DO NOT regress C back to H;
+              // otherwise C is the confirmed checkpoint tip cloneTip. lastPublishedTip stays cloneTip
+              // (H) above: it drives hasNewWork, a separate concern from the floor.
+              flight.checkpointFloor =
+                bridgeOutcome.kind === "bridged"
+                  ? bridgeOutcome.bridge
+                  : (cloneTip ?? flight.checkpointFloor);
               // PRD #267 M3: make the time-based publish observable, only for the time path so
               // we do not double-log the milestone case.
               if (!opts.reap) {
@@ -4918,6 +5388,227 @@ export class RunRunner {
         error: errMessage(e),
       }),
     );
+  }
+
+  /**
+   * PRD #1416 M2: at the mid-run checkpoint fetch-back, detect whether the branch's history was
+   * rewritten at/below a published/checkpoint FLOOR and, if so, steer the agent to restore it —
+   * once per distinct fetched tip. It NEVER blocks a git command (D2): it only emits ONE `status`
+   * run message and arms ONE worker-authoritative steer that the next implement turn consumes.
+   * The finalize bridge (M3) is the correctness backstop; this mid-run steer is prevention and
+   * bounds detection at CHECKPOINT_INTERVAL (SC1).
+   *
+   * Dedup discipline (what makes the tests' "exactly one status and one steer" hold):
+   *  - null P (no published floor, fact 17) or a falsy tip → return (nothing to compare).
+   *  - test P, and C when it is set and differs from P, with {@link Git.ancestry}; the FIRST
+   *    "divergent" is enough — break so a single rewrite never emits twice. "unknown" (a git
+   *    error / missing ref) and "ancestor" are NOT divergent, so a transient read never steers.
+   *  - dedup by the FETCHED TIP (`flight.steeredTips`): a repeated tick re-fetching the SAME
+   *    diverged tip emits nothing; a FURTHER rewrite (a new tip) is a new key and steers again.
+   *
+   * Called from the mid-run checkpoint fetch-back ONLY (M2 scope); the finalize/park/capture
+   * fetch-backs are M3's territory, which adds the ancestry check and the bridge there together.
+   */
+  private async maybeSteerOnDivergence(
+    barePath: string,
+    flight: RunFlight,
+    tip: string | null,
+    batcher: MessageBatcher,
+    steering: SteeringChannel,
+    runLog: Logger,
+  ): Promise<void> {
+    const publishedTip = flight.publishedTip;
+    if (!publishedTip) return; // no published floor → nothing to have rewritten below (fact 17)
+    if (!tip) return; // no fetched tip to compare against
+    const floors = [publishedTip];
+    if (flight.checkpointFloor && flight.checkpointFloor !== publishedTip) {
+      floors.push(flight.checkpointFloor);
+    }
+    let divergent = false;
+    for (const floor of floors) {
+      if ((await this.git.ancestry(barePath, floor, tip)) === "divergent") {
+        divergent = true;
+        break; // one divergent floor is enough — do not emit twice
+      }
+    }
+    if (!divergent) return;
+    // Dedup by the fetched tip: at most one status + steer per distinct diverged tip.
+    const steered = (flight.steeredTips ??= new Set<string>());
+    if (steered.has(tip)) return; // repeated tick, same tip → nothing new
+    steered.add(tip);
+    batcher.emit({
+      kind: "status",
+      agent: "worker",
+      payload: {
+        text: `the branch's history was rewritten below its published tip ${publishedTip.slice(0, 12)}; uzi pushes fast-forward only; steering the agent to restore it`,
+      },
+    });
+    steering.pushSafetySteer(composeSafetySteer(publishedTip, tip));
+    runLog.info("PRD #1416 M2: divergence below published floor detected; armed safety steer", {
+      run_id: flight.runId,
+      published_tip: publishedTip,
+      tip,
+    });
+  }
+
+  /**
+   * PRD #1416 M3 — at a PUBLICATION BOUNDARY (finalize push, park, release, capture), non-
+   * destructively repair a divergent bare tracking tip H by wrapping it in a synthesised bridge
+   * commit B so a rewritten branch FAST-FORWARDS from its published floor P (and checkpoint floor
+   * C) WITHOUT a force-push (D4). Reads H from the WORKER BARE tracking ref (worker-uid, via
+   * {@link Git.trackingTip}) — NEVER the runner clone (that crosses the ownership seam branchTip
+   * avoids). Advances the tracking ref to B and C to B on success, so everything a caller then
+   * captures / releases / aligns / pushes off the tracking ref carries B.
+   *
+   * Outcomes (never thrown for control flow — a git failure inside maps to "failed"/"unknown"):
+   *  - "clean"   — no floor to bridge (P null, or P and C are already ancestors of H). Nothing done.
+   *  - "unknown" — ancestry could not be determined (a broken read); do NOT bridge, do NOT fail.
+   *  - "bridged" — B built AND validated (tree === H's tree, P and H both ancestors of B); the bare
+   *                tracking ref was advanced to B and C set to B.
+   *  - "failed"  — H is divergent but B could not be built or validated; the ref is left at H.
+   */
+  private async bridgeBareTrackingRefIfDivergent(
+    barePath: string,
+    branch: string,
+    flight: RunFlight,
+    runLog: Logger,
+  ): Promise<BridgeOutcome> {
+    const publishedTip = flight.publishedTip;
+    if (!publishedTip) return { kind: "clean" }; // no published floor (fact 17) — nothing to bridge
+    // Read H from the WORKER-owned bare tracking ref; null ⇒ nothing published yet on this seam.
+    const H = await this.git.trackingTip(barePath, branch);
+    if (!H) return { kind: "clean" };
+    // Ancestry of P and of C (when C is set and differs from P) against H, tri-state.
+    const floors = [publishedTip];
+    if (flight.checkpointFloor && flight.checkpointFloor !== publishedTip) {
+      floors.push(flight.checkpointFloor);
+    }
+    let anyDivergent = false;
+    let anyUnknown = false;
+    for (const floor of floors) {
+      const rel = await this.git.ancestry(barePath, floor, H);
+      if (rel === "divergent") anyDivergent = true;
+      else if (rel === "unknown") anyUnknown = true;
+    }
+    if (!anyDivergent) {
+      // All ancestor, OR a mix of ancestor+unknown (no divergent): a broken read must NEVER bridge.
+      return anyUnknown ? { kind: "unknown" } : { kind: "clean" };
+    }
+    // Build B over the floors (bridgeToFloors appends only the ones actually missing).
+    const bridgeResult = await this.git.bridgeToFloors(barePath, H, floors);
+    if (bridgeResult.kind === "noop") {
+      // #1416 (MR-rework, finding 4): nothing was actually missing — H already covers every floor (a
+      // fast-forward). The caller's divergence read raced ahead of bridgeToFloors' recheck. Treat as
+      // clean so a fast-forwardable run is NOT failed as history_rewritten.
+      return { kind: "clean" };
+    }
+    if (bridgeResult.kind === "failed") {
+      runLog.warn("PRD #1416 M3: divergence below published floor but the bridge could not be built", {
+        run_id: flight.runId,
+        published_tip: publishedTip,
+        tip: H,
+      });
+      return { kind: "failed" };
+    }
+    const bridge = bridgeResult.sha;
+    // VALIDATE B before adopting it: tree byte-equal to H's, and P and H both ancestors of B.
+    // #1416 M3 — distinguish a TRANSIENT/UNKNOWN read from a DEFINITIVE validation failure. A
+    // revParse that returns null (a broken/transient read) or an `ancestry` that returns "unknown"
+    // is NOT proof that B is malformed; at the finalize sinks a "failed" throws HistoryRewrittenError
+    // and fails the whole run, so a transient read must NOT hard-fail it. Only a DEFINITIVELY
+    // malformed B fails: its tree RESOLVES and differs from H's, OR `ancestry` DEFINITIVELY reports
+    // "divergent" (P or H provably NOT an ancestor of B). A transient/unknown read → "unknown"
+    // (best-effort: do not adopt B, do not throw at finalize).
+    const bridgeTree = await this.git.revParse(barePath, `${bridge}^{tree}`);
+    const hTree = await this.git.revParse(barePath, `${H}^{tree}`);
+    const pRel = await this.git.ancestry(barePath, publishedTip, bridge);
+    const hRel = await this.git.ancestry(barePath, H, bridge);
+    // A tree read that could not resolve is transient; a resolved-but-different tree is definitive.
+    const treeUnknown = bridgeTree === null || hTree === null;
+    const treeMismatch = !treeUnknown && bridgeTree !== hTree;
+    const definitiveFail = treeMismatch || pRel === "divergent" || hRel === "divergent";
+    const transientUnknown = treeUnknown || pRel === "unknown" || hRel === "unknown";
+    if (definitiveFail) {
+      runLog.warn("PRD #1416 M3: bridge is definitively malformed; NOT adopting it", {
+        run_id: flight.runId,
+        published_tip: publishedTip,
+        tip: H,
+        bridge,
+        tree_mismatch: treeMismatch,
+        p_ancestry: pRel,
+        h_ancestry: hRel,
+      });
+      return { kind: "failed" };
+    }
+    if (transientUnknown) {
+      // A broken/transient read during validation: do NOT adopt B, but do NOT fail the run either
+      // (the finalize sinks would throw). Best-effort — the caller leaves the tracking ref at H.
+      runLog.warn("PRD #1416 M3: bridge validation read was transient/unknown; NOT adopting it (best-effort)", {
+        run_id: flight.runId,
+        published_tip: publishedTip,
+        tip: H,
+        bridge,
+        tree_unknown: treeUnknown,
+        p_ancestry: pRel,
+        h_ancestry: hRel,
+      });
+      return { kind: "unknown" };
+    }
+    // Adopt B: advance the bare tracking ref (worker-uid) and the checkpoint floor C.
+    try {
+      await this.git.updateTrackingRef(barePath, branch, bridge);
+    } catch (e) {
+      runLog.warn("PRD #1416 M3: could not advance the tracking ref to the bridge", {
+        run_id: flight.runId,
+        bridge,
+        error: errMessage(e),
+      });
+      return { kind: "failed" };
+    }
+    flight.checkpointFloor = bridge;
+    runLog.info("PRD #1416 M3: history rewritten below the published floor; bridged and advanced the tracking ref", {
+      run_id: flight.runId,
+      published_tip: publishedTip,
+      tip: H,
+      bridge,
+    });
+    return { kind: "bridged", bridge };
+  }
+
+  /**
+   * PRD #1416 M3 — the BEST-EFFORT bridge wrapper for the park / shutdown / capture sinks (C5-C8).
+   * Unlike the finalize sinks (C3/C4), which throw {@link HistoryRewrittenError} on a "failed"
+   * bridge, these boundaries must NEVER throw: a park/shutdown/capture that fails is worse than one
+   * that loses a bridge (D4). It runs the bridge, logs a "failed"/"unknown" outcome, and returns —
+   * the caller then captures/publishes whatever the tracking ref points at (B on success, the
+   * un-bridged H otherwise). Swallows any thrown error too, so nothing here can undo a park.
+   */
+  private async bridgeParkSinkBestEffort(
+    barePath: string,
+    branch: string,
+    flight: RunFlight,
+    runLog: Logger,
+    sink: string,
+  ): Promise<void> {
+    try {
+      const o = await this.bridgeBareTrackingRefIfDivergent(barePath, branch, flight, runLog);
+      if (o.kind === "failed" || o.kind === "unknown") {
+        runLog.info("PRD #1416 M3: park/capture bridge did not advance the tracking ref", {
+          run_id: flight.runId,
+          branch,
+          sink,
+          outcome: o.kind,
+        });
+      }
+    } catch (e) {
+      // Never let a bridge failure undo a park/shutdown/capture (D4).
+      runLog.warn("PRD #1416 M3: park/capture bridge threw; continuing best-effort", {
+        run_id: flight.runId,
+        branch,
+        sink,
+        error: errMessage(e),
+      });
+    }
   }
 
   /**
@@ -5629,6 +6320,12 @@ export class RunRunner {
           runLog,
         );
       }
+      // PRD #1416 M3 (C7): bridge a divergent tracking tip BEFORE the pause-park publish so a resume
+      // adopts B (the rewritten work), not the published tip. handlePausePark is checkpoint-first and
+      // does NOT route through the doCheckpointPublish/reapForSink machinery C1/C5/C6 cover, so it is
+      // wired here directly; the PauseNowSignal catch and the parkForPause callback both reach it, so
+      // this one placement covers both. Best-effort — a park must never throw (D4).
+      await this.bridgeParkSinkBestEffort(barePath, branch, flight, runLog, "pause-park");
     }
 
     // Checkpoint FIRST (Decision 8). An already-durable tip (a prior mid-run publish
@@ -5791,6 +6488,12 @@ export class RunRunner {
       branch,
     );
     if (!verified) return { verified: false, published: false };
+    // PRD #1416 M3 (C8): bridge a divergent tracking tip AFTER the fetch-back + verify (so the verify
+    // still confirms the tracking ref covered the run's HEAD H) and BEFORE the capture publish, so
+    // the recovery restore point + its published checkpoint hold B — a reseed on resume adopts B
+    // (which descends from P) instead of the rewritten H being set aside. Best-effort — a recovery
+    // capture must never throw.
+    await this.bridgeParkSinkBestEffort(barePath, branch, flight, runLog, "recovery-capture");
     // Remote publish is SEPARATE and best-effort. The agent tree was already reaped by the
     // caller (handleRecoveryExhausted's killAgentTree, untouched), so the overlay's PAT
     // default-fetch is permitted. publishCheckpointBestEffort surfaces the HTTP/skip outcome
@@ -6155,6 +6858,11 @@ export class RunRunner {
     // current HEAD (incl. any WIP marker), so a same-worker reseed recovers exactly this tip.
     const verified = await this.git.verifyRunnerTrackingCovers(barePath, worktreePath, branch);
     if (!verified) return NONE;
+    // PRD #1416 M3 (C8): bridge a divergent tracking tip AFTER the fetch-back + verify (so the verify
+    // still confirms the tracking ref covered H) and BEFORE the head is read + published, so a
+    // credential-switch release captures B, not the rewritten H — the completion-hold head and the
+    // published checkpoint both carry B, and a same-worker reclaim's reseed adopts it. Best-effort.
+    await this.bridgeParkSinkBestEffort(barePath, branch, flight, runLog, "hold-capture");
     // The captured head is the verified tracking tip. A verified ref whose tip is unresolvable is
     // treated as unverified (retain) — the hold contract requires a real head H for the permit.
     const head = await this.git.trackingTip(barePath, branch);
@@ -6334,6 +7042,11 @@ export class RunRunner {
     // PRD #212: the runner clone path (= runnerClone.path), so the gate can run a
     // runner-uid `git status --porcelain` there to surface plan-turn worktree writes.
     worktreePath: string,
+    // PRD #1416 M5: the branch's published floor P (flight.publishedTip), or undefined for a
+    // fresh, never-published branch. When set AND the submitted plan proposes rewriting history,
+    // the gate emits a warn-only status nudge (both modes) and, under auto-approve, arms the M2
+    // safety steer for the first implement turn. The verdict flow is untouched (never rejects).
+    publishedTip: string | undefined,
     // PRD #362 M3c: advisory hook fired AFTER the awaiting_approval report persists
     // plan_md, BEFORE the verdict wait (see the RunContext.gatePlan doc). Never invoked
     // on the autopilot branch: that branch DOES persist plan_md durably (RC1 #1197, via
@@ -6345,6 +7058,23 @@ export class RunRunner {
     // Get the plan message onto the stream regardless of mode — it is the audit
     // record of what the agent intended, autopilot or not.
     await batcher.flush().catch(() => undefined);
+
+    // PRD #1416 M5 (D5): a WARN-ONLY plan-gate nudge. When the branch has a published floor P and
+    // the submitted plan proposes rewriting history (a case-insensitive regex scan over plan_md),
+    // emit ONE visible `status` run message right after the plan — in BOTH modes, so a human sees
+    // it next to the plan and an auto-approved run still records it. The verdict flow is untouched:
+    // this never rejects and never blocks the plan (false positives are accepted, D5). The steer is
+    // armed under auto-approve only, below.
+    const proposesRewrite = !!publishedTip && planProposesRewrite(planMd);
+    if (proposesRewrite) {
+      batcher.emit({
+        kind: "status",
+        agent: "worker",
+        payload: {
+          text: `the plan proposes rewriting history on a branch published at ${publishedTip!.slice(0, 12)}; the worker lands fast-forward only and cannot land a rewritten branch — prefer \`git merge\``,
+        },
+      });
+    }
 
     if (autoApprove) {
       // Auto-approve is a VERDICT SOURCE at the existing gate, not a bypass around
@@ -6411,6 +7141,15 @@ export class RunRunner {
         run_id: runId,
         agent_source: selection.source,
       });
+      // PRD #1416 M5: on an AUTO-APPROVED run the human never sees the status nudge emitted above,
+      // so ALSO arm the M2 worker-authoritative safety steer with a plan-time PREVENTIVE body
+      // (composePlanGateNudge — distinct from composeSafetySteer, which references an already-
+      // rewritten tip H that does not exist yet at plan time). Both executors drain pullSafetySteer
+      // at their loop top, ahead of any follow-up and BEFORE the FIRST buildImplementPrompt, so the
+      // first implement turn is reminded not to rewrite at/below P. NOT armed on the human-gated
+      // branch below (a human sees the plan + the nudge and can revise/reject). The verdict is
+      // UNCHANGED — this arms guidance beside the approve, it does not alter it.
+      if (proposesRewrite) steering.pushSafetySteer(composePlanGateNudge(publishedTip!));
       return { kind: "approve", selection: { status: "ok", selection } };
     }
 
@@ -6965,8 +7704,22 @@ export function mrDescription(
   // reason), present in ANY branch — including on a closing accept-only PR. Absent/empty ⇒ no partial,
   // no accept, so the body is byte-identical to today.
   completionScope?: ClaimConfig["completion_scope"],
+  // PRD #1416 M3 (Part D): the pushed history contains an ancestry bridge (derived from history via
+  // rangeContainsBridge, NOT a flight-local flag). When true, ONE GENERIC sentence is appended to the
+  // body of EVERY kind's MR — never "the worker bridged it", because the agent's own `git merge -s
+  // ours <P>` bridge is equally possible. Defaults false so a non-bridged MR is byte-identical to today.
+  bridged = false,
 ): string {
   const footer = `Opened automatically by the uzi agent from branch \`${branch}\`. Please review and merge manually — the agent never merges.`;
+  // One generic sentence, rendered into whichever body arm runs below (a per-kind body or the issue
+  // body) so the note is path- AND kind-independent. Empty when not bridged (body unchanged). #1416
+  // FIX 6: the issue arm renders it WITHIN the body (before the `---` footer); the bridgeNote form
+  // (with its leading blank line) is kept for the per-kind arm, which appends it to a body that
+  // already carries its own footer.
+  const bridgeSentence = bridged
+    ? "This branch contains a history bridge: a published commit was restored as an ancestor so the branch fast-forwards without a force-push, and `git log --first-parent` still reads as the intended history."
+    : "";
+  const bridgeNote = bridgeSentence ? `\n\n${bridgeSentence}` : "";
   const repoMarker =
     agentSelection?.source === "repo"
       ? [
@@ -6991,7 +7744,7 @@ export function mrDescription(
     selfImproveSection,
     promptGuardSection,
   });
-  if (kindBody !== undefined) return kindBody;
+  if (kindBody !== undefined) return kindBody + bridgeNote;
   // PRD #1227 M2/M3: the owner completion decisions. `deferred` non-empty ⇒ owner PARTIAL
   // (scope_reduced): the issue is NOT fully delivered. `accepted` non-empty ⇒ owner-waived unmet
   // criteria to name in a warning block. Both absent/empty on a normal run.
@@ -7053,6 +7806,8 @@ export function mrDescription(
   }
   const gatesSection = gatesUnverifiedMrSection(gatesUnverified, gatesDiscoveryTruncated);
   if (gatesSection) body.push("", gatesSection);
+  // #1416 FIX 6: render the bridge sentence WITHIN the body, before the `---` footer.
+  if (bridgeSentence) body.push("", bridgeSentence);
   body.push("", "---", footer);
   return body.join("\n");
 }
