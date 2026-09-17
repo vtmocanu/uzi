@@ -7,7 +7,7 @@ import {
   type Worker,
 } from "../../lib/api";
 import { errorMessage } from "../../lib/apiError";
-import { runCredentialBody } from "../../lib/credentialOverride";
+import { setTokenBody } from "../../lib/credentialOverride";
 import { useSeededCredential } from "../../lib/useSeededCredential";
 import { stripUnsafeChars } from "../../lib/safeText";
 import { effectiveWorkerCaps } from "../../lib/workerCaps";
@@ -194,11 +194,12 @@ export function PlanPanel({
   // PRD #1247 M7: the token the IMPLEMENTATION phase runs on, chosen at the gate. Seeded
   // from the run's stored override (a pinned label→id resolved once the token list loads,
   // touched-ref guarded) so the picker shows the run's CURRENT choice, not a misleading
-  // "inherit". On approve, a CHANGED non-inherit choice is set via api.setRunCredential
-  // BEFORE the approve submits; an UNTOUCHED picker sends nothing (a no-op that PRESERVES
-  // the create-time override), and a genuine inherit pick still omits (runCredentialBody,
-  // the create-time body rule). The credential call stays HERE (not folded into
-  // onApprove's args) so the existing onApprove contract — and its tests — are untouched.
+  // "inherit". On approve, a TOUCHED picker always sends the switch-body contract via
+  // api.setRunCredential BEFORE the approve submits — including an explicit Inherit, which
+  // clears the run's override back to the worker binding (setTokenBody). An UNTOUCHED picker
+  // sends nothing (a no-op that PRESERVES the create-time override). The credential call
+  // stays HERE (not folded into onApprove's args) so the existing onApprove contract — and
+  // its tests — are untouched.
   const {
     selection: credential,
     onSelectionChange: onCredentialChange,
@@ -211,12 +212,12 @@ export function PlanPanel({
       setCredentialError("");
       // Only (re)set the token when the user CHANGED the gate picker: leaving the seeded
       // choice untouched keeps the run's create-time override (sending nothing is a no-op
-      // that preserves it), whereas re-sending the same value would be redundant. A
-      // genuine inherit pick still omits (runCredentialBody), the create-time rule.
-      const body = credentialTouched ? runCredentialBody(credential) : undefined;
-      if (body) {
+      // that preserves it). A TOUCHED picker always sends the switch-body contract — even
+      // an explicit Inherit, which clears the run's override back to the worker binding
+      // (setTokenBody sends {mode:"inherit"} rather than omitting it, unlike a create body).
+      if (credentialTouched) {
         try {
-          await api.setRunCredential(run.id, body);
+          await api.setRunCredential(run.id, setTokenBody(credential));
         } catch (e) {
           // Do not approve if setting the token failed — the run would otherwise
           // implement on the wrong credential. Surface the error at the gate.

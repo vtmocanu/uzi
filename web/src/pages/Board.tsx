@@ -397,6 +397,12 @@ export function Board() {
   // defaults to inherit — the run follows the worker binding.
   const [tokens, setTokens] = useState<SecretMeta[]>([]);
   const [cardCredential, setCardCredential] = useState<Record<number, CredentialSelection>>({});
+  // PRD #1247: cardCredential is keyed only by issue iid, and the route swaps :id without
+  // remounting the component, so a per-card pin from repo A would otherwise reapply to a
+  // same-iid card in repo B. Clear it on a repo change (no-op at mount).
+  useEffect(() => {
+    setCardCredential({});
+  }, [repoId]);
   // The viewer's runs on this repo blocked on their approval — drives the
   // attention strip above the columns.
   const [awaitingRuns, setAwaitingRuns] = useState<RunListItem[]>([]);

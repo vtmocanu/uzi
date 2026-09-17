@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { api, isHttpsUrl, preferForgeUrl, type IssueDetail, type RunListItem, type SecretMeta } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
@@ -62,6 +62,12 @@ export function IssueView() {
   // PRD #1247 M7: the token the run will spend, chosen before Start run. Default
   // inherit (shown explicitly) so an untouched start follows the worker binding.
   const [credential, setCredential] = useState<CredentialSelection>(INHERIT_SELECTION);
+  // PRD #1247: this component is reused across route-param changes without remounting (the
+  // data effect below keys on [repoId, iidNum] and refetches), so reset the picked
+  // credential to inherit when the route identity changes (no-op at mount).
+  useEffect(() => {
+    setCredential(INHERIT_SELECTION);
+  }, [repoId, iidNum]);
 
   const { data, loading, error: loadError, reload } = useAsyncData(
     async ({ isCurrent }) => {

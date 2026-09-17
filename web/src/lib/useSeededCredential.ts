@@ -8,12 +8,14 @@
 //
 // It lives OUTSIDE credentialOverride.ts (a deliberately React-free lib leaf) because it
 // uses hooks. Behaviour, mirroring ScheduleModal's credentialTouchedRef effect:
-//   - seed the selection from the override at mount (resolving a pin against any injected
-//     list — so an injected list needs no async re-seed);
+//   - seed the selection from the override, and RE-SEED whenever a seeding input changes
+//     (the override's mode/label, the `enabled` gate flipping late, or an injected list
+//     arriving/changing) — resolving a pin against any injected list, so an injected list
+//     needs no async re-seed;
 //   - self-fetch the user's Anthropic tokens when none are injected, then RE-SEED to
 //     resolve a pinned label→id now that the list is known — UNLESS the user already
-//     touched the picker, in which case their live edit stands (a ref, so the async
-//     re-seed never clobbers it);
+//     touched the picker, in which case their live edit stands (a ref, so neither the sync
+//     nor the async re-seed clobbers it);
 //   - `onSelectionChange` marks the picker touched and records the new selection.
 // `enabled` (default true) gates the self-fetch so a surface that HIDES the picker for a
 // non-owner (canSteer=false) fires no listSecrets for a viewer who cannot use it.
@@ -54,10 +56,25 @@ export function useSeededCredential(
   const [touched, setTouched] = useState(false);
   const touchedRef = useRef(false);
 
+  // Primitive/stable deps so the effect re-runs when a SEEDING input actually changes, not
+  // on every render from a new-but-equal `override`/`opts` object. selectionFromOverride
+  // reads only mode+label, so those two capture every seeding input; injectedSig detects a
+  // changed injected token list without depending on the array's identity.
+  const overrideMode = override?.mode;
+  const overrideLabel = override?.label ?? null;
+  const injectedSig = injected ? (injectedTokens ?? []).map((t) => t.id + ":" + t.label).join(",") : "";
+
   useEffect(() => {
-    // An injected list is known at mount, so the initial seed already resolved a pin;
-    // only self-fetch (and re-seed) when no list was injected and the picker is enabled.
-    if (injected || !enabled) return;
+    // Re-seed the selection whenever a seeding input changes — UNLESS the user already
+    // touched the picker, in which case their live edit stands (touchedRef, so neither the
+    // sync nor the async re-seed clobbers it). RunView streams a changed override into an
+    // unkeyed picker, canSteer can flip `enabled` late, and an injected list can change.
+    if (injected) {
+      // An injected list is known synchronously, so re-seed in place (no fetch needed).
+      if (!touchedRef.current) setSelection(selectionFromOverride(override, injectedTokens ?? []));
+      return;
+    }
+    if (!enabled) return;
     let cancelled = false;
     void (async () => {
       try {
@@ -67,7 +84,7 @@ export function useSeededCredential(
         setFetched(anthropic);
         // Re-seed to resolve a pinned label→id now the list is known — unless the user
         // already changed the picker (then their choice stands).
-        if (!touchedRef.current) setSelection(selectionFromOverride(override, anthropic));
+        if (!cancelled && !touchedRef.current) setSelection(selectionFromOverride(override, anthropic));
       } catch {
         // keep the pre-load seed; the picker still renders its four base states
       }
@@ -75,10 +92,12 @@ export function useSeededCredential(
     return () => {
       cancelled = true;
     };
-    // `override`/`opts` are stable for the surface's lifetime; run once on mount, exactly
-    // as ScheduleModal's credential seed effect does.
+    // mode+label capture all seeding inputs (selectionFromOverride reads only those), so
+    // the full `override` object is used for seeding but its identity is deliberately
+    // excluded. No infinite loop: setFetched runs only in the non-injected branch, where
+    // injectedSig is "" (stable) and mode/label are unchanged, so it never re-triggers.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [injected, enabled, overrideMode, overrideLabel, injectedSig]);
 
   const onSelectionChange = useCallback((sel: CredentialSelection) => {
     touchedRef.current = true;

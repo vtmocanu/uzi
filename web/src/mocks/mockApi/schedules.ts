@@ -611,6 +611,12 @@ export const schedulesApi = {
     }
     assertGuidanceWithinCap(input.guidance);
     const m: Schedule = { ...cur };
+    // PRD #1247: production validates with allowSelfImprove = (cur.target === "self_improve")
+    // (schedules.go), so converting a non-self_improve schedule TO self_improve is rejected
+    // 400 by validateScheduleConfig BEFORE any credential-override handling — regardless of
+    // whether credential_override is provided, cleared, or omitted.
+    if (input.target === "self_improve" && cur.target !== "self_improve")
+      throw new ApiError(400, "target must be one of: issue, sweep, prompt");
     if (input.target !== undefined) m.target = input.target;
     if (input.timing !== undefined) m.timing = input.timing;
     if (input.issue_iid !== undefined) m.issue_iid = input.issue_iid;

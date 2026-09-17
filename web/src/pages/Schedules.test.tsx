@@ -1144,3 +1144,22 @@ describe("Schedules — pause all (PRD #1093)", () => {
     expect(await snapshot()).toEqual(before);
   });
 });
+
+// PRD #1247 (CodeRabbit finding [O4]). Production's validateScheduleConfig runs with
+// allowSelfImprove = (cur.target === "self_improve"), so a PATCH converting a
+// non-self_improve schedule TO self_improve is rejected 400 BEFORE any credential-override
+// handling. The mock must reproduce that contract. Driven against schedulesApi directly,
+// like the D4 case above, because it is a mock-behaviour assertion.
+describe("Schedules — the mock rejects a self_improve target conversion (PRD #1247 O4)", () => {
+  it("400s a non-self_improve → self_improve PATCH with the production message", async () => {
+    const all = await schedulesApi.listSchedules();
+    // A USER-origin, non-self_improve row: a default row would trip its own catalog-lock
+    // 400 first (a different message), so pick a user schedule to exercise THIS path.
+    const victim = all.find((s) => s.origin === "user" && s.target !== "self_improve");
+    expect(victim).toBeTruthy();
+    await expect(schedulesApi.updateSchedule(victim!.id, { target: "self_improve" })).rejects.toMatchObject({
+      status: 400,
+      message: "target must be one of: issue, sweep, prompt",
+    });
+  });
+});

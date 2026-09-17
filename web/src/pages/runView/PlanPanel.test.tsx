@@ -190,6 +190,31 @@ describe("PlanPanel — gate credential path (PRD #1247 M7)", () => {
     expect(onApprove.mock.calls[0]).toHaveLength(1);
   });
 
+  it("sends an explicit inherit when the user touches an overridden picker back to Inherit", async () => {
+    // A run WITH an override. Picking Inherit is a MEANINGFUL action at the gate: it must
+    // clear the run's override back to the worker binding, so a TOUCHED inherit sends the
+    // switch-body {mode:"inherit"} — NOT nothing. On the old code runCredentialBody(inherit)
+    // returned undefined and the call was skipped, leaving the stale override in place.
+    mockApi.listSecrets.mockResolvedValue({ secrets: [token()] });
+    mockApi.setRunCredential.mockResolvedValue({ run: run() });
+    const { onApprove } = renderPanel({ credential_override: { mode: "pinned", label: "console-key" } });
+
+    const select = screen.getByLabelText("Anthropic token for the implementation phase") as HTMLSelectElement;
+    // The seed resolves to the pinned token first (so the switch to Inherit is a real edit)…
+    await waitFor(() => expect(select.value).toBe("sec-1"));
+    // …then the user picks Inherit.
+    fireEvent.change(select, { target: { value: "mode:inherit" } });
+
+    fireEvent.click(screen.getByRole("button", { name: /Approve plan/ }));
+
+    // The explicit inherit is sent BEFORE approve — the run's override is cleared.
+    await waitFor(() => expect(mockApi.setRunCredential).toHaveBeenCalledWith("r1", { mode: "inherit" }));
+    await waitFor(() => expect(onApprove).toHaveBeenCalled());
+    expect(mockApi.setRunCredential.mock.invocationCallOrder[0]).toBeLessThan(
+      onApprove.mock.invocationCallOrder[0],
+    );
+  });
+
   it("states accurate help copy: worker binding with no override, keep-current with one", () => {
     // No override → inherit follows the worker binding.
     renderPanel();
