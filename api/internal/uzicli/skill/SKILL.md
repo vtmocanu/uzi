@@ -1235,7 +1235,11 @@ into `file`/`dismiss`. `undo` keys on the `disposition_id` field (read it from
 
 - `uzi worker list` — your workers. `uzi worker rm <worker-id>` — delete one of
   your workers (its runs requeue). There is no `worker create`: minting a join
-  token is a web action, because the token can read decrypted secrets.
+  token is a web action, because the token can read decrypted secrets. A
+  worker that only briefly lost the api (not its own health) is not among
+  these requeues: its runs are re-adopted to their exact phase on its next
+  heartbeat instead. `uzi worker list` / `uzi admin workers` show the runs
+  each worker reports executing and in which phase.
 - `uzi worker set-token <worker-id> <label>|--default|--auto` — choose which
   Anthropic credential a worker's runs spend. A **label** pins it to that token;
   **`--default`** uses your default one; **`--auto`** lets uzi pick per claim from
