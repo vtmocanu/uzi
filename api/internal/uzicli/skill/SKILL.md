@@ -558,8 +558,10 @@ uzi version
   refused (409, exit 5) when no live worker currently holds the run, or the holding worker
   predates the `credential_switch` capability (an old worker fleet) — set-token never
   silently no-ops on either. A foreign/unknown run or an unknown token label is refused
-  (404 / usage); a codex run is 422, and the chat/judge/self_improve/review lane is 409
-  ("lane not switchable" — the override would never be honoured there). It may print a warning (the token has no
+  (404 / usage); a codex run is 422; the chat/judge/self_improve lanes are 409
+  ("lane not switchable") at every state; a review run (a `task` run reviewing another) is 409
+  only while it is HELD (running or at a gate) — a queued or parked review run accepts the
+  override and honours it on its next claim. It may print a warning (the token has no
   headroom, or `auto` will hold in `pool_wait`) **without** refusing — the switch still
   applies. Prints the updated run; `--json` emits the run object, whose `credential_switch`
   field reads `null` (no switch pending), `"requested"`, or `"released"` (awaiting reclaim)
