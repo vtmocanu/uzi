@@ -2702,6 +2702,22 @@ describe("CodexExecutor prompts — published-tip note (PRD #1416 M1)", () => {
     assert.ok(!implementPrompt(makeCtx({ approvedPlan: "p" }).ctx).includes("already published on the forge"));
     assert.ok(!implementPrompt(makeCtx({ approvedPlan: undefined }).ctx).includes("already published on the forge"));
   });
+
+  it("threads autoApprove: an autopilot Codex prompt gets plan-only rewrite guidance, not `ask_user`", () => {
+    // #1416 (MR-rework): under auto-approve the Codex plan/implement prompts must carry the
+    // autopilot-safe rewrite guidance, not the human-only `ask_user` wording (matches the SDK path).
+    const autoPlan = planPrompt(makeCtx({ publishedTip: P, autoApprove: true }).ctx);
+    assert.ok(autoPlan.includes("state the constraint plainly in the plan"), "autopilot plan gives plan-only guidance");
+    assert.ok(!autoPlan.includes("stop and call `ask_user`"), "autopilot plan does not call ask_user");
+    // The default (non-autopilot) form keeps the `ask_user` rewrite guidance.
+    const manualPlan = planPrompt(makeCtx({ publishedTip: P, autoApprove: false }).ctx);
+    assert.ok(manualPlan.includes("stop and call `ask_user`"), "the default Codex plan keeps the ask_user guidance");
+    const autoImpl = implementPrompt(
+      makeCtx({ approvedPlan: "the approved plan", publishedTip: P, autoApprove: true }).ctx,
+    );
+    assert.ok(autoImpl.includes("state the constraint plainly in the plan"), "autopilot implement gives plan-only guidance");
+    assert.ok(!autoImpl.includes("stop and call `ask_user`"), "autopilot implement does not call ask_user");
+  });
 });
 
 // PRD #1416 M2: the Codex implement loop drains ctx.pullSafetySteer at its loop top and, when

@@ -1775,7 +1775,9 @@ export class CodexExecutor implements Executor {
     const body = `${head}\n\n${ctx.issueDescription}\n\nProduce a plan for this work and submit it for approval.`;
     // PRD #1416 M1: these Codex builders bypass the shared buildPlanPrompt/buildImplementPrompt,
     // so prepend the published-floor paragraph here. Empty ⇒ unchanged (a fresh branch).
-    const note = publishedTipNote(ctx.publishedTip, ctx.defaultBranchCommit);
+    // #1416 (MR-rework): thread autoApprove so an autopilot Codex run gets the autopilot-safe
+    // rewrite guidance, not the human-only `ask_user` wording (matches the SDK builders).
+    const note = publishedTipNote(ctx.publishedTip, ctx.defaultBranchCommit, ctx.autoApprove);
     return note ? `${note}\n\n${body}` : body;
   }
 
@@ -1785,7 +1787,9 @@ export class CodexExecutor implements Executor {
     const body = approved ? approved : `${head}\n\n${ctx.issueDescription}`;
     // PRD #1416 M1: prepend the published-floor paragraph whether or not a plan is approved.
     // Empty ⇒ unchanged (a fresh branch).
-    const note = publishedTipNote(ctx.publishedTip, ctx.defaultBranchCommit);
+    // #1416 (MR-rework): thread autoApprove so an autopilot Codex run gets the autopilot-safe
+    // rewrite guidance, not the human-only `ask_user` wording (matches the SDK builders).
+    const note = publishedTipNote(ctx.publishedTip, ctx.defaultBranchCommit, ctx.autoApprove);
     return note ? `${note}\n\n${body}` : body;
   }
 
