@@ -27,4 +27,8 @@ type UserSettingsDTO struct {
 	LightTheme     *string `json:"light_theme"`
 	DarkTheme      *string `json:"dark_theme"`
 	Typeface       *string `json:"typeface"`
+	// DefaultHarness is the CLI decode mirror of the per-user default harness (PRD #1429
+	// M1 / D3); null = "no preference". Fidelity only — there is deliberately no CLI setter
+	// for the user default (D3), so this is carried so a decode never drops it.
+	DefaultHarness *string `json:"default_harness"`
 }

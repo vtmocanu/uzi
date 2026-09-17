@@ -36,6 +36,7 @@ function aRun(over: Partial<RunListItem> = {}): RunListItem {
     issue_iid: 7,
     issue_title: "A run",
     issue_description: "",
+    harness: "claude", // PRD #1429 M1: harness joined RunDTO.
     title: null,
     resume_of_run_id: null,
     status: "running",

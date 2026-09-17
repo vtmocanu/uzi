@@ -590,6 +590,9 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 			CacheCreationTokens: u.CacheCreationTokens,
 			OutputTokens:        u.OutputTokens,
 			CostUSD:             numericToFloat(u.CostUsd),
+			// PRD #1429 M1 (D7): the run's folded cost_status, so the run-detail usage strip
+			// can distinguish a real metered dollar total from a subscription/unreported one.
+			CostStatus: u.CostStatus,
 		}
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		slog.Error("get run usage total", "run_id", run.ID, "error", err)

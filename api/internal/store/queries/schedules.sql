@@ -322,8 +322,10 @@ WHERE schedule_id = @schedule_id
 -- prompt run has no forge issue and no PRD link. auto_approve and wait_on_limit come
 -- straight from the schedule (the owner set them there), so unlike the engine runs
 -- this path does not fall back to the owner's default.
--- harness (PRD #1332 M5A / D2) is the SQL literal 'claude', not a param: a prompt run is a
--- Claude production origin, and the literal defeats the DEFAULT-masks-omission trap.
+-- harness (PRD #1429 M1, was #1332 M5A / D2) is now the @harness PARAMETER supplied by the M5B
+-- create seam (workersvc.createRunAtomic), not the SQL literal 'claude'. A schedule pin is an
+-- explicit selection resolved at fire time; a null pin resolves from the then-current default
+-- (D2). M2 wires that real value. Every current caller passes string(HarnessClaude) as a stopgap.
 -- credential_override_mode / credential_override_secret_id (PRD #1247 M1) are the
 -- per-run credential override (D1/D5), both sqlc.narg — NULL = inherit, byte-identical
 -- to a pre-#1247 prompt run. M1 always passes NULL; M6 wires the schedule's stored
@@ -332,6 +334,6 @@ INSERT INTO runs (
     user_id, repo_id, kind, issue_title, issue_description, schedule_id, auto_approve, wait_on_limit, mr_rework_enabled, model, override_subagent_model, required_capabilities, trigger_source, harness, credential_override_mode, credential_override_secret_id
 ) VALUES (
     @user_id, @repo_id::uuid, 'prompt', @issue_title, @issue_description, @schedule_id::uuid, @auto_approve, @wait_on_limit, sqlc.narg('mr_rework_enabled'), sqlc.narg('model'), @override_subagent_model,
-    COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), 'schedule', 'claude', sqlc.narg('credential_override_mode'), sqlc.narg('credential_override_secret_id')
+    COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), 'schedule', @harness, sqlc.narg('credential_override_mode'), sqlc.narg('credential_override_secret_id')
 )
 RETURNING *;

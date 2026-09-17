@@ -63,6 +63,10 @@ func (s *Service) CreateSelfImproveRun(ctx context.Context, userID, repoID uuid.
 		// PRD #908 M1: the schedule's mr_rework override, stamped THROUGH live-inherit —
 		// nil ⇒ NULL ⇒ the run follows the owner default at read time.
 		MrReworkEnabled: pgconv.BoolPtr(mrReworkEnabled),
+		// PRD #1429 M1 stopgap: harness is now the @harness param. Stamp Claude explicitly
+		// (byte-identical to today); M2 threads the resolved D11 harness. Omitting it would
+		// ship harness='' → 23514.
+		Harness: string(HarnessClaude),
 	})
 	if err != nil {
 		if isUniqueViolation(err) {

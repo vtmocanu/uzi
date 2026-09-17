@@ -83,6 +83,7 @@ function aRun(over: Partial<RunListItem> = {}): RunListItem {
     issue_iid: 7,
     issue_title: "A run",
     issue_description: "",
+    harness: "claude", // PRD #1429 M1: harness joined RunDTO.
     title: null,
     resume_of_run_id: null,
     status: "running",
@@ -403,7 +404,7 @@ describe("RunsList — usage meta line (PRD #40)", () => {
           id: "with",
           issue_title: "Has usage",
           status: "running",
-          usage: { input_tokens: 114_400, cache_read_tokens: 1_170_000, cache_creation_tokens: 0, output_tokens: 48_200, cost_usd: 1.87 },
+          usage: { input_tokens: 114_400, cache_read_tokens: 1_170_000, cache_creation_tokens: 0, output_tokens: 48_200, cost_usd: 1.87, cost_status: "metered" as const },
         }),
         aRun({ id: "without", issue_title: "No usage", status: "running" }),
       ],

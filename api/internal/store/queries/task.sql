@@ -27,10 +27,12 @@
 -- service layer (resolveWaitOnLimit): a handoff has no per-request override today, so
 -- nil -> the owner's users.wait_on_limit is the whole behavior. Omitting it (as this
 -- query originally did) silently opts every task run OUT via the column DEFAULT false.
--- harness (PRD #1332 M5A / D2) is the SQL literal 'claude', not a param: a task run is a
--- Claude production origin, and the literal defeats the DEFAULT-masks-omission trap.
+-- harness (PRD #1429 M1, was #1332 M5A / D2) is now the @harness PARAMETER supplied by the M5B
+-- create seam (workersvc.createRunAtomic), not the SQL literal 'claude'. A handoff task uses
+-- D11; M2/M3 wire the real resolved value. Every current caller passes string(HarnessClaude)
+-- as a mechanical stopgap.
 INSERT INTO runs (id, user_id, repo_id, kind, branch, base_branch, open_mr, interactive, review_requested, then_fix_requested, issue_title, issue_description, auto_approve, wait_on_limit, required_capabilities, budget_wall_seconds, budget_max_iterations, trigger_source, harness)
-VALUES (@run_id, @user_id, @repo_id::uuid, 'task', @branch, sqlc.narg('base_branch'), @open_mr, @interactive, @review_requested, @then_fix_requested, @issue_title, @issue_description, true, @wait_on_limit, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), sqlc.narg('budget_wall_seconds'), sqlc.narg('budget_max_iterations'), 'task', 'claude')
+VALUES (@run_id, @user_id, @repo_id::uuid, 'task', @branch, sqlc.narg('base_branch'), @open_mr, @interactive, @review_requested, @then_fix_requested, @issue_title, @issue_description, true, @wait_on_limit, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), sqlc.narg('budget_wall_seconds'), sqlc.narg('budget_max_iterations'), 'task', @harness)
 RETURNING *;
 
 -- name: CreateThenFixRun :one
@@ -56,7 +58,10 @@ RETURNING *;
 -- path, so a then-fix parks/stops on an Anthropic usage limit the same way the original
 -- handoff would — omitting it silently opts every fix run OUT via the column DEFAULT false,
 -- so an owner who enabled parking could see the initial handoff park but its fix stop.
--- harness (PRD #1332 M5A / D2): SQL literal 'claude', not a param — a Claude production origin.
+-- harness (PRD #1429 M1, was #1332 M5A / D2): now the @harness PARAMETER supplied by the M5B
+-- create seam (workersvc.createRunAtomic). A then-fix inherits its original task's harness as
+-- an explicit selection (D4); M3 wires that real value. Every current caller passes
+-- string(HarnessClaude) as a mechanical stopgap.
 INSERT INTO runs (
     id, user_id, repo_id, kind, branch, base_branch,
     then_fix_of_run_id, review_target_run_id, dispatched_at,
@@ -70,7 +75,7 @@ VALUES (
     true, false, false, false, @wait_on_limit,
     @issue_title, @issue_description,
     COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'),
-    sqlc.narg('budget_wall_seconds'), sqlc.narg('budget_max_iterations'), 'then_fix', 'claude'
+    sqlc.narg('budget_wall_seconds'), sqlc.narg('budget_max_iterations'), 'then_fix', @harness
 )
 RETURNING *;
 
@@ -86,7 +91,10 @@ RETURNING *;
 -- review — no recursion). id is caller-supplied so Go derives the uzi/task/<id> namespace
 -- invariant the same way CreateTaskRun does. The uq_one_active_task_review_per_target
 -- partial unique index makes a duplicate active review raise 23505.
--- harness (PRD #1332 M5A / D2): SQL literal 'claude', not a param — a Claude production origin.
+-- harness (PRD #1429 M1, was #1332 M5A / D2): now the @harness PARAMETER supplied by the M5B
+-- create seam (workersvc.createRunAtomic). A task-review inherits its reviewed target's harness
+-- as an explicit selection (D4); M3 wires that real value. Every current caller passes
+-- string(HarnessClaude) as a mechanical stopgap.
 INSERT INTO runs (
     id, user_id, repo_id, kind, branch, base_branch,
     review_target_run_id, dispatched_at, auto_approve, open_mr, review_requested,
@@ -96,7 +104,7 @@ VALUES (
     @run_id, @user_id, @repo_id::uuid, 'task', @branch, sqlc.narg('base_branch'),
     @target_run_id, now(), true, false, false,
     @issue_title, '',
-    COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), 'task_review', 'claude'
+    COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), 'task_review', @harness
 )
 RETURNING *;
 

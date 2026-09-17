@@ -37,6 +37,7 @@ export const mockRuns: Run[] = [
     issue_iid: 26,
     issue_title: "Board card badges for MR pipeline status",
     issue_description: "See prds/12-board-run-lifecycle.md.",
+    harness: "claude", // PRD #1429 M1: runs.harness is now on RunDTO (NOT NULL, default claude).
     kind: "issue",
     title: null,
     resume_of_run_id: null,
@@ -101,6 +102,7 @@ export const mockRuns: Run[] = [
     issue_iid: null,
     issue_title: "Wire up worker heartbeat retry backoff",
     issue_description: "A handoff task run — repo + branch, no forge issue.",
+    harness: "claude", // PRD #1429 M1: runs.harness is now on RunDTO (NOT NULL, default claude).
     // PRD #411: this issue-less task run is flagged stuck (health below) so it also
     // surfaces in the board needs-attention strip, exercising the kind-chip branch there.
     kind: "task",
@@ -172,6 +174,7 @@ export const mockRuns: Run[] = [
     issue_iid: null,
     issue_title: "MR review watcher: auto-rework review comments until merge",
     issue_description: "See prds/700-mr-review-watcher.md.",
+    harness: "claude", // PRD #1429 M1: runs.harness is now on RunDTO (NOT NULL, default claude).
     kind: "mr_rework",
     title: null,
     resume_of_run_id: null,
@@ -231,6 +234,7 @@ export const mockRuns: Run[] = [
     issue_iid: null,
     issue_title: "Self-improve sweep: prune flaky tests",
     issue_description: "A background self-improvement run, deprioritized behind interactive work.",
+    harness: "claude", // PRD #1429 M1: runs.harness is now on RunDTO (NOT NULL, default claude).
     kind: "self_improve",
     title: null,
     resume_of_run_id: null,
@@ -289,6 +293,7 @@ export const mockRuns: Run[] = [
     issue_iid: 41,
     issue_title: "Hotfix: board card CI badge flickers on refetch",
     issue_description: "Bumped to the front of the queue by its owner.",
+    harness: "claude", // PRD #1429 M1: runs.harness is now on RunDTO (NOT NULL, default claude).
     kind: "issue",
     title: null,
     resume_of_run_id: null,
@@ -350,6 +355,7 @@ export const mockRuns: Run[] = [
     issue_iid: null,
     issue_title: "Judge meta-run (excluded from Runs count)",
     issue_description: "A repo-less judge run — off the /runs page and the Runs badge.",
+    harness: "claude", // PRD #1429 M1: runs.harness is now on RunDTO (NOT NULL, default claude).
     kind: "judge",
     title: null,
     resume_of_run_id: null,
@@ -405,6 +411,7 @@ export const mockRuns: Run[] = [
     issue_iid: 24,
     issue_title: "Worker heartbeat metrics endpoint",
     issue_description: "Expose worker heartbeat freshness as a metrics endpoint. See prds/13-worker-metrics.md.",
+    harness: "claude", // PRD #1429 M1: runs.harness is now on RunDTO (NOT NULL, default claude).
     kind: "issue",
     title: null,
     resume_of_run_id: null,
@@ -500,6 +507,7 @@ export const mockRuns: Run[] = [
     issue_iid: 21,
     issue_title: "Plan-approval notifications via email",
     issue_description: "Notify a run's owner when their plan is parked awaiting approval. See prds/9-approval-notify.md.",
+    harness: "claude", // PRD #1429 M1: runs.harness is now on RunDTO (NOT NULL, default claude).
     kind: "issue",
     title: null,
     resume_of_run_id: null,
@@ -623,6 +631,7 @@ export const mockRuns: Run[] = [
     issue_title: "Add a --since filter to `uzi run list`",
     issue_description:
       "Filter the runs list by age. Started from a plan authored locally in Claude Code (--plan-file).",
+    harness: "claude", // PRD #1429 M1: runs.harness is now on RunDTO (NOT NULL, default claude).
     kind: "issue",
     title: null,
     resume_of_run_id: null,
@@ -691,6 +700,7 @@ export const mockRuns: Run[] = [
     issue_iid: 33,
     issue_title: "Cache the forge issue list between polls",
     issue_description: "Reduce forge calls on the board poll. See prds/33-issue-cache.md.",
+    harness: "claude", // PRD #1429 M1: runs.harness is now on RunDTO (NOT NULL, default claude).
     kind: "issue",
     title: null,
     resume_of_run_id: null,
@@ -767,6 +777,7 @@ export const mockRuns: Run[] = [
     issue_iid: 25,
     issue_title: "Debounce the board poll while a drag is in flight",
     issue_description: "See prds/25-board-drag-poll.md.",
+    harness: "claude", // PRD #1429 M1: runs.harness is now on RunDTO (NOT NULL, default claude).
     kind: "issue",
     title: null,
     resume_of_run_id: null,
@@ -834,6 +845,7 @@ export const mockRuns: Run[] = [
     issue_iid: 18,
     issue_title: "Run view: fold tool results under their calls",
     issue_description: "See prds/11-run-view-ux.md.",
+    harness: "claude", // PRD #1429 M1: runs.harness is now on RunDTO (NOT NULL, default claude).
     kind: "issue",
     title: null,
     resume_of_run_id: null,
@@ -917,6 +929,7 @@ export const mockRuns: Run[] = [
     issue_iid: 61,
     issue_title: "Board: virtualize the card list for very large boards",
     issue_description: "See prds/61-board-virtualization.md.",
+    harness: "claude", // PRD #1429 M1: runs.harness is now on RunDTO (NOT NULL, default claude).
     kind: "issue",
     title: null,
     resume_of_run_id: null,
@@ -994,6 +1007,7 @@ export const mockRuns: Run[] = [
     issue_iid: 44,
     issue_title: "Audit: are any queries missing the tenant scope?",
     issue_description: "Investigate and report; no code change expected.",
+    harness: "claude", // PRD #1429 M1: runs.harness is now on RunDTO (NOT NULL, default claude).
     kind: "issue",
     title: null,
     resume_of_run_id: null,
@@ -1079,6 +1093,7 @@ export const mockRuns: Run[] = [
     issue_iid: 15,
     issue_title: "Encrypt per-user Anthropic tokens at rest",
     issue_description: "See prds/15-token-encryption.md.",
+    harness: "claude", // PRD #1429 M1: runs.harness is now on RunDTO (NOT NULL, default claude).
     kind: "issue",
     title: null,
     resume_of_run_id: null,
@@ -1137,6 +1152,7 @@ export const mockRuns: Run[] = [
     issue_iid: 12,
     issue_title: "Retry the flaky worker heartbeat probe",
     issue_description: "See prds/12-board-run-lifecycle.md.",
+    harness: "claude", // PRD #1429 M1: runs.harness is now on RunDTO (NOT NULL, default claude).
     kind: "issue",
     title: null,
     resume_of_run_id: null,
@@ -1197,6 +1213,7 @@ export const mockRuns: Run[] = [
     issue_iid: 7,
     issue_title: "Postgres connection pool tuning",
     issue_description: "See prds/3-pool-tuning.md.",
+    harness: "claude", // PRD #1429 M1: runs.harness is now on RunDTO (NOT NULL, default claude).
     kind: "issue",
     title: null,
     resume_of_run_id: null,
@@ -1276,6 +1293,7 @@ export const mockRuns: Run[] = [
     issue_iid: 9,
     issue_title: "Add a main-branch guard workflow",
     issue_description: "See prds/9-main-guard.md.",
+    harness: "claude", // PRD #1429 M1: runs.harness is now on RunDTO (NOT NULL, default claude).
     kind: "issue",
     title: null,
     resume_of_run_id: null,
@@ -1363,6 +1381,7 @@ export const mockRuns: Run[] = [
     issue_iid: 5,
     issue_title: "Healthcheck should ping the DB pool",
     issue_description: "See prds/2-health.md.",
+    harness: "claude", // PRD #1429 M1: runs.harness is now on RunDTO (NOT NULL, default claude).
     kind: "issue",
     title: null,
     resume_of_run_id: null,
@@ -1436,6 +1455,7 @@ export const mockRuns: Run[] = [
     issue_iid: 23,
     issue_title: "Stream run logs to the CLI with backpressure",
     issue_description: "See prds/23-cli-log-stream.md.",
+    harness: "claude", // PRD #1429 M1: runs.harness is now on RunDTO (NOT NULL, default claude).
     kind: "issue",
     title: null,
     resume_of_run_id: null,
@@ -1516,6 +1536,7 @@ export const mockRuns: Run[] = [
     issue_iid: 9,
     issue_title: "Cache the tenant lookup in the auth middleware",
     issue_description: "See prds/9-tenant-cache.md.",
+    harness: "claude", // PRD #1429 M1: runs.harness is now on RunDTO (NOT NULL, default claude).
     kind: "issue",
     title: null,
     resume_of_run_id: null,
@@ -1584,6 +1605,7 @@ export const mockRuns: Run[] = [
     issue_iid: 28,
     issue_title: "Backfill run credential history for the audit log",
     issue_description: "See prds/28-credential-audit-log.md.",
+    harness: "claude", // PRD #1429 M1: runs.harness is now on RunDTO (NOT NULL, default claude).
     kind: "issue",
     title: null,
     resume_of_run_id: null,
@@ -1648,6 +1670,7 @@ export const mockRuns: Run[] = [
     issue_iid: 33,
     issue_title: "One triage row for Judge, run page and Findings",
     issue_description: "See prds/33-triage-row.md.",
+    harness: "claude", // PRD #1429 M1: runs.harness is now on RunDTO (NOT NULL, default claude).
     kind: "issue",
     title: null,
     resume_of_run_id: null,

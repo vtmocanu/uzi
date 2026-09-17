@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -132,36 +133,41 @@ func TestUserAppearanceBackfillLiveDB(t *testing.T) {
 		t.Fatalf("MigrateTo(203): %v", err)
 	}
 
-	q := store.New(pool)
+	// Read the four appearance columns via RAW SQL, NOT the generated GetUserSettings: that
+	// query reflects the HEAD schema (since PRD #1429 M1 it SELECTs default_harness, a column
+	// added in 00226), which does not exist at the v203 schema this test pins — the same
+	// reason the seed above inserts with raw SQL. A narrow read of exactly the four backfilled
+	// columns keeps the assertion at v203 and independent of later schema additions.
+	readAppearance := func(id uuid.UUID) (mode, light, dark, typeface pgtype.Text) {
+		if err := pool.QueryRow(ctx,
+			`SELECT appearance_mode, light_theme, dark_theme, typeface FROM users WHERE id = $1`, id).
+			Scan(&mode, &light, &dark, &typeface); err != nil {
+			t.Fatalf("read appearance columns after 00203: %v", err)
+		}
+		return
+	}
 
 	// --- Assertion 1: the backfill pinned the pre-existing THEMED row into the dark slot
-	// at dark mode, and touched neither the light slot nor the typeface. Read through the
-	// generated GetUserSettings (HEAD schema == 203).
-	themed, err := q.GetUserSettings(ctx, themedID)
-	if err != nil {
-		t.Fatalf("GetUserSettings(themed) after 00203: %v", err)
+	// at dark mode, and touched neither the light slot nor the typeface.
+	themedMode, themedLight, themedDark, themedTypeface := readAppearance(themedID)
+	if !themedDark.Valid || themedDark.String != "mission" {
+		t.Errorf("backfill: themed user dark_theme = %+v, want {mission true} (00203 did not copy theme into the dark slot)", themedDark)
 	}
-	if !themed.DarkTheme.Valid || themed.DarkTheme.String != "mission" {
-		t.Errorf("backfill: themed user dark_theme = %+v, want {mission true} (00203 did not copy theme into the dark slot)", themed.DarkTheme)
+	if !themedMode.Valid || themedMode.String != "dark" {
+		t.Errorf("backfill: themed user appearance_mode = %+v, want {dark true} (00203 did not pin dark mode)", themedMode)
 	}
-	if !themed.AppearanceMode.Valid || themed.AppearanceMode.String != "dark" {
-		t.Errorf("backfill: themed user appearance_mode = %+v, want {dark true} (00203 did not pin dark mode)", themed.AppearanceMode)
+	if themedLight.Valid {
+		t.Errorf("backfill: themed user light_theme = %+v, want NULL (the backfill must not touch the light slot)", themedLight)
 	}
-	if themed.LightTheme.Valid {
-		t.Errorf("backfill: themed user light_theme = %+v, want NULL (the backfill must not touch the light slot)", themed.LightTheme)
-	}
-	if themed.Typeface.Valid {
-		t.Errorf("backfill: themed user typeface = %+v, want NULL (the backfill must not touch the typeface)", themed.Typeface)
+	if themedTypeface.Valid {
+		t.Errorf("backfill: themed user typeface = %+v, want NULL (the backfill must not touch the typeface)", themedTypeface)
 	}
 
 	// --- Assertion 2: the UN-THEMED row (theme NULL) took no backfill — all four
 	// appearance columns remain NULL, so it inherits every instance default.
-	plain, err := q.GetUserSettings(ctx, plainID)
-	if err != nil {
-		t.Fatalf("GetUserSettings(plain) after 00203: %v", err)
-	}
-	if plain.AppearanceMode.Valid || plain.LightTheme.Valid || plain.DarkTheme.Valid || plain.Typeface.Valid {
+	plainMode, plainLight, plainDark, plainTypeface := readAppearance(plainID)
+	if plainMode.Valid || plainLight.Valid || plainDark.Valid || plainTypeface.Valid {
 		t.Errorf("un-themed user appearance columns = {mode:%+v light:%+v dark:%+v typeface:%+v}, want all NULL (backfill matched a theme-NULL row)",
-			plain.AppearanceMode, plain.LightTheme, plain.DarkTheme, plain.Typeface)
+			plainMode, plainLight, plainDark, plainTypeface)
 	}
 }

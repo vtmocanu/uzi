@@ -135,24 +135,28 @@ func TestTriggerSourceStampedLiveDB(t *testing.T) {
 
 	// ── Store-query-level: the fixed-SQL-literal and param queries. ──
 	r, err = q.CreatePromptRun(ctx, store.CreatePromptRunParams{
-		UserID: userID, RepoID: repoID, IssueTitle: "t", IssueDescription: "d", ScheduleID: scheduleID,
+		Harness: "claude", // PRD #1429 M1: harness is now a required @harness param.
+		UserID:  userID, RepoID: repoID, IssueTitle: "t", IssueDescription: "d", ScheduleID: scheduleID,
 		AutoApprove: true, WaitOnLimit: false,
 	})
 	assert(t, "CreatePromptRun", "schedule", r, err)
 
 	r, err = q.CreateSelfImproveRun(ctx, store.CreateSelfImproveRunParams{
-		UserID: userID, RepoID: repoID, IssueIid: tInt8(902), IssueTitle: "t", IssueDescription: "d", WaitOnLimit: false,
+		Harness: "claude", // PRD #1429 M1: harness is now a required @harness param.
+		UserID:  userID, RepoID: repoID, IssueIid: tInt8(902), IssueTitle: "t", IssueDescription: "d", WaitOnLimit: false,
 	})
 	assert(t, "CreateSelfImproveRun", "self_improve", r, err)
 
 	r, err = q.CreateCIFixRun(ctx, store.CreateCIFixRunParams{
-		UserID: userID, RepoID: repoID, IssueTitle: "t", IssueDescription: "d",
+		Harness: "claude", // PRD #1429 M1: harness is now a required @harness param.
+		UserID:  userID, RepoID: repoID, IssueTitle: "t", IssueDescription: "d",
 		PipelineID: tInt8(7), PipelineRef: tText("agent/issue-7"), WaitOnLimit: false, AutoApprove: true,
 	})
 	assert(t, "CreateCIFixRun", "ci_fix", r, err)
 
 	r, err = q.CreateAutoMRReworkRun(ctx, store.CreateAutoMRReworkRunParams{
-		UserID: userID, RepoID: repoID, IssueTitle: "t", IssueDescription: "d",
+		Harness: "claude", // PRD #1429 M1: harness is now a required @harness param.
+		UserID:  userID, RepoID: repoID, IssueTitle: "t", IssueDescription: "d",
 		PipelineRef: tText("agent/issue-8"), MrIid: tInt8(8), TargetRunID: tUUID(base1), WaitOnLimit: false,
 		TriggerSource: "mr_rework",
 	})
@@ -169,31 +173,36 @@ func TestTriggerSourceStampedLiveDB(t *testing.T) {
 	assert(t, "CreateChatContinueRun", "resume", r, err)
 
 	r, err = q.CreateTaskRun(ctx, store.CreateTaskRunParams{
-		RunID: uuid.New(), UserID: userID, RepoID: repoID, Branch: tText("uzi/task/a"), BaseBranch: tText("main"),
+		Harness: "claude", // PRD #1429 M1: harness is now a required @harness param.
+		RunID:   uuid.New(), UserID: userID, RepoID: repoID, Branch: tText("uzi/task/a"), BaseBranch: tText("main"),
 		OpenMr: false, Interactive: false, ReviewRequested: false, ThenFixRequested: false,
 		IssueTitle: "t", IssueDescription: "d", WaitOnLimit: false,
 	})
 	assert(t, "CreateTaskRun", "task", r, err)
 
 	r, err = q.CreateTaskReviewRun(ctx, store.CreateTaskReviewRunParams{
-		RunID: uuid.New(), UserID: userID, RepoID: repoID, Branch: tText("uzi/task/b"), BaseBranch: tText("main"),
+		Harness: "claude", // PRD #1429 M1: harness is now a required @harness param.
+		RunID:   uuid.New(), UserID: userID, RepoID: repoID, Branch: tText("uzi/task/b"), BaseBranch: tText("main"),
 		TargetRunID: tUUID(base1), IssueTitle: "t",
 	})
 	assert(t, "CreateTaskReviewRun", "task_review", r, err)
 
 	r, err = q.CreateThenFixRun(ctx, store.CreateThenFixRunParams{
-		RunID: uuid.New(), UserID: userID, RepoID: repoID, Branch: tText("uzi/task/c"), BaseBranch: tText("main"),
+		Harness: "claude", // PRD #1429 M1: harness is now a required @harness param.
+		RunID:   uuid.New(), UserID: userID, RepoID: repoID, Branch: tText("uzi/task/c"), BaseBranch: tText("main"),
 		ThenFixOfRunID: tUUID(base1), WaitOnLimit: false, IssueTitle: "t", IssueDescription: "d",
 	})
 	assert(t, "CreateThenFixRun", "then_fix", r, err)
 
 	r, err = q.CreateJudgeRun(ctx, store.CreateJudgeRunParams{
-		UserID: userID, TargetRunID: tUUID(base1), IssueTitle: "t", IssueDescription: "d", TriggerSource: "judge",
+		Harness: "claude", // PRD #1429 M1: harness is now a required @harness param.
+		UserID:  userID, TargetRunID: tUUID(base1), IssueTitle: "t", IssueDescription: "d", TriggerSource: "judge",
 	})
 	assert(t, "CreateJudgeRun(judge)", "judge", r, err)
 
 	r, err = q.CreateJudgeRun(ctx, store.CreateJudgeRunParams{
-		UserID: userID, TargetRunID: tUUID(base2), IssueTitle: "t", IssueDescription: "d", TriggerSource: "judge_rerun",
+		Harness: "claude", // PRD #1429 M1: harness is now a required @harness param.
+		UserID:  userID, TargetRunID: tUUID(base2), IssueTitle: "t", IssueDescription: "d", TriggerSource: "judge_rerun",
 	})
 	assert(t, "CreateJudgeRun(judge_rerun)", "judge_rerun", r, err)
 

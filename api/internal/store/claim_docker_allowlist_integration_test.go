@@ -70,14 +70,16 @@ func TestClaimRunDockerRepoAllowlistLiveDB(t *testing.T) {
 
 	// A queued issue run per repo.
 	allowedRun, err := q.CreateRun(ctx, store.CreateRunParams{
-		UserID: userID, RepoID: allowedRepo,
+		Harness: "claude", // PRD #1429 M1: harness is now a required @harness param.
+		UserID:  userID, RepoID: allowedRepo,
 		IssueIid: pgtype.Int8{Int64: 1, Valid: true}, IssueTitle: "allowed", IssueDescription: "d", PlanSource: "agent", TriggerSource: "manual",
 	})
 	if err != nil {
 		t.Fatalf("CreateRun(allowed): %v", err)
 	}
 	deniedRun, err := q.CreateRun(ctx, store.CreateRunParams{
-		UserID: userID, RepoID: deniedRepo,
+		Harness: "claude", // PRD #1429 M1: harness is now a required @harness param.
+		UserID:  userID, RepoID: deniedRepo,
 		IssueIid: pgtype.Int8{Int64: 2, Valid: true}, IssueTitle: "denied", IssueDescription: "d", PlanSource: "agent", TriggerSource: "manual",
 	})
 	if err != nil {
@@ -87,7 +89,8 @@ func TestClaimRunDockerRepoAllowlistLiveDB(t *testing.T) {
 	// A completed target run + a queued repo-less judge run (the repo_id-IS-NULL
 	// exemption a docker worker keeps even under an empty allowlist).
 	target, err := q.CreateRun(ctx, store.CreateRunParams{
-		UserID: userID, RepoID: allowedRepo,
+		Harness: "claude", // PRD #1429 M1: harness is now a required @harness param.
+		UserID:  userID, RepoID: allowedRepo,
 		IssueIid: pgtype.Int8{Int64: 3, Valid: true}, IssueTitle: "target", IssueDescription: "d", PlanSource: "agent", TriggerSource: "manual",
 	})
 	if err != nil {
@@ -95,7 +98,8 @@ func TestClaimRunDockerRepoAllowlistLiveDB(t *testing.T) {
 	}
 	mustExec(ctx, t, pool, `UPDATE runs SET status = 'completed', finished_at = now() WHERE id = $1`, target.ID)
 	judge, err := q.CreateJudgeRun(ctx, store.CreateJudgeRunParams{
-		UserID: userID, TargetRunID: pgtype.UUID{Bytes: target.ID, Valid: true},
+		Harness: "claude", // PRD #1429 M1: harness is now a required @harness param.
+		UserID:  userID, TargetRunID: pgtype.UUID{Bytes: target.ID, Valid: true},
 		IssueTitle: "Judge: review target", IssueDescription: "", TriggerSource: "judge",
 	})
 	if err != nil {

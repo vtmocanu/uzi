@@ -105,7 +105,7 @@ function mockAuth(user: User, appearance = baseAppearance()) {
 
 beforeEach(() => {
   window.localStorage.clear();
-  mockApi.putMySettings.mockResolvedValue({ settings: { default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: "mission" } });
+  mockApi.putMySettings.mockResolvedValue({ settings: { default_harness: null, default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: "mission" } });
   mockAuth(baseUser);
 });
 

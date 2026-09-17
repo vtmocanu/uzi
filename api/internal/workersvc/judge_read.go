@@ -250,6 +250,10 @@ func (s *Service) RerunJudge(ctx context.Context, userID uuid.UUID, isAdmin bool
 		IssueTitle:       judgeRunTitle(target),
 		IssueDescription: "",
 		TriggerSource:    "judge_rerun",
+		// PRD #1429 M1 stopgap: harness is now the @harness param. Stamp Claude explicitly
+		// (byte-identical to today); M3 threads the target run's inherited harness. Omitting
+		// it would ship harness='' → 23514.
+		Harness: string(HarnessClaude),
 	})
 	if err != nil {
 		var pgErr *pgconn.PgError

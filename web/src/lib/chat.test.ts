@@ -188,6 +188,7 @@ describe("chatFromRun (create/continue runDTO → unified Chat view)", () => {
       issue_iid: null,
       issue_title: "How does it work?",
       issue_description: "",
+      harness: "claude", // PRD #1429 M1: harness joined RunDTO (NOT NULL, default claude).
       title: "How does it work?",
       resume_of_run_id: null,
       forge_type: "gitlab",

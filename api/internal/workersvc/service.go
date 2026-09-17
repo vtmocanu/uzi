@@ -1578,6 +1578,13 @@ type Service struct {
 	// non-atomically, so a deployment that never wired it can never complete an interlocked
 	// run without the permit transaction. A LEGACY completion never touches it.
 	txBeginner TxBeginner
+	// codexFreezeFn is the createRunAtomic Codex-binding freeze, a SEAM defaulting (nil) to
+	// s.freezeCodexBinding (PRD #1429 M1). It exists so a test can inject a failing freeze and
+	// prove the create transaction rolls the run INSERT back (D1: a freeze failure leaves NO
+	// runs row). Nil in production and every non-injecting test — createRunAtomic falls back
+	// to the real freeze — so the seam is inert unless a test sets it, matching the
+	// publishFn/deleteCheckpointFn/background seam idiom above.
+	codexFreezeFn func(ctx context.Context, q codexFreezeStore, userID, runID, secretID uuid.UUID, authMode string) error
 	// readyAt is the moment the worker-facing listener(s) became ready (PRD #1390 M1, D1),
 	// stored as Unix nanoseconds (0 = not yet ready). main.go writes it via SetReadyAt after
 	// binding every enabled listener; the sweeper goroutine reads it each tick to anchor the
@@ -5364,6 +5371,12 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		// this stamps the run interlocked (version 1) before its first claim. Listed
 		// explicitly per runtime.sql's 🔴 silently-omittable-narg warning.
 		CompletionContractVersion: completionContractVersion,
+		// PRD #1429 M1: harness is now a required parameter (the SQL literal 'claude' became
+		// @harness). This is the MECHANICAL STOPGAP — every current origin stamps Claude so
+		// behaviour is byte-identical to today; M2 replaces this with the D11-resolved harness
+		// from the atomic create seam (createRunAtomic). An OMITTED field would ship harness=''
+		// and 23514 on runs_harness_check, the exact silently-omittable trap runtime.sql warns of.
+		Harness: string(HarnessClaude),
 		// PRD #1247 M1 (D1): the per-run credential override, NULL/NULL for every M1
 		// caller (credOverride nil ⇒ inherit the worker binding, byte-identical to a
 		// pre-#1247 run). Listed explicitly per the same silently-omittable-narg warning:

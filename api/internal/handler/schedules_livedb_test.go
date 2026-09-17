@@ -837,6 +837,7 @@ func TestScheduleResumeRearmLiveDB(t *testing.T) {
 
 		// Insert a prompt run for this schedule (the scheduler's own insert path).
 		run, err := f.h.q.CreatePromptRun(ctx, store.CreatePromptRunParams{
+			Harness:     "claude", // PRD #1429 M1: harness is now a required @harness param.
 			UserID:      f.owner.ID,
 			RepoID:      f.repoID,
 			IssueTitle:  "scheduled prompt",

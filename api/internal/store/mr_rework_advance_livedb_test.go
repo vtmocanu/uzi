@@ -93,6 +93,7 @@ func TestCreateManualMRReworkRunAndAdvanceLiveDB(t *testing.T) {
 	create := func(atRef string, mrIID, highWater int64) (store.Run, error) {
 		t.Helper()
 		run, err := q.CreateManualMRReworkRunAndAdvance(ctx, store.CreateManualMRReworkRunAndAdvanceParams{
+			Harness:          "claude", // PRD #1429 M1: harness is now a required @harness param.
 			UserID:           user,
 			RepoID:           repoID,
 			IssueTitle:       "Rework MR review (on demand)",

@@ -141,6 +141,10 @@ func (s *Service) createMRReworkRun(ctx context.Context, userID, repoID uuid.UUI
 			ReviewComments:   reviewJSON,
 			WaitOnLimit:      waitOnLimit,
 			TriggerSource:    triggerSource,
+			// PRD #1429 M1 stopgap: harness is now the @harness param. Stamp Claude explicitly
+			// (byte-identical to today); M2 threads the source run's harness. Omitting it →
+			// harness='' → 23514.
+			Harness: string(HarnessClaude),
 		})
 	} else {
 		// Manual (on-demand) path: the run INSERT and the non-counting high-water advance
@@ -157,6 +161,10 @@ func (s *Service) createMRReworkRun(ctx context.Context, userID, repoID uuid.UUI
 			ReviewComments:   reviewJSON,
 			WaitOnLimit:      waitOnLimit,
 			HighWater:        *highWater,
+			// PRD #1429 M1 stopgap: harness is now the @harness param. Stamp Claude explicitly
+			// (byte-identical to today); M2 threads the source run's harness. Omitting it →
+			// harness='' → 23514.
+			Harness: string(HarnessClaude),
 		})
 	}
 	if err != nil {

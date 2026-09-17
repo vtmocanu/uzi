@@ -50,7 +50,8 @@ func TestCIFixRunsLiveDB(t *testing.T) {
 
 	createFix := func(ref string, snapPipelineID int64) store.Run {
 		run, err := q.CreateCIFixRun(ctx, store.CreateCIFixRunParams{
-			UserID: userID, RepoID: repoID,
+			Harness: "claude", // PRD #1429 M1: harness is now a required @harness param.
+			UserID:  userID, RepoID: repoID,
 			IssueTitle: "Fix CI", IssueDescription: "d",
 			PipelineID:      pgtype.Int8{Int64: snapPipelineID, Valid: true},
 			PipelineRef:     pgtype.Text{String: ref, Valid: true},
@@ -78,7 +79,8 @@ func TestCIFixRunsLiveDB(t *testing.T) {
 
 	// ── uq_runs_one_active_ci_fix: a second active fix on the same ref → 23505 ──
 	if _, err := q.CreateCIFixRun(ctx, store.CreateCIFixRunParams{
-		UserID: userID, RepoID: repoID, IssueTitle: "Fix CI", IssueDescription: "d",
+		Harness: "claude", // PRD #1429 M1: harness is now a required @harness param.
+		UserID:  userID, RepoID: repoID, IssueTitle: "Fix CI", IssueDescription: "d",
 		PipelineID:  pgtype.Int8{Int64: 4201, Valid: true},
 		PipelineRef: pgtype.Text{String: "main", Valid: true}, FailureSnapshot: []byte(`{}`),
 	}); !isUniqueViolation(err) {
