@@ -1,11 +1,14 @@
 package workersvc
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -20,8 +23,18 @@ import (
 
 // recordingSwitchBroadcaster captures PublishMessage calls so a test can assert the after-commit
 // broadcast (never before commit). The other Broadcaster methods are no-ops.
+//
+// When pool/ctx are set, PublishMessage also reads the two committed rows on a FRESH connection at
+// publication time — the switch message at the published seq and the advanced runs.last_seq — and
+// records whether BOTH are visible, which is only possible if the broadcast fires after tx.Commit.
 type recordingSwitchBroadcaster struct {
+	pool     *pgxpool.Pool
+	ctx      context.Context
 	messages []recordedSwitchMsg
+	// committedVisible is set on the FIRST PublishMessage when pool is non-nil: true iff both the
+	// switch row (at seq, kind credential_switch) and runs.last_seq>=seq are readable then.
+	committedVisible bool
+	visErr           error
 }
 
 type recordedSwitchMsg struct {
@@ -33,6 +46,21 @@ type recordedSwitchMsg struct {
 
 func (b *recordingSwitchBroadcaster) PublishMessage(runID uuid.UUID, seq int32, kind, _, _, _ string, payload []byte, _ time.Time) {
 	b.messages = append(b.messages, recordedSwitchMsg{runID: runID, seq: seq, kind: kind, payload: append([]byte(nil), payload...)})
+	if b.pool == nil {
+		return
+	}
+	// Both writes committed before this call, so a fresh read must see them.
+	var rowKind string
+	if err := b.pool.QueryRow(b.ctx, `SELECT kind FROM run_messages WHERE run_id = $1 AND seq = $2`, runID, seq).Scan(&rowKind); err != nil {
+		b.visErr = err
+		return
+	}
+	var lastSeq int32
+	if err := b.pool.QueryRow(b.ctx, `SELECT last_seq FROM runs WHERE id = $1`, runID).Scan(&lastSeq); err != nil {
+		b.visErr = err
+		return
+	}
+	b.committedVisible = rowKind == credentialSwitchMessageKind && lastSeq >= seq
 }
 func (b *recordingSwitchBroadcaster) PublishState(uuid.UUID, string)                {}
 func (b *recordingSwitchBroadcaster) PublishHealth(uuid.UUID, string, string, bool) {}
@@ -108,7 +136,7 @@ func TestRecordRunCredentialSwitchMessageAToBLiveDB(t *testing.T) {
 	runID := env.seedSwitchRun(t, userID, workerID, repoID, 2, 5)
 	env.seedEpoch(t, runID, tokenA, 1, "token-a", "default")
 
-	bc := &recordingSwitchBroadcaster{}
+	bc := &recordingSwitchBroadcaster{pool: env.pool, ctx: env.ctx}
 	svc := switchSvc(env, bc)
 	run := store.Run{ID: runID, UserID: userID, Kind: runkind.Issue, ClaimGeneration: 2, LastSeq: 5}
 	cred := claimCred{ID: tokenB, Label: "token-b"}
@@ -178,6 +206,14 @@ func TestRecordRunCredentialSwitchMessageAToBLiveDB(t *testing.T) {
 	}
 	if bc.messages[0].seq != 6 || bc.messages[0].kind != credentialSwitchMessageKind || bc.messages[0].runID != runID {
 		t.Fatalf("broadcast = %+v, want run %s seq 6 kind %s", bc.messages[0], runID, credentialSwitchMessageKind)
+	}
+	// Publication happened AFTER tx.Commit: at broadcast time a fresh read saw BOTH committed rows —
+	// the switch message at seq 6 and the advanced runs.last_seq.
+	if bc.visErr != nil {
+		t.Fatalf("committed-visibility read at publish time failed: %v", bc.visErr)
+	}
+	if !bc.committedVisible {
+		t.Fatal("switch row and advanced last_seq were NOT both visible at publish time — broadcast must fire after tx.Commit")
 	}
 }
 
@@ -309,6 +345,62 @@ func TestRecordRunCredentialSeqCollisionGaplessLiveDB(t *testing.T) {
 	}
 }
 
+// The bounded seq-collision loop EXHAUSTING must still advance runs.last_seq to the true high-water
+// (MAX(seq)) and RETURN it — not the stale locked last_seq the old exhaustion path returned — so
+// ClaimPayload.LastSeq never sits below a seq already present in run_messages and a resuming worker
+// never re-uses an occupied seq (the data-integrity regression). No attribution message is inserted
+// and nothing is broadcast on the skip. maxSwitchSeqAttempts is lowered to 1 so a single collision
+// exhausts the loop.
+func TestRecordRunCredentialSeqCollisionExhaustionAdvancesLastSeqLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	userID, workerID, repoID := env.seedCodexInfra(t)
+	tokenA := env.seedAnthropicToken(t, userID, "token-a-"+uuid.NewString())
+	tokenB := env.seedAnthropicToken(t, userID, "token-b-"+uuid.NewString())
+
+	const lastSeq int32 = 5
+	runID := env.seedSwitchRun(t, userID, workerID, repoID, 2, lastSeq)
+	env.seedEpoch(t, runID, tokenA, 1, "token-a", "default")
+
+	// Force exhaustion: one attempt only. Restore the default so no sibling test is affected.
+	defer func(orig int) { maxSwitchSeqAttempts = orig }(maxSwitchSeqAttempts)
+	maxSwitchSeqAttempts = 1
+
+	// A NON-switch worker frame at last_seq+1 collides the single attempt; a higher frame at
+	// last_seq+5 makes MAX(seq) exceed the locked last_seq, so the advance is observable.
+	env.exec(`INSERT INTO run_messages (run_id, seq, kind, payload, claim_generation)
+	          VALUES ($1, $2, 'status', $3, 2)`, runID, lastSeq+1, []byte(`{"event":"status"}`))
+	env.exec(`INSERT INTO run_messages (run_id, seq, kind, payload, claim_generation)
+	          VALUES ($1, $2, 'status', $3, 2)`, runID, lastSeq+5, []byte(`{"event":"status"}`))
+
+	bc := &recordingSwitchBroadcaster{}
+	svc := switchSvc(env, bc)
+	run := store.Run{ID: runID, UserID: userID, Kind: runkind.Issue, ClaimGeneration: 2, LastSeq: lastSeq}
+	got, err := svc.recordRunCredential(env.ctx, run, claimCred{ID: tokenB, Label: "token-b"}, secretChoice{reason: selectReasonRunPinned}, true)
+	if err != nil {
+		t.Fatalf("recordRunCredential: %v", err)
+	}
+	// Returned last_seq is the true high-water (MAX(seq) = last_seq+5), not the stale locked value.
+	if got != lastSeq+5 {
+		t.Fatalf("returned last_seq = %d, want %d (MAX(seq), not the stale %d)", got, lastSeq+5, lastSeq)
+	}
+	// runs.last_seq was advanced to the same high-water inside the tx.
+	var runLastSeq int32
+	if err := env.pool.QueryRow(env.ctx, `SELECT last_seq FROM runs WHERE id = $1`, runID).Scan(&runLastSeq); err != nil {
+		t.Fatalf("read last_seq: %v", err)
+	}
+	if runLastSeq != lastSeq+5 {
+		t.Fatalf("runs.last_seq = %d, want %d", runLastSeq, lastSeq+5)
+	}
+	// No attribution message was inserted (the loop exhausted before landing one).
+	if n := env.countSwitchMessages(t, runID); n != 0 {
+		t.Fatalf("credential_switch messages = %d, want 0 (message skipped on exhaustion)", n)
+	}
+	// A skip broadcasts nothing.
+	if len(bc.messages) != 0 {
+		t.Fatalf("broadcast messages = %d, want 0 (no broadcast on a skipped message)", len(bc.messages))
+	}
+}
+
 // The fence rejects a RELEASED claim: the run's claim was released (claim_released_at set) under this
 // old flight. recordRunCredential must abort WITHOUT writing — no credential recorded, no epoch, no
 // message — and return errRunVanished (the caller drops it like a vanished run).
@@ -323,8 +415,8 @@ func TestRecordRunCredentialFenceRejectsReleasedClaimLiveDB(t *testing.T) {
 	svc := switchSvc(env, nil)
 	run := store.Run{ID: runID, UserID: userID, Kind: runkind.Issue, ClaimGeneration: 2, LastSeq: 5}
 	_, err := svc.recordRunCredential(env.ctx, run, claimCred{ID: tokenB, Label: "token-b"}, secretChoice{reason: selectReasonRunPinned}, true)
-	if err == nil {
-		t.Fatal("recordRunCredential on a released claim: want an error, got nil")
+	if !errors.Is(err, errRunVanished) {
+		t.Fatalf("recordRunCredential on a released claim: want errRunVanished, got %v", err)
 	}
 	// Nothing written: no credential recorded, no epoch, no message.
 	var secretIsNull bool
@@ -357,8 +449,8 @@ func TestRecordRunCredentialFenceRejectsSupersededClaimLiveDB(t *testing.T) {
 
 	svc := switchSvc(env, nil)
 	run := store.Run{ID: runID, UserID: userID, Kind: runkind.Issue, ClaimGeneration: 2, LastSeq: 5}
-	if _, err := svc.recordRunCredential(env.ctx, run, claimCred{ID: tokenB, Label: "token-b"}, secretChoice{reason: selectReasonRunPinned}, true); err == nil {
-		t.Fatal("recordRunCredential on a superseded claim: want an error, got nil")
+	if _, err := svc.recordRunCredential(env.ctx, run, claimCred{ID: tokenB, Label: "token-b"}, secretChoice{reason: selectReasonRunPinned}, true); !errors.Is(err, errRunVanished) {
+		t.Fatalf("recordRunCredential on a superseded claim: want errRunVanished, got %v", err)
 	}
 	var epochCount int
 	if err := env.pool.QueryRow(env.ctx, `SELECT count(*) FROM run_credential_epochs WHERE run_id = $1`, runID).Scan(&epochCount); err != nil {
