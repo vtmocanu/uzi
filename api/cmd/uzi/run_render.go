@@ -16,6 +16,19 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
+// harnessListCell renders the `uzi run list` HARNESS column cell (PRD #1429 M5): Codex is
+// EXPLICIT, Claude stays visually UNMARKED (blank cell) — the terse convention the task
+// description asks for and the CLI twin of the web's HarnessBadge, which self-hides for
+// everything except "codex". A closed server enum, so no sanitizer is needed; an
+// unrecognised future value also renders blank (only "codex" is ever marked), rather than
+// widening the terse column with a value this build has no vocabulary for.
+func harnessListCell(h string) string {
+	if h == "codex" {
+		return "codex"
+	}
+	return ""
+}
+
 // inputOutcome is the human confirmation line for a submitted input.
 func inputOutcome(kind string, serverSide bool) string {
 	switch kind {
@@ -69,6 +82,13 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 	rows := [][]string{
 		{"ID", r.ID},
 		{"KIND", r.Kind},
+		// HARNESS (PRD #1429 M5, D2): the run's ACTUAL execution harness, a closed enum
+		// always on the wire (runs.harness is NOT NULL DEFAULT 'claude') — printed
+		// unconditionally like KIND/TRIGGER above, never a blank/emit-only-when-set row. A
+		// closed server enum is not untrusted free text (unlike ANTHROPIC_TOKEN's label
+		// below), so no sanitizer is needed; an unrecognised future value still renders
+		// honestly, byte for byte, rather than being special-cased away.
+		{"HARNESS", r.Harness},
 		// issue #857: what/how/who started the run. A NOT NULL server enum (DEFAULT
 		// 'manual'), so it is always set and printed unconditionally like KIND above.
 		{"TRIGGER", r.TriggerSource},
@@ -184,6 +204,14 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 	}
 	if r.BudgetWallSeconds != nil {
 		rows = append(rows, []string{"BUDGET_WALL", fmtUntil(time.Duration(*r.BudgetWallSeconds) * time.Second)})
+	}
+	// COST (PRD #1429 M5, D7): the run's HONEST per-run cost reading, branching on
+	// cost_status exactly like the TUI SPEND block and the web cost tile — never a bare
+	// dollar figure derived by guessing from cost_usd == 0. Emitted only when the run
+	// carries a usage bundle at all (pre-#40 / unclaimed runs have none), like the budget
+	// rows above.
+	if r.Usage != nil {
+		rows = append(rows, []string{"COST", costDetailCell(*r.Usage)})
 	}
 	// Which Anthropic credential this run spent (PRD #111 M1). Emitted only when the
 	// server recorded one — a pre-feature or still-queued run has nothing to say and

@@ -253,7 +253,12 @@ type Client interface {
 	// OMITS the credential_override key (inherit the worker binding); a present override
 	// carries {mode, secret_id?}. The label→id resolution for a pinned choice happens
 	// CLIENT-SIDE before this call, so the server receives an id, not a label.
-	CreateRun(ctx context.Context, repoID string, issueIID int64, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *CreateRunSeed, credOverride *CreateRunCredentialOverride) (apitypes.RunDTO, error)
+	//
+	// harness is PRD #1429 M5's create-time explicit harness selection (`--harness`): ""
+	// sends no meaningful selection (byte-identical to a pre-#1429 create; the server
+	// resolves the effective harness itself, D11), "claude"/"codex" (validated CLIENT-SIDE
+	// before this call) rides as an explicit pin.
+	CreateRun(ctx context.Context, repoID string, issueIID int64, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *CreateRunSeed, credOverride *CreateRunCredentialOverride, harness string) (apitypes.RunDTO, error)
 	// CreateTaskRun queues an issue-less handoff/task run on a repo (PRD #400 M3):
 	// POST /api/repos/{id}/task-runs {context, base_branch?, open_mr}. The server
 	// names the branch (uzi/task/<run-id>) and the created-run response carries it in
