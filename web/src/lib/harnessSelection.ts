@@ -54,3 +54,32 @@ export function selectionFromHarness(harness: Harness | null | undefined): Harne
 export function bothHarnessesUsable(claudeUsable: boolean, codexUsable: boolean): boolean {
   return claudeUsable && codexUsable;
 }
+
+// effectiveHarnessIsCodex is the show/hide gate for the Anthropic TOKEN controls (PRD
+// #1429 M4a review fix): gating on the raw picker `selection` alone is a UX trap. A
+// Codex-only user never sees the harness picker at all (bothHarnessesUsable is false),
+// so `selection` stays "inherit" even though the run WILL resolve to Codex under D11 —
+// and an Anthropic token/credential-switch control left visible for that user 422s the
+// moment it is used (D5: a Codex run cannot carry an Anthropic override). Gate on the
+// EFFECTIVE harness instead:
+//
+//   - an explicit "codex" pick is authoritative regardless of usability facts;
+//   - an explicit "claude" pick is likewise authoritative (never hidden);
+//   - "inherit" resolves to Codex only when Codex is the SOLE usable harness (the
+//     picker being hidden is exactly what makes this case reachable) — mirrors D11
+//     rule 3, NOT rule 4 (both usable + no default ⇒ Claude, so inherit is Claude-ish
+//     there and the token control stays visible).
+//
+// Used by every start-dialog Anthropic TokenPicker (IssueView, Board/IssueCard,
+// ScheduleModal) and by the actual-harness checks for an in-flight run (RunView,
+// PlanPanel, the "Switch token" action), which pass the run's real harness with
+// selection="codex"/"claude" (never "inherit" — an actual run's harness is never
+// unresolved) so this same helper decides both cases uniformly.
+export function effectiveHarnessIsCodex(
+  selection: HarnessSelection,
+  claudeUsable: boolean,
+  codexUsable: boolean,
+): boolean {
+  if (selection !== "inherit") return selection === "codex";
+  return codexUsable && !claudeUsable;
+}

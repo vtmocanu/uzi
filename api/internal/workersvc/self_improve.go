@@ -33,7 +33,12 @@ var ErrActiveSelfImproveExists = errors.New("a self-improvement run is already a
 // same shape as the model override: nil ⇒ NULL ⇒ the run inherits the owner default
 // live at read time; true/false stamp an explicit per-run override. The bespoke engine
 // passes nil.
-func (s *Service) CreateSelfImproveRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, title, description string, mrReworkEnabled *bool, model *string, overrideSubagentModel bool) (store.Run, error) {
+//
+// explicit is the schedule's pinned harness (PRD #1429 M4a rework, D1/D4): nil for a
+// null-harness schedule (the fire path resolves implicit D11 inside the transaction below),
+// or the schedule's authoritative pin, which never falls back to the other harness even
+// when both are usable. Every non-schedule caller (there are none today) passes nil.
+func (s *Service) CreateSelfImproveRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, title, description string, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, explicit *Harness) (store.Run, error) {
 	row, err := s.q.GetRepoForUser(ctx, store.GetRepoForUserParams{ID: repoID, UserID: userID})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -47,9 +52,11 @@ func (s *Service) CreateSelfImproveRun(ctx context.Context, userID, repoID uuid.
 	if err := s.guardDefaultBranch(ctx, row); err != nil {
 		return store.Run{}, err
 	}
-	// PRD #1429 M2: self_improve carries no override (D10) and no source run, so it uses IMPLICIT
-	// D11 (nil explicit) — the resolve + freeze commit atomically with the INSERT.
-	run, err := s.createRunResolved(ctx, userID, nil /*explicit: implicit D11*/, func(q Store, resolved resolvedHarness) (store.Run, error) {
+	// PRD #1429 M2/M4a rework: self_improve carries no credential override (D10) and no source
+	// run, but it DOES honour a schedule's pinned harness (D1/D4) — explicit is nil only for a
+	// null-harness schedule, in which case this resolves implicit D11; the resolve + freeze
+	// commit atomically with the INSERT either way.
+	run, err := s.createRunResolved(ctx, userID, explicit, func(q Store, resolved resolvedHarness) (store.Run, error) {
 		return q.CreateSelfImproveRun(ctx, store.CreateSelfImproveRunParams{
 			UserID:           userID,
 			RepoID:           repoID,

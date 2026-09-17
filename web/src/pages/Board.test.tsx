@@ -215,6 +215,87 @@ describe("IssueCard — per-card harness picker (PRD #1429 M4a)", () => {
     expect(screen.getByLabelText("Harness for #7")).toBeTruthy();
     expect(screen.queryByLabelText("Anthropic token for #7")).toBeNull();
   });
+
+  // Fix 2 (M4a review): a Codex-only card (showHarnessPicker false — D2, so `harness`
+  // stays the "inherit" default) still hides the Anthropic token picker, because
+  // codexUsable/claudeUsable name Codex as the effective harness even without an
+  // explicit pick.
+  it("hides the Anthropic token picker for a Codex-only card with no harness picker shown", () => {
+    render(
+      <MemoryRouter>
+        <IssueCard
+          card={aCard()}
+          repoId="repo-1"
+          chips={[]}
+          laneLabel="Backlog"
+          canMoveUp={false}
+          canMoveDown={false}
+          onMoveUp={vi.fn()}
+          onMoveDown={vi.fn()}
+          insertionEdge={null}
+          gate={{ enabled: true, reason: "" }}
+          starting={false}
+          onStart={vi.fn()}
+          tokens={[]}
+          credential={{ mode: "inherit" }}
+          onCredentialChange={vi.fn()}
+          claudeUsable={false}
+          codexUsable
+          fixCiBusy={false}
+          onFixCi={vi.fn()}
+          uziLabel="uzi"
+          isEligible
+          canPromote={false}
+          promoting={false}
+          onPromote={vi.fn()}
+          onDragStart={vi.fn()}
+          onDragEnd={vi.fn()}
+          dimmed={false}
+        />
+      </MemoryRouter>,
+    );
+    // Single-harness card: no harness picker (showHarnessPicker defaults false).
+    expect(screen.queryByLabelText(/Harness for #/)).toBeNull();
+    expect(screen.queryByLabelText("Anthropic token for #7")).toBeNull();
+  });
+
+  // Positive control for the case above: the pre-existing default props (claudeUsable
+  // defaults true, codexUsable defaults false) still show the Anthropic picker — the
+  // fix must not hide it universally.
+  it("still shows the Anthropic token picker on the pre-existing (Claude-usable) default props", () => {
+    render(
+      <MemoryRouter>
+        <IssueCard
+          card={aCard()}
+          repoId="repo-1"
+          chips={[]}
+          laneLabel="Backlog"
+          canMoveUp={false}
+          canMoveDown={false}
+          onMoveUp={vi.fn()}
+          onMoveDown={vi.fn()}
+          insertionEdge={null}
+          gate={{ enabled: true, reason: "" }}
+          starting={false}
+          onStart={vi.fn()}
+          tokens={[]}
+          credential={{ mode: "inherit" }}
+          onCredentialChange={vi.fn()}
+          fixCiBusy={false}
+          onFixCi={vi.fn()}
+          uziLabel="uzi"
+          isEligible
+          canPromote={false}
+          promoting={false}
+          onPromote={vi.fn()}
+          onDragStart={vi.fn()}
+          onDragEnd={vi.fn()}
+          dimmed={false}
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.getByLabelText("Anthropic token for #7")).toBeTruthy();
+  });
 });
 
 // Issue #562. A title carrying a long unbreakable token (e.g. an env-var assignment)
@@ -3148,5 +3229,19 @@ describe("Board — per-card harness picker gate (PRD #1429 M4a)", () => {
     fireEvent.click(screen.getByRole("button", { name: /start run/i }));
     await waitFor(() => expect(mockApi.createRun).toHaveBeenCalled());
     expect(mockApi.createRun).toHaveBeenCalledWith("repo-1", 1, undefined, undefined, "codex");
+  });
+
+  // Fix 2 (M4a review): a Codex-only card never shows the harness picker (only one
+  // harness is usable — D2), so `harness` stays "inherit". Gating the Anthropic
+  // TokenPicker on the raw picker value alone left it visible even though the card's
+  // run WILL resolve to Codex — using it 422s.
+  it("hides the Anthropic token picker for a Codex-only user, even with no explicit harness pick", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [codexKey()] });
+    renderBoard();
+    await screen.findByText("issue A");
+
+    // Single-harness user: no redundant harness picker either (D2).
+    expect(screen.queryByLabelText("Harness for #1")).toBeNull();
+    expect(screen.queryByLabelText("Anthropic token for #1")).toBeNull();
   });
 });

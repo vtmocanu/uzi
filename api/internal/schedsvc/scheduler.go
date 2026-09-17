@@ -134,8 +134,12 @@ type RunCreator interface {
 	// dedicated issue-shaped, auto_approve, kind='self_improve' run against the tracking
 	// issue, threading the schedule's per-schedule model override and (PRD #908 M1) the
 	// per-schedule mr_rework override. The per-repo unique index backs
-	// ErrActiveSelfImproveExists on a lost race.
-	CreateSelfImproveRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, title, description string, mrReworkEnabled *bool, model *string, overrideSubagentModel bool) (store.Run, error)
+	// ErrActiveSelfImproveExists on a lost race. explicit is the schedule's pinned
+	// run_schedules.harness (PRD #1429 M4a rework, D1/D4): a non-nil pin is authoritative and
+	// never falls back; nil resolves implicit D11 at fire time. self_improve carries no
+	// credential override (D10-excluded, see scheduleCredentialOverride), but it is NOT
+	// exempt from an explicit harness pin — every fire seam threads scheduleHarness(sched).
+	CreateSelfImproveRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, title, description string, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, explicit *workersvc.Harness) (store.Run, error)
 }
 
 // ForgeBuilder builds a forge driver from a stored (encrypted) connection — the same

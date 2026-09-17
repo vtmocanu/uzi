@@ -1458,4 +1458,22 @@ describe("the per-schedule harness picker (PRD #1429 M4a)", () => {
     expect(within(modelSelect).getByRole("option", { name: "gpt-6-astra" })).toBeTruthy();
     expect(within(modelSelect).queryByRole("option", { name: "opus" })).toBeNull();
   });
+
+  // Fix 2 (M4a review): a Codex-only owner never sees the harness picker (only one
+  // harness is usable — D2), so the schedule's harness pin stays unset/"inherit" even
+  // though every run this schedule fires WILL resolve to Codex implicitly. Gating the
+  // Anthropic TokenPicker on the raw picker value alone left it visible for this owner.
+  it("hides the Anthropic token picker for a Codex-only owner, even with no explicit pin", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [codexKey()] });
+    render(
+      <MemoryRouter>
+        <ScheduleModal editing={schedFixture()} onClose={vi.fn()} onSaved={vi.fn()} />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(mockApi.listSecrets).toHaveBeenCalled());
+    // Single-harness owner: no redundant harness picker either (D2).
+    expect(screen.queryByLabelText("Harness for this schedule")).toBeNull();
+    expect(screen.queryByLabelText("Anthropic token for this schedule")).toBeNull();
+    expect(screen.getByText(/fires on Codex/)).toBeTruthy();
+  });
 });

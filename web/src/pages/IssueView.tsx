@@ -7,7 +7,12 @@ import { hasAnthropicToken, hasAnyCodexCredential, isCodexUsable } from "../lib/
 import { startRunGate } from "../lib/runStream";
 import { startRunWithCredential } from "../lib/startRun";
 import { INHERIT_SELECTION, type CredentialSelection } from "../lib/credentialOverride";
-import { bothHarnessesUsable, INHERIT_HARNESS, type HarnessSelection } from "../lib/harnessSelection";
+import {
+  bothHarnessesUsable,
+  effectiveHarnessIsCodex,
+  INHERIT_HARNESS,
+  type HarnessSelection,
+} from "../lib/harnessSelection";
 import { TokenPicker } from "../components/TokenPicker";
 import { HarnessPicker } from "../components/HarnessPicker";
 import { activeRunInHistory, effectiveRunStatus, isStoppedRun, mrChipState, runStatusTone } from "../lib/runBadge";
@@ -109,6 +114,10 @@ export function IssueView() {
   // D2: the harness control appears only when BOTH harnesses are usable — a
   // single-harness user (Claude-only or Codex-only) sees no picker at all.
   const showHarnessPicker = bothHarnessesUsable(hasToken, codexUsable);
+  // Fix 2 (M4a review): gate the Anthropic TokenPicker on the EFFECTIVE harness, not the
+  // raw picker selection — a Codex-only user never sees the harness picker (showHarnessPicker
+  // is false), so `harness` stays "inherit" even though the run WILL resolve to Codex.
+  const startingOnCodex = effectiveHarnessIsCodex(harness, hasToken, codexUsable);
 
   const startRun = async () => {
     if (!issue) return;
@@ -361,9 +370,11 @@ export function IssueView() {
               )}
               {/* PRD #1247 M7: choose the token the run spends before starting it. Inherit
                   (the default, shown explicitly) follows the worker's binding. Hidden when
-                  the run is explicitly starting on Codex — a Codex run spends a Codex
-                  credential, never an Anthropic one, so the picker would be noise. */}
-              {harness !== "codex" && (
+                  the run will EFFECTIVELY start on Codex — an explicit pick, OR (M4a review
+                  fix) a Codex-only user whose picker is hidden but who WILL resolve to Codex
+                  implicitly — a Codex run spends a Codex credential, never an Anthropic one,
+                  so the picker would be noise (and using it would 422). */}
+              {!startingOnCodex && (
                 <Field label="Anthropic token" htmlFor="start-run-token">
                   <TokenPicker
                     id="start-run-token"

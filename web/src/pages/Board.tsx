@@ -1522,6 +1522,8 @@ export function Board() {
                     onHarnessChange={(h) =>
                       setCardHarness((prev) => ({ ...prev, [card.iid]: h }))
                     }
+                    claudeUsable={hasToken}
+                    codexUsable={codexUsable}
                     fixCiBusy={card.pipeline != null && fixingRef === card.pipeline.ref}
                     onFixCi={() => card.pipeline && fixCi(card.pipeline.ref)}
                     uziLabel={uziLabel}

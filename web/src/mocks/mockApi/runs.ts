@@ -506,6 +506,12 @@ export const runsApi = {
     if (isTerminalRun(run.status)) throw new ApiError(409, "run has already finished");
     if (isCredentialSwitchRefusedLane(run))
       throw new ApiError(409, "this run's lane does not support switching its Anthropic token");
+    // PRD #1429 D5/D9 (M4a review fix): a Codex run cannot carry an Anthropic-only override —
+    // mirrors the server's ErrCredentialOverrideHarnessUnsupported 422, so a demo/test can
+    // surface the harness-aware hiding (RunView/PlanPanel/SwitchTokenAction) rather than
+    // masking a stray call with a false success.
+    if (run.harness === "codex")
+      throw new ApiError(422, "credential override unsupported on codex harness");
     credentialSwitched.add(id);
     patchRun(id, {
       credential_override: overrideToRead(body),

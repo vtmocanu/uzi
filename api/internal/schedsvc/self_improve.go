@@ -182,11 +182,15 @@ func (e *Scheduler) fireSelfImprove(ctx context.Context, sched store.RunSchedule
 		description = genericSelfImproveDescription
 	}
 
-	// 7. Create the run, threading the schedule's per-schedule model override (PRD #300/#305).
+	// 7. Create the run, threading the schedule's per-schedule model override (PRD #300/#305)
+	// and its pinned harness (PRD #1429 M2/M4a rework, D1/D4): scheduleHarness(sched) is nil
+	// for a null-harness schedule (implicit D11 at fire time) or the schedule's authoritative
+	// pin, mirroring firePrompt/the two scheduled-issue seams below — self_improve must not be
+	// the one fire seam that silently drops a pinned Codex harness back to implicit resolution.
 	// A lost unique-index race (ErrActiveSelfImproveExists) is benign — the index did its job,
 	// a cycle is already in flight — so advance. Any other error (incl. ErrRepoNotFound /
 	// ErrGuardrailBlocked from the seam) rides up unchanged so advance() classifies it.
-	run, err := e.runs.CreateSelfImproveRun(ctx, sched.UserID, sched.RepoID, issueIID, selfImproveTrackingTitle, description, scheduleMrRework(sched), scheduleModel(sched), scheduleOverrideSubagentModel(sched))
+	run, err := e.runs.CreateSelfImproveRun(ctx, sched.UserID, sched.RepoID, issueIID, selfImproveTrackingTitle, description, scheduleMrRework(sched), scheduleModel(sched), scheduleOverrideSubagentModel(sched), scheduleHarness(sched))
 	if err != nil {
 		if errors.Is(err, workersvc.ErrActiveSelfImproveExists) {
 			e.logger.Info("scheduler: self_improve run already active (race)", "schedule", sched.ID.String())

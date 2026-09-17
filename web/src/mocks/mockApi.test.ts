@@ -396,6 +396,47 @@ describe("mockApi appearance settings (PRD #1167 Lights on m2)", () => {
   });
 });
 
+describe("mockApi default_harness setting (PRD #1429 M1/D3, M4a review fix)", () => {
+  it("putMySettings persists a default_harness pin across a reload (Run Defaults save)", async () => {
+    installStorage(); // empty store → seeds default_harness=null
+    let api = await reload();
+    expect((await api.getMySettings()).settings.default_harness).toBeNull();
+
+    await api.putMySettings({ default_harness: "codex" });
+    // Echoed back immediately from the same instance…
+    expect((await api.getMySettings()).settings.default_harness).toBe("codex");
+
+    // …and it survives a hard reload (write-through the persistence blob), proving Run
+    // Defaults' save notice ("saved") reflects a value the demo actually keeps.
+    api = await reload();
+    expect((await api.getMySettings()).settings.default_harness).toBe("codex");
+  });
+
+  it("clears a default_harness pin back to no-preference with present-null, leaving other fields", async () => {
+    installStorage();
+    const api = await reload();
+
+    await api.putMySettings({ default_harness: "claude", theme: "mission" });
+    expect((await api.getMySettings()).settings.default_harness).toBe("claude");
+
+    await api.putMySettings({ default_harness: null });
+    const s = (await api.getMySettings()).settings;
+    expect(s.default_harness).toBeNull();
+    // PATCH semantics: a present-null on one field leaves the others untouched.
+    expect(s.theme).toBe("mission");
+  });
+
+  it("rejects an unknown default_harness value with a 400 naming the field", async () => {
+    installStorage();
+    const api = await reload();
+
+    await expect(api.putMySettings({ default_harness: "gpt5" as never })).rejects.toMatchObject({
+      status: 400,
+      message: expect.stringContaining("default_harness"),
+    });
+  });
+});
+
 describe("mockApi run judge review (PRD #46 M4)", () => {
   it("returns the seeded review for a judged run, null for an unjudged one, 404 for unknown", async () => {
     installStorage();

@@ -148,8 +148,10 @@ export function SwitchTokenAction({
   // EXISTING token opens with that token SELECTED and the confirm ENABLED — never as a
   // spurious "(unavailable)". A touched ref freezes the async re-seed behind a live edit,
   // mirroring the ScheduleModal pattern. The picker (hence the fetch) only shows for a
-  // steering owner on a non-refused, non-terminal run, so gate `enabled` on that.
-  const pickerVisible = canSteer && !isCredentialSwitchRefusedLane(run) && !isTerminalRun(run.status);
+  // steering owner on a non-refused, non-terminal, non-Codex run (Fix 2), so gate
+  // `enabled` on that — a Codex run has no Anthropic token to seed/fetch for.
+  const pickerVisible =
+    canSteer && !isCredentialSwitchRefusedLane(run) && !isTerminalRun(run.status) && run.harness !== "codex";
   const {
     tokens: pickerTokens,
     selection,
@@ -159,10 +161,11 @@ export function SwitchTokenAction({
   const [error, setError] = useState("");
   const [warning, setWarning] = useState("");
 
-  // The refused lanes 409 server-side; a terminal run cannot switch. Hide the control
-  // rather than render a button that fails. (Checked after the hooks so hook order is
-  // stable across renders.)
-  if (isCredentialSwitchRefusedLane(run) || isTerminalRun(run.status)) return null;
+  // The refused lanes 409 server-side; a terminal run cannot switch; a Codex run 422s
+  // (Fix 2, M4a review — D5: a Codex run cannot carry an Anthropic-only override, so
+  // there is no token to switch). Hide the control rather than render a button that
+  // fails. (Checked after the hooks so hook order is stable across renders.)
+  if (isCredentialSwitchRefusedLane(run) || isTerminalRun(run.status) || run.harness === "codex") return null;
 
   if (!canSteer) {
     return <span className="text-xs text-muted">Only the run&rsquo;s owner can switch its token.</span>;
