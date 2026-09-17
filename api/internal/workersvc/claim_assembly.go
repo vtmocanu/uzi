@@ -135,7 +135,10 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	// repos → forge_connections and would treat a repo-less judge run as vanished)
 	// and before the bot-PAT open. Its claim carries only the Anthropic token.
 	if run.Kind == runkind.Judge {
-		return s.assembleJudgeClaim(ctx, run)
+		// PRD #1429 M3: the judge lane now threads the CLAIMING worker through too —
+		// assembleJudgeClaim's Codex branch needs it (codexClaimSecrets is worker-scoped),
+		// mirroring why THIS function itself takes wkr.
+		return s.assembleJudgeClaim(ctx, wkr, run)
 	}
 
 	rc, err := s.q.GetRunClaimContext(ctx, run.ID)

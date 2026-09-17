@@ -384,3 +384,102 @@ describe("runReadOnlyModelPass — HOME cleanup vs the aborted CLI (issue #933)"
     assert.equal(existsSync(home!), false, "HOME must be cleaned without waiting for the grace");
   });
 });
+
+// PRD #1429 M3: when opts.codex is set, runReadOnlyModelPass must route through the
+// INJECTED Codex advice-harness factory (never `new ClaudeAdviceHarness(...)`, never
+// `opts.queryFn`) and there is no ephemeral HOME for it to create or clean up.
+describe("runReadOnlyModelPass — Codex advice routing (PRD #1429 M3)", () => {
+  const codexBinding = { authMode: "api_key" as const, accessToken: "codex-tok", capability: "cap-1" };
+
+  it("routes to the injected Codex advice-harness factory and returns its text, never calling queryFn", async () => {
+    let queried = false;
+    const queryFn: SdkQueryFn = (() => {
+      queried = true;
+      return (async function* () {})() as never;
+    }) as unknown as SdkQueryFn;
+    let built: { runId: string; binding: unknown; signal?: AbortSignal } | undefined;
+    let ran: { request: { label: string; systemPrompt: string; prompt: string } } | undefined;
+    const buildHarness = (async (params: { runId: string; binding: unknown; signal?: AbortSignal }) => {
+      built = params;
+      return {
+        kind: "codex" as const,
+        run: async (request: { label: string; systemPrompt: string; prompt: string }) => {
+          ran = { request };
+          return { text: "codex advice text", end: { kind: "terminal", terminal: { outcome: "success" } } };
+        },
+      };
+    }) as never;
+
+    const out = await runReadOnlyModelPass(
+      baseOpts({
+        queryFn,
+        token: undefined,
+        codex: { runId: "run-codex-1", binding: codexBinding as never, buildHarness },
+      }),
+    );
+
+    assert.equal(out, "codex advice text");
+    assert.equal(queried, false, "the Codex path must never call the Claude SDK queryFn");
+    assert.equal(built?.runId, "run-codex-1");
+    assert.deepEqual(built?.binding, codexBinding);
+    assert.ok(built?.signal, "the harness factory must receive the pass's abort signal");
+    assert.equal(ran?.request.label, "review");
+    assert.equal(ran?.request.systemPrompt, "sys");
+    assert.equal(ran?.request.prompt, "hello");
+  });
+
+  it("creates no ephemeral HOME dir for the Codex path", async () => {
+    const before = new Set(await fs.readdir(os.tmpdir()));
+    const buildHarness = (async () => ({
+      kind: "codex" as const,
+      run: async () => ({ text: "x", end: { kind: "terminal", terminal: { outcome: "success" } } }),
+    })) as never;
+    await runReadOnlyModelPass(
+      baseOpts({
+        token: undefined,
+        homePrefix: "uzi-modelpass-codex-nohome-",
+        codex: { runId: "run-codex-2", binding: codexBinding as never, buildHarness },
+      }),
+    );
+    const after = await fs.readdir(os.tmpdir());
+    const created = after.filter((d) => !before.has(d) && d.startsWith("uzi-modelpass-codex-nohome-"));
+    assert.deepEqual(created, [], "the Codex path must create no ephemeral HOME dir (the harness owns its own)");
+  });
+
+  it("propagates the harness's terminal-error policy throw as the generic labeled error", async () => {
+    const buildHarness = (async () => ({
+      kind: "codex" as const,
+      run: async (
+        _request: unknown,
+        policy: { onTerminal: (t: unknown, ctx: { isError: boolean; latest: undefined }) => void },
+      ) => {
+        policy.onTerminal({}, { isError: true, latest: undefined });
+        return { text: "unreachable", end: { kind: "terminal", terminal: { outcome: "failed" } } };
+      },
+    })) as never;
+    await assert.rejects(
+      runReadOnlyModelPass(
+        baseOpts({ token: undefined, codex: { runId: "run-codex-3", binding: codexBinding as never, buildHarness } }),
+      ),
+      /review model call returned an error result/,
+    );
+  });
+
+  it("wall-clock timeout still fires on the Codex path", async () => {
+    const buildHarness = (async () => ({
+      kind: "codex" as const,
+      // Never settles — models a hung Codex advice call.
+      run: () => new Promise(() => {}),
+    })) as never;
+    await assert.rejects(
+      runReadOnlyModelPass(
+        baseOpts({
+          token: undefined,
+          timeoutMs: 5,
+          codex: { runId: "run-codex-4", binding: codexBinding as never, buildHarness },
+        }),
+      ),
+      /review model call exceeded 5ms/,
+    );
+  });
+});

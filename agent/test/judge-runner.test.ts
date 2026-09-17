@@ -430,6 +430,93 @@ describe("JudgeRunner", () => {
     assert.equal(calls.review?.review.status, "failed");
   });
 
+  // PRD #1429 M3: a Codex judge claim (secrets.codex present, NO anthropic_oauth_token) must
+  // drive the INJECTED Codex advice-harness factory to a REAL review, never the deterministic
+  // missing-token fallback the test above pins for the genuinely credential-less Claude case.
+  it("a Codex judge claim (secrets.codex present, no anthropic token) drives the injected Codex advice harness, not the missing-token fallback", async () => {
+    const { client, calls } = fakeClient(emptyTrace);
+    let queried = false;
+    const queryFn: SdkQueryFn = (() => {
+      queried = true;
+      return (async function* () {})();
+    }) as unknown as SdkQueryFn;
+    let harnessBuilt: { runId: string; binding: unknown } | undefined;
+    let harnessRan = false;
+    const codexModelJson = JSON.stringify({ verdict: "ok", summary: "codex advice", recommendations: [] });
+    const fakeHarness = {
+      kind: "codex" as const,
+      run: async () => {
+        harnessRan = true;
+        return { text: codexModelJson, end: { kind: "terminal", terminal: { outcome: "success" } } };
+      },
+    };
+    const codexAdviceHarnessFactory = (async (params: { runId: string; binding: unknown }) => {
+      harnessBuilt = params;
+      return fakeHarness;
+    }) as never;
+    const runner = new JudgeRunner(client, nullLogger(), { queryFn, codexAdviceHarnessFactory });
+    const codexSecrets = { auth_mode: "api_key", access_token: "codex-tok", capability: "cap-1" };
+    await runner.execute(judgeClaim({ secrets: { forge_pat: "", codex: codexSecrets } as never }));
+
+    assert.equal(queried, false, "a Codex judge claim must never call the Claude SDK queryFn");
+    assert.equal(harnessBuilt?.runId, "judge-1", "the factory must be built for THIS judge run");
+    // selectCodexBinding normalizes the wire (snake_case) block into the branded CodexBinding
+    // shape (camelCase); assert the VALUES carried through, not the wire's own field names.
+    assert.deepEqual(harnessBuilt?.binding, { authMode: "api_key", accessToken: "codex-tok", capability: "cap-1" });
+    assert.equal(harnessRan, true, "the Codex advice harness's run() must actually execute");
+    assert.equal(calls.review?.review.status, "complete", "a real Codex advice result must post, not the deterministic fallback");
+    assert.equal(calls.review?.review.verdict, "ok");
+  });
+
+  // PRD #1429 M3: the control — an ordinary Claude claim (no codex block) must never touch
+  // the injected Codex advice-harness factory, even when one is wired.
+  it("a Claude judge claim never touches the injected Codex advice-harness factory", async () => {
+    const { client, calls } = fakeClient(emptyTrace);
+    const modelJson = JSON.stringify({ verdict: "ok", summary: "claude advice", recommendations: [] });
+    let factoryCalled = false;
+    const codexAdviceHarnessFactory = (async () => {
+      factoryCalled = true;
+      throw new Error("must not be called for a Claude claim");
+    }) as never;
+    const runner = new JudgeRunner(client, nullLogger(), { queryFn: replyingQueryFn(modelJson), codexAdviceHarnessFactory });
+    await runner.execute(judgeClaim()); // default secrets: anthropic_oauth_token set, no codex block
+
+    assert.equal(factoryCalled, false, "a Claude claim must never build a Codex advice harness");
+    assert.equal(calls.review?.review.status, "complete");
+    assert.equal(calls.review?.review.verdict, "ok");
+  });
+
+  // PRD #1429 M3, D7 end-to-end: the claim's target_cost_status/target_cost_usd reach the
+  // ACTUAL Codex advice prompt (not just the buildJudgePrompt unit above).
+  it("a Codex judge claim's target_cost_status/target_cost_usd reach the advice prompt honestly", async () => {
+    const { client } = fakeClient(emptyTrace);
+    let capturedPrompt: string | undefined;
+    const fakeHarness = {
+      kind: "codex" as const,
+      run: async (request: { prompt: string }) => {
+        capturedPrompt = request.prompt;
+        return { text: JSON.stringify({ verdict: "ok", summary: "s", recommendations: [] }), end: { kind: "terminal", terminal: { outcome: "success" } } };
+      },
+    };
+    const codexAdviceHarnessFactory = (async () => fakeHarness) as never;
+    const runner = new JudgeRunner(client, nullLogger(), {
+      queryFn: (() => (async function* () {})()) as unknown as SdkQueryFn,
+      codexAdviceHarnessFactory,
+    });
+    const codexSecrets = { auth_mode: "api_key", access_token: "codex-tok", capability: "cap-1" };
+    await runner.execute(
+      judgeClaim({
+        secrets: { forge_pat: "", codex: codexSecrets } as never,
+        target_cost_status: "unreported",
+        target_cost_usd: null,
+      }),
+    );
+
+    assert.ok(capturedPrompt, "the harness must have received a prompt");
+    assert.match(capturedPrompt!, /Reviewed run cost: unreported/);
+    assert.ok(!/\$0(\.00)?\b/.test(capturedPrompt!), "an unreported target cost must never render as $0 in the real prompt");
+  });
+
   it("fails the run when the judge claim carries no target", async () => {
     const { client, calls } = fakeClient(emptyTrace);
     const runner = new JudgeRunner(client, nullLogger(), { queryFn: replyingQueryFn("{}") });
@@ -911,6 +998,50 @@ describe("buildJudgePrompt", () => {
   it("omits the failure class line when the class is null", () => {
     const prompt = buildJudgePrompt(emptyTrace, null, [], null);
     assert.ok(!prompt.includes("Failure class:"), "no failure-class line when the class is null");
+  });
+
+  // PRD #1429 M3, D7: the reviewed run's cost status must be rendered HONESTLY — never a
+  // subscription/unreported spend presented as a complete $0 — and it sits in the TRUSTED
+  // pre-fence header alongside the failure class, never inside the untrusted trace fence.
+  describe("target cost status (PRD #1429 M3, D7)", () => {
+    it("renders a metered dollar figure in the trusted pre-fence header", () => {
+      const prompt = buildJudgePrompt(emptyTrace, null, [], null, "metered", 1.23456);
+      assert.match(prompt, /Reviewed run cost: \$1\.23 \(metered\)\./);
+      const costIdx = prompt.indexOf("Reviewed run cost:");
+      const fenceIdx = prompt.indexOf("<untrusted_trace_");
+      assert.ok(fenceIdx > 0, "expected an untrusted-trace fence");
+      assert.ok(costIdx >= 0 && costIdx < fenceIdx, "the cost line must render before the untrusted fence (trusted header region)");
+    });
+
+    it("labels a subscription spend and NEVER prints a dollar figure for it", () => {
+      const prompt = buildJudgePrompt(emptyTrace, null, [], null, "subscription", 0);
+      assert.match(prompt, /Reviewed run cost: subscription usage/);
+      assert.ok(!/\$0(\.00)?\b/.test(prompt), "a subscription spend must never render as $0");
+      assert.ok(!prompt.includes("$"), "subscription cost must carry NO dollar figure at all");
+    });
+
+    it("labels an unreported spend as incomplete, never a complete $0", () => {
+      const prompt = buildJudgePrompt(emptyTrace, null, [], null, "unreported", 0);
+      assert.match(prompt, /Reviewed run cost: unreported/);
+      assert.match(prompt, /dollar cost is unavailable/);
+      assert.ok(!/\$0(\.00)?\b/.test(prompt), "an unreported spend must never render as a complete $0");
+    });
+
+    it("names an unrecognised future status honestly instead of dropping or zeroing it", () => {
+      const prompt = buildJudgePrompt(emptyTrace, null, [], null, "some_future_status", null);
+      assert.match(prompt, /Reviewed run cost status: some_future_status/);
+      assert.match(prompt, /never assume \$0/);
+    });
+
+    it("omits the cost line entirely when the target has no usage row (status null)", () => {
+      const prompt = buildJudgePrompt(emptyTrace, null, [], null, null, null);
+      assert.ok(!prompt.includes("Reviewed run cost"), "no cost line when there is no usage row");
+    });
+
+    it("a metered status with no known dollar amount says so rather than inventing a number", () => {
+      const prompt = buildJudgePrompt(emptyTrace, null, [], null, "metered", null);
+      assert.match(prompt, /Reviewed run cost: metered \(dollar amount unavailable\)\./);
+    });
   });
 
   // A target string that itself contains a would-be closing tag cannot break the fence:

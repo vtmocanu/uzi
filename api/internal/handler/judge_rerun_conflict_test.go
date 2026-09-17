@@ -14,6 +14,7 @@ import (
 
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // rerunStore is dispStore carried past the RerunJudge gates: the review read path stops
@@ -114,6 +115,13 @@ func TestRerunJudgeConflictMessages(t *testing.T) {
 		// -status and eligible-kind gates, so the only thing left to answer with is one of
 		// the two 409s.
 		ds, runID, _ := oneRecStore()
+		// PRD #1429 M3 (D4): RerunJudge now routes the enqueue through createRunResolved
+		// with the target's harness as an explicit selection. This fake store is not a
+		// *store.Queries, so createRunResolved takes its non-live-DB fallback path, which
+		// refuses any explicit harness other than Claude — stamp it explicitly (the
+		// pre-harness fixture left it "", which the fallback would now refuse) so the test
+		// still reaches CreateJudgeRun and the 409-vs-409 conflict this test is about.
+		ds.run.Harness = string(workersvc.HarnessClaude)
 		return &rerunStore{dispStore: ds}, runID
 	}
 

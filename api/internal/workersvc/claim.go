@@ -244,6 +244,20 @@ type ClaimPayload struct {
 	// carrying only the enum value.
 	FailureClass *string `json:"failure_class,omitempty"`
 
+	// TargetCostStatus is the reviewed run's folded cost-observability status (PRD #1429
+	// M3, D7): "metered" | "subscription" | "unreported", read from run_usage_totals at
+	// judge-claim assembly. Present only for kind=judge, and omitted when the target has
+	// no usage row yet (a target that never posted a result frame) — the SAME omitempty
+	// posture as FailureClass/JudgeSignal above. The judge prompt must render this
+	// honestly: a subscription/unreported target's total is never presented as a
+	// complete $0.
+	TargetCostStatus *string `json:"target_cost_status,omitempty"`
+	// TargetCostUSD is the reviewed run's metered dollar total, meaningful ONLY when
+	// TargetCostStatus == "metered" (a subscription/unreported target's total is not a
+	// real dollar figure and must not be rendered as one). nil alongside
+	// TargetCostStatus when the target has no usage row.
+	TargetCostUSD *float64 `json:"target_cost_usd,omitempty"`
+
 	// KnownImproveUziTargets is the run owner's existing improve_uzi target coordinates
 	// (issue #232): the judge reuses a matching one verbatim instead of inventing a new
 	// phrasing, so future recurrences land on the same exact key the cross-run dedup

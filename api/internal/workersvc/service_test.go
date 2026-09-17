@@ -317,6 +317,12 @@ type fakeStore struct {
 	pendingJudgeLookups []pgtype.UUID
 	toolTraceRows       []store.ListToolTraceForRunRow
 	toolTraceRowsErr    error
+	// PRD #1429 M3 (D7): the judge claim's target-cost-context read (GetRunUsageTotal).
+	// Unset (runUsageTotalSet=false) defaults to pgx.ErrNoRows — "the target has no usage
+	// row yet" is the common case in these fakes and must NOT fail the judge claim.
+	runUsageTotal    store.GetRunUsageTotalRow
+	runUsageTotalSet bool
+	runUsageTotalErr error
 	// knownTargets is the improve_uzi menu the judge claim carries (issue #232);
 	// knownTargetsErr fails the lookup (which must NOT fail the claim — the menu is an
 	// optimization). knownTargetsParams records the (user, lim) asked for, proving the
@@ -1263,6 +1269,19 @@ func (f *fakeStore) GetActiveJudgeRunForTarget(_ context.Context, targetRunID pg
 }
 func (f *fakeStore) ListToolTraceForRun(context.Context, store.ListToolTraceForRunParams) ([]store.ListToolTraceForRunRow, error) {
 	return f.toolTraceRows, f.toolTraceRowsErr
+}
+
+// GetRunUsageTotal backs the judge claim's D7 target-cost-context read (PRD #1429 M3).
+// Defaults to pgx.ErrNoRows (no usage row) unless a test explicitly sets one via
+// runUsageTotal/runUsageTotalSet, or an error via runUsageTotalErr.
+func (f *fakeStore) GetRunUsageTotal(context.Context, uuid.UUID) (store.GetRunUsageTotalRow, error) {
+	if f.runUsageTotalErr != nil {
+		return store.GetRunUsageTotalRow{}, f.runUsageTotalErr
+	}
+	if f.runUsageTotalSet {
+		return f.runUsageTotal, nil
+	}
+	return store.GetRunUsageTotalRow{}, pgx.ErrNoRows
 }
 func (f *fakeStore) ListKnownImproveUziTargetsForUser(_ context.Context, arg store.ListKnownImproveUziTargetsForUserParams) ([]string, error) {
 	f.knownTargetsParams = &arg

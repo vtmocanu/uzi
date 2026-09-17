@@ -13,6 +13,14 @@
 // error; on success it captures the terminal frame). The helper ALWAYS runs a
 // RateLimitObserver so `onResult` always has the latest observation — it is inert for
 // review/summary (zero behavior impact) and supplies `latest` to the judge.
+//
+// PRD #1429 M3: the pass now chooses the advice harness by CLAIM SHAPE. When the caller
+// supplies `opts.codex` (a Codex judge/review claim carrying secrets.codex), it builds a
+// CodexAdviceHarness through the INJECTED factory (`opts.codex.buildHarness` — produced by
+// `makeProductionCodexAdviceHarnessFactory` in codex/codex-executor.ts, one of the two
+// sites `semgrep/codex-fixed-constructor.yml` allows to construct one) instead of
+// `ClaudeAdviceHarness`. This file never constructs a Codex class itself. The Claude path
+// below is otherwise BYTE-IDENTICAL to before this change.
 
 import { promises as fs } from "node:fs";
 import path from "node:path";
@@ -29,6 +37,8 @@ import type { WorkerClient } from "./client.js"; // type-only — erased at runt
 import { postTerminalState, type TerminalOutboxDeps } from "./terminal-resolve.js";
 import type { StateRequest } from "./protocol.js";
 import type { SdkQueryFn } from "./sdk-executor.js"; // type-only — erased at runtime, so no import cycle
+import type { CodexBinding } from "./codex/select.js"; // type-only — erased at runtime, no construction here
+import type { CodexAdviceHarnessFactory } from "./codex/codex-executor.js"; // type-only — the injected seam, never constructed here
 import type {
   AdviceRequest,
   AdviceResultPolicy,
@@ -36,7 +46,10 @@ import type {
 
 /** Options for runReadOnlyModelPass — one tool-less, repo-isolated model turn. */
 export interface ReadOnlyModelPassOpts {
-  token: string;
+  /** The Anthropic token for the CLAUDE path. Omit ONLY when `codex` is set — a Codex
+   *  judge/review claim carries no Anthropic token at all (PRD #1429 M3, D4's auditor
+   *  invariant: no anthropic_oauth_token, no run_credential_epochs row). */
+  token?: string;
   /** The model id; applied to the query only when non-empty. */
   model?: string;
   /** Reasoning effort; applied to the query only when set. */
@@ -67,6 +80,17 @@ export interface ReadOnlyModelPassOpts {
    *  `${label} model call returned an error result` on an error frame, return the
    *  accumulated text on success. */
   onResult?(msg: unknown, ctx: { isError: boolean; latest: RateLimitObservation | undefined }): void;
+  /** PRD #1429 M3: when set, this pass runs the ISOLATED CODEX advice harness (built via
+   *  the injected `buildHarness` factory — never constructed in this file, per
+   *  semgrep/codex-fixed-constructor.yml) instead of ClaudeAdviceHarness. Set by the caller
+   *  when the claim carries a validated `secrets.codex` block
+   *  (codex/select.ts's selectCodexBinding). Mutually exclusive with the Claude path below
+   *  in practice — `token` is simply unused when this is set. */
+  codex?: {
+    readonly runId: string;
+    readonly binding: CodexBinding;
+    readonly buildHarness: CodexAdviceHarnessFactory;
+  };
 }
 
 /** Default bounded grace (ms) for the aborted SDK CLI to finish exiting before its
@@ -103,8 +127,22 @@ async function awaitQuerySettled(query: Promise<unknown>, graceMs: number): Prom
  * SDK query against a wall-clock timeout, accumulate the model's text, and clean up the
  * HOME. Returns the accumulated text (review/summary) — the judge captures its terminal
  * frame via `onResult` and reads the text from the return value.
+ *
+ * PRD #1429 M3: when `opts.codex` is set this delegates to {@link runCodexAdviceModelPass}
+ * instead — an EARLY branch, before any of the Claude-specific HOME/timer setup below runs,
+ * so the Claude path stays byte-identical to before this change.
  */
 export async function runReadOnlyModelPass(opts: ReadOnlyModelPassOpts): Promise<string> {
+  if (opts.codex) return runCodexAdviceModelPass(opts, opts.codex);
+
+  const token = opts.token;
+  if (!token) {
+    // Defensive, not a runtime condition to degrade from: every existing Claude caller
+    // (judge-runner.ts/review-runner.ts) already checked for a non-empty token before ever
+    // calling this function without `codex` set (see their own "no anthropic token" fallback
+    // branches). Reaching here with neither is a programming error.
+    throw new Error(`${opts.label} model pass requires a token or a codex claim`);
+  }
   const homeDir = await fs.mkdtemp(path.join(opts.homeRoot, opts.homePrefix));
   // PRD #51 M4: the advice SDK CLI runs as the `runner` uid (spawnClaudeCodeProcess ->
   // runnerSpawn), but fs.mkdtemp FORCES mode 0700 (Node ignores umask) and this runner
@@ -148,7 +186,7 @@ export async function runReadOnlyModelPass(opts: ReadOnlyModelPassOpts): Promise
     graceMs: opts.graceMs,
   };
   const runPromise = new ClaudeAdviceHarness({
-    token: opts.token,
+    token,
     homeDir,
     abort,
     queryFn: opts.queryFn,
@@ -175,6 +213,66 @@ export async function runReadOnlyModelPass(opts: ReadOnlyModelPassOpts): Promise
     await rmTreeForce(homeDir).catch((e) =>
       opts.log.warn(`${opts.label} HOME cleanup failed`, { home_dir: homeDir, error: errMessage(e) }),
     );
+  }
+}
+
+/**
+ * PRD #1429 M3: the CODEX sibling of {@link runReadOnlyModelPass}'s Claude path above — the
+ * SAME timeout/policy/request shape, but the harness is built via the INJECTED
+ * `codex.buildHarness` factory (produced by
+ * `codex/codex-executor.ts`'s `makeProductionCodexAdviceHarnessFactory`, one of the two
+ * sites `semgrep/codex-fixed-constructor.yml` allows to construct a Codex class — this file
+ * never constructs one itself) instead of `new ClaudeAdviceHarness(...)`.
+ *
+ * There is no ephemeral HOME for this function to create or clean up: the Codex advice
+ * harness launches its own isolated, disposable provider root and disposes it inside its
+ * own `run()` (codex-advice-harness.ts / codex-executor.ts's
+ * `makeProductionLaunchAdviceRoot`), so unlike the Claude path there is nothing here for a
+ * `finally` to `rm`.
+ *
+ * `opts.onResult` (the judge's raw-SDK-message rate-limit shim) is Claude-SDK-specific and
+ * is NOT invoked on this path: Codex M3 carries no rate-limit facts yet
+ * (codex-advice-harness.ts's `decodeTerminal`), so the neutral `policy` below is the whole
+ * failure contract — an error terminal throws the same generic labeled error the
+ * review/summary Claude callers get.
+ */
+async function runCodexAdviceModelPass(
+  opts: ReadOnlyModelPassOpts,
+  codex: NonNullable<ReadOnlyModelPassOpts["codex"]>,
+): Promise<string> {
+  const abort = new AbortController();
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      abort.abort();
+      reject(new Error(`${opts.label} model call exceeded ${opts.timeoutMs}ms`));
+    }, opts.timeoutMs);
+  });
+  const policy: AdviceResultPolicy = {
+    onTerminal: (_t, { isError }) => {
+      if (isError) throw new Error(`${opts.label} model call returned an error result`);
+    },
+  };
+  const request: AdviceRequest = {
+    label: opts.label as AdviceRequest["label"],
+    systemPrompt: opts.systemPrompt,
+    prompt: opts.prompt,
+    model: opts.model,
+    effort: opts.effort,
+    output: { kind: "text" },
+    signal: abort.signal,
+    timeoutMs: opts.timeoutMs,
+    graceMs: opts.graceMs,
+  };
+  const runPromise = (async (): Promise<string> => {
+    const harness = await codex.buildHarness({ runId: codex.runId, binding: codex.binding, signal: abort.signal });
+    const result = await harness.run(request, policy);
+    return result.text;
+  })();
+  try {
+    return await Promise.race([runPromise, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 

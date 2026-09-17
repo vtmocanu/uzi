@@ -6,7 +6,7 @@ import { GitCache } from "./git.js";
 import { StubExecutor } from "./executor.js";
 import { SdkExecutor } from "./sdk-executor.js";
 import { selectCodexBinding, CodexSelectionError } from "./codex/select.js";
-import { CodexExecutor, FailClosedExecutor, CODEX_PRODUCTION_PROVIDER } from "./codex/codex-executor.js";
+import { CodexExecutor, FailClosedExecutor, CODEX_PRODUCTION_PROVIDER, makeProductionCodexAdviceHarnessFactory } from "./codex/codex-executor.js";
 import { ChatExecutor, type ChatExecutorLike } from "./chat-executor.js";
 import { StubChatExecutor } from "./chat-executor-stub.js";
 import { RunRunner, type ExecutorFactory } from "./runner.js";
@@ -299,6 +299,16 @@ async function main(): Promise<void> {
     outboxSpillBufferBytes: config.outboxSpillBufferBytes,
   });
 
+  // PRD #1429 M3: the Codex advice-harness factory judge/review thread into
+  // runReadOnlyModelPass (model-pass.ts) so a Codex judge/review claim (secrets.codex
+  // present) gets a REAL Codex advice pass instead of the missing-token fallback. Built
+  // HERE — one of the two sites semgrep/codex-fixed-constructor.yml allows to construct a
+  // Codex class (the other is codex/codex-executor.ts itself) — and injected as an option,
+  // mirroring how makeExecutor above selects the real CodexExecutor unconditionally
+  // whenever the claim carries a valid codex block (never stub-gated; UZI_EXECUTOR=stub
+  // only ever affects the CLAUDE path).
+  const codexAdviceHarnessFactory = makeProductionCodexAdviceHarnessFactory(client, log, sdkHomeRoot);
+
   // The judge lane (PRD #46): a slim runner for `judge` claims. It reuses the SDK
   // HOME root but needs no executor/clone — it fetches the trace, calls the model
   // once, and posts a verdict. Under UZI_E2E_EXECUTOR=stub the model call is the
@@ -313,6 +323,7 @@ async function main(): Promise<void> {
     outbox,
     outboxTerminalMaxBytes: config.outboxTerminalMaxBytes,
     gapFillMax: config.gapFillMax,
+    codexAdviceHarnessFactory,
     ...(config.executor === "stub" ? { queryFn: stubJudgeQueryFn } : {}),
   });
 
@@ -330,6 +341,7 @@ async function main(): Promise<void> {
     outbox,
     outboxTerminalMaxBytes: config.outboxTerminalMaxBytes,
     gapFillMax: config.gapFillMax,
+    codexAdviceHarnessFactory,
     ...(config.executor === "stub" ? { queryFn: stubJudgeQueryFn } : {}),
   });
 

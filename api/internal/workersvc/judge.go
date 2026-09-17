@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/vtmocanu/uzi/api/internal/autoselect"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -1096,47 +1097,64 @@ func (s *Service) judgeChoice(ctx context.Context, run store.Run) (secretChoice,
 // & 4). Unlike the ordinary run lane it does NOT call GetRunClaimContext (no repo, no
 // forge connection) and NEVER opens the bot PAT: least privilege, and a judge must
 // not spuriously fail when the reviewed run's forge connection is gone (audit H2). It
-// delivers the run owner's Anthropic token (vault-aware openAnthropic), the reviewed
-// run's id (its trace is fetched out-of-band), the judge model, and the deterministic
-// command-not-found pre-scan. The trace itself never rides the claim (it can be MB).
-func (s *Service) assembleJudgeClaim(ctx context.Context, run store.Run) (*ClaimPayload, error) {
-	// The run owner's JUDGE binding resolves the credential — and deliberately NOT the
-	// claiming worker's binding, even though a judge run is claimed by an ordinary
-	// worker through the same ClaimRun lane. Under PRD #104 D1 the judge lane is bound
-	// per USER: which credential reviews your work is a property of you, not of
-	// whichever worker happened to pick the retrospective up, which would otherwise
-	// bill the same retrospective to different accounts run to run for no reason a user
-	// could see. judgeChoice reads the three-valued judge bind mode (PRD #1140 M2):
-	// default/pinned resolve statically, auto runs the pool ranker with D4's empty-pool
-	// fallback. Self-improve runs ride the run lane but follow this same resolution.
-	choice, err := s.judgeChoice(ctx, run)
-	if err != nil {
-		return nil, err
+// delivers the reviewed run's id (its trace is fetched out-of-band), the judge model,
+// and the deterministic command-not-found pre-scan. The trace itself never rides the
+// claim (it can be MB).
+//
+// PRD #1429 M3 (D4): harness-authoritative, the judge-lane repair mirroring the ordinary
+// lane's claim_assembly.go one. A Codex judge run (run.Harness == harnessCodex) NEVER calls
+// judgeChoice / openWithAutoRetry / recordRunCredential: it opens no Anthropic credential,
+// writes no run_credential_epochs Anthropic row, and AnthropicOAuthToken stays "". Its
+// Secrets.Codex is attached below through the SAME codexClaimSecrets authority path the
+// ordinary lane uses — which is why this now takes the CLAIMING WORKER (wkr); codexClaimSecrets
+// needs it. A Claude judge run is byte-identical to before this repair. The judge lane still
+// forks BEFORE GetRunClaimContext (a judge run has no repo) — that fork lives in
+// claim_assembly.go's assembleClaim, unchanged.
+func (s *Service) assembleJudgeClaim(ctx context.Context, wkr store.Worker, run store.Run) (*ClaimPayload, error) {
+	var anthropic []byte
+	recordedLastSeq := run.LastSeq
+	if run.Harness != harnessCodex {
+		// The run owner's JUDGE binding resolves the credential — and deliberately NOT the
+		// claiming worker's binding, even though a judge run is claimed by an ordinary
+		// worker through the same ClaimRun lane. Under PRD #104 D1 the judge lane is bound
+		// per USER: which credential reviews your work is a property of you, not of
+		// whichever worker happened to pick the retrospective up, which would otherwise
+		// bill the same retrospective to different accounts run to run for no reason a user
+		// could see. judgeChoice reads the three-valued judge bind mode (PRD #1140 M2):
+		// default/pinned resolve statically, auto runs the pool ranker with D4's empty-pool
+		// fallback. Self-improve runs ride the run lane but follow this same resolution.
+		choice, err := s.judgeChoice(ctx, run)
+		if err != nil {
+			return nil, err
+		}
+		// Open with the SAME open-failed retry the run lane uses (PRD #1140 M2): before the
+		// extraction the judge lane opened directly, so an `auto` judge pick that would not
+		// decrypt failed terminally while the run lane floored onto another pooled token.
+		cred, choice, err := s.openWithAutoRetry(ctx, run, choice)
+		if err != nil {
+			return nil, err
+		}
+		// The judge lane records what it spent exactly as the run lane does (PRD #111
+		// M1). It is the lane where this matters MOST: the judge binding exists so
+		// retrospectives can be billed to a different account, and until now nothing in
+		// the data said whether they actually were. The reason is whatever judgeChoice
+		// resolved — `judge` for a pin, `default` for an unbound lane, or auto /
+		// best_of_pool / pool_stale / pool_empty / open_failed for the auto mode — so the
+		// run view names the MODE with no new vocabulary (D20).
+		// emitSwitchMessage=false: the judge lane is not switchable (D10 — the verb refuses it), so it
+		// never emits a 'credential_switch' message. The returned last_seq is discarded — the judge
+		// lane never emits a switch message, so it never diverges from run.LastSeq.
+		if _, err := s.recordRunCredential(ctx, run, cred, choice, false); err != nil {
+			return nil, err
+		}
+		anthropic = cred.Token
 	}
-	// Open with the SAME open-failed retry the run lane uses (PRD #1140 M2): before the
-	// extraction the judge lane opened directly, so an `auto` judge pick that would not
-	// decrypt failed terminally while the run lane floored onto another pooled token.
-	cred, choice, err := s.openWithAutoRetry(ctx, run, choice)
-	if err != nil {
-		return nil, err
-	}
-	// The judge lane records what it spent exactly as the run lane does (PRD #111
-	// M1). It is the lane where this matters MOST: the judge binding exists so
-	// retrospectives can be billed to a different account, and until now nothing in
-	// the data said whether they actually were. The reason is whatever judgeChoice
-	// resolved — `judge` for a pin, `default` for an unbound lane, or auto /
-	// best_of_pool / pool_stale / pool_empty / open_failed for the auto mode — so the
-	// run view names the MODE with no new vocabulary (D20).
-	// emitSwitchMessage=false: the judge lane is not switchable (D10 — the verb refuses it), so it
-	// never emits a 'credential_switch' message. The returned last_seq is discarded.
-	if _, err := s.recordRunCredential(ctx, run, cred, choice, false); err != nil {
-		return nil, err
-	}
-	anthropic := cred.Token
 
 	var targetRunID *string
 	var signal *JudgeSignal
 	var failureClass *string
+	var targetCostStatus *string
+	var targetCostUSD *float64
 	if run.TargetRunID.Valid {
 		id := uuid.UUID(run.TargetRunID.Bytes).String()
 		targetRunID = &id
@@ -1154,6 +1172,11 @@ func (s *Service) assembleJudgeClaim(ctx context.Context, run store.Run) (*Claim
 			fc := target.FailOrigin.String
 			failureClass = &fc
 		}
+		// PRD #1429 M3 (D7): the reviewed target's own folded cost-observability status, so
+		// the judge PROMPT can name whether its total is a real metered dollar figure, an
+		// unmetered subscription spend, or unreported (tokens only) — never a
+		// subscription/unreported total silently rendered as a complete $0.
+		targetCostStatus, targetCostUSD = s.targetCostContext(ctx, uuid.UUID(run.TargetRunID.Bytes))
 	}
 
 	// Judge model resolution is user-value-wins (PRD #69 M2, Decision 5): the run
@@ -1175,6 +1198,17 @@ func (s *Service) assembleJudgeClaim(ctx context.Context, run store.Run) (*Claim
 				judgeModel = &m
 			}
 		}
+	}
+
+	// PRD #1429 D6: the model vocabulary is harness-owned, same guard as the ordinary lane
+	// (claim_assembly.go). A judge model incompatible with the judge run's OWN harness (a
+	// Claude alias resolved for a Codex judge, or the reverse) is dropped so the worker uses
+	// its own harness default, and a VISIBLE nonsecret status note is recorded — a Claude
+	// alias must never reach a Codex judge claim, nor a Codex model a Claude judge claim.
+	if judgeModel != nil && !harnessModelCompatible(Harness(run.Harness), *judgeModel) {
+		dropped := *judgeModel
+		judgeModel = nil
+		recordedLastSeq = s.recordHarnessModelFallbackNote(ctx, run, recordedLastSeq, Harness(run.Harness), dropped)
 	}
 
 	// The owner's existing improve_uzi target coordinates (issue #232), read best-effort:
@@ -1203,7 +1237,7 @@ func (s *Service) assembleJudgeClaim(ctx context.Context, run store.Run) (*Claim
 		// defaultEffort is the zero pgtype.Text (invalid) here → resolveEffortPtr → xhigh
 	}
 
-	return &ClaimPayload{
+	payload := &ClaimPayload{
 		RunID: run.ID.String(),
 		Kind:  run.Kind,
 		// PRD #1247 M2 fix round: the judge lane forks here BEFORE assembleClaim's ordinary
@@ -1220,11 +1254,17 @@ func (s *Service) assembleJudgeClaim(ctx context.Context, run store.Run) (*Claim
 		JudgeModel:             judgeModel,
 		JudgeSignal:            signal,
 		FailureClass:           failureClass,
+		TargetCostStatus:       targetCostStatus,
+		TargetCostUSD:          targetCostUSD,
 		KnownImproveUziTargets: knownTargets,
 		SessionID:              textPtr(run.SessionID),
-		LastSeq:                run.LastSeq,
-		IterationCount:         run.IterationCount,
-		RequeueCount:           run.RequeueCount,
+		// PRD #1429 M3: recordedLastSeq starts at run.LastSeq and only advances if the D6
+		// model-fallback note above landed one — the judge lane never emits a
+		// 'credential_switch' message (recordRunCredential's return is discarded above), so
+		// this is the ONLY thing that can move it off run.LastSeq.
+		LastSeq:        recordedLastSeq,
+		IterationCount: run.IterationCount,
+		RequeueCount:   run.RequeueCount,
 		Secrets: ClaimSecrets{
 			// ForgeUsername/ForgePAT are left empty by design: a judge never touches a
 			// repo. The wire still carries the (empty) forge_pat key because a judge run
@@ -1246,7 +1286,45 @@ func (s *Service) assembleJudgeClaim(ctx context.Context, run store.Run) (*Claim
 			ToolPackages:           []string{},
 			DeniedToolPackages:     toolprofile.DenylistNames(),
 		},
-	}, nil
+	}
+
+	// PRD #1429 M3 (D4 auditor invariant): a Codex judge run's Codex secrets are attached
+	// here, through the SAME codexClaimSecrets authority path the ordinary lane uses
+	// (claim_assembly.go) — never a separate/duplicated construction. Mirrors that lane's
+	// error handling: errVaultLocked/errRunVanished pass through untouched (transient
+	// requeue / drop by identity); every other codex sentinel is wrapped as
+	// errCredentialUnavailable so the run fails closed rather than falling back to Claude.
+	if run.Harness == harnessCodex {
+		codex, err := s.codexClaimSecrets(ctx, wkr, run)
+		if err != nil {
+			if errors.Is(err, errVaultLocked) || errors.Is(err, errRunVanished) {
+				return nil, err
+			}
+			return nil, fmt.Errorf("%w: %v", errCredentialUnavailable, err)
+		}
+		payload.Secrets.Codex = codex
+	}
+
+	return payload, nil
+}
+
+// targetCostContext reads the reviewed run's folded cost-observability status (PRD #1429
+// M3, D7) for the judge PROMPT: whether its total is a real metered dollar figure, an
+// unmetered subscription spend, or unreported (token totals only, no dollar figure).
+// Best-effort, mirroring judgeSignal's posture: a missing usage row (pgx.ErrNoRows — the
+// target never posted a result frame) or a read error yields (nil, nil), never failing
+// the claim.
+func (s *Service) targetCostContext(ctx context.Context, targetID uuid.UUID) (*string, *float64) {
+	row, err := s.q.GetRunUsageTotal(ctx, targetID)
+	if err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			slog.Warn("judge claim: read target run usage totals", "target", targetID.String(), "error", err)
+		}
+		return nil, nil
+	}
+	status := row.CostStatus
+	cost := numericToFloat64(row.CostUsd)
+	return &status, &cost
 }
 
 // judgeSignal runs the deterministic command-not-found scan over the reviewed run's

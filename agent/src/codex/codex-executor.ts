@@ -289,7 +289,7 @@ class ChildFrameQueue implements CodexChildSink {
   }
 }
 
-// ─── Part F: the advice auth bridge + factory (deliver only; NOT wired into model-pass) ──
+// ─── Part F: the advice auth bridge + factory (wired into model-pass, PRD #1429 M3) ──
 /**
  * A NARROW credential bridge scoped to ONE selected credential's capability, for the
  * isolated Codex advice lane. It wraps {@link WorkerClient.releaseCodex} (a fresh committed
@@ -578,8 +578,10 @@ export function buildRunLaneReconcile(
  * propagates rather than degrading to an un-credentialed root. The auth owner is the ONLY
  * credential seam fed into the harness — NO workspace/registry/broker, no env credential.
  *
- * This DELIVERS the factory + bridge; it is deliberately NOT wired into the shared
- * `model-pass.ts` (R3), which hardcodes `ClaudeAdviceHarness` and owns Claude parity.
+ * PRD #1429 M3: this is now WIRED into the shared `model-pass.ts`, via the injected
+ * {@link CodexAdviceHarnessFactory} `makeProductionCodexAdviceHarnessFactory` builds below —
+ * model-pass.ts never constructs a Codex class itself (semgrep/codex-fixed-constructor.yml
+ * allows only this file and main.ts to do that).
  */
 export async function makeCodexAdviceHarness(
   bridge: CodexAdviceCredentialBridge,
@@ -608,8 +610,9 @@ export async function makeCodexAdviceHarness(
  *  {@link CodexAdviceCredentialBridge.buildSubscriptionRefreshBridge}), so the advice lane's
  *  app-server refresh is byte-consistent with the run lane BY CONSTRUCTION — generation-after-
  *  delivery, not the immediate-advance {@link CodexAdviceCredentialBridge.refresh} primitive that
- *  a delivery-failed same-op retry would break. api_key builds a no-refresh key config. Unit-only
- *  (no live caller) — it keeps the advice lane fail-closed. */
+ *  a delivery-failed same-op retry would break. api_key builds a no-refresh key config. Called
+ *  from {@link makeCodexAdviceHarness} (PRD #1429 M3: now the production judge/review advice
+ *  path, via {@link makeProductionCodexAdviceHarnessFactory} below); fail-closed throughout. */
 function buildAdviceAuthConfig(
   bridge: CodexAdviceCredentialBridge,
   initial: string,
@@ -627,6 +630,113 @@ function buildAdviceAuthConfig(
     mode: "subscription",
     initial: { accessToken: initial, accountId },
     bridge: bridge.buildSubscriptionRefreshBridge(registerToken),
+  };
+}
+
+// ─── Part H: the production Codex advice-harness FACTORY (PRD #1429 M3) ─────────
+/**
+ * Build a fresh, disposable Codex advice-launch root for ONE call (PRD #1429 M3). Adapts the
+ * SAME `launchCodexRoot` primitive {@link defaultLaunchProviderRoot} uses for the run lane —
+ * a "provider" root under app-server auth, so the credential flows over the login RPC and
+ * NEVER the launcher env — but for the isolated, tool-less advice lane: NO registry, NO
+ * broker, NO command-effect surface, and its OWN disposable per-call owned-data-root/cwd
+ * (never the run lane's `codex-data/epoch-N` tree or worktree). `authMode` is bound once at
+ * FACTORY construction ({@link makeProductionCodexAdviceHarnessFactory}) because
+ * {@link CodexAdviceLaunchSpec} itself carries no auth-mode field (the pinned app-server auth
+ * owner authenticates over the login RPC, not a launcher config choice).
+ *
+ * `homeRoot` is the WORKER's shared SDK home root (`sdkHomeRoot` in main.ts) — the same
+ * setgid, runner-group-accessible tree {@link prepareCodexRunHome} prepares per run, reused
+ * here as a stable parent so a fresh per-call child directory inherits the correct
+ * ownership/group without a dedicated per-advice-call preparation step.
+ */
+function makeProductionLaunchAdviceRoot(homeRoot: string, authMode: CodexAppServerAuthMode): LaunchAdviceRootSeam {
+  return async (spec) => {
+    const id = randomUUID();
+    const dataParent = path.join(homeRoot, "codex-advice-data");
+    const cwdParent = path.join(homeRoot, "codex-advice-cwd");
+    await ensureCodexSharedDirectory(dataParent);
+    await ensureCodexSharedDirectory(cwdParent);
+    const ownedDataRoot = path.join(dataParent, id);
+    const cwd = path.join(cwdParent, id);
+    // The launcher's own deriveOwnedTrees creates ownedDataRoot itself (runner-owned, fresh
+    // per call); cwd is only the isolated, EXPLICITLY-untrusted project dir the advice thread
+    // pins (codex-advice-harness.ts's adviceThreadConfig), so it is prepared here the same
+    // shared-directory way as the run lane's HOME (worker-owned, group runner, setgid).
+    await ensureCodexSharedDirectory(cwd);
+
+    const handle = await launchCodexRoot({
+      ownedDataRoot,
+      // No credentialValue: the token flows over account/login/start, never the launcher env
+      // (mirrors defaultLaunchProviderRoot).
+      provider: { name: spec.provider.name, baseUrl: spec.provider.baseUrl, envKey: spec.provider.envKey },
+      model: spec.model,
+      codexBin: CODEX_BIN,
+      supervisorBin: SUPERVISOR_BIN,
+      kind: "provider",
+      childArgv: [...PROVIDER_CHILD_ARGV],
+      cwd,
+      useAppServerAuth: true,
+      authMode,
+    });
+    const stdout = handle.transport.stdout;
+    const stdin = handle.transport.stdin;
+    if (!stdout || !stdin) throw new Error("codex advice root is missing a stdio transport channel");
+    // Advice stderr is never model-visible or logged, but it must be drained (mirrors
+    // defaultLaunchProviderRoot): an unread pipe can fill and deadlock the app-server.
+    handle.transport.stderr?.resume();
+    const transport = createCodexTransport({ inbound: stdout, outbound: stdin });
+    return {
+      transport,
+      cwd,
+      dispose: async () => {
+        try {
+          await handle.dispose();
+        } finally {
+          // Best-effort cleanup of the per-call trees; a failed rm never fails the advice call
+          // (mirrors model-pass.ts's ephemeral-HOME cleanup posture for the Claude lane).
+          await fs.rm(ownedDataRoot, { recursive: true, force: true }).catch(() => undefined);
+          await fs.rm(cwd, { recursive: true, force: true }).catch(() => undefined);
+        }
+      },
+    };
+  };
+}
+
+/** One call's identity + credential binding, threaded into the production Codex
+ *  advice-harness factory (PRD #1429 M3). `runId` feeds the credential bridge's
+ *  release/refresh calls; `binding` is the claim's validated `secrets.codex` block
+ *  ({@link import("./select.js").selectCodexBinding}'s output). */
+export interface CodexAdviceHarnessBuildParams {
+  readonly runId: string;
+  readonly binding: CodexBinding;
+  readonly signal?: AbortSignal;
+}
+
+/** The injected judge/review advice-harness seam (PRD #1429 M3): built ONLY here and in
+ *  main.ts (the two sanctioned Codex-construction sites), and passed into
+ *  `JudgeRunner`/`ReviewRunner` as a constructor option so `model-pass.ts` chooses the
+ *  advice harness by CLAIM SHAPE without ever constructing a Codex class itself. */
+export type CodexAdviceHarnessFactory = (params: CodexAdviceHarnessBuildParams) => Promise<CodexAdviceHarness>;
+
+/**
+ * Build the PRODUCTION Codex advice-harness factory (PRD #1429 M3): the one seam
+ * `main.ts` hands to `JudgeRunner`/`ReviewRunner`, which thread it into
+ * `runReadOnlyModelPass` (model-pass.ts) so a Codex judge/review claim gets a REAL advice
+ * result instead of the deterministic missing-token fallback. Each call releases a FRESH
+ * credential through a fresh {@link CodexAdviceCredentialBridge} (never the run lane's
+ * registry/workspace/broker) and launches an isolated, tool-less provider root via
+ * {@link makeProductionLaunchAdviceRoot}, disposed when the harness's own `run()` completes.
+ */
+export function makeProductionCodexAdviceHarnessFactory(
+  client: WorkerClient,
+  log: Logger,
+  homeRoot: string,
+): CodexAdviceHarnessFactory {
+  return async ({ runId, binding, signal }: CodexAdviceHarnessBuildParams): Promise<CodexAdviceHarness> => {
+    const bridge = new CodexAdviceCredentialBridge(runId, client, binding);
+    const launchRoot = makeProductionLaunchAdviceRoot(homeRoot, binding.authMode);
+    return makeCodexAdviceHarness(bridge, CODEX_PRODUCTION_PROVIDER, launchRoot, log, signal);
   };
 }
 

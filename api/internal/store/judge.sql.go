@@ -442,7 +442,8 @@ SELECT rr.judge_run_id,
        ru.cache_read_tokens,
        ru.cache_creation_tokens,
        ru.output_tokens,
-       ru.cost_usd
+       ru.cost_usd,
+       ru.cost_status
 FROM run_reviews rr
 JOIN runs jr ON jr.id = rr.judge_run_id
 LEFT JOIN run_usage_totals ru ON ru.run_id = rr.judge_run_id
@@ -459,6 +460,7 @@ type GetJudgeRunUsageForTargetRow struct {
 	CacheCreationTokens pgtype.Int8        `json:"cache_creation_tokens"`
 	OutputTokens        pgtype.Int8        `json:"output_tokens"`
 	CostUsd             pgtype.Numeric     `json:"cost_usd"`
+	CostStatus          pgtype.Text        `json:"cost_status"`
 }
 
 // The judge run's timing + token/cost usage for a target run's review panel (PRD #69
@@ -473,6 +475,10 @@ type GetJudgeRunUsageForTargetRow struct {
 // pre-feature judge) yields NULLs, which the DTO renders as an absent strip — never a
 // fabricated 0. Owner-or-admin visibility is enforced by the caller (GetRunForViewer on
 // the target) BEFORE this read, exactly like GetRunReviewForTarget.
+//
+// cost_status (PRD #1429 M3, D7) rides along like the token/cost columns above, so the
+// panel's judge-run strip can tell a real metered dollar total from a subscription/
+// unreported one that cost_usd alone cannot represent — never a fabricated complete $0.
 func (q *Queries) GetJudgeRunUsageForTarget(ctx context.Context, targetRunID uuid.UUID) (GetJudgeRunUsageForTargetRow, error) {
 	row := q.db.QueryRow(ctx, getJudgeRunUsageForTarget, targetRunID)
 	var i GetJudgeRunUsageForTargetRow
@@ -486,6 +492,7 @@ func (q *Queries) GetJudgeRunUsageForTarget(ctx context.Context, targetRunID uui
 		&i.CacheCreationTokens,
 		&i.OutputTokens,
 		&i.CostUsd,
+		&i.CostStatus,
 	)
 	return i, err
 }
