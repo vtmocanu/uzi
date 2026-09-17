@@ -57,6 +57,12 @@ type fakeNotifStore struct {
 	chatCtx    store.GetSlackChatContextRow
 	chatCtxSet bool
 	chatCtxErr error
+	// PRD #1247 M9 (D14): the credential-switch evidence for the resume DM. A nil payload with no
+	// error models "no switch this cycle" (pgx.ErrNoRows), the same way `question` does. credSwitchArgs
+	// captures each call so a test can assert the park-cycle `since` anchor was passed.
+	credSwitch     []byte
+	credSwitchErr  error
+	credSwitchArgs []store.GetLatestCredentialSwitchSinceParams
 }
 
 func (f *fakeNotifStore) GetSlackRunContext(context.Context, uuid.UUID) (store.GetSlackRunContextRow, error) {
@@ -114,6 +120,16 @@ func (f *fakeNotifStore) SetSlackRunLimitPause(_ context.Context, arg store.SetS
 	f.msg.LimitPausedAt = arg.At  // stateful: the next GetSlackRunMessage sees the marker
 	f.msg.ParkKind = arg.ParkKind // stateful: the resume reads which park set it (PRD #1190)
 	return f.msg, nil
+}
+func (f *fakeNotifStore) GetLatestCredentialSwitchSince(_ context.Context, arg store.GetLatestCredentialSwitchSinceParams) ([]byte, error) {
+	f.credSwitchArgs = append(f.credSwitchArgs, arg)
+	if f.credSwitchErr != nil {
+		return nil, f.credSwitchErr
+	}
+	if f.credSwitch == nil {
+		return nil, pgx.ErrNoRows
+	}
+	return f.credSwitch, nil
 }
 func (f *fakeNotifStore) ClearSlackRunLimitPause(_ context.Context, arg store.ClearSlackRunLimitPauseParams) (store.SlackRunMessage, error) {
 	f.limitPauseClr = append(f.limitPauseClr, arg)
@@ -1290,7 +1306,7 @@ func TestHumanWait(t *testing.T) {
 // limit_wait park kind keeps the "· usage limit cleared" clause (#1116).
 func TestResumeThreadBlocksOmitsFragmentWhenNoWait(t *testing.T) {
 	rc := baseRun("running")
-	blocks, fallback := resumeThreadBlocks(rc, -5*time.Minute, false, "https://uzi.example", "limit_wait")
+	blocks, fallback := resumeThreadBlocks(rc, -5*time.Minute, false, "https://uzi.example", "limit_wait", "")
 	_, section := blockSummary(blocks)
 	if !strings.Contains(section, "Resumed · usage limit cleared") {
 		t.Fatalf("resume section = %q, want the resume head", section)
@@ -1320,7 +1336,7 @@ func TestResumeThreadBlocksHeaderPerParkKind(t *testing.T) {
 		{"limit_wait", "▶️ *Resumed · usage limit cleared*", ""},
 		{"", "▶️ *Resumed · usage limit cleared*", ""}, // legacy row: NULL park_kind, pre-column
 	} {
-		blocks, _ := resumeThreadBlocks(rc, time.Hour, true, "https://uzi.example", tc.parkKind)
+		blocks, _ := resumeThreadBlocks(rc, time.Hour, true, "https://uzi.example", tc.parkKind, "")
 		_, section := blockSummary(blocks)
 		if !strings.Contains(section, tc.want) {
 			t.Errorf("parkKind %q: section = %q, want it to contain %q", tc.parkKind, section, tc.want)

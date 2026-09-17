@@ -61,6 +61,11 @@ type NotifierStore interface {
 	// compare-and-swap on @at (PRD #1116): no row = a newer park or an already-cleared
 	// marker did not match, so a stale clear can never wipe a newer park's marker.
 	ClearSlackRunLimitPause(ctx context.Context, arg store.ClearSlackRunLimitPauseParams) (store.SlackRunMessage, error)
+	// GetLatestCredentialSwitchSince returns the newest 'credential_switch' run_message payload
+	// minted after @since — the durable evidence that a token switch was applied during this
+	// park cycle (PRD #1247 M9, D14). handleLimitResume uses it to name the new token in the
+	// ▶️ Resumed DM; no row (pgx.ErrNoRows) = no switch this cycle, so the DM is unchanged.
+	GetLatestCredentialSwitchSince(ctx context.Context, arg store.GetLatestCredentialSwitchSinceParams) ([]byte, error)
 }
 
 // Poster is the outbound Slack surface the notifier drives: open a DM channel and

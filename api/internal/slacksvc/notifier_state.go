@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/slack-go/slack"
@@ -175,10 +176,15 @@ func (n *Notifier) handleLimitResume(ctx context.Context, rc store.GetSlackRunCo
 	case "running":
 		waited := time.Since(anchor.LimitPausedAt.Time)
 		hasWait := waited >= 0 && waited <= maxPlausibleWait
+		// PRD #1247 M9 (D14): if a credential switch was APPLIED during THIS park cycle, name the
+		// new token in the resume DM. The evidence is the committed 'credential_switch' run message
+		// (durable + immutable, unlike run_credential_epochs.applied_at, which a same-generation
+		// retry refreshes), scoped to this cycle by created_at > the anchor's park-start.
+		switchedTo := n.credentialSwitchLabelSince(ctx, rc.ID, anchor.LimitPausedAt)
 		// anchor.ParkKind records which park set this marker (PRD #1190). NULL/empty on a
 		// legacy row written before the column existed reads as a usage-limit park, keeping
 		// the exact #1116 wording.
-		blocks, fallback := resumeThreadBlocks(rc, waited, hasWait, base, anchor.ParkKind.String)
+		blocks, fallback := resumeThreadBlocks(rc, waited, hasWait, base, anchor.ParkKind.String, switchedTo)
 		if _, perr := n.poster.PostBlocks(ctx, anchor.ChannelID, anchor.RootTs, fallback, blocks); perr != nil {
 			n.logf("post resume", perr)
 			return // leave the marker set; the next running report retries
@@ -217,7 +223,11 @@ const maxPlausibleWait = 8 * 24 * time.Hour
 // (parkKind "limit_wait" OR empty/NULL on a legacy row) keeps the exact #1116
 // "▶️ *Resumed · usage limit cleared*" wording — the detail line (waited/working) is accurate
 // for both and is unchanged.
-func resumeThreadBlocks(rc store.GetSlackRunContextRow, waited time.Duration, hasWait bool, base, parkKind string) (blocks []slack.Block, fallback string) {
+//
+// switchedTo (PRD #1247 M9, D14) is the label of a token switched to DURING this park cycle, or
+// "" for none. When set it appends a "· now on <label>" fragment to the detail line — escaped and
+// scrubbed like every other untrusted field — so a run that resumed on a different account says so.
+func resumeThreadBlocks(rc store.GetSlackRunContextRow, waited time.Duration, hasWait bool, base, parkKind, switchedTo string) (blocks []slack.Block, fallback string) {
 	repo := ScrubSecrets(EscapeMrkdwn(rc.PathWithNamespace))
 	header := "▶️ *Resumed · usage limit cleared*"
 	if parkKind == "paused" {
@@ -241,6 +251,14 @@ func resumeThreadBlocks(rc store.GetSlackRunContextRow, waited time.Duration, ha
 		}
 		detail.WriteString("working " + EscapeMrkdwn(title))
 	}
+	if switchedTo != "" {
+		if detail.Len() > 0 {
+			detail.WriteString(" · ")
+		}
+		// The label is untrusted user text — escaped here and scrubbed again with the whole
+		// detail string below (ScrubSecrets), so no raw label reaches Slack mrkdwn.
+		detail.WriteString("now on " + EscapeMrkdwn(switchedTo))
+	}
 
 	var ctxElems []slack.MixedElement
 	if detail.Len() > 0 {
@@ -253,6 +271,35 @@ func resumeThreadBlocks(rc store.GetSlackRunContextRow, waited time.Duration, ha
 		blocks = append(blocks, slack.NewContextBlock("slack_thread_resume_ctx", ctxElems...))
 	}
 	return blocks, fmt.Sprintf("Resumed · %s#%d", repo, iid(rc.IssueIid))
+}
+
+// credentialSwitchLabelSince returns the token label of a credential switch APPLIED during this
+// park cycle, or "" for none (PRD #1247 M9, D14). The evidence is the newest 'credential_switch'
+// run message minted after @since (the park-cycle anchor = the run's status_since at park). It is
+// durable and immutable, so a later same-generation epoch re-record cannot re-attribute — the
+// message's created_at, not run_credential_epochs.applied_at, anchors the cycle. Best-effort: no
+// row (pgx.ErrNoRows) or a malformed payload yields "" (the DM is simply unchanged); a real query
+// error is logged (redacted) and dropped, never affecting the run. A null/absent label in the
+// payload also yields "" — an unlabelled token adds no "now on" line rather than an empty one.
+func (n *Notifier) credentialSwitchLabelSince(ctx context.Context, runID uuid.UUID, since pgtype.Timestamptz) string {
+	payload, err := n.store.GetLatestCredentialSwitchSince(ctx, store.GetLatestCredentialSwitchSinceParams{RunID: runID, Since: since})
+	if err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			n.logf("credential switch label", err)
+		}
+		return ""
+	}
+	var p struct {
+		Label *string `json:"label"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		n.logf("parse credential switch payload", err)
+		return ""
+	}
+	if p.Label == nil {
+		return ""
+	}
+	return strings.TrimSpace(*p.Label)
 }
 
 // humanWait renders a park duration compactly: "<1m", "45m", "2h 13m", "3d 2h".

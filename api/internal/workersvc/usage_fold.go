@@ -474,6 +474,17 @@ func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uu
 	if insertErr != nil {
 		return obs, insertErr
 	}
+	// PRD #1247 M9 (D7): stamp the per-call fenced generation onto every frame before folding, so
+	// each leg is attributed to the epoch it was produced under (the join
+	// run_usage.claim_generation -> run_credential_epochs). All frames in ONE appendMessages call
+	// share the ONE fenced generation this batch stamped — uniform per-call assignment is correct
+	// (the fence already guaranteed they belong to this claim, or the batch would have been
+	// rejected above). effectiveClaimGen is nil for a legacy worker or a chat run, folding NULL
+	// provenance exactly as before. The stamp is on the fold input only; InsertRunMessage above
+	// persisted the SAME generation onto each row's own column independently.
+	for i := range msgs {
+		msgs[i].ClaimGeneration = effectiveClaimGen
+	}
 	// Fold every DELIVERED result frame's usage into run_usage (PRD #40 Decision 2)
 	// — over `msgs`, NOT `inserted`: a seq-deduped re-delivery (crash retry) must
 	// still re-run the fold, which is exactly what makes at-least-once delivery plus
@@ -616,6 +627,12 @@ func foldUsageFrames(ctx context.Context, q usageFoldQuerier, run store.Run, fra
 				CostUsd:             costUSD,
 				Harness:             run.Harness,
 				CostStatus:          costStatus,
+				// PRD #1247 M9 (D7): attribute this leg to the epoch the FRAME was produced under
+				// (the incremental path stamps effectiveClaimGen onto every frame; the refold reads
+				// each frame's persisted run_messages.claim_generation). COALESCE in UpsertRunUsage
+				// keeps an established non-null provenance, so a straggler re-delivery never
+				// re-attributes an already-attributed leg. nil ⇒ NULL provenance (legacy frame).
+				ClaimGeneration: pgconv.Int8Ptr(m.ClaimGeneration),
 			}); err != nil {
 				return fmt.Errorf("fold run usage (run %s, model %s): %w", run.ID, model, err)
 			}
