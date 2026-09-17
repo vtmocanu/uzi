@@ -55,31 +55,45 @@ export function bothHarnessesUsable(claudeUsable: boolean, codexUsable: boolean)
   return claudeUsable && codexUsable;
 }
 
-// effectiveHarnessIsCodex is the show/hide gate for the Anthropic TOKEN controls (PRD
-// #1429 M4a review fix): gating on the raw picker `selection` alone is a UX trap. A
-// Codex-only user never sees the harness picker at all (bothHarnessesUsable is false),
-// so `selection` stays "inherit" even though the run WILL resolve to Codex under D11 —
-// and an Anthropic token/credential-switch control left visible for that user 422s the
-// moment it is used (D5: a Codex run cannot carry an Anthropic override). Gate on the
-// EFFECTIVE harness instead:
+// effectiveHarnessIsCodex is the show/hide gate for the Anthropic TOKEN controls, on a
+// run/schedule that does NOT exist yet (PRD #1429 M4a review Fix 1/Fix 2): gating on the
+// raw picker `selection` alone is a UX trap. A Codex-only user never sees the harness
+// picker at all (bothHarnessesUsable is false), so `selection` stays "inherit" even
+// though the run WILL resolve to Codex under D11 — and an Anthropic token/credential
+// override control left visible for that user 422s the moment it is used (D5: a Codex
+// run cannot carry an Anthropic override). Gate on the EFFECTIVE harness instead, which
+// mirrors resolveHarness's (harness_resolver.go) explicit → usable-default → availability
+// order exactly:
 //
 //   - an explicit "codex" pick is authoritative regardless of usability facts;
 //   - an explicit "claude" pick is likewise authoritative (never hidden);
-//   - "inherit" resolves to Codex only when Codex is the SOLE usable harness (the
-//     picker being hidden is exactly what makes this case reachable) — mirrors D11
-//     rule 3, NOT rule 4 (both usable + no default ⇒ Claude, so inherit is Claude-ish
-//     there and the token control stays visible).
+//   - "inherit" first checks the caller's usable default_harness (D11 rule 2): a
+//     usable Codex default resolves to Codex even when Claude is ALSO usable (the
+//     picker showing does not mean inherit resolves to Claude); a usable Claude
+//     default resolves to Claude even when Codex is also usable;
+//   - otherwise "inherit" falls through to availability — Codex only when it is the
+//     SOLE usable harness (D11 rule 3); both-usable-with-no-usable-default and
+//     sole-Claude both resolve to Claude (D11 rules 3/4).
 //
-// Used by every start-dialog Anthropic TokenPicker (IssueView, Board/IssueCard,
-// ScheduleModal) and by the actual-harness checks for an in-flight run (RunView,
-// PlanPanel, the "Switch token" action), which pass the run's real harness with
-// selection="codex"/"claude" (never "inherit" — an actual run's harness is never
-// unresolved) so this same helper decides both cases uniformly.
+// Used by every NOT-YET-CREATED start-dialog Anthropic TokenPicker gate (IssueView's
+// start dialog, Board/IssueCard's per-card picker, ScheduleModal's per-schedule picker),
+// each passing the caller's own usable default_harness (a user's for the two start
+// sites, a schedule's owner's for ScheduleModal) alongside the picker's live selection.
+// The EXISTING-run sites (RunView, PlanPanel, the "Switch token" action) do NOT call
+// this helper — a run's harness is already frozen at creation, so they gate on the
+// run's own actual `run.harness === "codex"` directly, with no resolver to mirror.
 export function effectiveHarnessIsCodex(
   selection: HarnessSelection,
   claudeUsable: boolean,
   codexUsable: boolean,
+  defaultHarness: Harness | null = null,
 ): boolean {
   if (selection !== "inherit") return selection === "codex";
+  // Mirrors resolveHarness's rung 2: a USABLE user/schedule-owner default wins over
+  // plain availability, in either direction — this is what a both-usable user's Codex
+  // default (M4a's Run Defaults card) makes reachable on an untouched "inherit" pick.
+  if (defaultHarness === "codex" && codexUsable) return true;
+  if (defaultHarness === "claude" && claudeUsable) return false;
+  // Rungs 3-4: no usable default (or none set) falls through to availability alone.
   return codexUsable && !claudeUsable;
 }

@@ -1,5 +1,5 @@
 import { Link } from "react-router-dom";
-import { isHttpsUrl, preferForgeUrl, type Card as CardData, type SecretMeta } from "../../lib/api";
+import { isHttpsUrl, preferForgeUrl, type Card as CardData, type Harness, type SecretMeta } from "../../lib/api";
 import type { StartRunGate } from "../../lib/runStream";
 import { INHERIT_SELECTION, type CredentialSelection } from "../../lib/credentialOverride";
 import { effectiveHarnessIsCodex, INHERIT_HARNESS, type HarnessSelection } from "../../lib/harnessSelection";
@@ -86,6 +86,7 @@ export function IssueCard({
   onHarnessChange,
   claudeUsable = true,
   codexUsable = false,
+  defaultHarness = null,
   fixCiBusy,
   onFixCi,
   uziLabel,
@@ -164,6 +165,11 @@ export function IssueCard({
   // is explicitly codex" behavior byte-identical.
   claudeUsable?: boolean;
   codexUsable?: boolean;
+  // Fix 1 (M4a review follow-up): the viewer's own default_harness, threaded into the
+  // same effectiveHarnessIsCodex call so a both-usable viewer with a usable Codex/Claude
+  // default (D11 rule 2) gets the same hide/show as IssueView's start dialog. Defaults to
+  // null (no preference) so every pre-existing direct-render test keeps its old behavior.
+  defaultHarness?: Harness | null;
   fixCiBusy: boolean;
   onFixCi: () => void;
   // PRD #764. isEligible drives the treatment and the affordances: a card carrying the
@@ -552,7 +558,7 @@ export function IssueCard({
                 Codex-only card whose picker is hidden but WILL resolve to Codex implicitly
                 — a Codex run never spends an Anthropic credential, so the picker would be
                 noise (and using it would 422). */}
-            {onCredentialChange && !effectiveHarnessIsCodex(harness, claudeUsable, codexUsable) && (
+            {onCredentialChange && !effectiveHarnessIsCodex(harness, claudeUsable, codexUsable, defaultHarness) && (
               <TokenPicker
                 label={`Anthropic token for #${card.iid}`}
                 className="h-8 w-full text-xs"

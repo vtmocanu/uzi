@@ -31,6 +31,8 @@ vi.mock("../lib/api", async (importOriginal) => {
       ensureRepoLabels: vi.fn(),
       // PRD #1247 M7: the modal's TokenPicker seed loads the user's tokens.
       listSecrets: vi.fn(),
+      // PRD #1429 M4a review Fix 1: the owner's default_harness edit-time hint.
+      getMySettings: vi.fn(),
     },
   };
 });
@@ -57,6 +59,21 @@ beforeEach(() => {
   mockApi.checkRepoLabels.mockResolvedValue({ missing: [] });
   mockApi.ensureRepoLabels.mockResolvedValue({ ensured: [] });
   mockApi.listSecrets.mockResolvedValue({ secrets: [] });
+  // PRD #1429 M4a review Fix 1: no owner default_harness preference by default.
+  mockApi.getMySettings.mockResolvedValue({
+    settings: {
+      default_harness: null,
+      default_model: null,
+      default_effort: null,
+      judge_model: null,
+      summary_model: null,
+      appearance_mode: null,
+      light_theme: null,
+      dark_theme: null,
+      typeface: null,
+      theme: null,
+    },
+  });
 });
 afterEach(() => {
   cleanup();

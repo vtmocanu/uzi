@@ -4,6 +4,7 @@
 import { describe, expect, it } from "vitest";
 import {
   bothHarnessesUsable,
+  effectiveHarnessIsCodex,
   runHarnessBody,
   scheduleHarnessPatch,
   selectionFromHarness,
@@ -50,5 +51,49 @@ describe("bothHarnessesUsable", () => {
     expect(bothHarnessesUsable(true, false)).toBe(false);
     expect(bothHarnessesUsable(false, true)).toBe(false);
     expect(bothHarnessesUsable(false, false)).toBe(false);
+  });
+});
+
+describe("effectiveHarnessIsCodex", () => {
+  it("an explicit pick is authoritative regardless of usability facts", () => {
+    expect(effectiveHarnessIsCodex("codex", true, true)).toBe(true);
+    expect(effectiveHarnessIsCodex("codex", false, false)).toBe(true);
+    expect(effectiveHarnessIsCodex("claude", true, true)).toBe(false);
+    expect(effectiveHarnessIsCodex("claude", false, false)).toBe(false);
+  });
+
+  it("inherit with no default resolves Codex only when it is the SOLE usable harness", () => {
+    expect(effectiveHarnessIsCodex("inherit", false, true)).toBe(true);
+    expect(effectiveHarnessIsCodex("inherit", true, false)).toBe(false);
+    // Both usable, no default ⇒ Claude (D11 rule 4) — the token control stays visible.
+    expect(effectiveHarnessIsCodex("inherit", true, true)).toBe(false);
+  });
+
+  // PRD #1429 M4a review Fix 1 (D11 rule 2): a USABLE user default wins over plain
+  // availability on an untouched "inherit" pick, in either direction.
+  it("inherit with a usable Codex default resolves to Codex even when both are usable", () => {
+    expect(effectiveHarnessIsCodex("inherit", true, true, "codex")).toBe(true);
+  });
+
+  it("inherit with a usable Claude default resolves to Claude even when both are usable", () => {
+    expect(effectiveHarnessIsCodex("inherit", true, true, "claude")).toBe(false);
+  });
+
+  it("a Codex default that is NOT usable falls through to plain availability", () => {
+    // Codex unusable ⇒ the default is skipped (resolveHarness's fall-through), so a
+    // Claude-only user still reads Claude despite the stale Codex default.
+    expect(effectiveHarnessIsCodex("inherit", true, false, "codex")).toBe(false);
+    // Sole-Codex-usable still resolves Codex via availability, default aside.
+    expect(effectiveHarnessIsCodex("inherit", false, true, "codex")).toBe(true);
+  });
+
+  it("a Claude default that is NOT usable falls through to plain availability", () => {
+    expect(effectiveHarnessIsCodex("inherit", false, true, "claude")).toBe(true);
+  });
+
+  it("no default (null) behaves exactly as omitting the parameter", () => {
+    expect(effectiveHarnessIsCodex("inherit", true, true, null)).toBe(
+      effectiveHarnessIsCodex("inherit", true, true),
+    );
   });
 });

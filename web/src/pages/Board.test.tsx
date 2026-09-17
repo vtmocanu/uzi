@@ -25,12 +25,36 @@ vi.mock("../lib/api", async (importOriginal) => {
       promoteIssue: vi.fn(),
       syncRepo: vi.fn(),
       configureColumns: vi.fn(),
+      // PRD #1429 M4a review Fix 1: the board's loadPreconditions fetches the viewer's
+      // default_harness alongside listWorkers/listSecrets/listRuns.
+      getMySettings: vi.fn(),
     },
   };
 });
 vi.mock("../auth/AuthContext", () => ({ useAuth: vi.fn() }));
 
 const mockApi = vi.mocked(api);
+
+// A sane default so every test that mounts the full Board (loadPreconditions calls
+// api.getMySettings() unconditionally) does not have to opt in explicitly — mirrors
+// the per-describe listWorkers/listSecrets defaults already scattered through this
+// file, but set ONCE here since every one of them needs it.
+beforeEach(() => {
+  mockApi.getMySettings.mockResolvedValue({
+    settings: {
+      default_harness: null,
+      default_model: null,
+      default_effort: null,
+      judge_model: null,
+      summary_model: null,
+      appearance_mode: null,
+      light_theme: null,
+      dark_theme: null,
+      typeface: null,
+      theme: null,
+    },
+  });
+});
 
 afterEach(() => {
   cleanup();
