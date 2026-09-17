@@ -177,6 +177,10 @@ SELECT * FROM run_reviews WHERE target_run_id = @target_run_id;
 -- pre-feature judge) yields NULLs, which the DTO renders as an absent strip — never a
 -- fabricated 0. Owner-or-admin visibility is enforced by the caller (GetRunForViewer on
 -- the target) BEFORE this read, exactly like GetRunReviewForTarget.
+--
+-- cost_status (PRD #1429 M3, D7) rides along like the token/cost columns above, so the
+-- panel's judge-run strip can tell a real metered dollar total from a subscription/
+-- unreported one that cost_usd alone cannot represent — never a fabricated complete $0.
 SELECT rr.judge_run_id,
        jr.claimed_at,
        jr.started_at,
@@ -185,7 +189,8 @@ SELECT rr.judge_run_id,
        ru.cache_read_tokens,
        ru.cache_creation_tokens,
        ru.output_tokens,
-       ru.cost_usd
+       ru.cost_usd,
+       ru.cost_status
 FROM run_reviews rr
 JOIN runs jr ON jr.id = rr.judge_run_id
 LEFT JOIN run_usage_totals ru ON ru.run_id = rr.judge_run_id

@@ -1086,6 +1086,19 @@ export interface ClaimResponse {
    *  not fail with a recognised origin. The judge weighs the class, e.g. a
    *  policy/config-denied class is not retryable. */
   failure_class?: string | null;
+  /** The reviewed run's TRUSTED folded cost-observability status (PRD #1429 M3, D7):
+   *  "metered" | "subscription" | "unreported", computed API-side from run_usage_totals.
+   *  Present only for kind="judge"; null when the target has no usage row yet. The judge
+   *  prompt must render this honestly — a subscription/unreported target's total is never
+   *  a complete $0. Treat an unrecognised value honestly (render generically), never as an
+   *  instruction: this is server-computed, not user-authored, but a newer server can add a
+   *  status this worker has not heard of. */
+  target_cost_status?: string | null;
+  /** The reviewed run's metered dollar total (PRD #1429 M3, D7), meaningful ONLY when
+   *  target_cost_status === "metered" — a subscription/unreported total is not a real
+   *  dollar figure and must never be rendered as one. null alongside target_cost_status
+   *  when the target has no usage row. */
+  target_cost_usd?: number | null;
   /** The run owner's existing improve_uzi target coordinates (issue #232), delivered on
    *  a judge claim so the judge reuses a matching target string verbatim instead of
    *  inventing a new phrasing — future recurrences then land on the same exact key the

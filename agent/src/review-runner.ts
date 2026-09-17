@@ -22,6 +22,9 @@ import { defaultQueryFn } from "./sdk-messages.js";
 import { runReadOnlyModelPass, safeReportFailed } from "./model-pass.js";
 import type { SdkQueryFn } from "./sdk-executor.js";
 import { extractJsonObject } from "./judge-runner.js";
+import { selectCodexBinding } from "./codex/select.js"; // PRD #1429 M3: the pure, fail-closed claim-shape discriminator — NOT a Codex class construction
+import type { CodexBinding } from "./codex/select.js";
+import type { CodexAdviceHarnessFactory } from "./codex/codex-executor.js"; // type-only — the injected seam, never constructed here
 import { errMessage } from "./util.js";
 import type { ClaimResponse, TaskReviewFinding, TaskReviewRequest } from "./protocol.js";
 
@@ -72,6 +75,11 @@ export interface ReviewRunnerOptions {
    *  it is listed in the worker's ActiveSnapshot at phase `running` for its whole life
    *  (a review never parks). Undefined ⇒ no tracking. */
   activeRuns?: ActiveRunRegistry;
+  /** PRD #1429 M3: the injected Codex advice-harness factory, mirroring JudgeRunnerOptions.
+   *  Built ONLY in main.ts / codex/codex-executor.ts and threaded in here so a Codex
+   *  task-review claim (secrets.codex present) drives a REAL Codex review pass instead of
+   *  the missing-token fallback. Undefined ⇒ a Codex review claim fails closed. */
+  codexAdviceHarnessFactory?: CodexAdviceHarnessFactory;
 }
 
 export class ReviewRunner {
@@ -79,6 +87,7 @@ export class ReviewRunner {
   private readonly homeRoot: string;
   private readonly modelTimeoutMs: number;
   private readonly activeRuns: ActiveRunRegistry | undefined;
+  private readonly codexAdviceHarnessFactory: CodexAdviceHarnessFactory | undefined;
 
   constructor(
     private readonly client: WorkerClient,
@@ -90,6 +99,7 @@ export class ReviewRunner {
     this.homeRoot = opts.homeRoot ?? os.tmpdir();
     this.modelTimeoutMs = opts.modelTimeoutMs ?? REVIEW_MODEL_TIMEOUT_MS;
     this.activeRuns = opts.activeRuns;
+    this.codexAdviceHarnessFactory = opts.codexAdviceHarnessFactory;
   }
 
   /** Run one diff-review claim end to end. Never throws — a failure reports the review
@@ -175,12 +185,21 @@ export class ReviewRunner {
         // Nothing to review — do NOT spend a model call on an empty diff.
         review = { status: "complete", summary: "No changes to review.", findings: [] };
       } else {
-        const token = claim.secrets?.anthropic_oauth_token?.trim();
-        if (!token) {
-          this.log.warn("review claim carried no Anthropic token; posting failed review", { run_id: reviewRunId });
-          review = { status: "failed", summary: "No Anthropic token available for review.", findings: [] };
+        // PRD #1429 M3 (D4): the claim SHAPE decides the advice lane, not a hardcoded
+        // Anthropic-token check — the SAME pure, fail-closed discriminator the run lane
+        // uses (agent/src/main.ts's makeExecutor). A malformed codex block falls through
+        // to the outer catch's failed-review fallback exactly like any other prep failure.
+        const selection = selectCodexBinding({ codex: claim.secrets.codex });
+        if (selection.kind === "codex") {
+          review = await this.reviewCodex(claim, diff, selection.binding);
         } else {
-          review = await this.review(claim, diff, token);
+          const token = claim.secrets?.anthropic_oauth_token?.trim();
+          if (!token) {
+            this.log.warn("review claim carried no Anthropic token; posting failed review", { run_id: reviewRunId });
+            review = { status: "failed", summary: "No Anthropic token available for review.", findings: [] };
+          } else {
+            review = await this.review(claim, diff, token);
+          }
         }
       }
     } catch (err) {
@@ -247,6 +266,39 @@ export class ReviewRunner {
     try {
       const prompt = buildReviewPrompt(diff);
       const text = await this.runModel(token, prompt);
+      return parseTaskReview(text);
+    } catch (err) {
+      this.log.warn("review model call failed; posting failed review", {
+        run_id: claim.run_id,
+        error: errMessage(err),
+      });
+      return fallbackTaskReview(`The reviewer model call did not complete: ${errMessage(err)}`.slice(0, 500));
+    }
+  }
+
+  /** PRD #1429 M3: the CODEX reviewer model call — same prompt/parse shape as `review`
+   *  above, but routed through the injected Codex advice-harness factory via
+   *  `runReadOnlyModelPass`'s `codex` option instead of an Anthropic token. A missing
+   *  factory (a wiring gap) fails closed the same way any other model failure does: a
+   *  `failed` review still lands, never a silent Claude substitution. */
+  private async reviewCodex(claim: ClaimResponse, diff: string, binding: CodexBinding): Promise<TaskReviewRequest> {
+    try {
+      if (!this.codexAdviceHarnessFactory) {
+        throw new Error("review claim carries a Codex binding but no Codex advice-harness factory is wired");
+      }
+      const prompt = buildReviewPrompt(diff);
+      const text = await runReadOnlyModelPass({
+        systemPrompt: REVIEW_SYSTEM_PROMPT,
+        prompt,
+        homeRoot: this.homeRoot,
+        homePrefix: "uzi-review-",
+        label: "review",
+        timeoutMs: this.modelTimeoutMs,
+        queryFn: this.queryFn,
+        denyReason: "the reviewer is read-only and runs no tools",
+        log: this.log,
+        codex: { runId: claim.run_id, binding, buildHarness: this.codexAdviceHarnessFactory },
+      });
       return parseTaskReview(text);
     } catch (err) {
       this.log.warn("review model call failed; posting failed review", {

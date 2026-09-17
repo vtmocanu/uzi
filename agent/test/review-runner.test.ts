@@ -354,6 +354,55 @@ describe("ReviewRunner", () => {
     assert.equal(calls.states.at(-1)?.body.status, "completed", "the review run still completes");
   });
 
+  // PRD #1429 M3: a Codex review claim (secrets.codex present, NO anthropic_oauth_token)
+  // must drive the INJECTED Codex advice-harness factory to a REAL review, never the
+  // missing-token failed-review fallback the test above pins for the genuinely
+  // credential-less Claude case.
+  it("a Codex review claim (secrets.codex present, no anthropic token) drives the injected Codex advice harness, not the missing-token fallback", async () => {
+    const { client, calls } = fakeClient();
+    const { git } = fakeGit("diff --git a/poller.ts b/poller.ts\n@@ -1 +1 @@\n-old\n+new\n");
+    let harnessBuilt: { runId: string; binding: unknown } | undefined;
+    let harnessRan = false;
+    const codexModelJson = JSON.stringify({ summary: "codex review", findings: [] });
+    const fakeHarness = {
+      kind: "codex" as const,
+      run: async () => {
+        harnessRan = true;
+        return { text: codexModelJson, end: { kind: "terminal", terminal: { outcome: "success" } } };
+      },
+    };
+    const codexAdviceHarnessFactory = (async (params: { runId: string; binding: unknown }) => {
+      harnessBuilt = params;
+      return fakeHarness;
+    }) as never;
+    const runner = new ReviewRunner(client, git, nullLogger(), { queryFn: forbiddenQueryFn(), codexAdviceHarnessFactory });
+    const codexSecrets = { auth_mode: "api_key", access_token: "codex-tok", capability: "cap-1" };
+    await runner.execute(reviewClaim({ secrets: { forge_pat: "pat", codex: codexSecrets } as never }));
+
+    assert.equal(harnessBuilt?.runId, "review-1", "the factory must be built for THIS review run");
+    assert.deepEqual(harnessBuilt?.binding, { authMode: "api_key", accessToken: "codex-tok", capability: "cap-1" });
+    assert.equal(harnessRan, true, "the Codex advice harness's run() must actually execute");
+    assert.equal(calls.review?.review.status, "complete", "a real Codex advice result must post, not the missing-token failed review");
+    assert.equal(calls.review?.review.summary, "codex review");
+  });
+
+  // PRD #1429 M3: the control — an ordinary Claude claim (no codex block) must never touch
+  // the injected Codex advice-harness factory, even when one is wired.
+  it("a Claude review claim never touches the injected Codex advice-harness factory", async () => {
+    const { client, calls } = fakeClient();
+    const { git } = fakeGit("diff --git a/poller.ts b/poller.ts\n@@ -1 +1 @@\n-old\n+new\n");
+    let factoryCalled = false;
+    const codexAdviceHarnessFactory = (async () => {
+      factoryCalled = true;
+      throw new Error("must not be called for a Claude claim");
+    }) as never;
+    const runner = new ReviewRunner(client, git, nullLogger(), { queryFn: replyingQueryFn(goodModelJson), codexAdviceHarnessFactory });
+    await runner.execute(reviewClaim()); // default secrets: anthropic_oauth_token set, no codex block
+
+    assert.equal(factoryCalled, false, "a Claude claim must never build a Codex advice harness");
+    assert.equal(calls.review?.review.status, "complete");
+  });
+
   it("falls back to status failed and still completes on a malformed model response", async () => {
     const { client, calls } = fakeClient();
     const { git } = fakeGit("diff --git a/x b/x\n+one\n");
