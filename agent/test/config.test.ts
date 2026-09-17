@@ -236,3 +236,40 @@ describe("loadConfig spill knobs (PRD #1391 M2)", () => {
     }
   });
 });
+
+// PRD #1391 M3 (Run B): the terminal-journal knobs. These pin the VALUES so a wrong
+// multiplier — the cap in MB-not-MiB, or the reserve count as bytes — fails here.
+describe("loadConfig terminal-journal knobs (PRD #1391 M3)", () => {
+  it("applies the documented defaults", () => {
+    const c = loadConfig(baseEnv());
+    assert.strictEqual(c.outboxTerminalMaxBytes, Math.round(1.25 * 1024 * 1024), "1.25 MiB rounded to a whole byte");
+    assert.strictEqual(c.outboxTerminalMaxBytes, 1_310_720, "1.25 MiB is exactly 1_310_720 bytes");
+    assert.strictEqual(c.outboxReserveTerminals, 4, "four hard-max journals fit the reserve by default");
+    assert.strictEqual(c.gapFillMax, 10000, "the gap fill is bounded at 10,000 seqs");
+  });
+
+  it("honors the env overrides", () => {
+    const c = loadConfig(
+      baseEnv({
+        WORKER_OUTBOX_TERMINAL_MAX_BYTES: "2097152",
+        WORKER_OUTBOX_RESERVE_TERMINALS: "6",
+        WORKER_GAP_FILL_MAX: "500",
+      }),
+    );
+    assert.strictEqual(c.outboxTerminalMaxBytes, 2_097_152);
+    assert.strictEqual(c.outboxReserveTerminals, 6);
+    assert.strictEqual(c.gapFillMax, 500);
+  });
+
+  it("falls back to the defaults on a blank, zero, negative, or non-integer value", () => {
+    for (const v of ["  ", "0", "-1", "1.5"]) {
+      assert.strictEqual(
+        loadConfig(baseEnv({ WORKER_OUTBOX_TERMINAL_MAX_BYTES: v })).outboxTerminalMaxBytes,
+        Math.round(1.25 * 1024 * 1024),
+        `terminal cap ${JSON.stringify(v)} falls back`,
+      );
+      assert.strictEqual(loadConfig(baseEnv({ WORKER_OUTBOX_RESERVE_TERMINALS: v })).outboxReserveTerminals, 4);
+      assert.strictEqual(loadConfig(baseEnv({ WORKER_GAP_FILL_MAX: v })).gapFillMax, 10000);
+    }
+  });
+});

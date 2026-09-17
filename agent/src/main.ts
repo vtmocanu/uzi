@@ -11,7 +11,7 @@ import { ChatExecutor, type ChatExecutorLike } from "./chat-executor.js";
 import { StubChatExecutor } from "./chat-executor-stub.js";
 import { RunRunner, type ExecutorFactory } from "./runner.js";
 import { ChatRunner } from "./chat-runner.js";
-import { Outbox } from "./outbox.js";
+import { Outbox, deriveTerminalReserveBytes } from "./outbox.js";
 import { ActiveRunRegistry } from "./active-run-registry.js";
 import { JudgeRunner } from "./judge-runner.js";
 import { ReviewRunner } from "./review-runner.js";
@@ -125,6 +125,10 @@ async function main(): Promise<void> {
     runMaxBytes: config.outboxRunMaxBytes,
     maxBytes: config.outboxMaxBytes,
     retentionMs: config.outboxRetentionMs,
+    // PRD #1391 M3 (Run B, D2): size the physical `.reserve` for the terminal journals, derived from
+    // ONE source — the per-record cap times how many hard-max journals must survive a full volume,
+    // plus a per-record overhead. init() grows a deployed Run A worker's 64 KiB reserve up to this.
+    reserveBytes: deriveTerminalReserveBytes(config.outboxReserveTerminals, config.outboxTerminalMaxBytes),
   });
   await outbox.init();
   const rearm = new Map<string, () => void>();
