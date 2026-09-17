@@ -1207,6 +1207,11 @@ export interface ImplementPromptInput {
    *  baseCommit — later turns resume a session that already read it. Drives publishedTipNote.
    *  Absent (fresh issue branch) ⇒ no note. See publishedTipNote. */
   publishedTip?: string;
+  /** #1416 (MR-rework): this run auto-approves its own plan, so — like the plan builders —
+   *  the published-tip note's rewrite guidance must NOT tell the agent to call `ask_user`
+   *  (there is no human to answer). Drives publishedTipNote's autopilot-safe branch. Absent/
+   *  false ⇒ the `ask_user` wording, unchanged. */
+  autoApprove?: boolean;
   /** PRD #209 (D7): prior pushed work on this branch, for a SEEDED cold-start implement.
    *  A requeued seeded run whose transcript was dropped never saw a plan turn, so the
    *  amnesiac note an ordinary run got in its plan prompt must ride the implement prompt
@@ -1319,7 +1324,7 @@ export function buildImplementPrompt(input: ImplementPromptInput): string {
   // PRD #1416 M1: name the published floor P, first turn only — like baseNote, later turns
   // resume a session that already read it. Empty on a fresh branch ⇒ nothing added.
   const publishedNote = input.first
-    ? publishedTipNote(input.publishedTip, input.defaultBranchCommit)
+    ? publishedTipNote(input.publishedTip, input.defaultBranchCommit, input.autoApprove)
     : "";
   if (publishedNote) lines.push("", publishedNote);
   // PRD #122 M6: name the approved milestones and their live status EVERY turn (not

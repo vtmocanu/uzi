@@ -2191,6 +2191,10 @@ export class SdkExecutor implements Executor {
             // PRD #1416 M1: name the published floor P, first turn only (gated inside
             // buildImplementPrompt). Absent ⇒ no note.
             publishedTip: ctx.publishedTip,
+            // #1416 (MR-rework): under auto-approve the published-tip note's rewrite guidance
+            // must not tell the agent to call `ask_user` (no human answers it), matching the
+            // plan builders above.
+            autoApprove: ctx.autoApprove,
             // PRD #1416 M2: the worker-authoritative safety steer drained above, EVERY turn it is
             // present (drained fresh each turn, not first-turn-only). Rendered as worker guidance
             // ahead of any <follow_up> block. Absent ⇒ no block.

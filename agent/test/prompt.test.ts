@@ -901,6 +901,25 @@ describe("buildImplementPrompt", () => {
     assert.match(plainResume, /did not survive that rebuild/i, "the reseed note still renders on a non-WIP resume");
     assert.strictEqual(plainResume, wipFalse, "wipRecovered:false must change nothing");
   });
+
+  it("threads autoApprove into the first-turn published-tip note (autopilot-safe rewrite guidance)", () => {
+    // #1416 (MR-rework): the published-tip note renders on the first implement turn too, so under
+    // auto-approve its rewrite guidance must not tell the agent to call `ask_user` — mirroring the
+    // plan builders. Without the threading `auto` would keep the `ask_user` line.
+    const P = "a".repeat(40);
+    const base = {
+      branch: "agent/issue-7",
+      subagentNames: ["coder"],
+      first: true,
+      iteration: 1,
+      publishedTip: P,
+    };
+    const auto = buildImplementPrompt({ ...base, autoApprove: true });
+    const manual = buildImplementPrompt({ ...base, autoApprove: false });
+    assert.match(auto, /state the constraint plainly in the plan/, "autopilot form gives plan-only guidance");
+    assert.doesNotMatch(auto, /stop and call `ask_user`/, "autopilot form does not tell the agent to call ask_user");
+    assert.match(manual, /stop and call `ask_user`/, "the default implement form keeps the ask_user rewrite guidance");
+  });
 });
 
 describe("buildImplementPrompt — milestone note (PRD #122 M6)", () => {
