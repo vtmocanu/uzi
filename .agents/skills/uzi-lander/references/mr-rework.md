@@ -1,8 +1,9 @@
 # uzi may fix the CodeRabbit findings ITSELF (mr_rework) — coordinate, don't collide
 
-This is the full runbook split out of `SKILL.md` (which carries a short pointer stub under
-the same heading). Paths like `scripts/...` and `resume-recipe.md` are relative to this
-skill directory (`.agents/skills/uzi-watcher/`), unchanged by the split.
+The full runbook behind the *defer to mr_rework* rule in `SKILL.md`. Paths like
+`scripts/...` are relative to this skill directory (`.agents/skills/uzi-lander/`). To START
+a rework deliberately (a big finding set), use `uzi run rework RUN -m '…'` — see
+`coderabbit-triage.md`, *Rework on demand*; the waiting and reviewing below apply the same.
 
 **Before you fix a finding locally or merge, check whether uzi is already reworking the
 MR.** The **MR review-watcher** (`mr_rework`, `docs/mr-review-watcher.md`) is **on by
@@ -120,19 +121,18 @@ by anything on the PR itself.
 4. **When it pushed a commit, that push retriggers CodeRabbit.** Wait for the re-review on
    the **new head** (signal (c), the walkthrough `final_review_risk` block's `up to
    <short-sha>` marker covering the new SHA — the `recent_review` range is a retired
-   format; see the *Triaging CodeRabbit findings* runbook in `coderabbit-triage.md`
-   (this skill dir)),
+   format; see `coderabbit-triage.md` and `review-signals.md`, this dir),
    confirm no active `mr_rework` remains and CI is green on that head, THEN merge.
 
    **`scripts/watch-pr.sh OWNER/REPO PR [interval] [max]` runs this whole readiness poll**
    so you do not hand-roll it each time: it exits **0** merge-ready (CI green on the head,
-   CodeRabbit reviewed that exact head with zero live inline findings, no active
-   `mr_rework`), **1** on red CI, **3** when CodeRabbit reviewed the head but left live
-   findings to triage, **4** when an `mr_rework` run is active on the MR (defer, then re-run
-   it), and **2** on timeout — where **exit 0 is trustworthy but exit 2 means inspect
-   manually, never merge**. "Reviewed this head" is the union of a review whose `commit_id`
-   is the head SHA and the walkthrough `final_review_risk` block's `up to` short-sha
-   matching it, because a zero-actionable incremental posts no new review object.
+   the required reviewer(s) reviewed that exact head with zero live inline findings, no
+   active `mr_rework`), **1** on red CI, **3** on live findings (CodeRabbit's and
+   Greptile's), **4** when an `mr_rework` run is active on the MR (defer, then re-run it),
+   **5** when CodeRabbit is rate-limited on the head, **6** when no reviewer will come on
+   its own (skipped or absent past the grace), and **2** on timeout — where **exit 0 is
+   trustworthy but exit 2 means inspect manually, never merge**. The head signals per bot
+   are in `review-signals.md`.
 
 **When this session still fixes locally (mr_rework will not or cannot):**
 - the owner is **opted out**, or the admin **kill-switch** is engaged
@@ -146,7 +146,7 @@ by anything on the PR itself.
   branch-derivation bug, fixed in 0.68.0); on an older server every rework fails this way
   and the old self-fix flow is the only path.
 
-This is the **first** fork of *Reviewing the diff* (the section in `SKILL.md`) and
-*Triaging CodeRabbit findings* (the runbook in `coderabbit-triage.md`, this skill dir):
-read those for how to verify and label a finding, but decide **who fixes** it here first.
+This is the **first** fork of the findings step in `SKILL.md` and of `coderabbit-triage.md`
+(this dir): read those for how to verify and label a finding, but decide **who fixes** it
+here first.
 
