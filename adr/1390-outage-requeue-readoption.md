@@ -67,7 +67,7 @@ provenance.
 
 The worker reports `{snapshot_epoch, active: [{run_id, claim_generation, phase,
 terminal_pending}], pending_overflow}`. The api stores the latest per worker in
-`worker_active_runs` (migration `00235_worker_active_runs_snapshot.sql`), keyed
+`worker_active_runs` (migration `00236_worker_active_runs_snapshot.sql`), keyed
 `(worker_id, run_id)`, carrying `claim_generation`, `phase`, the lease
 (`terminal_pending`, `terminal_pending_until`), `snapshot_epoch` and `reported_at`. The
 shape is forced by four requirements a lighter design cannot meet at once:

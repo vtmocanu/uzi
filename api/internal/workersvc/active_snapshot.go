@@ -51,7 +51,7 @@ type ActiveRunEntry struct {
 
 // snapshotPhases is the closed set an ActiveRunEntry.Phase must belong to — the run lane's four
 // live phases (judge/review attempts are listed as 'running'). Mirrors the CHECK constraint on
-// worker_active_runs.phase (migration 00235).
+// worker_active_runs.phase (migration 00236).
 var snapshotPhases = map[string]bool{
 	"running":           true,
 	"awaiting_approval": true,
