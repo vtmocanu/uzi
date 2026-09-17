@@ -26,11 +26,19 @@ Below, `RUN` is a run id, `PR` a PR number, `S` this skill's `scripts/` director
   appends and prints `#1428: run completed → pr opened → ci green → cr rate-limited(57m) →
   waiting → cr clean → rebase+renumber → pushed → admin-merged 3f2a… → main ci green`.
   Use its vocabulary (header of the script). Say more only for a decision or a blocker.
+- **Full autonomy is the default.** Wait for the bots, fix small findings locally, trigger
+  a rework for big ones, rebase and renumber when needed, merge when ready, watch `main`:
+  none of it waits for an answer. The user steers by replying to a trail line or by saying
+  up front what they want held; you report decisions, you do not request them. Two things
+  still stop: a finding whose fix would change behaviour the plan or PRD specifies (a
+  product decision, not a review fix), and anything irreversible outside the PR branch.
+  Report those and keep going on the rest.
 - **Scripts do the deterministic parts.** Your judgment is: what a finding means, fix vs
   rework vs skip, whether to wait for a re-review, resolving a conflict, and the merge
   decision itself. When a step turns out to be mechanical, put it in a script.
-- **Absent user = time is cheap.** Ask in plain text with the default stated (never a
-  blocking prompt), start the patient path in the same turn, and let a reply override it.
+- **Absent user = time is cheap.** When a choice exists (wait for CodeRabbit's reset, or
+  switch to Greptile or a local review), say it in one line with the default stated, never
+  a blocking prompt, start the patient path in the same turn, and let a reply override it.
 - **Claim what you land.** `takeover.sh` records this session as the PR's lander in the
   repo's shared state (`claims.sh`), so other landers, Claude or Codex, see who holds what
   and message you instead of double-driving it. A PR another live session holds stops you
@@ -114,10 +122,14 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
      lease), trail `fix local → pushed`;
    - **big** (design-level, many files, needs the plan's context): `uzi run rework RUN -m
      'GUIDANCE'` (single-quoted), `SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)` captured first,
-     `S/wait-mrrework.sh OWNER/REPO PR 45 60 "$SINCE"`, review its commit, trail `fix rework`;
+     `S/wait-mrrework.sh OWNER/REPO PR 45 60 "$SINCE"`, review its commit, trail `fix rework`.
+     A 409 "disabled" means rework is off for that run: `uzi run mr-rework RUN --enabled`,
+     then retry; do not downgrade a big fix to a local one because the lane was off;
    - **skip**: false positive, deliberate, or inherited base artifact; a real inherited bug
      is fixed or filed (sweepable: `bug`+`uzi`), never silently skipped.
-   Several PRs with findings → assess all, present once, then execute unattended.
+   Decide, then report the decisions in one message (finding, label, choice, why) and
+   execute; do not wait for answers. Several PRs with findings → assess all, report once,
+   execute unattended.
    **After a push, the re-review is your call:** wait for it when the fix changed logic or
    a trust boundary; merge on green CI alone when it did not (docs, comments, renames);
    ask when unsure and the user is present. Say which in the merge note. Greptile does not
@@ -135,7 +147,8 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    renumber helper reported references to fix by hand. Exit 7 = a gate failed (log path
    printed). A push re-triggers CodeRabbit: back to step 2. Trail `rebase+renumber → pushed`.
    Say what you resolved in the merge note; do not ask first.
-6. **Merge.** Under the standing admin-merge authorization (or the user's OK when not):
+6. **Merge.** When the readiness poll says ready, merge; do not ask (the user opts out per
+   PR or per session by saying so):
 
    ```
    S/merge.sh OWNER/REPO PR --expect-head <sha you watched>     # squash + delete-branch + admin

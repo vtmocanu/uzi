@@ -5,14 +5,15 @@ relative to this skill directory (`.agents/skills/uzi-lander/`); `resume-recipe.
 `.agents/skills/uzi-watcher/`. Greptile findings enter the same flow (gathered by
 `scripts/pr-findings.sh`, verified the same way).
 
-When findings exist across one or more in-flight PRs, do NOT fix them piecemeal and do NOT
-decide them yourself. **Gather every finding across every PR, verify each, present them as
-one batch, collect the user's decision on each, THEN do all the work unattended.** One
-decision gate, then hands-off — that is the whole point of batching, and it is the flow the
-user asked for here (2026-08-24): "first we assess all, gather all answers, then work".
+When findings exist across one or more in-flight PRs, do NOT fix them piecemeal. **Gather
+every finding across every PR, verify each, decide each, report the batch in ONE message,
+THEN do all the work unattended.** One report, then hands-off. Since 2026-09-17 the
+decisions are the lander's (full autonomy is the default); the user reads the report and
+overrides only if they care. The one finding class still put to the user is a fix that
+would change behaviour the plan or PRD specifies.
 
-Present each finding with: PR, file:line, CodeRabbit's severity, your **real / inherited /
-deliberate / mock-only** label, and a one-line recommendation. For each, the user picks one:
+Report each finding with: PR, file:line, the bot's severity, your **real / inherited /
+deliberate / mock-only** label, and your choice from these:
 
 - **Fix locally** — amend the PR's own `agent/issue-*` branch with your own credentials (an
   isolated worktree; `git add` only your files), re-run CI, then merge. Keeps it in the one
