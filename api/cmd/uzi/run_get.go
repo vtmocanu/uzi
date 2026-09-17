@@ -34,9 +34,9 @@ func newRunListCmd(env Env, gf *globalFlags) *cobra.Command {
 			rows := make([][]string, 0, len(runs))
 			now := time.Now()
 			for _, r := range runs {
-				rows = append(rows, []string{r.ID, r.Kind, displayRunStatus(r.Status, r.IsPlanning, r.IsRevising, r.LandingState), runAgeCell(r.RunDTO, now), runTitle(r.RunDTO)})
+				rows = append(rows, []string{r.ID, r.Kind, displayRunStatus(r.Status, r.IsPlanning, r.IsRevising, r.LandingState), runAgeCell(r.RunDTO, now), harnessListCell(r.Harness), runTitle(r.RunDTO)})
 			}
-			return p.Table([]string{"ID", "KIND", "STATUS", "AGE", "TITLE"}, rows)
+			return p.Table([]string{"ID", "KIND", "STATUS", "AGE", "HARNESS", "TITLE"}, rows)
 		},
 	}
 	return list

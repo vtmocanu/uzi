@@ -39,8 +39,12 @@ func newRunCreateCmd(env Env, gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			harness, err := runHarnessFlag(cmd)
+			if err != nil {
+				return err
+			}
 			force, _ := cmd.Flags().GetBool("force")
-			run, err := c.CreateRun(cmd.Context(), repoID, issue, waitOnLimitFlag(cmd), mrReworkFlag(cmd), force, seed, credOverride)
+			run, err := c.CreateRun(cmd.Context(), repoID, issue, waitOnLimitFlag(cmd), mrReworkFlag(cmd), force, seed, credOverride, harness)
 			if err != nil {
 				return err
 			}
@@ -84,7 +88,34 @@ func newRunCreateCmd(env Env, gf *globalFlags) *cobra.Command {
 		"which Anthropic token this run spends: a token label (pins the run to it), "+
 			"'auto' (auto-select from your pool), 'default' (your default token), or 'inherit' "+
 			"(the worker's binding); omit to inherit")
+	// PRD #1429 M5: the run's explicit harness selection. Same tri-state precedent as --token:
+	// only sent when the flag was Changed, so an omitted flag stays byte-identical to a
+	// pre-#1429 create and the server resolves the effective harness itself (D11).
+	create.Flags().String("harness", "",
+		"which harness this run uses: claude or codex; omit to let the server resolve it "+
+			"(your effective default, D11)")
 	return create
+}
+
+// runHarnessFlag resolves `run create --harness` into the wire value (PRD #1429 M5), the
+// same tri-state precedent as credentialOverrideFlag/--token: the flag OMITTED sends no
+// selection ("" — the server never sees a harness key with meaning, so the create stays
+// byte-identical to a pre-#1429 request and resolves the effective harness itself, D11).
+// A PASSED value is validated CLIENT-SIDE against the closed claude|codex enum before any
+// request — a create has no existing pin to retain, so (unlike the schedule edit flag)
+// there is no explicit-clear sentinel here; every Changed value must name a harness.
+func runHarnessFlag(cmd *cobra.Command) (string, error) {
+	if !cmd.Flags().Changed("harness") {
+		return "", nil
+	}
+	v, _ := cmd.Flags().GetString("harness")
+	v = strings.TrimSpace(v)
+	switch v {
+	case "claude", "codex":
+		return v, nil
+	default:
+		return "", uzicli.Exitf(uzicli.ExitUsage, "--harness must be one of: claude, codex")
+	}
 }
 
 // credentialOverrideFlag resolves `uzi run create --token` into the wire credential override

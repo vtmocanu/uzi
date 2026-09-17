@@ -45,6 +45,35 @@ func scheduleCredentialOverrideFlag(cmd *cobra.Command, c uzicli.Client) (apityp
 	return apitypes.OptionalCredentialOverride{Present: true, Value: &co}, true, nil
 }
 
+// scheduleHarnessFlag resolves the optional --harness flag into a request-presence harness
+// pin (PRD #1429 M5, D2), mirroring scheduleCredentialOverrideFlag exactly. NOT passed → the
+// zero apitypes.OptionalHarness (Present=false), which `omitzero` drops from the marshaled
+// body so the server seeds-and-keeps the stored pin on a PATCH (an unrelated retime/model
+// edit never restates it) and defaults to implicit (D11) on create. Passed with "claude" or
+// "codex" → an explicit pin. Passed as "" (or whitespace-only) → an explicit CLEAR back to
+// implicit, the harness twin of --model's "empty string clears" convention (there is no
+// "inherit" keyword for a closed two-value enum, so the empty string is the natural sentinel,
+// unlike --token's auto/default/inherit words). Any other value is a client-side usage error
+// before any request. Returns (pin, present, error).
+func scheduleHarnessFlag(cmd *cobra.Command) (apitypes.OptionalHarness, bool, error) {
+	if !cmd.Flags().Changed("harness") {
+		return apitypes.OptionalHarness{}, false, nil
+	}
+	v, _ := cmd.Flags().GetString("harness")
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return apitypes.OptionalHarness{Present: true, Value: nil}, true, nil
+	}
+	switch v {
+	case "claude", "codex":
+		vv := v
+		return apitypes.OptionalHarness{Present: true, Value: &vv}, true, nil
+	default:
+		return apitypes.OptionalHarness{}, false, uzicli.Exitf(uzicli.ExitUsage,
+			"--harness must be one of: claude, codex (or \"\" to clear back to implicit)")
+	}
+}
+
 // buildScheduleRequest assembles the ScheduleRequest from the create flags, enforcing
 // the one-of TARGET and one-of TIMING constraints client-side so a bad invocation is a
 // clean exit-2 usage error before any request is sent (the server also enforces them).
@@ -204,6 +233,18 @@ func buildScheduleRequest(cmd *cobra.Command, c uzicli.Client) (apitypes.Schedul
 	}
 	if present {
 		req.CredentialOverride = co
+	}
+
+	// --harness (PRD #1429 M5): the schedule's per-run harness pin. Omitted → no harness key
+	// (create defaults to implicit D11); passed → validated client-side against claude|codex
+	// (or "" to explicitly send no pin, a no-op on create). Valid on every create target,
+	// like --token — a harness pin is a SELECTION, not a per-run credential override.
+	harness, hpresent, herr := scheduleHarnessFlag(cmd)
+	if herr != nil {
+		return apitypes.ScheduleRequest{}, nil, herr
+	}
+	if hpresent {
+		req.Harness = harness
 	}
 	return req, repos, nil
 }
@@ -425,6 +466,19 @@ func buildScheduleEditRequest(cmd *cobra.Command, c uzicli.Client, s apitypes.Sc
 		req.CredentialOverride = co
 		changed = true
 	}
+	// --harness (PRD #1429 M5): OMIT the harness key unless --harness was explicitly
+	// passed — omission preserves the stored pin via the server's presence-aware
+	// seed-and-keep, so (like --token, unlike model/mr_rework) it is NEVER restated from
+	// the fetched DTO. An explicit --harness (including "" to clear back to implicit)
+	// sends the resolved pin and counts as a change.
+	harness, hpresent, herr := scheduleHarnessFlag(cmd)
+	if herr != nil {
+		return apitypes.ScheduleRequest{}, herr
+	}
+	if hpresent {
+		req.Harness = harness
+		changed = true
+	}
 	if !changed {
 		return apitypes.ScheduleRequest{}, uzicli.Exitf(uzicli.ExitUsage, "nothing to edit (pass at least one field to change)")
 	}
@@ -633,9 +687,21 @@ func buildDefaultScheduleEditRequest(cmd *cobra.Command, c uzicli.Client, s apit
 		req.CredentialOverride = co
 		changed = true
 	}
+	// --harness (PRD #1429 M5) is likewise an owner-editable run option on a default schedule
+	// (patchDefaultScheduleConfig resolves it via the same resolveScheduleHarness seam): OMIT
+	// it unless --harness was passed (seed-and-keep), never restated. An explicit --harness
+	// (including "" to clear back to implicit) counts as a change.
+	harness, hpresent, herr := scheduleHarnessFlag(cmd)
+	if herr != nil {
+		return apitypes.ScheduleRequest{}, herr
+	}
+	if hpresent {
+		req.Harness = harness
+		changed = true
+	}
 	if !changed {
 		return apitypes.ScheduleRequest{}, uzicli.Exitf(uzicli.ExitUsage,
-			"nothing to edit (pass at least one editable field: --cron, --tz, --auto-approve, --wait-on-limit, --mr-rework, --max-issues, --guidance, --model, --output, --apply-model-to-agents, --token)")
+			"nothing to edit (pass at least one editable field: --cron, --tz, --auto-approve, --wait-on-limit, --mr-rework, --max-issues, --guidance, --model, --output, --apply-model-to-agents, --token, --harness)")
 	}
 	return req, nil
 }

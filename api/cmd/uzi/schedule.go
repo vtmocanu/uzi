@@ -275,6 +275,10 @@ func newScheduleCreateCmd(env Env, gf *globalFlags) *cobra.Command {
 	create.Flags().Bool("wait-on-limit", true, "park a fired run until the Anthropic usage window reopens instead of failing it; pass --wait-on-limit=false to fail on limit")
 	create.Flags().Bool("mr-rework", false, "enable or disable auto-rework of fired runs' MR review comments; omit to inherit the account default, or pass --mr-rework=false to force off")
 	create.Flags().String("token", "", "Anthropic token for runs this schedule fires: a token label (from `uzi token list`), or auto|default|inherit; omit to inherit the worker binding")
+	// PRD #1429 M5: pin the harness every run this schedule fires uses. Omit to let each fire
+	// resolve the effective harness itself (implicit D11); "" is accepted but a no-op on
+	// create (there is no stored pin yet to clear).
+	create.Flags().String("harness", "", "pin the harness for runs this schedule fires: claude or codex; omit to resolve it per fire (D11)")
 	create.Flags().Bool("enabled", true, "create the schedule enabled; pass --enabled=false to create it paused")
 	create.Flags().Bool("create-missing-labels", false, "for a --sweep target: create any --label missing on a target repo before creating the schedule (default: warn only)")
 	return create
@@ -323,9 +327,13 @@ func newScheduleListCmd(env Env, gf *globalFlags) *cobra.Command {
 					scheduleWhen(s),
 					scheduleNextCell(s, now, pause),
 					scheduleOn(s),
+					// HARNESS (PRD #1429 M5): the schedule's per-run harness pin, "-" for a null
+					// pin (implicit D11 resolution per fire) — matching this table's other "no
+					// value" convention (REPO's strOr fallback above).
+					strOr(s.Harness, "-"),
 				})
 			}
-			return p.Table([]string{"ID", "TARGET", "REPO", "WHEN", "NEXT", "ON"}, rows)
+			return p.Table([]string{"ID", "TARGET", "REPO", "WHEN", "NEXT", "ON", "HARNESS"}, rows)
 		},
 	}
 }
@@ -421,6 +429,9 @@ func newScheduleEditCmd(env Env, gf *globalFlags) *cobra.Command {
 	edit.Flags().Bool("wait-on-limit", true, "set whether a fired run parks on the usage limit instead of failing")
 	edit.Flags().Bool("mr-rework", false, "set whether fired runs' MR review comments are auto-reworked; pass --mr-rework=false to force off (an unset flag leaves the stored value unchanged)")
 	edit.Flags().String("token", "", "change the Anthropic token for runs this schedule fires: a token label (from `uzi token list`), or auto|default|inherit; an unset flag leaves the stored value unchanged")
+	// PRD #1429 M5: an unset flag leaves the stored pin unchanged (retain-on-omission, the
+	// server's presence-aware seed-and-keep); pass "" to explicitly clear it back to implicit.
+	edit.Flags().String("harness", "", "change the pinned harness for runs this schedule fires: claude or codex; pass \"\" to clear back to implicit; an unset flag leaves the stored pin unchanged")
 	edit.Flags().String("guidance", "", "change owner guidance injected into the run instruction (issue/sweep targets, or a prompt-target or sweep-target default)")
 	edit.Flags().Int("max-issues", 10, "change the per-fire sweep cap, oldest-first (sweep target only)")
 	edit.Flags().Bool("clear-guidance", false, "clear stored guidance back to none (issue/sweep targets, or a prompt-target or sweep-target default)")

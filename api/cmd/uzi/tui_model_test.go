@@ -1393,26 +1393,40 @@ func TestTUIBoardMilestoneBadgeCap(t *testing.T) {
 	}
 }
 
-// The board COST cell (boardCostSeg, PRD #650) renders whole dollars with three distinct states:
-// a real cost as "$N" (no decimal), a $0-with-tokens subscription run as "—" (never "$0"), a
-// sub-dollar real cost as "<$1", and a nil-Usage run as a blank cell (the boardCredSeg convention).
+// The board COST cell (boardCostSeg, PRD #650 / #1429 M5) branches on cost_status (D7): a
+// metered cost as "$N" (no decimal), a subscription-status run as "sub" (never "$0" — even a $0
+// with recorded tokens), an unreported/legacy-empty-status run as "n/a", a sub-dollar metered
+// cost as "<$1", and a nil-Usage run as a blank cell (the boardCredSeg convention).
 func TestTUIBoardCostCell(t *testing.T) {
 	m := tuiTestModel(t, &uzicli.FakeClient{}, "")
 
-	// A real cost renders whole dollars, no decimal.
-	real := apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{Usage: &apitypes.UsageDTO{CostUSD: 9.4, InputTokens: 100}}}
+	// A metered cost renders whole dollars, no decimal.
+	real := apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{Usage: &apitypes.UsageDTO{CostStatus: "metered", CostUSD: 9.4, InputTokens: 100}}}
 	if s := stripANSI(m.boardCostSeg(real, nil)); !strings.Contains(s, "$9") || strings.Contains(s, ".") {
 		t.Errorf("cost cell: want whole-dollar $9 with no decimal, got %q", s)
 	}
 
-	// $0 with tokens is a subscription-auth run the SDK prices at $0 → "—", never "$0".
-	sub := apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{Usage: &apitypes.UsageDTO{CostUSD: 0, InputTokens: 100}}}
-	if s := stripANSI(m.boardCostSeg(sub, nil)); !strings.Contains(s, "—") || strings.Contains(s, "$0") {
-		t.Errorf("cost cell: a $0-with-tokens run must render — not $0, got %q", s)
+	// A subscription-status run (even at $0 with recorded tokens) → "sub", never "$0".
+	sub := apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{Usage: &apitypes.UsageDTO{CostStatus: "subscription", CostUSD: 0, InputTokens: 100}}}
+	if s := stripANSI(m.boardCostSeg(sub, nil)); !strings.Contains(s, "sub") || strings.Contains(s, "$0") {
+		t.Errorf("cost cell: a subscription-status run must render sub not $0, got %q", s)
 	}
 
-	// A sub-dollar real cost renders "<$1" (so a real cost never shows as $0, keeping — unambiguous).
-	subdollar := apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{Usage: &apitypes.UsageDTO{CostUSD: 0.3, InputTokens: 100}}}
+	// An unreported-status run → "n/a", never a dollar figure.
+	unrep := apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{Usage: &apitypes.UsageDTO{CostStatus: "unreported", CostUSD: 0, InputTokens: 100}}}
+	if s := stripANSI(m.boardCostSeg(unrep, nil)); !strings.Contains(s, "n/a") || strings.Contains(s, "$") {
+		t.Errorf("cost cell: an unreported-status run must render n/a with no dollar figure, got %q", s)
+	}
+
+	// The pre-M1 empty cost_status folds to the SAME safe "n/a" bucket, never a dollar figure
+	// guessed from cost_usd == 0 (the exact bug D7 retires).
+	legacy := apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{Usage: &apitypes.UsageDTO{CostUSD: 0, InputTokens: 100}}}
+	if s := stripANSI(m.boardCostSeg(legacy, nil)); !strings.Contains(s, "n/a") {
+		t.Errorf("cost cell: an empty-status run must render n/a, got %q", s)
+	}
+
+	// A sub-dollar metered cost renders "<$1" (so a real cost never shows as $0).
+	subdollar := apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{Usage: &apitypes.UsageDTO{CostStatus: "metered", CostUSD: 0.3, InputTokens: 100}}}
 	if s := stripANSI(m.boardCostSeg(subdollar, nil)); !strings.Contains(s, "<$1") {
 		t.Errorf("cost cell: a sub-dollar cost must render <$1, got %q", s)
 	}
@@ -1425,7 +1439,7 @@ func TestTUIBoardCostCell(t *testing.T) {
 	// A pathological high cost must still fit the fixed COST cell width: $100000 would
 	// render "$100000" (7 > boardCostWidth), which without the board-cell cap would blow
 	// the column; fmtCostBoard abbreviates it so the cell stays exactly boardCostWidth.
-	huge := apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{Usage: &apitypes.UsageDTO{CostUSD: 100000, InputTokens: 100}}}
+	huge := apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{Usage: &apitypes.UsageDTO{CostStatus: "metered", CostUSD: 100000, InputTokens: 100}}}
 	hs := stripANSI(m.boardCostSeg(huge, nil))
 	if w := visualWidth(hs); w != boardCostWidth {
 		t.Errorf("cost cell for a huge cost must be exactly boardCostWidth=%d, got width %d (%q)", boardCostWidth, w, hs)
@@ -1436,7 +1450,7 @@ func TestTUIBoardCostCell(t *testing.T) {
 
 	// Even an absurd value above the $9999G abbreviation ceiling stays within the cell:
 	// the overflow marker is fixed-width, so the invariant holds for ALL inputs.
-	absurd := apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{Usage: &apitypes.UsageDTO{CostUSD: 1e13, InputTokens: 100}}}
+	absurd := apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{Usage: &apitypes.UsageDTO{CostStatus: "metered", CostUSD: 1e13, InputTokens: 100}}}
 	as := stripANSI(m.boardCostSeg(absurd, nil))
 	if w := visualWidth(as); w != boardCostWidth {
 		t.Errorf("cost cell for an absurd cost must be exactly boardCostWidth=%d, got width %d (%q)", boardCostWidth, w, as)
@@ -2156,11 +2170,13 @@ func TestTUIInitStartsThemeTicker(t *testing.T) {
 	}
 }
 
-// spendUsage is the shared PRD #650 M3 usage fixture: a real-shaped run at $9.55 with a
-// heavily-cached token profile (in 2.4M / out 88.4k / cache 14.2M).
+// spendUsage is the shared PRD #650 M3 usage fixture: a real-shaped METERED run at $9.55 with a
+// heavily-cached token profile (in 2.4M / out 88.4k / cache 14.2M). CostStatus: "metered" (PRD
+// #1429 M5) so callers exercising the real dollar-figure branch get it without restating it.
 func spendUsage() *apitypes.UsageDTO {
 	return &apitypes.UsageDTO{
-		CostUSD: 9.55, InputTokens: 2_400_000, CacheReadTokens: 14_200_000,
+		CostStatus: "metered",
+		CostUSD:    9.55, InputTokens: 2_400_000, CacheReadTokens: 14_200_000,
 		CacheCreationTokens: 0, OutputTokens: 88_400,
 	}
 }
@@ -2177,9 +2193,11 @@ func spendModel(t *testing.T, usage *apitypes.UsageDTO) tuiModel {
 	}, nil)
 }
 
-// TestTUIDetailHeadlineCost — PRD #650 M3 Part A: the run-view status tag carries the run's
-// rolled-up cost, faint, beside the duration. A subscription-auth $0 run renders "—" (never
-// "$0.00"), and a pre-#40 nil-Usage run appends no cost token at all.
+// TestTUIDetailHeadlineCost — PRD #650 M3 Part A / #1429 M5: the run-view status tag carries the
+// run's rolled-up cost, faint, beside the duration, branching on cost_status (D7) rather than
+// guessing from cost_usd == 0: "metered" renders the real dollar figure, "subscription" renders
+// the short "sub" label (never a dollar figure, never $0), anything else ("unreported", the pre-M1
+// empty string) renders "n/a", and a pre-#40 nil-Usage run appends no cost token at all.
 func TestTUIDetailHeadlineCost(t *testing.T) {
 	header := func(m tuiModel) string { return stripANSI(strings.Join(m.detailHeaderLines(), "\n")) }
 
@@ -2187,13 +2205,29 @@ func TestTUIDetailHeadlineCost(t *testing.T) {
 		t.Errorf("headline status tag missing the cost $9.55:\n%s", h)
 	}
 
-	// Subscription-auth $0 (real token usage, zero cost) → "—", never "$0.00".
-	zero := header(spendModel(t, &apitypes.UsageDTO{CostUSD: 0, InputTokens: 100}))
-	if !strings.Contains(zero, "—") {
-		t.Errorf("a $0 usage run should render the em-dash cost:\n%s", zero)
+	// A subscription-billed run (real token usage, no metered cost) → "sub", never "$0.00".
+	sub := header(spendModel(t, &apitypes.UsageDTO{CostStatus: "subscription", CostUSD: 0, InputTokens: 100}))
+	if !strings.Contains(sub, "sub") {
+		t.Errorf("a subscription-status run should render the sub label:\n%s", sub)
 	}
-	if strings.Contains(zero, "$0.00") || strings.Contains(zero, "$") {
-		t.Errorf("a $0 usage run must not render a dollar cost:\n%s", zero)
+	if strings.Contains(sub, "$0.00") || strings.Contains(sub, "$") {
+		t.Errorf("a subscription-status run must not render a dollar cost:\n%s", sub)
+	}
+
+	// An unreported cost (usage recorded, cost genuinely unknown) → "n/a", never a dollar figure.
+	unrep := header(spendModel(t, &apitypes.UsageDTO{CostStatus: "unreported", CostUSD: 0, InputTokens: 100}))
+	if !strings.Contains(unrep, "n/a") {
+		t.Errorf("an unreported-status run should render the n/a label:\n%s", unrep)
+	}
+	if strings.Contains(unrep, "$") {
+		t.Errorf("an unreported-status run must not render a dollar cost:\n%s", unrep)
+	}
+
+	// The pre-M1 empty cost_status folds to the SAME safe "n/a" bucket as unreported, never a
+	// guessed dollar figure derived from cost_usd == 0.
+	legacy := header(spendModel(t, &apitypes.UsageDTO{CostUSD: 0, InputTokens: 100}))
+	if !strings.Contains(legacy, "n/a") {
+		t.Errorf("an empty cost_status run should render the n/a label:\n%s", legacy)
 	}
 
 	// nil Usage (unclaimed / pre-#40) → no cost token in the header at all.
@@ -2282,35 +2316,56 @@ func TestTUIDetailSpendDropsWhole(t *testing.T) {
 	}
 }
 
-// TestTUIDetailSpendZeroCost — a $0 run WITH real token usage shows the "—" total in the SPEND
-// block while the in/out/cache lines still render (the token breakdown does not depend on cost).
+// TestTUIDetailSpendZeroCost — PRD #1429 M5: a subscription-status run WITH real token usage
+// shows the "Subscription" total in the SPEND block (never "—" or "$0.00") while the in/out/cache
+// lines still render (the token breakdown does not depend on cost).
 func TestTUIDetailSpendZeroCost(t *testing.T) {
-	m := spendModel(t, &apitypes.UsageDTO{CostUSD: 0, InputTokens: 1000, OutputTokens: 50})
+	m := spendModel(t, &apitypes.UsageDTO{CostStatus: "subscription", CostUSD: 0, InputTokens: 1000, OutputTokens: 50})
 	out := stripANSI(m.renderSpend(0))
-	if !strings.Contains(out, "—") {
-		t.Errorf("a $0 SPEND total should render the em-dash:\n%s", out)
+	if !strings.Contains(out, "Subscription") {
+		t.Errorf("a subscription-status SPEND total should render Subscription:\n%s", out)
+	}
+	if strings.Contains(out, "$0") || strings.Contains(out, "—") {
+		t.Errorf("a subscription-status SPEND total must not render a dollar figure or an em-dash:\n%s", out)
 	}
 	for _, want := range []string{"in 1.0k", "out 50", "cache 0"} {
 		if !strings.Contains(out, want) {
-			t.Errorf("SPEND token line missing %q on a $0 run:\n%s", want, out)
+			t.Errorf("SPEND token line missing %q on a subscription-status run:\n%s", want, out)
 		}
 	}
 }
 
-// TestTUIBoardCostAsciiSurvives — PRD #650 M4: under an Ascii (NO_COLOR) colorprofile downgrade
-// the board's plain-text cost cues survive. The "$", digits, and "—" are derived numerics, not
-// coloured chrome — only the tungsten/faint accent is stripped downstream at flush — so cost is
-// never signalled by colour alone. Mirrors TestBoardRateLimitStripAsciiSignalSurvives. NOTE: the
-// colorprofile Writer strips SGR downstream at flush, which the in-frame text does not show — so
-// this asserts the derived text cues are present regardless of colour.
+// TestTUIDetailSpendUnreportedCost — PRD #1429 M5: an unreported-status run shows "Unavailable"
+// in the SPEND block (never a guessed dollar figure), and the pre-M1 empty cost_status folds to
+// the same bucket.
+func TestTUIDetailSpendUnreportedCost(t *testing.T) {
+	for _, status := range []string{"unreported", ""} {
+		m := spendModel(t, &apitypes.UsageDTO{CostStatus: status, CostUSD: 0, InputTokens: 1000, OutputTokens: 50})
+		out := stripANSI(m.renderSpend(0))
+		if !strings.Contains(out, "Unavailable") {
+			t.Errorf("cost_status %q: SPEND total should render Unavailable:\n%s", status, out)
+		}
+		if strings.Contains(out, "$") {
+			t.Errorf("cost_status %q: SPEND total must not render a dollar figure:\n%s", status, out)
+		}
+	}
+}
+
+// TestTUIBoardCostAsciiSurvives — PRD #650 M4 / #1429 M5: under an Ascii (NO_COLOR) colorprofile
+// downgrade the board's plain-text cost cues survive. The "$", digits, and the "sub" label are
+// derived numerics/words, not coloured chrome — only the tungsten/faint accent is stripped
+// downstream at flush — so cost is never signalled by colour alone. Mirrors
+// TestBoardRateLimitStripAsciiSignalSurvives. NOTE: the colorprofile Writer strips SGR downstream
+// at flush, which the in-frame text does not show — so this asserts the derived text cues are
+// present regardless of colour.
 func TestTUIBoardCostAsciiSurvives(t *testing.T) {
 	// Two tokens so the credential gate clears (secretsMsg{count:2}); at width 120 the mile
 	// threshold (111) is under the terminal so every column, COST included, renders.
 	runs := []apitypes.RunListItemDTO{
 		{RunDTO: apitypes.RunDTO{ID: "aaaaaaaa-1", Kind: "issue", Status: "running", IssueTitle: "a real cost",
-			Usage: &apitypes.UsageDTO{CostUSD: 12.0, InputTokens: 100}}}, // → "$12"
+			Usage: &apitypes.UsageDTO{CostStatus: "metered", CostUSD: 12.0, InputTokens: 100}}}, // → "$12"
 		{RunDTO: apitypes.RunDTO{ID: "bbbbbbbb-2", Kind: "issue", Status: "running", IssueTitle: "a subscription run",
-			Usage: &apitypes.UsageDTO{CostUSD: 0, InputTokens: 100}}}, // → "—"
+			Usage: &apitypes.UsageDTO{CostStatus: "subscription", CostUSD: 0, InputTokens: 100}}}, // → "sub"
 	}
 	m := tuiTestModel(t, &uzicli.FakeClient{Runs: runs}, "")
 	m.width = 120
@@ -2324,9 +2379,9 @@ func TestTUIBoardCostAsciiSurvives(t *testing.T) {
 	m = next.(tuiModel)
 	out := stripANSI(m.View().Content)
 
-	// The per-row "$12" cell, the "—" subscription cue, and the rounded floor total (round(12+0) =
+	// The per-row "$12" cell, the "sub" subscription cue, and the rounded floor total (round(12+0) =
 	// "$12") all survive with colour gone.
-	for _, want := range []string{"$12", "—"} {
+	for _, want := range []string{"$12", "sub"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("Ascii-profile board dropped the plain cost cue %q:\n%s", want, out)
 		}
@@ -2343,7 +2398,7 @@ func TestTUIDetailCostAsciiSurvives(t *testing.T) {
 	m = applyDetail(m, apitypes.RunDTO{
 		ID: "run-detail", Status: "running", Health: "ok", IssueTitle: "cost run",
 		Usage: &apitypes.UsageDTO{
-			CostUSD: 9.55, InputTokens: 2_400_000, CacheReadTokens: 14_200_000,
+			CostStatus: "metered", CostUSD: 9.55, InputTokens: 2_400_000, CacheReadTokens: 14_200_000,
 			CacheCreationTokens: 0, OutputTokens: 88_400,
 		},
 	}, nil)

@@ -27,9 +27,19 @@ func (m tuiModel) renderSpend(usedRows int) string {
 	if u == nil {
 		return ""
 	}
-	total := "—" // subscription-auth $0
-	if u.CostUSD > 0 {
+	// The SPEND headline branches on cost_status (PRD #1429 M5, D7) rather than guessing
+	// "subscription" from cost_usd == 0: "metered" renders the real cents-precision figure
+	// (an exact metered $0 is a genuine reading, never special-cased away), "subscription"
+	// reads "Subscription", and anything else — "unreported", the pre-M1 empty string, or a
+	// status this build has not heard of — reads "Unavailable", mirroring web costHeadline.
+	var total string
+	switch classifyCostStatus(u.CostStatus) {
+	case costStatusMetered:
 		total = fmtCostCents(u.CostUSD)
+	case costStatusSubscription:
+		total = "Subscription"
+	default:
+		total = "Unavailable"
 	}
 	fresh := u.InputTokens + u.CacheCreationTokens
 	pct := cacheDisplayPct(u.InputTokens, u.CacheReadTokens, u.CacheCreationTokens)
