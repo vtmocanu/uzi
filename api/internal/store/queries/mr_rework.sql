@@ -159,8 +159,8 @@ WHERE repo_id = @repo_id::uuid AND ref <> ALL(@keep_refs::text[]);
 -- harness (PRD #1429 M1, was #1332 M5A / D2): now the @harness PARAMETER supplied by the M5B
 -- create seam (workersvc.createRunAtomic) in the SELECT list, not the SQL literal 'claude'. A
 -- derived mr_rework inherits its source run's harness as an explicit selection (D4); M2 wires
--- that real value. Every current caller passes string(HarnessClaude) as a mechanical stopgap.
--- Keep in sync with CreateManualMRReworkRunAndAdvance's body below.
+-- that real value — the caller passes the D11-resolved, source-run-inherited harness, not a
+-- stopgap. Keep in sync with CreateManualMRReworkRunAndAdvance's body below.
 INSERT INTO runs (
     user_id, repo_id, kind, issue_title, issue_description,
     pipeline_ref, mr_iid, target_run_id, review_comments, auto_approve, wait_on_limit, required_capabilities, trigger_source, harness
@@ -220,7 +220,7 @@ SELECT
     @user_id, @repo_id::uuid, 'mr_rework', @issue_title, @issue_description,
     @pipeline_ref, @mr_iid, @target_run_id, sqlc.narg('review_comments')::jsonb, true, @wait_on_limit,
     -- harness (PRD #1429 M1, was #1332 M5A / D2): the @harness PARAMETER, mirroring
-    -- CreateAutoMRReworkRun. Every current caller passes string(HarnessClaude) as a stopgap.
+    -- CreateAutoMRReworkRun. The caller passes the D11-resolved, source-run-inherited harness.
     COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), 'manual', @harness
 WHERE NOT EXISTS (
     SELECT 1 FROM runs
