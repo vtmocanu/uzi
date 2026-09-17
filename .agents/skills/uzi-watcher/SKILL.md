@@ -260,7 +260,8 @@ and namespace from your own kubeconfig; they are deployment-specific, do not har
    add DIR recover/issue-N`.
 4. **Rebase onto current main** (adopts main's workflow files → clears base-staleness): `git
    rebase origin/main`. Common conflict: a new goose migration (renumber to the next free
-   number above the live head, sequenced after any sibling PR's migration).
+   number above the live head, sequenced after any sibling PR's migration; `task
+   migration:renumber` does the git-mv and comment rewrite and reports other refs).
 5. **Verify + land:** both `git diff --name-only origin/main..HEAD -- .github/workflows/` and
    `git log --name-only origin/main..HEAD -- .github/workflows/` empty; run the touched `task
    gate:*`; push `recover/issue-N` (your token carries `workflow` scope); open a maintainer

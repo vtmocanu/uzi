@@ -71,7 +71,8 @@ cd <the repo>                              # your normal checkout; work happens 
    git fetch origin main && git rebase origin/main
    ```
    Common conflicts: a new goose migration (rename to the next free number above the live
-   head in `api/internal/store/migrations/`, sequenced after any sibling PR's migration); a
+   head in `api/internal/store/migrations/`, sequenced after any sibling PR's migration;
+   `task migration:renumber` does the git-mv and comment rewrite and reports other refs); a
    hand-edited shared doc (keep both sides).
 5. **Restore the uncommitted state** the tracking ref never held — the whole point for a
    task run. Skip cleanly when the run had none, but do NOT mask a real apply failure (a
@@ -92,7 +93,7 @@ cd <the repo>                              # your normal checkout; work happens 
    ```sh
    git diff --name-only origin/main..HEAD -- .github/workflows/
    git log  --name-only origin/main..HEAD -- .github/workflows/
-   git diff --name-only origin/main..HEAD -- api/internal/store/migrations/   # renumber if non-empty
+   git diff --name-only origin/main..HEAD -- api/internal/store/migrations/   # renumber if non-empty (task migration:renumber)
    git rev-list --count origin/main..HEAD                                     # the range length: must be > 0, and must equal the scan's "N commits scanned" line below
    go run github.com/zricethezav/gitleaks/v8@v8.30.1 git --log-opts="origin/main..HEAD" --no-banner --ignore-gitleaks-allow   # EVERY commit in the range (push protection scans them all); pinned like scripts/scan-secrets.sh
    ```
