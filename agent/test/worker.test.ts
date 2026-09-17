@@ -10,6 +10,7 @@ import type { JudgeRunner } from "../src/judge-runner.js";
 import type { ReviewRunner } from "../src/review-runner.js";
 import type { ClaimResponse, ChatClaimResponse, WorkerStats } from "../src/protocol.js";
 import { CODEX_HARNESS_CAPABILITY } from "../src/codex/codex-runtime-probe.js";
+import { ActiveRunRegistry } from "../src/active-run-registry.js";
 import { recordingLogger } from "./helpers.js";
 
 // These run-lane / chat-lane tests never claim a judge run, so a no-op JudgeRunner
@@ -461,6 +462,79 @@ describe("Worker — RUN lane slot semaphore (PRD #42 M2)", () => {
     assert.strictEqual(resolved, true);
     assert.strictEqual(ended.length, 3, "every in-flight run drained");
     assert.strictEqual(active(), 0);
+  });
+});
+
+// PRD #1390 M3 (blocker 7) — the claim loop's belt-and-braces duplicate-claim assertion.
+// The server-side pre-claim dedupe is the real guard; the worker keeps a LOUD assertion
+// only. When a claim returns a run this worker is ALREADY executing (present in the shared
+// ActiveRunRegistry the runners write), the loop logs at ERROR with a fixed, greppable
+// message and does NOT execute it — no second executionTails attempt, no slot, no custody
+// hold — while still claiming and executing a DIFFERENT id normally. This is ADDITIVE: the
+// Set<Promise> semaphore and the shutdown drain are untouched.
+describe("Worker — duplicate-claim assertion (PRD #1390 M3, blocker 7)", () => {
+  it("refuses to double-execute a claim whose run_id is already live, logs LOUD, and still executes a different id", async () => {
+    const controller = new AbortController();
+    const executed: string[] = [];
+    // The worker is already executing "dup-1" (a runner registered it at its generation).
+    const activeRuns = new ActiveRunRegistry();
+    activeRuns.add("dup-1", 3);
+
+    // The claim loop is offered the already-live "dup-1" FIRST, then a fresh "fresh-2".
+    const claims: Array<ClaimResponse | null> = [
+      { run_id: "dup-1" } as unknown as ClaimResponse,
+      { run_id: "fresh-2" } as unknown as ClaimResponse,
+    ];
+    let i = 0;
+    const client = {
+      register: async () => ({}),
+      heartbeat: async () => {},
+      // buildActiveSnapshot() consults hasFeature once activeRuns is wired; the snapshot's
+      // negotiation is not what this test exercises, so leave the feature off (no snapshot
+      // on the claim). The subject is the claim loop's registry assertion.
+      hasFeature: () => false,
+      claimRun: async (): Promise<ClaimResponse | null> => claims[i++] ?? null,
+      claimChat: async (): Promise<ChatClaimResponse | null> => null,
+    } as unknown as WorkerClient;
+
+    const runner = {
+      ...noResumeRecoveries,
+      execute: async (claim: ClaimResponse) => {
+        executed.push(claim.run_id);
+      },
+    } as unknown as RunRunner;
+    const { logger, lines } = recordingLogger();
+
+    const worker = new Worker(
+      fakeConfig(),
+      client,
+      runner,
+      {} as unknown as ChatRunner,
+      noJudge,
+      noReview,
+      logger,
+      okPreflight,
+      undefined, // outbox
+      undefined, // rearm
+      activeRuns,
+    );
+    const done = worker.run(controller.signal);
+    for (let n = 0; n < 500 && !executed.includes("fresh-2"); n++) await tick();
+    controller.abort();
+    await done;
+
+    assert.ok(!executed.includes("dup-1"), "the already-live run was NOT executed (no double-execute)");
+    assert.deepStrictEqual(executed, ["fresh-2"], "only the fresh, not-yet-live id executed");
+    assert.ok(
+      lines.some(
+        (l) =>
+          (l as { level?: string }).level === "error" &&
+          (l as { msg?: string }).msg ===
+            "claim returned a run this worker is already executing; refusing to double-execute" &&
+          (l as { run_id?: string }).run_id === "dup-1",
+      ),
+      "the refusal is logged LOUD (error) with the fixed greppable message and the run_id",
+    );
   });
 });
 

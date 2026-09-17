@@ -207,7 +207,7 @@ func TestClaimGuardrailBlocksAtClaim(t *testing.T) {
 	guard, _ := blockedGuard()
 	f.svc.SetRepoGuard(guard)
 
-	payload, err := f.svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: f.owner})
+	payload, err := f.svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: f.owner}, nil)
 	if err != nil {
 		t.Fatalf("Claim must report idle (nil error) for a guardrail-blocked run, got %v", err)
 	}
@@ -247,7 +247,7 @@ func TestClaimGuardrailNotBlockedProceeds(t *testing.T) {
 	guard := &fakeGuard{res: privcheck.GuardResult{Blocked: false}}
 	f.svc.SetRepoGuard(guard)
 
-	payload, err := f.svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: f.owner})
+	payload, err := f.svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: f.owner}, nil)
 	if err != nil {
 		t.Fatalf("Claim with a clearing guard: %v", err)
 	}
@@ -274,7 +274,7 @@ func TestClaimJudgeSkipsGuard(t *testing.T) {
 	guard := &fakeGuard{res: privcheck.GuardResult{Blocked: true}}
 	svc.SetRepoGuard(guard)
 
-	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid})
+	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid}, nil)
 	if err != nil {
 		t.Fatalf("Claim (judge): %v", err)
 	}
@@ -291,7 +291,7 @@ func TestClaimJudgeSkipsGuard(t *testing.T) {
 func TestClaimNilGuardBackstopSkips(t *testing.T) {
 	f := newClaimFixture(t) // SetRepoGuard deliberately not called
 
-	payload, err := f.svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: f.owner})
+	payload, err := f.svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: f.owner}, nil)
 	if err != nil {
 		t.Fatalf("Claim with a nil guard: %v", err)
 	}
@@ -359,7 +359,7 @@ func TestClaimThreadsOverriddenFromContext(t *testing.T) {
 			guard := &fakeGuard{res: privcheck.GuardResult{Blocked: false}}
 			f.svc.SetRepoGuard(guard)
 
-			if _, err := f.svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: f.owner}); err != nil {
+			if _, err := f.svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: f.owner}, nil); err != nil {
 				t.Fatalf("Claim: %v", err)
 			}
 			if guard.lastInput.Overridden != tc.wantOverr {

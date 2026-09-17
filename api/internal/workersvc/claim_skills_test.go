@@ -150,7 +150,7 @@ func TestClaimDeliversSkills(t *testing.T) {
 		},
 	}
 
-	payload, err := New(fs, box, testParams()).Claim(context.Background(), worker())
+	payload, err := New(fs, box, testParams()).Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}

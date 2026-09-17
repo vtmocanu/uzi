@@ -370,7 +370,23 @@ export class Worker {
         // monotonic epoch counter the heartbeat draws from) so the api's pre-claim dedupe
         // sees this worker's live runs even before the first post-outage heartbeat lands.
         const claim = await this.client.claimRun(this.buildActiveSnapshot());
-        if (claim) {
+        if (claim && this.activeRuns?.has(claim.run_id)) {
+          // PRD #1390 M3 (blocker 7) — belt-and-braces duplicate-claim assertion. The
+          // server-side pre-claim dedupe (M3 api) is the real guard; this is the loud last
+          // line of defence. The claim loop tracks in-flight PROMISES, not run ids, so a
+          // server that ever hands back a run this worker is ALREADY executing (the exact
+          // #1390 root cause: a same-worker re-claim of its own live run) would have
+          // `runner.execute` serialise a second attempt behind the first through
+          // `executionTails`, parking a slot AND opening a gen+1 custody hold. Refuse it:
+          // log LOUD (error, greppable, with run_id) and do NOT execute — no slot taken, no
+          // hold, no double-execution. `claimed` stays false so the loop backs off one poll
+          // rather than tight-looping on a persistently-buggy server. This is ADDITIVE — the
+          // Set<Promise> semaphore and the shutdown drain below are untouched.
+          this.log.error(
+            "claim returned a run this worker is already executing; refusing to double-execute",
+            { run_id: claim.run_id },
+          );
+        } else if (claim) {
           claimed = true;
           // PRD #400 M4b: a DIFF-REVIEW claim is a `task`-kind claim carrying a non-null
           // review_target_run_id — routed to the slim ReviewRunner (clone + diff + reviewer

@@ -2048,7 +2048,18 @@ func (s *Service) OutboxRunDepth(runID uuid.UUID) (OutboxEntry, uuid.UUID, bool)
 // it, so runs spread across a fleet instead of piling on whichever worker polls
 // first. The deferral is a no-op at the caller level — the run simply isn't
 // returned (nil payload / 204), so the worker just re-polls and a peer claims it.
-func (s *Service) Claim(ctx context.Context, wkr store.Worker) (*ClaimPayload, error) {
+//
+// snapshot is the worker's active-run snapshot riding the claim request (PRD #1390 M3, D3/D8),
+// nil for an old bodyless worker. When it is carried AND a tx beginner is wired, the claim runs in
+// ONE transaction in the canonical lock order — lock the worker row, pre-lock the request
+// snapshot's own runs, replace the snapshot, then (claimant guard) refuse the claim if the worker
+// is under an unexpired pending_overflow closure, else select and claim — so a run any fresh
+// snapshot lists (its own request's included) is never double-claimed and no sibling can steal a
+// pre-locked run until this tx commits. An invalid/stale/wrong-nonce claim snapshot fails the claim
+// CLOSED (ErrActiveSnapshotInvalid → the handler's 400). Without a snapshot (or without a tx
+// beginner: fake-store unit tests) it keeps the single auto-commit ClaimRun, which still applies
+// the persisted-snapshot exclusions and the overflow closure. Assembly always runs OUTSIDE the tx.
+func (s *Service) Claim(ctx context.Context, wkr store.Worker, snapshot *ActiveSnapshot) (*ClaimPayload, error) {
 	// Vault gate (PRD #32 M3): while the run owner's vault is locked (after a pod
 	// restart, or a manual lock), do not claim any of their runs — report idle so
 	// they stay queued as "waiting for vault unlock" instead of failing. This is a
@@ -2122,7 +2133,17 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker) (*ClaimPayload, e
 	// flag routes rather than silently degrading to a mid-run crash.
 	capabilityAware := s.capabilityAwareOn(ctx)
 
-	run, err := s.q.ClaimRun(ctx, store.ClaimRunParams{
+	// PRD #1390 M3: the request snapshot's index-aligned (run_id, generation) pairs, feeding
+	// ClaimRun's request-array exclusion so the claimant never re-claims a run its OWN request
+	// snapshot lists at the current generation, before the first heartbeat persists those rows
+	// (fact 7). Empty (nil-safe) when no snapshot rides the claim — an empty exclusion set.
+	reqIDs, reqGens := requestActivePairs(snapshot)
+
+	// ClaimRun params are built IDENTICALLY for both the no-snapshot auto-commit path and the
+	// transactional path (only the request arrays differ, and they are empty in the no-snapshot
+	// path). @snapshot_fresh_cutoff is the stale window plus one heartbeat interval (D3): a
+	// worker_active_runs row reported within it fences the run out of every claim.
+	params := store.ClaimRunParams{
 		WorkerID:            pgconv.UUID(wkr.ID),
 		UserID:              wkr.UserID,
 		AffinityCutoff:      pgconv.Time(s.now().Add(-s.p.WorkerAffinityCeiling)),
@@ -2159,19 +2180,134 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker) (*ClaimPayload, e
 		CustodyHoldLimit: custodyHoldLimit,
 		RecoveryCapable:  slices.Contains(wkr.ProtocolCapabilities, capability.RecoveryArchiveV1),
 		WorkerIdentity:   workerIdentity(wkr),
-	})
+		// PRD #1390 M3: the three snapshot-dedupe params. @snapshot_fresh_cutoff bounds the
+		// persisted-snapshot freshness test; the request arrays are the claimant's own listed runs
+		// (empty in the no-snapshot path). All three are always passed so an old worker still gets
+		// the persisted-snapshot exclusions + the overflow closure.
+		SnapshotFreshCutoff: pgconv.Time(s.now().Add(-(s.p.WorkerHeartbeatStale + s.p.WorkerHeartbeatInterval))),
+		RequestActiveIds:    reqIDs,
+		RequestActiveGens:   reqGens,
+	}
+
+	// No request snapshot (an old worker) or no tx beginner wired (fake-store unit tests): keep
+	// TODAY'S path — a single auto-commit ClaimRun, then assembleClaim. The predicate params above
+	// still apply, so an old worker gets the persisted-snapshot exclusions and the overflow closure;
+	// only the claimant guard (the flagged-worker-itself refusal) and the request pre-lock are
+	// snapshot-only, and an old worker is never flagged and lists nothing.
+	if snapshot == nil || s.txBeginner == nil {
+		run, err := s.q.ClaimRun(ctx, params)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil, nil // idle
+			}
+			return nil, err
+		}
+		payload, err := s.assembleClaim(ctx, wkr, run)
+		if err != nil {
+			return nil, s.recoverClaimAssembly(ctx, run, err)
+		}
+		return payload, nil
+	}
+
+	// Snapshot carried + tx beginner: ONE transaction in the canonical lock order (D8), so a
+	// sibling's concurrent FOR UPDATE SKIP LOCKED claim cannot see this claimant's pre-locked runs
+	// or replaced snapshot until it commits.
+	tx, err := s.txBeginner.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+	qtx := store.New(tx)
+	// (a) Lock the worker row FIRST — the canonical order shared with Register, Heartbeat and the
+	// stale-worker passes.
+	locked, err := qtx.GetWorkerForUpdate(ctx, wkr.ID)
+	if err != nil {
+		return nil, err
+	}
+	// (b) Pre-lock the request snapshot's own runs in deterministic id order (skip when empty), so a
+	// sibling's concurrent FOR UPDATE SKIP LOCKED claim skips them until this tx commits its
+	// replacement. An id for a run this worker does not own is a no-op (the WHERE excludes it).
+	if ids := snapshotRunIDs(snapshot); len(ids) > 0 {
+		if _, err := qtx.LockOwnedRunsByIDs(ctx, store.LockOwnedRunsByIDsParams{
+			RunIds:   ids,
+			WorkerID: pgconv.UUID(wkr.ID),
+		}); err != nil {
+			return nil, err
+		}
+	}
+	// (c) Replace the snapshot in CLAIM mode: an invalid/stale-epoch/wrong-nonce snapshot returns
+	// ErrActiveSnapshotInvalid — ROLLBACK (via the defer) and return it so the handler fails the
+	// claim CLOSED (400, no claim, no side effect). A real DB error propagates the same way.
+	if _, err := s.ReplaceWorkerActiveRuns(ctx, qtx, locked, snapshot, snapshotModeClaim); err != nil {
+		return nil, err
+	}
+	// (d) Claimant guard (snapshot-replace BEFORE overflow, blocker 2). The replace just set/cleared
+	// pending_overflow_until from the snapshot's pending_overflow flag; re-read the row to see the
+	// CURRENT value. If the worker is under an unexpired overflow closure it is refused every claim,
+	// unassigned runs included — but the replace is valid info that must persist, so COMMIT and
+	// report idle. An UNFLAGGED valid snapshot cleared the closure here, so the claim proceeds in
+	// this SAME tx below.
+	reread, err := qtx.GetWorkerByID(ctx, wkr.ID)
+	if err != nil {
+		return nil, err
+	}
+	if reread.PendingOverflowUntil.Valid && reread.PendingOverflowUntil.Time.After(s.now()) {
+		if err := tx.Commit(ctx); err != nil {
+			return nil, err
+		}
+		committed = true
+		return nil, nil // idle: the worker is overflowed, no claim
+	}
+	// (e) Claim inside the tx. On no candidate, COMMIT (the snapshot replace must persist) and report
+	// idle; on success, COMMIT and then assemble OUTSIDE the tx (assembly opens credentials + builds
+	// snapshots and must not hold the DB tx), exactly as the no-snapshot path does.
+	run, err := qtx.ClaimRun(ctx, params)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
+			if cerr := tx.Commit(ctx); cerr != nil {
+				return nil, cerr
+			}
+			committed = true
 			return nil, nil // idle
 		}
 		return nil, err
 	}
-
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	committed = true
 	payload, err := s.assembleClaim(ctx, wkr, run)
 	if err != nil {
 		return nil, s.recoverClaimAssembly(ctx, run, err)
 	}
 	return payload, nil
+}
+
+// requestActivePairs extracts the index-aligned (run_id, claim_generation) pairs a claim's request
+// snapshot lists (PRD #1390 M3), for ClaimRun's request-array exclusion. Only entries whose run_id
+// parses as a uuid are kept, and the two slices stay index-aligned (a dropped entry drops from
+// both). A nil/empty snapshot yields empty (non-nil) slices, which ClaimRun's WITH ORDINALITY zip
+// reads as an empty exclusion set.
+func requestActivePairs(snap *ActiveSnapshot) ([]uuid.UUID, []int64) {
+	ids := []uuid.UUID{}
+	gens := []int64{}
+	if snap == nil {
+		return ids, gens
+	}
+	for _, e := range snap.Active {
+		id, err := uuid.Parse(e.RunID)
+		if err != nil {
+			continue
+		}
+		ids = append(ids, id)
+		gens = append(gens, e.ClaimGeneration)
+	}
+	return ids, gens
 }
 
 // recoverClaimAssembly turns a failed claim assembly (run OR chat lane) into the

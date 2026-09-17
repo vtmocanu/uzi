@@ -301,7 +301,7 @@ func TestRecoveryWaitLiveDB(t *testing.T) {
 			t.Fatalf("pre-claim status = %q, want queued", r.Status)
 		}
 
-		payload, err := svc.Claim(ctx, wkr)
+		payload, err := svc.Claim(ctx, wkr, nil)
 		if err != nil {
 			t.Fatalf("svc.Claim: %v", err)
 		}

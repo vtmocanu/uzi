@@ -503,6 +503,43 @@ WITH target AS (
                       * p.max_concurrent_runs
           )
       )
+      -- PRD #1390 M3 (D3, D8): global, pre-claim snapshot dedupe — three exclusions that run
+      -- INSIDE candidate selection, BEFORE the generation increment and before the ` + "`" + `hold` + "`" + ` CTE
+      -- opens custody, so a run a fresh snapshot lists is never returned to any claimant (including
+      -- a sibling past the affinity ceiling) and no side effect fires for it.
+      --
+      -- (1) Fresh-snapshot / terminal-pending exclusion: never claim a run a FRESH snapshot lists
+      -- as active at its CURRENT generation. Freshness is the snapshot's OWN reported_at (a worker
+      -- whose snapshots fail validation must not keep stale rows protected by its liveness), within
+      -- @snapshot_fresh_cutoff = now() - (WORKER_HEARTBEAT_STALE + WORKER_HEARTBEAT_INTERVAL). A
+      -- terminal-pending lease (a.terminal_pending AND still unexpired) excludes regardless of
+      -- freshness (#1391's journaled outcome outlives the heartbeat, D11). Worker-scoped
+      -- (a.worker_id = r.worker_id) for consistency with the sweep predicates, and sound because a
+      -- run's snapshot row is only ever its owner's.
+      AND NOT EXISTS (
+          SELECT 1 FROM worker_active_runs a
+          WHERE a.run_id = r.id AND a.worker_id = r.worker_id
+            AND a.claim_generation = r.claim_generation
+            AND (a.reported_at >= $15
+                 OR (a.terminal_pending AND a.terminal_pending_until > now())))
+      -- (2) Request-array exclusion (fact 7): the claimant's OWN request snapshot excludes its
+      -- listed runs at the CURRENT generation, so the exclusion holds BEFORE the first heartbeat
+      -- persists the rows exclusion (1) reads. @request_active_ids / @request_active_gens are
+      -- index-aligned pairs; the two-array unnest is spelled as a WITH ORDINALITY zip because
+      -- sqlc's analyzer cannot type a multi-argument unnest(a, b) (see judge_bulk_disposition.sql).
+      -- Empty arrays (no request snapshot, or the no-snapshot path) match nothing → no exclusion.
+      AND NOT EXISTS (
+          SELECT 1
+          FROM unnest($16::uuid[]) WITH ORDINALITY AS req_id(id, ord)
+          JOIN unnest($17::bigint[]) WITH ORDINALITY AS req_gen(gen, ord)
+               ON req_gen.ord = req_id.ord
+          WHERE req_id.id = r.id AND req_gen.gen = r.claim_generation)
+      -- (3) Overflow closure (D11): never claim a run whose OWNER is under an unexpired
+      -- pending_overflow closure — an outcome the worker could not list has no row of its own to
+      -- lease, so the worker-level closure stands in for the row-level lease. An unassigned run
+      -- (r.worker_id IS NULL) has no owner row, so it is never closed here; the claimant-side half
+      -- (a flagged worker refused every claim, unassigned included) is the service-level guard.
+      AND NOT EXISTS (SELECT 1 FROM workers w WHERE w.id = r.worker_id AND w.pending_overflow_until > now())
     -- Three-level sort (PRD #320 D3): (1) resume affinity — a re-queued run
     -- prefers its prior worker, exactly as before; (2) priority rank —
     -- fn_run_priority slots BETWEEN affinity and FIFO, so an interactive run
@@ -512,7 +549,7 @@ WITH target AS (
     -- fail-open: a demoted run created before it reads as stale, so
     -- fn_run_priority returns normal and background work never starves.
     ORDER BY COALESCE(r.worker_id = $1, false) DESC,
-             fn_run_priority(r.kind, r.priority, r.created_at < $15) DESC,
+             fn_run_priority(r.kind, r.priority, r.created_at < $18) DESC,
              r.created_at ASC
     FOR UPDATE SKIP LOCKED
     LIMIT 1
@@ -532,9 +569,9 @@ hold AS (
          original_worker_id, original_worker_identity, live_worker_id, live_run_id,
          created_at, updated_at)
     SELECT gen_random_uuid(), t.user_id, t.repo_id, t.id, t.claim_generation + 1, 'open',
-           $1, $16::text, $1, t.id, now(), now()
+           $1, $19::text, $1, t.id, now(), now()
     FROM target t
-    WHERE $17::boolean
+    WHERE $20::boolean
       AND t.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework')
     RETURNING 1
 )
@@ -555,6 +592,11 @@ UPDATE runs SET
     -- flight's own first report. A run that was never released has claim_released_at NULL
     -- already, so this is a harmless no-op on the ordinary claim path.
     claim_released_at = NULL,
+    -- PRD #1390 M3 (D2 hygiene): clear the stale-requeue provenance on every fresh claim, alongside
+    -- the generation bump. The refund in ReadoptRunsFromSnapshot fires only when
+    -- stale_requeue_generation = claim_generation, so leaving a stale value here could refund a
+    -- requeue_count charged against a generation this claim has already replaced.
+    stale_requeue_generation = NULL,
     -- Exit contract (PRD #47 Decision 3): leaving 'queued' clears any health flag
     -- the detector raised (e.g. "no worker online"). health_notified_at is NOT reset.
     health = 'ok', health_reason = NULL, health_since = NULL
@@ -577,6 +619,9 @@ type ClaimRunParams struct {
 	IsEphemeral           bool               `json:"is_ephemeral"`
 	EphemeralRunID        pgtype.UUID        `json:"ephemeral_run_id"`
 	SpreadCutoff          pgtype.Timestamptz `json:"spread_cutoff"`
+	SnapshotFreshCutoff   pgtype.Timestamptz `json:"snapshot_fresh_cutoff"`
+	RequestActiveIds      []uuid.UUID        `json:"request_active_ids"`
+	RequestActiveGens     []int64            `json:"request_active_gens"`
 	BackgroundGraceCutoff pgtype.Timestamptz `json:"background_grace_cutoff"`
 	WorkerIdentity        string             `json:"worker_identity"`
 	RecoveryCapable       bool               `json:"recovery_capable"`
@@ -633,6 +678,9 @@ func (q *Queries) ClaimRun(ctx context.Context, arg ClaimRunParams) (Run, error)
 		arg.IsEphemeral,
 		arg.EphemeralRunID,
 		arg.SpreadCutoff,
+		arg.SnapshotFreshCutoff,
+		arg.RequestActiveIds,
+		arg.RequestActiveGens,
 		arg.BackgroundGraceCutoff,
 		arg.WorkerIdentity,
 		arg.RecoveryCapable,

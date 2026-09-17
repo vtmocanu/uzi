@@ -53,6 +53,14 @@ export class ActiveRunRegistry {
     return this.runs.size;
   }
 
+  /** Whether this worker is CURRENTLY executing `runId` (PRD #1390 M3, blocker 7). Read
+   *  by the claim loop's belt-and-braces duplicate-claim assertion: a returned claim whose
+   *  id is already live is refused, never double-executed. The server-side pre-claim dedupe
+   *  is the real guard; this is the loud last line of defence. */
+  has(runId: string): boolean {
+    return this.runs.has(runId);
+  }
+
   /**
    * Build the next {@link ActiveSnapshot}: increment the shared epoch and project the
    * live registry to wire entries. The `register_nonce` is NOT stamped here — the client

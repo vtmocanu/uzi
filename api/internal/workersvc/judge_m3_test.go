@@ -286,7 +286,7 @@ func TestJudgeClaimCarriesModelAndSignal(t *testing.T) {
 	svc := New(fs, box, testParams())
 	svc.SetSettings(fakeSettings{enabled: true, model: "haiku"})
 
-	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid})
+	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid}, nil)
 	if err != nil || payload == nil {
 		t.Fatalf("Claim: payload=%v err=%v", payload, err)
 	}

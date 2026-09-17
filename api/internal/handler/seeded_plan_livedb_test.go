@@ -155,7 +155,7 @@ func TestSeededRunClaimCarriesApprovedPlanNoInputRowLiveDB(t *testing.T) {
 		t.Fatalf("created run status = %q, want queued", run.Status)
 	}
 
-	payload, err := f.svc.Claim(ctx, f.wkr)
+	payload, err := f.svc.Claim(ctx, f.wkr, nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -214,7 +214,7 @@ func TestSeededRunFallThroughToGateDisarmsLiveDB(t *testing.T) {
 	// Claim #1: at birth the run is armed (plan_approved true), which is correct — this
 	// is the state the D8 fall-through must NOT be able to resurrect after the worker
 	// overwrites plan_md.
-	first, err := f.svc.Claim(ctx, f.wkr)
+	first, err := f.svc.Claim(ctx, f.wkr, nil)
 	if err != nil {
 		t.Fatalf("first Claim: %v", err)
 	}
@@ -263,7 +263,7 @@ func TestSeededRunFallThroughToGateDisarmsLiveDB(t *testing.T) {
 	// Re-claim: the run is now an ordinary agent-planned run with no approval behind it,
 	// so it must come back DISARMED. Without the plan_source='agent' write above, this
 	// assertion reads true and the run would implement a plan no human ever saw.
-	second, err := f.svc.Claim(ctx, f.wkr)
+	second, err := f.svc.Claim(ctx, f.wkr, nil)
 	if err != nil {
 		t.Fatalf("re-claim: %v", err)
 	}
@@ -317,7 +317,7 @@ func TestSeededRunClaimCarriesPlannedBaseCommitLiveDB(t *testing.T) {
 	}
 
 	// The claim re-delivers both to the worker.
-	payload, err := f.svc.Claim(ctx, f.wkr)
+	payload, err := f.svc.Claim(ctx, f.wkr, nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -359,7 +359,7 @@ func TestSeededRunNoPlannedCommitClaimIsInertLiveDB(t *testing.T) {
 		t.Error("require_base_match = true, want false by default")
 	}
 
-	payload, err := f.svc.Claim(ctx, f.wkr)
+	payload, err := f.svc.Claim(ctx, f.wkr, nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}

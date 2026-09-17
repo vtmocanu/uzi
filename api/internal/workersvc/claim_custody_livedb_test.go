@@ -60,7 +60,7 @@ func TestClaimOpensCustodyHoldLiveDB(t *testing.T) {
 		ID: workerID, UserID: userID, Name: "worker-alpha", Status: "online",
 		ProtocolCapabilities: []string{capability.RecoveryArchiveV1},
 	}
-	payload, err := svc.Claim(env.ctx, capableWkr)
+	payload, err := svc.Claim(env.ctx, capableWkr, nil)
 	if err != nil {
 		t.Fatalf("Claim(capable): %v", err)
 	}
@@ -98,7 +98,7 @@ func TestClaimOpensCustodyHoldLiveDB(t *testing.T) {
 	// ── Non-capable worker: claim increments the generation but opens NO hold (D9). ──
 	runB := seedQueuedRun(102)
 	plainWkr := store.Worker{ID: workerID, UserID: userID, Name: "worker-alpha", Status: "online"} // no recovery_archive_v1
-	payloadB, err := svc.Claim(env.ctx, plainWkr)
+	payloadB, err := svc.Claim(env.ctx, plainWkr, nil)
 	if err != nil {
 		t.Fatalf("Claim(non-capable): %v", err)
 	}

@@ -32,7 +32,7 @@ func TestClaimGateDrainingWorkerReachesClaimRunScoped(t *testing.T) {
 		UserID:        uuid.New(),
 		DrainingSince: pgtype.Timestamptz{Time: time.Now(), Valid: true},
 	}
-	payload, err := svc.Claim(context.Background(), wkr)
+	payload, err := svc.Claim(context.Background(), wkr, nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -56,7 +56,7 @@ func TestClaimNonDrainingWorkerProceeds(t *testing.T) {
 	svc := New(fs, newBox(t), testParams())
 
 	// worker() constructs a store.Worker with a zero-value DrainingSince (Valid=false).
-	payload, err := svc.Claim(context.Background(), worker())
+	payload, err := svc.Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}

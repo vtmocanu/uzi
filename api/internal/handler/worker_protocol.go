@@ -759,8 +759,38 @@ func (h *Handler) WorkerClaim(w http.ResponseWriter, r *http.Request) {
 		}
 		httpx.JSON(w, http.StatusOK, payload)
 	case "", "run":
-		payload, err := h.wsvc.Claim(r.Context(), wkr)
+		// PRD #1390 M3 (Task 1): the run-lane claim carries the worker's active-run snapshot, so a
+		// claim that beats the first post-outage heartbeat (fact 7) still dedupes and pre-locks its
+		// own runs. Strict-decode a body with just `active_snapshot`, treating EOF as "no snapshot"
+		// (the same !io.EOF guard the heartbeat/register handlers use) so an OLD bodyless worker
+		// never 400s. Chat stays bodyless (D10).
+		var req struct {
+			ActiveSnapshot json.RawMessage `json:"active_snapshot"`
+		}
+		if err := httpx.DecodeJSON(r, &req); err != nil && !errors.Is(err, io.EOF) {
+			httpx.Error(w, http.StatusBadRequest, "invalid request body")
+			return
+		}
+		// Feature gate, mirroring WorkerHeartbeat's D7 rule EXACTLY: a disabled api 400s a claim that
+		// still carries the field (the same generic 400 that triggers the worker's strip-and-retry);
+		// when enabled, parse the snapshot defensively (a malformed body drops to nil).
+		var snapshot *workersvc.ActiveSnapshot
+		if h.cfg.ActiveSnapshotDisabled {
+			if req.ActiveSnapshot != nil {
+				httpx.Error(w, http.StatusBadRequest, "invalid request body")
+				return
+			}
+		} else {
+			snapshot = parseActiveSnapshot(req.ActiveSnapshot, wkr.ID)
+		}
+		payload, err := h.wsvc.Claim(r.Context(), wkr, snapshot)
 		if err != nil {
+			// An invalid/stale-epoch/wrong-nonce claim snapshot fails the claim CLOSED (D3): 400,
+			// no claim, no side effect. Same generic body the worker reads for its strip-and-retry.
+			if errors.Is(err, workersvc.ErrActiveSnapshotInvalid) {
+				httpx.Error(w, http.StatusBadRequest, "invalid request body")
+				return
+			}
 			slog.Error("worker claim", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 			return

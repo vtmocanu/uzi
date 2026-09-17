@@ -20,6 +20,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/config"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -116,6 +117,39 @@ func TestWorkerClaimIdleReturns204NoBody(t *testing.T) {
 	}
 	if rec.Body.Len() != 0 {
 		t.Fatalf("204 must have an empty body, got %q", rec.Body.String())
+	}
+}
+
+func TestWorkerClaimRunLaneAcceptsSnapshotBody(t *testing.T) {
+	// PRD #1390 M3 (Task 1): the run lane now decodes an active_snapshot body. The strict decoder
+	// must ACCEPT the field (never 400 a claim that carries it) when the feature is enabled; with
+	// the fake ClaimRun idle it answers 204, proving the field was accepted and the claim ran.
+	h := newProtocolHandler(t, &protocolStore{claimErr: pgx.ErrNoRows})
+	rec := httptest.NewRecorder()
+	body := `{"active_snapshot":{"snapshot_epoch":1,"register_nonce":"n","active":[]}}`
+	h.WorkerClaim(rec, workerReq(http.MethodPost, body, uuid.Nil))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204 (a run-lane claim carrying active_snapshot must not 400), body %q", rec.Code, rec.Body.String())
+	}
+}
+
+func TestWorkerClaimDisabledApiRejectsSnapshotBody(t *testing.T) {
+	// PRD #1390 D7: an api started with UZI_ACTIVE_SNAPSHOT_DISABLED 400s a claim that still carries
+	// the field (the generic 400 that triggers the worker's strip-and-retry) — but an OLD bodyless
+	// claim on the same api still succeeds (never a lost claim).
+	h := newProtocolHandler(t, &protocolStore{claimErr: pgx.ErrNoRows})
+	h.cfg = config.Config{ActiveSnapshotDisabled: true}
+
+	withField := httptest.NewRecorder()
+	h.WorkerClaim(withField, workerReq(http.MethodPost, `{"active_snapshot":{"snapshot_epoch":1,"active":[]}}`, uuid.Nil))
+	if withField.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (a disabled api rejects a claim carrying active_snapshot)", withField.Code)
+	}
+
+	bodyless := httptest.NewRecorder()
+	h.WorkerClaim(bodyless, workerReq(http.MethodPost, "", uuid.Nil))
+	if bodyless.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204 (an old bodyless claim must not 400 on a disabled api)", bodyless.Code)
 	}
 }
 
