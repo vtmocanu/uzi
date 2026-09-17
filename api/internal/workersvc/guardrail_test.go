@@ -84,7 +84,7 @@ func TestCreateRunGuardrailBlocksBeforeInsert(t *testing.T) {
 	svc := New(fs, newBox(t), testParams())
 	svc.SetRepoGuard(guard)
 
-	_, err := svc.CreateRun(context.Background(), user, repo, 4, "desc", nil, nil, false, nil, nil)
+	_, err := svc.CreateRun(context.Background(), user, repo, 4, "desc", nil, nil, false, nil, nil, nil)
 	assertGuardrailBlocked(t, err, wantMsgs)
 	if guard.called != 1 {
 		t.Fatalf("guard called %d times, want 1", guard.called)
@@ -142,7 +142,7 @@ func TestCreatePromptRunGuardrailBlocksBeforeInsert(t *testing.T) {
 	svc := New(fs, newBox(t), testParams())
 	svc.SetRepoGuard(guard)
 
-	_, err := svc.CreatePromptRun(context.Background(), user, repo, sched, "t", "p", false, false, nil, nil, false, nil)
+	_, err := svc.CreatePromptRun(context.Background(), user, repo, sched, "t", "p", false, false, nil, nil, false, nil, nil)
 	assertGuardrailBlocked(t, err, wantMsgs)
 	if guard.called != 1 {
 		t.Fatalf("guard called %d times, want 1", guard.called)
@@ -161,7 +161,7 @@ func TestCreatePromptRunNotBlockedGuardProceeds(t *testing.T) {
 	svc := New(fs, newBox(t), testParams())
 	svc.SetRepoGuard(guard)
 
-	if _, err := svc.CreatePromptRun(context.Background(), user, repo, sched, "t", "p", false, false, nil, nil, false, nil); err != nil {
+	if _, err := svc.CreatePromptRun(context.Background(), user, repo, sched, "t", "p", false, false, nil, nil, false, nil, nil); err != nil {
 		t.Fatalf("CreatePromptRun with a clearing guard: %v", err)
 	}
 	if guard.called != 1 {
@@ -185,7 +185,7 @@ func TestCreateRunNotBlockedGuardProceeds(t *testing.T) {
 	svc := New(fs, newBox(t), testParams())
 	svc.SetRepoGuard(guard)
 
-	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "desc", nil, nil, false, nil, nil); err != nil {
+	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "desc", nil, nil, false, nil, nil, nil); err != nil {
 		t.Fatalf("CreateRun with a clearing guard: %v", err)
 	}
 	if guard.called != 1 {
@@ -330,7 +330,7 @@ func TestCreateRunThreadsOverriddenFromRow(t *testing.T) {
 			svc := New(fs, newBox(t), testParams())
 			svc.SetRepoGuard(guard)
 
-			if _, err := svc.CreateRun(context.Background(), user, repo, 4, "desc", nil, nil, false, nil, nil); err != nil {
+			if _, err := svc.CreateRun(context.Background(), user, repo, 4, "desc", nil, nil, false, nil, nil, nil); err != nil {
 				t.Fatalf("CreateRun: %v", err)
 			}
 			if guard.lastInput.Overridden != tc.wantOverr {
@@ -381,7 +381,7 @@ func TestCreateRunNilGuardNotBlocked(t *testing.T) {
 	}
 	svc := New(fs, newBox(t), testParams()) // SetRepoGuard deliberately not called
 
-	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "desc", nil, nil, false, nil, nil); err != nil {
+	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "desc", nil, nil, false, nil, nil, nil); err != nil {
 		t.Fatalf("CreateRun with a nil guard must not be guardrail-blocked: %v", err)
 	}
 	if fs.createRunParams == nil {

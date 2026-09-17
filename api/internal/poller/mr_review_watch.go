@@ -291,6 +291,13 @@ func (d *MRReviewWatch) detectOne(ctx context.Context, r store.ListEnabledReposW
 	case errors.Is(err, workersvc.ErrBranchInUse), errors.Is(err, workersvc.ErrActiveMRReworkExists):
 		// A race with a ci_fix on the branch, or a concurrent rework on this MR: swallow,
 		// do not advance the ledger, retry next tick.
+	case errors.Is(err, workersvc.ErrNoCredentialForHarness):
+		// PRD #1429 M2 (D4): the automatic rework INHERITS the source run's harness explicitly; if
+		// that harness is no longer usable, creation refuses with no fallback. Record a legible,
+		// static, NONSECRET skip on the poller feed (never a raw error), do NOT advance the ledger,
+		// and do not retry into a doomed create — a credential change re-enables it next tick.
+		slog.Warn("poller: mr-rework skipped: source-run harness has no usable credential",
+			"repo", r.PathWithNamespace, "ref", ref, "source_run", cand.SourceRunID.String())
 	default:
 		slog.Error("poller: mr-rework create run", "repo", r.PathWithNamespace, "ref", ref, "error", err)
 	}

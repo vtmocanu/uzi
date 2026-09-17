@@ -86,6 +86,12 @@ func TestIssueCommentsSnapshotLiveDB(t *testing.T) {
 		}
 	}
 	exec(`INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`, userID, fmt.Sprintf("m2a-comments-%s@e2e", userID))
+	// PRD #1429 M2: CreateRun now resolves a real D11 harness at create time, refusing with
+	// no_usable_credential when neither harness is usable — orthogonal to the comments-snapshot
+	// behaviour under test, so give the user a usable Anthropic token (Claude, byte-identical).
+	exec(`INSERT INTO user_secrets (id, user_id, kind, label, is_default, ciphertext, sealed_with)
+	      VALUES ($1, $2, 'anthropic_token', 'anthropic-default', true, $3, 'master')`,
+		uuid.New(), userID, []byte("ct"))
 	// Connection with a KNOWN bot id (100) and one with an UNKNOWN bot id (0, D9).
 	exec(`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
 	      VALUES ($1, $2, 'gitlab', 'https://forge.e2e', 'uzi-bot', $3, $4)`, connKnown, userID, botID, []byte{0x1})
@@ -116,7 +122,7 @@ func TestIssueCommentsSnapshotLiveDB(t *testing.T) {
 	}
 
 	// (1) Human + bot ⇒ stored JSONB carries the human comment and NOT the bot one.
-	run1, err := svc.CreateRun(ctx, userID, repoKnown, 11, "desc", &waitFalse, nil, false, nil, nil)
+	run1, err := svc.CreateRun(ctx, userID, repoKnown, 11, "desc", &waitFalse, nil, false, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("create run for issue 11: %v", err)
 	}
@@ -141,7 +147,7 @@ func TestIssueCommentsSnapshotLiveDB(t *testing.T) {
 	}
 
 	// (2) Only bot comments ⇒ stored NULL.
-	run2, err := svc.CreateRun(ctx, userID, repoKnown, 12, "desc", &waitFalse, nil, false, nil, nil)
+	run2, err := svc.CreateRun(ctx, userID, repoKnown, 12, "desc", &waitFalse, nil, false, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("create run for issue 12: %v", err)
 	}
@@ -150,7 +156,7 @@ func TestIssueCommentsSnapshotLiveDB(t *testing.T) {
 	}
 
 	// (3) Human comment but the connection's bot id is 0 ⇒ D9 stores NULL.
-	run3, err := svc.CreateRun(ctx, userID, repoZero, 13, "desc", &waitFalse, nil, false, nil, nil)
+	run3, err := svc.CreateRun(ctx, userID, repoZero, 13, "desc", &waitFalse, nil, false, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("create run for issue 13: %v", err)
 	}

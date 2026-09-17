@@ -47,26 +47,28 @@ func (s *Service) CreateSelfImproveRun(ctx context.Context, userID, repoID uuid.
 	if err := s.guardDefaultBranch(ctx, row); err != nil {
 		return store.Run{}, err
 	}
-	run, err := s.q.CreateSelfImproveRun(ctx, store.CreateSelfImproveRunParams{
-		UserID:           userID,
-		RepoID:           repoID,
-		IssueIid:         pgtype.Int8{Int64: issueIID, Valid: true},
-		IssueTitle:       title,
-		IssueDescription: description,
-		// PRD #35: the OWNER's default. An engine tick has no user in the loop either.
-		WaitOnLimit: s.resolveWaitOnLimit(ctx, userID, nil),
-		// PRD #590 M1: the schedule-driven fire path threads the schedule's per-schedule
-		// model override and "apply model also to agents" opt-in; the bespoke engine passes
-		// nil/false, freezing NULL/false onto its run exactly as before.
-		Model:                 pgconv.TextPtr(model),
-		OverrideSubagentModel: overrideSubagentModel,
-		// PRD #908 M1: the schedule's mr_rework override, stamped THROUGH live-inherit —
-		// nil ⇒ NULL ⇒ the run follows the owner default at read time.
-		MrReworkEnabled: pgconv.BoolPtr(mrReworkEnabled),
-		// PRD #1429 M1 stopgap: harness is now the @harness param. Stamp Claude explicitly
-		// (byte-identical to today); M2 threads the resolved D11 harness. Omitting it would
-		// ship harness='' → 23514.
-		Harness: string(HarnessClaude),
+	// PRD #1429 M2: self_improve carries no override (D10) and no source run, so it uses IMPLICIT
+	// D11 (nil explicit) — the resolve + freeze commit atomically with the INSERT.
+	run, err := s.createRunResolved(ctx, userID, nil /*explicit: implicit D11*/, func(q Store, resolved resolvedHarness) (store.Run, error) {
+		return q.CreateSelfImproveRun(ctx, store.CreateSelfImproveRunParams{
+			UserID:           userID,
+			RepoID:           repoID,
+			IssueIid:         pgtype.Int8{Int64: issueIID, Valid: true},
+			IssueTitle:       title,
+			IssueDescription: description,
+			// PRD #35: the OWNER's default. An engine tick has no user in the loop either.
+			WaitOnLimit: s.resolveWaitOnLimit(ctx, userID, nil),
+			// PRD #590 M1: the schedule-driven fire path threads the schedule's per-schedule
+			// model override and "apply model also to agents" opt-in; the bespoke engine passes
+			// nil/false, freezing NULL/false onto its run exactly as before.
+			Model:                 pgconv.TextPtr(model),
+			OverrideSubagentModel: overrideSubagentModel,
+			// PRD #908 M1: the schedule's mr_rework override, stamped THROUGH live-inherit —
+			// nil ⇒ NULL ⇒ the run follows the owner default at read time.
+			MrReworkEnabled: pgconv.BoolPtr(mrReworkEnabled),
+			// PRD #1429 M2 (D1 auditor invariant): the D11-resolved harness frozen in-tx.
+			Harness: string(resolved.Harness),
+		})
 	})
 	if err != nil {
 		if isUniqueViolation(err) {
