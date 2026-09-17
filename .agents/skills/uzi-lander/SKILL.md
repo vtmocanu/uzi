@@ -199,12 +199,21 @@ a user reply that arrives first wins.
 
 ## Keep this skill and its scripts current
 
-- A factually wrong line here or in a script is fixed the moment you find it.
-- Behaviour changes, new scripts and new rules are batched into **one end-of-session ask**
-  ("these three improvements to `uzi-lander`, ok?"), not applied silently.
+- **Never hand-roll a poll loop inline.** Every wait goes through a bundled poller; an
+  ad-hoc heredoc is where the path typos and fail-open reads came from. When a poller
+  lacks a signal, stop state, flag or exit code, extend the script: keep its existing exit
+  contract stable, add the new code, document it in the header, keep it
+  shellcheck-clean (`task lint:shell`, which walks tracked scripts only, so run it after
+  `git add`).
+- A factually wrong line here or in a script is fixed the moment you find it. A poller
+  change the current landing needs is made now, on a `[skip-cr]` branch you open at once
+  and run from; a nice-to-have waits.
+- Other behaviour changes, new scripts and new rules are batched into **one
+  end-of-session ask** ("these three improvements to `uzi-lander`, ok?"), not applied
+  silently.
 - A skill-maintenance PR is titled with `[skip-cr]` (no bot review), reviewed by a local
-  agent or a peer session, and by the user. Scripts stay shellcheck-clean (`task
-  lint:shell`) with stable exit-code contracts; re-run `agnix` on `SKILL.md` after editing.
+  agent or a peer session, and by the user. Re-run `agnix` on `SKILL.md` after editing;
+  `task check:skill-size` gates the size.
 
 ## Files
 
