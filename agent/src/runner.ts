@@ -672,6 +672,14 @@ interface RunFlight {
   branch: string | undefined;
   active: ActiveRun | undefined;
   parked: boolean;
+  /** PRD #1391 Run B M3 (N2/D5): true once ANY terminal outcome for this generation has been
+   *  sent/resolved through {@link RunRunner.journalAndSendTerminal} — a run-lane completed/failed
+   *  site, the permanent-failure hook, or reportGenericFailure itself. A journaled outcome is FINAL,
+   *  so once this latches, reportGenericFailure never reports a SECOND `failed` — even after a 200
+   *  RETIRED the journal (which makes `hasPendingTerminal` read false), the exact fall-through this
+   *  latch closes. Distinct from `hasPendingTerminal`: that reads the on-disk journal (kept), this
+   *  survives the journal's retirement. false until the first terminal resolve. */
+  terminalResolved: boolean;
   preserveSession: boolean;
   /** PRD #1392 M2: this run parked on a PRE-CLONE forge-unreachable transient error, so it
    *  captured no clone and no model session. Unlike a limit_wait/recovery park, it preserves its
@@ -1760,7 +1768,11 @@ export class RunRunner {
   ): Promise<void> {
     const deps = this.terminalDeps();
     if (!deps) {
+      // No usable outbox: send un-journaled exactly as today. A stale ack still THROWS
+      // StaleClaimError out of `send` and propagates to executeClaim's catch (there is no journal to
+      // stale-retire on this degradation path), so this branch is byte-for-byte unchanged.
       await send(body);
+      flight.terminalResolved = true;
       return;
     }
     await journalAndResolveTerminal(deps, {
@@ -1769,8 +1781,65 @@ export class RunRunner {
       phase,
       messagesThroughSeq: flight.batcher.currentSeq(),
       body,
-      send,
+      // PRD #1391 Run B M3b (B1): the run-lane reportState choke point (flight.reportState, reached
+      // through every `send` closure a terminal site passes here) THROWS StaleClaimError on a stale
+      // ack instead of RETURNING it — the shape resolvePendingTerminal's catch would otherwise read
+      // as a transport failure and KEEP the journal forever, leaking the run's whole outbox tree and
+      // holding its terminal_pending lease (and, past the cap, pending_overflow) open (D11). Normalize
+      // the throw into the `{applied:false, staleClaim:true}` ack actOnAck stale-retires on, so a
+      // superseded generation local-retires the journal UNIFORMLY across lanes (the judge/review/boot
+      // lanes already return this shape via raw client.reportState). StaleClaimError is defined and
+      // caught entirely within this file — it never leaks into terminal-resolve.ts. A genuine
+      // transport error still propagates, and resolvePendingTerminal keeps the journal for a later
+      // resolve, exactly as designed.
+      send: async (b, sig) => {
+        try {
+          return await send(b, sig);
+        } catch (err) {
+          if (err instanceof StaleClaimError) return { applied: false, staleClaim: true };
+          throw err;
+        }
+      },
     });
+    // PRD #1391 Run B M3 (N2/D5): latch that a terminal outcome for this generation has resolved, so
+    // a later reportGenericFailure never reports a SECOND `failed` — even after a 200 RETIRED the
+    // journal (hasPendingTerminal then reads false). Skipped on a throw above (reserve_exhausted's
+    // un-journaled send that failed), so that fallback still reports failed as today.
+    flight.terminalResolved = true;
+  }
+
+  /**
+   * PRD #1391 Run B M3 (D5): the permanent message-failure hook body, extracted from the batcher's
+   * onPermanentFailureReport closure so its ORDERING is unit-testable against the REAL shipping code
+   * (runner-terminal-journal.test.ts) rather than a synthetic hand-rolled handler. The `failed`
+   * journal is durably installed and resolved BEFORE `flight.cancel.abort()` is observable, so a
+   * completion racing the trip can never reverse the first durable winner (the no-replace install in
+   * journalTerminal arbitrates, D4). journalAndSendTerminal awaits the durable install; only then does
+   * the abort fire, unwinding execute() into reportGenericFailure — which awaits this settlement,
+   * finds the durable journal / the terminalResolved latch, and reports no second `failed` (fact 2).
+   * When no outbox is wired this degrades to today's direct `failed` report + abort. The abort is
+   * guarded so a concurrent abort (a racing steering-cancel/shutdown) is never doubled.
+   */
+  private async handlePermanentFailure(flight: RunFlight, reason: string): Promise<void> {
+    try {
+      await this.journalAndSendTerminal(
+        flight,
+        TERMINAL_JOURNAL_PHASE,
+        {
+          status: "failed",
+          failure_reason: reason.slice(0, MAX_FAILURE_REASON_LEN),
+        },
+        (b, sig) => flight.reportState(b, sig),
+      );
+    } catch (e) {
+      flight.runLog.error("could not journal/report the message-transport failure", {
+        error: errMessage(e),
+      });
+    }
+    // Abort the attempt ONLY AFTER the durable journal is installed (D5/D4), so execute() falls into
+    // its catch (→ reportGenericFailure, which awaits this handler's settlement, finds the durable
+    // journal / the terminalResolved latch, and does NOT report a second `failed`).
+    if (!flight.cancel.signal.aborted) flight.cancel.abort();
   }
 
   /**
@@ -1811,12 +1880,17 @@ export class RunRunner {
     // observed as installed before the hasPendingTerminal check below. Resolves immediately when the
     // breaker never tripped (every ordinary failure), so this is a no-op on the common path.
     await batcher.awaitPermanentFailureSettled();
-    // PRD #1391 Run B M3 (fact 2, D5): a JOURNALED outcome is FINAL. If a terminal journal already
-    // exists for this generation — the permanent-failure hook's durable `failed`, or a terminal site
-    // that journaled write-ahead before throwing into this catch — do NOT fall through to a SECOND
-    // `failed`: the first durable winner stands (the no-replace install arbitrates, D4). Still close
-    // the batcher and settle recovery custody (clone cleanup is independent of the report).
-    if (this.outbox && this.outbox.hasPendingTerminal(flight.runId, flight.claimGeneration)) {
+    // PRD #1391 Run B M3 (fact 2, D5, N2): a JOURNALED/RESOLVED outcome is FINAL. Do NOT fall through
+    // to a SECOND `failed` when EITHER a terminal outcome for this generation has already resolved
+    // (the `terminalResolved` latch — set even after a 200 RETIRED the journal, so hasPendingTerminal
+    // reads false) OR a write-ahead journal is still installed (the permanent-failure hook's durable
+    // `failed`, or a terminal site that journaled before throwing into this catch). The first durable
+    // winner stands (the no-replace install arbitrates, D4). Still close the batcher and settle
+    // recovery custody (clone cleanup is independent of the report).
+    if (
+      flight.terminalResolved ||
+      (this.outbox && this.outbox.hasPendingTerminal(flight.runId, flight.claimGeneration))
+    ) {
       runLog.info("run outcome already journaled write-ahead; not reporting a second failed", {
         run_id: flight.runId,
         claim_generation: flight.claimGeneration,
@@ -2388,7 +2462,9 @@ export class RunRunner {
         },
       });
       await closeBatcher();
-      await reportState({ status: "completed", fix_verdict: "not_code" });
+      // PRD #1391 Run B M3 (N1): journal write-ahead so an outage keeps the exact not_code
+      // completion, not a generic agent_failure.
+      await journalTerminalReport({ status: "completed", fix_verdict: "not_code" });
       runLog.info("ci_fix run completed with not_code verdict", {
         run_id: runId,
       });
@@ -2431,7 +2507,9 @@ export class RunRunner {
           },
         });
         await closeBatcher();
-        await reportState({
+        // PRD #1391 Run B M3 (N1): journal write-ahead so the typed orphan-checkpoint failure
+        // survives an outage as this exact outcome, not a generic agent_failure.
+        await journalTerminalReport({
           status: "failed",
           failure_reason:
             "signal_done was called with report_only, but this run published committed work to a checkpoint ref (refs/uzi-checkpoints/" +
@@ -2451,7 +2529,9 @@ export class RunRunner {
         },
       });
       await closeBatcher();
-      await reportState({
+      // PRD #1391 Run B M3 (N1): journal write-ahead so the report_only completion (report_md) is
+      // the durable outcome after an outage, not a generic agent_failure.
+      await journalTerminalReport({
         status: "completed",
         report_only: true,
         report_md: result.summary,
@@ -2540,7 +2620,9 @@ export class RunRunner {
               },
             });
             await closeBatcher();
-            await reportState({
+            // PRD #1391 Run B M3 (N1): journal the scope-capped report_only completion write-ahead
+            // so its exact outcome survives an outage, not a generic agent_failure.
+            await journalTerminalReport({
               status: "completed",
               report_only: true,
               scope_capped: true,
@@ -2563,7 +2645,9 @@ export class RunRunner {
             },
           });
           await closeBatcher();
-          await reportState({
+          // PRD #1391 Run B M3 (N1): journal write-ahead so the undeclared empty-diff failure is the
+          // durable outcome after an outage, not a generic agent_failure.
+          await journalTerminalReport({
             status: "failed",
             failure_reason:
               "signal_done was called but no changes were committed, and report_only was not set. If this run's deliverable is a report or command output with no code change, call signal_done with report_only: true.",
@@ -2615,7 +2699,9 @@ export class RunRunner {
             },
           });
           await closeBatcher();
-          await reportState({
+          // PRD #1391 Run B M3 (N1): journal write-ahead so the prompt-kind orphan-checkpoint failure
+          // survives an outage as this exact outcome, not a generic agent_failure.
+          await journalTerminalReport({
             status: "failed",
             failure_reason:
               "signal_done was called with report_only, but this run published committed work to a checkpoint ref (refs/uzi-checkpoints/" +
@@ -2635,7 +2721,10 @@ export class RunRunner {
           },
         });
         await closeBatcher();
-        await reportState({
+        // PRD #1391 Run B M3 (N1): journal write-ahead so the prompt report_only completion (its
+        // report_md AND any structured proposal) is the durable outcome after an outage, not a
+        // generic agent_failure that loses the proposal.
+        await journalTerminalReport({
           status: "completed",
           report_only: true,
           report_md: result.summary,
@@ -3191,7 +3280,11 @@ export class RunRunner {
                 run_id: runId,
               });
               await closeBatcher();
-              await reportState({
+              // PRD #1391 Run B M3 (N1): journal write-ahead so the typed base-align-conflict failure
+              // — its fail_origin AND its preserved_patch (the canonicaliser handles the diff size) —
+              // survives an outage as this exact outcome, not a generic agent_failure that loses the
+              // diff a human needs to land.
+              await journalTerminalReport({
                 status: "failed",
                 failure_reason: composeBaseAlignConflictReason(alignDefaultBranch),
                 fail_origin: "finalize_base_align_conflict",
@@ -3678,7 +3771,9 @@ export class RunRunner {
         return;
       }
       await closeBatcher();
-      await reportState({ status: "failed", failure_reason: COMPLETION_INTERLOCK_UNHELD_REASON });
+      // PRD #1391 Run B M3 (N1): journal write-ahead so the completion-interlock failure survives an
+      // outage as this exact outcome, not a generic agent_failure.
+      await journalTerminalReport({ status: "failed", failure_reason: COMPLETION_INTERLOCK_UNHELD_REASON });
       runLog.info("run failed: completion interlock could not park the incomplete run", {
         run_id: runId,
         reason: holdReason,
@@ -3694,7 +3789,9 @@ export class RunRunner {
     const failInterlockedClosed = async (reason: string): Promise<void> => {
       executor.killAgentTree?.();
       await closeBatcher().catch(() => undefined);
-      await reportState({ status: "failed", failure_reason: COMPLETION_INTERLOCK_UNHELD_REASON });
+      // PRD #1391 Run B M3 (N1): journal write-ahead so the fail-closed completion-interlock outcome
+      // survives an outage as this exact outcome, not a generic agent_failure.
+      await journalTerminalReport({ status: "failed", failure_reason: COMPLETION_INTERLOCK_UNHELD_REASON });
       runLog.info("run failed closed: completion interlock could not guarantee a non-closing MR", {
         run_id: runId,
         reason,
@@ -4158,6 +4255,10 @@ export class RunRunner {
       // rather than in the catch so the finally can see it; false is the safe default,
       // so every path that never reaches the park logic cleans up exactly as before.
       parked: false,
+      // PRD #1391 Run B M3 (N2/D5): no terminal outcome resolved yet. Set by journalAndSendTerminal
+      // the moment any completed/failed for this generation is sent/resolved (write-ahead or not),
+      // so reportGenericFailure never falls through to a SECOND `failed` once one is final.
+      terminalResolved: false,
       // PRD #556 M1 / #1197: set by shutdown or a pending recovery capture/report.
       // Like `parked`, it gates EXACTLY the two filesystem removals in the
       // finally (the sibling skills plugin dir and the per-run HOME) and nothing else — so
@@ -4185,27 +4286,9 @@ export class RunRunner {
     // install, so by the time the abort fires the `failed` is on disk. Chat keeps today's non-journal
     // behaviour (chat-runner.ts). When no outbox is wired this degrades to today's direct `failed`
     // report + abort.
-    batcher.onPermanentFailureReport(async ({ reason }) => {
-      try {
-        await this.journalAndSendTerminal(
-          flight,
-          TERMINAL_JOURNAL_PHASE,
-          {
-            status: "failed",
-            failure_reason: reason.slice(0, MAX_FAILURE_REASON_LEN),
-          },
-          (b, sig) => flight.reportState(b, sig),
-        );
-      } catch (e) {
-        runLog.error("could not journal/report the message-transport failure", {
-          error: errMessage(e),
-        });
-      }
-      // Abort the attempt so execute() falls into its catch (→ reportGenericFailure, which awaits
-      // this handler's settlement, finds the durable journal, and does NOT report a second `failed`).
-      // Guarded so a concurrent abort (a racing steering-cancel/shutdown) is never doubled.
-      if (!flight.cancel.signal.aborted) flight.cancel.abort();
-    });
+    // The hook body lives in handlePermanentFailure (a named method) so its journal-BEFORE-abort
+    // ordering is unit-testable against the REAL code — a mutation to abort-first reddens that test.
+    batcher.onPermanentFailureReport(({ reason }) => this.handlePermanentFailure(flight, reason));
 
     return flight;
   }

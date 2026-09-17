@@ -242,6 +242,21 @@ async function gapFillLoop(
   let filledTotal = 0;
   for (;;) {
     if (signal?.aborted) return; // aborted: leave the journal for a later resolve
+    // N3 (data-loss race): a gap-fill tombstone declares a seq UNRECOVERABLE, so it must run ONLY
+    // on a run whose message outbox is fully drained. If the drainer still holds undrained segments
+    // for this run (spilled during the same outage that is only now recovering), those segments
+    // cover seqs at/below the fence and the drainer WILL replay them — tombstoning here would race
+    // the drainer and destroy recoverable messages (the very hole the api reported is transient,
+    // closing as the drain lands). KEEP the journal and leave it for a later resolve after the drain
+    // completes; per the PRD gap-fill is only for a run "whose outbox is fully drained and still
+    // refused". Re-checked each pass so a drain that starts mid-loop stops the fill.
+    if (outbox.hasUndrainedMessages(runId)) {
+      log.info(
+        "outbox: terminal messages_pending but the run still has UNDRAINED message segments; leaving the journal for after the drain (not tombstoning)",
+        { run_id: runId },
+      );
+      return;
+    }
     // Collect every currently-missing seq in [1..fence], paging by keyset cursor. The gaps shrink as
     // we fill, but the keyset walk runs over higher closers than what we fill, so one pass covers the
     // whole hole (the trailing gap max_present..fence is included via the api's sentinel).
@@ -338,11 +353,27 @@ async function appendTombstones(
     await deps.client.postMessages(runId, msgs, claimGeneration, signal);
     return "sent";
   } catch (err) {
-    if (err instanceof RequestError && err.status === 409 && err.body.includes('"stale_claim"')) {
+    // Nit: read the PARSED top-level `disposition` off the 409 body (the same key readRunAck reads
+    // stale_claim from), never a fragile substring match on the raw JSON — a `"stale_claim"` literal
+    // could otherwise appear inside an unrelated error/message field and be misclassified.
+    if (err instanceof RequestError && err.status === 409 && has409Disposition(err.body, "stale_claim")) {
       return "stale_claim";
     }
     deps.log.warn("outbox: gap-fill tombstone append failed", { run_id: runId, error: errMessage(err) });
     return "error";
+  }
+}
+
+/** Parse a 409 RequestError body and report whether its TOP-LEVEL `disposition` equals `want`
+ *  (mirrors readRunAck's `parsed?.disposition === "stale_claim"` read). Total-by-construction: a
+ *  non-JSON or shapeless body answers false, so a malformed refusal is never misread as a stale
+ *  claim. */
+function has409Disposition(body: string, want: string): boolean {
+  try {
+    const parsed = JSON.parse(body) as { disposition?: unknown };
+    return parsed?.disposition === want;
+  } catch {
+    return false;
   }
 }
 

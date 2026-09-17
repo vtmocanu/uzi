@@ -373,4 +373,103 @@ describe("resolvePendingTerminal / journalAndResolveTerminal (PRD #1391 Run B M3
     delete sent.messages_through_seq;
     assert.deepEqual(sent, expected, "the sent body is the SAME canonical bytes, plus only the negotiated fence");
   });
+
+  // N3 (real data-loss race): gap-fill declares a seq UNRECOVERABLE, so it must run ONLY on a run
+  // whose message outbox is fully drained. A run that spilled during the same outage still has
+  // undrained segments covering those seqs; the drainer will replay them, so tombstoning here would
+  // race the drainer and destroy recoverable messages.
+  it("N3: does NOT tombstone a run with UNDRAINED local segments — keeps the journal for after the drain", async () => {
+    const { outbox } = await mkOutbox();
+    const client = new FakeClient();
+    const deps = depsFor(outbox, client);
+    // The run spilled messages [1..3] to the outbox (undrained: the drainer has not replayed them).
+    await outbox.appendSegment("r1", GEN, [
+      { seq: 1, kind: "text", agent: "lead", payload: { text: "a" } },
+      { seq: 2, kind: "text", agent: "lead", payload: { text: "b" } },
+      { seq: 3, kind: "text", agent: "lead", payload: { text: "c" } },
+    ]);
+    // The gaps read WOULD report [1..3] missing; on the unfixed code that becomes 3 tombstones.
+    client.gapsResponder = () => ({ gaps: [{ first: 1, last: 3 }] });
+
+    await journalAndResolveTerminal(deps, {
+      runId: "r1",
+      claimGeneration: GEN,
+      phase: "running",
+      messagesThroughSeq: 3,
+      body: { status: "completed" },
+      send: scriptedSend([{ applied: false, status: "running", reason: "messages_pending" }]).send,
+    });
+
+    assert.equal(client.postCalls.length, 0, "no tombstones posted while the run has undrained segments");
+    assert.equal(client.gapsCalls.length, 0, "the gaps read is not even attempted (the run is not fully drained)");
+    assert.equal(outbox.depthFor("r1")?.pendingTerminal, 1, "the journal is KEPT for a later resolve after the drain");
+    assert.equal(outbox.depthFor("r1")?.blockedReason, undefined, "and it is NOT marked blocked");
+  });
+
+  it("N3: a FULLY-DRAINED run with a genuine hole IS tombstoned (gap-fill proceeds)", async () => {
+    const { outbox } = await mkOutbox();
+    const client = new FakeClient();
+    client.features.add("terminal_fence");
+    const deps = depsFor(outbox, client);
+    // The run spilled [1..2] and the drainer has already replayed + retired them, so the message
+    // outbox is fully drained (records empty). The api still reports seq 3 as a genuine hole.
+    await outbox.appendSegment("r1", GEN, [
+      { seq: 1, kind: "text", agent: "lead", payload: { text: "a" } },
+      { seq: 2, kind: "text", agent: "lead", payload: { text: "b" } },
+    ]);
+    await outbox.drainRun("r1", async () => undefined); // replay + retire → fully drained
+    assert.equal(outbox.hasUndrainedMessages("r1"), false, "sanity: the run is fully drained");
+    let filled = false;
+    client.gapsResponder = (_through, _cursor) => (filled ? { gaps: [] } : { gaps: [{ first: 3, last: 3 }] });
+    client.postResponder = () => {
+      filled = true;
+    };
+
+    await journalAndResolveTerminal(deps, {
+      runId: "r1",
+      claimGeneration: GEN,
+      phase: "running",
+      messagesThroughSeq: 3,
+      body: { status: "completed" },
+      send: scriptedSend([
+        { applied: false, status: "running", reason: "messages_pending" },
+        { applied: true, status: "completed" },
+      ]).send,
+    });
+
+    assert.equal(client.postCalls.length, 1, "the genuine hole on a fully-drained run WAS tombstoned");
+    assert.deepEqual(client.postCalls[0]?.msgs.map((m) => m.seq), [3], "one per-seq tombstone for the hole");
+    assert.equal(outbox.depthFor("r1")?.pendingTerminal, 0, "the terminal applied and the journal retired");
+  });
+
+  // Nit: the stale-claim detection parses the top-level `disposition`, never a substring match on the
+  // raw body — a `"stale_claim"` literal in an unrelated field must NOT be read as a stale claim.
+  it("Nit: a 409 whose body mentions stale_claim in a NON-disposition field is NOT a stale-claim (parsed, not substring-matched)", async () => {
+    const { outbox } = await mkOutbox();
+    const client = new FakeClient();
+    const deps = depsFor(outbox, client);
+    client.gapsResponder = () => ({ gaps: [{ first: 2, last: 2 }] });
+    client.postResponder = () => {
+      // The 409 body carries the QUOTED literal "stale_claim" inside an ERROR field, not the
+      // disposition. A substring match on '"stale_claim"' would misread this as stale; the parsed
+      // top-level `disposition` read (undefined here) does not.
+      throw new RequestError("POST", "/messages", 409, '{"error":"stale_claim"}');
+    };
+    const scripted = scriptedSend([{ applied: false, status: "running", reason: "messages_pending" }]);
+
+    await journalAndResolveTerminal(deps, {
+      runId: "r1",
+      claimGeneration: GEN,
+      phase: "running",
+      messagesThroughSeq: 2,
+      body: { status: "completed" },
+      send: scripted.send,
+    });
+
+    // Not treated as stale ⇒ NOT stale-retired: the tombstone append is an ordinary transient error,
+    // so the journal is KEPT for a later resolve and stale_retired never advances.
+    assert.equal(outbox.depthFor("r1")?.staleRetired ?? 0, 0, "a non-disposition stale_claim mention does not stale-retire");
+    assert.equal(outbox.depthFor("r1")?.pendingTerminal, 1, "the journal is kept (transient append error), not stale-retired");
+    assert.equal(scripted.bodies.length, 1, "no re-send (the append errored transiently)");
+  });
 });

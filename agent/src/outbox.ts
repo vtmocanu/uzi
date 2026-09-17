@@ -954,6 +954,20 @@ export class Outbox {
     return out;
   }
 
+  /** PRD #1391 Run B M3b (N3): does this run still hold UNDRAINED message segments (locally-held
+   *  deliverable messages the per-worker drainer has not yet replayed)? The terminal send path's
+   *  gap-fill consults this before tombstoning a hole below the fence as "unrecoverable": a run
+   *  that spilled during the same outage may still have segments covering those seqs, and
+   *  tombstoning them would RACE the drainer and destroy recoverable messages. Gap-fill therefore
+   *  runs ONLY on a fully-drained run (this returns false); otherwise it keeps the journal for a
+   *  later resolve after the drain completes. A run with no message manifest (a terminal-only run)
+   *  returns false — the same "nothing undrained" answer as a fully-retired run. */
+  hasUndrainedMessages(runId: string): boolean {
+    const rs = this.runs.get(runId);
+    if (!rs) return false;
+    return rs.manifest.records.some((r) => r.lastSeq > rs.manifest.cursor);
+  }
+
   /** The outbox depth for one run, or undefined if the run is not tracked. */
   depthFor(runId: string): OutboxDepth | undefined {
     const rs = this.runs.get(runId);
