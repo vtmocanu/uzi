@@ -2370,7 +2370,10 @@ export function RunView() {
 
       {(usage.hasLiveTokens || usage.hasConfirmed) && (
         <Card className="p-4">
-          <RunUsagePanel usage={usage} />
+          {/* PRD #1429 M4b (D7): the server-truthed per-run cost_status, distinct from
+              the client-derived `usage` above — "" on a pre-M1 run reads defensively
+              as cost-unavailable inside the panel, never as a complete $0. */}
+          <RunUsagePanel usage={usage} costStatus={run.usage?.cost_status ?? ""} harness={run.harness} />
         </Card>
       )}
 

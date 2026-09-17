@@ -3,7 +3,7 @@ import { afterEach, describe, it, expect } from "vitest";
 import { cleanup, render } from "@testing-library/react";
 import { RunUsagePanel } from "./RunUsage";
 import { deriveRunUsage } from "../lib/runUsage";
-import type { RunMessage } from "../lib/api";
+import type { RunMessage, CostStatus } from "../lib/api";
 
 afterEach(cleanup);
 
@@ -53,7 +53,7 @@ function twoPhase(): RunMessage[] {
 
 describe("RunUsagePanel", () => {
   it("renders the strip totals, per-phase deltas, and per-agent attribution", () => {
-    const { getByText, getAllByText } = render(<RunUsagePanel usage={deriveRunUsage(twoPhase())} />);
+    const { getByText, getAllByText } = render(<RunUsagePanel costStatus="metered" usage={deriveRunUsage(twoPhase())} />);
 
     // Strip: tokens-in = fresh(80.3k) + cached(800.3k) = 880.6k, model, cache bar.
     expect(getByText("Tokens in")).toBeTruthy();
@@ -79,7 +79,7 @@ describe("RunUsagePanel", () => {
   });
 
   it("renders nothing for a run with no usage (pre-feature)", () => {
-    const { container } = render(<RunUsagePanel usage={deriveRunUsage([m("text", "lead", { text: "hi" })])} />);
+    const { container } = render(<RunUsagePanel costStatus="metered" usage={deriveRunUsage([m("text", "lead", { text: "hi" })])} />);
     expect(container.firstChild).toBeNull();
   });
 
@@ -89,7 +89,7 @@ describe("RunUsagePanel", () => {
     // rather than just the label is the point — the label was already there and was
     // unreliable, so a getByLabelText alone would have passed over the defect.
     seq = 0;
-    const { container } = render(<RunUsagePanel usage={deriveRunUsage(twoPhase())} />);
+    const { container } = render(<RunUsagePanel costStatus="metered" usage={deriveRunUsage(twoPhase())} />);
     const strip = container.querySelector('[aria-label="Run usage totals"]');
     expect(strip).toBeTruthy();
     expect(strip?.getAttribute("role")).toBe("group");
@@ -102,6 +102,7 @@ describe("RunUsagePanel", () => {
     seq = 0;
     const { container } = render(
       <RunUsagePanel
+        costStatus="metered"
         usage={deriveRunUsage([
           result({ input: 4_000, cacheRead: 996_000, output: 100, cost: 1 }, { turns: 1, durationMs: 1 }),
         ])}
@@ -153,6 +154,7 @@ describe("RunUsagePanel model column (PRD #93)", () => {
     seq = 0;
     const { container } = render(
       <RunUsagePanel
+        costStatus="metered"
         usage={deriveRunUsage([
           assistantFrame("lead", 100, "claude-opus-4-8"),
           assistantFrame("coder", 200, "claude-sonnet-5"),
@@ -169,6 +171,7 @@ describe("RunUsagePanel model column (PRD #93)", () => {
     seq = 0;
     const { getByText, getAllByText } = render(
       <RunUsagePanel
+        costStatus="metered"
         usage={deriveRunUsage([
           assistantFrame("lead", 100, "claude-opus-4-8"),
           assistantFrame("coder", 200, "claude-sonnet-5"),
@@ -187,6 +190,7 @@ describe("RunUsagePanel model column (PRD #93)", () => {
     seq = 0;
     const { getByText } = render(
       <RunUsagePanel
+        costStatus="metered"
         // The minority model is seen FIRST, so the cell cannot be satisfied by a
         // first-seen implementation — it must render the most frequent one.
         usage={deriveRunUsage([
@@ -206,6 +210,7 @@ describe("RunUsagePanel model column (PRD #93)", () => {
     seq = 0;
     const { getAllByText } = render(
       <RunUsagePanel
+        costStatus="metered"
         usage={deriveRunUsage([
           assistantFrame("lead", 100, "claude-opus-4-8"),
           assistantFrame("coder", 200, "claude-opus-4-8"),
@@ -221,7 +226,7 @@ describe("RunUsagePanel model column (PRD #93)", () => {
     seq = 0;
     const long = `claude-${"x".repeat(200)}-4-8`;
     const { container, getAllByText } = render(
-      <RunUsagePanel usage={deriveRunUsage([assistantFrame("lead", 100, long), resultFrame()])} />,
+      <RunUsagePanel costStatus="metered" usage={deriveRunUsage([assistantFrame("lead", 100, long), resultFrame()])} />,
     );
     // The clip has to be on an inner block-level span: `max-w` on a bare <td> is not
     // reliably honored by table layout, so asserting it on the <td> would prove nothing.
@@ -242,7 +247,7 @@ describe("RunUsagePanel model column (PRD #93)", () => {
   it("renders '—' in the Model column for a pre-feature run (usage, no models)", () => {
     seq = 0;
     const { container } = render(
-      <RunUsagePanel usage={deriveRunUsage([assistantFrame("lead", 100), resultFrame()])} />,
+      <RunUsagePanel costStatus="metered" usage={deriveRunUsage([assistantFrame("lead", 100), resultFrame()])} />,
     );
     const table = agentTable(container);
     expect(headerTexts(table)[1]).toBe("Model");
@@ -261,15 +266,76 @@ describe("RunUsagePanel model column (PRD #93)", () => {
   });
 });
 
-describe("RunUsagePanel $0 cost (Decision 8)", () => {
-  it("renders a $0 cost as '—' in the strip and per-phase total, never '$0.00'", () => {
+// PRD #40 Decision 8 ("a $0 cost renders '—', never a misleading $0.00") assumed a
+// $0 total always meant subscription auth. PRD #1429 D7 replaces that GUESS with the
+// server's real per-run cost_status: a genuinely metered $0 is now shown as exactly
+// that (a real reading, e.g. a cache-only call), and "—" is retired from cost display
+// entirely — it used to mean both "no data" and "we chose not to say", indistinguishably.
+describe("RunUsagePanel cost status (PRD #1429 D7)", () => {
+  it("metered: shows the real dollar figure — even a genuine $0.00 — and names the credential", () => {
     seq = 0;
-    // A subscription-auth run: real tokens, zero cost. Note it is `costUSD: 0` on the
-    // model entry that matters now, not the frame's `total_cost_usd` (issue #195).
+    // Note it is `costUSD: 0` on the model entry that matters, not the frame's
+    // `total_cost_usd` (issue #195).
     const messages = [result({ input: 1000, cacheRead: 0, output: 200, cost: 0 }, { turns: 3, durationMs: 5000 })];
-    const { container } = render(<RunUsagePanel usage={deriveRunUsage(messages)} />);
-    expect(container.textContent).toContain("—");
+    const { container } = render(
+      <RunUsagePanel costStatus="metered" harness="claude" usage={deriveRunUsage(messages)} />,
+    );
+    // Positive: the real metered figure renders as an actual dollar amount, and the
+    // sub-label names the credential it was spent against.
+    expect(container.textContent).toContain("$0.00");
+    expect(container.textContent).toContain("your Anthropic token");
+    // Negative, paired with the above: never the retired ambiguous dash, and never a
+    // non-metered label leaking onto a metered run.
+    expect(container.textContent).not.toContain("—");
+    expect(container.textContent).not.toContain("Subscription");
+    expect(container.textContent).not.toContain("Unavailable");
+  });
+
+  it("subscription: never a dollar figure even with real tokens spent — labelled, not hidden", () => {
+    seq = 0;
+    const messages = [result({ input: 1000, cacheRead: 0, output: 200, cost: 0 }, { turns: 3, durationMs: 5000 })];
+    const { container } = render(<RunUsagePanel costStatus="subscription" usage={deriveRunUsage(messages)} />);
+    // Positive: the run is explicitly labelled as subscription usage...
+    expect(container.textContent).toContain("Subscription");
+    expect(container.textContent).toContain("subscription usage");
+    // ...and its real tokens are still shown, not hidden alongside the missing dollar.
+    expect(container.textContent).toContain("Tokens in");
+    // Negative, paired with the above: no dollar figure anywhere in the panel, and
+    // specifically never the bare "$0.00" this milestone forbids for a non-metered run.
     expect(container.textContent).not.toContain("$0.00");
+    expect(container.textContent).not.toMatch(/\$\d/);
+  });
+
+  it("unreported: tokens stay visible, cost is explicitly unavailable — never a bare $0", () => {
+    seq = 0;
+    const messages = [result({ input: 1000, cacheRead: 0, output: 200, cost: 0 }, { turns: 3, durationMs: 5000 })];
+    const { container } = render(<RunUsagePanel costStatus="unreported" usage={deriveRunUsage(messages)} />);
+    expect(container.textContent).toContain("Unavailable");
+    expect(container.textContent).toContain("cost unavailable");
+    expect(container.textContent).toContain("Tokens in");
+    expect(container.textContent).not.toContain("$0.00");
+    expect(container.textContent).not.toMatch(/\$\d/);
+  });
+
+  it("a hostile/unknown future cost_status value renders as unavailable, never a complete $0", () => {
+    seq = 0;
+    // A newer server ships a status this build has never heard of, with a real nonzero
+    // cost_usd riding along — that figure must never surface.
+    const messages = [result({ input: 1000, cacheRead: 0, output: 200, cost: 5 }, { turns: 3, durationMs: 5000 })];
+    const { container } = render(
+      <RunUsagePanel costStatus={"something_new" as CostStatus} usage={deriveRunUsage(messages)} />,
+    );
+    expect(container.textContent).toContain("Unavailable");
+    expect(container.textContent).toContain("Tokens in");
+    expect(container.textContent).not.toMatch(/\$\d/);
+  });
+
+  it("the empty-string legacy cost_status (a pre-M1 run) renders as unavailable, not a metered zero", () => {
+    seq = 0;
+    const messages = [result({ input: 1000, cacheRead: 0, output: 200, cost: 0 }, { turns: 3, durationMs: 5000 })];
+    const { container } = render(<RunUsagePanel costStatus="" usage={deriveRunUsage(messages)} />);
+    expect(container.textContent).toContain("Unavailable");
+    expect(container.textContent).not.toMatch(/\$\d/);
   });
 });
 
@@ -299,7 +365,7 @@ function cellClasses(table: HTMLTableElement, row: number, col: number): string[
 
 describe("RunUsagePanel cell colour is exclusive (issue #152)", () => {
   it("gives a left-aligned body cell text-fg and NOT text-muted", () => {
-    const { container } = render(<RunUsagePanel usage={deriveRunUsage(twoPhase())} />);
+    const { container } = render(<RunUsagePanel costStatus="metered" usage={deriveRunUsage(twoPhase())} />);
 
     for (const [label, table, col] of [
       ["phase", tableWithHeader(container, "Phase"), 0],
@@ -313,7 +379,7 @@ describe("RunUsagePanel cell colour is exclusive (issue #152)", () => {
   });
 
   it("leaves the numeric columns muted, so the fix did not just brighten everything", () => {
-    const { container } = render(<RunUsagePanel usage={deriveRunUsage(twoPhase())} />);
+    const { container } = render(<RunUsagePanel costStatus="metered" usage={deriveRunUsage(twoPhase())} />);
     // Right-aligned, non-total: still the dim treatment the mock asks for. Without this,
     // `text-fg` everywhere would pass the test above and lose the whole visual hierarchy.
     const classes = cellClasses(tableWithHeader(container, "Phase"), 0, 1);
@@ -322,7 +388,7 @@ describe("RunUsagePanel cell colour is exclusive (issue #152)", () => {
   });
 
   it("keeps the total row emphasised and unmuted, left cell included", () => {
-    const { container } = render(<RunUsagePanel usage={deriveRunUsage(twoPhase())} />);
+    const { container } = render(<RunUsagePanel costStatus="metered" usage={deriveRunUsage(twoPhase())} />);
     const table = tableWithHeader(container, "Phase");
     const last = table.tBodies[0]!.rows.length - 1;
     for (const col of [0, 1]) {
@@ -339,7 +405,7 @@ describe("RunUsagePanel cell colour is exclusive (issue #152)", () => {
 // attribute, confirm the case reds — and therefore still required.
 describe("RunUsagePanel accessibility (item 8)", () => {
   function panel() {
-    return render(<RunUsagePanel usage={deriveRunUsage(twoPhase())} />);
+    return render(<RunUsagePanel costStatus="metered" usage={deriveRunUsage(twoPhase())} />);
   }
 
   it("names both scroll regions, and adds NO tab stop (WCAG 2.1.1 is already satisfied)", () => {
@@ -425,6 +491,7 @@ describe("RunUsagePanel live in-flight surface (issue #237)", () => {
     seq = 0;
     const { container, getByText, queryByText, getAllByText } = render(
       <RunUsagePanel
+        costStatus="metered"
         usage={deriveRunUsage([
           m("status", "lead", { event: "init", model: "claude-opus-4-8" }),
           liveFrame("lead", "claude-opus-4-8", { input: 40_000, cacheRead: 300_000, output: 5_000 }),
@@ -474,6 +541,7 @@ describe("RunUsagePanel live in-flight surface (issue #237)", () => {
     // Two byte-identical calls on the same lead-less lane (agent_instance null) → one record.
     const { queryByText, getAllByText } = render(
       <RunUsagePanel
+        costStatus="metered"
         usage={deriveRunUsage([
           liveFrame("coder", "claude-sonnet-5", { input: 60_000, cacheRead: 500_000, output: 8_000 }),
           liveFrame("coder", "claude-sonnet-5", { input: 60_000, cacheRead: 500_000, output: 8_000 }),
@@ -491,6 +559,7 @@ describe("RunUsagePanel live in-flight surface (issue #237)", () => {
     seq = 0;
     const { getByText, queryByText, getAllByText } = render(
       <RunUsagePanel
+        costStatus="metered"
         usage={deriveRunUsage([
           m("status", "lead", { event: "init", model: "claude-sonnet-5" }),
           liveFrame("coder", "claude-sonnet-5", { input: 60_000, cacheRead: 500_000, output: 8_000 }),

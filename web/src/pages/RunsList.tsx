@@ -37,7 +37,8 @@ import {
 } from "../lib/runBadge";
 import { activityAge } from "../lib/runActivity";
 import { RunPriorityBadge } from "../components/RunPriorityBadge";
-import { formatTokens, formatCost } from "../lib/formatTokens";
+import { formatTokens } from "../lib/formatTokens";
+import { costDisplay } from "../lib/costStatus";
 import { runDurationLabel } from "../lib/runDuration";
 import { useNow } from "../lib/rateLimits";
 import { hasTemplateDrift } from "../lib/workerTemplates";
@@ -285,6 +286,10 @@ export function RunRow({
   // Issue #256 M3: a live, per-state duration token ("running 1h 30m", "ran 42m", …);
   // "" for a pre-feature/no-anchor run, which then adds nothing to the meta line.
   const duration = runDurationLabel(run, now);
+  // PRD #1429 M4b (D7): the row's cost display, folded from the closed cost_status —
+  // never re-derived from cost_usd. undefined when the run has no usage bundle at all
+  // (a pre-feature run), matching the meta line's existing `run.usage &&` gate below.
+  const cost = run.usage ? costDisplay(run.usage.cost_status, run.usage.cost_usd) : undefined;
   // PRD #320 M6: the owner's Expedite/undo action on a queued row. Owner-scoped +
   // queued-only, matching the server; a background/restored/normal row offers "Expedite",
   // an already-expedited row offers "Undo". The action lives INSIDE the row's <Link>, so
@@ -396,14 +401,21 @@ export function RunRow({
             {/* PRD #40: tokens + cost join the meta line; hidden for a run with no
                 usage rows (a pre-feature run) — never a fabricated 0. A running run
                 shows its "so far" figure, which grows as phases fold. */}
-            {run.usage && (
+            {run.usage && cost && (
               <>
                 <span className="font-mono tabular-nums">
                   · {formatTokens(runUsageTotalTokens(run.usage))} tok
                   {run.status === "running" ? " so far" : ""}
                 </span>
-                {run.usage.cost_usd > 0 && (
-                  <span className="font-mono text-brand/90">· {formatCost(run.usage.cost_usd)}</span>
+                {/* PRD #1429 M4b (D7): metered shows the real $ figure; subscription/
+                    unreported get an honest marker — never a silent omission that
+                    reads as free, and never a bare "$0.00" for a non-metered run. */}
+                {cost.kind === "metered" ? (
+                  <span className="font-mono text-brand/90">· {cost.dollars}</span>
+                ) : (
+                  <span className="font-mono text-faint">
+                    · {cost.kind === "subscription" ? "subscription" : "cost n/a"}
+                  </span>
                 )}
               </>
             )}

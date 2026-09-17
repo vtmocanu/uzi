@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { RunRow, RunsHistory, RunsLayout, RunsList, sortPast } from "./RunsList";
-import { api, type RunListItem, type SecretMeta } from "../lib/api";
+import { api, type RunListItem, type SecretMeta, type CostStatus } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
 
 // Keep the real module (isTerminalRun etc.) and mock only the network + auth so the
@@ -437,7 +437,78 @@ describe("RunsList — usage meta line (PRD #40)", () => {
     // The no-usage run contributes no "tok" figure — exactly one run shows usage.
     expect(screen.queryAllByText(/tok/).length).toBe(1);
   });
-})
+});
+
+describe("RunsList — cost_status truthfulness (PRD #1429 M4b D7)", () => {
+  it("metered: shows the real dollar figure", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        aRun({
+          id: "metered",
+          issue_title: "Metered run",
+          usage: { input_tokens: 1000, cache_read_tokens: 0, cache_creation_tokens: 0, output_tokens: 200, cost_usd: 3.45, cost_status: "metered" as const },
+        }),
+      ],
+    });
+    renderRuns();
+    await waitFor(() => expect(screen.getByText("Metered run")).toBeTruthy());
+    expect(screen.getByText(/\$3\.45/)).toBeTruthy();
+  });
+
+  it("subscription: never a dollar figure, even with a nonzero cost_usd — an honest marker instead", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        aRun({
+          id: "sub",
+          issue_title: "Subscription run",
+          usage: { input_tokens: 1000, cache_read_tokens: 0, cache_creation_tokens: 0, output_tokens: 200, cost_usd: 0, cost_status: "subscription" as const },
+        }),
+      ],
+    });
+    renderRuns();
+    await waitFor(() => expect(screen.getByText("Subscription run")).toBeTruthy());
+    // Positive: the honest marker is shown, and tokens still render (not hidden).
+    expect(screen.getByText(/subscription/)).toBeTruthy();
+    expect(screen.getByText(/tok/)).toBeTruthy();
+    // Negative, paired with the above: never a dollar figure for this run.
+    expect(screen.queryByText(/\$/)).toBeNull();
+  });
+
+  it("unreported: tokens shown, cost marked unavailable rather than silently omitted", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        aRun({
+          id: "unrep",
+          issue_title: "Unreported run",
+          usage: { input_tokens: 1000, cache_read_tokens: 0, cache_creation_tokens: 0, output_tokens: 200, cost_usd: 0, cost_status: "unreported" as const },
+        }),
+      ],
+    });
+    renderRuns();
+    await waitFor(() => expect(screen.getByText("Unreported run")).toBeTruthy());
+    expect(screen.getByText(/cost n\/a/)).toBeTruthy();
+    expect(screen.getByText(/tok/)).toBeTruthy();
+    expect(screen.queryByText(/\$/)).toBeNull();
+  });
+
+  it("a hostile/unknown future cost_status renders as unavailable, never a complete $0", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        aRun({
+          id: "hostile",
+          issue_title: "Hostile status run",
+          // A newer server ships a status this build has never heard of, carrying a real
+          // nonzero cost_usd — it must never surface as a dollar figure.
+          usage: { input_tokens: 1000, cache_read_tokens: 0, cache_creation_tokens: 0, output_tokens: 200, cost_usd: 9.99, cost_status: "something_new" as CostStatus },
+        }),
+      ],
+    });
+    renderRuns();
+    await waitFor(() => expect(screen.getByText("Hostile status run")).toBeTruthy());
+    expect(screen.getByText(/cost n\/a/)).toBeTruthy();
+    expect(screen.queryByText(/\$/)).toBeNull();
+  });
+});
 
 // Issue #803: the MR/PR chip on a run row is a real deep-link to the forge request,
 // mirroring IssueView/Board — preferring the persisted mr_web_url and otherwise
