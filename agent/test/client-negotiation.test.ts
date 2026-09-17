@@ -32,9 +32,14 @@ interface ProgServer {
     /** PRD #1390 M2a: the per-registration nonce the api mints; echoed by the client on
      *  every snapshot it sends. undefined ⇒ the register response omits the field. */
     registerNonce: string | undefined;
+    /** PRD #1391 Run B M4: the server-side terminal-pending outbox cap the register response returns.
+     *  undefined ⇒ the field is omitted (an older api). */
+    workerOutboxMaxPending: number | undefined;
     heartbeat: (callIndex: number) => Reply;
     messages: (callIndex: number) => Reply;
     claim: (callIndex: number) => Reply;
+    /** PRD #1391 Run B M4: the GET /runs/{id}/ownership reply (status + additive claim_generation). */
+    ownership: () => Reply;
   };
   countOf: (kind: Recorded["kind"]) => number;
 }
@@ -47,9 +52,11 @@ async function startServer(): Promise<ProgServer> {
   const cfg: ProgServer["cfg"] = {
     features: [],
     registerNonce: undefined,
+    workerOutboxMaxPending: undefined,
     heartbeat: () => OK,
     messages: () => OK,
     claim: () => OK,
+    ownership: () => ({ status: 200, body: JSON.stringify({ status: "running" }) }),
   };
   const countOf = (kind: Recorded["kind"]): number => requests.filter((r) => r.kind === kind).length;
 
@@ -70,7 +77,11 @@ async function startServer(): Promise<ProgServer> {
         requests.push({ kind: "register", body });
         const registerBody: Record<string, unknown> = { worker_id: "w1", protocol_features: cfg.features };
         if (cfg.registerNonce !== undefined) registerBody.register_nonce = cfg.registerNonce;
+        if (cfg.workerOutboxMaxPending !== undefined) registerBody.worker_outbox_max_pending = cfg.workerOutboxMaxPending;
         reply = { status: 200, body: JSON.stringify(registerBody) };
+      } else if (url.endsWith("/ownership")) {
+        requests.push({ kind: "other", body });
+        reply = cfg.ownership();
       } else if (url.endsWith("/heartbeat")) {
         reply = cfg.heartbeat(countOf("heartbeat"));
         requests.push({ kind: "heartbeat", body });
@@ -401,5 +412,58 @@ describe("isStrictDecodeError (PRD #1391 D9)", () => {
     // The status must be 400, and the error must be a RequestError.
     assert.strictEqual(isStrictDecodeError(new RequestError("POST", "/x", 500, "invalid request body")), false);
     assert.strictEqual(isStrictDecodeError(new Error("invalid request body")), false);
+  });
+});
+
+describe("register snapshot + cap + ownership generation (PRD #1391 Run B M4)", () => {
+  it("carries the initial active_snapshot on the register body (nonce-EXEMPT — sent verbatim)", async () => {
+    srv.cfg.features = ["active_run_snapshot"];
+    srv.cfg.registerNonce = "nonce-xyz";
+    const c = newClient();
+    const initial: ActiveSnapshot = { snapshot_epoch: 1, active: [], pending_overflow: true };
+    await c.register("w", undefined, undefined, undefined, undefined, initial);
+
+    const reg = srv.requests.find((r) => r.kind === "register");
+    assert.deepStrictEqual(
+      reg!.body?.active_snapshot,
+      initial,
+      "the boot snapshot rides the register body verbatim, WITHOUT a stamped nonce (exempt)",
+    );
+  });
+
+  it("omits active_snapshot when no initial snapshot is passed (byte-identical register wire)", async () => {
+    const c = newClient();
+    await c.register("w");
+    const reg = srv.requests.find((r) => r.kind === "register");
+    assert.ok(reg!.body && !("active_snapshot" in reg!.body), "an ordinary worker sends no snapshot on register");
+  });
+
+  it("captures worker_outbox_max_pending off the register response", async () => {
+    srv.cfg.workerOutboxMaxPending = 32;
+    const c = newClient();
+    await c.register("w");
+    assert.strictEqual(c.workerOutboxMaxPending, 32, "the server cap is stashed for the registry to read");
+  });
+
+  it("leaves workerOutboxMaxPending undefined when the api omits it (older api ⇒ cap-0 floor)", async () => {
+    srv.cfg.workerOutboxMaxPending = undefined;
+    const c = newClient();
+    await c.register("w");
+    assert.strictEqual(c.workerOutboxMaxPending, undefined, "an older api ⇒ undefined ⇒ the registry treats it as cap 0");
+  });
+
+  it("getRunOwnership passes claim_generation through from the probe body", async () => {
+    srv.cfg.ownership = () => ({ status: 200, body: JSON.stringify({ status: "running", claim_generation: 7 }) });
+    const c = newClient();
+    const probe = await c.getRunOwnership("33333333-3333-3333-3333-333333333333");
+    assert.strictEqual(probe.status, "running");
+    assert.strictEqual(probe.claim_generation, 7, "the additive claim_generation flows through the full JSON body");
+  });
+
+  it("getRunOwnership leaves claim_generation undefined for an older api that omits it", async () => {
+    srv.cfg.ownership = () => ({ status: 200, body: JSON.stringify({ status: "running" }) });
+    const c = newClient();
+    const probe = await c.getRunOwnership("33333333-3333-3333-3333-333333333333");
+    assert.strictEqual(probe.claim_generation, undefined, "absent ⇒ undefined (the router cannot prove a mismatch)");
   });
 });

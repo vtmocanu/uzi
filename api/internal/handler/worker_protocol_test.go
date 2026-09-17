@@ -889,20 +889,30 @@ func TestWorkerMessagesForeignRunReturns404(t *testing.T) {
 // the live status, which the worker reads as "keep going".
 func TestWorkerRunOwnershipOwnedRunning(t *testing.T) {
 	runID := uuid.New()
-	h := newProtocolHandler(t, &protocolStore{ownedRun: store.Run{ID: runID, Status: "running"}})
+	h := newProtocolHandler(t, &protocolStore{ownedRun: store.Run{ID: runID, Status: "running", ClaimGeneration: 7}})
 	rec := httptest.NewRecorder()
 	h.WorkerRunOwnership(rec, workerReq(http.MethodGet, "", runID))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (owned+running)", rec.Code)
 	}
+	// PRD #1391 Run B M4: claim_generation is additive on the ownership probe. Decode it
+	// as a pointer so an ABSENT field (an older api) is distinguishable from an explicit 0 —
+	// the router treats a different generation as "end the attempt".
 	var got struct {
-		Status string `json:"status"`
+		Status          string `json:"status"`
+		ClaimGeneration *int64 `json:"claim_generation"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
 		t.Fatalf("decode body: %v", err)
 	}
 	if got.Status != "running" {
 		t.Fatalf("status = %q, want %q", got.Status, "running")
+	}
+	if got.ClaimGeneration == nil {
+		t.Fatalf("ownership probe missing claim_generation (body %q)", rec.Body.String())
+	}
+	if *got.ClaimGeneration != 7 {
+		t.Fatalf("claim_generation = %d, want 7 (= run.ClaimGeneration)", *got.ClaimGeneration)
 	}
 }
 

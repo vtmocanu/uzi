@@ -1136,7 +1136,7 @@ func (h *Handler) WorkerRunOwnership(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	status, recoveryRetryNotBefore, err := h.wsvc.RunOwnership(r.Context(), wkr, runID)
+	status, recoveryRetryNotBefore, claimGeneration, err := h.wsvc.RunOwnership(r.Context(), wkr, runID)
 	if err != nil {
 		if errors.Is(err, workersvc.ErrRunNotOwned) {
 			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
@@ -1150,7 +1150,11 @@ func (h *Handler) WorkerRunOwnership(w http.ResponseWriter, r *http.Request) {
 	// reconciling an unknown forge-park outcome (a transport failure after the report was sent)
 	// can still quote the acknowledged retry time on its feed event. Omitted (nil) for a run
 	// that is not recovery-parked.
-	body := map[string]any{"status": status}
+	//
+	// PRD #1391 Run B M4: claim_generation rides the same probe (additive) so the run-lane claim
+	// router can proceed ONLY on a claimed/running row AT the claim's generation, and end the
+	// attempt (no report) on a terminal status or a DIFFERENT generation.
+	body := map[string]any{"status": status, "claim_generation": claimGeneration}
 	if recoveryRetryNotBefore != nil {
 		body["recovery_retry_not_before"] = recoveryRetryNotBefore
 	}

@@ -77,6 +77,10 @@ describe("Worker outbox drainer (PRD #1391 M2)", () => {
     let drainCalls = 0;
     const outbox = {
       uncleanRuns: () => [],
+      // PRD #1391 Run B M4: the boot terminal resolve reads these; these drainer tests carry no
+      // pending terminal, so the store is enabled and lists nothing (resolveBootTerminals no-ops).
+      isDisabled: () => false,
+      listPendingTerminals: () => [],
       runsWithPending: () => ["r1"],
       depthFor: (id: string) => depth(id),
       drainRun: async () => {
@@ -121,6 +125,10 @@ describe("Worker outbox drainer (PRD #1391 M2)", () => {
     let retired = false;
     const outbox = {
       uncleanRuns: () => [],
+      // PRD #1391 Run B M4: the boot terminal resolve reads these; these drainer tests carry no
+      // pending terminal, so the store is enabled and lists nothing (resolveBootTerminals no-ops).
+      isDisabled: () => false,
+      listPendingTerminals: () => [],
       runsWithPending: () => (retired ? [] : ["r1"]),
       depthFor: (id: string) => depth(id),
       drainRun: async () => {
@@ -160,6 +168,10 @@ describe("Worker outbox drainer (PRD #1391 M2)", () => {
     let drainStarted = 0;
     const outbox = {
       uncleanRuns: () => [],
+      // PRD #1391 Run B M4: the boot terminal resolve reads these; these drainer tests carry no
+      // pending terminal, so the store is enabled and lists nothing (resolveBootTerminals no-ops).
+      isDisabled: () => false,
+      listPendingTerminals: () => [],
       runsWithPending: () => ["r1"],
       depthFor: (id: string) => depth(id),
       drainRun: async () => {
@@ -205,6 +217,10 @@ describe("Worker outbox drainer (PRD #1391 M2)", () => {
     let drainCalls = 0;
     const outbox = {
       uncleanRuns: () => [],
+      // PRD #1391 Run B M4: the boot terminal resolve reads these; these drainer tests carry no
+      // pending terminal, so the store is enabled and lists nothing (resolveBootTerminals no-ops).
+      isDisabled: () => false,
+      listPendingTerminals: () => [],
       runsWithPending: () => ["r1"],
       depthFor: (id: string) => depth(id),
       drainRun: async () => {

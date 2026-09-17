@@ -46,6 +46,7 @@ import { MessageBatcher } from "./batcher.js";
 import type { Outbox } from "./outbox.js";
 import {
   journalAndResolveTerminal,
+  resolvePendingTerminal,
   type SendTerminalState,
   type TerminalOutboxDeps,
 } from "./terminal-resolve.js";
@@ -93,6 +94,13 @@ const TERMINAL_RUN_STATUSES = new Set(["cancelled", "completed", "failed"]);
  *  report is produced while the run is at the `running` (finalize) phase, so this is the honest
  *  value; kept as one constant so every site agrees. */
 const TERMINAL_JOURNAL_PHASE = "running";
+
+/** PRD #1391 Run B M4: the FIXED log line the queued-duplicate claim router emits when it ends the
+ *  attempt WITHOUT executing (a terminal/held row, a different generation, a definitive not-owned, or
+ *  an exhausted transient-probe budget). One constant so every end-path logs the same greppable
+ *  message; the varying detail (run_id, reason, status) rides the structured fields. No terminal
+ *  report is ever sent on these paths — the run keeps its authoritative status. */
+const QUEUED_DUPLICATE_END_LOG = "queued duplicate claim ended without executing (ownership probe)";
 
 /** PRD #1226 M4 (D6): bounded in-call attempts to capture a VERIFIED completion-hold restore
  *  point before giving up. Mirrors handleRecoveryExhausted's retain-and-retry, but bounded (this
@@ -254,6 +262,22 @@ class CredentialSwitchRetainedStop extends Error {
   constructor() {
     super("credential switch unconfirmed; retaining work and stopping the flight");
     this.name = "CredentialSwitchRetainedStop";
+  }
+}
+
+/**
+ * PRD #1391 Run B M4: phaseClone's FIRST `running` report came back refused (applied:false) with a
+ * TERMINAL status — the run reached completed/failed/cancelled out from under this claim (a racing
+ * owner cancel, or an outcome that already landed). Continuing the phase clone would work a claim the
+ * run has already left, so STOP: close the batcher, report NO terminal state (a `failed` here would
+ * fight the authoritative terminal outcome), and set NO preserve flag (nothing was cloned yet). The
+ * distinct `staleClaim` disposition is handled separately by the reportState closure's StaleClaimError
+ * throw; this is the non-stale terminal case. Local, thrown and caught entirely within this file.
+ */
+class RunningAckTerminalError extends Error {
+  constructor(readonly runStatus: string) {
+    super(`first running report refused with a terminal status (${runStatus})`);
+    this.name = "RunningAckTerminalError";
   }
 }
 
@@ -828,6 +852,12 @@ export interface RunnerOptions {
    *  on terminal / requeue. The worker reads the registry to build the ActiveSnapshot.
    *  Undefined ⇒ no tracking (tests that never negotiate the feature). */
   activeRuns?: ActiveRunRegistry;
+  /** PRD #1391 Run B M4 — the wall-clock budget for the queued-duplicate ownership-probe retry: a
+   *  TRANSIENT probe failure retries with backoff up to this bound (the api's claim grace minus a
+   *  margin), a held/queued row is re-probed until it, then the attempt ends without executing.
+   *  Measured against the injectable `now`, so a test can shrink it. Default 20s — well under the
+   *  api's claimed-never-started grace so a probe never outlives the claim. */
+  queuedDuplicateProbeBudgetMs?: number;
 }
 
 /**
@@ -868,6 +898,8 @@ export class RunRunner {
   /** PRD #1391 Run B M3 — terminal-journal send-path config, threaded into the terminal-resolve deps. */
   private readonly outboxTerminalMaxBytes: number;
   private readonly gapFillMax: number;
+  /** PRD #1391 Run B M4 — wall-clock budget for the queued-duplicate ownership-probe retry. */
+  private readonly queuedDuplicateProbeBudgetMs: number;
   /** PRD #1390 M2a — the shared active-run registry (runId → phase + claim generation);
    *  undefined ⇒ no snapshot tracking. The worker reads it to build the ActiveSnapshot.
    *  Named distinctly from the `activeRuns` shutdown Map below — that tracks abortable
@@ -984,6 +1016,12 @@ export class RunRunner {
     // a test that injects an outbox but not these knobs still canonicalises + gap-fills sanely.
     this.outboxTerminalMaxBytes = opts.outboxTerminalMaxBytes ?? Math.round(1.25 * 1024 * 1024);
     this.gapFillMax = opts.gapFillMax ?? 10_000;
+    // PRD #1391 Run B M4: the queued-duplicate probe retry budget. Clamp a 0/negative override to
+    // the default (a non-positive budget would give up before the first probe).
+    this.queuedDuplicateProbeBudgetMs =
+      opts.queuedDuplicateProbeBudgetMs !== undefined && opts.queuedDuplicateProbeBudgetMs > 0
+        ? opts.queuedDuplicateProbeBudgetMs
+        : 20_000;
     // PRD #1390 M2a: the shared active-run registry the worker reads to build snapshots.
     this.snapshotRegistry = opts.activeRuns;
     this.checkpointIntervalMs = opts.checkpointIntervalMs ?? 20 * 60_000;
@@ -1033,12 +1071,131 @@ export class RunRunner {
     try {
       if (previous) {
         await previous;
+        // PRD #1391 Run B M4 — the generation-aware queued-duplicate router. A SECOND (or later) claim
+        // of this run serialised behind the first must NOT blindly re-execute: the first attempt may
+        // have journaled a terminal outcome, or a reclaim may have bumped the generation. Drain this
+        // run's pending terminal synchronously, then probe ownership and decide (proceed only on a
+        // claimed/running row AT this claim's generation). Ending here sends NO report — the run keeps
+        // its authoritative status for the api's own reclaim/sweep to resolve.
+        if (!(await this.gateQueuedDuplicate(claim))) return;
         claim = await this.refreshQueuedClaimCursor(claim);
       }
       await this.executeClaim(claim);
     } finally {
       if (this.executionTails.get(runId) === tail) this.executionTails.delete(runId);
       release();
+    }
+  }
+
+  /**
+   * PRD #1391 Run B M4 — the generation-aware queued-duplicate gate (fact 6). Called AFTER the
+   * previous same-run execution settled and BEFORE `executeClaim`, only on a serialised duplicate.
+   * Returns whether to PROCEED to execute:
+   *   1. Synchronously resolve this run's pending terminal journal (if any) — send/retire/stale-retire
+   *      per M3 — so a completion the previous attempt journaled lands (and its lease clears) first.
+   *   2. Probe `GET /worker/runs/{id}/ownership` (status + additive claim_generation) and decide:
+   *      - `claimed`/`running` AT this claim's generation → PROCEED (a `running` row is the case where
+   *        #1390 re-adopted this exact claim);
+   *      - a TERMINAL status, or a DIFFERENT generation → END (no report, no execute);
+   *      - a `queued`/held row at the SAME generation (e.g. SweepClaimedNeverStarted bumps nothing) →
+   *        re-probe up to the budget, then END without executing;
+   *      - a transient probe failure → retry with backoff up to the budget (the claim grace minus a
+   *        margin), then END without executing;
+   *      - a definitive 4xx (404 not-owned/reclaimed) → END without executing.
+   */
+  private async gateQueuedDuplicate(claim: ClaimResponse): Promise<boolean> {
+    const runId = claim.run_id;
+    // 1. Drain this run's pending terminal(s) first, so a journaled completion lands and clears its
+    //    lease before we read ownership. No-op when no usable outbox is wired.
+    await this.resolveRunPendingTerminals(runId);
+
+    const claimGen = claim.claim_generation;
+    const deadline = this.now() + this.queuedDuplicateProbeBudgetMs;
+    for (;;) {
+      if (this.shuttingDownGlobal) {
+        this.log.info(QUEUED_DUPLICATE_END_LOG, { run_id: runId, reason: "worker shutting down" });
+        return false;
+      }
+      let probe;
+      try {
+        probe = await this.client.getRunOwnership(runId);
+      } catch (err) {
+        // A definitive 4xx (404 not-owned / reclaimed, or any other non-transient 4xx) ends the
+        // attempt at once; a transient error (5xx / 429 / network) retries under the budget.
+        if (err instanceof RequestError && err.status >= 400 && err.status < 500 && err.status !== 429) {
+          this.log.info(QUEUED_DUPLICATE_END_LOG, {
+            run_id: runId,
+            reason: "ownership probe returned a definitive not-owned/4xx",
+            status: err.status,
+          });
+          return false;
+        }
+        if (this.now() >= deadline) {
+          this.log.warn(QUEUED_DUPLICATE_END_LOG, {
+            run_id: runId,
+            reason: "ownership probe kept failing up to the grace budget",
+            error: errMessage(err),
+          });
+          return false;
+        }
+        await sleep(this.recoveryRetryMs);
+        continue;
+      }
+      const status = probe.status;
+      // A DIFFERENT generation means a newer claim owns the run — end regardless of status. Only
+      // compare when BOTH sides carry a generation; an older api that omits it (undefined) cannot
+      // prove a mismatch, so we fall through to the status check.
+      if (probe.claim_generation !== undefined && claimGen !== undefined && probe.claim_generation !== claimGen) {
+        this.log.info(QUEUED_DUPLICATE_END_LOG, {
+          run_id: runId,
+          reason: "a different generation owns the run",
+          probe_generation: probe.claim_generation,
+          claim_generation: claimGen,
+          status,
+        });
+        return false;
+      }
+      if (TERMINAL_RUN_STATUSES.has(status)) {
+        this.log.info(QUEUED_DUPLICATE_END_LOG, { run_id: runId, reason: "run is terminal", status });
+        return false;
+      }
+      if (status === "claimed" || status === "running") {
+        return true; // proceed: this worker still holds the claim at this generation
+      }
+      // A `queued`/held row at the SAME generation: never proceed. Re-probe until the budget, then end
+      // (a bounded wait for it to settle, exactly as the PRD prescribes).
+      if (this.now() >= deadline) {
+        this.log.info(QUEUED_DUPLICATE_END_LOG, {
+          run_id: runId,
+          reason: "run is held/queued at the same generation",
+          status,
+        });
+        return false;
+      }
+      await sleep(this.recoveryRetryMs);
+    }
+  }
+
+  /**
+   * PRD #1391 Run B M4: synchronously resolve every pending terminal journal for ONE run (the
+   * queued-duplicate gate's step 1). Mirrors the worker's boot resolve: a state-only `client.reportState`
+   * send stamped with the journal's generation (so a superseded generation is refused stale_claim and
+   * local-retired, D11), letting a completion the previous attempt journaled land before the ownership
+   * probe reads the run's status. No-op when no usable outbox is wired.
+   */
+  private async resolveRunPendingTerminals(runId: string): Promise<void> {
+    const outbox = this.outbox;
+    if (!outbox || outbox.isDisabled()) return;
+    const deps = this.terminalDeps();
+    if (!deps) return;
+    for (const entry of outbox.listPendingTerminals()) {
+      if (entry.run_id !== runId) continue;
+      const gen = entry.claim_generation;
+      await resolvePendingTerminal(deps, {
+        runId,
+        claimGeneration: gen,
+        send: (body, sig) => this.client.reportState(runId, { ...body, claim_generation: gen }, sig),
+      });
     }
   }
 
@@ -1485,6 +1642,17 @@ export class RunRunner {
         // terminal state — a `failed` here would fight the owning claim — and set NO preserve flag
         // (normal teardown: the new claim has its own clone). The finally then runs ordinary cleanup.
         runLog.info("run claim superseded server-side (stale_claim); stopping this flight");
+        await batcher.close().catch(() => undefined);
+      } else if (err instanceof RunningAckTerminalError) {
+        // PRD #1391 Run B M4: phaseClone's first `running` report was refused with a TERMINAL status
+        // (the run reached completed/failed/cancelled out from under this claim). STOP with NO
+        // terminal report (the authoritative outcome already landed) and NO preserve flag — nothing
+        // was cloned before the running report, so the finally runs ordinary teardown. Caught here
+        // BEFORE the generic terminal path so this never becomes a `failed` run.
+        runLog.info("run reached a terminal status before the phase clone started; stopping this flight", {
+          run_id: flight.runId,
+          status: err.runStatus,
+        });
         await batcher.close().catch(() => undefined);
       } else if (err instanceof CredentialSwitchRetainedStop) {
         // PRD #1247 M5b (BLOCKING-2/3 rework): the in-place ctx.attemptCredentialSwitch could not
@@ -4351,7 +4519,20 @@ export class RunRunner {
       repo: claim.repo.url,
       branch: claim.branch ?? null,
     });
-    await reportState({ status: "running" });
+    // PRD #1391 Run B M4: CAPTURE the first `running` ack (previously discarded). A stale_claim
+    // disposition already threw StaleClaimError inside the reportState closure; here we additionally
+    // STOP when the report is refused (applied:false) with a TERMINAL status — the run reached a
+    // terminal state out from under this claim (a racing cancel / an outcome that already landed), so
+    // continuing the phase clone would work a claim the run has already left. Throw the non-`failed`
+    // stop signal rather than clone-and-run on it.
+    const runningAck = await reportState({ status: "running" });
+    if (!runningAck.applied && runningAck.status !== undefined && TERMINAL_RUN_STATUSES.has(runningAck.status)) {
+      runLog.info("first running report refused with a terminal status; stopping the phase clone", {
+        run_id: runId,
+        status: runningAck.status,
+      });
+      throw new RunningAckTerminalError(runningAck.status);
+    }
     steering.start();
 
     // PRD #1390 M4 — env-gated e2e DROP-EXECUTION seam. OFF unless UZI_E2E_DROP_ON_SENTINEL

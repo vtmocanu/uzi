@@ -4234,17 +4234,21 @@ func (s *Service) ListMemoryForRun(ctx context.Context, wkr store.Worker, runID 
 // forge pre-clone park (PRD #1392 M1, D10) uses the retry stamp to reconcile an unknown park
 // outcome after a transport failure — so a reconciled park can still quote its retry time. The
 // stamp is nil for a run that is not recovery-parked.
-func (s *Service) RunOwnership(ctx context.Context, wkr store.Worker, runID uuid.UUID) (status string, recoveryRetryNotBefore *time.Time, err error) {
+func (s *Service) RunOwnership(ctx context.Context, wkr store.Worker, runID uuid.UUID) (status string, recoveryRetryNotBefore *time.Time, claimGeneration int64, err error) {
 	run, err := s.runOwnedByWorker(ctx, runID, wkr)
 	if err != nil {
-		return "", nil, err
+		return "", nil, 0, err
 	}
 	var retry *time.Time
 	if run.RecoveryRetryNotBefore.Valid {
 		t := run.RecoveryRetryNotBefore.Time
 		retry = &t
 	}
-	return run.Status, retry, nil
+	// PRD #1391 Run B M4: the run's current claim_generation rides the ownership probe
+	// (additive), so the run-lane claim router can proceed ONLY on a claimed/running row AT
+	// the claim's generation and end the attempt on a DIFFERENT generation. It already lives
+	// on the store.Run this read returns — no new query.
+	return run.Status, retry, run.ClaimGeneration, nil
 }
 
 func (s *Service) runOwnedByWorker(ctx context.Context, runID uuid.UUID, wkr store.Worker) (store.Run, error) {

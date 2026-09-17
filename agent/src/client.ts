@@ -284,6 +284,24 @@ export class WorkerClient {
    */
   private registerNonce: string | undefined;
 
+  /**
+   * PRD #1391 Run B M4: the api's server-side terminal-pending outbox cap
+   * (`WORKER_OUTBOX_MAX_PENDING`), captured from the register response so the active-run registry
+   * can size its `pending_overflow` decision + deterministic rotation to the server WITHOUT a
+   * worker-side cap mirror. Undefined until an api that returns the field registers; an older api
+   * omits it and the registry treats the cap as 0 (protect every pending outcome via overflow). NOT
+   * cleared by the strict-decode heartbeat fallback — it is a register-response value, not a wire
+   * extension, and is re-read on the next register (process restart) regardless.
+   */
+  private workerOutboxMaxPendingValue: number | undefined;
+
+  /** PRD #1391 Run B M4: the register-returned terminal-pending outbox cap, or undefined when the
+   *  api did not return it (older api ⇒ the registry treats it as cap 0). Read by the active-run
+   *  registry's `pending_overflow` + rotation. */
+  get workerOutboxMaxPending(): number | undefined {
+    return this.workerOutboxMaxPendingValue;
+  }
+
   /** The advertised features as an array (PRD #1392 D7): the runner reads this to pick a
    *  capability-aware degradation for a pre-clone forge-unreachable park. Backed by
    *  `serverFeatures` so the two views never diverge and a rollback clear empties both. The
@@ -314,6 +332,7 @@ export class WorkerClient {
     maxConcurrentRuns?: number,
     capabilities?: string[],
     protocolCapabilities?: string[],
+    initialSnapshot?: ActiveSnapshot,
   ): Promise<RegisterResponse> {
     const body: RegisterRequest = { name, version: this.version };
     // Only send the field when known: an image without ENV WORKER_TEMPLATE reports
@@ -337,6 +356,12 @@ export class WorkerClient {
     // byte-identical to today. The server stores it in workers.protocol_capabilities,
     // SEPARATE from `capabilities`, and the ClaimRun hard clause reads it there.
     if (protocolCapabilities?.length) body.protocol_capabilities = protocolCapabilities;
+    // PRD #1391 Run B M4: carry the boot active-run snapshot on register so a worker holding pending
+    // terminal outcomes leases them BEFORE the api's register-time orphan pass runs. Nonce-EXEMPT (no
+    // nonce exists yet), so it is sent verbatim WITHOUT stamping registerNonce — unlike the heartbeat
+    // and claim snapshots. Sent only when the boot-replay path built one (a pending terminal journal
+    // exists); an ordinary worker passes undefined and the register wire stays byte-identical.
+    if (initialSnapshot !== undefined) body.active_snapshot = initialSnapshot;
     const res = (await this.postJSON(`${WORKER_API_PREFIX}/register`, body)) as RegisterResponse;
     // Capture the negotiated protocol features (PRD #1392 D7 / #1391 D8): REPLACE the set
     // from this register's advertisement so a re-register after a rollout reflects the
@@ -355,6 +380,15 @@ export class WorkerClient {
     // ActiveSnapshot the worker sends. A string only (defensive); absent on an older api ⇒
     // undefined, in which case no snapshot is sent either (the feature gate is off too).
     this.registerNonce = typeof res.register_nonce === "string" ? res.register_nonce : undefined;
+    // PRD #1391 Run B M4: stash the server-side terminal-pending outbox cap so the active-run
+    // registry sizes its overflow/rotation to it. A finite non-negative number only (defensive);
+    // an absent/garbled field leaves it undefined ⇒ the registry treats the cap as 0.
+    this.workerOutboxMaxPendingValue =
+      typeof res.worker_outbox_max_pending === "number" &&
+      Number.isFinite(res.worker_outbox_max_pending) &&
+      res.worker_outbox_max_pending >= 0
+        ? Math.floor(res.worker_outbox_max_pending)
+        : undefined;
     return res;
   }
 

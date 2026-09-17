@@ -339,6 +339,17 @@ export interface RegisterRequest {
    *  interlocked run. Sent only when non-empty (same "only send when known" shape as
    *  `capabilities`); the api Filter-s it against a server-owned protocol vocabulary. */
   protocol_capabilities?: string[];
+  /**
+   * PRD #1391 Run B M4: the worker's active-run snapshot, carried ON the register request so a
+   * worker holding pending terminal outcomes leases them BEFORE the api's register-time orphan
+   * pass can re-claim them (#1390 M2a persists it first). This is the ONE snapshot exempt from
+   * the register nonce (none exists yet at register time). #1390's own worker never sends it; the
+   * boot-replay path (M4) is its only producer, and only when a pending terminal journal exists —
+   * with an EMPTY pending subset + `pending_overflow:true`, so the protection is cap-independent
+   * (even cap 0, where a non-empty subset would be rejected whole when cap<count). An ordinary
+   * worker omits it and the register wire stays byte-identical to today.
+   */
+  active_snapshot?: ActiveSnapshot;
 }
 
 export interface RegisterResponse {
@@ -360,6 +371,14 @@ export interface RegisterResponse {
    *  `claim_generation` optimistically, regardless of the advertised features (see
    *  `MessagesRequest.claim_generation`). */
   protocol_features?: string[];
+  /** PRD #1391 Run B M4: the api's server-side terminal-pending outbox cap
+   *  (`WORKER_OUTBOX_MAX_PENDING`, default 32) — the number of pending outcomes #1390 will lease
+   *  from one worker's snapshot. The worker reads it at register (stashed on the client) so the
+   *  active-run registry can size its `pending_overflow` decision and its deterministic rotation to
+   *  the server's cap, WITHOUT a worker-side cap mirror or a separate config channel. OMITTED by an
+   *  older api that predates M3c ⇒ the worker treats the cap as 0 (protect every pending outcome via
+   *  overflow — the cap-independent floor). */
+  worker_outbox_max_pending?: number;
   /** PRD #1390 M2a: the per-registration nonce the api mints so it can trust the epoch of an
    *  ActiveSnapshot across a worker OR api restart. The worker captures it at register and
    *  echoes it verbatim on every snapshot it SENDS (heartbeat + claim); a snapshot whose
@@ -430,9 +449,10 @@ export type ActiveSnapshotPhase = "running" | "awaiting_approval" | "awaiting_in
 
 /** One entry in an {@link ActiveSnapshot} (PRD #1390 M2a): a run-lane attempt (or a
  *  judge/review attempt) this worker is currently executing, named by its run id, the
- *  `claim_generation` it was claimed at, and its current `phase`. For a #1390 worker
- *  `terminal_pending` is ALWAYS false — terminal-outcome journaling is #1391's, so this
- *  worker never lists a pending outcome. */
+ *  `claim_generation` it was claimed at, and its current `phase`. A #1390-only worker sets
+ *  `terminal_pending: false` on every entry; PRD #1391 Run B M4 sets it TRUE for a run whose
+ *  terminal outcome is journaled and pending replay (the api then keeps that run unclaimable and
+ *  its generation unbumped while the lease holds). */
 export interface ActiveSnapshotEntry {
   run_id: string;
   claim_generation: number;
@@ -2227,6 +2247,12 @@ export interface InputsResponse {
  *  thrown RequestError, not by this shape. */
 export interface RunOwnershipResponse {
   status: string;
+  /** PRD #1391 Run B M4: the run's current `claim_generation` (additive on the probe). The run-lane
+   *  claim router proceeds to execute ONLY on a `claimed`/`running` row AT the claim's generation; a
+   *  DIFFERENT generation ends the attempt (a newer claim owns the run). ABSENT from an older api ⇒
+   *  undefined, which the router treats as "generation unknown, cannot prove a mismatch" and so does
+   *  not refuse on generation alone. */
+  claim_generation?: number;
   /** PRD #1392 M2 (D10): the run's `recovery_retry_not_before` stamp, added to the ownership
    *  probe so a forge park reconciled through the probe (a transport failure lost the report
    *  ack) can still quote when it resumes. An RFC3339 string when the run is parked with a

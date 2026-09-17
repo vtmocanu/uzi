@@ -282,6 +282,16 @@ describe("recovery capture retry and restart safety (#1197)", () => {
       pages.push({ after, count: page.length });
       return page.map((m) => ({ ...m, agent: m.agent ?? null, created_at: "2026-09-08T00:00:00Z" }));
     };
+    // PRD #1391 Run B M4: a queued duplicate now PROBES ownership before executing. The fake answers
+    // the default {status:"running"} with no generation ⇒ same-generation running ⇒ the router
+    // PROCEEDS (a duplicate is no longer executed blindly, it is gated on the probe). Count the probes
+    // so the test proves the gate fired for each queued duplicate.
+    const originalOwnership = client.getRunOwnership.bind(client);
+    let ownershipProbes = 0;
+    client.getRunOwnership = async (rid) => {
+      ownershipProbes++;
+      return originalOwnership(rid);
+    };
     const runner = runnerWith(factory, gitlab, undefined, nullLogger(), { recoveryRetryMs: 5 });
     const pending = [runner.execute(claim)];
     try {
@@ -299,11 +309,18 @@ describe("recovery capture retry and restart safety (#1197)", () => {
       assert.ok(firstFinalSeq > duplicate.last_seq + 400, "the stale claim predates multiple pages of late messages");
       releaseCleanup.resolve();
       await secondStarted.promise;
+      // PRD #1391 Run B M4: the queued duplicate probed ownership after the previous execution
+      // settled and, seeing the SAME-generation `running` row, proceeded to execute (factories → 2).
+      assert.ok(ownershipProbes >= 1, "the queued duplicate probed ownership before executing");
       pending.push(runner.execute(duplicate));
-      assert.equal(factories, 2, "the first completion cannot delete a later queued execution's chain entry");
+      assert.equal(factories, 2, "same-generation running probe ⇒ the queued duplicate proceeds; the first completion cannot delete a later queued chain entry");
       releaseSecond.resolve();
       await Promise.all(pending);
-      assert.equal(factories, 3, "duplicates are queued, never dropped");
+      // Each queued duplicate PROBES ownership and — because the row stays same-generation running —
+      // proceeds; a stale generation or a terminal/held row would have ended the attempt with no
+      // report instead (covered by runner-claim-router.test.ts).
+      assert.equal(factories, 3, "queued duplicates probe ownership and, at the same generation, still execute — none is silently dropped");
+      assert.ok(ownershipProbes >= 2, "each queued duplicate consulted the ownership probe before executing");
       const messages = api.messages(claim.run_id);
       for (const attempt of [1, 2, 3]) {
         const emitted = messages.find((m) => m.payload.text === `execution-${attempt}`);
