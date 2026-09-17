@@ -525,14 +525,18 @@ func scheduleLaneKind(target string) string {
 
 // scheduleEffectiveHarness resolves a schedule's effective harness for the credential-override
 // validator (PRD #1247 M6, D9), mirroring createRunEffectiveHarness (runs_lifecycle.go): read
-// run_schedules.harness (a pgtype.Text on the model; defensive — a schedule row usually leaves
-// it unset) else the user's persisted default_harness, mapping codex→codex else claude. Only a
-// codex effective harness is refused (422); every other value (incl. the common NULL default)
-// resolves to claude, the safe direction.
+// run_schedules.harness (a pgtype.Text on the model), mapping codex→codex else claude; the
+// user's persisted default_harness is consulted ONLY when run_schedules.harness is NULL (a
+// schedule row usually leaves it unset). Only a codex effective harness is refused (422); every
+// other value (incl. the common NULL default) resolves to claude, the safe direction.
 func (h *Handler) scheduleEffectiveHarness(ctx context.Context, sched store.RunSchedule) (string, error) {
-	if sched.Harness.Valid && sched.Harness.String == string(workersvc.HarnessCodex) {
-		return string(workersvc.HarnessCodex), nil
+	if sched.Harness.Valid {
+		if sched.Harness.String == string(workersvc.HarnessCodex) {
+			return string(workersvc.HarnessCodex), nil
+		}
+		return string(workersvc.HarnessClaude), nil
 	}
+	// NULL: consult the user's persisted default_harness.
 	raw, err := h.q.GetUserDefaultHarness(ctx, sched.UserID)
 	if err != nil {
 		return "", err

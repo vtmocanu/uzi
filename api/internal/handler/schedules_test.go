@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"net/http"
 	"strings"
 	"testing"
@@ -745,5 +746,33 @@ func TestValidateScheduleConfigOutputMode(t *testing.T) {
 		if _, status, _ := validateScheduleConfig(tc.req, fixedNow, tc.allowSelfImprove); status != http.StatusUnprocessableEntity {
 			t.Fatalf("output_mode on %s target: status=%d, want 422", tc.name, status)
 		}
+	}
+}
+
+// TestScheduleEffectiveHarnessExplicit: when run_schedules.harness is set, it resolves from
+// that column ALONE (codex→codex, anything else→claude) and never consults the user default —
+// so an explicitly-Claude schedule stays claude even when the owner's default is codex (the
+// bug: falling through returned codex and 422'd a valid Claude override). Both cases return
+// BEFORE touching h.q, so a zero-value *Handler suffices; the NULL branch (which DOES call
+// h.q) is covered by the live-DB tests in schedules_credential_livedb_test.go.
+func TestScheduleEffectiveHarnessExplicit(t *testing.T) {
+	cases := []struct {
+		name    string
+		harness pgtype.Text
+		want    string
+	}{
+		{"explicit claude", pgtype.Text{String: string(workersvc.HarnessClaude), Valid: true}, string(workersvc.HarnessClaude)},
+		{"explicit codex", pgtype.Text{String: string(workersvc.HarnessCodex), Valid: true}, string(workersvc.HarnessCodex)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := (&Handler{}).scheduleEffectiveHarness(context.Background(), store.RunSchedule{Harness: tc.harness})
+			if err != nil {
+				t.Fatalf("scheduleEffectiveHarness returned err=%v, want nil", err)
+			}
+			if got != tc.want {
+				t.Fatalf("scheduleEffectiveHarness = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
