@@ -1,7 +1,9 @@
 import type { ReactNode } from "react";
 import type { AgentUsage, RunUsage } from "../lib/runUsage";
 import { cacheDisplayPct } from "../lib/runUsage";
-import { formatTokens, formatCost } from "../lib/formatTokens";
+import type { CostStatus, Harness } from "../lib/api";
+import { costDisplay, costHeadline, costSubLabel, costCellText } from "../lib/costStatus";
+import { formatTokens } from "../lib/formatTokens";
 import { formatDuration } from "./RunEvent";
 import { cx } from "./ui";
 
@@ -109,8 +111,6 @@ function AgentChip({ agent }: { agent: string }) {
   );
 }
 
-const money = (usd: number): string => (usd > 0 ? formatCost(usd) : "—");
-
 /** The mock's `td.model.dim`: a derived/absent value, not a model id the agent ran on. */
 const Dim = ({ children }: { children: ReactNode }) => <span className="text-faint">{children}</span>;
 
@@ -129,10 +129,27 @@ function totalModelCell(models: string[]): ReactNode {
   return models.length === 1 ? models[0] : <Dim>{models.length} models</Dim>;
 }
 
-export function RunUsagePanel({ usage }: { usage: RunUsage }) {
+// `costStatus` is the run's SERVER-truthed per-run cost_status (PRD #1429 M1/D7),
+// distinct from the `usage` prop above — that one is derived client-side from the
+// message stream and has no notion of cost_status at all. Required (not optional):
+// this run-view panel has exactly one production caller (RunView.tsx), which always
+// has the run DTO in hand, so there is no legitimate call site that cannot supply it.
+// A pre-M1 run's stored value is "" — costDisplay folds that into "unavailable"
+// defensively, the same as any future/hostile value; it is never promoted to a
+// complete $0. `harness` is optional and only refines the metered sub-label's wording.
+export function RunUsagePanel({
+  usage,
+  costStatus,
+  harness,
+}: {
+  usage: RunUsage;
+  costStatus: CostStatus | "";
+  harness?: Harness | null;
+}) {
   if (!usage.hasLiveTokens && !usage.hasConfirmed) return null;
   const { hasConfirmed, hasLiveTokens, total, model, phases, agents, agentTotal, agentModels } = usage;
   const { liveByModel, liveByAgent, liveTotal } = usage;
+  const cost = costDisplay(costStatus, total.costUsd);
   // Never Math.round(cacheHitRatio * 100) here: 99.6% rounds to a "100% from cache"
   // label beside a zero-width warn segment while fresh tokens exist. See cacheDisplayPct.
   const cachePct = cacheDisplayPct(total);
@@ -174,10 +191,8 @@ export function RunUsagePanel({ usage }: { usage: RunUsage }) {
         <Stat label="Duration" value={formatDuration(total.durationMs)}>
           {model && <div className="truncate text-[11px] text-muted">{model}</div>}
         </Stat>
-        <Stat label="Cost" value={money(total.costUsd)} cost>
-          <div className="text-[11px] text-muted">
-            {total.costUsd > 0 ? "your Anthropic token" : "subscription auth · no cost"}
-          </div>
+        <Stat label="Cost" value={costHeadline(cost)} cost={cost.kind === "metered"}>
+          <div className="text-[11px] text-muted">{costSubLabel(cost, harness)}</div>
         </Stat>
       </div>
 
@@ -236,7 +251,7 @@ export function RunUsagePanel({ usage }: { usage: RunUsage }) {
                   <Td>{formatTokens(p.fresh)}</Td>
                   <Td>{formatTokens(p.cached)}</Td>
                   <Td>{formatTokens(p.out)}</Td>
-                  <Td>{money(p.costUsd)}</Td>
+                  <Td>{costCellText(costDisplay(costStatus, p.costUsd))}</Td>
                 </tr>
               ))}
               <tr>
@@ -245,7 +260,7 @@ export function RunUsagePanel({ usage }: { usage: RunUsage }) {
                 <Td total>{formatTokens(total.fresh)}</Td>
                 <Td total>{formatTokens(total.cached)}</Td>
                 <Td total>{formatTokens(total.out)}</Td>
-                <Td total>{money(total.costUsd)}</Td>
+                <Td total>{costCellText(cost)}</Td>
               </tr>
             </tbody>
           </table>
