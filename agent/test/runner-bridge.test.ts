@@ -271,9 +271,10 @@ describe("RunRunner — the reseed after a bridge adopts B (PRD #1416 M3, SC2)",
     assert.strictEqual(before.seededFrom, "origin", "an un-bridged divergent tip is set aside (origin wins)");
 
     // BRIDGE the tracking ref to B (what bridgeBareTrackingRefIfDivergent does at the park sink).
-    const B = await git.bridgeToFloors(bare, H, [P]);
-    assert.ok(B);
-    await git.updateTrackingRef(bare, branch, B!);
+    const bridgeResult = await git.bridgeToFloors(bare, H, [P]);
+    assert.strictEqual(bridgeResult.kind, "built", "a bridge was built");
+    const B = (bridgeResult as { kind: "built"; sha: string }).sha;
+    await git.updateTrackingRef(bare, branch, B);
 
     // Now the reseed adopts B — the run resumes on its rewritten work.
     const after = await git.runnerCloneForBranch(bare, branch, "feature-reseed", "R1");
@@ -449,7 +450,10 @@ describe("RunRunner.bridgeBareTrackingRefIfDivergent (PRD #1416 M3 — the share
     const pTree = gitIn(bare, ["rev-parse", `${P}^{tree}`]);
     const malformed = gitIn(bare, [...IDENT, "commit-tree", pTree, "-p", H, "-p", P, "-m", "wrong-tree bridge"]);
     const origBridge = git.bridgeToFloors.bind(git);
-    (git as unknown as { bridgeToFloors: unknown }).bridgeToFloors = async () => malformed;
+    (git as unknown as { bridgeToFloors: unknown }).bridgeToFloors = async () => ({
+      kind: "built",
+      sha: malformed,
+    });
     try {
       const flight = { runId: "R1", publishedTip: P, checkpointFloor: P };
       const r = runner({ run: async (c) => ({ branch: c.branch }) }, gitlab);

@@ -131,9 +131,10 @@ const failedBody = (runId: string) =>
   api.states.find((s) => s.runId === runId && s.body.status === "failed")!.body;
 
 /** Force the ancestry bridge to be UNBUILDABLE: a divergent tip is detected, but bridgeToFloors
- *  returns null, so bridgeBareTrackingRefIfDivergent returns {kind:"failed"} — the M4 trigger. */
+ *  returns {kind:"failed"}, so bridgeBareTrackingRefIfDivergent returns {kind:"failed"} — the M4
+ *  trigger. */
 function stubBridgeUnbuildable(): void {
-  (git as unknown as { bridgeToFloors: unknown }).bridgeToFloors = async () => null;
+  (git as unknown as { bridgeToFloors: unknown }).bridgeToFloors = async () => ({ kind: "failed" });
 }
 
 describe("RunRunner — history_rewritten typed terminal (PRD #1416 M4)", () => {
@@ -338,6 +339,33 @@ describe("RunRunner — post-bridge secret scan (PRD #1416 MR-rework)", () => {
     const reason = failed.failure_reason ?? "";
     assert.doesNotMatch(reason, /GH013/, "the gitlab reason is forge-neutral: no GH013");
     assert.doesNotMatch(reason, /GitHub Push Protection/i, "the gitlab reason is forge-neutral: no GitHub Push Protection");
+    assert.match(reason, /pre-push secret scan detected a secret/i, "the reason cites the pre-push scan");
+  });
+
+  it("(GitLab, OMITTED forge_type) a trusted post-bridge finding still gets forge-neutral wording (finding 8, R8)", async () => {
+    // R8: an OMITTED forge_type means GitLab, which has no GH013 backstop. The default taskClaim repo
+    // sets NO forge_type. Without the call-site normalization, composePushSecretBlockedReason would
+    // default undefined → github and wrongly cite GH013/"GitHub Push Protection"; the fix normalizes
+    // the omitted value to gitlab at this call site.
+    const { gitlab } = fakeGitlab();
+    const branch = "feature/pb-gitlab-untyped";
+    const P = publishBranch(branch);
+    git.secretScanRange = (async () => leakFinding()) as typeof git.secretScanRange;
+    const claim = taskClaim(branch, { open_mr: false }); // repo carries no forge_type
+    assert.strictEqual(claim.repo.forge_type, undefined, "the claim genuinely omits forge_type");
+    await runner(rewritingExecutor({}), gitlab).execute(claim);
+
+    assert.ok(!statusesFor(claim.run_id).includes("completed"), "the run did not complete (blocked before the push)");
+    assert.strictEqual(gitIn(fx.originPath, ["rev-parse", branch]), P, "nothing was pushed (origin tip still P)");
+    const failed = failedBody(claim.run_id);
+    assert.strictEqual(failed.fail_origin, "push_secret_blocked");
+    const reason = failed.failure_reason ?? "";
+    assert.doesNotMatch(reason, /GH013/, "an omitted forge_type reason is forge-neutral: no GH013");
+    assert.doesNotMatch(
+      reason,
+      /GitHub Push Protection/i,
+      "an omitted forge_type reason is forge-neutral: no GitHub Push Protection",
+    );
     assert.match(reason, /pre-push secret scan detected a secret/i, "the reason cites the pre-push scan");
   });
 

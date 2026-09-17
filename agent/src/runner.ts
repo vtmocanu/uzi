@@ -2776,7 +2776,17 @@ export class RunRunner {
         username: claim.secrets.forge_username,
       });
       if (scan.trusted && scan.findings.length > 0) {
-        const reason = composePushSecretBlockedReason(scan.findings, claim.repo.forge_type);
+        // #1416 (MR-rework, finding 8) — forge_type is optional (an omitted value means GitLab, R8),
+        // but composePushSecretBlockedReason defaults undefined → github (relied on by the
+        // GitHub-gated top-of-finalize caller). Normalize HERE so an omitted-forge_type GitLab run
+        // gets forge-neutral wording, not GH013/"GitHub Push Protection".
+        const forgeType =
+          claim.repo.forge_type === "forgejo"
+            ? "forgejo"
+            : claim.repo.forge_type === "github"
+              ? "github"
+              : "gitlab"; // R8: an omitted forge_type is GitLab, which has no GH013 backstop
+        const reason = composePushSecretBlockedReason(scan.findings, forgeType);
         batcher.emit({
           kind: "status",
           agent: "worker",
@@ -5485,8 +5495,14 @@ export class RunRunner {
       return anyUnknown ? { kind: "unknown" } : { kind: "clean" };
     }
     // Build B over the floors (bridgeToFloors appends only the ones actually missing).
-    const bridge = await this.git.bridgeToFloors(barePath, H, floors);
-    if (!bridge) {
+    const bridgeResult = await this.git.bridgeToFloors(barePath, H, floors);
+    if (bridgeResult.kind === "noop") {
+      // #1416 (MR-rework, finding 4): nothing was actually missing — H already covers every floor (a
+      // fast-forward). The caller's divergence read raced ahead of bridgeToFloors' recheck. Treat as
+      // clean so a fast-forwardable run is NOT failed as history_rewritten.
+      return { kind: "clean" };
+    }
+    if (bridgeResult.kind === "failed") {
       runLog.warn("PRD #1416 M3: divergence below published floor but the bridge could not be built", {
         run_id: flight.runId,
         published_tip: publishedTip,
@@ -5494,6 +5510,7 @@ export class RunRunner {
       });
       return { kind: "failed" };
     }
+    const bridge = bridgeResult.sha;
     // VALIDATE B before adopting it: tree byte-equal to H's, and P and H both ancestors of B.
     // #1416 M3 — distinguish a TRANSIENT/UNKNOWN read from a DEFINITIVE validation failure. A
     // revParse that returns null (a broken/transient read) or an `ancestry` that returns "unknown"

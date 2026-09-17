@@ -99,7 +99,12 @@ describe("GitCache.ancestry (PRD #1416 M2)", () => {
     // off this same result, so a false "divergent" here would synthesize a spurious bridge merge).
     const bare = await git.ensureClone(fx.originPath);
     const mainTip = gitIn(bare, ["rev-parse", "refs/remotes/origin/main"]);
-    const other = "0123456789abcdef0123456789abcdef01234567"; // valid OID shape
+
+    // BASELINE first: with the REAL exec, both OIDs resolve and (mainTip, mainTip) is "ancestor".
+    // Using two RESOLVABLE OIDs makes the injection load-bearing — a nonexistent second arg would
+    // answer "unknown" even with the injection inert, so the assertions would not exercise the
+    // exit-preserving path at all.
+    assert.equal(await git.ancestry(bare, mainTip, mainTip), "ancestor");
 
     // Inject at the exec seam: force the underlying git subprocess to reject WITHOUT a numeric
     // exit code. (Set AFTER ensureClone/gitIn, which used the real exec.)
@@ -111,13 +116,13 @@ describe("GitCache.ancestry (PRD #1416 M2)", () => {
     const inject = git as unknown as { execScoped: () => Promise<never> };
 
     inject.execScoped = rejectWithCode("ENOENT"); // spawn failure — string code
-    assert.equal(await git.ancestry(bare, mainTip, other), "unknown");
+    assert.equal(await git.ancestry(bare, mainTip, mainTip), "unknown");
 
     inject.execScoped = rejectWithCode(null); // timeout / SIGTERM / signal kill — null code
-    assert.equal(await git.ancestry(bare, mainTip, other), "unknown");
+    assert.equal(await git.ancestry(bare, mainTip, mainTip), "unknown");
 
     inject.execScoped = rejectWithCode(undefined); // code-less error — no .code at all
-    assert.equal(await git.ancestry(bare, mainTip, other), "unknown");
+    assert.equal(await git.ancestry(bare, mainTip, mainTip), "unknown");
   });
 
   it("returns 'unknown' for a malformed floor/tip without running git", async () => {

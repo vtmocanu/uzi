@@ -728,6 +728,11 @@ function wipRecoveredNote(wipRecovered: boolean | undefined): string {
  *  clamp does not close. An OID cannot carry that. */
 const BASE_COMMIT_RE = /^[0-9a-f]{7,64}$/;
 
+// #1416 (MR-rework, finding 5b) — publishedTip/defaultBranchCommit are WORKER-verified full object
+// names (ADR D7); this note renders them OUTSIDE every untrusted fence, so require a full 40-hex OID
+// rather than the 7–64 hex BASE_COMMIT_RE, so an abbreviated value can never be presented as the floor.
+const PUBLISHED_TIP_RE = /^[0-9a-f]{40}$/;
+
 /**
  * The paragraph that tells the lead which commit its branch was cut from, and which diff
  * commands are therefore right. Plain and outside every untrusted fence: like priorWorkNote,
@@ -795,10 +800,11 @@ export function baseCommitNote(
 export function publishedTipNote(
   publishedTip: string | undefined,
   defaultBranchCommit?: string,
+  autoApprove?: boolean,
 ): string {
-  if (!publishedTip || !BASE_COMMIT_RE.test(publishedTip)) return "";
+  if (!publishedTip || !PUBLISHED_TIP_RE.test(publishedTip)) return "";
   const dflt =
-    defaultBranchCommit && BASE_COMMIT_RE.test(defaultBranchCommit)
+    defaultBranchCommit && PUBLISHED_TIP_RE.test(defaultBranchCommit)
       ? defaultBranchCommit
       : undefined;
   // The default-branch OID rides the merge clause only when it validates; its NAME never does.
@@ -810,7 +816,11 @@ export function publishedTipNote(
     `your work with a fast-forward push and never force-pushes, so a rewritten branch cannot be`,
     `landed. Never rebase, amend, squash, or reset any commit at or below ${publishedTip}.`,
     mergeLine,
-    `If a rewrite is genuinely unavoidable, stop and call \`ask_user\`.`,
+    // #1416 (MR-rework, finding 5c) — under auto-approve there is no human to answer `ask_user`
+    // (AUTOPILOT_PLAN_NOTE tells the lead not to call it), so give autopilot-safe guidance instead.
+    autoApprove
+      ? `If a rewrite is genuinely unavoidable, do not force it — state the constraint plainly in the plan for the human who reviews it.`
+      : `If a rewrite is genuinely unavoidable, stop and call \`ask_user\`.`,
   ].join("\n");
 }
 
@@ -1044,7 +1054,11 @@ export function buildPlanPrompt(input: PlanPromptInput): string {
   const baseNote = baseCommitNote(input.baseCommit, input.defaultBranchCommit);
   // PRD #1416 M1: name the published floor P beside the base-commit/branch facts. Empty ⇒
   // nothing added (a fresh branch has no published floor).
-  const publishedNote = publishedTipNote(input.publishedTip, input.defaultBranchCommit);
+  const publishedNote = publishedTipNote(
+    input.publishedTip,
+    input.defaultBranchCommit,
+    input.autoApprove,
+  );
   return [
     `Plan the work described by this forge issue. You are on branch \`${input.branch}\`.`,
     ...(priorNote ? ["", priorNote] : []),
@@ -1606,7 +1620,11 @@ export function buildSelfImprovePlanPrompt(
   const baseNote = baseCommitNote(input.baseCommit, input.defaultBranchCommit);
   // PRD #1416 M1: name the published floor P beside the base-commit/branch facts, OUTSIDE
   // every untrusted fence (exactly where baseNote sits). Empty ⇒ nothing added.
-  const publishedNote = publishedTipNote(input.publishedTip, input.defaultBranchCommit);
+  const publishedNote = publishedTipNote(
+    input.publishedTip,
+    input.defaultBranchCommit,
+    input.autoApprove,
+  );
   // Issue #297: the in-flight avoid-set gets its OWN nonce-fenced block, minted from a
   // fresh nonce so it never shares a delimiter with the recommendations fence above. An
   // empty avoid-set injects nothing — no dangling fence, no preface.
@@ -1830,7 +1848,11 @@ export function buildCIFixPlanPrompt(input: CIFixPlanPromptInput): string {
   const baseNote = baseCommitNote(input.baseCommit, input.defaultBranchCommit);
   // PRD #1416 M1: name the published floor P beside the base-commit/branch facts, OUTSIDE
   // the job-log fence (exactly where baseNote sits). Empty ⇒ nothing added.
-  const publishedNote = publishedTipNote(input.publishedTip, input.defaultBranchCommit);
+  const publishedNote = publishedTipNote(
+    input.publishedTip,
+    input.defaultBranchCommit,
+    input.autoApprove,
+  );
   const lines: string[] = [
     `A CI pipeline failed on ref \`${input.ref}\`. You are on branch \`${input.branch}\`.`,
     `Failing pipeline: ${input.pipelineWebURL}`,

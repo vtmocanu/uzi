@@ -3110,21 +3110,33 @@ export class GitCache {
    * whose tree merely coincided with H's (equal trees do not imply equal histories).
    *
    * INVARIANT (validated by the caller before adopting B): B's tree === H's tree byte-for-byte, and
-   * every appended floor AND H are ancestors of B. Returns a bridge sha — either a freshly built
-   * commit or an existing idempotent-superset floor — or `null` when no floor was actually missing
-   * (nothing to bridge) OR any git step failed (best-effort — a bridge that cannot be built never
-   * throws here; the caller decides how to fail).
+   * every appended floor AND H are ancestors of B.
+   *
+   * @returns a three-way tagged result:
+   *   - `{ kind: "built", sha }` — a bridge exists: either a freshly built commit or an existing
+   *     idempotent-superset floor. `sha` is a full 40-hex OID the caller validates and adopts.
+   *   - `{ kind: "noop" }` — NOTHING was actually missing (every floor already an ancestor of H, a
+   *     fast-forward): there was nothing to bridge, and no ancestry read was transiently `"unknown"`.
+   *   - `{ kind: "failed" }` — malformed input, a git error, or a transient `"unknown"` ancestry read
+   *     that could not be resolved to a clean no-op (best-effort — a bridge that cannot be built never
+   *     throws here; the caller decides how to fail). A `"failed"` is NEVER conflated with a clean
+   *     no-op, so a fast-forwardable run is not mistaken for a genuine synthesis failure and vice
+   *     versa.
    */
-  async bridgeToFloors(barePath: string, tip: string, floors: string[]): Promise<string | null> {
+  async bridgeToFloors(
+    barePath: string,
+    tip: string,
+    floors: string[],
+  ): Promise<{ kind: "built"; sha: string } | { kind: "noop" } | { kind: "failed" }> {
     const OID = /^[0-9a-f]{40}$/;
-    if (!OID.test(tip) || floors.length === 0 || !OID.test(floors[0]!)) return null;
+    if (!OID.test(tip) || floors.length === 0 || !OID.test(floors[0]!)) return { kind: "failed" };
     try {
       // B's tree === H's tree, byte-identical: a tree OID is content-addressed, so committing onto
       // `tip^{tree}` reproduces H's tree exactly (no read-tree/write-tree round-trip needed). Read it
       // up front because the superset-bridge idempotency check below also compares each additional
       // floor's tree to it.
       const tipTree = (await this.runGit(barePath, ["rev-parse", `${tip}^{tree}`])).trim();
-      if (!OID.test(tipTree)) return null;
+      if (!OID.test(tipTree)) return { kind: "failed" };
       // #1416 (MR-rework, finding 2) — IDEMPOTENT SUPERSET-BRIDGE check (replaces the old, UNSOUND
       // tree-equality skip). An idle re-bridge of the SAME divergent H must NOT nest a fresh wrapper
       // every tick. The prior fix skipped any ADDITIONAL floor whose tree merely EQUALLED H's — but
@@ -3156,7 +3168,7 @@ export class GitCache {
             break;
           }
         }
-        if (coversAll) return f; // f is already a superset bridge of H over all floors — idempotent
+        if (coversAll) return { kind: "built", sha: f }; // f is already a superset bridge of H over all floors — idempotent
       }
       // Only floors NOT already reachable from H become extra parents (a floor already an ancestor
       // needs no bridge parent). "divergent" is the only positive signal — "unknown" (a transient
@@ -3165,16 +3177,27 @@ export class GitCache {
       // divergent sibling with a coincidentally-equal tree is RETAINED as a parent, so its lineage
       // stays an ancestor of B.
       const missing: string[] = [];
+      let anyUnknown = false;
       for (let i = 0; i < floors.length; i++) {
         const floor = floors[i]!;
-        if (!OID.test(floor) || (await this.ancestry(barePath, floor, tip)) !== "divergent") continue;
+        if (!OID.test(floor)) continue;
+        const rel = await this.ancestry(barePath, floor, tip);
+        if (rel === "unknown") {
+          anyUnknown = true;
+          continue;
+        }
+        if (rel !== "divergent") continue; // "ancestor" → already covered, do not append
         missing.push(floor);
       }
-      if (missing.length === 0) return null; // nothing was actually missing — nothing to bridge
+      // A transient/unknown ancestry read is treated as a synthesis FAILURE, never a clean no-op: if
+      // no floor read "divergent" but some read "unknown", we cannot prove H already covers every
+      // floor, so returning "noop" would let a fast-forward masquerade for what may be a real
+      // divergence a broken read hid.
+      if (missing.length === 0) return anyUnknown ? { kind: "failed" } : { kind: "noop" };
       // Deterministic committer/author date = H's own committer date (buildWorkflowOverlay's rule),
       // so a re-bridge of the same H over the same floors yields the same OID.
       const committerDate = (await this.runGit(barePath, ["show", "-s", "--format=%cI", tip])).trim();
-      if (committerDate.length === 0) return null;
+      if (committerDate.length === 0) return { kind: "failed" };
       const args = ["-c", "commit.gpgsign=false", "commit-tree", tipTree, "-p", tip];
       for (const floor of missing) args.push("-p", floor);
       args.push(
@@ -3191,20 +3214,20 @@ export class GitCache {
           GIT_COMMITTER_DATE: committerDate,
         })
       ).trim();
-      if (!OID.test(sha)) return null;
+      if (!OID.test(sha)) return { kind: "failed" };
       this.log.info("PRD #1416 M3: ancestry bridge built", {
         tip,
         published_floor: floors[0],
         bridge_parents: missing.length + 1,
         bridge_sha: sha,
       });
-      return sha;
+      return { kind: "built", sha };
     } catch (e) {
       this.log.warn("PRD #1416 M3: ancestry bridge synthesis failed", {
         tip,
         error: gitErrorMessage(e),
       });
-      return null;
+      return { kind: "failed" };
     }
   }
 

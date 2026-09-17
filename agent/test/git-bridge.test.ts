@@ -79,11 +79,22 @@ function rootPublishedAndDivergent(): { R: string; P: string; H: string } {
   return { R, P, H };
 }
 
+/**
+ * #1416 (MR-rework): bridgeToFloors now returns a three-way tagged result. This helper asserts the
+ * BUILT case and unwraps its sha as a plain non-null string, so a "built" call site reads exactly
+ * as it did before the return type changed.
+ */
+async function built(tip: string, floors: string[]): Promise<string> {
+  const r = await git.bridgeToFloors(repo, tip, floors);
+  assert.strictEqual(r.kind, "built", "expected a built bridge");
+  return (r as { kind: "built"; sha: string }).sha;
+}
+
 describe("GitCache.bridgeToFloors (PRD #1416 M3)", () => {
   it("wraps a divergent H in B whose tree === H's tree byte-for-byte, with P and H both ancestors", async () => {
     const { P, H } = rootPublishedAndDivergent();
-    const B = await git.bridgeToFloors(repo, H, [P]);
-    assert.ok(B && OID.test(B), "a bridge sha was returned");
+    const B = await built(H, [P]);
+    assert.ok(OID.test(B), "a bridge sha was returned");
     // B's tree is byte-identical to H's tree.
     assert.strictEqual(
       gitIn(repo, ["rev-parse", `${B}^{tree}`]),
@@ -91,8 +102,8 @@ describe("GitCache.bridgeToFloors (PRD #1416 M3)", () => {
       "B's tree === H's tree",
     );
     // Both the published floor P and H are ancestors of B → a plain fast-forward push lands over P.
-    assert.ok(isAncestor(P!, B!), "P is an ancestor of B");
-    assert.ok(isAncestor(H, B!), "H is an ancestor of B");
+    assert.ok(isAncestor(P!, B), "P is an ancestor of B");
+    assert.ok(isAncestor(H, B), "H is an ancestor of B");
     // H is the FIRST parent (so `git log --first-parent` reads as the agent's history).
     assert.strictEqual(gitIn(repo, ["rev-parse", `${B}^1`]), H, "H is B's first parent");
     assert.strictEqual(gitIn(repo, ["rev-parse", `${B}^2`]), P, "P is B's second parent");
@@ -100,8 +111,8 @@ describe("GitCache.bridgeToFloors (PRD #1416 M3)", () => {
 
   it("uses the EXACT marker message naming P (floors[0]) and H", async () => {
     const { P, H } = rootPublishedAndDivergent();
-    const B = await git.bridgeToFloors(repo, H, [P]);
-    const msg = gitIn(repo, ["log", "-1", "--format=%B", B!]);
+    const B = await built(H, [P]);
+    const msg = gitIn(repo, ["log", "-1", "--format=%B", B]);
     assert.strictEqual(
       msg,
       `bridge: restore published tip ${P} as an ancestor of ${H} (tree unchanged)`,
@@ -110,18 +121,23 @@ describe("GitCache.bridgeToFloors (PRD #1416 M3)", () => {
 
   it("is DETERMINISTIC: the same inputs yield the same sha", async () => {
     const { P, H } = rootPublishedAndDivergent();
-    const B1 = await git.bridgeToFloors(repo, H, [P]);
-    const B2 = await git.bridgeToFloors(repo, H, [P]);
-    assert.ok(B1 && B2);
+    const B1 = await built(H, [P]);
+    const B2 = await built(H, [P]);
     assert.strictEqual(B1, B2, "a re-bridge of the same H over the same floors is byte-identical");
   });
 
-  it("returns null when no floor is missing (P already an ancestor of the tip)", async () => {
+  it("returns { kind: 'noop' } when no floor is missing (P already an ancestor of the tip)", async () => {
     const R = commit("base.txt", "base\n", "root");
     const P = commit("published.txt", "p\n", "published");
     const onTop = commit("more.ts", "1\n", "work on top of P"); // descends from P
     assert.ok(isAncestor(P, onTop));
-    assert.strictEqual(await git.bridgeToFloors(repo, onTop, [P]), null, "nothing to bridge");
+    // #1416 (MR-rework): a genuine no-op (a fast-forward, nothing missing) is a distinct tag from a
+    // failure, so a fast-forwardable run is NOT reported as history_rewritten.
+    assert.deepStrictEqual(
+      await git.bridgeToFloors(repo, onTop, [P]),
+      { kind: "noop" },
+      "nothing to bridge → noop, not failed",
+    );
     void R;
   });
 
@@ -131,8 +147,8 @@ describe("GitCache.bridgeToFloors (PRD #1416 M3)", () => {
     const C = commit("c.txt", "c\n", "checkpoint above P"); // C descends from P
     gitIn(repo, ["checkout", "-b", "h", P]);
     const H = commit("impl.ts", "1\n", "work on P but diverging from C"); // descends from P, not C
-    const B = await git.bridgeToFloors(repo, H, [P, C]);
-    assert.ok(B && OID.test(B));
+    const B = await built(H, [P, C]);
+    assert.ok(OID.test(B));
     // P is already an ancestor of H → NOT a bridge parent; only the missing C is appended.
     assert.strictEqual(gitIn(repo, ["rev-parse", `${B}^1`]), H, "first parent is H");
     assert.strictEqual(gitIn(repo, ["rev-parse", `${B}^2`]), C, "the only extra parent is C");
@@ -145,22 +161,25 @@ describe("GitCache.bridgeToFloors (PRD #1416 M3)", () => {
     void R;
   });
 
-  it("returns null on a malformed tip or empty floors (never throws)", async () => {
+  it("returns { kind: 'failed' } on a malformed tip or empty floors (never throws)", async () => {
     const { H } = rootPublishedAndDivergent();
-    assert.strictEqual(await git.bridgeToFloors(repo, "not-an-oid", ["a".repeat(40)]), null);
-    assert.strictEqual(await git.bridgeToFloors(repo, H, []), null);
-    assert.strictEqual(await git.bridgeToFloors(repo, H, ["nope"]), null);
+    // #1416 (MR-rework): malformed input is "failed", never conflated with a clean no-op.
+    assert.deepStrictEqual(await git.bridgeToFloors(repo, "not-an-oid", ["a".repeat(40)]), {
+      kind: "failed",
+    });
+    assert.deepStrictEqual(await git.bridgeToFloors(repo, H, []), { kind: "failed" });
+    assert.deepStrictEqual(await git.bridgeToFloors(repo, H, ["nope"]), { kind: "failed" });
   });
 
   it("is IDEMPOTENT on an idle re-bridge: a prior bridge B1 passed as an additional floor is SKIPPED (no nesting)", async () => {
     // FIX 1 (#1416) — the nested-bridge accumulation guard. B1 bridges the divergent H over [P].
     const { P, H } = rootPublishedAndDivergent();
-    const B1 = await git.bridgeToFloors(repo, H, [P]);
-    assert.ok(B1 && OID.test(B1));
+    const B1 = await built(H, [P]);
+    assert.ok(OID.test(B1));
     // A later idle checkpoint tick re-bridges the SAME unchanged H, now with C === B1 as an
     // additional floor. B1's tree === H's tree, so it contributes no unique content and is skipped —
     // the result is byte-identical to B1, NOT a new nested commit.
-    const B2 = await git.bridgeToFloors(repo, H, [P, B1!]);
+    const B2 = await built(H, [P, B1]);
     assert.strictEqual(B2, B1, "an idle re-bridge of an unchanged H yields the identical B (no growth)");
     // B2 has EXACTLY the two parents H and P — B1 was NOT appended as a third parent.
     assert.strictEqual(gitIn(repo, ["rev-parse", `${B2}^1`]), H, "first parent is H");
@@ -183,11 +202,11 @@ describe("GitCache.bridgeToFloors (PRD #1416 M3)", () => {
     const H = gitIn(repo, ["rev-parse", "HEAD"]);
     assert.strictEqual(gitIn(repo, ["rev-parse", `${H}^{tree}`]), rootTree, "H's tree === root tree");
     assert.strictEqual(gitIn(repo, ["rev-parse", `${P}^{tree}`]), rootTree, "P's tree === root tree");
-    const B = await git.bridgeToFloors(repo, H, [P]);
-    assert.ok(B && OID.test(B), "a bridge is built even though P's tree coincides with H's");
+    const B = await built(H, [P]);
+    assert.ok(OID.test(B), "a bridge is built even though P's tree coincides with H's");
     assert.strictEqual(gitIn(repo, ["rev-parse", `${B}^2`]), P, "P (floors[0]) is still an extra parent");
-    assert.ok(isAncestor(P, B!), "P remains an ancestor of B");
-    assert.ok(isAncestor(H, B!), "H remains an ancestor of B");
+    assert.ok(isAncestor(P, B), "P remains an ancestor of B");
+    assert.ok(isAncestor(H, B), "H remains an ancestor of B");
   });
 
   it("still appends an ADDITIONAL floor whose tree DIFFERS from the tip's tree", async () => {
@@ -198,8 +217,8 @@ describe("GitCache.bridgeToFloors (PRD #1416 M3)", () => {
     const C = commit("c.txt", "c\n", "checkpoint above P"); // C's tree adds c.txt → differs from H's
     gitIn(repo, ["checkout", "-b", "h", R]);
     const H = commit("impl.ts", "1\n", "diverges below P");
-    const B = await git.bridgeToFloors(repo, H, [P, C]);
-    assert.ok(B && OID.test(B));
+    const B = await built(H, [P, C]);
+    assert.ok(OID.test(B));
     assert.strictEqual(gitIn(repo, ["rev-parse", `${B}^2`]), P, "P appended");
     assert.strictEqual(
       gitIn(repo, ["rev-parse", `${B}^3`]),
@@ -226,13 +245,13 @@ describe("GitCache.bridgeToFloors (PRD #1416 M3)", () => {
       "C's tree coincidentally equals H's tree",
     );
     assert.ok(!isAncestor(C, H) && !isAncestor(H, C), "C and H are divergent siblings, neither an ancestor");
-    const B = await git.bridgeToFloors(repo, H, [P, C]);
-    assert.ok(B && OID.test(B), "a bridge is built");
+    const B = await built(H, [P, C]);
+    assert.ok(OID.test(B), "a bridge is built");
     // C is RETAINED as an extra parent even though its tree equals H's → C's lineage is an ancestor of B.
-    assert.ok(isAncestor(C, B!), "C (a genuine divergent sibling with an equal tree) is an ancestor of B");
-    assert.ok(isAncestor(P, B!), "P is an ancestor of B");
-    assert.ok(isAncestor(H, B!), "H is an ancestor of B");
-    const parents = gitIn(repo, ["rev-list", "--parents", "-n", "1", B!]).split(/\s+/).slice(1);
+    assert.ok(isAncestor(C, B), "C (a genuine divergent sibling with an equal tree) is an ancestor of B");
+    assert.ok(isAncestor(P, B), "P is an ancestor of B");
+    assert.ok(isAncestor(H, B), "H is an ancestor of B");
+    const parents = gitIn(repo, ["rev-list", "--parents", "-n", "1", B]).split(/\s+/).slice(1);
     assert.ok(parents.includes(C), "C is among B's parents");
     void R;
   });
@@ -248,16 +267,16 @@ describe("GitCache.bridgeToFloors (PRD #1416 M3)", () => {
     const C = commit("c.txt", "c\n", "genuine checkpoint sibling"); // distinct tree (adds c.txt)
     gitIn(repo, ["checkout", "-b", "h", R]);
     const H = commit("impl.ts", "1\n", "rewritten work"); // distinct tree (adds impl.ts)
-    const B1 = await git.bridgeToFloors(repo, H, [P, C]);
-    assert.ok(B1 && OID.test(B1));
+    const B1 = await built(H, [P, C]);
+    assert.ok(OID.test(B1));
     assert.strictEqual(gitIn(repo, ["rev-parse", `${B1}^1`]), H, "B1's first parent is H");
     assert.strictEqual(gitIn(repo, ["rev-parse", `${B1}^2`]), P, "B1's second parent is P");
     assert.strictEqual(gitIn(repo, ["rev-parse", `${B1}^3`]), C, "B1's third parent is the genuine C");
-    assert.ok(isAncestor(C, B1!), "C is an ancestor of B1");
+    assert.ok(isAncestor(C, B1), "C is an ancestor of B1");
     // A later idle re-bridge over [P, B1] returns B1 unchanged (true superset idempotency).
-    const B2 = await git.bridgeToFloors(repo, H, [P, B1!]);
+    const B2 = await built(H, [P, B1]);
     assert.strictEqual(B2, B1, "an idle re-bridge over [P, B1] returns B1 unchanged (no nesting)");
-    assert.ok(isAncestor(C, B2!), "C_genuine remains an ancestor of the returned bridge");
+    assert.ok(isAncestor(C, B2), "C_genuine remains an ancestor of the returned bridge");
     void R;
   });
 });
@@ -265,8 +284,8 @@ describe("GitCache.bridgeToFloors (PRD #1416 M3)", () => {
 describe("GitCache.rangeContainsBridge (PRD #1416 M3 — the structure-validated detector)", () => {
   it("ACCEPTS a P-only worker bridge", async () => {
     const { P, H } = rootPublishedAndDivergent();
-    const B = await git.bridgeToFloors(repo, H, [P]);
-    assert.strictEqual(await git.rangeContainsBridge(repo, P, B!), true);
+    const B = await built(H, [P]);
+    assert.strictEqual(await git.rangeContainsBridge(repo, P, B), true);
   });
 
   it("ACCEPTS a C-only worker bridge", async () => {
@@ -277,8 +296,8 @@ describe("GitCache.rangeContainsBridge (PRD #1416 M3 — the structure-validated
     const C = commit("c.txt", "c\n", "checkpoint above P");
     gitIn(repo, ["checkout", "-b", "h", P]);
     const H = commit("impl.ts", "1\n", "on P, diverging from C");
-    const B = await git.bridgeToFloors(repo, H, [P, C]);
-    assert.strictEqual(await git.rangeContainsBridge(repo, P, B!), true);
+    const B = await built(H, [P, C]);
+    assert.strictEqual(await git.rangeContainsBridge(repo, P, B), true);
   });
 
   it("ACCEPTS a P+C worker bridge", async () => {
@@ -287,9 +306,9 @@ describe("GitCache.rangeContainsBridge (PRD #1416 M3 — the structure-validated
     const C = commit("c.txt", "c\n", "checkpoint above P");
     gitIn(repo, ["checkout", "-b", "h", R]);
     const H = commit("impl.ts", "1\n", "diverges below P");
-    const B = await git.bridgeToFloors(repo, H, [P, C]);
+    const B = await built(H, [P, C]);
     assert.strictEqual(gitIn(repo, ["rev-parse", `${B}^3`]), C, "both P and C are extra parents");
-    assert.strictEqual(await git.rangeContainsBridge(repo, P, B!), true);
+    assert.strictEqual(await git.rangeContainsBridge(repo, P, B), true);
   });
 
   it("ACCEPTS an agent `git merge -s ours P` bridge (no marker)", async () => {
