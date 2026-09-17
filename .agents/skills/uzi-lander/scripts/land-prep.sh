@@ -132,6 +132,13 @@ else
   log "worktree $WT on $BRANCH"
 fi
 cd "$WT" || exit 3
+# A dirty worktree stops everything BEFORE any lease is recorded: a fast-forward that a
+# dirty tree silently prevented, with the lease written anyway, is exactly how a later
+# clean re-run force-pushes a stale local head over the remote.
+if [ -n "$(git status --porcelain)" ]; then
+  if [ "$SKIP_REBASE" -eq 1 ]; then echo "worktree is dirty; commit the manual fix first, then --skip-rebase" >&2; else echo "worktree is dirty; commit or stash first" >&2; fi
+  exit 3
+fi
 # The lease is the remote head this LANDING started from, persisted in the worktree's git
 # dir. Every later run of the same landing (--skip-rebase, or a plain restart after a
 # --no-push or a failed gate) pushes against THAT head, never a refreshed origin/$BRANCH:
@@ -153,10 +160,14 @@ if [ -f "$LEASE_FILE" ]; then
   fi
 else
   [ "$SKIP_REBASE" -eq 0 ] || { echo "no lease recorded for #$PR in this worktree; run once without --skip-rebase" >&2; exit 8; }
-  # A NEW landing: the worktree must already contain the remote head, or be fast-forwardable
-  # to it; anything else is a divergence no lease can vouch for.
+  # A NEW landing: the worktree must already contain the remote head, or be fast-forwarded
+  # to it NOW (a failed fast-forward records no lease); anything else is a divergence no
+  # lease can vouch for.
   if git merge-base --is-ancestor HEAD "origin/$BRANCH"; then
-    git merge -q --ff-only "origin/$BRANCH" 2>/dev/null || true
+    if ! git merge -q --ff-only "origin/$BRANCH"; then
+      echo "fast-forward of $WT to origin/$BRANCH failed; no lease recorded" >&2; exit 3
+    fi
+    [ "$(git rev-parse HEAD)" = "$remote_now" ] || { echo "worktree is not at the remote head after fast-forward; no lease recorded" >&2; exit 3; }
   elif ! git merge-base --is-ancestor "origin/$BRANCH" HEAD; then
     log "worktree HEAD $(git rev-parse --short HEAD) and remote ${remote_now:0:8} have diverged with no landing in progress; --fresh resets the worktree to the remote"
     echo "RESULT=diverged"; exit 8
@@ -167,7 +178,6 @@ fi
 
 # ---- rebase -----------------------------------------------------------------------------
 if [ "$SKIP_REBASE" -eq 0 ]; then
-  if [ -n "$(git status --porcelain)" ]; then echo "worktree is dirty; commit or stash first (or --skip-rebase after a manual step)" >&2; exit 3; fi
   if git rebase "origin/$BASE" --quiet; then
     log "rebased onto origin/$BASE ($(git rev-list --count "origin/$BASE..HEAD") commits)"
   else

@@ -156,12 +156,20 @@ for n in "$@"; do
   fi
 
   # ---- Live inline findings, both bots -----------------------------------------------
+  # The listing is fetched raw and validated first: a failed or unreadable findings
+  # request must not print nothing and let a "reviewed" PR exit 0 — it makes the PR
+  # unconfirmed (exit 3) with the reason printed.
   # CodeRabbit: severity emoji + bold title; a finding tagged "Addressed in commit" is done.
   # Greptile: P1/P2 badge from the <img alt="P1"> tag; title = first text after the badge.
+  inline_raw=$(gh api --paginate "repos/${repo}/pulls/${n}/comments" 2>/dev/null | jq -s 'add // []' 2>/dev/null || echo 'x')
+  if ! printf '%s' "$inline_raw" | jq -e 'type=="array"' >/dev/null 2>&1; then
+    echo "  🔴 inline findings UNREADABLE (comments request failed or returned garbage) — NOT confirmed clean"
+    unconfirmed="${unconfirmed} #${n}"
+    inline_raw='[]'
+  fi
   # $sev/$t/$p below are jq variables, not shell expansions — single quotes are correct.
   # shellcheck disable=SC2016
-  gh api "repos/${repo}/pulls/${n}/comments" --paginate \
-    --jq '.[]|select(.line!=null)
+  printf '%s' "$inline_raw" | jq -r '.[]|select(.line!=null)
       | if .user.login=="coderabbitai[bot]" then
           ((.body|match("🔴|🟠|🟡|🔵").string)? // "?") as $sev
           | ((.body|match("\\*\\*[^*]+\\*\\*").string)? // "-") as $t
@@ -171,7 +179,7 @@ for n in "$@"; do
           ((.body|match("alt=\"(P[0-9])\"").captures[0].string)? // "?") as $p
           | (.body|gsub("<[^>]*>";"")|gsub("[[:space:]]+";" ")|.[0:110]) as $t
           | "  GR  \(.path):\(.line)  [\($p)] \($t)"
-        else empty end' 2>/dev/null || true
+        else empty end' 2>/dev/null || { echo "  🔴 could not render the inline findings — NOT confirmed clean"; unconfirmed="${unconfirmed} #${n}"; }
 done
 
 if [ -n "$unreviewed" ] || [ -n "$unconfirmed" ]; then
@@ -180,7 +188,7 @@ if [ -n "$unreviewed" ] || [ -n "$unconfirmed" ]; then
     echo "🔴 NOT REVIEWED on head by any bot:${unreviewed} — trigger '@coderabbitai review' / '@greptileai review' or fall back to /code-review; do not merge as clean."
   fi
   if [ -n "$unconfirmed" ]; then
-    echo "🔴 REVIEWED but NOT confirmed clean:${unconfirmed} — tally-less non-APPROVED CodeRabbit review; inspect the review body before merging."
+    echo "🔴 REVIEWED but NOT confirmed clean:${unconfirmed} — a tally-less non-APPROVED CodeRabbit review (read its body), or the inline findings could not be read (re-run); do not merge on this."
   fi
   exit 3
 fi

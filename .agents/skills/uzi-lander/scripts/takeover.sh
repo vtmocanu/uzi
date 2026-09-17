@@ -47,9 +47,18 @@ fi
 echo "REPO=$REPO"
 
 have_uzi=0; command -v uzi >/dev/null 2>&1 && have_uzi=1
-repo_id=""
+# UNKNOWN is set by any lookup that fails or returns an unreadable payload; a snapshot with
+# UNKNOWN=1 never reaches NEXT=ready. Declared here because the first such lookup is next.
+UNKNOWN=0
+repo_id=""; repo_listed=0
 if [ "$have_uzi" -eq 1 ]; then
-  repo_id=$(uzi repo list --json 2>/dev/null | jq -r --arg p "$REPO" '.[]|select(.path_with_namespace==$p)|.id' 2>/dev/null | head -1 || true)
+  rl=$(uzi repo list --json 2>/dev/null || echo 'x')
+  if printf '%s' "$rl" | jq -e 'type=="array"' >/dev/null 2>&1; then
+    repo_listed=1
+    repo_id=$(printf '%s' "$rl" | jq -r --arg p "$REPO" '[.[]|select(.path_with_namespace==$p)|.id]|first // ""' 2>/dev/null) || UNKNOWN=1
+  else
+    UNKNOWN=1; echo "UZI_REPO_LIST=unreadable"
+  fi
 fi
 
 # ---- resolve run <-> PR --------------------------------------------------------------
@@ -98,10 +107,9 @@ state=$(printf '%s' "$pj" | jq -r .state); head=$(printf '%s' "$pj" | jq -r .hea
 merge_state=$(printf '%s' "$pj" | jq -r .mergeStateStatus); base=$(printf '%s' "$pj" | jq -r .baseRefName)
 case "$state" in MERGED) echo "NEXT=merged"; exit 0;; CLOSED) echo "NEXT=closed"; exit 0;; esac
 
-# Every lookup below that fails or returns an unparseable payload sets UNKNOWN=1, and an
-# unknown snapshot never reaches NEXT=ready: a masked failure would otherwise read as
-# "zero pending, zero findings".
-UNKNOWN=0
+# Every lookup below that fails or returns an unparseable payload sets UNKNOWN=1 (declared
+# at the top), and an unknown snapshot never reaches NEXT=ready: a masked failure would
+# otherwise read as "zero pending, zero findings".
 arr_or_unknown() { printf '%s' "$1" | jq -e 'type=="array"' >/dev/null 2>&1 || UNKNOWN=1; }
 
 # Required checks by bucket (must be a non-empty array; `{}`/`[]` are unknown).
@@ -177,17 +185,25 @@ if [ "$have_uzi" -eq 1 ] && [ -n "$repo_id" ]; then
   else
     UNKNOWN=1; echo "MR_REWORK=unreadable"
   fi
-elif [ "$have_uzi" -eq 1 ] && [ -z "$repo_id" ]; then
-  echo "MR_REWORK=repo-not-on-uzi-or-listing-failed"
+elif [ "$have_uzi" -eq 1 ] && [ "$repo_listed" -eq 1 ] && [ -z "$repo_id" ]; then
+  echo "MR_REWORK=repo-not-on-uzi"
 fi
 echo "MR_REWORK_ACTIVE=$mrw"
 
-# Workflow files and migrations in the PR diff (added files), vs main's migration set.
-files=$(gh api --paginate "repos/$REPO/pulls/$PR/files" 2>/dev/null | jq -s 'add // []' || echo '[]')
+# Workflow files and migrations in the PR diff (added files), vs the base's migration set.
+# An unreadable files list or base listing is UNKNOWN: a missed migration collision
+# bricks boot, so it must never read as "no collision".
+files=$(gh api --paginate "repos/$REPO/pulls/$PR/files" 2>/dev/null | jq -s 'add // []' 2>/dev/null || echo 'x')
+if ! printf '%s' "$files" | jq -e 'type=="array"' >/dev/null 2>&1; then UNKNOWN=1; echo "PR_FILES=unreadable"; files='[]'; fi
 wf=$(printf '%s' "$files" | jq '[.[]|select(.filename|startswith(".github/workflows/"))]|length' 2>/dev/null || echo 0)
 echo "WORKFLOW_FILES_IN_DIFF=$wf"
 added_mig=$(printf '%s' "$files" | jq -r '.[]|select(.status=="added" and (.filename|startswith("api/internal/store/migrations/")))|.filename|split("/")|last' 2>/dev/null || true)
-main_mig=$(gh api "repos/$REPO/contents/api/internal/store/migrations?ref=$base" --jq '.[].name' 2>/dev/null || true)
+main_mig_raw=$(gh api "repos/$REPO/contents/api/internal/store/migrations?ref=$base" 2>/dev/null || echo 'x')
+if printf '%s' "$main_mig_raw" | jq -e 'type=="array"' >/dev/null 2>&1; then
+  main_mig=$(printf '%s' "$main_mig_raw" | jq -r '.[].name')
+else
+  UNKNOWN=1; echo "BASE_MIGRATIONS=unreadable"; main_mig=""
+fi
 main_head=$(printf '%s\n' "$main_mig" | grep -oE '^[0-9]+' | sort -n | tail -1 || true)
 echo "MIGRATION_HEAD_ON_BASE=${main_head:-}"
 collision=""

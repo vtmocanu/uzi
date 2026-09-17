@@ -60,6 +60,7 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
 
 | NEXT | Do |
 |---|---|
+| `unknown` | a lookup failed or returned garbage: re-run the snapshot; never act on it |
 | `run_active:<status>` | step 1 |
 | `run_failed:*`, `run_completed_no_pr` | hand to `uzi-watcher` (*When a run fails*, recovery) |
 | `migration_collision`, `conflict` | step 5 |
@@ -237,7 +238,10 @@ a user reply that arrives first wins.
   silently.
 - A skill-maintenance PR is titled with `[skip-cr]` (no bot review), reviewed by a local
   agent or a peer session, and by the user. Re-run `agnix` on `SKILL.md` after editing;
-  `task check:skill-size` gates the size.
+  `task check:skill-size` gates the size. A Codex peer's shim delivers at most three
+  consecutive replies per 30 minutes; before a fourth review round run
+  `peers.py budget reset <peer>` (session-peers skill) or its verdict is dropped silently
+  (the shim log names it).
 
 ## Files
 
