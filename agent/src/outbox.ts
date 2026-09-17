@@ -164,6 +164,19 @@ export interface PendingTerminal {
   since: number;
 }
 
+/** PRD #1391 M3b: a pending terminal journal's durable payload, returned by
+ *  {@link Outbox.readTerminalJournal} for the send path — the already-canonical report `body`, its
+ *  `messagesThroughSeq` fence and the phase captured at journal time (`phase_at_journal`), plus its
+ *  blocked state (D13). The M3b `resolvePendingTerminal` send path sends `body` verbatim, adding the
+ *  fence only when the api advertises `terminal_fence` (D9). */
+export interface PendingTerminalJournal {
+  body: Record<string, unknown>;
+  messagesThroughSeq: number;
+  phase: string;
+  blocked: boolean;
+  blockedReason?: TerminalBlockedReason;
+}
+
 /** The on-disk terminal-journal record (D4). Installed crash-atomically and EXCLUSIVELY
  *  (first durable writer for a generation wins), authenticated with {@link MAC_DOMAIN_TERMINAL}.
  *  `body` is the ALREADY-canonical report body (M3b canonicalises before journalling AND before
@@ -1008,8 +1021,6 @@ export class Outbox {
         });
         return { journaled: false, reason: "reserve_exhausted" };
       }
-      await fs.mkdir(dir, { recursive: true, mode: 0o700 });
-      await this.fsyncDir(this.root);
       const since = this.now();
       const record: TerminalJournalData = {
         version: 1,
@@ -1026,7 +1037,24 @@ export class Outbox {
       const dst = path.join(dir, terminalFileName(claimGeneration));
       let adopted: boolean;
       try {
-        adopted = await this.installTerminalExclusive(dst, serialized);
+        // M3a review fold-in (SC2): the run-dir mkdir (and its dir fsync) can ENOSPC too, so a
+        // terminal write-ahead on a FULL volume with an ABSENT run dir would THROW if the mkdir
+        // sat before the ENOSPC handling. Wrap EVERY disk step that can hit ENOSPC — the mkdir
+        // INCLUDED — in withReserveOnEnospc so releasing the reserve frees the space the directory
+        // entry (and the record) needs; if even that cannot admit it the ENOSPC propagates to the
+        // catch below and degrades to reserve_exhausted rather than throwing. The mkdir is routed
+        // through the same rawWrite ENOSPC seam as the record write so a test can simulate a full
+        // volume at the directory-creation step.
+        adopted = await this.withReserveOnEnospc(async () => {
+          await this.rawWrite(
+            async () => {
+              await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+            },
+            { path: dir, kind: "terminal" },
+          );
+          await this.fsyncDir(this.root);
+          return this.installTerminalExclusive(dst, serialized);
+        });
       } catch (err) {
         if (isENOSPC(err)) {
           // Even releasing the reserve could not admit the journal: signal the caller to
@@ -1146,10 +1174,43 @@ export class Outbox {
     });
   }
 
-  /** Install a terminal journal crash-atomically and EXCLUSIVELY (D4): temp write (through the
-   *  ENOSPC-reserve seam so a full volume uses the reserve) → fsync → no-replace `link()` (EEXIST
-   *  means a first writer already won this generation) → dir fsync → remove temp. Returns whether an
-   *  existing winner was adopted rather than freshly installed. */
+  /**
+   * PRD #1391 M3b: read a pending terminal journal's DURABLE payload for the send path — the
+   * already-canonical report body, its `messages_through_seq` fence and the phase captured at
+   * journal time. The M3b `resolvePendingTerminal` send path reads this to send those exact
+   * canonical bytes (adding the fence only when the api advertises `terminal_fence`). Returns
+   * undefined when the run holds no such journal (already retired / never installed) or the file no
+   * longer authenticates (a tampered/absent record proves nothing — never sent).
+   */
+  async readTerminalJournal(
+    runId: string,
+    claimGeneration: number,
+  ): Promise<PendingTerminalJournal | undefined> {
+    if (this.disabled) return undefined;
+    return this.withRunLock(runId, async () => {
+      if (!this.validRunId(runId)) return undefined;
+      const parsed = await this.readAuthed(
+        path.join(this.runDir(runId), terminalFileName(claimGeneration)),
+        MAC_DOMAIN_TERMINAL,
+      );
+      if (!parsed) return undefined;
+      return coerceTerminalRecord(parsed, runId, claimGeneration) ?? undefined;
+    });
+  }
+
+  /** In-memory check: does this run hold an installed, un-retired terminal journal for the
+   *  generation? The executor catch reads it (via the send path) to treat a journaled outcome as
+   *  FINAL — no second fallback `failed` once the write-ahead journal exists (fact 2, D5). */
+  hasPendingTerminal(runId: string, claimGeneration: number): boolean {
+    return this.runs.get(runId)?.terminals.has(claimGeneration) ?? false;
+  }
+
+  /** Install a terminal journal crash-atomically and EXCLUSIVELY (D4): temp write → fsync →
+   *  no-replace `link()` (EEXIST means a first writer already won this generation) → dir fsync →
+   *  remove temp. Returns whether an existing winner was adopted rather than freshly installed.
+   *  The reserve/ENOSPC handling now lives in {@link journalTerminal}, wrapping this call AND the
+   *  run-dir mkdir together, so the whole sequence uses (and replenishes) the reserve exactly once
+   *  on a full volume — the temp write and the `link()` both ride that single release. */
   private async installTerminalExclusive(dst: string, serialized: string): Promise<boolean> {
     const tmp = `${dst}.${randomUUID()}.tmp`;
     const doWrite = async () => {
@@ -1166,7 +1227,7 @@ export class Outbox {
       }
     };
     try {
-      await this.withReserveOnEnospc(() => this.rawWrite(doWrite, { path: tmp, kind: "terminal" }));
+      await this.rawWrite(doWrite, { path: tmp, kind: "terminal" });
     } catch (err) {
       await fs.rm(tmp, { force: true }).catch(() => undefined);
       throw err;
@@ -1746,6 +1807,35 @@ function coerceTerminal(obj: Record<string, unknown>, runId: string, fileGen: nu
     claimGeneration: obj.claim_generation,
     phaseAtJournal: obj.phase_at_journal,
     since: obj.since,
+    blocked,
+    ...(blockedReason !== undefined ? { blockedReason } : {}),
+  };
+}
+
+/** Validate an authenticated terminal-journal object into the FULL send-path payload (body + fence +
+ *  phase + blocked state; the MAC already gated integrity in readAuthed). Binds the embedded `run_id`
+ *  to the directory and the embedded `claim_generation` to the filename, so a copied/misfiled journal
+ *  is rejected. Returns null on any mismatch — a bad record proves nothing and is never sent. */
+function coerceTerminalRecord(
+  obj: Record<string, unknown>,
+  runId: string,
+  fileGen: number,
+): PendingTerminalJournal | null {
+  if (obj.version !== 1) return null;
+  if (obj.run_id !== runId) return null;
+  if (typeof obj.claim_generation !== "number" || obj.claim_generation !== fileGen) return null;
+  if (typeof obj.phase_at_journal !== "string") return null;
+  if (typeof obj.messages_through_seq !== "number") return null;
+  if (typeof obj.body !== "object" || obj.body === null || Array.isArray(obj.body)) return null;
+  const blocked = obj.blocked === true;
+  let blockedReason: TerminalBlockedReason | undefined;
+  if (blocked && typeof obj.blocked_reason === "string" && TERMINAL_BLOCKED_REASONS.has(obj.blocked_reason)) {
+    blockedReason = obj.blocked_reason as TerminalBlockedReason;
+  }
+  return {
+    body: obj.body as Record<string, unknown>,
+    messagesThroughSeq: obj.messages_through_seq,
+    phase: obj.phase_at_journal,
     blocked,
     ...(blockedReason !== undefined ? { blockedReason } : {}),
   };

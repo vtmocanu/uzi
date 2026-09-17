@@ -26,6 +26,8 @@ import { LimitReachedError, type RateLimitObservation } from "./limit.js";
 import { errMessage } from "./util.js";
 import type { Logger } from "./log.js";
 import type { WorkerClient } from "./client.js"; // type-only — erased at runtime; client.ts imports no runner/model-pass, so no cycle
+import { postTerminalState, type TerminalOutboxDeps } from "./terminal-resolve.js";
+import type { StateRequest } from "./protocol.js";
 import type { SdkQueryFn } from "./sdk-executor.js"; // type-only — erased at runtime, so no import cycle
 import type {
   AdviceRequest,
@@ -198,7 +200,14 @@ const ADVICE_FAILURE_REASON_LEN = 500;
  *  it — UNCONDITIONALLY, mirroring that closure — on BOTH failed body shapes, so a
  *  credential_switch_v1 capability worker's failed advice report engages the server's
  *  per-query generation fence instead of being refused with a 409. Undefined on a pre-#1296
- *  claim, which leaves the field off the wire. */
+ *  claim, which leaves the field off the wire.
+ *
+ *  `terminalDeps` (PRD #1391 Run B M3b, D6) journals the terminal STATE write-ahead when an outbox
+ *  is wired, so a lost judge/review terminal cannot leave the run `running` forever (the timeout
+ *  sweep excludes judge runs, fact 12). NEVER the verdict/review POST — the caller posts that
+ *  separately, before this. The message fence is 0: a judge/review trace is a single advisory usage
+ *  frame that never gates api sub-work, so no fence is needed and none can strand the outcome.
+ *  Undefined (a test without spill, or a store that failed closed) ⇒ today's un-journaled report. */
 export async function safeReportFailed(
   client: Pick<WorkerClient, "reportState">,
   log: Logger,
@@ -207,22 +216,29 @@ export async function safeReportFailed(
   reason: string,
   cause?: unknown,
   claimGeneration?: number,
+  terminalDeps?: TerminalOutboxDeps,
 ): Promise<void> {
   try {
-    const body =
+    const body: StateRequest =
       cause instanceof LimitReachedError
         ? {
-            status: "failed" as const,
+            status: "failed",
             rate_limit_type: cause.rateLimitType,
             limit_resets_at: cause.resetsAtMs,
             claim_generation: claimGeneration,
           }
         : {
-            status: "failed" as const,
+            status: "failed",
             failure_reason: reason.slice(0, ADVICE_FAILURE_REASON_LEN),
             claim_generation: claimGeneration,
           };
-    await client.reportState(runId, body);
+    await postTerminalState(terminalDeps, client, {
+      runId,
+      claimGeneration: claimGeneration ?? 0,
+      phase: "running",
+      messagesThroughSeq: 0,
+      body,
+    });
   } catch (err) {
     log.warn(`${label} failed-state report failed`, { run_id: runId, error: errMessage(err) });
   }

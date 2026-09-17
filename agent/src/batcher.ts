@@ -206,8 +206,14 @@ export interface MessageBatcherOptions {
    * poison and never lands, and after a trip nothing flushes at all. Each runner
    * wires this to its own `reportState`, which has bounded retries, 4xx-fatal
    * semantics and already-terminal-is-success.
+   *
+   * PRD #1391 Run B M3 (D5): the handler MAY be async. When it is, {@link MessageBatcher.trip}
+   * captures its promise into {@link MessageBatcher.awaitPermanentFailureSettled} so the run lane
+   * can AWAIT the handler's durable `failed` journal + abort before finalizing — a completion that
+   * raced the permanent failure then cannot reverse the first durable winner. Chat keeps a
+   * synchronous fire-and-forget handler (today's behaviour).
    */
-  onPermanentFailure?: (info: PermanentFailureInfo) => void;
+  onPermanentFailure?: (info: PermanentFailureInfo) => void | Promise<void>;
   /**
    * PRD #1391 M2: the worker outbox to SPILL to after `transientTripMs` of unbroken
    * TRANSIENT failures, instead of tripping. Undefined ⇒ no store (should not happen
@@ -286,7 +292,12 @@ export class MessageBatcher {
   private readonly generation: number;
   private readonly transientTripMs: number;
   private readonly spillBufferBytes: number;
-  private permanentFailureHandler: ((info: PermanentFailureInfo) => void) | undefined;
+  private permanentFailureHandler: ((info: PermanentFailureInfo) => void | Promise<void>) | undefined;
+  /** PRD #1391 Run B M3 (D5): the promise the async permanent-failure handler returns, captured at
+   *  {@link trip} so the executor can AWAIT the handler's durable `failed` journal + abort before it
+   *  finalizes — the split-brain fix (a completion that races the permanent failure can never reverse
+   *  the first durable winner). Undefined until the breaker trips; never rejects (trip guards it). */
+  private permanentFailureSettled: Promise<void> | undefined;
   private seq: number;
   private timer: NodeJS.Timeout | undefined;
   private flushing = false;
@@ -538,9 +549,24 @@ export class MessageBatcher {
    * argument because both runners build their `reportState` closure AFTER the
    * batcher (it captures the session id the executor later observes), and
    * reordering that would be a bigger change than this one line.
+   *
+   * PRD #1391 Run B M3 (D5): the handler may be async — the run lane's handler journals `failed`
+   * (awaiting its durable install), resolves it, and aborts the attempt, and {@link trip} captures
+   * the returned promise into {@link awaitPermanentFailureSettled}. Chat passes a sync handler.
    */
-  onPermanentFailureReport(handler: (info: PermanentFailureInfo) => void): void {
+  onPermanentFailureReport(handler: (info: PermanentFailureInfo) => void | Promise<void>): void {
     this.permanentFailureHandler = handler;
+  }
+
+  /**
+   * PRD #1391 Run B M3 (D5): await the permanent-failure handler's settlement. Resolves immediately
+   * when the breaker never tripped (the common path), and otherwise resolves once the async handler
+   * has journaled its durable `failed` and aborted the attempt — so the run lane's finalize can
+   * observe the abort ONLY AFTER the outcome is durable, and a racing completion cannot reverse the
+   * first durable winner (the no-replace install in journalTerminal arbitrates, D4). Never rejects.
+   */
+  async awaitPermanentFailureSettled(): Promise<void> {
+    await this.permanentFailureSettled;
   }
 
   /**
@@ -647,10 +673,19 @@ export class MessageBatcher {
       dropped,
     });
     try {
-      this.permanentFailureHandler?.({ reason: text, lastSeq, dropped });
+      // PRD #1391 Run B M3 (D5): capture the handler's return into permanentFailureSettled so the
+      // run lane can AWAIT its durable `failed` journal + abort before finalizing. A sync handler
+      // returns void ⇒ Promise.resolve() settles immediately (today's behaviour). Swallow both a
+      // synchronous throw and a rejected promise: a throwing handler must not take the batcher (or
+      // the run) with it, and a caller awaiting permanentFailureSettled must never see a rejection.
+      const ret = this.permanentFailureHandler?.({ reason: text, lastSeq, dropped });
+      this.permanentFailureSettled = Promise.resolve(ret).catch((err) => {
+        this.log.warn("permanent-failure handler rejected", { run_id: this.runId, error: errMessage(err) });
+      });
     } catch (err) {
       // A throwing handler must not take the batcher (or the run) with it.
       this.log.warn("permanent-failure handler threw", { run_id: this.runId, error: errMessage(err) });
+      this.permanentFailureSettled = Promise.resolve();
     }
   }
 

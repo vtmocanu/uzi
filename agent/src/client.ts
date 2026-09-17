@@ -26,6 +26,7 @@ import {
   type InputsResponse,
   type RunOwnershipResponse,
   type RunOrphanClassificationResponse,
+  type MessageGapsResponse,
   type WorkerProposal,
   type WorkerRunDetail,
   type WorkerRunListItem,
@@ -815,6 +816,33 @@ export class WorkerClient {
    *  error via `err.status`. Reuses GetRunOwnedByWorker server-side; no new query. */
   async getRunOwnership(runId: string): Promise<RunOwnershipResponse> {
     return (await this.getJSON(`${WORKER_API_PREFIX}/runs/${runId}/ownership`)) as RunOwnershipResponse;
+  }
+
+  /** PRD #1391 Run B M3 (D3): read a page of a run's MISSING message-seq ranges in `[1..through]`
+   *  (GET /worker/runs/{id}/message-gaps?through=N&limit=&cursor=), index-backed and keyset-paginated
+   *  so the read never materialises N rows. The terminal-resolve path calls it when the fence refused
+   *  a terminal report `messages_pending`: it fills each missing seq with a per-seq "unrecoverable
+   *  gap" tombstone, then re-sends. `cursor` (the previous page's `next_cursor`) resumes the walk;
+   *  omit it (or 0) to start from the head. Throws a RequestError on 4xx/5xx (a 404 = run not owned).
+   *  The api fences the read on worker ownership, so no claim generation rides the query. */
+  async getMessageGaps(
+    runId: string,
+    through: number,
+    limit?: number,
+    cursor?: number,
+  ): Promise<MessageGapsResponse> {
+    const params = new URLSearchParams({ through: String(through) });
+    if (limit !== undefined) params.set("limit", String(limit));
+    if (cursor !== undefined && cursor > 0) params.set("cursor", String(cursor));
+    const res = (await this.getJSON(
+      `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/message-gaps?${params.toString()}`,
+    )) as MessageGapsResponse;
+    // Total-by-construction: an older/absent body yields an empty page (no gaps, no next cursor),
+    // which the resolve path reads as "nothing to fill" rather than throwing.
+    return {
+      gaps: Array.isArray(res?.gaps) ? res.gaps : [],
+      ...(typeof res?.next_cursor === "number" ? { next_cursor: res.next_cursor } : {}),
+    };
   }
 
   /** issue #1319 — the orphan-classification read: authoritative identity of a clone-orphan

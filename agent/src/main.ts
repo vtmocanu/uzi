@@ -235,6 +235,9 @@ async function main(): Promise<void> {
     rearm,
     transientTripMs: config.transientTripMs,
     outboxSpillBufferBytes: config.outboxSpillBufferBytes,
+    // PRD #1391 Run B M3: the terminal-journal send-path knobs (canonicaliser cap + gap-fill bound).
+    outboxTerminalMaxBytes: config.outboxTerminalMaxBytes,
+    gapFillMax: config.gapFillMax,
     // PRD #1390 M2a: the shared active-run registry the worker reads to build snapshots.
     activeRuns,
   });
@@ -298,6 +301,10 @@ async function main(): Promise<void> {
     homeRoot: sdkHomeRoot,
     // PRD #1390 M2a: a judge attempt holds a run slot, so it is listed in the snapshot.
     activeRuns,
+    // PRD #1391 Run B M3b (D6): journal the judge's terminal STATE write-ahead (never the verdict).
+    outbox,
+    outboxTerminalMaxBytes: config.outboxTerminalMaxBytes,
+    gapFillMax: config.gapFillMax,
     ...(config.executor === "stub" ? { queryFn: stubJudgeQueryFn } : {}),
   });
 
@@ -311,6 +318,10 @@ async function main(): Promise<void> {
     homeRoot: sdkHomeRoot,
     // PRD #1390 M2a: a review attempt holds a run slot, so it is listed in the snapshot.
     activeRuns,
+    // PRD #1391 Run B M3b (D6): journal the review's terminal STATE write-ahead (never the review POST).
+    outbox,
+    outboxTerminalMaxBytes: config.outboxTerminalMaxBytes,
+    gapFillMax: config.gapFillMax,
     ...(config.executor === "stub" ? { queryFn: stubJudgeQueryFn } : {}),
   });
 

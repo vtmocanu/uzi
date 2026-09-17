@@ -402,6 +402,62 @@ describe("MessageBatcher breaker (PRD #108 M3)", () => {
     assert.strictEqual(warn["last_rejected_seq"], 1);
   });
 
+  it("PRD #1391 Run B M3 (D5): awaitPermanentFailureSettled resolves immediately when the breaker never tripped", async () => {
+    const { client } = scriptedApi(() => undefined);
+    const { logger } = recordingLogger();
+    const batcher = new MessageBatcher(client, RUN, 0, 5, logger);
+    fill(batcher, 2);
+    await batcher.close();
+    // No trip ⇒ settled is a no-op that resolves at once (the common path for every ordinary run).
+    await batcher.awaitPermanentFailureSettled();
+    assert.strictEqual(batcher.isTripped(), false);
+  });
+
+  it("PRD #1391 Run B M3 (D5): captures an ASYNC handler's promise so a caller AWAITS the durable outcome before the abort is observed", async () => {
+    const { client } = scriptedApi(() => 401); // 401 trips at once
+    const { logger } = recordingLogger();
+    const events: string[] = [];
+    let aborted = false;
+    const batcher = new MessageBatcher(client, RUN, 0, 5, logger);
+    // The run lane's handler journals `failed` (durable), then aborts. Here: an async body that
+    // completes its durable step BEFORE the abort, so the ordering can be asserted.
+    batcher.onPermanentFailureReport(async () => {
+      events.push("handler-start");
+      await sleep(20); // stand in for the durable journal install
+      events.push("durable-installed");
+      aborted = true; // the attempt abort happens only AFTER the durable install
+      events.push("aborted");
+    });
+    fill(batcher, 4);
+    await batcher.close(); // the trip fires during the flush; the async handler is still mid-flight
+    await batcher.awaitPermanentFailureSettled();
+    assert.deepStrictEqual(
+      events,
+      ["handler-start", "durable-installed", "aborted"],
+      "the whole async handler ran before the settlement resolved",
+    );
+    assert.strictEqual(aborted, true, "the abort is observable only AFTER the settlement resolves");
+  });
+
+  it("PRD #1391 Run B M3 (D5): a REJECTING handler never rejects the settlement (a caller awaiting it is safe)", async () => {
+    const { client } = scriptedApi(() => 401);
+    const { logger, lines } = recordingLogger();
+    const batcher = new MessageBatcher(client, RUN, 0, 5, logger);
+    batcher.onPermanentFailureReport(async () => {
+      throw new Error("handler blew up");
+    });
+    fill(batcher, 3);
+    await batcher.close();
+    // Must not throw — the settlement swallows the handler's rejection and logs it.
+    await batcher.awaitPermanentFailureSettled();
+    assert.ok(
+      (lines as Array<Record<string, unknown>>).some(
+        (l) => !!l && typeof l === "object" && String((l as { msg?: string }).msg).includes("permanent-failure handler rejected"),
+      ),
+      "the rejection is logged, not propagated to the awaiting caller",
+    );
+  });
+
   it("an emit AFTER close is reported, never silently swallowed", async () => {
     // The pre-existing trap all three runner paths hit: close() then a throwing
     // terminal report, whose catch emits an `error` frame into a closed batcher.

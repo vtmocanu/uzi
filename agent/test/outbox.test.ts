@@ -1369,6 +1369,93 @@ describe("Outbox M3 terminal-journal store (PRD #1391 Run B)", () => {
       "about 5.2 MiB at the defaults",
     );
   });
+
+  it("T10. mkdir-ENOSPC fold-in: a terminal write-ahead on a full volume with an ABSENT run dir degrades to reserve_exhausted, NEVER throws", async () => {
+    // The M3a review gap: the run-dir mkdir used to sit BEFORE the ENOSPC→reserve_exhausted handling,
+    // so a full volume with no prior spill for the run THREW at the mkdir instead of degrading. The
+    // fix routes the mkdir through the same reserve/ENOSPC seam as the record write. Here the seam
+    // fails the mkdir (the run-dir path, never a .tmp) on EVERY attempt — even after the reserve is
+    // released — so the store cannot even create the dir and must SIGNAL the caller, not throw.
+    const root = await mkRoot();
+    const runDir = path.join(root, "r1");
+    const rawWrite: RawWriteSeam = async (write, ctx) => {
+      if (ctx.kind === "terminal" && ctx.path === runDir) {
+        const err = new Error("no space left on device") as NodeJS.ErrnoException;
+        err.code = "ENOSPC";
+        throw err; // the mkdir step, always full
+      }
+      await write();
+    };
+    const { logger, lines } = recordingLogger();
+    const o = makeOutbox(root, { rawWrite, log: logger });
+    await o.init();
+    assert.ok(!existsSync(runDir), "the run dir is absent before the write-ahead (no prior spill)");
+
+    const body = canonicalizeTerminalBody({ status: "failed", failure_reason: "boom" }, 1 << 20);
+    let threw = false;
+    let res: Awaited<ReturnType<typeof o.journalTerminal>> | undefined;
+    try {
+      res = await o.journalTerminal("r1", 1, "reviewing", 5, body);
+    } catch {
+      threw = true;
+    }
+    assert.equal(threw, false, "journalTerminal must NOT throw when the mkdir hits ENOSPC");
+    assert.deepEqual(res, { journaled: false, reason: "reserve_exhausted" }, "it degrades to reserve_exhausted");
+    assert.equal(o.depthFor("r1"), undefined, "nothing is tracked pending");
+    assert.ok(
+      (lines as Array<{ level: string; msg: string }>).some(
+        (l) => l.level === "error" && l.msg.includes("reserve exhausted"),
+      ),
+      "the unjournaled fallback is logged as an error (never a silent drop)",
+    );
+  });
+
+  it("T11. mkdir-ENOSPC fold-in: releasing the reserve ADMITS the run-dir mkdir, so the journal still installs", async () => {
+    // The complementary case: the mkdir hits ENOSPC ONCE (reserve present), the reserve release frees
+    // the space, and the retry succeeds — so a full volume with headroom in the reserve still journals
+    // the outcome durably rather than degrading.
+    const root = await mkRoot();
+    const runDir = path.join(root, "r1");
+    let mkdirCalls = 0;
+    const rawWrite: RawWriteSeam = async (write, ctx) => {
+      if (ctx.kind === "terminal" && ctx.path === runDir) {
+        mkdirCalls++;
+        if (mkdirCalls === 1) {
+          const err = new Error("no space left on device") as NodeJS.ErrnoException;
+          err.code = "ENOSPC";
+          throw err; // first mkdir attempt: full
+        }
+      }
+      await write(); // the retry (and the temp write) proceed
+    };
+    const o = makeOutbox(root, { rawWrite });
+    await o.init();
+
+    const body = canonicalizeTerminalBody({ status: "completed", branch: "b" }, 1 << 20);
+    const res = await o.journalTerminal("r1", 2, "reviewing", 9, body);
+    assert.deepEqual(res, { journaled: true, adopted: false }, "the reserve release admitted the mkdir; the journal installed");
+    assert.ok(mkdirCalls >= 2, "the mkdir was retried after the reserve release");
+    assert.deepEqual(await terminalFileNames(runDir), ["terminal-2.json"]);
+    assert.equal(o.depthFor("r1")?.pendingTerminal, 1);
+  });
+
+  it("T12. readTerminalJournal returns the durable canonical body + fence + phase, and undefined once retired / for an unknown gen", async () => {
+    const root = await mkRoot();
+    const o = makeOutbox(root);
+    await o.init();
+    const body = canonicalizeTerminalBody({ status: "completed", branch: "agent/issue-9", report_md: "done" }, 1 << 20);
+    await o.journalTerminal("r1", 3, "reviewing", 42, body);
+
+    const j = await o.readTerminalJournal("r1", 3);
+    assert.deepEqual(j?.body, body, "the canonical body is returned byte-for-byte for the send path");
+    assert.equal(j?.messagesThroughSeq, 42, "the fence is the journalled durable tail");
+    assert.equal(j?.phase, "reviewing");
+    assert.equal(j?.blocked, false);
+
+    assert.equal(await o.readTerminalJournal("r1", 999), undefined, "an unknown generation reads undefined");
+    await o.retireTerminal("r1", 3);
+    assert.equal(await o.readTerminalJournal("r1", 3), undefined, "a retired journal reads undefined");
+  });
 });
 
 describe("canonicalizeTerminalBody (PRD #1391 Run B / M3, D-A1)", () => {

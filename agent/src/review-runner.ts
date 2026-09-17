@@ -20,6 +20,8 @@ import type { Logger } from "./log.js";
 import { fenceNonce } from "./prompt.js";
 import { defaultQueryFn } from "./sdk-messages.js";
 import { runReadOnlyModelPass, safeReportFailed } from "./model-pass.js";
+import { makeTerminalOutboxDeps, postTerminalState, type TerminalOutboxDeps } from "./terminal-resolve.js";
+import type { Outbox } from "./outbox.js";
 import type { SdkQueryFn } from "./sdk-executor.js";
 import { extractJsonObject } from "./judge-runner.js";
 import { errMessage } from "./util.js";
@@ -72,6 +74,11 @@ export interface ReviewRunnerOptions {
    *  it is listed in the worker's ActiveSnapshot at phase `running` for its whole life
    *  (a review never parks). Undefined ⇒ no tracking. */
   activeRuns?: ActiveRunRegistry;
+  /** PRD #1391 Run B M3b (D6): the worker outbox + terminal knobs, so the review journals its
+   *  terminal STATE (never the postTaskReview) write-ahead. Undefined ⇒ un-journaled. */
+  outbox?: Outbox;
+  outboxTerminalMaxBytes?: number;
+  gapFillMax?: number;
 }
 
 export class ReviewRunner {
@@ -79,6 +86,8 @@ export class ReviewRunner {
   private readonly homeRoot: string;
   private readonly modelTimeoutMs: number;
   private readonly activeRuns: ActiveRunRegistry | undefined;
+  /** PRD #1391 Run B M3b: the terminal-resolve deps, or undefined when no usable outbox is wired. */
+  private readonly terminalDeps: TerminalOutboxDeps | undefined;
 
   constructor(
     private readonly client: WorkerClient,
@@ -90,6 +99,11 @@ export class ReviewRunner {
     this.homeRoot = opts.homeRoot ?? os.tmpdir();
     this.modelTimeoutMs = opts.modelTimeoutMs ?? REVIEW_MODEL_TIMEOUT_MS;
     this.activeRuns = opts.activeRuns;
+    this.terminalDeps = makeTerminalOutboxDeps(opts.outbox, this.client, {
+      gapFillMax: opts.gapFillMax ?? 10_000,
+      terminalMaxBytes: opts.outboxTerminalMaxBytes ?? Math.round(1.25 * 1024 * 1024),
+      log: this.log,
+    });
   }
 
   /** Run one diff-review claim end to end. Never throws — a failure reports the review
@@ -108,6 +122,7 @@ export class ReviewRunner {
         "review claim carried no target run",
         undefined,
         claim.claim_generation,
+        this.terminalDeps,
       );
       return;
     }
@@ -122,6 +137,7 @@ export class ReviewRunner {
         "review claim carried no branch to review",
         undefined,
         claim.claim_generation,
+        this.terminalDeps,
       );
       return;
     }
@@ -220,11 +236,15 @@ export class ReviewRunner {
         return;
       }
       await this.client.postTaskReview(targetId, review);
-      await this.client.reportState(reviewRunId, {
-        status: "completed",
-        // PRD #1247 M2 fix round: stamp the claim's run-lane generation on the terminal report too
-        // (direct report, not the RunRunner stamping closure), so the completion is fenced not 409'd.
-        claim_generation: claim.claim_generation,
+      // PRD #1391 Run B M3b (D6): journal the terminal STATE write-ahead (never the postTaskReview
+      // above), then resolve it. Fence 0 — a review's own trace gates no api sub-work. The completion
+      // still carries the claim generation (#1247 M2 fix round) so it is fenced not 409'd.
+      await postTerminalState(this.terminalDeps, this.client, {
+        runId: reviewRunId,
+        claimGeneration: claim.claim_generation ?? 0,
+        phase: "running",
+        messagesThroughSeq: 0,
+        body: { status: "completed", claim_generation: claim.claim_generation },
       });
       this.log.info("review run completed", {
         run_id: reviewRunId,
@@ -234,7 +254,16 @@ export class ReviewRunner {
       });
     } catch (err) {
       this.log.warn("review post/complete failed", { run_id: reviewRunId, error: errMessage(err) });
-      await safeReportFailed(this.client, this.log, "review", reviewRunId, errMessage(err), undefined, claim.claim_generation);
+      await safeReportFailed(
+        this.client,
+        this.log,
+        "review",
+        reviewRunId,
+        errMessage(err),
+        undefined,
+        claim.claim_generation,
+        this.terminalDeps,
+      );
     } finally {
       // PRD #1390 M2a: the review is terminal here on every path — stop listing it.
       this.activeRuns?.remove(reviewRunId);
