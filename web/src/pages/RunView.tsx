@@ -2282,6 +2282,7 @@ export function RunView() {
 
       {run.status === "awaiting_approval" && (
         <PlanPanel
+          key={run.id}
           run={run}
           messages={messages}
           workers={workers}

@@ -159,6 +159,35 @@ describe("PlanPanel — gate credential path (PRD #1247 M7)", () => {
     expect(onApprove).not.toHaveBeenCalled();
   });
 
+  it("guards against a double-submit: two rapid approve clicks set the credential and approve once", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [token()] });
+    // Hold the credential set in-flight so the second click races the first (the exact
+    // window doApprove's await opens before RunView's `busy` can rise).
+    let resolveSet: (v: { run: Run }) => void = () => {};
+    mockApi.setRunCredential.mockReturnValue(
+      new Promise<{ run: Run }>((res) => {
+        resolveSet = res;
+      }),
+    );
+    const { onApprove } = renderPanel();
+
+    const select = screen.getByLabelText("Anthropic token for the implementation phase") as HTMLSelectElement;
+    const opt = (await within(select).findByRole("option", { name: /console-key/ })) as HTMLOptionElement;
+    fireEvent.change(select, { target: { value: opt.value } });
+
+    const approve = screen.getByRole("button", { name: /Approve plan/ });
+    // Two synchronous clicks while the first credential set is still pending.
+    fireEvent.click(approve);
+    fireEvent.click(approve);
+
+    // The synchronous in-flight ref blocked the second click: exactly one credential set.
+    expect(mockApi.setRunCredential).toHaveBeenCalledTimes(1);
+
+    // Let the in-flight set resolve; the approve submits exactly once.
+    resolveSet({ run: run() });
+    await waitFor(() => expect(onApprove).toHaveBeenCalledTimes(1));
+  });
+
   it("skips setRunCredential and keeps the 1-arg approve when the picker is untouched (inherit)", async () => {
     mockApi.listSecrets.mockResolvedValue({ secrets: [token()] });
     const { onApprove } = renderPanel();

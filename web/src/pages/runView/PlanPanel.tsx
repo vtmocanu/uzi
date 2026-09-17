@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 import {
   api,
   type AgentSelectionInput,
@@ -207,29 +207,47 @@ export function PlanPanel({
     touched: credentialTouched,
   } = useSeededCredential(run.credential_override, { enabled: canSteer });
   const [credentialError, setCredentialError] = useState("");
+  // A synchronous in-flight guard for the approve sequence. doApprove awaits
+  // api.setRunCredential BEFORE onApprove, and RunView's `busy` only rises once
+  // onApprove -> act runs, so without this guard a second click during that await
+  // double-submits the credential set and the approval. The ref blocks re-entry
+  // synchronously (before any re-render); `submitting` disables the approve buttons.
+  const submittingRef = useRef(false);
+  const [submitting, setSubmitting] = useState(false);
   const doApprove = useCallback(
     async (withOverride: boolean) => {
+      if (submittingRef.current) return;
+      submittingRef.current = true;
+      setSubmitting(true);
       setCredentialError("");
-      // Only (re)set the token when the user CHANGED the gate picker: leaving the seeded
-      // choice untouched keeps the run's create-time override (sending nothing is a no-op
-      // that preserves it). A TOUCHED picker always sends the switch-body contract — even
-      // an explicit Inherit, which clears the run's override back to the worker binding
-      // (setTokenBody sends {mode:"inherit"} rather than omitting it, unlike a create body).
-      if (credentialTouched) {
-        try {
-          await api.setRunCredential(run.id, setTokenBody(credential));
-        } catch (e) {
-          // Do not approve if setting the token failed — the run would otherwise
-          // implement on the wrong credential. Surface the error at the gate.
-          setCredentialError(errorMessage(e, "Could not set the token for this run"));
-          return;
+      try {
+        // Only (re)set the token when the user CHANGED the gate picker: leaving the seeded
+        // choice untouched keeps the run's create-time override (sending nothing is a no-op
+        // that preserves it). A TOUCHED picker always sends the switch-body contract — even
+        // an explicit Inherit, which clears the run's override back to the worker binding
+        // (setTokenBody sends {mode:"inherit"} rather than omitting it, unlike a create body).
+        if (credentialTouched) {
+          try {
+            await api.setRunCredential(run.id, setTokenBody(credential));
+          } catch (e) {
+            // Do not approve if setting the token failed — the run would otherwise
+            // implement on the wrong credential. Surface the error at the gate.
+            setCredentialError(errorMessage(e, "Could not set the token for this run"));
+            return;
+          }
         }
+        // Preserve the exact onApprove arg-count contract (1 arg for the plain approve,
+        // 2 for the capability override) so RunView's `act` wrapper and the panel tests
+        // see no change.
+        if (withOverride) onApprove(selection, true);
+        else onApprove(selection);
+      } finally {
+        // Clear the guard. On the happy path onApprove has already flipped RunView's
+        // `busy` (batched with this update), so the buttons stay disabled; on the
+        // credential-error return, re-enable them so the user can retry.
+        submittingRef.current = false;
+        setSubmitting(false);
       }
-      // Preserve the exact onApprove arg-count contract (1 arg for the plain approve,
-      // 2 for the capability override) so RunView's `act` wrapper and the panel tests
-      // see no change.
-      if (withOverride) onApprove(selection, true);
-      else onApprove(selection);
     },
     [credential, credentialTouched, run.id, onApprove, selection],
   );
@@ -336,7 +354,7 @@ export function PlanPanel({
           <span className="text-[11px] text-faint">{roundsLabel}</span>
           {canSteer && !disclosing && (
             <div className="flex gap-2">
-              <Button disabled={busy} onClick={() => void doApprove(false)}>
+              <Button disabled={busy || submitting} onClick={() => void doApprove(false)}>
                 {approveLabel}
               </Button>
               <Button variant="secondary" disabled={busy} onClick={() => setRequesting(true)}>
@@ -467,7 +485,7 @@ export function PlanPanel({
                 default path. */}
             {unmetCaps.length > 0 && canSteer && (
               <div className="mt-2.5 border-t border-edge/60 pt-2.5">
-                <Button variant="secondary" size="sm" disabled={busy} onClick={() => void doApprove(true)}>
+                <Button variant="secondary" size="sm" disabled={busy || submitting} onClick={() => void doApprove(true)}>
                   Run without {unmetCaps.map((c) => stripUnsafeChars(c)).join(", ")}
                 </Button>
                 <p className="mt-1 text-[11px] text-faint">
