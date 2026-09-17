@@ -51,12 +51,15 @@ residual exactly.
 
 Run A's shape — bounded, honest about what it drops, never a silent loss — extends to
 terminal reports via two Run-B-specific bounds sized off the same physical-reserve
-mechanism. The terminal canonicaliser caps a serialised report at
+mechanism. The terminal canonicaliser caps each optional string field of a report at
 `WORKER_OUTBOX_TERMINAL_MAX_BYTES` (1.25 MiB, above the 1 MiB preserved patch a journal can
-carry) and drops an oversized optional field *whole* rather than truncating it — a byte-cut
-could leave an unrecognisable credential prefix past the api's own scrubber. The physical
-reserve is resized from Run A's one range-record's worth to `WORKER_OUTBOX_RESERVE_TERMINALS`
-(4) canonicalised-size journals plus per-record overhead (about 5.2 MiB at the defaults), so
+carry) — a *per-field* cap, not a whole-report bound. The one preserved patch is truncated
+rune-safely at a line boundary (with a marker), and every *other* oversized optional field is
+dropped *whole* rather than byte-cut mid-value — either way no value is ever cut mid-token, so
+a truncated secret can never leave an unrecognisable credential prefix past the api's own
+scrubber. The physical reserve is resized from Run A's one range-record's worth to
+`WORKER_OUTBOX_RESERVE_TERMINALS` (4) canonicalised-size journals plus per-record overhead
+(about 5.25 MiB at the defaults), so
 a terminal outcome can still be journaled crash-safely on a full volume. Past the reserve the
 outcome is sent unjournaled exactly as it always was — logged and counted, never a silent
 drop — the same degradation shape D2 already established for a message-quota overrun. Any
