@@ -476,7 +476,15 @@ owner's default token (recorded `pool_empty`) rather than holding in
 `pool_wait` as the run lane does, because a held retrospective carries no
 issue, no branch and nobody's attention, and would silently pile up. Because
 the token rides the claim rather than the worker, re-pointing a worker is
-complete server-side — no restart, no re-minted join token.
+complete server-side — no restart, no re-minted join token. Since PRD #1247
+`claimSecretID` also consults, ahead of the worker's own bind mode, a
+per-run (or per-schedule) credential override the owner can set or change at
+any time — queued, parked, at the plan gate, or mid-run — and a mid-run
+switch never rewrites a live claim in place: it reuses the same custody
+`runs.claim_generation` (below) plus a new `claim_released_at` fence to force
+the switch to cross an actual claim boundary, so the run always resumes with
+the new token rather than swapping it out from under a running turn; see
+[adr/1247-per-run-token-selection.md](adr/1247-per-run-token-selection.md).
 
 Since PRD #111 the bind mode is three-valued — `default`, `pinned` or `auto`
 — and `auto` ranks the owner's opted-in tokens by rate-limit headroom

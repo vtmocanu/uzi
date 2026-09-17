@@ -598,6 +598,7 @@ Tracked as GitLab issue vtmocanu/uzi#111; PRD at `prds/done/111-auto-select-anth
 - The candidate set is an opt-in pool, per token, default OFF — auto must never spend a token the user reserved for other work. [user 2026-07-22]
 - Ranking is least-consumed first; a within-threshold tie goes to the account that resets soonest. [user 2026-07-22]
 - The dev-cluster k8s validation (a PRD success criterion) is deferred to a follow-up issue, not dropped. [user 2026-07-27]
+- A run's owner can choose which of their Anthropic tokens a run spends — at run start, while parked, at the plan-approval gate, or mid-run — overriding the worker's binding for that run; an `auto` run parked on an exhausted account also fails over by itself to a pooled account with headroom, while a pinned or default choice is never moved automatically. [user, #1247]
 
 ## Feature #35 — Retry after an Anthropic usage limit
 

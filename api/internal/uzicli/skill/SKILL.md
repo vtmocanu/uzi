@@ -149,8 +149,8 @@ uzi run get <run-id> [--field <name>]...
 uzi run logs <run-id> [--follow] [--after <seq>] [--tail <n>]
 uzi run wait <run-id> [--until <status,...>] [--interval <dur>] [--timeout <dur>] [--min-plan-seq <n>]
 uzi run review <run-id>
-uzi run create --repo <repo-id> --issue <issue-iid> [--wait-on-limit[=false]] [--mr-rework[=false]] [--plan-file <path>] [--agent-source own|repo] [--exclude-agents <a,b>] [--planned-commit <sha>] [--require-base]
-uzi run approve <run-id> [--agent-source own|repo] [--exclude-agents <a,b>]
+uzi run create --repo <repo-id> --issue <issue-iid> [--wait-on-limit[=false]] [--mr-rework[=false]] [--plan-file <path>] [--agent-source own|repo] [--exclude-agents <a,b>] [--planned-commit <sha>] [--require-base] [--token <label>|auto|default|inherit]
+uzi run approve <run-id> [--agent-source own|repo] [--exclude-agents <a,b>] [--token <label>|auto|default|inherit]
 uzi run reject <run-id> [--message <text>]
 uzi run revise <run-id> [--message <text>]
 uzi run cancel <run-id>
@@ -171,10 +171,10 @@ uzi run decide <run-id> --continue [--guidance <text>]
 uzi run export <run-id> --output <path> [--capture <id>]
 uzi run recovery <run-id> [--json]
 uzi run discard <run-id> --hold <hold-id> [--yes]
-uzi schedule create --repo <repo-id> [--repo <repo-id>]... (--issue <iid> | --sweep [--label <l>]... [--create-missing-labels] | --prompt <text>) (--at <rfc3339> | --cron <expr>) [--tz <iana>] [--enabled[=false]] [--auto-approve[=false]] [--wait-on-limit] [--mr-rework[=false]] [--output mr|issues]
+uzi schedule create --repo <repo-id> [--repo <repo-id>]... (--issue <iid> | --sweep [--label <l>]... [--create-missing-labels] | --prompt <text>) (--at <rfc3339> | --cron <expr>) [--tz <iana>] [--enabled[=false]] [--auto-approve[=false]] [--wait-on-limit] [--mr-rework[=false]] [--output mr|issues] [--token <label>|auto|default|inherit]
 uzi schedule list
 uzi schedule get <schedule-id>
-uzi schedule edit <schedule-id> [--repo <repo-id>] [--cron <expr> | --at <rfc3339>] [--tz <iana>] [--prompt <text>] [--label <l>]... [--create-missing-labels] [--guidance <text> | --clear-guidance] [--max-issues <n> | --clear-max-issues] [--output mr|issues|""] [--auto-approve[=false]] [--wait-on-limit[=false]] [--mr-rework[=false] | --clear-mr-rework] [--model <alias|id>] [--apply-model-to-agents[=false]]
+uzi schedule edit <schedule-id> [--repo <repo-id>] [--cron <expr> | --at <rfc3339>] [--tz <iana>] [--prompt <text>] [--label <l>]... [--create-missing-labels] [--guidance <text> | --clear-guidance] [--max-issues <n> | --clear-max-issues] [--output mr|issues|""] [--auto-approve[=false]] [--wait-on-limit[=false]] [--mr-rework[=false] | --clear-mr-rework] [--model <alias|id>] [--apply-model-to-agents[=false]] [--token <label>|auto|default|inherit]
 uzi schedule pause <schedule-id>
 uzi schedule resume <schedule-id>
 uzi schedule pause-all --until <when>
@@ -546,15 +546,24 @@ uzi version
   to that token; `--auto` auto-selects from your pool, `--default` uses your default
   token, and `--inherit` clears the override back to the worker's binding. Exactly one of
   {label, `--auto`, `--default`, `--inherit`} is required and they are mutually exclusive
-  (usage error, exit 2). On a **queued** run the switch takes effect at the next claim; on
-  a **parked** run (`limit_wait`, `pool_wait`, `recovery_wait`, `paused`) it promotes the
-  run back to **queued** at once so the next claim spends the chosen token. On a **running**
-  or gated run held by a capable worker the switch is **requested** and takes effect when the
-  worker releases its claim; it is refused (409, exit 5) when no live worker holds the run
-  or the holding worker predates the `credential_switch` capability. A foreign/unknown run or an
-  unknown token label is refused (404 / usage); a codex run is 422. It may print a warning (the
-  token has no headroom, or `auto` will hold in `pool_wait`) **without** refusing — the
-  switch still applies. Prints the updated run; `--json` emits the run object.
+  (usage error, exit 2). What happens next depends on the run's state at the moment you
+  call it: **queued** — the override just applies at the next claim, nothing else changes;
+  **parked** (`limit_wait`, `pool_wait`, `recovery_wait`, `paused`) — a single-row promote
+  returns it to **queued** immediately, so the next claim spends the chosen token without
+  waiting out the park; **running, or held at a gate/question/follow-up, on a worker that
+  advertises the `credential_switch` capability** — the switch is only **requested**, not
+  yet applied: the server signals it to the worker, which finishes quiescing and
+  **releases** its claim (banking the elapsed time like a pause) before the switch is
+  **applied** at the next reclaim, so a live turn loses at most its in-flight step. It is
+  refused (409, exit 5) when no live worker currently holds the run, or the holding worker
+  predates the `credential_switch` capability (an old worker fleet) — set-token never
+  silently no-ops on either. A foreign/unknown run or an unknown token label is refused
+  (404 / usage); a codex run is 422, and the chat/judge/self_improve/review lane is 409
+  ("lane not switchable" — the override would never be honoured there). It may print a warning (the token has no
+  headroom, or `auto` will hold in `pool_wait`) **without** refusing — the switch still
+  applies. Prints the updated run; `--json` emits the run object, whose `credential_switch`
+  field reads `null` (no switch pending), `"requested"`, or `"released"` (awaiting reclaim)
+  — cleared again once the switch is actually applied or the run goes terminal.
 - `uzi run mr-rework <run-id>` — set the per-run override for the MR review-rework
   watcher (PRD #841): whether new review comments on this run's open MR are
   auto-reworked. Tri-state and editable on a **completed** run for as long as its MR is
@@ -669,6 +678,10 @@ nothing a manual start cannot.
     `--apply-model-to-agents` (default off) additionally applies that model to every
     subagent, overriding each agent's own model pin. Both are restated on `edit`, so a
     partial `edit` never wipes them.
+  - `--token <label>|auto|default|inherit` (valid on every target, PRD #1247) sets the
+    Anthropic credential override every run this schedule fires carries — the same
+    label/mode vocabulary as `run set-token` above, resolved client-side. Omit it and a
+    fired run has no override (inherits the claiming worker's binding).
 - `uzi schedule list` — your schedules as a table (`ID`, `TARGET`, `REPO`, `WHEN`,
   `NEXT`, `ON`); `--json` dumps the raw array. Each element's `target` is the
   string enum `issue` | `sweep` | `prompt` (a plain string, NOT a nested object),
@@ -688,7 +701,9 @@ nothing a manual start cannot.
   `description too large`, `fetch failed`), and — when a capped fire
   reached nobody — a hint to raise `--max-issues` or add the `uzi` label. A
   never-fired schedule reads `Last fire: never fired`. `--json` carries the same detail
-  under `.last_fire`.
+  under `.last_fire`. A `TOKEN` row shows the schedule's credential override (the pinned
+  label, `auto`, `default`, or `inherit` when none is set); `--json` carries it as
+  `credential_override`.
 - `uzi schedule edit <schedule-id>` — change a schedule's mutable config in place, keeping
   its id and run history (unlike delete-and-recreate). Any flag you omit keeps its stored
   value; editing config revives a terminal schedule (status returns to active — a recurring
@@ -700,10 +715,14 @@ nothing a manual start cannot.
   comments are auto-reworked; `--mr-rework=false` to force off), `--model <alias|id>`
   (change the run model in
   place; an empty string clears it back to the Worker-model default; valid on every
-  target and origin), `--apply-model-to-agents` (toggle the subagent model override). At
+  target and origin), `--apply-model-to-agents` (toggle the subagent model override),
+  `--token <label>|auto|default|inherit` (PRD #1247, change the credential override
+  fired runs carry; `--token inherit` clears it). At
   least one field is required. `edit` preserves the stored `--model`,
   `--apply-model-to-agents` and `--mr-rework` across any partial edit that does not pass
-  those flags (previously a plain retime silently wiped the stored model). Changing a
+  those flags (previously a plain retime silently wiped the stored model); a `--token`-less
+  edit leaves the stored override untouched the same way, so a retime never silently
+  clears it. Changing a
   sweep schedule's `--label` selector runs the same advisory sweep-label guardrail as
   `create`/`catalog enable` (`WARNING` on a newly-set label missing on the repo, or
   `--create-missing-labels` to create it first); it never blocks the edit, and an edit that

@@ -110,6 +110,30 @@ last known reading stays on screen but greys out and is marked **stale**
 (or explicitly **vault locked** on the admin page) until you unlock again.
 Nothing is lost, and nothing renders as a false zero.
 
+## Choosing a token near its limit
+
+Pointing a run at a token yourself — the start-run picker, the plan gate,
+`uzi run set-token`/`run create --token`/`run approve --token`, or a
+schedule's own picker — warns instead of refusing when the choice looks
+likely to run into trouble:
+
+- **Pinning the token that just exhausted this very run** (the one that
+  parked it in [`limit_wait`](run-limit-wait.md)) warns that it may re-park
+  until that window reopens.
+- **Pinning any token whose meter reads exhausted or stale** warns the same
+  way — the pin still goes through, but the gauge says the account may have
+  no room to spend right now.
+- **Choosing auto-select when nothing in the pool is eligible** (once the
+  just-exhausted token is excluded) warns that the run will hold in
+  [`pool_wait`](anthropic-token.md#waiting-for-a-token) until something
+  pools.
+
+None of these three refuses the choice — they tell you what to expect, and
+the switch still applies. The CLI prints the warning to stderr; the web shows
+it next to the picker. See [choosing the token for one
+run](anthropic-token.md#choosing-the-token-for-one-run) for every place you
+can make this choice.
+
 ## The probe, and turning it off
 
 Anthropic's free usage endpoint doesn't work for every credential type (it
