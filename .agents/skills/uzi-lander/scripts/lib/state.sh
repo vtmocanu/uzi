@@ -80,7 +80,11 @@ is_live() {
   n=$(printf '%s' "$pj" | jq -r --arg u "$1" \
     '([.claude[]?|select(.sessionId==$u)] + [.codex[]?|select(.id==$u and .holder_pid!=null)])|length' 2>/dev/null) || return 2
   [ "${n:-0}" -gt 0 ] && return 0
-  unver=$(printf '%s' "$pj" | jq -r '((.codex_schema_recognised==false) or (.codex_unverified==true) or (.claude_unverified==true))' 2>/dev/null || echo true)
+  # The *_unverified fields are ARRAYS of entries the registry could not probe (a boolean
+  # form is tolerated); any entry, or an unrecognised Codex schema, makes absence unknown.
+  unver=$(printf '%s' "$pj" | jq -r '
+    def truthy: if type=="array" then length>0 elif type=="boolean" then . else false end;
+    ((.codex_schema_recognised==false) or ((.codex_unverified // [])|truthy) or ((.claude_unverified // [])|truthy))' 2>/dev/null || echo true)
   [ "$unver" = "true" ] && return 2
   return 1
 }

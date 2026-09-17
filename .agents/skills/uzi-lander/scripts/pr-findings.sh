@@ -67,12 +67,27 @@ for n in "$@"; do
   # ---- CodeRabbit --------------------------------------------------------------------
   # Fetch CodeRabbit's reviews ONCE, then derive both the tally and the latest state from
   # that one snapshot (avoids a second API call and a read-your-writes race between them).
-  crreviews=$(gh api "repos/${repo}/pulls/${n}/reviews" --paginate \
-    --jq '[.[]|select(.user.login=="coderabbitai[bot]")]' 2>/dev/null | jq -s 'add // []' || true)
-  [ -n "$crreviews" ] || crreviews='[]'
-  tally=$(printf '%s' "$crreviews" | jq -r '.[].body' 2>/dev/null \
+  # ONLY reviews on the CURRENT head count: an APPROVED review on an earlier commit says
+  # nothing about the head (whose status may read "Review in progress").
+  crreviews=$(gh api "repos/${repo}/pulls/${n}/reviews" --paginate 2>/dev/null | jq -s --arg h "$head" \
+    '[.[][]?|select(.user.login=="coderabbitai[bot]" and ($h=="" or .commit_id==$h))]' 2>/dev/null || true)
+  printf '%s' "$crreviews" | jq -e 'type=="array"' >/dev/null 2>&1 || crreviews='[]'
+  tally=$(printf '%s' "$crreviews" | jq -r '.[].body // ""' 2>/dev/null \
     | grep -oiE 'Actionable comments posted: [0-9]+' | tail -1 || true)
   crstate=$(printf '%s' "$crreviews" | jq -r 'last | .state // empty' 2>/dev/null || true)
+  # A zero-actionable INCREMENTAL pass posts no review object at all; CodeRabbit's
+  # walkthrough comment marks the reviewed head instead (final_review_risk block, "up to
+  # `<sha>`"). Read it the fail-closed way: exactly one walkthrough comment, SHA parsed only
+  # inside its block.
+  wt_head=""
+  if wt_all=$(gh api --paginate "repos/${repo}/issues/${n}/comments" 2>/dev/null | jq -s 'add // []' 2>/dev/null) \
+     && [ "$(printf '%s' "$wt_all" | jq '[.[]|select(.user.login=="coderabbitai[bot]" and (.body|contains("<!-- walkthrough_start -->")))]|length' 2>/dev/null)" = "1" ]; then
+    # shellcheck disable=SC2016  # literal backticks in CodeRabbit's marker
+    wt_head=$(printf '%s' "$wt_all" | jq -r '.[]|select(.user.login=="coderabbitai[bot]" and (.body|contains("<!-- walkthrough_start -->")))|.body' \
+      | awk '/final_review_risk_start/{f=1} f{print} /final_review_risk_end/{f=0}' | grep -oE 'up to `[0-9a-f]{5,40}`' | tail -1 | grep -oE '[0-9a-f]{5,40}' || true)
+  fi
+  cr_walk=0
+  if [ -n "$wt_head" ] && [ -n "$head" ] && printf '%s' "$head" | grep -q "^$wt_head"; then cr_walk=1; fi
   # The commit status description names WHY CR did not review (rate limited / skipped).
   crdesc=""
   if [ -n "$head" ]; then
@@ -81,12 +96,15 @@ for n in "$@"; do
   fi
   cr_ok=0; cr_unconf=0
   if [ -n "$tally" ]; then
-    echo "  CodeRabbit: ${tally}"   # reviewed; N is the finding count (0 = genuinely clean)
+    echo "  CodeRabbit: ${tally} (on head)"   # reviewed; N is the finding count (0 = genuinely clean)
     cr_ok=1
   elif [ "$crstate" = "APPROVED" ]; then
     # A tally-less APPROVED review is CR's clean pass (empty body, no tally). The only
     # state on which it is safe to auto-clear the merge gate.
-    echo "  CodeRabbit: reviewed, APPROVED (no actionable comments — clean)"
+    echo "  CodeRabbit: reviewed, APPROVED on head (no actionable comments — clean)"
+    cr_ok=1
+  elif [ -z "$crstate" ] && [ "$cr_walk" -eq 1 ]; then
+    echo "  CodeRabbit: incremental pass covered the head (walkthrough marker); no review object, live findings listed below"
     cr_ok=1
   elif [ -n "$crstate" ]; then
     # A CR review exists but is neither tallied nor a clean APPROVED (e.g. a tally-less
@@ -96,7 +114,7 @@ for n in "$@"; do
     echo "  ⚠️  CodeRabbit state '${crstate}' with no actionable-comments tally — inspect the review body (grouped/outside-diff findings are not shown inline); NOT auto-clean."
     cr_unconf=1
   else
-    reason="absent (no CodeRabbit status on the head — review may not have landed yet)"
+    reason="absent on this head (no CodeRabbit verdict for ${head:0:8} — an earlier commit's review does not count)"
     case "$crdesc" in
       *"rate limited"*) reason="RATE LIMITED — CR did not review (scripts/cr-rate-limit.sh for the reset)" ;;
       *"in progress"*)  reason="IN PROGRESS — wait for it" ;;

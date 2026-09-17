@@ -33,6 +33,10 @@
 #   3  usage / gh error
 set -uo pipefail
 
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/state.sh
+. "$HERE/lib/state.sh"
+
 REPO=""; PR=""; ASK=0; WAIT=0; MAX_WAIT=180; INTERVAL=60
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -119,14 +123,25 @@ row=$(reset_from_pr) || { echo "gh error reading PR comments" >&2; exit 3; }
 reset_ts=$(printf '%s' "$row" | cut -f1); src=$(printf '%s' "$row" | cut -f2)
 
 if [ -z "$reset_ts" ] && [ "$ASK" -eq 1 ]; then
-  # In-flight guard: an unanswered `@coderabbitai rate limit` posted by anyone in the last
-  # 10 minutes is reused (its reply is what we wait for); a repeated or concurrent
-  # invocation must not post another one.
-  pending_ask=$(gh api --paginate "repos/$REPO/issues/$PR/comments" 2>/dev/null | jq -s 'add // []' | jq -r '
+  # In-flight guard, FAIL CLOSED and serialised: the post happens only under a per-PR lock
+  # (mkdir in the shared state dir, 10-min TTL) so two invocations cannot both post, and
+  # only after a SUCCESSFUL read of the comments proves no unanswered `@coderabbitai rate
+  # limit` from the last 10 minutes exists (an unreadable listing means do not post).
+  SD=$(state_dir) || exit 3
+  ask_lock="$SD/locks/cr-ask-${REPO//\//_}-$PR"
+  if ! mkdir "$ask_lock" 2>/dev/null; then
+    lage=$(( $(date +%s) - $(stat -f %m "$ask_lock" 2>/dev/null || stat -c %Y "$ask_lock" 2>/dev/null || date +%s) ))
+    if [ "$lage" -gt 600 ]; then rm -rf "$ask_lock"; mkdir "$ask_lock" 2>/dev/null || { echo "ask lock busy" >&2; exit 3; }
+    else echo "ASK_LOCK_HELD=1 (another invocation is asking; re-run without --ask in a minute)"; exit 2; fi
+  fi
+  trap 'rm -rf "$ask_lock"' EXIT
+  comments_now=$(gh api --paginate "repos/$REPO/issues/$PR/comments" 2>/dev/null | jq -s 'add // []' 2>/dev/null || true)
+  printf '%s' "$comments_now" | jq -e 'type=="array"' >/dev/null 2>&1 || { echo "cannot read the PR comments; not posting a rate-limit query" >&2; exit 3; }
+  pending_ask=$(printf '%s' "$comments_now" | jq -r '
     ([.[]|select(((.user.login|test("\\[bot\\]$"))|not) and ((.body|gsub("^\\s+|\\s+$";""))=="@coderabbitai rate limit"))]|last) as $a
     | if $a==null then "" else
         ([.[]|select(.user.login=="coderabbitai[bot]" and (.body|test("More reviews will be available")) and .created_at > $a.created_at)]|length) as $replied
-        | if $replied>0 then "" else $a.created_at end end' 2>/dev/null || true)
+        | if $replied>0 then "" else $a.created_at end end' 2>/dev/null) || { echo "cannot parse the PR comments; not posting" >&2; exit 3; }
   if [ -n "$pending_ask" ] && [ $(( $(date +%s) - $(iso2epoch "$pending_ask") )) -lt 600 ]; then
     asked_at="$pending_ask"; echo "ASK_IN_FLIGHT_SINCE=$asked_at (not posting again)"
   else

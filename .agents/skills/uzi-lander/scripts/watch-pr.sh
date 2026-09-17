@@ -99,9 +99,12 @@ while [ "$i" -lt "$MAX" ]; do
   unknown=0
 
   if [ "$repo_known" -eq 0 ]; then
-    if rl=$(uzi repo list --json 2>/dev/null); then
-      repo_id=$(printf '%s' "$rl" | jq -r --arg p "$REPO" '.[]|select(.path_with_namespace==$p)|.id' 2>/dev/null | head -1 || true)
-      repo_known=1
+    # Only a listing that parses as an array is a KNOWN answer; malformed output must not
+    # become "known, not connected" (which would skip the rework check on a false empty id).
+    if rl=$(uzi repo list --json 2>/dev/null) && is_array "$rl"; then
+      if repo_id=$(printf '%s' "$rl" | jq -r --arg p "$REPO" '[.[]|select(.path_with_namespace==$p)|.id]|first // ""' 2>/dev/null); then
+        repo_known=1
+      fi
     fi
   fi
 
@@ -118,12 +121,15 @@ while [ "$i" -lt "$MAX" ]; do
   # CI: only REQUIRED checks gate (an optional failure must not force red), and `cancel` is
   # a non-ready state (a cancelled required check = supersession, not green). Parse the JSON
   # by validity, NOT by gh's exit code — `gh pr checks` exits non-zero merely for pending.
+  # The payload must be a NON-EMPTY array: `{}` or `[]` (a PR whose checks have not
+  # registered yet, or a malformed reply) would count as zero failing / zero pending and
+  # forge a green, so both are unknown.
   fail=0; pend=0; cancel=0
   cj=$(gh pr checks "$PR" --repo "$REPO" --required --json bucket 2>/dev/null || true)
-  if printf '%s' "$cj" | jq -e . >/dev/null 2>&1; then
-    fail=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="fail")]|length')
-    pend=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="pending")]|length')
-    cancel=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="cancel")]|length')
+  if printf '%s' "$cj" | jq -e 'type=="array" and length>0' >/dev/null 2>&1; then
+    fail=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="fail")]|length') || unknown=1
+    pend=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="pending")]|length') || unknown=1
+    cancel=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="cancel")]|length') || unknown=1
   else
     unknown=1
   fi

@@ -12,6 +12,8 @@
 #                    a sibling of the repo root). Reused if it already exists on the branch.
 #   --skip-rebase    re-entry after you resolved a conflict by hand (`git rebase --continue`
 #                    done) or after a manual renumber fix: skips straight to gates + push.
+#   --fresh          start the landing over: reset the (clean) worktree to origin/<branch>
+#                    and drop the recorded lease. The answer to RESULT=remote_moved.
 #   --gate           which `task gate:<c>` targets to run before pushing. `auto` (default)
 #                    derives them from the changed paths (api/, web/, agent/, controller/);
 #                    `none` skips gates (only when CI is the arbiter, e.g. a docs-only PR).
@@ -37,14 +39,16 @@
 #   6  migration renumber needs hand work — the helper's report is printed and the tree is
 #      left dirty in the worktree: fix the other references, commit, re-run --skip-rebase
 #   7  a gate failed — log path printed; fix in the worktree, commit, re-run --skip-rebase
-#   8  the remote head moved since the start (lease would fail) — re-run from scratch
+#   8  the remote head moved since this landing started, or the worktree and the remote
+#      have diverged with no landing on record — start over with --fresh
 set -uo pipefail
 
-REPO=""; PR=""; WT=""; SKIP_REBASE=0; GATE="auto"; PUSH=1; ROOT=""; REWORK_CHECK=1
+REPO=""; PR=""; WT=""; SKIP_REBASE=0; GATE="auto"; PUSH=1; ROOT=""; REWORK_CHECK=1; FRESH=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --worktree) WT="${2:?}"; shift 2;;
     --skip-rebase) SKIP_REBASE=1; shift;;
+    --fresh) FRESH=1; shift;;
     --gate) GATE="${2:?}"; shift 2;;
     --no-push) PUSH=0; shift;;
     --no-rework-check) REWORK_CHECK=0; shift;;
@@ -66,18 +70,20 @@ fi
 log() { printf '%s [land-prep #%s] %s\n' "$(date +%H:%M:%S)" "$PR" "$*"; }
 
 # ---- PR coordinates ---------------------------------------------------------------------
-pj=$(gh pr view "$PR" --repo "$REPO" --json state,headRefName,baseRefName,headRefOid,headRepositoryOwner 2>/dev/null) \
+pj=$(gh pr view "$PR" --repo "$REPO" --json state,headRefName,baseRefName,headRefOid,headRepository,headRepositoryOwner 2>/dev/null) \
   || { echo "gh pr view $PR failed" >&2; exit 3; }
 state=$(printf '%s' "$pj" | jq -r .state)
 BRANCH=$(printf '%s' "$pj" | jq -r .headRefName)
 BASE=$(printf '%s' "$pj" | jq -r .baseRefName)
 HEAD0=$(printf '%s' "$pj" | jq -r .headRefOid)
 [ "$state" = "OPEN" ] || { echo "PR #$PR is $state, nothing to prepare" >&2; exit 3; }
-# A fork PR's head lives in ANOTHER repository: origin/$BRANCH here would be an unrelated
-# same-named branch (or nothing), so a lease push could overwrite the wrong thing.
-head_owner=$(printf '%s' "$pj" | jq -r '.headRepositoryOwner.login // ""')
-if [ -n "$head_owner" ] && [ "$head_owner" != "${REPO%%/*}" ]; then
-  echo "refusing: PR #$PR comes from a fork ($head_owner); its head is not origin/$BRANCH — land it by hand" >&2; exit 3
+# The head must be AFFIRMATIVELY this repository: owner/name equal to OWNER/REPO (case-
+# insensitive, GitHub's rule). A fork, a same-owner different repo, or a deleted head repo
+# (empty fields) means origin/$BRANCH is not the PR's head, and a lease push could overwrite
+# an unrelated same-named branch.
+head_repo=$(printf '%s' "$pj" | jq -r '"\(.headRepositoryOwner.login // "")/\(.headRepository.name // "")"')
+if [ "$(printf '%s' "$head_repo" | tr '[:upper:]' '[:lower:]')" != "$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')" ]; then
+  echo "refusing: PR #$PR's head repository is '${head_repo}', not '$REPO' (fork, other repo, or deleted); land it by hand" >&2; exit 3
 fi
 case "$BRANCH" in
   main|master|"$BASE") echo "refusing: PR head branch is '$BRANCH'" >&2; exit 3;;
@@ -126,21 +132,37 @@ else
   log "worktree $WT on $BRANCH"
 fi
 cd "$WT" || exit 3
-# The lease is the remote head this landing STARTED from, persisted in the worktree's git
-# dir so a --skip-rebase re-entry pushes against the ORIGINAL head, not the refreshed
-# origin/$BRANCH (which would let an intervening push be overwritten by the stale tree).
+# The lease is the remote head this LANDING started from, persisted in the worktree's git
+# dir. Every later run of the same landing (--skip-rebase, or a plain restart after a
+# --no-push or a failed gate) pushes against THAT head, never a refreshed origin/$BRANCH:
+# otherwise a restart would accept an intervening remote commit into the lease and then
+# overwrite it with the stale local branch. A landing ends when the push succeeds (the file
+# is removed) or when you start over with --fresh, which resets the worktree to the remote.
 LEASE_FILE="$(git rev-parse --git-dir)/uzi-lander-lease-$PR"
-if [ "$SKIP_REBASE" -eq 0 ]; then
-  LEASE=$(git rev-parse "origin/$BRANCH")
-  printf '%s' "$LEASE" > "$LEASE_FILE"
-else
-  LEASE=$(cat "$LEASE_FILE" 2>/dev/null || true)
-  [ -n "$LEASE" ] || { echo "no lease recorded for #$PR in this worktree; run once without --skip-rebase" >&2; exit 8; }
-  remote_now=$(git ls-remote origin "refs/heads/$BRANCH" | cut -f1)
+remote_now=$(git ls-remote origin "refs/heads/$BRANCH" | cut -f1)
+[ -n "$remote_now" ] || { echo "cannot read the remote head of $BRANCH" >&2; exit 3; }
+if [ "$FRESH" -eq 1 ]; then
+  [ -z "$(git status --porcelain)" ] || { echo "worktree is dirty; --fresh would discard it" >&2; exit 3; }
+  git reset -q --hard "origin/$BRANCH"; rm -f "$LEASE_FILE"; log "--fresh: worktree reset to origin/$BRANCH (${remote_now:0:8})"
+fi
+if [ -f "$LEASE_FILE" ]; then
+  LEASE=$(cat "$LEASE_FILE")
   if [ "$remote_now" != "$LEASE" ]; then
-    log "remote $BRANCH moved ${LEASE:0:8} -> ${remote_now:0:8} since this landing started; re-run from scratch"
+    log "remote $BRANCH moved ${LEASE:0:8} -> ${remote_now:0:8} since this landing started; start over with --fresh (resets the worktree)"
     echo "RESULT=remote_moved"; exit 8
   fi
+else
+  [ "$SKIP_REBASE" -eq 0 ] || { echo "no lease recorded for #$PR in this worktree; run once without --skip-rebase" >&2; exit 8; }
+  # A NEW landing: the worktree must already contain the remote head, or be fast-forwardable
+  # to it; anything else is a divergence no lease can vouch for.
+  if git merge-base --is-ancestor HEAD "origin/$BRANCH"; then
+    git merge -q --ff-only "origin/$BRANCH" 2>/dev/null || true
+  elif ! git merge-base --is-ancestor "origin/$BRANCH" HEAD; then
+    log "worktree HEAD $(git rev-parse --short HEAD) and remote ${remote_now:0:8} have diverged with no landing in progress; --fresh resets the worktree to the remote"
+    echo "RESULT=diverged"; exit 8
+  fi
+  LEASE="$remote_now"
+  printf '%s' "$LEASE" > "$LEASE_FILE"
 fi
 
 # ---- rebase -----------------------------------------------------------------------------

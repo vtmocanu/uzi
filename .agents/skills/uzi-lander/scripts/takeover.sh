@@ -21,6 +21,7 @@
 #   mr_rework_active      defer to uzi's rework
 #   cr_rate_limited       CR refused this head; CR_RESET_MIN set when known
 #   review_pending        a bot is reviewing this head now
+#   unknown               a lookup failed or returned an unreadable payload; never act on it
 #   no_review             nothing reviewed this head and nothing is coming — trigger or fall back
 #   findings              live inline findings on the head (LIVE_FINDINGS=n)
 #   ready                 CI green, head reviewed, 0 live findings, no rework (BEHIND is fine
@@ -97,38 +98,56 @@ state=$(printf '%s' "$pj" | jq -r .state); head=$(printf '%s' "$pj" | jq -r .hea
 merge_state=$(printf '%s' "$pj" | jq -r .mergeStateStatus); base=$(printf '%s' "$pj" | jq -r .baseRefName)
 case "$state" in MERGED) echo "NEXT=merged"; exit 0;; CLOSED) echo "NEXT=closed"; exit 0;; esac
 
-# Required checks by bucket.
+# Every lookup below that fails or returns an unparseable payload sets UNKNOWN=1, and an
+# unknown snapshot never reaches NEXT=ready: a masked failure would otherwise read as
+# "zero pending, zero findings".
+UNKNOWN=0
+arr_or_unknown() { printf '%s' "$1" | jq -e 'type=="array"' >/dev/null 2>&1 || UNKNOWN=1; }
+
+# Required checks by bucket (must be a non-empty array; `{}`/`[]` are unknown).
 ci_fail=0; ci_pend=0; ci_cancel=0
 cj=$(gh pr checks "$PR" --repo "$REPO" --required --json bucket 2>/dev/null || true)
-if printf '%s' "$cj" | jq -e . >/dev/null 2>&1; then
+if printf '%s' "$cj" | jq -e 'type=="array" and length>0' >/dev/null 2>&1; then
   ci_fail=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="fail")]|length')
   ci_pend=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="pending")]|length')
   ci_cancel=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="cancel")]|length')
+else
+  UNKNOWN=1; echo "CI_CHECKS=unreadable-or-empty"
 fi
 echo "CI_FAIL=$ci_fail"; echo "CI_PENDING=$ci_pend"; echo "CI_CANCELLED=$ci_cancel"
 
-# CodeRabbit on the head: commit-status description + review-on-head (signal a) + walkthrough marker (c).
-cr_desc=$(gh api "repos/$REPO/commits/$head/status" --jq '[.statuses[]|select(.context=="CodeRabbit")]|last|.description // empty' 2>/dev/null || true)
+# CodeRabbit on the head: commit-status description + a VERDICT review on the head (signal
+# a: APPROVED or a tally) + the walkthrough marker (c). A tally-less non-APPROVED review on
+# the head is an UNCONFIRMED finding (grouped findings live in its body).
+st=$(gh api "repos/$REPO/commits/$head/status" 2>/dev/null || true)
+if printf '%s' "$st" | jq -e 'has("statuses")' >/dev/null 2>&1; then
+  cr_desc=$(printf '%s' "$st" | jq -r '[.statuses[]|select(.context=="CodeRabbit")]|last|.description // empty')
+else cr_desc=""; UNKNOWN=1; fi
 echo "CR_STATUS='${cr_desc:-absent}'"
-cr_reviewed=0
-rev_raw=$(gh api --paginate "repos/$REPO/pulls/$PR/reviews" 2>/dev/null | jq -s 'add // []' || echo '[]')
+cr_reviewed=0; cr_unconfirmed=0
+rev_raw=$(gh api --paginate "repos/$REPO/pulls/$PR/reviews" 2>/dev/null | jq -s 'add // []' 2>/dev/null || echo 'x')
+arr_or_unknown "$rev_raw"; [ "$UNKNOWN" -eq 1 ] && rev_raw='[]'
 # shellcheck disable=SC2016
-n=$(printf '%s' "$rev_raw" | jq -r --arg h "$head" '[.[]|select(.user.login=="coderabbitai[bot]" and .commit_id==$h)]|length' 2>/dev/null || echo 0)
+n=$(printf '%s' "$rev_raw" | jq -r --arg h "$head" '[.[]|select(.user.login=="coderabbitai[bot]" and .commit_id==$h and (.state=="APPROVED" or ((.body // "")|test("Actionable comments posted: [0-9]+"))))]|length' 2>/dev/null || echo 0)
 [ "${n:-0}" -gt 0 ] && cr_reviewed=1
-issue_c=$(gh api --paginate "repos/$REPO/issues/$PR/comments" 2>/dev/null | jq -s 'add // []' || echo '[]')
+# shellcheck disable=SC2016
+cr_unconfirmed=$(printf '%s' "$rev_raw" | jq -r --arg h "$head" '[.[]|select(.user.login=="coderabbitai[bot]" and .commit_id==$h and .state!="APPROVED" and (((.body // "")|test("Actionable comments posted: [0-9]+"))|not))]|length' 2>/dev/null || echo 0)
+issue_c=$(gh api --paginate "repos/$REPO/issues/$PR/comments" 2>/dev/null | jq -s 'add // []' 2>/dev/null || echo 'x')
+arr_or_unknown "$issue_c"; printf '%s' "$issue_c" | jq -e 'type=="array"' >/dev/null 2>&1 || issue_c='[]'
 wt_body=$(printf '%s' "$issue_c" | jq -r '[.[]|select(.user.login=="coderabbitai[bot]" and (.body|contains("<!-- walkthrough_start -->") or contains("rate limited by coderabbit.ai")))]|last|.body // empty' 2>/dev/null || true)
 # shellcheck disable=SC2016
 fr_head=$(printf '%s' "$wt_body" | awk '/final_review_risk_start/{f=1} f{print} /final_review_risk_end/{f=0}' | grep -oE 'up to `[0-9a-f]{5,40}`' | tail -1 | grep -oE '[0-9a-f]{5,40}' || true)
 [ -n "$fr_head" ] && printf '%s' "$head" | grep -q "^$fr_head" && cr_reviewed=1
-echo "CR_REVIEWED_HEAD=$cr_reviewed"
+echo "CR_REVIEWED_HEAD=$cr_reviewed"; echo "CR_UNCONFIRMED_ON_HEAD=$cr_unconfirmed"
 cr_reset=$(printf '%s' "$wt_body" | awk '/auto-generated comment: rate limited by coderabbit.ai/{f=1} f{print} /end of auto-generated comment: rate limited/{f=0}' | grep -oE 'available in [0-9]+ minutes' | tail -1 | grep -oE '[0-9]+' || true)
 [ -n "$cr_reset" ] && echo "CR_RESET_MIN=$cr_reset (as of the walkthrough's last edit; scripts/cr-rate-limit.sh for the live remainder)"
 cr_tally=$(printf '%s' "$rev_raw" | jq -r '.[]|select(.user.login=="coderabbitai[bot]")|.body' 2>/dev/null | grep -oiE 'Actionable comments posted: [0-9]+' | tail -1 || true)
 [ -n "$cr_tally" ] && echo "CR_TALLY='$cr_tally'"
 
 # Greptile check-run on the head.
-gr_json=$(gh api --paginate "repos/$REPO/commits/$head/check-runs" 2>/dev/null \
-  | jq -s '[.[].check_runs[]?|select(.app.slug=="greptile-apps" and .name=="Greptile Review")]|last // empty' 2>/dev/null || true)
+cr_pages=$(gh api --paginate "repos/$REPO/commits/$head/check-runs" 2>/dev/null || echo 'x')
+printf '%s' "$cr_pages" | jq -es 'length>0 and all(.[]; type=="object" and has("check_runs"))' >/dev/null 2>&1 || UNKNOWN=1
+gr_json=$(printf '%s' "$cr_pages" | jq -s '[.[].check_runs[]?|select(.app.slug=="greptile-apps" and .name=="Greptile Review")]|last // empty' 2>/dev/null || true)
 gr_state="absent"; gr_sum=""; gr_concl=""; gr_reviewed=0
 if [ -n "$gr_json" ]; then
   gr_state=$(printf '%s' "$gr_json" | jq -r '.status // "absent"')
@@ -140,18 +159,26 @@ if [ -n "$gr_json" ]; then
 fi
 echo "GREPTILE=$gr_state${gr_concl:+/$gr_concl}"; [ -n "$gr_sum" ] && echo "GREPTILE_SUMMARY='$gr_sum'"; echo "GREPTILE_REVIEWED_HEAD=$gr_reviewed"
 
-# Live inline findings from either bot.
-pull_c=$(gh api --paginate "repos/$REPO/pulls/$PR/comments" 2>/dev/null | jq -s 'add // []' || echo '[]')
+# Live inline findings from either bot (+ the unconfirmed CodeRabbit review body).
+pull_c=$(gh api --paginate "repos/$REPO/pulls/$PR/comments" 2>/dev/null | jq -s 'add // []' 2>/dev/null || echo 'x')
+arr_or_unknown "$pull_c"; printf '%s' "$pull_c" | jq -e 'type=="array"' >/dev/null 2>&1 || pull_c='[]'
 cr_live=$(printf '%s' "$pull_c" | jq '[.[]|select(.user.login=="coderabbitai[bot]" and .line!=null and ((.body|contains("Addressed in commit"))|not))]|length' 2>/dev/null || echo 0)
 gr_live=$(printf '%s' "$pull_c" | jq '[.[]|select(.user.login=="greptile-apps[bot]" and .line!=null)]|length' 2>/dev/null || echo 0)
-live=$((cr_live + gr_live))
-echo "LIVE_FINDINGS=$live (cr=$cr_live gr=$gr_live)"
+live=$((cr_live + gr_live + cr_unconfirmed))
+echo "LIVE_FINDINGS=$live (cr=$cr_live gr=$gr_live cr_unconfirmed=$cr_unconfirmed)"
 
-# Active mr_rework on this MR.
+# Active mr_rework on this MR. A repo on uzi whose listing cannot be read is UNKNOWN.
 mrw=0
 if [ "$have_uzi" -eq 1 ] && [ -n "$repo_id" ]; then
-  mrw=$(uzi run list --json 2>/dev/null | jq -r --arg repo "$repo_id" --argjson pr "$PR" \
-    '[.[]|select(.kind=="mr_rework" and .repo_id==$repo and .mr_iid==$pr and ((.status|test("completed|failed|cancelled"))|not))]|length' 2>/dev/null || echo 0)
+  runs=$(uzi run list --json 2>/dev/null || echo 'x')
+  if printf '%s' "$runs" | jq -e 'type=="array"' >/dev/null 2>&1; then
+    mrw=$(printf '%s' "$runs" | jq -r --arg repo "$repo_id" --argjson pr "$PR" \
+      '[.[]|select(.kind=="mr_rework" and .repo_id==$repo and .mr_iid==$pr and ((.status|test("completed|failed|cancelled"))|not))]|length' 2>/dev/null) || UNKNOWN=1
+  else
+    UNKNOWN=1; echo "MR_REWORK=unreadable"
+  fi
+elif [ "$have_uzi" -eq 1 ] && [ -z "$repo_id" ]; then
+  echo "MR_REWORK=repo-not-on-uzi-or-listing-failed"
 fi
 echo "MR_REWORK_ACTIVE=$mrw"
 
@@ -193,7 +220,9 @@ fi
 # ---- NEXT -------------------------------------------------------------------------------
 reviewed=$cr_reviewed
 [ "$gr_reviewed" -eq 1 ] && reviewed=1
-if   [ -n "$collision" ]; then echo "NEXT=migration_collision"
+echo "UNKNOWN=$UNKNOWN"
+if   [ "$UNKNOWN" -eq 1 ]; then echo "NEXT=unknown (a lookup failed or returned an unreadable payload; re-run before acting)"
+elif [ -n "$collision" ]; then echo "NEXT=migration_collision"
 elif [ "$merge_state" = "DIRTY" ]; then echo "NEXT=conflict"
 elif [ "$ci_fail" -gt 0 ]; then echo "NEXT=ci_red"
 elif [ "$mrw" -gt 0 ]; then echo "NEXT=mr_rework_active"
