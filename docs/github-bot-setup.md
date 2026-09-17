@@ -120,11 +120,14 @@ commit — its tree is exactly the agent's tip, byte-for-byte unchanged, with
 the published commit added as an extra parent — so the branch **fast-forwards**
 with both histories intact. A merge request opened on a bridged branch carries
 a one-line note saying so; `git log --first-parent` still reads as the
-agent's own work. Only when a bridge cannot be built or validated (the branch
-moved again under the run, or the bridge fails its own consistency check)
+agent's own work. Only when a bridge cannot be built or validated (the agent
+rewrote the branch again, or the bridge fails its own consistency check)
 does the run end `failed` with a typed reason (`fail_origin =
-history_rewritten`), naming the published tip and, exactly as above,
-preserving the diff on the failed run's card for you to land by hand.
+history_rewritten`) naming the published tip. Unlike the two cases above, the
+diff is preserved on the failed run's card only when the push range could be
+secret-scanned first, which a rewritten branch usually prevents; either way
+your committed work stays on the run's branch and is recoverable with `uzi run
+export`.
 
 ## 4. Add the bot to your repo
 
