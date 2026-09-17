@@ -20,6 +20,7 @@
 # (.codex[] .holder_pid). Registry unavailable => unknown (rc 2), and callers fall back to
 # the last_seen TTL (UZI_LANDER_STALE_HOURS, default 6).
 PEERS_PY="${SESSION_PEERS_PY:-$HOME/.claude/skills/session-peers/scripts/peers.py}"
+# shellcheck disable=SC2034  # read by claims.sh (owner_live's TTL) after it sources this lib
 STALE_HOURS="${UZI_LANDER_STALE_HOURS:-6}"
 
 state_dir() {
