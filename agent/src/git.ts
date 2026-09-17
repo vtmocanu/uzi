@@ -3101,10 +3101,19 @@ export class GitCache {
    * where <P> is `floors[0]` (the published floor) and <H> is `tip`, both full 40-hex OIDs — the
    * deterministic marker {@link rangeContainsBridge} parses.
    *
+   * IDEMPOTENT (#1416 MR-rework, finding 2): before building anything, if an ADDITIONAL floor `f`
+   * (index > 0) is ALREADY a valid superset bridge of H over every other floor — H is an ancestor of
+   * `f`, `f`'s tree === H's tree, and every other floor is an ancestor of `f` — that existing `f` is
+   * returned UNCHANGED (no new commit). This makes an idle re-bridge of an unchanged H a no-op while
+   * PRESERVING `f`'s full lineage (any genuine checkpoint sibling folded into it stays an ancestor of
+   * B). It replaces the old tree-equality skip, which unsoundly DROPPED a genuine divergent sibling
+   * whose tree merely coincided with H's (equal trees do not imply equal histories).
+   *
    * INVARIANT (validated by the caller before adopting B): B's tree === H's tree byte-for-byte, and
-   * every appended floor AND H are ancestors of B. Returns the new commit sha, or `null` when no
-   * floor was actually missing (nothing to bridge) OR any git step failed (best-effort — a bridge
-   * that cannot be built never throws here; the caller decides how to fail).
+   * every appended floor AND H are ancestors of B. Returns a bridge sha — either a freshly built
+   * commit or an existing idempotent-superset floor — or `null` when no floor was actually missing
+   * (nothing to bridge) OR any git step failed (best-effort — a bridge that cannot be built never
+   * throws here; the caller decides how to fail).
    */
   async bridgeToFloors(barePath: string, tip: string, floors: string[]): Promise<string | null> {
     const OID = /^[0-9a-f]{40}$/;
@@ -3112,32 +3121,53 @@ export class GitCache {
     try {
       // B's tree === H's tree, byte-identical: a tree OID is content-addressed, so committing onto
       // `tip^{tree}` reproduces H's tree exactly (no read-tree/write-tree round-trip needed). Read it
-      // up front because the nested-bridge guard below also compares each additional floor's tree to
-      // it.
+      // up front because the superset-bridge idempotency check below also compares each additional
+      // floor's tree to it.
       const tipTree = (await this.runGit(barePath, ["rev-parse", `${tip}^{tree}`])).trim();
       if (!OID.test(tipTree)) return null;
+      // #1416 (MR-rework, finding 2) — IDEMPOTENT SUPERSET-BRIDGE check (replaces the old, UNSOUND
+      // tree-equality skip). An idle re-bridge of the SAME divergent H must NOT nest a fresh wrapper
+      // every tick. The prior fix skipped any ADDITIONAL floor whose tree merely EQUALLED H's — but
+      // equal trees do NOT imply equal histories, so a GENUINE divergent sibling C (e.g. a real
+      // checkpoint commit that does NOT descend from H) whose tree coincidentally equals H's would be
+      // dropped, and C's lineage would silently stop being an ancestor of B (degrading cross-worker
+      // `refs/uzi-checkpoints/<branch>` recovery).
+      //
+      // Detect TRUE idempotency instead: an additional floor f (index > 0) that is ALREADY a valid
+      // bridge of H over every other floor needs no new commit. f qualifies iff ALL hold — H is an
+      // ancestor of f (f descends from H), f's tree === H's tree, and every OTHER floor is an ancestor
+      // of f (f already covers them). Return that f unchanged: creating nothing preserves f's full
+      // lineage, including any genuine C folded into it. Growth stays bounded to one wrapper per
+      // GENUINE rewrite — after C advances to the new bridge B, the next idle re-bridge finds B already
+      // covers [P, C] and returns it unchanged, so no nesting accrues. Iterate in order and return the
+      // first covering candidate (deterministic; floors is at most [P, C] in practice, so at most one).
+      for (let i = 1; i < floors.length; i++) {
+        const f = floors[i]!;
+        if (!OID.test(f)) continue;
+        if ((await this.ancestry(barePath, tip, f)) !== "ancestor") continue; // H must descend into f
+        const fTree = (await this.tryGitStdout(barePath, ["rev-parse", `${f}^{tree}`])).trim();
+        if (!OID.test(fTree) || fTree !== tipTree) continue; // f must preserve H's tree
+        let coversAll = true;
+        for (let j = 0; j < floors.length; j++) {
+          if (j === i) continue;
+          const g = floors[j]!;
+          if (!OID.test(g) || (await this.ancestry(barePath, g, f)) !== "ancestor") {
+            coversAll = false;
+            break;
+          }
+        }
+        if (coversAll) return f; // f is already a superset bridge of H over all floors — idempotent
+      }
       // Only floors NOT already reachable from H become extra parents (a floor already an ancestor
       // needs no bridge parent). "divergent" is the only positive signal — "unknown" (a transient
       // read) and "ancestor" both mean "do not append", so a broken read never synthesises a
-      // spurious parent.
-      //
-      // #1416 M3 — nested-bridge accumulation guard. An ADDITIONAL floor (index > 0, e.g. the
-      // checkpoint floor C, which after a prior divergent tick IS the prior bridge B_prev) whose
-      // tree equals H's tree contributes NO unique tree content: appending it only NESTS one commit
-      // per divergent tick — INCLUDING idle ticks where H is unchanged — bloating the pushed history.
-      // Skip any such tree-equal additional floor. NEVER skip the published floor floors[0] (P) on
-      // this basis: P must remain an ancestor of B even when its tree coincides with H's. Skipping the
-      // tree-equal prior bridge keeps the identity deterministic — re-bridging the SAME divergent H
-      // yields the SAME sha (idempotent), so an idle re-bridge produces no growth, while a genuinely
-      // different H (a different tree) still chains once (the plan's "acceptable" one-per-rewrite).
+      // spurious parent. EVERY divergent floor is appended (no tree-equality skip): a genuine
+      // divergent sibling with a coincidentally-equal tree is RETAINED as a parent, so its lineage
+      // stays an ancestor of B.
       const missing: string[] = [];
       for (let i = 0; i < floors.length; i++) {
         const floor = floors[i]!;
         if (!OID.test(floor) || (await this.ancestry(barePath, floor, tip)) !== "divergent") continue;
-        if (i > 0) {
-          const floorTree = (await this.tryGitStdout(barePath, ["rev-parse", `${floor}^{tree}`])).trim();
-          if (OID.test(floorTree) && floorTree === tipTree) continue; // tree-equal prior bridge — no unique content
-        }
         missing.push(floor);
       }
       if (missing.length === 0) return null; // nothing was actually missing — nothing to bridge

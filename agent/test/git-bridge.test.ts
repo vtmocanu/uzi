@@ -207,6 +207,59 @@ describe("GitCache.bridgeToFloors (PRD #1416 M3)", () => {
       "the tree-differing additional floor C is still appended",
     );
   });
+
+  it("RETAINS a GENUINE divergent sibling C whose tree coincidentally equals H's tree (FIX finding 2)", async () => {
+    // The reviewer's exact scenario: C is a REAL commit (not a worker bridge), a divergent SIBLING of
+    // H that does NOT descend from H, whose tree coincidentally equals H's. Equal trees do NOT imply
+    // equal histories, so C MUST stay a parent of B (its lineage remains an ancestor of B) — the old
+    // tree-equality skip wrongly dropped it. Build C and H as siblings on R that add the SAME
+    // file+content, so C^{tree} === H^{tree} while neither is an ancestor of the other.
+    const R = commit("base.txt", "base\n", "root");
+    const P = commit("published.txt", "published\n", "published work"); // a real published tip above R
+    gitIn(repo, ["checkout", "-b", "c", R]);
+    const C = commit("shared.ts", "same\n", "genuine checkpoint sibling"); // divergent sibling of H
+    gitIn(repo, ["checkout", "-b", "h", R]);
+    const H = commit("shared.ts", "same\n", "rewritten work"); // same file+content → same tree as C
+    assert.strictEqual(
+      gitIn(repo, ["rev-parse", `${C}^{tree}`]),
+      gitIn(repo, ["rev-parse", `${H}^{tree}`]),
+      "C's tree coincidentally equals H's tree",
+    );
+    assert.ok(!isAncestor(C, H) && !isAncestor(H, C), "C and H are divergent siblings, neither an ancestor");
+    const B = await git.bridgeToFloors(repo, H, [P, C]);
+    assert.ok(B && OID.test(B), "a bridge is built");
+    // C is RETAINED as an extra parent even though its tree equals H's → C's lineage is an ancestor of B.
+    assert.ok(isAncestor(C, B!), "C (a genuine divergent sibling with an equal tree) is an ancestor of B");
+    assert.ok(isAncestor(P, B!), "P is an ancestor of B");
+    assert.ok(isAncestor(H, B!), "H is an ancestor of B");
+    const parents = gitIn(repo, ["rev-list", "--parents", "-n", "1", B!]).split(/\s+/).slice(1);
+    assert.ok(parents.includes(C), "C is among B's parents");
+    void R;
+  });
+
+  it("is IDEMPOTENT across ticks: a prior bridge B1 over a DISTINCT-tree C is returned unchanged and still covers C", async () => {
+    // Multi-tick idempotency with a GENUINE, distinct-tree checkpoint C. B1 bridges the divergent H
+    // over [P, C_genuine], so B1's parents are [H, P, C]. A later idle re-bridge over [P, B1] must
+    // return B1 UNCHANGED (the superset-check sees B1 already descends from H, preserves H's tree, and
+    // covers P) — and B1 still carries C_genuine as an ancestor, so no lineage is lost.
+    const R = commit("base.txt", "base\n", "root");
+    const P = commit("p.txt", "p\n", "published");
+    gitIn(repo, ["checkout", "-b", "c", R]);
+    const C = commit("c.txt", "c\n", "genuine checkpoint sibling"); // distinct tree (adds c.txt)
+    gitIn(repo, ["checkout", "-b", "h", R]);
+    const H = commit("impl.ts", "1\n", "rewritten work"); // distinct tree (adds impl.ts)
+    const B1 = await git.bridgeToFloors(repo, H, [P, C]);
+    assert.ok(B1 && OID.test(B1));
+    assert.strictEqual(gitIn(repo, ["rev-parse", `${B1}^1`]), H, "B1's first parent is H");
+    assert.strictEqual(gitIn(repo, ["rev-parse", `${B1}^2`]), P, "B1's second parent is P");
+    assert.strictEqual(gitIn(repo, ["rev-parse", `${B1}^3`]), C, "B1's third parent is the genuine C");
+    assert.ok(isAncestor(C, B1!), "C is an ancestor of B1");
+    // A later idle re-bridge over [P, B1] returns B1 unchanged (true superset idempotency).
+    const B2 = await git.bridgeToFloors(repo, H, [P, B1!]);
+    assert.strictEqual(B2, B1, "an idle re-bridge over [P, B1] returns B1 unchanged (no nesting)");
+    assert.ok(isAncestor(C, B2!), "C_genuine remains an ancestor of the returned bridge");
+    void R;
+  });
 });
 
 describe("GitCache.rangeContainsBridge (PRD #1416 M3 — the structure-validated detector)", () => {
