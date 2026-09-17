@@ -111,9 +111,15 @@ for n in "$@"; do
     gr_json=$(gh api --paginate "repos/${repo}/commits/${head}/check-runs" 2>/dev/null \
       | jq -s '[.[].check_runs[]?|select(.app.slug=="greptile-apps" and .name=="Greptile Review")]|last // empty' 2>/dev/null || true)
     if [ -n "$gr_json" ]; then
-      gr_status=$(printf '%s' "$gr_json" | jq -r '.status')
+      gr_status=$(printf '%s' "$gr_json" | jq -r '.status // ""')
+      gr_concl=$(printf '%s' "$gr_json" | jq -r '.conclusion // ""')
       gr_sum=$(printf '%s' "$gr_json" | jq -r '.output.summary // ""' | grep -oE '[0-9]+ files reviewed, [0-9]+ comments added' || true)
-      if [ "$gr_status" = "completed" ]; then gr_ok=1; gr_line="completed on head — ${gr_sum:-no summary}"
+      # Reviewed = completed AND success AND the summary; anything else completed (failure,
+      # cancelled, skipped, or no summary) is NOT a review and must not clear the gate.
+      if [ "$gr_status" = "completed" ] && [ "$gr_concl" = "success" ] && [ -n "$gr_sum" ]; then
+        gr_ok=1; gr_line="completed on head — ${gr_sum}"
+      elif [ "$gr_status" = "completed" ]; then
+        gr_line="completed but NOT a review (conclusion=${gr_concl:-none}, summary=${gr_sum:-none}); re-trigger"
       else gr_line="${gr_status} (started $(printf '%s' "$gr_json" | jq -r '.started_at'))"; fi
     fi
   fi

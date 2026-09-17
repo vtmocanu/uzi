@@ -68,14 +68,21 @@ self_identity() {
   printf '%s\t%s\t%s\n' "$name" "$uuid" "${kind:-claude}"
 }
 
-# is_live <uuid>: 0 live, 1 dead, 2 unknown (no registry).
+# is_live <uuid>: 0 live, 1 dead, 2 unknown (no registry, or a registry that could not
+# verify: `codex_schema_recognised=false`, `codex_unverified`, `claude_unverified`). Being
+# listed is positive evidence and wins; being ABSENT proves death only when the registry
+# is verified, otherwise it is unknown, so an unverifiable live owner is never "dead" and
+# its claim or merge lock is never stolen on that basis.
 is_live() {
-  local pj n
+  local pj n unver
   case "$1" in unknown-*) return 2;; esac
   pj=$(peers_json); [ -n "$pj" ] || return 2
   n=$(printf '%s' "$pj" | jq -r --arg u "$1" \
-    '([.claude[]?|select(.sessionId==$u)] + [.codex[]?|select(.id==$u and .holder_pid!=null)])|length' 2>/dev/null || echo 0)
-  [ "${n:-0}" -gt 0 ]
+    '([.claude[]?|select(.sessionId==$u)] + [.codex[]?|select(.id==$u and .holder_pid!=null)])|length' 2>/dev/null) || return 2
+  [ "${n:-0}" -gt 0 ] && return 0
+  unver=$(printf '%s' "$pj" | jq -r '((.codex_schema_recognised==false) or (.codex_unverified==true) or (.claude_unverified==true))' 2>/dev/null || echo true)
+  [ "$unver" = "true" ] && return 2
+  return 1
 }
 
 now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }

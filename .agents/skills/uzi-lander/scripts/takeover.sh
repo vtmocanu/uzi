@@ -129,12 +129,16 @@ cr_tally=$(printf '%s' "$rev_raw" | jq -r '.[]|select(.user.login=="coderabbitai
 # Greptile check-run on the head.
 gr_json=$(gh api --paginate "repos/$REPO/commits/$head/check-runs" 2>/dev/null \
   | jq -s '[.[].check_runs[]?|select(.app.slug=="greptile-apps" and .name=="Greptile Review")]|last // empty' 2>/dev/null || true)
-gr_state="absent"; gr_sum=""
+gr_state="absent"; gr_sum=""; gr_concl=""; gr_reviewed=0
 if [ -n "$gr_json" ]; then
-  gr_state=$(printf '%s' "$gr_json" | jq -r .status)
+  gr_state=$(printf '%s' "$gr_json" | jq -r '.status // "absent"')
+  gr_concl=$(printf '%s' "$gr_json" | jq -r '.conclusion // ""')
   gr_sum=$(printf '%s' "$gr_json" | jq -r '.output.summary // ""' | grep -oE '[0-9]+ files reviewed, [0-9]+ comments added' || true)
+  # Reviewed = completed AND success AND the review summary; a failed/cancelled/skipped
+  # completed check is not a review.
+  if [ "$gr_state" = "completed" ] && [ "$gr_concl" = "success" ] && [ -n "$gr_sum" ]; then gr_reviewed=1; fi
 fi
-echo "GREPTILE=$gr_state"; [ -n "$gr_sum" ] && echo "GREPTILE_SUMMARY='$gr_sum'"
+echo "GREPTILE=$gr_state${gr_concl:+/$gr_concl}"; [ -n "$gr_sum" ] && echo "GREPTILE_SUMMARY='$gr_sum'"; echo "GREPTILE_REVIEWED_HEAD=$gr_reviewed"
 
 # Live inline findings from either bot.
 pull_c=$(gh api --paginate "repos/$REPO/pulls/$PR/comments" 2>/dev/null | jq -s 'add // []' || echo '[]')
@@ -188,7 +192,7 @@ fi
 
 # ---- NEXT -------------------------------------------------------------------------------
 reviewed=$cr_reviewed
-[ "$gr_state" = "completed" ] && reviewed=1
+[ "$gr_reviewed" -eq 1 ] && reviewed=1
 if   [ -n "$collision" ]; then echo "NEXT=migration_collision"
 elif [ "$merge_state" = "DIRTY" ]; then echo "NEXT=conflict"
 elif [ "$ci_fail" -gt 0 ]; then echo "NEXT=ci_red"

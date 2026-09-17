@@ -7,7 +7,7 @@
 # directory, a red gate.
 #
 # Usage: land-prep.sh OWNER/REPO PR [--worktree DIR] [--skip-rebase] [--gate auto|none|api,web,agent,controller]
-#                     [--no-push] [--repo-root DIR]
+#                     [--no-push] [--no-rework-check] [--repo-root DIR]
 #   --worktree DIR   where the PR branch is checked out (default: <repo-root>-land-<PR>,
 #                    a sibling of the repo root). Reused if it already exists on the branch.
 #   --skip-rebase    re-entry after you resolved a conflict by hand (`git rebase --continue`
@@ -16,12 +16,15 @@
 #                    derives them from the changed paths (api/, web/, agent/, controller/);
 #                    `none` skips gates (only when CI is the arbiter, e.g. a docs-only PR).
 #   --no-push        stop before the push (inspect the worktree first).
+#   --no-rework-check  skip the mr_rework guard (ONLY for a repo that is not on uzi).
 #   --repo-root DIR  the checkout whose .git the worktree is added to (default: cwd's root).
 #
-# Guards, in order: no active mr_rework on the MR (a rework push would collide); the remote
-# branch head is read at the start and the push is `--force-with-lease=<branch>:<that head>`,
-# so a push that landed in between (a rework, a human) fails instead of being overwritten;
-# the branch must be the PR's own head branch (never main, never a renovate branch).
+# Guards, in order: no active mr_rework on the MR (a rework push would collide; the check
+# fails CLOSED when uzi cannot answer); the remote branch head is read when the landing
+# starts, persisted in the worktree's git dir, and the push is `--force-with-lease=<branch>:
+# <that head>` even on a --skip-rebase re-entry, so a push that landed in between (a rework,
+# a human) fails instead of being overwritten; the branch must be the PR's own head branch
+# in THIS repository (never main, never a renovate branch, never a fork's).
 #
 # Exit codes (callers branch on these; keep them stable):
 #   0  pushed (or, with --no-push, prepared) — prints NEW_HEAD=<sha>; a push re-triggers
@@ -37,13 +40,14 @@
 #   8  the remote head moved since the start (lease would fail) — re-run from scratch
 set -uo pipefail
 
-REPO=""; PR=""; WT=""; SKIP_REBASE=0; GATE="auto"; PUSH=1; ROOT=""
+REPO=""; PR=""; WT=""; SKIP_REBASE=0; GATE="auto"; PUSH=1; ROOT=""; REWORK_CHECK=1
 while [ $# -gt 0 ]; do
   case "$1" in
     --worktree) WT="${2:?}"; shift 2;;
     --skip-rebase) SKIP_REBASE=1; shift;;
     --gate) GATE="${2:?}"; shift 2;;
     --no-push) PUSH=0; shift;;
+    --no-rework-check) REWORK_CHECK=0; shift;;
     --repo-root) ROOT="${2:?}"; shift 2;;
     -h|--help) sed -n '2,38p' "$0"; exit 2;;
     -*) echo "unknown flag: $1" >&2; exit 2;;
@@ -69,6 +73,12 @@ BRANCH=$(printf '%s' "$pj" | jq -r .headRefName)
 BASE=$(printf '%s' "$pj" | jq -r .baseRefName)
 HEAD0=$(printf '%s' "$pj" | jq -r .headRefOid)
 [ "$state" = "OPEN" ] || { echo "PR #$PR is $state, nothing to prepare" >&2; exit 3; }
+# A fork PR's head lives in ANOTHER repository: origin/$BRANCH here would be an unrelated
+# same-named branch (or nothing), so a lease push could overwrite the wrong thing.
+head_owner=$(printf '%s' "$pj" | jq -r '.headRepositoryOwner.login // ""')
+if [ -n "$head_owner" ] && [ "$head_owner" != "${REPO%%/*}" ]; then
+  echo "refusing: PR #$PR comes from a fork ($head_owner); its head is not origin/$BRANCH — land it by hand" >&2; exit 3
+fi
 case "$BRANCH" in
   main|master|"$BASE") echo "refusing: PR head branch is '$BRANCH'" >&2; exit 3;;
   renovate/*) echo "refusing: '$BRANCH' is a renovate branch (renovate force-pushes it; make your own branch — see uzi-release)" >&2; exit 3;;
@@ -76,15 +86,23 @@ esac
 log "branch=$BRANCH base=$BASE head=${HEAD0:0:8}"
 
 # ---- guard: mr_rework ---------------------------------------------------------------------
+# FAIL CLOSED: an absent `uzi`, a failed listing, or unreadable JSON cannot rule out an
+# active rework, so each is a refusal (exit 4). Only a listing that SUCCEEDED and shows the
+# repo is not connected to uzi skips the check; --no-rework-check is the explicit bypass
+# for a repo that is not on uzi at all.
 mrw_check() {
-  local repo_id
-  command -v uzi >/dev/null 2>&1 || { log "uzi CLI absent; mr_rework check skipped (verify by hand)"; return 0; }
-  repo_id=$(uzi repo list --json 2>/dev/null | jq -r --arg p "$REPO" '.[]|select(.path_with_namespace==$p)|.id' 2>/dev/null | head -1 || true)
-  [ -n "$repo_id" ] || { log "repo not connected to uzi; mr_rework check skipped"; return 0; }
-  local n
-  n=$(uzi run list --json 2>/dev/null | jq -r --arg repo "$repo_id" --argjson pr "$PR" \
-    '[.[]|select(.kind=="mr_rework" and .repo_id==$repo and .mr_iid==$pr and ((.status|test("completed|failed|cancelled"))|not))]|length' 2>/dev/null || echo "?")
-  if [ "$n" = "?" ]; then log "uzi run list failed; cannot rule out an active mr_rework"; return 4; fi
+  local rl repo_id runs n
+  [ "$REWORK_CHECK" -eq 1 ] || { log "rework check skipped by --no-rework-check"; return 0; }
+  command -v uzi >/dev/null 2>&1 || { log "uzi CLI absent; cannot rule out an active mr_rework (pass --no-rework-check for a repo not on uzi)"; return 4; }
+  rl=$(uzi repo list --json 2>/dev/null) && printf '%s' "$rl" | jq -e 'type=="array"' >/dev/null 2>&1 \
+    || { log "uzi repo list failed; cannot rule out an active mr_rework"; return 4; }
+  repo_id=$(printf '%s' "$rl" | jq -r --arg p "$REPO" '.[]|select(.path_with_namespace==$p)|.id' | head -1)
+  [ -n "$repo_id" ] || { log "$REPO is not connected to uzi; mr_rework check skipped"; return 0; }
+  runs=$(uzi run list --json 2>/dev/null) && printf '%s' "$runs" | jq -e 'type=="array"' >/dev/null 2>&1 \
+    || { log "uzi run list failed; cannot rule out an active mr_rework"; return 4; }
+  n=$(printf '%s' "$runs" | jq -r --arg repo "$repo_id" --argjson pr "$PR" \
+    '[.[]|select(.kind=="mr_rework" and .repo_id==$repo and .mr_iid==$pr and ((.status|test("completed|failed|cancelled"))|not))]|length') \
+    || { log "could not parse uzi run list; cannot rule out an active mr_rework"; return 4; }
   if [ "${n:-0}" -gt 0 ]; then log "an mr_rework run is ACTIVE on #$PR — defer (scripts/wait-mrrework.sh)"; return 4; fi
   return 0
 }
@@ -108,8 +126,22 @@ else
   log "worktree $WT on $BRANCH"
 fi
 cd "$WT" || exit 3
-# Record the lease target NOW (the remote head this run started from).
-LEASE=$(git rev-parse "origin/$BRANCH")
+# The lease is the remote head this landing STARTED from, persisted in the worktree's git
+# dir so a --skip-rebase re-entry pushes against the ORIGINAL head, not the refreshed
+# origin/$BRANCH (which would let an intervening push be overwritten by the stale tree).
+LEASE_FILE="$(git rev-parse --git-dir)/uzi-lander-lease-$PR"
+if [ "$SKIP_REBASE" -eq 0 ]; then
+  LEASE=$(git rev-parse "origin/$BRANCH")
+  printf '%s' "$LEASE" > "$LEASE_FILE"
+else
+  LEASE=$(cat "$LEASE_FILE" 2>/dev/null || true)
+  [ -n "$LEASE" ] || { echo "no lease recorded for #$PR in this worktree; run once without --skip-rebase" >&2; exit 8; }
+  remote_now=$(git ls-remote origin "refs/heads/$BRANCH" | cut -f1)
+  if [ "$remote_now" != "$LEASE" ]; then
+    log "remote $BRANCH moved ${LEASE:0:8} -> ${remote_now:0:8} since this landing started; re-run from scratch"
+    echo "RESULT=remote_moved"; exit 8
+  fi
+fi
 
 # ---- rebase -----------------------------------------------------------------------------
 if [ "$SKIP_REBASE" -eq 0 ]; then
@@ -204,6 +236,7 @@ if [ "$remote_now" != "$LEASE" ]; then
   exit 8
 fi
 if git push --force-with-lease="${BRANCH}:${LEASE}" origin "HEAD:refs/heads/${BRANCH}" --quiet; then
+  rm -f "$LEASE_FILE"
   log "pushed ${NEW_HEAD:0:8} (lease ${LEASE:0:8}); a re-review follows — run watch-pr.sh"
   echo "RESULT=pushed NEW_HEAD=$NEW_HEAD OLD_HEAD=$HEAD0 WORKTREE=$WT"
   exit 0

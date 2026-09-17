@@ -17,7 +17,8 @@
 #                    limit` ONCE and parse the reply (polls up to ~3 min for it).
 #   --wait           when limited with a known reset, poll until the reset elapses (+2 min
 #                    margin) or CR's status leaves "rate limited"; then exit 0. With an
-#                    UNKNOWN reset, --wait waits --max-wait-min as a ceiling.
+#                    UNKNOWN reset, --wait waits --max-wait-min as a ceiling. Hitting the
+#                    ceiling with the reset still ahead exits 1 (unknown: 2), never 0.
 #   --max-wait-min   ceiling for --wait (default 180).
 #   --interval       poll seconds for --wait (default 60).
 #
@@ -64,25 +65,29 @@ cr_status() {
 # edits in place (base = its updated_at) and (2) the newest bot reply carrying "More reviews
 # will be available in N minutes" (base = its created_at). The later base wins.
 reset_from_pr() {
-  local comments best_ts="" best_src="" b n ts
+  local comments best_ts="" best_base="" best_src="" b n ts base
   comments=$(gh api --paginate "repos/$REPO/issues/$PR/comments" 2>/dev/null | jq -s 'add // []') || return 1
+  printf '%s' "$comments" | jq -e 'type=="array"' >/dev/null 2>&1 || return 1
   # (1) walkthrough / status comment with the rate-limited block.
-  b=$(printf '%s' "$comments" | jq -r '[.[]|select(.user.login=="coderabbitai[bot]" and (.body|contains("rate limited by coderabbit.ai")))]|last|"\(.updated_at)\t\(.body)"' 2>/dev/null)
-  if [ -n "$b" ] && [ "$b" != "null" ]; then
+  b=$(printf '%s' "$comments" | jq -r '[.[]|select(.user.login=="coderabbitai[bot]" and (.body|contains("rate limited by coderabbit.ai")))]|last|select(.!=null)|"\(.updated_at)\t\(.body)"' 2>/dev/null)
+  if [ -n "$b" ]; then
     ts=$(printf '%s' "$b" | head -1 | cut -f1)
     n=$(printf '%s' "$b" | awk '/auto-generated comment: rate limited by coderabbit.ai/{f=1} f{print} /end of auto-generated comment: rate limited/{f=0}' \
         | grep -oE 'available in [0-9]+ minutes' | tail -1 | grep -oE '[0-9]+' || true)
-    if [ -n "$n" ] && [ -n "$ts" ]; then best_ts=$(( $(iso2epoch "$ts") + n*60 )); best_src="walkthrough"; fi
+    if [ -n "$n" ] && [ -n "$ts" ] && base=$(iso2epoch "$ts") && [ -n "$base" ]; then
+      best_base=$base; best_ts=$(( base + n*60 )); best_src="walkthrough"
+    fi
   fi
-  # (2) the newest `rate limit` reply.
-  b=$(printf '%s' "$comments" | jq -r '[.[]|select(.user.login=="coderabbitai[bot]" and (.body|test("More reviews will be available in [0-9]+ minutes")))]|last|"\(.created_at)\t\(.body)"' 2>/dev/null)
-  if [ -n "$b" ] && [ "$b" != "null" ]; then
+  # (2) the newest `rate limit` reply. The statement with the LATER base timestamp wins
+  # (its "N minutes" is the fresher figure), not the later reset instant.
+  b=$(printf '%s' "$comments" | jq -r '[.[]|select(.user.login=="coderabbitai[bot]" and (.body|test("More reviews will be available in [0-9]+ minutes")))]|last|select(.!=null)|"\(.created_at)\t\(.body)"' 2>/dev/null)
+  if [ -n "$b" ]; then
     ts=$(printf '%s' "$b" | head -1 | cut -f1)
     n=$(printf '%s' "$b" | grep -oE 'More reviews will be available in [0-9]+ minutes' | tail -1 | grep -oE '[0-9]+' || true)
-    if [ -n "$n" ] && [ -n "$ts" ]; then
-      cand=$(( $(iso2epoch "$ts") + n*60 ))
-      # Prefer the statement made LATER (its base is fresher), not the later reset instant.
-      if [ -z "$best_ts" ] || [ "$(iso2epoch "$ts")" -ge "$(( best_ts - n*60 ))" ]; then best_ts=$cand; best_src="reply"; fi
+    if [ -n "$n" ] && [ -n "$ts" ] && base=$(iso2epoch "$ts") && [ -n "$base" ]; then
+      if [ -z "$best_base" ] || [ "$base" -ge "$best_base" ]; then
+        best_base=$base; best_ts=$(( base + n*60 )); best_src="reply"
+      fi
     fi
   fi
   [ -n "$best_ts" ] && printf '%s\t%s\n' "$best_ts" "$best_src"
@@ -114,9 +119,21 @@ row=$(reset_from_pr) || { echo "gh error reading PR comments" >&2; exit 3; }
 reset_ts=$(printf '%s' "$row" | cut -f1); src=$(printf '%s' "$row" | cut -f2)
 
 if [ -z "$reset_ts" ] && [ "$ASK" -eq 1 ]; then
-  asked_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  gh pr comment "$PR" --repo "$REPO" --body '@coderabbitai rate limit' >/dev/null 2>&1 || { echo "could not post the rate-limit query" >&2; exit 3; }
-  echo "ASKED_AT=$asked_at"
+  # In-flight guard: an unanswered `@coderabbitai rate limit` posted by anyone in the last
+  # 10 minutes is reused (its reply is what we wait for); a repeated or concurrent
+  # invocation must not post another one.
+  pending_ask=$(gh api --paginate "repos/$REPO/issues/$PR/comments" 2>/dev/null | jq -s 'add // []' | jq -r '
+    ([.[]|select(((.user.login|test("\\[bot\\]$"))|not) and ((.body|gsub("^\\s+|\\s+$";""))=="@coderabbitai rate limit"))]|last) as $a
+    | if $a==null then "" else
+        ([.[]|select(.user.login=="coderabbitai[bot]" and (.body|test("More reviews will be available")) and .created_at > $a.created_at)]|length) as $replied
+        | if $replied>0 then "" else $a.created_at end end' 2>/dev/null || true)
+  if [ -n "$pending_ask" ] && [ $(( $(date +%s) - $(iso2epoch "$pending_ask") )) -lt 600 ]; then
+    asked_at="$pending_ask"; echo "ASK_IN_FLIGHT_SINCE=$asked_at (not posting again)"
+  else
+    asked_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    gh pr comment "$PR" --repo "$REPO" --body '@coderabbitai rate limit' >/dev/null 2>&1 || { echo "could not post the rate-limit query" >&2; exit 3; }
+    echo "ASKED_AT=$asked_at"
+  fi
   for _ in $(seq 1 12); do
     sleep 15
     row=$(reset_from_pr) || continue
@@ -149,5 +166,9 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
     *) echo "CR_STATUS='${s:-absent}'"; echo "CR_RESUMED=1"; exit 0 ;;
   esac
 done
-echo "CR_RESET_ELAPSED=1"
-exit 0
+# The wait ended: only a reset that has actually passed is "elapsed". Hitting the ceiling
+# with the reset still ahead (or unknown) is NOT permission to trigger a review.
+now=$(date +%s)
+if [ -n "$reset_ts" ] && [ "$now" -ge "$reset_ts" ]; then echo "CR_RESET_ELAPSED=1"; exit 0; fi
+if [ -n "$reset_ts" ]; then echo "CR_WAIT_CEILING=1 (reset still $(( (reset_ts - now + 59) / 60 )) min ahead; re-run --wait)"; exit 1; fi
+echo "CR_WAIT_CEILING=1 (reset unknown; re-run with --ask)"; exit 2

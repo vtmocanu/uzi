@@ -3,9 +3,12 @@
 # admin-merge past the ruleset, then CONFIRM it merged and print the merge SHA for the
 # post-merge watch. The decision to merge is the caller's; this is only the mechanics.
 #
-# Usage: merge.sh OWNER/REPO PR [--expect-head SHA] [--method squash|merge] [--no-admin] [--no-delete-branch]
+# Usage: merge.sh OWNER/REPO PR [--expect-head SHA] [--method squash|merge] [--no-admin] [--no-delete-branch] [--no-rework-check]
 #   --expect-head   the head you reviewed/watched; a different current head refuses (exit 8)
-#                   so a push that landed after your last look is never merged unseen.
+#                   so a push that landed after your last look is never merged unseen. The
+#                   merge itself passes --match-head-commit, so a push in the window between
+#                   the preflight and the merge is refused by GitHub as well.
+#   --no-rework-check  skip the mr_rework guard (ONLY for a repo that is not on uzi).
 #   --method        squash (default; the convention for agent/issue-* branches) or merge
 #                   (uzi-release uses merge commits so the subject keeps the issue branch).
 #   --no-admin      drop --admin (needs the ruleset satisfied: review + up-to-date + checks).
@@ -32,13 +35,14 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/state.sh
 . "$HERE/lib/state.sh"
 
-REPO=""; PR=""; EXPECT=""; METHOD="squash"; ADMIN=1; DELETE=1
+REPO=""; PR=""; EXPECT=""; METHOD="squash"; ADMIN=1; DELETE=1; REWORK_CHECK=1
 while [ $# -gt 0 ]; do
   case "$1" in
     --expect-head) EXPECT="${2:?}"; shift 2;;
     --method) METHOD="${2:?}"; shift 2;;
     --no-admin) ADMIN=0; shift;;
     --no-delete-branch) DELETE=0; shift;;
+    --no-rework-check) REWORK_CHECK=0; shift;;
     -h|--help) sed -n '2,24p' "$0"; exit 2;;
     -*) echo "unknown flag: $1" >&2; exit 2;;
     *) if [ -z "$REPO" ]; then REPO="$1"; elif [ -z "$PR" ]; then PR="$1"; else echo "unexpected arg: $1" >&2; exit 2; fi; shift;;
@@ -56,24 +60,36 @@ if [ -n "$EXPECT" ] && ! printf '%s' "$head" | grep -q "^$EXPECT"; then
 fi
 echo "head=${head:0:8} mergeable=$mg mergeStateStatus=$ms"
 
-# mr_rework guard, last moment.
-if command -v uzi >/dev/null 2>&1; then
-  repo_id=$(uzi repo list --json 2>/dev/null | jq -r --arg p "$REPO" '.[]|select(.path_with_namespace==$p)|.id' 2>/dev/null | head -1 || true)
+# mr_rework guard, last moment — FAIL CLOSED: an absent uzi, a failed listing or unreadable
+# JSON cannot rule out an active rework (exit 4). Only a successful listing that shows the
+# repo is not connected skips it; --no-rework-check is the explicit bypass for such a repo.
+if [ "$REWORK_CHECK" -eq 1 ]; then
+  command -v uzi >/dev/null 2>&1 || { echo "uzi CLI absent; cannot rule out an active mr_rework (pass --no-rework-check for a repo not on uzi)"; exit 4; }
+  rl=$(uzi repo list --json 2>/dev/null) && printf '%s' "$rl" | jq -e 'type=="array"' >/dev/null 2>&1 \
+    || { echo "uzi repo list failed; cannot rule out an active mr_rework"; exit 4; }
+  repo_id=$(printf '%s' "$rl" | jq -r --arg p "$REPO" '.[]|select(.path_with_namespace==$p)|.id' | head -1)
   if [ -n "$repo_id" ]; then
-    n=$(uzi run list --json 2>/dev/null | jq -r --arg repo "$repo_id" --argjson pr "$PR" \
-      '[.[]|select(.kind=="mr_rework" and .repo_id==$repo and .mr_iid==$pr and ((.status|test("completed|failed|cancelled"))|not))]|length' 2>/dev/null || echo "?")
-    [ "$n" = "?" ] && { echo "uzi run list failed; cannot rule out an active mr_rework"; exit 4; }
+    runs=$(uzi run list --json 2>/dev/null) && printf '%s' "$runs" | jq -e 'type=="array"' >/dev/null 2>&1 \
+      || { echo "uzi run list failed; cannot rule out an active mr_rework"; exit 4; }
+    n=$(printf '%s' "$runs" | jq -r --arg repo "$repo_id" --argjson pr "$PR" \
+      '[.[]|select(.kind=="mr_rework" and .repo_id==$repo and .mr_iid==$pr and ((.status|test("completed|failed|cancelled"))|not))]|length') \
+      || { echo "could not parse uzi run list; cannot rule out an active mr_rework"; exit 4; }
     [ "${n:-0}" -gt 0 ] && { echo "mr_rework ACTIVE on #$PR — defer"; exit 4; }
+  else
+    echo "note: $REPO is not connected to uzi; rework check skipped"
   fi
 fi
 
-# Required checks on the head.
+# Required checks on the head — FAIL CLOSED: unreadable JSON is "not merging", a cancelled
+# required check is not green (supersession), pending is not green.
 cj=$(gh pr checks "$PR" --repo "$REPO" --required --json bucket 2>/dev/null || true)
-if printf '%s' "$cj" | jq -e . >/dev/null 2>&1; then
-  f=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="fail")]|length'); p=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="pending")]|length')
-  [ "$f" -gt 0 ] && { echo "required check failing on ${head:0:8}; not merging"; exit 1; }
-  [ "$p" -gt 0 ] && { echo "required checks still pending on ${head:0:8}; not merging"; exit 2; }
-fi
+printf '%s' "$cj" | jq -e 'type=="array"' >/dev/null 2>&1 || { echo "cannot read the required checks for #$PR; not merging"; exit 2; }
+f=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="fail")]|length')
+p=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="pending")]|length')
+c=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="cancel")]|length')
+[ "$f" -gt 0 ] && { echo "required check failing on ${head:0:8}; not merging"; exit 1; }
+[ "$p" -gt 0 ] && { echo "required checks still pending on ${head:0:8}; not merging"; exit 2; }
+[ "$c" -gt 0 ] && { echo "a required check on ${head:0:8} was cancelled (superseded?); not merging"; exit 2; }
 [ "$mg" = "CONFLICTING" ] && { echo "PR has merge conflicts (--admin does not bypass a git conflict); resolve with land-prep.sh"; exit 3; }
 
 # ---- merge lock (repo-wide, 10-min TTL) ----------------------------------------------------
@@ -99,7 +115,9 @@ if [ -n "$SD" ]; then
   trap 'rm -rf "$LOCK"' EXIT
 fi
 
-cmd=(gh pr merge "$PR" --repo "$REPO" "--$METHOD")
+# --match-head-commit makes GitHub itself refuse the merge if the head moved after the
+# preflight above (a push in the window), so --expect-head is enforced server-side too.
+cmd=(gh pr merge "$PR" --repo "$REPO" "--$METHOD" --match-head-commit "$head")
 [ "$DELETE" -eq 1 ] && cmd+=(--delete-branch)
 [ "$ADMIN" -eq 1 ] && cmd+=(--admin)
 echo "+ ${cmd[*]}"

@@ -74,6 +74,18 @@ case "$verb" in
     done
     me=$(self_identity "$as" "$uuid" "$kind"); my_name=$(printf '%s' "$me" | cut -f1); my_uuid=$(printf '%s' "$me" | cut -f2); my_kind=$(printf '%s' "$me" | cut -f3)
     f="$CL/$key.json"
+    # Acquisition is serialised per key with a mkdir lock (atomic on POSIX): two fresh claims
+    # cannot both succeed, the check-then-write below runs under it. A lock older than 60 s
+    # belongs to a crashed claimer and is broken.
+    lock="$CL/.lock.$key"; got=0
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      if mkdir "$lock" 2>/dev/null; then got=1; break; fi
+      lage=$(( $(date +%s) - $(stat -f %m "$lock" 2>/dev/null || stat -c %Y "$lock" 2>/dev/null || date +%s) ))
+      [ "$lage" -gt 60 ] && rm -rf "$lock"
+      sleep 0.3
+    done
+    [ "$got" -eq 1 ] || { echo "claim lock busy for $key; retry" >&2; exit 3; }
+    trap 'rm -rf "$lock"' EXIT
     if [ -f "$f" ]; then
       o_uuid=$(jq -r '.owner_uuid // ""' "$f"); o_name=$(jq -r '.owner // ""' "$f")
       if [ "$o_uuid" != "$my_uuid" ] && [ "$force" -eq 0 ]; then

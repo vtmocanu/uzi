@@ -73,6 +73,13 @@ INTERVAL=${POS[2]:-60}
 MAX=${POS[3]:-60}
 case "$REVIEWER" in any|coderabbit|greptile|none) ;; *) echo "bad --reviewer: $REVIEWER" >&2; usage;; esac
 
+# A request that SUCCEEDED but returned a payload jq cannot read must count as UNKNOWN,
+# never as "zero findings" — that is a route to a false ready. `gh api --paginate` emits
+# one document per page, so the checks slurp and test every page's shape.
+pages_are_arrays() { printf '%s' "$1" | jq -es 'length>0 and all(.[]; type=="array")' >/dev/null 2>&1; }
+pages_are_checkruns() { printf '%s' "$1" | jq -es 'length>0 and all(.[]; type=="object" and has("check_runs"))' >/dev/null 2>&1; }
+is_array() { printf '%s' "$1" | jq -e 'type=="array"' >/dev/null 2>&1; }
+
 # uzi repo_id for the mr_rework check, resolved lazily inside the loop. THREE states are
 # kept distinct so a failed lookup never masquerades as "not connected" (which would skip
 # the rework check and risk a false ready): `repo_known=1` + non-empty id = connected, run
@@ -127,10 +134,10 @@ while [ "$i" -lt "$MAX" ]; do
   if [ "$repo_known" -eq 0 ]; then
     unknown=1
   elif [ -n "$repo_id" ]; then
-    if rl2=$(uzi run list --json 2>/dev/null); then
+    if rl2=$(uzi run list --json 2>/dev/null) && is_array "$rl2"; then
       mrw_active=$(printf '%s' "$rl2" | jq -r --arg repo "$repo_id" --argjson pr "$PR" \
         '[.[]|select(.kind=="mr_rework" and .repo_id==$repo and .mr_iid==$pr
-                     and ((.status|test("completed|failed|cancelled"))|not))]|length' 2>/dev/null || echo 0)
+                     and ((.status|test("completed|failed|cancelled"))|not))]|length' 2>/dev/null) || unknown=1
     else
       unknown=1
     fi
@@ -143,8 +150,8 @@ while [ "$i" -lt "$MAX" ]; do
   # `state` is `success` even when rate-limited, so only the description is read. Absent
   # (no context) = CR has not touched this head at all.
   cr_desc=""; cr_pending=0; cr_limited=0; cr_skipped=0; cr_absent=0
-  if st=$(gh api "repos/$REPO/commits/$head/status" 2>/dev/null); then
-    cr_desc=$(printf '%s' "$st" | jq -r '[.statuses[]|select(.context=="CodeRabbit")]|last|.description // empty' 2>/dev/null || true)
+  if st=$(gh api "repos/$REPO/commits/$head/status" 2>/dev/null) && printf '%s' "$st" | jq -e 'has("statuses")' >/dev/null 2>&1; then
+    cr_desc=$(printf '%s' "$st" | jq -r '[.statuses[]|select(.context=="CodeRabbit")]|last|.description // empty' 2>/dev/null) || unknown=1
     case "$cr_desc" in
       "") cr_absent=1 ;;
       *"in progress"*) cr_pending=1 ;;
@@ -155,22 +162,31 @@ while [ "$i" -lt "$MAX" ]; do
     unknown=1
   fi
 
-  # Signal (a): a CodeRabbit review object on this exact head. Two gotchas handled here:
-  # `gh api --jq` does NOT accept jq's --arg (so the head SHA is passed to standalone jq),
-  # and `gh api --paginate` emits one array PER PAGE (so pages are slurped with `-s`/`.[][]`
-  # before counting). The constant bot login is inlined into the filter.
-  cr_reviewed=0
+  # Signal (a): a CodeRabbit review object on this exact head that is a VERDICT — APPROVED
+  # (its clean pass: empty, tally-less body) or one carrying the "Actionable comments
+  # posted: N" tally. A tally-less COMMENTED/CHANGES_REQUESTED review on the head is NOT a
+  # verdict: CodeRabbit puts grouped / outside-diff findings in that review BODY, which the
+  # inline count below never sees, so it is counted as an UNCONFIRMED finding instead
+  # (pr-findings.sh classifies it the same way). Two gotchas handled here: `gh api --jq`
+  # does NOT accept jq's --arg (so the head SHA is passed to standalone jq), and `gh api
+  # --paginate` emits one array PER PAGE (so pages are slurped with `-s`/`.[][]`).
+  cr_reviewed=0; cr_unconfirmed=0
   cr_a=""
-  if rev_raw=$(gh api --paginate "repos/$REPO/pulls/$PR/reviews" 2>/dev/null); then
+  if rev_raw=$(gh api --paginate "repos/$REPO/pulls/$PR/reviews" 2>/dev/null) && pages_are_arrays "$rev_raw"; then
     # shellcheck disable=SC2016  # $h is a jq var (--arg), must stay single-quoted
     rev_on_head=$(printf '%s' "$rev_raw" | jq -rs --arg h "$head" \
-      '[.[][]|select(.user.login=="coderabbitai[bot]" and .commit_id==$h)]|length' 2>/dev/null || echo 0)
+      '[.[][]|select(.user.login=="coderabbitai[bot]" and .commit_id==$h
+                     and (.state=="APPROVED" or ((.body // "")|test("Actionable comments posted: [0-9]+"))))]|length' 2>/dev/null) || unknown=1
     [ "${rev_on_head:-0}" -gt 0 ] && cr_reviewed=1
+    # shellcheck disable=SC2016
+    cr_unconfirmed=$(printf '%s' "$rev_raw" | jq -rs --arg h "$head" \
+      '[.[][]|select(.user.login=="coderabbitai[bot]" and .commit_id==$h
+                     and .state!="APPROVED" and (((.body // "")|test("Actionable comments posted: [0-9]+"))|not))]|length' 2>/dev/null) || unknown=1
     # cr_a: the commit CodeRabbit reviewed MOST RECENTLY (any head), for the equivalent-head
     # signal (d) below. Reviews come back oldest-first, so the last coderabbit entry is its
     # newest verdict. Empty when CodeRabbit has posted no review object yet.
     cr_a=$(printf '%s' "$rev_raw" | jq -rs \
-      '[.[][]|select(.user.login=="coderabbitai[bot]")]|last|.commit_id // empty' 2>/dev/null || true)
+      '[.[][]|select(.user.login=="coderabbitai[bot]")]|last|.commit_id // empty' 2>/dev/null) || unknown=1
   else
     unknown=1
   fi
@@ -195,8 +211,8 @@ while [ "$i" -lt "$MAX" ]; do
   # REMAINING figure here. Read from the newest such comment, independently of the
   # exactly-one walkthrough rule (it is informational, not a merge signal).
   cr_reset_min=""
-  if issue_c=$(gh api --paginate "repos/$REPO/issues/$PR/comments" 2>/dev/null); then
-    wt_count=$(printf '%s' "$issue_c" | jq -rs '[.[][]|select(.user.login=="coderabbitai[bot]")|select(.body|contains("<!-- walkthrough_start -->"))]|length' 2>/dev/null || echo 0)
+  if issue_c=$(gh api --paginate "repos/$REPO/issues/$PR/comments" 2>/dev/null) && pages_are_arrays "$issue_c"; then
+    wt_count=$(printf '%s' "$issue_c" | jq -rs '[.[][]|select(.user.login=="coderabbitai[bot]")|select(.body|contains("<!-- walkthrough_start -->"))]|length' 2>/dev/null) || unknown=1
     if [ "${wt_count:-0}" -eq 1 ]; then
       wt_body=$(printf '%s' "$issue_c" | jq -rs '.[][]|select(.user.login=="coderabbitai[bot]")|select(.body|contains("<!-- walkthrough_start -->"))|.body' 2>/dev/null || true)
       # final_review_risk marker: "up to `<sha>`" parsed ONLY within its own block.
@@ -230,28 +246,35 @@ while [ "$i" -lt "$MAX" ]; do
   # live=2 and produced a false exit-3 after a clean rework). Greptile findings are counted
   # by the same line != null anchor (no addressed-marker convention has been observed).
   cr_live=0; gr_live=0
-  if pull_c=$(gh api --paginate "repos/$REPO/pulls/$PR/comments" 2>/dev/null); then
-    cr_live=$(printf '%s' "$pull_c" | jq -rs '[.[][]|select(.user.login=="coderabbitai[bot]" and .line!=null and ((.body|contains("Addressed in commit"))|not))]|length' 2>/dev/null || echo 0)
-    gr_live=$(printf '%s' "$pull_c" | jq -rs '[.[][]|select(.user.login=="greptile-apps[bot]" and .line!=null)]|length' 2>/dev/null || echo 0)
+  if pull_c=$(gh api --paginate "repos/$REPO/pulls/$PR/comments" 2>/dev/null) && pages_are_arrays "$pull_c"; then
+    cr_live=$(printf '%s' "$pull_c" | jq -rs '[.[][]|select(.user.login=="coderabbitai[bot]" and .line!=null and ((.body|contains("Addressed in commit"))|not))]|length' 2>/dev/null) || unknown=1
+    gr_live=$(printf '%s' "$pull_c" | jq -rs '[.[][]|select(.user.login=="greptile-apps[bot]" and .line!=null)]|length' 2>/dev/null) || unknown=1
   else
     unknown=1
   fi
-  live=$((cr_live + gr_live))
+  # An unconfirmed CodeRabbit review (grouped findings in its body) counts as live: it
+  # blocks a ready and surfaces as exit 3 for a human to read the body.
+  live=$((cr_live + gr_live + cr_unconfirmed))
 
   # Greptile: its `Greptile Review` check-run on the head (app slug greptile-apps). Absent =
   # not triggered on this head (Greptile is on-demand here: greptile.json autoReview []).
-  # `gh api --paginate` emits one object per page, so slurp before selecting.
-  gr_state="absent"; gr_summary=""
-  if cr_raw=$(gh api --paginate "repos/$REPO/commits/$head/check-runs" 2>/dev/null); then
-    gr_json=$(printf '%s' "$cr_raw" | jq -s '[.[].check_runs[]?|select(.app.slug=="greptile-apps" and .name=="Greptile Review")]|last // empty' 2>/dev/null || true)
+  # "Reviewed" needs ALL of: status completed, conclusion success, and the "N files
+  # reviewed, M comments added" summary — a completed check that failed, was cancelled or
+  # skipped is not a review. `gh api --paginate` emits one object per page, so slurp first.
+  gr_state="absent"; gr_summary=""; gr_concl=""
+  if cr_raw=$(gh api --paginate "repos/$REPO/commits/$head/check-runs" 2>/dev/null) && pages_are_checkruns "$cr_raw"; then
+    gr_json=$(printf '%s' "$cr_raw" | jq -s '[.[].check_runs[]?|select(.app.slug=="greptile-apps" and .name=="Greptile Review")]|last // empty' 2>/dev/null) || unknown=1
     if [ -n "$gr_json" ]; then
-      gr_state=$(printf '%s' "$gr_json" | jq -r '.status' 2>/dev/null || echo absent)
+      gr_state=$(printf '%s' "$gr_json" | jq -r '.status // "absent"' 2>/dev/null) || unknown=1
+      gr_concl=$(printf '%s' "$gr_json" | jq -r '.conclusion // ""' 2>/dev/null) || unknown=1
       gr_summary=$(printf '%s' "$gr_json" | jq -r '.output.summary // ""' 2>/dev/null | grep -oE '[0-9]+ files reviewed, [0-9]+ comments added' || true)
     fi
   else
     unknown=1
   fi
-  gr_reviewed=0; [ "$gr_state" = "completed" ] && gr_reviewed=1
+  gr_reviewed=0
+  if [ "$gr_state" = "completed" ] && [ "$gr_concl" = "success" ] && [ -n "$gr_summary" ]; then gr_reviewed=1; fi
+  [ "$gr_state" = "completed" ] && [ "$gr_reviewed" -eq 0 ] && gr_state="completed(${gr_concl:-no-conclusion}, no summary)"
 
   # Signal (d): "equivalent head" — a logic-free merge commit CodeRabbit did not re-review
   # (issue #819). When the head is a merge that only brings in the PR base branch plus
@@ -316,7 +339,7 @@ while [ "$i" -lt "$MAX" ]; do
 
   eqnote=""
   [ "$equiv" -eq 1 ] && eqnote=" equiv=1"
-  echo "try $i: head=${head:0:8} req_fail=$fail req_pend=$pend req_cancel=$cancel mrw_active=$mrw_active cr_reviewed=$cr_reviewed${eqnote} cr_status='${cr_desc:-absent}' greptile=$gr_state${gr_summary:+ ($gr_summary)} live=$live (cr=$cr_live gr=$gr_live)${unknown:+ unknown=$unknown}"
+  echo "try $i: head=${head:0:8} req_fail=$fail req_pend=$pend req_cancel=$cancel mrw_active=$mrw_active cr_reviewed=$cr_reviewed${eqnote} cr_status='${cr_desc:-absent}' greptile=$gr_state${gr_summary:+ ($gr_summary)} live=$live (cr=$cr_live gr=$gr_live cr_unconfirmed=$cr_unconfirmed)${unknown:+ unknown=$unknown}"
 
   # A failed lookup this iteration: defer, do not decide on masked values.
   if [ "$unknown" -ne 0 ]; then sleep "$INTERVAL"; continue; fi
@@ -334,7 +357,7 @@ while [ "$i" -lt "$MAX" ]; do
         sleep "$INTERVAL"; continue
       fi
       if [ "$live" -eq 0 ]; then echo "RESULT=ready"; exit 0; fi
-      echo "RESULT=findings live=$live cr=$cr_live gr=$gr_live"; exit 3
+      echo "RESULT=findings live=$live cr=$cr_live gr=$gr_live cr_unconfirmed=$cr_unconfirmed"; exit 3
     fi
     # CI settled, no review on this head. Is one coming, or must the caller act?
     if [ "$cr_pending" -eq 1 ] || [ "$gr_state" = "in_progress" ] || [ "$gr_state" = "queued" ]; then
