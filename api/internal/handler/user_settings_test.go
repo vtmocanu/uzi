@@ -25,24 +25,26 @@ import (
 // -> respond) without a real database. The
 // SetUserDefaultModel/SetUserDefaultEffort/SetUserJudgeModel/SetUserSummaryModel/SetUserTheme
 // UPDATEs QueryRow a single Text RETURNING column (discarded by the handler) and
-// SetUserSidebarTokens a uuid[] one; GetUserSettings QueryRows eleven (default_model,
+// SetUserSidebarTokens a uuid[] one; GetUserSettings QueryRows twelve (default_model,
 // default_effort, judge_model, summary_model, theme, sidebar_token_ids,
 // mr_rework_enabled, appearance_mode, light_theme, dark_theme, typeface — the four
-// appearance columns joined the read in PRD #1167 M1) — summary_model rides that
+// appearance columns joined the read in PRD #1167 M1 — and default_harness, which joined
+// in PRD #1429 M1) — summary_model rides that
 // one-row read, so the settings handler makes no separate GetUserSummaryModel call.
 // The UPDATE paths record the written value so the round-trip is observable.
 type fakeSettingsDB struct {
-	model      pgtype.Text
-	effort     pgtype.Text
-	judge      pgtype.Text
-	summary    pgtype.Text
-	theme      pgtype.Text
-	mrRework   pgtype.Bool
-	sidebarIDs []uuid.UUID
-	apprMode   pgtype.Text
-	lightTheme pgtype.Text
-	darkTheme  pgtype.Text
-	typeface   pgtype.Text
+	model          pgtype.Text
+	effort         pgtype.Text
+	judge          pgtype.Text
+	summary        pgtype.Text
+	theme          pgtype.Text
+	mrRework       pgtype.Bool
+	sidebarIDs     []uuid.UUID
+	apprMode       pgtype.Text
+	lightTheme     pgtype.Text
+	darkTheme      pgtype.Text
+	typeface       pgtype.Text
+	defaultHarness pgtype.Text
 }
 
 func (f *fakeSettingsDB) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
@@ -83,6 +85,10 @@ func (f *fakeSettingsDB) QueryRow(_ context.Context, sql string, args ...any) pg
 		if ids, ok := args[0].([]uuid.UUID); ok {
 			f.sidebarIDs = ids // SetUserSidebarTokens: $1 = sidebar_token_ids
 		}
+	case strings.Contains(sql, "UPDATE users SET default_harness") && len(args) >= 1:
+		if h, ok := args[0].(pgtype.Text); ok {
+			f.defaultHarness = h // SetUserDefaultHarness: $1 = default_harness (PRD #1429 M1)
+		}
 	case strings.Contains(sql, "SET appearance_mode") && len(args) >= 8:
 		// SetUserAppearance PATCHes the four columns in one conditional UPDATE
 		// (PRD #1167 M2): $1=set_mode(bool), $2=appearance_mode, $3=set_light,
@@ -111,32 +117,34 @@ func (f *fakeSettingsDB) QueryRow(_ context.Context, sql string, args ...any) pg
 		}
 	}
 	return fakeSettingsRow{
-		model:      f.model,
-		effort:     f.effort,
-		judge:      f.judge,
-		summary:    f.summary,
-		theme:      f.theme,
-		mrRework:   f.mrRework,
-		sidebarIDs: f.sidebarIDs,
-		apprMode:   f.apprMode,
-		lightTheme: f.lightTheme,
-		darkTheme:  f.darkTheme,
-		typeface:   f.typeface,
+		model:          f.model,
+		effort:         f.effort,
+		judge:          f.judge,
+		summary:        f.summary,
+		theme:          f.theme,
+		mrRework:       f.mrRework,
+		sidebarIDs:     f.sidebarIDs,
+		apprMode:       f.apprMode,
+		lightTheme:     f.lightTheme,
+		darkTheme:      f.darkTheme,
+		typeface:       f.typeface,
+		defaultHarness: f.defaultHarness,
 	}
 }
 
 type fakeSettingsRow struct {
-	model      pgtype.Text
-	effort     pgtype.Text
-	judge      pgtype.Text
-	summary    pgtype.Text
-	theme      pgtype.Text
-	mrRework   pgtype.Bool
-	sidebarIDs []uuid.UUID
-	apprMode   pgtype.Text
-	lightTheme pgtype.Text
-	darkTheme  pgtype.Text
-	typeface   pgtype.Text
+	model          pgtype.Text
+	effort         pgtype.Text
+	judge          pgtype.Text
+	summary        pgtype.Text
+	theme          pgtype.Text
+	mrRework       pgtype.Bool
+	sidebarIDs     []uuid.UUID
+	apprMode       pgtype.Text
+	lightTheme     pgtype.Text
+	darkTheme      pgtype.Text
+	typeface       pgtype.Text
+	defaultHarness pgtype.Text
 }
 
 func (r fakeSettingsRow) Scan(dest ...any) error {
@@ -166,11 +174,12 @@ func (r fakeSettingsRow) Scan(dest ...any) error {
 		if p, ok := dest[3].(*pgtype.Text); ok {
 			*p = r.typeface
 		}
-	case 11:
+	case 12:
 		// GetUserSettings: SELECT default_model, default_effort, judge_model,
 		// summary_model, theme, sidebar_token_ids, mr_rework_enabled,
-		// appearance_mode, light_theme, dark_theme, typeface (the last four are
-		// PRD #1167 M1's appearance columns riding the same one-row read).
+		// appearance_mode, light_theme, dark_theme, typeface, default_harness (the
+		// last four before default_harness are PRD #1167 M1's appearance columns; the
+		// trailing default_harness rides the same one-row read as of PRD #1429 M1).
 		if p, ok := dest[0].(*pgtype.Text); ok {
 			*p = r.model
 		}
@@ -203,6 +212,9 @@ func (r fakeSettingsRow) Scan(dest ...any) error {
 		}
 		if p, ok := dest[10].(*pgtype.Text); ok {
 			*p = r.typeface
+		}
+		if p, ok := dest[11].(*pgtype.Text); ok {
+			*p = r.defaultHarness
 		}
 	}
 	return nil
@@ -1284,5 +1296,82 @@ func TestPutMySettingsModelOnlyLeavesAppearanceUntouched(t *testing.T) {
 	}
 	if !db.apprMode.Valid || db.apprMode.String != "light" {
 		t.Fatalf("appearance_mode must be untouched by a model-only PUT, got %+v", db.apprMode)
+	}
+}
+
+// decodeDefaultHarness pulls settings.default_harness out of a settings response.
+func decodeDefaultHarness(t *testing.T, body []byte) *string {
+	t.Helper()
+	var resp struct {
+		Settings struct {
+			DefaultHarness *string `json:"default_harness"`
+		} `json:"settings"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatalf("decode settings response %s: %v", body, err)
+	}
+	return resp.Settings.DefaultHarness
+}
+
+// PRD #1429 M1 (D3): a NULL default_harness column ("no preference") serializes as JSON null.
+func TestGetMySettingsNullDefaultHarnessSerializesAsNull(t *testing.T) {
+	h := &Handler{q: store.New(&fakeSettingsDB{})} // defaultHarness zero ⇒ NULL
+	rec := httptest.NewRecorder()
+	h.GetMySettings(rec, authed(httptest.NewRequest(http.MethodGet, "/api/me/settings", nil)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if got := decodeDefaultHarness(t, rec.Body.Bytes()); got != nil {
+		t.Fatalf("default_harness = %v, want null (no preference)", *got)
+	}
+}
+
+// PRD #1429 M1 (D3): PUT of a valid harness stores it and round-trips it back; a present-null
+// clears it to NULL ("no preference").
+func TestPutMySettingsDefaultHarnessRoundTrip(t *testing.T) {
+	db := &fakeSettingsDB{}
+	h := &Handler{q: store.New(db)}
+
+	rec := httptest.NewRecorder()
+	req := authed(httptest.NewRequest(http.MethodPut, "/api/me/settings", bytes.NewReader([]byte(`{"default_harness":"codex"}`))))
+	h.PutMySettings(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("set codex: status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if got := decodeDefaultHarness(t, rec.Body.Bytes()); got == nil || *got != "codex" {
+		t.Fatalf("response default_harness = %v, want codex", got)
+	}
+	if !db.defaultHarness.Valid || db.defaultHarness.String != "codex" {
+		t.Fatalf("stored default_harness = %+v, want a set codex", db.defaultHarness)
+	}
+
+	// present-null clears back to NULL.
+	rec = httptest.NewRecorder()
+	req = authed(httptest.NewRequest(http.MethodPut, "/api/me/settings", bytes.NewReader([]byte(`{"default_harness":null}`))))
+	h.PutMySettings(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("clear: status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if got := decodeDefaultHarness(t, rec.Body.Bytes()); got != nil {
+		t.Fatalf("response default_harness after clear = %v, want null", *got)
+	}
+	if db.defaultHarness.Valid {
+		t.Fatalf("stored default_harness after clear = %+v, want NULL", db.defaultHarness)
+	}
+}
+
+// PRD #1429 M1 (D3): an out-of-vocabulary harness is a 400 that writes nothing (validateHarness
+// accepts only claude|codex).
+func TestPutMySettingsRejectsInvalidDefaultHarness(t *testing.T) {
+	db := &fakeSettingsDB{}
+	h := &Handler{q: store.New(db)}
+	rec := httptest.NewRecorder()
+	req := authed(httptest.NewRequest(http.MethodPut, "/api/me/settings", bytes.NewReader([]byte(`{"default_harness":"gpt"}`))))
+	h.PutMySettings(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 for an invalid harness; body=%s", rec.Code, rec.Body.String())
+	}
+	if db.defaultHarness.Valid {
+		t.Fatalf("a rejected harness must write nothing, got %+v", db.defaultHarness)
 	}
 }

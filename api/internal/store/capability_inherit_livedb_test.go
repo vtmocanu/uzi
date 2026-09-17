@@ -91,6 +91,7 @@ func assertPathsInherit(ctx context.Context, t *testing.T, q *store.Queries, poo
 	taskID := uuid.New()
 	taskBranch := "uzi/task/" + taskID.String()
 	taskRun, err := q.CreateTaskRun(ctx, store.CreateTaskRunParams{
+		Harness:          "claude", // PRD #1429 M1: harness is now a required @harness param.
 		RunID:            taskID,
 		UserID:           userID,
 		RepoID:           repoID,
@@ -106,6 +107,7 @@ func assertPathsInherit(ctx context.Context, t *testing.T, q *store.Queries, poo
 	// CreateTaskReviewRun — a review of the task run above (non-null target FK).
 	reviewID := uuid.New()
 	reviewRun, err := q.CreateTaskReviewRun(ctx, store.CreateTaskReviewRunParams{
+		Harness:     "claude", // PRD #1429 M1: harness is now a required @harness param.
 		RunID:       reviewID,
 		UserID:      userID,
 		RepoID:      repoID,
@@ -121,6 +123,7 @@ func assertPathsInherit(ctx context.Context, t *testing.T, q *store.Queries, poo
 	// CreateThenFixRun — a fix derived from the task run above (non-null then_fix FK).
 	fixID := uuid.New()
 	fixRun, err := q.CreateThenFixRun(ctx, store.CreateThenFixRunParams{
+		Harness:          "claude", // PRD #1429 M1: harness is now a required @harness param.
 		RunID:            fixID,
 		UserID:           userID,
 		RepoID:           repoID,
@@ -137,6 +140,7 @@ func assertPathsInherit(ctx context.Context, t *testing.T, q *store.Queries, poo
 	// CreateCIFixRun — pipeline_ref is unique per repo so the one-active-ci_fix index
 	// never collides across the two repos.
 	ciFixRun, err := q.CreateCIFixRun(ctx, store.CreateCIFixRunParams{
+		Harness:          "claude", // PRD #1429 M1: harness is now a required @harness param.
 		UserID:           userID,
 		RepoID:           repoID,
 		IssueTitle:       "ci fix",
@@ -161,6 +165,7 @@ func assertPathsInherit(ctx context.Context, t *testing.T, q *store.Queries, poo
 		 VALUES ($1, $2, $3, 'prompt', 'do the thing', 'recurring', '0 0 * * *')`,
 		scheduleID, userID, repoID)
 	promptRun, err := q.CreatePromptRun(ctx, store.CreatePromptRunParams{
+		Harness:          "claude", // PRD #1429 M1: harness is now a required @harness param.
 		UserID:           userID,
 		RepoID:           repoID,
 		IssueTitle:       "prompt",
@@ -181,6 +186,7 @@ func assertPathsInherit(ctx context.Context, t *testing.T, q *store.Queries, poo
 	// marking each run terminal before the next create — otherwise the second call's INSERT
 	// trips a 23505 unique violation rather than testing the caps inheritance.
 	selfRun, err := q.CreateSelfImproveRun(ctx, store.CreateSelfImproveRunParams{
+		Harness:          "claude", // PRD #1429 M1: harness is now a required @harness param.
 		UserID:           userID,
 		RepoID:           repoID,
 		IssueIid:         pgtype.Int8{Int64: 7, Valid: true},

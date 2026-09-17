@@ -42,6 +42,9 @@ import { secrets } from "./secrets";
 // Bumped to v4 for PRD #1167 "Lights on" m2 (the four appearance override fields joined
 // UserSettings, the four default_* appearance fields joined AppSettings): a stale v3
 // blob lacks them, so discarding it re-seeds a complete shape.
+// PRD #1429 M1 (default_harness joined UserSettings) does NOT bump the key: default_harness
+// is validated tolerantly (undefined/null/string, like default_effort/judge_model) and
+// merged over the SEED on load, so a stale v4 blob stays valid and reads default_harness=null.
 const MOCK_SETTINGS_KEY = "uzi.mock.v4";
 const SEED_USER_SETTINGS: UserSettings = {
   default_model: null,
@@ -59,6 +62,8 @@ const SEED_USER_SETTINGS: UserSettings = {
   // PRD #700 M6: MR review watcher per-user opt-in. null = the default-ON state;
   // an explicit false opts the account out.
   mr_rework_enabled: null,
+  // PRD #1429 M1 (D3): per-user default harness; null = no preference (falls through D11).
+  default_harness: null,
 };
 const SEED_APP_SETTINGS: AppSettings = {
   autopilot_label: "autopilot",
@@ -158,6 +163,9 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
     (u.mr_rework_enabled === undefined ||
       u.mr_rework_enabled === null ||
       typeof u.mr_rework_enabled === "boolean") &&
+    // PRD #1429 M1: optional so a pre-feature blob stays valid; absent/null reads as "no
+    // preference" and the SEED fills default_harness=null on load (no key bump needed).
+    (u.default_harness === undefined || u.default_harness === null || typeof u.default_harness === "string") &&
     // Optional so a pre-feature blob stays valid; absent reads as default-only.
     (u.sidebar_token_ids === undefined ||
       (Array.isArray(u.sidebar_token_ids) &&

@@ -156,9 +156,11 @@ WHERE repo_id = @repo_id::uuid AND ref <> ALL(@keep_refs::text[]);
 -- mr_rework DUPLICATE (same pipeline_ref) now proceeds PAST this predicate — it is no
 -- longer swallowed as a false branch conflict — and is rejected by the
 -- uq_runs_one_active_mr_rework (repo_id, mr_iid) index → 23505 → ErrActiveMRReworkExists.
--- harness (PRD #1332 M5A / D2): SQL literal 'claude' in the SELECT list, not a param — an
--- mr_rework run is a Claude production origin, and the literal defeats the DEFAULT-masks-
--- omission trap. Keep in sync with CreateManualMRReworkRunAndAdvance's body below.
+-- harness (PRD #1429 M1, was #1332 M5A / D2): now the @harness PARAMETER supplied by the M5B
+-- create seam (workersvc.createRunAtomic) in the SELECT list, not the SQL literal 'claude'. A
+-- derived mr_rework inherits its source run's harness as an explicit selection (D4); M2 wires
+-- that real value. Every current caller passes string(HarnessClaude) as a mechanical stopgap.
+-- Keep in sync with CreateManualMRReworkRunAndAdvance's body below.
 INSERT INTO runs (
     user_id, repo_id, kind, issue_title, issue_description,
     pipeline_ref, mr_iid, target_run_id, review_comments, auto_approve, wait_on_limit, required_capabilities, trigger_source, harness
@@ -166,7 +168,7 @@ INSERT INTO runs (
 SELECT
     @user_id, @repo_id::uuid, 'mr_rework', @issue_title, @issue_description,
     @pipeline_ref, @mr_iid, @target_run_id, sqlc.narg('review_comments')::jsonb, true, @wait_on_limit,
-    COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), @trigger_source, 'claude'
+    COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), @trigger_source, @harness
 WHERE NOT EXISTS (
     SELECT 1 FROM runs
     WHERE repo_id = @repo_id::uuid
@@ -217,8 +219,9 @@ INSERT INTO runs (
 SELECT
     @user_id, @repo_id::uuid, 'mr_rework', @issue_title, @issue_description,
     @pipeline_ref, @mr_iid, @target_run_id, sqlc.narg('review_comments')::jsonb, true, @wait_on_limit,
-    -- harness (PRD #1332 M5A / D2): SQL literal 'claude', mirroring CreateAutoMRReworkRun.
-    COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), 'manual', 'claude'
+    -- harness (PRD #1429 M1, was #1332 M5A / D2): the @harness PARAMETER, mirroring
+    -- CreateAutoMRReworkRun. Every current caller passes string(HarnessClaude) as a stopgap.
+    COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), 'manual', @harness
 WHERE NOT EXISTS (
     SELECT 1 FROM runs
     WHERE repo_id = @repo_id::uuid

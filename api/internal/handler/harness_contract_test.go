@@ -2,119 +2,122 @@ package handler
 
 import (
 	"context"
-	"net/http"
-	"net/http/httptest"
+	"errors"
 	"strings"
 	"testing"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
-	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
-// harness_contract_test.go is the PRD #1332 (M5A / D7) negative acceptance for the dark
-// harness boundary: a raw request body carrying a `harness` field to a public
-// creation path MUST be rejected as an UNKNOWN field (HTTP 400), because the request
-// structs have no `harness` member and httpx.DecodeJSON{,Limited} set
-// DisallowUnknownFields. A raw API client sending {"harness":"codex"} therefore gets a
-// 400, so adding the field later (M5B) is a real contract change, not a silently-ignored
-// one. Each case is paired with a control body (same shape, no harness) that gets PAST
-// the decoder to a DIFFERENT 400, proving the rejection is specifically the harness key
-// and not a generic malformation.
+// harness_contract_test.go is the PRD #1429 (M1 / D2, D5) POSITIVE acceptance for the harness
+// seam, replacing M5A's dark unknown-field NEGATIVES (which asserted a public creation body
+// carrying `harness` was rejected at decode). M1 builds the seam but deliberately does NOT wire
+// the production handlers to accept `harness` — that is M2/M3 — so the contract this file pins
+// now is the #1247 EFFECTIVE-HARNESS override rule (D5), the one exported seam meaningfully
+// testable at this layer: workersvc.ResolveCredentialOverride REFUSES an Anthropic override when
+// the effective harness is Codex (a typed 422) and ACCEPTS it when the effective harness is
+// Claude. "Effective harness" is the exact D11 result the create transaction resolves —
+// createRunAtomic hands the insert closure that harness, so the M2 handler validates the override
+// against it, NOT against users.default_harness. So the two #1247 cases (an explicit-Claude
+// request that has a Codex default; an unusable-Codex-default that falls through to Claude) both
+// reduce to "effective harness = claude → accept" here.
+//
+// The resolver's enum-acceptance / explicit-unavailable(no_credential_for_harness) /
+// implicit-fallback matrix and the atomic freeze/rollback are proven end to end against a real
+// Postgres in workersvc's create_run_atomic_livedb_test.go + harness_resolver_livedb_test.go.
 
-// harnessContractDB answers only GetRepoForUser so repoForRequest (which runs BEFORE the
-// body decode in both handlers) succeeds; the returned row is left zero because neither
-// the decode-reject case nor the control case reads a repo field. Any other query is a
-// test failure — it would mean the handler advanced past the point these tests probe.
-type harnessContractDB struct{ t *testing.T }
+// overrideContractDB answers ONLY GetUserSecretMetaByIDOfKind (the owner-scoped pinned-token
+// lookup ResolveCredentialOverride makes for a pinned request) as a HIT, so a pinned Anthropic
+// override on a Claude harness resolves to a real override. Any other query is a test failure —
+// it would mean the validator advanced somewhere these tests do not probe.
+type overrideContractDB struct{ t *testing.T }
 
-func (harnessContractDB) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
+func (overrideContractDB) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
 	return pgconn.CommandTag{}, nil
 }
 
-func (harnessContractDB) Query(context.Context, string, ...any) (pgx.Rows, error) {
+func (overrideContractDB) Query(context.Context, string, ...any) (pgx.Rows, error) {
 	return nil, pgx.ErrNoRows
 }
 
-func (d harnessContractDB) QueryRow(_ context.Context, sql string, _ ...any) pgx.Row {
-	if strings.Contains(sql, "name: GetRepoForUser") {
-		// A repo the caller owns: err==nil with a zero row is all repoForRequest needs.
+func (d overrideContractDB) QueryRow(_ context.Context, sql string, _ ...any) pgx.Row {
+	if strings.Contains(sql, "name: GetUserSecretMetaByIDOfKind") {
+		// A token the caller owns of kind anthropic_token: err==nil (the row is discarded by
+		// ResolveCredentialOverride, which only distinguishes found vs pgx.ErrNoRows).
 		return fakeScanRow{func(...any) error { return nil }}
 	}
-	d.t.Errorf("unexpected query reached after the point under test: %s", sql)
+	d.t.Errorf("unexpected query reached: %s", sql)
 	return fakeScanRow{func(...any) error { return pgx.ErrNoRows }}
 }
 
-// repoScopedReq builds a repo-scoped POST with the caller in context and the chi {id}
-// URL param set to a fresh repo UUID, so repoForRequest resolves.
-func repoScopedReq(body string) *http.Request {
-	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
-	rctx := chi.NewRouteContext()
-	rctx.URLParams.Add("id", uuid.New().String())
-	ctx := context.WithValue(req.Context(), chi.RouteCtxKey, rctx)
-	return req.WithContext(mw.ContextWithUser(ctx, store.User{ID: uuid.New(), IsActive: true}))
+func overrideContractService(t *testing.T) *workersvc.Service {
+	return workersvc.New(store.New(overrideContractDB{t: t}), nil, workersvc.Params{})
 }
 
-// TestCreateRunRejectsHarnessField: POST issue-run start with {"harness":"codex", ...}
-// is a 400 unknown-field decode error, while the same body without harness gets past the
-// decoder to the issue_iid validation 400 — so the harness key is what the decoder
-// rejects.
-func TestCreateRunRejectsHarnessField(t *testing.T) {
-	h := &Handler{q: store.New(harnessContractDB{t: t})}
+// TestResolveCredentialOverrideCodexRefused: an effective Codex harness refuses an Anthropic
+// override with the typed sentinel the handler maps to 422 (D5/D9), for EVERY mode — the harness
+// check precedes the per-mode secret lookup, so even inherit or auto on a Codex run is refused
+// rather than silently clearing/accepting. Codex is a separate runtime and no cross-harness
+// resume exists, so an Anthropic-only override on a Codex run is an explicit error, not a no-op.
+func TestResolveCredentialOverrideCodexRefused(t *testing.T) {
+	svc := overrideContractService(t)
+	userID := uuid.New()
+	secretID := uuid.New()
 
-	rec := httptest.NewRecorder()
-	h.CreateRun(rec, repoScopedReq(`{"harness":"codex","issue_iid":123}`))
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400 for an unknown harness field; body=%s", rec.Code, rec.Body.String())
-	}
-	if !strings.Contains(rec.Body.String(), "invalid request body") {
-		t.Fatalf("body = %s, want the decode-level 'invalid request body' (proving the harness field was rejected at decode)", rec.Body.String())
-	}
-
-	// Control: identical shape minus harness decodes fine and fails LATER, at the
-	// issue_iid check — a different 400, so the harness key is the decode cause.
-	ctrl := httptest.NewRecorder()
-	h.CreateRun(ctrl, repoScopedReq(`{"issue_iid":0}`))
-	if ctrl.Code != http.StatusBadRequest {
-		t.Fatalf("control status = %d, want 400; body=%s", ctrl.Code, ctrl.Body.String())
-	}
-	if strings.Contains(ctrl.Body.String(), "invalid request body") {
-		t.Fatalf("control body = %s, must NOT be the decode error — a harness-free body must decode", ctrl.Body.String())
-	}
-	if !strings.Contains(ctrl.Body.String(), "issue_iid must be a positive integer") {
-		t.Fatalf("control body = %s, want the issue_iid validation 400", ctrl.Body.String())
+	for _, mode := range []string{
+		workersvc.CredentialOverrideModePinned,
+		workersvc.CredentialOverrideModeInherit,
+		workersvc.CredentialOverrideModeAuto,
+		workersvc.CredentialOverrideModeDefault,
+	} {
+		_, err := svc.ResolveCredentialOverride(context.Background(), userID, "issue", string(workersvc.HarnessCodex), mode, &secretID)
+		if !errors.Is(err, workersvc.ErrCredentialOverrideHarnessUnsupported) {
+			t.Fatalf("mode %q on codex harness: err = %v, want ErrCredentialOverrideHarnessUnsupported (422)", mode, err)
+		}
 	}
 }
 
-// TestCreateScheduleRejectsHarnessField: POST schedule-create with {"harness":"codex", ...}
-// is a 400 unknown-field decode error, while a harness-free body gets past the decoder to
-// schedule-config validation (a different 400).
-func TestCreateScheduleRejectsHarnessField(t *testing.T) {
-	h := &Handler{q: store.New(harnessContractDB{t: t})}
+// TestResolveCredentialOverrideClaudeAccepts pins the #1247 effective-harness cases (D5): when
+// the D11 result is Claude, a valid Anthropic override is accepted — a pinned override resolves
+// to the owned token, auto/default resolve to their mode, and inherit clears to nil. This is the
+// exact acceptance an explicit-Claude-with-a-Codex-default request and an unusable-Codex-default
+// falling through to Claude both get, because the seam feeds ResolveCredentialOverride the
+// resolved harness rather than the stored default.
+func TestResolveCredentialOverrideClaudeAccepts(t *testing.T) {
+	svc := overrideContractService(t)
+	userID := uuid.New()
+	secretID := uuid.New()
+	claude := string(workersvc.HarnessClaude)
 
-	rec := httptest.NewRecorder()
-	h.CreateSchedule(rec, repoScopedReq(`{"harness":"codex","target":"issue","timing":"daily","issue_iid":1}`))
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400 for an unknown harness field; body=%s", rec.Code, rec.Body.String())
+	// pinned: the owned anthropic token resolves to a pinned override.
+	ov, err := svc.ResolveCredentialOverride(context.Background(), userID, "issue", claude, workersvc.CredentialOverrideModePinned, &secretID)
+	if err != nil {
+		t.Fatalf("pinned override on claude harness: %v", err)
 	}
-	if !strings.Contains(rec.Body.String(), "invalid request body") {
-		t.Fatalf("body = %s, want the decode-level 'invalid request body'", rec.Body.String())
+	if ov == nil || ov.Mode != workersvc.CredentialOverrideModePinned || ov.SecretID == nil || *ov.SecretID != secretID {
+		t.Fatalf("pinned override = %+v, want {pinned, %s}", ov, secretID)
 	}
 
-	// Control: a harness-free body decodes fine and fails LATER, in validateScheduleConfig.
-	ctrl := httptest.NewRecorder()
-	h.CreateSchedule(ctrl, repoScopedReq(`{}`))
-	if ctrl.Code != http.StatusBadRequest {
-		t.Fatalf("control status = %d, want 400; body=%s", ctrl.Code, ctrl.Body.String())
+	// auto: accepted, no secret lookup.
+	ov, err = svc.ResolveCredentialOverride(context.Background(), userID, "issue", claude, workersvc.CredentialOverrideModeAuto, nil)
+	if err != nil {
+		t.Fatalf("auto override on claude harness: %v", err)
 	}
-	if strings.Contains(ctrl.Body.String(), "invalid request body") {
-		t.Fatalf("control body = %s, must NOT be the decode error — a harness-free body must decode", ctrl.Body.String())
+	if ov == nil || ov.Mode != workersvc.CredentialOverrideModeAuto {
+		t.Fatalf("auto override = %+v, want {auto}", ov)
 	}
-	if !strings.Contains(ctrl.Body.String(), "target must be one of") {
-		t.Fatalf("control body = %s, want the schedule-config validation 400", ctrl.Body.String())
+
+	// inherit: accepted, and clears both columns (a nil override).
+	ov, err = svc.ResolveCredentialOverride(context.Background(), userID, "issue", claude, workersvc.CredentialOverrideModeInherit, nil)
+	if err != nil {
+		t.Fatalf("inherit override on claude harness: %v", err)
+	}
+	if ov != nil {
+		t.Fatalf("inherit override = %+v, want nil (inherit clears both columns)", ov)
 	}
 }

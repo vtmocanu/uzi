@@ -92,7 +92,8 @@ func TestChatRunsLiveDB(t *testing.T) {
 
 	// ── claim lanes are disjoint: an issue run + the chat run above ──
 	issueRun, err := q.CreateRun(ctx, store.CreateRunParams{
-		UserID: userID, RepoID: repoID,
+		Harness: "claude", // PRD #1429 M1: harness is now a required @harness param.
+		UserID:  userID, RepoID: repoID,
 		IssueIid: pgtype.Int8{Int64: 42, Valid: true}, IssueTitle: "iss", IssueDescription: "d", PlanSource: "agent", TriggerSource: "manual",
 	})
 	if err != nil {

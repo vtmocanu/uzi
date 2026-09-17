@@ -58,6 +58,7 @@ export const chatApi = {
       issue_iid: null,
       issue_title: truncateChatTitle(message),
       issue_description: "",
+      harness: "claude", // PRD #1429 M1: runs.harness is now on RunDTO (NOT NULL, default claude).
       title: truncateChatTitle(message),
       resume_of_run_id: null,
       status: "running",

@@ -61,6 +61,7 @@ function aRun(over: Partial<RunListItem> = {}): RunListItem {
     issue_iid: 7,
     issue_title: "Live run row",
     issue_description: "",
+    harness: "claude", // PRD #1429 M1: harness joined RunDTO (NOT NULL, default claude).
     title: null,
     resume_of_run_id: null,
     status: "running",
@@ -202,9 +203,18 @@ beforeEach(() => {
   });
 });
 
-const zeros = () => ({ input_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0, output_tokens: 0, cost_usd: 0 });
+const zeros = () => ({ input_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0, output_tokens: 0, cost_usd: 0, cost_status: "" as const });
 function emptySelf() {
-  return { lifetime: zeros(), last_7_days: zeros(), run_count: 0 };
+  // PRD #1429 M1 (D7): the per-window subscription/unreported run counts (0 for empty usage).
+  return {
+    lifetime: zeros(),
+    last_7_days: zeros(),
+    run_count: 0,
+    lifetime_subscription_run_count: 0,
+    lifetime_unreported_run_count: 0,
+    last7_subscription_run_count: 0,
+    last7_unreported_run_count: 0,
+  };
 }
 
 afterEach(() => {
@@ -408,17 +418,23 @@ describe("Dashboard usage cards (PRD #40)", () => {
     cache_creation_tokens: 0,
     output_tokens: out,
     cost_usd: cost,
+    // PRD #1429 M1 (D7): these mock bundles are metered (a real dollar total).
+    cost_status: "metered" as const,
   });
   const selfWithUsage = {
     lifetime: bundle(1_610_000, 16_100_000, 710_000, 26.4),
     last_7_days: bundle(200_000, 2_800_000, 100_000, 4.55),
     run_count: 23,
+    lifetime_subscription_run_count: 0,
+    lifetime_unreported_run_count: 0,
+    last7_subscription_run_count: 0,
+    last7_unreported_run_count: 0,
   };
   const adminUsage = {
-    factory: { lifetime: bundle(5_400_000, 53_900_000, 2_400_000, 88.15), last_7_days: zeros(), run_count: 79 },
+    factory: { lifetime: bundle(5_400_000, 53_900_000, 2_400_000, 88.15), last_7_days: zeros(), run_count: 79, lifetime_subscription_run_count: 0, lifetime_unreported_run_count: 0, last7_subscription_run_count: 0, last7_unreported_run_count: 0 },
     users: [
-      { user_id: "a", email: "vlad@example.com", usage: bundle(1_610_000, 16_100_000, 710_000, 26.4), run_count: 23 },
-      { user_id: "b", email: "maria@example.com", usage: bundle(2_490_000, 21_400_000, 1_020_000, 37.83), run_count: 31 },
+      { user_id: "a", email: "vlad@example.com", usage: bundle(1_610_000, 16_100_000, 710_000, 26.4), run_count: 23, subscription_run_count: 0, unreported_run_count: 0 },
+      { user_id: "b", email: "maria@example.com", usage: bundle(2_490_000, 21_400_000, 1_020_000, 37.83), run_count: 31, subscription_run_count: 0, unreported_run_count: 0 },
     ],
     earliest_run: "2026-05-12T09:00:00Z",
   };

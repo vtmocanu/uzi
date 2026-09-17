@@ -245,6 +245,7 @@ export const runsApi = {
       issue_iid: issueIid,
       issue_title: card.title,
       issue_description: "See the linked PRD.",
+      harness: "claude", // PRD #1429 M1: runs.harness is now on RunDTO (NOT NULL, default claude).
       title: null,
       resume_of_run_id: null,
       status: "queued",
@@ -323,6 +324,7 @@ export const runsApi = {
       issue_iid: null,
       issue_title: `Fix CI: ${ref} pipeline`,
       issue_description: `Diagnose and fix the failed pipeline for \`${ref}\`.`,
+      harness: "claude", // PRD #1429 M1: runs.harness is now on RunDTO (NOT NULL, default claude).
       title: null,
       resume_of_run_id: null,
       status: "queued",
@@ -404,22 +406,32 @@ export const runsApi = {
   // dashboard's "Your usage" and (admin) factory cards + per-user table.
   getUsage: async () =>
     delay({
-      lifetime: { input_tokens: 1_610_000, cache_read_tokens: 16_100_000, cache_creation_tokens: 240_000, output_tokens: 710_000, cost_usd: 26.4 },
-      last_7_days: { input_tokens: 280_000, cache_read_tokens: 2_800_000, cache_creation_tokens: 40_000, output_tokens: 120_000, cost_usd: 4.55 },
+      // PRD #1429 M1 (D7): the per-window cost_status ("metered" on these demo bundles) and
+      // the subscription/unreported run counts (0 here — all demo runs are metered).
+      lifetime: { input_tokens: 1_610_000, cache_read_tokens: 16_100_000, cache_creation_tokens: 240_000, output_tokens: 710_000, cost_usd: 26.4, cost_status: "" as const },
+      last_7_days: { input_tokens: 280_000, cache_read_tokens: 2_800_000, cache_creation_tokens: 40_000, output_tokens: 120_000, cost_usd: 4.55, cost_status: "" as const },
       run_count: 23,
+      lifetime_subscription_run_count: 0,
+      lifetime_unreported_run_count: 0,
+      last7_subscription_run_count: 0,
+      last7_unreported_run_count: 0,
     }),
   getAdminUsage: async () =>
     delay({
       factory: {
-        lifetime: { input_tokens: 5_400_000, cache_read_tokens: 53_900_000, cache_creation_tokens: 900_000, output_tokens: 2_400_000, cost_usd: 88.15 },
-        last_7_days: { input_tokens: 900_000, cache_read_tokens: 9_100_000, cache_creation_tokens: 120_000, output_tokens: 410_000, cost_usd: 14.9 },
+        lifetime: { input_tokens: 5_400_000, cache_read_tokens: 53_900_000, cache_creation_tokens: 900_000, output_tokens: 2_400_000, cost_usd: 88.15, cost_status: "" as const },
+        last_7_days: { input_tokens: 900_000, cache_read_tokens: 9_100_000, cache_creation_tokens: 120_000, output_tokens: 410_000, cost_usd: 14.9, cost_status: "" as const },
         run_count: 79,
+        lifetime_subscription_run_count: 0,
+        lifetime_unreported_run_count: 0,
+        last7_subscription_run_count: 0,
+        last7_unreported_run_count: 0,
       },
       users: [
-        { user_id: "u-maria", email: "maria@example.com", usage: { input_tokens: 2_490_000, cache_read_tokens: 22_400_000, cache_creation_tokens: 400_000, output_tokens: 1_020_000, cost_usd: 37.83 }, run_count: 31 },
-        { user_id: "u-vlad", email: "vlad@example.com", usage: { input_tokens: 1_610_000, cache_read_tokens: 16_100_000, cache_creation_tokens: 240_000, output_tokens: 710_000, cost_usd: 26.4 }, run_count: 23 },
-        { user_id: "u-andrei", email: "andrei@example.com", usage: { input_tokens: 1_010_000, cache_read_tokens: 13_600_000, cache_creation_tokens: 210_000, output_tokens: 550_000, cost_usd: 19.71 }, run_count: 19 },
-        { user_id: "u-dana", email: "dana@example.com", usage: { input_tokens: 290_000, cache_read_tokens: 3_500_000, cache_creation_tokens: 50_000, output_tokens: 120_000, cost_usd: 4.21 }, run_count: 6 },
+        { user_id: "u-maria", email: "maria@example.com", usage: { input_tokens: 2_490_000, cache_read_tokens: 22_400_000, cache_creation_tokens: 400_000, output_tokens: 1_020_000, cost_usd: 37.83, cost_status: "metered" as const }, run_count: 31, subscription_run_count: 0, unreported_run_count: 0 },
+        { user_id: "u-vlad", email: "vlad@example.com", usage: { input_tokens: 1_610_000, cache_read_tokens: 16_100_000, cache_creation_tokens: 240_000, output_tokens: 710_000, cost_usd: 26.4, cost_status: "metered" as const }, run_count: 23, subscription_run_count: 0, unreported_run_count: 0 },
+        { user_id: "u-andrei", email: "andrei@example.com", usage: { input_tokens: 1_010_000, cache_read_tokens: 13_600_000, cache_creation_tokens: 210_000, output_tokens: 550_000, cost_usd: 19.71, cost_status: "metered" as const }, run_count: 19, subscription_run_count: 0, unreported_run_count: 0 },
+        { user_id: "u-dana", email: "dana@example.com", usage: { input_tokens: 290_000, cache_read_tokens: 3_500_000, cache_creation_tokens: 50_000, output_tokens: 120_000, cost_usd: 4.21, cost_status: "metered" as const }, run_count: 6, subscription_run_count: 0, unreported_run_count: 0 },
       ],
       earliest_run: "2026-05-12T09:00:00Z",
     }),
@@ -528,6 +540,7 @@ export const runsApi = {
       issue_iid: null,
       issue_web_url: null,
       issue_description: g ? `On-demand MR rework.\n\nGuidance:\n${g}` : "On-demand MR rework.",
+      harness: "claude", // PRD #1429 M1: runs.harness is now on RunDTO (NOT NULL, default claude).
       requeue_count: 0,
       iteration_count: 0,
       // A fresh manual rework has no automatic-loop guard readings of its own.

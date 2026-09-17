@@ -126,6 +126,10 @@ func (s *Service) CreateTaskRun(ctx context.Context, userID, repoID uuid.UUID, i
 		IssueDescription:    inlineContext,
 		BudgetWallSeconds:   budgetWall,
 		BudgetMaxIterations: budgetIters,
+		// PRD #1429 M1 stopgap: harness is now the @harness param (was the SQL literal
+		// 'claude'). Stamp Claude explicitly so behaviour is byte-identical; M3 replaces it
+		// with the D11-resolved harness. An omitted field would ship harness='' → 23514.
+		Harness: string(HarnessClaude),
 		// PRD #35: the OWNER's default. A handoff has no per-request wait_on_limit
 		// override today, so nil resolves to the user's users.wait_on_limit — the same
 		// defaulting every other creation path applies (ci_fix/mr_rework/CreateRun).
@@ -213,6 +217,10 @@ func (s *Service) CreateTaskReviewRun(ctx context.Context, userID, repoID, targe
 		BaseBranch:  pgTextTrimNarg(baseBranch),
 		TargetRunID: pgconv.UUID(targetRunID),
 		IssueTitle:  deriveTaskReviewTitle(branch),
+		// PRD #1429 M1 stopgap: harness is now the @harness param. Stamp Claude explicitly
+		// (byte-identical to today); M3 threads the reviewed target's harness. Omitting it
+		// would ship harness='' → 23514.
+		Harness: string(HarnessClaude),
 	})
 	if err != nil {
 		var pgErr *pgconn.PgError
@@ -267,14 +275,18 @@ func (s *Service) CreateThenFixRun(ctx context.Context, userID, repoID, original
 	}
 
 	run, err := s.q.CreateThenFixRun(ctx, store.CreateThenFixRunParams{
-		RunID:               id,
-		UserID:              userID,
-		RepoID:              repoID,
-		Branch:              pgconv.TextOrNull(branch),
-		BaseBranch:          pgTextTrimNarg(baseBranch),
-		ThenFixOfRunID:      pgconv.UUID(originalRunID),
-		IssueTitle:          deriveThenFixTitle(branch),
-		IssueDescription:    description,
+		RunID:            id,
+		UserID:           userID,
+		RepoID:           repoID,
+		Branch:           pgconv.TextOrNull(branch),
+		BaseBranch:       pgTextTrimNarg(baseBranch),
+		ThenFixOfRunID:   pgconv.UUID(originalRunID),
+		IssueTitle:       deriveThenFixTitle(branch),
+		IssueDescription: description,
+		// PRD #1429 M1 stopgap: harness is now the @harness param. Stamp Claude explicitly
+		// (byte-identical to today); M3 threads the original task's harness. Omitting it
+		// would ship harness='' → 23514.
+		Harness:             string(HarnessClaude),
 		BudgetWallSeconds:   budgetWall,
 		BudgetMaxIterations: budgetIters,
 		// PRD #35: stamp the owner's usage-limit-parking default, same as CreateTaskRun —

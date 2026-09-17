@@ -14,6 +14,9 @@ const bundle = (inp: number, cr: number, out: number, cost: number) => ({
   cache_creation_tokens: 0,
   output_tokens: out,
   cost_usd: cost,
+  // PRD #1429 M1 (D7): a per-run/aggregate bundle carries cost_status; these mock bundles are
+  // metered (a real dollar total). The literal type keeps it assignable to CostStatus | "".
+  cost_status: "metered" as const,
 });
 const wrap = (ui: ReactNode) => render(<MemoryRouter>{ui}</MemoryRouter>);
 
@@ -23,6 +26,10 @@ describe("YourUsageCard", () => {
       lifetime: bundle(1_610_000, 16_100_000, 710_000, 26.4),
       last_7_days: bundle(200_000, 2_800_000, 100_000, 4.55),
       run_count: 23,
+      lifetime_subscription_run_count: 0,
+      lifetime_unreported_run_count: 0,
+      last7_subscription_run_count: 0,
+      last7_unreported_run_count: 0,
     };
     const { container, getByText } = wrap(<YourUsageCard usage={usage} />);
     expect(getByText("Your usage")).toBeTruthy();
@@ -34,7 +41,7 @@ describe("YourUsageCard", () => {
   });
 
   it("shows the nothing-yet state (no fabricated 0) when run_count is 0", () => {
-    const usage: SelfUsage = { lifetime: bundle(0, 0, 0, 0), last_7_days: bundle(0, 0, 0, 0), run_count: 0 };
+    const usage: SelfUsage = { lifetime: bundle(0, 0, 0, 0), last_7_days: bundle(0, 0, 0, 0), run_count: 0, lifetime_subscription_run_count: 0, lifetime_unreported_run_count: 0, last7_subscription_run_count: 0, last7_unreported_run_count: 0 };
     const { getByText, container } = wrap(<YourUsageCard usage={usage} />);
     expect(getByText(/No usage recorded yet/)).toBeTruthy();
     // No "0 tokens" big number and no "Across N runs" kicker — nothing fabricated.
@@ -47,6 +54,10 @@ describe("YourUsageCard", () => {
       lifetime: bundle(1_000_000, 0, 200_000, 0), // nonzero tokens, zero cost
       last_7_days: bundle(0, 0, 0, 0),
       run_count: 2,
+      lifetime_subscription_run_count: 0,
+      lifetime_unreported_run_count: 0,
+      last7_subscription_run_count: 0,
+      last7_unreported_run_count: 0,
     };
     const { container } = wrap(<YourUsageCard usage={usage} />);
     expect(container.textContent).toContain("—");
@@ -58,6 +69,10 @@ describe("YourUsageCard", () => {
       lifetime: bundle(1_000_000, 0, 200_000, 1.23),
       last_7_days: bundle(100_000, 0, 50_000, 0.5),
       run_count: 3,
+      lifetime_subscription_run_count: 0,
+      lifetime_unreported_run_count: 0,
+      last7_subscription_run_count: 0,
+      last7_unreported_run_count: 0,
     };
     const { container } = wrap(<YourUsageCard usage={usage} />);
     const link = container.querySelector('a[href="/runs"]');
@@ -72,10 +87,10 @@ describe("YourUsageCard", () => {
 
 describe("FactoryTotalCard + PerUserUsageTable", () => {
   const admin: AdminUsage = {
-    factory: { lifetime: bundle(4_100_000, 37_500_000, 1_730_000, 64.23), last_7_days: bundle(0, 0, 0, 0), run_count: 54 },
+    factory: { lifetime: bundle(4_100_000, 37_500_000, 1_730_000, 64.23), last_7_days: bundle(0, 0, 0, 0), run_count: 54, lifetime_subscription_run_count: 0, lifetime_unreported_run_count: 0, last7_subscription_run_count: 0, last7_unreported_run_count: 0 },
     users: [
-      { user_id: "a", email: "big@x", usage: bundle(2_490_000, 22_400_000, 1_020_000, 37.83), run_count: 31 },
-      { user_id: "b", email: "small@x", usage: bundle(1_610_000, 15_100_000, 710_000, 26.4), run_count: 23 },
+      { user_id: "a", email: "big@x", usage: bundle(2_490_000, 22_400_000, 1_020_000, 37.83), run_count: 31, subscription_run_count: 0, unreported_run_count: 0 },
+      { user_id: "b", email: "small@x", usage: bundle(1_610_000, 15_100_000, 710_000, 26.4), run_count: 23, subscription_run_count: 0, unreported_run_count: 0 },
     ],
     earliest_run: "2026-05-12T09:00:00Z",
   };
@@ -109,11 +124,11 @@ describe("FactoryTotalCard + PerUserUsageTable", () => {
     // The leftover point ties (0.5 vs 0.5); the tie-break awards it to the larger
     // raw total (905), pinning the exact per-row values below.
     const admin3: AdminUsage = {
-      factory: { lifetime: bundle(1000, 0, 0, 0), last_7_days: bundle(0, 0, 0, 0), run_count: 3 },
+      factory: { lifetime: bundle(1000, 0, 0, 0), last_7_days: bundle(0, 0, 0, 0), run_count: 3, lifetime_subscription_run_count: 0, lifetime_unreported_run_count: 0, last7_subscription_run_count: 0, last7_unreported_run_count: 0 },
       users: [
-        { user_id: "a", email: "a@x", usage: bundle(905, 0, 0, 0), run_count: 1 },
-        { user_id: "b", email: "b@x", usage: bundle(85, 0, 0, 0), run_count: 1 },
-        { user_id: "c", email: "c@x", usage: bundle(10, 0, 0, 0), run_count: 1 },
+        { user_id: "a", email: "a@x", usage: bundle(905, 0, 0, 0), run_count: 1, subscription_run_count: 0, unreported_run_count: 0 },
+        { user_id: "b", email: "b@x", usage: bundle(85, 0, 0, 0), run_count: 1, subscription_run_count: 0, unreported_run_count: 0 },
+        { user_id: "c", email: "c@x", usage: bundle(10, 0, 0, 0), run_count: 1, subscription_run_count: 0, unreported_run_count: 0 },
       ],
       earliest_run: null,
     };

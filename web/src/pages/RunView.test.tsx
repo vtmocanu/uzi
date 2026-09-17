@@ -143,6 +143,7 @@ function run(over: Partial<Run>): Run {
     issue_iid: 87,
     issue_title: "Add rate limiting",
     issue_description: "d",
+    harness: "claude", // PRD #1429 M1: harness joined RunDTO.
     title: null,
     resume_of_run_id: null,
     status: "awaiting_approval",
@@ -2187,6 +2188,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
             cache_creation_tokens: 3100,
             output_tokens: 1840,
             cost_usd: 0.42,
+            cost_status: "metered" as const, // PRD #1429 M1 (D7)
           },
         },
       }),

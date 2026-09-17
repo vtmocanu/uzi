@@ -63,6 +63,7 @@ function histRun(i: number, minsBack: number): Run {
     issue_iid: 400 + i,
     issue_title: HIST_TITLES[i % HIST_TITLES.length],
     issue_description: "Generated demo history — see mockHistoryRuns in mocks/data.ts.",
+    harness: "claude", // PRD #1429 M1: runs.harness is now on RunDTO (NOT NULL, default claude).
     kind: "issue",
     title: null,
     resume_of_run_id: null,
@@ -149,6 +150,7 @@ export const mockOtherUserRuns: Run[] = [
     issue_iid: 61,
     issue_title: "Embed the changelog in the release email",
     issue_description: "Another user's in-flight run — factory-card demo fixture.",
+    harness: "claude", // PRD #1429 M1: runs.harness is now on RunDTO (NOT NULL, default claude).
     kind: "issue",
     title: null,
     resume_of_run_id: null,
@@ -208,6 +210,7 @@ export const mockOtherUserRuns: Run[] = [
     issue_iid: 77,
     issue_title: "Add retry budget to the seed sync",
     issue_description: "Another user's queued run — factory-card demo fixture.",
+    harness: "claude", // PRD #1429 M1: runs.harness is now on RunDTO (NOT NULL, default claude).
     kind: "issue",
     title: null,
     resume_of_run_id: null,
@@ -277,6 +280,8 @@ function demoRunUsage(r: Run): RunUsage | null {
     cache_creation_tokens: 0,
     output_tokens: round(48_200),
     cost_usd: Math.round(187 * scale) / 100,
+    // PRD #1429 M1 (D7): these mock runs are Claude/metered, so a real dollar total shows.
+    cost_status: "metered",
   };
 }
 

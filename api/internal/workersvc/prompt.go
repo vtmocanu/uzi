@@ -71,6 +71,10 @@ func (s *Service) CreatePromptRun(ctx context.Context, userID, repoID, scheduleI
 		// override onto the fired prompt run through this seam.
 		CredentialOverrideMode:     pgOverrideMode(credOverride),
 		CredentialOverrideSecretID: pgOverrideSecretID(credOverride),
+		// PRD #1429 M1 stopgap: harness is now the @harness param. Stamp Claude explicitly
+		// (byte-identical to today); M2 threads the schedule pin / resolved D11 harness.
+		// Omitting it would ship harness='' → 23514.
+		Harness: string(HarnessClaude),
 	})
 	if err != nil {
 		if isUniqueViolation(err) {

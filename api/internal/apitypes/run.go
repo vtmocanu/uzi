@@ -124,6 +124,14 @@ type RunDTO struct {
 	IssueIID         *int64 `json:"issue_iid"`
 	IssueTitle       string `json:"issue_title"`
 	IssueDescription string `json:"issue_description"`
+	// Harness is the run's ACTUAL execution harness (PRD #1429 M1 / D2), the stored
+	// runs.harness — a closed enum, "claude" | "codex". Always on the wire (the column is NOT
+	// NULL DEFAULT 'claude', so store.Run.Harness is a plain string): a pre-feature run and
+	// every current run read "claude". The web renders Claude visually unmarked and Codex
+	// explicit; the model/effort vocabulary keys on it. A client must render an unrecognised
+	// value honestly — the API is deployed separately and a newer server can ship a harness
+	// this client has not heard of.
+	Harness string `json:"harness"`
 	// HasPRDLink is server-computed PRD presence for the runs view (PRD #764),
 	// derived label-independently from the run's snapshotted issue description via
 	// the same detector the board card uses (forgesvc.HasPRDLink). False for

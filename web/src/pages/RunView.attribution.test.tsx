@@ -39,6 +39,7 @@ function run(over: Partial<Run>): Run {
     issue_iid: 87,
     issue_title: "Add rate limiting",
     issue_description: "d",
+    harness: "claude", // PRD #1429 M1: harness joined RunDTO (NOT NULL, default claude).
     title: null,
     resume_of_run_id: null,
     status: "running",

@@ -102,8 +102,8 @@ function mockAuth(user: User, appearance = baseAppearance()) {
 
 beforeEach(() => {
   mockApi.listSecrets.mockResolvedValue({ secrets: [] });
-  mockApi.getMySettings.mockResolvedValue({ settings: { default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null } });
-  mockApi.putMySettings.mockResolvedValue({ settings: { default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: "mission" } });
+  mockApi.getMySettings.mockResolvedValue({ settings: { default_harness: null, default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null } });
+  mockApi.putMySettings.mockResolvedValue({ settings: { default_harness: null, default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: "mission" } });
   mockApi.getMySlack.mockResolvedValue({
     slack: { member_id: null, notify: true, resolved_id: null, confirmed: false, state: "unlinked", workspace: "connected" },
   });
@@ -187,7 +187,7 @@ describe("Settings — per-token 'Show in sidebar' toggle", () => {
   it("checking an extra saves the whole set over PUT /me/settings", async () => {
     mockApi.listSecrets.mockResolvedValue({ secrets: twoSecrets });
     mockApi.putMySettings.mockResolvedValue({
-      settings: { default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null, sidebar_token_ids: ["sec-2"] },
+      settings: { default_harness: null, default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null, sidebar_token_ids: ["sec-2"] },
     });
     render(
       <MemoryRouter>

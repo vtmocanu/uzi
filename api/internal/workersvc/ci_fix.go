@@ -189,6 +189,10 @@ func (s *Service) createCIFixRun(ctx context.Context, userID, repoID uuid.UUID, 
 		// PRD #71 M4: false on the manual path (parks at the plan gate), true on the
 		// automatic path (worker approves the plan gate itself).
 		AutoApprove: autoApprove,
+		// PRD #1429 M1 stopgap: harness is now the @harness param. Stamp Claude explicitly
+		// (byte-identical to today); CI-fix uses implicit D11 in M2. Omitting it would ship
+		// harness='' → 23514.
+		Harness: string(HarnessClaude),
 	})
 	if err != nil {
 		if isUniqueViolation(err) {
