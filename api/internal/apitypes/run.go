@@ -793,6 +793,14 @@ type RunInputRequest struct {
 	// false-positive-inference correction. No runtime security boundary is bypassed: the
 	// §300 guardrail still denies docker USE on a daemon-less worker at run time.
 	OverrideCapabilities bool `json:"override_capabilities"`
+	// DiscardPendingOutcome is the PRD #1391 Run B M3d (D13) explicit confirmation on a `cancel`,
+	// default false → backward compatible (an older client omits it). When the target run has a
+	// terminal outcome journaled and leased on its worker, the server refuses the cancel with a
+	// typed 409 (reason "outcome_pending_confirmation_required") UNLESS this is true; with it the
+	// cancel takes the atomic owner-scoped no-live-poller branch that discards the held outcome.
+	// Meaningful only for cancel — inert on every other kind and on a cancel of a run with no
+	// pending outcome. Nothing is ever discarded on a timer; only the owner, explicitly.
+	DiscardPendingOutcome bool `json:"discard_pending_outcome"`
 }
 
 // RunInputResponse is the POST /api/runs/{id}/inputs reply: server_side reports

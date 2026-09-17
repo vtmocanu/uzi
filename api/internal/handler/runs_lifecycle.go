@@ -750,19 +750,28 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 	// validation and enqueue succeed, so a failed approve (e.g. an invalid selection) leaves
 	// the requirement INTACT and the retry stays gated. Owner- and awaiting_approval-scoped in
 	// SQL, and inert for any kind other than approve_plan (the gate only runs for approve_plan).
-	var res workersvc.SubmitInputResult
-	var err error
-	if req.OverrideCapabilities {
-		res, err = h.wsvc.SubmitInputWithCapabilityOverride(r.Context(), user.ID, id, req.Kind, req.Body, req.Selection)
-	} else {
-		res, err = h.wsvc.SubmitInput(r.Context(), user.ID, id, req.Kind, req.Body, req.Selection)
-	}
+	// PRD #1391 Run B M3d (D13): discard_pending_outcome rides alongside override_capabilities as
+	// an owner-authorized bypass, so route both through SubmitInputWithOptions. Both default false,
+	// so an approve without the capability override and a cancel of a run with no pending outcome
+	// behave exactly as before.
+	res, err := h.wsvc.SubmitInputWithOptions(r.Context(), user.ID, id, req.Kind, req.Body, req.Selection, workersvc.SubmitInputOptions{
+		OverrideCapabilities:  req.OverrideCapabilities,
+		DiscardPendingOutcome: req.DiscardPendingOutcome,
+	})
 	if err != nil {
 		switch {
 		case errors.Is(err, workersvc.ErrRunNotFound):
 			httpx.Error(w, http.StatusNotFound, "run not found")
 		case errors.Is(err, workersvc.ErrRunTerminal):
 			httpx.Error(w, http.StatusConflict, "run has already finished")
+		case errors.Is(err, workersvc.ErrOutcomePendingConfirmationRequired):
+			// PRD #1391 Run B M3d (D13): the cancel targets a run whose executor journaled a
+			// terminal (esp. blocked) outcome on its worker, and the request did not carry
+			// discard_pending_outcome. A typed 409 with a machine-readable `reason` beside the
+			// message so the web modal / CLI can detect exactly this case and retry with the bit,
+			// rather than string-matching the prose. Owner-only: a foreign/admin-ro caller resolves
+			// 0 rows upstream and 404s, never reaching here.
+			httpx.ErrorReason(w, http.StatusConflict, err.Error(), "outcome_pending_confirmation_required")
 		case errors.Is(err, workersvc.ErrStopNotInteractive):
 			// 409: a run-state conflict. Only an interactive task run's park honors a
 			// graceful stop; on any other run nothing would wind it down.

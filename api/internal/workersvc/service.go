@@ -232,6 +232,15 @@ var (
 	// on it. Checked in the SAME fence, BEFORE the mutation, and mapped by the handler to a typed
 	// 409 with a {reason:"gap_unrecoverable"} body (NOT a 400, and distinct from messages_pending).
 	ErrGapUnrecoverable = errors.New("terminal transition refused: too many messages are missing to recover")
+	// ErrOutcomePendingConfirmationRequired rejects a cancel of a run whose executor journaled a
+	// terminal (esp. blocked) outcome on its worker (PRD #1391 Run B M3d, D13) UNLESS the owner
+	// explicitly discards it. Such a run has no live poller for itself — its executor is gone —
+	// but an unconditional cancel would silently discard a completed/failed outcome held on the
+	// worker, so the server refuses without `discard_pending_outcome: true`. The handler maps it
+	// to a typed 409 with a {error, reason:"outcome_pending_confirmation_required"} body the
+	// web/CLI detect; with the discard bit set the cancel proceeds to the atomic no-live-poller
+	// branch (CancelRunServerSideWithPendingOutcome). Nothing is ever discarded on a timer.
+	ErrOutcomePendingConfirmationRequired = errors.New("cancel refused: this run has a pending outcome held on its worker; retry with discard_pending_outcome to discard it")
 	// ErrRunNotAwaitingInput rejects an `answer` for a run that is not parked on a
 	// clarification question (PRD #88 M1) → 409. Its sibling ErrStaleAnswer covers the
 	// run that IS parked but on a DIFFERENT question — the two are separated because
@@ -785,6 +794,16 @@ type Store interface {
 	// uq_runs_one_active_mr_rework partial unique index (migration 00167).
 	GetActiveMRReworkRunForMR(ctx context.Context, arg store.GetActiveMRReworkRunForMRParams) (store.Run, error)
 	CancelRunServerSide(ctx context.Context, arg store.CancelRunServerSideParams) (int64, error)
+	// RunHasPendingOutcomeLease reports whether a run's executor journaled a terminal outcome
+	// still leased on its owning worker (PRD #1391 Run B M3d, D13) — the POSITIVE form of the D11
+	// claim-exclusion predicate. Reused by hasLivePoller (such a run has no live poller for
+	// itself) and by the owner cancel's confirmation gate.
+	RunHasPendingOutcomeLease(ctx context.Context, id uuid.UUID) (bool, error)
+	// CancelRunServerSideWithPendingOutcome is the atomic owner-scoped cancel of a pending-outcome
+	// run (PRD #1391 Run B M3d, D13): one row-locking UPDATE whose WHERE re-checks the
+	// pending-outcome predicate, so a replayed SetState and this cancel resolve on the run's row
+	// lock rather than a stale Go-side read. Returns rows affected.
+	CancelRunServerSideWithPendingOutcome(ctx context.Context, arg store.CancelRunServerSideWithPendingOutcomeParams) (int64, error)
 	// CancelRunByWorker is the LIVE-worker cancel transition (PRD #503 M1). SetState's
 	// failed arm routes here (instead of SetRunFailed) when the loaded run carries
 	// stop_kind='cancelled', so an operator cancel ends 'cancelled'/NULL fail_origin —
@@ -5612,7 +5631,28 @@ func (s *Service) hasLivePoller(ctx context.Context, run store.Run) (bool, error
 	if !wkr.LastHeartbeatAt.Valid {
 		return false, nil
 	}
-	return s.now().Sub(wkr.LastHeartbeatAt.Time) < s.p.WorkerHeartbeatStale, nil
+	if s.now().Sub(wkr.LastHeartbeatAt.Time) >= s.p.WorkerHeartbeatStale {
+		// The worker's heartbeat has gone stale for ALL its runs — no live poller, unchanged.
+		return false, nil
+	}
+	// PRD #1391 Run B M3d (D13): the worker's heartbeat is fresh, but a run whose executor
+	// finished and journaled a terminal outcome sits with a terminal_pending lease on its owning
+	// worker (or that worker is under an unexpired pending_overflow) even while the worker keeps
+	// heartbeating for its OTHER runs. The poller for THIS run is gone — the executor no longer
+	// exists — so a cancel must go server-side (the atomic no-live-poller branch), NOT be enqueued
+	// for an executor that will never consume it. The predicate is the POSITIVE form of the D11
+	// claim-exclusion join; chat is exempt (D6/D10: it never journals a terminal), so it is skipped
+	// here rather than round-tripped for a query that always answers false.
+	if run.Kind != runkind.Chat {
+		pending, perr := s.q.RunHasPendingOutcomeLease(ctx, run.ID)
+		if perr != nil {
+			return false, perr
+		}
+		if pending {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // -------------------------------------------------------------------------

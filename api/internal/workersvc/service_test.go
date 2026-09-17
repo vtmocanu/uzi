@@ -52,6 +52,10 @@ type fakeStore struct {
 	claimCtxCalled bool
 	anthropic      []byte
 	anthropicErr   error
+	// pendingOutcomeLease drives RunHasPendingOutcomeLease (PRD #1391 Run B M3d): a test stages
+	// true to model a run whose executor journaled a terminal outcome on its worker.
+	pendingOutcomeLease    bool
+	pendingOutcomeLeaseErr error
 	// byIDSecrets is the by-id secret lookup (PRD #104): secret id → sealed row, the
 	// path a WORKER-BOUND claim takes instead of the by-kind default. Keyed by id so
 	// a test can stage two credentials and prove a rebind changes which one the
@@ -1317,6 +1321,14 @@ func (f *fakeStore) ListJudgeTriageRowsForUser(_ context.Context, userID uuid.UU
 }
 func (f *fakeStore) GetWorkerByID(context.Context, uuid.UUID) (store.Worker, error) {
 	return f.workerByID, f.workerByIDErr
+}
+
+// RunHasPendingOutcomeLease models the PRD #1391 Run B M3d (D13) positive predicate: false by
+// default (no journaled terminal outcome), or f.pendingOutcomeLease when a test stages one to
+// drive hasLivePoller / the cancel confirmation gate. hasLivePoller reads it only after a fresh
+// heartbeat and only for a non-chat run.
+func (f *fakeStore) RunHasPendingOutcomeLease(context.Context, uuid.UUID) (bool, error) {
+	return f.pendingOutcomeLease, f.pendingOutcomeLeaseErr
 }
 func (f *fakeStore) ClearRunRequiredCapabilities(_ context.Context, arg store.ClearRunRequiredCapabilitiesParams) (int64, error) {
 	f.clearedCaps = &arg

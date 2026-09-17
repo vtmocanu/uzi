@@ -274,8 +274,10 @@ func TestMessageDTOTags(t *testing.T) {
 
 func TestRunInputTags(t *testing.T) {
 	// PRD #84 M4 4c: override_capabilities is a plain bool (not omitempty), so it is always
-	// on the wire; meaningful only with approve_plan, default false.
-	assertTags(t, "RunInputRequest", RunInputRequest{}, "kind", "body", "selection", "override_capabilities")
+	// on the wire; meaningful only with approve_plan, default false. PRD #1391 Run B M3d (D13):
+	// discard_pending_outcome is the same shape — a plain bool, default false, meaningful only
+	// with cancel.
+	assertTags(t, "RunInputRequest", RunInputRequest{}, "kind", "body", "selection", "override_capabilities", "discard_pending_outcome")
 	// id + created_at are omitempty (nil on approve/cancel/reject): the zero value is
 	// still just server_side (PRD #95 S2).
 	assertTags(t, "RunInputResponse", RunInputResponse{}, "server_side")

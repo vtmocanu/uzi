@@ -198,7 +198,7 @@ func newRunApproveCmd(env Env, gf *globalFlags) *cobra.Command {
 					_, _ = fmt.Fprintf(env.Stderr, "warning: %s\n", sanitizeTTY(warning))
 				}
 			}
-			return submitInput(env, gf, c, cmd, args[0], kindApprovePlan, "", sel)
+			return submitInput(env, gf, c, cmd, args[0], kindApprovePlan, "", sel, false)
 		},
 	}
 	approve.Flags().String("agent-source", "", "which subagent roster to run: own|repo (default: the run's own default)")
@@ -229,7 +229,7 @@ func newRunRejectCmd(env Env, gf *globalFlags) *cobra.Command {
 			if strings.TrimSpace(msg) == "" {
 				return uzicli.Exitf(uzicli.ExitUsage, "a rejection needs a reason: pass -m <reason> or pipe it on stdin")
 			}
-			return submitInput(env, gf, c, cmd, args[0], kindRejectPlan, msg, nil)
+			return submitInput(env, gf, c, cmd, args[0], kindRejectPlan, msg, nil, false)
 		},
 	}
 	reject.Flags().StringP("message", "m", "", "reason to send back to the agent (or pipe it on stdin)")
@@ -250,10 +250,18 @@ func newRunCancelCmd(env Env, gf *globalFlags) *cobra.Command {
 			// PRD #503 M3: the cancel reason is OPTIONAL — unlike reject, no empty check.
 			msg, _ := cmd.Flags().GetString("message")
 			msg = resolveMessage(env, msg)
-			return submitInput(env, gf, c, cmd, args[0], kindCancel, msg, nil)
+			// PRD #1391 Run B M3d (D13): a run whose executor journaled a terminal (esp. blocked)
+			// outcome on its worker refuses a plain cancel with a typed 409 rather than silently
+			// discarding that outcome. This non-TTY flag is the explicit, no-prompt confirmation
+			// the owner passes to discard it and cancel.
+			discard, _ := cmd.Flags().GetBool("discard-pending-outcome")
+			return submitInput(env, gf, c, cmd, args[0], kindCancel, msg, nil, discard)
 		},
 	}
 	cancel.Flags().StringP("message", "m", "", "reason for cancelling (optional; or pipe it on stdin)")
+	cancel.Flags().Bool("discard-pending-outcome", false,
+		"discard a terminal outcome held on the run's worker (a completed/failed/blocked result the "+
+			"executor journaled but the server has not accepted) and cancel anyway; required for such a run")
 	return cancel
 }
 
@@ -283,7 +291,7 @@ func newRunStopCmd(env Env, gf *globalFlags) *cobra.Command {
 			// The stop message is OPTIONAL, like a cancel reason — no empty check.
 			msg, _ := cmd.Flags().GetString("message")
 			msg = resolveMessage(env, msg)
-			return submitInput(env, gf, c, cmd, args[0], kindStop, msg, nil)
+			return submitInput(env, gf, c, cmd, args[0], kindStop, msg, nil, false)
 		},
 	}
 	stop.Flags().StringP("message", "m", "", "an optional message to accompany the stop (or pipe it on stdin)")

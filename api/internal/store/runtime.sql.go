@@ -317,6 +317,53 @@ func (q *Queries) CancelRunServerSide(ctx context.Context, arg CancelRunServerSi
 	return result.RowsAffected(), nil
 }
 
+const cancelRunServerSideWithPendingOutcome = `-- name: CancelRunServerSideWithPendingOutcome :execrows
+UPDATE runs SET status = 'cancelled', status_since = now(), stop_kind = 'cancelled', move_pending_since = now(), finished_at = now(),
+    stop_reason = $1,
+    milestones_in_progress = NULL,
+    milestones_agents = NULL,
+    pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
+    credential_switch_requested_at = NULL, credential_switch_generation = NULL,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE runs.id = $2 AND runs.user_id = $3
+  AND runs.status NOT IN ('completed', 'failed', 'cancelled')
+  AND runs.kind <> 'chat'
+  AND (EXISTS (SELECT 1 FROM worker_active_runs a
+               WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                 AND a.terminal_pending_until > now()
+                 AND a.claim_generation = runs.claim_generation)
+       OR EXISTS (SELECT 1 FROM workers w
+                  WHERE w.id = runs.worker_id AND w.pending_overflow_until > now()))
+`
+
+type CancelRunServerSideWithPendingOutcomeParams struct {
+	StopReason pgtype.Text `json:"stop_reason"`
+	ID         uuid.UUID   `json:"id"`
+	UserID     uuid.UUID   `json:"user_id"`
+}
+
+// PRD #1391 Run B M3d (D13): the atomic owner-scoped cancel of a run whose executor journaled a
+// terminal (esp. blocked) outcome on its worker, when the owner explicitly discards it. This is
+// the resolution for a pending outcome the api permanently refuses — a silent unconditional
+// CancelRunServerSide would trade a visible stall for a lost outcome, so this variant carries the
+// SAME pending-outcome predicate the confirmation gate enforced (RunHasPendingOutcomeLease's
+// positive form) INSIDE the UPDATE: a Go-side check followed by the plain CancelRunServerSide
+// would race a lease clear or a re-claim and cancel a fresh generation on stale evidence. The
+// UPDATE is one row-locking statement (it re-evaluates the predicate against the latest committed
+// run row under READ COMMITTED / EvalPlanQual), so a replayed SetState and this cancel resolve on
+// the run's row lock, not on stale reads: if the replayed SetState commits `completed`/`failed`
+// first, this matches 0 rows (status NOT IN protects it); if this wins, the replay's no-op 409
+// returns `cancelled`, the journal retires and completion side effects never fire. Field-for-field
+// identical to CancelRunServerSide's terminal cleanup; only the WHERE differs.
+func (q *Queries) CancelRunServerSideWithPendingOutcome(ctx context.Context, arg CancelRunServerSideWithPendingOutcomeParams) (int64, error) {
+	result, err := q.db.Exec(ctx, cancelRunServerSideWithPendingOutcome, arg.StopReason, arg.ID, arg.UserID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const claimAutopilotTerminalComment = `-- name: ClaimAutopilotTerminalComment :execrows
 UPDATE runs SET autopilot_commented_at = now()
 WHERE id = $1 AND auto_approve = true AND autopilot_commented_at IS NULL
@@ -8876,6 +8923,38 @@ func (q *Queries) ResumePausedRun(ctx context.Context, arg ResumePausedRunParams
 	var i ResumePausedRunRow
 	err := row.Scan(&i.ID, &i.UserID, &i.Status)
 	return i, err
+}
+
+const runHasPendingOutcomeLease = `-- name: RunHasPendingOutcomeLease :one
+SELECT EXISTS (
+    SELECT 1 FROM runs
+    WHERE runs.id = $1
+      AND runs.kind <> 'chat'
+      AND (EXISTS (SELECT 1 FROM worker_active_runs a
+                   WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                     AND a.terminal_pending_until > now()
+                     AND a.claim_generation = runs.claim_generation)
+           OR EXISTS (SELECT 1 FROM workers w
+                      WHERE w.id = runs.worker_id AND w.pending_overflow_until > now()))
+)
+`
+
+// PRD #1391 Run B M3d (D13): does this run currently have a terminal outcome journaled and
+// leased on its owning worker? This is the POSITIVE form of the D11 claim-exclusion predicate
+// (see SweepClaimedNeverStarted / FailRunAutoStop, whose negative `NOT EXISTS(...) AND NOT
+// EXISTS(...)` PROTECT such a run). True when EITHER the run's owning worker holds an unexpired
+// terminal_pending lease for it at the run's EXACT current claim_generation (the executor
+// journaled a terminal outcome and is gone), OR the owning worker is under an unexpired
+// pending_overflow (M4's rotation left this run unlisted, but the worker-level closure stands in
+// for the missing row-level lease). Chat is excluded (D6/D10): chat has no claim generation and
+// never journals a terminal outcome, so it is never pending. Reused by hasLivePoller (a run this
+// returns true for has no live poller for ITSELF — its executor no longer exists) and by the
+// owner cancel's confirmation gate + atomic no-live-poller branch.
+func (q *Queries) RunHasPendingOutcomeLease(ctx context.Context, id uuid.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, runHasPendingOutcomeLease, id)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
 }
 
 const runHasVerdictSinceGateOpened = `-- name: RunHasVerdictSinceGateOpened :one

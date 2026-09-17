@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -355,9 +356,19 @@ func seededPlanFlag(env Env, cmd *cobra.Command) (*uzicli.CreateRunSeed, error) 
 // submitInput sends one steering input and reports the outcome. server_side (a
 // cancel/reject applied without a live worker) is surfaced so the caller knows the
 // action took effect immediately rather than being queued.
-func submitInput(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, runID, kind, body string, sel *apitypes.AgentSelection) error {
-	res, err := c.SubmitRunInput(cmd.Context(), runID, kind, body, sel)
+func submitInput(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, runID, kind, body string, sel *apitypes.AgentSelection, discardPendingOutcome bool) error {
+	res, err := c.SubmitRunInput(cmd.Context(), runID, kind, body, sel, discardPendingOutcome)
 	if err != nil {
+		// PRD #1391 Run B M3d (D13): a cancel of a run whose executor journaled a terminal
+		// outcome on its worker, sent WITHOUT --discard-pending-outcome, comes back as a typed 409
+		// carrying reason "outcome_pending_confirmation_required". Turn it into a clear,
+		// actionable guidance line naming the flag rather than surfacing the raw server prose —
+		// the actionable case is exactly when the caller did NOT pass the flag.
+		var ee *uzicli.ExitError
+		if !discardPendingOutcome && errors.As(err, &ee) && ee.Reason == uzicli.ReasonOutcomePendingConfirmationRequired {
+			return uzicli.Exitf(uzicli.ExitConflict,
+				"run %s has a pending outcome held on its worker; re-run with --discard-pending-outcome to discard it and cancel", runID)
+		}
 		return err
 	}
 	p := env.printer(gf)

@@ -299,7 +299,7 @@ type runInputsMsg struct {
 func (m tuiModel) submitSteerCmd(kind, body string) tea.Cmd {
 	c, ctx, runID := m.client, m.ctx, m.detail.runID
 	return func() tea.Msg {
-		res, err := c.SubmitRunInput(ctx, runID, kind, body, nil)
+		res, err := c.SubmitRunInput(ctx, runID, kind, body, nil, false)
 		return steerResultMsg{runID: runID, kind: kind, res: res, err: err}
 	}
 }

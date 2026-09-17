@@ -175,7 +175,7 @@ func TestSubmitRunInputWireShape(t *testing.T) {
 			_, _ = io.WriteString(w, `{"server_side":true}`)
 		}))
 		defer srv.Close()
-		res, err := newTestClient(srv).SubmitRunInput(context.Background(), "r1", "cancel", "", nil)
+		res, err := newTestClient(srv).SubmitRunInput(context.Background(), "r1", "cancel", "", nil, false)
 		if err != nil || !res.ServerSide {
 			t.Fatalf("res=%+v err=%v", res, err)
 		}
@@ -196,7 +196,7 @@ func TestSubmitRunInputWireShape(t *testing.T) {
 		}))
 		defer srv.Close()
 		sel := &apitypes.AgentSelection{Source: "own", Exclusions: []string{"tester"}}
-		_, err := newTestClient(srv).SubmitRunInput(context.Background(), "r1", "approve_plan", "", sel)
+		_, err := newTestClient(srv).SubmitRunInput(context.Background(), "r1", "approve_plan", "", sel, false)
 		if err != nil {
 			t.Fatal(err)
 		}
