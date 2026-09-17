@@ -7,6 +7,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import {
@@ -5513,10 +5514,15 @@ describe("RunView — held-outcome banner + discard confirmation (PRD #1391 M3d)
 
     // The reason is shown IN the modal (which stays open), not on the page banner.
     await screen.findByText("worker unreachable");
-    expect(screen.getByText(MODAL_BODY)).toBeTruthy();
-    // The page-level actionErr banner is NOT used for this failure — the modal owns it.
-    // (Only the modal-local copy of the message exists.)
-    expect(screen.getAllByText("worker unreachable")).toHaveLength(1);
+    const dialog = screen.getByRole("dialog");
+    expect(within(dialog).getByText("worker unreachable")).toBeTruthy();
+    expect(within(dialog).getByText(MODAL_BODY)).toBeTruthy();
+    // The page-level actionErr <Alert> (role="alert") must NOT carry this failure — routing
+    // it there instead of the modal would hide it behind the overlay. This pins the modal-vs-page
+    // routing: on the unfixed code the text lands on the page alert, failing both checks.
+    for (const alert of screen.queryAllByRole("alert")) {
+      expect(alert.textContent ?? "").not.toContain("worker unreachable");
+    }
 
     // A fresh confirm clears the stale modal-local error. Point submit at success this time.
     submit.mockImplementation(async () => undefined);
