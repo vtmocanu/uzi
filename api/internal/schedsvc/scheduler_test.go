@@ -409,7 +409,8 @@ func (f *fakeRuns) CreatePromptRun(_ context.Context, userID, repoID, scheduleID
 }
 
 // selfImproveCall records one CreateSelfImproveRun (PRD #590 M1) so a test can assert the
-// owner/repo/tracking-issue/description and the threaded per-schedule model reached the seam.
+// owner/repo/tracking-issue/description, the threaded per-schedule model, and (PRD #1429
+// M4a rework) the schedule's pinned harness reached the seam.
 type selfImproveCall struct {
 	userID, repoID        uuid.UUID
 	issueIID              int64
@@ -417,13 +418,14 @@ type selfImproveCall struct {
 	mrReworkEnabled       *bool
 	model                 *string
 	overrideSubagentModel bool
+	explicit              *workersvc.Harness
 }
 
-func (f *fakeRuns) CreateSelfImproveRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, title, description string, mrReworkEnabled *bool, model *string, overrideSubagentModel bool) (store.Run, error) {
+func (f *fakeRuns) CreateSelfImproveRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, title, description string, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, explicit *workersvc.Harness) (store.Run, error) {
 	if f.err != nil {
 		return store.Run{}, f.err
 	}
-	f.selfImprove = append(f.selfImprove, selfImproveCall{userID, repoID, issueIID, title, description, mrReworkEnabled, model, overrideSubagentModel})
+	f.selfImprove = append(f.selfImprove, selfImproveCall{userID, repoID, issueIID, title, description, mrReworkEnabled, model, overrideSubagentModel, explicit})
 	if f.selfImproveRun.ID == (uuid.UUID{}) {
 		f.selfImproveRun = store.Run{ID: uuid.New()}
 	}

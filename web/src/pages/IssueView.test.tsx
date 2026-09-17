@@ -413,6 +413,61 @@ describe("IssueView Start gate (PRD #764)", () => {
     expect(mockApi.createRun).toHaveBeenCalledWith("repo-1", 7, undefined, undefined, "codex");
   });
 
+  // Fix 2 (M4a review): a Codex-only user never sees the harness picker (only one
+  // harness is usable — D2), so `harness` stays "inherit". Gating the Anthropic
+  // TokenPicker on the raw picker value alone left it visible for this user even though
+  // the run WILL resolve to Codex — using it 422s. Paired with the positive control
+  // below (a Claude-only / both-usable user DOES see it) so this is not a vacuous
+  // "never renders" assertion.
+  it("hides the Anthropic token picker for a Codex-only user, even with no explicit harness pick", async () => {
+    setAuth();
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
+    mockApi.listSecrets.mockResolvedValue({
+      secrets: [{ ...aToken(), id: "sec-codex", kind: "openai_api_key" }],
+    });
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["uzi"], has_prd_link: false }) });
+    renderIssueView();
+
+    await screen.findByText("A small typo fix");
+    await screen.findByRole("button", { name: /start run/i });
+    // Single-harness user: no redundant harness picker either (D2).
+    expect(screen.queryByLabelText("Harness for this run")).toBeNull();
+    expect(screen.queryByLabelText("Anthropic token for this run")).toBeNull();
+  });
+
+  // Positive control for the case above: a Claude-only user (the pre-existing,
+  // single-harness flow) still sees the Anthropic picker — the fix must not hide it
+  // universally.
+  it("still shows the Anthropic token picker for a Claude-only user", async () => {
+    setAuth();
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
+    mockApi.listSecrets.mockResolvedValue({ secrets: [aToken()] });
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["uzi"], has_prd_link: false }) });
+    renderIssueView();
+
+    await screen.findByText("A small typo fix");
+    expect(await screen.findByLabelText("Anthropic token for this run")).toBeTruthy();
+  });
+
+  // Positive control: a both-usable user with the harness picker left on inherit (the
+  // untouched default) also still sees the Anthropic picker — D11 rule 4 resolves
+  // inherit to Claude when both are usable and no default is set, so hiding it here
+  // would be wrong.
+  it("still shows the Anthropic token picker for a both-usable user on the untouched inherit default", async () => {
+    setAuth();
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
+    mockApi.listSecrets.mockResolvedValue({
+      secrets: [aToken(), { ...aToken(), id: "sec-codex", kind: "openai_api_key" }],
+    });
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["uzi"], has_prd_link: false }) });
+    renderIssueView();
+
+    await screen.findByText("A small typo fix");
+    const picker = (await screen.findByLabelText("Harness for this run")) as HTMLSelectElement;
+    expect(picker.value).toBe("inherit");
+    expect(screen.getByLabelText("Anthropic token for this run")).toBeTruthy();
+  });
+
   // Issue #856 M3: a completed prior run that still owns an open MR makes the
   // server refuse a fresh run with a coded 409 (issue_has_open_mr). Start catches
   // it, confirms (the message names the MR), and retries with force on confirm.

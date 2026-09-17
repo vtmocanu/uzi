@@ -1024,6 +1024,16 @@ export const settingsApi = {
       // the server treating an absent/null value as ON.
       next = { ...next, mr_rework_enabled: patch.mr_rework_enabled ?? null };
     }
+    if (patch.default_harness !== undefined) {
+      // Tri-state (PRD #1429 M1/D3, review fix M4a): present-null clears to "no
+      // preference" (implicit run creation falls through D11); a claude|codex value
+      // sets the pin; anything else is a 400 — mirrors the server's validateHarness so
+      // Run Defaults saves (and its notice text) match the real handler in the demo.
+      if (patch.default_harness !== null && patch.default_harness !== "claude" && patch.default_harness !== "codex") {
+        throw new ApiError(400, "default_harness: must be one of claude, codex");
+      }
+      next = { ...next, default_harness: patch.default_harness };
+    }
     // Every field validated: commit the staged copy in one shot, then persist.
     userSettings = next;
     persistSettings();

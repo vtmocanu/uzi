@@ -25,6 +25,7 @@ import {
 } from "../lib/credentialOverride";
 import {
   bothHarnessesUsable,
+  effectiveHarnessIsCodex,
   scheduleHarnessPatch,
   selectionFromHarness,
   type HarnessSelection,
@@ -318,7 +319,18 @@ export function ScheduleModal({
   const harnessPatch = () => scheduleHarnessPatch(harnessSel, harnessTouched);
   // D2: the picker appears only when the caller has a usable credential for BOTH
   // harnesses — a single-harness user never sees a redundant picker.
-  const showHarnessPicker = bothHarnessesUsable(hasAnthropicToken(allSecrets), isCodexUsable(allSecrets));
+  const claudeUsableForHarness = hasAnthropicToken(allSecrets);
+  const codexUsableForHarness = isCodexUsable(allSecrets);
+  const showHarnessPicker = bothHarnessesUsable(claudeUsableForHarness, codexUsableForHarness);
+  // Fix 2 (M4a review): gate the Anthropic TokenPicker on the EFFECTIVE harness, not the
+  // raw `harnessSel` — a Codex-only owner never sees the harness picker above
+  // (showHarnessPicker is false), so `harnessSel` stays "inherit" even though every run
+  // this schedule fires WILL resolve to Codex implicitly.
+  const scheduleStartsOnCodex = effectiveHarnessIsCodex(
+    harnessSel,
+    claudeUsableForHarness,
+    codexUsableForHarness,
+  );
   // PRD #929 M1: per-schedule output mode for prompt-target schedules. "" = inherit the
   // catalog/job default; "mr" opens a merge request from an idea file, "issues" files issues.
   const [outputMode, setOutputMode] = useState<string>(
@@ -1152,16 +1164,18 @@ export function ScheduleModal({
 
           {/* PRD #1247 M6/M7: per-schedule Anthropic credential override, beside the model.
               HIDDEN for self_improve (that lane 409s an explicit override) and for a schedule
-              explicitly pinned to Codex (a Codex run spends a Codex credential, never an
-              Anthropic one — PRD #1429 M4a), each with a note in its place, so the modal
-              never sends an override in either case. Inherit follows the worker binding. */}
+              that will EFFECTIVELY fire on Codex — an explicit pin, OR (M4a review fix) a
+              Codex-only owner whose picker is hidden but who WILL resolve to Codex implicitly
+              (a Codex run spends a Codex credential, never an Anthropic one — PRD #1429
+              M4a) — each with a note in its place, so the modal never sends an override in
+              either case. Inherit follows the worker binding. */}
           {target === "self_improve" ? (
             <p className="text-[11px] text-faint">
               Self-improvement runs always use your worker&rsquo;s token — no per-schedule override.
             </p>
-          ) : harnessSel === "codex" ? (
+          ) : scheduleStartsOnCodex ? (
             <p className="text-[11px] text-faint">
-              This schedule is pinned to Codex — it spends a Codex credential, not an Anthropic
+              This schedule fires on Codex — it spends a Codex credential, not an Anthropic
               token.
             </p>
           ) : (

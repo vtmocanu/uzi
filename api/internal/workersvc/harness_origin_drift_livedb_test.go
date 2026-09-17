@@ -173,7 +173,7 @@ func runOriginDriftOrigins(t *testing.T, env codexTestEnv, svc *Service, userID,
 
 	t.Run("self-improve (Service.CreateSelfImproveRun)", func(t *testing.T) {
 		iid := iidBase + 5
-		run, err := svc.CreateSelfImproveRun(env.ctx, userID, repoID, iid, "t", "d", nil, nil, false)
+		run, err := svc.CreateSelfImproveRun(env.ctx, userID, repoID, iid, "t", "d", nil, nil, false, nil)
 		if err != nil {
 			t.Fatalf("CreateSelfImproveRun: %v", err)
 		}

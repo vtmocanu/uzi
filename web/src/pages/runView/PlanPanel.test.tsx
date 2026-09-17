@@ -256,4 +256,23 @@ describe("PlanPanel — gate credential path (PRD #1247 M7)", () => {
     renderPanel({ credential_override: { mode: "auto", label: null } });
     expect(screen.getByText(/Leaving the current choice keeps this run’s override\./)).toBeTruthy();
   });
+
+  // Fix 2 (M4a review): a run whose ACTUAL harness is codex cannot switch/set an
+  // Anthropic token at the gate (D5 — using the control would 422), so the gate token
+  // picker must be hidden — gated on run.harness, not just canSteer.
+  it("hides the plan-gate token picker for a codex-harness run", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [token()] });
+    renderPanel({ harness: "codex" });
+    // Give the (should-be-skipped) self-fetch a tick to settle either way.
+    await waitFor(() => expect(mockApi.listSecrets).not.toHaveBeenCalled());
+    expect(screen.queryByLabelText("Anthropic token for the implementation phase")).toBeNull();
+  });
+
+  // Positive control for the case above: an otherwise-identical claude-harness run
+  // still shows the gate token picker — the fix must not hide it universally.
+  it("still shows the plan-gate token picker for a claude-harness run", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [token()] });
+    renderPanel({ harness: "claude" });
+    expect(await screen.findByLabelText("Anthropic token for the implementation phase")).toBeTruthy();
+  });
 });

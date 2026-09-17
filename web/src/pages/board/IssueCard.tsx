@@ -2,7 +2,7 @@ import { Link } from "react-router-dom";
 import { isHttpsUrl, preferForgeUrl, type Card as CardData, type SecretMeta } from "../../lib/api";
 import type { StartRunGate } from "../../lib/runStream";
 import { INHERIT_SELECTION, type CredentialSelection } from "../../lib/credentialOverride";
-import { INHERIT_HARNESS, type HarnessSelection } from "../../lib/harnessSelection";
+import { effectiveHarnessIsCodex, INHERIT_HARNESS, type HarnessSelection } from "../../lib/harnessSelection";
 import { TokenPicker } from "../../components/TokenPicker";
 import { HarnessPicker } from "../../components/HarnessPicker";
 import {
@@ -84,6 +84,8 @@ export function IssueCard({
   showHarnessPicker = false,
   harness = INHERIT_HARNESS,
   onHarnessChange,
+  claudeUsable = true,
+  codexUsable = false,
   fixCiBusy,
   onFixCi,
   uziLabel,
@@ -153,6 +155,15 @@ export function IssueCard({
   showHarnessPicker?: boolean;
   harness?: HarnessSelection;
   onHarnessChange?: (next: HarnessSelection) => void;
+  // Fix 2 (M4a review): the board's harness-availability facts, used ONLY to gate the
+  // Anthropic TokenPicker on the EFFECTIVE harness (effectiveHarnessIsCodex) rather than
+  // the raw `harness` selection — a Codex-only card never shows the harness picker above
+  // (showHarnessPicker is false), so `harness` stays "inherit" even though the card WILL
+  // start on Codex. Default claudeUsable=true/codexUsable=false so every pre-existing
+  // direct-render test (which never sets these) keeps its old "hidden only when harness
+  // is explicitly codex" behavior byte-identical.
+  claudeUsable?: boolean;
+  codexUsable?: boolean;
   fixCiBusy: boolean;
   onFixCi: () => void;
   // PRD #764. isEligible drives the treatment and the affordances: a card carrying the
@@ -536,10 +547,12 @@ export function IssueCard({
             )}
             {/* PRD #1247 M7: choose the token the run spends before starting it. Inherit
                 (the default, shown explicitly) follows the worker's binding. Rendered only
-                when the board wires the change handler, and hidden once this card is
-                explicitly starting on Codex — a Codex run never spends an Anthropic
-                credential, so the picker would be noise. */}
-            {onCredentialChange && harness !== "codex" && (
+                when the board wires the change handler, and hidden once this card will
+                EFFECTIVELY start on Codex — an explicit pick, OR (M4a review fix) a
+                Codex-only card whose picker is hidden but WILL resolve to Codex implicitly
+                — a Codex run never spends an Anthropic credential, so the picker would be
+                noise (and using it would 422). */}
+            {onCredentialChange && !effectiveHarnessIsCodex(harness, claudeUsable, codexUsable) && (
               <TokenPicker
                 label={`Anthropic token for #${card.iid}`}
                 className="h-8 w-full text-xs"

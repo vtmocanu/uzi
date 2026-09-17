@@ -176,6 +176,25 @@ describe("SwitchTokenAction — refused lanes are hidden", () => {
     // Positive structural assertion: the component rendered nothing at all.
     expect(container.firstChild).toBeNull();
   });
+
+  // Fix 2 (M4a review): a run whose ACTUAL harness is codex cannot switch an Anthropic
+  // token (D5 — using the control would 422), so it must be hidden the same way the
+  // other refused lanes are — gated on run.harness, not just kind/trigger_source.
+  it("renders nothing for a codex-harness run", () => {
+    const { container } = render(
+      <SwitchTokenAction run={run({ kind: "issue", status: "running", harness: "codex" })} canSteer tokens={[token()]} />,
+    );
+    expect(container.firstChild).toBeNull();
+  });
+
+  // Positive control for the case above: an otherwise-identical claude-harness run
+  // still shows the control — the fix must not hide it universally.
+  it("still shows the Switch token control for a claude-harness run", () => {
+    render(
+      <SwitchTokenAction run={run({ kind: "issue", status: "running", harness: "claude" })} canSteer tokens={[token()]} />,
+    );
+    expect(screen.getByRole("button", { name: "Switch token" })).toBeTruthy();
+  });
 });
 
 describe("SwitchTokenAction — owner vs non-owner", () => {
