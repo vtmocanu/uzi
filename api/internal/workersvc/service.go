@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/url"
 	"regexp"
 	"slices"
@@ -216,6 +217,21 @@ var (
 	// worker (no capability) is still honoured unfenced when it omits it. The handler maps this to
 	// the SAME stale/refuse ack as ErrStaleClaim (a 409 with disposition:"stale_claim").
 	ErrMissingClaimGeneration = errors.New("capability worker omitted claim_generation on a mutating report")
+	// ErrMessagesPending rejects a TERMINAL transition whose messages_through_seq is not yet
+	// backed by a CONTIGUOUS [1..through] in run_messages (PRD #1391 Run B M3c, D3): the
+	// high-water last_seq has not reached `through`, or a hole exists below it (count < through).
+	// The fence returns it BEFORE the mutating SetRunCompleted/SetRunFailed/completeRunWithPermit
+	// call, so nothing is written; the worker fills the missing seqs and re-reports. The handler
+	// maps it to a typed 409 with a {run, reason:"messages_pending"} body — the SAME {run, reason}
+	// shape as the forge-park refusals, NOT the disposition shape. It is a RECOVERABLE refusal:
+	// the gap is small enough to fill (≤ WorkerGapFillMax), unlike ErrGapUnrecoverable.
+	ErrMessagesPending = errors.New("terminal transition refused: run messages are not yet contiguous through the reported seq")
+	// ErrGapUnrecoverable rejects a TERMINAL transition whose messages_through_seq leaves MORE than
+	// WorkerGapFillMax seqs missing from the stored [1..through] (PRD #1391 Run B M3c): the hole is
+	// too large to ever fill, so — unlike ErrMessagesPending — the worker must NOT keep re-parking
+	// on it. Checked in the SAME fence, BEFORE the mutation, and mapped by the handler to a typed
+	// 409 with a {reason:"gap_unrecoverable"} body (NOT a 400, and distinct from messages_pending).
+	ErrGapUnrecoverable = errors.New("terminal transition refused: too many messages are missing to recover")
 	// ErrRunNotAwaitingInput rejects an `answer` for a run that is not parked on a
 	// clarification question (PRD #88 M1) → 409. Its sibling ErrStaleAnswer covers the
 	// run that IS parked but on a DIFFERENT question — the two are separated because
@@ -468,6 +484,16 @@ type Store interface {
 	ListActiveRunsAll(ctx context.Context, backgroundGraceCutoff pgtype.Timestamptz) ([]store.ListActiveRunsAllRow, error)
 	ListAllWorkers(ctx context.Context) ([]store.ListAllWorkersRow, error)
 	GetRunOwnedByWorker(ctx context.Context, arg store.GetRunOwnedByWorkerParams) (store.Run, error)
+	// GetRunOwnedByWorkerLiveClaim is GetRunOwnedByWorker additionally fenced on the claim being
+	// current (claim_released_at IS NULL), for the message-gaps read (PRD #1391 Run B M3c): a
+	// released/superseded flight must not inspect a newer flight's gaps.
+	GetRunOwnedByWorkerLiveClaim(ctx context.Context, arg store.GetRunOwnedByWorkerLiveClaimParams) (store.Run, error)
+	// CountRunMessagesThrough counts the stored message seqs in [1..through] for a run, the
+	// terminal fence's contiguity probe (PRD #1391 Run B M3c, D3).
+	CountRunMessagesThrough(ctx context.Context, arg store.CountRunMessagesThroughParams) (int32, error)
+	// RunMessageGaps returns the missing seq ranges in [1..through] as bounded {first,last} pairs,
+	// keyset-paginated by seq after a cursor (PRD #1391 Run B M3c).
+	RunMessageGaps(ctx context.Context, arg store.RunMessageGapsParams) ([]store.RunMessageGapsRow, error)
 	GetRunOrphanIdentity(ctx context.Context, arg store.GetRunOrphanIdentityParams) (store.GetRunOrphanIdentityRow, error)
 	// GetRunForgeConnForWorker returns the forge connection facts for a run the
 	// worker holds (PRD #158 M1): forge_project_id + the connection. Worker-scoped
@@ -1147,6 +1173,12 @@ type Params struct {
 	// terminal_pending=true entries in one snapshot, mirrored from config. A worker beyond it
 	// sets pending_overflow. The default lives in config.go.
 	WorkerOutboxMaxPending int
+	// WorkerGapFillMax (PRD #1391 Run B M3c, WORKER_GAP_FILL_MAX) is the terminal fence's
+	// gap-recovery ceiling, mirrored from config: a terminal report whose messages_through_seq
+	// leaves more than this many seqs missing from stored run_messages is refused
+	// ErrGapUnrecoverable rather than the recoverable ErrMessagesPending. The zero value means
+	// "any hole is unrecoverable"; the positive default lives in config.go.
+	WorkerGapFillMax int
 	// SkillMaxBytes / SkillsMaxPerRun are the skill caps (PRD #16), mirrored from
 	// config. SkillsMaxPerRun bounds the per-run union at claim assembly; both ride
 	// the claim so the worker enforces the same limits (no server/worker drift).
@@ -2669,10 +2701,24 @@ type StateRequest struct {
 	// worker that sends it would 400 otherwise. The SAME field is also the forge-park fence
 	// (PRD #1392 M1): the forge_unreachable park transaction requires it to equal the locked
 	// run's claim_generation and answers 409 stale_claim on a mismatch (#1247's precedence).
-	ClaimGeneration *int64  `json:"claim_generation"`
-	PlanMd          *string `json:"plan_md"`
-	Branch          *string `json:"branch"`
-	MrIID           *int64  `json:"mr_iid"`
+	ClaimGeneration *int64 `json:"claim_generation"`
+	// MessagesThroughSeq is the terminal fence (PRD #1391 Run B M3c, D3): the highest message
+	// seq the worker asserts it has durably delivered to the api at the moment it reports a
+	// TERMINAL transition (completed/failed). When present, SetState refuses the terminal write
+	// until run_messages holds a CONTIGUOUS [1..through] — runs.last_seq must have reached
+	// `through` AND count(run_messages in [1..through]) must equal `through` (last_seq alone
+	// cannot see a hole below it) — answering ErrMessagesPending (409, reason messages_pending)
+	// otherwise so the worker fills the gap and re-reports. A missing count more than
+	// WorkerGapFillMax below `through` is instead ErrGapUnrecoverable (409, reason
+	// gap_unrecoverable): the hole is too large to ever fill, so the worker must stop re-parking.
+	// Nullable and OPTIONAL — a legacy worker omits it and the terminal transition is UNFENCED,
+	// byte-identical to before. The field MUST exist here because httpx.DecodeJSON sets
+	// DisallowUnknownFields — a fence-capable worker that sends it would 400 otherwise. A negative
+	// value is invalid (ErrInvalidState). Ignored on every non-terminal report.
+	MessagesThroughSeq *int64  `json:"messages_through_seq"`
+	PlanMd             *string `json:"plan_md"`
+	Branch             *string `json:"branch"`
+	MrIID              *int64  `json:"mr_iid"`
 	// Head is the EXACT source-branch tip H a `completed` report is being made against
 	// (PRD #1226 M2, D5). It is REQUIRED for an INTERLOCKED run's completion: SetState routes
 	// such a completion through completeRunWithPermit, which consumes the permit issued for
@@ -2897,6 +2943,57 @@ type StateRequest struct {
 type ProposalPayload struct {
 	Title string `json:"title"`
 	Body  string `json:"body"`
+}
+
+// terminalMessageFence is the terminal fence (PRD #1391 Run B M3c, D3). When a terminal
+// (completed/failed) report carries messages_through_seq, it refuses the transition — BEFORE any
+// mutating write — unless run_messages holds a CONTIGUOUS [1..through]:
+//
+//   - a NEGATIVE through is invalid (ErrInvalidState → 400);
+//   - MORE than WorkerGapFillMax seqs missing from [1..through] is ErrGapUnrecoverable — the hole
+//     is too large to ever fill, so the worker must stop re-parking on it (409 gap_unrecoverable);
+//   - any REMAINING shortfall — last_seq below through, or a hole below it (stored count < through)
+//     — is ErrMessagesPending, a recoverable refusal (409 messages_pending).
+//
+// A nil messages_through_seq leaves the transition UNFENCED (a legacy worker), byte-identical to
+// before. It runs the count on the SAME q the caller mutates through — the tx-bound qtx when the
+// generation FOR UPDATE fence is engaged, else the pool — so the contiguity read and the terminal
+// write share one snapshot. gap_unrecoverable is checked BEFORE messages_pending so a hole too
+// large to fill is never mislabelled as merely pending.
+func (s *Service) terminalMessageFence(ctx context.Context, q Store, runID uuid.UUID, owned store.Run, req StateRequest) error {
+	if req.MessagesThroughSeq == nil {
+		return nil
+	}
+	through := *req.MessagesThroughSeq
+	if through < 0 {
+		return fmt.Errorf("%w: messages_through_seq must be non-negative", ErrInvalidState)
+	}
+	// A message seq is an int32 column, so a run can never store `through` CONTIGUOUS messages once
+	// through exceeds int32 — the hole is unrecoverable by definition. Guarding here also makes the
+	// int32(through) cast at the count query provably in range (gosec G115).
+	if through > math.MaxInt32 {
+		return ErrGapUnrecoverable
+	}
+	// Cheap pre-check: last_seq is the high-water mark, so stored count <= last_seq. If the mark
+	// ALONE is more than a fill window short of `through`, the hole is unrecoverable no matter what
+	// is stored below it — answer without the count query.
+	if through-int64(owned.LastSeq) > int64(s.p.WorkerGapFillMax) {
+		return ErrGapUnrecoverable
+	}
+	// Contiguity count over the run_messages (run_id, seq) unique index. A hole BELOW last_seq is
+	// invisible to the high-water mark, so this — not runs.last_seq — is what proves [1..through]
+	// is gapless.
+	stored, cerr := q.CountRunMessagesThrough(ctx, store.CountRunMessagesThroughParams{RunID: runID, Through: int32(through)})
+	if cerr != nil {
+		return cerr
+	}
+	if through-int64(stored) > int64(s.p.WorkerGapFillMax) {
+		return ErrGapUnrecoverable
+	}
+	if int64(stored) < through {
+		return ErrMessagesPending
+	}
+	return nil
 }
 
 // SetState applies a worker's state transition and returns the run's resulting
@@ -3226,6 +3323,16 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			SessionID:      sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
 		})
 	case "completed":
+		// PRD #1391 Run B M3c (D3): the terminal fence, BEFORE any mutating write (the
+		// SetRunCompleted / completeRunWithPermit calls below). When the report carries
+		// messages_through_seq it refuses a completion whose run_messages are not yet contiguous
+		// through that seq (ErrMessagesPending) or whose hole is too large to fill
+		// (ErrGapUnrecoverable). A legacy worker omits it and this is a no-op. Runs on q, which is
+		// the tx-bound qtx when the generation FOR UPDATE fence is engaged (a non-interlocked
+		// capability completion), else the pool.
+		if ferr := s.terminalMessageFence(ctx, q, runID, owned, req); ferr != nil {
+			return owned, false, ferr
+		}
 		// PRD #265 M1: reconcile the milestone tracker from the lead's signal_done
 		// declaration. progressParams subset-validates the declared ids against the run's
 		// FROZEN list (Decision 12/13) exactly as the `running` path does — a non-issue
@@ -3362,6 +3469,14 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			SessionID: sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
 		})
 	case "failed":
+		// PRD #1391 Run B M3c (D3): the terminal fence, BEFORE any mutating write (the SetRunFailed /
+		// CancelRunByWorker / SupersedeRunByWorker calls below). Same contract as the completed arm:
+		// a `failed` report carrying messages_through_seq is refused until run_messages are contiguous
+		// through that seq (ErrMessagesPending), or told the hole is unrecoverable
+		// (ErrGapUnrecoverable). A legacy worker omits it and this is a no-op.
+		if ferr := s.terminalMessageFence(ctx, q, runID, owned, req); ferr != nil {
+			return owned, false, ferr
+		}
 		// PRD #634 follow-up: a scope-directed run that terminates abnormally (failed/cancelled/
 		// stopped/plan-rejected) never applied the scope cap, so settle its pending audit row
 		// 'declined' — otherwise `run inputs`/the web card render it "active" for a terminal run.
@@ -4083,6 +4198,76 @@ func (s *Service) runOwnedByWorker(ctx context.Context, runID uuid.UUID, wkr sto
 		return store.Run{}, err
 	}
 	return run, nil
+}
+
+// clampInt32 saturates an int64 into the int32 range (0..math.MaxInt32) rather than wrapping — the
+// explicit bounds also make the narrowing provable to gosec G115 (PRD #1391 Run B M3c). Callers
+// already validate their inputs to a far smaller cap; this is defense-in-depth for a direct caller.
+func clampInt32(v int64) int32 {
+	if v > math.MaxInt32 {
+		return math.MaxInt32
+	}
+	if v < 0 {
+		return 0
+	}
+	return int32(v)
+}
+
+// MessageGap is one missing seq range [First..Last] (inclusive) in a run's message log (PRD #1391
+// Run B M3c). Both bounds are >= 1 and First <= Last.
+type MessageGap struct {
+	First int64 `json:"first"`
+	Last  int64 `json:"last"`
+}
+
+// MessageGapsPage is one keyset page of a run's message gaps (PRD #1391 Run B M3c): the gaps in
+// seq order plus, when more pages may follow, the cursor to resume after. NextCursor is nil at the
+// end of the scan.
+type MessageGapsPage struct {
+	Gaps       []MessageGap
+	NextCursor *int64
+}
+
+// RunMessageGaps returns the MISSING seq ranges in [1..through] for a run the worker holds AT ITS
+// CURRENT, UNRELEASED CLAIM (PRD #1391 Run B M3c) — keyset-paginated by seq after `cursor`, at most
+// `limit` ranges. The ownership read is GetRunOwnedByWorkerLiveClaim, so a foreign worker OR a
+// released/superseded flight (a stale worker or generation) is ErrRunNotOwned (→ 404): it must not
+// inspect or fill a newer flight's gaps. NextCursor is set only when the page filled to `limit` and
+// did not reach the trailing gap (whose Last == through) — i.e. more ranges may follow; otherwise it
+// is nil. The caller validates and clamps through/cursor/limit before calling.
+func (s *Service) RunMessageGaps(ctx context.Context, wkr store.Worker, runID uuid.UUID, through, cursor, limit int64) (MessageGapsPage, error) {
+	if _, err := s.q.GetRunOwnedByWorkerLiveClaim(ctx, store.GetRunOwnedByWorkerLiveClaimParams{ID: runID, WorkerID: pgconv.UUID(wkr.ID)}); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return MessageGapsPage{}, ErrRunNotOwned
+		}
+		return MessageGapsPage{}, err
+	}
+	// The handler validates through/cursor to <= a cap (1<<30) and limit to a small ceiling, all
+	// well within int32; clamp defensively so a direct caller cannot overflow the casts and the
+	// conversions are provably in range (gosec G115). A negative here is impossible (the caller
+	// rejects it) but is floored to 0 for the same provability.
+	rows, err := s.q.RunMessageGaps(ctx, store.RunMessageGapsParams{
+		RunID:   runID,
+		Through: clampInt32(through),
+		Cursor:  clampInt32(cursor),
+		Lim:     clampInt32(limit),
+	})
+	if err != nil {
+		return MessageGapsPage{}, err
+	}
+	page := MessageGapsPage{Gaps: make([]MessageGap, 0, len(rows))}
+	for _, r := range rows {
+		page.Gaps = append(page.Gaps, MessageGap{First: int64(r.GapFirst), Last: int64(r.GapLast)})
+	}
+	// Keyset continuation: a full page MIGHT have more behind it, unless the last range is the
+	// trailing gap (Last == through), which is uniquely the final one — the query closes it with a
+	// sentinel and nothing can follow. A short page means the LIMIT was not hit, so the scan is
+	// exhausted. In both terminal cases NextCursor stays nil.
+	if int64(len(rows)) == limit && len(rows) > 0 && int64(rows[len(rows)-1].GapLast) < through {
+		next := int64(rows[len(rows)-1].NextCursor)
+		page.NextCursor = &next
+	}
+	return page, nil
 }
 
 // RunOrphanIdentity is the authoritative owner-run identity a worker needs to derive an

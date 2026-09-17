@@ -313,9 +313,11 @@ func run() error {
 		SweeperBootGrace: cfg.SweeperBootGrace,
 		// PRD #1390 M2a: the terminal-pending lease clock + the snapshot entry caps that
 		// ReplaceWorkerActiveRuns validates and stamps against.
-		TerminalPendingLease:        cfg.TerminalPendingLease,
-		ActiveSnapshotMaxEntries:    cfg.ActiveSnapshotMaxEntries,
-		WorkerOutboxMaxPending:      cfg.WorkerOutboxMaxPending,
+		TerminalPendingLease:     cfg.TerminalPendingLease,
+		ActiveSnapshotMaxEntries: cfg.ActiveSnapshotMaxEntries,
+		WorkerOutboxMaxPending:   cfg.WorkerOutboxMaxPending,
+		// PRD #1391 Run B M3c: the terminal fence's gap-recovery ceiling.
+		WorkerGapFillMax:            cfg.WorkerGapFillMax,
 		DiskPressureThreshold:       cfg.DiskPressureThreshold,
 		WorkerAffinityGrace:         cfg.WorkerAffinityGrace,
 		WorkerAffinityCeiling:       cfg.WorkerAffinityCeiling,

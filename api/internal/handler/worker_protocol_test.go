@@ -1056,3 +1056,35 @@ func TestNormalizeMemoryBasis(t *testing.T) {
 		})
 	}
 }
+
+// TestWorkerRegisterCarriesOutboxMaxPending pins that the register response carries
+// worker_outbox_max_pending (PRD #1391 Run B M3c) = the server's WorkerOutboxMaxPending, so the
+// worker can size its own pending-outcome quota to match the server without a separate config
+// channel. A pointer decode target distinguishes an ABSENT field (dropping the key) from a legit 0.
+func TestWorkerRegisterCarriesOutboxMaxPending(t *testing.T) {
+	box, err := secretbox.New(make([]byte, secretbox.KeySize))
+	if err != nil {
+		t.Fatalf("new box: %v", err)
+	}
+	h := &Handler{
+		wsvc: workersvc.New(&protocolStore{}, box, workersvc.Params{}),
+		cfg:  config.Config{WorkerOutboxMaxPending: 32},
+	}
+	rec := httptest.NewRecorder()
+	h.WorkerRegister(rec, workerReq(http.MethodPost, `{"name":"laptop","version":"1.2.3"}`, uuid.Nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body %q", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		WorkerOutboxMaxPending *int `json:"worker_outbox_max_pending"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode register response: %v (body %q)", err, rec.Body.String())
+	}
+	if resp.WorkerOutboxMaxPending == nil {
+		t.Fatalf("register response missing worker_outbox_max_pending (body %q)", rec.Body.String())
+	}
+	if *resp.WorkerOutboxMaxPending != 32 {
+		t.Fatalf("worker_outbox_max_pending = %d, want 32 (= cfg.WorkerOutboxMaxPending)", *resp.WorkerOutboxMaxPending)
+	}
+}

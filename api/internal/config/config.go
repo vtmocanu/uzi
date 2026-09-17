@@ -407,6 +407,13 @@ type Config struct {
 	// terminal_pending=true entries in one snapshot (#1391's pending-outcome quota). A worker
 	// with more sets pending_overflow instead of listing them. Default 32.
 	WorkerOutboxMaxPending int
+	// WorkerGapFillMax (PRD #1391 Run B M3c, WORKER_GAP_FILL_MAX) is the ceiling on how many
+	// contiguity gaps in [1..through] the terminal fence will let a worker recover before it
+	// gives up. When a `completed`/`failed` report's messages_through_seq leaves more than this
+	// many seqs missing from the stored run_messages (through - stored_count > WorkerGapFillMax),
+	// the fence answers a typed gap_unrecoverable 409 instead of messages_pending — the hole is
+	// too large to ever fill, so the worker must not keep re-parking on it. Default 10000.
+	WorkerGapFillMax int
 	// ActiveSnapshotDisabled (PRD #1390 M2a / D7, UZI_ACTIVE_SNAPSHOT_DISABLED) is the rollback
 	// switch: when set truthy the api omits `active_run_snapshot` from the register
 	// protocol_features and decodes heartbeats strictly as before (an active_snapshot field on
@@ -973,6 +980,9 @@ func Load() (Config, error) {
 	// PRD #1390 M2a / #1391: the pending-outcome quota (terminal_pending entries per snapshot).
 	// parseNonNegInt so 0 is legal (list no pending entries) and a malformed value falls back.
 	cfg.WorkerOutboxMaxPending = parseNonNegInt("WORKER_OUTBOX_MAX_PENDING", 32)
+	// PRD #1391 Run B M3c: the terminal-fence gap-recovery ceiling. parseNonNegInt so 0 is legal
+	// (any missing seq past `through` is immediately unrecoverable) and a malformed value falls back.
+	cfg.WorkerGapFillMax = parseNonNegInt("WORKER_GAP_FILL_MAX", 10000)
 	// PRD #1390 M2a / D7: the rollback switch. loud-on-misconfig (a control knob), matching
 	// UZI_USAGE_REFOLD_ENABLED — a set-but-malformed value aborts boot rather than silently
 	// defaulting.

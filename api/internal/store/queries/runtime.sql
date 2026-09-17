@@ -651,6 +651,16 @@ ORDER BY w.created_at DESC;
 -- Worker-endpoint authz: a worker may only touch a run it currently holds.
 SELECT * FROM runs WHERE id = @id AND worker_id = @worker_id;
 
+-- name: GetRunOwnedByWorkerLiveClaim :one
+-- Worker-endpoint authz for the message-gaps read (PRD #1391 Run B M3c): like GetRunOwnedByWorker
+-- but ALSO fenced on the claim being CURRENT — claim_released_at IS NULL. A held-state credential
+-- switch RELEASES the claim (sets claim_released_at) so a superseded old flight must NOT inspect
+-- or fill a NEWER flight's gaps; a reclaim by a DIFFERENT worker moves worker_id, which the
+-- worker_id predicate already excludes. Both stale cases return no rows → ErrRunNotOwned → 404, the
+-- same shape a foreign worker sees. A run whose claim was never released has claim_released_at NULL
+-- and reads exactly as GetRunOwnedByWorker would.
+SELECT * FROM runs WHERE id = @id AND worker_id = @worker_id AND claim_released_at IS NULL;
+
 -- name: GetRunOrphanIdentity :one
 -- Orphan-classification read (issue #1319): DISTINCT from GetRunOwnedByWorker. Scoped to
 -- the worker's OWNER (user) and the claimant's repo, NOT worker_id, so a terminal owner
@@ -3782,6 +3792,50 @@ WHERE run_id = @run_id AND kind = 'credential_switch'
 -- here and retries at max+1, leaving no gap and losing no worker frame. COALESCE(...,0)::int keeps
 -- the return an int32 for a run with no messages yet.
 SELECT COALESCE(MAX(seq), 0)::int FROM run_messages WHERE run_id = @run_id;
+
+-- name: CountRunMessagesThrough :one
+-- The terminal fence's contiguity probe (PRD #1391 Run B M3c, D3): how many DISTINCT stored
+-- message seqs fall in [1..through] for this run. Backed by the run_messages UNIQUE (run_id, seq)
+-- index, so the count is an index-only range scan. A fully-contiguous run has count == through; a
+-- run with any hole in [1..through] has count < through, which is exactly what SetState refuses a
+-- terminal transition on (ErrMessagesPending) — the high-water last_seq alone cannot see a hole
+-- BELOW it, so the terminal fence needs this count, not just runs.last_seq. Modeled on
+-- MaxRunMessageSeq; ::int keeps the return an int32.
+SELECT count(seq)::int FROM run_messages WHERE run_id = @run_id AND seq BETWEEN 1 AND @through::int;
+
+-- name: RunMessageGaps :many
+-- The hardened message-gaps read (PRD #1391 Run B M3c): the MISSING seq ranges in [1..through]
+-- as bounded {first,last} pairs, after a keyset @cursor, ordered by seq, at most @lim of them.
+-- KEYSET pagination only — NO OFFSET, NO generate_series, NO materialisation of `through` rows:
+-- the gaps are derived from the PRESENT rows via LAG over the (run_id, seq) index, so the scan is
+-- bounded by what is stored (at most the run's message count), never by the size of `through`.
+--
+-- Each interior/leading gap is CLOSED by the present row immediately after it: for a present
+-- `seq` whose predecessor (LAG) is `prev`, the hole [prev+1, seq-1] exists iff seq - prev > 1.
+-- The TRAILING gap (max present seq .. through) has no closing present row, so a sentinel row at
+-- through+1 is UNION-ed in to close it exactly like every interior gap. The keyset is the CLOSER
+-- (the right-neighbor seq): a gap is emitted only when its closer > @cursor, and next_cursor is
+-- that closer, so the next page continues strictly after the last one with no overlap and no gap
+-- re-emitted. The present set is bounded below by @cursor (seq >= @cursor) so a large cursor scans
+-- only the index tail; @cursor doubles as the LAG seed so the first closer after the cursor gets
+-- the correct predecessor. @cursor = 0 (the first page) admits every gap, including the leading
+-- one [1, min_present-1]. The trailing gap is uniquely the one whose `last` == through.
+WITH present AS (
+    SELECT seq FROM run_messages
+    WHERE run_id = @run_id AND seq BETWEEN 1 AND @through::int AND seq >= @cursor::int
+    UNION ALL
+    SELECT (@through::int) + 1
+),
+edges AS (
+    SELECT seq AS closer,
+           COALESCE(LAG(seq) OVER (ORDER BY seq), @cursor::int) AS prev
+    FROM present
+)
+SELECT (prev + 1)::int AS gap_first, (closer - 1)::int AS gap_last, closer::int AS next_cursor
+FROM edges
+WHERE closer - prev > 1 AND closer > @cursor::int
+ORDER BY closer ASC
+LIMIT @lim::int;
 
 -- name: ListRunMessagesAfter :many
 -- Replay for a (re)connecting browser: everything after its last-seen seq, in

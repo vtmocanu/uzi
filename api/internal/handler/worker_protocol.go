@@ -9,6 +9,7 @@ import (
 	"math"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -334,6 +335,10 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 		"worker":            dto,
 		"protocol_features": protocolFeatures(!h.cfg.ActiveSnapshotDisabled),
 		"register_nonce":    registerNonce,
+		// worker_outbox_max_pending (PRD #1391 Run B M3c): the server's terminal_pending outbox cap,
+		// returned at register so the worker can size its own pending-outcome quota to match the
+		// server's WORKER_OUTBOX_MAX_PENDING without a separate config channel.
+		"worker_outbox_max_pending": h.cfg.WorkerOutboxMaxPending,
 	})
 }
 
@@ -355,10 +360,14 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 // feature under rollout skew), and rides the strict-decode strip-and-retry fallback (PRD #1247
 // fix round) on the message, /state and completion wires if it meets an api that predates the
 // field. #1390 lands after #1247 and its own slice must preserve/dedupe
-// this token, not activate it for the first time. Do NOT advertise `terminal_fence` yet: it
-// belongs to Run B, lands after this, and is added to its own slice then — advertising it now
-// would tell the worker to send a fence this api still rejects. Returns a fresh slice so a
-// caller cannot mutate the advertised set.
+// this token, not activate it for the first time.
+//
+// `terminal_fence` (PRD #1391 Run B M3c) is Run B's own slice, added AFTER claim_generation_fence
+// and BEFORE the conditional active_run_snapshot append. This api now implements the terminal
+// fence — a terminal (completed/failed) report may stamp messages_through_seq and SetState refuses
+// the transition (ErrMessagesPending / ErrGapUnrecoverable) until run_messages are contiguous
+// through it — so advertising the token tells a fence-capable worker it may send the field. Returns
+// a fresh slice so a caller cannot mutate the advertised set.
 //
 // `active_run_snapshot` (PRD #1390 M2a) is appended in its own group, gated on
 // activeSnapshotEnabled (= !cfg.ActiveSnapshotDisabled). When the api is started with
@@ -369,6 +378,7 @@ func protocolFeatures(activeSnapshotEnabled bool) []string {
 		{"recovery_park_cause", "recovery_release_exact_echo"}, // PRD #1392 M1
 		{"heartbeat_outbox"},       // PRD #1391 M5, Run A
 		{"claim_generation_fence"}, // PRD #1247 M5 (D11): this api fences message/report inserts on claim_generation for a credential_switch_v1 worker
+		{"terminal_fence"},         // PRD #1391 Run B M3c: this api fences a terminal transition on messages_through_seq contiguity
 	}
 	if activeSnapshotEnabled {
 		groups = append(groups, []string{"active_run_snapshot"}) // PRD #1390 M2a
@@ -986,6 +996,23 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		switch {
+		case errors.Is(err, workersvc.ErrMessagesPending):
+			// PRD #1391 Run B M3c (D3): the terminal fence refused a completed/failed report whose
+			// run_messages are not yet contiguous through the reported messages_through_seq. 409 with
+			// the SAME {run, reason} shape as the forge-park refusals (top-level reason, NOT the
+			// disposition shape) so the worker fills the missing seqs and re-reports. SetState returns
+			// the run alongside the error.
+			httpx.JSON(w, http.StatusConflict, map[string]any{
+				"run":    runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock()),
+				"reason": "messages_pending",
+			})
+		case errors.Is(err, workersvc.ErrGapUnrecoverable):
+			// PRD #1391 Run B M3c: the hole below messages_through_seq is larger than
+			// WorkerGapFillMax, so it can never be filled — a typed 409 (NOT a 400) telling the worker
+			// to stop re-parking on it. Distinct reason token from messages_pending.
+			httpx.JSON(w, http.StatusConflict, map[string]any{
+				"reason": "gap_unrecoverable",
+			})
 		case errors.Is(err, workersvc.ErrStaleClaim), errors.Is(err, workersvc.ErrMissingClaimGeneration):
 			// PRD #1247 M5 (D3): the generation fence rejected this report — a held-state switch
 			// RELEASED this claim, or a reclaim SUPERSEDED it. M5a-1 rework: it ALSO covers a
@@ -1126,6 +1153,83 @@ func (h *Handler) WorkerRunOwnership(w http.ResponseWriter, r *http.Request) {
 	body := map[string]any{"status": status}
 	if recoveryRetryNotBefore != nil {
 		body["recovery_retry_not_before"] = recoveryRetryNotBefore
+	}
+	httpx.JSON(w, http.StatusOK, body)
+}
+
+// Message-gaps read bounds (PRD #1391 Run B M3c). maxMessageGapsThrough caps the `through` query
+// param well below math.MaxInt32 so the query's `through+1` sentinel and the int32 casts never
+// overflow; it is far above any real run's message count. defaultMessageGapsLimit /
+// maxMessageGapsLimit bound the page size — the default when `limit` is omitted, the hard ceiling
+// a larger value is clamped to.
+const (
+	maxMessageGapsThrough   = 1 << 30
+	defaultMessageGapsLimit = 256
+	maxMessageGapsLimit     = 1024
+)
+
+// WorkerRunMessageGaps returns the MISSING message-seq ranges in [1..through] for a run this worker
+// holds at its current, unreleased claim (PRD #1391 Run B M3c). Worker-authenticated, run-scoped,
+// generation-fenced and keyset-paginated: query params `through` (>=0, <= a cap), `limit` (default
+// 256, hard-capped) and `cursor` (a seq keyset value, the next_cursor of the previous page). A
+// foreign worker, or a stale/released flight, is 404 (ErrRunNotOwned) — it must not inspect or fill
+// a newer flight's gaps. Response: {"gaps":[{"first":F,"last":L},...], "next_cursor":<seq or omitted>}.
+func (h *Handler) WorkerRunMessageGaps(w http.ResponseWriter, r *http.Request) {
+	wkr, ok := mw.WorkerFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "worker authentication required")
+		return
+	}
+	runID, ok := httpx.PathUUID(w, r, "id", "run")
+	if !ok {
+		return
+	}
+	// through: required, >= 0, <= the cap (a bounded window the keyset walks).
+	through := int64(0)
+	if raw := r.URL.Query().Get("through"); raw != "" {
+		n, perr := strconv.ParseInt(raw, 10, 64)
+		if perr != nil || n < 0 || n > maxMessageGapsThrough {
+			httpx.Error(w, http.StatusBadRequest, "through must be an integer in [0, 2^30]")
+			return
+		}
+		through = n
+	}
+	// cursor: the seq keyset value to resume after; >= 0. 0 (the default) starts from the head.
+	cursor := int64(0)
+	if raw := r.URL.Query().Get("cursor"); raw != "" {
+		n, perr := strconv.ParseInt(raw, 10, 64)
+		if perr != nil || n < 0 || n > maxMessageGapsThrough {
+			httpx.Error(w, http.StatusBadRequest, "cursor must be an integer in [0, 2^30]")
+			return
+		}
+		cursor = n
+	}
+	// limit: default when omitted, clamped to the hard ceiling; a value <= 0 is invalid.
+	limit := int64(defaultMessageGapsLimit)
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		n, perr := strconv.ParseInt(raw, 10, 64)
+		if perr != nil || n <= 0 {
+			httpx.Error(w, http.StatusBadRequest, "limit must be a positive integer")
+			return
+		}
+		if n > maxMessageGapsLimit {
+			n = maxMessageGapsLimit
+		}
+		limit = n
+	}
+	page, err := h.wsvc.RunMessageGaps(r.Context(), wkr, runID, through, cursor, limit)
+	if err != nil {
+		if errors.Is(err, workersvc.ErrRunNotOwned) {
+			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
+			return
+		}
+		slog.Error("worker run message gaps", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	body := map[string]any{"gaps": page.Gaps}
+	if page.NextCursor != nil {
+		body["next_cursor"] = *page.NextCursor
 	}
 	httpx.JSON(w, http.StatusOK, body)
 }

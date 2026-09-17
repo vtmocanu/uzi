@@ -1564,17 +1564,22 @@ func testParams() Params {
 		TerminalPendingLease:     time.Hour,
 		ActiveSnapshotMaxEntries: 256,
 		WorkerOutboxMaxPending:   32,
-		WorkerAffinityGrace:      2 * time.Minute,
-		WorkerAffinityCeiling:    25 * time.Minute, // PRD #628 run-lane ceiling — deliberately != grace (2m) and != default (2h) so a test proves the run lane reads the ceiling
-		WorkerSpreadGrace:        9 * time.Second,
-		WorkerBackgroundGrace:    15 * time.Minute,
-		ClaimGrace:               5 * time.Minute,
-		SkillMaxBytes:            65536,
-		SkillsMaxPerRun:          32,
-		ChatIdleTimeout:          70 * time.Minute,
-		ChatMaxTurns:             50,
-		WorkerChatIdleTimeout:    60 * time.Minute,
-		WorkerChatTurnTimeout:    10 * time.Minute,
+		// PRD #1391 Run B M3c: the terminal-fence gap-recovery ceiling at its config default, so a
+		// Service from testParams() classifies a small hole as recoverable (ErrMessagesPending) and
+		// only a hole > 10000 as ErrGapUnrecoverable. Fence tests that exercise the unrecoverable
+		// branch either use a `through` far above the stored count or override this on their Params.
+		WorkerGapFillMax:      10000,
+		WorkerAffinityGrace:   2 * time.Minute,
+		WorkerAffinityCeiling: 25 * time.Minute, // PRD #628 run-lane ceiling — deliberately != grace (2m) and != default (2h) so a test proves the run lane reads the ceiling
+		WorkerSpreadGrace:     9 * time.Second,
+		WorkerBackgroundGrace: 15 * time.Minute,
+		ClaimGrace:            5 * time.Minute,
+		SkillMaxBytes:         65536,
+		SkillsMaxPerRun:       32,
+		ChatIdleTimeout:       70 * time.Minute,
+		ChatMaxTurns:          50,
+		WorkerChatIdleTimeout: 60 * time.Minute,
+		WorkerChatTurnTimeout: 10 * time.Minute,
 		// Issue #1197 transient-recovery park: the config defaults, so a svc built from
 		// testParams() computes a real recovery backoff (1m base doubling to a 30m cap).
 		RunRecoveryParkBase: time.Minute,
