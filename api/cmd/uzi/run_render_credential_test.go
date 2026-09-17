@@ -55,13 +55,13 @@ func TestRenderRunDetailCredentialOverride(t *testing.T) {
 }
 
 // TestRenderRunDetailCredentialEpochs pins the epoch history: it renders ONLY when an applied switch
-// actually changed the credential (more than one distinct label), and each epoch names its token,
+// actually changed the credential (more than one distinct secret_id), and each epoch names its token,
 // reason and applied_at.
 func TestRenderRunDetailCredentialEpochs(t *testing.T) {
 	applied := time.Date(2026, 9, 16, 10, 30, 0, 0, time.UTC)
 	twoTokens := []apitypes.CredentialEpochDTO{
-		{ClaimGeneration: 1, Label: sptr("primary-key"), SelectReason: sptr("run_pinned"), AppliedAt: applied},
-		{ClaimGeneration: 2, Label: sptr("backup-key"), SelectReason: sptr("run_default"), AppliedAt: applied.Add(time.Hour)},
+		{ClaimGeneration: 1, SecretID: sptr("secret-aaa"), Label: sptr("primary-key"), SelectReason: sptr("run_pinned"), AppliedAt: applied},
+		{ClaimGeneration: 2, SecretID: sptr("secret-bbb"), Label: sptr("backup-key"), SelectReason: sptr("run_default"), AppliedAt: applied.Add(time.Hour)},
 	}
 	run := apitypes.RunDTO{
 		ID: "run-1", Kind: "issue", Status: "running", Health: "ok",
@@ -81,30 +81,98 @@ func TestRenderRunDetailCredentialEpochs(t *testing.T) {
 		}
 	}
 
-	// A single-credential history (a plain reclaim across a resume — same token, two generations) is
-	// NOT a switch and renders no history block: the ANTHROPIC_TOKEN row already names the one token.
+	// A single-credential history (a plain reclaim across a resume — same secret_id, two generations)
+	// is NOT a switch and renders no history block: the ANTHROPIC_TOKEN row already names the one token.
 	reclaim := apitypes.RunDTO{
 		ID: "run-2", Kind: "issue", Status: "running", Health: "ok",
 		CredentialEpochs: []apitypes.CredentialEpochDTO{
-			{ClaimGeneration: 1, Label: sptr("primary-key"), SelectReason: sptr("run_pinned"), AppliedAt: applied},
-			{ClaimGeneration: 2, Label: sptr("primary-key"), SelectReason: sptr("run_pinned"), AppliedAt: applied.Add(time.Hour)},
+			{ClaimGeneration: 1, SecretID: sptr("secret-aaa"), Label: sptr("primary-key"), SelectReason: sptr("run_pinned"), AppliedAt: applied},
+			{ClaimGeneration: 2, SecretID: sptr("secret-aaa"), Label: sptr("primary-key"), SelectReason: sptr("run_pinned"), AppliedAt: applied.Add(time.Hour)},
 		},
 	}
 	if out := renderDetail(t, reclaim); strings.Contains(out, "TOKEN_HISTORY") {
 		t.Errorf("a same-token reclaim is not a switch and must render no history block, got:\n%s", out)
 	}
 
-	// A deleted-token generation reads "(deleted)" rather than a bare em dash, and still counts as a
-	// distinct credential against a named one so the switch history renders.
+	// A deleted-token generation (null secret_id, null label) reads "(deleted)" rather than a bare em
+	// dash, and its null id still counts as a distinct credential against a named one so the switch
+	// history renders.
 	deleted := apitypes.RunDTO{
 		ID: "run-3", Kind: "issue", Status: "running", Health: "ok",
 		CredentialEpochs: []apitypes.CredentialEpochDTO{
-			{ClaimGeneration: 1, Label: nil, SelectReason: sptr("run_pinned"), AppliedAt: applied},
-			{ClaimGeneration: 2, Label: sptr("backup-key"), SelectReason: sptr("run_default"), AppliedAt: applied.Add(time.Hour)},
+			{ClaimGeneration: 1, SecretID: nil, Label: nil, SelectReason: sptr("run_pinned"), AppliedAt: applied},
+			{ClaimGeneration: 2, SecretID: sptr("secret-bbb"), Label: sptr("backup-key"), SelectReason: sptr("run_default"), AppliedAt: applied.Add(time.Hour)},
 		},
 	}
 	if out := renderDetail(t, deleted); !strings.Contains(out, "TOKEN_HISTORY") || !strings.Contains(out, "(deleted)") {
 		t.Errorf("a deleted-token epoch must read (deleted) and still render the history, got:\n%s", out)
+	}
+}
+
+// TestCredentialHistoryHasSwitch pins the switch-detection key to the STABLE secret_id, not the
+// renameable/reusable label (CodeRabbit correctness finding): a rename must NOT read as a switch,
+// and a real switch behind a reused label MUST. Two cases are mutation-red against the old
+// label-keyed body — same-label/different-id (missed) and different-label/same-id (false positive).
+func TestCredentialHistoryHasSwitch(t *testing.T) {
+	applied := time.Date(2026, 9, 16, 10, 30, 0, 0, time.UTC)
+	epoch := func(gen int64, secretID, label *string) apitypes.CredentialEpochDTO {
+		return apitypes.CredentialEpochDTO{
+			ClaimGeneration: gen, SecretID: secretID, Label: label,
+			SelectReason: sptr("run_pinned"), AppliedAt: applied,
+		}
+	}
+	cases := []struct {
+		name   string
+		epochs []apitypes.CredentialEpochDTO
+		want   bool
+	}{
+		{
+			// A real switch the OLD label-keyed code MISSES: same label, different secret_id.
+			name: "same label different id is a switch",
+			epochs: []apitypes.CredentialEpochDTO{
+				epoch(1, sptr("secret-aaa"), sptr("primary-key")),
+				epoch(2, sptr("secret-bbb"), sptr("primary-key")),
+			},
+			want: true,
+		},
+		{
+			// A rename the OLD label-keyed code REPORTS as a false switch: different label, same id.
+			name: "different label same id is a rename not a switch",
+			epochs: []apitypes.CredentialEpochDTO{
+				epoch(1, sptr("secret-aaa"), sptr("old-name")),
+				epoch(2, sptr("secret-aaa"), sptr("new-name")),
+			},
+			want: false,
+		},
+		{
+			name: "two distinct ids is a switch",
+			epochs: []apitypes.CredentialEpochDTO{
+				epoch(1, sptr("secret-aaa"), sptr("primary-key")),
+				epoch(2, sptr("secret-bbb"), sptr("backup-key")),
+			},
+			want: true,
+		},
+		{
+			name:   "single epoch is not a switch",
+			epochs: []apitypes.CredentialEpochDTO{epoch(1, sptr("secret-aaa"), sptr("primary-key"))},
+			want:   false,
+		},
+		{
+			// Two deleted tokens (null id) group under one "deleted" bucket and cannot manufacture a switch.
+			name: "two null ids group as one deleted bucket",
+			epochs: []apitypes.CredentialEpochDTO{
+				epoch(1, nil, sptr("gone-a")),
+				epoch(2, nil, sptr("gone-b")),
+			},
+			want: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := credentialHistoryHasSwitch(tc.epochs); got != tc.want {
+				t.Errorf("credentialHistoryHasSwitch = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -120,8 +188,8 @@ func TestRenderRunDetailCredentialOverrideSanitizes(t *testing.T) {
 		ID: "run-1", Kind: "issue", Status: "running", Health: "ok",
 		CredentialOverride: &apitypes.CredentialOverrideDTO{Mode: "pinned", Label: sptr(hostileLabel)},
 		CredentialEpochs: []apitypes.CredentialEpochDTO{
-			{ClaimGeneration: 1, Label: sptr(hostileEpoch), SelectReason: sptr("run_pinned"), AppliedAt: time.Unix(0, 0).UTC()},
-			{ClaimGeneration: 2, Label: sptr("backup-key"), SelectReason: sptr("run_default"), AppliedAt: time.Unix(3600, 0).UTC()},
+			{ClaimGeneration: 1, SecretID: sptr("secret-aaa"), Label: sptr(hostileEpoch), SelectReason: sptr("run_pinned"), AppliedAt: time.Unix(0, 0).UTC()},
+			{ClaimGeneration: 2, SecretID: sptr("secret-bbb"), Label: sptr("backup-key"), SelectReason: sptr("run_default"), AppliedAt: time.Unix(3600, 0).UTC()},
 		},
 	}
 	out := renderDetail(t, run)

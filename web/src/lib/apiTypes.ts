@@ -2460,11 +2460,14 @@ export interface CredentialOverride {
 }
 
 /** CredentialEpoch is one claim's credential attribution (PRD #1247 M1, D7): the
- *  generation, the token it spent (label + select_reason, null-tolerant for a deleted
- *  token's history), and when it was applied. claim_generation is a plain JSON number
- *  (int64 on the wire). */
+ *  generation, the token it spent (secret_id + label + select_reason, all null-tolerant for
+ *  a deleted token's history), and when it was applied. claim_generation is a plain JSON
+ *  number (int64 on the wire). secret_id is the STABLE switch key (a label can be renamed
+ *  and reused, so switch detection keys on the id, not the label); null when the token was
+ *  deleted. */
 export interface CredentialEpoch {
   claim_generation: number;
+  secret_id: string | null;
   label: string | null;
   select_reason: string | null;
   applied_at: string;

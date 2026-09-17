@@ -699,11 +699,18 @@ type CredentialOverrideDTO struct {
 }
 
 // CredentialEpochDTO is one claim's credential attribution (PRD #1247 M1, D7): the
-// generation, the token it spent (label + select_reason, both null-tolerant so a deleted
-// token's history stays readable), and when it was applied. ClaimGeneration is int64 —
-// every generation on the wire is int64, mirroring runs.claim_generation.
+// generation, the token it spent (secret_id + label + select_reason, all null-tolerant so a
+// deleted token's history stays readable), and when it was applied. ClaimGeneration is int64
+// — every generation on the wire is int64, mirroring runs.claim_generation.
+//
+// SecretID is the STABLE switch key: a label can be renamed and reused after a delete, so a
+// consumer deciding whether the token actually changed keys on secret_id, not the label.
+// Nullable — the FK nulls it when the token is deleted, exactly as RunDTO.AnthropicSecretID
+// does, so a historical epoch legitimately carries a label with no id. Owner-or-admin scoped
+// like the rest of this DTO, so exposing the per-epoch id here is consistent with that field.
 type CredentialEpochDTO struct {
 	ClaimGeneration int64     `json:"claim_generation"`
+	SecretID        *string   `json:"secret_id"`
 	Label           *string   `json:"label"`
 	SelectReason    *string   `json:"select_reason"`
 	AppliedAt       time.Time `json:"applied_at"`

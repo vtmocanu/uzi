@@ -971,17 +971,19 @@ func credentialEpochRows(r apitypes.RunDTO) [][]string {
 // credentialHistoryHasSwitch reports whether the epoch history names more than one DISTINCT
 // credential — the signal that an applied switch changed the token, as opposed to the same token
 // being reclaimed across a resume (which still mints a fresh claim generation, D7). Distinctness is
-// keyed on the snapshotted label; two generations that both lost their label (deleted tokens) cannot
-// be told apart and so count as one, the honest reading when the data cannot prove a switch.
+// keyed on secret_id, which is STABLE across a rename: a label can be renamed and reused after a
+// delete, so keying on the label could both manufacture a false switch and hide a real one. Epochs
+// whose id is null (a deleted token) are grouped under one "deleted" sentinel bucket, so multiple
+// deleted-token generations count as one — the honest reading when the data cannot prove a switch.
 func credentialHistoryHasSwitch(epochs []apitypes.CredentialEpochDTO) bool {
 	if len(epochs) < 2 {
 		return false
 	}
 	seen := make(map[string]bool, len(epochs))
 	for _, e := range epochs {
-		key := "\x00nil" // a sentinel distinct from any real label so nil groups together
-		if e.Label != nil {
-			key = *e.Label
+		key := "\x00nil" // a sentinel distinct from any real id so deleted (null id) tokens group together
+		if e.SecretID != nil {
+			key = *e.SecretID
 		}
 		seen[key] = true
 		if len(seen) > 1 {
