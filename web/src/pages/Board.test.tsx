@@ -2826,3 +2826,139 @@ describe("Board — hide-empty defaults on + left-anchored toolbar (PRD #1208)",
     }
   });
 });
+
+// PRD #1247 (CodeRabbit finding [5]). Board is REUSED across a :id route change without
+// remounting (the same trap the sortMode/hideEmpty re-read effects document), and
+// cardCredential is keyed ONLY by issue iid — so without a reset a per-card pin on repo A's
+// card silently reapplies to a same-iid card on repo B. A repo change must clear the map.
+describe("Board — per-card credential resets on a repo change (PRD #1247)", () => {
+  function installStorage(): Map<string, string> {
+    const m = new Map<string, string>();
+    Object.defineProperty(window, "localStorage", {
+      configurable: true,
+      value: {
+        getItem: (k: string) => (m.has(k) ? m.get(k)! : null),
+        setItem: (k: string, v: string) => void m.set(k, String(v)),
+        removeItem: (k: string) => void m.delete(k),
+        clear: () => m.clear(),
+        key: (i: number) => [...m.keys()][i] ?? null,
+        get length() {
+          return m.size;
+        },
+      } as Storage,
+    });
+    return m;
+  }
+
+  const token = () =>
+    ({
+      id: "sec-1",
+      kind: "anthropic_token",
+      label: "console-key",
+      is_default: false,
+      auto_eligible: true,
+      created_at: "2026-01-01T00:00:00Z",
+      updated_at: "2026-01-01T00:00:00Z",
+    }) as unknown as import("../lib/api").SecretMeta;
+
+  // Both repos carry a runnable card at the SAME iid (1), so a leaked per-iid pin would be
+  // observable on repo B's identically-keyed card.
+  const boardFor = (repoId: string): BoardData => ({
+    repo_id: repoId,
+    path_with_namespace: repoId === "repo-1" ? "grp/one" : "grp/two",
+    web_url: "https://gitlab.example.com/grp/x",
+    forge_type: "gitlab",
+    columns: [] as BoardData["columns"],
+    cards: [
+      aCard({
+        iid: 1,
+        title: repoId === "repo-1" ? "issue A" : "issue B",
+        column: "",
+        labels: ["uzi"],
+        has_prd_link: false,
+      }),
+    ],
+    pipeline: null,
+    bot_forge_user_id: 0,
+  });
+
+  beforeEach(() => {
+    const store = installStorage();
+    store.set("uzi.board.repo-1.hideEmpty", "false");
+    store.set("uzi.board.repo-2.hideEmpty", "false");
+    vi.mocked(useAuth).mockReturnValue({
+      user: null,
+      loading: false,
+      uziLabel: "uzi",
+      autopilotLabel: "autopilot",
+      appearance: {
+        mode: "dark",
+        light_theme: "hall",
+        dark_theme: "ember",
+        typeface: "system",
+        overrides: { mode: null, light_theme: null, dark_theme: null, typeface: null },
+        defaults: { mode: "dark", light_theme: "hall", dark_theme: "ember", typeface: "system" },
+      },
+      vaultUnlocked: true,
+      vaultExists: true,
+      hasPassword: true,
+      register: vi.fn(),
+      login: vi.fn(),
+      logout: vi.fn(),
+      refresh: vi.fn(),
+    } as unknown as ReturnType<typeof useAuth>);
+    mockApi.getBoard.mockImplementation(async (repoId: string) => ({ board: boardFor(repoId) }));
+    mockApi.getBoardPrefs.mockResolvedValue({ extra_labels: null, show_all: false });
+    mockApi.setBoardPrefs.mockImplementation(async (_repoId, prefs) => prefs);
+    // A worker + a real token so the gate is enabled and the token is pinnable.
+    mockApi.listWorkers.mockResolvedValue({ workers: [{ id: "w1" } as unknown as import("../lib/api").Worker] });
+    mockApi.listSecrets.mockResolvedValue({ secrets: [token()] });
+    mockApi.listRuns.mockResolvedValue({ runs: [] });
+  });
+
+  function NavToRepo2() {
+    const navigate = useNavigate();
+    return (
+      <button type="button" onClick={() => navigate("/repos/repo-2/board")}>
+        go repo 2
+      </button>
+    );
+  }
+
+  const renderBoard = () =>
+    render(
+      <MemoryRouter initialEntries={["/repos/repo-1/board"]}>
+        <Routes>
+          <Route
+            path="/repos/:id/board"
+            element={
+              <>
+                <NavToRepo2 />
+                <Board />
+              </>
+            }
+          />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+  it("clears a per-card pin when the route swaps to another repo", async () => {
+    renderBoard();
+    await screen.findByText("issue A");
+
+    // Pin the token on repo A's card #1 (the user CHANGING the per-card selection).
+    const pickerA = screen.getByLabelText("Anthropic token for #1") as HTMLSelectElement;
+    const opt = (await within(pickerA).findByRole("option", { name: /console-key/ })) as HTMLOptionElement;
+    fireEvent.change(pickerA, { target: { value: opt.value } });
+    expect(pickerA.value).toBe("sec-1");
+
+    // Swap :id without remounting — repo B has a same-iid (1) card.
+    fireEvent.click(screen.getByRole("button", { name: "go repo 2" }));
+    await screen.findByText("issue B");
+
+    // The pin from repo A must NOT carry over: card #1 on repo B seeds back to inherit.
+    // On the old code (no reset) cardCredential[1] survives and this reads "sec-1".
+    const pickerB = screen.getByLabelText("Anthropic token for #1") as HTMLSelectElement;
+    await waitFor(() => expect(pickerB.value).toBe("mode:inherit"));
+  });
+});

@@ -1127,7 +1127,9 @@ func (s *Service) assembleJudgeClaim(ctx context.Context, run store.Run) (*Claim
 	// resolved — `judge` for a pin, `default` for an unbound lane, or auto /
 	// best_of_pool / pool_stale / pool_empty / open_failed for the auto mode — so the
 	// run view names the MODE with no new vocabulary (D20).
-	if err := s.recordRunCredential(ctx, run, cred, choice); err != nil {
+	// emitSwitchMessage=false: the judge lane is not switchable (D10 — the verb refuses it), so it
+	// never emits a 'credential_switch' message. The returned last_seq is discarded.
+	if _, err := s.recordRunCredential(ctx, run, cred, choice, false); err != nil {
 		return nil, err
 	}
 	anthropic := cred.Token

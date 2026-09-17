@@ -314,6 +314,21 @@ SELECT payload FROM run_messages
 WHERE run_id = @run_id AND kind = 'question'
 ORDER BY seq DESC LIMIT 1;
 
+-- name: GetLatestCredentialSwitchSince :one
+-- The newest 'credential_switch' run_message minted AFTER @since (PRD #1247 M9/D14, task d): the
+-- durable, immutable evidence that a token switch was APPLIED during this park cycle. Used by
+-- handleLimitResume to name the new token in the ▶️ Resumed DM. @since is the park-cycle anchor
+-- (slack_run_messages.limit_paused_at = the run's status_since copied at park), so created_at >
+-- @since scopes the message to THIS park cycle — a switch applied in an EARLIER cycle, or a
+-- same-generation epoch re-record that refreshed run_credential_epochs.applied_at during a LATER
+-- park, cannot re-attribute (the message's created_at is immutable and anchors the cycle, unlike
+-- applied_at which RecordRunCredentialEpoch refreshes on a retry). No row = no switch this cycle,
+-- so the resume DM is unchanged. The raw payload is returned and parsed in Go (label, then
+-- escaped/scrubbed before it reaches Slack), exactly like GetLatestRunQuestion.
+SELECT payload FROM run_messages
+WHERE run_id = @run_id AND kind = 'credential_switch' AND created_at > @since
+ORDER BY seq DESC LIMIT 1;
+
 -- name: SetSlackRunQuestion :one
 -- Record which question the run's thread already carries, and the ts of the message
 -- that carried it (PRD #88 M3). The two are written together because they are one

@@ -57,6 +57,11 @@ import { CIFixRunHeader } from "../components/CIFixRunHeader";
 import { RecoveryArchivesPanel } from "../components/RecoveryArchives";
 import { RunIssueRef } from "../components/RunIssueRef";
 import { RunCredential } from "../components/RunCredential";
+import {
+  CredentialEpochList,
+  RunCredentialOverride,
+  SwitchTokenAction,
+} from "../components/RunCredentialOverride";
 import { RunPriorityBadge } from "../components/RunPriorityBadge";
 import { formatDuration } from "../components/RunEvent";
 import { RunUsagePanel } from "../components/RunUsage";
@@ -1795,6 +1800,11 @@ export function RunView() {
                 ) : (
                   <span className="text-xs text-muted">Only the run's owner can resume it.</span>
                 ))}
+              {/* PRD #1247 M7: the owner's "Switch token" action, modelled on Resume above —
+                  a primary control for the owner, inert text for a non-owner, and hidden
+                  entirely for a refused lane (task_review / chat / judge / self_improve) or a
+                  terminal run (those 409 server-side). It refreshes the run after a switch. */}
+              <SwitchTokenAction run={run} canSteer={canSteer} onSwitched={refreshRun} />
               {/* PRD #1190: the pending-pause chip. Shown whenever a request is pending
                   (pause_requested_at set) — including on a run overtaken by an involuntary
                   park, where the intent survives (D6). Info-toned and, unlike the status
@@ -1948,6 +1958,10 @@ export function RunView() {
                   for every claimed run, and the usage panel only appears once a run
                   has reported usage. */}
               <RunCredential run={run} />
+              {/* PRD #1247 M7: the per-run credential OVERRIDE (the choice) + the pending
+                  held-state SWITCH, distinct from RunCredential above (the credential the
+                  claim SPENT). Self-hides when the run has neither. */}
+              <RunCredentialOverride run={run} />
               {/* PRD #300: the per-schedule model this run froze at fire time, shown on
                   EVERY status (not just completed) so a wrong/typo'd model is visible on a
                   FAILED or stopped run too (Risks / SC6). null = inherited the owner's
@@ -1984,6 +1998,10 @@ export function RunView() {
 
       {error && <Alert message={error} />}
       {actionErr && <Alert message={actionErr} />}
+
+      {/* PRD #1247 M7: the applied-switch history — one row per claim, naming the token it
+          spent, why, and when. Self-hides for a run with no epochs. */}
+      <CredentialEpochList epochs={run.credential_epochs} />
 
       {/* Issue #754: the pool-empty hold + Resume-now. Ordered ABOVE the usage-limit
           strip deliberately (web-ux should-fix): on a pool_wait run the strip below
@@ -2264,6 +2282,7 @@ export function RunView() {
 
       {run.status === "awaiting_approval" && (
         <PlanPanel
+          key={run.id}
           run={run}
           messages={messages}
           workers={workers}

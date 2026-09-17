@@ -136,14 +136,20 @@ func decodeLatestUnmet(raw []byte) []string {
 
 // credentialEpochsToDTO maps a run's credential-epoch journal rows to the DTO slice
 // (PRD #1247 M1, D7), oldest generation first (the query orders them). Always returns a
-// non-nil slice ([] over null) so the wire field is never null once enriched. label and
-// select_reason are null-tolerant so a deleted token's history stays readable.
+// non-nil slice ([] over null) so the wire field is never null once enriched. secret_id,
+// label and select_reason are all null-tolerant so a deleted token's history stays readable;
+// secret_id is mapped INDEPENDENTLY of label (the FK nulls the id on a delete while the
+// snapshotted label stays), exactly as runToDTO maps the run-level id/label pair.
 func credentialEpochsToDTO(rows []store.RunCredentialEpoch) []apitypes.CredentialEpochDTO {
 	out := make([]apitypes.CredentialEpochDTO, 0, len(rows))
 	for _, e := range rows {
 		dto := apitypes.CredentialEpochDTO{
 			ClaimGeneration: e.ClaimGeneration,
 			AppliedAt:       e.AppliedAt.Time,
+		}
+		if e.SecretID.Valid {
+			s := uuid.UUID(e.SecretID.Bytes).String()
+			dto.SecretID = &s
 		}
 		if e.Label.Valid {
 			l := e.Label.String

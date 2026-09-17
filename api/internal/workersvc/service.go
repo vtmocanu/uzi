@@ -2572,6 +2572,13 @@ type IncomingMessage struct {
 	AgentInstance string          `json:"agent_instance,omitempty"`
 	AgentLabel    string          `json:"agent_label,omitempty"`
 	Payload       json.RawMessage `json:"payload"`
+	// ClaimGeneration is the runs.claim_generation the frame was produced under (PRD #1247 M9,
+	// D7) — the epoch the usage fold attributes this frame's leg to. It is SERVER-POPULATED, not a
+	// wire field (`json:"-"`): the batch generation rides its own top-level `claim_generation` on
+	// the request, and appendMessages stamps the per-call effectiveClaimGen onto every frame it
+	// folds; the refold reads each frame's PERSISTED run_messages.claim_generation. nil = legacy /
+	// unknown (a pre-feature frame, or a legacy worker's unfenced batch), folded as NULL provenance.
+	ClaimGeneration *int64 `json:"-"`
 }
 
 // resultUsagePayload is the subset of a terminal result frame's payload the fold

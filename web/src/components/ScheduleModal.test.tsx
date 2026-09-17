@@ -5,10 +5,10 @@
 // POST /api/schedules/preview endpoint — never a client-side cron guess — so it
 // always matches server truth (Decision 6).
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { ScheduleModal } from "./ScheduleModal";
-import { api, ApiError, type Schedule } from "../lib/api";
+import { api, ApiError, type Schedule, type SecretMeta } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
 // The REAL mock (distinct from the vi.mock'd `api` above) — used to exercise the mock's
 // own updateSchedule repoint branch directly. It ships seeded schedules/repos and starts
@@ -29,6 +29,8 @@ vi.mock("../lib/api", async (importOriginal) => {
       // The sweep branch mounts SweepLabelWarn, which checks labels against the repo.
       checkRepoLabels: vi.fn(),
       ensureRepoLabels: vi.fn(),
+      // PRD #1247 M7: the modal's TokenPicker seed loads the user's tokens.
+      listSecrets: vi.fn(),
     },
   };
 });
@@ -54,6 +56,7 @@ beforeEach(() => {
   mockApi.listRepos.mockResolvedValue({ repos: [] });
   mockApi.checkRepoLabels.mockResolvedValue({ missing: [] });
   mockApi.ensureRepoLabels.mockResolvedValue({ ensured: [] });
+  mockApi.listSecrets.mockResolvedValue({ secrets: [] });
 });
 afterEach(() => {
   cleanup();
@@ -1209,5 +1212,120 @@ describe("the Next fires preview renders from the mocked endpoint", () => {
     const call = calls[calls.length - 1]?.[0];
     expect(call?.timing).toBe("recurring");
     expect(call?.cron_expr).toBe("0 2 * * 1-5");
+  });
+});
+
+// PRD #1247 M6/M7: the per-schedule Anthropic credential picker must decide omit-vs-send
+// correctly through the build path — an UNRELATED edit omits credential_override so the
+// server's seed-and-keep preserves the stored value, an explicit CLEAR sends {mode:"inherit"},
+// and a real PICK sends {mode:"pinned", secret_id}. A self_improve schedule never sends one.
+function anthropicToken(over: Partial<SecretMeta> = {}): SecretMeta {
+  return {
+    id: "sec-console",
+    kind: "anthropic_token",
+    label: "console-key",
+    is_default: false,
+    auto_eligible: true,
+    created_at: "2026-01-01T00:00:00Z",
+    updated_at: "2026-01-01T00:00:00Z",
+    ...over,
+  };
+}
+
+describe("the per-schedule credential picker (PRD #1247 M6/M7)", () => {
+  it("OMITS credential_override on an unrelated edit (seed-and-keep)", async () => {
+    mockApi.updateSchedule.mockResolvedValue(schedFixture());
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken()] });
+    render(
+      <MemoryRouter>
+        <ScheduleModal editing={schedFixture()} onClose={vi.fn()} onSaved={vi.fn()} />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(mockApi.listSecrets).toHaveBeenCalled());
+
+    // Touch ONLY the model — the credential picker is left untouched.
+    fireEvent.change(screen.getByLabelText("Model (optional)"), { target: { value: "opus" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenCalled());
+
+    const input = mockApi.updateSchedule.mock.calls[0]?.[1];
+    // The unrelated edit flowed (positive control) and credential_override was omitted.
+    expect(input?.model).toBe("opus");
+    expect(input?.credential_override).toBeUndefined();
+  });
+
+  it("sends {mode:'inherit'} when the user explicitly clears a stored override", async () => {
+    mockApi.updateSchedule.mockResolvedValue(schedFixture());
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken()] });
+    render(
+      <MemoryRouter>
+        <ScheduleModal
+          editing={schedFixture({ credential_override: { mode: "auto", label: null } })}
+          onClose={vi.fn()}
+          onSaved={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(mockApi.listSecrets).toHaveBeenCalled());
+
+    const select = screen.getByLabelText("Anthropic token for this schedule") as HTMLSelectElement;
+    // Seeded from the stored auto override (positive control before the clear).
+    const seededAuto = within(select).getByRole("option", { name: /Auto-select/ }) as HTMLOptionElement;
+    expect(select.value).toBe(seededAuto.value);
+
+    // Clear it back to Inherit — an EXPLICIT clear that must reach the validator.
+    const inheritOption = within(select).getByRole("option", { name: /Inherit the worker/ }) as HTMLOptionElement;
+    fireEvent.change(select, { target: { value: inheritOption.value } });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenCalled());
+
+    expect(mockApi.updateSchedule.mock.calls[0]?.[1]?.credential_override).toEqual({ mode: "inherit" });
+  });
+
+  it("sends {mode:'pinned', secret_id} when the user pins a token", async () => {
+    mockApi.updateSchedule.mockResolvedValue(schedFixture());
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken()] });
+    render(
+      <MemoryRouter>
+        <ScheduleModal editing={schedFixture()} onClose={vi.fn()} onSaved={vi.fn()} />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(mockApi.listSecrets).toHaveBeenCalled());
+
+    const select = screen.getByLabelText("Anthropic token for this schedule") as HTMLSelectElement;
+    // The token option appears once listSecrets resolves; pin to it.
+    const tokenOption = await within(select).findByRole("option", { name: /console-key/ });
+    fireEvent.change(select, { target: { value: (tokenOption as HTMLOptionElement).value } });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenCalled());
+
+    expect(mockApi.updateSchedule.mock.calls[0]?.[1]?.credential_override).toEqual({
+      mode: "pinned",
+      secret_id: "sec-console",
+    });
+  });
+
+  it("hides the picker and never sends an override for a self_improve schedule", async () => {
+    mockApi.updateSchedule.mockResolvedValue(schedFixture({ target: "self_improve" }));
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken()] });
+    render(
+      <MemoryRouter>
+        <ScheduleModal
+          editing={schedFixture({ origin: "default", target: "self_improve", catalog_slug: "self-improve" })}
+          onClose={vi.fn()}
+          onSaved={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(mockApi.listSecrets).toHaveBeenCalled());
+
+    // The picker is replaced by an explanation, so no token control renders…
+    expect(screen.queryByLabelText("Anthropic token for this schedule")).toBeNull();
+    expect(screen.getByText(/always use your worker.s token/i)).toBeTruthy();
+
+    // …and a save never carries a credential override for this lane.
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenCalled());
+    expect(mockApi.updateSchedule.mock.calls[0]?.[1]?.credential_override).toBeUndefined();
   });
 });

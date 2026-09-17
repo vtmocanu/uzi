@@ -189,6 +189,7 @@
   "credential_epochs": [
     {
       "claim_generation": 1,
+      "secret_id": "x",
       "label": "x",
       "select_reason": "x",
       "applied_at": "2020-01-02T03:04:05Z"

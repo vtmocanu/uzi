@@ -1,15 +1,20 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 import {
+  api,
   type AgentSelectionInput,
   type Run,
   type RunMessage,
   type Worker,
 } from "../../lib/api";
+import { errorMessage } from "../../lib/apiError";
+import { setTokenBody } from "../../lib/credentialOverride";
+import { useSeededCredential } from "../../lib/useSeededCredential";
 import { stripUnsafeChars } from "../../lib/safeText";
 import { effectiveWorkerCaps } from "../../lib/workerCaps";
 import { AgentPicker, selectionLabel, type OwnTemplate } from "../../components/AgentPicker";
 import { Markdown } from "../../components/Markdown";
-import { Badge, Button, Spinner, Textarea, cx } from "../../components/ui";
+import { TokenPicker } from "../../components/TokenPicker";
+import { Alert, Badge, Button, Field, Spinner, Textarea, cx } from "../../components/ui";
 
 // The server enforces the real revision cap; 3 is only the display default for the
 // "revision N of MAX" counter (PRD #41 Decision 9).
@@ -186,6 +191,67 @@ export function PlanPanel({
   });
   const onSelectionChange = useCallback((s: AgentSelectionInput) => setSelection(s), []);
 
+  // PRD #1247 M7: the token the IMPLEMENTATION phase runs on, chosen at the gate. Seeded
+  // from the run's stored override (a pinned label→id resolved once the token list loads,
+  // touched-ref guarded) so the picker shows the run's CURRENT choice, not a misleading
+  // "inherit". On approve, a TOUCHED picker always sends the switch-body contract via
+  // api.setRunCredential BEFORE the approve submits — including an explicit Inherit, which
+  // clears the run's override back to the worker binding (setTokenBody). An UNTOUCHED picker
+  // sends nothing (a no-op that PRESERVES the create-time override). The credential call
+  // stays HERE (not folded into onApprove's args) so the existing onApprove contract — and
+  // its tests — are untouched.
+  const {
+    selection: credential,
+    onSelectionChange: onCredentialChange,
+    tokens: credentialTokens,
+    touched: credentialTouched,
+  } = useSeededCredential(run.credential_override, { enabled: canSteer });
+  const [credentialError, setCredentialError] = useState("");
+  // A synchronous in-flight guard for the approve sequence. doApprove awaits
+  // api.setRunCredential BEFORE onApprove, and RunView's `busy` only rises once
+  // onApprove -> act runs, so without this guard a second click during that await
+  // double-submits the credential set and the approval. The ref blocks re-entry
+  // synchronously (before any re-render); `submitting` disables the approve buttons.
+  const submittingRef = useRef(false);
+  const [submitting, setSubmitting] = useState(false);
+  const doApprove = useCallback(
+    async (withOverride: boolean) => {
+      if (submittingRef.current) return;
+      submittingRef.current = true;
+      setSubmitting(true);
+      setCredentialError("");
+      try {
+        // Only (re)set the token when the user CHANGED the gate picker: leaving the seeded
+        // choice untouched keeps the run's create-time override (sending nothing is a no-op
+        // that preserves it). A TOUCHED picker always sends the switch-body contract — even
+        // an explicit Inherit, which clears the run's override back to the worker binding
+        // (setTokenBody sends {mode:"inherit"} rather than omitting it, unlike a create body).
+        if (credentialTouched) {
+          try {
+            await api.setRunCredential(run.id, setTokenBody(credential));
+          } catch (e) {
+            // Do not approve if setting the token failed — the run would otherwise
+            // implement on the wrong credential. Surface the error at the gate.
+            setCredentialError(errorMessage(e, "Could not set the token for this run"));
+            return;
+          }
+        }
+        // Preserve the exact onApprove arg-count contract (1 arg for the plain approve,
+        // 2 for the capability override) so RunView's `act` wrapper and the panel tests
+        // see no change.
+        if (withOverride) onApprove(selection, true);
+        else onApprove(selection);
+      } finally {
+        // Clear the guard. On the happy path onApprove has already flipped RunView's
+        // `busy` (batched with this update), so the buttons stay disabled; on the
+        // credential-error return, re-enable them so the user can retry.
+        submittingRef.current = false;
+        setSubmitting(false);
+      }
+    },
+    [credential, credentialTouched, run.id, onApprove, selection],
+  );
+
   const activeRoster = selection.source === "repo" ? repoAgents.map((a) => a.name) : ownTemplates.map((t) => t.name);
   const activeCount = activeRoster.length - selection.exclusions.length;
   const approveLabel =
@@ -288,7 +354,7 @@ export function PlanPanel({
           <span className="text-[11px] text-faint">{roundsLabel}</span>
           {canSteer && !disclosing && (
             <div className="flex gap-2">
-              <Button disabled={busy} onClick={() => onApprove(selection)}>
+              <Button disabled={busy || submitting} onClick={() => void doApprove(false)}>
                 {approveLabel}
               </Button>
               <Button variant="secondary" disabled={busy} onClick={() => setRequesting(true)}>
@@ -308,6 +374,31 @@ export function PlanPanel({
         {canSteer && (
           <AgentPicker repoAgents={repoAgents} ownTemplates={ownTemplates} onChange={onSelectionChange} />
         )}
+
+        {/* PRD #1247 M7: the gate token picker — the natural sibling of the agent picker.
+            Choose the Anthropic token the implementation phase runs on. Seeded from the
+            run's stored override so it shows the CURRENT choice (a pinned label→id resolved
+            once the list loads); a run with no override seeds to inherit. Owner-gated like
+            the AgentPicker. */}
+        {canSteer && (
+          <Field label="Anthropic token" htmlFor="plan-gate-token">
+            <TokenPicker
+              id="plan-gate-token"
+              label="Anthropic token for the implementation phase"
+              className="h-9 max-w-xs text-sm"
+              value={credential}
+              onChange={onCredentialChange}
+              tokens={credentialTokens}
+              disabled={busy}
+            />
+            <p className="mt-1 text-[11px] text-faint">
+              {run.credential_override
+                ? "The implementation phase runs on this token. Leaving the current choice keeps this run’s override."
+                : "The implementation phase runs on this token. Inherit keeps the worker’s current binding."}
+            </p>
+          </Field>
+        )}
+        {credentialError && <Alert message={credentialError} />}
 
         {/* PRD #122: the PRE-APPROVAL candidate milestones, shown ONLY at the plan gate,
             beside the plan body. Rendered as PLAIN JSX (never <Markdown>): a candidate
@@ -394,7 +485,7 @@ export function PlanPanel({
                 default path. */}
             {unmetCaps.length > 0 && canSteer && (
               <div className="mt-2.5 border-t border-edge/60 pt-2.5">
-                <Button variant="secondary" size="sm" disabled={busy} onClick={() => onApprove(selection, true)}>
+                <Button variant="secondary" size="sm" disabled={busy || submitting} onClick={() => void doApprove(true)}>
                   Run without {unmetCaps.map((c) => stripUnsafeChars(c)).join(", ")}
                 </Button>
                 <p className="mt-1 text-[11px] text-faint">

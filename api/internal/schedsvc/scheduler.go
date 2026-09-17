@@ -658,9 +658,9 @@ func (e *Scheduler) firePrompt(ctx context.Context, sched store.RunSchedule) (Fi
 	instruction := composeRunDescriptionWithSections(prompt, guidanceOf(sched), sections...)
 	// PRD #841 M2: the schedule's stored mr_rework override stamps onto the run (nil ⇒
 	// inherit the owner default live).
-	// nil credOverride (PRD #1247 M1): M6 threads the schedule's stored credential
-	// override onto the fired prompt run; M1 inherits the worker binding.
-	run, err := e.runs.CreatePromptRun(ctx, sched.UserID, sched.RepoID, sched.ID, title, instruction, sched.AutoApprove, sched.WaitOnLimit, scheduleMrRework(sched), scheduleModel(sched), scheduleOverrideSubagentModel(sched), nil)
+	// PRD #1247 M6: the schedule's stored credential override is threaded onto the fired
+	// prompt run (nil ⇒ inherit the worker binding, a pre-#1247 fire).
+	run, err := e.runs.CreatePromptRun(ctx, sched.UserID, sched.RepoID, sched.ID, title, instruction, sched.AutoApprove, sched.WaitOnLimit, scheduleMrRework(sched), scheduleModel(sched), scheduleOverrideSubagentModel(sched), scheduleCredentialOverride(sched))
 	switch {
 	case err == nil:
 		return FireOutcome{Matched: 1, Started: []Started{{RunID: run.ID, Title: title}}}, nil
@@ -714,8 +714,9 @@ func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule,
 		// guarantee that label-driven autopilot behaviour is unchanged.
 		// PRD #841 M2: the schedule's stored mr_rework override stamps onto the run
 		// (nil ⇒ inherit the owner default live).
-		// nil credOverride (PRD #1247 M1): M6 threads the schedule's stored override here.
-		run, err = e.runs.CreateScheduledAutopilotRun(ctx, sched.UserID, repoID, iid, desc, &waitOnLimit, scheduleMrRework(sched), scheduleModel(sched), scheduleOverrideSubagentModel(sched), nil)
+		// PRD #1247 M6: the schedule's stored credential override is threaded here
+		// (nil ⇒ inherit the worker binding).
+		run, err = e.runs.CreateScheduledAutopilotRun(ctx, sched.UserID, repoID, iid, desc, &waitOnLimit, scheduleMrRework(sched), scheduleModel(sched), scheduleOverrideSubagentModel(sched), scheduleCredentialOverride(sched))
 	} else {
 		// CreateScheduledRun is the non-auto-approve scheduled seam. Post-PRD #764 M1 it
 		// and the interactive CreateRun apply the SAME single uzi_label eligibility gate —
@@ -725,9 +726,9 @@ func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule,
 		// needs a human here), not eligibility.
 		// PRD #841 M2: the schedule's stored mr_rework override stamps onto the run
 		// (nil ⇒ inherit the owner default live).
-		// trailing nil, nil: seed (no seeded plan for a scheduled issue run) and
-		// credOverride (PRD #1247 M1 inherit; M6 threads the schedule's stored override).
-		run, err = e.runs.CreateScheduledRun(ctx, sched.UserID, repoID, iid, desc, &waitOnLimit, scheduleMrRework(sched), scheduleModel(sched), scheduleOverrideSubagentModel(sched), nil, nil)
+		// trailing seed=nil (no seeded plan for a scheduled issue run); PRD #1247 M6 threads
+		// the schedule's stored credential override (nil ⇒ inherit the worker binding).
+		run, err = e.runs.CreateScheduledRun(ctx, sched.UserID, repoID, iid, desc, &waitOnLimit, scheduleMrRework(sched), scheduleModel(sched), scheduleOverrideSubagentModel(sched), nil, scheduleCredentialOverride(sched))
 	}
 
 	if err == nil {
@@ -1091,6 +1092,26 @@ func scheduleMrRework(s store.RunSchedule) *bool {
 	}
 	v := s.MrReworkEnabled.Bool
 	return &v
+}
+
+// scheduleCredentialOverride builds the *workersvc.CredentialOverride a fired run inherits
+// from the schedule's stored credential columns (PRD #1247 M6, D5): nil when the mode column
+// is NULL/empty (inherit — the fired run follows the worker binding, byte-identical to a
+// pre-#1247 fire), else the stored mode plus, for a pinned mode, the pinned secret id. The
+// columns were validated through the one validator at schedule create/edit, so the fire path
+// trusts them and does not re-validate. Threaded into CreatePromptRun / CreateScheduledAutopilotRun
+// / CreateScheduledRun (the 3 seams covering the 5 logical producer paths); CreateSelfImproveRun
+// takes no override param and is D10-excluded, so self_improve never threads one.
+func scheduleCredentialOverride(s store.RunSchedule) *workersvc.CredentialOverride {
+	if !s.CredentialOverrideMode.Valid || s.CredentialOverrideMode.String == "" {
+		return nil
+	}
+	o := &workersvc.CredentialOverride{Mode: s.CredentialOverrideMode.String}
+	if s.CredentialOverrideSecretID.Valid {
+		id := uuid.UUID(s.CredentialOverrideSecretID.Bytes)
+		o.SecretID = &id
+	}
+	return o
 }
 
 // truncateUTF8 returns the longest prefix of s that is at most n bytes AND does not split

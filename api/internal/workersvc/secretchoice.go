@@ -2,8 +2,11 @@ package workersvc
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"strings"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -264,7 +267,7 @@ func (s *Service) openAnthropic(ctx context.Context, userID uuid.UUID, secretID 
 // case that is NOT an error: it means the run vanished under us (its forge
 // connection cascade-deleted the repo → run), which every other claim-path reader
 // treats as errRunVanished and drops.
-func (s *Service) recordRunCredential(ctx context.Context, run store.Run, cred claimCred, choice secretChoice) error {
+func (s *Service) recordRunCredential(ctx context.Context, run store.Run, cred claimCred, choice secretChoice, emitSwitchMessage bool) (int32, error) {
 	// The headroom recorded is the RAW headroom of the pick — what the user's own
 	// meters show — never the in-flight-penalised rank, which is an internal ordering
 	// key that appears nowhere else in the product. NULL for every non-auto lane,
@@ -275,7 +278,41 @@ func (s *Service) recordRunCredential(ctx context.Context, run store.Run, cred c
 	if choice.headroom != nil {
 		headroom = pgtype.Int2{Int16: *choice.headroom, Valid: true}
 	}
-	n, err := s.q.SetRunAnthropicSecret(ctx, store.SetRunAnthropicSecretParams{
+	// The RUN-LANE claim path (emitSwitchMessage) emits a 'credential_switch' run message on an
+	// APPLIED token switch, ATOMICALLY with the credential write + epoch journal, so the message
+	// and the journal can never disagree about which token this claim spends (PRD #1247 M9, D7/D14).
+	// That needs a transaction; when none is wired — the chat/judge lanes (emitSwitchMessage=false),
+	// or a degraded/test deployment with no pool — fall back to the two-write, no-message path,
+	// byte-identical to the pre-M9 behaviour. The two-write path returns run.LastSeq unchanged
+	// (its callers discard it).
+	if !emitSwitchMessage || s.txBeginner == nil {
+		if err := writeCredentialAndEpoch(ctx, s.q, run, cred, choice, headroom); err != nil {
+			return 0, err
+		}
+		return run.LastSeq, nil
+	}
+	return s.recordRunCredentialTx(ctx, run, cred, choice, headroom)
+}
+
+// credentialWriter is the two-statement credential-record surface shared by the transactional
+// (qtx: *store.Queries) and the non-transactional (s.q: workersvc Store) recordRunCredential
+// paths, so the SetRunAnthropicSecret + RecordRunCredentialEpoch pair is written once and both
+// paths cannot drift (PRD #1247 M9). Both satisfy it.
+type credentialWriter interface {
+	SetRunAnthropicSecret(ctx context.Context, arg store.SetRunAnthropicSecretParams) (int64, error)
+	RecordRunCredentialEpoch(ctx context.Context, arg store.RecordRunCredentialEpochParams) error
+}
+
+// writeCredentialAndEpoch records WHICH credential a claim spent (SetRunAnthropicSecret) and
+// appends the attribution-journal epoch for THIS claim (RecordRunCredentialEpoch), keyed by the
+// run's existing claim_generation (00223, PRD #1349 — this PRD never increments it). The epoch is
+// written AFTER SetRunAnthropicSecret confirmed a live run (n>0), so the FK to runs cannot fail on
+// a vanished run and the epoch can never disagree with runs.anthropic_secret_id about which token
+// this claim spent. Idempotent on the composite PK, so a claim retried at the same generation
+// re-records rather than duplicating. A 0-row SetRunAnthropicSecret is errRunVanished (the run's
+// forge connection cascade-deleted the repo → run), the one non-error 0-row case.
+func writeCredentialAndEpoch(ctx context.Context, w credentialWriter, run store.Run, cred claimCred, choice secretChoice, headroom pgtype.Int2) error {
+	n, err := w.SetRunAnthropicSecret(ctx, store.SetRunAnthropicSecretParams{
 		AnthropicSecretID:     pgconv.UUID(cred.ID),
 		AnthropicSecretLabel:  pgconv.TextOrNull(cred.Label),
 		AnthropicSelectReason: pgconv.TextOrNull(choice.reason),
@@ -289,13 +326,7 @@ func (s *Service) recordRunCredential(ctx context.Context, run store.Run, cred c
 	if n == 0 {
 		return errRunVanished
 	}
-	// PRD #1247 M1 (D7/D14): append the attribution-journal epoch for THIS claim, keyed
-	// by the run's existing claim_generation (00223, PRD #1349 — this PRD never
-	// increments it). Written AFTER SetRunAnthropicSecret confirmed a live run (n>0), so
-	// the FK to runs cannot fail on a vanished run and the epoch can never disagree with
-	// runs.anthropic_secret_id about which token this claim spent. Idempotent on the
-	// composite PK, so a claim retried after a crash re-records rather than duplicating.
-	if err := s.q.RecordRunCredentialEpoch(ctx, store.RecordRunCredentialEpochParams{
+	if err := w.RecordRunCredentialEpoch(ctx, store.RecordRunCredentialEpochParams{
 		RunID:           run.ID,
 		ClaimGeneration: run.ClaimGeneration,
 		SecretID:        pgconv.UUID(cred.ID),
@@ -305,6 +336,233 @@ func (s *Service) recordRunCredential(ctx context.Context, run store.Run, cred c
 		return fmt.Errorf("record run credential epoch: %w", err)
 	}
 	return nil
+}
+
+// credentialSwitchMessageKind is the run_messages.kind for the per-applied-switch feed message
+// (PRD #1247 M9, task c). There is NO CHECK constraint on run_messages.kind (kinds like 'plan' /
+// 'question' were added without a migration), so minting a new kind needs no migration. The fold
+// filters kind IN ('status','error'), so this kind is invisible to usage folding by construction.
+const credentialSwitchMessageKind = "credential_switch" //nolint:gosec // G101: a run_messages.kind label, not a credential
+
+// maxSwitchSeqAttempts bounds the gapless seq-collision recovery loop (PRD #1247 M9, task c step
+// 7). A worker's InsertRunMessage is NOT serialized by the run-row FOR UPDATE lock the switch
+// transaction holds, so a worker frame can occupy the seq we try; one re-read + retry normally
+// lands it (at most one competing frame at a time). The bound is generous defense against a
+// pathological burst; on exhaustion the mandatory credential write still commits and only the
+// best-effort message is skipped (see insertCredentialSwitchMessage).
+//
+// A var, not a const, only so the seq-collision regression test can lower it to force the loop to
+// exhaust; production never reassigns it (default 32).
+var maxSwitchSeqAttempts = 32
+
+// credentialSwitchMessagePayload is the 'credential_switch' run message body (PRD #1247 M9, task
+// c): enough for a downstream renderer to say "Switched to token <label> (<reason>)" and for the
+// Slack resume DM to name the token. Label is a pointer so an unlabelled token serialises as JSON
+// null rather than "".
+type credentialSwitchMessagePayload struct {
+	Label        *string `json:"label"`
+	SelectReason string  `json:"select_reason"`
+	SecretID     string  `json:"secret_id"`
+}
+
+// pendingSwitchBroadcast carries the just-inserted switch message out of the transaction so the
+// caller can broadcast it AFTER commit (never before — a spare-slot reclaim must not see a message
+// the tx might roll back). nil ⇒ no message was inserted (no switch, or an idempotent skip).
+type pendingSwitchBroadcast struct {
+	seq     int32
+	payload json.RawMessage
+}
+
+// recordRunCredentialTx is recordRunCredential's transactional (run-lane claim) path (PRD #1247
+// M9, task c). In ONE transaction it: locks the run row (FOR UPDATE) and re-validates the claim
+// fence under the lock; writes the credential + epoch; detects an APPLIED token switch by the
+// epoch delta; and, on a switch, emits an idempotent 'credential_switch' run message at a gapless
+// seq and advances runs.last_seq to the seq it landed. It returns the (possibly bumped) last_seq —
+// the caller sets ClaimPayload.LastSeq to it (NOT the stale run.LastSeq snapshot) so the worker
+// resumes past the server-inserted message and never re-uses its seq. The switch message is
+// broadcast AFTER commit, best-effort; a nil broadcaster is covered by REST replay (?after=<seq>).
+func (s *Service) recordRunCredentialTx(ctx context.Context, run store.Run, cred claimCred, choice secretChoice, headroom pgtype.Int2) (int32, error) {
+	gen := run.ClaimGeneration
+
+	tx, err := s.txBeginner.Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("record run credential: begin tx: %w", err)
+	}
+	// A no-op after a successful Commit; on every early return it undoes the lock and any write.
+	defer func() { _ = tx.Rollback(ctx) }()
+	qtx := store.New(tx)
+
+	// Step 1: lock the run row and re-read the fence columns (generation, released, last_seq).
+	locked, err := qtx.GetRunByIDForUpdate(ctx, run.ID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, errRunVanished
+		}
+		return 0, fmt.Errorf("record run credential: lock run: %w", err)
+	}
+	// Step 2: fence re-validate UNDER THE LOCK. A raced release/reclaim — the claim was released
+	// (claim_released_at set) or a reclaim bumped the generation past this claim's — makes this
+	// assembly stale. Abort WITHOUT writing and treat it like the vanished-run path
+	// (recoverClaimAssembly drops errRunVanished to an idle no-op; the run is requeued and
+	// re-claimed fresh). Defense in depth: assembleClaim runs synchronously right after ClaimRun,
+	// so the fence normally holds.
+	if locked.ClaimGeneration != gen || locked.ClaimReleasedAt.Valid {
+		return 0, errRunVanished
+	}
+
+	// Steps 3+4: the credential write and the epoch journal, in the tx.
+	if err := writeCredentialAndEpoch(ctx, qtx, run, cred, choice, headroom); err != nil {
+		return 0, err
+	}
+
+	lastSeq := locked.LastSeq
+	var broadcast *pendingSwitchBroadcast
+
+	// Step 5: applied-switch detection (epoch delta). Belt-and-braces skip for self_improve (D10):
+	// that lane follows the judge binding, so its epoch delta will not fire anyway.
+	if run.Kind != runkind.SelfImprove {
+		switched, err := priorEpochIsDifferentToken(ctx, qtx, run.ID, gen, cred.ID)
+		if err != nil {
+			return 0, err
+		}
+		if switched {
+			// Steps 6+7+8: idempotent insert at a gapless seq + last_seq advance, all in the tx.
+			// newLast is the last_seq this tx adopts even when no message was inserted (an idempotent
+			// skip returns the locked high-water; exhaustion returns MAX(seq)).
+			newLast, bc, err := s.insertCredentialSwitchMessage(ctx, qtx, run.ID, gen, cred, choice, locked.LastSeq)
+			if err != nil {
+				return 0, err
+			}
+			lastSeq = newLast
+			if bc != nil {
+				broadcast = bc
+			}
+		}
+	}
+
+	// Step 9: commit.
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("record run credential: commit: %w", err)
+	}
+
+	// AFTER commit only (never before): broadcast the new message to the run's WS channel. A nil
+	// broadcaster (tests / a deployment without the WS hub) is covered by REST replay — last_seq
+	// was advanced in the tx, so a client polling ?after=<prev> picks the message up.
+	if broadcast != nil && s.bcast != nil {
+		s.bcast.PublishMessage(run.ID, broadcast.seq, credentialSwitchMessageKind, "", "", "", broadcast.payload, s.now())
+	}
+	return lastSeq, nil
+}
+
+// priorEpochIsDifferentToken reports whether the run's epoch IMMEDIATELY BEFORE gen named a
+// DIFFERENT, known token than the current claim spends — i.e. this claim is an APPLIED switch (PRD
+// #1247 M9, task c step 5). No prior epoch (pgx.ErrNoRows) is a FIRST claim → not a switch. A
+// prior epoch naming the SAME token is a same-token reclaim → not a switch. A prior epoch with no
+// recorded secret (never happens for a successful claim) is treated conservatively as NOT a switch,
+// so a message is never emitted on evidence that cannot name the prior token. Robust and decoupled
+// from the #1422-deferred switch-stamp clear.
+func priorEpochIsDifferentToken(ctx context.Context, q *store.Queries, runID uuid.UUID, gen int64, current uuid.UUID) (bool, error) {
+	prior, err := q.GetPriorRunCredentialEpoch(ctx, store.GetPriorRunCredentialEpochParams{RunID: runID, ClaimGeneration: gen})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		return false, fmt.Errorf("record run credential: prior epoch: %w", err)
+	}
+	if !prior.SecretID.Valid {
+		return false, nil
+	}
+	return uuid.UUID(prior.SecretID.Bytes) != current, nil
+}
+
+// insertCredentialSwitchMessage inserts the 'credential_switch' feed message for an applied switch
+// and advances runs.last_seq, all inside the caller's transaction (PRD #1247 M9, task c steps
+// 6/7/8). It returns the last_seq the transaction should adopt, plus the inserted message for the
+// caller to broadcast after commit (nil broadcast ⇒ nothing was inserted — an idempotent skip, or
+// the bounded seq-collision loop exhausted).
+//
+//   - Step 6 (idempotency): a 'credential_switch' message already recorded for this
+//     (run_id, claim_generation) means a same-generation retry — skip, return startLastSeq with a
+//     nil broadcast, no duplicate. startLastSeq is the locked high-water, which already reflects any
+//     earlier committed advance.
+//   - Step 7 (gapless seq): seq starts at last_seq+1; a worker frame may already occupy it (its
+//     InsertRunMessage is not serialized by our run-row lock), so on the ON CONFLICT (Inserted
+//     false) re-read MAX(seq) and retry at max+1, leaving no gap and losing no worker frame. Under
+//     the lock the generation fence always holds, so Inserted false is only a seq collision. On a
+//     successful insert, return that seq.
+//   - Step 8: advance runs.last_seq (GREATEST) to the seq that actually landed, in the same tx.
+//
+// On exhaustion the mandatory credential write + epoch already committed in this tx, so only the
+// best-effort message is skipped — but runs.last_seq is STILL advanced (GREATEST, gen-fenced) to
+// MAX(seq) floored at startLastSeq, and that value is returned, so ClaimPayload.LastSeq is never
+// below the true high-water even when the attribution message is skipped and the worker never
+// resumes at a seq already present in run_messages.
+func (s *Service) insertCredentialSwitchMessage(ctx context.Context, q *store.Queries, runID uuid.UUID, gen int64, cred claimCred, choice secretChoice, startLastSeq int32) (int32, *pendingSwitchBroadcast, error) {
+	n, err := q.CountCredentialSwitchMessages(ctx, store.CountCredentialSwitchMessagesParams{RunID: runID, ClaimGeneration: gen})
+	if err != nil {
+		return 0, nil, fmt.Errorf("record run credential: idempotency check: %w", err)
+	}
+	if n > 0 {
+		// Already emitted for this generation; no duplicate, no broadcast. Keep the locked
+		// high-water (it already reflects any earlier committed advance).
+		return startLastSeq, nil, nil
+	}
+
+	payload := credentialSwitchMessagePayload{SelectReason: choice.reason, SecretID: cred.ID.String()}
+	if strings.TrimSpace(cred.Label) != "" {
+		label := cred.Label
+		payload.Label = &label
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return 0, nil, fmt.Errorf("record run credential: marshal switch payload: %w", err)
+	}
+
+	seq := startLastSeq + 1
+	for attempt := 0; attempt < maxSwitchSeqAttempts; attempt++ {
+		res, err := q.InsertRunMessage(ctx, store.InsertRunMessageParams{
+			RunID:           runID,
+			Seq:             seq,
+			Kind:            credentialSwitchMessageKind,
+			Payload:         raw,
+			ClaimGeneration: pgconv.Int8Ptr(&gen),
+		})
+		if err != nil {
+			return 0, nil, fmt.Errorf("record run credential: insert switch message: %w", err)
+		}
+		if res.Inserted {
+			if _, err := q.UpdateRunLastSeq(ctx, store.UpdateRunLastSeqParams{ID: runID, Seq: seq, ClaimGeneration: pgconv.Int8Ptr(&gen)}); err != nil {
+				return 0, nil, fmt.Errorf("record run credential: advance last_seq: %w", err)
+			}
+			return seq, &pendingSwitchBroadcast{seq: seq, payload: raw}, nil
+		}
+		// ON CONFLICT (run_id, seq): a worker frame beat us to this seq. Re-read the high-water
+		// mark and retry at max+1 (no gap, no lost frame).
+		maxSeq, err := q.MaxRunMessageSeq(ctx, runID)
+		if err != nil {
+			return 0, nil, fmt.Errorf("record run credential: re-read max seq: %w", err)
+		}
+		seq = maxSeq + 1
+	}
+	// Exhausted the bounded retry — extraordinarily unlikely. Do NOT fail the claim over a
+	// best-effort attribution message: the mandatory credential write + epoch already committed in
+	// this tx. Skip only the message, but still advance runs.last_seq to the true high-water so the
+	// caller's ClaimPayload.LastSeq never sits below a seq already present in run_messages (a stale
+	// last_seq would resume the worker onto an occupied seq).
+	maxSeq, err := q.MaxRunMessageSeq(ctx, runID)
+	if err != nil {
+		return 0, nil, fmt.Errorf("record run credential: re-read max seq: %w", err)
+	}
+	newLast := maxSeq
+	if newLast < startLastSeq {
+		newLast = startLastSeq
+	}
+	if _, err := q.UpdateRunLastSeq(ctx, store.UpdateRunLastSeqParams{ID: runID, Seq: newLast, ClaimGeneration: pgconv.Int8Ptr(&gen)}); err != nil {
+		return 0, nil, fmt.Errorf("record run credential: advance last_seq: %w", err)
+	}
+	slog.Warn("workersvc: credential switch message seq collision retry exhausted",
+		"run_id", runID.String(), "generation", gen)
+	return newLast, nil, nil
 }
 
 // claimSecretID resolves WHICH credential a run-lane claim spends, and is the one

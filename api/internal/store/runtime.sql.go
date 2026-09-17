@@ -1109,6 +1109,30 @@ func (q *Queries) ConsumeRunInputs(ctx context.Context, runID uuid.UUID) ([]Cons
 	return items, nil
 }
 
+const countCredentialSwitchMessages = `-- name: CountCredentialSwitchMessages :one
+SELECT count(*) FROM run_messages
+WHERE run_id = $1 AND kind = 'credential_switch'
+  AND claim_generation = $2::bigint
+`
+
+type CountCredentialSwitchMessagesParams struct {
+	RunID           uuid.UUID `json:"run_id"`
+	ClaimGeneration int64     `json:"claim_generation"`
+}
+
+// Idempotency guard for the applied-switch run message (PRD #1247 M9, task c step 6): how many
+// 'credential_switch' messages already exist for this run at this exact claim generation. Keyed on
+// (run_id, claim_generation) so a same-generation retry after a crash (the epoch DO UPDATE
+// re-records, and this claim re-assembles) finds the already-inserted message and does NOT emit a
+// duplicate. > 0 ⇒ skip the insert. claim_generation is the message's persisted column (M9's
+// InsertRunMessage stamp), so this matches only messages minted for THIS generation.
+func (q *Queries) CountCredentialSwitchMessages(ctx context.Context, arg CountCredentialSwitchMessagesParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countCredentialSwitchMessages, arg.RunID, arg.ClaimGeneration)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const countInProgressRunsForUser = `-- name: CountInProgressRunsForUser :one
 SELECT count(*) FROM runs
 WHERE user_id = $1
@@ -2988,6 +3012,40 @@ func (q *Queries) GetForgeTypeForRepo(ctx context.Context, repoID uuid.UUID) (st
 	return forge_type, err
 }
 
+const getPriorRunCredentialEpoch = `-- name: GetPriorRunCredentialEpoch :one
+SELECT run_id, claim_generation, secret_id, label, select_reason, applied_at
+FROM run_credential_epochs
+WHERE run_id = $1 AND claim_generation < $2
+ORDER BY claim_generation DESC
+LIMIT 1
+`
+
+type GetPriorRunCredentialEpochParams struct {
+	RunID           uuid.UUID `json:"run_id"`
+	ClaimGeneration int64     `json:"claim_generation"`
+}
+
+// The epoch IMMEDIATELY BEFORE @claim_generation for a run (PRD #1247 M9, task c step 5): the
+// highest-generation epoch strictly below the current claim's generation. recordRunCredential
+// consults it to detect an APPLIED credential switch — if a prior epoch exists AND its secret_id
+// differs from the token the current claim spent, this claim is a switch and earns a
+// 'credential_switch' run message. pgx.ErrNoRows means there is NO prior epoch (a first claim), so
+// no switch. NOT owner-scoped: the caller is inside the claim transaction with the run row locked,
+// and this reads the run's OWN journal by run_id — the owner-scoped read is ListRunCredentialEpochs.
+func (q *Queries) GetPriorRunCredentialEpoch(ctx context.Context, arg GetPriorRunCredentialEpochParams) (RunCredentialEpoch, error) {
+	row := q.db.QueryRow(ctx, getPriorRunCredentialEpoch, arg.RunID, arg.ClaimGeneration)
+	var i RunCredentialEpoch
+	err := row.Scan(
+		&i.RunID,
+		&i.ClaimGeneration,
+		&i.SecretID,
+		&i.Label,
+		&i.SelectReason,
+		&i.AppliedAt,
+	)
+	return i, err
+}
+
 const getRunByID = `-- name: GetRunByID :one
 SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash, pause_requested_at, pause_mode, pause_after_count, checkpoint_tip_at, recovery_wait_count, recovery_retry_not_before, completion_contract_version, contract_revision, completion_contract, completion_attempts, latest_completion_attempt, milestones_agents, hold_reason, hold_captured_head, completion_budget_exhausted_at, completion_question_at, budget_extension_seconds, claim_generation, harness, recovery_wait_cause, forge_park_count, credential_override_mode, credential_override_secret_id, claim_released_at, credential_switch_requested_at, credential_switch_generation, stale_requeue_generation FROM runs WHERE id = $1
 `
@@ -4535,8 +4593,8 @@ func (q *Queries) HeartbeatWorker(ctx context.Context, arg HeartbeatWorkerParams
 const insertRunMessage = `-- name: InsertRunMessage :one
 
 WITH ins AS (
-    INSERT INTO run_messages (run_id, seq, kind, agent, agent_instance, agent_label, payload)
-    SELECT $2, $3, $4, $5, $6, $7, $8
+    INSERT INTO run_messages (run_id, seq, kind, agent, agent_instance, agent_label, payload, claim_generation)
+    SELECT $2, $3, $4, $5, $6, $7, $8, $1::bigint
     WHERE $1::bigint IS NULL
        OR EXISTS (SELECT 1 FROM runs r
                   WHERE r.id = $2
@@ -4589,6 +4647,12 @@ type InsertRunMessageRow struct {
 // from a released/reclaimed OLD flight and persisted nothing). Both used to surface as :execrows
 // == 0, so the caller advanced its high-water mark and folded usage over STALE frames. A legacy
 // (NULL generation) caller always sees generation_live = TRUE, byte-identical to before.
+//
+// PRD #1247 M9 (D7): claim_generation is now also PERSISTED in the row's own column, not only used
+// in the fence WHERE. A capability worker's stamped generation lands on the frame, so both the
+// incremental fold and a refold attribute each frame to the epoch that produced it (the join
+// run_messages.claim_generation -> run_credential_epochs). A legacy caller (NULL narg) stores NULL,
+// byte-identical to before, and the fence behaviour is unchanged (the WHERE still reads the narg).
 func (q *Queries) InsertRunMessage(ctx context.Context, arg InsertRunMessageParams) (InsertRunMessageRow, error) {
 	row := q.db.QueryRow(ctx, insertRunMessage,
 		arg.ClaimGeneration,
@@ -7032,6 +7096,23 @@ func (q *Queries) MarkStaleWorkersOffline(ctx context.Context, cutoff pgtype.Tim
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const maxRunMessageSeq = `-- name: MaxRunMessageSeq :one
+SELECT COALESCE(MAX(seq), 0)::int FROM run_messages WHERE run_id = $1
+`
+
+// The run's current highest message seq, or 0 when it has none (PRD #1247 M9, task c step 7): the
+// gapless collision-recovery re-read. A worker's InsertRunMessage is NOT serialized by the run-row
+// FOR UPDATE lock the switch-message transaction holds, so a worker frame can land at last_seq+1
+// between the caller's read and its own insert; on that ON CONFLICT the caller re-reads MAX(seq)
+// here and retries at max+1, leaving no gap and losing no worker frame. COALESCE(...,0)::int keeps
+// the return an int32 for a run with no messages yet.
+func (q *Queries) MaxRunMessageSeq(ctx context.Context, runID uuid.UUID) (int32, error) {
+	row := q.db.QueryRow(ctx, maxRunMessageSeq, runID)
+	var column_1 int32
+	err := row.Scan(&column_1)
+	return column_1, err
 }
 
 const newestRunForMR = `-- name: NewestRunForMR :one
@@ -11432,10 +11513,10 @@ const upsertRunUsage = `-- name: UpsertRunUsage :exec
 
 INSERT INTO run_usage (
     run_id, session_id, model, lineage_epoch,
-    input_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, cost_usd, harness, cost_status, updated_at
+    input_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, cost_usd, harness, cost_status, claim_generation, updated_at
 ) VALUES (
     $1, $2, $3, $4,
-    $5, $6, $7, $8, $9, $10, $11, now()
+    $5, $6, $7, $8, $9, $10, $11, $12::bigint, now()
 )
 ON CONFLICT (run_id, session_id, model, lineage_epoch) DO UPDATE SET
     input_tokens          = GREATEST(run_usage.input_tokens,          EXCLUDED.input_tokens),
@@ -11444,6 +11525,9 @@ ON CONFLICT (run_id, session_id, model, lineage_epoch) DO UPDATE SET
     output_tokens         = GREATEST(run_usage.output_tokens,         EXCLUDED.output_tokens),
     -- The run's harness is immutable, so existing == EXCLUDED on conflict; keep existing.
     harness               = run_usage.harness,
+    -- Provenance is set-once: keep an established non-null generation, never clobber it with a
+    -- later same-leg frame's EXCLUDED (M9, D7). A NULL existing value adopts EXCLUDED.
+    claim_generation      = COALESCE(run_usage.claim_generation, EXCLUDED.claim_generation),
     cost_status           = CASE
                                 WHEN run_usage.cost_status = EXCLUDED.cost_status THEN run_usage.cost_status
                                 ELSE 'unreported'
@@ -11471,6 +11555,7 @@ type UpsertRunUsageParams struct {
 	CostUsd             pgtype.Numeric `json:"cost_usd"`
 	Harness             string         `json:"harness"`
 	CostStatus          string         `json:"cost_status"`
+	ClaimGeneration     pgtype.Int8    `json:"claim_generation"`
 }
 
 // Usage accounting (PRD #40) ------------------------------------------------
@@ -11500,6 +11585,14 @@ type UpsertRunUsageParams struct {
 // 'metered'), else 0 — so a redelivery can never combine an unreported/subscription status
 // with a positive dollar amount, and the result always satisfies 00226's
 // run_usage_nonmetered_zero_check (cost_status='metered' OR cost_usd=0).
+// PRD #1247 M9 (D7): claim_generation is PROVENANCE ONLY — the epoch of the frames that produced
+// this leg — never part of the leg key (00233's PK stays (run_id, session_id, model, lineage_epoch);
+// it is NOT added to ON CONFLICT). On conflict it is COALESCE(existing, EXCLUDED): an established
+// non-null provenance is NEVER clobbered by a later same-leg frame (a straggler re-delivery, or the
+// rare case where a later frame of the same (session_id, model, lineage_epoch) leg carries a
+// different generation), while a first frame whose existing value is NULL adopts the incoming one.
+// Legacy NULL frames leave the column NULL. run_usage.claim_generation is DERIVED OUTPUT of the fold,
+// never its evidence — the frame stamp on run_messages is the evidence.
 func (q *Queries) UpsertRunUsage(ctx context.Context, arg UpsertRunUsageParams) error {
 	_, err := q.db.Exec(ctx, upsertRunUsage,
 		arg.RunID,
@@ -11513,6 +11606,7 @@ func (q *Queries) UpsertRunUsage(ctx context.Context, arg UpsertRunUsageParams) 
 		arg.CostUsd,
 		arg.Harness,
 		arg.CostStatus,
+		arg.ClaimGeneration,
 	)
 	return err
 }

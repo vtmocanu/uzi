@@ -1116,6 +1116,20 @@ JOIN runs r ON r.id = e.run_id
 WHERE e.run_id = @run_id AND r.user_id = @user_id
 ORDER BY e.claim_generation ASC;
 
+-- name: GetPriorRunCredentialEpoch :one
+-- The epoch IMMEDIATELY BEFORE @claim_generation for a run (PRD #1247 M9, task c step 5): the
+-- highest-generation epoch strictly below the current claim's generation. recordRunCredential
+-- consults it to detect an APPLIED credential switch — if a prior epoch exists AND its secret_id
+-- differs from the token the current claim spent, this claim is a switch and earns a
+-- 'credential_switch' run message. pgx.ErrNoRows means there is NO prior epoch (a first claim), so
+-- no switch. NOT owner-scoped: the caller is inside the claim transaction with the run row locked,
+-- and this reads the run's OWN journal by run_id — the owner-scoped read is ListRunCredentialEpochs.
+SELECT run_id, claim_generation, secret_id, label, select_reason, applied_at
+FROM run_credential_epochs
+WHERE run_id = @run_id AND claim_generation < @claim_generation
+ORDER BY claim_generation DESC
+LIMIT 1;
+
 -- name: SetRunCredentialOverride :execrows
 -- Write the per-run credential override columns for `uzi run set-token` (PRD #1247 M4,
 -- D4). It is the FIRST write in every writable-state branch of the verb (queued /
@@ -3724,9 +3738,15 @@ RETURNING id, user_id, status;
 -- from a released/reclaimed OLD flight and persisted nothing). Both used to surface as :execrows
 -- == 0, so the caller advanced its high-water mark and folded usage over STALE frames. A legacy
 -- (NULL generation) caller always sees generation_live = TRUE, byte-identical to before.
+--
+-- PRD #1247 M9 (D7): claim_generation is now also PERSISTED in the row's own column, not only used
+-- in the fence WHERE. A capability worker's stamped generation lands on the frame, so both the
+-- incremental fold and a refold attribute each frame to the epoch that produced it (the join
+-- run_messages.claim_generation -> run_credential_epochs). A legacy caller (NULL narg) stores NULL,
+-- byte-identical to before, and the fence behaviour is unchanged (the WHERE still reads the narg).
 WITH ins AS (
-    INSERT INTO run_messages (run_id, seq, kind, agent, agent_instance, agent_label, payload)
-    SELECT @run_id, @seq, @kind, @agent, @agent_instance, @agent_label, @payload
+    INSERT INTO run_messages (run_id, seq, kind, agent, agent_instance, agent_label, payload, claim_generation)
+    SELECT @run_id, @seq, @kind, @agent, @agent_instance, @agent_label, @payload, sqlc.narg('claim_generation')::bigint
     WHERE sqlc.narg('claim_generation')::bigint IS NULL
        OR EXISTS (SELECT 1 FROM runs r
                   WHERE r.id = @run_id
@@ -3742,6 +3762,26 @@ SELECT
                 WHERE r.id = @run_id
                   AND r.claim_generation = sqlc.narg('claim_generation')::bigint
                   AND r.claim_released_at IS NULL)) AS generation_live;
+
+-- name: CountCredentialSwitchMessages :one
+-- Idempotency guard for the applied-switch run message (PRD #1247 M9, task c step 6): how many
+-- 'credential_switch' messages already exist for this run at this exact claim generation. Keyed on
+-- (run_id, claim_generation) so a same-generation retry after a crash (the epoch DO UPDATE
+-- re-records, and this claim re-assembles) finds the already-inserted message and does NOT emit a
+-- duplicate. > 0 ⇒ skip the insert. claim_generation is the message's persisted column (M9's
+-- InsertRunMessage stamp), so this matches only messages minted for THIS generation.
+SELECT count(*) FROM run_messages
+WHERE run_id = @run_id AND kind = 'credential_switch'
+  AND claim_generation = @claim_generation::bigint;
+
+-- name: MaxRunMessageSeq :one
+-- The run's current highest message seq, or 0 when it has none (PRD #1247 M9, task c step 7): the
+-- gapless collision-recovery re-read. A worker's InsertRunMessage is NOT serialized by the run-row
+-- FOR UPDATE lock the switch-message transaction holds, so a worker frame can land at last_seq+1
+-- between the caller's read and its own insert; on that ON CONFLICT the caller re-reads MAX(seq)
+-- here and retries at max+1, leaving no gap and losing no worker frame. COALESCE(...,0)::int keeps
+-- the return an int32 for a run with no messages yet.
+SELECT COALESCE(MAX(seq), 0)::int FROM run_messages WHERE run_id = @run_id;
 
 -- name: ListRunMessagesAfter :many
 -- Replay for a (re)connecting browser: everything after its last-seen seq, in
@@ -3816,12 +3856,20 @@ LIMIT @lim;
 -- 'metered'), else 0 — so a redelivery can never combine an unreported/subscription status
 -- with a positive dollar amount, and the result always satisfies 00226's
 -- run_usage_nonmetered_zero_check (cost_status='metered' OR cost_usd=0).
+-- PRD #1247 M9 (D7): claim_generation is PROVENANCE ONLY — the epoch of the frames that produced
+-- this leg — never part of the leg key (00233's PK stays (run_id, session_id, model, lineage_epoch);
+-- it is NOT added to ON CONFLICT). On conflict it is COALESCE(existing, EXCLUDED): an established
+-- non-null provenance is NEVER clobbered by a later same-leg frame (a straggler re-delivery, or the
+-- rare case where a later frame of the same (session_id, model, lineage_epoch) leg carries a
+-- different generation), while a first frame whose existing value is NULL adopts the incoming one.
+-- Legacy NULL frames leave the column NULL. run_usage.claim_generation is DERIVED OUTPUT of the fold,
+-- never its evidence — the frame stamp on run_messages is the evidence.
 INSERT INTO run_usage (
     run_id, session_id, model, lineage_epoch,
-    input_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, cost_usd, harness, cost_status, updated_at
+    input_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, cost_usd, harness, cost_status, claim_generation, updated_at
 ) VALUES (
     @run_id, @session_id, @model, @lineage_epoch,
-    @input_tokens, @cache_read_tokens, @cache_creation_tokens, @output_tokens, @cost_usd, @harness, @cost_status, now()
+    @input_tokens, @cache_read_tokens, @cache_creation_tokens, @output_tokens, @cost_usd, @harness, @cost_status, sqlc.narg('claim_generation')::bigint, now()
 )
 ON CONFLICT (run_id, session_id, model, lineage_epoch) DO UPDATE SET
     input_tokens          = GREATEST(run_usage.input_tokens,          EXCLUDED.input_tokens),
@@ -3830,6 +3878,9 @@ ON CONFLICT (run_id, session_id, model, lineage_epoch) DO UPDATE SET
     output_tokens         = GREATEST(run_usage.output_tokens,         EXCLUDED.output_tokens),
     -- The run's harness is immutable, so existing == EXCLUDED on conflict; keep existing.
     harness               = run_usage.harness,
+    -- Provenance is set-once: keep an established non-null generation, never clobber it with a
+    -- later same-leg frame's EXCLUDED (M9, D7). A NULL existing value adopts EXCLUDED.
+    claim_generation      = COALESCE(run_usage.claim_generation, EXCLUDED.claim_generation),
     cost_status           = CASE
                                 WHEN run_usage.cost_status = EXCLUDED.cost_status THEN run_usage.cost_status
                                 ELSE 'unreported'

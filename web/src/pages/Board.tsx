@@ -12,16 +12,16 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams, Link, useNavigate } from "react-router-dom";
 import {
   api,
-  ApiError,
-  isOpenMRConflict,
-  openMRConflictMRIID,
   type Board as BoardData,
   type Card as CardData,
   type RunListItem,
+  type SecretMeta,
 } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
 import { hasAnthropicToken } from "../lib/hasToken";
 import { startRunGate } from "../lib/runStream";
+import { startRunWithCredential } from "../lib/startRun";
+import { INHERIT_SELECTION, type CredentialSelection } from "../lib/credentialOverride";
 import {
   effectiveRunStatus,
   hasActiveRun,
@@ -392,6 +392,17 @@ export function Board() {
   // comes from the card's own latest_run (no separate listRuns fan-in).
   const [hasWorker, setHasWorker] = useState(false);
   const [hasToken, setHasToken] = useState(false);
+  // PRD #1247 M7: the viewer's Anthropic tokens (for the per-card token picker) and the
+  // per-card credential choice (keyed by issue iid). A card the user has not touched
+  // defaults to inherit — the run follows the worker binding.
+  const [tokens, setTokens] = useState<SecretMeta[]>([]);
+  const [cardCredential, setCardCredential] = useState<Record<number, CredentialSelection>>({});
+  // PRD #1247: cardCredential is keyed only by issue iid, and the route swaps :id without
+  // remounting the component, so a per-card pin from repo A would otherwise reapply to a
+  // same-iid card in repo B. Clear it on a repo change (no-op at mount).
+  useEffect(() => {
+    setCardCredential({});
+  }, [repoId]);
   // The viewer's runs on this repo blocked on their approval — drives the
   // attention strip above the columns.
   const [awaitingRuns, setAwaitingRuns] = useState<RunListItem[]>([]);
@@ -520,6 +531,8 @@ export function Board() {
       ]);
       setHasWorker(workers.length > 0);
       setHasToken(hasAnthropicToken(secrets));
+      // PRD #1247 M7: keep the Anthropic tokens for the per-card token picker.
+      setTokens(secrets.filter((s) => s.kind === "anthropic_token"));
       // issue #750: classify from the EFFECTIVE status, not the raw one. A run
       // re-planning after a revise keeps status === "awaiting_approval" server-side, but
       // effectiveRunStatus returns "revising" for it (is_revising true), so
@@ -600,44 +613,19 @@ export function Board() {
   const startRun = async (card: CardData) => {
     setError("");
     setStarting(card.iid);
-    // createAndOpen runs the create then navigates; the force path reuses it so
-    // the retry does not duplicate the navigate.
-    const createAndOpen = async (force?: boolean) => {
-      const { run } = await api.createRun(repoId, card.iid, force);
+    // The shared helper carries this card's chosen credential override (default inherit)
+    // and preserves it across the open-MR force retry (issue #856). onSettled keeps
+    // Board's pre-#1247 behaviour: clear the starting flag and re-read preconditions.
+    await startRunWithCredential(repoId, card.iid, cardCredential[card.iid] ?? INHERIT_SELECTION, {
       // encodeURIComponent the id: per-call-site open-redirect hardening (see
       // safeNextPath in Login.tsx). A no-op for today's UUID ids.
-      navigate(`/runs/${encodeURIComponent(run.id)}`);
-    };
-    try {
-      await createAndOpen();
-    } catch (err) {
-      // issue_has_open_mr (issue #856): a completed prior run still owns an open
-      // MR. Compose a web-specific confirm naming the MR (no --force jargon);
-      // confirm, then retry with force.
-      if (isOpenMRConflict(err) && err instanceof ApiError) {
-        const mr = openMRConflictMRIID(err);
-        const detail =
-          mr != null ? `an open merge request (!${mr})` : "an open merge request";
-        const proceed = window.confirm(
-          `This issue already has ${detail} from a completed run. Starting a new run will plan and review it again from scratch. Start a new run anyway?`,
-        );
-        if (proceed) {
-          try {
-            await createAndOpen(true);
-            return;
-          } catch (retryErr) {
-            setError(errorMessage(retryErr, "Could not start run"));
-          }
-        }
-        // Declined (or forced retry failed): clear starting, no toast on decline.
+      onCreated: (runId) => navigate(`/runs/${encodeURIComponent(runId)}`),
+      onError: (msg) => setError(msg),
+      onSettled: () => {
         setStarting(null);
         loadPreconditions();
-        return;
-      }
-      setError(errorMessage(err, "Could not start run"));
-      setStarting(null);
-      loadPreconditions();
-    }
+      },
+    });
   };
 
   // Fix CI (PRD #6): queue a plan-gated ci_fix run for a failed pipeline's ref.
@@ -1509,6 +1497,11 @@ export function Board() {
                     })}
                     starting={starting === card.iid}
                     onStart={() => startRun(card)}
+                    tokens={tokens}
+                    credential={cardCredential[card.iid] ?? INHERIT_SELECTION}
+                    onCredentialChange={(sel) =>
+                      setCardCredential((prev) => ({ ...prev, [card.iid]: sel }))
+                    }
                     fixCiBusy={card.pipeline != null && fixingRef === card.pipeline.ref}
                     onFixCi={() => card.pipeline && fixCi(card.pipeline.ref)}
                     uziLabel={uziLabel}

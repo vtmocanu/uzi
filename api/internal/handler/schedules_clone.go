@@ -133,13 +133,19 @@ func (h *Handler) CloneSchedule(w http.ResponseWriter, r *http.Request) {
 		Model:                 cur.Model,
 		OutputMode:            cur.OutputMode,
 		OverrideSubagentModel: cur.OverrideSubagentModel,
+		// PRD #1247 M6: carry the source row's per-run credential override onto the clone
+		// (both a custom and a default clone), so a clone never silently drops a pinned/auto/
+		// default override the owner set. A default clone lifts prompt/labels/guidance from the
+		// catalog, but the credential override is an owner run option, not catalog-owned.
+		CredentialOverrideMode:     cur.CredentialOverrideMode,
+		CredentialOverrideSecretID: cur.CredentialOverrideSecretID,
 	})
 	if err != nil {
 		slog.Error("clone run schedule", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	httpx.JSON(w, http.StatusCreated, h.scheduleDTO(s, h.repoPathFor(r.Context(), s)))
+	httpx.JSON(w, http.StatusCreated, h.scheduleDTOWithLabel(r.Context(), s, h.repoPathFor(r.Context(), s)))
 }
 
 // AddScheduleRepo replicates a custom schedule's current config onto another repo the caller
@@ -254,6 +260,10 @@ func (h *Handler) AddScheduleRepo(w http.ResponseWriter, r *http.Request) {
 		OutputMode:            cur.OutputMode,
 		OverrideSubagentModel: cur.OverrideSubagentModel,
 		SiblingGroupID:        group,
+		// PRD #1247 M6: replicate the source's per-run credential override onto the new
+		// sibling, so add-repo never drops the override (mirrors the clone above).
+		CredentialOverrideMode:     cur.CredentialOverrideMode,
+		CredentialOverrideSecretID: cur.CredentialOverrideSecretID,
 	})
 	if err != nil {
 		if isUniqueViolation(err) {
@@ -272,7 +282,7 @@ func (h *Handler) AddScheduleRepo(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	httpx.JSON(w, http.StatusCreated, h.scheduleDTO(s, h.repoPathFor(ctx, s)))
+	httpx.JSON(w, http.StatusCreated, h.scheduleDTOWithLabel(ctx, s, h.repoPathFor(ctx, s)))
 }
 
 // cloneNextFire recomputes the durable next_fire_at for a clone from the source's copied

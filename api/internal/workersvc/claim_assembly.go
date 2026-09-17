@@ -201,7 +201,16 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	// Record it before anything else can fail (PRD #111 M1): the credential HAS been
 	// opened at this point, so from the run's perspective it is already the account
 	// this claim commits to, whether or not the rest of assembly succeeds.
-	if err := s.recordRunCredential(ctx, run, cred, choice); err != nil {
+	//
+	// PRD #1247 M9 (task c): the RUN LANE passes emitSwitchMessage=true, so recordRunCredential
+	// emits a 'credential_switch' feed message on an APPLIED token switch (an epoch delta onto a
+	// different token) atomically with the credential write, and RETURNS the (possibly bumped)
+	// last_seq — the seq of the server-inserted message, or the run's current high-water mark when
+	// no message was emitted. ClaimPayload.LastSeq MUST be this returned value, not the stale
+	// run.LastSeq snapshot: the worker resumes seq numbering from it, so a stale snapshot would let
+	// it re-use the message's seq and collide.
+	recordedLastSeq, err := s.recordRunCredential(ctx, run, cred, choice, true)
+	if err != nil {
 		return nil, err
 	}
 	anthropic := cred.Token
@@ -400,7 +409,11 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		Branch:         textPtr(branch),
 		SessionID:      textPtr(run.SessionID),
 		CheckpointTip:  textPtr(run.CheckpointTip),
-		LastSeq:        run.LastSeq,
+		// PRD #1247 M9 (task c): the last_seq recordRunCredential actually landed — bumped past any
+		// 'credential_switch' message it just inserted — NOT the stale run.LastSeq snapshot, so the
+		// worker never re-uses the server-inserted message's seq. Equals run.LastSeq when no switch
+		// message was emitted.
+		LastSeq:        recordedLastSeq,
 		IterationCount: run.IterationCount,
 		RequeueCount:   run.RequeueCount,
 		// PRD #1296 M1 (D2): the claim-lane counter the ClaimRun CTE just incremented, read

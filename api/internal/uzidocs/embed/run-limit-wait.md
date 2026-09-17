@@ -45,6 +45,33 @@ The pause itself also updates that credential's rate-limit meter right away, so 
 
 A run can pause and resume more than once if the limit keeps recurring, backing off between attempts, up to a cap; a second cap bounds how far out any single pause may reach. Both are operator-configured — see [Configuration](configuration.md) to change them.
 
+## Switching to a different token while parked
+
+A park driven by one token can also end on a **different** one, instead of
+waiting out the reset — two ways:
+
+- **Automatically, for an auto-select worker.** A parked run is re-checked on
+  every sweep, not only at the moment it parked: the instant another one of
+  your pooled tokens gains enough headroom, the run promotes itself back to
+  `queued` — at most once per account per sweep tick — well before
+  `retry_not_before` arrives. This only happens for a worker set to
+  [auto-select from the pool](anthropic-token.md#letting-uzi-pick-the-token-auto-selection),
+  or a run carrying a per-run `auto`
+  [override](anthropic-token.md#choosing-the-token-for-one-run). A **pinned**
+  or **default**-bound run is never promoted early this way, at park time or
+  later — switching accounts on its behalf isn't something either mode
+  decides for you, and doing it anyway would only park it again.
+- **On demand, with `uzi run set-token`.** Pick a token yourself and the run
+  resumes right away, whatever its bind mode:
+  `uzi run set-token <run-id> <label>` (or `--auto` / `--default`) promotes
+  it straight to `queued`, and the next claim spends the token you named — no
+  waiting for the window, and nothing in flight to lose (a parked run has no
+  live claim). The dead token stays excluded from that next claim, so
+  pointing the run back at the very one that just hit its limit can park it
+  again — uzi warns about that up front rather than refusing, see
+  [Claude rate limits](rate-limits.md#choosing-a-token-near-its-limit). The
+  run page's token picker does the same switch.
+
 ## If a run isn't waiting out limits
 
 A run that isn't set up to wait still fails the moment it hits a limit, the same as before — but the failure now says why, instead of a bare error: *"Anthropic usage limit (5-hour) reached; resets at 2026-07-28T02:00:00Z"*. Re-run it once that time passes, or turn on waiting so next time it doesn't have to.
