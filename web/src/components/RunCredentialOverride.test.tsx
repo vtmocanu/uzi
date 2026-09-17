@@ -138,8 +138,8 @@ describe("RunCredentialOverride — override + pending switch", () => {
 
 describe("CredentialEpochList", () => {
   const epochs: CredentialEpoch[] = [
-    { claim_generation: 1, label: "default", select_reason: "default", applied_at: "2026-01-01T10:00:00Z" },
-    { claim_generation: 2, label: "console-key", select_reason: "override_pinned", applied_at: "2026-01-01T11:00:00Z" },
+    { claim_generation: 1, secret_id: "sec-default", label: "default", select_reason: "default", applied_at: "2026-01-01T10:00:00Z" },
+    { claim_generation: 2, secret_id: "sec-console-key", label: "console-key", select_reason: "override_pinned", applied_at: "2026-01-01T11:00:00Z" },
   ];
 
   it("renders one row per epoch with its token label and reason", () => {
@@ -154,7 +154,7 @@ describe("CredentialEpochList", () => {
     const bidi = String.fromCodePoint(0x202e); // U+202E RTL override, category Cf
     render(
       <CredentialEpochList
-        epochs={[{ claim_generation: 1, label: `con${bidi}sole`, select_reason: "pinned", applied_at: "2026-01-01T10:00:00Z" }]}
+        epochs={[{ claim_generation: 1, secret_id: "sec-1", label: `con${bidi}sole`, select_reason: "pinned", applied_at: "2026-01-01T10:00:00Z" }]}
       />,
     );
     const labelEl = screen.getByText("console");

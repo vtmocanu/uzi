@@ -110,12 +110,14 @@ const credentialSwitched = new Set<string>();
 const appliedEpochs = (): CredentialEpoch[] => [
   {
     claim_generation: 1,
+    secret_id: "sec-default",
     label: "default",
     select_reason: "default",
     applied_at: new Date(Date.now() - 90 * 60_000).toISOString(),
   },
   {
     claim_generation: 2,
+    secret_id: "sec-console-key",
     label: "console-key",
     select_reason: "override_pinned",
     applied_at: new Date(Date.now() - 20 * 60_000).toISOString(),
