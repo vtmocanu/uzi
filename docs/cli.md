@@ -91,7 +91,7 @@ uzi run create --repo <id> --issue <iid> [--plan-file <path>]
 uzi run approve <id> [--agent-source own|repo] [--exclude-agents a,b]
 uzi run reject <id> [--message <text>]
 uzi run revise <id> [--message <text>]
-uzi run cancel <id>
+uzi run cancel <id> [--discard-pending-outcome]
 uzi run stop <id> [--message <text>]
 uzi run scope <id> --through <n>
 uzi run extend <id> --by <duration>
@@ -214,7 +214,10 @@ A few worth knowing:
   and (via the server's `completed` transition) `--review` fires iff it was
   requested, then the run lands `completed` with a distinct stop disposition.
   Unlike `run cancel`, which aborts mid-turn, `stop` never discards in-flight
-  work. On a **milestone-structured issue run** (PRD #634), `stop` instead
+  work. If a run finished on its worker but its outcome never reached uzi (an
+  api outage held it on the worker), `run cancel` refuses with a confirmation
+  error unless you pass `--discard-pending-outcome`, which cancels the run and
+  throws that finished result away. On a **milestone-structured issue run** (PRD #634), `stop` instead
   sets an operator scope ceiling at the already-completed milestone count:
   the run finalizes the committed slice (pushes the branch, opens the MR
   when requested) and starts no further milestone — the same graceful

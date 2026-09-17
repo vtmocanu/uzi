@@ -176,6 +176,8 @@ re-queued during the outage gets that charge refunded once it's back. See
 [configuration.md](./configuration.md#server-api) for `SWEEPER_BOOT_GRACE`
 and the related knobs.
 
+The same write-ahead journal covers a run-lane attempt's terminal outcome (an issue run, a judge, or a review; chat is excluded — it never carries a claim generation to fence on). Before the worker ever sends a `completed`/`failed` report, it journals the outcome to the same durable outbox tree the message outbox above uses, keyed by the run and its claim generation. Once the api is back, replay sends the run's own messages first and the outcome only after they've caught up, so a run that finished during the outage still gets its MR and its final state exactly once — a journaled outcome is never re-attempted, and a duplicate claim on the same run is refused rather than executed. If the worker container restarts mid-outage, it resolves every pending journal from disk before its claim loops start, so the outcome lands even though the executor that produced it is gone. An outcome the api permanently refuses (most often because the run's messages can't be reconciled, or a completion permit no longer matches) is never discarded on a timer: it's surfaced on the run as a held outcome and cleared only by the owner explicitly cancelling with the discard bit set (`uzi run cancel --discard-pending-outcome`, or the same confirmation from the run page). Same-uid caveat as above: the outcome journal lives in the same worker-owned tree as the message outbox, so on the hosted single-uid runtime it protects against the outage, not against a hostile model.
+
 ## Concurrent runs
 
 By default a worker executes one run at a time. Set `WORKER_MAX_CONCURRENT_RUNS`
