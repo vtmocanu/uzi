@@ -95,10 +95,19 @@ resolve_run() {
     --json databaseId --jq '.[0].databaseId // empty' 2>/dev/null
 }
 
-# --sha mode: every run on BRANCH whose head matches SHA (prefix), one line per run:
-# databaseId<TAB>status<TAB>conclusion<TAB>workflowName. The list is capped at 50 so a
-# busy main does not push the SHA off the page within the watch window.
+# --sha mode: every run whose head matches SHA, one line per run:
+# databaseId<TAB>status<TAB>conclusion<TAB>workflowName. A full 40-hex SHA uses GitHub's
+# server-side --commit filter, so a busy main cannot push it out of a branch-list window.
+# gh does not resolve abbreviated values for --commit, so a short SHA keeps the capped branch
+# listing plus prefix filter for compatibility with hand-typed invocations.
 runs_for_sha() {
+  if [ "${#SHA}" -eq 40 ] && [[ "$SHA" != *[!0-9A-Fa-f]* ]]; then
+    gh run list "${GHR[@]}" --branch "$BRANCH" --commit "$SHA" --limit 50 \
+      --json databaseId,status,conclusion,workflowName \
+      --jq '.[] | [.databaseId, .status, (.conclusion // ""), .workflowName] | @tsv' \
+      2>/dev/null
+    return
+  fi
   gh run list "${GHR[@]}" --branch "$BRANCH" --limit 50 \
     --json databaseId,headSha,status,conclusion,workflowName \
     --jq ".[] | select(.headSha | startswith(\"$SHA\")) | [.databaseId, .status, (.conclusion // \"\"), .workflowName] | @tsv" \
@@ -152,7 +161,11 @@ while [ "$tick" -lt "$MAX_TICKS" ]; do
     # ---- --sha mode: aggregate over every run for the commit -------------------------
     runs="$(runs_for_sha)"
     if [ -z "$runs" ]; then
-      echo "[tick $tick] no run yet for sha=${SHA:0:8} on $BRANCH; retrying"
+      if [ "$seen_any" -eq 1 ]; then
+        echo "[tick $tick] workflow listing temporarily empty after runs were seen for sha=${SHA:0:8}; retrying"
+      else
+        echo "[tick $tick] no run yet for sha=${SHA:0:8} on $BRANCH; retrying"
+      fi
       sleep "$INTERVAL"; tick=$((tick+1)); continue
     fi
     seen_any=1

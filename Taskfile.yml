@@ -861,13 +861,14 @@ tasks:
       - ./.agents/skills/uzi-watcher/scripts/backup-loop.test.sh
 
   test:uzi-lander:
-    desc: hermetic tests of uzi-lander review routing, quota timing and stale-base push guards
+    desc: hermetic tests of uzi-lander review routing, quota timing, CI discovery and stale-base push guards
     cmds:
       - ./.agents/skills/uzi-lander/scripts/lib/review-threads.test.sh
       - ./.agents/skills/uzi-lander/scripts/cr-rate-limit.test.sh
       - ./.agents/skills/uzi-lander/scripts/land-prep.test.sh
       - ./.agents/skills/uzi-lander/scripts/watch-pr.test.sh
       - ./.agents/skills/uzi-lander/scripts/pr-findings.test.sh
+      - ./.agents/skills/uzi-lander/scripts/watch-run-ci.test.sh
 
   test:release-scripts:
     desc: offline fixture test of the release-train scripts (builds a temp git repo; PRD 1265)
