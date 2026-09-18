@@ -16,20 +16,25 @@ if [ "${1:-}" = pr ] && [ "${2:-}" = view ]; then echo deadbeefdeadbeefdeadbeefd
 if [ "${1:-}" = api ]; then
   case "$*" in
     *'/pulls/42/reviews'*)
-      if [ "$MODE" = race ]; then
-        echo '[{"id":7,"user":{"login":"greptile-apps[bot]"},"commit_id":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","state":"COMMENTED","body":""}]'
-      else echo '[]'; fi ;;
+      case "$MODE" in
+        race) echo '[{"id":7,"user":{"login":"greptile-apps[bot]"},"commit_id":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","state":"COMMENTED","body":""}]' ;;
+        in_progress) echo '[{"id":8,"user":{"login":"coderabbitai[bot]"},"commit_id":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","state":"APPROVED","body":""}]' ;;
+        *) echo '[]' ;;
+      esac ;;
     *'/issues/42/comments'*) echo '[]' ;;
     *'/commits/deadbeefdeadbeefdeadbeefdeadbeefdeadbeef/status'*) echo '' ;;
     *'/commits/deadbeefdeadbeefdeadbeefdeadbeefdeadbeef/check-runs'*)
-      if [ "$MODE" = race ]; then
-        echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"Greptile has reviewed the Pull Request.\n\n90 files reviewed, 1 comments added"}}]}'
-      else
-        echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"Greptile has reviewed the Pull Request.\n\n90 files reviewed, 0 comments added"}}]}'
-      fi ;;
+      case "$MODE" in
+        race) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"Greptile has reviewed the Pull Request.\n\n90 files reviewed, 1 comments added"}}]}' ;;
+        in_progress) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"in_progress","conclusion":null,"output":{"summary":""}}]}' ;;
+        *) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"Greptile has reviewed the Pull Request.\n\n90 files reviewed, 0 comments added"}}]}' ;;
+      esac ;;
     *'/pulls/42/comments'*)
-      if [ "$MODE" = race ]; then echo '[]'
-      else echo '[{"user":{"login":"greptile-apps[bot]"},"path":"old.go","line":8,"body":"<img alt=\"P1\"> old addressed finding","pull_request_review_id":99}]'; fi ;;
+      case "$MODE" in
+        race) echo '[]' ;;
+        in_progress) echo '[{"user":{"login":"greptile-apps[bot]"},"path":"partial.go","line":9,"body":"<img alt=\"P1\"> partial finding","pull_request_review_id":101}]' ;;
+        *) echo '[{"user":{"login":"greptile-apps[bot]"},"path":"old.go","line":8,"body":"<img alt=\"P1\"> old addressed finding","pull_request_review_id":99}]' ;;
+      esac ;;
     *) echo "unexpected gh api: $*" >&2; exit 1 ;;
   esac
   exit 0
@@ -55,4 +60,13 @@ set -e
 grep -q 'Greptile finding set incomplete (0/1 current-review comments readable)' "$WORK/race.out" \
   || fail "incomplete current Greptile findings were not surfaced"
 
-echo "PASS pr-findings: current-head clean and complete Greptile scope"
+MODE="in_progress"; export MODE
+set +e
+PATH="$WORK/bin:$PATH" bash "$SCRIPT" test/repo 42 > "$WORK/progress.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 3 ] || fail "in-progress review exited rc=$rc, want 3: $(cat "$WORK/progress.out")"
+grep -q 'review still in progress; findings deferred' "$WORK/progress.out" || fail "in-progress review was not deferred"
+if grep -q '^  GR  ' "$WORK/progress.out"; then fail "partial in-progress finding was printed"; fi
+
+echo "PASS pr-findings: settled, current-head Greptile scope"

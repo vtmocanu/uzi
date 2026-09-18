@@ -127,7 +127,7 @@ for n in "$@"; do
   fi
 
   # ---- Greptile ----------------------------------------------------------------------
-  gr_ok=0; gr_added=""; gr_line="not triggered on this head (on-demand: gh pr comment ${n} --body '@greptileai review')"
+  gr_ok=0; gr_added=""; gr_status="absent"; gr_line="not triggered on this head (on-demand: gh pr comment ${n} --body '@greptileai review')"
   if [ -n "$head" ]; then
     gr_json=$(gh api --paginate "repos/${repo}/commits/${head}/check-runs" 2>/dev/null \
       | jq -s '[.[].check_runs[]?|select(.app.slug=="greptile-apps" and .name=="Greptile Review")]|last // empty' 2>/dev/null || true)
@@ -151,6 +151,17 @@ for n in "$@"; do
     fi
   fi
   echo "  Greptile: ${gr_line}"
+
+  # A bot can expose early inline comments before its review settles. Do not print or act on
+  # a partial finding set, even when the other bot already satisfies the review gate.
+  review_active=0
+  case "$crdesc" in *"in progress"*) review_active=1;; esac
+  case "$gr_status" in queued|in_progress) review_active=1;; esac
+  if [ "$review_active" -eq 1 ]; then
+    echo "  ⏳ review still in progress; findings deferred until the set is complete"
+    unconfirmed="${unconfirmed} #${n}"
+    continue
+  fi
 
   # ---- Gate --------------------------------------------------------------------------
   if [ "$cr_ok" -eq 1 ]; then

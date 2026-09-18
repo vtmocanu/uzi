@@ -44,6 +44,6 @@ Greptile puts in the PR body. One credit per review. The check-run appears ~12 s
 1. Head SHA from `gh pr view --json headRefOid`; every signal is tested against it.
 2. CR: status description → pending / limited / skipped / absent; reviewed = (a) or (c) or (d); command reply can require the agent to decide on one full review.
 3. Greptile: check-run on head → absent / in_progress / completed(+M).
-4. Live findings = CR live + Greptile live, regardless of which bot the gate requires.
-5. Ready only when required CI is settled green, the required reviewer(s) reviewed this exact
-   head, live = 0, no `mr_rework` active, and the head re-reads unchanged (TOCTOU).
+4. If either bot is active, defer finding output; the set is incomplete even when the other bot already satisfies the gate.
+5. Live findings = CR live + current-head Greptile live, regardless of which bot the gate requires.
+6. Ready only when required CI is settled green, every active review settled, the required reviewer(s) reviewed this exact head, live = 0, no `mr_rework` active, and the head re-reads unchanged (TOCTOU).
