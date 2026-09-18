@@ -252,6 +252,23 @@ export function openMRConflictMRIID(err: unknown): number | null {
   return typeof n === "number" ? n : null;
 }
 
+// isOutcomePendingConfirmation reports whether an error is the 409 the cancel path
+// returns when the run's worker is holding a finished-but-unlanded outcome (PRD #1391
+// Run B M3d, D13). The server refuses the cancel WITHOUT discard_pending_outcome so a
+// completed outcome is never silently discarded; the run page turns this into a
+// confirmation modal that names what is lost, then retries the cancel with the discard
+// bit. The typed body is {error, reason:"outcome_pending_confirmation_required"} (httpx
+// ErrorReason), so the reason is read from `reason`, NOT the `code` that isOpenMRConflict
+// reads — a distinct machine-readable field beside the human message.
+export function isOutcomePendingConfirmation(err: unknown): boolean {
+  return (
+    err instanceof ApiError &&
+    err.status === 409 &&
+    (err.body as { reason?: string } | null)?.reason ===
+      "outcome_pending_confirmation_required"
+  );
+}
+
 async function request<T>(
   method: string,
   path: string,
@@ -1080,6 +1097,14 @@ const realApi = {
     // false-positive-inference correction. Sent only when truthy so an ordinary approve
     // body is unchanged (default false server-side).
     overrideCapabilities?: boolean,
+    // PRD #1391 Run B M3d (D13): the explicit "discard the held outcome" confirmation on a
+    // `cancel`. Meaningful ONLY with kind "cancel" (the server ignores it elsewhere). A
+    // cancel of a run whose worker holds a finished-but-unlanded outcome is refused with a
+    // typed 409 (reason "outcome_pending_confirmation_required", see
+    // isOutcomePendingConfirmation) UNLESS this is true; with it the server takes the atomic
+    // no-live-poller cancel branch and the held outcome is discarded. Sent only when truthy
+    // so an ordinary cancel body is unchanged (default false server-side).
+    discardPendingOutcome?: boolean,
   ) =>
     request<{ server_side: boolean; id?: number; created_at?: string }>(
       "POST",
@@ -1092,6 +1117,7 @@ const realApi = {
         // plain follow-up/cancel body is unchanged.
         ...(selection ? { selection } : {}),
         ...(overrideCapabilities ? { override_capabilities: true } : {}),
+        ...(discardPendingOutcome ? { discard_pending_outcome: true } : {}),
       },
     ),
 

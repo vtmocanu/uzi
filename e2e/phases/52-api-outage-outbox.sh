@@ -1,14 +1,14 @@
 # shellcheck shell=bash
 # phase:    api-outage-outbox
-# title:    PRD #1391: worker outbox survives an api outage (spill+drain, quota tombstones)
+# title:    PRD #1391: worker outbox survives an api outage (M5 spill+drain/tombstones, M6 write-ahead terminal replay)
 # critical: no
 # lane:     gitlab
 # executor: stub
 # requires: REPO_ID UZI_WORKER_TOKEN
 # provides: -
 # handoff:  -
-# mutates:  compose:api(force-recreated: heartbeat-stale window raised for the outage), compose:agent(force-recreated: outbox knobs); two stub runs created
-# restores: api + agent force-recreated back to their defaults; stub runs cancelled best-effort
+# mutates:  compose:api(force-recreated: heartbeat-stale window raised for the outage; stop/started per case for each outage), compose:agent(force-recreated: outbox knobs; short stub-outbox stream for the M6 cases; RESTARTED mid-outage for the boot-gate case); five stub runs created; one run's started_at/completion_attempts back-dated in-DB to reach the timeout-sweep carve-out
+# restores: api + agent force-recreated back to their defaults (stream length + quotas reset); stub runs cancelled best-effort
 # race-sensitive: yes
 # =============================================================================
 # PRD #1391 M5 (Run A) — the worker message OUTBOX survives an api outage. When the api
@@ -32,6 +32,28 @@
 #      is variable, D2 eviction is soft), but the contiguous-stream invariant it exists
 #      to protect is asserted unconditionally, so the guard is never vacuous.
 #
+# PRD #1391 M6 (Run B) — the worker also survives an outage that swallows a run's TERMINAL
+# OUTCOME, not just its messages. `completed`/`failed` of a run-lane attempt is journaled
+# WRITE-AHEAD to the outbox (M3, keyed by claim generation) BEFORE its first network send and
+# fenced on `runs.last_seq` at the api, so a run that finishes while the api is down replays its
+# messages first and its outcome only once the trace is contiguous — no false `failed`, nothing
+# redone. The M6 cases use the SAME UZI_STUB_OUTBOX sentinel with a SHORTER stream
+# (UZI_STUB_OUTBOX_TICKS, e2e-only, exported below) so the run reaches its terminal INSIDE a
+# bounded outage that stays under the raised heartbeat-stale window:
+#   3. FINISH-DURING-OUTAGE: a run reaches `completed` (journaled write-ahead) while the api is
+#      down; on recovery it ends `completed` AFTER its gapless messages (the fence), at its
+#      original generation (replayed, not re-executed), with no transient `failed`. The judge /
+#      notification enqueue rides the SAME fenced SetState, so it cannot fire ahead of the trace.
+#   4. RESTART-MID-OUTAGE (SC3): the agent CONTAINER is restarted mid-outage. Its /data outbox
+#      tree (the message spill + the pre-existing `.reserve` + the terminal journal) persists on
+#      the agentdata named volume, so the restart resumes onto that existing tree (the outbox init
+#      / reserve-grow-on-upgrade path) and the D7 BOOT GATE lands the journaled outcome BEFORE any
+#      new claim — proven by the generation staying put and no requeue being charged.
+#   5. INTERLOCKED-LOST-TERMINAL: a post-attempt run in the completion-interlock carve-out
+#      (completion_attempts>0 + a live worker) the ordinary timeout sweep is DELIBERATELY blind to
+#      — reached directly in the DB — loses its terminal to the outage; the journal replay lands
+#      `completed` (never the sweep's run_timeout `failed`), so it does not sit non-terminal forever.
+#
 # WHY the api heartbeat-stale window is RAISED here: the e2e boots with
 # E2E_WORKER_HEARTBEAT_STALE=15s, but each outage cuts the api for >15s, so at recovery
 # the worker's last heartbeat is stale and the 2s sweeper would REQUEUE the running run
@@ -41,7 +63,7 @@
 #
 # NOTE: this phase runs AFTER 51-auto-stop-poison, which (via 50) left the agent stopped;
 # it brings the agent back up itself. 59-restart-agent still runs after and re-ensures it.
-say "PRD #1391 M5: worker outbox survives an api outage (spill+drain, quota tombstones)"
+say "PRD #1391 M5+M6: worker outbox survives an api outage (spill+drain, quota tombstones; write-ahead terminal replay)"
 if [ "$EXECUTOR" != stub ]; then
   say "PRD #1391 outbox scenario: SKIPPED (stub-only — UZI_STUB_OUTBOX is a stub sentinel; executor=$EXECUTOR)"
 else
@@ -243,10 +265,156 @@ else
 fi
 
 # =============================================================================
+# PRD #1391 M6 (Run B) — write-ahead terminal reports survive the SAME outage. A run-lane
+# `completed`/`failed` is journaled write-ahead to the outbox (M3, keyed by claim generation)
+# BEFORE its first network send and fenced on runs.last_seq at the api, so a run that finishes
+# while the api is down replays its messages first and its outcome only once the trace is
+# contiguous. These cases reuse the UZI_STUB_OUTBOX sentinel but with the SHORT e2e-only stream
+# (UZI_STUB_OUTBOX_TICKS) so the run reaches its terminal INSIDE a bounded outage that still stays
+# under the 90s heartbeat-stale window raised above — the worker stays leased across the outage.
+say "M6 (Run B): write-ahead terminal reports survive an api outage (finish-during, restart, interlocked)"
+unset WORKER_OUTBOX_RUN_MAX_BYTES            # back to DEFAULT quotas (a clean spill, no eviction) for the M6 runs
+export UZI_STUB_OUTBOX_TICKS=20              # ~20s stream (vs the 90s Run A default), e2e-only; unset at restore
+"${COMPOSE[@]}" up -d --no-deps --force-recreate agent >/dev/null
+wait_worker_online
+pass "agent recreated with WORKER_TRANSIENT_TRIP_MS=3s + a short UZI_STUB_OUTBOX stream for the M6 terminal-replay cases"
+
+# rb_run_field RUN COL — a scalar runs column straight from the db (COL is a fixed literal from
+# THIS file, never user input). Empty string for a SQL NULL (the 42-readoption idiom).
+rb_run_field() { db_psql "SELECT $2 FROM runs WHERE id = '$1'"; }
+
+# Seconds the api stays down for each M6 outage: comfortably longer than the stream tail after
+# the cut PLUS the write-ahead terminal journal margin (so the run reaches AND journals its
+# terminal while the api is unreachable), yet well under the 90s heartbeat-stale window (so the
+# worker is never swept stale mid-outage and the run is never requeued).
+RB_OUTAGE=30
+
+# =============================================================================
+# CASE 3 — a run FINISHING during the outage is `completed` AFTER its messages (the fence), at its
+# original generation (replayed, not re-executed), with no false `failed` (SC1/SC2).
+say "CASE 3: a run finishing during the outage -> completed after its messages (fence), no false failed"
+make_outbox_run
+RUN_B1="$OUTBOX_RUN"
+GEN_B1="$(rb_run_field "$RUN_B1" claim_generation)"
+say "cutting the api ~${RB_OUTAGE}s so run $RUN_B1 reaches its terminal (journaled write-ahead) while it is down"
+"${COMPOSE[@]}" stop api >/dev/null 2>&1
+sleep "$RB_OUTAGE"
+"${COMPOSE[@]}" up -d --wait api >/dev/null
+wait_http
+login
+# On recovery the drainer replays the run's messages FIRST; the terminal SetState is then fenced
+# on runs.last_seq (409 messages_pending until the trace is contiguous through the journal's
+# messages_through_seq), so `completed` — and the judge/notification enqueue that rides the SAME
+# applied SetState (service.go:2759-2768) — can only land AFTER the whole trace. wait_status
+# completed ALSO fails on any transient `failed`, so SC1's "no false failed" is enforced here.
+wait_status "$RUN_B1" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
+wait_drained "$RUN_B1"
+assert_contiguous "$RUN_B1"
+RB1_FR="$(apiget "/api/runs/$RUN_B1" | jq -r '.run.failure_reason // ""')"
+[ -z "$RB1_FR" ] \
+  || fail "case 3: run carried a failure_reason after a transient outage — the journaled completed was not the outcome: $RB1_FR"
+# Replayed from the journal, not re-executed: the write-ahead outcome is sent at its ORIGINAL
+# claim generation, so the generation is unchanged (a re-execution would re-claim, +1).
+[ "$(rb_run_field "$RUN_B1" claim_generation)" = "$GEN_B1" ] \
+  || fail "case 3: generation advanced across the outage — the outcome was re-executed, not replayed (gen $GEN_B1 -> $(rb_run_field "$RUN_B1" claim_generation))"
+# A `completed` run whose whole persisted stream is gapless 1..N (assert_contiguous above) could
+# only reach terminal once last_seq was contiguous through the fence; the per-seq fence refusal
+# itself is asserted directly in api/internal/workersvc/terminal_fence_livedb_test.go.
+pass "case 3: run finished during the outage -> completed AFTER its gapless messages (fence held), gen unchanged ($GEN_B1), no false failed"
+
+# =============================================================================
+# CASE 4 — the agent CONTAINER restarted mid-outage lands the journaled outcome from the D7 BOOT
+# GATE, before any new claim (SC3). The run first spills MESSAGES during the outage, so its outbox
+# dir holds a message-only spill; combined with the suite's pre-existing `.reserve` this is the
+# EXISTING disk tree the restart resumes onto (the outbox init / reserve-grow-on-upgrade path runs
+# against it on boot). /data is the `agentdata` named volume, so the tree persists across a restart.
+say "CASE 4: agent restarted mid-outage -> boot gate lands the journaled outcome before any claim (SC3)"
+make_outbox_run
+RUN_B2="$OUTBOX_RUN"
+GEN_B2="$(rb_run_field "$RUN_B2" claim_generation)"
+RQ_B2="$(rb_run_field "$RUN_B2" requeue_count)"
+say "cutting the api so run $RUN_B2 spills its messages and journals its terminal while down"
+"${COMPOSE[@]}" stop api >/dev/null 2>&1
+sleep "$RB_OUTAGE"                      # stream ends + the write-ahead terminal journal installs (api unreachable)
+# Restart the agent CONTAINER while the api is still down. Its original execution process dies, so
+# the ONLY path left to terminal is the boot gate replaying the on-disk journal. `restart` reuses
+# the same container + the same /data volume, so the existing outbox tree is what the worker boots
+# onto (no --force-recreate, which would keep the named volume too but discard the container).
+say "restarting the agent container mid-outage (its /data outbox tree persists across the restart)"
+"${COMPOSE[@]}" restart agent >/dev/null 2>&1
+# Bring the api back. The restarted worker — parked in its register-retry while the api was down —
+# registers with its pending-terminal snapshot, then the boot gate resolves the journal BEFORE the
+# claim loops start.
+"${COMPOSE[@]}" up -d --wait api >/dev/null
+wait_http
+login
+wait_worker_online
+wait_status "$RUN_B2" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
+wait_drained "$RUN_B2"
+assert_contiguous "$RUN_B2"
+# Landed via the BOOT GATE, before any new claim: the terminal is sent at the JOURNALED generation
+# with no re-claim, so the generation is unchanged AND no requeue was charged. A re-execution
+# (journal missing / run re-claimed) would advance the generation and bank a requeue.
+[ "$(rb_run_field "$RUN_B2" claim_generation)" = "$GEN_B2" ] \
+  || fail "case 4: generation advanced across the restart — re-executed, not landed from the boot gate (gen $GEN_B2 -> $(rb_run_field "$RUN_B2" claim_generation))"
+[ "$(rb_run_field "$RUN_B2" requeue_count)" = "$RQ_B2" ] \
+  || fail "case 4: the run was requeued across the restart (re-executed) rather than replayed from the boot gate (requeue_count $RQ_B2 -> $(rb_run_field "$RUN_B2" requeue_count))"
+RB2_FR="$(apiget "/api/runs/$RUN_B2" | jq -r '.run.failure_reason // ""')"
+[ -z "$RB2_FR" ] \
+  || fail "case 4: run carried a failure_reason after the restart — the journaled outcome was not the result: $RB2_FR"
+pass "case 4: agent restart mid-outage -> boot gate landed the journaled completed at gen $GEN_B2 (no re-claim, no requeue), stream gapless"
+
+# =============================================================================
+# CASE 5 — an INTERLOCKED run's lost terminal lands on replay: it does not sit non-terminal forever.
+say "CASE 5: an interlocked run's lost terminal lands on replay (never sits non-terminal forever)"
+make_outbox_run
+RUN_B3="$OUTBOX_RUN"
+GEN_B3="$(rb_run_field "$RUN_B3" claim_generation)"
+# Place the run in the completion-interlock carve-out the ordinary timeout sweep is DELIBERATELY
+# blind to (SweepRunningTimeout / sweep.go: `completion_attempts > 0 AND a live worker`): a
+# post-attempt run past its wall budget that the wall-clock sweep will NOT terminal-fail. We reach
+# that exact DB state directly — completion_attempts=1 + a long-past started_at — rather than
+# driving the whole budget-exhaustion protocol, because the point of THIS case is that a LOST
+# terminal on such a run lands via the write-ahead journal, not the interlock protocol itself.
+db_psql "UPDATE runs SET completion_attempts = 1, started_at = now() - interval '30 days' WHERE id = '$RUN_B3'" >/dev/null
+[ "$(rb_run_field "$RUN_B3" completion_attempts)" = 1 ] \
+  || fail "case 5: could not place run $RUN_B3 in the interlock carve-out (completion_attempts != 1)"
+# The carve-out holds: the run is 30 days past its wall yet the 2s sweeper spares it (live worker +
+# completion_attempts>0). Watch it stay `running` across several sweep ticks — a broken carve-out
+# would fail it with fail_origin='run_timeout' right here, before the outage.
+CO_DEADLINE=$((SECONDS + 6))
+while [ "$SECONDS" -lt "$CO_DEADLINE" ]; do
+  CO_ST="$(rb_run_field "$RUN_B3" status)"
+  [ "$CO_ST" = running ] \
+    || fail "case 5: the past-wall interlocked run left 'running' before the outage (status=$CO_ST) — the timeout-sweep carve-out did not hold"
+  sleep 1
+done
+pass "case 5: past-wall interlocked run held at 'running' across the sweep (carve-out engaged; the wall-clock sweep will never terminalise it)"
+# Now lose its terminal to an outage. Without the journal replay this run would stay non-terminal
+# forever (the carve-out spares it from the timeout sweep AND the judge sweep never touches it).
+say "cutting the api so the interlocked run's terminal is journaled and its first send lost"
+"${COMPOSE[@]}" stop api >/dev/null 2>&1
+sleep "$RB_OUTAGE"
+"${COMPOSE[@]}" up -d --wait api >/dev/null
+wait_http
+login
+# The journal replays: the run reaches `completed` (never the sweep's run_timeout `failed`), at its
+# original generation, with a gapless trace.
+wait_status "$RUN_B3" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
+wait_drained "$RUN_B3"
+assert_contiguous "$RUN_B3"
+[ "$(rb_run_field "$RUN_B3" claim_generation)" = "$GEN_B3" ] \
+  || fail "case 5: generation advanced — the terminal was re-executed, not replayed from the journal (gen $GEN_B3 -> $(rb_run_field "$RUN_B3" claim_generation))"
+RB3_ORIGIN="$(apiget "/api/runs/$RUN_B3" | jq -r '.run.fail_origin // ""')"
+[ -z "$RB3_ORIGIN" ] \
+  || fail "case 5: run carried fail_origin=$RB3_ORIGIN — a wall-clock sweep failed it instead of the journal landing 'completed'"
+pass "case 5: the interlocked run's lost terminal landed on replay -> completed at gen $GEN_B3 (never sat non-terminal, never sweep-failed)"
+
+# =============================================================================
 # RESTORE — return the api stale window and the agent outbox knobs to their defaults so
 # later phases (59-restart-agent, 60-62) are unaffected. Mirrors phase 46's restore.
 say "restore: recreate api + agent back to their defaults"
-unset E2E_WORKER_HEARTBEAT_STALE WORKER_TRANSIENT_TRIP_MS WORKER_OUTBOX_RUN_MAX_BYTES
+unset E2E_WORKER_HEARTBEAT_STALE WORKER_TRANSIENT_TRIP_MS WORKER_OUTBOX_RUN_MAX_BYTES UZI_STUB_OUTBOX_TICKS
 "${COMPOSE[@]}" up -d --wait --no-deps --force-recreate api >/dev/null
 wait_http
 login
@@ -254,9 +422,10 @@ login
 wait_worker_online
 pass "api + agent recreated back to their defaults"
 
-# Best-effort cleanup: both runs completed (terminal), so a cancel is a no-op, but never
-# let a cleanup blip redden a passed phase.
-apipost "/api/runs/$RUN1/inputs" '{"kind":"cancel","body":""}' >/dev/null 2>&1 || true
-apipost "/api/runs/$RUN2/inputs" '{"kind":"cancel","body":""}' >/dev/null 2>&1 || true
+# Best-effort cleanup: every run completed (terminal), so a cancel is a no-op, but never let a
+# cleanup blip redden a passed phase.
+for r in "$RUN1" "$RUN2" "$RUN_B1" "$RUN_B2" "$RUN_B3"; do
+  [ -n "${r:-}" ] && apipost "/api/runs/$r/inputs" '{"kind":"cancel","body":""}' >/dev/null 2>&1 || true
+done
 
 fi

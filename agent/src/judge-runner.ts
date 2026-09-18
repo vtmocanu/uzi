@@ -18,6 +18,8 @@ import type { Logger } from "./log.js";
 import { fenceNonce } from "./prompt.js";
 import { defaultQueryFn, mapSdkMessage } from "./sdk-messages.js";
 import { runReadOnlyModelPass, safeReportFailed } from "./model-pass.js";
+import { makeTerminalOutboxDeps, postTerminalState, type TerminalOutboxDeps } from "./terminal-resolve.js";
+import type { Outbox } from "./outbox.js";
 import type { EmittedMessage } from "./executor.js";
 import { classifyLimitFailure, LimitReachedError } from "./limit.js";
 import type { SdkQueryFn } from "./sdk-executor.js";
@@ -136,6 +138,12 @@ export interface JudgeRunnerOptions {
    *  it is listed in the worker's ActiveSnapshot at phase `running` for its whole life
    *  (a judge never parks). Undefined ⇒ no tracking. */
   activeRuns?: ActiveRunRegistry;
+  /** PRD #1391 Run B M3b (D6): the worker outbox + its terminal knobs, so the judge journals its
+   *  terminal STATE (never the verdict POST) write-ahead — a lost judge terminal would otherwise sit
+   *  `running` forever (the timeout sweep excludes judge runs, fact 12). Undefined ⇒ un-journaled. */
+  outbox?: Outbox;
+  outboxTerminalMaxBytes?: number;
+  gapFillMax?: number;
 }
 
 export class JudgeRunner {
@@ -143,6 +151,8 @@ export class JudgeRunner {
   private readonly homeRoot: string;
   private readonly modelTimeoutMs: number;
   private readonly activeRuns: ActiveRunRegistry | undefined;
+  /** PRD #1391 Run B M3b: the terminal-resolve deps, or undefined when no usable outbox is wired. */
+  private readonly terminalDeps: TerminalOutboxDeps | undefined;
 
   constructor(
     private readonly client: WorkerClient,
@@ -153,6 +163,11 @@ export class JudgeRunner {
     this.homeRoot = opts.homeRoot ?? os.tmpdir();
     this.modelTimeoutMs = opts.modelTimeoutMs ?? JUDGE_MODEL_TIMEOUT_MS;
     this.activeRuns = opts.activeRuns;
+    this.terminalDeps = makeTerminalOutboxDeps(opts.outbox, this.client, {
+      gapFillMax: opts.gapFillMax ?? 10_000,
+      terminalMaxBytes: opts.outboxTerminalMaxBytes ?? Math.round(1.25 * 1024 * 1024),
+      log: this.log,
+    });
   }
 
   /** Run one judge claim end to end. Never throws — a failure reports the judge run
@@ -170,6 +185,7 @@ export class JudgeRunner {
         "judge claim carried no target run",
         undefined,
         claim.claim_generation,
+        this.terminalDeps,
       );
       return;
     }
@@ -276,16 +292,30 @@ export class JudgeRunner {
         return;
       }
       await this.client.postReview(targetId, review);
-      await this.client.reportState(judgeRunId, {
-        status: "completed",
-        // PRD #1247 M2 fix round: stamp the claim's run-lane generation on the terminal report too
-        // (direct report, not the RunRunner stamping closure), so the completion is fenced not 409'd.
-        claim_generation: claim.claim_generation,
+      // PRD #1391 Run B M3b (D6): journal the terminal STATE write-ahead (never the postReview above),
+      // then resolve it. Fence 0 — the judge's own trace is a single advisory usage frame that gates
+      // no api sub-work. The completion still carries the claim generation (#1247 M2 fix round: a
+      // direct report, not the RunRunner stamping closure) so it is fenced not 409'd.
+      await postTerminalState(this.terminalDeps, this.client, {
+        runId: judgeRunId,
+        claimGeneration: claim.claim_generation ?? 0,
+        phase: "running",
+        messagesThroughSeq: 0,
+        body: { status: "completed", claim_generation: claim.claim_generation },
       });
       this.log.info("judge run completed", { run_id: judgeRunId, target: targetId, verdict: review.verdict });
     } catch (err) {
       this.log.warn("judge post/complete failed", { run_id: judgeRunId, error: errMessage(err) });
-      await safeReportFailed(this.client, this.log, "judge", judgeRunId, errMessage(err), err, claim.claim_generation);
+      await safeReportFailed(
+        this.client,
+        this.log,
+        "judge",
+        judgeRunId,
+        errMessage(err),
+        err,
+        claim.claim_generation,
+        this.terminalDeps,
+      );
     } finally {
       // PRD #1390 M2a: the judge is terminal here on every path — stop listing it.
       this.activeRuns?.remove(judgeRunId);

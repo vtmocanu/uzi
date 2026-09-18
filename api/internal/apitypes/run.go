@@ -684,6 +684,28 @@ type RunDTO struct {
 	// [] over null — so a client reads it unconditionally. Populated from
 	// run_credential_epochs in the DTO builder's enrichment path.
 	CredentialEpochs []CredentialEpochDTO `json:"credential_epochs"`
+	// OutcomePending is set (PRD #1391 M3, D13) when the run's OWNING worker holds a
+	// finished terminal outcome its api could not land — a terminal journal the api
+	// permanently refused — so the owner can see the held outcome and resolve it with a
+	// discarding cancel. null (today's contract) for every run with no held outcome, which
+	// is every run until a worker reports a blocked terminal journal. It is NON-PURE
+	// telemetry (the outbox tracker, not the run row), so it is overlaid in the GetRun
+	// enrichment path, never in the pure runToDTO builder, and only for the single-run
+	// detail read — the list/board never carries it. Reason is one of a CLOSED enum
+	// (completion_permit_mismatch | gap_unrecoverable | reserve_exhausted), filtered
+	// server-side so untrusted worker text can never reach the client.
+	OutcomePending *OutcomePendingDTO `json:"outcome_pending"`
+}
+
+// OutcomePendingDTO names a finished outcome held on the run's worker (PRD #1391 M3,
+// D13). Reason is one of the closed set the worker may report — completion_permit_mismatch
+// (the run's completion permit no longer matches), gap_unrecoverable (a message hole the
+// worker cannot fill bounds the terminal fence), reserve_exhausted (the terminal-journal
+// reserve is full) — mapped to friendly text by the web owner-resolution UI. The api drops
+// any other value (the worker is untrusted), so a client may render an unrecognised value
+// honestly but will never see one from this api.
+type OutcomePendingDTO struct {
+	Reason string `json:"reason"`
 }
 
 // CredentialOverrideDTO is a run's or schedule's per-run credential override (PRD #1247
@@ -793,6 +815,14 @@ type RunInputRequest struct {
 	// false-positive-inference correction. No runtime security boundary is bypassed: the
 	// §300 guardrail still denies docker USE on a daemon-less worker at run time.
 	OverrideCapabilities bool `json:"override_capabilities"`
+	// DiscardPendingOutcome is the PRD #1391 Run B M3d (D13) explicit confirmation on a `cancel`,
+	// default false and omitted so a newer client remains compatible with an older strict-decoding
+	// api. When the target run has a terminal outcome journaled and leased on its worker, the server
+	// refuses the cancel with a typed 409 (reason "outcome_pending_confirmation_required") UNLESS this
+	// is true; with it the cancel takes the atomic owner-scoped no-live-poller branch that discards the
+	// held outcome. Meaningful only for cancel — inert on every other kind and on a cancel of a run
+	// with no pending outcome. Nothing is ever discarded on a timer; only the owner, explicitly.
+	DiscardPendingOutcome bool `json:"discard_pending_outcome,omitempty"`
 }
 
 // RunInputResponse is the POST /api/runs/{id}/inputs reply: server_side reports

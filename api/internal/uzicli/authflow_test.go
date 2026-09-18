@@ -1,6 +1,7 @@
 package uzicli
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -155,14 +156,28 @@ func TestCreateRunWireShape(t *testing.T) {
 
 // SubmitRunInput posts {kind, body, selection} to /api/runs/{id}/inputs. A nil
 // selection must serialize as an explicit null (the field is not omitempty), and a
-// non-nil selection must ride as {source, exclusions}.
+// non-nil selection must ride as {source, exclusions}. The false discard bit is
+// omitted so a newer CLI remains compatible with an older strict-decoding API.
 func TestSubmitRunInputWireShape(t *testing.T) {
+	type legacyRunInputRequest struct {
+		Kind                 string                   `json:"kind"`
+		Body                 string                   `json:"body"`
+		Selection            *apitypes.AgentSelection `json:"selection"`
+		OverrideCapabilities bool                     `json:"override_capabilities"`
+	}
+
 	t.Run("cancel, no selection", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path != "/api/runs/r1/inputs" {
 				t.Errorf("path = %s", r.URL.Path)
 			}
 			raw, _ := io.ReadAll(r.Body)
+			dec := json.NewDecoder(bytes.NewReader(raw))
+			dec.DisallowUnknownFields()
+			var legacy legacyRunInputRequest
+			if err := dec.Decode(&legacy); err != nil {
+				t.Errorf("legacy strict decode: %v (body: %s)", err, raw)
+			}
 			var body map[string]json.RawMessage
 			_ = json.Unmarshal(raw, &body)
 			if string(body["kind"]) != `"cancel"` {
@@ -171,11 +186,33 @@ func TestSubmitRunInputWireShape(t *testing.T) {
 			if string(body["selection"]) != "null" {
 				t.Errorf("selection = %s, want null", body["selection"])
 			}
+			if _, ok := body["discard_pending_outcome"]; ok {
+				t.Errorf("discard_pending_outcome must be omitted when false (body: %s)", raw)
+			}
 			w.WriteHeader(http.StatusAccepted)
 			_, _ = io.WriteString(w, `{"server_side":true}`)
 		}))
 		defer srv.Close()
-		res, err := newTestClient(srv).SubmitRunInput(context.Background(), "r1", "cancel", "", nil)
+		res, err := newTestClient(srv).SubmitRunInput(context.Background(), "r1", "cancel", "", nil, false)
+		if err != nil || !res.ServerSide {
+			t.Fatalf("res=%+v err=%v", res, err)
+		}
+	})
+
+	t.Run("confirmed discard carries true", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var body map[string]json.RawMessage
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode request: %v", err)
+			}
+			if string(body["discard_pending_outcome"]) != "true" {
+				t.Errorf("discard_pending_outcome = %s, want true", body["discard_pending_outcome"])
+			}
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = io.WriteString(w, `{"server_side":true}`)
+		}))
+		defer srv.Close()
+		res, err := newTestClient(srv).SubmitRunInput(context.Background(), "r1", "cancel", "", nil, true)
 		if err != nil || !res.ServerSide {
 			t.Fatalf("res=%+v err=%v", res, err)
 		}
@@ -196,7 +233,7 @@ func TestSubmitRunInputWireShape(t *testing.T) {
 		}))
 		defer srv.Close()
 		sel := &apitypes.AgentSelection{Source: "own", Exclusions: []string{"tester"}}
-		_, err := newTestClient(srv).SubmitRunInput(context.Background(), "r1", "approve_plan", "", sel)
+		_, err := newTestClient(srv).SubmitRunInput(context.Background(), "r1", "approve_plan", "", sel, false)
 		if err != nil {
 			t.Fatal(err)
 		}

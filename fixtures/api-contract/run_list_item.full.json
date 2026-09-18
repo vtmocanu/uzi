@@ -195,6 +195,9 @@
       "applied_at": "2020-01-02T03:04:05Z"
     }
   ],
+  "outcome_pending": {
+    "reason": "x"
+  },
   "repo_path": "x",
   "worker_name": "x",
   "owner_email": "x",

@@ -52,6 +52,10 @@ type fakeStore struct {
 	claimCtxCalled bool
 	anthropic      []byte
 	anthropicErr   error
+	// pendingOutcomeLease drives RunHasPendingOutcomeLease (PRD #1391 Run B M3d): a test stages
+	// true to model a run whose executor journaled a terminal outcome on its worker.
+	pendingOutcomeLease    bool
+	pendingOutcomeLeaseErr error
 	// byIDSecrets is the by-id secret lookup (PRD #104): secret id → sealed row, the
 	// path a WORKER-BOUND claim takes instead of the by-kind default. Keyed by id so
 	// a test can stage two credentials and prove a rebind changes which one the
@@ -1318,6 +1322,14 @@ func (f *fakeStore) ListJudgeTriageRowsForUser(_ context.Context, userID uuid.UU
 func (f *fakeStore) GetWorkerByID(context.Context, uuid.UUID) (store.Worker, error) {
 	return f.workerByID, f.workerByIDErr
 }
+
+// RunHasPendingOutcomeLease models the PRD #1391 Run B M3d (D13) positive predicate: false by
+// default (no journaled terminal outcome), or f.pendingOutcomeLease when a test stages one to
+// drive hasLivePoller / the cancel confirmation gate. hasLivePoller reads it only after a fresh
+// heartbeat and only for a non-chat run.
+func (f *fakeStore) RunHasPendingOutcomeLease(context.Context, uuid.UUID) (bool, error) {
+	return f.pendingOutcomeLease, f.pendingOutcomeLeaseErr
+}
 func (f *fakeStore) ClearRunRequiredCapabilities(_ context.Context, arg store.ClearRunRequiredCapabilitiesParams) (int64, error) {
 	f.clearedCaps = &arg
 	// Mirror the real owner+status-guarded UPDATE: on a matching row, empty the run's
@@ -1564,17 +1576,22 @@ func testParams() Params {
 		TerminalPendingLease:     time.Hour,
 		ActiveSnapshotMaxEntries: 256,
 		WorkerOutboxMaxPending:   32,
-		WorkerAffinityGrace:      2 * time.Minute,
-		WorkerAffinityCeiling:    25 * time.Minute, // PRD #628 run-lane ceiling — deliberately != grace (2m) and != default (2h) so a test proves the run lane reads the ceiling
-		WorkerSpreadGrace:        9 * time.Second,
-		WorkerBackgroundGrace:    15 * time.Minute,
-		ClaimGrace:               5 * time.Minute,
-		SkillMaxBytes:            65536,
-		SkillsMaxPerRun:          32,
-		ChatIdleTimeout:          70 * time.Minute,
-		ChatMaxTurns:             50,
-		WorkerChatIdleTimeout:    60 * time.Minute,
-		WorkerChatTurnTimeout:    10 * time.Minute,
+		// PRD #1391 Run B M3c: the terminal-fence gap-recovery ceiling at its config default, so a
+		// Service from testParams() classifies a small hole as recoverable (ErrMessagesPending) and
+		// only a hole > 10000 as ErrGapUnrecoverable. Fence tests that exercise the unrecoverable
+		// branch either use a `through` far above the stored count or override this on their Params.
+		WorkerGapFillMax:      10000,
+		WorkerAffinityGrace:   2 * time.Minute,
+		WorkerAffinityCeiling: 25 * time.Minute, // PRD #628 run-lane ceiling — deliberately != grace (2m) and != default (2h) so a test proves the run lane reads the ceiling
+		WorkerSpreadGrace:     9 * time.Second,
+		WorkerBackgroundGrace: 15 * time.Minute,
+		ClaimGrace:            5 * time.Minute,
+		SkillMaxBytes:         65536,
+		SkillsMaxPerRun:       32,
+		ChatIdleTimeout:       70 * time.Minute,
+		ChatMaxTurns:          50,
+		WorkerChatIdleTimeout: 60 * time.Minute,
+		WorkerChatTurnTimeout: 10 * time.Minute,
 		// Issue #1197 transient-recovery park: the config defaults, so a svc built from
 		// testParams() computes a real recovery backoff (1m base doubling to a 30m cap).
 		RunRecoveryParkBase: time.Minute,

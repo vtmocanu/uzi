@@ -39,7 +39,7 @@ func newRunScopeCmd(env Env, gf *globalFlags) *cobra.Command {
 				return uzicli.Exitf(uzicli.ExitUsage, "run scope needs --through N")
 			}
 			n, _ := cmd.Flags().GetInt("through")
-			if err := submitInput(env, gf, c, cmd, args[0], kindScope, strconv.Itoa(n), nil); err != nil {
+			if err := submitInput(env, gf, c, cmd, args[0], kindScope, strconv.Itoa(n), nil, false); err != nil {
 				return err
 			}
 			// The server clamps the ceiling to [already-completed, total]; the applied value
@@ -101,7 +101,7 @@ func newRunPauseCmd(env Env, gf *globalFlags) *cobra.Command {
 			case now:
 				body = "now"
 			}
-			res, err := c.SubmitRunInput(cmd.Context(), runID, kind, body, nil)
+			res, err := c.SubmitRunInput(cmd.Context(), runID, kind, body, nil, false)
 			if err != nil {
 				return err
 			}
@@ -177,7 +177,7 @@ func newRunExtendCmd(env Env, gf *globalFlags) *cobra.Command {
 				return err
 			}
 			runID := args[0]
-			res, err := c.SubmitRunInput(cmd.Context(), runID, kindExtend, strconv.Itoa(seconds), nil)
+			res, err := c.SubmitRunInput(cmd.Context(), runID, kindExtend, strconv.Itoa(seconds), nil, false)
 			if err != nil {
 				return err
 			}
@@ -299,7 +299,7 @@ func newRunFollowUpCmd(env Env, gf *globalFlags) *cobra.Command {
 			if strings.TrimSpace(msg) == "" {
 				return uzicli.Exitf(uzicli.ExitUsage, "a follow-up needs a message: pass -m <message> or pipe it on stdin")
 			}
-			return submitInput(env, gf, c, cmd, args[0], kindFollowUp, msg, nil)
+			return submitInput(env, gf, c, cmd, args[0], kindFollowUp, msg, nil, false)
 		},
 	}
 	followUp.Flags().StringP("message", "m", "", "the follow-up message (or pipe it on stdin)")
@@ -332,7 +332,7 @@ func newRunReviseCmd(env Env, gf *globalFlags) *cobra.Command {
 			if strings.TrimSpace(msg) == "" {
 				return uzicli.Exitf(uzicli.ExitUsage, "a revision needs a message: pass -m <feedback> or pipe it on stdin")
 			}
-			return submitInput(env, gf, c, cmd, args[0], kindRevisePlan, msg, nil)
+			return submitInput(env, gf, c, cmd, args[0], kindRevisePlan, msg, nil, false)
 		},
 	}
 	revise.Flags().StringP("message", "m", "", "the plan feedback to send back (or pipe it on stdin)")
@@ -396,7 +396,7 @@ func newRunAnswerCmd(env Env, gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return submitInput(env, gf, c, cmd, args[0], kindAnswer, string(body), nil)
+			return submitInput(env, gf, c, cmd, args[0], kindAnswer, string(body), nil, false)
 		},
 	}
 	answer.Flags().StringArrayP("message", "m", nil, "the answer (repeat once per question; or pipe a single answer on stdin)")

@@ -1,9 +1,14 @@
-import { describe, it } from "node:test";
+import { afterEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import fsp from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import type { Options as SdkOptions, HookInput } from "@anthropic-ai/claude-agent-sdk";
 
 import { JudgeRunner, buildJudgePrompt, parseReview, fallbackReview, calibrateReview } from "../src/judge-runner.js";
+import { Outbox } from "../src/outbox.js";
+import type { StateAck } from "../src/protocol.js";
 import { stubJudgeQueryFn } from "../src/judge-runner-stub.js";
 import type { SdkQueryFn } from "../src/sdk-executor.js";
 import type { WorkerClient } from "../src/client.js";
@@ -1175,5 +1180,96 @@ describe("judge tool confinement (PRD #89 M-allow / auditor Medium)", () => {
 
     assert.ok(captured.options, "the judge must have called the model (so options were captured)");
     assert.ok(!("effort" in captured.options!), "no effort is set when the claim carries no default_effort");
+  });
+});
+
+// PRD #1391 Run B M3b (D6): the judge journals its terminal STATE write-ahead — never the verdict
+// POST. A fake api whose terminal report FAILS transport leaves the journal on disk so the test can
+// prove (a) the outcome is journalled before it is confirmed, (b) the journal body is the terminal
+// STATE (never the verdict), and (c) postReview is called exactly ONCE (the verdict is never replayed
+// by the resolve path).
+const journalTmp: string[] = [];
+afterEach(async () => {
+  for (const r of journalTmp.splice(0)) await fsp.rm(r, { recursive: true, force: true }).catch(() => undefined);
+});
+
+async function journalingClient(trace: JudgeTraceResponse, failTerminal: boolean) {
+  const calls: {
+    reviewPosts: number;
+    terminalAcks: number;
+    states: { id: string; body: StateRequest }[];
+  } = { reviewPosts: 0, terminalAcks: 0, states: [] };
+  const client = {
+    getTrace: async () => trace,
+    postReview: async () => {
+      calls.reviewPosts++;
+    },
+    reportState: async (id: string, body: StateRequest): Promise<StateAck> => {
+      calls.states.push({ id, body });
+      if (body.status === "completed" || body.status === "failed") {
+        calls.terminalAcks++;
+        if (failTerminal) throw new Error("api unreachable"); // the terminal send fails ⇒ journal stays
+        return { applied: true, status: body.status };
+      }
+      return { applied: true, status: "running" };
+    },
+    postMessages: async () => undefined,
+    hasFeature: (f: string) => f === "terminal_fence",
+    getMessageGaps: async () => ({ gaps: [] }),
+  } as unknown as WorkerClient;
+  return { client, calls };
+}
+
+async function mkJournalOutbox(): Promise<Outbox> {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "judge-journal-"));
+  journalTmp.push(dir);
+  const outbox = new Outbox({
+    root: path.join(dir, "outbox"),
+    log: nullLogger(),
+    runMaxBytes: 64 * 1024 * 1024,
+    maxBytes: 512 * 1024 * 1024,
+    retentionMs: 7 * 86_400_000,
+  });
+  await outbox.init();
+  return outbox;
+}
+
+describe("JudgeRunner terminal journaling (PRD #1391 Run B M3b, D6)", () => {
+  it("journals the terminal STATE (not the verdict) write-ahead; the verdict POST is never replayed", async () => {
+    const outbox = await mkJournalOutbox();
+    const { client, calls } = await journalingClient(emptyTrace, /*failTerminal*/ true);
+    const modelJson = JSON.stringify({ verdict: "ok", summary: "s", recommendations: [] });
+    const runner = new JudgeRunner(client, nullLogger(), {
+      queryFn: replyingQueryFn(modelJson),
+      outbox,
+      outboxTerminalMaxBytes: 1 << 20,
+      gapFillMax: 100,
+    });
+    await runner.execute(judgeClaim({ claim_generation: 5 }));
+
+    // The terminal `completed` send failed, so the write-ahead journal is still on disk — proving
+    // it was journalled BEFORE the send confirmed.
+    assert.equal(outbox.hasPendingTerminal("judge-1", 5), true, "the terminal state was journalled write-ahead");
+    const j = await outbox.readTerminalJournal("judge-1", 5);
+    assert.equal(j?.body.status, "completed", "the journal holds the terminal STATE");
+    assert.equal(j?.messagesThroughSeq, 0, "a judge trace gates no api sub-work ⇒ fence 0");
+    // The verdict POST happened exactly ONCE and is NOT in the journal (D6: never the verdict).
+    assert.equal(calls.reviewPosts, 1, "postReview is called exactly once, never replayed by the resolve path");
+    assert.ok(!("verdict" in (j?.body ?? {})), "the verdict is never journalled");
+  });
+
+  it("retires the journal on a 200 terminal ack (no residue on the happy path)", async () => {
+    const outbox = await mkJournalOutbox();
+    const { client } = await journalingClient(emptyTrace, /*failTerminal*/ false);
+    const modelJson = JSON.stringify({ verdict: "ok", summary: "s", recommendations: [] });
+    const runner = new JudgeRunner(client, nullLogger(), {
+      queryFn: replyingQueryFn(modelJson),
+      outbox,
+      outboxTerminalMaxBytes: 1 << 20,
+      gapFillMax: 100,
+    });
+    await runner.execute(judgeClaim({ claim_generation: 9 }));
+
+    assert.equal(outbox.hasPendingTerminal("judge-1", 9), false, "a 200 terminal ack retires the journal");
   });
 });

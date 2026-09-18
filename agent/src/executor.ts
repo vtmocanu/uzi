@@ -1401,8 +1401,25 @@ export class StubExecutor implements Executor {
       // run stays alive and producing across the whole outage window (unlike the one-shot
       // health pauses above). Tick interval + count are tunable so a unit test shrinks the
       // stream to run instantly; the e2e leaves the STUB_OUTBOX_* defaults.
+      //
+      // PRD #1391 Run B M6 (e2e ONLY): the api-outage-outbox phase (52) additionally drives
+      // the stub run all the way to its TERMINAL inside a bounded outage — the write-ahead
+      // terminal-journal + boot-gate-replay cases — which needs a SHORTER stream than the 90s
+      // Run A default so the whole stop-api → journal → (restart) → start-api window stays
+      // UNDER the phase's raised heartbeat-stale window (the run must not be swept stale
+      // mid-outage). UZI_STUB_OUTBOX_TICKS shrinks the stream. It is UNSET in production and in
+      // every other e2e run (config.ts never reads it, the shipped compose never passes it, the
+      // e2e overlay passes it only when phase 52 exports it), so this is inert everywhere else —
+      // the same env-gated-seam discipline UZI_E2E_DROP_ON_SENTINEL uses in runner.ts. A unit
+      // test's explicit opts still win over the env.
+      const envOutboxTicks = ((): number | undefined => {
+        const raw = process.env.UZI_STUB_OUTBOX_TICKS;
+        if (raw === undefined || raw.trim() === "") return undefined;
+        const n = Number(raw);
+        return Number.isInteger(n) && n > 0 ? n : undefined;
+      })();
       const outboxTickMs = this.opts.outboxTickMs ?? STUB_OUTBOX_TICK_MS;
-      const outboxTicks = this.opts.outboxTicks ?? STUB_OUTBOX_TICKS;
+      const outboxTicks = this.opts.outboxTicks ?? envOutboxTicks ?? STUB_OUTBOX_TICKS;
       for (let i = 1; i <= outboxTicks; i++) {
         ctx.emit({
           kind: "status",

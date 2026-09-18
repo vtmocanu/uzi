@@ -54,6 +54,16 @@ func Error(w http.ResponseWriter, status int, message string) {
 	JSON(w, status, map[string]string{"error": message})
 }
 
+// ErrorReason writes a JSON error body carrying a machine-readable reason code beside the
+// human message: {"error": "<message>", "reason": "<reason>"}. It is the typed-body form of
+// Error for a status a client must branch on programmatically (PRD #1391 Run B M3d's cancel
+// confirmation gate reads reason=="outcome_pending_confirmation_required"), leaving the plain
+// {"error"} envelope — which every existing CLI/web error path already parses — a strict subset,
+// so a client that ignores `reason` sees exactly today's shape.
+func ErrorReason(w http.ResponseWriter, status int, message, reason string) {
+	JSON(w, status, map[string]string{"error": message, "reason": reason})
+}
+
 // RespondDecodeError writes the correct HTTP error for a DecodeJSONLimited failure.
 // An oversize body (*http.MaxBytesError, matchable via errors.As) gets a truthful
 // 413 with uzi's OWN prose — never err.Error(), which is net/http's fixed literal

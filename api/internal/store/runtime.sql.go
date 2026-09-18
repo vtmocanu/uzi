@@ -317,6 +317,53 @@ func (q *Queries) CancelRunServerSide(ctx context.Context, arg CancelRunServerSi
 	return result.RowsAffected(), nil
 }
 
+const cancelRunServerSideWithPendingOutcome = `-- name: CancelRunServerSideWithPendingOutcome :execrows
+UPDATE runs SET status = 'cancelled', status_since = now(), stop_kind = 'cancelled', move_pending_since = now(), finished_at = now(),
+    stop_reason = $1,
+    milestones_in_progress = NULL,
+    milestones_agents = NULL,
+    pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
+    credential_switch_requested_at = NULL, credential_switch_generation = NULL,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE runs.id = $2 AND runs.user_id = $3
+  AND runs.status NOT IN ('completed', 'failed', 'cancelled')
+  AND runs.kind <> 'chat'
+  AND (EXISTS (SELECT 1 FROM worker_active_runs a
+               WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                 AND a.terminal_pending_until > now()
+                 AND a.claim_generation = runs.claim_generation)
+       OR EXISTS (SELECT 1 FROM workers w
+                  WHERE w.id = runs.worker_id AND w.pending_overflow_until > now()))
+`
+
+type CancelRunServerSideWithPendingOutcomeParams struct {
+	StopReason pgtype.Text `json:"stop_reason"`
+	ID         uuid.UUID   `json:"id"`
+	UserID     uuid.UUID   `json:"user_id"`
+}
+
+// PRD #1391 Run B M3d (D13): the atomic owner-scoped cancel of a run whose executor journaled a
+// terminal (esp. blocked) outcome on its worker, when the owner explicitly discards it. This is
+// the resolution for a pending outcome the api permanently refuses — a silent unconditional
+// CancelRunServerSide would trade a visible stall for a lost outcome, so this variant carries the
+// SAME pending-outcome predicate the confirmation gate enforced (RunHasPendingOutcomeLease's
+// positive form) INSIDE the UPDATE: a Go-side check followed by the plain CancelRunServerSide
+// would race a lease clear or a re-claim and cancel a fresh generation on stale evidence. The
+// UPDATE is one row-locking statement (it re-evaluates the predicate against the latest committed
+// run row under READ COMMITTED / EvalPlanQual), so a replayed SetState and this cancel resolve on
+// the run's row lock, not on stale reads: if the replayed SetState commits `completed`/`failed`
+// first, this matches 0 rows (status NOT IN protects it); if this wins, the replay's no-op 409
+// returns `cancelled`, the journal retires and completion side effects never fire. Field-for-field
+// identical to CancelRunServerSide's terminal cleanup; only the WHERE differs.
+func (q *Queries) CancelRunServerSideWithPendingOutcome(ctx context.Context, arg CancelRunServerSideWithPendingOutcomeParams) (int64, error) {
+	result, err := q.db.Exec(ctx, cancelRunServerSideWithPendingOutcome, arg.StopReason, arg.ID, arg.UserID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const claimAutopilotTerminalComment = `-- name: ClaimAutopilotTerminalComment :execrows
 UPDATE runs SET autopilot_commented_at = now()
 WHERE id = $1 AND auto_approve = true AND autopilot_commented_at IS NULL
@@ -1388,6 +1435,29 @@ func (q *Queries) CountRunInitFramesBefore(ctx context.Context, arg CountRunInit
 	var count int64
 	err := row.Scan(&count)
 	return count, err
+}
+
+const countRunMessagesThrough = `-- name: CountRunMessagesThrough :one
+SELECT count(seq)::int FROM run_messages WHERE run_id = $1 AND seq BETWEEN 1 AND $2::int
+`
+
+type CountRunMessagesThroughParams struct {
+	RunID   uuid.UUID `json:"run_id"`
+	Through int32     `json:"through"`
+}
+
+// The terminal fence's contiguity probe (PRD #1391 Run B M3c, D3): how many DISTINCT stored
+// message seqs fall in [1..through] for this run. Backed by the run_messages UNIQUE (run_id, seq)
+// index, so the count is an index-only range scan. A fully-contiguous run has count == through; a
+// run with any hole in [1..through] has count < through, which is exactly what SetState refuses a
+// terminal transition on (ErrMessagesPending) — the high-water last_seq alone cannot see a hole
+// BELOW it, so the terminal fence needs this count, not just runs.last_seq. Modeled on
+// MaxRunMessageSeq; ::int keeps the return an int32.
+func (q *Queries) CountRunMessagesThrough(ctx context.Context, arg CountRunMessagesThroughParams) (int32, error) {
+	row := q.db.QueryRow(ctx, countRunMessagesThrough, arg.RunID, arg.Through)
+	var column_1 int32
+	err := row.Scan(&column_1)
+	return column_1, err
 }
 
 const countRunReviseInputs = `-- name: CountRunReviseInputs :one
@@ -8693,6 +8763,38 @@ func (q *Queries) ResumePausedRun(ctx context.Context, arg ResumePausedRunParams
 	return i, err
 }
 
+const runHasPendingOutcomeLease = `-- name: RunHasPendingOutcomeLease :one
+SELECT EXISTS (
+    SELECT 1 FROM runs
+    WHERE runs.id = $1
+      AND runs.kind <> 'chat'
+      AND (EXISTS (SELECT 1 FROM worker_active_runs a
+                   WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                     AND a.terminal_pending_until > now()
+                     AND a.claim_generation = runs.claim_generation)
+           OR EXISTS (SELECT 1 FROM workers w
+                      WHERE w.id = runs.worker_id AND w.pending_overflow_until > now()))
+)
+`
+
+// PRD #1391 Run B M3d (D13): does this run currently have a terminal outcome journaled and
+// leased on its owning worker? This is the POSITIVE form of the D11 claim-exclusion predicate
+// (see SweepClaimedNeverStarted / FailRunAutoStop, whose negative `NOT EXISTS(...) AND NOT
+// EXISTS(...)` PROTECT such a run). True when EITHER the run's owning worker holds an unexpired
+// terminal_pending lease for it at the run's EXACT current claim_generation (the executor
+// journaled a terminal outcome and is gone), OR the owning worker is under an unexpired
+// pending_overflow (M4's rotation left this run unlisted, but the worker-level closure stands in
+// for the missing row-level lease). Chat is excluded (D6/D10): chat has no claim generation and
+// never journals a terminal outcome, so it is never pending. Reused by hasLivePoller (a run this
+// returns true for has no live poller for ITSELF — its executor no longer exists) and by the
+// owner cancel's confirmation gate + atomic no-live-poller branch.
+func (q *Queries) RunHasPendingOutcomeLease(ctx context.Context, id uuid.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, runHasPendingOutcomeLease, id)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
 const runHasVerdictSinceGateOpened = `-- name: RunHasVerdictSinceGateOpened :one
 SELECT (EXISTS (
     SELECT 1 FROM run_user_inputs
@@ -8796,6 +8898,104 @@ func (q *Queries) RunHasVerdictSinceGateOpened(ctx context.Context, arg RunHasVe
 	var has_verdict bool
 	err := row.Scan(&has_verdict)
 	return has_verdict, err
+}
+
+const runMessageGaps = `-- name: RunMessageGaps :many
+WITH authorized AS (
+    SELECT 1 AS ok FROM runs r
+    WHERE r.id = $1
+      AND r.worker_id = $2
+      AND r.claim_released_at IS NULL
+      AND r.claim_generation = $3
+),
+present AS (
+    SELECT m.seq FROM run_messages m
+    CROSS JOIN authorized
+    WHERE m.run_id = $1 AND m.seq BETWEEN 1 AND $4::int AND m.seq >= $5::int
+    UNION ALL
+    SELECT ($4::int) + 1 FROM authorized
+),
+edges AS (
+    SELECT seq AS closer,
+           COALESCE(LAG(seq) OVER (ORDER BY seq), $5::int) AS prev
+    FROM present
+),
+gaps AS (
+    SELECT (prev + 1)::int AS gap_first, (closer - 1)::int AS gap_last, closer::int AS next_cursor
+    FROM edges
+    WHERE closer - prev > 1 AND closer > $5::int
+    ORDER BY closer ASC
+    LIMIT $6::int
+)
+SELECT gaps.gap_first, gaps.gap_last, gaps.next_cursor
+FROM authorized
+LEFT JOIN gaps ON true
+ORDER BY gaps.next_cursor ASC NULLS LAST
+`
+
+type RunMessageGapsParams struct {
+	RunID           uuid.UUID   `json:"run_id"`
+	WorkerID        pgtype.UUID `json:"worker_id"`
+	ClaimGeneration int64       `json:"claim_generation"`
+	Through         int32       `json:"through"`
+	Cursor          int32       `json:"cursor"`
+	Lim             int32       `json:"lim"`
+}
+
+type RunMessageGapsRow struct {
+	GapFirst   pgtype.Int4 `json:"gap_first"`
+	GapLast    pgtype.Int4 `json:"gap_last"`
+	NextCursor pgtype.Int4 `json:"next_cursor"`
+}
+
+// The hardened message-gaps read (PRD #1391 Run B M3c): the MISSING seq ranges in [1..through]
+// as bounded {first,last} pairs, after a keyset @cursor, ordered by seq, at most @lim of them.
+// Authorization is part of THIS statement and snapshot: the run must belong to @worker_id at its
+// current unreleased @claim_generation. A preliminary ownership query would leave a TOCTOU window
+// where a same-worker reclaim increments the generation before this query reads the newer flight's
+// gaps. `authorized` is empty for any stale/foreign/released claim, so the statement returns ZERO
+// rows. For an authorized run with no gaps, the final LEFT JOIN returns one all-NULL sentinel row;
+// the service uses that distinction to return an empty page rather than ErrRunNotOwned.
+//
+// KEYSET pagination only — NO OFFSET, NO generate_series, NO materialisation of `through` rows:
+// the gaps are derived from the PRESENT rows via LAG over the (run_id, seq) index, so the scan is
+// bounded by what is stored (at most the run's message count), never by the size of `through`.
+//
+// Each interior/leading gap is CLOSED by the present row immediately after it: for a present
+// `seq` whose predecessor (LAG) is `prev`, the hole [prev+1, seq-1] exists iff seq - prev > 1.
+// The TRAILING gap (max present seq .. through) has no closing present row, so a sentinel row at
+// through+1 is UNION-ed in to close it exactly like every interior gap. The keyset is the CLOSER
+// (the right-neighbor seq): a gap is emitted only when its closer > @cursor, and next_cursor is
+// that closer, so the next page continues strictly after the last one with no overlap and no gap
+// re-emitted. The present set is bounded below by @cursor (seq >= @cursor) so a large cursor scans
+// only the index tail; @cursor doubles as the LAG seed so the first closer after the cursor gets
+// the correct predecessor. @cursor = 0 (the first page) admits every gap, including the leading
+// one [1, min_present-1]. The trailing gap is uniquely the one whose `last` == through.
+func (q *Queries) RunMessageGaps(ctx context.Context, arg RunMessageGapsParams) ([]RunMessageGapsRow, error) {
+	rows, err := q.db.Query(ctx, runMessageGaps,
+		arg.RunID,
+		arg.WorkerID,
+		arg.ClaimGeneration,
+		arg.Through,
+		arg.Cursor,
+		arg.Lim,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []RunMessageGapsRow{}
+	for rows.Next() {
+		var i RunMessageGapsRow
+		if err := rows.Scan(&i.GapFirst, &i.GapLast, &i.NextCursor); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const runPriorityClass = `-- name: RunPriorityClass :one

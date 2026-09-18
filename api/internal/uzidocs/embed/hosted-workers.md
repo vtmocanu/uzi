@@ -152,6 +152,24 @@ run genuinely re-queued during the outage has that charge refunded once it's
 back. See [configuration.md](./configuration.md#server-api) for
 `SWEEPER_BOOT_GRACE` and the related knobs.
 
+The same write-ahead protection covers a run's actual outcome, not just its
+status. If a run-lane attempt (an issue run, a judge, or a review — chat is
+excluded) finishes `completed` or `failed` while the api can't be reached,
+the worker journals that outcome to disk before it ever tries to send it,
+in the same durable tree the message outbox above uses. Once the api is
+back, the journal replays after the run's own messages have caught up, so
+a run that finished during the outage still lands its MR and its final
+state exactly once — never redone, even if a duplicate claim attempt races
+it. If the worker container itself restarts mid-outage, it resolves every
+journaled outcome before claiming anything new, so the outcome still lands
+even though the process that produced it is gone. If the api permanently
+refuses a journaled outcome, it's never silently dropped: the run shows it
+as a held outcome, and only you can clear it, by cancelling the run and
+confirming you want to discard what's held. See
+[worker-setup.md](./worker-setup.md#message-outbox) for the outbox
+mechanics and the same-uid caveat, which applies to a journaled outcome
+exactly as it does to the message feed.
+
 ## How this differs from running your own worker
 
 A worker you run yourself is a container on hardware you control: you copy a

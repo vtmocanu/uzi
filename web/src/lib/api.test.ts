@@ -1,5 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { api, ApiError, MOCK_MODE, setUnauthorizedHandler } from "./api";
+import {
+  api,
+  ApiError,
+  isOutcomePendingConfirmation,
+  MOCK_MODE,
+  setUnauthorizedHandler,
+} from "./api";
 
 // These exercise the real request() layer, so the suite must be running unmocked
 // (mockApi never touches fetch and never 401s). Guard the assumption explicitly.
@@ -162,5 +168,74 @@ describe("getRecoveryHolds bounds the read to ?state=open (PRD #1371)", () => {
     expect(url).toContain("/api/recovery/holds");
     const qs = new URLSearchParams(url.split("?")[1] ?? "");
     expect(qs.get("state")).toBe("open");
+  });
+});
+
+// PRD #1391 Run B M3d (D13): the cancel-confirmation gate. The server refuses a cancel of a
+// run whose worker holds a finished-but-unlanded outcome with a typed 409 carrying
+// reason:"outcome_pending_confirmation_required", and the web routes ONLY that specific 409
+// into a discard-confirmation modal (never a generic 409). isOutcomePendingConfirmation is
+// the discriminator; these pin that it keys on the reason field, not a bare status.
+describe("isOutcomePendingConfirmation (PRD #1391 M3d)", () => {
+  it("is true for a 409 whose body reason is outcome_pending_confirmation_required", () => {
+    const err = new ApiError(409, "cancel refused: pending outcome", {
+      error: "cancel refused: pending outcome",
+      reason: "outcome_pending_confirmation_required",
+    });
+    expect(isOutcomePendingConfirmation(err)).toBe(true);
+  });
+
+  it("is false for a 409 with a different reason", () => {
+    const err = new ApiError(409, "conflict", { reason: "issue_has_open_mr" });
+    expect(isOutcomePendingConfirmation(err)).toBe(false);
+  });
+
+  it("is false for the right reason on the wrong status", () => {
+    const err = new ApiError(400, "bad", {
+      reason: "outcome_pending_confirmation_required",
+    });
+    expect(isOutcomePendingConfirmation(err)).toBe(false);
+  });
+
+  it("is false for a non-ApiError value", () => {
+    expect(isOutcomePendingConfirmation(new Error("boom"))).toBe(false);
+    expect(isOutcomePendingConfirmation(null)).toBe(false);
+  });
+});
+
+// PRD #1391 Run B M3d (D13): the confirmed retry must carry discard_pending_outcome:true so
+// the server takes the atomic no-live-poller cancel branch; an ordinary cancel omits it so a
+// completed outcome is never silently discarded. This pins the REQUEST body the client builds.
+describe("submitRunInput threads discard_pending_outcome (PRD #1391 M3d)", () => {
+  const stubDoc = () => vi.stubGlobal("document", { cookie: "" });
+
+  it("adds discard_pending_outcome:true when the flag is set", async () => {
+    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) =>
+      fakeResponse(200, { server_side: true }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    stubDoc();
+
+    // submitRunInput(id, kind, body, selection, overrideCapabilities, discardPendingOutcome)
+    await api.submitRunInput("run-1", "cancel", "", undefined, undefined, true);
+
+    const init = fetchMock.mock.calls[0][1] as RequestInit;
+    const body = JSON.parse(init.body as string) as Record<string, unknown>;
+    expect(body.kind).toBe("cancel");
+    expect(body.discard_pending_outcome).toBe(true);
+  });
+
+  it("omits discard_pending_outcome on an ordinary cancel", async () => {
+    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) =>
+      fakeResponse(200, { server_side: true }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    stubDoc();
+
+    await api.submitRunInput("run-1", "cancel");
+
+    const init = fetchMock.mock.calls[0][1] as RequestInit;
+    const body = JSON.parse(init.body as string) as Record<string, unknown>;
+    expect(body).not.toHaveProperty("discard_pending_outcome");
   });
 });

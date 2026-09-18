@@ -73,6 +73,14 @@ func (f *autoStopFakeStore) GetWorkerByID(_ context.Context, id uuid.UUID) (stor
 	return w, nil
 }
 
+// RunHasPendingOutcomeLease: an auto-stop candidate is a run whose message writes are looping,
+// not one whose executor journaled a terminal outcome, so it has no pending-outcome lease here
+// (PRD #1391 Run B M3d; the pending-outcome PROTECTION for auto-stop lives in FailRunAutoStop's
+// own SQL predicate, D11). hasLivePoller reads this after confirming a fresh heartbeat.
+func (f *autoStopFakeStore) RunHasPendingOutcomeLease(context.Context, uuid.UUID) (bool, error) {
+	return false, nil
+}
+
 func (f *autoStopFakeStore) FailRunAutoStop(_ context.Context, arg store.FailRunAutoStopParams) (int64, error) {
 	f.failCalls = append(f.failCalls, arg)
 	if f.failErr != nil {

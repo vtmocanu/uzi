@@ -339,6 +339,17 @@ export interface RegisterRequest {
    *  interlocked run. Sent only when non-empty (same "only send when known" shape as
    *  `capabilities`); the api Filter-s it against a server-owned protocol vocabulary. */
   protocol_capabilities?: string[];
+  /**
+   * PRD #1391 Run B M4: the worker's active-run snapshot, carried ON the register request so a
+   * worker holding pending terminal outcomes leases them BEFORE the api's register-time orphan
+   * pass can re-claim them (#1390 M2a persists it first). This is the ONE snapshot exempt from
+   * the register nonce (none exists yet at register time). #1390's own worker never sends it; the
+   * boot-replay path (M4) is its only producer, and only when a pending terminal journal exists —
+   * with an EMPTY pending subset + `pending_overflow:true`, so the protection is cap-independent
+   * (even cap 0, where a non-empty subset would be rejected whole when cap<count). An ordinary
+   * worker omits it and the register wire stays byte-identical to today.
+   */
+  active_snapshot?: ActiveSnapshot;
 }
 
 export interface RegisterResponse {
@@ -360,6 +371,14 @@ export interface RegisterResponse {
    *  `claim_generation` optimistically, regardless of the advertised features (see
    *  `MessagesRequest.claim_generation`). */
   protocol_features?: string[];
+  /** PRD #1391 Run B M4: the api's server-side terminal-pending outbox cap
+   *  (`WORKER_OUTBOX_MAX_PENDING`, default 32) — the number of pending outcomes #1390 will lease
+   *  from one worker's snapshot. The worker reads it at register (stashed on the client) so the
+   *  active-run registry can size its `pending_overflow` decision and its deterministic rotation to
+   *  the server's cap, WITHOUT a worker-side cap mirror or a separate config channel. OMITTED by an
+   *  older api that predates M3c ⇒ the worker treats the cap as 0 (protect every pending outcome via
+   *  overflow — the cap-independent floor). */
+  worker_outbox_max_pending?: number;
   /** PRD #1390 M2a: the per-registration nonce the api mints so it can trust the epoch of an
    *  ActiveSnapshot across a worker OR api restart. The worker captures it at register and
    *  echoes it verbatim on every snapshot it SENDS (heartbeat + claim); a snapshot whose
@@ -430,9 +449,10 @@ export type ActiveSnapshotPhase = "running" | "awaiting_approval" | "awaiting_in
 
 /** One entry in an {@link ActiveSnapshot} (PRD #1390 M2a): a run-lane attempt (or a
  *  judge/review attempt) this worker is currently executing, named by its run id, the
- *  `claim_generation` it was claimed at, and its current `phase`. For a #1390 worker
- *  `terminal_pending` is ALWAYS false — terminal-outcome journaling is #1391's, so this
- *  worker never lists a pending outcome. */
+ *  `claim_generation` it was claimed at, and its current `phase`. A #1390-only worker sets
+ *  `terminal_pending: false` on every entry; PRD #1391 Run B M4 sets it TRUE for a run whose
+ *  terminal outcome is journaled and pending replay (the api then keeps that run unclaimable and
+ *  its generation unbumped while the lease holds). */
 export interface ActiveSnapshotEntry {
   run_id: string;
   claim_generation: number;
@@ -2082,6 +2102,16 @@ export interface StateRequest {
    *  which the worker's capability-aware fallback avoids by only sending it when the api
    *  advertised `recovery_park_cause` at register (D7). */
   recovery_cause?: string;
+  /** PRD #1391 Run B M3 (D3): the worker's DURABLE message fence on a run-lane TERMINAL
+   *  (completed/failed) report — the run's last emitted seq after the final batcher flush. The api
+   *  refuses the transition with a typed 409 `messages_pending` while `runs.last_seq` is below it OR
+   *  the trace is not contiguous through it, so judge/task-review/notifications never fire ahead of
+   *  a complete trace. NEGOTIATED (D9): the worker sends it ONLY to an api that advertised
+   *  `terminal_fence` at register (the resolve/send path gates on client.hasFeature), never to an
+   *  older api that would strict-decode it as an unknown field. Validated `>= 0` server-side.
+   *  Additive + optional and OMITTED ENTIRELY on every non-terminal report and by a pre-#1391
+   *  worker, so the wire shape is unchanged. */
+  messages_through_seq?: number;
 }
 
 /**
@@ -2154,11 +2184,16 @@ export interface StateAck {
    *  boolean; the server owns the rule. Absent/non-boolean (older server, unparseable body) ⇒
    *  treated as false = "no budget-exhausted steer". */
   budgetExhausted?: boolean;
-  /** PRD #1392 M2 (D10): the TOP-LEVEL disposition reason the api returns on a 409 (and,
-   *  where present, a 200) for a `recovery_wait` park report — one of "stale_claim" (#1247: the
-   *  run moved on under this worker, so stop silently) or "custody_unsettled" (the exact-hold
-   *  cardinality/evidence step could not settle, so take today's failed path). Absent on an
-   *  ordinary ack. Read from the body's TOP LEVEL, NOT off `run`. */
+  /** The TOP-LEVEL disposition reason the api returns on a 409 (and, where present, a 200). Read
+   *  from the body's TOP LEVEL, NOT off `run`. Absent on an ordinary ack. Its vocabulary spans two
+   *  features:
+   *    - PRD #1392 M2 (D10) forge-park refusals: "stale_claim" (#1247: the run moved on under this
+   *      worker, so stop silently) or "custody_unsettled" (the exact-hold cardinality/evidence step
+   *      could not settle, so take today's failed path).
+   *    - PRD #1391 Run B M3 (D3) terminal fence refusals: "messages_pending" (the trace is not yet
+   *      contiguous through the reported `messages_through_seq`, so the resolve path fills the gaps
+   *      from the message-gaps read and re-sends) or "gap_unrecoverable" (the hole below the fence
+   *      exceeds `WORKER_GAP_FILL_MAX`, so the journal is marked blocked, D13). */
   reason?: string;
   /** PRD #1392 M2 (D10): the retry-not-before stamp the api returns on a `recovery_wait` ack —
    *  a field ON the RunDTO (`run.recovery_retry_not_before`), NOT top-level — so the pre-clone
@@ -2212,12 +2247,36 @@ export interface InputsResponse {
  *  thrown RequestError, not by this shape. */
 export interface RunOwnershipResponse {
   status: string;
+  /** PRD #1391 Run B M4: the run's current `claim_generation` (additive on the probe). The run-lane
+   *  claim router proceeds to execute ONLY on a `claimed`/`running` row AT the claim's generation; a
+   *  DIFFERENT generation ends the attempt (a newer claim owns the run). ABSENT from an older api ⇒
+   *  undefined, which the router treats as "generation unknown, cannot prove a mismatch" and so does
+   *  not refuse on generation alone. */
+  claim_generation?: number;
   /** PRD #1392 M2 (D10): the run's `recovery_retry_not_before` stamp, added to the ownership
    *  probe so a forge park reconciled through the probe (a transport failure lost the report
    *  ack) can still quote when it resumes. An RFC3339 string when the run is parked with a
    *  stamp; absent otherwise (an older api, or a non-parked run) ⇒ the feed event falls back
    *  to "retry after backoff". */
   recovery_retry_not_before?: string;
+}
+
+/** PRD #1391 Run B M3 (D3): one missing seq range in a run's message trace, as the message-gaps
+ *  read returns it. Inclusive `[first, last]`; the resolve path fills every seq in the range with a
+ *  per-seq "unrecoverable gap" tombstone so the trace becomes contiguous and the terminal fence
+ *  can pass. */
+export interface MessageGap {
+  first: number;
+  last: number;
+}
+
+/** PRD #1391 Run B M3 (D3): a page of a run's missing message-seq ranges in `[1..through]`, from
+ *  GET /worker/runs/{id}/message-gaps?claim_generation=G&through=N&limit=&cursor=. The api
+ *  authorizes the worker's exact current, unreleased generation in the same SQL snapshot as the
+ *  gap read. `next_cursor` is present only when more pages remain and becomes the next cursor. */
+export interface MessageGapsResponse {
+  gaps: MessageGap[];
+  next_cursor?: number;
 }
 
 /** Response of the issue #1319 orphan-classification read (GET
