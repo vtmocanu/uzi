@@ -11,8 +11,9 @@
 # UNCOMMITTED, so the uncommitted.patch + untracked capture is what saves it.
 #
 # For each run id it resolves worker_id -> pod FRESH each call (so it survives a
-# worker roll or a cross-worker migration), execs into the worker container, and
-# captures from the live runner working clone /data/runner/<slug>/<stem>:
+# worker roll or a cross-worker migration), then searches every running worker pod
+# when that current pod has lost the clone. It prefers the live working clone and
+# falls back to refs/uzi-runner/<branch> in a worker bare repo when no clone remains:
 #   issue-N.tgz               a tarball of:
 #     issue-N.bundle            git bundle of the branch (commits not on origin/main)
 #     issue-N.uncommitted.patch git diff HEAD  (staged+unstaged tracked changes)
@@ -22,9 +23,9 @@
 #   issue-N.plan.md           the latest approved plan (milestone breakdown)
 #   issue-N.progress.txt      status/health/token + milestones DONE vs LEFT
 #   issue-N.log-tail.ndjson   last 80 transcript messages
-# Together these fully reconstruct a worker's working tree + run state locally, so
-# work is recoverable even if the run is lost before it pushes an MR. See this
-# skill's "Recovering a failed run's work from the worker PVC" section.
+# A clone capture fully reconstructs the working tree. A bare-ref fallback preserves
+# committed checkpoints only and logs BARE loudly because uncommitted WIP is unavailable.
+# See this skill's "Recovering a failed run's work from the worker PVC" section.
 #
 # Usage:  bash backup-runs.sh <RUN_ID> [RUN_ID ...]
 # Env (all optional except where noted):
@@ -33,17 +34,25 @@
 #                   (default: "uzi-workers uzi-workers-docker")
 #   UZI_REPO_SLUG   worker bare/clone dir stem host+org+repo
 #                   (default: derived from this checkout's origin remote)
+#   UZI_RUNNER_BASE worker clone root override (default: /data/runner/<repo-slug>)
+#   UZI_REPOS_BASE  worker bare-repo root override (default: /data/repos)
 #   UZI_BACKUP_DIR  output root (default: /tmp/uzi-backups)
-#   UZI_KUBECTL / UZI_BIN / UZI_JQ   tool overrides (default: from PATH)
+#   UZI_BACKUP_RETENTION_DAYS  prune timestamped snapshots older than this many
+#                   24-hour periods (default: 14; 0 disables pruning)
+#   UZI_KUBECTL / UZI_BIN / UZI_JQ / UZI_STAT  tool overrides (default: from PATH)
+# Exit: 0 when every active target produced a verified recovery artifact (terminal
+# targets may be status-only); 1 when any active target did not; 2 for bad usage.
 set -u
 
 KUBECTL="${UZI_KUBECTL:-kubectl}"
 UZI="${UZI_BIN:-uzi}"
 JQ="${UZI_JQ:-jq}"
+STAT="${UZI_STAT:-stat}"
 
 CTX="${UZI_CTX:-$("$KUBECTL" config current-context 2>/dev/null)}"
 NAMESPACES="${UZI_WORKER_NS:-uzi-workers uzi-workers-docker}"
 OUTROOT="${UZI_BACKUP_DIR:-/tmp/uzi-backups}"
+RETENTION_DAYS="${UZI_BACKUP_RETENTION_DAYS:-14}"
 
 if [ "$#" -eq 0 ]; then
   echo "usage: backup-runs.sh <RUN_ID> [RUN_ID ...]" >&2
@@ -60,23 +69,82 @@ if [ -z "$REPO_SLUG" ]; then
   origin="$(git remote get-url origin 2>/dev/null || true)"
   REPO_SLUG="$(printf '%s' "$origin" | sed -E 's#^[a-z]+://##; s#^[^@]+@##; s#\.git$##; s#[:/]#+#g')"
 fi
+RUNNER_BASE="${UZI_RUNNER_BASE:-/data/runner/$REPO_SLUG}"
+REPOS_BASE="${UZI_REPOS_BASE:-/data/repos}"
+case "$RETENTION_DAYS" in
+  ''|*[!0-9]*) echo "error: UZI_BACKUP_RETENTION_DAYS must be a non-negative integer (got '$RETENTION_DAYS')" >&2; exit 2 ;;
+esac
+RETENTION_DAYS=$((10#$RETENTION_DAYS))
 if [ -z "$REPO_SLUG" ]; then
   echo "error: could not derive UZI_REPO_SLUG (not in a checkout? set it explicitly)" >&2
   exit 2
 fi
 
-RUNS=("$@")
-TS="$(date -u +%Y%m%dT%H%M%SZ)"
-DEST="$OUTROOT/$TS"
 # Backups hold unpushed repo work + run transcripts; keep them owner-only (0700
 # dirs / 0600 files) rather than inheriting a lax 022 umask on a shared host.
 umask 077
-mkdir -p "$DEST"
+mkdir -p "$OUTROOT"
+OUTROOT="$(cd "$OUTROOT" && pwd -P)" || exit 1
+RUNS=("$@")
+TS="$(date -u +%Y%m%dT%H%M%SZ)"
+DEST="$OUTROOT/$TS"
+if ! mkdir "$DEST" 2>/dev/null; then
+  DEST="$(mktemp -d "$OUTROOT/${TS}.XXXXXX")" || exit 1
+fi
 LOG="$DEST/backup.log"
 log(){ printf '%s %s\n' "$(date -u +%H:%M:%S)" "$*" | tee -a "$LOG"; }
 # UZI_CTX unset means the kubeconfig current-context, which is shared across sessions and
 # can be switched under a running loop; say so once so a later "no pod" WARN is legible.
 [ -n "${UZI_CTX:-}" ] || log "WARN UZI_CTX unset; using kubeconfig current-context '$CTX' (pass UZI_CTX explicitly)"
+failures=0
+recoverable=0
+
+path_mtime(){
+  local value
+  value="$("$STAT" -f %m "$1" 2>/dev/null || true)"
+  # GNU stat accepts -f as "filesystem" mode and exits 0 while printing a
+  # non-numeric result for %m. Validate the value, not only the exit status,
+  # before falling back to GNU's -c spelling.
+  case "$value" in ''|*[!0-9]*) value="$("$STAT" -c %Y "$1" 2>/dev/null || true)" ;; esac
+  case "$value" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s\n' "$value"
+}
+
+canonical_link_dir(){
+  local link="$1" target
+  target="$(readlink "$link" 2>/dev/null)" || return 1
+  case "$target" in
+    /*) ;;
+    *) target="$(dirname "$link")/$target" ;;
+  esac
+  [ -d "$target" ] || return 1
+  (cd "$target" && pwd -P)
+}
+
+prune_old_backups(){
+  [ "$RETENTION_DAYS" -gt 0 ] || return 0
+  local root now cutoff latest latest_attempt dir base mtime
+  root="$(cd "$OUTROOT" 2>/dev/null && pwd -P)" || return 1
+  # The name/path checks below already constrain every deletion, but reject broad
+  # roots too: a mis-set UZI_BACKUP_DIR must fail closed before any rm is reachable.
+  case "$root" in ''|/|"${HOME:-/nonexistent}") log "WARN refusing unsafe backup prune root '$root'"; return 1 ;; esac
+  now="$(date +%s)"
+  cutoff=$((now - RETENTION_DAYS * 86400))
+  latest="$(canonical_link_dir "$OUTROOT/latest" || true)"
+  latest_attempt="$(canonical_link_dir "$OUTROOT/latest-attempt" || true)"
+  for dir in "$root"/*; do
+    [ -d "$dir" ] && [ ! -L "$dir" ] || continue
+    [ "$(dirname "$dir")" = "$root" ] || continue
+    base="$(basename "$dir")"
+    printf '%s' "$base" | grep -Eq '^[0-9]{8}T[0-9]{6}Z([.][A-Za-z0-9]+)?$' || continue
+    [ "$dir" != "$latest" ] && [ "$dir" != "$latest_attempt" ] || continue
+    mtime="$(path_mtime "$dir")" || { log "WARN could not stat backup for pruning: $dir"; continue; }
+    if [ "$mtime" -lt "$cutoff" ]; then
+      rm -rf -- "$dir"
+      log "PRUNE removed backup older than ${RETENTION_DAYS}d: $dir"
+    fi
+  done
+}
 
 # --- on-pod capture: emits a tar.gz of the artifacts on stdout, noise on stderr.
 # This string runs REMOTELY (`sh -c` in the worker pod); only $REPO_SLUG is
@@ -156,6 +224,50 @@ tar cf - -C "$OUT" . 2>/dev/null | gzip -c
 rm -rf "$OUT"
 '
 
+# Bare-repo fallback: emits a tar.gz containing committed history + metadata only.
+# It deliberately creates no uncommitted.patch: without a live clone there is no
+# honest source for WIP. The host labels this BARE rather than OK.
+# shellcheck disable=SC2016
+BARE_CAPTURE='
+set -u
+STEM="$1"
+REF="$2"
+REALMAIN="${3:-}"
+REPOS_BASE="${4:-/data/repos}"
+BARE="$REPOS_BASE/'"$REPO_SLUG"'.git"
+git --git-dir="$BARE" show-ref --verify --quiet "$REF" || exit 4
+OUT="$(mktemp -d)"
+trap '\''rm -rf "$OUT"'\'' EXIT
+HEAD="$(git --git-dir="$BARE" rev-parse "$REF" 2>/dev/null)"
+BASE=""
+if [ -n "$REALMAIN" ] && git --git-dir="$BARE" cat-file -e "$REALMAIN" 2>/dev/null; then
+  BASE="$REALMAIN"
+elif git --git-dir="$BARE" rev-parse --verify -q refs/remotes/origin/main >/dev/null 2>&1; then
+  BASE="refs/remotes/origin/main"
+fi
+if [ -n "$BASE" ]; then
+  [ -n "$(git --git-dir="$BARE" rev-list "$BASE..$REF" 2>/dev/null | head -n1)" ] || exit 5
+  git --git-dir="$BARE" bundle create "$OUT/$STEM.bundle" "$REF" --not "$BASE" >/dev/null 2>&1 || exit 6
+else
+  git --git-dir="$BARE" bundle create "$OUT/$STEM.bundle" "$REF" >/dev/null 2>&1 || exit 6
+fi
+{
+  echo "stem=$STEM head=$HEAD ref=$REF captured=$(date -u +%FT%TZ) source=bare"
+  echo "real_remote_main=${REALMAIN:-unknown}"
+  echo "bundle_base=${BASE:-<none: full-history bundle>}"
+  echo "uncommitted_capture=unavailable (live clone missing)"
+  if [ -n "$BASE" ]; then
+    echo "merge_base=$(git --git-dir="$BARE" merge-base "$REF" "$BASE" 2>/dev/null)"
+    echo "--- new commits ($BASE..$REF = what the bundle carries):"
+    git --git-dir="$BARE" log --oneline "$BASE..$REF" 2>/dev/null
+  else
+    echo "--- commits (full history bundle; newest 10):"
+    git --git-dir="$BARE" log --oneline -10 "$REF" 2>/dev/null
+  fi
+} > "$OUT/$STEM.meta.txt" 2>&1
+tar cf - -C "$OUT" . 2>/dev/null | gzip -c
+'
+
 resolve_pod(){   # $1=worker_id ; prints "ns pod" if found
   # Only a Running pod is exec-able. A worker roll (release fleet upgrade, node
   # eviction) leaves the old ReplicaSet's dead pod behind, and it sorts BEFORE the
@@ -171,11 +283,46 @@ resolve_pod(){   # $1=worker_id ; prints "ns pod" if found
   return 1
 }
 
+list_pods(){
+  local ns p
+  for ns in $NAMESPACES; do
+    while IFS= read -r p; do
+      [ -n "$p" ] && printf '%s %s\n' "$ns" "${p#pod/}"
+    done < <("$KUBECTL" --context "$CTX" -n "$ns" get pods \
+      --field-selector=status.phase=Running -o name 2>/dev/null)
+  done
+}
+
+pod_has_clone(){
+  local ns="$1" pod="$2" stem="$3" branch="$4" rid="$5" clone journal
+  [ -n "$branch" ] || return 1
+  clone="$RUNNER_BASE/$stem"
+  # shellcheck disable=SC2016  # $1/$2 expand in the remote sh, not in this host shell.
+  "$KUBECTL" --context "$CTX" -n "$ns" exec "$pod" -c worker -- \
+    sh -c '[ -d "$1/.git" ]' _ "$clone" >/dev/null 2>&1 || return 1
+  journal="$("$KUBECTL" --context "$CTX" -n "$ns" exec "$pod" -c worker -- \
+    git --git-dir="$REPOS_BASE/$REPO_SLUG.git" config --get "uzi-recovery.$branch.clone" 2>/dev/null)" || return 1
+  # shellcheck disable=SC2016  # $rid/$clone are jq variables supplied with --arg.
+  printf '%s' "$journal" | "$JQ" -e --arg rid "$rid" --arg clone "$clone" \
+    '.runId == $rid and .clonePath == $clone' >/dev/null 2>&1
+}
+
+pod_has_ref(){
+  local ns="$1" pod="$2" ref="$3" branch="$4" rid="$5" owner
+  [ -n "$branch" ] || return 1
+  "$KUBECTL" --context "$CTX" -n "$ns" exec "$pod" -c worker -- \
+    git --git-dir="$REPOS_BASE/$REPO_SLUG.git" show-ref --verify --quiet "$ref" >/dev/null 2>&1 || return 1
+  owner="$("$KUBECTL" --context "$CTX" -n "$ns" exec "$pod" -c worker -- \
+    git --git-dir="$REPOS_BASE/$REPO_SLUG.git" config --get "uzi-trackowner.$branch.owner" 2>/dev/null)" || return 1
+  [ "$owner" = "$rid" ]
+}
+
 for RID in "${RUNS[@]}"; do
   J="$("$UZI" run get "$RID" --json 2>/dev/null)"
   st="$(printf '%s' "$J" | "$JQ" -r '.status // ""' 2>/dev/null)"
   if [ -z "${st:-}" ]; then
     log "WARN $RID: status unreadable (CLI/API); skipping this cycle"
+    failures=1
     continue
   fi
   iid="$(printf '%s' "$J" | "$JQ" -r '.issue_iid // .issue // ""' 2>/dev/null)"
@@ -198,21 +345,28 @@ for RID in "${RUNS[@]}"; do
   # sources its live branch from pipeline_ref), so keying mr_rework off .branch would
   # fall back to a mr_rework-<runid> dir that never exists and the capture would
   # silently produce a status snapshot only. slugify: replace "/" with "-".
+  RUN_BRANCH=""
   case "$kind" in
     issue|chat|judge|"")
-      if [ -n "$iid" ]; then STEM="issue-$iid"; LBL="#$iid"
+      if [ -n "$iid" ]; then STEM="issue-$iid"; LBL="#$iid"; RUN_BRANCH="agent/issue-$iid"
       else STEM="run-$RID"; LBL="run ${RID%%-*}"; fi ;;
-    task)         STEM="task-$RID";            LBL="task ${RID%%-*}" ;;
-    self_improve) STEM="uzi-self-improve-$RID"; LBL="self_improve ${RID%%-*}" ;;
-    prompt)       STEM="uzi-prompt-$RID";      LBL="prompt ${RID%%-*}" ;;
+    task)
+      STEM="task-$RID"; LBL="task ${RID%%-*}"; RUN_BRANCH="$branch"
+      [ -n "$RUN_BRANCH" ] || RUN_BRANCH="uzi/task/$RID" ;;
+    self_improve)
+      STEM="uzi-self-improve-$RID"; LBL="self_improve ${RID%%-*}"; RUN_BRANCH="uzi/self-improve/$RID" ;;
+    prompt)
+      STEM="uzi-prompt-$RID"; LBL="prompt ${RID%%-*}"; RUN_BRANCH="uzi/prompt-$RID" ;;
     *)  # mr_rework / ci_fix (and any future branch-scoped kind): use pipeline_ref, the
         # live branch in-flight; fall back to branch (populated once completed), else a
         # unique best-effort name. ci_fix's rare default-branch case (ci-fix/pipeline-<id>)
         # needs pipeline_id, which the DTO does not expose, so it is not reconstructed.
       src="$pref"; [ -n "$src" ] || src="$branch"
-      if [ -n "$src" ]; then STEM="$(printf '%s' "$src" | tr '/' '-')"; LBL="$kind ${RID%%-*}"
+      if [ -n "$src" ]; then STEM="$(printf '%s' "$src" | tr '/' '-')"; LBL="$kind ${RID%%-*}"; RUN_BRANCH="$src"
       else STEM="${kind:-run}-$RID"; LBL="${kind:-run} ${RID%%-*}"; fi ;;
   esac
+  TRACK_REF=""
+  [ -n "$RUN_BRANCH" ] && TRACK_REF="refs/uzi-runner/$RUN_BRANCH"
 
   # --- status/progress snapshot (ALWAYS, even if parked or terminal: what was
   #     done, what is left, so a backup is self-describing without the code) ---
@@ -240,18 +394,63 @@ for RID in "${RUNS[@]}"; do
       continue ;;
   esac
   if [ -z "$wid" ]; then
-    log "SNAP $RID ($LBL) status=$st: no worker_id, parked/unclaimed (status saved)"
+    # A branch name is not a run identity: a fresh queued run on an issue can reuse
+    # agent/issue-N after an older run. Without a current worker binding, an all-pod
+    # search could therefore capture stale work and call it this run's backup.
+    log "FAIL $RID ($LBL) status=$st: no current worker_id; status saved, refusing an unbound all-worker search"
+    failures=1
     continue
   fi
-  if ! read -r ns pod < <(resolve_pod "$wid"); then
-    log "WARN $RID ($LBL): status saved, but no pod for worker $wid in ctx=$CTX ns=[$NAMESPACES]"
+
+  preferred=""
+  preferred="$(resolve_pod "$wid" || true)"
+  ns=""; pod=""; capture_kind=""
+  if [ -n "$preferred" ]; then
+    ns="${preferred%% *}"; pod="${preferred#* }"
+    if pod_has_clone "$ns" "$pod" "$STEM" "$RUN_BRANCH" "$RID"; then capture_kind="clone"; fi
+  fi
+
+  # A run may have resumed on a new worker, or its pod may have rolled while an older
+  # persistent PVC still holds the clone. Search all running worker pods before giving up.
+  if [ -z "$capture_kind" ]; then
+    while read -r cns cpod; do
+      [ -n "$cpod" ] || continue
+      if [ -n "$preferred" ] && [ "$cns $cpod" = "$preferred" ]; then continue; fi
+      if pod_has_clone "$cns" "$cpod" "$STEM" "$RUN_BRANCH" "$RID"; then
+        ns="$cns"; pod="$cpod"; capture_kind="clone"; break
+      fi
+    done < <(list_pods)
+  fi
+
+  # No clone survived. Preserve the latest committed checkpoint from whichever
+  # persistent worker still owns the runner tracking ref.
+  if [ -z "$capture_kind" ] && [ -n "$TRACK_REF" ]; then
+    if [ -n "$preferred" ]; then
+      ns="${preferred%% *}"; pod="${preferred#* }"
+      if pod_has_ref "$ns" "$pod" "$TRACK_REF" "$RUN_BRANCH" "$RID"; then capture_kind="bare"; fi
+    fi
+    if [ -z "$capture_kind" ]; then
+      while read -r cns cpod; do
+        [ -n "$cpod" ] || continue
+        if [ -n "$preferred" ] && [ "$cns $cpod" = "$preferred" ]; then continue; fi
+        if pod_has_ref "$cns" "$cpod" "$TRACK_REF" "$RUN_BRANCH" "$RID"; then
+          ns="$cns"; pod="$cpod"; capture_kind="bare"; break
+        fi
+      done < <(list_pods)
+    fi
+  fi
+
+  if [ -z "$capture_kind" ]; then
+    log "FAIL $RID ($LBL): status saved, but no live clone or durable tracking ref found in ctx=$CTX ns=[$NAMESPACES]"
+    failures=1
     continue
   fi
+
   # The clone's origin/main is a private worker checkpoint, so read the TRUE public
   # remote main from the shared bare repo and pass it to the capture: the bundle then
   # excludes a forge-recoverable base instead of silently dropping checkpointed work.
   REALMAIN="$("$KUBECTL" --context "$CTX" -n "$ns" exec "$pod" -c worker -- \
-    git --git-dir="/data/repos/$REPO_SLUG.git" rev-parse -q --verify refs/remotes/origin/main 2>/dev/null \
+    git --git-dir="$REPOS_BASE/$REPO_SLUG.git" rev-parse -q --verify refs/remotes/origin/main 2>/dev/null \
     | tr -d '[:space:]')"
   f="$DEST/$STEM.tgz"
   # The capture streams a ~10-20 MB gzip out of the pod over `kubectl exec`, and
@@ -269,15 +468,22 @@ for RID in "${RUNS[@]}"; do
     # earlier attempt already produced — a truncated archive is still the best
     # forensic artifact we have. Promote to $f only when the attempt produced bytes.
     rm -f "$tmp"
-    "$KUBECTL" --context "$CTX" -n "$ns" exec "$pod" -c worker -- sh -c "$CAPTURE" _ "$STEM" "$REALMAIN" "${UZI_RUNNER_BASE:-}" > "$tmp" 2>>"$LOG"
+    if [ "$capture_kind" = "clone" ]; then
+      "$KUBECTL" --context "$CTX" -n "$ns" exec "$pod" -c worker -- \
+        sh -c "$CAPTURE" _ "$STEM" "$REALMAIN" "$RUNNER_BASE" > "$tmp" 2>>"$LOG"
+    else
+      "$KUBECTL" --context "$CTX" -n "$ns" exec "$pod" -c worker -- \
+        sh -c "$BARE_CAPTURE" _ "$STEM" "$TRACK_REF" "$REALMAIN" "$REPOS_BASE" > "$tmp" 2>>"$LOG"
+    fi
     kc_rc=$?
     if [ "$kc_rc" -ne 0 ]; then
       log "WARN $RID ($LBL): exec/capture attempt $cap_try exit=$kc_rc; see $LOG"
     fi
     if [ ! -s "$tmp" ]; then
-      # No bytes this attempt. A nonzero exit is a transient failure worth a retry;
-      # a clean exit with no output means the clone is missing (a retry won't help).
-      # Either way, leave any nonempty $f from a prior attempt in place.
+      # A typed missing-source/no-new-commits result is deterministic; retrying the same
+      # pod three times cannot create a clone or tracking ref. Other failures may be a
+      # transient kubectl stream break, so retry those.
+      case "$kc_rc" in 3|4|5) break ;; esac
       [ "$kc_rc" -ne 0 ] && continue
       break
     fi
@@ -296,17 +502,35 @@ for RID in "${RUNS[@]}"; do
     # it is absent, say so (PART) rather than OK — the patch/untracked/status are
     # still useful, but there are no committed commits to restore.
     if tar tzf "$f" 2>/dev/null | grep -qF "$STEM.bundle"; then
-      log "OK   $RID ($LBL) status=$st worker=$wid pod=$pod -> $f ($(du -h "$f" | cut -f1))"
+      if [ "$capture_kind" = "bare" ]; then
+        log "BARE $RID ($LBL) status=$st pod=$pod ref=$TRACK_REF -> $f ($(du -h "$f" | cut -f1)); committed history only, uncommitted WIP unavailable"
+      else
+        log "OK   $RID ($LBL) status=$st worker=$wid pod=$pod -> $f ($(du -h "$f" | cut -f1))"
+      fi
+      recoverable=1
     else
       log "PART $RID ($LBL): verified .tgz but WITHOUT a git bundle (uncommitted/status only) -> $f"
+      recoverable=1
     fi
   elif [ -s "$f" ]; then
     log "FAIL $RID ($LBL): .tgz still truncated after retries -> $f kept for forensics; see $LOG"
+    failures=1
   else
-    log "FAIL $RID ($LBL): empty artifact (clone missing?); see $LOG"
+    log "FAIL $RID ($LBL): empty artifact from $capture_kind source; see $LOG"
     rm -f "$f"
+    failures=1
   fi
 done
 
-ln -sfn "$DEST" "$OUTROOT/latest"
-log "DONE -> $DEST  (latest -> $OUTROOT/latest)"
+ln -sfn "$DEST" "$OUTROOT/latest-attempt"
+if [ "$failures" -eq 0 ] && [ "$recoverable" -eq 1 ]; then
+  ln -sfn "$DEST" "$OUTROOT/latest"
+  log "DONE -> $DEST  (latest + latest-attempt updated)"
+elif [ "$failures" -eq 0 ]; then
+  log "DONE -> $DEST  (status-only; latest unchanged, latest-attempt updated)"
+else
+  log "INCOMPLETE -> $DEST  (latest preserved, latest-attempt updated)"
+  prune_old_backups || log "WARN backup retention prune did not complete"
+  exit 1
+fi
+prune_old_backups || log "WARN backup retention prune did not complete"

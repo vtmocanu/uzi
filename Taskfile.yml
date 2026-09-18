@@ -291,6 +291,11 @@ tasks:
       # semantics AND guards the tally (>= 8 cases, c == p) so a gutted driver test cannot
       # read green. Before `scan:secrets`, which is deliberately last because it dominates.
       - task: test:e2e-driver
+      # Hermetic end-to-end tests for the repo-local uzi-watcher backup scripts. They use
+      # fake uzi/kubectl commands and temporary git repos: no cluster, forge or live backup
+      # directory is touched. This gates clone capture, bare-ref fallback, fail-closed
+      # publication/exit status, retention pruning and detached-loop terminal pruning.
+      - task: test:uzi-watcher-backups
       # cheapest-first: this whole-file duplicate check is sub-second, so it runs
       # before `scan:secrets`, which is deliberately last because it dominates.
       - task: check:spec-numbering
@@ -845,6 +850,12 @@ tasks:
       # asserts the tally exists, c == p, and c >= 8 (the 8 PRD #966 M2 driver behaviours;
       # the test emits more as sub-cases are added). See the script header.
       - ./scripts/check-e2e-driver.sh
+
+  test:uzi-watcher-backups:
+    desc: hermetic tests of uzi-watcher live-clone/bare-ref backups, retention and detached loop
+    cmds:
+      - ./.agents/skills/uzi-watcher/scripts/backup-runs.test.sh
+      - ./.agents/skills/uzi-watcher/scripts/backup-loop.test.sh
 
   test:release-scripts:
     desc: offline fixture test of the release-train scripts (builds a temp git repo; PRD 1265)

@@ -216,10 +216,12 @@ and namespace from your own kubeconfig; they are deployment-specific, do not har
    claimed on *now*. After a rate-limit resume, or a `resume_lineage_break` (worker log:
    "no earlier work could be recovered for this run on this worker — starting from the
    default branch"), that is the **cold-reassignment** worker and it has **no clone** — the
-   work is on the worker that ran the run *before* the interruption. So if
-   `refs/uzi-runner/agent/issue-N` is absent on the current worker's pod, enumerate the ref
-   across **every** `uzi-hw-*` pod (`git --git-dir=BARE for-each-ref refs/uzi-runner/`) and
-   recover from whichever pod holds the tip. Worker PVCs are **persistent and survive a pod
+   work is on the worker that ran the run *before* the interruption. `backup-runs.sh`
+   handles this automatically: it checks the current worker first, searches every running
+   `uzi-hw-*` pod for the live clone, then falls back to the exact `refs/uzi-runner/...`
+   tracking ref when no clone survives. For a manual recovery, perform the same
+   `git --git-dir=BARE for-each-ref refs/uzi-runner/` enumeration and recover from whichever
+   pod holds the tip. Worker PVCs are **persistent and survive a pod
    *roll*** (an image upgrade replaces the pod, not the volume), so the previous worker's
    *current* pod still holds the ref. (Measured 2026-09-02, run #1009: an
    `agent-base` image auto-roll landed at the same instant as the 5-hour-limit resume, so the
@@ -234,9 +236,10 @@ and namespace from your own kubeconfig; they are deployment-specific, do not har
    and also saves the uncommitted patch + untracked files separately. By hand (committed
    history only; add `git -C CLONE diff HEAD` and an untracked tar for WIP):
    `git --git-dir=/data/runner/SLUG/issue-N/.git bundle create /tmp/r.bundle BRANCH --not
-   origin/main`. Use the bare ref when the current worker has no clone (cold-reassignment,
-   step 1 — `backup-runs.sh` searches only the current `worker_id` and skips terminal runs) or
-   the clone is gone: `git --git-dir=BARE bundle create /tmp/r.bundle
+   origin/main`. `backup-runs.sh` emits a `BARE` capture automatically when the current
+   worker has no clone (cold-reassignment) or the clone is gone. Such a capture preserves
+   committed checkpoints only and states that uncommitted WIP is unavailable. By hand, use:
+   `git --git-dir=BARE bundle create /tmp/r.bundle
    refs/uzi-runner/agent/issue-N ^MERGEBASE` (`MERGEBASE` = `git --git-dir=BARE merge-base
    refs/uzi-runner/agent/issue-N refs/remotes/origin/main`). Then `kubectl cp` it out.
 3. **Fetch into a branch + an ISOLATED worktree** (never the `main` worktree): `git fetch
@@ -328,15 +331,19 @@ The recovery above is reactive — after a push rejection or a lost run. When yo
 driving runs through a shaky window (a rate-limited Anthropic token that keeps parking at
 `limit_wait`, an edge-case being hardened, anything where a resume might not come back
 cleanly), snapshot the in-flight work on a timer so a fallback always exists. Two bundled
-scripts do this, capturing from the **live runner working clone** (so uncommitted work is
-caught too, not just the checkpointed tracking ref):
+scripts do this, preferring the **live runner working clone** (so uncommitted work is caught)
+and falling back to the durable bare tracking ref when no clone survives:
 
 - **`scripts/backup-runs.sh <RUN_ID>...`** — one snapshot per run into
   `$UZI_BACKUP_DIR` (default `/tmp/uzi-backups/<ts>/`): `issue-N.tgz` (git **bundle** of
   commits not on `origin/main` + `uncommitted.patch` + `untracked.tar.gz` + `meta.txt`),
   plus a self-describing status set (`run.json`, `plan.md`, `progress.txt` with milestones
-  DONE vs LEFT, `log-tail.ndjson`). It resolves worker→pod FRESH each call, so it follows a
-  worker roll or a cross-worker migration. Deployment coordinates come from env
+  DONE vs LEFT, `log-tail.ndjson`). It resolves worker→pod FRESH each call, searches all
+  persistent workers when the current pod lost the clone, and falls back to the durable
+  runner tracking ref. The result vocabulary is `OK` (live clone + bundle), `PART` (live
+  clone, uncommitted/status only), `BARE` (committed history only; no live WIP), and `FAIL`.
+  An active-run `FAIL` exits 1, so callers cannot misread a status-only attempt as a backup.
+  Deployment coordinates come from env
   (`UZI_CTX`, `UZI_WORKER_NS`, `UZI_REPO_SLUG` — the last derived from `origin` if unset),
   never hard-coded. **Always pass `UZI_CTX` explicitly**: unset, it falls back to the
   kubeconfig's current context, which is shared across sessions and can be switched under
@@ -344,12 +351,21 @@ caught too, not just the checkpointed tracking ref):
   A run that has committed nothing beyond public `main` yet (its work still uncommitted)
   logs **`PART`** and its `.tgz` carries the `uncommitted.patch`/`untracked` but no
   `.bundle` — expected for an early run, not a failure; the bundle appears once it commits.
+  `latest-attempt` always names the newest status attempt, while `latest` advances only
+  when every active target produced a verified recovery artifact, so a failed attempt never
+  hides the last good backup. Timestamped backup directories older than 14 days are pruned
+  automatically; set `UZI_BACKUP_RETENTION_DAYS=0` to disable or another integer to change it.
+  Pruning is path/name constrained, never follows symlinks, and preserves both latest targets.
 - **`scripts/backup-loop.sh <RUN_ID>...`** — runs `backup-runs.sh` every
   `UZI_BACKUP_INTERVAL` (default 900s), **detached** so it outlives the session (`setsid`
   on Linux, a `( nohup … & )` subshell on macOS). It self-terminates when every run is
   terminal, after `UZI_BACKUP_MAX_HOURS` (default 12), or on `touch $UZI_BACKUP_DIR/STOP`.
-  It rides through `limit_wait` (keeps snapshotting while a run is parked). This is a
-  session-independent safety net; it is NOT a substitute for the pollers — keep those too.
+  It rides through `limit_wait` (keeps snapshotting while a run is parked), retires each
+  terminal run after its first terminal snapshot, and retries active runs after a failed
+  capture. `backup-loop.state` records its PID, context, namespaces, interval, exact end
+  time, retention and run set, so another session can audit the detached process without
+  reading its full environment. This is a session-independent safety net; it is NOT a
+  substitute for the pollers — keep those too.
 
 To recover from a snapshot, follow **`resume-recipe.md`** in this skill dir. It is the
 authoritative, run-kind-agnostic land-it recipe (issue AND task stems) and takes over where
