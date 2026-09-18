@@ -15,10 +15,17 @@ set -eu
 if [ "${1:-}" = pr ] && [ "${2:-}" = view ]; then echo deadbeefdeadbeefdeadbeefdeadbeefdeadbeef; exit 0; fi
 if [ "${1:-}" = api ]; then
   case "$*" in
+    *'graphql'*)
+      if [ "$MODE" = cr_resolved ]; then
+        echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"isResolved":true,"isOutdated":false,"comments":{"nodes":[{"databaseId":12,"author":{"login":"coderabbitai"},"body":"🟡 **resolved finding**","path":"resolved.go","line":8,"originalLine":8}],"pageInfo":{"hasNextPage":false}}}],"pageInfo":{"hasNextPage":false}}}}}}'
+      else
+        echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}}'
+      fi ;;
     *'/pulls/42/reviews'*)
       case "$MODE" in
         race) echo '[{"id":7,"user":{"login":"greptile-apps[bot]"},"commit_id":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","state":"COMMENTED","body":""}]' ;;
         in_progress) echo '[{"id":8,"user":{"login":"coderabbitai[bot]"},"commit_id":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","state":"APPROVED","body":""}]' ;;
+        cr_resolved) echo '[{"id":9,"user":{"login":"coderabbitai[bot]"},"commit_id":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","state":"APPROVED","body":""}]' ;;
         *) echo '[]' ;;
       esac ;;
     *'/issues/42/comments'*) echo '[]' ;;
@@ -33,6 +40,7 @@ if [ "${1:-}" = api ]; then
       case "$MODE" in
         race) echo '[]' ;;
         in_progress) echo '[{"user":{"login":"greptile-apps[bot]"},"path":"partial.go","line":9,"body":"<img alt=\"P1\"> partial finding","pull_request_review_id":101}]' ;;
+        cr_resolved) echo '[{"user":{"login":"coderabbitai[bot]"},"path":"resolved.go","line":8,"body":"🟡 **resolved finding**","pull_request_review_id":9}]' ;;
         *) echo '[{"user":{"login":"greptile-apps[bot]"},"path":"old.go","line":8,"body":"<img alt=\"P1\"> old addressed finding","pull_request_review_id":99}]' ;;
       esac ;;
     *) echo "unexpected gh api: $*" >&2; exit 1 ;;
@@ -69,4 +77,9 @@ set -e
 grep -q 'review still in progress; findings deferred' "$WORK/progress.out" || fail "in-progress review was not deferred"
 if grep -q '^  GR  ' "$WORK/progress.out"; then fail "partial in-progress finding was printed"; fi
 
-echo "PASS pr-findings: settled, current-head Greptile scope"
+MODE="cr_resolved"; export MODE
+PATH="$WORK/bin:$PATH" bash "$SCRIPT" test/repo 42 > "$WORK/cr-resolved.out" 2>&1 \
+  || fail "resolved CR thread did not satisfy the gate: $(cat "$WORK/cr-resolved.out")"
+if grep -q '^  CR  ' "$WORK/cr-resolved.out"; then fail "resolved CR thread was printed live"; fi
+
+echo "PASS pr-findings: settled, resolved current-head scope"

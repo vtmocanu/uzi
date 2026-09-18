@@ -38,6 +38,14 @@ if [ "${1:-}" = pr ] && [ "${2:-}" = checks ]; then
 fi
 if [ "${1:-}" = api ]; then
   case "$*" in
+    *'graphql'*)
+      if [ "$MODE" = pending_findings ]; then
+        echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"isResolved":false,"isOutdated":false,"comments":{"nodes":[{"databaseId":11,"author":{"login":"coderabbitai"},"body":"🟡 **partial finding**","path":"partial.go","line":7,"originalLine":7}],"pageInfo":{"hasNextPage":false}}}],"pageInfo":{"hasNextPage":false}}}}}}'
+      elif [ "$MODE" = cr_resolved ]; then
+        echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"isResolved":true,"isOutdated":false,"comments":{"nodes":[{"databaseId":12,"author":{"login":"coderabbitai"},"body":"🟡 **resolved finding**","path":"resolved.go","line":8,"originalLine":8}],"pageInfo":{"hasNextPage":false}}}],"pageInfo":{"hasNextPage":false}}}}}}'
+      else
+        echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}}'
+      fi ;;
     *'/commits/deadbeefdeadbeefdeadbeefdeadbeefdeadbeef/status'*)
       case "$MODE" in
         pending_findings) echo '{"statuses":[{"context":"CodeRabbit","description":"Review in progress"}]}' ;;
@@ -48,6 +56,7 @@ if [ "${1:-}" = api ]; then
       case "$MODE" in
         pending_findings) echo '[{"id":1,"user":{"login":"coderabbitai[bot]"},"commit_id":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","state":"APPROVED","body":""}]' ;;
         greptile_race) echo '[{"id":7,"user":{"login":"greptile-apps[bot]"},"commit_id":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","state":"COMMENTED","body":""}]' ;;
+        cr_resolved) echo '[{"id":9,"user":{"login":"coderabbitai[bot]"},"commit_id":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","state":"APPROVED","body":""}]' ;;
         *) echo '[]' ;;
       esac ;;
     *'/issues/42/comments'*) cat "$COMMENTS" ;;
@@ -55,6 +64,7 @@ if [ "${1:-}" = api ]; then
       case "$MODE" in
         pending_findings) echo '[{"user":{"login":"coderabbitai[bot]"},"line":7,"body":"🟡 **partial finding**","pull_request_review_id":1}]' ;;
         greptile_clean) echo '[{"user":{"login":"greptile-apps[bot]"},"line":8,"body":"<img alt=\"P1\"> old addressed finding","pull_request_review_id":99}]' ;;
+        cr_resolved) echo '[{"user":{"login":"coderabbitai[bot]"},"line":8,"body":"🟡 **resolved finding**","pull_request_review_id":9}]' ;;
         *) echo '[]' ;;
       esac ;;
     *'/commits/deadbeefdeadbeefdeadbeefdeadbeefdeadbeef/check-runs'*)
@@ -125,4 +135,13 @@ set -e
 [ "$rc" -eq 2 ] || fail "incomplete Greptile findings read ready, rc=$rc: $(cat "$WORK/greptile-race.out")"
 grep -q 'gr_scope=0/1.*unknown=1' "$WORK/greptile-race.out" || fail "incomplete Greptile scope was not visible"
 
-echo "PASS watch-pr: review replies, in-progress findings, current Greptile scope"
+# A GraphQL-resolved CodeRabbit thread is not live even if its REST comment stays anchored.
+MODE="cr_resolved"; export MODE
+set +e
+bash "$SCRIPT" test/repo 42 0 1 --reviewer coderabbit --reviewer-grace 0 > "$WORK/cr-resolved.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 0 ] || fail "resolved CR thread stayed live, rc=$rc: $(cat "$WORK/cr-resolved.out")"
+grep -q '^RESULT=ready$' "$WORK/cr-resolved.out" || fail "resolved CR thread did not reach ready"
+
+echo "PASS watch-pr: settled reviews and resolved-thread scope"

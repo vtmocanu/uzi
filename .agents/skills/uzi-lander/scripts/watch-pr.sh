@@ -55,6 +55,10 @@
 # The script errs toward timeout (exit 2) rather than a false "ready".
 set -euo pipefail
 
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/review-threads.sh
+. "$HERE/lib/review-threads.sh"
+
 usage() { echo "usage: watch-pr.sh OWNER/REPO PR [interval_secs] [max_polls] [--reviewer any|coderabbit|greptile|none] [--reviewer-grace MIN]" >&2; exit 2; }
 
 REVIEWER="any"; GRACE_MIN=10
@@ -268,16 +272,20 @@ while [ "$i" -lt "$MAX" ]; do
     unknown=1
   fi
 
-  # Live inline findings: bot comments still anchored to current code (line != null) AND
-  # not self-marked resolved. Two ways a CodeRabbit finding stops being live: an outdated
-  # finding re-anchors to line == null; a finding CodeRabbit judged FIXED by a later commit
-  # keeps line != null and instead appends a "✅ Addressed in commit <sha>" line to its body
-  # (measured 2026-08-29 on PR #807, where two such addressed findings were mis-counted as
-  # live=2 and produced a false exit-3 after a clean rework). Greptile findings are counted
-  # by the same line != null anchor (no addressed-marker convention has been observed).
+  # CodeRabbit liveness comes from GraphQL reviewThreads: REST line anchors survive a human
+  # resolving the thread and therefore over-count settled findings. Fail closed when the
+  # thread listing is unreadable or paginated beyond the bounded query.
   cr_live=0; gr_live=0; gr_scoped_total=0
+  if thread_nodes=$(fetch_review_threads "$REPO" "$PR"); then
+    cr_live=$(printf '%s' "$thread_nodes" | jq \
+      '[.[]|select(.isResolved==false and .isOutdated==false)
+            |select(any(.comments.nodes[]?; ((.author.login // "")|startswith("coderabbitai"))))]|length' 2>/dev/null) || unknown=1
+  else
+    unknown=1
+  fi
+  # Greptile liveness is scoped to its current-head review id; the check-run tally below
+  # proves whether GitHub has exposed the complete set.
   if pull_c=$(gh api --paginate "repos/$REPO/pulls/$PR/comments" 2>/dev/null) && pages_are_arrays "$pull_c"; then
-    cr_live=$(printf '%s' "$pull_c" | jq -rs '[.[][]|select(.user.login=="coderabbitai[bot]" and .line!=null and ((.body|contains("Addressed in commit"))|not))]|length' 2>/dev/null) || unknown=1
     if [ -n "$gr_review_id" ]; then
       gr_scoped_total=$(printf '%s' "$pull_c" | jq -rs --argjson rid "$gr_review_id" \
         '[.[][]|select(.user.login=="greptile-apps[bot]" and .pull_request_review_id==$rid)]|length' 2>/dev/null) || unknown=1

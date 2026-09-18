@@ -258,7 +258,8 @@ a user reply that arrives first wins.
 
 - `scripts/takeover.sh` snapshot + claim + `NEXT`; `scripts/trail.sh` the status line;
   `scripts/claims.sh` who lands what (claim / release / list / reap / whoami);
-  `scripts/lib/state.sh` the shared state dir and session identity.
+  `scripts/lib/state.sh` the shared state dir/session identity; `scripts/lib/review-threads.sh`
+  the fail-closed GitHub thread-resolution reader.
 - `scripts/watch-pr.sh` readiness (CI + CR/Greptile on head + rework + rate-limit/skip exits);
   `scripts/pr-findings.sh` findings from both bots; `scripts/cr-rate-limit.sh` reset +
   wait; `scripts/review-quota.sh` who else consumes reviews; `scripts/wait-mrrework.sh`
