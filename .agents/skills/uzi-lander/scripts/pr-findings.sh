@@ -51,6 +51,10 @@
 # CodeRabbit alone without a confirmable-clean verdict (inspect the review body); 2 = usage.
 set -euo pipefail
 
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/review-threads.sh
+. "$HERE/lib/review-threads.sh"
+
 cr_only=0
 if [ "${1:-}" = "--cr-only" ]; then cr_only=1; shift; fi
 repo=${1:?usage: pr-findings.sh [--cr-only] OWNER/REPO PR [PR ...]}
@@ -69,9 +73,12 @@ for n in "$@"; do
   # that one snapshot (avoids a second API call and a read-your-writes race between them).
   # ONLY reviews on the CURRENT head count: an APPROVED review on an earlier commit says
   # nothing about the head (whose status may read "Review in progress").
-  crreviews=$(gh api "repos/${repo}/pulls/${n}/reviews" --paginate 2>/dev/null | jq -s --arg h "$head" \
-    '[.[][]?|select(.user.login=="coderabbitai[bot]" and ($h=="" or .commit_id==$h))]' 2>/dev/null || true)
-  printf '%s' "$crreviews" | jq -e 'type=="array"' >/dev/null 2>&1 || crreviews='[]'
+  reviews_all=$(gh api "repos/${repo}/pulls/${n}/reviews" --paginate 2>/dev/null | jq -s 'add // []' 2>/dev/null || true)
+  printf '%s' "$reviews_all" | jq -e 'type=="array"' >/dev/null 2>&1 || reviews_all='[]'
+  crreviews=$(printf '%s' "$reviews_all" | jq --arg h "$head" \
+    '[.[]|select(.user.login=="coderabbitai[bot]" and ($h=="" or .commit_id==$h))]' 2>/dev/null || echo '[]')
+  gr_review_id=$(printf '%s' "$reviews_all" | jq -r --arg h "$head" \
+    '[.[]|select(.user.login=="greptile-apps[bot]" and .commit_id==$h)]|last|.id // empty' 2>/dev/null || true)
   tally=$(printf '%s' "$crreviews" | jq -r '.[].body // ""' 2>/dev/null \
     | grep -oiE 'Actionable comments posted: [0-9]+' | tail -1 || true)
   crstate=$(printf '%s' "$crreviews" | jq -r 'last | .state // empty' 2>/dev/null || true)
@@ -124,7 +131,7 @@ for n in "$@"; do
   fi
 
   # ---- Greptile ----------------------------------------------------------------------
-  gr_ok=0; gr_line="not triggered on this head (on-demand: gh pr comment ${n} --body '@greptileai review')"
+  gr_ok=0; gr_added=""; gr_status="absent"; gr_line="not triggered on this head (on-demand: gh pr comment ${n} --body '@greptileai review')"
   if [ -n "$head" ]; then
     gr_json=$(gh api --paginate "repos/${repo}/commits/${head}/check-runs" 2>/dev/null \
       | jq -s '[.[].check_runs[]?|select(.app.slug=="greptile-apps" and .name=="Greptile Review")]|last // empty' 2>/dev/null || true)
@@ -135,13 +142,30 @@ for n in "$@"; do
       # Reviewed = completed AND success AND the summary; anything else completed (failure,
       # cancelled, skipped, or no summary) is NOT a review and must not clear the gate.
       if [ "$gr_status" = "completed" ] && [ "$gr_concl" = "success" ] && [ -n "$gr_sum" ]; then
-        gr_ok=1; gr_line="completed on head — ${gr_sum}"
+        gr_ok=1
+        gr_added=$(printf '%s' "$gr_sum" | grep -oE '[0-9]+ comments added' | grep -oE '^[0-9]+' || true)
+        gr_line="completed on head — ${gr_sum}"
+        if [ "$gr_added" != "0" ] && [ -z "$gr_review_id" ]; then
+          echo "  🔴 Greptile added comments but its current-head review id is missing; findings cannot be scoped"
+          unconfirmed="${unconfirmed} #${n}"
+        fi
       elif [ "$gr_status" = "completed" ]; then
         gr_line="completed but NOT a review (conclusion=${gr_concl:-none}, summary=${gr_sum:-none}); re-trigger"
       else gr_line="${gr_status} (started $(printf '%s' "$gr_json" | jq -r '.started_at'))"; fi
     fi
   fi
   echo "  Greptile: ${gr_line}"
+
+  # A bot can expose early inline comments before its review settles. Do not print or act on
+  # a partial finding set, even when the other bot already satisfies the review gate.
+  review_active=0
+  case "$crdesc" in *"in progress"*) review_active=1;; esac
+  case "$gr_status" in queued|in_progress) review_active=1;; esac
+  if [ "$review_active" -eq 1 ]; then
+    echo "  ⏳ review still in progress; findings deferred until the set is complete"
+    unconfirmed="${unconfirmed} #${n}"
+    continue
+  fi
 
   # ---- Gate --------------------------------------------------------------------------
   if [ "$cr_ok" -eq 1 ]; then
@@ -159,27 +183,47 @@ for n in "$@"; do
   # The listing is fetched raw and validated first: a failed or unreadable findings
   # request must not print nothing and let a "reviewed" PR exit 0 — it makes the PR
   # unconfirmed (exit 3) with the reason printed.
-  # CodeRabbit: severity emoji + bold title; a finding tagged "Addressed in commit" is done.
-  # Greptile: P1/P2 badge from the <img alt="P1"> tag; title = first text after the badge.
+  # CodeRabbit liveness comes from GraphQL thread resolution, not REST line anchors. Greptile
+  # comments remain REST-scoped to its latest current-head review id.
+  thread_nodes='[]'
+  if ! thread_nodes=$(fetch_review_threads "$repo" "$n"); then
+    echo "  🔴 review threads UNREADABLE or paginated beyond the bounded query — NOT confirmed clean"
+    unconfirmed="${unconfirmed} #${n}"
+  fi
   inline_raw=$(gh api --paginate "repos/${repo}/pulls/${n}/comments" 2>/dev/null | jq -s 'add // []' 2>/dev/null || echo 'x')
   if ! printf '%s' "$inline_raw" | jq -e 'type=="array"' >/dev/null 2>&1; then
     echo "  🔴 inline findings UNREADABLE (comments request failed or returned garbage) — NOT confirmed clean"
     unconfirmed="${unconfirmed} #${n}"
     inline_raw='[]'
   fi
+  if [ "$gr_ok" -eq 1 ] && [ "$gr_added" != "0" ] && [ -n "$gr_review_id" ]; then
+    gr_scoped_total=$(printf '%s' "$inline_raw" | jq --argjson rid "$gr_review_id" \
+      '[.[]|select(.user.login=="greptile-apps[bot]" and .pull_request_review_id==$rid)]|length' 2>/dev/null || echo -1)
+    if [ "$gr_scoped_total" -ne "$gr_added" ]; then
+      echo "  🔴 Greptile finding set incomplete (${gr_scoped_total}/${gr_added} current-review comments readable) — NOT confirmed clean"
+      unconfirmed="${unconfirmed} #${n}"
+    fi
+  fi
   # $sev/$t/$p below are jq variables, not shell expansions — single quotes are correct.
+  # One output row per unresolved, non-outdated CR thread, using its first bot comment.
   # shellcheck disable=SC2016
-  printf '%s' "$inline_raw" | jq -r '.[]|select(.line!=null)
-      | if .user.login=="coderabbitai[bot]" then
-          ((.body|match("🔴|🟠|🟡|🔵").string)? // "?") as $sev
-          | ((.body|match("\\*\\*[^*]+\\*\\*").string)? // "-") as $t
-          | (if (.body|contains("Addressed in commit")) then " (addressed)" else "" end) as $a
-          | "  CR  \(.path):\(.line)  [\($sev)] \($t|gsub("\\*";""))\($a)"
-        elif .user.login=="greptile-apps[bot]" then
-          ((.body|match("alt=\"(P[0-9])\"").captures[0].string)? // "?") as $p
+  printf '%s' "$thread_nodes" | jq -r '.[]
+      | select(.isResolved==false and .isOutdated==false)
+      | ([.comments.nodes[]?|select(((.author.login // "")|startswith("coderabbitai")))]|first) as $c
+      | select($c!=null)
+      | (($c.body|match("🔴|🟠|🟡|🔵").string)? // "?") as $sev
+      | (($c.body|match("\\*\\*[^*]+\\*\\*").string)? // "-") as $t
+      | "  CR  \($c.path):\($c.line // $c.originalLine // "-")  [\($sev)] \($t|gsub("\\*";""))"' 2>/dev/null \
+    || { echo "  🔴 could not render CodeRabbit review threads — NOT confirmed clean"; unconfirmed="${unconfirmed} #${n}"; }
+  gr_clean=0; [ "$gr_ok" -eq 1 ] && [ "$gr_added" = "0" ] && gr_clean=1
+  # shellcheck disable=SC2016
+  printf '%s' "$inline_raw" | jq -r --argjson grclean "$gr_clean" --arg grid "$gr_review_id" '.[]
+      | select(.user.login=="greptile-apps[bot]" and .line!=null)
+      | if $grclean==1 or ($grid!="" and ((.pull_request_review_id|tostring)!=$grid)) then empty
+        else ((.body|match("alt=\"(P[0-9])\"").captures[0].string)? // "?") as $p
           | (.body|gsub("<[^>]*>";"")|gsub("[[:space:]]+";" ")|.[0:110]) as $t
           | "  GR  \(.path):\(.line)  [\($p)] \($t)"
-        else empty end' 2>/dev/null || { echo "  🔴 could not render the inline findings — NOT confirmed clean"; unconfirmed="${unconfirmed} #${n}"; }
+        end' 2>/dev/null || { echo "  🔴 could not render Greptile findings — NOT confirmed clean"; unconfirmed="${unconfirmed} #${n}"; }
 done
 
 if [ -n "$unreviewed" ] || [ -n "$unconfirmed" ]; then

@@ -38,7 +38,9 @@
 #      (scripts/cr-rate-limit.sh --wait), then trigger `@coderabbitai review` ONCE.
 #   6  no reviewer will come on its own: CodeRabbit skipped this head (its status names
 #      the reason: base branch, >100 files, ignored title keyword) or is absent past the
-#      grace, and Greptile has not reviewed it. Trigger a bot or fall back to /code-review.
+#      grace, and Greptile has not reviewed it. Trigger a bot or use a local reviewer.
+#   7  CodeRabbit rejected `@coderabbitai review` because it considers the last commit
+#      already reviewed; post `@coderabbitai full review` once, then re-run this watcher.
 #
 # "CodeRabbit reviewed this head" is the union of three robust signals, because a
 # zero-actionable incremental review can post NO new review object AND re-anchor no
@@ -52,6 +54,10 @@
 # findings Greptile posts NO review object, so the check-run is the only per-head signal.
 # The script errs toward timeout (exit 2) rather than a false "ready".
 set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/review-threads.sh
+. "$HERE/lib/review-threads.sh"
 
 usage() { echo "usage: watch-pr.sh OWNER/REPO PR [interval_secs] [max_polls] [--reviewer any|coderabbit|greptile|none] [--reviewer-grace MIN]" >&2; exit 2; }
 
@@ -177,7 +183,7 @@ while [ "$i" -lt "$MAX" ]; do
   # does NOT accept jq's --arg (so the head SHA is passed to standalone jq), and `gh api
   # --paginate` emits one array PER PAGE (so pages are slurped with `-s`/`.[][]`).
   cr_reviewed=0; cr_unconfirmed=0
-  cr_a=""
+  cr_a=""; gr_review_id=""
   if rev_raw=$(gh api --paginate "repos/$REPO/pulls/$PR/reviews" 2>/dev/null) && pages_are_arrays "$rev_raw"; then
     # shellcheck disable=SC2016  # $h is a jq var (--arg), must stay single-quoted
     rev_on_head=$(printf '%s' "$rev_raw" | jq -rs --arg h "$head" \
@@ -193,6 +199,10 @@ while [ "$i" -lt "$MAX" ]; do
     # newest verdict. Empty when CodeRabbit has posted no review object yet.
     cr_a=$(printf '%s' "$rev_raw" | jq -rs \
       '[.[][]|select(.user.login=="coderabbitai[bot]")]|last|.commit_id // empty' 2>/dev/null) || unknown=1
+    # Greptile posts a review object only when it adds comments. Keep its current-head review
+    # id so old still-anchored comments from prior reviews cannot contaminate this pass.
+    gr_review_id=$(printf '%s' "$rev_raw" | jq -rs --arg h "$head" \
+      '[.[][]|select(.user.login=="greptile-apps[bot]" and .commit_id==$h)]|last|.id // empty' 2>/dev/null) || unknown=1
   else
     unknown=1
   fi
@@ -216,7 +226,7 @@ while [ "$i" -lt "$MAX" ]; do
   # summary); N is relative to that comment's updated_at, so it is converted to a
   # REMAINING figure here. Read from the newest such comment, independently of the
   # exactly-one walkthrough rule (it is informational, not a merge signal).
-  cr_reset_min=""
+  cr_reset_min=""; cr_full_required=0
   if issue_c=$(gh api --paginate "repos/$REPO/issues/$PR/comments" 2>/dev/null) && pages_are_arrays "$issue_c"; then
     wt_count=$(printf '%s' "$issue_c" | jq -rs '[.[][]|select(.user.login=="coderabbitai[bot]")|select(.body|contains("<!-- walkthrough_start -->"))]|length' 2>/dev/null) || unknown=1
     if [ "${wt_count:-0}" -eq 1 ]; then
@@ -240,27 +250,54 @@ while [ "$i" -lt "$MAX" ]; do
         fi
       fi
     fi
+    # A normal review command can receive a terminal "already reviewed" reply while the
+    # status remains the stale Review completed from an older head. Surface the prescribed
+    # full-review command immediately, but only once: a later user full-review command
+    # suppresses this state while CodeRabbit starts it.
+    cr_full_required=$(printf '%s' "$issue_c" | jq -rs '
+      ([.[][]|select(((.user.login|test("\\[bot\\]$"))|not)
+                      and (((.body // "")|gsub("^\\s+|\\s+$";""))=="@coderabbitai review"))]|last) as $ask
+      | if $ask==null then 0 else
+          ([.[][]|select(.user.login=="coderabbitai[bot]" and .created_at>$ask.created_at
+                         and ((.body // "")|contains("Already reviewed the last commit"))
+                         and ((.body // "")|contains("@coderabbitai full review")))]|last) as $reply
+          | if $reply==null then 0 else
+              ([.[][]|select(((.user.login|test("\\[bot\\]$"))|not)
+                             and .created_at>$reply.created_at
+                             and (((.body // "")|gsub("^\\s+|\\s+$";""))=="@coderabbitai full review"))]|length) as $full
+              | if $full==0 then 1 else 0 end
+            end
+        end' 2>/dev/null) || unknown=1
   else
     unknown=1
   fi
 
-  # Live inline findings: bot comments still anchored to current code (line != null) AND
-  # not self-marked resolved. Two ways a CodeRabbit finding stops being live: an outdated
-  # finding re-anchors to line == null; a finding CodeRabbit judged FIXED by a later commit
-  # keeps line != null and instead appends a "✅ Addressed in commit <sha>" line to its body
-  # (measured 2026-08-29 on PR #807, where two such addressed findings were mis-counted as
-  # live=2 and produced a false exit-3 after a clean rework). Greptile findings are counted
-  # by the same line != null anchor (no addressed-marker convention has been observed).
-  cr_live=0; gr_live=0
-  if pull_c=$(gh api --paginate "repos/$REPO/pulls/$PR/comments" 2>/dev/null) && pages_are_arrays "$pull_c"; then
-    cr_live=$(printf '%s' "$pull_c" | jq -rs '[.[][]|select(.user.login=="coderabbitai[bot]" and .line!=null and ((.body|contains("Addressed in commit"))|not))]|length' 2>/dev/null) || unknown=1
-    gr_live=$(printf '%s' "$pull_c" | jq -rs '[.[][]|select(.user.login=="greptile-apps[bot]" and .line!=null)]|length' 2>/dev/null) || unknown=1
+  # CodeRabbit liveness comes from GraphQL reviewThreads: REST line anchors survive a human
+  # resolving the thread and therefore over-count settled findings. Fail closed when the
+  # thread listing is unreadable or paginated beyond the bounded query.
+  cr_live=0; gr_live=0; gr_scoped_total=0
+  if thread_nodes=$(fetch_review_threads "$REPO" "$PR"); then
+    cr_live=$(printf '%s' "$thread_nodes" | jq \
+      '[.[]|select(.isResolved==false and .isOutdated==false)
+            |select(any(.comments.nodes[]?; ((.author.login // "")|startswith("coderabbitai"))))]|length' 2>/dev/null) || unknown=1
   else
     unknown=1
   fi
-  # An unconfirmed CodeRabbit review (grouped findings in its body) counts as live: it
-  # blocks a ready and surfaces as exit 3 for a human to read the body.
-  live=$((cr_live + gr_live + cr_unconfirmed))
+  # Greptile liveness is scoped to its current-head review id; the check-run tally below
+  # proves whether GitHub has exposed the complete set.
+  if pull_c=$(gh api --paginate "repos/$REPO/pulls/$PR/comments" 2>/dev/null) && pages_are_arrays "$pull_c"; then
+    if [ -n "$gr_review_id" ]; then
+      gr_scoped_total=$(printf '%s' "$pull_c" | jq -rs --argjson rid "$gr_review_id" \
+        '[.[][]|select(.user.login=="greptile-apps[bot]" and .pull_request_review_id==$rid)]|length' 2>/dev/null) || unknown=1
+      gr_live=$(printf '%s' "$pull_c" | jq -rs --argjson rid "$gr_review_id" \
+        '[.[][]|select(.user.login=="greptile-apps[bot]" and .pull_request_review_id==$rid and .line!=null)]|length' 2>/dev/null) || unknown=1
+    else
+      gr_live=$(printf '%s' "$pull_c" | jq -rs \
+        '[.[][]|select(.user.login=="greptile-apps[bot]" and .line!=null)]|length' 2>/dev/null) || unknown=1
+    fi
+  else
+    unknown=1
+  fi
 
   # Greptile: its `Greptile Review` check-run on the head (app slug greptile-apps). Absent =
   # not triggered on this head (Greptile is on-demand here: greptile.json autoReview []).
@@ -278,9 +315,28 @@ while [ "$i" -lt "$MAX" ]; do
   else
     unknown=1
   fi
-  gr_reviewed=0
-  if [ "$gr_state" = "completed" ] && [ "$gr_concl" = "success" ] && [ -n "$gr_summary" ]; then gr_reviewed=1; fi
+  gr_reviewed=0; gr_added=""
+  if [ "$gr_state" = "completed" ] && [ "$gr_concl" = "success" ] && [ -n "$gr_summary" ]; then
+    gr_reviewed=1
+    gr_added=$(printf '%s' "$gr_summary" | grep -oE '[0-9]+ comments added' | grep -oE '^[0-9]+' || true)
+    if [ "$gr_added" = "0" ]; then
+      # Greptile posts no review object for a clean pass; the explicit current-head zero is
+      # authoritative and every still-anchored Greptile comment belongs to an older pass.
+      gr_live=0
+    elif [ -z "$gr_review_id" ]; then
+      # A summary says comments were added but no current-head review id can scope them.
+      # Fail closed rather than mixing old and new comments into a false finding set.
+      unknown=1
+    elif [ "$gr_scoped_total" -ne "$gr_added" ]; then
+      # GitHub can expose the completed check/review before all inline comments. Until the
+      # review-scoped count matches Greptile's own tally, the finding set is incomplete.
+      unknown=1
+    fi
+  fi
   [ "$gr_state" = "completed" ] && [ "$gr_reviewed" -eq 0 ] && gr_state="completed(${gr_concl:-no-conclusion}, no summary)"
+  # An unconfirmed CodeRabbit review counts as live; Greptile is now scoped to its latest
+  # current-head review (or cleared by an explicit clean zero-comment summary).
+  live=$((cr_live + gr_live + cr_unconfirmed))
 
   # Signal (d): "equivalent head" — a logic-free merge commit CodeRabbit did not re-review
   # (issue #819). When the head is a merge that only brings in the PR base branch plus
@@ -343,9 +399,10 @@ while [ "$i" -lt "$MAX" ]; do
     none)       reviewed_head=1 ;;
   esac
 
-  eqnote=""
+  eqnote=""; grnote=""
   [ "$equiv" -eq 1 ] && eqnote=" equiv=1"
-  echo "try $i: head=${head:0:8} req_fail=$fail req_pend=$pend req_cancel=$cancel mrw_active=$mrw_active cr_reviewed=$cr_reviewed${eqnote} cr_status='${cr_desc:-absent}' greptile=$gr_state${gr_summary:+ ($gr_summary)} live=$live (cr=$cr_live gr=$gr_live cr_unconfirmed=$cr_unconfirmed)${unknown:+ unknown=$unknown}"
+  [ "$gr_reviewed" -eq 1 ] && grnote=" gr_scope=$gr_scoped_total/${gr_added:-?}"
+  echo "try $i: head=${head:0:8} req_fail=$fail req_pend=$pend req_cancel=$cancel mrw_active=$mrw_active cr_reviewed=$cr_reviewed${eqnote} cr_status='${cr_desc:-absent}' cr_full_required=$cr_full_required greptile=$gr_state${gr_summary:+ ($gr_summary)}${grnote} live=$live (cr=$cr_live gr=$gr_live cr_unconfirmed=$cr_unconfirmed)${unknown:+ unknown=$unknown}"
 
   # A failed lookup this iteration: defer, do not decide on masked values.
   if [ "$unknown" -ne 0 ]; then sleep "$INTERVAL"; continue; fi
@@ -353,7 +410,11 @@ while [ "$i" -lt "$MAX" ]; do
   if [ "$fail" -gt 0 ]; then echo "RESULT=red"; exit 1; fi
   if [ "$mrw_active" -gt 0 ]; then echo "RESULT=mr_rework_active"; exit 4; fi
   if [ "$pend" -eq 0 ] && [ "$cancel" -eq 0 ]; then
-    if [ "$reviewed_head" -eq 1 ]; then
+    # A selected or auto-started review can still append findings. Let every in-flight bot
+    # settle before declaring ready or surfacing a partial finding set for local edits.
+    if [ "$cr_pending" -eq 1 ] || [ "$gr_state" = "in_progress" ] || [ "$gr_state" = "queued" ]; then
+      : # a review is in flight; keep polling
+    elif [ "$reviewed_head" -eq 1 ]; then
       # Revalidate the head right before deciding (TOCTOU): a push during this iteration would
       # otherwise let an exit 0 describe an unreviewed head. Proceed to ready ONLY when the
       # re-read succeeds AND matches; an empty (failed) re-read is unknown, not a match — defer.
@@ -364,10 +425,9 @@ while [ "$i" -lt "$MAX" ]; do
       fi
       if [ "$live" -eq 0 ]; then echo "RESULT=ready"; exit 0; fi
       echo "RESULT=findings live=$live cr=$cr_live gr=$gr_live cr_unconfirmed=$cr_unconfirmed"; exit 3
-    fi
-    # CI settled, no review on this head. Is one coming, or must the caller act?
-    if [ "$cr_pending" -eq 1 ] || [ "$gr_state" = "in_progress" ] || [ "$gr_state" = "queued" ]; then
-      : # a review is in flight; keep polling
+    elif [ "$cr_full_required" -eq 1 ] && [ "$REVIEWER" != "greptile" ] && [ "$REVIEWER" != "none" ]; then
+      echo "RESULT=cr_full_review_required command='@coderabbitai full review'"
+      exit 7
     elif [ "$cr_limited" -eq 1 ] && [ "$REVIEWER" != "greptile" ] && [ "$gr_reviewed" -eq 0 ]; then
       echo "RESULT=cr_rate_limited${cr_reset_min:+ CR_RESET_MIN=$cr_reset_min}"
       [ -n "$cr_reset_min" ] && echo "CR_RESET_MIN=$cr_reset_min"

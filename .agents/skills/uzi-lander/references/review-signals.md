@@ -5,22 +5,25 @@ the earlier CodeRabbit measurements cited in `coderabbit-triage.md`). `scripts/w
 `scripts/pr-findings.sh`, `scripts/takeover.sh` and `scripts/cr-rate-limit.sh` implement
 these; read this when you must hand-roll a check or extend a script.
 
-## CodeRabbit (auto on every PR against `main`; `.coderabbit.yaml`)
+## CodeRabbit (auto on eligible PRs against `main`; `.coderabbit.yaml`)
 
 | Surface | Endpoint | What it tells you |
 |---|---|---|
 | Commit status, context `CodeRabbit` | `repos/O/R/commits/<head>/status` → `.statuses[]` | The **only place CR says why it did not review**: `Review in progress`, `Review completed`, `Review rate limited`, `Review skipped: reviews are disabled for this base branch` / `147 files exceed the limit of 100` / `ignored keyword in the PR title`. `state` is `success` even when rate-limited: read the description. Absent = CR never touched this head. |
 | Review objects | `repos/O/R/pulls/N/reviews` | Signal (a): a `coderabbitai[bot]` review with `commit_id == head` proves a review of this head. The tally `Actionable comments posted: N` lives in the review body (a clean pass is an APPROVED review with an empty body; a COMMENTED tally-less review is *unconfirmed*, read its body). |
 | Walkthrough comment | `repos/O/R/issues/N/comments`, exactly one `coderabbitai[bot]` comment containing `<!-- walkthrough_start -->` | Signal (c): the `final_review_risk` block's ``up to `<short-sha>` `` names the last reviewed head; a zero-finding incremental posts no review object, so this is the signal that always fires. Parse only inside the block, fail closed on 0 or >1 comments. The same comment carries the **rate-limit block** (`rate limited by coderabbit.ai` … `Next included review available in N minutes`), relative to the comment's `updated_at`. |
-| Inline comments | `repos/O/R/pulls/N/comments` | Live finding = `line != null` and body without `Addressed in commit`. `line == null` = outdated. |
+| Command replies | `repos/O/R/issues/N/comments`, newest bot reply after the matching user command | A normal `@coderabbitai review` can terminate with “Already reviewed the last commit. Use `@coderabbitai full review`” while status stays stale `Review completed`. This is actionable, not pending: `watch-pr.sh` exits 7 unless a later full-review command already exists. |
+| Review threads | GraphQL `pullRequest.reviewThreads` | CodeRabbit finding liveness: count only threads with `isResolved == false`, `isOutdated == false`, and a CodeRabbit comment. REST `line != null` survives human thread resolution and is not authoritative. Refuse truncated thread/comment pagination. |
+| Inline comments | `repos/O/R/pulls/N/comments` | Finding bodies and anchors for display; not CodeRabbit resolution state. |
 | Equivalent head | two `compare` calls | Signal (d): a logic-free merge-in of the base plus regenerated artifacts needs no fresh review (#819); `watch-pr.sh` computes it fail-closed. |
 | Check-run `CodeRabbit` in `gh pr checks` | | Do not key on it: it reads `pass` for an earlier commit while the new head is unreviewed (PR #756). |
 
 **Rate limit, the three places the reset appears:** the walkthrough block above (free);
 the reply to the exact two-word `@coderabbitai rate limit` (`More reviews will be available
 in N minutes`, relative to the reply's `created_at`); nowhere on a bare `@coderabbitai
-review` while limited (it replies `Review rate limited`, no time). `@coderabbitai ratelimits`
-and plain English get "I cannot view the quota". Refill is adaptive to the org's 7-day volume.
+review` while limited (it replies `Review rate limited`, no time). When timing matters, the
+exact query is authoritative: never infer from a review timestamp or nominal hourly rate.
+`@coderabbitai ratelimits` and plain English get "I cannot view the quota". Refill is adaptive.
 Renovate-authored PRs and `*(deps)` / `[skip-cr]` titles are not auto-reviewed and consume
 nothing; every push to any other open PR is one review, including uzi's `mr_rework` pushes.
 
@@ -33,15 +36,15 @@ Greptile puts in the PR body. One credit per review. The check-run appears ~12 s
 |---|---|---|
 | Check-run `Greptile Review`, app `greptile-apps` | `repos/O/R/commits/<head>/check-runs` | **The per-head signal.** `in_progress` while reviewing; `completed` with `output.summary` = `Greptile has reviewed the Pull Request.\n\nN files reviewed, M comments added`. Conclusion is `success` even with a P1 finding: read M. Absent = not triggered on this head. Durations seen: 35 files 2.5 min, 107 files 6 min. |
 | Review object | `pulls/N/reviews` | Only when M > 0: a `greptile-apps[bot]` COMMENTED review, empty body, `commit_id` = reviewed head. **Zero findings posts no review at all**, so the reviews endpoint reads clean-as-absent. |
-| Inline comments | `pulls/N/comments` | Findings carry a `<img alt="P1">` / `P2` badge; live = `line != null`. |
+| Inline comments | `pulls/N/comments` | Findings carry a `<img alt="P1">` / `P2` badge. Scope them to the latest current-head review id; when the current-head check reports `M > 0`, wait until M scoped comments are readable. An explicit `0 comments added` makes older still-anchored comments non-live. |
 | PR body | `pulls/N` `.body` | Greptile may rewrite the description between `<!-- greptile_comment -->` markers: `Confidence Score: N/5`, a summary, a mermaid diagram, and `<sub>Reviews (K) · Last reviewed commit: [...](…/commit/<full-sha>)</sub>`. Seen on 2 of 3 PRs, so a **secondary** confirmation only. The edit bumps the PR `updated_at`. |
 | Issue comments | | None from Greptile. |
 
 ## Poll recipe (what the scripts do)
 
 1. Head SHA from `gh pr view --json headRefOid`; every signal is tested against it.
-2. CR: status description → pending / limited / skipped / absent; reviewed = (a) or (c) or (d).
+2. CR: status description → pending / limited / skipped / absent; reviewed = (a) or (c) or (d); command reply can require the agent to decide on one full review.
 3. Greptile: check-run on head → absent / in_progress / completed(+M).
-4. Live findings = CR live + Greptile live, regardless of which bot the gate requires.
-5. Ready only when required CI is settled green, the required reviewer(s) reviewed this exact
-   head, live = 0, no `mr_rework` active, and the head re-reads unchanged (TOCTOU).
+4. If either bot is active, defer finding output; the set is incomplete even when the other bot already satisfies the gate.
+5. Live findings = CR live + current-head Greptile live, regardless of which bot the gate requires.
+6. Ready only when required CI is settled green, every active review settled, the required reviewer(s) reviewed this exact head, live = 0, no `mr_rework` active, and the head re-reads unchanged (TOCTOU).

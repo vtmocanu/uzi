@@ -12,9 +12,11 @@
 # Every "N minutes" is relative to the comment's own timestamp, so this script converts it
 # to an absolute reset instant and prints the REMAINING minutes as of now.
 #
-# Usage: cr-rate-limit.sh OWNER/REPO PR [--ask] [--wait] [--max-wait-min N] [--interval S]
+# Usage: cr-rate-limit.sh OWNER/REPO PR [--ask] [--query] [--wait] [--max-wait-min N] [--interval S]
 #   --ask            when limited and no reset time is on the PR, post `@coderabbitai rate
 #                    limit` ONCE and parse the reply (polls up to ~3 min for it).
+#   --query          post that exact query even when the head status is stale/non-limited;
+#                    implies --ask. Use when exact quota timing matters.
 #   --wait           when limited with a known reset, poll until the reset elapses (+2 min
 #                    margin) or CR's status leaves "rate limited"; then exit 0. With an
 #                    UNKNOWN reset, --wait waits --max-wait-min as a ceiling. Hitting the
@@ -37,10 +39,11 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/state.sh
 . "$HERE/lib/state.sh"
 
-REPO=""; PR=""; ASK=0; WAIT=0; MAX_WAIT=180; INTERVAL=60
+REPO=""; PR=""; ASK=0; QUERY=0; WAIT=0; MAX_WAIT=180; INTERVAL=60
 while [ $# -gt 0 ]; do
   case "$1" in
     --ask) ASK=1; shift;;
+    --query) QUERY=1; ASK=1; shift;;
     --wait) WAIT=1; shift;;
     --max-wait-min) MAX_WAIT="${2:?}"; shift 2;;
     --interval) INTERVAL="${2:?}"; shift 2;;
@@ -49,7 +52,7 @@ while [ $# -gt 0 ]; do
     *) if [ -z "$REPO" ]; then REPO="$1"; elif [ -z "$PR" ]; then PR="$1"; else echo "unexpected arg: $1" >&2; exit 3; fi; shift;;
   esac
 done
-[ -n "$REPO" ] && [ -n "$PR" ] || { echo "usage: cr-rate-limit.sh OWNER/REPO PR [--ask] [--wait] [--max-wait-min N] [--interval S]" >&2; exit 3; }
+[ -n "$REPO" ] && [ -n "$PR" ] || { echo "usage: cr-rate-limit.sh OWNER/REPO PR [--ask] [--query] [--wait] [--max-wait-min N] [--interval S]" >&2; exit 3; }
 
 # ISO-8601 (GitHub's "2026-09-17T05:57:46Z") -> epoch seconds, via jq so it is portable
 # across BSD and GNU date. Fractional seconds are stripped first.
@@ -98,6 +101,25 @@ reset_from_pr() {
   return 0
 }
 
+# Exact query mode ignores a later-edited walkthrough: only a qualifying bot reply after
+# this invocation's command can answer it. Prints "<epoch-of-reset>\treply" or nothing.
+reset_from_reply_after() {
+  local asked_at=$1 comments b n ts base
+  comments=$(gh api --paginate "repos/$REPO/issues/$PR/comments" 2>/dev/null | jq -s 'add // []') || return 1
+  printf '%s' "$comments" | jq -e 'type=="array"' >/dev/null 2>&1 || return 1
+  b=$(printf '%s' "$comments" | jq -r --arg a "$asked_at" \
+    '[.[]|select(.user.login=="coderabbitai[bot]" and .created_at>$a
+                 and ((.body // "")|test("More reviews will be available in [0-9]+ minutes")))]
+     |last|select(.!=null)|"\(.created_at)\t\(.body)"' 2>/dev/null)
+  [ -n "$b" ] || return 0
+  ts=$(printf '%s' "$b" | head -1 | cut -f1)
+  n=$(printf '%s' "$b" | grep -oE 'More reviews will be available in [0-9]+ minutes' | tail -1 | grep -oE '[0-9]+' || true)
+  if [ -n "$n" ] && [ -n "$ts" ] && base=$(iso2epoch "$ts") && [ -n "$base" ]; then
+    printf '%s\treply\n' "$(( base + n*60 ))"
+  fi
+  return 0
+}
+
 report() {  # $1 = reset epoch or "", $2 = source
   local now rem
   now=$(date +%s)
@@ -113,16 +135,16 @@ report() {  # $1 = reset epoch or "", $2 = source
 
 status=$(cr_status) || { echo "gh error resolving PR $PR on $REPO" >&2; exit 3; }
 echo "CR_STATUS='${status:-absent}'"
-case "$status" in
-  *"rate limited"*) ;;
-  *) echo "CR_LIMITED=0"; exit 0 ;;
-esac
-echo "CR_LIMITED=1"
+status_limited=0
+case "$status" in *"rate limited"*) status_limited=1;; esac
+if [ "$status_limited" -eq 0 ] && [ "$QUERY" -eq 0 ]; then echo "CR_LIMITED=0"; exit 0; fi
 
 row=$(reset_from_pr) || { echo "gh error reading PR comments" >&2; exit 3; }
 reset_ts=$(printf '%s' "$row" | cut -f1); src=$(printf '%s' "$row" | cut -f2)
+# --query asks for an exact live answer. Never let an inferred walkthrough timestamp satisfy it.
+if [ "$QUERY" -eq 1 ]; then reset_ts=""; src=""; fi
 
-if [ -z "$reset_ts" ] && [ "$ASK" -eq 1 ]; then
+if { [ "$QUERY" -eq 1 ] || [ -z "$reset_ts" ]; } && [ "$ASK" -eq 1 ]; then
   # In-flight guard, FAIL CLOSED and serialised: the post happens only under a per-PR lock
   # (mkdir in the shared state dir, 10-min TTL) so two invocations cannot both post, and
   # only after a SUCCESSFUL read of the comments proves no unanswered `@coderabbitai rate
@@ -151,17 +173,17 @@ if [ -z "$reset_ts" ] && [ "$ASK" -eq 1 ]; then
   fi
   for _ in $(seq 1 12); do
     sleep 15
-    row=$(reset_from_pr) || continue
-    src=$(printf '%s' "$row" | cut -f2)
-    # Only a reply posted after our ask counts (a stale earlier reply would mislead).
-    if [ "$src" = "reply" ]; then
-      newest=$(gh api --paginate "repos/$REPO/issues/$PR/comments" 2>/dev/null | jq -s 'add // []' \
-        | jq -r --arg a "$asked_at" '[.[]|select(.user.login=="coderabbitai[bot]" and (.body|test("More reviews will be available")) and .created_at > $a)]|length')
-      [ "${newest:-0}" -ge 1 ] && { reset_ts=$(printf '%s' "$row" | cut -f1); break; }
+    row=$(reset_from_reply_after "$asked_at") || continue
+    if [ -n "$row" ]; then
+      reset_ts=$(printf '%s' "$row" | cut -f1)
+      src=$(printf '%s' "$row" | cut -f2)
+      break
     fi
   done
 fi
 
+[ -n "$reset_ts" ] && [ "$reset_ts" -gt "$(date +%s)" ] && status_limited=1
+echo "CR_LIMITED=$status_limited"
 report "$reset_ts" "${src:-}"
 
 if [ "$WAIT" -eq 0 ]; then
@@ -173,11 +195,19 @@ fi
 # --wait: poll until the reset (+2 min) elapses, CR's status changes, or the ceiling hits.
 deadline=$(( $(date +%s) + MAX_WAIT*60 ))
 [ -n "$reset_ts" ] && [ $(( reset_ts + 120 )) -lt "$deadline" ] && deadline=$(( reset_ts + 120 ))
+reset_label=unknown
+[ -n "$reset_ts" ] && reset_label=$(jq -rn --argjson e "$reset_ts" '$e|todate')
 while [ "$(date +%s)" -lt "$deadline" ]; do
   sleep "$INTERVAL"
+  if [ "$QUERY" -eq 1 ]; then
+    now=$(date +%s)
+    if [ -n "$reset_ts" ] && [ "$now" -ge "$reset_ts" ]; then echo "CR_RESET_ELAPSED=1"; exit 0; fi
+    echo "$(date +%H:%M:%S) waiting on exact quota reset at $reset_label"
+    continue
+  fi
   s=$(cr_status) || continue
   case "$s" in
-    *"rate limited"*) echo "$(date +%H:%M:%S) still limited; reset at ${reset_ts:+$(jq -rn --argjson e "$reset_ts" '$e|todate')}${reset_ts:-unknown}" ;;
+    *"rate limited"*) echo "$(date +%H:%M:%S) still limited; reset at $reset_label" ;;
     *) echo "CR_STATUS='${s:-absent}'"; echo "CR_RESUMED=1"; exit 0 ;;
   esac
 done
