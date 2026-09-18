@@ -1174,8 +1174,8 @@ const (
 
 // WorkerRunMessageGaps returns the MISSING message-seq ranges in [1..through] for a run this worker
 // holds at its current, unreleased claim (PRD #1391 Run B M3c). Worker-authenticated, run-scoped,
-// generation-fenced and keyset-paginated: query params `through` (>=0, <= a cap), `limit` (default
-// 256, hard-capped) and `cursor` (a seq keyset value, the next_cursor of the previous page). A
+// generation-fenced and keyset-paginated: required `claim_generation` (>=0), `through` (>=0, <= a
+// cap), `limit` (default 256, hard-capped) and `cursor` (the previous page's next_cursor). A
 // foreign worker, or a stale/released flight, is 404 (ErrRunNotOwned) — it must not inspect or fill
 // a newer flight's gaps. Response: {"gaps":[{"first":F,"last":L},...], "next_cursor":<seq or omitted>}.
 func (h *Handler) WorkerRunMessageGaps(w http.ResponseWriter, r *http.Request) {
@@ -1186,6 +1186,14 @@ func (h *Handler) WorkerRunMessageGaps(w http.ResponseWriter, r *http.Request) {
 	}
 	runID, ok := httpx.PathUUID(w, r, "id", "run")
 	if !ok {
+		return
+	}
+	// claim_generation: required and non-negative. The journal generation is what prevents an old
+	// same-worker flight from inspecting a newer reclaim's gaps; this endpoint and terminal_fence
+	// ship together, so there is no legacy generation-less caller to admit.
+	claimGeneration, perr := strconv.ParseInt(r.URL.Query().Get("claim_generation"), 10, 64)
+	if perr != nil || claimGeneration < 0 {
+		httpx.Error(w, http.StatusBadRequest, "claim_generation must be a non-negative integer")
 		return
 	}
 	// through: required, >= 0, <= the cap (a bounded window the keyset walks).
@@ -1221,7 +1229,7 @@ func (h *Handler) WorkerRunMessageGaps(w http.ResponseWriter, r *http.Request) {
 		}
 		limit = n
 	}
-	page, err := h.wsvc.RunMessageGaps(r.Context(), wkr, runID, through, cursor, limit)
+	page, err := h.wsvc.RunMessageGaps(r.Context(), wkr, runID, claimGeneration, through, cursor, limit)
 	if err != nil {
 		if errors.Is(err, workersvc.ErrRunNotOwned) {
 			httpx.Error(w, http.StatusNotFound, "run not found for this worker")

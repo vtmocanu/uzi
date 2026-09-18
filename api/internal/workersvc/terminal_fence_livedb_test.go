@@ -11,7 +11,7 @@ import (
 
 // This file is the live-DB half of PRD #1391 Run B M3c: it EXECUTES the terminal fence (SetState's
 // pre-mutation CountRunMessagesThrough contiguity check) and the hardened message-gaps read
-// (GetRunOwnedByWorkerLiveClaim + the RunMessageGaps LAG/keyset query) against a REAL Postgres —
+// (atomic worker/generation auth + the RunMessageGaps LAG/keyset query) against a REAL Postgres —
 // sqlc's type deduction is not Postgres's, and the LAG window + BETWEEN range scan can pass
 // `sqlc generate` yet behave differently at execute. Skipped unless UZI_TEST_DATABASE_URL is set
 // (setupCodexLiveDB skips).
@@ -185,9 +185,10 @@ func TestSetStateTerminalFenceGapUnrecoverableLiveDB(t *testing.T) {
 }
 
 // TestRunMessageGapsLiveDB executes the hardened message-gaps read (PRD #1391 Run B M3c): the
-// holes for a {1,3} run, the worker/generation fence (a foreign worker and a released claim both
-// 404 via ErrRunNotOwned), and keyset pagination over a HUGE `through` with a small limit — proving
-// the query never materialises `through` rows and pages bounded {first,last} ranges with a cursor.
+// holes for a {1,3} run, the atomic worker/generation fence (a foreign worker, released claim and
+// stale same-worker generation all 404 via ErrRunNotOwned), and keyset pagination over a HUGE
+// `through` with a small limit, proving the query never materialises `through` rows and pages bounded
+// {first,last} ranges with a cursor.
 func TestRunMessageGapsLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	svc := New(env.q, env.box, testParams())
@@ -198,7 +199,7 @@ func TestRunMessageGapsLiveDB(t *testing.T) {
 		id := seedRunningRun(t, env, o, 6200, 3)
 		insertRunMsg(t, env, id, 1)
 		insertRunMsg(t, env, id, 3)
-		page, err := svc.RunMessageGaps(env.ctx, wkr, id, 3, 0, 256)
+		page, err := svc.RunMessageGaps(env.ctx, wkr, id, 0, 3, 0, 256)
 		if err != nil {
 			t.Fatalf("RunMessageGaps: %v", err)
 		}
@@ -214,7 +215,7 @@ func TestRunMessageGapsLiveDB(t *testing.T) {
 		id := seedRunningRun(t, env, o, 6201, 2)
 		insertRunMsg(t, env, id, 2)
 		foreign := store.Worker{ID: uuid.New(), UserID: o.userID}
-		_, err := svc.RunMessageGaps(env.ctx, foreign, id, 2, 0, 256)
+		_, err := svc.RunMessageGaps(env.ctx, foreign, id, 0, 2, 0, 256)
 		if !errors.Is(err, ErrRunNotOwned) {
 			t.Fatalf("err = %v, want ErrRunNotOwned (a foreign worker must not read the gaps)", err)
 		}
@@ -225,9 +226,26 @@ func TestRunMessageGapsLiveDB(t *testing.T) {
 		insertRunMsg(t, env, id, 2)
 		// A held-state switch RELEASES the claim; the superseded flight must not inspect the gaps.
 		env.exec(`UPDATE runs SET claim_released_at = now() WHERE id = $1`, id)
-		_, err := svc.RunMessageGaps(env.ctx, wkr, id, 2, 0, 256)
+		_, err := svc.RunMessageGaps(env.ctx, wkr, id, 0, 2, 0, 256)
 		if !errors.Is(err, ErrRunNotOwned) {
 			t.Fatalf("err = %v, want ErrRunNotOwned (a released/superseded claim must not read the gaps)", err)
+		}
+	})
+
+	t.Run("a stale generation cannot read a same-worker reclaim", func(t *testing.T) {
+		id := seedRunningRun(t, env, o, 6204, 2)
+		insertRunMsg(t, env, id, 2)
+		setRunGeneration(t, env, id, 8) // same worker, newer flight
+
+		if _, err := svc.RunMessageGaps(env.ctx, wkr, id, 7, 2, 0, 256); !errors.Is(err, ErrRunNotOwned) {
+			t.Fatalf("stale generation err = %v, want ErrRunNotOwned", err)
+		}
+		page, err := svc.RunMessageGaps(env.ctx, wkr, id, 8, 2, 0, 256)
+		if err != nil {
+			t.Fatalf("current generation: %v", err)
+		}
+		if len(page.Gaps) != 1 || page.Gaps[0] != (MessageGap{First: 1, Last: 1}) {
+			t.Fatalf("current generation gaps = %+v, want [{1 1}]", page.Gaps)
 		}
 	})
 
@@ -245,7 +263,7 @@ func TestRunMessageGapsLiveDB(t *testing.T) {
 		cursor := int64(0)
 		pages := 0
 		for {
-			page, err := svc.RunMessageGaps(env.ctx, wkr, id, through, cursor, limit)
+			page, err := svc.RunMessageGaps(env.ctx, wkr, id, 0, through, cursor, limit)
 			if err != nil {
 				t.Fatalf("page at cursor %d: %v", cursor, err)
 			}

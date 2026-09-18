@@ -16,6 +16,7 @@ const TOKEN = "worker-join-token-0123456789";
 
 interface Recorded {
   kind: "register" | "heartbeat" | "messages" | "claim" | "other";
+  url: string;
   body: Record<string, unknown> | undefined;
 }
 interface Reply {
@@ -74,25 +75,28 @@ async function startServer(): Promise<ProgServer> {
       const url = req.url ?? "";
       let reply: Reply;
       if (url.endsWith("/register")) {
-        requests.push({ kind: "register", body });
+        requests.push({ kind: "register", url, body });
         const registerBody: Record<string, unknown> = { worker_id: "w1", protocol_features: cfg.features };
         if (cfg.registerNonce !== undefined) registerBody.register_nonce = cfg.registerNonce;
         if (cfg.workerOutboxMaxPending !== undefined) registerBody.worker_outbox_max_pending = cfg.workerOutboxMaxPending;
         reply = { status: 200, body: JSON.stringify(registerBody) };
       } else if (url.endsWith("/ownership")) {
-        requests.push({ kind: "other", body });
+        requests.push({ kind: "other", url, body });
         reply = cfg.ownership();
+      } else if (url.includes("/message-gaps?")) {
+        requests.push({ kind: "other", url, body });
+        reply = { status: 200, body: JSON.stringify({ gaps: [] }) };
       } else if (url.endsWith("/heartbeat")) {
         reply = cfg.heartbeat(countOf("heartbeat"));
-        requests.push({ kind: "heartbeat", body });
+        requests.push({ kind: "heartbeat", url, body });
       } else if (url.endsWith("/messages")) {
         reply = cfg.messages(countOf("messages"));
-        requests.push({ kind: "messages", body });
+        requests.push({ kind: "messages", url, body });
       } else if (url.endsWith("/runs/claim")) {
         reply = cfg.claim(countOf("claim"));
-        requests.push({ kind: "claim", body });
+        requests.push({ kind: "claim", url, body });
       } else {
-        requests.push({ kind: "other", body });
+        requests.push({ kind: "other", url, body });
         reply = { status: 404 };
       }
       res.writeHead(reply.status, reply.body ? { "Content-Type": "application/json" } : {});
@@ -465,5 +469,18 @@ describe("register snapshot + cap + ownership generation (PRD #1391 Run B M4)", 
     const c = newClient();
     const probe = await c.getRunOwnership("33333333-3333-3333-3333-333333333333");
     assert.strictEqual(probe.claim_generation, undefined, "absent ⇒ undefined (the router cannot prove a mismatch)");
+  });
+
+  it("getMessageGaps sends the exact claim generation with the keyset page", async () => {
+    const c = newClient();
+    await c.getMessageGaps("33333333-3333-3333-3333-333333333333", 7, 42, 9, 3);
+
+    const req = srv.requests.find((r) => r.url.includes("/message-gaps?"));
+    assert.ok(req, "the message-gaps request reached the server");
+    const query = new URL(req.url, srv.url).searchParams;
+    assert.strictEqual(query.get("claim_generation"), "7", "the journal generation fences the read");
+    assert.strictEqual(query.get("through"), "42");
+    assert.strictEqual(query.get("limit"), "9");
+    assert.strictEqual(query.get("cursor"), "3");
   });
 });

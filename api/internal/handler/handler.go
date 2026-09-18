@@ -1061,9 +1061,9 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 
 		// Message-gaps read (PRD #1391 Run B M3c): worker-authenticated, run-scoped, READ ONLY.
 		// Returns the MISSING message-seq ranges in [1..through] as keyset-paginated {first,last}
-		// pairs so a fence-blocked worker can fill the holes before re-reporting terminal. Fenced on
-		// the CURRENT, unreleased claim (GetRunOwnedByWorkerLiveClaim) — a stale worker or a
-		// released/superseded generation gets 404, it must not fill a newer flight's gaps.
+		// pairs so a fence-blocked worker can fill the holes before re-reporting terminal. The gaps
+		// query atomically fences on the exact worker + unreleased claim generation — a stale worker
+		// or released/superseded generation gets 404, never a view of a newer flight's gaps.
 		r.Get("/runs/{id}/message-gaps", h.WorkerRunMessageGaps)
 
 		// Orphan-classification read (issue #1319): worker-authenticated, READ ONLY.

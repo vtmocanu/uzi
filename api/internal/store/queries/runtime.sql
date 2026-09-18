@@ -651,16 +651,6 @@ ORDER BY w.created_at DESC;
 -- Worker-endpoint authz: a worker may only touch a run it currently holds.
 SELECT * FROM runs WHERE id = @id AND worker_id = @worker_id;
 
--- name: GetRunOwnedByWorkerLiveClaim :one
--- Worker-endpoint authz for the message-gaps read (PRD #1391 Run B M3c): like GetRunOwnedByWorker
--- but ALSO fenced on the claim being CURRENT — claim_released_at IS NULL. A held-state credential
--- switch RELEASES the claim (sets claim_released_at) so a superseded old flight must NOT inspect
--- or fill a NEWER flight's gaps; a reclaim by a DIFFERENT worker moves worker_id, which the
--- worker_id predicate already excludes. Both stale cases return no rows → ErrRunNotOwned → 404, the
--- same shape a foreign worker sees. A run whose claim was never released has claim_released_at NULL
--- and reads exactly as GetRunOwnedByWorker would.
-SELECT * FROM runs WHERE id = @id AND worker_id = @worker_id AND claim_released_at IS NULL;
-
 -- name: GetRunOrphanIdentity :one
 -- Orphan-classification read (issue #1319): DISTINCT from GetRunOwnedByWorker. Scoped to
 -- the worker's OWNER (user) and the claimant's repo, NOT worker_id, so a terminal owner
@@ -3862,6 +3852,13 @@ SELECT count(seq)::int FROM run_messages WHERE run_id = @run_id AND seq BETWEEN 
 -- name: RunMessageGaps :many
 -- The hardened message-gaps read (PRD #1391 Run B M3c): the MISSING seq ranges in [1..through]
 -- as bounded {first,last} pairs, after a keyset @cursor, ordered by seq, at most @lim of them.
+-- Authorization is part of THIS statement and snapshot: the run must belong to @worker_id at its
+-- current unreleased @claim_generation. A preliminary ownership query would leave a TOCTOU window
+-- where a same-worker reclaim increments the generation before this query reads the newer flight's
+-- gaps. `authorized` is empty for any stale/foreign/released claim, so the statement returns ZERO
+-- rows. For an authorized run with no gaps, the final LEFT JOIN returns one all-NULL sentinel row;
+-- the service uses that distinction to return an empty page rather than ErrRunNotOwned.
+--
 -- KEYSET pagination only — NO OFFSET, NO generate_series, NO materialisation of `through` rows:
 -- the gaps are derived from the PRESENT rows via LAG over the (run_id, seq) index, so the scan is
 -- bounded by what is stored (at most the run's message count), never by the size of `through`.
@@ -3876,22 +3873,36 @@ SELECT count(seq)::int FROM run_messages WHERE run_id = @run_id AND seq BETWEEN 
 -- only the index tail; @cursor doubles as the LAG seed so the first closer after the cursor gets
 -- the correct predecessor. @cursor = 0 (the first page) admits every gap, including the leading
 -- one [1, min_present-1]. The trailing gap is uniquely the one whose `last` == through.
-WITH present AS (
-    SELECT seq FROM run_messages
-    WHERE run_id = @run_id AND seq BETWEEN 1 AND @through::int AND seq >= @cursor::int
+WITH authorized AS (
+    SELECT 1 AS ok FROM runs r
+    WHERE r.id = @run_id
+      AND r.worker_id = @worker_id
+      AND r.claim_released_at IS NULL
+      AND r.claim_generation = @claim_generation
+),
+present AS (
+    SELECT m.seq FROM run_messages m
+    CROSS JOIN authorized
+    WHERE m.run_id = @run_id AND m.seq BETWEEN 1 AND @through::int AND m.seq >= @cursor::int
     UNION ALL
-    SELECT (@through::int) + 1
+    SELECT (@through::int) + 1 FROM authorized
 ),
 edges AS (
     SELECT seq AS closer,
            COALESCE(LAG(seq) OVER (ORDER BY seq), @cursor::int) AS prev
     FROM present
+),
+gaps AS (
+    SELECT (prev + 1)::int AS gap_first, (closer - 1)::int AS gap_last, closer::int AS next_cursor
+    FROM edges
+    WHERE closer - prev > 1 AND closer > @cursor::int
+    ORDER BY closer ASC
+    LIMIT @lim::int
 )
-SELECT (prev + 1)::int AS gap_first, (closer - 1)::int AS gap_last, closer::int AS next_cursor
-FROM edges
-WHERE closer - prev > 1 AND closer > @cursor::int
-ORDER BY closer ASC
-LIMIT @lim::int;
+SELECT gaps.gap_first, gaps.gap_last, gaps.next_cursor
+FROM authorized
+LEFT JOIN gaps ON true
+ORDER BY gaps.next_cursor ASC NULLS LAST;
 
 -- name: ListRunMessagesAfter :many
 -- Replay for a (re)connecting browser: everything after its last-seen seq, in

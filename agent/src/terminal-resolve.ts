@@ -267,7 +267,7 @@ async function gapFillLoop(
       if (signal?.aborted) return;
       let page: MessageGapsResponse;
       try {
-        page = await client.getMessageGaps(runId, fence, undefined, cursor);
+        page = await client.getMessageGaps(runId, claimGeneration, fence, undefined, cursor);
       } catch (err) {
         log.warn("outbox: message-gaps read failed during gap fill; leaving the journal", {
           run_id: runId,

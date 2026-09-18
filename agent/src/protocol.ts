@@ -2271,8 +2271,9 @@ export interface MessageGap {
 }
 
 /** PRD #1391 Run B M3 (D3): a page of a run's missing message-seq ranges in `[1..through]`, from
- *  GET /worker/runs/{id}/message-gaps?through=N&limit=&cursor=. `next_cursor` (a seq keyset value)
- *  is present only when more pages remain — the worker passes it as the next request's `cursor`. */
+ *  GET /worker/runs/{id}/message-gaps?claim_generation=G&through=N&limit=&cursor=. The api
+ *  authorizes the worker's exact current, unreleased generation in the same SQL snapshot as the
+ *  gap read. `next_cursor` is present only when more pages remain and becomes the next cursor. */
 export interface MessageGapsResponse {
   gaps: MessageGap[];
   next_cursor?: number;

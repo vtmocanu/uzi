@@ -40,6 +40,9 @@ type protocolStore struct {
 	// Orphan-classification read (issue #1319): the owner-run row/error the orphan query returns.
 	orphanRow store.GetRunOrphanIdentityRow
 	orphanErr error
+	gapRows   []store.RunMessageGapsRow
+	gapErr    error
+	gapArg    store.RunMessageGapsParams
 }
 
 func (p *protocolStore) ClaimRun(context.Context, store.ClaimRunParams) (store.Run, error) {
@@ -50,6 +53,10 @@ func (p *protocolStore) GetRunOwnedByWorker(context.Context, store.GetRunOwnedBy
 }
 func (p *protocolStore) GetRunOrphanIdentity(context.Context, store.GetRunOrphanIdentityParams) (store.GetRunOrphanIdentityRow, error) {
 	return p.orphanRow, p.orphanErr
+}
+func (p *protocolStore) RunMessageGaps(_ context.Context, arg store.RunMessageGapsParams) ([]store.RunMessageGapsRow, error) {
+	p.gapArg = arg
+	return p.gapRows, p.gapErr
 }
 func (p *protocolStore) SetRunCompleted(context.Context, store.SetRunCompletedParams) (int64, error) {
 	return p.completedRows, nil
@@ -948,6 +955,59 @@ func TestWorkerRunOwnershipTerminalReturnsStatus(t *testing.T) {
 	}
 	if got.Status != "completed" {
 		t.Fatalf("status = %q, want %q", got.Status, "completed")
+	}
+}
+
+func TestWorkerRunMessageGapsRequiresClaimGeneration(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		query string
+	}{
+		{name: "missing", query: "through=3"},
+		{name: "negative", query: "claim_generation=-1&through=3"},
+		{name: "not an integer", query: "claim_generation=nope&through=3"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := &protocolStore{}
+			h := newProtocolHandler(t, st)
+			req := workerReq(http.MethodGet, "", uuid.New())
+			req.URL.RawQuery = tc.query
+			rec := httptest.NewRecorder()
+
+			h.WorkerRunMessageGaps(rec, req)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 (body %q)", rec.Code, rec.Body.String())
+			}
+			if st.gapArg.RunID != uuid.Nil {
+				t.Fatal("invalid claim_generation reached the store")
+			}
+		})
+	}
+}
+
+func TestWorkerRunMessageGapsPassesClaimGenerationToAtomicQuery(t *testing.T) {
+	runID := uuid.New()
+	st := &protocolStore{gapRows: []store.RunMessageGapsRow{{}}} // authorized empty page sentinel
+	h := newProtocolHandler(t, st)
+	req := workerReq(http.MethodGet, "", runID)
+	req.URL.RawQuery = "claim_generation=9&through=42&cursor=3&limit=7"
+	wkr, _ := mw.WorkerFromContext(req.Context())
+	rec := httptest.NewRecorder()
+
+	h.WorkerRunMessageGaps(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %q)", rec.Code, rec.Body.String())
+	}
+	if st.gapArg.RunID != runID || !st.gapArg.WorkerID.Valid || st.gapArg.WorkerID.Bytes != wkr.ID {
+		t.Fatalf("query scope = {run:%s worker:%v}, want run %s worker %s", st.gapArg.RunID, st.gapArg.WorkerID, runID, wkr.ID)
+	}
+	if st.gapArg.ClaimGeneration != 9 {
+		t.Fatalf("claim_generation = %d, want 9", st.gapArg.ClaimGeneration)
+	}
+	if st.gapArg.Through != 42 || st.gapArg.Cursor != 3 || st.gapArg.Lim != 7 {
+		t.Fatalf("page args = {through:%d cursor:%d limit:%d}, want {42,3,7}", st.gapArg.Through, st.gapArg.Cursor, st.gapArg.Lim)
 	}
 }
 

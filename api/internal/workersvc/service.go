@@ -498,10 +498,6 @@ type Store interface {
 	ListActiveRunsAll(ctx context.Context, backgroundGraceCutoff pgtype.Timestamptz) ([]store.ListActiveRunsAllRow, error)
 	ListAllWorkers(ctx context.Context) ([]store.ListAllWorkersRow, error)
 	GetRunOwnedByWorker(ctx context.Context, arg store.GetRunOwnedByWorkerParams) (store.Run, error)
-	// GetRunOwnedByWorkerLiveClaim is GetRunOwnedByWorker additionally fenced on the claim being
-	// current (claim_released_at IS NULL), for the message-gaps read (PRD #1391 Run B M3c): a
-	// released/superseded flight must not inspect a newer flight's gaps.
-	GetRunOwnedByWorkerLiveClaim(ctx context.Context, arg store.GetRunOwnedByWorkerLiveClaimParams) (store.Run, error)
 	// CountRunMessagesThrough counts the stored message seqs in [1..through] for a run, the
 	// terminal fence's contiguity probe (PRD #1391 Run B M3c, D3).
 	CountRunMessagesThrough(ctx context.Context, arg store.CountRunMessagesThroughParams) (int32, error)
@@ -4295,44 +4291,49 @@ type MessageGapsPage struct {
 	NextCursor *int64
 }
 
-// RunMessageGaps returns the MISSING seq ranges in [1..through] for a run the worker holds AT ITS
-// CURRENT, UNRELEASED CLAIM (PRD #1391 Run B M3c) — keyset-paginated by seq after `cursor`, at most
-// `limit` ranges. The ownership read is GetRunOwnedByWorkerLiveClaim, so a foreign worker OR a
-// released/superseded flight (a stale worker or generation) is ErrRunNotOwned (→ 404): it must not
-// inspect or fill a newer flight's gaps. NextCursor is set only when the page filled to `limit` and
-// did not reach the trailing gap (whose Last == through) — i.e. more ranges may follow; otherwise it
-// is nil. The caller validates and clamps through/cursor/limit before calling.
-func (s *Service) RunMessageGaps(ctx context.Context, wkr store.Worker, runID uuid.UUID, through, cursor, limit int64) (MessageGapsPage, error) {
-	if _, err := s.q.GetRunOwnedByWorkerLiveClaim(ctx, store.GetRunOwnedByWorkerLiveClaimParams{ID: runID, WorkerID: pgconv.UUID(wkr.ID)}); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return MessageGapsPage{}, ErrRunNotOwned
-		}
-		return MessageGapsPage{}, err
-	}
+// RunMessageGaps returns the MISSING seq ranges in [1..through] for a run the worker holds AT THE
+// EXACT CURRENT, UNRELEASED `claimGeneration` (PRD #1391 Run B M3c) — keyset-paginated by seq after
+// `cursor`, at most `limit` ranges. Authorization and gap derivation are one SQL statement/snapshot,
+// so a same-worker reclaim cannot move the generation between a preliminary ownership read and the
+// gap read. Zero rows means a foreign, released or stale-generation claim (ErrRunNotOwned → 404);
+// an authorized run with no gaps returns one nullable sentinel row, filtered below. NextCursor is set
+// only when the page filled to `limit` and did not reach the trailing gap (whose Last == through).
+func (s *Service) RunMessageGaps(ctx context.Context, wkr store.Worker, runID uuid.UUID, claimGeneration, through, cursor, limit int64) (MessageGapsPage, error) {
 	// The handler validates through/cursor to <= a cap (1<<30) and limit to a small ceiling, all
 	// well within int32; clamp defensively so a direct caller cannot overflow the casts and the
 	// conversions are provably in range (gosec G115). A negative here is impossible (the caller
 	// rejects it) but is floored to 0 for the same provability.
 	rows, err := s.q.RunMessageGaps(ctx, store.RunMessageGapsParams{
-		RunID:   runID,
-		Through: clampInt32(through),
-		Cursor:  clampInt32(cursor),
-		Lim:     clampInt32(limit),
+		RunID:           runID,
+		WorkerID:        pgconv.UUID(wkr.ID),
+		ClaimGeneration: claimGeneration,
+		Through:         clampInt32(through),
+		Cursor:          clampInt32(cursor),
+		Lim:             clampInt32(limit),
 	})
 	if err != nil {
 		return MessageGapsPage{}, err
 	}
+	if len(rows) == 0 {
+		return MessageGapsPage{}, ErrRunNotOwned
+	}
 	page := MessageGapsPage{Gaps: make([]MessageGap, 0, len(rows))}
 	for _, r := range rows {
-		page.Gaps = append(page.Gaps, MessageGap{First: int64(r.GapFirst), Last: int64(r.GapLast)})
+		if !r.GapFirst.Valid {
+			continue // authorized run with no gaps: the query's all-NULL sentinel row
+		}
+		page.Gaps = append(page.Gaps, MessageGap{First: int64(r.GapFirst.Int32), Last: int64(r.GapLast.Int32)})
 	}
 	// Keyset continuation: a full page MIGHT have more behind it, unless the last range is the
 	// trailing gap (Last == through), which is uniquely the final one — the query closes it with a
 	// sentinel and nothing can follow. A short page means the LIMIT was not hit, so the scan is
 	// exhausted. In both terminal cases NextCursor stays nil.
-	if int64(len(rows)) == limit && len(rows) > 0 && int64(rows[len(rows)-1].GapLast) < through {
-		next := int64(rows[len(rows)-1].NextCursor)
-		page.NextCursor = &next
+	if int64(len(page.Gaps)) == limit && len(page.Gaps) > 0 {
+		last := rows[len(rows)-1]
+		if last.GapLast.Valid && int64(last.GapLast.Int32) < through {
+			next := int64(last.NextCursor.Int32)
+			page.NextCursor = &next
+		}
 	}
 	return page, nil
 }

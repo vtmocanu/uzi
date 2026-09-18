@@ -6,7 +6,7 @@
 // states get a hero banner: the MR link is the run's entire output and must
 // not hide in chrome. The breadcrumb keeps PRD #12's in-app board / issue links.
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import {
   api,
@@ -1520,6 +1520,8 @@ function outcomePendingReasonLabel(reason: string): string {
 
 export function RunView() {
   const { id = "" } = useParams();
+  const currentRunIdRef = useRef(id);
+  currentRunIdRef.current = id;
   const { run, messages, connected, error, submit, refreshRun, inputs, canSteer } = useRunStream(id);
   const [repoWebUrl, setRepoWebUrl] = useState<string | null>(null);
   const [workers, setWorkers] = useState<Worker[]>([]);
@@ -1592,41 +1594,57 @@ export function RunView() {
   // unlanded outcome with a typed 409 (isOutcomePendingConfirmation) unless the discard
   // bit is set; on that 409 we open the confirmation modal that NAMES what is lost instead
   // of surfacing the raw error, and the modal's confirm retries with discardPendingOutcome
-  // true. Any other error surfaces on the page banner exactly as today.
-  const [confirmDiscardOutcome, setConfirmDiscardOutcome] = useState(false);
+  // true. Bind the confirmation to the run that earned it: React Router reuses this component
+  // when only `:id` changes, and a late response from the old run must never authorize a discard
+  // on the new one. Any other error surfaces on the page banner exactly as today.
+  const [discardConfirmationRunId, setDiscardConfirmationRunId] = useState<string | null>(null);
+  const confirmDiscardOutcome = discardConfirmationRunId === id;
   // A MODAL-LOCAL error for the discard-confirmation modal. A failure of the confirmed
   // discard retry must be shown INSIDE the modal: the page-level actionErr <Alert> renders
   // behind the modal's `fixed inset-0 z-50` overlay, so surfacing it there on a high-stakes
   // destructive flow leaves the owner looking at an open modal with no feedback. Cleared on a
-  // fresh confirm attempt (below) and when the modal closes (closeDiscardModal).
+  // fresh confirm attempt (below), when the modal closes, and whenever the route changes runs.
   const [discardOutcomeErr, setDiscardOutcomeErr] = useState("");
+  useEffect(() => {
+    setDiscardConfirmationRunId(null);
+    setDiscardOutcomeErr("");
+  }, [id]);
   const closeDiscardModal = () => {
-    setConfirmDiscardOutcome(false);
+    setDiscardConfirmationRunId(null);
     setDiscardOutcomeErr("");
   };
   const cancelRun = async (discardPendingOutcome = false): Promise<boolean> => {
+    const requestRunId = id;
     setActionErr("");
     // A fresh attempt clears the modal-local error so a stale reason never lingers under a retry.
     setDiscardOutcomeErr("");
     setBusy(true);
     try {
       await submit("cancel", "", undefined, undefined, discardPendingOutcome);
-      setConfirmDiscardOutcome(false);
+      if (currentRunIdRef.current === requestRunId) {
+        setDiscardConfirmationRunId(null);
+      }
       return true;
     } catch (e) {
       if (isOutcomePendingConfirmation(e)) {
         // A finished outcome is held on the worker — do not surface the raw 409; open the
-        // modal that names the loss and offers the discarding retry.
-        setConfirmDiscardOutcome(true);
+        // modal that names the loss and offers the discarding retry, but only while this is
+        // still the run whose cancel the server refused.
+        if (currentRunIdRef.current === requestRunId) {
+          setDiscardConfirmationRunId(requestRunId);
+        }
         return false;
       }
       // A non-409 failure of the CONFIRMED discard retry (modal open) is shown inside the
       // modal — the page-level <Alert> is hidden behind the overlay — and the modal stays open
       // so the owner can retry or back out. Any other cancel entry point surfaces on the page.
-      if (discardPendingOutcome) {
-        setDiscardOutcomeErr(errorMessage(e, "Action failed"));
-      } else {
-        setActionErr(errorMessage(e, "Action failed"));
+      // Ignore a late response from a route we no longer render.
+      if (currentRunIdRef.current === requestRunId) {
+        if (discardPendingOutcome) {
+          setDiscardOutcomeErr(errorMessage(e, "Action failed"));
+        } else {
+          setActionErr(errorMessage(e, "Action failed"));
+        }
       }
       return false;
     } finally {

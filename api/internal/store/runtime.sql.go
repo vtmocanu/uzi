@@ -4255,168 +4255,6 @@ func (q *Queries) GetRunOwnedByWorkerForUpdate(ctx context.Context, arg GetRunOw
 	return i, err
 }
 
-const getRunOwnedByWorkerLiveClaim = `-- name: GetRunOwnedByWorkerLiveClaim :one
-SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash, pause_requested_at, pause_mode, pause_after_count, checkpoint_tip_at, recovery_wait_count, recovery_retry_not_before, completion_contract_version, contract_revision, completion_contract, completion_attempts, latest_completion_attempt, milestones_agents, hold_reason, hold_captured_head, completion_budget_exhausted_at, completion_question_at, budget_extension_seconds, claim_generation, harness, recovery_wait_cause, forge_park_count, credential_override_mode, credential_override_secret_id, claim_released_at, credential_switch_requested_at, credential_switch_generation, stale_requeue_generation FROM runs WHERE id = $1 AND worker_id = $2 AND claim_released_at IS NULL
-`
-
-type GetRunOwnedByWorkerLiveClaimParams struct {
-	ID       uuid.UUID   `json:"id"`
-	WorkerID pgtype.UUID `json:"worker_id"`
-}
-
-// Worker-endpoint authz for the message-gaps read (PRD #1391 Run B M3c): like GetRunOwnedByWorker
-// but ALSO fenced on the claim being CURRENT — claim_released_at IS NULL. A held-state credential
-// switch RELEASES the claim (sets claim_released_at) so a superseded old flight must NOT inspect
-// or fill a NEWER flight's gaps; a reclaim by a DIFFERENT worker moves worker_id, which the
-// worker_id predicate already excludes. Both stale cases return no rows → ErrRunNotOwned → 404, the
-// same shape a foreign worker sees. A run whose claim was never released has claim_released_at NULL
-// and reads exactly as GetRunOwnedByWorker would.
-func (q *Queries) GetRunOwnedByWorkerLiveClaim(ctx context.Context, arg GetRunOwnedByWorkerLiveClaimParams) (Run, error) {
-	row := q.db.QueryRow(ctx, getRunOwnedByWorkerLiveClaim, arg.ID, arg.WorkerID)
-	var i Run
-	err := row.Scan(
-		&i.ID,
-		&i.UserID,
-		&i.RepoID,
-		&i.IssueIid,
-		&i.IssueTitle,
-		&i.IssueDescription,
-		&i.Status,
-		&i.RequeueCount,
-		&i.WorkerID,
-		&i.SessionID,
-		&i.LastSeq,
-		&i.Branch,
-		&i.MrIid,
-		&i.FailureReason,
-		&i.PlanMd,
-		&i.IterationCount,
-		&i.ClaimedAt,
-		&i.StartedAt,
-		&i.FinishedAt,
-		&i.CreatedAt,
-		&i.UpdatedAt,
-		&i.OriginColumn,
-		&i.BoardColumn,
-		&i.MovePendingSince,
-		&i.MrState,
-		&i.AutoApprove,
-		&i.AutopilotCommentedAt,
-		&i.Kind,
-		&i.PipelineID,
-		&i.PipelineRef,
-		&i.FailureSnapshot,
-		&i.FixVerdict,
-		&i.StopKind,
-		&i.AgentSource,
-		&i.AgentExclusions,
-		&i.RepoAgents,
-		&i.Title,
-		&i.ResumeOfRunID,
-		&i.LastActivityAt,
-		&i.Health,
-		&i.HealthReason,
-		&i.HealthSince,
-		&i.HealthNotifiedAt,
-		&i.TargetRunID,
-		&i.MrWebUrl,
-		&i.PrdDonePath,
-		&i.PrdPatchSettledAt,
-		&i.AnthropicSecretID,
-		&i.AnthropicSecretLabel,
-		&i.AnthropicSelectReason,
-		&i.AnthropicHeadroomPct,
-		&i.WaitOnLimit,
-		&i.LimitResetsAt,
-		&i.RetryNotBefore,
-		&i.LimitWaitCount,
-		&i.RateLimitType,
-		&i.OpenQuestionID,
-		&i.ReviseCount,
-		&i.PlanSource,
-		&i.PlannedBaseCommit,
-		&i.RequireBaseMatch,
-		&i.MilestonesCandidate,
-		&i.MilestonesFrozen,
-		&i.MilestonesCompleted,
-		&i.MilestonesInProgress,
-		&i.BudgetMaxIterations,
-		&i.BudgetWallSeconds,
-		&i.ScheduleID,
-		&i.LimitDeadSecretID,
-		&i.ReportOnly,
-		&i.ReportMd,
-		&i.CiConfigPaths,
-		&i.Model,
-		&i.OverrideSubagentModel,
-		&i.FailOrigin,
-		&i.Priority,
-		&i.SummaryIntent,
-		&i.SummaryPlan,
-		&i.SummaryDeltas,
-		&i.IssueComments,
-		&i.BaseBranch,
-		&i.OpenMr,
-		&i.DispatchedAt,
-		&i.ReviewTargetRunID,
-		&i.ReviewRequested,
-		&i.ThenFixRequested,
-		&i.ThenFixOfRunID,
-		&i.PreservedPatch,
-		&i.RequiredCapabilities,
-		&i.StopReason,
-		&i.RequiredTools,
-		&i.SizeClass,
-		&i.Interactive,
-		&i.OpenFollowupID,
-		&i.PlanChangedFiles,
-		&i.ScopeCeiling,
-		&i.StatusSince,
-		&i.ReviewComments,
-		&i.BudgetPausedSeconds,
-		&i.MrReworkEnabled,
-		&i.TriggerSource,
-		&i.CheckpointTip,
-		&i.UsageRefolded,
-		&i.CodexSecretID,
-		&i.CodexAuthMode,
-		&i.CodexSecretLabel,
-		&i.CodexAccountKey,
-		&i.CodexMaterialRevision,
-		&i.CodexAccountRevision,
-		&i.CodexClaimEpoch,
-		&i.CodexCapHash,
-		&i.PauseRequestedAt,
-		&i.PauseMode,
-		&i.PauseAfterCount,
-		&i.CheckpointTipAt,
-		&i.RecoveryWaitCount,
-		&i.RecoveryRetryNotBefore,
-		&i.CompletionContractVersion,
-		&i.ContractRevision,
-		&i.CompletionContract,
-		&i.CompletionAttempts,
-		&i.LatestCompletionAttempt,
-		&i.MilestonesAgents,
-		&i.HoldReason,
-		&i.HoldCapturedHead,
-		&i.CompletionBudgetExhaustedAt,
-		&i.CompletionQuestionAt,
-		&i.BudgetExtensionSeconds,
-		&i.ClaimGeneration,
-		&i.Harness,
-		&i.RecoveryWaitCause,
-		&i.ForgeParkCount,
-		&i.CredentialOverrideMode,
-		&i.CredentialOverrideSecretID,
-		&i.ClaimReleasedAt,
-		&i.CredentialSwitchRequestedAt,
-		&i.CredentialSwitchGeneration,
-		&i.StaleRequeueGeneration,
-	)
-	return i, err
-}
-
 const getRunUsageTotal = `-- name: GetRunUsageTotal :one
 SELECT input_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, cost_usd, cost_status
 FROM run_usage_totals
@@ -9063,39 +8901,62 @@ func (q *Queries) RunHasVerdictSinceGateOpened(ctx context.Context, arg RunHasVe
 }
 
 const runMessageGaps = `-- name: RunMessageGaps :many
-WITH present AS (
-    SELECT seq FROM run_messages
-    WHERE run_id = $3 AND seq BETWEEN 1 AND $4::int AND seq >= $1::int
+WITH authorized AS (
+    SELECT 1 AS ok FROM runs r
+    WHERE r.id = $1
+      AND r.worker_id = $2
+      AND r.claim_released_at IS NULL
+      AND r.claim_generation = $3
+),
+present AS (
+    SELECT m.seq FROM run_messages m
+    CROSS JOIN authorized
+    WHERE m.run_id = $1 AND m.seq BETWEEN 1 AND $4::int AND m.seq >= $5::int
     UNION ALL
-    SELECT ($4::int) + 1
+    SELECT ($4::int) + 1 FROM authorized
 ),
 edges AS (
     SELECT seq AS closer,
-           COALESCE(LAG(seq) OVER (ORDER BY seq), $1::int) AS prev
+           COALESCE(LAG(seq) OVER (ORDER BY seq), $5::int) AS prev
     FROM present
+),
+gaps AS (
+    SELECT (prev + 1)::int AS gap_first, (closer - 1)::int AS gap_last, closer::int AS next_cursor
+    FROM edges
+    WHERE closer - prev > 1 AND closer > $5::int
+    ORDER BY closer ASC
+    LIMIT $6::int
 )
-SELECT (prev + 1)::int AS gap_first, (closer - 1)::int AS gap_last, closer::int AS next_cursor
-FROM edges
-WHERE closer - prev > 1 AND closer > $1::int
-ORDER BY closer ASC
-LIMIT $2::int
+SELECT gaps.gap_first, gaps.gap_last, gaps.next_cursor
+FROM authorized
+LEFT JOIN gaps ON true
+ORDER BY gaps.next_cursor ASC NULLS LAST
 `
 
 type RunMessageGapsParams struct {
-	Cursor  int32     `json:"cursor"`
-	Lim     int32     `json:"lim"`
-	RunID   uuid.UUID `json:"run_id"`
-	Through int32     `json:"through"`
+	RunID           uuid.UUID   `json:"run_id"`
+	WorkerID        pgtype.UUID `json:"worker_id"`
+	ClaimGeneration int64       `json:"claim_generation"`
+	Through         int32       `json:"through"`
+	Cursor          int32       `json:"cursor"`
+	Lim             int32       `json:"lim"`
 }
 
 type RunMessageGapsRow struct {
-	GapFirst   int32 `json:"gap_first"`
-	GapLast    int32 `json:"gap_last"`
-	NextCursor int32 `json:"next_cursor"`
+	GapFirst   pgtype.Int4 `json:"gap_first"`
+	GapLast    pgtype.Int4 `json:"gap_last"`
+	NextCursor pgtype.Int4 `json:"next_cursor"`
 }
 
 // The hardened message-gaps read (PRD #1391 Run B M3c): the MISSING seq ranges in [1..through]
 // as bounded {first,last} pairs, after a keyset @cursor, ordered by seq, at most @lim of them.
+// Authorization is part of THIS statement and snapshot: the run must belong to @worker_id at its
+// current unreleased @claim_generation. A preliminary ownership query would leave a TOCTOU window
+// where a same-worker reclaim increments the generation before this query reads the newer flight's
+// gaps. `authorized` is empty for any stale/foreign/released claim, so the statement returns ZERO
+// rows. For an authorized run with no gaps, the final LEFT JOIN returns one all-NULL sentinel row;
+// the service uses that distinction to return an empty page rather than ErrRunNotOwned.
+//
 // KEYSET pagination only — NO OFFSET, NO generate_series, NO materialisation of `through` rows:
 // the gaps are derived from the PRESENT rows via LAG over the (run_id, seq) index, so the scan is
 // bounded by what is stored (at most the run's message count), never by the size of `through`.
@@ -9112,10 +8973,12 @@ type RunMessageGapsRow struct {
 // one [1, min_present-1]. The trailing gap is uniquely the one whose `last` == through.
 func (q *Queries) RunMessageGaps(ctx context.Context, arg RunMessageGapsParams) ([]RunMessageGapsRow, error) {
 	rows, err := q.db.Query(ctx, runMessageGaps,
+		arg.RunID,
+		arg.WorkerID,
+		arg.ClaimGeneration,
+		arg.Through,
 		arg.Cursor,
 		arg.Lim,
-		arg.RunID,
-		arg.Through,
 	)
 	if err != nil {
 		return nil, err

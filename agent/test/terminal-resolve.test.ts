@@ -45,7 +45,7 @@ async function mkOutbox(): Promise<{ outbox: Outbox; root: string }> {
  *  test; records the tombstone posts and the gaps reads. */
 class FakeClient {
   features = new Set<string>();
-  gapsCalls: Array<{ through: number; cursor: number }> = [];
+  gapsCalls: Array<{ generation: number; through: number; cursor: number }> = [];
   postCalls: Array<{ msgs: OutgoingMessage[]; generation: number | undefined }> = [];
   gapsResponder: (through: number, cursor: number) => MessageGapsResponse = () => ({ gaps: [] });
   postResponder: (msgs: OutgoingMessage[], generation: number | undefined) => void = () => undefined;
@@ -53,8 +53,14 @@ class FakeClient {
   hasFeature(f: string): boolean {
     return this.features.has(f);
   }
-  async getMessageGaps(_runId: string, through: number, _limit?: number, cursor?: number): Promise<MessageGapsResponse> {
-    this.gapsCalls.push({ through, cursor: cursor ?? 0 });
+  async getMessageGaps(
+    _runId: string,
+    generation: number,
+    through: number,
+    _limit?: number,
+    cursor?: number,
+  ): Promise<MessageGapsResponse> {
+    this.gapsCalls.push({ generation, through, cursor: cursor ?? 0 });
     return this.gapsResponder(through, cursor ?? 0);
   }
   async postMessages(_runId: string, msgs: OutgoingMessage[], generation?: number): Promise<void> {
@@ -437,6 +443,11 @@ describe("resolvePendingTerminal / journalAndResolveTerminal (PRD #1391 Run B M3
       ]).send,
     });
 
+    assert.deepEqual(
+      client.gapsCalls[0],
+      { generation: GEN, through: 3, cursor: 0 },
+      "the gaps read is fenced on the terminal journal's claim generation",
+    );
     assert.equal(client.postCalls.length, 1, "the genuine hole on a fully-drained run WAS tombstoned");
     assert.deepEqual(client.postCalls[0]?.msgs.map((m) => m.seq), [3], "one per-seq tombstone for the hole");
     assert.equal(outbox.depthFor("r1")?.pendingTerminal, 0, "the terminal applied and the journal retired");

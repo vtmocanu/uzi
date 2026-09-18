@@ -9,7 +9,7 @@ import {
   waitFor,
   within,
 } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { createMemoryRouter, MemoryRouter, RouterProvider } from "react-router-dom";
 import {
   PlanPanel,
   SeededPlanPanel,
@@ -5375,6 +5375,25 @@ describe("RunView — held-outcome banner + discard confirmation (PRD #1391 M3d)
     outcome_pending: { reason: "gap_unrecoverable" },
   };
 
+  function renderRoutedPage(submits: Record<string, ReturnType<typeof vi.fn>>) {
+    mockUseRunStream.mockImplementation((runId) => ({
+      run: run({ ...HELD, id: runId }),
+      messages: [],
+      connected: true,
+      error: "",
+      submit: submits[runId],
+      refreshRun: vi.fn(),
+      inputs: [],
+      canSteer: true,
+    }) as unknown as ReturnType<typeof useRunStream>);
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
+    const router = createMemoryRouter(
+      [{ path: "/runs/:id", element: <RunView /> }],
+      { initialEntries: ["/runs/r1"] },
+    );
+    return { router, ...render(<RouterProvider router={router} />) };
+  }
+
   // A stable substring of the modal body copy that names the concrete loss (avoids the
   // apostrophe/em-dash so the regex stays plain). Presence == the modal is open.
   const MODAL_BODY = /Discarding it cancels the run and throws that finished result away/i;
@@ -5437,6 +5456,62 @@ describe("RunView — held-outcome banner + discard confirmation (PRD #1391 M3d)
     await waitFor(() => expect(screen.queryByText(MODAL_BODY)).toBeNull());
     // The first (unconfirmed) cancel carried no discard bit.
     expect(submit.mock.calls[0][4]).toBeFalsy();
+  });
+
+  it("closes an open discard confirmation when the route changes runs", async () => {
+    const submitR1 = vi.fn(async () => {
+      throw new ApiError(409, "cancel refused", {
+        reason: "outcome_pending_confirmation_required",
+      });
+    });
+    const submitR2 = vi.fn(async () => undefined);
+    const { router } = renderRoutedPage({ r1: submitR1, r2: submitR2 });
+    await screen.findByText("Add rate limiting");
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /discard held outcome/i }));
+    });
+    await screen.findByText(MODAL_BODY);
+
+    await act(async () => {
+      await router.navigate("/runs/r2");
+    });
+
+    await waitFor(() => expect(screen.queryByText(MODAL_BODY)).toBeNull());
+    expect(submitR2).not.toHaveBeenCalled();
+  });
+
+  it("ignores a confirmation-required response from the run shown before navigation", async () => {
+    let rejectR1!: (reason?: unknown) => void;
+    const pendingR1 = new Promise<never>((_resolve, reject) => {
+      rejectR1 = reject;
+    });
+    const submitR1 = vi.fn(() => pendingR1);
+    const submitR2 = vi.fn(async () => undefined);
+    const { router } = renderRoutedPage({ r1: submitR1, r2: submitR2 });
+    await screen.findByText("Add rate limiting");
+
+    fireEvent.click(screen.getByRole("button", { name: /discard held outcome/i }));
+    await waitFor(() => expect(submitR1).toHaveBeenCalledTimes(1));
+
+    await act(async () => {
+      await router.navigate("/runs/r2");
+    });
+    await act(async () => {
+      rejectR1(
+        new ApiError(409, "cancel refused", {
+          reason: "outcome_pending_confirmation_required",
+        }),
+      );
+      await Promise.resolve();
+    });
+
+    await waitFor(() => {
+      const discard = screen.getByRole("button", { name: /discard held outcome/i }) as HTMLButtonElement;
+      expect(discard.disabled).toBe(false);
+    });
+    expect(screen.queryByText(MODAL_BODY)).toBeNull();
+    expect(submitR2).not.toHaveBeenCalled();
   });
 
   it("'Keep waiting' closes the modal without cancelling", async () => {
